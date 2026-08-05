@@ -401,6 +401,7 @@ impl<'a> Emitter<'a> {
         }
         self.f.local_set(local);
         CTX_BYTES.with(|c| c.set(c.get() + (self.f.code.len() - before)));
+        note_traffic(r);
         self.regs.insert(
             r,
             Cached {
@@ -423,6 +424,25 @@ impl<'a> Emitter<'a> {
     }
 
     /// Write every dirty cached register back to the context.
+    ///
+    /// This is the traffic `gexc build` reports as a share of the module --
+    /// 19% for SQLite, 20% for Lua -- and carrying the hottest of those
+    /// registers in the block's *parameters* instead was tried and reverted.
+    /// A tail call can pass arguments, so four of them can ride across a
+    /// boundary in machine registers rather than through memory, and on a
+    /// microbenchmark whose loop body is one call that is 20% faster.
+    ///
+    /// It does not carry over. tcc compiling its largest source was 27%
+    /// *slower*, and Lua and SQLite were indistinguishable from unchanged
+    /// across six interleaved A/B rounds. The context is one 896-byte
+    /// structure that never leaves L1, so these stores and loads are nearly
+    /// free in cycles however much of the module they are; what the change
+    /// really did was hold four more values live across every function, and
+    /// on real blocks -- which are bigger than a microbenchmark's -- that
+    /// costs more in spills than the memory traffic ever cost. It also made
+    /// modules 6% larger, because a register carried in a parameter still
+    /// has to be spilled to the context before every host call and every
+    /// safepoint.
     fn flush(&mut self) {
         self.flush_inner(false);
     }
@@ -448,6 +468,7 @@ impl<'a> Emitter<'a> {
         dirty.sort_by_key(|(r, _)| Self::reg_offset(*r));
         let before = self.f.code.len();
         for (r, local) in dirty {
+            note_traffic(r);
             self.f.local_get(self.ctx_local);
             self.f.local_get(local);
             match r.ty() {
@@ -1421,9 +1442,19 @@ fn lane_shift_op(op: VShiftOp, lane: VLane) -> u32 {
 
 /// Whether a statement can leave the register cache stale.
 thread_local! {
-    /// Bytes emitted moving guest registers between the context and locals,
-    /// for `--verbose`. That traffic is the price of a block boundary.
+    /// Bytes emitted moving guest registers between the context and locals.
+    /// That traffic is the price of a block boundary, and `gexc build`
+    /// reports it as a share of the module.
     pub static CTX_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How often each guest register crosses a boundary, under
+    /// `GEX_REG_HISTOGRAM`. Which registers those are is the first question
+    /// anyone asks about that percentage.
+    pub static REG_TRAFFIC: std::cell::RefCell<HashMap<GuestReg, usize>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn note_traffic(r: GuestReg) {
+    REG_TRAFFIC.with(|t| *t.borrow_mut().entry(r).or_default() += 1);
 }
 
 /// Iterations of a fused loop between trips through the dispatcher.

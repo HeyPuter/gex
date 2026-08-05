@@ -250,6 +250,27 @@ fn cmd_build(args: &[String]) -> Result<()> {
         stats.wasm_bytes as f64 / (stats.instructions.max(1) * 4) as f64,
         100.0 * gex_emit::tier1::CTX_BYTES.with(|c| c.get()) as f64 / stats.wasm_bytes as f64,
     );
+    // Which registers make up that percentage, for anyone considering doing
+    // something about it.
+    if std::env::var_os("GEX_REG_HISTOGRAM").is_some() {
+        let mut v: Vec<(String, usize)> = gex_emit::tier1::REG_TRAFFIC.with(|t| {
+            t.borrow()
+                .iter()
+                .map(|(r, n)| (format!("{r:?}"), *n))
+                .collect()
+        });
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let total: usize = v.iter().map(|(_, n)| n).sum::<usize>().max(1);
+        let mut acc = 0;
+        for (name, n) in v.iter().take(16) {
+            acc += n;
+            eprintln!(
+                "{out}:   {name:<8} {n:>9} ({:.1}%, running {:.1}%)",
+                100.0 * *n as f64 / total as f64,
+                100.0 * acc as f64 / total as f64
+            );
+        }
+    }
     if stats.illegal_blocks > 0 {
         eprintln!(
             "{out}: {} blocks end in an instruction gex cannot execute yet; \
