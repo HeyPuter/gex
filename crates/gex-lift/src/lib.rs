@@ -19,7 +19,7 @@ use gex_ir::*;
 use gex_isa::{
     AddOp, AddrMode, BarrierKind, BfOp, Cond, Dp1Op, Dp2Op, Dp3Op, Extend, Inst, LogOp, MemSz,
     MoveOp, Ordering as IsaOrder, RegSel, RmwOp as IsaRmw, ShiftType, Sz, SysMaintOp, SysReg,
-    FpOp1, FpOp2, FpRound, FpSz, VAcrossOp, VArr, VOp2, VOp3, VPermOp, VSelKind, VShiftImmOp, VLogOp,
+    FpOp1, FpOp2, FpRound, FpSz, VAcrossOp, VArr, VOp2, VOp3, VPermOp, VSelKind, VShiftImmOp, VLogOp, VWidenOp,
 };
 
 mod block;
@@ -1260,6 +1260,191 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            Inst::VByElement {
+                op,
+                arr,
+                vd,
+                vn,
+                vm,
+                index,
+            } => {
+                // Broadcast the chosen lane, then this is an ordinary
+                // three-same operation.
+                let src = self.b.read(GuestReg::V128(vm.0));
+                let mut lanes = [0u8; 16];
+                for (i, slot) in lanes.iter_mut().enumerate() {
+                    let byte = i as u32 % arr.lane_bytes;
+                    *slot = (index * arr.lane_bytes + byte) as u8;
+                }
+                let b = self.b.def(Expr::VShuffle {
+                    lanes: Box::new(lanes),
+                    a: src,
+                    b: src,
+                });
+                self.three_same_with(op, arr, vd, vn, b, pc)
+            }
+
+            Inst::VWiden {
+                op,
+                arr,
+                upper,
+                signed,
+                vd,
+                vn,
+                vm,
+            } => {
+                // Everything here is "widen the narrow operands, then do an
+                // ordinary lane-wise operation at the wider size". The `w`
+                // forms simply skip widening their first operand.
+                let wide = VArr {
+                    lane_bytes: arr.lane_bytes * 2,
+                    q: true,
+                    float: false,
+                    scalar: false,
+                };
+                let lane = Self::lane_of(wide);
+                let widen = |s: &mut Self, v: Value| {
+                    s.b.def(Expr::VCvt {
+                        op: if upper {
+                            VCvtOp::ExtendHigh { signed }
+                        } else {
+                            VCvtOp::ExtendLow { signed }
+                        },
+                        from: Self::lane_of(arr),
+                        a: v,
+                        b: None,
+                    })
+                };
+                let raw_n = self.b.read(GuestReg::V128(vn.0));
+                let raw_m = self.b.read(GuestReg::V128(vm.0));
+                let a = match op {
+                    VWidenOp::AddW | VWidenOp::SubW => raw_n,
+                    _ => widen(self, raw_n),
+                };
+                let b = widen(self, raw_m);
+                let r = match op {
+                    VWidenOp::AddL | VWidenOp::AddW => {
+                        self.b.def(Expr::VLaneBin { op: VLaneBinOp::Add, lane, a, b })
+                    }
+                    VWidenOp::SubL | VWidenOp::SubW => {
+                        self.b.def(Expr::VLaneBin { op: VLaneBinOp::Sub, lane, a, b })
+                    }
+                    VWidenOp::MulL => {
+                        self.b.def(Expr::VLaneBin { op: VLaneBinOp::Mul, lane, a, b })
+                    }
+                    VWidenOp::MlaL | VWidenOp::MlsL => {
+                        let prod =
+                            self.b.def(Expr::VLaneBin { op: VLaneBinOp::Mul, lane, a, b });
+                        let acc = self.b.read(GuestReg::V128(vd.0));
+                        self.b.def(Expr::VLaneBin {
+                            op: if op == VWidenOp::MlaL {
+                                VLaneBinOp::Add
+                            } else {
+                                VLaneBinOp::Sub
+                            },
+                            lane,
+                            a: acc,
+                            b: prod,
+                        })
+                    }
+                    VWidenOp::AbdL | VWidenOp::AbaL => {
+                        // Widening first means max-minus-min cannot overflow,
+                        // so the absolute difference needs no saturation.
+                        let (mx, mn) = if signed {
+                            (VLaneBinOp::MaxS, VLaneBinOp::MinS)
+                        } else {
+                            (VLaneBinOp::MaxU, VLaneBinOp::MinU)
+                        };
+                        let hi = self.b.def(Expr::VLaneBin { op: mx, lane, a, b });
+                        let lo = self.b.def(Expr::VLaneBin { op: mn, lane, a, b });
+                        let d = self.b.def(Expr::VLaneBin {
+                            op: VLaneBinOp::Sub,
+                            lane,
+                            a: hi,
+                            b: lo,
+                        });
+                        if op == VWidenOp::AbdL {
+                            d
+                        } else {
+                            let acc = self.b.read(GuestReg::V128(vd.0));
+                            self.b.def(Expr::VLaneBin {
+                                op: VLaneBinOp::Add,
+                                lane,
+                                a: acc,
+                                b: d,
+                            })
+                        }
+                    }
+                };
+                self.b.write(GuestReg::V128(vd.0), r);
+                Flow::Next
+            }
+
+            Inst::VFpCvtPrecision {
+                widen,
+                narrow_bytes,
+                upper,
+                vd,
+                vn,
+            } => {
+                // Only single <-> double is reachable; half precision has no
+                // wasm lane type and stays undecoded.
+                if narrow_bytes != 4 {
+                    return Flow::End(Term::Illegal { raw: 0, pc });
+                }
+                let src = self.b.read(GuestReg::V128(vn.0));
+                if widen {
+                    // `fcvtl2` promotes the upper two singles, and wasm can
+                    // only promote the lower pair, so move them down first.
+                    let src = if upper {
+                        let mut sel = [0u8; 16];
+                        for (i, slot) in sel.iter_mut().enumerate() {
+                            *slot = (8 + i % 8) as u8;
+                        }
+                        self.b.def(Expr::VShuffle {
+                            lanes: Box::new(sel),
+                            a: src,
+                            b: src,
+                        })
+                    } else {
+                        src
+                    };
+                    let r = self.b.def(Expr::VCvt {
+                        op: VCvtOp::PromoteF32,
+                        from: VLane::F32,
+                        a: src,
+                        b: None,
+                    });
+                    self.b.write(GuestReg::V128(vd.0), r);
+                } else {
+                    let demoted = self.b.def(Expr::VCvt {
+                        op: VCvtOp::DemoteF64,
+                        from: VLane::F64,
+                        a: src,
+                        b: None,
+                    });
+                    if upper {
+                        // `fcvtn2` writes the upper half and leaves the lower
+                        // half of the destination alone.
+                        let old = self.b.read(GuestReg::V128(vd.0));
+                        let mut sel = [0u8; 16];
+                        for (i, slot) in sel.iter_mut().enumerate() {
+                            *slot = if i < 8 { i as u8 } else { (16 + i - 8) as u8 };
+                        }
+                        let r = self.b.def(Expr::VShuffle {
+                            lanes: Box::new(sel),
+                            a: old,
+                            b: demoted,
+                        });
+                        self.b.write(GuestReg::V128(vd.0), r);
+                    } else {
+                        let r = self.narrow_to_64(demoted, false);
+                        self.b.write(GuestReg::V128(vd.0), r);
+                    }
+                }
+                Flow::Next
+            }
+
             Inst::FpCompare { sz, vn, vm } => {
                 let double = sz.is_double();
                 let a = self.rd_fp(vn, sz);
@@ -1445,6 +1630,150 @@ impl<'a> Lifter<'a> {
                     });
                     self.wr_gp(rd, int_sz, v);
                 }
+                Flow::Next
+            }
+
+            Inst::VLoadStoreLane {
+                load,
+                replicate,
+                lane_bytes,
+                index,
+                q,
+                vt,
+                ref addr,
+            } => {
+                let msz = match lane_bytes {
+                    1 => gex_ir::MemSz::B1,
+                    2 => gex_ir::MemSz::B2,
+                    4 => gex_ir::MemSz::B4,
+                    _ => gex_ir::MemSz::B8,
+                };
+                let ty = if lane_bytes == 8 { Ty::I64 } else { Ty::I32 };
+                let a = self.address(addr);
+                if load {
+                    let val = self.b.def(Expr::Load {
+                        addr: a.base,
+                        offset: a.offset,
+                        sz: msz,
+                        signed: false,
+                        ty,
+                        order: Order::Relaxed,
+                    });
+                    let v = if replicate {
+                        let full = self.b.def(Expr::VSplat {
+                            a: val,
+                            lane_bytes,
+                        });
+                        // The 64-bit arrangement leaves the upper half zero.
+                        self.narrow_to_64(full, q)
+                    } else {
+                        let old = self.b.read(GuestReg::V128(vt.0));
+                        self.b.def(Expr::VReplace {
+                            a: old,
+                            lane: index,
+                            lane_bytes,
+                            val,
+                        })
+                    };
+                    self.b.write(GuestReg::V128(vt.0), v);
+                } else {
+                    let old = self.b.read(GuestReg::V128(vt.0));
+                    let val = self.b.def(Expr::VExtract {
+                        a: old,
+                        lane: index,
+                        lane_bytes,
+                        signed: false,
+                        ty,
+                    });
+                    self.b.stmt(Stmt::Store {
+                        addr: a.base,
+                        offset: a.offset,
+                        val,
+                        sz: msz,
+                        order: Order::Relaxed,
+                    });
+                }
+                self.finish_address(&a);
+                Flow::Next
+            }
+
+            Inst::VLoadStore2 {
+                load,
+                lane_bytes,
+                bytes,
+                vt,
+                ref addr,
+            } => {
+                // Two registers' worth of memory holds the lanes interleaved.
+                // Byte `2*i*L + k` of the block is byte `k` of lane `i` of the
+                // first register; the odd positions belong to the second. Both
+                // directions are therefore a pair of shuffles.
+                let lanes_each = bytes / lane_bytes;
+                let lb = lane_bytes;
+                let a = self.address(addr);
+                if load {
+                    let lo = self.b.def(Expr::VLoad {
+                        addr: a.base,
+                        offset: a.offset,
+                        bytes: 16.min(bytes * 2),
+                    });
+                    let hi = if bytes == 16 {
+                        self.b.def(Expr::VLoad {
+                            addr: a.base,
+                            offset: a.offset + 16,
+                            bytes: 16,
+                        })
+                    } else {
+                        lo
+                    };
+                    for half in 0..2u32 {
+                        let mut sel = [0u8; 16];
+                        for i in 0..lanes_each {
+                            for k in 0..lb {
+                                sel[(i * lb + k) as usize] =
+                                    ((2 * i + half) * lb + k) as u8;
+                            }
+                        }
+                        let v = self.b.def(Expr::VShuffle {
+                            lanes: Box::new(sel),
+                            a: lo,
+                            b: hi,
+                        });
+                        let v = self.narrow_to_64(v, bytes == 16);
+                        self.b
+                            .write(GuestReg::V128((vt.0 + half as u8) % 32), v);
+                    }
+                } else {
+                    let v0 = self.b.read(GuestReg::V128(vt.0));
+                    let v1 = self.b.read(GuestReg::V128((vt.0 + 1) % 32));
+                    // Each output block of 16 bytes alternates lanes taken
+                    // from v0 and v1, starting at lane `block * 8 / lb`.
+                    let blocks = bytes * 2 / 16;
+                    for blk in 0..blocks.max(1) {
+                        let mut sel = [0u8; 16];
+                        let out_bytes = if bytes == 16 { 16 } else { bytes * 2 };
+                        for pos in 0..out_bytes {
+                            let byte = blk * 16 + pos;
+                            let lane = byte / (2 * lb);
+                            let from_second = (byte / lb) % 2 == 1;
+                            let k = byte % lb;
+                            sel[pos as usize] =
+                                (lane * lb + k + if from_second { 16 } else { 0 }) as u8;
+                        }
+                        let v = self.b.def(Expr::VShuffle {
+                            lanes: Box::new(sel),
+                            a: v0,
+                            b: v1,
+                        });
+                        self.b.stmt(Stmt::VStore {
+                            addr: a.base,
+                            offset: a.offset + (blk as i64) * 16,
+                            val: v,
+                            bytes: if bytes == 16 { 16 } else { bytes * 2 },
+                        });
+                    }
+                }
+                self.finish_address(&a);
                 Flow::Next
             }
 
@@ -1708,6 +2037,7 @@ impl<'a> Lifter<'a> {
                 lane_bytes,
                 index,
                 q,
+                scalar,
             } => {
                 let a = self.b.read(GuestReg::V128(vn.0));
                 let mut lanes = [0u8; 16];
@@ -1720,8 +2050,18 @@ impl<'a> Lifter<'a> {
                     b: a,
                     lanes: Box::new(lanes),
                 });
-                let v = self.narrow_to_64(r, q);
-                self.b.write(GuestReg::V128(vd.0), v);
+                // The scalar form keeps only lane 0; `commit_vector` already
+                // knows how to say that.
+                self.commit_vector(
+                    vd,
+                    VArr {
+                        lane_bytes,
+                        q,
+                        float: false,
+                        scalar,
+                    },
+                    r,
+                );
                 Flow::Next
             }
 
@@ -1769,6 +2109,7 @@ impl<'a> Lifter<'a> {
                 vm,
                 nzcv,
                 cond,
+                signalling: _,
             } => {
                 let double = sz.is_double();
                 let a = self.rd_fp(vn, sz);
@@ -1873,15 +2214,31 @@ impl<'a> Lifter<'a> {
         vm: gex_isa::VReg,
         pc: u64,
     ) -> Flow {
+        let b = self.b.read(GuestReg::V128(vm.0));
+        self.three_same_with(op, arr, vd, vn, b, pc)
+    }
+
+    /// `three_same`, but with the second operand already in hand -- which is
+    /// what lets the by-element forms share every lowering below.
+    fn three_same_with(
+        &mut self,
+        op: VOp3,
+        arr: VArr,
+        vd: gex_isa::VReg,
+        vn: gex_isa::VReg,
+        b: Value,
+        pc: u64,
+    ) -> Flow {
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
-        let b = self.b.read(GuestReg::V128(vm.0));
 
         let simple = |op| Some(op);
         let bin: Option<VLaneBinOp> = match op {
             VOp3::Add | VOp3::FAdd => simple(VLaneBinOp::Add),
             VOp3::Sub | VOp3::FSub => simple(VLaneBinOp::Sub),
-            VOp3::Mul | VOp3::FMul => simple(VLaneBinOp::Mul),
+            // `fmulx` shares this lowering: it differs only for zero times
+            // infinity, which gex does not model. See README's fidelity notes.
+            VOp3::Mul | VOp3::FMul | VOp3::FMulx => simple(VLaneBinOp::Mul),
             VOp3::FDiv => simple(VLaneBinOp::Div),
             VOp3::SMax => simple(VLaneBinOp::MaxS),
             VOp3::SMin => simple(VLaneBinOp::MinS),
@@ -2117,12 +2474,7 @@ impl<'a> Lifter<'a> {
             }
             VOp2::FcvtZs | VOp2::FcvtZu => {
                 let signed = op == VOp2::FcvtZs;
-                let r = self.b.def(Expr::VCvt {
-                    op: VCvtOp::FpToIntSat { signed },
-                    from: lane,
-                    a,
-                    b: None,
-                });
+                let r = self.lane_convert(arr, a, FpConvert::FpToInt { signed }, signed);
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
@@ -2140,23 +2492,13 @@ impl<'a> Lifter<'a> {
                     VOp2::FcvtNs | VOp2::FcvtAs | VOp2::FcvtPs | VOp2::FcvtMs
                 );
                 let rounded = self.b.def(Expr::VLaneUn { op: round, lane, a });
-                let r = self.b.def(Expr::VCvt {
-                    op: VCvtOp::FpToIntSat { signed },
-                    from: lane,
-                    a: rounded,
-                    b: None,
-                });
+                let r = self.lane_convert(arr, rounded, FpConvert::FpToInt { signed }, signed);
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
             VOp2::Scvtf | VOp2::Ucvtf => {
                 let signed = op == VOp2::Scvtf;
-                let r = self.b.def(Expr::VCvt {
-                    op: VCvtOp::IntToFp { signed },
-                    from: lane.as_int(),
-                    a,
-                    b: None,
-                });
+                let r = self.lane_convert(arr, a, FpConvert::IntToFp { signed }, signed);
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
@@ -2216,9 +2558,97 @@ impl<'a> Lifter<'a> {
             VShiftImmOp::Shl => VShiftOp::Shl,
             VShiftImmOp::SShr => VShiftOp::ShrS,
             VShiftImmOp::UShr => VShiftOp::ShrU,
-            // The widening and narrowing shifts change the lane width, which
-            // needs a conversion the block-local form does not express yet.
-            _ => return Flow::End(Term::Illegal { raw: 0, pc }),
+            // The width-changing forms convert first and then shift at the
+            // other width, so they do not fit the shape below.
+            VShiftImmOp::SShll | VShiftImmOp::UShll => {
+                let signed = op == VShiftImmOp::SShll;
+                let wide = VArr {
+                    lane_bytes: arr.lane_bytes * 2,
+                    q: true,
+                    float: false,
+                    scalar: false,
+                };
+                // `sshll2` reads the source's upper half; `sshll` the lower.
+                let widened = self.b.def(Expr::VCvt {
+                    op: if arr.q {
+                        VCvtOp::ExtendHigh { signed }
+                    } else {
+                        VCvtOp::ExtendLow { signed }
+                    },
+                    from: lane,
+                    a,
+                    b: None,
+                });
+                let r = if shift == 0 {
+                    widened
+                } else {
+                    self.b.def(Expr::VShift {
+                        op: VShiftOp::Shl,
+                        lane: Self::lane_of(wide),
+                        a: widened,
+                        amount,
+                    })
+                };
+                self.b.write(GuestReg::V128(vd.0), r);
+                return Flow::Next;
+            }
+            VShiftImmOp::Shrn => {
+                // The source lanes are twice as wide as `arr` describes.
+                let wide = VArr {
+                    lane_bytes: arr.lane_bytes * 2,
+                    q: true,
+                    float: false,
+                    scalar: false,
+                };
+                let shifted = if shift == 0 {
+                    a
+                } else {
+                    self.b.def(Expr::VShift {
+                        op: VShiftOp::ShrU,
+                        lane: Self::lane_of(wide),
+                        a,
+                        amount,
+                    })
+                };
+                // `shrn` truncates rather than saturating, so mask each wide
+                // lane down before packing the halves together.
+                let mut mask = [0u8; 16];
+                for (i, slot) in mask.iter_mut().enumerate() {
+                    if (i as u32 % (arr.lane_bytes * 2)) < arr.lane_bytes {
+                        *slot = 0xff;
+                    }
+                }
+                let m = self.b.def(Expr::VConst(Box::new(mask)));
+                let masked = self.b.def(Expr::VBin {
+                    op: VBinOp::And,
+                    a: shifted,
+                    b: m,
+                });
+                let packed = self.b.def(Expr::VCvt {
+                    op: VCvtOp::NarrowSat { signed: false },
+                    from: Self::lane_of(wide),
+                    a: masked,
+                    b: Some(masked),
+                });
+                if arr.q {
+                    // `shrn2` fills the destination's upper half.
+                    let old = self.b.read(GuestReg::V128(vd.0));
+                    let mut sel = [0u8; 16];
+                    for (i, slot) in sel.iter_mut().enumerate() {
+                        *slot = if i < 8 { i as u8 } else { (16 + i - 8) as u8 };
+                    }
+                    let r = self.b.def(Expr::VShuffle {
+                        lanes: Box::new(sel),
+                        a: old,
+                        b: packed,
+                    });
+                    self.b.write(GuestReg::V128(vd.0), r);
+                } else {
+                    let r = self.narrow_to_64(packed, false);
+                    self.b.write(GuestReg::V128(vd.0), r);
+                }
+                return Flow::Next;
+            }
         };
         let r = self.b.def(Expr::VShift {
             op: sop,
@@ -2228,6 +2658,58 @@ impl<'a> Lifter<'a> {
         });
         self.commit_vector(vd, arr, r);
         Flow::Next
+    }
+
+    /// Convert every lane between integer and floating point.
+    ///
+    /// wasm's SIMD conversions only cover 32-bit lanes: there is no
+    /// `f64x2.convert_i64x2_s` and no `i64x2.trunc_sat_f64x2_s`. For the
+    /// 64-bit arrangements the two lanes are therefore converted one at a
+    /// time with the scalar instructions, which is still branch-free.
+    fn lane_convert(
+        &mut self,
+        arr: VArr,
+        a: Value,
+        kind: FpConvert,
+        signed: bool,
+    ) -> Value {
+        if arr.lane_bytes != 8 {
+            let to_fp = matches!(kind, FpConvert::IntToFp { .. });
+            let lane = Self::lane_of(arr);
+            return self.b.def(Expr::VCvt {
+                op: if to_fp {
+                    VCvtOp::IntToFp { signed }
+                } else {
+                    VCvtOp::FpToIntSat { signed }
+                },
+                from: if to_fp { lane.as_int() } else { lane },
+                a,
+                b: None,
+            });
+        }
+        let mut out = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+        for lane in 0..2 {
+            let x = self.b.def(Expr::VExtract {
+                a,
+                lane,
+                lane_bytes: 8,
+                signed: false,
+                ty: Ty::I64,
+            });
+            let c = self.b.def(Expr::FpCvt {
+                kind,
+                src_wide: true,
+                dst_wide: true,
+                a: x,
+            });
+            out = self.b.def(Expr::VReplace {
+                a: out,
+                lane,
+                lane_bytes: 8,
+                val: c,
+            });
+        }
+        out
     }
 
     /// The four flags an `fcmp` installs, shared with `fccmp`.

@@ -732,7 +732,10 @@ fn decode_load_store(raw: u32, pc: u64) -> Inst {
                 order: Ordering::None,
             },
             // PRFM (literal).
-            _ => Inst::Prefetch { addr },
+            _ => Inst::Prefetch {
+                addr,
+                hint: bits(raw, 4, 0) as u8,
+            },
         };
     }
     // Load/store pair: opc 101 V idx L imm7 Rt2 Rn Rt
@@ -762,6 +765,10 @@ fn decode_load_store(raw: u32, pc: u64) -> Inst {
     if bit(raw, 31) == 0 && bits(raw, 29, 24) == 0b001100 {
         return decode_simd_ldst_multi(raw);
     }
+    // Advanced SIMD load/store single structure.
+    if bit(raw, 31) == 0 && bits(raw, 29, 24) == 0b001101 {
+        return decode_simd_ldst_single(raw);
+    }
     Inst::Unknown { raw }
 }
 
@@ -776,13 +783,15 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
     let rm = bits(raw, 20, 16);
     let opcode = bits(raw, 15, 12);
 
-    // Only the non-interleaving forms; the register count is encoded in the
-    // opcode rather than as a field.
+    // The register count is encoded in the opcode rather than as a field.
+    // `ld2`/`st2` (opcode 1000) also live here but interleave, so they get
+    // their own instruction below.
     let regs: u8 = match opcode {
         0b0111 => 1,
         0b1010 => 2,
         0b0110 => 3,
         0b0010 => 4,
+        0b1000 => 0,
         _ => return Inst::Unknown { raw },
     };
     if !post_index && rm != 0 {
@@ -793,7 +802,8 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
     let addr = if post_index {
         // Rm == 31 means the immediate form: advance by the total size.
         let off = if rm == 0b11111 {
-            (regs as i64) * bytes as i64
+            // `ld2` reports zero registers but moves two.
+            (if regs == 0 { 2 } else { regs as i64 }) * bytes as i64
         } else {
             // The register-offset post-index form needs a value the lifter
             // would have to read; it does not appear in compiler output.
@@ -804,6 +814,15 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
         AddrMode::Offset { rn, off: 0 }
     };
     let vt = VReg(bits(raw, 4, 0) as u8);
+    if regs == 0 {
+        return Inst::VLoadStore2 {
+            load,
+            lane_bytes: 1 << bits(raw, 11, 10),
+            bytes,
+            vt,
+            addr,
+        };
+    }
     if load {
         Inst::VLoadMulti {
             regs,
@@ -818,6 +837,61 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
             bytes,
             addr,
         }
+    }
+}
+
+/// `ld1`/`st1` on one lane, and `ld1r`.
+///
+/// The lane index is scattered across Q, S and `size` in a way that depends on
+/// the element width, because a byte arrangement has sixteen lanes to name.
+fn decode_simd_ldst_single(raw: u32) -> Inst {
+    let q = bit(raw, 30) == 1;
+    let post_index = bit(raw, 23) == 1;
+    let load = bit(raw, 22) == 1;
+    // R selects the paired `ld2`/`ld2r` forms, which are not handled here.
+    if bit(raw, 21) != 0 {
+        return Inst::Unknown { raw };
+    }
+    let rm = bits(raw, 20, 16);
+    let opcode = bits(raw, 15, 13);
+    let s = bit(raw, 12);
+    let size = bits(raw, 11, 10);
+    let qb = q as u32;
+
+    let (lane_bytes, index, replicate) = match opcode {
+        0b000 => (1, qb << 3 | s << 2 | size, false),
+        0b010 if size & 1 == 0 => (2, qb << 2 | s << 1 | (size >> 1), false),
+        0b100 if size == 0b00 => (4, qb << 1 | s, false),
+        0b100 if size == 0b01 && s == 0 => (8, qb, false),
+        // `ld1r`, which has no index: `size` is simply the element width.
+        0b110 if load => (1 << size, 0, true),
+        _ => return Inst::Unknown { raw },
+    };
+    if !post_index && rm != 0 {
+        return Inst::Unknown { raw };
+    }
+    let rn = RegSel::sp(bits(raw, 9, 5));
+    let addr = if post_index {
+        // Only the immediate form appears in compiler output; it advances by
+        // exactly the element just transferred.
+        if rm != 0b11111 {
+            return Inst::Unknown { raw };
+        }
+        AddrMode::PostIndex {
+            rn,
+            off: lane_bytes as i64,
+        }
+    } else {
+        AddrMode::Offset { rn, off: 0 }
+    };
+    Inst::VLoadStoreLane {
+        load,
+        replicate,
+        lane_bytes,
+        index,
+        q,
+        vt: VReg(bits(raw, 4, 0) as u8),
+        addr,
     }
 }
 
@@ -930,10 +1004,10 @@ fn build_ldst(kind: LdSt, rt: RegSel, addr: AddrMode, order: Ordering, raw: u32)
             addr,
             order,
         },
-        LdSt::Prefetch => {
-            let _ = raw;
-            Inst::Prefetch { addr }
-        }
+        LdSt::Prefetch => Inst::Prefetch {
+            addr,
+            hint: bits(raw, 4, 0) as u8,
+        },
     }
 }
 
@@ -1203,13 +1277,18 @@ fn decode_simd_fp(raw: u32) -> Inst {
     let q = bit(raw, 30) == 1;
     let u = bit(raw, 29);
 
-    // Advanced SIMD copy: 0 Q op 01110000 imm5 0 imm4 1 Rn Rd
+    // Advanced SIMD copy: 0 Q op 01110000 imm5 0 imm4 1 Rn Rd, and its
+    // scalar sibling, which differs only in bit 28 and takes the single-lane
+    // `dup` out of it.
     if bit(raw, 31) == 0
-        && bits(raw, 28, 21) == 0b0111_0000
+        && bits(raw, 27, 21) == 0b111_0000
         && bit(raw, 15) == 0
         && bit(raw, 10) == 1
     {
-        return decode_simd_copy(raw, q, u);
+        let scalar = bit(raw, 28) == 1;
+        if !scalar || (q && u == 0 && bits(raw, 14, 11) == 0) {
+            return decode_simd_copy(raw, q, u, scalar);
+        }
     }
 
     // Advanced SIMD modified immediate: 0 Q op 0111100000 abc cmode o2 1 defgh Rd
@@ -1226,8 +1305,24 @@ fn decode_simd_fp(raw: u32) -> Inst {
         return Inst::VMoveImm {
             vd: VReg(bits(raw, 4, 0) as u8),
             value,
-            inverted: u == 1 && cmode != 0b1110,
+            // `cmode` 1110 is `movi`/`movi`-of-bytes and 1111 is `fmov`;
+            // only the numeric families below them have an inverting form.
+            inverted: u == 1 && cmode < 0b1110,
+            fp_lane_bytes: (cmode == 0b1111).then(|| if u == 1 { 8 } else { 4 }),
+            cmode: cmode as u8,
+            imm8: imm8 as u8,
+            q,
+            op: u == 1,
         };
+    }
+
+    // Advanced SIMD vector x indexed element: 0 Q U 01111 size L M Rm opcode
+    // H 0 Rn Rd. Bit 10 is what separates it from the shift-by-immediate and
+    // modified-immediate groups above, which both set it.
+    if bit(raw, 31) == 0 && bits(raw, 28, 24) == 0b01111 && bit(raw, 10) == 0 {
+        if let Some(inst) = decode_simd_by_element(raw, q, u) {
+            return inst;
+        }
     }
 
     // Advanced SIMD shift by immediate: 0 Q U 011110 immh immb opcode 1 Rn Rd
@@ -1235,6 +1330,19 @@ fn decode_simd_fp(raw: u32) -> Inst {
         let immh = bits(raw, 22, 19);
         if immh != 0 {
             return decode_simd_shift_imm(raw, q, u, immh, bits(raw, 18, 16));
+        }
+    }
+
+    // Advanced SIMD three different: 0 Q U 01110 size 1 Rm opcode 00 Rn Rd.
+    // Bits 11:10 being zero is what marks it out from the three-same group,
+    // which shares everything above them.
+    if bit(raw, 31) == 0
+        && bits(raw, 28, 24) == 0b01110
+        && bit(raw, 21) == 1
+        && bits(raw, 11, 10) == 0
+    {
+        if let Some(inst) = decode_simd_three_different(raw, q, u) {
+            return inst;
         }
     }
 
@@ -1422,7 +1530,7 @@ fn lane_from_size(size: u32) -> Option<u32> {
     }
 }
 
-fn decode_simd_copy(raw: u32, q: bool, u: u32) -> Inst {
+fn decode_simd_copy(raw: u32, q: bool, u: u32, scalar: bool) -> Inst {
     let imm5 = bits(raw, 20, 16);
     let imm4 = bits(raw, 14, 11);
 
@@ -1442,7 +1550,19 @@ fn decode_simd_copy(raw: u32, q: bool, u: u32) -> Inst {
         if !to_vector && lane_bytes == 8 && !q {
             return Inst::Undefined { raw };
         }
-        let int_sz = if q { Sz::X } else { Sz::W };
+        // For `ins` the source register's width follows the element, not Q,
+        // which the encoding leaves free. `smov`/`umov` do use Q.
+        let int_sz = if to_vector {
+            if lane_bytes == 8 {
+                Sz::X
+            } else {
+                Sz::W
+            }
+        } else if q {
+            Sz::X
+        } else {
+            Sz::W
+        };
         return Inst::VMoveLane {
             to_vector,
             signed,
@@ -1500,10 +1620,54 @@ fn decode_simd_copy(raw: u32, q: bool, u: u32) -> Inst {
                 lane_bytes,
                 index,
                 q,
+                scalar,
             }
         }
         _ => Inst::Unknown { raw },
     }
+}
+
+/// The three-different group, whose results are twice as wide as its inputs.
+///
+/// `Q` here does not select the register width -- the destination is always
+/// 128 bits -- but which half of the narrow sources is read, which is the `2`
+/// suffix in the assembly.
+fn decode_simd_three_different(raw: u32, q: bool, u: u32) -> Option<Inst> {
+    let op = match bits(raw, 15, 12) {
+        0b0000 => VWidenOp::AddL,
+        0b0001 => VWidenOp::AddW,
+        0b0010 => VWidenOp::SubL,
+        0b0011 => VWidenOp::SubW,
+        0b0101 => VWidenOp::AbaL,
+        0b0111 => VWidenOp::AbdL,
+        0b1000 => VWidenOp::MlaL,
+        0b1010 => VWidenOp::MlsL,
+        0b1100 => VWidenOp::MulL,
+        // The halving-narrow, saturating-doubling and polynomial forms share
+        // this space but do something else entirely.
+        _ => return None,
+    };
+    // A 64-bit source lane would give a 128-bit result, which does not exist.
+    let lane_bytes = match bits(raw, 23, 22) {
+        0b00 => 1,
+        0b01 => 2,
+        0b10 => 4,
+        _ => return None,
+    };
+    Some(Inst::VWiden {
+        op,
+        arr: VArr {
+            lane_bytes,
+            q,
+            float: false,
+            scalar: false,
+        },
+        upper: q,
+        signed: u == 0,
+        vd: VReg(bits(raw, 4, 0) as u8),
+        vn: VReg(bits(raw, 9, 5) as u8),
+        vm: VReg(bits(raw, 20, 16) as u8),
+    })
 }
 
 fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
@@ -1652,6 +1816,18 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
     // above 0b11000, plus the compare-with-zero and sign block when bit 23
     // marks it as the second size pair. `rev64 v0.4s` has size = 10 and would
     // be misread as floating point by a bit-23 test alone.
+    // `fcvtl`/`fcvtn` change the lane width, so they cannot share the
+    // same-shape lowering the rest of this group uses.
+    if u == 0 && matches!(opcode, 0b10110 | 0b10111) {
+        return Inst::VFpCvtPrecision {
+            widen: opcode == 0b10111,
+            narrow_bytes: if bit(raw, 22) == 1 { 4 } else { 2 },
+            upper: q,
+            vd,
+            vn,
+        };
+    }
+
     let fp_high = opcode >= 0b11000;
     let fp_low = bit(raw, 23) == 1 && (0b01100..=0b01111).contains(&opcode);
     if fp_high || fp_low {
@@ -1856,6 +2032,50 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
 /// multiply-add, and within `11110` bits `[11:10]` choose the family, with
 /// integer conversion recognised first because it is the only member whose
 /// bit 31 is `sf` rather than a fixed zero.
+/// The by-element multiply family.
+///
+/// The lane index is spread across three fields and assembled differently for
+/// each element width, because a 16-bit arrangement has eight lanes to address
+/// and only five register bits to spare.
+fn decode_simd_by_element(raw: u32, q: bool, u: u32) -> Option<Inst> {
+    let opcode = bits(raw, 15, 12);
+    let float = matches!(opcode, 0b0001 | 0b0101 | 0b1001);
+    let op = match (u, opcode) {
+        (0, 0b0001) => VOp3::FMla,
+        (0, 0b0101) => VOp3::FMls,
+        (0, 0b1001) => VOp3::FMul,
+        (1, 0b1001) => VOp3::FMulx,
+        (0, 0b1000) => VOp3::Mul,
+        (1, 0b0000) => VOp3::Mla,
+        (1, 0b0100) => VOp3::Mls,
+        _ => return None,
+    };
+    let size = bits(raw, 23, 22);
+    let m = bit(raw, 20);
+    let h = bit(raw, 11);
+    let l = bit(raw, 21);
+    // Half precision has no wasm lane type, so it stays undecoded.
+    let (lane_bytes, index, vm) = match (size, float) {
+        (0b01, false) => (2, h << 2 | l << 1 | m, bits(raw, 19, 16)),
+        (0b10, _) => (4, h << 1 | l, m << 4 | bits(raw, 19, 16)),
+        (0b11, true) => (8, h, m << 4 | bits(raw, 19, 16)),
+        _ => return None,
+    };
+    Some(Inst::VByElement {
+        op,
+        arr: VArr {
+            lane_bytes,
+            q,
+            float,
+            scalar: false,
+        },
+        vd: VReg(bits(raw, 4, 0) as u8),
+        vn: VReg(bits(raw, 9, 5) as u8),
+        vm: VReg(vm as u8),
+        index,
+    })
+}
+
 fn decode_scalar_fp(raw: u32) -> Inst {
     let group = bits(raw, 28, 24);
     if group == 0b11111 {
@@ -1933,8 +2153,16 @@ fn decode_scalar_fp(raw: u32) -> Inst {
             }
             Inst::Unknown { raw }
         }
-        // Floating-point conditional compare.
-        0b01 => Inst::Unknown { raw },
+        // Floating-point conditional compare. The `E` variant differs only in
+        // which NaNs raise, which gex does not model, so both decode alike.
+        0b01 => Inst::FpCondCompare {
+            sz,
+            vn,
+            vm,
+            nzcv: bits(raw, 3, 0) as u8,
+            cond: Cond(bits(raw, 15, 12) as u8),
+            signalling: bit(raw, 4) == 1,
+        },
         0b10 => {
             let op = match bits(raw, 15, 12) {
                 0b0000 => FpOp2::Mul,

@@ -639,7 +639,21 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             let rsz = if sz == MemSz::D { Sz::X } else { Sz::W };
             format!("stp {}, {}, {}", reg(rt, rsz), reg(rt2, rsz), addr_str(addr))
         }
-        Inst::Prefetch { ref addr } => format!("prfm {}", addr_str(addr)),
+        Inst::Prefetch { ref addr, hint } => {
+            // `Rt` is really three fields: what to prefetch, into which cache
+            // level, and whether to keep it there.
+            let kind = ["pld", "pli", "pst", "#"][(hint >> 3) as usize & 3];
+            let name = if kind == "#" {
+                format!("#0x{hint:x}")
+            } else {
+                format!(
+                    "{kind}l{}{}",
+                    ((hint >> 1) & 3) + 1,
+                    if hint & 1 == 1 { "strm" } else { "keep" }
+                )
+            };
+            format!("prfm {name}, {}", addr_str(addr))
+        }
 
         Inst::VLoad {
             bytes,
@@ -689,11 +703,59 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             vd,
             value,
             inverted,
-        } => format!(
-            "{} v{}, #0x{value:x}",
-            if inverted { "mvni" } else { "movi" },
-            vd.0
-        ),
+            fp_lane_bytes,
+            cmode,
+            imm8,
+            q,
+            op,
+        } => match fp_lane_bytes {
+            // The floating-point form does know its arrangement, because
+            // `cmode` fixes the lane width and Q the count.
+            Some(lb) => {
+                let lanes = (if q { 16 } else { 8 }) / lb;
+                let v = if lb == 8 {
+                    f64::from_bits(value as u64)
+                } else {
+                    f32::from_bits(value as u32) as f64
+                };
+                format!(
+                    "fmov v{}.{lanes}{}, #{}",
+                    vd.0,
+                    lane_letter(lb),
+                    fp_imm_text(v)
+                )
+            }
+            None => {
+                let m = if inverted { "mvni" } else { "movi" };
+                let (lane_bytes, shift, msl) = match (cmode >> 1, cmode & 1) {
+                    (c, 0) if c < 4 => (4, 8 * c as u32, false),
+                    (c, 0) if (4..6).contains(&c) => (2, 8 * (c as u32 - 4), false),
+                    (6, _) => (4, 8 * (1 + (cmode as u32 & 1)), true),
+                    // `cmode` 1110 with op set is the only 64-bit lane form,
+                    // and the only one whose immediate is worth printing whole.
+                    (7, _) if op => {
+                        return if q {
+                            format!("movi v{}.2d, #0x{:x}", vd.0, value as u64)
+                        } else {
+                            format!("movi d{}, #0x{:x}", vd.0, value as u64)
+                        };
+                    }
+                    _ => (1, 0, false),
+                };
+                let arr = VArr {
+                    lane_bytes,
+                    q,
+                    float: false,
+                    scalar: false,
+                };
+                let tail = match (shift, msl) {
+                    (0, false) => String::new(),
+                    (s, false) => format!(", lsl #{s}"),
+                    (s, true) => format!(", msl #{s}"),
+                };
+                format!("{m} v{}.{}, #0x{imm8:x}{tail}", vd.0, arr.suffix())
+            }
+        },
         Inst::FpDataProc1 { sz, op, vd, vn } => {
             let m = match op {
                 FpOp1::Mov => "fmov",
@@ -770,7 +832,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             } else {
                 f32::from_bits(bits as u32) as f64
             };
-            format!("fmov {}, #{value:e}", freg(vd, sz))
+            format!("fmov {}, #{}", freg(vd, sz), fp_imm_text(value))
         }
         Inst::FpConvertPrecision { from, to, vd, vn } => {
             format!("fcvt {}, {}", freg(vd, to), freg(vn, from))
@@ -884,6 +946,47 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 .collect();
             format!("{m} {{{}}}, {}", list.join(", "), addr_str(addr))
         }
+        Inst::VLoadStoreLane {
+            load,
+            replicate,
+            lane_bytes,
+            index,
+            q,
+            vt,
+            ref addr,
+        } => {
+            let m = if load { "ld1" } else { "st1" };
+            let l = lane_letter(lane_bytes);
+            if replicate {
+                let lanes = (if q { 16 } else { 8 }) / lane_bytes;
+                format!("ld1r {{v{}.{lanes}{l}}}, {}", vt.0, addr_str(addr))
+            } else {
+                format!("{m} {{v{}.{l}}}[{index}], {}", vt.0, addr_str(addr))
+            }
+        }
+        Inst::VLoadStore2 {
+            load,
+            lane_bytes,
+            bytes,
+            vt,
+            ref addr,
+        } => {
+            let arr = VArr {
+                lane_bytes,
+                q: bytes == 16,
+                float: false,
+                scalar: false,
+            };
+            format!(
+                "{} {{v{}.{}, v{}.{}}}, {}",
+                if load { "ld2" } else { "st2" },
+                vt.0,
+                arr.suffix(),
+                (vt.0 + 1) % 32,
+                arr.suffix(),
+                addr_str(addr)
+            )
+        }
         Inst::VCnt { vd, vn, q } => {
             let w = if q { "16b" } else { "8b" };
             format!("cnt v{}.{w}, v{}.{w}", vd.0, vn.0)
@@ -938,8 +1041,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             vm,
         } => {
             let m = vop3_name(op);
-            let a = arr.suffix();
-            format!("{m} v{}.{a}, v{}.{a}, v{}.{a}", vd.0, vn.0, vm.0)
+            format!("{m} {}, {}, {}", areg(vd, arr), areg(vn, arr), areg(vm, arr))
         }
         Inst::VTwoMisc { op, arr, vd, vn } => {
             let m = vop2_name(op);
@@ -953,7 +1055,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                     | VOp2::CmLtZero
                     | VOp2::CmLeZero
             ) {
-                return format!("{m} v{}.{a}, v{}.{a}, #0", vd.0, vn.0);
+                return format!("{m} {}, {}, #0", areg(vd, arr), areg(vn, arr));
             }
             if matches!(
                 op,
@@ -963,7 +1065,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                     | VOp2::FCmLtZero
                     | VOp2::FCmLeZero
             ) {
-                return format!("{m} v{}.{a}, v{}.{a}, #0.0", vd.0, vn.0);
+                return format!("{m} {}, {}, #0.0", areg(vd, arr), areg(vn, arr));
             }
             // The narrowing forms name the wider source arrangement.
             if matches!(op, VOp2::Xtn | VOp2::SqXtn | VOp2::UqXtn) {
@@ -981,7 +1083,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                     wide.suffix()
                 );
             }
-            format!("{m} v{}.{a}, v{}.{a}", vd.0, vn.0)
+            format!("{m} {}, {}", areg(vd, arr), areg(vn, arr))
         }
         Inst::VPermute {
             op,
@@ -998,8 +1100,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 VPermOp::Zip1 => "zip1",
                 VPermOp::Zip2 => "zip2",
             };
-            let a = arr.suffix();
-            format!("{m} v{}.{a}, v{}.{a}, v{}.{a}", vd.0, vn.0, vm.0)
+            format!("{m} {}, {}, {}", areg(vd, arr), areg(vn, arr), areg(vm, arr))
         }
         Inst::VExt {
             vd,
@@ -1036,7 +1137,22 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             vn,
             lane_bytes,
             index,
+            q: _,
+            scalar: true,
+        } => format!(
+            "mov {}{}, v{}.{}[{index}]",
+            lane_letter(lane_bytes),
+            vd.0,
+            vn.0,
+            lane_letter(lane_bytes)
+        ),
+        Inst::VDupElement {
+            vd,
+            vn,
+            lane_bytes,
+            index,
             q,
+            scalar: false,
         } => {
             let arr = VArr {
                 lane_bytes,
@@ -1080,17 +1196,156 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 VShiftImmOp::UShll => "ushll",
                 VShiftImmOp::Shrn => "shrn",
             };
-            let a = arr.suffix();
-            format!("{m} v{}.{a}, v{}.{a}, #{shift}", vd.0, vn.0)
+            // The width-changing forms name two arrangements: the wide one
+            // is always a full 128 bits, and `sxtl`/`uxtl` are the aliases
+            // for a zero shift.
+            let wide = VArr {
+                lane_bytes: arr.lane_bytes * 2,
+                q: true,
+                float: false,
+                scalar: false,
+            };
+            match op {
+                VShiftImmOp::SShll | VShiftImmOp::UShll => {
+                    let signed = op == VShiftImmOp::SShll;
+                    if shift == 0 {
+                        format!(
+                            "{}xtl{} v{}.{}, v{}.{}",
+                            if signed { 's' } else { 'u' },
+                            if arr.q { "2" } else { "" },
+                            vd.0,
+                            wide.suffix(),
+                            vn.0,
+                            arr.suffix()
+                        )
+                    } else {
+                        format!(
+                            "{m}{} v{}.{}, v{}.{}, #{shift}",
+                            if arr.q { "2" } else { "" },
+                            vd.0,
+                            wide.suffix(),
+                            vn.0,
+                            arr.suffix()
+                        )
+                    }
+                }
+                VShiftImmOp::Shrn => format!(
+                    "{m}{} v{}.{}, v{}.{}, #{shift}",
+                    if arr.q { "2" } else { "" },
+                    vd.0,
+                    arr.suffix(),
+                    vn.0,
+                    wide.suffix()
+                ),
+                _ => {
+                    format!("{m} {}, {}, #{shift}", areg(vd, arr), areg(vn, arr))
+                }
+            }
         }
+        Inst::VByElement {
+            op,
+            arr,
+            vd,
+            vn,
+            vm,
+            index,
+        } => format!(
+            "{} v{}.{}, v{}.{}, v{}.{}[{index}]",
+            vop3_name(op),
+            vd.0,
+            arr.suffix(),
+            vn.0,
+            arr.suffix(),
+            vm.0,
+            arr.letter()
+        ),
+
+        Inst::VWiden {
+            op,
+            arr,
+            upper,
+            signed,
+            vd,
+            vn,
+            vm,
+        } => {
+            let m = match op {
+                VWidenOp::AddL => "addl",
+                VWidenOp::AddW => "addw",
+                VWidenOp::SubL => "subl",
+                VWidenOp::SubW => "subw",
+                VWidenOp::MulL => "mull",
+                VWidenOp::MlaL => "mlal",
+                VWidenOp::MlsL => "mlsl",
+                VWidenOp::AbdL => "abdl",
+                VWidenOp::AbaL => "abal",
+            };
+            let wide = VArr {
+                lane_bytes: arr.lane_bytes * 2,
+                q: true,
+                float: false,
+                scalar: false,
+            };
+            // The `w` forms take one wide operand and one narrow one.
+            let n_arr = if matches!(op, VWidenOp::AddW | VWidenOp::SubW) {
+                wide
+            } else {
+                arr
+            };
+            format!(
+                "{}{m}{} v{}.{}, v{}.{}, v{}.{}",
+                if signed { 's' } else { 'u' },
+                if upper { "2" } else { "" },
+                vd.0,
+                wide.suffix(),
+                vn.0,
+                n_arr.suffix(),
+                vm.0,
+                arr.suffix()
+            )
+        }
+
+        Inst::VFpCvtPrecision {
+            widen,
+            narrow_bytes,
+            upper,
+            vd,
+            vn,
+        } => {
+            let narrow = VArr {
+                lane_bytes: narrow_bytes,
+                q: upper,
+                float: true,
+                scalar: false,
+            };
+            let wide = VArr {
+                lane_bytes: narrow_bytes * 2,
+                q: true,
+                float: true,
+                scalar: false,
+            };
+            let (d, s) = if widen { (wide, narrow) } else { (narrow, wide) };
+            format!(
+                "fcvt{}{} v{}.{}, v{}.{}",
+                if widen { 'l' } else { 'n' },
+                if upper { "2" } else { "" },
+                vd.0,
+                d.suffix(),
+                vn.0,
+                s.suffix()
+            )
+        }
+
         Inst::FpCondCompare {
             sz,
             vn,
             vm,
             nzcv,
             cond,
+            signalling,
         } => format!(
-            "fccmp {}, {}, #{nzcv}, {}",
+            "fccmp{} {}, {}, #{nzcv}, {}",
+            if signalling { "e" } else { "" },
             freg(vn, sz),
             freg(vm, sz),
             cond.name()
@@ -1217,6 +1472,16 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
     }
 }
 
+/// Spell a register the way its arrangement demands: `v3.4s` for a vector
+/// arrangement, and the plain `s3` for a scalar one.
+fn areg(v: VReg, arr: VArr) -> String {
+    if arr.scalar {
+        format!("{}{}", arr.letter(), v.0)
+    } else {
+        format!("v{}.{}", v.0, arr.suffix())
+    }
+}
+
 fn lane_letter(lane_bytes: u32) -> char {
     match lane_bytes {
         1 => 'b',
@@ -1224,6 +1489,18 @@ fn lane_letter(lane_bytes: u32) -> char {
         4 => 's',
         _ => 'd',
     }
+}
+
+/// A floating-point immediate the way binutils prints one: C's `%.18e`,
+/// with a signed at-least-two-digit exponent.
+fn fp_imm_text(v: f64) -> String {
+    let s = format!("{v:.18e}");
+    let (mantissa, exp) = s.split_once('e').unwrap();
+    let (sign, digits) = match exp.strip_prefix('-') {
+        Some(d) => ('-', d),
+        None => ('+', exp),
+    };
+    format!("{mantissa}e{sign}{digits:0>2}")
 }
 
 fn vop3_name(op: VOp3) -> &'static str {
@@ -1254,6 +1531,7 @@ fn vop3_name(op: VOp3) -> &'static str {
         VOp3::FAdd => "fadd",
         VOp3::FSub => "fsub",
         VOp3::FMul => "fmul",
+        VOp3::FMulx => "fmulx",
         VOp3::FDiv => "fdiv",
         VOp3::FMax => "fmax",
         VOp3::FMin => "fmin",

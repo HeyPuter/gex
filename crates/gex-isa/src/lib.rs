@@ -663,6 +663,18 @@ pub enum Inst {
         vd: VReg,
         value: u128,
         inverted: bool,
+        /// Set for the `fmov` form (`cmode` 1111), which is spelled as a
+        /// floating-point immediate even though it moves the same bits.
+        fp_lane_bytes: Option<u32>,
+        /// The encoding fields, kept so the disassembler can reproduce the
+        /// arrangement and shift the assembler wrote rather than the expanded
+        /// register value.
+        cmode: u8,
+        imm8: u8,
+        q: bool,
+        /// The `op` bit. With `cmode` 1110 it picks the 64-bit form, whose
+        /// immediate is a byte mask rather than a lane value.
+        op: bool,
     },
     /// Scalar floating-point, one source.
     FpDataProc1 {
@@ -783,6 +795,29 @@ pub enum Inst {
         bytes: u32,
         addr: AddrMode,
     },
+    /// `ld1`/`st1` on a single lane, and `ld1r`, which broadcasts instead.
+    VLoadStoreLane {
+        load: bool,
+        /// `ld1r`: fill every lane rather than writing one.
+        replicate: bool,
+        lane_bytes: u32,
+        /// Which lane; meaningless when `replicate`.
+        index: u32,
+        /// Only affects `ld1r`, which must zero the upper half when clear.
+        q: bool,
+        vt: VReg,
+        addr: AddrMode,
+    },
+    /// `ld2`/`st2`: two registers' worth of memory, de-interleaved on the way
+    /// in and re-interleaved on the way out.
+    VLoadStore2 {
+        load: bool,
+        lane_bytes: u32,
+        /// Bytes per register: 8 or 16.
+        bytes: u32,
+        vt: VReg,
+        addr: AddrMode,
+    },
     /// `cnt` — per-byte population count.
     VCnt { vd: VReg, vn: VReg, q: bool },
     /// `bsl`/`bit`/`bif`.
@@ -834,13 +869,15 @@ pub enum Inst {
         /// `tbx` leaves out-of-range lanes unchanged instead of zeroing them.
         is_tbx: bool,
     },
-    /// `dup vd, vn.<T>[index]`.
+    /// `dup vd, vn.<T>[index]`, and the scalar form binutils spells `mov`,
+    /// which copies the one lane and zeroes the rest of the register.
     VDupElement {
         vd: VReg,
         vn: VReg,
         lane_bytes: u32,
         index: u32,
         q: bool,
+        scalar: bool,
     },
     /// `ins vd.<T>[dst], vn.<T>[src]`.
     VInsElement {
@@ -858,6 +895,43 @@ pub enum Inst {
         vn: VReg,
         shift: u32,
     },
+    /// The by-element forms: `fmla v0.4s, v1.4s, v2.s[3]` and friends, where
+    /// one lane of `vm` is broadcast across the multiply. Encoded separately
+    /// from the three-same group but semantically identical once the lane is
+    /// splatted, so it reuses `VOp3`.
+    VByElement {
+        op: VOp3,
+        arr: VArr,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+        index: u32,
+    },
+    /// The three-different group: `smull`, `uaddw`, `saddl` and friends,
+    /// whose destination lanes are twice the width of their sources'.
+    VWiden {
+        op: VWidenOp,
+        /// The *source* arrangement. The destination has half as many lanes,
+        /// each twice as wide.
+        arr: VArr,
+        /// Read the upper half of the narrow sources (the `2` suffix).
+        upper: bool,
+        signed: bool,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+    },
+    /// `fcvtl`/`fcvtn`: change floating-point precision across a vector.
+    VFpCvtPrecision {
+        /// Widen (`fcvtl`) rather than narrow (`fcvtn`).
+        widen: bool,
+        /// The narrow side's lane width: 2 for half, 4 for single.
+        narrow_bytes: u32,
+        /// Operate on the upper half (the `2` suffix).
+        upper: bool,
+        vd: VReg,
+        vn: VReg,
+    },
     /// `fccmp`/`fccmpe`: conditional floating-point compare.
     FpCondCompare {
         sz: FpSz,
@@ -865,6 +939,9 @@ pub enum Inst {
         vm: VReg,
         nzcv: u8,
         cond: Cond,
+        /// The `e` form, which signals on a quiet NaN too. gex does not model
+        /// floating-point exceptions, so this only changes the mnemonic.
+        signalling: bool,
     },
     /// Reduce every lane into the destination's lowest lane.
     VAcross {
@@ -899,7 +976,8 @@ pub enum Inst {
         addr: AddrMode,
     },
     /// `prfm` — prefetch; a no-op for us but must not decode as Unknown.
-    Prefetch { addr: AddrMode },
+    /// `hint` is the `Rt` field: type, cache level and policy.
+    Prefetch { addr: AddrMode, hint: u8 },
 
     /// `ldxr`/`ldaxr` — load-exclusive, arms the local monitor.
     LoadExclusive {
@@ -1080,6 +1158,8 @@ pub enum VOp3 {
     FAdd,
     FSub,
     FMul,
+    /// `fmulx`: like `fmul` except that zero times infinity is two.
+    FMulx,
     FDiv,
     FMax,
     FMin,
@@ -1154,6 +1234,27 @@ pub enum VOp2 {
     /// Narrow to half width, saturating.
     SqXtn,
     UqXtn,
+}
+
+/// The three-different group's operations, named for what they do to the
+/// widened lanes rather than for each signed/unsigned spelling.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VWidenOp {
+    /// `saddl`: widen both operands, then add.
+    AddL,
+    /// `saddw`: widen only the second operand.
+    AddW,
+    SubL,
+    SubW,
+    /// `smull`: widen both, then multiply.
+    MulL,
+    /// `smlal`: widen both, multiply, accumulate into the destination.
+    MlaL,
+    MlsL,
+    /// `sabdl`: widen both, then absolute difference.
+    AbdL,
+    /// `sabal`: as `abdl`, accumulating.
+    AbaL,
 }
 
 /// Across-lane reductions.

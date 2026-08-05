@@ -118,6 +118,11 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/signals" "$HERE/programs/signals.c"
 "$CC" -static -no-pie -O3 -o "$WORK/vector" "$HERE/programs/vector.c"
 "$CC" -static -O3 -o "$WORK/vector-pie" "$HERE/programs/vector.c"
+# -ffast-math lets the vectoriser reach the by-element multiplies and the
+# widening conversions; neon2 drives the structure loads through intrinsics
+# so they are exercised even when gcc would not choose them.
+"$CC" -static -no-pie -O3 -ffast-math -o "$WORK/numeric" "$HERE/programs/numeric.c" -lm
+"$CC" -static -no-pie -O2 -o "$WORK/neon2" "$HERE/programs/neon2.c"
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
 # .eh_frame through personality routines -- a very different code shape from
 # anything the C programs reach.
@@ -177,6 +182,8 @@ for mode in fatal-default fatal-abort; do
 done
 compare "vector-O3" "$WORK/vector"
 compare "vector-pie" "$WORK/vector-pie"
+compare "numeric" "$WORK/numeric"
+compare "neon-structure" "$WORK/neon2"
 [ -n "$CPP" ] && compare "cpp-static" "$WORK/cpp"
 
 if [ -n "$DYNAMIC" ]; then
@@ -198,6 +205,7 @@ for area in arith float mem flow; do
     compare "nojit-$area" "$WORK/suite" "$area"
 done
 compare "nojit-vector" "$WORK/vector"
+compare "nojit-neon-structure" "$WORK/neon2"
 GEXC_ARGS=""
 
 echo

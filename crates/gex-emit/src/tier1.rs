@@ -1304,10 +1304,17 @@ fn lane_cvt_op(op: VCvtOp, from: VLane) -> u32 {
         (VCvtOp::FpToIntSat { signed: true }, VLane::F32) => 0xf8,
         (VCvtOp::FpToIntSat { signed: false }, VLane::F32) => 0xf9,
         // The f64 forms produce two lanes and zero the upper two.
-        (VCvtOp::FpToIntSat { signed: true }, _) => 0xfc,
-        (VCvtOp::FpToIntSat { signed: false }, _) => 0xfd,
+        (VCvtOp::FpToIntSat { signed: true }, VLane::F64) => 0xfc,
+        (VCvtOp::FpToIntSat { signed: false }, VLane::F64) => 0xfd,
         (VCvtOp::IntToFp { signed: true }, VLane::I32) => 0xfa,
         (VCvtOp::IntToFp { signed: false }, VLane::I32) => 0xfb,
+        // wasm has no i64x2 <-> f64x2 conversion, so the lifter must never
+        // ask for one; `f64x2.convert_low_i32x4_s` is not a substitute.
+        (VCvtOp::IntToFp { signed: true }, VLane::I64)
+        | (VCvtOp::IntToFp { signed: false }, VLane::I64)
+        | (VCvtOp::FpToIntSat { .. }, _) => {
+            panic!("no wasm SIMD conversion for {op:?} from {from:?}")
+        }
         (VCvtOp::IntToFp { signed: true }, _) => 0xfe,
         (VCvtOp::IntToFp { signed: false }, _) => 0xff,
         (VCvtOp::DemoteF64, _) => 0x5e,
