@@ -1564,7 +1564,8 @@ fn vop2_name(op: VOp2) -> &'static str {
     match op {
         VOp2::Neg => "neg",
         VOp2::Abs => "abs",
-        VOp2::Not => "not",
+        // binutils prefers the `mvn` alias for the vector bitwise NOT.
+        VOp2::Not => "mvn",
         VOp2::Cnt => "cnt",
         VOp2::Clz => "clz",
         VOp2::Cls => "cls",

@@ -175,7 +175,12 @@ consistent one:
 $ tests/integration/run.sh
 ```
 
-**Real programs.** Lua 5.4.6 runs a script exercising the parts of a language
+**Real programs.** BusyBox 1.36.1, built static, runs `sort`, `awk`, `sed`,
+`grep`, `tr`, `uniq`, `head`, `tail`, `wc`, `expr`, `date`, `basename`,
+`md5sum`, `sha256sum` and a `gzip`/`gunzip` round trip through a pipe. Every
+line matches QEMU's, and all 246,949 of its instructions disassemble exactly.
+
+Lua 5.4.6 runs a script exercising the parts of a language
 runtime that stress a translator: the interpreter's computed-goto dispatch,
 recursive `fib`, a 100k-element sort, string interning and pattern matching,
 metatables and inheritance, closures, coroutines, `pcall` (which is `longjmp`
@@ -187,9 +192,11 @@ script covering recursive CTEs, indexes, joins, full-text search, JSON
 extraction, a transaction and its rollback, and `ANALYZE`. Output is identical
 to QEMU's, and with `randomblob` replaced by `zeroblob` so the run is
 deterministic, the 1.4 MB database file the two engines produce is byte-for-byte
-the same. Across libstdc++, libgfortran, SQLite and Lua — 853,336 instructions — the
-disassembler reproduces every one exactly, with no undecoded instructions and
-no operand-text differences from binutils.
+the same. Across libstdc++, libgfortran, SQLite, Lua and BusyBox — 1.1 million
+instructions — the disassembler reproduces every one exactly, with no
+undecoded instructions and no operand-text differences from binutils. Over the
+whole 1.34-million-instruction corpus, including the system libraries'
+feature-gated paths, 111 remain undecoded and 2 differ in operand text.
 
 **Cross-engine, on V8.** The native host runs on wasmtime; the browser target
 is V8. Tail calls are load-bearing enough that a difference between the two
@@ -360,6 +367,51 @@ conditions consumed one and two edges away from their compare, across a call,
 through `adc` and `ccmp`, and as a loop's exit test. With the analysis
 deliberately broken to treat every flag as dead, that program hangs — which is
 the point of having it.
+
+---
+
+## Threads: what is done and what is not
+
+Guest threads are not implemented yet. The prerequisite is, and the shape of
+the rest is settled, so this records it rather than leaving it to be
+rediscovered.
+
+The ABI already reserves a register context per thread — `ctx_addr(slot)`,
+with `TID` and `INTERRUPT` among the per-thread fields — and every translated
+function takes its context as a parameter, so a thread is just a call to
+`enter` with a different one. Two things follow from wasmtime's model:
+
+* **A `Store` is `!Sync`**, so each guest thread needs its own, and therefore
+  its own instances and its own dispatch table. Instances of the same `Module`
+  populate their tables identically from the same element segments, so the
+  tables agree without being shared.
+* **A module-defined memory belongs to its instance.** The guest's memory is
+  therefore host-created, shared, and imported by every module. *This part is
+  done* — see the section above — and costs no measurable throughput.
+
+What remains:
+
+1. **The kernel behind a lock.** `Kernel` mixes process state (descriptors,
+   the VMA tree, mounts, signal dispositions) with three per-thread fields
+   (`ctx_addr`, `tid`, `clear_child_tid`). The process state becomes
+   `Arc<Mutex<Kernel>>`; the per-thread fields move into the host's per-thread
+   state and are installed under the same lock that guards the syscall. The
+   futex table is already `Arc<FutexTable>` with its own locking, built for
+   this.
+2. **A registry of translated modules.** A new thread instantiates the image
+   module and then every runtime-translated module, replaying the funcref
+   installs the host did for each, so its table covers the same addresses. The
+   same registry answers a dispatch miss for code another thread already
+   translated — instantiate rather than retranslate.
+3. **`clone`.** Allocate a tid and a context slot, initialise the child's
+   context from the parent's with `x0 = 0`, the child stack and the TLS
+   pointer, then spawn a host thread that builds a store and calls `enter`.
+   Thread exit writes zero to `clear_child_tid` and futex-wakes it, which is
+   what `pthread_join` waits on.
+
+The reason this is not half-built in the tree is that a half-applied version
+of step 1 leaves nothing working, and the prerequisite is worth having on its
+own.
 
 ---
 
