@@ -175,15 +175,21 @@ consistent one:
 $ tests/integration/run.sh
 ```
 
-**A real program.** SQLite 3.45 built for aarch64-linux-musl — 285k lines of
+**Real programs.** Lua 5.4.6 runs a script exercising the parts of a language
+runtime that stress a translator: the interpreter's computed-goto dispatch,
+recursive `fib`, a 100k-element sort, string interning and pattern matching,
+metatables and inheritance, closures, coroutines, `pcall` (which is `longjmp`
+underneath), and the garbage collector. Output is identical to QEMU's.
+
+SQLite 3.45 built for aarch64-linux-musl — 285k lines of
 C, 290k guest instructions, FTS5 and JSON1 and R-Tree compiled in — runs a
 script covering recursive CTEs, indexes, joins, full-text search, JSON
 extraction, a transaction and its rollback, and `ANALYZE`. Output is identical
 to QEMU's, and with `randomblob` replaced by `zeroblob` so the run is
 deterministic, the 1.4 MB database file the two engines produce is byte-for-byte
-the same. Of its 281,189 instructions the disassembler reproduces 281,186
-exactly; the three it does not are two fixed-point converts and a scalar shift,
-none of them on any path the run takes.
+the same. Across libstdc++, libgfortran, SQLite and Lua — 853,336 instructions — the
+disassembler reproduces every one exactly, with no undecoded instructions and
+no operand-text differences from binutils.
 
 **Cross-engine, on V8.** The native host runs on wasmtime; the browser target
 is V8. Tail calls are load-bearing enough that a difference between the two
@@ -275,6 +281,14 @@ does something different every time is a recompile that never quite settles.
 `--no-cache` turns all of it off. `--lazy` is the opposite trade — discover
 only from the entry point and leave the rest to runtime translation, 33 s to
 9.5 s with nothing cached, which is what a genuinely one-shot run wants.
+
+The key includes a fingerprint of the running `gexc` — its size and
+modification time — and a build that cannot identify itself does not use the
+cache at all. This is not belt-and-braces. A decoder fix that makes an
+instruction translatable changes nothing else the key can see: not the guest
+image, not the options. Without the fingerprint the fixed binary reuses the
+broken module, and the failure looks exactly like the fix not working. It cost
+an hour of chasing a bug that was already repaired.
 
 Deserialising a compiled module is `unsafe`: the bytes become executable code
 with only a header check in the way. That is why `gex-cache` is a crate of its
@@ -371,10 +385,13 @@ deliberate trade recorded here so nobody has to rediscover it.
   requires modelling a case wasm's multiply does not distinguish.
 * **The remaining undecoded instructions** are `ld3`/`ld4`, the
   halving-narrow (`addhn`) and saturating-doubling (`sqdmulh`) multiplies,
-  half precision, and the fixed-point converts — 116 instructions across a
-  752k-instruction corpus of system libraries.
-* **CRC32 is not implemented.** gex does not advertise the extension in
-  `AT_HWCAP`, so no well-behaved guest emits it.
+  and the register-shift forms (`ushl`/`sshl`). Nothing in the corpus reaches
+  them.
+* **CRC32, half precision and SVE are not implemented.** None is advertised
+  in `AT_HWCAP`, so no well-behaved guest emits them. They do appear in
+  libgcc's and musl's feature-gated paths — 97 half-precision `fcvt`s and 14
+  SVE instructions across the system libraries — which is why the corpus
+  reports a handful of undecoded instructions that nothing reaches.
 * **`fcmpe` does not raise on quiet NaN**, because FP exceptions are not
   modelled at all.
 * **Protection changes do not invalidate translations.** A page rewritten

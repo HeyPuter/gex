@@ -29,13 +29,40 @@ use wasmtime::{Engine, Module};
 
 pub mod sha256;
 
-/// Bumped whenever a change to gex would make a cached artifact wrong.
+/// Bumped whenever the *layout* of a cache entry changes.
 ///
-/// The guest image is hashed, so this only has to cover gex itself. In a
-/// release build it would be the crate version; during development the git
-/// hash of the working tree is not available, so a mismatch is caught the
-/// blunt way — by bumping this.
-const FORMAT_VERSION: u32 = 1;
+/// What gex itself does to the guest is covered by [`build_fingerprint`], not
+/// by this.
+const FORMAT_VERSION: u32 = 2;
+
+/// Identifies the running gex build, so a change to the translator cannot be
+/// served stale code from a previous one.
+///
+/// This is not optional. A decoder fix that makes an instruction translatable
+/// changes nothing else the key can see — not the guest image, not the
+/// options — so without it the fixed binary reuses the broken module. That is
+/// exactly what happened the first time this cache existed, and the failure
+/// looked like the fix had not worked.
+///
+/// The executable's size and modification time rather than a hash of it: gexc
+/// is tens of megabytes, and a rebuild always changes both. `None` means the
+/// cache must not be used at all, because a build that cannot be identified
+/// cannot be told apart from a different one.
+pub fn build_fingerprint() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let meta = std::fs::metadata(&exe).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(format!(
+        "{}:{}.{}",
+        meta.len(),
+        mtime.as_secs(),
+        mtime.subsec_nanos()
+    ))
+}
 
 fn gex_cache_root() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
@@ -108,9 +135,11 @@ pub fn write_profile(dir: &Path, key: &str, found: &[u64], limit: usize) {
 ///
 /// Each field is length-prefixed, so no regrouping of the same bytes across
 /// fields can produce the same key.
-pub fn key<'a>(fields: impl IntoIterator<Item = &'a [u8]>) -> String {
+pub fn key<'a>(build: &str, fields: impl IntoIterator<Item = &'a [u8]>) -> String {
     let mut h = sha256::Sha256::new();
     h.update(&FORMAT_VERSION.to_le_bytes());
+    h.update(&(build.len() as u64).to_le_bytes());
+    h.update(build.as_bytes());
     for f in fields {
         h.update(&(f.len() as u64).to_le_bytes());
         h.update(f);
@@ -206,20 +235,35 @@ mod tests {
 
     #[test]
     fn the_key_covers_every_field() {
-        let a = key([b"program".as_slice(), b"opts".as_slice()]);
-        assert_eq!(a, key([b"program".as_slice(), b"opts".as_slice()]));
-        assert_ne!(a, key([b"program!".as_slice(), b"opts".as_slice()]));
-        assert_ne!(a, key([b"program".as_slice(), b"opts!".as_slice()]));
-        assert_ne!(a, key([b"program".as_slice()]));
+        let a = key("build", [b"program".as_slice(), b"opts".as_slice()]);
+        assert_eq!(a, key("build", [b"program".as_slice(), b"opts".as_slice()]));
+        assert_ne!(a, key("build", [b"program!".as_slice(), b"opts".as_slice()]));
+        assert_ne!(a, key("build", [b"program".as_slice(), b"opts!".as_slice()]));
+        assert_ne!(a, key("build", [b"program".as_slice()]));
         assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn a_different_gex_build_is_a_different_key() {
+        // The case this exists for: same program, same options, translator
+        // changed underneath.
+        assert_ne!(
+            key("build-a", [b"program".as_slice()]),
+            key("build-b", [b"program".as_slice()])
+        );
+    }
+
+    #[test]
+    fn the_running_build_is_identifiable() {
+        assert!(super::build_fingerprint().is_some());
     }
 
     #[test]
     fn field_boundaries_cannot_be_shifted() {
         // Without length prefixes these two would hash the same bytes.
         assert_ne!(
-            key([b"ab".as_slice(), b"c".as_slice()]),
-            key([b"a".as_slice(), b"bc".as_slice()])
+            key("b", [b"ab".as_slice(), b"c".as_slice()]),
+            key("b", [b"a".as_slice(), b"bc".as_slice()])
         );
     }
 

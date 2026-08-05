@@ -843,11 +843,13 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             signed,
             vd,
             rn,
+            fbits,
         } => format!(
-            "{} {}, {}",
+            "{} {}, {}{}",
             if signed { "scvtf" } else { "ucvtf" },
             freg(vd, sz),
-            reg(rn, int_sz)
+            reg(rn, int_sz),
+            fbits_suffix(fbits)
         ),
         Inst::FpToInt {
             sz,
@@ -856,6 +858,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             round,
             rd,
             vn,
+            fbits,
         } => {
             let r = match round {
                 FpRound::Nearest => 'n',
@@ -865,10 +868,11 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 FpRound::Away => 'a',
             };
             format!(
-                "fcvt{r}{} {}, {}",
+                "fcvt{r}{} {}, {}{}",
                 if signed { "s" } else { "u" },
                 reg(rd, int_sz),
-                freg(vn, sz)
+                freg(vn, sz),
+                fbits_suffix(fbits)
             )
         }
         Inst::FpMoveGeneral {
@@ -1479,6 +1483,16 @@ fn areg(v: VReg, arr: VArr) -> String {
         format!("{}{}", arr.letter(), v.0)
     } else {
         format!("v{}.{}", v.0, arr.suffix())
+    }
+}
+
+/// The `, #n` a fixed-point conversion carries, and nothing for the plain
+/// form.
+fn fbits_suffix(fbits: u32) -> String {
+    if fbits == 0 {
+        String::new()
+    } else {
+        format!(", #{fbits}")
     }
 }
 

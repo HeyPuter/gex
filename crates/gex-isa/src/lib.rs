@@ -729,6 +729,8 @@ pub enum Inst {
         vn: VReg,
     },
     /// `scvtf`/`ucvtf`: integer register to float register.
+    /// `scvtf`/`ucvtf`. With `fbits` non-zero this is the fixed-point form:
+    /// the integer is read as a value scaled by `2^fbits`.
     FpFromInt {
         sz: FpSz,
         /// Width of the source integer register.
@@ -736,6 +738,8 @@ pub enum Inst {
         signed: bool,
         vd: VReg,
         rn: RegSel,
+        /// Fractional bits for the fixed-point form; zero for the plain one.
+        fbits: u32,
     },
     /// `fcvtzs`/`fcvtzu`/`fcvtns`/…: float register to integer register.
     FpToInt {
@@ -745,6 +749,8 @@ pub enum Inst {
         round: FpRound,
         rd: RegSel,
         vn: VReg,
+        /// Fractional bits for the fixed-point form; zero for the plain one.
+        fbits: u32,
     },
     /// `fmov` between a general register and a float register.
     FpMoveGeneral {

@@ -1420,10 +1420,13 @@ fn decode_simd_fp(raw: u32) -> Inst {
         }
     }
 
-    // Scalar Advanced SIMD. Bit 30 is what separates it from scalar
-    // floating point, which shares the same `11110` group: the SIMD forms set
-    // it, the floating-point ones clear it.
-    if bit(raw, 31) == 0 && bit(raw, 30) == 1 && bits(raw, 28, 24) == 0b11110 {
+    // Scalar Advanced SIMD. Bit 30 is what separates it from scalar floating
+    // point, which shares the `11110` group: the SIMD forms set it, the
+    // floating-point ones clear it. The group is matched only down to bit 25,
+    // because the shift-by-immediate forms sit at `11111` rather than
+    // `11110` -- testing bit 24 here would hide the whole family, which is
+    // what made `shl d1, d1, #52` undecodable.
+    if bit(raw, 31) == 0 && bit(raw, 30) == 1 && bits(raw, 28, 25) == 0b1111 {
         if let Some(inst) = decode_simd_scalar(raw, u) {
             return inst;
         }
@@ -2085,8 +2088,7 @@ fn decode_scalar_fp(raw: u32) -> Inst {
         return Inst::Unknown { raw };
     }
     if bit(raw, 21) == 0 {
-        // Conversion with a fixed-point immediate; not modelled.
-        return Inst::Unknown { raw };
+        return decode_fp_fixed_convert(raw, sz_of(bits(raw, 23, 22)));
     }
     // `fmov` to and from the upper half of a 128-bit register is the one
     // member of this family with ptype = 10, because the operand really is
@@ -2280,6 +2282,57 @@ fn decode_fp_madd(raw: u32) -> Inst {
     }
 }
 
+/// Conversion between a floating-point register and a *fixed-point* integer.
+///
+/// The same opcodes as the integer forms with bit 21 clear, plus a scale
+/// field: the integer is read (or written) as a value with `64 - scale`
+/// fractional bits, so `scvtf d0, w0, #2` divides by four.
+fn decode_fp_fixed_convert(raw: u32, sz: Option<FpSz>) -> Inst {
+    let Some(sz) = sz else {
+        return Inst::Unknown { raw };
+    };
+    let sf = bit(raw, 31);
+    let int_sz = Sz::from_sf(sf);
+    let scale = bits(raw, 15, 10);
+    let fbits = 64 - scale;
+    // A 32-bit register cannot carry more than 32 fractional bits, and zero
+    // fractional bits is the non-fixed-point encoding, which is elsewhere.
+    if fbits == 0 || fbits > 64 || (sf == 0 && fbits > 32) {
+        return Inst::Undefined { raw };
+    }
+    let rd = RegSel::gp(bits(raw, 4, 0));
+    let rn = RegSel::gp(bits(raw, 9, 5));
+    let vd = VReg(bits(raw, 4, 0) as u8);
+    let vn = VReg(bits(raw, 9, 5) as u8);
+    match (bits(raw, 20, 19), bits(raw, 18, 16)) {
+        // Fixed point to floating point.
+        (0b00, o @ (0b010 | 0b011)) => Inst::FpFromInt {
+            sz,
+            int_sz,
+            signed: o == 0b010,
+            vd,
+            rn,
+            fbits,
+        },
+        // Floating point to fixed point, always rounding toward zero.
+        (0b11, o @ (0b000 | 0b001)) => Inst::FpToInt {
+            sz,
+            int_sz,
+            signed: o == 0b000,
+            round: FpRound::Zero,
+            rd,
+            vn,
+            fbits,
+        },
+        _ => Inst::Unknown { raw },
+    }
+}
+
+/// The `type` field's floating-point size, or `None` for the reserved values.
+fn sz_of(ty: u32) -> Option<FpSz> {
+    fp_size(ty)
+}
+
 fn decode_fp_int_convert(raw: u32, sz: FpSz) -> Inst {
     let sf = bit(raw, 31);
     let int_sz = Sz::from_sf(sf);
@@ -2308,6 +2361,7 @@ fn decode_fp_int_convert(raw: u32, sz: FpSz) -> Inst {
             round,
             rd,
             vn,
+            fbits: 0,
         };
     }
     match (rmode, opcode) {
@@ -2317,6 +2371,7 @@ fn decode_fp_int_convert(raw: u32, sz: FpSz) -> Inst {
             signed: true,
             vd,
             rn,
+            fbits: 0,
         },
         (0b00, 0b011) => Inst::FpFromInt {
             sz,
@@ -2324,6 +2379,7 @@ fn decode_fp_int_convert(raw: u32, sz: FpSz) -> Inst {
             signed: false,
             vd,
             rn,
+            fbits: 0,
         },
         (0b00, 0b110) => Inst::FpMoveGeneral {
             sz,

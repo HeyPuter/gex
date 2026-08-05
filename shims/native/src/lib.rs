@@ -159,7 +159,7 @@ impl std::error::Error for StopExecution {}
 /// translator reads -- two builds of the same program that differ only in a
 /// section the loader drops should share an entry, and the same file loaded at
 /// a different bias must not.
-fn cache_key(image: &Image, xlate: &Options) -> String {
+fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
     let mut fields: Vec<Vec<u8>> = vec![
         image.bias.to_le_bytes().into(),
         image.entry.to_le_bytes().into(),
@@ -175,7 +175,7 @@ fn cache_key(image: &Image, xlate: &Options) -> String {
         fields.push(vec![seg.executable as u8]);
         fields.push(seg.bytes.clone());
     }
-    gex_cache::key(fields.iter().map(|f| f.as_slice()))
+    gex_cache::key(build, fields.iter().map(|f| f.as_slice()))
 }
 
 /// Build, instantiate and run a guest image to completion.
@@ -199,8 +199,14 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     // feeds `extra_entries`, so it changes the translation and therefore the
     // cache key: a run that discovers something new compiles once more and
     // then settles.
-    let profile_dir = opts.cache.then(gex_cache::profile_dir).flatten();
-    let image_key = cache_key(image, &Options::default());
+    // A build that cannot identify itself must not use the cache: it cannot
+    // be distinguished from a different one, and reusing another build's
+    // compiled code is how a fixed translator serves broken output.
+    let build = gex_cache::build_fingerprint();
+    let use_cache = opts.cache && build.is_some();
+    let build = build.unwrap_or_default();
+    let profile_dir = use_cache.then(gex_cache::profile_dir).flatten();
+    let image_key = cache_key(image, &Options::default(), &build);
     let mut xlate = xlate.clone();
     if let Some(dir) = &profile_dir {
         let learned = gex_cache::read_profile(dir, &image_key);
@@ -261,9 +267,9 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
         (m, s)
     };
 
-    let (module, meta) = match opts.cache.then(gex_cache::cache_dir).flatten() {
+    let (module, meta) = match use_cache.then(gex_cache::cache_dir).flatten() {
         Some(dir) => {
-            let key = cache_key(image, xlate);
+            let key = cache_key(image, xlate, &build);
             let mut built: Option<Stats> = None;
             let loaded = gex_cache::load_or_compile(&engine, &dir, &key, || {
                 let (m, s) = translate();

@@ -166,6 +166,8 @@ echo "building guest programs..."
 # get right -- a condition set in one block and consumed in another -- are
 # ones a compiler almost never emits.
 "$CC" -nostdlib -static -no-pie -o "$WORK/flags" "$HERE/programs/flags.S"
+# Inline assembly, because the fixed-point conversions have no C spelling.
+"$CC" -static -no-pie -O2 -o "$WORK/fixedpoint" "$HERE/programs/fixedpoint.c"
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
 # .eh_frame through personality routines -- a very different code shape from
 # anything the C programs reach.
@@ -228,6 +230,7 @@ compare "vector-pie" "$WORK/vector-pie"
 compare "numeric" "$WORK/numeric"
 compare "neon-structure" "$WORK/neon2"
 compare "cross-block-flags" "$WORK/flags"
+compare "fixed-point" "$WORK/fixedpoint"
 [ -n "$CPP" ] && compare "cpp-static" "$WORK/cpp"
 
 if [ -n "$DYNAMIC" ]; then
@@ -251,6 +254,7 @@ done
 compare "nojit-vector" "$WORK/vector"
 compare "nojit-neon-structure" "$WORK/neon2"
 compare "nojit-cross-block-flags" "$WORK/flags"
+compare "nojit-fixed-point" "$WORK/fixedpoint"
 GEXC_ARGS=""
 
 echo

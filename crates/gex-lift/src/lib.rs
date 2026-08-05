@@ -1504,6 +1504,7 @@ impl<'a> Lifter<'a> {
                 signed,
                 vd,
                 rn,
+                fbits,
             } => {
                 let a = self.rd_gp(rn, int_sz);
                 let v = self.b.def(Expr::FpCvt {
@@ -1512,6 +1513,14 @@ impl<'a> Lifter<'a> {
                     dst_wide: sz.is_double(),
                     a,
                 });
+                // The fixed-point form reads the integer as a value scaled by
+                // 2^fbits, so dividing it back out finishes the job. Scaling
+                // by a power of two is exact, and it commutes with the
+                // rounding the conversion already did, so this is the single
+                // correctly-rounded result the architecture asks for -- barring
+                // an underflow into subnormals, which no caller of this form
+                // is arranging for.
+                let v = self.scale_by_power_of_two(v, sz.is_double(), -(fbits as i32));
                 self.wr_fp(vd, sz, v);
                 Flow::Next
             }
@@ -1523,9 +1532,12 @@ impl<'a> Lifter<'a> {
                 round,
                 rd,
                 vn,
+                fbits,
             } => {
                 let double = sz.is_double();
                 let a = self.rd_fp(vn, sz);
+                // Scale up first, so the truncation keeps `fbits` of fraction.
+                let a = self.scale_by_power_of_two(a, double, fbits as i32);
                 // Only rounding toward zero is a single wasm instruction; the
                 // others round first and then truncate, which is exact
                 // because the rounded value is already integral.
@@ -2710,6 +2722,30 @@ impl<'a> Lifter<'a> {
             });
         }
         out
+    }
+
+    /// Multiply a float by `2^exp`, or return it unchanged when `exp` is zero.
+    ///
+    /// The multiplier is built as a bit pattern rather than parsed from a
+    /// literal, because `exp` reaches +/-64 and the exponent field is the only
+    /// part that moves.
+    fn scale_by_power_of_two(&mut self, v: Value, double: bool, exp: i32) -> Value {
+        if exp == 0 {
+            return v;
+        }
+        let k = if double {
+            let biased = (1023 + exp) as u64;
+            self.konst(Ty::I64, biased << 52)
+        } else {
+            let biased = (127 + exp) as u64;
+            self.konst(Ty::I32, biased << 23)
+        };
+        self.b.def(Expr::FpBin {
+            op: FpBinOp::Mul,
+            double,
+            a: v,
+            b: k,
+        })
     }
 
     /// The four flags an `fcmp` installs, shared with `fccmp`.
