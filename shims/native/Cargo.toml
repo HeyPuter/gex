@@ -8,6 +8,7 @@ description = "Native host for gex: wasmtime engine plus the kernel bindings"
 [dependencies]
 gex-abi.workspace = true
 gex-cache.workspace = true
+gex-mem.workspace = true
 gex-kernel.workspace = true
 gex-ld.workspace = true
 gex-xlate.workspace = true

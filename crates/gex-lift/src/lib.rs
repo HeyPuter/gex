@@ -2561,7 +2561,7 @@ impl<'a> Lifter<'a> {
         vd: gex_isa::VReg,
         vn: gex_isa::VReg,
         shift: u32,
-        pc: u64,
+        _pc: u64,
     ) -> Flow {
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));

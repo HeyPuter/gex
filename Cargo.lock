@@ -299,6 +299,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-mem"
+version = "0.0.1"
+dependencies = [
+ "wasmtime",
+]
+
+[[package]]
 name = "gex-native"
 version = "0.0.1"
 dependencies = [
@@ -308,6 +315,7 @@ dependencies = [
  "gex-kernel",
  "gex-ld",
  "gex-lift",
+ "gex-mem",
  "gex-xlate",
  "wasmtime",
 ]

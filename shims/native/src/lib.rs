@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{anyhow, bail, Context, Result};
-use gex_abi::{ctx, exports, imports, IMPORT_MODULE};
+use gex_abi::{ctx, exports, imports, GUEST_MEM_PAGES, IMPORT_MODULE};
 use gex_kernel::mem::prot;
 use gex_kernel::vfs::{DevFs, HostFs, ProcFs, TmpFs};
 use gex_kernel::{GuestMem, Kernel, ProcState, SyscallOutcome};
@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use wasmtime::{
-    Caller, Config, Engine, Extern, Linker, Memory, Module, Ref, Store, Table, Val,
+    Caller, Config, Engine, Extern, Linker, Module, Ref, Store, Table, Val,
 };
 
 /// How a guest run ended.
@@ -104,7 +104,7 @@ impl Default for RunOptions {
 /// Host-side state threaded through every import.
 struct HostState {
     kernel: Kernel,
-    memory: Option<Memory>,
+    memory: Option<gex_mem::GuestMemory>,
     /// Snapshot `/proc` reads from, refreshed before each syscall that could
     /// observe it.
     proc_state: Arc<Mutex<ProcState>>,
@@ -355,6 +355,16 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     let mut linker = Linker::new(&engine);
     register_imports(&mut linker)?;
 
+    // The guest's memory belongs to the host, not to any module: every guest
+    // thread runs in its own store, and a module-defined memory would give
+    // each of them a private copy of the address space.
+    let shared = wasmtime::SharedMemory::new(
+        &engine,
+        wasmtime::MemoryType::shared(GUEST_MEM_PAGES as u32, GUEST_MEM_PAGES as u32),
+    )
+    .context("creating the guest's shared memory")?;
+    linker.define(&mut store, IMPORT_MODULE, exports::MEMORY, shared.clone())?;
+
     let instance = linker
         .instantiate(&mut store, &module)
         .context("instantiating the translated module")?;
@@ -366,11 +376,8 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     }
     let phase = std::time::Instant::now();
 
-    let memory = match instance.get_export(&mut store, exports::MEMORY) {
-        Some(Extern::Memory(m)) => m,
-        _ => bail!("translated module does not export its memory"),
-    };
-    store.data_mut().memory = Some(memory);
+    let memory = gex_mem::GuestMemory::new(shared.clone());
+    store.data_mut().memory = Some(memory.clone());
 
     // Runtime translation needs the table to patch and the engine and linker
     // to build new modules with. Holding them here is what lets a dispatch
@@ -395,7 +402,7 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
 
     place_image(
         &mut store,
-        memory,
+        memory.clone(),
         program,
         opts,
         Identity {
@@ -408,7 +415,7 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     // Publish the image's page-directory entries, without which none of its
     // blocks are reachable through the table.
     {
-        let data = memory.data_mut(&mut store);
+        let data = memory.bytes();
         for (page, base) in &meta.dir_entries {
             let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
             if off + 4 <= data.len() {
@@ -420,7 +427,6 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     if opts.verbose {
         eprintln!("[gex] guest state placed in {:.2}s", phase.elapsed().as_secs_f64());
     }
-    let phase = std::time::Instant::now();
     let enter = instance
         .get_func(&mut store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
@@ -575,7 +581,7 @@ fn host_identity() -> (u32, u32) {
 /// Copy the ELF segments and the initial stack into guest memory.
 fn place_image(
     store: &mut Store<HostState>,
-    memory: Memory,
+    memory: gex_mem::GuestMemory,
     program: &Program,
     opts: &RunOptions,
     id: Identity,
@@ -583,7 +589,7 @@ fn place_image(
     let image = &program.exe;
     // Segments first: the executable's, then the interpreter's.
     for seg in program.segments() {
-        let data = memory.data_mut(&mut *store);
+        let data = memory.bytes();
         let start = seg.vaddr as usize;
         let end = start + seg.mem_size as usize;
         if end > data.len() {
@@ -623,7 +629,7 @@ fn place_image(
         *b"gexdeterministic",
         id,
     );
-    let data = memory.data_mut(&mut *store);
+    let data = memory.bytes();
     let start = layout.low as usize;
     let end = start + layout.bytes.len();
     if end > data.len() {
@@ -641,7 +647,7 @@ fn place_image(
 
     // Finally the initial register state: sp, and x0 cleared the way Linux
     // leaves it.
-    let data = memory.data_mut(&mut *store);
+    let data = memory.bytes();
     let ctx_addr = gex_abi::ctx_addr(0) as usize;
     write_u64(data, ctx_addr + ctx::SP, layout.sp);
     write_u64(data, ctx_addr + ctx::PC, image.entry);
@@ -668,6 +674,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let memory = caller
                 .data()
                 .memory
+                .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
             // Split the borrow: the kernel needs `&mut [u8]` and `&mut Kernel`
             // at once, and they live in different places.
@@ -677,7 +684,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let state = caller.data();
                 state.kernel.refresh_proc(&state.proc_state);
             }
-            let (data, state) = memory.data_and_store_mut(&mut caller);
+            let data = memory.bytes();
+            let state = caller.data_mut();
             let mut gm = GuestMem::new(data);
             match state.kernel.syscall(&mut gm, pc as u64) {
                 SyscallOutcome::Continue => Ok(()),
@@ -716,8 +724,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let memory = caller
                     .data()
                     .memory
-                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
-                let (data, state) = memory.data_and_store_mut(&mut caller);
+                    .clone()
+                .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
+            let state = caller.data_mut();
                 let mut gm = GuestMem::new(data);
                 return match state.kernel.sigreturn(&mut gm) {
                     Ok(target) => {
@@ -774,8 +784,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let memory = caller
                 .data()
                 .memory
+                .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
-            let (data, state) = memory.data_and_store_mut(&mut caller);
+            let data = memory.bytes();
+            let state = caller.data_mut();
             let mut gm = GuestMem::new(data);
             // A guest that installed a SIGILL handler gets to see it, which
             // is how some runtimes probe for optional instructions.
@@ -844,13 +856,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::CACHE_OP,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, _pc: i64, op: i32, addr: i64| -> Result<()> {
+        |caller: Caller<'_, HostState>, _ctx: i32, _pc: i64, op: i32, addr: i64| -> Result<()> {
             if op == gex_abi::cache_op::DC_ZVA {
                 let memory = caller
                     .data()
                     .memory
-                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
-                let data = memory.data_mut(&mut caller);
+                    .clone()
+                .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
                 let block = gex_abi::DCZID_BLOCK_BYTES;
                 let start = ((addr as u64) & !(block - 1)) as usize;
                 let end = start + block as usize;
@@ -871,8 +884,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let memory = caller
                 .data()
                 .memory
+                .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
-            let (data, state) = memory.data_and_store_mut(&mut caller);
+            let data = memory.bytes();
+            let state = caller.data_mut();
             let mut gm = GuestMem::new(data);
             // The context is complete here, so a handler frame built now
             // captures exactly the state the guest would see on hardware.
@@ -936,7 +951,8 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     let memory = caller
         .data()
         .memory
-        .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        .clone()
+                .ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let known: std::collections::HashSet<u64> = caller
         .data()
         .jit
@@ -953,7 +969,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         .map(|v| (v.start, v.end))
         .collect();
     let (translated_module, stats) = {
-        let data = memory.data(&mut *caller);
+        let data = memory.bytes();
         gex_xlate::translate_runtime(
             data,
             pc,
@@ -991,9 +1007,18 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             .context("growing the dispatch table")?;
     }
 
-    // The new module imports the memory and the table by name.
+    // The new module imports the memory and the table by name. The memory is
+    // already defined on the linker this was cloned from -- it has to be, the
+    // image module imports it too -- and the table is redefined per call, so
+    // both are shadowing writes.
     let mut linker = linker;
-    linker.define(&mut *caller, gex_abi::IMPORT_MODULE, exports::MEMORY, memory)?;
+    linker.allow_shadowing(true);
+    linker.define(
+        &mut *caller,
+        gex_abi::IMPORT_MODULE,
+        exports::MEMORY,
+        memory.shared().clone(),
+    )?;
     linker.define(
         &mut *caller,
         gex_abi::IMPORT_MODULE,
@@ -1025,7 +1050,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             .with_context(|| format!("installing block 0x{addr:x} in slot {slot}"))?;
         installed.push(*addr);
     }
-    write_dispatch_dir(caller, memory, &translated_module.dir_entries)?;
+    write_dispatch_dir(memory, &translated_module.dir_entries)?;
 
     // If the address that faulted did not end up with code, resuming would
     // fault again at the same place forever. Say so instead.
@@ -1043,12 +1068,8 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
 }
 
 /// Publish page-directory entries so translated code becomes reachable.
-fn write_dispatch_dir(
-    caller: &mut Caller<'_, HostState>,
-    memory: Memory,
-    entries: &[(u64, u32)],
-) -> Result<()> {
-    let data = memory.data_mut(&mut *caller);
+fn write_dispatch_dir(memory: gex_mem::GuestMemory, entries: &[(u64, u32)]) -> Result<()> {
+    let data = memory.bytes();
     for (page, base) in entries {
         let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
         if off + 4 > data.len() {
@@ -1061,11 +1082,7 @@ fn write_dispatch_dir(
 
 /// Turn a wasm trap into a guest signal.
 fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
-    let pc = store
-        .data()
-        .memory
-        .map(|_| 0u64)
-        .unwrap_or(0);
+    let pc = store.data().memory.as_ref().map(|_| 0u64).unwrap_or(0);
     if let Some(trap) = e.downcast_ref::<wasmtime::Trap>() {
         let detail = match trap {
             // The guard in tier-1 codegen steers a too-large effective

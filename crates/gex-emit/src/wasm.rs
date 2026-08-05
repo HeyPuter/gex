@@ -379,7 +379,7 @@ impl FuncBody {
 pub enum ImportKind {
     Func { ty: u32 },
     /// A memory with the given minimum size in pages.
-    Memory { min_pages: u64 },
+    Memory { pages: u64, shared: bool },
     /// A funcref table with the given minimum size.
     Table { min: u32 },
 }
@@ -463,11 +463,17 @@ impl Module {
     }
 
     /// Import the guest memory instead of declaring one.
-    pub fn import_memory(&mut self, module: &str, name: &str, min_pages: u64) {
+    /// Import a memory instead of defining one.
+    ///
+    /// A defined memory belongs to its instance, so two stores instantiating
+    /// the same module would get two of them. Every guest thread has to see
+    /// the same bytes, which means the host owns the memory and every module
+    /// imports it.
+    pub fn import_memory(&mut self, module: &str, name: &str, pages: u64, shared: bool) {
         self.imports.push(Import {
             module: module.to_string(),
             name: name.to_string(),
-            kind: ImportKind::Memory { min_pages },
+            kind: ImportKind::Memory { pages, shared },
         });
     }
 
@@ -561,10 +567,13 @@ impl Module {
                         s.push(0x00);
                         write_u32(&mut s, *ty);
                     }
-                    ImportKind::Memory { min_pages } => {
+                    ImportKind::Memory { pages, shared } => {
                         s.push(0x02);
-                        s.push(0x00); // limits without a maximum
-                        write_u64(&mut s, *min_pages);
+                        // A shared memory must declare a maximum, and says so
+                        // with bit 1 of the limits flags.
+                        s.push(if *shared { 0x03 } else { 0x01 });
+                        write_u64(&mut s, *pages);
+                        write_u64(&mut s, *pages);
                     }
                     ImportKind::Table { min } => {
                         s.push(0x01);

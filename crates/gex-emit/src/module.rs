@@ -300,15 +300,14 @@ impl ModuleBuilder {
             safepoint: m.import_func(im, imports::SAFEPOINT, t_syscall),
         };
 
-        // The table is sized in `finish`, once the set of pages the module
-        // touches is known; the memory is fixed.
-        if linkage == Linkage::Own {
-            m.set_memory(GUEST_MEM_PAGES, GUEST_MEM_PAGES);
-        }
+        // The memory is the host's, and shared, so every guest thread acts on
+        // the same bytes -- a defined memory would be per-instance, and each
+        // thread needs its own store. The table is sized in `finish`, once the
+        // set of pages the module touches is known.
+        m.import_memory(IMPORT_MODULE, exports::MEMORY, GUEST_MEM_PAGES, true);
         if linkage == Linkage::Shared {
-            // Both come from the image module, so this one's blocks act on
-            // exactly the same guest state.
-            m.import_memory(IMPORT_MODULE, exports::MEMORY, GUEST_MEM_PAGES);
+            // The table comes from the image module, so this one's blocks
+            // dispatch through exactly the same slots.
             m.import_table(IMPORT_MODULE, exports::DISPATCH_TABLE, 0);
         }
 
@@ -338,6 +337,9 @@ impl ModuleBuilder {
         b.m.define_func(enter, enter_body);
 
         if linkage == Linkage::Own {
+            // Re-export the imported memory. The index space puts imports
+            // first, so memory 0 is the host's; exporting it is what gives
+            // each store an ordinary `Memory` handle to the shared bytes.
             b.m.export(exports::MEMORY, ExportKind::Memory, 0);
             b.m.export(exports::DISPATCH_TABLE, ExportKind::Table, 0);
         }

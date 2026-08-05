@@ -1,0 +1,7 @@
+[package]
+name = "gex-mem"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }
