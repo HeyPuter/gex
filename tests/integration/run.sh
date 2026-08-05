@@ -130,7 +130,12 @@ cross_engine() {
 #
 # This is the real thing, not the cross-engine harness: gex-kernel compiled to
 # wasm, sharing one memory with the guest module, with JS supplying only a
-# console. Skipped when node or the shim build is absent.
+# console. Both ways of getting code there are checked -- a module with every
+# block translated ahead of time, and a small one that pulls the rest in
+# through the dispatch miss at run time -- because a page will want the second
+# and a deployment that must not compile later wants the first.
+#
+# Skipped when node or the shim build is absent.
 browser() {
     label="$1"; prog="$2"; shift 2
     shim=target/wasm32-unknown-unknown/release/gex_browser.wasm
@@ -140,20 +145,29 @@ browser() {
     # An absolute path, because `/proc/self/exe` is one and the browser has no
     # host directory to resolve a relative argv[0] against.
     prog="$(cd "$(dirname "$prog")" && pwd)/$(basename "$prog")"
-    wasm="$WORK/$label.br.wasm"
     set +e
-    "$GEXC" build --exhaustive --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1
     "$QEMU" "$prog" "$@" >"$WORK/$label.qemu2" 2>&1
-    "$NODE" shims/browser/js/run-node.mjs "$wasm" "$prog" "$@" >"$WORK/$label.br" 2>&1
     set -e
-    if ! cmp -s "$WORK/$label.qemu2" "$WORK/$label.br"; then
-        echo "FAIL browser-$label: the browser runtime and QEMU disagree"
-        diff -u "$WORK/$label.qemu2" "$WORK/$label.br" | head -20 || true
-        fail=$((fail + 1))
-        return
-    fi
-    echo "ok   browser-$label"
-    pass=$((pass + 1))
+    for mode in aot jit; do
+        wasm="$WORK/$label.$mode.wasm"
+        set +e
+        case "$mode" in
+            aot) "$GEXC" build --exhaustive --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1 ;;
+            jit) "$GEXC" build --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1 ;;
+        esac
+        "$NODE" shims/browser/js/run-node.mjs "$wasm" "$prog" "$@" >"$WORK/$label.$mode.br" 2>&1
+        set -e
+        name="browser-$label"
+        [ "$mode" = jit ] && name="browser-jit-$label"
+        if ! cmp -s "$WORK/$label.qemu2" "$WORK/$label.$mode.br"; then
+            echo "FAIL $name: the browser runtime and QEMU disagree"
+            diff -u "$WORK/$label.qemu2" "$WORK/$label.$mode.br" | head -20 || true
+            fail=$((fail + 1))
+            continue
+        fi
+        echo "ok   $name"
+        pass=$((pass + 1))
+    done
 }
 
 # Recover the label from a compare() argument list, whatever options precede it.

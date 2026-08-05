@@ -234,6 +234,35 @@ struct Thread {
     blocked_on: Option<gex_kernel::BlockOp>,
 }
 
+/// Runtime translation state.
+///
+/// The shim can lift and encode a module -- `gex-xlate` is ordinary Rust and
+/// compiles to wasm like everything else -- but it cannot *compile* one:
+/// nothing in wasm can hand bytes to the engine. So a miss produces the
+/// module here, leaves it for JS to instantiate, and comes back.
+struct Jit {
+    /// Which guest pages own which slots in the dispatch table.
+    page_table: gex_xlate::PageTable,
+    /// Whether the module said where it had got to. Without that this would
+    /// start handing out slots from zero and quietly overwrite the image
+    /// module's own blocks in the table, which is a very confusing way to
+    /// find out the module is too old.
+    described: bool,
+    /// Addresses whose slot now holds real code.
+    translated: std::collections::HashSet<u64>,
+    /// A module JS has yet to instantiate.
+    pending: Option<Vec<u8>>,
+    /// The slots it defines, once JS asks.
+    pending_dirs: Vec<(u64, u32)>,
+    /// How many slots the table must hold for it.
+    pending_slots: u64,
+    blocks: u64,
+    compiles: u64,
+    /// Nanoseconds spent lifting and encoding, which is the shim's own share
+    /// of a miss -- the engine's compile of what comes out is JS's.
+    nanos: u64,
+}
+
 struct Host {
     kernel: Kernel,
     /// The root filesystem, kept so files can be added before the guest runs.
@@ -249,6 +278,7 @@ struct Host {
     resume: Option<u64>,
     /// Set alongside `resume` when the scheduler switched threads.
     resume_ctx: Option<u64>,
+    jit: Jit,
 }
 
 thread_local! {
@@ -469,6 +499,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         write_u64(data, c + ctx::x(i), 0);
     }
 
+    let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
     let entry = image.entry;
     HOST.with(|h| {
         *h.borrow_mut() = Some(Host {
@@ -485,6 +516,17 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             exit: None,
             resume: None,
             resume_ctx: None,
+            jit: Jit {
+                described: meta.next_slot != 0,
+                page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
+                translated: Default::default(),
+                pending: None,
+                pending_dirs: Vec::new(),
+                pending_slots: 0,
+                blocks: 0,
+                compiles: 0,
+                nanos: 0,
+            },
         });
     });
     entry
@@ -536,6 +578,18 @@ fn shim_slice(p: u32, n: u32) -> &'static [u8] {
             n as usize,
         )
     }
+}
+
+/// The module's dispatch metadata, staged until the guest is loaded.
+///
+/// It rides in the module's own `gex.meta` custom section, which JS finds and
+/// hands over: everything runtime translation needs to carry on allocating
+/// table slots where the ahead-of-time build left off.
+static METADATA: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_set_metadata(ptr: u32, len: u32) {
+    *METADATA.0.borrow_mut() = shim_slice(ptr, len).to_vec();
 }
 
 /// Standard input, staged until the guest is loaded.
@@ -1007,29 +1061,151 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     }
 }
 
-/// A dispatch miss, with no runtime translator behind it. A module built with
-/// `--exhaustive` should never reach one.
+/// A dispatch miss: translate the block at `pc`, and everything reachable
+/// from it, into a module for JS to instantiate.
+///
+/// This is what lets a page ship a small module. Translating a whole program
+/// ahead of time costs 62 MiB of wasm for SQLite; discovering only what the
+/// entry point reaches costs 14 MiB, and the rest arrives here as it is
+/// needed.
+///
+/// The shim can lift and encode but not compile -- nothing inside wasm can
+/// hand bytes to the engine -- so it leaves the module behind and traps out,
+/// and JS instantiates it against the same memory and dispatch table before
+/// resuming the guest at exactly the address that missed.
 #[no_mangle]
 pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
-    // Silence here is the worst outcome: the guest simply stops, and the
-    // exit status looks like a segfault it never took.
-    let (i, addr) = with_host(|h| (h.current, h.threads[h.current].kstate.ctx_addr));
-    let gm = GuestMem::new(guest_bytes());
-    trace_line(&format!(
-        "gex: no translation for pc={pc:#x} (thread {i}, ctx {addr:#x})\n"
-    ));
-    let mut regs = String::from("gex:  ");
-    for r in 0..31u8 {
-        regs.push_str(&format!(
-            "x{r}={:#x} ",
-            gm.read_u64(addr + ctx::x(r) as u64).unwrap_or(0)
-        ));
+    let pc = pc as u64;
+    if tracing() {
+        trace_line(&format!("[gex] miss at pc={pc:#x}\n"));
     }
-    regs.push_str(&format!(
-        "sp={:#x}\n",
-        gm.read_u64(addr + ctx::SP as u64).unwrap_or(0)
-    ));
-    trace_line(&regs);
-    with_host(|h| h.exit = Some(128 + 11));
+    let translated = with_host(|h| {
+        if !h.jit.described {
+            return false;
+        }
+        let exec: Vec<(u64, u64)> = h
+            .kernel
+            .mem
+            .vmas()
+            .iter()
+            .filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
+            .map(|v| (v.start, v.end))
+            .collect();
+        if !exec.iter().any(|(a, b)| pc >= *a && pc + 4 <= *b) {
+            return false;
+        }
+        let started = now_ns();
+        let known = std::mem::take(&mut h.jit.translated);
+        let (unit, stats) = gex_xlate::translate_runtime(
+            guest_bytes(),
+            pc,
+            &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
+            &|a| known.contains(&a),
+            h.jit.page_table.clone(),
+            Default::default(),
+            // A cap keeps one miss from translating a whole library at once;
+            // the next miss picks up where this stopped.
+            2048,
+            // The browser's memory is not declared shared, and an import that
+            // disagrees with the memory it is given fails to instantiate.
+            false,
+        );
+        h.jit.translated = known;
+        if stats.blocks == 0 {
+            return false;
+        }
+        h.jit.page_table = unit.page_table.clone();
+        for (addr, _) in &unit.exported_blocks {
+            h.jit.translated.insert(*addr);
+        }
+        h.jit.pending_dirs = unit.dir_entries.clone();
+        h.jit.pending_slots = unit.table_slots;
+        h.jit.pending = Some(unit.wasm);
+        h.jit.blocks += stats.blocks as u64;
+        h.jit.compiles += 1;
+        h.jit.nanos += now_ns().saturating_sub(started);
+        if tracing() {
+            trace_line(&format!(
+                "[gex]   translated {} blocks, {} slots, {} pages\n",
+                stats.blocks,
+                unit.table_slots,
+                unit.dir_entries.len()
+            ));
+        }
+        // Come back at the address that missed, now that it will resolve.
+        h.resume = Some(pc);
+        h.resume_ctx = Some(h.threads[h.current].kstate.ctx_addr);
+        true
+    });
+    if !translated {
+        if !with_host(|h| h.jit.described) {
+            trace_line("gex: the guest module carries no gex.meta section, so there is\n");
+            trace_line("gex: nowhere for runtime translation to carry on from. Rebuild it.\n");
+        }
+        trace_line(&format!("gex: nothing to translate at pc={pc:#x}\n"));
+        with_host(|h| h.exit = Some(128 + 11));
+    }
     trap();
+}
+
+/// The module JS has to instantiate, or zero length if there is none.
+#[no_mangle]
+pub extern "C" fn gex_jit_pending_ptr() -> u32 {
+    with_host(|h| h.jit.pending.as_ref().map_or(0, |v| v.as_ptr() as u32))
+}
+
+#[no_mangle]
+pub extern "C" fn gex_jit_pending_len() -> u32 {
+    with_host(|h| h.jit.pending.as_ref().map_or(0, |v| v.len() as u32))
+}
+
+/// How many slots the dispatch table must hold for the pending module.
+#[no_mangle]
+pub extern "C" fn gex_jit_slots() -> u32 {
+    with_host(|h| h.jit.pending_slots as u32)
+}
+
+/// The dispatch-table slot a translated block belongs in.
+#[no_mangle]
+pub extern "C" fn gex_dispatch_slot(addr: i64) -> i32 {
+    with_host(|h| {
+        let page = gex_abi::dispatch_page(addr as u64);
+        match h.jit.page_table.lookup(page) {
+            Some(base) => gex_abi::dispatch_index(addr as u64, base) as i32,
+            None => -1,
+        }
+    })
+}
+
+/// Publish the pending module's pages, now that its blocks are in the table.
+///
+/// Deliberately last: until the directory entry points at real slots, a guest
+/// branch into one of these pages must keep reaching the miss stub.
+#[no_mangle]
+pub extern "C" fn gex_jit_installed() {
+    with_host(|h| {
+        let mut gm = GuestMem::new(guest_bytes());
+        for (page, base) in std::mem::take(&mut h.jit.pending_dirs) {
+            let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+        }
+        h.jit.pending = None;
+        h.jit.pending_slots = 0;
+    });
+}
+
+/// Blocks translated at run time, and how many times the translator ran.
+#[no_mangle]
+pub extern "C" fn gex_jit_blocks() -> i64 {
+    with_host(|h| h.jit.blocks as i64)
+}
+
+#[no_mangle]
+pub extern "C" fn gex_jit_compiles() -> i64 {
+    with_host(|h| h.jit.compiles as i64)
+}
+
+/// Milliseconds the shim itself spent translating.
+#[no_mangle]
+pub extern "C" fn gex_jit_millis() -> i64 {
+    with_host(|h| (h.jit.nanos / 1_000_000) as i64)
 }

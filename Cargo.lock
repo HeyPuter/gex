@@ -251,6 +251,7 @@ dependencies = [
  "gex-abi",
  "gex-kernel",
  "gex-ld",
+ "gex-xlate",
  "linked_list_allocator",
 ]
 

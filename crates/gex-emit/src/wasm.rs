@@ -540,6 +540,14 @@ impl Module {
 
     /// Serialise the whole module.
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_with_custom(&[])
+    }
+
+    /// Encode, with custom sections appended. A custom section is how a
+    /// module carries something the engine ignores and the host needs -- for
+    /// gex, the dispatch metadata, so one file is enough to run a program
+    /// rather than a module and a sidecar.
+    pub fn encode_with_custom(&self, custom: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 << 20);
         out.extend_from_slice(b"\0asm");
         out.extend_from_slice(&1u32.to_le_bytes());
@@ -696,6 +704,13 @@ impl Module {
                 s.extend_from_slice(&d.bytes);
             }
             section(&mut out, 11, &s);
+        }
+
+        for (name, bytes) in custom {
+            let mut sec = Vec::with_capacity(name.len() + bytes.len() + 8);
+            write_name(&mut sec, name);
+            sec.extend_from_slice(bytes);
+            section(&mut out, 0, &sec);
         }
 
         out

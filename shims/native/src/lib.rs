@@ -1735,6 +1735,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             // A cap keeps one miss from translating an entire library
             // synchronously; the next miss picks up where this stopped.
             4096,
+            true,
         )
     };
     if translated_module.exported_blocks.is_empty() {

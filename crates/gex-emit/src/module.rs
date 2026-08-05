@@ -187,6 +187,9 @@ impl Metadata {
     }
 }
 
+/// The custom section a module carries its [`Metadata`] in.
+pub const METADATA_SECTION: &str = "gex.meta";
+
 /// Bumped whenever the encoding changes, so an old sidecar is rejected.
 const METADATA_MAGIC: u64 = 0x6765785f6d657431; // "gex_met1"
 
@@ -536,8 +539,21 @@ impl ModuleBuilder {
             self.m.data(d);
         }
 
+        // The dispatch metadata rides in a custom section, so a module is
+        // self-describing: a page fetches one file and the host reads out of
+        // it everything it needs to set dispatch up. Written before the
+        // struct is built because it describes exactly these fields.
+        let meta = Metadata {
+            text_base: self.text_base,
+            table_slots,
+            dir_entries: dir_entries.clone(),
+            next_slot: self.page_table.slots(),
+            n_blocks,
+        };
         TranslatedModule {
-            wasm: self.m.encode(),
+            wasm: self
+                .m
+                .encode_with_custom(&[(METADATA_SECTION, meta.encode())]),
             text_base: self.text_base,
             table_slots,
             dir_entries,

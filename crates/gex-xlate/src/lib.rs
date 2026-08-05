@@ -344,6 +344,7 @@ pub fn translate_runtime(
     page_table: PageTable,
     limits: BlockLimits,
     max_blocks: usize,
+    shared_memory: bool,
 ) -> (TranslatedModule, Stats) {
     let fetch = |pc: u64| -> Option<u32> {
         if pc % 4 != 0 || !executable(pc) {
@@ -356,7 +357,8 @@ pub fn translate_runtime(
         Some(u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()))
     };
 
-    let mut builder = ModuleBuilder::with_pages(entry, 0, Linkage::Shared, page_table, true);
+    let mut builder =
+        ModuleBuilder::with_pages(entry, 0, Linkage::Shared, page_table, shared_memory);
     let mut stats = Stats::default();
     let mut worklist: BTreeSet<u64> = BTreeSet::new();
     let mut seen: HashSet<u64> = HashSet::new();

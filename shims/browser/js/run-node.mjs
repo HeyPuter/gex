@@ -70,4 +70,4 @@ const entry = await gex.load(shimWasm, readFileSync(guestPath), readFileSync(elf
   gid: process.getgid?.(),
   stdin: readStdin(),
 });
-process.exit(gex.run(entry));
+process.exit(await gex.run(entry));
