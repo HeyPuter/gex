@@ -149,6 +149,19 @@ export class Gex {
         // redirect resumes elsewhere, anything else is the end of the run.
         // A thread switch is the same mechanism -- the shim leaves the stack
         // and names the context to come back on.
+        // A trap unwinds the engine's own frames, but the shim's shadow
+        // stack is a mutable global that Rust adjusts in each function's
+        // prologue and restores in its epilogue -- and an abandoned frame
+        // never runs its epilogue. Every trap therefore leaked a few dozen
+        // bytes of it. Nothing was live below this point, so putting it back
+        // is exact rather than approximate.
+        //
+        // Left to itself it slid about 32 bytes per trap, and a program that
+        // switches threads often enough took it through 0x80000000 and into
+        // the top of the guest's own stack, where it overwrote saved
+        // registers: a thread would return through a link register holding
+        // an address out of the shim's heap.
+        this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
         const next = this.#shim.exports.gex_resume_pc();
         if (next !== 0n) {
           pc = next;

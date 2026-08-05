@@ -63,6 +63,10 @@ extern "C" {
     fn now() -> i64;
 }
 
+/// Back-edges a guest may take between safepoint calls, matching the native
+/// host's interval.
+const SAFEPOINT_INTERVAL: u32 = 1024;
+
 /// The host's clock, in the shape `gex-kernel` wants.
 fn browser_clock() -> (u64, u32) {
     let ns = unsafe { now() } as u64;
@@ -715,12 +719,7 @@ fn now_ns() -> u64 {
 
 /// Choose the next guest thread to run, and finish whatever syscall it was in
 /// the middle of.
-///
-/// Known limitation: shortening the time slice to 64 safepoints makes six
-/// threads sharing a SQLite connection return through a corrupt link
-/// register. At the slice used here, and at every longer one tried, it is
-/// byte-identical to QEMU -- so something about the switch is not yet exact
-/// and the coarse slice is hiding it rather than fixing it.
+
 ///
 /// The browser host has one wasm stack and no way to block on it, so guest
 /// threads are cooperative: a thread keeps the stack until it blocks, exits,
@@ -942,16 +941,28 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
 /// before this call and the pc it is given is the branch target, so this is
 /// exactly the point at which the stack can be handed to someone else.
 #[no_mangle]
-pub extern "C" fn gex_safepoint(_ctx: i32, pc: i64) {
+pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
+    // Rearm, as the native host does. Translated code counts down a word in
+    // the context and calls here when it reaches zero; leaving it there means
+    // it stays at zero and every later back-edge calls out. That is a
+    // thousand-fold difference in how often this runs, which is worth having
+    // right whether or not anything switches.
+    {
+        let mut gm = GuestMem::new(guest_bytes());
+        let _ = gm.write_u32(
+            ctx as u32 as u64 + ctx::SAFEPOINT_COUNTER as u64,
+            SAFEPOINT_INTERVAL,
+        );
+    }
     // Leaving wasm is not free -- it is a trap, a JS catch and a re-entry --
-    // so a thread gets many safepoints' worth of machine before it is asked
+    // so a thread gets several intervals' worth of machine before it is asked
     // to give it up. The slice is still short enough that a spin loop waiting
     // on another thread makes progress promptly.
-    const SAFEPOINTS_PER_SLICE: u32 = 4096;
+    const SLICES_PER_SWITCH: u32 = 4;
     static mut TICK: u32 = 0;
     let due = unsafe {
         TICK = TICK.wrapping_add(1);
-        TICK.is_multiple_of(SAFEPOINTS_PER_SLICE)
+        TICK.is_multiple_of(SLICES_PER_SWITCH)
     };
     if !due {
         return;
@@ -1005,10 +1016,20 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let (i, addr) = with_host(|h| (h.current, h.threads[h.current].kstate.ctx_addr));
     let gm = GuestMem::new(guest_bytes());
     trace_line(&format!(
-        "gex: no translation for pc={pc:#x} (thread {i}, ctx {addr:#x}, ctx.pc={:#x}, x30={:#x})\n",
-        gm.read_u64(addr + ctx::PC as u64).unwrap_or(0),
-        gm.read_u64(addr + ctx::x(30) as u64).unwrap_or(0)
+        "gex: no translation for pc={pc:#x} (thread {i}, ctx {addr:#x})\n"
     ));
+    let mut regs = String::from("gex:  ");
+    for r in 0..31u8 {
+        regs.push_str(&format!(
+            "x{r}={:#x} ",
+            gm.read_u64(addr + ctx::x(r) as u64).unwrap_or(0)
+        ));
+    }
+    regs.push_str(&format!(
+        "sp={:#x}\n",
+        gm.read_u64(addr + ctx::SP as u64).unwrap_or(0)
+    ));
+    trace_line(&regs);
     with_host(|h| h.exit = Some(128 + 11));
     trap();
 }
