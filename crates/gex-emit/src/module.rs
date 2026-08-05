@@ -409,6 +409,18 @@ impl ModuleBuilder {
     /// Generate all block bodies and encode the module.
     pub fn finish(mut self) -> TranslatedModule {
         let compiled: Vec<(u32, Vec<u8>)> = {
+            let gir: HashMap<u64, &Block> =
+                self.pending.iter().map(|(b, _)| (b.start, b)).collect();
+            // A block reachable only from its one predecessor can be folded
+            // into it without duplicating anything. `call_return` counts:
+            // a callee's `ret` lands there, so it has a predecessor the
+            // control-flow edges do not show.
+            let mut preds: HashMap<u64, u32> = HashMap::new();
+            for (b, _) in &self.pending {
+                for s in b.successors().chain(b.call_return) {
+                    *preds.entry(s).or_default() += 1;
+                }
+            }
             let cx = tier1::Context {
                 syscall: self.imports.syscall,
                 illegal: self.imports.illegal,
@@ -421,6 +433,8 @@ impl ModuleBuilder {
                 fma: self.imports.fma,
                 block_ty: self.block_ty,
                 blocks: &self.blocks,
+                gir: &gir,
+                preds: &preds,
             };
             self.pending
                 .iter()

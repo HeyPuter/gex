@@ -314,6 +314,40 @@ with only a header check in the way. That is why `gex-cache` is a crate of its
 own — the host forbids `unsafe`, and this is the one place the argument has to
 be made and written down.
 
+### Superblocks, and two things that did not work
+
+Three shapes of the same loop, to find where the time goes:
+
+| | gex | QEMU | native | gex/native |
+|---|---|---|---|---|
+| straight-line | 0.23 s | 0.20 s | 0.05 s | 4.9x |
+| direct calls | 1.49 s | 1.37 s | 0.14 s | 10.5x |
+| indirect calls | 2.39 s | 2.41 s | 0.13 s | 18.4x |
+
+Calls are the cost, and the cost is the tail call itself: about fifty cycles
+for an indirect one under wasmtime. That is why gex is 100x faster than QEMU on
+vectorised float code and only 1.2x on Lua's interpreter, which is a dispatch
+loop made of indirect branches.
+
+**An inline cache did not help.** Caching the last `(target, slot)` pair in the
+context skips the shift, the page-directory load, the select and the add — but
+those were never the cost. It gained 4% on a monomorphic `ret` and lost 6% on
+Lua, whose targets vary, because every miss pays the compare and two stores.
+Reverted.
+
+**Folding blocks into their predecessors did help, but only the careful
+version.** Emitting a `Goto` target's body in line rather than tail-calling it
+removes the call *and* lets the register cache live across the join. Doing it
+for every forward target duplicates the block into each predecessor: 10-18%
+more wasm, and Lua and matmul both ran *slower*. Restricting it to targets with
+exactly one predecessor duplicates nothing — 1.4% more wasm — and gives 1.19x
+on matmul and about 1.02x on Lua.
+
+A warning about measuring any of this. gex caches compiled modules and learns
+entry points across runs, so two builds are not comparable until both have
+settled; before they have, the same change measured as 1.29x and as 0.89x. The
+numbers here are minimums of twelve alternating runs with both sides warm.
+
 ### Two tier-1 optimisations
 
 Both are measured the same way: the minimum of runs alternating between the
@@ -544,10 +578,11 @@ sysroot: `os.execute` prints through the shell, the exit status comes back, and
 
 Lua's own `all.lua` driver gets three levels deep on this — gex runs Lua, Lua
 execs the shell, the shell execs Lua again and it prints its version banner —
-and then fails in `main.lua`'s interactive-interpreter checks, on an assertion
-about prompt output with stdin redirected from a file. That one is
-undiagnosed. QEMU cannot be used to tell whether it is gex's fault, because
-QEMU does not get as far as running the shell at all.
+and then fails in `main.lua`'s interactive-interpreter checks. That one is not
+gex's: the test asserts that the input line appears in the interpreter's
+output, which only happens when Lua is built against readline, and this one is
+not. Without `LUA_USE_READLINE`, `lua_readline` writes the prompt and calls
+`fgets`, and nothing echoes.
 
 `--cwd` and `--argv0` exist for this: under a sysroot the host path a program
 was loaded from is not a path the guest can resolve, and a program that passes
