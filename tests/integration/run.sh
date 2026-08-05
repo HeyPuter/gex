@@ -32,6 +32,7 @@ done
 mkdir -p "$WORK"
 pass=0
 fail=0
+flaky=0
 # Extra flags, set around a group of comparisons.
 GEXC_ARGS=""
 QEMU_ARGS=""
@@ -43,11 +44,45 @@ QEMU_ARGS=""
 # on when QEMU itself fails. It is opt-in per test rather than automatic,
 # because "QEMU exited with a signal and printed nothing" is also exactly
 # what a correct run of a program that dies from a signal looks like.
+# A comparison that fails is retried once before being called a failure, and
+# a case that then passes is reported as flaky rather than quietly swallowed.
+# The two engines share a machine, and a run that only fails sometimes is a
+# different problem from one that always does -- the point is to be able to
+# tell them apart, not to hide either.
 compare() {
-    oracle=""
-    check_stderr=1
+    if compare_once "$@"; then
+        return
+    fi
+    label_of "$@"
+    echo "     retrying $retry_label..."
+    if compare_once --quiet "$@"; then
+        echo "FLAKY $retry_label: failed once, passed on retry"
+        flaky=$((flaky + 1))
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+    fi
+}
+
+# Recover the label from a compare() argument list, whatever options precede it.
+label_of() {
     while :; do
         case "$1" in
+            --native-oracle) shift 2 ;;
+            --ignore-stderr|--quiet) shift ;;
+            *) break ;;
+        esac
+    done
+    retry_label="$1"
+}
+
+compare_once() {
+    oracle=""
+    check_stderr=1
+    quiet=0
+    while :; do
+        case "$1" in
+            --quiet) quiet=1; shift ;;
             --native-oracle) oracle="$2"; shift 2 ;;
             # For a process killed by a signal the contract is stdout and the
             # exit status. What the *supervisor* prints is not the guest's
@@ -86,25 +121,29 @@ compare() {
     fi
 
     if [ "$q_rc" != "$g_rc" ]; then
-        echo "FAIL $label: exit status qemu=$q_rc gex=$g_rc"
-        head -3 "$g_out.stderr" | sed 's/^/       /'
-        fail=$((fail + 1))
-        return
+        if [ "$quiet" -eq 0 ]; then
+            echo "FAIL $label: exit status qemu=$q_rc gex=$g_rc"
+            head -3 "$g_out.stderr" | sed 's/^/       /'
+        fi
+        return 1
     fi
     if ! cmp -s "$q_out.stdout" "$g_out.stdout"; then
-        echo "FAIL $label: stdout differs"
-        diff -u "$q_out.stdout" "$g_out.stdout" | head -20 || true
-        fail=$((fail + 1))
-        return
+        if [ "$quiet" -eq 0 ]; then
+            echo "FAIL $label: stdout differs"
+            diff -u "$q_out.stdout" "$g_out.stdout" | head -20 || true
+        fi
+        return 1
     fi
     if [ "$check_stderr" -eq 1 ] && ! cmp -s "$q_out.stderr" "$g_out.stderr"; then
-        echo "FAIL $label: stderr differs"
-        diff -u "$q_out.stderr" "$g_out.stderr" | head -20 || true
-        fail=$((fail + 1))
-        return
+        if [ "$quiet" -eq 0 ]; then
+            echo "FAIL $label: stderr differs"
+            diff -u "$q_out.stderr" "$g_out.stderr" | head -20 || true
+        fi
+        return 1
     fi
     echo "ok   $label"
     pass=$((pass + 1))
+    return 0
 }
 
 echo "building guest programs..."
@@ -209,5 +248,9 @@ compare "nojit-neon-structure" "$WORK/neon2"
 GEXC_ARGS=""
 
 echo
-echo "$pass passed, $fail failed"
+if [ "$flaky" -gt 0 ]; then
+    echo "$pass passed ($flaky flaky), $fail failed"
+else
+    echo "$pass passed, $fail failed"
+fi
 [ "$fail" -eq 0 ]

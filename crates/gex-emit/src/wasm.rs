@@ -254,6 +254,18 @@ impl FuncBody {
         self.byte(0x40);
     }
 
+    /// `loop` with no result.
+    pub fn loop_void(&mut self) {
+        self.byte(op::LOOP);
+        self.byte(0x40);
+    }
+
+    /// Unconditional branch to the label `depth` levels out.
+    pub fn br(&mut self, depth: u32) {
+        self.byte(op::BR);
+        self.u32(depth);
+    }
+
     pub fn else_(&mut self) {
         self.byte(op::ELSE);
     }

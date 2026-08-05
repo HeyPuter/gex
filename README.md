@@ -159,12 +159,16 @@ $ cargo run --release -p gex-difffuzz -- --iters 5000 --verbose
 across all thirteen data-processing families — currently agree with QEMU
 exactly.
 
-**Whole programs, against QEMU.** Thirty comparisons over compiled C
-exercising arithmetic and flags, floating point, memory and strings, control
-flow (jump tables, function pointers, `longjmp`), the filesystem and
-descriptor surface, signal delivery, and `-O3` auto-vectorised NEON — built
-static, static-PIE and dynamically linked, at `-O0`, `-O2` and `-O3`, with
-runtime translation both on and off:
+**Whole programs, against QEMU.** Thirty-five comparisons over compiled C and
+C++ exercising arithmetic and flags, floating point, memory and strings,
+control flow (jump tables, function pointers, `longjmp`), the filesystem and
+descriptor surface, signal delivery, `-O3` auto-vectorised NEON, the NEON
+structure loads driven through ACLE intrinsics, and a C++ program that throws
+across a shared-object boundary — built static, static-PIE and dynamically
+linked, at `-O0`, `-O2` and `-O3`, with runtime translation both on and off.
+A comparison that fails is retried once and reported as `FLAKY` if it then
+passes, so a genuine intermittent difference is distinguishable from a
+consistent one:
 
 ```console
 $ tests/integration/run.sh
@@ -200,6 +204,33 @@ fixed cost is large and its per-unit cost is not.
 
 All three produce byte-identical output.
 
+### Self-loop fusion
+
+A guest block whose only successor is itself is emitted as a real wasm `loop`
+rather than a tail call back to its own function, and the guest registers it
+carries stay in wasm locals across the back-edge instead of round-tripping
+through the context every iteration. Only the registers the block reads
+*before writing* are preloaded: everything preloaded stays live for the whole
+loop, and locals that stay live are machine registers the host's allocator
+cannot use for anything else. Preloading the full read set instead of the
+live-in set turned a 1.28x win on matmul into a 0.90x loss.
+
+Measured as the minimum of interleaved runs with and without the transform
+(`GEX_NO_LOOP_FUSION=1` disables it), on this machine, which is a VM and noisy
+enough that single runs are not worth reading:
+
+| loop | speedup |
+|---|---|
+| `ldr q`/`ldr q`/`fmla`/`str q` + counted branch | 2.47x |
+| `add`/`cmp`/`b.ne` | 1.88x |
+| 320x320 float matmul | 1.28x |
+| `fmla` accumulating into one register | 1.23x |
+| matmul + dot product + `fccmp` classification | 1.05x |
+
+The tail is where the transform stops paying: a loop already bound by a
+floating-point dependency chain, or by memory, does not care where its
+registers live.
+
 Two caveats, both worth stating plainly. The native baseline is x86-64, not
 aarch64, so this is the same C source at `-O2` rather than the same machine
 code — PLAN §13's target is against native aarch64 and this is not that
@@ -230,7 +261,14 @@ deliberate trade recorded here so nobody has to rediscover it.
   the only rounding primitive available; the two differ only exactly on
   halfway values.
 * **`fminnm`/`fmaxnm` propagate NaN** like `fmin`/`fmax`, rather than
-  returning the non-NaN operand.
+  returning the non-NaN operand. The same holds for the across-lane
+  `fminnmv`/`fmaxnmv` and the pairwise `fminnmp`/`fmaxnmp`.
+* **`fmulx` is `fmul`.** They differ only where zero meets infinity, which
+  requires modelling a case wasm's multiply does not distinguish.
+* **The remaining undecoded instructions** are `ld3`/`ld4`, the
+  halving-narrow (`addhn`) and saturating-doubling (`sqdmulh`) multiplies,
+  half precision, and the fixed-point converts — 116 instructions across a
+  752k-instruction corpus of system libraries.
 * **CRC32 is not implemented.** gex does not advertise the extension in
   `AT_HWCAP`, so no well-behaved guest emits it.
 * **`fcmpe` does not raise on quiet NaN**, because FP exceptions are not

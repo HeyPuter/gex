@@ -142,6 +142,10 @@ struct Emitter<'a> {
     free_v128: Vec<u32>,
     /// Guest register cache.
     regs: HashMap<GuestReg, Cached>,
+    /// Set while emitting a block fused into a `wasm` loop: how many nested
+    /// `if`s sit between here and the loop label, so a back-edge knows what
+    /// depth to branch to. `None` when the block is not fused.
+    loop_depth: Option<u32>,
 }
 
 impl<'a> Emitter<'a> {
@@ -164,6 +168,7 @@ impl<'a> Emitter<'a> {
             free_i64: Vec::new(),
             free_v128: Vec::new(),
             regs: HashMap::new(),
+            loop_depth: None,
         }
     }
 
@@ -175,6 +180,22 @@ impl<'a> Emitter<'a> {
 
         let last_use = compute_last_use(block);
 
+        // A block whose only successor is itself becomes a real wasm loop, so
+        // the guest registers it carries stay in locals across the back-edge
+        // instead of round-tripping through the context every iteration. That
+        // is only sound if every register the body reads is loaded *before*
+        // the loop -- otherwise a second iteration would read a context that
+        // the first iteration deliberately did not write back.
+        if self.can_fuse_self_loop(block) {
+            let mut reads = live_in_registers(block);
+            reads.sort_by_key(|r| Self::reg_offset(*r));
+            for r in reads {
+                self.reg_local(r);
+            }
+            self.f.loop_void();
+            self.loop_depth = Some(0);
+        }
+
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
             // Recycle locals whose values are dead after this statement.
@@ -185,6 +206,34 @@ impl<'a> Emitter<'a> {
             }
         }
         self.terminator(block);
+        if self.loop_depth.is_some() {
+            self.f.end();
+            self.loop_depth = None;
+        }
+    }
+
+    /// Whether this block can be emitted as a self-contained wasm loop.
+    ///
+    /// The body must not contain anything that invalidates the register cache
+    /// -- a host call can rewrite guest state, and after one the cached locals
+    /// no longer describe the machine.
+    fn can_fuse_self_loop(&self, block: &Block) -> bool {
+        let back_edge = match block.term {
+            Term::Goto { target } => target == block.start,
+            Term::Branch {
+                taken, not_taken, ..
+            } => taken == block.start || not_taken == block.start,
+            _ => false,
+        };
+        // A single-block loop that is also its own only successor would spin
+        // forever with no exit; `Goto` to itself is exactly that, but it still
+        // needs the safepoint, which the fused form emits.
+        // A kill switch, so the fused and unfused forms can be compared
+        // directly and a suspected miscompilation can be bisected.
+        if std::env::var_os("GEX_NO_LOOP_FUSION").is_some() {
+            return false;
+        }
+        back_edge && !block.stmts.iter().any(clobbers_guest_state)
     }
 
     // -- local management --------------------------------------------------
@@ -284,6 +333,19 @@ impl<'a> Emitter<'a> {
 
     /// Write every dirty cached register back to the context.
     fn flush(&mut self) {
+        self.flush_inner(false);
+    }
+
+    /// Flush, but leave the registers marked dirty.
+    ///
+    /// Used where the flush is emitted inside a conditional: the stores only
+    /// happen on some executions, so the emitter must keep believing the
+    /// context is stale and write them back again on the paths that leave.
+    fn flush_conditional(&mut self) {
+        self.flush_inner(true);
+    }
+
+    fn flush_inner(&mut self, keep_dirty: bool) {
         let mut dirty: Vec<(GuestReg, u32)> = self
             .regs
             .iter()
@@ -301,8 +363,10 @@ impl<'a> Emitter<'a> {
                 Ty::I64 => self.f.store(0x37, 3, Self::reg_offset(r)),
                 Ty::V128 => self.f.simd_mem(simd::V128_STORE, 4, Self::reg_offset(r)),
             }
-            if let Some(c) = self.regs.get_mut(&r) {
-                c.dirty = false;
+            if !keep_dirty {
+                if let Some(c) = self.regs.get_mut(&r) {
+                    c.dirty = false;
+                }
             }
         }
     }
@@ -913,6 +977,12 @@ impl<'a> Emitter<'a> {
     fn terminator(&mut self, block: &Block) {
         match block.term {
             Term::Goto { target } => {
+                if self.loop_depth.is_some() {
+                    self.emit_safepoint(target);
+                    let d = self.loop_depth.unwrap();
+                    self.f.br(d);
+                    return;
+                }
                 self.flush();
                 if target <= block.start {
                     self.emit_safepoint(target);
@@ -924,6 +994,35 @@ impl<'a> Emitter<'a> {
                 taken,
                 not_taken,
             } => {
+                if let Some(depth) = self.loop_depth {
+                    // One arm is the back-edge, which stays inside the loop
+                    // and keeps every register in its local. Only the exit arm
+                    // pays for a flush.
+                    self.push(cond);
+                    self.f.if_void();
+                    if taken == block.start {
+                        self.emit_safepoint(taken);
+                        self.f.br(depth + 1);
+                    } else {
+                        self.flush();
+                        if taken <= block.start {
+                            self.emit_safepoint(taken);
+                        }
+                        self.jump_to_constant(taken);
+                    }
+                    self.f.end();
+                    if not_taken == block.start {
+                        self.emit_safepoint(not_taken);
+                        self.f.br(depth);
+                    } else {
+                        self.flush();
+                        if not_taken <= block.start {
+                            self.emit_safepoint(not_taken);
+                        }
+                        self.jump_to_constant(not_taken);
+                    }
+                    return;
+                }
                 // Flush before the branch so both arms see the stores; doing
                 // it inside the `if` would only cover the taken path.
                 self.flush();
@@ -1003,6 +1102,13 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(0);
         self.f.byte(0x4c); // i32.le_s
         self.f.if_void();
+        // Inside a fused loop the registers live only in locals, so the slow
+        // path -- which may deliver a signal and unwind -- has to write them
+        // back. It runs once every few thousand iterations, so the cost does
+        // not show up.
+        if self.loop_depth.is_some() {
+            self.flush_conditional();
+        }
         self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);
         self.f.call(self.cx.safepoint);
@@ -1297,6 +1403,51 @@ fn lane_shift_op(op: VShiftOp, lane: VLane) -> u32 {
         VShiftOp::ShrS => 1,
         VShiftOp::ShrU => 2,
     }
+}
+
+/// Whether a statement can leave the register cache stale.
+fn clobbers_guest_state(s: &Stmt) -> bool {
+    match s {
+        Stmt::HostCall { func, .. } => func.clobbers_guest_state(),
+        Stmt::Def {
+            expr: Expr::HostCall { func, .. },
+            ..
+        } => func.clobbers_guest_state(),
+        _ => false,
+    }
+}
+
+/// The architectural registers a block reads before writing.
+///
+/// These are exactly the ones the fused loop form must load before the loop:
+/// inside it the context is deliberately left stale, so a read that reaches
+/// past the loop's top would see a value one or more iterations old. A
+/// register the block writes before reading needs no preload, and leaving it
+/// out matters -- every preloaded register is live across the whole loop, and
+/// wasm locals that stay live become machine registers the host's allocator
+/// cannot use for anything else.
+fn live_in_registers(block: &Block) -> Vec<GuestReg> {
+    let mut live_in = Vec::new();
+    let mut written = Vec::new();
+    for s in &block.stmts {
+        match s {
+            Stmt::Def {
+                expr: Expr::ReadReg(r),
+                ..
+            } => {
+                if !written.contains(r) && !live_in.contains(r) {
+                    live_in.push(*r);
+                }
+            }
+            Stmt::WriteReg { reg, .. } => {
+                if !written.contains(reg) {
+                    written.push(*reg);
+                }
+            }
+            _ => {}
+        }
+    }
+    live_in
 }
 
 fn lane_cvt_op(op: VCvtOp, from: VLane) -> u32 {
