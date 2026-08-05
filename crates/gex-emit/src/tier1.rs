@@ -38,6 +38,9 @@ mod simd {
     pub const I16X8_SPLAT: u32 = 0x10;
     pub const I32X4_SPLAT: u32 = 0x11;
     pub const I64X2_SPLAT: u32 = 0x12;
+    pub const I8X16_SHUFFLE: u32 = 0x0d;
+    pub const I8X16_SWIZZLE: u32 = 0x0e;
+    pub const V128_BITSELECT: u32 = 0x52;
     pub const I8X16_POPCNT: u32 = 0x62;
     pub const V128_AND: u32 = 0x4e;
     pub const V128_ANDNOT: u32 = 0x4f;
@@ -599,6 +602,56 @@ impl<'a> Emitter<'a> {
                     VBinOp::AndNot => simd::V128_ANDNOT,
                 });
             }
+            Expr::VLaneBin { op, lane, a, b } => {
+                self.push(*a);
+                self.push(*b);
+                match lane_bin_op(*op, *lane) {
+                    Some(sub) => self.f.simd(sub),
+                    None => panic!("no wasm SIMD instruction for {op:?} on {lane:?}"),
+                }
+            }
+            Expr::VLaneUn { op, lane, a } => {
+                self.push(*a);
+                match lane_un_op(*op, *lane) {
+                    Some(sub) => self.f.simd(sub),
+                    None => panic!("no wasm SIMD instruction for {op:?} on {lane:?}"),
+                }
+            }
+            Expr::VShift {
+                op,
+                lane,
+                a,
+                amount,
+            } => {
+                self.push(*a);
+                self.push(*amount);
+                self.f.simd(lane_shift_op(*op, *lane));
+            }
+            Expr::VShuffle { a, b, lanes } => {
+                self.push(*a);
+                self.push(*b);
+                self.f.simd_shuffle(lanes);
+            }
+            Expr::VSwizzle { a, idx } => {
+                self.push(*a);
+                self.push(*idx);
+                self.f.simd(simd::I8X16_SWIZZLE);
+            }
+            Expr::VBitSelect { mask, a, b } => {
+                // wasm's bitselect takes (a, b, mask) and yields
+                // (a & mask) | (b & !mask).
+                self.push(*a);
+                self.push(*b);
+                self.push(*mask);
+                self.f.simd(simd::V128_BITSELECT);
+            }
+            Expr::VCvt { op, from, a, b } => {
+                self.push(*a);
+                if let Some(b) = b {
+                    self.push(*b);
+                }
+                self.f.simd(lane_cvt_op(*op, *from));
+            }
             Expr::VUn { op, a } => {
                 self.push(*a);
                 match op {
@@ -1058,6 +1111,191 @@ fn cmp_op(op: CmpOp, ty: Ty) -> u8 {
         Ty::I32 => base32,
         // The i64 comparison block mirrors the i32 one, 11 opcodes later.
         Ty::I64 | Ty::V128 => base32 + 0x0b,
+    }
+}
+
+/// Wasm SIMD sub-opcode for a lane-wise binary operation.
+///
+/// The tables are irregular enough — `i64x2` has no unsigned comparisons, no
+/// min/max and no saturating forms — that spelling each case out is clearer
+/// than deriving them from a base plus an offset.
+fn lane_bin_op(op: VLaneBinOp, lane: VLane) -> Option<u32> {
+    use VLane::*;
+    use VLaneBinOp::*;
+    Some(match (op, lane) {
+        (Add, I8) => 0x6e,
+        (Add, I16) => 0x8e,
+        (Add, I32) => 0xae,
+        (Add, I64) => 0xce,
+        (Add, F32) => 0xe4,
+        (Add, F64) => 0xf0,
+        (Sub, I8) => 0x71,
+        (Sub, I16) => 0x91,
+        (Sub, I32) => 0xb1,
+        (Sub, I64) => 0xd1,
+        (Sub, F32) => 0xe5,
+        (Sub, F64) => 0xf1,
+        // There is no `i8x16.mul`; byte multiplies would need widening.
+        (Mul, I16) => 0x95,
+        (Mul, I32) => 0xb5,
+        (Mul, I64) => 0xd5,
+        (Mul, F32) => 0xe6,
+        (Mul, F64) => 0xf2,
+        (Div, F32) => 0xe7,
+        (Div, F64) => 0xf3,
+        // The signed min/max entries double as the floating-point ones,
+        // which the lane type disambiguates.
+        (MinS, I8) => 0x76,
+        (MinS, I16) => 0x96,
+        (MinS, I32) => 0xb6,
+        (MinS, F32) => 0xe8,
+        (MinS, F64) => 0xf4,
+        (MinU, I8) => 0x77,
+        (MinU, I16) => 0x97,
+        (MinU, I32) => 0xb7,
+        (MaxS, I8) => 0x78,
+        (MaxS, I16) => 0x98,
+        (MaxS, I32) => 0xb8,
+        (MaxS, F32) => 0xe9,
+        (MaxS, F64) => 0xf5,
+        (MaxU, I8) => 0x79,
+        (MaxU, I16) => 0x99,
+        (MaxU, I32) => 0xb9,
+        (AddSatS, I8) => 0x6f,
+        (AddSatS, I16) => 0x8f,
+        (AddSatU, I8) => 0x70,
+        (AddSatU, I16) => 0x90,
+        (SubSatS, I8) => 0x72,
+        (SubSatS, I16) => 0x92,
+        (SubSatU, I8) => 0x73,
+        (SubSatU, I16) => 0x93,
+        (AvgrU, I8) => 0x7b,
+        (AvgrU, I16) => 0x9b,
+        (Eq, I8) => 0x23,
+        (Eq, I16) => 0x2d,
+        (Eq, I32) => 0x37,
+        (Eq, I64) => 0xd6,
+        (Eq, F32) => 0x41,
+        (Eq, F64) => 0x47,
+        (Ne, I8) => 0x24,
+        (Ne, I16) => 0x2e,
+        (Ne, I32) => 0x38,
+        (Ne, I64) => 0xd7,
+        (Ne, F32) => 0x42,
+        (Ne, F64) => 0x48,
+        (LtS, I8) => 0x25,
+        (LtS, I16) => 0x2f,
+        (LtS, I32) => 0x39,
+        (LtS, I64) => 0xd8,
+        (LtS, F32) => 0x43,
+        (LtS, F64) => 0x49,
+        (LtU, I8) => 0x26,
+        (LtU, I16) => 0x30,
+        (LtU, I32) => 0x3a,
+        (GtS, I8) => 0x27,
+        (GtS, I16) => 0x31,
+        (GtS, I32) => 0x3b,
+        (GtS, I64) => 0xd9,
+        (GtS, F32) => 0x44,
+        (GtS, F64) => 0x4a,
+        (GtU, I8) => 0x28,
+        (GtU, I16) => 0x32,
+        (GtU, I32) => 0x3c,
+        (LeS, I8) => 0x29,
+        (LeS, I16) => 0x33,
+        (LeS, I32) => 0x3d,
+        (LeS, I64) => 0xda,
+        (LeS, F32) => 0x45,
+        (LeS, F64) => 0x4b,
+        (LeU, I8) => 0x2a,
+        (LeU, I16) => 0x34,
+        (LeU, I32) => 0x3e,
+        (GeS, I8) => 0x2b,
+        (GeS, I16) => 0x35,
+        (GeS, I32) => 0x3f,
+        (GeS, I64) => 0xdb,
+        (GeS, F32) => 0x46,
+        (GeS, F64) => 0x4c,
+        (GeU, I8) => 0x2c,
+        (GeU, I16) => 0x36,
+        (GeU, I32) => 0x40,
+        _ => return None,
+    })
+}
+
+fn lane_un_op(op: VLaneUnOp, lane: VLane) -> Option<u32> {
+    use VLane::*;
+    use VLaneUnOp::*;
+    Some(match (op, lane) {
+        (Abs, I8) => 0x60,
+        (Abs, I16) => 0x80,
+        (Abs, I32) => 0xa0,
+        (Abs, I64) => 0xc0,
+        (Abs, F32) => 0xe0,
+        (Abs, F64) => 0xec,
+        (Neg, I8) => 0x61,
+        (Neg, I16) => 0x81,
+        (Neg, I32) => 0xa1,
+        (Neg, I64) => 0xc1,
+        (Neg, F32) => 0xe1,
+        (Neg, F64) => 0xed,
+        (Sqrt, F32) => 0xe3,
+        (Sqrt, F64) => 0xef,
+        (Ceil, F32) => 0x67,
+        (Ceil, F64) => 0x74,
+        (Floor, F32) => 0x68,
+        (Floor, F64) => 0x75,
+        (Trunc, F32) => 0x69,
+        (Trunc, F64) => 0x7a,
+        (Nearest, F32) => 0x6a,
+        (Nearest, F64) => 0x94,
+        _ => return None,
+    })
+}
+
+fn lane_shift_op(op: VShiftOp, lane: VLane) -> u32 {
+    let base = match lane {
+        VLane::I8 => 0x6b,
+        VLane::I16 => 0x8b,
+        VLane::I32 | VLane::F32 => 0xab,
+        _ => 0xcb,
+    };
+    base + match op {
+        VShiftOp::Shl => 0,
+        VShiftOp::ShrS => 1,
+        VShiftOp::ShrU => 2,
+    }
+}
+
+fn lane_cvt_op(op: VCvtOp, from: VLane) -> u32 {
+    match (op, from) {
+        (VCvtOp::FpToIntSat { signed: true }, VLane::F32) => 0xf8,
+        (VCvtOp::FpToIntSat { signed: false }, VLane::F32) => 0xf9,
+        // The f64 forms produce two lanes and zero the upper two.
+        (VCvtOp::FpToIntSat { signed: true }, _) => 0xfc,
+        (VCvtOp::FpToIntSat { signed: false }, _) => 0xfd,
+        (VCvtOp::IntToFp { signed: true }, VLane::I32) => 0xfa,
+        (VCvtOp::IntToFp { signed: false }, VLane::I32) => 0xfb,
+        (VCvtOp::IntToFp { signed: true }, _) => 0xfe,
+        (VCvtOp::IntToFp { signed: false }, _) => 0xff,
+        (VCvtOp::DemoteF64, _) => 0x5e,
+        (VCvtOp::PromoteF32, _) => 0x5f,
+        (VCvtOp::ExtendLow { signed: true }, VLane::I8) => 0x87,
+        (VCvtOp::ExtendHigh { signed: true }, VLane::I8) => 0x88,
+        (VCvtOp::ExtendLow { signed: false }, VLane::I8) => 0x89,
+        (VCvtOp::ExtendHigh { signed: false }, VLane::I8) => 0x8a,
+        (VCvtOp::ExtendLow { signed: true }, VLane::I16) => 0xa7,
+        (VCvtOp::ExtendHigh { signed: true }, VLane::I16) => 0xa8,
+        (VCvtOp::ExtendLow { signed: false }, VLane::I16) => 0xa9,
+        (VCvtOp::ExtendHigh { signed: false }, VLane::I16) => 0xaa,
+        (VCvtOp::ExtendLow { signed: true }, _) => 0xc7,
+        (VCvtOp::ExtendHigh { signed: true }, _) => 0xc8,
+        (VCvtOp::ExtendLow { signed: false }, _) => 0xc9,
+        (VCvtOp::ExtendHigh { signed: false }, _) => 0xca,
+        (VCvtOp::NarrowSat { signed: true }, VLane::I16) => 0x65,
+        (VCvtOp::NarrowSat { signed: false }, VLane::I16) => 0x66,
+        (VCvtOp::NarrowSat { signed: true }, _) => 0x85,
+        (VCvtOp::NarrowSat { signed: false }, _) => 0x86,
     }
 }
 

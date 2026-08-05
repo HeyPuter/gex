@@ -705,6 +705,8 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 FpOp1::RoundMinus => "frintm",
                 FpOp1::RoundZero => "frintz",
                 FpOp1::RoundAway => "frinta",
+                FpOp1::RoundExact => "frintx",
+                FpOp1::RoundCurrent => "frinti",
             };
             format!("{m} {}, {}", freg(vd, sz), freg(vn, sz))
         }
@@ -886,20 +888,197 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             let w = if q { "16b" } else { "8b" };
             format!("cnt v{}.{w}, v{}.{w}", vd.0, vn.0)
         }
-        Inst::VAddAcross {
+        Inst::VAcross { op, arr, vd, vn } => {
+            let m = match op {
+                VAcrossOp::Add => "addv",
+                VAcrossOp::SMax => "smaxv",
+                VAcrossOp::SMin => "sminv",
+                VAcrossOp::UMax => "umaxv",
+                VAcrossOp::UMin => "uminv",
+                VAcrossOp::FMax => "fmaxv",
+                VAcrossOp::FMin => "fminv",
+            };
+            format!(
+                "{m} {}{}, v{}.{}",
+                lane_letter(arr.lane_bytes),
+                vd.0,
+                vn.0,
+                arr.suffix()
+            )
+        }
+
+        Inst::VSelect { kind, vd, vn, vm, q } => {
+            let w = if q { "16b" } else { "8b" };
+            let m = match kind {
+                VSelKind::Bsl => "bsl",
+                VSelKind::Bit => "bit",
+                VSelKind::Bif => "bif",
+            };
+            format!("{m} v{}.{w}, v{}.{w}, v{}.{w}", vd.0, vn.0, vm.0)
+        }
+        Inst::VThreeSame {
+            op,
+            arr,
+            vd,
+            vn,
+            vm,
+        } => {
+            let m = vop3_name(op);
+            let a = arr.suffix();
+            format!("{m} v{}.{a}, v{}.{a}, v{}.{a}", vd.0, vn.0, vm.0)
+        }
+        Inst::VTwoMisc { op, arr, vd, vn } => {
+            let m = vop2_name(op);
+            let a = arr.suffix();
+            // The compare-with-zero forms print the zero operand.
+            if matches!(
+                op,
+                VOp2::CmEqZero
+                    | VOp2::CmGtZero
+                    | VOp2::CmGeZero
+                    | VOp2::CmLtZero
+                    | VOp2::CmLeZero
+            ) {
+                return format!("{m} v{}.{a}, v{}.{a}, #0", vd.0, vn.0);
+            }
+            if matches!(
+                op,
+                VOp2::FCmEqZero
+                    | VOp2::FCmGtZero
+                    | VOp2::FCmGeZero
+                    | VOp2::FCmLtZero
+                    | VOp2::FCmLeZero
+            ) {
+                return format!("{m} v{}.{a}, v{}.{a}, #0.0", vd.0, vn.0);
+            }
+            // The narrowing forms name the wider source arrangement.
+            if matches!(op, VOp2::Xtn | VOp2::SqXtn | VOp2::UqXtn) {
+                let wide = VArr {
+                    lane_bytes: arr.lane_bytes * 2,
+                    q: true,
+                    float: false,
+                };
+                return format!(
+                    "{m}{} v{}.{a}, v{}.{}",
+                    if arr.q { "2" } else { "" },
+                    vd.0,
+                    vn.0,
+                    wide.suffix()
+                );
+            }
+            format!("{m} v{}.{a}, v{}.{a}", vd.0, vn.0)
+        }
+        Inst::VPermute {
+            op,
+            arr,
+            vd,
+            vn,
+            vm,
+        } => {
+            let m = match op {
+                VPermOp::Trn1 => "trn1",
+                VPermOp::Trn2 => "trn2",
+                VPermOp::Uzp1 => "uzp1",
+                VPermOp::Uzp2 => "uzp2",
+                VPermOp::Zip1 => "zip1",
+                VPermOp::Zip2 => "zip2",
+            };
+            let a = arr.suffix();
+            format!("{m} v{}.{a}, v{}.{a}, v{}.{a}", vd.0, vn.0, vm.0)
+        }
+        Inst::VExt {
+            vd,
+            vn,
+            vm,
+            index,
+            q,
+        } => {
+            let w = if q { "16b" } else { "8b" };
+            format!("ext v{}.{w}, v{}.{w}, v{}.{w}, #{index}", vd.0, vn.0, vm.0)
+        }
+        Inst::VTableLookup {
+            vd,
+            vn,
+            regs,
+            vm,
+            q,
+            is_tbx,
+        } => {
+            let w = if q { "16b" } else { "8b" };
+            let list: Vec<String> = (0..regs)
+                .map(|i| format!("v{}.16b", (vn.0 + i) % 32))
+                .collect();
+            format!(
+                "{} v{}.{w}, {{{}}}, v{}.{w}",
+                if is_tbx { "tbx" } else { "tbl" },
+                vd.0,
+                list.join(", "),
+                vm.0
+            )
+        }
+        Inst::VDupElement {
             vd,
             vn,
             lane_bytes,
+            index,
             q,
         } => {
-            let t = match lane_bytes {
-                1 => 'b',
-                2 => 'h',
-                _ => 's',
+            let arr = VArr {
+                lane_bytes,
+                q,
+                float: false,
             };
-            let lanes = (if q { 16 } else { 8 }) / lane_bytes;
-            format!("addv {t}{}, v{}.{lanes}{t}", vd.0, vn.0)
+            format!(
+                "dup v{}.{}, v{}.{}[{index}]",
+                vd.0,
+                arr.suffix(),
+                vn.0,
+                lane_letter(lane_bytes)
+            )
         }
+        Inst::VInsElement {
+            vd,
+            vn,
+            lane_bytes,
+            dst_index,
+            src_index,
+        } => {
+            let t = lane_letter(lane_bytes);
+            format!(
+                "mov v{}.{t}[{dst_index}], v{}.{t}[{src_index}]",
+                vd.0, vn.0
+            )
+        }
+        Inst::VShiftImm {
+            op,
+            arr,
+            vd,
+            vn,
+            shift,
+        } => {
+            let m = match op {
+                VShiftImmOp::Shl => "shl",
+                VShiftImmOp::SShr => "sshr",
+                VShiftImmOp::UShr => "ushr",
+                VShiftImmOp::SShll => "sshll",
+                VShiftImmOp::UShll => "ushll",
+                VShiftImmOp::Shrn => "shrn",
+            };
+            let a = arr.suffix();
+            format!("{m} v{}.{a}, v{}.{a}, #{shift}", vd.0, vn.0)
+        }
+        Inst::FpCondCompare {
+            sz,
+            vn,
+            vm,
+            nzcv,
+            cond,
+        } => format!(
+            "fccmp {}, {}, #{nzcv}, {}",
+            freg(vn, sz),
+            freg(vm, sz),
+            cond.name()
+        ),
 
         Inst::VLogical { op, vd, vn, vm, q } => {
             let w = if q { "16b" } else { "8b" };
@@ -1019,6 +1198,107 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 reg(rn, Sz::X)
             )
         }
+    }
+}
+
+fn lane_letter(lane_bytes: u32) -> char {
+    match lane_bytes {
+        1 => 'b',
+        2 => 'h',
+        4 => 's',
+        _ => 'd',
+    }
+}
+
+fn vop3_name(op: VOp3) -> &'static str {
+    match op {
+        VOp3::Add => "add",
+        VOp3::Sub => "sub",
+        VOp3::Mul => "mul",
+        VOp3::Mla => "mla",
+        VOp3::Mls => "mls",
+        VOp3::SMax => "smax",
+        VOp3::SMin => "smin",
+        VOp3::UMax => "umax",
+        VOp3::UMin => "umin",
+        VOp3::SqAdd => "sqadd",
+        VOp3::UqAdd => "uqadd",
+        VOp3::SqSub => "sqsub",
+        VOp3::UqSub => "uqsub",
+        VOp3::UrHAdd => "urhadd",
+        VOp3::CmEq => "cmeq",
+        VOp3::CmGt => "cmgt",
+        VOp3::CmGe => "cmge",
+        VOp3::CmHi => "cmhi",
+        VOp3::CmHs => "cmhs",
+        VOp3::CmTst => "cmtst",
+        VOp3::AddP => "addp",
+        VOp3::SAbd => "sabd",
+        VOp3::UAbd => "uabd",
+        VOp3::FAdd => "fadd",
+        VOp3::FSub => "fsub",
+        VOp3::FMul => "fmul",
+        VOp3::FDiv => "fdiv",
+        VOp3::FMax => "fmax",
+        VOp3::FMin => "fmin",
+        VOp3::FMaxNm => "fmaxnm",
+        VOp3::FMinNm => "fminnm",
+        VOp3::FAddP => "faddp",
+        VOp3::FMla => "fmla",
+        VOp3::FMls => "fmls",
+        VOp3::FCmEq => "fcmeq",
+        VOp3::FCmGe => "fcmge",
+        VOp3::FCmGt => "fcmgt",
+    }
+}
+
+fn vop2_name(op: VOp2) -> &'static str {
+    match op {
+        VOp2::Neg => "neg",
+        VOp2::Abs => "abs",
+        VOp2::Not => "not",
+        VOp2::Cnt => "cnt",
+        VOp2::Clz => "clz",
+        VOp2::Cls => "cls",
+        VOp2::Rbit => "rbit",
+        VOp2::Rev16 => "rev16",
+        VOp2::Rev32 => "rev32",
+        VOp2::Rev64 => "rev64",
+        VOp2::FNeg => "fneg",
+        VOp2::FAbs => "fabs",
+        VOp2::FSqrt => "fsqrt",
+        VOp2::FrintN => "frintn",
+        VOp2::FrintP => "frintp",
+        VOp2::FrintM => "frintm",
+        VOp2::FrintZ => "frintz",
+        VOp2::FrintA => "frinta",
+        VOp2::FrintX => "frintx",
+        VOp2::FrintI => "frinti",
+        VOp2::CmEqZero => "cmeq",
+        VOp2::CmGtZero => "cmgt",
+        VOp2::CmGeZero => "cmge",
+        VOp2::CmLtZero => "cmlt",
+        VOp2::CmLeZero => "cmle",
+        VOp2::FCmEqZero => "fcmeq",
+        VOp2::FCmGtZero => "fcmgt",
+        VOp2::FCmGeZero => "fcmge",
+        VOp2::FCmLtZero => "fcmlt",
+        VOp2::FCmLeZero => "fcmle",
+        VOp2::FcvtZs => "fcvtzs",
+        VOp2::FcvtZu => "fcvtzu",
+        VOp2::FcvtNs => "fcvtns",
+        VOp2::FcvtNu => "fcvtnu",
+        VOp2::FcvtPs => "fcvtps",
+        VOp2::FcvtPu => "fcvtpu",
+        VOp2::FcvtMs => "fcvtms",
+        VOp2::FcvtMu => "fcvtmu",
+        VOp2::FcvtAs => "fcvtas",
+        VOp2::FcvtAu => "fcvtau",
+        VOp2::Scvtf => "scvtf",
+        VOp2::Ucvtf => "ucvtf",
+        VOp2::Xtn => "xtn",
+        VOp2::SqXtn => "sqxtn",
+        VOp2::UqXtn => "uqxtn",
     }
 }
 

@@ -19,7 +19,7 @@ use gex_ir::*;
 use gex_isa::{
     AddOp, AddrMode, BarrierKind, BfOp, Cond, Dp1Op, Dp2Op, Dp3Op, Extend, Inst, LogOp, MemSz,
     MoveOp, Ordering as IsaOrder, RegSel, RmwOp as IsaRmw, ShiftType, Sz, SysMaintOp, SysReg,
-    FpOp1, FpOp2, FpRound, FpSz, VLogOp,
+    FpOp1, FpOp2, FpRound, FpSz, VAcrossOp, VArr, VOp2, VOp3, VPermOp, VSelKind, VShiftImmOp, VLogOp,
 };
 
 mod block;
@@ -1160,10 +1160,14 @@ impl<'a> Lifter<'a> {
                         double,
                         a,
                     }),
-                    FpOp1::RoundNearest | FpOp1::RoundAway => self.b.def(Expr::FpUn {
-                        // Wasm's `nearest` breaks ties to even. AArch64's
-                        // FRINTA breaks them away from zero, so the two agree
-                        // except exactly on halfway values.
+                    // Wasm's `nearest` breaks ties to even. FRINTA breaks
+                    // them away from zero, and FRINTX/FRINTI follow the FPCR
+                    // mode, which gex does not track in fast mode — so all
+                    // four agree except exactly on halfway values.
+                    FpOp1::RoundNearest
+                    | FpOp1::RoundAway
+                    | FpOp1::RoundExact
+                    | FpOp1::RoundCurrent => self.b.def(Expr::FpUn {
                         op: FpUnOp::RoundNearest,
                         double,
                         a,
@@ -1266,38 +1270,11 @@ impl<'a> Lifter<'a> {
                 // The architecture's mapping: equal -> 0110, less -> 1000,
                 // greater -> 0010, unordered -> 0011. That is exactly
                 // N = lt, Z = eq, C = NOT lt, V = unordered.
-                let lt = self.b.def(Expr::FpCmp {
-                    op: FpCmpOp::Lt,
-                    double,
-                    a,
-                    b,
-                });
-                let eq = self.b.def(Expr::FpCmp {
-                    op: FpCmpOp::Eq,
-                    double,
-                    a,
-                    b,
-                });
-                // A NaN is the only value not equal to itself.
-                let a_nan = self.b.def(Expr::FpCmp {
-                    op: FpCmpOp::Ne,
-                    double,
-                    a,
-                    b: a,
-                });
-                let b_nan = self.b.def(Expr::FpCmp {
-                    op: FpCmpOp::Ne,
-                    double,
-                    a: b,
-                    b,
-                });
-                let unordered = self.b.bin(BinOp::Or, Ty::I32, a_nan, b_nan);
-                let one = self.b.const_i32(1);
-                let not_lt = self.b.bin(BinOp::Xor, Ty::I32, lt, one);
-                self.b.write(GuestReg::N, lt);
-                self.b.write(GuestReg::Z, eq);
-                self.b.write(GuestReg::C, not_lt);
-                self.b.write(GuestReg::V, unordered);
+                let (n, z, c, v) = self.fp_compare_flags(double, a, b);
+                self.b.write(GuestReg::N, n);
+                self.b.write(GuestReg::Z, z);
+                self.b.write(GuestReg::C, c);
+                self.b.write(GuestReg::V, v);
                 Flow::Next
             }
 
@@ -1523,46 +1500,296 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
-            Inst::VAddAcross {
-                vd,
-                vn,
-                lane_bytes,
-                q,
-            } => {
-                // Wasm has no horizontal reduction, so the lanes are summed
-                // one at a time. The result is truncated to the element size,
-                // which the final `VReplace` into a zeroed vector does.
-                let vec = self.b.read(GuestReg::V128(vn.0));
-                let lanes = (if q { 16 } else { 8 }) / lane_bytes;
-                let ty = Ty::I32;
-                let mut acc = self.b.def(Expr::VExtract {
-                    a: vec,
-                    lane: 0,
-                    lane_bytes,
-                    signed: false,
-                    ty,
-                });
-                for lane in 1..lanes {
-                    let next = self.b.def(Expr::VExtract {
-                        a: vec,
-                        lane,
-                        lane_bytes,
-                        signed: false,
-                        ty,
+            Inst::VAcross { op, arr, vd, vn } => {
+                // Wasm has no horizontal reduction, so fold the vector in
+                // half repeatedly: log2(lanes) shuffles and lane-wise ops
+                // leave the answer in lane 0.
+                let lane = Self::lane_of(arr);
+                let bin = match op {
+                    VAcrossOp::Add => VLaneBinOp::Add,
+                    VAcrossOp::SMax | VAcrossOp::FMax => VLaneBinOp::MaxS,
+                    VAcrossOp::SMin | VAcrossOp::FMin => VLaneBinOp::MinS,
+                    VAcrossOp::UMax => VLaneBinOp::MaxU,
+                    VAcrossOp::UMin => VLaneBinOp::MinU,
+                };
+                let mut acc = self.b.read(GuestReg::V128(vn.0));
+                let lb = arr.lane_bytes;
+                let mut span = arr.lanes();
+                while span > 1 {
+                    let half = span / 2;
+                    // Bring the upper half of the live range down.
+                    let mut lanes = [0u8; 16];
+                    for (i, slot) in lanes.iter_mut().enumerate() {
+                        let i = i as u32;
+                        let l = i / lb;
+                        *slot = if l < half {
+                            ((l + half) * lb + i % lb) as u8
+                        } else {
+                            i as u8
+                        };
+                    }
+                    let shifted = self.b.def(Expr::VShuffle {
+                        a: acc,
+                        b: acc,
+                        lanes: Box::new(lanes),
                     });
-                    acc = self.b.bin(BinOp::Add, ty, acc, next);
+                    acc = self.b.def(Expr::VLaneBin {
+                        op: bin,
+                        lane,
+                        a: acc,
+                        b: shifted,
+                    });
+                    span = half;
                 }
+                // Only lane 0 is architecturally defined; the rest is zero.
+                let value = self.b.def(Expr::VExtract {
+                    a: acc,
+                    lane: 0,
+                    lane_bytes: lb,
+                    signed: false,
+                    ty: if lb == 8 { Ty::I64 } else { Ty::I32 },
+                });
                 let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
                 let out = self.b.def(Expr::VReplace {
                     a: zero,
                     lane: 0,
-                    lane_bytes,
-                    val: acc,
+                    lane_bytes: lb,
+                    val: value,
                 });
                 self.b.write(GuestReg::V128(vd.0), out);
                 Flow::Next
             }
 
+            Inst::VSelect { kind, vd, vn, vm, q } => {
+                // All three are one bitselect; they differ only in which
+                // operand supplies the mask and which the alternatives.
+                let d = self.b.read(GuestReg::V128(vd.0));
+                let n = self.b.read(GuestReg::V128(vn.0));
+                let m = self.b.read(GuestReg::V128(vm.0));
+                let (mask, a, b) = match kind {
+                    VSelKind::Bsl => (d, n, m),
+                    VSelKind::Bit => (m, n, d),
+                    VSelKind::Bif => (m, d, n),
+                };
+                let r = self.b.def(Expr::VBitSelect { mask, a, b });
+                let v = self.narrow_to_64(r, q);
+                self.b.write(GuestReg::V128(vd.0), v);
+                Flow::Next
+            }
+
+            Inst::VThreeSame {
+                op,
+                arr,
+                vd,
+                vn,
+                vm,
+            } => self.three_same(op, arr, vd, vn, vm, pc),
+
+            Inst::VTwoMisc { op, arr, vd, vn } => self.two_misc(op, arr, vd, vn, pc),
+
+            Inst::VPermute {
+                op,
+                arr,
+                vd,
+                vn,
+                vm,
+            } => {
+                let a = self.b.read(GuestReg::V128(vn.0));
+                let b = self.b.read(GuestReg::V128(vm.0));
+                let lanes = permute_pattern(op, arr);
+                let r = self.b.def(Expr::VShuffle {
+                    a,
+                    b,
+                    lanes: Box::new(lanes),
+                });
+                let v = self.narrow_to_64(r, arr.q);
+                self.b.write(GuestReg::V128(vd.0), v);
+                Flow::Next
+            }
+
+            Inst::VExt {
+                vd,
+                vn,
+                vm,
+                index,
+                q,
+            } => {
+                let a = self.b.read(GuestReg::V128(vn.0));
+                let b = self.b.read(GuestReg::V128(vm.0));
+                // The 64-bit form windows over the low halves of both
+                // registers, so the second source's bytes start at 8.
+                let width = if q { 16u32 } else { 8 };
+                let mut lanes = [0u8; 16];
+                for (i, slot) in lanes.iter_mut().enumerate() {
+                    let pos = index + i as u32;
+                    *slot = if pos < width {
+                        pos as u8
+                    } else {
+                        (16 + (pos - width)) as u8
+                    };
+                }
+                let r = self.b.def(Expr::VShuffle {
+                    a,
+                    b,
+                    lanes: Box::new(lanes),
+                });
+                let v = self.narrow_to_64(r, q);
+                self.b.write(GuestReg::V128(vd.0), v);
+                Flow::Next
+            }
+
+            Inst::VTableLookup {
+                vd,
+                vn,
+                regs,
+                vm,
+                q,
+                is_tbx,
+            } => {
+                // A single-register table is exactly wasm's swizzle: indices
+                // past the end produce zero. Wider tables need one swizzle
+                // per register, biased so each sees 0..15, then merged.
+                let idx = self.b.read(GuestReg::V128(vm.0));
+                let mut acc: Option<Value> = None;
+                for i in 0..regs {
+                    let table = self.b.read(GuestReg::V128((vn.0 + i) % 32));
+                    let bias = self.b.def(Expr::VConst(Box::new([i * 16; 16])));
+                    let local = self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Sub,
+                        lane: VLane::I8,
+                        a: idx,
+                        b: bias,
+                    });
+                    let part = self.b.def(Expr::VSwizzle {
+                        a: table,
+                        idx: local,
+                    });
+                    acc = Some(match acc {
+                        None => part,
+                        Some(prev) => self.b.def(Expr::VBin {
+                            op: VBinOp::Or,
+                            a: prev,
+                            b: part,
+                        }),
+                    });
+                }
+                let mut r = acc.expect("at least one table register");
+                if is_tbx {
+                    // `tbx` keeps the destination's existing bytes where the
+                    // index was out of range — exactly where swizzle gave 0.
+                    let old = self.b.read(GuestReg::V128(vd.0));
+                    let limit = self.b.def(Expr::VConst(Box::new([regs * 16; 16])));
+                    let in_range = self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::LtU,
+                        lane: VLane::I8,
+                        a: idx,
+                        b: limit,
+                    });
+                    r = self.b.def(Expr::VBitSelect {
+                        mask: in_range,
+                        a: r,
+                        b: old,
+                    });
+                }
+                let v = self.narrow_to_64(r, q);
+                self.b.write(GuestReg::V128(vd.0), v);
+                Flow::Next
+            }
+
+            Inst::VDupElement {
+                vd,
+                vn,
+                lane_bytes,
+                index,
+                q,
+            } => {
+                let a = self.b.read(GuestReg::V128(vn.0));
+                let mut lanes = [0u8; 16];
+                for (i, slot) in lanes.iter_mut().enumerate() {
+                    let byte = i as u32 % lane_bytes;
+                    *slot = (index * lane_bytes + byte) as u8;
+                }
+                let r = self.b.def(Expr::VShuffle {
+                    a,
+                    b: a,
+                    lanes: Box::new(lanes),
+                });
+                let v = self.narrow_to_64(r, q);
+                self.b.write(GuestReg::V128(vd.0), v);
+                Flow::Next
+            }
+
+            Inst::VInsElement {
+                vd,
+                vn,
+                lane_bytes,
+                dst_index,
+                src_index,
+            } => {
+                // Insertion leaves every other lane of the destination alone,
+                // so it is one shuffle drawing from both registers.
+                let dst = self.b.read(GuestReg::V128(vd.0));
+                let src = self.b.read(GuestReg::V128(vn.0));
+                let mut lanes = [0u8; 16];
+                for (i, slot) in lanes.iter_mut().enumerate() {
+                    let i = i as u32;
+                    let lane = i / lane_bytes;
+                    *slot = if lane == dst_index {
+                        (16 + src_index * lane_bytes + (i % lane_bytes)) as u8
+                    } else {
+                        i as u8
+                    };
+                }
+                let r = self.b.def(Expr::VShuffle {
+                    a: dst,
+                    b: src,
+                    lanes: Box::new(lanes),
+                });
+                self.b.write(GuestReg::V128(vd.0), r);
+                Flow::Next
+            }
+
+            Inst::VShiftImm {
+                op,
+                arr,
+                vd,
+                vn,
+                shift,
+            } => self.shift_imm(op, arr, vd, vn, shift, pc),
+
+            Inst::FpCondCompare {
+                sz,
+                vn,
+                vm,
+                nzcv,
+                cond,
+            } => {
+                let double = sz.is_double();
+                let a = self.rd_fp(vn, sz);
+                let b = self.rd_fp(vm, sz);
+                let (n, z, c, v) = self.fp_compare_flags(double, a, b);
+                let taken = self.eval_cond(cond);
+                let alt = [
+                    (nzcv >> 3) as u32 & 1,
+                    (nzcv >> 2) as u32 & 1,
+                    (nzcv >> 1) as u32 & 1,
+                    nzcv as u32 & 1,
+                ];
+                for (i, (flag, reg)) in [
+                    (n, GuestReg::N),
+                    (z, GuestReg::Z),
+                    (c, GuestReg::C),
+                    (v, GuestReg::V),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let fallback = self.b.const_i32(alt[i]);
+                    let sel = self.b.select(taken, flag, fallback, Ty::I32);
+                    self.b.write(reg, sel);
+                }
+                Flow::Next
+            }
             Inst::VLogical { op, vd, vn, vm, q } => {
                 let a = self.b.read(GuestReg::V128(vn.0));
                 let b = self.b.read(GuestReg::V128(vm.0));
@@ -1597,6 +1824,427 @@ impl<'a> Lifter<'a> {
     }
 
     // -- scalar floating point ---------------------------------------------
+
+    /// The lane type GIR should use for an arrangement.
+    fn lane_of(arr: VArr) -> VLane {
+        match (arr.lane_bytes, arr.float) {
+            (1, _) => VLane::I8,
+            (2, _) => VLane::I16,
+            (4, true) => VLane::F32,
+            (4, _) => VLane::I32,
+            (8, true) => VLane::F64,
+            _ => VLane::I64,
+        }
+    }
+
+    /// Restrict a result to the lanes the arrangement actually writes.
+    fn commit_vector(&mut self, vd: gex_isa::VReg, arr: VArr, value: Value) {
+        let v = self.narrow_to_64(value, arr.q);
+        self.b.write(GuestReg::V128(vd.0), v);
+    }
+
+    fn three_same(
+        &mut self,
+        op: VOp3,
+        arr: VArr,
+        vd: gex_isa::VReg,
+        vn: gex_isa::VReg,
+        vm: gex_isa::VReg,
+        pc: u64,
+    ) -> Flow {
+        let lane = Self::lane_of(arr);
+        let a = self.b.read(GuestReg::V128(vn.0));
+        let b = self.b.read(GuestReg::V128(vm.0));
+
+        let simple = |op| Some(op);
+        let bin: Option<VLaneBinOp> = match op {
+            VOp3::Add | VOp3::FAdd => simple(VLaneBinOp::Add),
+            VOp3::Sub | VOp3::FSub => simple(VLaneBinOp::Sub),
+            VOp3::Mul | VOp3::FMul => simple(VLaneBinOp::Mul),
+            VOp3::FDiv => simple(VLaneBinOp::Div),
+            VOp3::SMax => simple(VLaneBinOp::MaxS),
+            VOp3::SMin => simple(VLaneBinOp::MinS),
+            VOp3::UMax => simple(VLaneBinOp::MaxU),
+            VOp3::UMin => simple(VLaneBinOp::MinU),
+            // NEON's FMAX/FMIN propagate NaN, which is what wasm's
+            // f32x4.max/min do; the "number" forms differ only on NaN.
+            VOp3::FMax | VOp3::FMaxNm => simple(VLaneBinOp::MaxS),
+            VOp3::FMin | VOp3::FMinNm => simple(VLaneBinOp::MinS),
+            VOp3::SqAdd => simple(VLaneBinOp::AddSatS),
+            VOp3::UqAdd => simple(VLaneBinOp::AddSatU),
+            VOp3::SqSub => simple(VLaneBinOp::SubSatS),
+            VOp3::UqSub => simple(VLaneBinOp::SubSatU),
+            VOp3::UrHAdd => simple(VLaneBinOp::AvgrU),
+            VOp3::CmEq | VOp3::FCmEq => simple(VLaneBinOp::Eq),
+            VOp3::CmGt | VOp3::FCmGt => simple(VLaneBinOp::GtS),
+            VOp3::CmGe | VOp3::FCmGe => simple(VLaneBinOp::GeS),
+            VOp3::CmHi => simple(VLaneBinOp::GtU),
+            VOp3::CmHs => simple(VLaneBinOp::GeU),
+            _ => None,
+        };
+        if let Some(bin) = bin {
+            // The floating-point max/min share an enum entry with the signed
+            // integer ones; the lane type disambiguates them in the backend.
+            let r = self.b.def(Expr::VLaneBin { op: bin, lane, a, b });
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+
+        match op {
+            // Multiply-accumulate reads the destination as a third operand.
+            VOp3::Mla | VOp3::Mls | VOp3::FMla | VOp3::FMls => {
+                let acc = self.b.read(GuestReg::V128(vd.0));
+                let prod = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Mul,
+                    lane,
+                    a,
+                    b,
+                });
+                let add = matches!(op, VOp3::Mla | VOp3::FMla);
+                // The floating-point forms are fused on hardware; wasm has no
+                // vector FMA, so the product is rounded first (PLAN §5.7).
+                let r = self.b.def(Expr::VLaneBin {
+                    op: if add {
+                        VLaneBinOp::Add
+                    } else {
+                        VLaneBinOp::Sub
+                    },
+                    lane,
+                    a: acc,
+                    b: prod,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            // `cmtst` sets lanes where the bitwise AND is non-zero.
+            VOp3::CmTst => {
+                let and = self.b.def(Expr::VBin {
+                    op: VBinOp::And,
+                    a,
+                    b,
+                });
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                let r = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Ne,
+                    lane,
+                    a: and,
+                    b: zero,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            // Absolute difference: max - min avoids a signed overflow that a
+            // subtract-then-abs would hit at the extremes.
+            VOp3::SAbd | VOp3::UAbd => {
+                let signed = op == VOp3::SAbd;
+                let hi = self.b.def(Expr::VLaneBin {
+                    op: if signed {
+                        VLaneBinOp::MaxS
+                    } else {
+                        VLaneBinOp::MaxU
+                    },
+                    lane,
+                    a,
+                    b,
+                });
+                let lo = self.b.def(Expr::VLaneBin {
+                    op: if signed {
+                        VLaneBinOp::MinS
+                    } else {
+                        VLaneBinOp::MinU
+                    },
+                    lane,
+                    a,
+                    b,
+                });
+                let r = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Sub,
+                    lane,
+                    a: hi,
+                    b: lo,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            // Pairwise add: deinterleave the concatenation, then add.
+            VOp3::AddP | VOp3::FAddP => {
+                let (evens, odds) = pairwise_patterns(arr);
+                let e = self.b.def(Expr::VShuffle {
+                    a,
+                    b,
+                    lanes: Box::new(evens),
+                });
+                let o = self.b.def(Expr::VShuffle {
+                    a,
+                    b,
+                    lanes: Box::new(odds),
+                });
+                let r = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Add,
+                    lane,
+                    a: e,
+                    b: o,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            _ => Flow::End(Term::Illegal { raw: 0, pc }),
+        }
+    }
+
+    fn two_misc(
+        &mut self,
+        op: VOp2,
+        arr: VArr,
+        vd: gex_isa::VReg,
+        vn: gex_isa::VReg,
+        pc: u64,
+    ) -> Flow {
+        let lane = Self::lane_of(arr);
+        let a = self.b.read(GuestReg::V128(vn.0));
+
+        let un: Option<VLaneUnOp> = match op {
+            VOp2::Neg | VOp2::FNeg => Some(VLaneUnOp::Neg),
+            VOp2::Abs | VOp2::FAbs => Some(VLaneUnOp::Abs),
+            VOp2::FSqrt => Some(VLaneUnOp::Sqrt),
+            VOp2::FrintP => Some(VLaneUnOp::Ceil),
+            VOp2::FrintM => Some(VLaneUnOp::Floor),
+            VOp2::FrintZ => Some(VLaneUnOp::Trunc),
+            // Ties-to-even stands in for every nearest variant (PLAN §5.7).
+            VOp2::FrintN | VOp2::FrintA | VOp2::FrintX | VOp2::FrintI => {
+                Some(VLaneUnOp::Nearest)
+            }
+            _ => None,
+        };
+        if let Some(un) = un {
+            let r = self.b.def(Expr::VLaneUn { op: un, lane, a });
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+
+        match op {
+            VOp2::Not => {
+                let ones = self.b.def(Expr::VConst(Box::new([0xff; 16])));
+                let r = self.b.def(Expr::VBin {
+                    op: VBinOp::Xor,
+                    a,
+                    b: ones,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            VOp2::Cnt => {
+                let r = self.b.def(Expr::VUn {
+                    op: VUnOp::PopcntBytes,
+                    a,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            // The reverse family is a fixed byte permutation.
+            VOp2::Rev16 | VOp2::Rev32 | VOp2::Rev64 => {
+                let group = match op {
+                    VOp2::Rev16 => 2u32,
+                    VOp2::Rev32 => 4,
+                    _ => 8,
+                };
+                let mut lanes = [0u8; 16];
+                for (i, slot) in lanes.iter_mut().enumerate() {
+                    let i = i as u32;
+                    let base = i - (i % group);
+                    let within = i % group;
+                    // Reverse whole elements inside each group.
+                    let elem = within / arr.lane_bytes;
+                    let n_elems = group / arr.lane_bytes;
+                    let src_elem = n_elems - 1 - elem;
+                    *slot = (base + src_elem * arr.lane_bytes + (within % arr.lane_bytes)) as u8;
+                }
+                let r = self.b.def(Expr::VShuffle {
+                    a,
+                    b: a,
+                    lanes: Box::new(lanes),
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            VOp2::CmEqZero
+            | VOp2::CmGtZero
+            | VOp2::CmGeZero
+            | VOp2::CmLtZero
+            | VOp2::CmLeZero
+            | VOp2::FCmEqZero
+            | VOp2::FCmGtZero
+            | VOp2::FCmGeZero
+            | VOp2::FCmLtZero
+            | VOp2::FCmLeZero => {
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                let cmp = match op {
+                    VOp2::CmEqZero | VOp2::FCmEqZero => VLaneBinOp::Eq,
+                    VOp2::CmGtZero | VOp2::FCmGtZero => VLaneBinOp::GtS,
+                    VOp2::CmGeZero | VOp2::FCmGeZero => VLaneBinOp::GeS,
+                    VOp2::CmLtZero | VOp2::FCmLtZero => VLaneBinOp::LtS,
+                    _ => VLaneBinOp::LeS,
+                };
+                let r = self.b.def(Expr::VLaneBin {
+                    op: cmp,
+                    lane,
+                    a,
+                    b: zero,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            VOp2::FcvtZs | VOp2::FcvtZu => {
+                let signed = op == VOp2::FcvtZs;
+                let r = self.b.def(Expr::VCvt {
+                    op: VCvtOp::FpToIntSat { signed },
+                    from: lane,
+                    a,
+                    b: None,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            // The other rounding modes round first, then truncate; the
+            // rounded value is already integral so nothing is lost.
+            VOp2::FcvtNs | VOp2::FcvtNu | VOp2::FcvtAs | VOp2::FcvtAu | VOp2::FcvtPs
+            | VOp2::FcvtPu | VOp2::FcvtMs | VOp2::FcvtMu => {
+                let round = match op {
+                    VOp2::FcvtPs | VOp2::FcvtPu => VLaneUnOp::Ceil,
+                    VOp2::FcvtMs | VOp2::FcvtMu => VLaneUnOp::Floor,
+                    _ => VLaneUnOp::Nearest,
+                };
+                let signed = matches!(
+                    op,
+                    VOp2::FcvtNs | VOp2::FcvtAs | VOp2::FcvtPs | VOp2::FcvtMs
+                );
+                let rounded = self.b.def(Expr::VLaneUn { op: round, lane, a });
+                let r = self.b.def(Expr::VCvt {
+                    op: VCvtOp::FpToIntSat { signed },
+                    from: lane,
+                    a: rounded,
+                    b: None,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            VOp2::Scvtf | VOp2::Ucvtf => {
+                let signed = op == VOp2::Scvtf;
+                let r = self.b.def(Expr::VCvt {
+                    op: VCvtOp::IntToFp { signed },
+                    from: lane.as_int(),
+                    a,
+                    b: None,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            // Narrowing writes the low half of the destination, or the high
+            // half for the `2` forms; both are byte permutations of the
+            // truncated lanes.
+            VOp2::Xtn => {
+                let mut lanes = [0u8; 16];
+                let half = arr.lane_bytes;
+                for i in 0..8u32 {
+                    let elem = i / half;
+                    let within = i % half;
+                    lanes[i as usize] = (elem * half * 2 + within) as u8;
+                }
+                let packed = self.b.def(Expr::VShuffle {
+                    a,
+                    b: a,
+                    lanes: Box::new(lanes),
+                });
+                if arr.q {
+                    // `xtn2` keeps the destination's low half.
+                    let old = self.b.read(GuestReg::V128(vd.0));
+                    let mut merge = [0u8; 16];
+                    for i in 0..8 {
+                        merge[i] = i as u8;
+                        merge[i + 8] = (16 + i) as u8;
+                    }
+                    let r = self.b.def(Expr::VShuffle {
+                        a: old,
+                        b: packed,
+                        lanes: Box::new(merge),
+                    });
+                    self.b.write(GuestReg::V128(vd.0), r);
+                } else {
+                    let v = self.narrow_to_64(packed, false);
+                    self.b.write(GuestReg::V128(vd.0), v);
+                }
+                Flow::Next
+            }
+            _ => Flow::End(Term::Illegal { raw: 0, pc }),
+        }
+    }
+
+    fn shift_imm(
+        &mut self,
+        op: VShiftImmOp,
+        arr: VArr,
+        vd: gex_isa::VReg,
+        vn: gex_isa::VReg,
+        shift: u32,
+        pc: u64,
+    ) -> Flow {
+        let lane = Self::lane_of(arr);
+        let a = self.b.read(GuestReg::V128(vn.0));
+        let amount = self.b.const_i32(shift);
+        let sop = match op {
+            VShiftImmOp::Shl => VShiftOp::Shl,
+            VShiftImmOp::SShr => VShiftOp::ShrS,
+            VShiftImmOp::UShr => VShiftOp::ShrU,
+            // The widening and narrowing shifts change the lane width, which
+            // needs a conversion the block-local form does not express yet.
+            _ => return Flow::End(Term::Illegal { raw: 0, pc }),
+        };
+        let r = self.b.def(Expr::VShift {
+            op: sop,
+            lane,
+            a,
+            amount,
+        });
+        self.commit_vector(vd, arr, r);
+        Flow::Next
+    }
+
+    /// The four flags an `fcmp` installs, shared with `fccmp`.
+    fn fp_compare_flags(
+        &mut self,
+        double: bool,
+        a: Value,
+        b: Value,
+    ) -> (Value, Value, Value, Value) {
+        let lt = self.b.def(Expr::FpCmp {
+            op: FpCmpOp::Lt,
+            double,
+            a,
+            b,
+        });
+        let eq = self.b.def(Expr::FpCmp {
+            op: FpCmpOp::Eq,
+            double,
+            a,
+            b,
+        });
+        let a_nan = self.b.def(Expr::FpCmp {
+            op: FpCmpOp::Ne,
+            double,
+            a,
+            b: a,
+        });
+        let b_nan = self.b.def(Expr::FpCmp {
+            op: FpCmpOp::Ne,
+            double,
+            a: b,
+            b,
+        });
+        let unordered = self.b.bin(BinOp::Or, Ty::I32, a_nan, b_nan);
+        let one = self.b.const_i32(1);
+        let not_lt = self.b.bin(BinOp::Xor, Ty::I32, lt, one);
+        (lt, eq, not_lt, unordered)
+    }
 
     fn fp_bin(&mut self, op: FpBinOp, double: bool, a: Value, b: Value) -> Value {
         self.b.def(Expr::FpBin { op, double, a, b })
@@ -2070,6 +2718,70 @@ impl<'a> Lifter<'a> {
             }
         }
     }
+}
+
+/// Byte pattern implementing `trn`/`uzp`/`zip` for an arrangement.
+///
+/// All six are fixed selections from the concatenation of the two sources,
+/// so each becomes one shuffle. Indices 0-15 name the first operand and
+/// 16-31 the second.
+fn permute_pattern(op: VPermOp, arr: VArr) -> [u8; 16] {
+    let lb = arr.lane_bytes;
+    let n = arr.lanes();
+    let mut lanes = [0u8; 16];
+    // The 64-bit forms only fill the low half; the rest is masked away.
+    for out in 0..n {
+        let src_lane: u32 = match op {
+            VPermOp::Zip1 => out / 2 + if out % 2 == 1 { n } else { 0 },
+            VPermOp::Zip2 => n / 2 + out / 2 + if out % 2 == 1 { n } else { 0 },
+            VPermOp::Uzp1 => out * 2,
+            VPermOp::Uzp2 => out * 2 + 1,
+            VPermOp::Trn1 => (out & !1) + if out % 2 == 1 { n } else { 0 },
+            VPermOp::Trn2 => (out & !1) + 1 + if out % 2 == 1 { n } else { 0 },
+        };
+        // A lane index at or past `n` refers to the second operand, whose
+        // bytes start at 16 regardless of the arrangement's width.
+        let (reg_base, lane_in_reg) = if src_lane >= n {
+            (16u32, src_lane - n)
+        } else {
+            (0, src_lane)
+        };
+        for byte in 0..lb {
+            let idx = (out * lb + byte) as usize;
+            if idx < 16 {
+                lanes[idx] = (reg_base + lane_in_reg * lb + byte) as u8;
+            }
+        }
+    }
+    lanes
+}
+
+/// Even- and odd-lane gather patterns for pairwise addition.
+///
+/// `addp` treats the two sources as one 2n-lane vector and adds adjacent
+/// pairs, which is a deinterleave followed by an ordinary lane-wise add.
+fn pairwise_patterns(arr: VArr) -> ([u8; 16], [u8; 16]) {
+    let lb = arr.lane_bytes;
+    let n = arr.lanes();
+    let mut evens = [0u8; 16];
+    let mut odds = [0u8; 16];
+    for out in 0..n {
+        let src = out * 2;
+        let (base, lane) = if src >= n { (16u32, src - n) } else { (0, src) };
+        let (base2, lane2) = if src + 1 >= n {
+            (16u32, src + 1 - n)
+        } else {
+            (0, src + 1)
+        };
+        for byte in 0..lb {
+            let idx = (out * lb + byte) as usize;
+            if idx < 16 {
+                evens[idx] = (base + lane * lb + byte) as u8;
+                odds[idx] = (base2 + lane2 * lb + byte) as u8;
+            }
+        }
+    }
+    (evens, odds)
 }
 
 /// Encode a system register identifier for the host interface. Modelled

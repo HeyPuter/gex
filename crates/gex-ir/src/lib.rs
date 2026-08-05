@@ -306,6 +306,54 @@ pub enum Expr {
     VBin { op: VBinOp, a: Value, b: Value },
     /// Lane-wise unary operation on a vector.
     VUn { op: VUnOp, a: Value },
+    /// Lane-wise binary operation.
+    VLaneBin {
+        op: VLaneBinOp,
+        lane: VLane,
+        a: Value,
+        b: Value,
+    },
+    /// Lane-wise unary operation.
+    VLaneUn {
+        op: VLaneUnOp,
+        lane: VLane,
+        a: Value,
+    },
+    /// Lane-wise shift by an `I32` amount shared across lanes.
+    VShift {
+        op: VShiftOp,
+        lane: VLane,
+        a: Value,
+        amount: Value,
+    },
+    /// Byte-level permutation of two vectors.
+    ///
+    /// This single node covers `trn`, `uzp`, `zip`, `ext`, the `rev` family
+    /// and element `dup`/`ins`, because every one of them is a fixed byte
+    /// permutation and wasm has exactly that instruction.
+    VShuffle {
+        a: Value,
+        b: Value,
+        lanes: Box<[u8; 16]>,
+    },
+    /// Byte-level permutation by a runtime index vector; out-of-range indices
+    /// produce zero, which is what `tbl` with a single table register does.
+    VSwizzle { a: Value, idx: Value },
+    /// `(a & mask) | (b & !mask)`.
+    VBitSelect {
+        mask: Value,
+        a: Value,
+        b: Value,
+    },
+    /// Lane conversion.
+    VCvt {
+        op: VCvtOp,
+        /// Lane type of the source.
+        from: VLane,
+        a: Value,
+        /// Second operand, only for the narrowing conversions.
+        b: Option<Value>,
+    },
     /// Read one lane out as a scalar.
     VExtract {
         a: Value,
@@ -415,6 +463,113 @@ pub enum FpConvert {
     FpToFp,
 }
 
+/// The lane type a vector operation works on.
+///
+/// AArch64 spells this as an arrangement (`v0.4s`); GIR keeps only the lane
+/// type, because the number of lanes follows from the 128-bit register and
+/// the 64-bit forms are handled by masking the result.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VLane {
+    I8,
+    I16,
+    I32,
+    I64,
+    F32,
+    F64,
+}
+
+impl VLane {
+    pub fn bytes(self) -> u32 {
+        match self {
+            VLane::I8 => 1,
+            VLane::I16 => 2,
+            VLane::I32 | VLane::F32 => 4,
+            VLane::I64 | VLane::F64 => 8,
+        }
+    }
+    pub fn is_float(self) -> bool {
+        matches!(self, VLane::F32 | VLane::F64)
+    }
+    /// The integer lane type of the same width.
+    pub fn as_int(self) -> VLane {
+        match self {
+            VLane::F32 => VLane::I32,
+            VLane::F64 => VLane::I64,
+            other => other,
+        }
+    }
+}
+
+/// Lane-wise binary operations.
+///
+/// Comparisons write all-ones or all-zeros per lane, which is what both NEON
+/// and wasm SIMD do, so they compose directly with `bitselect`.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VLaneBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    MinS,
+    MinU,
+    MaxS,
+    MaxU,
+    AddSatS,
+    AddSatU,
+    SubSatS,
+    SubSatU,
+    AvgrU,
+    Eq,
+    Ne,
+    LtS,
+    LtU,
+    GtS,
+    GtU,
+    LeS,
+    LeU,
+    GeS,
+    GeU,
+}
+
+/// Lane-wise unary operations.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VLaneUnOp {
+    Neg,
+    Abs,
+    Sqrt,
+    Ceil,
+    Floor,
+    Trunc,
+    Nearest,
+}
+
+/// Lane-wise shift by a scalar amount shared across lanes.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VShiftOp {
+    Shl,
+    ShrS,
+    ShrU,
+}
+
+/// Lane-width and representation conversions.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VCvtOp {
+    /// Float lanes to integer lanes, rounding toward zero and saturating.
+    FpToIntSat { signed: bool },
+    /// Integer lanes to float lanes.
+    IntToFp { signed: bool },
+    /// `f64x2` to the low two lanes of an `f32x4`.
+    DemoteF64,
+    /// The low two lanes of an `f32x4` to `f64x2`.
+    PromoteF32,
+    /// Widen the low half of the source's lanes.
+    ExtendLow { signed: bool },
+    /// Widen the high half.
+    ExtendHigh { signed: bool },
+    /// Halve the lane width of two vectors into one, saturating.
+    NarrowSat { signed: bool },
+}
+
 /// Vector unary operations.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum VUnOp {
@@ -468,6 +623,13 @@ impl Expr {
             | Expr::VSplat { .. }
             | Expr::VBin { .. }
             | Expr::VUn { .. }
+            | Expr::VLaneBin { .. }
+            | Expr::VLaneUn { .. }
+            | Expr::VShift { .. }
+            | Expr::VShuffle { .. }
+            | Expr::VSwizzle { .. }
+            | Expr::VBitSelect { .. }
+            | Expr::VCvt { .. }
             | Expr::VReplace { .. } => Ty::V128,
             // Floating-point results are the bit pattern of the value, so
             // the width follows the precision.
@@ -523,6 +685,30 @@ impl Expr {
             Expr::VLoad { addr, .. } => f(*addr),
             Expr::VConst(_) => {}
             Expr::VSplat { a, .. } | Expr::VExtract { a, .. } | Expr::VUn { a, .. } => f(*a),
+            Expr::VLaneUn { a, .. } => f(*a),
+            Expr::VLaneBin { a, b, .. } | Expr::VShuffle { a, b, .. } => {
+                f(*a);
+                f(*b);
+            }
+            Expr::VShift { a, amount, .. } => {
+                f(*a);
+                f(*amount);
+            }
+            Expr::VSwizzle { a, idx } => {
+                f(*a);
+                f(*idx);
+            }
+            Expr::VBitSelect { mask, a, b } => {
+                f(*mask);
+                f(*a);
+                f(*b);
+            }
+            Expr::VCvt { a, b, .. } => {
+                f(*a);
+                if let Some(b) = b {
+                    f(*b);
+                }
+            }
             Expr::VBin { a, b, .. } => {
                 f(*a);
                 f(*b);

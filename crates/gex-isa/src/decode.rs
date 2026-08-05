@@ -1200,80 +1200,16 @@ fn decode_atomic_memop(raw: u32) -> Inst {
 // ---------------------------------------------------------------------------
 
 fn decode_simd_fp(raw: u32) -> Inst {
-    // The subset gex lifts today is the one real string and memory routines
-    // are built from: replicate a scalar, materialise a constant, and move
-    // whole registers around. Everything else stays Unknown, which becomes a
-    // precise SIGILL rather than a wrong answer (PLAN §6.1).
     let q = bit(raw, 30) == 1;
     let u = bit(raw, 29);
 
     // Advanced SIMD copy: 0 Q op 01110000 imm5 0 imm4 1 Rn Rd
-    if bit(raw, 31) == 0 && bits(raw, 28, 21) == 0b0111_0000 && bit(raw, 15) == 0 && bit(raw, 10) == 1
+    if bit(raw, 31) == 0
+        && bits(raw, 28, 21) == 0b0111_0000
+        && bit(raw, 15) == 0
+        && bit(raw, 10) == 1
     {
-        let imm5 = bits(raw, 20, 16);
-        let imm4 = bits(raw, 14, 11);
-        // Lane moves between a general register and a vector.
-        // imm4: 0011 = INS (general), 0101 = SMOV, 0111 = UMOV.
-        if matches!(imm4, 0b0011 | 0b0101 | 0b0111) {
-            let Some((lane_bytes, lane)) = decode_lane(imm5) else {
-                return Inst::Undefined { raw };
-            };
-            let to_vector = imm4 == 0b0011;
-            if to_vector && u != 1 {
-                return Inst::Unknown { raw };
-            }
-            if !to_vector && u != 0 {
-                return Inst::Unknown { raw };
-            }
-            let signed = imm4 == 0b0101;
-            // Extracting a doubleword needs the 64-bit general register.
-            if !to_vector && lane_bytes == 8 && !q {
-                return Inst::Undefined { raw };
-            }
-            let int_sz = if q { Sz::X } else { Sz::W };
-            return Inst::VMoveLane {
-                to_vector,
-                signed,
-                lane_bytes,
-                lane,
-                int_sz,
-                rd: RegSel::gp(if to_vector {
-                    bits(raw, 9, 5)
-                } else {
-                    bits(raw, 4, 0)
-                }),
-                vd: VReg(if to_vector {
-                    bits(raw, 4, 0) as u8
-                } else {
-                    bits(raw, 9, 5) as u8
-                }),
-            };
-        }
-        // imm4 == 0b0001 with op == 0 is DUP (general register).
-        if imm4 == 0b0001 && u == 0 {
-            let lane_bytes = if imm5 & 1 != 0 {
-                1
-            } else if imm5 & 2 != 0 {
-                2
-            } else if imm5 & 4 != 0 {
-                4
-            } else if imm5 & 8 != 0 {
-                8
-            } else {
-                return Inst::Undefined { raw };
-            };
-            // A 64-bit lane needs the 128-bit form.
-            if lane_bytes == 8 && !q {
-                return Inst::Undefined { raw };
-            }
-            return Inst::VDupGeneral {
-                vd: VReg(bits(raw, 4, 0) as u8),
-                rn: RegSel::gp(bits(raw, 9, 5)),
-                lane_bytes,
-                q,
-            };
-        }
-        return Inst::Unknown { raw };
+        return decode_simd_copy(raw, q, u);
     }
 
     // Advanced SIMD modified immediate: 0 Q op 0111100000 abc cmode o2 1 defgh Rd
@@ -1294,78 +1230,515 @@ fn decode_simd_fp(raw: u32) -> Inst {
         };
     }
 
-    // Advanced SIMD two-register miscellaneous: `cnt`.
-    //   0 Q U 01110 size 10000 00101 10 Rn Rd
-    if bit(raw, 31) == 0
-        && bits(raw, 28, 24) == 0b01110
-        && bits(raw, 21, 17) == 0b10000
-        && bits(raw, 16, 12) == 0b00101
-        && bits(raw, 11, 10) == 0b10
-        && u == 0
-        && bits(raw, 23, 22) == 0b00
-    {
-        return Inst::VCnt {
-            vd: VReg(bits(raw, 4, 0) as u8),
-            vn: VReg(bits(raw, 9, 5) as u8),
-            q,
-        };
-    }
-
-    // Advanced SIMD across lanes: `addv`.
-    //   0 Q U 01110 size 11000 11011 10 Rn Rd
-    if bit(raw, 31) == 0
-        && bits(raw, 28, 24) == 0b01110
-        && bits(raw, 21, 17) == 0b11000
-        && bits(raw, 16, 12) == 0b11011
-        && bits(raw, 11, 10) == 0b10
-        && u == 0
-    {
-        let lane_bytes = match bits(raw, 23, 22) {
-            0b00 => 1,
-            0b01 => 2,
-            0b10 => 4,
-            _ => return Inst::Undefined { raw },
-        };
-        // A 4-byte lane needs the 128-bit form: two lanes is not a valid
-        // arrangement for `addv`.
-        if lane_bytes == 4 && !q {
-            return Inst::Undefined { raw };
+    // Advanced SIMD shift by immediate: 0 Q U 011110 immh immb opcode 1 Rn Rd
+    if bit(raw, 31) == 0 && bits(raw, 28, 23) == 0b011110 && bit(raw, 10) == 1 {
+        let immh = bits(raw, 22, 19);
+        if immh != 0 {
+            return decode_simd_shift_imm(raw, q, u, immh, bits(raw, 18, 16));
         }
-        return Inst::VAddAcross {
-            vd: VReg(bits(raw, 4, 0) as u8),
-            vn: VReg(bits(raw, 9, 5) as u8),
-            lane_bytes,
-            q,
-        };
     }
 
-    // Advanced SIMD three-same, logical subgroup:
-    //   0 Q U 01110 size 1 Rm 00011 1 Rn Rd
-    if bit(raw, 31) == 0
-        && bits(raw, 28, 24) == 0b01110
-        && bit(raw, 21) == 1
-        && bits(raw, 15, 10) == 0b000111
-    {
-        let size = bits(raw, 23, 22);
-        let op = match (u, size) {
-            (0, 0b00) => VLogOp::And,
-            (0, 0b01) => VLogOp::Bic,
-            (0, 0b10) => VLogOp::Orr,
-            (0, 0b11) => VLogOp::Orn,
-            (_, 0b00) => VLogOp::Eor,
-            // BSL/BIT/BIF are three-operand selects, not plain bitwise ops.
-            _ => return Inst::Unknown { raw },
-        };
-        return Inst::VLogical {
-            op,
-            vd: VReg(bits(raw, 4, 0) as u8),
-            vn: VReg(bits(raw, 9, 5) as u8),
-            vm: VReg(bits(raw, 20, 16) as u8),
-            q,
-        };
+    // The three-same, two-register-misc, across-lanes, permute, extract and
+    // table-lookup groups all live under `0 Q U 01110 ...`.
+    if bit(raw, 31) == 0 && bits(raw, 28, 24) == 0b01110 {
+        // Extract: 0 Q 101110 op2 0 Rm 0 imm4 0 Rn Rd
+        if u == 1
+            && bits(raw, 23, 22) == 0
+            && bit(raw, 21) == 0
+            && bit(raw, 15) == 0
+            && bit(raw, 10) == 0
+        {
+            return Inst::VExt {
+                vd: VReg(bits(raw, 4, 0) as u8),
+                vn: VReg(bits(raw, 9, 5) as u8),
+                vm: VReg(bits(raw, 20, 16) as u8),
+                index: bits(raw, 14, 11),
+                q,
+            };
+        }
+        // Table lookup: 0 Q 001110 op2 0 Rm 0 len op 00 Rn Rd
+        if u == 0
+            && bits(raw, 23, 22) == 0
+            && bit(raw, 21) == 0
+            && bit(raw, 15) == 0
+            && bits(raw, 11, 10) == 0
+        {
+            return Inst::VTableLookup {
+                vd: VReg(bits(raw, 4, 0) as u8),
+                vn: VReg(bits(raw, 9, 5) as u8),
+                regs: bits(raw, 14, 13) as u8 + 1,
+                vm: VReg(bits(raw, 20, 16) as u8),
+                q,
+                is_tbx: bit(raw, 12) == 1,
+            };
+        }
+        // Permute: 0 Q 001110 size 0 Rm 0 opcode 10 Rn Rd
+        if bit(raw, 21) == 0 && bit(raw, 15) == 0 && bits(raw, 11, 10) == 0b10 {
+            let op = match bits(raw, 14, 12) {
+                0b001 => VPermOp::Uzp1,
+                0b010 => VPermOp::Trn1,
+                0b011 => VPermOp::Zip1,
+                0b101 => VPermOp::Uzp2,
+                0b110 => VPermOp::Trn2,
+                0b111 => VPermOp::Zip2,
+                _ => return Inst::Unknown { raw },
+            };
+            let Some(lane_bytes) = lane_from_size(bits(raw, 23, 22)) else {
+                return Inst::Undefined { raw };
+            };
+            return Inst::VPermute {
+                op,
+                arr: VArr {
+                    lane_bytes,
+                    q,
+                    float: false,
+                },
+                vd: VReg(bits(raw, 4, 0) as u8),
+                vn: VReg(bits(raw, 9, 5) as u8),
+                vm: VReg(bits(raw, 20, 16) as u8),
+            };
+        }
+        if bit(raw, 21) == 1 {
+            if bits(raw, 21, 17) == 0b10000 && bits(raw, 11, 10) == 0b10 {
+                return decode_simd_two_misc(raw, q, u);
+            }
+            if bits(raw, 21, 17) == 0b11000 && bits(raw, 11, 10) == 0b10 {
+                return decode_simd_across(raw, q, u);
+            }
+            if bit(raw, 10) == 1 {
+                return decode_simd_three_same(raw, q, u);
+            }
+        }
     }
 
     decode_scalar_fp(raw)
+}
+
+/// Lane width in bytes from a two-bit `size` field.
+fn lane_from_size(size: u32) -> Option<u32> {
+    match size {
+        0b00 => Some(1),
+        0b01 => Some(2),
+        0b10 => Some(4),
+        _ => Some(8),
+    }
+}
+
+fn decode_simd_copy(raw: u32, q: bool, u: u32) -> Inst {
+    let imm5 = bits(raw, 20, 16);
+    let imm4 = bits(raw, 14, 11);
+
+    // Lane moves between a general register and a vector.
+    // imm4: 0011 = INS (general), 0101 = SMOV, 0111 = UMOV.
+    if matches!(imm4, 0b0011 | 0b0101 | 0b0111) {
+        let Some((lane_bytes, lane)) = decode_lane(imm5) else {
+            return Inst::Undefined { raw };
+        };
+        // All of DUP, INS (general), SMOV and UMOV have op == 0; only
+        // INS (element) sets it.
+        if u != 0 {
+            return Inst::Unknown { raw };
+        }
+        let to_vector = imm4 == 0b0011;
+        let signed = imm4 == 0b0101;
+        if !to_vector && lane_bytes == 8 && !q {
+            return Inst::Undefined { raw };
+        }
+        let int_sz = if q { Sz::X } else { Sz::W };
+        return Inst::VMoveLane {
+            to_vector,
+            signed,
+            lane_bytes,
+            lane,
+            int_sz,
+            rd: RegSel::gp(if to_vector {
+                bits(raw, 9, 5)
+            } else {
+                bits(raw, 4, 0)
+            }),
+            vd: VReg(if to_vector {
+                bits(raw, 4, 0) as u8
+            } else {
+                bits(raw, 9, 5) as u8
+            }),
+        };
+    }
+    // INS (element): `op` is 1 and imm4 holds the source lane index.
+    if u == 1 {
+        let Some((lane_bytes, dst)) = decode_lane(imm5) else {
+            return Inst::Undefined { raw };
+        };
+        let shift = lane_bytes.trailing_zeros();
+        return Inst::VInsElement {
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+            lane_bytes,
+            dst_index: dst,
+            src_index: imm4 >> shift,
+        };
+    }
+    match imm4 {
+        0b0001 => {
+            let Some((lane_bytes, _)) = decode_lane(imm5) else {
+                return Inst::Undefined { raw };
+            };
+            if lane_bytes == 8 && !q {
+                return Inst::Undefined { raw };
+            }
+            Inst::VDupGeneral {
+                vd: VReg(bits(raw, 4, 0) as u8),
+                rn: RegSel::gp(bits(raw, 9, 5)),
+                lane_bytes,
+                q,
+            }
+        }
+        0b0000 => {
+            let Some((lane_bytes, index)) = decode_lane(imm5) else {
+                return Inst::Undefined { raw };
+            };
+            Inst::VDupElement {
+                vd: VReg(bits(raw, 4, 0) as u8),
+                vn: VReg(bits(raw, 9, 5) as u8),
+                lane_bytes,
+                index,
+                q,
+            }
+        }
+        _ => Inst::Unknown { raw },
+    }
+}
+
+fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
+    let size = bits(raw, 23, 22);
+    let opcode = bits(raw, 15, 11);
+    let vd = VReg(bits(raw, 4, 0) as u8);
+    let vn = VReg(bits(raw, 9, 5) as u8);
+    let vm = VReg(bits(raw, 20, 16) as u8);
+
+    // The bitwise subgroup keeps its own variants: `mov vd, vn` is spelled
+    // `orr vd, vn, vn`, and the selects take three operands.
+    if opcode == 0b00011 {
+        if u == 0 {
+            let op = match size {
+                0b00 => VLogOp::And,
+                0b01 => VLogOp::Bic,
+                0b10 => VLogOp::Orr,
+                _ => VLogOp::Orn,
+            };
+            return Inst::VLogical { op, vd, vn, vm, q };
+        }
+        return match size {
+            0b00 => Inst::VLogical {
+                op: VLogOp::Eor,
+                vd,
+                vn,
+                vm,
+                q,
+            },
+            0b01 => Inst::VSelect {
+                kind: VSelKind::Bsl,
+                vd,
+                vn,
+                vm,
+                q,
+            },
+            0b10 => Inst::VSelect {
+                kind: VSelKind::Bit,
+                vd,
+                vn,
+                vm,
+                q,
+            },
+            _ => Inst::VSelect {
+                kind: VSelKind::Bif,
+                vd,
+                vn,
+                vm,
+                q,
+            },
+        };
+    }
+
+    // Floating point: opcode 11xxx, bit 23 selects between the paired
+    // operations and bit 22 the precision.
+    if opcode >= 0b11000 {
+        let lane_bytes = if bit(raw, 22) == 1 { 8 } else { 4 };
+        let hi = bit(raw, 23) == 1;
+        let op = match (u, opcode, hi) {
+            (0, 0b11000, false) => VOp3::FMaxNm,
+            (0, 0b11000, true) => VOp3::FMinNm,
+            (0, 0b11001, false) => VOp3::FMla,
+            (0, 0b11001, true) => VOp3::FMls,
+            (0, 0b11010, false) => VOp3::FAdd,
+            (0, 0b11010, true) => VOp3::FSub,
+            (0, 0b11100, false) => VOp3::FCmEq,
+            (0, 0b11110, false) => VOp3::FMax,
+            (0, 0b11110, true) => VOp3::FMin,
+            (1, 0b11010, false) => VOp3::FAddP,
+            (1, 0b11011, false) => VOp3::FMul,
+            (1, 0b11100, false) => VOp3::FCmGe,
+            (1, 0b11100, true) => VOp3::FCmGt,
+            (1, 0b11111, false) => VOp3::FDiv,
+            _ => return Inst::Unknown { raw },
+        };
+        return Inst::VThreeSame {
+            op,
+            arr: VArr {
+                lane_bytes,
+                q,
+                float: true,
+            },
+            vd,
+            vn,
+            vm,
+        };
+    }
+
+    let Some(lane_bytes) = lane_from_size(size) else {
+        return Inst::Undefined { raw };
+    };
+    let op = match (opcode, u) {
+        (0b00001, 0) => VOp3::SqAdd,
+        (0b00001, _) => VOp3::UqAdd,
+        (0b00010, 1) => VOp3::UrHAdd,
+        (0b00101, 0) => VOp3::SqSub,
+        (0b00101, _) => VOp3::UqSub,
+        (0b00110, 0) => VOp3::CmGt,
+        (0b00110, _) => VOp3::CmHi,
+        (0b00111, 0) => VOp3::CmGe,
+        (0b00111, _) => VOp3::CmHs,
+        (0b01100, 0) => VOp3::SMax,
+        (0b01100, _) => VOp3::UMax,
+        (0b01101, 0) => VOp3::SMin,
+        (0b01101, _) => VOp3::UMin,
+        (0b01110, 0) => VOp3::SAbd,
+        (0b01110, _) => VOp3::UAbd,
+        (0b10000, 0) => VOp3::Add,
+        (0b10000, _) => VOp3::Sub,
+        (0b10001, 0) => VOp3::CmTst,
+        (0b10001, _) => VOp3::CmEq,
+        (0b10010, 0) => VOp3::Mla,
+        (0b10010, _) => VOp3::Mls,
+        (0b10011, 0) => VOp3::Mul,
+        (0b10111, 0) => VOp3::AddP,
+        _ => return Inst::Unknown { raw },
+    };
+    // Doubleword lanes exist only for add, sub, the comparisons and the
+    // saturating forms.
+    if lane_bytes == 8 && matches!(op, VOp3::Mul | VOp3::Mla | VOp3::Mls) {
+        return Inst::Undefined { raw };
+    }
+    Inst::VThreeSame {
+        op,
+        arr: VArr {
+            lane_bytes,
+            q,
+            float: false,
+        },
+        vd,
+        vn,
+        vm,
+    }
+}
+
+fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
+    let size = bits(raw, 23, 22);
+    let opcode = bits(raw, 16, 12);
+    let vd = VReg(bits(raw, 4, 0) as u8);
+    let vn = VReg(bits(raw, 9, 5) as u8);
+
+    // Bit 23 belongs to `size` for the integer members of this group, so the
+    // floating-point half has to be picked out by opcode: everything at or
+    // above 0b11000, plus the compare-with-zero and sign block when bit 23
+    // marks it as the second size pair. `rev64 v0.4s` has size = 10 and would
+    // be misread as floating point by a bit-23 test alone.
+    let fp_high = opcode >= 0b11000;
+    let fp_low = bit(raw, 23) == 1 && (0b01100..=0b01111).contains(&opcode);
+    if fp_high || fp_low {
+        let lane_bytes = if bit(raw, 22) == 1 { 8 } else { 4 };
+        let hi = bit(raw, 23) == 1;
+        let op = match (opcode, u, hi) {
+            (0b01100, 0, _) => VOp2::FCmGtZero,
+            (0b01101, 0, _) => VOp2::FCmEqZero,
+            (0b01110, 0, _) => VOp2::FCmLtZero,
+            (0b01111, 0, _) => VOp2::FAbs,
+            (0b01100, _, _) => VOp2::FCmGeZero,
+            (0b01101, _, _) => VOp2::FCmLeZero,
+            (0b01111, _, _) => VOp2::FNeg,
+            (0b11000, 0, false) => VOp2::FrintN,
+            (0b11000, 0, true) => VOp2::FrintP,
+            (0b11000, _, false) => VOp2::FrintA,
+            (0b11001, 0, false) => VOp2::FrintM,
+            (0b11001, 0, true) => VOp2::FrintZ,
+            (0b11001, _, false) => VOp2::FrintX,
+            (0b11001, _, true) => VOp2::FrintI,
+            (0b11010, 0, true) => VOp2::FcvtPs,
+            (0b11010, _, true) => VOp2::FcvtPu,
+            (0b11010, 0, false) => VOp2::FcvtNs,
+            (0b11010, _, false) => VOp2::FcvtNu,
+            (0b11011, 0, true) => VOp2::FcvtZs,
+            (0b11011, _, true) => VOp2::FcvtZu,
+            (0b11011, 0, false) => VOp2::FcvtMs,
+            (0b11011, _, false) => VOp2::FcvtMu,
+            (0b11100, 0, false) => VOp2::FcvtAs,
+            (0b11100, _, false) => VOp2::FcvtAu,
+            (0b11101, 0, false) => VOp2::Scvtf,
+            (0b11101, _, false) => VOp2::Ucvtf,
+            (0b11111, _, true) => VOp2::FSqrt,
+            _ => return Inst::Unknown { raw },
+        };
+        return Inst::VTwoMisc {
+            op,
+            arr: VArr {
+                lane_bytes,
+                q,
+                float: true,
+            },
+            vd,
+            vn,
+        };
+    }
+
+    let Some(lane_bytes) = lane_from_size(size) else {
+        return Inst::Undefined { raw };
+    };
+    let op = match (opcode, u) {
+        (0b00000, 0) => VOp2::Rev64,
+        (0b00000, _) => VOp2::Rev32,
+        (0b00001, 0) => VOp2::Rev16,
+        (0b00100, 0) => VOp2::Cls,
+        (0b00100, _) => VOp2::Clz,
+        (0b00101, 0) => VOp2::Cnt,
+        (0b00101, _) if size == 0b00 => VOp2::Not,
+        (0b00101, _) => VOp2::Rbit,
+        (0b01000, 0) => VOp2::CmGtZero,
+        (0b01000, _) => VOp2::CmGeZero,
+        (0b01001, 0) => VOp2::CmEqZero,
+        (0b01001, _) => VOp2::CmLeZero,
+        (0b01010, 0) => VOp2::CmLtZero,
+        (0b01011, 0) => VOp2::Abs,
+        (0b01011, _) => VOp2::Neg,
+        (0b10010, 0) => VOp2::Xtn,
+        (0b10100, 0) => VOp2::SqXtn,
+        (0b10100, _) => VOp2::UqXtn,
+        _ => return Inst::Unknown { raw },
+    };
+    Inst::VTwoMisc {
+        op,
+        arr: VArr {
+            lane_bytes,
+            q,
+            float: false,
+        },
+        vd,
+        vn,
+    }
+}
+
+fn decode_simd_across(raw: u32, q: bool, u: u32) -> Inst {
+    let opcode = bits(raw, 16, 12);
+    let vd = VReg(bits(raw, 4, 0) as u8);
+    let vn = VReg(bits(raw, 9, 5) as u8);
+
+    // The floating-point reductions put the precision in bit 22 and use
+    // bit 23 to pick between the max and min of each pair.
+    if u == 1 && matches!(opcode, 0b01100 | 0b01111) {
+        let op = match (opcode, bit(raw, 23)) {
+            (0b01111, 0) | (0b01100, 0) => VAcrossOp::FMax,
+            _ => VAcrossOp::FMin,
+        };
+        return Inst::VAcross {
+            op,
+            arr: VArr {
+                lane_bytes: 4,
+                q,
+                float: true,
+            },
+            vd,
+            vn,
+        };
+    }
+
+    let op = match (opcode, u) {
+        (0b01010, 0) => VAcrossOp::SMax,
+        (0b01010, _) => VAcrossOp::UMax,
+        (0b11010, 0) => VAcrossOp::SMin,
+        (0b11010, _) => VAcrossOp::UMin,
+        (0b11011, 0) => VAcrossOp::Add,
+        _ => return Inst::Unknown { raw },
+    };
+    let lane_bytes = match bits(raw, 23, 22) {
+        0b00 => 1,
+        0b01 => 2,
+        0b10 => 4,
+        _ => return Inst::Undefined { raw },
+    };
+    // A word-sized lane leaves only two of them in the 64-bit form, which
+    // the architecture does not define for these reductions.
+    if lane_bytes == 4 && !q {
+        return Inst::Undefined { raw };
+    }
+    Inst::VAcross {
+        op,
+        arr: VArr {
+            lane_bytes,
+            q,
+            float: false,
+        },
+        vd,
+        vn,
+    }
+}
+
+fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Inst {
+    let opcode = bits(raw, 15, 11);
+    let vd = VReg(bits(raw, 4, 0) as u8);
+    let vn = VReg(bits(raw, 9, 5) as u8);
+    // `immh`'s highest set bit gives the element width; the rest of it joins
+    // `immb` to form the amount.
+    let (lane_bytes, esize) = if immh & 0b1000 != 0 {
+        (8u32, 64u32)
+    } else if immh & 0b0100 != 0 {
+        (4, 32)
+    } else if immh & 0b0010 != 0 {
+        (2, 16)
+    } else {
+        (1, 8)
+    };
+    let imm = (immh << 3) | immb;
+    let op = match (opcode, u) {
+        (0b01010, 0) => VShiftImmOp::Shl,
+        (0b00000, 0) => VShiftImmOp::SShr,
+        (0b00000, _) => VShiftImmOp::UShr,
+        (0b10100, 0) => VShiftImmOp::SShll,
+        (0b10100, _) => VShiftImmOp::UShll,
+        (0b10000, 0) => VShiftImmOp::Shrn,
+        _ => return Inst::Unknown { raw },
+    };
+    // Left shifts count up from the element size; right shifts count down.
+    let left = matches!(
+        op,
+        VShiftImmOp::Shl | VShiftImmOp::SShll | VShiftImmOp::UShll
+    );
+    let shift = if left {
+        imm.wrapping_sub(esize)
+    } else {
+        (2 * esize).wrapping_sub(imm)
+    };
+    if shift >= esize {
+        return Inst::Undefined { raw };
+    }
+    Inst::VShiftImm {
+        op,
+        arr: VArr {
+            lane_bytes,
+            q,
+            float: false,
+        },
+        vd,
+        vn,
+        shift,
+    }
 }
 
 /// Scalar floating-point.
@@ -1533,10 +1906,12 @@ fn decode_fp_one_source(raw: u32, sz: FpSz, vd: VReg, vn: VReg) -> Inst {
         0b001010 => FpOp1::RoundMinus,
         0b001011 => FpOp1::RoundZero,
         0b001100 => FpOp1::RoundAway,
-        // FRINTX and FRINTI differ from FRINTN only in exception reporting
-        // and in honouring a non-default FPCR rounding mode, neither of
-        // which gex models in fast mode (PLAN §5.7).
-        0b001110 | 0b001111 => FpOp1::RoundNearest,
+        // FRINTX and FRINTI honour the FPCR rounding mode and FRINTX also
+        // reports inexact. gex tracks neither in fast mode (PLAN §5.7), so
+        // both behave as round-to-nearest — but they keep their own
+        // identities so the disassembler stays faithful.
+        0b001110 => FpOp1::RoundExact,
+        0b001111 => FpOp1::RoundCurrent,
         _ => return Inst::Unknown { raw },
     };
     Inst::FpDataProc1 { sz, op, vd, vn }
@@ -1703,7 +2078,34 @@ fn expand_simd_immediate(imm8: u32, cmode: u32, op: bool, q: bool) -> Option<u12
             let half = v as u128;
             return Some(if q { half | (half << 64) } else { half });
         }
-        // The floating-point forms (cmode = 1111) are not lifted yet.
+        // cmode = 1111: a floating-point immediate, expanded exactly as the
+        // scalar `fmov` form does.
+        (7, 1) => {
+            let bits = expand_fp_immediate(imm8 as u32, if op { FpSz::D } else { FpSz::S });
+            return Some(if op {
+                // The 64-bit form needs Q; the assembler will not emit the
+                // other combination.
+                let half = bits as u128;
+                if q {
+                    half | (half << 64)
+                } else {
+                    half
+                }
+            } else {
+                let lane = bits as u128 & 0xffff_ffff;
+                let mut v = 0u128;
+                let mut shift = 0;
+                while shift < 128 {
+                    v |= lane << shift;
+                    shift += 32;
+                }
+                if q {
+                    v
+                } else {
+                    v & u64::MAX as u128
+                }
+            });
+        }
         _ => return None,
     }
 

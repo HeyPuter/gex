@@ -785,12 +785,93 @@ pub enum Inst {
     },
     /// `cnt` — per-byte population count.
     VCnt { vd: VReg, vn: VReg, q: bool },
-    /// `addv` — sum all lanes into the destination's lowest lane.
-    VAddAcross {
+    /// `bsl`/`bit`/`bif`.
+    VSelect {
+        kind: VSelKind,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+        q: bool,
+    },
+    /// Lane-wise operation on two vector sources.
+    VThreeSame {
+        op: VOp3,
+        arr: VArr,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+    },
+    /// Lane-wise operation on one vector source.
+    VTwoMisc {
+        op: VOp2,
+        arr: VArr,
+        vd: VReg,
+        vn: VReg,
+    },
+    /// `trn`/`uzp`/`zip`.
+    VPermute {
+        op: VPermOp,
+        arr: VArr,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+    },
+    /// `ext vd, vn, vm, #index` — a byte-granular concatenation window.
+    VExt {
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+        index: u32,
+        q: bool,
+    },
+    /// `tbl`/`tbx` with one to four consecutive table registers.
+    VTableLookup {
+        vd: VReg,
+        vn: VReg,
+        regs: u8,
+        vm: VReg,
+        q: bool,
+        /// `tbx` leaves out-of-range lanes unchanged instead of zeroing them.
+        is_tbx: bool,
+    },
+    /// `dup vd, vn.<T>[index]`.
+    VDupElement {
         vd: VReg,
         vn: VReg,
         lane_bytes: u32,
+        index: u32,
         q: bool,
+    },
+    /// `ins vd.<T>[dst], vn.<T>[src]`.
+    VInsElement {
+        vd: VReg,
+        vn: VReg,
+        lane_bytes: u32,
+        dst_index: u32,
+        src_index: u32,
+    },
+    /// Shift by an immediate.
+    VShiftImm {
+        op: VShiftImmOp,
+        arr: VArr,
+        vd: VReg,
+        vn: VReg,
+        shift: u32,
+    },
+    /// `fccmp`/`fccmpe`: conditional floating-point compare.
+    FpCondCompare {
+        sz: FpSz,
+        vn: VReg,
+        vm: VReg,
+        nzcv: u8,
+        cond: Cond,
+    },
+    /// Reduce every lane into the destination's lowest lane.
+    VAcross {
+        op: VAcrossOp,
+        arr: VArr,
+        vd: VReg,
+        vn: VReg,
     },
 
     /// Bitwise operation on two vectors. `mov vd, vn` is `orr vd, vn, vn`.
@@ -890,6 +971,10 @@ pub enum FpOp1 {
     RoundZero,
     /// Round to nearest, ties away from zero.
     RoundAway,
+    /// Round using the current FPCR mode, raising inexact.
+    RoundExact,
+    /// Round using the current FPCR mode.
+    RoundCurrent,
 }
 
 /// Scalar floating-point two-source operations.
@@ -920,6 +1005,187 @@ pub enum FpRound {
     Zero,
     /// Round to nearest, ties away from zero.
     Away,
+}
+
+/// A NEON operand arrangement: lane width plus whether the operation is on
+/// the full 128-bit register or only its low half.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct VArr {
+    /// Lane width in bytes.
+    pub lane_bytes: u32,
+    /// False selects the 64-bit form, which zeroes the register's upper half.
+    pub q: bool,
+    /// True when the lanes hold floating-point values.
+    pub float: bool,
+}
+
+impl VArr {
+    pub fn lanes(self) -> u32 {
+        (if self.q { 16 } else { 8 }) / self.lane_bytes
+    }
+    /// The arrangement suffix binutils prints, e.g. `4s`.
+    pub fn suffix(self) -> String {
+        let t = match (self.lane_bytes, self.float) {
+            (1, _) => 'b',
+            (2, _) => 'h',
+            (4, _) => 's',
+            _ => 'd',
+        };
+        format!("{}{t}", self.lanes())
+    }
+}
+
+/// Lane-wise NEON operations with two vector sources.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VOp3 {
+    Add,
+    Sub,
+    Mul,
+    /// Multiply-accumulate into the destination.
+    Mla,
+    Mls,
+    SMax,
+    SMin,
+    UMax,
+    UMin,
+    SqAdd,
+    UqAdd,
+    SqSub,
+    UqSub,
+    UrHAdd,
+    CmEq,
+    CmGt,
+    CmGe,
+    CmHi,
+    CmHs,
+    /// Bitwise test: lanes where `a & b` is non-zero become all-ones.
+    CmTst,
+    /// Pairwise add of the concatenation of both operands.
+    AddP,
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+    FMax,
+    FMin,
+    FMaxNm,
+    FMinNm,
+    FAddP,
+    FMla,
+    FMls,
+    FCmEq,
+    FCmGe,
+    FCmGt,
+    /// Absolute difference.
+    SAbd,
+    UAbd,
+}
+
+/// Lane-wise NEON operations with one vector source.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VOp2 {
+    Neg,
+    Abs,
+    Not,
+    Cnt,
+    Clz,
+    Cls,
+    Rbit,
+    Rev16,
+    Rev32,
+    Rev64,
+    FNeg,
+    FAbs,
+    FSqrt,
+    FrintN,
+    FrintP,
+    FrintM,
+    FrintZ,
+    /// Round to nearest, ties away from zero.
+    FrintA,
+    /// Round using the current FPCR mode, raising inexact.
+    FrintX,
+    /// Round using the current FPCR mode.
+    FrintI,
+    /// Compare against zero.
+    CmEqZero,
+    CmGtZero,
+    CmGeZero,
+    CmLtZero,
+    CmLeZero,
+    FCmEqZero,
+    FCmGtZero,
+    FCmGeZero,
+    FCmLtZero,
+    FCmLeZero,
+    /// Float to signed/unsigned integer. The suffix names the rounding mode:
+    /// Z toward zero, N to nearest, P toward +inf, M toward -inf, A to
+    /// nearest with ties away.
+    FcvtZs,
+    FcvtZu,
+    FcvtNs,
+    FcvtNu,
+    FcvtPs,
+    FcvtPu,
+    FcvtMs,
+    FcvtMu,
+    FcvtAs,
+    FcvtAu,
+    /// Integer to float.
+    Scvtf,
+    Ucvtf,
+    /// Narrow each lane to half its width, taking the low half.
+    Xtn,
+    /// Narrow to half width, saturating.
+    SqXtn,
+    UqXtn,
+}
+
+/// Across-lane reductions.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VAcrossOp {
+    Add,
+    SMax,
+    SMin,
+    UMax,
+    UMin,
+    FMax,
+    FMin,
+}
+
+/// The three-operand bitwise selects.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VSelKind {
+    /// `bsl`: the destination holds the mask.
+    Bsl,
+    /// `bit`: insert `vn` where `vm` has ones.
+    Bit,
+    /// `bif`: insert `vn` where `vm` has zeros.
+    Bif,
+}
+
+/// Fixed byte permutations expressible as a single shuffle.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VPermOp {
+    Trn1,
+    Trn2,
+    Uzp1,
+    Uzp2,
+    Zip1,
+    Zip2,
+}
+
+/// Shift-by-immediate operations.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VShiftImmOp {
+    Shl,
+    SShr,
+    UShr,
+    /// Widen the low (or high, when `q`) half and shift left.
+    SShll,
+    UShll,
+    /// Narrow each lane to half width after shifting right.
+    Shrn,
 }
 
 /// Bitwise vector operations on the `v` register file.

@@ -122,6 +122,23 @@ fn expr(e: &Expr) -> String {
         Expr::VSplat { a, lane_bytes } => format!("splat{} {a:?}", lane_bytes * 8),
         Expr::VBin { op, a, b } => format!("v{op:?} {a:?}, {b:?}").to_lowercase(),
         Expr::VUn { op, a } => format!("v{op:?} {a:?}").to_lowercase(),
+        Expr::VLaneBin { op, lane, a, b } => {
+            format!("{lane:?}.{op:?} {a:?}, {b:?}").to_lowercase()
+        }
+        Expr::VLaneUn { op, lane, a } => format!("{lane:?}.{op:?} {a:?}").to_lowercase(),
+        Expr::VShift {
+            op,
+            lane,
+            a,
+            amount,
+        } => format!("{lane:?}.{op:?} {a:?}, {amount:?}").to_lowercase(),
+        Expr::VShuffle { a, b, lanes } => format!("shuffle {a:?}, {b:?}, {lanes:?}"),
+        Expr::VSwizzle { a, idx } => format!("swizzle {a:?}, {idx:?}"),
+        Expr::VBitSelect { mask, a, b } => format!("bitselect {mask:?} ? {a:?} : {b:?}"),
+        Expr::VCvt { op, from, a, b } => match b {
+            Some(b) => format!("cvt.{op:?}.{from:?} {a:?}, {b:?}").to_lowercase(),
+            None => format!("cvt.{op:?}.{from:?} {a:?}").to_lowercase(),
+        },
         Expr::VExtract {
             a,
             lane,

@@ -312,6 +312,13 @@ impl FuncBody {
         self.byte(lane);
     }
 
+    /// `i8x16.shuffle`, whose immediate is sixteen lane indices.
+    pub fn simd_shuffle(&mut self, lanes: &[u8; 16]) {
+        self.byte(0xfd);
+        self.u32(0x0d);
+        self.code.extend_from_slice(lanes);
+    }
+
     /// `v128.const`.
     pub fn v128_const(&mut self, bytes: &[u8; 16]) {
         self.byte(0xfd);
