@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use gex_abi::{ctx, exports, imports, GUEST_MEM_PAGES, IMPORT_MODULE};
 use gex_kernel::mem::prot;
 use gex_kernel::vfs::{DevFs, HostFs, ProcFs, TmpFs};
-use gex_kernel::{GuestMem, Kernel, ProcState, SyscallOutcome};
+use gex_kernel::{BlockOp, GuestMem, Kernel, ProcState, SyscallOutcome, ThreadState};
 use std::sync::{Arc, Mutex};
 use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
@@ -103,7 +103,12 @@ impl Default for RunOptions {
 
 /// Host-side state threaded through every import.
 struct HostState {
-    kernel: Kernel,
+    /// Shared with every other guest thread. The fields that describe one
+    /// thread rather than the process live in `thread` and are installed
+    /// under the lock; see [`ThreadState`].
+    kernel: Arc<Mutex<Kernel>>,
+    /// This thread's identity.
+    thread: ThreadState,
     memory: Option<gex_mem::GuestMemory>,
     /// Snapshot `/proc` reads from, refreshed before each syscall that could
     /// observe it.
@@ -114,25 +119,89 @@ struct HostState {
     resume_at: Option<u64>,
     /// Everything needed to translate and install code at run time.
     jit: Option<Jit>,
+    /// Everything a new guest thread needs to build a store of its own.
+    spawn: Option<Arc<SpawnContext>>,
+    /// Set by a `clone` that a host thread still has to be started for.
+    pending_spawn: Option<ThreadState>,
 }
 
-/// Runtime translation state (PLAN §6.2, M3).
+/// What a guest thread needs to start running.
+///
+/// A wasmtime store belongs to one host thread, so a new guest thread cannot
+/// be handed the parent's: it builds its own and instantiates the same
+/// modules into it. Everything here is either immutable or already shared.
+struct SpawnContext {
+    engine: Engine,
+    /// The image module, instantiated fresh in each thread's store.
+    image_module: Module,
+    /// A linker with only the `gex.*` imports registered -- no store-bound
+    /// definitions, so it can be cloned into another thread.
+    linker: Linker<HostState>,
+    memory: gex_mem::GuestMemory,
+    kernel: Arc<Mutex<Kernel>>,
+    proc_state: Arc<Mutex<ProcState>>,
+    jit_shared: Option<Arc<Mutex<JitShared>>>,
+    limits: gex_lift::BlockLimits,
+}
+
+/// Runtime translation state belonging to one store (PLAN §6.2, M3).
+///
+/// A wasm table belongs to its store, so each guest thread has its own and
+/// fills it from the same modules. `replayed` is how far through the shared
+/// registry this store has got.
 struct Jit {
+    shared: Arc<Mutex<JitShared>>,
     engine: Engine,
     linker: Linker<HostState>,
     table: Table,
-    /// Which guest pages own which table slots, carried across compilations
-    /// so a page keeps one base for the life of the process.
-    page_table: gex_xlate::PageTable,
-    /// Addresses whose dispatch slot now holds real code.
-    translated: std::collections::HashSet<u64>,
-    /// Modules compiled so far, kept alive because the table holds funcrefs
-    /// into them.
-    modules: Vec<wasmtime::Instance>,
+    /// Instances live here because the table holds funcrefs into them.
+    instances: Vec<wasmtime::Instance>,
+    /// Registry entries already instantiated into this store.
+    replayed: usize,
     limits: gex_lift::BlockLimits,
+}
+
+/// One runtime-translated module, kept so another thread's store can
+/// instantiate it rather than translating the same code again.
+struct CompiledUnit {
+    module: Module,
+    exported_blocks: Vec<(u64, String)>,
+    dir_entries: Vec<(u64, u32)>,
+    table_slots: u64,
+    /// Page assignment as of this unit, which is what its blocks' slots were
+    /// computed from.
+    page_table: gex_xlate::PageTable,
+}
+
+/// Runtime translation state shared by every guest thread.
+struct JitShared {
+    /// Which guest pages own which table slots. Process-wide, because a
+    /// page's directory entry is a single value in shared guest memory.
+    page_table: gex_xlate::PageTable,
+    /// Addresses whose dispatch slot now holds real code, in *some* store.
+    translated: std::collections::HashSet<u64>,
+    /// Every unit compiled so far, in installation order. Append-only, so a
+    /// store catches up by replaying from its own watermark.
+    registry: Vec<Arc<CompiledUnit>>,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
+}
+
+impl HostState {
+    /// Run `f` with the shared kernel locked and describing this thread.
+    ///
+    /// Every path into the kernel goes through here, which is what makes the
+    /// per-thread fields safe to keep in a shared structure: they are only
+    /// ever read while the lock that installed them is held.
+    fn with_kernel<R>(&mut self, f: impl FnOnce(&mut Kernel) -> R) -> R {
+        let shared = Arc::clone(&self.kernel);
+        let mut k = shared.lock().unwrap_or_else(|e| e.into_inner());
+        k.enter_thread(&self.thread);
+        let r = f(&mut k);
+        k.leave_thread(&mut self.thread);
+        r
+    }
 }
 
 /// A trap used to unwind out of translated code.
@@ -343,17 +412,23 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     let mut store = Store::new(
         &engine,
         HostState {
-            kernel,
+            kernel: Arc::new(Mutex::new(kernel)),
+            thread: ThreadState::new(ctx_addr, 1),
             memory: None,
             proc_state,
             exit: None,
             resume_at: None,
             jit: None,
+            spawn: None,
+            pending_spawn: None,
         },
     );
 
     let mut linker = Linker::new(&engine);
     register_imports(&mut linker)?;
+    // Kept before any store-bound definition is added, so a thread can clone
+    // it and define its own memory and table.
+    let base_linker = linker.clone();
 
     // The guest's memory belongs to the host, not to any module: every guest
     // thread runs in its own store, and a module-defined memory would give
@@ -388,15 +463,22 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     };
     if opts.jit {
         store.data_mut().jit = Some(Jit {
+            shared: Arc::new(Mutex::new(JitShared {
+                page_table: gex_xlate::PageTable::from_entries(
+                    &meta.dir_entries,
+                    meta.next_slot,
+                ),
+                translated: Default::default(),
+                registry: Vec::new(),
+                blocks: 0,
+                calls: 0,
+            })),
             engine: engine.clone(),
             linker: linker.clone(),
             table,
-                page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
-            translated: Default::default(),
-            modules: Vec::new(),
+            instances: Vec::new(),
+            replayed: 0,
             limits: xlate.limits,
-            blocks: 0,
-            calls: 0,
         });
     }
 
@@ -427,42 +509,30 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     if opts.verbose {
         eprintln!("[gex] guest state placed in {:.2}s", phase.elapsed().as_secs_f64());
     }
-    let enter = instance
-        .get_func(&mut store, exports::ENTER)
-        .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
+    // Everything a new guest thread needs. The linker here is the pristine
+    // one -- only the `gex.*` imports -- because a linker carrying store-bound
+    // definitions could not be cloned into another thread.
+    let spawn = Arc::new(SpawnContext {
+        engine: engine.clone(),
+        image_module: module.clone(),
+        linker: base_linker,
+        memory: memory.clone(),
+        kernel: Arc::clone(&store.data().kernel),
+        proc_state: Arc::clone(&store.data().proc_state),
+        jit_shared: store.data().jit.as_ref().map(|j| Arc::clone(&j.shared)),
+        limits: xlate.limits,
+    });
+    store.data_mut().spawn = Some(Arc::clone(&spawn));
 
-    // The run is a loop rather than a single call because a signal, a
-    // sigreturn or (from M3) a freshly translated block redirects execution
-    // by unwinding and re-entering at a new address.
-    let mut pc = program.entry();
-    let exit = loop {
-        let result = enter.call(
-            &mut store,
-            &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)],
-            &mut [],
-        );
-        match result {
-            // Falling off the end of translated code means the guest returned
-            // from its entry point, which Linux treats as an exit.
-            Ok(()) => break store.data().exit.clone().unwrap_or(Exit::Status(0)),
-            Err(e) => {
-                if let Some(next) = store.data_mut().resume_at.take() {
-                    pc = next;
-                    continue;
-                }
-                match store.data().exit.clone() {
-                    Some(x) => break x,
-                    None => return Err(classify_trap(e, &store)),
-                }
-            }
-        }
-    };
+    let exit = run_thread_loop(&mut store, &instance, ctx_addr, program.entry())?;
+
     if let Some(jit) = store.data().jit.as_ref() {
+        let (blocks, calls, translated) = {
+            let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+            (sh.blocks, sh.calls, sh.translated.clone())
+        };
         if opts.verbose {
-            eprintln!(
-                "[gex] runtime translation: {} blocks in {} compilations",
-                jit.blocks, jit.calls
-            );
+            eprintln!("[gex] runtime translation: {blocks} blocks in {calls} compilations");
         }
         if let Some(dir) = &profile_dir {
             // Only addresses in the executable's own image are worth
@@ -470,8 +540,7 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
             // it, and ahead-of-time translation of the executable cannot
             // reach it anyway.
             let (lo, hi) = image.text_range;
-            let found: Vec<u64> = jit
-                .translated
+            let found: Vec<u64> = translated
                 .iter()
                 .copied()
                 .filter(|a| *a >= lo && *a < hi)
@@ -480,6 +549,161 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
         }
     }
     Ok((exit, stats))
+}
+
+/// Perform a syscall's blocking half with the kernel unlocked.
+fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno::Errno> {
+    match op {
+        BlockOp::FutexWait {
+            table,
+            uaddr,
+            val,
+            deadline,
+        } => {
+            // The re-read has to happen under the queue's own lock, which is
+            // what closes the race between checking the word and sleeping.
+            let mem = GuestMem::new(data);
+            table
+                .wait(uaddr, val, deadline, &|| mem.read_u32(uaddr).ok())
+                .map(|_| 0)
+        }
+        BlockOp::Sleep(d) => {
+            std::thread::sleep(d);
+            Ok(0)
+        }
+    }
+}
+
+/// Run one guest thread until it stops.
+///
+/// A loop rather than a single call because a signal, a `sigreturn`, a
+/// freshly translated block or a `clone` all redirect execution by unwinding
+/// out of wasm and re-entering at a new address. `clone` in particular has to
+/// start its host thread from here: doing it inside the syscall import would
+/// mean spawning while a wasm frame is live and the store is borrowed.
+fn run_thread_loop(
+    store: &mut Store<HostState>,
+    instance: &wasmtime::Instance,
+    ctx_addr: u64,
+    entry: u64,
+) -> Result<Exit> {
+    let enter = instance
+        .get_func(&mut *store, exports::ENTER)
+        .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
+    let mut pc = entry;
+    loop {
+        let result = enter.call(
+            &mut *store,
+            &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)],
+            &mut [],
+        );
+        if let Some(child) = store.data_mut().pending_spawn.take() {
+            let cx = store
+                .data()
+                .spawn
+                .clone()
+                .ok_or_else(|| anyhow!("clone with no spawn context"))?;
+            // Detached: a guest thread is joined through its own futex, not
+            // through the host's handle, and `exit_group` ends the process
+            // whatever its threads are doing.
+            std::thread::Builder::new()
+                .name(format!("gex-tid-{}", child.tid))
+                .spawn(move || {
+                    if let Err(e) = run_guest_thread(cx, child) {
+                        eprintln!("gexc: thread {} failed: {e:#}", child.tid);
+                    }
+                })
+                .context("spawning a guest thread")?;
+        }
+        match result {
+            // Falling off the end of translated code means the guest returned
+            // from its entry point, which Linux treats as an exit.
+            Ok(()) => return Ok(store.data().exit.clone().unwrap_or(Exit::Status(0))),
+            Err(e) => {
+                if let Some(next) = store.data_mut().resume_at.take() {
+                    pc = next;
+                    continue;
+                }
+                match store.data().exit.clone() {
+                    Some(x) => return Ok(x),
+                    None => return Err(classify_trap(e, store)),
+                }
+            }
+        }
+    }
+}
+
+/// A guest thread: its own store, its own instances, the same memory.
+fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
+    let mut store = Store::new(
+        &cx.engine,
+        HostState {
+            kernel: Arc::clone(&cx.kernel),
+            thread,
+            memory: Some(cx.memory.clone()),
+            proc_state: Arc::clone(&cx.proc_state),
+            exit: None,
+            resume_at: None,
+            jit: None,
+            spawn: Some(Arc::clone(&cx)),
+            pending_spawn: None,
+        },
+    );
+    let mut linker = cx.linker.clone();
+    linker.allow_shadowing(true);
+    linker.define(
+        &mut store,
+        IMPORT_MODULE,
+        exports::MEMORY,
+        cx.memory.shared().clone(),
+    )?;
+    let instance = linker
+        .instantiate(&mut store, &cx.image_module)
+        .context("instantiating the image module for a new thread")?;
+    let table = match instance.get_export(&mut store, exports::DISPATCH_TABLE) {
+        Some(Extern::Table(t)) => t,
+        _ => bail!("translated module does not export its dispatch table"),
+    };
+    if let Some(shared) = &cx.jit_shared {
+        store.data_mut().jit = Some(Jit {
+            shared: Arc::clone(shared),
+            engine: cx.engine.clone(),
+            linker: cx.linker.clone(),
+            table,
+            instances: Vec::new(),
+            replayed: 0,
+            limits: cx.limits,
+        });
+    }
+
+    // This thread's table starts with only what the image module installed,
+    // so everything translated since has to be replayed into it before the
+    // first branch reaches for it.
+    catch_up_table(&mut store)?;
+
+    let entry = {
+        let data = cx.memory.bytes();
+        read_u64(data, (thread.ctx_addr + ctx::PC as u64) as usize)
+    };
+    let _ = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
+    Ok(())
+}
+
+/// Instantiate every registry entry into this store, outside a wasm frame.
+fn catch_up_table(store: &mut Store<HostState>) -> Result<()> {
+    let Some(jit) = store.data().jit.as_ref() else {
+        return Ok(());
+    };
+    let (shared, from) = (Arc::clone(&jit.shared), jit.replayed);
+    let pending: Vec<Arc<CompiledUnit>> = {
+        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.registry[from.min(sh.registry.len())..].to_vec()
+    };
+    for unit in &pending {
+        install_unit(&mut *store, unit)?;
+        store.data_mut().jit.as_mut().unwrap().replayed += 1;
+    }
+    Ok(())
 }
 
 /// Build the guest's namespace.
@@ -612,11 +836,10 @@ fn place_image(
         if seg.executable {
             p |= prot::EXEC;
         }
-        store
-            .data_mut()
-            .kernel
-            .mem
-            .insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]");
+        store.data_mut().with_kernel(|k| {
+            k.mem
+                .insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]")
+        });
     }
 
     // Then the stack. Determinism by default (PLAN §11) means a fixed
@@ -638,12 +861,14 @@ fn place_image(
     data[start..end].copy_from_slice(&layout.bytes);
 
     let stack_low = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
-    store.data_mut().kernel.mem.insert(
-        stack_low,
-        gex_abi::STACK_TOP,
-        prot::READ | prot::WRITE,
-        "[stack]",
-    );
+    store.data_mut().with_kernel(|k| {
+        k.mem.insert(
+            stack_low,
+            gex_abi::STACK_TOP,
+            prot::READ | prot::WRITE,
+            "[stack]",
+        )
+    });
 
     // Finally the initial register state: sp, and x0 cleared the way Linux
     // leaves it.
@@ -663,6 +888,10 @@ fn write_u64(data: &mut [u8], off: usize, v: u64) {
     data[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
+fn read_u64(data: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
+}
+
 /// Wire the `gex.*` import surface to the kernel.
 fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let m = IMPORT_MODULE;
@@ -676,18 +905,27 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .memory
                 .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
-            // Split the borrow: the kernel needs `&mut [u8]` and `&mut Kernel`
-            // at once, and they live in different places.
-            // /proc must reflect the state this syscall will see, so the
-            // snapshot is refreshed before the call rather than after.
-            {
-                let state = caller.data();
-                state.kernel.refresh_proc(&state.proc_state);
-            }
             let data = memory.bytes();
             let state = caller.data_mut();
             let mut gm = GuestMem::new(data);
-            match state.kernel.syscall(&mut gm, pc as u64) {
+            // /proc must reflect the state this syscall will see, so the
+            // snapshot is refreshed before the call rather than after.
+            let proc_state = Arc::clone(&state.proc_state);
+            let outcome = state.with_kernel(|k| {
+                k.refresh_proc(&proc_state);
+                k.syscall(&mut gm, pc as u64)
+            });
+            // A blocking syscall is run here, with the kernel unlocked, and
+            // then finished under the lock again.
+            let outcome = if let SyscallOutcome::Blocking(op) = outcome {
+                let r = perform_block(op, memory.bytes());
+                let mut gm = GuestMem::new(memory.bytes());
+                caller.data_mut().with_kernel(|k| k.finish_blocking(&mut gm, r))
+            } else {
+                outcome
+            };
+            let state = caller.data_mut();
+            match outcome {
                 SyscallOutcome::Continue => Ok(()),
                 SyscallOutcome::Resume(target) => {
                     state.resume_at = Some(target);
@@ -695,6 +933,32 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 SyscallOutcome::Exit(code) => {
                     state.exit = Some(Exit::Status(code));
+                    Err(StopExecution.into())
+                }
+                SyscallOutcome::SpawnThread {
+                    ctx_addr,
+                    tid,
+                    clear_child_tid,
+                } => {
+                    // Starting the thread here would mean spawning from
+                    // inside a wasm frame; record it and let the run loop do
+                    // it between calls, where nothing is borrowed.
+                    state.pending_spawn = Some(ThreadState {
+                        ctx_addr,
+                        tid,
+                        clear_child_tid,
+                    });
+                    state.resume_at = Some(
+                        gm.read_u64(state.thread.ctx_addr + ctx::PC as u64)
+                            .unwrap_or(0),
+                    );
+                    Err(StopExecution.into())
+                }
+                SyscallOutcome::Blocking(_) => {
+                    unreachable!("a blocking syscall was already completed")
+                }
+                SyscallOutcome::ThreadExit => {
+                    state.exit = Some(Exit::Status(0));
                     Err(StopExecution.into())
                 }
                 SyscallOutcome::Killed { signal, core } => {
@@ -729,7 +993,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let data = memory.bytes();
             let state = caller.data_mut();
                 let mut gm = GuestMem::new(data);
-                return match state.kernel.sigreturn(&mut gm) {
+                return match state.with_kernel(|k| k.sigreturn(&mut gm)) {
                     Ok(target) => {
                         state.resume_at = Some(target);
                         Err(StopExecution.into())
@@ -791,10 +1055,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let mut gm = GuestMem::new(data);
             // A guest that installed a SIGILL handler gets to see it, which
             // is how some runtimes probe for optional instructions.
-            match state
-                .kernel
-                .raise_fault(&mut gm, signal::SIGILL as u32, pc, pc)
-            {
+            match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGILL as u32, pc, pc)) {
                 gex_kernel::signal::Delivery::Resume(target) => {
                     state.resume_at = Some(target);
                 }
@@ -891,7 +1152,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let mut gm = GuestMem::new(data);
             // The context is complete here, so a handler frame built now
             // captures exactly the state the guest would see on hardware.
-            let ctx_addr = state.kernel.ctx_addr;
+            let ctx_addr = state.thread.ctx_addr;
             let _ = gm.write_u64(ctx_addr + gex_abi::ctx::PC as u64, pc as u64);
             // Rearm before delivering, so a handler that loops still polls.
             let counter = ctx_addr as usize + gex_abi::ctx::SAFEPOINT_COUNTER;
@@ -899,7 +1160,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 gm.bytes[counter..counter + 4]
                     .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
             }
-            match state.kernel.deliver_pending(&mut gm) {
+            match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {
                     state.resume_at = Some(target);
@@ -931,20 +1192,39 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
 /// table, so freshly translated code shares state with everything already
 /// running and can branch into it through the table.
 fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
-    let (limits, page_table) = {
+    // Another thread may already have translated this code. Catching up on
+    // the shared registry is far cheaper than translating again, and it is
+    // also how a newly spawned thread fills a table that starts out holding
+    // only what the image module put there.
+    if replay_registry(caller)? && {
+        let jit = caller.data().jit.as_ref().unwrap();
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.translated.contains(&pc)
+    } {
+        return Ok(true);
+    }
+
+    let (limits, shared) = {
         let jit = caller
             .data()
             .jit
             .as_ref()
             .ok_or_else(|| anyhow!("runtime translation is not set up"))?;
-        (jit.limits, jit.page_table.clone())
+        (jit.limits, Arc::clone(&jit.shared))
+    };
+    let page_table = {
+        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.page_table.clone()
     };
     if pc % 4 != 0 || pc >= gex_abi::DISPATCH_MAX_PAGES * gex_abi::DISPATCH_PAGE {
         return Ok(false);
     }
     // Only translate what the guest says is executable, so a wild branch into
     // data reports SIGSEGV rather than running whatever bytes are there.
-    if !caller.data().kernel.mem.check_access(pc, 4, prot::EXEC) {
+    if !caller
+        .data_mut()
+        .with_kernel(|k| k.mem.check_access(pc, 4, prot::EXEC))
+    {
         return Ok(false);
     }
 
@@ -952,22 +1232,19 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         .data()
         .memory
         .clone()
-                .ok_or_else(|| anyhow!("guest memory unavailable"))?;
-    let known: std::collections::HashSet<u64> = caller
-        .data()
-        .jit
-        .as_ref()
-        .map(|j| j.translated.clone())
-        .unwrap_or_default();
-    let exec_ranges: Vec<(u64, u64)> = caller
-        .data()
-        .kernel
-        .mem
-        .vmas()
-        .iter()
-        .filter(|v| v.prot & prot::EXEC != 0)
-        .map(|v| (v.start, v.end))
-        .collect();
+        .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let known: std::collections::HashSet<u64> = {
+        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.translated.clone()
+    };
+    let exec_ranges: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
+        k.mem
+            .vmas()
+            .iter()
+            .filter(|v| v.prot & prot::EXEC != 0)
+            .map(|v| (v.start, v.end))
+            .collect()
+    });
     let (translated_module, stats) = {
         let data = memory.bytes();
         gex_xlate::translate_runtime(
@@ -1058,13 +1335,126 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         bail!("translated {} blocks but none covered 0x{pc:x}", installed.len());
     }
 
+    {
+        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.translated.extend(installed);
+        sh.page_table = translated_module.page_table.clone();
+        sh.registry.push(Arc::new(CompiledUnit {
+            module,
+            exported_blocks: translated_module.exported_blocks.clone(),
+            dir_entries: translated_module.dir_entries.clone(),
+            table_slots: translated_module.table_slots,
+            page_table: translated_module.page_table.clone(),
+        }));
+        sh.blocks += stats.blocks;
+        sh.calls += 1;
+    }
     let jit = caller.data_mut().jit.as_mut().unwrap();
-    jit.translated.extend(installed);
-    jit.page_table = translated_module.page_table.clone();
-    jit.modules.push(instance);
-    jit.blocks += stats.blocks;
-    jit.calls += 1;
+    jit.instances.push(instance);
+    // This store now holds the unit it just pushed.
+    jit.replayed += 1;
     Ok(true)
+}
+
+/// Instantiate any registry entries this store has not seen yet.
+///
+/// Returns whether anything was replayed. The registry is append-only and
+/// ordered, so a store catches up by walking forward from its own watermark;
+/// two stores that have replayed the same count hold the same code.
+fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
+    let (shared, from) = {
+        let Some(jit) = caller.data().jit.as_ref() else {
+            return Ok(false);
+        };
+        (Arc::clone(&jit.shared), jit.replayed)
+    };
+    let pending: Vec<Arc<CompiledUnit>> = {
+        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if sh.registry.len() <= from {
+            return Ok(false);
+        }
+        sh.registry[from..].to_vec()
+    };
+    for unit in &pending {
+        install_unit(&mut *caller, unit)?;
+        caller.data_mut().jit.as_mut().unwrap().replayed += 1;
+    }
+    Ok(true)
+}
+
+/// Instantiate one compiled unit into this store and point its table slots at
+/// the result.
+fn install_unit(
+    mut cx: impl wasmtime::AsContextMut<Data = HostState>,
+    unit: &CompiledUnit,
+) -> Result<()> {
+    let (memory, linker, table) = {
+        let data = cx.as_context().data();
+        let jit = data
+            .jit
+            .as_ref()
+            .ok_or_else(|| anyhow!("runtime translation is not set up"))?;
+        (
+            data.memory
+                .clone()
+                .ok_or_else(|| anyhow!("guest memory unavailable"))?,
+            jit.linker.clone(),
+            jit.table,
+        )
+    };
+
+    let have = table.size(cx.as_context_mut());
+    if unit.table_slots > have {
+        let miss = table
+            .get(cx.as_context_mut(), 0)
+            .ok_or_else(|| anyhow!("dispatch table is empty"))?;
+        table
+            .grow(cx.as_context_mut(), unit.table_slots - have, miss)
+            .context("growing the dispatch table")?;
+    }
+
+    let mut linker = linker;
+    linker.allow_shadowing(true);
+    linker.define(
+        cx.as_context_mut(),
+        gex_abi::IMPORT_MODULE,
+        exports::MEMORY,
+        memory.shared().clone(),
+    )?;
+    linker.define(
+        cx.as_context_mut(),
+        gex_abi::IMPORT_MODULE,
+        exports::DISPATCH_TABLE,
+        table,
+    )?;
+    let instance = linker
+        .instantiate(cx.as_context_mut(), &unit.module)
+        .context("instantiating a runtime-translated module")?;
+
+    for (addr, name) in &unit.exported_blocks {
+        let Some(Extern::Func(f)) = instance.get_export(cx.as_context_mut(), name) else {
+            bail!("runtime module is missing its export {name}");
+        };
+        let page = gex_abi::dispatch_page(*addr);
+        let Some(base) = unit.page_table.lookup(page) else {
+            bail!("no dispatch page allocated for block 0x{addr:x}");
+        };
+        let slot = gex_abi::dispatch_index(*addr, base);
+        table
+            .set(cx.as_context_mut(), slot, Ref::Func(Some(f)))
+            .with_context(|| format!("installing block 0x{addr:x} in slot {slot}"))?;
+    }
+    // Idempotent: the directory lives in shared guest memory, so a second
+    // store writing the same entries changes nothing.
+    write_dispatch_dir(memory, &unit.dir_entries)?;
+    cx.as_context_mut()
+        .data_mut()
+        .jit
+        .as_mut()
+        .unwrap()
+        .instances
+        .push(instance);
+    Ok(())
 }
 
 /// Publish page-directory entries so translated code becomes reachable.

@@ -370,48 +370,68 @@ the point of having it.
 
 ---
 
-## Threads: what is done and what is not
+## Threads
 
-Guest threads are not implemented yet. The prerequisite is, and the shape of
-the rest is settled, so this records it rather than leaving it to be
-rediscovered.
+Guest threads are real host threads, as PLAN §8 asks: a `clone` with
+`CLONE_THREAD` spawns one, and a futex wait is a real wait rather than a
+scheduled one.
 
-The ABI already reserves a register context per thread — `ctx_addr(slot)`,
-with `TID` and `INTERRUPT` among the per-thread fields — and every translated
-function takes its context as a parameter, so a thread is just a call to
-`enter` with a different one. Two things follow from wasmtime's model:
+The shape follows from two facts about wasmtime. A `Store` is `!Sync`, so each
+guest thread has its own — and therefore its own instances and its own
+dispatch table. And a module-defined memory belongs to its instance, so the
+guest's memory is host-created, shared, and imported by every module. The ABI
+already anticipated the rest: contexts are addressed as `ctx_addr(slot)`, and
+every translated function takes its context as a parameter, so starting a
+thread is a call to `enter` with a different one.
 
-* **A `Store` is `!Sync`**, so each guest thread needs its own, and therefore
-  its own instances and its own dispatch table. Instances of the same `Module`
-  populate their tables identically from the same element segments, so the
-  tables agree without being shared.
-* **A module-defined memory belongs to its instance.** The guest's memory is
-  therefore host-created, shared, and imported by every module. *This part is
-  done* — see the section above — and costs no measurable throughput.
+Three pieces make it work:
 
-What remains:
+* **A shared kernel with an explicit per-thread seam.** `Kernel` holds process
+  state — descriptors, the VMA tree, mounts, signal dispositions — behind one
+  mutex. The three fields that describe *the calling thread* (`ctx_addr`,
+  `tid`, `clear_child_tid`) live in the host's per-thread state and are
+  installed under the same lock that guards the syscall, so what the kernel
+  holds always describes whoever owns it.
 
-1. **The kernel behind a lock.** `Kernel` mixes process state (descriptors,
-   the VMA tree, mounts, signal dispositions) with three per-thread fields
-   (`ctx_addr`, `tid`, `clear_child_tid`). The process state becomes
-   `Arc<Mutex<Kernel>>`; the per-thread fields move into the host's per-thread
-   state and are installed under the same lock that guards the syscall. The
-   futex table is already `Arc<FutexTable>` with its own locking, built for
-   this.
-2. **A registry of translated modules.** A new thread instantiates the image
-   module and then every runtime-translated module, replaying the funcref
-   installs the host did for each, so its table covers the same addresses. The
-   same registry answers a dispatch miss for code another thread already
-   translated — instantiate rather than retranslate.
-3. **`clone`.** Allocate a tid and a context slot, initialise the child's
-   context from the parent's with `x0 = 0`, the child stack and the TLS
-   pointer, then spawn a host thread that builds a store and calls `enter`.
-   Thread exit writes zero to `clear_child_tid` and futex-wakes it, which is
-   what `pthread_join` waits on.
+* **Blocking syscalls run unlocked.** This is the part that is easy to get
+  wrong and impossible to miss: a futex wait holding the kernel lock can never
+  be woken, because the waker needs the same lock to issue the wake. `futex`
+  and `nanosleep` are recognised before dispatch and answered as a
+  `BlockOp` that the host performs with nothing held, then completes under the
+  lock again. The first version deadlocked on exactly this.
 
-The reason this is not half-built in the tree is that a half-applied version
-of step 1 leaves nothing working, and the prerequisite is worth having on its
-own.
+* **A registry of translated modules.** Each store's dispatch table starts
+  with only what the image module installed. Everything translated since is
+  replayed into it — instantiate, not retranslate — and the same registry
+  answers a dispatch miss for code another thread has already compiled. It is
+  append-only and ordered, so a store catches up by walking forward from its
+  own watermark.
+
+Scaling, on a 24-core VM, with each thread running the same independent
+CPU-bound loop:
+
+| threads | wall | aggregate | vs QEMU |
+|---|---|---|---|
+| 1 | 2.22 s | 180 M iter/s | 2.86 s |
+| 2 | 2.32 s | 344 M iter/s | 2.60 s |
+| 4 | 2.74 s | 584 M iter/s | 2.60 s |
+| 8 | 3.37 s | 949 M iter/s | 3.32 s |
+| 16 | 5.61 s | 1140 M iter/s | 4.99 s |
+
+Sixteen times the work for two and a half times the wall clock. The falloff
+past eight is partly the machine and partly the single kernel lock, which
+every syscall takes; splitting it is the obvious next move if a syscall-heavy
+threaded workload needs it.
+
+`tests/integration/programs/threads.c` covers eight workers over a mutex,
+thread-local storage, `pthread_once`, a condition variable with a separate
+producer and consumer, and detached threads that nobody joins. Every number it
+prints is order-independent, so the comparison against QEMU is of the
+arithmetic rather than of the scheduler. It ran 20 times without a difference.
+
+Not done: `fork`, and `exit_group` while other threads are running detaches
+them rather than joining, which is fine for a process that is about to end and
+would not be for a library embedding.
 
 ---
 

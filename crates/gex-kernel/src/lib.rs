@@ -23,7 +23,7 @@ pub mod syscalls;
 pub mod vfs;
 
 pub use errno::Errno;
-pub use syscalls::{Kernel, KernelProcSource, ProcState, SyscallOutcome};
+pub use syscalls::{BlockOp, Kernel, KernelProcSource, ProcState, SyscallOutcome, ThreadState};
 
 /// Guest linear memory, addressed exactly as the guest addresses it.
 ///

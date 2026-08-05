@@ -56,9 +56,9 @@ compare() {
     label_of "$@"
     echo "     retrying $retry_label..."
     if compare_once --quiet "$@"; then
+        # `compare_once` already counted the pass.
         echo "FLAKY $retry_label: failed once, passed on retry"
         flaky=$((flaky + 1))
-        pass=$((pass + 1))
     else
         fail=$((fail + 1))
     fi
@@ -168,6 +168,9 @@ echo "building guest programs..."
 "$CC" -nostdlib -static -no-pie -o "$WORK/flags" "$HERE/programs/flags.S"
 # Inline assembly, because the fixed-point conversions have no C spelling.
 "$CC" -static -no-pie -O2 -o "$WORK/fixedpoint" "$HERE/programs/fixedpoint.c"
+# Every result this prints is order-independent, so the comparison is of the
+# arithmetic rather than of the scheduler.
+"$CC" -static -no-pie -O2 -o "$WORK/threads" "$HERE/programs/threads.c" -lpthread
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
 # .eh_frame through personality routines -- a very different code shape from
 # anything the C programs reach.
@@ -231,6 +234,7 @@ compare "numeric" "$WORK/numeric"
 compare "neon-structure" "$WORK/neon2"
 compare "cross-block-flags" "$WORK/flags"
 compare "fixed-point" "$WORK/fixedpoint"
+compare "threads" "$WORK/threads"
 [ -n "$CPP" ] && compare "cpp-static" "$WORK/cpp"
 
 if [ -n "$DYNAMIC" ]; then
@@ -255,6 +259,7 @@ compare "nojit-vector" "$WORK/vector"
 compare "nojit-neon-structure" "$WORK/neon2"
 compare "nojit-cross-block-flags" "$WORK/flags"
 compare "nojit-fixed-point" "$WORK/fixedpoint"
+compare "nojit-threads" "$WORK/threads"
 GEXC_ARGS=""
 
 echo

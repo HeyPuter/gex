@@ -29,7 +29,7 @@ pub mod op {
 }
 
 /// One wait queue, keyed by guest address.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Queue {
     /// Bumped on every wake, so a waiter can tell a real wake from a spurious
     /// wakeup without re-reading guest memory.
@@ -38,7 +38,7 @@ struct Queue {
 }
 
 /// The process's futex queues.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct FutexTable {
     queues: Mutex<HashMap<u64, Arc<Queue>>>,
 }

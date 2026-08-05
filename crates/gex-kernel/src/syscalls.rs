@@ -19,7 +19,7 @@ use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
 use crate::stdio::{StdStream, Stream};
 use crate::vfs::{FileType, ProcSource, Vfs};
 use crate::GuestMem;
-use gex_abi::ctx;
+use gex_abi::{ctx, ctx_addr, EXCLUSIVE_SCRATCH};
 use std::sync::{Arc, Mutex};
 
 /// aarch64 syscall numbers (the asm-generic ABI).
@@ -107,7 +107,7 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 
 /// What the host should do after a syscall returns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum SyscallOutcome {
     /// Resume the guest where it left off.
     Continue,
@@ -121,6 +121,50 @@ pub enum SyscallOutcome {
     Exit(i32),
     /// A signal with no handler ended the process.
     Killed { signal: u32, core: bool },
+    /// `clone` set up a new thread's context; the host must run it.
+    ///
+    /// The kernel cannot spawn a thread itself -- a wasmtime store belongs to
+    /// one -- so it prepares the context in shared guest memory and hands the
+    /// host what it needs.
+    SpawnThread {
+        ctx_addr: u64,
+        tid: i32,
+        /// `CLONE_CHILD_CLEARTID`: where the child must write zero and
+        /// futex-wake when it exits. Zero when the flag was not set.
+        clear_child_tid: u64,
+    },
+    /// This thread is finished; the process is not.
+    ThreadExit,
+    /// The syscall has to sleep, and must do so with the kernel unlocked.
+    ///
+    /// A blocking call that held the shared kernel would stop every other
+    /// thread from making the very progress it is waiting for -- a futex wait
+    /// could never be woken, because the waker needs the same lock to issue
+    /// its wake. The host performs the operation, then hands the result back
+    /// through [`Kernel::finish_blocking`].
+    Blocking(BlockOp),
+}
+
+/// A syscall's blocking half, to be run without the kernel lock.
+#[derive(Debug, Clone)]
+pub enum BlockOp {
+    FutexWait {
+        table: Arc<FutexTable>,
+        uaddr: u64,
+        val: u32,
+        deadline: Option<std::time::Duration>,
+    },
+    Sleep(std::time::Duration),
+}
+
+/// `clone` flags gex understands.
+pub mod clone_flags {
+    pub const VM: u64 = 0x0000_0100;
+    pub const THREAD: u64 = 0x0001_0000;
+    pub const SETTLS: u64 = 0x0008_0000;
+    pub const PARENT_SETTID: u64 = 0x0010_0000;
+    pub const CHILD_CLEARTID: u64 = 0x0020_0000;
+    pub const CHILD_SETTID: u64 = 0x0100_0000;
 }
 
 /// One guest process's kernel state.
@@ -151,9 +195,63 @@ pub struct Kernel {
     /// Syscalls seen but not implemented, for the ENOSYS telemetry in
     /// PLAN §14.
     pub unimplemented: Vec<u64>,
+    /// Next thread id to hand out. Thread ids are process-wide, so this lives
+    /// with the shared state rather than with a thread.
+    pub next_tid: i32,
+    /// Next free register-context slot. Slot 0 is the initial thread's.
+    pub next_ctx_slot: u32,
+    /// Threads that have been created and not yet exited, including this one.
+    pub live_threads: u32,
+}
+
+/// A thread the kernel has prepared and the host must start.
+#[derive(Clone, Copy, Debug)]
+pub struct SpawnRequest {
+    pub ctx_addr: u64,
+    pub tid: i32,
+    pub clear_child_tid: u64,
+}
+
+/// The parts of a kernel's state that belong to one thread, not the process.
+///
+/// [`Kernel`] is shared between every guest thread, so the fields describing
+/// "the thread making this call" cannot live there permanently. They are
+/// installed by [`Kernel::enter_thread`] under the same lock that guards the
+/// syscall and read back by [`Kernel::leave_thread`], so what the kernel holds
+/// always describes whichever thread currently owns it.
+#[derive(Clone, Copy, Debug)]
+pub struct ThreadState {
+    /// Address of this thread's register context.
+    pub ctx_addr: u64,
+    pub tid: i32,
+    /// Where to write zero and futex-wake when this thread exits, which is
+    /// what `pthread_join` is waiting on.
+    pub clear_child_tid: u64,
+}
+
+impl ThreadState {
+    pub fn new(ctx_addr: u64, tid: i32) -> ThreadState {
+        ThreadState {
+            ctx_addr,
+            tid,
+            clear_child_tid: 0,
+        }
+    }
 }
 
 impl Kernel {
+    /// Make the shared kernel describe `t` for the duration of a syscall.
+    pub fn enter_thread(&mut self, t: &ThreadState) {
+        self.ctx_addr = t.ctx_addr;
+        self.tid = t.tid;
+        self.clear_child_tid = t.clear_child_tid;
+    }
+
+    /// Copy back what the syscall changed about the calling thread.
+    pub fn leave_thread(&self, t: &mut ThreadState) {
+        t.clear_child_tid = self.clear_child_tid;
+    }
+
     pub fn new(ctx_addr: u64, brk_start: u64, exe_path: String) -> Kernel {
         let mut fds = FdTable::new();
         // The three standard streams, reported as terminals when the host's
@@ -188,6 +286,86 @@ impl Kernel {
             futexes: Arc::new(FutexTable::new()),
             trace: false,
             unimplemented: Vec::new(),
+            next_tid: 2,
+            next_ctx_slot: 1,
+            live_threads: 1,
+        }
+    }
+
+    /// `clone`, for the `CLONE_THREAD` case that `pthread_create` uses.
+    ///
+    /// The child's context is built in shared guest memory from the parent's,
+    /// so it inherits everything the ABI does not say otherwise about, and
+    /// then differs in exactly what the architecture and the flags require:
+    /// `x0` is zero because that is what the child's `clone` returns, `sp` and
+    /// the thread pointer come from the caller, and the exclusive monitor
+    /// starts clear because a monitor is per-thread and the parent's says
+    /// nothing about the child's.
+    ///
+    /// A `clone` without `CLONE_THREAD` is `fork`, which gex does not
+    /// implement -- one address space, one process.
+    fn sys_clone(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
+        let (flags, child_stack, parent_tid, tls, child_tid) = (a[0], a[1], a[2], a[3], a[4]);
+        if flags & clone_flags::THREAD == 0 || flags & clone_flags::VM == 0 {
+            return Err(Errno::ENOSYS);
+        }
+        if child_stack == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let tid = self.next_tid;
+        self.next_tid += 1;
+        let slot = self.next_ctx_slot;
+        self.next_ctx_slot += 1;
+        let child = ctx_addr(slot);
+        // Contexts live in the reserved region below the guest's own memory;
+        // running out of slots is a hard limit, not something to paper over.
+        if child + ctx::SIZE as u64 >= EXCLUSIVE_SCRATCH {
+            return Err(Errno::EAGAIN);
+        }
+
+        let parent = self.ctx_addr;
+        for off in (0..ctx::SIZE).step_by(8) {
+            let v = m.read_u64(parent + off as u64)?;
+            m.write_u64(child + off as u64, v)?;
+        }
+        m.write_u64(child + ctx::x(0) as u64, 0)?;
+        m.write_u64(child + ctx::SP as u64, child_stack)
+            ?;
+        m.write_u64(child + ctx::MON_SIZE as u64, 0)
+            ?;
+        m.write_u64(child + ctx::TID as u64, tid as u64)
+            ?;
+        if flags & clone_flags::SETTLS != 0 {
+            m.write_u64(child + ctx::TPIDR as u64, tls)
+                ?;
+        }
+        if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
+            m.write_u32(parent_tid, tid as u32)?;
+        }
+        if flags & clone_flags::CHILD_SETTID != 0 && child_tid != 0 {
+            m.write_u32(child_tid, tid as u32)?;
+        }
+        self.live_threads += 1;
+        Ok(SpawnRequest {
+            ctx_addr: child,
+            tid,
+            clear_child_tid: if flags & clone_flags::CHILD_CLEARTID != 0 {
+                child_tid
+            } else {
+                0
+            },
+        })
+    }
+
+    /// What a thread must do on its way out: release whatever is waiting on
+    /// it. `pthread_join` blocks on exactly this futex.
+    fn thread_exit(&mut self, m: &mut GuestMem<'_>) {
+        self.live_threads = self.live_threads.saturating_sub(1);
+        let addr = self.clear_child_tid;
+        if addr != 0 {
+            let _ = m.write_u32(addr, 0);
+            self.futexes.wake(addr, u32::MAX);
         }
     }
 
@@ -224,6 +402,49 @@ impl Kernel {
             };
         }
 
+        // `clone` and a thread's `exit` change which threads exist, so they
+        // answer with an outcome rather than a return value.
+        if n == nr::CLONE {
+            return match self.sys_clone(m, a) {
+                Ok(req) => {
+                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, req.tid as u64);
+                    if self.trace {
+                        eprintln!("[gex] clone(...) = {} (new thread)", req.tid);
+                    }
+                    SyscallOutcome::SpawnThread {
+                        ctx_addr: req.ctx_addr,
+                        tid: req.tid,
+                        clear_child_tid: req.clear_child_tid,
+                    }
+                }
+                Err(e) => {
+                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, e.as_return());
+                    if self.trace {
+                        eprintln!("[gex] clone(...) = {}", -(e.0 as i64));
+                    }
+                    SyscallOutcome::Continue
+                }
+            };
+        }
+        // `exit` ends one thread; only `exit_group` ends the process. For the
+        // last thread the two are the same thing.
+        if n == nr::EXIT && self.live_threads > 1 {
+            if self.trace {
+                eprintln!("[gex] exit({}) (thread {})", a[0] as i32, self.tid);
+            }
+            self.thread_exit(m);
+            return SyscallOutcome::ThreadExit;
+        }
+
+        // A syscall that sleeps must do so with the kernel unlocked, or the
+        // thread that would wake it can never get in.
+        if let Some(op) = self.blocking_op(m, n, a) {
+            if self.trace {
+                eprintln!("[gex] {} blocking", syscall_name(n));
+            }
+            return SyscallOutcome::Blocking(op);
+        }
+
         let outcome = self.dispatch(m, n, a);
         let ret = match &outcome {
             Ok(r) => encode(*r),
@@ -248,6 +469,64 @@ impl Kernel {
 
         // A syscall boundary is a safepoint: the context is complete, so a
         // pending signal can be delivered precisely here.
+        match self.deliver_pending(m) {
+            Delivery::None => SyscallOutcome::Continue,
+            Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
+            Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
+        }
+    }
+
+    /// The blocking half of a syscall, if it has one.
+    ///
+    /// Recognised before dispatch, because these are exactly the calls whose
+    /// whole purpose is to wait for another thread.
+    fn blocking_op(&mut self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
+        match n {
+            nr::FUTEX => {
+                let operation =
+                    (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
+                if operation != futex::op::WAIT && operation != futex::op::WAIT_BITSET {
+                    return None;
+                }
+                let deadline = if a[3] == 0 {
+                    None
+                } else {
+                    let secs = m.read_u64(a[3]).ok()?;
+                    let nanos = m.read_u64(a[3] + 8).ok()?;
+                    Some(std::time::Duration::new(
+                        secs.min(3600),
+                        (nanos % 1_000_000_000) as u32,
+                    ))
+                };
+                Some(BlockOp::FutexWait {
+                    table: Arc::clone(&self.futexes),
+                    uaddr: a[0],
+                    val: a[2] as u32,
+                    deadline,
+                })
+            }
+            nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => {
+                // `clock_nanosleep` puts the request in a[2]; `nanosleep` in
+                // a[0]. Neither clock nor the absolute-time flag is modelled.
+                let req = if n == nr::NANOSLEEP { a[0] } else { a[2] };
+                if req == 0 {
+                    return None;
+                }
+                let secs = m.read_u64(req).ok()?;
+                let nanos = m.read_u64(req + 8).ok()?;
+                Some(BlockOp::Sleep(std::time::Duration::new(
+                    secs.min(60),
+                    (nanos % 1_000_000_000) as u32,
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    /// Finish a syscall whose blocking half the host has now run.
+    pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
+        let ret = encode(r);
+        let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, ret);
         match self.deliver_pending(m) {
             Delivery::None => SyscallOutcome::Continue,
             Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
@@ -380,25 +659,9 @@ impl Kernel {
         // space, and the timeout is treated as relative either way.
         let operation = raw_op & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
         match operation {
-            futex::op::WAIT | futex::op::WAIT_BITSET => {
-                let deadline = if timeout == 0 {
-                    None
-                } else {
-                    let secs = m.read_u64(timeout)?;
-                    let nanos = m.read_u64(timeout + 8)?;
-                    Some(std::time::Duration::new(
-                        secs.min(3600),
-                        (nanos % 1_000_000_000) as u32,
-                    ))
-                };
-                // Cloning the table first frees `self`, leaving the memory
-                // borrow uncontended for the re-read under the queue lock.
-                let futexes = Arc::clone(&self.futexes);
-                let mem = &*m;
-                futexes
-                    .wait(uaddr, val, deadline, &|| mem.read_u32(uaddr).ok())
-                    .map(|_| 0)
-            }
+            // The waiting forms never reach here: `blocking_op` takes them
+            // before dispatch so the host can run them unlocked.
+            futex::op::WAIT | futex::op::WAIT_BITSET => Err(Errno::EINVAL),
             futex::op::WAKE | futex::op::WAKE_BITSET => Ok(self.futexes.wake(uaddr, val)),
             // Requeue is an optimisation for condition variables; waking
             // everyone is correct, if less efficient.
@@ -1030,8 +1293,9 @@ impl Kernel {
         let nanos = m.read_u64(req + 8)?;
         // A cap keeps a guest from parking the runtime indefinitely before
         // signals exist to interrupt it.
-        let d = std::time::Duration::new(secs.min(60), (nanos % 1_000_000_000) as u32);
-        std::thread::sleep(d);
+        let _ = (secs, nanos);
+        // The sleep itself is `BlockOp::Sleep`, run by the host with the
+        // kernel unlocked; reaching here means a zero request.
         Ok(0)
     }
 
