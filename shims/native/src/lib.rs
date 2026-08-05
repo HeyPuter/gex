@@ -82,6 +82,9 @@ pub struct RunOptions {
     pub jit: bool,
     /// Reuse compiled modules across runs (PLAN §10).
     pub cache: bool,
+    /// Guest directory to start in. Without one the guest inherits the host's
+    /// working directory, or `/` when a sysroot is mounted.
+    pub cwd: Option<String>,
 }
 
 impl Default for RunOptions {
@@ -93,6 +96,7 @@ impl Default for RunOptions {
             verbose: false,
             sysroot: None,
             jit: false,
+            cwd: None,
             // On by default: it is the difference between half a minute and
             // half a second on a program the size of SQLite, and a cache miss
             // costs only the write.
@@ -1143,7 +1147,12 @@ fn mount_filesystems(
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "/".into());
-    let _ = kernel.vfs.set_cwd(if opts.sysroot.is_some() { "/" } else { &cwd });
+    let start = match &opts.cwd {
+        Some(d) => d.clone(),
+        None if opts.sysroot.is_some() => "/".to_string(),
+        None => cwd,
+    };
+    let _ = kernel.vfs.set_cwd(&start);
     Ok(())
 }
 

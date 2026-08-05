@@ -66,13 +66,19 @@ run options:
   --no-jit        no runtime translation; implies --exhaustive
   --lazy          discover only from the entry point, leaving the rest to
                   runtime translation; much faster to start on a big binary
-  --no-cache      do not reuse compiled modules between runs"
+  --no-cache      do not reuse compiled modules between runs
+  --cwd DIR       start in this guest directory
+  --argv0 NAME    what the guest sees as argv[0]; useful with --sysroot,
+                  where the host path the program was loaded from is not a
+                  path the guest can resolve"
     );
 }
 
 /// Split gexc's own flags from the guest's argument vector.
 struct RunArgs {
     path: String,
+    /// What the guest should see as `argv[0]`, if not `path`.
+    argv0: Option<String>,
     guest_args: Vec<String>,
     opts: RunOptions,
     xlate: Options,
@@ -89,6 +95,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut exhaustive = false;
     let mut no_jit = false;
     let mut lazy = false;
+    let mut argv0: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -110,6 +117,16 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--no-jit" => no_jit = true,
             "--lazy" => lazy = true,
             "--no-cache" => opts.cache = false,
+            "--cwd" => {
+                i += 1;
+                let v = args.get(i).context("--cwd needs a directory")?;
+                opts.cwd = Some(v.clone());
+            }
+            "--argv0" => {
+                i += 1;
+                let v = args.get(i).context("--argv0 needs a name")?;
+                argv0 = Some(v.clone());
+            }
             "--env" => {
                 i += 1;
                 let v = args.get(i).context("--env needs an argument")?;
@@ -123,6 +140,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let path = path.context("expected a program to run")?;
     Ok(RunArgs {
         path,
+        argv0,
         guest_args,
         opts,
         xlate: Options {
@@ -150,8 +168,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     })
     .with_context(|| format!("loading {}", ra.path))?;
 
-    // argv[0] is the path as invoked, then whatever followed.
-    let mut argv = vec![ra.path.clone()];
+    // argv[0] is the path as invoked, then whatever followed. Under a sysroot
+    // that host path may mean nothing to the guest, so it can be overridden.
+    let mut argv = vec![ra.argv0.clone().unwrap_or_else(|| ra.path.clone())];
     argv.append(&mut ra.guest_args);
     ra.opts.args = argv;
     if ra.opts.env.is_empty() {

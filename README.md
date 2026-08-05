@@ -531,6 +531,28 @@ QEMU and works under gex. The exec test therefore checks against a written-down
 expectation of what Linux does, and the harness has an `expect` alongside
 `compare` for exactly this.
 
+A `clone` that names a child stack starts the child on it. A plain `fork`
+passes none and the child keeps the parent's SP, but `posix_spawn` allocates
+one and musl's `__clone` trampoline pops the function to run off it — a child
+left on the parent's stack pointer reads whatever happens to be there, which is
+how every `os.execute` and `popen` died with SIGSEGV before reaching `execve`
+at all.
+
+With that, Lua running under gex spawns a real aarch64 BusyBox `sh` out of a
+sysroot: `os.execute` prints through the shell, the exit status comes back, and
+`io.popen` reads the command's output through a pipe.
+
+Lua's own `all.lua` driver gets three levels deep on this — gex runs Lua, Lua
+execs the shell, the shell execs Lua again and it prints its version banner —
+and then fails in `main.lua`'s interactive-interpreter checks, on an assertion
+about prompt output with stdin redirected from a file. That one is
+undiagnosed. QEMU cannot be used to tell whether it is gex's fault, because
+QEMU does not get as far as running the shell at all.
+
+`--cwd` and `--argv0` exist for this: under a sysroot the host path a program
+was loaded from is not a path the guest can resolve, and a program that passes
+its own `argv[0]` to a shell needs it to be one that is.
+
 Not done: `vfork`'s suspend-the-parent contract (a full fork is stricter, and
 `posix_spawn` synchronises through a pipe anyway), and `execve` from a thread
 other than the process's first.
