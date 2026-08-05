@@ -242,11 +242,13 @@ fn cmd_build(args: &[String]) -> Result<()> {
     );
     std::fs::write(&out, &module.wasm).with_context(|| format!("writing {out}"))?;
     eprintln!(
-        "{out}: {} blocks, {} guest instructions, {} KiB wasm ({:.1}x guest text)",
+        "{out}: {} blocks, {} guest instructions, {} KiB wasm ({:.1}x guest \
+         text, {:.0}% of it register traffic across block boundaries)",
         stats.blocks,
         stats.instructions,
         stats.wasm_bytes / 1024,
         stats.wasm_bytes as f64 / (stats.instructions.max(1) * 4) as f64,
+        100.0 * gex_emit::tier1::CTX_BYTES.with(|c| c.get()) as f64 / stats.wasm_bytes as f64,
     );
     if stats.illegal_blocks > 0 {
         eprintln!(

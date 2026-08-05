@@ -355,6 +355,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "gex-abi",
+ "gex-emit",
  "gex-ir",
  "gex-isa",
  "gex-ld",

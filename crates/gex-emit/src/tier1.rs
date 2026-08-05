@@ -392,6 +392,7 @@ impl<'a> Emitter<'a> {
         }
         let ty = r.ty();
         let local = self.f.add_local(val_type(ty));
+        let before = self.f.code.len();
         self.f.local_get(self.ctx_local);
         match ty {
             Ty::I32 => self.f.load(0x28, 2, Self::reg_offset(r)),
@@ -399,6 +400,7 @@ impl<'a> Emitter<'a> {
             Ty::V128 => self.f.simd_mem(simd::V128_LOAD, 4, Self::reg_offset(r)),
         }
         self.f.local_set(local);
+        CTX_BYTES.with(|c| c.set(c.get() + (self.f.code.len() - before)));
         self.regs.insert(
             r,
             Cached {
@@ -444,6 +446,7 @@ impl<'a> Emitter<'a> {
         // Deterministic output makes translated modules reproducible, which
         // the content-addressed cache (PLAN §10) depends on.
         dirty.sort_by_key(|(r, _)| Self::reg_offset(*r));
+        let before = self.f.code.len();
         for (r, local) in dirty {
             self.f.local_get(self.ctx_local);
             self.f.local_get(local);
@@ -458,6 +461,7 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        CTX_BYTES.with(|c| c.set(c.get() + (self.f.code.len() - before)));
     }
 
     /// Forget every cached register, forcing later reads to reload. Used
@@ -1416,6 +1420,12 @@ fn lane_shift_op(op: VShiftOp, lane: VLane) -> u32 {
 }
 
 /// Whether a statement can leave the register cache stale.
+thread_local! {
+    /// Bytes emitted moving guest registers between the context and locals,
+    /// for `--verbose`. That traffic is the price of a block boundary.
+    pub static CTX_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Iterations of a fused loop between trips through the dispatcher.
 ///
 /// The same cadence the context's safepoint counter uses off a fused loop, so
