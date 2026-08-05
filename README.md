@@ -245,19 +245,36 @@ is what the translator reads. wasmtime checks engine compatibility itself when
 the artifact is loaded, so the key does not have to cover it, and an artifact
 it rejects is deleted and rebuilt rather than being an error.
 
+The dispatch metadata a translation produces — how many table slots, which
+pages it claimed, where the page table left off — is written beside the
+compiled module, so a hit skips translating too.
+
+That leaves what static discovery cannot find. SQLite's VDBE is a
+computed-goto interpreter, and recursive descent cannot follow a jump table:
+10,000 blocks were being translated on demand, every run. So gex records where
+execution actually went and reads it back next time as extra entry points.
+That changes the translation, hence the cache key, so a run that discovers
+something new compiles once more and then settles:
+
 ```console
-$ gexc run sqlite3 :memory: 'select 1;'    # first time
-35.1 s
-$ gexc run sqlite3 :memory: 'select 1;'    # thereafter
-7.3 s
+$ gexc run sqlite3 :memory: 'select 1;'
+37.9 s      # translate, compile, discover 10230 blocks at run time
+32.1 s      # translate those too, compile again
+ 0.16 s     # cache hit, nothing left to discover
+ 0.16 s
 ```
 
-The residue is gex's own 1.8 s of translation, which still runs on a hit
-because the host needs the dispatch metadata that comes with it, plus runtime
-translation of what static discovery missed. `--no-cache` turns it off;
-`--lazy` is the other end of the same trade, discovering only from the entry
-point and leaving everything else to runtime translation — 33 s to 9.5 s on a
-cold cache, and the right choice for a one-shot run.
+On the SQL script from the testing section, that is 35.0 s settling to 0.99 s
+against QEMU's 1.14 s; on a heavier one — 200k rows inserted, indexed, joined
+— 7.0 s against QEMU's 6.3 s. The profile is a hint and never a requirement:
+a stale entry costs a wasted translation, and an address that is no longer
+code is dropped by discovery's own executability check. The honest cost is the
+occasional expensive run when a new path is found, which on a program that
+does something different every time is a recompile that never quite settles.
+
+`--no-cache` turns all of it off. `--lazy` is the opposite trade — discover
+only from the entry point and leave the rest to runtime translation, 33 s to
+9.5 s with nothing cached, which is what a genuinely one-shot run wants.
 
 Deserialising a compiled module is `unsafe`: the bytes become executable code
 with only a header check in the way. That is why `gex-cache` is a crate of its

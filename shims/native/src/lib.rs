@@ -49,6 +49,10 @@ impl Exit {
     }
 }
 
+/// Most entry points a profile will remember. Large enough for a program the
+/// size of SQLite to converge, small enough that the file stays trivial.
+const PROFILE_LIMIT: usize = 1 << 18;
+
 /// Back-edges between signal polls. Small enough that delivery is prompt,
 /// large enough that the check is noise.
 const SAFEPOINT_INTERVAL: i32 = 1024;
@@ -189,6 +193,25 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
 /// Run a program, which may carry a dynamic linker alongside it.
 pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
     let image = &program.exe;
+
+    // A profile records where a previous run's execution actually went, which
+    // is how gex learns the entry points static discovery cannot reach. It
+    // feeds `extra_entries`, so it changes the translation and therefore the
+    // cache key: a run that discovers something new compiles once more and
+    // then settles.
+    let profile_dir = opts.cache.then(gex_cache::profile_dir).flatten();
+    let image_key = cache_key(image, &Options::default());
+    let mut xlate = xlate.clone();
+    if let Some(dir) = &profile_dir {
+        let learned = gex_cache::read_profile(dir, &image_key);
+        if !learned.is_empty() && opts.verbose {
+            eprintln!("[gex] profile: {} learned entry points", learned.len());
+        }
+        xlate.extra_entries.extend(learned);
+        xlate.extra_entries.sort_unstable();
+        xlate.extra_entries.dedup();
+    }
+    let xlate = &xlate;
 
     let phase = std::time::Instant::now();
     let mut config = Config::new();
@@ -422,12 +445,26 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
             }
         }
     };
-    if opts.verbose {
-        if let Some(jit) = store.data().jit.as_ref() {
+    if let Some(jit) = store.data().jit.as_ref() {
+        if opts.verbose {
             eprintln!(
                 "[gex] runtime translation: {} blocks in {} compilations",
                 jit.blocks, jit.calls
             );
+        }
+        if let Some(dir) = &profile_dir {
+            // Only addresses in the executable's own image are worth
+            // recording: a shared library lands wherever the interpreter put
+            // it, and ahead-of-time translation of the executable cannot
+            // reach it anyway.
+            let (lo, hi) = image.text_range;
+            let found: Vec<u64> = jit
+                .translated
+                .iter()
+                .copied()
+                .filter(|a| *a >= lo && *a < hi)
+                .collect();
+            gex_cache::write_profile(dir, &image_key, &found, PROFILE_LIMIT);
         }
     }
     Ok((exit, stats))

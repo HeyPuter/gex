@@ -37,12 +37,66 @@ pub mod sha256;
 /// blunt way — by bumping this.
 const FORMAT_VERSION: u32 = 1;
 
-/// Where compiled modules live.
-pub fn cache_dir() -> Option<PathBuf> {
+fn gex_cache_root() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("gex").join("modules"))
+    Some(base.join("gex"))
+}
+
+/// Where compiled modules live.
+pub fn cache_dir() -> Option<PathBuf> {
+    Some(gex_cache_root()?.join("modules"))
+}
+
+/// Where entry-point profiles live.
+pub fn profile_dir() -> Option<PathBuf> {
+    Some(gex_cache_root()?.join("profiles"))
+}
+
+/// Read the entry points a previous run of this image discovered.
+///
+/// Static discovery cannot follow a computed goto, so on a program built
+/// around an interpreter loop -- SQLite's VDBE, most language runtimes -- it
+/// leaves thousands of blocks to be translated on demand, every run. Recording
+/// where execution actually went lets the next run translate them ahead of
+/// time, which then gets compiled once and cached like everything else.
+///
+/// The profile is a hint, never a requirement: a stale or corrupt one costs a
+/// few wasted translations, and an address that is no longer code is dropped
+/// by the discovery loop's own executability check.
+pub fn read_profile(dir: &Path, key: &str) -> Vec<u64> {
+    let Ok(bytes) = std::fs::read(dir.join(format!("{key}.profile"))) else {
+        return Vec::new();
+    };
+    bytes
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// Record entry points for the next run, merged with what is already there.
+///
+/// Merging matters because two runs of the same program exercise different
+/// paths; the profile should converge on their union rather than flip between
+/// them. `limit` bounds that union so a pathological program cannot grow the
+/// file without end.
+pub fn write_profile(dir: &Path, key: &str, found: &[u64], limit: usize) {
+    let mut all: Vec<u64> = read_profile(dir, key);
+    let before = all.len();
+    all.extend_from_slice(found);
+    all.sort_unstable();
+    all.dedup();
+    if all.len() == before {
+        return;
+    }
+    all.truncate(limit);
+    let mut bytes = Vec::with_capacity(all.len() * 8);
+    for a in &all {
+        bytes.extend_from_slice(&a.to_le_bytes());
+    }
+    let path = dir.join(format!("{key}.profile"));
+    store(dir, &path, &bytes);
 }
 
 /// The cache key for one translation.
@@ -167,6 +221,38 @@ mod tests {
             key([b"ab".as_slice(), b"c".as_slice()]),
             key([b"a".as_slice(), b"bc".as_slice()])
         );
+    }
+
+    #[test]
+    fn a_profile_round_trips_and_merges() {
+        let dir = std::env::temp_dir().join(format!("gex-prof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(read_profile(&dir, "k").is_empty());
+
+        write_profile(&dir, "k", &[0x400, 0x100, 0x400], 100);
+        assert_eq!(read_profile(&dir, "k"), vec![0x100, 0x400]);
+
+        // A second run's addresses join the first's rather than replacing them.
+        write_profile(&dir, "k", &[0x200], 100);
+        assert_eq!(read_profile(&dir, "k"), vec![0x100, 0x200, 0x400]);
+
+        // Nothing new means no rewrite, and the limit is honoured.
+        write_profile(&dir, "k", &[0x100], 100);
+        assert_eq!(read_profile(&dir, "k").len(), 3);
+        write_profile(&dir, "k", &[0x500, 0x600], 4);
+        assert_eq!(read_profile(&dir, "k").len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncated_profile_is_read_as_far_as_it_goes() {
+        let dir = std::env::temp_dir().join(format!("gex-prof2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // Twelve bytes: one whole address and half of another.
+        std::fs::write(dir.join("t.profile"), [1u8; 12]).unwrap();
+        assert_eq!(read_profile(&dir, "t").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
