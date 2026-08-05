@@ -889,21 +889,35 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             format!("cnt v{}.{w}, v{}.{w}", vd.0, vn.0)
         }
         Inst::VAcross { op, arr, vd, vn } => {
-            let m = match op {
-                VAcrossOp::Add => "addv",
-                VAcrossOp::SMax => "smaxv",
-                VAcrossOp::SMin => "sminv",
-                VAcrossOp::UMax => "umaxv",
-                VAcrossOp::UMin => "uminv",
-                VAcrossOp::FMax => "fmaxv",
-                VAcrossOp::FMin => "fminv",
+            // The scalar forms reduce one pair, so they are spelled `-p`
+            // rather than `-v`, and their source is still a two-lane vector.
+            let m = match (op, arr.scalar) {
+                (VAcrossOp::Add, false) => "addv",
+                (VAcrossOp::Add, true) if arr.float => "faddp",
+                (VAcrossOp::Add, true) => "addp",
+                (VAcrossOp::SMax, _) => "smaxv",
+                (VAcrossOp::SMin, _) => "sminv",
+                (VAcrossOp::UMax, _) => "umaxv",
+                (VAcrossOp::UMin, _) => "uminv",
+                (VAcrossOp::FMax, false) => "fmaxv",
+                (VAcrossOp::FMax, true) => "fmaxp",
+                (VAcrossOp::FMin, false) => "fminv",
+                (VAcrossOp::FMin, true) => "fminp",
+                (VAcrossOp::FMaxNm, false) => "fmaxnmv",
+                (VAcrossOp::FMaxNm, true) => "fmaxnmp",
+                (VAcrossOp::FMinNm, false) => "fminnmv",
+                (VAcrossOp::FMinNm, true) => "fminnmp",
+            };
+            let src = VArr {
+                scalar: false,
+                ..arr
             };
             format!(
                 "{m} {}{}, v{}.{}",
                 lane_letter(arr.lane_bytes),
                 vd.0,
                 vn.0,
-                arr.suffix()
+                src.suffix()
             )
         }
 
@@ -957,6 +971,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                     lane_bytes: arr.lane_bytes * 2,
                     q: true,
                     float: false,
+                    scalar: false,
                 };
                 return format!(
                     "{m}{} v{}.{a}, v{}.{}",
@@ -1027,6 +1042,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 lane_bytes,
                 q,
                 float: false,
+                scalar: false,
             };
             format!(
                 "dup v{}.{}, v{}.{}[{index}]",

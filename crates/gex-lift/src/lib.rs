@@ -1507,14 +1507,20 @@ impl<'a> Lifter<'a> {
                 let lane = Self::lane_of(arr);
                 let bin = match op {
                     VAcrossOp::Add => VLaneBinOp::Add,
-                    VAcrossOp::SMax | VAcrossOp::FMax => VLaneBinOp::MaxS,
-                    VAcrossOp::SMin | VAcrossOp::FMin => VLaneBinOp::MinS,
+                    // As with the three-same forms, the `nm` variants share a
+                    // lowering with the plain ones: wasm's max/min already
+                    // propagate NaN like FMAX, and differ from FMAXNM only when
+                    // an input is NaN. See README's fidelity notes.
+                    VAcrossOp::SMax | VAcrossOp::FMax | VAcrossOp::FMaxNm => VLaneBinOp::MaxS,
+                    VAcrossOp::SMin | VAcrossOp::FMin | VAcrossOp::FMinNm => VLaneBinOp::MinS,
                     VAcrossOp::UMax => VLaneBinOp::MaxU,
                     VAcrossOp::UMin => VLaneBinOp::MinU,
                 };
                 let mut acc = self.b.read(GuestReg::V128(vn.0));
                 let lb = arr.lane_bytes;
-                let mut span = arr.lanes();
+                // The scalar pairwise forms reduce the two lanes of their
+                // source, not the one lane of their destination.
+                let mut span = if arr.scalar { 2 } else { arr.lanes() };
                 while span > 1 {
                     let half = span / 2;
                     // Bring the upper half of the live range down.
@@ -1838,8 +1844,23 @@ impl<'a> Lifter<'a> {
     }
 
     /// Restrict a result to the lanes the arrangement actually writes.
+    ///
+    /// A 64-bit form zeroes the register's upper half; a scalar form zeroes
+    /// everything above its single element. Both are a mask, which is why the
+    /// scalar instructions can share the vector lowerings outright.
     fn commit_vector(&mut self, vd: gex_isa::VReg, arr: VArr, value: Value) {
-        let v = self.narrow_to_64(value, arr.q);
+        let v = if arr.scalar {
+            let mut mask = [0u8; 16];
+            mask[..arr.lane_bytes as usize].fill(0xff);
+            let m = self.b.def(Expr::VConst(Box::new(mask)));
+            self.b.def(Expr::VBin {
+                op: VBinOp::And,
+                a: value,
+                b: m,
+            })
+        } else {
+            self.narrow_to_64(value, arr.q)
+        };
         self.b.write(GuestReg::V128(vd.0), v);
     }
 

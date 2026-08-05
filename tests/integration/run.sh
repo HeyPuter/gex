@@ -18,6 +18,7 @@ TOOLCHAIN="${GEX_TOOLCHAIN:-/home/claude/toolchains/aarch64-linux-musl-cross/bin
 QEMU="${GEX_QEMU:-/home/claude/toolchains/qemu-aarch64}"
 GEXC="${GEXC:-target/release/gexc}"
 CC="$TOOLCHAIN/aarch64-linux-musl-gcc"
+CXX="$TOOLCHAIN/aarch64-linux-musl-g++"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="${GEX_WORK:-target/integration}"
 
@@ -117,6 +118,13 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/signals" "$HERE/programs/signals.c"
 "$CC" -static -no-pie -O3 -o "$WORK/vector" "$HERE/programs/vector.c"
 "$CC" -static -O3 -o "$WORK/vector-pie" "$HERE/programs/vector.c"
+# C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
+# .eh_frame through personality routines -- a very different code shape from
+# anything the C programs reach.
+CPP=""
+if [ -x "$CXX" ] && "$CXX" -static -no-pie -O2 -o "$WORK/cpp" "$HERE/programs/cpp.cc" 2>/dev/null; then
+    CPP=1
+fi
 
 printf 'first line\nsecond line\n' >"$WORK/sample.txt"
 
@@ -135,6 +143,16 @@ if [ -f "$MUSL_LIBC" ]; then
     "$CC" -O2 -o "$WORK/dyn-suite" "$HERE/programs/suite.c"
     "$CC" -O2 -o "$WORK/dyn-vector" "$HERE/programs/vector.c"
     DYNAMIC=1
+    # Unwinding across a DSO boundary is the part that only the dynamic C++
+    # build exercises: libstdc++ and libgcc_s must be found and relocated by
+    # the guest's own interpreter before a throw can cross them.
+    for lib in libstdc++.so.6.0.29 libgcc_s.so.1; do
+        src="$(dirname "$TOOLCHAIN")/aarch64-linux-musl/lib/$lib"
+        [ -f "$src" ] && cp "$src" "$SYSROOT/lib/${lib%.0.29}"
+    done
+    if [ -n "$CPP" ]; then
+        "$CXX" -O2 -o "$WORK/dyn-cpp" "$HERE/programs/cpp.cc" 2>/dev/null || true
+    fi
 fi
 
 # A host-native build of the conformance suite, used only where QEMU itself
@@ -159,6 +177,7 @@ for mode in fatal-default fatal-abort; do
 done
 compare "vector-O3" "$WORK/vector"
 compare "vector-pie" "$WORK/vector-pie"
+[ -n "$CPP" ] && compare "cpp-static" "$WORK/cpp"
 
 if [ -n "$DYNAMIC" ]; then
     QEMU_ARGS="-L $SYSROOT"
@@ -167,6 +186,7 @@ if [ -n "$DYNAMIC" ]; then
         compare "dynamic-$area" "$WORK/dyn-suite" "$area"
     done
     compare "dynamic-vector" "$WORK/dyn-vector"
+    [ -f "$WORK/dyn-cpp" ] && compare "dynamic-cpp" "$WORK/dyn-cpp"
     QEMU_ARGS=""
     GEXC_ARGS=""
 fi

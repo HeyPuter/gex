@@ -1017,21 +1017,36 @@ pub struct VArr {
     pub q: bool,
     /// True when the lanes hold floating-point values.
     pub float: bool,
+    /// True for the scalar forms, which operate on lane 0 alone and zero
+    /// everything above it.
+    pub scalar: bool,
 }
 
 impl VArr {
     pub fn lanes(self) -> u32 {
+        if self.scalar {
+            return 1;
+        }
         (if self.q { 16 } else { 8 }) / self.lane_bytes
     }
-    /// The arrangement suffix binutils prints, e.g. `4s`.
-    pub fn suffix(self) -> String {
-        let t = match (self.lane_bytes, self.float) {
-            (1, _) => 'b',
-            (2, _) => 'h',
-            (4, _) => 's',
+
+    /// The element letter: `b`, `h`, `s` or `d`.
+    pub fn letter(self) -> char {
+        match self.lane_bytes {
+            1 => 'b',
+            2 => 'h',
+            4 => 's',
             _ => 'd',
-        };
-        format!("{}{t}", self.lanes())
+        }
+    }
+
+    /// The arrangement suffix binutils prints, e.g. `4s`. A scalar form has
+    /// no arrangement, only an element width.
+    pub fn suffix(self) -> String {
+        if self.scalar {
+            return self.letter().to_string();
+        }
+        format!("{}{}", self.lanes(), self.letter())
     }
 }
 
@@ -1151,6 +1166,9 @@ pub enum VAcrossOp {
     UMin,
     FMax,
     FMin,
+    /// `fmaxnmv`/`fmaxnmp`: a NaN loses to a number, rather than propagating.
+    FMaxNm,
+    FMinNm,
 }
 
 /// The three-operand bitwise selects.

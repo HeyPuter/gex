@@ -1292,6 +1292,7 @@ fn decode_simd_fp(raw: u32) -> Inst {
                     lane_bytes,
                     q,
                     float: false,
+                    scalar: false,
                 },
                 vd: VReg(bits(raw, 4, 0) as u8),
                 vn: VReg(bits(raw, 9, 5) as u8),
@@ -1311,7 +1312,104 @@ fn decode_simd_fp(raw: u32) -> Inst {
         }
     }
 
+    // Scalar Advanced SIMD. Bit 30 is what separates it from scalar
+    // floating point, which shares the same `11110` group: the SIMD forms set
+    // it, the floating-point ones clear it.
+    if bit(raw, 31) == 0 && bit(raw, 30) == 1 && bits(raw, 28, 24) == 0b11110 {
+        if let Some(inst) = decode_simd_scalar(raw, u) {
+            return inst;
+        }
+    }
+
     decode_scalar_fp(raw)
+}
+
+/// The scalar members of the Advanced SIMD families.
+///
+/// Every one operates on lane 0 and zeroes the rest of the register, so they
+/// reuse the vector decoders with a scalar arrangement and the lifter masks
+/// the result. Returning `None` falls through to the floating-point decoder
+/// rather than claiming an encoding this does not model.
+fn decode_simd_scalar(raw: u32, u: u32) -> Option<Inst> {
+    let scalarise = |mut inst: Inst| -> Inst {
+        match &mut inst {
+            Inst::VThreeSame { arr, .. }
+            | Inst::VTwoMisc { arr, .. }
+            | Inst::VShiftImm { arr, .. } => arr.scalar = true,
+            _ => {}
+        }
+        inst
+    };
+
+    // Shift by immediate: 01 U 111110 immh immb opcode 1 Rn Rd
+    if bits(raw, 28, 23) == 0b111110 && bit(raw, 10) == 1 {
+        let immh = bits(raw, 22, 19);
+        if immh != 0 {
+            let inst = decode_simd_shift_imm(raw, true, u, immh, bits(raw, 18, 16));
+            return matches!(inst, Inst::VShiftImm { .. }).then(|| scalarise(inst));
+        }
+        return None;
+    }
+    if bits(raw, 28, 24) != 0b11110 || bit(raw, 21) != 1 {
+        return None;
+    }
+    // Two-register misc: bits 21:17 == 10000.
+    if bits(raw, 21, 17) == 0b10000 && bits(raw, 11, 10) == 0b10 {
+        let inst = decode_simd_two_misc(raw, true, u);
+        return matches!(inst, Inst::VTwoMisc { .. }).then(|| scalarise(inst));
+    }
+    // Pairwise: bits 21:17 == 11000. Only the two-lane reductions exist here,
+    // which is what `addp d0, v0.2d` and the floating-point `faddp` are.
+    if bits(raw, 21, 17) == 0b11000 && bits(raw, 11, 10) == 0b10 {
+        let opcode = bits(raw, 16, 12);
+        let (op, arr) = match (u, opcode) {
+            (0, 0b11011) => (
+                VAcrossOp::Add,
+                VArr {
+                    lane_bytes: 8,
+                    q: true,
+                    float: false,
+                    scalar: true,
+                },
+            ),
+            (1, 0b01101) => (
+                VAcrossOp::Add,
+                VArr {
+                    lane_bytes: if bit(raw, 22) == 1 { 8 } else { 4 },
+                    q: true,
+                    float: true,
+                    scalar: true,
+                },
+            ),
+            (1, 0b01111 | 0b01100) => (
+                match (opcode, bit(raw, 23)) {
+                    (0b01111, 0) => VAcrossOp::FMax,
+                    (0b01111, _) => VAcrossOp::FMin,
+                    (_, 0) => VAcrossOp::FMaxNm,
+                    (_, _) => VAcrossOp::FMinNm,
+                },
+                VArr {
+                    lane_bytes: if bit(raw, 22) == 1 { 8 } else { 4 },
+                    q: true,
+                    float: true,
+                    scalar: true,
+                },
+            ),
+            _ => return None,
+        };
+        return Some(Inst::VAcross {
+            op,
+            arr,
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+        });
+    }
+    // Three-same.
+    if bit(raw, 10) == 1 {
+        let inst = decode_simd_three_same(raw, true, u);
+        return matches!(inst, Inst::VThreeSame { .. }).then(|| scalarise(inst));
+    }
+    None
 }
 
 /// Lane width in bytes from a two-bit `size` field.
@@ -1487,6 +1585,7 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
                 lane_bytes,
                 q,
                 float: true,
+                scalar: false,
             },
             vd,
             vn,
@@ -1534,6 +1633,7 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
             lane_bytes,
             q,
             float: false,
+            scalar: false,
         },
         vd,
         vn,
@@ -1593,6 +1693,7 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
                 lane_bytes,
                 q,
                 float: true,
+                scalar: false,
             },
             vd,
             vn,
@@ -1629,6 +1730,7 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
             lane_bytes,
             q,
             float: false,
+            scalar: false,
         },
         vd,
         vn,
@@ -1644,8 +1746,10 @@ fn decode_simd_across(raw: u32, q: bool, u: u32) -> Inst {
     // bit 23 to pick between the max and min of each pair.
     if u == 1 && matches!(opcode, 0b01100 | 0b01111) {
         let op = match (opcode, bit(raw, 23)) {
-            (0b01111, 0) | (0b01100, 0) => VAcrossOp::FMax,
-            _ => VAcrossOp::FMin,
+            (0b01111, 0) => VAcrossOp::FMax,
+            (0b01111, _) => VAcrossOp::FMin,
+            (_, 0) => VAcrossOp::FMaxNm,
+            (_, _) => VAcrossOp::FMinNm,
         };
         return Inst::VAcross {
             op,
@@ -1653,6 +1757,7 @@ fn decode_simd_across(raw: u32, q: bool, u: u32) -> Inst {
                 lane_bytes: 4,
                 q,
                 float: true,
+                scalar: false,
             },
             vd,
             vn,
@@ -1684,6 +1789,7 @@ fn decode_simd_across(raw: u32, q: bool, u: u32) -> Inst {
             lane_bytes,
             q,
             float: false,
+            scalar: false,
         },
         vd,
         vn,
@@ -1734,6 +1840,7 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
             lane_bytes,
             q,
             float: false,
+            scalar: false,
         },
         vd,
         vn,
