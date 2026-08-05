@@ -418,10 +418,36 @@ CPU-bound loop:
 | 8 | 3.37 s | 949 M iter/s | 3.32 s |
 | 16 | 5.61 s | 1140 M iter/s | 4.99 s |
 
-Sixteen times the work for two and a half times the wall clock. The falloff
-past eight is partly the machine and partly the single kernel lock, which
-every syscall takes; splitting it is the obvious next move if a syscall-heavy
-threaded workload needs it.
+Sixteen times the work for two and a half times the wall clock.
+
+### The snapshot that was rebuilt on every syscall
+
+A syscall-heavy threaded benchmark — `clock_gettime` and `getpid` in a loop —
+was the measurement that found this. Eight threads took **31.7 seconds**
+against QEMU's 0.58, and even one thread was four times slower than QEMU.
+
+The cause was not the lock. `/proc` is served from a snapshot of the kernel's
+state, and that snapshot was refreshed *before every syscall*: formatting the
+whole VMA tree into `/proc/self/maps`, listing every descriptor, and rebuilding
+`cmdline` and `environ`. Hundreds of allocations before a `clock_gettime`.
+
+A `/proc` file's contents are captured when it is opened, so only a syscall
+that resolves a path needs the snapshot to be current. That is now a list of
+syscalls that *skip* the refresh rather than a list that requires it —
+forgetting to exclude one costs a little speed, while forgetting to include
+one would serve a stale `/proc`.
+
+| | before | after | QEMU |
+|---|---|---|---|
+| 1 thread | 1.50 s | **0.11 s** | 0.40 s |
+| 8 threads | 31.75 s | **1.41 s** | 0.58 s |
+| threaded SQLite, 6 writers | 4.5 s | **3.2 s** | 4.4 s |
+
+3.7 M syscalls/s on one thread, against QEMU's 1 M. What remains is the single
+kernel lock: aggregate syscall throughput falls from 3.7 M to 1.7 M between one
+thread and sixteen, where QEMU stays flat. Splitting the lock — descriptors,
+the VMA tree, mounts and signals are almost never touched by the same call —
+is the next move, and now it really is the lock.
 
 Beyond the synthetic test: SQLite built with `SQLITE_THREADSAFE=1`, six
 threads inserting 24,000 rows through one shared connection — so every

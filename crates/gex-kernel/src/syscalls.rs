@@ -1413,17 +1413,76 @@ impl Kernel {
         s.exe = self.exe_path.clone();
         s.cwd = self.vfs.cwd.clone();
         s.fds = self.fds.list();
-        s.cmdline = self
-            .argv
-            .iter()
-            .flat_map(|a| a.bytes().chain(std::iter::once(0)))
-            .collect();
-        s.environ = self
-            .envp
-            .iter()
-            .flat_map(|a| a.bytes().chain(std::iter::once(0)))
-            .collect();
+        // argv and envp never change, so they are built once.
+        if s.cmdline.is_empty() {
+            s.cmdline = self
+                .argv
+                .iter()
+                .flat_map(|a| a.bytes().chain(std::iter::once(0)))
+                .collect();
+            s.environ = self
+                .envp
+                .iter()
+                .flat_map(|a| a.bytes().chain(std::iter::once(0)))
+                .collect();
+        }
     }
+}
+
+/// Whether a syscall could resolve a path through the VFS, and so needs
+/// `/proc` to be up to date before it runs.
+///
+/// A `/proc` file's contents are captured when it is *opened*, so a `read` on
+/// an already-open one needs nothing. Refreshing the snapshot means formatting
+/// the whole VMA tree and listing every descriptor, which is far too expensive
+/// to do before a `clock_gettime`.
+///
+/// This is deliberately a list of what does *not* need it rather than what
+/// does: forgetting to exclude a syscall costs a little speed, while
+/// forgetting to include one would serve a stale `/proc`.
+pub fn skips_proc_snapshot(n: u64) -> bool {
+    matches!(
+        n,
+        nr::CLOCK_GETTIME
+            | nr::CLOCK_GETRES
+            | nr::GETTIMEOFDAY
+            | nr::CLOCK_NANOSLEEP
+            | nr::NANOSLEEP
+            | nr::GETPID
+            | nr::GETPPID
+            | nr::GETTID
+            | nr::GETUID
+            | nr::GETEUID
+            | nr::GETGID
+            | nr::GETEGID
+            | nr::FUTEX
+            | nr::SCHED_YIELD
+            | nr::READ
+            | nr::WRITE
+            | nr::READV
+            | nr::WRITEV
+            | nr::PREAD64
+            | nr::PWRITE64
+            | nr::LSEEK
+            | nr::CLOSE
+            | nr::FCNTL
+            | nr::IOCTL
+            | nr::MMAP
+            | nr::MUNMAP
+            | nr::MPROTECT
+            | nr::MADVISE
+            | nr::BRK
+            | nr::RT_SIGPROCMASK
+            | nr::RT_SIGACTION
+            | nr::RT_SIGRETURN
+            | nr::SIGALTSTACK
+            | nr::SET_ROBUST_LIST
+            | nr::SET_TID_ADDRESS
+            | nr::TKILL
+            | nr::CLONE
+            | nr::EXIT
+            | nr::EXIT_GROUP
+    )
 }
 
 /// Name a syscall for trace output.

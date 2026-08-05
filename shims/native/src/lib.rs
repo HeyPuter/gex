@@ -911,8 +911,15 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // /proc must reflect the state this syscall will see, so the
             // snapshot is refreshed before the call rather than after.
             let proc_state = Arc::clone(&state.proc_state);
+            // The syscall number decides whether /proc has to be rebuilt
+            // first; most of the hot ones cannot observe it.
+            let nr = gm
+                .read_u64(state.thread.ctx_addr + ctx::x(8) as u64)
+                .unwrap_or(!0);
             let outcome = state.with_kernel(|k| {
-                k.refresh_proc(&proc_state);
+                if !gex_kernel::skips_proc_snapshot(nr) {
+                    k.refresh_proc(&proc_state);
+                }
                 k.syscall(&mut gm, pc as u64)
             });
             // A blocking syscall is run here, with the kernel unlocked, and
