@@ -104,32 +104,6 @@ pub struct Context<'a> {
     /// Guest address -> wasm function index, for blocks already assigned an
     /// index. A miss falls back to the dispatch table.
     pub blocks: &'a HashMap<u64, u32>,
-    /// Guest address -> the block's GIR, for superblock formation.
-    ///
-    /// A block whose only successor is a statically known one can have that
-    /// successor's body emitted in line instead of tail-calling it. The tail
-    /// call is the expensive part -- an indirect one costs about fifty cycles
-    /// under wasmtime -- and folding also lets the register cache live across
-    /// the join instead of flushing at it.
-    pub gir: &'a HashMap<u64, &'a Block>,
-    /// How many blocks in this unit branch to each address.
-    ///
-    /// Folding is restricted to targets with exactly one predecessor, so no
-    /// code is ever duplicated. Duplicating it -- folding into every
-    /// predecessor -- was measurably worse: 10-18% more wasm, and Lua and
-    /// matmul both ran slower for it, which outweighed the tail calls saved.
-    pub preds: &'a HashMap<u64, u32>,
-}
-
-/// How many blocks may be folded into one function.
-fn max_chain() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("GEX_MAX_CHAIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8)
-    })
 }
 
 /// Compile one GIR block into a wasm function body.
@@ -137,29 +111,6 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx);
     e.run(block);
     e.f.finish()
-}
-
-/// Whether `block`'s unconditional successor can be folded into it.
-///
-/// Only a plain `Goto`, only forwards, and only to a block this module has the
-/// GIR for. Forwards-only is what keeps a chain finite without tracking what
-/// is already in it: a back-edge is a loop, and loop fusion handles the one
-/// shape of that worth handling.
-fn chain_target(block: &Block, cx: &Context<'_>) -> Option<u64> {
-    // A kill switch, so the transform can be measured against its absence.
-    if std::env::var_os("GEX_NO_SUPERBLOCK").is_some() {
-        return None;
-    }
-    match block.term {
-        Term::Goto { target }
-            if target > block.start
-                && cx.gir.contains_key(&target)
-                && cx.preds.get(&target) == Some(&1) =>
-        {
-            Some(target)
-        }
-        _ => None,
-    }
 }
 
 /// Where a guest register currently lives.
@@ -226,28 +177,6 @@ impl<'a> Emitter<'a> {
     }
 
     fn run(&mut self, block: &Block) {
-        let mut current = block;
-        for i in 0..max_chain() {
-            // Whether this block's terminator is replaced by the next block's
-            // body has to be decided *before* emitting it: deciding after
-            // would leave the last block of a chain that hit the limit with a
-            // terminator and no body.
-            let next = if i + 1 == max_chain() {
-                None
-            } else {
-                chain_target(current, self.cx)
-            };
-            // A block folded into this one keeps the register cache, which is
-            // most of the saving: no flush at the join, no reload after it.
-            self.run_one(current, next.is_some());
-            match next {
-                Some(a) => current = self.cx.gir[&a],
-                None => return,
-            }
-        }
-    }
-
-    fn run_one(&mut self, block: &Block, chained: bool) {
         let n = block.n_values as usize;
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
@@ -284,10 +213,7 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        // A chained block's terminator is the next block's body.
-        if !chained {
-            self.terminator(block);
-        }
+        self.terminator(block);
         if self.loop_depth.is_some() {
             self.f.end();
             self.loop_depth = None;
@@ -1440,7 +1366,6 @@ fn lane_shift_op(op: VShiftOp, lane: VLane) -> u32 {
     }
 }
 
-/// Whether a statement can leave the register cache stale.
 thread_local! {
     /// Bytes emitted moving guest registers between the context and locals.
     /// That traffic is the price of a block boundary, and `gexc build`
@@ -1456,6 +1381,8 @@ thread_local! {
 fn note_traffic(r: GuestReg) {
     REG_TRAFFIC.with(|t| *t.borrow_mut().entry(r).or_default() += 1);
 }
+
+/// Whether a statement can leave the register cache stale.
 
 /// Iterations of a fused loop between trips through the dispatcher.
 ///
