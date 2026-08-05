@@ -124,9 +124,17 @@ struct HostState {
     /// Set by a `clone` that a host thread still has to be started for.
     pending_spawn: Option<ThreadState>,
     /// Set by a `clone` without CLONE_THREAD: a child process to build.
-    pending_fork: Option<i32>,
+    pending_fork: Option<ForkRequest>,
     /// Set by `execve`: a program to replace this process with.
     pending_exec: Option<ExecRequest>,
+}
+
+/// What a process-creating `clone` asked for.
+#[derive(Clone, Copy, Debug)]
+struct ForkRequest {
+    pid: i32,
+    child_stack: u64,
+    tls: Option<u64>,
 }
 
 /// What `execve` asked for.
@@ -749,8 +757,8 @@ fn run_thread_loop(
             &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)],
             &mut [],
         );
-        if let Some(pid) = store.data_mut().pending_fork.take() {
-            fork_process(store, pid)?;
+        if let Some(req) = store.data_mut().pending_fork.take() {
+            fork_process(store, req)?;
         }
         if let Some(child) = store.data_mut().pending_spawn.take() {
             let cx = store
@@ -806,7 +814,8 @@ fn run_thread_loop(
 /// regions copied into it, which is the whole of what `fork` means here: one
 /// address space per process, and no copy-on-write, because wasm gives the
 /// host no way to fault on a write.
-fn fork_process(store: &mut Store<HostState>, pid: i32) -> Result<()> {
+fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
+    let pid = req.pid;
     let cx = store
         .data()
         .spawn
@@ -853,9 +862,18 @@ fn fork_process(store: &mut Store<HostState>, pid: i32) -> Result<()> {
                 dst[a..b].copy_from_slice(&src[a..b]);
             }
         }
-        // `fork` returns zero in the child.
+        // `fork` returns zero in the child, and a clone that named a stack
+        // starts on it.
         let mut gm = GuestMem::new(dst);
         let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
+        if req.child_stack != 0 {
+            let _ = gm.write_u64(ctx_addr + ctx::SP as u64, req.child_stack);
+        }
+        if let Some(tls) = req.tls {
+            let _ = gm.write_u64(ctx_addr + ctx::TPIDR as u64, tls);
+        }
+        // A monitor is per-thread; the child's starts clear.
+        let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
     }
 
     let entry = {
@@ -1342,10 +1360,18 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     state.pending_exec = Some(ExecRequest { path, argv, envp });
                     Err(StopExecution.into())
                 }
-                SyscallOutcome::SpawnProcess { pid } => {
+                SyscallOutcome::SpawnProcess {
+                    pid,
+                    child_stack,
+                    tls,
+                } => {
                     // Same reason as a thread: the store is borrowed here, and
                     // a fork has to copy the whole address space.
-                    state.pending_fork = Some(pid);
+                    state.pending_fork = Some(ForkRequest {
+                        pid,
+                        child_stack,
+                        tls,
+                    });
                     state.resume_at = Some(
                         gm.read_u64(state.thread.ctx_addr + ctx::PC as u64)
                             .unwrap_or(0),

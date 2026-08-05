@@ -127,7 +127,18 @@ pub enum SyscallOutcome {
     /// the child from the same instruction with `x0` zero. Nothing about the
     /// child's memory can be prepared here, because the kernel can only see
     /// the parent's.
-    SpawnProcess { pid: i32 },
+    SpawnProcess {
+        pid: i32,
+        /// The stack the child must start on, or zero to keep the parent's.
+        ///
+        /// A plain `fork` passes zero. `posix_spawn` does not: musl clones
+        /// onto a stack it allocated, and its `__clone` trampoline pops the
+        /// function to run off that stack, so a child left on the parent's
+        /// stack pointer reads whatever happens to be there.
+        child_stack: u64,
+        /// `CLONE_SETTLS`: the thread pointer for the child.
+        tls: Option<u64>,
+    },
     /// `clone` set up a new thread's context; the host must run it.
     ///
     /// The kernel cannot spawn a thread itself -- a wasmtime store belongs to
@@ -619,9 +630,16 @@ impl Kernel {
             // host writes into the copy it makes.
             let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, pid as u64);
             if self.trace {
-                eprintln!("[gex] clone(...) = {pid} (new process)");
+                eprintln!(
+                    "[gex] clone(flags={:#x}, stack={:#x}) = {pid} (new process)",
+                    a[0], a[1]
+                );
             }
-            return SyscallOutcome::SpawnProcess { pid };
+            return SyscallOutcome::SpawnProcess {
+                pid,
+                child_stack: a[1],
+                tls: (a[0] & clone_flags::SETTLS != 0).then_some(a[3]),
+            };
         }
         if n == nr::CLONE {
             return match self.sys_clone(m, a) {
