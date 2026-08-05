@@ -83,7 +83,7 @@ impl<'a> CodeView<'a> {
 
     /// Fetch the instruction word at `pc`, if it lies in executable memory.
     pub fn fetch(&self, pc: u64) -> Option<u32> {
-        if pc % 4 != 0 {
+        if !pc.is_multiple_of(4) {
             return None;
         }
         for seg in &self.image.segments {
@@ -137,7 +137,7 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
         for seg in &image.segments {
             for (i, chunk) in seg.bytes.chunks_exact(8).enumerate() {
                 // Only naturally aligned words can be pointers.
-                if (seg.vaddr as usize + i * 8) % 8 != 0 {
+                if !(seg.vaddr as usize + i * 8).is_multiple_of(8) {
                     continue;
                 }
                 let v = u64::from_le_bytes(chunk.try_into().unwrap());

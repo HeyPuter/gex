@@ -12,4 +12,4 @@ pub mod elf;
 pub mod stack;
 
 pub use elf::{Image, LoadError, Segment, Symbol};
-pub use stack::{build_initial_stack, StackLayout};
+pub use stack::{build_initial_stack, Identity, StackLayout};

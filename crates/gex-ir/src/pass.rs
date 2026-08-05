@@ -225,11 +225,10 @@ pub fn dead_store_elim(block: &mut Block) {
                     }
                 }
             }
-            Stmt::HostCall { func, .. } => {
-                if func.clobbers_guest_state() {
+            Stmt::HostCall { func, .. }
+                if func.clobbers_guest_state() => {
                     overwritten.clear();
                 }
-            }
             _ => {}
         }
     }

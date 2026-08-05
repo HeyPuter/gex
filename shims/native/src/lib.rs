@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use gex_abi::{ctx, exports, imports, IMPORT_MODULE};
 use gex_kernel::mem::prot;
 use gex_kernel::{GuestMem, Kernel, SyscallOutcome};
-use gex_ld::{build_initial_stack, Image};
+use gex_ld::{build_initial_stack, Identity, Image};
 use gex_xlate::{Options, Stats};
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store, Val};
 
@@ -139,7 +139,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
     };
     store.data_mut().memory = Some(memory);
 
-    place_image(&mut store, memory, image, opts)?;
+    place_image(&mut store, memory, image, opts, Identity { uid, gid })?;
 
     let enter = instance
         .get_func(&mut store, exports::ENTER)
@@ -196,6 +196,7 @@ fn place_image(
     memory: Memory,
     image: &Image,
     opts: &RunOptions,
+    id: Identity,
 ) -> Result<()> {
     // Segments first.
     for seg in &image.segments {
@@ -237,6 +238,7 @@ fn place_image(
         &opts.args,
         &opts.env,
         *b"gexdeterministic",
+        id,
     );
     let data = memory.data_mut(&mut *store);
     let start = layout.low as usize;

@@ -54,6 +54,27 @@ pub const HWCAP: u64 = {
     HWCAP_FP | HWCAP_ASIMD | HWCAP_CPUID | HWCAP_ATOMICS
 };
 
+/// Process attributes the auxiliary vector reports.
+///
+/// These must agree with what the corresponding syscalls return: musl reads
+/// `AT_UID`/`AT_EUID` at startup to decide whether the process is running
+/// set-uid, and would reach a different conclusion from `getuid` if the two
+/// disagreed.
+#[derive(Clone, Copy, Debug)]
+pub struct Identity {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl Default for Identity {
+    fn default() -> Self {
+        Identity {
+            uid: 1000,
+            gid: 1000,
+        }
+    }
+}
+
 /// Where the initial stack ended up.
 #[derive(Clone, Debug)]
 pub struct StackLayout {
@@ -75,6 +96,7 @@ pub fn build_initial_stack(
     args: &[String],
     env: &[String],
     random: [u8; 16],
+    id: Identity,
 ) -> StackLayout {
     // Lay the variable-length data out first, from the top down, so that the
     // fixed-size vectors below can point at it.
@@ -94,7 +116,7 @@ pub fn build_initial_stack(
     }
     let execfn_off = offsets_argv.first().copied().unwrap_or(0);
     // AT_RANDOM must point at 16 readable bytes.
-    while blob.len() % 8 != 0 {
+    while !blob.len().is_multiple_of(8) {
         blob.push(0);
     }
     let random_off = blob.len();
@@ -114,10 +136,10 @@ pub fn build_initial_stack(
         (auxv::AT_BASE, 0),
         (auxv::AT_FLAGS, 0),
         (auxv::AT_ENTRY, image.entry),
-        (auxv::AT_UID, 1000),
-        (auxv::AT_EUID, 1000),
-        (auxv::AT_GID, 1000),
-        (auxv::AT_EGID, 1000),
+        (auxv::AT_UID, id.uid as u64),
+        (auxv::AT_EUID, id.uid as u64),
+        (auxv::AT_GID, id.gid as u64),
+        (auxv::AT_EGID, id.gid as u64),
         (auxv::AT_HWCAP, HWCAP),
         (auxv::AT_HWCAP2, 0),
         (auxv::AT_CLKTCK, 100),
@@ -204,6 +226,7 @@ mod tests {
             &["prog".into(), "arg".into()],
             &["PATH=/bin".into()],
             [7; 16],
+            Identity::default(),
         );
         assert_eq!(l.sp % 16, 0);
     }
@@ -212,7 +235,14 @@ mod tests {
     fn argc_argv_envp_and_auxv_are_reachable() {
         let args = vec!["prog".to_string(), "one".to_string()];
         let env = vec!["A=1".to_string()];
-        let l = build_initial_stack(&dummy_image(), 0x8000_0000, &args, &env, [3; 16]);
+        let l = build_initial_stack(
+            &dummy_image(),
+            0x8000_0000,
+            &args,
+            &env,
+            [3; 16],
+            Identity::default(),
+        );
 
         assert_eq!(read_u64(&l, l.sp), 2, "argc");
         // argv[0] points at "prog\0".
@@ -255,6 +285,7 @@ mod tests {
             &["x".repeat(300)],
             &["Y=".to_string() + &"z".repeat(500)],
             [0; 16],
+            Identity::default(),
         );
         assert!(l.low + l.bytes.len() as u64 <= 0x8000_0000);
         assert!(l.sp >= l.low);

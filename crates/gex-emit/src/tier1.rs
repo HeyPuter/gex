@@ -23,10 +23,6 @@ use std::collections::HashMap;
 /// SIMD sub-opcodes (the 0xFD prefix space).
 mod simd {
     pub const V128_LOAD: u32 = 0x00;
-    pub const V128_LOAD8_SPLAT: u32 = 0x07;
-    pub const V128_LOAD16_SPLAT: u32 = 0x08;
-    pub const V128_LOAD32_SPLAT: u32 = 0x09;
-    pub const V128_LOAD64_SPLAT: u32 = 0x0a;
     pub const V128_STORE: u32 = 0x0b;
     pub const I8X16_EXTRACT_LANE_S: u32 = 0x15;
     pub const I8X16_EXTRACT_LANE_U: u32 = 0x16;
@@ -47,10 +43,10 @@ mod simd {
     pub const V128_ANDNOT: u32 = 0x4f;
     pub const V128_OR: u32 = 0x50;
     pub const V128_XOR: u32 = 0x51;
+    // Only the narrow lane loads are used: 4- and 8-byte loads have
+    // dedicated zeroing forms, which are one instruction instead of two.
     pub const V128_LOAD8_LANE: u32 = 0x54;
     pub const V128_LOAD16_LANE: u32 = 0x55;
-    pub const V128_LOAD32_LANE: u32 = 0x56;
-    pub const V128_LOAD64_LANE: u32 = 0x57;
     pub const V128_STORE8_LANE: u32 = 0x58;
     pub const V128_STORE16_LANE: u32 = 0x59;
     pub const V128_STORE32_LANE: u32 = 0x5a;

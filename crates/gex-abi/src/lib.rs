@@ -240,21 +240,24 @@ pub const fn dispatch_index(pc: u64, text_base: u64) -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn context_fields_do_not_overlap() {
-        assert_eq!(ctx::x(0), 0);
-        assert_eq!(ctx::x(30), 240);
+    // The context layout is a compile-time contract between codegen, the
+    // kernel and the host, so it is checked at compile time.
+    const _: () = {
+        assert!(ctx::x(0) == 0);
+        assert!(ctx::x(30) == 240);
         assert!(ctx::SP > ctx::x(30));
         assert!(ctx::PC > ctx::SP);
         assert!(ctx::NF > ctx::PC);
         assert!(ctx::TPIDR > ctx::VF);
         assert!(ctx::V >= ctx::TID + 8);
-        assert_eq!(ctx::SIZE, ctx::v(31) + 16);
-    }
+        assert!(ctx::SIZE == ctx::v(31) + 16);
+        // The vector slots must be 16-byte aligned for `v128` accesses.
+        assert!(ctx::V % 16 == 0);
+    };
 
     #[test]
     fn guest_memory_leaves_a_trap_page() {
-        assert!(GUEST_MEM_BYTES % WASM_PAGE == 0);
+        assert!(GUEST_MEM_BYTES.is_multiple_of(WASM_PAGE));
         assert!((POISON_ADDR as u64) >= GUEST_MEM_BYTES);
         assert!((POISON_ADDR as u64) + 16 <= u32::MAX as u64 + 1);
     }

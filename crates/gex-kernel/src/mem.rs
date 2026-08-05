@@ -119,7 +119,7 @@ impl MemoryMap {
         let len = page_align_up(len);
 
         if flags & flags::FIXED != 0 {
-            if addr % PAGE_SIZE != 0 {
+            if !addr.is_multiple_of(PAGE_SIZE) {
                 return Err(Errno::EINVAL);
             }
             let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
@@ -133,7 +133,7 @@ impl MemoryMap {
         }
 
         // An address hint is honoured when the range happens to be free.
-        if addr != 0 && addr % PAGE_SIZE == 0 {
+        if addr != 0 && addr.is_multiple_of(PAGE_SIZE) {
             let end = addr.saturating_add(len);
             if end <= GUEST_LIMIT && self.is_free(addr, end) {
                 self.insert(addr, end, prot, name);
@@ -166,7 +166,7 @@ impl MemoryMap {
 
     /// Remove `[addr, addr+len)` from the map, splitting mappings as needed.
     pub fn unmap(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
-        if addr % PAGE_SIZE != 0 {
+        if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
         }
         let len = page_align_up(len);
@@ -201,7 +201,7 @@ impl MemoryMap {
 
     /// Change protection over a range, splitting mappings as needed.
     pub fn protect(&mut self, addr: u64, len: u64, new_prot: u32) -> Result<(), Errno> {
-        if addr % PAGE_SIZE != 0 {
+        if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
         }
         let len = page_align_up(len);
