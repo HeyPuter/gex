@@ -35,7 +35,7 @@ What runs today:
   NEON subset real string and memory routines are built from;
 * the T0 syscall tier — enough for a program to start, do file and terminal
   I/O, manage memory and exit;
-* a native host on wasmtime.
+* a native host on wasmtime, and the same modules execute unmodified on V8.
 
 What does not:
 
@@ -135,6 +135,10 @@ already minimised to one instruction:
 $ cargo run --release -p gex-difffuzz -- --iters 5000 --verbose
 ```
 
+7,500 cases — 5,000 single instructions and 2,500 four-instruction sequences,
+across all thirteen data-processing families — currently agree with QEMU
+exactly.
+
 **Whole programs, against QEMU.** Compiled C exercising arithmetic and flags,
 floating point, memory and strings, control flow (including jump tables,
 function pointers and `longjmp`) and the syscall surface, at `-O0` and `-O2`,
@@ -142,6 +146,16 @@ static and static-PIE:
 
 ```console
 $ tests/integration/run.sh
+```
+
+**Cross-engine, on V8.** The native host runs on wasmtime; the browser target
+is V8. Tail calls are load-bearing enough that a difference between the two
+engines would invalidate the design, so the *same* module `gexc build`
+produced is also executed under Node:
+
+```console
+$ gexc build prog -o prog.wasm
+$ node tests/cross-engine/run-node.mjs prog.wasm prog
 ```
 
 `cargo test --workspace` runs the unit tests.
