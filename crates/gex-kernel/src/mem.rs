@@ -44,6 +44,7 @@ pub struct Vma {
 
 /// The process's address space.
 #[derive(Debug)]
+#[derive(Clone)]
 pub struct MemoryMap {
     vmas: Vec<Vma>,
     brk_start: u64,

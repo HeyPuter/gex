@@ -24,7 +24,8 @@ pub mod vfs;
 
 pub use errno::Errno;
 pub use syscalls::{
-    skips_proc_snapshot, BlockOp, Kernel, KernelProcSource, ProcState, SyscallOutcome, ThreadState,
+    skips_proc_snapshot, BlockOp, Child, ChildHandle, Kernel, KernelProcSource, ProcState,
+    SyscallOutcome, ThreadState,
 };
 
 /// Guest linear memory, addressed exactly as the guest addresses it.

@@ -123,6 +123,8 @@ struct HostState {
     spawn: Option<Arc<SpawnContext>>,
     /// Set by a `clone` that a host thread still has to be started for.
     pending_spawn: Option<ThreadState>,
+    /// Set by a `clone` without CLONE_THREAD: a child process to build.
+    pending_fork: Option<i32>,
 }
 
 /// What a guest thread needs to start running.
@@ -426,6 +428,7 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
             jit: None,
             spawn: None,
             pending_spawn: None,
+            pending_fork: None,
         },
     );
 
@@ -613,6 +616,46 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
             std::thread::sleep(d);
             Ok(0)
         }
+        BlockOp::WaitChild {
+            children,
+            want,
+            wstatus,
+            nohang,
+        } => {
+            use gex_kernel::errno::Errno;
+            let candidates: Vec<_> = children
+                .iter()
+                .filter(|c| want <= 0 || c.pid == want)
+                .collect();
+            if candidates.is_empty() {
+                return Err(Errno::ECHILD);
+            }
+            loop {
+                for c in &candidates {
+                    let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(code) = st.take() {
+                        c.reaped.store(true, std::sync::atomic::Ordering::Release);
+                        if wstatus != 0 {
+                            // The wait status Linux reports for a normal
+                            // exit: the code in bits 8..16.
+                            let mut mem = GuestMem::new(data);
+                            mem.write_u32(wstatus, ((code as u32) & 0xff) << 8)?;
+                        }
+                        return Ok(c.pid as u64);
+                    }
+                }
+                if nohang {
+                    return Ok(0);
+                }
+                // Any child's condvar will do to park on; they are woken
+                // together with the status they set.
+                let c = candidates[0];
+                let guard = c.status.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = c
+                    .done
+                    .wait_timeout(guard, std::time::Duration::from_millis(20));
+            }
+        }
     }
 }
 
@@ -639,6 +682,9 @@ fn run_thread_loop(
             &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)],
             &mut [],
         );
+        if let Some(pid) = store.data_mut().pending_fork.take() {
+            fork_process(store, pid)?;
+        }
         if let Some(child) = store.data_mut().pending_spawn.take() {
             let cx = store
                 .data()
@@ -678,6 +724,165 @@ fn run_thread_loop(
     }
 }
 
+/// Build and start a child process.
+///
+/// A forked child is the same program at the same addresses, so it can reuse
+/// every module the parent has translated -- what it cannot share is the
+/// memory those modules act on. It gets a fresh one with the parent's mapped
+/// regions copied into it, which is the whole of what `fork` means here: one
+/// address space per process, and no copy-on-write, because wasm gives the
+/// host no way to fault on a write.
+fn fork_process(store: &mut Store<HostState>, pid: i32) -> Result<()> {
+    let cx = store
+        .data()
+        .spawn
+        .clone()
+        .ok_or_else(|| anyhow!("fork with no spawn context"))?;
+    let parent_mem = store
+        .data()
+        .memory
+        .clone()
+        .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+
+    // The child's kernel is a copy of the parent's: descriptors are `Arc`
+    // handles, so parent and child share the open file descriptions exactly
+    // as Linux does, while the VMA tree and the child list are its own.
+    let (child_kernel, regions, ctx_addr) = {
+        let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        let regions: Vec<(u64, u64)> = k.mem.vmas().iter().map(|v| (v.start, v.end)).collect();
+        let mut child = k.fork_kernel();
+        child.pid = pid;
+        child.tid = pid;
+        (child, regions, store.data().thread.ctx_addr)
+    };
+
+    let shared = wasmtime::SharedMemory::new(
+        &cx.engine,
+        wasmtime::MemoryType::shared(GUEST_MEM_PAGES as u32, GUEST_MEM_PAGES as u32),
+    )
+    .context("creating the child's memory")?;
+    let child_mem = gex_mem::GuestMemory::new(shared);
+    {
+        let src = parent_mem.bytes();
+        let dst = child_mem.bytes();
+        // Everything below the executable: the register contexts, and the
+        // dispatch directory that says which table slots a page owns. The
+        // directory begins *at* RESERVED_END, not before it -- copying only up
+        // to that boundary leaves the child with an all-zero directory, so
+        // every page resolves to the miss stub and the first branch after the
+        // fork translates the same block forever.
+        let low = (gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4) as usize;
+        dst[..low].copy_from_slice(&src[..low]);
+        for (start, end) in &regions {
+            let (a, b) = (*start as usize, (*end as usize).min(src.len()));
+            if a < b {
+                dst[a..b].copy_from_slice(&src[a..b]);
+            }
+        }
+        // `fork` returns zero in the child.
+        let mut gm = GuestMem::new(dst);
+        let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
+    }
+
+    let entry = {
+        let data = child_mem.bytes();
+        read_u64(data, (ctx_addr + ctx::PC as u64) as usize)
+    };
+    let child_cx = Arc::new(SpawnContext {
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        engine: cx.engine.clone(),
+        image_module: cx.image_module.clone(),
+        linker: cx.linker.clone(),
+        memory: child_mem,
+        kernel: Arc::new(Mutex::new(child_kernel)),
+        proc_state: Arc::new(Mutex::new(ProcState::default())),
+        // The registry is shared: the modules are the same code at the same
+        // addresses, and instantiating one against a different memory is
+        // exactly what the import is for.
+        jit_shared: cx.jit_shared.clone(),
+        limits: cx.limits,
+    });
+    let status = {
+        let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        k.children
+            .iter()
+            .find(|c| c.pid == pid)
+            .map(|c| (Arc::clone(&c.status), Arc::clone(&c.done)))
+            .ok_or_else(|| anyhow!("forked child {pid} is not registered"))?
+    };
+    let thread = ThreadState::new(ctx_addr, pid);
+    std::thread::Builder::new()
+        .name(format!("gex-pid-{pid}"))
+        .spawn(move || {
+            let code = match run_guest_process(child_cx, thread, entry) {
+                Ok(exit) => exit.code(),
+                Err(e) => {
+                    eprintln!("gexc: child {pid} failed: {e:#}");
+                    127
+                }
+            };
+            let (st, done) = status;
+            *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+            done.notify_all();
+        })
+        .context("spawning a child process")?;
+    Ok(())
+}
+
+/// Run a child process to completion in this host thread.
+fn run_guest_process(
+    cx: Arc<SpawnContext>,
+    thread: ThreadState,
+    entry: u64,
+) -> Result<Exit> {
+    let mut store = Store::new(
+        &cx.engine,
+        HostState {
+            kernel: Arc::clone(&cx.kernel),
+            thread,
+            memory: Some(cx.memory.clone()),
+            proc_state: Arc::clone(&cx.proc_state),
+            exit: None,
+            resume_at: None,
+            jit: None,
+            spawn: Some(Arc::clone(&cx)),
+            pending_spawn: None,
+            pending_fork: None,
+        },
+    );
+    let mut linker = cx.linker.clone();
+    linker.allow_shadowing(true);
+    linker.define(
+        &mut store,
+        IMPORT_MODULE,
+        exports::MEMORY,
+        cx.memory.shared().clone(),
+    )?;
+    let instance = linker
+        .instantiate(&mut store, &cx.image_module)
+        .context("instantiating the image module for a child process")?;
+    let table = match instance.get_export(&mut store, exports::DISPATCH_TABLE) {
+        Some(Extern::Table(t)) => t,
+        _ => bail!("translated module does not export its dispatch table"),
+    };
+    if let Some(shared) = &cx.jit_shared {
+        store.data_mut().jit = Some(Jit {
+            shared: Arc::clone(shared),
+            engine: cx.engine.clone(),
+            linker: cx.linker.clone(),
+            table,
+            instances: Vec::new(),
+            replayed: 0,
+            limits: cx.limits,
+        });
+    }
+    catch_up_table(&mut store)?;
+    let exit = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
+    stop_other_threads(&cx, false);
+    Ok(exit)
+}
+
 /// A guest thread: its own store, its own instances, the same memory.
 fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
     let mut store = Store::new(
@@ -692,6 +897,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
+            pending_fork: None,
         },
     );
     let mut linker = cx.linker.clone();
@@ -998,6 +1204,16 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     state.exit = Some(Exit::Status(code));
                     Err(StopExecution.into())
                 }
+                SyscallOutcome::SpawnProcess { pid } => {
+                    // Same reason as a thread: the store is borrowed here, and
+                    // a fork has to copy the whole address space.
+                    state.pending_fork = Some(pid);
+                    state.resume_at = Some(
+                        gm.read_u64(state.thread.ctx_addr + ctx::PC as u64)
+                            .unwrap_or(0),
+                    );
+                    Err(StopExecution.into())
+                }
                 SyscallOutcome::SpawnThread {
                     ctx_addr,
                     tid,
@@ -1287,7 +1503,8 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // the shared registry is far cheaper than translating again, and it is
     // also how a newly spawned thread fills a table that starts out holding
     // only what the image module put there.
-    if replay_registry(caller)? && {
+    let replayed_any = replay_registry(caller)?;
+    if replayed_any && {
         let jit = caller.data().jit.as_ref().unwrap();
         let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.translated.contains(&pc)
@@ -1354,81 +1571,22 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         return Ok(false);
     }
 
-    let (engine, linker) = {
+    let engine = {
         let jit = caller.data().jit.as_ref().unwrap();
-        (jit.engine.clone(), jit.linker.clone())
+        jit.engine.clone()
     };
     let module = Module::new(&engine, &translated_module.wasm)
         .context("validating runtime-translated wasm")?;
 
-    // Grow the shared table to cover the pages this module claimed, filling
-    // the new slots with the miss stub so an unreached address in a newly
-    // covered page still asks for translation.
-    let table = caller.data().jit.as_ref().unwrap().table;
-    let have = table.size(&mut *caller);
-    if translated_module.table_slots > have {
-        let miss = table
-            .get(&mut *caller, 0)
-            .ok_or_else(|| anyhow!("dispatch table is empty"))?;
-        table
-            .grow(&mut *caller, translated_module.table_slots - have, miss)
-            .context("growing the dispatch table")?;
-    }
-
-    // The new module imports the memory and the table by name. The memory is
-    // already defined on the linker this was cloned from -- it has to be, the
-    // image module imports it too -- and the table is redefined per call, so
-    // both are shadowing writes.
-    let mut linker = linker;
-    linker.allow_shadowing(true);
-    linker.define(
-        &mut *caller,
-        gex_abi::IMPORT_MODULE,
-        exports::MEMORY,
-        memory.shared().clone(),
-    )?;
-    linker.define(
-        &mut *caller,
-        gex_abi::IMPORT_MODULE,
-        exports::DISPATCH_TABLE,
-        table,
-    )?;
-    let instance = linker
-        .instantiate(&mut *caller, &module)
-        .context("instantiating runtime-translated module")?;
-
-    // Install each block, then publish the page directory entries. Doing it
-    // in that order means a page never becomes reachable before the slots it
-    // points at hold real code.
-    let mut installed = Vec::with_capacity(translated_module.exported_blocks.len());
-    for (addr, name) in &translated_module.exported_blocks {
-        let Some(Extern::Func(f)) = instance.get_export(&mut *caller, name) else {
-            bail!("runtime module is missing its export {name}");
-        };
-        let page = gex_abi::dispatch_page(*addr);
-        // The base comes from the shared page assignment, not from this
-        // module's list of *new* pages: a block often lands in a page some
-        // earlier translation already claimed.
-        let Some(base) = translated_module.page_table.lookup(page) else {
-            bail!("no dispatch page allocated for block 0x{addr:x}");
-        };
-        let slot = gex_abi::dispatch_index(*addr, base);
-        table
-            .set(&mut *caller, slot, Ref::Func(Some(f)))
-            .with_context(|| format!("installing block 0x{addr:x} in slot {slot}"))?;
-        installed.push(*addr);
-    }
-    write_dispatch_dir(memory, &translated_module.dir_entries)?;
-
-    // If the address that faulted did not end up with code, resuming would
-    // fault again at the same place forever. Say so instead.
-    if !installed.contains(&pc) {
-        bail!("translated {} blocks but none covered 0x{pc:x}", installed.len());
-    }
-
+    // Publish first, install second. The store's watermark only ever advances
+    // through `replay_registry`, so installing here as well would double-count
+    // whenever another thread appended between the catch-up above and this
+    // push -- which is exactly what filled one store with ten thousand
+    // instances of the same modules.
     {
         let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.translated.extend(installed);
+        sh.translated
+            .extend(translated_module.exported_blocks.iter().map(|(a, _)| *a));
         sh.page_table = translated_module.page_table.clone();
         sh.registry.push(Arc::new(CompiledUnit {
             module,
@@ -1440,10 +1598,17 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         sh.blocks += stats.blocks;
         sh.calls += 1;
     }
-    let jit = caller.data_mut().jit.as_mut().unwrap();
-    jit.instances.push(instance);
-    // This store now holds the unit it just pushed.
-    jit.replayed += 1;
+    replay_registry(caller)?;
+
+    // If the address that faulted did not end up with code, resuming would
+    // fault again at the same place forever. Say so instead.
+    let covered = {
+        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.translated.contains(&pc)
+    };
+    if !covered {
+        bail!("translated blocks but none covered 0x{pc:x}");
+    }
     Ok(true)
 }
 

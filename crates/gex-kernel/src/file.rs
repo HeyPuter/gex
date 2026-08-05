@@ -151,6 +151,7 @@ impl OpenFile {
 }
 
 /// The per-process descriptor table.
+#[derive(Clone)]
 pub struct FdTable {
     entries: Vec<Option<Arc<OpenFile>>>,
     cloexec: Vec<bool>,

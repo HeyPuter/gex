@@ -121,6 +121,13 @@ pub enum SyscallOutcome {
     Exit(i32),
     /// A signal with no handler ended the process.
     Killed { signal: u32, core: bool },
+    /// `clone` without `CLONE_THREAD`: a new *process*.
+    ///
+    /// The host copies the address space, duplicates this kernel, and runs
+    /// the child from the same instruction with `x0` zero. Nothing about the
+    /// child's memory can be prepared here, because the kernel can only see
+    /// the parent's.
+    SpawnProcess { pid: i32 },
     /// `clone` set up a new thread's context; the host must run it.
     ///
     /// The kernel cannot spawn a thread itself -- a wasmtime store belongs to
@@ -155,6 +162,16 @@ pub enum BlockOp {
         deadline: Option<std::time::Duration>,
     },
     Sleep(std::time::Duration),
+    /// `wait4`. Blocks until one of `children` has a status to collect.
+    WaitChild {
+        children: Vec<ChildHandle>,
+        /// Which child, or -1 for any.
+        want: i32,
+        /// Where to write the wait status, or zero.
+        wstatus: u64,
+        /// `WNOHANG`: report nothing rather than blocking.
+        nohang: bool,
+    },
 }
 
 /// `clone` flags gex understands.
@@ -202,6 +219,54 @@ pub struct Kernel {
     pub next_ctx_slot: u32,
     /// Threads that have been created and not yet exited, including this one.
     pub live_threads: u32,
+    /// Child processes, for `wait4`.
+    pub children: Vec<Child>,
+    /// Next process id to hand out. Shared with `next_tid` in Linux; kept
+    /// separate here because gex's pids are its own invention.
+    pub next_pid: i32,
+}
+
+/// A child process the kernel is tracking.
+#[derive(Debug)]
+pub struct Child {
+    pub pid: i32,
+    /// Set when the child exits, with the status `wait4` should report.
+    pub status: Arc<Mutex<Option<i32>>>,
+    /// Signalled when `status` is filled in.
+    pub done: Arc<std::sync::Condvar>,
+    /// Set once a `wait4` has collected this child, so a second one reports
+    /// `ECHILD` rather than blocking forever.
+    pub reaped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Child {
+    pub fn new(pid: i32) -> Child {
+        Child {
+            pid,
+            status: Arc::new(Mutex::new(None)),
+            done: Arc::new(std::sync::Condvar::new()),
+            reaped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// The handle the host needs to wait on this child.
+    pub fn handle(&self) -> ChildHandle {
+        ChildHandle {
+            pid: self.pid,
+            status: Arc::clone(&self.status),
+            done: Arc::clone(&self.done),
+            reaped: Arc::clone(&self.reaped),
+        }
+    }
+}
+
+/// A child, as the host sees it while waiting with the kernel unlocked.
+#[derive(Debug, Clone)]
+pub struct ChildHandle {
+    pub pid: i32,
+    pub status: Arc<Mutex<Option<i32>>>,
+    pub done: Arc<std::sync::Condvar>,
+    pub reaped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A thread the kernel has prepared and the host must start.
@@ -289,6 +354,44 @@ impl Kernel {
             next_tid: 2,
             next_ctx_slot: 1,
             live_threads: 1,
+            children: Vec::new(),
+            next_pid: 1000,
+        }
+    }
+
+    /// The kernel a forked child starts with.
+    ///
+    /// Descriptors carry `Arc` handles, so parent and child share the open
+    /// file *descriptions* -- offsets included -- exactly as Linux does, while
+    /// the table itself is separate so a `close` in one does not affect the
+    /// other. The VMA tree is copied because the child gets its own address
+    /// space, and the child list starts empty because a grandchild is not the
+    /// parent's to reap.
+    pub fn fork_kernel(&self) -> Kernel {
+        Kernel {
+            fds: self.fds.clone(),
+            mem: self.mem.clone(),
+            vfs: self.vfs.clone(),
+            ctx_addr: self.ctx_addr,
+            pid: self.pid,
+            tid: self.tid,
+            clear_child_tid: 0,
+            exe_path: self.exe_path.clone(),
+            argv: self.argv.clone(),
+            envp: self.envp.clone(),
+            uid: self.uid,
+            gid: self.gid,
+            trace: self.trace,
+            // A fork resets pending signals but keeps the dispositions.
+            signals: self.signals.fork(),
+            // Futexes live in the address space, and the child has its own.
+            futexes: Arc::new(FutexTable::new()),
+            unimplemented: Vec::new(),
+            next_tid: self.next_tid,
+            next_ctx_slot: self.next_ctx_slot,
+            live_threads: 1,
+            children: Vec::new(),
+            next_pid: self.next_pid + 1000,
         }
     }
 
@@ -306,7 +409,7 @@ impl Kernel {
     /// implement -- one address space, one process.
     fn sys_clone(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
         let (flags, child_stack, parent_tid, tls, child_tid) = (a[0], a[1], a[2], a[3], a[4]);
-        if flags & clone_flags::THREAD == 0 || flags & clone_flags::VM == 0 {
+        if flags & clone_flags::THREAD == 0 {
             return Err(Errno::ENOSYS);
         }
         if child_stack == 0 {
@@ -404,6 +507,20 @@ impl Kernel {
 
         // `clone` and a thread's `exit` change which threads exist, so they
         // answer with an outcome rather than a return value.
+        // A clone without CLONE_THREAD is a new process, which only the host
+        // can build: it needs a second address space.
+        if n == nr::CLONE && a[0] & clone_flags::THREAD == 0 {
+            let pid = self.next_pid;
+            self.next_pid += 1;
+            self.children.push(Child::new(pid));
+            // The parent sees the child's pid; the child sees zero, which the
+            // host writes into the copy it makes.
+            let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, pid as u64);
+            if self.trace {
+                eprintln!("[gex] clone(...) = {pid} (new process)");
+            }
+            return SyscallOutcome::SpawnProcess { pid };
+        }
         if n == nr::CLONE {
             return match self.sys_clone(m, a) {
                 Ok(req) => {
@@ -503,6 +620,20 @@ impl Kernel {
                     uaddr: a[0],
                     val: a[2] as u32,
                     deadline,
+                })
+            }
+            nr::WAIT4 => {
+                let alive: Vec<ChildHandle> = self
+                    .children
+                    .iter()
+                    .filter(|c| !c.reaped.load(std::sync::atomic::Ordering::Acquire))
+                    .map(|c| c.handle())
+                    .collect();
+                Some(BlockOp::WaitChild {
+                    children: alive,
+                    want: a[0] as i32,
+                    wstatus: a[1],
+                    nohang: a[2] & 1 != 0,
                 })
             }
             nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => {
@@ -653,8 +784,8 @@ impl Kernel {
         Ok(r)
     }
 
-    fn sys_futex(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let (uaddr, raw_op, val, timeout) = (a[0], a[1] as u32, a[2] as u32, a[3]);
+    fn sys_futex(&mut self, _m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let (uaddr, raw_op, val) = (a[0], a[1] as u32, a[2] as u32);
         // The private and clock bits change nothing here: gex has one address
         // space, and the timeout is treated as relative either way.
         let operation = raw_op & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
@@ -1348,6 +1479,7 @@ impl Kernel {
 ///
 /// Held behind a lock so procfs can read it without borrowing the kernel,
 /// which would deadlock against the syscall that is currently running.
+#[derive(Default, Clone)]
 pub struct ProcState {
     pub pid: i32,
     pub maps: String,

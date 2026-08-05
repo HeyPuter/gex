@@ -125,7 +125,7 @@ pub enum Delivery {
 }
 
 /// Per-process signal state.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Signals {
     actions: [SigAction; sig::MAX as usize + 1],
     /// Signals raised but not yet delivered.
@@ -140,6 +140,23 @@ pub struct Signals {
 impl Default for Signals {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Signals {
+    /// The signal state a forked child starts with.
+    ///
+    /// Dispositions and the blocked mask are inherited; the pending set is
+    /// not, and neither is a handler frame -- the child begins between
+    /// instructions, not inside a handler.
+    pub fn fork(&self) -> Signals {
+        Signals {
+            actions: self.actions,
+            pending: 0,
+            blocked: self.blocked,
+            alt_stack: self.alt_stack,
+            in_handler: false,
+        }
     }
 }
 

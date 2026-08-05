@@ -161,6 +161,7 @@ pub trait FileSystem: Send + Sync {
 }
 
 /// The mount table.
+#[derive(Clone)]
 pub struct Vfs {
     /// Mount point (absolute, no trailing slash except for "/") to backend.
     mounts: BTreeMap<String, Arc<dyn FileSystem>>,
