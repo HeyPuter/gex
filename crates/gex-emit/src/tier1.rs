@@ -1,0 +1,909 @@
+//! Tier-1 code generation: one wasm function per guest basic block.
+//!
+//! The shape is PLAN §2.4: every block is a function with the uniform
+//! signature `(ctx: i32) -> ()`; direct successors are reached with
+//! `return_call`, computed ones with `return_call_indirect` through the
+//! PC-indexed dispatch table. Guest stack depth therefore never shows up as
+//! wasm stack depth, and any 4-byte-aligned address can become an entry point
+//! later without retranslating anything.
+//!
+//! Two things make tier-1 more than a naive transliteration:
+//!
+//! * **Guest registers are cached in wasm locals** for the length of the
+//!   block. A register is loaded from the context at most once and stored
+//!   back at most once, at the block's exit (PLAN §5.4.2).
+//! * **Value locals are recycled** using last-use information, so a long
+//!   block needs a handful of locals rather than one per SSA value.
+
+use crate::wasm::{FuncBody, ValType};
+use gex_abi::{ctx, GUEST_LIMIT, POISON_ADDR};
+use gex_ir::*;
+use std::collections::HashMap;
+
+// Numeric opcodes, grouped so the i32/i64 pairs stay visibly adjacent.
+mod code {
+    pub const I64_EQ: u8 = 0x51;
+    pub const I32_WRAP_I64: u8 = 0xa7;
+    pub const I64_EXTEND_I32_S: u8 = 0xac;
+    pub const I64_EXTEND_I32_U: u8 = 0xad;
+    pub const I32_EXTEND8_S: u8 = 0xc0;
+    pub const I32_EXTEND16_S: u8 = 0xc1;
+    pub const I64_EXTEND8_S: u8 = 0xc2;
+    pub const I64_EXTEND16_S: u8 = 0xc3;
+    pub const I64_EXTEND32_S: u8 = 0xc4;
+    pub const I64_LT_U: u8 = 0x54;
+}
+
+/// Everything tier-1 needs to know about the module it is emitting into.
+pub struct Context<'a> {
+    /// Import index of `gex.syscall`.
+    pub syscall: u32,
+    /// Import index of `gex.illegal`.
+    pub illegal: u32,
+    /// Import index of `gex.breakpoint`.
+    pub breakpoint: u32,
+    /// Import index of `gex.sysreg_read`.
+    pub sysreg_read: u32,
+    /// Import index of `gex.sysreg_write`.
+    pub sysreg_write: u32,
+    /// Import index of `gex.cache_op`.
+    pub cache_op: u32,
+    /// Import index of `gex.dispatch_miss`.
+    pub dispatch_miss: u32,
+    /// Import index of `gex.safepoint`.
+    pub safepoint: u32,
+    /// Type index of the uniform block signature `(i32) -> ()`.
+    pub block_ty: u32,
+    /// Guest address the dispatch table is indexed from.
+    pub text_base: u64,
+    /// Number of slots in the dispatch table.
+    pub text_slots: u64,
+    /// Guest address -> wasm function index, for blocks already assigned an
+    /// index. A miss falls back to the dispatch table.
+    pub blocks: &'a HashMap<u64, u32>,
+}
+
+/// Compile one GIR block into a wasm function body.
+pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
+    let mut e = Emitter::new(cx);
+    e.run(block);
+    e.f.finish()
+}
+
+/// Where a guest register currently lives.
+struct Cached {
+    local: u32,
+    dirty: bool,
+}
+
+struct Emitter<'a> {
+    f: FuncBody,
+    cx: &'a Context<'a>,
+    /// The `ctx` parameter.
+    ctx_local: u32,
+    /// Scratch for address computation.
+    scratch_i64: u32,
+    /// Locals holding live GIR values.
+    value_local: Vec<Option<u32>>,
+    /// Constant value of each GIR value, when known.
+    value_const: Vec<Option<u64>>,
+    /// Width of each GIR value, needed to pick the right local pool.
+    value_is_i32: Vec<bool>,
+    /// Free locals available for reuse, by type.
+    free_i32: Vec<u32>,
+    free_i64: Vec<u32>,
+    /// Guest register cache.
+    regs: HashMap<GuestReg, Cached>,
+}
+
+impl<'a> Emitter<'a> {
+    fn new(cx: &'a Context<'a>) -> Emitter<'a> {
+        let mut f = FuncBody::new(1);
+        let scratch_i64 = f.add_local(ValType::I64);
+        Emitter {
+            f,
+            cx,
+            ctx_local: 0,
+            scratch_i64,
+            value_local: Vec::new(),
+            value_const: Vec::new(),
+            value_is_i32: Vec::new(),
+            free_i32: Vec::new(),
+            free_i64: Vec::new(),
+            regs: HashMap::new(),
+        }
+    }
+
+    fn run(&mut self, block: &Block) {
+        let n = block.n_values as usize;
+        self.value_local = vec![None; n];
+        self.value_const = vec![None; n];
+        self.value_is_i32 = vec![false; n];
+
+        let last_use = compute_last_use(block);
+
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            self.stmt(stmt, block);
+            // Recycle locals whose values are dead after this statement.
+            for (v, &lu) in last_use.iter().enumerate() {
+                if lu == Some(i) {
+                    self.release(Value(v as u32));
+                }
+            }
+        }
+        self.terminator(block);
+    }
+
+    // -- local management --------------------------------------------------
+
+    fn alloc(&mut self, ty: Ty) -> u32 {
+        let pool = match ty {
+            Ty::I32 => &mut self.free_i32,
+            Ty::I64 => &mut self.free_i64,
+        };
+        if let Some(l) = pool.pop() {
+            return l;
+        }
+        self.f.add_local(match ty {
+            Ty::I32 => ValType::I32,
+            Ty::I64 => ValType::I64,
+        })
+    }
+
+    fn release(&mut self, v: Value) {
+        let idx = v.0 as usize;
+        if idx >= self.value_local.len() {
+            return;
+        }
+        if let Some(local) = self.value_local[idx].take() {
+            // The type is recoverable from which pool the local came from;
+            // track it by checking the recorded type on allocation instead.
+            if self.value_is_i32[idx] {
+                self.free_i32.push(local);
+            } else {
+                self.free_i64.push(local);
+            }
+        }
+    }
+
+    /// Push a value onto the wasm operand stack.
+    fn push(&mut self, v: Value) {
+        let idx = v.0 as usize;
+        match self.value_local.get(idx).copied().flatten() {
+            Some(l) => self.f.local_get(l),
+            None => {
+                // A value with no local is either a folded constant or a bug
+                // in liveness; constants are re-materialised inline, which is
+                // cheaper than a local anyway.
+                match self.value_const.get(idx).copied().flatten() {
+                    Some(c) if self.value_is_i32[idx] => self.f.i32_const(c as i32),
+                    Some(c) => self.f.i64_const(c as i64),
+                    None => panic!("value {v:?} used after release"),
+                }
+            }
+        }
+    }
+
+    // -- guest register cache ---------------------------------------------
+
+    fn reg_offset(r: GuestReg) -> u32 {
+        (match r {
+            GuestReg::X(n) => ctx::x(n),
+            GuestReg::Sp => ctx::SP,
+            GuestReg::Pc => ctx::PC,
+            GuestReg::N => ctx::NF,
+            GuestReg::Z => ctx::ZF,
+            GuestReg::C => ctx::CF,
+            GuestReg::V => ctx::VF,
+            GuestReg::Tpidr => ctx::TPIDR,
+            GuestReg::TpidrRo => ctx::TPIDRRO,
+            GuestReg::MonAddr => ctx::MON_ADDR,
+            GuestReg::MonValue => ctx::MON_VALUE,
+            GuestReg::MonSize => ctx::MON_SIZE,
+        }) as u32
+    }
+
+    /// The local holding `r`, loading it from the context on first use.
+    fn reg_local(&mut self, r: GuestReg) -> u32 {
+        if let Some(c) = self.regs.get(&r) {
+            return c.local;
+        }
+        let ty = r.ty();
+        let local = self.f.add_local(match ty {
+            Ty::I32 => ValType::I32,
+            Ty::I64 => ValType::I64,
+        });
+        self.f.local_get(self.ctx_local);
+        let (opcode, align) = match ty {
+            Ty::I32 => (0x28u8, 2u32), // i32.load
+            Ty::I64 => (0x29u8, 3u32), // i64.load
+        };
+        self.f.load(opcode, align, Self::reg_offset(r));
+        self.f.local_set(local);
+        self.regs.insert(r, Cached { local, dirty: false });
+        local
+    }
+
+    /// Mark `r` as holding the value currently on top of the stack.
+    fn reg_store_from_stack(&mut self, r: GuestReg) {
+        let ty = r.ty();
+        let local = match self.regs.get(&r) {
+            Some(c) => c.local,
+            None => self.f.add_local(match ty {
+                Ty::I32 => ValType::I32,
+                Ty::I64 => ValType::I64,
+            }),
+        };
+        self.f.local_set(local);
+        self.regs.insert(r, Cached { local, dirty: true });
+    }
+
+    /// Write every dirty cached register back to the context.
+    fn flush(&mut self) {
+        let mut dirty: Vec<(GuestReg, u32)> = self
+            .regs
+            .iter()
+            .filter(|(_, c)| c.dirty)
+            .map(|(r, c)| (*r, c.local))
+            .collect();
+        // Deterministic output makes translated modules reproducible, which
+        // the content-addressed cache (PLAN §10) depends on.
+        dirty.sort_by_key(|(r, _)| Self::reg_offset(*r));
+        for (r, local) in dirty {
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(local);
+            let (opcode, align) = match r.ty() {
+                Ty::I32 => (0x36u8, 2u32), // i32.store
+                Ty::I64 => (0x37u8, 3u32), // i64.store
+            };
+            self.f.store(opcode, align, Self::reg_offset(r));
+            if let Some(c) = self.regs.get_mut(&r) {
+                c.dirty = false;
+            }
+        }
+    }
+
+    /// Forget every cached register, forcing later reads to reload. Used
+    /// after a host call that can rewrite guest state.
+    fn invalidate(&mut self) {
+        self.regs.clear();
+    }
+
+    /// Record the guest PC in the context, so a host call or dispatch miss
+    /// sees a precise architectural state.
+    fn store_pc(&mut self, pc: u64) {
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(pc as i64);
+        self.f.store(0x37, 3, ctx::PC as u32);
+    }
+
+    // -- addressing --------------------------------------------------------
+
+    /// Emit the 32-bit linear-memory address for `addr + offset`, returning
+    /// the static offset the access should carry.
+    ///
+    /// Guest VA equals linear-memory offset (PLAN §2.3), so this is a
+    /// truncation plus one guard: an effective address that does not fit in
+    /// 32 bits is steered to an address inside the unmapped top page, which
+    /// makes the access trap and become SIGSEGV rather than silently aliasing
+    /// low memory.
+    fn emit_address(&mut self, addr: Value, offset: i64) -> u32 {
+        // Constant addresses are extremely common (literal pools, absolute
+        // references) and need no guard at all.
+        if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
+            let ea = c.wrapping_add(offset as u64);
+            if ea < GUEST_LIMIT {
+                self.f.i32_const(ea as i32);
+                return 0;
+            }
+            self.f.i32_const(POISON_ADDR as i32);
+            return 0;
+        }
+
+        let static_off = if (0..=u32::MAX as i64).contains(&offset) {
+            self.push(addr);
+            offset as u32
+        } else {
+            self.push(addr);
+            self.f.i64_const(offset);
+            self.f.byte(0x7c); // i64.add
+            0
+        };
+        self.guard_to_i32();
+        static_off
+    }
+
+    /// Consume an `i64` effective address and leave a bounds-safe `i32`.
+    fn guard_to_i32(&mut self) {
+        let t = self.scratch_i64;
+        self.f.local_set(t);
+        self.f.local_get(t);
+        self.f.byte(code::I32_WRAP_I64);
+        self.f.i32_const(POISON_ADDR as i32);
+        self.f.local_get(t);
+        self.f.i64_const(GUEST_LIMIT as i64);
+        self.f.byte(code::I64_LT_U);
+        self.f.select();
+    }
+
+    // -- statements --------------------------------------------------------
+
+    fn stmt(&mut self, s: &Stmt, block: &Block) {
+        match s {
+            Stmt::Def { dst, expr } => self.def(*dst, expr),
+            Stmt::WriteReg { reg, val } => {
+                self.push(*val);
+                self.reg_store_from_stack(*reg);
+            }
+            Stmt::Store {
+                addr,
+                offset,
+                val,
+                sz,
+                order,
+            } => {
+                let static_off = self.emit_address(*addr, *offset);
+                self.push(*val);
+                let ty = self.type_of(*val);
+                if *order == Order::SeqCst {
+                    let sub = atomic_store_op(ty, *sz);
+                    self.f.atomic(sub, natural_align(*sz), static_off);
+                } else {
+                    let opcode = store_op(ty, *sz);
+                    self.f.store(opcode, natural_align(*sz), static_off);
+                }
+            }
+            Stmt::HostCall { func, args } => {
+                self.host_call(*func, args, None, block);
+            }
+            Stmt::Fence => self.f.atomic_fence(),
+        }
+    }
+
+    fn def(&mut self, dst: Value, expr: &Expr) {
+        let ty = expr.ty();
+        let idx = dst.0 as usize;
+        self.value_is_i32[idx] = ty == Ty::I32;
+
+        match expr {
+            Expr::ConstI32(c) => {
+                self.value_const[idx] = Some(*c as u64);
+                // Constants are re-materialised at each use rather than
+                // occupying a local; `push` handles that.
+                return;
+            }
+            Expr::ConstI64(c) => {
+                self.value_const[idx] = Some(*c);
+                return;
+            }
+            Expr::ReadReg(r) => {
+                let local = self.reg_local(*r);
+                self.f.local_get(local);
+            }
+            Expr::Bin { op, ty, a, b } => {
+                self.push(*a);
+                self.push(*b);
+                self.f.byte(bin_op(*op, *ty));
+            }
+            Expr::Un { op, ty, a } => match op {
+                UnOp::Not => {
+                    self.push(*a);
+                    match ty {
+                        Ty::I32 => self.f.i32_const(-1),
+                        Ty::I64 => self.f.i64_const(-1),
+                    }
+                    self.f.byte(bin_op(BinOp::Xor, *ty));
+                }
+                UnOp::Neg => {
+                    match ty {
+                        Ty::I32 => self.f.i32_const(0),
+                        Ty::I64 => self.f.i64_const(0),
+                    }
+                    self.push(*a);
+                    self.f.byte(bin_op(BinOp::Sub, *ty));
+                }
+                UnOp::Clz => {
+                    self.push(*a);
+                    self.f.byte(if *ty == Ty::I32 { 0x67 } else { 0x79 });
+                }
+                UnOp::Ctz => {
+                    self.push(*a);
+                    self.f.byte(if *ty == Ty::I32 { 0x68 } else { 0x7a });
+                }
+                UnOp::Popcnt => {
+                    self.push(*a);
+                    self.f.byte(if *ty == Ty::I32 { 0x69 } else { 0x7b });
+                }
+            },
+            Expr::Cmp { op, ty, a, b } => {
+                self.push(*a);
+                self.push(*b);
+                self.f.byte(cmp_op(*op, *ty));
+            }
+            Expr::Select { cond, a, b, .. } => {
+                self.push(*a);
+                self.push(*b);
+                self.push(*cond);
+                self.f.select();
+            }
+            Expr::Wrap(a) => {
+                self.push(*a);
+                self.f.byte(code::I32_WRAP_I64);
+            }
+            Expr::Extend { a, signed } => {
+                self.push(*a);
+                self.f.byte(if *signed {
+                    code::I64_EXTEND_I32_S
+                } else {
+                    code::I64_EXTEND_I32_U
+                });
+            }
+            Expr::ExtendBits {
+                a,
+                ty,
+                bits,
+                signed,
+            } => {
+                self.push(*a);
+                if *signed {
+                    match (*ty, *bits) {
+                        (Ty::I32, 8) => self.f.byte(code::I32_EXTEND8_S),
+                        (Ty::I32, 16) => self.f.byte(code::I32_EXTEND16_S),
+                        (Ty::I64, 8) => self.f.byte(code::I64_EXTEND8_S),
+                        (Ty::I64, 16) => self.f.byte(code::I64_EXTEND16_S),
+                        (Ty::I64, 32) => self.f.byte(code::I64_EXTEND32_S),
+                        _ => {
+                            // Widths the sign-extension opcodes do not cover:
+                            // shift up and back down arithmetically.
+                            let sh = ty.bits() - bits;
+                            match ty {
+                                Ty::I32 => self.f.i32_const(sh as i32),
+                                Ty::I64 => self.f.i64_const(sh as i64),
+                            }
+                            self.f.byte(bin_op(BinOp::Shl, *ty));
+                            match ty {
+                                Ty::I32 => self.f.i32_const(sh as i32),
+                                Ty::I64 => self.f.i64_const(sh as i64),
+                            }
+                            self.f.byte(bin_op(BinOp::ShrS, *ty));
+                        }
+                    }
+                } else {
+                    let mask = if *bits >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << bits) - 1
+                    };
+                    match ty {
+                        Ty::I32 => self.f.i32_const(mask as i32),
+                        Ty::I64 => self.f.i64_const(mask as i64),
+                    }
+                    self.f.byte(bin_op(BinOp::And, *ty));
+                }
+            }
+            Expr::Load {
+                addr,
+                offset,
+                sz,
+                signed,
+                ty,
+                order,
+            } => {
+                let static_off = self.emit_address(*addr, *offset);
+                if *order == Order::SeqCst {
+                    // Atomic loads have no signed forms; the architecture has
+                    // no signed load-acquire either.
+                    let sub = atomic_load_op(*ty, *sz);
+                    self.f.atomic(sub, natural_align(*sz), static_off);
+                } else {
+                    let opcode = load_op(*ty, *sz, *signed);
+                    self.f.load(opcode, natural_align(*sz), static_off);
+                }
+            }
+            Expr::Rmw {
+                op,
+                addr,
+                val,
+                sz,
+                ty,
+            } => {
+                let static_off = self.emit_address(*addr, 0);
+                self.push(*val);
+                let sub = atomic_rmw_op(*op, *ty, *sz);
+                self.f.atomic(sub, natural_align(*sz), static_off);
+            }
+            Expr::CmpXchg {
+                addr,
+                expected,
+                replacement,
+                sz,
+                ty,
+            } => {
+                let static_off = self.emit_address(*addr, 0);
+                self.push(*expected);
+                self.push(*replacement);
+                let sub = atomic_cmpxchg_op(*ty, *sz);
+                self.f.atomic(sub, natural_align(*sz), static_off);
+            }
+            Expr::HostCall { func, args, .. } => {
+                // Handled below so the result lands in a local like any other
+                // definition.
+                self.host_call_inline(*func, args);
+            }
+        }
+
+        // Everything that reaches here left one value on the stack.
+        let local = self.alloc(ty);
+        self.f.local_set(local);
+        self.value_local[idx] = Some(local);
+    }
+
+    fn type_of(&self, v: Value) -> Ty {
+        if self.value_is_i32.get(v.0 as usize).copied().unwrap_or(false) {
+            Ty::I32
+        } else {
+            Ty::I64
+        }
+    }
+
+    /// Emit a host call whose result stays on the stack.
+    fn host_call_inline(&mut self, func: HostFunc, args: &[Value]) {
+        if func.clobbers_guest_state() {
+            self.flush();
+        }
+        self.f.local_get(self.ctx_local);
+        for a in args {
+            self.push(*a);
+        }
+        self.f.call(self.import_index(func));
+        if func.clobbers_guest_state() {
+            self.invalidate();
+        }
+    }
+
+    fn host_call(&mut self, func: HostFunc, args: &[Value], _dst: Option<Value>, _b: &Block) {
+        if func.clobbers_guest_state() {
+            self.flush();
+        }
+        self.f.local_get(self.ctx_local);
+        for a in args {
+            self.push(*a);
+        }
+        self.f.call(self.import_index(func));
+        if func.clobbers_guest_state() {
+            self.invalidate();
+        }
+    }
+
+    fn import_index(&self, func: HostFunc) -> u32 {
+        match func {
+            HostFunc::Syscall => self.cx.syscall,
+            HostFunc::Illegal => self.cx.illegal,
+            HostFunc::Breakpoint => self.cx.breakpoint,
+            HostFunc::SysRegRead => self.cx.sysreg_read,
+            HostFunc::SysRegWrite => self.cx.sysreg_write,
+            HostFunc::CacheOp => self.cx.cache_op,
+            HostFunc::Safepoint => self.cx.safepoint,
+        }
+    }
+
+    // -- terminators -------------------------------------------------------
+
+    fn terminator(&mut self, block: &Block) {
+        match block.term {
+            Term::Goto { target } => {
+                self.flush();
+                self.jump_to_constant(target);
+            }
+            Term::Branch {
+                cond,
+                taken,
+                not_taken,
+            } => {
+                // Flush before the branch so both arms see the stores; doing
+                // it inside the `if` would only cover the taken path.
+                self.flush();
+                self.push(cond);
+                self.f.if_void();
+                self.jump_to_constant(taken);
+                self.f.end();
+                self.jump_to_constant(not_taken);
+            }
+            Term::Indirect { target, .. } => {
+                self.push(target);
+                self.f.local_set(self.scratch_i64);
+                // The context PC must be exact before a possible dispatch
+                // miss, since that is the only place the target is recorded.
+                self.f.local_get(self.ctx_local);
+                self.f.local_get(self.scratch_i64);
+                self.f.store(0x37, 3, ctx::PC as u32);
+                self.flush();
+                self.f.local_get(self.ctx_local);
+                self.emit_dispatch_index();
+                self.f
+                    .return_call_indirect(self.cx.block_ty, 0);
+            }
+            Term::Syscall { next } => {
+                self.flush();
+                self.store_pc(block.end - 4);
+                self.f.local_get(self.ctx_local);
+                self.f.i64_const((block.end - 4) as i64);
+                self.f.call(self.cx.syscall);
+                self.invalidate();
+                self.jump_to_constant(next);
+            }
+            Term::Illegal { raw, pc } => {
+                self.flush();
+                self.store_pc(pc);
+                self.f.local_get(self.ctx_local);
+                self.f.i64_const(pc as i64);
+                self.f.i32_const(raw as i32);
+                self.f.call(self.cx.illegal);
+                // `illegal` raises SIGILL and never returns.
+                self.f.unreachable();
+            }
+        }
+    }
+
+    /// Transfer control to a statically known guest address.
+    fn jump_to_constant(&mut self, target: u64) {
+        if let Some(&func) = self.cx.blocks.get(&target) {
+            self.f.local_get(self.ctx_local);
+            self.f.return_call(func);
+            return;
+        }
+        // No translation yet: record the PC and go through the table, whose
+        // untranslated slots hold the miss stub.
+        self.store_pc(target);
+        self.f.local_get(self.ctx_local);
+        let slot = dispatch_slot(target, self.cx.text_base, self.cx.text_slots);
+        match slot {
+            Some(i) => {
+                self.f.i32_const(i as i32);
+                self.f.return_call_indirect(self.cx.block_ty, 0);
+            }
+            None => {
+                self.f.local_get(self.ctx_local);
+                self.f.i64_const(target as i64);
+                self.f.call(self.cx.dispatch_miss);
+                self.f.return_call_indirect(self.cx.block_ty, 0);
+            }
+        }
+    }
+
+    /// Consume the target address in `scratch_i64` and leave a dispatch-table
+    /// index on the stack.
+    fn emit_dispatch_index(&mut self) {
+        // d = target - text_base
+        self.f.local_get(self.scratch_i64);
+        self.f.i64_const(self.cx.text_base as i64);
+        self.f.byte(0x7d); // i64.sub
+        self.f.local_set(self.scratch_i64);
+
+        // in_range = d < slots*4 && (d & 3) == 0
+        self.f.local_get(self.scratch_i64);
+        self.f.i64_const((self.cx.text_slots * 4) as i64);
+        self.f.byte(code::I64_LT_U);
+        self.f.local_get(self.scratch_i64);
+        self.f.i64_const(3);
+        self.f.byte(0x83); // i64.and
+        self.f.i64_const(0);
+        self.f.byte(code::I64_EQ);
+        self.f.byte(0x71); // i32.and
+
+        self.f.if_result(ValType::I32);
+        self.f.local_get(self.scratch_i64);
+        self.f.i64_const(2);
+        self.f.byte(0x88); // i64.shr_u
+        self.f.byte(code::I32_WRAP_I64);
+        self.f.else_();
+        // Out of range: ask the host, which either supplies a freshly
+        // translated slot (from M3) or raises SIGSEGV/SIGILL.
+        self.f.local_get(self.ctx_local);
+        self.f.local_get(self.scratch_i64);
+        self.f.i64_const(self.cx.text_base as i64);
+        self.f.byte(0x7c); // i64.add — restore the original address
+        self.f.call(self.cx.dispatch_miss);
+        self.f.end();
+    }
+}
+
+/// The dispatch-table slot for a statically known address, if it is in range.
+pub fn dispatch_slot(target: u64, text_base: u64, slots: u64) -> Option<u64> {
+    let d = target.wrapping_sub(text_base);
+    if d & 3 != 0 || d >= slots * 4 {
+        return None;
+    }
+    Some(d >> 2)
+}
+
+/// Index of the last statement that reads each value, or `None` when the
+/// value is read by the terminator (and so must survive the whole block).
+fn compute_last_use(block: &Block) -> Vec<Option<usize>> {
+    let n = block.n_values as usize;
+    // A value with no reader at all is freed immediately after its own
+    // definition, which is why the default is the defining statement.
+    let mut last: Vec<Option<usize>> = vec![Some(0); n];
+    for (i, stmt) in block.stmts.iter().enumerate() {
+        if let Stmt::Def { dst, .. } = stmt {
+            if let Some(slot) = last.get_mut(dst.0 as usize) {
+                *slot = Some(i);
+            }
+        }
+    }
+    for (i, stmt) in block.stmts.iter().enumerate() {
+        stmt.for_each_use(|v| {
+            if let Some(slot) = last.get_mut(v.0 as usize) {
+                *slot = Some(i);
+            }
+        });
+    }
+    // Values the terminator reads must survive to the end of the block.
+    block.term_uses(|v| {
+        if let Some(slot) = last.get_mut(v.0 as usize) {
+            *slot = None;
+        }
+    });
+    last
+}
+
+// ---------------------------------------------------------------------------
+// Opcode tables
+// ---------------------------------------------------------------------------
+
+fn bin_op(op: BinOp, ty: Ty) -> u8 {
+    let base32: u8 = match op {
+        BinOp::Add => 0x6a,
+        BinOp::Sub => 0x6b,
+        BinOp::Mul => 0x6c,
+        BinOp::DivS => 0x6d,
+        BinOp::DivU => 0x6e,
+        BinOp::RemS => 0x6f,
+        BinOp::RemU => 0x70,
+        BinOp::And => 0x71,
+        BinOp::Or => 0x72,
+        BinOp::Xor => 0x73,
+        BinOp::Shl => 0x74,
+        BinOp::ShrS => 0x75,
+        BinOp::ShrU => 0x76,
+        BinOp::Rotr => 0x78,
+    };
+    match ty {
+        Ty::I32 => base32,
+        // The i64 arithmetic block starts 18 opcodes after the i32 one and
+        // holds the same operations in the same order.
+        Ty::I64 => base32 + 0x12,
+    }
+}
+
+fn cmp_op(op: CmpOp, ty: Ty) -> u8 {
+    let base32: u8 = match op {
+        CmpOp::Eq => 0x46,
+        CmpOp::Ne => 0x47,
+        CmpOp::LtS => 0x48,
+        CmpOp::LtU => 0x49,
+        CmpOp::GtS => 0x4a,
+        CmpOp::GtU => 0x4b,
+        CmpOp::LeS => 0x4c,
+        CmpOp::LeU => 0x4d,
+        CmpOp::GeS => 0x4e,
+        CmpOp::GeU => 0x4f,
+    };
+    match ty {
+        Ty::I32 => base32,
+        // The i64 comparison block mirrors the i32 one, 11 opcodes later.
+        Ty::I64 => base32 + 0x0b,
+    }
+}
+
+fn natural_align(sz: MemSz) -> u32 {
+    match sz {
+        MemSz::B1 => 0,
+        MemSz::B2 => 1,
+        MemSz::B4 => 2,
+        MemSz::B8 => 3,
+    }
+}
+
+fn load_op(ty: Ty, sz: MemSz, signed: bool) -> u8 {
+    match (ty, sz, signed) {
+        (Ty::I32, MemSz::B1, false) => 0x2d,
+        (Ty::I32, MemSz::B1, true) => 0x2c,
+        (Ty::I32, MemSz::B2, false) => 0x2f,
+        (Ty::I32, MemSz::B2, true) => 0x2e,
+        (Ty::I32, _, _) => 0x28,
+        (Ty::I64, MemSz::B1, false) => 0x31,
+        (Ty::I64, MemSz::B1, true) => 0x30,
+        (Ty::I64, MemSz::B2, false) => 0x33,
+        (Ty::I64, MemSz::B2, true) => 0x32,
+        (Ty::I64, MemSz::B4, false) => 0x35,
+        (Ty::I64, MemSz::B4, true) => 0x34,
+        (Ty::I64, MemSz::B8, _) => 0x29,
+    }
+}
+
+fn store_op(ty: Ty, sz: MemSz) -> u8 {
+    match (ty, sz) {
+        (Ty::I32, MemSz::B1) => 0x3a,
+        (Ty::I32, MemSz::B2) => 0x3b,
+        (Ty::I32, _) => 0x36,
+        (Ty::I64, MemSz::B1) => 0x3c,
+        (Ty::I64, MemSz::B2) => 0x3d,
+        (Ty::I64, MemSz::B4) => 0x3e,
+        (Ty::I64, MemSz::B8) => 0x37,
+    }
+}
+
+/// Position of a `(type, size)` pair within an atomic opcode group.
+///
+/// Every atomic group in the threads proposal lists its seven variants in the
+/// same order: `i32`, `i64`, `i32.8`, `i32.16`, `i64.8`, `i64.16`, `i64.32`.
+fn atomic_slot(ty: Ty, sz: MemSz) -> u32 {
+    match (ty, sz) {
+        (Ty::I32, MemSz::B4) => 0,
+        (Ty::I64, MemSz::B8) => 1,
+        (Ty::I32, MemSz::B1) => 2,
+        (Ty::I32, MemSz::B2) => 3,
+        (Ty::I64, MemSz::B1) => 4,
+        (Ty::I64, MemSz::B2) => 5,
+        (Ty::I64, MemSz::B4) => 6,
+        // A 32-bit value with an 8-byte access cannot occur; treat it as the
+        // widest i32 form so the mapping stays total.
+        (Ty::I32, MemSz::B8) => 0,
+    }
+}
+
+fn atomic_load_op(ty: Ty, sz: MemSz) -> u32 {
+    0x10 + atomic_slot(ty, sz)
+}
+
+fn atomic_store_op(ty: Ty, sz: MemSz) -> u32 {
+    0x17 + atomic_slot(ty, sz)
+}
+
+fn atomic_rmw_op(op: RmwOp, ty: Ty, sz: MemSz) -> u32 {
+    let base = match op {
+        RmwOp::Add => 0x1e,
+        RmwOp::Sub => 0x25,
+        RmwOp::And => 0x2c,
+        RmwOp::Or => 0x33,
+        RmwOp::Xor => 0x3a,
+        RmwOp::Xchg => 0x41,
+    };
+    base + atomic_slot(ty, sz)
+}
+
+fn atomic_cmpxchg_op(ty: Ty, sz: MemSz) -> u32 {
+    0x48 + atomic_slot(ty, sz)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_groups_are_seven_wide() {
+        assert_eq!(atomic_rmw_op(RmwOp::Add, Ty::I32, MemSz::B4), 0x1e);
+        assert_eq!(atomic_rmw_op(RmwOp::Add, Ty::I64, MemSz::B4), 0x24);
+        assert_eq!(atomic_rmw_op(RmwOp::Sub, Ty::I32, MemSz::B4), 0x25);
+        assert_eq!(atomic_cmpxchg_op(Ty::I64, MemSz::B8), 0x49);
+    }
+
+    #[test]
+    fn integer_opcodes_match_the_spec() {
+        assert_eq!(bin_op(BinOp::Add, Ty::I32), 0x6a);
+        assert_eq!(bin_op(BinOp::Add, Ty::I64), 0x7c);
+        assert_eq!(bin_op(BinOp::Rotr, Ty::I64), 0x8a);
+        assert_eq!(cmp_op(CmpOp::Eq, Ty::I64), 0x51);
+        assert_eq!(cmp_op(CmpOp::GeU, Ty::I64), 0x5a);
+    }
+
+    #[test]
+    fn dispatch_slots_reject_misaligned_and_out_of_range() {
+        assert_eq!(dispatch_slot(0x1000, 0x1000, 16), Some(0));
+        assert_eq!(dispatch_slot(0x1004, 0x1000, 16), Some(1));
+        assert_eq!(dispatch_slot(0x1002, 0x1000, 16), None);
+        assert_eq!(dispatch_slot(0x1040, 0x1000, 16), None);
+        assert_eq!(dispatch_slot(0x0ffc, 0x1000, 16), None);
+    }
+}

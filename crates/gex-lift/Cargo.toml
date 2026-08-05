@@ -1,7 +1,11 @@
 [package]
-name="gex-lift"
-version.workspace=true
-edition.workspace=true
-license.workspace=true
+name = "gex-lift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AArch64 -> GIR instruction semantics"
 
 [dependencies]
+gex-isa.workspace = true
+gex-ir.workspace = true
+gex-abi.workspace = true

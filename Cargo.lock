@@ -3,8 +3,16 @@
 version = 4
 
 [[package]]
+name = "gex-abi"
+version = "0.0.1"
+
+[[package]]
 name = "gex-emit"
 version = "0.0.1"
+dependencies = [
+ "gex-abi",
+ "gex-ir",
+]
 
 [[package]]
 name = "gex-ir"
@@ -21,10 +29,18 @@ version = "0.0.1"
 [[package]]
 name = "gex-ld"
 version = "0.0.1"
+dependencies = [
+ "gex-abi",
+]
 
 [[package]]
 name = "gex-lift"
 version = "0.0.1"
+dependencies = [
+ "gex-abi",
+ "gex-ir",
+ "gex-isa",
+]
 
 [[package]]
 name = "gex-native"

@@ -1,0 +1,8 @@
+[package]
+name = "gex-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared layout contract between gex's compiler, kernel and runtime"
+
+[dependencies]

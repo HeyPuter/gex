@@ -1,7 +1,9 @@
 [package]
-name="gex-ld"
-version.workspace=true
-edition.workspace=true
-license.workspace=true
+name = "gex-ld"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "gex dynamic loader: ELF images, relocations, process layout"
 
 [dependencies]
+gex-abi.workspace = true

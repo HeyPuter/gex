@@ -1,7 +1,10 @@
 [package]
-name="gex-emit"
-version.workspace=true
-edition.workspace=true
-license.workspace=true
+name = "gex-emit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GIR -> WebAssembly code generation and .gexm packaging"
 
 [dependencies]
+gex-abi.workspace = true
+gex-ir.workspace = true
