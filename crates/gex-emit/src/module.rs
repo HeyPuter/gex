@@ -52,6 +52,19 @@ pub struct TranslatedModule {
     pub exported_blocks: Vec<(u64, String)>,
 }
 
+impl TranslatedModule {
+    /// The part of this translation a cached module still needs.
+    pub fn metadata(&self) -> Metadata {
+        Metadata {
+            text_base: self.text_base,
+            table_slots: self.table_slots,
+            dir_entries: self.dir_entries.clone(),
+            next_slot: self.page_table.slots(),
+            n_blocks: self.n_blocks,
+        }
+    }
+}
+
 /// Global assignment of guest pages to dispatch-table slots.
 ///
 /// This has to be process-wide, not per-module: a page's directory entry is a
@@ -92,6 +105,107 @@ impl PageTable {
     /// Total slots allocated so far.
     pub fn slots(&self) -> u64 {
         self.next_slot
+    }
+
+    /// Rebuild an assignment from the entries a previous run recorded.
+    ///
+    /// Used when a cached module is loaded instead of translated: the pages it
+    /// claimed have to keep the same bases, because the directory entries the
+    /// host is about to publish name them.
+    pub fn from_entries(entries: &[(u64, u32)], next_slot: u64) -> PageTable {
+        PageTable {
+            pages: entries.iter().copied().collect(),
+            next_slot,
+        }
+    }
+}
+
+/// What the host needs from a translation besides the wasm itself.
+///
+/// Small enough to sit beside a cached module, which is the point: on a cache
+/// hit the translation is skipped entirely, and this is everything that would
+/// otherwise have to be recomputed to set up dispatch.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Metadata {
+    pub text_base: u64,
+    pub table_slots: u64,
+    pub dir_entries: Vec<(u64, u32)>,
+    /// The page table's high-water mark, so runtime translation carries on
+    /// allocating where this left off.
+    pub next_slot: u64,
+    pub n_blocks: usize,
+}
+
+impl Metadata {
+    /// A compact little-endian encoding. Hand-rolled because the alternative
+    /// is a serialisation dependency for five fields.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(40 + self.dir_entries.len() * 12);
+        v.extend_from_slice(&METADATA_MAGIC.to_le_bytes());
+        v.extend_from_slice(&self.text_base.to_le_bytes());
+        v.extend_from_slice(&self.table_slots.to_le_bytes());
+        v.extend_from_slice(&self.next_slot.to_le_bytes());
+        v.extend_from_slice(&(self.n_blocks as u64).to_le_bytes());
+        v.extend_from_slice(&(self.dir_entries.len() as u64).to_le_bytes());
+        for (page, base) in &self.dir_entries {
+            v.extend_from_slice(&page.to_le_bytes());
+            v.extend_from_slice(&base.to_le_bytes());
+        }
+        v
+    }
+
+    /// Decode, returning `None` for anything that is not exactly this format.
+    ///
+    /// A caller that gets `None` should treat the cache entry as absent; the
+    /// sidecar is only ever written by gex, so the check is against corruption
+    /// and version skew rather than a hostile input.
+    pub fn decode(bytes: &[u8]) -> Option<Metadata> {
+        let mut r = Reader { b: bytes, at: 0 };
+        if r.u64()? != METADATA_MAGIC {
+            return None;
+        }
+        let text_base = r.u64()?;
+        let table_slots = r.u64()?;
+        let next_slot = r.u64()?;
+        let n_blocks = r.u64()? as usize;
+        let count = r.u64()?;
+        let mut dir_entries = Vec::with_capacity(count.min(1 << 20) as usize);
+        for _ in 0..count {
+            dir_entries.push((r.u64()?, r.u32()?));
+        }
+        // Trailing bytes mean this is not the file we think it is.
+        if r.at != bytes.len() {
+            return None;
+        }
+        Some(Metadata {
+            text_base,
+            table_slots,
+            dir_entries,
+            next_slot,
+            n_blocks,
+        })
+    }
+}
+
+/// Bumped whenever the encoding changes, so an old sidecar is rejected.
+const METADATA_MAGIC: u64 = 0x6765785f6d657431; // "gex_met1"
+
+struct Reader<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl Reader<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let s = self.b.get(self.at..self.at + n)?;
+        self.at += n;
+        Some(s)
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 }
 

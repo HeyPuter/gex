@@ -67,37 +67,67 @@ pub fn key<'a>(fields: impl IntoIterator<Item = &'a [u8]>) -> String {
 /// A compiled module, either loaded from the cache or freshly built.
 pub struct Loaded {
     pub module: Module,
+    /// Whatever the caller stored alongside it.
+    pub metadata: Vec<u8>,
     /// True when the compile was skipped.
     pub hit: bool,
 }
 
-/// Get the compiled form of `wasm`, using `dir` as the cache.
+/// Get the compiled form of a translation, using `dir` as the cache.
+///
+/// `build` is called only on a miss, and returns the wasm together with
+/// whatever the caller needs to remember about the translation. That is the
+/// reason for the closure: translating is over a second on a large program,
+/// and a hit should not pay it.
 ///
 /// A cache that cannot be read or written is not an error: the module is
 /// compiled and the run proceeds. That matters for a read-only home directory
 /// and for two gex processes racing on the same entry.
-pub fn load_or_compile(engine: &Engine, dir: &Path, key: &str, wasm: &[u8]) -> Result<Loaded> {
+pub fn load_or_compile(
+    engine: &Engine,
+    dir: &Path,
+    key: &str,
+    build: impl FnOnce() -> Result<(Vec<u8>, Vec<u8>)>,
+) -> Result<Loaded> {
     let path = dir.join(format!("{key}.cwasm"));
-    if let Ok(bytes) = std::fs::read(&path) {
+    let meta_path = dir.join(format!("{key}.meta"));
+    // Both halves must be present: a module without its metadata says nothing
+    // about where its dispatch pages went.
+    if let (Ok(bytes), Ok(metadata)) = (std::fs::read(&path), std::fs::read(&meta_path)) {
         // SAFETY: see the module comment. `deserialize` additionally rejects
         // an artifact that does not match this engine, so a stale or truncated
         // file produces an error rather than bad code -- which is why the
-        // failure path below simply recompiles.
+        // failure path below simply rebuilds.
         match unsafe { Module::deserialize(engine, &bytes) } {
-            Ok(module) => return Ok(Loaded { module, hit: true }),
+            Ok(module) => {
+                return Ok(Loaded {
+                    module,
+                    metadata,
+                    hit: true,
+                })
+            }
             Err(_) => {
                 // Unusable: drop it so the next run does not pay to find out
                 // again. Failing to remove it is not worth reporting.
                 let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(&meta_path);
             }
         }
     }
 
-    let module = Module::new(engine, wasm).context("validating translated wasm")?;
+    let (wasm, metadata) = build()?;
+    let module = Module::new(engine, &wasm).context("validating translated wasm")?;
     if let Ok(serialized) = module.serialize() {
+        // Metadata first: a reader requires both, so the module's arrival is
+        // what publishes the entry.
+        store(dir, &meta_path, &metadata);
         store(dir, &path, &serialized);
     }
-    Ok(Loaded { module, hit: false })
+    Ok(Loaded {
+        module,
+        metadata,
+        hit: false,
+    })
 }
 
 /// Write an artifact, atomically enough that a concurrent reader never sees a
@@ -148,13 +178,30 @@ mod tests {
 
         let engine = Engine::default();
         // The smallest valid module.
-        let wasm = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
-        let loaded = load_or_compile(&engine, &dir, k, &wasm).unwrap();
+        let build = || Ok((vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00], b"meta".to_vec()));
+        let loaded = load_or_compile(&engine, &dir, k, build).unwrap();
         assert!(!loaded.hit, "a corrupt entry must not count as a hit");
+        assert_eq!(loaded.metadata, b"meta");
 
-        // And the freshly stored one is usable.
-        let again = load_or_compile(&engine, &dir, k, &wasm).unwrap();
+        // And the freshly stored one is usable, without rebuilding.
+        let again = load_or_compile(&engine, &dir, k, || panic!("must not rebuild")).unwrap();
         assert!(again.hit, "the store should have replaced it");
+        assert_eq!(again.metadata, b"meta");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_module_without_its_metadata_is_not_a_hit() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-half-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let k = "halfentry";
+        let engine = Engine::default();
+        let build = || Ok((vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00], b"m".to_vec()));
+        load_or_compile(&engine, &dir, k, build).unwrap();
+        std::fs::remove_file(dir.join(format!("{k}.meta"))).unwrap();
+
+        let again = load_or_compile(&engine, &dir, k, build).unwrap();
+        assert!(!again.hit, "half an entry must not be used");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

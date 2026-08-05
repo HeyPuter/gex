@@ -189,23 +189,6 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
 /// Run a program, which may carry a dynamic linker alongside it.
 pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
     let image = &program.exe;
-    // Only the executable is translated ahead of time. The interpreter and
-    // everything it maps arrive through runtime translation, which is both
-    // simpler and correct: at build time we do not know where they land.
-    let (module_bytes, stats) = gex_xlate::translate_image(image, xlate);
-    if opts.verbose {
-        eprintln!(
-            "[gex] translated {} blocks / {} instructions -> {} KiB wasm ({} dispatch slots, \
-             {} entry points from data, {} untranslatable blocks, {} dead flag statements)",
-            stats.blocks,
-            stats.instructions,
-            stats.wasm_bytes / 1024,
-            module_bytes.table_slots,
-            stats.discovered_from_data,
-            stats.illegal_blocks,
-            stats.dead_flag_stmts,
-        );
-    }
 
     let phase = std::time::Instant::now();
     let mut config = Config::new();
@@ -227,14 +210,48 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     });
     let engine = Engine::new(&config).context("creating the wasm engine")?;
 
-    // Compiling the translated wasm is the bulk of startup on a large
-    // program, and it produces the same machine code every time. The key
-    // covers the guest image and the translation options; the engine's own
-    // configuration is checked by wasmtime when the artifact is loaded.
-    let module = match opts.cache.then(gex_cache::cache_dir).flatten() {
+    // Only the executable is translated ahead of time. The interpreter and
+    // everything it maps arrive through runtime translation, which is both
+    // simpler and correct: at build time we do not know where they land.
+    //
+    // Translation happens inside the cache's miss path, so a hit skips it
+    // outright -- on SQLite that is another second and a half. The `stats`
+    // a hit reports are therefore empty apart from the block count the
+    // sidecar carries, because nothing recomputed them.
+    let mut stats = Stats::default();
+    let translate = || {
+        let (m, s) = gex_xlate::translate_image(image, xlate);
+        if opts.verbose {
+            eprintln!(
+                "[gex] translated {} blocks / {} instructions -> {} KiB wasm ({} dispatch \
+                 slots, {} entry points from data, {} untranslatable blocks, {} dead flag \
+                 statements)",
+                s.blocks,
+                s.instructions,
+                s.wasm_bytes / 1024,
+                m.table_slots,
+                s.discovered_from_data,
+                s.illegal_blocks,
+                s.dead_flag_stmts,
+            );
+        }
+        (m, s)
+    };
+
+    let (module, meta) = match opts.cache.then(gex_cache::cache_dir).flatten() {
         Some(dir) => {
             let key = cache_key(image, xlate);
-            let loaded = gex_cache::load_or_compile(&engine, &dir, &key, &module_bytes.wasm)?;
+            let mut built: Option<Stats> = None;
+            let loaded = gex_cache::load_or_compile(&engine, &dir, &key, || {
+                let (m, s) = translate();
+                built = Some(s);
+                Ok((m.wasm.clone(), m.metadata().encode()))
+            })?;
+            if let Some(s) = built {
+                stats = s;
+            }
+            let meta = gex_xlate::Metadata::decode(&loaded.metadata)
+                .ok_or_else(|| anyhow!("cached module metadata is unreadable"))?;
             if opts.verbose {
                 eprintln!(
                     "[gex] compiled module {} ({})",
@@ -242,10 +259,21 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
                     dir.join(format!("{key}.cwasm")).display()
                 );
             }
-            loaded.module
+            (loaded.module, meta)
         }
-        None => Module::new(&engine, &module_bytes.wasm).context("validating translated wasm")?,
+        None => {
+            let (m, s) = translate();
+            stats = s;
+            let meta = m.metadata();
+            (
+                Module::new(&engine, &m.wasm).context("validating translated wasm")?,
+                meta,
+            )
+        }
     };
+    if stats.blocks == 0 {
+        stats.blocks = meta.n_blocks;
+    }
     if opts.verbose {
         eprintln!("[gex] module ready in {:.2}s", phase.elapsed().as_secs_f64());
     }
@@ -327,7 +355,7 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
             engine: engine.clone(),
             linker: linker.clone(),
             table,
-                page_table: module_bytes.page_table.clone(),
+                page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
             translated: Default::default(),
             modules: Vec::new(),
             limits: xlate.limits,
@@ -352,7 +380,7 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     // blocks are reachable through the table.
     {
         let data = memory.data_mut(&mut store);
-        for (page, base) in &module_bytes.dir_entries {
+        for (page, base) in &meta.dir_entries {
             let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
             if off + 4 <= data.len() {
                 data[off..off + 4].copy_from_slice(&base.to_le_bytes());

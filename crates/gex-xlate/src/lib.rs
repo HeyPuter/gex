@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 use gex_emit::module::Linkage;
+pub use gex_emit::module::Metadata;
 pub use gex_emit::PageTable;
 use gex_emit::{ModuleBuilder, TranslatedModule};
 use gex_ir::{pass, Block, Term};
