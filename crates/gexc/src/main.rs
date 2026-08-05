@@ -271,6 +271,12 @@ fn cmd_build(args: &[String]) -> Result<()> {
             );
         }
     }
+    let (regions, in_regions) = gex_emit::tier1::REGIONS.with(|c| c.get());
+    if regions > 0 {
+        eprintln!(
+            "{out}: {regions} loops emitted as one function each, {in_regions} blocks in them"
+        );
+    }
     if stats.illegal_blocks > 0 {
         eprintln!(
             "{out}: {} blocks end in an instruction gex cannot execute yet; \

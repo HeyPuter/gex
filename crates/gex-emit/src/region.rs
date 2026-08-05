@@ -47,6 +47,9 @@ pub fn grow(entry: u64, gir: &HashMap<u64, &Block>, limit: usize) -> Option<Regi
     };
 
     member(entry)?;
+
+    // Everything reachable from the entry, bounded. This is a superset of
+    // the loop: it runs on past the exits into whatever follows.
     let mut order = vec![entry];
     let mut seen: HashSet<u64> = HashSet::from([entry]);
     let mut i = 0;
@@ -67,14 +70,63 @@ pub fn grow(entry: u64, gir: &HashMap<u64, &Block>, limit: usize) -> Option<Regi
         i += 1;
     }
 
-    // A back edge into the region is what makes it a loop. Without one this
-    // is a tree of straight-line code and inlining it buys a tail call.
-    let looping = order.iter().any(|a| {
-        member(*a)
-            .map(|b| b.successors().any(|s| s <= *a && seen.contains(&s)))
-            .unwrap_or(false)
-    });
-    if !looping || order.len() < 2 {
+    // Narrow it to the loop: the blocks that can get back to the entry
+    // without leaving the set. Anything else is code after an exit, and
+    // pulling that in both duplicates it and drags in its own loops -- which
+    // is what makes a region containing more than one loop, the shape this
+    // deliberately does not form.
+    let mut in_loop: HashSet<u64> = HashSet::new();
+    loop {
+        let mut grew = false;
+        for a in &order {
+            if in_loop.contains(a) {
+                continue;
+            }
+            let Some(b) = member(*a) else { continue };
+            if b.successors()
+                .any(|s| s == entry || (in_loop.contains(&s) && s != *a))
+            {
+                in_loop.insert(*a);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    in_loop.insert(entry);
+    order.retain(|a| in_loop.contains(a));
+    let seen = in_loop;
+
+    // Exactly one loop, and it goes through the entry.
+    //
+    // A back edge is what makes this worth forming at all: without one it is
+    // a tree of straight-line code, and folding that buys one tail call and
+    // duplicates the blocks.
+    //
+    // Requiring the only one to reach the entry is what makes it safe to poll
+    // for signals and thread switches there alone. A guest that could cycle
+    // inside the region without passing through the entry would otherwise
+    // spin without ever reaching a poll -- and polling at the inner back
+    // edges instead is what does not work: a guest thread the browser
+    // preempts there comes back through the member's own function holding
+    // another thread's registers. Where that goes wrong is not yet
+    // understood, so a region stays out of the situation by construction.
+    let mut to_entry = false;
+    for a in &order {
+        let Some(b) = member(*a) else { continue };
+        for s in b.successors() {
+            if !seen.contains(&s) || s > *a {
+                continue;
+            }
+            if s == entry {
+                to_entry = true;
+            } else {
+                return None;
+            }
+        }
+    }
+    if !to_entry || order.len() < 2 {
         return None;
     }
     Some(order)

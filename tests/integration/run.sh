@@ -305,6 +305,10 @@ echo "building guest programs..."
 # get right -- a condition set in one block and consumed in another -- are
 # ones a compiler almost never emits.
 "$CC" -nostdlib -static -no-pie -o "$WORK/flags" "$HERE/programs/flags.S"
+# Loops of every shape, reduced to one number each. The rest of the suite is
+# mostly straight-line, which left changes to loop translation able to pass
+# everything here and still lose rows in SQLite.
+"$CC" -O2 -static -o "$WORK/loops" "$HERE/programs/loops.c"
 # Inline assembly, because the fixed-point conversions have no C spelling.
 "$CC" -static -no-pie -O2 -o "$WORK/fixedpoint" "$HERE/programs/fixedpoint.c"
 # Every result this prints is order-independent, so the comparison is of the
@@ -376,6 +380,7 @@ compare "vector-pie" "$WORK/vector-pie"
 compare "numeric" "$WORK/numeric"
 compare "neon-structure" "$WORK/neon2"
 compare "cross-block-flags" "$WORK/flags"
+compare "loops" "$WORK/loops"
 compare "fixed-point" "$WORK/fixedpoint"
 
 # The same modules on V8. Everything here is single-threaded and static: the
@@ -393,6 +398,7 @@ browser "fixedpoint" "$WORK/fixedpoint"
 browser "vector" "$WORK/vector"
 browser "neon-structure" "$WORK/neon2"
 browser "cross-block-flags" "$WORK/flags"
+browser "loops" "$WORK/loops"
 for area in arith float mem flow sys; do
     browser "suite-$area" "$WORK/suite" "$area"
 done
@@ -449,6 +455,7 @@ done
 compare "nojit-vector" "$WORK/vector"
 compare "nojit-neon-structure" "$WORK/neon2"
 compare "nojit-cross-block-flags" "$WORK/flags"
+compare "nojit-loops" "$WORK/loops"
 compare "nojit-fixed-point" "$WORK/fixedpoint"
 compare "nojit-threads" "$WORK/threads"
 GEXC_ARGS=""

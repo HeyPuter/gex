@@ -110,10 +110,8 @@ pub struct Context<'a> {
 
 /// How many blocks may go into one region. One means off.
 ///
-/// Off by default: regions are correct under the native host at every size
-/// tried and correct in the browser single-threaded, but a guest thread
-/// preempted inside one comes back with two callee-saved registers holding
-/// another thread's values. See [`Emitter::run_region`].
+/// Off by default: a region still miscompiles something. See
+/// [`Emitter::run_region`].
 fn region_limit() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -131,7 +129,13 @@ fn region_limit() -> usize {
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx);
     match crate::region::grow(block.start, cx.gir, region_limit()) {
-        Some(region) if region_limit() > 1 => e.run_region(&region),
+        Some(region) if region_limit() > 1 => {
+            REGIONS.with(|c| {
+                let (n, b) = c.get();
+                c.set((n + 1, b + region.len()))
+            });
+            e.run_region(&region)
+        }
         _ => e.run(block),
     }
     e.f.finish()
@@ -228,19 +232,20 @@ impl<'a> Emitter<'a> {
     ///
     /// # Not finished
     ///
-    /// Off by default (`GEX_REGION`). Two facts about a region make it
-    /// awkward, and both are handled: which registers are *dirty* depends on
-    /// the order the emitter walked the members, while control reaches them
-    /// in whatever order the guest branches, so every exit writes all of them
-    /// rather than the dirty ones; and the safepoint is a barrier in both
-    /// directions, because the host can change the context there.
+    /// Off by default (`GEX_REGION`). Two order-dependence hazards a region
+    /// has are handled: which registers are *dirty* follows the order the
+    /// emitter walked the members while control does not, so every exit
+    /// writes all of them; and the safepoint is a barrier in both directions,
+    /// because the host can change the context there. A third is avoided by
+    /// construction -- a region holds exactly one loop, through its entry, so
+    /// the poll at that entry is on every cycle and a guest thread is never
+    /// preempted at an inner back edge, which resumed through the member's
+    /// own function holding another thread's registers.
     ///
-    /// What is left is a guest thread preempted inside a region on the
-    /// browser host. It resumes at a member's address, through that member's
-    /// own standalone function, and comes back with x20 and x27 holding
-    /// values from another thread's context. Native threads are fine at every
-    /// size tried, and so is the browser with preemption turned off, so it is
-    /// something about resuming a region member rather than about regions.
+    /// Something else is still wrong. With regions on, SQLite inserts
+    /// 299,994 rows out of 300,000 and nbench does not finish, while the
+    /// whole integration suite passes -- which is why `programs/loops.c`
+    /// exists now. It reproduces in seconds and is the place to start.
     fn run_region(&mut self, region: &[u64]) {
         let n = region.len();
         let index: HashMap<u64, u32> = region
@@ -357,7 +362,9 @@ impl<'a> Emitter<'a> {
         match st.index.get(&target).copied() {
             Some(k) => {
                 let (idx_local, depth) = (st.idx_local, st.depth);
-                if target <= from {
+                // The region's only back edge goes to its entry, by
+                // construction, so this is the poll for the whole loop.
+                if k == 0 && target <= from {
                     self.emit_safepoint(target);
                 }
                 self.f.i32_const(k as i32);
@@ -1614,6 +1621,8 @@ fn lane_shift_op(op: VShiftOp, lane: VLane) -> u32 {
 }
 
 thread_local! {
+    /// Regions formed, and how many blocks went into them.
+    pub static REGIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     /// Bytes emitted moving guest registers between the context and locals.
     /// That traffic is the price of a block boundary, and `gexc build`
     /// reports it as a share of the module.
