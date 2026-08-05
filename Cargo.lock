@@ -245,6 +245,14 @@ name = "gex-abi"
 version = "0.0.1"
 
 [[package]]
+name = "gex-cache"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "wasmtime",
+]
+
+[[package]]
 name = "gex-difffuzz"
 version = "0.0.1"
 dependencies = [
@@ -296,6 +304,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "gex-abi",
+ "gex-cache",
  "gex-kernel",
  "gex-ld",
  "gex-lift",

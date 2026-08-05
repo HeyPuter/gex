@@ -1,0 +1,8 @@
+[package]
+name = "gex-cache"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }

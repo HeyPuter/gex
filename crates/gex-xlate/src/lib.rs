@@ -44,6 +44,14 @@ pub struct Options {
     /// for a deployment that must not compile code later, and as a way to
     /// isolate a suspected runtime-translation bug.
     pub exhaustive: bool,
+    /// Seed discovery from the entry point alone, ignoring the symbol table.
+    ///
+    /// Ahead-of-time discovery is thorough, and on a large program that is the
+    /// wrong trade: it hands the host a module with tens of thousands of
+    /// functions to compile, most of which the run will never enter. Runtime
+    /// translation reaches everything anyway, so this makes the up-front
+    /// module small and lets execution pull in the rest.
+    pub lazy: bool,
 }
 
 impl Default for Options {
@@ -55,6 +63,7 @@ impl Default for Options {
             // Off by default now that runtime translation covers the gaps;
             // still available for a build that must not translate later.
             exhaustive: false,
+            lazy: false,
         }
     }
 }
@@ -212,9 +221,11 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     let mut collected: Vec<Block> = Vec::new();
 
     worklist.insert(image.entry);
-    for sym in &image.symbols {
-        if view.is_executable(sym.value) && sym.value % 4 == 0 {
-            worklist.insert(sym.value);
+    if !opts.lazy {
+        for sym in &image.symbols {
+            if view.is_executable(sym.value) && sym.value % 4 == 0 {
+                worklist.insert(sym.value);
+            }
         }
     }
     for &a in &opts.extra_entries {
@@ -222,7 +233,7 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
             worklist.insert(a);
         }
     }
-    if opts.scan_pointers {
+    if opts.scan_pointers && !opts.lazy {
         let before = worklist.len();
         for seg in &image.segments {
             for (i, chunk) in seg.bytes.chunks_exact(8).enumerate() {

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/gex-abi",
+    "crates/gex-cache",
     "crates/gex-isa",
     "crates/gex-ir",
     "crates/gex-lift",
@@ -23,6 +24,7 @@ repository = "https://github.com/puter/gex"
 
 [workspace.dependencies]
 gex-abi = { path = "crates/gex-abi" }
+gex-cache = { path = "crates/gex-cache" }
 gex-isa = { path = "crates/gex-isa" }
 gex-ir = { path = "crates/gex-ir" }
 gex-lift = { path = "crates/gex-lift" }

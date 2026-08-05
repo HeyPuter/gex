@@ -63,7 +63,10 @@ run options:
   --env K=V       add an environment variable (repeatable)
   --sysroot DIR   present DIR as the guest's root filesystem
   --exhaustive    translate every decodable text address ahead of time
-  --no-jit        no runtime translation; implies --exhaustive"
+  --no-jit        no runtime translation; implies --exhaustive
+  --lazy          discover only from the entry point, leaving the rest to
+                  runtime translation; much faster to start on a big binary
+  --no-cache      do not reuse compiled modules between runs"
     );
 }
 
@@ -85,6 +88,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     // when it is turned off.
     let mut exhaustive = false;
     let mut no_jit = false;
+    let mut lazy = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -104,6 +108,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 opts.sysroot = Some(v.into());
             }
             "--no-jit" => no_jit = true,
+            "--lazy" => lazy = true,
+            "--no-cache" => opts.cache = false,
             "--env" => {
                 i += 1;
                 let v = args.get(i).context("--env needs an argument")?;
@@ -121,6 +127,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
         opts,
         xlate: Options {
             exhaustive: exhaustive || no_jit,
+            lazy: lazy && !no_jit,
             ..Options::default()
         },
         jit: !no_jit,

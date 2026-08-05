@@ -175,6 +175,16 @@ consistent one:
 $ tests/integration/run.sh
 ```
 
+**A real program.** SQLite 3.45 built for aarch64-linux-musl — 285k lines of
+C, 290k guest instructions, FTS5 and JSON1 and R-Tree compiled in — runs a
+script covering recursive CTEs, indexes, joins, full-text search, JSON
+extraction, a transaction and its rollback, and `ANALYZE`. Output is identical
+to QEMU's, and with `randomblob` replaced by `zeroblob` so the run is
+deterministic, the 1.4 MB database file the two engines produce is byte-for-byte
+the same. Of its 281,189 instructions the disassembler reproduces 281,186
+exactly; the three it does not are two fixed-point converts and a scalar shift,
+none of them on any path the run takes.
+
 **Cross-engine, on V8.** The native host runs on wasmtime; the browser target
 is V8. Tail calls are load-bearing enough that a difference between the two
 engines would invalidate the design, so the *same* module `gexc build`
@@ -216,6 +226,43 @@ is only 8-10x — is already inside the band set for tier-2. The startup cost is
 the other half of the story: it is almost entirely wasmtime compiling the
 thousands of functions exhaustive discovery produces, and it is what the
 content-addressed translation cache and runtime translation exist to remove.
+
+### Startup: the compiled-module cache
+
+Translating a program to wasm is cheap. Compiling that wasm is not, and on a
+large program it is nearly all of startup:
+
+| SQLite 3.45 (285k lines of C, 290k guest instructions) | |
+|---|---|
+| gex translates it to 14 MB of wasm | 1.8 s |
+| Cranelift compiles that | ~31 s |
+| everything else (instantiate, place the guest, run `select 1`) | < 0.1 s |
+
+The compiled code is the same on every run of the same binary, so it is kept.
+The key is a SHA-256 over the *placed* segments, where they were placed, and
+the translation options — the placed image rather than the file, because that
+is what the translator reads. wasmtime checks engine compatibility itself when
+the artifact is loaded, so the key does not have to cover it, and an artifact
+it rejects is deleted and rebuilt rather than being an error.
+
+```console
+$ gexc run sqlite3 :memory: 'select 1;'    # first time
+35.1 s
+$ gexc run sqlite3 :memory: 'select 1;'    # thereafter
+7.3 s
+```
+
+The residue is gex's own 1.8 s of translation, which still runs on a hit
+because the host needs the dispatch metadata that comes with it, plus runtime
+translation of what static discovery missed. `--no-cache` turns it off;
+`--lazy` is the other end of the same trade, discovering only from the entry
+point and leaving everything else to runtime translation — 33 s to 9.5 s on a
+cold cache, and the right choice for a one-shot run.
+
+Deserialising a compiled module is `unsafe`: the bytes become executable code
+with only a header check in the way. That is why `gex-cache` is a crate of its
+own — the host forbids `unsafe`, and this is the one place the argument has to
+be made and written down.
 
 ### Two tier-1 optimisations
 

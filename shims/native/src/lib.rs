@@ -62,7 +62,7 @@ pub mod signal {
 }
 
 /// Options for a native run.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RunOptions {
     pub args: Vec<String>,
     pub env: Vec<String>,
@@ -76,6 +76,25 @@ pub struct RunOptions {
     /// Translate code on demand when a branch reaches an address with no
     /// translation.
     pub jit: bool,
+    /// Reuse compiled modules across runs (PLAN §10).
+    pub cache: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        RunOptions {
+            args: Vec::new(),
+            env: Vec::new(),
+            trace: false,
+            verbose: false,
+            sysroot: None,
+            jit: false,
+            // On by default: it is the difference between half a minute and
+            // half a second on a program the size of SQLite, and a cache miss
+            // costs only the write.
+            cache: true,
+        }
+    }
 }
 
 /// Host-side state threaded through every import.
@@ -130,6 +149,31 @@ impl std::fmt::Display for StopExecution {
 
 impl std::error::Error for StopExecution {}
 
+/// The cache key for an image: everything that determines the wasm.
+///
+/// The *placed* segments rather than the file, because that is what the
+/// translator reads -- two builds of the same program that differ only in a
+/// section the loader drops should share an entry, and the same file loaded at
+/// a different bias must not.
+fn cache_key(image: &Image, xlate: &Options) -> String {
+    let mut fields: Vec<Vec<u8>> = vec![
+        image.bias.to_le_bytes().into(),
+        image.entry.to_le_bytes().into(),
+        image.text_range.0.to_le_bytes().into(),
+        image.text_range.1.to_le_bytes().into(),
+        format!("{xlate:?}").into_bytes(),
+        // Symbols steer discovery, so two images with the same code but
+        // different symbol tables translate differently.
+        (image.symbols.len() as u64).to_le_bytes().into(),
+    ];
+    for seg in &image.segments {
+        fields.push(seg.vaddr.to_le_bytes().into());
+        fields.push(vec![seg.executable as u8]);
+        fields.push(seg.bytes.clone());
+    }
+    gex_cache::key(fields.iter().map(|f| f.as_slice()))
+}
+
 /// Build, instantiate and run a guest image to completion.
 pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
     run_program(
@@ -163,15 +207,49 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
         );
     }
 
+    let phase = std::time::Instant::now();
     let mut config = Config::new();
     // Tail calls are load-bearing: the whole block-per-function design in
     // PLAN §2.4 depends on them.
     config.wasm_tail_call(true);
     config.wasm_threads(true);
     config.wasm_bulk_memory(true);
+    // gex's own output is already the optimised form -- the register cache,
+    // dead-flag elimination and loop fusion have run. What Cranelift adds on
+    // top is register allocation and peepholes, and on a large program the
+    // time it takes to add them dominates everything else: a 14 MB module out
+    // of SQLite costs half a minute to compile and under two seconds to
+    // translate. `GEX_OPT_LEVEL` picks the trade.
+    config.cranelift_opt_level(match std::env::var("GEX_OPT_LEVEL").as_deref() {
+        Ok("none") => wasmtime::OptLevel::None,
+        Ok("speed_and_size") => wasmtime::OptLevel::SpeedAndSize,
+        _ => wasmtime::OptLevel::Speed,
+    });
     let engine = Engine::new(&config).context("creating the wasm engine")?;
 
-    let module = Module::new(&engine, &module_bytes.wasm).context("validating translated wasm")?;
+    // Compiling the translated wasm is the bulk of startup on a large
+    // program, and it produces the same machine code every time. The key
+    // covers the guest image and the translation options; the engine's own
+    // configuration is checked by wasmtime when the artifact is loaded.
+    let module = match opts.cache.then(gex_cache::cache_dir).flatten() {
+        Some(dir) => {
+            let key = cache_key(image, xlate);
+            let loaded = gex_cache::load_or_compile(&engine, &dir, &key, &module_bytes.wasm)?;
+            if opts.verbose {
+                eprintln!(
+                    "[gex] compiled module {} ({})",
+                    if loaded.hit { "from cache" } else { "cached" },
+                    dir.join(format!("{key}.cwasm")).display()
+                );
+            }
+            loaded.module
+        }
+        None => Module::new(&engine, &module_bytes.wasm).context("validating translated wasm")?,
+    };
+    if opts.verbose {
+        eprintln!("[gex] module ready in {:.2}s", phase.elapsed().as_secs_f64());
+    }
+    let phase = std::time::Instant::now();
 
     let ctx_addr = gex_abi::ctx_addr(0);
     // `/proc/self/exe` is the resolved program, not argv[0]: a shell that
@@ -223,6 +301,13 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     let instance = linker
         .instantiate(&mut store, &module)
         .context("instantiating the translated module")?;
+    if opts.verbose {
+        eprintln!(
+            "[gex] instantiated in {:.2}s",
+            phase.elapsed().as_secs_f64()
+        );
+    }
+    let phase = std::time::Instant::now();
 
     let memory = match instance.get_export(&mut store, exports::MEMORY) {
         Some(Extern::Memory(m)) => m,
@@ -275,6 +360,10 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
         }
     }
 
+    if opts.verbose {
+        eprintln!("[gex] guest state placed in {:.2}s", phase.elapsed().as_secs_f64());
+    }
+    let phase = std::time::Instant::now();
     let enter = instance
         .get_func(&mut store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
