@@ -64,6 +64,12 @@ pub const HWCAP: u64 = {
 pub struct Identity {
     pub uid: u32,
     pub gid: u32,
+    /// Load bias of the dynamic linker, or zero for a static program.
+    ///
+    /// The interpreter reads `AT_BASE` to locate its own relocations; a
+    /// static image must see zero, which is how libc decides no interpreter
+    /// ran.
+    pub interp_base: u64,
 }
 
 impl Default for Identity {
@@ -71,6 +77,7 @@ impl Default for Identity {
         Identity {
             uid: 1000,
             gid: 1000,
+            interp_base: 0,
         }
     }
 }
@@ -133,7 +140,7 @@ pub fn build_initial_stack(
         (auxv::AT_PHENT, image.phentsize),
         (auxv::AT_PHNUM, image.phnum),
         (auxv::AT_PAGESZ, 4096),
-        (auxv::AT_BASE, 0),
+        (auxv::AT_BASE, id.interp_base),
         (auxv::AT_FLAGS, 0),
         (auxv::AT_ENTRY, image.entry),
         (auxv::AT_UID, id.uid as u64),
@@ -210,6 +217,7 @@ mod tests {
             tls: None,
             symbols: Vec::new(),
             pie: false,
+            interp: None,
         }
     }
 

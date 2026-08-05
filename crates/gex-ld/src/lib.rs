@@ -8,8 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dynamic;
 pub mod elf;
 pub mod stack;
 
+pub use dynamic::{load_program, Program};
 pub use elf::{Image, LoadError, Segment, Symbol};
 pub use stack::{build_initial_stack, Identity, StackLayout};

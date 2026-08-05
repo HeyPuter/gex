@@ -31,8 +31,9 @@ done
 mkdir -p "$WORK"
 pass=0
 fail=0
-# Extra flags for gexc, set around a group of comparisons.
+# Extra flags, set around a group of comparisons.
 GEXC_ARGS=""
+QEMU_ARGS=""
 
 # Compare one invocation between the two engines.
 #   compare [--native-oracle <path>] <label> <program> [args...]
@@ -63,7 +64,8 @@ compare() {
     # `set -e` must not abort on a guest that exits non-zero, and the status
     # has to be read before any other command overwrites it.
     set +e
-    "$QEMU" "$@" >"$q_out.stdout" 2>"$q_out.stderr"
+    # shellcheck disable=SC2086 -- QEMU_ARGS is intentionally word-split
+    "$QEMU" $QEMU_ARGS "$@" >"$q_out.stdout" 2>"$q_out.stderr"
     q_rc=$?
     # shellcheck disable=SC2086 -- GEXC_ARGS is intentionally word-split
     "$GEXC" run $GEXC_ARGS "$@" >"$g_out.stdout" 2>"$g_out.stderr"
@@ -118,6 +120,23 @@ echo "building guest programs..."
 
 printf 'first line\nsecond line\n' >"$WORK/sample.txt"
 
+# Dynamically linked builds, with a sysroot holding the interpreter, so the
+# cooperative loading path and runtime translation of a whole libc are
+# covered. QEMU needs -L to find the same interpreter.
+SYSROOT="$WORK/sysroot"
+mkdir -p "$SYSROOT/lib"
+# TOOLCHAIN points at .../bin; the target sysroot is its sibling. The
+# interpreter there is a symlink to an absolute path that only resolves
+# *inside* a sysroot, so copy the real libc.so under the interpreter's name.
+MUSL_LIBC="$(dirname "$TOOLCHAIN")/aarch64-linux-musl/lib/libc.so"
+DYNAMIC=""
+if [ -f "$MUSL_LIBC" ]; then
+    cp "$MUSL_LIBC" "$SYSROOT/lib/ld-musl-aarch64.so.1"
+    "$CC" -O2 -o "$WORK/dyn-suite" "$HERE/programs/suite.c"
+    "$CC" -O2 -o "$WORK/dyn-vector" "$HERE/programs/vector.c"
+    DYNAMIC=1
+fi
+
 # A host-native build of the conformance suite, used only where QEMU itself
 # is known to fail.
 SUITE_NATIVE=""
@@ -140,6 +159,17 @@ for mode in fatal-default fatal-abort; do
 done
 compare "vector-O3" "$WORK/vector"
 compare "vector-pie" "$WORK/vector-pie"
+
+if [ -n "$DYNAMIC" ]; then
+    QEMU_ARGS="-L $SYSROOT"
+    GEXC_ARGS="--sysroot $SYSROOT"
+    for area in arith float mem flow; do
+        compare "dynamic-$area" "$WORK/dyn-suite" "$area"
+    done
+    compare "dynamic-vector" "$WORK/dyn-vector"
+    QEMU_ARGS=""
+    GEXC_ARGS=""
+fi
 
 # The same programs with runtime translation disabled, so that both the
 # on-demand path and the translate-everything-up-front path stay covered.

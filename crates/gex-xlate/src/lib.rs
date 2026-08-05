@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 use gex_emit::module::Linkage;
+pub use gex_emit::PageTable;
 use gex_emit::{ModuleBuilder, TranslatedModule};
 use gex_ir::{pass, Term};
 use gex_ld::Image;
@@ -223,16 +224,15 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 /// list does not redo them.
 pub fn translate_runtime(
     memory: &[u8],
-    text_base: u64,
-    text_slots: u64,
     entry: u64,
+    executable: &dyn Fn(u64) -> bool,
     known: &dyn Fn(u64) -> bool,
+    page_table: PageTable,
     limits: BlockLimits,
     max_blocks: usize,
 ) -> (TranslatedModule, Stats) {
-    let text_end = text_base + text_slots * 4;
     let fetch = |pc: u64| -> Option<u32> {
-        if pc % 4 != 0 || pc < text_base || pc + 4 > text_end {
+        if pc % 4 != 0 || !executable(pc) {
             return None;
         }
         let off = pc as usize;
@@ -242,8 +242,7 @@ pub fn translate_runtime(
         Some(u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()))
     };
 
-    let mut builder =
-        ModuleBuilder::with_linkage(text_base, text_slots * 4, Linkage::Shared);
+    let mut builder = ModuleBuilder::with_pages(entry, 0, Linkage::Shared, page_table);
     let mut stats = Stats::default();
     let mut worklist: BTreeSet<u64> = BTreeSet::new();
     let mut seen: HashSet<u64> = HashSet::new();
@@ -260,6 +259,20 @@ pub fn translate_runtime(
             continue;
         }
         let mut block = lift_block(fetch, addr, limits);
+        // Fold through memory before the ordinary passes, so a PLT's GOT load
+        // becomes a constant and its `br` becomes a discoverable target.
+        pass::const_fold_with_memory(&mut block, &|a, bytes| {
+            let off = a as usize;
+            if off + bytes as usize > memory.len() {
+                return None;
+            }
+            Some(match bytes {
+                1 => memory[off] as u64,
+                2 => u16::from_le_bytes(memory[off..off + 2].try_into().unwrap()) as u64,
+                4 => u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()) as u64,
+                _ => u64::from_le_bytes(memory[off..off + 8].try_into().unwrap()),
+            })
+        });
         pass::optimize(&mut block);
 
         stats.blocks += 1;
@@ -267,7 +280,17 @@ pub fn translate_runtime(
         if matches!(block.term, Term::Illegal { .. }) {
             stats.illegal_blocks += 1;
         }
-        for succ in block.successors().chain(block.call_return) {
+
+        // A computed branch whose target folded to a constant is worth
+        // following: that is every cross-object call in a dynamic program.
+        let mut targets: Vec<u64> = block.successors().chain(block.call_return).collect();
+        if let Term::Indirect { target, .. } = block.term {
+            if let Some(t) = pass::const_value(&block, target) {
+                stats.discovered_from_data += 1;
+                targets.push(t);
+            }
+        }
+        for succ in targets {
             if fetch(succ).is_some() && !seen.contains(&succ) && !known(succ) {
                 worklist.insert(succ);
             }
@@ -310,6 +333,7 @@ mod tests {
             tls: None,
             symbols: Vec::new(),
             pie: false,
+            interp: None,
         }
     }
 
@@ -321,7 +345,10 @@ mod tests {
         assert!(stats.blocks >= 1);
         assert_eq!(&m.wasm[..4], b"\0asm");
         assert_eq!(m.text_base, 0x400000);
-        assert_eq!(m.text_slots, 3);
+        // One page of text, so the table is the reserved miss span plus one
+        // page's worth of slots.
+        assert_eq!(m.dir_entries.len(), 1);
+        assert_eq!(m.table_slots, gex_abi::MISS_SLOTS + gex_abi::SLOTS_PER_PAGE);
     }
 
     #[test]

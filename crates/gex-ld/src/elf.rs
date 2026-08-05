@@ -37,8 +37,7 @@ pub enum LoadError {
     NotElf64Le,
     NotAarch64,
     UnsupportedType(u16),
-    /// The image declares a `PT_INTERP`; gex-ld's dynamic path (PLAN §6.4)
-    /// lands in M2.
+    /// The image declares a `PT_INTERP` that could not be loaded.
     NeedsInterpreter(String),
     /// A segment would not fit in the guest address space.
     SegmentOutOfRange { vaddr: u64, size: u64 },
@@ -54,7 +53,7 @@ impl fmt::Display for LoadError {
             LoadError::NotAarch64 => write!(f, "not an aarch64 ELF file"),
             LoadError::UnsupportedType(t) => write!(f, "unsupported ELF type {t}"),
             LoadError::NeedsInterpreter(p) => {
-                write!(f, "dynamically linked (PT_INTERP = {p}); not supported yet")
+                write!(f, "could not load the interpreter {p}")
             }
             LoadError::SegmentOutOfRange { vaddr, size } => write!(
                 f,
@@ -111,6 +110,8 @@ pub struct Image {
     pub symbols: Vec<Symbol>,
     /// True for `ET_DYN` images.
     pub pie: bool,
+    /// The `PT_INTERP` path, when the image asks for a dynamic linker.
+    pub interp: Option<String>,
 }
 
 struct Reader<'a> {
@@ -188,6 +189,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     let mut text_hi = 0u64;
     let mut phdr_vaddr = 0u64;
     let mut dynamic: Option<(u64, u64)> = None;
+    let mut interp: Option<String> = None;
     let mut tls = None;
     let mut min_vaddr = u64::MAX;
 
@@ -201,9 +203,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         let p_memsz = r.u64(off + 40)?;
 
         match p_type {
-            PT_INTERP => {
-                return Err(LoadError::NeedsInterpreter(r.cstr(p_offset)));
-            }
+            PT_INTERP => interp = Some(r.cstr(p_offset)),
             PT_DYNAMIC => dynamic = Some((p_vaddr + bias, p_memsz)),
             PT_TLS => tls = Some((p_vaddr + bias, p_filesz, p_memsz, r.u64(off + 48)?)),
             PT_LOAD => {
@@ -264,6 +264,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         tls,
         symbols: Vec::new(),
         pie,
+        interp,
     };
 
     if let Some((dyn_vaddr, dyn_size)) = dynamic {

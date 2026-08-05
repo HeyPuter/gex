@@ -22,6 +22,67 @@ pub fn optimize(block: &mut Block) {
     dce(block);
 }
 
+/// The constant a value holds, if the block computed one for it.
+pub fn const_value(block: &Block, v: Value) -> Option<u64> {
+    block.stmts.iter().find_map(|s| match s {
+        Stmt::Def {
+            dst,
+            expr: Expr::ConstI64(c),
+        } if *dst == v => Some(*c),
+        Stmt::Def {
+            dst,
+            expr: Expr::ConstI32(c),
+        } if *dst == v => Some(*c as u64),
+        _ => None,
+    })
+}
+
+/// Constant-fold with an oracle that can read initialised guest memory.
+///
+/// This is what makes dynamically linked code discoverable. A PLT entry ends
+/// in `br x17`, where `x17` was loaded from a GOT slot the linker has already
+/// filled in, so the branch target is a constant *if* you are willing to read
+/// memory. Static translation is not, but runtime translation is.
+///
+/// Reading a slot that later changes cannot cause a wrong answer, only a
+/// wasted translation: discovery never decides where a branch actually goes,
+/// the dispatch table does (PLAN §6.1).
+pub fn const_fold_with_memory(block: &mut Block, read: &dyn Fn(u64, u32) -> Option<u64>) {
+    let mut known: Vec<Option<u64>> = vec![None; block.n_values as usize];
+    for stmt in &mut block.stmts {
+        let Stmt::Def { dst, expr } = stmt else {
+            continue;
+        };
+        // A plain, unsigned load from an address we know is the one case the
+        // ordinary evaluator cannot handle on its own.
+        let folded = if let Expr::Load {
+            addr,
+            offset,
+            sz,
+            signed: false,
+            order: Order::Relaxed,
+            ..
+        } = expr
+        {
+            get(&known, *addr).and_then(|base| read(base.wrapping_add(*offset as u64), sz.bytes()))
+        } else {
+            eval(expr, &known)
+        };
+        if let Some(v) = folded {
+            let ty = expr.ty();
+            *expr = match ty {
+                Ty::I32 => Expr::ConstI32(v as u32),
+                _ => Expr::ConstI64(v),
+            };
+            known[dst.0 as usize] = Some(v & ty.mask());
+        } else if let Expr::ConstI32(c) = *expr {
+            known[dst.0 as usize] = Some(c as u64);
+        } else if let Expr::ConstI64(c) = *expr {
+            known[dst.0 as usize] = Some(c);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constant folding
 // ---------------------------------------------------------------------------

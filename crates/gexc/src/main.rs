@@ -14,6 +14,10 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+/// Where the dynamic linker is placed, well above a PIE executable so their
+/// mappings cannot overlap.
+const INTERP_BASE: u64 = 0x2800_0000;
+
 fn main() -> ExitCode {
     match real_main() {
         Ok(code) => code,
@@ -57,6 +61,7 @@ run options:
   --strace        trace every syscall on stderr
   --verbose       report translation statistics
   --env K=V       add an environment variable (repeatable)
+  --sysroot DIR   present DIR as the guest's root filesystem
   --exhaustive    translate every decodable text address ahead of time
   --no-jit        no runtime translation; implies --exhaustive"
     );
@@ -93,6 +98,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--strace" => opts.trace = true,
             "--verbose" | "-v" => opts.verbose = true,
             "--exhaustive" => exhaustive = true,
+            "--sysroot" => {
+                i += 1;
+                let v = args.get(i).context("--sysroot needs a directory")?;
+                opts.sysroot = Some(v.into());
+            }
             "--no-jit" => no_jit = true,
             "--env" => {
                 i += 1;
@@ -120,8 +130,18 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let mut ra = parse_run_args(args)?;
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
-    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)
-        .with_context(|| format!("loading {}", ra.path))?;
+    // The interpreter is resolved through the guest's namespace — the sysroot
+    // when one is given — so a program links against the libraries its own
+    // root provides rather than the host's.
+    let sysroot = ra.opts.sysroot.clone();
+    let program = gex_ld::load_program(&bytes, gex_abi::PIE_BASE, INTERP_BASE, &|guest_path| {
+        let host = match &sysroot {
+            Some(root) => root.join(guest_path.trim_start_matches('/')),
+            None => std::path::PathBuf::from(guest_path),
+        };
+        std::fs::read(host).ok()
+    })
+    .with_context(|| format!("loading {}", ra.path))?;
 
     // argv[0] is the path as invoked, then whatever followed.
     let mut argv = vec![ra.path.clone()];
@@ -132,7 +152,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     }
 
     ra.opts.jit = ra.jit;
-    let (exit, _stats) = gex_native::run_image(&image, &ra.opts, &ra.xlate)?;
+    let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
     match &exit {
         Exit::Status(c) => Ok(ExitCode::from((*c & 0xff) as u8)),
         Exit::Signal {

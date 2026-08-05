@@ -14,10 +14,10 @@ use gex_kernel::mem::prot;
 use gex_kernel::vfs::{DevFs, HostFs, ProcFs, TmpFs};
 use gex_kernel::{GuestMem, Kernel, ProcState, SyscallOutcome};
 use std::sync::{Arc, Mutex};
-use gex_ld::{build_initial_stack, Identity, Image};
+use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use wasmtime::{
-    Caller, Config, Engine, Extern, Func, Linker, Memory, Module, Ref, Store, Table, Val,
+    Caller, Config, Engine, Extern, Linker, Memory, Module, Ref, Store, Table, Val,
 };
 
 /// How a guest run ended.
@@ -98,8 +98,9 @@ struct Jit {
     engine: Engine,
     linker: Linker<HostState>,
     table: Table,
-    text_base: u64,
-    text_slots: u64,
+    /// Which guest pages own which table slots, carried across compilations
+    /// so a page keeps one base for the life of the process.
+    page_table: gex_xlate::PageTable,
     /// Addresses whose dispatch slot now holds real code.
     translated: std::collections::HashSet<u64>,
     /// Modules compiled so far, kept alive because the table holds funcrefs
@@ -131,6 +132,22 @@ impl std::error::Error for StopExecution {}
 
 /// Build, instantiate and run a guest image to completion.
 pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
+    run_program(
+        &Program {
+            exe: image.clone(),
+            interp: None,
+        },
+        opts,
+        xlate,
+    )
+}
+
+/// Run a program, which may carry a dynamic linker alongside it.
+pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
+    let image = &program.exe;
+    // Only the executable is translated ahead of time. The interpreter and
+    // everything it maps arrive through runtime translation, which is both
+    // simpler and correct: at build time we do not know where they land.
     let (module_bytes, stats) = gex_xlate::translate_image(image, xlate);
     if opts.verbose {
         eprintln!(
@@ -139,7 +156,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
             stats.blocks,
             stats.instructions,
             stats.wasm_bytes / 1024,
-            module_bytes.text_slots,
+            module_bytes.table_slots,
             stats.discovered_from_data,
             stats.illegal_blocks,
         );
@@ -224,8 +241,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
             engine: engine.clone(),
             linker: linker.clone(),
             table,
-            text_base: module_bytes.text_base,
-            text_slots: module_bytes.text_slots,
+                page_table: module_bytes.page_table.clone(),
             translated: Default::default(),
             modules: Vec::new(),
             limits: xlate.limits,
@@ -234,7 +250,29 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
         });
     }
 
-    place_image(&mut store, memory, image, opts, Identity { uid, gid })?;
+    place_image(
+        &mut store,
+        memory,
+        program,
+        opts,
+        Identity {
+            uid,
+            gid,
+            interp_base: program.interp_base(),
+        },
+    )?;
+
+    // Publish the image's page-directory entries, without which none of its
+    // blocks are reachable through the table.
+    {
+        let data = memory.data_mut(&mut store);
+        for (page, base) in &module_bytes.dir_entries {
+            let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+            if off + 4 <= data.len() {
+                data[off..off + 4].copy_from_slice(&base.to_le_bytes());
+            }
+        }
+    }
 
     let enter = instance
         .get_func(&mut store, exports::ENTER)
@@ -243,7 +281,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
     // The run is a loop rather than a single call because a signal, a
     // sigreturn or (from M3) a freshly translated block redirects execution
     // by unwinding and re-entering at a new address.
-    let mut pc = image.entry;
+    let mut pc = program.entry();
     let exit = loop {
         let result = enter.call(
             &mut store,
@@ -377,12 +415,13 @@ fn host_identity() -> (u32, u32) {
 fn place_image(
     store: &mut Store<HostState>,
     memory: Memory,
-    image: &Image,
+    program: &Program,
     opts: &RunOptions,
     id: Identity,
 ) -> Result<()> {
-    // Segments first.
-    for seg in &image.segments {
+    let image = &program.exe;
+    // Segments first: the executable's, then the interpreter's.
+    for seg in program.segments() {
         let data = memory.data_mut(&mut *store);
         let start = seg.vaddr as usize;
         let end = start + seg.mem_size as usize;
@@ -716,15 +755,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
 /// table, so freshly translated code shares state with everything already
 /// running and can branch into it through the table.
 fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
-    let (text_base, text_slots, limits) = {
+    let (limits, page_table) = {
         let jit = caller
             .data()
             .jit
             .as_ref()
             .ok_or_else(|| anyhow!("runtime translation is not set up"))?;
-        (jit.text_base, jit.text_slots, jit.limits)
+        (jit.limits, jit.page_table.clone())
     };
-    if pc % 4 != 0 || pc < text_base || pc >= text_base + text_slots * 4 {
+    if pc % 4 != 0 || pc >= gex_abi::DISPATCH_MAX_PAGES * gex_abi::DISPATCH_PAGE {
+        return Ok(false);
+    }
+    // Only translate what the guest says is executable, so a wild branch into
+    // data reports SIGSEGV rather than running whatever bytes are there.
+    if !caller.data().kernel.mem.check_access(pc, 4, prot::EXEC) {
         return Ok(false);
     }
 
@@ -738,14 +782,23 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         .as_ref()
         .map(|j| j.translated.clone())
         .unwrap_or_default();
+    let exec_ranges: Vec<(u64, u64)> = caller
+        .data()
+        .kernel
+        .mem
+        .vmas()
+        .iter()
+        .filter(|v| v.prot & prot::EXEC != 0)
+        .map(|v| (v.start, v.end))
+        .collect();
     let (translated_module, stats) = {
         let data = memory.data(&mut *caller);
         gex_xlate::translate_runtime(
             data,
-            text_base,
-            text_slots,
             pc,
+            &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
             &|a| known.contains(&a),
+            page_table,
             limits,
             // A cap keeps one miss from translating an entire library
             // synchronously; the next miss picks up where this stopped.
@@ -763,11 +816,23 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     let module = Module::new(&engine, &translated_module.wasm)
         .context("validating runtime-translated wasm")?;
 
-    // The new module imports `gex.memory` and `gex.dispatch`, so they must be
-    // visible under the import module name.
+    // Grow the shared table to cover the pages this module claimed, filling
+    // the new slots with the miss stub so an unreached address in a newly
+    // covered page still asks for translation.
+    let table = caller.data().jit.as_ref().unwrap().table;
+    let have = table.size(&mut *caller);
+    if translated_module.table_slots > have {
+        let miss = table
+            .get(&mut *caller, 0)
+            .ok_or_else(|| anyhow!("dispatch table is empty"))?;
+        table
+            .grow(&mut *caller, translated_module.table_slots - have, miss)
+            .context("growing the dispatch table")?;
+    }
+
+    // The new module imports the memory and the table by name.
     let mut linker = linker;
     linker.define(&mut *caller, gex_abi::IMPORT_MODULE, exports::MEMORY, memory)?;
-    let table = caller.data().jit.as_ref().unwrap().table;
     linker.define(
         &mut *caller,
         gex_abi::IMPORT_MODULE,
@@ -778,28 +843,59 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         .instantiate(&mut *caller, &module)
         .context("instantiating runtime-translated module")?;
 
-    // Patch each new block into its dispatch slot.
+    // Install each block, then publish the page directory entries. Doing it
+    // in that order means a page never becomes reachable before the slots it
+    // points at hold real code.
     let mut installed = Vec::with_capacity(translated_module.exported_blocks.len());
     for (addr, name) in &translated_module.exported_blocks {
         let Some(Extern::Func(f)) = instance.get_export(&mut *caller, name) else {
             bail!("runtime module is missing its export {name}");
         };
-        let slot = (addr.wrapping_sub(text_base) / 4) as u64;
-        if slot >= text_slots {
-            continue;
-        }
+        let page = gex_abi::dispatch_page(*addr);
+        // The base comes from the shared page assignment, not from this
+        // module's list of *new* pages: a block often lands in a page some
+        // earlier translation already claimed.
+        let Some(base) = translated_module.page_table.lookup(page) else {
+            bail!("no dispatch page allocated for block 0x{addr:x}");
+        };
+        let slot = gex_abi::dispatch_index(*addr, base);
         table
-            .set(&mut *caller, slot as u64, Ref::Func(Some(f)))
+            .set(&mut *caller, slot, Ref::Func(Some(f)))
             .with_context(|| format!("installing block 0x{addr:x} in slot {slot}"))?;
         installed.push(*addr);
+    }
+    write_dispatch_dir(caller, memory, &translated_module.dir_entries)?;
+
+    // If the address that faulted did not end up with code, resuming would
+    // fault again at the same place forever. Say so instead.
+    if !installed.contains(&pc) {
+        bail!("translated {} blocks but none covered 0x{pc:x}", installed.len());
     }
 
     let jit = caller.data_mut().jit.as_mut().unwrap();
     jit.translated.extend(installed);
+    jit.page_table = translated_module.page_table.clone();
     jit.modules.push(instance);
     jit.blocks += stats.blocks;
     jit.calls += 1;
     Ok(true)
+}
+
+/// Publish page-directory entries so translated code becomes reachable.
+fn write_dispatch_dir(
+    caller: &mut Caller<'_, HostState>,
+    memory: Memory,
+    entries: &[(u64, u32)],
+) -> Result<()> {
+    let data = memory.data_mut(&mut *caller);
+    for (page, base) in entries {
+        let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+        if off + 4 > data.len() {
+            bail!("dispatch directory entry for page {page} is out of range");
+        }
+        data[off..off + 4].copy_from_slice(&base.to_le_bytes());
+    }
+    Ok(())
 }
 
 /// Turn a wasm trap into a guest signal.

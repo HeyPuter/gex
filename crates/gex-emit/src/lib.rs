@@ -10,4 +10,4 @@ pub mod module;
 pub mod tier1;
 pub mod wasm;
 
-pub use module::{ModuleBuilder, TranslatedModule};
+pub use module::{ModuleBuilder, PageTable, TranslatedModule};

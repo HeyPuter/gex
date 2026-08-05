@@ -16,7 +16,9 @@
 //!   block needs a handful of locals rather than one per SSA value.
 
 use crate::wasm::{FuncBody, ValType};
-use gex_abi::{ctx, GUEST_LIMIT, POISON_ADDR};
+use gex_abi::{
+    ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE, GUEST_LIMIT, POISON_ADDR,
+};
 use gex_ir::*;
 use std::collections::HashMap;
 
@@ -68,7 +70,6 @@ fn val_type(ty: Ty) -> ValType {
 
 // Numeric opcodes, grouped so the i32/i64 pairs stay visibly adjacent.
 mod code {
-    pub const I64_EQ: u8 = 0x51;
     pub const I32_WRAP_I64: u8 = 0xa7;
     pub const I64_EXTEND_I32_S: u8 = 0xac;
     pub const I64_EXTEND_I32_U: u8 = 0xad;
@@ -100,10 +101,6 @@ pub struct Context<'a> {
     pub safepoint: u32,
     /// Type index of the uniform block signature `(i32) -> ()`.
     pub block_ty: u32,
-    /// Guest address the dispatch table is indexed from.
-    pub text_base: u64,
-    /// Number of slots in the dispatch table.
-    pub text_slots: u64,
     /// Guest address -> wasm function index, for blocks already assigned an
     /// index. A miss falls back to the dispatch table.
     pub blocks: &'a HashMap<u64, u32>,
@@ -131,6 +128,8 @@ struct Emitter<'a> {
     scratch_i64: u32,
     /// Scratch for the safepoint counter.
     scratch_i32: u32,
+    /// Scratch for the dispatch page index.
+    scratch_page: u32,
     /// Locals holding live GIR values.
     value_local: Vec<Option<u32>>,
     /// Constant value of each GIR value, when known.
@@ -150,12 +149,14 @@ impl<'a> Emitter<'a> {
         let mut f = FuncBody::new(1);
         let scratch_i64 = f.add_local(ValType::I64);
         let scratch_i32 = f.add_local(ValType::I32);
+        let scratch_page = f.add_local(ValType::I64);
         Emitter {
             f,
             cx,
             ctx_local: 0,
             scratch_i64,
             scratch_i32,
+            scratch_page,
             value_local: Vec::new(),
             value_const: Vec::new(),
             value_ty: Vec::new(),
@@ -1015,69 +1016,54 @@ impl<'a> Emitter<'a> {
             self.f.return_call(func);
             return;
         }
-        // No translation yet: record the PC and go through the table, whose
-        // untranslated slots hold the miss stub.
+        // Not in this module: record the PC and go through the table. The
+        // page's directory entry decides whether that reaches real code or
+        // the miss stub, and it can change as translation proceeds, so even a
+        // constant target has to be looked up at run time.
         self.store_pc(target);
         self.f.local_get(self.ctx_local);
-        let slot = dispatch_slot(target, self.cx.text_base, self.cx.text_slots);
-        match slot {
-            Some(i) => {
-                self.f.i32_const(i as i32);
-                self.f.return_call_indirect(self.cx.block_ty, 0);
-            }
-            None => {
-                self.f.local_get(self.ctx_local);
-                self.f.i64_const(target as i64);
-                self.f.call(self.cx.dispatch_miss);
-                self.f.return_call_indirect(self.cx.block_ty, 0);
-            }
-        }
+        self.f.i64_const(target as i64);
+        self.f.local_set(self.scratch_i64);
+        self.emit_dispatch_index();
+        self.f.return_call_indirect(self.cx.block_ty, 0);
     }
 
     /// Consume the target address in `scratch_i64` and leave a dispatch-table
     /// index on the stack.
+    ///
+    /// Two levels, and deliberately branchless. A page with no translation
+    /// has a directory entry of zero, so the index lands in the reserved
+    /// miss-stub span at the bottom of the table and the stub asks the host
+    /// to translate. An address beyond the directory's reach selects zero the
+    /// same way, so it needs no separate test either.
     fn emit_dispatch_index(&mut self) {
-        // d = target - text_base
+        // page = pc >> 12
         self.f.local_get(self.scratch_i64);
-        self.f.i64_const(self.cx.text_base as i64);
-        self.f.byte(0x7d); // i64.sub
-        self.f.local_set(self.scratch_i64);
+        self.f.i64_const(DISPATCH_PAGE.trailing_zeros() as i64);
+        self.f.byte(0x88); // i64.shr_u
+        self.f.local_set(self.scratch_page);
 
-        // in_range = d < slots*4 && (d & 3) == 0
-        self.f.local_get(self.scratch_i64);
-        self.f.i64_const((self.cx.text_slots * 4) as i64);
+        // entry = page < MAX_PAGES ? load(DISPATCH_DIR + page*4) : 0
+        self.f.local_get(self.scratch_page);
+        self.f.byte(0xa7); // i32.wrap_i64
+        self.f.i32_const(4);
+        self.f.byte(0x6c); // i32.mul
+        self.f.load(0x28, 2, DISPATCH_DIR as u32);
+        self.f.i32_const(0);
+        self.f.local_get(self.scratch_page);
+        self.f.i64_const(DISPATCH_MAX_PAGES as i64);
         self.f.byte(code::I64_LT_U);
-        self.f.local_get(self.scratch_i64);
-        self.f.i64_const(3);
-        self.f.byte(0x83); // i64.and
-        self.f.i64_const(0);
-        self.f.byte(code::I64_EQ);
-        self.f.byte(0x71); // i32.and
+        self.f.select();
 
-        self.f.if_result(ValType::I32);
+        // index = entry + ((pc & 0xfff) >> 2)
         self.f.local_get(self.scratch_i64);
+        self.f.i64_const((DISPATCH_PAGE - 1) as i64);
+        self.f.byte(0x83); // i64.and
         self.f.i64_const(2);
         self.f.byte(0x88); // i64.shr_u
-        self.f.byte(code::I32_WRAP_I64);
-        self.f.else_();
-        // Out of range: ask the host, which either supplies a freshly
-        // translated slot (from M3) or raises SIGSEGV/SIGILL.
-        self.f.local_get(self.ctx_local);
-        self.f.local_get(self.scratch_i64);
-        self.f.i64_const(self.cx.text_base as i64);
-        self.f.byte(0x7c); // i64.add — restore the original address
-        self.f.call(self.cx.dispatch_miss);
-        self.f.end();
+        self.f.byte(0xa7); // i32.wrap_i64
+        self.f.byte(0x6a); // i32.add
     }
-}
-
-/// The dispatch-table slot for a statically known address, if it is in range.
-pub fn dispatch_slot(target: u64, text_base: u64, slots: u64) -> Option<u64> {
-    let d = target.wrapping_sub(text_base);
-    if d & 3 != 0 || d >= slots * 4 {
-        return None;
-    }
-    Some(d >> 2)
 }
 
 /// Index of the last statement that reads each value, or `None` when the
@@ -1453,11 +1439,15 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_slots_reject_misaligned_and_out_of_range() {
-        assert_eq!(dispatch_slot(0x1000, 0x1000, 16), Some(0));
-        assert_eq!(dispatch_slot(0x1004, 0x1000, 16), Some(1));
-        assert_eq!(dispatch_slot(0x1002, 0x1000, 16), None);
-        assert_eq!(dispatch_slot(0x1040, 0x1000, 16), None);
-        assert_eq!(dispatch_slot(0x0ffc, 0x1000, 16), None);
+    fn dispatch_indices_follow_the_page_directory() {
+        // A page whose directory entry is `base` maps its instructions to
+        // consecutive slots from there.
+        assert_eq!(gex_abi::dispatch_index(0x400000, 2048), 2048);
+        assert_eq!(gex_abi::dispatch_index(0x400004, 2048), 2049);
+        assert_eq!(gex_abi::dispatch_index(0x400ffc, 2048), 2048 + 1023);
+        // The next page starts over from its own entry.
+        assert_eq!(gex_abi::dispatch_index(0x401000, 4096), 4096);
+        // A page with no translation lands in the reserved miss span.
+        assert!(gex_abi::dispatch_index(0x400004, 0) < gex_abi::MISS_SLOTS);
     }
 }

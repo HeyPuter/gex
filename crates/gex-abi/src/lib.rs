@@ -50,8 +50,8 @@ pub const RESERVED_END: u64 = 0x0010_0000;
 pub const PIE_BASE: u64 = 0x2000_0000;
 
 /// Where a non-PIE image's own `p_vaddr` values are honoured from. Non-PIE
-/// aarch64 links at 0x400000, which is below [`RESERVED_END`]; the runtime
-/// therefore keeps the reserved region below 0x400000 in practice.
+/// aarch64 links at 0x400000, which is above both the reserved region and the
+/// dispatch directory, so a fixed-address image never collides with them.
 pub const EXEC_BASE: u64 = 0x0040_0000;
 
 /// Top of the guest stack. Grows down from here.
@@ -131,6 +131,56 @@ pub mod ctx {
     pub const fn v(n: u8) -> usize {
         V + (n as usize) * 16
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch (PLAN §5.6)
+// ---------------------------------------------------------------------------
+
+/// Bytes of guest text one dispatch-directory entry covers.
+pub const DISPATCH_PAGE: u64 = 4096;
+
+/// Dispatch-table slots per covered page: one per instruction slot.
+pub const SLOTS_PER_PAGE: u64 = DISPATCH_PAGE / 4;
+
+/// Table slots reserved at index 0, all holding the miss stub.
+///
+/// This is what makes the lookup branchless. A page with no translation has a
+/// directory entry of zero, so the computed index lands inside this reserved
+/// span and calls the stub — no comparison against a sentinel, no branch.
+pub const MISS_SLOTS: u64 = SLOTS_PER_PAGE;
+
+/// Guest address of the dispatch directory: one `u32` per page of guest text,
+/// holding the base table slot for that page, or zero when it has none.
+///
+/// A flat table indexed by `(pc - base) >> 2` cannot span an address space
+/// with libraries mapped far apart — it would need a slot for every four
+/// bytes in between. Indirecting through a page directory keeps the table
+/// proportional to the code actually mapped, which is what makes dynamic
+/// linking affordable.
+pub const DISPATCH_DIR: u64 = RESERVED_END;
+
+/// Pages the directory covers, and so the highest address code may occupy.
+pub const DISPATCH_MAX_PAGES: u64 = 0x8_0000;
+
+/// Size of the directory in bytes.
+pub const DISPATCH_DIR_BYTES: u64 = DISPATCH_MAX_PAGES * 4;
+
+/// First guest address above the dispatch directory.
+pub const DISPATCH_DIR_END: u64 = DISPATCH_DIR + DISPATCH_DIR_BYTES;
+
+/// Ceiling on the dispatch table, so it can grow as libraries are mapped.
+///
+/// Sixteen million slots is 16,384 covered pages, or 64 MiB of guest text —
+/// more than any single process maps, while staying an ordinary allocation
+/// for the engine. The table is created at the image's size and grown from
+/// there, so the ceiling costs nothing until it is used.
+pub const DISPATCH_TABLE_MAX_SLOTS: u64 = 1 << 24;
+
+/// Directory index for a guest address.
+#[inline]
+pub const fn dispatch_page(pc: u64) -> u64 {
+    pc / DISPATCH_PAGE
 }
 
 /// Scratch doubleword used to neutralise a store-exclusive whose local
@@ -230,10 +280,10 @@ pub const CTR_EL0: u64 = 0x8444_c004;
 /// arithmetic exact against a nanosecond host clock.
 pub const CNTFRQ: u64 = 1_000_000_000;
 
-/// Index of a dispatch-table slot for a guest text address.
+/// Table slot for a guest address, given its page's directory entry.
 #[inline]
-pub const fn dispatch_index(pc: u64, text_base: u64) -> u64 {
-    (pc.wrapping_sub(text_base)) >> 2
+pub const fn dispatch_index(pc: u64, page_base: u32) -> u64 {
+    page_base as u64 + ((pc % DISPATCH_PAGE) >> 2)
 }
 
 #[cfg(test)]
@@ -265,8 +315,12 @@ mod tests {
     #[test]
     fn layout_regions_are_ordered() {
         assert!(RESERVED_BASE < RESERVED_END);
-        // Runtime state must stay clear of the fixed non-PIE link address.
-        assert!(RESERVED_END <= EXEC_BASE);
+        // Runtime state and the dispatch directory must both stay clear of
+        // the fixed non-PIE link address.
+        assert!(RESERVED_END <= DISPATCH_DIR);
+        assert!(DISPATCH_DIR_END <= EXEC_BASE);
+        // Every address code may occupy must have a directory entry.
+        assert!(DISPATCH_MAX_PAGES * DISPATCH_PAGE >= STACK_TOP);
         assert!(EXEC_BASE < PIE_BASE);
         assert!(MMAP_BOTTOM < MMAP_TOP);
         assert!(MMAP_TOP <= STACK_TOP);

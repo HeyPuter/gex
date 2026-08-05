@@ -11,7 +11,10 @@
 
 use crate::tier1;
 use crate::wasm::{DataSegment, ElementSegment, ExportKind, FuncBody, FuncType, Module, ValType};
-use gex_abi::{ctx, exports, imports, GUEST_MEM_PAGES, IMPORT_MODULE};
+use gex_abi::{
+    ctx, dispatch_page, exports, imports, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE,
+    GUEST_MEM_PAGES, IMPORT_MODULE, MISS_SLOTS, SLOTS_PER_PAGE,
+};
 use gex_ir::Block;
 use std::collections::HashMap;
 
@@ -32,10 +35,15 @@ pub enum Linkage {
 pub struct TranslatedModule {
     /// The encoded wasm module.
     pub wasm: Vec<u8>,
-    /// Guest address the dispatch table is indexed from.
+    /// Guest address the module's text starts at.
     pub text_base: u64,
-    /// Number of dispatch-table slots.
-    pub text_slots: u64,
+    /// Number of dispatch-table slots this module's table needs.
+    pub table_slots: u64,
+    /// Pages this module was the first to claim, as `(page, base slot)`. The
+    /// host publishes them into the guest's dispatch directory.
+    pub dir_entries: Vec<(u64, u32)>,
+    /// The updated page assignment, to carry into the next translation.
+    pub page_table: PageTable,
     /// Number of guest basic blocks translated.
     pub n_blocks: usize,
     /// For a [`Linkage::Shared`] module, the blocks it defines and the export
@@ -44,11 +52,57 @@ pub struct TranslatedModule {
     pub exported_blocks: Vec<(u64, String)>,
 }
 
+/// Global assignment of guest pages to dispatch-table slots.
+///
+/// This has to be process-wide, not per-module: a page's directory entry is a
+/// single value in guest memory, so if two modules each picked their own base
+/// for the same page the second would orphan the first's blocks and they
+/// would be translated again on the next branch.
+#[derive(Debug, Default, Clone)]
+pub struct PageTable {
+    pages: std::collections::BTreeMap<u64, u32>,
+    next_slot: u64,
+}
+
+impl PageTable {
+    /// Start allocating above the reserved miss span.
+    pub fn new() -> PageTable {
+        PageTable {
+            pages: Default::default(),
+            next_slot: MISS_SLOTS,
+        }
+    }
+
+    /// The base slot for a page, allocating one if it has none.
+    pub fn base(&mut self, page: u64) -> u32 {
+        if let Some(&b) = self.pages.get(&page) {
+            return b;
+        }
+        let base = self.next_slot as u32;
+        self.next_slot += SLOTS_PER_PAGE;
+        self.pages.insert(page, base);
+        base
+    }
+
+    /// The base slot for a page, if it already has one.
+    pub fn lookup(&self, page: u64) -> Option<u32> {
+        self.pages.get(&page).copied()
+    }
+
+    /// Total slots allocated so far.
+    pub fn slots(&self) -> u64 {
+        self.next_slot
+    }
+}
+
 /// Builds a wasm module from GIR blocks.
 pub struct ModuleBuilder {
     m: Module,
     text_base: u64,
-    text_slots: u64,
+    /// Page-to-slot assignment, shared with everything already translated.
+    page_table: PageTable,
+    /// Pages this module allocated, which the host must publish.
+    new_pages: Vec<(u64, u32)>,
     block_ty: u32,
     miss_stub: u32,
     /// Guest block address -> wasm function index.
@@ -81,9 +135,24 @@ impl ModuleBuilder {
     }
 
     /// Start a module covering guest text `[text_base, text_base + text_size)`.
+    ///
+    /// `first_slot` is where this module's page allocations begin in the
+    /// shared table; an image module starts just above the reserved miss
+    /// span, and a runtime module starts wherever the host has grown the
+    /// table to.
     pub fn with_linkage(text_base: u64, text_size: u64, linkage: Linkage) -> ModuleBuilder {
+        Self::with_pages(text_base, text_size, linkage, PageTable::new())
+    }
+
+    /// As [`Self::with_linkage`], continuing an existing page assignment.
+    pub fn with_pages(
+        text_base: u64,
+        text_size: u64,
+        linkage: Linkage,
+        page_table: PageTable,
+    ) -> ModuleBuilder {
         assert_eq!(text_base % 4, 0, "text base must be instruction-aligned");
-        let text_slots = text_size.div_ceil(4);
+        let _ = text_size;
 
         let mut m = Module::new();
         let block_ty = m.func_type(FuncType::new(vec![ValType::I32], vec![]));
@@ -117,17 +186,16 @@ impl ModuleBuilder {
             safepoint: m.import_func(im, imports::SAFEPOINT, t_syscall),
         };
 
-        match linkage {
-            Linkage::Own => {
-                m.set_memory(GUEST_MEM_PAGES, GUEST_MEM_PAGES);
-                m.set_table(text_slots as u32, text_slots as u32);
-            }
-            Linkage::Shared => {
-                // Both come from the image module, so this one's blocks act
-                // on exactly the same guest state.
-                m.import_memory(IMPORT_MODULE, exports::MEMORY, GUEST_MEM_PAGES);
-                m.import_table(IMPORT_MODULE, exports::DISPATCH_TABLE, text_slots as u32);
-            }
+        // The table is sized in `finish`, once the set of pages the module
+        // touches is known; the memory is fixed.
+        if linkage == Linkage::Own {
+            m.set_memory(GUEST_MEM_PAGES, GUEST_MEM_PAGES);
+        }
+        if linkage == Linkage::Shared {
+            // Both come from the image module, so this one's blocks act on
+            // exactly the same guest state.
+            m.import_memory(IMPORT_MODULE, exports::MEMORY, GUEST_MEM_PAGES);
+            m.import_table(IMPORT_MODULE, exports::DISPATCH_TABLE, 0);
         }
 
         // The miss stub and `enter` are the first two local functions, so
@@ -138,7 +206,8 @@ impl ModuleBuilder {
         let mut b = ModuleBuilder {
             m,
             text_base,
-            text_slots,
+            page_table,
+            new_pages: Vec::new(),
             block_ty,
             miss_stub,
             blocks: HashMap::new(),
@@ -175,9 +244,21 @@ impl ModuleBuilder {
         f
     }
 
+    /// Allocate the table slots for a page, if it has none yet.
+    fn page_base(&mut self, addr: u64) -> u32 {
+        let page = dispatch_page(addr);
+        let fresh = self.page_table.lookup(page).is_none();
+        let base = self.page_table.base(page);
+        if fresh {
+            self.new_pages.push((page, base));
+        }
+        base
+    }
+
     /// Add a translated block, reserving its index if necessary.
     pub fn add_block(&mut self, block: Block) {
         let f = self.reserve(block.start);
+        self.page_base(block.start);
         // A shared module cannot write the table itself — element segments
         // may not target an imported table at an offset the host chose — so
         // its blocks are exported and the host installs them.
@@ -210,8 +291,6 @@ impl ModuleBuilder {
                 dispatch_miss: self.imports.dispatch_miss,
                 safepoint: self.imports.safepoint,
                 block_ty: self.block_ty,
-                text_base: self.text_base,
-                text_slots: self.text_slots,
                 blocks: &self.blocks,
             };
             self.pending
@@ -225,15 +304,26 @@ impl ModuleBuilder {
         }
 
         let mut exported_blocks = Vec::new();
+        let table_slots = self.page_table.slots();
+        let dir_entries = std::mem::take(&mut self.new_pages);
+
         match self.linkage {
             Linkage::Own => {
-                // Fill every dispatch slot: a translated block where one
-                // starts, the miss stub everywhere else.
-                let mut funcs = vec![self.miss_stub; self.text_slots as usize];
+                self.m.set_table(
+                    table_slots as u32,
+                    gex_abi::DISPATCH_TABLE_MAX_SLOTS as u32,
+                );
+                // Every slot starts as the miss stub; translated blocks then
+                // overwrite the ones they own. A branch anywhere else asks
+                // the host to translate rather than trapping.
+                let mut funcs = vec![self.miss_stub; table_slots as usize];
                 for (&addr, &f) in &self.blocks {
-                    let d = addr.wrapping_sub(self.text_base);
-                    if d % 4 == 0 && (d / 4) < self.text_slots {
-                        funcs[(d / 4) as usize] = f;
+                    let page = dispatch_page(addr);
+                    if let Some(base) = self.page_table.lookup(page) {
+                        let idx = base as u64 + ((addr % DISPATCH_PAGE) >> 2);
+                        if (idx as usize) < funcs.len() {
+                            funcs[idx as usize] = f;
+                        }
                     }
                 }
                 self.m.element(ElementSegment {
@@ -258,7 +348,9 @@ impl ModuleBuilder {
         TranslatedModule {
             wasm: self.m.encode(),
             text_base: self.text_base,
-            text_slots: self.text_slots,
+            table_slots,
+            dir_entries,
+            page_table: self.page_table.clone(),
             n_blocks,
             exported_blocks,
         }
@@ -285,7 +377,7 @@ impl ModuleBuilder {
     /// `(ctx, pc) -> ()`: the host's entry point into translated code.
     fn build_enter(&self) -> Vec<u8> {
         let mut f = FuncBody::new(2);
-        let scratch = f.add_local(ValType::I64);
+        let page = f.add_local(ValType::I64);
 
         // Record the entry PC so a miss inside `enter` reports it correctly.
         f.local_get(0);
@@ -294,32 +386,31 @@ impl ModuleBuilder {
 
         f.local_get(0); // ctx argument for the target block
 
-        // d = pc - text_base
+        // The same branchless two-level lookup tier-1 emits: page directory,
+        // then instruction slot within the page.
         f.local_get(1);
-        f.i64_const(self.text_base as i64);
-        f.byte(0x7d); // i64.sub
-        f.local_set(scratch);
+        f.i64_const(DISPATCH_PAGE.trailing_zeros() as i64);
+        f.byte(0x88); // i64.shr_u
+        f.local_set(page);
 
-        // in_range = d <u slots*4 && (d & 3) == 0
-        f.local_get(scratch);
-        f.i64_const((self.text_slots * 4) as i64);
+        f.local_get(page);
+        f.byte(0xa7); // i32.wrap_i64
+        f.i32_const(4);
+        f.byte(0x6c); // i32.mul
+        f.load(0x28, 2, DISPATCH_DIR as u32);
+        f.i32_const(0);
+        f.local_get(page);
+        f.i64_const(DISPATCH_MAX_PAGES as i64);
         f.byte(0x54); // i64.lt_u
-        f.local_get(scratch);
-        f.i64_const(3);
-        f.byte(0x83); // i64.and
-        f.byte(0x50); // i64.eqz
-        f.byte(0x71); // i32.and
+        f.select();
 
-        f.if_result(ValType::I32);
-        f.local_get(scratch);
+        f.local_get(1);
+        f.i64_const((DISPATCH_PAGE - 1) as i64);
+        f.byte(0x83); // i64.and
         f.i64_const(2);
         f.byte(0x88); // i64.shr_u
         f.byte(0xa7); // i32.wrap_i64
-        f.else_();
-        f.local_get(0);
-        f.local_get(1);
-        f.call(self.imports.dispatch_miss);
-        f.end();
+        f.byte(0x6a); // i32.add
 
         f.return_call_indirect(self.block_ty, 0);
         f.finish()
