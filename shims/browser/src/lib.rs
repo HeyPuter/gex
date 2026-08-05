@@ -409,6 +409,12 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
     );
     kernel.clock = browser_clock;
+    {
+        let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
+        if !cwd.is_empty() {
+            let _ = kernel.vfs.set_cwd(&cwd);
+        }
+    }
     kernel.uid = unsafe { IDENTITY.0 };
     // Replace the descriptors `Kernel::new` opened on `std::io` with ones the
     // host can actually see.
@@ -657,6 +663,19 @@ static METADATA: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(V
 #[no_mangle]
 pub extern "C" fn gex_set_metadata(ptr: u32, len: u32) {
     *METADATA.0.borrow_mut() = shim_slice(ptr, len).to_vec();
+}
+
+/// The directory the guest starts in, staged until it is loaded.
+static CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+
+/// Set the guest's working directory. A program given a relative path -- a
+/// benchmark reading its data files, a compiler given a source name -- has
+/// nowhere to resolve it from otherwise.
+#[no_mangle]
+pub extern "C" fn gex_set_cwd(ptr: u32, len: u32) {
+    if let Ok(s) = std::str::from_utf8(shim_slice(ptr, len)) {
+        *CWD.0.borrow_mut() = s.to_string();
+    }
 }
 
 /// Standard input, staged until the guest is loaded.

@@ -104,12 +104,36 @@ pub struct Context<'a> {
     /// Guest address -> wasm function index, for blocks already assigned an
     /// index. A miss falls back to the dispatch table.
     pub blocks: &'a HashMap<u64, u32>,
+    /// Guest address -> the block's GIR, for growing a region around a loop.
+    pub gir: &'a HashMap<u64, &'a Block>,
+}
+
+/// How many blocks may go into one region. One means off.
+///
+/// Off by default: regions are correct under the native host at every size
+/// tried and correct in the browser single-threaded, but a guest thread
+/// preempted inside one comes back with two callee-saved registers holding
+/// another thread's values. See [`Emitter::run_region`].
+fn region_limit() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("GEX_REGION")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    })
 }
 
 /// Compile one GIR block into a wasm function body.
+///
+/// When the block heads a loop, the loop's other blocks come with it: see
+/// [`Emitter::run_region`].
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx);
-    e.run(block);
+    match crate::region::grow(block.start, cx.gir, region_limit()) {
+        Some(region) if region_limit() > 1 => e.run_region(&region),
+        _ => e.run(block),
+    }
     e.f.finish()
 }
 
@@ -149,6 +173,18 @@ struct Emitter<'a> {
     /// Counts down to the next re-entry through the dispatcher, inside a
     /// fused loop. See `emit_reentry`.
     reenter_local: Option<u32>,
+    /// Set while emitting a member of a region.
+    region: Option<RegionState>,
+}
+
+/// What a region member needs to know to branch to its neighbours.
+struct RegionState {
+    /// Guest address -> arm of the dispatch table.
+    index: HashMap<u64, u32>,
+    /// The local holding which arm to run next.
+    idx_local: u32,
+    /// How many labels lie between here and the region's `loop`.
+    depth: u32,
 }
 
 impl<'a> Emitter<'a> {
@@ -173,6 +209,194 @@ impl<'a> Emitter<'a> {
             regs: HashMap::new(),
             loop_depth: None,
             reenter_local: None,
+            region: None,
+        }
+    }
+
+    /// Emit a whole loop as one function.
+    ///
+    /// The members become the arms of a `br_table` inside a `loop`, so an
+    /// edge between them is a branch and an assignment rather than a tail
+    /// call, and every guest register the loop touches is loaded once at the
+    /// top and stays in a local until control leaves. That is the difference
+    /// between a loop costing a context round-trip per edge and costing
+    /// nothing per edge, and it is also what gives V8 one function worth
+    /// optimising instead of half a dozen it will not bother with.
+    ///
+    /// Laid out as the usual nest: the table is in the innermost block, and
+    /// breaking out of the *k*th lands on the *k*th body.
+    ///
+    /// # Not finished
+    ///
+    /// Off by default (`GEX_REGION`). Two facts about a region make it
+    /// awkward, and both are handled: which registers are *dirty* depends on
+    /// the order the emitter walked the members, while control reaches them
+    /// in whatever order the guest branches, so every exit writes all of them
+    /// rather than the dirty ones; and the safepoint is a barrier in both
+    /// directions, because the host can change the context there.
+    ///
+    /// What is left is a guest thread preempted inside a region on the
+    /// browser host. It resumes at a member's address, through that member's
+    /// own standalone function, and comes back with x20 and x27 holding
+    /// values from another thread's context. Native threads are fine at every
+    /// size tried, and so is the browser with preemption turned off, so it is
+    /// something about resuming a region member rather than about regions.
+    fn run_region(&mut self, region: &[u64]) {
+        let n = region.len();
+        let index: HashMap<u64, u32> = region
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (*a, i as u32))
+            .collect();
+
+        // Every register any member touches has to be in a local before the
+        // loop: the context is authoritative on the way in and nowhere else,
+        // and one that is only ever written still has to be loaded, because
+        // an exit taken before anything wrote it would otherwise store
+        // whatever the local happened to hold.
+        let mut touched: Vec<GuestReg> = Vec::new();
+        for a in region {
+            for r in registers_touched(self.cx.gir[a]) {
+                if !touched.contains(&r) {
+                    touched.push(r);
+                }
+            }
+        }
+        touched.sort_by_key(|r| Self::reg_offset(*r));
+        for r in touched {
+            self.reg_local(r);
+        }
+
+        let idx = self.alloc(Ty::I32);
+        self.f.i32_const(0);
+        self.f.local_set(idx);
+        let counter = self.alloc(Ty::I32);
+        self.f.i32_const(loop_poll());
+        self.f.local_set(counter);
+        self.reenter_local = Some(counter);
+
+        self.f.loop_void();
+        for _ in 0..n {
+            self.f.block_void();
+        }
+        self.f.local_get(idx);
+        // Inside the innermost block, member k's label is n-1-k deep.
+        let targets: Vec<u32> = (0..n).map(|k| (n - 1 - k) as u32).collect();
+        self.f.br_table(&targets, targets[0]);
+        self.f.end();
+
+        // Bodies come out innermost first: the last member's body sits just
+        // inside the second-innermost block.
+        for k in (0..n).rev() {
+            let block = self.cx.gir[&region[k]];
+            // Depth from here back to the loop: k blocks still open.
+            self.region = Some(RegionState {
+                index: index.clone(),
+                idx_local: idx,
+                depth: k as u32,
+            });
+            self.run_member(block);
+            self.region = None;
+            if k > 0 {
+                self.f.end();
+            }
+        }
+        self.f.end(); // loop
+                      // Every member either branches back to the table or leaves the
+                      // function, so falling out of the loop cannot happen.
+        self.f.unreachable();
+    }
+
+    /// Write every register the region holds back to the context.
+    ///
+    /// Not just the dirty ones. Which registers are dirty is a fact about the
+    /// order the emitter walked the members in, and at run time control
+    /// reaches them in whatever order the guest's branches take -- a register
+    /// written by a member emitted later can already have been written by the
+    /// time this exit is taken. Storing all of them is the only version of
+    /// this that does not depend on emission order, and it costs stores only
+    /// where control leaves the loop.
+    fn flush_region_exit(&mut self) {
+        let mut all: Vec<(GuestReg, u32)> = self.regs.iter().map(|(r, c)| (*r, c.local)).collect();
+        all.sort_by_key(|(r, _)| Self::reg_offset(*r));
+        for (r, local) in all {
+            note_traffic(r);
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(local);
+            match r.ty() {
+                Ty::I32 => self.f.store(0x36, 2, Self::reg_offset(r)),
+                Ty::I64 => self.f.store(0x37, 3, Self::reg_offset(r)),
+                Ty::V128 => self.f.simd_mem(simd::V128_STORE, 4, Self::reg_offset(r)),
+            }
+        }
+    }
+
+    /// One member of a region: its body, then its terminator translated into
+    /// region terms.
+    fn run_member(&mut self, block: &Block) {
+        let n = block.n_values as usize;
+        self.value_local = vec![None; n];
+        self.value_const = vec![None; n];
+        self.value_ty = vec![Ty::I64; n];
+        let last_use = compute_last_use(block);
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            self.stmt(stmt, block);
+            for (v, &lu) in last_use.iter().enumerate() {
+                if lu == Some(i) {
+                    self.release(Value(v as u32));
+                }
+            }
+        }
+        self.region_terminator(block);
+    }
+
+    /// Go to `target`: a branch back to the table when it is in the region,
+    /// and the ordinary flush-and-tail-call when it is not.
+    fn region_goto(&mut self, target: u64, from: u64) {
+        let st = self.region.as_ref().expect("not in a region");
+        match st.index.get(&target).copied() {
+            Some(k) => {
+                let (idx_local, depth) = (st.idx_local, st.depth);
+                if target <= from {
+                    self.emit_safepoint(target);
+                }
+                self.f.i32_const(k as i32);
+                self.f.local_set(idx_local);
+                self.f.br(depth);
+            }
+            None => {
+                self.flush_region_exit();
+                if target <= from {
+                    self.emit_safepoint(target);
+                }
+                self.jump_to_constant(target);
+            }
+        }
+    }
+
+    fn region_terminator(&mut self, block: &Block) {
+        match block.term {
+            Term::Goto { target } => self.region_goto(target, block.start),
+            Term::Branch {
+                cond,
+                taken,
+                not_taken,
+            } => {
+                self.push(cond);
+                self.f.if_void();
+                // One more block is open inside the `if`.
+                if let Some(st) = self.region.as_mut() {
+                    st.depth += 1;
+                }
+                self.region_goto(taken, block.start);
+                if let Some(st) = self.region.as_mut() {
+                    st.depth -= 1;
+                }
+                self.f.end();
+                self.region_goto(not_taken, block.start);
+            }
+            // `region::grow` admits nothing else.
+            _ => unreachable!("region member with a non-branch terminator"),
         }
     }
 
@@ -1165,7 +1389,30 @@ impl<'a> Emitter<'a> {
         self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);
         self.f.call(self.cx.safepoint);
+        // Inside a region the locals *are* the guest's registers, so the call
+        // has to be a barrier in both directions: written out above, and read
+        // back here because the host may have changed them. It delivers
+        // signals, and on a host with one wasm stack it is also where guest
+        // threads change place.
+        if self.region.is_some() {
+            self.reload_region();
+        }
         self.f.end();
+    }
+
+    /// Re-read every register the region holds from the context.
+    fn reload_region(&mut self) {
+        let mut all: Vec<(GuestReg, u32)> = self.regs.iter().map(|(r, c)| (*r, c.local)).collect();
+        all.sort_by_key(|(r, _)| Self::reg_offset(*r));
+        for (r, local) in all {
+            self.f.local_get(self.ctx_local);
+            match r.ty() {
+                Ty::I32 => self.f.load(0x28, 2, Self::reg_offset(r)),
+                Ty::I64 => self.f.load(0x29, 3, Self::reg_offset(r)),
+                Ty::V128 => self.f.simd_mem(simd::V128_LOAD, 4, Self::reg_offset(r)),
+            }
+            self.f.local_set(local);
+        }
     }
 
     /// The safepoint on a fused loop's own back-edge.
@@ -1382,6 +1629,32 @@ fn note_traffic(r: GuestReg) {
     REG_TRAFFIC.with(|t| *t.borrow_mut().entry(r).or_default() += 1);
 }
 
+/// Every guest register a block reads or writes.
+///
+/// Unlike [`live_in_registers`] this does not care about order within the
+/// block: a region loads the union of these once and holds them in locals
+/// until control leaves, so what matters is only whether a register is
+/// involved at all.
+fn registers_touched(block: &Block) -> Vec<GuestReg> {
+    let mut out = Vec::new();
+    let mut note = |r: GuestReg, out: &mut Vec<GuestReg>| {
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    };
+    for s in &block.stmts {
+        match s {
+            Stmt::Def {
+                expr: Expr::ReadReg(r),
+                ..
+            } => note(*r, &mut out),
+            Stmt::WriteReg { reg, .. } => note(*reg, &mut out),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Whether a statement can leave the register cache stale.
 
 /// Iterations of a fused loop between trips through the dispatcher.
@@ -1401,7 +1674,7 @@ fn loop_poll() -> i32 {
     })
 }
 
-fn clobbers_guest_state(s: &Stmt) -> bool {
+pub fn clobbers_guest_state(s: &Stmt) -> bool {
     match s {
         Stmt::HostCall { func, .. } => func.clobbers_guest_state(),
         Stmt::Def {

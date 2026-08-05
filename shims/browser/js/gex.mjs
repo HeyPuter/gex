@@ -121,6 +121,13 @@ export class Gex {
       this.#u8.set(meta, mp);
       this.#shim.exports.gex_set_metadata(mp, meta.length);
     }
+    // Where the guest starts, for a program given relative paths.
+    if (opts.cwd) {
+      const c = new TextEncoder().encode(opts.cwd);
+      const cp = this.#shim.exports.gex_alloc(c.length) >>> 0;
+      this.#u8.set(c, cp);
+      this.#shim.exports.gex_set_cwd(cp, c.length);
+    }
     // Standard input, if the embedder has any: a page has nothing to block
     // on, so the guest is given all of it up front.
     if (opts.stdin && opts.stdin.length) {

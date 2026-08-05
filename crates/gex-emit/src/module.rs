@@ -435,6 +435,8 @@ impl ModuleBuilder {
     /// Generate all block bodies and encode the module.
     pub fn finish(mut self) -> TranslatedModule {
         let compiled: Vec<(u32, Vec<u8>)> = {
+            let gir: HashMap<u64, &Block> =
+                self.pending.iter().map(|(b, _)| (b.start, b)).collect();
             let cx = tier1::Context {
                 syscall: self.imports.syscall,
                 illegal: self.imports.illegal,
@@ -447,6 +449,7 @@ impl ModuleBuilder {
                 fma: self.imports.fma,
                 block_ty: self.block_ty,
                 blocks: &self.blocks,
+                gir: &gir,
             };
             self.pending
                 .iter()

@@ -254,6 +254,22 @@ impl FuncBody {
         self.byte(0x40);
     }
 
+    /// `block` with no result.
+    pub fn block_void(&mut self) {
+        self.byte(op::BLOCK);
+        self.byte(0x40);
+    }
+
+    /// `br_table`: branch to `targets[i]` for index `i`, or to `default`.
+    pub fn br_table(&mut self, targets: &[u32], default: u32) {
+        self.byte(op::BR_TABLE);
+        self.u32(targets.len() as u32);
+        for t in targets {
+            self.u32(*t);
+        }
+        self.u32(default);
+    }
+
     /// `loop` with no result.
     pub fn loop_void(&mut self) {
         self.byte(op::LOOP);

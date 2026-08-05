@@ -9,7 +9,8 @@
 //     --file <guest>=<host>     bundle a host file into the guest's filesystem
 //     --dir <guest>=<host>      bundle a whole directory tree
 //     --extract <guest>=<host>  write a file back out when the program ends
-//     --argv0 <name>         what the guest sees as argv[0]
+//     --argv0 <name>            what the guest sees as argv[0]
+//     --cwd <dir>               the directory the guest starts in
 //     --strace               narrate every syscall to stderr
 
 import { readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
@@ -19,6 +20,7 @@ import { Gex, Env } from './gex.mjs';
 // contain an `=` -- `lua -e 'local x=1'`, say -- reaches the guest intact.
 const files = {};
 let strace = false;
+let cwd = null;
 const extract = [];
 let argv0 = null;
 const rest = [];
@@ -51,7 +53,8 @@ const rest = [];
       const eq = spec.indexOf('=');
       if (eq <= 0) { console.error('--extract wants <guest>=<host>'); process.exit(2); }
       extract.push([spec.slice(0, eq), spec.slice(eq + 1)]);
-    } else if (av[i] === '--strace') strace = true;
+    } else if (av[i] === '--cwd') cwd = av[++i];
+    else if (av[i] === '--strace') strace = true;
     else if (av[i] === '--argv0') argv0 = av[++i];
     else break;
   }
@@ -92,6 +95,7 @@ const entry = await gex.load(shimWasm, readFileSync(guestPath), readFileSync(elf
   uid: process.getuid?.(),
   gid: process.getgid?.(),
   stdin: readStdin(),
+  cwd,
 });
 const status = await gex.run(entry);
 // Anything the program was asked to leave behind, written out for the caller.
