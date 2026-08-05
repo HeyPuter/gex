@@ -13,6 +13,7 @@ use crate::errno::{encode, Errno, SysResult};
 use crate::file::{FdTable, OpenFile, PipeEnd};
 use crate::fs::{oflags, Stat};
 use crate::mem::{flags as mflags, MemoryMap};
+use crate::futex::{self, FutexTable};
 use crate::pipe::Pipe;
 use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
 use crate::stdio::{StdStream, Stream};
@@ -143,6 +144,10 @@ pub struct Kernel {
     pub trace: bool,
     /// Signal dispositions, masks and pending set.
     pub signals: Signals,
+    /// Futex wait queues. A single-threaded guest still uses these: musl's
+    /// locks take the futex path whenever a lock is contended, and `EAGAIN`
+    /// from an already-changed word is the answer it needs.
+    pub futexes: Arc<FutexTable>,
     /// Syscalls seen but not implemented, for the ENOSYS telemetry in
     /// PLAN §14.
     pub unimplemented: Vec<u64>,
@@ -180,6 +185,7 @@ impl Kernel {
             uid: 1000,
             gid: 1000,
             signals: Signals::new(),
+            futexes: Arc::new(FutexTable::new()),
             trace: false,
             unimplemented: Vec::new(),
         }
@@ -350,6 +356,7 @@ impl Kernel {
             }
 
             nr::SET_ROBUST_LIST | nr::GET_ROBUST_LIST => Ok(0),
+            nr::FUTEX => self.sys_futex(m, a),
             // Restartable sequences are an optimisation the guest can live
             // without, and both libcs treat ENOSYS as "not available".
             nr::RSEQ => Err(Errno::ENOSYS),
@@ -365,6 +372,39 @@ impl Kernel {
             }
         };
         Ok(r)
+    }
+
+    fn sys_futex(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let (uaddr, raw_op, val, timeout) = (a[0], a[1] as u32, a[2] as u32, a[3]);
+        // The private and clock bits change nothing here: gex has one address
+        // space, and the timeout is treated as relative either way.
+        let operation = raw_op & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
+        match operation {
+            futex::op::WAIT | futex::op::WAIT_BITSET => {
+                let deadline = if timeout == 0 {
+                    None
+                } else {
+                    let secs = m.read_u64(timeout)?;
+                    let nanos = m.read_u64(timeout + 8)?;
+                    Some(std::time::Duration::new(
+                        secs.min(3600),
+                        (nanos % 1_000_000_000) as u32,
+                    ))
+                };
+                // Cloning the table first frees `self`, leaving the memory
+                // borrow uncontended for the re-read under the queue lock.
+                let futexes = Arc::clone(&self.futexes);
+                let mem = &*m;
+                futexes
+                    .wait(uaddr, val, deadline, &|| mem.read_u32(uaddr).ok())
+                    .map(|_| 0)
+            }
+            futex::op::WAKE | futex::op::WAKE_BITSET => Ok(self.futexes.wake(uaddr, val)),
+            // Requeue is an optimisation for condition variables; waking
+            // everyone is correct, if less efficient.
+            futex::op::REQUEUE | futex::op::CMP_REQUEUE => Ok(self.futexes.wake(uaddr, u32::MAX)),
+            _ => Err(Errno::ENOSYS),
+        }
     }
 
     // -- signals -------------------------------------------------------------

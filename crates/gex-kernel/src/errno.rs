@@ -41,6 +41,7 @@ impl Errno {
     pub const ENOSYS: Errno = Errno(38);
     pub const ENOTEMPTY: Errno = Errno(39);
     pub const ELOOP: Errno = Errno(40);
+    pub const ETIMEDOUT: Errno = Errno(110);
     pub const EOPNOTSUPP: Errno = Errno(95);
 
     /// The value the guest sees in `x0`.

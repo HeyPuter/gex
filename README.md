@@ -20,35 +20,43 @@ core, and executed here as WebAssembly.
 
 ---
 
-## Status: M0 complete
+## Status
 
-PLAN's M0 exit criterion is *"static musl `hello`, `cat`, `echo` run; the
-differential-fuzz harness runs in CI."* Both hold. The work also reaches into
-M1 and M2 in the places the exit criterion forced it to — musl's `memcpy` and
-`memset` are NEON, so NEON could not wait, and `printf("%f")` is scalar
-floating point, so that could not either.
+M0 and M1 are done, M2 is most of the way, and M3's runtime translation
+landed. What runs today:
 
-What runs today:
-
-* static and static-PIE aarch64 ELF images (`ET_EXEC` and `ET_DYN`);
-* the integer instruction set, scalar single/double floating point, and the
-  NEON subset real string and memory routines are built from;
-* the T0 syscall tier — enough for a program to start, do file and terminal
-  I/O, manage memory and exit;
+* **static, static-PIE and dynamically linked** aarch64 ELF images — musl's
+  own interpreter loads itself, maps libc, relocates and runs;
+* **the instruction set**: integer, scalar single/double floating point, and
+  NEON — lane arithmetic, permutes, horizontal reductions, conversions,
+  table lookup. 317 instructions out of 590,000 in the corpus are still
+  undecoded, all of them SIMD long tail;
+* **runtime translation** — a branch to an address with no translation gets
+  one, so a guest JIT or a late-loaded library needs no special handling;
+* **signals** — handler frames, `sigreturn`, alternate stacks, synchronous
+  faults, and delivery inside tight loops;
+* **a real filesystem** — mount table over tmpfs, host passthrough, synthetic
+  `/proc` and `/dev`, with the T0-T2 syscall tiers over it;
 * a native host on wasmtime, and the same modules execute unmodified on V8.
 
 What does not:
 
-* **Dynamic linking.** `PT_INTERP` is rejected with a clear error. gex-ld
-  (PLAN §6.4) is the largest single piece of remaining work.
-* **Threads, signals, `fork`/`exec`.** The context struct, safepoint counter
-  and interrupt flag are laid out for them; nothing drives them yet.
-* **Runtime translation.** An address with no translation reports precisely
-  where and why instead of translating on demand (PLAN §6.2, M3).
-* **Most of NEON**, and the FP fidelity modes in PLAN §5.7. Fast mode only.
+* **Threads.** The futex is built and tested; `clone` is not. The host needs
+  restructuring first — a shared memory instead of a module-owned one, one
+  store per thread because a wasmtime store is not shareable, and a
+  translation cache each thread instantiates from because a wasm table is not
+  shareable either. That shape is what the browser runtime needs anyway.
+* **`fork`/`exec`.** `fork` needs a second address space and the bounded
+  page copy PLAN §6.3 describes; `exec` needs to tear down and reload in
+  place.
+* **Tier-2.** Everything runs on tier-1 blocks. CFG recovery, superblocks and
+  cross-block register allocation are unbuilt (PLAN §5.5, M4).
+* **glibc.** The `GLIBC_PRIVATE` shim of PLAN §6.4 does not exist, so only
+  musl's cooperative path works. The dlopen manifest and prebinding are
+  likewise unbuilt.
 * **The browser host.** The kernel is written against a byte slice
-  specifically so it can be compiled to wasm later without a second
-  implementation, but the Worker/SharedArrayBuffer shim does not exist.
+  specifically so it can be compiled to wasm without a second
+  implementation, but the Worker/OPFS shim does not exist.
 
 ---
 
@@ -71,7 +79,7 @@ What does not:
 | `gex-emit` | wasm binary writer and tier-1 code generation |
 | `gex-ld` | ELF loading, relocations, initial process stack |
 | `gex-xlate` | code discovery and the translation driver |
-| `gex-kernel` | the Linux personality: syscalls, VFS, memory map |
+| `gex-kernel` | the Linux personality: syscalls, VFS, signals, memory map |
 | `shims/native` | wasmtime host |
 | `gexc` | the command-line driver |
 
@@ -90,8 +98,19 @@ address can become an entry point later without retranslating anything.
 Indirect branches go through a funcref table indexed by `(pc - base) >> 2`.
 
 **Discovery is never load-bearing for correctness.** Anything the translator
-fails to find lands on a stub that reports the exact address. That is what
-made it safe to ship an aggressive discovery strategy and tighten it later.
+fails to find lands on a stub, which now translates it on demand. That is
+also what makes it safe for discovery to *speculate*: runtime translation
+constant-folds through initialised memory to read a PLT's GOT slot and follow
+the call, and if that slot later changes the only cost is a wasted
+translation, never a wrong branch.
+
+**The dispatch table is a page directory, not a flat array.** A flat table
+indexed by `(pc - base) >> 2` cannot span an address space with libraries
+mapped far apart. One `u32` per 4 KiB page of guest text, held in guest
+memory, keeps the table proportional to the code actually mapped. The lookup
+stays branchless: a page with no translation has an entry of zero, so the
+index lands in a reserved span of miss stubs, which is the answer wanted
+anyway.
 
 ---
 
@@ -123,8 +142,9 @@ $ aarch64-linux-musl-objdump -d /path/to/binary \
     | cargo run --release --example objdump-diff -p gex-isa
 ```
 
-Across 584,417 instructions from linked aarch64 binaries — musl, libstdc++,
-libgfortran, libgomp, libitm, libgcc — there are zero mnemonic mismatches.
+Across 590,593 instructions from linked aarch64 binaries — musl, libstdc++,
+libgfortran, libgomp, libitm, libgcc — there are zero mnemonic mismatches and
+317 undecoded.
 
 **Lifter, against QEMU.** Random instructions are wrapped in a harness that
 seeds every register and the flags, executes the candidate, and dumps the
@@ -139,10 +159,12 @@ $ cargo run --release -p gex-difffuzz -- --iters 5000 --verbose
 across all thirteen data-processing families — currently agree with QEMU
 exactly.
 
-**Whole programs, against QEMU.** Compiled C exercising arithmetic and flags,
-floating point, memory and strings, control flow (including jump tables,
-function pointers and `longjmp`) and the syscall surface, at `-O0` and `-O2`,
-static and static-PIE:
+**Whole programs, against QEMU.** Thirty comparisons over compiled C
+exercising arithmetic and flags, floating point, memory and strings, control
+flow (jump tables, function pointers, `longjmp`), the filesystem and
+descriptor surface, signal delivery, and `-O3` auto-vectorised NEON — built
+static, static-PIE and dynamically linked, at `-O0`, `-O2` and `-O3`, with
+runtime translation both on and off:
 
 ```console
 $ tests/integration/run.sh
@@ -213,7 +235,8 @@ deliberate trade recorded here so nobody has to rediscover it.
   `AT_HWCAP`, so no well-behaved guest emits it.
 * **`fcmpe` does not raise on quiet NaN**, because FP exceptions are not
   modelled at all.
-* **Exhaustive discovery is a stopgap.** Until runtime translation lands,
-  every decodable 4-byte-aligned text address is translated ahead of time,
-  which costs module size. Jump tables are why: they store scaled relative
-  offsets that no pointer scan can recognise.
+* **Protection changes do not invalidate translations.** A page rewritten
+  before it was ever branched to needs nothing, because translation is lazy
+  and keyed by address. Invalidating a page that *was* already translated —
+  the `IC IVAU` hook in PLAN §6.2 — is not implemented, so a guest JIT that
+  reuses an address for different code would run the old translation.

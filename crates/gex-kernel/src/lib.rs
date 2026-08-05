@@ -14,6 +14,7 @@
 pub mod errno;
 pub mod file;
 pub mod fs;
+pub mod futex;
 pub mod mem;
 pub mod pipe;
 pub mod signal;
