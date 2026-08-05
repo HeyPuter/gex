@@ -123,17 +123,39 @@ export class Gex {
    * never becomes wasm stack depth.
    */
   run(entry) {
-    const CTX = 0x1000;
+    // Every thread switch and every signal leaves wasm by trapping, and V8
+    // captures a stack trace for each trap it turns into a RuntimeError.
+    // Nothing here ever reads one, and a program with contended locks takes
+    // hundreds of thousands of them.
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 0;
+    try {
+      return this.#runLoop(entry);
+    } finally {
+      Error.stackTraceLimit = limit;
+    }
+  }
+
+  #runLoop(entry) {
     let pc = entry;
+    // The first guest thread's context; a switch hands back a different one.
+    let ctx = 0x1000;
     for (;;) {
       try {
-        this.#guest.exports.enter(CTX, pc);
+        this.#guest.exports.enter(ctx, pc);
         return this.#shim.exports.gex_exit_code();
       } catch (err) {
         // The shim traps out of the guest stack rather than returning: a
         // redirect resumes elsewhere, anything else is the end of the run.
+        // A thread switch is the same mechanism -- the shim leaves the stack
+        // and names the context to come back on.
         const next = this.#shim.exports.gex_resume_pc();
-        if (next !== 0n) { pc = next; continue; }
+        if (next !== 0n) {
+          pc = next;
+          const nextCtx = this.#shim.exports.gex_resume_ctx() >>> 0;
+          if (nextCtx !== 0) ctx = nextCtx;
+          continue;
+        }
         if (String(err).includes("unreachable")) {
           return this.#shim.exports.gex_exit_code();
         }

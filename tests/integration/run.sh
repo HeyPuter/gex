@@ -351,6 +351,10 @@ for area in arith float mem flow sys; do
 done
 browser "vfs" "$WORK/vfs"
 browser "signal-all" "$WORK/signals" all
+# Guest threads, on one wasm stack: pthreads, mutexes, condition variables,
+# thread-local storage, and a main that calls exit_group while others spin.
+browser "threads" "$WORK/threads"
+browser "thread-exit-race" "$WORK/exitrace"
 if [ -n "$CPP" ]; then
     browser "cpp" "$WORK/cpp"
 fi

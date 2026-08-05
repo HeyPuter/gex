@@ -24,9 +24,14 @@
 //! checks twelve programs on every invocation -- the whole conformance suite,
 //! the VFS, signals, NEON and C++ exceptions.
 //!
-//! Not yet: threads (one Worker each, and the memory would have to be
-//! declared shared), `fork`, and runtime translation, so a module must be
-//! built with `--exhaustive`.
+//! Guest threads run too, cooperatively on the one wasm stack rather than on
+//! Workers: pthreads, mutexes, condition variables and thread-local storage
+//! all work, and six threads sharing one SQLite connection give byte-identical
+//! output. See [`schedule`].
+//!
+//! Not yet: real parallelism (a Worker each, with the memory declared shared),
+//! `fork`, and runtime translation, so a module must be built with
+//! `--exhaustive`.
 //!
 //! # What JS still does
 //!
@@ -194,6 +199,37 @@ unsafe impl std::alloc::GlobalAlloc for Heap {
     }
 }
 
+/// Why a guest thread is not running.
+enum Waiting {
+    /// Ready to be picked up.
+    Runnable,
+    /// Parked on a futex, until it is woken or the deadline passes.
+    Futex {
+        parked: gex_kernel::futex::Parked,
+        deadline: Option<u64>,
+    },
+    /// Sleeping until this many nanoseconds on the host clock.
+    Sleep(u64),
+    /// Finished; the slot stays so a `join` can still find the tid.
+    Exited,
+}
+
+/// One guest thread.
+///
+/// Every register it has is in its context in guest memory, so switching to it
+/// is a call to the guest module's entry with a different context pointer.
+/// There is no stack to save: the shim leaves the guest's wasm stack behind
+/// entirely, which is the same thing the native host does for a signal.
+struct Thread {
+    kstate: ThreadState,
+    /// Where to resume, which for a thread that blocked is the instruction
+    /// after its `svc`.
+    pc: u64,
+    waiting: Waiting,
+    /// The syscall to finish before it runs again.
+    blocked_on: Option<gex_kernel::BlockOp>,
+}
+
 struct Host {
     kernel: Kernel,
     /// The root filesystem, kept so files can be added before the guest runs.
@@ -201,9 +237,14 @@ struct Host {
     /// The snapshot `/proc` reads from, refreshed before each syscall that
     /// could look at it.
     proc_state: Arc<gex_kernel::KernelProcSource>,
-    thread: ThreadState,
+    /// Every guest thread, the running one included.
+    threads: Vec<Thread>,
+    /// Index into `threads` of the one on the wasm stack right now.
+    current: usize,
     exit: Option<i32>,
     resume: Option<u64>,
+    /// Set alongside `resume` when the scheduler switched threads.
+    resume_ctx: Option<u64>,
 }
 
 thread_local! {
@@ -430,9 +471,16 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             kernel,
             root,
             proc_state,
-            thread: ThreadState::new(gex_abi::ctx_addr(0), 1),
+            threads: vec![Thread {
+                kstate: ThreadState::new(gex_abi::ctx_addr(0), 1),
+                pc: entry as u64,
+                waiting: Waiting::Runnable,
+                blocked_on: None,
+            }],
+            current: 0,
             exit: None,
             resume: None,
+            resume_ctx: None,
         });
     });
     entry
@@ -535,11 +583,12 @@ fn trace_line(s: &str) {
 pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
-        let base = gex_abi::ctx_addr(0);
+        let base = with_host(|h| h.threads[h.current].kstate.ctx_addr);
         let g = |i: usize| gm.read_u64(base + ctx::x(i as u8) as u64).unwrap_or(0);
         let n = g(8);
+        let who = with_host(|h| h.current);
         trace_line(&format!(
-            "[gex] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}) ...\n",
+            "[gex] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}) ...\n",
             gex_kernel::syscalls::syscall_name(n),
             g(0),
             g(1),
@@ -562,18 +611,19 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
     }
     let stop = with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
-        h.kernel.enter_thread(&h.thread);
+        let kstate = h.threads[h.current].kstate.clone();
+        h.kernel.enter_thread(&kstate);
         // Rebuilding the snapshot costs more than most syscalls do, and only
         // a handful can observe it, so the rest skip it.
         let nr = gm
-            .read_u64(h.thread.ctx_addr + ctx::x(8) as u64)
+            .read_u64(kstate.ctx_addr + ctx::x(8) as u64)
             .unwrap_or(!0);
         if !gex_kernel::skips_proc_snapshot(nr) {
             let st = Arc::clone(&h.proc_state);
             h.kernel.refresh_proc(&st.0);
         }
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
-        h.kernel.leave_thread(&mut h.thread);
+        h.kernel.leave_thread(&mut h.threads[h.current].kstate);
         match outcome {
             SyscallOutcome::Continue => 0,
             SyscallOutcome::Resume(target) => {
@@ -588,23 +638,205 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                 h.exit = Some(128 + signal as i32);
                 2
             }
-            // One thread, no scheduler: a call that wants to block, fork or
-            // exec cannot be served. Saying so beats hanging.
+            SyscallOutcome::SpawnThread {
+                ctx_addr,
+                tid,
+                clear_child_tid,
+            } => {
+                // The kernel has already written the child's context; it
+                // starts at the pc that context carries.
+                let start = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+                h.threads.push(Thread {
+                    kstate: ThreadState {
+                        ctx_addr,
+                        tid,
+                        clear_child_tid,
+                    },
+                    pc: start,
+                    waiting: Waiting::Runnable,
+                    blocked_on: None,
+                });
+                // The parent carries straight on, as it does on Linux. The
+                // child waits for the first time the parent gives up the
+                // stack, which is what a safepoint or a blocking call is.
+                0
+            }
+            SyscallOutcome::ThreadExit => {
+                h.threads[h.current].waiting = Waiting::Exited;
+                3
+            }
+            SyscallOutcome::Blocking(op) => {
+                let waiting = match &op {
+                    gex_kernel::BlockOp::FutexWait {
+                        table,
+                        uaddr,
+                        deadline,
+                        ..
+                    } => Waiting::Futex {
+                        parked: table.park(*uaddr),
+                        deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
+                    },
+                    gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
+                    // Without `fork` there are no children to wait for, so
+                    // this can only be a wait that would never return.
+                    gex_kernel::BlockOp::WaitChild { .. } => Waiting::Exited,
+                };
+                let t = &mut h.threads[h.current];
+                t.pc = pc as u64 + 4;
+                t.waiting = waiting;
+                t.blocked_on = Some(op);
+                3
+            }
+            // `fork` and `execve` need a second address space, which a page
+            // has no way to give them. Saying so beats hanging.
             _ => {
                 h.exit = Some(128 + 31);
                 2
             }
         }
     });
+    // 3 means the running thread gave up the wasm stack: pick another.
+    let stop = if stop == 3 { schedule() } else { stop };
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
-        let x0 = gm
-            .read_u64(gex_abi::ctx_addr(0) + ctx::x(0) as u64)
-            .unwrap_or(0);
-        trace_line(&format!("[gex]   = {}\n", x0 as i64));
+        let (i, ctx_addr) = with_host(|h| (h.current, h.threads[h.current].kstate.ctx_addr));
+        let x0 = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
+        trace_line(&format!("[gex]   t{i} = {}\n", x0 as i64));
     }
     if stop != 0 {
         trap();
+    }
+}
+
+/// Nanoseconds on the host clock.
+fn now_ns() -> u64 {
+    unsafe { now() as u64 }
+}
+
+/// Choose the next guest thread to run, and finish whatever syscall it was in
+/// the middle of.
+///
+/// Known limitation: shortening the time slice to 64 safepoints makes six
+/// threads sharing a SQLite connection return through a corrupt link
+/// register. At the slice used here, and at every longer one tried, it is
+/// byte-identical to QEMU -- so something about the switch is not yet exact
+/// and the coarse slice is hiding it rather than fixing it.
+///
+/// The browser host has one wasm stack and no way to block on it, so guest
+/// threads are cooperative: a thread keeps the stack until it blocks, exits,
+/// or spawns another. Every register it owns is in its context in guest
+/// memory, so a switch is nothing more than re-entering the guest module with
+/// a different context pointer -- which is why this works at all without
+/// Workers, shared memory or a second stack.
+///
+/// Returns 2 when the process is over and 1 to re-enter the guest.
+fn schedule() -> i32 {
+    loop {
+        let pick = with_host(|h| {
+            // Nothing left that could ever run again ends the process, and
+            // the exit status is the one the main thread would have given.
+            if h.threads
+                .iter()
+                .all(|t| matches!(t.waiting, Waiting::Exited))
+            {
+                h.exit.get_or_insert(0);
+                return None;
+            }
+            let now = now_ns();
+            // Round-robin from the one after the current, so a thread that
+            // yields does not immediately get the stack back.
+            let n = h.threads.len();
+            for step in 1..=n {
+                let i = (h.current + step) % n;
+                let ready = match &h.threads[i].waiting {
+                    Waiting::Runnable => true,
+                    Waiting::Futex { parked, deadline } => {
+                        parked.woken() || deadline.is_some_and(|d| now >= d)
+                    }
+                    Waiting::Sleep(d) => now >= *d,
+                    Waiting::Exited => false,
+                };
+                if ready {
+                    let timed_out = match &h.threads[i].waiting {
+                        Waiting::Futex { parked, .. } => !parked.woken(),
+                        _ => false,
+                    };
+                    return Some(Some((i, timed_out)));
+                }
+            }
+            // Everything is asleep or parked with a deadline. There is no
+            // other thread to advance the clock, so spinning is the only way
+            // to reach the earliest one.
+            Some(None)
+        });
+        let Some(pick) = pick else {
+            return 2;
+        };
+        let Some((i, timed_out)) = pick else {
+            if with_host(|h| {
+                h.threads
+                    .iter()
+                    .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
+            }) {
+                // Every remaining thread is parked on a futex nothing will
+                // ever wake. On Linux this hangs; saying so is more useful.
+                trace_line("gex: every thread is blocked on a futex\n");
+                with_host(|h| h.exit = Some(128 + 31));
+                return 2;
+            }
+            continue;
+        };
+        if tracing() {
+            let (pc, blocked) = with_host(|h| (h.threads[i].pc, h.threads[i].blocked_on.is_some()));
+            trace_line(&format!(
+                "[gex] switch to thread {i} at pc={pc:#x} blocked={blocked}
+"
+            ));
+        }
+        let resume = with_host(|h| {
+            h.current = i;
+            let t = &mut h.threads[i];
+            t.waiting = Waiting::Runnable;
+            let op = t.blocked_on.take();
+            let (pc, kstate) = (t.pc, t.kstate.clone());
+            if let Some(op) = op {
+                // The syscall that parked this thread still owes it a return
+                // value, and the kernel writes that into the context of
+                // whichever thread it thinks is running.
+                let mut gm = GuestMem::new(guest_bytes());
+                h.kernel.enter_thread(&kstate);
+                let r = finish_parked(&op, timed_out);
+                let outcome = h.kernel.finish_blocking(&mut gm, r);
+                h.kernel.leave_thread(&mut h.threads[h.current].kstate);
+                if let SyscallOutcome::Exit(code) = outcome {
+                    h.exit = Some(code);
+                    return None;
+                }
+            }
+            Some((kstate.ctx_addr, pc))
+        });
+        match resume {
+            Some((ctx_addr, pc)) => {
+                with_host(|h| {
+                    h.resume = Some(pc);
+                    h.resume_ctx = Some(ctx_addr);
+                });
+                return 1;
+            }
+            None => return 2,
+        }
+    }
+}
+
+/// What a parked syscall should return now that its thread is running again.
+///
+/// A woken futex returns zero and the guest re-checks its own condition, the
+/// same as on Linux, where a wake is never a promise about the word.
+fn finish_parked(op: &gex_kernel::BlockOp, timed_out: bool) -> Result<u64, Errno> {
+    match op {
+        gex_kernel::BlockOp::FutexWait { .. } if timed_out => Err(Errno::ETIMEDOUT),
+        gex_kernel::BlockOp::FutexWait { .. } | gex_kernel::BlockOp::Sleep(_) => Ok(0),
+        gex_kernel::BlockOp::WaitChild { .. } => Err(Errno::ECHILD),
     }
 }
 
@@ -616,6 +848,13 @@ fn trap() -> ! {
 #[no_mangle]
 pub extern "C" fn gex_resume_pc() -> i64 {
     with_host(|h| h.resume.take().unwrap_or(0) as i64)
+}
+
+/// The context to re-enter with, which changes when the scheduler switches
+/// threads. Zero means "the same one as before".
+#[no_mangle]
+pub extern "C" fn gex_resume_ctx() -> i32 {
+    with_host(|h| h.resume_ctx.take().unwrap_or(0) as i32)
 }
 
 #[no_mangle]
@@ -694,8 +933,68 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         dst.fill(0);
     }
 }
+/// A poll on a loop back-edge, and the browser host's only preemption point.
+///
+/// With one wasm stack shared by every guest thread, a thread that neither
+/// blocks nor exits would otherwise keep the machine to itself for as long as
+/// it liked -- and a spin loop waiting on another thread would hang the
+/// process outright. The guest's registers are all flushed to its context
+/// before this call and the pc it is given is the branch target, so this is
+/// exactly the point at which the stack can be handed to someone else.
 #[no_mangle]
-pub extern "C" fn gex_safepoint(_ctx: i32, _pc: i64) {}
+pub extern "C" fn gex_safepoint(_ctx: i32, pc: i64) {
+    // Leaving wasm is not free -- it is a trap, a JS catch and a re-entry --
+    // so a thread gets many safepoints' worth of machine before it is asked
+    // to give it up. The slice is still short enough that a spin loop waiting
+    // on another thread makes progress promptly.
+    const SAFEPOINTS_PER_SLICE: u32 = 4096;
+    static mut TICK: u32 = 0;
+    let due = unsafe {
+        TICK = TICK.wrapping_add(1);
+        TICK.is_multiple_of(SAFEPOINTS_PER_SLICE)
+    };
+    if !due {
+        return;
+    }
+    let switch = with_host(|h| {
+        if h.threads.len() < 2 {
+            return false;
+        }
+        let now = now_ns();
+        let runnable = h.threads.iter().enumerate().any(|(i, t)| {
+            i != h.current
+                && match &t.waiting {
+                    Waiting::Runnable => true,
+                    Waiting::Futex { parked, deadline } => {
+                        parked.woken() || deadline.is_some_and(|d| now >= d)
+                    }
+                    Waiting::Sleep(d) => now >= *d,
+                    Waiting::Exited => false,
+                }
+        });
+        if runnable {
+            if tracing() {
+                trace_line(&format!(
+                    "[gex] preempt t{} at pc={:#x}\n",
+                    h.current, pc as u64
+                ));
+            }
+            // The context's own PC has to be exact too: a plain branch does
+            // not store it, and the next thing to read it -- a signal frame,
+            // a `clone` copying this context -- would otherwise see wherever
+            // the guest last happened to leave it.
+            let a = h.threads[h.current].kstate.ctx_addr;
+            let mut gm = GuestMem::new(guest_bytes());
+            let _ = gm.write_u64(a + ctx::PC as u64, pc as u64);
+            h.threads[h.current].pc = pc as u64;
+            h.threads[h.current].waiting = Waiting::Runnable;
+        }
+        runnable
+    });
+    if switch && schedule() != 0 {
+        trap();
+    }
+}
 
 /// A dispatch miss, with no runtime translator behind it. A module built with
 /// `--exhaustive` should never reach one.
@@ -703,7 +1002,13 @@ pub extern "C" fn gex_safepoint(_ctx: i32, _pc: i64) {}
 pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // Silence here is the worst outcome: the guest simply stops, and the
     // exit status looks like a segfault it never took.
-    trace_line(&format!("gex: no translation for pc={pc:#x}\n"));
+    let (i, addr) = with_host(|h| (h.current, h.threads[h.current].kstate.ctx_addr));
+    let gm = GuestMem::new(guest_bytes());
+    trace_line(&format!(
+        "gex: no translation for pc={pc:#x} (thread {i}, ctx {addr:#x}, ctx.pc={:#x}, x30={:#x})\n",
+        gm.read_u64(addr + ctx::PC as u64).unwrap_or(0),
+        gm.read_u64(addr + ctx::x(30) as u64).unwrap_or(0)
+    ));
     with_host(|h| h.exit = Some(128 + 11));
     trap();
 }

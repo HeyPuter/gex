@@ -37,6 +37,23 @@ struct Queue {
     ready: Condvar,
 }
 
+/// A place on a futex queue, held by a host that polls instead of blocking.
+///
+/// Holding it keeps the queue alive, so [`FutexTable::gc`] cannot drop the
+/// generation counter this is watching.
+#[derive(Debug)]
+pub struct Parked {
+    queue: Arc<Queue>,
+    at: u64,
+}
+
+impl Parked {
+    /// Whether anything has woken this address since the park.
+    pub fn woken(&self) -> bool {
+        *self.queue.generation.lock().unwrap() != self.at
+    }
+}
+
 /// The process's futex queues.
 #[derive(Default, Debug)]
 pub struct FutexTable {
@@ -118,6 +135,23 @@ impl FutexTable {
         }
     }
 
+    /// Take a place on `addr`'s queue without blocking on it.
+    ///
+    /// For a host that has no threads to block -- the browser's, where every
+    /// guest thread shares one wasm stack and the scheduler is cooperative.
+    /// Such a host cannot call [`Self::wait`], because there is nothing to
+    /// wake it; instead it parks here and asks [`Parked::woken`] each time it
+    /// looks for something to run.
+    ///
+    /// There is no race to close, unlike in [`Self::wait`]: a host with one
+    /// thread of execution cannot have a waker slip between the caller's
+    /// comparison and this call.
+    pub fn park(&self, addr: u64) -> Parked {
+        let queue = self.queue(addr);
+        let at = *queue.generation.lock().unwrap();
+        Parked { queue, at }
+    }
+
     /// Wake every waiter on every queue.
     ///
     /// Used when the process is ending: a thread parked on a futex will never
@@ -145,6 +179,26 @@ impl FutexTable {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn a_parked_waiter_sees_a_wake_without_blocking() {
+        let t = FutexTable::new();
+        let p = t.park(0x1000);
+        assert!(!p.woken());
+        assert_eq!(t.wake(0x2000, 1), 0);
+        assert!(!p.woken());
+        t.wake(0x1000, 1);
+        assert!(p.woken());
+    }
+
+    #[test]
+    fn parking_keeps_the_queue_alive_through_a_collection() {
+        let t = FutexTable::new();
+        let p = t.park(0x1000);
+        t.gc();
+        t.wake(0x1000, 1);
+        assert!(p.woken());
+    }
 
     #[test]
     fn a_changed_value_does_not_sleep() {
