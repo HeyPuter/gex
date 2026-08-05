@@ -42,6 +42,9 @@ pub fn const_fold(block: &mut Block) {
             *expr = match ty {
                 Ty::I32 => Expr::ConstI32(folded as u32),
                 Ty::I64 => Expr::ConstI64(folded),
+                // Vector expressions never fold to a scalar, so `eval` cannot
+                // return one for them.
+                Ty::V128 => unreachable!("vector expression folded to a scalar"),
             };
             known[dst.0 as usize] = Some(folded & ty.mask());
         } else if let Expr::ConstI32(c) = *expr {
@@ -129,11 +132,11 @@ fn eval_bin(op: BinOp, ty: Ty, a: u64, b: u64) -> Option<u64> {
         BinOp::ShrU => (a & m).wrapping_shr(sh),
         BinOp::ShrS => match ty {
             Ty::I32 => ((a as u32 as i32) >> sh) as u32 as u64,
-            Ty::I64 => ((a as i64) >> sh) as u64,
+            Ty::I64 | Ty::V128 => ((a as i64) >> sh) as u64,
         },
         BinOp::Rotr => match ty {
             Ty::I32 => (a as u32).rotate_right(sh) as u64,
-            Ty::I64 => a.rotate_right(sh),
+            Ty::I64 | Ty::V128 => a.rotate_right(sh),
         },
         // Division is left to run time: folding it here would have to
         // reproduce wasm's trapping behaviour exactly, and the lifter has
@@ -148,11 +151,11 @@ fn eval_un(op: UnOp, ty: Ty, a: u64) -> u64 {
     let a = a & m;
     match (op, ty) {
         (UnOp::Clz, Ty::I32) => (a as u32).leading_zeros() as u64,
-        (UnOp::Clz, Ty::I64) => a.leading_zeros() as u64,
+        (UnOp::Clz, _) => a.leading_zeros() as u64,
         (UnOp::Ctz, Ty::I32) => (a as u32).trailing_zeros() as u64,
-        (UnOp::Ctz, Ty::I64) => a.trailing_zeros() as u64,
+        (UnOp::Ctz, _) => a.trailing_zeros() as u64,
         (UnOp::Popcnt, Ty::I32) => (a as u32).count_ones() as u64,
-        (UnOp::Popcnt, Ty::I64) => a.count_ones() as u64,
+        (UnOp::Popcnt, _) => a.count_ones() as u64,
         (UnOp::Not, _) => !a,
         (UnOp::Neg, _) => 0u64.wrapping_sub(a),
     }
@@ -163,7 +166,7 @@ fn eval_cmp(op: CmpOp, ty: Ty, a: u64, b: u64) -> u32 {
     let (au, bu) = (a & m, b & m);
     let (as_, bs) = match ty {
         Ty::I32 => (au as u32 as i32 as i64, bu as u32 as i32 as i64),
-        Ty::I64 => (au as i64, bu as i64),
+        Ty::I64 | Ty::V128 => (au as i64, bu as i64),
     };
     let r = match op {
         CmpOp::Eq => au == bu,

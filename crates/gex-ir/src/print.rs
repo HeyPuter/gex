@@ -6,6 +6,7 @@ use std::fmt::Write;
 fn reg(r: GuestReg) -> String {
     match r {
         GuestReg::X(n) => format!("x{n}"),
+        GuestReg::V128(n) => format!("v{n}"),
         GuestReg::Sp => "sp".into(),
         GuestReg::Pc => "pc".into(),
         GuestReg::N => "nf".into(),
@@ -24,6 +25,7 @@ fn ty(t: Ty) -> &'static str {
     match t {
         Ty::I32 => "i32",
         Ty::I64 => "i64",
+        Ty::V128 => "v128",
     }
 }
 
@@ -102,6 +104,31 @@ fn expr(e: &Expr) -> String {
         Expr::HostCall { func, args, ty: t } => {
             format!("hostcall.{} {func:?}({args:?})", ty(*t))
         }
+        Expr::VLoad {
+            addr,
+            offset,
+            bytes,
+        } => format!("vload{} [{addr:?}{}]", bytes * 8, off(*offset)),
+        Expr::VConst(b) => format!("v128 {b:02x?}"),
+        Expr::VSplat { a, lane_bytes } => format!("splat{} {a:?}", lane_bytes * 8),
+        Expr::VBin { op, a, b } => format!("v{op:?} {a:?}, {b:?}").to_lowercase(),
+        Expr::VExtract {
+            a,
+            lane,
+            lane_bytes,
+            signed,
+            ..
+        } => format!(
+            "extract{}{} {a:?}[{lane}]",
+            lane_bytes * 8,
+            if *signed { "s" } else { "u" }
+        ),
+        Expr::VReplace {
+            a,
+            lane,
+            lane_bytes,
+            val,
+        } => format!("replace{} {a:?}[{lane}] = {val:?}", lane_bytes * 8),
     }
 }
 
@@ -134,6 +161,14 @@ pub fn block(b: &Block) -> String {
             }
             Stmt::HostCall { func, args } => {
                 let _ = writeln!(s, "  hostcall {func:?}({args:?})");
+            }
+            Stmt::VStore {
+                addr,
+                offset,
+                val,
+                bytes,
+            } => {
+                let _ = writeln!(s, "  vstore{} [{addr:?}{}] = {val:?}", bytes * 8, off(*offset));
             }
             Stmt::Fence => {
                 let _ = writeln!(s, "  fence");

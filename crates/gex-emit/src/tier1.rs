@@ -20,6 +20,53 @@ use gex_abi::{ctx, GUEST_LIMIT, POISON_ADDR};
 use gex_ir::*;
 use std::collections::HashMap;
 
+/// SIMD sub-opcodes (the 0xFD prefix space).
+mod simd {
+    pub const V128_LOAD: u32 = 0x00;
+    pub const V128_LOAD8_SPLAT: u32 = 0x07;
+    pub const V128_LOAD16_SPLAT: u32 = 0x08;
+    pub const V128_LOAD32_SPLAT: u32 = 0x09;
+    pub const V128_LOAD64_SPLAT: u32 = 0x0a;
+    pub const V128_STORE: u32 = 0x0b;
+    pub const I8X16_EXTRACT_LANE_S: u32 = 0x15;
+    pub const I8X16_EXTRACT_LANE_U: u32 = 0x16;
+    pub const I8X16_REPLACE_LANE: u32 = 0x17;
+    pub const I16X8_EXTRACT_LANE_S: u32 = 0x18;
+    pub const I16X8_EXTRACT_LANE_U: u32 = 0x19;
+    pub const I16X8_REPLACE_LANE: u32 = 0x1a;
+    pub const I32X4_EXTRACT_LANE: u32 = 0x1b;
+    pub const I32X4_REPLACE_LANE: u32 = 0x1c;
+    pub const I64X2_EXTRACT_LANE: u32 = 0x1d;
+    pub const I64X2_REPLACE_LANE: u32 = 0x1e;
+    pub const I8X16_SPLAT: u32 = 0x0f;
+    pub const I16X8_SPLAT: u32 = 0x10;
+    pub const I32X4_SPLAT: u32 = 0x11;
+    pub const I64X2_SPLAT: u32 = 0x12;
+    pub const V128_AND: u32 = 0x4e;
+    pub const V128_ANDNOT: u32 = 0x4f;
+    pub const V128_OR: u32 = 0x50;
+    pub const V128_XOR: u32 = 0x51;
+    pub const V128_LOAD8_LANE: u32 = 0x54;
+    pub const V128_LOAD16_LANE: u32 = 0x55;
+    pub const V128_LOAD32_LANE: u32 = 0x56;
+    pub const V128_LOAD64_LANE: u32 = 0x57;
+    pub const V128_STORE8_LANE: u32 = 0x58;
+    pub const V128_STORE16_LANE: u32 = 0x59;
+    pub const V128_STORE32_LANE: u32 = 0x5a;
+    pub const V128_STORE64_LANE: u32 = 0x5b;
+    pub const V128_LOAD32_ZERO: u32 = 0x5c;
+    pub const V128_LOAD64_ZERO: u32 = 0x5d;
+}
+
+/// The wasm value type backing a GIR type.
+fn val_type(ty: Ty) -> ValType {
+    match ty {
+        Ty::I32 => ValType::I32,
+        Ty::I64 => ValType::I64,
+        Ty::V128 => ValType::V128,
+    }
+}
+
 // Numeric opcodes, grouped so the i32/i64 pairs stay visibly adjacent.
 mod code {
     pub const I64_EQ: u8 = 0x51;
@@ -87,11 +134,12 @@ struct Emitter<'a> {
     value_local: Vec<Option<u32>>,
     /// Constant value of each GIR value, when known.
     value_const: Vec<Option<u64>>,
-    /// Width of each GIR value, needed to pick the right local pool.
-    value_is_i32: Vec<bool>,
+    /// Type of each GIR value, needed to pick the right local pool.
+    value_ty: Vec<Ty>,
     /// Free locals available for reuse, by type.
     free_i32: Vec<u32>,
     free_i64: Vec<u32>,
+    free_v128: Vec<u32>,
     /// Guest register cache.
     regs: HashMap<GuestReg, Cached>,
 }
@@ -107,9 +155,10 @@ impl<'a> Emitter<'a> {
             scratch_i64,
             value_local: Vec::new(),
             value_const: Vec::new(),
-            value_is_i32: Vec::new(),
+            value_ty: Vec::new(),
             free_i32: Vec::new(),
             free_i64: Vec::new(),
+            free_v128: Vec::new(),
             regs: HashMap::new(),
         }
     }
@@ -118,7 +167,7 @@ impl<'a> Emitter<'a> {
         let n = block.n_values as usize;
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
-        self.value_is_i32 = vec![false; n];
+        self.value_ty = vec![Ty::I64; n];
 
         let last_use = compute_last_use(block);
 
@@ -140,14 +189,12 @@ impl<'a> Emitter<'a> {
         let pool = match ty {
             Ty::I32 => &mut self.free_i32,
             Ty::I64 => &mut self.free_i64,
+            Ty::V128 => &mut self.free_v128,
         };
         if let Some(l) = pool.pop() {
             return l;
         }
-        self.f.add_local(match ty {
-            Ty::I32 => ValType::I32,
-            Ty::I64 => ValType::I64,
-        })
+        self.f.add_local(val_type(ty))
     }
 
     fn release(&mut self, v: Value) {
@@ -156,12 +203,10 @@ impl<'a> Emitter<'a> {
             return;
         }
         if let Some(local) = self.value_local[idx].take() {
-            // The type is recoverable from which pool the local came from;
-            // track it by checking the recorded type on allocation instead.
-            if self.value_is_i32[idx] {
-                self.free_i32.push(local);
-            } else {
-                self.free_i64.push(local);
+            match self.value_ty[idx] {
+                Ty::I32 => self.free_i32.push(local),
+                Ty::I64 => self.free_i64.push(local),
+                Ty::V128 => self.free_v128.push(local),
             }
         }
     }
@@ -176,7 +221,7 @@ impl<'a> Emitter<'a> {
                 // in liveness; constants are re-materialised inline, which is
                 // cheaper than a local anyway.
                 match self.value_const.get(idx).copied().flatten() {
-                    Some(c) if self.value_is_i32[idx] => self.f.i32_const(c as i32),
+                    Some(c) if self.value_ty[idx] == Ty::I32 => self.f.i32_const(c as i32),
                     Some(c) => self.f.i64_const(c as i64),
                     None => panic!("value {v:?} used after release"),
                 }
@@ -189,6 +234,7 @@ impl<'a> Emitter<'a> {
     fn reg_offset(r: GuestReg) -> u32 {
         (match r {
             GuestReg::X(n) => ctx::x(n),
+            GuestReg::V128(n) => ctx::v(n),
             GuestReg::Sp => ctx::SP,
             GuestReg::Pc => ctx::PC,
             GuestReg::N => ctx::NF,
@@ -209,16 +255,13 @@ impl<'a> Emitter<'a> {
             return c.local;
         }
         let ty = r.ty();
-        let local = self.f.add_local(match ty {
-            Ty::I32 => ValType::I32,
-            Ty::I64 => ValType::I64,
-        });
+        let local = self.f.add_local(val_type(ty));
         self.f.local_get(self.ctx_local);
-        let (opcode, align) = match ty {
-            Ty::I32 => (0x28u8, 2u32), // i32.load
-            Ty::I64 => (0x29u8, 3u32), // i64.load
-        };
-        self.f.load(opcode, align, Self::reg_offset(r));
+        match ty {
+            Ty::I32 => self.f.load(0x28, 2, Self::reg_offset(r)),
+            Ty::I64 => self.f.load(0x29, 3, Self::reg_offset(r)),
+            Ty::V128 => self.f.simd_mem(simd::V128_LOAD, 4, Self::reg_offset(r)),
+        }
         self.f.local_set(local);
         self.regs.insert(r, Cached { local, dirty: false });
         local
@@ -229,10 +272,7 @@ impl<'a> Emitter<'a> {
         let ty = r.ty();
         let local = match self.regs.get(&r) {
             Some(c) => c.local,
-            None => self.f.add_local(match ty {
-                Ty::I32 => ValType::I32,
-                Ty::I64 => ValType::I64,
-            }),
+            None => self.f.add_local(val_type(ty)),
         };
         self.f.local_set(local);
         self.regs.insert(r, Cached { local, dirty: true });
@@ -252,11 +292,11 @@ impl<'a> Emitter<'a> {
         for (r, local) in dirty {
             self.f.local_get(self.ctx_local);
             self.f.local_get(local);
-            let (opcode, align) = match r.ty() {
-                Ty::I32 => (0x36u8, 2u32), // i32.store
-                Ty::I64 => (0x37u8, 3u32), // i64.store
-            };
-            self.f.store(opcode, align, Self::reg_offset(r));
+            match r.ty() {
+                Ty::I32 => self.f.store(0x36, 2, Self::reg_offset(r)),
+                Ty::I64 => self.f.store(0x37, 3, Self::reg_offset(r)),
+                Ty::V128 => self.f.simd_mem(simd::V128_STORE, 4, Self::reg_offset(r)),
+            }
             if let Some(c) = self.regs.get_mut(&r) {
                 c.dirty = false;
             }
@@ -356,6 +396,27 @@ impl<'a> Emitter<'a> {
             Stmt::HostCall { func, args } => {
                 self.host_call(*func, args, None, block);
             }
+            Stmt::VStore {
+                addr,
+                offset,
+                val,
+                bytes,
+            } => {
+                let static_off = self.emit_address(*addr, *offset);
+                self.push(*val);
+                let align = bytes.trailing_zeros();
+                if *bytes == 16 {
+                    self.f.simd_mem(simd::V128_STORE, align, static_off);
+                } else {
+                    let sub = match bytes {
+                        1 => simd::V128_STORE8_LANE,
+                        2 => simd::V128_STORE16_LANE,
+                        4 => simd::V128_STORE32_LANE,
+                        _ => simd::V128_STORE64_LANE,
+                    };
+                    self.f.simd_mem_lane(sub, align, static_off, 0);
+                }
+            }
             Stmt::Fence => self.f.atomic_fence(),
         }
     }
@@ -363,7 +424,7 @@ impl<'a> Emitter<'a> {
     fn def(&mut self, dst: Value, expr: &Expr) {
         let ty = expr.ty();
         let idx = dst.0 as usize;
-        self.value_is_i32[idx] = ty == Ty::I32;
+        self.value_ty[idx] = ty;
 
         match expr {
             Expr::ConstI32(c) => {
@@ -388,17 +449,11 @@ impl<'a> Emitter<'a> {
             Expr::Un { op, ty, a } => match op {
                 UnOp::Not => {
                     self.push(*a);
-                    match ty {
-                        Ty::I32 => self.f.i32_const(-1),
-                        Ty::I64 => self.f.i64_const(-1),
-                    }
+                    self.const_of(*ty, -1i64 as u64);
                     self.f.byte(bin_op(BinOp::Xor, *ty));
                 }
                 UnOp::Neg => {
-                    match ty {
-                        Ty::I32 => self.f.i32_const(0),
-                        Ty::I64 => self.f.i64_const(0),
-                    }
+                    self.const_of(*ty, 0);
                     self.push(*a);
                     self.f.byte(bin_op(BinOp::Sub, *ty));
                 }
@@ -456,15 +511,9 @@ impl<'a> Emitter<'a> {
                             // Widths the sign-extension opcodes do not cover:
                             // shift up and back down arithmetically.
                             let sh = ty.bits() - bits;
-                            match ty {
-                                Ty::I32 => self.f.i32_const(sh as i32),
-                                Ty::I64 => self.f.i64_const(sh as i64),
-                            }
+                            self.const_of(*ty, sh as u64);
                             self.f.byte(bin_op(BinOp::Shl, *ty));
-                            match ty {
-                                Ty::I32 => self.f.i32_const(sh as i32),
-                                Ty::I64 => self.f.i64_const(sh as i64),
-                            }
+                            self.const_of(*ty, sh as u64);
                             self.f.byte(bin_op(BinOp::ShrS, *ty));
                         }
                     }
@@ -474,10 +523,7 @@ impl<'a> Emitter<'a> {
                     } else {
                         (1u64 << bits) - 1
                     };
-                    match ty {
-                        Ty::I32 => self.f.i32_const(mask as i32),
-                        Ty::I64 => self.f.i64_const(mask as i64),
-                    }
+                    self.const_of(*ty, mask);
                     self.f.byte(bin_op(BinOp::And, *ty));
                 }
             }
@@ -526,9 +572,69 @@ impl<'a> Emitter<'a> {
                 self.f.atomic(sub, natural_align(*sz), static_off);
             }
             Expr::HostCall { func, args, .. } => {
-                // Handled below so the result lands in a local like any other
+                // Handled here so the result lands in a local like any other
                 // definition.
                 self.host_call_inline(*func, args);
+            }
+
+            Expr::VLoad {
+                addr,
+                offset,
+                bytes,
+            } => self.emit_vload(*addr, *offset, *bytes),
+            Expr::VConst(b) => self.f.v128_const(b),
+            Expr::VSplat { a, lane_bytes } => {
+                self.push(*a);
+                self.f.simd(match lane_bytes {
+                    1 => simd::I8X16_SPLAT,
+                    2 => simd::I16X8_SPLAT,
+                    4 => simd::I32X4_SPLAT,
+                    _ => simd::I64X2_SPLAT,
+                });
+            }
+            Expr::VBin { op, a, b } => {
+                self.push(*a);
+                self.push(*b);
+                self.f.simd(match op {
+                    VBinOp::And => simd::V128_AND,
+                    VBinOp::Or => simd::V128_OR,
+                    VBinOp::Xor => simd::V128_XOR,
+                    VBinOp::AndNot => simd::V128_ANDNOT,
+                });
+            }
+            Expr::VExtract {
+                a,
+                lane,
+                lane_bytes,
+                signed,
+                ..
+            } => {
+                self.push(*a);
+                let sub = match (lane_bytes, signed) {
+                    (1, true) => simd::I8X16_EXTRACT_LANE_S,
+                    (1, false) => simd::I8X16_EXTRACT_LANE_U,
+                    (2, true) => simd::I16X8_EXTRACT_LANE_S,
+                    (2, false) => simd::I16X8_EXTRACT_LANE_U,
+                    (4, _) => simd::I32X4_EXTRACT_LANE,
+                    _ => simd::I64X2_EXTRACT_LANE,
+                };
+                self.f.simd_lane(sub, *lane as u8);
+            }
+            Expr::VReplace {
+                a,
+                lane,
+                lane_bytes,
+                val,
+            } => {
+                self.push(*a);
+                self.push(*val);
+                let sub = match lane_bytes {
+                    1 => simd::I8X16_REPLACE_LANE,
+                    2 => simd::I16X8_REPLACE_LANE,
+                    4 => simd::I32X4_REPLACE_LANE,
+                    _ => simd::I64X2_REPLACE_LANE,
+                };
+                self.f.simd_lane(sub, *lane as u8);
             }
         }
 
@@ -538,12 +644,54 @@ impl<'a> Emitter<'a> {
         self.value_local[idx] = Some(local);
     }
 
-    fn type_of(&self, v: Value) -> Ty {
-        if self.value_is_i32.get(v.0 as usize).copied().unwrap_or(false) {
-            Ty::I32
-        } else {
-            Ty::I64
+    /// Push a `ty`-typed constant.
+    fn const_of(&mut self, ty: Ty, v: u64) {
+        match ty {
+            Ty::I32 => self.f.i32_const(v as i32),
+            Ty::I64 => self.f.i64_const(v as i64),
+            Ty::V128 => {
+                let mut b = [0u8; 16];
+                b[..8].copy_from_slice(&v.to_le_bytes());
+                self.f.v128_const(&b);
+            }
         }
+    }
+
+    /// A SIMD&FP load. Anything narrower than 16 bytes must zero the rest of
+    /// the destination register, which is exactly what the `load*_zero` and
+    /// `load*_lane`-into-zero forms give us.
+    fn emit_vload(&mut self, addr: Value, offset: i64, bytes: u32) {
+        let align = bytes.trailing_zeros();
+        match bytes {
+            16 => {
+                let off = self.emit_address(addr, offset);
+                self.f.simd_mem(simd::V128_LOAD, align, off);
+            }
+            8 => {
+                let off = self.emit_address(addr, offset);
+                self.f.simd_mem(simd::V128_LOAD64_ZERO, align, off);
+            }
+            4 => {
+                let off = self.emit_address(addr, offset);
+                self.f.simd_mem(simd::V128_LOAD32_ZERO, align, off);
+            }
+            // There is no `load8_zero`/`load16_zero`, so load into lane 0 of
+            // an all-zero vector.
+            _ => {
+                let off = self.emit_address(addr, offset);
+                self.f.v128_const(&[0u8; 16]);
+                let sub = if bytes == 1 {
+                    simd::V128_LOAD8_LANE
+                } else {
+                    simd::V128_LOAD16_LANE
+                };
+                self.f.simd_mem_lane(sub, align, off, 0);
+            }
+        }
+    }
+
+    fn type_of(&self, v: Value) -> Ty {
+        self.value_ty.get(v.0 as usize).copied().unwrap_or(Ty::I64)
     }
 
     /// Emit a host call whose result stays on the stack.
@@ -771,8 +919,9 @@ fn bin_op(op: BinOp, ty: Ty) -> u8 {
     match ty {
         Ty::I32 => base32,
         // The i64 arithmetic block starts 18 opcodes after the i32 one and
-        // holds the same operations in the same order.
-        Ty::I64 => base32 + 0x12,
+        // holds the same operations in the same order. Vectors never reach
+        // here: they use the dedicated `VBin` expression.
+        Ty::I64 | Ty::V128 => base32 + 0x12,
     }
 }
 
@@ -792,7 +941,7 @@ fn cmp_op(op: CmpOp, ty: Ty) -> u8 {
     match ty {
         Ty::I32 => base32,
         // The i64 comparison block mirrors the i32 one, 11 opcodes later.
-        Ty::I64 => base32 + 0x0b,
+        Ty::I64 | Ty::V128 => base32 + 0x0b,
     }
 }
 
@@ -819,6 +968,8 @@ fn load_op(ty: Ty, sz: MemSz, signed: bool) -> u8 {
         (Ty::I64, MemSz::B4, false) => 0x35,
         (Ty::I64, MemSz::B4, true) => 0x34,
         (Ty::I64, MemSz::B8, _) => 0x29,
+        // Vector accesses go through `VLoad`/`VStore`, never this table.
+        (Ty::V128, _, _) => unreachable!("vector load reached the scalar table"),
     }
 }
 
@@ -831,6 +982,7 @@ fn store_op(ty: Ty, sz: MemSz) -> u8 {
         (Ty::I64, MemSz::B2) => 0x3d,
         (Ty::I64, MemSz::B4) => 0x3e,
         (Ty::I64, MemSz::B8) => 0x37,
+        (Ty::V128, _) => unreachable!("vector store reached the scalar table"),
     }
 }
 
@@ -850,6 +1002,8 @@ fn atomic_slot(ty: Ty, sz: MemSz) -> u32 {
         // A 32-bit value with an 8-byte access cannot occur; treat it as the
         // widest i32 form so the mapping stays total.
         (Ty::I32, MemSz::B8) => 0,
+        // There are no atomic vector accesses in the architecture.
+        (Ty::V128, _) => unreachable!("atomic vector access"),
     }
 }
 

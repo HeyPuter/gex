@@ -1,7 +1,20 @@
 [package]
-name="gexc"
-version.workspace=true
-edition.workspace=true
-license.workspace=true
+name = "gexc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The gex command-line driver"
+
+[[bin]]
+name = "gexc"
+path = "src/main.rs"
 
 [dependencies]
+gex-abi.workspace = true
+gex-isa.workspace = true
+gex-ir.workspace = true
+gex-lift.workspace = true
+gex-ld.workspace = true
+gex-xlate.workspace = true
+gex-native.workspace = true
+anyhow = "1"

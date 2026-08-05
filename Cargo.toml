@@ -11,6 +11,7 @@ members = [
     "crates/gex-kernel",
     "crates/gexc",
     "shims/native",
+    "tests/diff-fuzz",
 ]
 
 [workspace.package]

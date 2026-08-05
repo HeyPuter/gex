@@ -618,6 +618,52 @@ pub enum Inst {
         addr: AddrMode,
         order: Ordering,
     },
+    /// A SIMD&FP load of `bytes` bytes into the low lanes of `vt`, zeroing
+    /// the rest of the register — which is what every such load does.
+    VLoad {
+        bytes: u32,
+        vt: VReg,
+        addr: AddrMode,
+    },
+    /// A SIMD&FP store of the low `bytes` bytes of `vt`.
+    VStore {
+        bytes: u32,
+        vt: VReg,
+        addr: AddrMode,
+    },
+    /// `ldp`/`stp` of two SIMD&FP registers.
+    VLoadPair {
+        bytes: u32,
+        vt: VReg,
+        vt2: VReg,
+        addr: AddrMode,
+    },
+    VStorePair {
+        bytes: u32,
+        vt: VReg,
+        vt2: VReg,
+        addr: AddrMode,
+    },
+    /// `dup vd.<T>, rn` — replicate a general register across lanes.
+    VDupGeneral {
+        vd: VReg,
+        rn: RegSel,
+        lane_bytes: u32,
+        /// False selects the 64-bit form, which zeroes the upper half.
+        q: bool,
+    },
+    /// `movi`/`mvni`, with the immediate already expanded to the full
+    /// 128-bit register value.
+    VMoveImm { vd: VReg, value: u128 },
+    /// Bitwise operation on two vectors. `mov vd, vn` is `orr vd, vn, vn`.
+    VLogical {
+        op: VLogOp,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+        q: bool,
+    },
+
     /// `ldp`/`ldpsw`.
     LoadPair {
         sz: MemSz,
@@ -670,6 +716,18 @@ pub enum Inst {
         acquire: bool,
         release: bool,
     },
+}
+
+/// Bitwise vector operations on the `v` register file.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VLogOp {
+    And,
+    /// `vd = vn & !vm`.
+    Bic,
+    Orr,
+    /// `vd = vn | !vm`.
+    Orn,
+    Eor,
 }
 
 /// System registers we model. Anything else decodes to [`SysReg::Other`] and

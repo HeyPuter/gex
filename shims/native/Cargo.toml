@@ -1,7 +1,14 @@
 [package]
-name="gex-native"
-version.workspace=true
-edition.workspace=true
-license.workspace=true
+name = "gex-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native host for gex: wasmtime engine plus the kernel bindings"
 
 [dependencies]
+gex-abi.workspace = true
+gex-kernel.workspace = true
+gex-ld.workspace = true
+gex-xlate.workspace = true
+anyhow = "1"
+wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }

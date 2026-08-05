@@ -776,12 +776,29 @@ enum LdSt {
         sz: MemSz,
     },
     Prefetch,
+    /// A SIMD&FP access of `bytes` bytes.
+    VLoad {
+        bytes: u32,
+    },
+    VStore {
+        bytes: u32,
+    },
 }
 
 fn classify_ldst(size: u32, opc: u32, v: u32) -> Option<LdSt> {
     if v == 1 {
-        // SIMD&FP load/store — NEON milestone.
-        return None;
+        // SIMD&FP. `opc<1>:size` gives the access width and `opc<0>` the
+        // direction, so a 16-byte access is `opc = 1x` with `size = 00`.
+        let width_log2 = ((opc >> 1) << 2) | size;
+        if width_log2 > 4 {
+            return None;
+        }
+        let bytes = 1u32 << width_log2;
+        return Some(if opc & 1 != 0 {
+            LdSt::VLoad { bytes }
+        } else {
+            LdSt::VStore { bytes }
+        });
     }
     let msz = MemSz::from_log2(size);
     match opc {
@@ -817,8 +834,30 @@ fn classify_ldst(size: u32, opc: u32, v: u32) -> Option<LdSt> {
     }
 }
 
-fn build_ldst(kind: LdSt, rt: RegSel, addr: AddrMode, order: Ordering, raw: u32) -> Inst {
+/// Scale applied to a load/store's immediate offset: the log2 of the access
+/// width. For SIMD&FP that is *not* the `size` field, because a 16-byte
+/// access encodes `size = 00`.
+fn ldst_scale(kind: &LdSt) -> u32 {
     match kind {
+        LdSt::Load { sz, .. } | LdSt::Store { sz } => sz.log2(),
+        LdSt::VLoad { bytes } | LdSt::VStore { bytes } => bytes.trailing_zeros(),
+        LdSt::Prefetch => 3,
+    }
+}
+
+fn build_ldst(kind: LdSt, rt: RegSel, addr: AddrMode, order: Ordering, raw: u32) -> Inst {
+    let vreg = VReg((raw & 31) as u8);
+    match kind {
+        LdSt::VLoad { bytes } => Inst::VLoad {
+            bytes,
+            vt: vreg,
+            addr,
+        },
+        LdSt::VStore { bytes } => Inst::VStore {
+            bytes,
+            vt: vreg,
+            addr,
+        },
         LdSt::Load { sz, dest, signed } => Inst::Load {
             sz,
             dest,
@@ -847,8 +886,8 @@ fn decode_ldst_uimm(raw: u32) -> Inst {
     let Some(kind) = classify_ldst(size, opc, v) else {
         return Inst::Unknown { raw };
     };
-    // The 12-bit immediate is scaled by the access size.
-    let off = (bits(raw, 21, 10) as i64) << size;
+    // The 12-bit immediate is scaled by the access width.
+    let off = (bits(raw, 21, 10) as i64) << ldst_scale(&kind);
     let addr = AddrMode::Offset {
         rn: RegSel::sp(bits(raw, 9, 5)),
         off,
@@ -887,7 +926,7 @@ fn decode_ldst_regoff(raw: u32) -> Inst {
         return Inst::Undefined { raw };
     }
     let s = bit(raw, 12);
-    let amount = if s == 1 { size } else { 0 };
+    let amount = if s == 1 { ldst_scale(&kind) } else { 0 };
     let addr = AddrMode::RegOffset {
         rn: RegSel::sp(bits(raw, 9, 5)),
         rm: RegSel::gp(bits(raw, 20, 16)),
@@ -902,7 +941,39 @@ fn decode_ldst_pair(raw: u32) -> Inst {
     let v = bit(raw, 26);
     let load = bit(raw, 22) == 1;
     if v == 1 {
-        return Inst::Unknown { raw };
+        // SIMD&FP pair: opc selects 4-, 8- or 16-byte registers.
+        let bytes = match opc {
+            0b00 => 4u32,
+            0b01 => 8,
+            0b10 => 16,
+            _ => return Inst::Undefined { raw },
+        };
+        let scale = bytes.trailing_zeros();
+        let off = sext(bits(raw, 21, 15), 7) << scale;
+        let rn = RegSel::sp(bits(raw, 9, 5));
+        let addr = match bits(raw, 25, 23) {
+            0b000 | 0b010 => AddrMode::Offset { rn, off },
+            0b001 => AddrMode::PostIndex { rn, off },
+            0b011 => AddrMode::PreIndex { rn, off },
+            _ => return Inst::Unknown { raw },
+        };
+        let vt = VReg(bits(raw, 4, 0) as u8);
+        let vt2 = VReg(bits(raw, 14, 10) as u8);
+        return if load {
+            Inst::VLoadPair {
+                bytes,
+                vt,
+                vt2,
+                addr,
+            }
+        } else {
+            Inst::VStorePair {
+                bytes,
+                vt,
+                vt2,
+                addr,
+            }
+        };
     }
     let (sz, signed) = match opc {
         0b00 => (MemSz::W, false),
@@ -1071,7 +1142,152 @@ fn decode_atomic_memop(raw: u32) -> Inst {
 // ---------------------------------------------------------------------------
 
 fn decode_simd_fp(raw: u32) -> Inst {
+    // The subset gex lifts today is the one real string and memory routines
+    // are built from: replicate a scalar, materialise a constant, and move
+    // whole registers around. Everything else stays Unknown, which becomes a
+    // precise SIGILL rather than a wrong answer (PLAN §6.1).
+    let q = bit(raw, 30) == 1;
+    let u = bit(raw, 29);
+
+    // Advanced SIMD copy: 0 Q op 01110000 imm5 0 imm4 1 Rn Rd
+    if bit(raw, 31) == 0 && bits(raw, 28, 21) == 0b0111_0000 && bit(raw, 15) == 0 && bit(raw, 10) == 1
+    {
+        let imm5 = bits(raw, 20, 16);
+        let imm4 = bits(raw, 14, 11);
+        // imm4 == 0b0011 with op == 0 is DUP (general register).
+        if imm4 == 0b0001 && u == 0 {
+            let lane_bytes = if imm5 & 1 != 0 {
+                1
+            } else if imm5 & 2 != 0 {
+                2
+            } else if imm5 & 4 != 0 {
+                4
+            } else if imm5 & 8 != 0 {
+                8
+            } else {
+                return Inst::Undefined { raw };
+            };
+            // A 64-bit lane needs the 128-bit form.
+            if lane_bytes == 8 && !q {
+                return Inst::Undefined { raw };
+            }
+            return Inst::VDupGeneral {
+                vd: VReg(bits(raw, 4, 0) as u8),
+                rn: RegSel::gp(bits(raw, 9, 5)),
+                lane_bytes,
+                q,
+            };
+        }
+        return Inst::Unknown { raw };
+    }
+
+    // Advanced SIMD modified immediate: 0 Q op 0111100000 abc cmode o2 1 defgh Rd
+    if bit(raw, 31) == 0
+        && bits(raw, 28, 24) == 0b01111
+        && bits(raw, 23, 19) == 0
+        && bit(raw, 10) == 1
+    {
+        let cmode = bits(raw, 15, 12);
+        let imm8 = (bits(raw, 18, 16) << 5) | bits(raw, 9, 5);
+        let Some(value) = expand_simd_immediate(imm8, cmode, u == 1, q) else {
+            return Inst::Unknown { raw };
+        };
+        return Inst::VMoveImm {
+            vd: VReg(bits(raw, 4, 0) as u8),
+            value,
+        };
+    }
+
+    // Advanced SIMD three-same, logical subgroup:
+    //   0 Q U 01110 size 1 Rm 00011 1 Rn Rd
+    if bit(raw, 31) == 0
+        && bits(raw, 28, 24) == 0b01110
+        && bit(raw, 21) == 1
+        && bits(raw, 15, 10) == 0b000111
+    {
+        let size = bits(raw, 23, 22);
+        let op = match (u, size) {
+            (0, 0b00) => VLogOp::And,
+            (0, 0b01) => VLogOp::Bic,
+            (0, 0b10) => VLogOp::Orr,
+            (0, 0b11) => VLogOp::Orn,
+            (_, 0b00) => VLogOp::Eor,
+            // BSL/BIT/BIF are three-operand selects, not plain bitwise ops.
+            _ => return Inst::Unknown { raw },
+        };
+        return Inst::VLogical {
+            op,
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+            vm: VReg(bits(raw, 20, 16) as u8),
+            q,
+        };
+    }
+
     Inst::Unknown { raw }
+}
+
+/// `AdvSIMDExpandImm`: turn `imm8` and `cmode` into the full register value.
+///
+/// Returns `None` for the encodings gex does not model yet (the
+/// floating-point forms), which keeps the mapping honest rather than
+/// approximate.
+fn expand_simd_immediate(imm8: u32, cmode: u32, op: bool, q: bool) -> Option<u128> {
+    let imm8 = imm8 as u64;
+    let lane: u64;
+    let lane_bits: u32;
+    match (cmode >> 1, cmode & 1) {
+        // cmode = 0xx0: 32-bit lanes, imm8 shifted by 0/8/16/24.
+        (c, 0) if c < 4 => {
+            lane = imm8 << (8 * c);
+            lane_bits = 32;
+        }
+        // cmode = 10x0: 16-bit lanes, imm8 shifted by 0/8.
+        (c, 0) if (4..6).contains(&c) => {
+            lane = imm8 << (8 * (c - 4));
+            lane_bits = 16;
+        }
+        // cmode = 110x: 32-bit lanes, imm8 shifted up with ones below.
+        (6, _) => {
+            let shift = 8 * (1 + (cmode & 1));
+            lane = (imm8 << shift) | ((1u64 << shift) - 1);
+            lane_bits = 32;
+        }
+        (7, 0) if !op => {
+            // cmode = 1110, op = 0: replicate imm8 into every byte.
+            lane = imm8;
+            lane_bits = 8;
+        }
+        (7, 0) if op => {
+            // cmode = 1110, op = 1: each bit of imm8 expands to a byte.
+            let mut v = 0u64;
+            for i in 0..8 {
+                if imm8 & (1 << i) != 0 {
+                    v |= 0xffu64 << (i * 8);
+                }
+            }
+            // This form is always 64-bit lanes and never inverted.
+            let half = v as u128;
+            return Some(if q { half | (half << 64) } else { half });
+        }
+        // The floating-point forms (cmode = 1111) are not lifted yet.
+        _ => return None,
+    }
+
+    // MVNI inverts the lane before replication.
+    let lane = if op {
+        (!lane) & ((1u64 << lane_bits) - 1)
+    } else {
+        lane & ((1u64 << lane_bits) - 1)
+    };
+    let mut v: u128 = 0;
+    let mut shift = 0;
+    while shift < 128 {
+        v |= (lane as u128) << shift;
+        shift += lane_bits;
+    }
+    // The 64-bit form zeroes the upper half of the register.
+    Some(if q { v } else { v & u64::MAX as u128 })
 }
 
 #[cfg(test)]

@@ -283,6 +283,42 @@ impl FuncBody {
         self.memarg(align_log2, offset);
     }
 
+    /// Emit a SIMD instruction (0xFD prefix) with a memory argument.
+    pub fn simd_mem(&mut self, sub: u32, align_log2: u32, offset: u32) {
+        self.byte(0xfd);
+        self.u32(sub);
+        self.memarg(align_log2, offset);
+    }
+
+    /// Emit a SIMD instruction (0xFD prefix) with a memory argument and a
+    /// lane index — the `loadN_lane` / `storeN_lane` family.
+    pub fn simd_mem_lane(&mut self, sub: u32, align_log2: u32, offset: u32, lane: u8) {
+        self.byte(0xfd);
+        self.u32(sub);
+        self.memarg(align_log2, offset);
+        self.byte(lane);
+    }
+
+    /// Emit a SIMD instruction with no immediate.
+    pub fn simd(&mut self, sub: u32) {
+        self.byte(0xfd);
+        self.u32(sub);
+    }
+
+    /// Emit a SIMD instruction taking a lane index.
+    pub fn simd_lane(&mut self, sub: u32, lane: u8) {
+        self.byte(0xfd);
+        self.u32(sub);
+        self.byte(lane);
+    }
+
+    /// `v128.const`.
+    pub fn v128_const(&mut self, bytes: &[u8; 16]) {
+        self.byte(0xfd);
+        self.u32(0x0c);
+        self.code.extend_from_slice(bytes);
+    }
+
     /// `atomic.fence`.
     pub fn atomic_fence(&mut self) {
         self.byte(op::ATOMIC_PREFIX);

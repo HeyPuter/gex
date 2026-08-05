@@ -1,0 +1,13 @@
+[package]
+name = "gex-difffuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Instruction-level differential fuzzing of gex against QEMU"
+
+[[bin]]
+name = "gex-difffuzz"
+path = "src/main.rs"
+
+[dependencies]
+gex-isa.workspace = true

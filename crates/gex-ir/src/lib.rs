@@ -38,6 +38,8 @@ impl fmt::Debug for Value {
 pub enum Ty {
     I32,
     I64,
+    /// A 128-bit vector — one AArch64 `v` register, one wasm `v128`.
+    V128,
 }
 
 impl Ty {
@@ -46,14 +48,16 @@ impl Ty {
         match self {
             Ty::I32 => 32,
             Ty::I64 => 64,
+            Ty::V128 => 128,
         }
     }
 
-    /// All-ones mask for this width, as a `u64`.
+    /// All-ones mask for this width, as a `u64`. Only meaningful for the
+    /// scalar types; vectors are never handled as a single integer.
     pub fn mask(self) -> u64 {
         match self {
             Ty::I32 => 0xffff_ffff,
-            Ty::I64 => u64::MAX,
+            Ty::I64 | Ty::V128 => u64::MAX,
         }
     }
 }
@@ -66,6 +70,8 @@ impl Ty {
 pub enum GuestReg {
     /// `x0`–`x30`.
     X(u8),
+    /// `v0`–`v31`, the SIMD and floating-point register file.
+    V128(u8),
     /// Stack pointer.
     Sp,
     /// Program counter. Only written at block boundaries and safepoints.
@@ -95,6 +101,7 @@ impl GuestReg {
     pub fn ty(self) -> Ty {
         match self {
             GuestReg::N | GuestReg::Z | GuestReg::C | GuestReg::V => Ty::I32,
+            GuestReg::V128(_) => Ty::V128,
             _ => Ty::I64,
         }
     }
@@ -283,6 +290,46 @@ pub enum Expr {
         args: Vec<Value>,
         ty: Ty,
     },
+
+    /// Load `bytes` bytes into the low lanes of a vector, zeroing the rest.
+    /// This is how every SIMD&FP load works: writing `s0` clears bits 32-127.
+    VLoad {
+        addr: Value,
+        offset: i64,
+        bytes: u32,
+    },
+    /// A vector literal.
+    VConst(Box<[u8; 16]>),
+    /// Replicate a scalar into every `lane_bytes`-sized lane.
+    VSplat { a: Value, lane_bytes: u32 },
+    /// Bitwise operation on two vectors.
+    VBin { op: VBinOp, a: Value, b: Value },
+    /// Read one lane out as a scalar.
+    VExtract {
+        a: Value,
+        lane: u32,
+        lane_bytes: u32,
+        signed: bool,
+        /// Type of the extracted scalar.
+        ty: Ty,
+    },
+    /// Write one lane, producing a new vector.
+    VReplace {
+        a: Value,
+        lane: u32,
+        lane_bytes: u32,
+        val: Value,
+    },
+}
+
+/// Bitwise vector operations.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VBinOp {
+    And,
+    Or,
+    Xor,
+    /// `a & !b`.
+    AndNot,
 }
 
 impl Expr {
@@ -293,7 +340,11 @@ impl Expr {
     pub fn is_pure(&self) -> bool {
         !matches!(
             self,
-            Expr::Load { .. } | Expr::Rmw { .. } | Expr::CmpXchg { .. } | Expr::HostCall { .. }
+            Expr::Load { .. }
+                | Expr::Rmw { .. }
+                | Expr::CmpXchg { .. }
+                | Expr::HostCall { .. }
+                | Expr::VLoad { .. }
         )
     }
 
@@ -310,7 +361,13 @@ impl Expr {
             | Expr::Load { ty, .. }
             | Expr::Rmw { ty, .. }
             | Expr::CmpXchg { ty, .. }
-            | Expr::HostCall { ty, .. } => ty,
+            | Expr::HostCall { ty, .. }
+            | Expr::VExtract { ty, .. } => ty,
+            Expr::VLoad { .. }
+            | Expr::VConst(_)
+            | Expr::VSplat { .. }
+            | Expr::VBin { .. }
+            | Expr::VReplace { .. } => Ty::V128,
         }
     }
 
@@ -345,6 +402,17 @@ impl Expr {
                 f(*replacement);
             }
             Expr::HostCall { args, .. } => args.iter().copied().for_each(f),
+            Expr::VLoad { addr, .. } => f(*addr),
+            Expr::VConst(_) => {}
+            Expr::VSplat { a, .. } | Expr::VExtract { a, .. } => f(*a),
+            Expr::VBin { a, b, .. } => {
+                f(*a);
+                f(*b);
+            }
+            Expr::VReplace { a, val, .. } => {
+                f(*a);
+                f(*val);
+            }
         }
     }
 }
@@ -400,6 +468,13 @@ pub enum Stmt {
     },
     /// A host call whose result is discarded.
     HostCall { func: HostFunc, args: Vec<Value> },
+    /// Store the low `bytes` bytes of a vector to guest memory.
+    VStore {
+        addr: Value,
+        offset: i64,
+        val: Value,
+        bytes: u32,
+    },
     /// A memory fence.
     Fence,
 }
@@ -415,6 +490,10 @@ impl Stmt {
                 f(*val);
             }
             Stmt::HostCall { args, .. } => args.iter().copied().for_each(f),
+            Stmt::VStore { addr, val, .. } => {
+                f(*addr);
+                f(*val);
+            }
             Stmt::Fence => {}
         }
     }
@@ -424,7 +503,7 @@ impl Stmt {
         match self {
             Stmt::Def { expr, .. } => !expr.is_pure(),
             Stmt::WriteReg { .. } => true,
-            Stmt::Store { .. } | Stmt::HostCall { .. } | Stmt::Fence => true,
+            Stmt::Store { .. } | Stmt::HostCall { .. } | Stmt::VStore { .. } | Stmt::Fence => true,
         }
     }
 }
@@ -469,6 +548,14 @@ pub struct Block {
     pub term: Term,
     /// Number of SSA values defined; value indices are `0..n_values`.
     pub n_values: u32,
+    /// Where a call in this block is expected to return to.
+    ///
+    /// Set for `bl` and `blr`. It is not a control-flow successor — the block
+    /// transfers to the callee — but it *is* an entry point, because the
+    /// callee's `ret` will branch straight to it. Code discovery would miss
+    /// every return site without it, and tier-2's return-address prediction
+    /// (PLAN §5.6) is built on the same information.
+    pub call_return: Option<u64>,
 }
 
 impl Block {
@@ -479,6 +566,7 @@ impl Block {
             stmts: Vec::new(),
             term: Term::Goto { target: start },
             n_values: 0,
+            call_return: None,
         }
     }
 
@@ -542,11 +630,16 @@ impl Builder {
         self.def(Expr::ConstI64(v))
     }
 
-    /// A `ty`-typed constant.
+    /// A `ty`-typed constant. Vectors have no scalar constant form.
     pub fn const_ty(&mut self, ty: Ty, v: u64) -> Value {
         match ty {
             Ty::I32 => self.const_i32(v as u32),
             Ty::I64 => self.const_i64(v),
+            Ty::V128 => {
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&v.to_le_bytes());
+                self.def(Expr::VConst(Box::new(bytes)))
+            }
         }
     }
 
@@ -580,6 +673,11 @@ impl Builder {
 
     pub fn extend(&mut self, a: Value, signed: bool) -> Value {
         self.def(Expr::Extend { a, signed })
+    }
+
+    /// Record that this block calls out and expects to resume at `pc`.
+    pub fn set_call_return(&mut self, pc: u64) {
+        self.block.call_return = Some(pc);
     }
 
     /// Mark the block as covering guest instructions up to (excluding) `pc`.

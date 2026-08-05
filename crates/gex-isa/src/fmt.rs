@@ -641,6 +641,66 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
         }
         Inst::Prefetch { ref addr } => format!("prfm {}", addr_str(addr)),
 
+        Inst::VLoad {
+            bytes,
+            vt,
+            ref addr,
+        } => format!("ldr {}, {}", vreg_scalar(vt, bytes), addr_str(addr)),
+        Inst::VStore {
+            bytes,
+            vt,
+            ref addr,
+        } => format!("str {}, {}", vreg_scalar(vt, bytes), addr_str(addr)),
+        Inst::VLoadPair {
+            bytes,
+            vt,
+            vt2,
+            ref addr,
+        } => format!(
+            "ldp {}, {}, {}",
+            vreg_scalar(vt, bytes),
+            vreg_scalar(vt2, bytes),
+            addr_str(addr)
+        ),
+        Inst::VStorePair {
+            bytes,
+            vt,
+            vt2,
+            ref addr,
+        } => format!(
+            "stp {}, {}, {}",
+            vreg_scalar(vt, bytes),
+            vreg_scalar(vt2, bytes),
+            addr_str(addr)
+        ),
+        Inst::VDupGeneral {
+            vd,
+            rn,
+            lane_bytes,
+            q,
+        } => format!(
+            "dup {}, {}",
+            vreg_vector(vd, lane_bytes, q),
+            reg(rn, if lane_bytes == 8 { Sz::X } else { Sz::W })
+        ),
+        // The immediate is already expanded, so the lane shape the assembler
+        // chose is no longer recoverable; print the resulting register value.
+        Inst::VMoveImm { vd, value } => format!("movi v{}, #0x{value:x}", vd.0),
+        Inst::VLogical { op, vd, vn, vm, q } => {
+            let w = if q { "16b" } else { "8b" };
+            if op == VLogOp::Orr && vn == vm {
+                return format!("mov v{}.{w}, v{}.{w}", vd.0, vn.0);
+            }
+            let m = match op {
+                VLogOp::And => "and",
+                VLogOp::Bic => "bic",
+                VLogOp::Orr => "orr",
+                VLogOp::Orn => "orn",
+                VLogOp::Eor => "eor",
+            };
+            format!("{m} v{}.{w}, v{}.{w}, v{}.{w}", vd.0, vn.0, vm.0)
+        }
+
         Inst::LoadExclusive { sz, rt, rn, order } => {
             let acq = order == Ordering::Acquire;
             let m = match (sz, acq) {
@@ -745,6 +805,30 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             )
         }
     }
+}
+
+/// A SIMD&FP register named by its scalar view: `b`, `h`, `s`, `d` or `q`.
+fn vreg_scalar(v: VReg, bytes: u32) -> String {
+    let p = match bytes {
+        1 => 'b',
+        2 => 'h',
+        4 => 's',
+        8 => 'd',
+        _ => 'q',
+    };
+    format!("{p}{}", v.0)
+}
+
+/// A SIMD&FP register named by its vector view, e.g. `v3.16b`.
+fn vreg_vector(v: VReg, lane_bytes: u32, q: bool) -> String {
+    let lanes = (if q { 16 } else { 8 }) / lane_bytes;
+    let t = match lane_bytes {
+        1 => 'b',
+        2 => 'h',
+        4 => 's',
+        _ => 'd',
+    };
+    format!("v{}.{lanes}{t}", v.0)
 }
 
 fn load_mnemonic(

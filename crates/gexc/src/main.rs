@@ -1,0 +1,223 @@
+//! `gexc` — the gex command-line driver.
+//!
+//! M0 subcommands (PLAN §11):
+//!
+//! ```text
+//!   gexc run <elf> [args...]   translate and execute, natively
+//!   gexc build <elf> -o <out>  translate and write the wasm module
+//!   gexc disasm <elf>          disassemble, to check the decoder by eye
+//!   gexc ir <elf> --at <addr>  dump the GIR for one basic block
+//! ```
+
+use anyhow::{bail, Context, Result};
+use gex_native::{Exit, RunOptions};
+use gex_xlate::Options;
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    match real_main() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("gexc: {e:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn real_main() -> Result<ExitCode> {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() < 2 {
+        usage();
+        return Ok(ExitCode::from(2));
+    }
+    match argv[1].as_str() {
+        "run" => cmd_run(&argv[2..]),
+        "build" => cmd_build(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "-h" | "--help" | "help" => {
+            usage();
+            Ok(ExitCode::SUCCESS)
+        }
+        other => bail!("unknown subcommand `{other}` (try `gexc help`)"),
+    }
+}
+
+fn usage() {
+    eprintln!(
+        "gex — AArch64 to WebAssembly ahead-of-time compiler and Linux runtime
+
+usage:
+  gexc run    <elf> [args...]      translate and run the program
+  gexc build  <elf> -o <out.wasm>  translate and write the wasm module
+  gexc disasm <elf>                disassemble the executable segments
+  gexc ir     <elf> --at <addr>    print the GIR for one basic block
+
+run options:
+  --strace        trace every syscall on stderr
+  --verbose       report translation statistics
+  --env K=V       add an environment variable (repeatable)"
+    );
+}
+
+/// Split gexc's own flags from the guest's argument vector.
+struct RunArgs {
+    path: String,
+    guest_args: Vec<String>,
+    opts: RunOptions,
+}
+
+fn parse_run_args(args: &[String]) -> Result<RunArgs> {
+    let mut path = None;
+    let mut guest_args = Vec::new();
+    let mut opts = RunOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        // Once the program is named, everything else belongs to the guest.
+        if path.is_some() {
+            guest_args.push(a.clone());
+            i += 1;
+            continue;
+        }
+        match a.as_str() {
+            "--strace" => opts.trace = true,
+            "--verbose" | "-v" => opts.verbose = true,
+            "--env" => {
+                i += 1;
+                let v = args.get(i).context("--env needs an argument")?;
+                opts.env.push(v.clone());
+            }
+            other if other.starts_with('-') => bail!("unknown option `{other}`"),
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = path.context("expected a program to run")?;
+    Ok(RunArgs {
+        path,
+        guest_args,
+        opts,
+    })
+}
+
+fn cmd_run(args: &[String]) -> Result<ExitCode> {
+    let mut ra = parse_run_args(args)?;
+    let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
+    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)
+        .with_context(|| format!("loading {}", ra.path))?;
+
+    // argv[0] is the path as invoked, then whatever followed.
+    let mut argv = vec![ra.path.clone()];
+    argv.append(&mut ra.guest_args);
+    ra.opts.args = argv;
+    if ra.opts.env.is_empty() {
+        ra.opts.env = vec!["PATH=/usr/bin:/bin".into(), "HOME=/root".into()];
+    }
+
+    let (exit, _stats) = gex_native::run_image(&image, &ra.opts, &Options::default())?;
+    match &exit {
+        Exit::Status(c) => Ok(ExitCode::from((*c & 0xff) as u8)),
+        Exit::Signal {
+            signal,
+            pc,
+            detail,
+        } => {
+            eprintln!("gexc: guest terminated by signal {signal} at pc=0x{pc:x}: {detail}");
+            Ok(ExitCode::from((exit.code() & 0xff) as u8))
+        }
+    }
+}
+
+fn cmd_build(args: &[String]) -> Result<()> {
+    let mut path = None;
+    let mut out = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                i += 1;
+                out = Some(args.get(i).context("-o needs a path")?.clone());
+            }
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = path.context("expected an input ELF")?;
+    let out = out.unwrap_or_else(|| format!("{path}.wasm"));
+
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    let (module, stats) = gex_xlate::translate_image(&image, &Options::default());
+    std::fs::write(&out, &module.wasm).with_context(|| format!("writing {out}"))?;
+    eprintln!(
+        "{out}: {} blocks, {} guest instructions, {} KiB wasm ({:.1}x guest text)",
+        stats.blocks,
+        stats.instructions,
+        stats.wasm_bytes / 1024,
+        stats.wasm_bytes as f64 / (stats.instructions.max(1) * 4) as f64,
+    );
+    if stats.illegal_blocks > 0 {
+        eprintln!(
+            "{out}: {} blocks end in an instruction gex cannot execute yet; \
+             reaching one raises SIGILL",
+            stats.illegal_blocks
+        );
+    }
+    Ok(())
+}
+
+fn cmd_disasm(args: &[String]) -> Result<()> {
+    let path = args.first().context("expected an input ELF")?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+
+    let mut symbols: Vec<_> = image.symbols.iter().collect();
+    symbols.sort_by_key(|s| s.value);
+
+    for seg in &image.segments {
+        if !seg.executable {
+            continue;
+        }
+        for (i, word) in seg.bytes.chunks_exact(4).enumerate() {
+            let pc = seg.vaddr + (i * 4) as u64;
+            if let Some(sym) = symbols.iter().find(|s| s.value == pc) {
+                println!("\n{:016x} <{}>:", pc, sym.name);
+            }
+            let raw = u32::from_le_bytes(word.try_into().unwrap());
+            let inst = gex_isa::decode(raw, pc);
+            println!(
+                "{pc:8x}:\t{raw:08x}\t{}",
+                gex_isa::fmt::disasm(&inst, pc)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_ir(args: &[String]) -> Result<()> {
+    let mut path = None;
+    let mut at = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--at" => {
+                i += 1;
+                let v = args.get(i).context("--at needs an address")?;
+                let v = v.strip_prefix("0x").unwrap_or(v);
+                at = Some(u64::from_str_radix(v, 16).context("--at expects hex")?);
+            }
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = path.context("expected an input ELF")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    let at = at.unwrap_or(image.entry);
+
+    let view = gex_xlate::CodeView::new(&image);
+    let block = gex_lift::lift_block(|pc| view.fetch(pc), at, gex_lift::BlockLimits::default());
+    print!("{}", gex_ir::print::block(&block));
+    Ok(())
+}

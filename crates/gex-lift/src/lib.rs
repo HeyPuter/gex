@@ -19,6 +19,7 @@ use gex_ir::*;
 use gex_isa::{
     AddOp, AddrMode, BarrierKind, BfOp, Cond, Dp1Op, Dp2Op, Dp3Op, Extend, Inst, LogOp, MemSz,
     MoveOp, Ordering as IsaOrder, RegSel, RmwOp as IsaRmw, ShiftType, Sz, SysMaintOp, SysReg,
+    VLogOp,
 };
 
 mod block;
@@ -167,8 +168,8 @@ impl<'a> Lifter<'a> {
     /// The result is `ty`-typed, matching the enclosing operation's width.
     fn extend_reg(&mut self, rm: RegSel, ext: Extend, amount: u32, ty: Ty) -> Value {
         let raw = match ty {
-            Ty::I64 => self.rd_addr(rm),
             Ty::I32 => self.rd_gp(rm, Sz::W),
+            _ => self.rd_addr(rm),
         };
         let bits = ext.src_bits().min(ty.bits());
         let v = if bits >= ty.bits() {
@@ -206,7 +207,7 @@ impl<'a> Lifter<'a> {
                 // The carry flag is an i32 0/1; widen it to the operand width.
                 let cin_ty = match ty {
                     Ty::I32 => cin,
-                    Ty::I64 => self.b.extend(cin, false),
+                    _ => self.b.extend(cin, false),
                 };
                 let s = self.b.bin(BinOp::Add, ty, s1, cin_ty);
                 let c2 = self.b.cmp(CmpOp::LtU, ty, s, s1);
@@ -732,6 +733,7 @@ impl<'a> Lifter<'a> {
                 if link {
                     let ret = self.b.const_i64(next);
                     self.b.write(GuestReg::X(30), ret);
+                    self.b.set_call_return(next);
                 }
                 Flow::End(Term::Goto { target })
             }
@@ -798,6 +800,7 @@ impl<'a> Lifter<'a> {
                 if link {
                     let ret = self.b.const_i64(next);
                     self.b.write(GuestReg::X(30), ret);
+                    self.b.set_call_return(next);
                 }
                 Flow::End(Term::Indirect { target, is_ret })
             }
@@ -993,8 +996,8 @@ impl<'a> Lifter<'a> {
                     order: order_of(order),
                 });
                 let v64 = match ty {
-                    Ty::I64 => v,
                     Ty::I32 => self.b.extend(v, false),
+                    _ => v,
                 };
                 self.b.write(GuestReg::MonAddr, addr);
                 self.b.write(GuestReg::MonValue, v64);
@@ -1031,7 +1034,158 @@ impl<'a> Lifter<'a> {
             Inst::AtomicRmw {
                 sz, op, rs, rt, rn, ..
             } => self.atomic_rmw(sz, op, rs, rt, rn, pc),
+
+            // -- SIMD ------------------------------------------------------
+            Inst::VLoad {
+                bytes,
+                vt,
+                ref addr,
+            } => {
+                let a = self.address(addr);
+                let v = self.b.def(Expr::VLoad {
+                    addr: a.base,
+                    offset: a.offset,
+                    bytes,
+                });
+                self.b.write(GuestReg::V128(vt.0), v);
+                self.finish_address(&a);
+                Flow::Next
+            }
+
+            Inst::VStore {
+                bytes,
+                vt,
+                ref addr,
+            } => {
+                let val = self.b.read(GuestReg::V128(vt.0));
+                let a = self.address(addr);
+                self.b.stmt(Stmt::VStore {
+                    addr: a.base,
+                    offset: a.offset,
+                    val,
+                    bytes,
+                });
+                self.finish_address(&a);
+                Flow::Next
+            }
+
+            Inst::VLoadPair {
+                bytes,
+                vt,
+                vt2,
+                ref addr,
+            } => {
+                let a = self.address(addr);
+                let v1 = self.b.def(Expr::VLoad {
+                    addr: a.base,
+                    offset: a.offset,
+                    bytes,
+                });
+                let v2 = self.b.def(Expr::VLoad {
+                    addr: a.base,
+                    offset: a.offset + bytes as i64,
+                    bytes,
+                });
+                self.b.write(GuestReg::V128(vt.0), v1);
+                self.b.write(GuestReg::V128(vt2.0), v2);
+                self.finish_address(&a);
+                Flow::Next
+            }
+
+            Inst::VStorePair {
+                bytes,
+                vt,
+                vt2,
+                ref addr,
+            } => {
+                let v1 = self.b.read(GuestReg::V128(vt.0));
+                let v2 = self.b.read(GuestReg::V128(vt2.0));
+                let a = self.address(addr);
+                self.b.stmt(Stmt::VStore {
+                    addr: a.base,
+                    offset: a.offset,
+                    val: v1,
+                    bytes,
+                });
+                self.b.stmt(Stmt::VStore {
+                    addr: a.base,
+                    offset: a.offset + bytes as i64,
+                    val: v2,
+                    bytes,
+                });
+                self.finish_address(&a);
+                Flow::Next
+            }
+
+            Inst::VDupGeneral {
+                vd,
+                rn,
+                lane_bytes,
+                q,
+            } => {
+                let src = self.rd_gp(rn, if lane_bytes == 8 { Sz::X } else { Sz::W });
+                let splat = self.b.def(Expr::VSplat {
+                    a: src,
+                    lane_bytes,
+                });
+                let v = self.narrow_to_64(splat, q);
+                self.b.write(GuestReg::V128(vd.0), v);
+                Flow::Next
+            }
+
+            Inst::VMoveImm { vd, value } => {
+                let v = self.b.def(Expr::VConst(Box::new(value.to_le_bytes())));
+                self.b.write(GuestReg::V128(vd.0), v);
+                Flow::Next
+            }
+
+            Inst::VLogical { op, vd, vn, vm, q } => {
+                let a = self.b.read(GuestReg::V128(vn.0));
+                let b = self.b.read(GuestReg::V128(vm.0));
+                let (vop, lhs, rhs) = match op {
+                    VLogOp::And => (VBinOp::And, a, b),
+                    VLogOp::Orr => (VBinOp::Or, a, b),
+                    VLogOp::Eor => (VBinOp::Xor, a, b),
+                    VLogOp::Bic => (VBinOp::AndNot, a, b),
+                    // `orn a, b` is `not(andnot(not(a), ... ))`; expressed
+                    // directly it is `a | !b`, which wasm has no single
+                    // instruction for, so build it from andnot and xor.
+                    VLogOp::Orn => {
+                        let ones = self.b.def(Expr::VConst(Box::new([0xff; 16])));
+                        let notb = self.b.def(Expr::VBin {
+                            op: VBinOp::Xor,
+                            a: b,
+                            b: ones,
+                        });
+                        (VBinOp::Or, a, notb)
+                    }
+                };
+                let r = self.b.def(Expr::VBin {
+                    op: vop,
+                    a: lhs,
+                    b: rhs,
+                });
+                let v = self.narrow_to_64(r, q);
+                self.b.write(GuestReg::V128(vd.0), v);
+                Flow::Next
+            }
         }
+    }
+
+    /// A 64-bit-form SIMD instruction zeroes the upper half of its
+    /// destination; the 128-bit form leaves the value alone.
+    fn narrow_to_64(&mut self, v: Value, q: bool) -> Value {
+        if q {
+            return v;
+        }
+        let mut mask = [0u8; 16];
+        mask[..8].fill(0xff);
+        let m = self.b.def(Expr::VConst(Box::new(mask)));
+        self.b.def(Expr::VBin {
+            op: VBinOp::And,
+            a: v,
+            b: m,
+        })
     }
 
     // -- instruction families ----------------------------------------------
@@ -1321,8 +1475,8 @@ impl<'a> Lifter<'a> {
 
         let mon_value = self.b.read(GuestReg::MonValue);
         let expected = match ty {
-            Ty::I64 => mon_value,
             Ty::I32 => self.b.wrap(mon_value),
+            _ => mon_value,
         };
         let old = self.b.def(Expr::CmpXchg {
             addr: eff_addr,

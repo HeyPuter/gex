@@ -1,7 +1,9 @@
 [package]
-name="gex-kernel"
-version.workspace=true
-edition.workspace=true
-license.workspace=true
+name = "gex-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "gex-kernel: the userspace Linux personality"
 
 [dependencies]
+gex-abi.workspace = true
