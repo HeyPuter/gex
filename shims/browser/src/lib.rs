@@ -64,6 +64,38 @@ fn browser_clock() -> (u64, u32) {
     (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
 }
 
+/// Standard input, as bytes the embedder supplied before the guest started.
+///
+/// A page has nothing to block on -- no terminal, no pipe -- so stdin is
+/// whatever was handed over up front, and reads past the end return zero the
+/// way a closed pipe does. That is enough for the programs that read stdin at
+/// all: `sqlite3` taking a script, a filter reading a document.
+#[derive(Debug)]
+struct StdinBytes(Vec<u8>);
+
+impl FileHandle for StdinBytes {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        let start = (offset as usize).min(self.0.len());
+        let n = buf.len().min(self.0.len() - start);
+        buf[..n].copy_from_slice(&self.0[start..start + n]);
+        Ok(n as u64)
+    }
+
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> SysResult {
+        Err(Errno::EBADF)
+    }
+
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata {
+            file_type: gex_kernel::vfs::FileType::Fifo,
+            size: self.0.len() as u64,
+            mode: 0o400,
+            ino: 2,
+            mtime: 0,
+        })
+    }
+}
+
 /// stdout and stderr, as the host's console.
 ///
 /// `gex-kernel`'s own `StdStream` writes through `std::io`, which on
@@ -291,6 +323,17 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     kernel.uid = unsafe { IDENTITY.0 };
     // Replace the descriptors `Kernel::new` opened on `std::io` with ones the
     // host can actually see.
+    let _ = kernel.fds.install(
+        0,
+        OpenFile::new(
+            Arc::new(StdinBytes(std::mem::take(&mut *STDIN.0.borrow_mut()))),
+            "/dev/stdin".to_string(),
+            0,
+            true,
+            false,
+        ),
+        false,
+    );
     for fd in [1, 2] {
         let f = OpenFile::new(
             Arc::new(Console { fd }),
@@ -403,16 +446,6 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
 /// into the shim's own region, written by JS after [`gex_alloc`].
 #[no_mangle]
 pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u32) {
-    let shim_slice = |p: u32, n: u32| -> &'static [u8] {
-        // The shim's own heap is above the guest's limit, so it is reached
-        // through its own pointer rather than through `guest_bytes`.
-        unsafe {
-            std::slice::from_raw_parts(
-                std::ptr::with_exposed_provenance::<u8>(std::hint::black_box(p as usize)),
-                n as usize,
-            )
-        }
-    };
     let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
         return;
     };
@@ -441,6 +474,28 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
 /// loading. A page has no user, so 1000 is as good an answer as any; Node
 /// passes its own so a comparison against QEMU on the same machine agrees.
 static mut IDENTITY: (u32, u32) = (1000, 1000);
+
+/// Bytes JS wrote into the shim's own region, which is above the guest's
+/// limit and so is reached through a pointer rather than through
+/// [`guest_bytes`].
+fn shim_slice(p: u32, n: u32) -> &'static [u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::with_exposed_provenance::<u8>(std::hint::black_box(p as usize)),
+            n as usize,
+        )
+    }
+}
+
+/// Standard input, staged until the guest is loaded.
+static STDIN: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+
+/// Hand the guest its standard input, from `len` bytes at `ptr` in the shim's
+/// own region. Call before `gex_load`.
+#[no_mangle]
+pub extern "C" fn gex_set_stdin(ptr: u32, len: u32) {
+    *STDIN.0.borrow_mut() = shim_slice(ptr, len).to_vec();
+}
 
 #[no_mangle]
 pub extern "C" fn gex_set_identity(uid: i32, gid: i32) {

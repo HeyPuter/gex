@@ -165,6 +165,55 @@ impl MemoryMap {
         }
     }
 
+    /// Grow or shrink an existing mapping, as `mremap` does.
+    ///
+    /// Returns the new base, which is the old one when the mapping could be
+    /// extended in place and a fresh range otherwise. The caller moves the
+    /// bytes: this map knows about ranges, not contents.
+    ///
+    /// musl's `realloc` calls this for anything mmap-backed, and a plain
+    /// `ENOSYS` sends it down a malloc-copy-free path instead -- correct, but
+    /// it copies every time a large buffer grows.
+    pub fn mremap(
+        &mut self,
+        addr: u64,
+        old_len: u64,
+        new_len: u64,
+        may_move: bool,
+    ) -> Result<(u64, bool), Errno> {
+        if !addr.is_multiple_of(PAGE_SIZE) || old_len == 0 || new_len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let old_len = page_align_up(old_len);
+        let new_len = page_align_up(new_len);
+        // The whole range has to be one mapping, as Linux requires.
+        let Some(v) = self
+            .vmas
+            .iter()
+            .find(|v| v.start <= addr && v.end >= addr + old_len)
+            .cloned()
+        else {
+            return Err(Errno::EFAULT);
+        };
+        if new_len <= old_len {
+            if new_len < old_len {
+                self.unmap(addr + new_len, old_len - new_len)?;
+            }
+            return Ok((addr, false));
+        }
+        let grown = addr + new_len;
+        if grown <= GUEST_LIMIT && self.is_free(addr + old_len, grown) {
+            self.insert(addr + old_len, grown, v.prot, &v.name);
+            return Ok((addr, false));
+        }
+        if !may_move {
+            return Err(Errno::ENOMEM);
+        }
+        let dst = self.mmap(0, new_len, v.prot, 0, &v.name)?;
+        self.unmap(addr, old_len)?;
+        Ok((dst, true))
+    }
+
     fn is_free(&self, start: u64, end: u64) -> bool {
         !self.vmas.iter().any(|v| v.start < end && v.end > start)
     }

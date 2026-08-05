@@ -67,6 +67,13 @@ export class Gex {
     // loader the native host uses, so a program is placed identically.
     // Coerced unsigned: the shim's own region sits above 2 GiB, and a wasm
     // i32 return arrives in JS signed.
+    // Standard input, if the embedder has any: a page has nothing to block
+    // on, so the guest is given all of it up front.
+    if (opts.stdin && opts.stdin.length) {
+      const sp = this.#shim.exports.gex_alloc(opts.stdin.length) >>> 0;
+      this.#u8.set(opts.stdin, sp);
+      this.#shim.exports.gex_set_stdin(sp, opts.stdin.length);
+    }
     const ptr = this.#shim.exports.gex_alloc(elf.length) >>> 0;
     this.#u8.set(elf, ptr);
     const argvBlob = new TextEncoder().encode(args.join('\0'));

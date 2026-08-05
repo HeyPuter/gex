@@ -41,6 +41,17 @@ if (!guestPath || !elfPath) {
   process.exit(2);
 }
 
+// Everything on stdin, up front -- the browser host has no way to block for
+// more later. Nothing on a terminal, so an interactive run is not left
+// waiting for a pipe that will never close.
+function readStdin() {
+  try {
+    return process.stdin.isTTY ? null : readFileSync(0);
+  } catch {
+    return null;
+  }
+}
+
 class NodeEnv extends Env {
   write(fd, bytes) { writeSync(fd, bytes); }
   now() { return BigInt(Date.now()) * 1000000n; }
@@ -57,5 +68,6 @@ const entry = await gex.load(shimWasm, readFileSync(guestPath), readFileSync(elf
   // reports the real user.
   uid: process.getuid?.(),
   gid: process.getgid?.(),
+  stdin: readStdin(),
 });
 process.exit(gex.run(entry));

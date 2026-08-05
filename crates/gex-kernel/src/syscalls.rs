@@ -91,6 +91,7 @@ pub mod nr {
     pub const CLONE: u64 = 220;
     pub const EXECVE: u64 = 221;
     pub const MMAP: u64 = 222;
+    pub const MREMAP: u64 = 216;
     pub const MPROTECT: u64 = 226;
     pub const MADVISE: u64 = 233;
     pub const WAIT4: u64 = 260;
@@ -857,6 +858,7 @@ impl Kernel {
             nr::BRK => Ok(self.mem.brk(a[0])),
             nr::MMAP => self.sys_mmap(m, a),
             nr::MUNMAP => self.mem.unmap(a[0], a[1]).map(|_| 0),
+            nr::MREMAP => self.sys_mremap(m, a),
             nr::MPROTECT => self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0),
             nr::MADVISE => Ok(0),
 
@@ -1475,6 +1477,25 @@ impl Kernel {
 
     // -- memory --------------------------------------------------------------
 
+    /// `mremap`. The map decides where; this moves the bytes.
+    fn sys_mremap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        const MREMAP_MAYMOVE: u64 = 1;
+        let (addr, old_len, new_len, flags) = (a[0], a[1], a[2], a[3]);
+        let (dst, moved) = self
+            .mem
+            .mremap(addr, old_len, new_len, flags & MREMAP_MAYMOVE != 0)?;
+        if moved {
+            let keep = old_len.min(new_len) as usize;
+            let bytes = m.read(addr, keep)?.to_vec();
+            m.write(dst, &bytes)?;
+        } else if new_len > old_len {
+            // Growing in place must expose zeroes, not whatever the guest
+            // left behind the last time this range was mapped.
+            m.zero(addr + old_len, (new_len - old_len) as usize)?;
+        }
+        Ok(dst)
+    }
+
     fn sys_mmap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         let (addr, len, prot_bits, flags, fd, offset) =
             (a[0], a[1], a[2] as u32, a[3], a[4] as i32, a[5]);
@@ -1728,6 +1749,7 @@ pub fn skips_proc_snapshot(n: u64) -> bool {
             | nr::IOCTL
             | nr::MMAP
             | nr::MUNMAP
+            | nr::MREMAP
             | nr::MPROTECT
             | nr::MADVISE
             | nr::BRK
@@ -1808,6 +1830,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::SYSINFO => "sysinfo",
         nr::BRK => "brk",
         nr::MUNMAP => "munmap",
+        nr::MREMAP => "mremap",
         nr::CLONE => "clone",
         nr::EXECVE => "execve",
         nr::MMAP => "mmap",

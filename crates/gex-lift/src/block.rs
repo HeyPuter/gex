@@ -39,8 +39,21 @@ pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockL
             break;
         };
         let inst = decode(raw, pc);
+        let mark = builder.mark();
         let mut lifter = Lifter::new(&mut builder);
         let flow = lifter.lift(&inst, pc);
+        // An instruction the backend has no wasm form for is undone and
+        // becomes a SIGILL here, where the preceding instructions have
+        // already run. Exhaustive discovery decodes literal pools and
+        // padding, so `sqadd v0.2d` -- which the architecture defines and
+        // wasm SIMD has no instruction for -- turns up in programs that would
+        // never execute it, and a panic in the backend would refuse to build
+        // them at all.
+        if builder.has_inexpressible(mark) {
+            builder.rewind(mark);
+            term = Some(Term::Illegal { raw, pc });
+            break;
+        }
         pc += INST_BYTES;
         builder.end_at(pc);
         match flow {
