@@ -363,11 +363,20 @@ impl FuncBody {
 // Module assembly
 // ---------------------------------------------------------------------------
 
-/// An imported function.
+/// What kind of thing an import brings in.
+pub enum ImportKind {
+    Func { ty: u32 },
+    /// A memory with the given minimum size in pages.
+    Memory { min_pages: u64 },
+    /// A funcref table with the given minimum size.
+    Table { min: u32 },
+}
+
+/// An import.
 pub struct Import {
     pub module: String,
     pub name: String,
-    pub ty: u32,
+    pub kind: ImportKind,
 }
 
 /// Where a table's initial contents come from.
@@ -388,6 +397,7 @@ pub struct DataSegment {
 pub struct Module {
     types: Vec<FuncType>,
     imports: Vec<Import>,
+    n_func_imports: u32,
     /// Type index for each locally defined function.
     functions: Vec<u32>,
     /// Encoded bodies, parallel to `functions`.
@@ -434,13 +444,34 @@ impl Module {
         self.imports.push(Import {
             module: module.to_string(),
             name: name.to_string(),
-            ty,
+            kind: ImportKind::Func { ty },
         });
-        self.imports.len() as u32 - 1
+        self.n_func_imports += 1;
+        self.n_func_imports - 1
     }
 
+    /// Import the guest memory instead of declaring one.
+    pub fn import_memory(&mut self, module: &str, name: &str, min_pages: u64) {
+        self.imports.push(Import {
+            module: module.to_string(),
+            name: name.to_string(),
+            kind: ImportKind::Memory { min_pages },
+        });
+    }
+
+    /// Import the dispatch table instead of declaring one.
+    pub fn import_table(&mut self, module: &str, name: &str, min: u32) {
+        self.imports.push(Import {
+            module: module.to_string(),
+            name: name.to_string(),
+            kind: ImportKind::Table { min },
+        });
+    }
+
+    /// Number of imported *functions*, which is what local function indices
+    /// are offset by. Memory and table imports do not shift them.
     pub fn n_imports(&self) -> u32 {
-        self.imports.len() as u32
+        self.n_func_imports
     }
 
     /// Reserve a function index without providing a body yet, so that code
@@ -513,8 +544,23 @@ impl Module {
             for i in &self.imports {
                 write_name(&mut s, &i.module);
                 write_name(&mut s, &i.name);
-                s.push(0x00); // func
-                write_u32(&mut s, i.ty);
+                match &i.kind {
+                    ImportKind::Func { ty } => {
+                        s.push(0x00);
+                        write_u32(&mut s, *ty);
+                    }
+                    ImportKind::Memory { min_pages } => {
+                        s.push(0x02);
+                        s.push(0x00); // limits without a maximum
+                        write_u64(&mut s, *min_pages);
+                    }
+                    ImportKind::Table { min } => {
+                        s.push(0x01);
+                        s.push(ValType::FuncRef.byte());
+                        s.push(0x00);
+                        write_u32(&mut s, *min);
+                    }
+                }
             }
             section(&mut out, 2, &s);
         }

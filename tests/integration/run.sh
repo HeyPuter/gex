@@ -31,6 +31,8 @@ done
 mkdir -p "$WORK"
 pass=0
 fail=0
+# Extra flags for gexc, set around a group of comparisons.
+GEXC_ARGS=""
 
 # Compare one invocation between the two engines.
 #   compare [--native-oracle <path>] <label> <program> [args...]
@@ -63,7 +65,8 @@ compare() {
     set +e
     "$QEMU" "$@" >"$q_out.stdout" 2>"$q_out.stderr"
     q_rc=$?
-    "$GEXC" run "$@" >"$g_out.stdout" 2>"$g_out.stderr"
+    # shellcheck disable=SC2086 -- GEXC_ARGS is intentionally word-split
+    "$GEXC" run $GEXC_ARGS "$@" >"$g_out.stdout" 2>"$g_out.stderr"
     g_rc=$?
     set -e
 
@@ -137,6 +140,15 @@ for mode in fatal-default fatal-abort; do
 done
 compare "vector-O3" "$WORK/vector"
 compare "vector-pie" "$WORK/vector-pie"
+
+# The same programs with runtime translation disabled, so that both the
+# on-demand path and the translate-everything-up-front path stay covered.
+GEXC_ARGS="--no-jit"
+for area in arith float mem flow; do
+    compare "nojit-$area" "$WORK/suite" "$area"
+done
+compare "nojit-vector" "$WORK/vector"
+GEXC_ARGS=""
 
 echo
 echo "$pass passed, $fail failed"

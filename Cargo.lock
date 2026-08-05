@@ -298,6 +298,7 @@ dependencies = [
  "gex-abi",
  "gex-kernel",
  "gex-ld",
+ "gex-lift",
  "gex-xlate",
  "wasmtime",
 ]

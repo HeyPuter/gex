@@ -15,6 +15,19 @@ use gex_abi::{ctx, exports, imports, GUEST_MEM_PAGES, IMPORT_MODULE};
 use gex_ir::Block;
 use std::collections::HashMap;
 
+/// Where a module's memory and dispatch table come from.
+///
+/// The image module declares both. A module produced at run time imports
+/// them instead, so its blocks read the same guest memory and branch through
+/// the same table as everything already translated.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Linkage {
+    /// Declare and export the memory and table.
+    Own,
+    /// Import them from the already-instantiated image module.
+    Shared,
+}
+
 /// A finished translation unit.
 pub struct TranslatedModule {
     /// The encoded wasm module.
@@ -25,6 +38,10 @@ pub struct TranslatedModule {
     pub text_slots: u64,
     /// Number of guest basic blocks translated.
     pub n_blocks: usize,
+    /// For a [`Linkage::Shared`] module, the blocks it defines and the export
+    /// name each is reachable under, so the host can install them in the
+    /// table.
+    pub exported_blocks: Vec<(u64, String)>,
 }
 
 /// Builds a wasm module from GIR blocks.
@@ -40,6 +57,9 @@ pub struct ModuleBuilder {
     pending: Vec<(Block, u32)>,
     imports: Imports,
     data: Vec<DataSegment>,
+    linkage: Linkage,
+    /// Blocks to export by name, for a shared-linkage module.
+    exports_by_addr: Vec<(u64, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,8 +75,13 @@ struct Imports {
 }
 
 impl ModuleBuilder {
-    /// Start a module covering guest text `[text_base, text_base + text_size)`.
+    /// Start an image module: it owns the memory and the dispatch table.
     pub fn new(text_base: u64, text_size: u64) -> ModuleBuilder {
+        Self::with_linkage(text_base, text_size, Linkage::Own)
+    }
+
+    /// Start a module covering guest text `[text_base, text_base + text_size)`.
+    pub fn with_linkage(text_base: u64, text_size: u64, linkage: Linkage) -> ModuleBuilder {
         assert_eq!(text_base % 4, 0, "text base must be instruction-aligned");
         let text_slots = text_size.div_ceil(4);
 
@@ -92,8 +117,18 @@ impl ModuleBuilder {
             safepoint: m.import_func(im, imports::SAFEPOINT, t_syscall),
         };
 
-        m.set_memory(GUEST_MEM_PAGES, GUEST_MEM_PAGES);
-        m.set_table(text_slots as u32, text_slots as u32);
+        match linkage {
+            Linkage::Own => {
+                m.set_memory(GUEST_MEM_PAGES, GUEST_MEM_PAGES);
+                m.set_table(text_slots as u32, text_slots as u32);
+            }
+            Linkage::Shared => {
+                // Both come from the image module, so this one's blocks act
+                // on exactly the same guest state.
+                m.import_memory(IMPORT_MODULE, exports::MEMORY, GUEST_MEM_PAGES);
+                m.import_table(IMPORT_MODULE, exports::DISPATCH_TABLE, text_slots as u32);
+            }
+        }
 
         // The miss stub and `enter` are the first two local functions, so
         // their indices are known before any block is declared.
@@ -110,6 +145,8 @@ impl ModuleBuilder {
             pending: Vec::new(),
             imports,
             data: Vec::new(),
+            linkage,
+            exports_by_addr: Vec::new(),
         };
 
         let stub_body = b.build_miss_stub();
@@ -117,8 +154,10 @@ impl ModuleBuilder {
         let enter_body = b.build_enter();
         b.m.define_func(enter, enter_body);
 
-        b.m.export(exports::MEMORY, ExportKind::Memory, 0);
-        b.m.export(exports::DISPATCH_TABLE, ExportKind::Table, 0);
+        if linkage == Linkage::Own {
+            b.m.export(exports::MEMORY, ExportKind::Memory, 0);
+            b.m.export(exports::DISPATCH_TABLE, ExportKind::Table, 0);
+        }
         b.m.export(exports::ENTER, ExportKind::Func, enter);
         b
     }
@@ -139,6 +178,12 @@ impl ModuleBuilder {
     /// Add a translated block, reserving its index if necessary.
     pub fn add_block(&mut self, block: Block) {
         let f = self.reserve(block.start);
+        // A shared module cannot write the table itself — element segments
+        // may not target an imported table at an offset the host chose — so
+        // its blocks are exported and the host installs them.
+        if self.linkage == Linkage::Shared {
+            self.exports_by_addr.push((block.start, f));
+        }
         self.pending.push((block, f));
     }
 
@@ -179,20 +224,32 @@ impl ModuleBuilder {
             self.m.define_func(f, body);
         }
 
-        // Fill every dispatch slot: a translated block where one starts, the
-        // miss stub everywhere else.
-        let mut funcs = vec![self.miss_stub; self.text_slots as usize];
-        for (&addr, &f) in &self.blocks {
-            let d = addr.wrapping_sub(self.text_base);
-            if d % 4 == 0 && (d / 4) < self.text_slots {
-                funcs[(d / 4) as usize] = f;
+        let mut exported_blocks = Vec::new();
+        match self.linkage {
+            Linkage::Own => {
+                // Fill every dispatch slot: a translated block where one
+                // starts, the miss stub everywhere else.
+                let mut funcs = vec![self.miss_stub; self.text_slots as usize];
+                for (&addr, &f) in &self.blocks {
+                    let d = addr.wrapping_sub(self.text_base);
+                    if d % 4 == 0 && (d / 4) < self.text_slots {
+                        funcs[(d / 4) as usize] = f;
+                    }
+                }
+                self.m.element(ElementSegment {
+                    table: 0,
+                    offset: 0,
+                    funcs,
+                });
+            }
+            Linkage::Shared => {
+                for (addr, f) in std::mem::take(&mut self.exports_by_addr) {
+                    let name = format!("b{addr:x}");
+                    self.m.export(&name, ExportKind::Func, f);
+                    exported_blocks.push((addr, name));
+                }
             }
         }
-        self.m.element(ElementSegment {
-            table: 0,
-            offset: 0,
-            funcs,
-        });
 
         for d in std::mem::take(&mut self.data) {
             self.m.data(d);
@@ -203,6 +260,7 @@ impl ModuleBuilder {
             text_base: self.text_base,
             text_slots: self.text_slots,
             n_blocks,
+            exported_blocks,
         }
     }
 

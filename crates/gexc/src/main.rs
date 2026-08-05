@@ -56,7 +56,9 @@ usage:
 run options:
   --strace        trace every syscall on stderr
   --verbose       report translation statistics
-  --env K=V       add an environment variable (repeatable)"
+  --env K=V       add an environment variable (repeatable)
+  --exhaustive    translate every decodable text address ahead of time
+  --no-jit        no runtime translation; implies --exhaustive"
     );
 }
 
@@ -65,12 +67,19 @@ struct RunArgs {
     path: String,
     guest_args: Vec<String>,
     opts: RunOptions,
+    xlate: Options,
+    jit: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut path = None;
     let mut guest_args = Vec::new();
     let mut opts = RunOptions::default();
+    // Ahead-of-time discovery is best-effort; runtime translation fills the
+    // gaps. Translating every decodable address up front is the fallback for
+    // when it is turned off.
+    let mut exhaustive = false;
+    let mut no_jit = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -83,6 +92,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
         match a.as_str() {
             "--strace" => opts.trace = true,
             "--verbose" | "-v" => opts.verbose = true,
+            "--exhaustive" => exhaustive = true,
+            "--no-jit" => no_jit = true,
             "--env" => {
                 i += 1;
                 let v = args.get(i).context("--env needs an argument")?;
@@ -98,6 +109,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
         path,
         guest_args,
         opts,
+        xlate: Options {
+            exhaustive: exhaustive || no_jit,
+            ..Options::default()
+        },
+        jit: !no_jit,
     })
 }
 
@@ -115,7 +131,8 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         ra.opts.env = vec!["PATH=/usr/bin:/bin".into(), "HOME=/root".into()];
     }
 
-    let (exit, _stats) = gex_native::run_image(&image, &ra.opts, &Options::default())?;
+    ra.opts.jit = ra.jit;
+    let (exit, _stats) = gex_native::run_image(&image, &ra.opts, &ra.xlate)?;
     match &exit {
         Exit::Status(c) => Ok(ExitCode::from((*c & 0xff) as u8)),
         Exit::Signal {

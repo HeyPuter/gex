@@ -16,7 +16,9 @@ use gex_kernel::{GuestMem, Kernel, ProcState, SyscallOutcome};
 use std::sync::{Arc, Mutex};
 use gex_ld::{build_initial_stack, Identity, Image};
 use gex_xlate::{Options, Stats};
-use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store, Val};
+use wasmtime::{
+    Caller, Config, Engine, Extern, Func, Linker, Memory, Module, Ref, Store, Table, Val,
+};
 
 /// How a guest run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +73,9 @@ pub struct RunOptions {
     /// Host directory presented as the guest's root. Without one the guest
     /// sees the host filesystem directly.
     pub sysroot: Option<std::path::PathBuf>,
+    /// Translate code on demand when a branch reaches an address with no
+    /// translation.
+    pub jit: bool,
 }
 
 /// Host-side state threaded through every import.
@@ -84,6 +89,26 @@ struct HostState {
     exit: Option<Exit>,
     /// Set when a host function wants execution to continue elsewhere.
     resume_at: Option<u64>,
+    /// Everything needed to translate and install code at run time.
+    jit: Option<Jit>,
+}
+
+/// Runtime translation state (PLAN §6.2, M3).
+struct Jit {
+    engine: Engine,
+    linker: Linker<HostState>,
+    table: Table,
+    text_base: u64,
+    text_slots: u64,
+    /// Addresses whose dispatch slot now holds real code.
+    translated: std::collections::HashSet<u64>,
+    /// Modules compiled so far, kept alive because the table holds funcrefs
+    /// into them.
+    modules: Vec<wasmtime::Instance>,
+    limits: gex_lift::BlockLimits,
+    /// Diagnostics, reported under --verbose.
+    blocks: usize,
+    calls: usize,
 }
 
 /// A trap used to unwind out of translated code.
@@ -170,6 +195,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
             proc_state,
             exit: None,
             resume_at: None,
+            jit: None,
         },
     );
 
@@ -185,6 +211,28 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
         _ => bail!("translated module does not export its memory"),
     };
     store.data_mut().memory = Some(memory);
+
+    // Runtime translation needs the table to patch and the engine and linker
+    // to build new modules with. Holding them here is what lets a dispatch
+    // miss become a translation rather than an error.
+    let table = match instance.get_export(&mut store, exports::DISPATCH_TABLE) {
+        Some(Extern::Table(t)) => t,
+        _ => bail!("translated module does not export its dispatch table"),
+    };
+    if opts.jit {
+        store.data_mut().jit = Some(Jit {
+            engine: engine.clone(),
+            linker: linker.clone(),
+            table,
+            text_base: module_bytes.text_base,
+            text_slots: module_bytes.text_slots,
+            translated: Default::default(),
+            modules: Vec::new(),
+            limits: xlate.limits,
+            blocks: 0,
+            calls: 0,
+        });
+    }
 
     place_image(&mut store, memory, image, opts, Identity { uid, gid })?;
 
@@ -218,6 +266,14 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
             }
         }
     };
+    if opts.verbose {
+        if let Some(jit) = store.data().jit.as_ref() {
+            eprintln!(
+                "[gex] runtime translation: {} blocks in {} compilations",
+                jit.blocks, jit.calls
+            );
+        }
+    }
     Ok((exit, stats))
 }
 
@@ -479,19 +535,33 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 };
             }
-            // From M3 this is where gex-jit translates the target and patches
-            // the dispatch slot. Until then an unreachable address is a hard
-            // error, reported precisely rather than as a wasm trap.
-            caller.data_mut().exit = Some(Exit::Signal {
-                signal: signal::SIGSEGV,
-                pc,
-                detail: format!(
-                    "branch to 0x{pc:x}, which has no translation \
-                     (runtime translation lands in M3)"
-                ),
-                internal: true,
-            });
-            Err(StopExecution.into())
+            // Translate on demand and patch the slot, then resume there.
+            match translate_and_install(&mut caller, pc) {
+                Ok(true) => {
+                    caller.data_mut().resume_at = Some(pc);
+                    Err(StopExecution.into())
+                }
+                Ok(false) => {
+                    caller.data_mut().exit = Some(Exit::Signal {
+                        signal: signal::SIGSEGV,
+                        pc,
+                        detail: format!(
+                            "branch to 0x{pc:x}, which is not executable guest memory"
+                        ),
+                        internal: false,
+                    });
+                    Err(StopExecution.into())
+                }
+                Err(e) => {
+                    caller.data_mut().exit = Some(Exit::Signal {
+                        signal: signal::SIGSEGV,
+                        pc,
+                        detail: format!("translating 0x{pc:x} failed: {e:#}"),
+                        internal: true,
+                    });
+                    Err(StopExecution.into())
+                }
+            }
         },
     )?;
 
@@ -637,6 +707,99 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Translate the block at `pc`, install it and everything reachable from it,
+/// and report whether there was anything there to translate.
+///
+/// Blocks land in a module that *imports* the guest memory and the dispatch
+/// table, so freshly translated code shares state with everything already
+/// running and can branch into it through the table.
+fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
+    let (text_base, text_slots, limits) = {
+        let jit = caller
+            .data()
+            .jit
+            .as_ref()
+            .ok_or_else(|| anyhow!("runtime translation is not set up"))?;
+        (jit.text_base, jit.text_slots, jit.limits)
+    };
+    if pc % 4 != 0 || pc < text_base || pc >= text_base + text_slots * 4 {
+        return Ok(false);
+    }
+
+    let memory = caller
+        .data()
+        .memory
+        .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let known: std::collections::HashSet<u64> = caller
+        .data()
+        .jit
+        .as_ref()
+        .map(|j| j.translated.clone())
+        .unwrap_or_default();
+    let (translated_module, stats) = {
+        let data = memory.data(&mut *caller);
+        gex_xlate::translate_runtime(
+            data,
+            text_base,
+            text_slots,
+            pc,
+            &|a| known.contains(&a),
+            limits,
+            // A cap keeps one miss from translating an entire library
+            // synchronously; the next miss picks up where this stopped.
+            4096,
+        )
+    };
+    if translated_module.exported_blocks.is_empty() {
+        return Ok(false);
+    }
+
+    let (engine, linker) = {
+        let jit = caller.data().jit.as_ref().unwrap();
+        (jit.engine.clone(), jit.linker.clone())
+    };
+    let module = Module::new(&engine, &translated_module.wasm)
+        .context("validating runtime-translated wasm")?;
+
+    // The new module imports `gex.memory` and `gex.dispatch`, so they must be
+    // visible under the import module name.
+    let mut linker = linker;
+    linker.define(&mut *caller, gex_abi::IMPORT_MODULE, exports::MEMORY, memory)?;
+    let table = caller.data().jit.as_ref().unwrap().table;
+    linker.define(
+        &mut *caller,
+        gex_abi::IMPORT_MODULE,
+        exports::DISPATCH_TABLE,
+        table,
+    )?;
+    let instance = linker
+        .instantiate(&mut *caller, &module)
+        .context("instantiating runtime-translated module")?;
+
+    // Patch each new block into its dispatch slot.
+    let mut installed = Vec::with_capacity(translated_module.exported_blocks.len());
+    for (addr, name) in &translated_module.exported_blocks {
+        let Some(Extern::Func(f)) = instance.get_export(&mut *caller, name) else {
+            bail!("runtime module is missing its export {name}");
+        };
+        let slot = (addr.wrapping_sub(text_base) / 4) as u64;
+        if slot >= text_slots {
+            continue;
+        }
+        table
+            .set(&mut *caller, slot as u64, Ref::Func(Some(f)))
+            .with_context(|| format!("installing block 0x{addr:x} in slot {slot}"))?;
+        installed.push(*addr);
+    }
+
+    let jit = caller.data_mut().jit.as_mut().unwrap();
+    jit.translated.extend(installed);
+    jit.modules.push(instance);
+    jit.blocks += stats.blocks;
+    jit.calls += 1;
+    Ok(true)
 }
 
 /// Turn a wasm trap into a guest signal.

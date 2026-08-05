@@ -10,5 +10,6 @@ gex-abi.workspace = true
 gex-kernel.workspace = true
 gex-ld.workspace = true
 gex-xlate.workspace = true
+gex-lift.workspace = true
 anyhow = "1"
 wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }

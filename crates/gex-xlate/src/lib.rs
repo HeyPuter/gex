@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+use gex_emit::module::Linkage;
 use gex_emit::{ModuleBuilder, TranslatedModule};
 use gex_ir::{pass, Term};
 use gex_ld::Image;
@@ -35,14 +36,12 @@ pub struct Options {
     pub scan_pointers: bool,
     /// Treat *every* 4-byte-aligned executable address as an entry point.
     ///
-    /// This is the completeness setting. Recursive descent plus a pointer
-    /// scan still misses jump tables, which store scaled *relative* offsets
-    /// that look nothing like addresses — `pop_arg`'s switch in musl is a
-    /// perfect example. PLAN §5.5 gives every aligned text address a dispatch
-    /// slot precisely so this is always possible; with no runtime translator
-    /// yet (M3), filling them all ahead of time is what makes "any binary"
-    /// true today. It costs translation time and module size, and becomes a
-    /// pure optimisation to turn off once gex-jit can fill slots on demand.
+    /// Recursive descent plus a pointer scan still misses jump tables, which
+    /// store scaled *relative* offsets that look nothing like addresses.
+    /// Translating everything up front covers that without a runtime
+    /// translator, at the cost of translation time and module size — useful
+    /// for a deployment that must not compile code later, and as a way to
+    /// isolate a suspected runtime-translation bug.
     pub exhaustive: bool,
 }
 
@@ -52,7 +51,9 @@ impl Default for Options {
             limits: BlockLimits::default(),
             extra_entries: Vec::new(),
             scan_pointers: true,
-            exhaustive: true,
+            // Off by default now that runtime translation covers the gaps;
+            // still available for a build that must not translate later.
+            exhaustive: false,
         }
     }
 }
@@ -200,6 +201,77 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
             }
         }
         builder.reserve(addr);
+        builder.add_block(block);
+    }
+
+    let module = builder.finish();
+    stats.wasm_bytes = module.wasm.len();
+    (module, stats)
+}
+
+/// Translate code that is not in the image, reading it from live guest
+/// memory (PLAN §6.2).
+///
+/// This is the completeness guarantee: an address with no translation gets
+/// one on demand, whether it was missed by static discovery, produced by a
+/// guest JIT, or brought in by a library loaded after startup. Discovery
+/// still runs recursively from the entry point, so the first miss inside a
+/// function usually translates the whole function and the next branch in it
+/// costs nothing.
+///
+/// `known` names the addresses that already have translations, so the work
+/// list does not redo them.
+pub fn translate_runtime(
+    memory: &[u8],
+    text_base: u64,
+    text_slots: u64,
+    entry: u64,
+    known: &dyn Fn(u64) -> bool,
+    limits: BlockLimits,
+    max_blocks: usize,
+) -> (TranslatedModule, Stats) {
+    let text_end = text_base + text_slots * 4;
+    let fetch = |pc: u64| -> Option<u32> {
+        if pc % 4 != 0 || pc < text_base || pc + 4 > text_end {
+            return None;
+        }
+        let off = pc as usize;
+        if off + 4 > memory.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()))
+    };
+
+    let mut builder =
+        ModuleBuilder::with_linkage(text_base, text_slots * 4, Linkage::Shared);
+    let mut stats = Stats::default();
+    let mut worklist: BTreeSet<u64> = BTreeSet::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    worklist.insert(entry);
+
+    while let Some(&addr) = worklist.iter().next() {
+        worklist.remove(&addr);
+        if !seen.insert(addr) || stats.blocks >= max_blocks {
+            continue;
+        }
+        // Never re-translate something the table already answers for; the
+        // existing entry may be a tier-2 region.
+        if addr != entry && known(addr) {
+            continue;
+        }
+        let mut block = lift_block(fetch, addr, limits);
+        pass::optimize(&mut block);
+
+        stats.blocks += 1;
+        stats.instructions += ((block.end - block.start) / 4) as usize;
+        if matches!(block.term, Term::Illegal { .. }) {
+            stats.illegal_blocks += 1;
+        }
+        for succ in block.successors().chain(block.call_return) {
+            if fetch(succ).is_some() && !seen.contains(&succ) && !known(succ) {
+                worklist.insert(succ);
+            }
+        }
         builder.add_block(block);
     }
 
