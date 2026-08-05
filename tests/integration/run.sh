@@ -126,6 +126,33 @@ cross_engine() {
     pass=$((pass + 1))
 }
 
+# Run a program under the browser runtime and check it against QEMU.
+#
+# This is the real thing, not the cross-engine harness: gex-kernel compiled to
+# wasm, sharing one memory with the guest module, with JS supplying only a
+# console. Skipped when node or the shim build is absent.
+browser() {
+    label="$1"; prog="$2"; shift 2
+    shim=target/wasm32-unknown-unknown/release/gex_browser.wasm
+    if [ -z "$NODE" ] || [ ! -f "$shim" ]; then
+        return
+    fi
+    wasm="$WORK/$label.br.wasm"
+    set +e
+    "$GEXC" build --exhaustive --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1
+    "$QEMU" "$prog" "$@" >"$WORK/$label.qemu2" 2>&1
+    "$NODE" shims/browser/js/run-node.mjs "$wasm" "$prog" "$@" >"$WORK/$label.br" 2>&1
+    set -e
+    if ! cmp -s "$WORK/$label.qemu2" "$WORK/$label.br"; then
+        echo "FAIL browser-$label: the browser runtime and QEMU disagree"
+        diff -u "$WORK/$label.qemu2" "$WORK/$label.br" | head -20 || true
+        fail=$((fail + 1))
+        return
+    fi
+    echo "ok   browser-$label"
+    pass=$((pass + 1))
+}
+
 # Recover the label from a compare() argument list, whatever options precede it.
 label_of() {
     while :; do
@@ -307,6 +334,11 @@ cross_engine "vector" "$WORK/vector"
 cross_engine "numeric" "$WORK/numeric"
 cross_engine "fixedpoint" "$WORK/fixedpoint"
 cross_engine "neon-structure" "$WORK/neon2"
+
+# And under the browser runtime: the kernel itself in wasm.
+browser "numeric" "$WORK/numeric"
+browser "fixedpoint" "$WORK/fixedpoint"
+browser "vector" "$WORK/vector"
 compare "threads" "$WORK/threads"
 compare "thread-exit-race" "$WORK/exitrace"
 compare "fork" "$WORK/fork"

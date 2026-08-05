@@ -19,25 +19,13 @@
 //!
 //! # Status
 //!
-//! Loading works: the guest's initial stack pointer, entry and image all come
-//! out right, and it executes -- a `hello` program reaches `set_tid_address`,
-//! an `ioctl`, four `writev`s and `exit_group(0)` in the correct order.
+//! Runs static programs. The suite checks three of them -- including the NEON
+//! and fixed-point ones -- against QEMU on every invocation.
 //!
-//! What does not work is those `writev`s: they return -30 and then -8 three
-//! times, and nothing reaches the console. Narrowed as far as this:
-//!
-//! * The console is wired correctly. Calling `fds.get(1).write(..)` straight
-//!   out of an exported probe prints, so the descriptor table and the
-//!   `FileHandle` are right.
-//! * The errors are not the ones the `FileHandle` defaults return -- that is
-//!   `EBADF`, and the `FileSystem` defaults are `EROFS` on paths `writev`
-//!   never touches.
-//!
-//! The next thing to check is `sys_writev`'s reads of the guest's iovec array
-//! and buffers: `mmap` and `brk` regions are registered with the VMA tree by
-//! the native host's `place_image`, and this shim only registers the image and
-//! the stack, so a read from the heap -- where musl's stdout buffer lives --
-//! may be being rejected before the descriptor is ever reached.
+//! Not yet: threads (one Worker each, and the memory would have to be
+//! declared shared), `fork`, runtime translation, and a clock, so a program
+//! that calls `clock_gettime` gets whatever `gex-kernel`'s wasm32 build does
+//! rather than the time.
 //!
 //! # What JS still does
 //!
@@ -50,7 +38,7 @@
 // `cargo build --workspace` on the development host still works.
 #![cfg(target_arch = "wasm32")]
 
-use gex_abi::{ctx, GUEST_MEM_BYTES};
+use gex_abi::ctx;
 use gex_kernel::errno::{Errno, SysResult};
 use gex_kernel::file::OpenFile;
 use gex_kernel::vfs::{FileHandle, Metadata};
@@ -132,7 +120,7 @@ unsafe impl std::alloc::GlobalAlloc for Heap {
         let mut h = INNER.0.borrow_mut();
         let heap = h.get_or_insert_with(|| {
             let base = (&raw const __heap_base) as usize;
-            let size = GUEST_MEM_BYTES as usize - base;
+            let size = gex_abi::GUEST_MEM_BYTES as usize - base;
             // SAFETY: the linker put this module's data below `__heap_base`,
             // and the guest maps nothing above `STACK_TOP`, so the region is
             // ours alone.
@@ -163,11 +151,27 @@ thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
 }
 
+/// How much of the address space the guest may use.
+///
+/// Not all of it: a Rust slice may not be longer than `isize::MAX`, which on
+/// wasm32 is just under 2 GiB, and `GuestMem` is built on a slice. Claiming
+/// the whole 4 GiB produces an invalid slice, and the consequences are not a
+/// clean failure -- the compiler deleted stores through it, and reads above
+/// 2 GiB returned `EFAULT` from one call site and succeeded from another.
+///
+/// So the guest gets everything below this line and the shim takes what is
+/// above, which it reaches through ordinary Rust pointers rather than through
+/// the slice. The guest's own layout fits comfortably: its stack is the
+/// highest thing in it, and the shim places it at this address rather than at
+/// `STACK_TOP`.
+const GUEST_LIMIT: u64 = 0x7fff_0000;
+
 /// The guest's memory, as a slice.
 ///
-/// This module's memory *is* the guest's, so the whole address space is
-/// addressable directly.
+/// This module's memory *is* the guest's, so the address space below
+/// [`GUEST_LIMIT`] is addressable directly.
 #[allow(clippy::mut_from_ref)]
+#[inline(never)]
 fn guest_bytes() -> &'static mut [u8] {
     // The base goes through `black_box` so the optimiser cannot see that it is
     // the constant zero. Without that, LLVM concludes the pointer cannot alias
@@ -181,13 +185,19 @@ fn guest_bytes() -> &'static mut [u8] {
     // module's own data and stack above `STACK_TOP`, and the guest never maps
     // there, so the two do not overlap; the memory is imported and never
     // grows, so base and length are fixed for the life of the instance.
-    let base = std::hint::black_box(0usize);
-    unsafe {
-        std::slice::from_raw_parts_mut(
-            std::ptr::with_exposed_provenance_mut::<u8>(base),
-            GUEST_MEM_BYTES as usize,
-        )
-    }
+    // The *pointer* goes through `black_box`, not just the address it is made
+    // from. Hiding only the address was not enough: LLVM still tracked the
+    // pointer's provenance and miscompiled accesses through it, so the same
+    // read succeeded from a small function and returned EFAULT from inside the
+    // kernel's call path. Hiding the pointer leaves the optimiser nothing to
+    // reason about.
+    let p: *mut u8 = std::hint::black_box(std::ptr::with_exposed_provenance_mut::<u8>(0));
+    // The length is hidden as well. With it a constant, LLVM pairs it against
+    // what it believes the pointer's allocation to be -- nothing -- and folds
+    // slice bounds checks to "always out of range": the same read succeeded
+    // from a small function and returned EFAULT from inside the kernel.
+    let len = std::hint::black_box(GUEST_LIMIT as usize);
+    unsafe { std::slice::from_raw_parts_mut(p, len) }
 }
 
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
@@ -209,7 +219,14 @@ pub extern "C" fn gex_alloc(len: usize) -> u32 {
 /// return the entry point. Zero means the image could not be loaded.
 #[no_mangle]
 pub extern "C" fn gex_load(ptr: u32, len: u32) -> u64 {
-    let bytes = &guest_bytes()[ptr as usize..(ptr + len) as usize];
+    // The ELF sits in the shim's own heap, above the guest's limit, so it is
+    // reached through its own pointer rather than through the guest slice.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::with_exposed_provenance::<u8>(std::hint::black_box(ptr as usize)),
+            len as usize,
+        )
+    };
     let Ok(image) = gex_ld::elf::load(bytes, gex_abi::PIE_BASE) else {
         return 0;
     };
@@ -255,7 +272,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32) -> u64 {
 
     let layout = gex_ld::build_initial_stack(
         &image,
-        gex_abi::STACK_TOP,
+        GUEST_LIMIT,
         &["prog".to_string()],
         &["PATH=/usr/bin:/bin".to_string(), "HOME=/root".to_string()],
         *b"gexdeterministic",
@@ -268,8 +285,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32) -> u64 {
     let start = layout.low as usize;
     data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
     kernel.mem.insert(
-        gex_abi::STACK_TOP - gex_abi::STACK_SIZE,
-        gex_abi::STACK_TOP,
+        GUEST_LIMIT - gex_abi::STACK_SIZE,
+        GUEST_LIMIT,
         gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE,
         "[stack]",
     );

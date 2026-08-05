@@ -42,28 +42,64 @@ impl<'a> GuestMem<'a> {
         GuestMem { bytes }
     }
 
+    /// The backing bytes, hidden from the optimiser on wasm.
+    ///
+    /// In the browser host this slice covers the guest's whole address space,
+    /// which is the host's *own* linear memory reached through a pointer made
+    /// from an integer. LLVM sees a pointer with no provenance, decides the
+    /// allocation behind it has size zero, and folds the bounds checks below
+    /// to "always out of range" -- but only at some call sites, so the same
+    /// read succeeded from one function and returned `EFAULT` from another a
+    /// microsecond later. A barrier at each use leaves it nothing to fold.
+    ///
+    /// Native hosts get a real slice from wasmtime and need none of this.
+    #[inline(always)]
+    fn view(&self) -> &[u8] {
+        #[cfg(target_arch = "wasm32")]
+        {
+            std::hint::black_box(&*self.bytes)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.bytes
+        }
+    }
+
+    #[inline(always)]
+    fn view_mut(&mut self) -> &mut [u8] {
+        #[cfg(target_arch = "wasm32")]
+        {
+            std::hint::black_box(&mut *self.bytes)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.bytes
+        }
+    }
+
     fn range(&self, addr: u64, len: usize) -> Result<std::ops::Range<usize>, Errno> {
         let start = addr as usize;
         let end = start.checked_add(len).ok_or(Errno::EFAULT)?;
-        if addr > usize::MAX as u64 || end > self.bytes.len() {
+        if addr > usize::MAX as u64 || end > self.view().len() {
             return Err(Errno::EFAULT);
         }
         Ok(start..end)
     }
 
     pub fn read(&self, addr: u64, len: usize) -> Result<&[u8], Errno> {
-        Ok(&self.bytes[self.range(addr, len)?])
+        let r = self.range(addr, len)?;
+        Ok(&self.view()[r])
     }
 
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
         let r = self.range(addr, data.len())?;
-        self.bytes[r].copy_from_slice(data);
+        self.view_mut()[r].copy_from_slice(data);
         Ok(())
     }
 
     pub fn zero(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         let r = self.range(addr, len)?;
-        self.bytes[r].fill(0);
+        self.view_mut()[r].fill(0);
         Ok(())
     }
 
@@ -88,11 +124,11 @@ impl<'a> GuestMem<'a> {
     /// Read a NUL-terminated guest string, bounded by `max` bytes.
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
         let start = addr as usize;
-        if start >= self.bytes.len() {
+        if start >= self.view().len() {
             return Err(Errno::EFAULT);
         }
-        let end = (start + max).min(self.bytes.len());
-        let slice = &self.bytes[start..end];
+        let end = (start + max).min(self.view().len());
+        let slice = &self.view()[start..end];
         match slice.iter().position(|b| *b == 0) {
             Some(n) => Ok(slice[..n].to_vec()),
             None => Err(Errno::ENAMETOOLONG),
