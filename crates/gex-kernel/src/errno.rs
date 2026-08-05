@@ -18,6 +18,7 @@ impl Errno {
     pub const EBADF: Errno = Errno(9);
     pub const ECHILD: Errno = Errno(10);
     pub const EAGAIN: Errno = Errno(11);
+    pub const ENOEXEC: Errno = Errno(8);
     pub const ENOMEM: Errno = Errno(12);
     pub const EACCES: Errno = Errno(13);
     pub const EFAULT: Errno = Errno(14);

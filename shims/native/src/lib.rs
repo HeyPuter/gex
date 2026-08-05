@@ -125,6 +125,16 @@ struct HostState {
     pending_spawn: Option<ThreadState>,
     /// Set by a `clone` without CLONE_THREAD: a child process to build.
     pending_fork: Option<i32>,
+    /// Set by `execve`: a program to replace this process with.
+    pending_exec: Option<ExecRequest>,
+}
+
+/// What `execve` asked for.
+#[derive(Clone, Debug)]
+struct ExecRequest {
+    path: String,
+    argv: Vec<String>,
+    envp: Vec<String>,
 }
 
 /// What a guest thread needs to start running.
@@ -145,6 +155,10 @@ struct SpawnContext {
     /// definitions, so it can be cloned into another thread.
     linker: Linker<HostState>,
     memory: gex_mem::GuestMemory,
+    /// The options and translation knobs this process started with, so a
+    /// child that execs can pass them on.
+    opts: RunOptions,
+    xlate: Options,
     kernel: Arc<Mutex<Kernel>>,
     proc_state: Arc<Mutex<ProcState>>,
     jit_shared: Option<Arc<Mutex<JitShared>>>,
@@ -268,6 +282,21 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
 
 /// Run a program, which may carry a dynamic linker alongside it.
 pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
+    run_program_with(program, opts, xlate, None)
+}
+
+/// `run_program`, optionally reusing a kernel from a process that `execve`d.
+///
+/// Exec keeps the process: its pid, its descriptors, its working directory.
+/// What it replaces is the address space and the program in it, which from
+/// here is the same work as starting fresh -- so this is the same function,
+/// told not to build a new kernel.
+fn run_program_with(
+    program: &Program,
+    opts: &RunOptions,
+    xlate: &Options,
+    inherited: Option<(Kernel, Arc<Mutex<ProcState>>)>,
+) -> Result<(Exit, Stats)> {
     let image = &program.exe;
 
     // A profile records where a previous run's execution actually went, which
@@ -393,19 +422,36 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
         .and_then(|a| std::fs::canonicalize(a).ok())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| opts.args.first().cloned().unwrap_or_default());
-    let kernel = Kernel::new(ctx_addr, image.brk, exe_path.clone());
+    let fresh = inherited.is_none();
+    let (kernel, proc_state) = match inherited {
+        Some((mut k, ps)) => {
+            // The address space is new, so the map of it starts empty. Every
+            // other part of the kernel is what exec is defined to keep.
+            k.mem = gex_kernel::mem::MemoryMap::new(image.brk);
+            k.ctx_addr = ctx_addr;
+            k.exe_path = exe_path.clone();
+            k.argv = opts.args.clone();
+            k.envp = opts.env.clone();
+            k.live_threads = 1;
+            k.next_ctx_slot = 1;
+            (k, ps)
+        }
+        None => (
+            Kernel::new(ctx_addr, image.brk, exe_path.clone()),
+            Arc::new(Mutex::new(ProcState {
+                pid: 1,
+                maps: String::new(),
+                cmdline: Vec::new(),
+                environ: Vec::new(),
+                exe: exe_path,
+                cwd: "/".into(),
+                fds: Vec::new(),
+            })),
+        ),
+    };
     // Report the host's identity: with hostfs passthrough, a guest that
     // stats a file and then calls getuid must see a consistent answer.
     let (uid, gid) = host_identity();
-    let proc_state = Arc::new(Mutex::new(ProcState {
-        pid: 1,
-        maps: String::new(),
-        cmdline: Vec::new(),
-        environ: Vec::new(),
-        exe: exe_path,
-        cwd: "/".into(),
-        fds: Vec::new(),
-    }));
     let mut kernel = Kernel {
         trace: opts.trace,
         uid,
@@ -414,13 +460,17 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
         envp: opts.env.clone(),
         ..kernel
     };
-    mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;
+    // Mounts survive an exec, so they are only established for a new process.
+    if fresh {
+        mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;
+    }
+    let tid = kernel.pid;
 
     let mut store = Store::new(
         &engine,
         HostState {
             kernel: Arc::new(Mutex::new(kernel)),
-            thread: ThreadState::new(ctx_addr, 1),
+            thread: ThreadState::new(ctx_addr, tid),
             memory: None,
             proc_state,
             exit: None,
@@ -429,6 +479,7 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
             spawn: None,
             pending_spawn: None,
             pending_fork: None,
+            pending_exec: None,
         },
     );
 
@@ -527,6 +578,8 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
         image_module: module.clone(),
         linker: base_linker,
         memory: memory.clone(),
+        opts: opts.clone(),
+        xlate: xlate.clone(),
         kernel: Arc::clone(&store.data().kernel),
         proc_state: Arc::clone(&store.data().proc_state),
         jit_shared: store.data().jit.as_ref().map(|j| Arc::clone(&j.shared)),
@@ -534,7 +587,15 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     });
     store.data_mut().spawn = Some(Arc::clone(&spawn));
 
-    let exit = run_thread_loop(&mut store, &instance, ctx_addr, program.entry())?;
+    let stopped = run_thread_loop(&mut store, &instance, ctx_addr, program.entry())?;
+    if let Stopped::Exec(req) = stopped {
+        stop_other_threads(&spawn, opts.verbose);
+        let kernel = take_kernel(&spawn);
+        return exec_program(req, opts, xlate, kernel, Arc::clone(&spawn.proc_state));
+    }
+    let Stopped::Exited(exit) = stopped else {
+        unreachable!()
+    };
 
     // The process is over. Every other thread has to stop before the stores
     // and the memory they are using go away: set the flag their safepoints
@@ -666,12 +727,18 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
 /// out of wasm and re-entering at a new address. `clone` in particular has to
 /// start its host thread from here: doing it inside the syscall import would
 /// mean spawning while a wasm frame is live and the store is borrowed.
+enum Stopped {
+    Exited(Exit),
+    /// The guest called `execve`; the caller must build the new program.
+    Exec(ExecRequest),
+}
+
 fn run_thread_loop(
     store: &mut Store<HostState>,
     instance: &wasmtime::Instance,
     ctx_addr: u64,
     entry: u64,
-) -> Result<Exit> {
+) -> Result<Stopped> {
     let enter = instance
         .get_func(&mut *store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
@@ -706,17 +773,24 @@ fn run_thread_loop(
                 })
                 .context("spawning a guest thread")?;
         }
+        if let Some(req) = store.data_mut().pending_exec.take() {
+            return Ok(Stopped::Exec(req));
+        }
         match result {
             // Falling off the end of translated code means the guest returned
             // from its entry point, which Linux treats as an exit.
-            Ok(()) => return Ok(store.data().exit.clone().unwrap_or(Exit::Status(0))),
+            Ok(()) => {
+                return Ok(Stopped::Exited(
+                    store.data().exit.clone().unwrap_or(Exit::Status(0)),
+                ))
+            }
             Err(e) => {
                 if let Some(next) = store.data_mut().resume_at.take() {
                     pc = next;
                     continue;
                 }
                 match store.data().exit.clone() {
-                    Some(x) => return Ok(x),
+                    Some(x) => return Ok(Stopped::Exited(x)),
                     None => return Err(classify_trap(e, store)),
                 }
             }
@@ -795,6 +869,8 @@ fn fork_process(store: &mut Store<HostState>, pid: i32) -> Result<()> {
         image_module: cx.image_module.clone(),
         linker: cx.linker.clone(),
         memory: child_mem,
+        opts: cx.opts.clone(),
+        xlate: cx.xlate.clone(),
         kernel: Arc::new(Mutex::new(child_kernel)),
         proc_state: Arc::new(Mutex::new(ProcState::default())),
         // The registry is shared: the modules are the same code at the same
@@ -849,6 +925,7 @@ fn run_guest_process(
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
             pending_fork: None,
+            pending_exec: None,
         },
     );
     let mut linker = cx.linker.clone();
@@ -878,9 +955,63 @@ fn run_guest_process(
         });
     }
     catch_up_table(&mut store)?;
-    let exit = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
-    stop_other_threads(&cx, false);
-    Ok(exit)
+    match run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)? {
+        Stopped::Exited(exit) => {
+            stop_other_threads(&cx, false);
+            Ok(exit)
+        }
+        Stopped::Exec(req) => {
+            // The child is usually the one that execs: this is the shell's
+            // fork-then-exec, and the whole point of the fork.
+            stop_other_threads(&cx, false);
+            let kernel = take_kernel(&cx);
+            let opts = RunOptions {
+                args: req.argv.clone(),
+                env: req.envp.clone(),
+                ..cx.opts.clone()
+            };
+            exec_program(req, &opts, &cx.xlate, kernel, Arc::clone(&cx.proc_state))
+                .map(|(exit, _)| exit)
+        }
+    }
+}
+
+/// Take the kernel out of a process that is about to be replaced.
+fn take_kernel(cx: &SpawnContext) -> Kernel {
+    let mut guard = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+    // Every other thread is stopped by now, so nothing else will look at it.
+    std::mem::replace(&mut *guard, Kernel::new(0, 0, String::new()))
+}
+
+/// Load and run the program `execve` asked for, keeping the process.
+fn exec_program(
+    req: ExecRequest,
+    opts: &RunOptions,
+    xlate: &Options,
+    mut kernel: Kernel,
+    proc_state: Arc<Mutex<ProcState>>,
+) -> Result<(Exit, Stats)> {
+    // The file comes from the guest's namespace, not the host's, so a sysroot
+    // is honoured and `/bin/sh` means the guest's.
+    let bytes = kernel
+        .read_file(&req.path)
+        .ok_or_else(|| anyhow!("execve: cannot read {}", req.path))?;
+    let program = gex_ld::load_program(
+        &bytes,
+        gex_abi::PIE_BASE,
+        gex_abi::PIE_BASE + 0x1000_0000,
+        &|p| kernel.read_file(p),
+    )
+    .with_context(|| format!("execve: loading {}", req.path))?;
+    // Descriptors marked close-on-exec go now; the rest survive, which is how
+    // a shell hands a pipe to the command it starts.
+    kernel.close_on_exec();
+    let opts = RunOptions {
+        args: req.argv,
+        env: req.envp,
+        ..opts.clone()
+    };
+    run_program_with(&program, &opts, xlate, Some((kernel, proc_state)))
 }
 
 /// A guest thread: its own store, its own instances, the same memory.
@@ -898,6 +1029,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
             pending_fork: None,
+            pending_exec: None,
         },
     );
     let mut linker = cx.linker.clone();
@@ -936,7 +1068,9 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
         let data = cx.memory.bytes();
         read_u64(data, (thread.ctx_addr + ctx::PC as u64) as usize)
     };
-    let _ = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
+    if let Stopped::Exec(_) = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)? {
+        bail!("execve from a non-main thread is not supported");
+    }
     Ok(())
 }
 
@@ -1202,6 +1336,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 SyscallOutcome::Exit(code) => {
                     state.exit = Some(Exit::Status(code));
+                    Err(StopExecution.into())
+                }
+                SyscallOutcome::Exec { path, argv, envp } => {
+                    state.pending_exec = Some(ExecRequest { path, argv, envp });
                     Err(StopExecution.into())
                 }
                 SyscallOutcome::SpawnProcess { pid } => {

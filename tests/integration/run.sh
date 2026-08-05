@@ -64,6 +64,37 @@ compare() {
     fi
 }
 
+# Compare gex against an expected-output file rather than against QEMU.
+#
+# Needed where QEMU is not a usable oracle. `execve` is the case: qemu-aarch64
+# can only re-exec *itself* for the program it was given, so a guest that execs
+# another aarch64 binary fails under QEMU and works under gex. The expectation
+# is therefore written down, and derived from what Linux does.
+expect() {
+    label="$1"; expected="$2"; shift 2
+    g_out="$WORK/$label.gex"
+    set +e
+    # shellcheck disable=SC2086
+    "$GEXC" run $GEXC_ARGS "$@" >"$g_out.stdout" 2>"$g_out.stderr"
+    g_rc=$?
+    set -e
+    if [ "$g_rc" != 0 ]; then
+        echo "FAIL $label: exit status $g_rc"
+        head -3 "$g_out.stderr" | sed 's/^/       /'
+        fail=$((fail + 1))
+        return
+    fi
+    printf '%s\n' "$expected" >"$g_out.expected"
+    if ! cmp -s "$g_out.expected" "$g_out.stdout"; then
+        echo "FAIL $label: stdout differs from the expectation"
+        diff -u "$g_out.expected" "$g_out.stdout" | head -20 || true
+        fail=$((fail + 1))
+        return
+    fi
+    echo "ok   $label"
+    pass=$((pass + 1))
+}
+
 # Recover the label from a compare() argument list, whatever options precede it.
 label_of() {
     while :; do
@@ -174,6 +205,7 @@ echo "building guest programs..."
 # Exits while other threads are mid-work, including two parked on a futex.
 "$CC" -static -no-pie -O2 -o "$WORK/exitrace" "$HERE/programs/exitrace.c" -lpthread
 "$CC" -static -no-pie -O2 -o "$WORK/fork" "$HERE/programs/fork.c"
+"$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
 # .eh_frame through personality routines -- a very different code shape from
 # anything the C programs reach.
@@ -240,6 +272,15 @@ compare "fixed-point" "$WORK/fixedpoint"
 compare "threads" "$WORK/threads"
 compare "thread-exit-race" "$WORK/exitrace"
 compare "fork" "$WORK/fork"
+# argv and envp reach the new program, a close-on-exec descriptor is gone and
+# an ordinary one survives with its offset, and a failed exec returns.
+expect "exec" "argc=4 [child] [two] [three]
+env GEXA=one GEXB=two
+fd7 closed  fd8 open
+inherited fd reads 16 bytes: through the pipe
+child status 42
+failed exec status 99
+done" "$WORK/exec"
 [ -n "$CPP" ] && compare "cpp-static" "$WORK/cpp"
 
 if [ -n "$DYNAMIC" ]; then

@@ -142,6 +142,16 @@ pub enum SyscallOutcome {
     },
     /// This thread is finished; the process is not.
     ThreadExit,
+    /// `execve`: replace this process's program.
+    ///
+    /// The kernel has read the strings out of the address space it is about
+    /// to lose; everything else -- loading the image, building a new address
+    /// space -- is the host's, because only the host can make one.
+    Exec {
+        path: String,
+        argv: Vec<String>,
+        envp: Vec<String>,
+    },
     /// The syscall has to sleep, and must do so with the kernel unlocked.
     ///
     /// A blocking call that held the shared kernel would stop every other
@@ -359,6 +369,84 @@ impl Kernel {
         }
     }
 
+    /// Read a whole file out of the guest's namespace.
+    ///
+    /// Used to load an `execve` target and its interpreter, so the program
+    /// that runs is the one the guest can see -- the sysroot's `/bin/sh`, not
+    /// the host's.
+    pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        let h = self.vfs.open(path, 0, 0).ok()?;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = h.read_at(out.len() as u64, &mut buf).ok()? as usize;
+            if n == 0 {
+                return Some(out);
+            }
+            out.extend_from_slice(&buf[..n]);
+            if out.len() > 512 * 1024 * 1024 {
+                return None;
+            }
+        }
+    }
+
+    /// Drop the descriptors marked close-on-exec.
+    pub fn close_on_exec(&mut self) {
+        self.fds.close_on_exec();
+    }
+
+    /// Everything `execve` can fail at before the point of no return.
+    ///
+    /// The strings have to be read here because the address space holding
+    /// them is about to go away, and the file has to be checked here because
+    /// a failed `execve` *returns*: the guest sees `-ENOENT` and carries on in
+    /// the program it already had. Once the host starts building the new
+    /// address space there is nothing to return to.
+    fn prepare_exec(
+        &mut self,
+        m: &GuestMem<'_>,
+        a: [u64; 6],
+    ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
+        let (path, argv, envp) = self.read_exec_args(m, a)?;
+        let image = self.read_file(&path).ok_or(Errno::ENOENT)?;
+        if image.len() < 64 || &image[..4] != b"\x7fELF" {
+            return Err(Errno::ENOEXEC);
+        }
+        Ok((path, argv, envp))
+    }
+
+    /// Read `execve`'s path and its two string vectors out of guest memory,
+    /// before the address space holding them goes away.
+    fn read_exec_args(
+        &mut self,
+        m: &GuestMem<'_>,
+        a: [u64; 6],
+    ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
+        let bytes_to_string =
+            |b: Vec<u8>| String::from_utf8(b).map_err(|_| Errno::EINVAL);
+        let path = bytes_to_string(m.read_cstr(a[0], 4096)?)?;
+        let read_vec = |mut p: u64| -> Result<Vec<String>, Errno> {
+            let mut out = Vec::new();
+            // A bound, because the vector is the guest's and its terminator
+            // may not be there.
+            for _ in 0..4096 {
+                if p == 0 {
+                    break;
+                }
+                let ptr = m.read_u64(p)?;
+                if ptr == 0 {
+                    break;
+                }
+                out.push(bytes_to_string(m.read_cstr(ptr, 4096)?)?);
+                p += 8;
+            }
+            Ok(out)
+        };
+        let argv = read_vec(a[1])?;
+        let envp = read_vec(a[2])?;
+        Ok((path, argv, envp))
+    }
+
     /// The kernel a forked child starts with.
     ///
     /// Descriptors carry `Arc` handles, so parent and child share the open
@@ -507,6 +595,20 @@ impl Kernel {
 
         // `clone` and a thread's `exit` change which threads exist, so they
         // answer with an outcome rather than a return value.
+        if n == nr::EXECVE {
+            return match self.prepare_exec(m, a) {
+                Ok((path, argv, envp)) => {
+                    if self.trace {
+                        eprintln!("[gex] execve({path:?}, {} args)", argv.len());
+                    }
+                    SyscallOutcome::Exec { path, argv, envp }
+                }
+                Err(e) => {
+                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, e.as_return());
+                    SyscallOutcome::Continue
+                }
+            };
+        }
         // A clone without CLONE_THREAD is a new process, which only the host
         // can build: it needs a second address space.
         if n == nr::CLONE && a[0] & clone_flags::THREAD == 0 {

@@ -249,7 +249,14 @@ impl FdTable {
     }
 
     pub fn cloexec(&self, fd: i32) -> Result<bool, Errno> {
-        if fd < 0 || fd as usize >= self.cloexec.len() {
+        // A closed descriptor still has a slot in the flag vector, so the
+        // entry has to be checked too -- otherwise `F_GETFD` answers for a
+        // descriptor that is not there, which is how a program decides an
+        // `execve` failed to close what it asked to be closed.
+        if fd < 0
+            || fd as usize >= self.cloexec.len()
+            || self.entries.get(fd as usize).is_none_or(|e| e.is_none())
+        {
             return Err(Errno::EBADF);
         }
         Ok(self.cloexec[fd as usize])

@@ -500,7 +500,40 @@ never reaches a back-edge safepoint at all. With only the safepoint check, two
 threads parked on a `pthread_cond_wait` sat out the whole 500 ms grace period;
 with both, teardown takes a millisecond.
 
-Not done: `fork`.
+## Processes
+
+`fork` and `execve` work, which is what a shell is made of.
+
+A `clone` without `CLONE_THREAD` is a process, and a process needs a second
+address space. It gets one: a fresh shared memory with the parent's mapped
+regions copied into it. There is no copy-on-write, because wasm gives the host
+no way to fault on a write, so the cost is what the parent has mapped rather
+than what the child touches. What the child *does* share is what Linux says it
+should — descriptors are `Arc` handles, so parent and child hold the same open
+file descriptions, offsets included, while the tables are separate.
+
+The child reuses every module the parent has translated. Same program, same
+addresses, and a translated module imports the memory it acts on rather than
+owning it, so instantiating one against a different address space is exactly
+what that import is for.
+
+`execve` keeps the process — its pid, its descriptors, its working directory,
+its mounts — and replaces the address space and the program in it. From there
+it is the same work as starting fresh, so it is the same function, told not to
+build a new kernel. Close-on-exec descriptors go; the rest survive, which is
+how a shell hands a pipe to the command it starts. Everything that can fail is
+checked *before* the point of no return, because a failed `execve` has to
+return: the guest sees `ENOENT` and carries on in the program it already had.
+
+QEMU cannot be the oracle here. `qemu-aarch64` re-execs only *itself*, for the
+program it was given, so a guest that execs another aarch64 binary fails under
+QEMU and works under gex. The exec test therefore checks against a written-down
+expectation of what Linux does, and the harness has an `expect` alongside
+`compare` for exactly this.
+
+Not done: `vfork`'s suspend-the-parent contract (a full fork is stricter, and
+`posix_spawn` synchronises through a pipe anyway), and `execve` from a thread
+other than the process's first.
 
 ---
 
