@@ -210,15 +210,28 @@ undecoded instructions and no operand-text differences from binutils. Over the
 whole 1.34-million-instruction corpus, including the system libraries'
 feature-gated paths, 111 remain undecoded and 2 differ in operand text.
 
-**Cross-engine, on V8.** The native host runs on wasmtime; the browser target
-is V8. Tail calls are load-bearing enough that a difference between the two
-engines would invalidate the design, so the *same* module `gexc build`
-produced is also executed under Node:
+**Cross-engine, on V8.** The browser is the target that matters; wasmtime is
+the development host. Four of the suite's comparisons therefore run the *same*
+module under Node and check it against QEMU, and the stage is skipped rather
+than failed when Node is absent:
 
 ```console
-$ gexc build prog -o prog.wasm
+$ gexc build --exhaustive prog -o prog.wasm
 $ node tests/cross-engine/run-node.mjs prog.wasm prog
 ```
+
+`--exhaustive` because a built module has no runtime translator behind it, and
+anything discovery missed would be a dispatch miss with nowhere to go. The
+module carries its own page directory as a data segment, so it needs no host
+that knows to write one — which is what a browser runtime needs too.
+
+The harness has to supply `gex.fma`, and JS has no scalar FMA. Approximating
+it would show up as a cross-engine divergence that is not gex's fault, so the
+harness computes it exactly: BigInt arithmetic on the mantissas with the
+rounding done by hand for doubles, and for floats the observation that a
+24x24-bit product plus a 24-bit addend is exact in `f64`. `fmabench` — a loop
+of nothing but `__builtin_fma` — comes out byte-identical to the hardware FMA
+wasmtime uses.
 
 `cargo test --workspace` runs the unit tests.
 
@@ -313,6 +326,25 @@ Deserialising a compiled module is `unsafe`: the bytes become executable code
 with only a header check in the way. That is why `gex-cache` is a crate of its
 own — the host forbids `unsafe`, and this is the one place the argument has to
 be made and written down.
+
+### Measured on V8, not on wasmtime
+
+The engine that ships is the one to tune against, and the two disagree. On
+matmul, under V8:
+
+| | |
+|---|---|
+| everything on | 1.535 s |
+| without cross-block flag liveness | 2.005 s (**1.31x**) |
+| without self-loop fusion | 2.083 s (**1.36x**) |
+| without superblock folding | 1.512 s (**0.98x**) |
+
+Loop fusion and flag liveness earn their keep on both engines. Superblock
+folding does not agree with itself across them: 1.19x on matmul under
+wasmtime, 0.98x under V8. Where it *is* consistent is call-heavy code — 1.17x
+under wasmtime, 1.13x under V8 — and real programs are call-heavy, so it
+stays, but the honest summary is that its value depends on the engine and the
+workload.
 
 ### Superblocks, and two things that did not work
 

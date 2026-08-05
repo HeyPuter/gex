@@ -17,6 +17,9 @@ set -eu
 TOOLCHAIN="${GEX_TOOLCHAIN:-/home/claude/toolchains/aarch64-linux-musl-cross/bin}"
 QEMU="${GEX_QEMU:-/home/claude/toolchains/qemu-aarch64}"
 GEXC="${GEXC:-target/release/gexc}"
+# V8 is the target of record; the cross-engine stage is skipped rather than
+# failed when Node is absent, so the suite still runs on a bare machine.
+NODE="$(command -v node 2>/dev/null || true)"
 CC="$TOOLCHAIN/aarch64-linux-musl-gcc"
 CXX="$TOOLCHAIN/aarch64-linux-musl-g++"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -92,6 +95,34 @@ expect() {
         return
     fi
     echo "ok   $label"
+    pass=$((pass + 1))
+}
+
+# Compare the *same module* on V8 against QEMU.
+#
+# The browser is the target that matters, so this is not a curiosity: it is
+# the engine of record. `gexc build --exhaustive` because a built module has no
+# runtime translator behind it, and the module carries its own dispatch
+# directory so the harness has nothing to set up.
+cross_engine() {
+    label="$1"; prog="$2"; shift 2
+    if [ -z "$NODE" ]; then
+        return
+    fi
+    wasm="$WORK/$label.wasm"
+    set +e
+    "$GEXC" build --exhaustive "$prog" -o "$wasm" >/dev/null 2>&1
+    "$QEMU" "$prog" "$@" >"$WORK/$label.qemu" 2>&1
+    "$NODE" "$HERE/../cross-engine/run-node.mjs" "$wasm" "$prog" "$@" \
+        >"$WORK/$label.v8" 2>&1
+    set -e
+    if ! cmp -s "$WORK/$label.qemu" "$WORK/$label.v8"; then
+        echo "FAIL v8-$label: V8 and QEMU disagree"
+        diff -u "$WORK/$label.qemu" "$WORK/$label.v8" | head -20 || true
+        fail=$((fail + 1))
+        return
+    fi
+    echo "ok   v8-$label"
     pass=$((pass + 1))
 }
 
@@ -269,6 +300,13 @@ compare "numeric" "$WORK/numeric"
 compare "neon-structure" "$WORK/neon2"
 compare "cross-block-flags" "$WORK/flags"
 compare "fixed-point" "$WORK/fixedpoint"
+
+# The same modules on V8. Everything here is single-threaded and static: the
+# cross-engine harness is a few dozen syscalls, not the browser runtime.
+cross_engine "vector" "$WORK/vector"
+cross_engine "numeric" "$WORK/numeric"
+cross_engine "fixedpoint" "$WORK/fixedpoint"
+cross_engine "neon-structure" "$WORK/neon2"
 compare "threads" "$WORK/threads"
 compare "thread-exit-race" "$WORK/exitrace"
 compare "fork" "$WORK/fork"

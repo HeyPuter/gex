@@ -140,6 +140,10 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
 /// is already in it: a back-edge is a loop, and loop fusion handles the one
 /// shape of that worth handling.
 fn chain_target(block: &Block, cx: &Context<'_>) -> Option<u64> {
+    // A kill switch, so the transform can be measured against its absence.
+    if std::env::var_os("GEX_NO_SUPERBLOCK").is_some() {
+        return None;
+    }
     match block.term {
         Term::Goto { target }
             if target > block.start

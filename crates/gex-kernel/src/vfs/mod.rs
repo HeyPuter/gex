@@ -13,11 +13,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod devfs;
+// Passthrough to the host's own filesystem, which only exists where there is
+// one to pass through to. The browser gets `opfs` and `httpfs` instead
+// (PLAN §8); everything above this line is portable.
+#[cfg(unix)]
 pub mod hostfs;
 pub mod procfs;
 pub mod tmpfs;
 
 pub use devfs::DevFs;
+#[cfg(unix)]
 pub use hostfs::HostFs;
 pub use procfs::{ProcFs, ProcSource};
 pub use tmpfs::TmpFs;

@@ -35,6 +35,115 @@ class Exit extends Error {
   constructor(code) { super(`guest exited with ${code}`); this.code = code; }
 }
 
+// -- fused multiply-add ----------------------------------------------------
+//
+// `gex.fma` must round exactly once. JS has no scalar FMA, and rounding the
+// product first is what makes musl's `pow` return 1024.0000000000002 for
+// `2^10`, so an approximation would show up as a cross-engine divergence that
+// is not gex's fault. This is therefore exact rather than fast: the f64 case
+// does the arithmetic in BigInt and rounds by hand, and the f32 case falls out
+// of doing it in f64, where a 24x24-bit product and the addend still fit.
+
+const scratch = new DataView(new ArrayBuffer(8));
+
+function f64FromBits(bits) {
+  scratch.setBigUint64(0, BigInt.asUintN(64, bits), true);
+  return scratch.getFloat64(0, true);
+}
+function bitsFromF64(v) {
+  scratch.setFloat64(0, v, true);
+  return scratch.getBigUint64(0, true);
+}
+function f32FromBits(bits) {
+  scratch.setUint32(0, Number(BigInt.asUintN(32, bits)), true);
+  return scratch.getFloat32(0, true);
+}
+function bitsFromF32(v) {
+  scratch.setFloat32(0, v, true);
+  return BigInt(scratch.getUint32(0, true));
+}
+
+/** Split a double into `{ sign, m, e }` with value = (-1)^sign * m * 2^e. */
+function decompose(x) {
+  const bits = bitsFromF64(x);
+  const sign = Number((bits >> 63n) & 1n);
+  const rawExp = Number((bits >> 52n) & 0x7ffn);
+  const frac = bits & 0xf_ffff_ffff_ffffn;
+  if (rawExp === 0) return { sign, m: frac, e: -1074 };        // subnormal or zero
+  return { sign, m: frac | 0x10_0000_0000_0000n, e: rawExp - 1075 };
+}
+
+/** Round `(sign, m, e)` -- an exact value -- to the nearest double. */
+function roundToDouble(sign, m, e) {
+  if (m === 0n) return sign ? -0 : 0;
+  // Normalise to exactly 53 significant bits, keeping guard and sticky.
+  let bits = m.toString(2).length;
+  if (bits > 53) {
+    const drop = BigInt(bits - 53);
+    const rest = m & ((1n << drop) - 1n);
+    const half = 1n << (drop - 1n);
+    m >>= drop;
+    e += Number(drop);
+    // Nearest, ties to even.
+    if (rest > half || (rest === half && (m & 1n) === 1n)) {
+      m += 1n;
+      if (m.toString(2).length > 53) { m >>= 1n; e += 1; }
+    }
+  }
+  let v = Number(m) * Math.pow(2, e);
+  // Math.pow can underflow to zero in two steps; scale in halves if so.
+  if (!isFinite(v) || (v === 0 && m !== 0n)) {
+    v = Number(m);
+    let k = e;
+    while (k > 0) { const step = Math.min(k, 512); v *= Math.pow(2, step); k -= step; }
+    while (k < 0) { const step = Math.max(k, -512); v *= Math.pow(2, step); k -= step; }
+  }
+  return sign ? -v : v;
+}
+
+function fmaF64(a, b, c) {
+  const p = a * b;
+  // Specials and zeros: the ordinary expression already gives the right
+  // answer, and the exact path below has no way to represent them.
+  if (!isFinite(a) || !isFinite(b) || !isFinite(c) || a === 0 || b === 0) {
+    return p + c;
+  }
+  const A = decompose(a), B = decompose(b), C = decompose(c);
+  const sp = A.sign ^ B.sign;
+  let pm = A.m * B.m;
+  let pe = A.e + B.e;
+  let cm = C.m, ce = C.e, cs = C.sign;
+  if (cm === 0n) return roundToDouble(sp, pm, pe);
+  // Align to the lower exponent so both are integers of the same scale.
+  if (pe > ce) { pm <<= BigInt(pe - ce); pe = ce; } else { cm <<= BigInt(ce - pe); ce = pe; }
+  let sign, m;
+  if (sp === cs) {
+    sign = sp;
+    m = pm + cm;
+  } else if (pm >= cm) {
+    sign = sp;
+    m = pm - cm;
+  } else {
+    sign = cs;
+    m = cm - pm;
+  }
+  if (m === 0n) return 0;  // exact cancellation is +0 under round-to-nearest
+  return roundToDouble(sign, m, pe);
+}
+
+function fma(aBits, bBits, cBits, double) {
+  if (double) {
+    return BigInt.asUintN(
+      64,
+      bitsFromF64(fmaF64(f64FromBits(aBits), f64FromBits(bBits), f64FromBits(cBits))),
+    );
+  }
+  // A 24x24-bit product and a 24-bit addend are exact in f64, so one rounding
+  // back to f32 is the whole operation.
+  const r = f32FromBits(aBits) * f32FromBits(bBits) + f32FromBits(cBits);
+  return BigInt.asUintN(64, bitsFromF32(Math.fround(r)));
+}
+
 /** Minimal ELF64 reader: just enough to place the segments. */
 function loadElf(bytes) {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -167,8 +276,23 @@ function syscall(ctx, pc) {
   wr64(CTX_BASE, r);
 }
 
+// The guest's memory belongs to the host, not the module: every guest thread
+// runs in its own store (its own Worker, in a browser) and they all act on the
+// same bytes. Shared, so a SharedArrayBuffer is what backs it.
+const guestMemory = new WebAssembly.Memory({
+  initial: GUEST_MEM_PAGES,
+  maximum: GUEST_MEM_PAGES,
+  shared: true,
+});
+
 const imports = {
   gex: {
+    memory: guestMemory,
+    // Wasm has no fused multiply-add and rounding twice is not close enough:
+    // musl's pow is built out of this instruction. JS has no scalar FMA
+    // either, so this is the software one -- exact for the case that matters,
+    // which is recovering the rounding error of a product.
+    fma: (ctx, a, b, c, double) => fma(a, b, c, double !== 0),
     syscall: (ctx, pc) => syscall(ctx, Number(pc)),
     dispatch_miss: (ctx, pc) => {
       throw new Error(`branch to 0x${pc.toString(16)} with no translation`);
@@ -185,9 +309,9 @@ const imports = {
 };
 
 const instance = new WebAssembly.Instance(module_, imports);
-memory = instance.exports.memory;
+memory = guestMemory;
 if (memory.buffer.byteLength < GUEST_MEM_PAGES * 65536) {
-  console.error('cross-engine host: module exported a smaller memory than expected');
+  console.error('cross-engine host: memory is smaller than expected');
   process.exit(1);
 }
 

@@ -450,6 +450,33 @@ impl ModuleBuilder {
         let table_slots = self.page_table.slots();
         let dir_entries = std::mem::take(&mut self.new_pages);
 
+        if self.linkage == Linkage::Own {
+            // Publish the page directory as data, so a module is usable
+            // without a host that knows to write it -- which is what the
+            // cross-engine harness and the browser shim need. The native host
+            // writes the same values from the metadata; a data segment simply
+            // gets there first.
+            //
+            // Written as runs of consecutive pages rather than one span,
+            // because the gaps may hold entries some other module claimed and
+            // a zero would erase them.
+            let mut sorted = dir_entries.clone();
+            sorted.sort_unstable();
+            let mut i = 0;
+            while i < sorted.len() {
+                let start_page = sorted[i].0;
+                let mut bytes = Vec::new();
+                while i < sorted.len() && sorted[i].0 == start_page + (bytes.len() / 4) as u64 {
+                    bytes.extend_from_slice(&sorted[i].1.to_le_bytes());
+                    i += 1;
+                }
+                self.data.push(DataSegment {
+                    offset: DISPATCH_DIR + start_page * 4,
+                    bytes,
+                });
+            }
+        }
+
         match self.linkage {
             Linkage::Own => {
                 self.m.set_table(

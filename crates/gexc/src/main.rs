@@ -54,6 +54,9 @@ fn usage() {
 usage:
   gexc run    <elf> [args...]      translate and run the program
   gexc build  <elf> -o <out.wasm>  translate and write the wasm module
+                                   (--exhaustive: translate every decodable
+                                   address, since a built module has no
+                                   runtime translator behind it)
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
 
@@ -202,6 +205,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
 fn cmd_build(args: &[String]) -> Result<()> {
     let mut path = None;
     let mut out = None;
+    let mut exhaustive = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -209,6 +213,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
                 i += 1;
                 out = Some(args.get(i).context("-o needs a path")?.clone());
             }
+            // A built module has no runtime translator behind it, so anything
+            // discovery misses is a dispatch miss with nowhere to go.
+            "--exhaustive" => exhaustive = true,
             other => path = Some(other.to_string()),
         }
         i += 1;
@@ -218,7 +225,13 @@ fn cmd_build(args: &[String]) -> Result<()> {
 
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
-    let (module, stats) = gex_xlate::translate_image(&image, &Options::default());
+    let (module, stats) = gex_xlate::translate_image(
+        &image,
+        &Options {
+            exhaustive,
+            ..Options::default()
+        },
+    );
     std::fs::write(&out, &module.wasm).with_context(|| format!("writing {out}"))?;
     eprintln!(
         "{out}: {} blocks, {} guest instructions, {} KiB wasm ({:.1}x guest text)",
