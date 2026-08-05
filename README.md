@@ -423,6 +423,12 @@ past eight is partly the machine and partly the single kernel lock, which
 every syscall takes; splitting it is the obvious next move if a syscall-heavy
 threaded workload needs it.
 
+Beyond the synthetic test: SQLite built with `SQLITE_THREADSAFE=1`, six
+threads inserting 24,000 rows through one shared connection — so every
+statement takes the connection's mutex and the futex traffic is heavily
+contended. Correct on the first run and on ten more, at 4.5 s against QEMU's
+4.3 s.
+
 `tests/integration/programs/threads.c` covers eight workers over a mutex,
 thread-local storage, `pthread_once`, a condition variable with a separate
 producer and consumer, and detached threads that nobody joins. Every number it
