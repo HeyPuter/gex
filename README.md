@@ -461,9 +461,16 @@ producer and consumer, and detached threads that nobody joins. Every number it
 prints is order-independent, so the comparison against QEMU is of the
 arithmetic rather than of the scheduler. It ran 20 times without a difference.
 
-Not done: `fork`, and `exit_group` while other threads are running detaches
-them rather than joining, which is fine for a process that is about to end and
-would not be for a library embedding.
+When the process ends, the other threads have to stop before the stores and
+the memory they are using go away. `exit_group` sets a flag and releases
+everyone parked on a futex, since no guest code is going to wake them now.
+Threads notice it at a safepoint — and also at syscall entry, because a thread
+looping on a blocking call is exactly what a condition variable is, and it
+never reaches a back-edge safepoint at all. With only the safepoint check, two
+threads parked on a `pthread_cond_wait` sat out the whole 500 ms grace period;
+with both, teardown takes a millisecond.
+
+Not done: `fork`.
 
 ---
 

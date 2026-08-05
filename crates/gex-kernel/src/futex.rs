@@ -118,6 +118,19 @@ impl FutexTable {
         }
     }
 
+    /// Wake every waiter on every queue.
+    ///
+    /// Used when the process is ending: a thread parked on a futex will never
+    /// be woken by the guest, because the guest is not going to run again.
+    pub fn wake_everything(&self) {
+        let queues: Vec<Arc<Queue>> = self.queues.lock().unwrap().values().cloned().collect();
+        for q in queues {
+            let mut gen = q.generation.lock().unwrap();
+            *gen = gen.wrapping_add(1);
+            q.ready.notify_all();
+        }
+    }
+
     /// Drop queues nobody is using, so a long-running process does not keep
     /// an entry for every lock it ever touched.
     pub fn gc(&self) {

@@ -131,6 +131,11 @@ struct HostState {
 /// be handed the parent's: it builds its own and instantiates the same
 /// modules into it. Everything here is either immutable or already shared.
 struct SpawnContext {
+    /// Set when the process is ending, so every other thread stops at its
+    /// next safepoint instead of running on into a torn-down world.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// How many spawned threads have not yet noticed.
+    running: Arc<std::sync::atomic::AtomicUsize>,
     engine: Engine,
     /// The image module, instantiated fresh in each thread's store.
     image_module: Module,
@@ -513,6 +518,8 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     // one -- only the `gex.*` imports -- because a linker carrying store-bound
     // definitions could not be cloned into another thread.
     let spawn = Arc::new(SpawnContext {
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         engine: engine.clone(),
         image_module: module.clone(),
         linker: base_linker,
@@ -525,6 +532,14 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     store.data_mut().spawn = Some(Arc::clone(&spawn));
 
     let exit = run_thread_loop(&mut store, &instance, ctx_addr, program.entry())?;
+
+    // The process is over. Every other thread has to stop before the stores
+    // and the memory they are using go away: set the flag their safepoints
+    // watch, and release anyone parked on a futex, since no guest code is
+    // going to wake them now. They are given a bounded moment to notice --
+    // long enough for a thread between safepoints, short enough that a thread
+    // wedged in a host call cannot hold up the exit.
+    stop_other_threads(&spawn, opts.verbose);
 
     if let Some(jit) = store.data().jit.as_ref() {
         let (blocks, calls, translated) = {
@@ -549,6 +564,33 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
         }
     }
     Ok((exit, stats))
+}
+
+/// Bring every other guest thread to a halt after the process has exited.
+fn stop_other_threads(spawn: &SpawnContext, verbose: bool) {
+    use std::sync::atomic::Ordering;
+    let started = std::time::Instant::now();
+    spawn.stopping.store(true, Ordering::Release);
+    {
+        let k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        k.futexes.wake_everything();
+    }
+    let deadline = started + std::time::Duration::from_millis(500);
+    while spawn.running.load(Ordering::Acquire) > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    if verbose {
+        let left = spawn.running.load(Ordering::Acquire);
+        eprintln!(
+            "[gex] stopped other threads in {:.0}ms{}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            if left > 0 {
+                format!(", {left} did not stop in time")
+            } else {
+                String::new()
+            }
+        );
+    }
 }
 
 /// Perform a syscall's blocking half with the kernel unlocked.
@@ -606,12 +648,15 @@ fn run_thread_loop(
             // Detached: a guest thread is joined through its own futex, not
             // through the host's handle, and `exit_group` ends the process
             // whatever its threads are doing.
+            cx.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let running = Arc::clone(&cx.running);
             std::thread::Builder::new()
                 .name(format!("gex-tid-{}", child.tid))
                 .spawn(move || {
                     if let Err(e) = run_guest_thread(cx, child) {
                         eprintln!("gexc: thread {} failed: {e:#}", child.tid);
                     }
+                    running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 })
                 .context("spawning a guest thread")?;
         }
@@ -907,6 +952,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
             let data = memory.bytes();
             let state = caller.data_mut();
+            // A thread that loops on a blocking syscall -- a condition
+            // variable is exactly this -- never reaches a back-edge
+            // safepoint, so the process-is-ending check has to be here too.
+            if state
+                .spawn
+                .as_ref()
+                .is_some_and(|s| s.stopping.load(std::sync::atomic::Ordering::Acquire))
+            {
+                state.exit = Some(Exit::Status(0));
+                return Err(StopExecution.into());
+            }
             let mut gm = GuestMem::new(data);
             // /proc must reflect the state this syscall will see, so the
             // snapshot is refreshed before the call rather than after.
@@ -1166,6 +1222,16 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if counter + 4 <= gm.bytes.len() {
                 gm.bytes[counter..counter + 4]
                     .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
+            }
+            // The process may have ended in another thread while this one was
+            // running. A safepoint is the only place it is safe to notice.
+            if state
+                .spawn
+                .as_ref()
+                .is_some_and(|s| s.stopping.load(std::sync::atomic::Ordering::Acquire))
+            {
+                state.exit = Some(Exit::Status(0));
+                return Err(StopExecution.into());
             }
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),

@@ -171,6 +171,8 @@ echo "building guest programs..."
 # Every result this prints is order-independent, so the comparison is of the
 # arithmetic rather than of the scheduler.
 "$CC" -static -no-pie -O2 -o "$WORK/threads" "$HERE/programs/threads.c" -lpthread
+# Exits while other threads are mid-work, including two parked on a futex.
+"$CC" -static -no-pie -O2 -o "$WORK/exitrace" "$HERE/programs/exitrace.c" -lpthread
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
 # .eh_frame through personality routines -- a very different code shape from
 # anything the C programs reach.
@@ -235,6 +237,7 @@ compare "neon-structure" "$WORK/neon2"
 compare "cross-block-flags" "$WORK/flags"
 compare "fixed-point" "$WORK/fixedpoint"
 compare "threads" "$WORK/threads"
+compare "thread-exit-race" "$WORK/exitrace"
 [ -n "$CPP" ] && compare "cpp-static" "$WORK/cpp"
 
 if [ -n "$DYNAMIC" ]; then
