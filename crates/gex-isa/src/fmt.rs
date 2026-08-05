@@ -686,6 +686,213 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
         // The immediate is already expanded, so the lane shape the assembler
         // chose is no longer recoverable; print the resulting register value.
         Inst::VMoveImm { vd, value } => format!("movi v{}, #0x{value:x}", vd.0),
+        Inst::FpDataProc1 { sz, op, vd, vn } => {
+            let m = match op {
+                FpOp1::Mov => "fmov",
+                FpOp1::Abs => "fabs",
+                FpOp1::Neg => "fneg",
+                FpOp1::Sqrt => "fsqrt",
+                FpOp1::RoundNearest => "frintn",
+                FpOp1::RoundPlus => "frintp",
+                FpOp1::RoundMinus => "frintm",
+                FpOp1::RoundZero => "frintz",
+                FpOp1::RoundAway => "frinta",
+            };
+            format!("{m} {}, {}", freg(vd, sz), freg(vn, sz))
+        }
+        Inst::FpDataProc2 { sz, op, vd, vn, vm } => {
+            let m = match op {
+                FpOp2::Mul => "fmul",
+                FpOp2::Div => "fdiv",
+                FpOp2::Add => "fadd",
+                FpOp2::Sub => "fsub",
+                FpOp2::Max => "fmax",
+                FpOp2::Min => "fmin",
+                FpOp2::MaxNum => "fmaxnm",
+                FpOp2::MinNum => "fminnm",
+                FpOp2::NMul => "fnmul",
+            };
+            format!("{m} {}, {}, {}", freg(vd, sz), freg(vn, sz), freg(vm, sz))
+        }
+        Inst::FpDataProc3 {
+            sz,
+            vd,
+            vn,
+            vm,
+            va,
+            neg_product,
+            neg_addend,
+        } => {
+            let m = match (neg_product, neg_addend) {
+                (false, false) => "fmadd",
+                (true, false) => "fmsub",
+                (true, true) => "fnmadd",
+                (false, true) => "fnmsub",
+            };
+            format!(
+                "{m} {}, {}, {}, {}",
+                freg(vd, sz),
+                freg(vn, sz),
+                freg(vm, sz),
+                freg(va, sz)
+            )
+        }
+        Inst::FpCompare { sz, vn, vm } => match vm {
+            Some(vm) => format!("fcmp {}, {}", freg(vn, sz), freg(vm, sz)),
+            None => format!("fcmp {}, #0.0", freg(vn, sz)),
+        },
+        Inst::FpCondSelect {
+            sz,
+            vd,
+            vn,
+            vm,
+            cond,
+        } => format!(
+            "fcsel {}, {}, {}, {}",
+            freg(vd, sz),
+            freg(vn, sz),
+            freg(vm, sz),
+            cond.name()
+        ),
+        Inst::FpMoveImm { sz, vd, bits } => {
+            let value = if sz.is_double() {
+                f64::from_bits(bits)
+            } else {
+                f32::from_bits(bits as u32) as f64
+            };
+            format!("fmov {}, #{value:e}", freg(vd, sz))
+        }
+        Inst::FpConvertPrecision { from, to, vd, vn } => {
+            format!("fcvt {}, {}", freg(vd, to), freg(vn, from))
+        }
+        Inst::FpFromInt {
+            sz,
+            int_sz,
+            signed,
+            vd,
+            rn,
+        } => format!(
+            "{} {}, {}",
+            if signed { "scvtf" } else { "ucvtf" },
+            freg(vd, sz),
+            reg(rn, int_sz)
+        ),
+        Inst::FpToInt {
+            sz,
+            int_sz,
+            signed,
+            round,
+            rd,
+            vn,
+        } => {
+            let r = match round {
+                FpRound::Nearest => 'n',
+                FpRound::Plus => 'p',
+                FpRound::Minus => 'm',
+                FpRound::Zero => 'z',
+                FpRound::Away => 'a',
+            };
+            format!(
+                "fcvt{r}{} {}, {}",
+                if signed { "s" } else { "u" },
+                reg(rd, int_sz),
+                freg(vn, sz)
+            )
+        }
+        Inst::FpMoveGeneral {
+            sz,
+            to_vector,
+            rd,
+            vd,
+        } => {
+            let int_sz = if sz.is_double() { Sz::X } else { Sz::W };
+            if to_vector {
+                format!("fmov {}, {}", freg(vd, sz), reg(rd, int_sz))
+            } else {
+                format!("fmov {}, {}", reg(rd, int_sz), freg(vd, sz))
+            }
+        }
+
+        Inst::FpMoveTopHalf { to_vector, rd, vd } => {
+            if to_vector {
+                format!("fmov v{}.d[1], {}", vd.0, reg(rd, Sz::X))
+            } else {
+                format!("fmov {}, v{}.d[1]", reg(rd, Sz::X), vd.0)
+            }
+        }
+
+        Inst::VMoveLane {
+            to_vector,
+            signed,
+            lane_bytes,
+            lane,
+            int_sz,
+            rd,
+            vd,
+        } => {
+            let t = match lane_bytes {
+                1 => 'b',
+                2 => 'h',
+                4 => 's',
+                _ => 'd',
+            };
+            if to_vector {
+                format!("mov v{}.{t}[{lane}], {}", vd.0, reg(rd, int_sz))
+            } else if signed {
+                format!("smov {}, v{}.{t}[{lane}]", reg(rd, int_sz), vd.0)
+            } else {
+                // binutils prints the full-width extraction as `mov`.
+                let m = if lane_bytes == 8 || (lane_bytes == 4 && int_sz == Sz::W) {
+                    "mov"
+                } else {
+                    "umov"
+                };
+                format!("{m} {}, v{}.{t}[{lane}]", reg(rd, int_sz), vd.0)
+            }
+        }
+
+        Inst::VLoadMulti {
+            regs,
+            vt,
+            bytes,
+            ref addr,
+        }
+        | Inst::VStoreMulti {
+            regs,
+            vt,
+            bytes,
+            ref addr,
+        } => {
+            let m = if matches!(*inst, Inst::VLoadMulti { .. }) {
+                "ld1"
+            } else {
+                "st1"
+            };
+            let w = if bytes == 16 { "16b" } else { "8b" };
+            let list: Vec<String> = (0..regs)
+                .map(|i| format!("v{}.{w}", (vt.0 + i) % 32))
+                .collect();
+            format!("{m} {{{}}}, {}", list.join(", "), addr_str(addr))
+        }
+        Inst::VCnt { vd, vn, q } => {
+            let w = if q { "16b" } else { "8b" };
+            format!("cnt v{}.{w}, v{}.{w}", vd.0, vn.0)
+        }
+        Inst::VAddAcross {
+            vd,
+            vn,
+            lane_bytes,
+            q,
+        } => {
+            let t = match lane_bytes {
+                1 => 'b',
+                2 => 'h',
+                _ => 's',
+            };
+            let lanes = (if q { 16 } else { 8 }) / lane_bytes;
+            format!("addv {t}{}, v{}.{lanes}{t}", vd.0, vn.0)
+        }
+
         Inst::VLogical { op, vd, vn, vm, q } => {
             let w = if q { "16b" } else { "8b" };
             if op == VLogOp::Orr && vn == vm {
@@ -805,6 +1012,11 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             )
         }
     }
+}
+
+/// A SIMD&FP register named by its floating-point view: `s` or `d`.
+fn freg(v: VReg, sz: FpSz) -> String {
+    format!("{}{}", if sz.is_double() { 'd' } else { 's' }, v.0)
 }
 
 /// A SIMD&FP register named by its scalar view: `b`, `h`, `s`, `d` or `q`.

@@ -159,6 +159,11 @@ fn alias_equivalent(expect: &str, got: &str) -> bool {
             _ => return None,
         })
     };
+    // The `E` compare variants differ only in whether a quiet NaN raises an
+    // invalid-operation exception, which gex does not model.
+    if expect == "fcmpe" && got == "fcmp" {
+        return true;
+    }
     unscaled(expect) == Some(got)
 }
 

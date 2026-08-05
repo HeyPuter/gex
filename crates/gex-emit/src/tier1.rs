@@ -42,6 +42,7 @@ mod simd {
     pub const I16X8_SPLAT: u32 = 0x10;
     pub const I32X4_SPLAT: u32 = 0x11;
     pub const I64X2_SPLAT: u32 = 0x12;
+    pub const I8X16_POPCNT: u32 = 0x62;
     pub const V128_AND: u32 = 0x4e;
     pub const V128_ANDNOT: u32 = 0x4f;
     pub const V128_OR: u32 = 0x50;
@@ -602,6 +603,12 @@ impl<'a> Emitter<'a> {
                     VBinOp::AndNot => simd::V128_ANDNOT,
                 });
             }
+            Expr::VUn { op, a } => {
+                self.push(*a);
+                match op {
+                    VUnOp::PopcntBytes => self.f.simd(simd::I8X16_POPCNT),
+                }
+            }
             Expr::VExtract {
                 a,
                 lane,
@@ -636,12 +643,125 @@ impl<'a> Emitter<'a> {
                 };
                 self.f.simd_lane(sub, *lane as u8);
             }
+
+            Expr::FpBin { op, double, a, b } => {
+                self.push(*a);
+                self.reinterpret_to_fp(*double);
+                self.push(*b);
+                self.reinterpret_to_fp(*double);
+                let base: u8 = match op {
+                    FpBinOp::Add => 0x92,
+                    FpBinOp::Sub => 0x93,
+                    FpBinOp::Mul => 0x94,
+                    FpBinOp::Div => 0x95,
+                    FpBinOp::Min => 0x96,
+                    FpBinOp::Max => 0x97,
+                    FpBinOp::Copysign => 0x98,
+                };
+                // The f64 arithmetic block sits 14 opcodes after the f32 one.
+                self.f.byte(if *double { base + 0x0e } else { base });
+                self.reinterpret_from_fp(*double);
+            }
+            Expr::FpUn { op, double, a } => {
+                self.push(*a);
+                self.reinterpret_to_fp(*double);
+                let base: u8 = match op {
+                    FpUnOp::Abs => 0x8b,
+                    FpUnOp::Neg => 0x8c,
+                    FpUnOp::Ceil => 0x8d,
+                    FpUnOp::Floor => 0x8e,
+                    FpUnOp::Trunc => 0x8f,
+                    FpUnOp::RoundNearest => 0x90,
+                    FpUnOp::Sqrt => 0x91,
+                };
+                self.f.byte(if *double { base + 0x0e } else { base });
+                self.reinterpret_from_fp(*double);
+            }
+            Expr::FpCmp { op, double, a, b } => {
+                self.push(*a);
+                self.reinterpret_to_fp(*double);
+                self.push(*b);
+                self.reinterpret_to_fp(*double);
+                let base: u8 = match op {
+                    FpCmpOp::Eq => 0x5b,
+                    FpCmpOp::Ne => 0x5c,
+                    FpCmpOp::Lt => 0x5d,
+                    FpCmpOp::Gt => 0x5e,
+                    FpCmpOp::Le => 0x5f,
+                    FpCmpOp::Ge => 0x60,
+                };
+                self.f.byte(if *double { base + 0x06 } else { base });
+            }
+            Expr::FpCvt {
+                kind,
+                src_wide,
+                dst_wide,
+                a,
+            } => self.emit_fp_convert(*kind, *src_wide, *dst_wide, *a),
         }
 
         // Everything that reaches here left one value on the stack.
         let local = self.alloc(ty);
         self.f.local_set(local);
         self.value_local[idx] = Some(local);
+    }
+
+    /// Reinterpret the integer bit pattern on top of the stack as a float.
+    fn reinterpret_to_fp(&mut self, double: bool) {
+        // f64.reinterpret_i64 / f32.reinterpret_i32
+        self.f.byte(if double { 0xbf } else { 0xbe });
+    }
+
+    /// Reinterpret the float on top of the stack back to its bit pattern.
+    fn reinterpret_from_fp(&mut self, double: bool) {
+        // i64.reinterpret_f64 / i32.reinterpret_f32
+        self.f.byte(if double { 0xbd } else { 0xbc });
+    }
+
+    fn emit_fp_convert(&mut self, kind: FpConvert, src_wide: bool, dst_wide: bool, a: Value) {
+        match kind {
+            FpConvert::FpToFp => {
+                self.push(a);
+                self.reinterpret_to_fp(src_wide);
+                // f32.demote_f64 / f64.promote_f32
+                self.f.byte(if dst_wide { 0xbb } else { 0xb6 });
+                self.reinterpret_from_fp(dst_wide);
+            }
+            FpConvert::IntToFp { signed } => {
+                self.push(a);
+                let op: u8 = match (dst_wide, src_wide, signed) {
+                    (false, false, true) => 0xb2,  // f32.convert_i32_s
+                    (false, false, false) => 0xb3, // f32.convert_i32_u
+                    (false, true, true) => 0xb4,   // f32.convert_i64_s
+                    (false, true, false) => 0xb5,  // f32.convert_i64_u
+                    (true, false, true) => 0xb7,   // f64.convert_i32_s
+                    (true, false, false) => 0xb8,  // f64.convert_i32_u
+                    (true, true, true) => 0xb9,    // f64.convert_i64_s
+                    (true, true, false) => 0xba,   // f64.convert_i64_u
+                };
+                self.f.byte(op);
+                self.reinterpret_from_fp(dst_wide);
+            }
+            FpConvert::FpToInt { signed } => {
+                self.push(a);
+                self.reinterpret_to_fp(src_wide);
+                // The *saturating* conversions, because AArch64's FCVTZ*
+                // clamps out-of-range values and maps NaN to zero, while the
+                // trapping forms would abort the guest.
+                let sub: u32 = match (dst_wide, src_wide, signed) {
+                    (false, false, true) => 0x00,
+                    (false, false, false) => 0x01,
+                    (false, true, true) => 0x02,
+                    (false, true, false) => 0x03,
+                    (true, false, true) => 0x04,
+                    (true, false, false) => 0x05,
+                    (true, true, true) => 0x06,
+                    (true, true, false) => 0x07,
+                };
+                self.f.byte(0xfc);
+                self.f.u32(sub);
+            }
+        }
     }
 
     /// Push a `ty`-typed constant.

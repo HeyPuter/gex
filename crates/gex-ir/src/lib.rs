@@ -304,6 +304,8 @@ pub enum Expr {
     VSplat { a: Value, lane_bytes: u32 },
     /// Bitwise operation on two vectors.
     VBin { op: VBinOp, a: Value, b: Value },
+    /// Lane-wise unary operation on a vector.
+    VUn { op: VUnOp, a: Value },
     /// Read one lane out as a scalar.
     VExtract {
         a: Value,
@@ -320,6 +322,104 @@ pub enum Expr {
         lane_bytes: u32,
         val: Value,
     },
+
+    /// Scalar floating-point arithmetic on bit patterns.
+    FpBin {
+        op: FpBinOp,
+        /// True for double precision, false for single.
+        double: bool,
+        a: Value,
+        b: Value,
+    },
+    FpUn {
+        op: FpUnOp,
+        double: bool,
+        a: Value,
+    },
+    /// Compare two floats, producing an `I32` boolean. Any comparison
+    /// involving a NaN is false, which is IEEE-754's rule and wasm's.
+    FpCmp {
+        op: FpCmpOp,
+        double: bool,
+        a: Value,
+        b: Value,
+    },
+    /// Convert between floating-point and integer representations.
+    FpCvt {
+        kind: FpConvert,
+        /// Width of the source: true for 64-bit.
+        src_wide: bool,
+        /// Width of the destination: true for 64-bit.
+        dst_wide: bool,
+        a: Value,
+    },
+}
+
+/// Scalar floating-point operations.
+///
+/// FP values travel through GIR as their integer *bit patterns* (`I32` for
+/// single, `I64` for double), and the backend reinterprets around each
+/// operation. That keeps the type lattice at three entries and matches how
+/// AArch64 itself stores them — a `d` register is just the low half of a `v`
+/// register.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FpBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    /// IEEE-754 minimum, propagating NaN — AArch64's `FMIN`.
+    Min,
+    Max,
+    Copysign,
+}
+
+/// Scalar floating-point unary operations.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FpUnOp {
+    Abs,
+    Neg,
+    Sqrt,
+    /// Round to nearest, ties to even.
+    RoundNearest,
+    /// Round toward +infinity.
+    Ceil,
+    /// Round toward -infinity.
+    Floor,
+    /// Round toward zero.
+    Trunc,
+}
+
+/// Scalar floating-point comparisons, producing an `I32` boolean.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FpCmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// A conversion between a floating-point value and an integer, or between
+/// the two floating-point widths.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FpConvert {
+    /// Integer to float. `signed` selects the interpretation of the source.
+    IntToFp { signed: bool },
+    /// Float to integer, rounding toward zero and *saturating* — which is
+    /// what AArch64's `FCVTZ*` does, and why the lifter uses wasm's
+    /// non-trapping conversions rather than the trapping ones.
+    FpToInt { signed: bool },
+    /// Single to double, or double to single.
+    FpToFp,
+}
+
+/// Vector unary operations.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VUnOp {
+    /// Per-byte population count.
+    PopcntBytes,
 }
 
 /// Bitwise vector operations.
@@ -367,7 +467,25 @@ impl Expr {
             | Expr::VConst(_)
             | Expr::VSplat { .. }
             | Expr::VBin { .. }
+            | Expr::VUn { .. }
             | Expr::VReplace { .. } => Ty::V128,
+            // Floating-point results are the bit pattern of the value, so
+            // the width follows the precision.
+            Expr::FpBin { double, .. } | Expr::FpUn { double, .. } => {
+                if double {
+                    Ty::I64
+                } else {
+                    Ty::I32
+                }
+            }
+            Expr::FpCmp { .. } => Ty::I32,
+            Expr::FpCvt { dst_wide, .. } => {
+                if dst_wide {
+                    Ty::I64
+                } else {
+                    Ty::I32
+                }
+            }
         }
     }
 
@@ -404,7 +522,7 @@ impl Expr {
             Expr::HostCall { args, .. } => args.iter().copied().for_each(f),
             Expr::VLoad { addr, .. } => f(*addr),
             Expr::VConst(_) => {}
-            Expr::VSplat { a, .. } | Expr::VExtract { a, .. } => f(*a),
+            Expr::VSplat { a, .. } | Expr::VExtract { a, .. } | Expr::VUn { a, .. } => f(*a),
             Expr::VBin { a, b, .. } => {
                 f(*a);
                 f(*b);
@@ -413,6 +531,11 @@ impl Expr {
                 f(*a);
                 f(*val);
             }
+            Expr::FpBin { a, b, .. } | Expr::FpCmp { a, b, .. } => {
+                f(*a);
+                f(*b);
+            }
+            Expr::FpUn { a, .. } | Expr::FpCvt { a, .. } => f(*a),
         }
     }
 }

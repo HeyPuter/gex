@@ -29,6 +29,15 @@ fn ty(t: Ty) -> &'static str {
     }
 }
 
+/// Name a floating-point width.
+fn fw(double: bool) -> &'static str {
+    if double {
+        "f64"
+    } else {
+        "f32"
+    }
+}
+
 fn off(o: i64) -> String {
     if o == 0 {
         String::new()
@@ -112,6 +121,7 @@ fn expr(e: &Expr) -> String {
         Expr::VConst(b) => format!("v128 {b:02x?}"),
         Expr::VSplat { a, lane_bytes } => format!("splat{} {a:?}", lane_bytes * 8),
         Expr::VBin { op, a, b } => format!("v{op:?} {a:?}, {b:?}").to_lowercase(),
+        Expr::VUn { op, a } => format!("v{op:?} {a:?}").to_lowercase(),
         Expr::VExtract {
             a,
             lane,
@@ -129,6 +139,23 @@ fn expr(e: &Expr) -> String {
             lane_bytes,
             val,
         } => format!("replace{} {a:?}[{lane}] = {val:?}", lane_bytes * 8),
+        Expr::FpBin { op, double, a, b } => {
+            format!("f{op:?}.{} {a:?}, {b:?}", fw(*double)).to_lowercase()
+        }
+        Expr::FpUn { op, double, a } => format!("f{op:?}.{} {a:?}", fw(*double)).to_lowercase(),
+        Expr::FpCmp { op, double, a, b } => {
+            format!("fcmp.{op:?}.{} {a:?}, {b:?}", fw(*double)).to_lowercase()
+        }
+        Expr::FpCvt {
+            kind,
+            src_wide,
+            dst_wide,
+            a,
+        } => format!(
+            "fcvt.{kind:?} {}->{} {a:?}",
+            fw(*src_wide),
+            fw(*dst_wide)
+        ),
     }
 }
 

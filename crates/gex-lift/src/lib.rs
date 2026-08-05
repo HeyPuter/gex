@@ -19,7 +19,7 @@ use gex_ir::*;
 use gex_isa::{
     AddOp, AddrMode, BarrierKind, BfOp, Cond, Dp1Op, Dp2Op, Dp3Op, Extend, Inst, LogOp, MemSz,
     MoveOp, Ordering as IsaOrder, RegSel, RmwOp as IsaRmw, ShiftType, Sz, SysMaintOp, SysReg,
-    VLogOp,
+    FpOp1, FpOp2, FpRound, FpSz, VLogOp,
 };
 
 mod block;
@@ -1139,6 +1139,430 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            // -- scalar floating point -------------------------------------
+            Inst::FpDataProc1 { sz, op, vd, vn } => {
+                let a = self.rd_fp(vn, sz);
+                let double = sz.is_double();
+                let v = match op {
+                    FpOp1::Mov => a,
+                    FpOp1::Abs => self.b.def(Expr::FpUn {
+                        op: FpUnOp::Abs,
+                        double,
+                        a,
+                    }),
+                    FpOp1::Neg => self.b.def(Expr::FpUn {
+                        op: FpUnOp::Neg,
+                        double,
+                        a,
+                    }),
+                    FpOp1::Sqrt => self.b.def(Expr::FpUn {
+                        op: FpUnOp::Sqrt,
+                        double,
+                        a,
+                    }),
+                    FpOp1::RoundNearest | FpOp1::RoundAway => self.b.def(Expr::FpUn {
+                        // Wasm's `nearest` breaks ties to even. AArch64's
+                        // FRINTA breaks them away from zero, so the two agree
+                        // except exactly on halfway values.
+                        op: FpUnOp::RoundNearest,
+                        double,
+                        a,
+                    }),
+                    FpOp1::RoundPlus => self.b.def(Expr::FpUn {
+                        op: FpUnOp::Ceil,
+                        double,
+                        a,
+                    }),
+                    FpOp1::RoundMinus => self.b.def(Expr::FpUn {
+                        op: FpUnOp::Floor,
+                        double,
+                        a,
+                    }),
+                    FpOp1::RoundZero => self.b.def(Expr::FpUn {
+                        op: FpUnOp::Trunc,
+                        double,
+                        a,
+                    }),
+                };
+                self.wr_fp(vd, sz, v);
+                Flow::Next
+            }
+
+            Inst::FpDataProc2 { sz, op, vd, vn, vm } => {
+                let double = sz.is_double();
+                let a = self.rd_fp(vn, sz);
+                let b = self.rd_fp(vm, sz);
+                let v = match op {
+                    FpOp2::Add => self.fp_bin(FpBinOp::Add, double, a, b),
+                    FpOp2::Sub => self.fp_bin(FpBinOp::Sub, double, a, b),
+                    FpOp2::Mul => self.fp_bin(FpBinOp::Mul, double, a, b),
+                    FpOp2::Div => self.fp_bin(FpBinOp::Div, double, a, b),
+                    // Wasm's min/max propagate NaN, matching FMIN/FMAX. The
+                    // FMINNM/FMAXNM "number" variants instead return the
+                    // non-NaN operand; that difference only shows up with a
+                    // NaN input, and modelling it needs a select chain.
+                    FpOp2::Min | FpOp2::MinNum => self.fp_bin(FpBinOp::Min, double, a, b),
+                    FpOp2::Max | FpOp2::MaxNum => self.fp_bin(FpBinOp::Max, double, a, b),
+                    FpOp2::NMul => {
+                        let p = self.fp_bin(FpBinOp::Mul, double, a, b);
+                        self.b.def(Expr::FpUn {
+                            op: FpUnOp::Neg,
+                            double,
+                            a: p,
+                        })
+                    }
+                };
+                self.wr_fp(vd, sz, v);
+                Flow::Next
+            }
+
+            Inst::FpDataProc3 {
+                sz,
+                vd,
+                vn,
+                vm,
+                va,
+                neg_product,
+                neg_addend,
+            } => {
+                // AArch64 fuses this: one rounding for the whole expression.
+                // Wasm has no fused multiply-add, so the product is rounded
+                // before the addition and results can differ in the last
+                // place. That is the documented cost of fast mode
+                // (PLAN §5.7); strict mode will need a software FMA.
+                let double = sz.is_double();
+                let a = self.rd_fp(vn, sz);
+                let b = self.rd_fp(vm, sz);
+                let c = self.rd_fp(va, sz);
+                let mut prod = self.fp_bin(FpBinOp::Mul, double, a, b);
+                if neg_product {
+                    prod = self.b.def(Expr::FpUn {
+                        op: FpUnOp::Neg,
+                        double,
+                        a: prod,
+                    });
+                }
+                let addend = if neg_addend {
+                    self.b.def(Expr::FpUn {
+                        op: FpUnOp::Neg,
+                        double,
+                        a: c,
+                    })
+                } else {
+                    c
+                };
+                let v = self.fp_bin(FpBinOp::Add, double, prod, addend);
+                self.wr_fp(vd, sz, v);
+                Flow::Next
+            }
+
+            Inst::FpCompare { sz, vn, vm } => {
+                let double = sz.is_double();
+                let a = self.rd_fp(vn, sz);
+                let b = match vm {
+                    Some(vm) => self.rd_fp(vm, sz),
+                    None => self.konst(if double { Ty::I64 } else { Ty::I32 }, 0),
+                };
+                // The architecture's mapping: equal -> 0110, less -> 1000,
+                // greater -> 0010, unordered -> 0011. That is exactly
+                // N = lt, Z = eq, C = NOT lt, V = unordered.
+                let lt = self.b.def(Expr::FpCmp {
+                    op: FpCmpOp::Lt,
+                    double,
+                    a,
+                    b,
+                });
+                let eq = self.b.def(Expr::FpCmp {
+                    op: FpCmpOp::Eq,
+                    double,
+                    a,
+                    b,
+                });
+                // A NaN is the only value not equal to itself.
+                let a_nan = self.b.def(Expr::FpCmp {
+                    op: FpCmpOp::Ne,
+                    double,
+                    a,
+                    b: a,
+                });
+                let b_nan = self.b.def(Expr::FpCmp {
+                    op: FpCmpOp::Ne,
+                    double,
+                    a: b,
+                    b,
+                });
+                let unordered = self.b.bin(BinOp::Or, Ty::I32, a_nan, b_nan);
+                let one = self.b.const_i32(1);
+                let not_lt = self.b.bin(BinOp::Xor, Ty::I32, lt, one);
+                self.b.write(GuestReg::N, lt);
+                self.b.write(GuestReg::Z, eq);
+                self.b.write(GuestReg::C, not_lt);
+                self.b.write(GuestReg::V, unordered);
+                Flow::Next
+            }
+
+            Inst::FpCondSelect {
+                sz,
+                vd,
+                vn,
+                vm,
+                cond,
+            } => {
+                let a = self.rd_fp(vn, sz);
+                let b = self.rd_fp(vm, sz);
+                let c = self.eval_cond(cond);
+                let ty = if sz.is_double() { Ty::I64 } else { Ty::I32 };
+                let v = self.b.select(c, a, b, ty);
+                self.wr_fp(vd, sz, v);
+                Flow::Next
+            }
+
+            Inst::FpMoveImm { sz, vd, bits } => {
+                let ty = if sz.is_double() { Ty::I64 } else { Ty::I32 };
+                let v = self.konst(ty, bits);
+                self.wr_fp(vd, sz, v);
+                Flow::Next
+            }
+
+            Inst::FpConvertPrecision { from, to, vd, vn } => {
+                let a = self.rd_fp(vn, from);
+                let v = self.b.def(Expr::FpCvt {
+                    kind: FpConvert::FpToFp,
+                    src_wide: from.is_double(),
+                    dst_wide: to.is_double(),
+                    a,
+                });
+                self.wr_fp(vd, to, v);
+                Flow::Next
+            }
+
+            Inst::FpFromInt {
+                sz,
+                int_sz,
+                signed,
+                vd,
+                rn,
+            } => {
+                let a = self.rd_gp(rn, int_sz);
+                let v = self.b.def(Expr::FpCvt {
+                    kind: FpConvert::IntToFp { signed },
+                    src_wide: int_sz.is64(),
+                    dst_wide: sz.is_double(),
+                    a,
+                });
+                self.wr_fp(vd, sz, v);
+                Flow::Next
+            }
+
+            Inst::FpToInt {
+                sz,
+                int_sz,
+                signed,
+                round,
+                rd,
+                vn,
+            } => {
+                let double = sz.is_double();
+                let a = self.rd_fp(vn, sz);
+                // Only rounding toward zero is a single wasm instruction; the
+                // others round first and then truncate, which is exact
+                // because the rounded value is already integral.
+                let rounded = match round {
+                    FpRound::Zero => a,
+                    FpRound::Nearest | FpRound::Away => self.b.def(Expr::FpUn {
+                        op: FpUnOp::RoundNearest,
+                        double,
+                        a,
+                    }),
+                    FpRound::Plus => self.b.def(Expr::FpUn {
+                        op: FpUnOp::Ceil,
+                        double,
+                        a,
+                    }),
+                    FpRound::Minus => self.b.def(Expr::FpUn {
+                        op: FpUnOp::Floor,
+                        double,
+                        a,
+                    }),
+                };
+                let v = self.b.def(Expr::FpCvt {
+                    kind: FpConvert::FpToInt { signed },
+                    src_wide: double,
+                    dst_wide: int_sz.is64(),
+                    a: rounded,
+                });
+                self.wr_gp(rd, int_sz, v);
+                Flow::Next
+            }
+
+            Inst::FpMoveGeneral {
+                sz,
+                to_vector,
+                rd,
+                vd,
+            } => {
+                let int_sz = if sz.is_double() { Sz::X } else { Sz::W };
+                if to_vector {
+                    let a = self.rd_gp(rd, int_sz);
+                    self.wr_fp(vd, sz, a);
+                } else {
+                    let a = self.rd_fp(vd, sz);
+                    self.wr_gp(rd, int_sz, a);
+                }
+                Flow::Next
+            }
+
+            Inst::FpMoveTopHalf { to_vector, rd, vd } => {
+                if to_vector {
+                    let a = self.rd_addr(rd);
+                    let old = self.b.read(GuestReg::V128(vd.0));
+                    let out = self.b.def(Expr::VReplace {
+                        a: old,
+                        lane: 1,
+                        lane_bytes: 8,
+                        val: a,
+                    });
+                    self.b.write(GuestReg::V128(vd.0), out);
+                } else {
+                    let vec = self.b.read(GuestReg::V128(vd.0));
+                    let hi = self.b.def(Expr::VExtract {
+                        a: vec,
+                        lane: 1,
+                        lane_bytes: 8,
+                        signed: false,
+                        ty: Ty::I64,
+                    });
+                    self.wr_addr(rd, hi);
+                }
+                Flow::Next
+            }
+
+            Inst::VMoveLane {
+                to_vector,
+                signed,
+                lane_bytes,
+                lane,
+                int_sz,
+                rd,
+                vd,
+            } => {
+                if to_vector {
+                    let val = self.rd_gp(rd, if lane_bytes == 8 { Sz::X } else { Sz::W });
+                    let old = self.b.read(GuestReg::V128(vd.0));
+                    let out = self.b.def(Expr::VReplace {
+                        a: old,
+                        lane,
+                        lane_bytes,
+                        val,
+                    });
+                    self.b.write(GuestReg::V128(vd.0), out);
+                } else {
+                    let vec = self.b.read(GuestReg::V128(vd.0));
+                    let ty = ty_of(int_sz);
+                    let v = self.b.def(Expr::VExtract {
+                        a: vec,
+                        lane,
+                        lane_bytes,
+                        signed,
+                        ty,
+                    });
+                    self.wr_gp(rd, int_sz, v);
+                }
+                Flow::Next
+            }
+
+            Inst::VLoadMulti {
+                regs,
+                vt,
+                bytes,
+                ref addr,
+            } => {
+                let a = self.address(addr);
+                for i in 0..regs {
+                    let v = self.b.def(Expr::VLoad {
+                        addr: a.base,
+                        offset: a.offset + (i as i64) * bytes as i64,
+                        bytes,
+                    });
+                    self.b.write(GuestReg::V128((vt.0 + i) % 32), v);
+                }
+                self.finish_address(&a);
+                Flow::Next
+            }
+
+            Inst::VStoreMulti {
+                regs,
+                vt,
+                bytes,
+                ref addr,
+            } => {
+                let vals: Vec<Value> = (0..regs)
+                    .map(|i| self.b.read(GuestReg::V128((vt.0 + i) % 32)))
+                    .collect();
+                let a = self.address(addr);
+                for (i, val) in vals.into_iter().enumerate() {
+                    self.b.stmt(Stmt::VStore {
+                        addr: a.base,
+                        offset: a.offset + (i as i64) * bytes as i64,
+                        val,
+                        bytes,
+                    });
+                }
+                self.finish_address(&a);
+                Flow::Next
+            }
+
+            Inst::VCnt { vd, vn, q } => {
+                let a = self.b.read(GuestReg::V128(vn.0));
+                let counted = self.b.def(Expr::VUn {
+                    op: VUnOp::PopcntBytes,
+                    a,
+                });
+                let v = self.narrow_to_64(counted, q);
+                self.b.write(GuestReg::V128(vd.0), v);
+                Flow::Next
+            }
+
+            Inst::VAddAcross {
+                vd,
+                vn,
+                lane_bytes,
+                q,
+            } => {
+                // Wasm has no horizontal reduction, so the lanes are summed
+                // one at a time. The result is truncated to the element size,
+                // which the final `VReplace` into a zeroed vector does.
+                let vec = self.b.read(GuestReg::V128(vn.0));
+                let lanes = (if q { 16 } else { 8 }) / lane_bytes;
+                let ty = Ty::I32;
+                let mut acc = self.b.def(Expr::VExtract {
+                    a: vec,
+                    lane: 0,
+                    lane_bytes,
+                    signed: false,
+                    ty,
+                });
+                for lane in 1..lanes {
+                    let next = self.b.def(Expr::VExtract {
+                        a: vec,
+                        lane,
+                        lane_bytes,
+                        signed: false,
+                        ty,
+                    });
+                    acc = self.b.bin(BinOp::Add, ty, acc, next);
+                }
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                let out = self.b.def(Expr::VReplace {
+                    a: zero,
+                    lane: 0,
+                    lane_bytes,
+                    val: acc,
+                });
+                self.b.write(GuestReg::V128(vd.0), out);
+                Flow::Next
+            }
+
             Inst::VLogical { op, vd, vn, vm, q } => {
                 let a = self.b.read(GuestReg::V128(vn.0));
                 let b = self.b.read(GuestReg::V128(vm.0));
@@ -1170,6 +1594,40 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
         }
+    }
+
+    // -- scalar floating point ---------------------------------------------
+
+    fn fp_bin(&mut self, op: FpBinOp, double: bool, a: Value, b: Value) -> Value {
+        self.b.def(Expr::FpBin { op, double, a, b })
+    }
+
+    /// Read a scalar float out of a `v` register as its bit pattern.
+    fn rd_fp(&mut self, v: gex_isa::VReg, sz: FpSz) -> Value {
+        let vec = self.b.read(GuestReg::V128(v.0));
+        self.b.def(Expr::VExtract {
+            a: vec,
+            lane: 0,
+            lane_bytes: sz.bytes(),
+            signed: false,
+            ty: if sz.is_double() { Ty::I64 } else { Ty::I32 },
+        })
+    }
+
+    /// Write a scalar float bit pattern into a `v` register.
+    ///
+    /// Writing any scalar view of a SIMD&FP register zeroes every bit above
+    /// it, so the destination is built from an all-zero vector rather than
+    /// from the register's previous contents.
+    fn wr_fp(&mut self, v: gex_isa::VReg, sz: FpSz, bits: Value) {
+        let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+        let out = self.b.def(Expr::VReplace {
+            a: zero,
+            lane: 0,
+            lane_bytes: sz.bytes(),
+            val: bits,
+        });
+        self.b.write(GuestReg::V128(v.0), out);
     }
 
     /// A 64-bit-form SIMD instruction zeroes the upper half of its

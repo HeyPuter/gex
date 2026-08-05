@@ -655,6 +655,135 @@ pub enum Inst {
     /// `movi`/`mvni`, with the immediate already expanded to the full
     /// 128-bit register value.
     VMoveImm { vd: VReg, value: u128 },
+    /// Scalar floating-point, one source.
+    FpDataProc1 {
+        sz: FpSz,
+        op: FpOp1,
+        vd: VReg,
+        vn: VReg,
+    },
+    /// Scalar floating-point, two sources.
+    FpDataProc2 {
+        sz: FpSz,
+        op: FpOp2,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+    },
+    /// Fused multiply-add family: `vd = ±(vn * vm) ± va`.
+    FpDataProc3 {
+        sz: FpSz,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+        va: VReg,
+        /// Negate the product.
+        neg_product: bool,
+        /// Negate the addend.
+        neg_addend: bool,
+    },
+    /// `fcmp`/`fcmpe`, optionally against zero.
+    FpCompare {
+        sz: FpSz,
+        vn: VReg,
+        /// `None` compares against +0.0.
+        vm: Option<VReg>,
+    },
+    /// `fcsel`.
+    FpCondSelect {
+        sz: FpSz,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+        cond: Cond,
+    },
+    /// `fmov vd, #imm`, with the immediate already expanded to its bit
+    /// pattern at the given precision.
+    FpMoveImm { sz: FpSz, vd: VReg, bits: u64 },
+    /// `fcvt` between single and double.
+    FpConvertPrecision {
+        from: FpSz,
+        to: FpSz,
+        vd: VReg,
+        vn: VReg,
+    },
+    /// `scvtf`/`ucvtf`: integer register to float register.
+    FpFromInt {
+        sz: FpSz,
+        /// Width of the source integer register.
+        int_sz: Sz,
+        signed: bool,
+        vd: VReg,
+        rn: RegSel,
+    },
+    /// `fcvtzs`/`fcvtzu`/`fcvtns`/…: float register to integer register.
+    FpToInt {
+        sz: FpSz,
+        int_sz: Sz,
+        signed: bool,
+        round: FpRound,
+        rd: RegSel,
+        vn: VReg,
+    },
+    /// `fmov` between a general register and a float register.
+    FpMoveGeneral {
+        sz: FpSz,
+        /// True moves general -> float; false moves float -> general.
+        to_vector: bool,
+        rd: RegSel,
+        vd: VReg,
+    },
+
+    /// `fmov` between a general register and the *upper* half of a 128-bit
+    /// vector register — how a 128-bit long double is assembled.
+    FpMoveTopHalf {
+        /// True moves general -> vector lane 1.
+        to_vector: bool,
+        rd: RegSel,
+        vd: VReg,
+    },
+
+    /// `umov`/`smov`/`ins (general)`: move one lane between a `v` register
+    /// and a general register.
+    VMoveLane {
+        /// True inserts into the vector; false extracts from it.
+        to_vector: bool,
+        /// Sign-extend on extraction (`smov`).
+        signed: bool,
+        lane_bytes: u32,
+        lane: u32,
+        /// Width of the general register.
+        int_sz: Sz,
+        rd: RegSel,
+        vd: VReg,
+    },
+
+    /// `ld1`/`st1` with one to four consecutive registers. Element size does
+    /// not change which bytes move, only how the guest interprets them, so
+    /// this is `regs` back-to-back vector accesses.
+    VLoadMulti {
+        regs: u8,
+        vt: VReg,
+        /// Bytes per register: 8 for the 64-bit form, 16 for the 128-bit one.
+        bytes: u32,
+        addr: AddrMode,
+    },
+    VStoreMulti {
+        regs: u8,
+        vt: VReg,
+        bytes: u32,
+        addr: AddrMode,
+    },
+    /// `cnt` — per-byte population count.
+    VCnt { vd: VReg, vn: VReg, q: bool },
+    /// `addv` — sum all lanes into the destination's lowest lane.
+    VAddAcross {
+        vd: VReg,
+        vn: VReg,
+        lane_bytes: u32,
+        q: bool,
+    },
+
     /// Bitwise operation on two vectors. `mov vd, vn` is `orr vd, vn, vn`.
     VLogical {
         op: VLogOp,
@@ -716,6 +845,72 @@ pub enum Inst {
         acquire: bool,
         release: bool,
     },
+}
+
+/// Scalar floating-point precision.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FpSz {
+    /// Single precision (`s` registers).
+    S,
+    /// Double precision (`d` registers).
+    D,
+}
+
+impl FpSz {
+    pub fn is_double(self) -> bool {
+        matches!(self, FpSz::D)
+    }
+    pub fn bytes(self) -> u32 {
+        match self {
+            FpSz::S => 4,
+            FpSz::D => 8,
+        }
+    }
+}
+
+/// Scalar floating-point one-source operations.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FpOp1 {
+    Mov,
+    Abs,
+    Neg,
+    Sqrt,
+    RoundNearest,
+    RoundPlus,
+    RoundMinus,
+    RoundZero,
+    /// Round to nearest, ties away from zero.
+    RoundAway,
+}
+
+/// Scalar floating-point two-source operations.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FpOp2 {
+    Mul,
+    Div,
+    Add,
+    Sub,
+    Max,
+    Min,
+    MaxNum,
+    MinNum,
+    /// Negated multiply.
+    NMul,
+}
+
+/// How a float-to-integer conversion rounds.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FpRound {
+    /// Round to nearest, ties to even.
+    Nearest,
+    /// Round toward +infinity.
+    Plus,
+    /// Round toward -infinity.
+    Minus,
+    /// Round toward zero.
+    Zero,
+    /// Round to nearest, ties away from zero.
+    Away,
 }
 
 /// Bitwise vector operations on the `v` register file.

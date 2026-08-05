@@ -758,9 +758,67 @@ fn decode_load_store(raw: u32, pc: u64) -> Inst {
         }
         return Inst::Unknown { raw };
     }
-    // Advanced SIMD load/store multiple structures (LD1/ST1/…) and the
-    // remaining `x1x0` sub-groups.
+    // Advanced SIMD load/store multiple structures.
+    if bit(raw, 31) == 0 && bits(raw, 29, 24) == 0b001100 {
+        return decode_simd_ldst_multi(raw);
+    }
     Inst::Unknown { raw }
+}
+
+/// `ld1`/`st1` (multiple structures), with and without post-index.
+///
+/// The interleaving variants (`ld2`/`ld3`/`ld4`) share this space but permute
+/// lanes as they go, so only the `ld1`/`st1` opcodes are accepted here.
+fn decode_simd_ldst_multi(raw: u32) -> Inst {
+    let q = bit(raw, 30) == 1;
+    let post_index = bit(raw, 23) == 1;
+    let load = bit(raw, 22) == 1;
+    let rm = bits(raw, 20, 16);
+    let opcode = bits(raw, 15, 12);
+
+    // Only the non-interleaving forms; the register count is encoded in the
+    // opcode rather than as a field.
+    let regs: u8 = match opcode {
+        0b0111 => 1,
+        0b1010 => 2,
+        0b0110 => 3,
+        0b0010 => 4,
+        _ => return Inst::Unknown { raw },
+    };
+    if !post_index && rm != 0 {
+        return Inst::Unknown { raw };
+    }
+    let bytes = if q { 16 } else { 8 };
+    let rn = RegSel::sp(bits(raw, 9, 5));
+    let addr = if post_index {
+        // Rm == 31 means the immediate form: advance by the total size.
+        let off = if rm == 0b11111 {
+            (regs as i64) * bytes as i64
+        } else {
+            // The register-offset post-index form needs a value the lifter
+            // would have to read; it does not appear in compiler output.
+            return Inst::Unknown { raw };
+        };
+        AddrMode::PostIndex { rn, off }
+    } else {
+        AddrMode::Offset { rn, off: 0 }
+    };
+    let vt = VReg(bits(raw, 4, 0) as u8);
+    if load {
+        Inst::VLoadMulti {
+            regs,
+            vt,
+            bytes,
+            addr,
+        }
+    } else {
+        Inst::VStoreMulti {
+            regs,
+            vt,
+            bytes,
+            addr,
+        }
+    }
 }
 
 /// Interpret the `size`/`opc` pair shared by the register load/store forms.
@@ -1154,7 +1212,44 @@ fn decode_simd_fp(raw: u32) -> Inst {
     {
         let imm5 = bits(raw, 20, 16);
         let imm4 = bits(raw, 14, 11);
-        // imm4 == 0b0011 with op == 0 is DUP (general register).
+        // Lane moves between a general register and a vector.
+        // imm4: 0011 = INS (general), 0101 = SMOV, 0111 = UMOV.
+        if matches!(imm4, 0b0011 | 0b0101 | 0b0111) {
+            let Some((lane_bytes, lane)) = decode_lane(imm5) else {
+                return Inst::Undefined { raw };
+            };
+            let to_vector = imm4 == 0b0011;
+            if to_vector && u != 1 {
+                return Inst::Unknown { raw };
+            }
+            if !to_vector && u != 0 {
+                return Inst::Unknown { raw };
+            }
+            let signed = imm4 == 0b0101;
+            // Extracting a doubleword needs the 64-bit general register.
+            if !to_vector && lane_bytes == 8 && !q {
+                return Inst::Undefined { raw };
+            }
+            let int_sz = if q { Sz::X } else { Sz::W };
+            return Inst::VMoveLane {
+                to_vector,
+                signed,
+                lane_bytes,
+                lane,
+                int_sz,
+                rd: RegSel::gp(if to_vector {
+                    bits(raw, 9, 5)
+                } else {
+                    bits(raw, 4, 0)
+                }),
+                vd: VReg(if to_vector {
+                    bits(raw, 4, 0) as u8
+                } else {
+                    bits(raw, 9, 5) as u8
+                }),
+            };
+        }
+        // imm4 == 0b0001 with op == 0 is DUP (general register).
         if imm4 == 0b0001 && u == 0 {
             let lane_bytes = if imm5 & 1 != 0 {
                 1
@@ -1198,6 +1293,51 @@ fn decode_simd_fp(raw: u32) -> Inst {
         };
     }
 
+    // Advanced SIMD two-register miscellaneous: `cnt`.
+    //   0 Q U 01110 size 10000 00101 10 Rn Rd
+    if bit(raw, 31) == 0
+        && bits(raw, 28, 24) == 0b01110
+        && bits(raw, 21, 17) == 0b10000
+        && bits(raw, 16, 12) == 0b00101
+        && bits(raw, 11, 10) == 0b10
+        && u == 0
+        && bits(raw, 23, 22) == 0b00
+    {
+        return Inst::VCnt {
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+            q,
+        };
+    }
+
+    // Advanced SIMD across lanes: `addv`.
+    //   0 Q U 01110 size 11000 11011 10 Rn Rd
+    if bit(raw, 31) == 0
+        && bits(raw, 28, 24) == 0b01110
+        && bits(raw, 21, 17) == 0b11000
+        && bits(raw, 16, 12) == 0b11011
+        && bits(raw, 11, 10) == 0b10
+        && u == 0
+    {
+        let lane_bytes = match bits(raw, 23, 22) {
+            0b00 => 1,
+            0b01 => 2,
+            0b10 => 4,
+            _ => return Inst::Undefined { raw },
+        };
+        // A 4-byte lane needs the 128-bit form: two lanes is not a valid
+        // arrangement for `addv`.
+        if lane_bytes == 4 && !q {
+            return Inst::Undefined { raw };
+        }
+        return Inst::VAddAcross {
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+            lane_bytes,
+            q,
+        };
+    }
+
     // Advanced SIMD three-same, logical subgroup:
     //   0 Q U 01110 size 1 Rm 00011 1 Rn Rd
     if bit(raw, 31) == 0
@@ -1224,7 +1364,299 @@ fn decode_simd_fp(raw: u32) -> Inst {
         };
     }
 
-    Inst::Unknown { raw }
+    decode_scalar_fp(raw)
+}
+
+/// Scalar floating-point.
+///
+/// Only single and double precision are decoded; half precision needs
+/// FEAT_FP16, which the guest is told it does not have. Discrimination
+/// follows the Arm ARM tables C4-25 onwards: the `11111` sub-group is
+/// multiply-add, and within `11110` bits `[11:10]` choose the family, with
+/// integer conversion recognised first because it is the only member whose
+/// bit 31 is `sf` rather than a fixed zero.
+fn decode_scalar_fp(raw: u32) -> Inst {
+    let group = bits(raw, 28, 24);
+    if group == 0b11111 {
+        return decode_fp_madd(raw);
+    }
+    if group != 0b11110 || bit(raw, 29) != 0 || bit(raw, 30) != 0 {
+        return Inst::Unknown { raw };
+    }
+    if bit(raw, 21) == 0 {
+        // Conversion with a fixed-point immediate; not modelled.
+        return Inst::Unknown { raw };
+    }
+    // `fmov` to and from the upper half of a 128-bit register is the one
+    // member of this family with ptype = 10, because the operand really is
+    // 128 bits wide.
+    if bits(raw, 15, 10) == 0
+        && bits(raw, 23, 22) == 0b10
+        && bits(raw, 20, 19) == 0b01
+        && bit(raw, 31) == 1
+        && bits(raw, 18, 17) == 0b11
+    {
+        return Inst::FpMoveTopHalf {
+            to_vector: bit(raw, 16) == 1,
+            rd: RegSel::gp(bits(raw, if bit(raw, 16) == 1 { 9 } else { 4 }, if bit(raw, 16) == 1 { 5 } else { 0 })),
+            vd: VReg(bits(raw, if bit(raw, 16) == 1 { 4 } else { 9 }, if bit(raw, 16) == 1 { 0 } else { 5 }) as u8),
+        };
+    }
+    let Some(sz) = fp_size(bits(raw, 23, 22)) else {
+        return Inst::Unknown { raw };
+    };
+    let vd = VReg(bits(raw, 4, 0) as u8);
+    let vn = VReg(bits(raw, 9, 5) as u8);
+    let vm = VReg(bits(raw, 20, 16) as u8);
+
+    // Conversion between floating point and integer.
+    if bits(raw, 15, 10) == 0 {
+        return decode_fp_int_convert(raw, sz);
+    }
+    // Everything below requires M == 0.
+    if bit(raw, 31) != 0 {
+        return Inst::Unknown { raw };
+    }
+
+    match bits(raw, 11, 10) {
+        0b00 => {
+            if bit(raw, 12) == 1 {
+                // Floating-point immediate: imm8 in bits 20:13.
+                if bits(raw, 9, 5) != 0 {
+                    return Inst::Undefined { raw };
+                }
+                let imm8 = bits(raw, 20, 13);
+                return Inst::FpMoveImm {
+                    sz,
+                    vd,
+                    bits: expand_fp_immediate(imm8, sz),
+                };
+            }
+            if bit(raw, 13) == 1 {
+                // Floating-point compare. Bit 3 of opcode2 selects the
+                // compare-against-zero form; the `E` variants differ only in
+                // exception behaviour, which gex does not model.
+                let opcode2 = bits(raw, 4, 0);
+                if opcode2 & 0b00111 != 0 {
+                    return Inst::Unknown { raw };
+                }
+                let against_zero = opcode2 & 0b01000 != 0;
+                return Inst::FpCompare {
+                    sz,
+                    vn,
+                    vm: if against_zero { None } else { Some(vm) },
+                };
+            }
+            if bit(raw, 14) == 1 {
+                return decode_fp_one_source(raw, sz, vd, vn);
+            }
+            Inst::Unknown { raw }
+        }
+        // Floating-point conditional compare.
+        0b01 => Inst::Unknown { raw },
+        0b10 => {
+            let op = match bits(raw, 15, 12) {
+                0b0000 => FpOp2::Mul,
+                0b0001 => FpOp2::Div,
+                0b0010 => FpOp2::Add,
+                0b0011 => FpOp2::Sub,
+                0b0100 => FpOp2::Max,
+                0b0101 => FpOp2::Min,
+                0b0110 => FpOp2::MaxNum,
+                0b0111 => FpOp2::MinNum,
+                0b1000 => FpOp2::NMul,
+                _ => return Inst::Unknown { raw },
+            };
+            Inst::FpDataProc2 { sz, op, vd, vn, vm }
+        }
+        _ => Inst::FpCondSelect {
+            sz,
+            vd,
+            vn,
+            vm,
+            cond: Cond(bits(raw, 15, 12) as u8),
+        },
+    }
+}
+
+/// Decode an `imm5` lane specifier into `(lane size in bytes, lane index)`.
+///
+/// The lowest set bit selects the element width and the bits above it are
+/// the index, so a wider element simply consumes more of the field.
+fn decode_lane(imm5: u32) -> Option<(u32, u32)> {
+    if imm5 & 1 != 0 {
+        Some((1, (imm5 >> 1) & 0xf))
+    } else if imm5 & 2 != 0 {
+        Some((2, (imm5 >> 2) & 0x7))
+    } else if imm5 & 4 != 0 {
+        Some((4, (imm5 >> 3) & 0x3))
+    } else if imm5 & 8 != 0 {
+        Some((8, (imm5 >> 4) & 0x1))
+    } else {
+        None
+    }
+}
+
+fn fp_size(ptype: u32) -> Option<FpSz> {
+    match ptype {
+        0b00 => Some(FpSz::S),
+        0b01 => Some(FpSz::D),
+        _ => None,
+    }
+}
+
+fn decode_fp_one_source(raw: u32, sz: FpSz, vd: VReg, vn: VReg) -> Inst {
+    let opcode = bits(raw, 20, 15);
+    // `fcvt` between precisions shares this group.
+    if opcode >> 2 == 0b0001 {
+        let Some(to) = fp_size(opcode & 0b11) else {
+            return Inst::Unknown { raw };
+        };
+        if to == sz {
+            return Inst::Undefined { raw };
+        }
+        return Inst::FpConvertPrecision {
+            from: sz,
+            to,
+            vd,
+            vn,
+        };
+    }
+    let op = match opcode {
+        0b000000 => FpOp1::Mov,
+        0b000001 => FpOp1::Abs,
+        0b000010 => FpOp1::Neg,
+        0b000011 => FpOp1::Sqrt,
+        0b001000 => FpOp1::RoundNearest,
+        0b001001 => FpOp1::RoundPlus,
+        0b001010 => FpOp1::RoundMinus,
+        0b001011 => FpOp1::RoundZero,
+        0b001100 => FpOp1::RoundAway,
+        // FRINTX and FRINTI differ from FRINTN only in exception reporting
+        // and in honouring a non-default FPCR rounding mode, neither of
+        // which gex models in fast mode (PLAN §5.7).
+        0b001110 | 0b001111 => FpOp1::RoundNearest,
+        _ => return Inst::Unknown { raw },
+    };
+    Inst::FpDataProc1 { sz, op, vd, vn }
+}
+
+fn decode_fp_madd(raw: u32) -> Inst {
+    if bit(raw, 31) != 0 || bit(raw, 30) != 0 || bit(raw, 29) != 0 {
+        return Inst::Unknown { raw };
+    }
+    let Some(sz) = fp_size(bits(raw, 23, 22)) else {
+        return Inst::Unknown { raw };
+    };
+    let o1 = bit(raw, 21);
+    let o0 = bit(raw, 15);
+    // FMADD: +(n*m) + a   FMSUB: -(n*m) + a
+    // FNMADD: -(n*m) - a  FNMSUB: +(n*m) - a
+    let (neg_product, neg_addend) = match (o1, o0) {
+        (0, 0) => (false, false),
+        (0, 1) => (true, false),
+        (1, 0) => (true, true),
+        _ => (false, true),
+    };
+    Inst::FpDataProc3 {
+        sz,
+        vd: VReg(bits(raw, 4, 0) as u8),
+        vn: VReg(bits(raw, 9, 5) as u8),
+        vm: VReg(bits(raw, 20, 16) as u8),
+        va: VReg(bits(raw, 14, 10) as u8),
+        neg_product,
+        neg_addend,
+    }
+}
+
+fn decode_fp_int_convert(raw: u32, sz: FpSz) -> Inst {
+    let sf = bit(raw, 31);
+    let int_sz = Sz::from_sf(sf);
+    let rmode = bits(raw, 20, 19);
+    let opcode = bits(raw, 18, 16);
+    let rd = RegSel::gp(bits(raw, 4, 0));
+    let rn = RegSel::gp(bits(raw, 9, 5));
+    let vd = VReg(bits(raw, 4, 0) as u8);
+    let vn = VReg(bits(raw, 9, 5) as u8);
+
+    // Rounding mode is spread across `rmode` and the low opcode bit for the
+    // "round to nearest, ties away" forms.
+    let round = match (rmode, opcode) {
+        (0b00, 0b000 | 0b001) => Some(FpRound::Nearest),
+        (0b00, 0b100 | 0b101) => Some(FpRound::Away),
+        (0b01, 0b000 | 0b001) => Some(FpRound::Plus),
+        (0b10, 0b000 | 0b001) => Some(FpRound::Minus),
+        (0b11, 0b000 | 0b001) => Some(FpRound::Zero),
+        _ => None,
+    };
+    if let Some(round) = round {
+        return Inst::FpToInt {
+            sz,
+            int_sz,
+            signed: opcode & 1 == 0,
+            round,
+            rd,
+            vn,
+        };
+    }
+    match (rmode, opcode) {
+        (0b00, 0b010) => Inst::FpFromInt {
+            sz,
+            int_sz,
+            signed: true,
+            vd,
+            rn,
+        },
+        (0b00, 0b011) => Inst::FpFromInt {
+            sz,
+            int_sz,
+            signed: false,
+            vd,
+            rn,
+        },
+        (0b00, 0b110) => Inst::FpMoveGeneral {
+            sz,
+            to_vector: false,
+            rd,
+            vd: vn,
+        },
+        (0b00, 0b111) => Inst::FpMoveGeneral {
+            sz,
+            to_vector: true,
+            rd: rn,
+            vd,
+        },
+        // rmode=01 with opcode 110/111 moves the *top* half of a 128-bit
+        // register, which needs the full vector view.
+        _ => Inst::Unknown { raw },
+    }
+}
+
+/// `VFPExpandImm`: turn an 8-bit `fmov` immediate into its bit pattern.
+fn expand_fp_immediate(imm8: u32, sz: FpSz) -> u64 {
+    let a = ((imm8 >> 7) & 1) as u64;
+    let b = ((imm8 >> 6) & 1) as u64;
+    let cdefgh = (imm8 & 0x3f) as u64;
+    match sz {
+        FpSz::S => {
+            // sign : NOT(b) : b*5 : cdefgh : 0*19
+            let mut v = a << 31;
+            v |= (1 - b) << 30;
+            let rep = if b != 0 { 0b11111u64 } else { 0 };
+            v |= rep << 25;
+            v |= cdefgh << 19;
+            v
+        }
+        FpSz::D => {
+            // sign : NOT(b) : b*8 : cdefgh : 0*48
+            let mut v = a << 63;
+            v |= (1 - b) << 62;
+            let rep = if b != 0 { 0xffu64 } else { 0 };
+            v |= rep << 54;
+            v |= cdefgh << 48;
+            v
+        }
+    }
 }
 
 /// `AdvSIMDExpandImm`: turn `imm8` and `cmode` into the full register value.

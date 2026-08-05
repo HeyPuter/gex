@@ -77,6 +77,13 @@ pub struct Kernel {
     pub clear_child_tid: u64,
     /// Program name, for `/proc/self/exe` and `AT_EXECFN`.
     pub exe_path: String,
+    /// Identity reported to the guest.
+    ///
+    /// The native shim sets these from the host process so a passthrough run
+    /// sees the same identity a native run would; the browser runtime, which
+    /// has no host identity to report, keeps the defaults.
+    pub uid: u32,
+    pub gid: u32,
     /// Trace every syscall to stderr (PLAN §11's strace mode).
     pub trace: bool,
     /// Syscalls seen but not implemented, for the ENOSYS telemetry in
@@ -94,6 +101,8 @@ impl Kernel {
             tid: 1,
             clear_child_tid: 0,
             exe_path,
+            uid: 1000,
+            gid: 1000,
             trace: false,
             unimplemented: Vec::new(),
         }
@@ -178,8 +187,8 @@ impl Kernel {
             nr::GETPID => Ok(self.pid as u64),
             nr::GETPPID => Ok(0),
             nr::GETTID => Ok(self.tid as u64),
-            nr::GETUID | nr::GETEUID => Ok(1000),
-            nr::GETGID | nr::GETEGID => Ok(1000),
+            nr::GETUID | nr::GETEUID => Ok(self.uid as u64),
+            nr::GETGID | nr::GETEGID => Ok(self.gid as u64),
             nr::SET_TID_ADDRESS => {
                 self.clear_child_tid = a[0];
                 Ok(self.tid as u64)

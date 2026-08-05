@@ -109,10 +109,18 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
         image.brk,
         opts.args.first().cloned().unwrap_or_default(),
     );
+    // Report the host's identity: with hostfs passthrough, a guest that
+    // stats a file and then calls getuid must see a consistent answer.
+    let (uid, gid) = host_identity();
     let mut store = Store::new(
         &engine,
         HostState {
-            kernel: Kernel { trace: opts.trace, ..kernel },
+            kernel: Kernel {
+                trace: opts.trace,
+                uid,
+                gid,
+                ..kernel
+            },
             memory: None,
             exit: None,
         },
@@ -157,6 +165,29 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
         },
     };
     Ok((exit, stats))
+}
+
+/// The host process's real user and group ids.
+///
+/// Read from `/proc/self/status` rather than through `libc`, which keeps this
+/// crate free of a C dependency; falling back to 1000 costs only fidelity.
+fn host_identity() -> (u32, u32) {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return (1000, 1000);
+    };
+    let field = |name: &str| -> Option<u32> {
+        status
+            .lines()
+            .find(|l| l.starts_with(name))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    };
+    (
+        field("Uid:").unwrap_or(1000),
+        field("Gid:").unwrap_or(1000),
+    )
 }
 
 /// Copy the ELF segments and the initial stack into guest memory.

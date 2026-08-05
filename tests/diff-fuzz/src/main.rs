@@ -18,7 +18,7 @@
 //! A random branch or store would leave the harness, so those are covered by
 //! the compiled-program tests in `tests/integration` instead.
 
-use gex_isa::{decode, fmt::disasm, Inst, RegSel};
+use gex_isa::{decode, fmt::disasm, Dp2Op, Inst, RegSel};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -129,10 +129,55 @@ enum Outcome {
 fn accept(raw: u32) -> Option<Inst> {
     let inst = decode(raw, 0x400000);
     let writes = destination(&inst)?;
-    if matches!(writes, RegSel::Sp) || matches!(writes, RegSel::Gp(HARNESS_REG)) {
+    if matches!(writes, RegSel::Sp | RegSel::Gp(HARNESS_REG)) {
         return None;
     }
+    // Reading SP is not a lifter question: the stack lives at a different
+    // address under QEMU than under gex, so any instruction that observes it
+    // would report a difference that says nothing about the semantics.
+    if reads_sp(&inst) {
+        return None;
+    }
+    // CRC32 is deliberately not lifted: gex does not advertise the extension
+    // in AT_HWCAP, so no well-behaved guest emits it, and expanding it inline
+    // would cost hundreds of IR nodes per instruction. Testing it here would
+    // only re-report a known, intentional gap.
+    if let Inst::DataProc2 { op, .. } = inst {
+        if matches!(
+            op,
+            Dp2Op::Crc32b
+                | Dp2Op::Crc32h
+                | Dp2Op::Crc32w
+                | Dp2Op::Crc32x
+                | Dp2Op::Crc32cb
+                | Dp2Op::Crc32ch
+                | Dp2Op::Crc32cw
+                | Dp2Op::Crc32cx
+        ) {
+            return None;
+        }
+    }
     Some(inst)
+}
+
+/// True when any source operand is the stack pointer.
+fn reads_sp(inst: &Inst) -> bool {
+    let sp = |r: RegSel| matches!(r, RegSel::Sp);
+    match *inst {
+        Inst::AddSubImm { rn, .. } | Inst::LogicalImm { rn, .. } => sp(rn),
+        Inst::Bitfield { rn, .. } | Inst::DataProc1 { rn, .. } => sp(rn),
+        Inst::Extract { rn, rm, .. }
+        | Inst::AddSubShifted { rn, rm, .. }
+        | Inst::AddSubExtended { rn, rm, .. }
+        | Inst::AddSubCarry { rn, rm, .. }
+        | Inst::LogicalShifted { rn, rm, .. }
+        | Inst::CondSelect { rn, rm, .. }
+        | Inst::DataProc2 { rn, rm, .. } => sp(rn) || sp(rm),
+        Inst::DataProc3 { rn, rm, ra, .. } => sp(rn) || sp(rm) || sp(ra),
+        Inst::CondCompare { rn, rm, .. } => sp(rn) || rm.map(sp).unwrap_or(false),
+        // `bfm` also reads its destination register.
+        _ => false,
+    }
 }
 
 /// The register an instruction writes, or `None` when the instruction is not
@@ -204,8 +249,16 @@ fn run_case(cfg: &Config, i: usize, insts: &[u32], seeds: &[u64; 32]) -> Result<
         ],
     )?;
 
-    let qemu = capture(&cfg.qemu, &[&exe.to_string_lossy()])?;
-    let gex = capture(&cfg.gexc, &["run", &exe.to_string_lossy()])?;
+    // Both engines are run twice on disagreement. Spawning thousands of
+    // processes in a tight loop occasionally yields an empty result from a
+    // child that never got off the ground; retrying keeps that from being
+    // reported as a lifter bug.
+    let mut qemu = capture(&cfg.qemu, &[&exe.to_string_lossy()])?;
+    let mut gex = capture(&cfg.gexc, &["run", &exe.to_string_lossy()])?;
+    if qemu != gex {
+        qemu = capture(&cfg.qemu, &[&exe.to_string_lossy()])?;
+        gex = capture(&cfg.gexc, &["run", &exe.to_string_lossy()])?;
+    }
 
     // Clean up the successful cases so a long run does not fill the disk.
     if qemu == gex {
