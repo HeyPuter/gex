@@ -17,6 +17,28 @@
 //! The linker is told to put this module's data and stack above that (see
 //! `build.sh`), so the two never meet.
 //!
+//! # Status
+//!
+//! Loading works: the guest's initial stack pointer, entry and image all come
+//! out right, and it executes -- a `hello` program reaches `set_tid_address`,
+//! an `ioctl`, four `writev`s and `exit_group(0)` in the correct order.
+//!
+//! What does not work is those `writev`s: they return -30 and then -8 three
+//! times, and nothing reaches the console. Narrowed as far as this:
+//!
+//! * The console is wired correctly. Calling `fds.get(1).write(..)` straight
+//!   out of an exported probe prints, so the descriptor table and the
+//!   `FileHandle` are right.
+//! * The errors are not the ones the `FileHandle` defaults return -- that is
+//!   `EBADF`, and the `FileSystem` defaults are `EROFS` on paths `writev`
+//!   never touches.
+//!
+//! The next thing to check is `sys_writev`'s reads of the guest's iovec array
+//! and buffers: `mmap` and `brk` regions are registered with the VMA tree by
+//! the native host's `place_image`, and this shim only registers the image and
+//! the stack, so a read from the heap -- where musl's stdout buffer lives --
+//! may be being rejected before the descriptor is ever reached.
+//!
 //! # What JS still does
 //!
 //! Creates the memory, instantiates both modules against it, wires this
