@@ -1,0 +1,8 @@
+[package]
+name = "gex-isa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AArch64 (A64) instruction decoder for gex"
+
+[dependencies]
