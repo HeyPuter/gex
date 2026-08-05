@@ -180,8 +180,9 @@ bitwise operations, closures, `goto`, to-be-closed variables, metamethods,
 string patterns, UTF-8, `string.pack`, coroutines, error handling, the garbage
 collector, `math` and `sort`. Every one produces byte-identical output to
 QEMU, except `math` and `sort`, whose only differences are a random seed and
-printed millisecond timings. `all.lua` fails on both engines the same way: it
-shells out to a subprocess, and neither has `fork`.
+printed millisecond timings. `all.lua` fails on both engines, but not for the
+same reason: QEMU forks and execs successfully and then the *host* shell
+cannot run an aarch64 binary, while gex returns `ENOSYS` from `clone`.
 
 Finding that suite is what turned up the `fmadd` bug below. Four of its files
 failed before it was fixed.
