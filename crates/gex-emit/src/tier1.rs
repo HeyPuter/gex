@@ -38,7 +38,6 @@ mod simd {
     pub const I16X8_SPLAT: u32 = 0x10;
     pub const I32X4_SPLAT: u32 = 0x11;
     pub const I64X2_SPLAT: u32 = 0x12;
-    pub const I8X16_SHUFFLE: u32 = 0x0d;
     pub const I8X16_SWIZZLE: u32 = 0x0e;
     pub const V128_BITSELECT: u32 = 0x52;
     pub const I8X16_POPCNT: u32 = 0x62;

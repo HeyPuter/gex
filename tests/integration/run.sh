@@ -91,6 +91,7 @@ echo "building guest programs..."
 "$CC" -static -O2 -o "$WORK/suite-pie" "$HERE/programs/suite.c"
 "$CC" -static -no-pie -O0 -o "$WORK/suite-O0" "$HERE/programs/suite.c"
 # -O3 so gcc's vectoriser chooses the NEON instructions, rather than us.
+"$CC" -static -no-pie -O2 -o "$WORK/vfs" "$HERE/programs/vfs.c"
 "$CC" -static -no-pie -O3 -o "$WORK/vector" "$HERE/programs/vector.c"
 "$CC" -static -O3 -o "$WORK/vector-pie" "$HERE/programs/vector.c"
 
@@ -109,6 +110,7 @@ for area in arith float mem flow; do
     compare "pie-$area" "$WORK/suite-pie" "$area"
     compare "O0-$area" "$WORK/suite-O0" "$area"
 done
+compare "vfs" "$WORK/vfs"
 compare "vector-O3" "$WORK/vector"
 compare "vector-pie" "$WORK/vector-pie"
 

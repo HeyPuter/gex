@@ -11,7 +11,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use gex_abi::{ctx, exports, imports, IMPORT_MODULE};
 use gex_kernel::mem::prot;
-use gex_kernel::{GuestMem, Kernel, SyscallOutcome};
+use gex_kernel::vfs::{DevFs, HostFs, ProcFs, TmpFs};
+use gex_kernel::{GuestMem, Kernel, ProcState, SyscallOutcome};
+use std::sync::{Arc, Mutex};
 use gex_ld::{build_initial_stack, Identity, Image};
 use gex_xlate::{Options, Stats};
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store, Val};
@@ -52,12 +54,18 @@ pub struct RunOptions {
     pub trace: bool,
     /// Print translation statistics to stderr.
     pub verbose: bool,
+    /// Host directory presented as the guest's root. Without one the guest
+    /// sees the host filesystem directly.
+    pub sysroot: Option<std::path::PathBuf>,
 }
 
 /// Host-side state threaded through every import.
 struct HostState {
     kernel: Kernel,
     memory: Option<Memory>,
+    /// Snapshot `/proc` reads from, refreshed before each syscall that could
+    /// observe it.
+    proc_state: Arc<Mutex<ProcState>>,
     /// Set when a host function decided the run must stop.
     exit: Option<Exit>,
 }
@@ -104,24 +112,43 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
     let module = Module::new(&engine, &module_bytes.wasm).context("validating translated wasm")?;
 
     let ctx_addr = gex_abi::ctx_addr(0);
-    let kernel = Kernel::new(
-        ctx_addr,
-        image.brk,
-        opts.args.first().cloned().unwrap_or_default(),
-    );
+    // `/proc/self/exe` is the resolved program, not argv[0]: a shell that
+    // re-executes itself relies on the difference.
+    let exe_path = opts
+        .args
+        .first()
+        .and_then(|a| std::fs::canonicalize(a).ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| opts.args.first().cloned().unwrap_or_default());
+    let kernel = Kernel::new(ctx_addr, image.brk, exe_path.clone());
     // Report the host's identity: with hostfs passthrough, a guest that
     // stats a file and then calls getuid must see a consistent answer.
     let (uid, gid) = host_identity();
+    let proc_state = Arc::new(Mutex::new(ProcState {
+        pid: 1,
+        maps: String::new(),
+        cmdline: Vec::new(),
+        environ: Vec::new(),
+        exe: exe_path,
+        cwd: "/".into(),
+        fds: Vec::new(),
+    }));
+    let mut kernel = Kernel {
+        trace: opts.trace,
+        uid,
+        gid,
+        argv: opts.args.clone(),
+        envp: opts.env.clone(),
+        ..kernel
+    };
+    mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;
+
     let mut store = Store::new(
         &engine,
         HostState {
-            kernel: Kernel {
-                trace: opts.trace,
-                uid,
-                gid,
-                ..kernel
-            },
+            kernel,
             memory: None,
+            proc_state,
             exit: None,
         },
     );
@@ -165,6 +192,79 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
         },
     };
     Ok((exit, stats))
+}
+
+/// Build the guest's namespace.
+///
+/// The layout follows what a container presents: a root (the host, or a
+/// sysroot when one is given), the synthetic `/proc` and `/dev`, and a
+/// writable `/tmp` that never touches the host. Mount order does not matter
+/// because the VFS resolves by longest prefix.
+fn mount_filesystems(
+    kernel: &mut Kernel,
+    opts: &RunOptions,
+    proc_state: Arc<Mutex<ProcState>>,
+) -> Result<()> {
+    match &opts.sysroot {
+        Some(root) => {
+            if !root.is_dir() {
+                bail!("sysroot {} is not a directory", root.display());
+            }
+            kernel.vfs.mount("/", Arc::new(HostFs::new(root)));
+        }
+        None => kernel.vfs.mount("/", Arc::new(HostFs::new("/"))),
+    }
+    kernel.vfs.mount("/dev", Arc::new(DevFs::new()));
+    kernel.vfs.mount(
+        "/proc",
+        Arc::new(ProcFs::new(Arc::new(SharedProc(proc_state)))),
+    );
+    if opts.sysroot.is_some() {
+        // A sysroot has no host /tmp behind it, so give the guest one.
+        kernel.vfs.mount("/tmp", Arc::new(TmpFs::new()));
+    }
+    // Start where the host process is, so relative paths on the command line
+    // mean what the user typed.
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/".into());
+    let _ = kernel.vfs.set_cwd(if opts.sysroot.is_some() { "/" } else { &cwd });
+    Ok(())
+}
+
+/// A `/proc` source over the snapshot the host refreshes.
+struct SharedProc(Arc<Mutex<ProcState>>);
+
+impl gex_kernel::vfs::ProcSource for SharedProc {
+    fn pid(&self) -> i32 {
+        self.0.lock().unwrap().pid
+    }
+    fn maps(&self) -> String {
+        self.0.lock().unwrap().maps.clone()
+    }
+    fn cmdline(&self) -> Vec<u8> {
+        self.0.lock().unwrap().cmdline.clone()
+    }
+    fn environ(&self) -> Vec<u8> {
+        self.0.lock().unwrap().environ.clone()
+    }
+    fn exe(&self) -> String {
+        self.0.lock().unwrap().exe.clone()
+    }
+    fn cwd(&self) -> String {
+        self.0.lock().unwrap().cwd.clone()
+    }
+    fn fds(&self) -> Vec<(i32, String)> {
+        self.0.lock().unwrap().fds.clone()
+    }
+    fn stat(&self) -> String {
+        let s = self.0.lock().unwrap();
+        format!("{} (gex) R 0 {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0\n", s.pid, s.pid, s.pid)
+    }
+    fn status(&self) -> String {
+        let s = self.0.lock().unwrap();
+        format!("Name:\tgex\nState:\tR (running)\nPid:\t{}\nThreads:\t1\n", s.pid)
+    }
 }
 
 /// The host process's real user and group ids.
@@ -286,6 +386,12 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
             // Split the borrow: the kernel needs `&mut [u8]` and `&mut Kernel`
             // at once, and they live in different places.
+            // /proc must reflect the state this syscall will see, so the
+            // snapshot is refreshed before the call rather than after.
+            {
+                let state = caller.data();
+                state.kernel.refresh_proc(&state.proc_state);
+            }
             let (data, state) = memory.data_and_store_mut(&mut caller);
             let mut gm = GuestMem::new(data);
             match state.kernel.syscall(&mut gm, pc as u64) {

@@ -12,12 +12,16 @@
 #![forbid(unsafe_code)]
 
 pub mod errno;
+pub mod file;
 pub mod fs;
 pub mod mem;
+pub mod pipe;
+pub mod stdio;
 pub mod syscalls;
+pub mod vfs;
 
 pub use errno::Errno;
-pub use syscalls::{Kernel, SyscallOutcome};
+pub use syscalls::{Kernel, KernelProcSource, ProcState, SyscallOutcome};
 
 /// Guest linear memory, addressed exactly as the guest addresses it.
 ///
