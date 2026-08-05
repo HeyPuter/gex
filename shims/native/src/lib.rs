@@ -23,8 +23,18 @@ use wasmtime::{Caller, Config, Engine, Extern, Linker, Memory, Module, Store, Va
 pub enum Exit {
     /// `exit_group(status)`.
     Status(i32),
-    /// A fatal signal the runtime synthesised.
-    Signal { signal: i32, pc: u64, detail: String },
+    /// A fatal signal.
+    Signal {
+        signal: i32,
+        pc: u64,
+        detail: String,
+        /// True when the signal reflects a gex limitation rather than the
+        /// guest's own behaviour — an instruction we cannot execute, an
+        /// address with no translation. Those deserve a message on stderr; an
+        /// ordinary fatal signal does not, because Linux prints nothing
+        /// either and the shell reports the exit status.
+        internal: bool,
+    },
 }
 
 impl Exit {
@@ -36,6 +46,10 @@ impl Exit {
         }
     }
 }
+
+/// Back-edges between signal polls. Small enough that delivery is prompt,
+/// large enough that the check is noise.
+const SAFEPOINT_INTERVAL: i32 = 1024;
 
 /// Signal numbers the runtime raises.
 pub mod signal {
@@ -68,12 +82,17 @@ struct HostState {
     proc_state: Arc<Mutex<ProcState>>,
     /// Set when a host function decided the run must stop.
     exit: Option<Exit>,
+    /// Set when a host function wants execution to continue elsewhere.
+    resume_at: Option<u64>,
 }
 
-/// A trap used to unwind out of translated code when the run is over.
+/// A trap used to unwind out of translated code.
 ///
-/// Exiting by trapping keeps the common syscall path free of a return-value
-/// check: only the rare terminating call pays anything.
+/// Both stopping and *redirecting* use it. Redirecting is what signal
+/// delivery needs: the guest's registers are already in the context at every
+/// host call, so abandoning the wasm stack and re-entering at a new PC loses
+/// nothing (PLAN §2.4). Unwinding this way also keeps the common syscall path
+/// free of a return-value check.
 #[derive(Debug)]
 struct StopExecution;
 
@@ -150,6 +169,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
             memory: None,
             proc_state,
             exit: None,
+            resume_at: None,
         },
     );
 
@@ -172,24 +192,31 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
         .get_func(&mut store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
 
-    let result = enter.call(
-        &mut store,
-        &[Val::I32(ctx_addr as i32), Val::I64(image.entry as i64)],
-        &mut [],
-    );
-
-    let exit = match result {
-        Ok(()) => store
-            .data()
-            .exit
-            .clone()
+    // The run is a loop rather than a single call because a signal, a
+    // sigreturn or (from M3) a freshly translated block redirects execution
+    // by unwinding and re-entering at a new address.
+    let mut pc = image.entry;
+    let exit = loop {
+        let result = enter.call(
+            &mut store,
+            &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)],
+            &mut [],
+        );
+        match result {
             // Falling off the end of translated code means the guest returned
             // from its entry point, which Linux treats as an exit.
-            .unwrap_or(Exit::Status(0)),
-        Err(e) => match store.data().exit.clone() {
-            Some(x) => x,
-            None => return Err(classify_trap(e, &store)),
-        },
+            Ok(()) => break store.data().exit.clone().unwrap_or(Exit::Status(0)),
+            Err(e) => {
+                if let Some(next) = store.data_mut().resume_at.take() {
+                    pc = next;
+                    continue;
+                }
+                match store.data().exit.clone() {
+                    Some(x) => break x,
+                    None => return Err(classify_trap(e, &store)),
+                }
+            }
+        }
     };
     Ok((exit, stats))
 }
@@ -362,6 +389,8 @@ fn place_image(
     let ctx_addr = gex_abi::ctx_addr(0) as usize;
     write_u64(data, ctx_addr + ctx::SP, layout.sp);
     write_u64(data, ctx_addr + ctx::PC, image.entry);
+    data[ctx_addr + ctx::SAFEPOINT_COUNTER..ctx_addr + ctx::SAFEPOINT_COUNTER + 4]
+        .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
     for i in 0..31u8 {
         write_u64(data, ctx_addr + ctx::x(i), 0);
     }
@@ -396,8 +425,24 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let mut gm = GuestMem::new(data);
             match state.kernel.syscall(&mut gm, pc as u64) {
                 SyscallOutcome::Continue => Ok(()),
+                SyscallOutcome::Resume(target) => {
+                    state.resume_at = Some(target);
+                    Err(StopExecution.into())
+                }
                 SyscallOutcome::Exit(code) => {
                     state.exit = Some(Exit::Status(code));
+                    Err(StopExecution.into())
+                }
+                SyscallOutcome::Killed { signal, core } => {
+                    state.exit = Some(Exit::Signal {
+                        signal: signal as i32,
+                        pc: pc as u64,
+                        detail: format!(
+                            "killed by signal {signal}{}",
+                            if core { " (core dumped)" } else { "" }
+                        ),
+                        internal: false,
+                    });
                     Err(StopExecution.into())
                 }
             }
@@ -408,10 +453,35 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::DISPATCH_MISS,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<i32> {
+            let pc = pc as u64;
+            // Returning from a signal handler with no `sa_restorer` lands
+            // here: the trampoline address deliberately has no translation.
+            if pc == gex_kernel::signal::SIGRETURN_TRAMPOLINE {
+                let memory = caller
+                    .data()
+                    .memory
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let (data, state) = memory.data_and_store_mut(&mut caller);
+                let mut gm = GuestMem::new(data);
+                return match state.kernel.sigreturn(&mut gm) {
+                    Ok(target) => {
+                        state.resume_at = Some(target);
+                        Err(StopExecution.into())
+                    }
+                    Err(_) => {
+                        state.exit = Some(Exit::Signal {
+                            signal: signal::SIGSEGV,
+                            pc,
+                            detail: "corrupt signal frame on sigreturn".into(),
+                            internal: true,
+                        });
+                        Err(StopExecution.into())
+                    }
+                };
+            }
             // From M3 this is where gex-jit translates the target and patches
             // the dispatch slot. Until then an unreachable address is a hard
             // error, reported precisely rather than as a wasm trap.
-            let pc = pc as u64;
             caller.data_mut().exit = Some(Exit::Signal {
                 signal: signal::SIGSEGV,
                 pc,
@@ -419,6 +489,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     "branch to 0x{pc:x}, which has no translation \
                      (runtime translation lands in M3)"
                 ),
+                internal: true,
             });
             Err(StopExecution.into())
         },
@@ -430,11 +501,32 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, raw: i32| -> Result<()> {
             let pc = pc as u64;
             let raw = raw as u32;
-            caller.data_mut().exit = Some(Exit::Signal {
-                signal: signal::SIGILL,
-                pc,
-                detail: format!("instruction 0x{raw:08x} at 0x{pc:x} is not implemented"),
-            });
+            let memory = caller
+                .data()
+                .memory
+                .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            let (data, state) = memory.data_and_store_mut(&mut caller);
+            let mut gm = GuestMem::new(data);
+            // A guest that installed a SIGILL handler gets to see it, which
+            // is how some runtimes probe for optional instructions.
+            match state
+                .kernel
+                .raise_fault(&mut gm, signal::SIGILL as u32, pc, pc)
+            {
+                gex_kernel::signal::Delivery::Resume(target) => {
+                    state.resume_at = Some(target);
+                }
+                _ => {
+                    state.exit = Some(Exit::Signal {
+                        signal: signal::SIGILL,
+                        pc,
+                        detail: format!(
+                            "instruction 0x{raw:08x} at 0x{pc:x} is not implemented"
+                        ),
+                        internal: true,
+                    });
+                }
+            }
             Err(StopExecution.into())
         },
     )?;
@@ -447,6 +539,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 signal: signal::SIGTRAP,
                 pc: pc as u64,
                 detail: format!("brk #{imm}"),
+                internal: false,
             });
             Err(StopExecution.into())
         },
@@ -504,7 +597,43 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::SAFEPOINT,
-        |_caller: Caller<'_, HostState>, _ctx: i32, _pc: i64| {},
+        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
+            let memory = caller
+                .data()
+                .memory
+                .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            let (data, state) = memory.data_and_store_mut(&mut caller);
+            let mut gm = GuestMem::new(data);
+            // The context is complete here, so a handler frame built now
+            // captures exactly the state the guest would see on hardware.
+            let ctx_addr = state.kernel.ctx_addr;
+            let _ = gm.write_u64(ctx_addr + gex_abi::ctx::PC as u64, pc as u64);
+            // Rearm before delivering, so a handler that loops still polls.
+            let counter = ctx_addr as usize + gex_abi::ctx::SAFEPOINT_COUNTER;
+            if counter + 4 <= gm.bytes.len() {
+                gm.bytes[counter..counter + 4]
+                    .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
+            }
+            match state.kernel.deliver_pending(&mut gm) {
+                gex_kernel::signal::Delivery::None => Ok(()),
+                gex_kernel::signal::Delivery::Resume(target) => {
+                    state.resume_at = Some(target);
+                    Err(StopExecution.into())
+                }
+                gex_kernel::signal::Delivery::Terminate { signal, core } => {
+                    state.exit = Some(Exit::Signal {
+                        signal: signal as i32,
+                        pc: pc as u64,
+                        detail: format!(
+                            "killed by signal {signal}{}",
+                            if core { " (core dumped)" } else { "" }
+                        ),
+                        internal: false,
+                    });
+                    Err(StopExecution.into())
+                }
+            }
+        },
     )?;
 
     Ok(())

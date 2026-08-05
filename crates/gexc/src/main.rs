@@ -122,8 +122,15 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
             signal,
             pc,
             detail,
+            internal,
         } => {
-            eprintln!("gexc: guest terminated by signal {signal} at pc=0x{pc:x}: {detail}");
+            // A process killed by an ordinary signal says nothing itself —
+            // Linux prints nothing and the shell reports the status. Only a
+            // gex limitation is worth a message, since nothing else would
+            // explain it.
+            if *internal || ra.opts.verbose {
+                eprintln!("gexc: guest terminated by signal {signal} at pc=0x{pc:x}: {detail}");
+            }
             Ok(ExitCode::from((exit.code() & 0xff) as u8))
         }
     }

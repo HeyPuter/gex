@@ -16,6 +16,7 @@ pub mod file;
 pub mod fs;
 pub mod mem;
 pub mod pipe;
+pub mod signal;
 pub mod stdio;
 pub mod syscalls;
 pub mod vfs;

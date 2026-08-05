@@ -14,6 +14,7 @@ use crate::file::{FdTable, OpenFile, PipeEnd};
 use crate::fs::{oflags, Stat};
 use crate::mem::{flags as mflags, MemoryMap};
 use crate::pipe::Pipe;
+use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
 use crate::stdio::{StdStream, Stream};
 use crate::vfs::{FileType, ProcSource, Vfs};
 use crate::GuestMem;
@@ -65,11 +66,13 @@ pub mod nr {
     pub const CLOCK_NANOSLEEP: u64 = 115;
     pub const SCHED_YIELD: u64 = 124;
     pub const KILL: u64 = 129;
+    pub const TKILL: u64 = 130;
     pub const TGKILL: u64 = 131;
     pub const RT_SIGSUSPEND: u64 = 133;
     pub const RT_SIGACTION: u64 = 134;
     pub const RT_SIGPROCMASK: u64 = 135;
     pub const RT_SIGRETURN: u64 = 139;
+    pub const SIGALTSTACK: u64 = 132;
     pub const TIMES: u64 = 153;
     pub const UNAME: u64 = 160;
     pub const GETRUSAGE: u64 = 165;
@@ -105,10 +108,18 @@ const AT_REMOVEDIR: u64 = 0x200;
 /// What the host should do after a syscall returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyscallOutcome {
-    /// Resume the guest.
+    /// Resume the guest where it left off.
     Continue,
-    /// The process asked to terminate.
+    /// Re-enter translated code at this address instead.
+    ///
+    /// Produced by `rt_sigreturn` and by signal delivery. Redirecting is safe
+    /// at any host call because the guest's registers are already flushed to
+    /// the context, so there is no wasm stack to unwind (PLAN §2.4).
+    Resume(u64),
+    /// The process is over.
     Exit(i32),
+    /// A signal with no handler ended the process.
+    Killed { signal: u32, core: bool },
 }
 
 /// One guest process's kernel state.
@@ -130,6 +141,8 @@ pub struct Kernel {
     pub gid: u32,
     /// Trace every syscall to stderr (PLAN §11's strace mode).
     pub trace: bool,
+    /// Signal dispositions, masks and pending set.
+    pub signals: Signals,
     /// Syscalls seen but not implemented, for the ENOSYS telemetry in
     /// PLAN §14.
     pub unimplemented: Vec<u64>,
@@ -166,6 +179,7 @@ impl Kernel {
             envp: Vec::new(),
             uid: 1000,
             gid: 1000,
+            signals: Signals::new(),
             trace: false,
             unimplemented: Vec::new(),
         }
@@ -186,6 +200,23 @@ impl Kernel {
             self.arg(m, 4),
             self.arg(m, 5),
         ];
+
+        // Returning from a handler restores a whole context, so it cannot go
+        // through the normal "write x0 and continue" path.
+        if n == nr::RT_SIGRETURN {
+            return match self.sigreturn(m) {
+                Ok(pc) => {
+                    if self.trace {
+                        eprintln!("[gex] rt_sigreturn -> 0x{pc:x}");
+                    }
+                    SyscallOutcome::Resume(pc)
+                }
+                Err(_) => SyscallOutcome::Killed {
+                    signal: signal::sig::SIGSEGV,
+                    core: true,
+                },
+            };
+        }
 
         let outcome = self.dispatch(m, n, a);
         let ret = match &outcome {
@@ -208,7 +239,14 @@ impl Kernel {
             );
         }
         let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, ret);
-        SyscallOutcome::Continue
+
+        // A syscall boundary is a safepoint: the context is complete, so a
+        // pending signal can be delivered precisely here.
+        match self.deliver_pending(m) {
+            Delivery::None => SyscallOutcome::Continue,
+            Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
+            Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
+        }
     }
 
     /// The dispatch table. `Err(code)` means the process is exiting.
@@ -288,9 +326,30 @@ impl Kernel {
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
             nr::PRLIMIT64 => self.sys_prlimit(m, a[2], a[3]),
 
-            // Accepted but inert until the signal and thread layers exist.
-            nr::SET_ROBUST_LIST | nr::GET_ROBUST_LIST | nr::RT_SIGACTION
-            | nr::RT_SIGPROCMASK => Ok(0),
+            // -- signals -----------------------------------------------------
+            nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
+            nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(m, a[0] as u32, a[1], a[2]),
+            nr::SIGALTSTACK => self.sys_sigaltstack(m, a[0], a[1]),
+            // One process and one thread for now, so any target is us.
+            // `raise` goes through tkill, which is why it needs its own entry
+            // rather than falling into the unimplemented bucket.
+            nr::KILL | nr::TKILL | nr::TGKILL => {
+                let signo = match n {
+                    nr::KILL | nr::TKILL => a[1],
+                    _ => a[2],
+                } as u32;
+                if signo > 0 {
+                    self.signals.raise(signo);
+                }
+                Ok(0)
+            }
+            nr::RT_SIGRETURN => {
+                // Handled by the caller, which must redirect execution to the
+                // restored PC rather than returning here.
+                Ok(0)
+            }
+
+            nr::SET_ROBUST_LIST | nr::GET_ROBUST_LIST => Ok(0),
             // Restartable sequences are an optimisation the guest can live
             // without, and both libcs treat ENOSYS as "not available".
             nr::RSEQ => Err(Errno::ENOSYS),
@@ -306,6 +365,140 @@ impl Kernel {
             }
         };
         Ok(r)
+    }
+
+    // -- signals -------------------------------------------------------------
+
+    fn sys_rt_sigaction(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        signo: u32,
+        act: u64,
+        old: u64,
+    ) -> SysResult {
+        if signo == 0 || signo > signal::sig::MAX {
+            return Err(Errno::EINVAL);
+        }
+        if old != 0 {
+            let a = self.signals.action(signo);
+            m.write_u64(old, a.handler)?;
+            m.write_u64(old + 8, a.flags)?;
+            m.write_u64(old + 16, a.restorer)?;
+            m.write_u64(old + 24, a.mask)?;
+        }
+        if act != 0 {
+            let a = SigAction {
+                handler: m.read_u64(act)?,
+                flags: m.read_u64(act + 8)?,
+                restorer: m.read_u64(act + 16)?,
+                mask: m.read_u64(act + 24)?,
+            };
+            self.signals.set_action(signo, a)?;
+        }
+        Ok(0)
+    }
+
+    fn sys_rt_sigprocmask(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        how: u32,
+        set: u64,
+        old: u64,
+    ) -> SysResult {
+        const SIG_BLOCK: u32 = 0;
+        const SIG_UNBLOCK: u32 = 1;
+        const SIG_SETMASK: u32 = 2;
+        if old != 0 {
+            m.write_u64(old, self.signals.blocked)?;
+        }
+        if set != 0 {
+            let mask = m.read_u64(set)?;
+            self.signals.blocked = match how {
+                SIG_BLOCK => self.signals.blocked | mask,
+                SIG_UNBLOCK => self.signals.blocked & !mask,
+                SIG_SETMASK => mask,
+                _ => return Err(Errno::EINVAL),
+            };
+            // Neither of these can ever be blocked.
+            let unblockable =
+                (1u64 << (signal::sig::SIGKILL - 1)) | (1u64 << (signal::sig::SIGSTOP - 1));
+            self.signals.blocked &= !unblockable;
+        }
+        Ok(0)
+    }
+
+    fn sys_sigaltstack(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
+        if old != 0 {
+            let a = self.signals.alt_stack;
+            m.write_u64(old, a.sp)?;
+            m.write_u32(old + 8, a.flags)?;
+            m.write_u64(old + 16, a.size)?;
+        }
+        if new != 0 {
+            self.signals.alt_stack = SigAltStack {
+                sp: m.read_u64(new)?,
+                flags: m.read_u32(new + 8)?,
+                size: m.read_u64(new + 16)?,
+            };
+        }
+        Ok(0)
+    }
+
+    /// Deliver a pending signal, if any is deliverable right now.
+    ///
+    /// Called after every syscall and at safepoints. A `Resume` result means
+    /// the caller must re-enter translated code at the returned address
+    /// rather than continuing where it was.
+    pub fn deliver_pending(&mut self, m: &mut GuestMem<'_>) -> Delivery {
+        if !self.signals.has_pending() {
+            return Delivery::None;
+        }
+        signal::dispatch(&mut self.signals, m, self.ctx_addr).unwrap_or(Delivery::None)
+    }
+
+    /// Raise a synchronous fault against the running instruction.
+    ///
+    /// Returns where to resume if a handler took it. Unlike an asynchronous
+    /// signal these cannot simply be discarded: a program with no handler for
+    /// its own SIGSEGV must die.
+    pub fn raise_fault(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        signo: u32,
+        pc: u64,
+        fault_address: u64,
+    ) -> Delivery {
+        let action = self.signals.action(signo);
+        let blocked = self.signals.blocked & (1u64 << (signo - 1)) != 0;
+        // A synchronous fault that is blocked or ignored is fatal, because
+        // returning would re-execute the faulting instruction forever.
+        if action.handler == signal::SIG_DFL || action.handler == signal::SIG_IGN || blocked {
+            return Delivery::Terminate {
+                signal: signo,
+                core: matches!(
+                    signal::default_action(signo),
+                    signal::DefaultAction::Core
+                ),
+            };
+        }
+        if m.write_u64(self.ctx_addr + ctx::PC as u64, pc).is_err() {
+            return Delivery::Terminate {
+                signal: signo,
+                core: true,
+            };
+        }
+        match signal::setup_frame(&mut self.signals, m, self.ctx_addr, signo, fault_address) {
+            Ok(resume) => Delivery::Resume(resume),
+            Err(_) => Delivery::Terminate {
+                signal: signo,
+                core: true,
+            },
+        }
+    }
+
+    /// Restore the context a handler frame captured.
+    pub fn sigreturn(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
+        signal::sigreturn(&mut self.signals, m, self.ctx_addr)
     }
 
     // -- path helpers --------------------------------------------------------
@@ -973,10 +1166,12 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::CLOCK_NANOSLEEP => "clock_nanosleep",
         nr::SCHED_YIELD => "sched_yield",
         nr::KILL => "kill",
+        nr::TKILL => "tkill",
         nr::TGKILL => "tgkill",
         nr::RT_SIGACTION => "rt_sigaction",
         nr::RT_SIGPROCMASK => "rt_sigprocmask",
         nr::RT_SIGRETURN => "rt_sigreturn",
+        nr::SIGALTSTACK => "sigaltstack",
         nr::TIMES => "times",
         nr::UNAME => "uname",
         nr::GETRUSAGE => "getrusage",

@@ -129,6 +129,8 @@ struct Emitter<'a> {
     ctx_local: u32,
     /// Scratch for address computation.
     scratch_i64: u32,
+    /// Scratch for the safepoint counter.
+    scratch_i32: u32,
     /// Locals holding live GIR values.
     value_local: Vec<Option<u32>>,
     /// Constant value of each GIR value, when known.
@@ -147,11 +149,13 @@ impl<'a> Emitter<'a> {
     fn new(cx: &'a Context<'a>) -> Emitter<'a> {
         let mut f = FuncBody::new(1);
         let scratch_i64 = f.add_local(ValType::I64);
+        let scratch_i32 = f.add_local(ValType::I32);
         Emitter {
             f,
             cx,
             ctx_local: 0,
             scratch_i64,
+            scratch_i32,
             value_local: Vec::new(),
             value_const: Vec::new(),
             value_ty: Vec::new(),
@@ -909,6 +913,9 @@ impl<'a> Emitter<'a> {
         match block.term {
             Term::Goto { target } => {
                 self.flush();
+                if target <= block.start {
+                    self.emit_safepoint(target);
+                }
                 self.jump_to_constant(target);
             }
             Term::Branch {
@@ -919,10 +926,18 @@ impl<'a> Emitter<'a> {
                 // Flush before the branch so both arms see the stores; doing
                 // it inside the `if` would only cover the taken path.
                 self.flush();
+                // A conditional back-edge polls only on the taken path, so a
+                // loop's exit test costs nothing extra.
                 self.push(cond);
                 self.f.if_void();
+                if taken <= block.start {
+                    self.emit_safepoint(taken);
+                }
                 self.jump_to_constant(taken);
                 self.f.end();
+                if not_taken <= block.start {
+                    self.emit_safepoint(not_taken);
+                }
                 self.jump_to_constant(not_taken);
             }
             Term::Indirect { target, .. } => {
@@ -941,7 +956,11 @@ impl<'a> Emitter<'a> {
             }
             Term::Syscall { next } => {
                 self.flush();
-                self.store_pc(block.end - 4);
+                // The recorded PC is the instruction *after* the `svc`: it is
+                // where a signal frame must resume, and resuming at the `svc`
+                // itself would re-issue the syscall. The call still receives
+                // the syscall's own address, which is what a trace wants.
+                self.store_pc(next);
                 self.f.local_get(self.ctx_local);
                 self.f.i64_const((block.end - 4) as i64);
                 self.f.call(self.cx.syscall);
@@ -959,6 +978,34 @@ impl<'a> Emitter<'a> {
                 self.f.unreachable();
             }
         }
+    }
+
+    /// Poll for a pending signal before a backward jump.
+    ///
+    /// PLAN §5.6 puts safepoints on loop back-edges and a periodic counter.
+    /// A backward direct branch is the cheap, sound approximation of a loop:
+    /// it means no program can spin without reaching a poll, while
+    /// straight-line code pays nothing. Forward branches and calls are left
+    /// alone, and syscalls are already delivery points.
+    fn emit_safepoint(&mut self, pc: u64) {
+        // Count down, and only call out when the counter runs out, so the
+        // common case is a load, a subtract, a store and a not-taken branch.
+        self.f.local_get(self.ctx_local);
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
+        self.f.i32_const(1);
+        self.f.byte(0x6b); // i32.sub
+        self.f.local_tee(self.scratch_i32);
+        self.f.store(0x36, 2, ctx::SAFEPOINT_COUNTER as u32);
+
+        self.f.local_get(self.scratch_i32);
+        self.f.i32_const(0);
+        self.f.byte(0x4c); // i32.le_s
+        self.f.if_void();
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(pc as i64);
+        self.f.call(self.cx.safepoint);
+        self.f.end();
     }
 
     /// Transfer control to a statically known guest address.

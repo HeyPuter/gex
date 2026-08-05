@@ -33,8 +33,27 @@ pass=0
 fail=0
 
 # Compare one invocation between the two engines.
-#   compare <label> <program> [args...]
+#   compare [--native-oracle <path>] <label> <program> [args...]
+#
+# `--native-oracle` names a host-native build of the same source to fall back
+# on when QEMU itself fails. It is opt-in per test rather than automatic,
+# because "QEMU exited with a signal and printed nothing" is also exactly
+# what a correct run of a program that dies from a signal looks like.
 compare() {
+    oracle=""
+    check_stderr=1
+    while :; do
+        case "$1" in
+            --native-oracle) oracle="$2"; shift 2 ;;
+            # For a process killed by a signal the contract is stdout and the
+            # exit status. What the *supervisor* prints is not the guest's
+            # behaviour: QEMU announces "uncaught target signal", the shell
+            # announces "Terminated", and Linux itself announces nothing —
+            # which is what gex does.
+            --ignore-stderr) check_stderr=0; shift ;;
+            *) break ;;
+        esac
+    done
     label="$1"; shift
     q_out="$WORK/$label.qemu"
     g_out="$WORK/$label.gex"
@@ -48,18 +67,16 @@ compare() {
     g_rc=$?
     set -e
 
-    # The oracle is not infallible: QEMU 7.2 segfaults on the -O0 longjmp
-    # case before producing any output. The suite is written so its output is
-    # architecture-independent, which lets a natively compiled build stand in
-    # as a second oracle rather than losing the coverage.
-    if [ "$q_rc" -ge 128 ] && [ ! -s "$q_out.stdout" ] && [ -n "$NATIVE" ]; then
+    # QEMU 7.2 segfaults on the -O0 longjmp case before producing any output.
+    # The suite's output is architecture-independent, so a natively compiled
+    # build can stand in rather than losing the coverage.
+    if [ -n "$oracle" ] && [ "$q_rc" -ge 128 ] && [ ! -s "$q_out.stdout" ]; then
+        shift   # drop the program path; the oracle is a different binary
         set +e
-        "$NATIVE" "$@" >"$q_out.stdout" 2>/dev/null
+        "$oracle" "$@" >"$q_out.stdout" 2>/dev/null
         q_rc=$?
         set -e
-        # Drop the program path, which differs between the two builds.
-        shift
-        echo "note $label: qemu failed; comparing against the native build"
+        echo "note $label: qemu failed; compared against the native build"
     fi
 
     if [ "$q_rc" != "$g_rc" ]; then
@@ -74,7 +91,7 @@ compare() {
         fail=$((fail + 1))
         return
     fi
-    if ! cmp -s "$q_out.stderr" "$g_out.stderr"; then
+    if [ "$check_stderr" -eq 1 ] && ! cmp -s "$q_out.stderr" "$g_out.stderr"; then
         echo "FAIL $label: stderr differs"
         diff -u "$q_out.stderr" "$g_out.stderr" | head -20 || true
         fail=$((fail + 1))
@@ -92,15 +109,17 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O0 -o "$WORK/suite-O0" "$HERE/programs/suite.c"
 # -O3 so gcc's vectoriser chooses the NEON instructions, rather than us.
 "$CC" -static -no-pie -O2 -o "$WORK/vfs" "$HERE/programs/vfs.c"
+"$CC" -static -no-pie -O2 -o "$WORK/signals" "$HERE/programs/signals.c"
 "$CC" -static -no-pie -O3 -o "$WORK/vector" "$HERE/programs/vector.c"
 "$CC" -static -O3 -o "$WORK/vector-pie" "$HERE/programs/vector.c"
 
 printf 'first line\nsecond line\n' >"$WORK/sample.txt"
 
-# A host-native build of the same source, used only when QEMU itself fails.
-NATIVE=""
+# A host-native build of the conformance suite, used only where QEMU itself
+# is known to fail.
+SUITE_NATIVE=""
 if command -v cc >/dev/null 2>&1 && cc -O0 -o "$WORK/suite-native" "$HERE/programs/suite.c" 2>/dev/null; then
-    NATIVE="$WORK/suite-native"
+    SUITE_NATIVE="$WORK/suite-native"
 fi
 
 for area in arith float mem flow sys; do
@@ -108,9 +127,14 @@ for area in arith float mem flow sys; do
 done
 for area in arith float mem flow; do
     compare "pie-$area" "$WORK/suite-pie" "$area"
-    compare "O0-$area" "$WORK/suite-O0" "$area"
+    compare --native-oracle "$SUITE_NATIVE" "O0-$area" "$WORK/suite-O0" "$area"
 done
 compare "vfs" "$WORK/vfs"
+compare "signal-all" "$WORK/signals" all
+compare "signal-catch-illegal" "$WORK/signals" catch-illegal
+for mode in fatal-default fatal-abort; do
+    compare --ignore-stderr "signal-$mode" "$WORK/signals" "$mode"
+done
 compare "vector-O3" "$WORK/vector"
 compare "vector-pie" "$WORK/vector-pie"
 
