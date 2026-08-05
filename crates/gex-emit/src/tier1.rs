@@ -122,7 +122,15 @@ pub struct Context<'a> {
 }
 
 /// How many blocks may be folded into one function.
-const MAX_CHAIN: usize = 8;
+fn max_chain() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("GEX_MAX_CHAIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
 
 /// Compile one GIR block into a wasm function body.
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
@@ -219,12 +227,12 @@ impl<'a> Emitter<'a> {
 
     fn run(&mut self, block: &Block) {
         let mut current = block;
-        for i in 0..MAX_CHAIN {
+        for i in 0..max_chain() {
             // Whether this block's terminator is replaced by the next block's
             // body has to be decided *before* emitting it: deciding after
             // would leave the last block of a chain that hit the limit with a
             // terminator and no body.
-            let next = if i + 1 == MAX_CHAIN {
+            let next = if i + 1 == max_chain() {
                 None
             } else {
                 chain_target(current, self.cx)

@@ -301,12 +301,11 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     kernel
         .vfs
         .mount("/dev", Arc::new(gex_kernel::vfs::DevFs::new()));
-    // `/tmp` on its own filesystem, so a program that writes scratch files
-    // does not have them turn up in the bundle the page loaded.
+    // `/tmp` is part of the root filesystem rather than a mount of its own,
+    // so a page can bundle a file at any path at all. A mount there meant a
+    // bundled `/tmp/x` went into the root and every lookup of it went to the
+    // mount, which had never heard of it.
     root.add_dir("/tmp");
-    kernel
-        .vfs
-        .mount("/tmp", Arc::new(gex_kernel::vfs::TmpFs::new()));
     // `/proc` matters more here than it looks: a program that cannot open
     // `/proc/self/maps` gets a null `FILE*` back, and the next `fgets` calls
     // through it. That surfaces as a jump to address zero -- a dispatch miss
