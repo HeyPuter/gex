@@ -361,17 +361,23 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             len as usize,
         )
     };
-    let Ok(image) = gex_ld::elf::load(bytes, gex_abi::PIE_BASE) else {
-        return 0;
-    };
-    if image.interp.is_some() {
-        // A dynamic program needs its interpreter read through a filesystem,
-        // and this host has none yet.
-        return 0;
-    }
-
-    let mut kernel = Kernel::new(gex_abi::ctx_addr(0), image.brk, String::new());
+    // The bundle is a filesystem before anything else happens, because a
+    // dynamic executable's interpreter is read out of it.
     let root = Arc::new(gex_kernel::vfs::TmpFs::new());
+    install_bundle(&root);
+    let program = match gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, &|path| {
+        use gex_kernel::vfs::FileSystem;
+        let f = root.open(path.trim_start_matches('/'), 0, 0).ok()?;
+        let len = f.metadata().ok()?.size as usize;
+        let mut buf = vec![0u8; len];
+        f.read_at(0, &mut buf).ok()?;
+        Some(buf)
+    }) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+
+    let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
     kernel.vfs.mount("/", root.clone());
     kernel
         .vfs
@@ -425,7 +431,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     }
 
     let data = guest_bytes();
-    for seg in &image.segments {
+    for seg in program.segments() {
         let (a, b) = (seg.vaddr as usize, (seg.vaddr + seg.mem_size) as usize);
         data[a..b].fill(0);
         data[a..a + seg.bytes.len()].copy_from_slice(&seg.bytes);
@@ -470,7 +476,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     kernel.argv = args.clone();
     kernel.envp = env.to_vec();
     let layout = gex_ld::build_initial_stack(
-        &image,
+        &program.exe,
         GUEST_LIMIT,
         &args,
         &env,
@@ -478,7 +484,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         gex_ld::Identity {
             uid: unsafe { IDENTITY.0 },
             gid: unsafe { IDENTITY.1 },
-            interp_base: 0,
+            // Where the interpreter ended up, which is how it finds itself.
+            interp_base: program.interp_base(),
         },
     );
     let start = layout.low as usize;
@@ -492,7 +499,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
 
     let c = gex_abi::ctx_addr(0) as usize;
     write_u64(data, c + ctx::SP, layout.sp);
-    write_u64(data, c + ctx::PC, image.entry);
+    write_u64(data, c + ctx::PC, program.entry());
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
     for i in 0..31u8 {
@@ -500,7 +507,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     }
 
     let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
-    let entry = image.entry;
+    let entry = program.entry();
     HOST.with(|h| {
         *h.borrow_mut() = Some(Host {
             kernel,
@@ -543,8 +550,21 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
         return;
     };
     let bytes = shim_slice(data, data_len).to_vec();
-    with_host(|h| {
-        // Directories along the way, so a nested path resolves.
+    // Staged rather than installed. The bundle has to exist before the
+    // program is loaded, not after: a dynamic executable names its
+    // interpreter and the loader has to read it out of the same filesystem
+    // the guest will see.
+    FILES.0.borrow_mut().push((name.to_string(), bytes));
+}
+
+/// Files bundled by the page, in the order they arrived.
+type Bundle = Vec<(String, Vec<u8>)>;
+static FILES: SingleThreaded<Bundle> = SingleThreaded(const { RefCell::new(Vec::new()) });
+
+/// Put the staged bundle into a filesystem, creating the directories on the
+/// way to each file.
+fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
+    for (name, bytes) in std::mem::take(&mut *FILES.0.borrow_mut()) {
         let mut at = String::new();
         for part in name
             .trim_start_matches('/')
@@ -557,11 +577,16 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
         {
             at.push('/');
             at.push_str(part);
-            h.root.add_dir(&at);
+            root.add_dir(&at);
         }
-        h.root.add_file(name, bytes);
-    });
+        root.add_file(&name, bytes);
+    }
 }
+
+/// Where the dynamic linker is placed, clear of the executable so neither can
+/// overlap the other's mappings. The same address `gexc` uses, so a program
+/// looks identical under both hosts.
+const INTERP_BASE: u64 = 0x2800_0000;
 
 /// The identity the guest is given, which the embedder may override before
 /// loading. A page has no user, so 1000 is as good an answer as any; Node

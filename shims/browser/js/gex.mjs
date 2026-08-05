@@ -113,6 +113,19 @@ export class Gex {
       this.#u8.set(opts.stdin, sp);
       this.#shim.exports.gex_set_stdin(sp, opts.stdin.length);
     }
+    // The bundle goes over before the program does: a dynamic executable
+    // names an interpreter, and the loader reads it out of this filesystem.
+    const enc = new TextEncoder();
+    for (const [path, contents] of Object.entries(files)) {
+      const p = enc.encode(path);
+      const d = contents instanceof Uint8Array ? contents : enc.encode(contents);
+      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+      const dp = this.#shim.exports.gex_alloc(d.length) >>> 0;
+      this.#u8.set(p, pp);
+      this.#u8.set(d, dp);
+      this.#shim.exports.gex_add_file(pp, p.length, dp, d.length);
+    }
+
     const ptr = this.#shim.exports.gex_alloc(elf.length) >>> 0;
     this.#u8.set(elf, ptr);
     const argvBlob = new TextEncoder().encode(args.join('\0'));
@@ -124,16 +137,6 @@ export class Gex {
     const entry = this.#shim.exports.gex_load(ptr, elf.length, ap, argvBlob.length);
     if (entry === 0n) throw new Error('gex: could not load the program');
 
-    const enc = new TextEncoder();
-    for (const [path, contents] of Object.entries(files)) {
-      const p = enc.encode(path);
-      const d = contents instanceof Uint8Array ? contents : enc.encode(contents);
-      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
-      const dp = this.#shim.exports.gex_alloc(d.length) >>> 0;
-      this.#u8.set(p, pp);
-      this.#u8.set(d, dp);
-      this.#shim.exports.gex_add_file(pp, p.length, dp, d.length);
-    }
 
     const e = this.#shim.exports;
     this.#imports = {

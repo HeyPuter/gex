@@ -170,6 +170,39 @@ browser() {
     done
 }
 
+# The same, for a program that needs its interpreter and libraries. A page has
+# no filesystem to reach through, so they are bundled -- and the interpreter's
+# own code, and every library's, only exists once runtime translation reaches
+# it, which is why this can only be a jit run.
+browser_dynamic() {
+    label="$1"; prog="$2"; shift 2
+    shim=target/wasm32-unknown-unknown/release/gex_browser.wasm
+    if [ -z "$NODE" ] || [ ! -f "$shim" ] || [ -z "$DYNAMIC" ]; then
+        return
+    fi
+    prog="$(cd "$(dirname "$prog")" && pwd)/$(basename "$prog")"
+    bundle=""
+    for lib in "$SYSROOT"/lib/*; do
+        [ -f "$lib" ] || continue
+        bundle="$bundle --file /lib/$(basename "$lib")=$(cd "$(dirname "$lib")" && pwd)/$(basename "$lib")"
+    done
+    wasm="$WORK/$label.dyn.wasm"
+    set +e
+    "$GEXC" build --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1
+    "$QEMU" -L "$SYSROOT" "$prog" "$@" >"$WORK/$label.qemu3" 2>&1
+    # shellcheck disable=SC2086
+    "$NODE" shims/browser/js/run-node.mjs $bundle "$wasm" "$prog" "$@" >"$WORK/$label.dyn.br" 2>&1
+    set -e
+    if ! cmp -s "$WORK/$label.qemu3" "$WORK/$label.dyn.br"; then
+        echo "FAIL browser-dynamic-$label: the browser runtime and QEMU disagree"
+        diff -u "$WORK/$label.qemu3" "$WORK/$label.dyn.br" | head -20 || true
+        fail=$((fail + 1))
+        return
+    fi
+    echo "ok   browser-dynamic-$label"
+    pass=$((pass + 1))
+}
+
 # Recover the label from a compare() argument list, whatever options precede it.
 label_of() {
     while :; do
@@ -371,6 +404,15 @@ browser "threads" "$WORK/threads"
 browser "thread-exit-race" "$WORK/exitrace"
 if [ -n "$CPP" ]; then
     browser "cpp" "$WORK/cpp"
+fi
+# Dynamically linked, in the browser: musl's own loader runs translated, and
+# every library's code arrives through the dispatch miss.
+for area in arith float mem flow; do
+    browser_dynamic "suite-$area" "$WORK/dyn-suite" "$area"
+done
+browser_dynamic "vector" "$WORK/dyn-vector"
+if [ -n "$CPP" ] && [ -f "$WORK/dyn-cpp" ]; then
+    browser_dynamic "cpp" "$WORK/dyn-cpp"
 fi
 compare "threads" "$WORK/threads"
 compare "thread-exit-race" "$WORK/exitrace"
