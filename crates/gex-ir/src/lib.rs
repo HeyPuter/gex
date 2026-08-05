@@ -301,11 +301,21 @@ pub enum Expr {
     /// A vector literal.
     VConst(Box<[u8; 16]>),
     /// Replicate a scalar into every `lane_bytes`-sized lane.
-    VSplat { a: Value, lane_bytes: u32 },
+    VSplat {
+        a: Value,
+        lane_bytes: u32,
+    },
     /// Bitwise operation on two vectors.
-    VBin { op: VBinOp, a: Value, b: Value },
+    VBin {
+        op: VBinOp,
+        a: Value,
+        b: Value,
+    },
     /// Lane-wise unary operation on a vector.
-    VUn { op: VUnOp, a: Value },
+    VUn {
+        op: VUnOp,
+        a: Value,
+    },
     /// Lane-wise binary operation.
     VLaneBin {
         op: VLaneBinOp,
@@ -338,7 +348,10 @@ pub enum Expr {
     },
     /// Byte-level permutation by a runtime index vector; out-of-range indices
     /// produce zero, which is what `tbl` with a single table register does.
-    VSwizzle { a: Value, idx: Value },
+    VSwizzle {
+        a: Value,
+        idx: Value,
+    },
     /// `(a & mask) | (b & !mask)`.
     VBitSelect {
         mask: Value,

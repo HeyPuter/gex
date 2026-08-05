@@ -90,8 +90,14 @@ pub fn default_action(signal: u32) -> DefaultAction {
     match signal {
         sig::SIGCHLD | sig::SIGCONT | sig::SIGWINCH | 29 => DefaultAction::Ignore,
         sig::SIGSTOP | sig::SIGTSTP | 21 | 22 => DefaultAction::Stop,
-        sig::SIGQUIT | sig::SIGILL | sig::SIGTRAP | sig::SIGABRT | sig::SIGBUS | sig::SIGFPE
-        | sig::SIGSEGV | sig::SIGSYS => DefaultAction::Core,
+        sig::SIGQUIT
+        | sig::SIGILL
+        | sig::SIGTRAP
+        | sig::SIGABRT
+        | sig::SIGBUS
+        | sig::SIGFPE
+        | sig::SIGSEGV
+        | sig::SIGSYS => DefaultAction::Core,
         _ => DefaultAction::Terminate,
     }
 }
@@ -281,7 +287,10 @@ pub fn setup_frame(
     // synchronous signals, which is what a crash handler reads.
     m.write_u32(frame_addr, signal)?;
     m.write_u32(frame_addr + 8, fault_code(signal))?;
-    if matches!(signal, sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE) {
+    if matches!(
+        signal,
+        sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE
+    ) {
         m.write_u64(frame_addr + 16, fault_address)?;
     }
 
@@ -338,11 +347,7 @@ pub fn setup_frame(
 }
 
 /// Restore the context a handler frame captured. Returns the resume address.
-pub fn sigreturn(
-    signals: &mut Signals,
-    m: &mut GuestMem<'_>,
-    ctx_addr: u64,
-) -> Result<u64, Errno> {
+pub fn sigreturn(signals: &mut Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
     // The frame is at the stack pointer the handler was entered with, which
     // it is required to have preserved.
     let frame_addr = m.read_u64(ctx_addr + ctx::SP as u64)?;
@@ -386,10 +391,7 @@ pub fn dispatch(
             // Stopping needs a scheduler to resume from; until then it ends
             // the process, which is at least visible rather than a silent
             // hang.
-            DefaultAction::Core | DefaultAction::Stop => Delivery::Terminate {
-                signal,
-                core: true,
-            },
+            DefaultAction::Core | DefaultAction::Stop => Delivery::Terminate { signal, core: true },
             _ => Delivery::Terminate {
                 signal,
                 core: false,
@@ -450,7 +452,8 @@ mod tests {
             m.write_u64(CTX + ctx::SP as u64, 0x40000).unwrap();
             m.write_u64(CTX + ctx::PC as u64, 0x400100).unwrap();
             for i in 0..31u8 {
-                m.write_u64(CTX + ctx::x(i) as u64, 0x1000 + i as u64).unwrap();
+                m.write_u64(CTX + ctx::x(i) as u64, 0x1000 + i as u64)
+                    .unwrap();
             }
         }
         (buf, Signals::new())

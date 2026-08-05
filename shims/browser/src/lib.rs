@@ -19,13 +19,14 @@
 //!
 //! # Status
 //!
-//! Runs static programs. The suite checks three of them -- including the NEON
-//! and fixed-point ones -- against QEMU on every invocation.
+//! Runs static programs, including real ones: Lua 5.4 passes all sixteen of
+//! its own conformance files here byte-for-byte against QEMU. The suite
+//! checks twelve programs on every invocation -- the whole conformance suite,
+//! the VFS, signals, NEON and C++ exceptions.
 //!
 //! Not yet: threads (one Worker each, and the memory would have to be
-//! declared shared), `fork`, runtime translation, and a clock, so a program
-//! that calls `clock_gettime` gets whatever `gex-kernel`'s wasm32 build does
-//! rather than the time.
+//! declared shared), `fork`, and runtime translation, so a module must be
+//! built with `--exhaustive`.
 //!
 //! # What JS still does
 //!
@@ -57,6 +58,12 @@ extern "C" {
     fn now() -> i64;
 }
 
+/// The host's clock, in the shape `gex-kernel` wants.
+fn browser_clock() -> (u64, u32) {
+    let ns = unsafe { now() } as u64;
+    (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
+}
+
 /// stdout and stderr, as the host's console.
 ///
 /// `gex-kernel`'s own `StdStream` writes through `std::io`, which on
@@ -80,11 +87,26 @@ impl FileHandle for Console {
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata::regular(0))
+        Ok(Metadata {
+            file_type: gex_kernel::vfs::FileType::Fifo,
+            size: 0,
+            mode: 0o600,
+            ino: 1,
+            mtime: 0,
+        })
     }
 
-    fn is_tty(&self) -> bool {
+    /// A console is not seekable, so writes must not advance an offset.
+    fn is_stream(&self) -> bool {
         true
+    }
+
+    /// Not a terminal. A page's console looks like one, but saying so makes
+    /// musl line-buffer stdout, and then a program's bytes interleave
+    /// differently from the same program's under a pipe -- which is what
+    /// every comparison in the suite runs the reference against.
+    fn is_tty(&self) -> bool {
+        false
     }
 }
 
@@ -142,6 +164,11 @@ unsafe impl std::alloc::GlobalAlloc for Heap {
 
 struct Host {
     kernel: Kernel,
+    /// The root filesystem, kept so files can be added before the guest runs.
+    root: Arc<gex_kernel::vfs::TmpFs>,
+    /// The snapshot `/proc` reads from, refreshed before each syscall that
+    /// could look at it.
+    proc_state: Arc<gex_kernel::KernelProcSource>,
     thread: ThreadState,
     exit: Option<i32>,
     resume: Option<u64>,
@@ -218,7 +245,7 @@ pub extern "C" fn gex_alloc(len: usize) -> u32 {
 /// Load a static ELF that JS has written at `ptr`, place it and its stack, and
 /// return the entry point. Zero means the image could not be loaded.
 #[no_mangle]
-pub extern "C" fn gex_load(ptr: u32, len: u32) -> u64 {
+pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 {
     // The ELF sits in the shim's own heap, above the guest's limit, so it is
     // reached through its own pointer rather than through the guest slice.
     let bytes = unsafe {
@@ -237,14 +264,42 @@ pub extern "C" fn gex_load(ptr: u32, len: u32) -> u64 {
     }
 
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), image.brk, String::new());
-    kernel.vfs.mount("/", Arc::new(gex_kernel::vfs::TmpFs::new()));
-    kernel.vfs.mount("/dev", Arc::new(gex_kernel::vfs::DevFs::new()));
+    let root = Arc::new(gex_kernel::vfs::TmpFs::new());
+    kernel.vfs.mount("/", root.clone());
+    kernel
+        .vfs
+        .mount("/dev", Arc::new(gex_kernel::vfs::DevFs::new()));
+    // `/tmp` on its own filesystem, so a program that writes scratch files
+    // does not have them turn up in the bundle the page loaded.
+    root.add_dir("/tmp");
+    kernel
+        .vfs
+        .mount("/tmp", Arc::new(gex_kernel::vfs::TmpFs::new()));
+    // `/proc` matters more here than it looks: a program that cannot open
+    // `/proc/self/maps` gets a null `FILE*` back, and the next `fgets` calls
+    // through it. That surfaces as a jump to address zero -- a dispatch miss
+    // at pc=0 -- with nothing to say the filesystem was the cause.
+    root.add_dir("/proc");
+    let proc_state: Arc<gex_kernel::KernelProcSource> = Arc::new(gex_kernel::KernelProcSource(
+        std::sync::Mutex::new(Default::default()),
+    ));
+    kernel.vfs.mount(
+        "/proc",
+        Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
+    );
+    kernel.clock = browser_clock;
+    kernel.uid = unsafe { IDENTITY.0 };
     // Replace the descriptors `Kernel::new` opened on `std::io` with ones the
     // host can actually see.
     for fd in [1, 2] {
         let f = OpenFile::new(
             Arc::new(Console { fd }),
-            if fd == 1 { "/dev/stdout" } else { "/dev/stderr" }.to_string(),
+            if fd == 1 {
+                "/dev/stdout"
+            } else {
+                "/dev/stderr"
+            }
+            .to_string(),
             0,
             false,
             true,
@@ -267,18 +322,45 @@ pub extern "C" fn gex_load(ptr: u32, len: u32) -> u64 {
         if seg.executable {
             p |= gex_kernel::mem::prot::EXEC;
         }
-        kernel.mem.insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]");
+        kernel
+            .mem
+            .insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]");
     }
 
+    // argv arrives as a NUL-separated blob in the shim's own region.
+    let args: Vec<String> = if argv_len == 0 {
+        vec!["prog".to_string()]
+    } else {
+        let blob = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::with_exposed_provenance::<u8>(std::hint::black_box(argv as usize)),
+                argv_len as usize,
+            )
+        };
+        blob.split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect()
+    };
+    let env = ["PATH=/usr/bin:/bin".to_string(), "HOME=/root".to_string()];
+    // `/proc/self/{cmdline,exe}` read these. A relative argv[0] is resolved
+    // against the root, which is where a bundled program lives.
+    kernel.exe_path = if args[0].starts_with('/') {
+        args[0].clone()
+    } else {
+        format!("/{}", args[0])
+    };
+    kernel.argv = args.clone();
+    kernel.envp = env.to_vec();
     let layout = gex_ld::build_initial_stack(
         &image,
         GUEST_LIMIT,
-        &["prog".to_string()],
-        &["PATH=/usr/bin:/bin".to_string(), "HOME=/root".to_string()],
+        &args,
+        &env,
         *b"gexdeterministic",
         gex_ld::Identity {
-            uid: 1000,
-            gid: 1000,
+            uid: unsafe { IDENTITY.0 },
+            gid: unsafe { IDENTITY.1 },
             interp_base: 0,
         },
     );
@@ -304,12 +386,88 @@ pub extern "C" fn gex_load(ptr: u32, len: u32) -> u64 {
     HOST.with(|h| {
         *h.borrow_mut() = Some(Host {
             kernel,
+            root,
+            proc_state,
             thread: ThreadState::new(gex_abi::ctx_addr(0), 1),
             exit: None,
             resume: None,
         });
     });
     entry
+}
+
+/// Put a file into the guest's filesystem, before it runs.
+///
+/// A browser has no filesystem to pass through to, so the page bundles what
+/// the program needs: a script to interpret, data to read. Both pointers are
+/// into the shim's own region, written by JS after [`gex_alloc`].
+#[no_mangle]
+pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u32) {
+    let shim_slice = |p: u32, n: u32| -> &'static [u8] {
+        // The shim's own heap is above the guest's limit, so it is reached
+        // through its own pointer rather than through `guest_bytes`.
+        unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::with_exposed_provenance::<u8>(std::hint::black_box(p as usize)),
+                n as usize,
+            )
+        }
+    };
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return;
+    };
+    let bytes = shim_slice(data, data_len).to_vec();
+    with_host(|h| {
+        // Directories along the way, so a nested path resolves.
+        let mut at = String::new();
+        for part in name
+            .trim_start_matches('/')
+            .split('/')
+            .rev()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            at.push('/');
+            at.push_str(part);
+            h.root.add_dir(&at);
+        }
+        h.root.add_file(name, bytes);
+    });
+}
+
+/// The identity the guest is given, which the embedder may override before
+/// loading. A page has no user, so 1000 is as good an answer as any; Node
+/// passes its own so a comparison against QEMU on the same machine agrees.
+static mut IDENTITY: (u32, u32) = (1000, 1000);
+
+#[no_mangle]
+pub extern "C" fn gex_set_identity(uid: i32, gid: i32) {
+    unsafe { IDENTITY = (uid as u32, gid as u32) };
+}
+
+/// Whether to narrate every syscall to fd 2, the browser's `--strace`.
+///
+/// `gex-kernel`'s own tracing writes with `eprintln!`, which on
+/// `wasm32-unknown-unknown` goes nowhere, so the shim prints its own -- in the
+/// same shape as the native host's, so the two traces diff directly. That
+/// diff is the only way to see what a guest is doing differently under V8,
+/// which is where every browser-only bug so far has been found.
+static mut TRACE: bool = false;
+
+#[no_mangle]
+pub extern "C" fn gex_set_trace(on: i32) {
+    unsafe { TRACE = on != 0 };
+}
+
+fn tracing() -> bool {
+    unsafe { TRACE }
+}
+
+/// Write a line to fd 2 without going through the guest's descriptor table.
+fn trace_line(s: &str) {
+    unsafe { write(2, s.as_ptr() as u32, s.len() as u32) };
 }
 
 /// `svc #0`.
@@ -321,9 +479,45 @@ pub extern "C" fn gex_load(ptr: u32, len: u32) -> u64 {
 /// the common path entirely.
 #[no_mangle]
 pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
+    if tracing() {
+        let gm = GuestMem::new(guest_bytes());
+        let base = gex_abi::ctx_addr(0);
+        let g = |i: usize| gm.read_u64(base + ctx::x(i as u8) as u64).unwrap_or(0);
+        let n = g(8);
+        trace_line(&format!(
+            "[gex] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}) ...\n",
+            gex_kernel::syscalls::syscall_name(n),
+            g(0),
+            g(1),
+            g(2)
+        ));
+        // For a gather write, what the kernel sees at each iovec. A wrong
+        // byte here and a right one in the guest means the two disagree about
+        // the memory they share, which is the failure mode this host has.
+        if n == 66 {
+            for i in 0..g(2).min(8) {
+                let e = g(1) + i * 16;
+                let (base, len) = (
+                    gm.read_u64(e).unwrap_or(0),
+                    gm.read_u64(e + 8).unwrap_or(0).min(32),
+                );
+                let bytes = gm.read(base, len as usize).unwrap_or(&[]);
+                trace_line(&format!("[gex]   iov[{i}] {base:#x}+{len} {bytes:02x?}\n"));
+            }
+        }
+    }
     let stop = with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         h.kernel.enter_thread(&h.thread);
+        // Rebuilding the snapshot costs more than most syscalls do, and only
+        // a handful can observe it, so the rest skip it.
+        let nr = gm
+            .read_u64(h.thread.ctx_addr + ctx::x(8) as u64)
+            .unwrap_or(!0);
+        if !gex_kernel::skips_proc_snapshot(nr) {
+            let st = Arc::clone(&h.proc_state);
+            h.kernel.refresh_proc(&st.0);
+        }
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
         h.kernel.leave_thread(&mut h.thread);
         match outcome {
@@ -348,6 +542,13 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
             }
         }
     });
+    if tracing() {
+        let gm = GuestMem::new(guest_bytes());
+        let x0 = gm
+            .read_u64(gex_abi::ctx_addr(0) + ctx::x(0) as u64)
+            .unwrap_or(0);
+        trace_line(&format!("[gex]   = {}\n", x0 as i64));
+    }
     if stop != 0 {
         trap();
     }
@@ -389,30 +590,66 @@ pub extern "C" fn gex_fma(_ctx: i32, a: i64, b: i64, c: i64, double: i32) -> i64
 }
 
 #[no_mangle]
-pub extern "C" fn gex_illegal(_ctx: i32, _pc: i64, _raw: i32) {
+pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
+    trace_line(&format!(
+        "gex: illegal instruction {:#010x} at pc={:#x}\n",
+        raw as u32, pc
+    ));
     with_host(|h| h.exit = Some(128 + 4));
     trap();
 }
 #[no_mangle]
-pub extern "C" fn gex_breakpoint(_ctx: i32, _pc: i64, _raw: i32) {
+pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, _raw: i32) {
+    trace_line(&format!("gex: breakpoint at pc={pc:#x}\n"));
     with_host(|h| h.exit = Some(128 + 5));
     trap();
 }
 #[no_mangle]
-pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, _reg: i32) -> i64 {
-    0
+pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
+    match reg {
+        // CNTVCT_EL0, at the frequency the lifter tells the guest CNTFRQ is,
+        // so the guest's own arithmetic on it comes out exact.
+        -3 => unsafe { now() },
+        // MIDR_EL1: a plausible Cortex-A72, the same one the native host
+        // claims to be.
+        -7 => 0x410f_d083,
+        _ => 0,
+    }
 }
 #[no_mangle]
 pub extern "C" fn gex_sysreg_write(_ctx: i32, _pc: i64, _reg: i32, _val: i64) {}
+
+/// Cache maintenance.
+///
+/// Only `dc zva` does anything, and it has to: the lifter reports a 64-byte
+/// block through `DCZID_EL0`, and musl's `memset` zeroes whole blocks with it
+/// rather than storing. Leaving it a no-op means large `memset`s silently
+/// don't zero -- which showed up as Lua printing stale bytes where it had
+/// formatted a number, three layers down inside `vsnprintf`.
 #[no_mangle]
-pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, _op: i32, _addr: i64) {}
+pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
+    if op != gex_abi::cache_op::DC_ZVA {
+        // Clean, invalidate and barrier are all no-ops: the memory is
+        // coherent and nothing here translates at runtime yet.
+        return;
+    }
+    let block = gex_abi::DCZID_BLOCK_BYTES as usize;
+    let start = (addr as u64 & !(gex_abi::DCZID_BLOCK_BYTES - 1)) as usize;
+    let mem = guest_bytes();
+    if let Some(dst) = mem.get_mut(start..start + block) {
+        dst.fill(0);
+    }
+}
 #[no_mangle]
 pub extern "C" fn gex_safepoint(_ctx: i32, _pc: i64) {}
 
 /// A dispatch miss, with no runtime translator behind it. A module built with
 /// `--exhaustive` should never reach one.
 #[no_mangle]
-pub extern "C" fn gex_dispatch_miss(_ctx: i32, _pc: i64) -> i32 {
+pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
+    // Silence here is the worst outcome: the guest simply stops, and the
+    // exit status looks like a segfault it never took.
+    trace_line(&format!("gex: no translation for pc={pc:#x}\n"));
     with_host(|h| h.exit = Some(128 + 11));
     trap();
 }

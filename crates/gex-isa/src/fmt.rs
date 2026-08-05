@@ -257,11 +257,19 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
         } => {
             if set_flags && rd == RegSel::Zr {
                 let alias = if op == AddOp::Sub { "cmp" } else { "cmn" };
-                return format!("{alias} {}, {}", reg(rn, sz), shifted(rm, sz, shift, amount));
+                return format!(
+                    "{alias} {}, {}",
+                    reg(rn, sz),
+                    shifted(rm, sz, shift, amount)
+                );
             }
             if op == AddOp::Sub && rn == RegSel::Zr {
                 let alias = if set_flags { "negs" } else { "neg" };
-                return format!("{alias} {}, {}", reg(rd, sz), shifted(rm, sz, shift, amount));
+                return format!(
+                    "{alias} {}, {}",
+                    reg(rd, sz),
+                    shifted(rm, sz, shift, amount)
+                );
             }
             format!(
                 "{} {}, {}, {}",
@@ -283,11 +291,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
         } => {
             if set_flags && rd == RegSel::Zr {
                 let alias = if op == AddOp::Sub { "cmp" } else { "cmn" };
-                return format!(
-                    "{alias} {}, {}",
-                    reg(rn, sz),
-                    extended(rm, sz, ext, amount)
-                );
+                return format!("{alias} {}, {}", reg(rn, sz), extended(rm, sz, ext, amount));
             }
             format!(
                 "{} {}, {}, {}",
@@ -426,11 +430,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 Some(r) => reg(r, sz),
                 None => format!("#{v}"),
             };
-            format!(
-                "{m} {}, {second}, #{nzcv}, {}",
-                reg(rn, sz),
-                cond.name()
-            )
+            format!("{m} {}, {second}, #{nzcv}, {}", reg(rn, sz), cond.name())
         }
         Inst::DataProc1 { sz, op, rd, rn } => {
             let m = match op {
@@ -494,7 +494,12 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                     Dp3Op::Umsubl => "umnegl",
                     _ => unreachable!(),
                 };
-                return format!("{alias} {}, {}, {}", reg(rd, sz), reg(rn, ssz), reg(rm, ssz));
+                return format!(
+                    "{alias} {}, {}, {}",
+                    reg(rd, sz),
+                    reg(rn, ssz),
+                    reg(rm, ssz)
+                );
             }
             format!(
                 "{m} {}, {}, {}, {}",
@@ -626,9 +631,18 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             rt2,
             ref addr,
         } => {
-            let rsz = if sz == MemSz::D || signed { Sz::X } else { Sz::W };
+            let rsz = if sz == MemSz::D || signed {
+                Sz::X
+            } else {
+                Sz::W
+            };
             let m = if signed { "ldpsw" } else { "ldp" };
-            format!("{m} {}, {}, {}", reg(rt, rsz), reg(rt2, rsz), addr_str(addr))
+            format!(
+                "{m} {}, {}, {}",
+                reg(rt, rsz),
+                reg(rt2, rsz),
+                addr_str(addr)
+            )
         }
         Inst::StorePair {
             sz,
@@ -637,7 +651,12 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             ref addr,
         } => {
             let rsz = if sz == MemSz::D { Sz::X } else { Sz::W };
-            format!("stp {}, {}, {}", reg(rt, rsz), reg(rt2, rsz), addr_str(addr))
+            format!(
+                "stp {}, {}, {}",
+                reg(rt, rsz),
+                reg(rt2, rsz),
+                addr_str(addr)
+            )
         }
         Inst::Prefetch { ref addr, hint } => {
             // `Rt` is really three fields: what to prefetch, into which cache
@@ -1028,7 +1047,13 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             )
         }
 
-        Inst::VSelect { kind, vd, vn, vm, q } => {
+        Inst::VSelect {
+            kind,
+            vd,
+            vn,
+            vm,
+            q,
+        } => {
             let w = if q { "16b" } else { "8b" };
             let m = match kind {
                 VSelKind::Bsl => "bsl",
@@ -1045,7 +1070,12 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             vm,
         } => {
             let m = vop3_name(op);
-            format!("{m} {}, {}, {}", areg(vd, arr), areg(vn, arr), areg(vm, arr))
+            format!(
+                "{m} {}, {}, {}",
+                areg(vd, arr),
+                areg(vn, arr),
+                areg(vm, arr)
+            )
         }
         Inst::VTwoMisc { op, arr, vd, vn } => {
             let m = vop2_name(op);
@@ -1053,11 +1083,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             // The compare-with-zero forms print the zero operand.
             if matches!(
                 op,
-                VOp2::CmEqZero
-                    | VOp2::CmGtZero
-                    | VOp2::CmGeZero
-                    | VOp2::CmLtZero
-                    | VOp2::CmLeZero
+                VOp2::CmEqZero | VOp2::CmGtZero | VOp2::CmGeZero | VOp2::CmLtZero | VOp2::CmLeZero
             ) {
                 return format!("{m} {}, {}, #0", areg(vd, arr), areg(vn, arr));
             }
@@ -1104,7 +1130,12 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 VPermOp::Zip1 => "zip1",
                 VPermOp::Zip2 => "zip2",
             };
-            format!("{m} {}, {}, {}", areg(vd, arr), areg(vn, arr), areg(vm, arr))
+            format!(
+                "{m} {}, {}, {}",
+                areg(vd, arr),
+                areg(vn, arr),
+                areg(vm, arr)
+            )
         }
         Inst::VExt {
             vd,
@@ -1180,10 +1211,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             src_index,
         } => {
             let t = lane_letter(lane_bytes);
-            format!(
-                "mov v{}.{t}[{dst_index}], v{}.{t}[{src_index}]",
-                vd.0, vn.0
-            )
+            format!("mov v{}.{t}[{dst_index}], v{}.{t}[{src_index}]", vd.0, vn.0)
         }
         Inst::VShiftImm {
             op,
@@ -1328,7 +1356,11 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 float: true,
                 scalar: false,
             };
-            let (d, s) = if widen { (wide, narrow) } else { (narrow, wide) };
+            let (d, s) = if widen {
+                (wide, narrow)
+            } else {
+                (narrow, wide)
+            };
             format!(
                 "fcvt{}{} v{}.{}, v{}.{}",
                 if widen { 'l' } else { 'n' },
@@ -1698,11 +1730,7 @@ fn fmt_bitfield(sz: Sz, op: BfOp, rd: RegSel, rn: RegSel, immr: u32, imms: u32) 
             if imms >= immr {
                 return format!("ubfx {d}, {n}, #{immr}, #{}", imms - immr + 1);
             }
-            format!(
-                "ubfiz {d}, {n}, #{}, #{}",
-                bits - immr,
-                imms + 1
-            )
+            format!("ubfiz {d}, {n}, #{}, #{}", bits - immr, imms + 1)
         }
         BfOp::Sbfm => {
             if imms == bits - 1 {

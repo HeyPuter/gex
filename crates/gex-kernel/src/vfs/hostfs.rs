@@ -85,7 +85,9 @@ impl FileHandle for HostHandle {
         let mut f = self.file.lock().unwrap();
         f.seek(SeekFrom::Start(offset))
             .map_err(|e| Errno::from_io(&e))?;
-        f.read(buf).map(|n| n as u64).map_err(|e| Errno::from_io(&e))
+        f.read(buf)
+            .map(|n| n as u64)
+            .map_err(|e| Errno::from_io(&e))
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> SysResult {
@@ -230,8 +232,7 @@ impl FileSystem for HostFs {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        std::fs::rename(self.host_path(from)?, self.host_path(to)?)
-            .map_err(|e| Errno::from_io(&e))
+        std::fs::rename(self.host_path(from)?, self.host_path(to)?).map_err(|e| Errno::from_io(&e))
     }
 
     fn symlink(&self, target: &str, path: &str) -> Result<(), Errno> {
@@ -277,7 +278,10 @@ mod tests {
         let dir = scratch();
         std::fs::write(dir.join("ro.txt"), b"x").unwrap();
         let fs = HostFs::read_only(&dir);
-        assert_eq!(fs.open("ro.txt", oflags::O_WRONLY, 0).err(), Some(Errno::EROFS));
+        assert_eq!(
+            fs.open("ro.txt", oflags::O_WRONLY, 0).err(),
+            Some(Errno::EROFS)
+        );
         assert!(fs.open("ro.txt", oflags::O_RDONLY, 0).is_ok());
     }
 }

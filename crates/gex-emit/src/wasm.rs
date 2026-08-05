@@ -377,11 +377,18 @@ impl FuncBody {
 
 /// What kind of thing an import brings in.
 pub enum ImportKind {
-    Func { ty: u32 },
+    Func {
+        ty: u32,
+    },
     /// A memory with the given minimum size in pages.
-    Memory { pages: u64, shared: bool },
+    Memory {
+        pages: u64,
+        shared: bool,
+    },
     /// A funcref table with the given minimum size.
-    Table { min: u32 },
+    Table {
+        min: u32,
+    },
 }
 
 /// An import.

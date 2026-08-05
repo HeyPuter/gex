@@ -16,9 +16,7 @@
 //!   block needs a handful of locals rather than one per SSA value.
 
 use crate::wasm::{FuncBody, ValType};
-use gex_abi::{
-    ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE, GUEST_LIMIT, POISON_ADDR,
-};
+use gex_abi::{ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE, GUEST_LIMIT, POISON_ADDR};
 use gex_ir::*;
 use std::collections::HashMap;
 
@@ -384,7 +382,13 @@ impl<'a> Emitter<'a> {
             Ty::V128 => self.f.simd_mem(simd::V128_LOAD, 4, Self::reg_offset(r)),
         }
         self.f.local_set(local);
-        self.regs.insert(r, Cached { local, dirty: false });
+        self.regs.insert(
+            r,
+            Cached {
+                local,
+                dirty: false,
+            },
+        );
         local
     }
 
@@ -764,6 +768,13 @@ impl<'a> Emitter<'a> {
                 self.f.simd(lane_shift_op(*op, *lane));
             }
             Expr::VShuffle { a, b, lanes } => {
+                // A lane index above 31 is not merely wrong, it makes the
+                // module unloadable: V8 validates shuffle masks when it
+                // compiles, so one bad mask anywhere rejects everything.
+                debug_assert!(
+                    lanes.iter().all(|l| *l < 32),
+                    "shuffle mask out of range: {lanes:?}"
+                );
                 self.push(*a);
                 self.push(*b);
                 self.f.simd_shuffle(lanes);
@@ -1120,8 +1131,7 @@ impl<'a> Emitter<'a> {
                 self.flush();
                 self.f.local_get(self.ctx_local);
                 self.emit_dispatch_index();
-                self.f
-                    .return_call_indirect(self.cx.block_ty, 0);
+                self.f.return_call_indirect(self.cx.block_ty, 0);
             }
             Term::Syscall { next } => {
                 self.flush();

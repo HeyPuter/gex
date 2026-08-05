@@ -277,10 +277,7 @@ fn cmd_disasm(args: &[String]) -> Result<()> {
             }
             let raw = u32::from_le_bytes(word.try_into().unwrap());
             let inst = gex_isa::decode(raw, pc);
-            println!(
-                "{pc:8x}:\t{raw:08x}\t{}",
-                gex_isa::fmt::disasm(&inst, pc)
-            );
+            println!("{pc:8x}:\t{raw:08x}\t{}", gex_isa::fmt::disasm(&inst, pc));
         }
     }
     Ok(())

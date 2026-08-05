@@ -13,12 +13,10 @@ use gex_abi::{ctx, exports, imports, GUEST_MEM_PAGES, IMPORT_MODULE};
 use gex_kernel::mem::prot;
 use gex_kernel::vfs::{DevFs, HostFs, ProcFs, TmpFs};
 use gex_kernel::{BlockOp, GuestMem, Kernel, ProcState, SyscallOutcome, ThreadState};
-use std::sync::{Arc, Mutex};
 use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
-use wasmtime::{
-    Caller, Config, Engine, Extern, Linker, Module, Ref, Store, Table, Val,
-};
+use std::sync::{Arc, Mutex};
+use wasmtime::{Caller, Config, Engine, Extern, Linker, Module, Ref, Store, Table, Val};
 
 /// How a guest run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,7 +419,10 @@ fn run_program_with(
         stats.blocks = meta.n_blocks;
     }
     if opts.verbose {
-        eprintln!("[gex] module ready in {:.2}s", phase.elapsed().as_secs_f64());
+        eprintln!(
+            "[gex] module ready in {:.2}s",
+            phase.elapsed().as_secs_f64()
+        );
     }
     let phase = std::time::Instant::now();
 
@@ -535,10 +536,7 @@ fn run_program_with(
     if opts.jit {
         store.data_mut().jit = Some(Jit {
             shared: Arc::new(Mutex::new(JitShared {
-                page_table: gex_xlate::PageTable::from_entries(
-                    &meta.dir_entries,
-                    meta.next_slot,
-                ),
+                page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
                 translated: Default::default(),
                 registry: Vec::new(),
                 blocks: 0,
@@ -578,7 +576,10 @@ fn run_program_with(
     }
 
     if opts.verbose {
-        eprintln!("[gex] guest state placed in {:.2}s", phase.elapsed().as_secs_f64());
+        eprintln!(
+            "[gex] guest state placed in {:.2}s",
+            phase.elapsed().as_secs_f64()
+        );
     }
     // Everything a new guest thread needs. The linker here is the pristine
     // one -- only the `gex.*` imports -- because a linker carrying store-bound
@@ -929,11 +930,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
 }
 
 /// Run a child process to completion in this host thread.
-fn run_guest_process(
-    cx: Arc<SpawnContext>,
-    thread: ThreadState,
-    entry: u64,
-) -> Result<Exit> {
+fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> Result<Exit> {
     let mut store = Store::new(
         &cx.engine,
         HostState {
@@ -1183,11 +1180,17 @@ impl gex_kernel::vfs::ProcSource for SharedProc {
     }
     fn stat(&self) -> String {
         let s = self.0.lock().unwrap();
-        format!("{} (gex) R 0 {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0\n", s.pid, s.pid, s.pid)
+        format!(
+            "{} (gex) R 0 {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0\n",
+            s.pid, s.pid, s.pid
+        )
     }
     fn status(&self) -> String {
         let s = self.0.lock().unwrap();
-        format!("Name:\tgex\nState:\tR (running)\nPid:\t{}\nThreads:\t1\n", s.pid)
+        format!(
+            "Name:\tgex\nState:\tR (running)\nPid:\t{}\nThreads:\t1\n",
+            s.pid
+        )
     }
 }
 
@@ -1208,10 +1211,7 @@ fn host_identity() -> (u32, u32) {
             .parse()
             .ok()
     };
-    (
-        field("Uid:").unwrap_or(1000),
-        field("Gid:").unwrap_or(1000),
-    )
+    (field("Uid:").unwrap_or(1000), field("Gid:").unwrap_or(1000))
 }
 
 /// Copy the ELF segments and the initial stack into guest memory.
@@ -1350,7 +1350,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let outcome = if let SyscallOutcome::Blocking(op) = outcome {
                 let r = perform_block(op, memory.bytes());
                 let mut gm = GuestMem::new(memory.bytes());
-                caller.data_mut().with_kernel(|k| k.finish_blocking(&mut gm, r))
+                caller
+                    .data_mut()
+                    .with_kernel(|k| k.finish_blocking(&mut gm, r))
             } else {
                 outcome
             };
@@ -1441,9 +1443,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     .data()
                     .memory
                     .clone()
-                .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
                 let data = memory.bytes();
-            let state = caller.data_mut();
+                let state = caller.data_mut();
                 let mut gm = GuestMem::new(data);
                 return match state.with_kernel(|k| k.sigreturn(&mut gm)) {
                     Ok(target) => {
@@ -1471,9 +1473,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     caller.data_mut().exit = Some(Exit::Signal {
                         signal: signal::SIGSEGV,
                         pc,
-                        detail: format!(
-                            "branch to 0x{pc:x}, which is not executable guest memory"
-                        ),
+                        detail: format!("branch to 0x{pc:x}, which is not executable guest memory"),
                         internal: false,
                     });
                     Err(StopExecution.into())
@@ -1515,9 +1515,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     state.exit = Some(Exit::Signal {
                         signal: signal::SIGILL,
                         pc,
-                        detail: format!(
-                            "instruction 0x{raw:08x} at 0x{pc:x} is not implemented"
-                        ),
+                        detail: format!("instruction 0x{raw:08x} at 0x{pc:x} is not implemented"),
                         internal: true,
                     });
                 }
@@ -1575,7 +1573,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     .data()
                     .memory
                     .clone()
-                .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
                 let data = memory.bytes();
                 let block = gex_abi::DCZID_BLOCK_BYTES;
                 let start = ((addr as u64) & !(block - 1)) as usize;
@@ -1627,8 +1625,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // Rearm before delivering, so a handler that loops still polls.
             let counter = ctx_addr as usize + gex_abi::ctx::SAFEPOINT_COUNTER;
             if counter + 4 <= gm.bytes.len() {
-                gm.bytes[counter..counter + 4]
-                    .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
+                gm.bytes[counter..counter + 4].copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
             }
             // The process may have ended in another thread while this one was
             // running. A safepoint is the only place it is safe to notice.

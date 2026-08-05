@@ -64,4 +64,3 @@ impl Stat {
         b
     }
 }
-

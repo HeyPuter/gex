@@ -237,8 +237,14 @@ mod tests {
     fn the_key_covers_every_field() {
         let a = key("build", [b"program".as_slice(), b"opts".as_slice()]);
         assert_eq!(a, key("build", [b"program".as_slice(), b"opts".as_slice()]));
-        assert_ne!(a, key("build", [b"program!".as_slice(), b"opts".as_slice()]));
-        assert_ne!(a, key("build", [b"program".as_slice(), b"opts!".as_slice()]));
+        assert_ne!(
+            a,
+            key("build", [b"program!".as_slice(), b"opts".as_slice()])
+        );
+        assert_ne!(
+            a,
+            key("build", [b"program".as_slice(), b"opts!".as_slice()])
+        );
         assert_ne!(a, key("build", [b"program".as_slice()]));
         assert_eq!(a.len(), 64);
     }
@@ -308,7 +314,12 @@ mod tests {
 
         let engine = Engine::default();
         // The smallest valid module.
-        let build = || Ok((vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00], b"meta".to_vec()));
+        let build = || {
+            Ok((
+                vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+                b"meta".to_vec(),
+            ))
+        };
         let loaded = load_or_compile(&engine, &dir, k, build).unwrap();
         assert!(!loaded.hit, "a corrupt entry must not count as a hit");
         assert_eq!(loaded.metadata, b"meta");
@@ -326,7 +337,12 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let k = "halfentry";
         let engine = Engine::default();
-        let build = || Ok((vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00], b"m".to_vec()));
+        let build = || {
+            Ok((
+                vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+                b"m".to_vec(),
+            ))
+        };
         load_or_compile(&engine, &dir, k, build).unwrap();
         std::fs::remove_file(dir.join(format!("{k}.meta"))).unwrap();
 

@@ -17,9 +17,10 @@
 
 use gex_ir::*;
 use gex_isa::{
-    AddOp, AddrMode, BarrierKind, BfOp, Cond, Dp1Op, Dp2Op, Dp3Op, Extend, Inst, LogOp, MemSz,
-    MoveOp, Ordering as IsaOrder, RegSel, RmwOp as IsaRmw, ShiftType, Sz, SysMaintOp, SysReg,
-    FpOp1, FpOp2, FpRound, FpSz, VAcrossOp, VArr, VOp2, VOp3, VPermOp, VSelKind, VShiftImmOp, VLogOp, VWidenOp,
+    AddOp, AddrMode, BarrierKind, BfOp, Cond, Dp1Op, Dp2Op, Dp3Op, Extend, FpOp1, FpOp2, FpRound,
+    FpSz, Inst, LogOp, MemSz, MoveOp, Ordering as IsaOrder, RegSel, RmwOp as IsaRmw, ShiftType,
+    SysMaintOp, SysReg, Sz, VAcrossOp, VArr, VLogOp, VOp2, VOp3, VPermOp, VSelKind, VShiftImmOp,
+    VWidenOp,
 };
 
 mod block;
@@ -783,9 +784,12 @@ impl<'a> Lifter<'a> {
                 let mask = self.konst(ty, 1u64 << (bit % ty.bits()));
                 let masked = self.b.bin(BinOp::And, ty, v, mask);
                 let zero = self.konst(ty, 0);
-                let c =
-                    self.b
-                        .cmp(if nonzero { CmpOp::Ne } else { CmpOp::Eq }, ty, masked, zero);
+                let c = self.b.cmp(
+                    if nonzero { CmpOp::Ne } else { CmpOp::Eq },
+                    ty,
+                    masked,
+                    zero,
+                );
                 Flow::End(Term::Branch {
                     cond: c,
                     taken: target,
@@ -1124,10 +1128,7 @@ impl<'a> Lifter<'a> {
                 q,
             } => {
                 let src = self.rd_gp(rn, if lane_bytes == 8 { Sz::X } else { Sz::W });
-                let splat = self.b.def(Expr::VSplat {
-                    a: src,
-                    lane_bytes,
-                });
+                let splat = self.b.def(Expr::VSplat { a: src, lane_bytes });
                 let v = self.narrow_to_64(splat, q);
                 self.b.write(GuestReg::V128(vd.0), v);
                 Flow::Next
@@ -1267,8 +1268,14 @@ impl<'a> Lifter<'a> {
                     // pattern rides in the low half.
                     (
                         self.b.def(Expr::Extend { a, signed: false }),
-                        self.b.def(Expr::Extend { a: b, signed: false }),
-                        self.b.def(Expr::Extend { a: c, signed: false }),
+                        self.b.def(Expr::Extend {
+                            a: b,
+                            signed: false,
+                        }),
+                        self.b.def(Expr::Extend {
+                            a: c,
+                            signed: false,
+                        }),
                     )
                 };
                 let is_double = self.konst(Ty::I32, double as u64);
@@ -1277,11 +1284,7 @@ impl<'a> Lifter<'a> {
                     args: vec![a64, b64, c64, is_double],
                     ty: Ty::I64,
                 });
-                let v = if double {
-                    r
-                } else {
-                    self.b.def(Expr::Wrap(r))
-                };
+                let v = if double { r } else { self.b.def(Expr::Wrap(r)) };
                 self.wr_fp(vd, sz, v);
                 Flow::Next
             }
@@ -1349,18 +1352,31 @@ impl<'a> Lifter<'a> {
                 };
                 let b = widen(self, raw_m);
                 let r = match op {
-                    VWidenOp::AddL | VWidenOp::AddW => {
-                        self.b.def(Expr::VLaneBin { op: VLaneBinOp::Add, lane, a, b })
-                    }
-                    VWidenOp::SubL | VWidenOp::SubW => {
-                        self.b.def(Expr::VLaneBin { op: VLaneBinOp::Sub, lane, a, b })
-                    }
-                    VWidenOp::MulL => {
-                        self.b.def(Expr::VLaneBin { op: VLaneBinOp::Mul, lane, a, b })
-                    }
+                    VWidenOp::AddL | VWidenOp::AddW => self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Add,
+                        lane,
+                        a,
+                        b,
+                    }),
+                    VWidenOp::SubL | VWidenOp::SubW => self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Sub,
+                        lane,
+                        a,
+                        b,
+                    }),
+                    VWidenOp::MulL => self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Mul,
+                        lane,
+                        a,
+                        b,
+                    }),
                     VWidenOp::MlaL | VWidenOp::MlsL => {
-                        let prod =
-                            self.b.def(Expr::VLaneBin { op: VLaneBinOp::Mul, lane, a, b });
+                        let prod = self.b.def(Expr::VLaneBin {
+                            op: VLaneBinOp::Mul,
+                            lane,
+                            a,
+                            b,
+                        });
                         let acc = self.b.read(GuestReg::V128(vd.0));
                         self.b.def(Expr::VLaneBin {
                             op: if op == VWidenOp::MlaL {
@@ -1698,10 +1714,7 @@ impl<'a> Lifter<'a> {
                         order: Order::Relaxed,
                     });
                     let v = if replicate {
-                        let full = self.b.def(Expr::VSplat {
-                            a: val,
-                            lane_bytes,
-                        });
+                        let full = self.b.def(Expr::VSplat { a: val, lane_bytes });
                         // The 64-bit arrangement leaves the upper half zero.
                         self.narrow_to_64(full, q)
                     } else {
@@ -1768,8 +1781,7 @@ impl<'a> Lifter<'a> {
                         let mut sel = [0u8; 16];
                         for i in 0..lanes_each {
                             for k in 0..lb {
-                                sel[(i * lb + k) as usize] =
-                                    ((2 * i + half) * lb + k) as u8;
+                                sel[(i * lb + k) as usize] = ((2 * i + half) * lb + k) as u8;
                             }
                         }
                         let v = self.b.def(Expr::VShuffle {
@@ -1778,8 +1790,7 @@ impl<'a> Lifter<'a> {
                             b: hi,
                         });
                         let v = self.narrow_to_64(v, bytes == 16);
-                        self.b
-                            .write(GuestReg::V128((vt.0 + half as u8) % 32), v);
+                        self.b.write(GuestReg::V128((vt.0 + half as u8) % 32), v);
                     }
                 } else {
                     let v0 = self.b.read(GuestReg::V128(vt.0));
@@ -1933,7 +1944,13 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
-            Inst::VSelect { kind, vd, vn, vm, q } => {
+            Inst::VSelect {
+                kind,
+                vd,
+                vn,
+                vm,
+                q,
+            } => {
                 // All three are one bitselect; they differ only in which
                 // operand supplies the mask and which the alternatives.
                 let d = self.b.read(GuestReg::V128(vd.0));
@@ -2301,7 +2318,12 @@ impl<'a> Lifter<'a> {
         if let Some(bin) = bin {
             // The floating-point max/min share an enum entry with the signed
             // integer ones; the lane type disambiguates them in the backend.
-            let r = self.b.def(Expr::VLaneBin { op: bin, lane, a, b });
+            let r = self.b.def(Expr::VLaneBin {
+                op: bin,
+                lane,
+                a,
+                b,
+            });
             self.commit_vector(vd, arr, r);
             return Flow::Next;
         }
@@ -2427,9 +2449,7 @@ impl<'a> Lifter<'a> {
             VOp2::FrintM => Some(VLaneUnOp::Floor),
             VOp2::FrintZ => Some(VLaneUnOp::Trunc),
             // Ties-to-even stands in for every nearest variant (PLAN §5.7).
-            VOp2::FrintN | VOp2::FrintA | VOp2::FrintX | VOp2::FrintI => {
-                Some(VLaneUnOp::Nearest)
-            }
+            VOp2::FrintN | VOp2::FrintA | VOp2::FrintX | VOp2::FrintI => Some(VLaneUnOp::Nearest),
             _ => None,
         };
         if let Some(un) = un {
@@ -2518,8 +2538,14 @@ impl<'a> Lifter<'a> {
             }
             // The other rounding modes round first, then truncate; the
             // rounded value is already integral so nothing is lost.
-            VOp2::FcvtNs | VOp2::FcvtNu | VOp2::FcvtAs | VOp2::FcvtAu | VOp2::FcvtPs
-            | VOp2::FcvtPu | VOp2::FcvtMs | VOp2::FcvtMu => {
+            VOp2::FcvtNs
+            | VOp2::FcvtNu
+            | VOp2::FcvtAs
+            | VOp2::FcvtAu
+            | VOp2::FcvtPs
+            | VOp2::FcvtPu
+            | VOp2::FcvtMs
+            | VOp2::FcvtMu => {
                 let round = match op {
                     VOp2::FcvtPs | VOp2::FcvtPu => VLaneUnOp::Ceil,
                     VOp2::FcvtMs | VOp2::FcvtMu => VLaneUnOp::Floor,
@@ -2704,13 +2730,7 @@ impl<'a> Lifter<'a> {
     /// `f64x2.convert_i64x2_s` and no `i64x2.trunc_sat_f64x2_s`. For the
     /// 64-bit arrangements the two lanes are therefore converted one at a
     /// time with the scalar instructions, which is still branch-free.
-    fn lane_convert(
-        &mut self,
-        arr: VArr,
-        a: Value,
-        kind: FpConvert,
-        signed: bool,
-    ) -> Value {
+    fn lane_convert(&mut self, arr: VArr, a: Value, kind: FpConvert, signed: bool) -> Value {
         if arr.lane_bytes != 8 {
             let to_fp = matches!(kind, FpConvert::IntToFp { .. });
             let lane = Self::lane_of(arr);
@@ -2862,7 +2882,16 @@ impl<'a> Lifter<'a> {
     // -- instruction families ----------------------------------------------
 
     /// `add`/`sub` with optional flag setting, shared by all operand forms.
-    fn arith(&mut self, ty: Ty, op: AddOp, set_flags: bool, rd: RegSel, sz: Sz, a: Value, b: Value) {
+    fn arith(
+        &mut self,
+        ty: Ty,
+        op: AddOp,
+        set_flags: bool,
+        rd: RegSel,
+        sz: Sz,
+        a: Value,
+        b: Value,
+    ) {
         if !set_flags {
             let v = self.b.bin(
                 if op == AddOp::Add {
@@ -2982,7 +3011,15 @@ impl<'a> Lifter<'a> {
         self.wr_gp(rd, sz, result);
     }
 
-    fn dataproc2(&mut self, sz: Sz, op: Dp2Op, rd: RegSel, rn: RegSel, rm: RegSel, pc: u64) -> Flow {
+    fn dataproc2(
+        &mut self,
+        sz: Sz,
+        op: Dp2Op,
+        rd: RegSel,
+        rn: RegSel,
+        rm: RegSel,
+        pc: u64,
+    ) -> Flow {
         let ty = ty_of(sz);
         let a = self.rd_gp(rn, sz);
         let b = self.rd_gp(rm, sz);

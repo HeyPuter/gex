@@ -86,7 +86,11 @@ fn expr(e: &Expr) -> String {
             if *signed { "s" } else { "u" },
             ty(*t),
             off(*offset),
-            if *order == Order::SeqCst { " seq_cst" } else { "" }
+            if *order == Order::SeqCst {
+                " seq_cst"
+            } else {
+                ""
+            }
         ),
         Expr::Rmw {
             op,
@@ -122,9 +126,7 @@ fn expr(e: &Expr) -> String {
         Expr::VSplat { a, lane_bytes } => format!("splat{} {a:?}", lane_bytes * 8),
         Expr::VBin { op, a, b } => format!("v{op:?} {a:?}, {b:?}").to_lowercase(),
         Expr::VUn { op, a } => format!("v{op:?} {a:?}").to_lowercase(),
-        Expr::VLaneBin { op, lane, a, b } => {
-            format!("{lane:?}.{op:?} {a:?}, {b:?}").to_lowercase()
-        }
+        Expr::VLaneBin { op, lane, a, b } => format!("{lane:?}.{op:?} {a:?}, {b:?}").to_lowercase(),
         Expr::VLaneUn { op, lane, a } => format!("{lane:?}.{op:?} {a:?}").to_lowercase(),
         Expr::VShift {
             op,
@@ -168,11 +170,7 @@ fn expr(e: &Expr) -> String {
             src_wide,
             dst_wide,
             a,
-        } => format!(
-            "fcvt.{kind:?} {}->{} {a:?}",
-            fw(*src_wide),
-            fw(*dst_wide)
-        ),
+        } => format!("fcvt.{kind:?} {}->{} {a:?}", fw(*src_wide), fw(*dst_wide)),
     }
 }
 
@@ -200,7 +198,11 @@ pub fn block(b: &Block) -> String {
                     "  store{} [{addr:?}{}] = {val:?}{}",
                     sz.bytes() * 8,
                     off(*offset),
-                    if *order == Order::SeqCst { " seq_cst" } else { "" }
+                    if *order == Order::SeqCst {
+                        " seq_cst"
+                    } else {
+                        ""
+                    }
                 );
             }
             Stmt::HostCall { func, args } => {
@@ -212,7 +214,12 @@ pub fn block(b: &Block) -> String {
                 val,
                 bytes,
             } => {
-                let _ = writeln!(s, "  vstore{} [{addr:?}{}] = {val:?}", bytes * 8, off(*offset));
+                let _ = writeln!(
+                    s,
+                    "  vstore{} [{addr:?}{}] = {val:?}",
+                    bytes * 8,
+                    off(*offset)
+                );
             }
             Stmt::Fence => {
                 let _ = writeln!(s, "  fence");

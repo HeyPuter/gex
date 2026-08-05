@@ -12,8 +12,8 @@
 use crate::errno::{encode, Errno, SysResult};
 use crate::file::{FdTable, OpenFile, PipeEnd};
 use crate::fs::{oflags, Stat};
-use crate::mem::{flags as mflags, MemoryMap};
 use crate::futex::{self, FutexTable};
+use crate::mem::{flags as mflags, MemoryMap};
 use crate::pipe::Pipe;
 use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
 use crate::stdio::{StdStream, Stream};
@@ -245,6 +245,33 @@ pub struct Kernel {
     /// Next process id to hand out. Shared with `next_tid` in Linux; kept
     /// separate here because gex's pids are its own invention.
     pub next_pid: i32,
+    /// How to read the wall clock.
+    pub clock: ClockFn,
+}
+
+/// How the host tells the time: seconds and nanoseconds since the epoch.
+///
+/// A function rather than a call to `SystemTime`, because there are hosts
+/// without one. `wasm32-unknown-unknown` has no clock at all -- `SystemTime`
+/// panics there -- so the browser host passes its own, and everything else
+/// gets [`system_clock`].
+pub type ClockFn = fn() -> (u64, u32);
+
+/// The clock of a host that has one.
+pub fn system_clock() -> (u64, u32) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        (now.as_secs(), now.subsec_nanos())
+    }
+    // Standing still is wrong but it is not a panic, and a host that cares
+    // replaces this.
+    #[cfg(target_arch = "wasm32")]
+    {
+        (0, 0)
+    }
 }
 
 /// A child process the kernel is tracking.
@@ -377,6 +404,7 @@ impl Kernel {
             live_threads: 1,
             children: Vec::new(),
             next_pid: 1000,
+            clock: system_clock,
         }
     }
 
@@ -433,8 +461,7 @@ impl Kernel {
         m: &GuestMem<'_>,
         a: [u64; 6],
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
-        let bytes_to_string =
-            |b: Vec<u8>| String::from_utf8(b).map_err(|_| Errno::EINVAL);
+        let bytes_to_string = |b: Vec<u8>| String::from_utf8(b).map_err(|_| Errno::EINVAL);
         let path = bytes_to_string(m.read_cstr(a[0], 4096)?)?;
         let read_vec = |mut p: u64| -> Result<Vec<String>, Errno> {
             let mut out = Vec::new();
@@ -491,6 +518,7 @@ impl Kernel {
             live_threads: 1,
             children: Vec::new(),
             next_pid: self.next_pid + 1000,
+            clock: self.clock,
         }
     }
 
@@ -532,15 +560,11 @@ impl Kernel {
             m.write_u64(child + off as u64, v)?;
         }
         m.write_u64(child + ctx::x(0) as u64, 0)?;
-        m.write_u64(child + ctx::SP as u64, child_stack)
-            ?;
-        m.write_u64(child + ctx::MON_SIZE as u64, 0)
-            ?;
-        m.write_u64(child + ctx::TID as u64, tid as u64)
-            ?;
+        m.write_u64(child + ctx::SP as u64, child_stack)?;
+        m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
+        m.write_u64(child + ctx::TID as u64, tid as u64)?;
         if flags & clone_flags::SETTLS != 0 {
-            m.write_u64(child + ctx::TPIDR as u64, tls)
-                ?;
+            m.write_u64(child + ctx::TPIDR as u64, tls)?;
         }
         if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
             m.write_u32(parent_tid, tid as u32)?;
@@ -1029,10 +1053,7 @@ impl Kernel {
         if action.handler == signal::SIG_DFL || action.handler == signal::SIG_IGN || blocked {
             return Delivery::Terminate {
                 signal: signo,
-                core: matches!(
-                    signal::default_action(signo),
-                    signal::DefaultAction::Core
-                ),
+                core: matches!(signal::default_action(signo), signal::DefaultAction::Core),
             };
         }
         if m.write_u64(self.ctx_addr + ctx::PC as u64, pc).is_err() {
@@ -1099,14 +1120,7 @@ impl Kernel {
         Ok(n)
     }
 
-    fn sys_pwrite(
-        &mut self,
-        m: &GuestMem<'_>,
-        fd: i32,
-        buf: u64,
-        len: u64,
-        off: u64,
-    ) -> SysResult {
+    fn sys_pwrite(&mut self, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
         let data = m.read(buf, len as usize)?.to_vec();
         self.fds.get(fd)?.pwrite(off, &data)
     }
@@ -1175,8 +1189,7 @@ impl Kernel {
         let readable = acc == oflags::O_RDONLY || acc == oflags::O_RDWR;
         let writable = acc == oflags::O_WRONLY || acc == oflags::O_RDWR;
         let file = OpenFile::new(handle, p, flags, readable, writable);
-        self.fds
-            .insert(file, flags & oflags::O_CLOEXEC != 0)
+        self.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
     }
 
     fn sys_dup(&mut self, fd: i32) -> SysResult {
@@ -1189,8 +1202,7 @@ impl Kernel {
             return Err(Errno::EINVAL);
         }
         let file = self.fds.get(old)?;
-        self.fds
-            .install(new, file, flags & oflags::O_CLOEXEC != 0)
+        self.fds.install(new, file, flags & oflags::O_CLOEXEC != 0)
     }
 
     fn sys_pipe2(&mut self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
@@ -1291,8 +1303,7 @@ impl Kernel {
         match cmd {
             F_DUPFD | F_DUPFD_CLOEXEC => {
                 let file = self.fds.get(fd)?;
-                self.fds
-                    .insert_at(file, arg as i32, cmd == F_DUPFD_CLOEXEC)
+                self.fds.insert_at(file, arg as i32, cmd == F_DUPFD_CLOEXEC)
             }
             F_GETFD => Ok(self.fds.cloexec(fd)? as u64),
             F_SETFD => {
@@ -1507,11 +1518,9 @@ impl Kernel {
     }
 
     fn sys_clock_gettime(&mut self, m: &mut GuestMem<'_>, _clk: u64, buf: u64) -> SysResult {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        m.write_u64(buf, now.as_secs())?;
-        m.write_u64(buf + 8, now.subsec_nanos() as u64)?;
+        let (secs, nanos) = (self.clock)();
+        m.write_u64(buf, secs)?;
+        m.write_u64(buf + 8, nanos as u64)?;
         Ok(0)
     }
 
@@ -1528,11 +1537,9 @@ impl Kernel {
         if buf == 0 {
             return Ok(0);
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        m.write_u64(buf, now.as_secs())?;
-        m.write_u64(buf + 8, now.subsec_micros() as u64)?;
+        let (secs, nanos) = (self.clock)();
+        m.write_u64(buf, secs)?;
+        m.write_u64(buf + 8, (nanos / 1000) as u64)?;
         Ok(0)
     }
 
@@ -1888,7 +1895,12 @@ mod tests {
             &mut m,
             k.ctx_addr,
             nr::OPENAT,
-            &[(-100i64) as u64, 0x20000, oflags::O_CREAT | oflags::O_RDWR, 0],
+            &[
+                (-100i64) as u64,
+                0x20000,
+                oflags::O_CREAT | oflags::O_RDWR,
+                0,
+            ],
         );
         k.syscall(&mut m, 0);
         let fd = ret(&m, k.ctx_addr) as u64;
@@ -1970,7 +1982,12 @@ mod tests {
             &mut m,
             k.ctx_addr,
             nr::OPENAT,
-            &[(-100i64) as u64, 0x20100, oflags::O_CREAT | oflags::O_RDWR, 0],
+            &[
+                (-100i64) as u64,
+                0x20100,
+                oflags::O_CREAT | oflags::O_RDWR,
+                0,
+            ],
         );
         k.syscall(&mut m, 0);
         assert!(ret(&m, k.ctx_addr) >= 3);
@@ -2002,7 +2019,7 @@ mod tests {
         let (mut buf, mut k) = setup();
         let mut m = GuestMem::new(&mut buf);
         set_args(&mut m, k.ctx_addr, 9999, &[]);
-        assert_eq!(k.syscall(&mut m, 0), SyscallOutcome::Continue);
+        assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue));
         assert_eq!(ret(&m, k.ctx_addr), -38);
         assert_eq!(k.unimplemented, vec![9999]);
     }
@@ -2012,7 +2029,7 @@ mod tests {
         let (mut buf, mut k) = setup();
         let mut m = GuestMem::new(&mut buf);
         set_args(&mut m, k.ctx_addr, nr::EXIT_GROUP, &[7]);
-        assert_eq!(k.syscall(&mut m, 0), SyscallOutcome::Exit(7));
+        assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Exit(7)));
     }
 
     #[test]

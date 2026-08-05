@@ -38,8 +38,11 @@ export class Gex {
   /**
    * `shimWasm` is shims/browser's build output, `guestWasm` a module from
    * `gexc build --exhaustive --no-shared-memory`, `elf` the program's bytes.
+   *
+   * `files` is a map of guest path to contents. A browser has no filesystem to
+   * pass through to, so whatever the program needs to read is bundled here.
    */
-  async load(shimWasm, guestWasm, elf) {
+  async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
     const shimMod = await WebAssembly.compile(shimWasm);
     this.#shim = await WebAssembly.instantiate(shimMod, {
       env: { memory: this.#memory },
@@ -55,6 +58,9 @@ export class Gex {
     // --global-base, which is the guest's image. Move it into the shim's own
     // region, above everything the guest maps. Nothing has run yet.
     this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
+    if (opts.strace) this.#shim.exports.gex_set_trace(1);
+    // A page has no user; an embedder that has one says so.
+    if (opts.uid !== undefined) this.#shim.exports.gex_set_identity(opts.uid, opts.gid ?? opts.uid);
 
     // Hand the ELF across: the shim allocates inside its own region of the
     // shared memory, JS copies into it, and the shim does the rest -- the same
@@ -63,8 +69,25 @@ export class Gex {
     // i32 return arrives in JS signed.
     const ptr = this.#shim.exports.gex_alloc(elf.length) >>> 0;
     this.#u8.set(elf, ptr);
-    const entry = this.#shim.exports.gex_load(ptr, elf.length);
+    const argvBlob = new TextEncoder().encode(args.join('\0'));
+    let ap = 0;
+    if (argvBlob.length) {
+      ap = this.#shim.exports.gex_alloc(argvBlob.length) >>> 0;
+      this.#u8.set(argvBlob, ap);
+    }
+    const entry = this.#shim.exports.gex_load(ptr, elf.length, ap, argvBlob.length);
     if (entry === 0n) throw new Error('gex: could not load the program');
+
+    const enc = new TextEncoder();
+    for (const [path, contents] of Object.entries(files)) {
+      const p = enc.encode(path);
+      const d = contents instanceof Uint8Array ? contents : enc.encode(contents);
+      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+      const dp = this.#shim.exports.gex_alloc(d.length) >>> 0;
+      this.#u8.set(p, pp);
+      this.#u8.set(d, dp);
+      this.#shim.exports.gex_add_file(pp, p.length, dp, d.length);
+    }
 
     const e = this.#shim.exports;
     this.#guest = await WebAssembly.instantiate(await WebAssembly.compile(guestWasm), {

@@ -40,7 +40,10 @@ pub enum LoadError {
     /// The image declares a `PT_INTERP` that could not be loaded.
     NeedsInterpreter(String),
     /// A segment would not fit in the guest address space.
-    SegmentOutOfRange { vaddr: u64, size: u64 },
+    SegmentOutOfRange {
+        vaddr: u64,
+        size: u64,
+    },
     Malformed(&'static str),
 }
 
@@ -208,9 +211,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
             PT_TLS => tls = Some((p_vaddr + bias, p_filesz, p_memsz, r.u64(off + 48)?)),
             PT_LOAD => {
                 let vaddr = p_vaddr + bias;
-                if vaddr.checked_add(p_memsz).is_none()
-                    || vaddr + p_memsz >= gex_abi::GUEST_LIMIT
-                {
+                if vaddr.checked_add(p_memsz).is_none() || vaddr + p_memsz >= gex_abi::GUEST_LIMIT {
                     return Err(LoadError::SegmentOutOfRange {
                         vaddr,
                         size: p_memsz,
@@ -367,7 +368,9 @@ fn read_symbols(
     }
     for i in 0..e_shnum {
         let off = e_shoff + i * e_shentsize;
-        let Ok(sh_type) = r.u32(off + 4) else { continue };
+        let Ok(sh_type) = r.u32(off + 4) else {
+            continue;
+        };
         if sh_type != SHT_SYMTAB {
             continue;
         }

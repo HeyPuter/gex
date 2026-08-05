@@ -43,8 +43,7 @@ pub struct Vma {
 }
 
 /// The process's address space.
-#[derive(Debug)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct MemoryMap {
     vmas: Vec<Vma>,
     brk_start: u64,
@@ -154,7 +153,12 @@ impl MemoryMap {
                 return Ok(start);
             }
             // Skip below the mapping that got in the way.
-            match self.vmas.iter().rev().find(|v| v.start < start + len && v.end > start) {
+            match self
+                .vmas
+                .iter()
+                .rev()
+                .find(|v| v.start < start + len && v.end > start)
+            {
                 Some(v) => candidate = v.start,
                 None => return Err(Errno::ENOMEM),
             }
@@ -280,7 +284,11 @@ impl MemoryMap {
                 if v.prot & prot::READ != 0 { 'r' } else { '-' },
                 if v.prot & prot::WRITE != 0 { 'w' } else { '-' },
                 if v.prot & prot::EXEC != 0 { 'x' } else { '-' },
-                if v.name.is_empty() { "" } else { "                    " },
+                if v.name.is_empty() {
+                    ""
+                } else {
+                    "                    "
+                },
                 v.name,
             ));
         }
@@ -307,8 +315,12 @@ mod tests {
     #[test]
     fn mmap_allocates_downwards_without_overlap() {
         let mut m = MemoryMap::new(0x40_1000);
-        let a = m.mmap(0, 0x1000, prot::READ, flags::ANONYMOUS, "a").unwrap();
-        let b = m.mmap(0, 0x1000, prot::READ, flags::ANONYMOUS, "b").unwrap();
+        let a = m
+            .mmap(0, 0x1000, prot::READ, flags::ANONYMOUS, "a")
+            .unwrap();
+        let b = m
+            .mmap(0, 0x1000, prot::READ, flags::ANONYMOUS, "b")
+            .unwrap();
         assert!(b < a, "expected top-down allocation, got {a:x} then {b:x}");
         assert!(a + 0x1000 <= MMAP_TOP);
         assert_eq!(a % PAGE_SIZE, 0);
@@ -317,7 +329,9 @@ mod tests {
     #[test]
     fn unmap_splits_a_mapping_in_two() {
         let mut m = MemoryMap::new(0x40_1000);
-        let a = m.mmap(0, 0x4000, prot::READ, flags::ANONYMOUS, "x").unwrap();
+        let a = m
+            .mmap(0, 0x4000, prot::READ, flags::ANONYMOUS, "x")
+            .unwrap();
         m.unmap(a + 0x1000, 0x1000).unwrap();
         let covering: Vec<_> = m.vmas().iter().filter(|v| v.name == "x").collect();
         assert_eq!(covering.len(), 2);
@@ -343,7 +357,9 @@ mod tests {
     #[test]
     fn fixed_mapping_replaces_whatever_was_there() {
         let mut m = MemoryMap::new(0x40_1000);
-        let a = m.mmap(0, 0x2000, prot::READ, flags::ANONYMOUS, "x").unwrap();
+        let a = m
+            .mmap(0, 0x2000, prot::READ, flags::ANONYMOUS, "x")
+            .unwrap();
         let got = m
             .mmap(a, 0x1000, prot::WRITE, flags::ANONYMOUS | flags::FIXED, "y")
             .unwrap();

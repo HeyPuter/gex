@@ -215,12 +215,8 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
 pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
     let view = CodeView::new(image);
     let (text_lo, text_hi) = image.text_range;
-    let mut builder = ModuleBuilder::with_linkage(
-        text_lo,
-        text_hi - text_lo,
-        Linkage::Own,
-        opts.shared_memory,
-    );
+    let mut builder =
+        ModuleBuilder::with_linkage(text_lo, text_hi - text_lo, Linkage::Own, opts.shared_memory);
     let mut stats = Stats::default();
 
     // Collect entry points. A BTreeSet keeps translation order deterministic,
@@ -277,7 +273,8 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
                 // is what keeps exhaustive mode affordable — on a static
                 // musl binary it removes about three quarters of the slots.
                 match view.fetch(a).map(|raw| gex_isa::decode(raw, a)) {
-                    Some(gex_isa::Inst::Unknown { .. }) | Some(gex_isa::Inst::Undefined { .. })
+                    Some(gex_isa::Inst::Unknown { .. })
+                    | Some(gex_isa::Inst::Undefined { .. })
                     | None => {}
                     Some(_) => {
                         worklist.insert(a);

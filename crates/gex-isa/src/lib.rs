@@ -198,7 +198,10 @@ impl Extend {
     }
     #[inline]
     pub fn is_signed(self) -> bool {
-        matches!(self, Extend::Sxtb | Extend::Sxth | Extend::Sxtw | Extend::Sxtx)
+        matches!(
+            self,
+            Extend::Sxtb | Extend::Sxth | Extend::Sxtw | Extend::Sxtx
+        )
     }
     pub fn name(self) -> &'static str {
         match self {

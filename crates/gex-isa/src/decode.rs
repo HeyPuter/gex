@@ -82,7 +82,11 @@ fn decode_dp_imm(raw: u32, pc: u64) -> Inst {
         0b010 => {
             // Add/subtract (immediate).
             let sz = Sz::from_sf(bit(raw, 31));
-            let op = if bit(raw, 30) == 0 { AddOp::Add } else { AddOp::Sub };
+            let op = if bit(raw, 30) == 0 {
+                AddOp::Add
+            } else {
+                AddOp::Sub
+            };
             let set_flags = bit(raw, 29) == 1;
             let sh = bit(raw, 22);
             if bit(raw, 23) == 1 {
@@ -450,7 +454,9 @@ fn classify_sysreg(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> SysReg {
         (3, 3, 4, 4, 1) => SysReg::Fpsr,
         (3, 3, 4, 2, 0) => SysReg::Nzcv,
         _ => SysReg::Other(
-            ((op0 as u16) << 14) | ((op1 as u16) << 11) | ((crn as u16) << 7)
+            ((op0 as u16) << 14)
+                | ((op1 as u16) << 11)
+                | ((crn as u16) << 7)
                 | ((crm as u16) << 3)
                 | op2 as u16,
         ),
@@ -496,7 +502,11 @@ fn decode_dp_reg(raw: u32) -> Inst {
 
     // Add/subtract (shifted or extended register): sf op S 01011 ...
     if bits(raw, 28, 24) == 0b01011 {
-        let op = if bit(raw, 30) == 0 { AddOp::Add } else { AddOp::Sub };
+        let op = if bit(raw, 30) == 0 {
+            AddOp::Add
+        } else {
+            AddOp::Sub
+        };
         let set_flags = bit(raw, 29) == 1;
         if bit(raw, 21) == 0 {
             let shift = bits(raw, 23, 22);
@@ -552,7 +562,11 @@ fn decode_dp_reg(raw: u32) -> Inst {
             }
             Inst::AddSubCarry {
                 sz,
-                op: if bit(raw, 30) == 0 { AddOp::Add } else { AddOp::Sub },
+                op: if bit(raw, 30) == 0 {
+                    AddOp::Add
+                } else {
+                    AddOp::Sub
+                },
                 set_flags: bit(raw, 29) == 1,
                 rd: RegSel::gp(rd),
                 rn: RegSel::gp(rn),
@@ -567,13 +581,13 @@ fn decode_dp_reg(raw: u32) -> Inst {
             let imm_form = bit(raw, 11) == 1;
             Inst::CondCompare {
                 sz,
-                op: if bit(raw, 30) == 0 { AddOp::Add } else { AddOp::Sub },
-                rn: RegSel::gp(rn),
-                rm: if imm_form {
-                    None
+                op: if bit(raw, 30) == 0 {
+                    AddOp::Add
                 } else {
-                    Some(RegSel::gp(rm))
+                    AddOp::Sub
                 },
+                rn: RegSel::gp(rn),
+                rm: if imm_form { None } else { Some(RegSel::gp(rm)) },
                 imm: rm as u64,
                 nzcv: bits(raw, 3, 0) as u8,
                 cond: Cond(bits(raw, 15, 12) as u8),
@@ -1356,11 +1370,21 @@ fn decode_simd_fp(raw: u32) -> Inst {
             && bit(raw, 15) == 0
             && bit(raw, 10) == 0
         {
+            let index = bits(raw, 14, 11);
+            // With Q clear the window is eight bytes wide, so the top bit of
+            // imm4 must be zero; the architecture leaves the rest undefined.
+            // Exhaustive discovery decodes literal pools and padding, so this
+            // does come up -- and an out-of-range window would become an
+            // `i8x16.shuffle` whose lane indices exceed 31, which V8 rejects
+            // when it compiles the *module*, poisoning code that is never run.
+            if !q && index >= 8 {
+                return Inst::Undefined { raw };
+            }
             return Inst::VExt {
                 vd: VReg(bits(raw, 4, 0) as u8),
                 vn: VReg(bits(raw, 9, 5) as u8),
                 vm: VReg(bits(raw, 20, 16) as u8),
-                index: bits(raw, 14, 11),
+                index,
                 q,
             };
         }
@@ -2101,8 +2125,16 @@ fn decode_scalar_fp(raw: u32) -> Inst {
     {
         return Inst::FpMoveTopHalf {
             to_vector: bit(raw, 16) == 1,
-            rd: RegSel::gp(bits(raw, if bit(raw, 16) == 1 { 9 } else { 4 }, if bit(raw, 16) == 1 { 5 } else { 0 })),
-            vd: VReg(bits(raw, if bit(raw, 16) == 1 { 4 } else { 9 }, if bit(raw, 16) == 1 { 0 } else { 5 }) as u8),
+            rd: RegSel::gp(bits(
+                raw,
+                if bit(raw, 16) == 1 { 9 } else { 4 },
+                if bit(raw, 16) == 1 { 5 } else { 0 },
+            )),
+            vd: VReg(bits(
+                raw,
+                if bit(raw, 16) == 1 { 4 } else { 9 },
+                if bit(raw, 16) == 1 { 0 } else { 5 },
+            ) as u8),
         };
     }
     let Some(sz) = fp_size(bits(raw, 23, 22)) else {
@@ -2632,10 +2664,7 @@ mod tests {
         // tst x1, #0xf0  ->  ands xzr, x1, #0xf0
         match d(0xf27c0c3f) {
             Inst::LogicalImm {
-                imm,
-                rd,
-                set_flags,
-                ..
+                imm, rd, set_flags, ..
             } => {
                 assert_eq!(imm, 0xf0);
                 assert_eq!(rd, RegSel::Zr);

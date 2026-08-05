@@ -80,9 +80,13 @@ fn main() {
             e.3 += 1;
         } else if normalize_cmp(&got_full, aliased) != normalize_cmp(expect_full, aliased) {
             operand_diff += 1;
-            let e = operand_samples
-                .entry(expect_mnem.to_string())
-                .or_insert((expect_full.to_string(), got_full.clone(), 0, pc, raw));
+            let e = operand_samples.entry(expect_mnem.to_string()).or_insert((
+                expect_full.to_string(),
+                got_full.clone(),
+                0,
+                pc,
+                raw,
+            ));
             e.2 += 1;
         } else {
             agree += 1;
@@ -172,7 +176,9 @@ fn alias_equivalent(expect: &str, got: &str) -> bool {
 fn normalize_cmp(s: &str, drop_mnemonic: bool) -> String {
     let n = normalize(s);
     if drop_mnemonic {
-        n.split_once(' ').map(|(_, r)| r.to_string()).unwrap_or_default()
+        n.split_once(' ')
+            .map(|(_, r)| r.to_string())
+            .unwrap_or_default()
     } else {
         n
     }

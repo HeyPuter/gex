@@ -152,7 +152,12 @@ mod tests {
             BlockLimits { max_insts: 64 },
         );
         assert_eq!(b.end, 0x6000 + 64 * 4);
-        assert_eq!(b.term, Term::Goto { target: 0x6000 + 64 * 4 });
+        assert_eq!(
+            b.term,
+            Term::Goto {
+                target: 0x6000 + 64 * 4
+            }
+        );
     }
 
     #[test]

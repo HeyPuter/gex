@@ -261,7 +261,13 @@ impl ModuleBuilder {
         linkage: Linkage,
         shared_memory: bool,
     ) -> ModuleBuilder {
-        Self::with_pages(text_base, text_size, linkage, PageTable::new(), shared_memory)
+        Self::with_pages(
+            text_base,
+            text_size,
+            linkage,
+            PageTable::new(),
+            shared_memory,
+        )
     }
 
     /// As [`Self::with_linkage`], continuing an existing page assignment.
@@ -328,7 +334,12 @@ impl ModuleBuilder {
         // the same bytes -- a defined memory would be per-instance, and each
         // thread needs its own store. The table is sized in `finish`, once the
         // set of pages the module touches is known.
-        m.import_memory(IMPORT_MODULE, exports::MEMORY, GUEST_MEM_PAGES, shared_memory);
+        m.import_memory(
+            IMPORT_MODULE,
+            exports::MEMORY,
+            GUEST_MEM_PAGES,
+            shared_memory,
+        );
         if linkage == Linkage::Shared {
             // The table comes from the image module, so this one's blocks
             // dispatch through exactly the same slots.
@@ -491,10 +502,8 @@ impl ModuleBuilder {
 
         match self.linkage {
             Linkage::Own => {
-                self.m.set_table(
-                    table_slots as u32,
-                    gex_abi::DISPATCH_TABLE_MAX_SLOTS as u32,
-                );
+                self.m
+                    .set_table(table_slots as u32, gex_abi::DISPATCH_TABLE_MAX_SLOTS as u32);
                 // Every slot starts as the miss stub; translated blocks then
                 // overwrite the ones they own. A branch anywhere else asks
                 // the host to translate rather than trapping.

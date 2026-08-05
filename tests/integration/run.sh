@@ -137,6 +137,9 @@ browser() {
     if [ -z "$NODE" ] || [ ! -f "$shim" ]; then
         return
     fi
+    # An absolute path, because `/proc/self/exe` is one and the browser has no
+    # host directory to resolve a relative argv[0] against.
+    prog="$(cd "$(dirname "$prog")" && pwd)/$(basename "$prog")"
     wasm="$WORK/$label.br.wasm"
     set +e
     "$GEXC" build --exhaustive --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1
@@ -335,10 +338,22 @@ cross_engine "numeric" "$WORK/numeric"
 cross_engine "fixedpoint" "$WORK/fixedpoint"
 cross_engine "neon-structure" "$WORK/neon2"
 
-# And under the browser runtime: the kernel itself in wasm.
+# And under the browser runtime: the kernel itself in wasm. This is the
+# deliverable, so it gets the same breadth the native host does -- the whole
+# conformance suite, the VFS, signals, and C++ exceptions.
 browser "numeric" "$WORK/numeric"
 browser "fixedpoint" "$WORK/fixedpoint"
 browser "vector" "$WORK/vector"
+browser "neon-structure" "$WORK/neon2"
+browser "cross-block-flags" "$WORK/flags"
+for area in arith float mem flow sys; do
+    browser "suite-$area" "$WORK/suite" "$area"
+done
+browser "vfs" "$WORK/vfs"
+browser "signal-all" "$WORK/signals" all
+if [ -n "$CPP" ]; then
+    browser "cpp" "$WORK/cpp"
+fi
 compare "threads" "$WORK/threads"
 compare "thread-exit-race" "$WORK/exitrace"
 compare "fork" "$WORK/fork"

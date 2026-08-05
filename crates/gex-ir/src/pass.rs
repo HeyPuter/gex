@@ -137,7 +137,11 @@ fn eval(expr: &Expr, known: &[Option<u64>]) -> Option<u64> {
         }
         Expr::Select { cond, a, b, ty } => {
             let c = get(known, cond)?;
-            let v = if c != 0 { get(known, a)? } else { get(known, b)? };
+            let v = if c != 0 {
+                get(known, a)?
+            } else {
+                get(known, b)?
+            };
             Some(v & ty.mask())
         }
         Expr::Wrap(a) => Some(get(known, a)? & 0xffff_ffff),
@@ -377,10 +381,9 @@ pub fn dead_store_elim_with(block: &mut Block, dead_out: &[GuestReg]) {
                     }
                 }
             }
-            Stmt::HostCall { func, .. }
-                if func.clobbers_guest_state() => {
-                    overwritten.clear();
-                }
+            Stmt::HostCall { func, .. } if func.clobbers_guest_state() => {
+                overwritten.clear();
+            }
             _ => {}
         }
     }
@@ -560,14 +563,20 @@ mod tests {
         let mut blk = b.finish(Term::Goto { target: 4 });
         dead_store_elim_with(&mut blk, &[GuestReg::C]);
         // The write is genuinely dead; the read is not, and must remain.
-        assert!(blk
-            .stmts
-            .iter()
-            .any(|s| matches!(s, Stmt::Def { expr: Expr::ReadReg(GuestReg::C), .. })));
-        assert!(!blk
-            .stmts
-            .iter()
-            .any(|s| matches!(s, Stmt::WriteReg { reg: GuestReg::C, .. })));
+        assert!(blk.stmts.iter().any(|s| matches!(
+            s,
+            Stmt::Def {
+                expr: Expr::ReadReg(GuestReg::C),
+                ..
+            }
+        )));
+        assert!(!blk.stmts.iter().any(|s| matches!(
+            s,
+            Stmt::WriteReg {
+                reg: GuestReg::C,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -619,7 +628,15 @@ mod tests {
         let n_z_writes = blk
             .stmts
             .iter()
-            .filter(|s| matches!(s, Stmt::WriteReg { reg: GuestReg::Z, .. }))
+            .filter(|s| {
+                matches!(
+                    s,
+                    Stmt::WriteReg {
+                        reg: GuestReg::Z,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(n_z_writes, 2);
     }

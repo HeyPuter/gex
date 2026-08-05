@@ -71,9 +71,7 @@ impl TmpFs {
         let ino = inner.next_ino;
         inner.next_ino += 1;
         inner.inos.insert(path.clone(), ino);
-        inner
-            .nodes
-            .insert(path, Node::Symlink(target.to_string()));
+        inner.nodes.insert(path, Node::Symlink(target.to_string()));
     }
 
     /// Create every missing directory above `path`.
@@ -157,7 +155,10 @@ impl FileHandle for TmpHandle {
                 ino,
                 mtime: 0,
             }),
-            Some(Node::Dir) => Ok(Metadata { ino, ..Metadata::dir() }),
+            Some(Node::Dir) => Ok(Metadata {
+                ino,
+                ..Metadata::dir()
+            }),
             Some(Node::Symlink(t)) => Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: t.len() as u64,

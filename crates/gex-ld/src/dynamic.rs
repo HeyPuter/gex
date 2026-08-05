@@ -53,11 +53,7 @@ impl Program {
 
     /// First address above everything loaded, where `brk` starts.
     pub fn brk(&self) -> u64 {
-        let interp_end = self
-            .interp
-            .as_ref()
-            .map(|i| i.brk)
-            .unwrap_or(0);
+        let interp_end = self.interp.as_ref().map(|i| i.brk).unwrap_or(0);
         self.exe.brk.max(interp_end)
     }
 }

@@ -166,7 +166,9 @@ impl FileHandle for DevDir {
                 ino: 1,
             },
         ];
-        for name in ["null", "zero", "full", "random", "urandom", "tty", "console"] {
+        for name in [
+            "null", "zero", "full", "random", "urandom", "tty", "console",
+        ] {
             out.push(DirEntry {
                 name: name.into(),
                 file_type: FileType::CharDevice,
@@ -235,7 +237,10 @@ mod tests {
     #[test]
     fn standard_stream_names_are_symlinks_into_proc() {
         assert_eq!(DevFs.read_link("stdout").unwrap(), "/proc/self/fd/1");
-        assert_eq!(DevFs.metadata("stdout").unwrap().file_type, FileType::Symlink);
+        assert_eq!(
+            DevFs.metadata("stdout").unwrap().file_type,
+            FileType::Symlink
+        );
     }
 
     #[test]

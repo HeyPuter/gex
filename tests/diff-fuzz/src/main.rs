@@ -236,7 +236,10 @@ fn run_case(cfg: &Config, i: usize, insts: &[u32], seeds: &[u64; 32]) -> Result<
 
     let as_bin = cfg.toolchain.join("aarch64-linux-musl-as");
     let ld_bin = cfg.toolchain.join("aarch64-linux-musl-ld");
-    run_tool(&as_bin, &["-o", &obj.to_string_lossy(), &src.to_string_lossy()])?;
+    run_tool(
+        &as_bin,
+        &["-o", &obj.to_string_lossy(), &src.to_string_lossy()],
+    )?;
     run_tool(
         &ld_bin,
         &[
