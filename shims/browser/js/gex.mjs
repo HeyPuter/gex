@@ -66,6 +66,21 @@ export class Gex {
   get shim() { return this.#shim; }
 
   /**
+   * Read a file back out of the guest's filesystem, or null if it is not
+   * there. The other half of bundling: a page that runs a compiler wants the
+   * object file afterwards.
+   */
+  readFile(path) {
+    const p = new TextEncoder().encode(path);
+    const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+    this.#u8.set(p, pp);
+    const len = this.#shim.exports.gex_get_file(pp, p.length) >>> 0;
+    if (len === 0) return null;
+    const at = this.#shim.exports.gex_file_data() >>> 0;
+    return this.#u8.slice(at, at + len);
+  }
+
+  /**
    * `shimWasm` is shims/browser's build output, `guestWasm` a module from
    * `gexc build --exhaustive --no-shared-memory`, `elf` the program's bytes.
    *

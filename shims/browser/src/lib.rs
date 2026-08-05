@@ -155,53 +155,62 @@ impl FileHandle for Console {
 //
 // Rust's default allocator grows the memory when it runs out, and this memory
 // cannot grow: it is the guest's, fixed at its maximum so the guest's stack
-// lands where the ABI says. So the heap is a fixed region instead -- everything
-// between the end of this module's data and the end of the address space,
-// which is the rest of the two gigabytes the guest never touches.
+// lands where the ABI says. So the heap is a fixed region instead --
+// everything between the end of this module's data and the end of the address
+// space, which is the rest of the two gigabytes the guest never touches.
+//
+// It has to be a *good* allocator, which only became obvious once runtime
+// translation started running inside the shim. A first-fit linked list walks
+// its free list on every allocation and the translator allocates constantly:
+// lifting tcc's largest source took 15.2 seconds that way, against 0.3 with a
+// bump allocator that never freed. Talc bins its free lists, so allocation
+// does not degrade as the heap fragments, and it still frees.
 #[global_allocator]
-static ALLOC: Heap = Heap;
-
-struct Heap;
-
-/// The heap's state. Wrapped so it can be a `static`: wasm without threads is
-/// single-threaded, and this module is only ever entered from JS one call at a
-/// time, so there is nothing to race with.
-struct SingleThreaded<T>(RefCell<T>);
-// SAFETY: see above.
-unsafe impl<T> Sync for SingleThreaded<T> {}
-
-static INNER: SingleThreaded<Option<linked_list_allocator::Heap>> =
-    SingleThreaded(const { RefCell::new(None) });
+static ALLOC: talc::cell::TalcSyncCell<ShimRegion, talc::wasm::WasmBinning> =
+    talc::cell::TalcSyncCell::new_wasm(ShimRegion);
 
 extern "C" {
     static __heap_base: u8;
 }
 
-unsafe impl std::alloc::GlobalAlloc for Heap {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        // SAFETY: single-threaded; see above.
-        let mut h = INNER.0.borrow_mut();
-        let heap = h.get_or_insert_with(|| {
-            let base = (&raw const __heap_base) as usize;
-            let size = gex_abi::GUEST_MEM_BYTES as usize - base;
-            // SAFETY: the linker put this module's data below `__heap_base`,
-            // and the guest maps nothing above `STACK_TOP`, so the region is
-            // ours alone.
-            unsafe { linked_list_allocator::Heap::new(base as *mut u8, size) }
-        });
-        heap.allocate_first_fit(layout)
-            .map(|p| p.as_ptr())
-            .unwrap_or(std::ptr::null_mut())
-    }
+/// Hands the allocator everything above this module's data, once.
+///
+/// A linker symbol's address is not a constant, so the region cannot be named
+/// in the allocator's initialiser; it is claimed the first time anything is
+/// allocated instead.
+#[derive(Debug)]
+struct ShimRegion;
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        if let Some(heap) = INNER.0.borrow_mut().as_mut() {
-            if let Some(p) = std::ptr::NonNull::new(ptr) {
-                unsafe { heap.deallocate(p, layout) };
-            }
+// SAFETY: `acquire` claims a region of this module's own linear memory and
+// touches no other allocator.
+unsafe impl talc::source::Source for ShimRegion {
+    fn acquire<B: talc::base::binning::Binning>(
+        talc: &mut talc::base::Talc<Self, B>,
+        _layout: std::alloc::Layout,
+    ) -> Result<(), ()> {
+        // There is exactly one region; a second call means it is exhausted,
+        // and saying so beats claiming it again and looping forever.
+        static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if CLAIMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return Err(());
         }
+        let base = (&raw const __heap_base) as *mut u8;
+        // Short of the very top, so a span that would end exactly at the end
+        // of memory cannot be rounded past it.
+        let size = gex_abi::GUEST_MEM_BYTES as usize - base as usize - 65536;
+        // SAFETY: the linker put this module's data below `__heap_base`, and
+        // the guest maps nothing above `STACK_TOP`, so the region is ours.
+        unsafe { talc.claim(base, size).ok_or(())? };
+        Ok(())
     }
 }
+
+/// State wrapped so it can be a `static`: wasm without threads is
+/// single-threaded, and this module is only ever entered from JS one call at a
+/// time, so there is nothing to race with.
+struct SingleThreaded<T>(RefCell<T>);
+// SAFETY: see above.
+unsafe impl<T> Sync for SingleThreaded<T> {}
 
 /// Why a guest thread is not running.
 enum Waiting {
@@ -587,6 +596,39 @@ fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
 /// overlap the other's mappings. The same address `gexc` uses, so a program
 /// looks identical under both hosts.
 const INTERP_BASE: u64 = 0x2800_0000;
+
+/// A file read back out of the guest's filesystem, kept alive for JS.
+static EXTRACTED: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+
+/// Read a file out of the guest's filesystem, and return its length.
+///
+/// The other half of bundling: a page that runs a compiler wants the object
+/// file back. Zero means there is nothing there -- a length of zero and a
+/// missing file are the same answer, which is all a caller can act on anyway.
+#[no_mangle]
+pub extern "C" fn gex_get_file(path: u32, path_len: u32) -> u32 {
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return 0;
+    };
+    let bytes = with_host(|h| {
+        let f = h.kernel.vfs.open(name, 0, 0).ok()?;
+        let len = f.metadata().ok()?.size as usize;
+        let mut buf = vec![0u8; len];
+        let n = f.read_at(0, &mut buf).ok()? as usize;
+        buf.truncate(n);
+        Some(buf)
+    })
+    .unwrap_or_default();
+    let len = bytes.len() as u32;
+    *EXTRACTED.0.borrow_mut() = bytes;
+    len
+}
+
+/// Where the last [`gex_get_file`] left its contents.
+#[no_mangle]
+pub extern "C" fn gex_file_data() -> u32 {
+    EXTRACTED.0.borrow().as_ptr() as u32
+}
 
 /// The identity the guest is given, which the embedder may override before
 /// loading. A page has no user, so 1000 is as good an answer as any; Node
@@ -1151,8 +1193,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         h.jit.nanos += now_ns().saturating_sub(started);
         if tracing() {
             trace_line(&format!(
-                "[gex]   translated {} blocks, {} slots, {} pages\n",
+                "[gex]   translated {} blocks in {} ms, {} vmas, {} slots, {} pages\n",
                 stats.blocks,
+                (now_ns().saturating_sub(started)) / 1_000_000,
+                exec.len(),
                 unit.table_slots,
                 unit.dir_entries.len()
             ));
