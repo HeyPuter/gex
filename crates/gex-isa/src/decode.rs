@@ -1290,6 +1290,7 @@ fn decode_simd_fp(raw: u32) -> Inst {
         return Inst::VMoveImm {
             vd: VReg(bits(raw, 4, 0) as u8),
             value,
+            inverted: u == 1 && cmode != 0b1110,
         };
     }
 

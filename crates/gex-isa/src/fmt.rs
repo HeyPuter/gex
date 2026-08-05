@@ -684,8 +684,16 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             reg(rn, if lane_bytes == 8 { Sz::X } else { Sz::W })
         ),
         // The immediate is already expanded, so the lane shape the assembler
-        // chose is no longer recoverable; print the resulting register value.
-        Inst::VMoveImm { vd, value } => format!("movi v{}, #0x{value:x}", vd.0),
+        // chose is not recoverable; print the resulting register value.
+        Inst::VMoveImm {
+            vd,
+            value,
+            inverted,
+        } => format!(
+            "{} v{}, #0x{value:x}",
+            if inverted { "mvni" } else { "movi" },
+            vd.0
+        ),
         Inst::FpDataProc1 { sz, op, vd, vn } => {
             let m = match op {
                 FpOp1::Mov => "fmov",

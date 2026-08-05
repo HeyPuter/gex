@@ -1133,7 +1133,7 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
-            Inst::VMoveImm { vd, value } => {
+            Inst::VMoveImm { vd, value, .. } => {
                 let v = self.b.def(Expr::VConst(Box::new(value.to_le_bytes())));
                 self.b.write(GuestReg::V128(vd.0), v);
                 Flow::Next

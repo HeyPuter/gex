@@ -654,7 +654,16 @@ pub enum Inst {
     },
     /// `movi`/`mvni`, with the immediate already expanded to the full
     /// 128-bit register value.
-    VMoveImm { vd: VReg, value: u128 },
+    ///
+    /// `inverted` records which of the two it was. The lifter does not need
+    /// it — the value is already final — but without it the disassembler
+    /// cannot tell the two apart, and bulk validation against binutils would
+    /// lose sight of the whole family.
+    VMoveImm {
+        vd: VReg,
+        value: u128,
+        inverted: bool,
+    },
     /// Scalar floating-point, one source.
     FpDataProc1 {
         sz: FpSz,
