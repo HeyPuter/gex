@@ -238,6 +238,16 @@ pub mod imports {
     /// hook. Signature `(ctx: i32, pc: i64, op: i32, addr: i64) -> ()`.
     pub const CACHE_OP: &str = "cache_op";
 
+    /// Fused multiply-add: `round(a * b + c)` with one rounding.
+    ///
+    /// Signature `(ctx: i32, a: i64, b: i64, c: i64, double: i32) -> i64`,
+    /// with the operands and result as bit patterns -- single precision in
+    /// the low 32 bits. Wasm has no fused multiply-add, and a multiply
+    /// followed by an add rounds twice, which is enough to make musl's `pow`
+    /// return 1024.0000000000002 for `2^10`. Every host has one, so this asks
+    /// rather than approximating.
+    pub const FMA: &str = "fma";
+
     /// Safepoint poll taken when the interrupt flag is set.
     /// Signature `(ctx: i32, pc: i64) -> ()`.
     pub const SAFEPOINT: &str = "safepoint";

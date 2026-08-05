@@ -91,6 +91,8 @@ pub struct Context<'a> {
     pub breakpoint: u32,
     /// Import index of `gex.sysreg_read`.
     pub sysreg_read: u32,
+    /// Import index of `gex.fma`.
+    pub fma: u32,
     /// Import index of `gex.sysreg_write`.
     pub sysreg_write: u32,
     /// Import index of `gex.cache_op`.
@@ -969,6 +971,7 @@ impl<'a> Emitter<'a> {
             HostFunc::SysRegWrite => self.cx.sysreg_write,
             HostFunc::CacheOp => self.cx.cache_op,
             HostFunc::Safepoint => self.cx.safepoint,
+            HostFunc::Fma => self.cx.fma,
         }
     }
 

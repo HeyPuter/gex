@@ -743,6 +743,8 @@ pub enum HostFunc {
     CacheOp,
     /// Safepoint poll for signal delivery.
     Safepoint,
+    /// Fused multiply-add, which wasm cannot express.
+    Fma,
 }
 
 impl HostFunc {

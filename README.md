@@ -175,6 +175,17 @@ consistent one:
 $ tests/integration/run.sh
 ```
 
+**A conformance suite.** Lua's own test suite — 18 of its files, covering
+bitwise operations, closures, `goto`, to-be-closed variables, metamethods,
+string patterns, UTF-8, `string.pack`, coroutines, error handling, the garbage
+collector, `math` and `sort`. Every one produces byte-identical output to
+QEMU, except `math` and `sort`, whose only differences are a random seed and
+printed millisecond timings. `all.lua` fails on both engines the same way: it
+shells out to a subprocess, and neither has `fork`.
+
+Finding that suite is what turned up the `fmadd` bug below. Four of its files
+failed before it was fixed.
+
 **Real programs.** BusyBox 1.36.1, built static, runs `sort`, `awk`, `sed`,
 `grep`, `tr`, `uniq`, `head`, `tail`, `wc`, `expr`, `date`, `basename`,
 `md5sum`, `sha256sum` and a `gzip`/`gunzip` round trip through a pipe. Every
@@ -420,6 +431,24 @@ CPU-bound loop:
 
 Sixteen times the work for two and a half times the wall clock.
 
+### `fmadd` is fused, because it has to be
+
+Wasm has no fused multiply-add. Rounding the product before the addition
+sounds like a last-place difference, and PLAN §5.7 files it under fast mode —
+but musl builds its double-double arithmetic out of exactly this instruction,
+and the second rounding destroys it. Under gex, Lua's `2^10` was
+1024.0000000000002 and `2^30` no longer converted to an integer. Four files of
+Lua's test suite failed on it.
+
+There is no way to express one rounding in wasm, so translated code asks the
+host: a `gex.fma` import taking the three operands as bit patterns. Every host
+has an FMA instruction, and a browser shim can supply its own. It is a call
+per `fmadd`, which sounds expensive and is not — a loop doing nothing but
+`__builtin_fma` runs 8x faster under gex than under QEMU, and byte-identically.
+
+The vector `fmla` is still unfused; wasm has no vector FMA either, and the
+same trick would mean a host call per lane.
+
 ### The snapshot that was rebuilt on every syscall
 
 A syscall-heavy threaded benchmark — `clock_gettime` and `getpid` in a loop —
@@ -483,9 +512,6 @@ deliberate trade recorded here so nobody has to rediscover it.
   stray load or store, so a write through a `PROT_NONE` page succeeds. The
   VMA tree still records protections, because `/proc/self/maps`, translation
   invalidation and kernel-mediated accesses all need them.
-* **`fmadd` is not fused.** Wasm has no fused multiply-add, so the product is
-  rounded before the addition and results can differ in the last place. This
-  is PLAN §5.7's fast mode; strict mode needs a software FMA.
 * **`frinta` rounds ties to even, not away from zero.** Wasm's `nearest` is
   the only rounding primitive available; the two differ only exactly on
   halfway values.

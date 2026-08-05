@@ -1230,23 +1230,28 @@ impl<'a> Lifter<'a> {
                 neg_addend,
             } => {
                 // AArch64 fuses this: one rounding for the whole expression.
-                // Wasm has no fused multiply-add, so the product is rounded
-                // before the addition and results can differ in the last
-                // place. That is the documented cost of fast mode
-                // (PLAN §5.7); strict mode will need a software FMA.
+                // Wasm has no fused multiply-add, and rounding the product
+                // first is not a small difference -- it is enough to make
+                // musl's `pow` answer 1024.0000000000002 for `2^10`, because
+                // musl builds its double-double arithmetic out of exactly
+                // this instruction. So the host is asked; every one of them
+                // has an FMA (PLAN §5.7).
                 let double = sz.is_double();
                 let a = self.rd_fp(vn, sz);
                 let b = self.rd_fp(vm, sz);
                 let c = self.rd_fp(va, sz);
-                let mut prod = self.fp_bin(FpBinOp::Mul, double, a, b);
-                if neg_product {
-                    prod = self.b.def(Expr::FpUn {
+                // Negating an operand of the product is exact, so it can be
+                // done before the fused step without changing the result.
+                let a = if neg_product {
+                    self.b.def(Expr::FpUn {
                         op: FpUnOp::Neg,
                         double,
-                        a: prod,
-                    });
-                }
-                let addend = if neg_addend {
+                        a,
+                    })
+                } else {
+                    a
+                };
+                let c = if neg_addend {
                     self.b.def(Expr::FpUn {
                         op: FpUnOp::Neg,
                         double,
@@ -1255,7 +1260,28 @@ impl<'a> Lifter<'a> {
                 } else {
                     c
                 };
-                let v = self.fp_bin(FpBinOp::Add, double, prod, addend);
+                let (a64, b64, c64) = if double {
+                    (a, b, c)
+                } else {
+                    // The import speaks in 64-bit words; a single-precision
+                    // pattern rides in the low half.
+                    (
+                        self.b.def(Expr::Extend { a, signed: false }),
+                        self.b.def(Expr::Extend { a: b, signed: false }),
+                        self.b.def(Expr::Extend { a: c, signed: false }),
+                    )
+                };
+                let is_double = self.konst(Ty::I32, double as u64);
+                let r = self.b.def(Expr::HostCall {
+                    func: HostFunc::Fma,
+                    args: vec![a64, b64, c64, is_double],
+                    ty: Ty::I64,
+                });
+                let v = if double {
+                    r
+                } else {
+                    self.b.def(Expr::Wrap(r))
+                };
                 self.wr_fp(vd, sz, v);
                 Flow::Next
             }

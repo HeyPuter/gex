@@ -1201,6 +1201,24 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         },
     )?;
 
+    // Fused multiply-add. The host has one; wasm does not, and a multiply
+    // followed by an add rounds twice.
+    linker.func_wrap(
+        m,
+        imports::FMA,
+        |_caller: Caller<'_, HostState>, _ctx: i32, a: i64, b: i64, c: i64, double: i32| -> i64 {
+            if double != 0 {
+                f64::from_bits(a as u64)
+                    .mul_add(f64::from_bits(b as u64), f64::from_bits(c as u64))
+                    .to_bits() as i64
+            } else {
+                f32::from_bits(a as u32)
+                    .mul_add(f32::from_bits(b as u32), f32::from_bits(c as u32))
+                    .to_bits() as i64
+            }
+        },
+    )?;
+
     linker.func_wrap(
         m,
         imports::SAFEPOINT,
