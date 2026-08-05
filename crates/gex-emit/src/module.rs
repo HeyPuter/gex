@@ -246,7 +246,7 @@ struct Imports {
 impl ModuleBuilder {
     /// Start an image module: it owns the memory and the dispatch table.
     pub fn new(text_base: u64, text_size: u64) -> ModuleBuilder {
-        Self::with_linkage(text_base, text_size, Linkage::Own)
+        Self::with_linkage(text_base, text_size, Linkage::Own, true)
     }
 
     /// Start a module covering guest text `[text_base, text_base + text_size)`.
@@ -255,16 +255,28 @@ impl ModuleBuilder {
     /// shared table; an image module starts just above the reserved miss
     /// span, and a runtime module starts wherever the host has grown the
     /// table to.
-    pub fn with_linkage(text_base: u64, text_size: u64, linkage: Linkage) -> ModuleBuilder {
-        Self::with_pages(text_base, text_size, linkage, PageTable::new())
+    pub fn with_linkage(
+        text_base: u64,
+        text_size: u64,
+        linkage: Linkage,
+        shared_memory: bool,
+    ) -> ModuleBuilder {
+        Self::with_pages(text_base, text_size, linkage, PageTable::new(), shared_memory)
     }
 
     /// As [`Self::with_linkage`], continuing an existing page assignment.
+    ///
+    /// `shared_memory` decides whether the imported memory is declared shared.
+    /// Threads need it and it costs nothing on the native host, but a
+    /// single-threaded browser build wants it off: a Rust shim that imports a
+    /// shared memory has to be built with `+atomics`, which needs
+    /// `-Z build-std`.
     pub fn with_pages(
         text_base: u64,
         text_size: u64,
         linkage: Linkage,
         page_table: PageTable,
+        shared_memory: bool,
     ) -> ModuleBuilder {
         assert_eq!(text_base % 4, 0, "text base must be instruction-aligned");
         let _ = text_size;
@@ -316,7 +328,7 @@ impl ModuleBuilder {
         // the same bytes -- a defined memory would be per-instance, and each
         // thread needs its own store. The table is sized in `finish`, once the
         // set of pages the module touches is known.
-        m.import_memory(IMPORT_MODULE, exports::MEMORY, GUEST_MEM_PAGES, true);
+        m.import_memory(IMPORT_MODULE, exports::MEMORY, GUEST_MEM_PAGES, shared_memory);
         if linkage == Linkage::Shared {
             // The table comes from the image module, so this one's blocks
             // dispatch through exactly the same slots.

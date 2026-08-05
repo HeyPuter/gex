@@ -12,6 +12,7 @@ members = [
     "crates/gex-ld",
     "crates/gex-kernel",
     "crates/gexc",
+    "shims/browser",
     "shims/native",
     "tests/diff-fuzz",
 ]

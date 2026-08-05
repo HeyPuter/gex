@@ -53,6 +53,9 @@ pub struct Options {
     /// translation reaches everything anyway, so this makes the up-front
     /// module small and lets execution pull in the rest.
     pub lazy: bool,
+    /// Declare the imported memory shared. Off only for a single-threaded
+    /// build whose host cannot import a shared memory.
+    pub shared_memory: bool,
 }
 
 impl Default for Options {
@@ -65,6 +68,7 @@ impl Default for Options {
             // still available for a build that must not translate later.
             exhaustive: false,
             lazy: false,
+            shared_memory: true,
         }
     }
 }
@@ -211,7 +215,12 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
 pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
     let view = CodeView::new(image);
     let (text_lo, text_hi) = image.text_range;
-    let mut builder = ModuleBuilder::new(text_lo, text_hi - text_lo);
+    let mut builder = ModuleBuilder::with_linkage(
+        text_lo,
+        text_hi - text_lo,
+        Linkage::Own,
+        opts.shared_memory,
+    );
     let mut stats = Stats::default();
 
     // Collect entry points. A BTreeSet keeps translation order deterministic,
@@ -350,7 +359,7 @@ pub fn translate_runtime(
         Some(u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()))
     };
 
-    let mut builder = ModuleBuilder::with_pages(entry, 0, Linkage::Shared, page_table);
+    let mut builder = ModuleBuilder::with_pages(entry, 0, Linkage::Shared, page_table, true);
     let mut stats = Stats::default();
     let mut worklist: BTreeSet<u64> = BTreeSet::new();
     let mut seen: HashSet<u64> = HashSet::new();

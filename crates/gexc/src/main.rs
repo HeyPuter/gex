@@ -56,7 +56,9 @@ usage:
   gexc build  <elf> -o <out.wasm>  translate and write the wasm module
                                    (--exhaustive: translate every decodable
                                    address, since a built module has no
-                                   runtime translator behind it)
+                                   runtime translator behind it;
+                                   --no-shared-memory: declare a plain memory,
+                                   for a single-threaded host)
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
 
@@ -206,6 +208,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut path = None;
     let mut out = None;
     let mut exhaustive = false;
+    let mut shared_memory = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -216,6 +219,10 @@ fn cmd_build(args: &[String]) -> Result<()> {
             // A built module has no runtime translator behind it, so anything
             // discovery misses is a dispatch miss with nowhere to go.
             "--exhaustive" => exhaustive = true,
+            // A host that cannot import a shared memory -- a Rust shim built
+            // without `+atomics`, which is every stable-toolchain build --
+            // needs the guest module to declare a plain one.
+            "--no-shared-memory" => shared_memory = false,
             other => path = Some(other.to_string()),
         }
         i += 1;
@@ -229,6 +236,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
         &image,
         &Options {
             exhaustive,
+            shared_memory,
             ..Options::default()
         },
     );
