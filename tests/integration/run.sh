@@ -162,6 +162,10 @@ echo "building guest programs..."
 # so they are exercised even when gcc would not choose them.
 "$CC" -static -no-pie -O3 -ffast-math -o "$WORK/numeric" "$HERE/programs/numeric.c" -lm
 "$CC" -static -no-pie -O2 -o "$WORK/neon2" "$HERE/programs/neon2.c"
+# Hand-written assembly, because the shapes cross-block flag liveness has to
+# get right -- a condition set in one block and consumed in another -- are
+# ones a compiler almost never emits.
+"$CC" -nostdlib -static -no-pie -o "$WORK/flags" "$HERE/programs/flags.S"
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
 # .eh_frame through personality routines -- a very different code shape from
 # anything the C programs reach.
@@ -223,6 +227,7 @@ compare "vector-O3" "$WORK/vector"
 compare "vector-pie" "$WORK/vector-pie"
 compare "numeric" "$WORK/numeric"
 compare "neon-structure" "$WORK/neon2"
+compare "cross-block-flags" "$WORK/flags"
 [ -n "$CPP" ] && compare "cpp-static" "$WORK/cpp"
 
 if [ -n "$DYNAMIC" ]; then
@@ -245,6 +250,7 @@ for area in arith float mem flow; do
 done
 compare "nojit-vector" "$WORK/vector"
 compare "nojit-neon-structure" "$WORK/neon2"
+compare "nojit-cross-block-flags" "$WORK/flags"
 GEXC_ARGS=""
 
 echo

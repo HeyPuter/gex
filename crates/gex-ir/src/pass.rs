@@ -245,6 +245,84 @@ fn eval_cmp(op: CmpOp, ty: Ty, a: u64, b: u64) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Flag liveness
+// ---------------------------------------------------------------------------
+
+/// The four condition flags, as a bitmask.
+pub const ALL_FLAGS: u8 = 0b1111;
+
+/// Bit position of a flag in an [`ALL_FLAGS`] mask.
+fn flag_bit(r: GuestReg) -> Option<u8> {
+    match r {
+        GuestReg::N => Some(1),
+        GuestReg::Z => Some(2),
+        GuestReg::C => Some(4),
+        GuestReg::V => Some(8),
+        _ => None,
+    }
+}
+
+/// Turn a mask back into the registers it names.
+pub fn flags_of_mask(mask: u8) -> Vec<GuestReg> {
+    [GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V]
+        .into_iter()
+        .filter(|r| mask & flag_bit(*r).unwrap() != 0)
+        .collect()
+}
+
+/// A block's effect on the flags: which it reads before writing, and which it
+/// writes on every path through it.
+///
+/// These are the `use` and `def` sets of a backwards liveness analysis. `def`
+/// is what a flag must be overwritten by for a write upstream to be dead, so
+/// it may only include writes the block always performs -- which, since a GIR
+/// block is straight-line, is all of them.
+pub fn flag_effects(block: &Block) -> (u8, u8) {
+    let (mut uses, mut defs) = (0u8, 0u8);
+    for s in &block.stmts {
+        match s {
+            Stmt::Def {
+                expr: Expr::ReadReg(r),
+                ..
+            } => {
+                if let Some(b) = flag_bit(*r) {
+                    // Only a read that reaches past the block's top is a use.
+                    if defs & b == 0 {
+                        uses |= b;
+                    }
+                }
+            }
+            Stmt::WriteReg { reg, .. } => {
+                if let Some(b) = flag_bit(*reg) {
+                    defs |= b;
+                }
+            }
+            // The kernel reads the whole context, flags included.
+            Stmt::HostCall { func, .. }
+            | Stmt::Def {
+                expr: Expr::HostCall { func, .. },
+                ..
+            } if func.clobbers_guest_state() => {
+                uses = ALL_FLAGS;
+            }
+            _ => {}
+        }
+    }
+    (uses, defs)
+}
+
+/// Whether a block's terminator can reach code this analysis cannot see.
+///
+/// An indirect branch, a syscall's return into the kernel, or a SIGILL all
+/// leave the graph, so everything must be assumed live across them.
+pub fn escapes(block: &Block) -> bool {
+    matches!(
+        block.term,
+        Term::Indirect { .. } | Term::Illegal { .. } | Term::Syscall { .. }
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Dead guest-register store elimination
 // ---------------------------------------------------------------------------
 
@@ -262,9 +340,22 @@ fn eval_cmp(op: CmpOp, ty: Ty, a: u64, b: u64) -> u32 {
 /// * a host call that clobbers guest state is treated as reading everything,
 ///   because the kernel inspects the context.
 pub fn dead_store_elim(block: &mut Block) {
+    dead_store_elim_with(block, &[]);
+}
+
+/// `dead_store_elim`, told which registers are already dead at the block's
+/// exit.
+///
+/// Within one block the terminator has to be treated as reading everything,
+/// because a successor might. Once the whole control-flow graph is known that
+/// is answerable, and for the flags the answer is almost always "nothing reads
+/// them": AArch64 sets all four of NZCV on every `cmp`, `adds` and `subs`, and
+/// the branch that follows consumes one or two. See [`flag_effects`].
+pub fn dead_store_elim_with(block: &mut Block, dead_out: &[GuestReg]) {
     // Walk backwards, tracking which registers are already known to be
-    // overwritten later in the block.
-    let mut overwritten: Vec<GuestReg> = Vec::new();
+    // overwritten later in the block. A register dead at the exit behaves
+    // exactly like one overwritten just past the terminator.
+    let mut overwritten: Vec<GuestReg> = dead_out.to_vec();
     let mut drop_at: Vec<bool> = vec![false; block.stmts.len()];
 
     for (i, stmt) in block.stmts.iter().enumerate().rev() {
@@ -432,6 +523,86 @@ mod tests {
             })
             .collect();
         assert_eq!(writes, vec![(GuestReg::Z, one), (GuestReg::N, one)]);
+    }
+
+    #[test]
+    fn dead_out_flags_are_dropped_but_live_ones_are_not() {
+        // The caller has established that N is dead past this block and Z is
+        // not; only N's write may go.
+        let mut b = Builder::new(0);
+        let one = b.const_i32(1);
+        b.write(GuestReg::Z, one);
+        b.write(GuestReg::N, one);
+        b.write(GuestReg::C, one);
+        let mut blk = b.finish(Term::Goto { target: 4 });
+        dead_store_elim_with(&mut blk, &[GuestReg::N, GuestReg::C]);
+        let writes: Vec<_> = blk
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::WriteReg { reg, .. } => Some(*reg),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writes, vec![GuestReg::Z]);
+    }
+
+    #[test]
+    fn a_dead_out_flag_read_earlier_in_the_block_still_survives() {
+        // `adcs` reads C and then writes it. Even with C dead on exit, the
+        // read must see the incoming value, so the write cannot be hoisted
+        // away in a manner that disturbs it -- and the read keeps the
+        // *incoming* C live, which is the caller's problem, not this one's.
+        let mut b = Builder::new(0);
+        let c = b.read(GuestReg::C);
+        b.write(GuestReg::X(0), c);
+        b.write(GuestReg::C, c);
+        let mut blk = b.finish(Term::Goto { target: 4 });
+        dead_store_elim_with(&mut blk, &[GuestReg::C]);
+        // The write is genuinely dead; the read is not, and must remain.
+        assert!(blk
+            .stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Def { expr: Expr::ReadReg(GuestReg::C), .. })));
+        assert!(!blk
+            .stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::WriteReg { reg: GuestReg::C, .. })));
+    }
+
+    #[test]
+    fn flag_effects_separates_use_from_def() {
+        // Reads Z before writing it (a use), writes N without reading it
+        // (a def only), and reads C only after writing C (not a use).
+        let mut b = Builder::new(0);
+        let z = b.read(GuestReg::Z);
+        b.write(GuestReg::X(0), z);
+        b.write(GuestReg::N, z);
+        b.write(GuestReg::C, z);
+        let c = b.read(GuestReg::C);
+        b.write(GuestReg::X(1), c);
+        b.write(GuestReg::Z, z);
+        let blk = b.finish(Term::Goto { target: 4 });
+        let (uses, defs) = flag_effects(&blk);
+        assert_eq!(flags_of_mask(uses), vec![GuestReg::Z]);
+        assert_eq!(
+            flags_of_mask(defs),
+            vec![GuestReg::N, GuestReg::Z, GuestReg::C]
+        );
+    }
+
+    #[test]
+    fn a_block_that_leaves_the_graph_is_marked_escaping() {
+        let mut b = Builder::new(0);
+        let t = b.const_i64(0x1000);
+        let blk = b.finish(Term::Indirect {
+            target: t,
+            is_ret: true,
+        });
+        assert!(escapes(&blk));
+
+        let b2 = Builder::new(0);
+        assert!(!escapes(&b2.finish(Term::Goto { target: 4 })));
     }
 
     #[test]

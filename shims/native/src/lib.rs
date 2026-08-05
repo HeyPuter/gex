@@ -152,13 +152,14 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     if opts.verbose {
         eprintln!(
             "[gex] translated {} blocks / {} instructions -> {} KiB wasm ({} dispatch slots, \
-             {} entry points from data, {} untranslatable blocks)",
+             {} entry points from data, {} untranslatable blocks, {} dead flag statements)",
             stats.blocks,
             stats.instructions,
             stats.wasm_bytes / 1024,
             module_bytes.table_slots,
             stats.discovered_from_data,
             stats.illegal_blocks,
+            stats.dead_flag_stmts,
         );
     }
 

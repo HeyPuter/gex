@@ -22,10 +22,10 @@
 use gex_emit::module::Linkage;
 pub use gex_emit::PageTable;
 use gex_emit::{ModuleBuilder, TranslatedModule};
-use gex_ir::{pass, Term};
+use gex_ir::{pass, Block, Term};
 use gex_ld::Image;
 use gex_lift::{lift_block, BlockLimits};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Knobs for a translation run.
 #[derive(Clone, Debug)]
@@ -70,6 +70,8 @@ pub struct Stats {
     pub discovered_from_data: usize,
     /// Entry points reachable only because `exhaustive` was set.
     pub discovered_exhaustively: usize,
+    /// Statements deleted by cross-block flag liveness.
+    pub dead_flag_stmts: usize,
     pub wasm_bytes: usize,
 }
 
@@ -110,7 +112,92 @@ impl<'a> CodeView<'a> {
     }
 }
 
-/// Translate a whole loaded image to a wasm module.
+/// Delete flag writes that no reachable block ever reads.
+///
+/// Every `cmp`, `adds` and `subs` writes all four of NZCV, and the branch that
+/// follows reads one or two. Within a single block the other three have to be
+/// kept, because a successor might want them; across the whole graph they are
+/// almost always dead, and dropping the write lets [`pass::dce`] delete the
+/// arithmetic that produced it. On a vectorised inner loop that is a third of
+/// the block.
+///
+/// The analysis is an ordinary backwards liveness fixpoint over the blocks in
+/// hand. A successor that is not among them -- an indirect branch, a call into
+/// a function translated later, an address outside this module -- is assumed
+/// to read every flag, so an incomplete graph loses the optimisation rather
+/// than producing wrong code.
+fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
+    // A kill switch, so the transform can be measured against its absence and
+    // a suspected miscompilation bisected.
+    if std::env::var_os("GEX_NO_FLAG_LIVENESS").is_some() {
+        return 0;
+    }
+    let index: HashMap<u64, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.start, i))
+        .collect();
+    let effects: Vec<(u8, u8)> = blocks.iter().map(pass::flag_effects).collect();
+    // A block that can leave the graph keeps everything live, and so does one
+    // with a successor nobody translated.
+    //
+    // A call's flags are live if either the callee reads them or the code it
+    // returns to does, so `call_return` counts as a successor here even though
+    // it is not a control-flow edge out of this block. Without it a
+    // hand-written `cmp; bl f; b.eq` -- legal whenever `f` preserves the
+    // flags, which the ABI permits though no compiler relies on it -- would
+    // lose its compare.
+    let succs = |b: &Block| -> Vec<u64> { b.successors().chain(b.call_return).collect() };
+    let opaque: Vec<bool> = blocks
+        .iter()
+        .map(|b| pass::escapes(b) || succs(b).iter().any(|s| !index.contains_key(s)))
+        .collect();
+
+    let mut live_in = vec![0u8; blocks.len()];
+    loop {
+        let mut changed = false;
+        for (i, b) in blocks.iter().enumerate() {
+            let live_out = if opaque[i] {
+                pass::ALL_FLAGS
+            } else {
+                succs(b)
+                    .iter()
+                    .map(|s| live_in[index[s]])
+                    .fold(0, |a, x| a | x)
+            };
+            let (uses, defs) = effects[i];
+            let next = uses | (live_out & !defs);
+            if next != live_in[i] {
+                live_in[i] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut removed = 0;
+    for (i, b) in blocks.iter_mut().enumerate() {
+        if opaque[i] {
+            continue;
+        }
+        let live_out = succs(b)
+            .iter()
+            .map(|s| live_in[index[s]])
+            .fold(0, |a, x| a | x);
+        let dead = pass::flags_of_mask(pass::ALL_FLAGS & !live_out);
+        if dead.is_empty() {
+            continue;
+        }
+        let before = b.stmts.len();
+        pass::dead_store_elim_with(b, &dead);
+        pass::dce(b);
+        removed += before - b.stmts.len();
+    }
+    removed
+}
+
 pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
     let view = CodeView::new(image);
     let (text_lo, text_hi) = image.text_range;
@@ -122,6 +209,7 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     // usable as a content-addressed cache key (PLAN §10).
     let mut worklist: BTreeSet<u64> = BTreeSet::new();
     let mut seen: HashSet<u64> = HashSet::new();
+    let mut collected: Vec<Block> = Vec::new();
 
     worklist.insert(image.entry);
     for sym in &image.symbols {
@@ -201,7 +289,15 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
                 worklist.insert(succ);
             }
         }
-        builder.reserve(addr);
+        collected.push(block);
+    }
+
+    // Flag liveness needs the whole graph, so it runs once discovery has
+    // finished rather than per block. Emission order is unchanged, which
+    // keeps function indices -- and the module's hash -- deterministic.
+    stats.dead_flag_stmts = eliminate_dead_flags(&mut collected);
+    for block in collected {
+        builder.reserve(block.start);
         builder.add_block(block);
     }
 
@@ -246,6 +342,7 @@ pub fn translate_runtime(
     let mut stats = Stats::default();
     let mut worklist: BTreeSet<u64> = BTreeSet::new();
     let mut seen: HashSet<u64> = HashSet::new();
+    let mut collected: Vec<Block> = Vec::new();
     worklist.insert(entry);
 
     while let Some(&addr) = worklist.iter().next() {
@@ -295,6 +392,11 @@ pub fn translate_runtime(
                 worklist.insert(succ);
             }
         }
+        collected.push(block);
+    }
+
+    stats.dead_flag_stmts = eliminate_dead_flags(&mut collected);
+    for block in collected {
         builder.add_block(block);
     }
 

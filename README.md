@@ -159,12 +159,13 @@ $ cargo run --release -p gex-difffuzz -- --iters 5000 --verbose
 across all thirteen data-processing families — currently agree with QEMU
 exactly.
 
-**Whole programs, against QEMU.** Thirty-five comparisons over compiled C and
-C++ exercising arithmetic and flags, floating point, memory and strings,
+**Whole programs, against QEMU.** Thirty-seven comparisons over compiled C,
+C++ and hand-written assembly exercising arithmetic and flags, floating point, memory and strings,
 control flow (jump tables, function pointers, `longjmp`), the filesystem and
 descriptor surface, signal delivery, `-O3` auto-vectorised NEON, the NEON
-structure loads driven through ACLE intrinsics, and a C++ program that throws
-across a shared-object boundary — built static, static-PIE and dynamically
+structure loads driven through ACLE intrinsics, conditions that outlive the
+block that set them, and a C++ program that throws across a shared-object
+boundary — built static, static-PIE and dynamically
 linked, at `-O0`, `-O2` and `-O3`, with runtime translation both on and off.
 A comparison that fails is retried once and reported as `FLAKY` if it then
 passes, so a genuine intermittent difference is distinguishable from a
@@ -204,33 +205,6 @@ fixed cost is large and its per-unit cost is not.
 
 All three produce byte-identical output.
 
-### Self-loop fusion
-
-A guest block whose only successor is itself is emitted as a real wasm `loop`
-rather than a tail call back to its own function, and the guest registers it
-carries stay in wasm locals across the back-edge instead of round-tripping
-through the context every iteration. Only the registers the block reads
-*before writing* are preloaded: everything preloaded stays live for the whole
-loop, and locals that stay live are machine registers the host's allocator
-cannot use for anything else. Preloading the full read set instead of the
-live-in set turned a 1.28x win on matmul into a 0.90x loss.
-
-Measured as the minimum of interleaved runs with and without the transform
-(`GEX_NO_LOOP_FUSION=1` disables it), on this machine, which is a VM and noisy
-enough that single runs are not worth reading:
-
-| loop | speedup |
-|---|---|
-| `ldr q`/`ldr q`/`fmla`/`str q` + counted branch | 2.47x |
-| `add`/`cmp`/`b.ne` | 1.88x |
-| 320x320 float matmul | 1.28x |
-| `fmla` accumulating into one register | 1.23x |
-| matmul + dot product + `fccmp` classification | 1.05x |
-
-The tail is where the transform stops paying: a loop already bound by a
-floating-point dependency chain, or by memory, does not care where its
-registers live.
-
 Two caveats, both worth stating plainly. The native baseline is x86-64, not
 aarch64, so this is the same C source at `-O2` rather than the same machine
 code — PLAN §13's target is against native aarch64 and this is not that
@@ -242,6 +216,72 @@ is only 8-10x — is already inside the band set for tier-2. The startup cost is
 the other half of the story: it is almost entirely wasmtime compiling the
 thousands of functions exhaustive discovery produces, and it is what the
 content-addressed translation cache and runtime translation exist to remove.
+
+### Two tier-1 optimisations
+
+Both are measured the same way: the minimum of runs alternating between the
+transform enabled and disabled, on a VM noisy enough that a single run means
+nothing and even a minimum-of-eight moves by a few percent between sessions.
+The combined column is the reliable one; attributing a share to each transform
+individually is at the edge of what this machine can resolve.
+
+| workload | baseline | both on | speedup |
+|---|---|---|---|
+| `ldr q`/`ldr q`/`fmla`/`str q` + counted branch, 200M | 1.803 s | 0.726 s | **2.48x** |
+| `add`/`cmp`/`b.ne`, 200M | 1.452 s | 0.697 s | **2.08x** |
+| `fmla` accumulating into one register, 200M | 1.877 s | 1.274 s | **1.47x** |
+| 320x320 float matmul, 12 passes | 1.514 s | 1.267 s | **1.19x** |
+| matmul + dot product + `fccmp` classification | 1.368 s | 1.241 s | **1.10x** |
+
+The pattern is consistent: a loop whose cost was bookkeeping gets most of it
+back, and a loop already bound by a floating-point dependency chain or by
+memory does not.
+
+**Self-loop fusion** (`GEX_NO_LOOP_FUSION=1` disables it). A guest block whose
+only successor is itself becomes a real wasm `loop` rather than a tail call to
+its own function, and the guest registers it carries stay in wasm locals
+across the back-edge instead of round-tripping through the context every
+iteration. The safepoint poll still runs on the back-edge, and its slow path —
+which may deliver a signal and unwind — flushes first, so a handler sees the
+right architectural state; the flush sits inside the conditional, so the
+emitter keeps treating those registers as dirty for the paths that leave. A
+block containing a host call that can rewrite guest state is not fused at all.
+
+Only the *live-in* registers are preloaded, not everything the block reads.
+That is not a micro-optimisation: a preloaded register is live for the whole
+loop, and a wasm local that stays live is a machine register Cranelift cannot
+use for anything else. Preloading the full read set made matmul *slower* than
+not fusing at all.
+
+**Cross-block flag liveness** (`GEX_NO_FLAG_LIVENESS=1` disables it). Every
+`cmp`, `adds` and `subs` writes all four of NZCV; the branch that follows reads
+one or two. Within a block the other three have to be kept, because a successor
+might want them — but once the whole control-flow graph is in hand that
+question is answerable, and the answer is almost always "nothing". Dropping the
+write lets dead-code elimination delete the arithmetic behind it, which for a
+`subs` is the sign, zero, carry and overflow synthesis: about a third of the
+statements in a tight loop. On a static C++ binary the pass deletes roughly
+2000 statements and takes 5% off the module.
+
+It is an ordinary backwards liveness fixpoint over the blocks a translation
+unit produced. What makes it safe is what it refuses to reason about: an
+indirect branch, a syscall, a SIGILL, or any successor not translated in the
+same unit marks the block opaque, and an opaque block keeps every flag. An
+incomplete graph loses the optimisation rather than producing wrong code. A
+`bl`'s return site counts as a successor even though it is not a control-flow
+edge, so `cmp; bl f; b.eq` — legal whenever `f` preserves the flags, which the
+ABI permits though no compiler relies on it — keeps its compare.
+
+This is the part of tier-2 that PLAN §5.4 describes as needing a CFG, done in
+tier-1 because discovery had already built one.
+
+Because a compiler almost never emits a condition that crosses a block
+boundary, the C tests cannot exercise the cases this analysis must not break.
+`tests/integration/programs/flags.S` is hand-written assembly that does:
+conditions consumed one and two edges away from their compare, across a call,
+through `adc` and `ccmp`, and as a loop's exit test. With the analysis
+deliberately broken to treat every flag as dead, that program hangs — which is
+the point of having it.
 
 ---
 
