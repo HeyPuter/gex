@@ -188,6 +188,13 @@ pub trait FileSystem: Send + Sync {
         let _ = (from, to);
         Err(Errno::EROFS)
     }
+    /// Change a file's mode. Filesystems that do not model permissions
+    /// accept it and do nothing, which is what the guest expects to see.
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let _ = (path, mode);
+        Ok(())
+    }
+
     /// A second name for the same file. `EPERM` is what Linux says for a
     /// filesystem that has no hard links, which is the honest default.
     fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
@@ -344,6 +351,11 @@ impl Vfs {
             return Err(Errno::EXDEV);
         }
         fs.rename(&rel_from, &rel_to)
+    }
+
+    pub fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let (fs, rel) = self.resolve(path)?;
+        fs.chmod(&rel, mode)
     }
 
     /// `link`. Both names must be on one filesystem, as they must on Linux:

@@ -895,10 +895,30 @@ fn run_thread_loop(
                     pc = next;
                     continue;
                 }
-                match store.data().exit.clone() {
-                    Some(x) => return Ok(Stopped::Exited(x)),
-                    None => return Err(classify_trap(e, store)),
+                if let Some(x) = store.data().exit.clone() {
+                    return Ok(Stopped::Exited(x));
                 }
+                // A dispatch through a slot this thread's table has not
+                // reached yet.
+                //
+                // Every thread of a process shares the dispatch directory --
+                // it is in guest memory -- but each has its own wasm table,
+                // filled only when its own store installs a translation. So
+                // one thread can publish a directory entry naming slot N
+                // while another's table is still shorter than N, and that
+                // thread's next branch is not a recoverable miss but a trap.
+                //
+                // It is recoverable here, and exactly, because both indirect
+                // transfers write the target into the context before they
+                // take it: the guest made no progress, and its own record of
+                // where it was going is correct. Catch up and re-enter there.
+                if is_stale_table_trap(&e) {
+                    if let Some(next) = catch_up_and_resume(store, ctx_addr)? {
+                        pc = next;
+                        continue;
+                    }
+                }
+                return Err(classify_trap(e, store));
             }
         }
     }
@@ -2163,6 +2183,40 @@ fn write_dispatch_dir(memory: gex_mem::GuestMemory, entries: &[(u64, u32)]) -> R
 }
 
 /// Turn a wasm trap into a guest signal.
+/// Whether a trap is a dispatch through a table slot that is not there yet.
+///
+/// Both shapes mean the same thing: the slot is past the end of this store's
+/// table, or within it but never filled.
+fn is_stale_table_trap(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<wasmtime::Trap>(),
+        Some(wasmtime::Trap::TableOutOfBounds) | Some(wasmtime::Trap::IndirectCallToNull)
+    )
+}
+
+/// Replay what other threads have translated and say where to resume.
+///
+/// `None` when there was nothing to replay, which means the trap was not a
+/// stale table after all and the caller should report it.
+fn catch_up_and_resume(store: &mut Store<HostState>, ctx_addr: u64) -> Result<Option<u64>> {
+    let behind = match store.data().jit.as_ref() {
+        Some(jit) => {
+            let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+            sh.registry.len() > jit.replayed
+        }
+        None => return Ok(None),
+    };
+    if !behind {
+        return Ok(None);
+    }
+    catch_up_table(store)?;
+    let Some(memory) = store.data().memory.clone() else {
+        return Ok(None);
+    };
+    let pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+    Ok((pc != 0).then_some(pc))
+}
+
 fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
     let pc = store.data().memory.as_ref().map(|_| 0u64).unwrap_or(0);
     if let Some(trap) = e.downcast_ref::<wasmtime::Trap>() {

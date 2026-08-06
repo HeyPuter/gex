@@ -70,6 +70,8 @@ pub mod nr {
     pub const SYNC: u64 = 81;
     pub const STATX: u64 = 291;
     pub const PSELECT6: u64 = 72;
+    pub const FCHOWNAT: u64 = 54;
+    pub const FCHOWN: u64 = 55;
     pub const UTIMENSAT: u64 = 88;
     pub const STATFS: u64 = 43;
     pub const FSTATFS: u64 = 44;
@@ -396,6 +398,35 @@ fn set_id(slot: &mut u32, want: u64) -> SysResult {
         *slot = want as u32;
     }
     Ok(0)
+}
+
+/// The path a syscall names, for the trace.
+///
+/// A pointer is not a useful thing to read in a trace of a package manager:
+/// half the diagnosis is which file it could not open. Only the calls that
+/// take a path at a known argument are decoded, and a bad pointer prints
+/// nothing rather than failing.
+fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
+    let at = match n {
+        nr::OPENAT
+        | nr::NEWFSTATAT
+        | nr::FACCESSAT
+        | nr::FACCESSAT2
+        | nr::UNLINKAT
+        | nr::MKDIRAT
+        | nr::READLINKAT
+        | nr::UTIMENSAT
+        | nr::FCHOWNAT
+        | nr::FCHMODAT
+        | nr::STATX => a[1],
+        nr::CHDIR | nr::STATFS | nr::MOUNT | nr::UMOUNT2 => a[0],
+        nr::RENAMEAT | nr::LINKAT | nr::SYMLINKAT => a[1],
+        _ => return String::new(),
+    };
+    match m.read_cstr(at, 4096) {
+        Ok(raw) => format!(" {:?}", String::from_utf8_lossy(&raw)),
+        Err(_) => String::new(),
+    }
 }
 
 /// A terminal in the mode a shell finds it in: echo on, input line at a time.
@@ -1064,12 +1095,13 @@ impl Kernel {
         };
         if self.trace {
             eprintln!(
-                "[gex:{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}) = {}",
+                "[gex:{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} = {}",
                 self.pid,
                 syscall_name(n),
                 a[0],
                 a[1],
                 a[2],
+                traced_path(m, n, a),
                 ret as i64
             );
         }
@@ -1287,7 +1319,11 @@ impl Kernel {
             }
             // Permission bits are not modelled; reporting success keeps
             // installers and build systems moving.
-            nr::FCHMOD | nr::FCHMODAT => Ok(0),
+            nr::FCHMOD | nr::FCHMODAT => self.sys_chmod(m, n, a),
+            // Ownership is not modelled: there is one user and the guest is
+            // it. Refusing would be worse than accepting -- tar treats a
+            // failed chown while unpacking as a failure to unpack.
+            nr::FCHOWN | nr::FCHOWNAT => Ok(0),
 
             // -- memory ------------------------------------------------------
             nr::BRK => Ok(self.mem.brk(a[0])),
@@ -2185,6 +2221,17 @@ impl Kernel {
         Ok(())
     }
 
+    /// `fchmod` and `fchmodat`. The first names an open file, whose path the
+    /// descriptor kept; the second names a path directly.
+    fn sys_chmod(&mut self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+        let (path, mode) = if n == nr::FCHMOD {
+            (self.fds.get(a[0] as i32)?.path.clone(), a[1] as u32)
+        } else {
+            (self.at_path(m, a[0] as i32, a[1])?, a[2] as u32)
+        };
+        self.vfs.chmod(&path, mode).map(|_| 0)
+    }
+
     /// `sched_getaffinity`. One processor, and it is the one the caller is
     /// already on. dpkg asks in order to size its worker pool.
     fn sys_getaffinity(&mut self, m: &mut GuestMem<'_>, len: u64, mask: u64) -> SysResult {
@@ -2962,6 +3009,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::PPOLL => "ppoll",
         nr::PSELECT6 => "pselect6",
         nr::UTIMENSAT => "utimensat",
+        nr::FCHOWN => "fchown",
+        nr::FCHOWNAT => "fchownat",
         nr::STATFS => "statfs",
         nr::FSTATFS => "fstatfs",
         nr::UMASK => "umask",

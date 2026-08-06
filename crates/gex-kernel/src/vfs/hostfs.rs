@@ -182,7 +182,16 @@ impl FileSystem for HostFs {
         opts.read(acc == oflags::O_RDONLY || acc == oflags::O_RDWR)
             .write(want_write);
         if flags & oflags::O_CREAT != 0 {
-            opts.create(true).mode(mode);
+            // The guest's mode, but never without owner read and write.
+            //
+            // gex does not enforce permissions -- there is one user and the
+            // guest is root -- so the mode on disk is advisory. The host
+            // process is not root, though, and a file it creates with mode 0
+            // is a file it cannot open again. dpkg does exactly that: it
+            // unpacks into a `.dpkg-new` created with mode 0 so a
+            // half-written binary is never executable, chmods it at the end,
+            // and reopens it in between.
+            opts.create(true).mode(mode | 0o600);
         }
         if flags & oflags::O_EXCL != 0 {
             opts.create_new(true);
@@ -245,6 +254,21 @@ impl FileSystem for HostFs {
             return Err(Errno::EROFS);
         }
         std::fs::rename(self.host_path(from)?, self.host_path(to)?).map_err(|e| Errno::from_io(&e))
+    }
+
+    /// `chmod`, with the same floor as creation: the mode is the guest's
+    /// except that the host must keep being able to read and write what it
+    /// owns on the guest's behalf.
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            self.host_path(path)?,
+            std::fs::Permissions::from_mode((mode & 0o7777) | 0o600),
+        )
+        .map_err(|e| Errno::from_io(&e))
     }
 
     fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
