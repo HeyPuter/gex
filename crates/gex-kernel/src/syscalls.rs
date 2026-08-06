@@ -75,6 +75,7 @@ pub mod nr {
     pub const UMASK: u64 = 166;
     pub const UMOUNT2: u64 = 39;
     pub const MOUNT: u64 = 40;
+    pub const SCHED_GETAFFINITY: u64 = 123;
     pub const SCHED_YIELD: u64 = 124;
     pub const KILL: u64 = 129;
     pub const TKILL: u64 = 130;
@@ -1373,6 +1374,9 @@ impl Kernel {
             nr::NANOSLEEP => self.sys_nanosleep(m, a[0]),
             nr::CLOCK_NANOSLEEP => self.sys_nanosleep(m, a[2]),
             nr::GETRANDOM => self.sys_getrandom(m, a[0], a[1]),
+            // One processor, and it is the one the caller is on. dpkg asks
+            // to size its worker pool.
+            nr::SCHED_GETAFFINITY => self.sys_getaffinity(m, a[1], a[2]),
             nr::SCHED_YIELD => {
                 std::thread::yield_now();
                 Ok(0)
@@ -2173,6 +2177,17 @@ impl Kernel {
         Ok(())
     }
 
+    /// `sched_getaffinity`. One processor, and it is the one the caller is
+    /// already on. dpkg asks in order to size its worker pool.
+    fn sys_getaffinity(&mut self, m: &mut GuestMem<'_>, len: u64, mask: u64) -> SysResult {
+        let len = (len as usize).min(1024);
+        if mask != 0 && len >= 8 {
+            m.zero(mask, len)?;
+            m.write_u64(mask, 1)?;
+        }
+        Ok(8)
+    }
+
     /// `statfs`. One filesystem, large and mostly empty, which is what a
     /// program checking for room before it writes wants to hear.
     fn sys_statfs(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
@@ -2954,6 +2969,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::CLOCK_GETTIME => "clock_gettime",
         nr::CLOCK_GETRES => "clock_getres",
         nr::CLOCK_NANOSLEEP => "clock_nanosleep",
+        nr::SCHED_GETAFFINITY => "sched_getaffinity",
         nr::SCHED_YIELD => "sched_yield",
         nr::KILL => "kill",
         nr::TKILL => "tkill",
