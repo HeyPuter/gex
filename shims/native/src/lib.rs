@@ -669,6 +669,33 @@ fn run_program_with(
     });
     store.data_mut().spawn = Some(Arc::clone(&spawn));
 
+    // The interpreter is placed by gex's own loader, not by a guest `mmap`,
+    // so nothing announces it and the mapping hook never sees it. Without
+    // this it is the one object that is never statically recompiled -- and it
+    // is the one the guest starts in, so with the runtime translator off the
+    // program dies on its first instruction.
+    if opts.recompile_objects {
+        if let Some(interp) = &program.interp {
+            for seg in interp.segments.iter().filter(|s| s.executable) {
+                let map = gex_kernel::CodeMap {
+                    start: seg.vaddr,
+                    end: seg.vaddr + seg.bytes.len() as u64,
+                    path: program
+                        .exe
+                        .interp
+                        .clone()
+                        .unwrap_or_else(|| "[interp]".to_string()),
+                };
+                // Empty seeds: scan the whole segment. The interpreter's
+                // functions are almost all local and exported nowhere, so
+                // its symbol table covers a fraction of it.
+                if let Err(e) = recompile_object(&mut store, &map, &[]) {
+                    eprintln!("gex: could not recompile the interpreter: {e:#}");
+                }
+            }
+        }
+    }
+
     let stopped = run_thread_loop(&mut store, &instance, ctx_addr, program.entry())?;
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);
@@ -1780,7 +1807,15 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .with_kernel(|k| std::mem::take(&mut k.new_code));
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {
-                if let Err(e) = recompile_object(&mut caller, &m) {
+                // Empty seeds: a block at every decodable address.
+                //
+                // Symbols plus every address the object's own data takes gets
+                // libc down from 200,000 blocks to 62,000 and is *nearly*
+                // complete -- one address in libc still died, reached by a
+                // computed branch that neither reveals. Nearly complete is
+                // fine behind a runtime translator and fatal without one, and
+                // this path exists to work without one.
+                if let Err(e) = recompile_object(&mut caller, &m, &[]) {
                     // Not fatal: the runtime translator is still behind this,
                     // and it will pick the object up a block at a time.
                     eprintln!("gex: could not recompile {}: {e:#}", m.path);
@@ -2383,8 +2418,15 @@ fn write_dispatch_dir(memory: gex_mem::GuestMemory, entries: &[(u64, u32)]) -> R
 ///
 /// Empty when the file cannot be read or has no symbols, which tells
 /// `translate_object` to scan instead.
-fn object_seeds(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMap) -> Vec<u64> {
-    let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&map.path)) else {
+fn object_seeds(
+    caller: &mut impl wasmtime::AsContextMut<Data = HostState>,
+    map: &gex_kernel::CodeMap,
+) -> Vec<u64> {
+    let Some(bytes) = caller
+        .as_context_mut()
+        .data_mut()
+        .with_kernel(|k| k.read_file(&map.path))
+    else {
         return Vec::new();
     };
     // Parsed at its own addresses; the bias is worked out from where the
@@ -2404,6 +2446,37 @@ fn object_seeds(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMap) -
         .map(|s| s.value.wrapping_add(bias))
         .collect();
     seeds.push(image.entry.wrapping_add(bias));
+
+    // Every word in the object's own data that points into its own text.
+    //
+    // This is what makes symbol seeding complete enough to run without a
+    // runtime translator behind it. Discovery finds what a block branches to;
+    // symbols find what another object can call. Neither finds a function
+    // whose address was only ever taken -- a vtable, a jump table, an
+    // initialiser array, a callback stored in a struct -- and those are
+    // exactly the targets of the indirect branches that were dying.
+    //
+    // The alternative is starting a block at every decodable address, which
+    // is complete and costs 200,000 blocks for libc against a few tens of
+    // thousands here, nearly all of them interior addresses nothing ever
+    // jumps to.
+    //
+    // The values are unrelocated, so they are the library's own vaddrs and
+    // the same bias applies.
+    for seg in &image.segments {
+        if seg.executable {
+            continue;
+        }
+        for (i, chunk) in seg.bytes.chunks_exact(8).enumerate() {
+            if !(seg.vaddr as usize + i * 8).is_multiple_of(8) {
+                continue;
+            }
+            let v = u64::from_le_bytes(chunk.try_into().unwrap());
+            if v >= lo && v < hi && v % 4 == 0 {
+                seeds.push(v.wrapping_add(bias));
+            }
+        }
+    }
     seeds.sort_unstable();
     seeds.dedup();
     seeds
@@ -2413,10 +2486,14 @@ fn object_seeds(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMap) -
 /// would be a long pause for nothing.
 const MAX_OBJECT_BYTES: u64 = 64 << 20;
 
-/// A cap on one object, so a pathological mapping cannot stall the guest
-/// indefinitely. Anything past it still arrives through the runtime
-/// translator, which is what that path is for.
-const MAX_OBJECT_BLOCKS: usize = 200_000;
+/// A cap on one object, high enough not to bind on anything real: a megabyte
+/// of guest text is a quarter of a million instructions and so at most that
+/// many blocks. It exists only so a mapping of something that is not code
+/// cannot run away.
+///
+/// It used to be 200,000, which libc exceeded -- and with no runtime
+/// translator behind it, a capped object is an object the guest dies in.
+const MAX_OBJECT_BLOCKS: usize = 4_000_000;
 
 /// Statically recompile a shared library the guest has just mapped.
 ///
@@ -2430,8 +2507,12 @@ const MAX_OBJECT_BLOCKS: usize = 200_000;
 /// Cached by the hash of exactly what was translated -- the mapped bytes and
 /// the base address -- so the second run of any program using the library
 /// pays nothing.
-fn recompile_object(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMap) -> Result<()> {
-    if caller.data().jit.is_none() {
+fn recompile_object(
+    caller: &mut impl wasmtime::AsContextMut<Data = HostState>,
+    map: &gex_kernel::CodeMap,
+    seeds: &[u64],
+) -> Result<()> {
+    if caller.as_context().data().jit.is_none() {
         return Ok(());
     }
     // The interpreter maps its own segments before it has a kernel to ask, so
@@ -2441,7 +2522,7 @@ fn recompile_object(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMa
         return Ok(());
     }
     let (limits, shared) = {
-        let jit = caller.data().jit.as_ref().unwrap();
+        let jit = caller.as_context().data().jit.as_ref().unwrap();
         (jit.limits, Arc::clone(&jit.shared))
     };
     let page_table = {
@@ -2453,11 +2534,12 @@ fn recompile_object(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMa
         sh.translated.clone()
     };
     let memory = caller
+        .as_context()
         .data()
         .memory
         .clone()
         .ok_or_else(|| anyhow!("guest memory unavailable"))?;
-    let exec_ranges: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
+    let exec_ranges: Vec<(u64, u64)> = caller.as_context_mut().data_mut().with_kernel(|k| {
         k.mem
             .vmas()
             .iter()
@@ -2475,7 +2557,6 @@ fn recompile_object(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMa
     // affordable: on libc it finds 200,000 blocks where the symbols find a
     // small fraction of that, and the difference is all interior addresses
     // that a block starting at the function entry already covers.
-    let seeds = object_seeds(caller, map);
     let started = std::time::Instant::now();
     let (translated, stats) = {
         let data = memory.bytes();
@@ -2483,7 +2564,7 @@ fn recompile_object(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMa
             data,
             map.start,
             map.end,
-            &seeds,
+            seeds,
             &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
             &|a| known.contains(&a),
             page_table,
@@ -2495,8 +2576,13 @@ fn recompile_object(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMa
     if translated.exported_blocks.is_empty() {
         return Ok(());
     }
-    let engine = caller.data().jit.as_ref().unwrap().engine.clone();
-    let cache = caller.data().jit.as_ref().and_then(|j| j.cache.clone());
+    let engine = caller.as_context().data().jit.as_ref().unwrap().engine.clone();
+    let cache = caller
+        .as_context()
+        .data()
+        .jit
+        .as_ref()
+        .and_then(|j| j.cache.clone());
     let module = match cache {
         Some((dir, build)) => {
             let key = gex_cache::key(&build, [translated.wasm.as_slice()]);
@@ -2508,22 +2594,24 @@ fn recompile_object(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMa
         None => Module::new(&engine, &translated.wasm)
             .context("validating a statically recompiled object")?,
     };
+    let unit = Arc::new(CompiledUnit {
+        module,
+        exported_blocks: translated.exported_blocks.clone(),
+        dir_entries: translated.dir_entries.clone(),
+        table_slots: translated.table_slots,
+        page_table: translated.page_table.clone(),
+    });
     {
         let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.translated
             .extend(translated.exported_blocks.iter().map(|(a, _)| *a));
         sh.page_table = translated.page_table.clone();
-        sh.registry.push(Arc::new(CompiledUnit {
-            module,
-            exported_blocks: translated.exported_blocks.clone(),
-            dir_entries: translated.dir_entries.clone(),
-            table_slots: translated.table_slots,
-            page_table: translated.page_table.clone(),
-        }));
+        sh.registry.push(Arc::clone(&unit));
         sh.blocks += stats.blocks;
         sh.calls += 1;
     }
-    replay_registry(caller)?;
+    install_unit(caller.as_context_mut(), &unit)?;
+    caller.as_context_mut().data_mut().jit.as_mut().unwrap().replayed += 1;
     if std::env::var("GEX_VERBOSE_OBJECTS").is_ok() {
         eprintln!(
             "[gex] recompiled {} [{:#x}..{:#x}): {} blocks in {:.2}s",

@@ -503,6 +503,16 @@ fn translate_seeded(
             continue;
         }
         let mut block = lift_block(fetch, addr, limits);
+        // Deliberately *not* marking the block's interior as covered.
+        //
+        // Skipping seeds that fall inside an existing block is a large saving
+        // -- it takes libc from 200,000 blocks to a few tens of thousands --
+        // and it is wrong. An interior address is still a legal target for an
+        // indirect branch, and dispatch needs a block that starts exactly
+        // there; entering the containing block would re-run the instructions
+        // before it. With runtime translation behind it that is only a miss.
+        // Without, it is where the program dies, which is what `ld.so` did at
+        // 0x2801ae40 the first time this was tried.
         // Fold through memory before the ordinary passes, so a PLT's GOT load
         // becomes a constant and its `br` becomes a discoverable target.
         pass::const_fold_with_memory(&mut block, &|a, bytes| {
