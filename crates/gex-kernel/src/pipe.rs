@@ -105,10 +105,15 @@ impl Pipe {
             if s.writers == 0 {
                 return Ok(0);
             }
-            if self.is_nonblocking() {
-                return Err(Errno::EAGAIN);
-            }
-            s = self.ready.wait(s).unwrap();
+            // Never wait here. This runs with the kernel locked, and the
+            // process that would supply the data needs that lock to write --
+            // so waiting is not slow, it is a deadlock. A descriptor that
+            // should block is parked by the syscall layer instead, outside
+            // the lock, which is what `BlockOp::ReadStream` is for.
+            //
+            // apt's download helper found this: it read its control pipe,
+            // the pipe was momentarily empty, and the whole guest stopped.
+            return Err(Errno::EAGAIN);
         }
     }
 
@@ -151,6 +156,11 @@ impl Pipe {
 
     /// Bytes available to read, for `poll` and `FIONREAD`.
     pub fn available(&self) -> usize {
+        self.state.lock().unwrap().buf.len()
+    }
+
+    /// How many bytes are waiting to be read.
+    pub fn buffered(&self) -> usize {
         self.state.lock().unwrap().buf.len()
     }
 
@@ -208,17 +218,18 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_reader_wakes_when_data_arrives() {
+    fn an_empty_pipe_reports_rather_than_waits() {
+        // A read here runs with the kernel locked, and whoever would supply
+        // the data needs that lock to write. So an empty pipe says so, and
+        // the syscall layer parks the caller outside the lock.
         let p = Arc::new(Pipe::new());
-        let writer = Arc::clone(&p);
-        let t = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            writer.write(b"late").unwrap();
-        });
         let mut buf = [0u8; 8];
+        assert!(!p.readable());
+        assert_eq!(p.read(&mut buf).err(), Some(Errno::EAGAIN));
+        p.write(b"late").unwrap();
+        assert!(p.readable());
         let n = p.read(&mut buf).unwrap();
         assert_eq!(&buf[..n as usize], b"late");
-        t.join().unwrap();
     }
 
     #[test]

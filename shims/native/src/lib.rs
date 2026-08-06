@@ -710,16 +710,20 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
                 gex_kernel::net::Status::Closed => return Err(Errno::ECONNRESET),
             }
         },
-        BlockOp::Poll { fds, deadline } => {
+        BlockOp::Poll {
+            fds,
+            deadline,
+            report,
+        } => {
             let start = std::time::Instant::now();
             loop {
                 if gex_kernel::syscalls::poll_ready(&fds) {
                     let mut mem = GuestMem::new(data);
-                    return gex_kernel::syscalls::poll_finish(&fds, &mut mem);
+                    return gex_kernel::syscalls::poll_finish(&fds, &report, &mut mem);
                 }
                 if deadline.is_some_and(|d| start.elapsed() >= d) {
                     let mut mem = GuestMem::new(data);
-                    return gex_kernel::syscalls::poll_finish(&fds, &mut mem);
+                    return gex_kernel::syscalls::poll_finish(&fds, &report, &mut mem);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -1353,6 +1357,18 @@ impl gex_kernel::net::Transport for HostStream {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
             Err(_) => true,
         }
+    }
+
+    /// How much has arrived, by peeking. A real syscall, but `FIONREAD` is
+    /// asked rarely and the alternative -- guessing -- is what made glibc's
+    /// resolver read a datagram into a zero-length buffer.
+    fn available(&self) -> usize {
+        let mut guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_mut() else {
+            return 0;
+        };
+        let mut scratch = vec![0u8; 64 * 1024];
+        sock.peek(&mut scratch).unwrap_or(0)
     }
 
     fn close(&self) {

@@ -1607,7 +1607,9 @@ fn finish_parked(
             // could have woken it.
             gex_kernel::net::Status::Connecting => Err(Errno::EINPROGRESS),
         },
-        gex_kernel::BlockOp::Poll { fds, .. } => gex_kernel::syscalls::poll_finish(fds, gm),
+        gex_kernel::BlockOp::Poll { fds, report, .. } => {
+            gex_kernel::syscalls::poll_finish(fds, report, gm)
+        }
         gex_kernel::BlockOp::WaitChild {
             children,
             procs,

@@ -58,6 +58,12 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
     /// Whether `recv` would return without waiting -- which includes a closed
     /// connection, because end-of-file is an answer.
     fn has_data(&self) -> bool;
+    /// How many bytes are waiting, for `FIONREAD`. A stream may under-report
+    /// and the caller simply reads again; the number only has to be right
+    /// when it is zero.
+    fn available(&self) -> usize {
+        usize::from(self.has_data())
+    }
     fn close(&self);
 }
 
@@ -349,6 +355,27 @@ impl FileHandle for Socket {
     /// here made `poll` report a socket ready whenever the guest had asked
     /// not to block. A resolver polled, was told yes, read `EAGAIN`, and went
     /// round until it timed out.
+    /// For a datagram socket this has to be exact: it is the length of the
+    /// next datagram, and a caller sizes its buffer by it.
+    fn available(&self) -> Option<u64> {
+        if self.kind == Kind::Udp {
+            return Some(
+                self.dgrams
+                    .lock()
+                    .unwrap()
+                    .front()
+                    .map_or(0, |d| d.len() as u64),
+            );
+        }
+        Some(
+            self.transport
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |t| t.available() as u64),
+        )
+    }
+
     fn poll_readable(&self) -> bool {
         if self.kind == Kind::Udp {
             return !self.dgrams.lock().unwrap().is_empty();

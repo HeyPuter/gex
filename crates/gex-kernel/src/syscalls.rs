@@ -69,6 +69,10 @@ pub mod nr {
     pub const CLOCK_NANOSLEEP: u64 = 115;
     pub const SYNC: u64 = 81;
     pub const STATX: u64 = 291;
+    pub const PSELECT6: u64 = 72;
+    pub const STATFS: u64 = 43;
+    pub const FSTATFS: u64 = 44;
+    pub const UMASK: u64 = 166;
     pub const UMOUNT2: u64 = 39;
     pub const MOUNT: u64 = 40;
     pub const SCHED_YIELD: u64 = 124;
@@ -124,6 +128,8 @@ pub mod nr {
     pub const SHUTDOWN: u64 = 210;
     pub const SENDMSG: u64 = 211;
     pub const RECVMSG: u64 = 212;
+    pub const RECVMMSG: u64 = 243;
+    pub const SENDMMSG: u64 = 269;
     pub const BRK: u64 = 214;
     pub const MUNMAP: u64 = 215;
     pub const CLONE: u64 = 220;
@@ -243,6 +249,9 @@ pub enum BlockOp {
     Poll {
         fds: Vec<PollFd>,
         deadline: Option<std::time::Duration>,
+        /// How the answer is reported, which is the only thing that differs
+        /// between `poll` and `select`.
+        report: PollReport,
     },
     /// `wait4`. Blocks until one of `children` has a status to collect.
     WaitChild {
@@ -324,6 +333,13 @@ pub struct Kernel {
     /// Sockets by handle address, so a descriptor can be got back to the
     /// concrete socket the network syscalls need.
     pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
+    /// Serial for the unnamed files `O_TMPFILE` asks for.
+    pub next_tmpfile: u64,
+    /// The file-creation mask. Recorded rather than applied: nothing here
+    /// enforces permissions, but `umask(022)` is expected to hand back what
+    /// it replaced, and a build system that does not get one back concludes
+    /// the mask was zero and re-runs itself.
+    pub umask: u32,
     /// The terminal's size, as rows and columns. A page resizes.
     pub winsize: (u16, u16),
     /// The terminal settings, when there is a terminal.
@@ -399,11 +415,33 @@ pub const ECHO: u32 = 0x8;
 #[derive(Clone, Debug)]
 pub struct PollFd {
     /// Where the guest's `struct pollfd` sits, so `revents` can be written.
+    /// Unused when the waiter is `select`, which reports through bitmaps.
     pub addr: u64,
+    /// The descriptor, which `select` needs to find its bit again.
+    pub fd: i32,
     pub events: u16,
     /// `None` for a descriptor that does not exist, which is `POLLNVAL`.
     pub handle: Option<Arc<dyn crate::vfs::FileHandle>>,
     pub writable: bool,
+}
+
+/// How a waiter wants its answer written back.
+///
+/// `poll` and `select` ask the same question and differ only in the shape of
+/// the reply: one writes `revents` next to each descriptor, the other sets
+/// bits in three bitmaps. Everything between them is shared.
+#[derive(Clone, Debug)]
+pub enum PollReport {
+    /// `revents` in place, in the caller's `pollfd` array.
+    Poll,
+    /// `select`'s three `fd_set`s. A zero address means the caller did not
+    /// pass that set.
+    Select {
+        nfds: u32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+    },
 }
 
 /// What a `poll` entry would report right now.
@@ -428,18 +466,70 @@ pub fn poll_ready(fds: &[PollFd]) -> bool {
     fds.iter().any(|p| poll_revents(p) != 0)
 }
 
-/// Write `revents` back and count what is ready. Shared by the immediate
-/// answer and the one a parked `poll` gives when it wakes.
-pub fn poll_finish(fds: &[PollFd], m: &mut GuestMem<'_>) -> SysResult {
-    let mut ready = 0u64;
-    for p in fds {
-        let r = poll_revents(p);
-        if r != 0 {
-            ready += 1;
+/// Write the answer back and count what is ready. Shared by the immediate
+/// reply and the one a parked wait gives when it wakes.
+pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) -> SysResult {
+    const POLLIN: u16 = 0x001;
+    const POLLOUT: u16 = 0x004;
+    match report {
+        PollReport::Poll => {
+            let mut ready = 0u64;
+            for p in fds {
+                let r = poll_revents(p);
+                if r != 0 {
+                    ready += 1;
+                }
+                m.write_u32(p.addr + 4, ((r as u32) << 16) | p.events as u32)?;
+            }
+            Ok(ready)
         }
-        m.write_u32(p.addr + 4, ((r as u32) << 16) | p.events as u32)?;
+        PollReport::Select {
+            nfds,
+            readfds,
+            writefds,
+            exceptfds,
+        } => {
+            // `select` reports by rewriting the caller's sets in place, so
+            // every set it was given is cleared first: a descriptor that is
+            // not ready must come back clear even though it went in set.
+            let words = (*nfds as usize).div_ceil(64).max(1);
+            let mut out = [[0u64; 16]; 2];
+            for p in fds {
+                if p.fd < 0 || p.fd as u32 >= *nfds {
+                    continue;
+                }
+                let r = poll_revents(p);
+                let (w, bit) = ((p.fd / 64) as usize, p.fd % 64);
+                if w >= 16 {
+                    continue;
+                }
+                if r & POLLIN != 0 {
+                    out[0][w] |= 1 << bit;
+                }
+                if r & POLLOUT != 0 {
+                    out[1][w] |= 1 << bit;
+                }
+            }
+            let mut ready = 0u64;
+            for (i, set) in [*readfds, *writefds].into_iter().enumerate() {
+                if set == 0 {
+                    continue;
+                }
+                for w in 0..words.min(16) {
+                    m.write_u64(set + (w as u64) * 8, out[i][w])?;
+                    ready += out[i][w].count_ones() as u64;
+                }
+            }
+            // Nothing here ever reports an exceptional condition, but a
+            // caller that passed the set expects it cleared.
+            if *exceptfds != 0 {
+                for w in 0..words.min(16) {
+                    m.write_u64(*exceptfds + (w as u64) * 8, 0)?;
+                }
+            }
+            Ok(ready)
+        }
     }
-    Ok(ready)
 }
 
 /// A child process the kernel is tracking.
@@ -573,6 +663,8 @@ impl Kernel {
             procs: Arc::new(ProcTable::new()),
             ppid: 0,
             clock: system_clock,
+            next_tmpfile: 0,
+            umask: 0o022,
             net: None,
             resolver: Arc::new(net::Resolver::new()),
             sockets: Default::default(),
@@ -693,6 +785,8 @@ impl Kernel {
             procs: Arc::clone(&self.procs),
             ppid: self.pid,
             clock: self.clock,
+            next_tmpfile: self.next_tmpfile,
+            umask: self.umask,
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
             sockets: self.sockets.clone(),
@@ -915,7 +1009,19 @@ impl Kernel {
         // thread that would wake it can never get in.
         if let Some(op) = self.blocking_op(m, n, a) {
             if self.trace {
-                eprintln!("[gex] {} blocking", syscall_name(n));
+                // A parked `poll` says what it is parked on: which
+                // descriptors, and what it wants from each. Finding out that
+                // apt was waiting to read from a worker it had nothing
+                // queued for was the whole of one afternoon.
+                if let BlockOp::Poll { fds, .. } = &op {
+                    let want: Vec<String> = fds
+                        .iter()
+                        .map(|p| format!("{}:{:x}", p.fd, p.events))
+                        .collect();
+                    eprintln!("[gex] {} blocking on [{}]", syscall_name(n), want.join(" "));
+                } else {
+                    eprintln!("[gex] {} blocking", syscall_name(n));
+                }
             }
             return SyscallOutcome::Blocking(op);
         }
@@ -969,23 +1075,44 @@ impl Kernel {
                 let waits = file.would_block() && started == Err(Errno::EINPROGRESS);
                 waits.then_some(BlockOp::Connect { socket })
             }
-            nr::PPOLL => {
-                let fds = self.collect_pollfds(m, a[0], a[1])?;
+            nr::PPOLL | nr::PSELECT6 => {
+                let (fds, report, timeout) = if n == nr::PPOLL {
+                    (
+                        self.collect_pollfds(m, a[0], a[1])?,
+                        PollReport::Poll,
+                        a[2],
+                    )
+                } else {
+                    (
+                        self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?,
+                        PollReport::Select {
+                            nfds: a[0] as u32,
+                            readfds: a[1],
+                            writefds: a[2],
+                            exceptfds: a[3],
+                        },
+                        a[4],
+                    )
+                };
                 if poll_ready(&fds) {
                     return None;
                 }
                 // A zero timeout is a question, not a wait.
-                let deadline = if a[2] == 0 {
+                let deadline = if timeout == 0 {
                     None
                 } else {
-                    let secs = m.read_u64(a[2]).ok()?;
-                    let nanos = m.read_u64(a[2] + 8).ok()?;
+                    let secs = m.read_u64(timeout).ok()?;
+                    let nanos = m.read_u64(timeout + 8).ok()?;
                     if secs == 0 && nanos == 0 {
                         return None;
                     }
                     Some(std::time::Duration::new(secs, nanos as u32))
                 };
-                Some(BlockOp::Poll { fds, deadline })
+                Some(BlockOp::Poll {
+                    fds,
+                    deadline,
+                    report,
+                })
             }
             nr::READ => {
                 let file = self.fds.get(a[0] as i32).ok()?;
@@ -1104,6 +1231,15 @@ impl Kernel {
             nr::RENAMEAT => self.sys_renameat(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::SYMLINKAT => self.sys_symlinkat(m, a[0], a[2]),
             nr::PPOLL => self.sys_ppoll(m, a[0], a[1]),
+            nr::PSELECT6 => self.sys_pselect(m, a),
+            nr::STATFS | nr::FSTATFS => self.sys_statfs(m, a[1]),
+            // There is one process's view of the world and nothing consults
+            // a umask, but a program that sets one wants the old value back.
+            nr::UMASK => {
+                let old = self.umask;
+                self.umask = a[0] as u32 & 0o777;
+                Ok(old as u64)
+            }
             // Permission bits are not modelled; reporting success keeps
             // installers and build systems moving.
             nr::FCHMOD | nr::FCHMODAT => Ok(0),
@@ -1167,6 +1303,8 @@ impl Kernel {
             nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[4], a[5]),
             nr::SENDMSG => self.sys_sendmsg(m, a[0] as i32, a[1]),
             nr::RECVMSG => self.sys_recvmsg(m, a[0] as i32, a[1]),
+            nr::SENDMMSG => self.sys_sendmmsg(m, a[0] as i32, a[1], a[2]),
+            nr::RECVMMSG => self.sys_recvmmsg(m, a[0] as i32, a[1], a[2]),
             nr::GETPEERNAME => self.sys_getpeername(m, a[0] as i32, a[1], a[2]),
             // One interface, unnamed. A guest that asks where it is calling
             // from gets 0.0.0.0, which is what an unbound socket reports.
@@ -1522,7 +1660,30 @@ impl Kernel {
         mode: u32,
     ) -> SysResult {
         let p = self.at_path(m, dirfd, path)?;
-        let handle = self.vfs.open(&p, flags, mode)?;
+        // `O_TMPFILE` names a directory and asks for an unnamed file inside
+        // it. Ignoring the bit opens the directory, and every write to it
+        // then fails with `EISDIR` -- which is what apt saw while writing its
+        // package cache.
+        //
+        // The file is made, opened, and its name removed straight away, which
+        // is what "unnamed" means: the handle keeps it alive and nothing else
+        // can find it. A later `linkat` to give it a name would fail, and
+        // that is honest -- the alternative is leaving litter in the guest's
+        // filesystem under a name it never chose.
+        let handle = if flags & oflags::O_TMPFILE == oflags::O_TMPFILE {
+            let n = self.next_tmpfile;
+            self.next_tmpfile += 1;
+            let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
+            let h = self.vfs.open(
+                &tmp,
+                oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
+                if mode == 0 { 0o600 } else { mode },
+            )?;
+            let _ = self.vfs.unlink(&tmp);
+            h
+        } else {
+            self.vfs.open(&p, flags, mode)?
+        };
         let acc = flags & oflags::ACCMODE;
         let readable = acc == oflags::O_RDONLY || acc == oflags::O_RDWR;
         let writable = acc == oflags::O_WRONLY || acc == oflags::O_RDWR;
@@ -1766,9 +1927,14 @@ impl Kernel {
             TIOCSPGRP if is_tty => Ok(0),
             TIOCSWINSZ if is_tty => Ok(0),
             FIONREAD => {
-                let md = file.metadata()?;
-                let remaining = md.size.saturating_sub(file.offset());
-                m.write_u32(arg, remaining as u32)?;
+                let n = match file.handle.available() {
+                    Some(n) => n,
+                    None => {
+                        let md = file.metadata()?;
+                        md.size.saturating_sub(file.offset())
+                    }
+                };
+                m.write_u32(arg, n as u32)?;
                 Ok(0)
             }
             _ => Err(Errno::ENOTTY),
@@ -1861,12 +2027,109 @@ impl Kernel {
             let file = self.fds.get(fd).ok();
             out.push(PollFd {
                 addr,
+                fd,
                 events,
                 handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
                 writable: file.as_ref().is_some_and(|f| f.writable),
             });
         }
         Some(out)
+    }
+
+    /// Read `select`'s three bitmaps into the same list `poll` uses.
+    ///
+    /// The two calls ask the same question. Only the reply differs, so only
+    /// the reply is written twice.
+    fn collect_selectfds(
+        &self,
+        m: &GuestMem<'_>,
+        nfds: u32,
+        readfds: u64,
+        writefds: u64,
+        exceptfds: u64,
+    ) -> Option<Vec<PollFd>> {
+        const POLLIN: u16 = 0x001;
+        const POLLOUT: u16 = 0x004;
+        let nfds = nfds.min(1024);
+        let mut want: std::collections::BTreeMap<i32, u16> = Default::default();
+        for (set, ev) in [(readfds, POLLIN), (writefds, POLLOUT)] {
+            if set == 0 {
+                continue;
+            }
+            for w in 0..(nfds as usize).div_ceil(64) {
+                let word = m.read_u64(set + (w as u64) * 8).ok()?;
+                if word == 0 {
+                    continue;
+                }
+                for bit in 0..64u32 {
+                    let fd = (w as u32) * 64 + bit;
+                    if fd >= nfds {
+                        break;
+                    }
+                    if word & (1 << bit) != 0 {
+                        *want.entry(fd as i32).or_default() |= ev;
+                    }
+                }
+            }
+        }
+        // An exceptional condition never happens here, so a descriptor named
+        // only in that set is watched for nothing and simply never fires.
+        let _ = exceptfds;
+        Some(
+            want.into_iter()
+                .map(|(fd, events)| {
+                    let file = self.fds.get(fd).ok();
+                    PollFd {
+                        addr: 0,
+                        fd,
+                        events,
+                        handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
+                        writable: file.as_ref().is_some_and(|f| f.writable),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// `statfs`. One filesystem, large and mostly empty, which is what a
+    /// program checking for room before it writes wants to hear.
+    fn sys_statfs(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
+        if buf == 0 {
+            return Err(Errno::EFAULT);
+        }
+        let mut out = [0u8; 120];
+        let put = |o: &mut [u8; 120], at: usize, v: u64| {
+            o[at..at + 8].copy_from_slice(&v.to_le_bytes())
+        };
+        put(&mut out, 0, 0x0102_1994); // f_type: TMPFS_MAGIC
+        put(&mut out, 8, 4096); // f_bsize
+        put(&mut out, 16, 1 << 20); // f_blocks
+        put(&mut out, 24, 1 << 19); // f_bfree
+        put(&mut out, 32, 1 << 19); // f_bavail
+        put(&mut out, 40, 1 << 18); // f_files
+        put(&mut out, 48, 1 << 17); // f_ffree
+        put(&mut out, 72, 255); // f_namelen
+        put(&mut out, 80, 4096); // f_frsize
+        m.write(buf, &out)?;
+        Ok(0)
+    }
+
+    /// `pselect6`, for the case where something is ready already. The waiting
+    /// case is a [`BlockOp::Poll`], decided before this is reached.
+    fn sys_pselect(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let set = self
+            .collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])
+            .ok_or(Errno::EFAULT)?;
+        poll_finish(
+            &set,
+            &PollReport::Select {
+                nfds: a[0] as u32,
+                readfds: a[1],
+                writefds: a[2],
+                exceptfds: a[3],
+            },
+            m,
+        )
     }
 
     /// `ppoll`, for the case where something is ready already. The waiting
@@ -1878,7 +2141,7 @@ impl Kernel {
     /// again. It asks the handle now.
     fn sys_ppoll(&mut self, m: &mut GuestMem<'_>, fds: u64, nfds: u64) -> SysResult {
         let set = self.collect_pollfds(m, fds, nfds).ok_or(Errno::EFAULT)?;
-        poll_finish(&set, m)
+        poll_finish(&set, &PollReport::Poll, m)
     }
 
     // -- memory --------------------------------------------------------------
@@ -2193,6 +2456,17 @@ impl Kernel {
     /// `sendmsg`, which is how glibc writes to a socket. Only the iovecs
     /// matter here: there is no ancillary data to carry and one destination.
     fn sys_sendmsg(&mut self, m: &GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
+        // `msg_name` is where this one goes, and a reply has to be reported
+        // as having come from there or a resolver drops it as spoofed.
+        let name = m.read_u64(msg)?;
+        if name != 0 {
+            if let Ok(sock) = self.socket_of(fd) {
+                let bytes = m.read(name, 16)?.to_vec();
+                if let Ok((ip, port)) = net::parse_sockaddr(&bytes) {
+                    sock.set_peer(ip, port);
+                }
+            }
+        }
         let iov = m.read_u64(msg + 16)?;
         let iovlen = m.read_u64(msg + 24)?;
         let mut data = Vec::new();
@@ -2204,6 +2478,54 @@ impl Kernel {
             }
         }
         self.fds.get(fd)?.write(&data)
+    }
+
+    /// One `struct mmsghdr` is a `msghdr` and the length it carried.
+    const MMSGHDR: u64 = 64;
+
+    /// `sendmmsg`: several datagrams in one call.
+    ///
+    /// glibc's resolver sends its A and AAAA queries this way, and answering
+    /// `ENOSYS` does not send it back to `sendto` -- it reports the name as
+    /// unresolvable, which is how `apt-get update` failed with "Temporary
+    /// failure resolving".
+    fn sys_sendmmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, vec: u64, n: u64) -> SysResult {
+        let mut sent = 0u64;
+        for i in 0..n.min(1024) {
+            let hdr = vec + i * Self::MMSGHDR;
+            match self.sys_sendmsg(m, fd, hdr) {
+                Ok(len) => {
+                    m.write_u32(hdr + 56, len as u32)?;
+                    sent += 1;
+                }
+                // A failure on the first is the call's failure; after that
+                // the count is the answer, as it is for `sendmsg`.
+                Err(e) if sent == 0 => return Err(e),
+                Err(_) => break,
+            }
+        }
+        Ok(sent)
+    }
+
+    fn sys_recvmmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, vec: u64, n: u64) -> SysResult {
+        let mut got = 0u64;
+        for i in 0..n.min(1024) {
+            let hdr = vec + i * Self::MMSGHDR;
+            match self.sys_recvmsg(m, fd, hdr) {
+                Ok(len) => {
+                    m.write_u32(hdr + 56, len as u32)?;
+                    got += 1;
+                    // A datagram socket delivers one message per call; if
+                    // this one came up short there is nothing else waiting.
+                    if len == 0 {
+                        break;
+                    }
+                }
+                Err(e) if got == 0 => return Err(e),
+                Err(_) => break,
+            }
+        }
+        Ok(got)
     }
 
     fn sys_recvmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
@@ -2520,6 +2842,10 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::PREAD64 => "pread64",
         nr::PWRITE64 => "pwrite64",
         nr::PPOLL => "ppoll",
+        nr::PSELECT6 => "pselect6",
+        nr::STATFS => "statfs",
+        nr::FSTATFS => "fstatfs",
+        nr::UMASK => "umask",
         nr::READLINKAT => "readlinkat",
         nr::NEWFSTATAT => "newfstatat",
         nr::FSTAT => "fstat",
@@ -2580,6 +2906,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::SHUTDOWN => "shutdown",
         nr::SENDMSG => "sendmsg",
         nr::RECVMSG => "recvmsg",
+        nr::SENDMMSG => "sendmmsg",
+        nr::RECVMMSG => "recvmmsg",
         nr::SOCKETPAIR => "socketpair",
         nr::CONNECT => "connect",
         nr::SENDTO => "sendto",

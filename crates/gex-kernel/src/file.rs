@@ -308,6 +308,19 @@ pub struct PipeEnd {
 }
 
 impl FileHandle for PipeEnd {
+    /// A pipe with nothing in it is not readable, whatever the default says.
+    ///
+    /// The default is "yes", which is right for a file and wrong here, and it
+    /// is what a `select` on an empty pipe was told: ready, read nothing, ask
+    /// again. apt waits for its download helper's greeting exactly that way.
+    fn poll_readable(&self) -> bool {
+        self.write || self.pipe.readable()
+    }
+
+    fn available(&self) -> Option<u64> {
+        Some(if self.write { 0 } else { self.pipe.buffered() as u64 })
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if self.write {
             return Err(Errno::EBADF);

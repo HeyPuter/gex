@@ -144,6 +144,17 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn poll_readable(&self) -> bool {
         true
     }
+
+    /// How many bytes a read would return right now, for `FIONREAD`.
+    ///
+    /// `None` means "work it out from the size and the offset", which is the
+    /// right answer for a file and no answer at all for a socket. glibc's
+    /// resolver asks this to size the buffer it will read a datagram into,
+    /// so a socket that says nothing is available gets read with a
+    /// zero-length buffer and its answer is thrown away.
+    fn available(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A mounted filesystem.

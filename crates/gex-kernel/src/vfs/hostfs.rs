@@ -81,6 +81,18 @@ struct HostHandle {
 }
 
 impl FileHandle for HostHandle {
+    /// `ftruncate`. Without this the trait's default answered `EINVAL`, which
+    /// is what a caller sees when it truncates a file it has just opened to
+    /// rewrite -- apt does exactly that before hashing a download, and
+    /// reported it as "Unable to truncate to 0".
+    fn truncate(&self, len: u64) -> Result<(), Errno> {
+        self.file
+            .lock()
+            .unwrap()
+            .set_len(len)
+            .map_err(|e| Errno::from_io(&e))
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         let mut f = self.file.lock().unwrap();
         f.seek(SeekFrom::Start(offset))

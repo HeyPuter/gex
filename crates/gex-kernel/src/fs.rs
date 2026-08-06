@@ -16,6 +16,9 @@ pub mod oflags {
     pub const O_NONBLOCK: u64 = 0o4000;
     pub const O_DIRECTORY: u64 = 0o200000;
     pub const O_CLOEXEC: u64 = 0o2000000;
+    /// An unnamed file created inside the named *directory*. The bit overlaps
+    /// `O_DIRECTORY`, which is why it is always tested together with it.
+    pub const O_TMPFILE: u64 = 0o20000000;
     pub const ACCMODE: u64 = 0o3;
 }
 
