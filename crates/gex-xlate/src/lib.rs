@@ -140,6 +140,33 @@ impl<'a> CodeView<'a> {
 /// a function translated later, an address outside this module -- is assumed
 /// to read every flag, so an incomplete graph loses the optimisation rather
 /// than producing wrong code.
+/// The general-register analogue of this pass is not here, and that is a
+/// result rather than an omission.
+///
+/// Twenty percent of emitted code is guest registers going out to the context
+/// at a block boundary and coming back at the next, so removing the writes
+/// that no successor reads looks like the obvious whole-object optimisation:
+/// it needs every successor in hand, which a static recompilation has and a
+/// demand-driven translation of a few thousand blocks does not.
+///
+/// Built and measured: it removes 44 statements out of 27,614 guest
+/// instructions. Nothing. The reason is that the guest was compiled by GCC,
+/// which allocated its registers already -- a value written near the end of a
+/// basic block is written because something downstream reads it, and dead
+/// stores across a boundary essentially do not occur in optimised code.
+///
+/// A return had to be modelled before the analysis found even that much:
+/// treating `ret` as opaque floods every function body with live registers
+/// from its own exit, and the pass removes exactly zero. Assuming the
+/// procedure call standard there -- x9 to x18 are caller-saved and dead at a
+/// return -- cut the opaque blocks from 1514 to 1096 and changed the number
+/// of statements removed not at all. So the assumption buys nothing either,
+/// which is worth knowing before anyone trades soundness for it.
+///
+/// The traffic is not dead writes. It is live values that a block boundary
+/// forces out of locals, and the only things that help are the ones that keep
+/// them in locals across the boundary: regions, and passing registers as
+/// block parameters. Both already exist.
 fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
     // A kill switch, so the transform can be measured against its absence and
     // a suspected miscompilation bisected.
