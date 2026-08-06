@@ -244,6 +244,16 @@ impl FdTable {
         Ok(fd as u64)
     }
 
+    /// Drop every descriptor, as the kernel does when a process dies.
+    ///
+    /// What matters is not the tidiness: a pipe end held by a process nobody
+    /// will ever reap keeps the pipe open, and whoever is reading the other
+    /// end waits for an end of file that cannot come.
+    pub fn close_all(&mut self) {
+        self.entries.clear();
+        self.cloexec.clear();
+    }
+
     pub fn close(&mut self, fd: i32) -> Result<(), Errno> {
         if fd < 0 {
             return Err(Errno::EBADF);

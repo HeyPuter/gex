@@ -915,7 +915,7 @@ impl Kernel {
             return match self.sigreturn(m) {
                 Ok(pc) => {
                     if self.trace {
-                        eprintln!("[gex] rt_sigreturn -> 0x{pc:x}");
+                        eprintln!("[gex:{}] rt_sigreturn -> 0x{pc:x}", self.pid);
                     }
                     SyscallOutcome::Resume(pc)
                 }
@@ -960,7 +960,7 @@ impl Kernel {
                 }
             };
             if self.trace {
-                eprintln!("[gex] reboot({what})");
+                eprintln!("[gex:{}] reboot({what})", self.pid);
             }
             self.procs.request_halt(0);
             return SyscallOutcome::Exit(0);
@@ -969,7 +969,7 @@ impl Kernel {
             return match self.prepare_exec(m, a) {
                 Ok((path, argv, envp)) => {
                     if self.trace {
-                        eprintln!("[gex] execve({path:?}, {} args)", argv.len());
+                        eprintln!("[gex:{}] execve({path:?}, {} args)", self.pid, argv.len());
                     }
                     SyscallOutcome::Exec { path, argv, envp }
                 }
@@ -1003,7 +1003,7 @@ impl Kernel {
                 Ok(req) => {
                     let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, req.tid as u64);
                     if self.trace {
-                        eprintln!("[gex] clone(...) = {} (new thread)", req.tid);
+                        eprintln!("[gex:{}] clone(...) = {} (new thread)", self.pid, req.tid);
                     }
                     SyscallOutcome::SpawnThread {
                         ctx_addr: req.ctx_addr,
@@ -1014,7 +1014,7 @@ impl Kernel {
                 Err(e) => {
                     let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, e.as_return());
                     if self.trace {
-                        eprintln!("[gex] clone(...) = {}", -(e.0 as i64));
+                        eprintln!("[gex:{}] clone(...) = {}", self.pid, -(e.0 as i64));
                     }
                     SyscallOutcome::Continue
                 }
@@ -1024,7 +1024,7 @@ impl Kernel {
         // last thread the two are the same thing.
         if n == nr::EXIT && self.live_threads > 1 {
             if self.trace {
-                eprintln!("[gex] exit({}) (thread {})", a[0] as i32, self.tid);
+                eprintln!("[gex:{}] exit({}) (thread {})", self.pid, a[0] as i32, self.tid);
             }
             self.thread_exit(m);
             return SyscallOutcome::ThreadExit;
@@ -1043,9 +1043,9 @@ impl Kernel {
                         .iter()
                         .map(|p| format!("{}:{:x}", p.fd, p.events))
                         .collect();
-                    eprintln!("[gex] {} blocking on [{}]", syscall_name(n), want.join(" "));
+                    eprintln!("[gex:{}] {} blocking on [{}]", self.pid, syscall_name(n), want.join(" "));
                 } else {
-                    eprintln!("[gex] {} blocking", syscall_name(n));
+                    eprintln!("[gex:{}] {} blocking", self.pid, syscall_name(n));
                 }
             }
             return SyscallOutcome::Blocking(op);
@@ -1056,14 +1056,15 @@ impl Kernel {
             Ok(r) => encode(*r),
             Err(exit) => {
                 if self.trace {
-                    eprintln!("[gex] exit_group({exit})");
+                    eprintln!("[gex:{}] exit_group({exit})", self.pid);
                 }
                 return SyscallOutcome::Exit(*exit);
             }
         };
         if self.trace {
             eprintln!(
-                "[gex] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}) = {}",
+                "[gex:{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}) = {}",
+                self.pid,
                 syscall_name(n),
                 a[0],
                 a[1],
@@ -1442,7 +1443,7 @@ impl Kernel {
                     self.unimplemented.push(n);
                 }
                 if self.trace {
-                    eprintln!("[gex] unimplemented syscall {n} -> ENOSYS");
+                    eprintln!("[gex:{}] unimplemented syscall {n} -> ENOSYS", self.pid);
                 }
                 Err(Errno::ENOSYS)
             }

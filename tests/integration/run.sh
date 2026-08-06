@@ -321,6 +321,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/fork" "$HERE/programs/fork.c"
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 "$CC" -static -no-pie -O2 -o "$WORK/init" "$HERE/programs/init.c"
+"$CC" -static -no-pie -O2 -pthread -o "$WORK/forkthread" "$HERE/programs/forkthread.c"
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
 # .eh_frame through personality routines -- a very different code shape from
 # anything the C programs reach.
@@ -455,6 +456,13 @@ group: pid 4 exited 42
 group: pid 5 exited 42
 init: wait with no children -> ECHILD
 init: done" "$WORK/init"
+# Threads and pipes inside a process that was forked and then exec'd, which
+# is what a package manager does to unpack an archive. Not compared against
+# qemu, which cannot exec the child without its own wrapper in the way.
+expect "fork-exec-threads" "worker: 4 threads joined, mix=877
+main: worker exited 0
+sink: 140434 bytes summing to 983040
+main: sink exited 0" "$WORK/forkthread"
 [ -n "$CPP" ] && compare "cpp-static" "$WORK/cpp"
 
 if [ -n "$DYNAMIC" ]; then

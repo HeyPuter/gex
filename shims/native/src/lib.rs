@@ -856,8 +856,24 @@ fn run_thread_loop(
             std::thread::Builder::new()
                 .name(format!("gex-tid-{}", child.tid))
                 .spawn(move || {
-                    if let Err(e) = run_guest_thread(cx, child) {
+                    if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
                         eprintln!("gexc: thread {} failed: {e:#}", child.tid);
+                        // A thread that fails takes its process with it. On
+                        // Linux an unhandled fault is fatal to the whole
+                        // thread group, and here it also has to be: the other
+                        // threads would otherwise sit in a futex forever, the
+                        // process would never exit, and every descriptor it
+                        // holds would stay open. A reader waiting on the other
+                        // end of one of its pipes waits for good.
+                        //
+                        // That is how a trap in dpkg's decompressor turned
+                        // into `apt-get install` hanging rather than failing.
+                        stop_other_threads(&cx, false);
+                        cx.kernel
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .fds
+                            .close_all();
                     }
                     running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 })
@@ -1003,10 +1019,26 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
     std::thread::Builder::new()
         .name(format!("gex-pid-{pid}"))
         .spawn(move || {
+            let cleanup = Arc::clone(&child_cx);
             let code = match run_guest_process(child_cx, thread, entry) {
                 Ok(exit) => exit.code(),
                 Err(e) => {
                     eprintln!("gexc: child {pid} failed: {e:#}");
+                    // A process that dies takes its threads and its
+                    // descriptors with it. Without this the threads sit in a
+                    // futex nobody will wake, they hold the last references
+                    // to the kernel, and every pipe the process had stays
+                    // open -- so whoever is reading the other end waits for
+                    // an end of file that cannot come. A trap in dpkg's
+                    // decompressor hung `apt-get install` that way rather
+                    // than failing it.
+                    stop_other_threads(&cleanup, false);
+                    cleanup
+                        .kernel
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .fds
+                        .close_all();
                     127
                 }
             };
@@ -1510,6 +1542,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::SYSCALL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
+            // Every thread of a process shares the dispatch directory -- it
+            // is in guest memory -- but each has its own wasm table, and a
+            // table only gains a translation when its own store installs it.
+            // So a thread can be told by the directory to call slot N while
+            // its table is still shorter than N, which is not a dispatch miss
+            // it can recover from but a hard trap with nowhere to land.
+            //
+            // dpkg's decompressor hit this: two threads entering the same
+            // freshly translated loop, one of them a moment behind.
+            //
+            // Catching up here costs a comparison of two integers on the
+            // common path and closes the window to whatever a thread can
+            // execute between one syscall and the next.
+            catch_up_in_caller(&mut caller)?;
             let memory = caller
                 .data()
                 .memory
@@ -1808,6 +1854,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::SAFEPOINT,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
+            // Same reason as the syscall hook: a loop that never calls the
+            // kernel still reaches a back-edge, and this is where it does.
+            catch_up_in_caller(&mut caller)?;
             let memory = caller
                 .data()
                 .memory
@@ -1986,6 +2035,24 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
 /// Returns whether anything was replayed. The registry is append-only and
 /// ordered, so a store catches up by walking forward from its own watermark;
 /// two stores that have replayed the same count hold the same code.
+/// Replay anything this store has not seen, cheaply enough to call often.
+///
+/// The check is a length comparison; the work only happens when another
+/// thread has translated something since.
+fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> {
+    let behind = match caller.data().jit.as_ref() {
+        Some(jit) => {
+            let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+            sh.registry.len() > jit.replayed
+        }
+        None => false,
+    };
+    if behind {
+        replay_registry(caller)?;
+    }
+    Ok(())
+}
+
 fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
     let (shared, from) = {
         let Some(jit) = caller.data().jit.as_ref() else {
