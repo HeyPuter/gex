@@ -89,6 +89,28 @@ int main(void) {
     { uint32x2_t r = vget_low_u32(a32); r = vorr_u32(r, vdup_n_u32(0x0000ff00));
       printf("orr_2s     %08x\n", hash(&r, 8)); }
 
+    /* A right shift by the whole element width. Legal, and it means what it
+       says: everything shifted out, so zero unsigned and the replicated sign
+       bit signed. wasm has no such shift -- it takes the count modulo the
+       lane width, so 32 on a 32-bit lane is a shift by nothing at all and
+       hands back the operand. Quietly returning the input is the worst
+       available answer and is what gex did until this was written. */
+    { uint32x4_t r = a32;
+      __asm__ volatile("ushr %0.4s, %1.4s, #32" : "=w"(r) : "w"(a32));
+      printf("ushr_full  %08x\n", hash(&r, 16)); }
+    { int32x4_t r;
+      __asm__ volatile("sshr %0.4s, %1.4s, #32" : "=w"(r) : "w"(a32));
+      printf("sshr_full  %08x\n", hash(&r, 16)); }
+    { uint16x8_t r;
+      __asm__ volatile("ushr %0.8h, %1.8h, #16" : "=w"(r) : "w"(a16));
+      printf("ushr_full16 %08x\n", hash(&r, 16)); }
+    { int16x8_t r;
+      __asm__ volatile("sshr %0.8h, %1.8h, #16" : "=w"(r) : "w"(a16));
+      printf("sshr_full16 %08x\n", hash(&r, 16)); }
+    { uint8x16_t r;
+      __asm__ volatile("ushr %0.16b, %1.16b, #8" : "=w"(r) : "w"(a8));
+      printf("ushr_full8 %08x\n", hash(&r, 16)); }
+
     /* And the sequence glibc actually runs: find the first zero byte by
        comparing, folding with addhn, and reading the result as a scalar. */
     static const char *cases[] = {"", "a", "hello", "0123456789abcdef",

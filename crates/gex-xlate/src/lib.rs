@@ -325,6 +325,15 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
         stats.instructions += ((block.end - block.start) / 4) as usize;
         if matches!(block.term, Term::Illegal { .. }) {
             stats.illegal_blocks += 1;
+            // Which instruction, so the gap can be closed rather than
+            // counted. The lifter reaching one of these is a hole in the
+            // static recompilation: the block is emitted, it is dispatched
+            // to, and it raises SIGILL.
+            if std::env::var_os("GEX_SHOW_ILLEGAL").is_some() {
+                if let Term::Illegal { raw, pc } = block.term {
+                    eprintln!("[illegal] {raw:#010x} at {pc:#x}");
+                }
+            }
         }
 
         // Both the successors and the return site of any call in this block

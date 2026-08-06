@@ -2764,6 +2764,29 @@ impl<'a> Lifter<'a> {
     ) -> Flow {
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
+        // A right shift by the whole element width is legal on AArch64 and
+        // means what it says: every bit shifted out, so zero unsigned and the
+        // replicated sign bit signed. wasm does not have that shift -- it
+        // takes the count modulo the lane width, so a count of 32 on a 32-bit
+        // lane is a shift by zero and returns the input unchanged.
+        //
+        // Quietly returning the input is the worst possible answer, and it is
+        // what gex did: `ushr v0.4s, v0.4s, #32` came back with its operand.
+        // dpkg-deb decompressing a package overran a buffer and glibc's stack
+        // protector aborted it, several hundred files into the archive.
+        let bits = arr.lane_bytes * 8;
+        let shift = if matches!(op, VShiftImmOp::SShr | VShiftImmOp::UShr) && shift >= bits {
+            if op == VShiftImmOp::UShr {
+                // Nothing survives. Shifting by one less and then once more
+                // would work too; a zero is clearer and cheaper.
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                self.commit_vector(vd, arr, zero);
+                return Flow::Next;
+            }
+            bits - 1
+        } else {
+            shift
+        };
         let amount = self.b.const_i32(shift);
         let sop = match op {
             VShiftImmOp::Shl => VShiftOp::Shl,
