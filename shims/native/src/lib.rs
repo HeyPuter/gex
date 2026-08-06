@@ -329,6 +329,14 @@ fn run_program_with(
     // feeds `extra_entries`, so it changes the translation and therefore the
     // cache key: a run that discovers something new compiles once more and
     // then settles.
+    //
+    // Worth knowing before measuring anything: "once more" is a whole
+    // recompilation, and Cranelift on a megabyte of guest text is tens of
+    // seconds. A binary with many independent entry points pays it once per
+    // path. `busybox md5sum` took 29 seconds and then 0.148; `busybox wget`
+    // took 27 and then 0.656. Both look exactly like a runtime problem in the
+    // program being measured, and neither is -- so warm the path first, or
+    // pass --no-cache and measure the build honestly.
     // A build that cannot identify itself must not use the cache: it cannot
     // be distinguished from a different one, and reusing another build's
     // compiled code is how a fixed translator serves broken output.
