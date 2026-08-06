@@ -180,6 +180,9 @@ struct Emitter<'a> {
     reenter_local: Option<u32>,
     /// Set while emitting a member of a region.
     region: Option<RegionState>,
+    /// Which registers the region writes, and so has to store on the way out.
+    /// The ones it only reads are already correct in the context.
+    region_writes: std::collections::HashSet<GuestReg>,
 }
 
 /// What a region member needs to know to branch to its neighbours.
@@ -215,6 +218,7 @@ impl<'a> Emitter<'a> {
             loop_depth: None,
             reenter_local: None,
             region: None,
+            region_writes: Default::default(),
         }
     }
 
@@ -253,21 +257,20 @@ impl<'a> Emitter<'a> {
     /// Only leaf loops qualify -- a call in the body ends the region, because
     /// the callee returns through the table -- so this fires on a few hundred
     /// loops in a large program: 195 in Lua, 1287 in SQLite. On nbench in the
-    /// browser, against the same module built without it, one paired run:
+    /// browser, against the same module built without it:
     ///
     /// ```text
-    ///     STRING SORT  +13%      NUMERIC SORT   +1%
-    ///     HUFFMAN       +7%      FOURIER        -0%
-    ///     NEURAL NET    +6%      IDEA           -3%
-    ///     ASSIGNMENT    +5%      FP EMULATION  -12%
-    ///     BITFIELD      +2%
+    ///     ASSIGNMENT   +15%      FOURIER        +3%
+    ///     NUMERIC SORT +13%      IDEA           -3%
+    ///     STRING SORT  +10%      FP EMULATION   -7%
+    ///     BITFIELD      +3%      geometric mean +5%
     /// ```
     ///
-    /// A small net win, not a large one, and worth reading with the machine's
-    /// run-to-run spread in mind -- about 8% here, so only the two ends of
-    /// that list are solid. FP emulation was down in both runs of it, and is
-    /// the one to look at: it is the kernel most made of tight branchy
-    /// integer loops, which is what this was supposed to help.
+    /// Assignment and numeric sort are two of the kernels where gex was
+    /// behind QEMU. FP emulation is the one that resists: it is the kernel
+    /// most made of tight branchy integer loops, which is what this was
+    /// supposed to help, and it has been negative in every measurement --
+    /// though narrowing what a region stores took it from -12% to -7%.
     ///
     /// Lua, matmul and a call microbenchmark are unchanged, which is what a
     /// transform reaching only leaf loops should look like.
@@ -279,20 +282,47 @@ impl<'a> Emitter<'a> {
             .map(|(i, a)| (*a, i as u32))
             .collect();
 
-        // Every register any member touches has to be in a local before the
-        // loop: the context is authoritative on the way in and nowhere else,
-        // and one that is only ever written still has to be loaded, because
-        // an exit taken before anything wrote it would otherwise store
-        // whatever the local happened to hold.
-        let mut touched: Vec<GuestReg> = Vec::new();
+        // Every register the loop touches starts in a local holding the
+        // context's value -- including one the loop only ever writes, because
+        // an exit taken on a path that has not reached the write yet still
+        // stores the local, and an uninitialised one would put a zero in the
+        // context. What the two sets are actually for is the way *out*: a
+        // register the loop only reads is already correct in the context and
+        // needs no store, and a region pays that store on every exit.
+        let (mut reads, mut writes): (Vec<GuestReg>, Vec<GuestReg>) = (Vec::new(), Vec::new());
         for a in region {
-            for r in registers_touched(self.cx.gir[a]) {
-                if !touched.contains(&r) {
-                    touched.push(r);
+            let (r, w) = registers_read_and_written(self.cx.gir[a]);
+            for x in r {
+                if !reads.contains(&x) {
+                    reads.push(x);
+                }
+            }
+            for x in w {
+                if !writes.contains(&x) {
+                    writes.push(x);
                 }
             }
         }
+        self.region_writes = writes.iter().copied().collect();
+        let mut touched = reads;
+        for w in writes {
+            if !touched.contains(&w) {
+                touched.push(w);
+            }
+        }
         touched.sort_by_key(|r| Self::reg_offset(*r));
+        if std::env::var_os("GEX_REGION_DEBUG").is_some() {
+            let insts: u64 = region
+                .iter()
+                .map(|a| (self.cx.gir[a].end - self.cx.gir[a].start) / 4)
+                .sum();
+            eprintln!(
+                "[region] {} blocks, {} instructions, {} registers held",
+                n,
+                insts,
+                touched.len()
+            );
+        }
         for r in touched {
             self.reg_local(r);
         }
@@ -347,7 +377,12 @@ impl<'a> Emitter<'a> {
     /// this that does not depend on emission order, and it costs stores only
     /// where control leaves the loop.
     fn flush_region_exit(&mut self) {
-        let mut all: Vec<(GuestReg, u32)> = self.regs.iter().map(|(r, c)| (*r, c.local)).collect();
+        let mut all: Vec<(GuestReg, u32)> = self
+            .regs
+            .iter()
+            .filter(|(r, _)| self.region_writes.contains(*r))
+            .map(|(r, c)| (*r, c.local))
+            .collect();
         all.sort_by_key(|(r, _)| Self::reg_offset(*r));
         for (r, local) in all {
             note_traffic(r);
@@ -1646,30 +1681,37 @@ fn note_traffic(r: GuestReg) {
     REG_TRAFFIC.with(|t| *t.borrow_mut().entry(r).or_default() += 1);
 }
 
-/// Every guest register a block reads or writes.
+/// Every guest register a block reads, and every one it writes.
 ///
 /// Unlike [`live_in_registers`] this does not care about order within the
-/// block: a region loads the union of these once and holds them in locals
-/// until control leaves, so what matters is only whether a register is
-/// involved at all.
-fn registers_touched(block: &Block) -> Vec<GuestReg> {
-    let mut out = Vec::new();
-    let mut note = |r: GuestReg, out: &mut Vec<GuestReg>| {
-        if !out.contains(&r) {
-            out.push(r);
-        }
-    };
+/// block: a region holds its registers in locals from entry to exit, so what
+/// matters is only whether a register is read at all -- in which case the
+/// local has to start out holding the context's value -- and whether it is
+/// written at all -- in which case the context has to be caught up when
+/// control leaves. Keeping the two apart is worth doing: a register the loop
+/// only reads needs no store on the way out, and one it only writes needs no
+/// load on the way in, and a region pays those on every entry and exit.
+fn registers_read_and_written(block: &Block) -> (Vec<GuestReg>, Vec<GuestReg>) {
+    let (mut read, mut written) = (Vec::new(), Vec::new());
     for s in &block.stmts {
         match s {
             Stmt::Def {
                 expr: Expr::ReadReg(r),
                 ..
-            } => note(*r, &mut out),
-            Stmt::WriteReg { reg, .. } => note(*reg, &mut out),
+            } => {
+                if !read.contains(r) {
+                    read.push(*r);
+                }
+            }
+            Stmt::WriteReg { reg, .. } => {
+                if !written.contains(reg) {
+                    written.push(*reg);
+                }
+            }
             _ => {}
         }
     }
-    out
+    (read, written)
 }
 
 /// Whether a statement can leave the register cache stale.
