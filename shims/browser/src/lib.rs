@@ -48,6 +48,7 @@ use gex_abi::ctx;
 use gex_kernel::errno::{Errno, SysResult};
 use gex_kernel::file::OpenFile;
 use gex_kernel::vfs::{FileHandle, Metadata};
+use gex_kernel::net;
 use gex_kernel::{GuestMem, Kernel, SyscallOutcome, ThreadState};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -62,6 +63,124 @@ extern "C" {
     fn write(fd: i32, ptr: u32, len: u32);
     /// Nanoseconds since an arbitrary epoch.
     fn now() -> i64;
+
+    // The network. A page cannot open a socket, so every one of these is a
+    // question for JS, which has a Wisp connection to a proxy. All are
+    // non-blocking: the waiting is the kernel's job, because the kernel is
+    // what can park a guest thread, and JS blocking here would take the
+    // page's only wasm stack with it.
+    //
+    // A stream is named by a small integer JS hands out. Zero is never a
+    // stream, so it can mean failure.
+    fn net_open() -> i32;
+    fn net_connect(id: i32, host: u32, host_len: u32, port: i32);
+    /// 0 connecting, 1 open, 2 closed, 3 refused.
+    fn net_status(id: i32) -> i32;
+    /// Bytes taken, or -1.
+    fn net_send(id: i32, ptr: u32, len: u32) -> i32;
+    /// Bytes delivered, 0 at end of stream, -1 when nothing has arrived yet.
+    fn net_recv(id: i32, ptr: u32, len: u32) -> i32;
+    /// Whether `net_recv` would answer without waiting.
+    fn net_avail(id: i32) -> i32;
+    fn net_close(id: i32);
+}
+
+/// Whether the page gave the shim a network at all.
+static mut HAVE_NET: bool = false;
+
+/// Say that the page has a Wisp connection behind the `net_*` imports.
+///
+/// Off by default: a page with no proxy configured should have its guest see
+/// a machine with no network, which fails cleanly, rather than one whose
+/// every connection hangs.
+#[no_mangle]
+pub extern "C" fn gex_set_network(on: i32) {
+    unsafe { HAVE_NET = on != 0 };
+    with_host(|h| {
+        h.kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
+    });
+}
+
+/// One Wisp stream, as the kernel's [`net::Transport`].
+#[derive(Debug)]
+struct WispStream {
+    id: Cell<i32>,
+}
+
+// Single-threaded by construction, like everything else here.
+unsafe impl Send for WispStream {}
+unsafe impl Sync for WispStream {}
+
+impl net::Transport for WispStream {
+    fn connect(&self, host: &str, port: u16) -> Result<(), Errno> {
+        let id = unsafe { net_open() };
+        if id <= 0 {
+            return Err(Errno::ENETUNREACH);
+        }
+        self.id.set(id);
+        unsafe { net_connect(id, host.as_ptr() as u32, host.len() as u32, port as i32) };
+        Ok(())
+    }
+
+    fn status(&self) -> net::Status {
+        match self.id.get() {
+            0 => net::Status::Closed,
+            id => match unsafe { net_status(id) } {
+                0 => net::Status::Connecting,
+                1 => net::Status::Open,
+                3 => net::Status::Refused,
+                _ => net::Status::Closed,
+            },
+        }
+    }
+
+    fn send(&self, data: &[u8]) -> Result<usize, Errno> {
+        let id = self.id.get();
+        if id == 0 {
+            return Err(Errno::ENOTCONN);
+        }
+        match unsafe { net_send(id, data.as_ptr() as u32, data.len() as u32) } {
+            n if n >= 0 => Ok(n as usize),
+            _ => Err(Errno::EPIPE),
+        }
+    }
+
+    fn recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let id = self.id.get();
+        if id == 0 {
+            return Ok(0);
+        }
+        match unsafe { net_recv(id, buf.as_mut_ptr() as u32, buf.len() as u32) } {
+            -1 => Err(Errno::EAGAIN),
+            n if n >= 0 => Ok(n as usize),
+            _ => Err(Errno::ECONNRESET),
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        let id = self.id.get();
+        id != 0 && unsafe { net_avail(id) } != 0
+    }
+
+    fn close(&self) {
+        let id = self.id.replace(0);
+        if id != 0 {
+            unsafe { net_close(id) };
+        }
+    }
+}
+
+/// Where the browser's connections come from.
+#[derive(Debug)]
+struct WispNet;
+
+unsafe impl Send for WispNet {}
+unsafe impl Sync for WispNet {}
+
+impl net::NetStack for WispNet {
+    fn tcp(&self) -> Result<Arc<dyn net::Transport>, Errno> {
+        Ok(Arc::new(WispStream { id: Cell::new(0) }))
+    }
 }
 
 /// Back-edges a guest may take between safepoint calls, matching the native
@@ -264,6 +383,11 @@ enum Waiting {
     /// Waiting on a stream with nothing in it: a terminal nobody has typed at
     /// yet. Ready as soon as the handle says a read would return.
     Read(Arc<dyn gex_kernel::vfs::FileHandle>),
+    /// Waiting on the network -- a connection coming up, or a `poll` with
+    /// nothing ready. Whether it is ready is a question for the operation
+    /// itself, which the scheduler holds in `blocked_on`, so this only
+    /// carries the deadline.
+    Net(Option<u64>),
     /// Finished; the slot stays so a `join` can still find the tid.
     Exited,
 }
@@ -365,10 +489,12 @@ struct Host {
     /// Parents waiting for a child to finish, innermost last. A shell that
     /// runs a pipeline is two deep.
     suspended: Vec<Suspended>,
-    /// Set when the scheduler gave the stack back to JS because every thread
-    /// is waiting for input. Not an exit: the page is expected to deliver
-    /// some and call `gex_wake`.
-    stdin_wanted: bool,
+    /// Why the scheduler gave the stack back to JS, when it was not an exit.
+    /// 1: every thread is waiting for input the page must supply. 2: every
+    /// thread is waiting on the network, and the page's event loop is what
+    /// makes the bytes arrive. Either way the page is expected to call
+    /// `gex_wake`; the difference is what it should do first.
+    paused: u8,
     jit: Jit,
 }
 
@@ -505,6 +631,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
     );
     kernel.clock = browser_clock;
+    kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
     {
         let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
         if !cwd.is_empty() {
@@ -635,7 +762,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             resume: None,
             resume_ctx: None,
             suspended: Vec::new(),
-            stdin_wanted: false,
+            paused: 0,
             jit: Jit {
                 described: meta.next_slot != 0,
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
@@ -816,7 +943,15 @@ pub extern "C" fn gex_stdin_eof() {
 /// has to be asked for.
 #[no_mangle]
 pub extern "C" fn gex_paused_for_input() -> i32 {
-    with_host(|h| h.stdin_wanted as i32)
+    with_host(|h| (h.paused == 1) as i32)
+}
+
+/// Whether the guest stopped because it is waiting on the network. The page
+/// has nothing to supply -- it only has to let its event loop run, so the
+/// data it is waiting for can arrive -- and then call [`gex_wake`].
+#[no_mangle]
+pub extern "C" fn gex_paused_for_net() -> i32 {
+    with_host(|h| (h.paused == 2) as i32)
 }
 
 /// Carry on after input has arrived: pick a thread and say where to re-enter.
@@ -824,7 +959,7 @@ pub extern "C" fn gex_paused_for_input() -> i32 {
 /// Returns 1 when there is somewhere to go, 2 when the guest is finished.
 #[no_mangle]
 pub extern "C" fn gex_wake() -> i32 {
-    with_host(|h| h.stdin_wanted = false);
+    with_host(|h| h.paused = 0);
     schedule()
 }
 
@@ -998,6 +1133,13 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                     gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
                     gex_kernel::BlockOp::ReadStream { handle, .. } => {
                         Waiting::Read(Arc::clone(handle))
+                    }
+                    // Both of these wait on something outside the guest, so
+                    // both give the stack back and are re-checked by the
+                    // scheduler on its way round.
+                    gex_kernel::BlockOp::Connect { .. } => Waiting::Net(None),
+                    gex_kernel::BlockOp::Poll { deadline, .. } => {
+                        Waiting::Net(deadline.map(|d| now_ns() + d.as_nanos() as u64))
                     }
                     // A child always finishes before its parent runs again --
                     // that is what the checkpoint means -- so a `wait4` that
@@ -1312,6 +1454,18 @@ fn schedule() -> i32 {
                     }
                     Waiting::Sleep(d) => now >= *d,
                     Waiting::Read(handle) => handle.poll_readable(),
+                    Waiting::Net(deadline) => {
+                        deadline.is_some_and(|d| now >= d)
+                            || match &h.threads[i].blocked_on {
+                                Some(gex_kernel::BlockOp::Connect { socket }) => {
+                                    socket.status() != gex_kernel::net::Status::Connecting
+                                }
+                                Some(gex_kernel::BlockOp::Poll { fds, .. }) => {
+                                    gex_kernel::syscalls::poll_ready(fds)
+                                }
+                                _ => true,
+                            }
+                    }
                     Waiting::Exited => false,
                 };
                 if ready {
@@ -1334,8 +1488,38 @@ fn schedule() -> i32 {
             // A thread waiting for input is not stuck: the page will deliver
             // some. Give the stack back to JS so it can, and come back here
             // when it has.
-            if with_host(|h| h.threads.iter().any(|t| matches!(t.waiting, Waiting::Read(_)))) {
-                with_host(|h| h.stdin_wanted = true);
+            // Nothing can run, but not everything that cannot run is stuck.
+            // A thread waiting for a keystroke needs the page to supply one;
+            // a thread waiting on the network needs the page's event loop to
+            // turn, so the bytes it is waiting for can arrive. Both mean
+            // giving the wasm stack back, and the page is told which.
+            // A read parks the same way whatever it is reading, so which
+            // kind of wait this is comes from the handle. A socket read is a
+            // network wait -- telling the page to ask for a keystroke instead
+            // means it never turns its event loop, and the bytes it is
+            // waiting for never arrive.
+            let why = with_host(|h| {
+                let mut kind = 0;
+                for t in &h.threads {
+                    match &t.waiting {
+                        Waiting::Net(_) => return 2,
+                        Waiting::Read(handle) => {
+                            let is_socket = handle
+                                .metadata()
+                                .map(|m| m.file_type == gex_kernel::vfs::FileType::Socket)
+                                .unwrap_or(false);
+                            if is_socket {
+                                return 2;
+                            }
+                            kind = 1;
+                        }
+                        _ => {}
+                    }
+                }
+                kind
+            });
+            if why != 0 {
+                with_host(|h| h.paused = why);
                 return 2;
             }
             if with_host(|h| {
@@ -1415,6 +1599,15 @@ fn finish_parked(
             gm.write(*buf, &tmp[..n as usize])?;
             Ok(n)
         }
+        gex_kernel::BlockOp::Connect { socket } => match socket.status() {
+            gex_kernel::net::Status::Open => Ok(0),
+            gex_kernel::net::Status::Refused => Err(Errno::ECONNREFUSED),
+            gex_kernel::net::Status::Closed => Err(Errno::ECONNRESET),
+            // Woken by a deadline that a connect does not have; nothing else
+            // could have woken it.
+            gex_kernel::net::Status::Connecting => Err(Errno::EINPROGRESS),
+        },
+        gex_kernel::BlockOp::Poll { fds, .. } => gex_kernel::syscalls::poll_finish(fds, gm),
         gex_kernel::BlockOp::WaitChild {
             children,
             procs,
@@ -1583,6 +1776,9 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                     }
                     Waiting::Sleep(d) => now >= *d,
                     Waiting::Read(handle) => handle.poll_readable(),
+                    // Only the scheduler proper re-checks these; a safepoint
+                    // switch does not need to.
+                    Waiting::Net(deadline) => deadline.is_some_and(|d| now >= d),
                     Waiting::Exited => false,
                 }
         });

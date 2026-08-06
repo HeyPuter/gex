@@ -14,6 +14,7 @@ use crate::file::{FdTable, OpenFile, PipeEnd};
 use crate::fs::{oflags, Stat};
 use crate::futex::{self, FutexTable};
 use crate::mem::{flags as mflags, MemoryMap};
+use crate::net;
 use crate::proc::ProcTable;
 use crate::pipe::Pipe;
 use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
@@ -109,8 +110,19 @@ pub mod nr {
     pub const PRCTL: u64 = 167;
     pub const SOCKET: u64 = 198;
     pub const SOCKETPAIR: u64 = 199;
-    pub const SENDTO: u64 = 206;
+    pub const BIND: u64 = 200;
+    pub const LISTEN: u64 = 201;
+    pub const ACCEPT: u64 = 202;
     pub const CONNECT: u64 = 203;
+    pub const GETSOCKNAME: u64 = 204;
+    pub const GETPEERNAME: u64 = 205;
+    pub const SENDTO: u64 = 206;
+    pub const RECVFROM: u64 = 207;
+    pub const SETSOCKOPT: u64 = 208;
+    pub const GETSOCKOPT: u64 = 209;
+    pub const SHUTDOWN: u64 = 210;
+    pub const SENDMSG: u64 = 211;
+    pub const RECVMSG: u64 = 212;
     pub const BRK: u64 = 214;
     pub const MUNMAP: u64 = 215;
     pub const CLONE: u64 = 220;
@@ -222,6 +234,15 @@ pub enum BlockOp {
         buf: u64,
         len: usize,
     },
+    /// A `connect` on a descriptor that is not non-blocking. Ready once the
+    /// connection is up, refused, or gone.
+    Connect { socket: Arc<net::Socket> },
+    /// A `poll` with nothing ready yet. The descriptors travel with it so the
+    /// host can ask again without going back through the kernel.
+    Poll {
+        fds: Vec<PollFd>,
+        deadline: Option<std::time::Duration>,
+    },
     /// `wait4`. Blocks until one of `children` has a status to collect.
     WaitChild {
         children: Vec<ChildHandle>,
@@ -292,6 +313,16 @@ pub struct Kernel {
     pub ppid: i32,
     /// How to read the wall clock.
     pub clock: ClockFn,
+    /// Where connections come from, when the host has anywhere to get them.
+    /// `None` is a guest with no network, which is every guest until a host
+    /// says otherwise.
+    pub net: Option<Arc<dyn net::NetStack>>,
+    /// Names the guest has resolved. Shared across `fork`, because a child
+    /// connecting to an address its parent resolved must reach the same host.
+    pub resolver: Arc<net::Resolver>,
+    /// Sockets by handle address, so a descriptor can be got back to the
+    /// concrete socket the network syscalls need.
+    pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
     /// The terminal's size, as rows and columns. A page resizes.
     pub winsize: (u16, u16),
     /// The terminal settings, when there is a terminal.
@@ -361,6 +392,54 @@ pub const COOKED_TERMIOS: [u8; 60] = {
 /// `c_lflag`'s ICANON and ECHO, the two the host has to follow.
 pub const ICANON: u32 = 0x2;
 pub const ECHO: u32 = 0x8;
+
+/// One entry of a `poll` set, kept so the host can re-check it without going
+/// back through the kernel.
+#[derive(Clone, Debug)]
+pub struct PollFd {
+    /// Where the guest's `struct pollfd` sits, so `revents` can be written.
+    pub addr: u64,
+    pub events: u16,
+    /// `None` for a descriptor that does not exist, which is `POLLNVAL`.
+    pub handle: Option<Arc<dyn crate::vfs::FileHandle>>,
+    pub writable: bool,
+}
+
+/// What a `poll` entry would report right now.
+pub fn poll_revents(p: &PollFd) -> u16 {
+    const POLLIN: u16 = 0x001;
+    const POLLOUT: u16 = 0x004;
+    const POLLNVAL: u16 = 0x020;
+    let Some(h) = &p.handle else {
+        return POLLNVAL;
+    };
+    let mut r = 0;
+    if p.events & POLLIN != 0 && h.poll_readable() {
+        r |= POLLIN;
+    }
+    if p.events & POLLOUT != 0 && p.writable {
+        r |= POLLOUT;
+    }
+    r
+}
+
+pub fn poll_ready(fds: &[PollFd]) -> bool {
+    fds.iter().any(|p| poll_revents(p) != 0)
+}
+
+/// Write `revents` back and count what is ready. Shared by the immediate
+/// answer and the one a parked `poll` gives when it wakes.
+pub fn poll_finish(fds: &[PollFd], m: &mut GuestMem<'_>) -> SysResult {
+    let mut ready = 0u64;
+    for p in fds {
+        let r = poll_revents(p);
+        if r != 0 {
+            ready += 1;
+        }
+        m.write_u32(p.addr + 4, ((r as u32) << 16) | p.events as u32)?;
+    }
+    Ok(ready)
+}
 
 /// A child process the kernel is tracking.
 #[derive(Debug)]
@@ -493,6 +572,9 @@ impl Kernel {
             procs: Arc::new(ProcTable::new()),
             ppid: 0,
             clock: system_clock,
+            net: None,
+            resolver: Arc::new(net::Resolver::new()),
+            sockets: Default::default(),
             winsize: (24, 80),
             termios: COOKED_TERMIOS,
         }
@@ -610,6 +692,9 @@ impl Kernel {
             procs: Arc::clone(&self.procs),
             ppid: self.pid,
             clock: self.clock,
+            net: self.net.clone(),
+            resolver: Arc::clone(&self.resolver),
+            sockets: self.sockets.clone(),
             winsize: self.winsize,
             termios: self.termios,
         }
@@ -871,6 +956,36 @@ impl Kernel {
     /// whole purpose is to wait for another thread.
     fn blocking_op(&mut self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
         match n {
+            nr::CONNECT => {
+                let bytes = m.read(a[1], (a[2] as usize).min(128)).ok()?.to_vec();
+                let (ip, port) = net::parse_sockaddr(&bytes).ok()?;
+                let file = self.fds.get(a[0] as i32).ok()?;
+                let socket = self.socket_of(a[0] as i32).ok()?;
+                // Start it here, whichever way this goes: the non-blocking
+                // path reaches `sys_connect`, which finds the connection
+                // already under way and only reports on it.
+                let started = socket.connect(ip, port);
+                let waits = file.would_block() && started == Err(Errno::EINPROGRESS);
+                waits.then_some(BlockOp::Connect { socket })
+            }
+            nr::PPOLL => {
+                let fds = self.collect_pollfds(m, a[0], a[1])?;
+                if poll_ready(&fds) {
+                    return None;
+                }
+                // A zero timeout is a question, not a wait.
+                let deadline = if a[2] == 0 {
+                    None
+                } else {
+                    let secs = m.read_u64(a[2]).ok()?;
+                    let nanos = m.read_u64(a[2] + 8).ok()?;
+                    if secs == 0 && nanos == 0 {
+                        return None;
+                    }
+                    Some(std::time::Duration::new(secs, nanos as u32))
+                };
+                Some(BlockOp::Poll { fds, deadline })
+            }
             nr::READ => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 if !file.would_block() {
@@ -1043,11 +1158,29 @@ impl Kernel {
             nr::MOUNT => self.sys_mount(m, a),
             nr::UMOUNT2 => self.sys_umount(m, a[0]),
 
-            // No networking. `ENOSYS` sends a caller looking for a fallback it
-            // may not have, whereas "this address family is unsupported" is an
-            // answer libc understands: busybox falls back from syslog to
-            // stderr on it rather than retrying.
-            nr::SOCKET | nr::SOCKETPAIR | nr::CONNECT | nr::SENDTO => Err(Errno::EAFNOSUPPORT),
+            // -- sockets -----------------------------------------------------
+            nr::SOCKET => self.sys_socket(a[0], a[1]),
+            nr::CONNECT => self.sys_connect(m, a[0] as i32, a[1], a[2]),
+            nr::SENDTO => self.sys_sendto(m, a[0] as i32, a[1], a[2], a[4]),
+            nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[4], a[5]),
+            nr::SENDMSG => self.sys_sendmsg(m, a[0] as i32, a[1]),
+            nr::RECVMSG => self.sys_recvmsg(m, a[0] as i32, a[1]),
+            nr::GETPEERNAME => self.sys_getpeername(m, a[0] as i32, a[1], a[2]),
+            // One interface, unnamed. A guest that asks where it is calling
+            // from gets 0.0.0.0, which is what an unbound socket reports.
+            nr::GETSOCKNAME => self.sys_write_sockaddr(m, 0, 0, a[1], a[2]),
+            // Nothing here has an option worth setting -- no timeouts, no
+            // buffer sizes that mean anything -- and refusing makes libraries
+            // treat the socket as broken.
+            nr::SETSOCKOPT => Ok(0),
+            nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[2], a[3]),
+            nr::SHUTDOWN => self.fds.get(a[0] as i32).map(|_| 0),
+            // A local address means nothing when there is one interface and
+            // it is a proxy, but a resolver binds its socket before it sends
+            // and gives up if that fails.
+            nr::BIND => self.fds.get(a[0] as i32).map(|_| 0),
+            // No listening, though: a page cannot be connected to.
+            nr::LISTEN | nr::ACCEPT | nr::SOCKETPAIR => Err(Errno::EOPNOTSUPP),
             nr::SET_TID_ADDRESS => {
                 self.clear_child_tid = a[0];
                 Ok(self.tid as u64)
@@ -1655,34 +1788,34 @@ impl Kernel {
     /// answer from their buffer state. There is no waiting yet, so a poll
     /// that would block returns zero ready descriptors after the timeout is
     /// checked, which callers handle as a spurious wakeup.
-    fn sys_ppoll(&mut self, m: &mut GuestMem<'_>, fds: u64, nfds: u64) -> SysResult {
-        const POLLIN: u16 = 0x001;
-        const POLLOUT: u16 = 0x004;
-        const POLLNVAL: u16 = 0x020;
-        let mut ready = 0u64;
+    /// Read the guest's `pollfd` array into something the host can re-check.
+    fn collect_pollfds(&self, m: &GuestMem<'_>, fds: u64, nfds: u64) -> Option<Vec<PollFd>> {
+        let mut out = Vec::with_capacity(nfds.min(1024) as usize);
         for i in 0..nfds.min(1024) {
-            let base = fds + i * 8;
-            let fd = m.read_u32(base)? as i32;
-            let events = (m.read_u32(base + 4)? & 0xffff) as u16;
-            let revents = match self.fds.get(fd) {
-                Err(_) => POLLNVAL,
-                Ok(file) => {
-                    let mut r = 0u16;
-                    if events & POLLIN != 0 && file.readable {
-                        r |= POLLIN;
-                    }
-                    if events & POLLOUT != 0 && file.writable {
-                        r |= POLLOUT;
-                    }
-                    r
-                }
-            };
-            if revents != 0 {
-                ready += 1;
-            }
-            m.write_u32(base + 4, ((revents as u32) << 16) | events as u32)?;
+            let addr = fds + i * 8;
+            let fd = m.read_u32(addr).ok()? as i32;
+            let events = (m.read_u32(addr + 4).ok()? & 0xffff) as u16;
+            let file = self.fds.get(fd).ok();
+            out.push(PollFd {
+                addr,
+                events,
+                handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
+                writable: file.as_ref().is_some_and(|f| f.writable),
+            });
         }
-        Ok(ready)
+        Some(out)
+    }
+
+    /// `ppoll`, for the case where something is ready already. The waiting
+    /// case is a [`BlockOp::Poll`], decided before this is reached.
+    ///
+    /// This used to report `POLLIN` for any descriptor open for reading,
+    /// which is true of a file and a lie about a socket: a caller polling for
+    /// data that has not arrived was told it had, read nothing, and polled
+    /// again. It asks the handle now.
+    fn sys_ppoll(&mut self, m: &mut GuestMem<'_>, fds: u64, nfds: u64) -> SysResult {
+        let set = self.collect_pollfds(m, fds, nfds).ok_or(Errno::EFAULT)?;
+        poll_finish(&set, m)
     }
 
     // -- memory --------------------------------------------------------------
@@ -1840,6 +1973,199 @@ impl Kernel {
             }
             None => Err(Errno::EAGAIN),
         }
+    }
+
+
+    // -- sockets ---------------------------------------------------------------
+
+    /// `socket`. Only AF_INET, and only the two kinds that matter: a stream,
+    /// which the host carries, and a datagram, which only ever goes to the
+    /// resolver this kernel is.
+    fn sys_socket(&mut self, domain: u64, ty: u64) -> SysResult {
+        const AF_INET: u64 = 2;
+        const SOCK_STREAM: u64 = 1;
+        const SOCK_DGRAM: u64 = 2;
+        const SOCK_NONBLOCK: u64 = 0o4000;
+        const SOCK_CLOEXEC: u64 = 0o2000000;
+        let Some(net) = self.net.clone() else {
+            return Err(Errno::EAFNOSUPPORT);
+        };
+        if domain != AF_INET {
+            return Err(Errno::EAFNOSUPPORT);
+        }
+        let kind = match ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC) {
+            SOCK_STREAM => net::Kind::Tcp,
+            SOCK_DGRAM => net::Kind::Udp,
+            _ => return Err(Errno::EPROTONOSUPPORT),
+        };
+        let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(&self.resolver)));
+        sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
+        let flags = if ty & SOCK_NONBLOCK != 0 {
+            crate::fs::oflags::O_NONBLOCK
+        } else {
+            0
+        };
+        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+        let fd = self.fds.insert(file, ty & SOCK_CLOEXEC != 0)?;
+        self.sockets.insert(key, sock);
+        Ok(fd)
+    }
+
+    fn socket_of(&self, fd: i32) -> Result<Arc<net::Socket>, Errno> {
+        let file = self.fds.get(fd)?;
+        // `Arc<dyn FileHandle>` cannot be downcast without `Any`, so the
+        // socket table is the way back to the concrete type. Keyed by the
+        // handle's address, which is stable for as long as the descriptor is.
+        let key = Arc::as_ptr(&file.handle) as *const () as usize;
+        self.sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+    }
+
+    fn sys_connect(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
+        let bytes = m.read(addr, (len as usize).min(128))?.to_vec();
+        let (ip, port) = net::parse_sockaddr(&bytes)?;
+        let sock = self.socket_of(fd)?;
+        match sock.connect(ip, port) {
+            Ok(()) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn sys_sendto(
+        &mut self,
+        m: &GuestMem<'_>,
+        fd: i32,
+        buf: u64,
+        len: u64,
+        dest: u64,
+    ) -> SysResult {
+        if dest != 0 {
+            if let Ok(sock) = self.socket_of(fd) {
+                let bytes = m.read(dest, 16)?.to_vec();
+                if let Ok((ip, port)) = net::parse_sockaddr(&bytes) {
+                    sock.set_peer(ip, port);
+                }
+            }
+        }
+        let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
+        self.fds.get(fd)?.write(&data)
+    }
+
+    fn sys_recvfrom(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        fd: i32,
+        buf: u64,
+        len: u64,
+        addr: u64,
+        addrlen: u64,
+    ) -> SysResult {
+        let len = (len as usize).min(1 << 22);
+        let mut tmp = vec![0u8; len];
+        let n = self.fds.get(fd)?.read(&mut tmp)?;
+        m.write(buf, &tmp[..n as usize])?;
+        if addr != 0 {
+            let peer = self.socket_of(fd).ok().and_then(|s| s.peer());
+            let (ip, port) = peer.unwrap_or((0, 0));
+            self.sys_write_sockaddr(m, ip, port, addr, addrlen)?;
+        }
+        Ok(n)
+    }
+
+    fn sys_write_sockaddr(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        ip: u32,
+        port: u16,
+        addr: u64,
+        addrlen: u64,
+    ) -> SysResult {
+        if addr == 0 {
+            return Ok(0);
+        }
+        let sa = net::build_sockaddr(ip, port);
+        let room = if addrlen != 0 {
+            m.read_u32(addrlen)? as usize
+        } else {
+            sa.len()
+        };
+        let n = room.min(sa.len());
+        m.write(addr, &sa[..n])?;
+        if addrlen != 0 {
+            m.write_u32(addrlen, sa.len() as u32)?;
+        }
+        Ok(0)
+    }
+
+    fn sys_getpeername(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        fd: i32,
+        addr: u64,
+        addrlen: u64,
+    ) -> SysResult {
+        let (ip, port) = self.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
+        self.sys_write_sockaddr(m, ip, port, addr, addrlen)
+    }
+
+    /// `getsockopt`. The only one anybody asks: has the connection come up?
+    fn sys_getsockopt(&mut self, m: &mut GuestMem<'_>, fd: i32, name: u64, val: u64) -> SysResult {
+        const SO_ERROR: u64 = 4;
+        let err = if name == SO_ERROR {
+            match self.socket_of(fd)?.status() {
+                net::Status::Refused => Errno::ECONNREFUSED.0,
+                net::Status::Connecting => Errno::EINPROGRESS.0,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        if val != 0 {
+            m.write_u32(val, err as u32)?;
+        }
+        Ok(0)
+    }
+
+    /// `sendmsg`, which is how glibc writes to a socket. Only the iovecs
+    /// matter here: there is no ancillary data to carry and one destination.
+    fn sys_sendmsg(&mut self, m: &GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
+        let iov = m.read_u64(msg + 16)?;
+        let iovlen = m.read_u64(msg + 24)?;
+        let mut data = Vec::new();
+        for i in 0..iovlen.min(1024) {
+            let base = m.read_u64(iov + i * 16)?;
+            let len = m.read_u64(iov + i * 16 + 8)? as usize;
+            if len > 0 {
+                data.extend_from_slice(m.read(base, len.min(1 << 22))?);
+            }
+        }
+        self.fds.get(fd)?.write(&data)
+    }
+
+    fn sys_recvmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
+        let iov = m.read_u64(msg + 16)?;
+        let iovlen = m.read_u64(msg + 24)?;
+        let mut total = 0u64;
+        for i in 0..iovlen.min(1024) {
+            let base = m.read_u64(iov + i * 16)?;
+            let len = m.read_u64(iov + i * 16 + 8)? as usize;
+            if len == 0 {
+                continue;
+            }
+            let mut tmp = vec![0u8; len.min(1 << 22)];
+            let n = self.fds.get(fd)?.read(&mut tmp)?;
+            m.write(base, &tmp[..n as usize])?;
+            total += n;
+            // A short read means there is no more waiting; asking again would
+            // block, and `recvmsg` returns what it has.
+            if (n as usize) < tmp.len() {
+                break;
+            }
+        }
+        // msg_flags and msg_controllen: nothing to report.
+        m.write_u64(msg + 40, 0)?;
+        Ok(total)
     }
 
     // -- process and time ----------------------------------------------------
@@ -2179,6 +2505,17 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::REBOOT => "reboot",
         nr::RT_SIGTIMEDWAIT => "rt_sigtimedwait",
         nr::SOCKET => "socket",
+        nr::BIND => "bind",
+        nr::LISTEN => "listen",
+        nr::ACCEPT => "accept",
+        nr::GETSOCKNAME => "getsockname",
+        nr::GETPEERNAME => "getpeername",
+        nr::RECVFROM => "recvfrom",
+        nr::SETSOCKOPT => "setsockopt",
+        nr::GETSOCKOPT => "getsockopt",
+        nr::SHUTDOWN => "shutdown",
+        nr::SENDMSG => "sendmsg",
+        nr::RECVMSG => "recvmsg",
         nr::SOCKETPAIR => "socketpair",
         nr::CONNECT => "connect",
         nr::SENDTO => "sendto",

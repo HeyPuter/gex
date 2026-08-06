@@ -63,7 +63,7 @@ function metadataSection(wasm) {
 }
 
 export class Gex {
-  #memory; #shim; #guest; #env; #u8; #imports;
+  #memory; #shim; #guest; #env; #u8; #imports; #net = null;
 
   constructor(env = new Env()) {
     this.#env = env;
@@ -106,6 +106,27 @@ export class Gex {
         write: (fd, ptr, len) =>
           this.#env.write(fd, this.#u8.subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0))),
         now: () => this.#env.now(),
+        // The network. Every one of these must return without waiting: the
+        // guest's thread is parked by the kernel, not by JS, because there is
+        // one wasm stack and blocking here would take it.
+        net_open: () => (this.#net ? this.#net.open() : 0),
+        net_connect: (id, host, len, port) => {
+          const name = new TextDecoder().decode(
+            this.#u8.subarray(host >>> 0, (host >>> 0) + (len >>> 0)),
+          );
+          this.#net?.connect(id, name, port);
+        },
+        net_status: (id) => (this.#net ? this.#net.status(id) : 2),
+        net_send: (id, ptr, len) =>
+          this.#net
+            ? this.#net.send(id, this.#u8.subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
+            : -1,
+        net_recv: (id, ptr, len) =>
+          this.#net
+            ? this.#net.recv(id, this.#u8.subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
+            : 0,
+        net_avail: (id) => (this.#net ? (this.#net.available(id) ? 1 : 0) : 1),
+        net_close: (id) => this.#net?.close(id),
       },
     });
     this.#u8 = new Uint8Array(this.#memory.buffer);
@@ -223,6 +244,18 @@ export class Gex {
   /** Say there will be no more input. */
   endStdin() { this.#shim.exports.gex_stdin_eof(); }
 
+  /**
+   * Give the guest a network.
+   *
+   * `net` is an object with the seven calls in `Net` below. Off by default:
+   * a guest with no proxy behind it should see a machine with no network,
+   * which fails cleanly, rather than one whose every connection hangs.
+   */
+  useNetwork(net) {
+    this.#net = net;
+    this.#shim.exports.gex_set_network(net ? 1 : 0);
+  }
+
   async run(entry) {
     // Every switch, signal and miss leaves wasm by trapping, and V8 captures
     // a stack trace for each trap it turns into a RuntimeError. Nothing here
@@ -259,31 +292,52 @@ export class Gex {
         // registers: a thread would return through a link register holding
         // an address out of the shim's heap.
         this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
-        if (this.#shim.exports.gex_jit_pending_len() >>> 0) await this.#installTranslation();
-        const next = this.#shim.exports.gex_resume_pc();
+        const e = this.#shim.exports;
+        if (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
+        const next = e.gex_resume_pc();
         if (next !== 0n) {
           pc = next;
-          const nextCtx = this.#shim.exports.gex_resume_ctx() >>> 0;
+          const nextCtx = e.gex_resume_ctx() >>> 0;
           if (nextCtx !== 0) ctx = nextCtx;
           continue;
         }
-        // Every thread is waiting for a keystroke. The guest gave the stack
-        // back so that this could happen at all: there is one wasm stack and
-        // no way to block on it, so waiting has to be done out here, where
-        // there is an event loop.
-        if (this.#shim.exports.gex_paused_for_input()) {
-          const more = await this.#env.readStdin();
-          if (more === false) this.endStdin();
-          if (this.#shim.exports.gex_wake() !== 1) {
-            return this.#shim.exports.gex_exit_code();
+        // The guest gave the wasm stack back without finishing, because
+        // every thread is waiting for something only the page can produce.
+        // Waiting has to happen out here: there is one wasm stack, and a
+        // guest holding it is a guest nothing can be delivered to.
+        //
+        // The loop matters. One turn of the event loop is not a promise that
+        // what is being waited for has arrived, and treating "still not
+        // ready" as "finished" ended a program the moment its first `poll`
+        // parked.
+        if (e.gex_paused_for_net() || e.gex_paused_for_input()) {
+          let woke = 0;
+          while (e.gex_paused_for_net() || e.gex_paused_for_input()) {
+            if (e.gex_paused_for_net()) {
+              // A timer rather than a microtask: a microtask would run before
+              // the socket callbacks this is waiting for.
+              await new Promise((r) => setTimeout(r, 1));
+            } else {
+              const more = await this.#env.readStdin();
+              if (more === false) {
+                this.endStdin();
+                // An environment with no input at all answers instantly, and
+                // this loop would then be a spin that never lets anything
+                // else happen. One tick is enough to keep the page alive.
+                await new Promise((r) => setTimeout(r, 1));
+              }
+            }
+            woke = e.gex_wake();
+            if (woke === 1) break;
           }
-          pc = this.#shim.exports.gex_resume_pc();
-          const wakeCtx = this.#shim.exports.gex_resume_ctx() >>> 0;
+          if (woke !== 1) return e.gex_exit_code();
+          pc = e.gex_resume_pc();
+          const wakeCtx = e.gex_resume_ctx() >>> 0;
           if (wakeCtx !== 0) ctx = wakeCtx;
           continue;
         }
         if (String(err).includes("unreachable")) {
-          return this.#shim.exports.gex_exit_code();
+          return e.gex_exit_code();
         }
         throw err;
       }

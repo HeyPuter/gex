@@ -16,6 +16,7 @@ pub mod file;
 pub mod fs;
 pub mod futex;
 pub mod mem;
+pub mod net;
 pub mod pipe;
 pub mod proc;
 pub mod signal;

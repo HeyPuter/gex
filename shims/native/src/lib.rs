@@ -675,6 +675,7 @@ fn stop_other_threads(spawn: &SpawnContext, verbose: bool) {
 
 /// Perform a syscall's blocking half with the kernel unlocked.
 fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno::Errno> {
+    use gex_kernel::errno::Errno;
     match op {
         BlockOp::FutexWait {
             table,
@@ -697,6 +698,32 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
         // a stream is only ever "not readable yet" for a pipe whose writer has
         // not written. Polling is enough for that, and it keeps the kernel
         // unlocked while it happens.
+        // Both of these are polls. Natively there is a real thread here, so
+        // sleeping in it costs nothing anyone else needs.
+        BlockOp::Connect { socket } => loop {
+            match socket.status() {
+                gex_kernel::net::Status::Connecting => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                gex_kernel::net::Status::Open => return Ok(0),
+                gex_kernel::net::Status::Refused => return Err(Errno::ECONNREFUSED),
+                gex_kernel::net::Status::Closed => return Err(Errno::ECONNRESET),
+            }
+        },
+        BlockOp::Poll { fds, deadline } => {
+            let start = std::time::Instant::now();
+            loop {
+                if gex_kernel::syscalls::poll_ready(&fds) {
+                    let mut mem = GuestMem::new(data);
+                    return gex_kernel::syscalls::poll_finish(&fds, &mut mem);
+                }
+                if deadline.is_some_and(|d| start.elapsed() >= d) {
+                    let mut mem = GuestMem::new(data);
+                    return gex_kernel::syscalls::poll_finish(&fds, &mut mem);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         BlockOp::ReadStream { handle, buf, len } => {
             let mut tmp = vec![0u8; len];
             loop {
@@ -716,7 +743,6 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
             wstatus,
             nohang,
         } => {
-            use gex_kernel::errno::Errno;
             let candidates: Vec<_> = children
                 .iter()
                 .filter(|c| want <= 0 || c.pid == want)
