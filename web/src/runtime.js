@@ -170,7 +170,7 @@ class TerminalEnv extends Env {
  * Returns the exit status. The caller owns the terminal; nothing here clears
  * it, so a demo can print its own banner first.
  */
-export async function runProgram(term, { elf, files = {}, args, cwd = '/', tty = true, env = {} }) {
+export async function runProgram(term, { elf, files = {}, args, cwd = '/', tty = true, network = null }) {
   const { shimBytes, seedBytes } = await loadRuntime();
   const ref = { current: null };
   const tenv = new TerminalEnv(term, ref);
@@ -182,12 +182,21 @@ export async function runProgram(term, { elf, files = {}, args, cwd = '/', tty =
   if (gex.shim.exports.gex_set_winsize) {
     gex.shim.exports.gex_set_winsize(term.rows, term.cols);
   }
-  for (const [k, v] of Object.entries(env)) {
-    void k;
-    void v; // reserved: the shim takes envp with the ELF today
+  if (network) gex.useNetwork(network);
+  // Keystrokes go to the environment, not straight to the guest: whether
+  // they are echoed, and whether they are delivered a line at a time, is the
+  // guest's choice, read out of its termios.
+  const keys = term.onData((d) => tenv.onKey(d));
+  const resize = term.onResize(({ rows, cols }) => {
+    gex.shim.exports.gex_set_winsize?.(rows, cols);
+  });
+  try {
+    const status = await gex.run(entry);
+    return { status, gex, tenv };
+  } finally {
+    keys.dispose();
+    resize.dispose();
   }
-  const status = await gex.run(entry);
-  return { status, gex, tenv };
 }
 
 export { TerminalEnv };

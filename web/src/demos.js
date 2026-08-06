@@ -175,19 +175,90 @@ const debian = {
   async enter(ctx) {
     ctx.actions([
       { label: 'Boot', primary: true, id: 'dboot', onClick: () => bootDebian(ctx) },
+      { label: 'Wisp endpoint…', onClick: () => setWisp(ctx) },
     ]);
-    ctx.hint('try `apt-get update`, then `apt-get install -y cowsay`');
-    ctx.term.writeln('A Debian arm64 rootfs. This one is large and glibc-based, which is a');
-    ctx.term.writeln('harder target than musl: a real dynamic loader, and far more syscalls.');
+    ctx.hint(`network: ${wispUrl() || 'not set'}`);
+    ctx.term.writeln('A Debian bookworm arm64 rootfs, built by web/build-debian.sh.');
     ctx.term.writeln('');
-    ctx.term.writeln(ctx.ansi.dim('Network syscalls are carried over Wisp to a proxy, because a'));
-    ctx.term.writeln(ctx.ansi.dim('page cannot open a TCP socket. Set the endpoint below.'));
+    ctx.term.writeln(ctx.ansi.dim('glibc is a harder target than musl -- a real dynamic loader and'));
+    ctx.term.writeln(ctx.ansi.dim('far more syscalls. `bash`, `ls`, `dpkg` and `apt-get` all run.'));
+    ctx.term.writeln(ctx.ansi.dim('`apt-get update` gets as far as starting its download helper and'));
+    ctx.term.writeln(ctx.ansi.dim('stops there; that is the next thing to fix, not a claim it works.'));
+    ctx.term.writeln('');
+    ctx.term.writeln(ctx.ansi.dim('A page cannot open a TCP socket, so network syscalls are carried'));
+    ctx.term.writeln(ctx.ansi.dim('over Wisp to a proxy. Set one to give the guest a network.'));
     ctx.term.writeln('');
   },
 };
 
+const WISP_KEY = 'gex.wisp';
+const wispUrl = () => localStorage.getItem(WISP_KEY) || '';
+
+function setWisp(ctx) {
+  const url = prompt(
+    'Wisp endpoint (a wss:// or ws:// URL ending in a slash).\n' +
+      'Leave empty for no network.',
+    wispUrl(),
+  );
+  if (url === null) return;
+  if (url) localStorage.setItem(WISP_KEY, url);
+  else localStorage.removeItem(WISP_KEY);
+  ctx.hint(`network: ${wispUrl() || 'not set'}`);
+}
+
 async function bootDebian(ctx) {
-  ctx.term.writeln(ctx.ansi.red('not wired up yet'));
+  document.getElementById('dboot').disabled = true;
+  try {
+    const tree = await ctx.rootfs('/rootfs/debian.tar');
+    const files = { ...tree.files };
+    for (const [path, target] of Object.entries(tree.links)) {
+      const abs = target.startsWith('/')
+        ? target
+        : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+      if (files[abs]) files[path] = files[abs];
+    }
+    const elf = files['/bin/bash'] || files['/usr/bin/bash'];
+    if (!elf) throw new Error('the rootfs has no /bin/bash');
+
+    let network = null;
+    if (wispUrl()) {
+      ctx.busy('connecting to the proxy');
+      const { WispNetwork } = await import('./net.js');
+      network = new WispNetwork(wispUrl(), (e) => ctx.setNet(e.split(' ')[0]));
+      await network.start();
+      ctx.setNet('open');
+    } else {
+      ctx.setNet('off');
+    }
+
+    ctx.idle();
+    ctx.term.reset();
+    ctx.term.writeln(ctx.ansi.dim(`rootfs: ${Object.keys(files).length} files`));
+    ctx.term.writeln(
+      ctx.ansi.dim(network ? 'network: wisp' : 'network: none -- apt will not reach a mirror'),
+    );
+    ctx.term.writeln('');
+    ctx.status('running');
+    running(true);
+    const { status } = await ctx.runProgram(ctx.term, {
+      elf,
+      files,
+      args: ['/bin/bash', '-i'],
+      cwd: '/root',
+      tty: true,
+      network,
+    });
+    ctx.term.writeln(ctx.ansi.dim(`\r\n[bash exited ${status}]`));
+    ctx.status('finished', 'good');
+  } catch (e) {
+    ctx.term.writeln(ctx.ansi.red(`\r\n${e.message}`));
+    ctx.status(e.message, 'bad');
+  } finally {
+    running(false);
+    ctx.idle();
+    const b = document.getElementById('dboot');
+    if (b) b.disabled = false;
+  }
 }
 
 export const DEMOS = [upload, busybox, debian];

@@ -1,3 +1,7 @@
 target/
 *.gexm
 tests/corpus/bin/
+web/node_modules/
+web/dist/
+web/public/gex/
+web/public/rootfs/
