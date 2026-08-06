@@ -348,6 +348,8 @@ pub struct Kernel {
     pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
     /// File mappings whose writes are meant to reach the file.
     pub shared_maps: Vec<SharedMap>,
+    /// Executable mappings made since the host last looked.
+    pub new_code: Vec<CodeMap>,
     /// Serial for the unnamed files `O_TMPFILE` asks for.
     pub next_tmpfile: u64,
     /// The file-creation mask. Recorded rather than applied: nothing here
@@ -576,6 +578,20 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
     }
 }
 
+/// An executable mapping the guest has just made.
+///
+/// The host drains these and statically recompiles what is in them. Only the
+/// executable arrives through gex's own loader; every shared library is
+/// mapped here, by the interpreter, out of guest code -- so without this the
+/// static recompiler never sees any of them.
+#[derive(Clone, Debug)]
+pub struct CodeMap {
+    pub start: u64,
+    pub end: u64,
+    /// The file it came from, for the trace.
+    pub path: String,
+}
+
 /// A `MAP_SHARED` file mapping, and where its bytes belong.
 ///
 /// A file mapping here is an eager copy rather than a page table pointed at
@@ -721,6 +737,7 @@ impl Kernel {
             ppid: 0,
             clock: system_clock,
             shared_maps: Vec::new(),
+            new_code: Vec::new(),
             next_tmpfile: 0,
             umask: 0o022,
             net: None,
@@ -844,6 +861,7 @@ impl Kernel {
             ppid: self.pid,
             clock: self.clock,
             shared_maps: Vec::new(),
+            new_code: Vec::new(),
             next_tmpfile: self.next_tmpfile,
             umask: self.umask,
             net: self.net.clone(),
@@ -2353,6 +2371,16 @@ impl Kernel {
             // is the whole of the mapping, so nothing does until it is
             // written back -- at `msync`, and at `munmap`, which is where a
             // program that never calls `msync` expects its changes to land.
+            // An executable file mapping is a shared library arriving. Tell
+            // the host, so the static recompiler gets a whole object at once
+            // rather than the runtime translator getting it a miss at a time.
+            if prot_bits & crate::mem::prot::EXEC != 0 {
+                self.new_code.push(CodeMap {
+                    start,
+                    end: start + len_aligned,
+                    path: name.clone(),
+                });
+            }
             if flags & crate::mem::flags::SHARED != 0 {
                 self.shared_maps.push(SharedMap {
                     start,

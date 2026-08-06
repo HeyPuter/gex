@@ -18,6 +18,7 @@ const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
+const SHT_DYNSYM: u32 = 11;
 const SHT_SYMTAB: u32 = 2;
 const STT_FUNC: u8 = 2;
 
@@ -371,7 +372,11 @@ fn read_symbols(
         let Ok(sh_type) = r.u32(off + 4) else {
             continue;
         };
-        if sh_type != SHT_SYMTAB {
+        // `.dynsym` as well as `.symtab`. A shipped shared library has been
+        // stripped of the second and keeps the first, and its exported
+        // functions are exactly the entry points a static recompiler wants to
+        // start from.
+        if sh_type != SHT_SYMTAB && sh_type != SHT_DYNSYM {
             continue;
         }
         let (Ok(sh_offset), Ok(sh_size), Ok(sh_link), Ok(sh_entsize)) = (

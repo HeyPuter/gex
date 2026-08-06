@@ -76,6 +76,12 @@ run options:
   --sample        report the guest's hottest back-edges when it exits. Biased
                   towards loops, which is the bias you want when the question
                   is where the time went
+  --recompile-objects
+                  statically recompile each shared library as it is mapped,
+                  rather than translating it a dispatch miss at a time. Off by
+                  default: measured slower, because seeding from every
+                  decodable address translates far more of a library than any
+                  one program uses
   --exhaustive    translate every decodable text address ahead of time
   --no-jit        no runtime translation; implies --exhaustive
   --lazy          discover only from the entry point, leaving the rest to
@@ -124,6 +130,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--verbose" | "-v" => opts.verbose = true,
             "--exhaustive" => exhaustive = true,
             "--sample" => opts.sample = true,
+            "--recompile-objects" => opts.recompile_objects = true,
             "--uid" => {
                 i += 1;
                 let v = args.get(i).context("--uid needs a number")?;

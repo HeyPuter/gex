@@ -361,9 +361,109 @@ pub fn seed_module(shared_memory: bool) -> TranslatedModule {
 ///
 /// `known` names the addresses that already have translations, so the work
 /// list does not redo them.
+/// Statically recompile a whole mapped object: every decodable address in
+/// `[lo, hi)`, not just what one entry point reaches.
+///
+/// This is the static recompiler applied to shared libraries. Only the
+/// executable is translated ahead of time from its ELF, because only the
+/// executable is loaded by gex -- the interpreter maps everything else itself,
+/// at run time, from guest code. So for a dynamically linked program almost
+/// nothing was statically recompiled: the executable is a stub and ld.so,
+/// libc and the rest all arrived one dispatch miss at a time.
+///
+/// `seeds` says where to start; empty means every decodable address in the
+/// range. Empty is right for an object with no symbols left and wrong for one
+/// that has them -- a shipped library's `.dynsym` names a few thousand entry
+/// points, and scanning instead finds two hundred thousand, most of them the
+/// middle of a function that a block starting earlier already covers.
+///
+/// Seeding from the object rather than from one entry point is what makes
+/// it static. Discovery still runs -- a block's successors are followed, and
+/// a PLT's GOT load is folded so its indirect branch becomes a known target --
+/// but it no longer depends on which address the guest happened to reach
+/// first, which is what made the demand-driven output differ between runs.
+#[allow(clippy::too_many_arguments)]
+pub fn translate_object(
+    memory: &[u8],
+    lo: u64,
+    hi: u64,
+    seeds: &[u64],
+    executable: &dyn Fn(u64) -> bool,
+    known: &dyn Fn(u64) -> bool,
+    page_table: PageTable,
+    limits: BlockLimits,
+    max_blocks: usize,
+    shared_memory: bool,
+) -> (TranslatedModule, Stats) {
+    // Addresses that do not begin a decodable instruction are skipped rather
+    // than translated into a block that can only report SIGILL. On a static
+    // musl binary that is about three quarters of them, and the same holds
+    // here: an executable segment is full of padding and literal pools.
+    let mut scanned: Vec<u64> = Vec::new();
+    let seeds = if seeds.is_empty() {
+        let mut a = lo;
+        while a + 4 <= hi {
+            if executable(a) {
+                let off = a as usize;
+                if off + 4 <= memory.len() {
+                    let raw = u32::from_le_bytes(memory[off..off + 4].try_into().unwrap());
+                    if !matches!(
+                        gex_isa::decode(raw, a),
+                        gex_isa::Inst::Unknown { .. } | gex_isa::Inst::Undefined { .. }
+                    ) {
+                        scanned.push(a);
+                    }
+                }
+            }
+            a += 4;
+        }
+        &scanned[..]
+    } else {
+        seeds
+    };
+    translate_seeded(
+        memory,
+        lo,
+        seeds,
+        executable,
+        known,
+        page_table,
+        limits,
+        max_blocks,
+        shared_memory,
+    )
+}
+
 pub fn translate_runtime(
     memory: &[u8],
     entry: u64,
+    executable: &dyn Fn(u64) -> bool,
+    known: &dyn Fn(u64) -> bool,
+    page_table: PageTable,
+    limits: BlockLimits,
+    max_blocks: usize,
+    shared_memory: bool,
+) -> (TranslatedModule, Stats) {
+    translate_seeded(
+        memory,
+        entry,
+        &[entry],
+        executable,
+        known,
+        page_table,
+        limits,
+        max_blocks,
+        shared_memory,
+    )
+}
+
+/// The body both paths share: lift from live memory, following what each
+/// block reaches, starting from whatever was seeded.
+#[allow(clippy::too_many_arguments)]
+fn translate_seeded(
+    memory: &[u8],
+    entry: u64,
+    seeds: &[u64],
     executable: &dyn Fn(u64) -> bool,
     known: &dyn Fn(u64) -> bool,
     page_table: PageTable,
@@ -388,7 +488,7 @@ pub fn translate_runtime(
     let mut worklist: BTreeSet<u64> = BTreeSet::new();
     let mut seen: HashSet<u64> = HashSet::new();
     let mut collected: Vec<Block> = Vec::new();
-    worklist.insert(entry);
+    worklist.extend(seeds.iter().copied());
 
     while let Some(&addr) = worklist.iter().next() {
         worklist.remove(&addr);
@@ -396,7 +496,9 @@ pub fn translate_runtime(
             continue;
         }
         // Never re-translate something the table already answers for; the
-        // existing entry may be a tier-2 region.
+        // existing entry may be a tier-2 region. The address that prompted a
+        // demand-driven translation is the exception -- it is being asked for
+        // precisely because the table does not answer for it yet.
         if addr != entry && known(addr) {
             continue;
         }

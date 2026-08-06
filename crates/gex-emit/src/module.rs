@@ -16,7 +16,7 @@ use gex_abi::{
     GUEST_MEM_PAGES, IMPORT_MODULE, MISS_SLOTS, SLOTS_PER_PAGE,
 };
 use gex_ir::Block;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Where a module's memory and dispatch table come from.
 ///
@@ -429,9 +429,6 @@ impl ModuleBuilder {
     pub fn add_block(&mut self, block: Block) {
         let f = self.reserve(block.start);
         self.page_base(block.start);
-        // A shared module cannot write the table itself — element segments
-        // may not target an imported table at an offset the host chose — so
-        // its blocks are exported and the host installs them.
         if self.linkage == Linkage::Shared {
             self.exports_by_addr.push((block.start, f));
         }
@@ -532,10 +529,61 @@ impl ModuleBuilder {
                 });
             }
             Linkage::Shared => {
+                // The table is imported, and the module fills it itself.
+                //
+                // It used to export every block by name and let the host set
+                // the slots one at a time. That is a name lookup and a table
+                // write per block, from outside the engine, and on a whole
+                // shared library it is the dominant cost of using the
+                // translation at all: 200,000 blocks for libc took half a
+                // minute to install into each store, dwarfing the compile.
+                //
+                // An active element segment may target an imported table --
+                // the earlier comment here said otherwise, and was wrong --
+                // and the slot base of every page is already fixed by the
+                // time this runs, because `page_base` allocated it. So the
+                // offsets are constants and the whole thing is one segment
+                // per page, filled by the engine at instantiation.
+                let mut by_page: BTreeMap<u64, Vec<(u64, u32)>> = BTreeMap::new();
                 for (addr, f) in std::mem::take(&mut self.exports_by_addr) {
-                    let name = format!("b{addr:x}");
-                    self.m.export(&name, ExportKind::Func, f);
-                    exported_blocks.push((addr, name));
+                    by_page.entry(dispatch_page(addr)).or_default().push((addr, f));
+                    exported_blocks.push((addr, String::new()));
+                }
+                for (page, mut blocks) in by_page {
+                    let Some(base) = self.page_table.lookup(page) else {
+                        continue;
+                    };
+                    blocks.sort_by_key(|(a, _)| *a);
+                    // One segment per contiguous run of slots. A page is
+                    // 1024 slots and a translated page is usually sparse, so
+                    // filling the gaps with the miss stub would be both
+                    // larger and wrong -- the stub belongs to a module this
+                    // one cannot name.
+                    let mut run: Vec<u32> = Vec::new();
+                    let mut run_start = 0u64;
+                    let mut expect = u64::MAX;
+                    for (addr, f) in blocks {
+                        let idx = base as u64 + ((addr % DISPATCH_PAGE) >> 2);
+                        if idx != expect && !run.is_empty() {
+                            self.m.element(ElementSegment {
+                                table: 0,
+                                offset: run_start as u32,
+                                funcs: std::mem::take(&mut run),
+                            });
+                        }
+                        if run.is_empty() {
+                            run_start = idx;
+                        }
+                        run.push(f);
+                        expect = idx + 1;
+                    }
+                    if !run.is_empty() {
+                        self.m.element(ElementSegment {
+                            table: 0,
+                            offset: run_start as u32,
+                            funcs: run,
+                        });
+                    }
                 }
             }
         }

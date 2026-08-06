@@ -83,6 +83,21 @@ pub struct RunOptions {
     pub identity: Option<(u32, u32)>,
     /// Sample the guest's back-edges and report the hottest at exit.
     pub sample: bool,
+    /// Statically recompile each shared library as it is mapped, instead of
+    /// letting the runtime translator find it a dispatch miss at a time.
+    ///
+    /// Off by default, and the reason is measured rather than assumed. On
+    /// `dpkg --version` the demand-driven path costs 0.60s warm; recompiling
+    /// every object costs 32s warm and three and a half minutes cold. The
+    /// modules are the problem: seeding from every decodable address gives
+    /// 200,000 blocks for libc alone, and instantiating that into each store
+    /// swamps everything, while the program touches a few thousand of them.
+    ///
+    /// It is kept because the *approach* is right and the seeding is wrong.
+    /// Seeding from the dynamic symbol table instead of from every address
+    /// would cut it by an order of magnitude, and a tier-2 pass over a whole
+    /// object can see things a demand-driven one cannot.
+    pub recompile_objects: bool,
     /// Translate code on demand when a branch reaches an address with no
     /// translation.
     pub jit: bool,
@@ -103,6 +118,7 @@ impl Default for RunOptions {
             sysroot: None,
             identity: None,
             sample: false,
+            recompile_objects: false,
             jit: false,
             cwd: None,
             // On by default: it is the difference between half a minute and
@@ -457,6 +473,11 @@ fn run_program_with(
 
     let ctx_addr = gex_abi::ctx_addr(0);
     let sampler = sampler_for(opts);
+    RECOMPILE_OBJECTS.store(
+        opts.recompile_objects,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    JIT_ON.store(opts.jit, std::sync::atomic::Ordering::Relaxed);
     // The same directory the ahead-of-time modules use; the keys cannot
     // collide because they hash different things.
     let jit_cache = use_cache
@@ -573,7 +594,12 @@ fn run_program_with(
         Some(Extern::Table(t)) => t,
         _ => bail!("translated module does not export its dispatch table"),
     };
-    if opts.jit {
+    // The machinery here is "install a translated module into this store": a
+    // table, a linker, a registry other stores replay from. Translating on a
+    // dispatch miss is one user of it; statically recompiling a whole object
+    // the moment it is mapped is another, and that one is not runtime
+    // translation at all. `--no-jit` turns off the miss handler, not this.
+    if opts.jit || opts.recompile_objects {
         store.data_mut().jit = Some(Jit {
             shared: Arc::new(Mutex::new(JitShared {
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
@@ -1408,6 +1434,16 @@ impl Sampler {
 /// of a package manager's work that matters.
 static SAMPLER: std::sync::OnceLock<Option<Arc<Sampler>>> = std::sync::OnceLock::new();
 
+/// Whether to statically recompile each object as it is mapped. Process-wide
+/// for the same reason the sampler is: the import surface is registered once
+/// and outlives any one program.
+static RECOMPILE_OBJECTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a dispatch miss may translate. Distinct from whether the
+/// installation machinery exists.
+static JIT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn sampler_for(opts: &RunOptions) -> Option<Arc<Sampler>> {
     // Off unless asked for: it is a lock and a hash insert on every back-edge
     // safepoint, which is not free.
@@ -1736,6 +1772,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             } else {
                 outcome
             };
+            // A shared library has just been mapped. Recompile the whole
+            // object now rather than letting the runtime translator find it
+            // one dispatch miss at a time.
+            let mapped: Vec<gex_kernel::CodeMap> = caller
+                .data_mut()
+                .with_kernel(|k| std::mem::take(&mut k.new_code));
+            let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
+            for m in mapped.into_iter().filter(|_| want_objects) {
+                if let Err(e) = recompile_object(&mut caller, &m) {
+                    // Not fatal: the runtime translator is still behind this,
+                    // and it will pick the object up a block at a time.
+                    eprintln!("gex: could not recompile {}: {e:#}", m.path);
+                }
+            }
             let state = caller.data_mut();
             match outcome {
                 SyscallOutcome::Continue => Ok(()),
@@ -2055,6 +2105,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
 /// table, so freshly translated code shares state with everything already
 /// running and can branch into it through the table.
 fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
+    // With runtime translation off, a miss is still worth catching up on --
+    // another thread or a freshly mapped object may already have covered this
+    // address -- but nothing new is translated for it. A miss that survives
+    // that is a hole in the static recompilation and should be reported as
+    // one rather than quietly filled in.
+    if !JIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        let replayed = replay_registry(caller)?;
+        let covered = replayed && {
+            let jit = caller.data().jit.as_ref().unwrap();
+            let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+            sh.translated.contains(&pc)
+        };
+        return Ok(covered);
+    }
     // Another thread may already have translated this code. Catching up on
     // the shared registry is far cheaper than translating again, and it is
     // also how a newly spawned thread fills a table that starts out holding
@@ -2283,19 +2347,10 @@ fn install_unit(
         .instantiate(cx.as_context_mut(), &unit.module)
         .context("instantiating a runtime-translated module")?;
 
-    for (addr, name) in &unit.exported_blocks {
-        let Some(Extern::Func(f)) = instance.get_export(cx.as_context_mut(), name) else {
-            bail!("runtime module is missing its export {name}");
-        };
-        let page = gex_abi::dispatch_page(*addr);
-        let Some(base) = unit.page_table.lookup(page) else {
-            bail!("no dispatch page allocated for block 0x{addr:x}");
-        };
-        let slot = gex_abi::dispatch_index(*addr, base);
-        table
-            .set(cx.as_context_mut(), slot, Ref::Func(Some(f)))
-            .with_context(|| format!("installing block 0x{addr:x} in slot {slot}"))?;
-    }
+    // Nothing to install by hand: the module carries element segments for
+    // the table it imports, so instantiating it above already filled every
+    // slot it owns. This loop used to be a name lookup and a table write per
+    // block, and on a whole shared library it cost more than the compile.
     // Idempotent: the directory lives in shared guest memory, so a second
     // store writing the same entries changes nothing.
     write_dispatch_dir(memory, &unit.dir_entries)?;
@@ -2323,6 +2378,165 @@ fn write_dispatch_dir(memory: gex_mem::GuestMemory, entries: &[(u64, u32)]) -> R
 }
 
 /// Turn a wasm trap into a guest signal.
+/// The exported entry points of the object mapped at `map`, biased to where
+/// it actually landed.
+///
+/// Empty when the file cannot be read or has no symbols, which tells
+/// `translate_object` to scan instead.
+fn object_seeds(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMap) -> Vec<u64> {
+    let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&map.path)) else {
+        return Vec::new();
+    };
+    // Parsed at its own addresses; the bias is worked out from where the
+    // executable segment was asked to go against where it ended up.
+    let Ok(image) = gex_ld::elf::load(&bytes, 0) else {
+        return Vec::new();
+    };
+    let Some(text) = image.segments.iter().find(|s| s.executable) else {
+        return Vec::new();
+    };
+    let bias = map.start.wrapping_sub(text.vaddr & !0xfff);
+    let (lo, hi) = (text.vaddr, text.vaddr + text.bytes.len() as u64);
+    let mut seeds: Vec<u64> = image
+        .symbols
+        .iter()
+        .filter(|s| s.value >= lo && s.value < hi)
+        .map(|s| s.value.wrapping_add(bias))
+        .collect();
+    seeds.push(image.entry.wrapping_add(bias));
+    seeds.sort_unstable();
+    seeds.dedup();
+    seeds
+}
+
+/// A mapping larger than this is not a shared library, and recompiling it
+/// would be a long pause for nothing.
+const MAX_OBJECT_BYTES: u64 = 64 << 20;
+
+/// A cap on one object, so a pathological mapping cannot stall the guest
+/// indefinitely. Anything past it still arrives through the runtime
+/// translator, which is what that path is for.
+const MAX_OBJECT_BLOCKS: usize = 200_000;
+
+/// Statically recompile a shared library the guest has just mapped.
+///
+/// The point of doing it here, all at once, is that it is *static*: the whole
+/// object is translated from its own bytes, so the result depends on the
+/// library and where it was loaded and on nothing else. The demand-driven
+/// path produces a different module depending on which address the guest
+/// reached first, which is why its output never settled and its cache never
+/// quite hit.
+///
+/// Cached by the hash of exactly what was translated -- the mapped bytes and
+/// the base address -- so the second run of any program using the library
+/// pays nothing.
+fn recompile_object(caller: &mut Caller<'_, HostState>, map: &gex_kernel::CodeMap) -> Result<()> {
+    if caller.data().jit.is_none() {
+        return Ok(());
+    }
+    // The interpreter maps its own segments before it has a kernel to ask, so
+    // a range with nothing decodable in it is normal and not worth reporting.
+    let span = map.end.saturating_sub(map.start);
+    if span == 0 || span > MAX_OBJECT_BYTES {
+        return Ok(());
+    }
+    let (limits, shared) = {
+        let jit = caller.data().jit.as_ref().unwrap();
+        (jit.limits, Arc::clone(&jit.shared))
+    };
+    let page_table = {
+        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.page_table.clone()
+    };
+    let known: std::collections::HashSet<u64> = {
+        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.translated.clone()
+    };
+    let memory = caller
+        .data()
+        .memory
+        .clone()
+        .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let exec_ranges: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
+        k.mem
+            .vmas()
+            .iter()
+            .filter(|v| v.prot & prot::EXEC != 0)
+            .map(|v| (v.start, v.end))
+            .collect()
+    });
+    // Where to start: the library's own exported functions. A shipped object
+    // keeps `.dynsym` even when it has been stripped of `.symtab`, and those
+    // symbols are exactly the addresses anything outside can call. Discovery
+    // does the rest -- successors, and the folded target of a PLT's indirect
+    // branch.
+    //
+    // Falling back to scanning every decodable address is correct but not
+    // affordable: on libc it finds 200,000 blocks where the symbols find a
+    // small fraction of that, and the difference is all interior addresses
+    // that a block starting at the function entry already covers.
+    let seeds = object_seeds(caller, map);
+    let started = std::time::Instant::now();
+    let (translated, stats) = {
+        let data = memory.bytes();
+        gex_xlate::translate_object(
+            data,
+            map.start,
+            map.end,
+            &seeds,
+            &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
+            &|a| known.contains(&a),
+            page_table,
+            limits,
+            MAX_OBJECT_BLOCKS,
+            true,
+        )
+    };
+    if translated.exported_blocks.is_empty() {
+        return Ok(());
+    }
+    let engine = caller.data().jit.as_ref().unwrap().engine.clone();
+    let cache = caller.data().jit.as_ref().and_then(|j| j.cache.clone());
+    let module = match cache {
+        Some((dir, build)) => {
+            let key = gex_cache::key(&build, [translated.wasm.as_slice()]);
+            let wasm = translated.wasm.clone();
+            gex_cache::load_or_compile(&engine, &dir, &key, move || Ok((wasm, Vec::new())))
+                .context("compiling a statically recompiled object")?
+                .module
+        }
+        None => Module::new(&engine, &translated.wasm)
+            .context("validating a statically recompiled object")?,
+    };
+    {
+        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.translated
+            .extend(translated.exported_blocks.iter().map(|(a, _)| *a));
+        sh.page_table = translated.page_table.clone();
+        sh.registry.push(Arc::new(CompiledUnit {
+            module,
+            exported_blocks: translated.exported_blocks.clone(),
+            dir_entries: translated.dir_entries.clone(),
+            table_slots: translated.table_slots,
+            page_table: translated.page_table.clone(),
+        }));
+        sh.blocks += stats.blocks;
+        sh.calls += 1;
+    }
+    replay_registry(caller)?;
+    if std::env::var("GEX_VERBOSE_OBJECTS").is_ok() {
+        eprintln!(
+            "[gex] recompiled {} [{:#x}..{:#x}): {} blocks in {:.2}s",
+            map.path,
+            map.start,
+            map.end,
+            stats.blocks,
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
 /// Whether a trap is a dispatch through a table slot that is not there yet.
 ///
 /// Both shapes mean the same thing: the slot is past the end of this store's
