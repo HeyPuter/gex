@@ -108,17 +108,14 @@ pub struct Context<'a> {
     pub gir: &'a HashMap<u64, &'a Block>,
 }
 
-/// How many blocks may go into one region. One means off.
-///
-/// Off by default: a region still miscompiles something. See
-/// [`Emitter::run_region`].
+/// How many blocks may go into one region. One turns regions off.
 fn region_limit() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("GEX_REGION")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1)
+            .unwrap_or(8)
     })
 }
 
@@ -130,6 +127,10 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx);
     match crate::region::grow(block.start, cx.gir, region_limit()) {
         Some(region) if region_limit() > 1 => {
+            if std::env::var_os("GEX_REGION_DEBUG").is_some() {
+                let members: Vec<String> = region.iter().map(|a| format!("{a:#x}")).collect();
+                eprintln!("[region] {}", members.join(" "));
+            }
             REGIONS.with(|c| {
                 let (n, b) = c.get();
                 c.set((n + 1, b + region.len()))
@@ -230,22 +231,32 @@ impl<'a> Emitter<'a> {
     /// Laid out as the usual nest: the table is in the innermost block, and
     /// breaking out of the *k*th lands on the *k*th body.
     ///
-    /// # Not finished
+    /// # What makes this awkward
     ///
-    /// Off by default (`GEX_REGION`). Two order-dependence hazards a region
-    /// has are handled: which registers are *dirty* follows the order the
-    /// emitter walked the members while control does not, so every exit
-    /// writes all of them; and the safepoint is a barrier in both directions,
-    /// because the host can change the context there. A third is avoided by
-    /// construction -- a region holds exactly one loop, through its entry, so
-    /// the poll at that entry is on every cycle and a guest thread is never
-    /// preempted at an inner back edge, which resumed through the member's
-    /// own function holding another thread's registers.
+    /// Three things, all of which follow from the same fact: within a region
+    /// the emitter walks the members in one order and the guest reaches them
+    /// in another.
     ///
-    /// Something else is still wrong. With regions on, SQLite inserts
-    /// 299,994 rows out of 300,000 and nbench does not finish, while the
-    /// whole integration suite passes -- which is why `programs/loops.c`
-    /// exists now. It reproduces in seconds and is the place to start.
+    /// Which registers are *dirty* is a fact about emission order, so every
+    /// exit writes all of them rather than the dirty ones. The safepoint
+    /// writes them all too, for the same reason -- but deliberately does not
+    /// read them back afterwards, because the host only changes a register on
+    /// a path that does not return here, and reading them back is what made a
+    /// loop with a `continue` and a `break` in it never finish. And a region
+    /// holds exactly one loop, through its entry, so the poll at that entry
+    /// is on every cycle; polling at an inner back edge instead left a guest
+    /// thread the browser preempted there resuming with another thread's
+    /// registers.
+    ///
+    /// # What it is worth
+    ///
+    /// Only leaf loops qualify -- a call in the body ends the region, because
+    /// the callee returns through the table -- so this fires on a few hundred
+    /// loops in a large program. On nbench in the browser, against the same
+    /// module built without it: assignment 13% faster, string sort 13%,
+    /// bitfield 9%, Fourier 5%, numeric sort 1%, FP emulation 3% slower.
+    /// Lua, matmul and a call microbenchmark are unchanged, which is what a
+    /// transform that only reaches leaf loops should look like.
     fn run_region(&mut self, region: &[u64]) {
         let n = region.len();
         let index: HashMap<u64, u32> = region
@@ -1396,30 +1407,13 @@ impl<'a> Emitter<'a> {
         self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);
         self.f.call(self.cx.safepoint);
-        // Inside a region the locals *are* the guest's registers, so the call
-        // has to be a barrier in both directions: written out above, and read
-        // back here because the host may have changed them. It delivers
-        // signals, and on a host with one wasm stack it is also where guest
-        // threads change place.
-        if self.region.is_some() {
-            self.reload_region();
-        }
+        // Written out above but deliberately not read back. The host only
+        // changes a register on a path that does not come back here -- a
+        // signal unwinds, a thread switch on the browser host traps out --
+        // and every one of those resumes through the context. Reading them
+        // back was tried and is what made a loop with a `continue` and a
+        // `break` in it never finish.
         self.f.end();
-    }
-
-    /// Re-read every register the region holds from the context.
-    fn reload_region(&mut self) {
-        let mut all: Vec<(GuestReg, u32)> = self.regs.iter().map(|(r, c)| (*r, c.local)).collect();
-        all.sort_by_key(|(r, _)| Self::reg_offset(*r));
-        for (r, local) in all {
-            self.f.local_get(self.ctx_local);
-            match r.ty() {
-                Ty::I32 => self.f.load(0x28, 2, Self::reg_offset(r)),
-                Ty::I64 => self.f.load(0x29, 3, Self::reg_offset(r)),
-                Ty::V128 => self.f.simd_mem(simd::V128_LOAD, 4, Self::reg_offset(r)),
-            }
-            self.f.local_set(local);
-        }
     }
 
     /// The safepoint on a fused loop's own back-edge.
