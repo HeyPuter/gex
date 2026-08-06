@@ -22,7 +22,8 @@
 use gex_emit::module::Linkage;
 pub use gex_emit::module::Metadata;
 pub use gex_emit::PageTable;
-use gex_emit::{ModuleBuilder, TranslatedModule};
+pub use gex_emit::TranslatedModule;
+use gex_emit::ModuleBuilder;
 use gex_ir::{pass, Block, Term};
 use gex_ld::Image;
 use gex_lift::{lift_block, BlockLimits};

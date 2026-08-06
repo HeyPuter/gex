@@ -71,19 +71,41 @@ impl TranslatedModule {
 /// single value in guest memory, so if two modules each picked their own base
 /// for the same page the second would orphan the first's blocks and they
 /// would be translated again on the next branch.
-#[derive(Debug, Default, Clone)]
+///
+/// The allocation mark is shared between clones rather than copied with them.
+/// A host translates from a *snapshot* of this table and publishes the result
+/// much later -- milliseconds of lifting and seconds of Cranelift later -- and
+/// with a copied mark two threads doing that at once both allocated from the
+/// same number. Two different guest pages were handed the same base, and an
+/// indirect branch to one of them landed inside a function belonging to the
+/// other; dpkg's decompressor produced a byte-perfect 5 MB of output and then
+/// failed a stack canary in an `exit` handler it had entered halfway through.
+///
+/// Sharing the mark makes the collision impossible without a lock, which is
+/// the point: the alternative is holding one across the compile, and a lock
+/// held for seconds around a step every thread needs is a thing to avoid
+/// rather than to measure.
+///
+/// Two translations can still allocate *different* bases for the same page.
+/// That is harmless -- both sets of slots hold correct code for those
+/// addresses, so a branch is right whichever it reaches -- and it costs a page
+/// of slots.
+#[derive(Debug, Clone)]
 pub struct PageTable {
     pages: std::collections::BTreeMap<u64, u32>,
-    next_slot: u64,
+    next_slot: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Default for PageTable {
+    fn default() -> PageTable {
+        PageTable::from_entries(&[], 0)
+    }
 }
 
 impl PageTable {
     /// Start allocating above the reserved miss span.
     pub fn new() -> PageTable {
-        PageTable {
-            pages: Default::default(),
-            next_slot: MISS_SLOTS,
-        }
+        PageTable::from_entries(&[], MISS_SLOTS)
     }
 
     /// The base slot for a page, allocating one if it has none.
@@ -91,8 +113,9 @@ impl PageTable {
         if let Some(&b) = self.pages.get(&page) {
             return b;
         }
-        let base = self.next_slot as u32;
-        self.next_slot += SLOTS_PER_PAGE;
+        let base = self
+            .next_slot
+            .fetch_add(SLOTS_PER_PAGE, std::sync::atomic::Ordering::SeqCst) as u32;
         self.pages.insert(page, base);
         base
     }
@@ -102,14 +125,27 @@ impl PageTable {
         self.pages.get(&page).copied()
     }
 
-    /// Total slots allocated so far.
+    /// Total slots allocated so far, by this table and everything sharing its
+    /// mark.
     pub fn slots(&self) -> u64 {
-        self.next_slot
+        self.next_slot.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Every page-to-base assignment made so far.
     pub fn entries(&self) -> Vec<(u64, u32)> {
         self.pages.iter().map(|(p, b)| (*p, *b)).collect()
+    }
+
+    /// Take in another table's assignments, its own winning where they
+    /// disagree.
+    ///
+    /// Publishing is ordered, and every store replays the units in that same
+    /// order, so the last assignment merged here is the one whose directory
+    /// entry the guest ends up holding.
+    pub fn merge(&mut self, other: &PageTable) {
+        for (page, base) in &other.pages {
+            self.pages.insert(*page, *base);
+        }
     }
 
     /// Move the allocation mark forward, never back.
@@ -120,7 +156,8 @@ impl PageTable {
     /// and a page whose directory entry survived the restore would dispatch
     /// into whatever code now occupies its slots.
     pub fn advance_to(&mut self, slot: u64) {
-        self.next_slot = self.next_slot.max(slot);
+        self.next_slot
+            .fetch_max(slot, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Rebuild an assignment from the entries a previous run recorded.
@@ -128,10 +165,13 @@ impl PageTable {
     /// Used when a cached module is loaded instead of translated: the pages it
     /// claimed have to keep the same bases, because the directory entries the
     /// host is about to publish name them.
+    ///
+    /// This starts a *new* mark. Everything cloned from the result shares it;
+    /// nothing already in flight does.
     pub fn from_entries(entries: &[(u64, u32)], next_slot: u64) -> PageTable {
         PageTable {
             pages: entries.iter().copied().collect(),
-            next_slot,
+            next_slot: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(next_slot)),
         }
     }
 }

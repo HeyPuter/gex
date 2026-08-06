@@ -346,6 +346,7 @@ if [ -f "$MUSL_LIBC" ]; then
     cp "$MUSL_LIBC" "$SYSROOT/lib/ld-musl-aarch64.so.1"
     "$CC" -O2 -o "$WORK/dyn-suite" "$HERE/programs/suite.c"
     "$CC" -O2 -o "$WORK/dyn-vector" "$HERE/programs/vector.c"
+    "$CC" -O2 -pthread -lm -o "$WORK/dyn-threads" "$HERE/programs/dyn-threads.c"
     DYNAMIC=1
     # Unwinding across a DSO boundary is the part that only the dynamic C++
     # build exercises: libstdc++ and libgcc_s must be found and relocated by
@@ -472,6 +473,8 @@ if [ -n "$DYNAMIC" ]; then
         compare "dynamic-$area" "$WORK/dyn-suite" "$area"
     done
     compare "dynamic-vector" "$WORK/dyn-vector"
+    # Threads racing to translate library code: see programs/dyn-threads.c.
+    compare "dynamic-threads" "$WORK/dyn-threads"
     [ -f "$WORK/dyn-cpp" ] && compare "dynamic-cpp" "$WORK/dyn-cpp"
     QEMU_ARGS=""
     GEXC_ARGS=""

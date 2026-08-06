@@ -251,6 +251,9 @@ struct JitShared {
     /// Every unit compiled so far, in installation order. Append-only, so a
     /// store catches up by replaying from its own watermark.
     registry: Vec<Arc<CompiledUnit>>,
+    /// Which page owns each base slot, so the one thing that must never
+    /// happen can be noticed if it ever does. See `publish_unit`.
+    slot_owner: std::collections::HashMap<u32, u64>,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -478,6 +481,14 @@ fn run_program_with(
         std::sync::atomic::Ordering::Relaxed,
     );
     JIT_ON.store(opts.jit, std::sync::atomic::Ordering::Relaxed);
+    DUMP_ABORT.store(
+        std::env::var_os("GEX_DUMP_ABORT").is_some(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    WATCH_ON.store(
+        std::env::var_os("GEX_WATCH").is_some(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // The same directory the ahead-of-time modules use; the keys cannot
     // collide because they hash different things.
     let jit_cache = use_cache
@@ -607,6 +618,7 @@ fn run_program_with(
                 registry: Vec::new(),
                 blocks: 0,
                 calls: 0,
+                slot_owner: Default::default(),
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -1482,6 +1494,160 @@ static RECOMPILE_OBJECTS: std::sync::atomic::AtomicBool =
 /// installation machinery exists.
 static JIT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// Whether to print the guest's registers and stack when it aborts.
+///
+/// `abort` is the end of the road for a guest: it raises SIGABRT at itself and
+/// nothing runs afterwards, so unless the state is captured at the syscall it
+/// is gone. glibc's `__stack_chk_fail` arrives here, and the interesting
+/// question -- which function's canary failed -- is answerable only from the
+/// return addresses still on the stack.
+static DUMP_ABORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A watch on a range of guest memory: `GEX_WATCH=<hex addr>[+<hex len>]`.
+///
+/// Corruption is found by asking who wrote to a place, and a translated guest
+/// has no hardware watchpoint to ask with. This is the next best thing: the
+/// bytes are remembered, and every safepoint and every syscall compares them
+/// and reports the first pc at which they differ. A back-edge poll is a coarse
+/// net -- the write happened somewhere in the loop, not at the pc printed --
+/// but it narrows a whole program down to one loop, which is the hard part.
+static WATCH: std::sync::Mutex<Option<(u64, usize, Vec<u8>)>> = std::sync::Mutex::new(None);
+
+fn watch_check(gm: &GuestMem<'_>, pc: u64, tid: i32) {
+    if !WATCH_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut w = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if w.is_none() {
+        watch_arm(gm, &mut w);
+    }
+    let Some((addr, len, before)) = w.as_mut() else {
+        return;
+    };
+    let (start, end) = (*addr as usize, *addr as usize + *len);
+    if end > gm.bytes.len() {
+        return;
+    }
+    let now = &gm.bytes[start..end];
+    if now == before.as_slice() {
+        return;
+    }
+    eprintln!(
+        "gex: watch {addr:#x} changed at pc {pc:#x} (thread {tid})\n  was {}\n  now {}",
+        hex_bytes(before),
+        hex_bytes(now)
+    );
+    before.clear();
+    before.extend_from_slice(now);
+}
+
+fn hex_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+static WATCH_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Take the initial snapshot, at the guest's first syscall.
+///
+/// Later than it looks: by the time a dynamic program makes a syscall the
+/// loader is running, so an address in a library that is not mapped yet reads
+/// as zero and the mapping itself is reported as the first change.
+fn watch_arm(gm: &GuestMem<'_>, slot: &mut Option<(u64, usize, Vec<u8>)>) {
+    let Some(spec) = std::env::var_os("GEX_WATCH") else {
+        WATCH_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
+    let spec = spec.to_string_lossy().to_string();
+    let (a, l) = spec.split_once('+').unwrap_or((spec.as_str(), "8"));
+    let (Ok(addr), Ok(len)) = (
+        u64::from_str_radix(a.trim_start_matches("0x"), 16),
+        usize::from_str_radix(l.trim_start_matches("0x"), 16),
+    ) else {
+        eprintln!("gex: GEX_WATCH wants <hex addr>[+<hex len>], got {spec:?}");
+        WATCH_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
+    if addr as usize + len > gm.bytes.len() {
+        return;
+    }
+    let bytes = gm.bytes[addr as usize..addr as usize + len].to_vec();
+    eprintln!("gex: watching {addr:#x}+{len:#x}, now {}", hex_bytes(&bytes));
+    *slot = Some((addr, len, bytes));
+}
+
+/// Print the register file and the return addresses on the stack.
+///
+/// There is no unwind information here and none is wanted: a scan of the stack
+/// for words that point just after a `bl` in an executable mapping finds the
+/// call chain and some noise, and the noise is easy to read past. Each hit is
+/// reported against the mapping that contains it, so an address in a library
+/// is a name and an offset rather than a bare number.
+fn dump_guest(gm: &mut GuestMem<'_>, ctx_addr: u64, tid: i32, vmas: &[gex_kernel::mem::Vma]) {
+    let at = |a: u64| -> Option<&gex_kernel::mem::Vma> {
+        vmas.iter().find(|v| a >= v.start && a < v.end)
+    };
+    let describe = |a: u64| -> String {
+        match at(a) {
+            Some(v) if !v.name.is_empty() => format!("{}+0x{:x}", v.name, a - v.start),
+            _ => String::new(),
+        }
+    };
+    let read =
+        |gm: &mut GuestMem<'_>, off: usize| gm.read_u64(ctx_addr + off as u64).unwrap_or(0);
+    let pc = read(gm, ctx::PC);
+    let sp = read(gm, ctx::SP);
+    eprintln!("gex: guest abort in thread {tid}");
+    eprintln!("  pc  {pc:#018x}  {}", describe(pc));
+    eprintln!("  sp  {sp:#018x}  {}", describe(sp));
+    for row in 0..8 {
+        let mut line = String::new();
+        for col in 0..4 {
+            let i = row * 4 + col;
+            if i > 30 {
+                break;
+            }
+            line.push_str(&format!("  x{i:<2} {:#018x}", read(gm, ctx::x(i))));
+        }
+        eprintln!(" {line}");
+    }
+    // glibc keeps a frame pointer, so the call chain is a linked list rather
+    // than a guess: x29 points at the saved pair, and the return address is
+    // the word above it.
+    eprintln!("  frames:");
+    let mut fp = read(gm, ctx::x(29));
+    for _ in 0..32 {
+        if fp == 0 || fp % 8 != 0 {
+            break;
+        }
+        let (Ok(next), Ok(ra)) = (gm.read_u64(fp), gm.read_u64(fp + 8)) else {
+            break;
+        };
+        if ra == 0 {
+            break;
+        }
+        eprintln!("    fp {fp:#014x}  ra {ra:#018x}  {}", describe(ra));
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    // The stack, upwards from where it is now. 32 KB is more than a canary
+    // failure needs and cheap enough not to think about.
+    eprintln!("  return addresses on the stack:");
+    let mut found = 0;
+    let mut a = sp & !7;
+    while a < sp + 0x8000 && found < 40 {
+        let Ok(w) = gm.read_u64(a) else { break };
+        // A return address points *after* a `bl`, so the word before it must
+        // be executable too; that alone discards most stray data.
+        if w >= 4 && at(w).is_some_and(|v| v.prot & prot::EXEC != 0) {
+            eprintln!("    [sp+{:#06x}] {w:#018x}  {}", a - sp, describe(w));
+            found += 1;
+        }
+        a += 8;
+    }
+}
+
 fn sampler_for(opts: &RunOptions) -> Option<Arc<Sampler>> {
     // Off unless asked for: it is a lock and a hash insert on every back-edge
     // safepoint, which is not free.
@@ -1793,6 +1959,27 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let nr = gm
                 .read_u64(state.thread.ctx_addr + ctx::x(8) as u64)
                 .unwrap_or(!0);
+            watch_check(&gm, pc as u64, state.thread.tid);
+            // A guest that is about to kill itself is the last moment its
+            // state means anything. `abort` unwinds nothing, so by the time
+            // the process is gone there is no way to ask where it was.
+            if DUMP_ABORT.load(std::sync::atomic::Ordering::Relaxed) {
+                let signo = match nr {
+                    gex_kernel::syscalls::nr::KILL | gex_kernel::syscalls::nr::TKILL => {
+                        gm.read_u64(state.thread.ctx_addr + ctx::x(1) as u64)
+                    }
+                    gex_kernel::syscalls::nr::TGKILL => {
+                        gm.read_u64(state.thread.ctx_addr + ctx::x(2) as u64)
+                    }
+                    _ => Err(gex_kernel::Errno::EINVAL),
+                };
+                if signo == Ok(6) {
+                    let ctx_addr = state.thread.ctx_addr;
+                    let tid = state.thread.tid;
+                    let vmas = state.with_kernel(|k| k.mem.vmas().to_vec());
+                    dump_guest(&mut gm, ctx_addr, tid, &vmas);
+                }
+            }
             let outcome = state.with_kernel(|k| {
                 if !gex_kernel::skips_proc_snapshot(nr) {
                     k.refresh_proc(&proc_state);
@@ -2119,6 +2306,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // The context is complete here, so a handler frame built now
             // captures exactly the state the guest would see on hardware.
             let ctx_addr = state.thread.ctx_addr;
+            watch_check(&gm, pc as u64, state.thread.tid);
             let _ = gm.write_u64(ctx_addr + gex_abi::ctx::PC as u64, pc as u64);
             // Rearm before delivering, so a handler that loops still polls.
             let counter = ctx_addr as usize + gex_abi::ctx::SAFEPOINT_COUNTER;
@@ -2202,6 +2390,8 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             .ok_or_else(|| anyhow!("runtime translation is not set up"))?;
         (jit.limits, Arc::clone(&jit.shared))
     };
+    // From here to the publish below, this is the only thread deciding which
+    // table slots anything occupies. See `JitShared::translating`.
     let page_table = {
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.page_table.clone()
@@ -2287,21 +2477,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // whenever another thread appended between the catch-up above and this
     // push -- which is exactly what filled one store with ten thousand
     // instances of the same modules.
-    {
-        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.translated
-            .extend(translated_module.exported_blocks.iter().map(|(a, _)| *a));
-        sh.page_table = translated_module.page_table.clone();
-        sh.registry.push(Arc::new(CompiledUnit {
-            module,
-            exported_blocks: translated_module.exported_blocks.clone(),
-            dir_entries: translated_module.dir_entries.clone(),
-            table_slots: translated_module.table_slots,
-            page_table: translated_module.page_table.clone(),
-        }));
-        sh.blocks += stats.blocks;
-        sh.calls += 1;
-    }
+    publish_unit(&shared, &translated_module, module, stats.blocks)?;
     replay_registry(caller)?;
 
     // If the address that faulted did not end up with code, resuming would
@@ -2358,6 +2534,60 @@ fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
         caller.data_mut().jit.as_mut().unwrap().replayed += 1;
     }
     Ok(true)
+}
+
+/// Merge a finished translation into the shared state.
+///
+/// Page bases come from a mark shared by every clone of the page table (see
+/// `PageTable`), so two translations running at once cannot be handed the same
+/// slots however long either of them takes. This is the check that the
+/// property still holds: if a base ever turns up owned by two different guest
+/// pages, an indirect branch to one of them will land inside a function
+/// belonging to the other, and the guest will fail somewhere else entirely --
+/// which is how this cost a day to find the first time.
+fn publish_unit(
+    shared: &Arc<Mutex<JitShared>>,
+    translated: &gex_xlate::TranslatedModule,
+    module: Module,
+    blocks: usize,
+) -> Result<Arc<CompiledUnit>> {
+    let unit = Arc::new(CompiledUnit {
+        module,
+        exported_blocks: translated.exported_blocks.clone(),
+        dir_entries: translated.dir_entries.clone(),
+        table_slots: translated.table_slots,
+        page_table: translated.page_table.clone(),
+    });
+    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    for (page, base) in translated.page_table.entries() {
+        match sh.slot_owner.entry(base) {
+            std::collections::hash_map::Entry::Occupied(e) if *e.get() != page => {
+                // Loudly, and not only through the error: an error out of here
+                // becomes a guest fault somewhere unrelated, which is exactly
+                // the kind of silence this check exists to break.
+                eprintln!(
+                    "gex: BUG: dispatch base {base} is claimed by guest page \
+                     {:#x} and again by {page:#x}; slot allocation is not \
+                     atomic",
+                    e.get()
+                );
+                bail!("two guest pages were given the same dispatch slots");
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(page);
+            }
+        }
+    }
+    sh.translated
+        .extend(translated.exported_blocks.iter().map(|(a, _)| *a));
+    let mut merged = sh.page_table.clone();
+    merged.merge(&translated.page_table);
+    sh.page_table = merged;
+    sh.registry.push(Arc::clone(&unit));
+    sh.blocks += blocks;
+    sh.calls += 1;
+    Ok(unit)
 }
 
 /// Instantiate one compiled unit into this store and point its table slots at
@@ -2621,22 +2851,7 @@ fn recompile_object(
         None => Module::new(&engine, &translated.wasm)
             .context("validating a statically recompiled object")?,
     };
-    let unit = Arc::new(CompiledUnit {
-        module,
-        exported_blocks: translated.exported_blocks.clone(),
-        dir_entries: translated.dir_entries.clone(),
-        table_slots: translated.table_slots,
-        page_table: translated.page_table.clone(),
-    });
-    {
-        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.translated
-            .extend(translated.exported_blocks.iter().map(|(a, _)| *a));
-        sh.page_table = translated.page_table.clone();
-        sh.registry.push(Arc::clone(&unit));
-        sh.blocks += stats.blocks;
-        sh.calls += 1;
-    }
+    let unit = publish_unit(&shared, &translated, module, stats.blocks)?;
     install_unit(caller.as_context_mut(), &unit)?;
     caller.as_context_mut().data_mut().jit.as_mut().unwrap().replayed += 1;
     if std::env::var("GEX_VERBOSE_OBJECTS").is_ok() {
