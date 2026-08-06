@@ -37,6 +37,39 @@
 //! the code after each call; with natural-loop growth it works and inherits
 //! that approach's losses.
 //!
+//! *More coverage, three ways*, measured on a harness that had been
+//! calibrated against two identical builds first -- which the earlier
+//! attempts above did not have, and is why they could only say "somewhere
+//! between -1% and +5%".
+//!
+//! What the regions that do form are worth, against forming none at all:
+//! crunch 0.899 (+/-2.6%), interp 0.954 (+/-2.4%). Ten percent on integer
+//! code, from 87 blocks out of 5945 -- 1.5% coverage. That is what made more
+//! coverage look like the obvious next move.
+//!
+//! Allowing a region to contain a loop that does not pass through its entry
+//! takes crunch from 87 blocks in regions to 1425, sixteen times as many, and
+//! costs 34%: 1.343 (+/-1.4%). Correct -- both benchmarks match qemu byte for
+//! byte -- and much slower. Note also that widening the forward walk without
+//! allowing nesting finds *fewer* regions, not more: 33 down to 26, because a
+//! wider walk pulls in inner loops and every one disqualifies the candidate.
+//!
+//! Selecting among the wide candidates by density -- internal edges per live
+//! register -- does almost nothing, because the big regions have the most
+//! internal edges and sail through. It removes the small ones, which is
+//! backwards.
+//!
+//! Selecting by the live register set directly, which is the cost this note
+//! names, does discriminate: at most 16 live registers gives 168 blocks in
+//! regions, twice the default, and everything above 24 is where the harmful
+//! ones live. Measured it is a wash -- crunch 0.981 (+/-1.7%), interp 1.027
+//! (+/-0.4%) -- slightly better on one and slightly worse on the other.
+//!
+//! So the accidental heuristic is at a local optimum that two principled
+//! alternatives do not beat. `GEX_REGION_NESTED`, `GEX_REGION_RATIO` and
+//! `GEX_REGION_MAXLIVE` exist to run these again; all three are off by
+//! default and change nothing until set.
+//!
 //! *Leaving the region to poll* rather than calling the host from inside it,
 //! which makes it impossible to preempt a guest thread with its registers in
 //! a region's locals. That was worth trying because three separate attempts
@@ -155,7 +188,7 @@ pub fn grow(entry: u64, gir: &HashMap<u64, &Block>, limit: usize) -> Option<Regi
             }
             if s == entry {
                 to_entry = true;
-            } else {
+            } else if !allow_nested() {
                 return None;
             }
         }
@@ -163,5 +196,102 @@ pub fn grow(entry: u64, gir: &HashMap<u64, &Block>, limit: usize) -> Option<Regi
     if !to_entry || order.len() < 2 {
         return None;
     }
-    Some(order)
+    worth_forming(&order, gir).then_some(order)
+}
+
+/// Whether a loop is worth emitting as one function.
+///
+/// The note above says a region's cost is its live register set, paid on
+/// every entry and every exit, and that the small accidental regions the
+/// forward walk found were the ones worth forming. That is a statement about
+/// a ratio, and it was being enforced by a block count -- which is a proxy
+/// for it and a poor one, because two loops of the same size can differ by a
+/// factor of three in how many registers they touch.
+///
+/// So: count what a region buys and what it costs, and compare.
+///
+/// It buys the edges between members, which become wasm branches instead of
+/// tail calls through the dispatch table. It costs the registers it holds in
+/// locals, which are written out at entry and read back at every exit --
+/// and, more importantly, which Cranelift must keep somewhere for the whole
+/// body.
+///
+/// `GEX_REGION_RATIO` is the number of internal edges each live register has
+/// to earn. Zero forms everything the soundness rules allow, which is the
+/// natural-loop growth the note measured as a loss; the default asks a loop
+/// to be denser than that.
+fn worth_forming(order: &[u64], gir: &HashMap<u64, &Block>) -> bool {
+    let ratio = region_ratio();
+    if ratio <= 0.0 && max_live() == usize::MAX {
+        return true;
+    }
+    let members: HashSet<u64> = order.iter().copied().collect();
+    let mut edges = 0usize;
+    let mut live: HashSet<gex_ir::GuestReg> = HashSet::new();
+    for a in order {
+        let Some(b) = gir.get(a) else { continue };
+        for s in b.successors() {
+            if members.contains(&s) {
+                edges += 1;
+            }
+        }
+        let (reads, writes) = crate::tier1::registers_read_and_written(b);
+        live.extend(reads);
+        live.extend(writes);
+    }
+    // A loop with no registers to spill is free to form.
+    if live.is_empty() {
+        return true;
+    }
+    if live.len() > max_live() {
+        return false;
+    }
+    edges as f64 >= ratio * live.len() as f64
+}
+
+/// The largest live register set a region may carry.
+///
+/// This is the cost, stated directly. Every register the region touches is
+/// written out when it is entered and read back at every exit, and held in a
+/// wasm local in between -- so a loop that touches forty registers pays for
+/// forty however few blocks it has, and the block count that used to stand in
+/// for this is a poor proxy: two loops of the same size can differ threefold.
+///
+/// The default is deliberately larger than anything the current growth rule
+/// produces, so it changes nothing until asked.
+fn max_live() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("GEX_REGION_MAXLIVE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX)
+    })
+}
+
+/// Whether a region may contain a loop that does not pass through its entry.
+///
+/// The rule against it is a safety rule: the entry is the only place a region
+/// polls, so a guest cycling inside without reaching the entry would never
+/// see a signal or a thread switch. It is also what keeps regions tiny --
+/// growing the walk from 8 blocks to 512 finds *fewer* regions, because a
+/// wider walk pulls in nested loops and every one of them disqualifies the
+/// whole candidate.
+///
+/// Worth measuring against, because the regions that do form are worth about
+/// 10% on an integer benchmark while covering 1.5% of blocks. Off by default:
+/// with it on, a long-running inner loop is unpreemptable.
+fn allow_nested() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var_os("GEX_REGION_NESTED").is_some())
+}
+
+fn region_ratio() -> f64 {
+    static R: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("GEX_REGION_RATIO")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0)
+    })
 }

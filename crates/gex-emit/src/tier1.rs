@@ -1692,7 +1692,7 @@ fn note_traffic(r: GuestReg) {
 /// control leaves. Keeping the two apart is worth doing: a register the loop
 /// only reads needs no store on the way out, and one it only writes needs no
 /// load on the way in, and a region pays those on every entry and exit.
-fn registers_read_and_written(block: &Block) -> (Vec<GuestReg>, Vec<GuestReg>) {
+pub(crate) fn registers_read_and_written(block: &Block) -> (Vec<GuestReg>, Vec<GuestReg>) {
     let (mut read, mut written) = (Vec::new(), Vec::new());
     for s in &block.stmts {
         match s {
