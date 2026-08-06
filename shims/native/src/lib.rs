@@ -687,8 +687,9 @@ fn run_program_with(
                         .unwrap_or_else(|| "[interp]".to_string()),
                 };
                 // Empty seeds: scan the whole segment. The interpreter's
-                // functions are almost all local and exported nowhere, so
-                // its symbol table covers a fraction of it.
+                // functions are almost all local and exported nowhere, so its
+                // symbol table covers a fraction of it -- and it is small
+                // enough that scanning is affordable where it is not for libc.
                 if let Err(e) = recompile_object(&mut store, &map, &[]) {
                     eprintln!("gex: could not recompile the interpreter: {e:#}");
                 }
@@ -1807,15 +1808,31 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .with_kernel(|k| std::mem::take(&mut k.new_code));
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {
-                // Empty seeds: a block at every decodable address.
+                // Seeded from what the object says about itself: its
+                // exported symbols, and every address its own data takes.
                 //
-                // Symbols plus every address the object's own data takes gets
-                // libc down from 200,000 blocks to 62,000 and is *nearly*
-                // complete -- one address in libc still died, reached by a
-                // computed branch that neither reveals. Nearly complete is
-                // fine behind a runtime translator and fatal without one, and
-                // this path exists to work without one.
-                if let Err(e) = recompile_object(&mut caller, &m, &[]) {
+                // A block at every decodable address is the only *complete*
+                // seeding, and it is quadratic -- starting a block at each of
+                // the L instructions in a basic block emits L blocks totalling
+                // L(L+1)/2 instructions. libc comes out at 297,215 blocks and
+                // a 217 MB compiled module, 128 times its own text, and ten
+                // seconds to map. Leaders give 62,085 blocks.
+                //
+                // What leaders cannot give is certainty. An indirect branch
+                // can go to an address no symbol names and no data holds, and
+                // in a stripped object built without branch protection --
+                // which bookworm's libc is -- nothing in the file says where.
+                // That residue is what the runtime translator is for.
+                // Which seeding depends on whether anything is behind this.
+                // With the runtime translator on, leaders are enough and far
+                // cheaper. With it off, the static pass is the only pass and
+                // has to be complete, whatever that costs.
+                let seeds = if JIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
+                    object_seeds(&mut caller, &m)
+                } else {
+                    Vec::new()
+                };
+                if let Err(e) = recompile_object(&mut caller, &m, &seeds) {
                     // Not fatal: the runtime translator is still behind this,
                     // and it will pick the object up a block at a time.
                     eprintln!("gex: could not recompile {}: {e:#}", m.path);
