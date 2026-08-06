@@ -19,6 +19,10 @@ pub mod oflags {
     /// An unnamed file created inside the named *directory*. The bit overlaps
     /// `O_DIRECTORY`, which is why it is always tested together with it.
     pub const O_TMPFILE: u64 = 0o20000000;
+    /// A handle to a name rather than to its contents. Legal on a dangling
+    /// symlink, and usable only for the `*at` calls and `fstat`.
+    pub const O_PATH: u64 = 0o10000000;
+    pub const O_NOFOLLOW: u64 = 0o400000;
     pub const ACCMODE: u64 = 0o3;
 }
 

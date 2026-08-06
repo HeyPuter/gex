@@ -163,6 +163,27 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// A descriptor that names a file without opening it: `O_PATH`.
+///
+/// It answers `fstat` and carries its path for the `*at` calls, and refuses
+/// everything else, which is what Linux does. The point of it is that it is
+/// legal on things an ordinary open is not -- a symlink, and in particular a
+/// symlink whose target does not exist.
+#[derive(Debug)]
+pub struct PathHandle(pub Metadata);
+
+impl FileHandle for PathHandle {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
+        Err(Errno::EBADF)
+    }
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> SysResult {
+        Err(Errno::EBADF)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(self.0.clone())
+    }
+}
+
 /// A mounted filesystem.
 pub trait FileSystem: Send + Sync {
     /// Open a path relative to this mount's root (no leading slash).

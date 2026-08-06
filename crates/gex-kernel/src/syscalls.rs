@@ -424,7 +424,9 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
         | nr::FCHMODAT
         | nr::STATX => a[1],
         nr::CHDIR | nr::STATFS | nr::MOUNT | nr::UMOUNT2 => a[0],
-        nr::RENAMEAT | nr::LINKAT | nr::SYMLINKAT => a[1],
+        nr::RENAMEAT | nr::LINKAT => a[1],
+        // `symlinkat` names the link it creates third, not second.
+        nr::SYMLINKAT => a[2],
         _ => return String::new(),
     };
     match m.read_cstr(at, 4096) {
@@ -1320,7 +1322,7 @@ impl Kernel {
             nr::UNLINKAT => self.sys_unlinkat(m, a[0] as i32, a[1], a[2]),
             nr::RENAMEAT => self.sys_renameat(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::LINKAT => self.sys_linkat(m, a),
-            nr::SYMLINKAT => self.sys_symlinkat(m, a[0], a[2]),
+            nr::SYMLINKAT => self.sys_symlinkat(m, a[0], a[1] as i32, a[2]),
             nr::PPOLL => self.sys_ppoll(m, a[0], a[1]),
             nr::PSELECT6 => self.sys_pselect(m, a),
             nr::STATFS | nr::FSTATFS => self.sys_statfs(m, a[1]),
@@ -1785,7 +1787,19 @@ impl Kernel {
         // can find it. A later `linkat` to give it a name would fail, and
         // that is honest -- the alternative is leaving litter in the guest's
         // filesystem under a name it never chose.
-        let handle = if flags & oflags::O_TMPFILE == oflags::O_TMPFILE {
+        // `O_PATH` opens the name, not the file. tar uses it to get a handle
+        // on a symlink it has just created so it can set the mode through
+        // it, and the symlink's target very often does not exist yet -- so
+        // opening it the ordinary way follows the link and answers `ENOENT`,
+        // which tar reports as a failure to unpack the archive.
+        let handle = if flags & oflags::O_PATH != 0 {
+            let md = if flags & oflags::O_NOFOLLOW != 0 {
+                self.vfs.metadata_nofollow(&p)?
+            } else {
+                self.vfs.metadata(&p)?
+            };
+            Arc::new(crate::vfs::PathHandle(md)) as Arc<dyn crate::vfs::FileHandle>
+        } else if flags & oflags::O_TMPFILE == oflags::O_TMPFILE {
             let n = self.next_tmpfile;
             self.next_tmpfile += 1;
             let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
@@ -2142,9 +2156,24 @@ impl Kernel {
         self.vfs.rename(&from, &to).map(|_| 0)
     }
 
-    fn sys_symlinkat(&mut self, m: &GuestMem<'_>, target: u64, path: u64) -> SysResult {
+    /// `symlinkat(target, newdirfd, linkpath)`.
+    ///
+    /// The directory descriptor is the third argument and it was being
+    /// ignored: every symlink resolved against the working directory
+    /// instead. A program that opens its destination and works relative to it
+    /// -- which is what tar does, and what anything careful about races does
+    /// -- got `ENOENT`, because the parent it had just created is not there
+    /// relative to the cwd. Unpacking any Debian package containing a symlink
+    /// failed on it.
+    fn sys_symlinkat(
+        &mut self,
+        m: &GuestMem<'_>,
+        target: u64,
+        newdirfd: i32,
+        path: u64,
+    ) -> SysResult {
         let t = String::from_utf8(m.read_cstr(target, 4096)?).map_err(|_| Errno::EINVAL)?;
-        let p = self.at_path(m, AT_FDCWD, path)?;
+        let p = self.at_path(m, newdirfd, path)?;
         self.vfs.symlink(&t, &p).map(|_| 0)
     }
 
@@ -2249,11 +2278,32 @@ impl Kernel {
     /// `fchmod` and `fchmodat`. The first names an open file, whose path the
     /// descriptor kept; the second names a path directly.
     fn sys_chmod(&mut self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
-        let (path, mode) = if n == nr::FCHMOD {
-            (self.fds.get(a[0] as i32)?.path.clone(), a[1] as u32)
+        let (path, mode, flags) = if n == nr::FCHMOD {
+            (self.fds.get(a[0] as i32)?.path.clone(), a[1] as u32, 0)
         } else {
-            (self.at_path(m, a[0] as i32, a[1])?, a[2] as u32)
+            (self.at_path(m, a[0] as i32, a[1])?, a[2] as u32, a[3])
         };
+        // `AT_SYMLINK_NOFOLLOW` on a symlink is not something Linux supports:
+        // a symlink has no mode of its own, and the call reports
+        // `EOPNOTSUPP`. Following the link instead is both wrong and
+        // dangerous -- it changes a different file -- and here it produced a
+        // stranger failure, because a symlink is very often created before
+        // its target exists.
+        //
+        // GNU tar unpacking a package does exactly that, and `chmod`
+        // following the link answered `ENOENT`. tar reports that as a real
+        // error, dpkg-deb reports tar's failure, and a Debian package with a
+        // dangling symlink in it -- which `libpython3.11-minimal` has, the
+        // last entry in the archive -- fails to install after unpacking
+        // perfectly.
+        if self
+            .vfs
+            .metadata_nofollow(&path)
+            .is_ok_and(|m| m.file_type == FileType::Symlink)
+            && (flags & AT_SYMLINK_NOFOLLOW != 0 || n == nr::FCHMOD)
+        {
+            return Err(Errno::EOPNOTSUPP);
+        }
         self.vfs.chmod(&path, mode).map(|_| 0)
     }
 
