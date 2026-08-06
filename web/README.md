@@ -8,7 +8,8 @@ A Vite app that runs AArch64 Linux programs in the browser. Three demos:
    translator produce the whole program on demand.
 2. **A BusyBox userspace.** A root filesystem and a shell on top of it, with
    real `fork`, `exec` and pipes.
-3. **Debian, with `apt`.** Networking over Wisp, because a page cannot open a
+3. **Debian, with `apt`.** `apt-get update` fetches and parses the real
+   bookworm index. Networking goes over Wisp, because a page cannot open a
    TCP socket.
 
 ## Running it

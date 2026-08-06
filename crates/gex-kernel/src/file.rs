@@ -65,6 +65,13 @@ impl OpenFile {
     ///
     /// A descriptor opened `O_NONBLOCK` never waits -- it is asking for the
     /// `EAGAIN` -- so it answers no however empty the stream is.
+    /// Whether a `write` on this descriptor would have to wait.
+    pub fn write_would_block(&self) -> bool {
+        self.writable
+            && self.flags.load(Ordering::Relaxed) & crate::fs::oflags::O_NONBLOCK == 0
+            && !self.handle.poll_writable()
+    }
+
     pub fn would_block(&self) -> bool {
         self.readable
             && self.flags.load(Ordering::Relaxed) & crate::fs::oflags::O_NONBLOCK == 0
@@ -319,6 +326,10 @@ impl FileHandle for PipeEnd {
 
     fn available(&self) -> Option<u64> {
         Some(if self.write { 0 } else { self.pipe.buffered() as u64 })
+    }
+
+    fn poll_writable(&self) -> bool {
+        !self.write || self.pipe.writable()
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {

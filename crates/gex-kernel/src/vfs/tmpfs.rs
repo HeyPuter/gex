@@ -367,6 +367,28 @@ impl FileSystem for TmpFs {
         Ok(())
     }
 
+    /// A second name for the same node. The node is behind an `Arc`, so both
+    /// names see one file and a write through either is a write to both --
+    /// which is what a hard link is.
+    fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        // Only a regular file can gain a second name; a directory cannot,
+        // which is what Linux says too.
+        let node = match inner.nodes.get(from) {
+            Some(Node::File(f)) => Node::File(Arc::clone(f)),
+            Some(Node::Symlink(t)) => Node::Symlink(t.clone()),
+            Some(Node::Dir) => return Err(Errno::EPERM),
+            None => return Err(Errno::ENOENT),
+        };
+        if inner.nodes.contains_key(to) {
+            return Err(Errno::EEXIST);
+        }
+        let ino = inner.inos.get(from).copied().unwrap_or(1);
+        inner.nodes.insert(to.to_string(), node);
+        inner.inos.insert(to.to_string(), ino);
+        Ok(())
+    }
+
     fn symlink(&self, target: &str, path: &str) -> Result<(), Errno> {
         let mut inner = self.inner.lock().unwrap();
         if inner.nodes.contains_key(path) {

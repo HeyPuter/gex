@@ -383,6 +383,8 @@ enum Waiting {
     /// Waiting on a stream with nothing in it: a terminal nobody has typed at
     /// yet. Ready as soon as the handle says a read would return.
     Read(Arc<dyn gex_kernel::vfs::FileHandle>),
+    /// Waiting for room in a stream: a pipe nobody has drained yet.
+    Write(Arc<dyn gex_kernel::vfs::FileHandle>),
     /// Waiting on the network -- a connection coming up, or a `poll` with
     /// nothing ready. Whether it is ready is a question for the operation
     /// itself, which the scheduler holds in `blocked_on`, so this only
@@ -1134,6 +1136,9 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                     gex_kernel::BlockOp::ReadStream { handle, .. } => {
                         Waiting::Read(Arc::clone(handle))
                     }
+                    gex_kernel::BlockOp::WriteStream { handle, .. } => {
+                        Waiting::Write(Arc::clone(handle))
+                    }
                     // Both of these wait on something outside the guest, so
                     // both give the stack back and are re-checked by the
                     // scheduler on its way round.
@@ -1454,6 +1459,7 @@ fn schedule() -> i32 {
                     }
                     Waiting::Sleep(d) => now >= *d,
                     Waiting::Read(handle) => handle.poll_readable(),
+                    Waiting::Write(handle) => handle.poll_writable(),
                     Waiting::Net(deadline) => {
                         deadline.is_some_and(|d| now >= d)
                             || match &h.threads[i].blocked_on {
@@ -1503,6 +1509,7 @@ fn schedule() -> i32 {
                 for t in &h.threads {
                     match &t.waiting {
                         Waiting::Net(_) => return 2,
+                        Waiting::Write(_) => return 1,
                         Waiting::Read(handle) => {
                             let is_socket = handle
                                 .metadata()
@@ -1598,6 +1605,10 @@ fn finish_parked(
             let n = handle.read_at(0, &mut tmp)?;
             gm.write(*buf, &tmp[..n as usize])?;
             Ok(n)
+        }
+        gex_kernel::BlockOp::WriteStream { handle, buf, len } => {
+            let data = gm.read(*buf, *len)?.to_vec();
+            handle.write_at(0, &data)
         }
         gex_kernel::BlockOp::Connect { socket } => match socket.status() {
             gex_kernel::net::Status::Open => Ok(0),
@@ -1778,6 +1789,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                     }
                     Waiting::Sleep(d) => now >= *d,
                     Waiting::Read(handle) => handle.poll_readable(),
+                    Waiting::Write(handle) => handle.poll_writable(),
                     // Only the scheduler proper re-checks these; a safepoint
                     // switch does not need to.
                     Waiting::Net(deadline) => deadline.is_some_and(|d| now >= d),

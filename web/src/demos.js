@@ -181,9 +181,9 @@ const debian = {
     ctx.term.writeln('A Debian bookworm arm64 rootfs, built by web/build-debian.sh.');
     ctx.term.writeln('');
     ctx.term.writeln(ctx.ansi.dim('glibc is a harder target than musl -- a real dynamic loader and'));
-    ctx.term.writeln(ctx.ansi.dim('far more syscalls. `bash`, `ls`, `dpkg` and `apt-get` all run.'));
-    ctx.term.writeln(ctx.ansi.dim('`apt-get update` gets as far as starting its download helper and'));
-    ctx.term.writeln(ctx.ansi.dim('stops there; that is the next thing to fix, not a claim it works.'));
+    ctx.term.writeln(ctx.ansi.dim('far more syscalls. `apt-get update` fetches and parses the real'));
+    ctx.term.writeln(ctx.ansi.dim('bookworm index; `bash`, `ls` and `dpkg` all run. Installing a'));
+    ctx.term.writeln(ctx.ansi.dim('package is the next step and is not finished.'));
     ctx.term.writeln('');
     ctx.term.writeln(ctx.ansi.dim('A page cannot open a TCP socket, so network syscalls are carried'));
     ctx.term.writeln(ctx.ansi.dim('over Wisp to a proxy. Set one to give the guest a network.'));

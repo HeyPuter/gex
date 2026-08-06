@@ -247,6 +247,14 @@ impl FileSystem for HostFs {
         std::fs::rename(self.host_path(from)?, self.host_path(to)?).map_err(|e| Errno::from_io(&e))
     }
 
+    fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        std::fs::hard_link(self.host_path(from)?, self.host_path(to)?)
+            .map_err(|e| Errno::from_io(&e))
+    }
+
     fn symlink(&self, target: &str, path: &str) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);

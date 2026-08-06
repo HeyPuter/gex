@@ -75,6 +75,12 @@ pub struct RunOptions {
     /// Host directory presented as the guest's root. Without one the guest
     /// sees the host filesystem directly.
     pub sysroot: Option<std::path::PathBuf>,
+    /// Who the guest thinks it is. `None` reports the host's own ids, which
+    /// is what a passthrough filesystem needs to stay consistent -- a guest
+    /// that stats a file it owns and then calls `getuid` must get the same
+    /// answer. A sysroot is a different situation: it is the guest's whole
+    /// world, and a package manager in it expects to be root.
+    pub identity: Option<(u32, u32)>,
     /// Translate code on demand when a branch reaches an address with no
     /// translation.
     pub jit: bool,
@@ -93,6 +99,7 @@ impl Default for RunOptions {
             trace: false,
             verbose: false,
             sysroot: None,
+            identity: None,
             jit: false,
             cwd: None,
             // On by default: it is the difference between half a minute and
@@ -467,7 +474,7 @@ fn run_program_with(
     };
     // Report the host's identity: with hostfs passthrough, a guest that
     // stats a file and then calls getuid must see a consistent answer.
-    let (uid, gid) = host_identity();
+    let (uid, gid) = opts.identity.unwrap_or_else(host_identity);
     let mut kernel = Kernel {
         trace: opts.trace,
         uid,
@@ -724,6 +731,15 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
                 if deadline.is_some_and(|d| start.elapsed() >= d) {
                     let mut mem = GuestMem::new(data);
                     return gex_kernel::syscalls::poll_finish(&fds, &report, &mut mem);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        BlockOp::WriteStream { handle, buf, len } => {
+            let data = GuestMem::new(data).read(buf, len)?.to_vec();
+            loop {
+                if handle.poll_writable() {
+                    return handle.write_at(0, &data);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }

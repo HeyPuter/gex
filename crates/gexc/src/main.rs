@@ -71,6 +71,8 @@ run options:
   --verbose       report translation statistics
   --env K=V       add an environment variable (repeatable)
   --sysroot DIR   present DIR as the guest's root filesystem
+  --uid N[:M]     the uid (and gid) the guest sees; `--uid 0` is root, which
+                  is what a package manager inside a sysroot expects
   --exhaustive    translate every decodable text address ahead of time
   --no-jit        no runtime translation; implies --exhaustive
   --lazy          discover only from the entry point, leaving the rest to
@@ -118,6 +120,15 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--strace" => opts.trace = true,
             "--verbose" | "-v" => opts.verbose = true,
             "--exhaustive" => exhaustive = true,
+            "--uid" => {
+                i += 1;
+                let v = args.get(i).context("--uid needs a number")?;
+                let (u, g) = match v.split_once(':') {
+                    Some((u, g)) => (u, g),
+                    None => (v.as_str(), v.as_str()),
+                };
+                opts.identity = Some((u.parse().context("--uid")?, g.parse().context("--uid")?));
+            }
             "--sysroot" => {
                 i += 1;
                 let v = args.get(i).context("--sysroot needs a directory")?;

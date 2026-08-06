@@ -138,6 +138,7 @@ pub mod nr {
     pub const MREMAP: u64 = 216;
     pub const MPROTECT: u64 = 226;
     pub const MADVISE: u64 = 233;
+    pub const MSYNC: u64 = 227;
     pub const WAIT4: u64 = 260;
     pub const PRLIMIT64: u64 = 261;
     pub const GETRANDOM: u64 = 278;
@@ -253,6 +254,12 @@ pub enum BlockOp {
         /// between `poll` and `select`.
         report: PollReport,
     },
+    /// A `write` to a stream with no room: a pipe nobody is draining.
+    WriteStream {
+        handle: Arc<dyn crate::vfs::FileHandle>,
+        buf: u64,
+        len: usize,
+    },
     /// `wait4`. Blocks until one of `children` has a status to collect.
     WaitChild {
         children: Vec<ChildHandle>,
@@ -333,6 +340,8 @@ pub struct Kernel {
     /// Sockets by handle address, so a descriptor can be got back to the
     /// concrete socket the network syscalls need.
     pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
+    /// File mappings whose writes are meant to reach the file.
+    pub shared_maps: Vec<SharedMap>,
     /// Serial for the unnamed files `O_TMPFILE` asks for.
     pub next_tmpfile: u64,
     /// The file-creation mask. Recorded rather than applied: nothing here
@@ -532,6 +541,19 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
     }
 }
 
+/// A `MAP_SHARED` file mapping, and where its bytes belong.
+///
+/// A file mapping here is an eager copy rather than a page table pointed at
+/// the file, so the two are only the same thing until somebody writes. This
+/// is what makes them the same thing again.
+#[derive(Debug)]
+pub struct SharedMap {
+    pub start: u64,
+    pub len: u64,
+    pub file: Arc<OpenFile>,
+    pub offset: u64,
+}
+
 /// A child process the kernel is tracking.
 #[derive(Debug)]
 pub struct Child {
@@ -663,6 +685,7 @@ impl Kernel {
             procs: Arc::new(ProcTable::new()),
             ppid: 0,
             clock: system_clock,
+            shared_maps: Vec::new(),
             next_tmpfile: 0,
             umask: 0o022,
             net: None,
@@ -785,6 +808,7 @@ impl Kernel {
             procs: Arc::clone(&self.procs),
             ppid: self.pid,
             clock: self.clock,
+            shared_maps: Vec::new(),
             next_tmpfile: self.next_tmpfile,
             umask: self.umask,
             net: self.net.clone(),
@@ -1114,6 +1138,17 @@ impl Kernel {
                     report,
                 })
             }
+            nr::WRITE => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if !file.write_would_block() {
+                    return None;
+                }
+                Some(BlockOp::WriteStream {
+                    handle: Arc::clone(&file.handle),
+                    buf: a[1],
+                    len: a[2].min(1 << 24) as usize,
+                })
+            }
             nr::READ => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 if !file.would_block() {
@@ -1229,6 +1264,7 @@ impl Kernel {
             nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
             nr::UNLINKAT => self.sys_unlinkat(m, a[0] as i32, a[1], a[2]),
             nr::RENAMEAT => self.sys_renameat(m, a[0] as i32, a[1], a[2] as i32, a[3]),
+            nr::LINKAT => self.sys_linkat(m, a),
             nr::SYMLINKAT => self.sys_symlinkat(m, a[0], a[2]),
             nr::PPOLL => self.sys_ppoll(m, a[0], a[1]),
             nr::PSELECT6 => self.sys_pselect(m, a),
@@ -1247,7 +1283,13 @@ impl Kernel {
             // -- memory ------------------------------------------------------
             nr::BRK => Ok(self.mem.brk(a[0])),
             nr::MMAP => self.sys_mmap(m, a),
-            nr::MUNMAP => self.mem.unmap(a[0], a[1]).map(|_| 0),
+            nr::MUNMAP => {
+                let flushed = self.flush_shared(m, a[0], a[1]);
+                self.shared_maps
+                    .retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
+                flushed.and_then(|_| self.mem.unmap(a[0], a[1])).map(|_| 0)
+            }
+            nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
             nr::MREMAP => self.sys_mremap(m, a),
             nr::MPROTECT => self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0),
             nr::MADVISE => Ok(0),
@@ -1704,9 +1746,15 @@ impl Kernel {
         self.fds.install(new, file, flags & oflags::O_CLOEXEC != 0)
     }
 
+    /// `linkat`: a second name for a file that already exists.
+    fn sys_linkat(&mut self, m: &GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let from = self.at_path(m, a[0] as i32, a[1])?;
+        let to = self.at_path(m, a[2] as i32, a[3])?;
+        self.vfs.link(&from, &to).map(|_| 0)
+    }
+
     fn sys_pipe2(&mut self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
         let pipe = Arc::new(Pipe::new());
-        pipe.set_nonblocking(flags);
         let cloexec = flags & oflags::O_CLOEXEC != 0;
         let read_end = OpenFile::new(
             Arc::new(PipeEnd {
@@ -1714,7 +1762,12 @@ impl Kernel {
                 write: false,
             }),
             "pipe:[0]".to_string(),
-            flags,
+            // The access mode belongs in the flags, not only in the two
+            // booleans: `fcntl(F_GETFL)` reports it, and glibc's `fdopen`
+            // refuses a descriptor whose mode does not match the one asked
+            // for. A write end reporting `O_RDONLY` is why apt could not
+            // open its dpkg pipe.
+            flags | oflags::O_RDONLY,
             true,
             false,
         );
@@ -1724,7 +1777,7 @@ impl Kernel {
                 write: true,
             }),
             "pipe:[0]".to_string(),
-            flags,
+            flags | oflags::O_WRONLY,
             false,
             true,
         );
@@ -1870,7 +1923,18 @@ impl Kernel {
                 self.fds.set_cloexec(fd, arg & 1 != 0)?;
                 Ok(0)
             }
-            F_GETFL => Ok(self.fds.get(fd)?.flags()),
+            // Only the access mode and the status flags. Linux does not
+            // keep `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_TMPFILE` or
+            // `O_CLOEXEC` on the open file description, and reporting them
+            // is how `fdopen` decided the descriptor was invalid.
+            F_GETFL => {
+                const STATUS: u64 = oflags::ACCMODE
+                    | oflags::O_APPEND
+                    | oflags::O_NONBLOCK
+                    | 0o40000 // O_DIRECT
+                    | 0o4010000; // O_SYNC | O_NOATIME
+                Ok(self.fds.get(fd)?.flags() & STATUS)
+            }
             F_SETFL => {
                 self.fds.get(fd)?.set_flags(arg);
                 Ok(0)
@@ -2091,6 +2155,24 @@ impl Kernel {
         )
     }
 
+    /// Write a shared mapping's bytes back to the file behind it.
+    fn flush_shared(&mut self, m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
+        if self.shared_maps.is_empty() {
+            return Ok(());
+        }
+        let (lo, hi) = (addr, addr.saturating_add(len));
+        for map in &self.shared_maps {
+            let from = map.start.max(lo);
+            let to = (map.start + map.len).min(hi);
+            if from >= to {
+                continue;
+            }
+            let bytes = m.read(from, (to - from) as usize)?;
+            map.file.pwrite(map.offset + (from - map.start), bytes)?;
+        }
+        Ok(())
+    }
+
     /// `statfs`. One filesystem, large and mostly empty, which is what a
     /// program checking for room before it writes wants to hear.
     fn sys_statfs(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
@@ -2179,6 +2261,18 @@ impl Kernel {
             let n = file.pread(offset, &mut tmp)? as usize;
             m.zero(start, len_aligned as usize)?;
             m.write(start, &tmp[..n])?;
+            // A shared mapping is expected to reach the file. The copy above
+            // is the whole of the mapping, so nothing does until it is
+            // written back -- at `msync`, and at `munmap`, which is where a
+            // program that never calls `msync` expects its changes to land.
+            if flags & crate::mem::flags::SHARED != 0 {
+                self.shared_maps.push(SharedMap {
+                    start,
+                    len: len_aligned,
+                    file,
+                    offset,
+                });
+            }
             return Ok(start);
         }
         let start = self.mem.mmap(addr, len, prot_bits, flags, "")?;
@@ -2823,6 +2917,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::IOCTL => "ioctl",
         nr::MKDIRAT => "mkdirat",
         nr::UNLINKAT => "unlinkat",
+        nr::LINKAT => "linkat",
         nr::SYMLINKAT => "symlinkat",
         nr::RENAMEAT => "renameat",
         nr::FTRUNCATE => "ftruncate",
@@ -2925,6 +3020,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::MMAP => "mmap",
         nr::MPROTECT => "mprotect",
         nr::MADVISE => "madvise",
+        nr::MSYNC => "msync",
         nr::WAIT4 => "wait4",
         nr::PRLIMIT64 => "prlimit64",
         nr::GETRANDOM => "getrandom",

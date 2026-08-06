@@ -155,6 +155,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn available(&self) -> Option<u64> {
         None
     }
+
+    /// Whether a write would make progress without waiting. Only a stream
+    /// that can fill up answers no.
+    fn poll_writable(&self) -> bool {
+        true
+    }
 }
 
 /// A mounted filesystem.
@@ -182,6 +188,13 @@ pub trait FileSystem: Send + Sync {
         let _ = (from, to);
         Err(Errno::EROFS)
     }
+    /// A second name for the same file. `EPERM` is what Linux says for a
+    /// filesystem that has no hard links, which is the honest default.
+    fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
+        let _ = (from, to);
+        Err(Errno::EPERM)
+    }
+
     fn symlink(&self, target: &str, path: &str) -> Result<(), Errno> {
         let _ = (target, path);
         Err(Errno::EROFS)
@@ -331,6 +344,18 @@ impl Vfs {
             return Err(Errno::EXDEV);
         }
         fs.rename(&rel_from, &rel_to)
+    }
+
+    /// `link`. Both names must be on one filesystem, as they must on Linux:
+    /// a hard link is a second directory entry for the same inode, and an
+    /// inode does not span mounts.
+    pub fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
+        let (fs, rel_from) = self.resolve(from)?;
+        let (fs_to, rel_to) = self.resolve(to)?;
+        if !Arc::ptr_eq(fs, fs_to) {
+            return Err(Errno::EXDEV);
+        }
+        fs.link(&rel_from, &rel_to)
     }
 
     pub fn symlink(&self, target: &str, path: &str) -> Result<(), Errno> {

@@ -30,8 +30,7 @@ struct State {
 pub struct Pipe {
     state: Mutex<State>,
     ready: Condvar,
-    /// Set from the descriptor's `O_NONBLOCK`.
-    nonblocking: std::sync::atomic::AtomicBool,
+
 }
 
 impl Default for Pipe {
@@ -49,20 +48,10 @@ impl Pipe {
                 writers: 1,
             }),
             ready: Condvar::new(),
-            nonblocking: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    pub fn set_nonblocking(&self, flags: u64) {
-        self.nonblocking.store(
-            flags & oflags::O_NONBLOCK != 0,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
 
-    fn is_nonblocking(&self) -> bool {
-        self.nonblocking.load(std::sync::atomic::Ordering::Relaxed)
-    }
 
     /// Note that another descriptor now refers to one end.
     pub fn open_end(&self, write: bool) {
@@ -143,14 +132,16 @@ impl Pipe {
                     return Ok(written as u64);
                 }
             }
-            if self.is_nonblocking() {
-                return if written > 0 {
-                    Ok(written as u64)
-                } else {
-                    Err(Errno::EAGAIN)
-                };
-            }
-            s = self.ready.wait(s).unwrap();
+            // Never wait here, for the same reason a read does not: this
+            // runs with the kernel locked and the reader that would drain
+            // the pipe needs that lock. A partial write is what the caller
+            // gets, or `EAGAIN` if nothing fitted, and the syscall layer
+            // parks a descriptor that should block.
+            return if written > 0 {
+                Ok(written as u64)
+            } else {
+                Err(Errno::EAGAIN)
+            };
         }
     }
 
@@ -210,9 +201,8 @@ mod tests {
     }
 
     #[test]
-    fn nonblocking_reads_report_eagain() {
+    fn reads_report_eagain_rather_than_waiting() {
         let p = Pipe::new();
-        p.set_nonblocking(oflags::O_NONBLOCK);
         let mut buf = [0u8; 4];
         assert_eq!(p.read(&mut buf).err(), Some(Errno::EAGAIN));
     }
@@ -233,17 +223,17 @@ mod tests {
     }
 
     #[test]
-    fn a_full_pipe_blocks_until_drained() {
-        let p = Arc::new(Pipe::new());
-        let reader = Arc::clone(&p);
-        let t = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            let mut buf = vec![0u8; PIPE_BUF];
-            reader.read(&mut buf).unwrap()
-        });
-        // One byte more than the capacity cannot complete until the reader runs.
+    fn a_full_pipe_takes_what_fits_and_says_so() {
+        // As with a read, waiting here would be a deadlock: the reader that
+        // would drain this needs the kernel lock the writer is holding. A
+        // short write is what the caller gets, and the syscall layer parks a
+        // descriptor that is supposed to block.
+        let p = Pipe::new();
         let data = vec![7u8; PIPE_BUF + 1];
-        assert_eq!(p.write(&data).unwrap(), (PIPE_BUF + 1) as u64);
-        assert!(t.join().unwrap() > 0);
+        assert_eq!(p.write(&data).unwrap(), PIPE_BUF as u64);
+        assert_eq!(p.write(b"x").err(), Some(Errno::EAGAIN));
+        let mut buf = vec![0u8; PIPE_BUF];
+        assert_eq!(p.read(&mut buf).unwrap(), PIPE_BUF as u64);
+        assert_eq!(p.write(b"x").unwrap(), 1);
     }
 }

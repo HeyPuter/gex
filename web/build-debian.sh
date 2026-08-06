@@ -24,8 +24,11 @@ ARCH=arm64
 
 # The roots of the closure. `apt` is the point of the exercise; the rest is
 # what a shell prompt needs to be worth having.
+# libc-bin is not a dependency of libc6 but dpkg refuses to run without the
+# ldconfig in it; perl-base is what maintainer scripts are written in.
 ROOTS="apt dash bash coreutils dpkg findutils grep sed tar gzip diffutils \
-       debianutils base-files base-passwd hostname ca-certificates"
+       debianutils base-files base-passwd hostname ca-certificates \
+       libc-bin perl-base"
 
 mkdir -p "$WORK/debs" "$WORK/root"
 R="$WORK/root"
@@ -135,6 +138,9 @@ for p in json.load(open(f'{work}/closure.json')):
     out.append(
         f"Package: {p['Package']}\n"
         f"Status: install ok installed\n"
+        # dpkg warns on every package without one, which is a hundred lines
+        # of noise before anything useful happens.
+        f"Maintainer: gex <root@localhost>\n"
         f"Architecture: {p['Architecture']}\n"
         f"Version: {p['Version']}\n"
         + (f"Depends: {p['Depends']}\n" if p['Depends'] else '')
