@@ -73,6 +73,9 @@ run options:
   --sysroot DIR   present DIR as the guest's root filesystem
   --uid N[:M]     the uid (and gid) the guest sees; `--uid 0` is root, which
                   is what a package manager inside a sysroot expects
+  --sample        report the guest's hottest back-edges when it exits. Biased
+                  towards loops, which is the bias you want when the question
+                  is where the time went
   --exhaustive    translate every decodable text address ahead of time
   --no-jit        no runtime translation; implies --exhaustive
   --lazy          discover only from the entry point, leaving the rest to
@@ -120,6 +123,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--strace" => opts.trace = true,
             "--verbose" | "-v" => opts.verbose = true,
             "--exhaustive" => exhaustive = true,
+            "--sample" => opts.sample = true,
             "--uid" => {
                 i += 1;
                 let v = args.get(i).context("--uid needs a number")?;

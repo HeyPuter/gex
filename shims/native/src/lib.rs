@@ -81,6 +81,8 @@ pub struct RunOptions {
     /// answer. A sysroot is a different situation: it is the guest's whole
     /// world, and a package manager in it expects to be root.
     pub identity: Option<(u32, u32)>,
+    /// Sample the guest's back-edges and report the hottest at exit.
+    pub sample: bool,
     /// Translate code on demand when a branch reaches an address with no
     /// translation.
     pub jit: bool,
@@ -100,6 +102,7 @@ impl Default for RunOptions {
             verbose: false,
             sysroot: None,
             identity: None,
+            sample: false,
             jit: false,
             cwd: None,
             // On by default: it is the difference between half a minute and
@@ -126,6 +129,8 @@ struct HostState {
     exit: Option<Exit>,
     /// Set when a host function wants execution to continue elsewhere.
     resume_at: Option<u64>,
+    /// Where the guest is spending its time, when anyone asked.
+    sampler: Option<Arc<Sampler>>,
     /// Everything needed to translate and install code at run time.
     jit: Option<Jit>,
     /// Everything a new guest thread needs to build a store of its own.
@@ -178,6 +183,9 @@ struct SpawnContext {
     xlate: Options,
     kernel: Arc<Mutex<Kernel>>,
     proc_state: Arc<Mutex<ProcState>>,
+    /// Shared across threads and inherited by children, so a profile of a
+    /// process tree is one profile.
+    sampler: Option<Arc<Sampler>>,
     jit_shared: Option<Arc<Mutex<JitShared>>>,
     limits: gex_lift::BlockLimits,
 }
@@ -434,6 +442,7 @@ fn run_program_with(
     let phase = std::time::Instant::now();
 
     let ctx_addr = gex_abi::ctx_addr(0);
+    let sampler = sampler_for(opts);
     // `/proc/self/exe` is the resolved program, not argv[0]: a shell that
     // re-executes itself relies on the difference.
     let exe_path = opts
@@ -498,6 +507,7 @@ fn run_program_with(
             proc_state,
             exit: None,
             resume_at: None,
+            sampler: sampler.clone(),
             jit: None,
             spawn: None,
             pending_spawn: None,
@@ -595,6 +605,7 @@ fn run_program_with(
     // one -- only the `gex.*` imports -- because a linker carrying store-bound
     // definitions could not be cloned into another thread.
     let spawn = Arc::new(SpawnContext {
+        sampler: sampler.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         engine: engine.clone(),
@@ -627,6 +638,10 @@ fn run_program_with(
     // long enough for a thread between safepoints, short enough that a thread
     // wedged in a host call cannot hold up the exit.
     stop_other_threads(&spawn, opts.verbose);
+
+    if let Some(s) = &sampler {
+        s.report(&image.symbols, 20);
+    }
 
     if let Some(jit) = store.data().jit.as_ref() {
         let (blocks, calls, translated) = {
@@ -1008,6 +1023,9 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         Arc::new(ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&child_proc))))),
     );
     let child_cx = Arc::new(SpawnContext {
+        // One profile for the whole process tree: a package manager spends
+        // most of its time in programs it started.
+        sampler: cx.sampler.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         engine: cx.engine.clone(),
@@ -1084,6 +1102,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
             resume_at: None,
+            sampler: cx.sampler.clone(),
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
@@ -1188,6 +1207,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
             resume_at: None,
+            sampler: cx.sampler.clone(),
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
@@ -1300,6 +1320,77 @@ fn mount_filesystems(
 }
 
 /// A `/proc` source over the snapshot the host refreshes.
+/// Where the guest spends its time, sampled at back-edge safepoints.
+///
+/// A safepoint fires every thousand-odd back-edges, so the sample is biased
+/// towards loops -- which is exactly the bias wanted. A program that is
+/// spinning is a program taking back-edges, and this says which ones.
+///
+/// It is not a general profiler: straight-line code between loops is
+/// invisible to it, and so is anything the guest does without looping. What
+/// it is good at is answering "what is it doing" when the answer is "going
+/// round and round somewhere".
+#[derive(Debug, Default)]
+pub struct Sampler {
+    counts: Mutex<std::collections::HashMap<u64, u64>>,
+}
+
+impl Sampler {
+    fn sample(&self, pc: u64) {
+        *self
+            .counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(pc)
+            .or_insert(0) += 1;
+    }
+
+    /// Print the hottest addresses, naming them where the image can.
+    pub fn report(&self, symbols: &[gex_ld::elf::Symbol], top: usize) {
+        let counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let total: u64 = counts.values().sum();
+        if total == 0 {
+            return;
+        }
+        let mut rows: Vec<(u64, u64)> = counts.iter().map(|(a, n)| (*a, *n)).collect();
+        rows.sort_by_key(|(a, n)| (std::cmp::Reverse(*n), *a));
+        eprintln!("[gex] {total} safepoint samples, hottest back-edges:");
+        // Sorted once so each address is a binary search rather than a scan.
+        let mut syms: Vec<&gex_ld::elf::Symbol> =
+            symbols.iter().filter(|s| s.size > 0).collect();
+        syms.sort_by_key(|s| s.value);
+        for (addr, n) in rows.into_iter().take(top) {
+            let name = match syms.binary_search_by(|s| s.value.cmp(&addr)) {
+                Ok(i) => Some(syms[i]),
+                Err(0) => None,
+                Err(i) => Some(syms[i - 1]),
+            }
+            .filter(|s| addr < s.value + s.size)
+            .map(|s| format!("{}+{:#x}", s.name, addr - s.value))
+            .unwrap_or_else(|| "?".to_string());
+            eprintln!(
+                "[gex]   {:5.1}%  {addr:#012x}  {name}",
+                100.0 * n as f64 / total as f64
+            );
+        }
+    }
+}
+
+/// The one sampler for this run.
+///
+/// Process-wide rather than passed down, because `exec` replaces everything
+/// else and a profile that stopped at the first `exec` would miss the part
+/// of a package manager's work that matters.
+static SAMPLER: std::sync::OnceLock<Option<Arc<Sampler>>> = std::sync::OnceLock::new();
+
+fn sampler_for(opts: &RunOptions) -> Option<Arc<Sampler>> {
+    // Off unless asked for: it is a lock and a hash insert on every back-edge
+    // safepoint, which is not free.
+    SAMPLER
+        .get_or_init(|| opts.sample.then(|| Arc::new(Sampler::default())))
+        .clone()
+}
+
 /// The guest's network, as the host's real sockets.
 ///
 /// The kernel wants a transport that never blocks -- it does the waiting
@@ -1874,6 +1965,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::SAFEPOINT,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
+            if let Some(s) = caller.data().sampler.clone() {
+                s.sample(pc as u64);
+            }
             // Same reason as the syscall hook: a loop that never calls the
             // kernel still reaches a back-edge, and this is where it does.
             catch_up_in_caller(&mut caller)?;
