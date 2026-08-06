@@ -2080,12 +2080,16 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         (0b10100, 0) => VShiftImmOp::SShll,
         (0b10100, _) => VShiftImmOp::UShll,
         (0b10000, 0) => VShiftImmOp::Shrn,
+        (0b00010, 0) => VShiftImmOp::SSra,
+        (0b00010, _) => VShiftImmOp::USra,
+        (0b01000, 1) => VShiftImmOp::Sri,
+        (0b01010, 1) => VShiftImmOp::Sli,
         _ => return Inst::Unknown { raw },
     };
     // Left shifts count up from the element size; right shifts count down.
     let left = matches!(
         op,
-        VShiftImmOp::Shl | VShiftImmOp::SShll | VShiftImmOp::UShll
+        VShiftImmOp::Shl | VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Sli
     );
     let shift = if left {
         imm.wrapping_sub(esize)

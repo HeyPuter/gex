@@ -40,7 +40,7 @@ pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockL
         };
         let inst = decode(raw, pc);
         let mark = builder.mark();
-        let mut lifter = Lifter::new(&mut builder);
+        let mut lifter = Lifter::new(&mut builder).with_raw(raw);
         let flow = lifter.lift(&inst, pc);
         // An instruction the backend has no wasm form for is undone and
         // becomes a SIGILL here, where the preceding instructions have

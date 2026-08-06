@@ -33,6 +33,14 @@ pub const INST_BYTES: u64 = 4;
 /// Lifting state for one basic block.
 pub struct Lifter<'a> {
     b: &'a mut Builder,
+    /// The instruction word being lifted.
+    ///
+    /// Only the decoder needs this normally, but an instruction the lifter has
+    /// no wasm form for becomes a SIGILL naming the word, and a SIGILL that
+    /// names `0x00000000` sends the reader looking for memory corruption
+    /// instead of a missing instruction. That happened: `ushl` reported itself
+    /// as a zero word in the middle of libpython.
+    raw: u32,
 }
 
 /// What the lifter decided about control flow after one instruction.
@@ -96,7 +104,13 @@ struct Address {
 
 impl<'a> Lifter<'a> {
     pub fn new(b: &'a mut Builder) -> Lifter<'a> {
-        Lifter { b }
+        Lifter { b, raw: 0 }
+    }
+
+    /// The word `lift` is about to be given, so a SIGILL can name it.
+    pub fn with_raw(mut self, raw: u32) -> Lifter<'a> {
+        self.raw = raw;
+        self
     }
 
     // -- register access ---------------------------------------------------
@@ -1567,7 +1581,7 @@ impl<'a> Lifter<'a> {
                 // Only single <-> double is reachable; half precision has no
                 // wasm lane type and stays undecoded.
                 if narrow_bytes != 4 {
-                    return Flow::End(Term::Illegal { raw: 0, pc });
+                    return Flow::End(Term::Illegal { raw: self.raw, pc });
                 }
                 let src = self.b.read(GuestReg::V128(vn.0));
                 if widen {
@@ -2573,7 +2587,105 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
-            _ => Flow::End(Term::Illegal { raw: 0, pc }),
+            // The register-variable shifts. wasm has no per-lane shift count
+            // -- `i64x2.shl` takes one scalar for the whole vector -- so each
+            // lane is done on its own, which is two extracts, a handful of
+            // scalar operations and a replace.
+            //
+            // AArch64 reads the count from the *low byte* of the second
+            // operand's lane, as a signed value: negative shifts right. A
+            // count at or past the lane width is not undefined here the way it
+            // is in wasm, it means everything is shifted out -- zero, or for a
+            // signed right shift the sign bit replicated -- so each direction
+            // needs its own out-of-range case rather than wasm's modulo.
+            //
+            // libpython reaches this in its integer code, which is where it
+            // was found: `ushl v0.2d, v0.2d, v5.2d`.
+            VOp3::UShl | VOp3::SShl => {
+                let signed = op == VOp3::SShl;
+                let bits = arr.lane_bytes * 8;
+                let ty = if arr.lane_bytes == 8 { Ty::I64 } else { Ty::I32 };
+                let lanes = if arr.scalar {
+                    1
+                } else {
+                    (if arr.q { 16 } else { 8 }) / arr.lane_bytes
+                };
+                let zero = self.konst(ty, 0);
+                let limit = self.konst(ty, bits as u64);
+                let mut out = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                for i in 0..lanes {
+                    let val = self.b.def(Expr::VExtract {
+                        a,
+                        lane: i,
+                        lane_bytes: arr.lane_bytes,
+                        signed,
+                        ty,
+                    });
+                    // The count is the low byte of the lane, signed. Taking
+                    // it as a byte is the whole rule: the rest of the lane is
+                    // ignored. A byte extract yields an i32 whatever the lane
+                    // width, so a 64-bit lane needs it widened.
+                    let n = self.b.def(Expr::VExtract {
+                        a: b,
+                        lane: i * arr.lane_bytes,
+                        lane_bytes: 1,
+                        signed: true,
+                        ty: Ty::I32,
+                    });
+                    let n = if ty == Ty::I64 {
+                        self.b.def(Expr::Extend { a: n, signed: true })
+                    } else {
+                        n
+                    };
+                    let neg = self.b.bin(BinOp::Sub, ty, zero, n);
+                    let left = self.b.bin(BinOp::Shl, ty, val, n);
+                    let right = self.b.bin(
+                        if signed { BinOp::ShrS } else { BinOp::ShrU },
+                        ty,
+                        val,
+                        neg,
+                    );
+                    // Out of range: everything is gone. Left and unsigned
+                    // right give zero; a signed right gives the sign bit,
+                    // which is what shifting by width-1 leaves behind.
+                    let all = self.konst(ty, (bits - 1) as u64);
+                    let saturated = if signed {
+                        self.b.bin(BinOp::ShrS, ty, val, all)
+                    } else {
+                        zero
+                    };
+                    let far_left = self.b.cmp(CmpOp::GeS, ty, n, limit);
+                    let left = self.b.def(Expr::Select {
+                        cond: far_left,
+                        a: zero,
+                        b: left,
+                        ty,
+                    });
+                    let far_right = self.b.cmp(CmpOp::GeS, ty, neg, limit);
+                    let right = self.b.def(Expr::Select {
+                        cond: far_right,
+                        a: saturated,
+                        b: right,
+                        ty,
+                    });
+                    let is_left = self.b.cmp(CmpOp::GeS, ty, n, zero);
+                    let lane_out = self.b.def(Expr::Select {
+                        cond: is_left,
+                        a: left,
+                        b: right,
+                        ty,
+                    });
+                    out = self.b.def(Expr::VReplace {
+                        a: out,
+                        lane: i,
+                        lane_bytes: arr.lane_bytes,
+                        val: lane_out,
+                    });
+                }
+                self.commit_vector(vd, arr, out);
+                Flow::Next
+            }
+            _ => Flow::End(Term::Illegal { raw: self.raw, pc }),
         }
     }
 
@@ -2749,7 +2861,7 @@ impl<'a> Lifter<'a> {
                 }
                 Flow::Next
             }
-            _ => Flow::End(Term::Illegal { raw: 0, pc }),
+            _ => Flow::End(Term::Illegal { raw: self.raw, pc }),
         }
     }
 
@@ -2790,6 +2902,85 @@ impl<'a> Lifter<'a> {
         let amount = self.b.const_i32(shift);
         let sop = match op {
             VShiftImmOp::Shl => VShiftOp::Shl,
+            // Shift and insert. The bits the shift vacates come from the
+            // destination, so this is a splice: shift the source, and keep the
+            // part of the destination the shift did not reach. A shift by the
+            // whole width cannot be encoded for either of these, so the mask
+            // below is never all-ones or all-zeroes.
+            //
+            // libpython's hashing reaches `sli`, which is where these turned
+            // up. A width-independent mask would be nice; each lane's mask is
+            // the same, so building the constant once is enough.
+            VShiftImmOp::Sli | VShiftImmOp::Sri => {
+                let old = self.b.read(GuestReg::V128(vd.0));
+                let left = op == VShiftImmOp::Sli;
+                // `sri` may shift by the whole element width, which leaves
+                // nothing of the source and the destination untouched. wasm's
+                // modulo count would hand back the source unchanged instead.
+                // `sli` cannot encode that count, so only one side needs it.
+                let shifted = if !left && shift >= bits {
+                    self.b.def(Expr::VConst(Box::new([0u8; 16])))
+                } else {
+                    self.b.def(Expr::VShift {
+                        op: if left { VShiftOp::Shl } else { VShiftOp::ShrU },
+                        lane,
+                        a,
+                        amount,
+                    })
+                };
+                // Bits of the destination that survive: the low `shift` of
+                // each lane for `sli`, the high `shift` for `sri`.
+                let mut keep = [0u8; 16];
+                let width = arr.lane_bytes as usize;
+                for lane_i in 0..16 / width {
+                    for bit in 0..bits {
+                        let alive = if left { bit < shift } else { bit >= bits - shift };
+                        if alive {
+                            let byte = lane_i * width + (bit / 8) as usize;
+                            keep[byte] |= 1 << (bit % 8);
+                        }
+                    }
+                }
+                let mask = self.b.def(Expr::VConst(Box::new(keep)));
+                let kept = self.b.def(Expr::VBin {
+                    op: VBinOp::And,
+                    a: old,
+                    b: mask,
+                });
+                let r = self.b.def(Expr::VBin {
+                    op: VBinOp::Or,
+                    a: shifted,
+                    b: kept,
+                });
+                self.commit_vector(vd, arr, r);
+                return Flow::Next;
+            }
+            // Shift right and accumulate. The shift itself is the ordinary
+            // one, including its behaviour at the full element width, and the
+            // result is added to what the destination already holds.
+            VShiftImmOp::SSra | VShiftImmOp::USra => {
+                let signed = op == VShiftImmOp::SSra;
+                let old = self.b.read(GuestReg::V128(vd.0));
+                let shifted = if !signed && shift >= bits {
+                    self.b.def(Expr::VConst(Box::new([0u8; 16])))
+                } else {
+                    let n = self.b.const_i32(if shift >= bits { bits - 1 } else { shift });
+                    self.b.def(Expr::VShift {
+                        op: if signed { VShiftOp::ShrS } else { VShiftOp::ShrU },
+                        lane,
+                        a,
+                        amount: n,
+                    })
+                };
+                let r = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Add,
+                    lane,
+                    a: old,
+                    b: shifted,
+                });
+                self.commit_vector(vd, arr, r);
+                return Flow::Next;
+            }
             VShiftImmOp::SShr => VShiftOp::ShrS,
             VShiftImmOp::UShr => VShiftOp::ShrU,
             // The width-changing forms convert first and then shift at the
@@ -3227,7 +3418,7 @@ impl<'a> Lifter<'a> {
             Dp2Op::Rorv => self.b.bin(BinOp::Rotr, ty, a, b),
             // CRC32 needs a table or a carry-less multiply; not worth an
             // inline expansion until something in the corpus uses it.
-            _ => return Flow::End(Term::Illegal { raw: 0, pc }),
+            _ => return Flow::End(Term::Illegal { raw: self.raw, pc }),
         };
         self.wr_gp(rd, sz, v);
         Flow::Next
@@ -3403,7 +3594,7 @@ impl<'a> Lifter<'a> {
             // block-local GIR cannot express. They are vanishingly rare in
             // real userspace, so trap precisely rather than guess.
             IsaRmw::Smax | IsaRmw::Smin | IsaRmw::Umax | IsaRmw::Umin => {
-                return Flow::End(Term::Illegal { raw: 0, pc })
+                return Flow::End(Term::Illegal { raw: self.raw, pc })
             }
         };
         let old = self.b.def(Expr::Rmw {

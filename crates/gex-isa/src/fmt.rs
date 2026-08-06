@@ -1226,6 +1226,10 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 VShiftImmOp::UShr => "ushr",
                 VShiftImmOp::SShll => "sshll",
                 VShiftImmOp::UShll => "ushll",
+                VShiftImmOp::SSra => "ssra",
+                VShiftImmOp::USra => "usra",
+                VShiftImmOp::Sli => "sli",
+                VShiftImmOp::Sri => "sri",
                 VShiftImmOp::Shrn => "shrn",
             };
             // The width-changing forms name two arrangements: the wide one

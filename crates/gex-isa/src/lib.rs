@@ -1357,6 +1357,13 @@ pub enum VShiftImmOp {
     UShll,
     /// Narrow each lane to half width after shifting right.
     Shrn,
+    /// Shift right and accumulate into the destination.
+    SSra,
+    USra,
+    /// Shift and insert: the bits shifted in come from the destination rather
+    /// than being zero, so the shift is a splice of the two registers.
+    Sli,
+    Sri,
 }
 
 /// Bitwise vector operations on the `v` register file.
