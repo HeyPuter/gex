@@ -252,11 +252,25 @@ impl<'a> Emitter<'a> {
     ///
     /// Only leaf loops qualify -- a call in the body ends the region, because
     /// the callee returns through the table -- so this fires on a few hundred
-    /// loops in a large program. On nbench in the browser, against the same
-    /// module built without it: assignment 13% faster, string sort 13%,
-    /// bitfield 9%, Fourier 5%, numeric sort 1%, FP emulation 3% slower.
+    /// loops in a large program: 195 in Lua, 1287 in SQLite. On nbench in the
+    /// browser, against the same module built without it, one paired run:
+    ///
+    /// ```text
+    ///     STRING SORT  +13%      NUMERIC SORT   +1%
+    ///     HUFFMAN       +7%      FOURIER        -0%
+    ///     NEURAL NET    +6%      IDEA           -3%
+    ///     ASSIGNMENT    +5%      FP EMULATION  -12%
+    ///     BITFIELD      +2%
+    /// ```
+    ///
+    /// A small net win, not a large one, and worth reading with the machine's
+    /// run-to-run spread in mind -- about 8% here, so only the two ends of
+    /// that list are solid. FP emulation was down in both runs of it, and is
+    /// the one to look at: it is the kernel most made of tight branchy
+    /// integer loops, which is what this was supposed to help.
+    ///
     /// Lua, matmul and a call microbenchmark are unchanged, which is what a
-    /// transform that only reaches leaf loops should look like.
+    /// transform reaching only leaf loops should look like.
     fn run_region(&mut self, region: &[u64]) {
         let n = region.len();
         let index: HashMap<u64, u32> = region
