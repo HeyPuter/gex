@@ -65,6 +65,25 @@ impl OpenFile {
     ///
     /// A descriptor opened `O_NONBLOCK` never waits -- it is asking for the
     /// `EAGAIN` -- so it answers no however empty the stream is.
+    /// Whether a `write` on this descriptor has to be carried to completion
+    /// by the syscall layer rather than issued once.
+    ///
+    /// A blocking `write` to a pipe returns only when the whole buffer is in,
+    /// which is what every caller expects and what Linux does. The pipe
+    /// itself cannot deliver that -- it must not wait, because it runs with
+    /// the kernel locked and the reader needs that lock -- so it takes what
+    /// fits and says how much. Somebody has to do the rest, outside the lock.
+    ///
+    /// Leaving the short count to the caller looks defensible and is not: a
+    /// program that ignores it loses the tail of every large write silently.
+    /// dpkg piping a package into tar produced "this does not look like a tar
+    /// archive".
+    pub fn write_is_atomic(&self) -> bool {
+        self.writable
+            && self.flags.load(Ordering::Relaxed) & crate::fs::oflags::O_NONBLOCK == 0
+            && self.handle.is_stream()
+    }
+
     /// Whether a `write` on this descriptor would have to wait.
     pub fn write_would_block(&self) -> bool {
         self.writable
@@ -340,6 +359,10 @@ impl FileHandle for PipeEnd {
 
     fn poll_writable(&self) -> bool {
         !self.write || self.pipe.writable()
+    }
+
+    fn write_room(&self) -> Option<u64> {
+        self.write.then(|| self.pipe.room() as u64)
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {

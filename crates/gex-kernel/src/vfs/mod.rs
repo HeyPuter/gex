@@ -161,6 +161,16 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn poll_writable(&self) -> bool {
         true
     }
+
+    /// How many bytes a write can take right now, when that is bounded.
+    ///
+    /// `None` means it is not -- a file, a terminal, a socket -- and a write
+    /// there either completes or is the caller's business. A pipe is the case
+    /// that is bounded, and a blocking write larger than its free space has
+    /// to be carried to completion by the syscall layer.
+    fn write_room(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A descriptor that names a file without opening it: `O_PATH`.

@@ -150,6 +150,11 @@ impl Pipe {
         self.state.lock().unwrap().buf.len()
     }
 
+    /// How many bytes a write can take before the pipe is full.
+    pub fn room(&self) -> usize {
+        PIPE_BUF.saturating_sub(self.state.lock().unwrap().buf.len())
+    }
+
     /// How many bytes are waiting to be read.
     pub fn buffered(&self) -> usize {
         self.state.lock().unwrap().buf.len()

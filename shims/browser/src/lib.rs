@@ -1607,6 +1607,9 @@ fn finish_parked(
             Ok(n)
         }
         gex_kernel::BlockOp::WriteStream { handle, buf, len } => {
+            // One turn's worth; the scheduler brings the thread back while
+            // anything is left, because the descriptor stays unwritable until
+            // the reader has drained.
             let data = gm.read(*buf, *len)?.to_vec();
             handle.write_at(0, &data)
         }

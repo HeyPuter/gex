@@ -1197,7 +1197,15 @@ impl Kernel {
             }
             nr::WRITE => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.write_would_block() {
+                if !file.write_is_atomic() {
+                    return None;
+                }
+                // Only when it cannot be done in one go. A file, a terminal
+                // and a socket all say `None` here and take the direct path,
+                // which is every write in the common case; a pipe says how
+                // much room it has, and only a write past that has to be
+                // carried in pieces.
+                if a[2] <= file.handle.write_room()? {
                     return None;
                 }
                 Some(BlockOp::WriteStream {

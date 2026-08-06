@@ -828,12 +828,22 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
         }
         BlockOp::WriteStream { handle, buf, len } => {
             let data = GuestMem::new(data).read(buf, len)?.to_vec();
-            loop {
-                if handle.poll_writable() {
-                    return handle.write_at(0, &data);
+            let mut done = 0usize;
+            while done < data.len() {
+                if !handle.poll_writable() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                match handle.write_at(0, &data[done..]) {
+                    Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Ok(n) => done += n as usize,
+                    // A partial write already delivered is what the caller
+                    // gets; the error belongs to the next call.
+                    Err(_) if done > 0 => break,
+                    Err(e) => return Err(e),
+                }
             }
+            Ok(done as u64)
         }
         BlockOp::ReadStream { handle, buf, len } => {
             let mut tmp = vec![0u8; len];
