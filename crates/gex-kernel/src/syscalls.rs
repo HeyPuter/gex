@@ -78,6 +78,8 @@ pub mod nr {
     pub const UMASK: u64 = 166;
     pub const UMOUNT2: u64 = 39;
     pub const MOUNT: u64 = 40;
+    pub const GETITIMER: u64 = 102;
+    pub const SETITIMER: u64 = 103;
     pub const SCHED_GETAFFINITY: u64 = 123;
     pub const SCHED_YIELD: u64 = 124;
     pub const KILL: u64 = 129;
@@ -1421,6 +1423,11 @@ impl Kernel {
             // One processor, and it is the one the caller is on. dpkg asks
             // to size its worker pool.
             nr::SCHED_GETAFFINITY => self.sys_getaffinity(m, a[1], a[2]),
+            // Interval timers are not delivered: nothing here raises SIGALRM.
+            // Accepting the call is still right -- a program that cannot arm
+            // a timeout does not conclude it has no timeout, it concludes
+            // something is badly wrong, and busybox's wget spins on it.
+            nr::SETITIMER | nr::GETITIMER => self.sys_itimer(m, a[2]),
             nr::SCHED_YIELD => {
                 std::thread::yield_now();
                 Ok(0)
@@ -2232,6 +2239,17 @@ impl Kernel {
         self.vfs.chmod(&path, mode).map(|_| 0)
     }
 
+    /// `setitimer` and `getitimer`. Interval timers are not delivered:
+    /// nothing here raises `SIGALRM`. Accepting the call is still right --
+    /// a program that cannot arm a timeout does not conclude it has no
+    /// timeout, it concludes something is badly wrong.
+    fn sys_itimer(&mut self, m: &mut GuestMem<'_>, old: u64) -> SysResult {
+        if old != 0 {
+            m.zero(old, 32)?;
+        }
+        Ok(0)
+    }
+
     /// `sched_getaffinity`. One processor, and it is the one the caller is
     /// already on. dpkg asks in order to size its worker pool.
     fn sys_getaffinity(&mut self, m: &mut GuestMem<'_>, len: u64, mask: u64) -> SysResult {
@@ -3027,6 +3045,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::CLOCK_GETTIME => "clock_gettime",
         nr::CLOCK_GETRES => "clock_getres",
         nr::CLOCK_NANOSLEEP => "clock_nanosleep",
+        nr::SETITIMER => "setitimer",
+        nr::GETITIMER => "getitimer",
         nr::SCHED_GETAFFINITY => "sched_getaffinity",
         nr::SCHED_YIELD => "sched_yield",
         nr::KILL => "kill",
