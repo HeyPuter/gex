@@ -1313,6 +1313,26 @@ fn decode_simd_fp(raw: u32) -> Inst {
     {
         let cmode = bits(raw, 15, 12);
         let imm8 = (bits(raw, 18, 16) << 5) | bits(raw, 9, 5);
+        // An odd `cmode` below 1100 is not a move at all: it reads the
+        // destination and combines the immediate into it. `orr` for op=0 and
+        // `bic` for op=1. This is checked before the move expansion, which
+        // has its own idea of what an inverted immediate means and rejects
+        // these outright.
+        if cmode & 1 == 1 && cmode < 0b1100 {
+            // The immediate expands exactly as the move one bit below does:
+            // `cmode` 0xx1 is the 32-bit-lane shifted form, 10x1 the
+            // 16-bit-lane one. Asking for the odd `cmode` itself gets
+            // nothing, because the expander only knows the move encodings.
+            let Some(plain) = expand_simd_immediate(imm8, cmode & !1, false, q) else {
+                return Inst::Unknown { raw };
+            };
+            return Inst::VLogicalImm {
+                vd: VReg(bits(raw, 4, 0) as u8),
+                value: plain,
+                clear: u == 1,
+                q,
+            };
+        }
         let Some(value) = expand_simd_immediate(imm8, cmode, u == 1, q) else {
             return Inst::Unknown { raw };
         };
@@ -1441,6 +1461,7 @@ fn decode_simd_fp(raw: u32) -> Inst {
             if bit(raw, 10) == 1 {
                 return decode_simd_three_same(raw, q, u);
             }
+
         }
     }
 
@@ -1670,8 +1691,39 @@ fn decode_simd_three_different(raw: u32, q: bool, u: u32) -> Option<Inst> {
         0b1000 => VWidenOp::MlaL,
         0b1010 => VWidenOp::MlsL,
         0b1100 => VWidenOp::MulL,
-        // The halving-narrow, saturating-doubling and polynomial forms share
-        // this space but do something else entirely.
+        // The narrowing forms: two vectors of one width giving one of half
+        // that width, keeping the top halves of the results. glibc's `strlen`
+        // folds a byte mask to a scalar with `addhn`, so a dynamic glibc
+        // program reaches this before it reaches `main`.
+        0b0100 | 0b0110 => {
+            let narrow = match (bits(raw, 15, 12), u) {
+                (0b0100, 0) => VNarrowOp::AddHn,
+                (0b0100, _) => VNarrowOp::RAddHn,
+                (0b0110, 0) => VNarrowOp::SubHn,
+                _ => VNarrowOp::RSubHn,
+            };
+            // The sources are one size up from the result, so a 64-bit
+            // result lane -- `size` of 0b11 -- would need 128-bit sources.
+            let dst_bytes = match bits(raw, 23, 22) {
+                0b00 => 1,
+                0b01 => 2,
+                0b10 => 4,
+                _ => return None,
+            };
+            return Some(Inst::VNarrow {
+                op: narrow,
+                dst_bytes,
+                // `Q` names which half of the destination is written, not the
+                // width of anything: `addhn2` fills the top and leaves the
+                // bottom as it was.
+                upper: q,
+                vd: VReg(bits(raw, 4, 0) as u8),
+                vn: VReg(bits(raw, 9, 5) as u8),
+                vm: VReg(bits(raw, 20, 16) as u8),
+            });
+        }
+        // The saturating-doubling and polynomial forms share this space but
+        // do something else entirely.
         _ => return None,
     };
     // A 64-bit source lane would give a 128-bit result, which does not exist.
@@ -1811,6 +1863,12 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
         (0b10010, _) => VOp3::Mls,
         (0b10011, 0) => VOp3::Mul,
         (0b10111, 0) => VOp3::AddP,
+        (0b01000, 0) => VOp3::SShl,
+        (0b01000, _) => VOp3::UShl,
+        (0b10100, 0) => VOp3::SMaxP,
+        (0b10100, _) => VOp3::UMaxP,
+        (0b10101, 0) => VOp3::SMinP,
+        (0b10101, _) => VOp3::UMinP,
         _ => return Inst::Unknown { raw },
     };
     // Doubleword lanes exist only for add, sub, the comparisons and the

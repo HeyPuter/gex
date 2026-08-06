@@ -20,6 +20,7 @@ use gex_isa::{
     AddOp, AddrMode, BarrierKind, BfOp, Cond, Dp1Op, Dp2Op, Dp3Op, Extend, FpOp1, FpOp2, FpRound,
     FpSz, Inst, LogOp, MemSz, MoveOp, Ordering as IsaOrder, RegSel, RmwOp as IsaRmw, ShiftType,
     SysMaintOp, SysReg, Sz, VAcrossOp, VArr, VLogOp, VOp2, VOp3, VPermOp, VSelKind, VShiftImmOp,
+    VNarrowOp,
     VWidenOp,
 };
 
@@ -1313,6 +1314,140 @@ impl<'a> Lifter<'a> {
                 self.three_same_with(op, arr, vd, vn, b, pc)
             }
 
+            Inst::VLogicalImm {
+                vd,
+                value,
+                clear,
+                q,
+            } => {
+                let bytes = if clear {
+                    (!value).to_le_bytes()
+                } else {
+                    value.to_le_bytes()
+                };
+                let imm = self.b.def(Expr::VConst(Box::new(bytes)));
+                let old = self.b.read(GuestReg::V128(vd.0));
+                let r = self.b.def(Expr::VBin {
+                    op: if clear { VBinOp::And } else { VBinOp::Or },
+                    a: old,
+                    b: imm,
+                });
+                // The 64-bit form clears the top half, as every write to a
+                // `.8b`/`.4h`/`.2s` arrangement does.
+                let r = self.narrow_to_64(r, q);
+                self.b.write(GuestReg::V128(vd.0), r);
+                Flow::Next
+            }
+            Inst::VNarrow {
+                op,
+                dst_bytes,
+                upper,
+                vd,
+                vn,
+                vm,
+            } => {
+                // Add or subtract at the source width, then keep the top half
+                // of each result. wasm has no narrowing that truncates -- its
+                // `narrow` instructions saturate, which is a different answer
+                // -- so the halves are picked out with a byte shuffle, which
+                // is what "keep the high half of each lane" means once the
+                // lanes are laid out in memory order.
+                let src = VArr {
+                    lane_bytes: dst_bytes * 2,
+                    q: true,
+                    float: false,
+                    scalar: false,
+                };
+                let lane = Self::lane_of(src);
+                let a = self.b.read(GuestReg::V128(vn.0));
+                let b = self.b.read(GuestReg::V128(vm.0));
+                let wide = match op {
+                    VNarrowOp::AddHn | VNarrowOp::RAddHn => self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Add,
+                        lane,
+                        a,
+                        b,
+                    }),
+                    VNarrowOp::SubHn | VNarrowOp::RSubHn => self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Sub,
+                        lane,
+                        a,
+                        b,
+                    }),
+                };
+                // The rounding forms add half a result-lane before narrowing,
+                // so the kept half is rounded rather than truncated.
+                let wide = if matches!(op, VNarrowOp::RAddHn | VNarrowOp::RSubHn) {
+                    let mut half = [0u8; 16];
+                    let sb = (dst_bytes * 2) as usize;
+                    for lane_i in 0..16 / sb {
+                        // Half of 2^(8*dst_bytes) is a one in the top bit of
+                        // the low half, which is byte dst_bytes-1.
+                        half[lane_i * sb + dst_bytes as usize - 1] = 0x80;
+                    }
+                    let h = self.b.def(Expr::VConst(Box::new(half)));
+                    self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Add,
+                        lane,
+                        a: wide,
+                        b: h,
+                    })
+                } else {
+                    wide
+                };
+                // Pick the high `dst_bytes` of each source lane. The result
+                // is 64 bits wide; where it lands in the register depends on
+                // whether this is the `2` form.
+                let mut pick = [0u8; 16];
+                let sb = (dst_bytes * 2) as usize;
+                let db = dst_bytes as usize;
+                for out in 0..16 / sb {
+                    for byte in 0..db {
+                        pick[out * db + byte] = (out * sb + db + byte) as u8;
+                    }
+                }
+                let narrowed = self.b.def(Expr::VShuffle {
+                    a: wide,
+                    b: wide,
+                    lanes: Box::new(pick),
+                });
+                let out_arr = VArr {
+                    lane_bytes: dst_bytes,
+                    q: upper,
+                    float: false,
+                    scalar: false,
+                };
+                if upper {
+                    // `addhn2` writes the top half and leaves the bottom as
+                    // it was, so the eight bytes move up and the old value
+                    // supplies the rest.
+                    let mut up = [0u8; 16];
+                    for i in 0..8 {
+                        up[i] = i as u8;
+                        up[8 + i] = i as u8;
+                    }
+                    let old = self.b.read(GuestReg::V128(vd.0));
+                    let moved = self.b.def(Expr::VShuffle {
+                        a: narrowed,
+                        b: narrowed,
+                        lanes: Box::new(up),
+                    });
+                    let mut keep = [0u8; 16];
+                    for i in 0..8 {
+                        keep[i] = i as u8;
+                        keep[8 + i] = (16 + 8 + i) as u8;
+                    }
+                    let r = self.b.def(Expr::VShuffle {
+                        a: old,
+                        b: moved,
+                        lanes: Box::new(keep),
+                    });
+                    self.b.write(GuestReg::V128(vd.0), r);
+                } else {
+                    self.commit_vector(vd, out_arr, narrowed);
+                }
+                Flow::Next
+            }
             Inst::VWiden {
                 op,
                 arr,
@@ -2404,8 +2539,13 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
-            // Pairwise add: deinterleave the concatenation, then add.
-            VOp3::AddP | VOp3::FAddP => {
+            // Pairwise: deinterleave the concatenation, then combine.
+            VOp3::AddP
+            | VOp3::FAddP
+            | VOp3::SMaxP
+            | VOp3::UMaxP
+            | VOp3::SMinP
+            | VOp3::UMinP => {
                 let (evens, odds) = pairwise_patterns(arr);
                 let e = self.b.def(Expr::VShuffle {
                     a,
@@ -2417,8 +2557,15 @@ impl<'a> Lifter<'a> {
                     b,
                     lanes: Box::new(odds),
                 });
+                let pair = match op {
+                    VOp3::SMaxP => VLaneBinOp::MaxS,
+                    VOp3::UMaxP => VLaneBinOp::MaxU,
+                    VOp3::SMinP => VLaneBinOp::MinS,
+                    VOp3::UMinP => VLaneBinOp::MinU,
+                    _ => VLaneBinOp::Add,
+                };
                 let r = self.b.def(Expr::VLaneBin {
-                    op: VLaneBinOp::Add,
+                    op: pair,
                     lane,
                     a: e,
                     b: o,

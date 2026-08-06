@@ -838,6 +838,29 @@ pub enum Inst {
         q: bool,
     },
     /// Lane-wise operation on two vector sources.
+    /// `orr` and `bic` with a modified immediate, which read the destination
+    /// rather than replacing it.
+    VLogicalImm {
+        vd: VReg,
+        value: u128,
+        /// `bic`: clear the bits in `value` rather than setting them.
+        clear: bool,
+        q: bool,
+    },
+    /// Two vectors of one lane width producing one of half that width:
+    /// `addhn`, `subhn` and their rounding forms.
+    VNarrow {
+        op: VNarrowOp,
+        /// The width of a *result* lane, in bytes. The sources are twice
+        /// this.
+        dst_bytes: u32,
+        /// Write the top half of the destination, leaving the bottom alone --
+        /// the `addhn2` spelling.
+        upper: bool,
+        vd: VReg,
+        vn: VReg,
+        vm: VReg,
+    },
     VThreeSame {
         op: VOp3,
         arr: VArr,
@@ -1139,6 +1162,15 @@ impl VArr {
 
 /// Lane-wise NEON operations with two vector sources.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum VNarrowOp {
+    AddHn,
+    RAddHn,
+    SubHn,
+    RSubHn,
+}
+
+/// Three-operand lane-wise operations on equal-width vectors.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum VOp3 {
     Add,
     Sub,
@@ -1164,6 +1196,17 @@ pub enum VOp3 {
     CmTst,
     /// Pairwise add of the concatenation of both operands.
     AddP,
+    /// Pairwise maximum and minimum. glibc's `strlen` and `memchr` reduce a
+    /// comparison mask with these, so a dynamic glibc program reaches them
+    /// before it reaches `main`.
+    SMaxP,
+    UMaxP,
+    SMinP,
+    UMinP,
+    /// Shift left by a signed per-lane amount; a negative amount shifts
+    /// right. The rounding and saturating variants are not here.
+    SShl,
+    UShl,
     FAdd,
     FSub,
     FMul,

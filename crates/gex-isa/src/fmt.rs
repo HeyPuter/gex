@@ -1337,6 +1337,65 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             )
         }
 
+        Inst::VLogicalImm {
+            vd,
+            value,
+            clear,
+            q,
+        } => {
+            let arr = VArr {
+                lane_bytes: 4,
+                q,
+                float: false,
+                scalar: false,
+            };
+            format!(
+                "{} v{}.{}, #{:#x}",
+                if clear { "bic" } else { "orr" },
+                vd.0,
+                arr.suffix(),
+                value as u32
+            )
+        }
+
+        Inst::VNarrow {
+            op,
+            dst_bytes,
+            upper,
+            vd,
+            vn,
+            vm,
+        } => {
+            let m = match op {
+                VNarrowOp::AddHn => "addhn",
+                VNarrowOp::RAddHn => "raddhn",
+                VNarrowOp::SubHn => "subhn",
+                VNarrowOp::RSubHn => "rsubhn",
+            };
+            let dst = VArr {
+                lane_bytes: dst_bytes,
+                q: upper,
+                float: false,
+                scalar: false,
+            };
+            let src = VArr {
+                lane_bytes: dst_bytes * 2,
+                q: true,
+                float: false,
+                scalar: false,
+            };
+            format!(
+                "{m}{} v{}.{}, v{}.{}, v{}.{}",
+                if upper { "2" } else { "" },
+                vd.0,
+                dst.suffix(),
+                vn.0,
+                src.suffix(),
+                vm.0,
+                src.suffix()
+            )
+        }
+
         Inst::VFpCvtPrecision {
             widen,
             narrow_bytes,
@@ -1572,6 +1631,12 @@ fn vop3_name(op: VOp3) -> &'static str {
         VOp3::CmHs => "cmhs",
         VOp3::CmTst => "cmtst",
         VOp3::AddP => "addp",
+        VOp3::SMaxP => "smaxp",
+        VOp3::UMaxP => "umaxp",
+        VOp3::SMinP => "sminp",
+        VOp3::UMinP => "uminp",
+        VOp3::SShl => "sshl",
+        VOp3::UShl => "ushl",
         VOp3::SAbd => "sabd",
         VOp3::UAbd => "uabd",
         VOp3::FAdd => "fadd",

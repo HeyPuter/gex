@@ -295,6 +295,8 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/vfs" "$HERE/programs/vfs.c"
 "$CC" -static -no-pie -O2 -o "$WORK/signals" "$HERE/programs/signals.c"
 "$CC" -static -no-pie -O3 -o "$WORK/vector" "$HERE/programs/vector.c"
+# -O2: these are intrinsics, and -O3 lets gcc constant-fold half of them away.
+"$CC" -static -no-pie -O2 -o "$WORK/neon3" "$HERE/programs/neon3.c"
 "$CC" -static -O3 -o "$WORK/vector-pie" "$HERE/programs/vector.c"
 # -ffast-math lets the vectoriser reach the by-element multiplies and the
 # widening conversions; neon2 drives the structure loads through intrinsics
@@ -380,6 +382,9 @@ compare "vector-O3" "$WORK/vector"
 compare "vector-pie" "$WORK/vector-pie"
 compare "numeric" "$WORK/numeric"
 compare "neon-structure" "$WORK/neon2"
+# The narrowing adds, the pairwise reductions and the read-modify-write forms
+# of the modified-immediate group -- what glibc's string routines use.
+compare "neon-glibc" "$WORK/neon3"
 compare "cross-block-flags" "$WORK/flags"
 compare "loops" "$WORK/loops"
 compare "fixed-point" "$WORK/fixedpoint"
@@ -390,6 +395,7 @@ cross_engine "vector" "$WORK/vector"
 cross_engine "numeric" "$WORK/numeric"
 cross_engine "fixedpoint" "$WORK/fixedpoint"
 cross_engine "neon-structure" "$WORK/neon2"
+cross_engine "neon-glibc" "$WORK/neon3"
 
 # And under the browser runtime: the kernel itself in wasm. This is the
 # deliverable, so it gets the same breadth the native host does -- the whole
@@ -398,6 +404,7 @@ browser "numeric" "$WORK/numeric"
 browser "fixedpoint" "$WORK/fixedpoint"
 browser "vector" "$WORK/vector"
 browser "neon-structure" "$WORK/neon2"
+browser "neon-glibc" "$WORK/neon3"
 browser "cross-block-flags" "$WORK/flags"
 browser "loops" "$WORK/loops"
 for area in arith float mem flow sys; do
