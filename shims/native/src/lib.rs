@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use gex_abi::{ctx, exports, imports, GUEST_MEM_PAGES, IMPORT_MODULE};
 use gex_kernel::mem::prot;
 use gex_kernel::vfs::{DevFs, HostFs, ProcFs, TmpFs};
-use gex_kernel::{BlockOp, GuestMem, Kernel, ProcState, SyscallOutcome, ThreadState};
+use gex_kernel::{BlockOp, GuestMem, Kernel, KernelProcSource, ProcState, SyscallOutcome, ThreadState};
 use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
@@ -453,6 +453,9 @@ fn run_program_with(
             Kernel::new(ctx_addr, image.brk, exe_path.clone()),
             Arc::new(Mutex::new(ProcState {
                 pid: 1,
+                ppid: 0,
+                pgid: 1,
+                sid: 1,
                 maps: String::new(),
                 cmdline: Vec::new(),
                 environ: Vec::new(),
@@ -692,6 +695,7 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
         }
         BlockOp::WaitChild {
             children,
+            procs,
             want,
             wstatus,
             nohang,
@@ -709,6 +713,10 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
                     let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(code) = st.take() {
                         c.reaped.store(true, std::sync::atomic::Ordering::Release);
+                        // Collected, so the table can forget it. Without this
+                        // an init that respawns for the life of the machine
+                        // grows a record per restart.
+                        procs.reap(c.pid);
                         if wstatus != 0 {
                             // The wait status Linux reports for a normal
                             // exit: the code in bits 8..16.
@@ -720,6 +728,13 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
                 }
                 if nohang {
                     return Ok(0);
+                }
+                // A halt reaches a parked `wait4` here. `EINTR` is what the
+                // guest would see if a signal had arrived, and it sends every
+                // caller back round to a syscall -- where the halt check
+                // stops it.
+                if procs.halt_code().is_some() {
+                    return Err(Errno::EINTR);
                 }
                 // Any child's condvar will do to park on; they are woken
                 // together with the status they set.
@@ -835,7 +850,8 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
     // The child's kernel is a copy of the parent's: descriptors are `Arc`
     // handles, so parent and child share the open file descriptions exactly
     // as Linux does, while the VMA tree and the child list are its own.
-    let (child_kernel, regions, ctx_addr) = {
+    let child_proc = Arc::new(Mutex::new(ProcState::default()));
+    let (mut child_kernel, regions, ctx_addr) = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         let regions: Vec<(u64, u64)> = k.mem.vmas().iter().map(|v| (v.start, v.end)).collect();
         let mut child = k.fork_kernel();
@@ -885,6 +901,14 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         let data = child_mem.bytes();
         read_u64(data, (ctx_addr + ctx::PC as u64) as usize)
     };
+    // The child's VFS was cloned from the parent's, and that clone included
+    // the parent's `/proc` -- so without this the child, and everything it
+    // goes on to exec, reads its ancestor's pid, maps and command line from
+    // `/proc/self`. Each process gets its own.
+    child_kernel.vfs.mount(
+        "/proc",
+        Arc::new(ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&child_proc))))),
+    );
     let child_cx = Arc::new(SpawnContext {
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -895,7 +919,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         opts: cx.opts.clone(),
         xlate: cx.xlate.clone(),
         kernel: Arc::new(Mutex::new(child_kernel)),
-        proc_state: Arc::new(Mutex::new(ProcState::default())),
+        proc_state: child_proc,
         // The registry is shared: the modules are the same code at the same
         // addresses, and instantiating one against a different memory is
         // exactly what the import is for.
@@ -904,11 +928,14 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
     });
     let status = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
-        k.children
-            .iter()
-            .find(|c| c.pid == pid)
+        k.procs
+            .handle(pid)
             .map(|c| (Arc::clone(&c.status), Arc::clone(&c.done)))
             .ok_or_else(|| anyhow!("forked child {pid} is not registered"))?
+    };
+    let procs = {
+        let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&k.procs)
     };
     let thread = ThreadState::new(ctx_addr, pid);
     std::thread::Builder::new()
@@ -921,6 +948,9 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
                     127
                 }
             };
+            // Through the table, so this process's own children -- if any are
+            // still running -- become init's rather than being lost.
+            procs.exit(pid, code);
             let (st, done) = status;
             *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
             done.notify_all();
@@ -1133,7 +1163,7 @@ fn mount_filesystems(
     kernel.vfs.mount("/dev", Arc::new(DevFs::new()));
     kernel.vfs.mount(
         "/proc",
-        Arc::new(ProcFs::new(Arc::new(SharedProc(proc_state)))),
+        Arc::new(ProcFs::new(Arc::new(KernelProcSource(proc_state)))),
     );
     if opts.sysroot.is_some() {
         // A sysroot has no host /tmp behind it, so give the guest one.
@@ -1154,46 +1184,6 @@ fn mount_filesystems(
 }
 
 /// A `/proc` source over the snapshot the host refreshes.
-struct SharedProc(Arc<Mutex<ProcState>>);
-
-impl gex_kernel::vfs::ProcSource for SharedProc {
-    fn pid(&self) -> i32 {
-        self.0.lock().unwrap().pid
-    }
-    fn maps(&self) -> String {
-        self.0.lock().unwrap().maps.clone()
-    }
-    fn cmdline(&self) -> Vec<u8> {
-        self.0.lock().unwrap().cmdline.clone()
-    }
-    fn environ(&self) -> Vec<u8> {
-        self.0.lock().unwrap().environ.clone()
-    }
-    fn exe(&self) -> String {
-        self.0.lock().unwrap().exe.clone()
-    }
-    fn cwd(&self) -> String {
-        self.0.lock().unwrap().cwd.clone()
-    }
-    fn fds(&self) -> Vec<(i32, String)> {
-        self.0.lock().unwrap().fds.clone()
-    }
-    fn stat(&self) -> String {
-        let s = self.0.lock().unwrap();
-        format!(
-            "{} (gex) R 0 {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0\n",
-            s.pid, s.pid, s.pid
-        )
-    }
-    fn status(&self) -> String {
-        let s = self.0.lock().unwrap();
-        format!(
-            "Name:\tgex\nState:\tR (running)\nPid:\t{}\nThreads:\t1\n",
-            s.pid
-        )
-    }
-}
-
 /// The host process's real user and group ids.
 ///
 /// Read from `/proc/self/status` rather than through `libc`, which keeps this

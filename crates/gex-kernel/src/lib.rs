@@ -17,12 +17,14 @@ pub mod fs;
 pub mod futex;
 pub mod mem;
 pub mod pipe;
+pub mod proc;
 pub mod signal;
 pub mod stdio;
 pub mod syscalls;
 pub mod vfs;
 
 pub use errno::Errno;
+pub use proc::{ProcTable, INIT_PID};
 pub use syscalls::{
     skips_proc_snapshot, system_clock, BlockOp, Child, ChildHandle, ClockFn, Kernel,
     KernelProcSource, ProcState, SyscallOutcome, ThreadState,

@@ -402,7 +402,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // at pc=0 -- with nothing to say the filesystem was the cause.
     root.add_dir("/proc");
     let proc_state: Arc<gex_kernel::KernelProcSource> = Arc::new(gex_kernel::KernelProcSource(
-        std::sync::Mutex::new(Default::default()),
+        std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
     ));
     kernel.vfs.mount(
         "/proc",

@@ -318,6 +318,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/exitrace" "$HERE/programs/exitrace.c" -lpthread
 "$CC" -static -no-pie -O2 -o "$WORK/fork" "$HERE/programs/fork.c"
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
+"$CC" -static -no-pie -O2 -o "$WORK/init" "$HERE/programs/init.c"
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
 # .eh_frame through personality routines -- a very different code shape from
 # anything the C programs reach.
@@ -432,6 +433,21 @@ inherited fd reads 16 bytes: through the pipe
 child status 42
 failed exec status 99
 done" "$WORK/exec"
+# Pid 1: its own session, a service in another, an orphan it has to adopt, and
+# a process group it stops with one signal. Not compared against qemu, which
+# cannot agree about which process is pid 1.
+expect "init" "init: pid=1 ppid=0 pgid=1 sid=1
+init: setsid again -> EPERM
+service: pid 2
+service: pid 2 exited 0
+adopted: pid 3 exited 1
+group: led by 4 with 5
+group: both joined -> yes
+group: kill(-4, SIGTERM) -> 0
+group: pid 4 exited 42
+group: pid 5 exited 42
+init: wait with no children -> ECHILD
+init: done" "$WORK/init"
 [ -n "$CPP" ] && compare "cpp-static" "$WORK/cpp"
 
 if [ -n "$DYNAMIC" ]; then

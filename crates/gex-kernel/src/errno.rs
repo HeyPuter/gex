@@ -44,6 +44,7 @@ impl Errno {
     pub const ELOOP: Errno = Errno(40);
     pub const ETIMEDOUT: Errno = Errno(110);
     pub const EOPNOTSUPP: Errno = Errno(95);
+    pub const EAFNOSUPPORT: Errno = Errno(97);
 
     /// The value the guest sees in `x0`.
     pub fn as_return(self) -> u64 {

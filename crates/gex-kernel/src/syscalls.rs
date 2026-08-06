@@ -14,6 +14,7 @@ use crate::file::{FdTable, OpenFile, PipeEnd};
 use crate::fs::{oflags, Stat};
 use crate::futex::{self, FutexTable};
 use crate::mem::{flags as mflags, MemoryMap};
+use crate::proc::ProcTable;
 use crate::pipe::Pipe;
 use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
 use crate::stdio::{StdStream, Stream};
@@ -65,6 +66,9 @@ pub mod nr {
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_GETRES: u64 = 114;
     pub const CLOCK_NANOSLEEP: u64 = 115;
+    pub const SYNC: u64 = 81;
+    pub const UMOUNT2: u64 = 39;
+    pub const MOUNT: u64 = 40;
     pub const SCHED_YIELD: u64 = 124;
     pub const KILL: u64 = 129;
     pub const TKILL: u64 = 130;
@@ -74,7 +78,23 @@ pub mod nr {
     pub const RT_SIGPROCMASK: u64 = 135;
     pub const RT_SIGRETURN: u64 = 139;
     pub const SIGALTSTACK: u64 = 132;
+    pub const RT_SIGTIMEDWAIT: u64 = 137;
+    pub const REBOOT: u64 = 142;
+    pub const SETREGID: u64 = 143;
+    pub const SETGID: u64 = 144;
+    pub const SETREUID: u64 = 145;
+    pub const SETUID: u64 = 146;
+    pub const SETRESUID: u64 = 147;
+    pub const GETRESUID: u64 = 148;
+    pub const SETRESGID: u64 = 149;
+    pub const GETRESGID: u64 = 150;
     pub const TIMES: u64 = 153;
+    pub const SETPGID: u64 = 154;
+    pub const GETPGID: u64 = 155;
+    pub const GETSID: u64 = 156;
+    pub const SETSID: u64 = 157;
+    pub const GETGROUPS: u64 = 158;
+    pub const SETGROUPS: u64 = 159;
     pub const UNAME: u64 = 160;
     pub const GETRUSAGE: u64 = 165;
     pub const GETTIMEOFDAY: u64 = 169;
@@ -86,6 +106,11 @@ pub mod nr {
     pub const GETEGID: u64 = 177;
     pub const GETTID: u64 = 178;
     pub const SYSINFO: u64 = 179;
+    pub const PRCTL: u64 = 167;
+    pub const SOCKET: u64 = 198;
+    pub const SOCKETPAIR: u64 = 199;
+    pub const SENDTO: u64 = 206;
+    pub const CONNECT: u64 = 203;
     pub const BRK: u64 = 214;
     pub const MUNMAP: u64 = 215;
     pub const CLONE: u64 = 220;
@@ -187,6 +212,9 @@ pub enum BlockOp {
     /// `wait4`. Blocks until one of `children` has a status to collect.
     WaitChild {
         children: Vec<ChildHandle>,
+        /// So the waiter can drop the record once it has collected the child,
+        /// and can notice a halt while parked.
+        procs: Arc<ProcTable>,
         /// Which child, or -1 for any.
         want: i32,
         /// Where to write the wait status, or zero.
@@ -241,11 +269,14 @@ pub struct Kernel {
     pub next_ctx_slot: u32,
     /// Threads that have been created and not yet exited, including this one.
     pub live_threads: u32,
-    /// Child processes, for `wait4`.
-    pub children: Vec<Child>,
-    /// Next process id to hand out. Shared with `next_tid` in Linux; kept
-    /// separate here because gex's pids are its own invention.
-    pub next_pid: i32,
+    /// The system's processes: pids, parents, groups and sessions. Shared by
+    /// every process, because reparenting an orphan and killing a process
+    /// group are both questions no single process can answer. See [`crate::proc`].
+    pub procs: Arc<ProcTable>,
+    /// This process's parent, cached from the table so `getppid` is not a
+    /// lock. It never changes for a live process except when the parent dies,
+    /// and `getppid` re-reads the table in that case.
+    pub ppid: i32,
     /// How to read the wall clock.
     pub clock: ClockFn,
 }
@@ -273,6 +304,14 @@ pub fn system_clock() -> (u64, u32) {
     {
         (0, 0)
     }
+}
+
+/// Apply a `set*id` request, where the all-ones value means "leave alone".
+fn set_id(slot: &mut u32, want: u64) -> SysResult {
+    if want as u32 != u32::MAX {
+        *slot = want as u32;
+    }
+    Ok(0)
 }
 
 /// A child process the kernel is tracking.
@@ -403,8 +442,8 @@ impl Kernel {
             next_tid: 2,
             next_ctx_slot: 1,
             live_threads: 1,
-            children: Vec::new(),
-            next_pid: 1000,
+            procs: Arc::new(ProcTable::new()),
+            ppid: 0,
             clock: system_clock,
         }
     }
@@ -517,8 +556,9 @@ impl Kernel {
             next_tid: self.next_tid,
             next_ctx_slot: self.next_ctx_slot,
             live_threads: 1,
-            children: Vec::new(),
-            next_pid: self.next_pid + 1000,
+            // The table is the system's, not the process's.
+            procs: Arc::clone(&self.procs),
+            ppid: self.pid,
             clock: self.clock,
         }
     }
@@ -631,6 +671,43 @@ impl Kernel {
 
         // `clone` and a thread's `exit` change which threads exist, so they
         // answer with an outcome rather than a return value.
+        // Someone has halted the machine. Every process notices here and
+        // stops, however deep in its own work it was.
+        if let Some(code) = self.procs.halt_code() {
+            return SyscallOutcome::Exit(code);
+        }
+        // Anything another process has sent becomes pending here, at the one
+        // point where this process is definitely holding its own signal state
+        // and not running guest code.
+        self.take_sent_signals();
+        // `reboot` is two syscalls wearing one number. The shutdown commands
+        // do not return -- there is one machine here and it is this process,
+        // so halting it and exiting are the same act -- but the Ctrl-Alt-Del
+        // commands are ordinary settings, and busybox init issues `CAD_OFF`
+        // as its first act. Treating that as a shutdown ends the boot on line
+        // one, which is exactly what it did.
+        if n == nr::REBOOT {
+            const RESTART: u64 = 0x0123_4567;
+            const HALT: u64 = 0xcdef_0123;
+            const POWER_OFF: u64 = 0x4321_fedc;
+            const RESTART2: u64 = 0xa1b2_c3d4;
+            let what = match a[2] {
+                RESTART | RESTART2 => "restart",
+                HALT => "halt",
+                POWER_OFF => "power off",
+                // CAD_OFF, CAD_ON, SW_SUSPEND, KEXEC: nothing to do, and a
+                // failure would be reported by an init that can carry on.
+                _ => {
+                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, 0);
+                    return SyscallOutcome::Continue;
+                }
+            };
+            if self.trace {
+                eprintln!("[gex] reboot({what})");
+            }
+            self.procs.request_halt(0);
+            return SyscallOutcome::Exit(0);
+        }
         if n == nr::EXECVE {
             return match self.prepare_exec(m, a) {
                 Ok((path, argv, envp)) => {
@@ -648,9 +725,7 @@ impl Kernel {
         // A clone without CLONE_THREAD is a new process, which only the host
         // can build: it needs a second address space.
         if n == nr::CLONE && a[0] & clone_flags::THREAD == 0 {
-            let pid = self.next_pid;
-            self.next_pid += 1;
-            self.children.push(Child::new(pid));
+            let pid = self.procs.spawn(self.pid);
             // The parent sees the child's pid; the child sees zero, which the
             // host writes into the copy it makes.
             let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, pid as u64);
@@ -768,14 +843,13 @@ impl Kernel {
                 })
             }
             nr::WAIT4 => {
-                let alive: Vec<ChildHandle> = self
-                    .children
-                    .iter()
-                    .filter(|c| !c.reaped.load(std::sync::atomic::Ordering::Acquire))
-                    .map(|c| c.handle())
-                    .collect();
+                // Children come from the table, not from a list this process
+                // owns, so a child reparented here when its own parent died
+                // is one this `wait4` can collect. That is what makes pid 1
+                // able to do its job.
                 Some(BlockOp::WaitChild {
-                    children: alive,
+                    children: self.procs.children(self.pid),
+                    procs: Arc::clone(&self.procs),
                     want: a[0] as i32,
                     wstatus: a[1],
                     nohang: a[2] & 1 != 0,
@@ -865,10 +939,52 @@ impl Kernel {
             // -- process and time --------------------------------------------
             nr::UNAME => self.sys_uname(m, a[0]),
             nr::GETPID => Ok(self.pid as u64),
-            nr::GETPPID => Ok(0),
+            nr::GETPPID => Ok(self.procs.ppid(self.pid) as u64),
             nr::GETTID => Ok(self.tid as u64),
             nr::GETUID | nr::GETEUID => Ok(self.uid as u64),
             nr::GETGID | nr::GETEGID => Ok(self.gid as u64),
+
+            // -- sessions and process groups ---------------------------------
+            nr::SETSID => self.procs.setsid(self.pid).map(|s| s as u64),
+            nr::GETSID => self.procs.sid(self.pid, a[0] as i32).map(|s| s as u64),
+            nr::GETPGID => self.procs.pgid(self.pid, a[0] as i32).map(|g| g as u64),
+            nr::SETPGID => self
+                .procs
+                .setpgid(self.pid, a[0] as i32, a[1] as i32)
+                .map(|_| 0),
+
+            // -- credentials -------------------------------------------------
+            // There is no privilege model here: the guest is the whole system,
+            // so a request to become another user is recorded and granted.
+            // Refusing would be the less honest answer, since nothing gex does
+            // is protected by the uid in the first place.
+            nr::SETUID => set_id(&mut self.uid, a[0]),
+            nr::SETGID => set_id(&mut self.gid, a[0]),
+            nr::SETREUID => set_id(&mut self.uid, a[1]),
+            nr::SETREGID => set_id(&mut self.gid, a[1]),
+            nr::SETRESUID => set_id(&mut self.uid, a[1]),
+            nr::SETRESGID => set_id(&mut self.gid, a[1]),
+            nr::GETRESUID => self.sys_getres(m, a, self.uid),
+            nr::GETRESGID => self.sys_getres(m, a, self.gid),
+            // No supplementary groups. `getgroups(0, _)` asks for the count.
+            nr::GETGROUPS => Ok(0),
+            nr::SETGROUPS => Ok(0),
+            // Names, death signals and dumpability: all things a process may
+            // set about itself that change nothing observable here.
+            nr::PRCTL => Ok(0),
+
+            // -- mounts ------------------------------------------------------
+            // Nothing here is written back to a device, so there is nothing
+            // to flush -- but an init script's last act is usually to call it.
+            nr::SYNC => Ok(0),
+            nr::MOUNT => self.sys_mount(m, a),
+            nr::UMOUNT2 => self.sys_umount(m, a[0]),
+
+            // No networking. `ENOSYS` sends a caller looking for a fallback it
+            // may not have, whereas "this address family is unsupported" is an
+            // answer libc understands: busybox falls back from syslog to
+            // stderr on it rather than retrying.
+            nr::SOCKET | nr::SOCKETPAIR | nr::CONNECT | nr::SENDTO => Err(Errno::EAFNOSUPPORT),
             nr::SET_TID_ADDRESS => {
                 self.clear_child_tid = a[0];
                 Ok(self.tid as u64)
@@ -890,20 +1006,42 @@ impl Kernel {
 
             // -- signals -----------------------------------------------------
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
+            nr::RT_SIGTIMEDWAIT => self.sys_rt_sigtimedwait(m, a),
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(m, a[0] as u32, a[1], a[2]),
             nr::SIGALTSTACK => self.sys_sigaltstack(m, a[0], a[1]),
             // One process and one thread for now, so any target is us.
             // `raise` goes through tkill, which is why it needs its own entry
             // rather than falling into the unimplemented bucket.
-            nr::KILL | nr::TKILL | nr::TGKILL => {
-                let signo = match n {
-                    nr::KILL | nr::TKILL => a[1],
-                    _ => a[2],
-                } as u32;
+            // `tkill` and `tgkill` address a thread, and every thread of a
+            // process shares this kernel, so they raise here directly.
+            nr::TKILL | nr::TGKILL => {
+                let signo = if n == nr::TKILL { a[1] } else { a[2] } as u32;
                 if signo > 0 {
                     self.signals.raise(signo);
                 }
                 Ok(0)
+            }
+            // `kill` addresses a process, which may be any process on the
+            // system. It goes through the table, which leaves the signal
+            // pending for the target to collect at its next syscall.
+            nr::KILL => {
+                let target = a[0] as i32;
+                let signo = a[1] as u32;
+                match self.procs.kill(self.pid, target, signo) {
+                    Ok(_) => {
+                        // If the caller was one of the targets -- it signalled
+                        // itself, or its own group, or everything -- it must
+                        // see the signal before this syscall returns, because
+                        // `raise` is expected to have delivered by then. Who
+                        // the targets were is the table's question to answer,
+                        // not a rule to restate here: getting it wrong the
+                        // other way made `kill(-pgid)` signal a caller that
+                        // was in a different group entirely.
+                        self.take_sent_signals();
+                        Ok(0)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             nr::RT_SIGRETURN => {
                 // Handled by the caller, which must redirect execution to the
@@ -1518,6 +1656,120 @@ impl Kernel {
         Ok(start)
     }
 
+
+    // -- sessions, credentials and mounts --------------------------------------
+
+    /// Move anything another process has sent into this one's pending set.
+    fn take_sent_signals(&mut self) {
+        if !self.procs.has_signals(self.pid) {
+            return;
+        }
+        let mut sent = self.procs.take_signals(self.pid);
+        while sent != 0 {
+            let signo = sent.trailing_zeros() + 1;
+            sent &= sent - 1;
+            self.signals.raise(signo);
+        }
+    }
+
+    /// `getresuid` and `getresgid`: real, effective and saved, all the same
+    /// value here because nothing ever differs between them.
+    fn sys_getres(&mut self, m: &mut GuestMem<'_>, a: [u64; 6], id: u32) -> SysResult {
+        for slot in [a[0], a[1], a[2]] {
+            if slot != 0 {
+                m.write_u32(slot, id)?;
+            }
+        }
+        Ok(0)
+    }
+
+    /// `mount`, for the filesystems gex has.
+    ///
+    /// An init script's first act is usually to mount `/proc`, `/sys` and
+    /// `/dev`, and failing that is not fatal but it does mean everything
+    /// afterwards reads an empty `/proc`. The hosts already mount `/proc` and
+    /// `/dev` before the guest starts, so the common case is a request for
+    /// something that is there -- which succeeds, because the guest's view
+    /// afterwards is the one it asked for.
+    fn sys_mount(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let target = self.at_path(m, -100, a[1])?;
+        let fstype = if a[2] == 0 {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&m.read_cstr(a[2], 64)?).into_owned()
+        };
+        // A remount or a bind of something already there changes nothing gex
+        // models, and reporting failure would stop an init script that is in
+        // fact fine.
+        const MS_REMOUNT: u64 = 32;
+        const MS_BIND: u64 = 4096;
+        if a[3] & (MS_REMOUNT | MS_BIND) != 0 {
+            return Ok(0);
+        }
+        match fstype.as_str() {
+            "tmpfs" | "ramfs" => {
+                self.vfs.mount(&target, Arc::new(crate::vfs::TmpFs::new()));
+                Ok(0)
+            }
+            "devtmpfs" | "devfs" => {
+                self.vfs.mount(&target, Arc::new(crate::vfs::DevFs::new()));
+                Ok(0)
+            }
+            // `/proc` needs a source of process state that only the host can
+            // build, so it cannot be created on demand -- but the host has
+            // already mounted one, and a second request for it is satisfied.
+            "proc" | "procfs" => {
+                if self.vfs.is_mount_point(&target) {
+                    Ok(0)
+                } else {
+                    Err(Errno::ENODEV)
+                }
+            }
+            // An empty `/sys` is what most programs want from sysfs: they
+            // probe for a path, do not find it, and take the other branch.
+            "sysfs" | "debugfs" | "cgroup" | "cgroup2" => {
+                if !self.vfs.is_mount_point(&target) {
+                    self.vfs.mount(&target, Arc::new(crate::vfs::TmpFs::new()));
+                }
+                Ok(0)
+            }
+            _ => Err(Errno::ENODEV),
+        }
+    }
+
+    fn sys_umount(&mut self, m: &mut GuestMem<'_>, target: u64) -> SysResult {
+        let target = self.at_path(m, -100, target)?;
+        if self.vfs.unmount(&target) {
+            Ok(0)
+        } else {
+            Err(Errno::EINVAL)
+        }
+    }
+
+    /// `rt_sigtimedwait`, for a signal already pending.
+    ///
+    /// The blocking case is not implemented: a caller that asks to wait gets
+    /// `EAGAIN` as though the timeout had expired. That is a real limitation
+    /// and it is visible -- `sigwaitinfo` with no timeout is supposed never to
+    /// return empty-handed -- but the alternative is a fifth kind of
+    /// [`BlockOp`], and every caller seen so far uses this to drain signals it
+    /// has blocked rather than to sleep on them.
+    fn sys_rt_sigtimedwait(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let set = if a[0] == 0 { 0 } else { m.read_u64(a[0])? };
+        match self.signals.take_pending_in(set) {
+            Some(signal) => {
+                // A `siginfo_t` the caller can read the number out of: si_signo,
+                // si_errno, si_code, then the union, which nothing here fills.
+                if a[1] != 0 {
+                    m.zero(a[1], 128)?;
+                    m.write_u32(a[1], signal)?;
+                }
+                Ok(signal as u64)
+            }
+            None => Err(Errno::EAGAIN),
+        }
+    }
+
     // -- process and time ----------------------------------------------------
 
     fn sys_uname(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
@@ -1630,6 +1882,9 @@ impl Kernel {
 #[derive(Default, Clone)]
 pub struct ProcState {
     pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+    pub sid: i32,
     pub maps: String,
     pub cmdline: Vec<u8>,
     pub environ: Vec<u8>,
@@ -1639,7 +1894,7 @@ pub struct ProcState {
 }
 
 /// A `/proc` source backed by a snapshot the kernel refreshes.
-pub struct KernelProcSource(pub Mutex<ProcState>);
+pub struct KernelProcSource(pub Arc<Mutex<ProcState>>);
 
 impl ProcSource for KernelProcSource {
     fn pid(&self) -> i32 {
@@ -1665,21 +1920,27 @@ impl ProcSource for KernelProcSource {
     }
     fn stat(&self) -> String {
         let s = self.0.lock().unwrap();
+        // pid, comm, state, ppid, pgrp, session, then the rest, which nothing
+        // seen so far reads. `ps` and every "who is my parent" one-liner cut
+        // fields out of this by number, so the first six have to be right
+        // even when the remainder is zeroes.
         format!(
-            "{} ({}) R 0 {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0\n",
+            "{} ({}) R {} {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0\n",
             s.pid,
             s.exe.rsplit('/').next().unwrap_or("gex"),
-            s.pid,
-            s.pid
+            s.ppid,
+            s.pgid,
+            s.sid
         )
     }
     fn status(&self) -> String {
         let s = self.0.lock().unwrap();
         format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t0\nThreads:\t1\n",
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nThreads:\t1\n",
             s.exe.rsplit('/').next().unwrap_or("gex"),
             s.pid,
-            s.pid
+            s.pid,
+            s.ppid
         )
     }
 }
@@ -1689,6 +1950,9 @@ impl Kernel {
     pub fn refresh_proc(&self, state: &Mutex<ProcState>) {
         let mut s = state.lock().unwrap();
         s.pid = self.pid;
+        s.ppid = self.procs.ppid(self.pid);
+        s.pgid = self.procs.pgid(self.pid, 0).unwrap_or(self.pid);
+        s.sid = self.procs.sid(self.pid, 0).unwrap_or(self.pid);
         s.maps = self.mem.proc_maps();
         s.exe = self.exe_path.clone();
         s.cwd = self.vfs.cwd.clone();
@@ -1822,6 +2086,30 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::GETTIMEOFDAY => "gettimeofday",
         nr::GETPID => "getpid",
         nr::GETPPID => "getppid",
+        nr::SETSID => "setsid",
+        nr::GETSID => "getsid",
+        nr::SETPGID => "setpgid",
+        nr::GETPGID => "getpgid",
+        nr::SETUID => "setuid",
+        nr::SETGID => "setgid",
+        nr::SETREUID => "setreuid",
+        nr::SETREGID => "setregid",
+        nr::SETRESUID => "setresuid",
+        nr::SETRESGID => "setresgid",
+        nr::GETRESUID => "getresuid",
+        nr::GETRESGID => "getresgid",
+        nr::GETGROUPS => "getgroups",
+        nr::SETGROUPS => "setgroups",
+        nr::PRCTL => "prctl",
+        nr::SYNC => "sync",
+        nr::MOUNT => "mount",
+        nr::UMOUNT2 => "umount2",
+        nr::REBOOT => "reboot",
+        nr::RT_SIGTIMEDWAIT => "rt_sigtimedwait",
+        nr::SOCKET => "socket",
+        nr::SOCKETPAIR => "socketpair",
+        nr::CONNECT => "connect",
+        nr::SENDTO => "sendto",
         nr::GETUID => "getuid",
         nr::GETEUID => "geteuid",
         nr::GETGID => "getgid",

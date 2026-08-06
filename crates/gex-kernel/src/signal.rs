@@ -206,6 +206,23 @@ impl Signals {
         }
     }
 
+    /// Take the lowest-numbered pending signal that is in `set`, whether or
+    /// not it is blocked.
+    ///
+    /// `sigwaitinfo` is used precisely on signals the caller has blocked --
+    /// blocking them is how it stops the default action from running before
+    /// the wait -- so this deliberately ignores the mask that
+    /// [`Signals::next_deliverable`] respects.
+    pub fn take_pending_in(&mut self, set: u64) -> Option<u32> {
+        let ready = self.pending & set;
+        if ready == 0 {
+            return None;
+        }
+        let signal = ready.trailing_zeros() + 1;
+        self.pending &= !bit(signal);
+        Some(signal)
+    }
+
     pub fn has_pending(&self) -> bool {
         self.pending & !self.blocked != 0
     }

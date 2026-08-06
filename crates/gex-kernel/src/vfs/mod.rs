@@ -187,6 +187,18 @@ impl Vfs {
         self.mounts.insert(at, fs);
     }
 
+    /// Whether something is mounted at exactly this path.
+    pub fn is_mount_point(&self, path: &str) -> bool {
+        self.mounts.contains_key(&normalize(path, &self.cwd))
+    }
+
+    /// Remove the mount at exactly this path. The root mount stays: a guest
+    /// that unmounts `/` has nothing left to run from.
+    pub fn unmount(&mut self, path: &str) -> bool {
+        let at = normalize(path, &self.cwd);
+        at != "/" && self.mounts.remove(&at).is_some()
+    }
+
     /// Find the backend responsible for `path`, and the path relative to it.
     ///
     /// Longest prefix wins, so a `/proc` mount shadows the root mount for
