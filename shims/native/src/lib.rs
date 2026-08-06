@@ -183,6 +183,8 @@ struct SpawnContext {
     xlate: Options,
     kernel: Arc<Mutex<Kernel>>,
     proc_state: Arc<Mutex<ProcState>>,
+    /// Where compiled runtime translations are kept, passed to every store.
+    jit_cache: Option<(std::path::PathBuf, String)>,
     /// Shared across threads and inherited by children, so a profile of a
     /// process tree is one profile.
     sampler: Option<Arc<Sampler>>,
@@ -200,6 +202,10 @@ struct Jit {
     engine: Engine,
     linker: Linker<HostState>,
     table: Table,
+    /// Where compiled runtime translations are kept, and the build they
+    /// belong to. `None` when the cache is off or this build cannot name
+    /// itself.
+    cache: Option<(std::path::PathBuf, String)>,
     /// Instances live here because the table holds funcrefs into them.
     instances: Vec<wasmtime::Instance>,
     /// Registry entries already instantiated into this store.
@@ -451,6 +457,12 @@ fn run_program_with(
 
     let ctx_addr = gex_abi::ctx_addr(0);
     let sampler = sampler_for(opts);
+    // The same directory the ahead-of-time modules use; the keys cannot
+    // collide because they hash different things.
+    let jit_cache = use_cache
+        .then(gex_cache::cache_dir)
+        .flatten()
+        .map(|d| (d, build.clone()));
     // `/proc/self/exe` is the resolved program, not argv[0]: a shell that
     // re-executes itself relies on the difference.
     let exe_path = opts
@@ -573,6 +585,7 @@ fn run_program_with(
             engine: engine.clone(),
             linker: linker.clone(),
             table,
+            cache: jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
             limits: xlate.limits,
@@ -613,6 +626,7 @@ fn run_program_with(
     // one -- only the `gex.*` imports -- because a linker carrying store-bound
     // definitions could not be cloned into another thread.
     let spawn = Arc::new(SpawnContext {
+        jit_cache: jit_cache.clone(),
         sampler: sampler.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1031,6 +1045,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         Arc::new(ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&child_proc))))),
     );
     let child_cx = Arc::new(SpawnContext {
+        jit_cache: cx.jit_cache.clone(),
         // One profile for the whole process tree: a package manager spends
         // most of its time in programs it started.
         sampler: cx.sampler.clone(),
@@ -1139,6 +1154,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             engine: cx.engine.clone(),
             linker: cx.linker.clone(),
             table,
+            cache: cx.jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
             limits: cx.limits,
@@ -1244,6 +1260,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             engine: cx.engine.clone(),
             linker: cx.linker.clone(),
             table,
+            cache: cx.jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
             limits: cx.limits,
@@ -2115,8 +2132,29 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         let jit = caller.data().jit.as_ref().unwrap();
         jit.engine.clone()
     };
-    let module = Module::new(&engine, &translated_module.wasm)
-        .context("validating runtime-translated wasm")?;
+    // Cranelift is the expensive half of a miss -- the lift above takes
+    // milliseconds and this takes seconds -- and its output is a pure
+    // function of the wasm handed to it. So it is cached by the hash of
+    // exactly that, across runs and across processes.
+    //
+    // This matters far more than it looks. Only the executable is translated
+    // ahead of time; the interpreter and every shared library arrive through
+    // this path. Without the cache, every run of every dynamic program
+    // recompiles ld.so and libc from scratch -- `dpkg --version` loads its
+    // own module in 0.03s and then spends eight seconds here -- and a package
+    // manager forks a dozen such processes.
+    let cache = caller.data().jit.as_ref().and_then(|j| j.cache.clone());
+    let module = match cache {
+        Some((dir, build)) => {
+            let key = gex_cache::key(&build, [translated_module.wasm.as_slice()]);
+            let wasm = translated_module.wasm.clone();
+            gex_cache::load_or_compile(&engine, &dir, &key, move || Ok((wasm, Vec::new())))
+                .context("compiling runtime-translated wasm")?
+                .module
+        }
+        None => Module::new(&engine, &translated_module.wasm)
+            .context("validating runtime-translated wasm")?,
+    };
 
     // Publish first, install second. The store's watermark only ever advances
     // through `replay_registry`, so installing here as well would double-count
