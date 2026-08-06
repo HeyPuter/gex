@@ -1,0 +1,255 @@
+/* A dark console-shaped page. Two columns: a rail that names the demos and a
+   stage that is almost entirely terminal, because the terminal is the point. */
+
+:root {
+  --bg: #0b0d10;
+  --panel: #12151a;
+  --panel-2: #171b21;
+  --line: #232833;
+  --text: #d6dbe4;
+  --dim: #7d8797;
+  --accent: #6ee7a8;
+  --accent-dim: #2f6b4f;
+  --warn: #f0b866;
+  --bad: #f07a7a;
+  --radius: 10px;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 var(--mono);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  display: grid;
+  grid-template-columns: 290px 1fr;
+  height: 100%;
+}
+
+/* -- rail ---------------------------------------------------------------- */
+
+.rail {
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.brand {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 20px 18px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand .mark {
+  font-size: 26px;
+  line-height: 1;
+  color: var(--accent);
+  text-shadow: 0 0 24px rgba(110, 231, 168, 0.35);
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: 0.06em;
+}
+
+.brand p {
+  margin: 2px 0 0;
+  font-size: 11px;
+  color: var(--dim);
+  line-height: 1.35;
+}
+
+nav {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.demo {
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 11px 12px;
+  cursor: pointer;
+  font: inherit;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.demo:hover { background: var(--panel-2); }
+
+.demo[aria-current="true"] {
+  background: var(--panel-2);
+  border-color: var(--accent-dim);
+}
+
+.demo .n {
+  display: inline-block;
+  min-width: 18px;
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.demo .t { font-weight: 600; }
+
+.demo .d {
+  display: block;
+  margin-top: 3px;
+  padding-left: 18px;
+  font-size: 11px;
+  color: var(--dim);
+  line-height: 1.4;
+}
+
+.rail-foot {
+  border-top: 1px solid var(--line);
+  padding: 12px 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.stat {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.stat b { color: var(--text); font-weight: 500; }
+
+/* -- stage --------------------------------------------------------------- */
+
+main {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+header h2 { margin: 0; font-size: 15px; }
+
+header p {
+  margin: 3px 0 0;
+  font-size: 12px;
+  color: var(--dim);
+  max-width: 70ch;
+}
+
+.actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+button.act {
+  font: inherit;
+  font-size: 12px;
+  padding: 7px 13px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button.act:hover:not(:disabled) { border-color: var(--accent-dim); }
+button.act:disabled { opacity: 0.4; cursor: default; }
+
+button.act.primary {
+  border-color: var(--accent-dim);
+  background: rgba(110, 231, 168, 0.1);
+  color: var(--accent);
+}
+
+.stage {
+  position: relative;
+  min-height: 0;
+  padding: 12px 12px 0;
+}
+
+#terminal { height: 100%; }
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(11, 13, 16, 0.82);
+  backdrop-filter: blur(2px);
+}
+
+.overlay.hidden { display: none; }
+
+.overlay-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.overlay-card p { margin: 0; font-size: 13px; color: var(--dim); }
+
+.spinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 20px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.spacer { flex: 1; }
+#status.bad { color: var(--bad); }
+#status.good { color: var(--accent); }
+.hint { opacity: 0.75; }
+
+/* Narrow screens: the rail becomes a strip across the top. */
+@media (max-width: 820px) {
+  #app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  .rail { flex-direction: row; align-items: center; border-right: 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .brand p, .rail-foot, .demo .d { display: none; }
+  nav { flex-direction: row; }
+}

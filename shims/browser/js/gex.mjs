@@ -23,6 +23,16 @@ export class Env {
   }
   /** Nanoseconds since an arbitrary epoch. */
   now() { return BigInt(Math.round(performance.now() * 1e6)); }
+
+  /**
+   * Called when every guest thread is waiting for input. Resolve once some
+   * has been delivered with `pushStdin`, or return false to say there will
+   * never be any -- which is what a program reading to end-of-file needs.
+   *
+   * The default has no terminal behind it, so it says so straight away and a
+   * read returns zero.
+   */
+  async readStdin() { return false; }
 }
 
 /**
@@ -104,6 +114,9 @@ export class Gex {
     // region, above everything the guest maps. Nothing has run yet.
     this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
+    // A terminal changes how libc buffers and whether a shell prints a
+    // prompt, so a page with xterm.js in it has to say so.
+    if (opts.tty) this.#shim.exports.gex_set_tty(1);
     // A page has no user; an embedder that has one says so.
     if (opts.uid !== undefined) this.#shim.exports.gex_set_identity(opts.uid, opts.gid ?? opts.uid);
 
@@ -199,6 +212,17 @@ export class Gex {
    * Asynchronous because of the miss: instantiating a module is, and a page
    * may not compile one synchronously anyway beyond a few kilobytes.
    */
+  /** Hand the guest some standard input. Safe to call at any time. */
+  pushStdin(bytes) {
+    const p = this.#shim.exports.gex_alloc(bytes.length) >>> 0;
+    this.#u8.set(bytes, p);
+    this.#shim.exports.gex_push_stdin(p, bytes.length);
+    this.#shim.exports.gex_free(p, bytes.length);
+  }
+
+  /** Say there will be no more input. */
+  endStdin() { this.#shim.exports.gex_stdin_eof(); }
+
   async run(entry) {
     // Every switch, signal and miss leaves wasm by trapping, and V8 captures
     // a stack trace for each trap it turns into a RuntimeError. Nothing here
@@ -241,6 +265,21 @@ export class Gex {
           pc = next;
           const nextCtx = this.#shim.exports.gex_resume_ctx() >>> 0;
           if (nextCtx !== 0) ctx = nextCtx;
+          continue;
+        }
+        // Every thread is waiting for a keystroke. The guest gave the stack
+        // back so that this could happen at all: there is one wasm stack and
+        // no way to block on it, so waiting has to be done out here, where
+        // there is an event loop.
+        if (this.#shim.exports.gex_paused_for_input()) {
+          const more = await this.#env.readStdin();
+          if (more === false) this.endStdin();
+          if (this.#shim.exports.gex_wake() !== 1) {
+            return this.#shim.exports.gex_exit_code();
+          }
+          pc = this.#shim.exports.gex_resume_pc();
+          const wakeCtx = this.#shim.exports.gex_resume_ctx() >>> 0;
+          if (wakeCtx !== 0) ctx = wakeCtx;
           continue;
         }
         if (String(err).includes("unreachable")) {

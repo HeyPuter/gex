@@ -1,0 +1,198 @@
+// The demo page.
+//
+// Three demos, one terminal, one runtime. Each demo says what it needs (a
+// binary, a root filesystem, a network) and the shell around it handles the
+// fetching, the progress and the terminal.
+
+import '@xterm/xterm/css/xterm.css';
+import './style.css';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import { WebLinksAddon } from '@xterm/addon-web-links';
+import { loadRuntime, fetchBytes, runProgram } from './runtime.js';
+import { untar } from './tar.js';
+import { DEMOS } from './demos.js';
+
+const $ = (id) => document.getElementById(id);
+
+const ui = {
+  status: $('status'),
+  hint: $('hint'),
+  title: $('demo-title'),
+  blurb: $('demo-blurb'),
+  actions: $('actions'),
+  overlay: $('overlay'),
+  overlayText: $('overlay-text'),
+  engine: $('stat-engine'),
+  blocks: $('stat-blocks'),
+  net: $('stat-net'),
+};
+
+const term = new Terminal({
+  fontFamily: 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace',
+  fontSize: 13,
+  lineHeight: 1.25,
+  cursorBlink: true,
+  convertEol: true,
+  scrollback: 5000,
+  theme: {
+    background: '#0b0d10',
+    foreground: '#d6dbe4',
+    cursor: '#6ee7a8',
+    selectionBackground: '#2f3a46',
+    black: '#1a1e25', red: '#f07a7a', green: '#6ee7a8', yellow: '#f0b866',
+    blue: '#7aa2f7', magenta: '#bb9af7', cyan: '#7dcfff', white: '#c0caf5',
+  },
+});
+const fit = new FitAddon();
+term.loadAddon(fit);
+term.loadAddon(new WebLinksAddon());
+term.open($('terminal'));
+fit.fit();
+new ResizeObserver(() => {
+  try {
+    fit.fit();
+  } catch {
+    /* the element can be zero-sized mid-layout */
+  }
+}).observe($('terminal'));
+
+// -- the page's own chrome ------------------------------------------------
+
+const ansi = {
+  dim: (s) => `\x1b[2m${s}\x1b[0m`,
+  green: (s) => `\x1b[32m${s}\x1b[0m`,
+  red: (s) => `\x1b[31m${s}\x1b[0m`,
+  bold: (s) => `\x1b[1m${s}\x1b[0m`,
+};
+
+function status(text, kind = '') {
+  ui.status.textContent = text;
+  ui.status.className = kind;
+}
+
+function busy(text) {
+  ui.overlayText.textContent = text;
+  ui.overlay.classList.remove('hidden');
+}
+
+function idle() {
+  ui.overlay.classList.add('hidden');
+}
+
+function bytes(n) {
+  if (n > 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MiB`;
+  if (n > 1024) return `${(n / 1024).toFixed(0)} KiB`;
+  return `${n} B`;
+}
+
+// -- demo plumbing the demos share ---------------------------------------
+
+/** Fetch and unpack a rootfs tar, with progress on the overlay. */
+const rootfsCache = new Map();
+async function rootfs(url) {
+  if (rootfsCache.has(url)) return rootfsCache.get(url);
+  const buf = await fetchBytes(url, (got, total) => {
+    busy(total ? `fetching root filesystem — ${bytes(got)} of ${bytes(total)}` : `fetching root filesystem — ${bytes(got)}`);
+  });
+  busy('unpacking');
+  const tree = untar(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+  rootfsCache.set(url, tree);
+  return tree;
+}
+
+const ctx = {
+  term,
+  ansi,
+  status,
+  busy,
+  idle,
+  bytes,
+  rootfs,
+  fetchBytes,
+  runProgram,
+  setNet: (s) => {
+    ui.net.textContent = s;
+  },
+  setBlocks: (s) => {
+    ui.blocks.textContent = s;
+  },
+  actions(list) {
+    ui.actions.replaceChildren();
+    for (const a of list) {
+      const b = document.createElement('button');
+      b.className = `act${a.primary ? ' primary' : ''}`;
+      b.textContent = a.label;
+      b.onclick = a.onClick;
+      if (a.id) b.id = a.id;
+      ui.actions.append(b);
+    }
+  },
+  hint(text) {
+    ui.hint.textContent = text;
+  },
+};
+
+// -- routing --------------------------------------------------------------
+
+let current = null;
+let running = false;
+
+async function select(demo) {
+  if (running && !confirm('A program is still running. Leave it?')) return;
+  running = false;
+  current = demo;
+  for (const el of document.querySelectorAll('.demo')) {
+    el.setAttribute('aria-current', String(el.dataset.id === demo.id));
+  }
+  ui.title.textContent = demo.title;
+  ui.blurb.textContent = demo.blurb;
+  ctx.hint('');
+  ctx.setNet(demo.network ? 'wisp' : 'off');
+  term.reset();
+  location.hash = demo.id;
+  await demo.enter(ctx);
+}
+
+const nav = $('demos');
+DEMOS.forEach((d, i) => {
+  const b = document.createElement('button');
+  b.className = 'demo';
+  b.dataset.id = d.id;
+  b.innerHTML = `<span class="n">${String(i + 1).padStart(2, '0')}</span><span class="t"></span><span class="d"></span>`;
+  b.querySelector('.t').textContent = d.title;
+  b.querySelector('.d').textContent = d.blurb;
+  b.onclick = () => select(d);
+  nav.append(b);
+});
+
+// -- start ----------------------------------------------------------------
+
+(async function start() {
+  ui.engine.textContent = navigator.userAgent.includes('Firefox') ? 'spidermonkey' : 'v8';
+  term.writeln(ansi.bold('gex') + ansi.dim(' — AArch64 Linux programs, recompiled to WebAssembly'));
+  term.writeln('');
+  busy('fetching the runtime');
+  try {
+    const { shimBytes, seedBytes } = await loadRuntime((got, total) => {
+      busy(total ? `fetching the runtime — ${bytes(got)} of ${bytes(total)}` : `fetching the runtime — ${bytes(got)}`);
+    });
+    term.writeln(ansi.dim(`  runtime ${bytes(shimBytes.length)}, seed module ${bytes(seedBytes.length)}`));
+    term.writeln(ansi.dim('  the seed translates nothing; every block is compiled on first use'));
+    term.writeln('');
+    status('ready', 'good');
+  } catch (e) {
+    term.writeln(ansi.red(`could not load the runtime: ${e.message}`));
+    status(String(e.message), 'bad');
+  } finally {
+    idle();
+  }
+  const want = DEMOS.find((d) => d.id === location.hash.slice(1)) || DEMOS[0];
+  await select(want);
+})();
+
+// Demos declare when they start and stop so navigation can warn.
+window.addEventListener('gex:running', (e) => {
+  running = e.detail;
+});
+void current;

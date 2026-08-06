@@ -49,7 +49,8 @@ use gex_kernel::errno::{Errno, SysResult};
 use gex_kernel::file::OpenFile;
 use gex_kernel::vfs::{FileHandle, Metadata};
 use gex_kernel::{GuestMem, Kernel, SyscallOutcome, ThreadState};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 // The two things wasm cannot do for itself. Everything else about a syscall
@@ -73,20 +74,41 @@ fn browser_clock() -> (u64, u32) {
     (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
 }
 
-/// Standard input, as bytes the embedder supplied before the guest started.
+/// The guest's standard input, as a queue the page appends to.
 ///
-/// A page has nothing to block on -- no terminal, no pipe -- so stdin is
-/// whatever was handed over up front, and reads past the end return zero the
-/// way a closed pipe does. That is enough for the programs that read stdin at
-/// all: `sqlite3` taking a script, a filter reading a document.
-#[derive(Debug)]
-struct StdinBytes(Vec<u8>);
+/// A page that hands over a fixed buffer up front can run a filter. A page
+/// with a terminal in it cannot: the bytes do not exist until someone types
+/// them, and a shell asks for them long before that. So this is a queue --
+/// `gex_push_stdin` adds to it, a read takes from it, and a read that finds
+/// it empty parks the calling thread until it is not (see `Waiting::Read`).
+///
+/// `eof` is the difference between "nothing yet" and "nothing ever". Without
+/// it a shell reading its script from stdin waits forever at the end instead
+/// of exiting.
+#[derive(Debug, Default)]
+struct StdinQueue {
+    bytes: RefCell<VecDeque<u8>>,
+    eof: Cell<bool>,
+}
 
-impl FileHandle for StdinBytes {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
-        let start = (offset as usize).min(self.0.len());
-        let n = buf.len().min(self.0.len() - start);
-        buf[..n].copy_from_slice(&self.0[start..start + n]);
+impl StdinQueue {
+    fn push(&self, data: &[u8]) {
+        self.bytes.borrow_mut().extend(data.iter().copied());
+    }
+}
+
+// The browser shim is single-threaded by construction; `SingleThreaded` is
+// the wrapper the rest of this file uses to say so.
+unsafe impl Send for StdinQueue {}
+unsafe impl Sync for StdinQueue {}
+
+impl FileHandle for StdinQueue {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
+        let mut q = self.bytes.borrow_mut();
+        let n = buf.len().min(q.len());
+        for (i, b) in q.drain(..n).enumerate() {
+            buf[i] = b;
+        }
         Ok(n as u64)
     }
 
@@ -96,12 +118,28 @@ impl FileHandle for StdinBytes {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(Metadata {
-            file_type: gex_kernel::vfs::FileType::Fifo,
-            size: self.0.len() as u64,
-            mode: 0o400,
+            file_type: gex_kernel::vfs::FileType::CharDevice,
+            size: 0,
+            mode: 0o600,
             ino: 2,
             mtime: 0,
         })
+    }
+
+    fn is_stream(&self) -> bool {
+        true
+    }
+
+    /// A terminal, when the page says there is one. musl line-buffers stdout
+    /// on a tty, and a shell will not print a prompt without one.
+    fn is_tty(&self) -> bool {
+        unsafe { STDIN_TTY }
+    }
+
+    /// Nothing typed yet is a wait, unless the page has said there will be no
+    /// more.
+    fn poll_readable(&self) -> bool {
+        self.eof.get() || !self.bytes.borrow().is_empty()
     }
 }
 
@@ -223,8 +261,45 @@ enum Waiting {
     },
     /// Sleeping until this many nanoseconds on the host clock.
     Sleep(u64),
+    /// Waiting on a stream with nothing in it: a terminal nobody has typed at
+    /// yet. Ready as soon as the handle says a read would return.
+    Read(Arc<dyn gex_kernel::vfs::FileHandle>),
     /// Finished; the slot stays so a `join` can still find the tid.
     Exited,
+}
+
+/// A parent process, frozen while its child runs.
+///
+/// There is one address space here and no way to make a second: a guest
+/// address is a byte offset into the page's wasm memory, and a page gets one
+/// memory. So `fork` is done by checkpoint. The parent's memory, kernel and
+/// threads are copied aside, the child runs in place, and when the child
+/// exits the parent is put back exactly as it was, with the child's pid
+/// already in `x0` where the kernel wrote it before any of this started.
+///
+/// What this buys is the whole of a Unix userspace in a page: a shell that
+/// starts real processes, a pipeline, `make`, `apt`. What it costs is
+/// concurrency -- the parent cannot run while the child does. For the shape
+/// every shell has, `fork` then immediately `wait`, that is not a
+/// restriction. For a parent that forks and then keeps working it is, and it
+/// shows up as the parent simply not running until the child is done.
+struct Suspended {
+    pid: i32,
+    /// Guest memory as it was, region by region. Includes the register
+    /// contexts and the dispatch directory, which live below the image and
+    /// are not in the memory map.
+    snapshot: Vec<(u64, Vec<u8>)>,
+    kernel: Kernel,
+    threads: Vec<Thread>,
+    current: usize,
+    /// Where the parent resumes: the instruction after its `clone`.
+    resume_pc: u64,
+    resume_ctx: u64,
+    /// The dispatch directory as the parent left it. A child that execs a
+    /// different program translates different code into the same slots, so
+    /// without this the parent comes back dispatching into its child's.
+    page_table: gex_xlate::PageTable,
+    translated: std::collections::HashSet<u64>,
 }
 
 /// One guest thread.
@@ -287,6 +362,13 @@ struct Host {
     resume: Option<u64>,
     /// Set alongside `resume` when the scheduler switched threads.
     resume_ctx: Option<u64>,
+    /// Parents waiting for a child to finish, innermost last. A shell that
+    /// runs a pipeline is two deep.
+    suspended: Vec<Suspended>,
+    /// Set when the scheduler gave the stack back to JS because every thread
+    /// is waiting for input. Not an exit: the page is expected to deliver
+    /// some and call `gex_wake`.
+    stdin_wanted: bool,
     jit: Jit,
 }
 
@@ -358,6 +440,20 @@ pub extern "C" fn gex_alloc(len: usize) -> u32 {
     p
 }
 
+/// Give back an allocation from [`gex_alloc`].
+///
+/// The setup calls allocate once and never care; interactive input is the
+/// case that does, because it allocates per keystroke and a page stays open.
+///
+/// # Safety
+/// `ptr` and `len` must be exactly what a previous `gex_alloc` returned.
+#[no_mangle]
+pub unsafe extern "C" fn gex_free(ptr: u32, len: usize) {
+    if ptr != 0 && len != 0 {
+        drop(Vec::from_raw_parts(ptr as *mut u8, len, len));
+    }
+}
+
 /// Load a static ELF that JS has written at `ptr`, place it and its stack, and
 /// return the entry point. Zero means the image could not be loaded.
 #[no_mangle]
@@ -421,7 +517,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     let _ = kernel.fds.install(
         0,
         OpenFile::new(
-            Arc::new(StdinBytes(std::mem::take(&mut *STDIN.0.borrow_mut()))),
+            Arc::clone(&*STDIN) as Arc<dyn FileHandle>,
             "/dev/stdin".to_string(),
             0,
             true,
@@ -538,6 +634,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             exit: None,
             resume: None,
             resume_ctx: None,
+            suspended: Vec::new(),
+            stdin_wanted: false,
             jit: Jit {
                 described: meta.next_slot != 0,
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
@@ -679,13 +777,89 @@ pub extern "C" fn gex_set_cwd(ptr: u32, len: u32) {
 }
 
 /// Standard input, staged until the guest is loaded.
-static STDIN: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+/// The one stdin queue, reachable both from the descriptor the kernel holds
+/// and from the exports the page calls.
+static STDIN: StdinHandle = StdinHandle(std::sync::LazyLock::new(|| Arc::new(StdinQueue::default())));
+
+struct StdinHandle(std::sync::LazyLock<Arc<StdinQueue>>);
+unsafe impl Sync for StdinHandle {}
+impl std::ops::Deref for StdinHandle {
+    type Target = Arc<StdinQueue>;
+    fn deref(&self) -> &Arc<StdinQueue> {
+        &self.0
+    }
+}
+
+/// Whether stdin should report itself a terminal.
+static mut STDIN_TTY: bool = false;
+
+/// Append what the user typed. The page calls this from its keyboard handler,
+/// between runs of the guest.
+#[no_mangle]
+pub extern "C" fn gex_push_stdin(ptr: u32, len: u32) {
+    STDIN.push(shim_slice(ptr, len));
+}
+
+/// There will be no more input. A read that finds the queue empty returns
+/// zero from here on rather than waiting.
+#[no_mangle]
+pub extern "C" fn gex_stdin_eof() {
+    STDIN.eof.set(true);
+}
+
+/// Whether the guest stopped because it is waiting for input rather than
+/// because it finished.
+///
+/// A page with a terminal in it needs to tell the two apart: one means "show
+/// a cursor and wait", the other means "the program is over". Both arrive in
+/// JS the same way -- the guest gives up the wasm stack -- so the difference
+/// has to be asked for.
+#[no_mangle]
+pub extern "C" fn gex_paused_for_input() -> i32 {
+    with_host(|h| h.stdin_wanted as i32)
+}
+
+/// Carry on after input has arrived: pick a thread and say where to re-enter.
+///
+/// Returns 1 when there is somewhere to go, 2 when the guest is finished.
+#[no_mangle]
+pub extern "C" fn gex_wake() -> i32 {
+    with_host(|h| h.stdin_wanted = false);
+    schedule()
+}
 
 /// Hand the guest its standard input, from `len` bytes at `ptr` in the shim's
 /// own region. Call before `gex_load`.
 #[no_mangle]
 pub extern "C" fn gex_set_stdin(ptr: u32, len: u32) {
-    *STDIN.0.borrow_mut() = shim_slice(ptr, len).to_vec();
+    STDIN.push(shim_slice(ptr, len));
+    // A page that hands over the whole of stdin at once is not going to type
+    // any more, and a guest that reads to the end must see the end.
+    STDIN.eof.set(true);
+}
+
+/// The guest's current `c_lflag`, so the page can follow it between cooked
+/// and raw mode.
+///
+/// Bit 1 is ICANON and bit 3 is ECHO. While they are set the page does the
+/// line editing -- collect a line, echo it, deliver it on Enter. When the
+/// guest clears them it has taken over, and the page must pass keystrokes
+/// through untouched and echo nothing.
+#[no_mangle]
+pub extern "C" fn gex_tty_lflag() -> u32 {
+    with_host(|h| u32::from_le_bytes(h.kernel.termios[12..16].try_into().unwrap()))
+}
+
+/// Tell the guest how big the terminal is.
+#[no_mangle]
+pub extern "C" fn gex_set_winsize(rows: u32, cols: u32) {
+    with_host(|h| h.kernel.winsize = (rows as u16, cols as u16));
+}
+
+/// Say that stdin is a terminal, which is what makes a shell print a prompt.
+#[no_mangle]
+pub extern "C" fn gex_set_tty(on: i32) {
+    unsafe { STDIN_TTY = on != 0 };
 }
 
 #[no_mangle]
@@ -774,6 +948,7 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                 h.resume = Some(target);
                 1
             }
+            SyscallOutcome::Exit(code) if !h.suspended.is_empty() => resume_parent(h, code),
             SyscallOutcome::Exit(code) => {
                 h.exit = Some(code);
                 2
@@ -821,9 +996,15 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                         deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
                     },
                     gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
-                    // Without `fork` there are no children to wait for, so
-                    // this can only be a wait that would never return.
-                    gex_kernel::BlockOp::WaitChild { .. } => Waiting::Exited,
+                    gex_kernel::BlockOp::ReadStream { handle, .. } => {
+                        Waiting::Read(Arc::clone(handle))
+                    }
+                    // A child always finishes before its parent runs again --
+                    // that is what the checkpoint means -- so a `wait4` that
+                    // reaches here is asking about a child whose status is
+                    // already in the table, or about nobody at all. Either
+                    // way it is answered immediately rather than parked.
+                    gex_kernel::BlockOp::WaitChild { .. } => Waiting::Runnable,
                 };
                 let t = &mut h.threads[h.current];
                 t.pc = pc as u64 + 4;
@@ -831,8 +1012,35 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                 t.blocked_on = Some(op);
                 3
             }
-            // `fork` and `execve` need a second address space, which a page
-            // has no way to give them. Saying so beats hanging.
+            SyscallOutcome::SpawnProcess {
+                pid,
+                child_stack,
+                tls,
+            } => {
+                do_fork(h, pid, pc as u64, child_stack, tls);
+                // The child is on this stack already, at the instruction
+                // after the `clone`. Nothing to switch to.
+                0
+            }
+            SyscallOutcome::Exec { path, argv, envp } => {
+                let entry = do_exec(h, &path, &argv, &envp);
+                if entry == 0 {
+                    // The kernel checked the path before saying `Exec`, so a
+                    // failure here is the loader's: not an ELF, or one this
+                    // cannot place. `ENOEXEC` is what the guest expects.
+                    let mut gm = GuestMem::new(guest_bytes());
+                    let ctx_addr = h.threads[h.current].kstate.ctx_addr;
+                    let _ = gm.write_u64(
+                        ctx_addr + ctx::x(0) as u64,
+                        Errno::ENOEXEC.as_return(),
+                    );
+                    0
+                } else {
+                    h.resume = Some(entry);
+                    h.resume_ctx = Some(h.threads[h.current].kstate.ctx_addr);
+                    1
+                }
+            }
             _ => {
                 h.exit = Some(128 + 31);
                 2
@@ -850,6 +1058,216 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
     if stop != 0 {
         trap();
     }
+}
+
+
+/// Everything below the guest's image: the register contexts, the exclusive
+/// monitor scratch, and the dispatch directory. None of it is in the memory
+/// map, and all of it is per-process.
+const LOW_END: u64 = gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4;
+
+/// Copy out every part of guest memory a process owns.
+fn snapshot_memory(h: &Host) -> Vec<(u64, Vec<u8>)> {
+    let data = guest_bytes();
+    let mut out = vec![(0u64, data[..LOW_END as usize].to_vec())];
+    for v in h.kernel.mem.vmas() {
+        let (a, b) = (v.start as usize, (v.end as usize).min(data.len()));
+        if a < b {
+            out.push((v.start, data[a..b].to_vec()));
+        }
+    }
+    out
+}
+
+fn restore_memory(snapshot: &[(u64, Vec<u8>)]) {
+    let data = guest_bytes();
+    for (at, bytes) in snapshot {
+        let a = *at as usize;
+        let b = (a + bytes.len()).min(data.len());
+        if a < b {
+            data[a..b].copy_from_slice(&bytes[..b - a]);
+        }
+    }
+}
+
+/// `fork`: freeze the parent and carry on as the child.
+///
+/// The child needs no new stack and no scheduler switch -- it is this very
+/// thread, in this very address space, with `x0` changed from the child's pid
+/// to zero. Everything that makes it a *different* process is in what got put
+/// aside.
+fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) {
+    let ctx_addr = h.threads[h.current].kstate.ctx_addr;
+    let snapshot = snapshot_memory(h);
+    let mut child_kernel = h.kernel.fork_kernel();
+    child_kernel.pid = pid;
+    child_kernel.tid = pid;
+    let parent_kernel = std::mem::replace(&mut h.kernel, child_kernel);
+    h.suspended.push(Suspended {
+        pid,
+        snapshot,
+        kernel: parent_kernel,
+        threads: std::mem::take(&mut h.threads),
+        current: h.current,
+        resume_pc: pc + 4,
+        resume_ctx: ctx_addr,
+        page_table: h.jit.page_table.clone(),
+        translated: h.jit.translated.clone(),
+    });
+    // The child is this thread, renumbered, and alone: `fork` does not carry
+    // the parent's other threads across.
+    h.threads = vec![Thread {
+        kstate: ThreadState::new(ctx_addr, pid),
+        pc: pc + 4,
+        waiting: Waiting::Runnable,
+        blocked_on: None,
+    }];
+    h.current = 0;
+    let mut gm = GuestMem::new(guest_bytes());
+    // What `fork` returns in the child.
+    let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
+    if child_stack != 0 {
+        let _ = gm.write_u64(ctx_addr + ctx::SP as u64, child_stack);
+    }
+    if let Some(tls) = tls {
+        let _ = gm.write_u64(ctx_addr + ctx::TPIDR as u64, tls);
+    }
+    // A monitor is per-thread and the child's starts clear.
+    let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
+}
+
+/// A child has finished. Put its parent back and let it see the status.
+///
+/// Returns 1 when there is a parent to resume, 2 when this was the last
+/// process and the page's run is over.
+fn resume_parent(h: &mut Host, code: i32) -> i32 {
+    let Some(p) = h.suspended.pop() else {
+        h.exit = Some(code);
+        return 2;
+    };
+    // Published before the memory goes back, because the table is shared
+    // between the two kernels and this is the only record the parent's
+    // `wait4` will find.
+    h.kernel.procs.exit(p.pid, code);
+    restore_memory(&p.snapshot);
+    h.kernel = p.kernel;
+    h.threads = p.threads;
+    h.current = p.current;
+    // The parent's pages keep the slots they had -- its directory, just
+    // restored, names them -- but allocation carries on from wherever the
+    // child got to. Rewinding the mark would hand the parent's next
+    // translation slots the child is still using, and the parent would
+    // dispatch one page's code from another page's directory entry.
+    let mark = h.jit.page_table.slots();
+    h.jit.page_table = p.page_table;
+    h.jit.page_table.advance_to(mark);
+    h.jit.translated = p.translated;
+    h.resume = Some(p.resume_pc);
+    h.resume_ctx = Some(p.resume_ctx);
+    1
+}
+
+/// `execve`: replace this process's image with another program's.
+///
+/// Everything about the process that is not the image survives -- pid,
+/// parent, descriptors that are not close-on-exec, the working directory --
+/// which is what makes the shell's fork-then-exec work at all.
+///
+/// Returns the entry point, or zero if the program could not be loaded, in
+/// which case the caller has already been given an errno.
+fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
+    let Some(bytes) = h.kernel.read_file(path) else {
+        return 0;
+    };
+    let read = |p: &str| h.kernel.read_file(p);
+    let program = match gex_ld::load_program(&bytes, gex_abi::PIE_BASE, INTERP_BASE, &read) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    h.kernel.close_on_exec();
+    h.kernel.mem = gex_kernel::mem::MemoryMap::new(program.brk());
+    h.kernel.exe_path = path.to_string();
+    h.kernel.argv = argv.to_vec();
+    h.kernel.envp = envp.to_vec();
+    h.kernel.live_threads = 1;
+    h.kernel.next_ctx_slot = 1;
+    // Signal handlers do not survive an exec; the mask does.
+    h.kernel.signals = gex_kernel::signal::Signals::new();
+
+    let data = guest_bytes();
+    // The new image goes where its own headers say, which for a static
+    // executable is the same place the old one was.
+    for seg in program.segments() {
+        let (a, b) = (seg.vaddr as usize, (seg.vaddr + seg.mem_size) as usize);
+        if b > data.len() {
+            return 0;
+        }
+        data[a..b].fill(0);
+        data[a..a + seg.bytes.len()].copy_from_slice(&seg.bytes);
+        let mut prot = 0;
+        if seg.readable {
+            prot |= gex_kernel::mem::prot::READ;
+        }
+        if seg.writable {
+            prot |= gex_kernel::mem::prot::WRITE;
+        }
+        if seg.executable {
+            prot |= gex_kernel::mem::prot::EXEC;
+        }
+        h.kernel
+            .mem
+            .insert(seg.vaddr, seg.vaddr + seg.mem_size, prot, "[image]");
+    }
+    let layout = gex_ld::build_initial_stack(
+        &program.exe,
+        GUEST_LIMIT,
+        argv,
+        envp,
+        *b"gexdeterministic",
+        gex_ld::Identity {
+            uid: unsafe { IDENTITY.0 },
+            gid: unsafe { IDENTITY.1 },
+            interp_base: program.interp_base(),
+        },
+    );
+    let start = layout.low as usize;
+    data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
+    h.kernel.mem.insert(
+        GUEST_LIMIT - gex_abi::STACK_SIZE,
+        GUEST_LIMIT,
+        gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE,
+        "[stack]",
+    );
+
+    // The new program's pages have nothing translated for them, and anything
+    // the old one left in the directory is code at the same addresses doing
+    // something else entirely. Clearing it sends every branch back through
+    // the miss stub, which is where a fresh translation comes from.
+    data[gex_abi::DISPATCH_DIR as usize..LOW_END as usize].fill(0);
+    // Slots already handed out are never reused -- a page that comes back
+    // through a `fork` checkpoint still points at its own -- so allocation
+    // carries on from the high-water mark rather than restarting.
+    h.jit.page_table = gex_xlate::PageTable::from_entries(&[], h.jit.page_table.slots());
+    h.jit.translated.clear();
+
+    let ctx_addr = h.threads[h.current].kstate.ctx_addr;
+    let c = ctx_addr as usize;
+    for i in 0..31u8 {
+        write_u64(data, c + ctx::x(i), 0);
+    }
+    write_u64(data, c + ctx::SP, layout.sp);
+    write_u64(data, c + ctx::PC, program.entry());
+    write_u64(data, c + ctx::MON_SIZE, 0);
+    data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
+        .copy_from_slice(&1024i32.to_le_bytes());
+    h.threads = vec![Thread {
+        kstate: ThreadState::new(ctx_addr, h.kernel.pid),
+        pc: program.entry(),
+        waiting: Waiting::Runnable,
+        blocked_on: None,
+    }];
+    h.current = 0;
+    program.entry()
 }
 
 /// Nanoseconds on the host clock.
@@ -893,6 +1311,7 @@ fn schedule() -> i32 {
                         parked.woken() || deadline.is_some_and(|d| now >= d)
                     }
                     Waiting::Sleep(d) => now >= *d,
+                    Waiting::Read(handle) => handle.poll_readable(),
                     Waiting::Exited => false,
                 };
                 if ready {
@@ -912,6 +1331,13 @@ fn schedule() -> i32 {
             return 2;
         };
         let Some((i, timed_out)) = pick else {
+            // A thread waiting for input is not stuck: the page will deliver
+            // some. Give the stack back to JS so it can, and come back here
+            // when it has.
+            if with_host(|h| h.threads.iter().any(|t| matches!(t.waiting, Waiting::Read(_)))) {
+                with_host(|h| h.stdin_wanted = true);
+                return 2;
+            }
             if with_host(|h| {
                 h.threads
                     .iter()
@@ -944,7 +1370,7 @@ fn schedule() -> i32 {
                 // whichever thread it thinks is running.
                 let mut gm = GuestMem::new(guest_bytes());
                 h.kernel.enter_thread(&kstate);
-                let r = finish_parked(&op, timed_out);
+                let r = finish_parked(&op, timed_out, &mut gm);
                 let outcome = h.kernel.finish_blocking(&mut gm, r);
                 h.kernel.leave_thread(&mut h.threads[h.current].kstate);
                 if let SyscallOutcome::Exit(code) = outcome {
@@ -971,11 +1397,47 @@ fn schedule() -> i32 {
 ///
 /// A woken futex returns zero and the guest re-checks its own condition, the
 /// same as on Linux, where a wake is never a promise about the word.
-fn finish_parked(op: &gex_kernel::BlockOp, timed_out: bool) -> Result<u64, Errno> {
+fn finish_parked(
+    op: &gex_kernel::BlockOp,
+    timed_out: bool,
+    gm: &mut GuestMem<'_>,
+) -> Result<u64, Errno> {
     match op {
         gex_kernel::BlockOp::FutexWait { .. } if timed_out => Err(Errno::ETIMEDOUT),
         gex_kernel::BlockOp::FutexWait { .. } | gex_kernel::BlockOp::Sleep(_) => Ok(0),
-        gex_kernel::BlockOp::WaitChild { .. } => Err(Errno::ECHILD),
+        // The read the guest asked for happens now, into the buffer it named.
+        // Doing it here rather than re-executing the instruction is what keeps
+        // the guest's pc moving forward: a syscall that parks is finished by
+        // the scheduler, never retried.
+        gex_kernel::BlockOp::ReadStream { handle, buf, len } => {
+            let mut tmp = vec![0u8; *len];
+            let n = handle.read_at(0, &mut tmp)?;
+            gm.write(*buf, &tmp[..n as usize])?;
+            Ok(n)
+        }
+        gex_kernel::BlockOp::WaitChild {
+            children,
+            procs,
+            want,
+            wstatus,
+            ..
+        } => {
+            for c in children {
+                if *want > 0 && c.pid != *want {
+                    continue;
+                }
+                let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(code) = st.take() {
+                    c.reaped.store(true, std::sync::atomic::Ordering::Release);
+                    procs.reap(c.pid);
+                    if *wstatus != 0 {
+                        gm.write_u32(*wstatus, ((code as u32) & 0xff) << 8)?;
+                    }
+                    return Ok(c.pid as u64);
+                }
+            }
+            Err(Errno::ECHILD)
+        }
     }
 }
 
@@ -1120,6 +1582,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                         parked.woken() || deadline.is_some_and(|d| now >= d)
                     }
                     Waiting::Sleep(d) => now >= *d,
+                    Waiting::Read(handle) => handle.poll_readable(),
                     Waiting::Exited => false,
                 }
         });

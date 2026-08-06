@@ -209,6 +209,19 @@ pub enum BlockOp {
         deadline: Option<std::time::Duration>,
     },
     Sleep(std::time::Duration),
+    /// A `read` on a stream with nothing in it yet: a terminal nobody has
+    /// typed at, a socket with nothing arrived.
+    ///
+    /// The handle travels with the operation so the host can both ask whether
+    /// it has become readable and perform the read once it has, without
+    /// holding the kernel meanwhile. On a host with real threads that is a
+    /// poll; in the browser, where there is one wasm stack, it is the only
+    /// way a shell can wait for a keystroke at all.
+    ReadStream {
+        handle: Arc<dyn crate::vfs::FileHandle>,
+        buf: u64,
+        len: usize,
+    },
     /// `wait4`. Blocks until one of `children` has a status to collect.
     WaitChild {
         children: Vec<ChildHandle>,
@@ -279,6 +292,18 @@ pub struct Kernel {
     pub ppid: i32,
     /// How to read the wall clock.
     pub clock: ClockFn,
+    /// The terminal's size, as rows and columns. A page resizes.
+    pub winsize: (u16, u16),
+    /// The terminal settings, when there is a terminal.
+    ///
+    /// A `struct termios` as the guest sees it, kept whole rather than
+    /// decoded: nothing here acts on the flags, but the *host* does. A page
+    /// with a terminal has to know whether the guest has turned off echo and
+    /// canonical input, because if it has then the guest is doing its own
+    /// line editing and the page must stop doing its own -- otherwise every
+    /// keystroke appears twice. Returning success from `TCSETS` while
+    /// discarding what it set is how that goes wrong quietly.
+    pub termios: [u8; 60],
 }
 
 /// How the host tells the time: seconds and nanoseconds since the epoch.
@@ -313,6 +338,29 @@ fn set_id(slot: &mut u32, want: u64) -> SysResult {
     }
     Ok(0)
 }
+
+/// A terminal in the mode a shell finds it in: echo on, input line at a time.
+///
+/// The flag words are what Linux hands back for a fresh pty. libc reads
+/// `c_lflag` to decide whether a descriptor is a terminal at all, and musl
+/// line-buffers stdout when it is.
+pub const COOKED_TERMIOS: [u8; 60] = {
+    let mut t = [0u8; 60];
+    // c_iflag: ICRNL | IXON | BRKINT | ...
+    let iflag = 0x2502u32.to_le_bytes();
+    let oflag = 0x5u32.to_le_bytes(); // OPOST | ONLCR
+    let cflag = 0xbfu32.to_le_bytes(); // B38400 | CS8 | CREAD
+    let lflag = 0x8a3bu32.to_le_bytes(); // ISIG | ICANON | ECHO | ECHOE | ...
+    t[0] = iflag[0]; t[1] = iflag[1]; t[2] = iflag[2]; t[3] = iflag[3];
+    t[4] = oflag[0]; t[5] = oflag[1]; t[6] = oflag[2]; t[7] = oflag[3];
+    t[8] = cflag[0]; t[9] = cflag[1]; t[10] = cflag[2]; t[11] = cflag[3];
+    t[12] = lflag[0]; t[13] = lflag[1]; t[14] = lflag[2]; t[15] = lflag[3];
+    t
+};
+
+/// `c_lflag`'s ICANON and ECHO, the two the host has to follow.
+pub const ICANON: u32 = 0x2;
+pub const ECHO: u32 = 0x8;
 
 /// A child process the kernel is tracking.
 #[derive(Debug)]
@@ -445,6 +493,8 @@ impl Kernel {
             procs: Arc::new(ProcTable::new()),
             ppid: 0,
             clock: system_clock,
+            winsize: (24, 80),
+            termios: COOKED_TERMIOS,
         }
     }
 
@@ -560,6 +610,8 @@ impl Kernel {
             procs: Arc::clone(&self.procs),
             ppid: self.pid,
             clock: self.clock,
+            winsize: self.winsize,
+            termios: self.termios,
         }
     }
 
@@ -819,6 +871,17 @@ impl Kernel {
     /// whole purpose is to wait for another thread.
     fn blocking_op(&mut self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
         match n {
+            nr::READ => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if !file.would_block() {
+                    return None;
+                }
+                Some(BlockOp::ReadStream {
+                    handle: Arc::clone(&file.handle),
+                    buf: a[1],
+                    len: a[2].min(1 << 24) as usize,
+                })
+            }
             nr::FUTEX => {
                 let operation =
                     (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
@@ -1468,35 +1531,44 @@ impl Kernel {
     fn sys_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> SysResult {
         const TCGETS: u64 = 0x5401;
         const TCSETS: u64 = 0x5402;
+        const TCSETSW: u64 = 0x5403;
+        const TCSETSF: u64 = 0x5404;
         const TIOCGWINSZ: u64 = 0x5413;
         const FIONREAD: u64 = 0x541b;
         const TIOCGPGRP: u64 = 0x540f;
+        const TIOCSPGRP: u64 = 0x5410;
+        const TIOCSWINSZ: u64 = 0x5414;
         let file = self.fds.get(fd)?;
         let is_tty = file.is_tty();
         match req {
             TCGETS if is_tty => {
-                // A plausible cooked-mode termios keeps isatty and the
-                // line-buffering decision correct.
-                let mut t = [0u8; 60];
-                t[0..4].copy_from_slice(&0x2502u32.to_le_bytes()); // c_iflag
-                t[4..8].copy_from_slice(&0x5u32.to_le_bytes()); // c_oflag
-                t[8..12].copy_from_slice(&0xbfu32.to_le_bytes()); // c_cflag
-                t[12..16].copy_from_slice(&0x8a3bu32.to_le_bytes()); // c_lflag
-                m.write(arg, &t)?;
+                m.write(arg, &self.termios)?;
                 Ok(0)
             }
-            TCSETS if is_tty => Ok(0),
+            // Kept, not discarded. A shell that turns off ICANON and ECHO is
+            // taking over line editing, and the host has to stop doing its
+            // own or every keystroke lands twice.
+            TCSETS | TCSETSW | TCSETSF if is_tty => {
+                let mut t = [0u8; 60];
+                t.copy_from_slice(m.read(arg, 60)?);
+                self.termios = t;
+                Ok(0)
+            }
             TIOCGWINSZ if is_tty => {
                 let mut ws = [0u8; 8];
-                ws[0..2].copy_from_slice(&24u16.to_le_bytes());
-                ws[2..4].copy_from_slice(&80u16.to_le_bytes());
+                ws[0..2].copy_from_slice(&self.winsize.0.to_le_bytes());
+                ws[2..4].copy_from_slice(&self.winsize.1.to_le_bytes());
                 m.write(arg, &ws)?;
                 Ok(0)
             }
             TIOCGPGRP if is_tty => {
-                m.write_u32(arg, self.pid as u32)?;
+                m.write_u32(arg, self.procs.pgid(self.pid, 0).unwrap_or(self.pid) as u32)?;
                 Ok(0)
             }
+            // A shell claiming the terminal for a job. There is one terminal
+            // and no contest for it, so this only has to not fail.
+            TIOCSPGRP if is_tty => Ok(0),
+            TIOCSWINSZ if is_tty => Ok(0),
             FIONREAD => {
                 let md = file.metadata()?;
                 let remaining = md.size.saturating_sub(file.offset());

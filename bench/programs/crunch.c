@@ -10,7 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define N 20000
+/* Small enough to stay in cache. This started at 20000 longs -- a 160 KB
+   working set -- and on a shared machine that makes the benchmark a measure
+   of how much cache everything else is using: two identical builds compared
+   against each other read anywhere from 0.94 to 1.00. The instruction mix is
+   what this program is for, not the memory traffic, so the array shrinks and
+   the round count rises to keep the same amount of work. */
+#define N 2048
 
 static uint64_t heapsort_sum(uint64_t seed, int rounds) {
     static long a[N];
@@ -101,8 +107,8 @@ static uint64_t crypt(int rounds) {
 
 int main(int argc, char **argv) {
     int scale = argc > 1 ? atoi(argv[1]) : 1;
-    printf("%llu\n", (unsigned long long)heapsort_sum(1, 60 * scale));
-    printf("%llu\n", (unsigned long long)bitfield(200 * scale));
+    printf("%llu\n", (unsigned long long)heapsort_sum(1, 800 * scale));
+    printf("%llu\n", (unsigned long long)bitfield(2000 * scale));
     printf("%llu\n", (unsigned long long)crypt(4000000 * scale));
     return 0;
 }

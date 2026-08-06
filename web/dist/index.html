@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>gex — AArch64 Linux in the browser</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>▚</text></svg>" />
+    <script type="module" crossorigin src="/assets/index-Dq4bINR9.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-lslV5zF4.css">
+  </head>
+  <body>
+    <div id="app">
+      <aside class="rail">
+        <div class="brand">
+          <span class="mark">▚</span>
+          <div>
+            <h1>gex</h1>
+            <p>AArch64 Linux, recompiled to WebAssembly</p>
+          </div>
+        </div>
+
+        <nav id="demos"></nav>
+
+        <div class="rail-foot">
+          <div class="stat"><span>engine</span><b id="stat-engine">—</b></div>
+          <div class="stat"><span>translated</span><b id="stat-blocks">—</b></div>
+          <div class="stat"><span>network</span><b id="stat-net">off</b></div>
+        </div>
+      </aside>
+
+      <main>
+        <header>
+          <div>
+            <h2 id="demo-title">—</h2>
+            <p id="demo-blurb"></p>
+          </div>
+          <div class="actions" id="actions"></div>
+        </header>
+
+        <section class="stage">
+          <div id="terminal"></div>
+          <div id="overlay" class="overlay hidden">
+            <div class="overlay-card">
+              <div class="spinner"></div>
+              <p id="overlay-text">working</p>
+            </div>
+          </div>
+        </section>
+
+        <footer>
+          <span id="status">ready</span>
+          <span class="spacer"></span>
+          <span class="hint" id="hint"></span>
+        </footer>
+      </main>
+    </div>
+  </body>
+</html>

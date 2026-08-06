@@ -693,6 +693,22 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
             std::thread::sleep(d);
             Ok(0)
         }
+        // Natively this is nearly unreachable: the host's own stdin blocks, so
+        // a stream is only ever "not readable yet" for a pipe whose writer has
+        // not written. Polling is enough for that, and it keeps the kernel
+        // unlocked while it happens.
+        BlockOp::ReadStream { handle, buf, len } => {
+            let mut tmp = vec![0u8; len];
+            loop {
+                if handle.poll_readable() {
+                    let n = handle.read_at(0, &mut tmp)?;
+                    let mut mem = GuestMem::new(data);
+                    mem.write(buf, &tmp[..n as usize])?;
+                    return Ok(n);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         BlockOp::WaitChild {
             children,
             procs,

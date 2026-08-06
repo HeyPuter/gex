@@ -107,6 +107,22 @@ impl PageTable {
         self.next_slot
     }
 
+    /// Every page-to-base assignment made so far.
+    pub fn entries(&self) -> Vec<(u64, u32)> {
+        self.pages.iter().map(|(p, b)| (*p, *b)).collect()
+    }
+
+    /// Move the allocation mark forward, never back.
+    ///
+    /// Slots must never be handed out twice. A host that saves and restores a
+    /// page table -- which is what `fork` in the browser does -- would
+    /// otherwise reuse everything the other side of the checkpoint allocated,
+    /// and a page whose directory entry survived the restore would dispatch
+    /// into whatever code now occupies its slots.
+    pub fn advance_to(&mut self, slot: u64) {
+        self.next_slot = self.next_slot.max(slot);
+    }
+
     /// Rebuild an assignment from the entries a previous run recorded.
     ///
     /// Used when a cached module is loaded instead of translated: the pages it

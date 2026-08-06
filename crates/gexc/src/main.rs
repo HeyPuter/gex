@@ -37,6 +37,7 @@ fn real_main() -> Result<ExitCode> {
     match argv[1].as_str() {
         "run" => cmd_run(&argv[2..]),
         "build" => cmd_build(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "seed" => cmd_seed(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
@@ -59,6 +60,9 @@ usage:
                                    runtime translator behind it;
                                    --no-shared-memory: declare a plain memory,
                                    for a single-threaded host)
+  gexc seed   -o <out.wasm>        write a module that translates nothing, for
+                                   a host that will translate at runtime and
+                                   does not know the program in advance
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
 
@@ -202,6 +206,30 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
             Ok(ExitCode::from((exit.code() & 0xff) as u8))
         }
     }
+}
+
+/// `gexc seed`: one module that will run any program, given a runtime
+/// translator behind it.
+fn cmd_seed(args: &[String]) -> Result<()> {
+    let mut out = None;
+    let mut shared_memory = true;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                i += 1;
+                out = Some(args.get(i).context("-o needs a path")?.clone());
+            }
+            "--no-shared-memory" => shared_memory = false,
+            other => bail!("unexpected argument {other}"),
+        }
+        i += 1;
+    }
+    let out = out.unwrap_or_else(|| "seed.wasm".to_string());
+    let module = gex_xlate::seed_module(shared_memory);
+    std::fs::write(&out, &module.wasm).with_context(|| format!("writing {out}"))?;
+    eprintln!("{out}: {} bytes, translates nothing", module.wasm.len());
+    Ok(())
 }
 
 fn cmd_build(args: &[String]) -> Result<()> {

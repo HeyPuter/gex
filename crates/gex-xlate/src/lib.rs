@@ -324,6 +324,31 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     (module, stats)
 }
 
+/// A module that translates nothing: the entry stub, the miss stub, and an
+/// empty dispatch table.
+///
+/// Every branch it takes misses, so the runtime translator behind it produces
+/// the whole program. That makes it usable with *any* guest, which is the
+/// point: a web page cannot run the ahead-of-time compiler, so a page that
+/// lets a visitor supply their own binary needs one module it can ship in
+/// advance and use for all of them. The dispatch directory is indexed by
+/// guest page across the whole address space, so nothing in here depends on
+/// where the program it will end up running is linked.
+///
+/// The trade is the one the ahead-of-time path exists to avoid: the first
+/// execution of every block goes through a miss, a lift and a compile.
+pub fn seed_module(shared_memory: bool) -> TranslatedModule {
+    // A text range is still declared because the builder wants one; with no
+    // blocks in it, nothing reads it back.
+    ModuleBuilder::with_linkage(
+        gex_abi::PIE_BASE,
+        0,
+        Linkage::Own,
+        shared_memory,
+    )
+    .finish()
+}
+
 /// Translate code that is not in the image, reading it from live guest
 /// memory (PLAN §6.2).
 ///

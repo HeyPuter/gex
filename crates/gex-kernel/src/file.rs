@@ -61,6 +61,16 @@ impl OpenFile {
         self.offset.load(Ordering::Relaxed)
     }
 
+    /// Whether a `read` on this descriptor would have to wait.
+    ///
+    /// A descriptor opened `O_NONBLOCK` never waits -- it is asking for the
+    /// `EAGAIN` -- so it answers no however empty the stream is.
+    pub fn would_block(&self) -> bool {
+        self.readable
+            && self.flags.load(Ordering::Relaxed) & crate::fs::oflags::O_NONBLOCK == 0
+            && !self.handle.poll_readable()
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> SysResult {
         if !self.readable {
             return Err(Errno::EBADF);

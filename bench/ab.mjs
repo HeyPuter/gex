@@ -17,9 +17,18 @@
 //     --stdin <path>    feed a file to the guest's standard input
 //
 // Each round runs A and B in fresh processes, so neither sees the other's
-// warmed-up engine. The report is the minimum for each -- the least
-// interfered-with round -- plus the spread across rounds, because a ratio is
-// only worth reading next to how much the two sides moved on their own.
+// warmed-up engine. The headline is the *median of the per-round ratios*, not
+// the ratio of the two minima. The two are not the same thing and the
+// difference matters: on a benchmark with a large working set, CPU time
+// tracks how much cache the rest of the machine is using, which drifts over
+// minutes. Comparing A and B from the same round cancels that drift; comparing
+// two minima drawn from different rounds does not.
+//
+// How much it matters was measured by running this against two identical
+// builds. On a cache-resident benchmark the two agree and both read 1.00. On
+// one with a 160 KB working set the minima read 0.94 -- a 6% win, from no
+// change at all -- while the paired median read 1.00. Anything smaller than
+// the null-test figure below is not a result.
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -86,16 +95,38 @@ function once(wasm) {
   return Number(line.slice(7));
 }
 
+// A then B on even rounds, B then A on odd ones. Always running A first
+// gives B a warm page cache and a clock that has already boosted, and that is
+// worth about 2.5% here: two identical builds compared in a fixed order read
+// as a consistent 2.5% win for whichever went second. Alternating cancels it.
 const a = [];
 const b = [];
 for (let i = 0; i < opt.reps; i++) {
-  a.push(once(wasmA));
-  b.push(once(wasmB));
+  if (i % 2 === 0) {
+    a.push(once(wasmA));
+    b.push(once(wasmB));
+  } else {
+    b.push(once(wasmB));
+    a.push(once(wasmA));
+  }
 }
 const ms = (us) => (us / 1000).toFixed(0);
 const spread = (v) => (100 * (Math.max(...v) / Math.min(...v) - 1)).toFixed(0);
-const [minA, minB] = [Math.min(...a), Math.min(...b)];
+const median = (v) => {
+  const s = [...v].sort((x, y) => x - y);
+  const h = s.length >> 1;
+  return s.length % 2 ? s[h] : (s[h - 1] + s[h]) / 2;
+};
+const ratios = a.map((x, i) => b[i] / x);
+// How far the per-round ratios scatter, as the median distance from the
+// median. The full range would be the obvious measure and is the wrong one
+// with a handful of rounds: one round where something else woke up on the
+// machine sets it, and it then reports the worst round rather than the usual
+// one. A result closer to 1.0 than this figure is indistinguishable from
+// having changed nothing.
+const mid = median(ratios);
+const noise = (100 * median(ratios.map((r) => Math.abs(r - mid)))).toFixed(1);
 console.log(
-  `A ${ms(minA)} ms (spread ${spread(a)}%)  B ${ms(minB)} ms (spread ${spread(b)}%)  ` +
-    `B/A ${(minB / minA).toFixed(3)}`,
+  `A ${ms(median(a))} ms (spread ${spread(a)}%)  B ${ms(median(b))} ms (spread ${spread(b)}%)  ` +
+    `B/A ${mid.toFixed(3)} (+/-${noise}%)`,
 );

@@ -132,6 +132,18 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn is_tty(&self) -> bool {
         false
     }
+    /// Whether a read would return without waiting.
+    ///
+    /// Only streams that can genuinely be empty answer no -- a terminal
+    /// nobody has typed at, a socket with nothing arrived. Everything else
+    /// keeps the default, because a read from a file is never a wait.
+    ///
+    /// This is asked *before* the read rather than turning an `EAGAIN` into a
+    /// wait afterwards, because the two are different answers: a descriptor
+    /// the guest opened `O_NONBLOCK` is supposed to see the `EAGAIN`.
+    fn poll_readable(&self) -> bool {
+        true
+    }
 }
 
 /// A mounted filesystem.
