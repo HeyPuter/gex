@@ -70,6 +70,7 @@ pub mod nr {
     pub const SYNC: u64 = 81;
     pub const STATX: u64 = 291;
     pub const PSELECT6: u64 = 72;
+    pub const UTIMENSAT: u64 = 88;
     pub const STATFS: u64 = 43;
     pub const FSTATFS: u64 = 44;
     pub const UMASK: u64 = 166;
@@ -1271,6 +1272,12 @@ impl Kernel {
             nr::PPOLL => self.sys_ppoll(m, a[0], a[1]),
             nr::PSELECT6 => self.sys_pselect(m, a),
             nr::STATFS | nr::FSTATFS => self.sys_statfs(m, a[1]),
+            // Modification times are not settable here: tmpfs keeps one it
+            // maintains itself and hostfs reports the host's. Accepting the
+            // call is still better than refusing it -- apt sets the time on
+            // a file it has just downloaded, and treats the failure as a
+            // failure of the download.
+            nr::UTIMENSAT => self.fds.get(a[0] as i32).map(|_| 0).or(Ok(0)),
             // There is one process's view of the world and nothing consults
             // a umask, but a program that sets one wants the old value back.
             nr::UMASK => {
@@ -2954,6 +2961,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::PWRITE64 => "pwrite64",
         nr::PPOLL => "ppoll",
         nr::PSELECT6 => "pselect6",
+        nr::UTIMENSAT => "utimensat",
         nr::STATFS => "statfs",
         nr::FSTATFS => "fstatfs",
         nr::UMASK => "umask",
