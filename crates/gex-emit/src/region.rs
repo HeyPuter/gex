@@ -13,6 +13,40 @@
 //! duplicates the block -- so a region is grown from a block that some block
 //! reachable from it branches back to.
 
+//! # Things tried that did not pay
+//!
+//! *Growing the natural loop* instead of walking forwards and narrowing.
+//! The textbook construction -- find the latches, take everything that
+//! reaches one without passing through the header -- finds seven to eleven
+//! times as much: Lua goes from 495 blocks in regions to 5617, SQLite from
+//! 3396 to 25769. It is also slower. nbench comes out at +1% against the +5%
+//! this gets, and Lua is 11% down over three runs. A region's cost is its
+//! live register set, paid on every entry and every exit, and a bigger loop
+//! has more of both; the small accidental regions this finds turn out to be
+//! the ones worth forming. A cost model that grows the real loop and then
+//! decides is the thing to try, not more coverage.
+//!
+//! *Giving each region a function and turning its members into stubs* that
+//! record the address and tail-call it, so a branch to any member carries on
+//! inside the region rather than running a duplicate copy outside it. Works,
+//! and costs: zstd 5% down over three runs, Lua mixed.
+//!
+//! *Spanning a call*, by following the return rather than the callee. Needs
+//! the stubs, since the return lands on a member. With forward growth it
+//! collapses regions (SQLite 1287 to 21) because the walk wanders off down
+//! the code after each call; with natural-loop growth it works and inherits
+//! that approach's losses.
+//!
+//! *Leaving the region to poll* rather than calling the host from inside it,
+//! which makes it impossible to preempt a guest thread with its registers in
+//! a region's locals. That was worth trying because three separate attempts
+//! at wider regions failed only under the browser host's cooperative
+//! preemption -- but the cause turned out to be an ownership bug in one of
+//! those attempts rather than anything about polling, and against this
+//! machine's spread the change measures somewhere between -1% and +5% with
+//! the baseline itself moving 15% between runs. Not shippable on that
+//! evidence either way.
+
 use gex_ir::{Block, Term};
 use std::collections::{HashMap, HashSet};
 
