@@ -256,8 +256,8 @@ impl<'a> Emitter<'a> {
     ///
     /// Only leaf loops qualify -- a call in the body ends the region, because
     /// the callee returns through the table -- so this fires on a few hundred
-    /// loops in a large program: 195 in Lua, 1287 in SQLite. On nbench in the
-    /// browser, against the same module built without it:
+    /// loops in a large program: 195 in Lua, 638 in zstd, 1287 in SQLite. On
+    /// nbench in the browser, against the same module built without it:
     ///
     /// ```text
     ///     ASSIGNMENT   +15%      FOURIER        +3%
@@ -267,13 +267,14 @@ impl<'a> Emitter<'a> {
     /// ```
     ///
     /// Assignment and numeric sort are two of the kernels where gex was
-    /// behind QEMU. FP emulation is the one that resists: it is the kernel
-    /// most made of tight branchy integer loops, which is what this was
-    /// supposed to help, and it has been negative in every measurement --
-    /// though narrowing what a region stores took it from -12% to -7%.
+    /// behind QEMU. zstd compressing at level 9 is 13% faster; at level 19,
+    /// unchanged. Lua, matmul and a call microbenchmark are unchanged, which
+    /// is what a transform reaching only leaf loops should look like.
     ///
-    /// Lua, matmul and a call microbenchmark are unchanged, which is what a
-    /// transform reaching only leaf loops should look like.
+    /// FP emulation reads as a loss above and is not one: nbench's kernel
+    /// pulled out into a program of its own and measured the same way comes
+    /// out at 1.06, 1.04 and 0.91 across three runs. It straddles even, and
+    /// what the table shows is this machine's spread, which is about 8%.
     fn run_region(&mut self, region: &[u64]) {
         let n = region.len();
         let index: HashMap<u64, u32> = region
