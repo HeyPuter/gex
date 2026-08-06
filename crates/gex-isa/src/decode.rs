@@ -2092,7 +2092,11 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
     } else {
         (2 * esize).wrapping_sub(imm)
     };
-    if shift >= esize {
+    // A left shift can move by at most one less than the element width; a
+    // right shift may move by the whole of it, which for the narrowing forms
+    // is the common case -- `shrn v0.2s, v0.2d, #32` takes the top half of
+    // each doubleword, and rejecting it made apt's hash table unreachable.
+    if (left && shift >= esize) || (!left && shift > esize) {
         return Inst::Undefined { raw };
     }
     Inst::VShiftImm {

@@ -68,6 +68,7 @@ pub mod nr {
     pub const CLOCK_GETRES: u64 = 114;
     pub const CLOCK_NANOSLEEP: u64 = 115;
     pub const SYNC: u64 = 81;
+    pub const STATX: u64 = 291;
     pub const UMOUNT2: u64 = 39;
     pub const MOUNT: u64 = 40;
     pub const SCHED_YIELD: u64 = 124;
@@ -1086,6 +1087,7 @@ impl Kernel {
             nr::GETDENTS64 => self.sys_getdents(m, a[0] as i32, a[1], a[2]),
             nr::FSTAT => self.sys_fstat(m, a[0] as i32, a[1]),
             nr::NEWFSTATAT => self.sys_fstatat(m, a[0] as i32, a[1], a[2], a[3]),
+            nr::STATX => self.sys_statx(m, a[0] as i32, a[1], a[2], a[4]),
             nr::FCNTL => self.sys_fcntl(a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self
@@ -1597,6 +1599,67 @@ impl Kernel {
             },
             ..Default::default()
         }
+    }
+
+    /// `statx`, which is how glibc stats a file on any kernel new enough to
+    /// have it.
+    ///
+    /// Answering `ENOSYS` is supposed to be safe -- glibc falls back to
+    /// `fstatat` -- and it very nearly is: the fallback runs, returns the
+    /// right answer, and then `ls` branches into padding. Rather than find
+    /// out why a path that is barely exercised on any real system goes wrong,
+    /// this is the path glibc wants.
+    fn sys_statx(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        dirfd: i32,
+        path: u64,
+        flags: u64,
+        buf: u64,
+    ) -> SysResult {
+        let raw = m.read_cstr(path, 4096)?;
+        let md = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            self.fds.get(dirfd)?.metadata()?
+        } else {
+            let p = self.at_path(m, dirfd, path)?;
+            if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                self.vfs.metadata_nofollow(&p)?
+            } else {
+                self.vfs.metadata(&p)?
+            }
+        };
+        let st = Self::stat_from(&md);
+
+        // `struct statx` is 256 bytes and mostly reserved.
+        let mut out = [0u8; 256];
+        let put32 = |o: &mut [u8; 256], at: usize, v: u32| {
+            o[at..at + 4].copy_from_slice(&v.to_le_bytes())
+        };
+        let put64 = |o: &mut [u8; 256], at: usize, v: u64| {
+            o[at..at + 8].copy_from_slice(&v.to_le_bytes())
+        };
+        // What is filled in. The caller asks for a mask and the kernel says
+        // which parts it actually answered; claiming everything but the
+        // birth time is what a Linux filesystem without one reports.
+        const STATX_BASIC_STATS: u32 = 0x07ff;
+        put32(&mut out, 0, STATX_BASIC_STATS);
+        put32(&mut out, 4, st.blksize as u32);
+        put32(&mut out, 16, st.nlink as u32);
+        put32(&mut out, 20, self.uid);
+        put32(&mut out, 24, self.gid);
+        out[28..30].copy_from_slice(&(st.mode as u16).to_le_bytes());
+        put64(&mut out, 32, st.ino);
+        put64(&mut out, 40, st.size as u64);
+        put64(&mut out, 48, st.blocks as u64);
+        // atime, btime, ctime, mtime: 16 bytes each from offset 64. Only the
+        // seconds are known, and all four get the same one.
+        for at in [64usize, 80, 96, 112] {
+            put64(&mut out, at, st.mtime as u64);
+        }
+        put32(&mut out, 128, (st.rdev >> 8) as u32);
+        put32(&mut out, 132, (st.rdev & 0xff) as u32);
+        m.write(buf, &out)?;
+        Ok(0)
     }
 
     fn sys_fstat(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
@@ -2500,6 +2563,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::SETGROUPS => "setgroups",
         nr::PRCTL => "prctl",
         nr::SYNC => "sync",
+        nr::STATX => "statx",
         nr::MOUNT => "mount",
         nr::UMOUNT2 => "umount2",
         nr::REBOOT => "reboot",

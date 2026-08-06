@@ -1203,6 +1203,8 @@ fn mount_filesystems(
         None => kernel.vfs.mount("/", Arc::new(HostFs::new("/"))),
     }
     kernel.vfs.mount("/dev", Arc::new(DevFs::new()));
+    // A native host has real sockets, so the guest gets a real network.
+    kernel.net = Some(Arc::new(HostNet));
     kernel.vfs.mount(
         "/proc",
         Arc::new(ProcFs::new(Arc::new(KernelProcSource(proc_state)))),
@@ -1226,6 +1228,138 @@ fn mount_filesystems(
 }
 
 /// A `/proc` source over the snapshot the host refreshes.
+/// The guest's network, as the host's real sockets.
+///
+/// The kernel wants a transport that never blocks -- it does the waiting
+/// itself, because it is what can park a guest thread -- so the socket is put
+/// in non-blocking mode and a background reader is not needed: the kernel
+/// polls, and polling a non-blocking socket is a syscall.
+#[derive(Debug)]
+struct HostNet;
+
+impl gex_kernel::net::NetStack for HostNet {
+    fn tcp(&self) -> Result<Arc<dyn gex_kernel::net::Transport>, gex_kernel::Errno> {
+        Ok(Arc::new(HostStream::default()))
+    }
+}
+
+#[derive(Debug, Default)]
+struct HostStream {
+    sock: Mutex<Option<std::net::TcpStream>>,
+    /// Set once the connection has been shown to be up or to have failed, so
+    /// the status does not depend on probing a socket that is already open.
+    settled: Mutex<Option<gex_kernel::net::Status>>,
+}
+
+impl HostStream {
+    /// Whether the connection has finished coming up.
+    ///
+    /// A non-blocking `connect` reports its outcome through the socket's
+    /// error, which `take_error` returns exactly once, so the answer is
+    /// remembered.
+    fn probe(&self) -> gex_kernel::net::Status {
+        use gex_kernel::net::Status;
+        if let Some(s) = *self.settled.lock().unwrap_or_else(|e| e.into_inner()) {
+            return s;
+        }
+        let guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_ref() else {
+            return Status::Closed;
+        };
+        let s = match sock.take_error() {
+            Ok(Some(_)) => Status::Refused,
+            Err(_) => Status::Refused,
+            // Writability is how a finished connect announces itself; a peer
+            // name is the cheapest way to ask.
+            Ok(None) => match sock.peer_addr() {
+                Ok(_) => Status::Open,
+                Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Status::Connecting,
+                Err(_) => Status::Refused,
+            },
+        };
+        if s != Status::Connecting {
+            *self.settled.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+        }
+        s
+    }
+}
+
+impl gex_kernel::net::Transport for HostStream {
+    fn connect(&self, host: &str, port: u16) -> Result<(), gex_kernel::Errno> {
+        use gex_kernel::Errno;
+        use std::net::ToSocketAddrs;
+        // The host's own resolver, which is the one thing a native host has
+        // that a page does not.
+        let mut addrs = (host, port)
+            .to_socket_addrs()
+            .map_err(|_| Errno::ENETUNREACH)?;
+        let addr = addrs.next().ok_or(Errno::ENETUNREACH)?;
+        let sock = std::net::TcpStream::connect(addr).map_err(|_| Errno::ECONNREFUSED)?;
+        sock.set_nonblocking(true)
+            .map_err(|_| Errno::ENETUNREACH)?;
+        *self.sock.lock().unwrap_or_else(|e| e.into_inner()) = Some(sock);
+        Ok(())
+    }
+
+    fn status(&self) -> gex_kernel::net::Status {
+        self.probe()
+    }
+
+    fn send(&self, data: &[u8]) -> Result<usize, gex_kernel::Errno> {
+        use std::io::Write;
+        let mut guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_mut() else {
+            return Err(gex_kernel::Errno::ENOTCONN);
+        };
+        match sock.write(data) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(gex_kernel::Errno::from_io(&e)),
+        }
+    }
+
+    fn recv(&self, buf: &mut [u8]) -> Result<usize, gex_kernel::Errno> {
+        use std::io::Read;
+        let mut guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_mut() else {
+            return Ok(0);
+        };
+        match sock.read(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(gex_kernel::Errno::EAGAIN)
+            }
+            Err(e) => Err(gex_kernel::Errno::from_io(&e)),
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        use std::io::Read;
+        if self.probe() != gex_kernel::net::Status::Open {
+            return true;
+        }
+        let mut guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_mut() else {
+            return true;
+        };
+        // A zero-length read cannot say whether anything is there, so this
+        // peeks one byte and puts it back by never taking it: `MSG_PEEK` is
+        // not in std, so the socket is asked to read into a scratch buffer
+        // the caller will read again -- which would lose the byte. Instead,
+        // ask whether a read would block, which is what `WouldBlock` means.
+        let mut probe = [0u8; 1];
+        match sock.peek(&mut probe) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(_) => true,
+        }
+    }
+
+    fn close(&self) {
+        let _ = self.sock.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
+
 /// The host process's real user and group ids.
 ///
 /// Read from `/proc/self/status` rather than through `libc`, which keeps this
