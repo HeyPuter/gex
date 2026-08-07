@@ -86,6 +86,24 @@ s = open(p).read()
 if '__EMSCRIPTEN__' not in s:
     s = re.sub(r"#if DETECT_OS_LINUX\n", "#if DETECT_OS_LINUX && !defined(__EMSCRIPTEN__)\n", s, count=1)
     open(p, 'w').write(s)
+
+# vtest writes its replies to a file descriptor. There is no descriptor to
+# write to in a tab, so a negative fd means "hand them to gex" and the module
+# collects them in a buffer for JavaScript to copy out.
+p = f'{src}/vtest/vtest_renderer.c'
+s = open(p).read()
+if 'gex_virgl_sink' not in s:
+    s = s.replace('''static int vtest_block_write(int fd, void *buf, int size)
+{''', '''void gex_virgl_sink(const void *data, size_t len);
+
+static int vtest_block_write(int fd, void *buf, int size)
+{
+   if (fd < 0) {
+      gex_virgl_sink(buf, (size_t)size);
+      return size;
+   }''', 1)
+    assert 'gex_virgl_sink' in s, 'vtest_block_write did not match'
+    open(p, 'w').write(s)
 PATCH
 
 # -- the epoxy stand-in -----------------------------------------------------
@@ -145,6 +163,13 @@ bool epoxy_has_gl_extension(const char *ext) {
 }
 bool epoxy_has_glx_extension(void *dpy, int screen, const char *ext) {
     (void)dpy; (void)screen; (void)ext; return false;
+}
+
+/* Not GL, and the only non-GL symbol missing: emscripten leaves this out
+ * unless the build uses pthreads. Naming a thread is for debuggers. */
+int pthread_setname_np(void *thread, const char *name);
+int pthread_setname_np(void *thread, const char *name) {
+    (void)thread; (void)name; return 0;
 }
 EOF
 
@@ -255,11 +280,125 @@ PKG_CONFIG_LIBDIR="$EPOXY/lib/pkgconfig" meson setup "$OUT/build" "$SRC" \
 # library is. Build that alone so a missing link-time symbol in an executable
 # nobody uses does not fail the build.
 ninja -C "$OUT/build" src/libvirglrenderer.a src/libvirgl.a \
+    src/gallium/libgallium.a src/mesa/libmesa.a vtest/libvtest.a 2>/dev/null ||
+ninja -C "$OUT/build" src/libvirglrenderer.a src/libvirgl.a \
     src/gallium/libgallium.a src/mesa/libmesa.a
+
+# -- the module the page loads ----------------------------------------------
+#
+# FULL_ES3 is what gives the GLES 3 entry points virglrenderer calls -- and
+# what makes emscripten route them at a WebGL 2 context rather than emulating
+# GLES 2. The desktop-only ones it still cannot supply are in the epoxy shim.
+HERE_DIR="$(cd "$(dirname "$0")" && pwd)"
+VTEST_SRC="$SRC/vtest/vtest_renderer.c $SRC/vtest/util.c $SRC/vtest/vtest_shm.c"
+
+# The include and define set meson uses for the vtest sources, taken from its
+# own compile database rather than guessed. Mesa's utility headers want a
+# generated config.h, an endianness it will not infer, and a `compat`
+# directory that supplies C11 pieces clang does not have here; getting any of
+# them wrong is a `#error`, not a warning.
+VTEST_FLAGS="$(cd "$OUT/build" && python3 -c "
+import json, shlex
+for e in json.load(open('compile_commands.json')):
+    if e['file'].endswith('vtest_renderer.c'):
+        args = shlex.split(e['command'])
+        out = []
+        for a in args:
+            if a.startswith('-I') and not a[2:].startswith('/'):
+                out.append('-I' + '$OUT/build/' + a[2:])
+            elif a.startswith(('-I', '-D')):
+                out.append(a)
+        print(' '.join(out))
+        break
+")"
+
+# -- the second stub set ----------------------------------------------------
+#
+# The first set covers what the GLES headers declare and the desktop ones do
+# not. This is the mirror: entry points the *desktop* headers declare, so
+# virglrenderer compiles, that emscripten's GL library does not implement
+# because WebGL 2 has no such call -- glTextureView, glFramebufferTexture1D,
+# the multisample-texture family, and so on. virglrenderer reaches them only
+# after asking whether the host is desktop GL, and this shim says no.
+#
+# Discovered by linking rather than listed here: the set follows the version
+# of virglrenderer and the version of the SDK, and a list in this file would
+# be wrong the first time either moved.
+LINK_ARGS="-I$EPOXY/include $VTEST_FLAGS -Wno-pedantic -Wno-c23-extensions \
+    -sFULL_ES3=1 -sMAX_WEBGL_VERSION=2 -sMIN_WEBGL_VERSION=2"
+OBJS="$HERE_DIR/virgl/gexvirgl.c $VTEST_SRC \
+    $OUT/build/src/libvirglrenderer.a $OUT/build/src/libvirgl.a \
+    $OUT/build/src/gallium/libgallium.a $OUT/build/src/mesa/libmesa.a \
+    $EPOXY/lib/libepoxy.a"
+
+: > "$EPOXY/desktop_stubs.c"
+# Twice, because generating a stub can pull a new object out of the archives
+# and that object can want something else. Two rounds have always been
+# enough; a third costs a link and proves it.
+: > "$OUT/link.log"
+for _round in 1 2 3; do
+    "$EMCC/emcc" -O2 -c "$EPOXY/desktop_stubs.c" -o "$EPOXY/desktop_stubs.o" \
+        -I"$EPOXY/include" 2>/dev/null || true
+    "$EMCC/emar" rcs "$EPOXY/lib/libepoxy.a" "$EPOXY/epoxy.o" "$EPOXY/stubs.o" \
+        ${_round:+$([ -f "$EPOXY/desktop_stubs.o" ] && echo "$EPOXY/desktop_stubs.o")}
+    # shellcheck disable=SC2086
+    "$EMCC/emcc" -O0 -o "$OUT/probe-link.js" $OBJS $LINK_ARGS \
+        -sERROR_ON_UNDEFINED_SYMBOLS=1 -Wl,--error-limit=0 2>>"$OUT/link.log" && break
+done
+python3 - "$SYSROOT" "$EPOXY" "$OUT/link.log" <<'DESKTOP'
+import re, sys
+sysroot, out, log = sys.argv[1], sys.argv[2], sys.argv[3]
+missing = sorted(set(re.findall(r'undefined symbol: (gl[A-Za-z0-9]+)', open(log).read())))
+decls = open(f'{sysroot}/GL/gl.h').read() + open(f'{sysroot}/GL/glext.h').read()
+found, unknown = [], []
+for name in missing:
+    # The word boundary matters: GL/gl.h spells the macro `GLAPIENTRY`, and a
+    # bare `APIENTRY` matches its tail, leaving "GL" glued to the return type
+    # and every stub declared as `void GL glFoo(...)`.
+    m = re.search(r'GLAPI\s+([A-Za-z_][A-Za-z0-9_ *]*?)\s*\b(?:GLAPIENTRY|APIENTRY)\s+'
+                  + re.escape(name) + r'\s*\(([^;]*?)\)\s*;', decls)
+    (found if m else unknown).append((name, m.group(1).strip(), m.group(2).strip()) if m else name)
+body = ['/* Generated by web/build-virgl-wasm.sh. Entry points the desktop GL',
+        ' * headers declare that WebGL 2 does not have. Reaching one means',
+        ' * virglrenderer did not ask whether the host was desktop GL, so say',
+        ' * which call it was rather than rendering nothing. */',
+        '#include <stdio.h>', '#include <stdlib.h>',
+        '#define GL_GLEXT_PROTOTYPES 1',
+        '#include <GL/gl.h>', '#include <GL/glext.h>', '',
+        'static void gex_desktop_only(const char *name) {',
+        '    fprintf(stderr, "gex-virgl: %s is desktop GL; WebGL 2 has no such call\\n", name);',
+        '    abort();', '}', '']
+for name, ret, args in found:
+    b = f'    gex_desktop_only("{name}");\n'
+    if ret != 'void':
+        b += f'    return ({ret})0;\n'
+    body.append(f'{ret} {name}({args}) {{\n{b}}}')
+open(f'{out}/desktop_stubs.c', 'w').write('\n'.join(body) + '\n')
+print(f'desktop stubs: {len(found)} generated'
+      + (f', {len(unknown)} with no prototype: {unknown}' if unknown else ''))
+DESKTOP
+"$EMCC/emcc" -O2 -c "$EPOXY/desktop_stubs.c" -o "$EPOXY/desktop_stubs.o" -I"$EPOXY/include"
+"$EMCC/emar" rcs "$EPOXY/lib/libepoxy.a" "$EPOXY/epoxy.o" "$EPOXY/stubs.o" "$EPOXY/desktop_stubs.o"
+
+# shellcheck disable=SC2086 -- the flag list is intentionally word-split
+"$EMCC/emcc" -O2 \
+    -o "$OUT/gexvirgl.mjs" \
+    "$HERE_DIR/virgl/gexvirgl.c" $VTEST_SRC \
+    "$OUT/build/src/libvirglrenderer.a" "$OUT/build/src/libvirgl.a" \
+    "$OUT/build/src/gallium/libgallium.a" "$OUT/build/src/mesa/libmesa.a" \
+    "$EPOXY/lib/libepoxy.a" \
+    $VTEST_FLAGS \
+    -Wno-pedantic -Wno-c23-extensions \
+    -sFULL_ES3=1 -sMAX_WEBGL_VERSION=2 -sMIN_WEBGL_VERSION=2 \
+    -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 \
+    -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,UTF8ToString \
+    -sENVIRONMENT=web,worker \
+    -sEXPORTED_FUNCTIONS=_gex_virgl_init,_gex_virgl_describe,_gex_virgl_feed,_gex_virgl_pump,_gex_virgl_pending,_gex_virgl_replies,_gex_virgl_drain,_malloc,_free
 
 echo
 for a in src/libvirglrenderer.a src/libvirgl.a src/gallium/libgallium.a src/mesa/libmesa.a; do
     printf '  %-34s %8d bytes\n' "$a" "$(stat -c%s "$OUT/build/$a")"
 done
+printf '  %-34s %8d bytes\n' "gexvirgl.wasm" "$(stat -c%s "$OUT/gexvirgl.wasm")"
 echo
-echo "built into $OUT/build"
+echo "built into $OUT"

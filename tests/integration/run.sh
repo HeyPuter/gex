@@ -879,6 +879,23 @@ fi
 # for `rt_sigsuspend`, the native shim learned it, and the browser shim was
 # left with two non-exhaustive matches for however long it took someone to
 # rebuild the page.
+# virglrenderer, compiled to wasm, coming up on a WebGL 2 context in a real
+# browser. Not a translation test at all -- it is the other half of the
+# graphics path: the native runtime gives the guest a GPU by handing VirGL to
+# the host's libvirglrenderer, and a page has no host to hand it to, so the
+# renderer itself is what crosses. Skips without the wasm build or a browser.
+if [ -n "$NODE" ]; then
+    if out=$("$NODE" "$HERE/../../web/test/virgl-webgl.mjs" 2>&1); then
+        echo "$out" | grep -E "^(ok|skip|     )" || true
+        echo "$out" | grep -q "^ok" && pass=$((pass + 1))
+    else
+        echo "$out" | sed 's/^/     /' | head -8
+        fail=$((fail + 1))
+    fi
+else
+    echo "skip virgl-webgl: no node"
+fi
+
 # Debian's own glxinfo and glxgears, on the host's real OpenGL, through the
 # guest's own unmodified Mesa. Minutes on a cold cache -- it translates all of
 # Mesa and LLVM -- so it is opt-in with the rest of the slow ones.
