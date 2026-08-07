@@ -88,6 +88,27 @@ fn dw(b: &[u8], i: usize) -> u32 {
 }
 
 /// One connected guest client.
+/// Append everything the guest sends to the file named by `GEX_VTEST_RECORD`.
+///
+/// A vtest stream is the whole of what a guest asks of a GPU, and it is
+/// exactly reproducible: the same program draws the same commands. Capturing
+/// one here means the browser port can be handed a real glxgears frame --
+/// unmodified Mesa's own output -- without a guest, a rootfs or a translator
+/// anywhere near it. That is the difference between "the renderer
+/// initialises" and "the renderer can draw what Mesa asks for".
+fn record(bytes: &[u8]) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let f = FILE.get_or_init(|| {
+        let path = std::env::var_os("GEX_VTEST_RECORD")?;
+        std::fs::File::create(path).ok().map(std::sync::Mutex::new)
+    });
+    if let Some(f) = f {
+        let _ = f.lock().unwrap_or_else(|e| e.into_inner()).write_all(bytes);
+    }
+}
+
 pub struct Session {
     /// Bytes read from the guest that do not yet form a whole command.
     input: Vec<u8>,
@@ -117,6 +138,7 @@ impl Session {
 
     /// Bytes have arrived from the guest.
     pub fn feed(&mut self, bytes: &[u8]) {
+        record(bytes);
         self.input.extend_from_slice(bytes);
     }
 

@@ -52,7 +52,7 @@
  * "GL context" is a WebGL 2 context on a canvas. */
 static EMSCRIPTEN_WEBGL_CONTEXT_HANDLE gex_ctx;
 
-static virgl_renderer_gl_context gex_create_gl_context(
+virgl_renderer_gl_context gex_create_gl_context(
     void *cookie, int scanout, struct virgl_renderer_gl_ctx_param *param) {
     (void)cookie;
     (void)scanout;
@@ -64,14 +64,14 @@ static virgl_renderer_gl_context gex_create_gl_context(
     return (virgl_renderer_gl_context)(intptr_t)gex_ctx;
 }
 
-static void gex_destroy_gl_context(void *cookie, virgl_renderer_gl_context ctx) {
+void gex_destroy_gl_context(void *cookie, virgl_renderer_gl_context ctx) {
     (void)cookie;
     (void)ctx;
     /* The one context outlives every sub-context; destroying it here would
      * take the canvas with it. */
 }
 
-static int gex_make_current(void *cookie, int scanout, virgl_renderer_gl_context ctx) {
+int gex_make_current(void *cookie, int scanout, virgl_renderer_gl_context ctx) {
     (void)cookie;
     (void)scanout;
     return emscripten_webgl_make_context_current(
@@ -80,30 +80,11 @@ static int gex_make_current(void *cookie, int scanout, virgl_renderer_gl_context
                : -1;
 }
 
-static void gex_write_fence(void *cookie, uint32_t fence) {
-    (void)cookie;
-    (void)fence;
-}
-
-/* Deliberately no `get_egl_display`.
- *
- * Supplying it is what the native build does, because the system
- * libvirglrenderer is built with EGL and wants a display to hang its dmabuf
- * imports on. This one is built with no platform at all -- `HAVE_EPOXY_EGL_H`
- * is not defined -- so `vrend_winsys_init_external` would refuse the display
- * and fail the whole init. Leaving the callback out skips that block, and
- * contexts then come straight from `create_gl_context` below, which is the
- * arrangement a tab wants anyway.
- *
- * Held by pointer inside virglrenderer, so it must outlive the call that
- * passes it -- a lesson from the native port, where this was a local. */
-static struct virgl_renderer_callbacks gex_callbacks = {
-    .version = VIRGL_RENDERER_CALLBACKS_VERSION,
-    .write_fence = gex_write_fence,
-    .create_gl_context = gex_create_gl_context,
-    .destroy_gl_context = gex_destroy_gl_context,
-    .make_current = gex_make_current,
-};
+/* The callbacks are vtest's, not ours: `vtest_init_renderer` registers its
+ * own set, and gex's three context callbacks are grafted onto them by the
+ * build script. Calling `virgl_renderer_init` here instead would leave
+ * vtest's renderer state unbuilt, and the first CREATE_RENDERER would fail
+ * with nothing said. */
 
 /* -- the byte streams ---------------------------------------------------- */
 
@@ -149,7 +130,19 @@ static int (*const gex_commands[])(uint32_t) = {
     [VCMD_TRANSFER_GET] = vtest_transfer_get,
     [VCMD_TRANSFER_PUT] = vtest_transfer_put,
     [VCMD_SUBMIT_CMD] = vtest_submit_cmd,
-    [VCMD_RESOURCE_BUSY_WAIT] = vtest_resource_busy_wait,
+    /* The non-blocking variant, and it has to be.
+     *
+     * `vtest_resource_busy_wait` is a `do { ... } while (true)` around
+     * `virgl_renderer_get_poll_fd()`: it waits for a fence by polling a
+     * descriptor. There is no descriptor in a tab and nothing else runs while
+     * this loop does, so it never ends -- the whole module wedges on the
+     * first fence a program waits for, which for glxgears is its first frame.
+     *
+     * Reporting completion immediately is not a shortcut here. `THREAD_SYNC`
+     * needs an eventfd and is stripped for want of one, so submission is
+     * synchronous: by the time the guest asks, the commands really have run.
+     */
+    [VCMD_RESOURCE_BUSY_WAIT] = vtest_resource_busy_wait_nop,
     [VCMD_CREATE_RENDERER] = NULL,
     [VCMD_GET_CAPS2] = vtest_send_caps2,
     [VCMD_PING_PROTOCOL_VERSION] = vtest_ping_protocol_version,
@@ -193,13 +186,8 @@ int gex_virgl_init(int width, int height) {
         return -2;
     }
     /* Flags zero: the winsys is ours, so virglrenderer must not go looking
-     * for EGL or a DRM node of its own.
-     *
-     * The cookie must not be NULL. It is opaque and gex has nothing to put in
-     * it, but `virgl_renderer_init` checks it against NULL and refuses -- so
-     * this points at something rather than being clever. */
-    static int cookie;
-    if (virgl_renderer_init(&cookie, 0, &gex_callbacks) != 0) {
+     * for EGL or a DRM node of its own. vtest adds the two it insists on. */
+    if (vtest_init_renderer(false, 0, NULL) != 0) {
         return -3;
     }
     gex_renderer_up = true;
