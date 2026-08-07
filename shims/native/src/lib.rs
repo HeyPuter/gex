@@ -162,7 +162,23 @@ impl Default for RunOptions {
             identity: None,
             sample: false,
             wayland: None,
-            virgl: None,
+            // On unless the build cannot render or the caller says
+            // `--no-virgl`.
+            //
+            // It costs nothing until something connects: the name is bound,
+            // and the host renderer -- which is a Mesa initialisation -- is
+            // not brought up until a client arrives. What it buys is that an
+            // unmodified OpenGL program in the guest simply works, which is
+            // the whole point of serving VirGL rather than an API of our own.
+            //
+            // Off-by-default was worse than it looks. Mesa's vtest winsys
+            // does not fall back when the socket is missing: it takes the
+            // ECONNREFUSED, writes its handshake into the dead descriptor
+            // anyway, and then blocks reading a reply that cannot come.
+            // `glxinfo` under a forgotten `--virgl` does not fail, it hangs
+            // in `read` forever, and nothing on the way there says why.
+            virgl: virgl::VirglDevice::available()
+                .then(|| virgl::DEFAULT_SOCKET.to_string()),
             wayland_size: (640, 480),
             wayland_out: None,
             wayland_gpu: false,

@@ -194,32 +194,55 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
         .map(|(i, b)| (b.start, i))
         .collect();
     let effects: Vec<(u8, u8)> = blocks.iter().map(pass::flag_effects).collect();
-    // A block that can leave the graph keeps everything live, and so does one
-    // with a successor nobody translated.
+
+    // Successors as block indices, in one flat array rather than a `Vec` per
+    // block.
     //
-    // A call's flags are live if either the callee reads them or the code it
-    // returns to does, so `call_return` counts as a successor here even though
-    // it is not a control-flow edge out of this block. Without it a
+    // The fixpoint below walks every block's successors on every round, and
+    // this used to build a fresh `Vec<u64>` and hash each address back to an
+    // index each time it did. On a 410,000-block exhaustive translation that
+    // was millions of allocations and tens of millions of hash lookups, and
+    // it made flag liveness the largest phase in the whole pipeline --
+    // larger than lifting and larger than code generation. Resolving the
+    // edges once turns the inner loop into two array reads.
+    //
+    // A call's `call_return` is a successor here even though it is not a
+    // control-flow edge out of the block: a call's flags are live if either
+    // the callee reads them or the code it returns to does. Without it a
     // hand-written `cmp; bl f; b.eq` -- legal whenever `f` preserves the
     // flags, which the ABI permits though no compiler relies on it -- would
     // lose its compare.
-    let succs = |b: &Block| -> Vec<u64> { b.successors().chain(b.call_return).collect() };
-    let opaque: Vec<bool> = blocks
-        .iter()
-        .map(|b| pass::escapes(b) || succs(b).iter().any(|s| !index.contains_key(s)))
-        .collect();
+    let mut succ_at: Vec<u32> = Vec::with_capacity(blocks.len() + 1);
+    let mut succ_of: Vec<u32> = Vec::new();
+    // A block that can leave the graph keeps everything live, and so does one
+    // with a successor nobody translated.
+    let mut opaque: Vec<bool> = Vec::with_capacity(blocks.len());
+    for b in blocks.iter() {
+        succ_at.push(succ_of.len() as u32);
+        let mut unknown = false;
+        for s in b.successors().chain(b.call_return) {
+            match index.get(&s) {
+                Some(&i) => succ_of.push(i as u32),
+                None => unknown = true,
+            }
+        }
+        opaque.push(unknown || pass::escapes(b));
+    }
+    succ_at.push(succ_of.len() as u32);
+    let succs_of = |i: usize| -> &[u32] {
+        &succ_of[succ_at[i] as usize..succ_at[i + 1] as usize]
+    };
 
     let mut live_in = vec![0u8; blocks.len()];
     loop {
         let mut changed = false;
-        for (i, b) in blocks.iter().enumerate() {
+        for i in 0..blocks.len() {
             let live_out = if opaque[i] {
                 pass::ALL_FLAGS
             } else {
-                succs(b)
+                succs_of(i)
                     .iter()
-                    .map(|s| live_in[index[s]])
-                    .fold(0, |a, x| a | x)
+                    .fold(0, |a, &s| a | live_in[s as usize])
             };
             let (uses, defs) = effects[i];
             let next = uses | (live_out & !defs);
@@ -233,28 +256,65 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
         }
     }
 
-    let mut removed = 0;
-    for (i, b) in blocks.iter_mut().enumerate() {
-        if opaque[i] {
-            continue;
-        }
-        let live_out = succs(b)
-            .iter()
-            .map(|s| live_in[index[s]])
-            .fold(0, |a, x| a | x);
-        let dead = pass::flags_of_mask(pass::ALL_FLAGS & !live_out);
-        if dead.is_empty() {
-            continue;
+    // What each block may drop, settled before anything is rewritten, so the
+    // rewrite reads nothing that another thread is changing.
+    let dead: Vec<u8> = (0..blocks.len())
+        .map(|i| {
+            if opaque[i] {
+                return 0;
+            }
+            let live_out = succs_of(i)
+                .iter()
+                .fold(0, |a, &s| a | live_in[s as usize]);
+            pass::ALL_FLAGS & !live_out
+        })
+        .collect();
+
+    // Each block's rewrite touches only that block, so they all run at once.
+    gex_emit::par::map_mut(blocks, &|i: usize, b: &mut Block| -> usize {
+        let flags = pass::flags_of_mask(dead[i]);
+        if flags.is_empty() {
+            return 0;
         }
         let before = b.stmts.len();
-        pass::dead_store_elim_with(b, &dead);
+        pass::dead_store_elim_with(b, &flags);
         pass::dce(b);
-        removed += before - b.stmts.len();
+        before - b.stmts.len()
+    })
+    .iter()
+    .sum::<usize>()
+}
+
+
+/// Print how long each phase of a translation took, when `GEX_TIMING` is set.
+///
+/// Static recompilation is a pipeline of a few large passes and the balance
+/// between them is not obvious -- and it moves. Lifting was the whole cost
+/// until it was spread over the cores, and then wasm encoding was. Without a
+/// breakdown the next round of that is guesswork.
+struct Phases {
+    on: bool,
+    last: std::time::Instant,
+}
+
+impl Phases {
+    fn start() -> Phases {
+        Phases {
+            on: std::env::var_os("GEX_TIMING").is_some(),
+            last: std::time::Instant::now(),
+        }
     }
-    removed
+
+    fn mark(&mut self, what: &str) {
+        if self.on {
+            eprintln!("[timing] {what}: {:.2}s", self.last.elapsed().as_secs_f64());
+        }
+        self.last = std::time::Instant::now();
+    }
 }
 
 pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
+    let mut phases = Phases::start();
     let view = CodeView::new(image);
     let (text_lo, text_hi) = image.text_range;
     let mut builder =
@@ -336,6 +396,7 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
         }
         stats.discovered_exhaustively = worklist.len().saturating_sub(before);
     }
+    phases.mark("seeding");
 
     // Breadth-first, a level at a time, because a level lifts in parallel and
     // an address-ordered worklist does not. In `--exhaustive` mode the first
@@ -389,6 +450,8 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
         frontier = next;
     }
 
+    phases.mark("lifting");
+
     // Back into address order, which is what the worklist used to produce.
     // Emission order fixes the function indices and therefore the module's
     // bytes, which the compiled-module cache is keyed on; it also decides
@@ -399,12 +462,15 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     // Flag liveness needs the whole graph, so it runs once discovery has
     // finished rather than per block.
     stats.dead_flag_stmts = eliminate_dead_flags(&mut collected);
+    phases.mark("flag liveness");
     for block in collected {
         builder.reserve(block.start);
         builder.add_block(block);
     }
+    phases.mark("reserving");
 
     let module = builder.finish();
+    phases.mark("codegen and encoding");
     stats.wasm_bytes = module.wasm.len();
     (module, stats)
 }

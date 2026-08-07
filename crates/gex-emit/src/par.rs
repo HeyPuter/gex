@@ -88,6 +88,64 @@ where
         .collect()
 }
 
+/// Rewrite every item in place, on as many cores as there are.
+///
+/// The index comes with the item because the callers key their own
+/// precomputed state by position -- liveness per block, say -- and there is
+/// no way to recover it from a `&mut T` alone.
+#[cfg(feature = "parallel")]
+pub fn map_mut<T, R, F>(items: &mut [T], f: &F) -> Vec<R>
+where
+    T: Send,
+    R: Send + Default + Clone,
+    F: Fn(usize, &mut T) -> R + Sync,
+{
+    const MIN_PARALLEL: usize = 64;
+    let threads = threads();
+    if threads < 2 || items.len() < MIN_PARALLEL {
+        return items.iter_mut().enumerate().map(|(i, t)| f(i, t)).collect();
+    }
+
+    let chunk = items.len().div_ceil(threads * 8).max(1);
+    let mut out: Vec<R> = vec![R::default(); items.len()];
+    // Chunks of both, taken in step, handed out to whichever thread is free.
+    // A `&mut` slice cannot be shared, so the queue owns them and a thread
+    // takes one out rather than borrowing it.
+    let queue: std::sync::Mutex<Vec<(usize, &mut [T], &mut [R])>> = std::sync::Mutex::new(
+        items
+            .chunks_mut(chunk)
+            .zip(out.chunks_mut(chunk))
+            .enumerate()
+            .map(|(n, (a, b))| (n * chunk, a, b))
+            .rev()
+            .collect(),
+    );
+
+    std::thread::scope(|scope| {
+        let queue = &queue;
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(move || loop {
+                    let Some((base, part, dst)) =
+                        queue.lock().unwrap_or_else(|e| e.into_inner()).pop()
+                    else {
+                        return;
+                    };
+                    for (k, item) in part.iter_mut().enumerate() {
+                        dst[k] = f(base + k, item);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            if let Err(e) = h.join() {
+                std::panic::resume_unwind(e);
+            }
+        }
+    });
+    out
+}
+
 /// The single-threaded map, for a build with no threads to spread over --
 /// the browser shim, which reaches this code compiled to wasm.
 #[cfg(not(feature = "parallel"))]
@@ -96,6 +154,15 @@ where
     F: Fn(&T) -> R,
 {
     items.iter().map(f).collect()
+}
+
+/// The single-threaded in-place rewrite. See [`map`].
+#[cfg(not(feature = "parallel"))]
+pub fn map_mut<T, R, F>(items: &mut [T], f: &F) -> Vec<R>
+where
+    F: Fn(usize, &mut T) -> R,
+{
+    items.iter_mut().enumerate().map(|(i, t)| f(i, t)).collect()
 }
 
 #[cfg(test)]

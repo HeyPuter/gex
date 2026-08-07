@@ -201,6 +201,7 @@ mod tests {
         Image {
             bias: 0,
             entry: 0x400000,
+            code: vec![(0x400000, 0x400010)],
             segments: vec![Segment {
                 vaddr: 0x400000,
                 bytes: vec![0; 16],

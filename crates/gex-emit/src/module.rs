@@ -487,6 +487,8 @@ impl ModuleBuilder {
 
     /// Generate all block bodies and encode the module.
     pub fn finish(mut self) -> TranslatedModule {
+        let timing = std::env::var_os("GEX_TIMING").is_some();
+        let started = std::time::Instant::now();
         let compiled: Vec<(u32, Vec<u8>)> = {
             let gir: HashMap<u64, &Block> =
                 self.pending.iter().map(|(b, _)| (b.start, b)).collect();
@@ -514,8 +516,15 @@ impl ModuleBuilder {
             })
         };
         let n_blocks = compiled.len();
+        if timing {
+            eprintln!("[timing]   tier-1 codegen: {:.2}s", started.elapsed().as_secs_f64());
+        }
+        let started = std::time::Instant::now();
         for (f, body) in compiled {
             self.m.define_func(f, body);
+        }
+        if timing {
+            eprintln!("[timing]   defining bodies: {:.2}s", started.elapsed().as_secs_f64());
         }
 
         let mut exported_blocks = Vec::new();
@@ -654,10 +663,15 @@ impl ModuleBuilder {
             next_slot: self.page_table.slots(),
             n_blocks,
         };
+        let started = std::time::Instant::now();
+        let wasm = self
+            .m
+            .encode_with_custom(&[(METADATA_SECTION, meta.encode())]);
+        if timing {
+            eprintln!("[timing]   encoding: {:.2}s", started.elapsed().as_secs_f64());
+        }
         TranslatedModule {
-            wasm: self
-                .m
-                .encode_with_custom(&[(METADATA_SECTION, meta.encode())]),
+            wasm,
             text_base: self.text_base,
             table_slots,
             dir_entries,
