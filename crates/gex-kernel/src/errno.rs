@@ -47,6 +47,8 @@ impl Errno {
     pub const EAFNOSUPPORT: Errno = Errno(97);
     pub const ECONNREFUSED: Errno = Errno(111);
     pub const EADDRINUSE: Errno = Errno(98);
+    /// The same number as EAGAIN on Linux, and the name `flock` uses.
+    pub const EWOULDBLOCK: Errno = Errno(11);
     pub const ENOTCONN: Errno = Errno(107);
     pub const EINPROGRESS: Errno = Errno(115);
     pub const EPROTONOSUPPORT: Errno = Errno(93);

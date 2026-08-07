@@ -353,6 +353,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/neon-move" "$HERE/programs/neon-move.c"
 "$CC" -static -O2 -o "$WORK/itimer" "$HERE/programs/itimer.c"
 "$CC" -static -O2 -o "$WORK/unixsock" "$HERE/programs/unixsock.c"
+"$CC" -static -O2 -o "$WORK/hostfacilities" "$HERE/programs/hostfacilities.c"
 "$CC" -static -O2 -o "$WORK/wlclient" "$HERE/programs/wlclient.c"
 "$CC" -static -O3 -o "$WORK/vector-pie" "$HERE/programs/vector.c"
 # -ffast-math lets the vectoriser reach the by-element multiplies and the
@@ -450,6 +451,37 @@ compare "neon-move" "$WORK/neon-move"
 compare "itimer" "$WORK/itimer"
 # Unix sockets and descriptor passing: see programs/unixsock.c.
 compare "unixsock" "$WORK/unixsock"
+# Shebang scripts, flock and epoll. Not compared against QEMU: the flock and
+# epoll halves agree with it exactly, but qemu-aarch64 can only re-exec itself
+# for the program it was given, so every `execve` of a script fails there with
+# ENOEXEC and succeeds here. The expectation is what Linux does.
+expect "hostfacilities" "$(cat <<'HFEOF'
+interp arg1 [--interp]
+interp got: [shebang1] [extra]
+script 1 exited 4
+interp arg1 [--interp with two words]
+interp got: [shebang2] [extra]
+script 2 exited 4
+exec 3 failed: ENOEXEC
+script 3 exited 9
+exclusive: 0
+second on the same file: -1 EWOULDBLOCK
+a different file: 0
+through a dup: 0
+unlock: 0
+after unlock: 0
+shared then shared: 0 0
+add: 0
+add twice: -1 EEXIST
+nothing ready: 0
+after a write: 1 events=EPOLLIN data=feedface
+mod: 0
+after mod: 1 data=1234
+del: 0
+del twice: -1 ENOENT
+after del: 0
+HFEOF
+)" "$WORK/hostfacilities"
 # The compositor, end to end: see programs/wlclient.c.
 wayland "wayland" "$WORK/wlclient"
 compare "cross-block-flags" "$WORK/flags"

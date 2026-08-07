@@ -714,3 +714,266 @@ impl FileHandle for MemFd {
         })
     }
 }
+
+/// Whole-file advisory locks: `flock`.
+///
+/// A lock belongs to the *open file description*, not to the descriptor and
+/// not to the process, so `dup` and `fork` share one lock and two separate
+/// `open`s of the same path contend. That is the rule that makes `flock`
+/// usable as a mutex between a parent and a child, which is what most callers
+/// want it for.
+///
+/// Debconf found the absence of this: perl's `flock` returned ENOSYS, and
+/// debconf reported it as "locked by another process", so configuring
+/// `x11-common` failed and everything depending on it stayed unconfigured.
+///
+/// One deviation, deliberate and narrow. A blocking request that cannot be
+/// granted returns `EWOULDBLOCK` rather than waiting, because waiting needs
+/// the syscall to be suspended and resumed and there is nothing here that
+/// contends in practice. A spurious `EWOULDBLOCK` is a caller retrying; the
+/// alternative -- granting every lock, which is what "always succeed" does --
+/// is two processes writing the same file believing they are alone.
+#[derive(Debug, Default)]
+pub struct FileLocks {
+    held: Mutex<Vec<Held>>,
+}
+
+#[derive(Debug)]
+struct Held {
+    /// What is locked. Two `open`s of one path contend; two paths do not.
+    file: String,
+    /// Who holds it: the open file description, not the process.
+    key: usize,
+    exclusive: bool,
+}
+
+/// `flock`'s operations.
+pub mod lock_op {
+    pub const SH: u64 = 1;
+    pub const EX: u64 = 2;
+    pub const NB: u64 = 4;
+    pub const UN: u64 = 8;
+}
+
+impl FileLocks {
+    pub fn new() -> FileLocks {
+        FileLocks::default()
+    }
+
+    /// Apply an operation on behalf of one open file description.
+    ///
+    /// `file` names the resource and `key` the owner. Both are needed and
+    /// leaving out the first is a mistake worth naming: with the conflict
+    /// test written over owners alone, a lock on one file refused a lock on
+    /// every other, and debconf -- which locks four unrelated databases in a
+    /// row -- got as far as the second.
+    pub fn flock(&self, file: &str, key: usize, op: u64) -> SysResult {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if op & lock_op::UN != 0 {
+            held.retain(|h| h.key != key);
+            return Ok(0);
+        }
+        let exclusive = op & lock_op::EX != 0;
+        if !exclusive && op & lock_op::SH == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let conflict = held
+            .iter()
+            .any(|h| h.file == file && h.key != key && (exclusive || h.exclusive));
+        if conflict {
+            return Err(Errno::EWOULDBLOCK);
+        }
+        // Re-locking the same description converts the mode, which is what
+        // Linux does rather than stacking two locks.
+        held.retain(|h| !(h.file == file && h.key == key));
+        held.push(Held {
+            file: file.to_string(),
+            key,
+            exclusive,
+        });
+        Ok(0)
+    }
+
+    /// Drop everything a description held, when it is closed.
+    pub fn release(&self, key: usize) {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|h| h.key != key);
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn an_exclusive_lock_excludes_another_description() {
+        let l = FileLocks::new();
+        assert_eq!(l.flock("/a", 1, lock_op::EX), Ok(0));
+        assert_eq!(
+            l.flock("/a", 2, lock_op::EX | lock_op::NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+        assert_eq!(
+            l.flock("/a", 2, lock_op::SH | lock_op::NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+        l.flock("/a", 1, lock_op::UN).unwrap();
+        assert_eq!(l.flock("/a", 2, lock_op::EX), Ok(0));
+    }
+
+    #[test]
+    fn a_lock_on_one_file_says_nothing_about_another() {
+        let l = FileLocks::new();
+        assert_eq!(l.flock("/a", 1, lock_op::EX), Ok(0));
+        assert_eq!(l.flock("/b", 2, lock_op::EX), Ok(0));
+        assert_eq!(l.flock("/c", 3, lock_op::EX), Ok(0));
+    }
+
+    #[test]
+    fn shared_locks_coexist() {
+        let l = FileLocks::new();
+        assert_eq!(l.flock("/a", 1, lock_op::SH), Ok(0));
+        assert_eq!(l.flock("/a", 2, lock_op::SH), Ok(0));
+        assert_eq!(
+            l.flock("/a", 3, lock_op::EX | lock_op::NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+    }
+
+    #[test]
+    fn the_same_description_may_relock_and_convert() {
+        let l = FileLocks::new();
+        assert_eq!(l.flock("/a", 1, lock_op::SH), Ok(0));
+        assert_eq!(
+            l.flock("/a", 1, lock_op::EX),
+            Ok(0),
+            "converting is not contention"
+        );
+        assert_eq!(
+            l.flock("/a", 2, lock_op::SH | lock_op::NB),
+            Err(Errno::EWOULDBLOCK)
+        );
+    }
+
+    #[test]
+    fn closing_releases() {
+        let l = FileLocks::new();
+        l.flock("/a", 1, lock_op::EX).unwrap();
+        l.release(1);
+        assert_eq!(l.flock("/a", 2, lock_op::EX), Ok(0));
+    }
+}
+
+/// An `epoll` set: the descriptors a program is watching, and what it wants
+/// to be told about each.
+///
+/// `poll` hands the kernel its whole list on every call; `epoll` keeps the
+/// list in the kernel and the call only asks what has happened. For a program
+/// watching a handful of descriptors the two are the same amount of work, and
+/// this implementation makes that literal -- an `epoll_wait` turns the
+/// registrations back into the list `poll` already knows how to answer.
+///
+/// It exists because every serious event loop uses it. Xwayland's was the one
+/// that forced the issue: `epoll_create1` returned ENOSYS and it stopped with
+/// "failed to allocate poll structure" before printing anything else.
+#[derive(Debug, Default)]
+pub struct EpollSet {
+    watched: Mutex<Vec<Watch>>,
+}
+
+/// One registration.
+#[derive(Clone, Copy, Debug)]
+pub struct Watch {
+    pub fd: i32,
+    pub events: u32,
+    /// The opaque word the caller wants handed back, which is how it finds
+    /// its own state again. Usually a pointer.
+    pub data: u64,
+}
+
+/// `epoll_ctl`'s operations.
+pub mod epoll_op {
+    pub const ADD: u64 = 1;
+    pub const DEL: u64 = 2;
+    pub const MOD: u64 = 3;
+}
+
+impl EpollSet {
+    pub fn new() -> EpollSet {
+        EpollSet::default()
+    }
+
+    pub fn ctl(&self, op: u64, fd: i32, events: u32, data: u64) -> SysResult {
+        let mut w = self.watched.lock().unwrap_or_else(|e| e.into_inner());
+        match op {
+            epoll_op::ADD => {
+                if w.iter().any(|x| x.fd == fd) {
+                    return Err(Errno::EEXIST);
+                }
+                w.push(Watch { fd, events, data });
+                Ok(0)
+            }
+            epoll_op::MOD => match w.iter_mut().find(|x| x.fd == fd) {
+                Some(x) => {
+                    x.events = events;
+                    x.data = data;
+                    Ok(0)
+                }
+                None => Err(Errno::ENOENT),
+            },
+            epoll_op::DEL => {
+                let before = w.len();
+                w.retain(|x| x.fd != fd);
+                if w.len() == before {
+                    return Err(Errno::ENOENT);
+                }
+                Ok(0)
+            }
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    pub fn watches(&self) -> Vec<Watch> {
+        self.watched
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+impl FileHandle for EpollSet {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
+        Err(Errno::EINVAL)
+    }
+
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata {
+            file_type: FileType::Regular,
+            size: 0,
+            mode: 0o600,
+            ino: 0,
+            mtime: 0,
+        })
+    }
+}
+
+#[cfg(test)]
+mod epoll_tests {
+    use super::*;
+
+    #[test]
+    fn add_modify_and_delete() {
+        let e = EpollSet::new();
+        assert_eq!(e.ctl(epoll_op::ADD, 3, 1, 0xaa), Ok(0));
+        assert_eq!(e.ctl(epoll_op::ADD, 3, 1, 0xbb), Err(Errno::EEXIST));
+        assert_eq!(e.ctl(epoll_op::MOD, 3, 4, 0xcc), Ok(0));
+        assert_eq!(e.watches()[0].events, 4);
+        assert_eq!(e.watches()[0].data, 0xcc);
+        assert_eq!(e.ctl(epoll_op::DEL, 3, 0, 0), Ok(0));
+        assert!(e.watches().is_empty());
+        assert_eq!(e.ctl(epoll_op::DEL, 3, 0, 0), Err(Errno::ENOENT));
+        assert_eq!(e.ctl(epoll_op::MOD, 3, 0, 0), Err(Errno::ENOENT));
+    }
+}

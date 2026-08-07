@@ -127,6 +127,10 @@ pub mod nr {
     pub const ACCEPT: u64 = 202;
     pub const ACCEPT4: u64 = 242;
     pub const MEMFD_CREATE: u64 = 279;
+    pub const FLOCK: u64 = 32;
+    pub const EPOLL_CREATE1: u64 = 20;
+    pub const EPOLL_CTL: u64 = 21;
+    pub const EPOLL_PWAIT: u64 = 22;
     pub const CONNECT: u64 = 203;
     pub const GETSOCKNAME: u64 = 204;
     pub const GETPEERNAME: u64 = 205;
@@ -372,10 +376,14 @@ pub struct Kernel {
     pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
     /// The same trick for unix sockets, which are a different concrete type.
     pub unix_sockets: std::collections::HashMap<usize, Arc<unix::UnixSocket>>,
+    /// And for epoll sets.
+    pub epolls: std::collections::HashMap<usize, Arc<unix::EpollSet>>,
     /// Which unix socket answers to which path. Shared system-wide, because
     /// a server and its clients are different processes and the whole point
     /// of a named socket is that they find each other by name.
     pub socket_names: Arc<unix::SocketNames>,
+    /// Advisory whole-file locks, shared for the same reason.
+    pub file_locks: Arc<unix::FileLocks>,
     /// File mappings whose writes are meant to reach the file.
     pub shared_maps: Vec<SharedMap>,
     /// Executable mappings made since the host last looked.
@@ -544,6 +552,16 @@ pub struct PollFd {
 pub enum PollReport {
     /// `revents` in place, in the caller's `pollfd` array.
     Poll,
+    /// `epoll_wait`'s output array: one `struct epoll_event` per ready
+    /// descriptor, rather than a slot for every one that was asked about.
+    Epoll {
+        /// Where the array starts.
+        out: u64,
+        /// How many entries fit.
+        max: u32,
+        /// The opaque word to hand back for each descriptor.
+        data: Vec<(i32, u64)>,
+    },
     /// `select`'s three `fd_set`s. A zero address means the caller did not
     /// pass that set.
     Select {
@@ -592,6 +610,31 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
                 m.write_u32(p.addr + 4, ((r as u32) << 16) | p.events as u32)?;
             }
             Ok(ready)
+        }
+        PollReport::Epoll { out, max, data } => {
+            // Only the ready ones, each with the caller's own token, which is
+            // the whole difference between this and `poll`.
+            let mut n = 0u64;
+            for p in fds {
+                if n >= *max as u64 {
+                    break;
+                }
+                let r = poll_revents(p);
+                if r == 0 {
+                    continue;
+                }
+                let token = data
+                    .iter()
+                    .find(|(fd, _)| *fd == p.fd)
+                    .map(|(_, d)| *d)
+                    .unwrap_or(0);
+                let at = out + n * 16;
+                m.write_u32(at, r as u32)?;
+                m.write_u32(at + 4, 0)?;
+                m.write_u64(at + 8, token)?;
+                n += 1;
+            }
+            Ok(n)
         }
         PollReport::Select {
             nfds,
@@ -811,7 +854,9 @@ impl Kernel {
             resolver: Arc::new(net::Resolver::new()),
             sockets: Default::default(),
             unix_sockets: Default::default(),
+            epolls: Default::default(),
             socket_names: Arc::new(unix::SocketNames::new()),
+            file_locks: Arc::new(unix::FileLocks::new()),
             winsize: (24, 80),
             termios: COOKED_TERMIOS,
         }
@@ -856,11 +901,72 @@ impl Kernel {
         a: [u64; 6],
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
         let (path, argv, envp) = self.read_exec_args(m, a)?;
+        let (path, argv) = self.resolve_interpreter(path, argv)?;
         let image = self.read_file(&path).ok_or(Errno::ENOENT)?;
         if image.len() < 64 || &image[..4] != b"\x7fELF" {
             return Err(Errno::ENOEXEC);
         }
         Ok((path, argv, envp))
+    }
+
+    /// Follow a `#!` line, so a script can be executed like a program.
+    ///
+    /// Linux does this in the kernel, not the shell: `execve` on a file
+    /// beginning `#!` runs the named interpreter with the script's path
+    /// inserted as its first argument. Without it every interpreted script in
+    /// a distribution fails to start, and what the caller sees is not a clear
+    /// error but whatever its shell decides to do next -- Debian's
+    /// `x11-common` postinst runs a Perl script through debconf, dash got
+    /// ENOENT, fell back to reading it as shell, and reported
+    /// `use: not found`.
+    ///
+    /// The line is `#!` then optional spaces, the interpreter, then at most
+    /// *one* argument, which is Linux's rule and not an oversight: everything
+    /// after the first space is a single argument even if it contains more
+    /// spaces. `#!/usr/bin/perl -w` passes `-w`; `#!/usr/bin/env perl -w`
+    /// passes `perl -w` as one word, which is why that form does not work on
+    /// Linux either.
+    ///
+    /// Nesting is bounded. A script naming itself would otherwise loop.
+    fn resolve_interpreter(
+        &mut self,
+        mut path: String,
+        mut argv: Vec<String>,
+    ) -> Result<(String, Vec<String>), Errno> {
+        for _ in 0..4 {
+            let head = self.read_file(&path).ok_or(Errno::ENOENT)?;
+            if head.len() >= 4 && &head[..4] == b"\x7fELF" {
+                return Ok((path, argv));
+            }
+            if head.len() < 2 || &head[..2] != b"#!" {
+                return Ok((path, argv));
+            }
+            // Only the first line, and Linux truncates it at 255 bytes.
+            let line_end = head[..head.len().min(255)]
+                .iter()
+                .position(|&c| c == b'\n')
+                .unwrap_or(head.len().min(255));
+            let line = String::from_utf8_lossy(&head[2..line_end]);
+            let line = line.trim_start();
+            let (interp, arg) = match line.find(char::is_whitespace) {
+                Some(at) => (&line[..at], line[at..].trim()),
+                None => (line, ""),
+            };
+            if interp.is_empty() {
+                return Err(Errno::ENOEXEC);
+            }
+            // argv[0] as the caller gave it is replaced by the script's path,
+            // which is what the interpreter is asked to open.
+            let mut next = vec![interp.to_string()];
+            if !arg.is_empty() {
+                next.push(arg.to_string());
+            }
+            next.push(path.clone());
+            next.extend(argv.into_iter().skip(1));
+            argv = next;
+            path = self.vfs.absolute(interp);
+        }
+        Err(Errno::ELOOP)
     }
 
     /// Read `execve`'s path and its two string vectors out of guest memory,
@@ -942,9 +1048,11 @@ impl Kernel {
             resolver: Arc::clone(&self.resolver),
             sockets: self.sockets.clone(),
             unix_sockets: self.unix_sockets.clone(),
+            epolls: self.epolls.clone(),
             // Named sockets are system-wide: a forked child must still be
             // able to reach a server its parent could.
             socket_names: Arc::clone(&self.socket_names),
+            file_locks: Arc::clone(&self.file_locks),
             winsize: self.winsize,
             termios: self.termios,
         }
@@ -1398,7 +1506,7 @@ impl Kernel {
             nr::PREAD64 => self.sys_pread(m, a[0] as i32, a[1], a[2], a[3]),
             nr::PWRITE64 => self.sys_pwrite(m, a[0] as i32, a[1], a[2], a[3]),
             nr::OPENAT => self.sys_openat(m, a[0] as i32, a[1], a[2], a[3] as u32),
-            nr::CLOSE => self.fds.close(a[0] as i32).map(|_| 0),
+            nr::CLOSE => self.sys_close(a[0] as i32),
             nr::LSEEK => self
                 .fds
                 .get(a[0] as i32)
@@ -1545,6 +1653,10 @@ impl Kernel {
             nr::ACCEPT4 => self.sys_unix_accept(m, a[0] as i32, a[1], a[2], a[3]),
             nr::SOCKETPAIR => self.sys_socketpair(m, a[0], a[1], a[3]),
             nr::MEMFD_CREATE => self.sys_memfd_create(m, a[0], a[1]),
+            nr::FLOCK => self.sys_flock(a[0] as i32, a[1]),
+            nr::EPOLL_CREATE1 => self.sys_epoll_create(a[0]),
+            nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
+            nr::EPOLL_PWAIT => self.sys_epoll_wait(m, a[0] as i32, a[1], a[2] as u32),
             // No listening, though: a page cannot be connected to.
             nr::SET_TID_ADDRESS => {
                 self.clear_child_tid = a[0];
@@ -2913,6 +3025,136 @@ impl Kernel {
     /// A Wayland client's buffers are these. The `path` recorded is what
     /// Linux shows in `/proc/self/fd`, which is where a program looks to work
     /// out what a descriptor it was handed actually is.
+    /// `close`, which also drops any advisory lock the description held.
+    ///
+    /// Only when this was the last descriptor onto it: `dup` and `fork` share
+    /// one description and one lock, so closing a copy releases nothing. And
+    /// it has to happen, because the lock is keyed by the description's
+    /// address and a freed one's address is handed straight back to the next
+    /// open -- a stale lock would then belong to an unrelated file.
+    fn sys_close(&mut self, fd: i32) -> SysResult {
+        let file = self.fds.get(fd)?;
+        let key = Arc::as_ptr(&file) as *const () as usize;
+        self.fds.close(fd)?;
+        // One reference in the table is gone; `file` is the other. Anything
+        // above that is another descriptor.
+        if Arc::strong_count(&file) == 1 {
+            self.file_locks.release(key);
+        }
+        Ok(0)
+    }
+
+    /// `epoll_create1`.
+    fn sys_epoll_create(&mut self, flags: u64) -> SysResult {
+        const EPOLL_CLOEXEC: u64 = 0o2000000;
+        let set = Arc::new(unix::EpollSet::new());
+        let handle: Arc<dyn crate::vfs::FileHandle> = set.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let file = OpenFile::new(handle, "anon_inode:[eventpoll]".into(), 0, true, true);
+        let fd = self.fds.insert(file, flags & EPOLL_CLOEXEC != 0)?;
+        self.epolls.insert(key, set);
+        Ok(fd)
+    }
+
+    /// The epoll set behind a descriptor.
+    ///
+    /// Kept in a side table for the same reason sockets are: an
+    /// `Arc<dyn FileHandle>` cannot be asked what it really is.
+    fn epoll_of(&self, fd: i32) -> Result<Arc<unix::EpollSet>, Errno> {
+        let file = self.fds.get(fd)?;
+        let key = Arc::as_ptr(&file.handle) as *const () as usize;
+        self.epolls.get(&key).cloned().ok_or(Errno::EINVAL)
+    }
+
+    /// `epoll_ctl`. A `struct epoll_event` on aarch64 is a 32-bit event mask,
+    /// four bytes of padding, and the caller's 64-bit token -- unlike x86-64,
+    /// where the structure is packed and the token starts at offset four.
+    fn sys_epoll_ctl(
+        &mut self,
+        m: &GuestMem<'_>,
+        epfd: i32,
+        op: u64,
+        fd: i32,
+        event: u64,
+    ) -> SysResult {
+        let set = self.epoll_of(epfd)?;
+        // `EPOLL_CTL_DEL` is allowed a null event pointer.
+        let (events, data) = if event == 0 {
+            (0, 0)
+        } else {
+            (m.read_u32(event)?, m.read_u64(event + 8)?)
+        };
+        // Watching something that is not open is an error, and a program that
+        // gets silence instead waits for a readiness that cannot arrive.
+        if op != unix::epoll_op::DEL {
+            self.fds.get(fd)?;
+        }
+        set.ctl(op, fd, events, data)
+    }
+
+    /// `epoll_pwait`, answered from the same readiness the `poll` path uses.
+    fn sys_epoll_wait(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        epfd: i32,
+        out: u64,
+        max: u32,
+    ) -> SysResult {
+        let set = self.epoll_of(epfd)?;
+        let ready = self.epoll_ready(&set);
+        let n = self.write_epoll_events(m, out, max, &ready)?;
+        Ok(n)
+    }
+
+    /// Which of a set's descriptors are ready, and with what.
+    fn epoll_ready(&self, set: &unix::EpollSet) -> Vec<(u32, u64)> {
+        let mut out = Vec::new();
+        for w in set.watches() {
+            let Ok(file) = self.fds.get(w.fd) else {
+                // A closed descriptor is dropped from the answer rather than
+                // reported; Linux removes it from the set entirely.
+                continue;
+            };
+            let p = PollFd {
+                addr: 0,
+                fd: w.fd,
+                events: (w.events & 0xffff) as u16,
+                handle: Some(Arc::clone(&file.handle)),
+                writable: file.writable,
+            };
+            let got = poll_revents(&p) as u32;
+            if got != 0 {
+                out.push((got, w.data));
+            }
+        }
+        out
+    }
+
+    fn write_epoll_events(
+        &self,
+        m: &mut GuestMem<'_>,
+        out: u64,
+        max: u32,
+        ready: &[(u32, u64)],
+    ) -> SysResult {
+        let n = ready.len().min(max as usize);
+        for (i, (events, data)) in ready.iter().take(n).enumerate() {
+            let at = out + i as u64 * 16;
+            m.write_u32(at, *events)?;
+            m.write_u32(at + 4, 0)?;
+            m.write_u64(at + 8, *data)?;
+        }
+        Ok(n as u64)
+    }
+
+    /// `flock`. The open file description owns the lock, and its address is
+    /// a stable name for it while it is open.
+    fn sys_flock(&mut self, fd: i32, op: u64) -> SysResult {
+        let file = self.fds.get(fd)?;
+        let key = Arc::as_ptr(&file) as *const () as usize;
+        self.file_locks.flock(&file.path, key, op)
+    }
+
     fn sys_memfd_create(&mut self, m: &GuestMem<'_>, name: u64, flags: u64) -> SysResult {
         const MFD_CLOEXEC: u64 = 1;
         let raw = m.read_cstr(name, 249)?;
@@ -3696,6 +3938,10 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::LISTEN => "listen",
         nr::ACCEPT4 => "accept4",
         nr::MEMFD_CREATE => "memfd_create",
+        nr::FLOCK => "flock",
+        nr::EPOLL_CREATE1 => "epoll_create1",
+        nr::EPOLL_CTL => "epoll_ctl",
+        nr::EPOLL_PWAIT => "epoll_pwait",
         nr::ACCEPT => "accept",
         nr::GETSOCKNAME => "getsockname",
         nr::GETPEERNAME => "getpeername",
