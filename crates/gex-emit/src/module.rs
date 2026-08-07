@@ -125,6 +125,17 @@ impl PageTable {
         self.pages.get(&page).copied()
     }
 
+    /// Give up a page's slots, so the next translation of it gets fresh ones.
+    ///
+    /// Used when the guest unmaps executable memory. The old slots are not
+    /// reused -- reusing them would leave the guest's directory pointing at a
+    /// base whose contents are about to change under it, which is exactly the
+    /// bug this exists to close. They are simply abandoned; the table grows,
+    /// and a program has to unmap a great deal of code before that matters.
+    pub fn forget(&mut self, page: u64) -> Option<u32> {
+        self.pages.remove(&page)
+    }
+
     /// Total slots allocated so far, by this table and everything sharing its
     /// mark.
     pub fn slots(&self) -> u64 {

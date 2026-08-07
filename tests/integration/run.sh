@@ -549,6 +549,8 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/exitrace" "$HERE/programs/exitrace.c" -lpthread
 "$CC" -static -no-pie -O2 -o "$WORK/fork" "$HERE/programs/fork.c"
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
+"$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
+"$CC" -static -O2 -o "$WORK/selfmod" "$HERE/programs/selfmod.c"
 "$CC" -static -no-pie -O2 -o "$WORK/init" "$HERE/programs/init.c"
 "$CC" -static -no-pie -O2 -pthread -o "$WORK/forkthread" "$HERE/programs/forkthread.c"
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
@@ -794,6 +796,18 @@ compare "neon-pairwise" "$WORK/neon-pairwise"
 compare "fp-literal" "$WORK/fp-literal"
 compare "unixsock-visible" "$WORK/unixsock-visible"
 compare "iov-partial" "$WORK/iov-partial"
+# What `brk` moves over must read as zero. Lowering the break and raising it
+# again is the case that shows it: growing into never-touched memory is clean
+# by accident, because a fresh wasm memory is zero to begin with.
+compare "brk-zero" "$WORK/brk-zero"
+# A guest that writes its own machine code -- a JVM, a JavaScript engine, a
+# regex compiler -- and a plugin host that maps a different library over an
+# address it has already run code at. A dispatch slot answers for an address,
+# not for the bytes at it, so without invalidation the guest calls its new
+# function and runs the old one, silently and with no fault anywhere. Every
+# round returns a different constant so a stale translation reads as the
+# previous answer.
+compare "selfmod" "$WORK/selfmod"
 compare "signal-kill" "$WORK/signal-kill"
 compare "signal-alarm" "$WORK/signal-alarm"
 compare "signal-sigchld" "$WORK/signal-sigchld"

@@ -401,6 +401,16 @@ pub struct Kernel {
     pub shared_maps: Vec<SharedMap>,
     /// Executable mappings made since the host last looked.
     pub new_code: Vec<CodeMap>,
+    /// Executable ranges *unmapped* since the host last looked.
+    ///
+    /// A translation is only valid while the code it was made from is still
+    /// there. `dlclose` unmaps a library and a later `dlopen` maps a
+    /// different one over the same addresses, and without this the guest
+    /// branches into the previous library's translated code -- the dispatch
+    /// slot still answers for the page. Nothing reports an error; the guest
+    /// simply runs the wrong function. A long-running X server does exactly
+    /// this every time its last client disconnects and it resets.
+    pub retired_code: Vec<(u64, u64)>,
     /// Serial for the unnamed files `O_TMPFILE` asks for.
     pub next_tmpfile: u64,
     /// The file-creation mask. Recorded rather than applied: nothing here
@@ -886,6 +896,7 @@ impl Kernel {
             started: 0,
             shared_maps: Vec::new(),
             new_code: Vec::new(),
+            retired_code: Vec::new(),
             next_tmpfile: 0,
             umask: 0o022,
             net: None,
@@ -1082,6 +1093,7 @@ impl Kernel {
             started: self.now_nanos(),
             shared_maps: Vec::new(),
             new_code: Vec::new(),
+            retired_code: Vec::new(),
             next_tmpfile: self.next_tmpfile,
             umask: self.umask,
             net: self.net.clone(),
@@ -1675,17 +1687,34 @@ impl Kernel {
             nr::FCHOWN | nr::FCHOWNAT => Ok(0),
 
             // -- memory ------------------------------------------------------
-            nr::BRK => Ok(self.mem.brk(a[0])),
+            nr::BRK => {
+                // Zeroed, because Linux zeroes it and libc counts on that.
+                let (result, grew) = self.mem.brk_grow(a[0]);
+                if let Some((from, to)) = grew {
+                    let _ = m.zero(from, (to - from) as usize);
+                }
+                Ok(result)
+            }
             nr::MMAP => self.sys_mmap(m, a),
             nr::MUNMAP => {
                 let flushed = self.flush_shared(m, a[0], a[1]);
                 self.shared_maps
                     .retain(|s| s.start + s.len <= a[0] || s.start >= a[0] + a[1]);
+                self.retire_code(a[0], a[1]);
                 flushed.and_then(|_| self.mem.unmap(a[0], a[1])).map(|_| 0)
             }
             nr::MSYNC => self.flush_shared(m, a[0], a[1]).map(|_| 0),
             nr::MREMAP => self.sys_mremap(m, a),
-            nr::MPROTECT => self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0),
+            nr::MPROTECT => {
+                // Losing execute retires the translations as surely as
+                // unmapping does: `ld.so` applies RELRO by dropping write,
+                // but a JIT in the guest flips a page from executable back to
+                // writable precisely so it can put different code there.
+                if (a[2] as u32) & crate::mem::prot::EXEC == 0 {
+                    self.retire_code(a[0], a[1]);
+                }
+                self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0)
+            }
             nr::MADVISE => Ok(0),
 
             // -- process and time --------------------------------------------
@@ -3312,6 +3341,29 @@ impl Kernel {
             self.fds.get(fd)?;
         }
         set.ctl(op, fd, events, data)
+    }
+
+    /// Note that `[addr, addr + len)` no longer holds the code it did.
+    ///
+    /// Only ranges that overlap an executable mapping are worth reporting:
+    /// unmapping the heap or a data file happens constantly and has no
+    /// translations behind it.
+    fn retire_code(&mut self, addr: u64, len: u64) {
+        let (start, end) = (
+            crate::mem::page_align_down(addr),
+            crate::mem::page_align_up(addr.saturating_add(len)),
+        );
+        if end <= start {
+            return;
+        }
+        let executable = self
+            .mem
+            .vmas()
+            .iter()
+            .any(|v| v.prot & crate::mem::prot::EXEC != 0 && v.start < end && v.end > start);
+        if executable {
+            self.retired_code.push((start, end));
+        }
     }
 
     /// `epoll_pwait`, answered from the same readiness the `poll` path uses.

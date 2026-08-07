@@ -93,19 +93,38 @@ impl MemoryMap {
     /// `brk(0)` reports the break; `brk(addr)` moves it and returns the new
     /// value. Linux returns the *current* break on failure rather than an
     /// error, which is what libc's allocator probes for.
-    pub fn brk(&mut self, addr: u64) -> u64 {
+    ///
+    /// The second return value is the range the break just grew over, which
+    /// the caller must zero. See [`Self::brk`]'s note on why that is not
+    /// optional.
+    pub fn brk_grow(&mut self, addr: u64) -> (u64, Option<(u64, u64)>) {
         if addr == 0 {
-            return self.brk_cur;
+            return (self.brk_cur, None);
         }
         let new = page_align_up(addr);
         if new < self.brk_start || new >= MMAP_BOTTOM {
-            return self.brk_cur;
+            return (self.brk_cur, None);
         }
-        if new > self.brk_cur {
-            self.insert(self.brk_cur, new, prot::READ | prot::WRITE, "[heap]");
+        let grew = (new > self.brk_cur).then_some((self.brk_cur, new));
+        if let Some((from, to)) = grew {
+            self.insert(from, to, prot::READ | prot::WRITE, "[heap]");
         }
         self.brk_cur = new;
-        addr
+        (addr, grew)
+    }
+
+    /// Move the break without zeroing what it exposed.
+    ///
+    /// Only for callers with no guest memory to hand -- tests, mostly. A
+    /// syscall must use [`Self::brk_grow`] and zero the range: Linux
+    /// guarantees that memory reads as zero, and glibc's `calloc` *relies* on
+    /// it, skipping its own memset for the part of a chunk that came from a
+    /// fresh `sbrk`. Handing back the previous program's bytes instead means
+    /// `calloc` returns uninitialised memory, and the first thing that
+    /// notices is the dynamic loader finding a garbage field in a structure
+    /// it just allocated.
+    pub fn brk(&mut self, addr: u64) -> u64 {
+        self.brk_grow(addr).0
     }
 
     /// Find and reserve a free range of `len` bytes.

@@ -264,7 +264,16 @@ pub fn load_or_compile(
                 // which is what eviction sorts by. It is a few hundred bytes
                 // and it is the difference between keeping the modules that
                 // get reused and keeping whichever happen to be newest.
-                let _ = std::fs::write(&meta_path, &metadata);
+                //
+                // Through `store`, not `fs::write`, because this is the one
+                // write that happens on the *common* path -- every hit, in
+                // every process -- and `fs::write` truncates before it fills.
+                // Two runs of the same program at once and one of them reads
+                // the other's empty file: "cached module metadata is
+                // unreadable", from a cache entry that is perfectly good.
+                // Thirty concurrent runs of one binary failed twenty-three
+                // times that way.
+                store(dir, &meta_path, &metadata);
                 return Ok(Loaded {
                     module,
                     metadata,
@@ -306,9 +315,16 @@ fn store(dir: &Path, path: &Path, bytes: &[u8]) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
+    // Unique per *write*, not per process: two threads storing the same key
+    // -- which happens whenever two guest threads translate at once -- would
+    // otherwise share one temp file, and one would rename the other's
+    // half-written bytes into place. Atomic-by-rename is only atomic if
+    // nobody else is writing the thing being renamed.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = dir.join(format!(
-        "tmp-{}-{}",
+        "tmp-{}-{}-{}",
         std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
         path.file_name().and_then(|n| n.to_str()).unwrap_or("x")
     ));
     if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
@@ -318,6 +334,57 @@ fn store(dir: &Path, path: &Path, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    /// A hit must never leave the metadata visible in a partial state.
+    ///
+    /// Refreshing the mtime used to truncate-and-rewrite it in place, so two
+    /// processes running the same program at once raced and one of them read
+    /// an empty file. It is the *hit* path, so it is the path every run takes
+    /// once the cache is warm.
+    #[test]
+    fn a_concurrent_reader_never_sees_half_a_meta_file() {
+        let dir = std::env::temp_dir().join(format!("gex-meta-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k.meta");
+        let payload = vec![7u8; 4096];
+        super::store(&dir, &path, &payload);
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let saw_partial = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        super::store(&dir, &path, &payload);
+                    }
+                });
+            }
+            for _ in 0..2000 {
+                // Absent is allowed -- a reader can look between the unlink
+                // and the link of a rename. Present and the wrong length is
+                // not.
+                if let Ok(got) = std::fs::read(&path) {
+                    if got.len() != payload.len() {
+                        saw_partial.store(got.len(), std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+            // Set before any assertion: a panic here would leave the writers
+            // spinning and the scope never joining, so a failing test would
+            // hang instead of failing.
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let short = saw_partial.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            short,
+            usize::MAX,
+            "a reader saw a {short}-byte file where {} were written",
+            payload.len()
+        );
+    }
+
     use super::*;
 
     #[test]

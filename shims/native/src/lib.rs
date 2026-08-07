@@ -2389,6 +2389,16 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A shared library has just been mapped. Recompile the whole
             // object now rather than letting the runtime translator find it
             // one dispatch miss at a time.
+            // Code that has gone away. Done before the newly mapped code
+            // below, because a `dlclose` followed by a `dlopen` lands the new
+            // object on the addresses the old one had, and retiring after
+            // would throw away the translation just made for it.
+            let retired: Vec<(u64, u64)> = caller
+                .data_mut()
+                .with_kernel(|k| std::mem::take(&mut k.retired_code));
+            if !retired.is_empty() {
+                retire_translations(&mut caller, &retired)?;
+            }
             let mapped: Vec<gex_kernel::CodeMap> = caller
                 .data_mut()
                 .with_kernel(|k| std::mem::take(&mut k.new_code));
@@ -2635,7 +2645,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::CACHE_OP,
-        |caller: Caller<'_, HostState>, _ctx: i32, _pc: i64, op: i32, addr: i64| -> Result<()> {
+        |mut caller: Caller<'_, HostState>, _ctx: i32, _pc: i64, op: i32, addr: i64| -> Result<()> {
             if op == gex_abi::cache_op::DC_ZVA {
                 let memory = caller
                     .data()
@@ -2650,8 +2660,27 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     data[start..end].fill(0);
                 }
             }
-            // IC IVAU / ISB are the self-modifying-code hooks (PLAN §6.2).
-            // With no runtime translation yet there is nothing to invalidate.
+            // `ic ivau` is the guest saying, in the only way the architecture
+            // gives it, that the bytes at this address are no longer the
+            // instructions that were there. It is what every code generator
+            // emits after writing, and the one hook a translator cannot
+            // ignore: a dispatch slot answers for an address, so without this
+            // the guest calls its newly compiled function and runs the
+            // previous one.
+            //
+            // Retirement is by dispatch page rather than by the cache line
+            // the instruction names. Coarser than it needs to be, and cheap
+            // in the shape this actually arrives in: a generator writes a
+            // whole function, then sweeps it with one `ic ivau` per line, and
+            // every line after the first in a page finds it already retired.
+            if op == gex_abi::cache_op::IC_INVALIDATE {
+                let addr = addr as u64;
+                let page = addr / gex_abi::DISPATCH_PAGE;
+                retire_translations(
+                    &mut caller,
+                    &[(page * gex_abi::DISPATCH_PAGE, (page + 1) * gex_abi::DISPATCH_PAGE)],
+                )?;
+            }
             Ok(())
         },
     )?;
@@ -3042,6 +3071,73 @@ fn install_unit(
         .unwrap()
         .instances
         .push(instance);
+    Ok(())
+}
+
+/// Forget the translations of code the guest has unmapped.
+///
+/// A dispatch slot answers for a guest address, not for the bytes that were
+/// at it. `dlclose` unmaps a library; a later `dlopen` maps a different one
+/// over the same range; and the directory still points the old translations
+/// at those addresses. The guest calls into the new library and runs the old
+/// one's code. Nothing reports an error -- an X server resetting after its
+/// last client disconnects simply dies somewhere unrelated, inside its own
+/// dynamic loader, several dlopens later.
+///
+/// Three things have to go, together:
+///
+///   * the page's directory entry, so a branch there misses;
+///   * the page's slot assignment, so the next translation is given fresh
+///     slots rather than rewriting the ones an older unit still owns;
+///   * the addresses in `translated`, so discovery does not skip them as
+///     already done.
+///
+/// The old slots are abandoned rather than reused. Reuse would mean a stale
+/// unit replayed into a new store could refill them, and the ordering that
+/// makes replay safe -- newest wins -- only holds while a base belongs to one
+/// page for the life of the run.
+fn retire_translations(
+    caller: &mut impl wasmtime::AsContextMut<Data = HostState>,
+    ranges: &[(u64, u64)],
+) -> Result<()> {
+    let Some(shared) = caller
+        .as_context()
+        .data()
+        .jit
+        .as_ref()
+        .map(|j| Arc::clone(&j.shared))
+    else {
+        return Ok(());
+    };
+    let memory = caller
+        .as_context()
+        .data()
+        .memory
+        .clone()
+        .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+
+    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pages = 0usize;
+    for &(start, end) in ranges {
+        sh.translated.retain(|a| *a < start || *a >= end);
+        let (first, last) = (
+            start / gex_abi::DISPATCH_PAGE,
+            (end - 1) / gex_abi::DISPATCH_PAGE,
+        );
+        for page in first..=last {
+            if sh.page_table.forget(page).is_some() {
+                pages += 1;
+            }
+            let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+            let data = memory.bytes();
+            if off + 4 <= data.len() {
+                data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+    if pages > 0 && std::env::var_os("GEX_VERBOSE_OBJECTS").is_some() {
+        eprintln!("[gex] retired {pages} dispatch pages the guest unmapped");
+    }
     Ok(())
 }
 
