@@ -1,0 +1,13 @@
+[package]
+name = "gex-gl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenGL ES passthrough: a guest's GL calls, run on the host's GL"
+
+[dependencies]
+
+# The host half links against the host's own GL. There is nothing to build on
+# a target that has none, and the guest half is C, so this is the only side
+# that needs a library at all.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]

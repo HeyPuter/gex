@@ -1641,6 +1641,7 @@ fn vop3_name(op: VOp3) -> &'static str {
         VOp3::UMinP => "uminp",
         VOp3::SShl => "sshl",
         VOp3::UShl => "ushl",
+        VOp3::FAbd => "fabd",
         VOp3::SAbd => "sabd",
         VOp3::UAbd => "uabd",
         VOp3::FAdd => "fadd",

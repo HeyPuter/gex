@@ -16,6 +16,7 @@ use gex_kernel::{BlockOp, GuestMem, Kernel, KernelProcSource, ProcState, Syscall
 use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
+pub mod gl;
 pub mod wayland;
 
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Module, Ref, Store, Table, Val};
@@ -96,6 +97,9 @@ pub struct RunOptions {
     /// Composite on the GPU. Falls back to the CPU with a note if there is
     /// no adapter.
     pub wayland_gpu: bool,
+    /// Give the guest a graphics device at `/dev/gex-gl`, so its GL calls run
+    /// on the host's GL. See the `gl` module.
+    pub gl: bool,
     /// Statically recompile each shared library as it is mapped, instead of
     /// letting the runtime translator find it a dispatch miss at a time.
     ///
@@ -135,6 +139,7 @@ impl Default for RunOptions {
             wayland_size: (640, 480),
             wayland_out: None,
             wayland_gpu: false,
+            gl: false,
             recompile_objects: false,
             jit: false,
             cwd: None,
@@ -852,7 +857,20 @@ fn stop_other_threads(spawn: &SpawnContext, verbose: bool) {
 }
 
 /// Perform a syscall's blocking half with the kernel unlocked.
-fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno::Errno> {
+/// Run a blocking operation with the kernel unlocked.
+///
+/// `service` is called on every turn of every wait loop. It is how anything
+/// the host provides keeps running while the guest is asleep -- and without
+/// it the compositor is a deadlock: a client writes a request, blocks waiting
+/// for the reply, and the only thing that would produce the reply runs when
+/// the guest makes a syscall, which it will not do again until the reply
+/// arrives. Xwayland found that, and found it intermittently, because a guest
+/// that happens to poll for other reasons breaks the cycle by accident.
+fn perform_block(
+    op: BlockOp,
+    data: &mut [u8],
+    service: &dyn Fn(&mut [u8]),
+) -> Result<u64, gex_kernel::errno::Errno> {
     use gex_kernel::errno::Errno;
     match op {
         BlockOp::FutexWait {
@@ -895,6 +913,7 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
         } => {
             let start = std::time::Instant::now();
             loop {
+                service(data);
                 if gex_kernel::syscalls::poll_ready(&fds) {
                     let mut mem = GuestMem::new(data);
                     return gex_kernel::syscalls::poll_finish(&fds, &report, &mut mem);
@@ -928,6 +947,7 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
         BlockOp::ReadStream { handle, buf, len } => {
             let mut tmp = vec![0u8; len];
             loop {
+                service(data);
                 if handle.poll_readable() {
                     let n = handle.read_at(0, &mut tmp)?;
                     let mut mem = GuestMem::new(data);
@@ -941,6 +961,7 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
             // Only the wait: the descriptor is made by the kernel afterwards,
             // which is the one place that has a descriptor table.
             loop {
+                service(data);
                 if socket.has_pending() {
                     return Ok(0);
                 }
@@ -1476,7 +1497,14 @@ fn mount_filesystems(
         }
         None => kernel.vfs.mount("/", Arc::new(HostFs::new("/"))),
     }
-    kernel.vfs.mount("/dev", Arc::new(DevFs::new()));
+    let mut devfs = DevFs::new();
+    if opts.gl {
+        // Named for what it is rather than as `/dev/dri/renderD128`: this is
+        // not a DRM device and a program that probed it as one would be
+        // misled. The guest's GL library looks for this name.
+        devfs.add("gex-gl", crate::gl::GlDevice::new(1024, 1024));
+    }
+    kernel.vfs.mount("/dev", Arc::new(devfs));
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));
     kernel.vfs.mount(
@@ -2070,7 +2098,18 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A blocking syscall is run here, with the kernel unlocked, and
             // then finished under the lock again.
             let outcome = if let SyscallOutcome::Blocking(op) = outcome {
-                let r = perform_block(op, memory.bytes());
+                let compositor = caller.data().wayland.clone();
+                let kernel_for_service = Arc::clone(&caller.data().kernel);
+                let service = move |bytes: &mut [u8]| {
+                    if let Some(w) = &compositor {
+                        let k = kernel_for_service
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let gm = GuestMem::new(bytes);
+                        w.pump(&k, &gm);
+                    }
+                };
+                let r = perform_block(op, memory.bytes(), &service);
                 let mut gm = GuestMem::new(memory.bytes());
                 caller
                     .data_mut()

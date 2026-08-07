@@ -86,6 +86,8 @@ run options:
                   what size to tell a toplevel window it is (default 640x480)
   --wayland-out PATH
                   write each composited screen as PATH-NNN.ppm
+  --gl            give the guest /dev/gex-gl, so a program linked against the
+                  guest's libGLESv2 runs its OpenGL on the host's
   --wayland-gpu   composite surfaces on the GPU through WebGPU, rather than
                   handing the host one client buffer at a time. Falls back to
                   the CPU, with a note, when there is no adapter
@@ -158,6 +160,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 opts.wayland_size = (w.parse()?, h.parse()?);
             }
             "--wayland-gpu" => opts.wayland_gpu = true,
+            "--gl" => opts.gl = true,
             "--wayland-out" => {
                 i += 1;
                 opts.wayland_out =

@@ -170,6 +170,85 @@ wayland_gpu() {
     pass=$((pass + 1))
 }
 
+# An unmodified OpenGL ES program, run against the host's GL.
+#
+# QEMU is no oracle: there is no graphics device behind it. What is checked is
+# that a program which includes the standard headers and links against
+# libEGL/libGLESv2 by their usual sonames gets a real context, compiles its own
+# GLSL, draws, and reads back the pixels it drew -- with the guest's GL library
+# being a marshaller and the host's driver doing the work.
+#
+# The version string is the host's and varies, so it is only required to be
+# non-empty. The pixels are the test.
+gles() {
+    label="$1"; prog="$2"; root="$3"
+    out="$WORK/$label"
+    set +e
+    "$GEXC" run --gl --sysroot "$root" --env LD_LIBRARY_PATH=/usr/lib \
+        "$prog" >"$out.stdout" 2>"$out.stderr"
+    rc=$?
+    set -e
+    if grep -q "^EGL " "$out.stdout" && ! grep -q "^GL_VERSION .\+" "$out.stdout"; then
+        echo "skip $label: the host has no GL"
+        return
+    fi
+    if [ "$rc" != 0 ]; then
+        echo "FAIL $label: exit status $rc"
+        head -3 "$out.stderr" | sed 's/^/       /'
+        fail=$((fail + 1))
+        return
+    fi
+    got=$(grep -E "^(gl error|inside|outside)" "$out.stdout" | tr '\n' '|')
+    want="gl error 0|inside  0 255 0|outside 0 0 255|"
+    if [ "$got" != "$want" ]; then
+        echo "FAIL $label: got [$got], expected [$want]"
+        head -8 "$out.stdout" | sed 's/^/       /'
+        fail=$((fail + 1))
+        return
+    fi
+    echo "ok   $label ($(sed -n 's/^GL_VERSION //p' "$out.stdout" | head -1))"
+    pass=$((pass + 1))
+}
+
+# The gears, on the host's GL: real geometry, real shaders, real per-frame
+# uniforms. Checked by how much of the frame they cover, which catches a
+# transform that smears them across it or a depth test that loses them, and by
+# GL having reported no error over the whole run.
+gears() {
+    label="$1"; prog="$2"; root="$3"
+    out="$WORK/$label"
+    set +e
+    "$GEXC" run --gl --sysroot "$root" --env LD_LIBRARY_PATH=/usr/lib \
+        "$prog" 30 /gears.ppm >"$out.stdout" 2>"$out.stderr"
+    rc=$?
+    set -e
+    if ! grep -q "^renderer .\+" "$out.stdout"; then
+        echo "skip $label: the host has no GL"
+        return
+    fi
+    if [ "$rc" != 0 ]; then
+        echo "FAIL $label: exit status $rc"
+        head -3 "$out.stderr" | sed 's/^/       /'
+        fail=$((fail + 1))
+        return
+    fi
+    covered=$(sed -n 's/^covered \([0-9]*\)%$/\1/p' "$out.stdout")
+    errors=$(sed -n 's/^gl error //p' "$out.stdout")
+    if [ "$errors" != "0" ]; then
+        echo "FAIL $label: GL reported error $errors"
+        fail=$((fail + 1))
+        return
+    fi
+    if [ -z "$covered" ] || [ "$covered" -lt 5 ] || [ "$covered" -gt 60 ]; then
+        echo "FAIL $label: the gears covered ${covered:-?}% of the frame"
+        head -8 "$out.stdout" | sed 's/^/       /'
+        fail=$((fail + 1))
+        return
+    fi
+    echo "ok   $label (${covered}% covered, $(sed -n 's/^triangles //p' "$out.stdout") triangles)"
+    pass=$((pass + 1))
+}
+
 expect() {
     label="$1"; expected="$2"; shift 2
     g_out="$WORK/$label.gex"
@@ -531,6 +610,31 @@ HFEOF
 wayland "wayland" "$WORK/wlclient"
 # And the same again on the GPU, which must agree exactly.
 wayland_gpu "wayland-gpu" "$WORK/wlclient"
+
+# An unmodified GLES2 program on the host's GL: see programs/gles-triangle.c.
+GLROOT="$WORK/glroot"
+if "$HERE/../../guest/gl/build.sh" "$WORK/glout" >/dev/null 2>&1 &&
+   [ -f "$WORK/glout/libGLESv2.so.2" ] && [ -d /usr/include/GLES2 ]; then
+    rm -rf "$GLROOT"
+    mkdir -p "$GLROOT/lib" "$GLROOT/usr/lib" "$WORK/glinc"
+    cp "$MUSL_LIBC" "$GLROOT/lib/ld-musl-aarch64.so.1"
+    cp "$WORK/glout/libGLESv2.so.2" "$WORK/glout/libEGL.so.1" "$GLROOT/usr/lib/"
+    # The GL headers have no architecture in them, so the host's serve for a
+    # cross build; copied out so the host's libc headers are not dragged in.
+    cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/glinc/" 2>/dev/null || true
+    if "$CC" -O2 -o "$GLROOT/triangle" "$HERE/programs/gles-triangle.c" \
+        -I "$WORK/glinc" -L "$WORK/glout" -lEGL -lGLESv2 2>/dev/null; then
+        gles "gles-triangle" "$GLROOT/triangle" "$GLROOT"
+        if "$CC" -O2 -o "$GLROOT/gears" "$HERE/programs/gles-gears.c" \
+            -I "$WORK/glinc" -L "$WORK/glout" -lEGL -lGLESv2 -lm 2>/dev/null; then
+            gears "gles-gears" "$GLROOT/gears" "$GLROOT"
+        fi
+    else
+        echo "skip gles-triangle: could not build it"
+    fi
+else
+    echo "skip gles-triangle: no guest GL driver"
+fi
 compare "cross-block-flags" "$WORK/flags"
 compare "loops" "$WORK/loops"
 compare "fixed-point" "$WORK/fixedpoint"

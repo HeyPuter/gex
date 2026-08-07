@@ -1212,6 +1212,8 @@ pub enum VOp3 {
     FMul,
     /// `fmulx`: like `fmul` except that zero times infinity is two.
     FMulx,
+    /// `|a - b|` per lane. Xwayland's font code reaches this one.
+    FAbd,
     FDiv,
     FMax,
     FMin,

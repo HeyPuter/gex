@@ -2522,6 +2522,24 @@ impl<'a> Lifter<'a> {
             }
             // Absolute difference: max - min avoids a signed overflow that a
             // subtract-then-abs would hit at the extremes.
+            // `|a - b|`, which for floating point is a subtract and an
+            // absolute value rather than the compare-and-select the integer
+            // forms below need.
+            VOp3::FAbd => {
+                let diff = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Sub,
+                    lane,
+                    a,
+                    b,
+                });
+                let r = self.b.def(Expr::VLaneUn {
+                    op: VLaneUnOp::Abs,
+                    lane,
+                    a: diff,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
             VOp3::SAbd | VOp3::UAbd => {
                 let signed = op == VOp3::SAbd;
                 let hi = self.b.def(Expr::VLaneBin {

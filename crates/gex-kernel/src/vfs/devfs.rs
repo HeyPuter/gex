@@ -4,6 +4,9 @@
 //! and zero sinks, the random sources, the standard-stream symlinks and
 //! `/dev/tty`. Everything else is absent rather than faked, so a program that
 //! needs a real device fails where it would on a container.
+//!
+//! The host may add its own. That is how the guest gets a graphics device: a
+//! node here whose `ioctl` reaches code outside the guest entirely.
 
 use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata};
 use crate::errno::{Errno, SysResult};
@@ -71,11 +74,25 @@ impl FileHandle for DevHandle {
 }
 
 /// The `/dev` filesystem.
-pub struct DevFs;
+pub struct DevFs {
+    /// Nodes the host added, by name without a leading slash.
+    extra: Vec<(String, Arc<dyn FileHandle>)>,
+}
 
 impl DevFs {
     pub fn new() -> DevFs {
-        DevFs
+        DevFs { extra: Vec::new() }
+    }
+
+    /// Add a device the host provides.
+    ///
+    /// The handle is shared, not cloned per open, because a device is one
+    /// thing however many descriptors point at it -- which is what lets a
+    /// graphics device keep a context across the several times a program
+    /// opens it.
+    pub fn add(&mut self, name: &str, handle: Arc<dyn FileHandle>) {
+        self.extra.retain(|(n, _)| n != name);
+        self.extra.push((name.to_string(), handle));
     }
 
     fn device_of(path: &str) -> Option<Device> {
@@ -101,8 +118,13 @@ impl FileSystem for DevFs {
         if let Some(device) = Self::device_of(path) {
             return Ok(Arc::new(DevHandle { device }));
         }
+        if let Some((_, handle)) = self.extra.iter().find(|(n, _)| n == path) {
+            return Ok(Arc::clone(handle));
+        }
         if path.is_empty() {
-            return Ok(Arc::new(DevDir));
+            return Ok(Arc::new(DevDir {
+                extra: self.extra.iter().map(|(n, _)| n.clone()).collect(),
+            }));
         }
         Err(Errno::ENOENT)
     }
@@ -144,7 +166,10 @@ impl FileSystem for DevFs {
 }
 
 #[derive(Debug)]
-struct DevDir;
+struct DevDir {
+    /// Names the host added, so `ls /dev` shows them.
+    extra: Vec<String>,
+}
 
 impl FileHandle for DevDir {
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
@@ -168,7 +193,11 @@ impl FileHandle for DevDir {
         ];
         for name in [
             "null", "zero", "full", "random", "urandom", "tty", "console",
-        ] {
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(self.extra.iter().cloned())
+        {
             out.push(DirEntry {
                 name: name.into(),
                 file_type: FileType::CharDevice,
@@ -214,7 +243,7 @@ mod tests {
 
     #[test]
     fn null_reads_empty_and_swallows_writes() {
-        let f = DevFs.open("null", 0, 0).unwrap();
+        let f = DevFs::new().open("null", 0, 0).unwrap();
         let mut buf = [0xffu8; 8];
         assert_eq!(f.read_at(0, &mut buf).unwrap(), 0);
         assert_eq!(f.write_at(0, b"discarded").unwrap(), 9);
@@ -222,7 +251,7 @@ mod tests {
 
     #[test]
     fn zero_reads_zeros() {
-        let f = DevFs.open("zero", 0, 0).unwrap();
+        let f = DevFs::new().open("zero", 0, 0).unwrap();
         let mut buf = [0xffu8; 8];
         assert_eq!(f.read_at(0, &mut buf).unwrap(), 8);
         assert_eq!(buf, [0u8; 8]);
@@ -230,21 +259,77 @@ mod tests {
 
     #[test]
     fn full_fails_writes_with_enospc() {
-        let f = DevFs.open("full", 0, 0).unwrap();
+        let f = DevFs::new().open("full", 0, 0).unwrap();
         assert_eq!(f.write_at(0, b"x").err(), Some(Errno::ENOSPC));
     }
 
     #[test]
     fn standard_stream_names_are_symlinks_into_proc() {
-        assert_eq!(DevFs.read_link("stdout").unwrap(), "/proc/self/fd/1");
+        assert_eq!(DevFs::new().read_link("stdout").unwrap(), "/proc/self/fd/1");
         assert_eq!(
-            DevFs.metadata("stdout").unwrap().file_type,
+            DevFs::new().metadata("stdout").unwrap().file_type,
             FileType::Symlink
         );
     }
 
     #[test]
     fn unknown_devices_are_absent_rather_than_faked() {
-        assert_eq!(DevFs.open("sda1", 0, 0).err(), Some(Errno::ENOENT));
+        assert_eq!(DevFs::new().open("sda1", 0, 0).err(), Some(Errno::ENOENT));
+    }
+
+    /// A device the host adds is opened like any other, and the same handle
+    /// comes back every time -- which is what lets one keep state across the
+    /// several times a program opens it.
+    #[test]
+    fn a_host_device_is_openable_and_shared() {
+        #[derive(Debug)]
+        struct Counter(std::sync::atomic::AtomicU32);
+        impl FileHandle for Counter {
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> SysResult {
+                Err(Errno::EINVAL)
+            }
+            fn metadata(&self) -> Result<Metadata, Errno> {
+                Ok(Metadata {
+                    file_type: FileType::CharDevice,
+                    size: 0,
+                    mode: 0o666,
+                    ino: 0,
+                    mtime: 0,
+                })
+            }
+            fn ioctl(
+                &self,
+                _m: &mut crate::GuestMem<'_>,
+                request: u64,
+                _arg: u64,
+            ) -> Option<SysResult> {
+                if request == 42 {
+                    let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(Ok(n as u64))
+                } else {
+                    None
+                }
+            }
+        }
+        let device = Arc::new(Counter(std::sync::atomic::AtomicU32::new(0)));
+        let mut fs = DevFs::new();
+        fs.add("gex-thing", device);
+        let a = fs.open("gex-thing", 0, 0).unwrap();
+        let b = fs.open("gex-thing", 0, 0).unwrap();
+        let mut bytes = [0u8; 16];
+        let mut mem = crate::GuestMem::new(&mut bytes);
+        assert_eq!(a.ioctl(&mut mem, 42, 0), Some(Ok(0)));
+        assert_eq!(b.ioctl(&mut mem, 42, 0), Some(Ok(1)), "the same device");
+        assert_eq!(a.ioctl(&mut mem, 7, 0), None, "not its ioctl");
+        // And it is listed, so `ls /dev` shows it.
+        let names: Vec<String> = fs
+            .open("", 0, 0)
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "gex-thing"));
     }
 }

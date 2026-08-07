@@ -661,6 +661,25 @@ mod tests {
 pub struct MemFd {
     pub name: String,
     data: Mutex<Vec<u8>>,
+    /// Seals applied with `F_ADD_SEALS`. See [`seal`].
+    ///
+    /// Enforced rather than recorded. A caller seals a buffer precisely so it
+    /// can stop checking -- Xwayland seals its shared memory against
+    /// shrinking so the compositor cannot be made to read off the end of it --
+    /// and accepting the seal while ignoring it hands back the guarantee
+    /// without the safety.
+    seals: Mutex<u32>,
+}
+
+/// `F_ADD_SEALS` bits.
+pub mod seal {
+    /// No more seals may be added.
+    pub const SEAL: u32 = 1;
+    pub const SHRINK: u32 = 2;
+    pub const GROW: u32 = 4;
+    pub const WRITE: u32 = 8;
+    pub const FUTURE_WRITE: u32 = 0x10;
+    pub const ALL: u32 = SEAL | SHRINK | GROW | WRITE | FUTURE_WRITE;
 }
 
 impl MemFd {
@@ -668,7 +687,40 @@ impl MemFd {
         MemFd {
             name: name.to_string(),
             data: Mutex::new(Vec::new()),
+            seals: Mutex::new(0),
         }
+    }
+
+    pub fn seals(&self) -> u32 {
+        *self.seals.lock().unwrap()
+    }
+
+    /// Add seals. Once `F_SEAL_SEAL` is set nothing more may be added, which
+    /// is the point of it.
+    pub fn add_seals(&self, add: u32) -> SysResult {
+        if add & !seal::ALL != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut held = self.seals.lock().unwrap();
+        if *held & seal::SEAL != 0 {
+            return Err(Errno::EPERM);
+        }
+        *held |= add;
+        Ok(0)
+    }
+
+    /// Make sure the file is at least this long, for `fallocate`.
+    pub fn reserve(&self, upto: u64) -> SysResult {
+        let seals = self.seals();
+        let mut data = self.data.lock().unwrap();
+        if (upto as usize) <= data.len() {
+            return Ok(0);
+        }
+        if seals & seal::GROW != 0 {
+            return Err(Errno::EPERM);
+        }
+        data.resize(upto as usize, 0);
+        Ok(0)
     }
 
     pub fn len(&self) -> u64 {
@@ -690,9 +742,16 @@ impl FileHandle for MemFd {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> SysResult {
+        let seals = self.seals();
+        if seals & (seal::WRITE | seal::FUTURE_WRITE) != 0 {
+            return Err(Errno::EPERM);
+        }
         let mut data = self.data.lock().unwrap();
         let start = offset as usize;
         if start + buf.len() > data.len() {
+            if seals & seal::GROW != 0 {
+                return Err(Errno::EPERM);
+            }
             data.resize(start + buf.len(), 0);
         }
         data[start..start + buf.len()].copy_from_slice(buf);
@@ -700,7 +759,16 @@ impl FileHandle for MemFd {
     }
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {
-        self.data.lock().unwrap().resize(len as usize, 0);
+        let seals = self.seals();
+        let mut data = self.data.lock().unwrap();
+        let len = len as usize;
+        if len < data.len() && seals & seal::SHRINK != 0 {
+            return Err(Errno::EPERM);
+        }
+        if len > data.len() && seals & seal::GROW != 0 {
+            return Err(Errno::EPERM);
+        }
+        data.resize(len, 0);
         Ok(())
     }
 

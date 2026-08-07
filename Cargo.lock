@@ -412,6 +412,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-gl"
+version = "0.0.1"
+
+[[package]]
 name = "gex-gpu"
 version = "0.0.1"
 dependencies = [
@@ -465,6 +469,7 @@ dependencies = [
  "anyhow",
  "gex-abi",
  "gex-cache",
+ "gex-gl",
  "gex-gpu",
  "gex-kernel",
  "gex-ld",

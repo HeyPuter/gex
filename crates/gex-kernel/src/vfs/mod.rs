@@ -162,6 +162,22 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         true
     }
 
+    /// An `ioctl` this handle answers itself.
+    ///
+    /// `None` means "not mine", and the kernel's own handling runs -- which
+    /// is what every ordinary file wants, since the kernel knows about
+    /// terminals and this does not.
+    ///
+    /// Guest memory is passed because an `ioctl` argument is almost always a
+    /// pointer to a structure the device has to read, write, or both. A
+    /// device the host provides -- the graphics device is the one that
+    /// matters -- also uses it to reach the buffers the caller is pointing at,
+    /// which is how a command stream crosses without being copied.
+    fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
+        let _ = (m, request, arg);
+        None
+    }
+
     /// How many bytes a write can take right now, when that is bounded.
     ///
     /// `None` means it is not -- a file, a terminal, a socket -- and a write

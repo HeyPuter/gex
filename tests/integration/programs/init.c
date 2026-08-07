@@ -162,8 +162,38 @@ static int role_init(void) {
     printf("group: both joined -> %s\n",
            getpgid(lead) == lead && getpgid(second) == lead ? "yes" : "no");
     printf("group: kill(-%d, SIGTERM) -> %d\n", (int)lead, kill(-lead, SIGTERM));
-    reap("group");
-    reap("group");
+    /* Two children signalled at once, reaped in whichever order they happen
+       to die. Which comes back first is not something Linux promises and not
+       something this test is about, so they are collected and reported in a
+       fixed order -- reporting them as they arrive made this fail whenever
+       anything changed the timing of a wait. */
+    {
+        int lines = 0;
+        char seen[2][64];
+        for (int i = 0; i < 2; i++) {
+            int status = 0;
+            pid_t pid = wait(&status);
+            if (pid < 0) {
+                snprintf(seen[lines++], sizeof seen[0], "group: wait failed: %s",
+                         strerror(errno));
+            } else if (WIFEXITED(status)) {
+                snprintf(seen[lines++], sizeof seen[0], "group: pid %d exited %d",
+                         (int)pid, WEXITSTATUS(status));
+            } else {
+                snprintf(seen[lines++], sizeof seen[0], "group: pid %d killed by %d",
+                         (int)pid, WTERMSIG(status));
+            }
+        }
+        if (lines == 2 && strcmp(seen[0], seen[1]) > 0) {
+            char tmp[64];
+            memcpy(tmp, seen[0], sizeof tmp);
+            memcpy(seen[0], seen[1], sizeof tmp);
+            memcpy(seen[1], tmp, sizeof tmp);
+        }
+        for (int i = 0; i < lines; i++) {
+            printf("%s\n", seen[i]);
+        }
+    }
 
     /* Nobody left. */
     printf("init: wait with no children -> %s\n",

@@ -128,6 +128,7 @@ pub mod nr {
     pub const ACCEPT4: u64 = 242;
     pub const MEMFD_CREATE: u64 = 279;
     pub const FLOCK: u64 = 32;
+    pub const FALLOCATE: u64 = 47;
     pub const EPOLL_CREATE1: u64 = 20;
     pub const EPOLL_CTL: u64 = 21;
     pub const EPOLL_PWAIT: u64 = 22;
@@ -378,6 +379,8 @@ pub struct Kernel {
     pub unix_sockets: std::collections::HashMap<usize, Arc<unix::UnixSocket>>,
     /// And for epoll sets.
     pub epolls: std::collections::HashMap<usize, Arc<unix::EpollSet>>,
+    /// And for anonymous shared files, which have seals.
+    pub memfds: std::collections::HashMap<usize, Arc<unix::MemFd>>,
     /// Which unix socket answers to which path. Shared system-wide, because
     /// a server and its clients are different processes and the whole point
     /// of a named socket is that they find each other by name.
@@ -855,6 +858,7 @@ impl Kernel {
             sockets: Default::default(),
             unix_sockets: Default::default(),
             epolls: Default::default(),
+            memfds: Default::default(),
             socket_names: Arc::new(unix::SocketNames::new()),
             file_locks: Arc::new(unix::FileLocks::new()),
             winsize: (24, 80),
@@ -1049,6 +1053,7 @@ impl Kernel {
             sockets: self.sockets.clone(),
             unix_sockets: self.unix_sockets.clone(),
             epolls: self.epolls.clone(),
+            memfds: self.memfds.clone(),
             // Named sockets are system-wide: a forked child must still be
             // able to reach a server its parent could.
             socket_names: Arc::clone(&self.socket_names),
@@ -1339,6 +1344,37 @@ impl Kernel {
                 let started = socket.connect(ip, port);
                 let waits = file.would_block() && started == Err(Errno::EINPROGRESS);
                 waits.then_some(BlockOp::Connect { socket })
+            }
+            // `epoll_pwait` waits, and a version of it that always returned
+            // at once turned every event loop into a spin. Xwayland's is the
+            // one that showed it: it made progress, but only when the timing
+            // happened to suit it.
+            nr::EPOLL_PWAIT => {
+                let set = self.epoll_of(a[0] as i32).ok()?;
+                let fds = self.epoll_pollfds(&set);
+                if poll_ready(&fds) {
+                    return None;
+                }
+                // The timeout is milliseconds here rather than a `timespec`,
+                // and negative means wait forever.
+                let millis = a[3] as i32;
+                if millis == 0 {
+                    return None;
+                }
+                let deadline = if millis < 0 {
+                    None
+                } else {
+                    Some(std::time::Duration::from_millis(millis as u64))
+                };
+                Some(BlockOp::Poll {
+                    fds,
+                    deadline,
+                    report: PollReport::Epoll {
+                        out: a[1],
+                        max: a[2] as u32,
+                        data: set.watches().iter().map(|w| (w.fd, w.data)).collect(),
+                    },
+                })
             }
             nr::PPOLL | nr::PSELECT6 => {
                 let (fds, report, timeout) = if n == nr::PPOLL {
@@ -1654,6 +1690,7 @@ impl Kernel {
             nr::SOCKETPAIR => self.sys_socketpair(m, a[0], a[1], a[3]),
             nr::MEMFD_CREATE => self.sys_memfd_create(m, a[0], a[1]),
             nr::FLOCK => self.sys_flock(a[0] as i32, a[1]),
+            nr::FALLOCATE => self.sys_fallocate(a[0] as i32, a[1], a[2], a[3]),
             nr::EPOLL_CREATE1 => self.sys_epoll_create(a[0]),
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
             nr::EPOLL_PWAIT => self.sys_epoll_wait(m, a[0] as i32, a[1], a[2] as u32),
@@ -2229,6 +2266,8 @@ impl Kernel {
         const F_SETFL: u64 = 4;
         const F_SETLK: u64 = 6;
         const F_SETLKW: u64 = 7;
+        const F_ADD_SEALS: u64 = 1033;
+        const F_GET_SEALS: u64 = 1034;
         const F_DUPFD_CLOEXEC: u64 = 1030;
         match cmd {
             F_DUPFD | F_DUPFD_CLOEXEC => {
@@ -2262,6 +2301,12 @@ impl Kernel {
                 self.fds.get(fd)?;
                 Ok(0)
             }
+            // Sealing an anonymous shared file. Only a memfd has seals, and
+            // Linux says EINVAL for anything else -- which is the answer
+            // Xwayland was already getting, and it stopped rather than
+            // carrying on without the guarantee.
+            F_ADD_SEALS => self.memfd_of(fd)?.add_seals(arg as u32),
+            F_GET_SEALS => Ok(self.memfd_of(fd)?.seals() as u64),
             _ => Err(Errno::EINVAL),
         }
     }
@@ -2277,6 +2322,12 @@ impl Kernel {
         const TIOCSPGRP: u64 = 0x5410;
         const TIOCSWINSZ: u64 = 0x5414;
         let file = self.fds.get(fd)?;
+        // A device the host provides answers its own ioctls, and knows things
+        // the kernel does not. Asked first, because the request numbers below
+        // are the terminal's and a graphics device's are its own.
+        if let Some(r) = file.handle.ioctl(m, req, arg) {
+            return r;
+        }
         let is_tty = file.is_tty();
         match req {
             TCGETS if is_tty => {
@@ -3106,6 +3157,23 @@ impl Kernel {
         Ok(n)
     }
 
+    /// A set's registrations as the list the poll path understands.
+    fn epoll_pollfds(&self, set: &unix::EpollSet) -> Vec<PollFd> {
+        set.watches()
+            .iter()
+            .filter_map(|w| {
+                let file = self.fds.get(w.fd).ok()?;
+                Some(PollFd {
+                    addr: 0,
+                    fd: w.fd,
+                    events: (w.events & 0xffff) as u16,
+                    handle: Some(Arc::clone(&file.handle)),
+                    writable: file.writable,
+                })
+            })
+            .collect()
+    }
+
     /// Which of a set's descriptors are ready, and with what.
     fn epoll_ready(&self, set: &unix::EpollSet) -> Vec<(u32, u64)> {
         let mut out = Vec::new();
@@ -3147,6 +3215,37 @@ impl Kernel {
         Ok(n as u64)
     }
 
+    /// The anonymous shared file behind a descriptor, if it is one.
+    fn memfd_of(&self, fd: i32) -> Result<Arc<unix::MemFd>, Errno> {
+        let file = self.fds.get(fd)?;
+        let key = Arc::as_ptr(&file.handle) as *const () as usize;
+        self.memfds.get(&key).cloned().ok_or(Errno::EINVAL)
+    }
+
+    /// `fallocate`. Only mode zero, which is "make sure these bytes exist".
+    ///
+    /// Xwayland calls this through `posix_fallocate` after sealing its shared
+    /// memory, to be certain the pages are there before it hands the
+    /// descriptor to a compositor. The other modes -- punching holes,
+    /// collapsing ranges -- are refused rather than silently treated as
+    /// allocation, which would leave a caller believing it had freed space.
+    fn sys_fallocate(&mut self, fd: i32, mode: u64, offset: u64, len: u64) -> SysResult {
+        if mode != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let end = offset.checked_add(len).ok_or(Errno::EINVAL)?;
+        if let Ok(memfd) = self.memfd_of(fd) {
+            return memfd.reserve(end);
+        }
+        // An ordinary file grows by being written to its new length.
+        let file = self.fds.get(fd)?;
+        let size = file.handle.metadata()?.size;
+        if end > size {
+            file.handle.truncate(end)?;
+        }
+        Ok(0)
+    }
+
     /// `flock`. The open file description owns the lock, and its address is
     /// a stable name for it while it is open.
     fn sys_flock(&mut self, fd: i32, op: u64) -> SysResult {
@@ -3159,9 +3258,13 @@ impl Kernel {
         const MFD_CLOEXEC: u64 = 1;
         let raw = m.read_cstr(name, 249)?;
         let name = String::from_utf8_lossy(&raw).into_owned();
-        let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(unix::MemFd::new(&name));
+        let memfd = Arc::new(unix::MemFd::new(&name));
+        let handle: Arc<dyn crate::vfs::FileHandle> = memfd.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
         let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
-        self.fds.insert(file, flags & MFD_CLOEXEC != 0)
+        let fd = self.fds.insert(file, flags & MFD_CLOEXEC != 0)?;
+        self.memfds.insert(key, memfd);
+        Ok(fd)
     }
 
     fn sys_socketpair(&mut self, m: &mut GuestMem<'_>, domain: u64, ty: u64, out: u64) -> SysResult {
@@ -3939,6 +4042,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::ACCEPT4 => "accept4",
         nr::MEMFD_CREATE => "memfd_create",
         nr::FLOCK => "flock",
+        nr::FALLOCATE => "fallocate",
         nr::EPOLL_CREATE1 => "epoll_create1",
         nr::EPOLL_CTL => "epoll_ctl",
         nr::EPOLL_PWAIT => "epoll_pwait",

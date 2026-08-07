@@ -98,7 +98,15 @@ enum Object {
 
 #[derive(Clone, Debug)]
 struct BufferSpec {
-    pool: u32,
+    /// The descriptor the pool was made from, and how big it was.
+    ///
+    /// Held here rather than looked up through the pool, because destroying a
+    /// `wl_shm_pool` does not destroy the buffers made from it -- the memory
+    /// lives until the last buffer goes. Xwayland creates a pool, creates one
+    /// buffer, and destroys the pool immediately, so a buffer that pointed at
+    /// its pool pointed at nothing by the time it was drawn.
+    fd: u32,
+    pool_size: usize,
     offset: i32,
     width: i32,
     height: i32,
@@ -228,7 +236,26 @@ impl Client {
         self.send(w);
     }
 
+    /// Whether to report every request, and every one that is refused.
+    ///
+    /// A client that stops has usually asked for something it did not get,
+    /// and from the outside that looks like it stopped for no reason. This is
+    /// how Xwayland's requirements were found rather than guessed at.
+    fn tracing() -> bool {
+        std::env::var_os("GEX_WL_TRACE").is_some()
+    }
+
     fn dispatch(&mut self, object: u32, opcode: u16, body: &[u8], buffers: &dyn Buffers) {
+        if Self::tracing() {
+            eprintln!(
+                "[wl] -> object {object} opcode {opcode} ({} bytes) {}",
+                body.len(),
+                match self.objects.get(&object) {
+                    Some(o) => format!("{o:?}"),
+                    None => "UNKNOWN".into(),
+                }
+            );
+        }
         let Some(target) = self.objects.get(&object).cloned() else {
             self.error(
                 object,
@@ -274,6 +301,9 @@ impl Client {
         };
         self.fds = fds;
         if !ok && self.failed.is_none() {
+            if Self::tracing() {
+                eprintln!("[wl] REFUSED object {object} opcode {opcode}");
+            }
             self.error(
                 object,
                 display_error::INVALID_METHOD,
@@ -324,6 +354,9 @@ impl Client {
         else {
             return false;
         };
+        if Self::tracing() {
+            eprintln!("[wl] bind {interface} v{_version} as {id}");
+        }
         let Some((expected, _)) = GLOBALS.get(name as usize - 1) else {
             return false;
         };
@@ -441,10 +474,12 @@ impl Client {
                 else {
                     return false;
                 };
+                let _ = object;
                 self.objects.insert(
                     id,
                     Object::Buffer(BufferSpec {
-                        pool: object,
+                        fd,
+                        pool_size: size,
                         offset,
                         width,
                         height,
@@ -541,18 +576,28 @@ impl Client {
         let mut produced = None;
         if let Some(buffer_id) = buffer_id {
             if let Some(Object::Buffer(spec)) = self.objects.get(&buffer_id).cloned() {
-                if let Some(Object::ShmPool { fd, size }) = self.objects.get(&spec.pool).cloned() {
-                    if let Some(pool) = buffers.map(fd, size) {
-                        produced = Self::cut(&pool, &spec).map(|pixels| Frame {
-                            surface,
-                            width: spec.width,
-                            height: spec.height,
-                            stride: spec.stride,
-                            format: spec.format,
-                            pixels,
-                            title: state.title.clone(),
-                        });
-                    }
+                let mapped = buffers.map(spec.fd, spec.pool_size);
+                if Self::tracing() {
+                    eprintln!(
+                        "[wl] buffer {buffer_id}: fd {} pool {} -> {:?} bytes, {}x{} stride {}",
+                        spec.fd,
+                        spec.pool_size,
+                        mapped.as_ref().map(|p| p.len()),
+                        spec.width,
+                        spec.height,
+                        spec.stride
+                    );
+                }
+                if let Some(pool) = mapped {
+                    produced = Self::cut(&pool, &spec).map(|pixels| Frame {
+                        surface,
+                        width: spec.width,
+                        height: spec.height,
+                        stride: spec.stride,
+                        format: spec.format,
+                        pixels,
+                        title: state.title.clone(),
+                    });
                 }
             }
             // A client may not draw into a buffer again until it is released,
@@ -560,8 +605,12 @@ impl Client {
             let w = Writer::new(buffer_id, 0);
             self.send(w);
         }
-        if let Some(frame) = produced {
-            self.frames.push(frame);
+        match produced {
+            Some(frame) => self.frames.push(frame),
+            None if buffer_id.is_some() && Self::tracing() => {
+                eprintln!("[wl] commit on surface {surface} produced no frame");
+            }
+            None => {}
         }
         // The frame callbacks belong to the commit that carried them. The
         // timestamp is meant to be milliseconds of some monotonic clock; a
@@ -956,7 +1005,8 @@ mod tests {
         let px = vec![0u8; 4];
         let pool = Pool(px);
         let spec = BufferSpec {
-            pool: 9,
+            fd: 77,
+            pool_size: 4,
             offset: 0,
             width: 4,
             height: 4,
@@ -970,7 +1020,8 @@ mod tests {
     #[test]
     fn a_stride_narrower_than_the_row_is_refused() {
         let spec = BufferSpec {
-            pool: 9,
+            fd: 77,
+            pool_size: 64,
             offset: 0,
             width: 4,
             height: 1,

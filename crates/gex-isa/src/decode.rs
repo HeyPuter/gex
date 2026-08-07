@@ -1816,6 +1816,7 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
             (0, 0b11110, false) => VOp3::FMax,
             (0, 0b11110, true) => VOp3::FMin,
             (1, 0b11010, false) => VOp3::FAddP,
+            (1, 0b11010, true) => VOp3::FAbd,
             (1, 0b11011, false) => VOp3::FMul,
             (1, 0b11100, false) => VOp3::FCmGe,
             (1, 0b11100, true) => VOp3::FCmGt,
