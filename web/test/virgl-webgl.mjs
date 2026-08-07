@@ -73,9 +73,16 @@ if (STREAM && (await exists(STREAM))) {
 // offered, so a blank frame from here is not evidence of a defect in the
 // port -- it is what should happen.
 //
+// Forcing the native host onto its GLES path (GEX_VIRGL_GLES) does not
+// rescue it. Both native configurations advertise capability set version 2,
+// 5,508 bytes of it; WebGL 2 can only offer version 1, 308 bytes. The guest
+// asked for v2 and got it, so every recording made against this stack is
+// unreplayable here, and no amount of matching the host API fixes that.
+//
 // So this is a smoke test with a hard boundary: it proves the transport, the
 // framing and the command dispatch, and it cannot prove a picture. A picture
 // needs the guest negotiating live against the renderer that will serve it.
+// The pixel count below is reported, never asserted, for that reason.
 const REPLIES = process.env.GEX_VTEST_REPLIES || '';
 let compare = false;
 if (replay && REPLIES && (await exists(REPLIES))) {
@@ -254,7 +261,11 @@ await rm(dir, { recursive: true, force: true });
 
 console.log(`     ${said}`);
 if (said.startsWith('OK ')) {
-  console.log(replay ? 'ok   virgl-webgl (replayed a recorded stream)' : 'ok   virgl-webgl');
+  console.log(
+    replay
+      ? 'ok   virgl-webgl (transport and dispatch; a replay cannot prove pixels)'
+      : 'ok   virgl-webgl',
+  );
   process.exit(0);
 }
 console.log('FAIL virgl-webgl: the renderer did not come up on WebGL 2');

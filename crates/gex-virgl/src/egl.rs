@@ -117,7 +117,18 @@ impl Winsys {
                 return Err(format!("eglInitialize failed: {:#x}", eglGetError()));
             }
 
-            let desktop_gl = eglBindAPI(EGL_OPENGL_API) != 0;
+            // Desktop unless `GEX_VIRGL_GLES` says otherwise.
+            //
+            // The override is for recording. A vtest stream is what the
+            // guest's Mesa emits *having been told what the host can do*, so
+            // a stream recorded against desktop GL 4.3 asks for things a
+            // GLES 3.0 renderer was never offered -- which makes it useless
+            // for testing the browser port, where the renderer is WebGL 2.
+            // Forcing GLES here records a stream the browser could plausibly
+            // serve, and gets a picture out of a replay instead of a
+            // correctly blank frame.
+            let want_gles = std::env::var_os("GEX_VIRGL_GLES").is_some();
+            let desktop_gl = !want_gles && eglBindAPI(EGL_OPENGL_API) != 0;
             if !desktop_gl && eglBindAPI(EGL_OPENGL_ES_API) == 0 {
                 return Err("EGL offers neither OpenGL nor OpenGL ES".into());
             }
