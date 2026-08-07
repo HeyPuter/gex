@@ -333,9 +333,14 @@ dependencies = [
  "gex-ld",
  "gex-lift",
  "gex-mem",
+ "gex-wayland",
  "gex-xlate",
  "wasmtime",
 ]
+
+[[package]]
+name = "gex-wayland"
+version = "0.0.1"
 
 [[package]]
 name = "gex-xlate"

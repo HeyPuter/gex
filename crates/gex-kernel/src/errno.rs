@@ -46,6 +46,7 @@ impl Errno {
     pub const EOPNOTSUPP: Errno = Errno(95);
     pub const EAFNOSUPPORT: Errno = Errno(97);
     pub const ECONNREFUSED: Errno = Errno(111);
+    pub const EADDRINUSE: Errno = Errno(98);
     pub const ENOTCONN: Errno = Errno(107);
     pub const EINPROGRESS: Errno = Errno(115);
     pub const EPROTONOSUPPORT: Errno = Errno(93);

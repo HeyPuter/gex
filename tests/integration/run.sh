@@ -73,6 +73,58 @@ compare() {
 # can only re-exec *itself* for the program it was given, so a guest that execs
 # another aarch64 binary fails under QEMU and works under gex. The expectation
 # is therefore written down, and derived from what Linux does.
+# Run a Wayland client against gex's own compositor and check the pixels.
+#
+# QEMU is no oracle here: there is no compositor on the other side of it, so
+# the client would find nothing to connect to. What is checked instead is that
+# the client got all the way through the protocol -- registry, bind, surface,
+# toplevel, shm buffer, attach, commit, frame callback -- and that the pixels
+# the host read back out of the guest's memory are the ones the client drew.
+#
+# Offsets rather than a decoder: the header is a fixed 13 bytes for this size,
+# and a pixel is three bytes at 13 + (y * 64 + x) * 3.
+wl_pixel() {
+    od -An -tu1 -j "$2" -N 3 "$1" | tr -s ' ' | sed 's/^ //;s/ $//'
+}
+
+wayland() {
+    label="$1"; prog="$2"
+    out="$WORK/$label"
+    rm -f "$out"-*.ppm
+    set +e
+    "$GEXC" run --wayland /run/user/0/wayland-0 --wayland-size 64x48 \
+        --wayland-out "$out" "$prog" >"$out.stdout" 2>"$out.stderr"
+    rc=$?
+    set -e
+    if [ "$rc" != 0 ]; then
+        echo "FAIL $label: exit status $rc"
+        head -3 "$out.stderr" | sed 's/^/       /'
+        fail=$((fail + 1))
+        return
+    fi
+    if ! grep -q "^frame callback yes$" "$out.stdout"; then
+        echo "FAIL $label: the client never got its frame callback"
+        head -10 "$out.stdout" | sed 's/^/       /'
+        fail=$((fail + 1))
+        return
+    fi
+    if [ ! -f "$out-000.ppm" ]; then
+        echo "FAIL $label: the compositor produced no frame"
+        fail=$((fail + 1))
+        return
+    fi
+    # The client draws a green border, a blue field and a red diagonal.
+    got="$(wl_pixel "$out-000.ppm" 103)|$(wl_pixel "$out-000.ppm" 3943)|$(wl_pixel "$out-000.ppm" 4717)"
+    want="0 200 0|0 0 200|200 0 0"
+    if [ "$got" != "$want" ]; then
+        echo "FAIL $label: pixels are [$got], expected [$want]"
+        fail=$((fail + 1))
+        return
+    fi
+    echo "ok   $label"
+    pass=$((pass + 1))
+}
+
 expect() {
     label="$1"; expected="$2"; shift 2
     g_out="$WORK/$label.gex"
@@ -300,6 +352,8 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/neon-varshift" "$HERE/programs/neon-varshift.c"
 "$CC" -static -no-pie -O2 -o "$WORK/neon-move" "$HERE/programs/neon-move.c"
 "$CC" -static -O2 -o "$WORK/itimer" "$HERE/programs/itimer.c"
+"$CC" -static -O2 -o "$WORK/unixsock" "$HERE/programs/unixsock.c"
+"$CC" -static -O2 -o "$WORK/wlclient" "$HERE/programs/wlclient.c"
 "$CC" -static -O3 -o "$WORK/vector-pie" "$HERE/programs/vector.c"
 # -ffast-math lets the vectoriser reach the by-element multiplies and the
 # widening conversions; neon2 drives the structure loads through intrinsics
@@ -394,6 +448,10 @@ compare "neon-varshift" "$WORK/neon-varshift"
 compare "neon-move" "$WORK/neon-move"
 # Interval timers: see programs/itimer.c.
 compare "itimer" "$WORK/itimer"
+# Unix sockets and descriptor passing: see programs/unixsock.c.
+compare "unixsock" "$WORK/unixsock"
+# The compositor, end to end: see programs/wlclient.c.
+wayland "wayland" "$WORK/wlclient"
 compare "cross-block-flags" "$WORK/flags"
 compare "loops" "$WORK/loops"
 compare "fixed-point" "$WORK/fixedpoint"

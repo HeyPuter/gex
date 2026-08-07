@@ -17,6 +17,7 @@ use crate::mem::{flags as mflags, MemoryMap};
 use crate::net;
 use crate::proc::ProcTable;
 use crate::pipe::Pipe;
+use crate::unix;
 use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
 use crate::stdio::{StdStream, Stream};
 use crate::vfs::{FileType, ProcSource, Vfs};
@@ -124,6 +125,8 @@ pub mod nr {
     pub const BIND: u64 = 200;
     pub const LISTEN: u64 = 201;
     pub const ACCEPT: u64 = 202;
+    pub const ACCEPT4: u64 = 242;
+    pub const MEMFD_CREATE: u64 = 279;
     pub const CONNECT: u64 = 203;
     pub const GETSOCKNAME: u64 = 204;
     pub const GETPEERNAME: u64 = 205;
@@ -251,6 +254,10 @@ pub enum BlockOp {
     /// A `connect` on a descriptor that is not non-blocking. Ready once the
     /// connection is up, refused, or gone.
     Connect { socket: Arc<net::Socket> },
+    /// An `accept` on a listener with nothing waiting. The host only waits;
+    /// the descriptor is made by the kernel afterwards, because only the
+    /// kernel has a descriptor table. See `Kernel::retry_accept`.
+    AcceptWait { socket: Arc<unix::UnixSocket> },
     /// A `poll` with nothing ready yet. The descriptors travel with it so the
     /// host can ask again without going back through the kernel.
     Poll {
@@ -338,6 +345,13 @@ pub struct Kernel {
     pub clock: ClockFn,
     /// The interval timers, indexed by `which`. See [`Kernel::check_timers`].
     pub itimers: [Option<Itimer>; 3],
+    /// An `accept` that waited, and the arguments to finish it with.
+    ///
+    /// A blocking operation is performed by the host with the kernel
+    /// unlocked, and the host cannot allocate a descriptor. So `accept`
+    /// splits: the host waits for a connection to arrive, and the work
+    /// happens back here.
+    pub retry_accept: Option<(i32, u64, u64, u64)>,
     /// When this process began, on the guest's clock, so it can be asked how
     /// much time it has used. See [`Kernel::cpu_nanos`].
     ///
@@ -356,6 +370,12 @@ pub struct Kernel {
     /// Sockets by handle address, so a descriptor can be got back to the
     /// concrete socket the network syscalls need.
     pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
+    /// The same trick for unix sockets, which are a different concrete type.
+    pub unix_sockets: std::collections::HashMap<usize, Arc<unix::UnixSocket>>,
+    /// Which unix socket answers to which path. Shared system-wide, because
+    /// a server and its clients are different processes and the whole point
+    /// of a named socket is that they find each other by name.
+    pub socket_names: Arc<unix::SocketNames>,
     /// File mappings whose writes are meant to reach the file.
     pub shared_maps: Vec<SharedMap>,
     /// Executable mappings made since the host last looked.
@@ -781,6 +801,7 @@ impl Kernel {
             ppid: 0,
             clock: system_clock,
             itimers: [None; 3],
+            retry_accept: None,
             started: 0,
             shared_maps: Vec::new(),
             new_code: Vec::new(),
@@ -789,6 +810,8 @@ impl Kernel {
             net: None,
             resolver: Arc::new(net::Resolver::new()),
             sockets: Default::default(),
+            unix_sockets: Default::default(),
+            socket_names: Arc::new(unix::SocketNames::new()),
             winsize: (24, 80),
             termios: COOKED_TERMIOS,
         }
@@ -908,6 +931,7 @@ impl Kernel {
             clock: self.clock,
             // A fork does not inherit its parent's timers.
             itimers: [None; 3],
+            retry_accept: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
             shared_maps: Vec::new(),
@@ -917,6 +941,10 @@ impl Kernel {
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
             sockets: self.sockets.clone(),
+            unix_sockets: self.unix_sockets.clone(),
+            // Named sockets are system-wide: a forked child must still be
+            // able to reach a server its parent could.
+            socket_names: Arc::clone(&self.socket_names),
             winsize: self.winsize,
             termios: self.termios,
         }
@@ -1262,6 +1290,16 @@ impl Kernel {
                     len: a[2].min(1 << 24) as usize,
                 })
             }
+            nr::ACCEPT | nr::ACCEPT4 => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                let socket = self.unix_of(a[0] as i32).ok()?;
+                if !file.would_block() || socket.has_pending() {
+                    return None;
+                }
+                let flags = if n == nr::ACCEPT4 { a[3] } else { 0 };
+                self.retry_accept = Some((a[0] as i32, a[1], a[2], flags));
+                Some(BlockOp::AcceptWait { socket })
+            }
             nr::READ => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 if !file.would_block() {
@@ -1329,6 +1367,15 @@ impl Kernel {
 
     /// Finish a syscall whose blocking half the host has now run.
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
+        // An `accept` that waited does its real work here, now that the
+        // kernel is locked again and there is a descriptor table to put the
+        // new socket in.
+        let r = match self.retry_accept.take() {
+            Some((fd, addr, len, flags)) if r.is_ok() => {
+                self.sys_unix_accept(m, fd, addr, len, flags)
+            }
+            _ => r,
+        };
         let ret = encode(r);
         let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, ret);
         match self.deliver_pending(m) {
@@ -1463,7 +1510,13 @@ impl Kernel {
 
             // -- sockets -----------------------------------------------------
             nr::SOCKET => self.sys_socket(a[0], a[1]),
-            nr::CONNECT => self.sys_connect(m, a[0] as i32, a[1], a[2]),
+            // A unix socket and an internet socket are different concrete
+            // types behind the same descriptor, so which `connect` this is
+            // depends on what the descriptor turned out to be.
+            nr::CONNECT => match self.sys_unix_connect(m, a[0] as i32, a[1], a[2]) {
+                Err(Errno::ENOTSOCK) => self.sys_connect(m, a[0] as i32, a[1], a[2]),
+                other => other,
+            },
             nr::SENDTO => self.sys_sendto(m, a[0] as i32, a[1], a[2], a[4]),
             nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[4], a[5]),
             nr::SENDMSG => self.sys_sendmsg(m, a[0] as i32, a[1]),
@@ -1483,9 +1536,16 @@ impl Kernel {
             // A local address means nothing when there is one interface and
             // it is a proxy, but a resolver binds its socket before it sends
             // and gives up if that fails.
-            nr::BIND => self.fds.get(a[0] as i32).map(|_| 0),
+            nr::BIND => match self.sys_unix_bind(m, a[0] as i32, a[1], a[2]) {
+                Err(Errno::ENOTSOCK) => self.fds.get(a[0] as i32).map(|_| 0),
+                other => other,
+            },
+            nr::LISTEN => self.unix_of(a[0] as i32).and_then(|s| s.listen()),
+            nr::ACCEPT => self.sys_unix_accept(m, a[0] as i32, a[1], a[2], 0),
+            nr::ACCEPT4 => self.sys_unix_accept(m, a[0] as i32, a[1], a[2], a[3]),
+            nr::SOCKETPAIR => self.sys_socketpair(m, a[0], a[1], a[3]),
+            nr::MEMFD_CREATE => self.sys_memfd_create(m, a[0], a[1]),
             // No listening, though: a page cannot be connected to.
-            nr::LISTEN | nr::ACCEPT | nr::SOCKETPAIR => Err(Errno::EOPNOTSUPP),
             nr::SET_TID_ADDRESS => {
                 self.clear_child_tid = a[0];
                 Ok(self.tid as u64)
@@ -2564,6 +2624,22 @@ impl Kernel {
             let len_aligned = crate::mem::page_align_up(len);
             let file = self.fds.get(fd)?;
             let name = file.path.clone();
+            // A second `MAP_SHARED` of the same open file must see the first
+            // one's writes -- that is what shared means -- and the way to
+            // arrange that in a single address space is to hand back the same
+            // pages. A Wayland client maps a buffer and sends the descriptor;
+            // whoever maps it next has to be looking at the same pixels, and
+            // with a copy they were looking at zeroes.
+            //
+            // The mapping is not reference counted, so unmapping one alias
+            // unmaps both. Nothing that does this unmaps early.
+            if flags & crate::mem::flags::SHARED != 0 {
+                if let Some(existing) = self.shared_maps.iter().find(|s| {
+                    Arc::ptr_eq(&s.file, &file) && s.offset == offset && s.len >= len_aligned
+                }) {
+                    return Ok(existing.start);
+                }
+            }
             let start = self.mem.mmap(addr, len_aligned, prot_bits, flags, &name)?;
             let mut tmp = vec![0u8; len as usize];
             let n = file.pread(offset, &mut tmp)? as usize;
@@ -2720,17 +2796,34 @@ impl Kernel {
     /// which the host carries, and a datagram, which only ever goes to the
     /// resolver this kernel is.
     fn sys_socket(&mut self, domain: u64, ty: u64) -> SysResult {
+        const AF_UNIX: u64 = 1;
         const AF_INET: u64 = 2;
         const SOCK_STREAM: u64 = 1;
         const SOCK_DGRAM: u64 = 2;
         const SOCK_NONBLOCK: u64 = 0o4000;
         const SOCK_CLOEXEC: u64 = 0o2000000;
+        // A unix socket needs no network behind it: both ends are in this
+        // machine, and one of them may be the host rather than a guest.
+        if domain == AF_UNIX {
+            let kind = ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if kind != SOCK_STREAM && kind != 5 {
+                // SOCK_SEQPACKET is 5 and behaves closely enough to a stream
+                // for what uses it here; datagram unix sockets are not.
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            let sock = Arc::new(unix::UnixSocket::new(true));
+            let nonblock = ty & SOCK_NONBLOCK != 0;
+            sock.set_nonblocking(nonblock);
+            let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
+            return self.install_unix(sock, flags, ty & SOCK_CLOEXEC != 0);
+        }
         let Some(net) = self.net.clone() else {
             return Err(Errno::EAFNOSUPPORT);
         };
         if domain != AF_INET {
             return Err(Errno::EAFNOSUPPORT);
         }
+        let _ = &net;
         let kind = match ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC) {
             SOCK_STREAM => net::Kind::Tcp,
             SOCK_DGRAM => net::Kind::Udp,
@@ -2749,6 +2842,150 @@ impl Kernel {
         let fd = self.fds.insert(file, ty & SOCK_CLOEXEC != 0)?;
         self.sockets.insert(key, sock);
         Ok(fd)
+    }
+
+    /// The unix socket behind a descriptor, if it is one.
+    fn unix_of(&self, fd: i32) -> Result<Arc<unix::UnixSocket>, Errno> {
+        let file = self.fds.get(fd)?;
+        let key = Arc::as_ptr(&file.handle) as *const () as usize;
+        self.unix_sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+    }
+
+    /// Put a unix socket in the descriptor table and remember the concrete
+    /// type, the way `sys_socket` does for an internet one.
+    fn install_unix(&mut self, sock: Arc<unix::UnixSocket>, flags: u64, cloexec: bool) -> SysResult {
+        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+        let fd = self.fds.insert(file, cloexec)?;
+        self.unix_sockets.insert(key, sock);
+        Ok(fd)
+    }
+
+    /// The path out of a `struct sockaddr_un`: a two-byte family then up to
+    /// 108 bytes of NUL-terminated path.
+    ///
+    /// The abstract namespace -- a leading NUL, which is how D-Bus and X11
+    /// usually bind -- is kept as a distinct name by prefixing it, so an
+    /// abstract socket and a filesystem one of the same spelling do not
+    /// collide.
+    fn sockaddr_un(m: &GuestMem<'_>, addr: u64, len: u64) -> Result<String, Errno> {
+        if addr == 0 || len < 2 {
+            return Err(Errno::EINVAL);
+        }
+        let bytes = m.read(addr, (len as usize).min(110))?;
+        let path = &bytes[2..];
+        if path.first() == Some(&0) {
+            let end = path.len();
+            let name = &path[1..end];
+            let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())];
+            return Ok(format!("\0{}", String::from_utf8_lossy(name)));
+        }
+        let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+        Ok(String::from_utf8_lossy(&path[..end]).into_owned())
+    }
+
+    /// Write a `struct sockaddr_un` back, for `getsockname` and `accept`.
+    fn write_sockaddr_un(
+        m: &mut GuestMem<'_>,
+        addr: u64,
+        len_out: u64,
+        path: &str,
+    ) -> Result<(), Errno> {
+        const AF_UNIX: u16 = 1;
+        if addr != 0 {
+            let mut buf = vec![0u8; 110];
+            buf[..2].copy_from_slice(&AF_UNIX.to_le_bytes());
+            let raw = path.as_bytes();
+            let n = raw.len().min(107);
+            buf[2..2 + n].copy_from_slice(&raw[..n]);
+            m.write(addr, &buf[..2 + n + 1])?;
+        }
+        if len_out != 0 {
+            m.write_u32(len_out, (2 + path.len().min(107) + 1) as u32)?;
+        }
+        Ok(())
+    }
+
+    /// `socketpair`, which is a connected pair with no name.
+    /// `memfd_create`: an anonymous file with no name in any filesystem.
+    ///
+    /// A Wayland client's buffers are these. The `path` recorded is what
+    /// Linux shows in `/proc/self/fd`, which is where a program looks to work
+    /// out what a descriptor it was handed actually is.
+    fn sys_memfd_create(&mut self, m: &GuestMem<'_>, name: u64, flags: u64) -> SysResult {
+        const MFD_CLOEXEC: u64 = 1;
+        let raw = m.read_cstr(name, 249)?;
+        let name = String::from_utf8_lossy(&raw).into_owned();
+        let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(unix::MemFd::new(&name));
+        let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
+        self.fds.insert(file, flags & MFD_CLOEXEC != 0)
+    }
+
+    fn sys_socketpair(&mut self, m: &mut GuestMem<'_>, domain: u64, ty: u64, out: u64) -> SysResult {
+        const AF_UNIX: u64 = 1;
+        const SOCK_NONBLOCK: u64 = 0o4000;
+        const SOCK_CLOEXEC: u64 = 0o2000000;
+        if domain != AF_UNIX {
+            return Err(Errno::EAFNOSUPPORT);
+        }
+        let (a, b) = unix::UnixSocket::pair();
+        let nonblock = ty & SOCK_NONBLOCK != 0;
+        a.set_nonblocking(nonblock);
+        b.set_nonblocking(nonblock);
+        let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
+        let cloexec = ty & SOCK_CLOEXEC != 0;
+        let fa = self.install_unix(a, flags, cloexec)?;
+        let fb = self.install_unix(b, flags, cloexec)?;
+        m.write_u32(out, fa as u32)?;
+        m.write_u32(out + 4, fb as u32)?;
+        Ok(0)
+    }
+
+    fn sys_unix_bind(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
+        let sock = self.unix_of(fd)?;
+        let path = Self::sockaddr_un(m, addr, len)?;
+        // A filesystem socket resolves against the guest's root the way any
+        // other path does; an abstract one has no filesystem existence.
+        let path = if path.starts_with('\0') {
+            path
+        } else {
+            self.vfs.absolute(&path)
+        };
+        sock.bind(&path)?;
+        self.socket_names.bind(&path, sock)
+    }
+
+    fn sys_unix_connect(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
+        let sock = self.unix_of(fd)?;
+        let path = Self::sockaddr_un(m, addr, len)?;
+        let path = if path.starts_with('\0') {
+            path
+        } else {
+            self.vfs.absolute(&path)
+        };
+        let names = Arc::clone(&self.socket_names);
+        names.connect(&sock, &path)
+    }
+
+    fn sys_unix_accept(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        fd: i32,
+        addr: u64,
+        len_out: u64,
+        flags: u64,
+    ) -> SysResult {
+        const SOCK_NONBLOCK: u64 = 0o4000;
+        const SOCK_CLOEXEC: u64 = 0o2000000;
+        let listener = self.unix_of(fd)?;
+        let session = listener.accept()?;
+        let path = listener.bound_path().unwrap_or_default();
+        Self::write_sockaddr_un(m, addr, len_out, &path)?;
+        let nonblock = flags & SOCK_NONBLOCK != 0;
+        session.set_nonblocking(nonblock);
+        let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
+        self.install_unix(session, oflag, flags & SOCK_CLOEXEC != 0)
     }
 
     fn socket_of(&self, fd: i32) -> Result<Arc<net::Socket>, Errno> {
@@ -2865,8 +3102,83 @@ impl Kernel {
         Ok(0)
     }
 
-    /// `sendmsg`, which is how glibc writes to a socket. Only the iovecs
-    /// matter here: there is no ancillary data to carry and one destination.
+    /// A `struct cmsghdr` is a length, a level, a type, then the payload,
+    /// with every field and the whole header aligned to a pointer.
+    const CMSG_ALIGN: u64 = 8;
+    const CMSG_HDR: u64 = 16;
+
+    fn cmsg_align(n: u64) -> u64 {
+        n.div_ceil(Self::CMSG_ALIGN) * Self::CMSG_ALIGN
+    }
+
+    /// Collect the descriptors a `sendmsg` is passing.
+    ///
+    /// `SCM_RIGHTS` is the whole reason unix sockets are here. A Wayland
+    /// client draws into shared memory and sends the *descriptor*; without
+    /// this the compositor is handed a number that means nothing to it.
+    fn read_scm_rights(
+        &mut self,
+        m: &GuestMem<'_>,
+        control: u64,
+        len: u64,
+    ) -> Result<Vec<Arc<OpenFile>>, Errno> {
+        const SOL_SOCKET: u32 = 1;
+        const SCM_RIGHTS: u32 = 1;
+        let mut out = Vec::new();
+        let mut at = 0u64;
+        while at + Self::CMSG_HDR <= len {
+            let cmsg_len = m.read_u64(control + at)?;
+            if cmsg_len < Self::CMSG_HDR || at + cmsg_len > len {
+                break;
+            }
+            let level = m.read_u32(control + at + 8)?;
+            let ty = m.read_u32(control + at + 12)?;
+            if level == SOL_SOCKET && ty == SCM_RIGHTS {
+                let n = (cmsg_len - Self::CMSG_HDR) / 4;
+                for i in 0..n.min(253) {
+                    let fd = m.read_u32(control + at + Self::CMSG_HDR + i * 4)? as i32;
+                    out.push(self.fds.get(fd)?);
+                }
+            }
+            at += Self::cmsg_align(cmsg_len);
+        }
+        Ok(out)
+    }
+
+    /// Install received descriptors and describe them in the control buffer.
+    ///
+    /// Returns the bytes of control data written. A buffer too small for all
+    /// of them gets what fits; Linux sets `MSG_CTRUNC` and closes the rest,
+    /// and the socket layer here simply never handed over more than fit.
+    fn write_scm_rights(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        control: u64,
+        len: u64,
+        files: Vec<Arc<OpenFile>>,
+    ) -> Result<u64, Errno> {
+        const SOL_SOCKET: u32 = 1;
+        const SCM_RIGHTS: u32 = 1;
+        if files.is_empty() || control == 0 {
+            return Ok(0);
+        }
+        let payload = files.len() as u64 * 4;
+        let cmsg_len = Self::CMSG_HDR + payload;
+        if cmsg_len > len {
+            return Ok(0);
+        }
+        m.write_u64(control, cmsg_len)?;
+        m.write_u32(control + 8, SOL_SOCKET)?;
+        m.write_u32(control + 12, SCM_RIGHTS)?;
+        for (i, f) in files.into_iter().enumerate() {
+            let fd = self.fds.insert(f, false)?;
+            m.write_u32(control + Self::CMSG_HDR + i as u64 * 4, fd as u32)?;
+        }
+        Ok(cmsg_len)
+    }
+
+    /// `sendmsg`, which is how glibc writes to a socket, and the only way to
+    /// pass a descriptor to another process.
     fn sys_sendmsg(&mut self, m: &GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
         // `msg_name` is where this one goes, and a reply has to be reported
         // as having come from there or a resolver drops it as spoofed.
@@ -2887,6 +3199,17 @@ impl Kernel {
             let len = m.read_u64(iov + i * 16 + 8)? as usize;
             if len > 0 {
                 data.extend_from_slice(m.read(base, len.min(1 << 22))?);
+            }
+        }
+        // Ancillary data, which for a unix socket may be descriptors. Staged
+        // on the socket rather than passed down, so the send attaches them to
+        // the first byte it writes and a send that fails attaches nothing.
+        let control = m.read_u64(msg + 32)?;
+        let controllen = m.read_u64(msg + 40)?;
+        if control != 0 && controllen >= Self::CMSG_HDR {
+            if let Ok(sock) = self.unix_of(fd) {
+                let files = self.read_scm_rights(m, control, controllen)?;
+                sock.stage_send(files);
             }
         }
         self.fds.get(fd)?.write(&data)
@@ -2943,6 +3266,17 @@ impl Kernel {
     fn sys_recvmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
         let iov = m.read_u64(msg + 16)?;
         let iovlen = m.read_u64(msg + 24)?;
+        let control = m.read_u64(msg + 32)?;
+        let controllen = m.read_u64(msg + 40)?;
+        // How many descriptors the caller left room for. A reader that offers
+        // no room leaves them queued for the next call rather than losing
+        // them, which is what Wayland's two-stage read depends on.
+        let room = if control != 0 && controllen >= Self::CMSG_HDR {
+            ((controllen - Self::CMSG_HDR) / 4) as usize
+        } else {
+            0
+        };
+        let unix_sock = self.unix_of(fd).ok();
         let mut total = 0u64;
         for i in 0..iovlen.min(1024) {
             let base = m.read_u64(iov + i * 16)?;
@@ -2951,7 +3285,10 @@ impl Kernel {
                 continue;
             }
             let mut tmp = vec![0u8; len.min(1 << 22)];
-            let n = self.fds.get(fd)?.read(&mut tmp)?;
+            let n = match &unix_sock {
+                Some(sock) => sock.recv(&mut tmp, room, false)?,
+                None => self.fds.get(fd)?.read(&mut tmp)?,
+            };
             m.write(base, &tmp[..n as usize])?;
             total += n;
             // A short read means there is no more waiting; asking again would
@@ -2960,8 +3297,9 @@ impl Kernel {
                 break;
             }
         }
-        // msg_flags and msg_controllen: nothing to report.
-        m.write_u64(msg + 40, 0)?;
+        let received = unix_sock.map(|s| s.take_received()).unwrap_or_default();
+        let written = self.write_scm_rights(m, control, controllen, received)?;
+        m.write_u64(msg + 40, written)?;
         Ok(total)
     }
 
@@ -3356,6 +3694,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::SOCKET => "socket",
         nr::BIND => "bind",
         nr::LISTEN => "listen",
+        nr::ACCEPT4 => "accept4",
+        nr::MEMFD_CREATE => "memfd_create",
         nr::ACCEPT => "accept",
         nr::GETSOCKNAME => "getsockname",
         nr::GETPEERNAME => "getpeername",

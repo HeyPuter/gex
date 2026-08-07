@@ -10,6 +10,7 @@ gex-abi.workspace = true
 gex-cache.workspace = true
 gex-mem.workspace = true
 gex-kernel.workspace = true
+gex-wayland.workspace = true
 gex-ld.workspace = true
 gex-xlate.workspace = true
 gex-lift.workspace = true

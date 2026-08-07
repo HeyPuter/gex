@@ -79,6 +79,13 @@ run options:
   --sample        report the guest's hottest back-edges when it exits. Biased
                   towards loops, which is the bias you want when the question
                   is where the time went
+  --wayland PATH  run a Wayland compositor and bind it at PATH inside the
+                  guest, so a guest client can open a window. WAYLAND_DISPLAY
+                  and XDG_RUNTIME_DIR are set to match unless already given
+  --wayland-size WxH
+                  what size to tell a toplevel window it is (default 640x480)
+  --wayland-out PATH
+                  write each committed frame as PATH-NNN.ppm
   --recompile-objects
                   statically recompile each shared library as it is mapped,
                   rather than translating it a dispatch miss at a time. Off by
@@ -134,6 +141,24 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--exhaustive" => exhaustive = true,
             "--sample" => opts.sample = true,
             "--recompile-objects" => opts.recompile_objects = true,
+            // A display server for the guest, bound at a path in its own
+            // unix-socket namespace. Clients find it through WAYLAND_DISPLAY
+            // and XDG_RUNTIME_DIR, which are set below if the caller did not.
+            "--wayland" => {
+                i += 1;
+                opts.wayland = Some(args.get(i).context("--wayland needs a path")?.clone());
+            }
+            "--wayland-size" => {
+                i += 1;
+                let spec = args.get(i).context("--wayland-size needs WxH")?;
+                let (w, h) = spec.split_once('x').context("--wayland-size wants WxH")?;
+                opts.wayland_size = (w.parse()?, h.parse()?);
+            }
+            "--wayland-out" => {
+                i += 1;
+                opts.wayland_out =
+                    Some(args.get(i).context("--wayland-out needs a path")?.clone());
+            }
             "--uid" => {
                 i += 1;
                 let v = args.get(i).context("--uid needs a number")?;
@@ -207,6 +232,17 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let mut argv = vec![ra.argv0.clone().unwrap_or_else(|| ra.path.clone())];
     argv.append(&mut ra.guest_args);
     ra.opts.args = argv;
+    // A client finds the display by joining these two together, so a guest
+    // given a compositor and not told where it is would never connect. Only
+    // defaulted: a caller that set either of them meant it.
+    if let Some(path) = ra.opts.wayland.clone() {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+        for (k, v) in [("XDG_RUNTIME_DIR", dir), ("WAYLAND_DISPLAY", name)] {
+            if !ra.opts.env.iter().any(|e| e.starts_with(&format!("{k}="))) {
+                ra.opts.env.push(format!("{k}={v}"));
+            }
+        }
+    }
     if ra.opts.env.is_empty() {
         ra.opts.env = vec!["PATH=/usr/bin:/bin".into(), "HOME=/root".into()];
     }

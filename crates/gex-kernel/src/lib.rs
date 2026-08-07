@@ -23,6 +23,7 @@ pub mod signal;
 pub mod stdio;
 pub mod syscalls;
 pub mod vfs;
+pub mod unix;
 
 pub use errno::Errno;
 pub use proc::{ProcTable, INIT_PID};

@@ -1,0 +1,8 @@
+[package]
+name = "gex-wayland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A Wayland compositor for gex guests, as a protocol state machine"
+
+[dependencies]

@@ -16,6 +16,8 @@ use gex_kernel::{BlockOp, GuestMem, Kernel, KernelProcSource, ProcState, Syscall
 use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
+pub mod wayland;
+
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Module, Ref, Store, Table, Val};
 
 /// How a guest run ended.
@@ -83,6 +85,14 @@ pub struct RunOptions {
     pub identity: Option<(u32, u32)>,
     /// Sample the guest's back-edges and report the hottest at exit.
     pub sample: bool,
+    /// Run a Wayland compositor and bind it at this path in the guest, so a
+    /// guest client can put a window on the screen. See `wayland`.
+    pub wayland: Option<String>,
+    /// What size to tell a toplevel it is.
+    pub wayland_size: (i32, i32),
+    /// Where to write each committed frame, as a PPM. A window would be
+    /// nicer; a file is what a test can compare.
+    pub wayland_out: Option<String>,
     /// Statically recompile each shared library as it is mapped, instead of
     /// letting the runtime translator find it a dispatch miss at a time.
     ///
@@ -118,6 +128,9 @@ impl Default for RunOptions {
             sysroot: None,
             identity: None,
             sample: false,
+            wayland: None,
+            wayland_size: (640, 480),
+            wayland_out: None,
             recompile_objects: false,
             jit: false,
             cwd: None,
@@ -147,6 +160,8 @@ struct HostState {
     resume_at: Option<u64>,
     /// Where the guest is spending its time, when anyone asked.
     sampler: Option<Arc<Sampler>>,
+    /// The compositor, when the guest was given one.
+    wayland: Option<wayland::Wayland>,
     /// Everything needed to translate and install code at run time.
     jit: Option<Jit>,
     /// Everything a new guest thread needs to build a store of its own.
@@ -204,6 +219,9 @@ struct SpawnContext {
     /// Shared across threads and inherited by children, so a profile of a
     /// process tree is one profile.
     sampler: Option<Arc<Sampler>>,
+    /// Inherited the same way, so a client that a shell forked reaches the
+    /// same compositor its parent could.
+    wayland: Option<wayland::Wayland>,
     jit_shared: Option<Arc<Mutex<JitShared>>>,
     limits: gex_lift::BlockLimits,
 }
@@ -566,6 +584,20 @@ fn run_program_with(
     if fresh {
         mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;
     }
+    // The compositor binds a name in the guest's unix-socket namespace, which
+    // is shared across the process tree, so a client the guest forks later
+    // finds it. Bound before anything runs, because a client that connects
+    // before the name exists gets ECONNREFUSED and gives up.
+    let compositor = opts.wayland.as_ref().map(|path| {
+        let w = wayland::Wayland::new(opts.wayland_size.0, opts.wayland_size.1);
+        if let Some(out) = &opts.wayland_out {
+            w.write_frames_to(out);
+        }
+        kernel
+            .socket_names
+            .bind_host(path, Arc::new(w.clone()) as Arc<dyn gex_kernel::unix::HostListener>);
+        w
+    });
     let tid = kernel.pid;
 
     let mut store = Store::new(
@@ -578,6 +610,7 @@ fn run_program_with(
             exit: None,
             resume_at: None,
             sampler: sampler.clone(),
+            wayland: compositor.clone(),
             jit: None,
             spawn: None,
             pending_spawn: None,
@@ -684,6 +717,7 @@ fn run_program_with(
     let spawn = Arc::new(SpawnContext {
         jit_cache: jit_cache.clone(),
         sampler: sampler.clone(),
+        wayland: compositor.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         engine: engine.clone(),
@@ -883,6 +917,16 @@ fn perform_block(op: BlockOp, data: &mut [u8]) -> Result<u64, gex_kernel::errno:
                     let mut mem = GuestMem::new(data);
                     mem.write(buf, &tmp[..n as usize])?;
                     return Ok(n);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        BlockOp::AcceptWait { socket } => {
+            // Only the wait: the descriptor is made by the kernel afterwards,
+            // which is the one place that has a descriptor table.
+            loop {
+                if socket.has_pending() {
+                    return Ok(0);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -1143,6 +1187,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         // One profile for the whole process tree: a package manager spends
         // most of its time in programs it started.
         sampler: cx.sampler.clone(),
+        wayland: cx.wayland.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         engine: cx.engine.clone(),
@@ -1220,6 +1265,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             exit: None,
             resume_at: None,
             sampler: cx.sampler.clone(),
+            wayland: cx.wayland.clone(),
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
@@ -1326,6 +1372,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             exit: None,
             resume_at: None,
             sampler: cx.sampler.clone(),
+            wayland: cx.wayland.clone(),
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
@@ -2015,6 +2062,16 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             } else {
                 outcome
             };
+            // The compositor runs here, between one syscall and the next. A
+            // client writes a request and then waits for the reply, and the
+            // write is a syscall, so by the time it waits the reply is
+            // already in its socket.
+            if let Some(w) = caller.data().wayland.clone() {
+                let kernel = Arc::clone(&caller.data().kernel);
+                let k = kernel.lock().unwrap_or_else(|e| e.into_inner());
+                let gm = GuestMem::new(memory.bytes());
+                w.pump(&k, &gm);
+            }
             // A shared library has just been mapped. Recompile the whole
             // object now rather than letting the runtime translator find it
             // one dispatch miss at a time.
