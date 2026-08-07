@@ -97,15 +97,33 @@ fn dw(b: &[u8], i: usize) -> u32 {
 /// anywhere near it. That is the difference between "the renderer
 /// initialises" and "the renderer can draw what Mesa asks for".
 fn record(bytes: &[u8]) {
+    record_to("GEX_VTEST_RECORD", bytes);
+}
+
+/// And what was sent back, under `GEX_VTEST_REPLIES`.
+///
+/// The replies are the answer key. Feeding the same stream to another
+/// renderer and comparing what comes out is how to tell a port that draws
+/// from one that only runs -- a blank frame and a correct frame execute the
+/// same commands and differ only here.
+pub fn record_replies(bytes: &[u8]) {
+    record_to("GEX_VTEST_REPLIES", bytes);
+}
+
+fn record_to(var: &str, bytes: &[u8]) {
+    use std::collections::HashMap;
     use std::io::Write;
-    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+    use std::sync::Mutex;
+    static FILES: std::sync::OnceLock<Mutex<HashMap<String, Option<std::fs::File>>>> =
         std::sync::OnceLock::new();
-    let f = FILE.get_or_init(|| {
-        let path = std::env::var_os("GEX_VTEST_RECORD")?;
-        std::fs::File::create(path).ok().map(std::sync::Mutex::new)
+    let files = FILES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut files = files.lock().unwrap_or_else(|e| e.into_inner());
+    let f = files.entry(var.to_string()).or_insert_with(|| {
+        let path = std::env::var_os(var)?;
+        std::fs::File::create(path).ok()
     });
     if let Some(f) = f {
-        let _ = f.lock().unwrap_or_else(|e| e.into_inner()).write_all(bytes);
+        let _ = f.write_all(bytes);
     }
 }
 

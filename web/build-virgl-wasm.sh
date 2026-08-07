@@ -135,6 +135,29 @@ static struct virgl_renderer_callbacks renderer_cbs = {
    .make_current = gex_make_current,
 };''', 1)
     assert 'gex_create_gl_context' in s, 'renderer_cbs did not match'
+# Both vtest changes land together. Losing this write once cost an afternoon:
+# vtest kept its own callbacks, `create_gl_context` stayed NULL, and the
+# module died on an indirect call to an empty table slot -- "null function",
+# with nothing else printed, because it happened before virglrenderer had
+# said anything at all.
+open(p, 'w').write(s)
+
+# GL_MAP_UNSYNCHRONIZED_BIT is a promise that nothing else is using the range,
+# and emscripten refuses any glMapBufferRange carrying it -- WebGL has no
+# unsynchronised mapping to offer. virglrenderer then falls back to a
+# glBufferSubData upload, so nothing breaks, but every vertex upload takes the
+# slow path and says so. The bit is a hint: dropping it asks for more
+# synchronisation, never less.
+p = f'{src}/src/vrend_renderer.c'
+s = open(p).read()
+if 'GEX_NO_UNSYNCHRONIZED' not in s:
+    s = s.replace('''      if (!info->synchronized)
+         map_flags |= GL_MAP_UNSYNCHRONIZED_BIT;''',
+                  '''#ifndef __EMSCRIPTEN__ /* GEX_NO_UNSYNCHRONIZED */
+      if (!info->synchronized)
+         map_flags |= GL_MAP_UNSYNCHRONIZED_BIT;
+#endif''', 1)
+    assert 'GEX_NO_UNSYNCHRONIZED' in s, 'the unsynchronized map did not match'
     open(p, 'w').write(s)
 PATCH
 
@@ -507,7 +530,7 @@ DESKTOP
     -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 \
     -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,UTF8ToString \
     -sENVIRONMENT=web,worker \
-    -sEXPORTED_FUNCTIONS=_gex_virgl_init,_gex_virgl_describe,_gex_virgl_feed,_gex_virgl_pump,_gex_virgl_pending,_gex_virgl_replies,_gex_virgl_drain,_malloc,_free
+    -sEXPORTED_FUNCTIONS=_gex_virgl_init,_gex_virgl_describe,_gex_virgl_gl_state,_gex_virgl_feed,_gex_virgl_pump,_gex_virgl_pending,_gex_virgl_replies,_gex_virgl_drain,_malloc,_free
 
 echo
 for a in src/libvirglrenderer.a src/libvirgl.a src/gallium/libgallium.a src/mesa/libmesa.a; do

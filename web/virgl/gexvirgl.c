@@ -291,6 +291,36 @@ int gex_virgl_pump(void) {
     return ran;
 }
 
+/* What GL makes of the state the replay left behind.
+ *
+ * virglrenderer reports what it notices, and a frame that comes back blank
+ * with nothing said means it noticed nothing -- so ask the other side. An
+ * incomplete framebuffer drops every draw silently, and a sticky error from
+ * a call made hundreds of commands ago is the usual reason.
+ */
+EMSCRIPTEN_KEEPALIVE
+const char *gex_virgl_gl_state(void) {
+    static char out[256];
+    GLint draw_fbo = 0, read_fbo = 0, vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+    glGetIntegerv(GL_VIEWPORT, vp);
+    GLenum status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    /* Drained, because GL keeps only the first of each and one left over
+     * from setup would mask everything after it. */
+    GLenum err = glGetError(), last = err;
+    for (int i = 0; i < 32 && last != GL_NO_ERROR; i++) {
+        last = glGetError();
+        if (last != GL_NO_ERROR) {
+            err = last;
+        }
+    }
+    snprintf(out, sizeof out,
+             "draw_fbo=%d read_fbo=%d viewport=%d,%d,%dx%d fbo_status=0x%x gl_error=0x%x",
+             draw_fbo, read_fbo, vp[0], vp[1], vp[2], vp[3], status, err);
+    return out;
+}
+
 /* How many reply bytes are waiting, and where they are. JavaScript copies
  * them out of the heap and calls `gex_virgl_drain`. */
 EMSCRIPTEN_KEEPALIVE

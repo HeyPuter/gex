@@ -64,16 +64,22 @@ await writeFile(
   join(dir, 'index.html'),
   `<!doctype html><meta charset=utf-8><title>pending</title>
 <canvas id="gex-gl" width="300" height="300"></canvas>
-<pre id="out">pending</pre>
+<pre id="out">pending</pre><pre id="png"></pre>
 <script type="module">
 const REPLAY = __REPLAY__;
 import Module from './gexvirgl.mjs';
 const say = (s) => { document.getElementById('out').textContent = s; document.title = s; };
 // virglrenderer explains itself on stderr and says nothing through its return
 // value beyond "no". Collect it, or a failure is just a number.
+//
+// Deduplicated, and that is not tidiness: a shader that will not compile is
+// reported once and a buffer map that will not map is reported for every
+// draw, so the tail of the log is guaranteed to be the harmless one.
 const log = [];
+const seen = new Set();
+const note = (t) => { const k = String(t).slice(0, 120); if (!seen.has(k)) { seen.add(k); log.push(k); } };
 try {
-  const m = await Module({ printErr: (s) => log.push(s), print: (s) => log.push(s) });
+  const m = await Module({ printErr: note, print: note });
   const rc = m._gex_virgl_init(300, 300);
   if (rc !== 0) { say('INIT FAILED ' + rc + ' :: ' + log.join(' / ')); }
   else if (!REPLAY) { say('OK ' + m.UTF8ToString(m._gex_virgl_describe()) + ' :: ' + log.join(' / ')); }
@@ -84,6 +90,7 @@ try {
     // the normal case and the rewind that handles it needs exercising.
     const CHUNK = 4093;
     let ran = 0, replies = 0, fed = 0, refused = false;
+    let biggest = new Uint8Array(0);
     const buf = m._malloc(CHUNK);
     for (let off = 0; off < stream.length && !refused; off += CHUNK) {
       const part = stream.subarray(off, Math.min(off + CHUNK, stream.length));
@@ -93,17 +100,54 @@ try {
       const n = m._gex_virgl_pump();
       if (n < 0) { refused = true; break; }
       ran += n;
-      replies += m._gex_virgl_pending();
+      const got = m._gex_virgl_pending();
+      // Keep the biggest reply. A TRANSFER_GET of the frame is far larger
+      // than anything else on the wire -- 300x300 RGBA is 360,000 bytes
+      // against a few dozen for a fence or a capability answer -- so the
+      // largest one is the picture, and the picture is the only thing that
+      // says whether any of this actually drew.
+      if (got > biggest.length) {
+        biggest = m.HEAPU8.slice(m._gex_virgl_replies(), m._gex_virgl_replies() + got);
+      }
+      replies += got;
       m._gex_virgl_drain();
     }
     m._free(buf);
-    const tail = log.slice(-8).join(' / ');
+    const tail = log.join(' | ');
     if (refused) {
       say('PUMP REFUSED after ' + ran + ' commands, ' + fed + ' of '
           + stream.length + ' bytes :: ' + tail);
     } else {
+      // The frame, as a PNG, so it can be looked at rather than counted.
+      // Counted across the whole reply, not a slice of it. A pump can answer
+      // two TRANSFER_GETs at once -- 729,648 bytes is two 300x300 frames and
+      // some fences -- so any fixed offset into it is a guess, and a guess
+      // that lands wrong reads zeros for the wrong reason.
+      let nz = 0;
+      for (let i = 0; i < biggest.length; i++) if (biggest[i]) nz++;
+      let drawn = 'biggest reply ' + biggest.length + 'B, ' + nz + ' non-zero bytes';
+      const W = 300, H = 300;
+      if (biggest.length >= W * H * 4) {
+        const px = biggest.subarray(biggest.length - W * H * 4);
+        const c = document.createElement('canvas');
+        c.width = W; c.height = H;
+        const cx = c.getContext('2d');
+        const img = cx.createImageData(W, H);
+        // Bottom-up: GL's origin is the lower left, a canvas's is upper left.
+        for (let y = 0; y < H; y++) {
+          const src = (H - 1 - y) * W * 4;
+          img.data.set(px.subarray(src, src + W * 4), y * W * 4);
+        }
+        cx.putImageData(img, 0, 0);
+        document.getElementById('png').textContent = c.toDataURL('image/png');
+        let nonzero = 0;
+        for (let i = 0; i < px.length; i += 4) if (px[i] || px[i+1] || px[i+2]) nonzero++;
+        drawn += ', ' + nonzero + '/' + (W * H) + ' pixels non-black in the tail';
+      }
       say('OK replayed ' + stream.length + ' bytes, ' + ran + ' commands, '
-          + replies + ' reply bytes :: ' + tail);
+          + replies + ' reply bytes, ' + drawn
+          + ' :: ' + m.UTF8ToString(m._gex_virgl_gl_state())
+          + ' :: ' + tail);
     }
   }
 } catch (e) {
@@ -155,6 +199,11 @@ server.close();
 
 const m = /<pre id="out">([^<]*)<\/pre>/.exec(dom.out);
 const said = m ? m[1] : '(no result element)';
+const png = /<pre id="png">data:image\/png;base64,([^<]*)<\/pre>/.exec(dom.out);
+if (png && process.env.GEX_VTEST_PNG) {
+  await writeFile(process.env.GEX_VTEST_PNG, Buffer.from(png[1], 'base64'));
+  console.log(`     wrote ${process.env.GEX_VTEST_PNG}`);
+}
 await rm(dir, { recursive: true, force: true });
 
 console.log(`     ${said}`);

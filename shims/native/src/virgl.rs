@@ -166,7 +166,9 @@ impl VirglDevice {
                 }
             }
 
-            s.out.extend_from_slice(&s.state.run(renderer));
+            let produced = s.state.run(renderer);
+            gex_virgl::vtest::record_replies(&produced);
+            s.out.extend_from_slice(&produced);
             // As much as the socket will take. Whatever is left waits for the
             // next pump, by which time the guest will have read some of what
             // is already there and made room.
