@@ -336,6 +336,16 @@ pub struct Kernel {
     pub ppid: i32,
     /// How to read the wall clock.
     pub clock: ClockFn,
+    /// The interval timers, indexed by `which`. See [`Kernel::check_timers`].
+    pub itimers: [Option<Itimer>; 3],
+    /// When this process began, on the guest's clock, so it can be asked how
+    /// much time it has used. See [`Kernel::cpu_nanos`].
+    ///
+    /// Zero until something asks, rather than set at construction: a host may
+    /// replace `clock` after building the kernel -- the browser does, because
+    /// `SystemTime` panics there -- and a start time taken from the clock that
+    /// was in place beforehand is fifty years out.
+    pub started: u128,
     /// Where connections come from, when the host has anywhere to get them.
     /// `None` is a guest with no network, which is every guest until a host
     /// says otherwise.
@@ -371,6 +381,24 @@ pub struct Kernel {
     pub termios: [u8; 60],
 }
 
+/// One armed interval timer.
+///
+/// Times are absolute nanoseconds on the same clock the guest reads, because
+/// a deadline compared against a clock that can be replaced per host has to
+/// be in that clock's terms.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Itimer {
+    /// When it next fires.
+    pub next: u128,
+    /// What to reload on firing. Zero is a one-shot timer, which disarms.
+    pub interval: u128,
+}
+
+/// The three interval timers, in the order `which` names them.
+pub const ITIMER_REAL: usize = 0;
+pub const ITIMER_VIRTUAL: usize = 1;
+pub const ITIMER_PROF: usize = 2;
+
 /// How the host tells the time: seconds and nanoseconds since the epoch.
 ///
 /// A function rather than a call to `SystemTime`, because there are hosts
@@ -378,6 +406,20 @@ pub struct Kernel {
 /// panics there -- so the browser host passes its own, and everything else
 /// gets [`system_clock`].
 pub type ClockFn = fn() -> (u64, u32);
+
+/// Read a `struct timeval` -- seconds then microseconds -- as nanoseconds.
+fn read_timeval(m: &GuestMem<'_>, at: u64) -> Result<u128, Errno> {
+    let secs = m.read_u64(at)?;
+    let usecs = m.read_u64(at + 8)?;
+    Ok(secs as u128 * 1_000_000_000 + (usecs as u128).min(999_999) * 1_000)
+}
+
+/// Write nanoseconds back as a `struct timeval`.
+fn write_timeval(m: &mut GuestMem<'_>, at: u64, nanos: u128) -> Result<(), Errno> {
+    m.write_u64(at, (nanos / 1_000_000_000) as u64)?;
+    m.write_u64(at + 8, (nanos % 1_000_000_000 / 1_000) as u64)?;
+    Ok(())
+}
 
 /// The clock of a host that has one.
 pub fn system_clock() -> (u64, u32) {
@@ -738,6 +780,8 @@ impl Kernel {
             procs: Arc::new(ProcTable::new()),
             ppid: 0,
             clock: system_clock,
+            itimers: [None; 3],
+            started: 0,
             shared_maps: Vec::new(),
             new_code: Vec::new(),
             next_tmpfile: 0,
@@ -862,6 +906,10 @@ impl Kernel {
             procs: Arc::clone(&self.procs),
             ppid: self.pid,
             clock: self.clock,
+            // A fork does not inherit its parent's timers.
+            itimers: [None; 3],
+            // Nor its accumulated time: the child's clock starts now.
+            started: self.now_nanos(),
             shared_maps: Vec::new(),
             new_code: Vec::new(),
             next_tmpfile: self.next_tmpfile,
@@ -1455,7 +1503,8 @@ impl Kernel {
             // Accepting the call is still right -- a program that cannot arm
             // a timeout does not conclude it has no timeout, it concludes
             // something is badly wrong, and busybox's wget spins on it.
-            nr::SETITIMER | nr::GETITIMER => self.sys_itimer(m, a[2]),
+            nr::SETITIMER => self.sys_itimer(m, a[0], a[1], a[2], true),
+            nr::GETITIMER => self.sys_itimer(m, a[0], 0, a[1], false),
             nr::SCHED_YIELD => {
                 std::thread::yield_now();
                 Ok(0)
@@ -1629,6 +1678,7 @@ impl Kernel {
     /// the caller must re-enter translated code at the returned address
     /// rather than continuing where it was.
     pub fn deliver_pending(&mut self, m: &mut GuestMem<'_>) -> Delivery {
+        self.check_timers();
         if !self.signals.has_pending() {
             return Delivery::None;
         }
@@ -2315,15 +2365,109 @@ impl Kernel {
         self.vfs.chmod(&path, mode).map(|_| 0)
     }
 
-    /// `setitimer` and `getitimer`. Interval timers are not delivered:
-    /// nothing here raises `SIGALRM`. Accepting the call is still right --
-    /// a program that cannot arm a timeout does not conclude it has no
-    /// timeout, it concludes something is badly wrong.
-    fn sys_itimer(&mut self, m: &mut GuestMem<'_>, old: u64) -> SysResult {
-        if old != 0 {
-            m.zero(old, 32)?;
+    /// Nanoseconds on the guest's clock, for comparing deadlines against.
+    pub fn now_nanos(&self) -> u128 {
+        let (secs, nanos) = (self.clock)();
+        secs as u128 * 1_000_000_000 + nanos as u128
+    }
+
+    /// `setitimer` and `getitimer`.
+    ///
+    /// A `struct itimerval` is two `timeval`s -- reload interval then time
+    /// remaining -- and a `timeval` is two 64-bit words, seconds and
+    /// *microseconds*. Thirty-two bytes in all.
+    ///
+    /// These used to be accepted and dropped, on the reasoning that a program
+    /// that cannot arm a timeout is worse off than one whose timeout never
+    /// fires. That reasoning is wrong for the programs that actually use
+    /// them: `openssl speed` runs its measurement loop until SIGALRM arrives
+    /// and nothing else ever stops it, so accepting the call and never firing
+    /// turned a two-second benchmark into an infinite one.
+    fn sys_itimer(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        which: u64,
+        new: u64,
+        old: u64,
+        set: bool,
+    ) -> SysResult {
+        let which = which as usize;
+        if which > ITIMER_PROF {
+            return Err(Errno::EINVAL);
         }
+        let now = self.now_nanos();
+        // What is left, which both calls may be asked to report.
+        if old != 0 {
+            let (interval, remaining) = match self.itimers[which] {
+                Some(t) => (t.interval, t.next.saturating_sub(now)),
+                None => (0, 0),
+            };
+            write_timeval(m, old, interval)?;
+            write_timeval(m, old + 16, remaining)?;
+        }
+        if !set {
+            return Ok(0);
+        }
+        if new == 0 {
+            return Err(Errno::EFAULT);
+        }
+        let interval = read_timeval(m, new)?;
+        let value = read_timeval(m, new + 16)?;
+        // A zero `it_value` disarms, whatever the interval says.
+        self.itimers[which] = if value == 0 {
+            None
+        } else {
+            Some(Itimer {
+                next: now + value,
+                interval,
+            })
+        };
         Ok(0)
+    }
+
+    /// Fire any timer whose deadline has passed, and reload it if it repeats.
+    ///
+    /// Called wherever a signal could be delivered, which on this design is
+    /// every back-edge safepoint. That is the right granularity for a timer
+    /// whose job is to interrupt a loop, and the wrong one for a process
+    /// asleep in `read` -- a guest blocked in the host has no back-edges, so
+    /// its timer waits for the read to finish. Worth knowing before relying on
+    /// one of these as a watchdog.
+    ///
+    /// `ITIMER_VIRTUAL` and `ITIMER_PROF` are meant to count the process's own
+    /// CPU time rather than wall clock. They are driven from the same clock
+    /// here, which for a guest that is mostly running is nearly the same
+    /// number and for one that is mostly blocked is not.
+    pub fn check_timers(&mut self) {
+        if self.itimers.iter().all(|t| t.is_none()) {
+            return;
+        }
+        let now = self.now_nanos();
+        for which in 0..3 {
+            let Some(timer) = self.itimers[which] else {
+                continue;
+            };
+            if now < timer.next {
+                continue;
+            }
+            self.itimers[which] = if timer.interval == 0 {
+                None
+            } else {
+                // Skip whole missed periods rather than firing once per
+                // period afterwards: a guest that was away for a second with
+                // a millisecond timer does not want a thousand signals.
+                let missed = (now - timer.next) / timer.interval + 1;
+                Some(Itimer {
+                    next: timer.next + missed * timer.interval,
+                    interval: timer.interval,
+                })
+            };
+            self.signals.raise(match which {
+                ITIMER_VIRTUAL => signal::sig::SIGVTALRM,
+                ITIMER_PROF => signal::sig::SIGPROF,
+                _ => signal::sig::SIGALRM,
+            });
+        }
     }
 
     /// `sched_getaffinity`. One processor, and it is the one the caller is
@@ -2841,8 +2985,21 @@ impl Kernel {
         Ok(0)
     }
 
-    fn sys_clock_gettime(&mut self, m: &mut GuestMem<'_>, _clk: u64, buf: u64) -> SysResult {
-        let (secs, nanos) = (self.clock)();
+    fn sys_clock_gettime(&mut self, m: &mut GuestMem<'_>, clk: u64, buf: u64) -> SysResult {
+        // The two processor clocks count from when the process started, not
+        // from the epoch. A program timing itself with one of these and
+        // getting the wall clock instead sees a plausible-looking number that
+        // is forty years too large, which subtracts away for a delta and does
+        // not for anything else.
+        const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+        const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+        let (secs, nanos) = match clk {
+            CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
+                let t = self.cpu_nanos();
+                ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
+            }
+            _ => (self.clock)(),
+        };
         m.write_u64(buf, secs)?;
         m.write_u64(buf + 8, nanos as u64)?;
         Ok(0)
@@ -2881,16 +3038,43 @@ impl Kernel {
         Ok(0)
     }
 
-    fn sys_times(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        if buf != 0 {
-            m.zero(buf, 32)?;
+    /// How much time this process has used, in nanoseconds.
+    ///
+    /// Wall clock since it started, not processor time: nothing here measures
+    /// how much of that the guest was actually scheduled for, and on a host
+    /// where the guest is one thread of one process there is no portable way
+    /// to ask. For a guest that is computing it is very nearly the same
+    /// number, and for one that spends its life blocked it is not.
+    ///
+    /// The alternative was what this used to do, which is report zero.
+    /// `openssl speed` divides by it, and printed every throughput as `infk`.
+    pub fn cpu_nanos(&mut self) -> u128 {
+        let now = self.now_nanos();
+        if self.started == 0 {
+            self.started = now;
         }
-        Ok(0)
+        now.saturating_sub(self.started)
     }
 
+    /// `times`. Four `clock_t` -- user, system, and the same for reaped
+    /// children -- counted in the hundredths of a second that `USER_HZ` means
+    /// on Linux, and a return value on the same scale.
+    fn sys_times(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
+        let ticks = (self.cpu_nanos() / 10_000_000) as u64;
+        if buf != 0 {
+            m.zero(buf, 32)?;
+            m.write_u64(buf, ticks)?;
+        }
+        Ok(ticks)
+    }
+
+    /// `getrusage`. Only the two times are filled in; the page-fault and
+    /// context-switch counters stay zero, which is what a program that asks
+    /// for them under emulation should expect to see.
     fn sys_getrusage(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
         if buf != 0 {
             m.zero(buf, 144)?;
+            write_timeval(m, buf, self.cpu_nanos())?;
         }
         Ok(0)
     }

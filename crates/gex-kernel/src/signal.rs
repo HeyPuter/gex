@@ -40,6 +40,8 @@ pub mod sig {
     pub const SIGCONT: u32 = 18;
     pub const SIGSTOP: u32 = 19;
     pub const SIGTSTP: u32 = 20;
+    pub const SIGVTALRM: u32 = 26;
+    pub const SIGPROF: u32 = 27;
     pub const SIGWINCH: u32 = 28;
     pub const SIGSYS: u32 = 31;
     /// Signals 1..=64 exist; 0 is "no signal".

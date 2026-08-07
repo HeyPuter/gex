@@ -299,6 +299,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/neon3" "$HERE/programs/neon3.c"
 "$CC" -static -no-pie -O2 -o "$WORK/neon-varshift" "$HERE/programs/neon-varshift.c"
 "$CC" -static -no-pie -O2 -o "$WORK/neon-move" "$HERE/programs/neon-move.c"
+"$CC" -static -O2 -o "$WORK/itimer" "$HERE/programs/itimer.c"
 "$CC" -static -O3 -o "$WORK/vector-pie" "$HERE/programs/vector.c"
 # -ffast-math lets the vectoriser reach the by-element multiplies and the
 # widening conversions; neon2 drives the structure loads through intrinsics
@@ -391,6 +392,8 @@ compare "neon-structure" "$WORK/neon2"
 compare "neon-glibc" "$WORK/neon3"
 compare "neon-varshift" "$WORK/neon-varshift"
 compare "neon-move" "$WORK/neon-move"
+# Interval timers: see programs/itimer.c.
+compare "itimer" "$WORK/itimer"
 compare "cross-block-flags" "$WORK/flags"
 compare "loops" "$WORK/loops"
 compare "fixed-point" "$WORK/fixedpoint"
