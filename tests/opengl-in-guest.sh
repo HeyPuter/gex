@@ -39,7 +39,20 @@ if [ ! -x "$ROOT/usr/bin/glxgears.aarch64-linux-gnu" ] \
 fi
 
 mkdir -p "$WORK"
-cat > "$ROOT/opengl-test.sh" <<'SCRIPT'
+
+# One gexc run per program, deliberately.
+#
+# A second GL client started after the first has exited, in the same run,
+# dies -- glxgears after glxinfo comes apart inside the guest's own ld.so
+# with "Assertion `cnt + 1 < imap->l_scope_max' failed". That is a real
+# defect and it has its own task; it is not what this test is for, and
+# folding the two programs into one script would only ever measure it.
+run_guest() {
+    timeout 900 "$GEXC" run --sysroot "$ROOT" --uid 0 --argv0 /bin/sh \
+        "$ROOT/bin/dash" "$1" 2>&1 || true
+}
+
+cat > "$ROOT/opengl-info.sh" <<'SCRIPT'
 export DISPLAY=:0
 export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu
 mkdir -p /tmp/.X11-unix
@@ -54,17 +67,22 @@ done
 # the only thing the guest is told, and it is a stock Mesa environment
 # variable, not anything gex invented.
 export GALLIUM_DRIVER=virpipe
-timeout 120 glxinfo.aarch64-linux-gnu -B
-# glxgears is the interesting one: it is immediate-mode fixed-function GL
-# from 1997, and it works because the guest's Mesa lowers all of that before
-# gex sees it.
-timeout 60 glxgears.aarch64-linux-gnu
+timeout 200 glxinfo.aarch64-linux-gnu -B
 echo "SCRIPT DONE"
 SCRIPT
 
-# Long, because the first run translates all of Mesa and LLVM.
-timeout 900 "$GEXC" run --sysroot "$ROOT" --uid 0 --argv0 /bin/sh \
-    "$ROOT/bin/dash" /opengl-test.sh >"$WORK/out" 2>&1 || true
+# glxgears is the interesting one: immediate-mode fixed-function GL from
+# 1997, working because the guest's Mesa lowers all of it before gex sees a
+# byte. 90 seconds because the first frame waits on Mesa and LLVM being
+# translated -- 37s cold, 7s once the compiled modules are cached -- and
+# glxgears only reports every 5 seconds of drawing after that.
+sed 's/^timeout 200 glxinfo.*/timeout 90 glxgears.aarch64-linux-gnu/' \
+    "$ROOT/opengl-info.sh" > "$ROOT/opengl-gears.sh"
+
+# Long, because a cold run translates all of Mesa and LLVM.
+run_guest /opengl-info.sh >"$WORK/out" 2>&1
+run_guest /opengl-gears.sh >"$WORK/gears" 2>&1
+cat "$WORK/gears" >> "$WORK/out"
 
 renderer=$(sed -n 's/^OpenGL renderer string: //p' "$WORK/out" | head -1)
 version=$(sed -n 's/^OpenGL core profile version string: //p' "$WORK/out" | head -1)
