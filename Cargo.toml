@@ -12,6 +12,7 @@ members = [
     "crates/gex-ld",
     "crates/gex-kernel",
     "crates/gex-wayland",
+    "crates/gex-gpu",
     "crates/gexc",
     "shims/browser",
     "shims/native",
@@ -30,6 +31,7 @@ gex-abi = { path = "crates/gex-abi" }
 gex-cache = { path = "crates/gex-cache" }
 gex-mem = { path = "crates/gex-mem" }
 gex-wayland = { path = "crates/gex-wayland" }
+gex-gpu = { path = "crates/gex-gpu" }
 gex-isa = { path = "crates/gex-isa" }
 gex-ir = { path = "crates/gex-ir" }
 gex-lift = { path = "crates/gex-lift" }

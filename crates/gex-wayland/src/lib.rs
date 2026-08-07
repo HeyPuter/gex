@@ -20,13 +20,17 @@
 //! its pools and buffers, `wl_surface`, `wl_region`, `wl_seat` with a keyboard
 //! and a pointer, `wl_output`, and the `xdg_shell` trio that every toolkit
 //! now requires. Shared memory only: there is no `linux-dmabuf` and no
-//! `wl_drm`, so a client that insists on a GPU buffer will not find one. See
-//! the note on acceleration in the README.
+//! `wl_drm`, so a client that insists on a GPU buffer will not find one.
+//!
+//! That is about how a *client* gets its pixels in, and is separate from how
+//! they get drawn: [`gex_gpu`](../gex_gpu/index.html) composites these frames
+//! through WebGPU. A client still paints with its own CPU; giving the guest
+//! itself a graphics device is a different piece of work again.
 
 pub mod wire;
 
 use std::collections::HashMap;
-use wire::{header, Fixed, Reader, Writer};
+use wire::{header, Reader, Writer};
 
 /// Where a buffer's pixels are.
 ///

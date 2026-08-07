@@ -1,0 +1,19 @@
+[package]
+name = "gex-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebGPU compositing for gex's Wayland surfaces"
+
+[dependencies]
+gex-wayland.workspace = true
+
+# wgpu *is* the WebGPU API. Natively it goes to Vulkan, Metal or D3D12; built
+# for wasm32 it goes to the browser's WebGPU implementation, which is the
+# whole reason for choosing it over anything platform-specific.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = { version = "27", default-features = false, features = ["vulkan", "gles", "wgsl"] }
+pollster = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "27", default-features = false, features = ["webgpu", "wgsl"] }

@@ -85,7 +85,10 @@ run options:
   --wayland-size WxH
                   what size to tell a toplevel window it is (default 640x480)
   --wayland-out PATH
-                  write each committed frame as PATH-NNN.ppm
+                  write each composited screen as PATH-NNN.ppm
+  --wayland-gpu   composite surfaces on the GPU through WebGPU, rather than
+                  handing the host one client buffer at a time. Falls back to
+                  the CPU, with a note, when there is no adapter
   --recompile-objects
                   statically recompile each shared library as it is mapped,
                   rather than translating it a dispatch miss at a time. Off by
@@ -154,6 +157,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 let (w, h) = spec.split_once('x').context("--wayland-size wants WxH")?;
                 opts.wayland_size = (w.parse()?, h.parse()?);
             }
+            "--wayland-gpu" => opts.wayland_gpu = true,
             "--wayland-out" => {
                 i += 1;
                 opts.wayland_out =

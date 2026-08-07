@@ -93,6 +93,9 @@ pub struct RunOptions {
     /// Where to write each committed frame, as a PPM. A window would be
     /// nicer; a file is what a test can compare.
     pub wayland_out: Option<String>,
+    /// Composite on the GPU. Falls back to the CPU with a note if there is
+    /// no adapter.
+    pub wayland_gpu: bool,
     /// Statically recompile each shared library as it is mapped, instead of
     /// letting the runtime translator find it a dispatch miss at a time.
     ///
@@ -131,6 +134,7 @@ impl Default for RunOptions {
             wayland: None,
             wayland_size: (640, 480),
             wayland_out: None,
+            wayland_gpu: false,
             recompile_objects: false,
             jit: false,
             cwd: None,
@@ -592,6 +596,18 @@ fn run_program_with(
         let w = wayland::Wayland::new(opts.wayland_size.0, opts.wayland_size.1);
         if let Some(out) = &opts.wayland_out {
             w.write_frames_to(out);
+        }
+        if opts.wayland_gpu {
+            match w.enable_gpu(opts.wayland_size.0, opts.wayland_size.1) {
+                Ok(adapter) => {
+                    if opts.verbose {
+                        eprintln!("[gex] compositing on {adapter}");
+                    }
+                }
+                // Not fatal. The guest still gets a display; the host just
+                // does the drawing itself.
+                Err(e) => eprintln!("gex: no GPU compositor ({e}); using the CPU"),
+            }
         }
         kernel
             .socket_names

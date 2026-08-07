@@ -125,6 +125,51 @@ wayland() {
     pass=$((pass + 1))
 }
 
+# The GPU compositor must produce exactly what the CPU one does.
+#
+# With the screen the same size as the window there is nowhere for a surface
+# to be placed but the origin, so the two paths have to agree byte for byte:
+# same pixels, same swizzle, same everything. That is a stronger check than
+# any list of sample points, and it is why the sizes match here rather than
+# testing placement -- placement is covered by the unit tests in gex-gpu,
+# which can ask for a screen bigger than the window.
+#
+# A machine with no graphics adapter falls back to the CPU and the comparison
+# becomes vacuous, so the run is required to say which adapter it got.
+wayland_gpu() {
+    label="$1"; prog="$2"
+    out="$WORK/$label"
+    rm -f "$out"-*.ppm
+    set +e
+    "$GEXC" run --verbose --wayland /run/user/0/wayland-0 --wayland-size 64x48 \
+        --wayland-gpu --wayland-out "$out" "$prog" >"$out.stdout" 2>"$out.stderr"
+    rc=$?
+    set -e
+    if [ "$rc" != 0 ]; then
+        echo "FAIL $label: exit status $rc"
+        head -3 "$out.stderr" | sed 's/^/       /'
+        fail=$((fail + 1))
+        return
+    fi
+    if ! grep -q "compositing on " "$out.stderr"; then
+        echo "skip $label: no graphics adapter"
+        grep "no GPU compositor" "$out.stderr" | head -1 | sed 's/^/       /' || true
+        return
+    fi
+    if [ ! -f "$out-000.ppm" ]; then
+        echo "FAIL $label: the compositor produced no frame"
+        fail=$((fail + 1))
+        return
+    fi
+    if ! cmp -s "$WORK/wayland-000.ppm" "$out-000.ppm"; then
+        echo "FAIL $label: the GPU and CPU screens differ"
+        fail=$((fail + 1))
+        return
+    fi
+    echo "ok   $label ($(sed -n 's/.*compositing on //p' "$out.stderr" | head -1))"
+    pass=$((pass + 1))
+}
+
 expect() {
     label="$1"; expected="$2"; shift 2
     g_out="$WORK/$label.gex"
@@ -484,6 +529,8 @@ HFEOF
 )" "$WORK/hostfacilities"
 # The compositor, end to end: see programs/wlclient.c.
 wayland "wayland" "$WORK/wlclient"
+# And the same again on the GPU, which must agree exactly.
+wayland_gpu "wayland-gpu" "$WORK/wlclient"
 compare "cross-block-flags" "$WORK/flags"
 compare "loops" "$WORK/loops"
 compare "fixed-point" "$WORK/fixedpoint"

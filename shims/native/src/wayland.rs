@@ -55,6 +55,12 @@ struct Inner {
     /// Where to write each frame, and how many have been written.
     out: Mutex<Option<String>>,
     written: Mutex<u32>,
+    /// The GPU compositor, when one could be started.
+    ///
+    /// Optional on purpose: a machine with no graphics adapter is a machine
+    /// gex should still run on, and the difference is only where the
+    /// compositing happens.
+    gpu: Mutex<Option<gex_gpu::Compositor>>,
 }
 
 impl std::fmt::Debug for Wayland {
@@ -73,6 +79,23 @@ impl Wayland {
         }
     }
 
+    /// Composite on the GPU rather than by handing single frames to the host.
+    ///
+    /// Returns what the adapter turned out to be, or the reason there is
+    /// none. Either way the compositor keeps working; this only decides
+    /// whether surfaces are drawn onto a screen by a graphics processor or
+    /// handed over one at a time.
+    pub fn enable_gpu(&self, width: i32, height: i32) -> Result<String, String> {
+        match gex_gpu::Compositor::new(width.max(1) as u32, height.max(1) as u32) {
+            Ok(c) => {
+                let name = c.adapter.clone();
+                *self.inner.gpu.lock().unwrap() = Some(c);
+                Ok(name)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Write every committed frame as a PPM at `prefix-NNN.ppm`.
     ///
     /// A window would be better and a canvas better still, but a file is what
@@ -81,15 +104,35 @@ impl Wayland {
         *self.inner.out.lock().unwrap() = Some(prefix.to_string());
     }
 
-    fn save(&self, frame: &Frame) {
+    /// Write out what was drawn.
+    ///
+    /// With a GPU that is the whole screen, every surface composited onto it,
+    /// which is what a screen is. Without one it is a single client buffer,
+    /// because nothing here would otherwise combine them.
+    fn save(&self, frames: &[Frame]) {
         let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
             return;
+        };
+        let mut gpu = self.inner.gpu.lock().unwrap();
+        let (width, height, rgb) = if let Some(c) = gpu.as_mut() {
+            match c.draw(frames).and_then(|()| c.read_back()) {
+                Ok(rgba) => {
+                    let (w, h) = c.size();
+                    (w as i32, h as i32, gex_gpu::rgba_to_rgb(&rgba))
+                }
+                Err(e) => {
+                    eprintln!("gex: the GPU compositor failed: {e}");
+                    return;
+                }
+            }
+        } else {
+            let Some(frame) = frames.last() else { return };
+            (frame.width, frame.height, gex_wayland::to_rgb(frame))
         };
         let mut n = self.inner.written.lock().unwrap();
         let path = format!("{prefix}-{:03}.ppm", *n);
         *n += 1;
-        let rgb = gex_wayland::to_rgb(frame);
-        let mut out = format!("P6\n{} {}\n255\n", frame.width, frame.height).into_bytes();
+        let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
         out.extend_from_slice(&rgb);
         if let Err(e) = std::fs::write(&path, out) {
             eprintln!("gex: could not write {path}: {e}");
@@ -153,9 +196,9 @@ impl Wayland {
         });
         drop(sessions);
         if !produced.is_empty() {
-            for f in &produced {
-                self.save(f);
-            }
+            // One screen per batch of commits, not one per surface: a
+            // compositor draws everything that is up, together.
+            self.save(&produced);
             self.inner.frames.lock().unwrap().extend(produced);
         }
     }
