@@ -41,6 +41,10 @@ mod simd {
     pub const I8X16_SWIZZLE: u32 = 0x0e;
     pub const V128_BITSELECT: u32 = 0x52;
     pub const I8X16_POPCNT: u32 = 0x62;
+    pub const I16X8_EXTADD_PAIRWISE_I8X16_S: u32 = 0x7c;
+    pub const I16X8_EXTADD_PAIRWISE_I8X16_U: u32 = 0x7d;
+    pub const I32X4_EXTADD_PAIRWISE_I16X8_S: u32 = 0x7e;
+    pub const I32X4_EXTADD_PAIRWISE_I16X8_U: u32 = 0x7f;
     pub const V128_AND: u32 = 0x4e;
     pub const V128_ANDNOT: u32 = 0x4f;
     pub const V128_OR: u32 = 0x50;
@@ -1065,6 +1069,18 @@ impl<'a> Emitter<'a> {
                 self.push(*a);
                 match op {
                     VUnOp::PopcntBytes => self.f.simd(simd::I8X16_POPCNT),
+                    VUnOp::ExtAddPairwiseU8 => {
+                        self.f.simd(simd::I16X8_EXTADD_PAIRWISE_I8X16_U)
+                    }
+                    VUnOp::ExtAddPairwiseU16 => {
+                        self.f.simd(simd::I32X4_EXTADD_PAIRWISE_I16X8_U)
+                    }
+                    VUnOp::ExtAddPairwiseS8 => {
+                        self.f.simd(simd::I16X8_EXTADD_PAIRWISE_I8X16_S)
+                    }
+                    VUnOp::ExtAddPairwiseS16 => {
+                        self.f.simd(simd::I32X4_EXTADD_PAIRWISE_I16X8_S)
+                    }
                 }
             }
             Expr::VExtract {

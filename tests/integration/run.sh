@@ -73,6 +73,39 @@ compare() {
 # can only re-exec *itself* for the program it was given, so a guest that execs
 # another aarch64 binary fails under QEMU and works under gex. The expectation
 # is therefore written down, and derived from what Linux does.
+# A host device has to survive an `execve`.
+#
+# The compositor and the virtio-gpu renderer each bind a name in the guest's
+# socket namespace, and `execve` re-enters the function that created them.
+# Building a second one rebinds the name: a client that connects afterwards is
+# accepted by the new device while the process that would service it holds the
+# old, and the guest waits forever for a reply nobody will write. A shell's
+# fork-then-exec hits it every time.
+#
+# QEMU is no oracle -- there is no renderer behind it -- so what is checked is
+# that both the parent and the program it exec'd got an answer.
+virgl_exec() {
+    label="$1"; prog="$2"
+    out="$WORK/$label"
+    if ! "$GEXC" run --virgl /tmp/.gex-test-virgl "$prog" >"$out.stdout" 2>"$out.stderr"; then
+        echo "skip $label: no host renderer"
+        return
+    fi
+    if grep -q "no host renderer" "$out.stderr"; then
+        echo "skip $label: no host renderer"
+        return
+    fi
+    if grep -q "^parent: read 8" "$out.stdout" &&
+        grep -q "^exec.d child: read 8" "$out.stdout"; then
+        echo "ok   $label"
+        pass=$((pass + 1))
+    else
+        echo "FAIL $label: a client was accepted but never serviced"
+        sed 's/^/     /' "$out.stdout"
+        fail=$((fail + 1))
+    fi
+}
+
 # Run a Wayland client against gex's own compositor and check the pixels.
 #
 # QEMU is no oracle here: there is no compositor on the other side of it, so
@@ -493,6 +526,20 @@ echo "building guest programs..."
 # mostly straight-line, which left changes to loop translation able to pass
 # everything here and still lose rows in SQLite.
 "$CC" -O2 -static -o "$WORK/loops" "$HERE/programs/loops.c"
+"$CC" -O2 -static -o "$WORK/termios-size" "$HERE/programs/termios-size.c"
+"$CC" -O2 -static -o "$WORK/neon-cmp64" "$HERE/programs/neon-cmp64.c"
+"$CC" -O2 -static -o "$WORK/neon-lane-stride" "$HERE/programs/neon-lane-stride.c"
+"$CC" -O2 -static -o "$WORK/neon-fixedconv" "$HERE/programs/neon-fixedconv.c"
+"$CC" -O2 -static -o "$WORK/neon-interleave" "$HERE/programs/neon-interleave.c"
+"$CC" -O2 -static -o "$WORK/neon-clz" "$HERE/programs/neon-clz.c"
+"$CC" -O2 -static -o "$WORK/neon-pairwise" "$HERE/programs/neon-pairwise.c"
+"$CC" -O2 -static -o "$WORK/fp-literal" "$HERE/programs/fp-literal.c"
+"$CC" -O2 -static -o "$WORK/unixsock-visible" "$HERE/programs/unixsock-visible.c"
+"$CC" -O2 -static -o "$WORK/virgl-exec" "$HERE/programs/virgl-exec.c"
+"$CC" -O2 -static -o "$WORK/iov-partial" "$HERE/programs/iov-partial.c"
+"$CC" -O2 -static -o "$WORK/signal-kill" "$HERE/programs/signal-kill.c"
+"$CC" -O2 -static -o "$WORK/signal-alarm" "$HERE/programs/signal-alarm.c"
+"$CC" -O2 -static -o "$WORK/signal-sigchld" "$HERE/programs/signal-sigchld.c"
 # Inline assembly, because the fixed-point conversions have no C spelling.
 "$CC" -static -no-pie -O2 -o "$WORK/fixedpoint" "$HERE/programs/fixedpoint.c"
 # Every result this prints is order-independent, so the comparison is of the
@@ -738,6 +785,19 @@ GEXC_ARGS="--no-jit"
 for area in arith float mem flow; do
     compare "nojit-$area" "$WORK/suite" "$area"
 done
+compare "neon-cmp64" "$WORK/neon-cmp64"
+compare "neon-lane-stride" "$WORK/neon-lane-stride"
+compare "neon-fixedconv" "$WORK/neon-fixedconv"
+compare "neon-interleave" "$WORK/neon-interleave"
+compare "neon-clz" "$WORK/neon-clz"
+compare "neon-pairwise" "$WORK/neon-pairwise"
+compare "fp-literal" "$WORK/fp-literal"
+compare "unixsock-visible" "$WORK/unixsock-visible"
+compare "iov-partial" "$WORK/iov-partial"
+compare "signal-kill" "$WORK/signal-kill"
+compare "signal-alarm" "$WORK/signal-alarm"
+compare "signal-sigchld" "$WORK/signal-sigchld"
+virgl_exec "virgl-exec" "$WORK/virgl-exec"
 compare "nojit-vector" "$WORK/vector"
 compare "nojit-neon-structure" "$WORK/neon2"
 compare "nojit-cross-block-flags" "$WORK/flags"
@@ -745,6 +805,104 @@ compare "nojit-loops" "$WORK/loops"
 compare "nojit-fixed-point" "$WORK/fixedpoint"
 compare "nojit-threads" "$WORK/threads"
 GEXC_ARGS=""
+
+# How much of `struct termios` a TCGETS writes. Needs a terminal on both
+# sides, so both run under `script` -- without one the program has nothing to
+# ask and says so, and a vacuous pass is worse than no test. See
+# programs/termios-size.c for why the size is the whole point.
+if command -v script >/dev/null 2>&1; then
+    if [ -x "$WORK/termios-size" ]; then
+        g="$(script -qec "$GEXC run $WORK/termios-size" /dev/null 2>&1 | tr -d '\r')"
+        q="$(script -qec "$QEMU $WORK/termios-size" /dev/null 2>&1 | tr -d '\r')"
+        if [ "$g" = "$q" ] && [ "${g#*clobbered 0}" != "$g" ]; then
+            echo "ok   termios-size"
+            pass=$((pass + 1))
+        else
+            echo "FAIL termios-size: gex and QEMU disagree, or the guard was overwritten"
+            echo "     gex:  $g"
+            echo "     qemu: $q"
+            fail=$((fail + 1))
+        fi
+    fi
+else
+    echo "skip termios-size: no script(1) to make a terminal with"
+fi
+
+# Debian's gcc compiling and running a program, inside the guest. The most
+# demanding thing gex runs, and it needs a 257 MB root filesystem that is not
+# built by default, so it skips when that is absent. See the script's header.
+if out=$("$HERE/../gcc-in-guest.sh" 2>&1); then
+    echo "$out" | grep -E "^(ok|skip)" || true
+    echo "$out" | grep -q "^ok" && pass=$((pass + 1))
+else
+    echo "$out" | sed 's/^/     /'
+    fail=$((fail + 1))
+fi
+
+# The same toolchain at the scale real software is written at: SQLite's 9 MB
+# amalgamation, compiled and then run. Minutes rather than seconds, so it is
+# opt-in -- but it is the case that found the per-store instance ceiling, and
+# a ceiling is exactly the kind of bug a small test cannot reach.
+if [ "${GEX_SLOW:-0}" = "1" ]; then
+    if out=$("$HERE/../sqlite-build-in-guest.sh" 2>&1); then
+        echo "$out" | grep -E "^(ok|skip)" || true
+        echo "$out" | grep -q "^ok" && pass=$((pass + 1))
+    else
+        echo "$out" | sed 's/^/     /'
+        fail=$((fail + 1))
+    fi
+else
+    echo "skip sqlite-build-in-guest: set GEX_SLOW=1 (it takes minutes)"
+fi
+
+# The browser shim still compiles to wasm.
+#
+# Not a behaviour test -- it is a build. It is here because the browser is the
+# only target that matters and it is the one nothing else in this file
+# touches: the terminal test below runs against `web/public`, which holds
+# whatever the last `build-assets.sh` produced, so the shim can stop compiling
+# entirely and every test still passes. It did. A `BlockOp` variant was added
+# for `rt_sigsuspend`, the native shim learned it, and the browser shim was
+# left with two non-exhaustive matches for however long it took someone to
+# rebuild the page.
+#
+# `cargo check`, not `cargo build`: a plain `cargo build` for wasm32 writes
+# `gex_browser.wasm` *without* the link flags in `shims/browser/build.sh`, and
+# a shim linked without `--export=__stack_pointer` loads and then dies on the
+# first call. Checking never produces an artifact, so it cannot clobber the
+# one the browser tests above just ran against.
+if rustup target list --installed 2>/dev/null | grep -q wasm32-unknown-unknown; then
+    if cargo check --quiet --release --target wasm32-unknown-unknown \
+        -p gex-browser >"$WORK/browser-check.out" 2>&1; then
+        echo "ok   browser-builds"
+        pass=$((pass + 1))
+    else
+        echo "FAIL browser-builds: the browser shim does not compile to wasm"
+        grep -E "^error" -A 6 "$WORK/browser-check.out" | head -20 | sed 's/^/     /'
+        fail=$((fail + 1))
+    fi
+else
+    echo "skip browser-builds: no wasm32-unknown-unknown target installed"
+fi
+
+# The demo page's terminal. Not a translation test: it checks the seam above
+# the runtime, where a keystroke has to travel from an xterm through the line
+# discipline into a parked guest read. That seam broke once without any test
+# noticing, because a terminal that ignores input looks exactly like a program
+# that is busy.
+if [ -n "$NODE" ] && [ -f web/public/rootfs/busybox.tar ] \
+    && [ -f web/public/gex/gex_browser.wasm ]; then
+    if "$NODE" web/test/terminal-input.mjs >"$WORK/terminal-input.out" 2>&1; then
+        sed -n 's/^ok   /ok   terminal-/p' "$WORK/terminal-input.out"
+        pass=$((pass + 1))
+    else
+        echo "FAIL terminal-input"
+        sed 's/^/     /' "$WORK/terminal-input.out"
+        fail=$((fail + 1))
+    fi
+else
+    echo "skip terminal-input: no node, or the web assets are not built"
+fi
 
 echo
 if [ "$flaky" -gt 0 ]; then

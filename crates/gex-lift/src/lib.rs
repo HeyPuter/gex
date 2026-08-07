@@ -98,8 +98,11 @@ struct AddResult {
 struct Address {
     base: Value,
     offset: i64,
-    /// Post-index writeback to apply after the access.
-    post: Option<(RegSel, i64)>,
+    /// Post-index writeback to apply after the access: the register to
+    /// update and how much to add to it. A value rather than a constant
+    /// because the register-offset form exists, and there the amount is only
+    /// known at run time.
+    post: Option<(RegSel, Value)>,
 }
 
 impl<'a> Lifter<'a> {
@@ -397,10 +400,22 @@ impl<'a> Lifter<'a> {
             }
             AddrMode::PostIndex { rn, off } => {
                 let base = self.rd_addr(rn);
+                let delta = self.b.const_i64(off as u64);
                 Address {
                     base,
                     offset: 0,
-                    post: Some((rn, off)),
+                    post: Some((rn, delta)),
+                }
+            }
+            AddrMode::PostIndexReg { rn, rm } => {
+                let base = self.rd_addr(rn);
+                // Read before the access, because the access may write the
+                // very register holding the stride.
+                let delta = self.rd_addr(rm);
+                Address {
+                    base,
+                    offset: 0,
+                    post: Some((rn, delta)),
                 }
             }
             AddrMode::RegOffset {
@@ -430,9 +445,8 @@ impl<'a> Lifter<'a> {
     }
 
     fn finish_address(&mut self, a: &Address) {
-        if let Some((rn, off)) = a.post {
+        if let Some((rn, delta)) = a.post {
             let base = self.rd_addr(rn);
-            let delta = self.b.const_i64(off as u64);
             let updated = self.b.bin(BinOp::Add, Ty::I64, base, delta);
             self.wr_addr(rn, updated);
         }
@@ -1897,6 +1911,15 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            Inst::VLoadStoreN {
+                load,
+                regs,
+                lane_bytes,
+                bytes,
+                vt,
+                ref addr,
+            } => self.load_store_n(load, regs, lane_bytes, bytes, vt, addr),
+
             Inst::VLoadStore2 {
                 load,
                 lane_bytes,
@@ -2460,8 +2483,10 @@ impl<'a> Lifter<'a> {
             VOp3::CmEq | VOp3::FCmEq => simple(VLaneBinOp::Eq),
             VOp3::CmGt | VOp3::FCmGt => simple(VLaneBinOp::GtS),
             VOp3::CmGe | VOp3::FCmGe => simple(VLaneBinOp::GeS),
-            VOp3::CmHi => simple(VLaneBinOp::GtU),
-            VOp3::CmHs => simple(VLaneBinOp::GeU),
+            // Only up to 32-bit lanes: wasm has no `i64x2.gt_u`. The
+            // 64-bit cases are rewritten below rather than refused.
+            VOp3::CmHi if lane != VLane::I64 => simple(VLaneBinOp::GtU),
+            VOp3::CmHs if lane != VLane::I64 => simple(VLaneBinOp::GeU),
             _ => None,
         };
         if let Some(bin) = bin {
@@ -2469,6 +2494,41 @@ impl<'a> Lifter<'a> {
             // integer ones; the lane type disambiguates them in the backend.
             let r = self.b.def(Expr::VLaneBin {
                 op: bin,
+                lane,
+                a,
+                b,
+            });
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+
+        // `cmhi`/`cmhs` on 64-bit lanes. wasm's i64x2 comparisons are signed
+        // only, so the operands are biased into signed order first: flipping
+        // the top bit of each lane maps the unsigned range onto the signed
+        // one monotonically, and `a >u b` becomes `(a ^ min) >s (b ^ min)`.
+        // Two extra xors, no branches, and it keeps Mesa's 64-bit compares
+        // out of SIGILL -- which is where they were.
+        if matches!(op, VOp3::CmHi | VOp3::CmHs) && lane == VLane::I64 {
+            let mut bytes = [0u8; 16];
+            bytes[7] = 0x80;
+            bytes[15] = 0x80;
+            let sign = self.b.def(Expr::VConst(Box::new(bytes)));
+            let a = self.b.def(Expr::VBin {
+                op: VBinOp::Xor,
+                a,
+                b: sign,
+            });
+            let b = self.b.def(Expr::VBin {
+                op: VBinOp::Xor,
+                a: b,
+                b: sign,
+            });
+            let r = self.b.def(Expr::VLaneBin {
+                op: if op == VOp3::CmHi {
+                    VLaneBinOp::GtS
+                } else {
+                    VLaneBinOp::GeS
+                },
                 lane,
                 a,
                 b,
@@ -2746,10 +2806,155 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
+            // `saddlp`/`uaddlp` and the accumulating `sadalp`/`uadalp`.
+            // The encoding's `size` is the *source* width, so the result has
+            // half as many lanes of twice the width.
+            //
+            // wasm has the byte and halfword steps outright. The word step it
+            // does not, so that one is a pair of shuffles against a zero
+            // vector -- which is how a lane gets zero-extended without an
+            // extend instruction -- and an add.
+            VOp2::Saddlp | VOp2::Uaddlp | VOp2::Sadalp | VOp2::Uadalp => {
+                let signed = matches!(op, VOp2::Saddlp | VOp2::Sadalp);
+                let accumulate = matches!(op, VOp2::Sadalp | VOp2::Uadalp);
+                let wide = VArr {
+                    lane_bytes: arr.lane_bytes * 2,
+                    ..arr
+                };
+                let summed = match arr.lane_bytes {
+                    1 => self.b.def(Expr::VUn {
+                        op: if signed {
+                            VUnOp::ExtAddPairwiseS8
+                        } else {
+                            VUnOp::ExtAddPairwiseU8
+                        },
+                        a,
+                    }),
+                    2 => self.b.def(Expr::VUn {
+                        op: if signed {
+                            VUnOp::ExtAddPairwiseS16
+                        } else {
+                            VUnOp::ExtAddPairwiseU16
+                        },
+                        a,
+                    }),
+                    4 => {
+                        // Signed would need the sign replicated into the
+                        // upper half rather than zeroes, which this shuffle
+                        // cannot do. `saddlp` at this width has not been
+                        // seen; leaving it precise is better than guessing.
+                        if signed {
+                            return Flow::End(Term::Illegal { raw: self.raw, pc });
+                        }
+                        let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                        let mut ev = [16u8; 16];
+                        let mut od = [16u8; 16];
+                        for half in 0..2usize {
+                            for k in 0..4usize {
+                                ev[half * 8 + k] = (half * 8 + k) as u8;
+                                od[half * 8 + k] = (half * 8 + 4 + k) as u8;
+                            }
+                        }
+                        let evens = self.b.def(Expr::VShuffle {
+                            lanes: Box::new(ev),
+                            a,
+                            b: zero,
+                        });
+                        let odds = self.b.def(Expr::VShuffle {
+                            lanes: Box::new(od),
+                            a,
+                            b: zero,
+                        });
+                        self.b.def(Expr::VLaneBin {
+                            op: VLaneBinOp::Add,
+                            lane: Self::lane_of(wide),
+                            a: evens,
+                            b: odds,
+                        })
+                    }
+                    _ => return Flow::End(Term::Illegal { raw: self.raw, pc }),
+                };
+                let r = if accumulate {
+                    let old = self.b.read(GuestReg::V128(vd.0));
+                    self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Add,
+                        lane: Self::lane_of(wide),
+                        a: old,
+                        b: summed,
+                    })
+                } else {
+                    summed
+                };
+                self.commit_vector(vd, wide, r);
+                Flow::Next
+            }
             VOp2::Cnt => {
                 let r = self.b.def(Expr::VUn {
                     op: VUnOp::PopcntBytes,
                     a,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            // wasm has no vector count-leading-zeros at any lane width, so
+            // it is built from one it does have. Smearing every set bit down
+            // to the bottom of its lane turns the leading-zero count into a
+            // population count: after `x |= x >> 1 … >> w/2`, the lane holds
+            // exactly as many ones as it had bits at or below its highest
+            // set one, and `w - popcount` is the answer. Zero smears to zero
+            // and gives `w`, which is right.
+            //
+            // The population count itself comes back per byte, so for wider
+            // lanes it is summed with pairwise adds -- one for halfwords, two
+            // for words.
+            VOp2::Clz => {
+                let bits = arr.lane_bytes * 8;
+                let lane = Self::lane_of(arr);
+                let mut x = a;
+                let mut sh = 1;
+                while sh < bits {
+                    let amount = self.b.const_i32(sh);
+                    let shifted = self.b.def(Expr::VShift {
+                        op: VShiftOp::ShrU,
+                        lane,
+                        a: x,
+                        amount,
+                    });
+                    x = self.b.def(Expr::VBin {
+                        op: VBinOp::Or,
+                        a: x,
+                        b: shifted,
+                    });
+                    sh *= 2;
+                }
+                let mut counted = self.b.def(Expr::VUn {
+                    op: VUnOp::PopcntBytes,
+                    a: x,
+                });
+                if arr.lane_bytes >= 2 {
+                    counted = self.b.def(Expr::VUn {
+                        op: VUnOp::ExtAddPairwiseU8,
+                        a: counted,
+                    });
+                }
+                if arr.lane_bytes >= 4 {
+                    counted = self.b.def(Expr::VUn {
+                        op: VUnOp::ExtAddPairwiseU16,
+                        a: counted,
+                    });
+                }
+                let mut width = [0u8; 16];
+                for i in 0..(16 / arr.lane_bytes) {
+                    // Little-endian, so the count goes in the lane's low byte
+                    // and the width is never more than 64.
+                    width[(i * arr.lane_bytes) as usize] = bits as u8;
+                }
+                let w = self.b.def(Expr::VConst(Box::new(width)));
+                let r = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Sub,
+                    lane,
+                    a: w,
+                    b: counted,
                 });
                 self.commit_vector(vd, arr, r);
                 Flow::Next
@@ -2900,6 +3105,17 @@ impl<'a> Lifter<'a> {
         shift: u32,
         _pc: u64,
     ) -> Flow {
+        // The fixed-point conversions share this encoding but are not
+        // shifts, so they leave before any of the shift reasoning below.
+        if matches!(
+            op,
+            VShiftImmOp::Scvtf
+                | VShiftImmOp::Ucvtf
+                | VShiftImmOp::Fcvtzs
+                | VShiftImmOp::Fcvtzu
+        ) {
+            return self.fixed_convert(op, arr, vd, vn, shift);
+        }
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
         // A right shift by the whole element width is legal on AArch64 and
@@ -3100,6 +3316,11 @@ impl<'a> Lifter<'a> {
                 }
                 return Flow::Next;
             }
+            // Handled above, before any of the shift reasoning.
+            VShiftImmOp::Scvtf
+            | VShiftImmOp::Ucvtf
+            | VShiftImmOp::Fcvtzs
+            | VShiftImmOp::Fcvtzu => unreachable!("fixed-point converts leave earlier"),
         };
         let r = self.b.def(Expr::VShift {
             op: sop,
@@ -3111,12 +3332,220 @@ impl<'a> Lifter<'a> {
         Flow::Next
     }
 
+    /// `ld3`/`ld4` and `st3`/`st4`: three or four registers interleaved.
+    ///
+    /// Memory holds lane 0 of every register, then lane 1 of every register,
+    /// and so on, so both directions are a byte gather. The block is
+    /// `regs * bytes` long -- 64 for the four-register full-width forms --
+    /// and is moved as whole vectors, with a trailing eight-byte access when
+    /// the total is not a multiple of sixteen (`ld3` on the 64-bit
+    /// arrangements is 24 bytes).
+    ///
+    /// Two registers get their own instruction because a single shuffle
+    /// reaches two inputs; beyond that the gather needs a tree, which is what
+    /// [`Self::gather_bytes`] is.
+    fn load_store_n(
+        &mut self,
+        load: bool,
+        regs: u8,
+        lane_bytes: u32,
+        bytes: u32,
+        vt: gex_isa::VReg,
+        addr: &AddrMode,
+    ) -> Flow {
+        let lb = lane_bytes;
+        let lanes_each = bytes / lb;
+        let total = regs as u32 * bytes;
+        // 16 bytes at a time, with a final 8 when the block is not a whole
+        // number of vectors.
+        let chunks: Vec<(i64, u32)> = {
+            let mut v = Vec::new();
+            let mut at = 0;
+            while at < total {
+                let n = if total - at >= 16 { 16 } else { total - at };
+                v.push((at as i64, n));
+                at += n;
+            }
+            v
+        };
+
+        if load {
+            let a = self.address(addr);
+            let srcs: Vec<Value> = chunks
+                .iter()
+                .map(|&(off, n)| {
+                    self.b.def(Expr::VLoad {
+                        addr: a.base,
+                        offset: a.offset + off,
+                        bytes: n,
+                    })
+                })
+                .collect();
+            for r in 0..regs {
+                // Output byte `lane * lb + k` of register `r` is block byte
+                // `(lane * regs + r) * lb + k`.
+                let mut want = [0u8; 16];
+                for lane in 0..lanes_each {
+                    for k in 0..lb {
+                        let src = (lane * regs as u32 + r as u32) * lb + k;
+                        want[(lane * lb + k) as usize] = src as u8;
+                    }
+                }
+                let v = self.gather_bytes(&srcs, &want);
+                let v = self.narrow_to_64(v, bytes == 16);
+                self.b.write(GuestReg::V128((vt.0 + r) % 32), v);
+            }
+            self.finish_address(&a);
+        } else {
+            let srcs: Vec<Value> = (0..regs)
+                .map(|i| self.b.read(GuestReg::V128((vt.0 + i) % 32)))
+                .collect();
+            let a = self.address(addr);
+            for &(off, n) in &chunks {
+                // Block byte `B` is byte `lane * lb + k` of register
+                // `elem % regs`, where `elem = B / lb`.
+                let mut want = [0u8; 16];
+                for pos in 0..n {
+                    let b_off = off as u32 + pos;
+                    let elem = b_off / lb;
+                    let k = b_off % lb;
+                    let r = elem % regs as u32;
+                    let lane = elem / regs as u32;
+                    // Registers are 16 bytes apart in the gather's numbering,
+                    // whatever the arrangement's width.
+                    want[pos as usize] = (r * 16 + lane * lb + k) as u8;
+                }
+                let v = self.gather_bytes(&srcs, &want);
+                self.b.stmt(Stmt::VStore {
+                    addr: a.base,
+                    offset: a.offset + off,
+                    bytes: n,
+                    val: v,
+                });
+            }
+            self.finish_address(&a);
+        }
+        Flow::Next
+    }
+
+    /// Build one vector by taking each byte from a numbered position in a
+    /// concatenation of up to four source vectors.
+    ///
+    /// `want[i]` is that position, counting sixteen bytes per source. wasm's
+    /// shuffle reaches two vectors, so three or four sources take a tree: one
+    /// shuffle per pair, then one to choose between the pairs. Positions that
+    /// are not wanted from a given pair select byte zero of it, which is
+    /// harmless because the final shuffle never picks them.
+    fn gather_bytes(&mut self, srcs: &[Value], want: &[u8; 16]) -> Value {
+        debug_assert!(!srcs.is_empty() && srcs.len() <= 4);
+        let pair = |lift: &mut Self, base: usize| -> Value {
+            let a = srcs[base];
+            let b = *srcs.get(base + 1).unwrap_or(&a);
+            let mut sel = [0u8; 16];
+            for i in 0..16 {
+                let w = want[i] as usize;
+                sel[i] = if w >= base * 16 && w < base * 16 + 32 {
+                    (w - base * 16) as u8
+                } else {
+                    0
+                };
+            }
+            lift.b.def(Expr::VShuffle {
+                lanes: Box::new(sel),
+                a,
+                b,
+            })
+        };
+        let lo = pair(self, 0);
+        if srcs.len() <= 2 {
+            return lo;
+        }
+        let hi = pair(self, 2);
+        let mut sel = [0u8; 16];
+        for i in 0..16 {
+            sel[i] = if (want[i] as usize) < 32 {
+                i as u8
+            } else {
+                (16 + i) as u8
+            };
+        }
+        self.b.def(Expr::VShuffle {
+            lanes: Box::new(sel),
+            a: lo,
+            b: hi,
+        })
+    }
+
     /// Convert every lane between integer and floating point.
     ///
     /// wasm's SIMD conversions only cover 32-bit lanes: there is no
     /// `f64x2.convert_i64x2_s` and no `i64x2.trunc_sat_f64x2_s`. For the
     /// 64-bit arrangements the two lanes are therefore converted one at a
     /// time with the scalar instructions, which is still branch-free.
+    /// `scvtf`/`ucvtf`/`fcvtzs`/`fcvtzu` with a fractional-bit count.
+    ///
+    /// The lane holds a fixed-point number with `fbits` fractional bits, so
+    /// the conversion is the ordinary one with a scale either side of it:
+    /// dividing by `2^fbits` on the way out of an integer, multiplying by it
+    /// on the way in. Scaling by a power of two is exact in binary floating
+    /// point, so nothing is lost by doing it as a separate multiply rather
+    /// than folding it into the conversion the way the hardware does.
+    fn fixed_convert(
+        &mut self,
+        op: VShiftImmOp,
+        arr: VArr,
+        vd: gex_isa::VReg,
+        vn: gex_isa::VReg,
+        fbits: u32,
+    ) -> Flow {
+        let signed = matches!(op, VShiftImmOp::Scvtf | VShiftImmOp::Fcvtzs);
+        let to_fp = matches!(op, VShiftImmOp::Scvtf | VShiftImmOp::Ucvtf);
+        // The same lanes, read as floats: the arrangement the encoding gives
+        // describes the integer side.
+        let fa = VArr {
+            float: true,
+            ..arr
+        };
+        let lane = Self::lane_of(fa);
+        let a = self.b.read(GuestReg::V128(vn.0));
+
+        let scale = if to_fp { -(fbits as i32) } else { fbits as i32 };
+        let scale = exp2_exact(scale as i32);
+        let mut bytes = [0u8; 16];
+        if arr.lane_bytes == 4 {
+            let f = (scale as f32).to_le_bytes();
+            for i in 0..4 {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&f);
+            }
+        } else {
+            let d = scale.to_le_bytes();
+            for i in 0..2 {
+                bytes[i * 8..i * 8 + 8].copy_from_slice(&d);
+            }
+        }
+        let k = self.b.def(Expr::VConst(Box::new(bytes)));
+
+        let r = if to_fp {
+            let f = self.lane_convert(fa, a, FpConvert::IntToFp { signed }, signed);
+            self.b.def(Expr::VLaneBin {
+                op: VLaneBinOp::Mul,
+                lane,
+                a: f,
+                b: k,
+            })
+        } else {
+            let scaled = self.b.def(Expr::VLaneBin {
+                op: VLaneBinOp::Mul,
+                lane,
+                a,
+                b: k,
+            });
+            self.lane_convert(fa, scaled, FpConvert::FpToInt { signed }, signed)
+        };
+        self.commit_vector(vd, arr, r);
+        Flow::Next
+    }
+
     fn lane_convert(&mut self, arr: VArr, a: Value, kind: FpConvert, signed: bool) -> Value {
         if arr.lane_bytes != 8 {
             let to_fp = matches!(kind, FpConvert::IntToFp { .. });
@@ -3790,4 +4219,17 @@ pub fn sysreg_code(r: SysReg) -> i32 {
         SysReg::Fpsr => -9,
         SysReg::Nzcv => -10,
     }
+}
+
+
+/// `2^n` for the fixed-point scales, built from the exponent field rather
+/// than computed.
+///
+/// `powi` would do, but it is not `const`-friendly and pulls in a libm call
+/// for something that is one exact bit pattern. The range here is bounded by
+/// the element width, so the exponent always fits.
+fn exp2_exact(n: i32) -> f64 {
+    // Bias 1023; the significand stays zero, which is what makes it exact.
+    let biased = (n + 1023) as u64;
+    f64::from_bits(biased << 52)
 }

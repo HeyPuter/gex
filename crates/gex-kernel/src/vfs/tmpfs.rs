@@ -28,6 +28,10 @@ enum Node {
     File(Arc<FileNode>),
     Dir,
     Symlink(String),
+    /// A bound UNIX socket. It holds no data -- reading or writing goes
+    /// through the socket, not the path -- but it has to be visible to
+    /// `stat` and removable by `unlink`.
+    Socket,
 }
 
 #[derive(Debug, Default)]
@@ -193,6 +197,13 @@ impl FileHandle for TmpHandle {
                 ino,
                 mtime: 0,
             }),
+            Some(Node::Socket) => Ok(Metadata {
+                file_type: FileType::Socket,
+                size: 0,
+                mode: 0o755,
+                ino,
+                mtime: 0,
+            }),
             None => Err(Errno::ENOENT),
         }
     }
@@ -233,6 +244,7 @@ impl FileHandle for TmpHandle {
                     Node::File(_) => FileType::Regular,
                     Node::Dir => FileType::Directory,
                     Node::Symlink(_) => FileType::Symlink,
+                    Node::Socket => FileType::Socket,
                 },
                 ino: TmpFs::ino_of(&inner, path),
             });
@@ -378,6 +390,8 @@ impl FileSystem for TmpFs {
             Some(Node::File(f)) => Node::File(Arc::clone(f)),
             Some(Node::Symlink(t)) => Node::Symlink(t.clone()),
             Some(Node::Dir) => return Err(Errno::EPERM),
+            // A socket has one name, the one it was bound to.
+            Some(Node::Socket) => return Err(Errno::EPERM),
             None => return Err(Errno::ENOENT),
         };
         if inner.nodes.contains_key(to) {
@@ -386,6 +400,21 @@ impl FileSystem for TmpFs {
         let ino = inner.inos.get(from).copied().unwrap_or(1);
         inner.nodes.insert(to.to_string(), node);
         inner.inos.insert(to.to_string(), ino);
+        Ok(())
+    }
+
+    fn mksocket(&self, path: &str) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        // Rebinding over a live name is the caller's error, but a stale node
+        // left by a crashed server is ordinary: the X server unlinks the path
+        // before it binds, and so does everything else.
+        if inner.nodes.contains_key(path) {
+            return Err(Errno::EADDRINUSE);
+        }
+        let ino = inner.next_ino;
+        inner.next_ino += 1;
+        inner.inos.insert(path.to_string(), ino);
+        inner.nodes.insert(path.to_string(), Node::Socket);
         Ok(())
     }
 

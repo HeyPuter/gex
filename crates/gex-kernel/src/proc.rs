@@ -27,6 +27,9 @@
 //! keyrings. A guest that asks gets plausible answers, not Linux's.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+
+/// The signal a parent is owed when a child ends.
+const SIGCHLD: u32 = crate::signal::sig::SIGCHLD;
 use std::sync::{Arc, Mutex};
 
 use crate::errno::Errno;
@@ -177,6 +180,21 @@ impl ProcTable {
     pub fn exit(&self, pid: i32, status: i32) {
         let (cell, done) = {
             let mut t = self.lock();
+            // The parent is owed a SIGCHLD. A `wait4` that parks on the
+            // condvar below does not need one, which is why this was missing
+            // and nothing noticed -- but a parent that polls with `WNOHANG`
+            // and sleeps in `sigsuspend` between polls has nothing else to
+            // wake it. coreutils `timeout` installs an empty SIGCHLD handler
+            // for exactly that purpose, and without the signal it waited for
+            // a child that had already exited.
+            let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
+            if let Some(ppid) = ppid {
+                if let Some(parent) = t.procs.iter().find(|p| p.pid == ppid) {
+                    parent
+                        .pending
+                        .fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
+                }
+            }
             for p in t.procs.iter_mut() {
                 if p.ppid == pid {
                     p.ppid = INIT_PID;

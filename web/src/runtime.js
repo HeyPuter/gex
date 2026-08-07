@@ -170,14 +170,21 @@ class TerminalEnv extends Env {
  * Returns the exit status. The caller owns the terminal; nothing here clears
  * it, so a demo can print its own banner first.
  */
-export async function runProgram(term, { elf, files = {}, args, cwd = '/', tty = true, network = null }) {
+export async function runProgram(
+  term,
+  { elf, files = {}, args, cwd = '/', tty = true, network = null, gl = null, uid },
+) {
   const { shimBytes, seedBytes } = await loadRuntime();
   const ref = { current: null };
   const tenv = new TerminalEnv(term, ref);
   const gex = new Gex(tenv);
   ref.current = gex;
 
-  const entry = await gex.load(shimBytes, seedBytes, elf, files, args, { cwd, tty });
+  // Before `load`: the graphics device node is created while the guest's
+  // filesystem is, and a guest that opens /dev/gex-gl and does not find it
+  // concludes the machine has no graphics.
+  if (gl) gex.useGl(gl);
+  const entry = await gex.load(shimBytes, seedBytes, elf, files, args, { cwd, tty, uid });
   if (!entry) throw new Error('the program could not be loaded');
   if (gex.shim.exports.gex_set_winsize) {
     gex.shim.exports.gex_set_winsize(term.rows, term.cols);
@@ -187,6 +194,12 @@ export async function runProgram(term, { elf, files = {}, args, cwd = '/', tty =
   // they are echoed, and whether they are delivered a line at a time, is the
   // guest's choice, read out of its termios.
   const keys = term.onData((d) => tenv.onKey(d));
+  // xterm only hears the keyboard through a hidden textarea, which has to
+  // hold the focus. Nothing gives it that on its own, and the button that
+  // starts a demo disables itself on the way -- which drops focus to the
+  // body. So a program would start, print its prompt, and ignore every key
+  // until the person thought to click on the terminal.
+  term.focus?.();
   const resize = term.onResize(({ rows, cols }) => {
     gex.shim.exports.gex_set_winsize?.(rows, cols);
   });

@@ -88,6 +88,10 @@ run options:
                   write each composited screen as PATH-NNN.ppm
   --gl            give the guest /dev/gex-gl, so a program linked against the
                   guest's libGLESv2 runs its OpenGL on the host's
+  --virgl [PATH]  serve a virtio-gpu renderer, so the guest's own Mesa draws
+                  on the host's GPU. Unmodified OpenGL programs work through
+                  this; set GALLIUM_DRIVER=virpipe in the guest. Defaults to
+                  /tmp/.virgl_test, which is where Mesa looks.
   --wayland-gpu   composite surfaces on the GPU through WebGPU, rather than
                   handing the host one client buffer at a time. Falls back to
                   the CPU, with a note, when there is no adapter
@@ -96,7 +100,18 @@ run options:
                   rather than translating it a dispatch miss at a time. Off by
                   default: measured slower, because seeding from every
                   decodable address translates far more of a library than any
-                  one program uses
+                  one program uses. Measured on Debian bash and glibc, with
+                  compilation parallel and the element-segment limit fixed:
+                  cold 14s against the runtime translator's 8s, and 4s
+                  against 1s once both are cached. What it buys is the
+                  absence of translation pauses part way through a run, not
+                  speed -- an X server that dlopens a 24 MB driver mid-frame
+                  is the case that wants it.
+  --profile       reuse the previous run's discovered entry points. Off by
+                  default: it changes the translation and so the cache key,
+                  which costs a whole recompilation on the second run of a
+                  program -- measured at five to six seconds on bash and
+                  busybox, for no measurable gain once both settle
   --exhaustive    translate every decodable text address ahead of time
   --no-jit        no runtime translation; implies --exhaustive
   --lazy          discover only from the entry point, leaving the rest to
@@ -146,6 +161,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--exhaustive" => exhaustive = true,
             "--sample" => opts.sample = true,
             "--recompile-objects" => opts.recompile_objects = true,
+            "--profile" => opts.profile = true,
             // A display server for the guest, bound at a path in its own
             // unix-socket namespace. Clients find it through WAYLAND_DISPLAY
             // and XDG_RUNTIME_DIR, which are set below if the caller did not.
@@ -160,6 +176,19 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 opts.wayland_size = (w.parse()?, h.parse()?);
             }
             "--wayland-gpu" => opts.wayland_gpu = true,
+            "--virgl" => {
+                // The path is optional: Mesa has a default and almost nobody
+                // overrides it, so requiring it would be noise.
+                let next = args.get(i + 1);
+                let path = match next {
+                    Some(p) if !p.starts_with('-') => {
+                        i += 1;
+                        p.clone()
+                    }
+                    _ => gex_native::virgl::DEFAULT_SOCKET.to_string(),
+                };
+                opts.virgl = Some(path);
+            }
             "--gl" => opts.gl = true,
             "--wayland-out" => {
                 i += 1;
@@ -268,7 +297,15 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
             // Linux prints nothing and the shell reports the status. Only a
             // gex limitation is worth a message, since nothing else would
             // explain it.
-            if *internal || ra.opts.verbose {
+            if *internal {
+                // Not a guest crash, whatever the signal number says. gex
+                // delivers its own failures as SIGSEGV because that is the
+                // only way to stop a running guest, and calling that
+                // "terminated by signal 11" sent one investigation looking
+                // for a miscompile when the real answer was a resource
+                // limit. Say which side failed.
+                eprintln!("gexc: gex failed at guest pc=0x{pc:x}: {detail}");
+            } else if ra.opts.verbose {
                 eprintln!("gexc: guest terminated by signal {signal} at pc=0x{pc:x}: {detail}");
             }
             Ok(ExitCode::from((exit.code() & 0xff) as u8))

@@ -28,6 +28,31 @@ echo "building the shim..."
 "$ROOT/shims/browser/build.sh" >/dev/null
 cp "$ROOT/target/wasm32-unknown-unknown/release/gex_browser.wasm" "$PUB/gex/"
 
+# Every export the page's glue calls, checked here rather than discovered by
+# a visitor. A shim built before the glue gained a call still loads, still
+# instantiates, and then fails on the first demo with "is not a function" --
+# which is what a stale copy of this file did, for a fortnight, with nothing
+# to say the asset rather than the code was wrong.
+node - "$PUB/gex/gex_browser.wasm" "$ROOT/shims/browser/js/gex.mjs" <<'NODEEOF'
+const fs = require('fs');
+const [, , wasmPath, gluePath] = process.argv;
+const glue = fs.readFileSync(gluePath, 'utf8');
+// Everything the glue reaches for by name, less the ones it guards with `?.`.
+const wanted = new Set();
+for (const m of glue.matchAll(/exports\.(gex_[a-z0-9_]+)(\??)\.?/g)) {
+  if (m[2] !== '?') wanted.add(m[1]);
+}
+WebAssembly.compile(fs.readFileSync(wasmPath)).then((mod) => {
+  const have = new Set(WebAssembly.Module.exports(mod).map((e) => e.name));
+  const missing = [...wanted].filter((n) => !have.has(n));
+  if (missing.length) {
+    console.error(`the shim is missing: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+  console.log(`  shim exports all ${wanted.size} the page calls`);
+});
+NODEEOF
+
 echo "building the seed module..."
 cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc >/dev/null 2>&1
 "$ROOT/target/release/gexc" seed -o "$PUB/gex/seed.wasm" --no-shared-memory
@@ -83,16 +108,41 @@ echo "  $PUB/rootfs/busybox.tar: $(du -h "$PUB/rootfs/busybox.tar" | cut -f1)"
 
 # -- debian rootfs ---------------------------------------------------------
 
+# `web/build-debian.sh` does this without root and without debootstrap: a
+# .deb is an `ar` archive with a tar inside, so unpacking the dependency
+# closure of `apt` into a directory is a working userspace. The old branch
+# here shelled out to `sudo debootstrap`, which is why the asset was never
+# built and the demo failed with "the rootfs has no /bin/bash".
+#
+# Skipped unless asked for, because it fetches about 40 MB of packages.
 if [ "${1-}" = "--debian" ]; then
-    D="$WORK/debian"
-    if [ ! -d "$D" ]; then
-        echo "building a minimal debian arm64 rootfs (needs debootstrap and root)..."
-        sudo debootstrap --arch=arm64 --variant=minbase --foreign \
-            bookworm "$D" http://deb.debian.org/debian
-    fi
-    echo "packing the debian rootfs..."
-    tar -C "$D" -cf "$PUB/rootfs/debian.tar" .
-    echo "  $PUB/rootfs/debian.tar: $(du -h "$PUB/rootfs/debian.tar" | cut -f1)"
+    "$HERE/build-debian.sh" "$PUB/rootfs/debian.tar"
+elif [ ! -f "$PUB/rootfs/debian.tar" ]; then
+    echo "no debian rootfs -- run web/build-assets.sh --debian to fetch one"
+fi
+
+# -- the gears, and the GL driver it links against -------------------------
+#
+# An ordinary GLES2 program, cross-compiled and served as an ELF. The page
+# gives the guest a canvas and the guest's libGLESv2 sends every call to it,
+# so what appears is drawn by the browser's own GPU stack.
+#
+# The GL headers have no architecture in them, so the host's serve for a
+# cross build; they are copied out rather than used in place so the host's
+# libc headers are not dragged in with them.
+CC="$TOOLCHAIN/bin/aarch64-linux-musl-gcc"
+MUSL="$TOOLCHAIN/aarch64-linux-musl/lib/libc.so"
+if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
+    echo "building the gears and the guest's GL driver..."
+    mkdir -p "$PUB/fs" "$WORK/glinc"
+    "$ROOT/guest/gl/build.sh" "$WORK/gldriver" >/dev/null
+    cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/glinc/" 2>/dev/null || true
+    "$CC" -O2 -o "$PUB/fs/gles-gears" "$ROOT/tests/integration/programs/gles-gears.c" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    cp "$WORK/gldriver/libGLESv2.so.2" "$WORK/gldriver/libEGL.so.1" "$PUB/fs/"
+    cp "$MUSL" "$PUB/fs/ld-musl-aarch64.so.1"
+else
+    echo "skipping the gears: no cross compiler or no GLES2 headers"
 fi
 
 echo "done"

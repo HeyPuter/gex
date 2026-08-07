@@ -1,0 +1,12 @@
+[package]
+name = "gex-virgl"
+version = "0.1.0"
+edition = "2021"
+
+# `links` so cargo knows only one crate in the graph may claim the native
+# library, and so the build script's metadata reaches dependents.
+links = "virglrenderer"
+
+[dependencies]
+
+[build-dependencies]

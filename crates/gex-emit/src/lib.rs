@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod module;
+pub mod par;
 pub mod region;
 pub mod tier1;
 pub mod wasm;

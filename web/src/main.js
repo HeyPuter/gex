@@ -123,7 +123,15 @@ const ctx = {
       const b = document.createElement('button');
       b.className = `act${a.primary ? ' primary' : ''}`;
       b.textContent = a.label;
-      b.onclick = a.onClick;
+      // Hand the keyboard back to the terminal. A button keeps the focus
+      // after it is clicked, and one that disables itself -- which the Boot
+      // buttons do -- drops it to the body instead, where keystrokes go
+      // nowhere at all.
+      b.onclick = (ev) => {
+        const r = a.onClick(ev);
+        term.focus();
+        return r;
+      };
       if (a.id) b.id = a.id;
       ui.actions.append(b);
     }
@@ -131,7 +139,16 @@ const ctx = {
   hint(text) {
     ui.hint.textContent = text;
   },
+  /// Undo something when the demo is left. A demo that puts anything on the
+  /// page -- the gears put a canvas there -- has to take it away again, and
+  /// doing that here means the demo does not have to know when it happens.
+  onLeave(fn) {
+    leaving.push(fn);
+  },
 };
+
+/// What the current demo asked to have undone.
+let leaving = [];
 
 // -- routing --------------------------------------------------------------
 
@@ -141,6 +158,13 @@ let running = false;
 async function select(demo) {
   if (running && !confirm('A program is still running. Leave it?')) return;
   running = false;
+  for (const fn of leaving.splice(0)) {
+    try {
+      fn();
+    } catch {
+      // A demo that fails to tidy up must not stop the next one starting.
+    }
+  }
   current = demo;
   for (const el of document.querySelectorAll('.demo')) {
     el.setAttribute('aria-current', String(el.dataset.id === demo.id));
@@ -187,7 +211,10 @@ DEMOS.forEach((d, i) => {
   } finally {
     idle();
   }
-  const want = DEMOS.find((d) => d.id === location.hash.slice(1)) || DEMOS[0];
+  // `?demo=` as well as `#demo`, so a link can carry the demo's own options
+  // in the query alongside it.
+  const asked = new URLSearchParams(location.search).get('demo') || location.hash.slice(1);
+  const want = DEMOS.find((d) => d.id === asked) || DEMOS[0];
   await select(want);
 })();
 

@@ -345,6 +345,12 @@ pub enum AddrMode {
     Offset { rn: RegSel, off: i64 },
     /// `[rn], #off` — access at `rn`, then `rn += off`.
     PostIndex { rn: RegSel, off: i64 },
+    /// `[rn], rm` — access at `rn`, then `rn += rm`.
+    ///
+    /// Only the SIMD structure loads and stores have this form, and only
+    /// there because the stride of an image row is not a constant. Mesa's
+    /// pixel loops use it heavily.
+    PostIndexReg { rn: RegSel, rm: RegSel },
     /// `[rn, #off]!` — `rn += off`, then access at `rn`.
     PreIndex { rn: RegSel, off: i64 },
     /// `[rn, rm, <ext> #amount]`.
@@ -827,6 +833,22 @@ pub enum Inst {
         vt: VReg,
         addr: AddrMode,
     },
+    /// `ld3`/`st3`/`ld4`/`st4` — three or four registers interleaved in
+    /// memory.
+    ///
+    /// The same shape as [`Inst::VLoadStore2`] with a wider stride. Kept
+    /// separate rather than folded in because two registers fit a single
+    /// shuffle and more do not, so the lowering differs.
+    VLoadStoreN {
+        load: bool,
+        /// How many registers are interleaved: 3 or 4.
+        regs: u8,
+        lane_bytes: u32,
+        /// Bytes per register: 8 or 16.
+        bytes: u32,
+        vt: VReg,
+        addr: AddrMode,
+    },
     /// `cnt` — per-byte population count.
     VCnt { vd: VReg, vn: VReg, q: bool },
     /// `bsl`/`bit`/`bif`.
@@ -1239,6 +1261,14 @@ pub enum VOp2 {
     Cnt,
     Clz,
     Cls,
+    /// `saddlp`/`uaddlp` — add adjacent lanes into lanes of twice the width.
+    /// The arrangement names the *destination*, so the source lanes are half
+    /// as wide and there are twice as many.
+    Saddlp,
+    Uaddlp,
+    /// `sadalp`/`uadalp` — the same, accumulated into the destination.
+    Sadalp,
+    Uadalp,
     Rbit,
     Rev16,
     Rev32,
@@ -1366,6 +1396,15 @@ pub enum VShiftImmOp {
     /// than being zero, so the shift is a splice of the two registers.
     Sli,
     Sri,
+    /// Fixed-point to floating point: the lane is an integer with `shift`
+    /// fractional bits, so the result is it divided by `2^shift`. Shares the
+    /// shift-by-immediate encoding because the scale sits in the same field.
+    Scvtf,
+    Ucvtf,
+    /// Floating point to fixed point, rounding toward zero: multiply by
+    /// `2^shift` and truncate.
+    Fcvtzs,
+    Fcvtzu,
 }
 
 /// Bitwise vector operations on the `v` register file.

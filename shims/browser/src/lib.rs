@@ -52,6 +52,8 @@ use gex_kernel::net;
 use gex_kernel::{GuestMem, Kernel, SyscallOutcome, ThreadState};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+pub mod gl;
+
 use std::sync::Arc;
 
 // The two things wasm cannot do for itself. Everything else about a syscall
@@ -612,9 +614,14 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
 
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
     kernel.vfs.mount("/", root.clone());
-    kernel
-        .vfs
-        .mount("/dev", Arc::new(gex_kernel::vfs::DevFs::new()));
+    // The graphics device, when the page said it has a canvas to draw on.
+    // Absent otherwise, so a guest sees a machine with no GL rather than one
+    // whose drawing vanishes.
+    let mut devfs = gex_kernel::vfs::DevFs::new();
+    if crate::gl::have_gl() {
+        devfs.add("gex-gl", crate::gl::GlDevice::new());
+    }
+    kernel.vfs.mount("/dev", Arc::new(devfs));
     // `/tmp` is part of the root filesystem rather than a mount of its own,
     // so a page can bundle a file at any path at all. A mount there meant a
     // bundled `/tmp/x` went into the root and every lookup of it went to the
@@ -945,7 +952,7 @@ pub extern "C" fn gex_stdin_eof() {
 /// has to be asked for.
 #[no_mangle]
 pub extern "C" fn gex_paused_for_input() -> i32 {
-    with_host(|h| (h.paused == 1) as i32)
+    with_host(|h| (h.paused & 1 != 0) as i32)
 }
 
 /// Whether the guest stopped because it is waiting on the network. The page
@@ -953,7 +960,7 @@ pub extern "C" fn gex_paused_for_input() -> i32 {
 /// data it is waiting for can arrive -- and then call [`gex_wake`].
 #[no_mangle]
 pub extern "C" fn gex_paused_for_net() -> i32 {
-    with_host(|h| (h.paused == 2) as i32)
+    with_host(|h| (h.paused & 2 != 0) as i32)
 }
 
 /// Carry on after input has arrived: pick a thread and say where to re-enter.
@@ -1152,6 +1159,16 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                     // already in the table, or about nobody at all. Either
                     // way it is answered immediately rather than parked.
                     gex_kernel::BlockOp::WaitChild { .. } => Waiting::Runnable,
+                    // A listener with nothing waiting. The same shape as a
+                    // poll: the scheduler asks again each turn.
+                    gex_kernel::BlockOp::AcceptWait { .. } => Waiting::Runnable,
+                    // `sigsuspend` waits for a signal and nothing else. The
+                    // scheduler is where a signal is delivered, so coming
+                    // back round each turn is the whole implementation: if
+                    // one arrived, delivery happens before this thread runs
+                    // its next instruction, and if not the turn is given up
+                    // again.
+                    gex_kernel::BlockOp::SigSuspend { .. } => Waiting::Runnable,
                 };
                 let t = &mut h.threads[h.current];
                 t.pc = pc as u64 + 4;
@@ -1332,6 +1349,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         Err(_) => return 0,
     };
     h.kernel.close_on_exec();
+    // Handlers are addresses in the image being replaced; see Signals::exec.
+    h.kernel.signals.exec();
     h.kernel.mem = gex_kernel::mem::MemoryMap::new(program.brk());
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
@@ -1504,26 +1523,61 @@ fn schedule() -> i32 {
             // network wait -- telling the page to ask for a keystroke instead
             // means it never turns its event loop, and the bytes it is
             // waiting for never arrive.
+            // The two are not exclusive, so this is a pair of bits and not a
+            // choice: bit 0 says a thread wants a keystroke, bit 1 says a
+            // thread wants the page's event loop to turn. A guest with a
+            // shell in one process and a download in another wants both, and
+            // reporting only one of them starves the other.
             let why = with_host(|h| {
-                let mut kind = 0;
+                let is_socket = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
+                    handle
+                        .metadata()
+                        .map(|m| m.file_type == gex_kernel::vfs::FileType::Socket)
+                        .unwrap_or(false)
+                };
+                let mut mask = 0u8;
                 for t in &h.threads {
                     match &t.waiting {
-                        Waiting::Net(_) => return 2,
-                        Waiting::Write(_) => return 1,
+                        Waiting::Write(_) => mask |= 1,
                         Waiting::Read(handle) => {
-                            let is_socket = handle
-                                .metadata()
-                                .map(|m| m.file_type == gex_kernel::vfs::FileType::Socket)
-                                .unwrap_or(false);
-                            if is_socket {
-                                return 2;
+                            mask |= if is_socket(handle) { 2 } else { 1 };
+                        }
+                        // Every timed wait and every poll parks as `Net`, but
+                        // most of them are not the network. An interactive
+                        // shell polls its terminal rather than blocking in
+                        // `read` -- busybox's does -- and calling that a
+                        // network wait told the page to turn its event loop
+                        // and never ask for a keystroke. The terminal then
+                        // took input and dropped it on the floor, forever.
+                        //
+                        // So a poll is classified by what it is polling.
+                        Waiting::Net(deadline) => {
+                            match &t.blocked_on {
+                                Some(gex_kernel::BlockOp::Poll { fds, .. }) => {
+                                    let mut saw = false;
+                                    for p in fds {
+                                        if let Some(handle) = &p.handle {
+                                            mask |= if is_socket(handle) { 2 } else { 1 };
+                                            saw = true;
+                                        }
+                                    }
+                                    if !saw {
+                                        mask |= 2;
+                                    }
+                                }
+                                _ => mask |= 2,
                             }
-                            kind = 1;
+                            // A wait that can time out needs the clock to
+                            // move, and only the page can move it, so it
+                            // wants the event loop whatever else it wants.
+                            if deadline.is_some() {
+                                mask |= 2;
+                            }
                         }
                         _ => {}
                     }
                 }
-                kind
+                mask
             });
             if why != 0 {
                 with_host(|h| h.paused = why);
@@ -1613,6 +1667,15 @@ fn finish_parked(
             let data = gm.read(*buf, *len)?.to_vec();
             handle.write_at(0, &data)
         }
+        // `accept` is finished by the kernel, which is the only thing with a
+        // descriptor table; the wait here is only for a connection to arrive.
+        gex_kernel::BlockOp::AcceptWait { socket } => {
+            if socket.has_pending() {
+                Ok(0)
+            } else {
+                Err(Errno::EAGAIN)
+            }
+        }
         gex_kernel::BlockOp::Connect { socket } => match socket.status() {
             gex_kernel::net::Status::Open => Ok(0),
             gex_kernel::net::Status::Refused => Err(Errno::ECONNREFUSED),
@@ -1624,6 +1687,8 @@ fn finish_parked(
         gex_kernel::BlockOp::Poll { fds, report, .. } => {
             gex_kernel::syscalls::poll_finish(fds, report, gm)
         }
+        // `sigsuspend` only ever ends one way, whether or not a handler ran.
+        gex_kernel::BlockOp::SigSuspend { .. } => Err(Errno::EINTR),
         gex_kernel::BlockOp::WaitChild {
             children,
             procs,

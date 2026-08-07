@@ -74,6 +74,9 @@ fn addr_str(a: &AddrMode) -> String {
                 format!("[{}], #0x{:x}", reg(rn, Sz::X), off)
             }
         }
+        AddrMode::PostIndexReg { rn, rm } => {
+            format!("[{}], {}", reg(rn, Sz::X), reg(rm, Sz::X))
+        }
         AddrMode::PreIndex { rn, off } => {
             if off < 0 {
                 format!("[{}, #-0x{:x}]!", reg(rn, Sz::X), -off)
@@ -1010,6 +1013,30 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 addr_str(addr)
             )
         }
+        Inst::VLoadStoreN {
+            load,
+            regs,
+            lane_bytes,
+            bytes,
+            vt,
+            ref addr,
+        } => {
+            let arr = VArr {
+                lane_bytes,
+                q: bytes == 16,
+                float: false,
+                scalar: false,
+            };
+            let list: Vec<String> = (0..regs)
+                .map(|i| format!("v{}.{}", (vt.0 + i) % 32, arr.suffix()))
+                .collect();
+            format!(
+                "{}{regs} {{{}}}, {}",
+                if load { "ld" } else { "st" },
+                list.join(", "),
+                addr_str(addr)
+            )
+        }
         Inst::VCnt { vd, vn, q } => {
             let w = if q { "16b" } else { "8b" };
             format!("cnt v{}.{w}, v{}.{w}", vd.0, vn.0)
@@ -1231,6 +1258,10 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 VShiftImmOp::Sli => "sli",
                 VShiftImmOp::Sri => "sri",
                 VShiftImmOp::Shrn => "shrn",
+                VShiftImmOp::Scvtf => "scvtf",
+                VShiftImmOp::Ucvtf => "ucvtf",
+                VShiftImmOp::Fcvtzs => "fcvtzs",
+                VShiftImmOp::Fcvtzu => "fcvtzu",
             };
             // The width-changing forms name two arrangements: the wide one
             // is always a full 128 bits, and `sxtl`/`uxtl` are the aliases
@@ -1669,6 +1700,10 @@ fn vop2_name(op: VOp2) -> &'static str {
         // binutils prefers the `mvn` alias for the vector bitwise NOT.
         VOp2::Not => "mvn",
         VOp2::Cnt => "cnt",
+        VOp2::Saddlp => "saddlp",
+        VOp2::Uaddlp => "uaddlp",
+        VOp2::Sadalp => "sadalp",
+        VOp2::Uadalp => "uadalp",
         VOp2::Clz => "clz",
         VOp2::Cls => "cls",
         VOp2::Rbit => "rbit",

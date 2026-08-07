@@ -717,8 +717,20 @@ fn decode_load_store(raw: u32, pc: u64) -> Inst {
             addr: pc.wrapping_add(off as u64),
         };
         if v == 1 {
-            // SIMD&FP literal load — deferred to the NEON milestone.
-            return Inst::Unknown { raw };
+            // A float constant fetched from the pool the compiler puts next
+            // to the code. Every arrangement is a plain load of 4, 8 or 16
+            // bytes into a vector register; only the reserved size is not.
+            let bytes = match opc {
+                0b00 => 4,
+                0b01 => 8,
+                0b10 => 16,
+                _ => return Inst::Undefined { raw },
+            };
+            return Inst::VLoad {
+                bytes,
+                vt: VReg(bits(raw, 4, 0) as u8),
+                addr,
+            };
         }
         return match opc {
             0b00 => Inst::Load {
@@ -800,13 +812,24 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
     // The register count is encoded in the opcode rather than as a field.
     // `ld2`/`st2` (opcode 1000) also live here but interleave, so they get
     // their own instruction below.
+    // Non-interleaving `ld1`/`st1` in one to four registers, plus the
+    // interleaving forms, which are reported as zero and named separately
+    // below because they lower differently.
     let regs: u8 = match opcode {
         0b0111 => 1,
         0b1010 => 2,
         0b0110 => 3,
         0b0010 => 4,
         0b1000 => 0,
+        0b0100 => 0,
+        0b0000 => 0,
         _ => return Inst::Unknown { raw },
+    };
+    let interleave: u8 = match opcode {
+        0b1000 => 2,
+        0b0100 => 3,
+        0b0000 => 4,
+        _ => 1,
     };
     if !post_index && rm != 0 {
         return Inst::Unknown { raw };
@@ -815,23 +838,42 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
     let rn = RegSel::sp(bits(raw, 9, 5));
     let addr = if post_index {
         // Rm == 31 means the immediate form: advance by the total size.
-        let off = if rm == 0b11111 {
-            // `ld2` reports zero registers but moves two.
-            (if regs == 0 { 2 } else { regs as i64 }) * bytes as i64
+        // Anything else is a register holding the stride, which Mesa's pixel
+        // loops use because an image row is not a compile-time constant.
+        if rm == 0b11111 {
+            // The interleaving forms report zero registers but move as many
+            // as they name.
+            let off = (if regs == 0 {
+                interleave as i64
+            } else {
+                regs as i64
+            }) * bytes as i64;
+            AddrMode::PostIndex { rn, off }
         } else {
-            // The register-offset post-index form needs a value the lifter
-            // would have to read; it does not appear in compiler output.
-            return Inst::Unknown { raw };
-        };
-        AddrMode::PostIndex { rn, off }
+            AddrMode::PostIndexReg {
+                rn,
+                rm: RegSel::gp(rm),
+            }
+        }
     } else {
         AddrMode::Offset { rn, off: 0 }
     };
     let vt = VReg(bits(raw, 4, 0) as u8);
     if regs == 0 {
-        return Inst::VLoadStore2 {
+        let lane_bytes = 1 << bits(raw, 11, 10);
+        if interleave == 2 {
+            return Inst::VLoadStore2 {
+                load,
+                lane_bytes,
+                bytes,
+                vt,
+                addr,
+            };
+        }
+        return Inst::VLoadStoreN {
             load,
-            lane_bytes: 1 << bits(raw, 11, 10),
+            regs: interleave,
+            lane_bytes,
             bytes,
             vt,
             addr,
@@ -886,14 +928,18 @@ fn decode_simd_ldst_single(raw: u32) -> Inst {
     }
     let rn = RegSel::sp(bits(raw, 9, 5));
     let addr = if post_index {
-        // Only the immediate form appears in compiler output; it advances by
-        // exactly the element just transferred.
-        if rm != 0b11111 {
-            return Inst::Unknown { raw };
-        }
-        AddrMode::PostIndex {
-            rn,
-            off: lane_bytes as i64,
+        // Rm == 31 is the immediate form, advancing by exactly the element
+        // just transferred; any other register holds the amount.
+        if rm == 0b11111 {
+            AddrMode::PostIndex {
+                rn,
+                off: lane_bytes as i64,
+            }
+        } else {
+            AddrMode::PostIndexReg {
+                rn,
+                rm: RegSel::gp(rm),
+            }
         }
     } else {
         AddrMode::Offset { rn, off: 0 }
@@ -1969,6 +2015,10 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
         (0b00000, 0) => VOp2::Rev64,
         (0b00000, _) => VOp2::Rev32,
         (0b00001, 0) => VOp2::Rev16,
+        (0b00010, 0) => VOp2::Saddlp,
+        (0b00010, _) => VOp2::Uaddlp,
+        (0b00110, 0) => VOp2::Sadalp,
+        (0b00110, _) => VOp2::Uadalp,
         (0b00100, 0) => VOp2::Cls,
         (0b00100, _) => VOp2::Clz,
         (0b00101, 0) => VOp2::Cnt,
@@ -2104,8 +2154,24 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         (0b00010, _) => VShiftImmOp::USra,
         (0b01000, 1) => VShiftImmOp::Sri,
         (0b01010, 1) => VShiftImmOp::Sli,
+        // The fixed-point conversions. They are not shifts, but the scale
+        // lives in the same `immh:immb` field and counts down from the
+        // element width exactly as a right shift does.
+        (0b11100, 0) => VShiftImmOp::Scvtf,
+        (0b11100, _) => VShiftImmOp::Ucvtf,
+        (0b11111, 0) => VShiftImmOp::Fcvtzs,
+        (0b11111, _) => VShiftImmOp::Fcvtzu,
         _ => return Inst::Unknown { raw },
     };
+    // Only single and double lanes can hold a float, so the 8- and 16-bit
+    // element widths of this encoding are reserved for the conversions.
+    if matches!(
+        op,
+        VShiftImmOp::Scvtf | VShiftImmOp::Ucvtf | VShiftImmOp::Fcvtzs | VShiftImmOp::Fcvtzu
+    ) && esize < 32
+    {
+        return Inst::Undefined { raw };
+    }
     // Left shifts count up from the element size; right shifts count down.
     let left = matches!(
         op,

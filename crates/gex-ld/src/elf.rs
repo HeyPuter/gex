@@ -108,6 +108,20 @@ pub struct Image {
     pub brk: u64,
     /// Executable address range, as `[start, end)`.
     pub text_range: (u64, u64),
+    /// The sections that actually hold instructions, biased, as
+    /// `[start, end)`.
+    ///
+    /// Segment permissions are too coarse to discover code with. A shared
+    /// library is commonly linked with one `R E` LOAD covering everything
+    /// read-only -- Mesa's 23 MB driver has exactly one, and it spans
+    /// `.dynsym`, `.dynstr`, the relocations and 4.6 MB of `.rodata` as well
+    /// as `.text`. Walking that whole range disassembles string tables as
+    /// instructions: the literals "MESA", "PIPE" and "GL_A" each decode to
+    /// something, and each becomes a block that ends in SIGILL.
+    ///
+    /// Empty when the section headers are gone, and then the segments are all
+    /// there is to go on.
+    pub code: Vec<(u64, u64)>,
     /// `PT_TLS`, if present: `(vaddr, filesz, memsz, align)`.
     pub tls: Option<(u64, u64, u64, u64)>,
     /// Function symbols, when a symbol table survives.
@@ -265,6 +279,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         text_range: (text_lo, text_hi),
         tls,
         symbols: Vec::new(),
+        code: Vec::new(),
         pie,
         interp,
     };
@@ -273,6 +288,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         apply_relative_relocations(&mut image, dyn_vaddr, dyn_size);
     }
     image.symbols = read_symbols(&r, e_shoff, e_shentsize, e_shnum, bias);
+    image.code = read_code_sections(&r, e_shoff, e_shentsize, e_shnum, bias);
     Ok(image)
 }
 
@@ -354,6 +370,55 @@ fn write_u64(image: &mut Image, vaddr: u64, value: u64) {
             return;
         }
     }
+}
+
+/// The address ranges of every section marked `SHF_EXECINSTR`.
+///
+/// See [`Image::code`] for why the segment's `PF_X` is not good enough.
+fn read_code_sections(
+    r: &Reader<'_>,
+    e_shoff: usize,
+    e_shentsize: usize,
+    e_shnum: usize,
+    bias: u64,
+) -> Vec<(u64, u64)> {
+    const SHF_EXECINSTR: u64 = 0x4;
+    const SHT_NOBITS: u32 = 8;
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    if e_shoff == 0 || e_shnum == 0 {
+        return out;
+    }
+    for i in 0..e_shnum {
+        let off = e_shoff + i * e_shentsize;
+        let (Ok(sh_type), Ok(sh_flags), Ok(sh_addr), Ok(sh_size)) = (
+            r.u32(off + 4),
+            r.u64(off + 8),
+            r.u64(off + 16),
+            r.u64(off + 32),
+        ) else {
+            continue;
+        };
+        // `.bss` can be marked executable and has no contents to read.
+        if sh_flags & SHF_EXECINSTR == 0 || sh_type == SHT_NOBITS || sh_size == 0 {
+            continue;
+        }
+        // A section with no address is not mapped, so nothing branches to it.
+        if sh_addr == 0 {
+            continue;
+        }
+        out.push((sh_addr + bias, sh_addr + bias + sh_size));
+    }
+    // Merged, because `.plt`, `.text` and `.fini` are usually adjacent and a
+    // single range is cheaper to test than three.
+    out.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in out {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 fn read_symbols(

@@ -243,6 +243,14 @@ pub enum BlockOp {
         deadline: Option<std::time::Duration>,
     },
     Sleep(std::time::Duration),
+    /// `rt_sigsuspend`: wait until a signal the caller can see arrives.
+    ///
+    /// The blocked mask has already been replaced with the one the caller
+    /// asked for, so "can see" means whatever is deliverable now.
+    /// `restore_mask` is what to put back afterwards, which
+    /// [`Kernel::finish_blocking`] does before the call returns `EINTR` --
+    /// the only thing it ever returns.
+    SigSuspend { restore_mask: u64 },
     /// A `read` on a stream with nothing in it yet: a terminal nobody has
     /// typed at, a socket with nothing arrived.
     ///
@@ -357,6 +365,8 @@ pub struct Kernel {
     /// splits: the host waits for a connection to arrive, and the work
     /// happens back here.
     pub retry_accept: Option<(i32, u64, u64, u64)>,
+    /// The blocked mask an `rt_sigsuspend` has to put back when it returns.
+    pub restore_sigmask: Option<u64>,
     /// When this process began, on the guest's clock, so it can be asked how
     /// much time it has used. See [`Kernel::cpu_nanos`].
     ///
@@ -513,6 +523,13 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
 /// The flag words are what Linux hands back for a fresh pty. libc reads
 /// `c_lflag` to decide whether a descriptor is a terminal at all, and musl
 /// line-buffers stdout when it is.
+/// How much of `struct termios` the kernel actually exchanges.
+///
+/// Four flag words, `c_line`, and `c_cc[19]`: `NCCS` is 19 in the kernel's
+/// asm-generic definition, not the 32 a C library declares for its own
+/// structure. Every `TCGETS`/`TCSETS` is this size and no more.
+pub const KERNEL_TERMIOS: usize = 4 * 4 + 1 + 19;
+
 pub const COOKED_TERMIOS: [u8; 60] = {
     let mut t = [0u8; 60];
     // c_iflag: ICRNL | IXON | BRKINT | ...
@@ -524,6 +541,23 @@ pub const COOKED_TERMIOS: [u8; 60] = {
     t[4] = oflag[0]; t[5] = oflag[1]; t[6] = oflag[2]; t[7] = oflag[3];
     t[8] = cflag[0]; t[9] = cflag[1]; t[10] = cflag[2]; t[11] = cflag[3];
     t[12] = lflag[0]; t[13] = lflag[1]; t[14] = lflag[2]; t[15] = lflag[3];
+    // c_line is 0 (N_TTY), and then c_cc. Leaving these zero is not
+    // harmless: an interactive shell reads its erase, interrupt and
+    // end-of-file characters from here, and a zero erase character means
+    // backspace does nothing. These are the kernel's own INIT_C_CC.
+    //
+    //     VINTR ^C   VQUIT ^\   VERASE DEL  VKILL ^U   VEOF ^D
+    //     VTIME 0    VMIN 1     VSWTC 0     VSTART ^Q  VSTOP ^S
+    //     VSUSP ^Z   VEOL 0     VREPRINT ^R VDISCARD ^O
+    //     VWERASE ^W VLNEXT ^V  VEOL2 0
+    let cc = [
+        3u8, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0,
+    ];
+    let mut i = 0;
+    while i < 19 {
+        t[17 + i] = cc[i];
+        i += 1;
+    }
     t
 };
 
@@ -848,6 +882,7 @@ impl Kernel {
             clock: system_clock,
             itimers: [None; 3],
             retry_accept: None,
+            restore_sigmask: None,
             started: 0,
             shared_maps: Vec::new(),
             new_code: Vec::new(),
@@ -1042,6 +1077,7 @@ impl Kernel {
             // A fork does not inherit its parent's timers.
             itimers: [None; 3],
             retry_accept: None,
+            restore_sigmask: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
             shared_maps: Vec::new(),
@@ -1333,6 +1369,28 @@ impl Kernel {
     /// whole purpose is to wait for another thread.
     fn blocking_op(&mut self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<BlockOp> {
         match n {
+            // `rt_sigsuspend`: replace the blocked mask, wait for a signal
+            // the caller can now see, put the mask back.
+            //
+            // The swap and the wait have to look atomic to the guest -- that
+            // is the entire reason the call exists instead of a
+            // `sigprocmask` followed by a `pause` -- so the mask changes
+            // here, before the kernel is unlocked, and is restored in
+            // `finish_blocking`.
+            //
+            // Without it, `timeout 3 sleep 30` ran for the full thirty
+            // seconds and then reported success: musl saw `ENOSYS` and spun,
+            // 1.6 million syscalls' worth, until the child ended by itself.
+            nr::RT_SIGSUSPEND => {
+                let want = m.read_u64(a[0]).ok()?;
+                let restore_mask = self.signals.blocked;
+                // Neither `SIGKILL` nor `SIGSTOP` can be blocked, here or
+                // anywhere else.
+                const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
+                self.signals.blocked = want & !UNBLOCKABLE;
+                self.restore_sigmask = Some(restore_mask);
+                Some(BlockOp::SigSuspend { restore_mask })
+            }
             nr::CONNECT => {
                 let bytes = m.read(a[1], (a[2] as usize).min(128)).ok()?.to_vec();
                 let (ip, port) = net::parse_sockaddr(&bytes).ok()?;
@@ -1520,9 +1578,31 @@ impl Kernel {
             }
             _ => r,
         };
+        // `rt_sigsuspend` waited with a mask of the caller's choosing. The
+        // old mask goes back *after* the handler runs, which means the frame
+        // has to carry it -- restoring it here instead would block the very
+        // signal that ended the wait, leaving it pending forever.
+        let suspended = self.restore_sigmask.take();
         let ret = encode(r);
         let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, ret);
-        match self.deliver_pending(m) {
+        if let Some(mask) = suspended {
+            self.signals.suspend_restore = Some(mask);
+        }
+        let delivery = self.deliver_pending(m);
+        // Nothing was delivered, so no frame took the mask: put it back here.
+        if let Some(mask) = self.signals.suspend_restore.take() {
+            self.signals.blocked = mask;
+        }
+        if self.trace {
+            eprintln!(
+                "[gex:{}] after blocking: delivery {:?}, pending {:#x}, blocked {:#x}",
+                self.pid,
+                delivery,
+                self.signals.pending_raw(),
+                self.signals.blocked
+            );
+        }
+        match delivery {
             Delivery::None => SyscallOutcome::Continue,
             Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
             Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
@@ -1746,6 +1826,9 @@ impl Kernel {
             nr::KILL => {
                 let target = a[0] as i32;
                 let signo = a[1] as u32;
+                if self.trace {
+                    eprintln!("[gex:{}] kill -> pid {target} signal {signo}", self.pid);
+                }
                 match self.procs.kill(self.pid, target, signo) {
                     Ok(_) => {
                         // If the caller was one of the targets -- it signalled
@@ -1887,11 +1970,60 @@ impl Kernel {
     /// the caller must re-enter translated code at the returned address
     /// rather than continuing where it was.
     pub fn deliver_pending(&mut self, m: &mut GuestMem<'_>) -> Delivery {
+        self.collect_signals();
         self.check_timers();
         if !self.signals.has_pending() {
             return Delivery::None;
         }
         signal::dispatch(&mut self.signals, m, self.ctx_addr).unwrap_or(Delivery::None)
+    }
+
+    /// Move signals other processes have sent into this one's pending set.
+    ///
+    /// `kill` cannot reach into another process's kernel -- each has its own
+    /// -- so it leaves the signal on a shared per-process word and the target
+    /// picks it up here. Nothing did: `ProcState::take_signals` existed, was
+    /// tested, and had no caller outside its own tests, so `kill(pid, sig)`
+    /// recorded a signal that was never delivered to anything.
+    ///
+    /// A child asleep in `nanosleep` therefore ran its full thirty seconds
+    /// and exited normally when its parent had sent it `SIGTERM` a second in;
+    /// a spinning one never stopped at all. That is `timeout`, job control,
+    /// and every supervisor.
+    pub fn collect_signals(&mut self) {
+        let inbox = self.procs.take_signals(self.pid);
+        if inbox == 0 {
+            return;
+        }
+        if self.trace {
+            eprintln!("[gex:{}] collected signals {inbox:#x}", self.pid);
+        }
+        for signo in 1..=64u32 {
+            if inbox & (1u64 << (signo - 1)) != 0 {
+                self.signals.raise(signo);
+            }
+        }
+    }
+
+    /// Whether anything is waiting to be delivered, counting what other
+    /// processes have sent. Asked from the host's wait loops, which have no
+    /// other way to notice.
+    pub fn signal_pending(&mut self) -> bool {
+        self.collect_signals();
+        self.check_timers();
+        let ready = self.signals.has_pending();
+        if self.trace && !ready && self.signals.pending_raw() != 0 {
+            // Arrived but not deliverable. Almost always the blocked mask,
+            // and worth saying out loud: a process that will not wake looks
+            // exactly like one nobody signalled.
+            eprintln!(
+                "[gex:{}] signal pending {:#x} but blocked {:#x}",
+                self.pid,
+                self.signals.pending_raw(),
+                self.signals.blocked
+            );
+        }
+        ready
     }
 
     /// Raise a synchronous fault against the running instruction.
@@ -2005,8 +2137,23 @@ impl Kernel {
             if len == 0 {
                 continue;
             }
-            let data = m.read(base, len as usize)?.to_vec();
-            let n = file.write(&data)?;
+            let data = match m.read(base, len as usize) {
+                Ok(d) => d.to_vec(),
+                // Same rule as below: bytes already accepted have to be
+                // reported, or the caller sends them twice.
+                Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
+            };
+            let n = match file.write(&data) {
+                Ok(n) => n,
+                // A pipe or socket that has filled up answers `EAGAIN`. If
+                // earlier vectors were already accepted, the call has
+                // succeeded partially and must say so: returning the error
+                // instead throws away the count for bytes that are already
+                // gone, and the caller -- believing it sent nothing --
+                // retransmits them. An X client doing that corrupts the
+                // request stream.
+                Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
+            };
             total += n;
             // A short write ends the call; the caller retries the remainder.
             if n < len {
@@ -2025,7 +2172,20 @@ impl Kernel {
                 continue;
             }
             let mut tmp = vec![0u8; len as usize];
-            let n = file.read(&mut tmp)?;
+            let n = match file.read(&mut tmp) {
+                Ok(n) => n,
+                // The vector filled and the next one found the socket empty,
+                // which is `EAGAIN`. Reporting that would discard the count
+                // for bytes this call has *already taken out of the socket*
+                // and written into the caller's memory -- they are consumed,
+                // and nothing can give them back. The caller sees "nothing
+                // arrived" and waits for data it is already holding.
+                //
+                // That is the X protocol deadlocking: the server reads a
+                // request header into the first vector, loses it here, and
+                // waits forever for a request the client believes it sent.
+                Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
+            };
             m.write(base, &tmp[..n as usize])?;
             total += n;
             if n < len {
@@ -2331,16 +2491,27 @@ impl Kernel {
         let is_tty = file.is_tty();
         match req {
             TCGETS if is_tty => {
-                m.write(arg, &self.termios)?;
+                // Only the kernel's part of the structure. This is not a
+                // detail: glibc's `tcgetattr` passes a `struct
+                // __kernel_termios` that lives on the caller's stack, and on
+                // this architecture that is 36 bytes because NCCS is 19.
+                // Writing the 60-byte userspace shape into it overruns by 24
+                // and lands on the stack canary -- which is exactly what
+                // `bash -i` did, and why it reported stack smashing before it
+                // had printed a prompt. musl hides the bug by passing its own
+                // larger struct straight through.
+                m.write(arg, &self.termios[..KERNEL_TERMIOS])?;
                 Ok(0)
             }
             // Kept, not discarded. A shell that turns off ICANON and ECHO is
             // taking over line editing, and the host has to stop doing its
             // own or every keystroke lands twice.
             TCSETS | TCSETSW | TCSETSF if is_tty => {
-                let mut t = [0u8; 60];
-                t.copy_from_slice(m.read(arg, 60)?);
-                self.termios = t;
+                // The same shape in the other direction: the caller gave a
+                // kernel-sized structure, so reading past it would read the
+                // caller's stack.
+                let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
+                self.termios[..KERNEL_TERMIOS].copy_from_slice(&src);
                 Ok(0)
             }
             TIOCGWINSZ if is_tty => {
@@ -3298,7 +3469,19 @@ impl Kernel {
             self.vfs.absolute(&path)
         };
         sock.bind(&path)?;
-        self.socket_names.bind(&path, sock)
+        self.socket_names.bind(&path, sock)?;
+        // And a node in the filesystem, so the name can be seen as well as
+        // connected to. Xvfb binds /tmp/.X11-unix/X0 and every X client waits
+        // for that path to appear before trying it; without the node the
+        // server was listening and nothing could tell.
+        //
+        // A filesystem that will not take one is not an error here: the
+        // socket is bound and reachable either way, which is the part that
+        // matters.
+        if !path.starts_with('\0') {
+            let _ = self.vfs.mksocket(&path);
+        }
+        Ok(0)
     }
 
     fn sys_unix_connect(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {

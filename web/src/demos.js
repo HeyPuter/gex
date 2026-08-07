@@ -247,6 +247,10 @@ async function bootDebian(ctx) {
       cwd: '/root',
       tty: true,
       network,
+      // Root, because that is who /root belongs to and who a package
+      // manager expects to be. Without it the guest is some uid with no
+      // passwd entry, and bash greets you with "I have no name!".
+      uid: 0,
     });
     ctx.term.writeln(ctx.ansi.dim(`\r\n[bash exited ${status}]`));
     ctx.status('finished', 'good');
@@ -261,4 +265,119 @@ async function bootDebian(ctx) {
   }
 }
 
-export const DEMOS = [upload, busybox, debian];
+// -- 4: the gears ---------------------------------------------------------
+
+const gears = {
+  id: 'gears',
+  title: 'OpenGL, on your GPU',
+  blurb:
+    'An ordinary OpenGL ES 2 program. It includes the standard headers and links against ' +
+    'libEGL and libGLESv2 by their usual names -- and those libraries, inside the guest, are ' +
+    'marshallers: every call crosses to this page and runs on WebGL.',
+  network: false,
+
+  async enter(ctx) {
+    const { GlDevice } = await import('./gl.js');
+
+    // The canvas lives above the terminal for as long as this demo is
+    // chosen. It is made here rather than in the page's markup so nothing
+    // else has to know the demo exists.
+    const wrap = document.createElement('div');
+    wrap.className = 'canvas-wrap';
+    const canvas = document.createElement('canvas');
+    canvas.width = 320;
+    canvas.height = 240;
+    wrap.append(canvas);
+    document.getElementById('terminal')?.before(wrap);
+    ctx.onLeave(() => wrap.remove());
+
+    const gl = new GlDevice(canvas);
+    if (!gl.ok) {
+      ctx.term.writeln(ctx.ansi.red('This browser has no WebGL 2, so there is no GPU to use.'));
+      ctx.status('no WebGL 2', 'bad');
+      return;
+    }
+
+    ctx.term.writeln('Three interlocking gears, drawn by an aarch64 binary.');
+    ctx.term.writeln('');
+    ctx.term.writeln(ctx.ansi.dim(`  ${gl.describe()}`));
+    ctx.term.writeln('');
+    ctx.term.writeln(
+      ctx.ansi.dim('The guest runs no graphics driver. Mesa would cost tens of thousands of'),
+    );
+    ctx.term.writeln(
+      ctx.ansi.dim('translated instructions per draw and would compile every shader twice, so'),
+    );
+    ctx.term.writeln(
+      ctx.ansi.dim('the split is at the API instead: the guest fills a buffer with commands'),
+    );
+    ctx.term.writeln(
+      ctx.ansi.dim('and hands it over once a frame. The shaders are the ones it wrote.'),
+    );
+    ctx.term.writeln('');
+
+    const start = async (frames) => {
+      ctx.actions([]);
+      ctx.status('fetching');
+      running(true);
+      const t0 = performance.now();
+      try {
+        const [elf, loader, glesv2, egl] = await Promise.all(
+          [
+            '/fs/gles-gears',
+            '/fs/ld-musl-aarch64.so.1',
+            '/fs/libGLESv2.so.2',
+            '/fs/libEGL.so.1',
+          ].map(async (u) => {
+            const r = await fetch(u);
+            if (!r.ok) throw new Error(`${u}: ${r.status}`);
+            return new Uint8Array(await r.arrayBuffer());
+          }),
+        );
+        rule(ctx, `gles-gears — ${ctx.bytes(elf.length)}`);
+        ctx.status('running');
+        const { status } = await ctx.runProgram(ctx.term, {
+          elf,
+          files: {
+            '/lib/ld-musl-aarch64.so.1': loader,
+            '/usr/lib/libGLESv2.so.2': glesv2,
+            '/usr/lib/libEGL.so.1': egl,
+          },
+          args: ['/gles-gears', String(frames)],
+          cwd: '/',
+          tty: true,
+          gl,
+        });
+        const ms = (performance.now() - t0).toFixed(0);
+        ctx.term.writeln('');
+        rule(ctx, `exit ${status} in ${ms} ms`);
+        ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
+      } catch (e) {
+        ctx.term.writeln(ctx.ansi.red(`\r\n${e.message}`));
+        ctx.status(e.message, 'bad');
+      } finally {
+        running(false);
+        ctx.idle();
+        ctx.actions([
+          { label: 'Draw 30 frames', primary: true, onClick: () => start(30) },
+          { label: 'Draw 200', onClick: () => start(200) },
+        ]);
+      }
+    };
+
+    ctx.actions([
+      { label: 'Draw 30 frames', primary: true, onClick: () => start(30) },
+      { label: 'Draw 200', onClick: () => start(200) },
+    ]);
+    ctx.hint('every GL call crosses to this page and runs on WebGL');
+
+    // `?frames=N` starts it straight away, so a link can show someone the
+    // thing rather than a button that shows it.
+    const asked = Number(new URLSearchParams(location.search).get('frames'));
+    if (Number.isFinite(asked) && asked > 0) {
+      await start(Math.min(asked, 2000));
+    }
+  },
+};
+
+export const DEMOS = [upload, busybox, debian, gears];

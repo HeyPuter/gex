@@ -26,9 +26,12 @@ ARCH=arm64
 # what a shell prompt needs to be worth having.
 # libc-bin is not a dependency of libc6 but dpkg refuses to run without the
 # ldconfig in it; perl-base is what maintainer scripts are written in.
-ROOTS="apt dash bash coreutils dpkg findutils grep sed tar gzip diffutils \
+# Overridable, because the same closure-resolver builds the graphics rootfs
+# the virtio-gpu tests need -- that one wants Mesa and mesa-utils-bin on top,
+# and there is no reason for a second copy of this script to say so.
+ROOTS="${GEX_DEBIAN_ROOTS:-apt dash bash coreutils dpkg findutils grep sed tar gzip diffutils \
        debianutils base-files base-passwd hostname ca-certificates \
-       libc-bin perl-base"
+       libc-bin perl-base}"
 
 mkdir -p "$WORK/debs" "$WORK/root"
 R="$WORK/root"
@@ -163,6 +166,10 @@ cat > "$R/etc/hosts" <<'EOF'
 127.0.0.1 localhost gex
 EOF
 # apt over plain HTTP, and without the sandbox user it cannot drop to.
+# The directory is made rather than assumed: the same closure-resolver builds
+# root filesystems that have no apt in them at all, and one of those should
+# not fail on the last line of the script.
+mkdir -p "$R/etc/apt/apt.conf.d"
 cat > "$R/etc/apt/apt.conf.d/99gex" <<'EOF'
 APT::Sandbox::User "root";
 Acquire::AllowInsecureRepositories "true";

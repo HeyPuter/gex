@@ -253,6 +253,18 @@ pub trait FileSystem: Send + Sync {
         let _ = (target, path);
         Err(Errno::EROFS)
     }
+
+    /// Place a node that `stat` reports as a socket.
+    ///
+    /// A UNIX socket bound to a path exists in two places: the socket
+    /// namespace, where `connect` finds it, and the filesystem, where
+    /// everything else does. gex had only the first, so a bound socket was
+    /// invisible -- `test -e /tmp/.X11-unix/X0` said no while the X server
+    /// was listening on exactly that name.
+    fn mksocket(&self, path: &str) -> Result<(), Errno> {
+        let _ = path;
+        Err(Errno::EROFS)
+    }
 }
 
 /// The mount table.
@@ -415,6 +427,12 @@ impl Vfs {
             return Err(Errno::EXDEV);
         }
         fs.link(&rel_from, &rel_to)
+    }
+
+    /// Create a filesystem node for a bound UNIX socket.
+    pub fn mksocket(&self, path: &str) -> Result<(), Errno> {
+        let (fs, rel) = self.resolve(path)?;
+        fs.mksocket(&rel)
     }
 
     pub fn symlink(&self, target: &str, path: &str) -> Result<(), Errno> {

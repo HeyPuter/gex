@@ -41,6 +41,29 @@ sub = re.search(r'pub const GEX_GL_SUBMIT: u64 = (0x[0-9a-fA-F_]+);', dev).group
 out += [f"#define GEXGL_SUBMIT {sub.replace('_','')}u"]
 out += ["", "#endif", ""]
 open(f'{here}/gexgl.h', 'w').write("\n".join(out))
+
+# And the same for the browser, whose executor is JavaScript. Three languages
+# now agree about these numbers because two of them are generated.
+js = ["// Opcodes for the gex graphics device.",
+      "//",
+      "// Generated from crates/gex-gl/src/proto.rs by guest/gl/build.sh.",
+      "// Do not edit: the guest, the native host and this must agree exactly.",
+      "", "export const op = {"]
+for m in re.finditer(r'pub const ([A-Z_0-9]+): u32 = (\d+);', body):
+    js.append(f"    {m.group(1)}: {m.group(2)},")
+js += ["};", "",
+       f"export const MAGIC = {magic.replace('_','')};",
+       "export const HEADER_BYTES = 32;", ""]
+errs = src[src.index('pub mod error {'):]
+errs = errs[:errs.index('\n}')]
+js += ["export const error = {"]
+for m in re.finditer(r'pub const ([A-Z_0-9]+): u32 = (\d+);', errs):
+    js.append(f"    {m.group(1)}: {m.group(2)},")
+js += ["};", ""]
+import os
+webdir = f'{root}/web/src'
+if os.path.isdir(webdir):
+    open(f'{webdir}/gl-proto.js', 'w').write("\n".join(js))
 PYEOF
 
 mkdir -p "$OUT"

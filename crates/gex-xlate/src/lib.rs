@@ -27,7 +27,7 @@ use gex_emit::ModuleBuilder;
 use gex_ir::{pass, Block, Term};
 use gex_ld::Image;
 use gex_lift::{lift_block, BlockLimits};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Knobs for a translation run.
 #[derive(Clone, Debug)]
@@ -120,6 +120,20 @@ impl<'a> CodeView<'a> {
     }
 
     fn is_executable(&self, addr: u64) -> bool {
+        // Sections first. A segment's `PF_X` covers everything read-only in
+        // the same mapping, which for a shared library means the string
+        // tables and relocations as well as the code -- and discovery that
+        // trusts it disassembles "MESA" and "PIPE" into blocks that end in
+        // SIGILL. The section flags say which bytes are really instructions.
+        if !self.image.code.is_empty() {
+            return self
+                .image
+                .code
+                .iter()
+                .any(|&(lo, hi)| addr >= lo && addr < hi);
+        }
+        // Stripped of its section headers, and then the segments are all
+        // there is.
         self.image
             .segments
             .iter()
@@ -254,7 +268,16 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     let mut seen: HashSet<u64> = HashSet::new();
     let mut collected: Vec<Block> = Vec::new();
 
-    worklist.insert(image.entry);
+    // A shared library has no entry point: its `e_entry` is zero, so
+    // `image.entry` is just the load bias and points at the ELF header. gex
+    // seeded it anyway and disassembled "\x7fELF" as an instruction, which is
+    // one block per library that could only ever raise SIGILL.
+    //
+    // Executables always have one, and it is never at offset zero, so
+    // comparing against the bias tells the two apart.
+    if image.entry != image.bias && view.is_executable(image.entry) {
+        worklist.insert(image.entry);
+    }
     if !opts.lazy {
         for sym in &image.symbols {
             if view.is_executable(sym.value) && sym.value % 4 == 0 {
@@ -314,42 +337,67 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
         stats.discovered_exhaustively = worklist.len().saturating_sub(before);
     }
 
-    while let Some(&addr) = worklist.iter().next() {
-        worklist.remove(&addr);
-        if !seen.insert(addr) {
-            continue;
-        }
-        let mut block = lift_block(|pc| view.fetch(pc), addr, opts.limits);
-        pass::optimize(&mut block);
+    // Breadth-first, a level at a time, because a level lifts in parallel and
+    // an address-ordered worklist does not. In `--exhaustive` mode the first
+    // level is every decodable address in the text, which is the whole job:
+    // the run that translates all of Debian used to spend it on one core
+    // while Cranelift waited for it with twenty-three idle.
+    //
+    // Each level is sorted, so the block order -- and with it the module's
+    // hash, which the compiled-module cache is keyed on -- is the same on
+    // every run regardless of how the threads were scheduled.
+    let mut frontier: Vec<u64> = worklist.iter().copied().collect();
+    seen.extend(frontier.iter().copied());
+    let show_illegal = std::env::var_os("GEX_SHOW_ILLEGAL").is_some();
 
-        stats.blocks += 1;
-        stats.instructions += ((block.end - block.start) / 4) as usize;
-        if matches!(block.term, Term::Illegal { .. }) {
-            stats.illegal_blocks += 1;
-            // Which instruction, so the gap can be closed rather than
-            // counted. The lifter reaching one of these is a hole in the
-            // static recompilation: the block is emitted, it is dispatched
-            // to, and it raises SIGILL.
-            if std::env::var_os("GEX_SHOW_ILLEGAL").is_some() {
-                if let Term::Illegal { raw, pc } = block.term {
-                    eprintln!("[illegal] {raw:#010x} at {pc:#x}");
+    while !frontier.is_empty() {
+        let lifted = gex_emit::par::map(&frontier, &|&addr| {
+            let mut block = lift_block(|pc| view.fetch(pc), addr, opts.limits);
+            pass::optimize(&mut block);
+            block
+        });
+
+        let mut next: Vec<u64> = Vec::new();
+        for block in lifted {
+            stats.blocks += 1;
+            stats.instructions += ((block.end - block.start) / 4) as usize;
+            if matches!(block.term, Term::Illegal { .. }) {
+                stats.illegal_blocks += 1;
+                // Which instruction, so the gap can be closed rather than
+                // counted. The lifter reaching one of these is a hole in the
+                // static recompilation: the block is emitted, it is
+                // dispatched to, and it raises SIGILL.
+                if show_illegal {
+                    if let Term::Illegal { raw, pc } = block.term {
+                        eprintln!("[illegal] {raw:#010x} at {pc:#x}");
+                    }
                 }
             }
-        }
 
-        // Both the successors and the return site of any call in this block
-        // are entry points; a callee's `ret` branches straight to the latter.
-        for succ in block.successors().chain(block.call_return) {
-            if !seen.contains(&succ) && view.is_executable(succ) {
-                worklist.insert(succ);
+            // Both the successors and the return site of any call in this
+            // block are entry points; a callee's `ret` branches straight to
+            // the latter.
+            for succ in block.successors().chain(block.call_return) {
+                if !seen.contains(&succ) && view.is_executable(succ) {
+                    seen.insert(succ);
+                    next.push(succ);
+                }
             }
+            collected.push(block);
         }
-        collected.push(block);
+        next.sort_unstable();
+        frontier = next;
     }
 
+    // Back into address order, which is what the worklist used to produce.
+    // Emission order fixes the function indices and therefore the module's
+    // bytes, which the compiled-module cache is keyed on; it also decides
+    // which blocks tier-1 considers together when it folds regions. Neither
+    // should change because the lifting was spread over more cores.
+    collected.sort_unstable_by_key(|b| b.start);
+
     // Flag liveness needs the whole graph, so it runs once discovery has
-    // finished rather than per block. Emission order is unchanged, which
-    // keeps function indices -- and the module's hash -- deterministic.
+    // finished rather than per block.
     stats.dead_flag_stmts = eliminate_dead_flags(&mut collected);
     for block in collected {
         builder.reserve(block.start);
@@ -425,13 +473,13 @@ pub fn translate_object(
     lo: u64,
     hi: u64,
     seeds: &[u64],
-    executable: &dyn Fn(u64) -> bool,
-    known: &dyn Fn(u64) -> bool,
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    known: &(dyn Fn(u64) -> bool + Sync),
     page_table: PageTable,
     limits: BlockLimits,
     max_blocks: usize,
     shared_memory: bool,
-) -> (TranslatedModule, Stats) {
+) -> (Vec<TranslatedModule>, Stats) {
     // Addresses that do not begin a decodable instruction are skipped rather
     // than translated into a block that can only report SIGILL. On a static
     // musl binary that is about three quarters of them, and the same holds
@@ -458,24 +506,111 @@ pub fn translate_object(
     } else {
         seeds
     };
-    translate_seeded(
-        memory,
-        lo,
-        seeds,
-        executable,
-        known,
-        page_table,
-        limits,
-        max_blocks,
-        shared_memory,
-    )
+    let (blocks, mut stats) = discover(
+        memory, lo, seeds, executable, known, limits, max_blocks,
+    );
+    let modules = emit_modules(blocks, lo, page_table, shared_memory, MAX_FUNCS_PER_MODULE);
+    stats.wasm_bytes = modules.iter().map(|m| m.wasm.len()).sum();
+    (modules, stats)
+}
+
+/// How many block functions gex will put in one wasm module.
+///
+/// wasmtime refuses a module with more than a million functions, and Mesa and
+/// libz3 both have more blocks than that -- `--recompile-objects` failed on
+/// them and quietly fell back to translating at run time, which is the one
+/// outcome static recompilation exists to avoid. So an object that does not
+/// fit in one module is emitted as several.
+///
+/// The number is well under the ceiling on purpose. Splitting is not free:
+/// `tier1` emits a direct tail call for an edge whose target is in the same
+/// module and a table dispatch for one that is not, so every split turns some
+/// direct calls into indirect ones. Fewer, fuller modules are faster, and the
+/// chunking below keeps consecutive pages together so that the edges that do
+/// cross a boundary are the rare long-range ones rather than a function's own
+/// fallthrough.
+pub const MAX_FUNCS_PER_MODULE: usize = 500_000;
+
+/// Encode discovered blocks as one module, or as several if there are too
+/// many for one.
+///
+/// The split is by dispatch page, never within one: a page's slots are
+/// allocated as a unit and its element segment is written by whichever module
+/// claimed it, so two modules sharing a page would each hold half its slots
+/// and the second to be installed would overwrite the first's with the stub.
+/// Whole pages, in address order, keeps each module's slot range its own.
+fn emit_modules(
+    blocks: Vec<Block>,
+    text_base: u64,
+    page_table: PageTable,
+    shared_memory: bool,
+    max_funcs: usize,
+) -> Vec<TranslatedModule> {
+    if blocks.len() <= max_funcs {
+        let mut builder = ModuleBuilder::with_pages(
+            text_base,
+            0,
+            Linkage::Shared,
+            page_table,
+            shared_memory,
+        );
+        for block in blocks {
+            builder.add_block(block);
+        }
+        return vec![builder.finish()];
+    }
+
+    // Group by page first, then walk the pages in address order filling one
+    // chunk at a time. A page is never split, so a chunk may overshoot the
+    // budget by up to one page's worth of blocks -- 1024 at the very most,
+    // against a budget of half a million.
+    let mut by_page: BTreeMap<u64, Vec<Block>> = BTreeMap::new();
+    for block in blocks {
+        by_page
+            .entry(block.start / gex_abi::DISPATCH_PAGE)
+            .or_default()
+            .push(block);
+    }
+
+    let mut modules = Vec::new();
+    // Threaded from one chunk to the next: page assignments the earlier
+    // chunks made have to be visible to the later ones, or a page would be
+    // given two different slot bases.
+    let mut pages = page_table;
+    let mut chunk: Vec<Block> = Vec::new();
+    let mut flush = |chunk: &mut Vec<Block>, pages: &mut PageTable, modules: &mut Vec<_>| {
+        if chunk.is_empty() {
+            return;
+        }
+        let mut builder = ModuleBuilder::with_pages(
+            text_base,
+            0,
+            Linkage::Shared,
+            pages.clone(),
+            shared_memory,
+        );
+        for block in chunk.drain(..) {
+            builder.add_block(block);
+        }
+        let m = builder.finish();
+        *pages = m.page_table.clone();
+        modules.push(m);
+    };
+    for (_page, page_blocks) in by_page {
+        if !chunk.is_empty() && chunk.len() + page_blocks.len() > max_funcs {
+            flush(&mut chunk, &mut pages, &mut modules);
+        }
+        chunk.extend(page_blocks);
+    }
+    flush(&mut chunk, &mut pages, &mut modules);
+    modules
 }
 
 pub fn translate_runtime(
     memory: &[u8],
     entry: u64,
-    executable: &dyn Fn(u64) -> bool,
-    known: &dyn Fn(u64) -> bool,
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    known: &(dyn Fn(u64) -> bool + Sync),
     page_table: PageTable,
     limits: BlockLimits,
     max_blocks: usize,
@@ -495,108 +630,160 @@ pub fn translate_runtime(
 }
 
 /// The body both paths share: lift from live memory, following what each
-/// block reaches, starting from whatever was seeded.
+/// block reaches, starting from whatever was seeded, and encode the result as
+/// one module.
 #[allow(clippy::too_many_arguments)]
 fn translate_seeded(
     memory: &[u8],
     entry: u64,
     seeds: &[u64],
-    executable: &dyn Fn(u64) -> bool,
-    known: &dyn Fn(u64) -> bool,
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    known: &(dyn Fn(u64) -> bool + Sync),
     page_table: PageTable,
     limits: BlockLimits,
     max_blocks: usize,
     shared_memory: bool,
 ) -> (TranslatedModule, Stats) {
+    let (blocks, mut stats) =
+        discover(memory, entry, seeds, executable, known, limits, max_blocks);
+    let mut modules = emit_modules(blocks, entry, page_table, shared_memory, usize::MAX);
+    let module = modules.pop().expect("an unbounded budget emits one module");
+    stats.wasm_bytes = module.wasm.len();
+    (module, stats)
+}
+
+/// Lift every block reachable from the seeds.
+///
+/// Separate from encoding because one object's blocks may not fit in one
+/// module -- see [`emit_modules`].
+#[allow(clippy::too_many_arguments)]
+fn discover(
+    memory: &[u8],
+    entry: u64,
+    seeds: &[u64],
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    known: &(dyn Fn(u64) -> bool + Sync),
+    limits: BlockLimits,
+    max_blocks: usize,
+) -> (Vec<Block>, Stats) {
+    let mut stats = Stats::default();
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut collected: Vec<Block> = Vec::new();
+
+    // Breadth-first rather than the address-ordered worklist this used to be,
+    // because a level can be lifted in parallel and an arbitrary worklist
+    // cannot. Lifting is the serial half of static recompilation: Cranelift
+    // uses every core, and until this changed the pass that feeds it used
+    // one, so a large object spent minutes at 4% of the machine.
+    //
+    // The seeds are the first level. Each level is sorted, so the output is
+    // the same on every run -- the compiled-module cache is content-addressed
+    // and a translation that varied between runs would never hit it.
+    let mut frontier: Vec<u64> = seeds
+        .iter()
+        .copied()
+        .filter(|a| *a == entry || !known(*a))
+        .collect();
+    frontier.sort_unstable();
+    frontier.dedup();
+    seen.extend(frontier.iter().copied());
+
+    while !frontier.is_empty() && stats.blocks < max_blocks {
+        if frontier.len() + stats.blocks > max_blocks {
+            frontier.truncate(max_blocks - stats.blocks);
+        }
+        let lifted = gex_emit::par::map(&frontier, &|&a| lift_one(a, memory, executable, limits));
+
+        let mut next: Vec<u64> = Vec::new();
+        for block in lifted {
+            stats.blocks += 1;
+            stats.instructions += ((block.end - block.start) / 4) as usize;
+            if matches!(block.term, Term::Illegal { .. }) {
+                stats.illegal_blocks += 1;
+            }
+
+            // A computed branch whose target folded to a constant is worth
+            // following: that is every cross-object call in a dynamic program.
+            let mut targets: Vec<u64> = block.successors().chain(block.call_return).collect();
+            if let Term::Indirect { target, .. } = block.term {
+                if let Some(t) = pass::const_value(&block, target) {
+                    stats.discovered_from_data += 1;
+                    targets.push(t);
+                }
+            }
+            for succ in targets {
+                // Deliberately *not* skipping an address that falls inside a
+                // block already lifted.
+                //
+                // Doing so is a large saving -- it takes libc from 200,000
+                // blocks to a few tens of thousands -- and it is wrong. An
+                // interior address is still a legal target for an indirect
+                // branch, and dispatch needs a block that starts exactly
+                // there; entering the containing block would re-run the
+                // instructions before it. With runtime translation behind it
+                // that is only a miss. Without, it is where the program dies,
+                // which is what `ld.so` did at 0x2801ae40 the first time this
+                // was tried.
+                if fetchable(memory, executable, succ)
+                    && !seen.contains(&succ)
+                    // Never re-translate something the table already answers
+                    // for; the existing entry may be a tier-2 region.
+                    && !known(succ)
+                {
+                    seen.insert(succ);
+                    next.push(succ);
+                }
+            }
+            collected.push(block);
+        }
+        next.sort_unstable();
+        frontier = next;
+    }
+
+    // Address order, as the worklist this replaced produced. See the note in
+    // `translate_image`: emission order decides the module's bytes.
+    collected.sort_unstable_by_key(|b| b.start);
+    stats.dead_flag_stmts = eliminate_dead_flags(&mut collected);
+    (collected, stats)
+}
+
+/// Whether `pc` holds an instruction this translation may read.
+fn fetchable(memory: &[u8], executable: &(dyn Fn(u64) -> bool + Sync), pc: u64) -> bool {
+    pc % 4 == 0 && executable(pc) && pc as usize + 4 <= memory.len()
+}
+
+/// Lift one block, with the folding that makes a PLT's indirect branch a
+/// discoverable target.
+fn lift_one(
+    addr: u64,
+    memory: &[u8],
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    limits: BlockLimits,
+) -> Block {
     let fetch = |pc: u64| -> Option<u32> {
-        if pc % 4 != 0 || !executable(pc) {
+        if !fetchable(memory, executable, pc) {
             return None;
         }
         let off = pc as usize;
-        if off + 4 > memory.len() {
-            return None;
-        }
         Some(u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()))
     };
-
-    let mut builder =
-        ModuleBuilder::with_pages(entry, 0, Linkage::Shared, page_table, shared_memory);
-    let mut stats = Stats::default();
-    let mut worklist: BTreeSet<u64> = BTreeSet::new();
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut collected: Vec<Block> = Vec::new();
-    worklist.extend(seeds.iter().copied());
-
-    while let Some(&addr) = worklist.iter().next() {
-        worklist.remove(&addr);
-        if !seen.insert(addr) || stats.blocks >= max_blocks {
-            continue;
+    let mut block = lift_block(fetch, addr, limits);
+    // Folded through memory before the ordinary passes, so a PLT's GOT load
+    // becomes a constant and its `br` becomes a target discovery can follow.
+    pass::const_fold_with_memory(&mut block, &|a, bytes| {
+        let off = a as usize;
+        if off + bytes as usize > memory.len() {
+            return None;
         }
-        // Never re-translate something the table already answers for; the
-        // existing entry may be a tier-2 region. The address that prompted a
-        // demand-driven translation is the exception -- it is being asked for
-        // precisely because the table does not answer for it yet.
-        if addr != entry && known(addr) {
-            continue;
-        }
-        let mut block = lift_block(fetch, addr, limits);
-        // Deliberately *not* marking the block's interior as covered.
-        //
-        // Skipping seeds that fall inside an existing block is a large saving
-        // -- it takes libc from 200,000 blocks to a few tens of thousands --
-        // and it is wrong. An interior address is still a legal target for an
-        // indirect branch, and dispatch needs a block that starts exactly
-        // there; entering the containing block would re-run the instructions
-        // before it. With runtime translation behind it that is only a miss.
-        // Without, it is where the program dies, which is what `ld.so` did at
-        // 0x2801ae40 the first time this was tried.
-        // Fold through memory before the ordinary passes, so a PLT's GOT load
-        // becomes a constant and its `br` becomes a discoverable target.
-        pass::const_fold_with_memory(&mut block, &|a, bytes| {
-            let off = a as usize;
-            if off + bytes as usize > memory.len() {
-                return None;
-            }
-            Some(match bytes {
-                1 => memory[off] as u64,
-                2 => u16::from_le_bytes(memory[off..off + 2].try_into().unwrap()) as u64,
-                4 => u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()) as u64,
-                _ => u64::from_le_bytes(memory[off..off + 8].try_into().unwrap()),
-            })
-        });
-        pass::optimize(&mut block);
-
-        stats.blocks += 1;
-        stats.instructions += ((block.end - block.start) / 4) as usize;
-        if matches!(block.term, Term::Illegal { .. }) {
-            stats.illegal_blocks += 1;
-        }
-
-        // A computed branch whose target folded to a constant is worth
-        // following: that is every cross-object call in a dynamic program.
-        let mut targets: Vec<u64> = block.successors().chain(block.call_return).collect();
-        if let Term::Indirect { target, .. } = block.term {
-            if let Some(t) = pass::const_value(&block, target) {
-                stats.discovered_from_data += 1;
-                targets.push(t);
-            }
-        }
-        for succ in targets {
-            if fetch(succ).is_some() && !seen.contains(&succ) && !known(succ) {
-                worklist.insert(succ);
-            }
-        }
-        collected.push(block);
-    }
-
-    stats.dead_flag_stmts = eliminate_dead_flags(&mut collected);
-    for block in collected {
-        builder.add_block(block);
-    }
-
-    let module = builder.finish();
-    stats.wasm_bytes = module.wasm.len();
-    (module, stats)
+        Some(match bytes {
+            1 => memory[off] as u64,
+            2 => u16::from_le_bytes(memory[off..off + 2].try_into().unwrap()) as u64,
+            4 => u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()) as u64,
+            _ => u64::from_le_bytes(memory[off..off + 8].try_into().unwrap()),
+        })
+    });
+    pass::optimize(&mut block);
+    block
 }
 
 #[cfg(test)]
@@ -613,6 +800,7 @@ mod tests {
         Image {
             bias: 0,
             entry: base,
+            code: vec![(base, base + len)],
             segments: vec![Segment {
                 vaddr: base,
                 bytes,
@@ -630,6 +818,66 @@ mod tests {
             symbols: Vec::new(),
             pie: false,
             interp: None,
+        }
+    }
+
+    /// An object too large for one module comes back as several, and the
+    /// split respects the one boundary that matters.
+    ///
+    /// A dispatch page's slots are allocated as a unit and written by
+    /// whichever module claimed the page. Two modules holding blocks from the
+    /// same page would each write that page's whole element segment, and the
+    /// second installed would overwrite the first's entries with the miss
+    /// stub -- every block in the first module would then be silently
+    /// unreachable, which is the kind of failure that shows up as a
+    /// mysterious dispatch miss a long way from here.
+    #[test]
+    fn a_large_object_splits_on_page_boundaries() {
+        // Eight pages of `ret`, every word a seed, so the blocks spread
+        // across pages instead of collapsing into one.
+        let base = 0x10000u64;
+        let span = 8 * gex_abi::DISPATCH_PAGE;
+        let mut memory = vec![0u8; (base + span) as usize];
+        let mut a = base;
+        while a < base + span {
+            memory[a as usize..a as usize + 4].copy_from_slice(&0xd65f03c0u32.to_le_bytes());
+            a += 4;
+        }
+        let seeds: Vec<u64> = (base..base + span).step_by(4).collect();
+        let (blocks, _) = discover(
+            &memory,
+            base,
+            &seeds,
+            &|x| x >= base && x < base + span,
+            &|_| false,
+            BlockLimits::default(),
+            usize::MAX,
+        );
+        let total = blocks.len();
+        assert_eq!(total, seeds.len(), "every `ret` is its own block");
+
+        // A budget that forces a split without dictating where it falls.
+        let modules = emit_modules(blocks, base, PageTable::default(), false, total / 4);
+        assert!(modules.len() > 1, "the budget should have forced a split");
+
+        let mut seen_addrs = HashSet::new();
+        let mut seen_pages = HashMap::new();
+        for (i, m) in modules.iter().enumerate() {
+            for (addr, _) in &m.exported_blocks {
+                assert!(seen_addrs.insert(*addr), "{addr:#x} exported twice");
+                let page = addr / gex_abi::DISPATCH_PAGE;
+                let owner = seen_pages.entry(page).or_insert(i);
+                assert_eq!(*owner, i, "page {page:#x} is split across two modules");
+            }
+        }
+        assert_eq!(seen_addrs.len(), total, "a block went missing in the split");
+
+        // Slot bases are handed out once, across all the modules together.
+        let mut bases = HashSet::new();
+        for m in &modules {
+            for (_page, base) in &m.dir_entries {
+                assert!(bases.insert(*base), "slot base {base} given out twice");
+            }
         }
     }
 

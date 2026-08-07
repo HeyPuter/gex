@@ -253,3 +253,24 @@ footer {
   .brand p, .rail-foot, .demo .d { display: none; }
   nav { flex-direction: row; }
 }
+
+/* The gears demo's canvas, above the terminal for as long as it is chosen.
+   Pixelated because the guest renders at a fixed size and scaling it
+   smoothly would blur what is being demonstrated. */
+.canvas-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 12px 0;
+  background: #0d0f14;
+  border-bottom: 1px solid #23262e;
+}
+
+.canvas-wrap canvas {
+  width: 640px;
+  max-width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+  border: 1px solid #23262e;
+  border-radius: 4px;
+  background: #000;
+}

@@ -8,3 +8,9 @@ description = "GIR -> WebAssembly code generation and .gexm packaging"
 [dependencies]
 gex-abi.workspace = true
 gex-ir.workspace = true
+
+[features]
+# Lift and generate code on every core. Off for the browser shim, which
+# reaches this crate compiled to wasm where `std::thread::scope` is absent.
+default = []
+parallel = []

@@ -53,12 +53,20 @@ impl HostFs {
 }
 
 fn file_type_of(md: &std::fs::Metadata) -> FileType {
+    use std::os::unix::fs::FileTypeExt;
+    let t = md.file_type();
     if md.is_dir() {
         FileType::Directory
     } else if md.is_symlink() {
         FileType::Symlink
     } else if md.is_file() {
         FileType::Regular
+    } else if t.is_socket() {
+        // A bound UNIX socket. Everything that waits for a server to come up
+        // stats its path and asks for exactly this.
+        FileType::Socket
+    } else if t.is_fifo() {
+        FileType::Fifo
     } else {
         FileType::CharDevice
     }
@@ -285,6 +293,27 @@ impl FileSystem for HostFs {
         }
         std::os::unix::fs::symlink(Path::new(target), self.host_path(path)?)
             .map_err(|e| Errno::from_io(&e))
+    }
+
+    /// A real socket node, made the only way the standard library can: bind a
+    /// listener and let it go.
+    ///
+    /// Dropping a `UnixListener` closes the descriptor but leaves the node --
+    /// which here is the point, since the guest's own socket is the one that
+    /// will serve it. The alternative is `mknod`, which would mean a libc
+    /// dependency for one call.
+    fn mksocket(&self, path: &str) -> Result<(), Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        let host = self.host_path(path)?;
+        match std::os::unix::net::UnixListener::bind(&host) {
+            Ok(l) => {
+                drop(l);
+                Ok(())
+            }
+            Err(e) => Err(Errno::from_io(&e)),
+        }
     }
 }
 

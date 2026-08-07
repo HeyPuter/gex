@@ -143,6 +143,17 @@ pub struct Signals {
     pub alt_stack: SigAltStack,
     /// Set while a handler runs, so `rt_sigreturn` knows a frame exists.
     pub in_handler: bool,
+    /// The mask a signal frame should record instead of the current one.
+    ///
+    /// `rt_sigsuspend` runs with a mask of the caller's choosing and has to
+    /// put the old one back *after* the handler returns, not before -- and
+    /// the frame is what carries a mask across a handler. So the suspend
+    /// leaves the old mask here, `setup_frame` writes that into the frame,
+    /// and `sigreturn` restores it. Without it the woken signal is blocked
+    /// again before it can be delivered, stays pending forever, and every
+    /// later suspend returns instantly: `timeout` spun 2.2 million times
+    /// that way.
+    pub suspend_restore: Option<u64>,
 }
 
 impl Default for Signals {
@@ -162,9 +173,36 @@ impl Signals {
             actions: self.actions,
             pending: 0,
             blocked: self.blocked,
+            suspend_restore: None,
             alt_stack: self.alt_stack,
             in_handler: false,
         }
+    }
+
+    /// The signal state after `execve`.
+    ///
+    /// A handler is an address in the image that installed it, and `execve`
+    /// replaces the image -- so every caught signal has to go back to its
+    /// default. Nothing did that, and the consequence is worse than a wrong
+    /// disposition: a shell installs handlers, forks, and execs, and the new
+    /// program inherited the *address* of a handler that no longer exists.
+    /// The first signal sent to it jumped there. `timeout 3 sleep 30` died
+    /// that way -- not in `sleep`, which has no handlers at all, but in
+    /// dash's, resurrected in an address space where it is not code.
+    ///
+    /// What survives is what POSIX says survives: ignored stays ignored,
+    /// because a shell relies on that to protect a child it started in the
+    /// background; the blocked mask carries over; and so do pending signals.
+    /// The alternate stack does not -- it pointed into the old image too.
+    pub fn exec(&mut self) {
+        for action in self.actions.iter_mut() {
+            if action.handler != SIG_DFL && action.handler != SIG_IGN {
+                *action = SigAction::default();
+            }
+        }
+        self.alt_stack = SigAltStack::default();
+        self.in_handler = false;
+        self.suspend_restore = None;
     }
 }
 
@@ -183,6 +221,7 @@ impl Signals {
             actions: [SigAction::default(); sig::MAX as usize + 1],
             pending: 0,
             blocked: 0,
+            suspend_restore: None,
             alt_stack: SigAltStack::default(),
             in_handler: false,
         }
@@ -223,6 +262,11 @@ impl Signals {
         let signal = ready.trailing_zeros() + 1;
         self.pending &= !bit(signal);
         Some(signal)
+    }
+
+    /// Everything raised, deliverable or not. For diagnostics only.
+    pub fn pending_raw(&self) -> u64 {
+        self.pending
     }
 
     pub fn has_pending(&self) -> bool {
@@ -321,7 +365,10 @@ pub fn setup_frame(
     m.write_u32(uc + frame::UC_STACK as u64 + 8, signals.alt_stack.flags)?;
     m.write_u64(uc + frame::UC_STACK as u64 + 16, signals.alt_stack.size)?;
     // The mask to restore on return is the one in force right now.
-    m.write_u64(uc + frame::UC_SIGMASK as u64, signals.blocked)?;
+    m.write_u64(
+        uc + frame::UC_SIGMASK as u64,
+        signals.suspend_restore.take().unwrap_or(signals.blocked),
+    )?;
 
     // The machine context: every general register, sp, pc and pstate, taken
     // from the thread context, which a host call has already made complete.

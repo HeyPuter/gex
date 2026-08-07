@@ -25,7 +25,84 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use wasmtime::{Engine, Module};
+
+/// How much disk the cache may use, before it starts discarding the entries
+/// it has gone longest without reading.
+///
+/// It needs a limit because most of what lands here is never read again. A
+/// whole program keys on its own bytes and hits on every later run, which is
+/// the case this cache was built for; a batch of runtime-translated blocks
+/// keys on *which blocks were in the batch*, and that depends on the order
+/// discovery happened to reach them, so it almost never recurs. Those entries
+/// are written once and read never.
+///
+/// Measured on this machine after a few days of graphics work: 247,684
+/// entries, 21 GB, of which 88% were under 64 KB -- runtime batches. Nothing
+/// removed any of them.
+const DEFAULT_BUDGET: u64 = 4 << 30;
+
+/// Sweeping means listing the directory, so it is not done on every store.
+const STORES_BETWEEN_SWEEPS: u64 = 64;
+static STORES: AtomicU64 = AtomicU64::new(0);
+
+fn budget() -> u64 {
+    std::env::var("GEX_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_BUDGET)
+}
+
+/// Delete the least recently used entries until the cache is comfortably
+/// under budget.
+///
+/// "Least recently used" is the metadata file's modification time, which
+/// [`load_or_compile`] refreshes on a hit. Sorting by it therefore keeps the
+/// modules that are actually being reused and drops the ones that are not,
+/// which is precisely the split between whole programs and runtime batches.
+///
+/// Down to 80% rather than exactly to the limit, so a run does not sweep on
+/// every store once it is full.
+fn evict(dir: &Path, budget: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // (mtime, key, bytes) for each entry, sized as module plus metadata.
+    let mut items: Vec<(std::time::SystemTime, String, u64)> = Vec::new();
+    let mut total = 0u64;
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("cwasm") {
+            continue;
+        }
+        let Some(key) = path.file_stem().and_then(|k| k.to_str()).map(String::from) else {
+            continue;
+        };
+        let wasm_len = e.metadata().map(|m| m.len()).unwrap_or(0);
+        let meta_path = dir.join(format!("{key}.meta"));
+        let meta = std::fs::metadata(&meta_path);
+        let meta_len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let when = meta
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        total += wasm_len + meta_len;
+        items.push((when, key, wasm_len + meta_len));
+    }
+    if total <= budget {
+        return;
+    }
+    items.sort_by_key(|(when, _, _)| *when);
+    let target = budget / 5 * 4;
+    for (_, key, size) in items {
+        if total <= target {
+            break;
+        }
+        let _ = std::fs::remove_file(dir.join(format!("{key}.cwasm")));
+        let _ = std::fs::remove_file(dir.join(format!("{key}.meta")));
+        total = total.saturating_sub(size);
+    }
+}
 
 pub mod sha256;
 
@@ -183,11 +260,16 @@ pub fn load_or_compile(
         // failure path below simply rebuilds.
         match unsafe { Module::deserialize(engine, &bytes) } {
             Ok(module) => {
+                // Rewriting the metadata refreshes its modification time,
+                // which is what eviction sorts by. It is a few hundred bytes
+                // and it is the difference between keeping the modules that
+                // get reused and keeping whichever happen to be newest.
+                let _ = std::fs::write(&meta_path, &metadata);
                 return Ok(Loaded {
                     module,
                     metadata,
                     hit: true,
-                })
+                });
             }
             Err(_) => {
                 // Unusable: drop it so the next run does not pay to find out
@@ -205,6 +287,11 @@ pub fn load_or_compile(
         // what publishes the entry.
         store(dir, &meta_path, &metadata);
         store(dir, &path, &serialized);
+        // Not on every store: the sweep lists the whole directory, and with a
+        // quarter of a million entries that is not free.
+        if STORES.fetch_add(1, Ordering::Relaxed) % STORES_BETWEEN_SWEEPS == 0 {
+            evict(dir, budget());
+        }
     }
     Ok(Loaded {
         module,
@@ -348,6 +435,47 @@ mod tests {
 
         let again = load_or_compile(&engine, &dir, k, build).unwrap();
         assert!(!again.hit, "half an entry must not be used");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// A cache over budget loses its least recently used entries and keeps
+    /// the rest.
+    #[test]
+    fn eviction_keeps_what_was_read_recently() {
+        let dir = std::env::temp_dir().join(format!("gex-cache-evict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Ten entries of a kilobyte each, written oldest first. The
+        // modification times have to differ or the sort has nothing to go on,
+        // and a filesystem's timestamp granularity can be coarse.
+        for i in 0..10 {
+            let key = format!("k{i}");
+            std::fs::write(dir.join(format!("{key}.cwasm")), vec![0u8; 1024]).unwrap();
+            std::fs::write(dir.join(format!("{key}.meta")), b"m").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        // Read the oldest, which is what a hit does.
+        std::fs::write(dir.join("k0.meta"), b"m").unwrap();
+
+        // Budget for four entries; eviction goes to 80% of it.
+        evict(&dir, 4 * 1025);
+
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("cwasm"))
+            .map(|e| e.path().file_stem().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.len() <= 4, "still over budget: {left:?}");
+        assert!(left.contains(&"k0".to_string()), "dropped a recent read: {left:?}");
+        assert!(left.contains(&"k9".to_string()), "dropped the newest: {left:?}");
+        assert!(!left.contains(&"k1".to_string()), "kept the oldest unread: {left:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

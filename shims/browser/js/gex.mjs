@@ -63,7 +63,7 @@ function metadataSection(wasm) {
 }
 
 export class Gex {
-  #memory; #shim; #guest; #env; #u8; #imports; #net = null;
+  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null;
 
   constructor(env = new Env()) {
     this.#env = env;
@@ -127,9 +127,32 @@ export class Gex {
             : 0,
         net_avail: (id) => (this.#net ? (this.#net.available(id) ? 1 : 0) : 1),
         net_close: (id) => this.#net?.close(id),
+        // Graphics. The guest's GL library has already put a whole batch of
+        // commands in its own memory; this hands over the address and the
+        // page runs them on WebGL. Nothing is copied in either direction.
+        gl_submit: (ring) => (this.#gl ? this.#gl.submit(this.#memory, ring >>> 0) : -1),
       },
     });
     this.#u8 = new Uint8Array(this.#memory.buffer);
+    // A shim older than this file still loads and still instantiates, and
+    // then fails on the first call to something it does not have -- which
+    // surfaces as `e.gex_paused_for_net is not a function` at the moment the
+    // guest first waits for input, long after the mistake. Named here
+    // instead, once, where it says what to do about it.
+    const required = [
+      'gex_alloc', 'gex_load', 'gex_add_file', 'gex_push_stdin', 'gex_wake',
+      'gex_paused_for_input', 'gex_paused_for_net', 'gex_resume_pc',
+      'gex_resume_ctx', 'gex_exit_code', 'gex_jit_pending_len',
+    ];
+    const missing = required.filter((n) => typeof this.#shim.exports[n] !== 'function');
+    if (missing.length) {
+      throw new Error(
+        `the gex runtime is out of date: it has no ${missing.join(', ')}. ` +
+          'Rebuild it with web/build-assets.sh and reload.',
+      );
+    }
+    // Whatever `useGl` was told before the shim existed.
+    this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
     // wasm-ld puts the shim's stack at address zero regardless of
     // --global-base, which is the guest's image. Move it into the shim's own
     // region, above everything the guest maps. Nothing has run yet.
@@ -256,6 +279,23 @@ export class Gex {
     this.#shim.exports.gex_set_network(net ? 1 : 0);
   }
 
+  /**
+   * Give the guest a graphics device.
+   *
+   * `gl` is a `GlDevice` from `web/src/gl.js`, holding a canvas. Off by
+   * default for the same reason the network is: a guest with no canvas behind
+   * it should see a machine with no graphics device, which fails at `open`,
+   * rather than one whose drawing disappears.
+   */
+  useGl(gl) {
+    this.#gl = gl;
+    // Before `load` is the useful order -- the device node is created while
+    // the guest's filesystem is being built, and a guest that opens
+    // /dev/gex-gl and does not find it concludes it has no graphics. Calling
+    // this afterwards still works for a second run.
+    this.#shim?.exports?.gex_set_gl?.(gl ? 1 : 0);
+  }
+
   async run(entry) {
     // Every switch, signal and miss leaves wasm by trapping, and V8 captures
     // a stack trace for each trap it turns into a RuntimeError. Nothing here
@@ -313,12 +353,22 @@ export class Gex {
         if (e.gex_paused_for_net() || e.gex_paused_for_input()) {
           let woke = 0;
           while (e.gex_paused_for_net() || e.gex_paused_for_input()) {
-            if (e.gex_paused_for_net()) {
-              // A timer rather than a microtask: a microtask would run before
-              // the socket callbacks this is waiting for.
-              await new Promise((r) => setTimeout(r, 1));
-            } else {
-              const more = await this.#env.readStdin();
+            // Input first, and the two are not exclusive. A guest can have a
+            // shell waiting on the keyboard and a download waiting on a
+            // socket at the same time, and asking only about the network
+            // meant a terminal that was never read from.
+            if (e.gex_paused_for_input()) {
+              // Waiting for a keystroke is an indefinite wait, and it should
+              // be: no timer, no polling, the page simply idles. But when
+              // something is waiting on the clock or a socket too, the wait
+              // has to end on its own as well, or that other thread never
+              // gets to run. Losing the race costs nothing -- a key that
+              // arrives later is handed to the guest by the environment
+              // whether or not anyone is still awaiting this promise.
+              const key = this.#env.readStdin();
+              const more = e.gex_paused_for_net()
+                ? await Promise.race([key, new Promise((r) => setTimeout(() => r(true), 5))])
+                : await key;
               if (more === false) {
                 this.endStdin();
                 // An environment with no input at all answers instantly, and
@@ -326,6 +376,10 @@ export class Gex {
                 // else happen. One tick is enough to keep the page alive.
                 await new Promise((r) => setTimeout(r, 1));
               }
+            } else {
+              // A timer rather than a microtask: a microtask would run before
+              // the socket callbacks this is waiting for.
+              await new Promise((r) => setTimeout(r, 1));
             }
             woke = e.gex_wake();
             if (woke === 1) break;

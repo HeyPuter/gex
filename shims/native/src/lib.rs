@@ -17,6 +17,7 @@ use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
 pub mod gl;
+pub mod virgl;
 pub mod wayland;
 
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Module, Ref, Store, Table, Val};
@@ -46,6 +47,25 @@ impl Exit {
         match self {
             Exit::Status(c) => *c,
             Exit::Signal { signal, .. } => 128 + signal,
+        }
+    }
+
+    /// The status `wait4` reports, which is not the same number.
+    ///
+    /// A shell shows `128 + signal` for a death by signal, and that is what
+    /// [`Exit::code`] gives. The kernel's own encoding is different: the
+    /// signal goes in the low seven bits, with `0x80` set if a core would
+    /// have been written, and a normal exit puts its code in bits 8 to 15.
+    /// `WIFSIGNALED` tests the low bits, so storing `128 + signal` makes a
+    /// killed child look like one that exited normally with a large code --
+    /// which is what gex reported, and why `timeout` could not tell that the
+    /// program it killed had been killed.
+    pub fn wait_status(&self) -> i32 {
+        match self {
+            Exit::Status(c) => (c & 0xff) << 8,
+            // Whether a core would have been written is not modelled, and
+            // `WIFSIGNALED` does not depend on it.
+            Exit::Signal { signal, .. } => signal & 0x7f,
         }
     }
 }
@@ -89,6 +109,9 @@ pub struct RunOptions {
     /// Run a Wayland compositor and bind it at this path in the guest, so a
     /// guest client can put a window on the screen. See `wayland`.
     pub wayland: Option<String>,
+    /// Serve a virtio-gpu renderer on this socket name, so the guest's own
+    /// Mesa can render on the host's GPU. See `virgl`.
+    pub virgl: Option<String>,
     /// What size to tell a toplevel it is.
     pub wayland_size: (i32, i32),
     /// Where to write each committed frame, as a PPM. A window would be
@@ -115,6 +138,9 @@ pub struct RunOptions {
     /// would cut it by an order of magnitude, and a tier-2 pass over a whole
     /// object can see things a demand-driven one cannot.
     pub recompile_objects: bool,
+    /// Feed the previous run's discovered entry points into this one's
+    /// translation. Off by default; see the note in `run_program_with`.
+    pub profile: bool,
     /// Translate code on demand when a branch reaches an address with no
     /// translation.
     pub jit: bool,
@@ -136,11 +162,13 @@ impl Default for RunOptions {
             identity: None,
             sample: false,
             wayland: None,
+            virgl: None,
             wayland_size: (640, 480),
             wayland_out: None,
             wayland_gpu: false,
             gl: false,
             recompile_objects: false,
+            profile: false,
             jit: false,
             cwd: None,
             // On by default: it is the difference between half a minute and
@@ -171,6 +199,7 @@ struct HostState {
     sampler: Option<Arc<Sampler>>,
     /// The compositor, when the guest was given one.
     wayland: Option<wayland::Wayland>,
+    virgl: Option<virgl::VirglDevice>,
     /// Everything needed to translate and install code at run time.
     jit: Option<Jit>,
     /// Everything a new guest thread needs to build a store of its own.
@@ -181,6 +210,8 @@ struct HostState {
     pending_fork: Option<ForkRequest>,
     /// Set by `execve`: a program to replace this process with.
     pending_exec: Option<ExecRequest>,
+    /// Raised past wasmtime's defaults. See [`store_limits`].
+    store_limits: wasmtime::StoreLimits,
 }
 
 /// What a process-creating `clone` asked for.
@@ -231,6 +262,7 @@ struct SpawnContext {
     /// Inherited the same way, so a client that a shell forked reaches the
     /// same compositor its parent could.
     wayland: Option<wayland::Wayland>,
+    virgl: Option<virgl::VirglDevice>,
     jit_shared: Option<Arc<Mutex<JitShared>>>,
     limits: gex_lift::BlockLimits,
 }
@@ -386,11 +418,28 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
 /// What it replaces is the address space and the program in it, which from
 /// here is the same work as starting fresh -- so this is the same function,
 /// told not to build a new kernel.
+/// What survives an `execve`.
+///
+/// The kernel and the process table, obviously. Less obviously the host-side
+/// devices: the compositor and the virtio-gpu renderer each bind a name in
+/// the guest's socket namespace, and `execve` re-enters the function that
+/// created them. Building a second one rebinds the name, so a client that
+/// connects afterwards is accepted by the new device while the process that
+/// would service it holds the old -- which is a guest blocked forever on a
+/// reply nobody is going to write. A shell's fork-then-exec hits this every
+/// time; `glxinfo` under Xvfb was the case that found it.
+struct Inherited {
+    kernel: Kernel,
+    proc_state: Arc<Mutex<ProcState>>,
+    wayland: Option<wayland::Wayland>,
+    virgl: Option<virgl::VirglDevice>,
+}
+
 fn run_program_with(
     program: &Program,
     opts: &RunOptions,
     xlate: &Options,
-    inherited: Option<(Kernel, Arc<Mutex<ProcState>>)>,
+    inherited: Option<Inherited>,
 ) -> Result<(Exit, Stats)> {
     let image = &program.exe;
 
@@ -416,7 +465,31 @@ fn run_program_with(
     let profile_dir = use_cache.then(gex_cache::profile_dir).flatten();
     let image_key = cache_key(image, &Options::default(), &build);
     let mut xlate = xlate.clone();
-    if let Some(dir) = &profile_dir {
+    // Off unless asked for, because it was measured and did not pay.
+    //
+    // The profile records where execution actually went, so the next
+    // translation can include entry points static discovery cannot reach.
+    // The catch is that it changes the translation and therefore the cache
+    // key, so the second run of every program recompiles from scratch --
+    // for, on Debian bash, 230 extra blocks out of 51,000.
+    //
+    // Measured four consecutive runs, wall clock, with compilation parallel:
+    //
+    //     bash            with 9s 6s 0s 1s     without 8s 1s 1s 2s
+    //     busybox md5sum  with 6s 5s 0s 0s     without 5s 1s 0s 0s
+    //
+    // Both reach the same steady state. The profile costs five or six
+    // seconds on the second run and buys nothing measurable after it. The
+    // coverage is real -- fewer dispatch misses -- it just does not pay for
+    // its own recompilation on programs of this size, and those are the
+    // programs people run.
+    //
+    // Still written on every run, so turning it on costs nothing but the
+    // recompile it asks for. Kept rather than deleted because a long-running
+    // program with many cold indirect branches is the case that could still
+    // want it, and that case has not been measured.
+    let use_profile = opts.profile;
+    if let Some(dir) = profile_dir.as_ref().filter(|_| use_profile) {
         let learned = gex_cache::read_profile(dir, &image_key);
         if !learned.is_empty() && opts.verbose {
             eprintln!("[gex] profile: {} learned entry points", learned.len());
@@ -549,8 +622,18 @@ fn run_program_with(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| opts.args.first().cloned().unwrap_or_default());
     let fresh = inherited.is_none();
+    // Taken before the kernel is moved out, because the setup below uses them
+    // to decide whether to build a device or keep the one already bound.
+    let (kept_wayland, kept_virgl) = match &inherited {
+        Some(i) => (i.wayland.clone(), i.virgl.clone()),
+        None => (None, None),
+    };
     let (kernel, proc_state) = match inherited {
-        Some((mut k, ps)) => {
+        Some(Inherited {
+            kernel: mut k,
+            proc_state: ps,
+            ..
+        }) => {
             // The address space is new, so the map of it starts empty. Every
             // other part of the kernel is what exec is defined to keep.
             k.mem = gex_kernel::mem::MemoryMap::new(image.brk);
@@ -597,7 +680,7 @@ fn run_program_with(
     // is shared across the process tree, so a client the guest forks later
     // finds it. Bound before anything runs, because a client that connects
     // before the name exists gets ECONNREFUSED and gives up.
-    let compositor = opts.wayland.as_ref().map(|path| {
+    let compositor = kept_wayland.or_else(|| opts.wayland.as_ref().map(|path| {
         let w = wayland::Wayland::new(opts.wayland_size.0, opts.wayland_size.1);
         if let Some(out) = &opts.wayland_out {
             w.write_frames_to(out);
@@ -618,7 +701,22 @@ fn run_program_with(
             .socket_names
             .bind_host(path, Arc::new(w.clone()) as Arc<dyn gex_kernel::unix::HostListener>);
         w
-    });
+    }));
+    // The same shape, and bound just as early: Mesa connects while it is
+    // still working out which driver it has, long before the first draw.
+    let renderer = kept_virgl.or_else(|| opts.virgl.as_ref().map(|path| {
+        if !virgl::VirglDevice::available() {
+            eprintln!(
+                "gex: this build has no libvirglrenderer, so {path} will accept \
+                 connections and answer nothing"
+            );
+        }
+        let v = virgl::VirglDevice::new(opts.verbose);
+        kernel
+            .socket_names
+            .bind_host(path, Arc::new(v.clone()) as Arc<dyn gex_kernel::unix::HostListener>);
+        v
+    }));
     let tid = kernel.pid;
 
     let mut store = Store::new(
@@ -632,13 +730,18 @@ fn run_program_with(
             resume_at: None,
             sampler: sampler.clone(),
             wayland: compositor.clone(),
+        virgl: renderer.clone(),
             jit: None,
             spawn: None,
             pending_spawn: None,
             pending_fork: None,
             pending_exec: None,
+            store_limits: store_limits(),
         },
     );
+    // Without this the store keeps wasmtime's default of ten thousand
+    // instances, and gex spends one per runtime translation.
+    store.limiter(|s| &mut s.store_limits);
 
     let mut linker = Linker::new(&engine);
     register_imports(&mut linker)?;
@@ -739,6 +842,7 @@ fn run_program_with(
         jit_cache: jit_cache.clone(),
         sampler: sampler.clone(),
         wayland: compositor.clone(),
+        virgl: renderer.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         engine: engine.clone(),
@@ -786,7 +890,15 @@ fn run_program_with(
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);
         let kernel = take_kernel(&spawn);
-        return exec_program(req, opts, xlate, kernel, Arc::clone(&spawn.proc_state));
+        return exec_program(
+            req,
+            opts,
+            xlate,
+            kernel,
+            Arc::clone(&spawn.proc_state),
+            spawn.wayland.clone(),
+            spawn.virgl.clone(),
+        );
     }
     let Stopped::Exited(exit) = stopped else {
         unreachable!()
@@ -857,6 +969,29 @@ fn stop_other_threads(spawn: &SpawnContext, verbose: bool) {
 }
 
 /// Perform a syscall's blocking half with the kernel unlocked.
+/// What one store may hold.
+///
+/// wasmtime defaults to ten thousand instances per store, which is a sensible
+/// number for a program that instantiates a few modules and a fatal one here:
+/// gex adds an instance per runtime translation, so the ceiling is a bound on
+/// how much guest code a process may execute. `cc1` compiling SQLite's
+/// amalgamation reached it and died -- and died as a segmentation fault at a
+/// guest address, because a translation that cannot be instantiated is
+/// reported to the guest as a fault. A 9 MB translation unit looked like a
+/// miscompile; a 900 KB one worked, which made it look like one that depended
+/// on size. It was a resource limit all along.
+///
+/// The numbers are deliberately far above anything real rather than merely
+/// above what SQLite needed. Tables and memories are raised with instances
+/// because every instance may bring one.
+fn store_limits() -> wasmtime::StoreLimits {
+    wasmtime::StoreLimitsBuilder::new()
+        .instances(1 << 20)
+        .tables(1 << 20)
+        .memories(1 << 20)
+        .build()
+}
+
 /// Run a blocking operation with the kernel unlocked.
 ///
 /// `service` is called on every turn of every wait loop. It is how anything
@@ -866,12 +1001,31 @@ fn stop_other_threads(spawn: &SpawnContext, verbose: bool) {
 /// the guest makes a syscall, which it will not do again until the reply
 /// arrives. Xwayland found that, and found it intermittently, because a guest
 /// that happens to poll for other reasons breaks the cycle by accident.
+/// Run a syscall that had to wait, outside the kernel lock.
+///
+/// `interrupted` asks whether a signal has arrived that the guest can see. A
+/// blocking syscall has to give up when one has, with `EINTR`, or the handler
+/// only runs once the wait finishes on its own -- which is not a signal
+/// arriving late, it is the signal not working. `timeout 3 sleep 30` came
+/// back after thirty seconds reporting success; `alarm` could not bound
+/// anything; nothing could interrupt a read.
 fn perform_block(
     op: BlockOp,
     data: &mut [u8],
     service: &dyn Fn(&mut [u8]),
+    interrupted: &dyn Fn() -> bool,
 ) -> Result<u64, gex_kernel::errno::Errno> {
     use gex_kernel::errno::Errno;
+    /// One turn of a wait loop: let the host do its work, then give up if a
+    /// signal has arrived.
+    macro_rules! turn {
+        () => {
+            if interrupted() {
+                return Err(Errno::EINTR);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+    }
     match op {
         BlockOp::FutexWait {
             table,
@@ -887,7 +1041,19 @@ fn perform_block(
                 .map(|_| 0)
         }
         BlockOp::Sleep(d) => {
-            std::thread::sleep(d);
+            // In slices, so a signal ends it. A flat `sleep(d)` is why
+            // `nanosleep` ran its full five seconds against a one-second
+            // alarm while QEMU returned `EINTR` after one.
+            let start = std::time::Instant::now();
+            while start.elapsed() < d {
+                if interrupted() {
+                    return Err(Errno::EINTR);
+                }
+                // Saturating: the deadline can pass between the test above
+                // and here, and `Duration` subtraction panics on underflow.
+                let left = d.saturating_sub(start.elapsed());
+                std::thread::sleep(left.min(std::time::Duration::from_millis(1)));
+            }
             Ok(0)
         }
         // Natively this is nearly unreachable: the host's own stdin blocks, so
@@ -899,7 +1065,7 @@ fn perform_block(
         BlockOp::Connect { socket } => loop {
             match socket.status() {
                 gex_kernel::net::Status::Connecting => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    turn!();
                 }
                 gex_kernel::net::Status::Open => return Ok(0),
                 gex_kernel::net::Status::Refused => return Err(Errno::ECONNREFUSED),
@@ -922,7 +1088,7 @@ fn perform_block(
                     let mut mem = GuestMem::new(data);
                     return gex_kernel::syscalls::poll_finish(&fds, &report, &mut mem);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                turn!();
             }
         }
         BlockOp::WriteStream { handle, buf, len } => {
@@ -930,6 +1096,11 @@ fn perform_block(
             let mut done = 0usize;
             while done < data.len() {
                 if !handle.poll_writable() {
+                    // A partial write already delivered is the caller's
+                    // answer; only an untouched write reports the signal.
+                    if interrupted() {
+                        return if done > 0 { Ok(done as u64) } else { Err(Errno::EINTR) };
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
@@ -954,9 +1125,17 @@ fn perform_block(
                     mem.write(buf, &tmp[..n as usize])?;
                     return Ok(n);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                turn!();
             }
         }
+        BlockOp::SigSuspend { .. } => loop {
+            // Nothing to poll but the signal state, which `interrupted` is.
+            service(data);
+            if interrupted() {
+                return Err(Errno::EINTR);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        },
         BlockOp::AcceptWait { socket } => {
             // Only the wait: the descriptor is made by the kernel afterwards,
             // which is the one place that has a descriptor table.
@@ -965,7 +1144,7 @@ fn perform_block(
                 if socket.has_pending() {
                     return Ok(0);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                turn!();
             }
         }
         BlockOp::WaitChild {
@@ -992,10 +1171,10 @@ fn perform_block(
                         // grows a record per restart.
                         procs.reap(c.pid);
                         if wstatus != 0 {
-                            // The wait status Linux reports for a normal
-                            // exit: the code in bits 8..16.
+                            // Already in the kernel's encoding: see
+                            // `Exit::wait_status`.
                             let mut mem = GuestMem::new(data);
-                            mem.write_u32(wstatus, ((code as u32) & 0xff) << 8)?;
+                            mem.write_u32(wstatus, code as u32)?;
                         }
                         return Ok(c.pid as u64);
                     }
@@ -1008,6 +1187,12 @@ fn perform_block(
                 // caller back round to a syscall -- where the halt check
                 // stops it.
                 if procs.halt_code().is_some() {
+                    return Err(Errno::EINTR);
+                }
+                // And an ordinary signal, which is what a shell's `timeout`
+                // relies on: it parks in `wait4` and expects `SIGALRM` to
+                // bring it back so it can kill the child.
+                if interrupted() {
                     return Err(Errno::EINTR);
                 }
                 // Any child's condvar will do to park on; they are woken
@@ -1225,6 +1410,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         // most of its time in programs it started.
         sampler: cx.sampler.clone(),
         wayland: cx.wayland.clone(),
+        virgl: cx.virgl.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         engine: cx.engine.clone(),
@@ -1257,8 +1443,10 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         .name(format!("gex-pid-{pid}"))
         .spawn(move || {
             let cleanup = Arc::clone(&child_cx);
-            let code = match run_guest_process(child_cx, thread, entry) {
-                Ok(exit) => exit.code(),
+            // Two numbers, deliberately: the process table keeps the one a
+            // shell would print, and `wait4` gets the kernel's encoding.
+            let (code, wstatus) = match run_guest_process(child_cx, thread, entry) {
+                Ok(exit) => (exit.code(), exit.wait_status()),
                 Err(e) => {
                     eprintln!("gexc: child {pid} failed: {e:#}");
                     // A process that dies takes its threads and its
@@ -1276,14 +1464,17 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
                         .unwrap_or_else(|e| e.into_inner())
                         .fds
                         .close_all();
-                    127
+                    (127, 127 << 8)
                 }
             };
+            if std::env::var_os("GEX_TRACE_EXIT").is_some() {
+                eprintln!("[gex:{pid}] process finished: code {code}, wait status {wstatus:#x}");
+            }
             // Through the table, so this process's own children -- if any are
             // still running -- become init's rather than being lost.
             procs.exit(pid, code);
             let (st, done) = status;
-            *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+            *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
             done.notify_all();
         })
         .context("spawning a child process")?;
@@ -1303,13 +1494,18 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             resume_at: None,
             sampler: cx.sampler.clone(),
             wayland: cx.wayland.clone(),
+            virgl: cx.virgl.clone(),
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
             pending_fork: None,
             pending_exec: None,
+            store_limits: store_limits(),
         },
     );
+    // Without this the store keeps wasmtime's default of ten thousand
+    // instances, and gex spends one per runtime translation.
+    store.limiter(|s| &mut s.store_limits);
     let mut linker = cx.linker.clone();
     linker.allow_shadowing(true);
     linker.define(
@@ -1353,8 +1549,16 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
                 env: req.envp.clone(),
                 ..cx.opts.clone()
             };
-            exec_program(req, &opts, &cx.xlate, kernel, Arc::clone(&cx.proc_state))
-                .map(|(exit, _)| exit)
+            exec_program(
+                req,
+                &opts,
+                &cx.xlate,
+                kernel,
+                Arc::clone(&cx.proc_state),
+                cx.wayland.clone(),
+                cx.virgl.clone(),
+            )
+            .map(|(exit, _)| exit)
         }
     }
 }
@@ -1367,12 +1571,15 @@ fn take_kernel(cx: &SpawnContext) -> Kernel {
 }
 
 /// Load and run the program `execve` asked for, keeping the process.
+#[allow(clippy::too_many_arguments)]
 fn exec_program(
     req: ExecRequest,
     opts: &RunOptions,
     xlate: &Options,
     mut kernel: Kernel,
     proc_state: Arc<Mutex<ProcState>>,
+    wayland: Option<wayland::Wayland>,
+    virgl: Option<virgl::VirglDevice>,
 ) -> Result<(Exit, Stats)> {
     // The file comes from the guest's namespace, not the host's, so a sysroot
     // is honoured and `/bin/sh` means the guest's.
@@ -1389,12 +1596,24 @@ fn exec_program(
     // Descriptors marked close-on-exec go now; the rest survive, which is how
     // a shell hands a pipe to the command it starts.
     kernel.close_on_exec();
+    // And the handlers, which are addresses in the image being replaced.
+    kernel.signals.exec();
     let opts = RunOptions {
         args: req.argv,
         env: req.envp,
         ..opts.clone()
     };
-    run_program_with(&program, &opts, xlate, Some((kernel, proc_state)))
+    run_program_with(
+        &program,
+        &opts,
+        xlate,
+        Some(Inherited {
+            kernel,
+            proc_state,
+            wayland,
+            virgl,
+        }),
+    )
 }
 
 /// A guest thread: its own store, its own instances, the same memory.
@@ -1410,13 +1629,18 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             resume_at: None,
             sampler: cx.sampler.clone(),
             wayland: cx.wayland.clone(),
+            virgl: cx.virgl.clone(),
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
             pending_fork: None,
             pending_exec: None,
+            store_limits: store_limits(),
         },
     );
+    // Without this the store keeps wasmtime's default of ten thousand
+    // instances, and gex spends one per runtime translation.
+    store.limiter(|s| &mut s.store_limits);
     let mut linker = cx.linker.clone();
     linker.allow_shadowing(true);
     linker.define(
@@ -2099,6 +2323,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // then finished under the lock again.
             let outcome = if let SyscallOutcome::Blocking(op) = outcome {
                 let compositor = caller.data().wayland.clone();
+                let renderer = caller.data().virgl.clone();
                 let kernel_for_service = Arc::clone(&caller.data().kernel);
                 let service = move |bytes: &mut [u8]| {
                     if let Some(w) = &compositor {
@@ -2108,8 +2333,23 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                         let gm = GuestMem::new(bytes);
                         w.pump(&k, &gm);
                     }
+                    // The renderer needs neither the kernel nor guest memory:
+                    // at this protocol version every payload is in the stream.
+                    if let Some(v) = &renderer {
+                        v.pump();
+                    }
                 };
-                let r = perform_block(op, memory.bytes(), &service);
+                // Timers are checked here rather than only at syscall entry:
+                // a process asleep in a wait loop issues no syscalls, so
+                // nothing else would ever arm `SIGALRM`.
+                let kernel_for_signals = Arc::clone(&caller.data().kernel);
+                let interrupted = move || {
+                    kernel_for_signals
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .signal_pending()
+                };
+                let r = perform_block(op, memory.bytes(), &service, &interrupted);
                 let mut gm = GuestMem::new(memory.bytes());
                 caller
                     .data_mut()
@@ -2126,6 +2366,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let k = kernel.lock().unwrap_or_else(|e| e.into_inner());
                 let gm = GuestMem::new(memory.bytes());
                 w.pump(&k, &gm);
+            }
+            if let Some(v) = caller.data().virgl.clone() {
+                v.pump();
             }
             // A shared library has just been mapped. Recompile the whole
             // object now rather than letting the runtime translator find it
@@ -2880,6 +3123,21 @@ const MAX_OBJECT_BYTES: u64 = 64 << 20;
 ///
 /// It used to be 200,000, which libc exceeded -- and with no runtime
 /// translator behind it, a capped object is an object the guest dies in.
+/// This path always has one: `recompile_object` returns early without it.
+///
+/// It was 900,000 for a while, and that number came from wasm rather than
+/// from taste: a module may hold a million functions, gex emits one per block
+/// plus one per region, and libz3 -- 22 MB of guest text, 993,645 blocks and
+/// 18,583 regions -- came to about 1,012,000. It missed by one percent, and
+/// the whole 37-second translation was thrown away for it. Capping kept most
+/// of the work but left the tail to the runtime translator, which is exactly
+/// what static recompilation is for.
+///
+/// Objects are now split across as many modules as they need
+/// ([`gex_xlate::MAX_FUNCS_PER_MODULE`]), so the per-module ceiling no longer
+/// bounds the object. What is left is the runaway guard the constant was
+/// originally for: a range that decodes as code but is not, or a discovery
+/// bug, should stop rather than translate forever.
 const MAX_OBJECT_BLOCKS: usize = 4_000_000;
 
 /// Statically recompile a shared library the guest has just mapped.
@@ -2945,7 +3203,7 @@ fn recompile_object(
     // small fraction of that, and the difference is all interior addresses
     // that a block starting at the function entry already covers.
     let started = std::time::Instant::now();
-    let (translated, stats) = {
+    let (modules, stats) = {
         let data = memory.bytes();
         gex_xlate::translate_object(
             data,
@@ -2960,7 +3218,7 @@ fn recompile_object(
             true,
         )
     };
-    if translated.exported_blocks.is_empty() {
+    if modules.iter().all(|m| m.exported_blocks.is_empty()) {
         return Ok(());
     }
     let engine = caller.as_context().data().jit.as_ref().unwrap().engine.clone();
@@ -2970,28 +3228,49 @@ fn recompile_object(
         .jit
         .as_ref()
         .and_then(|j| j.cache.clone());
-    let module = match cache {
-        Some((dir, build)) => {
-            let key = gex_cache::key(&build, [translated.wasm.as_slice()]);
-            let wasm = translated.wasm.clone();
-            gex_cache::load_or_compile(&engine, &dir, &key, move || Ok((wasm, Vec::new())))
-                .context("compiling a statically recompiled object")?
-                .module
+    // An object too large for one wasm module comes back as several, in
+    // address order. They are published in that order because each one's page
+    // assignments are the next one's starting point.
+    let n_modules = modules.len();
+    let mut wasm_bytes = 0usize;
+    let lifted = started.elapsed();
+    for translated in &modules {
+        if translated.exported_blocks.is_empty() {
+            continue;
         }
-        None => Module::new(&engine, &translated.wasm)
-            .context("validating a statically recompiled object")?,
-    };
-    let unit = publish_unit(&shared, &translated, module, stats.blocks)?;
-    install_unit(caller.as_context_mut(), &unit)?;
-    caller.as_context_mut().data_mut().jit.as_mut().unwrap().replayed += 1;
+        wasm_bytes += translated.wasm.len();
+        let module = match &cache {
+            Some((dir, build)) => {
+                let key = gex_cache::key(build, [translated.wasm.as_slice()]);
+                let wasm = translated.wasm.clone();
+                gex_cache::load_or_compile(&engine, dir, &key, move || Ok((wasm, Vec::new())))
+                    .context("compiling a statically recompiled object")?
+                    .module
+            }
+            None => Module::new(&engine, &translated.wasm)
+                .context("validating a statically recompiled object")?,
+        };
+        let unit = publish_unit(&shared, translated, module, translated.n_blocks)?;
+        install_unit(caller.as_context_mut(), &unit)?;
+        caller.as_context_mut().data_mut().jit.as_mut().unwrap().replayed += 1;
+    }
     if std::env::var("GEX_VERBOSE_OBJECTS").is_ok() {
         eprintln!(
-            "[gex] recompiled {} [{:#x}..{:#x}): {} blocks in {:.2}s",
+            "[gex] recompiled {} [{:#x}..{:#x}): {} blocks in {:.2}s \
+             ({:.2}s to wasm, {:.2}s in cranelift), {:.1} MB of wasm{}",
             map.path,
             map.start,
             map.end,
             stats.blocks,
-            started.elapsed().as_secs_f64()
+            started.elapsed().as_secs_f64(),
+            lifted.as_secs_f64(),
+            (started.elapsed() - lifted).as_secs_f64(),
+            wasm_bytes as f64 / (1 << 20) as f64,
+            if n_modules > 1 {
+                format!(" across {n_modules} modules")
+            } else {
+                String::new()
+            }
         );
     }
     Ok(())

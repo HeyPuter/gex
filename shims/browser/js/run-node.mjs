@@ -41,9 +41,28 @@ const rest = [];
       if (eq <= 0) { console.error('--dir wants <guest>=<host>'); process.exit(2); }
       const [guestRoot, hostRoot] = [spec.slice(0, eq), spec.slice(eq + 1)];
       const walk = (guest, host) => {
-        for (const name of readdirSync(host)) {
+        // Unreadable directories are ordinary in a root filesystem --
+        // /usr/lib/ssl/private is mode 0700 and owned by root -- and one of
+        // them must not take the whole run down.
+        let names;
+        try {
+          names = readdirSync(host);
+        } catch {
+          return;
+        }
+        for (const name of names) {
           const h = `${host}/${name}`, g = `${guest}/${name}`;
-          if (statSync(h).isDirectory()) walk(g, h);
+          // A real root filesystem has dangling symlinks in it -- Debian's
+          // has /usr/bin/ld.so pointing at a package that is not installed --
+          // and `stat` follows links, so it throws on them. Skipping is what
+          // a guest sees anyway: the link resolves to nothing there too.
+          let st;
+          try {
+            st = statSync(h);
+          } catch {
+            continue;
+          }
+          if (st.isDirectory()) walk(g, h);
           else files[g] = readFileSync(h);
         }
       };

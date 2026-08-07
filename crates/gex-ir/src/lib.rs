@@ -588,6 +588,15 @@ pub enum VCvtOp {
 pub enum VUnOp {
     /// Per-byte population count.
     PopcntBytes,
+    /// Add adjacent bytes into 16-bit lanes, and adjacent 16-bit lanes into
+    /// 32-bit ones, signed or unsigned.
+    ///
+    /// These exist twice over: to sum a population count back up to the lane
+    /// width it came from, and because `saddlp`/`uaddlp` are exactly them.
+    ExtAddPairwiseU8,
+    ExtAddPairwiseU16,
+    ExtAddPairwiseS8,
+    ExtAddPairwiseS16,
 }
 
 /// Bitwise vector operations.

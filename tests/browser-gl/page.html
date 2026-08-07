@@ -1,0 +1,130 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>gex: a guest's OpenGL on WebGL</title>
+<!--
+  The smallest page that runs a guest and gives it a canvas.
+
+  Nothing here is about presentation; it exists so a headless browser can
+  report what happened. The demo page in web/ is the one meant for people.
+
+  What it checks is the whole path: an aarch64 binary that calls eglInitialize
+  and glDrawArrays, translated to wasm, whose GL library marshals into its own
+  memory, handed to this page one batch at a time, executed on WebGL 2, drawn
+  on the canvas below.
+-->
+<style>
+  body { background: #14161c; color: #c8ccd4; font: 13px ui-monospace, monospace; }
+  canvas { border: 1px solid #333; image-rendering: pixelated; }
+  #log { white-space: pre-wrap; }
+</style>
+<canvas id="screen" width="320" height="240"></canvas>
+<pre id="log"></pre>
+
+<script type="module">
+import { Gex, Env } from './gex.mjs';
+import { GlDevice } from './src/gl.js';
+
+// The DOM is scraped by the runner, so everything it needs goes in one
+// element joined by bars -- newlines do not survive --dump-dom intact.
+const lines = [];
+const say = (s) => {
+  lines.push(s);
+  document.getElementById('log').textContent = lines.join('|');
+};
+
+/// Tell the runner it is over. A page cannot be scraped reliably while it is
+/// still working -- the guest takes as long as it takes -- so it reports
+/// rather than being watched.
+const finish = () => {
+  // A plain GET, not `sendBeacon`: that one POSTs, and a report that silently
+  // goes to a method the server does not answer looks exactly like a page
+  // that never finished.
+  const body = encodeURIComponent(lines.join('|'));
+  return fetch(`/result?log=${body}`, { keepalive: true }).catch(() => {});
+};
+
+const prog = new URLSearchParams(location.search).get('prog') || 'gles-triangle';
+
+/** Collects what the guest writes, and answers reads with nothing. */
+class Collect extends Env {
+  constructor() { super(); this.text = ''; this.partial = ''; }
+  write(fd, bytes) {
+    const s = new TextDecoder().decode(bytes);
+    this.text += s;
+    // Reported as it arrives rather than at the end: if the guest stops
+    // half way, what it managed to say is the only clue there is.
+    this.partial += s;
+    let nl;
+    while ((nl = this.partial.indexOf('\n')) >= 0) {
+      const line = this.partial.slice(0, nl).trim();
+      this.partial = this.partial.slice(nl + 1);
+      if (line) say(line);
+    }
+  }
+  now() { return BigInt(Date.now()) * 1000000n; }
+}
+
+async function bytes(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: ${r.status}`);
+  return new Uint8Array(await r.arrayBuffer());
+}
+
+try {
+  const canvas = document.getElementById('screen');
+  const gl = new GlDevice(canvas);
+  if (!gl.ok) throw new Error('no WebGL 2 in this browser');
+  say(`webgl ${gl.describe()}`);
+
+  const env = new Collect();
+  const gex = new Gex(env);
+  // Before load: the device node is made while the guest's filesystem is.
+  gex.useGl(gl);
+
+  // The guest's own filesystem: its loader and the GL driver it links
+  // against. musl searches /usr/lib by default, so nothing has to tell it
+  // where these are.
+  say('fetching');
+  const files = {
+    '/lib/ld-musl-aarch64.so.1': await bytes('/fs/ld-musl-aarch64.so.1'),
+    '/usr/lib/libGLESv2.so.2': await bytes('/fs/libGLESv2.so.2'),
+    '/usr/lib/libEGL.so.1': await bytes('/fs/libEGL.so.1'),
+  };
+  const args = [`/${prog}`, ...(prog === 'gles-gears' ? ['12'] : [])];
+
+  say('loading');
+  const entry = await gex.load(
+    await bytes('/gex/gex_browser.wasm'),
+    await bytes(`/fs/${prog}.wasm`),
+    await bytes(`/fs/${prog}`),
+    files,
+    args,
+    {},
+  );
+  say(`entry ${entry}`);
+  const status = await gex.run(entry);
+  say(`exit ${status}`);
+
+  // The checks, which differ per program because what they draw does.
+  let ok = false;
+  if (prog === 'gles-triangle') {
+    ok = /inside\s+0 255 0/.test(env.text) && /outside\s+0 0 255/.test(env.text);
+  } else {
+    const m = env.text.match(/covered (\d+)%/);
+    const covered = m ? Number(m[1]) : -1;
+    ok = /gl error 0/.test(env.text) && covered >= 5 && covered <= 60;
+  }
+  // And that something actually landed on the canvas, which is the part the
+  // guest's own output cannot tell us.
+  const px = new Uint8Array(4);
+  gl.gl.readPixels(canvas.width >> 1, canvas.height >> 1, 1, 1,
+                   gl.gl.RGBA, gl.gl.UNSIGNED_BYTE, px);
+  say(`canvas centre ${px[0]} ${px[1]} ${px[2]}`);
+  const drawn = px[0] + px[1] + px[2] > 0;
+  say(`RESULT ${ok && drawn ? 'ok' : 'failed'}`);
+} catch (e) {
+  say(`error ${e && e.message ? e.message : e}`);
+  say('RESULT failed');
+}
+await finish();
+</script>

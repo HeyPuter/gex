@@ -12,3 +12,9 @@ gex-ir.workspace = true
 gex-lift.workspace = true
 gex-emit.workspace = true
 gex-ld.workspace = true
+
+[features]
+# Lift blocks on every core. Off for the browser shim, which reaches this
+# code compiled to wasm where `std::thread::scope` is not available.
+default = []
+parallel = ["gex-emit/parallel"]

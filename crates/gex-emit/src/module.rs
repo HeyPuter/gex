@@ -504,10 +504,14 @@ impl ModuleBuilder {
                 blocks: &self.blocks,
                 gir: &gir,
             };
-            self.pending
-                .iter()
-                .map(|(block, f)| (*f, tier1::compile(block, &cx)))
-                .collect()
+            // The single largest serial phase there was: one wasm function
+            // body per guest block, hundreds of thousands of them for a
+            // library the size of libz3, generated one at a time while
+            // Cranelift waited behind it with the rest of the machine idle.
+            // `compile` reads nothing it does not own, so the map spreads.
+            crate::par::map(&self.pending, &|(block, f): &(Block, u32)| {
+                (*f, tier1::compile(block, &cx))
+            })
         };
         let n_blocks = compiled.len();
         for (f, body) in compiled {
@@ -589,41 +593,48 @@ impl ModuleBuilder {
                     by_page.entry(dispatch_page(addr)).or_default().push((addr, f));
                     exported_blocks.push((addr, String::new()));
                 }
+                // One segment per page, not one per contiguous run.
+                //
+                // A run per gap is the smaller encoding and it does not
+                // scale: Mesa's driver is 457,000 blocks scattered over its
+                // pages, which came to more than a hundred thousand runs --
+                // and wasmtime refuses a module with more than 100,000
+                // element segments. `--recompile-objects` failed on exactly
+                // the library that most wants static translation, fell back
+                // to translating it a block at a time at run time, and the
+                // failure was a line on stderr that nothing was watching.
+                //
+                // The gaps are filled with this module's own miss stub. An
+                // earlier comment here said that was "wrong -- the stub
+                // belongs to a module this one cannot name", and that is not
+                // so: every module, shared or not, defines its own stub. Nor
+                // does filling clobber anyone: a page covers one 4 KiB region
+                // of guest text, so every slot in it belongs to this object,
+                // and an untranslated one should ask the host to translate --
+                // which is what the stub does.
+                //
+                // Only the interior is filled. Trailing slots past the last
+                // translated block cost nothing to leave alone.
                 for (page, mut blocks) in by_page {
                     let Some(base) = self.page_table.lookup(page) else {
                         continue;
                     };
                     blocks.sort_by_key(|(a, _)| *a);
-                    // One segment per contiguous run of slots. A page is
-                    // 1024 slots and a translated page is usually sparse, so
-                    // filling the gaps with the miss stub would be both
-                    // larger and wrong -- the stub belongs to a module this
-                    // one cannot name.
-                    let mut run: Vec<u32> = Vec::new();
-                    let mut run_start = 0u64;
-                    let mut expect = u64::MAX;
-                    for (addr, f) in blocks {
-                        let idx = base as u64 + ((addr % DISPATCH_PAGE) >> 2);
-                        if idx != expect && !run.is_empty() {
-                            self.m.element(ElementSegment {
-                                table: 0,
-                                offset: run_start as u32,
-                                funcs: std::mem::take(&mut run),
-                            });
-                        }
-                        if run.is_empty() {
-                            run_start = idx;
-                        }
-                        run.push(f);
-                        expect = idx + 1;
+                    let slot = |addr: u64| base as u64 + ((addr % DISPATCH_PAGE) >> 2);
+                    let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
+                        continue;
+                    };
+                    let start = slot(first.0);
+                    let end = slot(last.0);
+                    let mut funcs = vec![self.miss_stub; (end - start + 1) as usize];
+                    for (addr, f) in &blocks {
+                        funcs[(slot(*addr) - start) as usize] = *f;
                     }
-                    if !run.is_empty() {
-                        self.m.element(ElementSegment {
-                            table: 0,
-                            offset: run_start as u32,
-                            funcs: run,
-                        });
-                    }
+                    self.m.element(ElementSegment {
+                        table: 0,
+                        offset: start as u32,
+                        funcs,
+                    });
                 }
             }
         }
