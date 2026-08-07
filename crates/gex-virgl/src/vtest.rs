@@ -110,20 +110,48 @@ pub fn record_replies(bytes: &[u8]) {
     record_to("GEX_VTEST_REPLIES", bytes);
 }
 
+/// How much to keep, from `GEX_VTEST_LIMIT`. Default 8 MB.
+///
+/// Not a nicety. The replies are almost entirely framebuffer read-back --
+/// 360,000 bytes per frame at 43 frames a second -- and an unbounded
+/// recording of a few minutes of glxgears is 1.6 GB. Both files stop at the
+/// same command, so they stay comparable.
+fn limit() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("GEX_VTEST_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8 << 20)
+    })
+}
+
 fn record_to(var: &str, bytes: &[u8]) {
     use std::collections::HashMap;
     use std::io::Write;
     use std::sync::Mutex;
-    static FILES: std::sync::OnceLock<Mutex<HashMap<String, Option<std::fs::File>>>> =
+    struct Sink {
+        file: std::fs::File,
+        written: u64,
+    }
+    static FILES: std::sync::OnceLock<Mutex<HashMap<String, Option<Sink>>>> =
         std::sync::OnceLock::new();
     let files = FILES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut files = files.lock().unwrap_or_else(|e| e.into_inner());
     let f = files.entry(var.to_string()).or_insert_with(|| {
         let path = std::env::var_os(var)?;
-        std::fs::File::create(path).ok()
+        Some(Sink {
+            file: std::fs::File::create(path).ok()?,
+            written: 0,
+        })
     });
-    if let Some(f) = f {
-        let _ = f.write_all(bytes);
+    if let Some(sink) = f {
+        // Truncated at a command boundary rather than mid-reply: a partial
+        // reply at the end of the file would read as a divergence.
+        if sink.written + bytes.len() as u64 <= limit() {
+            let _ = sink.file.write_all(bytes);
+            sink.written += bytes.len() as u64;
+        }
     }
 }
 

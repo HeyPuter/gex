@@ -58,6 +58,31 @@ if (STREAM && (await exists(STREAM))) {
   replay = true;
 }
 
+// The native renderer's answers to the same stream, from GEX_VTEST_REPLIES.
+//
+// This compares, and it is worth being clear about how far it can mean
+// anything. The replies agree exactly up to reply byte 32, and then diverge
+// on the capability set -- 5,508 bytes of it natively against 308 here,
+// because that host is desktop GL 4.3 and this one is GLES 3.0.
+//
+// That divergence is correct. What it costs is the rest of the comparison,
+// and more than the comparison. The recorded stream is what the guest's Mesa
+// emits *having been told it has GL 4.3*: every shader, format and draw after
+// the capability exchange was chosen on that basis. Replaying it into a
+// renderer with a smaller capability set asks for features that were never
+// offered, so a blank frame from here is not evidence of a defect in the
+// port -- it is what should happen.
+//
+// So this is a smoke test with a hard boundary: it proves the transport, the
+// framing and the command dispatch, and it cannot prove a picture. A picture
+// needs the guest negotiating live against the renderer that will serve it.
+const REPLIES = process.env.GEX_VTEST_REPLIES || '';
+let compare = false;
+if (replay && REPLIES && (await exists(REPLIES))) {
+  await copyFile(REPLIES, join(dir, 'replies.bin'));
+  compare = true;
+}
+
 // The result goes into the title, which --dump-dom brings back. Anything
 // printed to the console would need a debugging protocol to collect.
 await writeFile(
@@ -67,6 +92,7 @@ await writeFile(
 <pre id="out">pending</pre><pre id="png"></pre>
 <script type="module">
 const REPLAY = __REPLAY__;
+const COMPARE = __COMPARE__;
 import Module from './gexvirgl.mjs';
 const say = (s) => { document.getElementById('out').textContent = s; document.title = s; };
 // virglrenderer explains itself on stderr and says nothing through its return
@@ -88,6 +114,10 @@ try {
     // In pieces, and deliberately not on command boundaries: the guest's
     // socket delivers whatever it has, so a command arriving in two halves is
     // the normal case and the rewind that handles it needs exercising.
+    const want = COMPARE
+      ? new Uint8Array(await (await fetch('./replies.bin')).arrayBuffer())
+      : null;
+    let at = 0, diffAt = -1, diffCmd = -1;
     const CHUNK = 4093;
     let ran = 0, replies = 0, fed = 0, refused = false;
     let biggest = new Uint8Array(0);
@@ -101,6 +131,14 @@ try {
       if (n < 0) { refused = true; break; }
       ran += n;
       const got = m._gex_virgl_pending();
+      if (want && diffAt < 0 && got) {
+        const mine = m.HEAPU8.subarray(m._gex_virgl_replies(),
+                                       m._gex_virgl_replies() + got);
+        for (let i = 0; i < mine.length && at + i < want.length; i++) {
+          if (mine[i] !== want[at + i]) { diffAt = at + i; diffCmd = ran; break; }
+        }
+        at += got;
+      }
       // Keep the biggest reply. A TRANSFER_GET of the frame is far larger
       // than anything else on the wire -- 300x300 RGBA is 360,000 bytes
       // against a few dozen for a fence or a capability answer -- so the
@@ -144,8 +182,16 @@ try {
         for (let i = 0; i < px.length; i += 4) if (px[i] || px[i+1] || px[i+2]) nonzero++;
         drawn += ', ' + nonzero + '/' + (W * H) + ' pixels non-black in the tail';
       }
+      let verdict = '';
+      if (want) {
+        verdict = diffAt < 0
+          ? ', replies match the native renderer for ' + Math.min(at, want.length) + ' bytes'
+          : ', FIRST DIVERGENCE at reply byte ' + diffAt + ' after ' + diffCmd
+            + ' commands (mine ' + Math.min(at, want.length) + 'B vs native '
+            + want.length + 'B)';
+      }
       say('OK replayed ' + stream.length + ' bytes, ' + ran + ' commands, '
-          + replies + ' reply bytes, ' + drawn
+          + replies + ' reply bytes, ' + drawn + verdict
           + ' :: ' + m.UTF8ToString(m._gex_virgl_gl_state())
           + ' :: ' + tail);
     }
@@ -153,7 +199,7 @@ try {
 } catch (e) {
   say('THREW ' + (e && e.message ? e.message : String(e)) + ' :: ' + log.join(' / '));
 }
-</script>`.replace('__REPLAY__', String(replay)),
+</script>`.replace('__REPLAY__', String(replay)).replace('__COMPARE__', String(compare)),
 );
 
 // A file:// page cannot load an ES module sibling under Chromium's rules, so
