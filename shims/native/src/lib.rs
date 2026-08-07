@@ -319,6 +319,24 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
 }
 
 /// Build, instantiate and run a guest image to completion.
+/// Check that a module is well-formed wasm, without compiling or running it.
+///
+/// Emitting a module that does not validate is never useful, and the lifter
+/// can produce one: an `smov x0, v0.h[2]` asked for a 64-bit value from a lane
+/// extract that yields a 32-bit one, and nothing noticed until wasmtime
+/// refused the module 182 MB in. Validation is a fraction of the cost of
+/// translating, so `gexc build` does it every time, and an exhaustive
+/// translation of a large real binary is the best lifter test there is --
+/// it reaches encodings no program gex has ever run would execute.
+pub fn validate_module(wasm: &[u8]) -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_tail_call(true);
+    config.wasm_threads(true);
+    config.wasm_bulk_memory(true);
+    let engine = Engine::new(&config).context("creating the wasm engine")?;
+    Module::validate(&engine, wasm)
+}
+
 pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
     run_program(
         &Program {

@@ -59,7 +59,10 @@ usage:
                                    address, since a built module has no
                                    runtime translator behind it;
                                    --no-shared-memory: declare a plain memory,
-                                   for a single-threaded host)
+                                   for a single-threaded host;
+                                   --no-validate: write the module even if it
+                                   is not valid wasm, for inspecting one that
+                                   is not)
   gexc seed   -o <out.wasm>        write a module that translates nothing, for
                                    a host that will translate at runtime and
                                    does not know the program in advance
@@ -250,6 +253,8 @@ fn cmd_seed(args: &[String]) -> Result<()> {
     let out = out.unwrap_or_else(|| "seed.wasm".to_string());
     let module = gex_xlate::seed_module(shared_memory);
     std::fs::write(&out, &module.wasm).with_context(|| format!("writing {out}"))?;
+    gex_native::validate_module(&module.wasm)
+        .with_context(|| format!("{out} is not valid wasm"))?;
     eprintln!("{out}: {} bytes, translates nothing", module.wasm.len());
     Ok(())
 }
@@ -259,6 +264,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut out = None;
     let mut exhaustive = false;
     let mut shared_memory = true;
+    let mut no_validate = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -273,6 +279,8 @@ fn cmd_build(args: &[String]) -> Result<()> {
             // without `+atomics`, which is every stable-toolchain build --
             // needs the guest module to declare a plain one.
             "--no-shared-memory" => shared_memory = false,
+            // Only for looking at a module that is known not to validate.
+            "--no-validate" => no_validate = true,
             other => path = Some(other.to_string()),
         }
         i += 1;
@@ -291,6 +299,10 @@ fn cmd_build(args: &[String]) -> Result<()> {
         },
     );
     std::fs::write(&out, &module.wasm).with_context(|| format!("writing {out}"))?;
+    if !no_validate {
+        gex_native::validate_module(&module.wasm)
+            .with_context(|| format!("{out} is not valid wasm"))?;
+    }
     eprintln!(
         "{out}: {} blocks, {} guest instructions, {} KiB wasm ({:.1}x guest \
          text, {:.0}% of it register traffic across block boundaries)",

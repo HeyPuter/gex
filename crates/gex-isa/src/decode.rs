@@ -1985,6 +1985,25 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
         (0b10100, _) => VOp2::UqXtn,
         _ => return Inst::Unknown { raw },
     };
+    // The reverse family reverses elements *inside* a group of a fixed width,
+    // so an element at least as wide as its group is not an instruction. The
+    // architecture reserves those encodings; `rev16 v0.4s` does not exist.
+    //
+    // Worth rejecting properly rather than letting the lifter cope, because
+    // the lifter did not: it computes `group / lane_bytes - 1` and that
+    // underflows, giving a byte permutation with lane indices of 248. wasm
+    // rejects the whole module for one of those, so a reserved encoding in the
+    // middle of a library nothing executes made the library unloadable.
+    // Exhaustive translation of libhogweed found it; nothing runs it.
+    let group = match op {
+        VOp2::Rev16 => 2,
+        VOp2::Rev32 => 4,
+        VOp2::Rev64 => 8,
+        _ => u32::MAX,
+    };
+    if lane_bytes >= group {
+        return Inst::Undefined { raw };
+    }
     Inst::VTwoMisc {
         op,
         arr: VArr {

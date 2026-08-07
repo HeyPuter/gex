@@ -1072,7 +1072,7 @@ impl<'a> Emitter<'a> {
                 lane,
                 lane_bytes,
                 signed,
-                ..
+                ty,
             } => {
                 self.push(*a);
                 let sub = match (lane_bytes, signed) {
@@ -1084,6 +1084,19 @@ impl<'a> Emitter<'a> {
                     _ => simd::I64X2_EXTRACT_LANE,
                 };
                 self.f.simd_lane(sub, *lane as u8);
+                // Every lane extract narrower than 64 bits produces an i32,
+                // whatever the node says its type is. `smov x0, v0.h[2]` wants
+                // the halfword sign-extended into a 64-bit register, and asked
+                // for `I64`; without this the module fails validation, which
+                // is how it was found -- in an exhaustive translation of
+                // CPython, 182 MB into the wasm.
+                if *ty == Ty::I64 && *lane_bytes < 8 {
+                    self.f.byte(if *signed {
+                        code::I64_EXTEND_I32_S
+                    } else {
+                        code::I64_EXTEND_I32_U
+                    });
+                }
             }
             Expr::VReplace {
                 a,

@@ -2743,6 +2743,14 @@ impl<'a> Lifter<'a> {
                     VOp2::Rev32 => 4,
                     _ => 8,
                 };
+                // The decoder rejects an element at least as wide as its
+                // group, which is what would make the arithmetic below
+                // underflow. Checked again here because a permutation with a
+                // wrapped index does not produce a wrong answer, it produces a
+                // module that will not load.
+                if arr.lane_bytes >= group {
+                    return Flow::End(Term::Illegal { raw: self.raw, pc });
+                }
                 let mut lanes = [0u8; 16];
                 for (i, slot) in lanes.iter_mut().enumerate() {
                     let i = i as u32;

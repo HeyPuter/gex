@@ -28,6 +28,23 @@
 # suite has an intermittent qemu=139 under load with the same shape. Recorded
 # rather than explained.
 #
+# With the runtime translator switched off entirely -- `--no-jit
+# --recompile-objects`, which exhaustively translates the executable and every
+# library it maps and then never translates anything again -- CPython still
+# runs, and runs at the same speed:
+#
+#   fannkuch 0.950   nbody 2.037   dicts 0.567
+#
+# against 0.88 / 1.91 / 0.54 with the runtime translator available, which is
+# inside the run-to-run spread. So the whole of CPython can be statically
+# recompiled and the sustained speed is unchanged: what the runtime translator
+# buys is startup, not throughput.
+#
+# Startup, though, is twelve minutes, and a second run is no faster. The
+# compiled-module cache stores Cranelift's output, and exhaustive translation
+# spends its time in the lift, before anything the cache knows about. See the
+# task about caching the lifted module.
+#
 # Regions were the obvious thing to try here, since a dispatch loop is a loop
 # and regions exist to keep one in a single wasm function. Paired medians of
 # five, alternating which configuration ran first:
