@@ -865,6 +865,21 @@ fi
 # for `rt_sigsuspend`, the native shim learned it, and the browser shim was
 # left with two non-exhaustive matches for however long it took someone to
 # rebuild the page.
+# Debian's own glxinfo and glxgears, on the host's real OpenGL, through the
+# guest's own unmodified Mesa. Minutes on a cold cache -- it translates all of
+# Mesa and LLVM -- so it is opt-in with the rest of the slow ones.
+if [ "${GEX_SLOW:-0}" = "1" ]; then
+    if out=$("$HERE/../opengl-in-guest.sh" 2>&1); then
+        echo "$out" | grep -E "^(ok|skip|     )" || true
+        echo "$out" | grep -q "^ok" && pass=$((pass + 1))
+    else
+        echo "$out" | sed 's/^/     /'
+        fail=$((fail + 1))
+    fi
+else
+    echo "skip opengl-in-guest: set GEX_SLOW=1 (it takes minutes)"
+fi
+
 #
 # `cargo check`, not `cargo build`: a plain `cargo build` for wasm32 writes
 # `gex_browser.wasm` *without* the link flags in `shims/browser/build.sh`, and

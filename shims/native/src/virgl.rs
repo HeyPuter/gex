@@ -34,6 +34,19 @@ pub const DEFAULT_SOCKET: &str = "/tmp/.virgl_test";
 struct Session {
     socket: Arc<UnixSocket>,
     state: vtest::Session,
+    /// Reply bytes the guest's socket had no room for yet.
+    ///
+    /// A UNIX socket holds 256 KB and a vtest reply can be larger: reading
+    /// back a 300x300 framebuffer is 360,000 bytes in one `TRANSFER_GET`.
+    /// The send is therefore short, and this used to throw the remainder
+    /// away -- `let _ = send(..)`. What that looks like from the guest is
+    /// not an error: Mesa reads the 262,144 bytes that arrived and blocks
+    /// forever waiting for the other 97,856. glxgears brought up a 4.3
+    /// context, drew one frame, and then simply stopped, with every
+    /// component reporting success.
+    out: Vec<u8>,
+    /// How much of `out` has gone.
+    sent: usize,
 }
 
 struct Inner {
@@ -153,9 +166,19 @@ impl VirglDevice {
                 }
             }
 
-            let out = s.state.run(renderer);
-            if !out.is_empty() {
-                let _ = s.socket.send(&out);
+            s.out.extend_from_slice(&s.state.run(renderer));
+            // As much as the socket will take. Whatever is left waits for the
+            // next pump, by which time the guest will have read some of what
+            // is already there and made room.
+            while s.sent < s.out.len() {
+                match s.socket.send(&s.out[s.sent..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => s.sent += n as usize,
+                }
+            }
+            if s.sent == s.out.len() {
+                s.out.clear();
+                s.sent = 0;
             }
             if let Some(why) = &s.state.failed {
                 if verbose {
@@ -181,6 +204,8 @@ impl HostListener for VirglDevice {
         inner.sessions.push(Session {
             socket: peer,
             state: vtest::Session::new(),
+            out: Vec::new(),
+            sent: 0,
         });
     }
 }

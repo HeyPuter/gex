@@ -38,6 +38,17 @@ struct Session {
     /// The protocol refers to one by the index it arrived at rather than by
     /// the client's own descriptor number, which means nothing on this side.
     fds: Vec<Arc<OpenFile>>,
+    /// Event bytes the client's socket had no room for yet, and how much of
+    /// them has gone.
+    ///
+    /// Wayland events are small and a socket holds 256 KB, so this is
+    /// usually empty. It is here because the same code in the virgl device
+    /// dropped the tail of a short write and reasoned that it could not
+    /// happen -- and then a framebuffer read-back, 360,000 bytes in one
+    /// reply, made it happen. A dropped tail does not fail: it desynchronises
+    /// the stream, and the client waits for bytes nobody is going to send.
+    out: Vec<u8>,
+    sent: usize,
 }
 
 /// The compositor, as the guest sees it: a name that accepts connections.
@@ -183,13 +194,16 @@ impl Wayland {
                     break;
                 }
             }
-            let out = s.client.take_outgoing();
-            if !out.is_empty() {
-                // A short write would desynchronise the stream. The socket
-                // buffer is a quarter of a megabyte, so this only comes up
-                // when a client has stopped reading entirely, and then the
-                // connection is over anyway.
-                let _ = s.socket.send(&out);
+            s.out.extend_from_slice(&s.client.take_outgoing());
+            while s.sent < s.out.len() {
+                match s.socket.send(&s.out[s.sent..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => s.sent += n as usize,
+                }
+            }
+            if s.sent == s.out.len() {
+                s.out.clear();
+                s.sent = 0;
             }
             produced.extend(s.client.take_frames());
             !gone && s.client.failed.is_none()
@@ -213,6 +227,8 @@ impl HostListener for Wayland {
             socket: peer,
             client,
             fds: Vec::new(),
+            out: Vec::new(),
+            sent: 0,
         });
     }
 }
