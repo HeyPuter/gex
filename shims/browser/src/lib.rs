@@ -1329,8 +1329,8 @@ fn trace_line(s: &str) {
 /// syscall that always answers immediately. Nothing stalls, nothing idles,
 /// nothing waits; it simply never gets anywhere, at full speed.
 ///
-/// Reported on powers of two from 65,536, so a program doing ordinary work
-/// says one line every so often and a program in a loop says a great many.
+/// Reported on powers of two, so a program doing ordinary work says one line
+/// every so often and a program in a loop says a great many.
 /// The list is trimmed to the ten commonest, because the tail is never the
 /// answer.
 fn count_syscall() {
@@ -1353,7 +1353,10 @@ fn count_syscall() {
         TOTAL = TOTAL.wrapping_add(1);
         TOTAL
     };
-    if !total.is_power_of_two() || total < 65536 {
+    // From 4,096, not 65,536. A whole glxgears run makes fewer than
+    // sixty-five thousand syscalls, so the higher threshold meant the one
+    // workload this was built to explain never produced a single line.
+    if !total.is_power_of_two() || total < 4096 {
         return;
     }
     let mut top: Vec<(u32, usize)> = unsafe {
