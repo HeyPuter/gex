@@ -28,30 +28,12 @@ echo "building the shim..."
 "$ROOT/shims/browser/build.sh" >/dev/null
 cp "$ROOT/target/wasm32-unknown-unknown/release/gex_browser.wasm" "$PUB/gex/"
 
-# Every export the page's glue calls, checked here rather than discovered by
-# a visitor. A shim built before the glue gained a call still loads, still
-# instantiates, and then fails on the first demo with "is not a function" --
-# which is what a stale copy of this file did, for a fortnight, with nothing
-# to say the asset rather than the code was wrong.
-node - "$PUB/gex/gex_browser.wasm" "$ROOT/shims/browser/js/gex.mjs" <<'NODEEOF'
-const fs = require('fs');
-const [, , wasmPath, gluePath] = process.argv;
-const glue = fs.readFileSync(gluePath, 'utf8');
-// Everything the glue reaches for by name, less the ones it guards with `?.`.
-const wanted = new Set();
-for (const m of glue.matchAll(/exports\.(gex_[a-z0-9_]+)(\??)\.?/g)) {
-  if (m[2] !== '?') wanted.add(m[1]);
-}
-WebAssembly.compile(fs.readFileSync(wasmPath)).then((mod) => {
-  const have = new Set(WebAssembly.Module.exports(mod).map((e) => e.name));
-  const missing = [...wanted].filter((n) => !have.has(n));
-  if (missing.length) {
-    console.error(`the shim is missing: ${missing.join(', ')}`);
-    process.exit(1);
-  }
-  console.log(`  shim exports all ${wanted.size} the page calls`);
-});
-NODEEOF
+# Do the shim and the glue agree, in both directions -- every export the page
+# calls, and every import the shim needs, with the right number of arguments.
+# Checked here rather than discovered by a visitor: a mismatch either way
+# survives the build, survives loading, and surfaces a minute into a demo.
+node "$ROOT/shims/browser/js/check-glue.mjs" \
+    "$PUB/gex/gex_browser.wasm" "$ROOT/shims/browser/js/gex.mjs"
 
 echo "building the seed module..."
 cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc >/dev/null 2>&1

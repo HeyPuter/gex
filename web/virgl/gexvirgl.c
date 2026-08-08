@@ -86,33 +86,67 @@ int gex_make_current(void *cookie, int scanout, virgl_renderer_gl_context ctx) {
  * vtest's renderer state unbuilt, and the first CREATE_RENDERER would fail
  * with nothing said. */
 
-/* -- the byte streams ---------------------------------------------------- */
+/* -- the byte streams, one set per client --------------------------------- */
 
-static uint8_t *in_buf;
-static size_t in_len, in_cap, in_pos;
+/* Every GL program that opens the renderer's socket is its own vtest client:
+ * its own context, its own resource handles, its own stream. The X server is
+ * one of them and glxgears is another, and they run at the same time.
+ *
+ * They used to share one buffer and one context, which worked for exactly as
+ * long as there was one of them. The second client's first command is
+ * CREATE_RENDERER, the context already existed, so it fell through to the
+ * "command this build does not know" arm and the whole stream was refused --
+ * after which no reply ever came back, glxgears waited for one forever, and
+ * with every process blocked the run went silent rather than failing. Twelve
+ * minutes of heartbeat with nothing in it, from one shared variable.
+ */
+#define GEX_SESSIONS 16
+
+struct gex_session {
+    bool live;
+    uint8_t *in_buf;
+    size_t in_len, in_cap, in_pos;
+    uint8_t *out_buf;
+    size_t out_len, out_cap;
+    struct vtest_context *ctx;
+};
+
+static struct gex_session gex_sessions[GEX_SESSIONS];
+/* Which one the renderer is currently running commands for. vtest reads its
+ * input and writes its replies through callbacks that take no argument for
+ * it, so it has to be here rather than passed. */
+static struct gex_session *cur;
 static bool short_read;
 
-/* Filled by the patched `vtest_block_write` when the fd is negative. */
-uint8_t *gex_out_buf;
-size_t gex_out_len, gex_out_cap;
-
-void gex_virgl_sink(const void *data, size_t len) {
-    if (gex_out_len + len > gex_out_cap) {
-        gex_out_cap = (gex_out_len + len) * 2 + 4096;
-        gex_out_buf = realloc(gex_out_buf, gex_out_cap);
+static struct gex_session *gex_session(int sid) {
+    if (sid < 0 || sid >= GEX_SESSIONS) return NULL;
+    struct gex_session *s = &gex_sessions[sid];
+    if (!s->live) {
+        memset(s, 0, sizeof *s);
+        s->live = true;
     }
-    memcpy(gex_out_buf + gex_out_len, data, len);
-    gex_out_len += len;
+    return s;
+}
+
+/* Filled by the patched `vtest_block_write` when the fd is negative. */
+void gex_virgl_sink(const void *data, size_t len) {
+    if (!cur) return;
+    if (cur->out_len + len > cur->out_cap) {
+        cur->out_cap = (cur->out_len + len) * 2 + 4096;
+        cur->out_buf = realloc(cur->out_buf, cur->out_cap);
+    }
+    memcpy(cur->out_buf + cur->out_len, data, len);
+    cur->out_len += len;
 }
 
 static int gex_input_read(struct vtest_input *input, void *buf, int size) {
     (void)input;
-    if (size < 0 || in_pos + (size_t)size > in_len) {
+    if (!cur || size < 0 || cur->in_pos + (size_t)size > cur->in_len) {
         short_read = true;
         return 0;
     }
-    memcpy(buf, in_buf + in_pos, (size_t)size);
-    in_pos += (size_t)size;
+    memcpy(buf, cur->in_buf + cur->in_pos, (size_t)size);
+    cur->in_pos += (size_t)size;
     return size;
 }
 
@@ -139,13 +173,34 @@ static struct vtest_input gex_input = {.read = gex_input_read};
 static GLuint gex_blit_fbo;
 static int gex_presented;
 
+/* Why a readback did not become a picture. A blank canvas has several
+ * causes that look identical from outside -- the guest never read back, it
+ * read back a resource that is not a texture, it read back something the
+ * size of a cursor -- and each wants a different fix. Counting them apart
+ * costs four words and turns a day of guessing into a glance. */
+static int gex_present_no_info, gex_present_no_tex, gex_present_small,
+    gex_present_incomplete;
+static uint32_t gex_present_last_w, gex_present_last_h;
+
 static void gex_present(uint32_t handle) {
     struct virgl_renderer_resource_info info;
-    if (virgl_renderer_resource_get_info((int)handle, &info) != 0) return;
+    if (virgl_renderer_resource_get_info((int)handle, &info) != 0) {
+        gex_present_no_info++;
+        return;
+    }
+    gex_present_last_w = info.width;
+    gex_present_last_h = info.height;
     /* Textures only, and only ones big enough to be a window. The X server
      * also reads back cursors and small pixmaps, and a 32x32 cursor stretched
      * over the canvas is not what anyone means by "the picture". */
-    if (!info.tex_id || info.width < 64 || info.height < 64) return;
+    if (!info.tex_id) {
+        gex_present_no_tex++;
+        return;
+    }
+    if (info.width < 64 || info.height < 64) {
+        gex_present_small++;
+        return;
+    }
 
     int w, h;
     emscripten_get_canvas_element_size("#gex-gl", &w, &h);
@@ -164,6 +219,8 @@ static void gex_present(uint32_t handle) {
         glBlitFramebuffer(0, 0, (GLint)info.width, (GLint)info.height,
                           0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         gex_presented++;
+    } else {
+        gex_present_incomplete++;
     }
     /* Back exactly as it was. virglrenderer keeps its own idea of the bound
      * framebuffer and does not expect anything else to have moved it. */
@@ -173,17 +230,23 @@ static void gex_present(uint32_t handle) {
 
 /* The resource handle is the first word of a TRANSFER_GET body, so it can be
  * read without consuming it and without duplicating the header struct. */
-static int gex_transfer_get(uint32_t len) {
+static uint32_t gex_peek_handle(void) {
     uint32_t handle = 0;
-    if (in_pos + sizeof handle <= in_len) memcpy(&handle, in_buf + in_pos, sizeof handle);
+    if (cur && cur->in_pos + sizeof handle <= cur->in_len) {
+        memcpy(&handle, cur->in_buf + cur->in_pos, sizeof handle);
+    }
+    return handle;
+}
+
+static int gex_transfer_get(uint32_t len) {
+    uint32_t handle = gex_peek_handle();
     int r = vtest_transfer_get(len);
     if (r >= 0 && handle) gex_present(handle);
     return r;
 }
 
 static int gex_transfer_get2(uint32_t len) {
-    uint32_t handle = 0;
-    if (in_pos + sizeof handle <= in_len) memcpy(&handle, in_buf + in_pos, sizeof handle);
+    uint32_t handle = gex_peek_handle();
     int r = vtest_transfer_get2(len);
     if (r >= 0 && handle) gex_present(handle);
     return r;
@@ -227,8 +290,27 @@ static int (*const gex_commands[])(uint32_t) = {
      * negotiates version 0, because the later versions pass shared memory by
      * descriptor and there are no descriptors to pass here. */
 };
-static struct vtest_context *gex_context;
 static bool gex_renderer_up;
+
+/* How many of each command has run, indexed the same as the table above. A
+ * guest that draws nothing and a guest that draws and is never read back
+ * both leave a black canvas; this says which. */
+static uint32_t gex_cmd_count[sizeof gex_commands / sizeof *gex_commands];
+static const char *const gex_cmd_names[] = {
+    [VCMD_GET_CAPS] = "get_caps",
+    [VCMD_RESOURCE_CREATE] = "res_create",
+    [VCMD_RESOURCE_UNREF] = "res_unref",
+    [VCMD_TRANSFER_GET] = "transfer_get",
+    [VCMD_TRANSFER_PUT] = "transfer_put",
+    [VCMD_SUBMIT_CMD] = "submit_cmd",
+    [VCMD_RESOURCE_BUSY_WAIT] = "busy_wait",
+    [VCMD_GET_CAPS2] = "get_caps2",
+    [VCMD_PING_PROTOCOL_VERSION] = "ping_version",
+    [VCMD_PROTOCOL_VERSION] = "version",
+    [VCMD_RESOURCE_CREATE2] = "res_create2",
+    [VCMD_TRANSFER_GET2] = "transfer_get2",
+    [VCMD_TRANSFER_PUT2] = "transfer_put2",
+};
 
 /* -- what JavaScript calls ----------------------------------------------- */
 
@@ -285,61 +367,71 @@ const char *gex_virgl_describe(void) {
 /* Hand over guest bytes. They are appended; nothing is executed until
  * `gex_virgl_pump`. */
 EMSCRIPTEN_KEEPALIVE
-int gex_virgl_feed(const uint8_t *data, int len) {
+int gex_virgl_feed(int sid, const uint8_t *data, int len) {
+    struct gex_session *s = gex_session(sid);
+    if (!s) return -1;
     if (len <= 0) {
         return 0;
     }
     /* Compact first, so a long session does not grow the buffer without
      * bound just because its front has been consumed. */
-    if (in_pos > 0 && in_pos == in_len) {
-        in_pos = in_len = 0;
-    } else if (in_pos > 65536) {
-        memmove(in_buf, in_buf + in_pos, in_len - in_pos);
-        in_len -= in_pos;
-        in_pos = 0;
+    if (s->in_pos > 0 && s->in_pos == s->in_len) {
+        s->in_pos = s->in_len = 0;
+    } else if (s->in_pos > 65536) {
+        memmove(s->in_buf, s->in_buf + s->in_pos, s->in_len - s->in_pos);
+        s->in_len -= s->in_pos;
+        s->in_pos = 0;
     }
-    if (in_len + (size_t)len > in_cap) {
-        in_cap = (in_len + (size_t)len) * 2 + 65536;
-        in_buf = realloc(in_buf, in_cap);
+    if (s->in_len + (size_t)len > s->in_cap) {
+        s->in_cap = (s->in_len + (size_t)len) * 2 + 65536;
+        s->in_buf = realloc(s->in_buf, s->in_cap);
     }
-    memcpy(in_buf + in_len, data, (size_t)len);
-    in_len += (size_t)len;
+    memcpy(s->in_buf + s->in_len, data, (size_t)len);
+    s->in_len += (size_t)len;
     return 0;
 }
 
 /* Run every complete command the buffer holds. Returns the number run, or -1
  * if the stream is unusable. */
 EMSCRIPTEN_KEEPALIVE
-int gex_virgl_pump(void) {
+int gex_virgl_pump(int sid) {
     if (!gex_renderer_up) {
         return -1;
     }
+    struct gex_session *s = gex_session(sid);
+    if (!s) return -1;
+    cur = s;
+    /* Whose resources and whose GL state the next command means. vtest keeps
+     * this in a global of its own, and the last client to run left it
+     * pointing at itself. */
+    if (s->ctx) vtest_set_current_context(s->ctx);
     int ran = 0;
     for (;;) {
-        size_t began = in_pos;
+        size_t began = s->in_pos;
         uint32_t header[VTEST_HDR_SIZE];
         short_read = false;
         if (gex_input_read(&gex_input, &header, sizeof(header)) <= 0) {
-            in_pos = began;
+            s->in_pos = began;
             break;
         }
 
         int ret;
-        if (!gex_context) {
+        if (!s->ctx) {
             /* The first command must be the one that makes the context. */
             if (header[1] != VCMD_CREATE_RENDERER) {
                 return -1;
             }
-            ret = vtest_create_context(&gex_input, -1, header[0], &gex_context);
+            ret = vtest_create_context(&gex_input, -1, header[0], &s->ctx);
             if (ret >= 0) {
-                ret = vtest_lazy_init_context(gex_context);
+                ret = vtest_lazy_init_context(s->ctx);
             }
             if (ret >= 0) {
-                vtest_set_current_context(gex_context);
+                vtest_set_current_context(s->ctx);
             }
         } else if (header[1] < sizeof gex_commands / sizeof *gex_commands
                    && gex_commands[header[1]] != NULL) {
             vtest_poll_resource_busy_wait();
+            gex_cmd_count[header[1]]++;
             ret = gex_commands[header[1]](header[0]);
         } else {
             /* A command this build does not know. The stream is framed by
@@ -351,7 +443,7 @@ int gex_virgl_pump(void) {
         if (short_read) {
             /* Only part of this command has arrived. Put it back and wait;
              * running half of it would desynchronise the stream for good. */
-            in_pos = began;
+            s->in_pos = began;
             break;
         }
         if (ret < 0) {
@@ -393,19 +485,72 @@ const char *gex_virgl_gl_state(void) {
     return out;
 }
 
+/* Everything the guest asked for, and everything that stopped a readback
+ * from reaching the canvas.
+ *
+ * The two halves answer different questions and both are needed. A stream
+ * with no `transfer_get` means the guest is drawing and never looking, so
+ * the picture is somewhere the canvas is not. A stream full of them with
+ * `no_tex` climbing means the readbacks are of buffers rather than
+ * textures, and the blit needs a different source. `small` climbing alone
+ * means the only thing being read back is a cursor.
+ */
+EMSCRIPTEN_KEEPALIVE
+const char *gex_virgl_commands(void) {
+    static char out[512];
+    size_t at = 0;
+    for (size_t i = 0; i < sizeof gex_cmd_count / sizeof *gex_cmd_count; i++) {
+        if (!gex_cmd_count[i] || at >= sizeof out - 1) continue;
+        const char *name = i < sizeof gex_cmd_names / sizeof *gex_cmd_names
+                               ? gex_cmd_names[i] : NULL;
+        if (name) {
+            at += snprintf(out + at, sizeof out - at, "%s%s=%u", at ? " " : "",
+                           name, gex_cmd_count[i]);
+        } else {
+            at += snprintf(out + at, sizeof out - at, "%s#%zu=%u", at ? " " : "",
+                           i, gex_cmd_count[i]);
+        }
+    }
+    snprintf(out + at, sizeof out - at,
+             "%sdropped: no_info=%d no_tex=%d small=%d incomplete=%d last=%ux%u",
+             at ? " | " : "", gex_present_no_info, gex_present_no_tex,
+             gex_present_small, gex_present_incomplete, gex_present_last_w,
+             gex_present_last_h);
+    return out;
+}
+
 /* How many reply bytes are waiting, and where they are. JavaScript copies
  * them out of the heap and calls `gex_virgl_drain`. */
 EMSCRIPTEN_KEEPALIVE
-int gex_virgl_pending(void) {
-    return (int)gex_out_len;
+int gex_virgl_pending(int sid) {
+    struct gex_session *s = gex_session(sid);
+    return s ? (int)s->out_len : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE
-uint8_t *gex_virgl_replies(void) {
-    return gex_out_buf;
+uint8_t *gex_virgl_replies(int sid) {
+    struct gex_session *s = gex_session(sid);
+    return s ? s->out_buf : NULL;
 }
 
 EMSCRIPTEN_KEEPALIVE
-void gex_virgl_drain(void) {
-    gex_out_len = 0;
+void gex_virgl_drain(int sid) {
+    struct gex_session *s = gex_session(sid);
+    if (s) s->out_len = 0;
+}
+
+/* A client has gone. Its context owns GL objects and its buffers own heap,
+ * and a demo that opens a window per program would leak both. */
+EMSCRIPTEN_KEEPALIVE
+void gex_virgl_close(int sid) {
+    struct gex_session *s = gex_session(sid);
+    if (!s) return;
+    if (s->ctx) {
+        vtest_set_current_context(s->ctx);
+        vtest_destroy_context(s->ctx);
+        if (cur == s) cur = NULL;
+    }
+    free(s->in_buf);
+    free(s->out_buf);
+    memset(s, 0, sizeof *s);
 }

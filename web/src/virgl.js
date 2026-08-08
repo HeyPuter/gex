@@ -77,18 +77,30 @@ export class VirglRenderer {
   }
 
   /**
+   * Every command the guest has sent, by name and count, and every reason a
+   * readback did not become a picture.
+   *
+   * This is the one to read when the canvas is black. `presented` says only
+   * that nothing arrived; this says whether the guest drew at all, whether
+   * it ever read back, and if it did, what was wrong with what it read.
+   */
+  commands() {
+    return this.ok ? this.#module.UTF8ToString(this.#module._gex_virgl_commands()) : this.#failed;
+  }
+
+  /**
    * Hand over `len` bytes of the guest's stream, at `ptr` in the *shim's*
    * memory, and run every command they complete.
    *
    * @returns {number} reply bytes waiting, or -1 with no renderer
    */
-  submit(shimMemory, ptr, len) {
+  submit(session, shimMemory, ptr, len) {
     if (!this.ok) return -1;
     const buf = this.#module._malloc(len);
     this.#module.HEAPU8.set(new Uint8Array(shimMemory.buffer, ptr, len), buf);
-    this.#module._gex_virgl_feed(buf, len);
+    this.#module._gex_virgl_feed(session, buf, len);
     this.#module._free(buf);
-    const ran = this.#module._gex_virgl_pump();
+    const ran = this.#module._gex_virgl_pump(session);
     // A refusal is the end of the connection, not of this call: a stream
     // protocol cannot resynchronise after a command of unknown length, and
     // pretending otherwise turns one bad command into a stream of garbage.
@@ -96,36 +108,44 @@ export class VirglRenderer {
       this.#failed = 'the renderer refused the stream';
       return -1;
     }
-    return this.#module._gex_virgl_pending();
+    return this.#module._gex_virgl_pending(session);
   }
 
   /** Copy up to `max` reply bytes to `ptr` in the shim's memory. */
-  take(shimMemory, ptr, max) {
+  take(session, shimMemory, ptr, max) {
     if (!this.ok) return 0;
-    const have = this.#module._gex_virgl_pending();
+    const have = this.#module._gex_virgl_pending(session);
     const n = Math.min(have, max);
     if (n > 0) {
-      const from = this.#module._gex_virgl_replies();
+      const from = this.#module._gex_virgl_replies(session);
       new Uint8Array(shimMemory.buffer, ptr, n).set(
         this.#module.HEAPU8.subarray(from, from + n),
       );
     }
     // All or nothing: the shim always asks for everything waiting, and a
     // partial drain would leave the rest to be re-sent on top of itself.
-    this.#module._gex_virgl_drain();
+    this.#module._gex_virgl_drain(session);
     return n;
+  }
+
+  /** A client has gone: drop its context and its buffers. */
+  close(session) {
+    if (this.ok) this.#module._gex_virgl_close(session);
   }
 }
 
 /**
- * The two imports `shims/browser/src/virgl.rs` declares.
+ * The three imports `shims/browser/src/virgl.rs` declares.
  *
  * `memory` is the shim's, resolved lazily because the module that owns it is
  * being instantiated when these are handed over.
  */
 export function virglImports(renderer, getMemory) {
   return {
-    virgl_submit: (ptr, len) => (renderer ? renderer.submit(getMemory(), ptr, len) : -1),
-    virgl_take: (ptr, max) => (renderer ? renderer.take(getMemory(), ptr, max) : 0),
+    virgl_submit: (session, ptr, len) =>
+      (renderer ? renderer.submit(session, getMemory(), ptr, len) : -1),
+    virgl_take: (session, ptr, max) =>
+      (renderer ? renderer.take(session, getMemory(), ptr, max) : 0),
+    virgl_close: (session) => renderer?.close(session),
   };
 }

@@ -145,10 +145,18 @@ export class Gex {
         // compiled to wasm. Bytes rather than an address, because that
         // renderer is a separate module with a heap of its own -- see
         // web/src/virgl.js.
-        virgl_submit: (ptr, len) =>
-          this.#virgl ? this.#virgl.submit(this.#memory, ptr >>> 0, len >>> 0) : -1,
-        virgl_take: (ptr, max) =>
-          this.#virgl ? this.#virgl.take(this.#memory, ptr >>> 0, max >>> 0) : 0,
+        // Every GL program that opens the socket is its own vtest client with
+        // its own context and its own stream, so which one these bytes belong
+        // to has to be said.
+        virgl_submit: (session, ptr, len) =>
+          this.#virgl
+            ? this.#virgl.submit(session >>> 0, this.#memory, ptr >>> 0, len >>> 0)
+            : -1,
+        virgl_take: (session, ptr, max) =>
+          this.#virgl
+            ? this.#virgl.take(session >>> 0, this.#memory, ptr >>> 0, max >>> 0)
+            : 0,
+        virgl_close: (session) => this.#virgl?.close(session >>> 0),
       },
     });
     this.#u8 = new Uint8Array(this.#memory.buffer);

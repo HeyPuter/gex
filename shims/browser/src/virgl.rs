@@ -38,9 +38,11 @@ extern "C" {
     /// Hand the renderer `len` bytes at `ptr` and run every command they
     /// complete. Returns the number of reply bytes waiting, or negative if
     /// the page has no renderer.
-    fn virgl_submit(ptr: u32, len: u32) -> i32;
+    fn virgl_submit(session: u32, ptr: u32, len: u32) -> i32;
     /// Copy up to `max` reply bytes into `ptr`; returns how many were copied.
-    fn virgl_take(ptr: u32, max: u32) -> i32;
+    fn virgl_take(session: u32, ptr: u32, max: u32) -> i32;
+    /// Let go of a client's context and its buffers.
+    fn virgl_close(session: u32);
 }
 
 /// Set when the page said it brought a renderer.
@@ -71,7 +73,22 @@ pub static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Where Mesa's vtest winsys looks unless `VTEST_SOCKET_NAME` says otherwise.
 pub const DEFAULT_SOCKET: &str = "/tmp/.virgl_test";
 
+/// How many GL programs can have the renderer open at once. Matches the
+/// renderer's own table; a connection past it is refused rather than given a
+/// number that would collide with a live one.
+const MAX_SESSIONS: usize = 16;
+
 struct Session {
+    /// Which of the renderer's clients this is.
+    ///
+    /// Each one has its own vtest context, its own resource handles and its
+    /// own stream, and the renderer keeps them apart by this number. They
+    /// used to share one of each, which held up for exactly as long as there
+    /// was one client: the second's `CREATE_RENDERER` arrived at a renderer
+    /// that already had a context, was refused as an unknown command, and
+    /// took the stream down with it. Nothing said so -- the guest simply
+    /// waited for a reply for ever.
+    id: u32,
     socket: Arc<UnixSocket>,
     /// Reply bytes the guest's socket had no room for yet, and how much of
     /// them has gone.
@@ -89,6 +106,10 @@ struct Session {
 #[derive(Default)]
 struct Inner {
     sessions: Vec<Session>,
+    /// Which client numbers are in use. The renderer keeps a fixed table, so
+    /// a long run that opens and closes windows has to give numbers back
+    /// rather than count upwards.
+    taken: [bool; MAX_SESSIONS],
     /// How many clients have ever connected, so a session that vanishes can
     /// be told from one that never arrived.
     accepted: u64,
@@ -143,6 +164,7 @@ impl VirglDevice {
         // Mesa submits a whole command buffer in one write, and those run to
         // tens of kilobytes for a frame with real geometry.
         let mut buf = vec![0u8; 256 * 1024];
+        let mut freed = Vec::new();
         inner.sessions.retain_mut(|s| {
             let mut gone = false;
             loop {
@@ -158,7 +180,7 @@ impl VirglDevice {
                 // SAFETY: the page reads `n` bytes at this address out of
                 // this module's memory, which is the same arrangement the GL
                 // device uses, and does not retain the pointer.
-                let waiting = unsafe { virgl_submit(buf.as_ptr() as u32, n as u32) };
+                let waiting = unsafe { virgl_submit(s.id, buf.as_ptr() as u32, n as u32) };
                 if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
                     Self::trace(&format!("[virgl] fed {n} bytes, {waiting} waiting\n"));
                 }
@@ -167,7 +189,7 @@ impl VirglDevice {
                     s.out.resize(at + waiting as usize, 0);
                     // SAFETY: as above, and the slice is exactly `waiting`.
                     let took = unsafe {
-                        virgl_take(s.out[at..].as_mut_ptr() as u32, waiting as u32)
+                        virgl_take(s.id, s.out[at..].as_mut_ptr() as u32, waiting as u32)
                     };
                     if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
                         Self::trace(&format!("[virgl] took {took} of {waiting}\n"));
@@ -199,8 +221,16 @@ impl VirglDevice {
                 s.out.clear();
                 s.sent = 0;
             }
+            if gone {
+                // SAFETY: an import that takes a number and retains nothing.
+                unsafe { virgl_close(s.id) };
+                freed.push(s.id);
+            }
             !gone
         });
+        for id in freed {
+            inner.taken[id as usize] = false;
+        }
     }
 }
 
@@ -208,6 +238,14 @@ impl HostListener for VirglDevice {
     fn accept(&self, peer: Arc<UnixSocket>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.accepted += 1;
+        let Some(id) = (0..MAX_SESSIONS).find(|&i| !inner.taken[i]) else {
+            // Refused out loud. A client given a number already in use would
+            // render into another program's resources, which looks like
+            // corruption rather than like being turned away.
+            Self::trace("[virgl] no free session: refusing a client\n");
+            return;
+        };
+        inner.taken[id] = true;
         // Said out loud, and not only under the verbose flag. This is the
         // moment the guest's Mesa finds the GPU, and it is the one event that
         // separates "still translating libGL" from "talking to the renderer"
@@ -218,6 +256,7 @@ impl HostListener for VirglDevice {
             inner.accepted
         ));
         inner.sessions.push(Session {
+            id: id as u32,
             socket: peer,
             out: Vec::new(),
             sent: 0,

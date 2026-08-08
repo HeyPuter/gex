@@ -37,9 +37,13 @@
 #
 # STATUS
 #
-# The renderer core compiles: `libvirglrenderer.a`, wasm objects. It is not
-# yet linked into a module the page loads, and nothing is wired to the guest.
-# See the task list.
+# It links, the page loads it, and Debian's Xvfb and glxgears both connect to
+# it and get a GL context. See the task list for what is left.
+#
+# Re-running this is cheap. The clone is skipped when the tree is there, and
+# meson's build is incremental -- so a change to `virgl/gexvirgl.c`, which is
+# the file anyone actually edits, costs a compile and a link rather than the
+# ten minutes the first build takes.
 set -eu
 
 OUT="${1:-${TMPDIR:-/tmp}/gex-virgl-wasm}"
@@ -533,7 +537,7 @@ DESKTOP
     -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 \
     -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,UTF8ToString \
     -sENVIRONMENT=web,worker \
-    -sEXPORTED_FUNCTIONS=_gex_virgl_init,_gex_virgl_describe,_gex_virgl_gl_state,_gex_virgl_feed,_gex_virgl_pump,_gex_virgl_pending,_gex_virgl_replies,_gex_virgl_drain,_malloc,_free
+    -sEXPORTED_FUNCTIONS=_gex_virgl_init,_gex_virgl_describe,_gex_virgl_gl_state,_gex_virgl_commands,_gex_virgl_feed,_gex_virgl_pump,_gex_virgl_pending,_gex_virgl_replies,_gex_virgl_drain,_gex_virgl_close,_malloc,_free
 
 echo
 for a in src/libvirglrenderer.a src/libvirgl.a src/gallium/libgallium.a src/mesa/libmesa.a; do

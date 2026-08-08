@@ -181,7 +181,7 @@ try {
       while (queued.length) {
         const [at, l] = queued.shift();
         post('progress', at + 's | ' + l + ' | ' + blocks + ' blocks in ' + ms +
-          'ms | ' + renderer.glState());
+          'ms | ' + renderer.glState() + '\\n        ' + renderer.commands());
       }
     });
   };
@@ -192,7 +192,8 @@ try {
   const status = await Promise.race([gex.run(entry), firstFrame]);
   const result = 'EXIT ' + status + '\\n' + output.trim() +
       '\\nrenderer: ' + renderer.describe() +
-      '\\nstate: ' + renderer.glState();
+      '\\nstate: ' + renderer.glState() +
+      '\\ncommands: ' + renderer.commands();
   say(result);
   await post('done', result);
 } catch (e) {
