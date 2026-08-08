@@ -11,6 +11,30 @@
 # translated ahead of time. There is no runtime translation in these numbers
 # at all. It is a measurement of the static recompiler and nothing else.
 #
+# THREE ENGINES, AND THE ONE THAT MATTERS
+#
+# It used to measure the static recompiler through Cranelift and wasmtime,
+# which is the debug adapter. The `v8` column is the same statically
+# recompiled module run under Node, which is the engine a page has.
+#
+# Five rounds, alternating, on an idle machine. Ratios are against qemu-user,
+# so lower is faster:
+#
+#   fannkuch (integer, list)   qemu 0.732s   gex 1.581x   v8 1.466x
+#   nbody    (float)           qemu 2.724s   gex 0.800x   v8 0.766x
+#   dicts    (allocation)      qemu 0.329s   gex 1.681x   v8 1.696x
+#
+# V8 is ahead of Cranelift on two of the three and level on the third,
+# running a CPython whose every opcode handler was translated ahead of time.
+# That is the same answer nbench gave (see tests/real-programs/BASELINE.md,
+# where V8 wins six kernels of ten), now on the workload that was supposed to
+# be worst for this design.
+#
+# Compare the two columns from the *same* invocation and not against the
+# numbers written down below: those were taken on a differently loaded
+# machine and the absolute ratios moved a long way between them. What does
+# not move is which engine is ahead.
+#
 # Measured on this machine, medians, gex against qemu-user, over three
 # separate invocations of this script:
 #
@@ -150,9 +174,56 @@ for name, fn, arg in (("fannkuch", fannkuch, 8), ("nbody", nbody, 30000),
     print("%s %.3f %s" % (name, time.time() - t, r))
 PYEOF
 
+# -- the browser leg -------------------------------------------------------
+#
+# The comment at the top of this file calls CPython a measurement of the
+# static recompiler and nothing else. That was only half true: it measured
+# the static recompiler through Cranelift and wasmtime, which is the debug
+# adapter. The engine that matters is V8, and this is the same module run
+# there.
+#
+# `gexc build --exhaustive` translates every decodable address in the
+# executable, so the interpreter loop and all several hundred of its opcode
+# handlers are in the module before it starts. Debian's python3-minimal links
+# the interpreter into the executable, so that really is all of it: the
+# libraries it maps are libc, libm, libz and libexpat, and no bytecode
+# dispatch happens in any of them.
+#
+# A subset of the rootfs, not the whole thing. `--dir` bundles eagerly into
+# the guest's filesystem, and 665 MB of Debian exhausts the shim's heap
+# before the program starts -- `rust_oom`, from inside wasm, which is not an
+# obvious way to be told the harness asked for too much.
+SHIM="$HERE/target/wasm32-unknown-unknown/release/gex_browser.wasm"
+BROWSER=""
+if command -v node >/dev/null 2>&1 && [ -f "$SHIM" ]; then
+    W="${TMPDIR:-/tmp}/gex-pybench"
+    mkdir -p "$W/root/usr/bin" "$W/root/usr/lib/aarch64-linux-gnu" "$W/root/lib" "$W/root/var"
+    cp -L "$R$PY" "$W/root/usr/bin/python3.11"
+    [ -d "$W/root/usr/lib/python3.11" ] || cp -a "$R/usr/lib/python3.11" "$W/root/usr/lib/"
+    for f in libm.so.6 libz.so.1 libexpat.so.1 libc.so.6 ld-linux-aarch64.so.1; do
+        src=$(find "$R" -name "$f" 2>/dev/null | head -1)
+        [ -n "$src" ] && cp -L "$src" "$W/root/usr/lib/aarch64-linux-gnu/$f"
+    done
+    cp -L "$W/root/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" "$W/root/lib/"
+    cp "$R/var/bench.py" "$W/root/var/bench.py"
+    if [ ! -f "$W/python.wasm" ]; then
+        echo "== statically recompiling CPython for the browser"
+        "$GEXC" build --exhaustive --no-shared-memory \
+            "$W/root/usr/bin/python3.11" -o "$W/python.wasm" 2>&1 | tail -1
+    fi
+    BROWSER="$W"
+fi
+
+run_browser() {
+    node "$HERE/shims/browser/js/run-node.mjs" \
+        --dir "/=$BROWSER/root" --cwd / --argv0 /usr/bin/python3.11 \
+        "$BROWSER/python.wasm" "$BROWSER/root/usr/bin/python3.11" /var/bench.py
+}
+
 # The guest times itself, so translation and startup are outside the number.
 # A cold run first, because the first one pays for Cranelift.
 "$GEXC" run --uid 0 --sysroot "$R" "$R$PY" /var/bench.py >/dev/null 2>&1 || true
+[ -n "$BROWSER" ] && run_browser >/dev/null 2>&1 || true
 
 i=0
 while [ "$i" -lt "$ROUNDS" ]; do
@@ -166,6 +237,8 @@ while [ "$i" -lt "$ROUNDS" ]; do
         "$QEMU" -L "$R" "$R$PY" /var/bench.py | sed 's/^/qemu /'
         "$GEXC" run --uid 0 --sysroot "$R" "$R$PY" /var/bench.py | sed 's/^/gex /'
     fi
+    [ -n "$BROWSER" ] && run_browser | sed 's/^/v8 /'
+    true
 done > "$R/var/bench.out"
 
 awk '
@@ -174,9 +247,11 @@ END {
     split("fannkuch nbody dicts", names, " ")
     for (k = 1; k <= 3; k++) {
         n = names[k]
-        printf "%-9s gex %6.3fs   qemu %6.3fs   ratio %5.3f\n", n,
-               med(t["gex," n]), med(t["qemu," n]),
-               med(t["gex," n]) / med(t["qemu," n])
+        printf "%-9s qemu %6.3fs   gex %6.3fs %5.3fx   v8 %6.3fs %5.3fx\n", n,
+               med(t["qemu," n]), med(t["gex," n]),
+               med(t["gex," n]) / med(t["qemu," n]),
+               med(t["v8," n]),
+               med(t["v8," n]) == 0 ? 0 : med(t["v8," n]) / med(t["qemu," n])
     }
 }
 function med(s,   a, c, i) {

@@ -3015,6 +3015,46 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     if !with_host(|h| h.jit.described) {
         return 0;
     }
+    // Has another process already paid for this library?
+    //
+    // Two processes map the same Mesa and the same libc at the same
+    // addresses, and the slots one of them translated into answer perfectly
+    // well for the other -- that is what the identity map is for, and the
+    // miss path has always used it. Recompiling an object without asking
+    // meant the second process translated all of it again and claimed a
+    // second full set of slots: 2,439,742 blocks over 8,395,776 slots for
+    // the gears demo, which is how a run reached V8's ceiling of ten million
+    // and died with the dispatch table refusing to grow.
+    //
+    // Whole pages, because that is the unit the identity map is keyed by. An
+    // object whose every page is already answered for is skipped outright.
+    let adopted = with_host(|h| {
+        let first = gex_abi::dispatch_page(map.start);
+        let last = gex_abi::dispatch_page(map.end.saturating_sub(1));
+        let mut missing = 0usize;
+        for page in first..=last {
+            if h.jit.page_table.lookup(page).is_some() {
+                continue;
+            }
+            let Some(key) = page_identity(h, page * gex_abi::DISPATCH_PAGE) else {
+                missing += 1;
+                continue;
+            };
+            match h.jit.shared.get(&(page, key)) {
+                Some(&base) => {
+                    h.jit.page_table.assign(page, base);
+                    // And the guest's directory, which `execve` cleared.
+                    let mut gm = GuestMem::new(guest_bytes());
+                    let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+                }
+                None => missing += 1,
+            }
+        }
+        missing
+    });
+    if adopted == 0 {
+        return 0;
+    }
     let seeds = object_seeds(map);
     let (exec, page_table, known) = with_host(|h| {
         let exec: Vec<(u64, u64)> = h

@@ -77,6 +77,7 @@ const SECONDS = '__SECONDS__';
 const TRACE = __TRACE__;
 const process_HEARTBEAT = __HEARTBEAT__;
 const __MISSES__ = __TRACEMISS__;
+const __RECOMPILE__ = __RECOMPILEKIB__;
 import { Gex, Env } from './gex.mjs';
 import { VirglRenderer } from './virgl.js';
 import { untar } from './tar.js';
@@ -174,6 +175,10 @@ try {
   // only window into a stretch that makes no syscalls and runs no JavaScript.
   e.gex_set_heartbeat?.(BigInt(process_HEARTBEAT));
   if (__MISSES__) e.gex_set_trace_misses?.(1);
+  // Static recompilation: translate each shared object whole as the guest
+  // maps it, rather than meeting it a dispatch miss at a time. The value is
+  // a cap in KiB of mapped text -- see run-node.mjs for why 8192.
+  if (__RECOMPILE__) e.gex_set_recompile_objects?.(__RECOMPILE__);
   // A pulse from the page itself, on the clock, owing nothing to the guest.
   //
   // Every other report in this harness is produced from inside the run: the
@@ -228,7 +233,12 @@ try {
 </script>`.replace('__SECONDS__', SECONDS)
    .replace('__TRACE__', String(!!process.env.GEX_VIRGL_TRACE))
    .replace('__HEARTBEAT__', String(Number(process.env.GEX_HEARTBEAT || 0)))
-   .replace('__TRACEMISS__', process.env.GEX_TRACE_MISSES ? 'true' : 'false'),
+   .replace('__TRACEMISS__', process.env.GEX_TRACE_MISSES ? 'true' : 'false')
+   .replace('__RECOMPILEKIB__', String(
+     process.env.GEX_RECOMPILE_OBJECTS === undefined
+       ? 0
+       : Number(process.env.GEX_RECOMPILE_OBJECTS) || 8192,
+   )),
 );
 
 let finish;
