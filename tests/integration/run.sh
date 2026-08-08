@@ -1110,6 +1110,43 @@ else
     echo "skip browser-builds: no wasm32-unknown-unknown target installed"
 fi
 
+# The two-memory shape the whole kernel design rests on, asked of the engine
+# rather than assumed: two imported memories at once, one shared and one not,
+# and a `memory.copy` naming both. If an engine ever refuses this, everything
+# above it is unbuildable, and it should say so here rather than surfacing as
+# a link error in a demo.
+if [ -n "$NODE" ]; then
+    out=$("$NODE" web/test/multimemory.mjs 2>&1 || true)
+    case "$out" in
+        ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
+        *) echo "FAIL multimemory"; echo "$out" | sed 's/^/     /' | head -4; fail=$((fail + 1)) ;;
+    esac
+else
+    echo "skip multimemory: no node"
+fi
+
+# And the same shape built from Rust and actually shared: one global kernel
+# module, instantiated in two Workers against one memory, each Worker with its
+# own process memory. This is what replaces the snapshot switcher. Separate
+# address spaces mean two processes cannot put their libraries at the same
+# addresses, so there is nothing to save and restore; one shared kernel memory
+# means the file table and the process table are simply there, and a syscall
+# stays a call rather than becoming a message.
+if [ -n "$NODE" ] && [ -f web/public/gex/gex_kernel.wasm ]; then
+    out=$("$NODE" web/test/kernel-shared.mjs 2>&1 || true)
+    case "$out" in
+        ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
+        skip*) echo "$out" | head -1 ;;
+        *)
+            echo "FAIL kernel-shared: the global kernel is not shared, or not separate"
+            echo "$out" | sed 's/^/     /' | head -6
+            fail=$((fail + 1))
+            ;;
+    esac
+else
+    echo "skip kernel-shared: no node, or shims/kernel/build.sh has not been run"
+fi
+
 # The demo page's terminal. Not a translation test: it checks the seam above
 # the runtime, where a keystroke has to travel from an xterm through the line
 # discipline into a parked guest read. That seam broke once without any test

@@ -466,6 +466,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-kernel-wasm"
+version = "0.0.1"
+dependencies = [
+ "gex-kmem",
+]
+
+[[package]]
+name = "gex-kmem"
+version = "0.0.1"
+
+[[package]]
 name = "gex-ld"
 version = "0.0.1"
 dependencies = [
