@@ -65,6 +65,18 @@ export class VirglRenderer {
   }
 
   /**
+   * The renderer's GL state, and how many frames it has put on the canvas.
+   *
+   * `presented` is the one worth reading. vtest has no present -- the guest
+   * reads its pixels back and never looks at a screen -- so a run can be
+   * drawing perfectly with nothing visible, and this is what tells the two
+   * apart.
+   */
+  glState() {
+    return this.ok ? this.#module.UTF8ToString(this.#module._gex_virgl_gl_state()) : this.#failed;
+  }
+
+  /**
    * Hand over `len` bytes of the guest's stream, at `ptr` in the *shim's*
    * memory, and run every command they complete.
    *

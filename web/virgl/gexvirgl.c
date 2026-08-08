@@ -118,6 +118,77 @@ static int gex_input_read(struct vtest_input *input, void *buf, int size) {
 
 static struct vtest_input gex_input = {.read = gex_input_read};
 
+/* -- putting the picture on the canvas ----------------------------------- */
+
+/* vtest has no present. That is not an omission -- it is what vtest is: a
+ * test harness whose client reads its pixels back with TRANSFER_GET and
+ * compares them. The guest here is an X server, and it does exactly that,
+ * copies the result into its own framebuffer, and is perfectly happy for
+ * nothing ever to appear on a screen.
+ *
+ * A demo needs the screen. So every readback of a colour surface is also
+ * blitted to the canvas: the resource virglrenderer just rendered into is a
+ * GL texture, and `virgl_renderer_resource_get_info` says which one. That
+ * makes the canvas a mirror of whatever the guest last looked at, which for
+ * glxgears is the frame it is about to hand to X.
+ *
+ * The blit is upside down on purpose. GL's origin is bottom-left and the
+ * canvas's is top-left, so the destination rectangle is inverted rather than
+ * the source.
+ */
+static GLuint gex_blit_fbo;
+static int gex_presented;
+
+static void gex_present(uint32_t handle) {
+    struct virgl_renderer_resource_info info;
+    if (virgl_renderer_resource_get_info((int)handle, &info) != 0) return;
+    /* Textures only, and only ones big enough to be a window. The X server
+     * also reads back cursors and small pixmaps, and a 32x32 cursor stretched
+     * over the canvas is not what anyone means by "the picture". */
+    if (!info.tex_id || info.width < 64 || info.height < 64) return;
+
+    int w, h;
+    emscripten_get_canvas_element_size("#gex-gl", &w, &h);
+    if (!gex_blit_fbo) glGenFramebuffers(1, &gex_blit_fbo);
+
+    GLint draw_fbo = 0, read_fbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, gex_blit_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, info.tex_id, 0);
+    if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glDisable(GL_SCISSOR_TEST);
+        glBlitFramebuffer(0, 0, (GLint)info.width, (GLint)info.height,
+                          0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        gex_presented++;
+    }
+    /* Back exactly as it was. virglrenderer keeps its own idea of the bound
+     * framebuffer and does not expect anything else to have moved it. */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_fbo);
+}
+
+/* The resource handle is the first word of a TRANSFER_GET body, so it can be
+ * read without consuming it and without duplicating the header struct. */
+static int gex_transfer_get(uint32_t len) {
+    uint32_t handle = 0;
+    if (in_pos + sizeof handle <= in_len) memcpy(&handle, in_buf + in_pos, sizeof handle);
+    int r = vtest_transfer_get(len);
+    if (r >= 0 && handle) gex_present(handle);
+    return r;
+}
+
+static int gex_transfer_get2(uint32_t len) {
+    uint32_t handle = 0;
+    if (in_pos + sizeof handle <= in_len) memcpy(&handle, in_buf + in_pos, sizeof handle);
+    int r = vtest_transfer_get2(len);
+    if (r >= 0 && handle) gex_present(handle);
+    return r;
+}
+
 /* The command table, as `vtest_server.c` has it. Kept here rather than
  * reached into, because the server's copy is `static` and its transport is a
  * socket. `VCMD_CREATE_RENDERER` is absent on purpose: it is what makes the
@@ -127,7 +198,7 @@ static int (*const gex_commands[])(uint32_t) = {
     [VCMD_GET_CAPS] = vtest_send_caps,
     [VCMD_RESOURCE_CREATE] = vtest_create_resource,
     [VCMD_RESOURCE_UNREF] = vtest_resource_unref,
-    [VCMD_TRANSFER_GET] = vtest_transfer_get,
+    [VCMD_TRANSFER_GET] = gex_transfer_get,
     [VCMD_TRANSFER_PUT] = vtest_transfer_put,
     [VCMD_SUBMIT_CMD] = vtest_submit_cmd,
     /* The non-blocking variant, and it has to be.
@@ -149,7 +220,7 @@ static int (*const gex_commands[])(uint32_t) = {
     [VCMD_PROTOCOL_VERSION] = vtest_protocol_version,
     /* since protocol version 2 */
     [VCMD_RESOURCE_CREATE2] = vtest_create_resource2,
-    [VCMD_TRANSFER_GET2] = vtest_transfer_get2,
+    [VCMD_TRANSFER_GET2] = gex_transfer_get2,
     [VCMD_TRANSFER_PUT2] = vtest_transfer_put2,
     /* Protocol version 3 -- GET_PARAM through SUBMIT_CMD2 -- is behind
      * VIRGL_RENDERER_UNSTABLE_APIS and is not built. It is not missed: gex
@@ -316,8 +387,9 @@ const char *gex_virgl_gl_state(void) {
         }
     }
     snprintf(out, sizeof out,
-             "draw_fbo=%d read_fbo=%d viewport=%d,%d,%dx%d fbo_status=0x%x gl_error=0x%x",
-             draw_fbo, read_fbo, vp[0], vp[1], vp[2], vp[3], status, err);
+             "draw_fbo=%d read_fbo=%d viewport=%d,%d,%dx%d fbo_status=0x%x gl_error=0x%x "
+             "presented=%d",
+             draw_fbo, read_fbo, vp[0], vp[1], vp[2], vp[3], status, err, gex_presented);
     return out;
 }
 

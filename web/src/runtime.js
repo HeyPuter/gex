@@ -172,7 +172,7 @@ class TerminalEnv extends Env {
  */
 export async function runProgram(
   term,
-  { elf, files = {}, args, cwd = '/', tty = true, network = null, gl = null, uid },
+  { elf, files = {}, args, cwd = '/', tty = true, network = null, gl = null, virgl = null, uid },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
   const ref = { current: null };
@@ -184,6 +184,10 @@ export async function runProgram(
   // filesystem is, and a guest that opens /dev/gex-gl and does not find it
   // concludes the machine has no graphics.
   if (gl) gex.useGl(gl);
+  // Likewise, and for a sharper reason: the vtest socket is bound while the
+  // guest's namespace is built, and Mesa connecting to a socket nobody serves
+  // does not fail -- it writes into the dead descriptor and waits forever.
+  if (virgl) gex.useVirgl(virgl);
   const entry = await gex.load(shimBytes, seedBytes, elf, files, args, { cwd, tty, uid });
   if (!entry) throw new Error('the program could not be loaded');
   if (gex.shim.exports.gex_set_winsize) {

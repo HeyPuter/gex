@@ -380,4 +380,117 @@ const gears = {
   },
 };
 
-export const DEMOS = [upload, busybox, debian, gears];
+// -- 5: the real gears ----------------------------------------------------
+
+const virglGears = {
+  id: 'virgl',
+  title: 'Debian glxgears, on real Mesa',
+  blurb:
+    "The unmodified aarch64 `glxgears` Debian ships, against Debian's own Mesa, with an X " +
+    'server beside it. Nothing is marshalled at the API: the guest runs a real graphics driver, ' +
+    'and what reads its command stream is virglrenderer, compiled to wasm, on this page.',
+  network: false,
+
+  async enter(ctx) {
+    const wrap = document.createElement('div');
+    wrap.className = 'canvas-wrap';
+    const canvas = document.createElement('canvas');
+    canvas.width = 300;
+    canvas.height = 300;
+    wrap.append(canvas);
+    document.getElementById('terminal')?.before(wrap);
+    ctx.onLeave(() => wrap.remove());
+
+    ctx.term.writeln('The other GL demo splits at the API: the guest links against libGLESv2');
+    ctx.term.writeln('and libEGL that are marshallers, and every call crosses to this page.');
+    ctx.term.writeln('');
+    ctx.term.writeln(ctx.ansi.dim('This one does not split at all. The guest loads Mesa, Mesa'));
+    ctx.term.writeln(ctx.ansi.dim("picks its `virgl` Gallium driver, and that driver writes the"));
+    ctx.term.writeln(ctx.ansi.dim('virtio-gpu command stream it would write to a real GPU. The'));
+    ctx.term.writeln(ctx.ansi.dim('thing on the other end is virglrenderer -- the same C that runs'));
+    ctx.term.writeln(ctx.ansi.dim('on a host, built to WebAssembly, pointed at WebGL 2.'));
+    ctx.term.writeln('');
+    ctx.term.writeln(ctx.ansi.dim('The guest is not told where its GPU is. It looks for a socket,'));
+    ctx.term.writeln(ctx.ansi.dim('asks what the far side can do, and gets an answer from this'));
+    ctx.term.writeln(ctx.ansi.dim('browser. On a host that answer is capability set version 2;'));
+    ctx.term.writeln(ctx.ansi.dim('here it is version 1, because WebGL 2 is GLES 3.0 and has no'));
+    ctx.term.writeln(ctx.ansi.dim('compute or geometry shaders. Mesa falls back to match.'));
+    ctx.term.writeln('');
+    ctx.term.writeln(
+      ctx.ansi.dim('It is slow to start. Every basic block of Mesa, libGL, libX11 and'),
+    );
+    ctx.term.writeln(
+      ctx.ansi.dim('the X server is translated on the way past, and there are a lot.'),
+    );
+    ctx.term.writeln('');
+
+    const start = async (seconds) => {
+      ctx.actions([]);
+      running(true);
+      const t0 = performance.now();
+      let renderer = null;
+      try {
+        ctx.busy('loading the renderer');
+        const { VirglRenderer } = await import('./virgl.js');
+        renderer = await VirglRenderer.create(canvas, '/gex/gexvirgl.mjs');
+        if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
+        ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
+        ctx.term.writeln('');
+
+        const tree = await ctx.rootfs('/rootfs/graphics.tar');
+        const files = { ...tree.files };
+        for (const [path, target] of Object.entries(tree.links)) {
+          const abs = target.startsWith('/')
+            ? target
+            : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+          if (files[abs]) files[path] = files[abs];
+        }
+        // The loader passes no environment, so the bound is written into a
+        // script rather than exported around one.
+        files['/run.sh'] = new TextEncoder().encode(
+          `GEARS_SECONDS=${seconds}\nexport GEARS_SECONDS\n. /gears.sh\n`,
+        );
+
+        ctx.idle();
+        rule(ctx, `graphics rootfs — ${Object.keys(files).length} files`);
+        ctx.status('running');
+        const { status } = await ctx.runProgram(ctx.term, {
+          elf: files['/bin/sh'],
+          files,
+          args: ['/bin/sh', '/run.sh'],
+          cwd: '/',
+          tty: true,
+          uid: 0,
+          virgl: renderer,
+        });
+        const ms = (performance.now() - t0).toFixed(0);
+        ctx.term.writeln('');
+        rule(ctx, `exit ${status} in ${ms} ms`);
+        // `presented` is the honest number. vtest has no present -- the X
+        // server reads its pixels back and never looks at a screen -- so a
+        // run can draw perfectly with a blank canvas, and this says which
+        // happened.
+        ctx.term.writeln(ctx.ansi.dim(`  ${renderer.glState()}`));
+        ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
+      } catch (e) {
+        ctx.term.writeln(ctx.ansi.red(`\r\n${e.message}`));
+        ctx.status(e.message, 'bad');
+      } finally {
+        running(false);
+        ctx.idle();
+        ctx.actions([
+          { label: 'Draw for 30s', primary: true, onClick: () => start(30) },
+          { label: 'Draw for 2 minutes', onClick: () => start(120) },
+        ]);
+      }
+    };
+
+    ctx.actions([
+      { label: 'Draw for 30s', primary: true, onClick: () => start(30) },
+      { label: 'Draw for 2 minutes', onClick: () => start(120) },
+    ]);
+    ctx.hint('Xvfb and glxgears, as Debian built them');
+  },
+};
+
+export const DEMOS = [upload, busybox, debian, gears, virglGears];

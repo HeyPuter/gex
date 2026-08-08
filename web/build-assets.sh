@@ -57,6 +57,27 @@ echo "building the seed module..."
 cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc >/dev/null 2>&1
 "$ROOT/target/release/gexc" seed -o "$PUB/gex/seed.wasm" --no-shared-memory
 
+# -- virglrenderer, for the guest's own Mesa -------------------------------
+#
+# The other GL demo splits at the API: the guest links against libGLESv2
+# marshallers that forward each call to the page. This one does not split at
+# all. The guest runs Debian's Mesa, Mesa's `virgl` Gallium driver writes the
+# virtio-gpu command stream it would write to a real GPU, and the thing that
+# reads it is virglrenderer -- the same C, compiled to wasm, with WebGL 2
+# where its GL binding used to be.
+#
+# Built by `web/build-virgl-wasm.sh`, which wants emscripten and about ten
+# minutes. Copied here when it has been, skipped when it has not, because
+# every other demo on the page must keep building without it.
+VIRGL_BUILD="${GEX_VIRGL_WASM:-${TMPDIR:-/tmp}/gex-virgl-wasm}"
+if [ -f "$VIRGL_BUILD/gexvirgl.wasm" ]; then
+    echo "copying the virgl renderer..."
+    cp "$VIRGL_BUILD/gexvirgl.wasm" "$VIRGL_BUILD/gexvirgl.mjs" "$PUB/gex/"
+    echo "  $(du -h "$PUB/gex/gexvirgl.wasm" | cut -f1) of renderer"
+else
+    echo "no virgl renderer -- run web/build-virgl-wasm.sh to build one"
+fi
+
 # -- busybox rootfs --------------------------------------------------------
 
 BB="$WORK/busybox"
@@ -119,6 +140,15 @@ if [ "${1-}" = "--debian" ]; then
     "$HERE/build-debian.sh" "$PUB/rootfs/debian.tar"
 elif [ ! -f "$PUB/rootfs/debian.tar" ]; then
     echo "no debian rootfs -- run web/build-assets.sh --debian to fetch one"
+fi
+
+# -- the graphics rootfs, for the Mesa demo --------------------------------
+#
+# Debian's own glxgears and Xvfb, and the Mesa they link against. Built from
+# the same tree `tests/opengl-in-guest.sh` uses, which is not fetched by
+# default -- so this is skipped rather than failed when it is absent.
+if [ -x "$HERE/build-graphics-rootfs.sh" ]; then
+    "$HERE/build-graphics-rootfs.sh" "$PUB/rootfs/graphics.tar"
 fi
 
 # -- the gears, and the GL driver it links against -------------------------

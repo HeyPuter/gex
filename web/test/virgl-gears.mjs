@@ -1,0 +1,241 @@
+// Debian's glxgears, drawing on WebGL 2, in a headless browser.
+//
+//   node web/test/virgl-gears.mjs
+//
+// `virgl-guest.mjs` proved the negotiation: a translated aarch64 program
+// asked a page what its GPU could do and got an answer from WebGL 2 rather
+// than from a recording. That is the handshake and only the handshake --
+// nothing had ever been drawn through it.
+//
+// This is the drawing. The guest is Debian's own aarch64 `glxgears` against
+// Debian's own Mesa, with an `Xvfb` beside it, all of it translated in the
+// page. Mesa's `virgl` Gallium driver writes the command stream it would
+// write to a real GPU, and virglrenderer -- compiled to wasm -- executes it
+// on the canvas.
+//
+// Two things have to be true for this to pass, and they fail differently:
+//
+//   * glxgears prints a frame rate. That means Mesa completed frames and got
+//     its pixels back, which is the whole guest half of the chain.
+//   * the renderer reports having presented. TRANSFER_GET is a readback, not
+//     a present, so a guest can render perfectly and leave the canvas black
+//     forever; `presented` counts the blits that put a frame on it.
+//
+// It is slow. A cold run translates Mesa, an X server and glibc through the
+// runtime translator, and that is minutes rather than seconds -- which is
+// exactly the argument for the static recompiler, and is why the budget
+// below is what it is.
+import { spawn } from 'node:child_process';
+import { mkdtemp, writeFile, rm, copyFile, access, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createServer } from 'node:http';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(HERE, '..', '..');
+const BUILD = process.env.GEX_VIRGL_WASM || join(tmpdir(), 'gex-virgl-wasm');
+const CHROME = process.env.CHROME || '/usr/bin/chromium';
+const TAR = process.env.GEX_GRAPHICS_TAR || join(ROOT, 'web/public/rootfs/graphics.tar');
+const SECONDS = process.env.GEX_GEARS_SECONDS || '25';
+
+const exists = async (p) => access(p).then(() => true, () => false);
+const skip = (why) => {
+  console.log(`skip: ${why}`);
+  process.exit(0);
+};
+
+if (!(await exists(join(BUILD, 'gexvirgl.mjs')))) skip(`no renderer at ${BUILD}`);
+if (!(await exists(CHROME))) skip(`no browser at ${CHROME}`);
+if (!(await exists(TAR))) skip(`no graphics rootfs at ${TAR} (web/build-graphics-rootfs.sh)`);
+const shim = join(ROOT, 'target/wasm32-unknown-unknown/release/gex_browser.wasm');
+const seed = join(ROOT, 'web/public/gex/seed.wasm');
+if (!(await exists(shim))) skip('no browser shim (run shims/browser/build.sh)');
+if (!(await exists(seed))) skip('no seed module (run web/build-assets.sh)');
+
+const dir = await mkdtemp(join(tmpdir(), 'gex-virgl-gears-'));
+for (const [from, to] of [
+  [join(BUILD, 'gexvirgl.mjs'), 'gexvirgl.mjs'],
+  [join(BUILD, 'gexvirgl.wasm'), 'gexvirgl.wasm'],
+  [shim, 'shim.wasm'],
+  [seed, 'seed.wasm'],
+  [TAR, 'graphics.tar'],
+  [join(ROOT, 'shims/browser/js/gex.mjs'), 'gex.mjs'],
+  [join(ROOT, 'web/src/virgl.js'), 'virgl.js'],
+  [join(ROOT, 'web/src/tar.js'), 'tar.js'],
+]) {
+  await copyFile(from, join(dir, to));
+}
+
+await writeFile(
+  join(dir, 'index.html'),
+  `<!doctype html><meta charset=utf-8><title>pending</title>
+<canvas id="gex-gl" width="300" height="300"></canvas>
+<pre id="out">pending</pre>
+<script type="module">
+const SECONDS = '__SECONDS__';
+import { Gex, Env } from './gex.mjs';
+import { VirglRenderer } from './virgl.js';
+import { untar } from './tar.js';
+const el = document.getElementById('out');
+let output = '';
+let step = 'start';
+const paint = () => { el.textContent = 'at ' + step + '\\n' + output; };
+const mark = (s) => { step = s; paint(); };
+const say = (s) => { el.textContent = s; document.title = s.split('\\n')[0]; };
+addEventListener('error', (e) => say('ERROR at ' + step + ': ' + (e.message || e)));
+addEventListener('unhandledrejection', (e) =>
+  say('REJECTED at ' + step + ': ' + (e.reason?.message || e.reason)));
+
+class PageEnv extends Env {
+  write(fd, bytes) { output += new TextDecoder().decode(bytes); paint(); }
+  now() { return BigInt(Date.now()) * 1000000n; }
+}
+
+try {
+  mark('creating the renderer');
+  const renderer = await VirglRenderer.create(document.getElementById('gex-gl'),
+                                              './gexvirgl.mjs');
+  if (!renderer.ok) { say('RENDERER FAILED: ' + renderer.error); throw 0; }
+
+  mark('unpacking the rootfs');
+  const grab = async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer());
+  const tarBytes = await grab('./graphics.tar');
+  const tree = untar(tarBytes.buffer.slice(tarBytes.byteOffset,
+                                           tarBytes.byteOffset + tarBytes.byteLength));
+  const files = { ...tree.files };
+  for (const [path, target] of Object.entries(tree.links)) {
+    const abs = target.startsWith('/')
+      ? target
+      : (path.slice(0, path.lastIndexOf('/')) + '/' + target).replace(/\\/{2,}/g, '/');
+    if (files[abs]) files[path] = files[abs];
+  }
+  // The browser loader has no way to pass an environment, so the bound is
+  // written into a script instead of exported around one.
+  files['/run.sh'] = new TextEncoder().encode(
+    'GEARS_SECONDS=' + SECONDS + '\\nexport GEARS_SECONDS\\n. /gears.sh\\n');
+  output += Object.keys(files).length + ' files in the image\\n';
+
+  const gex = new Gex(new PageEnv());
+  gex.useVirgl(renderer, false);
+  mark('loading the guest');
+  const entry = await gex.load(
+    await grab('./shim.wasm'), await grab('./seed.wasm'), files['/bin/sh'],
+    files, ['/bin/sh', '/run.sh'], { uid: 0, gid: 0, cwd: '/' });
+  mark('running the guest');
+  // A sample every few seconds, into the same element. A run that does not
+  // finish inside the budget is dumped where it stands, and without this the
+  // page says only "at running the guest" -- which is true of a guest that
+  // has drawn a thousand frames and of one that never opened the socket.
+  const post = (kind, body) =>
+    fetch('/report?kind=' + kind, { method: 'POST', body }).catch(() => {});
+  const t0 = Date.now();
+  const sampler = setInterval(() => {
+    post('progress', ((Date.now() - t0) / 1000).toFixed(0) + 's ' + renderer.glState() +
+      '\\n' + output.trim());
+  }, 10000);
+  const status = await gex.run(entry).finally(() => clearInterval(sampler));
+  const result = 'EXIT ' + status + '\\n' + output.trim() +
+      '\\nrenderer: ' + renderer.describe() +
+      '\\nstate: ' + renderer.glState();
+  say(result);
+  await post('done', result);
+} catch (e) {
+  if (e !== 0) {
+    const result = 'THREW ' + (e?.message || String(e)) + '\\n' + output.trim();
+    say(result);
+    await fetch('/report?kind=done', { method: 'POST', body: result }).catch(() => {});
+  }
+}
+</script>`.replace('__SECONDS__', SECONDS),
+);
+
+let finish;
+const finished = new Promise((r) => (finish = r));
+const server = createServer(async (req, res) => {
+  const name = (req.url === '/' ? '/index.html' : req.url).split('?')[0];
+  // The page reports rather than being dumped. `--virtual-time-budget` was
+  // the wrong tool: it advances the clock for every timer, so a five-second
+  // sampler burned 1,750 seconds of a half-hour budget in two minutes of real
+  // time and the browser was killed with the X server still starting. Real
+  // time and a report make the run as long as it needs to be, and say where
+  // it is while it lasts.
+  if (name === '/report') {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const body = Buffer.concat(chunks).toString();
+    const kind = new URL(req.url, 'http://x').searchParams.get('kind');
+    if (kind === 'progress') {
+      if (!process.env.GEX_QUIET) console.log(`     ... ${body.split('\n')[0]}`);
+    } else {
+      finish(body);
+    }
+    res.writeHead(204).end();
+    return;
+  }
+  try {
+    const body = await readFile(join(dir, name));
+    const type = name.endsWith('.wasm')
+      ? 'application/wasm'
+      : /\.(mjs|js)$/.test(name)
+        ? 'text/javascript'
+        : name.endsWith('.tar')
+          ? 'application/x-tar'
+          : 'text/html';
+    res.writeHead(200, { 'content-type': type });
+    res.end(body);
+  } catch {
+    res.writeHead(404).end();
+  }
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+
+const child = spawn(
+  CHROME,
+  [
+    '--headless',
+    '--no-sandbox',
+    '--disable-gpu-sandbox',
+    '--enable-unsafe-swiftshader',
+    url,
+  ],
+  { stdio: ['ignore', 'pipe', 'pipe'] },
+);
+let err = '';
+child.stderr.on('data', (d) => (err += d));
+
+const WALL = Number(process.env.GEX_WALL || 3600) * 1000;
+const said = await Promise.race([
+  finished,
+  new Promise((r) => setTimeout(() => r(null), WALL)),
+]);
+child.kill('SIGKILL');
+server.close();
+await rm(dir, { recursive: true, force: true });
+
+if (said === null) {
+  console.log(`FAIL virgl-gears: nothing reported in ${WALL / 1000}s`);
+  console.log(err.split('\n').filter((l) => l && !l.includes('Fontconfig')).slice(-10)
+    .map((l) => `     ${l}`).join('\n'));
+  process.exit(1);
+}
+const dom = { err };
+
+console.log(said.split('\n').map((l) => `     ${l}`).join('\n'));
+
+const drew = /frames in .* seconds/.test(said);
+const presented = Number(/presented=(\d+)/.exec(said)?.[1] || 0);
+if (drew && presented > 0) {
+  console.log(`ok   virgl-gears (glxgears drew, and ${presented} frames reached the canvas)`);
+  process.exit(0);
+}
+console.log(
+  `FAIL virgl-gears: ${drew ? 'glxgears drew' : 'glxgears never reported a frame rate'}` +
+    `, ${presented} frames reached the canvas`,
+);
+console.log(
+  dom.err.split('\n').filter((l) => l && !l.includes('Fontconfig')).slice(-15)
+    .map((l) => `     ${l}`).join('\n'),
+);
+process.exit(1);

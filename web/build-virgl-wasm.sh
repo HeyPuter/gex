@@ -48,6 +48,9 @@ EMSDK="${EMSDK:-$HOME/emsdk}"
 # 1.0.0 is the last release before the build grew a hard Vulkan dependency.
 VIRGL_TAG="${VIRGL_TAG:-virglrenderer-1.0.0}"
 
+# `pip install --user` puts them here and nothing adds it to a non-login
+# shell's PATH, so the script reported meson missing on a machine that had it.
+PATH="$HOME/.local/bin:$PATH"
 command -v meson >/dev/null 2>&1 || { echo "need meson (pip install meson ninja)"; exit 1; }
 [ -f "$EMSDK/emsdk_env.sh" ] || { echo "no emscripten at $EMSDK"; exit 1; }
 # shellcheck disable=SC1091
