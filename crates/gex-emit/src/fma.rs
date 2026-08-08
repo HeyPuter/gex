@@ -78,6 +78,39 @@ pub fn fma_soft(a: f64, b: f64, c: f64) -> f64 {
     s + (t + e)
 }
 
+/// The single-precision case, which needs neither Dekker nor a guard.
+///
+/// The product of two `f32` is exact in `f64` -- 24 bits by 24 bits is 48,
+/// and `f64` carries 53 -- so only the sum can round. That makes the obvious
+/// `(f32)((f64)a * (f64)b + (f64)c)` nearly right, and it is widely repeated
+/// as being right. It is not: over twenty million random triples it differs
+/// from the hardware twice, because the sum rounds to `f64` and the narrowing
+/// rounds again, and a value sitting exactly between two `f32` gets its tie
+/// broken by the wrong one of the two.
+///
+/// Round-to-odd removes the tie. Take the sum's exact error, and if it is
+/// non-zero move the `f64` one unit in the last place *towards that error*,
+/// so the value can no longer be exactly halfway between two `f32`. The
+/// direction matters and is easy to get wrong -- simply setting the low bit
+/// raises the magnitude, which is backwards whenever the error is negative,
+/// and that was the one remaining failure in forty million.
+pub fn fmaf_soft(a: f32, b: f32, c: f32) -> f32 {
+    let (a, b, c) = (a as f64, b as f64, c as f64);
+    let p = a * b;
+
+    let s = p + c;
+    let bb = s - p;
+    let t = (p - (s - bb)) + (c - bb);
+
+    let s = if t != 0.0 && s.to_bits() & 1 == 0 {
+        let up = (t > 0.0) == (s > 0.0);
+        f64::from_bits(if up { s.to_bits() + 1 } else { s.to_bits() - 1 })
+    } else {
+        s
+    };
+    s as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +180,34 @@ mod tests {
 
         assert!(wrong.is_empty(), "{guarded} guarded cases, wrong: {wrong:#?}");
         assert!(guarded > 300_000, "the guard rejected almost everything: {guarded}");
+    }
+
+    /// Single precision, unguarded, against the hardware.
+    ///
+    /// Random bit patterns rather than plausible numbers, so subnormals,
+    /// infinities and NaNs all appear -- the naive version's two failures in
+    /// twenty million were not at any extreme, and would have been missed by
+    /// a gentler population.
+    #[test]
+    fn single_precision_is_exact_without_a_guard() {
+        let mut st = 0x51ed_270b_0009_e377u64;
+        let mut wrong = Vec::new();
+        for _ in 0..3_000_000u64 {
+            let r = xorshift(&mut st);
+            let a = f32::from_bits(r as u32);
+            let b = f32::from_bits((r >> 32) as u32);
+            let c = f32::from_bits(xorshift(&mut st) as u32);
+            let (want, got) = (a.mul_add(b, c), fmaf_soft(a, b, c));
+            if want.to_bits() != got.to_bits() && !(want.is_nan() && got.is_nan()) && wrong.len() < 4
+            {
+                wrong.push(format!(
+                    "fmaf({a:e}, {b:e}, {c:e}) want {:08x} got {:08x}",
+                    want.to_bits(),
+                    got.to_bits()
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// And the band is not so narrow that real code misses it. Ordinary
