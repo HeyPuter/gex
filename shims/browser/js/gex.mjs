@@ -92,9 +92,15 @@ export class Gex {
    * time. Processes still never share memory with each other; that is what
    * keeps two of them from putting libraries at the same addresses.
    */
-  constructor(env = new Env(), { shared = false } = {}) {
+  constructor(env = new Env(), { shared = false, memory = null } = {}) {
     this.#env = env;
-    this.#memory = new WebAssembly.Memory({ initial: PAGES, maximum: PAGES, shared });
+    // `memory` adopts a process's existing address space rather than making
+    // one. That is what a *thread* is here: a second Worker on the memory a
+    // process already has, seeing the same guest and -- because the shim's own
+    // state lives in that memory too -- the same kernel, the same file table,
+    // the same everything. A new memory would be a new process.
+    this.#memory =
+      memory ?? new WebAssembly.Memory({ initial: PAGES, maximum: PAGES, shared });
   }
 
   get memory() { return this.#memory; }
@@ -117,19 +123,17 @@ export class Gex {
     return this.#u8.slice(at, at + len);
   }
 
+
   /**
-   * `shimWasm` is shims/browser's build output, `guestWasm` a module from
-   * `gexc build --exhaustive --no-shared-memory`, `elf` the program's bytes.
+   * Everything the shim asks of JS: the console, the clock, the network and
+   * the two graphics paths.
    *
-   * `files` is a map of guest path to contents. A browser has no filesystem to
-   * pass through to, so whatever the program needs to read is bundled here.
+   * A method rather than an inline object because `attach` needs the same set
+   * -- a thread's Worker instantiates the same shim and must supply the same
+   * imports, or it will not link.
    */
-  async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
-    const shimMod = await WebAssembly.compile(shimWasm);
-    this.#shim = await WebAssembly.instantiate(shimMod, {
-      env: { memory: this.#memory },
-      // The shim asks JS for exactly the two things wasm has no way to do.
-      gex_env: {
+  #hostImports() {
+    return {
         write: (fd, ptr, len) =>
           this.#env.write(fd, this.#u8.subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0))),
         now: () => this.#env.now(),
@@ -175,7 +179,22 @@ export class Gex {
             ? this.#virgl.take(session >>> 0, this.#memory, ptr >>> 0, max >>> 0)
             : 0,
         virgl_close: (session) => this.#virgl?.close(session >>> 0),
-      },
+    };
+  }
+
+  /**
+   * `shimWasm` is shims/browser's build output, `guestWasm` a module from
+   * `gexc build --exhaustive --no-shared-memory`, `elf` the program's bytes.
+   *
+   * `files` is a map of guest path to contents. A browser has no filesystem to
+   * pass through to, so whatever the program needs to read is bundled here.
+   */
+  async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
+    const shimMod = await WebAssembly.compile(shimWasm);
+    this.#shim = await WebAssembly.instantiate(shimMod, {
+      env: { memory: this.#memory },
+      // The shim asks JS for exactly the two things wasm has no way to do.
+      gex_env: this.#hostImports(),
     });
     this.#u8 = new Uint8Array(this.#memory.buffer);
     // A shim older than this file still loads and still instantiates, and
@@ -284,6 +303,50 @@ export class Gex {
       gex: this.#imports,
     });
     return entry;
+  }
+
+  /**
+   * Join a process that is already loaded, as one of its threads.
+   *
+   * The counterpart of `load`: same memory, same shim, same guest module, but
+   * no program is placed and no kernel is built. Both already exist, in the
+   * memory this Worker just adopted -- the shim's heap and its statics live
+   * there, so the `Host` that owns the file table is simply *there* to find.
+   *
+   * Instantiating a second time is safe, and only because of how the shared
+   * build is linked: `--shared-memory` makes wasm-ld emit passive data
+   * segments and an `__wasm_init_memory` guarded by an atomic, so the first
+   * instance initialises the module's data and later ones leave it alone.
+   * Against a plain memory those segments are active and a second
+   * instantiation would quietly wipe the first thread's kernel.
+   */
+  async attach(shimWasm, guestWasm) {
+    this.#shim = await WebAssembly.instantiate(await WebAssembly.compile(shimWasm), {
+      env: { memory: this.#memory },
+      gex_env: this.#hostImports(),
+    });
+    this.#u8 = new Uint8Array(this.#memory.buffer);
+    // The shim's stack pointer is a mutable *global*, which belongs to the
+    // instance rather than to the memory -- so every Worker has its own and
+    // every Worker has to be told where it goes. Two threads sharing one stack
+    // is the thing this design exists to avoid.
+    this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
+    const e = this.#shim.exports;
+    this.#imports = {
+      memory: this.#memory,
+      syscall: e.gex_syscall,
+      dispatch_miss: e.gex_dispatch_miss,
+      illegal: e.gex_illegal,
+      breakpoint: e.gex_breakpoint,
+      sysreg_read: e.gex_sysreg_read,
+      sysreg_write: e.gex_sysreg_write,
+      cache_op: e.gex_cache_op,
+      safepoint: e.gex_safepoint,
+      fma: e.gex_fma,
+    };
+    this.#guest = await WebAssembly.instantiate(await WebAssembly.compile(guestWasm), {
+      gex: this.#imports,
+    });
   }
 
   /**

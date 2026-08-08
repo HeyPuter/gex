@@ -1147,6 +1147,28 @@ else
     echo "skip kernel-shared: no node, or shims/kernel/build.sh has not been run"
 fi
 
+# Two Workers on one process's memory, which is what a thread is here. The
+# claim under test is that they share a *kernel*: the shim's heap and statics
+# live in that memory, so a file one thread opens is open in the other. It is
+# only true because `HOST` stopped being a thread-local -- with `+atomics`
+# each Worker gets its own TLS block, so a thread-local kernel is a silent
+# fork and every file one thread opened would be missing from the other.
+if [ -n "$NODE" ] && [ -f target/wasm32-unknown-unknown/release/gex_browser.shared.wasm ] \
+    && [ -f web/public/gex/seed.shared.wasm ] && [ -x "$WORK/flags" ]; then
+    out=$("$NODE" web/test/threads-shared.mjs "$WORK/flags" 2>&1 || true)
+    case "$out" in
+        ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
+        skip*) echo "$out" | head -1 ;;
+        *)
+            echo "FAIL threads-shared: two Workers on one memory do not share a kernel"
+            echo "$out" | sed 's/^/     /' | head -6
+            fail=$((fail + 1))
+            ;;
+    esac
+else
+    echo "skip threads-shared: no node, or no shared-memory build"
+fi
+
 # The demo page's terminal. Not a translation test: it checks the seam above
 # the runtime, where a keystroke has to travel from an xterm through the line
 # discipline into a parked guest read. That seam broke once without any test
