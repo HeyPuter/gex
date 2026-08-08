@@ -749,6 +749,79 @@ pub extern "C" fn gex_host_recv(handle: i32, ptr: u32, max: u32) -> i32 {
     s.recv(out, 0, false).map(|n| n as i32).unwrap_or(0)
 }
 
+/// A socket the host serves, whose accepted connections JS collects.
+///
+/// The other half of [`gex_host_connect`], and the one that makes two guest
+/// processes in two Workers able to talk. Each Worker has its own kernel and
+/// its own filesystem -- that is the point of the design -- so a client in
+/// one cannot see a socket a server bound in the other. What crosses is the
+/// stream: the client's Worker serves the path, the host accepts, and the
+/// host also connects into the server's Worker with `gex_host_connect`. Two
+/// handles, and JS moves bytes between them.
+#[derive(Default, Debug)]
+struct JsListener {
+    accepted: std::sync::Mutex<Vec<Arc<gex_kernel::unix::UnixSocket>>>,
+}
+
+impl gex_kernel::unix::HostListener for JsListener {
+    fn accept(&self, peer: Arc<gex_kernel::unix::UnixSocket>) {
+        self.accepted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(peer);
+    }
+}
+
+static HOST_LISTENERS: SingleThreaded<Vec<Arc<JsListener>>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
+
+/// Serve a unix socket at `path` from the host. Returns a listener id.
+///
+/// A guest connecting to it succeeds immediately; the connection waits in
+/// this listener until [`gex_host_accept`] takes it.
+#[no_mangle]
+pub extern "C" fn gex_host_bind(path: u32, path_len: u32) -> i32 {
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return -1;
+    };
+    let listener = Arc::new(JsListener::default());
+    with_host(|h| {
+        h.kernel.socket_names.bind_host(
+            name,
+            Arc::clone(&listener) as Arc<dyn gex_kernel::unix::HostListener>,
+        );
+        // Not made visible to `stat`: the tmpfs root is only in scope at
+        // load time, which is where the virtio-gpu socket gets its entry. A
+        // client that connects straight to the path is served; one that
+        // checks the path exists first -- Xlib does -- will need the same
+        // treatment, and that wants the root threaded through to here.
+    });
+    let mut table = HOST_LISTENERS.0.borrow_mut();
+    table.push(listener);
+    (table.len() - 1) as i32
+}
+
+/// Take one waiting connection, as a handle for [`gex_host_send`] and
+/// [`gex_host_recv`]. -1 when nothing is waiting.
+#[no_mangle]
+pub extern "C" fn gex_host_accept(listener: i32) -> i32 {
+    let l = HOST_LISTENERS
+        .0
+        .borrow()
+        .get(listener.max(0) as usize)
+        .cloned();
+    let Some(l) = l else { return -1 };
+    let sock = l
+        .accepted
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop();
+    let Some(sock) = sock else { return -1 };
+    let mut table = HOST_SOCKETS.0.borrow_mut();
+    table.push(sock);
+    (table.len() - 1) as i32
+}
+
 /// How many regions of guest memory this process actually owns.
 ///
 /// A process's world is two gigabytes of address space and a few hundred
