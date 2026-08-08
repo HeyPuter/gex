@@ -231,6 +231,17 @@ pub mod imports {
     /// `brk #imm`. Signature `(ctx: i32, pc: i64, imm: i32) -> ()`.
     pub const BREAKPOINT: &str = "breakpoint";
 
+    /// Not a `brk` at all: the stack-pointer check reporting a wild `sp`.
+    ///
+    /// Reuses the breakpoint import rather than adding one, so a shim built
+    /// before the check existed still links. A guest `brk` immediate is 16
+    /// bits unsigned, so a negative value cannot be one and the host can tell
+    /// the two apart without ambiguity.
+    ///
+    /// See `tier1::emit_sp_check`, and #73, where a corrupt `sp` surfaced as
+    /// a fault in an innocent function's prologue several calls later.
+    pub const BRK_BAD_SP: i32 = -1;
+
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
     pub const SYSREG_READ: &str = "sysreg_read";

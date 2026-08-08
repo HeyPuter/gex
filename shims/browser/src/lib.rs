@@ -2960,7 +2960,39 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     trap();
 }
 #[no_mangle]
-pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, _raw: i32) {
+pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
+    // The stack-pointer check borrows this import rather than adding one, so
+    // a shim built before the check existed still links. It is worth saying
+    // which object the block is in: the whole point of the check is that the
+    // block that *writes* a bad `sp` is somewhere else entirely from the one
+    // that dies on it, and naming the library is most of finding it.
+    if raw == gex_abi::imports::BRK_BAD_SP {
+        let line = with_host(|h| {
+            let gm = GuestMem::new(guest_bytes());
+            let c = h.threads[h.current].kstate.ctx_addr;
+            let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+            let x30 = gm.read_u64(c + ctx::x(30) as u64).unwrap_or(0);
+            // `x30` is the link register, so it names whoever called into
+            // this block -- which, for a block reached by `ret`, is the last
+            // place the guest was somewhere sane.
+            let object = |a: u64| {
+                h.kernel
+                    .mem
+                    .vmas()
+                    .iter()
+                    .find(|v| a >= v.start && a < v.end)
+                    .map_or(String::new(), |v| format!(" in {} +{:#x}", v.name, a - v.start))
+            };
+            format!(
+                "gex: wild sp {sp:#x} on entry to {pc:#x}{}, x30={x30:#x}{}\n",
+                object(pc as u64),
+                object(x30),
+            )
+        });
+        trace_line(&line);
+        with_host(|h| h.exit = Some(128 + 11));
+        trap();
+    }
     trace_line(&format!("gex: breakpoint at pc={pc:#x}\n"));
     with_host(|h| h.exit = Some(128 + 5));
     trap();
@@ -3826,6 +3858,22 @@ static mut TRACE_MISSES: bool = false;
 #[no_mangle]
 pub extern "C" fn gex_set_trace_misses(on: i32) {
     unsafe { TRACE_MISSES = on != 0 };
+}
+
+/// Check the guest's stack pointer on entry to every block translated after
+/// this, and stop at the first one that has a wild one.
+///
+/// The native side reads `GEX_CHECK_SP` from the environment; a page has no
+/// environment, so it says so here instead. Only blocks translated afterwards
+/// carry the check -- turning it on partway through a run leaves everything
+/// already in the dispatch table unchecked, which is usually what is wanted:
+/// it keeps the check off the startup path and on the object under suspicion.
+///
+/// Costs a load, a compare and a never-taken branch per block, so it is for
+/// finding a bug rather than for shipping.
+#[no_mangle]
+pub extern "C" fn gex_set_check_sp(on: i32) {
+    gex_xlate::set_check_sp(on != 0);
 }
 
 /// Ask for a heartbeat every `every` safepoints.

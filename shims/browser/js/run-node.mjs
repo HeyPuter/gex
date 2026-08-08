@@ -155,6 +155,15 @@ if (process.env.GEX_HEARTBEAT) {
 if (process.env.GEX_TRACE_MISSES) {
   gex.shim.exports.gex_set_trace_misses?.(1);
 }
+// GEX_CHECK_SP puts a stack-pointer check at the top of every block the shim
+// translates from here on. A corrupt `sp` is invisible until something
+// dereferences it, and by then the guest is deep inside an innocent function
+// -- #73 ends in an ordinary prologue faulting on its own first store. This
+// names the block that arrives with the bad value instead of the one that
+// dies on it.
+if (process.env.GEX_CHECK_SP) {
+  gex.shim.exports.gex_set_check_sp?.(1);
+}
 if (process.env.GEX_RECOMPILE_OBJECTS) {
   // The value is a cap in KiB of mapped text. Eight megabytes is not a
   // principled number -- it is the largest that works: every one of the 57

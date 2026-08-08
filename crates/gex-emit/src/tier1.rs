@@ -123,12 +123,39 @@ fn region_limit() -> usize {
     })
 }
 
+/// Whether every block should check the guest's stack pointer on entry.
+///
+/// Off unless asked for: `GEX_CHECK_SP=1` natively, or `gex_set_check_sp(1)`
+/// in the browser, where there is no environment to read. Costs a load, a
+/// compare and a never-taken branch per block.
+///
+/// It exists because a corrupt `sp` is invisible until something dereferences
+/// it, and by then the guest is deep inside an innocent function. #73 ends in
+/// `stp x29, x30, [sp, #-32]!` -- a perfectly ordinary prologue, faulting on
+/// its own first store because control reached it with `sp` already wild. The
+/// address in the crash names the victim; this names the writer.
+static CHECK_SP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the stack-pointer check on or off for blocks compiled after this.
+pub fn set_check_sp(on: bool) {
+    CHECK_SP.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn check_sp() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var_os("GEX_CHECK_SP").is_some())
+        || CHECK_SP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Compile one GIR block into a wasm function body.
 ///
 /// When the block heads a loop, the loop's other blocks come with it: see
 /// [`Emitter::run_region`].
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx);
+    if check_sp() {
+        e.emit_sp_check(block.start);
+    }
     match crate::region::grow(block.start, cx.gir, region_limit()) {
         Some(region) if region_limit() > 1 => {
             if std::env::var_os("GEX_REGION_DEBUG").is_some() {
@@ -608,6 +635,43 @@ impl<'a> Emitter<'a> {
     }
 
     /// The local holding `r`, loading it from the context on first use.
+    /// Trap into the host if the guest's stack pointer is not a stack address.
+    ///
+    /// Emitted before anything else in the body, so the value tested is what
+    /// the *previous* block left behind rather than anything this one did.
+    ///
+    ///     local.get ctx
+    ///     i64.load  offset=SP
+    ///     i64.const STACK_TOP
+    ///     i64.ge_u                 ; unsigned: a negative sp is a huge one
+    ///     if
+    ///       local.get ctx
+    ///       i64.const <this block's guest address>
+    ///       i32.const BRK_BAD_SP
+    ///       call      breakpoint
+    ///     end
+    ///
+    /// One bound, not two. Above `STACK_TOP` is the shim's own world and no
+    /// guest `sp` is ever there, which catches a wild value however it went
+    /// wrong; a lower bound would have to know where this thread's stack was
+    /// mapped, and the emitter does not and should not.
+    ///
+    /// The register cache is untouched on purpose -- this reads the context
+    /// directly rather than through `reg_local`, so it cannot make the body
+    /// that follows believe `sp` is already in a local.
+    fn emit_sp_check(&mut self, pc: u64) {
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x29, 3, ctx::SP as u32);
+        self.f.i64_const(gex_abi::STACK_TOP as i64);
+        self.f.byte(0x5a); // i64.ge_u
+        self.f.if_void();
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(pc as i64);
+        self.f.i32_const(gex_abi::imports::BRK_BAD_SP);
+        self.f.call(self.cx.breakpoint);
+        self.f.end();
+    }
+
     fn reg_local(&mut self, r: GuestReg) -> u32 {
         if let Some(c) = self.regs.get(&r) {
             return c.local;
