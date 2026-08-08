@@ -683,7 +683,7 @@ thread_local! {
 /// A spinlock rather than a blocking one because there is no OS underneath to
 /// park on, and because a syscall holds this for a few microseconds at most.
 #[cfg(feature = "shared-memory")]
-static HOST: spinning_top::Spinlock<Option<Host>> = spinning_top::Spinlock::new(None);
+static mut HOST: Option<Host> = None;
 
 /// How much of the address space the guest may use.
 ///
@@ -773,7 +773,8 @@ fn set_host(host: Host) {
 
 #[cfg(feature = "shared-memory")]
 fn set_host(host: Host) {
-    *HOST.lock() = Some(host);
+    // SAFETY: see `with_host` -- one Worker is inside the kernel at a time.
+    unsafe { *core::ptr::addr_of_mut!(HOST) = Some(host) };
 }
 
 #[cfg(not(feature = "shared-memory"))]
@@ -793,30 +794,34 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
 #[cfg(feature = "shared-memory")]
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
-    // The `Host` is taken *out* for the duration and put back after, rather
-    // than the lock being held across `f`.
+    // A borrow in place, with neither a lock nor a move.
     //
-    // Holding it would be the obvious thing and is wrong here, because this
-    // shim traps out of `with_host` as ordinary control flow -- that is how a
-    // guest hands the wasm stack back to JavaScript. A trap does not unwind,
-    // so a held guard is never dropped and the kernel is locked out for the
-    // rest of the run: the next syscall waits forever, having done nothing
-    // wrong. Taking the value has the same failure mode as the thread-local
-    // `RefCell` this replaces -- a trap leaves it absent and the next caller
-    // says so -- which is a failure that names itself.
+    // Both were tried and both were wrong. *Holding* a lock across `f` is the
+    // obvious shape: this shim traps out of `with_host` as ordinary control
+    // flow -- that is how a guest hands the wasm stack back to JavaScript --
+    // and a trap does not unwind, so the guard would never drop and the
+    // kernel would be locked out for the rest of the run. *Moving* the `Host`
+    // out and back avoids that and is worse: it copies the whole structure
+    // twice on every syscall and every dispatch miss, which is not a hang but
+    // is indistinguishable from one -- `park` produced no output at all,
+    // where the same build with a thread-local ran it to completion.
     //
-    // The lock is therefore held only across the take and the put, and it is
-    // what makes the *statics* safe to touch from more than one Worker. Two
-    // threads genuinely inside the kernel at once would find it absent; that
-    // is honest for today, when one Worker runs at a time, and is the thing
-    // to revisit when `clone` starts spawning Workers.
-    let mut host = HOST
-        .lock()
-        .take()
-        .expect("gex: the kernel is absent -- not initialised, or a trap left it taken");
-    let r = f(&mut host);
-    *HOST.lock() = Some(host);
-    r
+    // So: a plain static, borrowed where it lies. It is shared between this
+    // process's Workers for free, because the shim's data lives in the
+    // guest's linear memory and that memory is a `SharedArrayBuffer`.
+    //
+    // SAFETY: one Worker is inside the kernel at a time. That is true today
+    // -- a thread's Worker exists but does not yet run guest code, because
+    // `clone` still schedules on one stack -- and it is exactly as safe as
+    // the `RefCell` this replaces, which also protected nothing across
+    // Workers. It stops being true when `clone` spawns a Worker, and that
+    // step has to bring real mutual exclusion with it: a lock that is
+    // released on the trap path, or a kernel that does not need one.
+    unsafe {
+        f((*core::ptr::addr_of_mut!(HOST))
+            .as_mut()
+            .expect("gex: not initialised"))
+    }
 }
 
 /// Sockets the host holds one end of, so JS can carry a guest's stream
