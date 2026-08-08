@@ -65,6 +65,8 @@ await writeFile(
 <canvas id="gex-gl" width="300" height="300"></canvas>
 <pre id="out">pending</pre>
 <script type="module">
+const OFF = __OFF__;
+const TRACE = __TRACE__;
 import { Gex, Env } from './gex.mjs';
 import { VirglRenderer } from './virgl.js';
 const el = document.getElementById('out');
@@ -73,7 +75,11 @@ const say = (s) => { el.textContent = s; document.title = s.split('\\n')[0]; };
 // page that reports "pending" says nothing about which of the four things it
 // loads was the problem. These do.
 let step = 'start';
-const mark = (s) => { step = s; say('at ' + s); };
+// Additive, because the marks and the guest's output share one element and
+// a mark that replaced it threw away everything written so far -- which made
+// the reported step wander depending on when the browser was dumped, and
+// sent one investigation after a hang in the wrong function.
+const mark = (s) => { step = s; el.textContent = 'at ' + s + '\\n' + output; };
 addEventListener('error', (e) => say('ERROR at ' + step + ': ' + (e.message || e)));
 addEventListener('unhandledrejection', (e) =>
   say('REJECTED at ' + step + ': ' + (e.reason?.message || e.reason)));
@@ -106,7 +112,11 @@ try {
   // hangs -- Mesa's winsys writes into the dead descriptor and waits.
   // Tracing on: a stall then says where it stalled, through the guest's
   // own stderr, which in a page is the only channel there is.
-  gex.useVirgl(renderer, true);
+  // GEX_VIRGL_OFF runs the identical page with the renderer not attached.
+  // The guest then finds no socket and says so, which is a complete run --
+  // so it separates a harness that cannot load a guest at all from one that
+  // only fails when a renderer is present.
+  if (!OFF) gex.useVirgl(renderer, TRACE);
   mark('loading the guest');
   const entry = await gex.load(
     await grab('./shim.wasm'), await grab('./guest.wasm'), await grab('./guest.elf'),
@@ -123,7 +133,8 @@ try {
 } catch (e) {
   if (e !== 0) say('THREW ' + (e?.message || String(e)) + '\\n' + output.trim());
 }
-</script>`,
+</script>`.replace('__OFF__', String(!!process.env.GEX_VIRGL_OFF))
+   .replace('__TRACE__', String(!!process.env.GEX_VIRGL_TRACE)),
 );
 
 const server = createServer(async (req, res) => {

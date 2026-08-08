@@ -124,6 +124,18 @@ impl VirglDevice {
 
     /// Move bytes in both directions for every client.
     pub fn pump(&self) {
+        // Counted, and reported on a curve, because the two failures this has
+        // to tell apart are "never ran" and "ran a million times without
+        // getting anywhere" -- and a trace that only prints when there are
+        // bytes to move cannot distinguish them.
+        if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 4 || n.is_power_of_two() {
+                let live = self.inner.lock().unwrap_or_else(|e| e.into_inner()).sessions.len();
+                Self::trace(&format!("[virgl] pump #{n}, {live} sessions\n"));
+            }
+        }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.sessions.is_empty() {
             return;
@@ -157,6 +169,9 @@ impl VirglDevice {
                     let took = unsafe {
                         virgl_take(s.out[at..].as_mut_ptr() as u32, waiting as u32)
                     };
+                    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                        Self::trace(&format!("[virgl] took {took} of {waiting}\n"));
+                    }
                     s.out.truncate(at + took.max(0) as usize);
                 }
                 if n < buf.len() {
@@ -172,6 +187,13 @@ impl VirglDevice {
                     Ok(0) | Err(_) => break,
                     Ok(k) => s.sent += k as usize,
                 }
+            }
+            if TRACE.load(std::sync::atomic::Ordering::Relaxed) && !s.out.is_empty() {
+                Self::trace(&format!(
+                    "[virgl] queued {}, sent {}\n",
+                    s.out.len(),
+                    s.sent
+                ));
             }
             if s.sent == s.out.len() {
                 s.out.clear();
