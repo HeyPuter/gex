@@ -2232,6 +2232,32 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
             SAFEPOINT_INTERVAL,
         );
     }
+    // A heartbeat, when tracing, and this is the only place one can go.
+    //
+    // Nothing else runs while the guest executes translated code: no syscall,
+    // no dispatch miss, no JavaScript. A page watching a run therefore sees
+    // nothing at all during a long stretch of guest execution, and cannot
+    // tell it from a hang -- which is exactly the state glxgears was in, at
+    // 100% of a core, for six minutes, with the last word from it being
+    // "loading Mesa and drawing".
+    //
+    // Translated code calls here on back-edges whether or not it makes a
+    // syscall, so this says where the guest is when nothing else can.
+    let every = unsafe { HEARTBEAT };
+    if every != 0 {
+        static mut BEAT: u64 = 0;
+        let beat = unsafe {
+            BEAT = BEAT.wrapping_add(1);
+            BEAT
+        };
+        if beat.is_multiple_of(every) {
+            let blocks = with_host(|h| h.jit.blocks);
+            trace_line(&format!(
+                "[beat] {beat} safepoints, pc={:#x}, {blocks} blocks translated\n",
+                pc as u64
+            ));
+        }
+    }
     // Leaving wasm is not free -- it is a trap, a JS catch and a re-entry --
     // so a thread gets several intervals' worth of machine before it is asked
     // to give it up. The slice is still short enough that a spin loop waiting
@@ -2308,6 +2334,27 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
     if tracing() {
         trace_line(&format!("[gex] miss at pc={pc:#x}\n"));
+    }
+    // The other half of the heartbeat, and the half that matters when the
+    // guest is not running at all.
+    //
+    // A safepoint beat says where the *guest* is; it says nothing while the
+    // host is lifting and the engine is compiling, which for a program the
+    // size of Mesa is most of the time. A run can then go minutes at a full
+    // core with no beat, no syscall and no output, and there is no way to
+    // tell translating from wedged -- which is exactly where glxgears sat.
+    if unsafe { HEARTBEAT } != 0 {
+        static mut MISSES: u64 = 0;
+        let n = unsafe {
+            MISSES = MISSES.wrapping_add(1);
+            MISSES
+        };
+        if n.is_multiple_of(200) {
+            let (blocks, ms) = with_host(|h| (h.jit.blocks, h.jit.nanos / 1_000_000));
+            trace_line(&format!(
+                "[beat] miss {n} at pc={pc:#x}, {blocks} blocks, {ms}ms lifting\n"
+            ));
+        }
     }
     // A signal handler returning. When the guest gave no `sa_restorer` the
     // kernel puts `SIGRETURN_TRAMPOLINE` in x30, an address inside the
@@ -2505,6 +2552,20 @@ pub extern "C" fn gex_jit_installed() {
         h.jit.pending = None;
         h.jit.pending_slots = 0;
     });
+}
+
+/// How often the safepoint says where the guest is; zero is off.
+static mut HEARTBEAT: u64 = 0;
+
+/// Ask for a heartbeat every `every` safepoints.
+///
+/// Its own switch rather than a level of `gex_set_trace`, because the two
+/// answer different questions and one drowns the other: a syscall trace of a
+/// run that translates Mesa is hundreds of megabytes, and the thing worth
+/// knowing -- is the guest moving at all -- is a line a second.
+#[no_mangle]
+pub extern "C" fn gex_set_heartbeat(every: i64) {
+    unsafe { HEARTBEAT = every.max(0) as u64 };
 }
 
 /// Blocks translated at run time, and how many times the translator ran.

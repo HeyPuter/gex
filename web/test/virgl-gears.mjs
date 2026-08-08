@@ -75,6 +75,7 @@ await writeFile(
 <script type="module">
 const SECONDS = '__SECONDS__';
 const TRACE = __TRACE__;
+const process_HEARTBEAT = __HEARTBEAT__;
 import { Gex, Env } from './gex.mjs';
 import { VirglRenderer } from './virgl.js';
 import { untar } from './tar.js';
@@ -160,11 +161,30 @@ try {
   // count is not: the scheduler ticks whether or not the guest advances, so
   // a guest wedged on a socket and a guest translating libGL look identical
   // through it.
+  //
+  // Read in a microtask, not here. This runs inside the guest's write,
+  // which the shim calls while it still holds its own state borrowed --
+  // asking it anything from in here is a re-entrant borrow, and the run died
+  // with 'RefCell already borrowed' before the X server had finished
+  // starting. A microtask runs once the stack has unwound back to the page,
+  // by which time the borrow is gone.
   const e = gex.shim.exports;
-  report = (line) =>
-    post('progress', ((Date.now() - t0) / 1000).toFixed(0) + 's | ' + line +
-      ' | ' + Number(e.gex_jit_blocks()) + ' blocks in ' +
-      Number(e.gex_jit_millis()) + 'ms | ' + renderer.glState());
+  // A line roughly once a second while the guest is executing, which is the
+  // only window into a stretch that makes no syscalls and runs no JavaScript.
+  e.gex_set_heartbeat?.(BigInt(process_HEARTBEAT));
+  const queued = [];
+  report = (line) => {
+    queued.push([((Date.now() - t0) / 1000).toFixed(0), line]);
+    queueMicrotask(() => {
+      const blocks = Number(e.gex_jit_blocks());
+      const ms = Number(e.gex_jit_millis());
+      while (queued.length) {
+        const [at, l] = queued.shift();
+        post('progress', at + 's | ' + l + ' | ' + blocks + ' blocks in ' + ms +
+          'ms | ' + renderer.glState());
+      }
+    });
+  };
   // Whichever comes first: the guest finishing, or the guest drawing.
   const firstFrame = new Promise((r) => {
     drew = (line) => r('DREW ' + line);
@@ -183,7 +203,8 @@ try {
   }
 }
 </script>`.replace('__SECONDS__', SECONDS)
-   .replace('__TRACE__', String(!!process.env.GEX_VIRGL_TRACE)),
+   .replace('__TRACE__', String(!!process.env.GEX_VIRGL_TRACE))
+   .replace('__HEARTBEAT__', String(Number(process.env.GEX_HEARTBEAT || 0))),
 );
 
 let finish;
