@@ -56,6 +56,11 @@ NODEEOF
 echo "building the seed module..."
 cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc >/dev/null 2>&1
 "$ROOT/target/release/gexc" seed -o "$PUB/gex/seed.wasm" --no-shared-memory
+# And one for a shared memory, to pair with the shim built the same way. A
+# memory import's `shared` flag is part of its type, so the two cannot be
+# mixed: a page picks a pair by whether it is cross-origin isolated, and the
+# shared pair is what lets a process's threads each be a Worker.
+"$ROOT/target/release/gexc" seed -o "$PUB/gex/seed.shared.wasm"
 
 # -- virglrenderer, for the guest's own Mesa -------------------------------
 #

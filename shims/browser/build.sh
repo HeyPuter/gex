@@ -26,11 +26,45 @@ GUEST_BYTES=$((0xFFFF0000))
 # stack, then the shim's data and heap.
 SHIM_STACK_TOP=$((0x80800000))
 SHIM_BASE=$SHIM_STACK_TOP
-RUSTFLAGS="-C link-arg=--import-memory \
+LINK="-C link-arg=--import-memory \
   -C link-arg=--initial-memory=$GUEST_BYTES \
   -C link-arg=--max-memory=$GUEST_BYTES \
   -C link-arg=--global-base=$SHIM_BASE \
   -C link-arg=-zstack-size=8388608 \
-  -C link-arg=--export=__stack_pointer" \
-  cargo build -p gex-browser --target wasm32-unknown-unknown --release
-echo "shims/browser: $(stat -c%s target/wasm32-unknown-unknown/release/gex_browser.wasm) bytes"
+  -C link-arg=--export=__stack_pointer"
+
+OUT=target/wasm32-unknown-unknown/release/gex_browser.wasm
+RUSTFLAGS="$LINK" cargo build -p gex-browser --target wasm32-unknown-unknown --release
+echo "shims/browser: $(stat -c%s "$OUT") bytes"
+
+# And the same shim against a *shared* memory, when the toolchain can build
+# one. Two binaries rather than one because a memory import's `shared` flag is
+# part of its type: a module built against a shared memory will not
+# instantiate against a plain one, or the other way round, so this is not a
+# runtime choice. The page picks, by whether it is cross-origin isolated.
+#
+# What the shared build is for is threads. A process gets one memory; if that
+# memory is a SharedArrayBuffer then each of its *threads* can be its own
+# Worker and run at the same time, which is the only way real parallelism
+# happens in a tab. Processes still never share memory with each other -- that
+# is what stops two of them putting libraries at the same addresses, which is
+# what the snapshot switcher died of.
+#
+# It needs nightly: a Rust module importing a shared memory must be built with
+# `+atomics`, and the standard library it links has to have been built the
+# same way, which is `-Z build-std`. `GEX_NO_SHARED_MEMORY=1` skips it, and a
+# machine without nightly simply does not get the second binary.
+if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | grep -q nightly; then
+    SHARED=target/wasm32-unknown-unknown/release/gex_browser.shared.wasm
+    if RUSTFLAGS="$LINK \
+        -C link-arg=--shared-memory \
+        -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
+        cargo +nightly build -p gex-browser --target wasm32-unknown-unknown \
+          --release -Z build-std=std,panic_abort --features shared-memory \
+          --target-dir target/shared >/dev/null 2>&1; then
+        cp target/shared/wasm32-unknown-unknown/release/gex_browser.wasm "$SHARED"
+        echo "shims/browser: $(stat -c%s "$SHARED") bytes (shared memory)"
+    else
+        echo "shims/browser: no shared-memory build (needs nightly and rust-src)"
+    fi
+fi

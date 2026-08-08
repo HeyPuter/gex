@@ -325,9 +325,24 @@ impl FileHandle for Console {
 // lifting tcc's largest source took 15.2 seconds that way, against 0.3 with a
 // bump allocator that never freed. Talc bins its free lists, so allocation
 // does not degrade as the heap fragments, and it still frees.
+// Two of them, because the two builds differ in exactly one way that matters
+// here. Against a plain memory the module is single-threaded and a cell is
+// enough. Against a *shared* memory each of a process's threads can be its own
+// Worker and be inside this module at the same time, so the heap needs a real
+// lock -- and `TalcSyncCell` says so itself, refusing to compile once the
+// target has atomics rather than being quietly unsound.
+#[cfg(not(feature = "shared-memory"))]
 #[global_allocator]
 static ALLOC: talc::cell::TalcSyncCell<ShimRegion, talc::wasm::WasmBinning> =
     talc::cell::TalcSyncCell::new_wasm(ShimRegion);
+
+#[cfg(feature = "shared-memory")]
+#[global_allocator]
+static ALLOC: talc::sync::TalcLock<
+    spinning_top::RawSpinlock,
+    ShimRegion,
+    talc::wasm::WasmBinning,
+> = talc::sync::TalcLock::new(ShimRegion);
 
 extern "C" {
     static __heap_base: u8;
@@ -388,6 +403,16 @@ enum Waiting {
     Read(Arc<dyn gex_kernel::vfs::FileHandle>),
     /// Waiting for room in a stream: a pipe nobody has drained yet.
     Write(Arc<dyn gex_kernel::vfs::FileHandle>),
+    /// Waiting in `accept` for a client to arrive.
+    ///
+    /// This used to park as `Runnable`, on the reasoning that the scheduler
+    /// would come back round and ask again. It does -- and `finish_parked`
+    /// answers EAGAIN when nothing has arrived, which is the right answer for
+    /// a *non-blocking* accept and is handed straight to the guest. A server
+    /// therefore got EAGAIN from a blocking `accept` and gave up. Nothing
+    /// noticed because the only host-served socket was the virtio-gpu
+    /// renderer, where the guest connects and never accepts.
+    Accept(Arc<gex_kernel::unix::UnixSocket>),
     /// Waiting in `wait4` for a child to finish.
     ///
     /// This used to be impossible: the parent was frozen until the child
@@ -630,6 +655,70 @@ fn install_panic_hook() {
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
     HOST.with(|h| f(h.borrow_mut().as_mut().expect("gex: not initialised")))
+}
+
+/// Sockets the host holds one end of, so JS can carry a guest's stream
+/// somewhere the guest cannot reach -- another Worker, in particular.
+static HOST_SOCKETS: SingleThreaded<Vec<Arc<gex_kernel::unix::UnixSocket>>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
+
+/// Connect the host to a unix socket the *guest* has bound.
+///
+/// The mirror of `bind_host`, and the half that was missing. A guest that
+/// connects to a socket the host serves already works -- that is how the
+/// virtio-gpu renderer is reached. A guest that *serves* one had no way to be
+/// reached from outside, which is the problem with putting each process in
+/// its own Worker: an X server in one Worker and its client in another need a
+/// socket between them, and only one of those two directions existed.
+///
+/// `SocketNames::connect` already does the work; it only needed a host-owned
+/// socket to do it with.
+///
+/// Returns a handle for [`gex_host_send`] and [`gex_host_recv`], or -1 when
+/// nothing is bound at that path.
+#[no_mangle]
+pub extern "C" fn gex_host_connect(path: u32, path_len: u32) -> i32 {
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return -1;
+    };
+    with_host(|h| {
+        let sock = Arc::new(gex_kernel::unix::UnixSocket::new(true));
+        if h.kernel.socket_names.connect(&sock, name).is_err() {
+            return -1;
+        }
+        let mut table = HOST_SOCKETS.0.borrow_mut();
+        table.push(sock);
+        (table.len() - 1) as i32
+    })
+}
+
+/// Write to the guest through a handle from [`gex_host_connect`].
+#[no_mangle]
+pub extern "C" fn gex_host_send(handle: i32, ptr: u32, len: u32) -> i32 {
+    let bytes = shim_slice(ptr, len);
+    let sock = HOST_SOCKETS
+        .0
+        .borrow()
+        .get(handle.max(0) as usize)
+        .cloned();
+    match sock {
+        Some(s) => s.send(bytes).map(|n| n as i32).unwrap_or(-1),
+        None => -1,
+    }
+}
+
+/// Read whatever the guest has written. Returns 0 when there is nothing yet,
+/// which is not the same as end of stream -- the caller comes back.
+#[no_mangle]
+pub extern "C" fn gex_host_recv(handle: i32, ptr: u32, max: u32) -> i32 {
+    let sock = HOST_SOCKETS
+        .0
+        .borrow()
+        .get(handle.max(0) as usize)
+        .cloned();
+    let Some(s) = sock else { return -1 };
+    let out = shim_slice_mut(ptr, max);
+    s.recv(out, 0, false).map(|n| n as i32).unwrap_or(0)
 }
 
 /// How many regions of guest memory this process actually owns.
@@ -1298,9 +1387,12 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                             Waiting::Child
                         }
                     }
-                    // A listener with nothing waiting. The same shape as a
-                    // poll: the scheduler asks again each turn.
-                    gex_kernel::BlockOp::AcceptWait { .. } => Waiting::Runnable,
+                    // A listener with nothing waiting sleeps until something
+                    // does, rather than being asked again and answering
+                    // EAGAIN to a caller that did not ask for it.
+                    gex_kernel::BlockOp::AcceptWait { socket } => {
+                        Waiting::Accept(Arc::clone(socket))
+                    }
                     // `sigsuspend` waits for a signal and nothing else. The
                     // scheduler is where a signal is delivered, so coming
                     // back round each turn is the whole implementation: if
@@ -1847,6 +1939,7 @@ fn thread_ready(t: &Thread, now: u64) -> bool {
             }
             _ => true,
         },
+        Waiting::Accept(socket) => socket.has_pending(),
         Waiting::Exited => false,
     }
 }
@@ -1954,6 +2047,13 @@ fn schedule() -> i32 {
                 for t in &h.threads {
                     match &t.waiting {
                         Waiting::Write(_) => mask |= 1,
+                        // A listener waiting for a client. Whoever connects
+                        // is outside this guest -- the page, or another
+                        // Worker -- so the page's event loop has to turn for
+                        // it to arrive. Without saying so the scheduler spun:
+                        // nothing was ready, nothing was reported, and the
+                        // loop went round for ever.
+                        Waiting::Accept(_) => mask |= 2,
                         Waiting::Read(handle) => {
                             mask |= if is_socket(handle) { 2 } else { 1 };
                         }
@@ -2349,6 +2449,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                     // switch does not need to.
                     Waiting::Net(deadline) => deadline.is_some_and(|d| now >= d),
                     Waiting::Child => false,
+                    Waiting::Accept(socket) => socket.has_pending(),
                     Waiting::Exited => false,
                 }
         });
@@ -2501,9 +2602,12 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
             2048,
-            // The browser's memory is not declared shared, and an import that
-            // disagrees with the memory it is given fails to instantiate.
-            false,
+            // Must match the memory this shim was built against: an import
+            // that disagrees about sharing does not link, and a module the
+            // translator emits is instantiated against the same memory the
+            // guest runs in. The plain build says no and the shared build
+            // says yes, which is exactly what the feature means.
+            cfg!(feature = "shared-memory"),
         );
         h.jit.translated = known;
         if stats.blocks == 0 {

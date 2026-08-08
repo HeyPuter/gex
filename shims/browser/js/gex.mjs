@@ -65,9 +65,18 @@ function metadataSection(wasm) {
 export class Gex {
   #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #virgl = null; #virglTrace = false;
 
-  constructor(env = new Env()) {
+  /**
+   * `shared` asks for a SharedArrayBuffer, which needs the shim and guest
+   * modules built for one -- a memory import's `shared` flag is part of its
+   * type, so a plain module will not instantiate against it or the other way
+   * round. It buys threads: a process gets one memory, and if that memory is
+   * shared then each of its threads can be its own Worker and run at the same
+   * time. Processes still never share memory with each other; that is what
+   * keeps two of them from putting libraries at the same addresses.
+   */
+  constructor(env = new Env(), { shared = false } = {}) {
     this.#env = env;
-    this.#memory = new WebAssembly.Memory({ initial: PAGES, maximum: PAGES });
+    this.#memory = new WebAssembly.Memory({ initial: PAGES, maximum: PAGES, shared });
   }
 
   get memory() { return this.#memory; }

@@ -551,6 +551,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/background" "$HERE/programs/background.c"
 "$CC" -static -no-pie -O2 -o "$WORK/sigblocked" "$HERE/programs/signal-while-blocked.c"
 "$CC" -static -no-pie -O2 -o "$WORK/park" "$HERE/programs/park-across-switch.c"
+"$CC" -static -no-pie -O2 -o "$WORK/socket-server" "$HERE/programs/socket-server.c"
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
 "$CC" -static -O2 -o "$WORK/selfmod" "$HERE/programs/selfmod.c"
@@ -787,6 +788,45 @@ if [ -n "$NODE" ] && [ -x "$WORK/park" ] && [ -x "$WORK/background" ]; then
     fi
 else
     echo "skip worker-processes: no node or no programs"
+fi
+
+# The host reaching a socket the *guest* serves -- the direction that did not
+# exist, and the one a relay between two Workers needs. It also holds the
+# blocking `accept` honest: it used to answer EAGAIN to a caller that had not
+# asked for one, which every guest that serves a socket would get.
+if [ -n "$NODE" ] && [ -x "$WORK/socket-server" ]; then
+    out=$(timeout 200 "$NODE" "$HERE/../../web/test/host-socket.mjs" \
+              "$WORK/socket-server" 2>&1 || true)
+    case "$out" in
+        ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
+        skip*) echo "$out" | head -1 ;;
+        *)
+            echo "FAIL host-socket: the host could not reach the guest's socket"
+            echo "$out" | sed 's/^/     /' | head -6
+            fail=$((fail + 1))
+            ;;
+    esac
+else
+    echo "skip host-socket: no node or no program"
+fi
+
+# The same guest on a plain memory and on a SharedArrayBuffer. Two builds,
+# because a memory import's `shared` flag is part of its type and cannot be
+# chosen at run time; the shared one is what will let a process's threads each
+# be a Worker. Skips where there is no nightly toolchain to build it with.
+if [ -n "$NODE" ] && [ -x "$WORK/park" ]; then
+    out=$(timeout 200 "$NODE" "$HERE/../../web/test/shared-memory.mjs" "$WORK/park" 2>&1 || true)
+    case "$out" in
+        ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
+        skip*) echo "$out" | head -1 ;;
+        *)
+            echo "FAIL shared-memory: the two builds do not agree"
+            echo "$out" | sed 's/^/     /' | head -6
+            fail=$((fail + 1))
+            ;;
+    esac
+else
+    echo "skip shared-memory: no node or no program"
 fi
 # argv and envp reach the new program, a close-on-exec descriptor is gone and
 # an ordinary one survives with its offset, and a failed exec returns.
