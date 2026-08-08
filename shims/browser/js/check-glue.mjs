@@ -122,12 +122,21 @@ function importedArities(bytes) {
  * an entry written any other way is reported rather than assumed fine.
  */
 function suppliedArities(source) {
-  const at = source.indexOf(`${NS}: {`);
+  // The object used to be written inline as `gex_env: { ... }`. It is a method
+  // now, because a thread's Worker instantiates the same shim and needs the
+  // same imports, so both `load` and `attach` ask for them. Either spelling is
+  // accepted: what this reads is the object literal, wherever it is written.
+  const marker = source.includes('#hostImports() {\n    return {')
+    ? '#hostImports() {\n    return {'
+    : `${NS}: {`;
+  const at = source.indexOf(marker);
   if (at < 0) throw new Error(`no ${NS} import object in the glue`);
   // To the matching brace, counting depth, so a nested arrow body does not
   // end the object early.
+  // Starting *at* the opening brace, not past it, so the depth count begins
+  // at one and the loop below ends on the brace that closes this object.
   let depth = 0;
-  let end = at + NS.length + 2;
+  let end = at + marker.length - 1;
   for (let i = end; i < source.length; i++) {
     if (source[i] === '{') depth++;
     else if (source[i] === '}' && --depth === 0) {

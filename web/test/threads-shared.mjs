@@ -80,6 +80,15 @@ const WORKER = `
       } else if (m.kind === 'poke') {
         new Uint8Array(gex.memory.buffer).set(new Uint8Array(m.bytes), m.at);
         parentPort.postMessage({ kind: 'poked' });
+      } else if (m.kind === 'run') {
+        // Running translates blocks and installs them into *this* Worker's
+        // dispatch tables. A thread joining afterwards has none of them.
+        const status = await gex.run(entry);
+        parentPort.postMessage({
+          kind: 'ran', status, modules: gex.installedModules,
+        });
+      } else if (m.kind === 'modules') {
+        parentPort.postMessage({ kind: 'modules', n: gex.installedModules });
       } else if (m.kind === 'file') {
         const b = gex.readFile(m.path);
         parentPort.postMessage({ kind: 'file', text: b ? new TextDecoder().decode(b) : null });
@@ -134,6 +143,13 @@ await a.ask({ kind: 'load', files: { '/hello': new TextEncoder().encode('written
 const marker = [...new TextEncoder().encode('thread A was here')];
 await a.ask({ kind: 'poke', at: 0x900000, bytes: marker }, 'poked');
 
+// Run it, which is what fills the first Worker's dispatch tables.
+const ran = await a.ask({ kind: 'run' }, 'ran');
+if (!ran.modules) {
+  console.log('FAIL threads-shared: the first Worker translated nothing, so there is nothing to replay');
+  process.exit(1);
+}
+
 // 1 and 2: a second Worker on the same memory, seeing what the first wrote.
 const b = await spawn();
 await b.ask({ kind: 'attach' }, 'attached');
@@ -141,6 +157,19 @@ const seen = await b.ask({ kind: 'peek', at: 0x900000, len: marker.length }, 'pe
 const text = new TextDecoder().decode(new Uint8Array(seen.bytes));
 if (text !== 'thread A was here') {
   console.log(`FAIL threads-shared: the second Worker read ${JSON.stringify(text)} from the shared memory`);
+  process.exit(1);
+}
+
+// The replay. A dispatch table belongs to a module instance, so this Worker
+// began with empty ones while the page directory -- which is shared -- already
+// pointed at slots. Attaching must have put every module the process
+// translated into this Worker's own tables; a thread short of even one of them
+// would dispatch into a slot that has never been filled.
+const mods = await b.ask({ kind: 'modules' }, 'modules');
+if (mods.n !== ran.modules) {
+  console.log(
+    `FAIL threads-shared: the joining Worker installed ${mods.n} of ${ran.modules} translated modules`,
+  );
   process.exit(1);
 }
 
@@ -157,4 +186,6 @@ if (file.text !== 'written by thread A') {
 
 a.worker.terminate();
 b.worker.terminate();
-console.log('ok   threads-shared (two Workers, one process memory, one kernel)');
+console.log(
+  `ok   threads-shared (two Workers, one process memory, one kernel, ${ran.modules} modules replayed)`,
+);

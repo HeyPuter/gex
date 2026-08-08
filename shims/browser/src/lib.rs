@@ -577,6 +577,15 @@ struct Jit {
     described: bool,
     /// Addresses whose slot now holds real code.
     translated: std::collections::HashSet<u64>,
+    /// Every translated module's bytes, in the order they were installed.
+    ///
+    /// A dispatch table belongs to a module instance, and instances are not
+    /// shared between Workers -- so a thread joining this process has an
+    /// empty table while the page directory, which *is* shared, already
+    /// points at slots. Keeping the modules is what lets a joining Worker
+    /// instantiate them into its own tables and catch up. Order matters: each
+    /// module's page assignments are the next one's starting point.
+    registry: Vec<Vec<u8>>,
     /// Slots that code of a given identity was translated into, for the whole
     /// tab rather than for one process.
     ///
@@ -1242,6 +1251,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 described: meta.next_slot != 0,
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
                 translated: Default::default(),
+                registry: Vec::new(),
                 shared: Default::default(),
                 candidates: Vec::new(),
                 pending: Default::default(),
@@ -3930,7 +3940,55 @@ pub extern "C" fn gex_jit_installed() {
         for (page, base) in done.dirs {
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
         }
+        // Kept, not dropped. A dispatch table belongs to a module *instance*
+        // and cannot be shared between Workers, so a thread joining this
+        // process has none of what has already been translated -- and the
+        // page directory, which *is* shared, will send it to slots its own
+        // table has never had filled. The bytes stay here so a joining Worker
+        // can instantiate the same modules into its own tables and catch up.
+        //
+        // This is the same registry-and-replay the native host keeps for its
+        // stores. It costs the size of every module translated so far, which
+        // is the price of a thread being able to run at all.
+        h.jit.registry.push(done.wasm);
     });
+}
+
+/// How many translated modules this process has, for a Worker catching up.
+#[no_mangle]
+pub extern "C" fn gex_module_count() -> u32 {
+    with_host(|h| h.jit.registry.len() as u32)
+}
+
+/// Where module `i`'s bytes are, in the memory every thread shares.
+///
+/// A pointer rather than a copy: the registry lives in the process memory and
+/// a joining Worker is already looking at it.
+#[no_mangle]
+pub extern "C" fn gex_module_ptr(i: u32) -> u32 {
+    with_host(|h| {
+        h.jit
+            .registry
+            .get(i as usize)
+            .map_or(0, |m| m.as_ptr() as u32)
+    })
+}
+
+/// Every slot this process has claimed, across every module.
+///
+/// What a Worker catching up must grow its tables to. `gex_jit_slots` reports
+/// the *pending* module's high-water mark, which is the right answer only for
+/// the Worker that is installing it; a thread replaying the registry has to
+/// reach the whole process's.
+#[no_mangle]
+pub extern "C" fn gex_jit_slots_total() -> u32 {
+    with_host(|h| h.jit.page_table.slots() as u32)
+}
+
+/// How long module `i` is.
+#[no_mangle]
+pub extern "C" fn gex_module_len(i: u32) -> u32 {
+    with_host(|h| h.jit.registry.get(i as usize).map_or(0, |m| m.len() as u32))
 }
 
 /// A direct-mapped table of back-edge counts, keyed by guest pc.

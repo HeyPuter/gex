@@ -82,6 +82,11 @@ const TABLE_NAMES = [
 
 export class Gex {
   #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #virgl = null; #virglTrace = false;
+  // How many of the process's translated modules *this* Worker has put into
+  // its own dispatch tables. Per Worker, not per process: the tables belong to
+  // a module instance and instances are not shared, so every thread starts
+  // with empty tables however much the process has already translated.
+  #installed = 0;
 
   /**
    * `shared` asks for a SharedArrayBuffer, which needs the shim and guest
@@ -107,6 +112,16 @@ export class Gex {
 
   /** The shim instance, for diagnostics. */
   get shim() { return this.#shim; }
+
+  /**
+   * How many of the process's translated modules this Worker has put into its
+   * own dispatch tables.
+   *
+   * A thread that joins late must reach the same number as the process has
+   * produced, or its tables are missing code the shared page directory
+   * already points at.
+   */
+  get installedModules() { return this.#installed; }
 
   /**
    * Read a file back out of the guest's filesystem, or null if it is not
@@ -347,6 +362,37 @@ export class Gex {
     this.#guest = await WebAssembly.instantiate(await WebAssembly.compile(guestWasm), {
       gex: this.#imports,
     });
+    // Everything the process translated before this thread existed.
+    await this.#catchUp();
+  }
+
+  /**
+   * Put any modules this Worker is missing into its own dispatch tables.
+   *
+   * The page directory is in shared memory, so a joining thread's guest code
+   * is already being sent to slots -- slots that this Worker's tables have
+   * never had filled, because a table belongs to an instance. Without this a
+   * thread's first indirect branch reaches whatever the table holds, which is
+   * the miss stub at best and nothing at all past the table's end.
+   *
+   * In order, and from the start: each module's page assignments are the next
+   * one's starting point, so they cannot be applied out of sequence.
+   */
+  async #catchUp() {
+    const e = this.#shim.exports;
+    if (!e.gex_module_count) return;
+    const have = e.gex_module_count() >>> 0;
+    // Every slot the *process* has claimed, not the pending module's -- this
+    // Worker is catching up on all of them at once.
+    const need = (e.gex_jit_slots_total?.() ?? 0) >>> 0;
+    for (; this.#installed < have; this.#installed++) {
+      const ptr = e.gex_module_ptr(this.#installed) >>> 0;
+      const len = e.gex_module_len(this.#installed) >>> 0;
+      if (!len) continue;
+      // Copied out before compiling: the registry is in the guest's memory,
+      // and another thread allocating can move it.
+      await this.#installModule(this.#u8.slice(ptr, ptr + len), need);
+    }
   }
 
   /**
@@ -617,20 +663,38 @@ export class Gex {
     const e = this.#shim.exports;
     const ptr = e.gex_jit_pending_ptr() >>> 0;
     const len = e.gex_jit_pending_len() >>> 0;
-    const bytes = this.#u8.slice(ptr, ptr + len);
+    await this.#installModule(this.#u8.slice(ptr, ptr + len), e.gex_jit_slots() >>> 0);
+    e.gex_jit_installed();
+    // This Worker translated it, so it is already the newest one installed
+    // here; the registry entry `gex_jit_installed` just added is the same
+    // module and must not be replayed on top of itself.
+    this.#installed = e.gex_module_count ? e.gex_module_count() >>> 0 : this.#installed;
+  }
+
+  /**
+   * Put one translated module's blocks into this Worker's dispatch tables.
+   *
+   * Shared by the two ways a module arrives: this Worker translated it, or
+   * another thread did and this one is catching up. The work is the same
+   * either way, which is the point of it being one function -- a thread that
+   * installed modules differently from the thread that made them would
+   * dispatch to different code.
+   */
+  async #installModule(bytes, need) {
+    const e = this.#shim.exports;
     const tables = this.#dispatchTables();
     // The shim allocates in one slot space that spans every table, so the
     // figure it reports is a running total and each table's share is that
     // total clamped to its own window. Several tables exist because V8 caps
     // one at ten million entries, which is 38 MiB of guest text -- less than
     // half the graphics rootfs. See #64.
+    //
     // Finite, not `Infinity`: the window arithmetic multiplies this by the
     // table index, and `0 * Infinity` is `NaN`, which reaches `Table.grow`
     // as "Argument 0 must be convertible to a valid number" and says nothing
     // about where it came from. A shim from before this export existed has
     // one table, so any number too large to reach is the right answer.
     const per = (e.gex_slots_per_table?.() ?? 0) >>> 0 || Number.MAX_SAFE_INTEGER;
-    const need = e.gex_jit_slots() >>> 0;
     // Table 0's slot 0 is the miss stub, and it is what an unfilled slot in
     // any table must hold: a branch to an address nothing has translated has
     // to reach the host, not a stale function. Tables past the first start
@@ -660,7 +724,6 @@ export class Gex {
       if (packed < 0) continue;
       tables[packed >>> 24].set(packed & 0xffffff, inst.exports[name]);
     }
-    e.gex_jit_installed();
   }
 
   /** Every dispatch table the guest module exports, in index order. */
