@@ -1197,6 +1197,36 @@ pub extern "C" fn gex_paused_for_net() -> i32 {
 /// Returns 1 when there is somewhere to go, 2 when the guest is finished.
 #[no_mangle]
 pub extern "C" fn gex_wake() -> i32 {
+    // Counted, because the shape that hides is not a stall but a cycle. A
+    // thread that parks, is woken a millisecond later, runs a handful of
+    // instructions and parks again makes no progress and costs no CPU, and
+    // resets every counter it passes on the way: the idle census never fires
+    // because something *was* runnable, and the heartbeat never fires because
+    // 2,000 safepoints at that rate is a very long time. What it looks like
+    // is a run that has quietly stopped, which is what it is.
+    //
+    // On a curve from 4,096, which at a millisecond a turn is about four
+    // seconds of getting nowhere.
+    static WAKES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() && n >= 4096 {
+        let census = with_host(|h| {
+            let mut out = String::new();
+            for (pid, p) in std::iter::once((0usize, &h.threads))
+                .chain(h.suspended.iter().enumerate().map(|(i, p)| (i + 1, &p.threads)))
+            {
+                for (i, t) in p.iter().enumerate() {
+                    out.push_str(&format!(
+                        " {pid}.{i}={}@{:#x}",
+                        waiting_name(&t.waiting),
+                        t.pc
+                    ));
+                }
+            }
+            out
+        });
+        trace_line(&format!("[gex] woken {n} times, threads:{census}\n"));
+    }
     with_host(|h| h.paused = 0);
     schedule()
 }
@@ -1263,6 +1293,63 @@ fn trace_line(s: &str) {
     unsafe { write(2, s.as_ptr() as u32, s.len() as u32) };
 }
 
+/// Which syscalls a run is making, and how many of each.
+///
+/// The third instrument of the same shape as the idle census and the wake
+/// counter, and for the same reason: a run that is making no progress and a
+/// run that is working can look identical from outside. This one covers the
+/// case the other two miss -- a guest burning a whole core going round a
+/// syscall that always answers immediately. Nothing stalls, nothing idles,
+/// nothing waits; it simply never gets anywhere, at full speed.
+///
+/// Reported on powers of two from 65,536, so a program doing ordinary work
+/// says one line every so often and a program in a loop says a great many.
+/// The list is trimmed to the ten commonest, because the tail is never the
+/// answer.
+fn count_syscall() {
+    if unsafe { HEARTBEAT } == 0 {
+        return;
+    }
+    // Indexed by number. aarch64 Linux stops well short of this, and anything
+    // past it is a guest asking for something that does not exist.
+    static mut COUNTS: [u32; 512] = [0; 512];
+    static mut TOTAL: u32 = 0;
+    let nr = with_host(|h| {
+        let gm = GuestMem::new(guest_bytes());
+        let at = h.threads[h.current].kstate.ctx_addr;
+        gm.read_u64(at + ctx::x(8) as u64).unwrap_or(!0)
+    });
+    let total = unsafe {
+        if (nr as usize) < COUNTS.len() {
+            COUNTS[nr as usize] = COUNTS[nr as usize].saturating_add(1);
+        }
+        TOTAL = TOTAL.wrapping_add(1);
+        TOTAL
+    };
+    if !total.is_power_of_two() || total < 65536 {
+        return;
+    }
+    let mut top: Vec<(u32, usize)> = unsafe {
+        COUNTS
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(i, &c)| (c, i))
+            .collect()
+    };
+    top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    top.truncate(10);
+    let mut line = format!("[gex] {total} syscalls:");
+    for (c, nr) in top {
+        line.push_str(&format!(
+            " {}={c}",
+            gex_kernel::syscalls::syscall_name(nr as u64)
+        ));
+    }
+    line.push('\n');
+    trace_line(&line);
+}
+
 /// `svc #0`.
 ///
 /// Returns normally when the guest should carry straight on, which is almost
@@ -1300,6 +1387,7 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
             }
         }
     }
+    count_syscall();
     let stop = with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[h.current].kstate.clone();
