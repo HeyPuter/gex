@@ -571,6 +571,15 @@ fn guest_bytes() -> &'static mut [u8] {
 /// import the guest's own output uses, so a panic reads like a panic.
 ///
 /// Installed on the first `with_host`, which every entry point goes through.
+/// Write to the guest's stderr, which in a page is the only channel the shim
+/// has to say anything at all.
+///
+/// # Safety
+/// The one thread a page has; `write` only reads the bytes.
+pub(crate) unsafe fn write_stderr(text: &str) {
+    write(2, text.as_ptr() as u32, text.len() as u32);
+}
+
 fn install_panic_hook() {
     use std::sync::Once;
     static ONCE: Once = Once::new();

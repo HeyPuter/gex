@@ -63,7 +63,7 @@ function metadataSection(wasm) {
 }
 
 export class Gex {
-  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #virgl = null;
+  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #virgl = null; #virglTrace = false;
 
   constructor(env = new Env()) {
     this.#env = env;
@@ -167,7 +167,7 @@ export class Gex {
     // because Mesa's vtest winsys does not fall back -- it writes its
     // handshake into the dead descriptor and blocks on a reply that cannot
     // come.
-    this.#shim.exports.gex_set_virgl?.(this.#virgl ? 1 : 0);
+    this.#shim.exports.gex_set_virgl?.(this.#virgl ? (this.#virglTrace ? 2 : 1) : 0);
     // wasm-ld puts the shim's stack at address zero regardless of
     // --global-base, which is the guest's image. Move it into the shim's own
     // region, above everything the guest maps. Nothing has run yet.
@@ -325,9 +325,10 @@ export class Gex {
    * handshake into the dead descriptor and blocks on a reply that cannot
    * come. A late call gives the next run a GPU and this one a hang.
    */
-  useVirgl(renderer) {
+  useVirgl(renderer, trace = false) {
     this.#virgl = renderer;
-    this.#shim?.exports?.gex_set_virgl?.(renderer ? 1 : 0);
+    this.#virglTrace = trace;
+    this.#shim?.exports?.gex_set_virgl?.(renderer ? (trace ? 2 : 1) : 0);
   }
 
   async run(entry) {

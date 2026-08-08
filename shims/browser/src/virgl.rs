@@ -58,11 +58,15 @@ static mut HAVE_VIRGL: bool = false;
 #[no_mangle]
 pub extern "C" fn gex_set_virgl(on: i32) {
     unsafe { HAVE_VIRGL = on != 0 }
+    TRACE.store(on == 2, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn have_virgl() -> bool {
     unsafe { HAVE_VIRGL }
 }
+
+/// Narrate every pump. Set by passing 2 rather than 1 to `gex_set_virgl`.
+pub static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Where Mesa's vtest winsys looks unless `VTEST_SOCKET_NAME` says otherwise.
 pub const DEFAULT_SOCKET: &str = "/tmp/.virgl_test";
@@ -106,6 +110,18 @@ impl VirglDevice {
         VirglDevice::default()
     }
 
+    /// Narrate a pump, when `gex_set_virgl(2)` asked for it.
+    ///
+    /// Through the same import the guest's output uses, because in a page
+    /// that is the only channel there is -- and a pump that never produces
+    /// anything is indistinguishable from a pump that never runs.
+    fn trace(text: &str) {
+        if unsafe { HAVE_VIRGL } {
+            // SAFETY: the one thread a page has, and `write` only reads.
+            unsafe { crate::write_stderr(text) };
+        }
+    }
+
     /// Move bytes in both directions for every client.
     pub fn pump(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -131,6 +147,9 @@ impl VirglDevice {
                 // this module's memory, which is the same arrangement the GL
                 // device uses, and does not retain the pointer.
                 let waiting = unsafe { virgl_submit(buf.as_ptr() as u32, n as u32) };
+                if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                    Self::trace(&format!("[virgl] fed {n} bytes, {waiting} waiting\n"));
+                }
                 if waiting > 0 {
                     let at = s.out.len();
                     s.out.resize(at + waiting as usize, 0);
