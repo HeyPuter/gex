@@ -109,6 +109,7 @@ function syncReport(line) {
   } catch (e) { /* the server has gone; nothing to be done from here */ }
 }
 let report = () => {};
+let hotDump = () => {};
 let drew = () => {};
 class PageEnv extends Env {
   write(fd, bytes) {
@@ -117,7 +118,7 @@ class PageEnv extends Env {
     // it interleaves correctly with the renderer's own lines. Two channels
     // with different latencies produce a plausible ordering that is not the
     // real one, and the whole point of this trace is what came last.
-    if (TRACE && fd === 2) syncReport(text.trimEnd());
+    if (TRACE && fd === 2) { syncReport(text.trimEnd()); hotDump(); }
     output += text;
     paint();
     for (const line of text.split('\\n')) {
@@ -208,6 +209,34 @@ try {
   // only window into a stretch that makes no syscalls and runs no JavaScript.
   e.gex_set_heartbeat?.(BigInt(process_HEARTBEAT));
   if (__MISSES__) e.gex_set_trace_misses?.(1);
+  // The guest's hottest back edges, every so often, on the synchronous
+  // channel. This is the browser's answer to the native host's --sample:
+  // the heartbeat alone reports whichever address happened to be current,
+  // which for a regular loop is the same two or three forever and says
+  // nothing about the shape of the work.
+  if (TRACE && e.gex_hot_blocks) {
+    let n = 0;
+    // One buffer, allocated once. And wrapped, because this is called from
+    // inside the guest's own write: anything thrown here unwinds the guest
+    // rather than the reporter, which ended three runs early and made the
+    // samples look frozen when they were simply the last before the crash.
+    let at = 0;
+    hotDump = () => {
+      if (++n % 4) return;
+      try {
+        if (!at) at = e.gex_alloc(2048) >>> 0;
+        const len = e.gex_hot_blocks(at, 2048) >>> 0;
+        if (len) {
+          syncReport('[hot] ' +
+            new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, len))
+              .trim().split('\\n').join(' | '));
+        }
+      } catch (err) {
+        syncReport('[hot] sampling failed: ' + (err?.message || err));
+        hotDump = () => {};
+      }
+    };
+  }
   // Static recompilation: translate each shared object whole as the guest
   // maps it, rather than meeting it a dispatch miss at a time. The value is
   // a cap in KiB of mapped text -- see run-node.mjs for why 8192.

@@ -2674,6 +2674,27 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
             BEAT = BEAT.wrapping_add(1);
             BEAT
         };
+        // Where the guest's back edges are, counted.
+        //
+        // The native host has had `--sample` for a while and a page has had
+        // nothing: the heartbeat prints whichever pc happened to be current
+        // when it fired, which for a regular loop is the same two or three
+        // addresses over and over and says nothing about the shape of the
+        // work. A count over every safepoint does.
+        unsafe {
+            let slot = (pc as u64 as usize >> 2) % HOT_SLOTS;
+            if HOT_PC[slot] == pc as u64 {
+                HOT_N[slot] += 1;
+            } else if HOT_N[slot] == 0 {
+                HOT_PC[slot] = pc as u64;
+                HOT_N[slot] = 1;
+            } else {
+                // Someone else's slot. Age it rather than fight over it, so
+                // a genuinely hot address wins the slot within a few
+                // thousand samples instead of never.
+                HOT_N[slot] -= 1;
+            }
+        }
         if beat.is_multiple_of(every) {
             // With the threads, because a spin says nothing on its own. A
             // guest looping over three addresses for two million safepoints
@@ -3374,6 +3395,44 @@ pub extern "C" fn gex_jit_installed() {
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
         }
     });
+}
+
+/// A direct-mapped table of back-edge counts, keyed by guest pc.
+///
+/// Direct-mapped and lossy on purpose: this runs on every safepoint, so it
+/// has to be a shift, a compare and an add. Collisions age each other out,
+/// which costs accuracy on a flat profile and none at all on the peaked one
+/// this exists to find.
+const HOT_SLOTS: usize = 4096;
+static mut HOT_PC: [u64; HOT_SLOTS] = [0; HOT_SLOTS];
+static mut HOT_N: [u64; HOT_SLOTS] = [0; HOT_SLOTS];
+
+/// The hottest back edges, as `pc count` lines, most first.
+///
+/// Deliberately without `with_host`. This is read from inside the guest's
+/// own `write`, which is already inside it, and re-entering panics -- the
+/// trap comes back as a bare "unreachable" and unwinds the guest rather
+/// than the reporter. Symbolising the addresses needs the VMA list and so
+/// needs the lock, so it is not done here; `gex_object_at` does it when the
+/// caller is somewhere safe, and the raw addresses are useful without it.
+#[no_mangle]
+pub extern "C" fn gex_hot_blocks(out: u32, max: u32) -> u32 {
+    let mut top: Vec<(u64, u64)> = unsafe {
+        HOT_N.iter()
+            .enumerate()
+            .filter(|(_, &n)| n > 0)
+            .map(|(i, &n)| (n, HOT_PC[i]))
+            .collect()
+    };
+    top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    top.truncate(12);
+    let mut text = String::new();
+    for (n, pc) in top {
+        text.push_str(&format!("{pc:#x} {n}\n"));
+    }
+    let n = text.len().min(max as usize);
+    shim_slice_mut(out, n as u32).copy_from_slice(&text.as_bytes()[..n]);
+    n as u32
 }
 
 /// How often the safepoint says where the guest is; zero is off.
