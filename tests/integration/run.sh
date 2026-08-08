@@ -551,6 +551,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
 "$CC" -static -O2 -o "$WORK/selfmod" "$HERE/programs/selfmod.c"
+"$CC" -static -O2 -o "$WORK/virgl-handshake" "$HERE/programs/virgl-handshake.c"
 "$CC" -static -no-pie -O2 -o "$WORK/init" "$HERE/programs/init.c"
 "$CC" -static -no-pie -O2 -pthread -o "$WORK/forkthread" "$HERE/programs/forkthread.c"
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
@@ -879,6 +880,25 @@ fi
 # for `rt_sigsuspend`, the native shim learned it, and the browser shim was
 # left with two non-exhaustive matches for however long it took someone to
 # rebuild the page.
+# The vtest handshake, over the socket the guest's Mesa would use. QEMU is no
+# oracle -- it has no renderer behind that socket -- and the capability set
+# differs by host, so what is checked is that the answer arrives whole: the
+# size is announced and then that many bytes follow. The size itself is
+# printed, because it is the one number that says which renderer answered.
+if out=$("$GEXC" run "$WORK/virgl-handshake" 2>&1); then
+    echo "$out" | sed -n 's/^capset reply/     capset reply/p'
+    if echo "$out" | grep -q "^capset read whole$"; then
+        echo "ok   virgl-handshake"
+        pass=$((pass + 1))
+    else
+        echo "FAIL virgl-handshake: the capability set did not arrive whole"
+        echo "$out" | sed 's/^/     /' | head -6
+        fail=$((fail + 1))
+    fi
+else
+    echo "skip virgl-handshake: no renderer in this build"
+fi
+
 # virglrenderer, compiled to wasm, coming up on a WebGL 2 context in a real
 # browser. Not a translation test at all -- it is the other half of the
 # graphics path: the native runtime gives the guest a GPU by handing VirGL to

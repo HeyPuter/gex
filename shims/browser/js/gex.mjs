@@ -63,7 +63,7 @@ function metadataSection(wasm) {
 }
 
 export class Gex {
-  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null;
+  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #virgl = null;
 
   constructor(env = new Env()) {
     this.#env = env;
@@ -131,6 +131,15 @@ export class Gex {
         // commands in its own memory; this hands over the address and the
         // page runs them on WebGL. Nothing is copied in either direction.
         gl_submit: (ring) => (this.#gl ? this.#gl.submit(this.#memory, ring >>> 0) : -1),
+        // And the other way of giving the guest a GPU: unmodified Mesa in
+        // the guest, speaking VirGL over a socket, decoded by virglrenderer
+        // compiled to wasm. Bytes rather than an address, because that
+        // renderer is a separate module with a heap of its own -- see
+        // web/src/virgl.js.
+        virgl_submit: (ptr, len) =>
+          this.#virgl ? this.#virgl.submit(this.#memory, ptr >>> 0, len >>> 0) : -1,
+        virgl_take: (ptr, max) =>
+          this.#virgl ? this.#virgl.take(this.#memory, ptr >>> 0, max >>> 0) : 0,
       },
     });
     this.#u8 = new Uint8Array(this.#memory.buffer);
@@ -153,6 +162,12 @@ export class Gex {
     }
     // Whatever `useGl` was told before the shim existed.
     this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+    // Only when there really is one: a guest that connects to a socket
+    // nobody serves is worse off than one that finds no socket at all,
+    // because Mesa's vtest winsys does not fall back -- it writes its
+    // handshake into the dead descriptor and blocks on a reply that cannot
+    // come.
+    this.#shim.exports.gex_set_virgl?.(this.#virgl ? 1 : 0);
     // wasm-ld puts the shim's stack at address zero regardless of
     // --global-base, which is the guest's image. Move it into the shim's own
     // region, above everything the guest maps. Nothing has run yet.
@@ -294,6 +309,25 @@ export class Gex {
     // /dev/gex-gl and does not find it concludes it has no graphics. Calling
     // this afterwards still works for a second run.
     this.#shim?.exports?.gex_set_gl?.(gl ? 1 : 0);
+  }
+
+  /**
+   * Give the guest a virtio-gpu renderer instead.
+   *
+   * The other way of giving a guest a GPU, and the one that needs nothing of
+   * the guest: `useGl` wants the program linked against gex's own libGLESv2,
+   * while this wants Debian's Mesa and no changes at all. `renderer` is a
+   * `VirglRenderer` from `web/src/virgl.js`.
+   *
+   * Before `load`, for a stronger reason than `useGl`: the socket is bound
+   * while the guest's namespace is built, and Mesa's vtest winsys does not
+   * fall back when it is missing -- it takes the ECONNREFUSED, writes its
+   * handshake into the dead descriptor and blocks on a reply that cannot
+   * come. A late call gives the next run a GPU and this one a hang.
+   */
+  useVirgl(renderer) {
+    this.#virgl = renderer;
+    this.#shim?.exports?.gex_set_virgl?.(renderer ? 1 : 0);
   }
 
   async run(entry) {

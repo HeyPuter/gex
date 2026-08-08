@@ -185,3 +185,35 @@ mod tests {
         assert_eq!(super::map(&items, &|n: &usize| n + 1), vec![1, 2, 3]);
     }
 }
+
+/// A stopwatch that exists only where there is a clock.
+///
+/// `std::time::Instant::now()` does not merely return something useless on
+/// wasm32-unknown-unknown -- it panics, "time not implemented on this
+/// platform". Timing added to a shared crate for the native build therefore
+/// takes the browser down with it, and on wasm32 a Rust panic is a bare
+/// `unreachable`: what the page sees is `RuntimeError: unreachable`, with no
+/// file, no line and no message. One `Instant::now` in `ModuleBuilder::finish`
+/// broke every runtime translation in the browser and cost a bisect to find.
+pub struct Stopwatch(#[cfg(not(target_family = "wasm"))] std::time::Instant);
+
+impl Stopwatch {
+    pub fn start() -> Stopwatch {
+        Stopwatch(
+            #[cfg(not(target_family = "wasm"))]
+            std::time::Instant::now(),
+        )
+    }
+
+    /// Seconds since `start`, and zero where there is no clock to ask.
+    pub fn secs(&self) -> f64 {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.0.elapsed().as_secs_f64()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            0.0
+        }
+    }
+}

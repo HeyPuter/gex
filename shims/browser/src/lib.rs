@@ -53,6 +53,7 @@ use gex_kernel::{GuestMem, Kernel, SyscallOutcome, ThreadState};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 pub mod gl;
+pub mod virgl;
 
 use std::sync::Arc;
 
@@ -477,6 +478,11 @@ struct Jit {
 
 struct Host {
     kernel: Kernel,
+    /// The virtio-gpu renderer, when the page brought one. Held here rather
+    /// than in the kernel because the scheduler is what pumps it, and the
+    /// scheduler is the one place every thread passes through on its way to
+    /// waiting for a reply.
+    virgl: Option<crate::virgl::VirglDevice>,
     /// The root filesystem, kept so files can be added before the guest runs.
     root: Arc<gex_kernel::vfs::TmpFs>,
     /// The snapshot `/proc` reads from, refreshed before each syscall that
@@ -555,7 +561,30 @@ fn guest_bytes() -> &'static mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(p, len) }
 }
 
+/// Make a panic say what it was.
+///
+/// On wasm32 a Rust panic is a bare `unreachable`, and what reaches the page
+/// is `RuntimeError: unreachable` with no file, no line and no message. That
+/// is the whole of the diagnosis for any bug in the shim, which is not
+/// enough to act on -- it took a bisect to find out even which subsystem had
+/// failed. The hook writes the message and location to stderr through the
+/// import the guest's own output uses, so a panic reads like a panic.
+///
+/// Installed on the first `with_host`, which every entry point goes through.
+fn install_panic_hook() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let text = format!("gex: panic in the shim: {info}\n");
+            // SAFETY: the one thread a page has, and `write` only reads.
+            unsafe { write(2, text.as_ptr() as u32, text.len() as u32) };
+        }));
+    });
+}
+
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+    install_panic_hook();
     HOST.with(|h| f(h.borrow_mut().as_mut().expect("gex: not initialised")))
 }
 
@@ -622,6 +651,19 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         devfs.add("gex-gl", crate::gl::GlDevice::new());
     }
     kernel.vfs.mount("/dev", Arc::new(devfs));
+    // The virtio-gpu renderer, bound where Mesa's vtest winsys looks. Only
+    // when the page brought one: a guest that connects to a socket nobody
+    // serves is worse off than one that finds no socket, because Mesa's
+    // winsys does not fall back -- it writes its handshake into the dead
+    // descriptor and blocks reading a reply that cannot come.
+    let virgl = crate::virgl::have_virgl().then(|| {
+        let device = crate::virgl::VirglDevice::new();
+        kernel.socket_names.bind_host(
+            crate::virgl::DEFAULT_SOCKET,
+            Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
+        );
+        device
+    });
     // `/tmp` is part of the root filesystem rather than a mount of its own,
     // so a page can bundle a file at any path at all. A mount there meant a
     // bundled `/tmp/x` went into the root and every lookup of it went to the
@@ -758,6 +800,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     HOST.with(|h| {
         *h.borrow_mut() = Some(Host {
             kernel,
+            virgl,
             root,
             proc_state,
             threads: vec![Thread {
@@ -1455,6 +1498,12 @@ fn now_ns() -> u64 {
 /// Returns 2 when the process is over and 1 to re-enter the guest.
 fn schedule() -> i32 {
     loop {
+        // Before anything is chosen. A vtest client writes a request and then
+        // blocks reading the reply, and both are syscalls, so the renderer
+        // has to run in between -- here, which is the one place every thread
+        // passes through on its way to waiting. Nothing is ready to run until
+        // it has.
+        with_host(|h| h.virgl.clone()).map(|v| v.pump());
         let pick = with_host(|h| {
             // Nothing left that could ever run again ends the process, and
             // the exit status is the one the main thread would have given.

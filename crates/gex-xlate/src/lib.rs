@@ -294,22 +294,22 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
 /// breakdown the next round of that is guesswork.
 struct Phases {
     on: bool,
-    last: std::time::Instant,
+    last: gex_emit::par::Stopwatch,
 }
 
 impl Phases {
     fn start() -> Phases {
         Phases {
             on: std::env::var_os("GEX_TIMING").is_some(),
-            last: std::time::Instant::now(),
+            last: gex_emit::par::Stopwatch::start(),
         }
     }
 
     fn mark(&mut self, what: &str) {
         if self.on {
-            eprintln!("[timing] {what}: {:.2}s", self.last.elapsed().as_secs_f64());
+            eprintln!("[timing] {what}: {:.2}s", self.last.secs());
         }
-        self.last = std::time::Instant::now();
+        self.last = gex_emit::par::Stopwatch::start();
     }
 }
 
