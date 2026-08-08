@@ -1169,6 +1169,26 @@ else
     echo "skip threads-shared: no node, or no shared-memory build"
 fi
 
+# fork, wait and kill across two Workers with *separate* address spaces --
+# which is the whole of what the snapshot switcher exists to make possible.
+# The switcher keeps every process in one memory because the process table is
+# an ordinary Rust structure and structures live in a memory; put it in the
+# global kernel's memory instead and two processes need share nothing else.
+if [ -n "$NODE" ] && [ -f web/public/gex/gex_kernel.wasm ]; then
+    out=$("$NODE" web/test/procs-shared.mjs 2>&1 || true)
+    case "$out" in
+        ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
+        skip*) echo "$out" | head -1 ;;
+        *)
+            echo "FAIL procs-shared: two address spaces cannot share a process table"
+            echo "$out" | sed 's/^/     /' | head -6
+            fail=$((fail + 1))
+            ;;
+    esac
+else
+    echo "skip procs-shared: no node, or shims/kernel/build.sh has not been run"
+fi
+
 # The demo page's terminal. Not a translation test: it checks the seam above
 # the runtime, where a keystroke has to travel from an xterm through the line
 # discipline into a parked guest read. That seam broke once without any test

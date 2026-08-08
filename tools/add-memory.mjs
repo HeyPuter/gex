@@ -75,7 +75,11 @@ const entry = [
 ];
 
 let at = 8; // past the magic and version
-const out = [...src.subarray(0, 8)];
+// Chunks, concatenated once at the end, rather than one big array pushed
+// into. `out.push(...section)` spreads every byte as an argument, and a
+// section of any real size overflows the call stack -- which it duly did as
+// soon as this module grew a standard library.
+const chunks = [src.subarray(0, 8)];
 let found = false;
 
 while (at < src.length) {
@@ -89,11 +93,15 @@ while (at < src.length) {
     // rather than adjusted.
     let count, after;
     [count, after] = uleb(src, bodyAt);
-    const body = [...enc(count + 1), ...src.subarray(after, end), ...entry];
-    out.push(2, ...enc(body.length), ...body);
+    const body = Uint8Array.from([
+      ...enc(count + 1),
+      ...src.subarray(after, end),
+      ...entry,
+    ]);
+    chunks.push(Uint8Array.from([2, ...enc(body.length)]), body);
     found = true;
   } else {
-    out.push(...src.subarray(at, end));
+    chunks.push(src.subarray(at, end));
   }
   at = end;
 }
@@ -106,7 +114,15 @@ if (!found) {
   process.exit(1);
 }
 
-const result = new Uint8Array(out);
+const total = chunks.reduce((n, c) => n + c.length, 0);
+const result = new Uint8Array(total);
+{
+  let at = 0;
+  for (const c of chunks) {
+    result.set(c, at);
+    at += c.length;
+  }
+}
 // Compile it here rather than discovering at run time that the surgery was
 // wrong. This is the only check that the appended entry is well formed and
 // that the `memory.copy` instructions referring to it now validate.

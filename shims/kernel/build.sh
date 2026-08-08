@@ -32,5 +32,5 @@ RUSTFLAGS="-C link-arg=--import-memory \
   -C link-arg=--export-table \
   -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
   cargo +nightly build -p gex-kernel-wasm --target wasm32-unknown-unknown \
-    --release -Z build-std=core,panic_abort --target-dir target/shared-kernel
+    --release -Z build-std=std,panic_abort --target-dir target/shared-kernel
 node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.wasm env process

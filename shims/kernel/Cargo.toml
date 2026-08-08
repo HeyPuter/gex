@@ -8,3 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 gex-kmem.workspace = true
+gex-kernel.workspace = true
