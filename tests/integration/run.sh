@@ -769,6 +769,25 @@ if [ -n "$NODE" ] && [ -x "$WORK/park" ]; then
 else
     echo "skip park-across-switch: no node or no program"
 fi
+
+# Two guest processes in two Workers, each with its own WebAssembly.Memory.
+# The first step of replacing the snapshot switcher: a private address space
+# per process is what stops two processes' libraries landing on each other,
+# which is the reason a switch has to copy 223 MiB in the first place.
+if [ -n "$NODE" ] && [ -x "$WORK/park" ] && [ -x "$WORK/background" ]; then
+    out=$(timeout 300 "$NODE" "$HERE/../../web/test/worker.mjs" \
+              "$WORK/park" "$WORK/background" 2>&1 || true)
+    if [ "$(echo "$out" | grep -c "^ok   worker-")" = "2" ]; then
+        echo "ok   worker-processes (two, each in its own address space)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL worker-processes: a guest did not run in a Worker"
+        echo "$out" | sed 's/^/     /' | head -6
+        fail=$((fail + 1))
+    fi
+else
+    echo "skip worker-processes: no node or no programs"
+fi
 # argv and envp reach the new program, a close-on-exec descriptor is gone and
 # an ordinary one survives with its offset, and a failed exec returns.
 expect "exec" "argc=4 [child] [two] [three]
