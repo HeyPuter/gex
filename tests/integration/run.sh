@@ -1189,6 +1189,26 @@ else
     echo "skip procs-shared: no node, or shims/kernel/build.sh has not been run"
 fi
 
+# A pipe whose two ends are in different address spaces. A shell pipeline is
+# two processes and a pipe, and apt is a process and four method workers on
+# pairs of them; under the switcher those processes must share a memory,
+# because a pipe is an `Arc<Pipe>` and a pointer means a memory. In the global
+# kernel it is a number, and the bytes cross by being copied.
+if [ -n "$NODE" ] && [ -f web/public/gex/gex_kernel.wasm ]; then
+    out=$("$NODE" web/test/pipe-shared.mjs 2>&1 || true)
+    case "$out" in
+        ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
+        skip*) echo "$out" | head -1 ;;
+        *)
+            echo "FAIL pipe-shared: a pipe does not cross two address spaces"
+            echo "$out" | sed 's/^/     /' | head -6
+            fail=$((fail + 1))
+            ;;
+    esac
+else
+    echo "skip pipe-shared: no node, or shims/kernel/build.sh has not been run"
+fi
+
 # The demo page's terminal. Not a translation test: it checks the seam above
 # the runtime, where a keystroke has to travel from an xterm through the line
 # discipline into a parked guest read. That seam broke once without any test

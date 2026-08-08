@@ -148,6 +148,105 @@ pub extern "C" fn k_halt_code() -> i32 {
     procs().halt_code().unwrap_or(-1)
 }
 
+// -- pipes -------------------------------------------------------------------
+//
+// The second thing processes share, and the one a shell pipeline and apt's
+// method workers are made of. A pipe is a buffer with two ends and a pair of
+// counts, which is exactly the kind of state that forced every process into
+// one address space: `Arc<Pipe>` is a pointer, and a pointer means a memory.
+//
+// Here it is a *number* instead. Each process's file table holds an id and the
+// buffer lives in the global memory, so the two ends can be in Workers that
+// share nothing else.
+
+/// Every pipe in the system, by id.
+fn pipes() -> &'static std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::pipe::Pipe>>> {
+    static PIPES: OnceLock<std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::pipe::Pipe>>>> =
+        OnceLock::new();
+    PIPES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn pipe_at(id: i32) -> Option<std::sync::Arc<gex_kernel::pipe::Pipe>> {
+    pipes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id as usize)
+        .cloned()
+}
+
+/// Make a pipe with both ends open. Returns its id.
+#[no_mangle]
+pub extern "C" fn k_pipe_new() -> i32 {
+    let mut t = pipes().lock().unwrap_or_else(|e| e.into_inner());
+    t.push(std::sync::Arc::new(gex_kernel::pipe::Pipe::new()));
+    (t.len() - 1) as i32
+}
+
+/// Another descriptor onto one end, as `dup` and `fork` both make.
+#[no_mangle]
+pub extern "C" fn k_pipe_open_end(id: i32, write: i32) {
+    if let Some(p) = pipe_at(id) {
+        p.open_end(write != 0);
+    }
+}
+
+/// Drop a descriptor. The last one on an end is what a reader sees as EOF.
+#[no_mangle]
+pub extern "C" fn k_pipe_close_end(id: i32, write: i32) {
+    if let Some(p) = pipe_at(id) {
+        p.close_end(write != 0);
+    }
+}
+
+/// Write `len` bytes of the caller's memory into the pipe.
+///
+/// The bytes are copied out of the calling process's memory first, because
+/// this module cannot address it -- that copy is what makes the two ends able
+/// to live in different address spaces at all. Returns bytes written, or a
+/// negative errno.
+#[no_mangle]
+pub extern "C" fn k_pipe_write(id: i32, at: u32, len: u32) -> i32 {
+    let Some(p) = pipe_at(id) else { return -9 }; // EBADF
+    let mut buf = vec![0u8; len as usize];
+    unsafe { gex_kmem::pull(buf.as_mut_ptr(), at, len) };
+    match p.write(&buf) {
+        Ok(n) => n as i32,
+        Err(e) => -(e.0 as i32),
+    }
+}
+
+/// Read up to `len` bytes into the caller's memory. See [`k_pipe_write`].
+#[no_mangle]
+pub extern "C" fn k_pipe_read(id: i32, at: u32, len: u32) -> i32 {
+    let Some(p) = pipe_at(id) else { return -9 };
+    let mut buf = vec![0u8; len as usize];
+    match p.read(&mut buf) {
+        Ok(n) => {
+            unsafe { gex_kmem::push(at, buf.as_ptr(), n as u32) };
+            n as i32
+        }
+        Err(e) => -(e.0 as i32),
+    }
+}
+
+/// Would a read block? False also when every writer has gone, which is EOF.
+#[no_mangle]
+pub extern "C" fn k_pipe_readable(id: i32) -> i32 {
+    pipe_at(id).is_some_and(|p| p.readable()) as i32
+}
+
+/// Would a write block?
+#[no_mangle]
+pub extern "C" fn k_pipe_writable(id: i32) -> i32 {
+    pipe_at(id).is_some_and(|p| p.writable()) as i32
+}
+
+/// How many bytes are waiting, for `FIONREAD` and for a poll's report.
+#[no_mangle]
+pub extern "C" fn k_pipe_buffered(id: i32) -> i32 {
+    pipe_at(id).map_or(0, |p| p.buffered() as i32)
+}
+
 /// Copy `len` bytes of the calling process's memory in, and report their sum.
 ///
 /// The shape every syscall taking a pointer will use: the argument names an
