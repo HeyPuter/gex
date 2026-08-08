@@ -483,6 +483,18 @@ struct Jit {
     described: bool,
     /// Addresses whose slot now holds real code.
     translated: std::collections::HashSet<u64>,
+    /// Slots that code of a given identity was translated into, for the whole
+    /// tab rather than for one process.
+    ///
+    /// Keyed by the guest address of the page and by what the bytes there
+    /// are: the file, the offset within it, and the length of the mapping.
+    /// Two processes that map the same library at the same address hash to
+    /// the same key and share the slots, so the second one dispatches into
+    /// translations the first already paid for.
+    ///
+    /// Not part of a process's saved state. That is the point -- it outlives
+    /// every `fork` and `execve`, which is where the waste was.
+    shared: std::collections::HashMap<(u64, u64), u32>,
     /// A module JS has yet to instantiate.
     pending: Option<Vec<u8>>,
     /// The slots it defines, once JS asks.
@@ -762,9 +774,17 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         if seg.executable {
             p |= gex_kernel::mem::prot::EXEC;
         }
-        kernel
-            .mem
-            .insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]");
+        kernel.mem.insert_from(
+            seg.vaddr,
+            seg.vaddr + seg.mem_size,
+            p,
+            "[image]",
+            // The path is not known yet -- argv is parsed below -- and this
+            // load happens once in the life of a tab, so a marker is as
+            // unique as a name would be. An `execve` later uses the real
+            // path, so nothing can collide with this by accident.
+            Some(("[initial]".to_string(), seg.vaddr)),
+        );
     }
 
     // argv arrives as a NUL-separated blob in the shim's own region.
@@ -847,6 +867,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 described: meta.next_slot != 0,
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
                 translated: Default::default(),
+                shared: Default::default(),
                 pending: None,
                 pending_dirs: Vec::new(),
                 pending_slots: 0,
@@ -1569,9 +1590,15 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         if seg.executable {
             prot |= gex_kernel::mem::prot::EXEC;
         }
-        h.kernel
-            .mem
-            .insert(seg.vaddr, seg.vaddr + seg.mem_size, prot, "[image]");
+        // Named by the program, so the next process to run it shares what
+        // was translated. `/proc/self/maps` still says `[image]`.
+        h.kernel.mem.insert_from(
+            seg.vaddr,
+            seg.vaddr + seg.mem_size,
+            prot,
+            "[image]",
+            Some((path.to_string(), seg.vaddr)),
+        );
     }
     let layout = gex_ld::build_initial_stack(
         &program.exe,
@@ -1623,6 +1650,36 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     }];
     h.current = 0;
     program.entry()
+}
+
+/// What identifies the code at `page`, when anything does.
+///
+/// `None` for a page that could change under us -- anything writable, and
+/// anything with no file behind it. Sharing slots for those would be the
+/// bug this is careful to avoid: a slot whose contents no longer match the
+/// bytes it was translated from.
+///
+/// The length of the mapping is in the key as well as the offset, because a
+/// translation can follow a branch past the end of the page it started in.
+/// Same file, same offset and same length means the whole reachable extent is
+/// the same, which is what makes the sharing sound rather than probable.
+fn page_identity(h: &Host, page: u64) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let v = h
+        .kernel
+        .mem
+        .vmas()
+        .iter()
+        .find(|v| page >= v.start && page < v.end)?;
+    if v.prot & gex_kernel::mem::prot::WRITE != 0 {
+        return None;
+    }
+    let (id, off) = v.origin.as_ref()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    (off + (page - v.start)).hash(&mut hasher);
+    (v.end - v.start).hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 /// Nanoseconds on the host clock.
@@ -1906,7 +1963,12 @@ fn schedule() -> i32 {
                     // frame, and branched to address 0x80 with 17 -- SIGCHLD
                     // -- still sitting in x0 where the handler's first
                     // argument goes.
-                    SyscallOutcome::Resume(target) => pc = target,
+                    SyscallOutcome::Resume(target) => {
+                        if tracing() {
+                            trace_line(&format!("[sig] resume at {target:#x}\n"));
+                        }
+                        pc = target;
+                    }
                     SyscallOutcome::Killed { signal, .. } => {
                         h.exit = Some(128 + signal as i32);
                         return None;
@@ -2232,6 +2294,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             h.kernel.leave_thread(&mut h.threads[h.current].kstate);
             match r {
                 Ok(target) => {
+                    if tracing() {
+                        trace_line(&format!("[sig] sigreturn to {target:#x}\n"));
+                    }
                     h.threads[h.current].pc = target;
                     h.resume = Some(target);
                     h.resume_ctx = Some(kstate.ctx_addr);
@@ -2262,6 +2327,28 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if !exec.iter().any(|(a, b)| pc >= *a && pc + 4 <= *b) {
             return false;
         }
+        // Before anything is translated: if this page's code has been
+        // translated already, by another process or by this one before an
+        // `execve`, point the page at those slots instead of claiming more.
+        // The page table is keyed by dispatch page, which is an index; the
+        // identity is asked about an address, because that is what names a
+        // mapping.
+        let page = gex_abi::dispatch_page(pc);
+        if h.jit.page_table.lookup(page).is_none() {
+            if let Some(key) = page_identity(h, page * gex_abi::DISPATCH_PAGE) {
+                if let Some(&base) = h.jit.shared.get(&(page, key)) {
+                    h.jit.page_table.assign(page, base);
+                    // And the guest's directory, which `execve` cleared.
+                    // Only *freshly allocated* pages get an entry from the
+                    // translation unit, and this page is not fresh -- it has
+                    // a base already. Without writing it here the branch
+                    // misses again on the very next instruction, translating
+                    // one block per turn forever.
+                    let mut gm = GuestMem::new(guest_bytes());
+                    let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+                }
+            }
+        }
         let started = now_ns();
         let known = std::mem::take(&mut h.jit.translated);
         let (unit, stats) = gex_xlate::translate_runtime(
@@ -2283,6 +2370,15 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             return false;
         }
         h.jit.page_table = unit.page_table.clone();
+        // And what this translation claimed, so the next process to run the
+        // same code finds it. Recorded rather than overwritten: a page that
+        // already has an owner keeps it, because the code just emitted names
+        // whichever base it was given.
+        for (page, base) in &unit.dir_entries {
+            if let Some(key) = page_identity(h, *page * gex_abi::DISPATCH_PAGE) {
+                h.jit.shared.entry((*page, key)).or_insert(*base);
+            }
+        }
         for (addr, _) in &unit.exported_blocks {
             h.jit.translated.insert(*addr);
         }

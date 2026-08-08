@@ -12,9 +12,13 @@
  *
  * So this starts a child that stays alive, keeps working in the parent while
  * it does, sends it a message it can only receive by being scheduled, and
- * collects it at the end. Every line is ordered by something -- a pipe read,
- * a write, an exit status -- rather than by timing, so the output is the same
- * under QEMU and in a page.
+ * collects it at the end.
+ *
+ * Every line has to be ordered by an event -- a pipe read, a write, an exit
+ * status -- and not by which process happens to be running. Two processes
+ * that both print before either waits produce whichever order the scheduler
+ * chose, and the first version of this file did exactly that and passed or
+ * failed depending on the run.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,9 +47,11 @@ int main(void) {
     if (kid == 0) {
         close(down[1]);
         close(up[0]);
-        /* Alive and waiting. The parent has to run to send anything, so
-         * reaching the end of this read at all is the whole test. */
-        put("child: waiting for work\n");
+        /* Nothing is printed before the read. The parent has to run to send
+         * anything, so reaching the end of this read at all is the whole
+         * test -- and a line printed *before* it would be ordered by nothing
+         * but scheduling, which is how the first version of this file came
+         * out one way under QEMU and the other in a page. */
         char buf[32];
         ssize_t n = read(down[0], buf, sizeof buf - 1);
         if (n <= 0) {

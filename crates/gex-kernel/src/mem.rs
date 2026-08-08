@@ -40,6 +40,32 @@ pub struct Vma {
     pub prot: u32,
     /// A short label for `/proc/self/maps`.
     pub name: String,
+    /// Where these bytes came from, when they came from somewhere nameable:
+    /// the file, and the offset within it that `start` corresponds to.
+    ///
+    /// This is not for `/proc`. It is what lets two processes that map the
+    /// same library at the same address agree that the *code* is the same,
+    /// and so share the dispatch slots and the translations that went into
+    /// them. Without it every `execve` starts a fresh page table and pays for
+    /// libc again -- and in a browser tab, where the dispatch table cannot
+    /// grow past ten million slots, paying twice is not merely slow.
+    pub origin: Option<(String, u64)>,
+}
+
+impl Vma {
+    /// A piece of this mapping, with the origin offset moved to match.
+    fn slice(&self, start: u64, end: u64, prot: u32) -> Vma {
+        Vma {
+            start,
+            end,
+            prot,
+            name: self.name.clone(),
+            origin: self
+                .origin
+                .as_ref()
+                .map(|(id, off)| (id.clone(), off + (start - self.start))),
+        }
+    }
 }
 
 /// The process's address space.
@@ -81,11 +107,29 @@ impl MemoryMap {
     /// Record a mapping made outside the allocator, such as an ELF segment or
     /// the initial stack.
     pub fn insert(&mut self, start: u64, end: u64, prot: u32, name: &str) {
+        self.insert_from(start, end, prot, name, None);
+    }
+
+    /// As [`Self::insert`], recording where the bytes came from.
+    pub fn insert_from(
+        &mut self,
+        start: u64,
+        end: u64,
+        prot: u32,
+        name: &str,
+        origin: Option<(String, u64)>,
+    ) {
+        let aligned = page_align_down(start);
+        // The offset moves with the start: the caller names the offset of the
+        // address it asked for, and rounding down to a page boundary walks
+        // backwards into the file by the same amount.
+        let origin = origin.map(|(id, off)| (id, off.saturating_sub(start - aligned)));
         self.vmas.push(Vma {
-            start: page_align_down(start),
+            start: aligned,
             end: page_align_up(end),
             prot,
             name: name.to_string(),
+            origin,
         });
         self.vmas.sort_by_key(|v| v.start);
     }
@@ -132,6 +176,19 @@ impl MemoryMap {
     /// Allocation is top-down from [`MMAP_TOP`], matching Linux's default
     /// layout, so the heap growing up and mappings growing down stay apart.
     pub fn mmap(&mut self, addr: u64, len: u64, prot: u32, flags: u64, name: &str) -> SysResult {
+        self.mmap_from(addr, len, prot, flags, name, None)
+    }
+
+    /// As [`Self::mmap`], recording the file and offset the bytes came from.
+    pub fn mmap_from(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u32,
+        flags: u64,
+        name: &str,
+        origin: Option<(String, u64)>,
+    ) -> SysResult {
         if len == 0 {
             return Err(Errno::EINVAL);
         }
@@ -147,7 +204,7 @@ impl MemoryMap {
             }
             // MAP_FIXED replaces whatever was there.
             self.unmap(addr, len)?;
-            self.insert(addr, end, prot, name);
+            self.insert_from(addr, end, prot, name, origin);
             return Ok(addr);
         }
 
@@ -155,7 +212,7 @@ impl MemoryMap {
         if addr != 0 && addr.is_multiple_of(PAGE_SIZE) {
             let end = addr.saturating_add(len);
             if end <= GUEST_LIMIT && self.is_free(addr, end) {
-                self.insert(addr, end, prot, name);
+                self.insert_from(addr, end, prot, name, origin);
                 return Ok(addr);
             }
         }
@@ -168,7 +225,7 @@ impl MemoryMap {
             let start = page_align_down(candidate - len);
             if self.is_free(start, start + len) {
                 self.mmap_next = start;
-                self.insert(start, start + len, prot, name);
+                self.insert_from(start, start + len, prot, name, origin);
                 return Ok(start);
             }
             // Skip below the mapping that got in the way.
@@ -251,20 +308,10 @@ impl MemoryMap {
                 continue;
             }
             if v.start < addr {
-                out.push(Vma {
-                    start: v.start,
-                    end: addr,
-                    prot: v.prot,
-                    name: v.name.clone(),
-                });
+                out.push(v.slice(v.start, addr, v.prot));
             }
             if v.end > end {
-                out.push(Vma {
-                    start: end,
-                    end: v.end,
-                    prot: v.prot,
-                    name: v.name.clone(),
-                });
+                out.push(v.slice(end, v.end, v.prot));
             }
         }
         out.sort_by_key(|v| v.start);
@@ -288,26 +335,11 @@ impl MemoryMap {
             }
             touched = true;
             if v.start < addr {
-                out.push(Vma {
-                    start: v.start,
-                    end: addr,
-                    prot: v.prot,
-                    name: v.name.clone(),
-                });
+                out.push(v.slice(v.start, addr, v.prot));
             }
-            out.push(Vma {
-                start: v.start.max(addr),
-                end: v.end.min(end),
-                prot: new_prot,
-                name: v.name.clone(),
-            });
+            out.push(v.slice(v.start.max(addr), v.end.min(end), new_prot));
             if v.end > end {
-                out.push(Vma {
-                    start: end,
-                    end: v.end,
-                    prot: v.prot,
-                    name: v.name.clone(),
-                });
+                out.push(v.slice(end, v.end, v.prot));
             }
         }
         out.sort_by_key(|v| v.start);

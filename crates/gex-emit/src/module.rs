@@ -120,6 +120,20 @@ impl PageTable {
         base
     }
 
+    /// Point a page at slots that already hold code for it.
+    ///
+    /// For a host that knows two processes have the same bytes at the same
+    /// address -- the same library mapped from the same file at the same
+    /// offset -- and so can share what was translated from them. Without it
+    /// every `execve` re-translates libc into fresh slots, which is 4.2 times
+    /// the slots and 4.2 times the work for the same code.
+    ///
+    /// The caller owns the claim that the bytes match. Assigning a base whose
+    /// slots hold something else is the same defect as reusing a freed one.
+    pub fn assign(&mut self, page: u64, base: u32) {
+        self.pages.insert(page, base);
+    }
+
     /// The base slot for a page, if it already has one.
     pub fn lookup(&self, page: u64) -> Option<u32> {
         self.pages.get(&page).copied()

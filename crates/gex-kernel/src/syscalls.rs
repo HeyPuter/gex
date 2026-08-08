@@ -3003,7 +3003,18 @@ impl Kernel {
                     return Ok(existing.start);
                 }
             }
-            let start = self.mem.mmap(addr, len_aligned, prot_bits, flags, &name)?;
+            // The path and offset travel with the mapping. Two processes
+            // that map the same library at the same address then agree that
+            // the code is the same, which is what lets them share the
+            // dispatch slots it was translated into.
+            let start = self.mem.mmap_from(
+                addr,
+                len_aligned,
+                prot_bits,
+                flags,
+                &name,
+                Some((name.clone(), offset)),
+            )?;
             let mut tmp = vec![0u8; len as usize];
             let n = file.pread(offset, &mut tmp)? as usize;
             m.zero(start, len_aligned as usize)?;
