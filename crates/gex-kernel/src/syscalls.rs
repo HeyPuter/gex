@@ -2684,7 +2684,26 @@ impl Kernel {
                 fd,
                 events,
                 handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
-                writable: file.as_ref().is_some_and(|f| f.writable),
+                // Whether a write would *proceed*, not whether the
+                // descriptor was opened for writing.
+                //
+                // It used to be the open mode, so `poll` answered POLLOUT
+                // for every writable fd whatever the state of the thing
+                // behind it -- including a unix socket whose 256 KB buffer
+                // was full. A program doing the correct thing then cannot
+                // make progress: it writes, gets EAGAIN, polls, is told the
+                // fd is ready, writes again. glxgears sat in exactly that
+                // pair for two and a quarter million iterations:
+                //
+                //     writev(0x3, ...) = -11      (EAGAIN)
+                //     ppoll(...)       = 1        (ready)
+                //     writev(0x3, ...) = -11
+                //
+                // The handle knows; the default for anything that does not
+                // care is `true`, so a regular file still polls writable.
+                writable: file
+                    .as_ref()
+                    .is_some_and(|f| f.writable && f.handle.poll_writable()),
             });
         }
         Some(out)
@@ -2738,7 +2757,26 @@ impl Kernel {
                         fd,
                         events,
                         handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
-                        writable: file.as_ref().is_some_and(|f| f.writable),
+                        // Whether a write would *proceed*, not whether the
+                // descriptor was opened for writing.
+                //
+                // It used to be the open mode, so `poll` answered POLLOUT
+                // for every writable fd whatever the state of the thing
+                // behind it -- including a unix socket whose 256 KB buffer
+                // was full. A program doing the correct thing then cannot
+                // make progress: it writes, gets EAGAIN, polls, is told the
+                // fd is ready, writes again. glxgears sat in exactly that
+                // pair for two and a quarter million iterations:
+                //
+                //     writev(0x3, ...) = -11      (EAGAIN)
+                //     ppoll(...)       = 1        (ready)
+                //     writev(0x3, ...) = -11
+                //
+                // The handle knows; the default for anything that does not
+                // care is `true`, so a regular file still polls writable.
+                writable: file
+                    .as_ref()
+                    .is_some_and(|f| f.writable && f.handle.poll_writable()),
                     }
                 })
                 .collect(),
@@ -3429,7 +3467,9 @@ impl Kernel {
                 fd: w.fd,
                 events: (w.events & 0xffff) as u16,
                 handle: Some(Arc::clone(&file.handle)),
-                writable: file.writable,
+                // As in `collect_pollfds`: would a write proceed, not was
+                // this opened for writing.
+                writable: file.writable && file.handle.poll_writable(),
             };
             let got = poll_revents(&p) as u32;
             if got != 0 {

@@ -225,10 +225,16 @@ try {
       if (++n % 4) return;
       try {
         if (!at) at = e.gex_alloc(2048) >>> 0;
-        const len = e.gex_hot_blocks(at, 2048) >>> 0;
-        if (len) {
+        const slen = e.gex_recent_syscalls ? e.gex_recent_syscalls(at, 2048) >>> 0 : 0;
+        if (slen) {
+          syncReport('[last syscalls] ' +
+            new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, slen))
+              .trim().split('\\n').join(' | '));
+        }
+        const len2 = e.gex_hot_blocks(at, 2048) >>> 0;
+        if (len2) {
           syncReport('[hot] ' +
-            new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, len))
+            new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, len2))
               .trim().split('\\n').join(' | '));
         }
       } catch (err) {

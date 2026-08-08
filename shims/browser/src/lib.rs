@@ -1333,6 +1333,44 @@ fn trace_line(s: &str) {
 /// every so often and a program in a loop says a great many.
 /// The list is trimmed to the ten commonest, because the tail is never the
 /// answer.
+/// The last few syscalls, in order, for when a run stops making them.
+///
+/// The histogram says what a run did; when it stops doing anything, the
+/// question is what it did *last*. glxgears makes 4,096 syscalls and then
+/// none at all while looping over a mutex, and which call it made
+/// immediately before that is the whole question -- a `writev` that went out
+/// and was never answered means something different from a `poll` that came
+/// back empty.
+const SYSLOG_N: usize = 24;
+static mut SYSLOG: [(u64, u64, u64, u64); SYSLOG_N] = [(0, 0, 0, 0); SYSLOG_N];
+static mut SYSLOG_AT: usize = 0;
+
+/// The ring, oldest first, as `name(arg0, arg1) = ret` lines.
+///
+/// Without `with_host`: this is read from inside the guest's own write,
+/// which already holds it, and re-entering panics as a bare "unreachable"
+/// that unwinds the guest instead of the reporter.
+#[no_mangle]
+pub extern "C" fn gex_recent_syscalls(out: u32, max: u32) -> u32 {
+    let mut text = String::new();
+    unsafe {
+        for k in 0..SYSLOG_N {
+            let (nr, a0, a1, ret) = SYSLOG[(SYSLOG_AT + k) % SYSLOG_N];
+            if nr == 0 && a0 == 0 && ret == 0 {
+                continue;
+            }
+            text.push_str(&format!(
+                "{}({a0:#x}, {a1:#x})={}\n",
+                gex_kernel::syscalls::syscall_name(nr),
+                ret as i64
+            ));
+        }
+    }
+    let n = text.len().min(max as usize);
+    shim_slice_mut(out, n as u32).copy_from_slice(&text.as_bytes()[..n]);
+    n as u32
+}
+
 fn count_syscall() {
     if unsafe { HEARTBEAT } == 0 {
         return;
@@ -1346,10 +1384,20 @@ fn count_syscall() {
         let at = h.threads[h.current].kstate.ctx_addr;
         gm.read_u64(at + ctx::x(8) as u64).unwrap_or(!0)
     });
+    let (a0, a1) = with_host(|h| {
+        let gm = GuestMem::new(guest_bytes());
+        let at = h.threads[h.current].kstate.ctx_addr;
+        (
+            gm.read_u64(at + ctx::x(0) as u64).unwrap_or(0),
+            gm.read_u64(at + ctx::x(1) as u64).unwrap_or(0),
+        )
+    });
     let total = unsafe {
         if (nr as usize) < COUNTS.len() {
             COUNTS[nr as usize] = COUNTS[nr as usize].saturating_add(1);
         }
+        SYSLOG[SYSLOG_AT] = (nr, a0, a1, 0);
+        SYSLOG_AT = (SYSLOG_AT + 1) % SYSLOG_N;
         TOTAL = TOTAL.wrapping_add(1);
         TOTAL
     };
@@ -1594,6 +1642,20 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
     recompile_objects();
     // 3 means the running thread gave up the wasm stack: pick another.
     let stop = if stop == 3 { schedule() } else { stop };
+    // What it answered, into the slot the entry took. The ring is written
+    // before the call because a call that never returns is exactly the one
+    // worth seeing; this fills the answer in for the ones that do.
+    if unsafe { HEARTBEAT } != 0 {
+        let x0 = with_host(|h| {
+            let gm = GuestMem::new(guest_bytes());
+            let at = h.threads[h.current].kstate.ctx_addr;
+            gm.read_u64(at + ctx::x(0) as u64).unwrap_or(0)
+        });
+        unsafe {
+            let last = (SYSLOG_AT + SYSLOG_N - 1) % SYSLOG_N;
+            SYSLOG[last].3 = x0;
+        }
+    }
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
         let (i, ctx_addr) = with_host(|h| (h.current, h.threads[h.current].kstate.ctx_addr));
