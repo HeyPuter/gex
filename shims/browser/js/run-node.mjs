@@ -116,6 +116,13 @@ const entry = await gex.load(shimWasm, readFileSync(guestPath), readFileSync(elf
   stdin: readStdin(),
   cwd,
 });
+// GEX_NETWORK gives the guest a network made of real TCP sockets, so the
+// paths above Wisp -- apt's helper, a fetch, a parse -- can be exercised here
+// rather than only in a browser with a proxy configured.
+if (process.env.GEX_NETWORK) {
+  const { NodeNetwork } = await import('./net-node.mjs');
+  gex.useNetwork(new NodeNetwork());
+}
 // GEX_HEARTBEAT asks the shim to say where the guest is every N safepoints
 // and every 200 dispatch misses. Nothing else runs while translated code
 // does, so without it a run that is merely slow cannot be told from one that
