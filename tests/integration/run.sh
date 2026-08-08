@@ -552,6 +552,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/sigblocked" "$HERE/programs/signal-while-blocked.c"
 "$CC" -static -no-pie -O2 -o "$WORK/park" "$HERE/programs/park-across-switch.c"
 "$CC" -static -no-pie -O2 -o "$WORK/socket-server" "$HERE/programs/socket-server.c"
+"$CC" -static -no-pie -O2 -o "$WORK/socket-client" "$HERE/programs/socket-client.c"
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
 "$CC" -static -O2 -o "$WORK/selfmod" "$HERE/programs/selfmod.c"
@@ -808,6 +809,30 @@ if [ -n "$NODE" ] && [ -x "$WORK/socket-server" ]; then
     esac
 else
     echo "skip host-socket: no node or no program"
+fi
+
+# And both directions at once: two guests, in two Workers, each with its own
+# memory and its own kernel, talking to each other. That is the transport the
+# Worker-per-process design rests on, and it needs the half above *and* its
+# mirror -- `gex_host_bind`, serving a path inside a Worker.
+#
+# The client stats the path before connecting, the way Xlib does, so this also
+# holds the filesystem entry honest: a host-bound socket that lives only in
+# the name table is invisible to everything that looks before it leaps.
+if [ -n "$NODE" ] && [ -x "$WORK/socket-server" ] && [ -x "$WORK/socket-client" ]; then
+    out=$(timeout 300 "$NODE" "$HERE/../../web/test/two-workers.mjs" \
+              "$WORK/socket-server" "$WORK/socket-client" 2>&1 || true)
+    case "$out" in
+        ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
+        skip*) echo "$out" | head -1 ;;
+        *)
+            echo "FAIL two-workers: two guests in two Workers could not talk"
+            echo "$out" | sed 's/^/     /' | head -8
+            fail=$((fail + 1))
+            ;;
+    esac
+else
+    echo "skip two-workers: no node or no programs"
 fi
 
 # The same guest on a plain memory and on a SharedArrayBuffer. Two builds,

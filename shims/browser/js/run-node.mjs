@@ -98,7 +98,24 @@ function readStdin() {
 }
 
 class NodeEnv extends Env {
-  write(fd, bytes) { writeSync(fd, bytes); }
+  /**
+   * The guest's stdout and stderr, on this process's own streams.
+   *
+   * Through `process.stdout` rather than `writeSync(1, ...)` because this
+   * runner also runs inside a Worker, and a Worker's fd 1 is the *process's*
+   * fd 1 -- the guest's output went straight past the Worker's piped stream
+   * and interleaved with the parent's, out of order and unfilterable. Any
+   * other descriptor is a real file, and still goes to the fd.
+   *
+   * Copied, because `writeSync` was synchronous and this is not: `bytes` is a
+   * view into the guest's memory, and that memory can be written again -- or
+   * grown, which detaches every view of it -- long before the stream flushes.
+   */
+  write(fd, bytes) {
+    const s = fd === 1 ? process.stdout : fd === 2 ? process.stderr : null;
+    if (s) s.write(Buffer.from(bytes));
+    else writeSync(fd, bytes);
+  }
   now() { return BigInt(Date.now()) * 1000000n; }
 }
 

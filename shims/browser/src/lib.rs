@@ -790,11 +790,12 @@ pub extern "C" fn gex_host_bind(path: u32, path_len: u32) -> i32 {
             name,
             Arc::clone(&listener) as Arc<dyn gex_kernel::unix::HostListener>,
         );
-        // Not made visible to `stat`: the tmpfs root is only in scope at
-        // load time, which is where the virtio-gpu socket gets its entry. A
-        // client that connects straight to the path is served; one that
-        // checks the path exists first -- Xlib does -- will need the same
-        // treatment, and that wants the root threaded through to here.
+        // And in the filesystem, for the same reason the virtio-gpu socket
+        // is: `connect` goes through the name table and never needs a node,
+        // but anything that checks the path exists first is told there is
+        // nothing there. Mesa connects without looking; Xlib does not, and
+        // neither does a shell script guarding on `test -S`.
+        h.root.add_socket(name);
     });
     let mut table = HOST_LISTENERS.0.borrow_mut();
     table.push(listener);

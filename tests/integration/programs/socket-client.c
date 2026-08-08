@@ -13,13 +13,26 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
+#define PATH "/tmp/relay"
+
 int main(void) {
+    /* Look before connecting, the way Xlib does. A host-bound socket lived
+     * only in the name table for a while, so `connect` found it and `stat`
+     * did not -- which is invisible to anything that connects blind and fatal
+     * to anything that checks. Checking here keeps that from coming back. */
+    struct stat st;
+    if (stat(PATH, &st)) { perror("stat " PATH); return 1; }
+    if (!S_ISSOCK(st.st_mode)) {
+        fprintf(stderr, "%s is not a socket (mode %o)\n", PATH, st.st_mode);
+        return 1;
+    }
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); return 1; }
     struct sockaddr_un a = { .sun_family = AF_UNIX };
-    strcpy(a.sun_path, "/tmp/relay");
+    strcpy(a.sun_path, PATH);
     if (connect(fd, (struct sockaddr *)&a, sizeof a)) { perror("connect"); return 1; }
     const char *msg = "over here";
     if (write(fd, msg, strlen(msg)) < 0) { perror("write"); return 1; }
