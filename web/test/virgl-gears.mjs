@@ -76,6 +76,7 @@ await writeFile(
 const SECONDS = '__SECONDS__';
 const TRACE = __TRACE__;
 const process_HEARTBEAT = __HEARTBEAT__;
+const WANT_REPORTS = __REPORTS__;
 const __MISSES__ = __TRACEMISS__;
 const __RECOMPILE__ = __RECOMPILEKIB__;
 import { Gex, Env } from './gex.mjs';
@@ -108,6 +109,7 @@ function syncReport(line) {
     x.send(line);
   } catch (e) { /* the server has gone; nothing to be done from here */ }
 }
+const rates = [];
 let report = () => {};
 let hotDump = () => {};
 let drew = () => {};
@@ -126,7 +128,14 @@ class PageEnv extends Env {
       // glxgears never stops on its own, and the question this answers is
       // whether it draws at all -- so the first frame rate it prints is the
       // result, not something to wait past.
-      if (/frames in .* seconds/.test(line)) drew(line.trim());
+      // glxgears prints a rate every five seconds. The first one is a cold
+      // run -- it counts the frames drawn while Mesa, an X server and glibc
+      // were still being translated a basic block at a time -- so waiting
+      // for a later one is the only way to see sustained speed.
+      if (/frames in .* seconds/.test(line)) {
+        rates.push(line.trim());
+        if (rates.length >= WANT_REPORTS) drew(rates.join(' ; '));
+      }
     }
   }
   now() { return BigInt(Date.now()) * 1000000n; }
@@ -303,6 +312,7 @@ try {
    .replace('__TRACE__', String(!!process.env.GEX_VIRGL_TRACE))
    .replace('__HEARTBEAT__', String(Number(process.env.GEX_HEARTBEAT || 0)))
    .replace('__TRACEMISS__', process.env.GEX_TRACE_MISSES ? 'true' : 'false')
+   .replace('__REPORTS__', String(Number(process.env.GEX_GEARS_REPORTS) || 1))
    .replace('__RECOMPILEKIB__', String(
      process.env.GEX_RECOMPILE_OBJECTS === undefined
        ? 0
