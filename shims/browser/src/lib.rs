@@ -1549,26 +1549,30 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
     // syscall that created the mapping has finished -- the loader maps a
     // library and then jumps into it, and a translation that arrives late is
     // a translation the dispatch miss got to first.
-    let mut stop = stop;
-    // Only when the syscall was going to return normally. Anything else has
-    // already decided where the guest goes next -- a redirect, an exit, a
-    // thread that gave up the stack -- and its resume point is the right one.
-    if stop == 0 && recompile_objects() {
-        // The modules have to be instantiated, which only JavaScript can do,
-        // so the guest gives the stack back and comes straight in again.
-        //
-        // At the instruction after the `svc`. This is the one address that
-        // has to be right and is not written down anywhere: on the ordinary
-        // path the guest simply returns from here and carries on, so nothing
-        // records where "carry on" is. The thread's own `pc` is where it was
-        // when it trapped, which is the `svc` itself -- resuming there runs
-        // the syscall a second time.
-        with_host(|h| {
-            h.resume = Some(pc as u64 + 4);
-            h.resume_ctx = Some(h.threads[h.current].kstate.ctx_addr);
-        });
-        stop = 1;
-    }
+    // Objects the guest has just mapped, statically recompiled in bulk
+    // before it can branch into one.
+    //
+    // The modules are only queued. Nothing is instantiated here and the
+    // guest is not interrupted, because it cannot reach any of this yet: a
+    // page's directory entry is published when its module is installed, and
+    // until then every branch into it still finds the miss stub. JavaScript
+    // picks the queue up at the next trap, which is the next miss.
+    //
+    // Interrupting was tried and is wrong. Trapping out with a resume of
+    // `pc + 4` looks right -- that is the address the emitter records before
+    // the `svc`, and `Term::Syscall` flushes the registers first -- and it
+    // faulted every time, at exactly that instruction, on the `mmap` that
+    // mapped the library:
+    //
+    //     0x1b854  mov x8, #222      (mmap)
+    //     0x1b858  svc #0
+    //     0x1b85c  cmn x0, #0x1000   <- memory access out of bounds
+    //
+    // Re-entering translated code at an arbitrary address is not the same as
+    // falling out of the bottom of the block that called the syscall, and
+    // the difference is not worth paying for something that did not need to
+    // happen now.
+    recompile_objects();
     // 3 means the running thread gave up the wasm stack: pick another.
     let stop = if stop == 3 { schedule() } else { stop };
     if tracing() {
@@ -2949,7 +2953,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
 /// working should get the runtime translator; this is a different claim about
 /// what the system is, and it should be made deliberately.
 fn recompile_objects() -> bool {
-    if !unsafe { RECOMPILE_OBJECTS } {
+    if unsafe { RECOMPILE_OBJECTS } == 0 {
         return false;
     }
     let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
@@ -2966,28 +2970,43 @@ fn recompile_objects() -> bool {
         any = true;
         if unsafe { HEARTBEAT } != 0 {
             let ms = (now_ns() - began) / 1_000_000;
-            let slots = with_host(|h| h.jit.page_table.slots());
+            let (slots, mods, bytes) = with_host(|h| {
+                (
+                    h.jit.page_table.slots(),
+                    h.jit.pending.len(),
+                    h.jit.pending.iter().map(|p| p.wasm.len()).sum::<usize>(),
+                )
+            });
             trace_line(&format!(
                 "[gex] recompiled {} statically: {blocks} blocks in {ms}ms, \
-                 {slots} dispatch slots claimed in all\n",
-                m.path
+                 {mods} module(s) of {} KiB waiting, {slots} slots claimed in all\n",
+                m.path,
+                bytes / 1024
             ));
         }
     }
     any
 }
 
-/// Whether to statically recompile each object as it is mapped.
-static mut RECOMPILE_OBJECTS: bool = false;
+/// Whether to statically recompile each object as it is mapped, and how big
+/// an object to attempt.
+///
+/// The size is a bisection handle rather than a policy: with static
+/// recompilation on, the graphics rootfs faults inside `ld.so`, and the
+/// quickest way to find out which library's translation is wrong is to raise
+/// the cap until it breaks. Zero is off; anything else is a limit in KiB of
+/// mapped text, with `i32::MAX` meaning no limit worth mentioning.
+static mut RECOMPILE_OBJECTS: u64 = 0;
 
 #[no_mangle]
-pub extern "C" fn gex_set_recompile_objects(on: i32) {
-    unsafe { RECOMPILE_OBJECTS = on != 0 };
+pub extern "C" fn gex_set_recompile_objects(kib: i32) {
+    unsafe { RECOMPILE_OBJECTS = if kib <= 0 { 0 } else { kib as u64 } };
 }
 
 fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     let span = map.end.saturating_sub(map.start);
-    if span == 0 || span > MAX_OBJECT_BYTES {
+    let cap = (unsafe { RECOMPILE_OBJECTS }).saturating_mul(1024).min(MAX_OBJECT_BYTES);
+    if span == 0 || span > cap {
         return 0;
     }
     // The same guard the miss path has. Until the guest module has said how
@@ -3115,6 +3134,47 @@ fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {
     seeds.sort_unstable();
     seeds.dedup();
     seeds
+}
+
+/// Where the running thread is, right now.
+///
+/// For the report when a trap escapes: a `RuntimeError` out of `enter` says
+/// what went wrong and nothing at all about where, and "memory access out of
+/// bounds" from translated code means the guest computed a wild pointer,
+/// which is a question about the guest's own program counter.
+/// The context the running thread is using. Wild register state usually
+/// means a wild context pointer, and the two are told apart by looking.
+#[no_mangle]
+pub extern "C" fn gex_current_ctx() -> i64 {
+    with_host(|h| h.threads[h.current].kstate.ctx_addr as i64)
+}
+
+#[no_mangle]
+pub extern "C" fn gex_current_pc() -> i64 {
+    with_host(|h| {
+        let gm = GuestMem::new(guest_bytes());
+        let at = h.threads[h.current].kstate.ctx_addr;
+        gm.read_u64(at + ctx::PC as u64).unwrap_or(0) as i64
+    })
+}
+
+/// Which mapped object an address belongs to, written into `out` as bytes.
+/// Returns the length, or zero when nothing is mapped there.
+#[no_mangle]
+pub extern "C" fn gex_object_at(addr: i64, out: u32, max: u32) -> u32 {
+    let name = with_host(|h| {
+        h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .find(|v| (addr as u64) >= v.start && (addr as u64) < v.end)
+            .map(|v| format!("{} +{:#x}", v.name, addr as u64 - v.start))
+    });
+    let Some(name) = name else { return 0 };
+    let n = name.len().min(max as usize);
+    let dst = shim_slice_mut(out, n as u32);
+    dst.copy_from_slice(&name.as_bytes()[..n]);
+    n as u32
 }
 
 /// The module JS has to instantiate, or zero length if there is none.

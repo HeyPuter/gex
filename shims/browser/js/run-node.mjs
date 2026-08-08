@@ -139,7 +139,14 @@ if (process.env.GEX_TRACE_MISSES) {
   gex.shim.exports.gex_set_trace_misses?.(1);
 }
 if (process.env.GEX_RECOMPILE_OBJECTS) {
-  gex.shim.exports.gex_set_recompile_objects?.(1);
+  // The value is a cap in KiB of mapped text. Eight megabytes is not a
+  // principled number -- it is the largest that works: every one of the 57
+  // libraries in the graphics rootfs is under it, and the one object above
+  // it, Mesa's software rasteriser at 15 MB of text and 471,205 blocks,
+  // brings the run down inside ld.so shortly after it is mapped. See #73.
+  gex.shim.exports.gex_set_recompile_objects?.(
+    Number(process.env.GEX_RECOMPILE_OBJECTS) || 8192,
+  );
 }
 const status = await gex.run(entry);
 // GEX_FMA_COUNT reports how many fused multiply-adds crossed out of the guest

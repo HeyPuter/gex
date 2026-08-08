@@ -30,7 +30,7 @@ fn main() {
         std::process::exit(2);
     }
     let elf = std::fs::read(&args[1]).expect("read the elf");
-    let addr = u64::from_str_radix(args[2].trim_start_matches("0x"), 16).expect("hex address");
+    let addr = if args[2] == "object" { 0 } else { u64::from_str_radix(args[2].trim_start_matches("0x"), 16).expect("hex address") };
     let max_blocks: usize = args.get(3).map_or(2048, |s| s.parse().expect("a number"));
 
     // Just enough of the address space to hold the image. The guest's is two
@@ -86,6 +86,45 @@ fn main() {
         }
         v
     };
+
+    // `object` recompiles the whole executable segment the way the runtime
+    // does when the guest maps a library, rather than following one address.
+    // That is the path a browser now takes, and the one that breaks on
+    // Mesa's software rasteriser: 471,205 blocks, which is the first object
+    // in the graphics rootfs big enough to need more than one wasm module.
+    if args[2] == "object" {
+        let (lo, hi) = exec.first().copied().unwrap_or((base, base));
+        let mut seeds: Vec<u64> = Vec::new();
+        let began = std::time::Instant::now();
+        let (modules, stats) = gex_xlate::translate_object(
+            &memory,
+            lo,
+            hi,
+            &mut seeds,
+            &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
+            &|_| false,
+            gex_xlate::PageTable::default(),
+            Default::default(),
+            max_blocks,
+            false,
+        );
+        println!(
+            "{} blocks in {} module(s), {:.2}s",
+            stats.blocks,
+            modules.len(),
+            began.elapsed().as_secs_f64()
+        );
+        for (i, m) in modules.iter().enumerate() {
+            println!(
+                "  module {i}: {} KiB, {} table slots, {} pages claimed, {} exported blocks",
+                m.wasm.len() / 1024,
+                m.table_slots,
+                m.dir_entries.len(),
+                m.exported_blocks.len()
+            );
+        }
+        return;
+    }
 
     eprintln!("translating from {addr:#x}, at most {max_blocks} blocks");
     let _ = std::io::stderr().flush();

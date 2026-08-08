@@ -447,6 +447,24 @@ export class Gex {
           if (wakeCtx !== 0) ctx = wakeCtx;
           continue;
         }
+        // Anything that gets this far is a trap nothing here expects, and
+        // the message alone -- "memory access out of bounds" -- says what
+        // went wrong and nothing about where. Translated code faulting that
+        // way means the guest computed a wild pointer, so the guest's own
+        // program counter is the question, and which library it is in.
+        if (e.gex_current_pc && !String(err).includes('unreachable')) {
+          const pc = e.gex_current_pc();
+          let where = '';
+          if (e.gex_object_at) {
+            const at = e.gex_alloc(160) >>> 0;
+            const n = e.gex_object_at(pc, at, 160) >>> 0;
+            if (n) where = ' in ' + new TextDecoder().decode(this.#u8.subarray(at, at + n));
+          }
+          const ctx = e.gex_current_ctx ? e.gex_current_ctx() : 0n;
+          err.message +=
+            ` (guest pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}${where}` +
+            `, ctx=0x${ctx.toString(16)})`;
+        }
         if (String(err).includes("unreachable")) {
           return e.gex_exit_code();
         }
