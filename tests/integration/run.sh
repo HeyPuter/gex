@@ -550,6 +550,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/fork" "$HERE/programs/fork.c"
 "$CC" -static -no-pie -O2 -o "$WORK/background" "$HERE/programs/background.c"
 "$CC" -static -no-pie -O2 -o "$WORK/sigblocked" "$HERE/programs/signal-while-blocked.c"
+"$CC" -static -no-pie -O2 -o "$WORK/park" "$HERE/programs/park-across-switch.c"
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
 "$CC" -static -O2 -o "$WORK/selfmod" "$HERE/programs/selfmod.c"
@@ -747,6 +748,27 @@ compare "background" "$WORK/background"
 # handler at all ended the run -- and since the first handler most programs
 # install is SIGCHLD, every fork from a shell did it.
 compare "signal-while-blocked" "$WORK/sigblocked"
+
+# A syscall that parks while another process runs, and is woken by a timeout
+# after the process that displaced it has gone. Browser-only, deliberately:
+# the shape needs the host to have nothing at all to run, and the native
+# adapter ends the whole run when its first process exits, so the child's
+# output never appears there at all. See the program's own comment.
+if [ -n "$NODE" ] && [ -x "$WORK/park" ]; then
+    out=$(timeout 120 "$NODE" "$HERE/../../shims/browser/js/run-node.mjs" \
+              "$HERE/../../web/public/gex/seed.wasm" "$WORK/park" 2>&1 || true)
+    if echo "$out" | grep -q "child: epoll_wait returned 0" &&
+       echo "$out" | grep -q "child: first event 0"; then
+        echo "ok   park-across-switch"
+        pass=$((pass + 1))
+    else
+        echo "FAIL park-across-switch: the parked syscall did not finish"
+        echo "$out" | sed 's/^/     /' | head -5
+        fail=$((fail + 1))
+    fi
+else
+    echo "skip park-across-switch: no node or no program"
+fi
 # argv and envp reach the new program, a close-on-exec descriptor is gone and
 # an ordinary one survives with its offset, and a failed exec returns.
 expect "exec" "argc=4 [child] [two] [three]

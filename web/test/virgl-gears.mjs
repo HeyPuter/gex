@@ -37,7 +37,7 @@ const ROOT = join(HERE, '..', '..');
 const BUILD = process.env.GEX_VIRGL_WASM || join(tmpdir(), 'gex-virgl-wasm');
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
 const TAR = process.env.GEX_GRAPHICS_TAR || join(ROOT, 'web/public/rootfs/graphics.tar');
-const SECONDS = process.env.GEX_GEARS_SECONDS || '25';
+const SECONDS = process.env.GEX_GEARS_SECONDS || '0';
 
 const exists = async (p) => access(p).then(() => true, () => false);
 const skip = (why) => {
@@ -74,6 +74,7 @@ await writeFile(
 <pre id="out">pending</pre>
 <script type="module">
 const SECONDS = '__SECONDS__';
+const TRACE = __TRACE__;
 import { Gex, Env } from './gex.mjs';
 import { VirglRenderer } from './virgl.js';
 import { untar } from './tar.js';
@@ -87,8 +88,31 @@ addEventListener('error', (e) => say('ERROR at ' + step + ': ' + (e.message || e
 addEventListener('unhandledrejection', (e) =>
   say('REJECTED at ' + step + ': ' + (e.reason?.message || e.reason)));
 
+// Progress is reported from the guest's own writes, not from a timer.
+//
+// A timer cannot work here: the run loop yields to the event loop only when
+// it pauses, and while it is translating Mesa it does not pause for minutes
+// at a time -- so setInterval fired twice, at ten and twenty seconds, and
+// then said nothing for the rest of the run. Silence from a harness is worse
+// than no harness: it cannot tell slow from wedged.
+//
+// The guest writes a line each time it reaches a stage, and those writes come
+// through here.
+let report = () => {};
+let drew = () => {};
 class PageEnv extends Env {
-  write(fd, bytes) { output += new TextDecoder().decode(bytes); paint(); }
+  write(fd, bytes) {
+    const text = new TextDecoder().decode(bytes);
+    output += text;
+    paint();
+    for (const line of text.split('\\n')) {
+      if (line.trim()) report(line.trim());
+      // glxgears never stops on its own, and the question this answers is
+      // whether it draws at all -- so the first frame rate it prints is the
+      // result, not something to wait past.
+      if (/frames in .* seconds/.test(line)) drew(line.trim());
+    }
+  }
   now() { return BigInt(Date.now()) * 1000000n; }
 }
 
@@ -117,7 +141,7 @@ try {
   output += Object.keys(files).length + ' files in the image\\n';
 
   const gex = new Gex(new PageEnv());
-  gex.useVirgl(renderer, false);
+  gex.useVirgl(renderer, TRACE);
   mark('loading the guest');
   const entry = await gex.load(
     await grab('./shim.wasm'), await grab('./seed.wasm'), files['/bin/sh'],
@@ -130,11 +154,22 @@ try {
   const post = (kind, body) =>
     fetch('/report?kind=' + kind, { method: 'POST', body }).catch(() => {});
   const t0 = Date.now();
-  const sampler = setInterval(() => {
-    post('progress', ((Date.now() - t0) / 1000).toFixed(0) + 's ' + renderer.glState() +
-      '\\n' + output.trim());
-  }, 10000);
-  const status = await gex.run(entry).finally(() => clearInterval(sampler));
+  // Fire and forget: awaiting here would hand the event loop back in the
+  // middle of a guest write, which is not a safe place to give up the stack.
+  // Blocks translated is the honest progress meter. The renderer's pump
+  // count is not: the scheduler ticks whether or not the guest advances, so
+  // a guest wedged on a socket and a guest translating libGL look identical
+  // through it.
+  const e = gex.shim.exports;
+  report = (line) =>
+    post('progress', ((Date.now() - t0) / 1000).toFixed(0) + 's | ' + line +
+      ' | ' + Number(e.gex_jit_blocks()) + ' blocks in ' +
+      Number(e.gex_jit_millis()) + 'ms | ' + renderer.glState());
+  // Whichever comes first: the guest finishing, or the guest drawing.
+  const firstFrame = new Promise((r) => {
+    drew = (line) => r('DREW ' + line);
+  });
+  const status = await Promise.race([gex.run(entry), firstFrame]);
   const result = 'EXIT ' + status + '\\n' + output.trim() +
       '\\nrenderer: ' + renderer.describe() +
       '\\nstate: ' + renderer.glState();
@@ -147,7 +182,8 @@ try {
     await fetch('/report?kind=done', { method: 'POST', body: result }).catch(() => {});
   }
 }
-</script>`.replace('__SECONDS__', SECONDS),
+</script>`.replace('__SECONDS__', SECONDS)
+   .replace('__TRACE__', String(!!process.env.GEX_VIRGL_TRACE)),
 );
 
 let finish;

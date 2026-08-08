@@ -441,7 +441,11 @@ struct Suspended {
     kernel: Kernel,
     threads: Vec<Thread>,
     current: usize,
-    /// Where the parent resumes: the instruction after its `clone`.
+    /// Where this process was when it was written out. Kept for the trace
+    /// rather than to resume from: the scheduler resumes a process by picking
+    /// one of its threads, which is what finishes the syscall that thread
+    /// parked in. Resuming straight from here skipped that. See
+    /// [`install_process`].
     resume_pc: u64,
     resume_ctx: u64,
     /// The dispatch directory as the parent left it. A child that execs a
@@ -702,6 +706,10 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             crate::virgl::DEFAULT_SOCKET,
             Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
         );
+        // And in the filesystem, so a guest that looks before it connects
+        // finds it. `connect` goes through the name table and never needed
+        // this; `test -e` does.
+        root.add_socket(crate::virgl::DEFAULT_SOCKET);
         device
     });
     // `/tmp` is part of the root filesystem rather than a mount of its own,
@@ -1437,8 +1445,19 @@ fn install_process(h: &mut Host, p: Suspended) {
     h.jit.page_table = p.page_table;
     h.jit.page_table.advance_to(mark);
     h.jit.translated = p.translated;
-    h.resume = Some(p.resume_pc);
-    h.resume_ctx = Some(p.resume_ctx);
+    // Emphatically *not* a resume point. The scheduler is the only thing that
+    // may set one, because it is the only thing that finishes the syscall the
+    // thread parked in.
+    //
+    // Setting it here looked harmless -- both callers go straight on to the
+    // scheduler, which overwrites it. But `gex_resume_pc` is a take, and when
+    // the scheduler finds nothing ready it gives the stack back to the page
+    // *without* choosing: the page then read this stale value and re-entered
+    // the guest at the instruction after its `svc`, with no return value ever
+    // written. `epoll_wait` came back with 5, which was its own epfd still
+    // sitting in x0, and the guest walked five events off its stack.
+    h.resume = None;
+    h.resume_ctx = None;
 }
 
 /// Give the stack to the saved process at `idx`, saving the running one.
@@ -1481,10 +1500,17 @@ fn switch_process(h: &mut Host, idx: usize) {
             }
         }
     }
+    if tracing() {
+        trace_line(&format!(
+            "[proc] switch {} -> {} (resume {:#x})\n",
+            mine.pid, target.pid, target.resume_pc
+        ));
+    }
     restore_memory(&target.snapshot);
     h.jit.page_table.advance_to(mark);
-    h.resume = Some(target.resume_pc);
-    h.resume_ctx = Some(target.resume_ctx);
+    // See `install_process`: choosing is the scheduler's job.
+    h.resume = None;
+    h.resume_ctx = None;
     h.suspended.push(mine);
 }
 
@@ -1511,6 +1537,14 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
         return 2;
     };
     let target = h.suspended.remove(idx);
+    if tracing() {
+        trace_line(&format!(
+            "[proc] exit {pid} -> {} of {} saved (resume {:#x})\n",
+            target.pid,
+            h.suspended.len() + 1,
+            target.resume_pc
+        ));
+    }
     clear_mapped(h);
     install_process(h, target);
     // 3: the scheduler picks a thread out of the process just installed, and
@@ -2408,6 +2442,20 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             trace_line("gex: the guest module carries no gex.meta section, so there is\n");
             trace_line("gex: nowhere for runtime translation to carry on from. Rebuild it.\n");
         }
+        with_host(|h| {
+            let gm = GuestMem::new(guest_bytes());
+            let c = h.threads[h.current].kstate.ctx_addr;
+            let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
+            trace_line(&format!(
+                "gex: pid {} thread {} ctx {c:#x} sp={:#x} x30={:#x} x0={:#x} x1={:#x}\n",
+                h.kernel.pid,
+                h.current,
+                gm.read_u64(c + ctx::SP as u64).unwrap_or(0),
+                r(30),
+                r(0),
+                r(1)
+            ));
+        });
         trace_line(&format!("gex: nothing to translate at pc={pc:#x}\n"));
         with_host(|h| h.exit = Some(128 + 11));
     }

@@ -14,22 +14,28 @@
 # opens, which is 204 MB, and then removes the two libraries that make up most
 # of it.
 #
-# # The LLVM stub
+# # LLVM, and the switch that removes it
 #
 # Debian ships one megadriver: `swrast_dri.so` is every Gallium driver at
 # once, and it declares `libLLVM-15.so.1` in DT_NEEDED because *llvmpipe*
-# wants it. 106 MB, plus the 21 MB of libz3 that LLVM in turn wants. The
-# virgl driver does not use any of it -- but ld.so does not know that, and
-# maps the library before a line of driver code runs.
+# wants it -- 106 MB, plus the 21 MB of libz3 that LLVM in turn wants. That
+# is 127 MB of a 208 MB image, and in a browser it is worse than download
+# size: a dispatch slot is claimed per 4 KiB of guest text, a browser will
+# not grow the table past ten million of them, and llvmpipe is a great deal
+# of text.
 #
-# So this generates a stand-in: the 280 symbols `swrast_dri.so` actually
-# imports from LLVM, each one a `brk #0`. Nothing calls them on the virgl
-# path, and if anything ever does it dies at the instruction with the guest
-# PC in the trap, which is a far better failure than a silently different
-# picture.
+# `GEX_LLVM_STUB=1` replaces it with a stand-in: the 280 symbols the
+# megadriver imports from LLVM, each one a `brk #0`. Nothing on the virgl
+# path should call them, and anything that does dies at the instruction with
+# the guest PC in the trap, which is a far better failure than a quietly
+# different picture.
 #
-# That is 127 MB removed for 40 KB added, and it is the difference between a
-# demo a browser will fetch and one it will not.
+# It is off by default because it has been seen to break. Xvfb brings up GLX
+# through the swrast DRI entry points, and when that fell back to llvmpipe
+# the run stopped at `gex: breakpoint at pc=0x6d435040` before the X socket
+# ever appeared. Whether it falls back when virgl is actually *available* --
+# it was not, in the run that found this -- is the open question, and the
+# reason this is a switch rather than a decision.
 set -eu
 
 OUT="${1:-$(cd "$(dirname "$0")" && pwd)/public/rootfs/graphics.tar}"
@@ -60,7 +66,6 @@ libtinfo.so.6 libgpg-error.so.0 libgcrypt.so.20 libsystemd.so.0
 libGL.so.1 libGLX.so.0 libGLX_mesa.so.0 libGLdispatch.so.0 libglapi.so.0
 libdrm.so.2 libdrm_amdgpu.so.1 libdrm_nouveau.so.2 libdrm_radeon.so.1
 libelf.so.1 libsensors.so.5 libstdc++.so.6
-libLLVM-15.so.1 libz3.so.4
 libX11.so.6 libX11-xcb.so.1 libXau.so.6 libXdmcp.so.6 libXext.so.6
 libXfixes.so.3 libXfont2.so.2 libXxf86vm.so.1 libxkbfile.so.1
 libxcb.so.1 libxcb-dri2.so.0 libxcb-dri3.so.0 libxcb-glx.so.0
@@ -113,6 +118,36 @@ cp -r "$SRC/usr/share/X11/xkb" "$R/usr/share/X11/xkb"
 [ -e "$SRC/usr/lib/xorg/protocol.txt" ] && cp "$SRC/usr/lib/xorg/protocol.txt" "$R/usr/lib/xorg/"
 
 
+if [ -n "${GEX_LLVM_STUB:-}" ]; then
+    # Generated from the megadriver's own import list, so it stays right when
+    # the driver comes from a different Debian.
+    readelf -W --dyn-syms "$R/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so" |
+        awk '$7 == "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/undef"
+    readelf -W --dyn-syms "$SRC/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" |
+        awk '$7 != "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/llvm"
+    comm -12 "$WORK/undef" "$WORK/llvm" > "$WORK/need"
+    {
+        echo '.text'
+        while read -r sym; do
+            printf '.globl %s\n.type %s,@function\n%s:\n  brk #0\n' "$sym" "$sym" "$sym"
+        done < "$WORK/need"
+    } > "$WORK/llvmstub.s"
+    # The version, and it is not decoration: the megadriver imports every one
+    # of these as `LLVMFoo@LLVM_15`, and against an unversioned definition
+    # glibc's ld.so does not warn -- it fails an assertion in dl-lookup.c and
+    # kills the process before `main`.
+    printf 'LLVM_15 { global: *; };\n' > "$WORK/llvmstub.map"
+    "$CC" -shared -nostdlib -o "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" \
+        "$WORK/llvmstub.s" -Wl,-soname,libLLVM-15.so.1 \
+        -Wl,--version-script="$WORK/llvmstub.map"
+    echo "  libLLVM: a stub of $(wc -l < "$WORK/need") symbols, $(du -h "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" | cut -f1)"
+else
+    for l in libLLVM-15.so.1 libz3.so.4; do
+        cp -L "$SRC/usr/lib/aarch64-linux-gnu/$l" "$R/usr/lib/aarch64-linux-gnu/$l"
+    done
+    echo "  libLLVM: the real one, $(du -h "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" | cut -f1)"
+fi
+
 cat > "$R/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/sh
 EOF
@@ -147,9 +182,19 @@ echo "gex: loading Mesa and drawing"
 # virpipe is Mesa's own name for virgl over a vtest socket, and it is the
 # only thing the guest is told. Everything else it works out itself.
 export GALLIUM_DRIVER=virpipe
-# GEARS_SECONDS bounds the run. `timeout 0` is coreutils' own spelling of
-# "no limit", which is what a demo left running wants.
-exec timeout "${GEARS_SECONDS:-0}" glxgears.aarch64-linux-gnu
+# Unbounded unless asked otherwise, and whoever started it decides when to
+# stop -- a page closes the tab, a harness gives up. glxgears reports its
+# frame rate every five seconds, which is the signal either of them wants.
+#
+# `timeout` used to bound this and was removed: it forks the program and
+# waits, and `wait` came back ECHILD in a browser, so the run ended with
+# `timeout: error waiting for command: No child processes` and nothing to say
+# whether the gears had drawn. That is a real defect with its own task, but it
+# is not this demo's, and having it in the way made every run ambiguous.
+if [ -n "${GEARS_SECONDS:-}" ] && [ "${GEARS_SECONDS}" != "0" ]; then
+  exec timeout "$GEARS_SECONDS" glxgears.aarch64-linux-gnu
+fi
+exec glxgears.aarch64-linux-gnu
 EOF
 chmod +x "$R/gears.sh"
 

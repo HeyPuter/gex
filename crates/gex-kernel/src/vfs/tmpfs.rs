@@ -87,6 +87,24 @@ impl TmpFs {
         inner.nodes.entry(path).or_insert(Node::Dir);
     }
 
+    /// A socket node the host serves.
+    ///
+    /// A guest that binds a socket gets one of these from `bind`; one the
+    /// *host* binds -- the virtio-gpu renderer, at `/tmp/.virgl_test` --
+    /// lived only in the name table, so `connect` found it and `stat` did
+    /// not. Mesa connects without looking, so nothing broke, but anything
+    /// that checks first was told there was no renderer and the demo's own
+    /// script said so on screen.
+    pub fn add_socket(&self, path: &str) {
+        let path = path.trim_start_matches('/').to_string();
+        let mut inner = self.inner.lock().unwrap();
+        Self::ensure_parents(&mut inner, &path);
+        let ino = inner.next_ino;
+        inner.next_ino += 1;
+        inner.inos.insert(path.clone(), ino);
+        inner.nodes.insert(path, Node::Socket);
+    }
+
     pub fn add_symlink(&self, path: &str, target: &str) {
         let path = path.trim_start_matches('/').to_string();
         let mut inner = self.inner.lock().unwrap();

@@ -208,6 +208,15 @@ impl HostListener for VirglDevice {
     fn accept(&self, peer: Arc<UnixSocket>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.accepted += 1;
+        // Said out loud, and not only under the verbose flag. This is the
+        // moment the guest's Mesa finds the GPU, and it is the one event that
+        // separates "still translating libGL" from "talking to the renderer"
+        // -- which is a distinction that cost a day of watching a pump report
+        // zero sessions with nothing to say why.
+        Self::trace(&format!(
+            "[virgl] a guest connected: session {}\n",
+            inner.accepted
+        ));
         inner.sessions.push(Session {
             socket: peer,
             out: Vec::new(),

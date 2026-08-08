@@ -69,6 +69,11 @@ const ansi = {
 function status(text, kind = '') {
   ui.status.textContent = text;
   ui.status.className = kind;
+  // Announced as well as displayed, so something other than a person can
+  // tell whether a demo got where it was going. `web/test/site.mjs` drives
+  // the built bundle through a real browser and listens for this; without it
+  // the only way to check the page was to look at it.
+  window.dispatchEvent(new CustomEvent('gex:status', { detail: { text, kind } }));
 }
 
 function busy(text) {
@@ -213,9 +218,16 @@ DEMOS.forEach((d, i) => {
   }
   // `?demo=` as well as `#demo`, so a link can carry the demo's own options
   // in the query alongside it.
-  const asked = new URLSearchParams(location.search).get('demo') || location.hash.slice(1);
+  const params = new URLSearchParams(location.search);
+  const asked = params.get('demo') || location.hash.slice(1);
   const want = DEMOS.find((d) => d.id === asked) || DEMOS[0];
   await select(want);
+  // `?run=1` presses the demo's own first button. A link that shows someone
+  // the thing rather than a button that shows it -- and the only way a test
+  // can drive the page without reaching inside it.
+  if (params.get('run')) {
+    document.querySelector('#actions .act.primary')?.click();
+  }
 })();
 
 // Demos declare when they start and stop so navigation can warn.
