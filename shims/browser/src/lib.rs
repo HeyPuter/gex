@@ -632,6 +632,42 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     HOST.with(|h| f(h.borrow_mut().as_mut().expect("gex: not initialised")))
 }
 
+/// How many regions of guest memory this process actually owns.
+///
+/// A process's world is two gigabytes of address space and a few hundred
+/// megabytes of it at most, so anything that has to *move* a process -- a
+/// `fork` that hands the child to another Worker, a host that wants to
+/// checkpoint one -- needs to know which parts are real. Copying the address
+/// space instead is not an option at this size.
+///
+/// Paired with [`gex_vma_at`]: count first, then ask for each.
+#[no_mangle]
+pub extern "C" fn gex_vma_count() -> i32 {
+    with_host(|h| h.kernel.mem.vmas().len() as i32)
+}
+
+/// Describe region `i`, writing `start`, `end` and `prot` as three `u64` at
+/// `out` in this module's own region.
+///
+/// Returns 0, or -1 if there is no such region. The three words rather than a
+/// return value because a wasm function returns one thing and this is the
+/// cheapest way to hand back three without a struct layout both sides have to
+/// agree on.
+#[no_mangle]
+pub extern "C" fn gex_vma_at(i: i32, out: u32) -> i32 {
+    with_host(|h| {
+        let Some(v) = h.kernel.mem.vmas().get(i.max(0) as usize) else {
+            return -1;
+        };
+        let (start, end, prot) = (v.start, v.end, v.prot as u64);
+        let dst = shim_slice_mut(out, 24);
+        dst[0..8].copy_from_slice(&start.to_le_bytes());
+        dst[8..16].copy_from_slice(&end.to_le_bytes());
+        dst[16..24].copy_from_slice(&prot.to_le_bytes());
+        0
+    })
+}
+
 /// Reserve `len` bytes of this module's own heap and return a guest address
 /// JS can write to. Used to hand the ELF across.
 #[no_mangle]
@@ -976,6 +1012,16 @@ fn shim_slice(p: u32, n: u32) -> &'static [u8] {
     unsafe {
         std::slice::from_raw_parts(
             std::ptr::with_exposed_provenance::<u8>(std::hint::black_box(p as usize)),
+            n as usize,
+        )
+    }
+}
+
+/// As [`shim_slice`], for a buffer the shim is filling in for JS to read.
+fn shim_slice_mut(p: u32, n: u32) -> &'static mut [u8] {
+    unsafe {
+        std::slice::from_raw_parts_mut(
+            std::ptr::with_exposed_provenance_mut::<u8>(std::hint::black_box(p as usize)),
             n as usize,
         )
     }
