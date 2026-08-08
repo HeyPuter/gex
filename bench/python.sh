@@ -24,10 +24,13 @@
 #   nbody    (float)           qemu 2.460s   gex 0.927x   v8 0.689x
 #   dicts    (allocation)      qemu 0.399s   gex 1.373x   v8 1.479x
 #
-# V8 is a long way ahead on floating point and a little behind on the other
-# two, running a CPython whose every opcode handler was translated ahead of
-# time. Mixed, in other words, which is a weaker claim than the one first
-# recorded here and is the one the numbers support.
+# Only the floating-point row is a result. `bench/ab-browser.mjs
+# --calibrate` runs a module against a copy of itself and comes out 2.6% to
+# 5.9% away from 1.000, so this harness cannot see a difference smaller than
+# about six per cent -- and it takes fewer rounds than that one does. The
+# 2% on fannkuch and the 8% on dicts are at or under the floor. nbody's 34%
+# is not, and is the claim worth making: V8 is a long way ahead on floating
+# point, and indistinguishable on the other two.
 #
 # The first measurement said V8 was ahead on two of three. It was taken with
 # a `gexc` that had not rebuilt for hours -- the native shim had a
