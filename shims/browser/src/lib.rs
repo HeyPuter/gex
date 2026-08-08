@@ -462,7 +462,7 @@ struct Suspended {
     /// Guest memory as it was, region by region. Includes the register
     /// contexts and the dispatch directory, which live below the image and
     /// are not in the memory map.
-    snapshot: Vec<(u64, Vec<u8>)>,
+    snapshot: Vec<Region>,
     kernel: Kernel,
     threads: Vec<Thread>,
     current: usize,
@@ -1673,18 +1673,76 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
 /// map, and all of it is per-process.
 const LOW_END: u64 = gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4;
 
+/// One piece of a suspended process's memory.
+enum Region {
+    /// Bytes, copied out.
+    Bytes(u64, Vec<u8>),
+    /// A read-only mapping of a file, which does not need copying: the file
+    /// says what is there.
+    ///
+    /// This is where a switch's cost went. A snapshot copied every mapping
+    /// in full, and most of what a process maps is library text -- Mesa,
+    /// libc, libX11 -- which it never writes. The gears demo moved 218 to
+    /// 223 MiB per switch and 17.9 GiB over a minute, almost all of it the
+    /// same read-only bytes going back and forth.
+    ///
+    /// Skipping the copy outright was tried once and was wrong: two
+    /// processes map *different* libraries at the same addresses, so leaving
+    /// whatever is there is only correct if it happens to be the same
+    /// library. Naming the file is different, and sound -- the bytes come
+    /// from the file at the offset the mapping was made from, whoever was
+    /// resident before.
+    ///
+    /// The origin is dropped by `MemoryMap::protect` for any range it
+    /// touches, which is what keeps a relocated GOT or an mprotected page
+    /// from being restored to its on-disk contents.
+    FromFile {
+        start: u64,
+        len: usize,
+        path: String,
+        offset: u64,
+    },
+}
+
 /// Copy out every part of guest memory a process owns.
-fn snapshot_memory(h: &Host) -> Vec<(u64, Vec<u8>)> {
+fn snapshot_memory(h: &Host) -> Vec<Region> {
     let data = guest_bytes();
-    let mut out = vec![(0u64, data[..LOW_END as usize].to_vec())];
+    let mut out = vec![Region::Bytes(0, data[..LOW_END as usize].to_vec())];
     for v in h.kernel.mem.vmas() {
         let (a, b) = (v.start as usize, (v.end as usize).min(data.len()));
-        if a < b {
-            out.push((v.start, data[a..b].to_vec()));
+        if a >= b {
+            continue;
+        }
+        // Writable, or from nowhere nameable: it has to be copied.
+        if v.prot & gex_kernel::mem::prot::WRITE != 0 {
+            out.push(Region::Bytes(v.start, data[a..b].to_vec()));
+            continue;
+        }
+        match &v.origin {
+            Some((path, offset)) => out.push(Region::FromFile {
+                start: v.start,
+                len: b - a,
+                path: path.clone(),
+                offset: *offset,
+            }),
+            None => out.push(Region::Bytes(v.start, data[a..b].to_vec())),
         }
     }
     if unsafe { HEARTBEAT } != 0 {
-        let bytes: usize = out.iter().map(|(_, b)| b.len()).sum();
+        let bytes: usize = out
+            .iter()
+            .map(|r| match r {
+                Region::Bytes(_, b) => b.len(),
+                Region::FromFile { .. } => 0,
+            })
+            .sum();
+        let spared: usize = out
+            .iter()
+            .map(|r| match r {
+                Region::FromFile { len, .. } => *len,
+                Region::Bytes(..) => 0,
+            })
+            .sum();
         static mut SWITCHES: u64 = 0;
         static mut COPIED: u64 = 0;
         let (n, total) = unsafe {
@@ -1693,9 +1751,11 @@ fn snapshot_memory(h: &Host) -> Vec<(u64, Vec<u8>)> {
             (SWITCHES, COPIED)
         };
         trace_line(&format!(
-            "[beat] switch {n}: pid {} wrote out {} MiB, {} MiB copied in all\n",
+            "[beat] switch {n}: pid {} wrote out {} MiB ({} MiB left in files), \
+             {} MiB copied in all\n",
             h.kernel.pid,
             bytes / (1 << 20),
+            spared / (1 << 20),
             total / (1 << 20)
         ));
     }
@@ -1725,13 +1785,52 @@ fn clear_mapped(h: &Host) {
     }
 }
 
-fn restore_memory(snapshot: &[(u64, Vec<u8>)]) {
+/// `k` is the kernel of the process the snapshot belongs to, because a path
+/// is resolved in the filesystem of whoever mapped it -- not in whichever
+/// process happens to be resident when it is restored.
+fn restore_memory(k: &Kernel, snapshot: &[Region]) {
     let data = guest_bytes();
-    for (at, bytes) in snapshot {
-        let a = *at as usize;
-        let b = (a + bytes.len()).min(data.len());
-        if a < b {
-            data[a..b].copy_from_slice(&bytes[..b - a]);
+    for r in snapshot {
+        match r {
+            Region::Bytes(at, bytes) => {
+                let a = *at as usize;
+                let b = (a + bytes.len()).min(data.len());
+                if a < b {
+                    data[a..b].copy_from_slice(&bytes[..b - a]);
+                }
+            }
+            Region::FromFile {
+                start,
+                len,
+                path,
+                offset,
+            } => {
+                let a = *start as usize;
+                let b = (a + *len).min(data.len());
+                if a >= b {
+                    continue;
+                }
+                // Whatever the file cannot supply is zero, which is what a
+                // mapping past the end of a file reads as anyway.
+                let want = b - a;
+                match k.read_file(path) {
+                    Some(f) => {
+                        let from = (*offset as usize).min(f.len());
+                        let have = (f.len() - from).min(want);
+                        data[a..a + have].copy_from_slice(&f[from..from + have]);
+                        data[a + have..b].fill(0);
+                    }
+                    None => {
+                        // The file has gone. Nothing can be restored from it,
+                        // and a guest that branches in here will fault rather
+                        // than run somebody else's code.
+                        trace_line(&format!(
+                            "gex: {path} is gone; {start:#x} cannot be restored\n"
+                        ));
+                        data[a..b].fill(0);
+                    }
+                }
+            }
         }
     }
 }
@@ -1792,7 +1891,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
 /// differ in exactly that, and each does its own half:
 /// [`switch_process`] saves it first, and [`exit_process`] throws it away.
 fn install_process(h: &mut Host, p: Suspended) {
-    restore_memory(&p.snapshot);
+    restore_memory(&p.kernel, &p.snapshot);
     h.kernel = p.kernel;
     h.threads = p.threads;
     h.current = p.current;
@@ -1866,7 +1965,7 @@ fn switch_process(h: &mut Host, idx: usize) {
             mine.pid, target.pid, target.resume_pc
         ));
     }
-    restore_memory(&target.snapshot);
+    restore_memory(&h.kernel, &target.snapshot);
     h.jit.page_table.advance_to(mark);
     // See `install_process`: choosing is the scheduler's job.
     h.resume = None;
