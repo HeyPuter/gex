@@ -191,6 +191,14 @@ impl OpenFile {
 pub struct FdTable {
     entries: Vec<Option<Arc<OpenFile>>>,
     cloexec: Vec<bool>,
+    /// Bumped by every change to the table.
+    ///
+    /// The same story as `MemoryMap::generation`: `/proc/self/fd` is served
+    /// from a snapshot, the snapshot listed every descriptor and cloned every
+    /// path before each syscall, and a guest opens files a few thousand times
+    /// while making millions of syscalls. A counter turns the rebuild into a
+    /// comparison.
+    generation: u64,
 }
 
 impl Default for FdTable {
@@ -204,6 +212,7 @@ impl FdTable {
         FdTable {
             entries: Vec::new(),
             cloexec: Vec::new(),
+            generation: 0,
         }
     }
 
@@ -219,6 +228,7 @@ impl FdTable {
 
     /// Install a description at the lowest free descriptor at or above `min`.
     pub fn insert_at(&mut self, file: Arc<OpenFile>, min: i32, cloexec: bool) -> SysResult {
+        self.generation += 1;
         let min = min.max(0) as usize;
         while self.entries.len() <= min {
             self.entries.push(None);
@@ -250,6 +260,7 @@ impl FdTable {
 
     /// Force a description into a specific descriptor, closing what was there.
     pub fn install(&mut self, fd: i32, file: Arc<OpenFile>, cloexec: bool) -> SysResult {
+        self.generation += 1;
         if fd < 0 {
             return Err(Errno::EBADF);
         }
@@ -269,11 +280,13 @@ impl FdTable {
     /// will ever reap keeps the pipe open, and whoever is reading the other
     /// end waits for an end of file that cannot come.
     pub fn close_all(&mut self) {
+        self.generation += 1;
         self.entries.clear();
         self.cloexec.clear();
     }
 
     pub fn close(&mut self, fd: i32) -> Result<(), Errno> {
+        self.generation += 1;
         if fd < 0 {
             return Err(Errno::EBADF);
         }
@@ -287,6 +300,7 @@ impl FdTable {
     }
 
     pub fn set_cloexec(&mut self, fd: i32, on: bool) -> Result<(), Errno> {
+        self.generation += 1;
         if fd < 0 || fd as usize >= self.cloexec.len() || self.entries[fd as usize].is_none() {
             return Err(Errno::EBADF);
         }
@@ -310,11 +324,17 @@ impl FdTable {
 
     /// Drop every close-on-exec descriptor, as `execve` does.
     pub fn close_on_exec(&mut self) {
+        self.generation += 1;
         for (i, flag) in self.cloexec.iter().enumerate() {
             if *flag {
                 self.entries[i] = None;
             }
         }
+    }
+
+    /// How many times the table has changed.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Every open descriptor and the path behind it.
@@ -332,6 +352,7 @@ impl FdTable {
         FdTable {
             entries: self.entries.clone(),
             cloexec: self.cloexec.clone(),
+            generation: self.generation,
         }
     }
 }

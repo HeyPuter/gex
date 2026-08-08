@@ -2114,8 +2114,15 @@ impl Kernel {
     // -- I/O -----------------------------------------------------------------
 
     fn sys_write(&mut self, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
-        let data = m.read(buf, len as usize)?.to_vec();
-        self.fds.get(fd)?.write(&data)
+        // Straight out of the guest's memory, with no copy in between.
+        //
+        // Guest virtual address equals byte offset here, so the bytes are
+        // already a slice; taking `.to_vec()` of them bought nothing and cost
+        // an allocation and a copy of every byte written. See `sys_writev`,
+        // where the same copy was most of a browser run.
+        let data = m.read(buf, len as usize)?;
+        let file = self.fds.get(fd)?;
+        file.write(data)
     }
 
     fn sys_read(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
@@ -2167,12 +2174,12 @@ impl Kernel {
                 continue;
             }
             let data = match m.read(base, len as usize) {
-                Ok(d) => d.to_vec(),
+                Ok(d) => d,
                 // Same rule as below: bytes already accepted have to be
                 // reported, or the caller sends them twice.
                 Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
             };
-            let n = match file.write(&data) {
+            let n = match file.write(data) {
                 Ok(n) => n,
                 // A pipe or socket that has filled up answers `EAGAIN`. If
                 // earlier vectors were already accepted, the call has
@@ -4060,6 +4067,8 @@ pub struct ProcState {
     /// Not part of what `/proc` serves -- it is how the rendering is avoided.
     /// See `MemoryMap::generation`.
     pub maps_generation: u64,
+    /// Which version of the descriptor table `fds` was listed from.
+    pub fds_generation: u64,
 }
 
 /// A `/proc` source backed by a snapshot the kernel refreshes.
@@ -4141,7 +4150,11 @@ impl Kernel {
         if s.cwd != self.vfs.cwd {
             s.cwd.clone_from(&self.vfs.cwd);
         }
-        s.fds = self.fds.list();
+        let fds_generation = self.fds.generation();
+        if s.fds_generation != fds_generation || s.fds.is_empty() {
+            s.fds = self.fds.list();
+            s.fds_generation = fds_generation;
+        }
         // argv and envp never change, so they are built once.
         if s.cmdline.is_empty() {
             s.cmdline = self
