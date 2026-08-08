@@ -13,6 +13,28 @@
 //! duplicates the block -- so a region is grown from a block that some block
 //! reachable from it branches back to.
 
+//! # What the baseline-compiler argument is actually worth
+//!
+//! The reason given above for regions -- V8 sees hundreds of thousands of
+//! tiny functions and never optimises most of them, and 76% of SQLite's
+//! execution stays in the baseline compiler -- suggests a large prize for
+//! any change that makes functions fewer and bigger.
+//!
+//! Measured, it is not there. Running CPython statically recompiled, the
+//! same module both sides, one of them with V8 told to compile everything
+//! with TurboFan up front (`--no-liftoff`), five alternating rounds,
+//! minimums:
+//!
+//!     fannkuch   default 7.103s   TurboFan-only 6.629s   0.933x
+//!     nbody      default 7.568s   TurboFan-only 8.218s   1.086x
+//!     dicts      default 2.258s   TurboFan-only 2.172s   0.962x
+//!
+//! Two marginally faster, one marginally slower, all near the six per cent
+//! this can resolve (`bench/ab-browser.mjs --calibrate`). Whatever the
+//! tier-up statistic is measuring, removing it entirely buys nothing --
+//! which is not an argument against regions, but is an argument against
+//! expecting a large win from function count alone.
+//!
 //! # Things tried that did not pay
 //!
 //! *Growing the natural loop* instead of walking forwards and narrowing.

@@ -77,12 +77,20 @@ if (!a || !b || !rootfs || !program) {
   process.exit(2);
 }
 
+/** Extra node flags for the B side, so an engine setting can be A/B'd too.
+ *
+ *   AB_FLAGS_B=--no-liftoff node bench/ab-browser.mjs A.wasm A.wasm ...
+ *
+ * The same module both sides, one of them compiled differently. That is how
+ * to ask what V8's tiering is worth without changing the program. */
+const FLAGS_B = (process.env.AB_FLAGS_B || '').split(' ').filter(Boolean);
+
 /** One run, returning every `name seconds` pair the guest printed. */
-function once(wasm) {
+function once(wasm, flags = []) {
   return new Promise((resolve) => {
     const p = spawn(
       process.execPath,
-      [RUNNER, '--dir', `/=${rootfs}`, '--cwd', '/', '--argv0', program, wasm, join(rootfs, program), ...rest],
+      [...flags, RUNNER, '--dir', `/=${rootfs}`, '--cwd', '/', '--argv0', program, wasm, join(rootfs, program), ...rest],
       { stdio: ['ignore', 'pipe', 'ignore'] },
     );
     let out = '';
@@ -109,7 +117,9 @@ const add = (side, pairs) => {
 for (let r = 0; r < ROUNDS; r++) {
   // Alternate, so nothing that warms up warms up for one side only.
   const order = r % 2 ? ['B', 'A'] : ['A', 'B'];
-  for (const side of order) add(side, await once(side === 'A' ? a : b));
+  for (const side of order) {
+    add(side, await once(side === 'A' ? a : b, side === 'B' ? FLAGS_B : []));
+  }
   process.stderr.write(`\rround ${r + 1}/${ROUNDS}`);
 }
 process.stderr.write('\n');
