@@ -784,6 +784,14 @@ fi
 
 # The same programs with runtime translation disabled, so that both the
 # on-demand path and the translate-everything-up-front path stay covered.
+#
+# This setting reaches all the way to the reset below, which is deliberate but
+# easy to miss: a test added between here and there runs in one mode only, and
+# a test that *needs* the runtime translator cannot go there at all. `selfmod`
+# was added in the middle of it and failed for the best possible reason --
+# code that does not exist until the guest writes it has nothing to translate
+# ahead of time, so a SIGSEGV is the correct answer to the question the flag
+# was asking. It runs after the reset now.
 GEXC_ARGS="--no-jit"
 for area in arith float mem flow; do
     compare "nojit-$area" "$WORK/suite" "$area"
@@ -801,14 +809,6 @@ compare "iov-partial" "$WORK/iov-partial"
 # again is the case that shows it: growing into never-touched memory is clean
 # by accident, because a fresh wasm memory is zero to begin with.
 compare "brk-zero" "$WORK/brk-zero"
-# A guest that writes its own machine code -- a JVM, a JavaScript engine, a
-# regex compiler -- and a plugin host that maps a different library over an
-# address it has already run code at. A dispatch slot answers for an address,
-# not for the bytes at it, so without invalidation the guest calls its new
-# function and runs the old one, silently and with no fault anywhere. Every
-# round returns a different constant so a stale translation reads as the
-# previous answer.
-compare "selfmod" "$WORK/selfmod"
 compare "signal-kill" "$WORK/signal-kill"
 compare "signal-alarm" "$WORK/signal-alarm"
 compare "signal-sigchld" "$WORK/signal-sigchld"
@@ -820,6 +820,19 @@ compare "nojit-loops" "$WORK/loops"
 compare "nojit-fixed-point" "$WORK/fixedpoint"
 compare "nojit-threads" "$WORK/threads"
 GEXC_ARGS=""
+
+# A guest that writes its own machine code -- a JVM, a JavaScript engine, a
+# regex compiler -- and a plugin host that maps a different library over an
+# address it has already run code at. A dispatch slot answers for an address,
+# not for the bytes at it, so without invalidation the guest calls its new
+# function and runs the old one, silently and with no fault anywhere. Every
+# round returns a different constant so a stale translation reads as the
+# previous answer.
+#
+# Necessarily with the runtime translator on. The code under test does not
+# exist when the program starts, so there is nothing for an ahead-of-time pass
+# to find, and `--no-jit` can only fail here.
+compare "selfmod" "$WORK/selfmod"
 
 # How much of `struct termios` a TCGETS writes. Needs a terminal on both
 # sides, so both run under `script` -- without one the program has nothing to
