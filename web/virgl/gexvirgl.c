@@ -185,7 +185,7 @@ static int gex_presented;
  * size of a cursor -- and each wants a different fix. Counting them apart
  * costs four words and turns a day of guessing into a glance. */
 static int gex_present_no_info, gex_present_no_tex, gex_present_small,
-    gex_present_incomplete;
+    gex_present_incomplete, gex_present_no_handle;
 static uint32_t gex_present_last_w, gex_present_last_h;
 
 static void gex_present(uint32_t handle) {
@@ -236,26 +236,44 @@ static void gex_present(uint32_t handle) {
 
 /* The resource handle is the first word of a TRANSFER_GET body, so it can be
  * read without consuming it and without duplicating the header struct. */
-static uint32_t gex_peek_handle(void) {
-    uint32_t handle = 0;
-    if (cur && cur->in_pos + sizeof handle <= cur->in_len) {
-        memcpy(&handle, cur->in_buf + cur->in_pos, sizeof handle);
+/* The resource handle is the first word of a TRANSFER_GET body.
+ *
+ * Read *after* the command, from where the body started, rather than peeked
+ * before it. Peeking ahead only works when the whole body has already
+ * arrived; when it has not, the peek returns zero, vtest goes on to read the
+ * body correctly as more bytes turn up, and the frame is executed perfectly
+ * and never presented. Ten readbacks out of twelve went that way, and
+ * because the skip happened before `gex_present` none of the four drop
+ * counters noticed -- a black canvas with nothing to say for itself.
+ *
+ * By the time the command returns, `in_pos` has moved past the body and the
+ * bytes are still there: the buffer is only ever compacted by `feed`, which
+ * cannot run in the middle of a command.
+ */
+static int gex_transfer_common(int r, size_t body) {
+    if (r < 0 || short_read || !cur) {
+        return r;
     }
-    return handle;
+    uint32_t handle = 0;
+    if (body + sizeof handle <= cur->in_len) {
+        memcpy(&handle, cur->in_buf + body, sizeof handle);
+    }
+    if (handle) {
+        gex_present(handle);
+    } else {
+        gex_present_no_handle++;
+    }
+    return r;
 }
 
 static int gex_transfer_get(uint32_t len) {
-    uint32_t handle = gex_peek_handle();
-    int r = vtest_transfer_get(len);
-    if (r >= 0 && handle) gex_present(handle);
-    return r;
+    size_t body = cur ? cur->in_pos : 0;
+    return gex_transfer_common(vtest_transfer_get(len), body);
 }
 
 static int gex_transfer_get2(uint32_t len) {
-    uint32_t handle = gex_peek_handle();
-    int r = vtest_transfer_get2(len);
-    if (r >= 0 && handle) gex_present(handle);
-    return r;
+    size_t body = cur ? cur->in_pos : 0;
+    return gex_transfer_common(vtest_transfer_get2(len), body);
 }
 
 /* The command table, as `vtest_server.c` has it. Kept here rather than
@@ -531,10 +549,11 @@ const char *gex_virgl_commands(void) {
         }
     }
     snprintf(out + at, sizeof out - at,
-             "%sdropped: no_info=%d no_tex=%d small=%d incomplete=%d last=%ux%u",
-             at ? " | " : "", gex_present_no_info, gex_present_no_tex,
-             gex_present_small, gex_present_incomplete, gex_present_last_w,
-             gex_present_last_h);
+             "%sdropped: no_handle=%d no_info=%d no_tex=%d small=%d incomplete=%d "
+             "last=%ux%u",
+             at ? " | " : "", gex_present_no_handle, gex_present_no_info,
+             gex_present_no_tex, gex_present_small, gex_present_incomplete,
+             gex_present_last_w, gex_present_last_h);
     return out;
 }
 
