@@ -162,6 +162,16 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         true
     }
 
+    /// A short description of this handle's state, for a diagnostic.
+    ///
+    /// Two processes waiting on each other is the hardest thing to read from
+    /// outside: a descriptor number says which slot, and the path says
+    /// "socket", and neither says whether the buffer behind it is empty or
+    /// full or which way it points. The handle knows.
+    fn debug_state(&self) -> String {
+        String::new()
+    }
+
     /// An `ioctl` this handle answers itself.
     ///
     /// `None` means "not mine", and the kernel's own handling runs -- which

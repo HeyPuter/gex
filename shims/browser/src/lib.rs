@@ -2199,9 +2199,16 @@ fn report_idle(why: u8) {
     }
     let census = with_host(|h| {
         let mut out = String::new();
-        for (pid, p) in std::iter::once((0usize, &h.threads))
-            .chain(h.suspended.iter().enumerate().map(|(i, p)| (i + 1, &p.threads)))
-        {
+        // Each process with its own descriptor table, so a polled fd can be
+        // named. A number on its own says which slot a process is waiting
+        // on and nothing about what is at the other end, which is exactly
+        // the question when two processes are waiting for each other.
+        for (pid, p, k) in std::iter::once((0usize, &h.threads, &h.kernel)).chain(
+            h.suspended
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i + 1, &p.threads, &p.kernel)),
+        ) {
             for (i, t) in p.iter().enumerate() {
                 out.push_str(&format!(" {pid}.{i}={}", waiting_name(&t.waiting)));
                 // And, for a poll, exactly which descriptors and how each
@@ -2212,8 +2219,16 @@ fn report_idle(why: u8) {
                 if let Some(gex_kernel::BlockOp::Poll { fds, .. }) = &t.blocked_on {
                     out.push('(');
                     for f in fds {
+                        let what = k
+                            .fds
+                            .get(f.fd)
+                            .map(|o| {
+                                let d = o.handle.debug_state();
+                                if d.is_empty() { o.path.clone() } else { d }
+                            })
+                            .unwrap_or_else(|_| "?".into());
                         out.push_str(&format!(
-                            "{}:want{:#x}/have{:#x} ",
+                            "[{} {what} want{:#x} have{:#x}] ",
                             f.fd,
                             f.events,
                             gex_kernel::syscalls::poll_revents(f)

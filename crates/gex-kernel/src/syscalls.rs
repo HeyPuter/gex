@@ -631,7 +631,15 @@ pub fn poll_revents(p: &PollFd) -> u16 {
     if p.events & POLLIN != 0 && h.poll_readable() {
         r |= POLLIN;
     }
-    if p.events & POLLOUT != 0 && p.writable {
+    // Asked of the handle, not remembered. `p.writable` is the descriptor's
+    // open mode, which cannot change; whether a write would block can, and
+    // a parked poll is re-evaluated long after it was built.
+    //
+    // Freezing it was a real hang: a poll made while the socket was full
+    // stored "not writable", the other end drained the buffer, and the
+    // stored answer never moved. POLLIN was always asked live, which is why
+    // only this direction could get stuck.
+    if p.events & POLLOUT != 0 && p.writable && h.poll_writable() {
         r |= POLLOUT;
     }
     r
@@ -2684,26 +2692,10 @@ impl Kernel {
                 fd,
                 events,
                 handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
-                // Whether a write would *proceed*, not whether the
-                // descriptor was opened for writing.
-                //
-                // It used to be the open mode, so `poll` answered POLLOUT
-                // for every writable fd whatever the state of the thing
-                // behind it -- including a unix socket whose 256 KB buffer
-                // was full. A program doing the correct thing then cannot
-                // make progress: it writes, gets EAGAIN, polls, is told the
-                // fd is ready, writes again. glxgears sat in exactly that
-                // pair for two and a quarter million iterations:
-                //
-                //     writev(0x3, ...) = -11      (EAGAIN)
-                //     ppoll(...)       = 1        (ready)
-                //     writev(0x3, ...) = -11
-                //
-                // The handle knows; the default for anything that does not
-                // care is `true`, so a regular file still polls writable.
-                writable: file
-                    .as_ref()
-                    .is_some_and(|f| f.writable && f.handle.poll_writable()),
+                // The open mode only. Whether a write would *block* is
+                // asked of the handle in `poll_revents`, every time, because
+                // a parked poll outlives the state it was built from.
+                writable: file.as_ref().is_some_and(|f| f.writable),
             });
         }
         Some(out)
@@ -2757,26 +2749,10 @@ impl Kernel {
                         fd,
                         events,
                         handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
-                        // Whether a write would *proceed*, not whether the
-                // descriptor was opened for writing.
-                //
-                // It used to be the open mode, so `poll` answered POLLOUT
-                // for every writable fd whatever the state of the thing
-                // behind it -- including a unix socket whose 256 KB buffer
-                // was full. A program doing the correct thing then cannot
-                // make progress: it writes, gets EAGAIN, polls, is told the
-                // fd is ready, writes again. glxgears sat in exactly that
-                // pair for two and a quarter million iterations:
-                //
-                //     writev(0x3, ...) = -11      (EAGAIN)
-                //     ppoll(...)       = 1        (ready)
-                //     writev(0x3, ...) = -11
-                //
-                // The handle knows; the default for anything that does not
-                // care is `true`, so a regular file still polls writable.
-                writable: file
-                    .as_ref()
-                    .is_some_and(|f| f.writable && f.handle.poll_writable()),
+                        // The open mode only. Whether a write would *block* is
+                // asked of the handle in `poll_revents`, every time, because
+                // a parked poll outlives the state it was built from.
+                writable: file.as_ref().is_some_and(|f| f.writable),
                     }
                 })
                 .collect(),
@@ -3467,9 +3443,7 @@ impl Kernel {
                 fd: w.fd,
                 events: (w.events & 0xffff) as u16,
                 handle: Some(Arc::clone(&file.handle)),
-                // As in `collect_pollfds`: would a write proceed, not was
-                // this opened for writing.
-                writable: file.writable && file.handle.poll_writable(),
+                writable: file.writable,
             };
             let got = poll_revents(&p) as u32;
             if got != 0 {

@@ -395,6 +395,19 @@ impl FileHandle for UnixSocket {
         }
     }
 
+    fn debug_state(&self) -> String {
+        match &*self.role.lock().unwrap() {
+            Role::Fresh => "fresh".into(),
+            Role::Bound(p) => format!("bound {p}"),
+            Role::Listening { path, backlog } => {
+                format!("listening {path}, {} waiting", backlog.lock().unwrap().len())
+            }
+            Role::Connected { rx, tx, .. } => {
+                format!("connected rx={} tx={}", rx.available(), tx.available())
+            }
+        }
+    }
+
     fn poll_writable(&self) -> bool {
         match &*self.role.lock().unwrap() {
             Role::Connected { tx, .. } => tx.writable(),
