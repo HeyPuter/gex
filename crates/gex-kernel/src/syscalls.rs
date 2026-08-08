@@ -3724,7 +3724,13 @@ impl Kernel {
         let err = if name == SO_ERROR {
             match self.socket_of(fd)?.status() {
                 net::Status::Refused => Errno::ECONNREFUSED.0,
-                net::Status::Connecting => Errno::EINPROGRESS.0,
+                // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
+                // *finished*, and Linux leaves it zero until one has; a
+                // caller is meant to learn "not yet" from the descriptor not
+                // being writable, which is what `poll_writable` now says.
+                // Reporting it here made `apt` treat "still connecting" as
+                // the error that stopped it.
+                net::Status::Connecting => 0,
                 _ => 0,
             }
         } else {

@@ -651,9 +651,30 @@ struct Host {
     jit: Jit,
 }
 
+// Against a plain memory the shim is single-threaded and one Worker owns
+// everything, so a thread-local is exactly right and costs nothing.
+#[cfg(not(feature = "shared-memory"))]
 thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
 }
+
+/// The kernel, shared by every Worker running a thread of this process.
+///
+/// A thread-local is wrong here, and was the thing standing between this
+/// runtime and real threads. With `+atomics` each Worker gets its own TLS
+/// block, so each would have had its own file table, its own memory map and
+/// its own process table -- which is a fork, not a thread.
+///
+/// A plain `static` is right instead, and for a reason particular to this
+/// design: the shim's data and heap live in the *guest's* linear memory, and
+/// against a shared memory that memory is a `SharedArrayBuffer`. So a static
+/// here is already visible to every Worker that instantiated against it. The
+/// only thing missing was mutual exclusion, which is what the lock is.
+///
+/// A spinlock rather than a blocking one because there is no OS underneath to
+/// park on, and because a syscall holds this for a few microseconds at most.
+#[cfg(feature = "shared-memory")]
+static HOST: spinning_top::Spinlock<Option<Host>> = spinning_top::Spinlock::new(None);
 
 /// How much of the address space the guest may use.
 ///
@@ -735,9 +756,35 @@ fn install_panic_hook() {
     });
 }
 
+/// Install the kernel this Worker will run against.
+#[cfg(not(feature = "shared-memory"))]
+fn set_host(host: Host) {
+    HOST.with(|h| *h.borrow_mut() = Some(host));
+}
+
+#[cfg(feature = "shared-memory")]
+fn set_host(host: Host) {
+    *HOST.lock() = Some(host);
+}
+
+#[cfg(not(feature = "shared-memory"))]
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
     HOST.with(|h| f(h.borrow_mut().as_mut().expect("gex: not initialised")))
+}
+
+/// The same, holding the lock for the duration.
+///
+/// Re-entrancy is a real hazard and not a theoretical one: a host call that
+/// asks the guest to write something can come back through here, and with a
+/// spinlock that is a deadlock rather than a panic. Every such path already
+/// had to avoid it -- `gex_hot_blocks` is the one that caught it before, by
+/// re-entering from inside a guest `write` -- so the rule is unchanged and
+/// only the punishment is worse.
+#[cfg(feature = "shared-memory")]
+fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
+    install_panic_hook();
+    f(HOST.lock().as_mut().expect("gex: not initialised"))
 }
 
 /// Sockets the host holds one end of, so JS can carry a guest's stream
@@ -1174,8 +1221,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
 
     let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
     let entry = program.entry();
-    HOST.with(|h| {
-        *h.borrow_mut() = Some(Host {
+    set_host(Host {
             kernel,
             virgl,
             root,
@@ -1203,7 +1249,6 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 compiles: 0,
                 nanos: 0,
             },
-        });
     });
     entry
 }
@@ -1617,12 +1662,29 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
         let g = |i: usize| gm.read_u64(base + ctx::x(i as u8) as u64).unwrap_or(0);
         let n = g(8);
         let who = with_host(|h| h.current);
+        // The path, for the calls whose whole meaning is which file. A trace
+        // of `execve(0x2805ef70, ...)` says a program was run and not which,
+        // and a run with four of them is four questions rather than an
+        // answer. `openat` puts the path in the second argument, the rest in
+        // the first.
+        let path = |at: u64| {
+            gm.read_cstr(at, 255)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
+        use gex_kernel::syscalls::nr;
+        let named = match n {
+            nr::EXECVE | nr::STATX => Some(path(g(0))),
+            nr::OPENAT | nr::UNLINKAT | nr::RENAMEAT => Some(path(g(1))),
+            _ => None,
+        };
         trace_line(&format!(
-            "[gex] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}) ...\n",
+            "[gex] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} ...\n",
             gex_kernel::syscalls::syscall_name(n),
             g(0),
             g(1),
-            g(2)
+            g(2),
+            named.map_or(String::new(), |p| format!(" \"{p}\"")),
         ));
         // For a gather write, what the kernel sees at each iovec. A wrong
         // byte here and a right one in the guest means the two disagree about
@@ -1662,10 +1724,13 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                 1
             }
             SyscallOutcome::Exit(code) => exit_process(h, code),
-            SyscallOutcome::Killed { signal, .. } => {
-                h.exit = Some(128 + signal as i32);
-                2
-            }
+            // A signal with no handler kills the *process*, not the run.
+            // Setting the run's exit here is what ended `apt update`: apt
+            // stops its http method with `kill(pid, SIGINT)` -- ordinary
+            // shutdown, and the method installs no handler -- and the whole
+            // guest went down with it, after the download had succeeded.
+            // Negative for "died of a signal"; see `exit_process`.
+            SyscallOutcome::Killed { signal, .. } => exit_process(h, -(signal as i32)),
             SyscallOutcome::SpawnThread {
                 ctx_addr,
                 tid,
@@ -2150,6 +2215,14 @@ fn switch_process(h: &mut Host, idx: usize) {
 /// This process has exited. Hand the stack to another, or end the run.
 ///
 /// Returns 1 when another process took over, 2 when this was the last one.
+/// End the running process and give the stack to another.
+///
+/// `code` is an exit status, or the negated signal number when the process
+/// died of one -- the two are different things to `wait4`, which reports a
+/// normal exit as `code << 8` and a signal death as the bare signal, and a
+/// parent tells them apart with `WIFEXITED`/`WIFSIGNALED`. Carrying the sign
+/// is enough to keep them apart without widening everything that passes a
+/// status along.
 fn exit_process(h: &mut Host, code: i32) -> i32 {
     // Published before anything else, because the table is shared between
     // every kernel and this is the record a parent's `wait4` will find --
@@ -2166,7 +2239,12 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
         .position(|p| p.pid == ppid)
         .or(h.suspended.len().checked_sub(1));
     let Some(idx) = idx else {
-        h.exit = Some(code);
+        // Nothing left to run, so this process's fate is the run's. A shell
+        // reports a signal death as 128 + the signal, and so does this.
+        if tracing() {
+            trace_line(&format!("[proc] exit {pid} with {code}, nothing left to run\n"));
+        }
+        h.exit = Some(if code < 0 { 128 - code } else { code });
         return 2;
     };
     let target = h.suspended.remove(idx);
@@ -2771,8 +2849,16 @@ fn schedule() -> i32 {
                 let outcome = h.kernel.finish_blocking(&mut gm, r);
                 h.kernel.leave_thread(&mut h.threads[h.current].kstate);
                 match outcome {
+                    // One process, not the run -- the same distinction the
+                    // syscall path makes. This is the site that ended `apt
+                    // update`: apt's gpgv method exits from a syscall it had
+                    // been parked in, and the whole guest went with it, after
+                    // the download had already succeeded and with apt's own
+                    // process still live and holding a child. `exit_process`
+                    // publishes the status the parent's `wait4` collects and
+                    // hands the stack to whoever is next.
                     SyscallOutcome::Exit(code) => {
-                        h.exit = Some(code);
+                        exit_process(h, code);
                         return None;
                     }
                     // Finishing a blocked syscall can *deliver a signal*.
@@ -2794,8 +2880,12 @@ fn schedule() -> i32 {
                         }
                         pc = target;
                     }
+                    // Same as the syscall path: this ends one process. The
+                    // difference is that there is no stack to return to, so
+                    // the caller is told there is no thread to resume and the
+                    // scheduler picks the next one.
                     SyscallOutcome::Killed { signal, .. } => {
-                        h.exit = Some(128 + signal as i32);
+                        exit_process(h, -(signal as i32));
                         return None;
                     }
                     _ => {}
@@ -2883,7 +2973,15 @@ fn finish_parked(
                     c.reaped.store(true, std::sync::atomic::Ordering::Release);
                     procs.reap(c.pid);
                     if *wstatus != 0 {
-                        gm.write_u32(*wstatus, ((code as u32) & 0xff) << 8)?;
+                        // `WIFEXITED`: the code in the second byte, low bits
+                        // clear. `WIFSIGNALED`: the signal in the low seven,
+                        // which is what a negative code means here.
+                        let word = if code < 0 {
+                            (-code) as u32 & 0x7f
+                        } else {
+                            ((code as u32) & 0xff) << 8
+                        };
+                        gm.write_u32(*wstatus, word)?;
                     }
                     return Ok(c.pid as u64);
                 }

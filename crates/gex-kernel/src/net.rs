@@ -387,6 +387,33 @@ impl FileHandle for Socket {
             None => true,
         }
     }
+
+    /// Writable, which for a socket in the middle of `connect` means the
+    /// connect has finished -- one way or the other.
+    ///
+    /// This is the whole of how a non-blocking connect reports itself. The
+    /// caller gets `EINPROGRESS`, waits for the descriptor to become
+    /// writable, and only then asks `SO_ERROR` whether it worked. Inheriting
+    /// the trait's `true` said "finished" the instant the connection was
+    /// started, so `apt` asked immediately, was told `EINPROGRESS`, and
+    /// reported it as the reason it could not connect:
+    ///
+    ///     Could not connect to deb.debian.org:80 (240.0.0.1).
+    ///       - connect (115: Operation now in progress)
+    ///
+    /// which reads like a network failure and is really a socket answering a
+    /// question before it knew.
+    fn poll_writable(&self) -> bool {
+        if self.kind == Kind::Udp {
+            return true;
+        }
+        match &*self.transport.lock().unwrap() {
+            Some(t) => !matches!(t.status(), Status::Connecting),
+            // No `connect` yet. A fresh TCP socket is writable on Linux too,
+            // and a caller polling one has not asked about a connection.
+            None => true,
+        }
+    }
 }
 
 impl Drop for Socket {

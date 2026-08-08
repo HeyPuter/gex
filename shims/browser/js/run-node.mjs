@@ -152,6 +152,14 @@ if (process.env.GEX_HEARTBEAT) {
 // time. That is what the native host does with `--recompile-objects`, and
 // what a page has never had -- there is no ahead-of-time step in a browser,
 // so every block used to arrive through a miss.
+// GEX_TRACE is the syscall log. Large -- a run that translates Mesa produces
+// hundreds of megabytes of it -- so it is for a question already narrowed to
+// a few seconds of guest time, like which process sent the signal that ended
+// a run.
+if (process.env.GEX_DEBUG_EXIT) globalThis.GEX_DEBUG_EXIT = 1;
+if (process.env.GEX_TRACE) {
+  gex.shim.exports.gex_set_trace?.(1);
+}
 if (process.env.GEX_TRACE_MISSES) {
   gex.shim.exports.gex_set_trace_misses?.(1);
 }
@@ -208,4 +216,13 @@ for (const [guest, host] of extract) {
   const bytes = gex.readFile(guest);
   if (bytes) writeFileSync(host, bytes);
 }
-process.exit(status);
+// `process.exitCode`, not `process.exit`. The guest's output goes through
+// `process.stdout`/`process.stderr` -- it has to, so that this runner works
+// inside a Worker, whose fd 1 is the *process's* -- and those are
+// asynchronous when they are a pipe. `process.exit` does not wait for them,
+// so whatever had not drained was thrown away: `apt update` appeared to stop
+// after its first download, with the rest of its output and its error
+// message both lost, and the run looked like a hang that had exited 0.
+//
+// Setting the code instead lets node finish the writes and leave on its own.
+process.exitCode = status;

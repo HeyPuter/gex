@@ -194,6 +194,18 @@ export async function runProgram(
     gex.shim.exports.gex_set_winsize(term.rows, term.cols);
   }
   if (network) gex.useNetwork(network);
+  // Statically recompile each shared object the guest maps, rather than
+  // meeting it one dispatch miss at a time. This is the whole feature the
+  // project exists for, and the page was not using it: every block on this
+  // site arrived through a miss, so glxgears spent 11.8 of its first 34
+  // seconds inside the translator and drew at a third of a frame a second.
+  //
+  // The value is a cap in KiB of mapped text per object. Eight megabytes is
+  // the largest that works today -- above it the graphics rootfs meets #73 --
+  // and it covers every library the demos actually run except Mesa's software
+  // rasteriser, which nothing here wants because the renderer is on the other
+  // side of the vtest socket.
+  gex.shim.exports.gex_set_recompile_objects?.(8192);
   // Keystrokes go to the environment, not straight to the guest: whether
   // they are echoed, and whether they are delivered a line at a time, is the
   // guest's choice, read out of its termios.

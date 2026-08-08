@@ -387,6 +387,13 @@ export class Gex {
     for (;;) {
       try {
         this.#guest.exports.enter(ctx, pc);
+        // `enter` returning means the guest gave the stack back for good --
+        // normally because the last process exited. `GEX_DEBUG_EXIT` says so,
+        // because "the run ended" and "the program finished" look identical
+        // from outside and are not the same thing.
+        if (globalThis.GEX_DEBUG_EXIT) {
+          console.error(`[gex] run ended: enter returned, code ${this.#shim.exports.gex_exit_code()}`);
+        }
         return this.#shim.exports.gex_exit_code();
       } catch (err) {
         // A trap unwinds the engine's own frames, but the shim's shadow
@@ -459,7 +466,15 @@ export class Gex {
             woke = e.gex_wake();
             if (woke === 1) break;
           }
-          if (woke !== 1) return e.gex_exit_code();
+          if (woke !== 1) {
+            // Every thread is waiting and nothing woke them. That is the end
+            // of the run whether or not the guest is finished, so it is worth
+            // being able to tell the two apart.
+            if (globalThis.GEX_DEBUG_EXIT) {
+              console.error(`[gex] run ended: nothing woke (wake=${woke}), code ${e.gex_exit_code()}`);
+            }
+            return e.gex_exit_code();
+          }
           pc = e.gex_resume_pc();
           const wakeCtx = e.gex_resume_ctx() >>> 0;
           if (wakeCtx !== 0) ctx = wakeCtx;
@@ -513,6 +528,12 @@ export class Gex {
             `, ctx=0x${ctx.toString(16)}${heap}${dispatch})`;
         }
         if (String(err).includes("unreachable")) {
+          // The ordinary end: the shim set an exit status and abandoned the
+          // wasm stack. `enter` never returns in that case, so this is the
+          // path a finished program actually takes.
+          if (globalThis.GEX_DEBUG_EXIT) {
+            console.error(`[gex] run ended: shim trapped out, code ${e.gex_exit_code()}`);
+          }
           return e.gex_exit_code();
         }
         throw err;
