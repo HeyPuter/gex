@@ -67,7 +67,25 @@ const REPORTER = `
   addEventListener('gex:status', (e) => {
     post('status', e.detail.kind + '|' + e.detail.text + '|' + term());
   });
+  // A ping the moment this runs, so "nothing arrived" can be told from
+  // "the page never loaded". They are the same output otherwise.
+  post('status', 'reporter|installed|');
   addEventListener('error', (e) => post('threw', String(e.message || e)));
+  // In the capture phase as well, which is the only way a *resource* load
+  // failure is heard -- a module script that 404s or is served as the wrong
+  // type fires on the element, not on window, and bubbles nowhere. That is
+  // invisible to every listener above and is what a page that loads and
+  // then does absolutely nothing looks like.
+  addEventListener(
+    'error',
+    (e) => {
+      const t = e.target;
+      if (t && t !== window) {
+        post('threw', 'failed to load ' + (t.src || t.href || t.tagName));
+      }
+    },
+    true,
+  );
   addEventListener('unhandledrejection', (e) =>
     post('threw', String(e.reason?.message || e.reason)));
 })();
@@ -85,7 +103,12 @@ const server = createServer(async (req, res) => {
     res.writeHead(204).end();
     return;
   }
-  const name = (req.url === '/' ? '/index.html' : req.url).split('?')[0];
+  // The query goes first, then the check for the root. The other order
+  // compared `/?demo=busybox&run=1` against `/`, did not match, stripped the
+  // query afterwards and asked for the directory -- which is not a file, so
+  // the server answered 404 to its own page. Every demo then "timed out with
+  // no status", which is exactly what a page that was never served does.
+  const name = req.url.split('?')[0] === '/' ? '/index.html' : req.url.split('?')[0];
   const path = join(DIST, name);
   try {
     if (!(await stat(path)).isFile()) throw new Error('not a file');
