@@ -534,6 +534,21 @@ struct Jit {
     /// Not part of a process's saved state. That is the point -- it outlives
     /// every `fork` and `execve`, which is where the waste was.
     shared: std::collections::HashMap<(u64, u64), u32>,
+    /// Objects the guest has mapped that have not been recompiled yet, and
+    /// how many dispatch misses have landed in each.
+    ///
+    /// Translating an object the moment it is mapped is the wrong policy
+    /// even though it is the right mechanism. Measured on the gears demo:
+    /// 1,487,251 blocks against 352,080 for the demand path, to reach the
+    /// same two places later, because whole-object translation pays for
+    /// every function in Mesa and libc whether or not the run calls one.
+    /// The X-server test goes the other way -- 30 seconds to 12 -- because
+    /// there the same libraries stay in use.
+    ///
+    /// So an object waits until it proves itself. A library the run touches
+    /// twice stays on the demand path; libc is entered thousands of times
+    /// before anything else happens and is recompiled almost at once.
+    candidates: Vec<(gex_kernel::CodeMap, u32)>,
     /// Modules JS has yet to instantiate, oldest first.
     ///
     /// A queue rather than one, because statically recompiling a whole
@@ -1008,6 +1023,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
                 translated: Default::default(),
                 shared: Default::default(),
+                candidates: Vec::new(),
                 pending: Default::default(),
                 blocks: 0,
                 compiles: 0,
@@ -2802,6 +2818,19 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let _ = resumed;
         trap();
     }
+    // Before translating one block: has this object been missed often
+    // enough to be worth translating whole? If so it is now queued, and the
+    // block this miss asked for is in it.
+    if maybe_recompile_at(pc) {
+        // The same resume the ordinary path uses: come back at the address
+        // that missed, once JavaScript has instantiated what was queued and
+        // the address resolves.
+        with_host(|h| {
+            h.resume = Some(pc);
+            h.resume_ctx = Some(h.threads[h.current].kstate.ctx_addr);
+        });
+        trap();
+    }
     let translated = with_host(|h| {
         if !h.jit.described {
             return false;
@@ -2952,40 +2981,97 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
 /// Off unless the page asks. A demo that wants to show the runtime translator
 /// working should get the runtime translator; this is a different claim about
 /// what the system is, and it should be made deliberately.
-fn recompile_objects() -> bool {
+fn recompile_objects() {
+    if unsafe { RECOMPILE_OBJECTS } == 0 {
+        return;
+    }
+    let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
+    with_host(|h| {
+        for m in mapped {
+            h.jit.candidates.push((m, 0));
+        }
+    });
+}
+
+/// How many dispatch misses an object takes before the rest of it is
+/// translated in bulk.
+///
+/// # What this is worth, measured
+///
+/// Waiting is much better than not waiting. On the gears demo, against
+/// recompiling every object the moment it is mapped:
+///
+///     objects recompiled     57  ->  31
+///     dispatch slots      6.26M  ->  3.89M   (V8 caps a table at 10M)
+///     first GL client       25s  ->  14s
+///     second                56s  ->  41s
+///
+/// But neither is better than leaving it off. Pure runtime translation
+/// reaches the same two places at 10s and 29s, and CPython -- a sustained
+/// workload rather than a startup-dominated one, five interleaved rounds
+/// under V8 -- comes out slower with it on:
+///
+///     fannkuch  off 1.150s   on 1.242s   1.080x
+///     nbody     off 1.578s   on 1.652s   1.047x
+///     dicts     off 0.534s   on 0.558s   1.045x
+///
+/// Four to eight per cent, the same direction on all three, which is worth
+/// more than the size of it. The reason is not mysterious: CPython's hot
+/// loop is in the executable, which `gexc build --exhaustive` already
+/// translated, and the parts of libc it leans on -- malloc, memcpy -- are
+/// reached early and translated by the demand path within a few misses
+/// anyway. Translating the rest of libc buys nothing and costs V8 a much
+/// larger module to compile.
+///
+/// So this stays off by default. The mechanism is right and the case for it
+/// has not been demonstrated: it wants a run that is long *and* spends its
+/// time in a library, which neither workload here is.
+const RECOMPILE_AFTER_MISSES: u32 = 24;
+
+/// A dispatch miss landed at `pc`. If it is in an object that has now been
+/// missed often enough, translate the rest of that object.
+///
+/// Returns whether anything was queued, which the caller takes as "the work
+/// is done, do not also translate one block".
+fn maybe_recompile_at(pc: u64) -> bool {
     if unsafe { RECOMPILE_OBJECTS } == 0 {
         return false;
     }
-    let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
-    if mapped.is_empty() {
+    let due = with_host(|h| {
+        let at = h
+            .jit
+            .candidates
+            .iter()
+            .position(|(m, _)| pc >= m.start && pc < m.end)?;
+        h.jit.candidates[at].1 += 1;
+        if h.jit.candidates[at].1 < RECOMPILE_AFTER_MISSES {
+            return None;
+        }
+        Some(h.jit.candidates.remove(at).0)
+    });
+    let Some(map) = due else { return false };
+    let began = now_ns();
+    let blocks = recompile_object(&map);
+    if blocks == 0 {
         return false;
     }
-    let mut any = false;
-    for m in mapped {
-        let began = now_ns();
-        let blocks = recompile_object(&m);
-        if blocks == 0 {
-            continue;
-        }
-        any = true;
-        if unsafe { HEARTBEAT } != 0 {
-            let ms = (now_ns() - began) / 1_000_000;
-            let (slots, mods, bytes) = with_host(|h| {
-                (
-                    h.jit.page_table.slots(),
-                    h.jit.pending.len(),
-                    h.jit.pending.iter().map(|p| p.wasm.len()).sum::<usize>(),
-                )
-            });
-            trace_line(&format!(
-                "[gex] recompiled {} statically: {blocks} blocks in {ms}ms, \
-                 {mods} module(s) of {} KiB waiting, {slots} slots claimed in all\n",
-                m.path,
-                bytes / 1024
-            ));
-        }
+    if unsafe { HEARTBEAT } != 0 {
+        let ms = (now_ns() - began) / 1_000_000;
+        let (slots, mods, bytes) = with_host(|h| {
+            (
+                h.jit.page_table.slots(),
+                h.jit.pending.len(),
+                h.jit.pending.iter().map(|p| p.wasm.len()).sum::<usize>(),
+            )
+        });
+        trace_line(&format!(
+            "[gex] recompiled {} statically: {blocks} blocks in {ms}ms, \
+             {mods} module(s) of {} KiB waiting, {slots} slots claimed in all\n",
+            map.path,
+            bytes / 1024
+        ));
     }
-    any
+    true
 }
 
 /// Whether to statically recompile each object as it is mapped, and how big
