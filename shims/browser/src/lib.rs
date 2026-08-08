@@ -499,57 +499,6 @@ enum Waiting {
     /// Finished; the slot stays so a `join` can still find the tid.
     Exited,
 }
-
-/// A parent process, frozen while its child runs.
-///
-/// There is one address space here and no way to make a second: a guest
-/// address is a byte offset into the page's wasm memory, and a page gets one
-/// memory. So `fork` is done by checkpoint. The parent's memory, kernel and
-/// threads are copied aside, the child runs in place, and when the child
-/// exits the parent is put back exactly as it was, with the child's pid
-/// already in `x0` where the kernel wrote it before any of this started.
-///
-/// What this buys is the whole of a Unix userspace in a page: a shell that
-/// starts real processes, a pipeline, `make`, `apt`.
-///
-/// Processes take turns rather than nesting. A saved process is not "the
-/// parent, waiting" -- it is any process that is not the one on the wasm
-/// stack, and [`switch_process`] puts one back when the running one has
-/// nothing left that can run. That is what makes a background process work:
-/// `Xvfb &` starts a daemon that never exits, and while the parent was only
-/// ever put back *on the child's exit*, the shell after an `&` never ran
-/// again. An X server and its client are two processes that talk to each
-/// other and neither finishes first, which is most of what a graphical
-/// program is.
-///
-/// It is a swap and not real concurrency: one runs at a time, and switching
-/// copies both memory images. Only the mapped regions move, and only when
-/// nothing in the current process can run, so a `fork` immediately followed
-/// by a `wait` -- the shape every shell has -- still costs one copy and not
-/// one per timeslice.
-struct Suspended {
-    pid: i32,
-    /// Guest memory as it was, region by region. Includes the register
-    /// contexts and the dispatch directory, which live below the image and
-    /// are not in the memory map.
-    snapshot: Vec<Region>,
-    kernel: Kernel,
-    threads: Vec<Thread>,
-    current: usize,
-    /// Where this process was when it was written out. Kept for the trace
-    /// rather than to resume from: the scheduler resumes a process by picking
-    /// one of its threads, which is what finishes the syscall that thread
-    /// parked in. Resuming straight from here skipped that. See
-    /// [`install_process`].
-    resume_pc: u64,
-    resume_ctx: u64,
-    /// The dispatch directory as the parent left it. A child that execs a
-    /// different program translates different code into the same slots, so
-    /// without this the parent comes back dispatching into its child's.
-    page_table: gex_xlate::PageTable,
-    translated: std::collections::HashSet<u64>,
-}
-
 /// One guest thread.
 ///
 /// Every register it has is in its context in guest memory, so switching to it
@@ -664,8 +613,6 @@ struct Host {
     resume: Option<u64>,
     /// Set alongside `resume` when the scheduler switched threads.
     resume_ctx: Option<u64>,
-    /// Every process except the one on the wasm stack.
-    suspended: Vec<Suspended>,
     /// Why the scheduler gave the stack back to JS, when it was not an exit.
     /// 1: every thread is waiting for input the page must supply. 2: every
     /// thread is waiting on the network, and the page's event loop is what
@@ -1356,7 +1303,6 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             exit: None,
             resume: None,
             resume_ctx: None,
-            suspended: Vec::new(),
             paused: 0,
             jit: Jit {
                 described: meta.next_slot != 0,
@@ -1579,9 +1525,10 @@ pub extern "C" fn gex_wake() -> i32 {
     if n.is_power_of_two() && n >= 4096 {
         let census = with_host(|h| {
             let mut out = String::new();
-            for (pid, p) in std::iter::once((0usize, &h.threads))
-                .chain(h.suspended.iter().enumerate().map(|(i, p)| (i + 1, &p.threads)))
-            {
+            // One process per Worker now, so this Worker's threads are all
+            // there are to report. The other processes are other Workers and
+            // census their own.
+            for (pid, p) in std::iter::once((h.kernel.pid as usize, &h.threads)) {
                 for (i, t) in p.iter().enumerate() {
                     out.push_str(&format!(
                         " {pid}.{i}={}@{:#x}",
@@ -2033,304 +1980,73 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
 /// map, and all of it is per-process.
 const LOW_END: u64 = gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4;
 
-/// One piece of a suspended process's memory.
-enum Region {
-    /// Bytes, copied out.
-    Bytes(u64, Vec<u8>),
-    /// A read-only mapping of a file, which does not need copying: the file
-    /// says what is there.
-    ///
-    /// This is where a switch's cost went. A snapshot copied every mapping
-    /// in full, and most of what a process maps is library text -- Mesa,
-    /// libc, libX11 -- which it never writes. The gears demo moved 218 to
-    /// 223 MiB per switch and 17.9 GiB over a minute, almost all of it the
-    /// same read-only bytes going back and forth.
-    ///
-    /// Skipping the copy outright was tried once and was wrong: two
-    /// processes map *different* libraries at the same addresses, so leaving
-    /// whatever is there is only correct if it happens to be the same
-    /// library. Naming the file is different, and sound -- the bytes come
-    /// from the file at the offset the mapping was made from, whoever was
-    /// resident before.
-    ///
-    /// The origin is dropped by `MemoryMap::protect` for any range it
-    /// touches, which is what keeps a relocated GOT or an mprotected page
-    /// from being restored to its on-disk contents.
-    FromFile {
-        start: u64,
-        len: usize,
-        path: String,
-        offset: u64,
-    },
-}
+// The snapshot switcher was here: `Region`, `snapshot_memory`,
+// `restore_memory`, `clear_mapped`, `switch_process` and `install_process`.
+//
+// It existed because every guest process shared one address space, and that
+// was forced by a detail rather than a design: the state processes are
+// supposed to share -- the process table, pipes, sockets -- is made of
+// pointers, and a pointer means a memory. Sharing them meant sharing an
+// address space, which meant two processes' libraries landing on each other,
+// which meant writing one out and reading the other in. 33 MiB a switch, and
+// 205 MiB over a single `apt update`.
+//
+// That state now lives in the global kernel module, whose memory every Worker
+// instantiates against, where a pipe is an id rather than an `Arc`. Processes
+// no longer need to share an address space, so there is nothing to save and
+// nothing to restore.
+//
+// What has to replace it, and does not exist yet:
+//
+//   * `fork` asks the host for a Worker with a copy of the parent's mapped
+//     regions, rather than snapshotting the parent in place.
+//   * `wait4`, `kill` and `exit` route through the global kernel's process
+//     table (`k_spawn`, `k_wait`, `k_kill`, `k_exit`) instead of a local one.
+//   * the scheduler stops choosing between processes, because each one is a
+//     Worker the engine schedules.
 
-/// Copy out every part of guest memory a process owns.
-fn snapshot_memory(h: &Host) -> Vec<Region> {
-    let data = guest_bytes();
-    let mut out = vec![Region::Bytes(0, data[..LOW_END as usize].to_vec())];
-    for v in h.kernel.mem.vmas() {
-        let (a, b) = (v.start as usize, (v.end as usize).min(data.len()));
-        if a >= b {
-            continue;
-        }
-        // Writable, or from nowhere nameable: it has to be copied.
-        if v.prot & gex_kernel::mem::prot::WRITE != 0 {
-            out.push(Region::Bytes(v.start, data[a..b].to_vec()));
-            continue;
-        }
-        match &v.origin {
-            Some((path, offset)) => out.push(Region::FromFile {
-                start: v.start,
-                len: b - a,
-                path: path.clone(),
-                offset: *offset,
-            }),
-            None => out.push(Region::Bytes(v.start, data[a..b].to_vec())),
-        }
-    }
-    if unsafe { HEARTBEAT } != 0 {
-        let bytes: usize = out
-            .iter()
-            .map(|r| match r {
-                Region::Bytes(_, b) => b.len(),
-                Region::FromFile { .. } => 0,
-            })
-            .sum();
-        let spared: usize = out
-            .iter()
-            .map(|r| match r {
-                Region::FromFile { len, .. } => *len,
-                Region::Bytes(..) => 0,
-            })
-            .sum();
-        static mut SWITCHES: u64 = 0;
-        static mut COPIED: u64 = 0;
-        let (n, total) = unsafe {
-            SWITCHES = SWITCHES.wrapping_add(1);
-            COPIED = COPIED.wrapping_add(bytes as u64);
-            (SWITCHES, COPIED)
-        };
-        trace_line(&format!(
-            "[beat] switch {n}: pid {} wrote out {} MiB ({} MiB left in files), \
-             {} MiB copied in all\n",
-            h.kernel.pid,
-            bytes / (1 << 20),
-            spared / (1 << 20),
-            total / (1 << 20)
-        ));
-    }
-    out
-}
-
-/// Blank everything the running process has mapped.
-///
-/// Called on the way out of a process, and it is not tidiness. There is one
-/// address space, so a region this process mapped and the next one does not
-/// would otherwise still be sitting there when the next one looks -- and what
-/// it finds is a *relocated* copy of a library at exactly the address its own
-/// ld.so is about to use. That is how `exec` broke: the second program's
-/// .got.plt kept its link-time addresses because ld.so found a world that
-/// already looked done, and the first call through the PLT branched to an
-/// unbiased PLT0 and died in unmapped memory.
-///
-/// Regions the incoming process does have are filled in immediately after by
-/// [`restore_memory`], so this only ever leaves behind what nothing owns.
-fn clear_mapped(h: &Host) {
-    let data = guest_bytes();
-    for v in h.kernel.mem.vmas() {
-        let (a, b) = (v.start as usize, (v.end as usize).min(data.len()));
-        if a < b {
-            data[a..b].fill(0);
-        }
-    }
-}
-
-/// `k` is the kernel of the process the snapshot belongs to, because a path
-/// is resolved in the filesystem of whoever mapped it -- not in whichever
-/// process happens to be resident when it is restored.
-fn restore_memory(k: &Kernel, snapshot: &[Region]) {
-    let data = guest_bytes();
-    for r in snapshot {
-        match r {
-            Region::Bytes(at, bytes) => {
-                let a = *at as usize;
-                let b = (a + bytes.len()).min(data.len());
-                if a < b {
-                    data[a..b].copy_from_slice(&bytes[..b - a]);
-                }
-            }
-            Region::FromFile {
-                start,
-                len,
-                path,
-                offset,
-            } => {
-                let a = *start as usize;
-                let b = (a + *len).min(data.len());
-                if a >= b {
-                    continue;
-                }
-                // Only the mapped range, straight into guest memory.
-                // Reading the whole file to copy a slice out of it is the
-                // copy this was meant to avoid, moved one layer down.
-                //
-                // Whatever the file cannot supply is zero, which is what a
-                // mapping past the end of a file reads as anyway.
-                match k.read_file_at(path, *offset, &mut data[a..b]) {
-                    Some(have) => {
-                        data[a + have..b].fill(0);
-                    }
-                    None => {
-                        // The file has gone. Nothing can be restored from it,
-                        // and a guest that branches in here will fault rather
-                        // than run somebody else's code.
-                        trace_line(&format!(
-                            "gex: {path} is gone; {start:#x} cannot be restored\n"
-                        ));
-                        data[a..b].fill(0);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// `fork`: freeze the parent and carry on as the child.
-///
-/// The child needs no new stack and no scheduler switch -- it is this very
-/// thread, in this very address space, with `x0` changed from the child's pid
-/// to zero. Everything that makes it a *different* process is in what got put
-/// aside.
 fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) {
     let ctx_addr = h.threads[h.current].kstate.ctx_addr;
-    // The parent carries on after its `clone`, whenever it next gets a turn.
+    // The parent carries straight on, as it does on Linux, and -- now that
+    // there is no switcher -- without being written out first. It keeps its
+    // memory, its threads and its dispatch tables, because the child is not
+    // going to be using them.
     h.threads[h.current].pc = pc + 4;
     h.threads[h.current].waiting = Waiting::Runnable;
     h.threads[h.current].blocked_on = None;
-    let snapshot = snapshot_memory(h);
-    let mut child_kernel = h.kernel.fork_kernel();
-    child_kernel.pid = pid;
-    child_kernel.tid = pid;
-    let parent_kernel = std::mem::replace(&mut h.kernel, child_kernel);
-    h.suspended.push(Suspended {
-        pid,
-        snapshot,
-        kernel: parent_kernel,
-        threads: std::mem::take(&mut h.threads),
-        current: h.current,
-        resume_pc: pc + 4,
-        resume_ctx: ctx_addr,
-        page_table: h.jit.page_table.clone(),
-        translated: h.jit.translated.clone(),
-    });
-    // The child is this thread, renumbered, and alone: `fork` does not carry
-    // the parent's other threads across.
-    h.threads = vec![Thread {
-        kstate: ThreadState::new(ctx_addr, pid),
-        pc: pc + 4,
-        waiting: Waiting::Runnable,
-        blocked_on: None,
-    }];
-    h.current = 0;
-    let mut gm = GuestMem::new(guest_bytes());
-    // What `fork` returns in the child.
-    let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
-    if child_stack != 0 {
-        let _ = gm.write_u64(ctx_addr + ctx::SP as u64, child_stack);
-    }
-    if let Some(tls) = tls {
-        let _ = gm.write_u64(ctx_addr + ctx::TPIDR as u64, tls);
-    }
-    // A monitor is per-thread and the child's starts clear.
-    let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
-}
 
-/// Put a saved process back on the wasm stack, and set `h` to be it.
-///
-/// The one that was running is *not* preserved by this; the two callers
-/// differ in exactly that, and each does its own half:
-/// [`switch_process`] saves it first, and [`exit_process`] throws it away.
-fn install_process(h: &mut Host, p: Suspended) {
-    restore_memory(&p.kernel, &p.snapshot);
-    h.kernel = p.kernel;
-    h.threads = p.threads;
-    h.current = p.current;
-    // The restored process's pages keep the slots they had -- its directory,
-    // just restored, names them -- but allocation carries on from wherever
-    // the other one got to. Rewinding the mark would hand this process's next
-    // translation slots the other is still using, and it would dispatch one
-    // page's code from another page's directory entry.
-    let mark = h.jit.page_table.slots();
-    h.jit.page_table = p.page_table;
-    h.jit.page_table.advance_to(mark);
-    h.jit.translated = p.translated;
-    // Emphatically *not* a resume point. The scheduler is the only thing that
-    // may set one, because it is the only thing that finishes the syscall the
-    // thread parked in.
+    // The child is a *Worker*: its own memory, its own shim, its own tables.
+    // What it needs from here is the parent's mapped regions copied into that
+    // memory, and a context to start at -- `pc + 4`, with `x0` of zero, on
+    // `child_stack` if `clone` named one.
     //
-    // Setting it here looked harmless -- both callers go straight on to the
-    // scheduler, which overwrites it. But `gex_resume_pc` is a take, and when
-    // the scheduler finds nothing ready it gives the stack back to the page
-    // *without* choosing: the page then read this stale value and re-entered
-    // the guest at the instruction after its `svc`, with no return value ever
-    // written. `epoll_wait` came back with 5, which was its own epfd still
-    // sitting in x0, and the guest walked five events off its stack.
-    h.resume = None;
-    h.resume_ctx = None;
+    // FORK_PENDING is what the host reads to build it. Nothing constructs the
+    // Worker yet, which is the part of this that is unfinished: the queue
+    // fills and nobody drains it, so a forking program now runs its parent
+    // and never its child.
+    //
+    // What has to arrive here:
+    //
+    //   * the host creating a `WebAssembly.Memory`, instantiating the shim and
+    //     the guest module against it, and copying every mapped region across
+    //     -- `gex_vma_count`/`gex_vma_at` already report which they are;
+    //   * that Worker calling `enter(ctx, pc + 4)` with the context below;
+    //   * `k_spawn` in the global kernel giving the child its place in the
+    //     process table, so the parent's `wait4` can find it.
+    let _ = (pid, child_stack, tls, ctx_addr);
+    FORK_PENDING.store(pid, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Give the stack to the saved process at `idx`, saving the running one.
+/// A child `fork` has created that the host has not built a Worker for.
 ///
-/// The caller has already decided that nothing in the running process can
-/// make progress, which is the whole of the scheduling policy: a process runs
-/// until it blocks. There is no timeslice, because a switch copies two memory
-/// images and preempting a busy process would pay that for nothing.
-///
-/// The two images are exchanged rather than saved and then loaded, so there
-/// is never a moment when the host holds neither a kernel nor a process.
-fn switch_process(h: &mut Host, idx: usize) {
-    let target = h.suspended.remove(idx);
-    // Everything read out of the running process, before any of it moves.
-    let pid = h.kernel.pid;
-    let t = &h.threads[h.current];
-    let (resume_pc, resume_ctx) = (t.pc, t.kstate.ctx_addr);
-    let snapshot = snapshot_memory(h);
-    let mark = h.jit.page_table.slots();
+/// Zero when there is none. Read by `gex_fork_pending`, which is how the host
+/// learns it has a process to start.
+static FORK_PENDING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-    let mine = Suspended {
-        pid,
-        snapshot,
-        resume_pc,
-        resume_ctx,
-        kernel: std::mem::replace(&mut h.kernel, target.kernel),
-        threads: std::mem::replace(&mut h.threads, target.threads),
-        current: std::mem::replace(&mut h.current, target.current),
-        page_table: std::mem::replace(&mut h.jit.page_table, target.page_table),
-        translated: std::mem::replace(&mut h.jit.translated, target.translated),
-    };
-    // Cleared through the *outgoing* process's map, which is why this reads
-    // from `mine` rather than from `h` -- by now `h.kernel` is the target's.
-    {
-        let data = guest_bytes();
-        for v in mine.kernel.mem.vmas() {
-            let (a, b) = (v.start as usize, (v.end as usize).min(data.len()));
-            if a < b {
-                data[a..b].fill(0);
-            }
-        }
-    }
-    if tracing() {
-        trace_line(&format!(
-            "[proc] switch {} -> {} (resume {:#x})\n",
-            mine.pid, target.pid, target.resume_pc
-        ));
-    }
-    restore_memory(&h.kernel, &target.snapshot);
-    h.jit.page_table.advance_to(mark);
-    // See `install_process`: choosing is the scheduler's job.
-    h.resume = None;
-    h.resume_ctx = None;
-    h.suspended.push(mine);
+/// The pid of a child waiting for a Worker, taken. Zero when there is none.
+#[no_mangle]
+pub extern "C" fn gex_fork_pending() -> i32 {
+    FORK_PENDING.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// This process has exited. Hand the stack to another, or end the run.
@@ -2350,38 +2066,19 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
     // and the parent may be parked on exactly that.
     let pid = h.kernel.pid;
     h.kernel.procs.exit(pid, code);
-    // The parent first when there is one, so `fork` then `wait` costs one
-    // switch and lands where it did before any of this existed. Otherwise
-    // whatever is left, in the order it was saved.
-    let ppid = h.kernel.ppid;
-    let idx = h
-        .suspended
-        .iter()
-        .position(|p| p.pid == ppid)
-        .or(h.suspended.len().checked_sub(1));
-    let Some(idx) = idx else {
-        // Nothing left to run, so this process's fate is the run's. A shell
-        // reports a signal death as 128 + the signal, and so does this.
-        if tracing() {
-            trace_line(&format!("[proc] exit {pid} with {code}, nothing left to run\n"));
-        }
-        set_exit(h, if code < 0 { 128 - code } else { code });
-        return 2;
-    };
-    let target = h.suspended.remove(idx);
+    // This Worker ran one process and that process is over, so the Worker is
+    // over. There is nothing to hand the stack to: the other processes are
+    // other Workers, already running, and the parent's `wait4` finds the
+    // status in the shared process table rather than by being switched to.
+    //
+    // That is the whole of what the switcher's exit path did, and all of it
+    // is now somebody else's job.
     if tracing() {
-        trace_line(&format!(
-            "[proc] exit {pid} -> {} of {} saved (resume {:#x})\n",
-            target.pid,
-            h.suspended.len() + 1,
-            target.resume_pc
-        ));
+        trace_line(&format!("[proc] exit {pid} with {code}\n"));
     }
-    clear_mapped(h);
-    install_process(h, target);
-    // 3: the scheduler picks a thread out of the process just installed, and
-    // finishes whatever syscall it was parked in.
-    3
+    // A shell reports a signal death as 128 + the signal, and so does this.
+    set_exit(h, if code < 0 { 128 - code } else { code });
+    2
 }
 
 /// `execve`: replace this process's image with another program's.
@@ -2560,22 +2257,22 @@ fn now_ns() -> u64 {
 /// the middle of.
 
 ///
-/// The browser host has one wasm stack and no way to block on it, so guest
-/// threads are cooperative: a thread keeps the stack until it blocks, exits,
-/// or spawns another. Every register it owns is in its context in guest
-/// memory, so a switch is nothing more than re-entering the guest module with
-/// a different context pointer -- which is why this works at all without
-/// Workers, shared memory or a second stack.
+/// A Worker has one wasm stack and no way to block on it, so the *threads* of
+/// this process are cooperative: one keeps the stack until it blocks, exits,
+/// or spawns another. Every register a thread owns is in its context in guest
+/// memory, so a switch between them is nothing more than re-entering the guest
+/// module with a different context pointer.
+///
+/// It no longer chooses between *processes*. There is one process per Worker;
+/// the others are running elsewhere and need nothing from this scheduler.
 ///
 /// What the scheduler decided.
 enum Pick {
-    /// Run this thread of the process already loaded, having timed out or not.
+    /// Run this thread, having timed out or not.
     Thread(usize, bool),
-    /// A different process is now on the stack, with its resume point set.
-    Switched,
-    /// Nothing anywhere can run yet.
+    /// Nothing in this process can run yet.
     Idle,
-    /// The last process has finished.
+    /// This process has finished.
     Over,
 }
 
@@ -2675,12 +2372,12 @@ fn report_idle(why: u8) {
         // named. A number on its own says which slot a process is waiting
         // on and nothing about what is at the other end, which is exactly
         // the question when two processes are waiting for each other.
-        for (pid, p, k) in std::iter::once((0usize, &h.threads, &h.kernel)).chain(
-            h.suspended
-                .iter()
-                .enumerate()
-                .map(|(i, p)| (i + 1, &p.threads, &p.kernel)),
-        ) {
+        // This Worker's process only. When two processes are waiting for each
+        // other the other half of the picture is in the other Worker's own
+        // census, which is a loss this has to get back another way -- by
+        // asking the global kernel, which can see every process's blocked
+        // descriptors because the pipes and sockets are all in its memory.
+        for (pid, p, k) in std::iter::once((h.kernel.pid as usize, &h.threads, &h.kernel)) {
             for (i, t) in p.iter().enumerate() {
                 out.push_str(&format!(" {pid}.{i}={}", waiting_name(&t.waiting)));
                 // And, for a poll, exactly which descriptors and how each
@@ -2752,17 +2449,15 @@ fn schedule() -> i32 {
         // it has.
         with_host(|h| h.virgl.clone()).map(|v| v.pump());
         let pick = with_host(|h| {
-            // Nothing left that could ever run again ends this process. It
-            // does not necessarily end the run: another may be waiting for
-            // exactly this, and `exit_process` hands it the stack.
+            // Every thread gone ends this process, and this process is all
+            // this Worker has. Whoever is waiting for it finds the status in
+            // the shared process table.
             if h.threads
                 .iter()
                 .all(|t| matches!(t.waiting, Waiting::Exited))
             {
                 let code = h.exit.take().unwrap_or(0);
-                if exit_process(h, code) == 1 {
-                    return Pick::Switched;
-                }
+                exit_process(h, code);
                 h.exit.get_or_insert(code);
                 return Pick::Over;
             }
@@ -2780,24 +2475,10 @@ fn schedule() -> i32 {
                     return Pick::Thread(i, timed_out);
                 }
             }
-            // Nothing here can run. Another process might -- a shell that
-            // started a daemon with `&` is sitting Runnable in `suspended`
-            // while the daemon waits for a connection, and before processes
-            // took turns that shell simply never ran again.
-            //
-            // The check costs nothing: a saved thread's readiness is asked of
-            // the same handles and futexes, which are reference-counted and
-            // alive whether or not their process's memory is loaded.
-            if let Some(idx) = h
-                .suspended
-                .iter()
-                .position(|p| p.threads.iter().any(|t| thread_ready(t, now)))
-            {
-                switch_process(h, idx);
-                // `switch_process` set the resume point; the caller re-enters
-                // the guest with it rather than picking a thread here.
-                return Pick::Switched;
-            }
+            // Nothing in this process can run. Another process might, and
+            // that is no longer this scheduler's problem: every other process
+            // is a Worker the engine is already running, and it will make its
+            // own progress without being switched to.
             // Everything is asleep or parked with a deadline. There is no
             // other thread to advance the clock, so spinning is the only way
             // to reach the earliest one.
@@ -2809,9 +2490,6 @@ fn schedule() -> i32 {
         // skipped that, so it carried on with no return value in x0 and
         // branched through whatever was there: `nothing to translate at
         // pc=0xffff0`, on every pipeline.
-        if matches!(pick, Pick::Switched) {
-            continue;
-        }
         if matches!(pick, Pick::Over) {
             return 2;
         }
@@ -2848,11 +2526,7 @@ fn schedule() -> i32 {
                 // child -- the one actually waiting on the page -- was not
                 // being looked at, so the answer came out zero and the loop
                 // below spun at full speed for as long as the run lasted.
-                for t in h
-                    .threads
-                    .iter()
-                    .chain(h.suspended.iter().flat_map(|p| p.threads.iter()))
-                {
+                for t in h.threads.iter() {
                     match &t.waiting {
                         Waiting::Write(_) => mask |= 1,
                         // A listener waiting for a client. Whoever connects
@@ -2917,11 +2591,6 @@ fn schedule() -> i32 {
                 h.threads
                     .iter()
                     .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
-                    && h.suspended.iter().all(|p| {
-                        p.threads
-                            .iter()
-                            .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
-                    })
             }) {
                 // Every remaining thread is parked on a futex nothing will
                 // ever wake. On Linux this hangs; saying so is more useful.
