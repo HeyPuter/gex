@@ -1209,6 +1209,25 @@ else
     echo "skip pipe-shared: no node, or shims/kernel/build.sh has not been run"
 fi
 
+# One filesystem, two address spaces. The third thing processes share and the
+# one without which the other two do not help: a shell that unpacks a rootfs
+# and forks hands its child an empty root, and the child's `execve` cannot
+# find the program it was forked to run.
+if [ -n "$NODE" ] && [ -f web/public/gex/gex_kernel.wasm ]; then
+    out=$("$NODE" web/test/fs-shared.mjs 2>&1 || true)
+    case "$out" in
+        ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
+        skip*) echo "$out" | head -1 ;;
+        *)
+            echo "FAIL fs-shared: a file does not cross two address spaces"
+            echo "$out" | sed 's/^/     /' | head -6
+            fail=$((fail + 1))
+            ;;
+    esac
+else
+    echo "skip fs-shared: no node, or shims/kernel/build.sh has not been run"
+fi
+
 # `fork` end to end, with the child in a Worker of its own. The switcher's
 # replacement: no snapshot, no switch, both processes running at once, and a
 # parent collecting a child it cannot see -- the process table is in the

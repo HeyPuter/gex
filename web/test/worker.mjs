@@ -17,6 +17,7 @@
 // the same file a page loads; what differs is only how a message is posted,
 // and Node turns a twenty-minute cycle into a two-minute one.
 import { Worker } from 'node:worker_threads';
+import { ProcessHost } from '../../shims/browser/js/host.mjs';
 import { readFile, access } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -59,6 +60,18 @@ for (const p of programs) {
 const shim = new Uint8Array(await readFile(SHIM));
 const seed = new Uint8Array(await readFile(SEED));
 
+// The global kernel, if it has been built: the process table and the
+// filesystem every process shares. Without it a guest that forks gets as far
+// as the fork and no further, because the child would have neither a place in
+// the process table nor a root to `execve` out of.
+const KERNEL = join(ROOT, 'web/public/gex/gex_kernel.plain.wasm');
+const kernel = (await exists(KERNEL))
+  ? {
+      module: await WebAssembly.compile(new Uint8Array(await readFile(KERNEL))),
+      memory: new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }),
+    }
+  : null;
+
 /** Everything under `dir`, as the guest's filesystem. */
 async function bundle(dir) {
   const { readdir } = await import('node:fs/promises');
@@ -78,40 +91,24 @@ const files = root ? await bundle(root) : {};
 
 /** Run one program in its own Worker and collect what it said. */
 function runInWorker(elfPath, elf, args) {
-  return new Promise((resolve) => {
-    const w = new Worker(WORKER);
-    let output = '';
-    const done = (result) => {
-      w.terminate();
-      resolve({ ...result, output });
-    };
-    w.on('message', (m) => {
-      switch (m.kind) {
-        case 'ready':
-          w.postMessage({
-            kind: 'run',
-            gexUrl: join(ROOT, 'shims/browser/js/gex.mjs'),
-            shim,
-            guest: seed,
-            elf,
-            files,
-            args,
-            opts: root ? { cwd: '/', uid: 0 } : {},
-          });
-          break;
-        case 'output':
-          output += m.text;
-          break;
-        case 'exit':
-          done({ status: m.status, blocks: m.blocks, millis: m.millis });
-          break;
-        case 'threw':
-          done({ threw: m.message });
-          break;
-      }
-    });
-    w.on('error', (e) => done({ threw: e.message }));
+  let output = '';
+  const host = new ProcessHost({
+    makeWorker: () => new Worker(WORKER),
+    shim,
+    guest: seed,
+    kernel,
+    gexUrl: join(ROOT, 'shims/browser/js/gex.mjs'),
+    onOutput: (fd, text) => {
+      output += text;
+    },
   });
+  return host
+    .start({ elf, files, args, opts: root ? { cwd: '/', uid: 0 } : {} })
+    .then((status) => ({ status, forked: host.forked, output }))
+    .catch((e) => {
+      host.stop();
+      return { threw: e.message, output };
+    });
 }
 
 const runs = await Promise.all(
@@ -136,7 +133,7 @@ for (const [path, r] of runs) {
     continue;
   }
   console.log(
-    `ok   worker-${name} (${r.blocks} blocks in ${r.millis}ms, own address space)`,
+    `ok   worker-${name} (own address space${r.forked ? `, ${r.forked} forked` : ''})`,
   );
   for (const line of r.output.trimEnd().split('\n')) console.log(`     ${line}`);
 }

@@ -219,6 +219,32 @@ extern "C" {
     fn k_setpgid(caller: i32, target: i32, pgid: i32) -> i32;
     fn k_request_halt(code: i32);
     fn k_halt_code() -> i32;
+
+    // The filesystem. Every address below is in *this* process's memory; the
+    // other side copies across with `memory.copy`, which is the only way it
+    // can reach a memory it does not own. See `gex_kernel::vfs::remote` for
+    // the two layouts that cross.
+    fn k_fs_open(path: u32, path_len: u32, flags: u64, mode: u32) -> i32;
+    fn k_fs_close(handle: i32);
+    fn k_fs_read(handle: i32, offset: u64, at: u32, len: u32) -> i32;
+    fn k_fs_write(handle: i32, offset: u64, at: u32, len: u32) -> i32;
+    fn k_fs_meta(handle: i32, at: u32) -> i32;
+    fn k_fs_truncate(handle: i32, len: u64) -> i32;
+    fn k_fs_read_dir(handle: i32, at: u32, cap: u32) -> i32;
+    fn k_fs_path_meta(path: u32, path_len: u32, at: u32) -> i32;
+    fn k_fs_read_link(path: u32, path_len: u32, at: u32, cap: u32) -> i32;
+    fn k_fs_unlink(path: u32, path_len: u32) -> i32;
+    fn k_fs_mkdir(path: u32, path_len: u32, mode: u32) -> i32;
+    fn k_fs_rmdir(path: u32, path_len: u32) -> i32;
+    fn k_fs_rename(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
+    fn k_fs_chmod(path: u32, path_len: u32, mode: u32) -> i32;
+    fn k_fs_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32;
+    fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
+    fn k_fs_add(path: u32, path_len: u32, at: u32, len: u32) -> i32;
+    /// Has some process already filled the shared root? Only the first
+    /// should: the rest would unpack the same rootfs over the top of it.
+    fn k_fs_populated() -> i32;
+    fn k_fs_populate_done();
 }
 
 // A wasm import is `unsafe`, and `Remote` holds safe fn pointers, so each one
@@ -303,6 +329,112 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             halt_code: r_halt_code,
         },
     )))
+}
+
+extern "C" fn rf_open(path: u32, path_len: u32, flags: u64, mode: u32) -> i32 {
+    unsafe { k_fs_open(path, path_len, flags, mode) }
+}
+extern "C" fn rf_close(handle: i32) {
+    unsafe { k_fs_close(handle) }
+}
+extern "C" fn rf_read(handle: i32, offset: u64, at: u32, len: u32) -> i32 {
+    unsafe { k_fs_read(handle, offset, at, len) }
+}
+extern "C" fn rf_write(handle: i32, offset: u64, at: u32, len: u32) -> i32 {
+    unsafe { k_fs_write(handle, offset, at, len) }
+}
+extern "C" fn rf_meta(handle: i32, at: u32) -> i32 {
+    unsafe { k_fs_meta(handle, at) }
+}
+extern "C" fn rf_truncate(handle: i32, len: u64) -> i32 {
+    unsafe { k_fs_truncate(handle, len) }
+}
+extern "C" fn rf_read_dir(handle: i32, at: u32, cap: u32) -> i32 {
+    unsafe { k_fs_read_dir(handle, at, cap) }
+}
+extern "C" fn rf_path_meta(path: u32, path_len: u32, at: u32) -> i32 {
+    unsafe { k_fs_path_meta(path, path_len, at) }
+}
+extern "C" fn rf_read_link(path: u32, path_len: u32, at: u32, cap: u32) -> i32 {
+    unsafe { k_fs_read_link(path, path_len, at, cap) }
+}
+extern "C" fn rf_unlink(path: u32, path_len: u32) -> i32 {
+    unsafe { k_fs_unlink(path, path_len) }
+}
+extern "C" fn rf_mkdir(path: u32, path_len: u32, mode: u32) -> i32 {
+    unsafe { k_fs_mkdir(path, path_len, mode) }
+}
+extern "C" fn rf_rmdir(path: u32, path_len: u32) -> i32 {
+    unsafe { k_fs_rmdir(path, path_len) }
+}
+extern "C" fn rf_rename(from: u32, from_len: u32, to: u32, to_len: u32) -> i32 {
+    unsafe { k_fs_rename(from, from_len, to, to_len) }
+}
+extern "C" fn rf_chmod(path: u32, path_len: u32, mode: u32) -> i32 {
+    unsafe { k_fs_chmod(path, path_len, mode) }
+}
+extern "C" fn rf_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
+    unsafe { k_fs_symlink(target, target_len, path, path_len) }
+}
+extern "C" fn rf_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32 {
+    unsafe { k_fs_link(from, from_len, to, to_len) }
+}
+
+/// The root every process shares, if the host gave us a global kernel.
+///
+/// Mounted at `/` in place of this process's own `TmpFs`. Without it a forked
+/// child arrives with an empty root and its `execve` cannot find the program
+/// it was forked to run -- under the switcher the child got its parent's
+/// whole address space and the question never came up.
+fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
+    if unsafe { k_present() } == 0 {
+        return None;
+    }
+    Some(Arc::new(gex_kernel::vfs::RemoteFs::new(
+        gex_kernel::vfs::remote::Remote {
+            open: rf_open,
+            close: rf_close,
+            read: rf_read,
+            write: rf_write,
+            meta: rf_meta,
+            truncate: rf_truncate,
+            read_dir: rf_read_dir,
+            path_meta: rf_path_meta,
+            read_link: rf_read_link,
+            unlink: rf_unlink,
+            mkdir: rf_mkdir,
+            rmdir: rf_rmdir,
+            rename: rf_rename,
+            chmod: rf_chmod,
+            symlink: rf_symlink,
+            link: rf_link,
+        },
+    )))
+}
+
+/// Put the page's bundle into the shared root, once for the whole system.
+///
+/// The first process to load fills it; every later one finds it filled and
+/// does nothing, which matters because the bundle is the same two hundred
+/// megabytes of rootfs each time and unpacking it per process would be both
+/// slow and pointless.
+fn install_bundle_remote() {
+    if unsafe { k_fs_populated() } != 0 {
+        FILES.0.borrow_mut().clear();
+        return;
+    }
+    for (name, bytes) in std::mem::take(&mut *FILES.0.borrow_mut()) {
+        let p = name.as_bytes();
+        unsafe {
+            k_fs_add(
+                p.as_ptr() as u32,
+                p.len() as u32,
+                bytes.as_ptr() as u32,
+                bytes.len() as u32,
+            )
+        };
+    }
+    unsafe { k_fs_populate_done() };
 }
 
 /// Back-edges a guest may take between safepoint calls, matching the native
@@ -1251,16 +1383,32 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
     // The bundle is a filesystem before anything else happens, because a
     // dynamic executable's interpreter is read out of it.
+    //
+    // Two roots, and only one of them mounted. With a global kernel the files
+    // belong to the *system* rather than to this process -- a child forked
+    // from here has to see them, and it has a memory of its own -- so the
+    // bundle goes there and this process mounts a `RemoteFs` over it. Without
+    // one there is only this process, and its own `TmpFs` is the whole
+    // filesystem, as it always was.
     let root = Arc::new(gex_kernel::vfs::TmpFs::new());
-    install_bundle(&root);
-    let program = match gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, &|path| {
+    let shared_root = global_root();
+    match &shared_root {
+        Some(_) => install_bundle_remote(),
+        None => install_bundle(&root),
+    }
+    let read_file = |path: &str| -> Option<Vec<u8>> {
         use gex_kernel::vfs::FileSystem;
-        let f = root.open(path.trim_start_matches('/'), 0, 0).ok()?;
+        let p = path.trim_start_matches('/');
+        let f = match &shared_root {
+            Some(r) => r.open(p, 0, 0).ok()?,
+            None => root.open(p, 0, 0).ok()?,
+        };
         let len = f.metadata().ok()?.size as usize;
         let mut buf = vec![0u8; len];
         f.read_at(0, &mut buf).ok()?;
         Some(buf)
-    }) {
+    };
+    let program = match gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, &read_file) {
         Ok(p) => p,
         Err(_) => return 0,
     };
@@ -1272,7 +1420,10 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     if let Some(procs) = global_procs() {
         kernel.procs = procs;
     }
-    kernel.vfs.mount("/", root.clone());
+    match &shared_root {
+        Some(r) => kernel.vfs.mount("/", r.clone()),
+        None => kernel.vfs.mount("/", root.clone()),
+    }
     // The graphics device, when the page said it has a canvas to draw on.
     // Absent otherwise, so a guest sees a machine with no GL rather than one
     // whose drawing vanishes.
@@ -2288,6 +2439,13 @@ pub extern "C" fn gex_adopt_child(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls
     }
     kernel.pid = pid;
     kernel.tid = pid;
+    // The system's filesystem, which the child could not otherwise have: its
+    // parent's `TmpFs` was Rust data in a memory this Worker cannot see, so
+    // without this a forked child's root is empty and its `execve` cannot
+    // find the program it was forked to run.
+    if let Some(r) = global_root() {
+        kernel.vfs.mount("/", r);
+    }
     set_host(Host {
         kernel,
         virgl: None,

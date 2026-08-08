@@ -19,12 +19,15 @@ pub mod devfs;
 #[cfg(unix)]
 pub mod hostfs;
 pub mod procfs;
+/// The filesystem when it is not in this process's memory.
+pub mod remote;
 pub mod tmpfs;
 
 pub use devfs::DevFs;
 #[cfg(unix)]
 pub use hostfs::HostFs;
 pub use procfs::{ProcFs, ProcSource};
+pub use remote::RemoteFs;
 pub use tmpfs::TmpFs;
 
 /// What kind of thing a directory entry names.

@@ -497,28 +497,39 @@ export class Gex {
   #kernelImports() {
     const k = this.#kernel;
     const absent = () => 0;
-    if (!k) {
-      return {
-        k_present: absent,
-        k_spawn: absent, k_exit: absent, k_reap: absent,
-        k_wait: () => 0n, k_wait_ready: absent, k_has_children: absent,
-        k_kill: absent, k_take_signals: () => 0n, k_has_signals: absent,
-        k_ppid: absent, k_pgid: absent, k_sid: absent,
-        k_setsid: absent, k_setpgid: absent,
-        k_request_halt: absent, k_halt_code: () => -1,
-      };
+    // Named once, so a call added on one side and forgotten on the other is
+    // a link error at instantiation rather than a stub that quietly answers
+    // nought for the life of the run.
+    const NAMES = [
+      'k_spawn', 'k_exit', 'k_reap', 'k_wait', 'k_wait_ready',
+      'k_has_children', 'k_kill', 'k_take_signals', 'k_has_signals',
+      'k_ppid', 'k_pgid', 'k_sid', 'k_setsid', 'k_setpgid',
+      'k_request_halt', 'k_halt_code',
+      'k_fs_open', 'k_fs_close', 'k_fs_read', 'k_fs_write', 'k_fs_meta',
+      'k_fs_truncate', 'k_fs_read_dir', 'k_fs_path_meta', 'k_fs_read_link',
+      'k_fs_unlink', 'k_fs_mkdir', 'k_fs_rmdir', 'k_fs_rename', 'k_fs_chmod',
+      'k_fs_symlink', 'k_fs_link', 'k_fs_add', 'k_fs_populated',
+      'k_fs_populate_done',
+    ];
+    // Two of these return an i64, which JS has to answer with a BigInt.
+    const BIG = new Set(['k_wait', 'k_take_signals']);
+    const out = { k_present: () => (k ? 1 : 0) };
+    for (const n of NAMES) {
+      if (k) {
+        if (typeof k[n] !== 'function') {
+          throw new Error(
+            `the global kernel has no ${n}: it is older than this glue. ` +
+              'Rebuild it with shims/kernel/build.sh.',
+          );
+        }
+        out[n] = k[n];
+      } else {
+        out[n] = BIG.has(n) ? () => 0n : absent;
+      }
     }
-    return {
-      k_present: () => 1,
-      k_spawn: k.k_spawn, k_exit: k.k_exit, k_reap: k.k_reap,
-      k_wait: k.k_wait, k_wait_ready: k.k_wait_ready,
-      k_has_children: k.k_has_children,
-      k_kill: k.k_kill, k_take_signals: k.k_take_signals,
-      k_has_signals: k.k_has_signals,
-      k_ppid: k.k_ppid, k_pgid: k.k_pgid, k_sid: k.k_sid,
-      k_setsid: k.k_setsid, k_setpgid: k.k_setpgid,
-      k_request_halt: k.k_request_halt, k_halt_code: k.k_halt_code,
-    };
+    // Nobody has asked for a halt, rather than "halt with status 0".
+    if (!k) out.k_halt_code = () => -1;
+    return out;
   }
 
   /**
