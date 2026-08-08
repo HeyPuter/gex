@@ -76,6 +76,20 @@ pub struct MemoryMap {
     brk_cur: u64,
     /// Next address the top-down allocator will try.
     mmap_next: u64,
+    /// Bumped by every change to the map.
+    ///
+    /// `/proc/self/maps` is built by formatting this whole tree as hex text,
+    /// and the snapshot that backs it was rebuilt before every syscall that
+    /// could resolve a path. For an X server -- which polls, reads and writes
+    /// in a tight loop with several hundred mappings live -- that put half of
+    /// all execution into `core::fmt`. Measured: 11.7% in `fmt::write`, 8.7%
+    /// in `write_str`, 7.2% in `format_inner`, 6.1% in the allocator serving
+    /// them, and `proc_maps` itself underneath.
+    ///
+    /// A counter costs one increment per `mmap` and turns the rebuild into a
+    /// comparison. The map changes thousands of times in a run; it is read
+    /// millions.
+    generation: u64,
 }
 
 pub fn page_align_up(v: u64) -> u64 {
@@ -90,10 +104,18 @@ impl MemoryMap {
     pub fn new(brk_start: u64) -> MemoryMap {
         MemoryMap {
             vmas: Vec::new(),
+            generation: 0,
             brk_start: page_align_up(brk_start),
             brk_cur: page_align_up(brk_start),
             mmap_next: MMAP_TOP,
         }
+    }
+
+    /// How many times the map has changed. Two equal readings mean the VMA
+    /// tree is byte-for-byte the same, so anything derived from it still
+    /// holds.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn vmas(&self) -> &[Vma] {
@@ -107,6 +129,7 @@ impl MemoryMap {
     /// Record a mapping made outside the allocator, such as an ELF segment or
     /// the initial stack.
     pub fn insert(&mut self, start: u64, end: u64, prot: u32, name: &str) {
+        self.generation += 1;
         self.insert_from(start, end, prot, name, None);
     }
 
@@ -119,6 +142,7 @@ impl MemoryMap {
         name: &str,
         origin: Option<(String, u64)>,
     ) {
+        self.generation += 1;
         let aligned = page_align_down(start);
         // The offset moves with the start: the caller names the offset of the
         // address it asked for, and rounding down to a page boundary walks
@@ -142,6 +166,7 @@ impl MemoryMap {
     /// the caller must zero. See [`Self::brk`]'s note on why that is not
     /// optional.
     pub fn brk_grow(&mut self, addr: u64) -> (u64, Option<(u64, u64)>) {
+        self.generation += 1;
         if addr == 0 {
             return (self.brk_cur, None);
         }
@@ -168,6 +193,7 @@ impl MemoryMap {
     /// notices is the dynamic loader finding a garbage field in a structure
     /// it just allocated.
     pub fn brk(&mut self, addr: u64) -> u64 {
+        self.generation += 1;
         self.brk_grow(addr).0
     }
 
@@ -176,6 +202,7 @@ impl MemoryMap {
     /// Allocation is top-down from [`MMAP_TOP`], matching Linux's default
     /// layout, so the heap growing up and mappings growing down stay apart.
     pub fn mmap(&mut self, addr: u64, len: u64, prot: u32, flags: u64, name: &str) -> SysResult {
+        self.generation += 1;
         self.mmap_from(addr, len, prot, flags, name, None)
     }
 
@@ -189,6 +216,7 @@ impl MemoryMap {
         name: &str,
         origin: Option<(String, u64)>,
     ) -> SysResult {
+        self.generation += 1;
         if len == 0 {
             return Err(Errno::EINVAL);
         }
@@ -257,6 +285,7 @@ impl MemoryMap {
         new_len: u64,
         may_move: bool,
     ) -> Result<(u64, bool), Errno> {
+        self.generation += 1;
         if !addr.is_multiple_of(PAGE_SIZE) || old_len == 0 || new_len == 0 {
             return Err(Errno::EINVAL);
         }
@@ -296,6 +325,7 @@ impl MemoryMap {
 
     /// Remove `[addr, addr+len)` from the map, splitting mappings as needed.
     pub fn unmap(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
+        self.generation += 1;
         if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
         }
@@ -321,6 +351,7 @@ impl MemoryMap {
 
     /// Change protection over a range, splitting mappings as needed.
     pub fn protect(&mut self, addr: u64, len: u64, new_prot: u32) -> Result<(), Errno> {
+        self.generation += 1;
         if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
         }

@@ -76,6 +76,7 @@ await writeFile(
 const SECONDS = '__SECONDS__';
 const TRACE = __TRACE__;
 const process_HEARTBEAT = __HEARTBEAT__;
+const __MISSES__ = __TRACEMISS__;
 import { Gex, Env } from './gex.mjs';
 import { VirglRenderer } from './virgl.js';
 import { untar } from './tar.js';
@@ -172,6 +173,27 @@ try {
   // A line roughly once a second while the guest is executing, which is the
   // only window into a stretch that makes no syscalls and runs no JavaScript.
   e.gex_set_heartbeat?.(BigInt(process_HEARTBEAT));
+  if (__MISSES__) e.gex_set_trace_misses?.(1);
+  // A pulse from the page itself, on the clock, owing nothing to the guest.
+  //
+  // Every other report in this harness is produced from inside the run: the
+  // heartbeat needs a safepoint, the histogram needs a syscall, the census
+  // needs the scheduler. A guest that stops reaching any of them goes silent,
+  // and a silent run at 100% of a core has two completely different causes
+  // that no existing instrument separates -- the guest is inside one long
+  // stretch of translated code and JavaScript is not running at all, or
+  // JavaScript is running perfectly well and something out here is spinning.
+  //
+  // This tells them apart by construction. The entry point does not return
+  // until the guest traps, so while the guest holds the wasm stack no timer
+  // can fire:
+  // these lines stopping *is* the proof that the run is inside wasm, and
+  // these lines continuing while nothing else reports puts the loop out here.
+  setInterval(() => {
+    const at = ((Date.now() - t0) / 1000).toFixed(0);
+    post('progress', at + 's | [page] the event loop is still turning | ' +
+      Number(e.gex_jit_blocks()) + ' blocks | ' + renderer.commands());
+  }, 5000);
   const queued = [];
   report = (line) => {
     queued.push([((Date.now() - t0) / 1000).toFixed(0), line]);
@@ -205,7 +227,8 @@ try {
 }
 </script>`.replace('__SECONDS__', SECONDS)
    .replace('__TRACE__', String(!!process.env.GEX_VIRGL_TRACE))
-   .replace('__HEARTBEAT__', String(Number(process.env.GEX_HEARTBEAT || 0))),
+   .replace('__HEARTBEAT__', String(Number(process.env.GEX_HEARTBEAT || 0)))
+   .replace('__TRACEMISS__', process.env.GEX_TRACE_MISSES ? 'true' : 'false'),
 );
 
 let finish;
@@ -262,6 +285,14 @@ const child = spawn(
     '--no-sandbox',
     '--disable-gpu-sandbox',
     '--enable-unsafe-swiftshader',
+    // GEX_PROFILE=1 turns on V8's sampling profiler. It samples from a signal
+    // handler, so it reports where a run is even while the guest holds the
+    // wasm stack and nothing in this harness can say anything -- which is the
+    // one state where every other instrument here is silent by construction.
+    // The log lands in the served directory, next to the page.
+    ...(process.env.GEX_PROFILE
+      ? [`--js-flags=--prof --logfile=${process.env.GEX_PROFILE}`]
+      : []),
     url,
   ],
   { stdio: ['ignore', 'pipe', 'pipe'] },

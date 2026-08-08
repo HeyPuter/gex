@@ -2695,7 +2695,10 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 #[no_mangle]
 pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
-    if tracing() {
+    if tracing() || unsafe { TRACE_MISSES } {
+        // Printed *before* the translation, deliberately. The question this
+        // answers is which block the translator did not come back from, and
+        // a line printed afterwards is a line that never appears.
         trace_line(&format!("[gex] miss at pc={pc:#x}\n"));
     }
     // The other half of the heartbeat, and the half that matters when the
@@ -2922,6 +2925,19 @@ pub extern "C" fn gex_jit_installed() {
 
 /// How often the safepoint says where the guest is; zero is off.
 static mut HEARTBEAT: u64 = 0;
+
+/// Say which block is about to be translated, for every miss.
+///
+/// Loud -- a cold Mesa run makes eleven thousand of these -- and worth it for
+/// one question: when a run stops with the wasm stack held and no beat, no
+/// syscall and no scheduler entry, the last line is the block the translator
+/// went into and did not come out of.
+static mut TRACE_MISSES: bool = false;
+
+#[no_mangle]
+pub extern "C" fn gex_set_trace_misses(on: i32) {
+    unsafe { TRACE_MISSES = on != 0 };
+}
 
 /// Ask for a heartbeat every `every` safepoints.
 ///

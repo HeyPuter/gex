@@ -4055,6 +4055,11 @@ pub struct ProcState {
     pub exe: String,
     pub cwd: String,
     pub fds: Vec<(i32, String)>,
+    /// Which version of the memory map `maps` was rendered from.
+    ///
+    /// Not part of what `/proc` serves -- it is how the rendering is avoided.
+    /// See `MemoryMap::generation`.
+    pub maps_generation: u64,
 }
 
 /// A `/proc` source backed by a snapshot the kernel refreshes.
@@ -4117,9 +4122,25 @@ impl Kernel {
         s.ppid = self.procs.ppid(self.pid);
         s.pgid = self.procs.pgid(self.pid, 0).unwrap_or(self.pid);
         s.sid = self.procs.sid(self.pid, 0).unwrap_or(self.pid);
-        s.maps = self.mem.proc_maps();
-        s.exe = self.exe_path.clone();
-        s.cwd = self.vfs.cwd.clone();
+        // Only when the map has actually changed. Formatting the VMA tree is
+        // the single most expensive thing this function does -- half of all
+        // execution in a browser run of an X server, which polls in a tight
+        // loop with several hundred mappings live -- and between two `mmap`s
+        // it produces the identical string every time.
+        let generation = self.mem.generation();
+        if s.maps_generation != generation || s.maps.is_empty() {
+            s.maps = self.mem.proc_maps();
+            s.maps_generation = generation;
+        }
+        // Compared before cloning, for the same reason at a smaller scale:
+        // these are two allocations per syscall to arrive at the bytes that
+        // are already there.
+        if s.exe != self.exe_path {
+            s.exe = self.exe_path.clone();
+        }
+        if s.cwd != self.vfs.cwd {
+            s.cwd.clone_from(&self.vfs.cwd);
+        }
         s.fds = self.fds.list();
         // argv and envp never change, so they are built once.
         if s.cmdline.is_empty() {
