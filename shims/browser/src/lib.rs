@@ -2204,6 +2204,23 @@ fn report_idle(why: u8) {
         {
             for (i, t) in p.iter().enumerate() {
                 out.push_str(&format!(" {pid}.{i}={}", waiting_name(&t.waiting)));
+                // And, for a poll, exactly which descriptors and how each
+                // one answers right now. "net" says a thread is waiting on
+                // something outside itself; it does not say whether the
+                // thing it is waiting for is already true, which is the
+                // difference between a wait and a deadlock.
+                if let Some(gex_kernel::BlockOp::Poll { fds, .. }) = &t.blocked_on {
+                    out.push('(');
+                    for f in fds {
+                        out.push_str(&format!(
+                            "{}:want{:#x}/have{:#x} ",
+                            f.fd,
+                            f.events,
+                            gex_kernel::syscalls::poll_revents(f)
+                        ));
+                    }
+                    out.push(')');
+                }
             }
         }
         out

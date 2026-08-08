@@ -398,7 +398,17 @@ impl FileHandle for UnixSocket {
     fn poll_writable(&self) -> bool {
         match &*self.role.lock().unwrap() {
             Role::Connected { tx, .. } => tx.writable(),
-            _ => false,
+            // Anything not connected has no buffer to fill, so a write on it
+            // cannot *block* -- it fails with ENOTCONN, which is a different
+            // thing and one the caller finds out by writing.
+            //
+            // This said `false`, which was harmless while `poll` answered
+            // POLLOUT from the descriptor's open mode and never asked. Now
+            // that it asks, saying no here means a socket that is not yet
+            // connected is never reported writable, and the usual
+            // non-blocking connect -- connect, then poll for POLLOUT to
+            // learn it finished -- waits for ever.
+            _ => true,
         }
     }
 }
