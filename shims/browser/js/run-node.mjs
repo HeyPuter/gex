@@ -148,7 +148,29 @@ if (process.env.GEX_RECOMPILE_OBJECTS) {
     Number(process.env.GEX_RECOMPILE_OBJECTS) || 8192,
   );
 }
+// GEX_HOT dumps the guest's hottest back edges when the run ends, which is
+// the browser's answer to the native host's `--sample`. A block-per-function
+// translation makes a profile of the *host* nearly useless -- it is all
+// `wasm-function[N]` across thousands of modules -- so the question "which
+// guest code is hot" needs asking of the guest.
 const status = await gex.run(entry);
+if (process.env.GEX_HOT && gex.shim.exports.gex_hot_blocks) {
+  const e = gex.shim.exports;
+  const at = e.gex_alloc(4096) >>> 0;
+  const n = e.gex_hot_blocks(at, 4096) >>> 0;
+  const text = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, n));
+  for (const line of text.trim().split('\n')) {
+    const [pc, count] = line.split(' ');
+    // Named where it can be: an address alone is a library and an offset
+    // that nobody has worked out yet.
+    const nameAt = e.gex_alloc(160) >>> 0;
+    const len = e.gex_object_at ? e.gex_object_at(BigInt(pc), nameAt, 160) >>> 0 : 0;
+    const where = len
+      ? new TextDecoder().decode(new Uint8Array(gex.memory.buffer, nameAt, len))
+      : pc;
+    console.error(`[hot] ${count.padStart(10)}  ${where}`);
+  }
+}
 // GEX_FMA_COUNT reports how many fused multiply-adds crossed out of the guest
 // module. wasm has no FMA, so each one is a call into the shim's.
 if (process.env.GEX_FMA_COUNT) {
