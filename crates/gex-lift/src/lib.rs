@@ -27,6 +27,15 @@ use gex_isa::{
 mod block;
 pub use block::{lift_block, BlockLimits};
 
+/// Whether to emit a fused multiply-add as an unfused multiply and add.
+///
+/// A measurement aid, never a shipping configuration: fusing rounds once and
+/// the pair rounds twice, so the answers differ.
+fn inline_fma() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_INLINE_FMA").is_some())
+}
+
 /// Guest instruction width. A64 is fixed-width; the whole design leans on it.
 pub const INST_BYTES: u64 = 4;
 
@@ -1290,6 +1299,28 @@ impl<'a> Lifter<'a> {
                 } else {
                     c
                 };
+                // GEX_INLINE_FMA emits a multiply and an add instead of the
+                // fused call. It is *not* correct -- fusing rounds once and
+                // this rounds twice, which is a different number -- and it
+                // exists only to size the prize: nbench's LU decomposition
+                // makes 706 million of these calls, and the question is what
+                // fraction of the kernel that actually costs.
+                if inline_fma() {
+                    let prod = self.b.def(Expr::FpBin {
+                        op: FpBinOp::Mul,
+                        double,
+                        a,
+                        b,
+                    });
+                    let v = self.b.def(Expr::FpBin {
+                        op: FpBinOp::Add,
+                        double,
+                        a: prod,
+                        b: c,
+                    });
+                    self.wr_fp(vd, sz, v);
+                    return Flow::Next;
+                }
                 let (a64, b64, c64) = if double {
                     (a, b, c)
                 } else {

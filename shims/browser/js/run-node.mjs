@@ -117,6 +117,12 @@ const entry = await gex.load(shimWasm, readFileSync(guestPath), readFileSync(elf
   cwd,
 });
 const status = await gex.run(entry);
+// GEX_FMA_COUNT reports how many fused multiply-adds crossed out of the guest
+// module. wasm has no FMA, so each one is a call into the shim's.
+if (process.env.GEX_FMA_COUNT) {
+  const n = gex.shim?.exports?.gex_fma_calls?.();
+  if (n !== undefined) process.stderr.write(`[gex] fma calls: ${n}\n`);
+}
 // Anything the program was asked to leave behind, written out for the caller.
 for (const [guest, host] of extract) {
   const bytes = gex.readFile(guest);

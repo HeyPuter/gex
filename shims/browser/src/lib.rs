@@ -1804,6 +1804,12 @@ fn write_u64(data: &mut [u8], off: usize, v: u64) {
 /// where there is not, which is what the guest needs either way.
 #[no_mangle]
 pub extern "C" fn gex_fma(_ctx: i32, a: i64, b: i64, c: i64, double: i32) -> i64 {
+    // Counted, because "the guest does a lot of fused multiply-adds" is a
+    // guess until it is a number. wasm has no FMA instruction, so every one
+    // of these leaves the guest module for the shim's -- and a cross-module
+    // call in the middle of a floating-point inner loop is the sort of thing
+    // that costs more than the arithmetic.
+    FMA_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if double != 0 {
         f64::from_bits(a as u64)
             .mul_add(f64::from_bits(b as u64), f64::from_bits(c as u64))
@@ -1813,6 +1819,15 @@ pub extern "C" fn gex_fma(_ctx: i32, a: i64, b: i64, c: i64, double: i32) -> i64
             .mul_add(f32::from_bits(b as u32), f32::from_bits(c as u32))
             .to_bits() as i64
     }
+}
+
+/// How many times the guest has asked for a fused multiply-add.
+pub static FMA_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read and reset the count, for a harness that wants it per phase.
+#[no_mangle]
+pub extern "C" fn gex_fma_calls() -> i64 {
+    FMA_CALLS.swap(0, std::sync::atomic::Ordering::Relaxed) as i64
 }
 
 #[no_mangle]
