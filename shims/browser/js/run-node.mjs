@@ -130,6 +130,17 @@ if (process.env.GEX_NETWORK) {
 if (process.env.GEX_HEARTBEAT) {
   gex.shim.exports.gex_set_heartbeat?.(BigInt(process.env.GEX_HEARTBEAT));
 }
+// GEX_RECOMPILE_OBJECTS makes the runtime statically recompile each shared
+// object as the guest maps it, instead of meeting it a dispatch miss at a
+// time. That is what the native host does with `--recompile-objects`, and
+// what a page has never had -- there is no ahead-of-time step in a browser,
+// so every block used to arrive through a miss.
+if (process.env.GEX_TRACE_MISSES) {
+  gex.shim.exports.gex_set_trace_misses?.(1);
+}
+if (process.env.GEX_RECOMPILE_OBJECTS) {
+  gex.shim.exports.gex_set_recompile_objects?.(1);
+}
 const status = await gex.run(entry);
 // GEX_FMA_COUNT reports how many fused multiply-adds crossed out of the guest
 // module. wasm has no FMA, so each one is a call into the shim's.

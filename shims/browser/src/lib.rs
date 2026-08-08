@@ -502,6 +502,16 @@ struct Thread {
 /// compiles to wasm like everything else -- but it cannot *compile* one:
 /// nothing in wasm can hand bytes to the engine. So a miss produces the
 /// module here, leaves it for JS to instantiate, and comes back.
+/// One emitted module, waiting for JavaScript to instantiate it.
+struct PendingModule {
+    wasm: Vec<u8>,
+    /// The pages it is the first to claim, published only once its blocks are
+    /// actually in the table.
+    dirs: Vec<(u64, u32)>,
+    /// How many slots the dispatch table must hold for it.
+    slots: u64,
+}
+
 struct Jit {
     /// Which guest pages own which slots in the dispatch table.
     page_table: gex_xlate::PageTable,
@@ -524,12 +534,15 @@ struct Jit {
     /// Not part of a process's saved state. That is the point -- it outlives
     /// every `fork` and `execve`, which is where the waste was.
     shared: std::collections::HashMap<(u64, u64), u32>,
-    /// A module JS has yet to instantiate.
-    pending: Option<Vec<u8>>,
-    /// The slots it defines, once JS asks.
-    pending_dirs: Vec<(u64, u32)>,
-    /// How many slots the table must hold for it.
-    pending_slots: u64,
+    /// Modules JS has yet to instantiate, oldest first.
+    ///
+    /// A queue rather than one, because statically recompiling a whole
+    /// object produces as many modules as it needs: a wasm module holds at
+    /// most a million functions and gex emits one per block, so libc is
+    /// several and libz3 is many. They must be installed in the order they
+    /// were emitted, since each one's page assignments are the next one's
+    /// starting point.
+    pending: std::collections::VecDeque<PendingModule>,
     blocks: u64,
     compiles: u64,
     /// Nanoseconds spent lifting and encoding, which is the shim's own share
@@ -995,9 +1008,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
                 translated: Default::default(),
                 shared: Default::default(),
-                pending: None,
-                pending_dirs: Vec::new(),
-                pending_slots: 0,
+                pending: Default::default(),
                 blocks: 0,
                 compiles: 0,
                 nanos: 0,
@@ -1530,6 +1541,34 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
             }
         }
     });
+    // Objects the guest has just mapped, statically recompiled in bulk
+    // before it can branch into one.
+    //
+    // Here rather than inside the `with_host` above because recompiling
+    // takes the host lock itself, and because it must happen after the
+    // syscall that created the mapping has finished -- the loader maps a
+    // library and then jumps into it, and a translation that arrives late is
+    // a translation the dispatch miss got to first.
+    let mut stop = stop;
+    // Only when the syscall was going to return normally. Anything else has
+    // already decided where the guest goes next -- a redirect, an exit, a
+    // thread that gave up the stack -- and its resume point is the right one.
+    if stop == 0 && recompile_objects() {
+        // The modules have to be instantiated, which only JavaScript can do,
+        // so the guest gives the stack back and comes straight in again.
+        //
+        // At the instruction after the `svc`. This is the one address that
+        // has to be right and is not written down anywhere: on the ordinary
+        // path the guest simply returns from here and carries on, so nothing
+        // records where "carry on" is. The thread's own `pc` is where it was
+        // when it trapped, which is the `svc` itself -- resuming there runs
+        // the syscall a second time.
+        with_host(|h| {
+            h.resume = Some(pc as u64 + 4);
+            h.resume_ctx = Some(h.threads[h.current].kstate.ctx_addr);
+        });
+        stop = 1;
+    }
     // 3 means the running thread gave up the wasm stack: pick another.
     let stop = if stop == 3 { schedule() } else { stop };
     if tracing() {
@@ -2832,9 +2871,11 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         for (addr, _) in &unit.exported_blocks {
             h.jit.translated.insert(*addr);
         }
-        h.jit.pending_dirs = unit.dir_entries.clone();
-        h.jit.pending_slots = unit.table_slots;
-        h.jit.pending = Some(unit.wasm);
+        h.jit.pending.push_back(PendingModule {
+            dirs: unit.dir_entries.clone(),
+            slots: unit.table_slots,
+            wasm: unit.wasm,
+        });
         h.jit.blocks += stats.blocks as u64;
         h.jit.compiles += 1;
         h.jit.nanos += now_ns().saturating_sub(started);
@@ -2878,21 +2919,219 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     trap();
 }
 
+
+/// Statically recompile a whole object the guest has just mapped.
+///
+/// This is what the native host does with `--recompile-objects`, and what a
+/// page never had. Without it the browser meets a library one dispatch miss
+/// at a time: eleven thousand of them to bring up Mesa and an X server, each
+/// one lifting at most a couple of thousand blocks and then stopping to have
+/// a module compiled. Sixteen seconds of lifting for a demo that draws one
+/// frame.
+///
+/// Doing it in bulk is not merely fewer round trips. It is *static*: the
+/// whole object is translated from its own bytes, so what comes out depends
+/// on the library and where it was loaded and on nothing else. The
+/// demand-driven path produces a different module depending on which address
+/// the guest happened to reach first, which is why its output never settled
+/// and its cache never quite hit.
+///
+/// The runtime translator stays behind this. Seeding from symbols and from
+/// the object's own data finds what anything can call and what any of its
+/// own words point at; it cannot find a target that is only ever computed,
+/// and that residue is what a dispatch miss is still for.
+/// Drain what the guest has mapped since the last syscall, and recompile it.
+///
+/// Returns whether anything was emitted, which is the caller's cue to hand
+/// the stack back so JavaScript can instantiate it.
+///
+/// Off unless the page asks. A demo that wants to show the runtime translator
+/// working should get the runtime translator; this is a different claim about
+/// what the system is, and it should be made deliberately.
+fn recompile_objects() -> bool {
+    if !unsafe { RECOMPILE_OBJECTS } {
+        return false;
+    }
+    let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
+    if mapped.is_empty() {
+        return false;
+    }
+    let mut any = false;
+    for m in mapped {
+        let began = now_ns();
+        let blocks = recompile_object(&m);
+        if blocks == 0 {
+            continue;
+        }
+        any = true;
+        if unsafe { HEARTBEAT } != 0 {
+            let ms = (now_ns() - began) / 1_000_000;
+            let slots = with_host(|h| h.jit.page_table.slots());
+            trace_line(&format!(
+                "[gex] recompiled {} statically: {blocks} blocks in {ms}ms, \
+                 {slots} dispatch slots claimed in all\n",
+                m.path
+            ));
+        }
+    }
+    any
+}
+
+/// Whether to statically recompile each object as it is mapped.
+static mut RECOMPILE_OBJECTS: bool = false;
+
+#[no_mangle]
+pub extern "C" fn gex_set_recompile_objects(on: i32) {
+    unsafe { RECOMPILE_OBJECTS = on != 0 };
+}
+
+fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
+    let span = map.end.saturating_sub(map.start);
+    if span == 0 || span > MAX_OBJECT_BYTES {
+        return 0;
+    }
+    // The same guard the miss path has. Until the guest module has said how
+    // many slots it already uses, claiming from zero would hand out slots
+    // the image module's own blocks are sitting in.
+    if !with_host(|h| h.jit.described) {
+        return 0;
+    }
+    let seeds = object_seeds(map);
+    let (exec, page_table, known) = with_host(|h| {
+        let exec: Vec<(u64, u64)> = h
+            .kernel
+            .mem
+            .vmas()
+            .iter()
+            .filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
+            .map(|v| (v.start, v.end))
+            .collect();
+        (exec, h.jit.page_table.clone(), std::mem::take(&mut h.jit.translated))
+    });
+    let (modules, stats) = gex_xlate::translate_object(
+        guest_bytes(),
+        map.start,
+        map.end,
+        &seeds,
+        &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
+        &|a| known.contains(&a),
+        page_table,
+        Default::default(),
+        MAX_OBJECT_BLOCKS,
+        cfg!(feature = "shared-memory"),
+    );
+    with_host(|h| {
+        h.jit.translated = known;
+        if modules.iter().all(|m| m.exported_blocks.is_empty()) {
+            return;
+        }
+        // In emitted order. Each module's page assignments are the next
+        // one's starting point, so installing them out of order hands two
+        // modules the same slots.
+        for m in &modules {
+            h.jit.page_table = m.page_table.clone();
+            for b in &m.exported_blocks {
+                h.jit.translated.insert(b.0);
+            }
+        }
+        h.jit.blocks += stats.blocks as u64;
+        // And what this claimed, so the next process to map the same library
+        // finds it rather than translating it again. The miss path does this
+        // for what it translates; without the same here, the second process
+        // to load libc pays for all 62,085 blocks of it a second time.
+        for m in &modules {
+            for (page, base) in &m.dir_entries {
+                if let Some(key) = page_identity(h, *page * gex_abi::DISPATCH_PAGE) {
+                    h.jit.shared.entry((*page, key)).or_insert(*base);
+                }
+            }
+        }
+        for m in modules {
+            h.jit.pending.push_back(PendingModule {
+                dirs: m.dir_entries,
+                slots: m.table_slots,
+                wasm: m.wasm,
+            });
+        }
+    });
+    stats.blocks
+}
+
+/// A mapping larger than this is not a shared library, and recompiling it
+/// would be a long pause for nothing.
+const MAX_OBJECT_BYTES: u64 = 64 << 20;
+
+/// A runaway guard, not a budget. Objects are split across as many modules as
+/// they need, so this only stops a range that decodes as code but is not.
+const MAX_OBJECT_BLOCKS: usize = 4_000_000;
+
+/// Where to start translating an object: everything it says about itself.
+///
+/// Its exported symbols are what anything outside can call, and every word in
+/// its own data that points into its own text is the target of an indirect
+/// branch that discovery cannot reach -- a vtable, a jump table, an
+/// initialiser array, a callback in a struct.
+///
+/// The alternative is starting a block at every decodable address, which is
+/// the only complete seeding and is quadratic: starting a block at each of
+/// the L instructions of a basic block emits L blocks totalling L(L+1)/2
+/// instructions. Empty when the file cannot be read, which tells
+/// `translate_object` to scan instead.
+fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {
+    let Some(bytes) = with_host(|h| h.kernel.read_file(&map.path)) else {
+        return Vec::new();
+    };
+    let Ok(image) = gex_ld::elf::load(&bytes, 0) else {
+        return Vec::new();
+    };
+    let Some(text) = image.segments.iter().find(|s| s.executable) else {
+        return Vec::new();
+    };
+    // Parsed at its own addresses; the bias is where the executable segment
+    // was asked to go against where it ended up.
+    let bias = map.start.wrapping_sub(text.vaddr & !0xfff);
+    let (lo, hi) = (text.vaddr, text.vaddr + text.bytes.len() as u64);
+    let mut seeds: Vec<u64> = image
+        .symbols
+        .iter()
+        .filter(|s| s.value >= lo && s.value < hi)
+        .map(|s| s.value.wrapping_add(bias))
+        .collect();
+    seeds.push(image.entry.wrapping_add(bias));
+    for seg in &image.segments {
+        if seg.executable {
+            continue;
+        }
+        for (i, chunk) in seg.bytes.chunks_exact(8).enumerate() {
+            if !(seg.vaddr as usize + i * 8).is_multiple_of(8) {
+                continue;
+            }
+            let v = u64::from_le_bytes(chunk.try_into().unwrap());
+            if v >= lo && v < hi && v % 4 == 0 {
+                seeds.push(v.wrapping_add(bias));
+            }
+        }
+    }
+    seeds.sort_unstable();
+    seeds.dedup();
+    seeds
+}
+
 /// The module JS has to instantiate, or zero length if there is none.
 #[no_mangle]
 pub extern "C" fn gex_jit_pending_ptr() -> u32 {
-    with_host(|h| h.jit.pending.as_ref().map_or(0, |v| v.as_ptr() as u32))
+    with_host(|h| h.jit.pending.front().map_or(0, |m| m.wasm.as_ptr() as u32))
 }
 
 #[no_mangle]
 pub extern "C" fn gex_jit_pending_len() -> u32 {
-    with_host(|h| h.jit.pending.as_ref().map_or(0, |v| v.len() as u32))
+    with_host(|h| h.jit.pending.front().map_or(0, |m| m.wasm.len() as u32))
 }
 
 /// How many slots the dispatch table must hold for the pending module.
 #[no_mangle]
 pub extern "C" fn gex_jit_slots() -> u32 {
-    with_host(|h| h.jit.pending_slots as u32)
+    with_host(|h| h.jit.pending.front().map_or(0, |m| m.slots as u32))
 }
 
 /// The dispatch-table slot a translated block belongs in.
@@ -2914,12 +3153,13 @@ pub extern "C" fn gex_dispatch_slot(addr: i64) -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_jit_installed() {
     with_host(|h| {
+        let Some(done) = h.jit.pending.pop_front() else {
+            return;
+        };
         let mut gm = GuestMem::new(guest_bytes());
-        for (page, base) in std::mem::take(&mut h.jit.pending_dirs) {
+        for (page, base) in done.dirs {
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
         }
-        h.jit.pending = None;
-        h.jit.pending_slots = 0;
     });
 }
 

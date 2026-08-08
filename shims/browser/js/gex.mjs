@@ -385,7 +385,12 @@ export class Gex {
         // an address out of the shim's heap.
         this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
         const e = this.#shim.exports;
-        if (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
+        // Drained, not taken one at a time. Statically recompiling a whole
+        // object emits as many modules as it needs -- a wasm module holds a
+        // million functions and gex emits one per block -- and they have to
+        // go in in the order they were emitted, because each one's page
+        // assignments are the next one's starting point.
+        while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
         const next = e.gex_resume_pc();
         if (next !== 0n) {
           pc = next;
