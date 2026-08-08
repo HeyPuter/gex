@@ -1687,6 +1687,28 @@ impl<'a> Emitter<'a> {
                 self.f.local_get(self.scratch_i64);
                 self.f.store(0x37, 3, ctx::PC as u32);
                 self.flush();
+                // Poll here too, and not only on a backward direct branch.
+                //
+                // A backward direct branch is the cheap approximation of a
+                // loop, and it misses the loop that matters most: one whose
+                // back edge is computed. A bytecode interpreter's dispatch
+                // is `br <reg>` through a table, and so is anything
+                // jump-threaded -- CPython's, Mesa's. A thread inside one
+                // reached no poll at all, which means it could not be
+                // preempted, could not take a signal, could not be
+                // interrupted by a timer, and did not appear in any trace.
+                //
+                // Measured: two hundred million iterations of a loop closed
+                // only by `br x16` produced zero safepoints. The same loop
+                // with a target the compiler could fold to a direct branch
+                // produced 195. That difference is the bug, and it is why
+                // glxgears went quiet at a full core with nothing to say.
+                //
+                // The context PC is already the target, stored above, and
+                // the registers are already flushed -- so the slow path may
+                // deliver a signal and unwind from here safely. The pc
+                // passed is this branch's own, which is what a trace wants.
+                self.emit_safepoint_no_flush(block.end - 4);
                 self.f.local_get(self.ctx_local);
                 self.emit_dispatch_index();
                 self.f.return_call_indirect(self.cx.block_ty, 0);
@@ -1724,6 +1746,31 @@ impl<'a> Emitter<'a> {
     /// it means no program can spin without reaching a poll, while
     /// straight-line code pays nothing. Forward branches and calls are left
     /// alone, and syscalls are already delivery points.
+    /// The safepoint countdown, for a caller that has already flushed and
+    /// that carries on rather than jumping.
+    ///
+    /// `emit_safepoint` is written for a direct branch: it may flush inside
+    /// a fused loop, and its caller follows it with a jump to a constant.
+    /// An indirect branch has flushed already and its target is in a local,
+    /// so it needs the counter and the call and nothing else.
+    fn emit_safepoint_no_flush(&mut self, pc: u64) {
+        self.f.local_get(self.ctx_local);
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
+        self.f.i32_const(1);
+        self.f.byte(0x6b); // i32.sub
+        self.f.local_tee(self.scratch_i32);
+        self.f.store(0x36, 2, ctx::SAFEPOINT_COUNTER as u32);
+        self.f.local_get(self.scratch_i32);
+        self.f.i32_const(0);
+        self.f.byte(0x4c); // i32.le_s
+        self.f.if_void();
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(pc as i64);
+        self.f.call(self.cx.safepoint);
+        self.f.end();
+    }
+
     fn emit_safepoint(&mut self, pc: u64) {
         // Count down, and only call out when the counter runs out, so the
         // common case is a load, a subtract, a store and a not-taken branch.

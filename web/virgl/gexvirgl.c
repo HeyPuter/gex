@@ -112,6 +112,12 @@ struct gex_session {
 };
 
 static struct gex_session gex_sessions[GEX_SESSIONS];
+
+/* Narrate every command as it starts. */
+static bool gex_trace_commands;
+
+EMSCRIPTEN_KEEPALIVE
+void gex_virgl_trace_commands(int on) { gex_trace_commands = on != 0; }
 /* Which one the renderer is currently running commands for. vtest reads its
  * input and writes its replies through callbacks that take no argument for
  * it, so it has to be here rather than passed. */
@@ -432,6 +438,19 @@ int gex_virgl_pump(int sid) {
                    && gex_commands[header[1]] != NULL) {
             vtest_poll_resource_busy_wait();
             gex_cmd_count[header[1]]++;
+            /* Said before the command runs, not after.
+             *
+             * A command that does not return takes the whole run with it:
+             * this is called from JavaScript, so no timer fires, the shim's
+             * counters do not advance, and the guest is not executing. The
+             * question is which command, and a line printed afterwards is a
+             * line that never appears. */
+            if (gex_trace_commands) {
+                const char *nm = header[1] < sizeof gex_cmd_names / sizeof *gex_cmd_names
+                                     ? gex_cmd_names[header[1]] : NULL;
+                fprintf(stderr, "[virgl] running %s (%u dwords)\n",
+                        nm ? nm : "?", header[0]);
+            }
             ret = gex_commands[header[1]](header[0]);
         } else {
             /* A command this build does not know. The stream is framed by

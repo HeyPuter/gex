@@ -145,6 +145,7 @@ try {
 
   const gex = new Gex(new PageEnv());
   gex.useVirgl(renderer, TRACE);
+  if (TRACE) renderer.traceCommands(true);
   mark('loading the guest');
   const entry = await gex.load(
     await grab('./shim.wasm'), await grab('./seed.wasm'), files['/bin/sh'],
@@ -295,6 +296,12 @@ const child = spawn(
     '--no-sandbox',
     '--disable-gpu-sandbox',
     '--enable-unsafe-swiftshader',
+    // Without this the page's console goes nowhere. `console.warn` is where
+    // the renderer's own diagnostics come out -- it is a separate wasm
+    // module with its own libc, so it cannot reach the shim's stderr -- and
+    // a trace that is never delivered is worse than no trace.
+    '--enable-logging=stderr',
+    '--v=0',
     // GEX_PROFILE=1 turns on V8's sampling profiler. It samples from a signal
     // handler, so it reports where a run is even while the guest holds the
     // wasm stack and nothing in this harness can say anything -- which is the

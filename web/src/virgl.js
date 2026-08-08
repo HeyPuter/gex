@@ -128,6 +128,18 @@ export class VirglRenderer {
     return n;
   }
 
+  /**
+   * Narrate every command as it starts.
+   *
+   * For the case where the renderer does not come back: it is called from
+   * JavaScript, so a command that loops takes the page with it -- no timer
+   * fires, the shim's counters stop, and the guest is not running. The last
+   * line printed names the command it went into.
+   */
+  traceCommands(on) {
+    if (this.ok) this.#module._gex_virgl_trace_commands(on ? 1 : 0);
+  }
+
   /** A client has gone: drop its context and its buffers. */
   close(session) {
     if (this.ok) this.#module._gex_virgl_close(session);

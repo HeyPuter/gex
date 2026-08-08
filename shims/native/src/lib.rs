@@ -663,17 +663,19 @@ fn run_program_with(
         }
         None => (
             Kernel::new(ctx_addr, image.brk, exe_path.clone()),
+            // `..Default::default()` for the rest, deliberately. This site
+            // listed every field, so adding one to `ProcState` broke it --
+            // and it broke the *native* shim only, which is how `gexc` sat
+            // unbuilt for hours while the browser target compiled fine and
+            // every check came back green.
             Arc::new(Mutex::new(ProcState {
                 pid: 1,
                 ppid: 0,
                 pgid: 1,
                 sid: 1,
-                maps: String::new(),
-                cmdline: Vec::new(),
-                environ: Vec::new(),
                 exe: exe_path,
                 cwd: "/".into(),
-                fds: Vec::new(),
+                ..Default::default()
             })),
         ),
     };

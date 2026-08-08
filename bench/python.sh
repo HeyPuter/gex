@@ -20,15 +20,22 @@
 # Five rounds, alternating, on an idle machine. Ratios are against qemu-user,
 # so lower is faster:
 #
-#   fannkuch (integer, list)   qemu 0.732s   gex 1.581x   v8 1.466x
-#   nbody    (float)           qemu 2.724s   gex 0.800x   v8 0.766x
-#   dicts    (allocation)      qemu 0.329s   gex 1.681x   v8 1.696x
+#   fannkuch (integer, list)   qemu 0.791s   gex 1.665x   v8 1.705x
+#   nbody    (float)           qemu 2.460s   gex 0.927x   v8 0.689x
+#   dicts    (allocation)      qemu 0.399s   gex 1.373x   v8 1.479x
 #
-# V8 is ahead of Cranelift on two of the three and level on the third,
-# running a CPython whose every opcode handler was translated ahead of time.
-# That is the same answer nbench gave (see tests/real-programs/BASELINE.md,
-# where V8 wins six kernels of ten), now on the workload that was supposed to
-# be worst for this design.
+# V8 is a long way ahead on floating point and a little behind on the other
+# two, running a CPython whose every opcode handler was translated ahead of
+# time. Mixed, in other words, which is a weaker claim than the one first
+# recorded here and is the one the numbers support.
+#
+# The first measurement said V8 was ahead on two of three. It was taken with
+# a `gexc` that had not rebuilt for hours -- the native shim had a
+# compilation error and only the browser target was current -- so the `v8`
+# column had two syscall fixes that the `gex` column did not. Both columns
+# are built from the same tree now. The lesson is not about the numbers: a
+# broken build in one shim and not the other is invisible to every check
+# that greps the shim it did build.
 #
 # Compare the two columns from the *same* invocation and not against the
 # numbers written down below: those were taken on a differently loaded
