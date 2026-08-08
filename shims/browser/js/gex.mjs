@@ -505,6 +505,27 @@ export class Gex {
         }
         return this.#shim.exports.gex_exit_code();
       } catch (err) {
+        // First, before anything else asks the shim a question: was this the
+        // shim handing the stack back, or the shim falling over?
+        //
+        // Every way out is the same `unreachable` to the engine -- the
+        // deliberate handoff, a Rust panic, a failed allocation, a bad access
+        // inside the kernel -- and treating them alike reported a runtime
+        // that had crashed as a program that exited cleanly with status 0.
+        // That is how `apt update` came to print nothing, write no lists and
+        // return success. `trap()` sets a flag; nothing else does.
+        //
+        // It has to be first because the recovery below calls back into the
+        // shim, and after a crash the kernel may still be borrowed by
+        // whatever crashed -- so those calls fail with a second, misleading
+        // error that buries the first.
+        if (this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff()) {
+          throw new Error(
+            `the gex runtime trapped inside the shim (${err.message}). That is a ` +
+              'crash in the runtime, not a guest exit; anything printed above is ' +
+              'all the guest managed to do first.',
+          );
+        }
         // A trap unwinds the engine's own frames, but the shim's shadow
         // stack is a mutable global that Rust adjusts in each function's
         // prologue and restores in its epilogue -- and an abandoned frame

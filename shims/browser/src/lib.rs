@@ -369,6 +369,21 @@ unsafe impl Sync for Counting {}
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
         let p = unsafe { self.0.alloc(l) };
+        // Rust turns a null into `handle_alloc_error`, which aborts, which in
+        // wasm is a bare `unreachable` with nothing said. That is the least
+        // debuggable failure this shim has: the heap is a *fixed* region --
+        // the memory belongs to the guest and cannot grow -- so running out
+        // is a real and reachable state, and it used to surface as a guest
+        // that mysteriously stopped. Say it before the abort.
+        if p.is_null() {
+            trace_line(&format!(
+                "gex: out of shim heap asking for {} bytes (align {}); {} of {} MiB in use\n",
+                l.size(),
+                l.align(),
+                gex_heap_used_kib() / 1024,
+                gex_heap_total_kib() / 1024,
+            ));
+        }
         #[cfg(feature = "heap-counters")]
         if !p.is_null() {
             self.1.fetch_add(l.size(), std::sync::atomic::Ordering::Relaxed);
@@ -777,10 +792,77 @@ fn set_host(host: Host) {
     unsafe { *core::ptr::addr_of_mut!(HOST) = Some(host) };
 }
 
+/// Where the call currently inside `with_host` came from.
+///
+/// Re-entering the kernel is the failure this shim is most prone to and the
+/// hardest to place: the panic says "already borrowed" and names the borrow
+/// that *failed*, which is never the interesting one. This records the borrow
+/// that succeeded, so the message can name both.
+static HOST_HOLDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The last few `with_host` call sites, oldest first, for the message below.
+///
+/// A location alone says who is holding the kernel and not how it got there,
+/// and the interesting part of a re-entrancy is the path. Six is enough to
+/// see the shape and small enough to cost nothing.
+static RING: [std::sync::atomic::AtomicUsize; 6] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
+static RING_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn note(l: &'static std::panic::Location<'static>) {
+    let i = RING_AT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % RING.len();
+    RING[i].store(l as *const _ as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn recent() -> String {
+    let n = RING_AT.load(std::sync::atomic::Ordering::Relaxed);
+    let mut out = String::new();
+    for k in 0..RING.len().min(n) {
+        let i = (n + k) % RING.len();
+        if let 0 = RING[i].load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        let p = RING[i].load(std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: only ever set from `&'static Location`.
+        let l = unsafe { &*(p as *const std::panic::Location<'static>) };
+        out.push_str(&format!(" {}:{}", l.file().rsplit('/').next().unwrap_or(""), l.line()));
+    }
+    out
+}
+
+fn holder() -> String {
+    match HOST_HOLDER.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => "?".to_string(),
+        p => {
+            // SAFETY: only ever set from `&'static Location`.
+            let l = unsafe { &*(p as *const std::panic::Location<'static>) };
+            format!("{}:{}", l.file(), l.line())
+        }
+    }
+}
+
 #[cfg(not(feature = "shared-memory"))]
+#[track_caller]
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
-    HOST.with(|h| f(h.borrow_mut().as_mut().expect("gex: not initialised")))
+    let here = std::panic::Location::caller();
+    HOST.with(|h| {
+        let mut b = match h.try_borrow_mut() {
+            Ok(b) => b,
+            Err(_) => panic!(
+                "gex: the kernel was re-entered at {}:{} while {} holds it; recent:{}",
+                here.file(),
+                here.line(),
+                holder(),
+                recent(),
+            ),
+        };
+        HOST_HOLDER.store(here as *const _ as usize, std::sync::atomic::Ordering::Relaxed);
+        note(here);
+        let r = f(b.as_mut().expect("gex: not initialised"));
+        HOST_HOLDER.store(0, std::sync::atomic::Ordering::Relaxed);
+        r
+    })
 }
 
 /// The same, holding the lock for the duration.
@@ -792,6 +874,7 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
 /// re-entering from inside a guest `write` -- so the rule is unchanged and
 /// only the punishment is worse.
 #[cfg(feature = "shared-memory")]
+#[track_caller]
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
     // A borrow in place, with neither a lock nor a move.
@@ -1880,7 +1963,7 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                 }
             }
             _ => {
-                h.exit = Some(128 + 31);
+                set_exit(h, 128 + 31);
                 2
             }
         }
@@ -2282,7 +2365,7 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
         if tracing() {
             trace_line(&format!("[proc] exit {pid} with {code}, nothing left to run\n"));
         }
-        h.exit = Some(if code < 0 { 128 - code } else { code });
+        set_exit(h, if code < 0 { 128 - code } else { code });
         return 2;
     };
     let target = h.suspended.remove(idx);
@@ -2843,7 +2926,7 @@ fn schedule() -> i32 {
                 // Every remaining thread is parked on a futex nothing will
                 // ever wake. On Linux this hangs; saying so is more useful.
                 trace_line("gex: every thread is blocked on a futex\n");
-                with_host(|h| h.exit = Some(128 + 31));
+                with_host(|h| set_exit(h, 128 + 31));
                 return 2;
             }
             // Nothing is runnable and nothing above recognised what anything
@@ -3030,8 +3113,30 @@ fn finish_parked(
 }
 
 /// Abandon the guest's wasm stack and return control to JS.
+///
+/// Deliberate, and says so. Every way out of this module is the same
+/// `unreachable` to the engine -- this handoff, a Rust panic, a failed
+/// allocation, a bad access inside the kernel -- and JavaScript could not
+/// tell them apart. So a shim that fell over mid-translation was indexed as
+/// a guest that exited cleanly: `apt update` printed nothing, wrote no
+/// lists, and returned success. The flag is what makes the difference
+/// visible; `gex_handoff` reads and clears it.
 fn trap() -> ! {
+    HANDOFF.store(true, std::sync::atomic::Ordering::Relaxed);
     core::arch::wasm32::unreachable()
+}
+
+/// Set by [`trap`], cleared by [`gex_handoff`].
+static HANDOFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Did the shim mean to give the stack back? Clears the flag.
+///
+/// Not `with_host`: this is asked on the way out of a trap, which is exactly
+/// when the kernel may still be borrowed by whatever trapped.
+#[no_mangle]
+pub extern "C" fn gex_handoff() -> i32 {
+    HANDOFF.swap(false, std::sync::atomic::Ordering::Relaxed) as i32
 }
 
 #[no_mangle]
@@ -3092,7 +3197,7 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
         "gex: illegal instruction {:#010x} at pc={:#x}\n",
         raw as u32, pc
     ));
-    with_host(|h| h.exit = Some(128 + 4));
+    with_host(|h| set_exit(h, 128 + 4));
     trap();
 }
 #[no_mangle]
@@ -3126,11 +3231,11 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             )
         });
         trace_line(&line);
-        with_host(|h| h.exit = Some(128 + 11));
+        with_host(|h| set_exit(h, 128 + 11));
         trap();
     }
     trace_line(&format!("gex: breakpoint at pc={pc:#x}\n"));
-    with_host(|h| h.exit = Some(128 + 5));
+    with_host(|h| set_exit(h, 128 + 5));
     trap();
 }
 #[no_mangle]
@@ -3403,7 +3508,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 }
                 Err(_) => {
                     trace_line("gex: corrupt signal frame on sigreturn\n");
-                    h.exit = Some(128 + 11);
+                    set_exit(h, 128 + 11);
                     false
                 }
             }
@@ -3502,6 +3607,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             slots: unit.table_slots,
             wasm: unit.wasm,
         });
+        publish_pending(h);
         h.jit.blocks += stats.blocks as u64;
         h.jit.compiles += 1;
         h.jit.nanos += now_ns().saturating_sub(started);
@@ -3540,7 +3646,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             ));
         });
         trace_line(&format!("gex: nothing to translate at pc={pc:#x}\n"));
-        with_host(|h| h.exit = Some(128 + 11));
+        with_host(|h| set_exit(h, 128 + 11));
     }
     trap();
 }
@@ -3791,6 +3897,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
                 wasm: m.wasm,
             });
         }
+        publish_pending(h);
     });
     stats.blocks
 }
@@ -3899,18 +4006,18 @@ pub extern "C" fn gex_object_at(addr: i64, out: u32, max: u32) -> u32 {
 /// The module JS has to instantiate, or zero length if there is none.
 #[no_mangle]
 pub extern "C" fn gex_jit_pending_ptr() -> u32 {
-    with_host(|h| h.jit.pending.front().map_or(0, |m| m.wasm.as_ptr() as u32))
+    PENDING[0].load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[no_mangle]
 pub extern "C" fn gex_jit_pending_len() -> u32 {
-    with_host(|h| h.jit.pending.front().map_or(0, |m| m.wasm.len() as u32))
+    PENDING[1].load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How many slots the dispatch table must hold for the pending module.
 #[no_mangle]
 pub extern "C" fn gex_jit_slots() -> u32 {
-    with_host(|h| h.jit.pending.front().map_or(0, |m| m.slots as u32))
+    PENDING[2].load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Where a translated block belongs: the table in the top eight bits, the
@@ -3978,8 +4085,73 @@ pub extern "C" fn gex_jit_installed() {
         // This is the same registry-and-replay the native host keeps for its
         // stores. It costs the size of every module translated so far, which
         // is the price of a thread being able to run at all.
+        // Only where a thread might have to replay it. A dispatch table
+        // belongs to a module instance, so a Worker joining this process
+        // needs every module the process has translated -- but against a
+        // plain memory there are no other Workers, and keeping the bytes is
+        // pure loss. It is a large loss: the shim's heap is a fixed 2 GiB,
+        // and `apt update` filled it, which surfaced as a 1 MiB allocation
+        // failing 2037 MiB in.
+        //
+        // The shared build still keeps them all, which is a ceiling on how
+        // much a threaded process may translate and the next thing to bound
+        // -- by dropping a module once every live Worker has installed it.
+        #[cfg(feature = "shared-memory")]
         h.jit.registry.push(done.wasm);
+        publish_pending(h);
     });
+}
+
+/// Record a guest exit, and say so where a trap handler can see it.
+fn set_exit(h: &mut Host, code: i32) {
+    h.exit = Some(code);
+    EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the guest actually finished, as opposed to the shim falling over.
+///
+/// `trap()` is how a guest hands the wasm stack back, and it is also what a
+/// panic or a failed allocation inside the shim comes out as. Both arrive in
+/// JavaScript as `RuntimeError: unreachable` and nothing distinguishes them,
+/// so a shim that crashed mid-translation was reported as a program that
+/// exited cleanly with status 0 -- which is how `apt update` came to say
+/// nothing, write no lists, and return success.
+#[no_mangle]
+pub extern "C" fn gex_exited() -> i32 {
+    // Deliberately not `with_host`: this is asked on the way out of a trap,
+    // which is exactly when the kernel may still be borrowed by whatever
+    // trapped.
+    EXITED.load(std::sync::atomic::Ordering::Relaxed) as i32
+}
+
+/// Set when a guest exit is recorded, so `gex_exited` need not borrow.
+static EXITED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The head of the pending queue, as three plain words.
+///
+/// JavaScript reads these between handing the wasm stack back and giving it
+/// again, and it must not need the kernel to do it. It used to: each of
+/// `gex_jit_pending_ptr`, `_len` and `gex_jit_slots` took `with_host`, and
+/// the ordering that makes that safe -- the guest is never running while JS
+/// asks -- is not one this side can enforce. When it was violated the
+/// symptom was `RefCell already borrowed` in the plain build and a silent
+/// hang in the shared one, which is the worst pair of failure modes for the
+/// same bug.
+///
+/// Written wherever the queue is, read without a borrow. Three words that
+/// only the kernel writes and only JS reads need no more than that.
+static PENDING: [std::sync::atomic::AtomicU32; 3] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+
+/// Republish the head of the queue. Call after every push and pop.
+fn publish_pending(h: &Host) {
+    let (p, l, s) = h.jit.pending.front().map_or((0, 0, 0), |m| {
+        (m.wasm.as_ptr() as u32, m.wasm.len() as u32, m.slots as u32)
+    });
+    PENDING[0].store(p, std::sync::atomic::Ordering::Relaxed);
+    PENDING[1].store(l, std::sync::atomic::Ordering::Relaxed);
+    PENDING[2].store(s, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// How many translated modules this process has, for a Worker catching up.
