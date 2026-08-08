@@ -122,7 +122,18 @@ for (const id of list) {
 
   const child = spawn(
     CHROME,
-    ['--headless', '--no-sandbox', '--disable-gpu-sandbox', '--enable-unsafe-swiftshader', url],
+    [
+      '--headless',
+      '--no-sandbox',
+      '--disable-gpu-sandbox',
+      '--enable-unsafe-swiftshader',
+      // Without this the page's console goes nowhere, and a demo that throws
+      // before it runs a byte fails as "timeout, last status: (none)" with
+      // nothing else to say. That is the failure this file exists to catch.
+      '--enable-logging=stderr',
+      '--v=0',
+      url,
+    ],
     { stdio: ['ignore', 'ignore', 'pipe'] },
   );
   let err = '';
@@ -142,7 +153,8 @@ for (const id of list) {
     console.log(`FAIL site-${id}: ${result.how}${result.body ? ` (${result.body})` : ''}`);
     console.log(`     last status: ${last || '(none)'}`);
     console.log(
-      err.split('\n').filter((l) => l && !/Fontconfig|GPU|gpu|Registration/.test(l)).slice(-5)
+      err.split('\n').filter((l) => l && !/Fontconfig|GPU|gpu|Registration|Vulkan|dawn/.test(l))
+        .slice(-8)
         .map((l) => `     ${l}`).join('\n'),
     );
   }

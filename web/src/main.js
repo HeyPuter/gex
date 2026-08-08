@@ -226,7 +226,20 @@ DEMOS.forEach((d, i) => {
   // the thing rather than a button that shows it -- and the only way a test
   // can drive the page without reaching inside it.
   if (params.get('run')) {
-    document.querySelector('#actions .act.primary')?.click();
+    // Waited for, not assumed. A demo registers its actions during setup,
+    // and setup may await a fetch first -- so clicking the instant `select`
+    // resolves finds nothing, and `?.click()` on nothing is a silent no-op.
+    // Every demo on the site then sat there doing exactly what it was asked
+    // to do, which was nothing, and the page test reported "timeout, last
+    // status: (none)" for all of them.
+    for (let i = 0; i < 100; i++) {
+      const b = document.querySelector('#actions .act.primary');
+      if (b) {
+        b.click();
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
   }
 })();
 
