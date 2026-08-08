@@ -33,9 +33,25 @@ LINK="-C link-arg=--import-memory \
   -C link-arg=-zstack-size=8388608 \
   -C link-arg=--export=__stack_pointer"
 
+# GEX_HEAP_COUNTERS=1 builds a shim that tracks how much of its heap is out on
+# loan, and reports it through `gex_heap_used_kib` -- which the glue folds into
+# the message on an unexpected trap.
+#
+# Worth having because the heap is a *fixed* region: `--global-base` puts it
+# above the guest's world and it runs to the top of a memory that cannot grow,
+# so there is a real ceiling (`gex_heap_total_kib`, about 2039 MiB) and no
+# symptom when a lift hits it. Recompiling Mesa's software rasteriser is the
+# case -- 471,205 blocks, a peak working set of 2109 MiB measured natively --
+# and telling that apart from a wild pointer needs a number.
+#
+# Not the default because counting charges every allocation and free, and the
+# runtime translator allocates constantly.
+FEATURES=""
+[ -n "${GEX_HEAP_COUNTERS:-}" ] && FEATURES="--features heap-counters"
+
 OUT=target/wasm32-unknown-unknown/release/gex_browser.wasm
-RUSTFLAGS="$LINK" cargo build -p gex-browser --target wasm32-unknown-unknown --release
-echo "shims/browser: $(stat -c%s "$OUT") bytes"
+RUSTFLAGS="$LINK" cargo build -p gex-browser --target wasm32-unknown-unknown --release $FEATURES
+echo "shims/browser: $(stat -c%s "$OUT") bytes${FEATURES:+ (heap counters on)}"
 
 # And the same shim against a *shared* memory, when the toolchain can build
 # one. Two binaries rather than one because a memory import's `shared` flag is

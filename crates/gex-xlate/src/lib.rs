@@ -572,12 +572,44 @@ pub fn translate_object(
     } else {
         seeds
     };
+    stage("seeds", seeds.len());
     let (blocks, mut stats) = discover(
         memory, lo, seeds, executable, known, limits, max_blocks,
     );
+    stage("discovered", blocks.len());
     let modules = emit_modules(blocks, lo, page_table, shared_memory, MAX_FUNCS_PER_MODULE);
+    stage("emitted", modules.len());
     stats.wasm_bytes = modules.iter().map(|m| m.wasm.len()).sum();
     (modules, stats)
+}
+
+/// Announce where a whole-object lift has got to, when asked.
+///
+/// Set `GEX_XLATE_STAGES=1` to get a line per stage on stderr. This exists
+/// because the largest object in the graphics rootfs -- Mesa's software
+/// rasteriser, 471,205 blocks -- lifts to a peak working set of 2109 MiB,
+/// against a shim heap of 2039 MiB, and a total at the end says nothing about
+/// which stage holds the peak. Off by default and one `getenv` when it is on,
+/// so it costs nothing in the runtime that cannot afford it.
+///
+/// The resident figure is read from `/proc` and is therefore native-only; in
+/// the shim it prints the count alone, which is still the useful half.
+fn stage(what: &str, n: usize) {
+    if std::env::var_os("GEX_XLATE_STAGES").is_none() {
+        return;
+    }
+    let rss = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))?
+                .split_whitespace()
+                .nth(1)?
+                .parse::<usize>()
+                .ok()
+        })
+        .map_or(String::new(), |kib| format!("  resident {} MiB", kib / 1024));
+    eprintln!("  xlate {what:12} {n:>9}{rss}");
 }
 
 /// How many block functions gex will put in one wasm module.
@@ -637,6 +669,7 @@ fn emit_modules(
             .or_default()
             .push(block);
     }
+    stage("grouped", by_page.len());
 
     let mut modules = Vec::new();
     // Threaded from one chunk to the next: page assignments the earlier

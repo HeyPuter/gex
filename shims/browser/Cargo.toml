@@ -20,3 +20,12 @@ spinning_top = { version = "0.3", optional = true }
 # Built with `+atomics`, so more than one thread of the same process can be in
 # the module at once and the allocator has to be told.
 shared-memory = ["dep:spinning_top"]
+# Let the shim report how much of its heap is in use (`gex_heap_stats`).
+#
+# Off by default because it charges every allocation and free, and the runtime
+# translator allocates constantly -- this is a measuring build, not a shipping
+# one. It exists because the shim's heap is a *fixed* region (the memory it
+# shares with the guest cannot grow), so running out of it is a real failure
+# mode with no symptom of its own: what the page sees is a fault at whatever
+# the guest touched next.
+heap-counters = ["talc/counters"]

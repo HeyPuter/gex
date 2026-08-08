@@ -461,9 +461,23 @@ export class Gex {
             if (n) where = ' in ' + new TextDecoder().decode(this.#u8.subarray(at, at + n));
           }
           const ctx = e.gex_current_ctx ? e.gex_current_ctx() : 0n;
+          // And how full the shim's own heap was. That heap is a fixed region
+          // -- the memory belongs to the guest and cannot grow -- so running
+          // out of it is a real failure mode whose only visible symptom is a
+          // fault somewhere in the guest, at whatever address the guest was
+          // last recorded at, nowhere near the allocation that failed. A
+          // number here is the difference between reading that message as a
+          // wild pointer and reading it as a heap that ran out. Present only
+          // in a build with `--features heap-counters`.
+          const used = e.gex_heap_used_kib?.() ?? -1;
+          const total = e.gex_heap_total_kib?.() ?? -1;
+          const heap =
+            used >= 0 && total > 0
+              ? `, heap ${(used / 1024).toFixed(0)}/${(total / 1024).toFixed(0)} MiB`
+              : '';
           err.message +=
             ` (guest pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}${where}` +
-            `, ctx=0x${ctx.toString(16)})`;
+            `, ctx=0x${ctx.toString(16)}${heap})`;
         }
         if (String(err).includes("unreachable")) {
           return e.gex_exit_code();

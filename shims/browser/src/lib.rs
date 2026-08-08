@@ -332,17 +332,72 @@ impl FileHandle for Console {
 // lock -- and `TalcSyncCell` says so itself, refusing to compile once the
 // target has atomics rather than being quietly unsound.
 #[cfg(not(feature = "shared-memory"))]
-#[global_allocator]
-static ALLOC: talc::cell::TalcSyncCell<ShimRegion, talc::wasm::WasmBinning> =
-    talc::cell::TalcSyncCell::new_wasm(ShimRegion);
+type Heap = talc::cell::TalcSyncCell<ShimRegion, talc::wasm::WasmBinning>;
+#[cfg(not(feature = "shared-memory"))]
+const HEAP: Heap = talc::cell::TalcSyncCell::new_wasm(ShimRegion);
 
 #[cfg(feature = "shared-memory")]
+type Heap =
+    talc::sync::TalcLock<spinning_top::RawSpinlock, ShimRegion, talc::wasm::WasmBinning>;
+#[cfg(feature = "shared-memory")]
+const HEAP: Heap = talc::sync::TalcLock::new(ShimRegion);
+
 #[global_allocator]
-static ALLOC: talc::sync::TalcLock<
-    spinning_top::RawSpinlock,
-    ShimRegion,
-    talc::wasm::WasmBinning,
-> = talc::sync::TalcLock::new(ShimRegion);
+static ALLOC: Counting = Counting(HEAP, std::sync::atomic::AtomicUsize::new(0));
+
+/// The heap, plus how much of it is out on loan.
+///
+/// Talc keeps this figure itself, behind its `counters` feature -- but only
+/// on the plain `TalcCell`, and the shim's allocator is a `TalcSyncCell`,
+/// which wraps one and does not pass the accessor through. Counting here is
+/// less code than working around that, and it counts the same thing.
+///
+/// The total is worth having because the heap is *fixed*: `__heap_base` to
+/// the top of memory, about 2039 MiB, with no growing, because the memory
+/// belongs to the guest and moving its top would move where the guest's stack
+/// lands. Running out has no symptom of its own -- the page sees a fault at
+/// whatever the guest touched next -- so the only way to know is to ask.
+///
+/// Without `heap-counters` this is the allocator and nothing else: the
+/// counting arms compile away and what is left is a delegating newtype.
+struct Counting(Heap, std::sync::atomic::AtomicUsize);
+
+// SAFETY: both inner allocators are `Sync` on their intended target, and the
+// counter is atomic.
+unsafe impl Sync for Counting {}
+
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { self.0.alloc(l) };
+        #[cfg(feature = "heap-counters")]
+        if !p.is_null() {
+            self.1.fetch_add(l.size(), std::sync::atomic::Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        #[cfg(feature = "heap-counters")]
+        self.1.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { self.0.dealloc(p, l) }
+    }
+
+    // Realloc is forwarded rather than left to the default, which would
+    // allocate-copy-free: talc grows in place where it can, and the lifter
+    // pushes onto a great many vectors.
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        let q = unsafe { self.0.realloc(p, l, new) };
+        #[cfg(feature = "heap-counters")]
+        if !q.is_null() {
+            if new >= l.size() {
+                self.1.fetch_add(new - l.size(), std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.1.fetch_sub(l.size() - new, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        q
+    }
+}
 
 extern "C" {
     static __heap_base: u8;
@@ -857,6 +912,51 @@ pub extern "C" fn gex_vma_at(i: i32, out: u32) -> i32 {
         dst[16..24].copy_from_slice(&prot.to_le_bytes());
         0
     })
+}
+
+/// How much of the shim's heap is in use, in KiB. -1 without the counters.
+///
+/// The heap is a *fixed* region -- `__heap_base` to the top of the memory,
+/// about 2039 MiB -- because the memory belongs to the guest and cannot grow
+/// without moving where the guest's stack lands. So exhausting it is a real
+/// failure mode, and one with no symptom of its own: what a page sees is a
+/// fault at whatever the guest touched next, at whatever address the guest
+/// was last recorded at, which is nowhere near the allocation that failed.
+///
+/// Recompiling Mesa's software rasteriser is the case that motivated this.
+/// It lifts 471,205 blocks, and natively that costs a peak working set of
+/// 2109 MiB against those 2039 -- close enough on both sides of the line that
+/// guessing is no good and a number is needed.
+///
+/// Needs `--features heap-counters`, which charges every allocation and free
+/// and is therefore not what the page ships.
+#[no_mangle]
+pub extern "C" fn gex_heap_used_kib() -> i32 {
+    #[cfg(feature = "heap-counters")]
+    {
+        (ALLOC.1.load(std::sync::atomic::Ordering::Relaxed) / 1024) as i32
+    }
+    #[cfg(not(feature = "heap-counters"))]
+    {
+        -1
+    }
+}
+
+/// How large the shim's heap is in total, in KiB. Always available.
+///
+/// `__heap_base` is a link-time address, so this is not a constant anyone can
+/// write down -- it moves whenever the shim's own data does. Reported rather
+/// than assumed, so a ceiling quoted in a bug report is the real one.
+///
+/// `total - used` is an upper bound on what is left, not the answer: talc can
+/// only hand out a contiguous span, so a fragmented heap refuses allocations
+/// while this still says there is room. A lift that fails with a gigabyte
+/// nominally free has a fragmentation problem rather than a size one, and the
+/// two want different fixes.
+#[no_mangle]
+pub extern "C" fn gex_heap_total_kib() -> i32 {
+    let base = (&raw const __heap_base) as usize;
+    ((gex_abi::GUEST_MEM_BYTES as usize - base - 65536) / 1024) as i32
 }
 
 /// Reserve `len` bytes of this module's own heap and return a guest address
