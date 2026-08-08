@@ -11,6 +11,13 @@ const GUEST_BYTES = 0xffff0000;
 // The shim's world starts where the guest's ends (`STACK_TOP`); its stack sits
 // at the bottom of that, below its data.
 const SHIM_STACK_TOP = 0x80800000;
+// Everything below the guest's image: the reserved low region, the per-thread
+// register contexts, and the dispatch directory. It is not in the memory map,
+// so a forked child that copied only the mapped regions would arrive with no
+// context to enter and no directory to dispatch through.
+//
+// `DISPATCH_DIR + DISPATCH_MAX_PAGES * 4`, from `gex_abi`.
+const LOW_END = 0x00100000 + 0x80000 * 4;
 const PAGES = GUEST_BYTES / 65536;
 
 /** Everything the host has to supply that wasm cannot do for itself. */
@@ -33,6 +40,26 @@ export class Env {
    * read returns zero.
    */
   async readStdin() { return false; }
+
+  /**
+   * Start a guest process the guest itself forked.
+   *
+   * `child` is `{ pid, pc, ctx, sp, tls, image }`, where `image` is the
+   * parent's mapped memory as `{ at, bytes }` records. A host implements this
+   * by making a `WebAssembly.Memory`, writing every record into it,
+   * instantiating the shim and guest module against it, calling
+   * `gex_adopt_child(pid, ctx, pc, sp, tls)` and entering at what it returns.
+   *
+   * There is no default, because the answer differs by host -- a page makes a
+   * Worker, Node makes a `worker_thread` -- and because a silent default here
+   * would mean a forking program quietly running only half of itself. A host
+   * that does not implement it gets told the guest forked and it could not.
+   */
+  async spawnProcess(child) {
+    throw new Error(
+      `this environment cannot start guest process ${child.pid}: no spawnProcess`,
+    );
+  }
 }
 
 /**
@@ -87,6 +114,16 @@ export class Gex {
   // a module instance and instances are not shared, so every thread starts
   // with empty tables however much the process has already translated.
   #installed = 0;
+  // What `load` was told, so a forked child can be told the same. A child is
+  // the same program with the same terminal and the same user; rebuilding its
+  // kernel without them gave it a pipe where the parent had a tty, which is
+  // enough to change how libc buffers and whether a shell prints a prompt.
+  #opts = {};
+  // Every module this process has put into its tables, compiled. Kept because
+  // a forked child needs the same code in the same slots, and a
+  // `WebAssembly.Module` crosses to a Worker without being compiled again --
+  // which the bytes would not.
+  #compiled = [];
 
   /**
    * `shared` asks for a SharedArrayBuffer, which needs the shim and guest
@@ -241,6 +278,7 @@ export class Gex {
     // --global-base, which is the guest's image. Move it into the shim's own
     // region, above everything the guest maps. Nothing has run yet.
     this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
+    this.#opts = { strace: opts.strace, tty: opts.tty, uid: opts.uid, gid: opts.gid };
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
     // A terminal changes how libc buffers and whether a shell prints a
     // prompt, so a page with xterm.js in it has to say so.
@@ -256,12 +294,7 @@ export class Gex {
     // The module describes its own dispatch, in a custom section. Runtime
     // translation needs it to carry on allocating table slots where the
     // ahead-of-time build stopped.
-    const meta = metadataSection(guestWasm);
-    if (meta && meta.length) {
-      const mp = this.#shim.exports.gex_alloc(meta.length) >>> 0;
-      this.#u8.set(meta, mp);
-      this.#shim.exports.gex_set_metadata(mp, meta.length);
-    }
+    this.#setMetadata(guestWasm);
     // Where the guest starts, for a program given relative paths.
     if (opts.cwd) {
       const c = new TextEncoder().encode(opts.cwd);
@@ -378,9 +411,173 @@ export class Gex {
    * In order, and from the start: each module's page assignments are the next
    * one's starting point, so they cannot be applied out of sequence.
    */
+  /**
+   * Everything this process has mapped, as `{ at, bytes }`.
+   *
+   * What a forked child needs and the only thing it needs: its image, its
+   * stack and its heap, which after `fork` are exactly the parent's. The low
+   * region comes too -- the register contexts and the dispatch directory live
+   * below the image and are not in the memory map, and a child with neither
+   * has no context to enter and no directory to dispatch through.
+   *
+   * Copied rather than shared, deliberately. Two processes sharing a memory
+   * is the thing the switcher was built to cope with; this is a copy once, at
+   * `fork`, instead of a copy on every switch for the life of both.
+   */
+  #processImage() {
+    const e = this.#shim.exports;
+    const out = [{ at: 0, bytes: this.#u8.slice(0, LOW_END) }];
+    const scratch = e.gex_alloc(24) >>> 0;
+    const dv = new DataView(this.#memory.buffer);
+    const n = e.gex_vma_count();
+    for (let i = 0; i < n; i++) {
+      if (e.gex_vma_at(i, scratch) !== 0) continue;
+      const start = Number(dv.getBigUint64(scratch, true));
+      const end = Number(dv.getBigUint64(scratch + 8, true));
+      const prot = Number(dv.getBigUint64(scratch + 16, true));
+      // `prot` travels with the bytes: the child rebuilds its memory *map*
+      // from these, and a map is not recoverable from the memory it
+      // describes. A child whose map is empty maps straight over its image.
+      if (end > start) out.push({ at: start, end, prot, bytes: this.#u8.slice(start, end) });
+    }
+    e.gex_free?.(scratch, 24);
+    return out;
+  }
+
+  /**
+   * Hand the shim the module's `gex.meta` section.
+   *
+   * Runtime translation carries on from where the ahead-of-time build
+   * stopped, and this is the record of where that was. A kernel without it
+   * reports "nothing to translate" at the first address the tables do not
+   * already cover -- which for a forked child is the first address its
+   * *parent* had not reached either.
+   */
+  #setMetadata(guestWasm) {
+    const meta = metadataSection(guestWasm);
+    if (!meta || !meta.length) return;
+    const mp = this.#shim.exports.gex_alloc(meta.length) >>> 0;
+    this.#u8.set(meta, mp);
+    this.#shim.exports.gex_set_metadata(mp, meta.length);
+  }
+
+  /**
+   * Which dispatch slots this process's translated pages are in.
+   *
+   * Read out as one block rather than page by page: the table is a sorted
+   * map, and a real process has tens of thousands of pages in it.
+   */
+  #pageMap() {
+    const e = this.#shim.exports;
+    if (!e.gex_page_count) return [];
+    const n = e.gex_page_count() >>> 0;
+    if (!n) return [];
+    const p = e.gex_alloc(n * 12) >>> 0;
+    const wrote = e.gex_page_dump(p, n * 12);
+    const out = wrote > 0 ? this.#u8.slice(p, p + wrote * 12) : new Uint8Array(0);
+    e.gex_free?.(p, n * 12);
+    return out;
+  }
+
+  /**
+   * Become the child a `fork` in another Worker produced.
+   *
+   * Everything a process is, in the order the pieces depend on each other:
+   *
+   *   * its memory -- the parent's mapped regions, copied,
+   *   * a shim and a guest module instantiated against that memory,
+   *   * a kernel: its pid, its break, its memory map,
+   *   * its dispatch slots, and the code already in them.
+   *
+   * The last is the one that is easy to miss and impossible to work around
+   * afterwards. The child inherits the parent's dispatch *directory* with the
+   * memory, so its guest code branches straight into slots the parent
+   * allocated -- and a child that had not adopted the same map and the same
+   * modules would find those slots empty, or past the end of a table it had
+   * never grown.
+   */
+  async adoptProcess(shimWasm, guestWasm, child) {
+    const u8 = new Uint8Array(this.#memory.buffer);
+    for (const r of child.image) u8.set(new Uint8Array(r.bytes), r.at);
+    await this.attach(shimWasm, guestWasm);
+    const e = this.#shim.exports;
+    // Before the kernel is built, not after: the metadata is what the child's
+    // dispatch table starts from, and `gex_adopt_child` reads it as it builds.
+    this.#setMetadata(guestWasm);
+    const entry = e.gex_adopt_child(child.pid, child.ctx, child.pc, child.sp, child.tls);
+    // The kernel exists now, so everything that configures one can be said.
+    const o = child.opts ?? {};
+    this.#opts = o;
+    if (o.strace) e.gex_set_trace(1);
+    if (o.tty) e.gex_set_tty(1);
+    if (o.uid !== undefined) e.gex_set_identity(o.uid, o.gid ?? o.uid);
+    // The map, which the bytes do not carry: without it the child's first
+    // `mmap` hands out an address its own image is already at.
+    for (const r of child.image) {
+      if (r.end !== undefined) e.gex_adopt_vma(BigInt(r.at), BigInt(r.end), r.prot);
+    }
+    // Before the modules, because installing one asks the shim which slot
+    // each of its blocks belongs in and the answer is in this map.
+    if (child.pages?.length && e.gex_adopt_page) {
+      const dv = new DataView(child.pages.buffer, child.pages.byteOffset, child.pages.byteLength);
+      for (let i = 0; i + 12 <= child.pages.byteLength; i += 12) {
+        e.gex_adopt_page(dv.getBigUint64(i, true), dv.getUint32(i + 8, true));
+      }
+    }
+    for (const m of child.modules ?? []) await this.#installModule(m.mod, m.need);
+    return entry;
+  }
+
+  /**
+   * Hand the host any child `fork` has just made.
+   *
+   * Called where the guest gives the stack back, which after a `fork` is the
+   * next thing that happens: the parent runs on and this drains the child
+   * before it gets far. The environment decides what a Worker *is* -- a page
+   * and Node disagree -- so all that happens here is describing the process
+   * that needs one.
+   */
+  async #drainFork() {
+    const e = this.#shim.exports;
+    if (!e.gex_fork_pending) return;
+    const pid = e.gex_fork_pending();
+    if (!pid) return;
+    const child = {
+      pid,
+      pc: e.gex_fork_pc(),
+      ctx: e.gex_fork_ctx(),
+      sp: e.gex_fork_sp(),
+      tls: e.gex_fork_tls(),
+      image: this.#processImage(),
+      // The map from a guest page to the dispatch slots its blocks are in,
+      // and the modules those slots point into. Neither is in the memory --
+      // the map is Rust data in this Worker's heap and the modules are
+      // compiled wasm the engine holds -- so neither crosses with the bytes.
+      //
+      // A `WebAssembly.Module` is structured-cloneable, so handing the child
+      // these costs nothing: it links them against its own memory and tables
+      // without compiling a line.
+      pages: this.#pageMap(),
+      modules: this.#compiled.slice(),
+      opts: this.#opts,
+    };
+    e.gex_fork_taken();
+    if (!this.#env.spawnProcess) {
+      throw new Error(
+        `the guest forked pid ${pid} and this environment cannot start a process. ` +
+          'Give the Env a `spawnProcess`, or the child will never run.',
+      );
+    }
+    await this.#env.spawnProcess(child);
+  }
+
   async #catchUp() {
     const e = this.#shim.exports;
     if (!e.gex_module_count) return;
+    // A Worker that has attached but not yet been given a process has no
+    // kernel to ask, and asking anyway is a panic rather than a zero. That is
+    // the order a forked child arrives in: attach, then adopt.
+    if (e.gex_has_host && !e.gex_has_host()) return;
     const have = e.gex_module_count() >>> 0;
     // Every slot the *process* has claimed, not the pending module's -- this
     // Worker is catching up on all of them at once.
@@ -546,6 +743,11 @@ export class Gex {
         // go in in the order they were emitted, because each one's page
         // assignments are the next one's starting point.
         while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
+        // A `fork` leaves a child here for the host to start. Drained before
+        // the parent runs on, so the two are only ever one process apart --
+        // and before the memory is touched again, because what the child gets
+        // is a copy of it as `fork` left it.
+        await this.#drainFork();
         const next = e.gex_resume_pc();
         if (next !== 0n) {
           pc = next;
@@ -732,11 +934,11 @@ export class Gex {
         );
       }
     }
+    const mod = bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
+    this.#compiled.push({ mod, need });
     const imports = { ...this.#imports };
     for (let i = 0; i < tables.length; i++) imports[TABLE_NAMES[i]] = tables[i];
-    const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
-      gex: imports,
-    });
+    const inst = await WebAssembly.instantiate(mod, { gex: imports });
     for (const name of Object.keys(inst.exports)) {
       if (name[0] !== 'b') continue;
       // The shim packs the table index into the top eight bits, the same way

@@ -739,6 +739,26 @@ fn set_host(host: Host) {
     unsafe { *core::ptr::addr_of_mut!(HOST) = Some(host) };
 }
 
+/// Whether this Worker has a kernel yet.
+///
+/// A Worker that has instantiated the shim but not yet been given a process
+/// -- everything between `attach` and `gex_adopt_child` -- has a memory and
+/// no `Host`, and every other export here would panic on the way in. The host
+/// asks this rather than guessing, because the alternative is that a joining
+/// thread's first diagnostic call takes down the Worker it was diagnosing.
+#[no_mangle]
+pub extern "C" fn gex_has_host() -> i32 {
+    #[cfg(not(feature = "shared-memory"))]
+    {
+        HOST.with(|h| h.borrow().is_some()) as i32
+    }
+    #[cfg(feature = "shared-memory")]
+    {
+        // SAFETY: a read of an `Option`'s discriminant; see `with_host`.
+        unsafe { (*core::ptr::addr_of!(HOST)).is_some() as i32 }
+    }
+}
+
 /// Where the call currently inside `with_host` came from.
 ///
 /// Re-entering the kernel is the failure this shim is most prone to and the
@@ -1886,9 +1906,19 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                 tls,
             } => {
                 do_fork(h, pid, pc as u64, child_stack, tls);
-                // The child is on this stack already, at the instruction
-                // after the `clone`. Nothing to switch to.
-                0
+                // Give the stack back, even though the parent is about to
+                // carry straight on with it.
+                //
+                // Because what the child gets is a *copy of this memory*, and
+                // the copy has to be taken now. The host takes it where the
+                // stack comes back; letting the parent run on first meant the
+                // child was made from the parent's memory several syscalls
+                // later, with a context saved over by the parent's next
+                // syscall -- a child whose registers were its parent's and
+                // whose `rt_sigprocmask` was handed a pointer of 2.
+                h.resume = Some(pc as u64 + 4);
+                h.resume_ctx = Some(h.threads[h.current].kstate.ctx_addr);
+                1
             }
             SyscallOutcome::Exec { path, argv, envp } => {
                 let entry = do_exec(h, &path, &argv, &envp);
@@ -2025,28 +2055,164 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     // fills and nobody drains it, so a forking program now runs its parent
     // and never its child.
     //
-    // What has to arrive here:
-    //
-    //   * the host creating a `WebAssembly.Memory`, instantiating the shim and
-    //     the guest module against it, and copying every mapped region across
-    //     -- `gex_vma_count`/`gex_vma_at` already report which they are;
-    //   * that Worker calling `enter(ctx, pc + 4)` with the context below;
-    //   * `k_spawn` in the global kernel giving the child its place in the
-    //     process table, so the parent's `wait4` can find it.
-    let _ = (pid, child_stack, tls, ctx_addr);
-    FORK_PENDING.store(pid, std::sync::atomic::Ordering::Relaxed);
+    // The host reads these, builds the Worker, and that Worker calls
+    // `gex_adopt_child` to become the process.
+    FORK[1].store(pc + 4, std::sync::atomic::Ordering::Relaxed);
+    FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
+    FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
+    FORK[4].store(tls.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    // Last, because it is what the host tests: the rest must be readable by
+    // the time a non-zero pid appears.
+    FORK[0].store(pid as u64, std::sync::atomic::Ordering::Release);
 }
 
-/// A child `fork` has created that the host has not built a Worker for.
+/// A child `fork` has made that the host has not built a Worker for:
+/// pid, entry pc, context address, child stack, TLS.
 ///
-/// Zero when there is none. Read by `gex_fork_pending`, which is how the host
-/// learns it has a process to start.
-static FORK_PENDING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// Plain words rather than a queue. `fork` returns to the parent immediately
+/// and the host drains this before the parent runs again, so there is only
+/// ever one.
+static FORK: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
-/// The pid of a child waiting for a Worker, taken. Zero when there is none.
+/// The pid of a child needing a Worker, or zero. Does not clear: the host
+/// reads the other four after this and clears with `gex_fork_taken`.
 #[no_mangle]
 pub extern "C" fn gex_fork_pending() -> i32 {
-    FORK_PENDING.swap(0, std::sync::atomic::Ordering::Relaxed)
+    FORK[0].load(std::sync::atomic::Ordering::Acquire) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_pc() -> i64 {
+    FORK[1].load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_ctx() -> i64 {
+    FORK[2].load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_sp() -> i64 {
+    FORK[3].load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_tls() -> i64 {
+    FORK[4].load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+/// The child has been built; stop offering it.
+#[no_mangle]
+pub extern "C" fn gex_fork_taken() {
+    FORK[0].store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// Become the forked child, in a Worker holding a copy of the parent's memory.
+///
+/// The host has already made this Worker's memory and copied every mapped
+/// region of the parent into it, so the guest's image, stack and heap are all
+/// here -- what is missing is a kernel that says this is process `pid`, and
+/// the handful of context words that differ between a parent and its child.
+///
+/// Those words are written here rather than by the parent, because the parent
+/// must not touch them: it is still using that context itself, and the copy
+/// the child received was taken while both were the same process.
+///
+/// Returns the pc to enter at.
+#[no_mangle]
+pub extern "C" fn gex_adopt_child(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls: i64) -> i64 {
+    let ctx_addr = ctx_addr as u64;
+    {
+        let mut gm = GuestMem::new(guest_bytes());
+        // What `fork` returns in the child.
+        let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
+        if sp != 0 {
+            // `posix_spawn` clones onto a stack it allocated; a plain `fork`
+            // passes zero and keeps the parent's.
+            let _ = gm.write_u64(ctx_addr + ctx::SP as u64, sp as u64);
+        }
+        if tls != 0 {
+            let _ = gm.write_u64(ctx_addr + ctx::TPIDR as u64, tls as u64);
+        }
+        // A monitor is per-thread and the child's starts clear.
+        let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
+    }
+    // A kernel of its own. The child's *memory* arrived as a copy; its kernel
+    // state did not, because that is Rust data in the parent's Worker and no
+    // amount of copying guest bytes brings it over.
+    //
+    // What is rebuilt here is the part the child cannot run without: its
+    // identity, its break, and -- through `gex_adopt_vma`, which the host
+    // calls once per region straight after this -- its memory map. Without
+    // the map a child's first `mmap` hands out addresses its image is already
+    // using.
+    //
+    // What is *not* rebuilt, and is the next thing needed: the inherited file
+    // descriptors. The child gets the three standard ones and nothing else,
+    // so a shell pipeline's child still cannot read the pipe it was forked
+    // to read. That wants the file table in the global kernel, next to the
+    // pipes it already holds.
+    let mut kernel = Kernel::new(ctx_addr, 0, String::new());
+    kernel.pid = pid;
+    kernel.tid = pid;
+    set_host(Host {
+        kernel,
+        virgl: None,
+        root: Arc::new(gex_kernel::vfs::TmpFs::new()),
+        proc_state: Arc::new(gex_kernel::KernelProcSource(Arc::new(
+            std::sync::Mutex::new(Default::default()),
+        ))),
+        // The child is one thread: `fork` does not carry the parent's others
+        // across, and in this design they were never in this Worker anyway.
+        threads: vec![Thread {
+            kstate: ThreadState::new(ctx_addr, pid),
+            pc: pc as u64,
+            waiting: Waiting::Runnable,
+            blocked_on: None,
+        }],
+        current: 0,
+        exit: None,
+        resume: None,
+        resume_ctx: None,
+        paused: 0,
+        // Built from the module's `gex.meta`, the same as `gex_load` does:
+        // runtime translation carries on where the ahead-of-time build
+        // stopped, and a child that started from an empty table would report
+        // "nothing to translate" at the first address its parent had not
+        // reached either -- which for a forked child is almost immediately,
+        // because `fork` returns into libc.
+        jit: {
+            let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
+            Jit {
+            described: meta.next_slot != 0,
+            page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
+            translated: Default::default(),
+            registry: Vec::new(),
+            shared: Default::default(),
+            candidates: Vec::new(),
+            pending: Default::default(),
+            blocks: 0,
+            compiles: 0,
+            nanos: 0,
+        }},
+    });
+    pc
+}
+
+/// Record one of the parent's mappings in the adopted child's memory map.
+///
+/// Called once per region by the host, straight after `gex_adopt_child` and
+/// before the child runs. The bytes are already there -- the host copied them
+/// -- but the *map* is Rust state that did not travel, and a child whose map
+/// is empty will `mmap` straight over its own image.
+#[no_mangle]
+pub extern "C" fn gex_adopt_vma(start: i64, end: i64, prot: i32) {
+    with_host(|h| {
+        h.kernel
+            .mem
+            .insert(start as u64, end as u64, prot as u32, "[forked]");
+    });
 }
 
 /// This process has exited. Hand the stack to another, or end the run.
@@ -3711,6 +3877,55 @@ pub extern "C" fn gex_dispatch_slot(addr: i64) -> i32 {
             None => -1,
         }
     })
+}
+
+/// How many guest pages this process has dispatch slots for.
+///
+/// Paired with [`gex_page_at`]. The page table is the map from a guest page
+/// to the slots its translated blocks live in, and it is Rust data in this
+/// Worker's heap -- so a forked child, which gets a copy of the *memory* and
+/// nothing else, arrives without it. What the child does get is the dispatch
+/// directory, copied with the low region, already pointing at those slots.
+/// A child that did not adopt the map would translate a page the directory
+/// says is already translated, into fresh slots, and its next branch into
+/// the old ones would find an empty table entry.
+#[no_mangle]
+pub extern "C" fn gex_page_count() -> u32 {
+    with_host(|h| h.jit.page_table.entries().len() as u32)
+}
+
+/// Write every page assignment to `out` as a `u64` page and a `u32` entry,
+/// twelve bytes each, and return how many were written.
+///
+/// -1 if `cap` bytes will not hold them; ask [`gex_page_count`] first. One
+/// call rather than one per page because the table is a `BTreeMap` and
+/// indexing it costs a walk -- a per-page export made adopting a real
+/// process's map quadratic in the pages it had translated.
+#[no_mangle]
+pub extern "C" fn gex_page_dump(out: u32, cap: u32) -> i32 {
+    with_host(|h| {
+        let entries = h.jit.page_table.entries();
+        if (entries.len() * 12) as u32 > cap {
+            return -1;
+        }
+        let dst = shim_slice_mut(out, (entries.len() * 12) as u32);
+        for (i, (page, entry)) in entries.iter().enumerate() {
+            dst[i * 12..i * 12 + 8].copy_from_slice(&page.to_le_bytes());
+            dst[i * 12 + 8..i * 12 + 12].copy_from_slice(&entry.to_le_bytes());
+        }
+        entries.len() as i32
+    })
+}
+
+/// Take a page's slots from the process this one was forked from.
+///
+/// The claim the caller is making -- that the slots already hold code for
+/// this page -- is true for a fork by construction: the child's text is a
+/// byte-for-byte copy of the parent's at the same addresses, which is the
+/// same claim the cross-process identity map makes for a shared library.
+#[no_mangle]
+pub extern "C" fn gex_adopt_page(page: i64, entry: u32) {
+    with_host(|h| h.jit.page_table.assign(page as u64, entry));
 }
 
 /// Slots one dispatch table holds, so the glue knows where each one ends.
