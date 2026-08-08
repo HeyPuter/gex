@@ -1302,7 +1302,274 @@ impl<'a> Emitter<'a> {
     }
 
     /// Emit a host call whose result stays on the stack.
+    /// A fused multiply-add, without leaving the module.
+    ///
+    /// wasm has no FMA, so this would otherwise be a call to the shim's --
+    /// and nbench's LU decomposition makes 706 million of them in one kernel.
+    /// Removing the call is worth 6x on that kernel in the browser, 3.2x on
+    /// NEURAL NET and 1.2x on FOURIER.
+    ///
+    /// The arithmetic and its guard are in [`crate::fma`], with the fuzzing
+    /// that establishes them; this emits the same steps in wasm. Inlining at
+    /// the site rather than calling a shared function is affordable because
+    /// the sites are few even when the executions are not -- nbench's whole
+    /// binary has about thirty-five.
+    ///
+    /// Returns false when the caller should emit the call after all.
+    fn emit_fma(&mut self, args: &[Value]) -> bool {
+        if args.len() != 4 {
+            return false;
+        }
+        // The precision is a constant the lifter just made, so the shape is
+        // decided here rather than at run time.
+        let double = match self.value_const.get(args[3].0 as usize).copied().flatten() {
+            Some(v) => v != 0,
+            None => return false,
+        };
+        if double {
+            self.emit_fma64(args);
+        } else {
+            self.emit_fmaf(args);
+        }
+        true
+    }
+
+    /// Push an f64 constant.
+    fn f64_const(&mut self, v: f64) {
+        self.f.byte(0x44);
+        for b in v.to_bits().to_le_bytes() {
+            self.f.byte(b);
+        }
+    }
+
+    /// Take the f64 on the stack into a fresh local and leave it there.
+    fn tee_f64(&mut self, l: u32) {
+        self.f.local_tee(l);
+    }
+
+    /// Single precision: the product of two f32 is exact in f64, so only the
+    /// sum can round, and round-to-odd stops the narrowing from breaking a
+    /// tie the wrong way. No guard is needed.
+    fn emit_fmaf(&mut self, args: &[Value]) {
+        let (pl, sl, tl) = (
+            self.f.add_local(ValType::F64),
+            self.f.add_local(ValType::F64),
+            self.f.add_local(ValType::F64),
+        );
+        // Each operand arrives as f32 bits in the low half of an i64.
+        let mut widen = |me: &mut Self, v: Value| {
+            me.push(v);
+            me.f.byte(0xa7); // i32.wrap_i64
+            me.f.byte(0xbe); // f32.reinterpret_i32
+            me.f.byte(0xbb); // f64.promote_f32
+        };
+        widen(self, args[0]);
+        widen(self, args[1]);
+        self.f.byte(0xa2); // f64.mul -- exact
+        self.tee_f64(pl);
+        widen(self, args[2]);
+        self.f.byte(0xa0); // f64.add
+        self.tee_f64(sl);
+
+        // t = (p - (s - bb)) + (c - bb), where bb = s - p.
+        self.f.local_get(pl);
+        self.f.local_get(sl);
+        self.f.local_get(pl);
+        self.f.byte(0xa1); // bb = s - p
+        let bb = self.f.add_local(ValType::F64);
+        self.f.local_tee(bb);
+        // stack: p, s, bb -> p - (s - bb)
+        self.f.byte(0xa1); // s - bb
+        self.f.byte(0xa1); // p - (s - bb)
+        widen(self, args[2]);
+        self.f.local_get(bb);
+        self.f.byte(0xa1); // c - bb
+        self.f.byte(0xa0);
+        self.f.local_set(tl);
+
+        // if t != 0 and s is even, step s one ulp toward t.
+        self.f.local_get(tl);
+        self.f64_const(0.0);
+        self.f.byte(0x61); // f64.eq
+        self.f.byte(0x45); // i32.eqz -> t != 0
+        self.f.local_get(sl);
+        self.f.byte(0xbd); // i64.reinterpret_f64
+        self.f.i64_const(1);
+        self.f.byte(0x83); // i64.and
+        self.f.byte(0x50); // i64.eqz -> low bit clear
+        self.f.byte(0x71); // i32.and
+        self.f.if_result(ValType::F64);
+        {
+            // Toward the error's sign, not simply upward: raising the
+            // magnitude is backwards when the error is negative.
+            self.f.local_get(sl);
+            self.f.byte(0xbd);
+            self.f.local_get(tl);
+            self.f64_const(0.0);
+            self.f.byte(0x64); // f64.gt -- t > 0
+            self.f.local_get(sl);
+            self.f64_const(0.0);
+            self.f.byte(0x64); // s > 0
+            self.f.byte(0x46); // i32.eq -- same sign
+            self.f.if_result(ValType::I64);
+            self.f.i64_const(1);
+            self.f.else_();
+            self.f.i64_const(-1);
+            self.f.end();
+            self.f.byte(0x7c); // i64.add
+            self.f.byte(0xbf); // f64.reinterpret_i64
+        }
+        self.f.else_();
+        self.f.local_get(sl);
+        self.f.end();
+
+        self.f.byte(0xb6); // f32.demote_f64
+        self.f.byte(0xbc); // i32.reinterpret_f32
+        self.f.byte(0xad); // i64.extend_i32_u -- the import's result shape
+    }
+
+    /// Double precision: Dekker's method behind an exponent guard, with the
+    /// call it replaces in the else arm.
+    fn emit_fma64(&mut self, args: &[Value]) {
+        let l = |me: &mut Self| me.f.add_local(ValType::F64);
+        let (al, bl, cl) = (l(self), l(self), l(self));
+        self.push(args[0]);
+        self.f.byte(0xbf);
+        self.f.local_set(al);
+        self.push(args[1]);
+        self.f.byte(0xbf);
+        self.f.local_set(bl);
+        self.push(args[2]);
+        self.f.byte(0xbf);
+        self.f.local_set(cl);
+
+        // The guard: every operand either zero, or with a biased exponent in
+        // the band the fuzzing showed to be exact. The band cannot simply be
+        // "finite" -- a*b doubles the exponent, so operands that are
+        // individually fine overflow their product.
+        for (i, v) in [al, bl, cl].iter().enumerate() {
+            self.emit_in_fast_range(*v);
+            if i > 0 {
+                self.f.byte(0x71); // i32.and
+            }
+        }
+        self.f.if_result(ValType::I64);
+        self.emit_dekker(al, bl, cl);
+        self.f.byte(0xbd); // i64.reinterpret_f64
+        self.f.else_();
+        // Everything the guard rejects goes where it used to.
+        self.f.local_get(self.ctx_local);
+        for a in args {
+            self.push(*a);
+        }
+        self.f.call(self.cx.fma);
+        self.f.end();
+    }
+
+    /// Leave 1 on the stack when the f64 in `v` is one the fast path handles.
+    fn emit_in_fast_range(&mut self, v: u32) {
+        let e = self.f.add_local(ValType::I64);
+        self.f.local_get(v);
+        self.f.byte(0xbd); // i64.reinterpret_f64
+        self.f.i64_const(52);
+        self.f.byte(0x87); // i64.shr_u
+        self.f.i64_const(0x7ff);
+        self.f.byte(0x83); // i64.and
+        self.f.local_tee(e);
+        self.f.i64_const(crate::fma::SAFE_LO as i64);
+        self.f.byte(0x56); // i64.ge_u
+        self.f.local_get(e);
+        self.f.i64_const(crate::fma::SAFE_HI as i64);
+        self.f.byte(0x58); // i64.le_u
+        self.f.byte(0x71); // i32.and
+        // Zero is admitted too, and is carried through exactly.
+        self.f.local_get(v);
+        self.f64_const(0.0);
+        self.f.byte(0x61); // f64.eq
+        self.f.byte(0x72); // i32.or
+    }
+
+    /// `p + e == a*b` exactly, `s + t == p + c` exactly, then one rounding.
+    fn emit_dekker(&mut self, al: u32, bl: u32, cl: u32) {
+        let lf = |me: &mut Self| me.f.add_local(ValType::F64);
+        let (p, e, s, t, tmp) = (lf(self), lf(self), lf(self), lf(self), lf(self));
+        let (ah, al2, bh, bl2) = (lf(self), lf(self), lf(self), lf(self));
+
+        // p = a * b
+        self.f.local_get(al);
+        self.f.local_get(bl);
+        self.f.byte(0xa2);
+        self.f.local_set(p);
+
+        // Split a and b into halves that multiply without error.
+        for (x, hi, lo) in [(al, ah, al2), (bl, bh, bl2)] {
+            self.f.local_get(x);
+            self.f64_const(crate::fma::SPLIT);
+            self.f.byte(0xa2);
+            self.f.local_tee(tmp);
+            self.f.local_get(tmp);
+            self.f.local_get(x);
+            self.f.byte(0xa1); // tmp - x
+            self.f.byte(0xa1); // hi = tmp - (tmp - x)
+            self.f.local_set(hi);
+            self.f.local_get(x);
+            self.f.local_get(hi);
+            self.f.byte(0xa1); // lo = x - hi
+            self.f.local_set(lo);
+        }
+
+        // e = ((ah*bh - p) + ah*bl + al*bh) + al*bl
+        self.f.local_get(ah);
+        self.f.local_get(bh);
+        self.f.byte(0xa2);
+        self.f.local_get(p);
+        self.f.byte(0xa1);
+        self.f.local_get(ah);
+        self.f.local_get(bl2);
+        self.f.byte(0xa2);
+        self.f.byte(0xa0);
+        self.f.local_get(al2);
+        self.f.local_get(bh);
+        self.f.byte(0xa2);
+        self.f.byte(0xa0);
+        self.f.local_get(al2);
+        self.f.local_get(bl2);
+        self.f.byte(0xa2);
+        self.f.byte(0xa0);
+        self.f.local_set(e);
+
+        // s = p + c, and t its exact error.
+        self.f.local_get(p);
+        self.f.local_get(cl);
+        self.f.byte(0xa0);
+        self.f.local_set(s);
+        self.f.local_get(s);
+        self.f.local_get(p);
+        self.f.byte(0xa1);
+        self.f.local_set(tmp); // bb
+        self.f.local_get(p);
+        self.f.local_get(s);
+        self.f.local_get(tmp);
+        self.f.byte(0xa1);
+        self.f.byte(0xa1);
+        self.f.local_get(cl);
+        self.f.local_get(tmp);
+        self.f.byte(0xa1);
+        self.f.byte(0xa0);
+        self.f.local_set(t);
+
+        // The one rounding.
+        self.f.local_get(s);
+        self.f.local_get(t);
+        self.f.local_get(e);
+        self.f.byte(0xa0);
+        self.f.byte(0xa0);
+    }
+
     fn host_call_inline(&mut self, func: HostFunc, args: &[Value]) {
+        if func == HostFunc::Fma && self.emit_fma(args) {
+            return;
+        }
         if func.clobbers_guest_state() {
             self.flush();
         }

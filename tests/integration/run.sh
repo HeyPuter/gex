@@ -551,6 +551,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
 "$CC" -static -O2 -o "$WORK/selfmod" "$HERE/programs/selfmod.c"
+"$CC" -static -O2 -o "$WORK/fma" "$HERE/programs/fma.c"
 "$CC" -static -O2 -o "$WORK/virgl-handshake" "$HERE/programs/virgl-handshake.c"
 "$CC" -static -no-pie -O2 -o "$WORK/init" "$HERE/programs/init.c"
 "$CC" -static -no-pie -O2 -pthread -o "$WORK/forkthread" "$HERE/programs/forkthread.c"
@@ -809,6 +810,12 @@ compare "iov-partial" "$WORK/iov-partial"
 # again is the case that shows it: growing into never-touched memory is clean
 # by accident, because a fresh wasm memory is zero to begin with.
 compare "brk-zero" "$WORK/brk-zero"
+# Fused multiply-add, which wasm does not have and gex now emits inline
+# rather than calling out for. Exactness is the whole claim -- a fused
+# multiply-add differs from an unfused one in the last place -- so every
+# value is compared as a bit pattern, over ordinary magnitudes, random bit
+# patterns, the exponent band's edges and zeros.
+compare "fma" "$WORK/fma"
 compare "signal-kill" "$WORK/signal-kill"
 compare "signal-alarm" "$WORK/signal-alarm"
 compare "signal-sigchld" "$WORK/signal-sigchld"

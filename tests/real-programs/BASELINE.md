@@ -45,6 +45,30 @@ loops over arrays, where a template-JIT's per-block overhead is small and its
 register allocation is good. These are the kernels a tier-2 pass would have to
 earn its keep on.
 
+## What the FMA call costs
+
+The same suite built with `GEX_INLINE_FMA=1`, which replaces every fused
+multiply-add with an unfused multiply and add. That is *wrong* -- it rounds
+twice -- so it measures the prize rather than claiming it.
+
+Compare the multipliers, not the raw rates: QEMU's own numbers moved 20-30%
+between the two runs, so the machine was not the same, and the ratio is what
+divides that out.
+
+| KERNEL           | browser, fused | browser, inlined |        |
+|------------------|----------------|------------------|--------|
+| LU DECOMPOSITION | 3.82x          | 23.11x           | 6.0x   |
+| NEURAL NET       | 11.24x         | 36.18x           | 3.2x   |
+| FOURIER          | 16.55x         | 19.51x           | 1.2x   |
+| everything else  | --             | unchanged        | noise  |
+
+Exactly the three floating-point kernels, and in the order the static counts
+predict: `DoNNetIteration` has 18 fused multiply-adds, `lusolve` 5 and `DoLU`
+3, `DoFourier` 1. The rest of the table has none and does not move.
+
+`crates/gex-emit/src/fma.rs` has arithmetic that is exact and can therefore
+ship; what is left is to lower it instead of the call.
+
 ## Caveats worth keeping
 
 * MINSECONDS=2 is short. Most kernels print "NOT 95 % statistically certain",
