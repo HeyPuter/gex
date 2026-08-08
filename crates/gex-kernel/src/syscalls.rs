@@ -925,6 +925,28 @@ impl Kernel {
     /// Used to load an `execve` target and its interpreter, so the program
     /// that runs is the one the guest can see -- the sysroot's `/bin/sh`, not
     /// the host's.
+    /// Read one range of a file straight into `out`, returning how many
+    /// bytes were filled. The rest of `out` is left alone.
+    ///
+    /// `read_file` reads the whole thing, which is the wrong shape when the
+    /// caller wants a page of it: restoring a suspended process's read-only
+    /// mappings from their files reads libc for a 4 KiB mapping of libc, and
+    /// Mesa's driver is fifteen megabytes. That showed up as a third of the
+    /// remaining `memcpy` in a profile of the gears demo -- the copy the
+    /// switcher no longer does, done again one layer down.
+    pub fn read_file_at(&self, path: &str, offset: u64, out: &mut [u8]) -> Option<usize> {
+        let h = self.vfs.open(path, 0, 0).ok()?;
+        let mut done = 0usize;
+        while done < out.len() {
+            let n = h.read_at(offset + done as u64, &mut out[done..]).ok()? as usize;
+            if n == 0 {
+                break;
+            }
+            done += n;
+        }
+        Some(done)
+    }
+
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let h = self.vfs.open(path, 0, 0).ok()?;
         let mut out = Vec::new();

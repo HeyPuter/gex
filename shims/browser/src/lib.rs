@@ -1810,14 +1810,14 @@ fn restore_memory(k: &Kernel, snapshot: &[Region]) {
                 if a >= b {
                     continue;
                 }
+                // Only the mapped range, straight into guest memory.
+                // Reading the whole file to copy a slice out of it is the
+                // copy this was meant to avoid, moved one layer down.
+                //
                 // Whatever the file cannot supply is zero, which is what a
                 // mapping past the end of a file reads as anyway.
-                let want = b - a;
-                match k.read_file(path) {
-                    Some(f) => {
-                        let from = (*offset as usize).min(f.len());
-                        let have = (f.len() - from).min(want);
-                        data[a..a + have].copy_from_slice(&f[from..from + have]);
+                match k.read_file_at(path, *offset, &mut data[a..b]) {
+                    Some(have) => {
                         data[a + have..b].fill(0);
                     }
                     None => {
