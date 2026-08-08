@@ -1973,6 +1973,40 @@ fn waiting_name(w: &Waiting) -> &'static str {
 /// start from zero every time and never notice it was getting nowhere.
 static IDLE_SPINS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// One turn of the scheduler found nothing to run. Say so, occasionally.
+///
+/// On a curve rather than every time: a guest genuinely waiting for a
+/// keystroke passes through here a thousand times a second quite
+/// legitimately, and a line for each would bury the run it is meant to
+/// explain. The powers of two mean a wait that resolves says nothing at all,
+/// and a wait that does not gets louder in proportion to how wrong it is.
+fn report_idle(why: u8) {
+    let n = IDLE_SPINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if !n.is_power_of_two() || n < 1024 {
+        return;
+    }
+    let census = with_host(|h| {
+        let mut out = String::new();
+        for (pid, p) in std::iter::once((0usize, &h.threads))
+            .chain(h.suspended.iter().enumerate().map(|(i, p)| (i + 1, &p.threads)))
+        {
+            for (i, t) in p.iter().enumerate() {
+                out.push_str(&format!(" {pid}.{i}={}", waiting_name(&t.waiting)));
+            }
+        }
+        out
+    });
+    let asked = match why {
+        0 => "nothing the page can supply",
+        1 => "a keystroke",
+        2 => "the event loop to turn",
+        _ => "a keystroke and the event loop",
+    };
+    trace_line(&format!(
+        "[gex] {n} turns with nothing runnable, wanting {asked}, threads:{census}\n"
+    ));
+}
+
 fn schedule() -> i32 {
     loop {
         // Before anything is chosen. A vtest client writes a request and then
@@ -2133,6 +2167,13 @@ fn schedule() -> i32 {
                 mask
             });
             if why != 0 {
+                // Also counted, and this is the case that hides. Handing the
+                // stack back for a wait the page can satisfy is exactly
+                // right; doing it a thousand times a second for a wait
+                // nothing will ever satisfy is a hang that costs no CPU and
+                // says nothing, which is how the first frame of glxgears was
+                // followed by silence rather than by a second frame.
+                report_idle(why);
                 with_host(|h| h.paused = why);
                 return 2;
             }
@@ -2165,27 +2206,7 @@ fn schedule() -> i32 {
             // So say what everything is waiting for, once, and then hand the
             // stack back. Yielding cannot be wrong when nothing can run: at
             // worst the page turns its event loop and gives it straight back.
-            let idle_spins =
-                IDLE_SPINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            // On a curve. A guest that is genuinely waiting for a keystroke
-            // passes through here every millisecond quite legitimately, and a
-            // line for each would bury the run it is meant to explain.
-            if idle_spins.is_power_of_two() && idle_spins >= 1024 {
-                let census = with_host(|h| {
-                    let mut out = String::new();
-                    for (pid, p) in std::iter::once((0usize, &h.threads))
-                        .chain(h.suspended.iter().enumerate().map(|(i, p)| (i + 1, &p.threads)))
-                    {
-                        for (i, t) in p.iter().enumerate() {
-                            out.push_str(&format!(" {pid}:{i}={}", waiting_name(&t.waiting)));
-                        }
-                    }
-                    out
-                });
-                trace_line(&format!(
-                    "[gex] nothing runnable after {idle_spins} turns, waiting on:{census}\n"
-                ));
-            }
+            report_idle(0);
             with_host(|h| h.paused = 2);
             return 2;
         };
