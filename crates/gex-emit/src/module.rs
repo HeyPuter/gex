@@ -108,16 +108,34 @@ impl PageTable {
         PageTable::from_entries(&[], MISS_SLOTS)
     }
 
-    /// The base slot for a page, allocating one if it has none.
+    /// Slots one table holds, rounded down so a page never straddles two.
+    ///
+    /// V8 refuses to grow a table past ten million however it was declared,
+    /// and a page's 1024 slots are allocated and written as a unit, so the
+    /// usable size is the largest whole number of pages under the cap.
+    pub const SLOTS_PER_TABLE: u64 = (gex_abi::DISPATCH_TABLE_MAX_SLOTS / SLOTS_PER_PAGE)
+        * SLOTS_PER_PAGE;
+
+    /// The directory entry for a page, allocating slots if it has none.
+    ///
+    /// Allocation is linear in one *virtual* slot space that spans every
+    /// table; which table a page lands in is that number divided by the size
+    /// of a table. Keeping one counter is what makes the cross-process
+    /// identity map still work -- a page adopted from another process brings
+    /// its whole entry, table index and all, and means the same thing.
     pub fn base(&mut self, page: u64) -> u32 {
         if let Some(&b) = self.pages.get(&page) {
             return b;
         }
-        let base = self
+        let v = self
             .next_slot
-            .fetch_add(SLOTS_PER_PAGE, std::sync::atomic::Ordering::SeqCst) as u32;
-        self.pages.insert(page, base);
-        base
+            .fetch_add(SLOTS_PER_PAGE, std::sync::atomic::Ordering::SeqCst);
+        let entry = gex_abi::dispatch_entry(
+            (v / Self::SLOTS_PER_TABLE) as usize,
+            (v % Self::SLOTS_PER_TABLE) as u32,
+        );
+        self.pages.insert(page, entry);
+        entry
     }
 
     /// Point a page at slots that already hold code for it.
@@ -130,8 +148,21 @@ impl PageTable {
     ///
     /// The caller owns the claim that the bytes match. Assigning a base whose
     /// slots hold something else is the same defect as reusing a freed one.
-    pub fn assign(&mut self, page: u64, base: u32) {
-        self.pages.insert(page, base);
+    pub fn assign(&mut self, page: u64, entry: u32) {
+        self.pages.insert(page, entry);
+        // And make sure this table never hands the same slots out again, and
+        // that the host grows its tables far enough to contain them.
+        //
+        // An adopted page was allocated by somebody else, so it can sit above
+        // anything this table has issued -- and `slots()` is what the host
+        // grows to. Without this the directory names slots the table has not
+        // got, and the guest's next indirect branch into that page is a
+        // `table index is out of bounds` a long way from the cause.
+        let end = gex_abi::dispatch_entry_table(entry) as u64 * Self::SLOTS_PER_TABLE
+            + gex_abi::dispatch_entry_base(entry) as u64
+            + SLOTS_PER_PAGE;
+        self.next_slot
+            .fetch_max(end, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The base slot for a page, if it already has one.
@@ -425,9 +456,14 @@ impl ModuleBuilder {
             shared_memory,
         );
         if linkage == Linkage::Shared {
-            // The table comes from the image module, so this one's blocks
-            // dispatch through exactly the same slots.
-            m.import_table(IMPORT_MODULE, exports::DISPATCH_TABLE, 0);
+            // The tables come from the image module, so this one's blocks
+            // dispatch through exactly the same slots. All of them are
+            // imported whether or not this module's pages reach past the
+            // first: the block bodies select between them with a `br_table`
+            // over every table index, so every index has to exist.
+            for i in 0..gex_abi::DISPATCH_TABLES {
+                m.import_table(IMPORT_MODULE, exports::dispatch_table(i), 0);
+            }
         }
 
         // The miss stub and `enter` are the first two local functions, so
@@ -460,7 +496,9 @@ impl ModuleBuilder {
             // first, so memory 0 is the host's; exporting it is what gives
             // each store an ordinary `Memory` handle to the shared bytes.
             b.m.export(exports::MEMORY, ExportKind::Memory, 0);
-            b.m.export(exports::DISPATCH_TABLE, ExportKind::Table, 0);
+            for i in 0..gex_abi::DISPATCH_TABLES {
+                b.m.export(exports::dispatch_table(i), ExportKind::Table, i as u32);
+            }
         }
         b.m.export(exports::ENTER, ExportKind::Func, enter);
         b
@@ -587,14 +625,28 @@ impl ModuleBuilder {
             Linkage::Own => {
                 self.m
                     .set_table(table_slots as u32, gex_abi::DISPATCH_TABLE_MAX_SLOTS as u32);
+                // A whole-program module's pages all live in table 0 -- one
+                // program's text is nowhere near the ceiling. The rest are
+                // declared empty so that the `br_table` in every block body
+                // has a table for each of its arms.
+                for _ in 1..gex_abi::DISPATCH_TABLES {
+                    self.m.set_table(0, gex_abi::DISPATCH_TABLE_MAX_SLOTS as u32);
+                }
                 // Every slot starts as the miss stub; translated blocks then
                 // overwrite the ones they own. A branch anywhere else asks
                 // the host to translate rather than trapping.
                 let mut funcs = vec![self.miss_stub; table_slots as usize];
                 for (&addr, &f) in &self.blocks {
                     let page = dispatch_page(addr);
-                    if let Some(base) = self.page_table.lookup(page) {
-                        let idx = base as u64 + ((addr % DISPATCH_PAGE) >> 2);
+                    if let Some(entry) = self.page_table.lookup(page) {
+                        // Masked, not used raw: a directory entry carries the
+                        // table index in its top bits now. A whole-program
+                        // module's pages are all in table 0 -- one program's
+                        // text is nowhere near ten million slots -- so the
+                        // mask is what makes that assumption explicit rather
+                        // than silently indexing by a table number.
+                        debug_assert_eq!(gex_abi::dispatch_entry_table(entry), 0);
+                        let idx = gex_abi::dispatch_index(addr, entry);
                         if (idx as usize) < funcs.len() {
                             funcs[idx as usize] = f;
                         }
@@ -650,11 +702,15 @@ impl ModuleBuilder {
                 // Only the interior is filled. Trailing slots past the last
                 // translated block cost nothing to leave alone.
                 for (page, mut blocks) in by_page {
-                    let Some(base) = self.page_table.lookup(page) else {
+                    let Some(entry) = self.page_table.lookup(page) else {
                         continue;
                     };
+                    // Which table this page lives in. A page is allocated and
+                    // written as a unit and never straddles two, so one
+                    // segment still covers it.
+                    let table = gex_abi::dispatch_entry_table(entry) as u32;
                     blocks.sort_by_key(|(a, _)| *a);
-                    let slot = |addr: u64| base as u64 + ((addr % DISPATCH_PAGE) >> 2);
+                    let slot = |addr: u64| gex_abi::dispatch_index(addr, entry);
                     let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
                         continue;
                     };
@@ -665,7 +721,7 @@ impl ModuleBuilder {
                         funcs[(slot(*addr) - start) as usize] = *f;
                     }
                     self.m.element(ElementSegment {
-                        table: 0,
+                        table,
                         offset: start as u32,
                         funcs,
                     });

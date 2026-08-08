@@ -190,6 +190,16 @@ struct Emitter<'a> {
     scratch_i32: u32,
     /// Scratch for the dispatch page index.
     scratch_page: u32,
+    /// Scratch for a directory entry, and then for the table it names.
+    ///
+    /// Only used when there is more than one dispatch table; with one, the
+    /// entry is consumed on the stack and never needs a name.
+    scratch_entry: u32,
+    /// Scratch for the computed slot, held across the `br_table`.
+    ///
+    /// A value pushed outside a `block` cannot be consumed inside one, so the
+    /// index has to be in a local before the selection starts.
+    scratch_index: u32,
     /// Locals holding live GIR values.
     value_local: Vec<Option<u32>>,
     /// Constant value of each GIR value, when known.
@@ -232,6 +242,8 @@ impl<'a> Emitter<'a> {
         let scratch_i64 = f.add_local(ValType::I64);
         let scratch_i32 = f.add_local(ValType::I32);
         let scratch_page = f.add_local(ValType::I64);
+        let scratch_entry = f.add_local(ValType::I32);
+        let scratch_index = f.add_local(ValType::I32);
         Emitter {
             f,
             cx,
@@ -239,6 +251,8 @@ impl<'a> Emitter<'a> {
             scratch_i64,
             scratch_i32,
             scratch_page,
+            scratch_entry,
+            scratch_index,
             value_local: Vec::new(),
             value_const: Vec::new(),
             value_ty: Vec::new(),
@@ -1773,9 +1787,7 @@ impl<'a> Emitter<'a> {
                 // deliver a signal and unwind from here safely. The pc
                 // passed is this branch's own, which is what a trace wants.
                 self.emit_safepoint_no_flush(block.end - 4);
-                self.f.local_get(self.ctx_local);
-                self.emit_dispatch_index();
-                self.f.return_call_indirect(self.cx.block_ty, 0);
+                self.emit_dispatch_tail_call();
             }
             Term::Syscall { next } => {
                 self.flush();
@@ -1926,11 +1938,9 @@ impl<'a> Emitter<'a> {
         // the miss stub, and it can change as translation proceeds, so even a
         // constant target has to be looked up at run time.
         self.store_pc(target);
-        self.f.local_get(self.ctx_local);
         self.f.i64_const(target as i64);
         self.f.local_set(self.scratch_i64);
-        self.emit_dispatch_index();
-        self.f.return_call_indirect(self.cx.block_ty, 0);
+        self.emit_dispatch_tail_call();
     }
 
     /// Consume the target address in `scratch_i64` and leave a dispatch-table
@@ -1942,6 +1952,18 @@ impl<'a> Emitter<'a> {
     /// to translate. An address beyond the directory's reach selects zero the
     /// same way, so it needs no separate test either.
     fn emit_dispatch_index(&mut self) {
+        self.emit_dispatch_entry();
+        self.mask_slot_bits();
+        self.add_page_offset();
+    }
+
+    /// Load the directory entry for the address in `scratch_i64`.
+    ///
+    /// Split out from the index arithmetic because with several tables the
+    /// entry is wanted twice -- once for its table index and once for its
+    /// base slot -- and loading it twice would mean two loads on every
+    /// indirect branch.
+    fn emit_dispatch_entry(&mut self) {
         // page = pc >> 12
         self.f.local_get(self.scratch_i64);
         self.f.i64_const(DISPATCH_PAGE.trailing_zeros() as i64);
@@ -1959,8 +1981,21 @@ impl<'a> Emitter<'a> {
         self.f.i64_const(DISPATCH_MAX_PAGES as i64);
         self.f.byte(code::I64_LT_U);
         self.f.select();
+    }
 
-        // index = entry + ((pc & 0xfff) >> 2)
+    /// Drop the table index from an entry on the stack, leaving the base slot.
+    ///
+    /// Skipped entirely with one table, where the top bits are always zero
+    /// and the mask would be an instruction that can never change anything.
+    fn mask_slot_bits(&mut self) {
+        if gex_abi::DISPATCH_TABLES > 1 {
+            self.f.i32_const(gex_abi::DISPATCH_SLOT_MASK as i32);
+            self.f.byte(0x71); // i32.and
+        }
+    }
+
+    /// index += (pc & 0xfff) >> 2
+    fn add_page_offset(&mut self) {
         self.f.local_get(self.scratch_i64);
         self.f.i64_const((DISPATCH_PAGE - 1) as i64);
         self.f.byte(0x83); // i64.and
@@ -1968,6 +2003,79 @@ impl<'a> Emitter<'a> {
         self.f.byte(0x88); // i64.shr_u
         self.f.byte(0xa7); // i32.wrap_i64
         self.f.byte(0x6a); // i32.add
+    }
+
+    /// Tail-call the block at the address in `scratch_i64`, through whichever
+    /// dispatch table its page lives in.
+    ///
+    /// With one table this is what it always was: compute the index, then a
+    /// single `return_call_indirect`. One table cannot hold a real
+    /// application, though -- see `DISPATCH_TABLES` -- so the entry also
+    /// carries which of several it means, in the eight bits above the slot,
+    /// and the choice is a `br_table` over one tail call per table:
+    ///
+    ///     block            ; falls through to table 0, and is the default
+    ///       block          ; ... to table 1
+    ///         ...
+    ///           local.get tbl
+    ///           br_table N-1 ... 1 0 N-1
+    ///         end
+    ///         ; table N-1: ctx, index, return_call_indirect ty N-1
+    ///       end
+    ///       ...
+    ///
+    /// Entry zero still means "no translation": table 0, and a slot inside
+    /// the reserved miss span at the bottom of it. So an untranslated page,
+    /// an address past the directory's reach and a genuine table-0 block all
+    /// take the same path with no test between them, which is the property
+    /// the single-table version had and the one worth keeping.
+    ///
+    /// The index and the table are computed into locals before the blocks
+    /// start, because a value pushed outside a `block` cannot be consumed
+    /// inside one.
+    fn emit_dispatch_tail_call(&mut self) {
+        if gex_abi::DISPATCH_TABLES <= 1 {
+            self.f.local_get(self.ctx_local);
+            self.emit_dispatch_index();
+            self.f.return_call_indirect(self.cx.block_ty, 0);
+            return;
+        }
+        let n = gex_abi::DISPATCH_TABLES as u32;
+        let entry = self.scratch_entry;
+        let index = self.scratch_index;
+
+        self.emit_dispatch_entry();
+        self.f.local_tee(entry);
+        self.mask_slot_bits();
+        self.add_page_offset();
+        self.f.local_set(index);
+
+        // tbl = entry >> 24, reusing the entry local now its base is spent.
+        self.f.local_get(entry);
+        self.f.i32_const(gex_abi::DISPATCH_SLOT_BITS as i32);
+        self.f.byte(0x76); // i32.shr_u
+        self.f.local_set(entry);
+
+        // `n` blocks, not `n-1`: the region *inside* the innermost one is
+        // unreachable, because `br_table` always branches. Each `end` opens a
+        // reachable region and there must be one per table.
+        for _ in 0..n {
+            self.f.block_void();
+        }
+        self.f.local_get(entry);
+        // Depth 0 is the innermost block, so its `end` is the first region
+        // emitted and belongs to the last table. Table k breaks to depth
+        // `n-1-k`; the default is table 0's depth, which is where an entry
+        // naming a table that does not exist ends up -- the miss stub, for a
+        // directory that has been scribbled on.
+        let targets: Vec<u32> = (0..n).map(|k| n - 1 - k).collect();
+        self.f.br_table(&targets, n - 1);
+        for k in (0..n).rev() {
+            self.f.end();
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(index);
+            self.f.return_call_indirect(self.cx.block_ty, k);
+        }
     }
 }
 

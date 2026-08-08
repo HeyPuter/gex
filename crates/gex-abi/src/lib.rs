@@ -182,6 +182,60 @@ pub const DISPATCH_DIR_END: u64 = DISPATCH_DIR + DISPATCH_DIR_BYTES;
 /// with no indication that the limit was the engine's.
 pub const DISPATCH_TABLE_MAX_SLOTS: u64 = 10_000_000;
 
+/// How many dispatch tables there are.
+///
+/// One table cannot hold a real application. The graphics rootfs is 89.5 MiB
+/// of guest text across 73 objects -- 46 of it libLLVM, 17 libz3, 15 Mesa's
+/// rasteriser -- and a slot per four-byte address makes that 23,457,792
+/// slots against V8's ten million, which is 38 MiB of text. Static
+/// recompilation of that rootfs is 2.3x over the ceiling, and the
+/// `--recompile-objects` cap of 8 MiB that "works" works precisely because it
+/// excludes the three big objects.
+///
+/// wasm allows many tables and `call_indirect` names one, so the ceiling is
+/// per table rather than per program. Eight of them is 80,000,000 slots, or
+/// 305 MiB of guest text.
+///
+/// The cost is a `br_table` on the indirect-branch path, and only there:
+/// direct branches use `return_call` and never look at a table. Set this to 1
+/// and the emitter goes back to a single `return_call_indirect` with no
+/// selection at all, byte for byte what it emitted before there were several
+/// -- which is what makes the cost of the change measurable rather than
+/// argued about.
+pub const DISPATCH_TABLES: usize = 8;
+
+/// Bits of a directory entry that hold the slot; the rest hold the table.
+///
+/// Ten million needs 24 bits, so the top eight of the `u32` were free. That
+/// is where the table index goes, which is why several tables cost nothing in
+/// the directory -- no second array, no wider entry, no extra load.
+pub const DISPATCH_SLOT_BITS: u32 = 24;
+
+/// Mask of the slot half of a directory entry.
+pub const DISPATCH_SLOT_MASK: u32 = (1u32 << DISPATCH_SLOT_BITS) - 1;
+
+/// Pack a table index and a base slot into a directory entry.
+///
+/// Entry zero has to keep meaning "no translation, table 0, the miss span",
+/// because that is what an unwritten directory reads as and what makes the
+/// lookup branchless.
+#[inline]
+pub const fn dispatch_entry(table: usize, base: u32) -> u32 {
+    ((table as u32) << DISPATCH_SLOT_BITS) | (base & DISPATCH_SLOT_MASK)
+}
+
+/// The table a directory entry names.
+#[inline]
+pub const fn dispatch_entry_table(entry: u32) -> usize {
+    (entry >> DISPATCH_SLOT_BITS) as usize
+}
+
+/// The base slot a directory entry names, within its own table.
+#[inline]
+pub const fn dispatch_entry_base(entry: u32) -> u32 {
+    entry & DISPATCH_SLOT_MASK
+}
+
 /// Directory index for a guest address.
 #[inline]
 pub const fn dispatch_page(pc: u64) -> u64 {
@@ -275,6 +329,31 @@ pub mod exports {
     pub const MEMORY: &str = "memory";
     /// The PC-indexed dispatch table of translated block entry points.
     pub const DISPATCH_TABLE: &str = "dispatch";
+
+    /// The rest of them. There is more than one because V8 caps a table at
+    /// ten million entries and a real application needs more; see
+    /// [`super::DISPATCH_TABLES`].
+    ///
+    /// Table 0 keeps the bare name it always had, so a module built before
+    /// there were several still names the same thing -- and so the miss span,
+    /// which lives at the bottom of table 0, is where an unwritten directory
+    /// entry of zero has always pointed.
+    pub const DISPATCH_TABLE_N: [&str; 8] = [
+        "dispatch",
+        "dispatch1",
+        "dispatch2",
+        "dispatch3",
+        "dispatch4",
+        "dispatch5",
+        "dispatch6",
+        "dispatch7",
+    ];
+
+    /// The name of dispatch table `i`.
+    pub const fn dispatch_table(i: usize) -> &'static str {
+        DISPATCH_TABLE_N[i]
+    }
+
     /// `(ctx: i32, pc: i64) -> ()`: enter translated code at `pc`.
     pub const ENTER: &str = "enter";
 }
@@ -307,9 +386,13 @@ pub const CTR_EL0: u64 = 0x8444_c004;
 pub const CNTFRQ: u64 = 1_000_000_000;
 
 /// Table slot for a guest address, given its page's directory entry.
+///
+/// Takes the whole entry, table index and all, and masks: a caller that
+/// already had the base can pass it unchanged, because a base is an entry
+/// whose table happens to be zero.
 #[inline]
-pub const fn dispatch_index(pc: u64, page_base: u32) -> u64 {
-    page_base as u64 + ((pc % DISPATCH_PAGE) >> 2)
+pub const fn dispatch_index(pc: u64, page_entry: u32) -> u64 {
+    dispatch_entry_base(page_entry) as u64 + ((pc % DISPATCH_PAGE) >> 2)
 }
 
 #[cfg(test)]

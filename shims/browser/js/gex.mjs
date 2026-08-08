@@ -62,6 +62,24 @@ function metadataSection(wasm) {
   return null;
 }
 
+// The dispatch tables a translated module imports and exports, in index
+// order. Table 0 keeps the bare name it had when there was only one, so a
+// module built before there were several still names the same thing.
+//
+// There is more than one because V8 caps a table at ten million entries,
+// which at a slot per four-byte guest address is 38 MiB of text -- and the
+// graphics rootfs is 89.5 MiB. See #64.
+const TABLE_NAMES = [
+  'dispatch',
+  'dispatch1',
+  'dispatch2',
+  'dispatch3',
+  'dispatch4',
+  'dispatch5',
+  'dispatch6',
+  'dispatch7',
+];
+
 export class Gex {
   #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #virgl = null; #virglTrace = false;
 
@@ -475,9 +493,24 @@ export class Gex {
             used >= 0 && total > 0
               ? `, heap ${(used / 1024).toFixed(0)}/${(total / 1024).toFixed(0)} MiB`
               : '';
+          // And where dispatch thought that address lived. "table index is
+          // out of bounds" means a `return_call_indirect` ran off the end of
+          // whichever table the page directory named, and the two numbers
+          // that settle it are the slot it wanted and how long that table
+          // actually is -- neither of which the engine's message carries.
+          let dispatch = '';
+          if (e.gex_dispatch_slot) {
+            const packed = e.gex_dispatch_slot(pc);
+            const tables = this.#dispatchTables();
+            const lens = tables.map((t) => t.length).join(',');
+            dispatch =
+              packed < 0
+                ? `, no slots for this page, tables ${lens}`
+                : `, table ${packed >>> 24} slot ${packed & 0xffffff}, tables ${lens}`;
+          }
           err.message +=
             ` (guest pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}${where}` +
-            `, ctx=0x${ctx.toString(16)}${heap})`;
+            `, ctx=0x${ctx.toString(16)}${heap}${dispatch})`;
         }
         if (String(err).includes("unreachable")) {
           return e.gex_exit_code();
@@ -501,26 +534,60 @@ export class Gex {
     const ptr = e.gex_jit_pending_ptr() >>> 0;
     const len = e.gex_jit_pending_len() >>> 0;
     const bytes = this.#u8.slice(ptr, ptr + len);
-    const table = this.#guest.exports.dispatch;
+    const tables = this.#dispatchTables();
+    // The shim allocates in one slot space that spans every table, so the
+    // figure it reports is a running total and each table's share is that
+    // total clamped to its own window. Several tables exist because V8 caps
+    // one at ten million entries, which is 38 MiB of guest text -- less than
+    // half the graphics rootfs. See #64.
+    // Finite, not `Infinity`: the window arithmetic multiplies this by the
+    // table index, and `0 * Infinity` is `NaN`, which reaches `Table.grow`
+    // as "Argument 0 must be convertible to a valid number" and says nothing
+    // about where it came from. A shim from before this export existed has
+    // one table, so any number too large to reach is the right answer.
+    const per = (e.gex_slots_per_table?.() ?? 0) >>> 0 || Number.MAX_SAFE_INTEGER;
     const need = e.gex_jit_slots() >>> 0;
-    if (table.length < need) {
+    // Table 0's slot 0 is the miss stub, and it is what an unfilled slot in
+    // any table must hold: a branch to an address nothing has translated has
+    // to reach the host, not a stale function. Tables past the first start
+    // empty, so they have no element 0 of their own to grow from.
+    const stub = tables[0].get(0);
+    for (let i = 0; i < tables.length; i++) {
+      const want = Math.min(Math.max(need - i * per, 0), per);
+      if (tables[i].length >= want) continue;
       try {
-        table.grow(need - table.length, table.get(0));
+        tables[i].grow(want - tables[i].length, stub);
       } catch (err) {
         throw new Error(
-          `the dispatch table would not grow from ${table.length} to ${need}: ${err.message}`,
+          `dispatch table ${i} would not grow from ${tables[i].length} to ${want}: ${err.message}`,
         );
       }
     }
+    const imports = { ...this.#imports };
+    for (let i = 0; i < tables.length; i++) imports[TABLE_NAMES[i]] = tables[i];
     const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
-      gex: { ...this.#imports, dispatch: table },
+      gex: imports,
     });
     for (const name of Object.keys(inst.exports)) {
       if (name[0] !== 'b') continue;
-      const slot = e.gex_dispatch_slot(BigInt('0x' + name.slice(1)));
-      if (slot >= 0) table.set(slot >>> 0, inst.exports[name]);
+      // The shim packs the table index into the top eight bits, the same way
+      // a directory entry does.
+      const packed = e.gex_dispatch_slot(BigInt('0x' + name.slice(1)));
+      if (packed < 0) continue;
+      tables[packed >>> 24].set(packed & 0xffffff, inst.exports[name]);
     }
     e.gex_jit_installed();
+  }
+
+  /** Every dispatch table the guest module exports, in index order. */
+  #dispatchTables() {
+    const out = [];
+    for (const n of TABLE_NAMES) {
+      const t = this.#guest.exports[n];
+      if (!t) break;
+      out.push(t);
+    }
+    return out;
   }
 
 }

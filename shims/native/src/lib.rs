@@ -292,7 +292,14 @@ struct Jit {
     shared: Arc<Mutex<JitShared>>,
     engine: Engine,
     linker: Linker<HostState>,
-    table: Table,
+    /// Every dispatch table, in index order; `tables[0]` is the one that
+    /// holds the miss span and everything a program this size ever needs.
+    ///
+    /// There are several because V8 caps a table at ten million entries, and
+    /// the emitted code selects between them with a `br_table`, so every
+    /// index the code names has to exist even here where nothing reaches the
+    /// second. Natively there is no such cap and tables 1 and up stay empty.
+    tables: Vec<Table>,
     /// Where compiled runtime translations are kept, and the build they
     /// belong to. `None` when the cache is off or this build cannot name
     /// itself.
@@ -794,10 +801,8 @@ fn run_program_with(
     // Runtime translation needs the table to patch and the engine and linker
     // to build new modules with. Holding them here is what lets a dispatch
     // miss become a translation rather than an error.
-    let table = match instance.get_export(&mut store, exports::DISPATCH_TABLE) {
-        Some(Extern::Table(t)) => t,
-        _ => bail!("translated module does not export its dispatch table"),
-    };
+    let tables = dispatch_tables(&mut store, &instance)?;
+    let table = tables[0];
     // The machinery here is "install a translated module into this store": a
     // table, a linker, a registry other stores replay from. Translating on a
     // dispatch miss is one user of it; statically recompiling a whole object
@@ -815,7 +820,7 @@ fn run_program_with(
             })),
             engine: engine.clone(),
             linker: linker.clone(),
-            table,
+            tables,
             cache: jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
@@ -1535,16 +1540,14 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
     let instance = linker
         .instantiate(&mut store, &cx.image_module)
         .context("instantiating the image module for a child process")?;
-    let table = match instance.get_export(&mut store, exports::DISPATCH_TABLE) {
-        Some(Extern::Table(t)) => t,
-        _ => bail!("translated module does not export its dispatch table"),
-    };
+    let tables = dispatch_tables(&mut store, &instance)?;
+    let table = tables[0];
     if let Some(shared) = &cx.jit_shared {
         store.data_mut().jit = Some(Jit {
             shared: Arc::clone(shared),
             engine: cx.engine.clone(),
             linker: cx.linker.clone(),
-            table,
+            tables,
             cache: cx.jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
@@ -1670,16 +1673,14 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
     let instance = linker
         .instantiate(&mut store, &cx.image_module)
         .context("instantiating the image module for a new thread")?;
-    let table = match instance.get_export(&mut store, exports::DISPATCH_TABLE) {
-        Some(Extern::Table(t)) => t,
-        _ => bail!("translated module does not export its dispatch table"),
-    };
+    let tables = dispatch_tables(&mut store, &instance)?;
+    let table = tables[0];
     if let Some(shared) = &cx.jit_shared {
         store.data_mut().jit = Some(Jit {
             shared: Arc::clone(shared),
             engine: cx.engine.clone(),
             linker: cx.linker.clone(),
-            table,
+            tables,
             cache: cx.jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
@@ -3016,7 +3017,7 @@ fn install_unit(
     mut cx: impl wasmtime::AsContextMut<Data = HostState>,
     unit: &CompiledUnit,
 ) -> Result<()> {
-    let (memory, linker, table) = {
+    let (memory, linker, tables) = {
         let data = cx.as_context().data();
         let jit = data
             .jit
@@ -3027,18 +3028,25 @@ fn install_unit(
                 .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?,
             jit.linker.clone(),
-            jit.table,
+            jit.tables.clone(),
         )
     };
-
-    let have = table.size(cx.as_context_mut());
-    if unit.table_slots > have {
-        let miss = table
-            .get(cx.as_context_mut(), 0)
-            .ok_or_else(|| anyhow!("dispatch table is empty"))?;
-        table
-            .grow(cx.as_context_mut(), unit.table_slots - have, miss)
-            .context("growing the dispatch table")?;
+    // Slots are allocated in one space that spans every table, so the figure
+    // the unit carries is a running total and each table's share is that
+    // total clamped to its own window. Natively only the first ever has any.
+    let per = gex_xlate::PageTable::SLOTS_PER_TABLE as u64;
+    let miss = tables[0]
+        .get(cx.as_context_mut(), 0)
+        .ok_or_else(|| anyhow!("dispatch table is empty"))?;
+    for (i, t) in tables.iter().enumerate() {
+        let want = (unit.table_slots as u64)
+            .saturating_sub(i as u64 * per)
+            .min(per);
+        let have = t.size(cx.as_context_mut());
+        if want > have {
+            t.grow(cx.as_context_mut(), want - have, miss.clone())
+                .with_context(|| format!("growing dispatch table {i}"))?;
+        }
     }
 
     let mut linker = linker;
@@ -3049,12 +3057,14 @@ fn install_unit(
         exports::MEMORY,
         memory.shared().clone(),
     )?;
-    linker.define(
-        cx.as_context_mut(),
-        gex_abi::IMPORT_MODULE,
-        exports::DISPATCH_TABLE,
-        table,
-    )?;
+    for (i, t) in tables.iter().enumerate() {
+        linker.define(
+            cx.as_context_mut(),
+            gex_abi::IMPORT_MODULE,
+            exports::dispatch_table(i),
+            *t,
+        )?;
+    }
     let instance = linker
         .instantiate(cx.as_context_mut(), &unit.module)
         .context("instantiating a runtime-translated module")?;
@@ -3074,6 +3084,30 @@ fn install_unit(
         .instances
         .push(instance);
     Ok(())
+}
+
+/// Every dispatch table a translated image module exports, in index order.
+///
+/// There is more than one because V8 caps a table at ten million entries and
+/// the emitted code selects between them with a `br_table`; natively there is
+/// no such cap and every table past the first stays empty, but they still
+/// have to exist and be linked, because the code names them.
+fn dispatch_tables(
+    store: &mut Store<HostState>,
+    instance: &wasmtime::Instance,
+) -> Result<Vec<Table>> {
+    let mut out = Vec::new();
+    for i in 0..gex_abi::DISPATCH_TABLES {
+        match instance.get_export(&mut *store, exports::dispatch_table(i)) {
+            Some(Extern::Table(t)) => out.push(t),
+            // A module from before there were several exports only the first.
+            // That is fine as long as nothing dispatches past it, which
+            // natively nothing does.
+            _ if i > 0 => break,
+            _ => bail!("translated module does not export its dispatch table"),
+        }
+    }
+    Ok(out)
 }
 
 /// Forget the translations of code the guest has unmapped.

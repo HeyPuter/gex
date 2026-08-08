@@ -3777,16 +3777,45 @@ pub extern "C" fn gex_jit_slots() -> u32 {
     with_host(|h| h.jit.pending.front().map_or(0, |m| m.slots as u32))
 }
 
-/// The dispatch-table slot a translated block belongs in.
+/// Where a translated block belongs: the table in the top eight bits, the
+/// slot within it in the rest. -1 when its page has no slots.
+///
+/// Packed into one return rather than split across two calls because this is
+/// called once per block installed by name, and a block-per-function
+/// translation installs a great many.
+///
+/// The packing is the directory entry's own -- see `gex_abi::dispatch_entry`
+/// -- so this is the entry with the page offset already added in, and it fits
+/// because a table holds fewer than 2^24 slots.
 #[no_mangle]
 pub extern "C" fn gex_dispatch_slot(addr: i64) -> i32 {
     with_host(|h| {
         let page = gex_abi::dispatch_page(addr as u64);
         match h.jit.page_table.lookup(page) {
-            Some(base) => gex_abi::dispatch_index(addr as u64, base) as i32,
+            Some(entry) => gex_abi::dispatch_entry(
+                gex_abi::dispatch_entry_table(entry),
+                gex_abi::dispatch_index(addr as u64, entry) as u32,
+            ) as i32,
             None => -1,
         }
     })
+}
+
+/// Slots one dispatch table holds, so the glue knows where each one ends.
+///
+/// Reported rather than written down twice: it is V8's ten-million cap
+/// rounded down to a whole number of dispatch pages, and a glue that
+/// disagreed with the emitter about where table 1 starts would put blocks in
+/// the wrong table and dispatch would find the wrong code.
+#[no_mangle]
+pub extern "C" fn gex_slots_per_table() -> u32 {
+    gex_xlate::PageTable::SLOTS_PER_TABLE as u32
+}
+
+/// How many dispatch tables the emitter was built for.
+#[no_mangle]
+pub extern "C" fn gex_dispatch_tables() -> u32 {
+    gex_abi::DISPATCH_TABLES as u32
 }
 
 /// Publish the pending module's pages, now that its blocks are in the table.

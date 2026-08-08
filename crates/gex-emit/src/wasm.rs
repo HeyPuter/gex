@@ -438,7 +438,8 @@ pub struct Module {
     /// Encoded bodies, parallel to `functions`.
     bodies: Vec<Vec<u8>>,
     /// `(min, max)` in elements, for the single funcref table.
-    table: Option<(u32, u32)>,
+    /// Locally defined dispatch tables, in index order.
+    tables: Vec<(u32, u32)>,
     /// `(min, max)` in pages.
     memory: Option<(u64, u64)>,
     exports: Vec<(String, ExportKind, u32)>,
@@ -530,8 +531,13 @@ impl Module {
         self.bodies[local] = body;
     }
 
+    /// Declare a locally defined dispatch table.
+    ///
+    /// Called once per table, in index order. Several exist because V8 caps
+    /// one at ten million entries and a real application needs more -- see
+    /// `gex_abi::DISPATCH_TABLES`.
     pub fn set_table(&mut self, min: u32, max: u32) {
-        self.table = Some((min, max));
+        self.tables.push((min, max));
     }
 
     pub fn set_memory(&mut self, min_pages: u64, max_pages: u64) {
@@ -628,13 +634,15 @@ impl Module {
         }
 
         // 4: tables
-        if let Some((min, max)) = self.table {
+        if !self.tables.is_empty() {
             let mut s = Vec::new();
-            write_u32(&mut s, 1);
-            s.push(ValType::FuncRef.byte());
-            s.push(0x01); // limits with maximum
-            write_u32(&mut s, min);
-            write_u32(&mut s, max);
+            write_u32(&mut s, self.tables.len() as u32);
+            for (min, max) in &self.tables {
+                s.push(ValType::FuncRef.byte());
+                s.push(0x01); // limits with maximum
+                write_u32(&mut s, *min);
+                write_u32(&mut s, *max);
+            }
             section(&mut out, 4, &s);
         }
 
