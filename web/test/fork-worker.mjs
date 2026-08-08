@@ -29,6 +29,11 @@ const ROOT = join(HERE, '..', '..');
 const SHIM = join(ROOT, 'target/wasm32-unknown-unknown/release/gex_browser.wasm');
 const SEED = join(ROOT, 'web/public/gex/seed.wasm');
 const GEX = join(ROOT, 'shims/browser/js/gex.mjs');
+// The plain variant: these processes each have a memory of their own that is
+// not a SharedArrayBuffer, and a memory import's `shared` flag is part of its
+// type. The kernel's *own* memory is shared in both variants -- that is the
+// one every Worker looks at.
+const KERNEL = join(ROOT, 'web/public/gex/gex_kernel.plain.wasm');
 
 const [elfPath] = process.argv.slice(2);
 for (const p of [SHIM, SEED, elfPath]) {
@@ -41,6 +46,18 @@ for (const p of [SHIM, SEED, elfPath]) {
 const shim = new Uint8Array(readFileSync(SHIM));
 const seed = new Uint8Array(readFileSync(SEED));
 const elf = new Uint8Array(readFileSync(elfPath));
+
+// The global kernel: compiled once here and handed to every Worker, against
+// one shared memory. That memory is where the process table lives, so the
+// parent's `wait4` and the child's `exit_group` are talking about the same
+// bytes even though neither can see the other's address space.
+if (!existsSync(KERNEL)) {
+  console.log('skip fork-worker: run shims/kernel/build.sh first');
+  process.exit(0);
+}
+const kernelModule = await WebAssembly.compile(new Uint8Array(readFileSync(KERNEL)));
+const kernelMemory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
+const kernel = { module: kernelModule, memory: kernelMemory };
 
 // Every Worker's output, in arrival order, so a child's writes are visible
 // even though it is not the process the harness started.
@@ -68,7 +85,7 @@ function run(child) {
         // make another Worker, and only it has this file.
         async spawnProcess(c) { parentPort.postMessage({ kind: 'fork', child: c }); }
       }
-      const gex = new Gex(new E());
+      const gex = new Gex(new E(), { kernel: workerData.kernel });
       if (process.env.GEX_STRACE) globalThis.__gexStrace = 1;
       const c = workerData.child;
       let entry;
@@ -84,7 +101,7 @@ function run(child) {
       const status = await gex.run(entry);
       parentPort.postMessage({ kind: 'exit', status });
       `,
-      { eval: true, workerData: { shim, seed, elf, child } },
+      { eval: true, workerData: { shim, seed, elf, child, kernel } },
     );
     w.on('message', (m) => {
       if (m.kind === 'out') {

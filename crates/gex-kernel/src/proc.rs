@@ -38,6 +38,49 @@ use crate::syscalls::{Child, ChildHandle};
 /// The pid the kernel gives the first process, and the one orphans go to.
 pub const INIT_PID: i32 = 1;
 
+/// The process table when it is not in this process's memory.
+///
+/// The table above is shared between the *threads* of one process, because
+/// they are threads and share everything. Between processes it is shared by
+/// being somewhere else: in the browser, a second wasm module that every
+/// Worker instantiates against one `SharedArrayBuffer`, so its `Vec<Proc>` is
+/// literally the same bytes for all of them.
+///
+/// A process reaches that module through calls, not pointers -- it is a
+/// different memory and no `Arc` in it means anything here. So this is the
+/// call surface, as plain function pointers a host fills in. Everything is a
+/// scalar for the same reason: a `ChildHandle` is an `Arc` and an `Arc` is an
+/// address in a memory the other side cannot read.
+///
+/// `None` is the single-process case, and is the default: a run with no
+/// second module keeps the table it already had, in its own memory, and
+/// behaves exactly as it did before this existed.
+#[derive(Clone, Copy)]
+pub struct Remote {
+    pub spawn: extern "C" fn(ppid: i32) -> i32,
+    pub exit: extern "C" fn(pid: i32, status: i32),
+    pub reap: extern "C" fn(pid: i32),
+    /// Collect a finished child: the pid in the high 32 bits and the wait
+    /// status in the low 32, or zero if none is ready. Packed into one return
+    /// rather than split across two calls because two Workers can be
+    /// collecting at the same moment, and a status left somewhere between
+    /// calls belongs to whichever of them asked last.
+    pub wait: extern "C" fn(ppid: i32, want: i32) -> i64,
+    pub has_children: extern "C" fn(ppid: i32) -> i32,
+    pub kill: extern "C" fn(caller: i32, target: i32, signo: u32) -> i32,
+    pub take_signals: extern "C" fn(pid: i32) -> u64,
+    pub has_signals: extern "C" fn(pid: i32) -> i32,
+    pub ppid: extern "C" fn(pid: i32) -> i32,
+    pub pgid: extern "C" fn(caller: i32, of: i32) -> i32,
+    pub sid: extern "C" fn(caller: i32, of: i32) -> i32,
+    pub setsid: extern "C" fn(pid: i32) -> i32,
+    pub setpgid: extern "C" fn(caller: i32, target: i32, pgid: i32) -> i32,
+    /// Would a `wait4` answer now? See [`ProcTable::wait_ready`].
+    pub wait_ready: extern "C" fn(ppid: i32, want: i32) -> i32,
+    pub request_halt: extern "C" fn(code: i32),
+    pub halt_code: extern "C" fn() -> i32,
+}
+
 /// One process, as the table sees it.
 struct Proc {
     pid: i32,
@@ -80,6 +123,8 @@ pub struct ProcTable {
     /// soon, and never in the middle of one.
     halting: AtomicBool,
     halt_code: AtomicI32,
+    /// Where the table really is, when it is not here. See [`Remote`].
+    remote: Option<Remote>,
 }
 
 impl std::fmt::Debug for ProcTable {
@@ -105,6 +150,7 @@ impl ProcTable {
         ProcTable {
             halting: AtomicBool::new(false),
             halt_code: AtomicI32::new(0),
+            remote: None,
             inner: Mutex::new(Table {
                 next_pid: INIT_PID + 1,
                 procs: vec![Proc {
@@ -129,6 +175,9 @@ impl ProcTable {
     /// `fork` does and what lets a shell put a whole pipeline in one group by
     /// calling `setpgid` afterwards.
     pub fn spawn(&self, ppid: i32) -> i32 {
+        if let Some(r) = self.remote {
+            return (r.spawn)(ppid);
+        }
         let mut t = self.lock();
         let pid = t.next_pid;
         t.next_pid += 1;
@@ -172,12 +221,18 @@ impl ProcTable {
     /// already collected" -- which is also `ECHILD`, but reaching it by a
     /// different route matters for the trace.
     pub fn has_children(&self, ppid: i32) -> bool {
+        if let Some(r) = self.remote {
+            return (r.has_children)(ppid) != 0;
+        }
         self.lock().procs.iter().any(|p| p.ppid == ppid)
     }
 
     /// Record that `pid` has exited, wake anyone waiting on it, and give its
     /// surviving children to init.
     pub fn exit(&self, pid: i32, status: i32) {
+        if let Some(r) = self.remote {
+            return (r.exit)(pid, status);
+        }
         let (cell, done) = {
             let mut t = self.lock();
             // The parent is owed a SIGCHLD. A `wait4` that parks on the
@@ -215,11 +270,17 @@ impl ProcTable {
     /// Forget a process that has been collected, so a long-lived init does not
     /// accumulate a record per respawn for the life of the machine.
     pub fn reap(&self, pid: i32) {
+        if let Some(r) = self.remote {
+            return (r.reap)(pid);
+        }
         let mut t = self.lock();
         t.procs.retain(|p| p.pid != pid);
     }
 
     pub fn ppid(&self, pid: i32) -> i32 {
+        if let Some(r) = self.remote {
+            return (r.ppid)(pid);
+        }
         self.lock()
             .procs
             .iter()
@@ -229,6 +290,9 @@ impl ProcTable {
 
     /// `getpgid`. A pid of zero means the caller, as it does in Linux.
     pub fn pgid(&self, caller: i32, of: i32) -> Result<i32, Errno> {
+        if let Some(r) = self.remote {
+            return errno_or(( r.pgid)(caller, of));
+        }
         let want = if of == 0 { caller } else { of };
         self.lock()
             .procs
@@ -240,6 +304,9 @@ impl ProcTable {
 
     /// `getsid`, with the same zero-means-me rule.
     pub fn sid(&self, caller: i32, of: i32) -> Result<i32, Errno> {
+        if let Some(r) = self.remote {
+            return errno_or((r.sid)(caller, of));
+        }
         let want = if of == 0 { caller } else { of };
         self.lock()
             .procs
@@ -256,6 +323,9 @@ impl ProcTable {
     /// calling this precisely so the child is not a leader and the call can
     /// succeed.
     pub fn setsid(&self, pid: i32) -> Result<i32, Errno> {
+        if let Some(r) = self.remote {
+            return errno_or((r.setsid)(pid));
+        }
         let mut t = self.lock();
         if t.procs.iter().any(|p| p.pgid == pid) {
             return Err(Errno::EPERM);
@@ -276,6 +346,9 @@ impl ProcTable {
     /// yourself or a child, never across a session boundary, and never a
     /// session leader.
     pub fn setpgid(&self, caller: i32, target: i32, pgid: i32) -> Result<(), Errno> {
+        if let Some(r) = self.remote {
+            return errno_or((r.setpgid)(caller, target, pgid)).map(|_| ());
+        }
         let target = if target == 0 { caller } else { target };
         let pgid = if pgid == 0 { target } else { pgid };
         if pgid < 0 {
@@ -324,6 +397,9 @@ impl ProcTable {
     /// nothing and only reports whether there was anyone to send to, which is
     /// what `kill(pid, 0)` is for.
     pub fn kill(&self, caller: i32, target: i32, signo: u32) -> Result<usize, Errno> {
+        if let Some(r) = self.remote {
+            return errno_or((r.kill)(caller, target, signo)).map(|n| n as usize);
+        }
         if signo > 64 {
             return Err(Errno::EINVAL);
         }
@@ -378,6 +454,9 @@ impl ProcTable {
 
     /// Take everything sent to `pid` since the last call.
     pub fn take_signals(&self, pid: i32) -> u64 {
+        if let Some(r) = self.remote {
+            return (r.take_signals)(pid);
+        }
         match self.lock().procs.iter().find(|p| p.pid == pid) {
             Some(p) => p.pending.swap(0, Ordering::AcqRel),
             None => 0,
@@ -387,6 +466,9 @@ impl ProcTable {
     /// Whether anything is waiting for `pid`, without taking it. Cheap enough
     /// to ask on every syscall.
     pub fn has_signals(&self, pid: i32) -> bool {
+        if let Some(r) = self.remote {
+            return (r.has_signals)(pid) != 0;
+        }
         self.lock()
             .procs
             .iter()
@@ -396,12 +478,21 @@ impl ProcTable {
 
     /// Stop the machine. Every process exits with `code` at its next syscall.
     pub fn request_halt(&self, code: i32) {
+        if let Some(r) = self.remote {
+            return (r.request_halt)(code);
+        }
         self.halt_code.store(code, Ordering::Release);
         self.halting.store(true, Ordering::Release);
     }
 
     /// The exit code the machine is halting with, if it is.
     pub fn halt_code(&self) -> Option<i32> {
+        if let Some(r) = self.remote {
+            // -1 for "nobody has asked", because a halt code is a status and
+            // a status is unsigned; there is no legal -1 to be confused with.
+            let c = (r.halt_code)();
+            return (c >= 0).then_some(c);
+        }
         self.halting
             .load(Ordering::Acquire)
             .then(|| self.halt_code.load(Ordering::Acquire))
@@ -410,6 +501,78 @@ impl ProcTable {
     /// Whether `pid` names a live process, for `kill(pid, 0)`.
     pub fn exists(&self, pid: i32) -> bool {
         self.lock().procs.iter().any(|p| p.pid == pid)
+    }
+
+    /// Whether a `wait4` by `ppid` for `want` would answer now.
+    ///
+    /// Two things count as an answer: a child with a status ready, and no
+    /// matching child at all -- the second is `ECHILD`, which is a result and
+    /// not a reason to sleep forever.
+    ///
+    /// Separate from `collect` because collecting *takes* the child: asking
+    /// whether one is ready must not be the same call as reaping it, or every
+    /// poll of the run queue would consume a status nobody asked for.
+    pub fn wait_ready(&self, ppid: i32, want: i32) -> bool {
+        if let Some(r) = self.remote {
+            return (r.wait_ready)(ppid, want) != 0;
+        }
+        let mut any = false;
+        for c in self
+            .children(ppid)
+            .iter()
+            .filter(|c| want <= 0 || c.pid == want)
+        {
+            any = true;
+            if c.status.lock().map(|st| st.is_some()).unwrap_or(true) {
+                return true;
+            }
+        }
+        !any
+    }
+
+    /// A table that is really somewhere else. See [`Remote`].
+    ///
+    /// The local `Table` is still built, and still holds init -- it costs one
+    /// allocation and it means every method that has no remote counterpart
+    /// keeps working rather than having to be reasoned about twice.
+    pub fn shared(remote: Remote) -> ProcTable {
+        ProcTable {
+            remote: Some(remote),
+            ..ProcTable::new()
+        }
+    }
+
+    /// Whether this table's answers come from somewhere else.
+    ///
+    /// The one thing a caller has to know, because `wait4` cannot be
+    /// expressed the same way both ways round: a local table hands out
+    /// `ChildHandle`s to park on, and a remote one has no handles to hand --
+    /// its children are in another memory. See [`ProcTable::collect`].
+    pub fn is_shared(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    /// Collect a finished child of `ppid` from a remote table.
+    ///
+    /// `Some((pid, wait status))` when one was ready, `None` when none was --
+    /// the caller tells "nothing yet" from `ECHILD` with `wait_ready`, as it
+    /// does locally. `None` also when the table is local, which no caller
+    /// should reach: check `is_shared` first.
+    pub fn collect(&self, ppid: i32, want: i32) -> Option<(i32, i32)> {
+        let r = self.remote?;
+        let packed = (r.wait)(ppid, want);
+        let pid = (packed >> 32) as i32;
+        (pid > 0).then(|| (pid, packed as u32 as i32))
+    }
+}
+
+/// A remote call's `i32`: negative is a negated errno, as the kernel's own
+/// syscall returns are.
+fn errno_or(v: i32) -> Result<i32, Errno> {
+    if v < 0 {
+        Err(Errno(-v))
+    } else {
+        Ok(v)
     }
 }
 

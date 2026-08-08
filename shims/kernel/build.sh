@@ -33,4 +33,11 @@ RUSTFLAGS="-C link-arg=--import-memory \
   -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
   cargo +nightly build -p gex-kernel-wasm --target wasm32-unknown-unknown \
     --release -Z build-std=std,panic_abort --target-dir target/shared-kernel
-node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.wasm env process
+# Twice, differing only in whether the *process* memory it reaches into is
+# shared. Its own memory is always shared -- that is the point of it. But a
+# process is shared only between its threads, and a process that is one Worker
+# has a plain memory; a memory import's `shared` flag is part of its type, so
+# which one this module declares is not a runtime choice. The host picks the
+# file that matches the processes it is running.
+node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.wasm env process 65535 1
+node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.plain.wasm env process 65535 0

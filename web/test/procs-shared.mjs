@@ -124,16 +124,19 @@ if (taken !== 1 << 1) fail(`took ${taken}, expected ${1 << 1} for SIGINT`);
 // The child exits, in its own Worker, and the parent collects it in the
 // other. This is `wait4` across two address spaces, which is the call the
 // switcher exists to make possible.
-const status = 42 << 8; // WIFEXITED, code 42
-await child.call('k_exit', pid, status);
-const got = await parent.call('k_wait', 1, -1);
+// `k_exit` takes an exit *code*; `k_wait` is where it becomes the word a
+// parent reads, with the pid packed above it.
+await child.call('k_exit', pid, 42);
+if (!(await parent.call('k_wait_ready', 1, -1))) fail('a finished child was not ready to collect');
+const packed = BigInt(await parent.call('k_wait', 1, -1));
+const got = Number(packed >> 32n);
+const gotStatus = Number(packed & 0xffffffffn);
 if (got !== pid) fail(`wait collected ${got}, expected ${pid}`);
-const gotStatus = await parent.call('k_wait_status');
-if (gotStatus !== status) fail(`wait status ${gotStatus}, expected ${status}`);
+if (gotStatus !== 42 << 8) fail(`wait status ${gotStatus}, expected ${42 << 8}`);
 
 // And once collected it is gone, so a second wait says there is nothing --
 // which is how a parent learns its children are finished rather than looping.
-if ((await parent.call('k_wait', 1, -1)) !== -1) fail('the child was collected twice');
+if ((await parent.call('k_wait', 1, -1)) !== 0) fail('the child was collected twice');
 if (await parent.call('k_has_children', 1)) fail('the parent still has children');
 
 parent.worker.terminate();

@@ -288,10 +288,17 @@ pub enum BlockOp {
     },
     /// `wait4`. Blocks until one of `children` has a status to collect.
     WaitChild {
+        /// Empty when the table is shared: a `ChildHandle` is an `Arc`, and
+        /// an `Arc` names a memory the other processes cannot read. A shared
+        /// table is asked instead -- `wait_ready` to see whether this thread
+        /// can run, `collect` to take the child.
         children: Vec<ChildHandle>,
         /// So the waiter can drop the record once it has collected the child,
         /// and can notice a halt while parked.
         procs: Arc<ProcTable>,
+        /// Who is waiting. Implicit in `children` when the table is local,
+        /// and needed on every call when it is not.
+        ppid: i32,
         /// Which child, or -1 for any.
         want: i32,
         /// Where to write the wait status, or zero.
@@ -1584,8 +1591,15 @@ impl Kernel {
                 // is one this `wait4` can collect. That is what makes pid 1
                 // able to do its job.
                 Some(BlockOp::WaitChild {
-                    children: self.procs.children(self.pid),
+                    // Nothing to hand out when the table is elsewhere; the
+                    // host asks it directly. See `BlockOp::WaitChild`.
+                    children: if self.procs.is_shared() {
+                        Vec::new()
+                    } else {
+                        self.procs.children(self.pid)
+                    },
                     procs: Arc::clone(&self.procs),
+                    ppid: self.pid,
                     want: a[0] as i32,
                     wstatus: a[1],
                     nohang: a[2] & 1 != 0,

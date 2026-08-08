@@ -1209,6 +1209,28 @@ else
     echo "skip pipe-shared: no node, or shims/kernel/build.sh has not been run"
 fi
 
+# `fork` end to end, with the child in a Worker of its own. The switcher's
+# replacement: no snapshot, no switch, both processes running at once, and a
+# parent collecting a child it cannot see -- the process table is in the
+# global kernel and neither address space owns it.
+if [ -n "$NODE" ] && [ -x "$WORK/fork" ] && [ -f web/public/gex/gex_kernel.plain.wasm ]; then
+    out=$(timeout 300 "$NODE" web/test/fork-worker.mjs "$WORK/fork" 2>&1 || true)
+    case "$out" in
+        *"ok   fork-worker"*)
+            echo "$out" | grep "^ok   fork-worker" | head -1
+            pass=$((pass + 1))
+            ;;
+        *"skip fork-worker"*) echo "$out" | grep "^skip" | head -1 ;;
+        *)
+            echo "FAIL fork-worker: a forked child did not run in its own Worker"
+            echo "$out" | sed 's/^/     /' | tail -8
+            fail=$((fail + 1))
+            ;;
+    esac
+else
+    echo "skip fork-worker: no node, no fork program, or no global kernel"
+fi
+
 # The demo page's terminal. Not a translation test: it checks the seam above
 # the runtime, where a keystroke has to travel from an xterm through the line
 # discipline into a parked guest read. That seam broke once without any test

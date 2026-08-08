@@ -54,42 +54,56 @@ pub extern "C" fn k_spawn(ppid: i32) -> i32 {
 
 /// Record that `pid` has exited with `status`.
 ///
-/// `status` is a wait status, not an exit code: a normal exit is `code << 8`
-/// and a signal death is the bare signal, which is what `wait4` reports and
-/// how a parent tells them apart.
+/// `status` is an exit *code*, or the negated signal number when the process
+/// died of one -- the same convention `ProcTable::exit` takes. The two are
+/// different things to `wait4`, and [`k_wait`] is where they become the one
+/// word a parent reads.
 #[no_mangle]
 pub extern "C" fn k_exit(pid: i32, status: i32) {
     procs().exit(pid, status);
 }
 
-/// Collect a finished child of `ppid`, or -1 if none is ready.
+/// Collect a finished child of `ppid`. Zero if none is ready.
 ///
-/// `want` is a specific pid, or -1 for any. The status is left in
-/// `k_wait_status` -- one call, two results, and no pointer into a memory
-/// this module cannot address.
+/// Returns the pid in the high 32 bits and the wait status in the low 32:
+/// one call and two results, rather than a second call for the status. The
+/// pairing has to be atomic, because two processes in two Workers can be
+/// collecting from this table at the same moment and a status left in a
+/// static between calls belongs to whichever of them asked last.
+///
+/// `want` is a specific pid, or -1 for any.
 #[no_mangle]
-pub extern "C" fn k_wait(ppid: i32, want: i32) -> i32 {
+pub extern "C" fn k_wait(ppid: i32, want: i32) -> i64 {
     for c in procs().children(ppid) {
         if want > 0 && c.pid != want {
             continue;
         }
         let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(status) = st.take() {
+        if let Some(code) = st.take() {
             c.reaped.store(true, std::sync::atomic::Ordering::Release);
             procs().reap(c.pid);
-            LAST_STATUS.store(status, std::sync::atomic::Ordering::Relaxed);
-            return c.pid;
+            // `WIFEXITED`: the code in the second byte, low bits clear.
+            // `WIFSIGNALED`: the signal in the low seven, which is what a
+            // negative code means here.
+            let word = if code < 0 {
+                (-code) as u32 & 0x7f
+            } else {
+                ((code as u32) & 0xff) << 8
+            };
+            return ((c.pid as i64) << 32) | word as i64;
         }
     }
-    -1
+    0
 }
 
-static LAST_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-/// The wait status of the child [`k_wait`] last collected.
+/// Whether a `wait4` by `ppid` for `want` would answer now: a collectable
+/// child, or no matching child at all.
+///
+/// Separate from [`k_wait`] because collecting *takes* the child, and a
+/// scheduler asking whether a parked thread can run must not reap one.
 #[no_mangle]
-pub extern "C" fn k_wait_status() -> i32 {
-    LAST_STATUS.load(std::sync::atomic::Ordering::Relaxed)
+pub extern "C" fn k_wait_ready(ppid: i32, want: i32) -> i32 {
+    procs().wait_ready(ppid, want) as i32
 }
 
 /// Whether `ppid` has any live children, which is what tells `wait4` the
@@ -134,6 +148,50 @@ pub extern "C" fn k_exists(pid: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_ppid(pid: i32) -> i32 {
     procs().ppid(pid)
+}
+
+/// Forget a collected process, so a long-lived init does not accumulate a
+/// record per respawn for the life of the machine.
+#[no_mangle]
+pub extern "C" fn k_reap(pid: i32) {
+    procs().reap(pid);
+}
+
+/// `getpgid`, with Linux's zero-means-the-caller rule. Negative errno on
+/// failure, as every call here reports it.
+#[no_mangle]
+pub extern "C" fn k_pgid(caller: i32, of: i32) -> i32 {
+    match procs().pgid(caller, of) {
+        Ok(v) => v,
+        Err(e) => -e.0,
+    }
+}
+
+/// `getsid`, same rule.
+#[no_mangle]
+pub extern "C" fn k_sid(caller: i32, of: i32) -> i32 {
+    match procs().sid(caller, of) {
+        Ok(v) => v,
+        Err(e) => -e.0,
+    }
+}
+
+/// `setsid`: become the leader of a new session and a new group.
+#[no_mangle]
+pub extern "C" fn k_setsid(pid: i32) -> i32 {
+    match procs().setsid(pid) {
+        Ok(v) => v,
+        Err(e) => -e.0,
+    }
+}
+
+/// `setpgid`. Zero for either argument means the caller.
+#[no_mangle]
+pub extern "C" fn k_setpgid(caller: i32, target: i32, pgid: i32) -> i32 {
+    match procs().setpgid(caller, target, pgid) {
+        Ok(()) => 0,
+        Err(e) => -e.0,
+    }
 }
 
 /// Ask every process to stop, with this status. See `ProcTable::request_halt`.

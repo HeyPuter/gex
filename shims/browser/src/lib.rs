@@ -186,6 +186,125 @@ impl net::NetStack for WispNet {
     }
 }
 
+// The global kernel: the process table, in a module of its own.
+//
+// Every process is a Worker with its own memory, so no two of them can share
+// a `ProcTable` the way two threads do -- an `Arc` is an address, and an
+// address means a memory. The table lives instead in a second wasm module
+// (`shims/kernel`) that every Worker instantiates against one shared memory,
+// so its `Vec<Proc>` is literally the same bytes for all of them.
+//
+// Reached by *calling*, which is what these imports are. JS wires them to
+// that module's exports; a host with no global kernel wires `k_present` to
+// zero and the rest to stubs, and the run keeps the table it always had, in
+// its own memory, behaving exactly as it did before this existed.
+#[link(wasm_import_module = "gex_k")]
+extern "C" {
+    /// Is there a global kernel behind these calls at all?
+    fn k_present() -> i32;
+    fn k_spawn(ppid: i32) -> i32;
+    fn k_exit(pid: i32, status: i32);
+    fn k_reap(pid: i32);
+    /// pid in the high 32 bits, wait status in the low 32; zero for none.
+    fn k_wait(ppid: i32, want: i32) -> i64;
+    fn k_wait_ready(ppid: i32, want: i32) -> i32;
+    fn k_has_children(ppid: i32) -> i32;
+    fn k_kill(caller: i32, target: i32, signo: u32) -> i32;
+    fn k_take_signals(pid: i32) -> u64;
+    fn k_has_signals(pid: i32) -> i32;
+    fn k_ppid(pid: i32) -> i32;
+    fn k_pgid(caller: i32, of: i32) -> i32;
+    fn k_sid(caller: i32, of: i32) -> i32;
+    fn k_setsid(pid: i32) -> i32;
+    fn k_setpgid(caller: i32, target: i32, pgid: i32) -> i32;
+    fn k_request_halt(code: i32);
+    fn k_halt_code() -> i32;
+}
+
+// A wasm import is `unsafe`, and `Remote` holds safe fn pointers, so each one
+// needs a wrapper. Written out rather than generated: a macro here would save
+// thirty lines and cost the ability to read the surface at a glance, which is
+// the one thing this list is for.
+extern "C" fn r_spawn(ppid: i32) -> i32 {
+    unsafe { k_spawn(ppid) }
+}
+extern "C" fn r_exit(pid: i32, status: i32) {
+    unsafe { k_exit(pid, status) }
+}
+extern "C" fn r_reap(pid: i32) {
+    unsafe { k_reap(pid) }
+}
+extern "C" fn r_wait(ppid: i32, want: i32) -> i64 {
+    unsafe { k_wait(ppid, want) }
+}
+extern "C" fn r_wait_ready(ppid: i32, want: i32) -> i32 {
+    unsafe { k_wait_ready(ppid, want) }
+}
+extern "C" fn r_has_children(ppid: i32) -> i32 {
+    unsafe { k_has_children(ppid) }
+}
+extern "C" fn r_kill(caller: i32, target: i32, signo: u32) -> i32 {
+    unsafe { k_kill(caller, target, signo) }
+}
+extern "C" fn r_take_signals(pid: i32) -> u64 {
+    unsafe { k_take_signals(pid) }
+}
+extern "C" fn r_has_signals(pid: i32) -> i32 {
+    unsafe { k_has_signals(pid) }
+}
+extern "C" fn r_ppid(pid: i32) -> i32 {
+    unsafe { k_ppid(pid) }
+}
+extern "C" fn r_pgid(caller: i32, of: i32) -> i32 {
+    unsafe { k_pgid(caller, of) }
+}
+extern "C" fn r_sid(caller: i32, of: i32) -> i32 {
+    unsafe { k_sid(caller, of) }
+}
+extern "C" fn r_setsid(pid: i32) -> i32 {
+    unsafe { k_setsid(pid) }
+}
+extern "C" fn r_setpgid(caller: i32, target: i32, pgid: i32) -> i32 {
+    unsafe { k_setpgid(caller, target, pgid) }
+}
+extern "C" fn r_request_halt(code: i32) {
+    unsafe { k_request_halt(code) }
+}
+extern "C" fn r_halt_code() -> i32 {
+    unsafe { k_halt_code() }
+}
+
+/// The process table every process shares, if the host gave us one.
+///
+/// `None` is a run with one process in it -- a page that loads a program and
+/// never forks, or a host that has not wired the second module up. Nothing
+/// about that case changes.
+fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
+    if unsafe { k_present() } == 0 {
+        return None;
+    }
+    Some(Arc::new(gex_kernel::proc::ProcTable::shared(
+        gex_kernel::proc::Remote {
+            spawn: r_spawn,
+            exit: r_exit,
+            reap: r_reap,
+            wait: r_wait,
+            wait_ready: r_wait_ready,
+            has_children: r_has_children,
+            kill: r_kill,
+            take_signals: r_take_signals,
+            has_signals: r_has_signals,
+            ppid: r_ppid,
+            pgid: r_pgid,
+            sid: r_sid,
+            setsid: r_setsid,
+            setpgid: r_setpgid,
+            request_halt: r_request_halt,
+            halt_code: r_halt_code,
+        },
+    )))
+}
+
 /// Back-edges a guest may take between safepoint calls, matching the native
 /// host's interval.
 const SAFEPOINT_INTERVAL: u32 = 1024;
@@ -1147,6 +1266,12 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
 
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
+    // The table every process shares, when the host has wired one up. This
+    // process is the first, so it keeps the pid the kernel gave it -- the
+    // global table's `INIT_PID` is the same 1.
+    if let Some(procs) = global_procs() {
+        kernel.procs = procs;
+    }
     kernel.vfs.mount("/", root.clone());
     // The graphics device, when the page said it has a canvas to draw on.
     // Absent otherwise, so a guest sees a machine with no GL rather than one
@@ -2154,6 +2279,13 @@ pub extern "C" fn gex_adopt_child(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls
     // to read. That wants the file table in the global kernel, next to the
     // pipes it already holds.
     let mut kernel = Kernel::new(ctx_addr, 0, String::new());
+    // The same table the parent has, because it is not in either of their
+    // memories. This is what makes the parent's `wait4` able to find a child
+    // it can no longer see: the child publishes its exit into a table both
+    // Workers are calling into, and the parent parked on exactly that.
+    if let Some(procs) = global_procs() {
+        kernel.procs = procs;
+    }
     kernel.pid = pid;
     kernel.tid = pid;
     set_host(Host {
@@ -2474,7 +2606,20 @@ fn thread_ready(t: &Thread, now: u64) -> bool {
         // waiting, and also when there are none at all -- that is `ECHILD`,
         // which is an answer and not a reason to sleep forever.
         Waiting::Child => match &t.blocked_on {
-            Some(gex_kernel::BlockOp::WaitChild { children, want, .. }) => {
+            Some(gex_kernel::BlockOp::WaitChild {
+                children,
+                procs,
+                ppid,
+                want,
+                ..
+            }) => {
+                // The child is another Worker, so its status is not in this
+                // memory and there is no handle here to look at: the table
+                // that holds it is asked instead. Asking must not reap --
+                // this runs on every turn of the run queue.
+                if procs.is_shared() {
+                    return procs.wait_ready(*ppid, *want);
+                }
                 let mut any = false;
                 for c in children.iter().filter(|c| *want <= 0 || c.pid == *want) {
                     any = true;
@@ -2916,10 +3061,23 @@ fn finish_parked(
         gex_kernel::BlockOp::WaitChild {
             children,
             procs,
+            ppid,
             want,
             wstatus,
             ..
         } => {
+            // A shared table already holds the status in the form `wait4`
+            // reports it, because the child's own Worker published it there
+            // as it exited. Nothing here has to reconstruct it.
+            if procs.is_shared() {
+                let Some((pid, word)) = procs.collect(*ppid, *want) else {
+                    return Err(Errno::ECHILD);
+                };
+                if *wstatus != 0 {
+                    gm.write_u32(*wstatus, word as u32)?;
+                }
+                return Ok(pid as u64);
+            }
             for c in children {
                 if *want > 0 && c.pid != *want {
                     continue;

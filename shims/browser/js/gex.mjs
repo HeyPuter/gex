@@ -124,6 +124,15 @@ export class Gex {
   // `WebAssembly.Module` crosses to a Worker without being compiled again --
   // which the bytes would not.
   #compiled = [];
+  // `{ module, memory }` for the global kernel, and the instance made from it.
+  //
+  // The global kernel is a second wasm module holding the state that spans
+  // *processes* -- the process table today, the file table and the pipes
+  // next. Every Worker instantiates the same module against the same shared
+  // memory, so its Rust data structures are one set of bytes for all of them.
+  // Null is a run of one process, which needs none of that.
+  #kernelSpec = null;
+  #kernel = null;
 
   /**
    * `shared` asks for a SharedArrayBuffer, which needs the shim and guest
@@ -134,7 +143,7 @@ export class Gex {
    * time. Processes still never share memory with each other; that is what
    * keeps two of them from putting libraries at the same addresses.
    */
-  constructor(env = new Env(), { shared = false, memory = null } = {}) {
+  constructor(env = new Env(), { shared = false, memory = null, kernel = null } = {}) {
     this.#env = env;
     // `memory` adopts a process's existing address space rather than making
     // one. That is what a *thread* is here: a second Worker on the memory a
@@ -143,6 +152,7 @@ export class Gex {
     // the same everything. A new memory would be a new process.
     this.#memory =
       memory ?? new WebAssembly.Memory({ initial: PAGES, maximum: PAGES, shared });
+    this.#kernelSpec = kernel;
   }
 
   get memory() { return this.#memory; }
@@ -243,10 +253,12 @@ export class Gex {
    */
   async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
     const shimMod = await WebAssembly.compile(shimWasm);
+    await this.#startKernel();
     this.#shim = await WebAssembly.instantiate(shimMod, {
       env: { memory: this.#memory },
       // The shim asks JS for exactly the two things wasm has no way to do.
       gex_env: this.#hostImports(),
+      gex_k: this.#kernelImports(),
     });
     this.#u8 = new Uint8Array(this.#memory.buffer);
     // A shim older than this file still loads and still instantiates, and
@@ -369,9 +381,11 @@ export class Gex {
    * instantiation would quietly wipe the first thread's kernel.
    */
   async attach(shimWasm, guestWasm) {
+    await this.#startKernel();
     this.#shim = await WebAssembly.instantiate(await WebAssembly.compile(shimWasm), {
       env: { memory: this.#memory },
       gex_env: this.#hostImports(),
+      gex_k: this.#kernelImports(),
     });
     this.#u8 = new Uint8Array(this.#memory.buffer);
     // The shim's stack pointer is a mutable *global*, which belongs to the
@@ -442,6 +456,69 @@ export class Gex {
     }
     e.gex_free?.(scratch, 24);
     return out;
+  }
+
+  /**
+   * Instantiate the global kernel against this process's memory.
+   *
+   * Every Worker does this, with the same module and the same *kernel*
+   * memory, and a different process memory. The kernel memory is where the
+   * module's own Rust state lives, so all of them see one process table; the
+   * process memory is memory 1, which is how it copies bytes into and out of
+   * a process it cannot address with a pointer.
+   *
+   * Nothing here without a `kernel` in the constructor's options: a run of one
+   * process needs no table spanning processes, and paying 4.8 MB of module
+   * for one would be silly.
+   */
+  async #startKernel() {
+    if (!this.#kernelSpec || this.#kernel) return;
+    const { module, memory } = this.#kernelSpec;
+    const mod = module instanceof WebAssembly.Module
+      ? module
+      : await WebAssembly.compile(module);
+    const inst = await WebAssembly.instantiate(mod, {
+      env: { memory, process: this.#memory },
+    });
+    this.#kernel = inst.exports;
+  }
+
+  /** The global kernel's exports, or null. */
+  get kernel() { return this.#kernel; }
+
+  /**
+   * What the shim calls to reach the process table every process shares.
+   *
+   * `k_present` is the whole of the negotiation: nought means there is no
+   * global kernel, and the shim keeps the table in its own memory and behaves
+   * as it did before any of this existed. So the stubs below are never
+   * called -- they exist because a wasm import cannot be absent, only unused.
+   */
+  #kernelImports() {
+    const k = this.#kernel;
+    const absent = () => 0;
+    if (!k) {
+      return {
+        k_present: absent,
+        k_spawn: absent, k_exit: absent, k_reap: absent,
+        k_wait: () => 0n, k_wait_ready: absent, k_has_children: absent,
+        k_kill: absent, k_take_signals: () => 0n, k_has_signals: absent,
+        k_ppid: absent, k_pgid: absent, k_sid: absent,
+        k_setsid: absent, k_setpgid: absent,
+        k_request_halt: absent, k_halt_code: () => -1,
+      };
+    }
+    return {
+      k_present: () => 1,
+      k_spawn: k.k_spawn, k_exit: k.k_exit, k_reap: k.k_reap,
+      k_wait: k.k_wait, k_wait_ready: k.k_wait_ready,
+      k_has_children: k.k_has_children,
+      k_kill: k.k_kill, k_take_signals: k.k_take_signals,
+      k_has_signals: k.k_has_signals,
+      k_ppid: k.k_ppid, k_pgid: k.k_pgid, k_sid: k.k_sid,
+      k_setsid: k.k_setsid, k_setpgid: k.k_setpgid,
+      k_request_halt: k.k_request_halt, k_halt_code: k.k_halt_code,
+    };
   }
 
   /**

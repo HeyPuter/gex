@@ -1,6 +1,6 @@
 // Give a linked wasm module a second imported memory.
 //
-//   node tools/add-memory.mjs <in.wasm> <out.wasm> [module] [name] [pages]
+//   node tools/add-memory.mjs <in.wasm> <out.wasm> [module] [name] [pages] [shared]
 //
 // The global kernel module addresses its own memory as memory 0 -- that is
 // what `--import-memory` gives it and what every Rust pointer in it means --
@@ -21,10 +21,18 @@ import { readFileSync, writeFileSync } from 'node:fs';
 // ABI says it does.
 const GUEST_PAGES = 0xffff0000 / 65536;
 
-const [inPath, outPath, mod = 'env', name = 'process', pages = GUEST_PAGES] =
-  process.argv.slice(2);
+const [
+  inPath,
+  outPath,
+  mod = 'env',
+  name = 'process',
+  pages = GUEST_PAGES,
+  shared = '1',
+] = process.argv.slice(2);
 if (!inPath || !outPath) {
-  console.error('usage: add-memory.mjs <in.wasm> <out.wasm> [module] [name] [pages]');
+  console.error(
+    'usage: add-memory.mjs <in.wasm> <out.wasm> [module] [name] [pages] [shared]',
+  );
   process.exit(2);
 }
 
@@ -69,9 +77,16 @@ const str = (s) => [...enc(s.length), ...[...s].map((c) => c.charCodeAt(0))];
 // that declares a plain memory will not accept a `SharedArrayBuffer` however
 // large it is, and one that declares the wrong bounds will not link at all.
 // Both numbers are the guest's fixed address space.
+//
+// `shared` is an argument for exactly that reason. A process whose threads
+// are Workers has a shared memory and needs flag 0x03; a process that is a
+// single Worker has a plain one and needs 0x01, and a module built for the
+// first will not instantiate against the second. So the kernel module is
+// emitted twice, once for each, and a host picks by what its processes are.
 const entry = [
   ...str(mod), ...str(name),
-  0x02, 0x03, ...enc(Number(pages)), ...enc(Number(pages)),
+  0x02, shared === '0' ? 0x01 : 0x03,
+  ...enc(Number(pages)), ...enc(Number(pages)),
 ];
 
 let at = 8; // past the magic and version
