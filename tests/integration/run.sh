@@ -899,6 +899,28 @@ else
     echo "skip virgl-handshake: no renderer in this build"
 fi
 
+# The same handshake, but in a browser: the guest running as translated wasm
+# in headless Chromium, talking to virglrenderer on a WebGL 2 context. This is
+# the only test of the browser renderer that can mean anything -- a recorded
+# stream carries the capability set the *recording* host gave, and no
+# recording made against a desktop-GL or GLES host is a valid input to a
+# WebGL 2 one. The guest has to ask for itself, and the number it gets back
+# differs from the native one, which is how you know it did.
+if [ -n "$NODE" ] && [ -f "$WORK/virgl-handshake" ]; then
+    "$GEXC" build --no-shared-memory "$WORK/virgl-handshake" \
+        -o "$WORK/virgl-handshake.wasm" >/dev/null 2>&1
+    cp "$WORK/virgl-handshake" "$WORK/virgl-handshake.wasm.elf"
+    if out=$(GEX_VIRGL_GUEST="$WORK/virgl-handshake.wasm" \
+             "$NODE" "$HERE/../../web/test/virgl-guest.mjs" 2>&1); then
+        echo "$out" | grep -E "^(ok|skip)" || true
+        echo "$out" | sed -n 's/^     capset reply/     capset reply/p'
+        echo "$out" | grep -q "^ok" && pass=$((pass + 1))
+    else
+        echo "$out" | sed 's/^/     /' | head -8
+        fail=$((fail + 1))
+    fi
+fi
+
 # virglrenderer, compiled to wasm, coming up on a WebGL 2 context in a real
 # browser. Not a translation test at all -- it is the other half of the
 # graphics path: the native runtime gives the guest a GPU by handing VirGL to

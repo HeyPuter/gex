@@ -122,13 +122,10 @@ try {
     await grab('./shim.wasm'), await grab('./guest.wasm'), await grab('./guest.elf'),
     {}, ['/virgl-handshake'], { uid: 0, gid: 0, cwd: '/' });
   mark('running the guest');
-  // A guest that never finishes reports nothing at all, and "nothing at all"
-  // does not say whether it got as far as connecting. The watchdog turns a
-  // hang into whatever the program managed to print first.
-  const status = await Promise.race([
-    gex.run(entry),
-    new Promise((r) => setTimeout(() => r('STUCK'), 20000)),
-  ]);
+  // No watchdog. One here read a slow run as a stuck one and cost an
+  // afternoon; the browser's own virtual-time budget already bounds this,
+  // and whatever the guest printed is in the document either way.
+  const status = await gex.run(entry);
   say('EXIT ' + status + '\\n' + output.trim() + '\\nrenderer: ' + renderer.describe());
 } catch (e) {
   if (e !== 0) say('THREW ' + (e?.message || String(e)) + '\\n' + output.trim());
@@ -166,7 +163,13 @@ const dom = await new Promise((resolve, reject) => {
       '--disable-gpu-sandbox',
       '--enable-unsafe-swiftshader',
       '--use-gl=swiftshader',
-      '--virtual-time-budget=60000',
+      // Ten minutes of virtual time, which is not generosity. The clock only
+      // advances while the page is idle, and this page is not: it translates
+      // an aarch64 program and runs it. At sixty seconds the browser was
+      // dumped mid-run and the result read exactly like a hang -- the guest
+      // had printed the size of the capability set and appeared to stall
+      // draining it. It had not stalled. It was still going.
+      '--virtual-time-budget=' + (process.env.GEX_BUDGET || 600000),
       '--dump-dom',
       url,
     ],
