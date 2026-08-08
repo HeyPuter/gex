@@ -35,6 +35,21 @@ cp "$ROOT/target/wasm32-unknown-unknown/release/gex_browser.wasm" "$PUB/gex/"
 node "$ROOT/shims/browser/js/check-glue.mjs" \
     "$PUB/gex/gex_browser.wasm" "$ROOT/shims/browser/js/gex.mjs"
 
+# The global kernel module: one memory shared by every Worker of every
+# process, so the file table and the process table are simply there and a
+# syscall stays a direct call. Needs nightly, for the inline assembly that
+# emits a `memory.copy` naming two memories -- Rust has no other spelling for
+# reaching a guest buffer that is not in this module's own address space.
+#
+# Skipped rather than failed without nightly, like the shared-memory shim: a
+# machine that cannot build it should still get every other demo.
+if rustup toolchain list 2>/dev/null | grep -q nightly; then
+    echo "building the global kernel module..."
+    "$ROOT/shims/kernel/build.sh"
+else
+    echo "no global kernel module -- needs nightly"
+fi
+
 echo "building the seed module..."
 cargo build --release --manifest-path "$ROOT/Cargo.toml" -p gexc >/dev/null 2>&1
 "$ROOT/target/release/gexc" seed -o "$PUB/gex/seed.wasm" --no-shared-memory

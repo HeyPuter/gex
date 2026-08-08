@@ -793,7 +793,30 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
 #[cfg(feature = "shared-memory")]
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
-    f(HOST.lock().as_mut().expect("gex: not initialised"))
+    // The `Host` is taken *out* for the duration and put back after, rather
+    // than the lock being held across `f`.
+    //
+    // Holding it would be the obvious thing and is wrong here, because this
+    // shim traps out of `with_host` as ordinary control flow -- that is how a
+    // guest hands the wasm stack back to JavaScript. A trap does not unwind,
+    // so a held guard is never dropped and the kernel is locked out for the
+    // rest of the run: the next syscall waits forever, having done nothing
+    // wrong. Taking the value has the same failure mode as the thread-local
+    // `RefCell` this replaces -- a trap leaves it absent and the next caller
+    // says so -- which is a failure that names itself.
+    //
+    // The lock is therefore held only across the take and the put, and it is
+    // what makes the *statics* safe to touch from more than one Worker. Two
+    // threads genuinely inside the kernel at once would find it absent; that
+    // is honest for today, when one Worker runs at a time, and is the thing
+    // to revisit when `clone` starts spawning Workers.
+    let mut host = HOST
+        .lock()
+        .take()
+        .expect("gex: the kernel is absent -- not initialised, or a trap left it taken");
+    let r = f(&mut host);
+    *HOST.lock() = Some(host);
+    r
 }
 
 /// Sockets the host holds one end of, so JS can carry a guest's stream
