@@ -388,6 +388,14 @@ enum Waiting {
     Read(Arc<dyn gex_kernel::vfs::FileHandle>),
     /// Waiting for room in a stream: a pipe nobody has drained yet.
     Write(Arc<dyn gex_kernel::vfs::FileHandle>),
+    /// Waiting in `wait4` for a child to finish.
+    ///
+    /// This used to be impossible: the parent was frozen until the child
+    /// exited, so a `wait4` that ran at all was asking about a child whose
+    /// status was already recorded. Now that processes take turns, a parent
+    /// can reach `wait4` while its child is still running, and has to park
+    /// like anything else.
+    Child,
     /// Waiting on the network -- a connection coming up, or a `poll` with
     /// nothing ready. Whether it is ready is a question for the operation
     /// itself, which the scheduler holds in `blocked_on`, so this only
@@ -407,11 +415,23 @@ enum Waiting {
 /// already in `x0` where the kernel wrote it before any of this started.
 ///
 /// What this buys is the whole of a Unix userspace in a page: a shell that
-/// starts real processes, a pipeline, `make`, `apt`. What it costs is
-/// concurrency -- the parent cannot run while the child does. For the shape
-/// every shell has, `fork` then immediately `wait`, that is not a
-/// restriction. For a parent that forks and then keeps working it is, and it
-/// shows up as the parent simply not running until the child is done.
+/// starts real processes, a pipeline, `make`, `apt`.
+///
+/// Processes take turns rather than nesting. A saved process is not "the
+/// parent, waiting" -- it is any process that is not the one on the wasm
+/// stack, and [`switch_process`] puts one back when the running one has
+/// nothing left that can run. That is what makes a background process work:
+/// `Xvfb &` starts a daemon that never exits, and while the parent was only
+/// ever put back *on the child's exit*, the shell after an `&` never ran
+/// again. An X server and its client are two processes that talk to each
+/// other and neither finishes first, which is most of what a graphical
+/// program is.
+///
+/// It is a swap and not real concurrency: one runs at a time, and switching
+/// copies both memory images. Only the mapped regions move, and only when
+/// nothing in the current process can run, so a `fork` immediately followed
+/// by a `wait` -- the shape every shell has -- still costs one copy and not
+/// one per timeslice.
 struct Suspended {
     pid: i32,
     /// Guest memory as it was, region by region. Includes the register
@@ -496,8 +516,7 @@ struct Host {
     resume: Option<u64>,
     /// Set alongside `resume` when the scheduler switched threads.
     resume_ctx: Option<u64>,
-    /// Parents waiting for a child to finish, innermost last. A shell that
-    /// runs a pipeline is two deep.
+    /// Every process except the one on the wasm stack.
     suspended: Vec<Suspended>,
     /// Why the scheduler gave the stack back to JS, when it was not an exit.
     /// 1: every thread is waiting for input the page must supply. 2: every
@@ -1144,11 +1163,7 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                 h.resume = Some(target);
                 1
             }
-            SyscallOutcome::Exit(code) if !h.suspended.is_empty() => resume_parent(h, code),
-            SyscallOutcome::Exit(code) => {
-                h.exit = Some(code);
-                2
-            }
+            SyscallOutcome::Exit(code) => exit_process(h, code),
             SyscallOutcome::Killed { signal, .. } => {
                 h.exit = Some(128 + signal as i32);
                 2
@@ -1205,12 +1220,15 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
                     gex_kernel::BlockOp::Poll { deadline, .. } => {
                         Waiting::Net(deadline.map(|d| now_ns() + d.as_nanos() as u64))
                     }
-                    // A child always finishes before its parent runs again --
-                    // that is what the checkpoint means -- so a `wait4` that
-                    // reaches here is asking about a child whose status is
-                    // already in the table, or about nobody at all. Either
-                    // way it is answered immediately rather than parked.
-                    gex_kernel::BlockOp::WaitChild { .. } => Waiting::Runnable,
+                    // `WNOHANG` answers straight away; anything else waits
+                    // for the child, which may not have started yet.
+                    gex_kernel::BlockOp::WaitChild { nohang, .. } => {
+                        if *nohang {
+                            Waiting::Runnable
+                        } else {
+                            Waiting::Child
+                        }
+                    }
                     // A listener with nothing waiting. The same shape as a
                     // poll: the scheduler asks again each turn.
                     gex_kernel::BlockOp::AcceptWait { .. } => Waiting::Runnable,
@@ -1295,6 +1313,29 @@ fn snapshot_memory(h: &Host) -> Vec<(u64, Vec<u8>)> {
     out
 }
 
+/// Blank everything the running process has mapped.
+///
+/// Called on the way out of a process, and it is not tidiness. There is one
+/// address space, so a region this process mapped and the next one does not
+/// would otherwise still be sitting there when the next one looks -- and what
+/// it finds is a *relocated* copy of a library at exactly the address its own
+/// ld.so is about to use. That is how `exec` broke: the second program's
+/// .got.plt kept its link-time addresses because ld.so found a world that
+/// already looked done, and the first call through the PLT branched to an
+/// unbiased PLT0 and died in unmapped memory.
+///
+/// Regions the incoming process does have are filled in immediately after by
+/// [`restore_memory`], so this only ever leaves behind what nothing owns.
+fn clear_mapped(h: &Host) {
+    let data = guest_bytes();
+    for v in h.kernel.mem.vmas() {
+        let (a, b) = (v.start as usize, (v.end as usize).min(data.len()));
+        if a < b {
+            data[a..b].fill(0);
+        }
+    }
+}
+
 fn restore_memory(snapshot: &[(u64, Vec<u8>)]) {
     let data = guest_bytes();
     for (at, bytes) in snapshot {
@@ -1314,6 +1355,10 @@ fn restore_memory(snapshot: &[(u64, Vec<u8>)]) {
 /// aside.
 fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) {
     let ctx_addr = h.threads[h.current].kstate.ctx_addr;
+    // The parent carries on after its `clone`, whenever it next gets a turn.
+    h.threads[h.current].pc = pc + 4;
+    h.threads[h.current].waiting = Waiting::Runnable;
+    h.threads[h.current].blocked_on = None;
     let snapshot = snapshot_memory(h);
     let mut child_kernel = h.kernel.fork_kernel();
     child_kernel.pid = pid;
@@ -1352,35 +1397,104 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
 }
 
-/// A child has finished. Put its parent back and let it see the status.
+/// Put a saved process back on the wasm stack, and set `h` to be it.
 ///
-/// Returns 1 when there is a parent to resume, 2 when this was the last
-/// process and the page's run is over.
-fn resume_parent(h: &mut Host, code: i32) -> i32 {
-    let Some(p) = h.suspended.pop() else {
-        h.exit = Some(code);
-        return 2;
-    };
-    // Published before the memory goes back, because the table is shared
-    // between the two kernels and this is the only record the parent's
-    // `wait4` will find.
-    h.kernel.procs.exit(p.pid, code);
+/// The one that was running is *not* preserved by this; the two callers
+/// differ in exactly that, and each does its own half:
+/// [`switch_process`] saves it first, and [`exit_process`] throws it away.
+fn install_process(h: &mut Host, p: Suspended) {
     restore_memory(&p.snapshot);
     h.kernel = p.kernel;
     h.threads = p.threads;
     h.current = p.current;
-    // The parent's pages keep the slots they had -- its directory, just
-    // restored, names them -- but allocation carries on from wherever the
-    // child got to. Rewinding the mark would hand the parent's next
-    // translation slots the child is still using, and the parent would
-    // dispatch one page's code from another page's directory entry.
+    // The restored process's pages keep the slots they had -- its directory,
+    // just restored, names them -- but allocation carries on from wherever
+    // the other one got to. Rewinding the mark would hand this process's next
+    // translation slots the other is still using, and it would dispatch one
+    // page's code from another page's directory entry.
     let mark = h.jit.page_table.slots();
     h.jit.page_table = p.page_table;
     h.jit.page_table.advance_to(mark);
     h.jit.translated = p.translated;
     h.resume = Some(p.resume_pc);
     h.resume_ctx = Some(p.resume_ctx);
-    1
+}
+
+/// Give the stack to the saved process at `idx`, saving the running one.
+///
+/// The caller has already decided that nothing in the running process can
+/// make progress, which is the whole of the scheduling policy: a process runs
+/// until it blocks. There is no timeslice, because a switch copies two memory
+/// images and preempting a busy process would pay that for nothing.
+///
+/// The two images are exchanged rather than saved and then loaded, so there
+/// is never a moment when the host holds neither a kernel nor a process.
+fn switch_process(h: &mut Host, idx: usize) {
+    let target = h.suspended.remove(idx);
+    // Everything read out of the running process, before any of it moves.
+    let pid = h.kernel.pid;
+    let t = &h.threads[h.current];
+    let (resume_pc, resume_ctx) = (t.pc, t.kstate.ctx_addr);
+    let snapshot = snapshot_memory(h);
+    let mark = h.jit.page_table.slots();
+
+    let mine = Suspended {
+        pid,
+        snapshot,
+        resume_pc,
+        resume_ctx,
+        kernel: std::mem::replace(&mut h.kernel, target.kernel),
+        threads: std::mem::replace(&mut h.threads, target.threads),
+        current: std::mem::replace(&mut h.current, target.current),
+        page_table: std::mem::replace(&mut h.jit.page_table, target.page_table),
+        translated: std::mem::replace(&mut h.jit.translated, target.translated),
+    };
+    // Cleared through the *outgoing* process's map, which is why this reads
+    // from `mine` rather than from `h` -- by now `h.kernel` is the target's.
+    {
+        let data = guest_bytes();
+        for v in mine.kernel.mem.vmas() {
+            let (a, b) = (v.start as usize, (v.end as usize).min(data.len()));
+            if a < b {
+                data[a..b].fill(0);
+            }
+        }
+    }
+    restore_memory(&target.snapshot);
+    h.jit.page_table.advance_to(mark);
+    h.resume = Some(target.resume_pc);
+    h.resume_ctx = Some(target.resume_ctx);
+    h.suspended.push(mine);
+}
+
+/// This process has exited. Hand the stack to another, or end the run.
+///
+/// Returns 1 when another process took over, 2 when this was the last one.
+fn exit_process(h: &mut Host, code: i32) -> i32 {
+    // Published before anything else, because the table is shared between
+    // every kernel and this is the record a parent's `wait4` will find --
+    // and the parent may be parked on exactly that.
+    let pid = h.kernel.pid;
+    h.kernel.procs.exit(pid, code);
+    // The parent first when there is one, so `fork` then `wait` costs one
+    // switch and lands where it did before any of this existed. Otherwise
+    // whatever is left, in the order it was saved.
+    let ppid = h.kernel.ppid;
+    let idx = h
+        .suspended
+        .iter()
+        .position(|p| p.pid == ppid)
+        .or(h.suspended.len().checked_sub(1));
+    let Some(idx) = idx else {
+        h.exit = Some(code);
+        return 2;
+    };
+    let target = h.suspended.remove(idx);
+    clear_mapped(h);
+    install_process(h, target);
+    // 3: the scheduler picks a thread out of the process just installed, and
+    // finishes whatever syscall it was parked in.
+    3
 }
 
 /// `execve`: replace this process's image with another program's.
@@ -1403,7 +1517,30 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.close_on_exec();
     // Handlers are addresses in the image being replaced; see Signals::exec.
     h.kernel.signals.exec();
+    // The old image goes, and not only from the memory map.
+    //
+    // On a real kernel `execve` gets a new address space and everything the
+    // old program had is gone. Here there is one address space, so anything
+    // not deliberately cleared is still sitting in it -- and the next program
+    // maps its libraries at the same addresses, because a fresh map allocates
+    // from the same place. What it finds there is the previous program's
+    // *relocated* copy of the same library.
+    //
+    // That is not harmless. `sleep` after `dash` came up with its .got.plt
+    // still holding link-time addresses: ld.so had decided there was nothing
+    // to do, and the first call through the PLT branched to 0x15c0 -- the
+    // unbiased PLT0 -- and died in unmapped memory.
+    let old: Vec<(u64, u64)> = h.kernel.mem.vmas().iter().map(|v| (v.start, v.end)).collect();
     h.kernel.mem = gex_kernel::mem::MemoryMap::new(program.brk());
+    {
+        let data = guest_bytes();
+        for (start, end) in old {
+            let (a, b) = (start as usize, (end as usize).min(data.len()));
+            if a < b {
+                data[a..b].fill(0);
+            }
+        }
+    }
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
@@ -1504,7 +1641,67 @@ fn now_ns() -> u64 {
 /// a different context pointer -- which is why this works at all without
 /// Workers, shared memory or a second stack.
 ///
-/// Returns 2 when the process is over and 1 to re-enter the guest.
+/// What the scheduler decided.
+enum Pick {
+    /// Run this thread of the process already loaded, having timed out or not.
+    Thread(usize, bool),
+    /// A different process is now on the stack, with its resume point set.
+    Switched,
+    /// Nothing anywhere can run yet.
+    Idle,
+    /// The last process has finished.
+    Over,
+}
+
+/// Whether a thread could make progress if it were given the stack.
+///
+/// Asked of threads whose process is not loaded as well as of the running
+/// one, which is what lets the scheduler cross a process boundary. Everything
+/// it consults -- handles, sockets, futexes, the clock -- is reference-counted
+/// and lives outside guest memory, so the answer does not depend on whose
+/// image is currently in it.
+fn thread_ready(t: &Thread, now: u64) -> bool {
+    match &t.waiting {
+        Waiting::Runnable => true,
+        Waiting::Futex { parked, deadline } => {
+            parked.woken() || deadline.is_some_and(|d| now >= d)
+        }
+        Waiting::Sleep(d) => now >= *d,
+        Waiting::Read(handle) => handle.poll_readable(),
+        Waiting::Write(handle) => handle.poll_writable(),
+        Waiting::Net(deadline) => {
+            deadline.is_some_and(|d| now >= d)
+                || match &t.blocked_on {
+                    Some(gex_kernel::BlockOp::Connect { socket }) => {
+                        socket.status() != gex_kernel::net::Status::Connecting
+                    }
+                    Some(gex_kernel::BlockOp::Poll { fds, .. }) => {
+                        gex_kernel::syscalls::poll_ready(fds)
+                    }
+                    _ => true,
+                }
+        }
+        // Ready when one of the children this call can collect has a status
+        // waiting, and also when there are none at all -- that is `ECHILD`,
+        // which is an answer and not a reason to sleep forever.
+        Waiting::Child => match &t.blocked_on {
+            Some(gex_kernel::BlockOp::WaitChild { children, want, .. }) => {
+                let mut any = false;
+                for c in children.iter().filter(|c| *want <= 0 || c.pid == *want) {
+                    any = true;
+                    if c.status.lock().map(|st| st.is_some()).unwrap_or(true) {
+                        return true;
+                    }
+                }
+                !any
+            }
+            _ => true,
+        },
+        Waiting::Exited => false,
+    }
+}
+
+/// Returns 2 when the run is over and 1 to re-enter the guest.
 fn schedule() -> i32 {
     loop {
         // Before anything is chosen. A vtest client writes a request and then
@@ -1514,14 +1711,19 @@ fn schedule() -> i32 {
         // it has.
         with_host(|h| h.virgl.clone()).map(|v| v.pump());
         let pick = with_host(|h| {
-            // Nothing left that could ever run again ends the process, and
-            // the exit status is the one the main thread would have given.
+            // Nothing left that could ever run again ends this process. It
+            // does not necessarily end the run: another may be waiting for
+            // exactly this, and `exit_process` hands it the stack.
             if h.threads
                 .iter()
                 .all(|t| matches!(t.waiting, Waiting::Exited))
             {
-                h.exit.get_or_insert(0);
-                return None;
+                let code = h.exit.take().unwrap_or(0);
+                if exit_process(h, code) == 1 {
+                    return Pick::Switched;
+                }
+                h.exit.get_or_insert(code);
+                return Pick::Over;
             }
             let now = now_ns();
             // Round-robin from the one after the current, so a thread that
@@ -1529,45 +1731,50 @@ fn schedule() -> i32 {
             let n = h.threads.len();
             for step in 1..=n {
                 let i = (h.current + step) % n;
-                let ready = match &h.threads[i].waiting {
-                    Waiting::Runnable => true,
-                    Waiting::Futex { parked, deadline } => {
-                        parked.woken() || deadline.is_some_and(|d| now >= d)
-                    }
-                    Waiting::Sleep(d) => now >= *d,
-                    Waiting::Read(handle) => handle.poll_readable(),
-                    Waiting::Write(handle) => handle.poll_writable(),
-                    Waiting::Net(deadline) => {
-                        deadline.is_some_and(|d| now >= d)
-                            || match &h.threads[i].blocked_on {
-                                Some(gex_kernel::BlockOp::Connect { socket }) => {
-                                    socket.status() != gex_kernel::net::Status::Connecting
-                                }
-                                Some(gex_kernel::BlockOp::Poll { fds, .. }) => {
-                                    gex_kernel::syscalls::poll_ready(fds)
-                                }
-                                _ => true,
-                            }
-                    }
-                    Waiting::Exited => false,
-                };
-                if ready {
+                if thread_ready(&h.threads[i], now) {
                     let timed_out = match &h.threads[i].waiting {
                         Waiting::Futex { parked, .. } => !parked.woken(),
                         _ => false,
                     };
-                    return Some(Some((i, timed_out)));
+                    return Pick::Thread(i, timed_out);
                 }
+            }
+            // Nothing here can run. Another process might -- a shell that
+            // started a daemon with `&` is sitting Runnable in `suspended`
+            // while the daemon waits for a connection, and before processes
+            // took turns that shell simply never ran again.
+            //
+            // The check costs nothing: a saved thread's readiness is asked of
+            // the same handles and futexes, which are reference-counted and
+            // alive whether or not their process's memory is loaded.
+            if let Some(idx) = h
+                .suspended
+                .iter()
+                .position(|p| p.threads.iter().any(|t| thread_ready(t, now)))
+            {
+                switch_process(h, idx);
+                // `switch_process` set the resume point; the caller re-enters
+                // the guest with it rather than picking a thread here.
+                return Pick::Switched;
             }
             // Everything is asleep or parked with a deadline. There is no
             // other thread to advance the clock, so spinning is the only way
             // to reach the earliest one.
-            Some(None)
+            Pick::Idle
         });
-        let Some(pick) = pick else {
+        // A switch installs a process but chooses nothing. Going round again
+        // is what picks a thread out of it -- and, crucially, what finishes
+        // the syscall that thread parked in. Resuming its saved pc directly
+        // skipped that, so it carried on with no return value in x0 and
+        // branched through whatever was there: `nothing to translate at
+        // pc=0xffff0`, on every pipeline.
+        if matches!(pick, Pick::Switched) {
+            continue;
+        }
+        if matches!(pick, Pick::Over) {
             return 2;
-        };
-        let Some((i, timed_out)) = pick else {
+        }
+        let Pick::Thread(i, timed_out) = pick else {
             // A thread waiting for input is not stuck: the page will deliver
             // some. Give the stack back to JS so it can, and come back here
             // when it has.
@@ -1645,6 +1852,11 @@ fn schedule() -> i32 {
                 h.threads
                     .iter()
                     .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
+                    && h.suspended.iter().all(|p| {
+                        p.threads
+                            .iter()
+                            .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
+                    })
             }) {
                 // Every remaining thread is parked on a futex nothing will
                 // ever wake. On Linux this hangs; saying so is more useful.
@@ -1934,6 +2146,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                     // Only the scheduler proper re-checks these; a safepoint
                     // switch does not need to.
                     Waiting::Net(deadline) => deadline.is_some_and(|d| now >= d),
+                    Waiting::Child => false,
                     Waiting::Exited => false,
                 }
         });

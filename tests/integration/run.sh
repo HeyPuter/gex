@@ -548,6 +548,7 @@ echo "building guest programs..."
 # Exits while other threads are mid-work, including two parked on a futex.
 "$CC" -static -no-pie -O2 -o "$WORK/exitrace" "$HERE/programs/exitrace.c" -lpthread
 "$CC" -static -no-pie -O2 -o "$WORK/fork" "$HERE/programs/fork.c"
+"$CC" -static -no-pie -O2 -o "$WORK/background" "$HERE/programs/background.c"
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
 "$CC" -static -O2 -o "$WORK/selfmod" "$HERE/programs/selfmod.c"
@@ -736,6 +737,10 @@ fi
 compare "threads" "$WORK/threads"
 compare "thread-exit-race" "$WORK/exitrace"
 compare "fork" "$WORK/fork"
+# A child that is still running while its parent works. The browser host used
+# to freeze the parent until the child exited, so a daemon started with `&`
+# stopped the shell for good; this is the test that says it does not.
+compare "background" "$WORK/background"
 # argv and envp reach the new program, a close-on-exec descriptor is gone and
 # an ordinary one survives with its offset, and a failed exec returns.
 expect "exec" "argc=4 [child] [two] [three]

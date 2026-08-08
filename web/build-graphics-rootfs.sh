@@ -60,6 +60,7 @@ libtinfo.so.6 libgpg-error.so.0 libgcrypt.so.20 libsystemd.so.0
 libGL.so.1 libGLX.so.0 libGLX_mesa.so.0 libGLdispatch.so.0 libglapi.so.0
 libdrm.so.2 libdrm_amdgpu.so.1 libdrm_nouveau.so.2 libdrm_radeon.so.1
 libelf.so.1 libsensors.so.5 libstdc++.so.6
+libLLVM-15.so.1 libz3.so.4
 libX11.so.6 libX11-xcb.so.1 libXau.so.6 libXdmcp.so.6 libXext.so.6
 libXfixes.so.3 libXfont2.so.2 libXxf86vm.so.1 libxkbfile.so.1
 libxcb.so.1 libxcb-dri2.so.0 libxcb-dri3.so.0 libxcb-glx.so.0
@@ -111,31 +112,6 @@ cp -r "$SRC/usr/share/X11/xkb" "$R/usr/share/X11/xkb"
 [ -e "$SRC/usr/share/drirc.d" ] && cp -r "$SRC/usr/share/drirc.d" "$R/usr/share/drirc.d"
 [ -e "$SRC/usr/lib/xorg/protocol.txt" ] && cp "$SRC/usr/lib/xorg/protocol.txt" "$R/usr/lib/xorg/"
 
-# The stand-in for LLVM. Generated from the megadriver's own import list, so
-# it stays right when the driver is rebuilt from a different Debian.
-readelf -W --dyn-syms "$R/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so" |
-    awk '$7 == "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/undef"
-readelf -W --dyn-syms "$SRC/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" |
-    awk '$7 != "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/llvm"
-comm -12 "$WORK/undef" "$WORK/llvm" > "$WORK/need"
-{
-    echo '.text'
-    while read -r s; do
-        printf '.globl %s\n.type %s,@function\n%s:\n  brk #0\n' "$s" "$s" "$s"
-    done < "$WORK/need"
-} > "$WORK/llvmstub.s"
-# The version, and it is not decoration. swrast_dri.so imports every one of
-# these as `LLVMFoo@LLVM_15`, and a stub that defines them unversioned does
-# not merely warn: glibc's ld.so fails an internal assertion in dl-lookup.c
-# and kills the process before `main`. So the stub declares the same version
-# libLLVM does.
-cat > "$WORK/llvmstub.map" <<'MAPEOF'
-LLVM_15 { global: *; };
-MAPEOF
-"$CC" -shared -nostdlib -o "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" \
-    "$WORK/llvmstub.s" -Wl,-soname,libLLVM-15.so.1 \
-    -Wl,--version-script="$WORK/llvmstub.map"
-echo "  libLLVM stub: $(wc -l < "$WORK/need") symbols, $(du -h "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" | cut -f1)"
 
 cat > "$R/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/sh
