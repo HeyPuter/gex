@@ -27,7 +27,16 @@ export class VirglRenderer {
    * @param {HTMLCanvasElement} canvas the drawing surface
    * @param {string} url where gexvirgl.mjs was published
    */
-  static async create(canvas, url = '/gex/gexvirgl.mjs') {
+  /**
+   * @param {HTMLCanvasElement} canvas the drawing surface
+   * @param {string} url where gexvirgl.mjs was published
+   * @param {(s: string) => void} [onLog] where the renderer's own diagnostics
+   *   go. The default is the console, which in a headless browser goes
+   *   nowhere useful and is dropped under load -- a trace that arrives four
+   *   lines out of twenty is worse than none, because it reads like the
+   *   twentieth. A harness that has a channel of its own should pass it.
+   */
+  static async create(canvas, url = '/gex/gexvirgl.mjs', onLog = null) {
     const r = new VirglRenderer();
     r.#canvas = canvas;
     // virglrenderer looks the canvas up by selector, so it has to carry the
@@ -38,8 +47,8 @@ export class VirglRenderer {
       r.#module = await Module({
         // virglrenderer explains itself on stderr and says nothing through a
         // return value beyond "no", so this is the only diagnostic there is.
-        printErr: (s) => console.warn('[virgl]', s),
-        print: (s) => console.log('[virgl]', s),
+        printErr: (s) => (onLog ? onLog(s) : console.warn('[virgl]', s)),
+        print: (s) => (onLog ? onLog(s) : console.log('[virgl]', s)),
       });
       const rc = r.#module._gex_virgl_init(canvas.width, canvas.height);
       if (rc !== 0) {

@@ -101,11 +101,23 @@ addEventListener('unhandledrejection', (e) =>
 //
 // The guest writes a line each time it reaches a stage, and those writes come
 // through here.
+function syncReport(line) {
+  try {
+    const x = new XMLHttpRequest();
+    x.open('POST', '/report?kind=progress', false);
+    x.send(line);
+  } catch (e) { /* the server has gone; nothing to be done from here */ }
+}
 let report = () => {};
 let drew = () => {};
 class PageEnv extends Env {
   write(fd, bytes) {
     const text = new TextDecoder().decode(bytes);
+    // When tracing, the guest's stderr goes out synchronously too, so that
+    // it interleaves correctly with the renderer's own lines. Two channels
+    // with different latencies produce a plausible ordering that is not the
+    // real one, and the whole point of this trace is what came last.
+    if (TRACE && fd === 2) syncReport(text.trimEnd());
     output += text;
     paint();
     for (const line of text.split('\\n')) {
@@ -121,8 +133,28 @@ class PageEnv extends Env {
 
 try {
   mark('creating the renderer');
+  // The renderer's diagnostics through this harness's own channel, not the
+  // console. It is a separate wasm module with its own libc and cannot reach
+  // the shim's stderr, and the headless browser's console is unreliable
+  // under load -- four lines of twenty arrived, which reads like the whole
+  // trace and is not.
+  // Delivered synchronously when tracing, with a blocking XMLHttpRequest.
+  //
+  // Everything else in this harness reports through fetch, which needs the
+  // event loop to turn. That is fine until the thing being diagnosed is a
+  // call that does not return: the line naming it is written, queued, and
+  // never sent, so the last thing reported is always the last thing before
+  // the interesting one. A synchronous request is slow and rude and arrives.
+  const rsend = (s) => syncReport('[virgl] ' + s);
+
+  const rlog = [];
   const renderer = await VirglRenderer.create(document.getElementById('gex-gl'),
-                                              './gexvirgl.mjs');
+                                              './gexvirgl.mjs',
+                                              (s) => {
+                                                if (TRACE) { rsend(s); return; }
+                                                rlog.push(s);
+                                                if (rlog.length > 6) rlog.shift();
+                                              });
   if (!renderer.ok) { say('RENDERER FAILED: ' + renderer.error); throw 0; }
 
   mark('unpacking the rootfs');
@@ -209,7 +241,8 @@ try {
       while (queued.length) {
         const [at, l] = queued.shift();
         post('progress', at + 's | ' + l + ' | ' + blocks + ' blocks in ' + ms +
-          'ms | ' + renderer.glState() + '\\n        ' + renderer.commands());
+          'ms | ' + renderer.glState() + '\\n        ' + renderer.commands() +
+          (rlog.length ? '\\n        renderer: ' + rlog.join(' / ') : ''));
       }
     });
   };

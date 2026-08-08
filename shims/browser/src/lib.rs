@@ -2675,9 +2675,33 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
             BEAT
         };
         if beat.is_multiple_of(every) {
-            let blocks = with_host(|h| h.jit.blocks);
+            // With the threads, because a spin says nothing on its own. A
+            // guest looping over three addresses for two million safepoints
+            // is either the only thread there is -- in which case it is
+            // waiting for something outside itself -- or it is waiting for a
+            // sibling that is not being given a turn, and those want
+            // completely different fixes.
+            let (blocks, census, whose) = with_host(|h| {
+                let mut out = String::new();
+                for (i, t) in h.threads.iter().enumerate() {
+                    out.push_str(&format!(" {i}={}", waiting_name(&t.waiting)));
+                }
+                // And which object the pc is in. A bare address says a run
+                // is spinning; the library and the offset say where to look,
+                // and turn it into a disassembly rather than a mystery.
+                let whose = h
+                    .kernel
+                    .mem
+                    .vmas()
+                    .iter()
+                    .find(|v| (pc as u64) >= v.start && (pc as u64) < v.end)
+                    .map(|v| format!("{}+{:#x}", v.name, pc as u64 - v.start))
+                    .unwrap_or_default();
+                (h.jit.blocks, out, whose)
+            });
             trace_line(&format!(
-                "[beat] {beat} safepoints, pc={:#x}, {blocks} blocks translated\n",
+                "[beat] {beat} safepoints, pc={:#x} ({whose}), {blocks} blocks, \
+                 threads:{census}\n",
                 pc as u64
             ));
         }
