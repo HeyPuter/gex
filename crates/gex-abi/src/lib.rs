@@ -171,11 +171,16 @@ pub const DISPATCH_DIR_END: u64 = DISPATCH_DIR + DISPATCH_DIR_BYTES;
 
 /// Ceiling on the dispatch table, so it can grow as libraries are mapped.
 ///
-/// Sixteen million slots is 16,384 covered pages, or 64 MiB of guest text —
-/// more than any single process maps, while staying an ordinary allocation
-/// for the engine. The table is created at the image's size and grown from
-/// there, so the ceiling costs nothing until it is used.
-pub const DISPATCH_TABLE_MAX_SLOTS: u64 = 1 << 24;
+/// Ten million slots is 9,765 covered pages, or 38 MiB of guest text. The
+/// table is created at the image's size and grown from there, so the ceiling
+/// costs nothing until it is used.
+///
+/// The number is V8's, not a choice: `WebAssembly.Table.grow` refuses past
+/// ten million however the table was declared, so a larger ceiling here was
+/// only ever a promise the browser would not keep. It said `1 << 24`, and
+/// what a page actually got was `failed to grow table by 20480` at 9,996,288
+/// with no indication that the limit was the engine's.
+pub const DISPATCH_TABLE_MAX_SLOTS: u64 = 10_000_000;
 
 /// Directory index for a guest address.
 #[inline]

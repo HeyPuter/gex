@@ -1878,7 +1878,7 @@ fn schedule() -> i32 {
             let t = &mut h.threads[i];
             t.waiting = Waiting::Runnable;
             let op = t.blocked_on.take();
-            let (pc, kstate) = (t.pc, t.kstate.clone());
+            let (mut pc, kstate) = (t.pc, t.kstate.clone());
             if let Some(op) = op {
                 // The syscall that parked this thread still owes it a return
                 // value, and the kernel writes that into the context of
@@ -1888,9 +1888,30 @@ fn schedule() -> i32 {
                 let r = finish_parked(&op, timed_out, &mut gm);
                 let outcome = h.kernel.finish_blocking(&mut gm, r);
                 h.kernel.leave_thread(&mut h.threads[h.current].kstate);
-                if let SyscallOutcome::Exit(code) = outcome {
-                    h.exit = Some(code);
-                    return None;
+                match outcome {
+                    SyscallOutcome::Exit(code) => {
+                        h.exit = Some(code);
+                        return None;
+                    }
+                    // Finishing a blocked syscall can *deliver a signal*.
+                    // Delivery builds the handler's frame and says where to
+                    // go, and this is the only place that can honour it: the
+                    // thread's saved pc is the instruction after its `svc`,
+                    // which is not where a handler starts.
+                    //
+                    // Dropping it is why every `fork` from a shell broke. A
+                    // child exiting is SIGCHLD and a shell handles SIGCHLD,
+                    // so `(echo sub); echo after` printed `sub`, ran the
+                    // instruction after the `svc` on top of the handler's
+                    // frame, and branched to address 0x80 with 17 -- SIGCHLD
+                    // -- still sitting in x0 where the handler's first
+                    // argument goes.
+                    SyscallOutcome::Resume(target) => pc = target,
+                    SyscallOutcome::Killed { signal, .. } => {
+                        h.exit = Some(128 + signal as i32);
+                        return None;
+                    }
+                    _ => {}
                 }
             }
             Some((kstate.ctx_addr, pc))
@@ -2191,6 +2212,40 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
     if tracing() {
         trace_line(&format!("[gex] miss at pc={pc:#x}\n"));
+    }
+    // A signal handler returning. When the guest gave no `sa_restorer` the
+    // kernel puts `SIGRETURN_TRAMPOLINE` in x30, an address inside the
+    // reserved region that deliberately has nothing translated at it -- so
+    // the handler's `ret` arrives here, which is the whole mechanism.
+    //
+    // The native host has always done this. The browser did not, and the
+    // failure was spectacular rather than quiet: any handler at all ended the
+    // run with `nothing to translate at pc=0xffff0`. What made it look like a
+    // fork bug is that a shell's first handler is SIGCHLD, so it took a child
+    // exiting to reach one.
+    if pc == gex_kernel::signal::SIGRETURN_TRAMPOLINE {
+        let resumed = with_host(|h| {
+            let mut gm = GuestMem::new(guest_bytes());
+            let kstate = h.threads[h.current].kstate.clone();
+            h.kernel.enter_thread(&kstate);
+            let r = h.kernel.sigreturn(&mut gm);
+            h.kernel.leave_thread(&mut h.threads[h.current].kstate);
+            match r {
+                Ok(target) => {
+                    h.threads[h.current].pc = target;
+                    h.resume = Some(target);
+                    h.resume_ctx = Some(kstate.ctx_addr);
+                    true
+                }
+                Err(_) => {
+                    trace_line("gex: corrupt signal frame on sigreturn\n");
+                    h.exit = Some(128 + 11);
+                    false
+                }
+            }
+        });
+        let _ = resumed;
+        trap();
     }
     let translated = with_host(|h| {
         if !h.jit.described {

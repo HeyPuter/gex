@@ -449,7 +449,15 @@ export class Gex {
     const bytes = this.#u8.slice(ptr, ptr + len);
     const table = this.#guest.exports.dispatch;
     const need = e.gex_jit_slots() >>> 0;
-    if (table.length < need) table.grow(need - table.length, table.get(0));
+    if (table.length < need) {
+      try {
+        table.grow(need - table.length, table.get(0));
+      } catch (err) {
+        throw new Error(
+          `the dispatch table would not grow from ${table.length} to ${need}: ${err.message}`,
+        );
+      }
+    }
     const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
       gex: { ...this.#imports, dispatch: table },
     });

@@ -549,6 +549,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/exitrace" "$HERE/programs/exitrace.c" -lpthread
 "$CC" -static -no-pie -O2 -o "$WORK/fork" "$HERE/programs/fork.c"
 "$CC" -static -no-pie -O2 -o "$WORK/background" "$HERE/programs/background.c"
+"$CC" -static -no-pie -O2 -o "$WORK/sigblocked" "$HERE/programs/signal-while-blocked.c"
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
 "$CC" -static -O2 -o "$WORK/selfmod" "$HERE/programs/selfmod.c"
@@ -741,6 +742,11 @@ compare "fork" "$WORK/fork"
 # to freeze the parent until the child exited, so a daemon started with `&`
 # stopped the shell for good; this is the test that says it does not.
 compare "background" "$WORK/background"
+# A signal delivered while the program is parked in a syscall. The browser
+# dropped the delivery and had no case for the sigreturn trampoline, so any
+# handler at all ended the run -- and since the first handler most programs
+# install is SIGCHLD, every fork from a shell did it.
+compare "signal-while-blocked" "$WORK/sigblocked"
 # argv and envp reach the new program, a close-on-exec descriptor is gone and
 # an ordinary one survives with its offset, and a failed exec returns.
 expect "exec" "argc=4 [child] [two] [three]

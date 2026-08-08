@@ -424,15 +424,18 @@ const virglGears = {
     );
     ctx.term.writeln('');
     ctx.term.writeln(
-      ctx.ansi.red('This one does not draw yet. The X server starts, then dies setting up'),
+      ctx.ansi.red('This one does not draw yet. The X server starts and runs; what stops'),
     );
     ctx.term.writeln(
-      ctx.ansi.red('its keyboard: it hands the keymap to `xkbcomp` down a pipe, and a pipe'),
+      ctx.ansi.red('it is the dispatch table, which a browser will not grow past ten'),
     );
     ctx.term.writeln(
-      ctx.ansi.red('between two guest processes reads end-of-file here. Everything up to'),
+      ctx.ansi.red('million entries. A slot is claimed per 4 KiB of guest text and none is'),
     );
-    ctx.term.writeln(ctx.ansi.red('that point is real, and what follows is the run, unedited.'));
+    ctx.term.writeln(
+      ctx.ansi.red('ever given back, so an X server, Mesa and the LLVM inside it exhaust'),
+    );
+    ctx.term.writeln(ctx.ansi.red('them. What follows is the run, unedited, as far as it gets.'));
     ctx.term.writeln('');
 
     const start = async (seconds) => {
