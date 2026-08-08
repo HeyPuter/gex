@@ -69,11 +69,36 @@ predict: `DoNNetIteration` has 18 fused multiply-adds, `lusolve` 5 and `DoLU`
 `crates/gex-emit/src/fma.rs` has arithmetic that is exact and can therefore
 ship; what is left is to lower it instead of the call.
 
+## After the inline FMA
+
+Re-run 2026-08-07 with the fused multiply-add emitted inline. Browser
+multipliers against QEMU, before and after:
+
+| KERNEL           | before | after  |        |
+|------------------|--------|--------|--------|
+| LU DECOMPOSITION | 3.82x  | 8.03x  | 2.1x   |
+| NEURAL NET       | 11.24x | 17.66x | 1.6x   |
+| STRING SORT      | 2.30x  | 2.65x  | noise  |
+| everything else  |        |        | noise  |
+
+The two that moved are the two with fused multiply-adds worth counting. LU
+matches the isolated measurement (2.2x) closely enough to believe both.
+
+Several kernels appear to have got *worse* -- FP EMULATION 1.08x to 0.81x,
+HUFFMAN 1.51x to 1.37x -- and that is the noise, not a regression. FP
+EMULATION measured on its own is 160-182 iterations/sec with the call and
+168-178 inline: the ranges overlap, and no fused multiply-add leaves the
+module during it, so the guard is not failing either. Anything that looks
+like a change here should be isolated before it is believed.
+
 ## Caveats worth keeping
 
-* MINSECONDS=2 is short. Most kernels print "NOT 95 % statistically certain",
-  and the browser run is noisier than the other two. Treat single-digit
-  percentage differences as noise; the shape of the table is what is solid.
+* **The noise is about 30%, not a few percent.** QEMU running the same
+  binary three times gave 8.82, 11.19 and 11.46 on ASSIGNMENT, and 300, 386
+  and 383 on NUMERIC SORT. MINSECONDS=2 on a shared machine is simply not
+  enough. Only effects the size of the FMA one are readable from this table;
+  for anything smaller, isolate the kernel and run it repeatedly, which is
+  what `-c<FILE>` with a cut-down config is for.
 * 890 of the module's blocks end in an instruction gex cannot execute, which
   raise SIGILL if reached. None is on a path any kernel took, or the run would
   have died -- but a change that moves work onto one of them would look like a
