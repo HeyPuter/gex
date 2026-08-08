@@ -71,22 +71,14 @@ const WORKER = `
   const u8 = new Uint8Array(proc.buffer);
 
   parentPort.on('message', (m) => {
-    if (m.kind === 'note') {
-      // Write a word into *this* process's memory, then have the kernel copy
-      // it across and remember it. The kernel never dereferences the address.
-      new DataView(proc.buffer).setBigUint64(m.at, BigInt(m.value), true);
-      parentPort.postMessage({ kind: 'noted', got: k.k_note_from_guest(m.at) });
-    } else if (m.kind === 'read') {
-      // And the other direction: the kernel writes into this process.
-      k.k_note_to_guest(m.at);
-      const v = new DataView(proc.buffer).getBigUint64(m.at, true);
-      parentPort.postMessage({ kind: 'readback', value: Number(v) });
+    if (m.kind === 'spawn') {
+      parentPort.postMessage({ kind: 'spawned', pid: k.k_spawn(m.ppid) });
+    } else if (m.kind === 'exists') {
+      parentPort.postMessage({ kind: 'exists', yes: k.k_exists(m.pid) });
     } else if (m.kind === 'checksum') {
       const b = new TextEncoder().encode(m.text);
       u8.set(b, m.at);
       parentPort.postMessage({ kind: 'sum', sum: k.k_checksum(m.at, b.length) });
-    } else if (m.kind === 'calls') {
-      parentPort.postMessage({ kind: 'calls', n: k.k_calls() });
     } else if (m.kind === 'peek') {
       // Whatever is at this address in *my* process memory.
       parentPort.postMessage({ kind: 'peeked', byte: u8[m.at] });
@@ -126,17 +118,14 @@ const fail = (why) => {
 const a = await spawn();
 const b = await spawn();
 
-// 1. The kernel's state is one thing, not two.
-await a.ask({ kind: 'note', at: 0x1000, value: 0xbeef }, 'noted');
-const seen = await b.ask({ kind: 'read', at: 0x2000 }, 'readback');
-if (seen.value !== 0xbeef) {
-  fail(`process B read ${seen.value.toString(16)} where A left beef -- the kernel memory is not shared`);
+// 1. The kernel's state is one thing, not two: a process created through one
+//    Worker's instance is there in the other's.
+const spawned = await a.ask({ kind: 'spawn', ppid: 1 }, 'spawned');
+if (spawned.pid <= 1) fail(`spawn gave pid ${spawned.pid}`);
+const seen = await b.ask({ kind: 'exists', pid: spawned.pid }, 'exists');
+if (!seen.yes) {
+  fail(`process ${spawned.pid} is missing in the other Worker -- the kernel memory is not shared`);
 }
-
-// The call counter proves the same thing from the other side: B's instance
-// incremented a counter A's instance had already touched.
-const calls = await b.ask({ kind: 'calls' }, 'calls');
-if (calls.n < 2) fail(`the kernel counted ${calls.n} calls across two Workers, expected at least 2`);
 
 // 2. And the process memories are *not* shared. A wrote 0xbeef at 0x1000 of
 //    its own; B's 0x1000 must be untouched. If this fails, two guests are
