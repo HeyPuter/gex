@@ -1945,6 +1945,34 @@ fn thread_ready(t: &Thread, now: u64) -> bool {
 }
 
 /// Returns 2 when the run is over and 1 to re-enter the guest.
+/// What a parked thread is waiting for, in one word, for a census.
+///
+/// Written out rather than derived: `Waiting` carries file handles and futex
+/// parks, and none of those are worth printing -- what matters when a run
+/// stops is the shape of the wait, not its contents.
+fn waiting_name(w: &Waiting) -> &'static str {
+    match w {
+        Waiting::Runnable => "runnable",
+        Waiting::Futex { deadline: Some(_), .. } => "futex+timeout",
+        Waiting::Futex { .. } => "futex",
+        Waiting::Sleep(_) => "sleep",
+        Waiting::Read(_) => "read",
+        Waiting::Write(_) => "write",
+        Waiting::Accept(_) => "accept",
+        Waiting::Child => "wait4",
+        Waiting::Net(Some(_)) => "net+timeout",
+        Waiting::Net(None) => "net",
+        Waiting::Exited => "exited",
+    }
+}
+
+/// How many scheduler turns in a row have found nothing to run.
+///
+/// Outside the function because each turn is its own call: the scheduler
+/// hands the stack back to the page and is re-entered, so a local would
+/// start from zero every time and never notice it was getting nowhere.
+static IDLE_SPINS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn schedule() -> i32 {
     loop {
         // Before anything is chosen. A vtest client writes a request and then
@@ -2044,7 +2072,17 @@ fn schedule() -> i32 {
                         .unwrap_or(false)
                 };
                 let mut mask = 0u8;
-                for t in &h.threads {
+                // Every thread in the run, not just the ones in the process
+                // that happens to be loaded. A shell blocked in `wait4` for a
+                // child in another process contributes nothing here, and the
+                // child -- the one actually waiting on the page -- was not
+                // being looked at, so the answer came out zero and the loop
+                // below spun at full speed for as long as the run lasted.
+                for t in h
+                    .threads
+                    .iter()
+                    .chain(h.suspended.iter().flat_map(|p| p.threads.iter()))
+                {
                     match &t.waiting {
                         Waiting::Write(_) => mask |= 1,
                         // A listener waiting for a client. Whoever connects
@@ -2114,8 +2152,44 @@ fn schedule() -> i32 {
                 with_host(|h| h.exit = Some(128 + 31));
                 return 2;
             }
-            continue;
+            // Nothing is runnable and nothing above recognised what anything
+            // is waiting for. Going round again would ask the same question
+            // of the same unchanged state, at whatever speed the CPU allows.
+            //
+            // That is what happened: 105% of a core, for as long as anyone
+            // let it run, with no output at all -- the heartbeat only beats
+            // from a safepoint or a dispatch miss, and a guest that is not
+            // executing reaches neither. A hang and a hard-working run were
+            // the same picture.
+            //
+            // So say what everything is waiting for, once, and then hand the
+            // stack back. Yielding cannot be wrong when nothing can run: at
+            // worst the page turns its event loop and gives it straight back.
+            let idle_spins =
+                IDLE_SPINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // On a curve. A guest that is genuinely waiting for a keystroke
+            // passes through here every millisecond quite legitimately, and a
+            // line for each would bury the run it is meant to explain.
+            if idle_spins.is_power_of_two() && idle_spins >= 1024 {
+                let census = with_host(|h| {
+                    let mut out = String::new();
+                    for (pid, p) in std::iter::once((0usize, &h.threads))
+                        .chain(h.suspended.iter().enumerate().map(|(i, p)| (i + 1, &p.threads)))
+                    {
+                        for (i, t) in p.iter().enumerate() {
+                            out.push_str(&format!(" {pid}:{i}={}", waiting_name(&t.waiting)));
+                        }
+                    }
+                    out
+                });
+                trace_line(&format!(
+                    "[gex] nothing runnable after {idle_spins} turns, waiting on:{census}\n"
+                ));
+            }
+            with_host(|h| h.paused = 2);
+            return 2;
         };
+        IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
         if tracing() {
             let (pc, blocked) = with_host(|h| (h.threads[i].pc, h.threads[i].blocked_on.is_some()));
             trace_line(&format!(

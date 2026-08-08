@@ -224,7 +224,13 @@ const server = createServer(async (req, res) => {
     const body = Buffer.concat(chunks).toString();
     const kind = new URL(req.url, 'http://x').searchParams.get('kind');
     if (kind === 'progress') {
-      if (!process.env.GEX_QUIET) console.log(`     ... ${body.split('\n')[0]}`);
+      // Every line, indented under the first. This took the first only, and
+      // silently ate the command histogram it was asked to print.
+      if (!process.env.GEX_QUIET) {
+        const [first, ...rest] = body.split('\n');
+        console.log(`     ... ${first}`);
+        for (const l of rest) console.log(`         ${l.trim()}`);
+      }
     } else {
       finish(body);
     }
