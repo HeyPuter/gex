@@ -2814,6 +2814,16 @@ pub extern "C" fn gex_sysreg_write(_ctx: i32, _pc: i64, _reg: i32, _val: i64) {}
 /// don't zero -- which showed up as Lua printing stale bytes where it had
 /// formatted a number, three layers down inside `vsnprintf`.
 #[no_mangle]
+/// `dc zva` and friends.
+///
+/// Zeroing a block is a call out of wasm, which looks like it should be the
+/// same kind of prize inlining the fused multiply-add was -- musl's `memset`
+/// zeroes whole blocks with it, so on paper that is a host call every 64
+/// bytes. Measured, it is not: 1.6 GiB of `memset` runs at about 6 GiB/s and
+/// beats qemu-user 0.26s to 0.47s, which is far too fast for twenty-six
+/// million host calls. Whatever musl's `memset` selects for these sizes, it
+/// is not this path. Worth re-checking on a workload that provably reaches
+/// it before lowering this to `memory.fill`.
 pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
     if op != gex_abi::cache_op::DC_ZVA {
         // Clean, invalidate and barrier are all no-ops: the memory is
