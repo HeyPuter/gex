@@ -30,12 +30,19 @@
 # the guest PC in the trap, which is a far better failure than a quietly
 # different picture.
 #
-# It is off by default because it has been seen to break. Xvfb brings up GLX
-# through the swrast DRI entry points, and when that fell back to llvmpipe
-# the run stopped at `gex: breakpoint at pc=0x6d435040` before the X socket
-# ever appeared. Whether it falls back when virgl is actually *available* --
-# it was not, in the run that found this -- is the open question, and the
-# reason this is a switch rather than a decision.
+# It does not work, and the question is now settled rather than open. Xvfb
+# brings up GLX through the swrast DRI entry points and *calls* into llvmpipe,
+# not merely maps it: with the renderer listening and `GALLIUM_DRIVER=virpipe`
+# exported before the X server, the run still stopped at
+# `gex: breakpoint at pc=0x6d435040` five seconds in, before the X socket
+# appeared. The switch remains for anyone who wants to try a client-only
+# workload, where nothing brings up a software rasteriser -- but it will not
+# get an X server up, so it is off.
+#
+# Which also means the 106 MB is not avoidable this way. `swrast_dri.so`
+# names libLLVM in DT_NEEDED, so ld.so maps it at dlopen whichever Gallium
+# driver is chosen, and Xvfb writes out 221 MiB every time it is swapped.
+# That is what makes the arena split (task #71) the thing to do instead.
 set -eu
 
 OUT="${1:-$(cd "$(dirname "$0")" && pwd)/public/rootfs/graphics.tar}"
@@ -160,6 +167,18 @@ EOF
 cat > "$R/gears.sh" <<'EOF'
 export DISPLAY=:0
 export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu
+# Before the X server, not after it.
+#
+# virpipe is Mesa's own name for virgl over a vtest socket, and it is the only
+# thing this guest is ever told about its GPU. It used to be exported further
+# down, just before the client -- which left *Xvfb* to pick a driver for its
+# own GLX, and it picked llvmpipe. The heartbeat caught it: at six and ten
+# seconds the guest was executing at 0x6501bd00 and 0x668fbbfc, deep in the
+# 106 MB of libLLVM, before the X socket had even appeared.
+#
+# Nothing in this demo wants a software rasteriser. The renderer is on the
+# other side of the socket.
+export GALLIUM_DRIVER=virpipe
 # Every step says so. In a page this is the only channel there is, and a run
 # that is merely slow looks exactly like one that is stuck without it -- the
 # first browser attempt at this printed nothing for half an hour and the
@@ -179,9 +198,6 @@ else
   echo "gex: no /tmp/.virgl_test -- Mesa will connect to nothing and wait"
 fi
 echo "gex: loading Mesa and drawing"
-# virpipe is Mesa's own name for virgl over a vtest socket, and it is the
-# only thing the guest is told. Everything else it works out itself.
-export GALLIUM_DRIVER=virpipe
 # Unbounded unless asked otherwise, and whoever started it decides when to
 # stop -- a page closes the tab, a harness gives up. glxgears reports its
 # frame rate every five seconds, which is the signal either of them wants.

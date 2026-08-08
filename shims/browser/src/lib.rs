@@ -782,17 +782,11 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         if seg.executable {
             p |= gex_kernel::mem::prot::EXEC;
         }
-        kernel.mem.insert_from(
-            seg.vaddr,
-            seg.vaddr + seg.mem_size,
-            p,
-            "[image]",
-            // The path is not known yet -- argv is parsed below -- and this
-            // load happens once in the life of a tab, so a marker is as
-            // unique as a name would be. An `execve` later uses the real
-            // path, so nothing can collide with this by accident.
-            Some(("[initial]".to_string(), seg.vaddr)),
-        );
+        // See `do_exec`: an image segment is built, not mapped, so it has
+        // no file to be reconstructed from.
+        kernel
+            .mem
+            .insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]");
     }
 
     // argv arrives as a NUL-separated blob in the shim's own region.
@@ -1339,6 +1333,22 @@ fn snapshot_memory(h: &Host) -> Vec<(u64, Vec<u8>)> {
             out.push((v.start, data[a..b].to_vec()));
         }
     }
+    if unsafe { HEARTBEAT } != 0 {
+        let bytes: usize = out.iter().map(|(_, b)| b.len()).sum();
+        static mut SWITCHES: u64 = 0;
+        static mut COPIED: u64 = 0;
+        let (n, total) = unsafe {
+            SWITCHES = SWITCHES.wrapping_add(1);
+            COPIED = COPIED.wrapping_add(bytes as u64);
+            (SWITCHES, COPIED)
+        };
+        trace_line(&format!(
+            "[beat] switch {n}: pid {} wrote out {} MiB, {} MiB copied in all\n",
+            h.kernel.pid,
+            bytes / (1 << 20),
+            total / (1 << 20)
+        ));
+    }
     out
 }
 
@@ -1624,15 +1634,18 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         if seg.executable {
             prot |= gex_kernel::mem::prot::EXEC;
         }
-        // Named by the program, so the next process to run it shares what
-        // was translated. `/proc/self/maps` still says `[image]`.
-        h.kernel.mem.insert_from(
-            seg.vaddr,
-            seg.vaddr + seg.mem_size,
-            prot,
-            "[image]",
-            Some((path.to_string(), seg.vaddr)),
-        );
+        // No origin. An image segment is *built* by the loader rather than
+        // copied from a file at an offset -- `mem_size` runs past the file's
+        // bytes and the tail is zeroed -- so it cannot be reconstructed by
+        // re-reading, and a snapshot has to carry its bytes.
+        //
+        // Saying otherwise cost a run: the identity was recorded as the
+        // segment's vaddr rather than a file offset, and putting the process
+        // back reported `[initial] is gone; 0x20000000 cannot be restored`
+        // and left the guest executing zeroes.
+        h.kernel
+            .mem
+            .insert(seg.vaddr, seg.vaddr + seg.mem_size, prot, "[image]");
     }
     let layout = gex_ld::build_initial_stack(
         &program.exe,

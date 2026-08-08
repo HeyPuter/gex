@@ -337,7 +337,17 @@ impl MemoryMap {
             if v.start < addr {
                 out.push(v.slice(v.start, addr, v.prot));
             }
-            out.push(v.slice(v.start.max(addr), v.end.min(end), new_prot));
+            // The piece whose protection changed loses its origin, and that
+            // is not tidiness: a mapping that is read-only *now* may have
+            // been written while it was writable. `ld.so` maps a library,
+            // relocates its RELRO region, and mprotects it read-only -- the
+            // bytes there are no longer the file's, so a host that
+            // reconstructed them by re-reading would throw the relocations
+            // away. Only a mapping that has never been writable can be
+            // reconstructed, and that is exactly the one this never touches.
+            let mut piece = v.slice(v.start.max(addr), v.end.min(end), new_prot);
+            piece.origin = None;
+            out.push(piece);
             if v.end > end {
                 out.push(v.slice(end, v.end, v.prot));
             }

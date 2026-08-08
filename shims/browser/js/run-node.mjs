@@ -116,6 +116,13 @@ const entry = await gex.load(shimWasm, readFileSync(guestPath), readFileSync(elf
   stdin: readStdin(),
   cwd,
 });
+// GEX_HEARTBEAT asks the shim to say where the guest is every N safepoints
+// and every 200 dispatch misses. Nothing else runs while translated code
+// does, so without it a run that is merely slow cannot be told from one that
+// is stuck -- and this is the fast lane where that question gets asked.
+if (process.env.GEX_HEARTBEAT) {
+  gex.shim.exports.gex_set_heartbeat?.(BigInt(process.env.GEX_HEARTBEAT));
+}
 const status = await gex.run(entry);
 // GEX_FMA_COUNT reports how many fused multiply-adds crossed out of the guest
 // module. wasm has no FMA, so each one is a call into the shim's.
