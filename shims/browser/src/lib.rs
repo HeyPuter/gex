@@ -2096,6 +2096,26 @@ fn report_idle(why: u8) {
 }
 
 fn schedule() -> i32 {
+    // Unconditional, and at the top, because every other counter in this file
+    // sits on a path that can be missed. A run has now spent seven minutes
+    // pinning a core while producing no safepoint, no dispatch miss, no
+    // syscall, no wake and no idle turn -- which says only that whatever it
+    // is doing is not any of the things that are instrumented.
+    //
+    // This is the last place left that everything passes through. If it
+    // climbs, the loop is out here; if it does not, the guest is inside a
+    // single stretch of translated code and the problem is a back-edge that
+    // never polls.
+    if unsafe { HEARTBEAT } != 0 {
+        static mut ENTRIES: u64 = 0;
+        let n = unsafe {
+            ENTRIES = ENTRIES.wrapping_add(1);
+            ENTRIES
+        };
+        if n.is_power_of_two() && n >= 65536 {
+            trace_line(&format!("[gex] {n} scheduler entries\n"));
+        }
+    }
     loop {
         // Before anything is chosen. A vtest client writes a request and then
         // blocks reading the reply, and both are syscalls, so the renderer
