@@ -1,6 +1,6 @@
 // Give a linked wasm module a second imported memory.
 //
-//   node tools/add-memory.mjs <in.wasm> <out.wasm> [module] [name]
+//   node tools/add-memory.mjs <in.wasm> <out.wasm> [module] [name] [pages]
 //
 // The global kernel module addresses its own memory as memory 0 -- that is
 // what `--import-memory` gives it and what every Rust pointer in it means --
@@ -16,9 +16,15 @@
 // import leaves the module's own memory at 0 where all its code expects it.
 import { readFileSync, writeFileSync } from 'node:fs';
 
-const [inPath, outPath, mod = 'env', name = 'process'] = process.argv.slice(2);
+// The guest's address space, in wasm pages: `GUEST_MEM_BYTES / WASM_PAGE`.
+// Fixed rather than growable, because the guest's stack has to land where the
+// ABI says it does.
+const GUEST_PAGES = 0xffff0000 / 65536;
+
+const [inPath, outPath, mod = 'env', name = 'process', pages = GUEST_PAGES] =
+  process.argv.slice(2);
 if (!inPath || !outPath) {
-  console.error('usage: add-memory.mjs <in.wasm> <out.wasm> [module] [name]');
+  console.error('usage: add-memory.mjs <in.wasm> <out.wasm> [module] [name] [pages]');
   process.exit(2);
 }
 
@@ -49,13 +55,24 @@ function enc(n) {
 
 const str = (s) => [...enc(s.length), ...[...s].map((c) => c.charCodeAt(0))];
 
-// The entry to append: kind 0x02 (memory), limits flag 0x00 (a minimum only).
+// The entry to append: kind 0x02 (memory), limits flag 0x03 -- a maximum, and
+// shared.
 //
-// No maximum and not shared, deliberately. This memory is *someone else's* --
-// a guest process's address space, which the host creates and sizes -- and an
-// import whose declared type disagrees with the memory handed over will not
-// link. A minimum of zero agrees with anything.
-const entry = [...str(mod), ...str(name), 0x02, 0x00, ...enc(0)];
+// Shared, because the process memory *is* shared: it is one guest process's
+// address space and every thread of that process is a Worker running on it.
+// Only the sharing is narrower than the kernel's, which spans every process.
+// So there is no "shared one and plain one" here; there are two shared
+// memories with different scopes.
+//
+// That matters concretely rather than nominally: a memory import's `shared`
+// flag is part of its *type*, and so are its minimum and maximum. A module
+// that declares a plain memory will not accept a `SharedArrayBuffer` however
+// large it is, and one that declares the wrong bounds will not link at all.
+// Both numbers are the guest's fixed address space.
+const entry = [
+  ...str(mod), ...str(name),
+  0x02, 0x03, ...enc(Number(pages)), ...enc(Number(pages)),
+];
 
 let at = 8; // past the magic and version
 const out = [...src.subarray(0, 8)];

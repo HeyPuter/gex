@@ -21,7 +21,8 @@
 // assume:
 //
 //   1. two Workers' kernel instances share state (a counter, and a note),
-//   2. neither can see the other's process memory,
+//   2. neither can see the other's process memory -- both are shared, but a
+//      process's is shared only with its own threads,
 //   3. the kernel can pull a buffer out of whichever process called it.
 import { Worker } from 'node:worker_threads';
 import { readFileSync, existsSync } from 'node:fs';
@@ -36,6 +37,9 @@ if (!existsSync(KERNEL)) {
 }
 const bytes = new Uint8Array(readFileSync(KERNEL));
 
+/** The guest's address space in wasm pages: `GUEST_MEM_BYTES / WASM_PAGE`. */
+const GUEST_PAGES = 0xffff0000 / 65536;
+
 // The one shared memory. Created once, here, and handed to every Worker --
 // which is what "global kernel" means concretely.
 //
@@ -49,7 +53,17 @@ const WORKER = `
   import { parentPort, workerData } from 'node:worker_threads';
   // Each Worker builds its *own* process memory. Not shared, not seen by
   // anyone else: this is one guest process's address space.
-  const proc = new WebAssembly.Memory({ initial: 2, maximum: 2 });
+  // Shared, not plain: this is one process's address space and every thread
+  // of that process is a Worker running on it. Both memories are shared; what
+  // differs is scope -- the kernel's spans every process, this one spans only
+  // this process's threads.
+  //
+  // The full guest address space, because the kernel module's import declares
+  // it and a memory import's bounds are part of its type. It is reserved, not
+  // committed: what a process has actually touched is what it costs.
+  const proc = new WebAssembly.Memory({
+    initial: workerData.guestPages, maximum: workerData.guestPages, shared: true,
+  });
   const mod = await WebAssembly.compile(workerData.bytes);
   const k = (await WebAssembly.instantiate(mod, {
     env: { memory: workerData.kernel, process: proc },
@@ -83,7 +97,10 @@ const WORKER = `
 
 function spawn() {
   return new Promise((resolve) => {
-    const w = new Worker(WORKER, { eval: true, workerData: { bytes, kernel } });
+    const w = new Worker(WORKER, {
+      eval: true,
+      workerData: { bytes, kernel, guestPages: GUEST_PAGES },
+    });
     const pending = [];
     const api = {
       worker: w,

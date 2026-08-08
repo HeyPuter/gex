@@ -13,7 +13,8 @@
 // It rests on three things this checks, cheaply, before any of it is built:
 //
 //   1. a module may *import* two memories at once,
-//   2. one of them may be shared and the other not,
+//   2. both may be shared -- they are, and with different scopes: the kernel's
+//      spans every process, a process's spans only its own threads,
 //   3. `memory.copy` may name both, so the kernel can reach a guest buffer
 //      that is not in its own address space.
 //
@@ -39,7 +40,7 @@ const section = (id, body) => [id, ...uleb(body.length), ...body];
 
 // (module
 //   (import "e" "kernel"  (memory 1 1 shared))   ; memory 0
-//   (import "e" "process" (memory 1 1))          ; memory 1
+//   (import "e" "process" (memory 1 1 shared))   ; memory 1
 //   (func (export "pull") (param i32 i32 i32)
 //     local.get 0 local.get 1 local.get 2
 //     memory.copy 0 1)                           ; dst=kernel, src=process
@@ -55,7 +56,7 @@ const wasm = new Uint8Array(
     section(2, enc(
       uleb(2),
       str('e'), str('kernel'), 0x02, 0x03, uleb(1), uleb(1),  // 0x03: max + shared
-      str('e'), str('process'), 0x02, 0x01, uleb(1), uleb(1), // 0x01: max, not shared
+      str('e'), str('process'), 0x02, 0x03, uleb(1), uleb(1), // shared too
     )),
     // 3: functions
     section(3, enc(uleb(2), uleb(0), uleb(0))),
@@ -91,7 +92,8 @@ try {
 }
 
 const kernel = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
-const process1 = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+// Shared as well: a process's threads are Workers on this one memory.
+const process1 = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
 let inst;
 try {
   inst = await WebAssembly.instantiate(mod, { e: { kernel, process: process1 } });
@@ -123,7 +125,7 @@ if (pushed !== 'and the answer going back') {
 // The point of the shared one: a second instance, as a second Worker would
 // build, sees what the first wrote. Nothing is copied between them.
 const second = await WebAssembly.instantiate(mod, {
-  e: { kernel, process: new WebAssembly.Memory({ initial: 1, maximum: 1 }) },
+  e: { kernel, process: new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }) },
 });
 second.exports.push(0x500, 0x300, reply.length);
 const other = new Uint8Array(kernel.buffer);
@@ -131,4 +133,4 @@ if (new TextDecoder().decode(other.subarray(0x300, 0x300 + reply.length)) !== 'a
   fail('a second instance did not see the first\'s kernel memory');
 }
 
-console.log('ok   multimemory (two imported memories, one shared, copy across both)');
+console.log('ok   multimemory (two shared memories, different scopes, copy across both)');
