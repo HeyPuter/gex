@@ -613,10 +613,30 @@ next sibling. Each `ls` starts from dash's snapshot, and dash has never run
 
 So the waste is siblings unable to reuse each other's work, not a child
 failing to reuse its parent's. The mechanism is right and the scope of one
-map is wrong: the identity map belongs in the global kernel, the module every
-Worker already instantiates against one shared memory for exactly this class
-of state, and the compiled modules belong in a host registry handed to each
-new Worker.
+map is wrong.
+
+**Half of that is now done.** The identity map moved into the global kernel
+-- `k_slot_get` / `k_slot_put`, a `static` in the memory every Worker
+instantiates against, which is where the process table and the filesystem
+already live. `miss` goes to zero and `hit` to twelve on the loop above, and
+stays there across iterations.
+
+It does not save the lifting on its own, and that was expected: a hit gives
+the *slots*, and a dispatch table belongs to a module instance, so a Worker
+that has not instantiated the module cannot reach the code however well it
+knows the slot number. Blocks moved 0.4%.
+
+**The other half was built and reverted.** Put the module bytes in the kernel
+too, and on a miss whose identity the kernel knows, copy them out and push
+them onto the shim's own `pending` queue -- the queue a fresh translation
+already uses, so JavaScript installs them by the path that exists and no new
+host plumbing is needed. It hangs, for a reason worth writing down:
+`PendingModule` carries the size the dispatch table must be grown to, a
+*foreign* module was built against another process's high-water mark, and
+passing the local one understates it. The table is not grown far enough, the
+install throws inside the drain loop, and the run wedges. Store the slot
+count with the module and replay its `dir_entries` before installing. See
+#95.
 
 **And a control worth keeping.** Per-process lifting was unchanged and wall
 clock did not move either. That says the 55.3s is not on the critical path:
