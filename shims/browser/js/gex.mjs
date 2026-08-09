@@ -23,6 +23,15 @@ const SHIM_STACK_TOP = 0x04800000;
 //
 // `DISPATCH_DIR + DISPATCH_MAX_PAGES * 4`, from `gex_abi`.
 const LOW_END = 0x00100000 + 0x80000 * 4;
+/// Whether the guest memory is 64-bit.
+///
+/// Set by whoever starts the runtime, because it has to match two things
+/// this file cannot see: the shim was built for `wasm64-unknown-unknown`,
+/// and the translator emitted with `GEX_MEMORY64`. Getting it wrong is a
+/// link error rather than a silent wrong answer -- a module importing a
+/// 64-bit memory will not accept a 32-bit one -- which is the failure mode
+/// to want.
+const memory64 = () => !!globalThis.GEX_MEMORY64;
 const PAGES = GUEST_BYTES / 65536;
 const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
 
@@ -231,9 +240,26 @@ export class Gex {
     // process already has, seeing the same guest and -- because the shim's own
     // state lives in that memory too -- the same kernel, the same file table,
     // the same everything. A new memory would be a new process.
+    // `index: 'u64'` makes this a memory64, which is what a shim built for
+    // `wasm64-unknown-unknown` imports and what lets the translator hand the
+    // engine a guest address directly. The three have to agree -- this, the
+    // shim's target, and the emitter's `GEX_MEMORY64` -- so the flag is read
+    // from the module rather than guessed here.
+    // A 64-bit memory is asked for by `address`, not `index` -- the proposal
+    // renamed "index type" to "address type" and V8 followed -- and its page
+    // counts are BigInts. Passing `index` instead is not an error: the
+    // descriptor is ignored, a 32-bit memory comes back, and the mismatch
+    // only surfaces at instantiation as "cannot import i32 memory as i64".
     this.#memory =
       memory ??
-      new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: PAGES, shared });
+      (memory64()
+        ? new WebAssembly.Memory({
+            initial: BigInt(INITIAL_PAGES),
+            maximum: BigInt(PAGES),
+            shared,
+            address: 'i64',
+          })
+        : new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: PAGES, shared }));
     this.#kernelSpec = kernel;
   }
 
@@ -282,7 +308,9 @@ export class Gex {
   #growTo(end) {
     const have = this.#memory.buffer.byteLength;
     if (end <= have) return;
-    this.#memory.grow(Math.ceil((end - have) / 65536));
+    // A 64-bit memory counts its pages in BigInt, here as everywhere else.
+    const pages = Math.ceil((end - have) / 65536);
+    this.#memory.grow(memory64() ? BigInt(pages) : pages);
     this.#u8 = null;
   }
 
@@ -406,7 +434,10 @@ export class Gex {
     // touches a thread-local before it writes through a null base, into the
     // bottom of the guest's address space, which is where the register
     // contexts live. Every call below is such a function.
-    this.#shim.exports.__stack_pointer.value = this.#workerStack();
+    // On wasm64 the stack pointer is an `i64` global, so it takes a BigInt.
+    this.#shim.exports.__stack_pointer.value = memory64()
+      ? BigInt(this.#workerStack())
+      : this.#workerStack();
     // A shim older than this file still loads and still instantiates, and
     // then fails on the first call to something it does not have -- which
     // surfaces as `e.gex_paused_for_net is not a function` at the moment the
@@ -436,7 +467,10 @@ export class Gex {
     // wasm-ld puts the shim's stack at address zero regardless of
     // --global-base, which is the guest's image. Move it into the shim's own
     // region, above everything the guest maps. Nothing has run yet.
-    this.#shim.exports.__stack_pointer.value = this.#workerStack();
+    // On wasm64 the stack pointer is an `i64` global, so it takes a BigInt.
+    this.#shim.exports.__stack_pointer.value = memory64()
+      ? BigInt(this.#workerStack())
+      : this.#workerStack();
     this.#opts = { strace: opts.strace, tty: opts.tty, uid: opts.uid, gid: opts.gid };
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
     // A terminal changes how libc buffers and whether a shell prints a
@@ -539,7 +573,10 @@ export class Gex {
     // instance rather than to the memory -- so every Worker has its own and
     // every Worker has to be told where it goes. Two threads sharing one stack
     // is the thing this design exists to avoid.
-    this.#shim.exports.__stack_pointer.value = this.#workerStack();
+    // On wasm64 the stack pointer is an `i64` global, so it takes a BigInt.
+    this.#shim.exports.__stack_pointer.value = memory64()
+      ? BigInt(this.#workerStack())
+      : this.#workerStack();
     // The devices this process has, which `load` sets from the same fields.
     // Before the kernel is built, because that is when the device nodes are
     // made and the vtest socket is bound: a forked child told about its GPU
@@ -1197,6 +1234,7 @@ export class Gex {
           // kernel, and it narrows a crash to a single handler.
           const nr = ask(e.gex_last_syscall, (n) =>
             n === 0xffffffff ? '' : `, inside syscall ${n}`);
+          if (globalThis.GEX_TRAP_STACK) console.error(err.stack ?? err);
           throw new Error(
             `the gex runtime trapped inside the shim (${err.message}${at}${nr}` +
               `${code}${heap}). That is a crash in the runtime, not a guest exit; ` +
@@ -1215,7 +1253,10 @@ export class Gex {
         // the top of the guest's own stack, where it overwrote saved
         // registers: a thread would return through a link register holding
         // an address out of the shim's heap.
-        this.#shim.exports.__stack_pointer.value = this.#workerStack();
+        // On wasm64 the stack pointer is an `i64` global, so it takes a BigInt.
+    this.#shim.exports.__stack_pointer.value = memory64()
+      ? BigInt(this.#workerStack())
+      : this.#workerStack();
         const e = this.#shim.exports;
         // Drained, not taken one at a time. Statically recompiling a whole
         // object emits as many modules as it needs -- a wasm module holds a

@@ -415,6 +415,9 @@ pub fn validate_module(wasm: &[u8]) -> Result<()> {
     config.wasm_tail_call(true);
     config.wasm_threads(true);
     config.wasm_bulk_memory(true);
+    // A module built under GEX_MEMORY64 declares a 64-bit memory, which the
+    // validator refuses to even look at unless it is told the proposal is on.
+    config.wasm_memory64(true);
     let engine = Engine::new(&config).context("creating the wasm engine")?;
     Module::validate(&engine, wasm)
 }

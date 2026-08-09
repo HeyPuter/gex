@@ -746,10 +746,20 @@ impl Module {
         if !self.data.is_empty() {
             let mut s = Vec::new();
             write_u32(&mut s, self.data.len() as u32);
+            // The offset of an active data segment is a constant expression
+            // typed by the memory it lands in, so a 64-bit memory wants an
+            // `i64.const` here -- an `i32.const` is a validation error, not a
+            // widening.
+            let wide = crate::tier1::memory64_enabled();
             for d in &self.data {
                 s.push(0x00); // active, memory 0
-                s.push(op::I32_CONST);
-                write_i32(&mut s, d.offset as i32);
+                if wide {
+                    s.push(op::I64_CONST);
+                    write_i64(&mut s, d.offset as i64);
+                } else {
+                    s.push(op::I32_CONST);
+                    write_i32(&mut s, d.offset as i32);
+                }
                 s.push(op::END);
                 write_u32(&mut s, d.bytes.len() as u32);
                 s.extend_from_slice(&d.bytes);

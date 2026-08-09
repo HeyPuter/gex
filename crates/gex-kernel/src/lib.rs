@@ -59,11 +59,11 @@ impl<'a> GuestMem<'a> {
     /// Native hosts get a real slice from wasmtime and need none of this.
     #[inline(always)]
     fn view(&self) -> &[u8] {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             std::hint::black_box(&*self.bytes)
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             self.bytes
         }
@@ -71,11 +71,11 @@ impl<'a> GuestMem<'a> {
 
     #[inline(always)]
     fn view_mut(&mut self) -> &mut [u8] {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         {
             std::hint::black_box(&mut *self.bytes)
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         {
             self.bytes
         }

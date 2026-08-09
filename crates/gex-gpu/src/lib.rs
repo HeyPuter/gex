@@ -107,7 +107,7 @@ impl Compositor {
     /// Blocks while the adapter and device are requested. Both are futures in
     /// WebGPU because a browser has to ask the user's machine, and both
     /// resolve immediately in practice.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(width: u32, height: u32) -> Result<Compositor, GpuError> {
         pollster::block_on(Compositor::new_async(width, height))
     }
@@ -449,7 +449,7 @@ impl Compositor {
     /// Only for a host that has nowhere to present to -- a test, or a file.
     /// A host with a window or a canvas draws into its swapchain instead and
     /// never pays for this.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn read_back(&self) -> Result<Vec<u8>, GpuError> {
         pollster::block_on(self.read_back_async())
     }

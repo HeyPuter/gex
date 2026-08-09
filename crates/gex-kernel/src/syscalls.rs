@@ -505,7 +505,7 @@ fn write_timeval(m: &mut GuestMem<'_>, at: u64, nanos: u128) -> Result<(), Errno
 
 /// The clock of a host that has one.
 pub fn system_clock() -> (u64, u32) {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -514,7 +514,7 @@ pub fn system_clock() -> (u64, u32) {
     }
     // Standing still is wrong but it is not a panic, and a host that cares
     // replaces this.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     {
         (0, 0)
     }

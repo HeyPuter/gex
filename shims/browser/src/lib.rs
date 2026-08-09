@@ -42,12 +42,20 @@
 // Only meaningful as wasm: everything below assumes it shares a linear memory
 // with the guest module beside it. On any other target the crate is empty, so
 // `cargo build --workspace` on the development host still works.
-#![cfg(target_arch = "wasm32")]
+#![cfg(target_family = "wasm")]
+
 // `memory.atomic.wait32` and `memory.atomic.notify`, which the kernel lock in
 // the shared build is built on. Unstable in `core::arch::wasm32` and nowhere
 // else: they are wasm instructions, and the shared build is a nightly build
 // already because a module importing a shared memory has to be.
 #![cfg_attr(feature = "shared-memory", feature(stdarch_wasm_atomic_wait))]
+
+// `core::arch::wasm32` is named for the address size, not the family, so the
+// 64-bit build has to reach for a different module to say the same thing.
+#[cfg(target_arch = "wasm32")]
+use core::arch::wasm32 as warch;
+#[cfg(target_arch = "wasm64")]
+use core::arch::wasm64 as warch;
 
 use gex_abi::ctx;
 use gex_kernel::errno::{Errno, SysResult};
@@ -899,7 +907,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
                 gex_heap_total_kib() / 1024,
                 ARENA_NEXT.load(std::sync::atomic::Ordering::Relaxed),
                 gex_abi::MMAP_TOP,
-                core::arch::wasm32::memory_size(0) as u64 * 65536 / (1024 * 1024),
+                warch::memory_size(0) as u64 * 65536 / (1024 * 1024),
             ));
         }
         #[cfg(feature = "heap-counters")]
@@ -956,7 +964,7 @@ struct ShimRegion;
 /// process being killed by a trap on an address that was never backed.
 fn grow_memory_to(end: u64) -> bool {
     const PAGE: u64 = 65536;
-    let have = core::arch::wasm32::memory_size(0) as u64 * PAGE;
+    let have = warch::memory_size(0) as u64 * PAGE;
     if end <= have {
         return true;
     }
@@ -964,7 +972,7 @@ fn grow_memory_to(end: u64) -> bool {
     // cheap -- the engine may copy -- and a guest that maps a page at a time
     // would otherwise pay for each one.
     let want = (end - have).div_ceil(PAGE).max(16);
-    core::arch::wasm32::memory_grow(0, want as usize) != usize::MAX
+    warch::memory_grow(0, want as usize) != usize::MAX
 }
 
 /// The arena both the guest and this module take from, in address order.
@@ -1623,7 +1631,7 @@ impl KLock {
                     // SAFETY: the address of a `static AtomicU32`, which is
                     // four-byte aligned and in the memory every Worker shares.
                     unsafe {
-                        core::arch::wasm32::memory_atomic_wait32(
+                        warch::memory_atomic_wait32(
                             KLOCK.as_ptr() as *mut i32,
                             held as i32,
                             // A millisecond, so a lock lost to a trapped
@@ -1650,7 +1658,7 @@ impl Drop for KLock {
         KLOCK.store(0, std::sync::atomic::Ordering::Release);
         // SAFETY: as above.
         unsafe {
-            core::arch::wasm32::memory_atomic_notify(KLOCK.as_ptr() as *mut i32, 1);
+            warch::memory_atomic_notify(KLOCK.as_ptr() as *mut i32, 1);
         }
     }
 }
@@ -1880,7 +1888,14 @@ pub extern "C" fn gex_heap_total_kib() -> i32 {
 /// Reserve `len` bytes of this module's own heap and return a guest address
 /// JS can write to. Used to hand the ELF across.
 #[no_mangle]
-pub extern "C" fn gex_alloc(len: usize) -> u32 {
+pub extern "C" fn gex_alloc(len: u32) -> u32 {
+    // `u32` rather than `usize` deliberately. This is the JS boundary, and
+    // keeping every parameter and result the same width on both targets is
+    // what lets the same glue drive a 32- and a 64-bit build with no
+    // conversion anywhere: a `usize` here would become an i64 on wasm64 and
+    // JS would have to pass a BigInt to this one function and a Number to the
+    // ninety-six others. Nothing JS allocates is near 4 GiB.
+    let len = len as usize;
     let mut v = Vec::<u8>::with_capacity(len);
     v.resize(len, 0);
     let p = v.as_mut_ptr() as u32;
@@ -1896,7 +1911,9 @@ pub extern "C" fn gex_alloc(len: usize) -> u32 {
 /// # Safety
 /// `ptr` and `len` must be exactly what a previous `gex_alloc` returned.
 #[no_mangle]
-pub unsafe extern "C" fn gex_free(ptr: u32, len: usize) {
+pub unsafe extern "C" fn gex_free(ptr: u32, len: u32) {
+    // `u32` for the same reason as `gex_alloc`.
+    let len = len as usize;
     if ptr != 0 && len != 0 {
         drop(Vec::from_raw_parts(ptr as *mut u8, len, len));
     }
@@ -4659,7 +4676,7 @@ fn finish_parked(
 /// visible; `gex_handoff` reads and clears it.
 fn trap() -> ! {
     HANDOFF.with(|c| c.set(true));
-    core::arch::wasm32::unreachable()
+    warch::unreachable()
 }
 
 /// The syscall number the guest is inside, or the last one it was inside.
