@@ -24,6 +24,18 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..');
 const DIST = join(WEB, 'dist');
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
+// A site to test other than the built one.
+//
+//   GEX_SITE=http://localhost:5173 node web/test/site.mjs virgl
+//
+// `dist` and `npm run dev` are not the same page: the dev server serves the
+// module graph rather than a bundle, transforms on the fly, and starts its
+// Workers from source. Everything here had only ever been proved against
+// `dist`, which is the one nobody develops against.
+//
+// The requests are passed through so the page under test is exactly what that
+// server sends; only the HTML is touched, to add the reporter.
+const UPSTREAM = process.env.GEX_SITE || '';
 const WALL = Number(process.env.GEX_WALL || 900) * 1000;
 
 // Which demos to drive, and what counts as having worked. A demo that needs a
@@ -70,7 +82,7 @@ const skip = (why) => {
   process.exit(0);
 };
 
-if (!(await exists(DIST))) skip(`no build at ${DIST} (npm run build)`);
+if (!UPSTREAM && !(await exists(DIST))) skip(`no build at ${DIST} (npm run build)`);
 if (!(await exists(CHROME))) skip(`no browser at ${CHROME}`);
 
 const wanted = process.argv.slice(2).filter((a) => DEMOS[a]);
@@ -108,7 +120,17 @@ const REPORTER = `
   // the demo was running, while the demo did nothing at all.
   let ticks = 0;
   setInterval(() => post('status', 'tick|running ' + ++ticks * 5 + 's|' + term()), 5000);
-  addEventListener('error', (e) => post('threw', String(e.message || e)));
+  // The message, or -- when there is none because this is a *resource*
+  // failing rather than code throwing -- what failed to load. Reporting the
+  // event itself stringifies to "[object Event]", which names nothing.
+  addEventListener('error', (e) => {
+    const t = e.target;
+    if (t && t !== window) {
+      post('threw', 'failed to load ' + (t.src || t.href || t.tagName));
+    } else {
+      post('threw', String(e.message || e));
+    }
+  });
   // In the capture phase as well, which is the only way a *resource* load
   // failure is heard -- a module script that 404s or is served as the wrong
   // type fires on the element, not on window, and bubbles nowhere. That is
@@ -139,6 +161,31 @@ const server = createServer(async (req, res) => {
       Buffer.concat(chunks).toString(),
     );
     res.writeHead(204).end();
+    return;
+  }
+  // A server of somebody else's, passed through.
+  //
+  // Only the HTML is rewritten, and only to add the reporter: what runs has
+  // to be that server's page, or this proves nothing about it.
+  if (UPSTREAM) {
+    try {
+      const target = new URL(req.url, UPSTREAM);
+      const up = await fetch(target, { headers: { accept: req.headers.accept ?? '*/*' } });
+      const type = up.headers.get('content-type') ?? 'application/octet-stream';
+      const body = Buffer.from(await up.arrayBuffer());
+      const html = type.includes('text/html');
+      res.writeHead(up.status, {
+        'content-type': type,
+        // Added here rather than assumed: a dev server that forgets them
+        // has no `SharedArrayBuffer`, which is a different failure and one
+        // worth telling apart from this one.
+        'Cross-Origin-Opener-Policy': 'same-origin',
+        'Cross-Origin-Embedder-Policy': 'require-corp',
+      });
+      res.end(html ? Buffer.from(body.toString() + REPORTER) : body);
+    } catch (e) {
+      res.writeHead(502).end(String(e?.message ?? e));
+    }
     return;
   }
   // The query goes first, then the check for the root. The other order

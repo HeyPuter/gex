@@ -18,7 +18,23 @@ const ISOLATED = {
 };
 
 export default defineConfig({
-  server: { port: 5173, host: true, headers: ISOLATED },
+  server: {
+    port: 5173,
+    host: true,
+    headers: ISOLATED,
+    // The runtime lives outside this directory, in the shim it belongs to,
+    // and a guest process is a Worker started from a file there. `vite build`
+    // bundles that file and never asks; `vite dev` serves it over HTTP and
+    // refuses anything above the project root:
+    //
+    //   403 Restricted -- "/home/claude/gex/shims/browser/js/worker.mjs" is
+    //   outside of Vite serving allow list.
+    //
+    // So every demo on the dev server made a Worker that 404'd, reported an
+    // error event with no message, and stopped -- while the built site
+    // worked, which is the pair of facts that kept this hidden.
+    fs: { allow: [fileURLToPath(new URL('..', import.meta.url))] },
+  },
   preview: { headers: ISOLATED },
   build: { target: 'es2022', chunkSizeWarningLimit: 2048 },
   // A guest process is a Worker, and `worker.mjs` is a module -- it imports
