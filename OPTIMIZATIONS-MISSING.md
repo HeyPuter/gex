@@ -1057,10 +1057,25 @@ Half the blocks and a third of the time, and every pin lands:
     [gex] pin ok: libapt-pkg.so.6.0      wanted 0x50a0000, landed 0x50a0000
     ... seventeen of them, all ok
 
-Not zero, because this closure was built with ordinary discovery rather than
-`--exhaustive`; dash's closure only reached zero exhaustively. Nineteen
-objects exhaustively is a much larger build than dash's three, and whether it
-is worth making is #93's question rather than this one's.
+Exhaustively, it is zero:
+
+    apt-get --version, seed module          32,033 blocks   948 ms
+    apt-get --version, image module alone   31,693 blocks  1151 ms
+    apt-get --version, closure, ordinary    16,743 blocks   683 ms
+    apt-get --version, closure, exhaustive       0 blocks     0 ms
+
+Nineteen objects, all seventeen pins landing, the right output, and the
+runtime translator never entered. apt is a much bigger program than dash and
+it makes no difference: what the build covers, the run does not pay for.
+
+The build is 1,724,482 blocks and 678 MB of wasm, against 348,056 blocks and
+80 MB with ordinary discovery. Binary size is not what this project is
+optimising and the trade is the right way round, but 678 MB to run
+`--version` is the clearest possible statement of #93's point: whole-object
+translation is the wrong granularity. Most of those blocks are in libraries
+apt loads and barely enters -- libsystemd, libgcrypt, libzstd -- and the
+measurement to make next is which fraction of each object a real `apt update`
+actually reaches.
 
 ### What the hunt for the crash left behind
 
