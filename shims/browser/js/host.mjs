@@ -31,7 +31,7 @@
  */
 export class ProcessHost {
   #makeWorker; #shim; #guest; #kernel; #extra;
-  #onOutput; #onFork; #readStdin; #onOther;
+  #onOutput; #onFork; #onExit; #readStdin; #onOther;
   #workers = new Map();
   #pending = new Map();
   #first = null;
@@ -66,6 +66,12 @@ export class ProcessHost {
     extra = {},
     onOutput = () => {},
     onFork = () => {},
+    // Every process's exit message, whole. `start` resolves with pid 1's
+    // status, which is what a caller usually wants; this is for the rest of
+    // what a Worker reports on its way out -- how long its guest ran, what
+    // its memory grew to, anything read out of its address space before the
+    // thread that owns it goes away.
+    onExit = () => {},
     readStdin = null,
     // Anything a Worker posts that this file has no meaning for -- the GPU
     // asking to be served, a network event for the page's status line.
@@ -77,6 +83,7 @@ export class ProcessHost {
     this.#kernel = kernel;
     this.#onOutput = onOutput;
     this.#onFork = onFork;
+    this.#onExit = onExit;
     this.#readStdin = readStdin;
     this.#extra = extra;
     this.#onOther = onMessage;
@@ -275,6 +282,9 @@ export class ProcessHost {
         break;
       }
       case 'exit':
+        // Before the release, because releasing terminates the Worker and a
+        // handler that wanted to ask it anything else would be too late.
+        this.#onExit(m, pid);
         this.#release(pid, w);
         resolve(m.status);
         break;

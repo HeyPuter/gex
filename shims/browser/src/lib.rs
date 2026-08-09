@@ -1428,7 +1428,12 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
         };
         HOST_HOLDER.store(here as *const _ as usize, std::sync::atomic::Ordering::Relaxed);
         note(here);
-        let r = f(b.as_mut().expect("gex: not initialised"));
+        // Named, because "not initialised" on its own says only that some
+        // export ran before `gex_init` and not which -- and the glue calls
+        // thirty of them.
+        let r = f(b.as_mut().unwrap_or_else(|| {
+            panic!("gex: not initialised, called from {}:{}", here.file(), here.line())
+        }));
         HOST_HOLDER.store(0, std::sync::atomic::Ordering::Relaxed);
         r
     })

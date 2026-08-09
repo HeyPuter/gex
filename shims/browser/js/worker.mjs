@@ -95,6 +95,32 @@ port.on((msg) => {
   });
 });
 
+/**
+ * The guest's hottest back edges, as lines of `count  where`.
+ *
+ * Read here rather than by whoever started this Worker, because naming an
+ * address needs the shim that has the object table and the memory the answer
+ * is written into -- both of which belong to this thread.
+ */
+function hotBlocks(gex) {
+  const e = gex.shim.exports;
+  if (!e.gex_hot_blocks) return [];
+  const at = e.gex_alloc(4096) >>> 0;
+  const n = e.gex_hot_blocks(at, 4096) >>> 0;
+  const text = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, n)).trim();
+  if (!text) return [];
+  return text.split('\n').map((line) => {
+    const [pc, count] = line.split(' ');
+    // An address alone is a library and an offset nobody has worked out yet.
+    const nameAt = e.gex_alloc(160) >>> 0;
+    const len = e.gex_object_at ? e.gex_object_at(BigInt(pc), nameAt, 160) >>> 0 : 0;
+    const where = len
+      ? new TextDecoder().decode(new Uint8Array(gex.memory.buffer, nameAt, len))
+      : pc;
+    return `${String(count).padStart(10)}  ${where}`;
+  });
+}
+
 async function handle(msg) {
   if (msg?.kind === 'stdin') {
     stdinWaiter?.(msg.bytes);
@@ -127,12 +153,15 @@ async function handle(msg) {
         // that say why -- the shim's panic goes to fd 2 and then it traps.
         console.error(new TextDecoder().decode(bytes.slice()));
       }
-      port.post({
-        kind: 'output',
-        fd,
-        text: new TextDecoder().decode(bytes.slice()),
-        lflag: lastLflag,
-      });
+      // A page wants text, because it has a terminal to put it in. A command
+      // line wants the bytes: `gzip -c` writes a deflate stream to standard
+      // output, and a decode-and-re-encode round trip through UTF-8 turns
+      // every byte that is not a character into U+FFFD.
+      port.post(
+        msg.rawOutput
+          ? { kind: 'output', fd, bytes: bytes.slice(), lflag: lastLflag }
+          : { kind: 'output', fd, text: new TextDecoder().decode(bytes.slice()), lflag: lastLflag },
+      );
     }
     now() {
       return BigInt(Date.now()) * 1000000n;
@@ -166,6 +195,10 @@ async function handle(msg) {
   }
 
   if (msg.debugExit) globalThis.GEX_DEBUG_EXIT = 1;
+  // Read by `gex.mjs` when it builds the memory, so it has to be set before
+  // the `Gex` below and not after. The runner sets its own copy; a Worker is
+  // a separate global scope and never saw it.
+  if (msg.memory64) globalThis.GEX_MEMORY64 = 1;
   // `kernelStack` is this Worker's slice of the global kernel's stack array.
   // Absent for the first Worker, which keeps the stack the module was linked
   // with and is the one that reads the numbers out for everybody else.
@@ -293,10 +326,40 @@ async function handle(msg) {
     // to be told. Sent with every write because that is when it changes in
     // practice: a shell sets its terminal up and then prints a prompt.
     lflag = () => gex.shim.exports.gex_tty_lflag?.() ?? 0;
+    // The rest of the switches. These used to be set by `run-node.mjs`, which
+    // held the first guest itself; now that every process is in a Worker the
+    // runner holds none of them and asks for them here instead.
+    const ex = gex.shim.exports;
+    if (msg.hot) ex.gex_set_hot?.(1);
+    if (msg.noIntrinsics) ex.gex_set_intrinsics?.(0);
+    if (msg.trace) ex.gex_set_trace?.(1);
+    if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
+    if (msg.checkSp) ex.gex_set_check_sp?.(1);
+    if (msg.debugExit) {
+      // Before the guest has executed an instruction: a process's memory is
+      // what decides how many of them a browser will hold, so it matters
+      // whether the cost is placing the image or running it.
+      port.post({ kind: 'loaded', memoryMib: gex.memory.buffer.byteLength / (1 << 20) });
+    }
+    // Around `gex.run` alone. Everything before it is loading, placing the
+    // image and letting the engine compile a seventeen-megabyte module;
+    // everything inside it is the guest. A codegen A/B measured through the
+    // total is a third module size and V8's compiler.
+    const runStarted = performance.now();
     const status = await gex.run(entry, ctx);
+    const guestMillis = Math.round(performance.now() - runStarted);
+    // `close` before the reporting, not after: it drops the tick channel,
+    // which is a live handle that would otherwise keep a Node Worker up.
+    gex.close?.();
     port.post({
       kind: 'exit',
       status,
+      guestMillis,
+      // Whatever the runner asked to be read out of the guest before its
+      // address space goes away with this thread.
+      hot: msg.hot ? hotBlocks(gex) : undefined,
+      fmaCalls: msg.fmaCount ? Number(ex.gex_fma_calls?.() ?? -1) : undefined,
+      extracted: (msg.extract ?? []).map((p) => [p, gex.readFile(p)]),
       blocks: Number(gex.shim.exports.gex_jit_blocks?.() ?? 0),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
       // How much of this process's memory the shim ever used. It decides how
@@ -317,7 +380,12 @@ async function handle(msg) {
     let where = '';
     try {
       const ex = gex.shim?.exports;
-      if (ex?.gex_current_pc) {
+      // Only if this Worker got as far as having a kernel. `gex_has_host`
+      // exists for this and was not being asked: a failure *during* load left
+      // no host, `gex_current_pc` panicked on the way in, and the trap that
+      // panic became replaced the real error with a bare `unreachable`. The
+      // diagnostic was taking down the thing it was diagnosing.
+      if (ex?.gex_current_pc && ex.gex_has_host?.()) {
         const pc = ex.gex_current_pc();
         where = ` at guest pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}`;
         if (ex.gex_object_at) {
@@ -349,7 +417,12 @@ async function handle(msg) {
     } catch {
       // Nothing to add.
     }
-    if (msg.debugExit) console.error(`gex: worker threw: ${e?.message ?? e}${where}`);
+    // The stack too, under GEX_DEBUG_EXIT. A trap out of the shim reaches
+    // here as `unreachable` and nothing else; which export was on the stack
+    // is the only thing that says where to look, and it is readable here.
+    if (msg.debugExit) {
+      console.error(`gex: worker threw: ${e?.message ?? e}${where}\n${e?.stack ?? ''}`);
+    }
     port.post({ kind: 'threw', message: (e?.message ?? String(e)) + where });
   }
 }
