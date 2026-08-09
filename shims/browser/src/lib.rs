@@ -5852,10 +5852,25 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 if mod_id != 0 {
                     // SAFETY: a call into the kernel taking no borrow here.
                     unsafe { k_mod_claim(*page, key, mod_id) };
-                    // And against the object as a whole, which is the grain
-                    // another process installs at.
-                    if let Some(obj) = object_identity(h, *page * gex_abi::DISPATCH_PAGE) {
-                        // SAFETY: as above.
+                }
+            }
+        }
+        // Claim against the objects this unit actually emitted code for.
+        //
+        // `dir_entries` is the wrong list to claim from: it holds only the
+        // pages this unit *freshly allocated* a base for, and a unit whose
+        // blocks land on pages an earlier unit already based contributes
+        // nothing to it. That is most of them -- 445 units stored and about
+        // 27 claimed, which is why installing per object bought so little.
+        // What the unit emitted is `exported_blocks`, and every one of those
+        // is inside an object somebody else will miss in.
+        if mod_id != 0 {
+            let mut claimed: Vec<u64> = Vec::new();
+            for (addr, _) in &unit.exported_blocks {
+                if let Some(obj) = object_identity(h, *addr) {
+                    if !claimed.contains(&obj) {
+                        claimed.push(obj);
+                        // SAFETY: a call into the kernel taking no borrow.
                         unsafe { k_mod_claim_object(obj, mod_id) };
                     }
                 }
