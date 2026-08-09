@@ -3599,19 +3599,34 @@ fn finish_parked(
             ppid,
             want,
             wstatus,
+            nohang,
             ..
         } => {
             // A shared table already holds the status in the form `wait4`
             // reports it, because the child's own Worker published it there
             // as it exited. Nothing here has to reconstruct it.
             if procs.is_shared() {
-                let Some((pid, word)) = procs.collect(*ppid, *want) else {
-                    return Err(Errno::ECHILD);
-                };
-                if *wstatus != 0 {
-                    gm.write_u32(*wstatus, word as u32)?;
+                if let Some((pid, word)) = procs.collect(*ppid, *want) {
+                    if *wstatus != 0 {
+                        gm.write_u32(*wstatus, word as u32)?;
+                    }
+                    return Ok(pid as u64);
                 }
-                return Ok(pid as u64);
+                // Nothing ready is two different answers, and Linux is
+                // careful about which: `ECHILD` when there is no such child
+                // at all, and zero when there is one that has not finished.
+                //
+                // Only `WNOHANG` can tell them apart -- a blocking wait gets
+                // here only once the scheduler has said a child is
+                // collectable. Giving `ECHILD` to both is what ended the
+                // gears demo with "error waiting for command: No child
+                // processes" while the program being timed drew happily in
+                // the next Worker along.
+                return if *nohang && procs.has_children(*ppid) {
+                    Ok(0)
+                } else {
+                    Err(Errno::ECHILD)
+                };
             }
             for c in children {
                 if *want > 0 && c.pid != *want {

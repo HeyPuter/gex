@@ -553,6 +553,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/park" "$HERE/programs/park-across-switch.c"
 "$CC" -static -no-pie -O2 -o "$WORK/socket-server" "$HERE/programs/socket-server.c"
 "$CC" -static -no-pie -O2 -o "$WORK/socket-fork" "$HERE/programs/socket-fork.c"
+"$CC" -static -no-pie -O2 -o "$WORK/wait-after-group" "$HERE/programs/wait-after-group.c"
 "$CC" -static -no-pie -O2 -o "$WORK/socket-client" "$HERE/programs/socket-client.c"
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
@@ -1232,6 +1233,27 @@ if [ -n "$NODE" ] && [ -x "$WORK/socket-fork" ] && [ -f web/public/gex/gex_kerne
     fi
 else
     echo "skip socket-fork: no node, no program, or no global kernel"
+fi
+
+# A parent polling for a child with WNOHANG, which is how `timeout` waits and
+# therefore how every bounded gears run waits. "Nothing ready yet" is zero;
+# ECHILD means there is no such child, and a caller told the wrong one reports
+# an error and gives up. The demo used to end with "timeout: error waiting for
+# command: No child processes" while the program it was timing drew happily in
+# the next Worker along.
+if [ -n "$NODE" ] && [ -x "$WORK/wait-after-group" ] && [ -f web/public/gex/gex_kernel.plain.wasm ]; then
+    out=$(timeout 120 "$NODE" shims/browser/js/run-node.mjs \
+              web/public/gex/seed.wasm "$WORK/wait-after-group" 2>&1 || true)
+    if echo "$out" | grep -q "parent: collected 1 after polling 1, exited 7"; then
+        echo "ok   wait-nohang (a polling parent is told 'not yet', not 'no such child')"
+        pass=$((pass + 1))
+    else
+        echo "FAIL wait-nohang: a polling waitpid did not answer correctly"
+        echo "$out" | sed 's/^/     /' | head -6
+        fail=$((fail + 1))
+    fi
+else
+    echo "skip wait-nohang: no node, no program, or no global kernel"
 fi
 
 # One filesystem, two address spaces. The third thing processes share and the
