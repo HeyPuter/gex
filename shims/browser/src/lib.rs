@@ -4327,10 +4327,28 @@ fn page_identity(h: &Host, page: u64) -> Option<u64> {
         return None;
     }
     let (id, off) = v.origin.as_ref()?;
+    // The file and the offset within it, and nothing else.
+    //
+    // The extent of the mapping used to be in here too, and it made the key
+    // unstable in both directions. `ld.so` builds a library's mapping in
+    // four steps -- reserve the span, `MAP_FIXED` each segment over it,
+    // `munmap` the slack, `mprotect` the RELRO -- and every one of those
+    // splits a vma. Which splits a page ends up on either side of depends on
+    // what else the process has mapped, so two processes running the same
+    // program hashed the same libc page differently; and the RELRO
+    // `mprotect` happens *after* some pages are already translated, so a
+    // page's identity changed during the life of one process.
+    //
+    // Neither is a fact about the code. What determines the bytes on a page
+    // is the file and the offset, and what determines whether a translation
+    // of them is reusable is the address -- which is already the other half
+    // of the key, since the store is indexed by `(page, identity)`.
+    //
+    // Measured on three `ls` in one shell: 18 shared modules served out of
+    // 1,295 dispatch misses before, because the key almost never matched.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     (off + (page - v.start)).hash(&mut hasher);
-    (v.end - v.start).hash(&mut hasher);
     Some(hasher.finish())
 }
 

@@ -1380,3 +1380,56 @@ Closing it needs one of two things, and both are real features:
 
 Worth the effort at roughly 12,000 blocks against 281,254 -- a twentieth of
 what is already saved -- but not before the run is confirmed end to end.
+
+## Why every `ls` in the demo costs a second
+
+Reported from the demo: running `ls` takes seconds, every time, however many
+times you have run it. Measured, three `ls` in one shell:
+
+    pid 2  (ls #1)  574 ms  17,814 blocks   have=407 hit=6  miss=6
+    pid 3  (ls #2)  563 ms  15,725 blocks   have=407 hit=12 miss=0
+    pid 4  (ls #3)  441 ms  15,725 blocks   have=407 hit=12 miss=0
+
+The same 15,725 blocks, every time. There is a mechanism meant to prevent
+exactly this -- a system-wide store of translated modules, keyed by page and
+by the identity of the code on it -- and it fires 18 times against 1,295
+dispatch misses. One and a half per cent.
+
+Two things are wrong, and the second is why the first cannot simply be fixed.
+
+**The reuse path is behind the wrong guard.** It is consulted only when the
+page has no dispatch base:
+
+    if h.jit.page_table.lookup(page).is_none() { ...ask the store... }
+
+and `have=407` counts the misses where it *did* have one. Those 407 are where
+the time goes: a page whose base exists but whose slot for this particular
+entry point is empty, because discovery found some of the page's blocks and
+not this one. Every one of them translates instead of asking whether somebody
+has already done it.
+
+**Slots are allocated per process, so serving a foreign module is unsafe.**
+`PageTable::next_slot` is an `AtomicU64` owned by one process's table, started
+from the image module's high-water mark. Two processes running the same
+program therefore hand out *the same slot numbers* to different code. A
+module built by process A fills slots `[X, Y)`; process B may already have its
+own blocks there, and B's directory entries for its own pages still point at
+`X`. Installing A's module makes a branch into B's page execute A's code.
+
+The eighteen serves that happen today are that hazard, running rarely enough
+not to have been caught. Opening the guard would make it frequent.
+
+So the order of work is fixed by the second problem: slot allocation has to
+become globally unique before reuse can be turned up. That is what the parked
+`shared-slot-allocator` branch was for, and it is the same conclusion its
+notes reached from the other end -- it made the allocator global first and
+found a pipe wedge on the third process, which is where it stopped.
+
+One change went in from this investigation and is worth recording as *not*
+having helped: the page identity used to hash the extent of the mapping
+(`v.end - v.start`) along with the file and offset. `ld.so` builds a library's
+mapping in four steps and every one of them splits a vma, and the RELRO
+`mprotect` happens after some pages are already translated -- so the extent is
+not a fact about the code and changes during a process's life. Removing it is
+right on its own terms. It moved nothing: `hit` stayed at 12, blocks stayed at
+15,725. The binding constraint is the guard, not the key.
