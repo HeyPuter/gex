@@ -63,6 +63,18 @@ export class WispNetwork {
   }
 
   /** Open the WebSocket. Resolves once the proxy has said hello. */
+  /**
+   * The proxy this was pointed at, normalised.
+   *
+   * A guest process is a Worker now, and each opens its own connection to
+   * the proxy rather than relaying through the page -- a socket is per
+   * process on a real machine too. So the address is what travels, and this
+   * is where a page that has already made one gets it from.
+   */
+  get url() {
+    return this.#url;
+  }
+
   async start() {
     if (this.#conn) return;
     await new Promise((resolve, reject) => {

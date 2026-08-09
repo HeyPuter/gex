@@ -114,7 +114,14 @@ const server = createServer(async (req, res) => {
     if (!(await stat(path)).isFile()) throw new Error('not a file');
     let body = await readFile(path);
     if (name === '/index.html') body = Buffer.from(body.toString() + REPORTER);
-    res.writeHead(200, { 'content-type': TYPES[extname(name)] || 'application/octet-stream' });
+    // Cross-origin isolation, as the dev server and the deployed site send.
+    // The page needs a `SharedArrayBuffer` for the global kernel's memory,
+    // and without these headers the constructor is not there at all.
+    res.writeHead(200, {
+      'content-type': TYPES[extname(name)] || 'application/octet-stream',
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    });
     res.end(body);
   } catch {
     res.writeHead(404).end();

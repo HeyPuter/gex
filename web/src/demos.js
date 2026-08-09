@@ -247,6 +247,7 @@ async function bootDebian(ctx) {
       cwd: '/root',
       tty: true,
       network,
+      onNetEvent: (e) => ctx.setNet(e.split(' ')[0]),
       // Root, because that is who /root belongs to and who a package
       // manager expects to be. Without it the guest is some uid with no
       // passwd entry, and bash greets you with "I have no name!".

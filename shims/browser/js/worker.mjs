@@ -53,11 +53,18 @@ const port = await channel();
 // host and waits here; `readStdin` below is what the run loop awaits.
 let stdinWaiter = null;
 let stdinEof = false;
+// Set once the guest is loaded: how the page is told about the terminal.
+let lflag = () => 0;
+let winsize = () => {};
 
 port.on(async (msg) => {
   if (msg?.kind === 'stdin') {
     stdinWaiter?.(msg.bytes);
     stdinWaiter = null;
+    return;
+  }
+  if (msg?.kind === 'winsize') {
+    winsize(msg.rows, msg.cols);
     return;
   }
   if (msg?.kind === 'eof') {
@@ -77,7 +84,18 @@ port.on(async (msg) => {
       // Copied: `bytes` is a view on the guest's memory, and posting a view
       // of a memory the guest is still running in is posting whatever it
       // writes next.
-      port.post({ kind: 'output', fd, text: new TextDecoder().decode(bytes.slice()) });
+      if (msg.debugExit) {
+        // Straight out as well as posted. A Worker that crashes takes its
+        // last few messages with it, and the last few are exactly the ones
+        // that say why -- the shim's panic goes to fd 2 and then it traps.
+        console.error(new TextDecoder().decode(bytes.slice()));
+      }
+      port.post({
+        kind: 'output',
+        fd,
+        text: new TextDecoder().decode(bytes.slice()),
+        lflag: lflag(),
+      });
     }
     now() {
       return BigInt(Date.now()) * 1000000n;
@@ -86,7 +104,7 @@ port.on(async (msg) => {
       if (stdinEof) return false;
       const bytes = await new Promise((r) => {
         stdinWaiter = r;
-        port.post({ kind: 'stdin' });
+        port.post({ kind: 'stdin', lflag: lflag() });
       });
       if (!bytes) return false;
       gex.pushStdin(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
@@ -102,6 +120,28 @@ port.on(async (msg) => {
 
   if (msg.debugExit) globalThis.GEX_DEBUG_EXIT = 1;
   const gex = new Gex(new WorkerEnv(), { kernel: msg.kernel ?? null });
+
+  // The guest's GPU. The renderer is where the canvas is -- the page -- and
+  // this is a Worker, so the calls cross a `SharedArrayBuffer` and block on
+  // `Atomics.wait`. They have to be synchronous: `virgl_submit` is called
+  // from inside a syscall, with the guest's thread on the wasm stack.
+  //
+  // Before `load`, for a sharp reason: the vtest socket is bound while the
+  // guest's namespace is built, and Mesa's winsys does not fall back when it
+  // is missing -- it writes its handshake into the dead descriptor and blocks
+  // on a reply that cannot come.
+  if (msg.virgl) {
+    const { VirglProxy } = await import(msg.virglUrl ?? '../../../web/src/virgl-bridge.js');
+    gex.useVirgl(new VirglProxy(msg.virgl, () => port.post({ kind: 'virgl' })), !!msg.virglTrace);
+  }
+  // A network of this process's own. Each Worker opens its own connection to
+  // the proxy rather than relaying through the page: a socket is per process
+  // on a real machine too, and a relay would put the page in the path of
+  // every byte a download takes.
+  if (msg.wispUrl) {
+    const { WispNetwork } = await import(msg.netUrl ?? '../../../web/src/net.js');
+    gex.useNetwork(new WispNetwork(msg.wispUrl, (e) => port.post({ kind: 'net', event: e })));
+  }
   try {
     let entry;
     if (msg.kind === 'adopt') {
@@ -116,16 +156,30 @@ port.on(async (msg) => {
         msg.opts ?? {},
       );
       if (!entry) throw new Error('the program could not be loaded');
-      // Statically recompile each object the guest maps once it proves hot,
-      // rather than meeting it one dispatch miss at a time. This is the
-      // feature the project exists for and it is off unless asked for.
-      if (msg.opts?.recompileObjects) {
-        gex.shim.exports.gex_set_recompile_objects?.(msg.opts.recompileObjects);
-      }
+    }
+    // Statically recompile each object the guest maps once it proves hot,
+    // rather than meeting it one dispatch miss at a time. This is the feature
+    // the project exists for and it is off unless asked for.
+    //
+    // For a forked child too: it inherits its parent's *translated* code, but
+    // the first thing a shell's child does is `execve`, and what it maps then
+    // has never been seen by anyone.
+    const recompile = msg.opts?.recompileObjects ?? msg.recompileObjects;
+    if (recompile) {
+      gex.shim.exports.gex_set_recompile_objects?.(recompile);
     }
     if (msg.heartbeat) {
       gex.shim.exports.gex_set_heartbeat?.(BigInt(msg.heartbeat));
     }
+    if (msg.winsize) {
+      gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);
+    }
+    winsize = (rows, cols) => gex.shim.exports.gex_set_winsize?.(rows, cols);
+    // The line discipline is the guest's choice, read out of its termios --
+    // and the page is what does the echoing and the line editing, so it has
+    // to be told. Sent with every write because that is when it changes in
+    // practice: a shell sets its terminal up and then prints a prompt.
+    lflag = () => gex.shim.exports.gex_tty_lflag?.() ?? 0;
     const status = await gex.run(entry);
     port.post({
       kind: 'exit',
@@ -134,7 +188,31 @@ port.on(async (msg) => {
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
     });
   } catch (e) {
-    port.post({ kind: 'threw', message: e?.message ?? String(e) });
+    // Where the guest was, not only what the engine said. A crash inside the
+    // shim reaches the host as `unreachable` and nothing else; the address
+    // and the object it is in are the only things that name the cause, and
+    // they are readable here and nowhere else.
+    let where = '';
+    try {
+      const ex = gex.shim?.exports;
+      if (ex?.gex_current_pc) {
+        const pc = ex.gex_current_pc();
+        where = ` at guest pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}`;
+        if (ex.gex_object_at) {
+          const at = ex.gex_alloc(160) >>> 0;
+          const n = ex.gex_object_at(pc, at, 160) >>> 0;
+          if (n) {
+            where += ` in ${new TextDecoder().decode(
+              new Uint8Array(gex.memory.buffer, at, n),
+            )}`;
+          }
+        }
+      }
+    } catch {
+      // A shim too broken to ask. The engine's message is all there is.
+    }
+    if (msg.debugExit) console.error(`gex: worker threw: ${e?.message ?? e}${where}`);
+    port.post({ kind: 'threw', message: (e?.message ?? String(e)) + where });
   }
 });
 

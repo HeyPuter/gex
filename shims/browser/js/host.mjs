@@ -30,8 +30,8 @@
  * knowing which it is running under.
  */
 export class ProcessHost {
-  #makeWorker; #shim; #guest; #kernel; #gexUrl;
-  #onOutput; #onFork; #readStdin;
+  #makeWorker; #shim; #guest; #kernel; #gexUrl; #extra;
+  #onOutput; #onFork; #readStdin; #onOther;
   #workers = new Map();
   #pending = new Map();
   #first = null;
@@ -43,9 +43,17 @@ export class ProcessHost {
     guest,
     kernel = null,
     gexUrl = null,
+    // Merged into every Worker's start message. Everything a process needs
+    // that is not the program itself: the GPU channel, the proxy's address,
+    // the terminal's size. Every process gets the same, because on a real
+    // machine every process does.
+    extra = {},
     onOutput = () => {},
     onFork = () => {},
     readStdin = null,
+    // Anything a Worker posts that this file has no meaning for -- the GPU
+    // asking to be served, a network event for the page's status line.
+    onMessage = () => {},
   }) {
     this.#makeWorker = makeWorker;
     this.#shim = shim;
@@ -55,6 +63,8 @@ export class ProcessHost {
     this.#onOutput = onOutput;
     this.#onFork = onFork;
     this.#readStdin = readStdin;
+    this.#extra = extra;
+    this.#onOther = onMessage;
   }
 
   /** How many children the guest has forked. */
@@ -91,6 +101,11 @@ export class ProcessHost {
   /** Say there will be no more input. */
   endStdin() {
     this.#first?.postMessage({ kind: 'eof' });
+  }
+
+  /** Tell every process the terminal changed size. */
+  resize(rows, cols) {
+    for (const w of this.#workers.values()) w.postMessage({ kind: 'winsize', rows, cols });
   }
 
   /** Stop every Worker, whatever it is doing. */
@@ -130,6 +145,7 @@ export class ProcessHost {
         this.#pending.delete(pid);
         if (msg) {
           w.postMessage({
+            ...this.#extra,
             ...msg,
             gexUrl: this.#gexUrl ?? undefined,
             shim: this.#shim,
@@ -140,7 +156,7 @@ export class ProcessHost {
         break;
       }
       case 'output':
-        this.#onOutput(m.fd, m.text, pid);
+        this.#onOutput(m.fd, m.text, pid, m);
         break;
       case 'fork':
         this.#forked++;
@@ -174,6 +190,9 @@ export class ProcessHost {
         this.#workers.delete(pid);
         w.terminate();
         reject(new Error(m.message));
+        break;
+      default:
+        this.#onOther(m, pid, w);
         break;
     }
   }

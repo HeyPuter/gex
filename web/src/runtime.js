@@ -6,7 +6,8 @@
 // is the guest's choice, made by clearing ICANON in its termios, and the page
 // has to follow it or every keystroke appears twice.
 
-import { Gex, Env } from '../../shims/browser/js/gex.mjs';
+import { Env } from '../../shims/browser/js/gex.mjs';
+import { ProcessHost } from '../../shims/browser/js/host.mjs';
 
 const ICANON = 0x2;
 const ECHO = 0x8;
@@ -14,6 +15,10 @@ const ECHO = 0x8;
 /** Where the built runtime lives, relative to the site root. */
 const SHIM_URL = '/gex/gex_browser.wasm';
 const SEED_URL = '/gex/seed.wasm';
+// The global kernel. `.plain` because each process's own memory is an
+// ordinary `ArrayBuffer` here: a memory import's `shared` flag is part of its
+// type, and a process whose threads are not yet Workers does not need one.
+const KERNEL_URL = '/gex/gex_kernel.plain.wasm';
 
 let shimBytes = null;
 let seedBytes = null;
@@ -59,14 +64,21 @@ export { fetchBytes };
  * `readStdin` -- so this is where a promise sits until a key arrives.
  */
 class TerminalEnv extends Env {
-  constructor(term, gexRef) {
+  constructor(term) {
     super();
     this.term = term;
-    this.gexRef = gexRef;
     this.pending = [];
     this.line = [];
     this.waiter = null;
     this.closed = false;
+    // The guest's terminal flags, as its Worker last reported them.
+    //
+    // Read rather than asked for, because the guest is in a Worker now and
+    // `gex_tty_lflag` is a synchronous call into its shim. Every process
+    // sends its flags with each write and each request for input, which is
+    // when they change in practice: a shell sets its terminal up and then
+    // prints a prompt.
+    this.lflag = ICANON | ECHO;
   }
 
   write(fd, bytes) {
@@ -81,15 +93,11 @@ class TerminalEnv extends Env {
 
   /** Whether the guest is doing its own line editing. */
   #raw() {
-    const shim = this.gexRef.current?.shim;
-    if (!shim?.exports?.gex_tty_lflag) return false;
-    return (shim.exports.gex_tty_lflag() & ICANON) === 0;
+    return (this.lflag & ICANON) === 0;
   }
 
   #echoes() {
-    const shim = this.gexRef.current?.shim;
-    if (!shim?.exports?.gex_tty_lflag) return true;
-    return (shim.exports.gex_tty_lflag() & ECHO) !== 0;
+    return (this.lflag & ECHO) !== 0;
   }
 
   /** A keystroke from xterm. */
@@ -143,19 +151,32 @@ class TerminalEnv extends Env {
     if (this.waiter) {
       const w = this.waiter;
       this.waiter = null;
-      this.gexRef.current.pushStdin(bytes);
-      w(true);
+      w(bytes);
     } else {
       this.pending.push(bytes);
     }
   }
 
+  /**
+   * The next thing typed, as bytes, or false at end of input.
+   *
+   * The bytes are *returned* rather than pushed into a shim: the guest is in
+   * a Worker and this is the page, so what crosses is a message. Everything
+   * waiting is joined into one, because a guest reading a line wants the
+   * line.
+   */
   async readStdin() {
     if (this.closed) return false;
     if (this.pending.length) {
-      for (const b of this.pending) this.gexRef.current.pushStdin(b);
+      const total = this.pending.reduce((n, b) => n + b.length, 0);
+      const out = new Uint8Array(total);
+      let at = 0;
+      for (const b of this.pending) {
+        out.set(b, at);
+        at += b.length;
+      }
       this.pending = [];
-      return true;
+      return out;
     }
     return new Promise((resolve) => {
       this.waiter = resolve;
@@ -170,45 +191,157 @@ class TerminalEnv extends Env {
  * Returns the exit status. The caller owns the terminal; nothing here clears
  * it, so a demo can print its own banner first.
  */
+/**
+ * The global kernel, fetched once and instantiated per Worker.
+ *
+ * Everything guest processes share and no single process can own: the process
+ * table, the filesystem, the pipes. Its memory is a `SharedArrayBuffer`, so
+ * the page has to be cross-origin isolated -- see the COOP/COEP headers in
+ * `vite.config.js`. A page that is not gets no kernel and one process, which
+ * still runs anything that does not fork.
+ */
+let kernelSpec = null;
+async function loadKernel() {
+  if (kernelSpec !== null) return kernelSpec || null;
+  // The direct question, rather than `crossOriginIsolated`: what is needed is
+  // a `SharedArrayBuffer`, and in a page that flag is only how the browser
+  // says whether there is one. Asking for the constructor works under Node
+  // too, which is what lets the terminal test drive this same file.
+  if (typeof SharedArrayBuffer !== 'function') {
+    kernelSpec = false;
+    return null;
+  }
+  try {
+    const bytes = await fetchBytes(KERNEL_URL);
+    kernelSpec = {
+      module: await WebAssembly.compile(bytes),
+      memory: new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }),
+    };
+  } catch {
+    kernelSpec = false;
+    return null;
+  }
+  return kernelSpec;
+}
+
+/**
+ * How to make a Worker running one guest process.
+ *
+ * A page has `Worker`; Node has `worker_threads`. Both are here because the
+ * terminal test drives this same file under Node -- the line discipline and
+ * the promise that parks a guest read are page code, and running them in a
+ * browser to test them would be a twenty-minute cycle instead of a two-minute
+ * one.
+ *
+ * The browser branch is written out in full and inline because that is the
+ * shape vite recognises and bundles; the Node one keeps its path out of a
+ * literal so that the bundler leaves it alone.
+ */
+async function guestWorkerFactory() {
+  if (typeof Worker === 'function') {
+    return () =>
+      new Worker(new URL('../../shims/browser/js/worker.mjs', import.meta.url), {
+        type: 'module',
+      });
+  }
+  const { Worker: NodeWorker } = await import('node:worker_threads');
+  const where = ['..', '..', 'shims', 'browser', 'js', 'worker.mjs'].join('/');
+  return () => new NodeWorker(new URL(where, import.meta.url));
+}
+
+/**
+ * Run one program to completion.
+ *
+ * `files` is the guest's filesystem as a path-to-bytes map, `args` its argv.
+ * Returns the exit status. The caller owns the terminal; nothing here clears
+ * it, so a demo can print its own banner first.
+ *
+ * The program runs in a Worker, and so does everything it forks. That is the
+ * whole of what replaced the snapshot switcher: each process has a memory of
+ * its own, nothing collides, nothing is written out and read back. What they
+ * share is in the global kernel, which every one of them instantiates against
+ * one shared memory.
+ */
 export async function runProgram(
   term,
-  { elf, files = {}, args, cwd = '/', tty = true, network = null, gl = null, virgl = null, uid },
+  {
+    elf,
+    files = {},
+    args,
+    cwd = '/',
+    tty = true,
+    network = null,
+    onNetEvent = null,
+    gl = null,
+    virgl = null,
+    uid,
+  },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
-  const ref = { current: null };
-  const tenv = new TerminalEnv(term, ref);
-  const gex = new Gex(tenv);
-  ref.current = gex;
+  const kernel = await loadKernel();
+  const makeGuestWorker = await guestWorkerFactory();
+  const tenv = new TerminalEnv(term);
 
-  // Before `load`: the graphics device node is created while the guest's
-  // filesystem is, and a guest that opens /dev/gex-gl and does not find it
-  // concludes the machine has no graphics.
-  if (gl) gex.useGl(gl);
-  // Likewise, and for a sharper reason: the vtest socket is bound while the
-  // guest's namespace is built, and Mesa connecting to a socket nobody serves
-  // does not fail -- it writes into the dead descriptor and waits forever.
-  if (virgl) gex.useVirgl(virgl);
-  const entry = await gex.load(shimBytes, seedBytes, elf, files, args, { cwd, tty, uid });
-  if (!entry) throw new Error('the program could not be loaded');
-  if (gex.shim.exports.gex_set_winsize) {
-    gex.shim.exports.gex_set_winsize(term.rows, term.cols);
+  // The GPU, if this demo has one. The renderer stays here, with the canvas;
+  // the guest reaches it across a `SharedArrayBuffer` and blocks on
+  // `Atomics.wait`, because `virgl_submit` is called from inside a syscall
+  // and there is nothing to await with. See `virgl-bridge.js`.
+  let channel = null;
+  let serve = null;
+  if (virgl) {
+    if (!globalThis.crossOriginIsolated) {
+      throw new Error(
+        'the graphics demo needs a cross-origin isolated page: the renderer is ' +
+          'here and the guest is in a Worker, and what carries the command ' +
+          'stream between them is a SharedArrayBuffer.',
+      );
+    }
+    const { makeChannel, serveVirgl } = await import('@gex/virgl-bridge.mjs');
+    channel = makeChannel();
+    serve = serveVirgl(virgl, channel);
   }
-  if (network) gex.useNetwork(network);
-  // Statically recompile each shared object the guest maps, rather than
-  // meeting it one dispatch miss at a time. This is the whole feature the
-  // project exists for, and the page was not using it: every block on this
-  // site arrived through a miss, so glxgears spent 11.8 of its first 34
-  // seconds inside the translator and drew at a third of a frame a second.
-  //
-  // The value is a cap in KiB of mapped text per object. Eight megabytes is
-  // the largest that works today -- above it the graphics rootfs meets #73 --
-  // and it covers every library the demos actually run except Mesa's software
-  // rasteriser, which nothing here wants because the renderer is on the other
-  // side of the vtest socket.
-  gex.shim.exports.gex_set_recompile_objects?.(8192);
-  // Keystrokes go to the environment, not straight to the guest: whether
-  // they are echoed, and whether they are delivered a line at a time, is the
-  // guest's choice, read out of its termios.
+
+  const host = new ProcessHost({
+    makeWorker: makeGuestWorker,
+    shim: shimBytes,
+    guest: seedBytes,
+    kernel,
+    extra: {
+      virgl: channel ?? undefined,
+      wispUrl: network?.url ?? undefined,
+      winsize: { rows: term.rows, cols: term.cols },
+      // Every guest write mirrored to the console as well as posted, and a
+      // crash narrated where it happens. A Worker that falls over takes its
+      // last few messages with it, and those are the ones that say why.
+      debugExit: !!globalThis.GEX_DEBUG_EXIT,
+      // Statically recompile each object the guest maps once it proves hot,
+      // rather than meeting it one dispatch miss at a time. This is the
+      // feature the project exists for, and the page was not using it: every
+      // block on this site arrived through a miss, so glxgears spent 11.8 of
+      // its first 34 seconds inside the translator and drew at a third of a
+      // frame a second.
+      //
+      // A cap in KiB of mapped text per object. Eight megabytes is the
+      // largest that works today -- above it the graphics rootfs meets #73 --
+      // and it covers every library these demos run except Mesa's software
+      // rasteriser, which nothing here wants because the renderer is on the
+      // other side of the vtest socket.
+      recompileObjects: 8192,
+    },
+    onOutput: (fd, text, pid, m) => {
+      if (m?.lflag !== undefined) tenv.lflag = m.lflag;
+      term.write(text);
+    },
+    readStdin: () => tenv.readStdin(),
+    onMessage: (m) => {
+      if (m.kind === 'virgl') serve?.();
+      else if (m.kind === 'net') onNetEvent?.(m.event);
+    },
+  });
+
+  // Keystrokes go to the environment, not straight to the guest: whether they
+  // are echoed, and whether they are delivered a line at a time, is the
+  // guest's choice, read out of its termios and reported by its Worker.
   const keys = term.onData((d) => tenv.onKey(d));
   // xterm only hears the keyboard through a hidden textarea, which has to
   // hold the focus. Nothing gives it that on its own, and the button that
@@ -216,15 +349,19 @@ export async function runProgram(
   // body. So a program would start, print its prompt, and ignore every key
   // until the person thought to click on the terminal.
   term.focus?.();
-  const resize = term.onResize(({ rows, cols }) => {
-    gex.shim.exports.gex_set_winsize?.(rows, cols);
-  });
+  const resize = term.onResize(({ rows, cols }) => host.resize(rows, cols));
   try {
-    const status = await gex.run(entry);
-    return { status, gex, tenv };
+    const status = await host.start({
+      elf,
+      files,
+      args,
+      opts: { cwd, tty, uid, recompileObjects: 8192 },
+    });
+    return { status, host, tenv };
   } finally {
     keys.dispose();
     resize.dispose();
+    host.stop();
   }
 }
 

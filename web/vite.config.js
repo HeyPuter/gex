@@ -21,6 +21,10 @@ export default defineConfig({
   server: { port: 5173, host: true, headers: ISOLATED },
   preview: { headers: ISOLATED },
   build: { target: 'es2022', chunkSizeWarningLimit: 2048 },
+  // A guest process is a Worker, and `worker.mjs` is a module -- it imports
+  // `gex.mjs` and awaits at the top level to work out whether it is under a
+  // page or under Node. The default `iife` output cannot express either.
+  worker: { format: 'es' },
   resolve: {
     alias: {
       // The page runs the same `gex.mjs` the tests do, from the shim it
