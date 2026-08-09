@@ -172,6 +172,16 @@ EOF
 mkdir -p "$R/etc/apt/apt.conf.d"
 cat > "$R/etc/apt/apt.conf.d/99gex" <<'EOF'
 APT::Sandbox::User "root";
+// Bookworm's arm64 index is 49 MB of Packages and 32 MB of Translation-en,
+// and apt builds its cache in one mapping. Started at the default it grows
+// to about 27 MB and then gives up:
+//
+//   E: Dynamic MMap ran out of room. Please increase the size of
+//      APT::Cache-Start. Current value: 28311552.
+//   E: Problem with MergeList .../binary-arm64_Packages
+//
+// Started here it parses the whole index and `apt-get update` exits 0.
+APT::Cache-Start "134217728";
 Acquire::AllowInsecureRepositories "true";
 Acquire::Check-Valid-Until "false";
 APT::Get::AllowUnauthenticated "true";

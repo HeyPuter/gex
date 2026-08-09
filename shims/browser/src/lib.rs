@@ -1120,15 +1120,12 @@ struct Host {
     /// Index into `threads` of the one on the wasm stack right now.
 
     exit: Option<i32>,
-    resume: Option<u64>,
     /// Set alongside `resume` when the scheduler switched threads.
-    resume_ctx: Option<u64>,
     /// Why the scheduler gave the stack back to JS, when it was not an exit.
     /// 1: every thread is waiting for input the page must supply. 2: every
     /// thread is waiting on the network, and the page's event loop is what
     /// makes the bytes arrive. Either way the page is expected to call
     /// `gex_wake`; the difference is what it should do first.
-    paused: u8,
     jit: Jit,
 }
 
@@ -1981,9 +1978,6 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 blocked_on: None,
             }],
             exit: None,
-            resume: None,
-            resume_ctx: None,
-            paused: 0,
             jit: Jit {
                 described: meta.next_slot != 0,
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
@@ -2174,7 +2168,7 @@ pub extern "C" fn gex_stdin_eof() {
 /// has to be asked for.
 #[no_mangle]
 pub extern "C" fn gex_paused_for_input() -> i32 {
-    with_host(|h| (h.paused & 1 != 0) as i32)
+    with_host(|h| (paused() & 1 != 0) as i32)
 }
 
 /// Whether the guest stopped because it is waiting on the network. The page
@@ -2182,7 +2176,7 @@ pub extern "C" fn gex_paused_for_input() -> i32 {
 /// data it is waiting for can arrive -- and then call [`gex_wake`].
 #[no_mangle]
 pub extern "C" fn gex_paused_for_net() -> i32 {
-    with_host(|h| (h.paused & 2 != 0) as i32)
+    with_host(|h| (paused() & 2 != 0) as i32)
 }
 
 /// Carry on after input has arrived: pick a thread and say where to re-enter.
@@ -2221,7 +2215,7 @@ pub extern "C" fn gex_wake() -> i32 {
         });
         trace_line(&format!("[gex] woken {n} times, threads:{census}\n"));
     }
-    with_host(|h| h.paused = 0);
+    set_paused_to(0);
     schedule()
 }
 
@@ -2481,7 +2475,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         match outcome {
             SyscallOutcome::Continue => 0,
             SyscallOutcome::Resume(target) => {
-                h.resume = Some(target);
+                set_resume(target);
                 1
             }
             SyscallOutcome::Exit(code) => exit_process(h, code),
@@ -2527,8 +2521,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     // The stack goes back so the host can see the record and
                     // start the Worker, exactly as a `fork` does. The parent
                     // resumes where it was: `clone` returns the tid to it.
-                    h.resume = Some(pc as u64 + 4);
-                    h.resume_ctx = Some(h.threads[cur()].kstate.ctx_addr);
+                    set_resume(pc as u64 + 4);
+                    set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
                     return 1;
                 }
                 // The parent carries straight on, as it does on Linux. The
@@ -2610,8 +2604,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // later, with a context saved over by the parent's next
                 // syscall -- a child whose registers were its parent's and
                 // whose `rt_sigprocmask` was handed a pointer of 2.
-                h.resume = Some(pc as u64 + 4);
-                h.resume_ctx = Some(h.threads[cur()].kstate.ctx_addr);
+                set_resume(pc as u64 + 4);
+                set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
                 1
             }
             SyscallOutcome::Exec { path, argv, envp } => {
@@ -2628,8 +2622,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     );
                     0
                 } else {
-                    h.resume = Some(entry);
-                    h.resume_ctx = Some(h.threads[cur()].kstate.ctx_addr);
+                    set_resume(entry);
+                    set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
                     1
                 }
             }
@@ -2971,6 +2965,53 @@ pub extern "C" fn gex_fork_brk() -> i64 {
     claimed_fork(4)
 }
 
+/// Where this Worker re-enters the guest, and why it stopped.
+///
+/// Per Worker for the same reason as `CURRENT`: they describe what one
+/// Worker is doing, and a field on the shared `Host` meant one thread's
+/// resume address overwrote another's. What came out was a Worker resuming
+/// at zero -- `nothing to translate at pc=0x0` with a perfectly good pc
+/// sitting in its own context.
+thread_local! {
+    static RESUME: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static RESUME_CTX: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Why the guest gave the stack back when it was not an exit. 1: a thread
+    /// wants a keystroke. 2: a thread wants the page's event loop to turn.
+    static PAUSED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn resume() -> Option<u64> {
+    RESUME.with(|c| c.get())
+}
+
+fn set_resume(v: u64) {
+    RESUME.with(|c| c.set(Some(v)));
+}
+
+fn set_resume_none() {
+    RESUME.with(|c| c.set(None));
+}
+
+fn resume_ctx() -> Option<u64> {
+    RESUME_CTX.with(|c| c.get())
+}
+
+fn set_resume_ctx(v: u64) {
+    RESUME_CTX.with(|c| c.set(Some(v)));
+}
+
+fn set_resume_ctx_none() {
+    RESUME_CTX.with(|c| c.set(None));
+}
+
+fn paused() -> u8 {
+    PAUSED.with(|c| c.get())
+}
+
+fn set_paused_to(v: u8) {
+    PAUSED.with(|c| c.set(v));
+}
+
 /// Which thread of this process *this Worker* is running.
 ///
 /// Per Worker rather than per process, and that is the whole of what makes a
@@ -3201,9 +3242,6 @@ pub extern "C" fn gex_adopt_child(
             blocked_on: None,
         }],
         exit: None,
-        resume: None,
-        resume_ctx: None,
-        paused: 0,
         // Built from the module's `gex.meta`, the same as `gex_load` does:
         // runtime translation carries on where the ahead-of-time build
         // stopped, and a child that started from an empty table would report
@@ -3831,7 +3869,7 @@ fn schedule() -> i32 {
                 // says nothing, which is how the first frame of glxgears was
                 // followed by silence rather than by a second frame.
                 report_idle(why);
-                with_host(|h| h.paused = why);
+                set_paused_to(why);
                 return 2;
             }
             if with_host(|h| {
@@ -3859,7 +3897,7 @@ fn schedule() -> i32 {
             // stack back. Yielding cannot be wrong when nothing can run: at
             // worst the page turns its event loop and gives it straight back.
             report_idle(0);
-            with_host(|h| h.paused = 2);
+            set_paused_to(2);
             return 2;
         };
         IDLE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -3933,8 +3971,8 @@ fn schedule() -> i32 {
         match resume {
             Some((ctx_addr, pc)) => {
                 with_host(|h| {
-                    h.resume = Some(pc);
-                    h.resume_ctx = Some(ctx_addr);
+                    set_resume(pc);
+                    set_resume_ctx(ctx_addr);
                 });
                 return 1;
             }
@@ -4066,7 +4104,7 @@ fn finish_parked(
 /// lists, and returned success. The flag is what makes the difference
 /// visible; `gex_handoff` reads and clears it.
 fn trap() -> ! {
-    HANDOFF.store(true, std::sync::atomic::Ordering::Relaxed);
+    HANDOFF.with(|c| c.set(true));
     core::arch::wasm32::unreachable()
 }
 
@@ -4084,8 +4122,13 @@ pub extern "C" fn gex_last_syscall() -> u32 {
 }
 
 /// Set by [`trap`], cleared by [`gex_handoff`].
-static HANDOFF: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Per Worker, not per process. It says "*this* Worker meant to give the
+/// stack back", and a static in a shared memory meant one Worker's trap flag
+/// was consumed by another's run loop: the first thread of a threaded program
+/// handed the stack back and was told it had crashed.
+thread_local! {
+    static HANDOFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Did the shim mean to give the stack back? Clears the flag.
 ///
@@ -4093,19 +4136,19 @@ static HANDOFF: std::sync::atomic::AtomicBool =
 /// when the kernel may still be borrowed by whatever trapped.
 #[no_mangle]
 pub extern "C" fn gex_handoff() -> i32 {
-    HANDOFF.swap(false, std::sync::atomic::Ordering::Relaxed) as i32
+    HANDOFF.with(|c| c.replace(false)) as i32
 }
 
 #[no_mangle]
 pub extern "C" fn gex_resume_pc() -> i64 {
-    with_host(|h| h.resume.take().unwrap_or(0) as i64)
+    RESUME.with(|c| c.take()).unwrap_or(0) as i64
 }
 
 /// The context to re-enter with, which changes when the scheduler switches
 /// threads. Zero means "the same one as before".
 #[no_mangle]
 pub extern "C" fn gex_resume_ctx() -> i32 {
-    with_host(|h| h.resume_ctx.take().unwrap_or(0) as i32)
+    RESUME_CTX.with(|c| c.take()).unwrap_or(0) as i32
 }
 
 #[no_mangle]
@@ -4347,6 +4390,15 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     if !due {
         return;
     }
+    // A Worker that owns one thread has nobody to hand the stack to.
+    //
+    // The check below asks whether another thread of this process could run,
+    // which is exactly the wrong question once each of them is a Worker: the
+    // answer is yes, and taking it means two Workers on one context. The
+    // engine does the preempting now.
+    if thread_workers() {
+        return;
+    }
     let switch = with_host(|h| {
         if h.threads.len() < 2 {
             return false;
@@ -4462,8 +4514,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         trace_line(&format!("[sig] sigreturn to {target:#x}\n"));
                     }
                     h.threads[cur()].pc = target;
-                    h.resume = Some(target);
-                    h.resume_ctx = Some(kstate.ctx_addr);
+                    set_resume(target);
+                    set_resume_ctx(kstate.ctx_addr);
                     true
                 }
                 Err(_) => {
@@ -4484,8 +4536,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // that missed, once JavaScript has instantiated what was queued and
         // the address resolves.
         with_host(|h| {
-            h.resume = Some(pc);
-            h.resume_ctx = Some(h.threads[cur()].kstate.ctx_addr);
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
         });
         trap();
     }
@@ -4582,8 +4634,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             ));
         }
         // Come back at the address that missed, now that it will resolve.
-        h.resume = Some(pc);
-        h.resume_ctx = Some(h.threads[cur()].kstate.ctx_addr);
+        set_resume(pc);
+        set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
         true
     });
     if !translated {

@@ -75,7 +75,11 @@ const host = new ProcessHost({
   },
 });
 
-const status = await host.start({ elf, args: ['prog'] });
+const status = await host.start({
+  elf,
+  args: ['prog'],
+  opts: { strace: !!process.env.GEX_STRACE },
+});
 
 const want = [
   ['tls ok', /tls ok/],

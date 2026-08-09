@@ -212,8 +212,11 @@ async function handle(msg) {
   }
   try {
     let entry;
+    // Which registers to enter with. A process enters on its first thread,
+    // which is where `run` starts by default; a thread has one of its own.
+    let ctx;
     if (msg.kind === 'thread') {
-      entry = await gex.adoptThread(msg.shim, msg.guest, msg);
+      ({ entry, ctx } = await gex.adoptThread(msg.shim, msg.guest, msg));
     } else if (msg.kind === 'adopt') {
       entry = await gex.adoptProcess(msg.shim, msg.guest, msg.child);
     } else {
@@ -264,7 +267,7 @@ async function handle(msg) {
     // to be told. Sent with every write because that is when it changes in
     // practice: a shell sets its terminal up and then prints a prompt.
     lflag = () => gex.shim.exports.gex_tty_lflag?.() ?? 0;
-    const status = await gex.run(entry);
+    const status = await gex.run(entry, ctx);
     port.post({
       kind: 'exit',
       status,

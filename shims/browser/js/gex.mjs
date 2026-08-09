@@ -776,6 +776,12 @@ export class Gex {
     if (!tid) return;
     const thread = { tid, ctx: e.gex_thread_ctx(), pc: e.gex_thread_pc(), memory: this.#memory };
     e.gex_thread_taken();
+    if (globalThis.GEX_DEBUG_EXIT) {
+      console.error(
+        `[gex] thread -> tid ${thread.tid} pc=0x${thread.pc.toString(16)} ` +
+          `ctx=0x${thread.ctx.toString(16)}`,
+      );
+    }
     if (typeof this.#env.spawnThread !== 'function') {
       throw new Error(
         `the guest started thread ${tid} and this environment cannot run one. ` +
@@ -796,7 +802,7 @@ export class Gex {
     await this.attach(shimWasm, guestWasm);
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
-    return entry;
+    return { entry, ctx: Number(thread.ctx) };
   }
 
   async #drainFork() {
@@ -964,7 +970,7 @@ export class Gex {
     this.#shim?.exports?.gex_set_virgl?.(renderer ? (trace ? 2 : 1) : 0);
   }
 
-  async run(entry) {
+  async run(entry, startCtx = 0x1000) {
     // Every switch, signal and miss leaves wasm by trapping, and V8 captures
     // a stack trace for each trap it turns into a RuntimeError. Nothing here
     // ever reads one, and a program with contended locks takes hundreds of
@@ -972,18 +978,32 @@ export class Gex {
     const limit = Error.stackTraceLimit;
     if (!globalThis.__gexKeepTrace) Error.stackTraceLimit = 0;
     try {
-      return await this.#runLoop(entry);
+      return await this.#runLoop(entry, startCtx);
     } finally {
       Error.stackTraceLimit = limit;
     }
   }
 
-  async #runLoop(entry) {
+  async #runLoop(entry, startCtx = 0x1000) {
     let pc = entry;
-    // The first guest thread's context; a switch hands back a different one.
-    let ctx = 0x1000;
+    // Which thread's registers to enter with. The process's first thread
+    // unless told otherwise -- and a thread in a Worker of its own has to say
+    // otherwise, or it runs the *main* thread's registers: four threads all
+    // entered at 0x1000, re-executed whatever the main thread was in the
+    // middle of, and one of them came out having forked.
+    let ctx = startCtx;
     for (;;) {
       try {
+        // Address zero is never a guest instruction, and entering there is
+        // how a lost resume address shows up: `nothing to translate at
+        // pc=0x0`, from the dispatch table, several layers away from
+        // whatever forgot to say where to go. Named here instead.
+        if (!pc) {
+          throw new Error(
+            `gex: nothing said where to resume (ctx=0x${ctx.toString(16)}). ` +
+              'A trap gave the stack back without setting a resume address.',
+          );
+        }
         this.#guest.exports.enter(ctx, pc);
         // `enter` returning means the guest gave the stack back for good --
         // normally because the last process exited. `GEX_DEBUG_EXIT` says so,
@@ -1058,6 +1078,17 @@ export class Gex {
         // go in in the order they were emitted, because each one's page
         // assignments are the next one's starting point.
         while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
+        // And anything another Worker of this process translated.
+        //
+        // The queue above is one queue for the whole process, because the
+        // shim's state is: whichever Worker traps next drains it, installs
+        // the module into *its own* dispatch tables, and the Worker that
+        // asked for the translation never sees it. Its next branch into that
+        // page then finds an empty slot -- `nothing to translate at pc=0x0`,
+        // which is what a thread of a threaded program did within a second
+        // of starting. `#catchUp` compares this Worker's count against the
+        // process's and is a comparison when there is nothing to do.
+        await this.#catchUp();
         // A `fork` leaves a child here for the host to start. Drained before
         // the parent runs on, so the two are only ever one process apart --
         // and before the memory is touched again, because what the child gets
