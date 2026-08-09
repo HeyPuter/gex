@@ -528,11 +528,12 @@ fn cmd_closure(args: &[String]) -> Result<()> {
     for o in &closure.objects {
         let (lo, hi) = o.image.text_range;
         println!(
-            "{:>2}  {:<40} {:>8} KiB text  at 0x{:x}",
+            "{:>2}  {:<40} {:>8} KiB text  at 0x{:x}  span 0x{:x}",
             o.depth,
             o.name,
             (hi.saturating_sub(lo)) / 1024,
             o.image.bias,
+            o.span,
         );
     }
     println!(
