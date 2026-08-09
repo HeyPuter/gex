@@ -470,7 +470,12 @@ const virglGears = {
         // The loader passes no environment, so the bound is written into a
         // script rather than exported around one.
         files['/run.sh'] = new TextEncoder().encode(
-          `GEARS_SECONDS=${seconds}\nexport GEARS_SECONDS\n. /gears.sh\n`,
+          // `?gears_size=100x100` shrinks the screen. The frame rate question
+          // is whether a frame costs by the pixel or by the call, and the
+          // answer is whichever number moves when this one does.
+          `GEARS_SECONDS=${seconds}\nexport GEARS_SECONDS\n` +
+            `GEARS_SIZE=${/^\d+x\d+$/.test(new URLSearchParams(location.search).get('gears_size') ?? '') ? new URLSearchParams(location.search).get('gears_size') : '300x300'}\nexport GEARS_SIZE\n` +
+            `. /gears.sh\n`,
         );
 
         ctx.idle();
@@ -503,6 +508,13 @@ const virglGears = {
           .join(' ');
         ctx.term.writeln(ctx.ansi.dim(`  ${nums}`));
         ctx.term.writeln(ctx.ansi.dim(`  ${gl}`));
+        // What the guest actually asked the renderer to do. A frame that
+        // arrives empty is either a frame nothing was drawn into or a frame
+        // drawn somewhere else, and the command counts are what tell those
+        // apart.
+        for (const part of renderer.commands().split('|')) {
+          ctx.term.writeln(ctx.ansi.dim(`  ${part.trim()}`));
+        }
         ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
       } catch (e) {
         ctx.term.writeln(ctx.ansi.red(`\r\n${e.message}`));

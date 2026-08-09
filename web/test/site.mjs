@@ -234,19 +234,39 @@ for (const id of list) {
   // at once -- the guest drew *and* the frames reached the canvas -- cannot
   // say so in one pattern.
   const reached = typeof want === 'function' ? want : (t) => want.test(t);
-  const url = `http://127.0.0.1:${port}/?demo=${id}&run=1`;
+  // `GEX_QUERY=gears_size=100x100` reaches the demo. An experiment that only
+  // changes one thing about a run should not need a code change to run.
+  const extra = process.env.GEX_QUERY ? `&${process.env.GEX_QUERY}` : '';
+  const url = `http://127.0.0.1:${port}/?demo=${id}&run=1${extra}`;
   let last = '';
+  let lastTerminal = '';
+  // Every line the terminal has ever shown, in the order it first appeared.
+  //
+  // The reporter can only read the rows on screen, and a run long enough to
+  // scroll loses the top of what it said. That is fatal for evidence made of
+  // two things far apart in time: glxgears prints its frame rate while it
+  // runs and its pixel counts after it exits, and by the time the counts
+  // arrive the frame rates are gone. A snapshot holds one or the other and
+  // never both, so a run that had proved everything sat until the wall.
+  const seen = new Set();
+  const history = () => [...seen].join('\n');
   const done = new Promise((resolve) => {
     onReport = (kind, body) => {
       if (kind === 'threw') return resolve({ how: 'threw', body });
       const [statusKind, text, terminal] = body.split('|');
       last = `${statusKind || '-'} ${text}`;
+      // Kept so that a failure can show what the guest actually said. The
+      // tick line below carries one line; a demo that fails is worth twenty.
+      lastTerminal = terminal || lastTerminal;
+      for (const line of (terminal || '').split('\n')) {
+        if (line.trim()) seen.add(line);
+      }
       // Each status change is a line, so a run that takes minutes still says
       // where it is rather than going quiet. A tick carries the terminal's
       // last line as well, because that is where the guest speaks.
       const tail = (terminal || '').trim().split('\n').filter(Boolean).slice(-1)[0] || '';
       console.log(`     [${id}] ${text}${statusKind === 'tick' && tail ? ` | ${tail}` : ''}`);
-      if (reached(terminal || '') || text === settle) {
+      if (reached(history()) || text === settle) {
         resolve({ how: 'reached', body: text });
       }
       // A run that ended having proved the opposite. Without this the wait
@@ -290,6 +310,11 @@ for (const id of list) {
     console.log(`ok   site-${id}`);
   } else {
     failures++;
+    // The end of the terminal, not just its last line: what a demo printed on
+    // its way to failing is the only account of why.
+    for (const line of lastTerminal.trim().split('\n').slice(-20)) {
+      console.log(`     | ${line}`);
+    }
     console.log(`FAIL site-${id}: ${result.how}${result.body ? ` (${result.body})` : ''}`);
     console.log(`     last status: ${last || '(none)'}`);
     console.log(

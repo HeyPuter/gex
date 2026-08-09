@@ -184,7 +184,10 @@ export GALLIUM_DRIVER=virpipe
 # first browser attempt at this printed nothing for half an hour and the
 # question "where is it" had no answer at all.
 echo "gex: starting the X server"
-Xvfb :0 -screen 0 300x300x24 -nolisten tcp &
+# The screen size is a variable so that a run can ask the question "is the
+# frame rate bound by pixels or by calls?" without rebuilding this image.
+# glxgears with no geometry fills the screen, so this is the window too.
+Xvfb :0 -screen 0 "${GEARS_SIZE:-300x300}x24" -nolisten tcp &
 i=0
 while [ ! -e /tmp/.X11-unix/X0 ]; do
   i=$((i + 1))
