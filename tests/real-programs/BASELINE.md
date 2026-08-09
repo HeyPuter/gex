@@ -106,3 +106,49 @@ like a change here should be isolated before it is believed.
 * The browser leg of this harness produced nothing at all until 2026-08-07,
   because the shim had stopped compiling to wasm and nothing noticed. The
   numbers above are the first ones it has ever produced.
+
+# `cmp`+`b.cond` fusion, measured
+
+Recorded 2026-08-09 on the same 24-core host, with
+`tests/real-programs/nbench-ab.cfg`: three runs of each side, the guest
+statically recompiled both times with `gexc build --exhaustive
+--no-shared-memory`, run under the browser shim on the Node host. The only
+difference between the two modules is whether the lifter remembers what the
+flags were computed from.
+
+| KERNEL       | fusion off | fusion on | change |
+|--------------|------------|-----------|--------|
+| NUMERIC SORT | 377.97     | 488.73    | +29.3% |
+| STRING SORT  | 191.40     | 240.21    | +25.5% |
+| IDEA         | 3296.97    | 3828.4    | +16.1% |
+| FOURIER      | 15201.3    | 15861.3   | +4.3%  |
+
+The three runs per cell, so the spread is visible rather than asserted:
+
+    NUMERIC SORT   on 487.23 486.05 492.92   off 385.01 372.82 376.09
+    STRING SORT    on 238.79 244.93 236.92   off 197.84 190.57 185.80
+    IDEA           on 3802.8 3989.0 3693.5   off 3290.1 3368.6 3232.2
+    FOURIER        on  16109  15683  15792   off  15146  15321  15137
+
+No range overlaps its opposite number, which is what three runs are for.
+
+**FOURIER is the reason to believe the other three.** It is floating point,
+the fusion cannot touch its inner loop, and it moved 4.3% while the integer
+kernels moved 16-29%. A change that had merely made the machine faster --
+or a measurement taken at a quieter moment -- would have moved all four
+together. The 4.3% is probably real and probably loop control, since even an
+FFT counts and compares; it is not the effect being claimed.
+
+And a figure that needs no machine at all: the same 149,913 guest
+instructions across 27,594 blocks emit **8002 KiB of wasm without the fusion
+and 7673 KiB with**, 4.1% less. That is the change as instructions not
+emitted, and nothing about the host can move it.
+
+## What this says about the 30% above
+
+The caveat further up -- that the noise is about 30% and only very large
+effects are readable -- is a fact about ten kernels at two seconds each, not
+about the harness. Five seconds and four kernels spread 1.4% on NUMERIC
+SORT, 3.4% on STRING SORT, 2.7% on FOURIER and 7.7% on IDEA, on a shared
+machine with a VM busy on it. A 15% change is comfortably resolvable. The
+earlier number should not be read as "this harness cannot measure codegen".
