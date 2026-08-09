@@ -408,7 +408,38 @@ a compiler -- are at the STRING SORT end.
 every access has a different address, so this is not redundancy V8 can
 collapse -- it must emit all eight instructions, every time.
 
-## Why section 16(d) is not the way out of the guards
+## Section 16(d) is buildable: the shim compiles for wasm64
+
+Written up twice today as blocked, and it is not. `wasm64-unknown-unknown`
+is in `rustc --print target-list`; it is absent from `rustup target list`,
+which is a different question and the one I checked first.
+
+    RUSTFLAGS="-Zcrate-attr=feature(simd_wasm64)" cargo +nightly build \
+      -p gex-browser --target wasm64-unknown-unknown \
+      -Z build-std=std,panic_abort --release
+
+35 seconds. `std` builds from source cleanly. The only crate that fails is
+`talc`, the allocator, reaching for `core::arch::wasm64::memory_grow`
+behind an unstable feature, and `-Zcrate-attr` injects that feature into
+every crate compiled including dependencies. The artifact declares a
+64-bit memory: section 5, flags `0x04`.
+
+And the memory is not exported by the shim at all -- the shim is linked
+`--import-memory`, so JavaScript supplies one `WebAssembly.Memory` that
+both it and the guest modules import. There is no export/import mismatch
+to resolve, only one memory to construct as 64-bit and two importers that
+have to agree.
+
+What remains is mechanical:
+
+  * `emit_address` stops narrowing. It computes an `i64` today and wraps
+    it; memory64 wants the `i64`, so the wrap and the guard both go.
+  * load and store offsets become u64 LEBs; `memory.copy` and
+    `memory.fill` take `i64` operands.
+  * `ModuleBuilder::import_memory` sets the 64-bit flag.
+  * the glue constructs the memory with `index: 'u64'`.
+
+## The old note, kept because the reasoning was wrong in an instructive way
 
 `memory64` with a large reservation, so the engine's own bounds check
 subsumes the `select`, is the right shape and is not buildable *as things
