@@ -2197,7 +2197,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
 /// program land the library in the same place and can share what was built
 /// for it. Without the second, only the first process would be right.
 #[no_mangle]
-pub extern "C" fn gex_pin_object(path: u32, path_len: u32, base: u64) {
+pub extern "C" fn gex_pin_object(path: u32, path_len: u32, base: u64, span: u64) {
     let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
         return;
     };
@@ -2208,12 +2208,14 @@ pub extern "C" fn gex_pin_object(path: u32, path_len: u32, base: u64) {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             name.hash(&mut hasher);
-            // The span is not known here and does not need to be: the
-            // reservation that follows carries it, and all this has to do is
-            // keep the automatic counter from handing the same address out
-            // to something else. One page of separation does that, because
-            // the pinned bases came from a build that spaced them already.
-            k_place_set(hasher.finish(), base, 0);
+            // With the span, which is not optional. Told zero, the counter
+            // moved one alignment past each pinned base and the *next*
+            // object placed automatically landed inside the pinned one --
+            // whereupon libc's own reservation found its address occupied,
+            // was placed elsewhere, and every module built for it was wrong.
+            // `ls` segfaulted on that, and the pin report said so:
+            // "wanted 0x5000000, landed 0xde42000".
+            k_place_set(hasher.finish(), base, span);
         }
     }
 }
@@ -4965,7 +4967,15 @@ fn finish_parked(
                 // gears demo with "error waiting for command: No child
                 // processes" while the program being timed drew happily in
                 // the next Worker along.
-                return if *nohang && procs.has_children(*ppid) {
+                let kids = procs.has_children(*ppid);
+                if !*nohang {
+                    trace_line(&format!(
+                        "[gex] wait4 blocking by {ppid} for {want}: nothing to collect, \
+                         has_children={kids}, ready={}\n",
+                        procs.wait_ready(*ppid, *want)
+                    ));
+                }
+                return if *nohang && kids {
                     Ok(0)
                 } else {
                     Err(Errno::ECHILD)
@@ -6397,6 +6407,38 @@ pub extern "C" fn gex_jit_installed() {
         #[cfg(feature = "shared-memory")]
         h.jit.registry.push(done.wasm);
         publish_pending(h);
+    });
+}
+
+/// Publish an exit for a process whose Worker is stopping without one.
+///
+/// A process that stops existing must become collectable, however it stopped.
+/// A guest that calls `exit_group` goes through `do_exit`, which tells the
+/// process table; a guest that *traps* -- a lifter gap, a bad access, a panic
+/// in the shim -- never gets there, and its record stays in the table
+/// unreaped and with no status. Its parent then parks in `wait4` on a child
+/// that will never report, and the run wedges with nothing runnable: not
+/// `ECHILD`, which at least ends the wait, but silence.
+///
+/// That is #69. The status reads as death by `SIGKILL`, which is the closest
+/// true thing: the process did not choose to stop.
+///
+/// Idempotent by way of the table: `exit` on a pid that has already published
+/// finds the record, sets the cell again to the same shape, and wakes nobody
+/// new. Calling it after a clean exit is therefore harmless, which is what
+/// lets the Worker call it unconditionally on its way out.
+#[no_mangle]
+pub extern "C" fn gex_abandon(code: i32) {
+    if gex_has_host() == 0 {
+        return;
+    }
+    with_host(|h| {
+        let pid = h.kernel.pid;
+        if h.exit.is_some() {
+            return;
+        }
+        trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
+        h.kernel.procs.exit(pid, code);
     });
 }
 

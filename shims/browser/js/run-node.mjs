@@ -139,7 +139,7 @@ const guestWasm = readFileSync(guestPath);
 const elf = readFileSync(elfPath);
 const args = [argv0 ?? elfPath, ...guestArgs];
 
-/// Read a `.pins` manifest into `{ path: base }`.
+/// Read a `.pins` manifest into `{ path: { base, span } }`.
 ///
 /// The same file `gexc run --pin` takes, and the same format the closure
 /// build writes: a hex base, a space, a guest path.
@@ -148,11 +148,15 @@ function readPins() {
   if (!path) return undefined;
   const out = {};
   for (const line of readFileSync(path, 'utf8').split('\n')) {
-    const at = line.indexOf(' ');
-    if (at < 0) continue;
-    const base = Number(line.slice(0, at).trim());
+    // `base span path`: three fields, and the span matters as much as the
+    // base -- it is what stops the automatic placer handing out an address
+    // inside a pinned object.
+    const f = line.split(' ');
+    if (f.length < 3) continue;
+    const base = Number(f[0]);
+    const span = Number(f[1]);
     if (!Number.isFinite(base) || base <= 0) continue;
-    out[line.slice(at + 1).trim()] = base;
+    out[f.slice(2).join(' ').trim()] = { base, span: Number.isFinite(span) ? span : 0 };
   }
   return out;
 }

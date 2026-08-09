@@ -239,7 +239,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 let v = args.get(i).context("--pin needs a manifest path")?;
                 let text = std::fs::read_to_string(v).with_context(|| format!("reading {v}"))?;
                 for line in text.lines() {
-                    let Some((base, path)) = line.split_once(' ') else {
+                    // `base span path`. The span is what keeps the automatic
+                    // placer from handing out an address inside a pinned
+                    // object: without it the counter moved one alignment past
+                    // each base, and the next library landed in the middle of
+                    // libc.
+                    let mut f = line.splitn(3, ' ');
+                    let (Some(base), Some(_span), Some(path)) = (f.next(), f.next(), f.next())
+                    else {
                         continue;
                     };
                     let base = base.trim().trim_start_matches("0x");
@@ -576,7 +583,7 @@ fn build_closure(
         // reservation, so there is nothing to pin and a line for it would
         // only ever be reported as never reserved.
         if n > 0 && Some(o.path.as_str()) != interp.as_deref() && !is_interp_name(&o.name) {
-            pins.push_str(&format!("{:#x} {}\n", o.image.bias, o.path));
+            pins.push_str(&format!("{:#x} {:#x} {}\n", o.image.bias, o.span, o.path));
         }
         first_slot = module.metadata().next_slot;
         blocks += stats.blocks;
@@ -799,7 +806,7 @@ fn cmd_closure(args: &[String]) -> Result<()> {
             if Some(o.path.as_str()) == interp || is_interp_name(&o.name) {
                 continue;
             }
-            text.push_str(&format!("{:#x} {}\n", o.image.bias, o.path));
+            text.push_str(&format!("{:#x} {:#x} {}\n", o.image.bias, o.span, o.path));
         }
         std::fs::write(out, text).with_context(|| format!("writing {out}"))?;
         eprintln!("  pins written to {out}");

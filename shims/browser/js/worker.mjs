@@ -434,6 +434,15 @@ async function handle(msg) {
     if (msg.debugExit) {
       console.error(`gex: worker threw: ${e?.message ?? e}${where}\n${e?.stack ?? ''}`);
     }
+    // Before the message: this process has stopped existing, and until the
+    // table knows that, its parent's `wait4` is parked on a child that will
+    // never report. See `gex_abandon` -- this is #69, and a crash in a child
+    // used to wedge the whole run rather than end it.
+    try {
+      gex?.shim?.exports?.gex_abandon?.(-9);
+    } catch {
+      // The shim is what just fell over; there may be nothing left to call.
+    }
     port.post({ kind: 'threw', message: (e?.message ?? String(e)) + where });
   }
 }

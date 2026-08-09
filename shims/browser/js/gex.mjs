@@ -541,12 +541,15 @@ export class Gex {
     // is a precondition rather than a hint -- and the guest cooperates
     // without knowing it, because `mmap(NULL, span)` takes what it is given.
     const pin = this.#shim.exports.gex_pin_object;
-    for (const [path, base] of Object.entries(opts.pins ?? {})) {
+    for (const [path, where] of Object.entries(opts.pins ?? {})) {
       if (!pin) break;
       const b = enc.encode(path);
       const bp = this.#shim.exports.gex_alloc(b.length) >>> 0;
       this.#bytes().set(b, bp);
-      pin(bp, b.length, BigInt(base));
+      // The span as well as the base: the placement table needs to know how
+      // much of the address space a pinned object owns, or it hands the next
+      // one an address inside it.
+      pin(bp, b.length, BigInt(where.base ?? where), BigInt(where.span ?? 0));
       free?.(bp, b.length);
     }
 

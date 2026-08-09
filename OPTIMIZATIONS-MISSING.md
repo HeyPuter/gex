@@ -964,3 +964,43 @@ The command does not complete, and the reason is not this: `wait4` returns
 ECHILD, which is #69, and the closure exposes it by making the child finish
 before the parent asks. The six-case substitution suite passes with this shim
 when no closure is loaded, so nothing here regressed the ordinary path.
+
+### Two bugs the closure work turned up
+
+**A pinned object's span was not passed on, so the next one landed inside
+it.** `k_place_set` seeds the global placement table from the closure's
+manifest, and it was told the span was zero -- on the reasoning that the
+reservation which follows carries the length anyway. It does, but too late:
+the counter moved one 64 KiB alignment past each pinned base, so the *next*
+object placed automatically was handed an address inside the pinned one.
+libc's own reservation then found 0x5000000 occupied, took what the allocator
+gave it instead, and every module built for libc was wrong. `ls` segfaulted
+on it, and the pin report said exactly what had happened:
+
+    [gex] pin MISPLACED: /lib/aarch64-linux-gnu/libc.so.6
+          wanted 0x5000000, landed 0xde42000
+
+The manifest now carries `base span path`, and the placement table is told
+both.
+
+**A process that trapped never became collectable, so its parent waited
+forever.** #69. `exit_group` goes through `do_exit`, which publishes to the
+process table; a guest that *traps* -- a lifter gap, a bad access, a panic in
+the shim -- never reaches it, and its record stays unreaped with no status.
+The parent parks in `wait4` on a child that will never report, and the run
+ends with nothing runnable and no message. `gex_abandon` publishes a SIGKILL
+status from the Worker's own crash handler, which is the closest true thing:
+the process did not choose to stop. A crash in a child now ends the run with
+an error instead of hanging it.
+
+With both, `dash -c 'echo $(ls /bin | wc -l)'` on dash's exhaustive closure
+completes, and the blocks translated at runtime are
+
+    pid 1  dash          0
+    pid 2  dash (fork)   0
+    pid 3  ls        3,281
+    pid 4  wc        1,329
+
+Zero for both processes the closure was built for, and for the two it was
+not, only their own text and the libraries outside it -- libselinux and
+libpcre2, which are in `ls`'s closure and not in dash's.
