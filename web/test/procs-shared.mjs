@@ -49,6 +49,24 @@ const GUEST_PAGES = 0xffff0000 / 65536;
 // memory carries its bounds in its type.
 const kernel = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 
+// Where the kernel's per-Worker stacks are. Probed here, from a throwaway
+// instance, because this file makes the memory and can ask before any Worker
+// exists. Every Worker below installs its own slice.
+const probe = (await WebAssembly.instantiate(
+  await WebAssembly.compile(bytes),
+  {
+    env: {
+      memory: kernel,
+      process: new WebAssembly.Memory({
+        initial: GUEST_PAGES, maximum: GUEST_PAGES, shared: true,
+      }),
+    },
+  },
+)).exports;
+const STACK_AREA = probe.k_stack_area() >>> 0;
+const STACK_SIZE = probe.k_stack_size() >>> 0;
+let stacksTaken = 0;
+
 const WORKER = `
   import { parentPort, workerData } from 'node:worker_threads';
   // This Worker's own process memory. Not shared with the other Worker --
@@ -60,6 +78,10 @@ const WORKER = `
     await WebAssembly.compile(workerData.bytes),
     { env: { memory: workerData.kernel, process: proc } },
   )).exports;
+  // This Worker's own stack in the kernel module. A wasm global belongs to an
+  // instance, so each Worker has a stack pointer of its own -- and wasm-ld
+  // starts every one of them at the same address in the memory they share.
+  if (workerData.stackTop) k.__stack_pointer.value = workerData.stackTop | 0;
   parentPort.on('message', (m) => {
     const r = k[m.fn](...(m.args ?? []));
     parentPort.postMessage({ kind: 'ret', fn: m.fn, value: Number(r) });
@@ -71,7 +93,12 @@ function spawn() {
   return new Promise((resolve, reject) => {
     const w = new Worker(WORKER, {
       eval: true,
-      workerData: { bytes, kernel, guestPages: GUEST_PAGES },
+      workerData: {
+        bytes,
+        kernel,
+        guestPages: GUEST_PAGES,
+        stackTop: STACK_AREA + ++stacksTaken * STACK_SIZE,
+      },
     });
     const pending = [];
     const api = {

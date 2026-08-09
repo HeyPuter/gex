@@ -47,7 +47,7 @@ const GUEST_PAGES = 0xffff0000 / 65536;
 // the linker fixed when it built it; a shared memory also has to declare a
 // maximum, and that maximum is the ceiling on everything the kernel will ever
 // hold -- every process's file table, every pipe's buffer.
-const kernel = new WebAssembly.Memory({ initial: 64, maximum: 16384, shared: true });
+const kernel = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 
 const WORKER = `
   import { parentPort, workerData } from 'node:worker_threads';

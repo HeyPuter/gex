@@ -46,12 +46,17 @@ use gex_kernel::proc::ProcTable;
 /// the top of it. The array is in `.bss` -- it costs address space in the
 /// kernel memory and nothing else until it is written.
 ///
-/// Half a megabyte each. This module's deepest call is a `TmpFs` lookup and
-/// a `Vec` grow; the browser shim, which does real work, gets eight.
-pub const STACK_BYTES: u32 = 512 * 1024;
-/// As many as there are guest processes plus their threads. Sixty-four is
-/// well past what a page will run and costs nothing until it is touched.
-pub const STACK_COUNT: u32 = 64;
+/// A quarter of a megabyte each. This module's deepest call is a `TmpFs`
+/// lookup and a `Vec` grow; the browser shim, which does real work, gets
+/// eight megabytes.
+pub const STACK_BYTES: u32 = 256 * 1024;
+/// As many as there are guest processes plus their threads.
+///
+/// It is not free: `.bss` counts towards the module's *declared* initial
+/// memory, so this is eight megabytes a host must provide before the kernel
+/// will link at all. Thirty-two is past what a page will run and still small
+/// enough that the number is not the reason a memory has to be big.
+pub const STACK_COUNT: u32 = 32;
 static mut STACKS: [u8; (STACK_BYTES * STACK_COUNT) as usize] =
     [0; (STACK_BYTES * STACK_COUNT) as usize];
 
