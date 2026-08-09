@@ -634,9 +634,29 @@ host plumbing is needed. It hangs, for a reason worth writing down:
 `PendingModule` carries the size the dispatch table must be grown to, a
 *foreign* module was built against another process's high-water mark, and
 passing the local one understates it. The table is not grown far enough, the
-install throws inside the drain loop, and the run wedges. Store the slot
-count with the module and replay its `dir_entries` before installing. See
-#95.
+install throws inside the drain loop, and the run wedges.
+
+That fix was then made -- the slot count stored with the module and read back
+through `k_mod_slots`, the module's `dir_entries` stored and replayed into
+`page_table` *before* the install so its blocks resolve to real slots instead
+of being silently dropped -- **and it still hangs**, in the same place: the
+second `ls` of the loop, the first process to serve a module rather than lift
+one. So the diagnosis was incomplete, and this is an open question rather
+than a known bug with a known fix.
+
+Ruled out by the two attempts: the slot count (fixed, no change); the blocks
+failing to resolve (dirs replayed first, no change); and the kernel's `Mutex`
+being unsound across Workers, which was the next suspect and is not it --
+`ProcTable` holds a `Mutex<Table>` in exactly the same way and every `fork`
+in the suite goes through it.
+
+Left, in the order worth trying. Whether an early `return true` from inside
+the `with_host` closure reaches the same `trap()` the normal path falls
+through to. Whether pushing a `PendingModule` onto a queue that already has
+one confuses `publish_pending`, which publishes the *front* rather than the
+entry just added. And whether replaying another process's `dirs` reassigns a
+page this one had already placed elsewhere. One trace line in the serve path
+separates those in a single run. See #95.
 
 **And a control worth keeping.** Per-process lifting was unchanged and wall
 clock did not move either. That says the 55.3s is not on the critical path:
