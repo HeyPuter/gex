@@ -21,13 +21,19 @@
 # will not link.
 set -e
 cd "$(dirname "$0")/../.."
+# What a process's memory may grow to, and what it is allocated with. They
+# differ because there is one memory per process and `initial` is paid for the
+# moment the process exists -- see `gex_abi::GUEST_MEM_INITIAL_BYTES`.
 GUEST_BYTES=$((0xFFFF0000))
-# The guest's world ends at STACK_TOP (0x8000_0000). Above it: 8 MiB of shim
-# stack, then the shim's data and heap.
-SHIM_STACK_TOP=$((0x80800000))
+GUEST_INITIAL=$((0x05000000))
+# The guest's stack tops out at STACK_TOP (0x0400_0000). Above it: 8 MiB of
+# shim stack, then the shim's data. The shim's *heap* is not here at all any
+# more -- it claims spans from the same growing arena the guest's mappings
+# come from, so neither pays for a ceiling it is not using.
+SHIM_STACK_TOP=$((0x04800000))
 SHIM_BASE=$SHIM_STACK_TOP
 LINK="-C link-arg=--import-memory \
-  -C link-arg=--initial-memory=$GUEST_BYTES \
+  -C link-arg=--initial-memory=$GUEST_INITIAL \
   -C link-arg=--max-memory=$GUEST_BYTES \
   -C link-arg=--global-base=$SHIM_BASE \
   -C link-arg=-zstack-size=8388608 \

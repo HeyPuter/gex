@@ -40,5 +40,5 @@ RUSTFLAGS="-C link-arg=--import-memory \
 # has a plain memory; a memory import's `shared` flag is part of its type, so
 # which one this module declares is not a runtime choice. The host picks the
 # file that matches the processes it is running.
-node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.wasm env process 65535 1
-node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.plain.wasm env process 65535 0
+node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.wasm env process "" 1
+node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.plain.wasm env process "" 0

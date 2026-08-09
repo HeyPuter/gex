@@ -76,6 +76,24 @@ pub struct MemoryMap {
     brk_cur: u64,
     /// Next address the top-down allocator will try.
     mmap_next: u64,
+    /// How far up the arena has been claimed, and who to ask for more.
+    ///
+    /// A native host owns a whole address space and can hand out anything
+    /// between [`MMAP_BOTTOM`] and [`MMAP_TOP`] straight away. A guest in a
+    /// browser lives in a `WebAssembly.Memory` that has to be *allocated* up
+    /// to its highest used address, and there is one per process -- so the
+    /// arena is claimed as it is needed and the memory grown to match.
+    /// `None` is the native case: everything is available already.
+    ///
+    /// `arena` is the spans this map has been given, in the order it got
+    /// them. It only ever hands out addresses inside them, because the same
+    /// growing region also feeds the runtime's own heap and the two must not
+    /// pick the same bytes.
+    arena: Vec<(u64, u64)>,
+    take: Option<fn(u64) -> u64>,
+    /// Make the host's memory reach an address, for a mapping the guest
+    /// placed itself rather than one the arena handed out.
+    back: Option<fn(u64) -> bool>,
     /// Bumped by every change to the map.
     ///
     /// `/proc/self/maps` is built by formatting this whole tree as hex text,
@@ -108,6 +126,9 @@ impl MemoryMap {
             brk_start: page_align_up(brk_start),
             brk_cur: page_align_up(brk_start),
             mmap_next: MMAP_TOP,
+            arena: Vec::new(),
+            take: None,
+            back: None,
         }
     }
 
@@ -120,6 +141,70 @@ impl MemoryMap {
 
     pub fn vmas(&self) -> &[Vma] {
         &self.vmas
+    }
+
+    /// Hand out arena addresses from the bottom up, asking `grow` before
+    /// using any that are not backed yet.
+    ///
+    /// Called by a host whose memory has to be allocated up to whatever it
+    /// hands out. `grow` is given the address one past the highest byte the
+    /// map is about to use and answers whether the memory now covers it.
+    pub fn grows_on_demand(&mut self, take: fn(u64) -> u64, back: fn(u64) -> bool) {
+        self.take = Some(take);
+        self.back = Some(back);
+        self.arena.clear();
+    }
+
+    /// The address one past the highest byte in use, which is how much memory
+    /// a process actually needs.
+    pub fn high_water(&self) -> u64 {
+        self.vmas
+            .iter()
+            .map(|v| v.end)
+            .chain(std::iter::once(self.brk_cur))
+            .max()
+            .unwrap_or(MMAP_BOTTOM)
+    }
+
+    /// Make sure the host's memory reaches `end`, for a mapping placed at an
+    /// address the guest chose rather than one the arena handed out.
+    ///
+    /// `MAP_FIXED` and an honoured address hint both put a mapping where the
+    /// caller said, which may be above anything the arena has claimed. A
+    /// pthread stack is the common one, and without this the guest's first
+    /// write to it trapped on memory that had never been grown.
+    fn ensure_backed(&mut self, end: u64) -> Result<(), Errno> {
+        let Some(take) = self.take else {
+            return Ok(());
+        };
+        if self.arena.iter().any(|&(_, e)| end <= e) {
+            return Ok(());
+        }
+        let _ = take;
+        // A fixed address the guest chose: the memory has to reach it, but
+        // nothing is claimed from the arena -- the guest named the range and
+        // this map records it as an ordinary mapping.
+        match self.back {
+            Some(back) if end <= MMAP_TOP && back(end) => Ok(()),
+            _ => Err(Errno::ENOMEM),
+        }
+    }
+
+    /// Claim `len` more bytes of arena, growing the memory behind it.
+    fn extend_arena(&mut self, len: u64) -> Result<u64, Errno> {
+        let Some(take) = self.take else {
+            return Err(Errno::ENOMEM);
+        };
+        // A chunk at a time, so a guest that maps a page at a time does not
+        // ask the host to grow its memory once per page.
+        const CHUNK: u64 = 8 * 1024 * 1024;
+        let want = page_align_up(len).max(CHUNK);
+        let start = take(want);
+        if start == 0 {
+            return Err(Errno::ENOMEM);
+        }
+        self.arena.push((start, start + want));
+        Ok(start)
     }
 
     pub fn brk_current(&self) -> u64 {
@@ -171,7 +256,7 @@ impl MemoryMap {
             return (self.brk_cur, None);
         }
         let new = page_align_up(addr);
-        if new < self.brk_start || new >= MMAP_BOTTOM {
+        if new < self.brk_start || new >= gex_abi::BRK_TOP {
             return (self.brk_cur, None);
         }
         let grew = (new > self.brk_cur).then_some((self.brk_cur, new));
@@ -231,6 +316,7 @@ impl MemoryMap {
                 return Err(Errno::ENOMEM);
             }
             // MAP_FIXED replaces whatever was there.
+            self.ensure_backed(end)?;
             self.unmap(addr, len)?;
             self.insert_from(addr, end, prot, name, origin);
             return Ok(addr);
@@ -239,10 +325,42 @@ impl MemoryMap {
         // An address hint is honoured when the range happens to be free.
         if addr != 0 && addr.is_multiple_of(PAGE_SIZE) {
             let end = addr.saturating_add(len);
-            if end <= GUEST_LIMIT && self.is_free(addr, end) {
+            if end <= GUEST_LIMIT && self.is_free(addr, end) && self.ensure_backed(end).is_ok() {
                 self.insert_from(addr, end, prot, name, origin);
                 return Ok(addr);
             }
+        }
+
+        // Bottom-up when the host's memory grows with the arena, so the
+        // highest address in use stays as low as the run allows. A hole left
+        // by `munmap` is reused before any more is claimed; only when nothing
+        // fits does the arena -- and the memory behind it -- get bigger.
+        if self.take.is_some() {
+            // Bottom-up inside what this map already owns, so a hole left by
+            // `munmap` is reused before the host is asked to grow.
+            let chunks = self.arena.clone();
+            for (lo, hi) in chunks {
+                let mut candidate = page_align_up(lo);
+                while candidate + len <= hi {
+                    if self.is_free(candidate, candidate + len) {
+                        self.insert_from(candidate, candidate + len, prot, name, origin);
+                        return Ok(candidate);
+                    }
+                    match self
+                        .vmas
+                        .iter()
+                        .filter(|v| v.start < candidate + len && v.end > candidate)
+                        .map(|v| v.end)
+                        .max()
+                    {
+                        Some(end) => candidate = page_align_up(end),
+                        None => break,
+                    }
+                }
+            }
+            let start = self.extend_arena(len)?;
+            self.insert_from(start, start + len, prot, name, origin);
+            return Ok(start);
         }
 
         let mut candidate = self.mmap_next;

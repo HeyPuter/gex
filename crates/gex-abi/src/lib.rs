@@ -26,6 +26,21 @@ pub const GUEST_MEM_BYTES: u64 = 0xFFFF_0000;
 /// Number of wasm pages in [`GUEST_MEM_BYTES`].
 pub const GUEST_MEM_PAGES: u64 = GUEST_MEM_BYTES / WASM_PAGE;
 
+/// What a process's memory is *allocated* with, as opposed to what it may
+/// grow to.
+///
+/// Everything below [`MMAP_BOTTOM`] is the fixed layout a process needs
+/// before it runs: the register contexts, the dispatch directory, the image,
+/// its break and its stack, and the runtime's own stack and data. Above it
+/// nothing is touched until something asks, and the memory is grown then.
+///
+/// This is the number multiplied by the number of processes a run has, so it
+/// is the one that decides whether a demo works on somebody else's machine.
+pub const GUEST_MEM_INITIAL_BYTES: u64 = MMAP_BOTTOM;
+
+/// Number of wasm pages in [`GUEST_MEM_INITIAL_BYTES`].
+pub const GUEST_MEM_INITIAL_PAGES: u64 = GUEST_MEM_INITIAL_BYTES / WASM_PAGE;
+
 /// Highest guest address that can ever be valid.
 pub const GUEST_LIMIT: u64 = GUEST_MEM_BYTES;
 
@@ -47,24 +62,59 @@ pub const RESERVED_BASE: u64 = 0x1000;
 pub const RESERVED_END: u64 = 0x0010_0000;
 
 /// Default load bias for position-independent executables.
-pub const PIE_BASE: u64 = 0x2000_0000;
+///
+/// Low, because every byte below the highest thing a process touches is
+/// memory that process's `WebAssembly.Memory` has to have from the moment it
+/// is created -- and there is one of those per process. 16 MiB leaves room
+/// under it for a non-PIE image at [`EXEC_BASE`] and the runtime's own
+/// tables, and puts the image where a small process's whole world fits in a
+/// few tens of megabytes.
+pub const PIE_BASE: u64 = 0x0100_0000;
 
 /// Where a non-PIE image's own `p_vaddr` values are honoured from. Non-PIE
 /// aarch64 links at 0x400000, which is above both the reserved region and the
 /// dispatch directory, so a fixed-address image never collides with them.
 pub const EXEC_BASE: u64 = 0x0040_0000;
 
+/// Where a dynamic program's interpreter is placed.
+///
+/// Above the window the executable and its break share, below the stack. It
+/// lives here rather than in a host because the break's ceiling is defined by
+/// it: a break that grew past this would run over `ld.so`.
+pub const INTERP_BASE: u64 = 0x0300_0000;
+
+/// Highest address the break may reach.
+///
+/// The executable is loaded at [`PIE_BASE`] and its break grows up from the
+/// end of it; 32 MiB is what that window holds, which is more than any
+/// program in the suite uses and larger than the biggest binary in it. A
+/// program that wants more gets the old break back from `brk`, and libc does
+/// what it does on any system that says no: it uses `mmap`.
+pub const BRK_TOP: u64 = INTERP_BASE;
+
 /// Top of the guest stack. Grows down from here.
-pub const STACK_TOP: u64 = 0x8000_0000;
+///
+/// Just above the image and its break, rather than at the top of the address
+/// space. A stack at the top makes the top load-bearing, and a linear memory
+/// has to be allocated up to its highest used address: that is how a process
+/// came to cost four gigabytes before it had run an instruction, and why the
+/// gears demo -- six processes -- asked a browser for twenty-five.
+pub const STACK_TOP: u64 = 0x0400_0000;
 
 /// Default guest stack size (8 MiB, matching a typical `RLIMIT_STACK`).
 pub const STACK_SIZE: u64 = 8 * 1024 * 1024;
 
-/// Base of the top-down mmap region.
-pub const MMAP_TOP: u64 = 0x7000_0000;
+/// Ceiling of the region a guest's mappings and the runtime's own heap grow
+/// into.
+///
+/// Everything below [`MMAP_BOTTOM`] is a fixed layout that a process needs
+/// from the start; everything above it is handed out as it is asked for, and
+/// the memory is grown to match. So this is a limit rather than a cost.
+pub const MMAP_TOP: u64 = 0xF000_0000;
 
-/// Lowest address the mmap allocator will hand out.
-pub const MMAP_BOTTOM: u64 = 0x3000_0000;
+/// Lowest address the mmap allocator will hand out, and the bottom of the
+/// region that grows.
+pub const MMAP_BOTTOM: u64 = 0x0500_0000;
 
 // ---------------------------------------------------------------------------
 // Thread context (PLAN §4)
@@ -432,7 +482,11 @@ mod tests {
         assert!(DISPATCH_MAX_PAGES * DISPATCH_PAGE >= STACK_TOP);
         assert!(EXEC_BASE < PIE_BASE);
         assert!(MMAP_BOTTOM < MMAP_TOP);
-        assert!(MMAP_TOP <= STACK_TOP);
-        assert!(STACK_TOP < GUEST_LIMIT);
+        // The stack sits at the top of the fixed low region, and the arena
+        // starts above it and grows upward.
+        assert!(PIE_BASE < INTERP_BASE);
+        assert!(INTERP_BASE < STACK_TOP);
+        assert!(STACK_TOP <= MMAP_BOTTOM);
+        assert!(MMAP_TOP <= GUEST_LIMIT);
     }
 }

@@ -1,6 +1,6 @@
 // Give a linked wasm module a second imported memory.
 //
-//   node tools/add-memory.mjs <in.wasm> <out.wasm> [module] [name] [pages] [shared]
+//   node tools/add-memory.mjs <in.wasm> <out.wasm> [module] [name] [min] [shared] [max]
 //
 // The global kernel module addresses its own memory as memory 0 -- that is
 // what `--import-memory` gives it and what every Rust pointer in it means --
@@ -16,22 +16,26 @@
 // import leaves the module's own memory at 0 where all its code expects it.
 import { readFileSync, writeFileSync } from 'node:fs';
 
-// The guest's address space, in wasm pages: `GUEST_MEM_BYTES / WASM_PAGE`.
-// Fixed rather than growable, because the guest's stack has to land where the
-// ABI says it does.
-const GUEST_PAGES = 0xffff0000 / 65536;
+// A process's address space, in wasm pages. Growable: `min` is what the host
+// allocates when the process is created -- `GUEST_MEM_INITIAL_BYTES`, the
+// fixed layout below the arena -- and `max` is how far it may grow. They are
+// different numbers because there is one memory per process and the first is
+// paid for immediately.
+const GUEST_MAX_PAGES = 0xffff0000 / 65536;
+const GUEST_MIN_PAGES = 0x05000000 / 65536;
 
 const [
   inPath,
   outPath,
   mod = 'env',
   name = 'process',
-  pages = GUEST_PAGES,
+  pages,
   shared = '1',
+  maxPages = GUEST_MAX_PAGES,
 ] = process.argv.slice(2);
 if (!inPath || !outPath) {
   console.error(
-    'usage: add-memory.mjs <in.wasm> <out.wasm> [module] [name] [pages] [shared]',
+    'usage: add-memory.mjs <in.wasm> <out.wasm> [module] [name] [min] [shared] [max]',
   );
   process.exit(2);
 }
@@ -83,10 +87,13 @@ const str = (s) => [...enc(s.length), ...[...s].map((c) => c.charCodeAt(0))];
 // single Worker has a plain one and needs 0x01, and a module built for the
 // first will not instantiate against the second. So the kernel module is
 // emitted twice, once for each, and a host picks by what its processes are.
+// An empty argument means "whatever the layout says", so the size lives in
+// one place rather than in every caller's command line.
+const min = pages ? Number(pages) : GUEST_MIN_PAGES;
 const entry = [
   ...str(mod), ...str(name),
   0x02, shared === '0' ? 0x01 : 0x03,
-  ...enc(Number(pages)), ...enc(Number(pages)),
+  ...enc(min), ...enc(Number(maxPages)),
 ];
 
 let at = 8; // past the magic and version

@@ -928,6 +928,72 @@ extern "C" {
 #[derive(Debug)]
 struct ShimRegion;
 
+/// Make the memory cover everything below `end`.
+///
+/// A process's memory starts at what its fixed low layout needs -- contexts,
+/// image, break, stack -- and grows from there. Both things that grow, the
+/// guest's mmap arena and this module's heap, come through here, so the
+/// memory is never larger than what a run has actually asked for.
+///
+/// Returns false when the engine will not give any more, which is a real
+/// answer: `mmap` reports ENOMEM and the allocator fails, rather than the
+/// process being killed by a trap on an address that was never backed.
+fn grow_memory_to(end: u64) -> bool {
+    const PAGE: u64 = 65536;
+    let have = core::arch::wasm32::memory_size(0) as u64 * PAGE;
+    if end <= have {
+        return true;
+    }
+    // A megabyte at a time past what was asked for. `memory.grow` is not
+    // cheap -- the engine may copy -- and a guest that maps a page at a time
+    // would otherwise pay for each one.
+    let want = (end - have).div_ceil(PAGE).max(16);
+    core::arch::wasm32::memory_grow(0, want as usize) != usize::MAX
+}
+
+/// The arena both the guest and this module take from, in address order.
+///
+/// One cursor rather than two regions: two would each need a fixed ceiling,
+/// and a fixed ceiling is memory a process pays for whether it uses it or
+/// not. Anything the guest unmaps goes back to the kernel's own free list;
+/// this only ever moves up.
+static ARENA_NEXT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Take `len` bytes of arena for this module's heap.
+fn arena_take(len: u64) -> Option<u64> {
+    let at = ARENA_NEXT.load(std::sync::atomic::Ordering::Relaxed);
+    let at = if at == 0 { gex_abi::MMAP_BOTTOM } else { at };
+    let end = at.checked_add(len)?;
+    if end > gex_abi::MMAP_TOP || !grow_memory_to(end) {
+        return None;
+    }
+    ARENA_NEXT.store(end, std::sync::atomic::Ordering::Relaxed);
+    Some(at)
+}
+
+/// Make the memory reach `end`, and keep the arena above it.
+///
+/// For a mapping the guest placed itself -- `MAP_FIXED`, or an address hint
+/// the map honoured. The range is the guest's, so nothing else may be handed
+/// out below it: this module's heap takes from the same cursor and would
+/// otherwise put its bookkeeping inside a mapping the guest is using.
+fn arena_back(end: u64) -> bool {
+    if !grow_memory_to(end) {
+        return false;
+    }
+    ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// What the kernel's memory map calls to claim a span of arena.
+///
+/// The same cursor this module's heap takes from, so the two can never hand
+/// out the same bytes. Zero means the memory would not grow.
+fn arena_grow(len: u64) -> u64 {
+    arena_take(len).unwrap_or(0)
+}
+
 // SAFETY: `acquire` claims a region of this module's own linear memory and
 // touches no other allocator.
 unsafe impl talc::source::Source for ShimRegion {
@@ -935,19 +1001,20 @@ unsafe impl talc::source::Source for ShimRegion {
         talc: &mut talc::base::Talc<Self, B>,
         _layout: std::alloc::Layout,
     ) -> Result<(), ()> {
-        // There is exactly one region; a second call means it is exhausted,
-        // and saying so beats claiming it again and looping forever.
-        static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if CLAIMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            return Err(());
-        }
-        let base = (&raw const __heap_base) as *mut u8;
-        // Short of the very top, so a span that would end exactly at the end
-        // of memory cannot be rounded past it.
-        let size = gex_abi::GUEST_MEM_BYTES as usize - base as usize - 65536;
-        // SAFETY: the linker put this module's data below `__heap_base`, and
-        // the guest maps nothing above `STACK_TOP`, so the region is ours.
-        unsafe { talc.claim(base, size).ok_or(())? };
+        // A span at a time, from the arena the guest's mappings come from
+        // too, and each one grows the memory behind it.
+        //
+        // It used to claim everything between this module's data and the top
+        // of a fixed four-gigabyte memory, once. That is why the memory had
+        // to *be* four gigabytes: the ceiling was the allocator's, and a
+        // process paid for it before it had allocated a byte.
+        const CHUNK: u64 = 16 * 1024 * 1024;
+        let len = (_layout.size() as u64 + _layout.align() as u64).max(CHUNK);
+        let len = len.next_multiple_of(65536);
+        let base = arena_take(len).ok_or(())? as *mut u8;
+        // SAFETY: `arena_take` handed this span out to nobody else and grew
+        // the memory to cover it.
+        unsafe { talc.claim(base, len as usize).ok_or(())? };
         Ok(())
     }
 }
@@ -1830,6 +1897,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
 
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
+    // This host's memory has to be allocated up to whatever the map hands
+    // out, so the map asks before it hands anything out.
+    kernel.mem.grows_on_demand(arena_grow, arena_back);
     // The table every process shares, when the host has wired one up. This
     // process is the first, so it keeps the pid the kernel gave it -- the
     // global table's `INIT_PID` is the same 1.
@@ -1935,7 +2005,13 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     kernel.envp = env.to_vec();
     let layout = gex_ld::build_initial_stack(
         &program.exe,
-        GUEST_LIMIT,
+        // `STACK_TOP`, not the top of the guest's addressable range.
+        //
+        // A stack at the top makes the top load-bearing, and a linear memory
+        // has to be allocated up to the highest address anything touches --
+        // so a process cost four gigabytes before running an instruction,
+        // and six of them cost more than a browser would give.
+        gex_abi::STACK_TOP,
         &args,
         &env,
         *b"gexdeterministic",
@@ -1949,8 +2025,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     let start = layout.low as usize;
     data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
     kernel.mem.insert(
-        GUEST_LIMIT - gex_abi::STACK_SIZE,
-        GUEST_LIMIT,
+        gex_abi::STACK_TOP - gex_abi::STACK_SIZE,
+        gex_abi::STACK_TOP,
         gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE,
         "[stack]",
     );
@@ -2041,7 +2117,14 @@ fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
 /// Where the dynamic linker is placed, clear of the executable so neither can
 /// overlap the other's mappings. The same address `gexc` uses, so a program
 /// looks identical under both hosts.
-const INTERP_BASE: u64 = 0x2800_0000;
+// Inside the fixed low region, with the image and its break below it and the
+// stack above.
+//
+// It was at 640 MiB, which is above where a process's memory now starts and
+// is written *directly* rather than through the memory map -- so the first
+// dynamic program to load trapped on memory that had never been grown. The
+// graphics rootfs is all dynamic, which is why it was the one that showed it.
+const INTERP_BASE: u64 = gex_abi::INTERP_BASE;
 
 /// A file read back out of the guest's filesystem, kept alive for JS.
 static EXTRACTED: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(Vec::new()) });
@@ -3200,6 +3283,7 @@ pub extern "C" fn gex_adopt_child(
     // `malloc` an address at the bottom of the address space, which is where
     // the register contexts are.
     let mut kernel = Kernel::new(ctx_addr, brk as u64, String::new());
+    kernel.mem.grows_on_demand(arena_grow, arena_back);
     // The same table the parent has, because it is not in either of their
     // memories. This is what makes the parent's `wait4` able to find a child
     // it can no longer see: the child publishes its exit into a table both
@@ -3360,6 +3444,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // unbiased PLT0 -- and died in unmapped memory.
     let old: Vec<(u64, u64)> = h.kernel.mem.vmas().iter().map(|v| (v.start, v.end)).collect();
     h.kernel.mem = gex_kernel::mem::MemoryMap::new(program.brk());
+    // A fresh map for a fresh image, and it grows the same way.
+    h.kernel.mem.grows_on_demand(arena_grow, arena_back);
     {
         let data = guest_bytes();
         for (start, end) in old {
@@ -3412,7 +3498,13 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     }
     let layout = gex_ld::build_initial_stack(
         &program.exe,
-        GUEST_LIMIT,
+        // `STACK_TOP`, not the top of the guest's addressable range.
+        //
+        // A stack at the top makes the top load-bearing, and a linear memory
+        // has to be allocated up to the highest address anything touches --
+        // so a process cost four gigabytes before running an instruction,
+        // and six of them cost more than a browser would give.
+        gex_abi::STACK_TOP,
         argv,
         envp,
         *b"gexdeterministic",
@@ -3425,8 +3517,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let start = layout.low as usize;
     data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
     h.kernel.mem.insert(
-        GUEST_LIMIT - gex_abi::STACK_SIZE,
-        GUEST_LIMIT,
+        gex_abi::STACK_TOP - gex_abi::STACK_SIZE,
+        gex_abi::STACK_TOP,
         gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE,
         "[stack]",
     );

@@ -396,9 +396,12 @@ pub enum ImportKind {
     Func {
         ty: u32,
     },
-    /// A memory with the given minimum size in pages.
+    /// A memory the host provides, in pages: `min` is what it must allocate,
+    /// `max` how far it may grow. A process pays for `min` the moment it
+    /// exists, so the two are not the same number.
     Memory {
-        pages: u64,
+        min: u64,
+        max: u64,
         shared: bool,
     },
     /// A funcref table with the given minimum size.
@@ -493,11 +496,13 @@ impl Module {
     /// the same module would get two of them. Every guest thread has to see
     /// the same bytes, which means the host owns the memory and every module
     /// imports it.
-    pub fn import_memory(&mut self, module: &str, name: &str, pages: u64, shared: bool) {
+    /// `min` is what the host must allocate; `max` is how far it may grow.
+    /// They differ because a process pays for `min` the moment it exists.
+    pub fn import_memory(&mut self, module: &str, name: &str, min: u64, max: u64, shared: bool) {
         self.imports.push(Import {
             module: module.to_string(),
             name: name.to_string(),
-            kind: ImportKind::Memory { pages, shared },
+            kind: ImportKind::Memory { min, max, shared },
         });
     }
 
@@ -604,13 +609,13 @@ impl Module {
                         s.push(0x00);
                         write_u32(&mut s, *ty);
                     }
-                    ImportKind::Memory { pages, shared } => {
+                    ImportKind::Memory { min, max, shared } => {
                         s.push(0x02);
                         // A shared memory must declare a maximum, and says so
                         // with bit 1 of the limits flags.
                         s.push(if *shared { 0x03 } else { 0x01 });
-                        write_u64(&mut s, *pages);
-                        write_u64(&mut s, *pages);
+                        write_u64(&mut s, *min);
+                        write_u64(&mut s, *max);
                     }
                     ImportKind::Table { min } => {
                         s.push(0x01);

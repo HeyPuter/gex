@@ -277,6 +277,13 @@ if (process.env.GEX_RECOMPILE_OBJECTS) {
 // `wasm-function[N]` across thousands of modules -- so the question "which
 // guest code is hot" needs asking of the guest.
 const status = await gex.run(entry);
+// What this process's memory actually grew to. One memory per process, so
+// this is the number multiplied by however many processes a run has.
+if (process.env.GEX_DEBUG_EXIT) {
+  process.stderr.write(
+    `[gex] memory ${(gex.memory.buffer.byteLength / (1 << 20)).toFixed(0)} MiB\n`,
+  );
+}
 if (process.env.GEX_HOT && gex.shim.exports.gex_hot_blocks) {
   const e = gex.shim.exports;
   const at = e.gex_alloc(4096) >>> 0;

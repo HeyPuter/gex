@@ -7,10 +7,15 @@
 //
 // Works unchanged in a browser; `run-node.mjs` beside it is the Node entry.
 
+// How far a process's memory may grow, and what it is allocated with. The
+// second is the number that matters: there is one memory per process, and it
+// is paid for the moment the process exists. See
+// `gex_abi::GUEST_MEM_INITIAL_BYTES`.
 const GUEST_BYTES = 0xffff0000;
+const GUEST_INITIAL_BYTES = 0x05000000;
 // The shim's world starts where the guest's ends (`STACK_TOP`); its stack sits
 // at the bottom of that, below its data.
-const SHIM_STACK_TOP = 0x80800000;
+const SHIM_STACK_TOP = 0x04800000;
 // Everything below the guest's image: the reserved low region, the per-thread
 // register contexts, and the dispatch directory. It is not in the memory map,
 // so a forked child that copied only the mapped regions would arrive with no
@@ -19,6 +24,7 @@ const SHIM_STACK_TOP = 0x80800000;
 // `DISPATCH_DIR + DISPATCH_MAX_PAGES * 4`, from `gex_abi`.
 const LOW_END = 0x00100000 + 0x80000 * 4;
 const PAGES = GUEST_BYTES / 65536;
+const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
 
 /** Everything the host has to supply that wasm cannot do for itself. */
 export class Env {
@@ -169,7 +175,8 @@ export class Gex {
     // state lives in that memory too -- the same kernel, the same file table,
     // the same everything. A new memory would be a new process.
     this.#memory =
-      memory ?? new WebAssembly.Memory({ initial: PAGES, maximum: PAGES, shared });
+      memory ??
+      new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: PAGES, shared });
     this.#kernelSpec = kernel;
   }
 
@@ -197,6 +204,38 @@ export class Gex {
     return this.#stackTop;
   }
 
+  /**
+   * The guest's memory as bytes, re-made when it has grown.
+   *
+   * A memory that grows *detaches* the `ArrayBuffer` behind it, and every
+   * view onto the old one stops working -- `Cannot perform
+   * %TypedArray%.prototype.set on a detached ArrayBuffer`. That is not an
+   * error case here: a process starts with the few tens of megabytes its
+   * layout needs and grows as the guest maps things, so this happens on any
+   * run that does real work.
+   */
+  /**
+   * Make this process's memory cover `end`, growing it if it does not.
+   *
+   * A process starts with the fixed layout its ABI needs and grows as it
+   * maps; the shim does that for itself from inside, and this is for the
+   * places JavaScript writes guest memory directly -- which is a forked
+   * child's image and nothing else.
+   */
+  #growTo(end) {
+    const have = this.#memory.buffer.byteLength;
+    if (end <= have) return;
+    this.#memory.grow(Math.ceil((end - have) / 65536));
+    this.#u8 = null;
+  }
+
+  #bytes() {
+    if (!this.#u8 || this.#u8.byteLength === 0) {
+      this.#u8 = new Uint8Array(this.#memory.buffer);
+    }
+    return this.#u8;
+  }
+
   get memory() { return this.#memory; }
 
   /** The shim instance, for diagnostics. */
@@ -220,11 +259,11 @@ export class Gex {
   readFile(path) {
     const p = new TextEncoder().encode(path);
     const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
-    this.#u8.set(p, pp);
+    this.#bytes().set(p, pp);
     const len = this.#shim.exports.gex_get_file(pp, p.length) >>> 0;
     if (len === 0) return null;
     const at = this.#shim.exports.gex_file_data() >>> 0;
-    return this.#u8.slice(at, at + len);
+    return this.#bytes().slice(at, at + len);
   }
 
 
@@ -239,7 +278,7 @@ export class Gex {
   #hostImports() {
     return {
         write: (fd, ptr, len) =>
-          this.#env.write(fd, this.#u8.subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0))),
+          this.#env.write(fd, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0))),
         now: () => this.#env.now(),
         // The network. Every one of these must return without waiting: the
         // guest's thread is parked by the kernel, not by JS, because there is
@@ -247,18 +286,18 @@ export class Gex {
         net_open: () => (this.#net ? this.#net.open() : 0),
         net_connect: (id, host, len, port) => {
           const name = new TextDecoder().decode(
-            this.#u8.subarray(host >>> 0, (host >>> 0) + (len >>> 0)),
+            this.#bytes().subarray(host >>> 0, (host >>> 0) + (len >>> 0)),
           );
           this.#net?.connect(id, name, port);
         },
         net_status: (id) => (this.#net ? this.#net.status(id) : 2),
         net_send: (id, ptr, len) =>
           this.#net
-            ? this.#net.send(id, this.#u8.subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
+            ? this.#net.send(id, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
             : -1,
         net_recv: (id, ptr, len) =>
           this.#net
-            ? this.#net.recv(id, this.#u8.subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
+            ? this.#net.recv(id, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)))
             : 0,
         net_avail: (id) => (this.#net ? (this.#net.available(id) ? 1 : 0) : 1),
         net_close: (id) => this.#net?.close(id),
@@ -302,7 +341,7 @@ export class Gex {
       gex_env: this.#hostImports(),
       gex_k: this.#kernelImports(),
     });
-    this.#u8 = new Uint8Array(this.#memory.buffer);
+    this.#u8 = null;
     // First, before any call into the shim.
     //
     // `gex_worker_init` is what gives this Worker its own thread-local block,
@@ -361,14 +400,14 @@ export class Gex {
     if (opts.cwd) {
       const c = new TextEncoder().encode(opts.cwd);
       const cp = this.#shim.exports.gex_alloc(c.length) >>> 0;
-      this.#u8.set(c, cp);
+      this.#bytes().set(c, cp);
       this.#shim.exports.gex_set_cwd(cp, c.length);
     }
     // Standard input, if the embedder has any: a page has nothing to block
     // on, so the guest is given all of it up front.
     if (opts.stdin && opts.stdin.length) {
       const sp = this.#shim.exports.gex_alloc(opts.stdin.length) >>> 0;
-      this.#u8.set(opts.stdin, sp);
+      this.#bytes().set(opts.stdin, sp);
       this.#shim.exports.gex_set_stdin(sp, opts.stdin.length);
     }
     // The bundle goes over before the program does: a dynamic executable
@@ -379,18 +418,18 @@ export class Gex {
       const d = contents instanceof Uint8Array ? contents : enc.encode(contents);
       const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
       const dp = this.#shim.exports.gex_alloc(d.length) >>> 0;
-      this.#u8.set(p, pp);
-      this.#u8.set(d, dp);
+      this.#bytes().set(p, pp);
+      this.#bytes().set(d, dp);
       this.#shim.exports.gex_add_file(pp, p.length, dp, d.length);
     }
 
     const ptr = this.#shim.exports.gex_alloc(elf.length) >>> 0;
-    this.#u8.set(elf, ptr);
+    this.#bytes().set(elf, ptr);
     const argvBlob = new TextEncoder().encode(args.join('\0'));
     let ap = 0;
     if (argvBlob.length) {
       ap = this.#shim.exports.gex_alloc(argvBlob.length) >>> 0;
-      this.#u8.set(argvBlob, ap);
+      this.#bytes().set(argvBlob, ap);
     }
     const entry = this.#shim.exports.gex_load(ptr, elf.length, ap, argvBlob.length);
     if (entry === 0n) throw new Error('gex: could not load the program');
@@ -437,7 +476,7 @@ export class Gex {
       gex_env: this.#hostImports(),
       gex_k: this.#kernelImports(),
     });
-    this.#u8 = new Uint8Array(this.#memory.buffer);
+    this.#u8 = null;
     // The shim's stack pointer is a mutable *global*, which belongs to the
     // instance rather than to the memory -- so every Worker has its own and
     // every Worker has to be told where it goes. Two threads sharing one stack
@@ -506,7 +545,7 @@ export class Gex {
    */
   #processImage() {
     const e = this.#shim.exports;
-    const out = [{ at: 0, bytes: this.#u8.slice(0, LOW_END) }];
+    const out = [{ at: 0, bytes: this.#bytes().slice(0, LOW_END) }];
     const scratch = e.gex_alloc(24) >>> 0;
     const dv = new DataView(this.#memory.buffer);
     const n = e.gex_vma_count();
@@ -518,7 +557,7 @@ export class Gex {
       // `prot` travels with the bytes: the child rebuilds its memory *map*
       // from these, and a map is not recoverable from the memory it
       // describes. A child whose map is empty maps straight over its image.
-      if (end > start) out.push({ at: start, end, prot, bytes: this.#u8.slice(start, end) });
+      if (end > start) out.push({ at: start, end, prot, bytes: this.#bytes().slice(start, end) });
     }
     e.gex_free?.(scratch, 24);
     return out;
@@ -646,7 +685,7 @@ export class Gex {
     const meta = metadataSection(guestWasm);
     if (!meta || !meta.length) return;
     const mp = this.#shim.exports.gex_alloc(meta.length) >>> 0;
-    this.#u8.set(meta, mp);
+    this.#bytes().set(meta, mp);
     this.#shim.exports.gex_set_metadata(mp, meta.length);
   }
 
@@ -663,7 +702,7 @@ export class Gex {
     if (!n) return [];
     const p = e.gex_alloc(n * 12) >>> 0;
     const wrote = e.gex_page_dump(p, n * 12);
-    const out = wrote > 0 ? this.#u8.slice(p, p + wrote * 12) : new Uint8Array(0);
+    const out = wrote > 0 ? this.#bytes().slice(p, p + wrote * 12) : new Uint8Array(0);
     e.gex_free?.(p, n * 12);
     return out;
   }
@@ -694,7 +733,12 @@ export class Gex {
       ? (s) => console.error(`[gex] adopt ${child.pid}: ${s}`)
       : () => {};
     step('copying the image');
-    const u8 = new Uint8Array(this.#memory.buffer);
+    // The parent's memory had grown to hold what it mapped; this one has
+    // only what a process starts with, so it has to catch up before a byte
+    // is written. Without this the copy throws `RangeError: offset is out of
+    // bounds` on the first region above the initial size.
+    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.at + r.bytes.byteLength), 0));
+    const u8 = this.#bytes();
     for (const r of child.image) u8.set(new Uint8Array(r.bytes), r.at);
     // How much of the context survives each step. A child that enters at zero
     // arrived with a context of zeros, and the only question worth asking is
@@ -746,7 +790,7 @@ export class Gex {
     // forked child does is read or write a descriptor it expects to have.
     if (child.fds?.length && e.gex_adopt_fds) {
       const p = e.gex_alloc(child.fds.length) >>> 0;
-      this.#u8.set(child.fds, p);
+      this.#bytes().set(child.fds, p);
       e.gex_adopt_fds(p, child.fds.length);
       e.gex_free?.(p, child.fds.length);
     }
@@ -845,7 +889,7 @@ export class Gex {
       // never seen that heap. Without this a shell pipeline's child cannot
       // read the pipe it was forked to read.
       fds: e.gex_fork_fds_len
-        ? this.#u8.slice(
+        ? this.#bytes().slice(
             e.gex_fork_fds_ptr() >>> 0,
             (e.gex_fork_fds_ptr() >>> 0) + (e.gex_fork_fds_len() >>> 0),
           )
@@ -888,7 +932,7 @@ export class Gex {
       if (!len) continue;
       // Copied out before compiling: the registry is in the guest's memory,
       // and another thread allocating can move it.
-      await this.#installModule(this.#u8.slice(ptr, ptr + len), need);
+      await this.#installModule(this.#bytes().slice(ptr, ptr + len), need);
     }
   }
 
@@ -915,7 +959,7 @@ export class Gex {
   /** Hand the guest some standard input. Safe to call at any time. */
   pushStdin(bytes) {
     const p = this.#shim.exports.gex_alloc(bytes.length) >>> 0;
-    this.#u8.set(bytes, p);
+    this.#bytes().set(bytes, p);
     this.#shim.exports.gex_push_stdin(p, bytes.length);
     this.#shim.exports.gex_free(p, bytes.length);
   }
@@ -1178,7 +1222,7 @@ export class Gex {
           if (e.gex_object_at) {
             const at = e.gex_alloc(160) >>> 0;
             const n = e.gex_object_at(pc, at, 160) >>> 0;
-            if (n) where = ' in ' + new TextDecoder().decode(this.#u8.subarray(at, at + n));
+            if (n) where = ' in ' + new TextDecoder().decode(this.#bytes().subarray(at, at + n));
           }
           const ctx = e.gex_current_ctx ? e.gex_current_ctx() : 0n;
           // And how full the shim's own heap was. That heap is a fixed region
@@ -1234,7 +1278,14 @@ export class Gex {
             const where =
               say(e.gex_current_pc, (pc) => `, pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}`) +
               say(e.gex_last_syscall, (n) => (n === 0xffffffff ? '' : `, in syscall ${n}`));
-            console.error(`[gex] run ended: shim trapped out, code ${e.gex_exit_code()}${where}`);
+            // And how much of this process's memory the shim actually used,
+            // which is the number that decides how big a memory has to be --
+            // and therefore how many processes a browser can hold at once.
+            const heap = say(e.gex_heap_used_kib, (k) =>
+              k >= 0 ? `, shim heap ${(k / 1024).toFixed(1)} MiB` : '');
+            console.error(
+              `[gex] run ended: shim trapped out, code ${e.gex_exit_code()}${where}${heap}`,
+            );
           }
           return e.gex_exit_code();
         }
@@ -1256,7 +1307,7 @@ export class Gex {
     const e = this.#shim.exports;
     const ptr = e.gex_jit_pending_ptr() >>> 0;
     const len = e.gex_jit_pending_len() >>> 0;
-    await this.#installModule(this.#u8.slice(ptr, ptr + len), e.gex_jit_slots() >>> 0);
+    await this.#installModule(this.#bytes().slice(ptr, ptr + len), e.gex_jit_slots() >>> 0);
     e.gex_jit_installed();
     // This Worker translated it, so it is already the newest one installed
     // here; the registry entry `gex_jit_installed` just added is the same

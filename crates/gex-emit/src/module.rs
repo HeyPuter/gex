@@ -13,7 +13,7 @@ use crate::tier1;
 use crate::wasm::{DataSegment, ElementSegment, ExportKind, FuncBody, FuncType, Module, ValType};
 use gex_abi::{
     ctx, dispatch_page, exports, imports, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE,
-    GUEST_MEM_PAGES, IMPORT_MODULE, MISS_SLOTS, SLOTS_PER_PAGE,
+    GUEST_MEM_INITIAL_PAGES, GUEST_MEM_PAGES, IMPORT_MODULE, MISS_SLOTS, SLOTS_PER_PAGE,
 };
 use gex_ir::Block;
 use std::collections::{BTreeMap, HashMap};
@@ -452,6 +452,7 @@ impl ModuleBuilder {
         m.import_memory(
             IMPORT_MODULE,
             exports::MEMORY,
+            GUEST_MEM_INITIAL_PAGES,
             GUEST_MEM_PAGES,
             shared_memory,
         );

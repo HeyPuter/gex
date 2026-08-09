@@ -1176,6 +1176,10 @@ fn perform_block(
             want,
             wstatus,
             nohang,
+            // Which process is waiting, for a table shared between address
+            // spaces. There is one address space here, so the children list
+            // above is the whole answer.
+            ppid: _,
         } => {
             let candidates: Vec<_> = children
                 .iter()

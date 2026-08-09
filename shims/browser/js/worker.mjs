@@ -273,6 +273,11 @@ async function handle(msg) {
       status,
       blocks: Number(gex.shim.exports.gex_jit_blocks?.() ?? 0),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
+      // How much of this process's memory the shim ever used. It decides how
+      // big a memory has to be, and a memory per process decides how many
+      // processes a browser will hold at once -- which is the number that
+      // makes a demo work on somebody else's machine or not.
+      heapKib: Number(gex.shim.exports.gex_heap_used_kib?.() ?? -1),
     });
   } catch (e) {
     // Where the guest was, not only what the engine said. A crash inside the
