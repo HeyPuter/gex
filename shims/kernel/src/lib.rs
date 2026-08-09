@@ -31,7 +31,8 @@
 //! a second memory and cannot address with a pointer; `gex-kmem` copies
 //! across the two with `memory.copy`.
 
-use std::sync::OnceLock;
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
 
 use gex_kernel::proc::ProcTable;
 
@@ -203,6 +204,66 @@ fn procs() -> &'static ProcTable {
     note_panics();
     static PROCS: OnceLock<ProcTable> = OnceLock::new();
     PROCS.get_or_init(ProcTable::new)
+}
+
+/// Which dispatch slots the code of a given identity was translated into.
+///
+/// Keyed by the dispatch page and by what the bytes there *are* -- the file,
+/// the offset within it, the length of the mapping -- so two processes that
+/// map the same library at the same address agree without either knowing the
+/// other exists.
+///
+/// This lived in the shim, per Worker, and travelled parent to child in the
+/// fork record and nowhere else. That made sibling reuse impossible: a shell
+/// loop that execs `ls` three times lifted the same 20,868 blocks three
+/// times, because each `ls` started from the shell's snapshot and the shell
+/// has never run `ls`. Counted with `gex_reuse_stat`: `hit=0`, every time.
+///
+/// Here it is one map for the whole system, for the same reason the process
+/// table and the filesystem are: this module's data lives in the memory every
+/// Worker instantiates against, so a static is already shared bytes.
+///
+/// Base zero means absent. A real base never is -- slot zero and the span
+/// above it are the miss stubs, reserved before anything is handed out.
+fn slots() -> &'static Mutex<BTreeMap<(u64, u64), u32>> {
+    note_panics();
+    static SLOTS: OnceLock<Mutex<BTreeMap<(u64, u64), u32>>> = OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// The slots page `page` of the object identified by `key` was translated
+/// into, or zero.
+#[no_mangle]
+pub extern "C" fn k_slot_get(page: u64, key: u64) -> u32 {
+    slots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(page, key))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Record it, if nothing has claimed that page and identity already.
+///
+/// First writer wins, which is the same rule the per-Worker map used: a page
+/// that already has an owner keeps it, because the code that was emitted
+/// names whichever base it was given.
+#[no_mangle]
+pub extern "C" fn k_slot_put(page: u64, key: u64, base: u32) {
+    if base == 0 {
+        return;
+    }
+    slots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry((page, key))
+        .or_insert(base);
+}
+
+/// How many pages the map answers for. A diagnostic.
+#[no_mangle]
+pub extern "C" fn k_slot_count() -> u32 {
+    slots().lock().unwrap_or_else(|e| e.into_inner()).len() as u32
 }
 
 /// Somewhere to stage a guest buffer copied out of a process's memory.

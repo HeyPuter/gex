@@ -262,6 +262,14 @@ extern "C" {
     fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
     fn k_fs_mksocket(path: u32, path_len: u32) -> i32;
     fn k_fs_add(path: u32, path_len: u32, at: u32, len: u32) -> i32;
+    /// The system-wide map from a page of a mapped object to the dispatch
+    /// slots its code was translated into. Zero means nobody has.
+    ///
+    /// In the kernel rather than here because a shim's statics are one
+    /// Worker's, and this has to be every Worker's: the whole point is that
+    /// the second process to run `ls` finds what the first one did.
+    fn k_slot_get(page: u64, key: u64) -> u32;
+    fn k_slot_put(page: u64, key: u64, base: u32);
     /// Has some process already filled the shared root? Only the first
     /// should: the rest would unpack the same rootfs over the top of it.
     fn k_fs_populated() -> i32;
@@ -3980,6 +3988,34 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
 /// translation can follow a branch past the end of the page it started in.
 /// Same file, same offset and same length means the whole reachable extent is
 /// the same, which is what makes the sharing sound rather than probable.
+/// Where code of this identity was translated to, system-wide when there is
+/// a global kernel and per Worker when there is not.
+///
+/// A run of one process has no kernel and needs none of this; a run of many
+/// has one, and then the map has to be the kernel's or siblings cannot see
+/// each other's work. Both are kept in step: the local map is still written,
+/// so the fork record still carries something useful to a child.
+fn shared_slot(h: &Host, page: u64, key: u64) -> Option<u32> {
+    // SAFETY: a plain lookup in the kernel's own memory, taking no borrow of
+    // anything this module owns.
+    if unsafe { k_present() } != 0 {
+        let base = unsafe { k_slot_get(page, key) };
+        if base != 0 {
+            return Some(base);
+        }
+    }
+    h.jit.shared.get(&(page, key)).copied()
+}
+
+/// Record it in both, first writer winning in each.
+fn record_shared_slot(h: &mut Host, page: u64, key: u64, base: u32) {
+    h.jit.shared.entry((page, key)).or_insert(base);
+    // SAFETY: as above.
+    if unsafe { k_present() } != 0 {
+        unsafe { k_slot_put(page, key, base) };
+    }
+}
+
 fn page_identity(h: &Host, page: u64) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let v = h
@@ -5215,12 +5251,12 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 h.jit.reuse_noident += 1;
             }
             if let Some(key) = ident {
-                if h.jit.shared.contains_key(&(page, key)) {
+                if shared_slot(h, page, key).is_some() {
                     h.jit.reuse_hit += 1;
                 } else {
                     h.jit.reuse_miss += 1;
                 }
-                if let Some(&base) = h.jit.shared.get(&(page, key)) {
+                if let Some(base) = shared_slot(h, page, key) {
                     h.jit.page_table.assign(page, base);
                     // And the guest's directory, which `execve` cleared.
                     // Only *freshly allocated* pages get an entry from the
@@ -5264,7 +5300,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // whichever base it was given.
         for (page, base) in &unit.dir_entries {
             if let Some(key) = page_identity(h, *page * gex_abi::DISPATCH_PAGE) {
-                h.jit.shared.entry((*page, key)).or_insert(*base);
+                record_shared_slot(h, *page, key, *base);
             }
         }
         for (addr, _) in &unit.exported_blocks {

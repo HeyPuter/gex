@@ -758,6 +758,11 @@ export class Gex {
       'k_sock_available', 'k_sock_close', 'k_sock_shutdown', 'k_sock_exists',
       'k_virgl_take', 'k_virgl_release',
       'k_wake_seq', 'k_wake', 'k_park',
+      // Which dispatch slots the code of a given identity is in, for the
+      // whole system rather than for one Worker. Without a kernel these
+      // answer nought, which is exactly right: a run of one process has no
+      // sibling to share with, and the shim keeps its own map anyway.
+      'k_slot_get', 'k_slot_put',
     ];
     // Not imported by the shim -- the host reads it after a crash -- so it is
     // not in the list above and its absence is not a link error.
