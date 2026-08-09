@@ -56,6 +56,27 @@ const DEMOS = {
   // anchored on "$ " never matches a prompt that is plainly there.
   busybox: { want: /~ \$/ },
   debian: { want: /[#$]/ },
+  // The same demo, told to run `apt-get update` and exit rather than open a
+  // shell. Needs a proxy: `GEX_QUERY='wisp=ws://127.0.0.1:5111/&cmd=apt-get
+  // update'`, with `wisp-js-server` on that port.
+  //
+  // `Fetched` is the line apt prints when it has the index and has read it.
+  // Not `Get:`, which only says a download started -- the run this exists to
+  // catch got as far as one `Get:` and then stopped forever.
+  // A command in the Debian rootfs, judged by a marker the command itself
+  // prints. Not by `debian`'s prompt pattern: that is `/[#$]/`, which matches
+  // a `$` anywhere -- including in the demo's own echo of the command it was
+  // given. Several runs "passed" at the first tick on the strength of a `$?`
+  // in the command line, and the browser was killed five seconds in, before
+  // the guest had done anything. A check that can pass without the guest is
+  // worse than no check.
+  'debian-cmd': { demo: 'debian', want: /GEX-CMD-DONE/ },
+  'debian-apt': {
+    // The page has no such demo: this is the Debian one, run differently.
+    demo: 'debian',
+    want: /Fetched .* in |Reading package lists\.\.\. Done/,
+    fail: /Temporary failure|Could not resolve|Failed to fetch/,
+  },
   gears: { want: /exit 0 in \d+ ms/, settle: 'finished' },
   // The guest's own evidence, not the page's. "graphics rootfs -- N files"
   // and a status of `running` were both true of a demo that unpacked the
@@ -237,7 +258,7 @@ for (const id of list) {
   // `GEX_QUERY=gears_size=100x100` reaches the demo. An experiment that only
   // changes one thing about a run should not need a code change to run.
   const extra = process.env.GEX_QUERY ? `&${process.env.GEX_QUERY}` : '';
-  const url = `http://127.0.0.1:${port}/?demo=${id}&run=1${extra}`;
+  const url = `http://127.0.0.1:${port}/?demo=${DEMOS[id].demo ?? id}&run=1${extra}`;
   let last = '';
   let lastTerminal = '';
   // Every line the terminal has ever shown, in the order it first appeared.

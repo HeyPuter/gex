@@ -208,7 +208,30 @@ async function handle(msg) {
     // proxy was named, so a Node run that never asks for a network never
     // looks for it.
     const { WispNetwork } = await import('../../../web/src/net.js');
-    gex.useNetwork(new WispNetwork(msg.wispUrl, (e) => port.post({ kind: 'net', event: e })));
+    const net = new WispNetwork(msg.wispUrl, (e) => port.post({ kind: 'net', event: e }));
+    // Opened here, and waited for.
+    //
+    // Constructing one only remembers the address; until the WebSocket has
+    // said hello there is no connection, and `open` answers zero. Zero is
+    // what the shim turns into `ENETUNREACH`, so every guest in every Worker
+    // had a network that could not reach anything:
+    //
+    //   Cannot initiate the connection to deb.debian.org:80 (240.0.0.1).
+    //     - connect (101: Network is unreachable)
+    //
+    // The page opens its own and always has, which is why the proxy showed a
+    // connection per run and never a single stream: the connection was the
+    // page's, and nothing that wanted to fetch anything was on it.
+    //
+    // A proxy that cannot be reached is not a reason to refuse to run. The
+    // guest gets a network that fails, which is what it would get from a
+    // machine with no route, and the page says so.
+    try {
+      await net.start();
+    } catch (e) {
+      port.post({ kind: 'net', event: `error ${e?.message ?? e}` });
+    }
+    gex.useNetwork(net);
   }
   try {
     let entry;

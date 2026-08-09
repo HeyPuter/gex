@@ -192,7 +192,11 @@ const debian = {
 };
 
 const WISP_KEY = 'gex.wisp';
-const wispUrl = () => localStorage.getItem(WISP_KEY) || '';
+// `?wisp=ws://…` ahead of what was typed in, so a link can carry a proxy and
+// a harness can hand one over. Typing it into a prompt is fine for a person
+// and is exactly what nothing else can do.
+const wispUrl = () =>
+  new URLSearchParams(location.search).get('wisp') || localStorage.getItem(WISP_KEY) || '';
 
 function setWisp(ctx) {
   const url = prompt(
@@ -208,6 +212,7 @@ function setWisp(ctx) {
 
 async function bootDebian(ctx) {
   document.getElementById('dboot').disabled = true;
+  const cmd = new URLSearchParams(location.search).get('cmd');
   try {
     const tree = await ctx.rootfs('/rootfs/debian.tar');
     const files = { ...tree.files };
@@ -216,6 +221,9 @@ async function bootDebian(ctx) {
         ? target
         : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
       if (files[abs]) files[path] = files[abs];
+    }
+    if (cmd) {
+      files['/cmd.sh'] = new TextEncoder().encode(`${cmd}\n`);
     }
     const elf = files['/bin/bash'] || files['/usr/bin/bash'];
     if (!elf) throw new Error('the rootfs has no /bin/bash');
@@ -237,13 +245,23 @@ async function bootDebian(ctx) {
     ctx.term.writeln(
       ctx.ansi.dim(network ? 'network: wisp' : 'network: none -- apt will not reach a mirror'),
     );
+    if (cmd) ctx.term.writeln(ctx.ansi.dim(`command: ${cmd}`));
     ctx.term.writeln('');
     ctx.status('running');
     running(true);
     const { status } = await ctx.runProgram(ctx.term, {
       elf,
       files,
-      args: ['/bin/bash', '-i'],
+      // `?cmd=apt-get update` runs one command and exits, instead of opening
+      // a shell. A prompt is what a person wants and is exactly what nothing
+      // else can drive: the demo that proves apt works could only be run by
+      // hand, so it was not run.
+      //
+      // Through a file rather than `-c`. `bash -lc '…'` came back with exit 0
+      // having printed nothing and run nothing, which is a worse answer than
+      // an error -- it looks like a command that succeeded. A script is what
+      // the graphics demo already does and it works.
+      args: cmd ? ['/bin/bash', '/cmd.sh'] : ['/bin/bash', '-i'],
       cwd: '/root',
       tty: true,
       network,

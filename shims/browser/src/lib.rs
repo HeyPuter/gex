@@ -883,12 +883,23 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         // is a real and reachable state, and it used to surface as a guest
         // that mysteriously stopped. Say it before the abort.
         if p.is_null() {
+            // With where the arena had got to and how big the memory is.
+            //
+            // "Out of heap" stopped being the whole story when the heap
+            // started taking spans from the growing arena: the request can
+            // fail because the arena has reached its ceiling, or because the
+            // memory would not grow, and those want different fixes. The
+            // numbers say which.
             trace_line(&format!(
-                "gex: out of shim heap asking for {} bytes (align {}); {} of {} MiB in use\n",
+                "gex: out of shim heap asking for {} bytes (align {}); {} of {} MiB in use; \
+                 arena at {:#x} of {:#x}, memory {} MiB\n",
                 l.size(),
                 l.align(),
                 gex_heap_used_kib() / 1024,
                 gex_heap_total_kib() / 1024,
+                ARENA_NEXT.load(std::sync::atomic::Ordering::Relaxed),
+                gex_abi::MMAP_TOP,
+                core::arch::wasm32::memory_size(0) as u64 * 65536 / (1024 * 1024),
             ));
         }
         #[cfg(feature = "heap-counters")]
@@ -4233,8 +4244,17 @@ fn schedule() -> i32 {
                 // Wisp is the whole of that second case here. A process with
                 // no network has nothing the page delivers except keystrokes,
                 // which are bit 0 and have their own path.
+                // Bit 1 with it, always. Bit 2 is an annotation on "give the
+                // stack back", not a reason of its own, and on its own it is
+                // a silent death: the loop in JavaScript asks whether the
+                // guest is paused for input or for the event loop, and a
+                // mask of bit 2 alone answers no to both -- so the loop body
+                // never runs, nothing ever wakes, and the run ends reporting
+                // whatever exit code it happened to hold. Which is zero. A
+                // guest that stopped for a reason nobody recognised looked
+                // exactly like a program that had finished successfully.
                 if h.kernel.net.is_some() {
-                    mask |= 4;
+                    mask |= 2 | 4;
                 }
                 // Every thread in the run, not just the ones in the process
                 // that happens to be loaded. A shell blocked in `wait4` for a

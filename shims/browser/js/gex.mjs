@@ -1279,13 +1279,26 @@ export class Gex {
             if (woke === 1) break;
           }
           if (woke !== 1) {
-            // Every thread is waiting and nothing woke them. That is the end
-            // of the run whether or not the guest is finished, so it is worth
-            // being able to tell the two apart.
-            if (globalThis.GEX_DEBUG_EXIT) {
-              console.error(`[gex] run ended: nothing woke (wake=${woke}), code ${e.gex_exit_code()}`);
-            }
-            return e.gex_exit_code();
+            // Every thread is waiting and nothing woke them.
+            //
+            // Said out loud, and never as a success. This used to return
+            // `gex_exit_code()` quietly, and for a guest that had not exited
+            // that code is zero -- so a run that stopped for a reason nobody
+            // here recognised was reported as a program that finished
+            // perfectly. `apt-get --version` "succeeded" that way, printing
+            // nothing, and so did every other thing that stopped here; the
+            // failure was invisible for as long as it has existed.
+            //
+            // A guest that really exited has said so, and that code is its
+            // own. Anything else is this runtime giving up, which is 125 --
+            // outside the range a program of its own accord would use.
+            const stalled = e.gex_exited ? !e.gex_exited() : false;
+            const why =
+              `[gex] the run stopped and nothing could wake it ` +
+              `(wake=${woke}, exited=${!stalled})`;
+            this.#env.write(2, new TextEncoder().encode(`${why}\n`));
+            console.error(why);
+            return stalled ? 125 : e.gex_exit_code();
           }
           pc = e.gex_resume_pc();
           const wakeCtx = e.gex_resume_ctx() >>> 0;
