@@ -266,6 +266,209 @@ pub extern "C" fn k_slot_count() -> u32 {
     slots().lock().unwrap_or_else(|e| e.into_inner()).len() as u32
 }
 
+/// Every translated module, once, and which object's pages each one covers.
+///
+/// The slot map above lets a Worker learn *where* code of a given identity
+/// was put. That is not enough to use it: a dispatch table belongs to a
+/// module instance, so a Worker that has not instantiated the module cannot
+/// reach the code however well it knows the slot number. This is the other
+/// half -- the module itself, in the memory everybody shares, so the second
+/// process to run `ls` installs what the first one produced instead of
+/// lifting it again.
+///
+/// Bytes rather than anything compiled, because compiled code is a JavaScript
+/// object and this is a wasm memory. The Worker copies them out and hands
+/// them to the same `pending` queue a fresh translation goes through, which
+/// is why this needs no new path through the host at all.
+struct SharedModule {
+    wasm: Vec<u8>,
+    /// How large the dispatch table must be for it.
+    ///
+    /// Kept here rather than recomputed because it is a fact about the
+    /// process that *produced* the module, and the one installing it has a
+    /// different high-water mark. Passing the local number understates it,
+    /// the table is not grown far enough, and the install throws -- which is
+    /// how the first attempt at this wedged.
+    slots: u64,
+    /// Which pages it holds code for, and at which base. The installing
+    /// Worker has to assign these before the install, or the blocks resolve
+    /// to no slot and are silently dropped.
+    dirs: Vec<(u64, u32)>,
+}
+
+struct ModStore {
+    /// By id. Index zero is never used: zero means "none".
+    mods: Vec<SharedModule>,
+    /// Which module holds the code for a page of a given object.
+    by_page: BTreeMap<(u64, u64), u32>,
+    /// What has been stored, against [`MOD_BUDGET`].
+    total: usize,
+}
+
+/// How much translated wasm to keep for sharing.
+///
+/// The kernel's memory is capped at 1 GiB and the filesystem is in it too, so
+/// this cannot be unbounded. A quarter is enough for the libraries a forking
+/// program shares -- apt's whole closure is 80 MB of wasm and it only ever
+/// translates the part it reaches -- and running out means falling back to
+/// translating, which is what happened before this existed.
+const MOD_BUDGET: usize = 256 << 20;
+
+fn modules() -> &'static Mutex<ModStore> {
+    note_panics();
+    static MODS: OnceLock<Mutex<ModStore>> = OnceLock::new();
+    MODS.get_or_init(|| {
+        Mutex::new(ModStore {
+            mods: vec![SharedModule {
+                wasm: Vec::new(),
+                slots: 0,
+                dirs: Vec::new(),
+            }],
+            by_page: BTreeMap::new(),
+            total: 0,
+        })
+    })
+}
+
+/// Keep a module. Returns its id, or zero when the budget is spent.
+///
+/// `dirs` is `(u64 page, u32 base)` pairs, twelve bytes each, little-endian.
+///
+/// SAFETY: every pointer names the *calling process's* memory, not the
+/// kernel's. The two are different wasm memories and a Rust pointer here
+/// means the kernel's, so the bytes have to be pulled across rather than
+/// read -- reading them directly is how this first shipped, and it stored a
+/// module of zeros that `WebAssembly.compile` then rejected for its magic
+/// word.
+#[no_mangle]
+pub unsafe extern "C" fn k_mod_store(
+    ptr: u32,
+    len: u32,
+    slots: u64,
+    dirs_ptr: u32,
+    dirs_len: u32,
+) -> u32 {
+    let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    if len == 0 || m.total + len as usize > MOD_BUDGET {
+        return 0;
+    }
+    let mut wasm = vec![0u8; len as usize];
+    unsafe { gex_kmem::pull(wasm.as_mut_ptr(), ptr, len) };
+    let mut raw = vec![0u8; dirs_len as usize];
+    if dirs_len > 0 {
+        unsafe { gex_kmem::pull(raw.as_mut_ptr(), dirs_ptr, dirs_len) };
+    }
+    let mut dirs = Vec::with_capacity(raw.len() / 12);
+    for c in raw.chunks_exact(12) {
+        let page = u64::from_le_bytes(c[0..8].try_into().unwrap());
+        let base = u32::from_le_bytes(c[8..12].try_into().unwrap());
+        dirs.push((page, base));
+    }
+    m.total += len as usize;
+    m.mods.push(SharedModule { wasm, slots, dirs });
+    (m.mods.len() - 1) as u32
+}
+
+/// Say that module `id` holds the code for page `page` of object `key`.
+#[no_mangle]
+pub extern "C" fn k_mod_claim(page: u64, key: u64, id: u32) {
+    if id == 0 {
+        return;
+    }
+    modules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_page
+        .entry((page, key))
+        .or_insert(id);
+}
+
+/// Which module holds it, or zero.
+#[no_mangle]
+pub extern "C" fn k_mod_for(page: u64, key: u64) -> u32 {
+    modules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_page
+        .get(&(page, key))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// How large a dispatch table module `id` needs.
+#[no_mangle]
+pub extern "C" fn k_mod_slots(id: u32) -> u64 {
+    modules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .mods
+        .get(id as usize)
+        .map(|m| m.slots)
+        .unwrap_or(0)
+}
+
+/// How long its bytes are, and how many bytes its `dirs` take.
+#[no_mangle]
+pub extern "C" fn k_mod_len(id: u32) -> u32 {
+    modules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .mods
+        .get(id as usize)
+        .map(|m| m.wasm.len() as u32)
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn k_mod_dirs_len(id: u32) -> u32 {
+    modules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .mods
+        .get(id as usize)
+        .map(|m| (m.dirs.len() * 12) as u32)
+        .unwrap_or(0)
+}
+
+/// Copy the bytes out. Returns how much was written, or zero if it did not
+/// fit.
+///
+/// SAFETY: `out` and `cap` describe a range of the calling process's memory.
+#[no_mangle]
+pub unsafe extern "C" fn k_mod_read(id: u32, out: u32, cap: u32) -> u32 {
+    let m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(sm) = m.mods.get(id as usize) else {
+        return 0;
+    };
+    if sm.wasm.len() > cap as usize {
+        return 0;
+    }
+    unsafe { gex_kmem::push(out, sm.wasm.as_ptr(), sm.wasm.len() as u32) };
+    sm.wasm.len() as u32
+}
+
+/// And the `dirs`, in the same twelve-byte encoding they arrived in.
+///
+/// SAFETY: as above.
+#[no_mangle]
+pub unsafe extern "C" fn k_mod_dirs_read(id: u32, out: u32, cap: u32) -> u32 {
+    let m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(sm) = m.mods.get(id as usize) else {
+        return 0;
+    };
+    let n = sm.dirs.len() * 12;
+    if n > cap as usize {
+        return 0;
+    }
+    let mut buf = vec![0u8; n];
+    for (i, (page, base)) in sm.dirs.iter().enumerate() {
+        buf[i * 12..i * 12 + 8].copy_from_slice(&page.to_le_bytes());
+        buf[i * 12 + 8..i * 12 + 12].copy_from_slice(&base.to_le_bytes());
+    }
+    unsafe { gex_kmem::push(out, buf.as_ptr(), n as u32) };
+    n as u32
+}
+
 /// Somewhere to stage a guest buffer copied out of a process's memory.
 static mut SCRATCH: [u8; 4096] = [0; 4096];
 

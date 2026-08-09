@@ -270,6 +270,18 @@ extern "C" {
     /// the second process to run `ls` finds what the first one did.
     fn k_slot_get(page: u64, key: u64) -> u32;
     fn k_slot_put(page: u64, key: u64, base: u32);
+    /// Translated modules, once for the whole system. Knowing which slots a
+    /// page's code is in does not let a Worker reach it -- a dispatch table
+    /// belongs to a module instance -- so the module itself has to be
+    /// shareable too, and between two wasm modules that means bytes.
+    fn k_mod_store(ptr: u32, len: u32, slots: u64, dirs_ptr: u32, dirs_len: u32) -> u32;
+    fn k_mod_claim(page: u64, key: u64, id: u32);
+    fn k_mod_for(page: u64, key: u64) -> u32;
+    fn k_mod_slots(id: u32) -> u64;
+    fn k_mod_len(id: u32) -> u32;
+    fn k_mod_dirs_len(id: u32) -> u32;
+    fn k_mod_read(id: u32, out: u32, cap: u32) -> u32;
+    fn k_mod_dirs_read(id: u32, out: u32, cap: u32) -> u32;
     /// Has some process already filled the shared root? Only the first
     /// should: the rest would unpack the same rootfs over the top of it.
     fn k_fs_populated() -> i32;
@@ -1157,6 +1169,12 @@ struct Jit {
     /// Not part of a process's saved state. That is the point -- it outlives
     /// every `fork` and `execve`, which is where the waste was.
     shared: std::collections::HashMap<(u64, u64), u32>,
+    /// Shared modules this Worker has already put into its own tables.
+    ///
+    /// A dispatch table belongs to a module instance, so this describes the
+    /// Worker and not the program: it survives `execve` for the same reason
+    /// the tables do.
+    installed_mods: std::collections::HashSet<u32>,
     /// How the shared-slot lookup went, for the question of why a forked and
     /// exec'd child re-lifts its parent's libraries. Three outcomes: the page
     /// already had a base in *this* process's table, the identity map knew
@@ -1165,6 +1183,8 @@ struct Jit {
     reuse_hit: u64,
     reuse_miss: u64,
     reuse_noident: u64,
+    /// Modules installed from the shared store instead of being lifted.
+    reuse_served: u64,
     /// Guest addresses that are `memcpy` and friends, to be served by a wasm
     /// bulk-memory instruction rather than translated.
     ///
@@ -2130,10 +2150,12 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 translated: Default::default(),
                 registry: Vec::new(),
                 shared: Default::default(),
+                installed_mods: Default::default(),
                 reuse_have: 0,
                 reuse_hit: 0,
                 reuse_miss: 0,
                 reuse_noident: 0,
+                reuse_served: 0,
                 intrinsics: Default::default(),
                 intrinsics_scanned: Default::default(),
                 candidates: Vec::new(),
@@ -3757,10 +3779,12 @@ pub extern "C" fn gex_adopt_child(
             translated: Default::default(),
             registry: Vec::new(),
             shared: Default::default(),
+            installed_mods: Default::default(),
             reuse_have: 0,
             reuse_hit: 0,
             reuse_miss: 0,
             reuse_noident: 0,
+            reuse_served: 0,
             intrinsics: Default::default(),
             intrinsics_scanned: Default::default(),
             candidates: Vec::new(),
@@ -4013,6 +4037,75 @@ fn record_shared_slot(h: &mut Host, page: u64, key: u64, base: u32) {
     // SAFETY: as above.
     if unsafe { k_present() } != 0 {
         unsafe { k_slot_put(page, key, base) };
+    }
+}
+
+/// Keep a translated module where every Worker can reach it. Zero if there is
+/// no kernel, or it has no room left.
+fn share_module(wasm: &[u8], slots: u64, dirs: &[(u64, u32)]) -> u32 {
+    // SAFETY: `k_present` takes no borrow; both pointers name ranges of this
+    // module's memory, which is the process memory the kernel copies across
+    // from, and both slices outlive the call.
+    unsafe {
+        if k_present() == 0 {
+            return 0;
+        }
+        let mut raw = Vec::with_capacity(dirs.len() * 12);
+        for (page, base) in dirs {
+            raw.extend_from_slice(&page.to_le_bytes());
+            raw.extend_from_slice(&base.to_le_bytes());
+        }
+        k_mod_store(
+            wasm.as_ptr() as u32,
+            wasm.len() as u32,
+            slots,
+            raw.as_ptr() as u32,
+            raw.len() as u32,
+        )
+    }
+}
+
+/// The shared module holding this page's code, if there is one and this
+/// Worker has not installed it: `(id, slots, dirs, wasm)`.
+fn shared_module_at(
+    h: &Host,
+    page: u64,
+    key: u64,
+) -> Option<(u32, u64, Vec<(u64, u32)>, Vec<u8>)> {
+    // SAFETY: every call below either returns a scalar, or writes into a
+    // buffer allocated here whose length was asked of the kernel first -- it
+    // refuses rather than overruns when the two disagree.
+    unsafe {
+        if k_present() == 0 {
+            return None;
+        }
+        let id = k_mod_for(page, key);
+        if id == 0 || h.jit.installed_mods.contains(&id) {
+            return None;
+        }
+        let len = k_mod_len(id) as usize;
+        if len == 0 {
+            return None;
+        }
+        let mut wasm = vec![0u8; len];
+        if k_mod_read(id, wasm.as_mut_ptr() as u32, len as u32) as usize != len {
+            return None;
+        }
+        let dlen = k_mod_dirs_len(id) as usize;
+        let mut raw = vec![0u8; dlen];
+        if dlen > 0 && k_mod_dirs_read(id, raw.as_mut_ptr() as u32, dlen as u32) as usize != dlen {
+            return None;
+        }
+        let dirs = raw
+            .chunks_exact(12)
+            .map(|c| {
+                (
+                    u64::from_le_bytes(c[0..8].try_into().unwrap()),
+                    u32::from_le_bytes(c[8..12].try_into().unwrap()),
+                )
+            })
+            .collect();
+        Some((id, k_mod_slots(id), dirs, wasm))
     }
 }
 
@@ -5256,6 +5349,41 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 } else {
                     h.jit.reuse_miss += 1;
                 }
+                // Somebody has translated this page and this Worker's
+                // tables do not hold it. Take their module rather than
+                // lifting the same code again: it goes onto the very queue a
+                // fresh translation uses, so JavaScript installs it by the
+                // path that already exists, and the branch is retried once it
+                // resolves.
+                if let Some((id, slots, dirs, wasm)) = shared_module_at(h, page, key) {
+                    h.jit.installed_mods.insert(id);
+                    // Every page it covers, before the install rather than
+                    // after: installing asks the shim which slot each block
+                    // belongs in, and the answer comes from here. A Worker
+                    // that assigned only the page it faulted on would place
+                    // one block and silently drop the rest.
+                    for (p, b) in &dirs {
+                        h.jit.page_table.assign(*p, *b);
+                    }
+                    h.jit.reuse_served += 1;
+                    if tracing() {
+                        trace_line(&format!(
+                            "[gex] serve mod {id} for page {page:#x} pc={pc:#x}: {} dirs, {} slots, {} bytes\n",
+                            dirs.len(),
+                            slots,
+                            wasm.len()
+                        ));
+                    }
+                    h.jit.pending.push_back(PendingModule {
+                        dirs,
+                        slots,
+                        wasm,
+                    });
+                    publish_pending(h);
+                    set_resume(pc);
+                    set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+                    return true;
+                }
                 if let Some(base) = shared_slot(h, page, key) {
                     h.jit.page_table.assign(page, base);
                     // And the guest's directory, which `execve` cleared.
@@ -5298,10 +5426,22 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // same code finds it. Recorded rather than overwritten: a page that
         // already has an owner keeps it, because the code just emitted names
         // whichever base it was given.
+        // Into the system-wide store, so a sibling installs it rather than
+        // lifting the same code again. The slot count travels with it: it is
+        // a fact about the process that produced the module, and the one
+        // installing it has a different high-water mark.
+        let mod_id = share_module(&unit.wasm, unit.table_slots, &unit.dir_entries);
         for (page, base) in &unit.dir_entries {
             if let Some(key) = page_identity(h, *page * gex_abi::DISPATCH_PAGE) {
                 record_shared_slot(h, *page, key, *base);
+                if mod_id != 0 {
+                    // SAFETY: a call into the kernel taking no borrow here.
+                    unsafe { k_mod_claim(*page, key, mod_id) };
+                }
             }
+        }
+        if mod_id != 0 {
+            h.jit.installed_mods.insert(mod_id);
         }
         for (addr, _) in &unit.exported_blocks {
             h.jit.translated.insert(*addr);
@@ -6285,6 +6425,7 @@ pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
             0 => h.jit.reuse_have,
             1 => h.jit.reuse_hit,
             2 => h.jit.reuse_miss,
+            4 => h.jit.reuse_served,
             _ => h.jit.reuse_noident,
         }) as i64
     })

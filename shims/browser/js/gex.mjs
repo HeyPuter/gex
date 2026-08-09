@@ -763,6 +763,8 @@ export class Gex {
       // answer nought, which is exactly right: a run of one process has no
       // sibling to share with, and the shim keeps its own map anyway.
       'k_slot_get', 'k_slot_put',
+      'k_mod_store', 'k_mod_claim', 'k_mod_for', 'k_mod_slots',
+      'k_mod_len', 'k_mod_dirs_len', 'k_mod_read', 'k_mod_dirs_read',
     ];
     // Not imported by the shim -- the host reads it after a crash -- so it is
     // not in the list above and its absence is not a link error.
