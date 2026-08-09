@@ -217,6 +217,15 @@ const host = new ProcessHost({
     else writeSync(fd, typeof bytes === 'string' ? Buffer.from(bytes) : bytes);
   },
   onExit: (m, pid) => {
+    // How much of the run was translating, as opposed to running what was
+    // translated. Every process separately, because a program that forks
+    // pays it again -- which is the whole question about whether translating
+    // ahead of time is worth anything.
+    if (process.env.GEX_TIME_JIT) {
+      process.stderr.write(
+        `[gex] pid ${pid}: ${m.millis}ms translating ${m.blocks} blocks\n`,
+      );
+    }
     if (pid !== 1) {
       if (process.env.GEX_DEBUG_EXIT) {
         const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB`;
