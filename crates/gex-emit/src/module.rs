@@ -558,7 +558,6 @@ impl ModuleBuilder {
             let gir: HashMap<u64, &Block> =
                 self.pending.iter().map(|(b, _)| (b.start, b)).collect();
             let cx = tier1::Context {
-                memory64: tier1::memory64_enabled(),
                 syscall: self.imports.syscall,
                 illegal: self.imports.illegal,
                 breakpoint: self.imports.breakpoint,
@@ -776,11 +775,7 @@ impl ModuleBuilder {
         let mut f = FuncBody::new(1);
         f.local_get(0); // ctx argument for the eventual target
         f.local_get(0); // and again, for dispatch_miss itself
-        // As a memory address this time, so on a 64-bit memory it extends.
-        f.local_get(0);
-        if tier1::memory64_enabled() {
-            f.byte(0xad); // i64.extend_i32_u
-        }
+        f.local_get(0); // and as a memory address, to read the PC out
         f.load(0x29, 3, ctx::PC as u32); // i64.load ctx.pc
         f.call(self.imports.dispatch_miss);
         f.return_call_indirect(self.block_ty, 0);
@@ -794,9 +789,6 @@ impl ModuleBuilder {
 
         // Record the entry PC so a miss inside `enter` reports it correctly.
         f.local_get(0);
-        if tier1::memory64_enabled() {
-            f.byte(0xad); // i64.extend_i32_u
-        }
         f.local_get(1);
         f.store(0x37, 3, ctx::PC as u32);
 
@@ -809,23 +801,10 @@ impl ModuleBuilder {
         f.byte(0x88); // i64.shr_u
         f.local_set(page);
 
-        // Same as tier-1's: on a 64-bit memory the directory address stays
-        // i64, so the page is clamped rather than wrapped.
-        if tier1::memory64_enabled() {
-            f.local_get(page);
-            f.i64_const(0);
-            f.local_get(page);
-            f.i64_const(DISPATCH_MAX_PAGES as i64);
-            f.byte(0x54); // i64.lt_u
-            f.select();
-            f.i64_const(4);
-            f.byte(0x7e); // i64.mul
-        } else {
-            f.local_get(page);
-            f.byte(0xa7); // i32.wrap_i64
-            f.i32_const(4);
-            f.byte(0x6c); // i32.mul
-        }
+        f.local_get(page);
+        f.byte(0xa7); // i32.wrap_i64
+        f.i32_const(4);
+        f.byte(0x6c); // i32.mul
         f.load(0x28, 2, DISPATCH_DIR as u32);
         f.i32_const(0);
         f.local_get(page);

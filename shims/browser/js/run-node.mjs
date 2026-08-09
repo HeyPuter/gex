@@ -98,18 +98,8 @@ function readStdin() {
   }
 }
 
-// A 64-bit guest memory needs the shim that was built for one: the module
-// imports a memory64 and will not link against a 32-bit one. Selected here
-// rather than guessed, and the global is set before anything constructs a
-// `Gex`, because `gex.mjs` reads it when it makes the memory.
-if (process.env.GEX_MEMORY64) globalThis.GEX_MEMORY64 = 1;
 const shimWasm = readFileSync(
-  new URL(
-    process.env.GEX_MEMORY64
-      ? '../../../target/wasm64-unknown-unknown/release/gex_browser.wasm'
-      : '../../../target/wasm32-unknown-unknown/release/gex_browser.wasm',
-    import.meta.url,
-  ),
+  new URL('../../../target/wasm32-unknown-unknown/release/gex_browser.wasm', import.meta.url),
 );
 
 // The global kernel: the process table, the filesystem and the pipes every
@@ -117,24 +107,11 @@ const shimWasm = readFileSync(
 // memory. Optional, because a run of one process needs none of it -- but
 // without it a program that forks gets as far as the fork and no further.
 let kernel = null;
-// The global kernel is its own module and is still built for wasm32, so it
-// asks for a 32-bit memory and cannot share a 64-bit one. Skipped until it
-// has a wasm64 build of its own; a single process does not need it, which
-// is enough to run and measure one.
-if (process.env.GEX_MEMORY64) {
-  process.stderr.write('[gex] memory64: skipping the global kernel (wasm32 only)\n');
-} else try {
+try {
   const path = new URL('../../../web/public/gex/gex_kernel.plain.wasm', import.meta.url);
   kernel = {
     module: await WebAssembly.compile(readFileSync(path)),
-    memory: process.env.GEX_MEMORY64
-      ? new WebAssembly.Memory({
-          initial: 2048n,
-          maximum: 16384n,
-          shared: true,
-          address: 'i64',
-        })
-      : new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }),
+    memory: new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }),
   };
 } catch {
   // Not built. `shims/kernel/build.sh` makes it; a run that never forks will
@@ -181,7 +158,6 @@ const host = new ProcessHost({
     // without one.
     network: !!process.env.GEX_NETWORK,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
-    memory64: !!process.env.GEX_MEMORY64,
     // GEX_HEARTBEAT asks the shim to say where the guest is every N safepoints
     // and every 200 dispatch misses. Nothing else runs while translated code
     // does, so without it a run that is merely slow cannot be told from one

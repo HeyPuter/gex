@@ -88,34 +88,9 @@ mod code {
     pub const MEMORY_FILL: u32 = 11;
 }
 
-/// Whether the guest memory is 64-bit.
-///
-/// `GEX_MEMORY64=1` while the migration is in progress. It has to agree with
-/// the shim's own target and with the memory JavaScript hands both of them,
-/// so it is a property of the build rather than of one translation, and an
-/// environment switch is the cheapest thing that says so until it becomes a
-/// real option.
-pub fn memory64_enabled() -> bool {
-    // Inside a wasm64 build this is not a choice: the memory the emitted
-    // module has to import is the one this shim is already running on. The
-    // environment switch is for the host-side compiler, which can target
-    // either -- and a shim compiled for wasm64 that consulted it would read
-    // nothing and quietly emit 32-bit modules its own runtime cannot link.
-    if cfg!(target_arch = "wasm64") {
-        return true;
-    }
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GEX_MEMORY64").is_some())
-}
-
 /// The wasm type of a pointer into guest memory -- the memory's index type.
 pub fn ptr_ty() -> crate::wasm::ValType {
-    if memory64_enabled() {
-        crate::wasm::ValType::I64
-    } else {
-        crate::wasm::ValType::I32
-    }
+    crate::wasm::ValType::I32
 }
 
 /// Everything tier-1 needs to know about the module it is emitting into.
@@ -145,11 +120,6 @@ pub struct Context<'a> {
     pub blocks: &'a HashMap<u64, u32>,
     /// Guest address -> the block's GIR, for growing a region around a loop.
     pub gir: &'a HashMap<u64, &'a Block>,
-    /// The guest memory is 64-bit, so a guest address is a memory offset
-    /// with no narrowing and no proof obligation: an address past the end
-    /// is the engine's business, and the trap it raises is the SIGSEGV the
-    /// guard was emitting eight instructions to produce.
-    pub memory64: bool,
 }
 
 /// How many blocks may go into one region. One turns regions off.
@@ -236,10 +206,6 @@ struct Emitter<'a> {
     /// Only used when there is more than one dispatch table; with one, the
     /// entry is consumed on the stack and never needs a name.
     scratch_entry: u32,
-    /// Two addresses for `memory.copy`, which on a 64-bit memory takes them
-    /// as `i64` and so cannot borrow the i32 scratches the 32-bit path uses.
-    /// Zero, and never touched, unless `memory64` is on.
-    scratch_addr: (u32, u32),
     /// Scratch for the computed slot, held across the `br_table`.
     ///
     /// A value pushed outside a `block` cannot be consumed inside one, so the
@@ -289,13 +255,6 @@ impl<'a> Emitter<'a> {
         let scratch_page = f.add_local(ValType::I64);
         let scratch_entry = f.add_local(ValType::I32);
         let scratch_index = f.add_local(ValType::I32);
-        // Added only under memory64, so the 32-bit module keeps exactly the
-        // locals it had before.
-        let scratch_addr = if cx.memory64 {
-            (f.add_local(ValType::I64), f.add_local(ValType::I64))
-        } else {
-            (0, 0)
-        };
         Emitter {
             f,
             cx,
@@ -305,7 +264,6 @@ impl<'a> Emitter<'a> {
             scratch_page,
             scratch_entry,
             scratch_index,
-            scratch_addr,
             value_local: Vec::new(),
             value_const: Vec::new(),
             value_ty: Vec::new(),
@@ -495,7 +453,7 @@ impl<'a> Emitter<'a> {
             for r in flags {
                 note_traffic(r);
             }
-            self.ctx_base();
+            self.f.local_get(self.ctx_local);
             self.f.local_get(locals[0]);
             for (i, &l) in locals.iter().enumerate().skip(1) {
                 self.f.local_get(l);
@@ -510,7 +468,7 @@ impl<'a> Emitter<'a> {
                 continue;
             }
             note_traffic(r);
-            self.ctx_base();
+            self.f.local_get(self.ctx_local);
             self.f.local_get(local);
             if Self::is_flag(r) {
                 self.f.store(0x3a, 0, Self::reg_offset(r)); // i32.store8
@@ -764,7 +722,7 @@ impl<'a> Emitter<'a> {
     /// directly rather than through `reg_local`, so it cannot make the body
     /// that follows believe `sp` is already in a local.
     fn emit_sp_check(&mut self, pc: u64) {
-        self.ctx_base();
+        self.f.local_get(self.ctx_local);
         self.f.load(0x29, 3, ctx::SP as u32);
         self.f.i64_const(gex_abi::STACK_TOP as i64);
         self.f.byte(0x5a); // i64.ge_u
@@ -783,7 +741,7 @@ impl<'a> Emitter<'a> {
         let ty = r.ty();
         let local = self.f.add_local(val_type(ty));
         let before = self.f.code.len();
-        self.ctx_base();
+        self.f.local_get(self.ctx_local);
         if Self::is_flag(r) {
             // i32.load8_u: the flag is one byte of the packed slot, and it is
             // 0 or 1, so there is nothing to sign-extend or mask.
@@ -886,7 +844,7 @@ impl<'a> Emitter<'a> {
             for r in flags {
                 note_traffic(r);
             }
-            self.ctx_base();
+            self.f.local_get(self.ctx_local);
             self.f.local_get(locals[0]);
             for (i, &l) in locals.iter().enumerate().skip(1) {
                 self.f.local_get(l);
@@ -909,7 +867,7 @@ impl<'a> Emitter<'a> {
                 continue;
             }
             note_traffic(r);
-            self.ctx_base();
+            self.f.local_get(self.ctx_local);
             self.f.local_get(local);
             if Self::is_flag(r) {
                 self.f.store(0x3a, 0, Self::reg_offset(r)); // i32.store8
@@ -938,7 +896,7 @@ impl<'a> Emitter<'a> {
     /// Record the guest PC in the context, so a host call or dispatch miss
     /// sees a precise architectural state.
     fn store_pc(&mut self, pc: u64) {
-        self.ctx_base();
+        self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);
         self.f.store(0x37, 3, ctx::PC as u32);
     }
@@ -958,13 +916,6 @@ impl<'a> Emitter<'a> {
         // references) and need no guard at all.
         if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
             let ea = c.wrapping_add(offset as u64);
-            if self.cx.memory64 {
-                // No poison and no clamp: an address past the end of the
-                // memory traps by itself, which is the outcome the poison
-                // page was arranged to produce.
-                self.f.i64_const(ea as i64);
-                return 0;
-            }
             if ea < GUEST_LIMIT {
                 self.f.i32_const(ea as i32);
                 return 0;
@@ -972,20 +923,6 @@ impl<'a> Emitter<'a> {
             self.f.i32_const(POISON_ADDR as i32);
             return 0;
         }
-        // A 64-bit memory takes the guest address as it stands. This is the
-        // whole of the memory64 win: the eight instructions below become
-        // none, on every load and store whose address is not a constant.
-        if self.cx.memory64 {
-            if (0..=u32::MAX as i64).contains(&offset) {
-                self.push(addr);
-                return offset as u32;
-            }
-            self.push(addr);
-            self.f.i64_const(offset);
-            self.f.byte(0x7c); // i64.add
-            return 0;
-        }
-
         // Guarding the same base twice in a block emits the same arithmetic
         // twice, and caching it in a local was tried: it removed 18% of the
         // guard bytes on gzip and moved no kernel on nbench, in either
@@ -1011,30 +948,16 @@ impl<'a> Emitter<'a> {
         static_off
     }
 
-    /// Push the register context as a *memory address*.
-    ///
-    /// `ctx` is an i32 parameter on both targets -- the shim declares it
-    /// `ctx: i32` and casts inside, so it is a fixed ABI rather than something
-    /// that widens with the address space. On a 64-bit memory that means every
-    /// use of it as a base has to be extended first. The extend is a zero-cost
-    /// move on any 64-bit host: an i32 local is already held zero-extended.
-    /// Use `ctx_local` directly when passing it *to* a call, not through one.
-    fn ctx_base(&mut self) {
-        self.f.local_get(self.ctx_local);
-        if self.cx.memory64 {
-            self.f.byte(code::I64_EXTEND_I32_U);
-        }
-    }
-
     /// Whether to emit the bounds guard at all.
     ///
     /// `GEX_UNSAFE_NO_GUARD=1` drops it, which is **not shippable**: a guest
     /// that computes an address above `GUEST_LIMIT` then aliases low memory
     /// silently instead of taking SIGSEGV. It exists to put a number on what
     /// the guard costs, because the principled way to remove it -- a
-    /// `memory64` guest memory, so the engine's own bounds check subsumes it
-    /// -- needs the shim on a tier-3 Rust target, and nobody should start
-    /// that without knowing the size of the prize.
+    /// 64-bit guest memory, so the engine's own bounds check subsumes it --
+    /// was built and measured and bought nothing: V8 emits a check of its own,
+    /// and a 32-bit memory already gets a free one from the 4 GiB reservation.
+    /// See OPTIMIZATIONS-MISSING.md. This stays as the way to price the guard.
     fn no_guard() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
@@ -1118,16 +1041,7 @@ impl<'a> Emitter<'a> {
             Stmt::MemCopy { dst, src, len } => {
                 // Both addresses first: `guard_to_i32` borrows the i64
                 // scratch, and the length wants it afterwards.
-                //
-                // On a 64-bit memory the addresses and the length all stay
-                // i64 -- the index type of the memory is what `memory.copy`
-                // takes -- so the wraps below are the 32-bit path only.
-                let wide = self.cx.memory64;
-                let (d, s) = if wide {
-                    self.scratch_addr
-                } else {
-                    (self.scratch_i32, self.scratch_entry)
-                };
+                let (d, s) = (self.scratch_i32, self.scratch_entry);
                 self.emit_address(*dst, 0);
                 self.f.local_set(d);
                 self.emit_address(*src, 0);
@@ -1136,29 +1050,22 @@ impl<'a> Emitter<'a> {
                 self.f.local_get(d);
                 self.f.local_get(s);
                 self.f.local_get(self.scratch_i64);
-                if !wide {
-                    self.f.byte(code::I32_WRAP_I64);
-                }
+                self.f.byte(code::I32_WRAP_I64);
                 self.f.byte(crate::wasm::op::MISC_PREFIX);
                 self.f.u32(code::MEMORY_COPY);
                 self.f.byte(0); // destination memory
                 self.f.byte(0); // source memory
             }
             Stmt::MemFill { dst, val, len } => {
-                let wide = self.cx.memory64;
-                let d = if wide { self.scratch_addr.0 } else { self.scratch_i32 };
+                let d = self.scratch_i32;
                 self.emit_address(*dst, 0);
                 self.f.local_set(d);
                 self.clamp_len(*len, &[d]);
                 self.f.local_get(d);
-                // The byte to write is an i32 whatever the memory's index
-                // type is, so this wrap stays on both paths.
                 self.push(*val);
                 self.f.byte(code::I32_WRAP_I64);
                 self.f.local_get(self.scratch_i64);
-                if !wide {
-                    self.f.byte(code::I32_WRAP_I64);
-                }
+                self.f.byte(code::I32_WRAP_I64);
                 self.f.byte(crate::wasm::op::MISC_PREFIX);
                 self.f.u32(code::MEMORY_FILL);
                 self.f.byte(0); // memory
@@ -1187,10 +1094,7 @@ impl<'a> Emitter<'a> {
         for &b in bases {
             self.f.i64_const(GUEST_LIMIT as i64);
             self.f.local_get(b);
-            // Under memory64 the base is already an i64 local.
-            if !self.cx.memory64 {
-                self.f.byte(code::I64_EXTEND_I32_U);
-            }
+            self.f.byte(code::I64_EXTEND_I32_U);
             self.f.byte(code::I64_SUB);
             self.f.local_set(room);
             self.f.local_get(n);
@@ -1252,12 +1156,12 @@ impl<'a> Emitter<'a> {
         self.f.local_get(la);
         self.f.local_get(idx);
         self.f.byte(0x7c); // i64.add
-        self.guarded_byte_address();
+        self.guard_to_i32();
         self.f.load(0x2d, 0, 0); // i32.load8_u
         self.f.local_get(lb);
         self.f.local_get(idx);
         self.f.byte(0x7c);
-        self.guarded_byte_address();
+        self.guard_to_i32();
         self.f.load(0x2d, 0, 0);
         self.f.local_set(tb);
 
@@ -1283,17 +1187,6 @@ impl<'a> Emitter<'a> {
         let i = dst.0 as usize;
         self.value_ty[i] = Ty::I32;
         self.value_local[i] = Some(local);
-    }
-
-    /// Turn an `i64` effective address on the stack into one a load can take.
-    ///
-    /// The same rule `emit_address` follows for a non-constant address: on a
-    /// 64-bit memory it is already the address, and on a 32-bit one it goes
-    /// through the bounds guard.
-    fn guarded_byte_address(&mut self) {
-        if !self.cx.memory64 {
-            self.guard_to_i32();
-        }
     }
 
     fn def(&mut self, dst: Value, expr: &Expr) {
@@ -2154,7 +2047,7 @@ impl<'a> Emitter<'a> {
                 self.f.local_set(self.scratch_i64);
                 // The context PC must be exact before a possible dispatch
                 // miss, since that is the only place the target is recorded.
-                self.ctx_base();
+                self.f.local_get(self.ctx_local);
                 self.f.local_get(self.scratch_i64);
                 self.f.store(0x37, 3, ctx::PC as u32);
                 self.flush();
@@ -2229,8 +2122,8 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_safepoint_no_flush_inner(&mut self, pc: u64) {
-        self.ctx_base();
-        self.ctx_base();
+        self.f.local_get(self.ctx_local);
+        self.f.local_get(self.ctx_local);
         self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
         self.f.i32_const(1);
         self.f.byte(0x6b); // i32.sub
@@ -2257,8 +2150,8 @@ impl<'a> Emitter<'a> {
     fn emit_safepoint_inner(&mut self, pc: u64) {
         // Count down, and only call out when the counter runs out, so the
         // common case is a load, a subtract, a store and a not-taken branch.
-        self.ctx_base();
-        self.ctx_base();
+        self.f.local_get(self.ctx_local);
+        self.f.local_get(self.ctx_local);
         self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
         self.f.i32_const(1);
         self.f.byte(0x6b); // i32.sub
@@ -2385,26 +2278,10 @@ impl<'a> Emitter<'a> {
         self.f.local_set(self.scratch_page);
 
         // entry = page < MAX_PAGES ? load(DISPATCH_DIR + page*4) : 0
-        if self.cx.memory64 {
-            // The address stays 64-bit, so a wild page can no longer be
-            // wrapped back inside the memory the way `i32.wrap_i64` did -- it
-            // would run off the end and trap. Clamp the page to zero before
-            // the load; the select below still turns that entry into a miss,
-            // so an out-of-range branch reaches the stub exactly as before.
-            self.f.local_get(self.scratch_page);
-            self.f.i64_const(0);
-            self.f.local_get(self.scratch_page);
-            self.f.i64_const(DISPATCH_MAX_PAGES as i64);
-            self.f.byte(code::I64_LT_U);
-            self.f.select();
-            self.f.i64_const(4);
-            self.f.byte(0x7e); // i64.mul
-        } else {
-            self.f.local_get(self.scratch_page);
-            self.f.byte(0xa7); // i32.wrap_i64
-            self.f.i32_const(4);
-            self.f.byte(0x6c); // i32.mul
-        }
+        self.f.local_get(self.scratch_page);
+        self.f.byte(0xa7); // i32.wrap_i64
+        self.f.i32_const(4);
+        self.f.byte(0x6c); // i32.mul
         self.f.load(0x28, 2, DISPATCH_DIR as u32);
         self.f.i32_const(0);
         self.f.local_get(self.scratch_page);

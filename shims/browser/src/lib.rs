@@ -50,12 +50,7 @@
 // already because a module importing a shared memory has to be.
 #![cfg_attr(feature = "shared-memory", feature(stdarch_wasm_atomic_wait))]
 
-// `core::arch::wasm32` is named for the address size, not the family, so the
-// 64-bit build has to reach for a different module to say the same thing.
-#[cfg(target_arch = "wasm32")]
 use core::arch::wasm32 as warch;
-#[cfg(target_arch = "wasm64")]
-use core::arch::wasm64 as warch;
 
 use gex_abi::ctx;
 use gex_kernel::errno::{Errno, SysResult};
@@ -1885,12 +1880,8 @@ pub extern "C" fn gex_heap_total_kib() -> i32 {
 /// JS can write to. Used to hand the ELF across.
 #[no_mangle]
 pub extern "C" fn gex_alloc(len: u32) -> u32 {
-    // `u32` rather than `usize` deliberately. This is the JS boundary, and
-    // keeping every parameter and result the same width on both targets is
-    // what lets the same glue drive a 32- and a 64-bit build with no
-    // conversion anywhere: a `usize` here would become an i64 on wasm64 and
-    // JS would have to pass a BigInt to this one function and a Number to the
-    // ninety-six others. Nothing JS allocates is near 4 GiB.
+    // `u32` rather than `usize`: this is the JS boundary, and a length is a
+    // Number there. Nothing JS allocates is near 4 GiB.
     let len = len as usize;
     let mut v = Vec::<u8>::with_capacity(len);
     v.resize(len, 0);

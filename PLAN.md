@@ -54,8 +54,10 @@ hook for translation invalidation (§6.2). Every mainstream distro ships aarch64
    control every address allocation (mmap, brk, stack, ELF load bias). Keep the whole guest
    address space inside one wasm32 linear memory (4 GiB max) so every guest load/store is a
    single bounds-checked wasm access with zero translation arithmetic. A memory64 build
-   variant exists for guests that truly need > 4 GiB (accepting the ~10-20% bounds-check
-   tax and reserving-vs-allocating differences). Non-PIE aarch64 binaries link at
+   variant was built for guests needing > 4 GiB and removed again: it loses on four of the
+   five programs measured, because a wasm32 memory gets its bounds checks free from the
+   4 GiB reservation and a 64-bit one pays a real compare per access. See
+   OPTIMIZATIONS-MISSING.md. Non-PIE aarch64 binaries link at
    0x400000 — comfortably inside range; PIE we place wherever we like.
 
 4. **Basic-block-per-function + tail calls as the baseline codegen.** Every translated
@@ -335,9 +337,11 @@ with stale bindings. The guest-visible GOT/PLT bytes are still materialized in m
    guest loads/stores. A stray guest write through a "PROT_NONE" page won't fault. This
    is the fidelity cost of trap-free wasm; gVisor-class apps don't care. (A debug build
    can enforce via check-instrumented loads/stores at ~2× cost.)
-3. **memory64 variant:** same codebase, guest VA space up to engine limit (16 GiB today),
-   for JVM-with-big-heap-class workloads. Chosen per-image at `gexc` time or by the
-   loader when ELF headers/limits demand it.
+3. **memory64 variant:** *tried and withdrawn.* Guest VA space up to the engine limit,
+   for JVM-with-big-heap-class workloads. Built end to end and measured slower on
+   NUMERIC SORT, IDEA, perl and gzip, faster only on STRING SORT; the code is gone and
+   the measurement is in OPTIMIZATIONS-MISSING.md. A workload that genuinely needs more
+   than 4 GiB would have to reintroduce it knowing that price.
 4. **File mappings:** MAP_PRIVATE = eager copy (correct). MAP_SHARED on regular files =
    shared kernel-heap-backed pages when all mappers are gex processes; writeback on
    msync/munmap/exit with whole-mapping dirty granularity. MAP_SHARED coherence with
@@ -482,7 +486,7 @@ flamegraph over *guest* symbols.
 | Syscall long tail is endless | tier by strace corpora of target apps; gVisor tests quantify coverage; ENOSYS-with-logging telemetry to prioritize |
 | glibc `GLIBC_PRIVATE` loader interface drifts across releases | the consumed surface is small and slow-moving; shim data layouts are per-glibc-version, pinned by a per-distro CI matrix; `--loader=guest` (run the real ld.so translated) is the always-correct fallback |
 | Wild-pointer writes don't fault (no page traps) | documented fidelity gap; debug build with checked accesses; matters for crash-*reporting* fidelity, rarely for correct programs |
-| Single 4 GiB space per process | memory64 variant; per-process (not global) limit keeps multi-process workloads fine |
+| Single 4 GiB space per process | per-process (not global) limit keeps multi-process workloads fine; the memory64 variant was measured and withdrawn |
 
 ---
 
@@ -536,7 +540,7 @@ Estimates assume 2–3 systems engineers; each milestone has a demo + CI gate.
   open-world dlopen; shell pipelines/job control solid.
 - **M4 — performance (≈10 wks):** tier-2 optimizer (CFG recovery, superblocks, reg-alloc,
   flag elimination, inline caches, return cache); cross-DSO prebinding → direct calls +
-  bundle-scoped inlining (§6.4); memory64 variant; CDN translation cache.
+  bundle-scoped inlining (§6.4); CDN translation cache.
   **Exit:** ≤4× geomean on the bench suite; OpenJDK runs; gex builds itself inside gex.
 - **M5 — product hardening (≈8 wks):** gdb stub + strace polish; `gexc image` for OCI
   images; multi-process browser session manager; quota/limits; docs.

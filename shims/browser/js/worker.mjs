@@ -195,10 +195,6 @@ async function handle(msg) {
   }
 
   if (msg.debugExit) globalThis.GEX_DEBUG_EXIT = 1;
-  // Read by `gex.mjs` when it builds the memory, so it has to be set before
-  // the `Gex` below and not after. The runner sets its own copy; a Worker is
-  // a separate global scope and never saw it.
-  if (msg.memory64) globalThis.GEX_MEMORY64 = 1;
   // `kernelStack` is this Worker's slice of the global kernel's stack array.
   // Absent for the first Worker, which keeps the stack the module was linked
   // with and is the one that reads the numbers out for everybody else.

@@ -76,9 +76,9 @@ re-treads them.
     Missing: (a) dominance-based redundant-guard elimination when accesses
     share a base; (b) guard hoisting out of loops; (c) range facts for
     SP-relative accesses (`sp` is checked at entry under `GEX_CHECK_SP`, and
-    the fact is not propagated); (d) the structural fix — a `memory64` guest
-    memory with a 2^33-byte reservation, where the engine's own bound check
-    subsumes the select entirely.
+    the fact is not propagated). What was (d) — a `memory64` guest memory,
+    where the engine's own bound check subsumes the select entirely — was
+    built and measured and lost; see below.
 17. **No address-mode reuse across a pair.** `ldp x0,x1,[x9,#16]` computes the
     guarded address twice rather than once with two static offsets.
 18. **`ldp`/`stp` not fused** into a single `v128.load`/`v128.store` plus lane
@@ -515,149 +515,74 @@ a compiler -- are at the STRING SORT end.
 every access has a different address, so this is not redundancy V8 can
 collapse -- it must emit all eight instructions, every time.
 
-## Section 16(d) is buildable: the shim compiles for wasm64
+## memory64: built, measured, and deleted
 
-Written up twice today as blocked, and it is not. `wasm64-unknown-unknown`
-is in `rustc --print target-list`; it is absent from `rustup target list`,
-which is a different question and the one I checked first.
+Section 16(d) proposed a 64-bit guest memory so the engine's own bounds
+check subsumes ours, and priced it at the 62% above. The whole thing was
+built -- a `wasm64-unknown-unknown` shim, `i64` addressing in the emitter,
+the 0x04 limits flag, a 64-bit `WebAssembly.Memory` in the glue -- and gzip
+1.12 ran through ld.so to a byte-identical result on it. Bounds guards went
+from 13% of the emitted module to 0%, and the module from 793 to 712 KiB.
 
-    RUSTFLAGS="-Zcrate-attr=feature(simd_wasm64)" cargo +nightly build \
-      -p gex-browser --target wasm64-unknown-unknown \
-      -Z build-std=std,panic_abort --release
-
-35 seconds. `std` builds from source cleanly. The only crate that fails is
-`talc`, the allocator, reaching for `core::arch::wasm64::memory_grow`
-behind an unstable feature, and `-Zcrate-attr` injects that feature into
-every crate compiled including dependencies. The artifact declares a
-64-bit memory: section 5, flags `0x04`.
-
-And the memory is not exported by the shim at all -- the shim is linked
-`--import-memory`, so JavaScript supplies one `WebAssembly.Memory` that
-both it and the guest modules import. There is no export/import mismatch
-to resolve, only one memory to construct as 64-bit and two importers that
-have to agree.
-
-What remains is mechanical:
-
-  * `emit_address` stops narrowing. It computes an `i64` today and wraps
-    it; memory64 wants the `i64`, so the wrap and the guard both go.
-  * load and store offsets become u64 LEBs; `memory.copy` and
-    `memory.fill` take `i64` operands.
-  * `ModuleBuilder::import_memory` sets the 64-bit flag.
-  * the glue constructs the memory with `index: 'u64'`.
-
-## What memory64 actually bought, measured
-
-Built and run. `GEX_MEMORY64=1 gexc build` emits a module importing a 64-bit
-memory; `shims/browser/build64.sh` builds the shim for
-`wasm64-unknown-unknown`; gzip 1.12, a dynamically linked Debian binary,
-runs through ld.so to a byte-identical result on both. Bounds guards go from
-13% of the emitted module to 0%, and the module from 793 KiB to 712 KiB.
-
-The speed did not follow. gzip -6 over 13 MB, six runs a side, alternating,
-on a shared machine with a VM busy on it -- all three producing identical
-output:
+It is not faster. gzip -6 over 13 MB, six runs a side, alternating:
 
     guarded wasm32     9563  9609  9840 10168 10206 11048   median 10004 ms
     memory64           9027  9060  9469  9645 10916 11363   median  9557 ms
     wasm32, no guard   9925 10017 11441                     median 10017 ms
 
 The third row is the control and it is the answer: removing the guard
-*entirely*, unsafely, with nothing put in its place, changes nothing on
-gzip. So there was no 62% to collect here, and memory64's 4% is inside the
-spread.
+*entirely*, unsafely, with nothing in its place, changes nothing on gzip.
+There was no 62% to collect, and memory64's 4% is inside the spread.
 
-nbench, the benchmark the 62.9% came from, run the same way -- four kernels
-at five seconds, FOURIER as the floating-point control:
+nbench, the benchmark the 62.9% came from, with FOURIER as the
+floating-point control:
 
     NUMERIC SORT   475.10 -> 395.57   -16.7%
     STRING SORT    236.42 -> 322.59   +36.4%
     IDEA          4018.7  -> 2917.4   -27.4%
     FOURIER      13864    -> 14165     +2.2%   (control)
 
-The control moved 2.2%, so the rest are real. And they do not agree with
-each other: memory64 is a large win on the pointer-chasing kernel and a
-large *loss* on the two array-and-integer ones.
+The control moved 2.2%, so the rest are real -- and they disagree with each
+other. Two effects run in opposite directions: our guard goes away, which is
+worth a lot exactly where V8 could not already see through it; and V8's own
+bounds check arrives, and it is *not* free the way the 32-bit one is. A
+wasm32 memory gets a 4 GiB virtual reservation and the checks become guard
+pages costing nothing. A 64-bit memory does not, so every access carries a
+real compare, and the kernels whose addresses V8 had already proven in range
+pay it for nothing.
 
-That is the whole finding, and it is not the one #89 predicted. Two effects
-run in opposite directions:
-
-  * our guard goes away, which is worth a lot exactly where V8 could not
-    already see through it -- STRING SORT, +36% (against +62.9% for removing
-    it with nothing in its place, so V8's own check eats about half);
-  * V8's bounds check arrives, and it is *not* free the way the 32-bit one
-    is. A wasm32 memory gets a 4 GiB virtual reservation and the checks
-    become guard pages, costing nothing; a 64-bit memory does not, so every
-    access carries a real compare. NUMERIC SORT and IDEA touch memory
-    constantly with addresses V8 had already proven in range, and they pay
-    that compare for nothing.
-
-So memory64 should stay behind `GEX_MEMORY64` rather than become the
-default, and the honest summary is: it trades a guard V8 can often remove
-for one it never can. Whether that is a win is a property of the program.
-
-And then perl, which was supposed to be the confirming case and is not.
-
-The reading above says memory64 wins where a program chases pointers. A
-language interpreter is the pointer-chasing program: a dispatch loop over a
-switch reached through a function pointer, hot data two hops away, a
-comparator called back from C a few hundred thousand times. So perl should
-have gained like STRING SORT. Fourteen interleaved pairs, `tests/ab.sh`:
+perl was supposed to be the confirming case, being the pointer-chasing
+program par excellence, and it is not. Fourteen interleaved pairs:
 
     11 of 14 pairs favour wasm32, p = 0.057 by sign test
     median per-pair ratio: memory64 is 13% *slower*
 
-Suggestive rather than established at p = 0.057, and stated that way. If
-anything it understates the penalty: those pairs ran A first every time, and
-first place turned out to be a disadvantage worth about 29% -- see the
-ordering bias in `tests/ab.sh` -- so memory64 was getting the *easier* slot
-and still lost. But it
-points the wrong way for the story, and the story should be weakened
-accordingly: the honest summary is not "memory64 wins on pointer-chasing
-code". It is that **STRING SORT gains and everything else measured so far
-loses** -- NUMERIC SORT -16.7%, IDEA -27.4%, perl -13%, gzip nothing. One
-kernel out of five programs is not a rule, it is an exception waiting for an
-explanation, and I do not have one. Do not build on it.
+Suggestive rather than established at p = 0.057, and if anything it
+understates the penalty: those pairs ran A first every time, and first place
+turned out to be a disadvantage worth about 29% -- see the ordering bias
+`tests/ab.sh` now corrects for -- so memory64 had the easier slot and still
+lost.
 
-What survives regardless: memory64 modules are 11-14% smaller, and it traps
-on wild pointers below 4 GiB that the guard lets through.
+**One kernel out of five programs gains.** NUMERIC SORT -16.7%, IDEA -27.4%,
+perl -13%, gzip nothing, STRING SORT +36.4%. That is an exception waiting for
+an explanation, not a rule, and the code is gone rather than left behind a
+flag: a second address width in the emitter, the shim, the glue and the
+kernel is a standing cost paid by everyone who reads them, in exchange for an
+option nobody should exercise. The measurement is what was worth keeping.
 
-That is not a contradiction of the 62.9% above -- it is a scoping of it.
-That figure is nbench STRING SORT, which chases pointers; gzip indexes
-arrays with induction variables. The guard is pure arithmetic on the address
-V8 is about to use anyway, so when V8 can see the range it folds the guard
-into the load and the bytes cost nothing. When it cannot -- an address
-loaded from memory, as in a linked list -- the guard survives to run time
-and costs what it costs. Which is the cost model this file already argues
-for elsewhere: *redundancy an optimiser can see is worth nothing to remove*.
+Two things it was unambiguously worth, if either ever becomes the point:
+modules were 11-14% smaller, and a wild pointer below 4 GiB traps under
+memory64 where today it reads zeros from the flat mapping unnoticed.
 
-So the honest expected value of memory64 is "whatever fraction of the
-program chases pointers", not 62%, and gzip's fraction is near zero.
-
-What it is unambiguously worth, independent of speed: 13% smaller modules,
-and it restores protection the guard never gave -- a wild pointer below
-4 GiB reads zeros from the flat mapping today and traps under memory64.
-
-## The old note, kept because the reasoning was wrong in an instructive way
-
-`memory64` with a large reservation, so the engine's own bounds check
-subsumes the `select`, is the right shape and is not buildable *as things
-stand* -- which, given the number above, is a reason to change how things
-stand rather than to drop it. The
-guest modules do not own the memory: they `import_memory` it from the shim,
-and the shim is Rust built for `wasm32-unknown-unknown`. A wasm32 module
-cannot export a 64-bit memory, so this needs the shim on
-wasm64 -- and `rustup target list` has no wasm64 entry at all, on stable or
-nightly, so that means a custom target JSON plus `-Z build-std` rather than
-`rustup target add` -- or the guest memory separated from the shim's, which
-is most of the runtime.
-
-Against 62% that is worth attempting. The emitter side is the easy half: it
-already computes addresses as `i64` and *narrows* them to `i32`, so memory64
-deletes the narrowing rather than adding anything. And memory64 restores
-*more* protection than the guard gives today, since an address beyond the
-guest's address space traps -- including the sub-4 GiB wild pointers that
-currently read zeros unnoticed.
+And the scoping this puts on the 62.9%: that figure is nbench STRING SORT,
+which chases pointers. gzip indexes arrays with induction variables. The
+guard is pure arithmetic on the address V8 is about to use anyway, so when
+V8 can see the range it folds the guard into the load and the bytes cost
+nothing; when it cannot -- an address loaded from memory, as in a linked
+list -- the guard survives to run time and costs what it costs. Which is
+this file's own cost model: *redundancy an optimiser can see is worth
+nothing to remove*. The expected value of removing the guard is whatever
+fraction of the program chases pointers, not 62%.
 
 # Ranked by expected value
 
@@ -671,5 +596,6 @@ currently read zeros unnoticed.
    where gex trails QEMU.
 5. **Redundant-load elimination + stack-slot promotion** (§13, §15) — attacks
    the spill traffic regions only partly fix.
-6. **Guard elision via range facts or `memory64`** (§16) — five instructions
-   off every memory access.
+6. **Guard elision via range facts** (§16) — five instructions off every
+   memory access. Range facts only: `memory64` was built and measured and
+   lost on four programs out of five, and has been deleted.

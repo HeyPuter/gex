@@ -410,9 +410,6 @@ pub enum ImportKind {
         min: u64,
         max: u64,
         shared: bool,
-        /// The index type is `i64`, so an address is a guest address and
-        /// the engine bounds-checks it directly. See `tier1::emit_address`.
-        memory64: bool,
     },
     /// A funcref table with the given minimum size.
     Table {
@@ -512,12 +509,7 @@ impl Module {
         self.imports.push(Import {
             module: module.to_string(),
             name: name.to_string(),
-            kind: ImportKind::Memory {
-                min,
-                max,
-                shared,
-                memory64: crate::tier1::memory64_enabled(),
-            },
+            kind: ImportKind::Memory { min, max, shared },
         });
     }
 
@@ -624,23 +616,13 @@ impl Module {
                         s.push(0x00);
                         write_u32(&mut s, *ty);
                     }
-                    ImportKind::Memory {
-                        min,
-                        max,
-                        shared,
-                        memory64,
-                    } => {
+                    ImportKind::Memory { min, max, shared } => {
                         s.push(0x02);
                         // Limits flags: bit 0 says a maximum follows, bit 1
-                        // shared, bit 2 that the index type is `i64`. A
-                        // shared memory must declare a maximum, and both of
-                        // the other two are independent of that.
+                        // shared. A shared memory must declare a maximum.
                         let mut flags = 0x01;
                         if *shared {
                             flags |= 0x02;
-                        }
-                        if *memory64 {
-                            flags |= 0x04;
                         }
                         s.push(flags);
                         write_u64(&mut s, *min);
@@ -754,19 +736,11 @@ impl Module {
             let mut s = Vec::new();
             write_u32(&mut s, self.data.len() as u32);
             // The offset of an active data segment is a constant expression
-            // typed by the memory it lands in, so a 64-bit memory wants an
-            // `i64.const` here -- an `i32.const` is a validation error, not a
-            // widening.
-            let wide = crate::tier1::memory64_enabled();
+            // typed by the memory it lands in.
             for d in &self.data {
                 s.push(0x00); // active, memory 0
-                if wide {
-                    s.push(op::I64_CONST);
-                    write_i64(&mut s, d.offset as i64);
-                } else {
-                    s.push(op::I32_CONST);
-                    write_i32(&mut s, d.offset as i32);
-                }
+                s.push(op::I32_CONST);
+                write_i32(&mut s, d.offset as i32);
                 s.push(op::END);
                 write_u32(&mut s, d.bytes.len() as u32);
                 s.extend_from_slice(&d.bytes);
