@@ -30,7 +30,7 @@
  * knowing which it is running under.
  */
 export class ProcessHost {
-  #makeWorker; #shim; #guest; #kernel; #gexUrl; #extra;
+  #makeWorker; #shim; #guest; #kernel; #extra;
   #onOutput; #onFork; #readStdin; #onOther;
   #workers = new Map();
   #pending = new Map();
@@ -51,7 +51,6 @@ export class ProcessHost {
     shim,
     guest,
     kernel = null,
-    gexUrl = null,
     // Merged into every Worker's start message. Everything a process needs
     // that is not the program itself: the GPU channel, the proxy's address,
     // the terminal's size. Every process gets the same, because on a real
@@ -68,7 +67,6 @@ export class ProcessHost {
     this.#shim = shim;
     this.#guest = guest;
     this.#kernel = kernel;
-    this.#gexUrl = gexUrl;
     this.#onOutput = onOutput;
     this.#onFork = onFork;
     this.#readStdin = readStdin;
@@ -177,7 +175,6 @@ export class ProcessHost {
             ...this.#extra,
             ...msg,
             kernelStack: this.#nextKernelStack(),
-            gexUrl: this.#gexUrl ?? undefined,
             shim: this.#shim,
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,

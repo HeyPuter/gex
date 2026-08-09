@@ -97,7 +97,6 @@ function runInWorker(elfPath, elf, args) {
     shim,
     guest: seed,
     kernel,
-    gexUrl: join(ROOT, 'shims/browser/js/gex.mjs'),
     onOutput: (fd, text) => {
       output += text;
     },

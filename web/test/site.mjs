@@ -28,11 +28,29 @@ const WALL = Number(process.env.GEX_WALL || 900) * 1000;
 
 // Which demos to drive, and what counts as having worked. A demo that needs a
 // network or a GPU that this machine may not have says so rather than failing.
+// Every `want` is something the *guest* wrote. The page's own lines --
+// "rootfs: N files", a status of running -- were what these used to look for,
+// and both are true of a demo that unpacks an image and then does nothing at
+// all. That is how every one of these passed while no guest ran: the Worker
+// chunk imported a module that did not exist, 404'd, and rejected where
+// nobody was listening.
+//
+// `settle` is the status that ends the wait when there is one. An interactive
+// shell never finishes, so those demos have no settle and must produce their
+// prompt.
 const DEMOS = {
-  busybox: { want: /rootfs: \d+ files/, settle: 'running' },
-  debian: { want: /rootfs: \d+ files/, settle: 'running' },
+  // The prompt each shell actually prints, taken from a run rather than
+  // guessed: xterm's `innerText` drops the trailing space, so a pattern
+  // anchored on "$ " never matches a prompt that is plainly there.
+  busybox: { want: /~ \$/ },
+  debian: { want: /[#$]/ },
   gears: { want: /exit 0 in \d+ ms/, settle: 'finished' },
-  virgl: { want: /graphics rootfs — \d+ files/, settle: 'running' },
+  // The guest's own evidence, not the page's. "graphics rootfs -- N files"
+  // and a status of `running` were both true of a demo that unpacked the
+  // image and then did nothing at all, which is how this test passed while
+  // the demo did not boot. What has to be true is that Xvfb came up, its
+  // client reached it, and glxgears drew.
+  virgl: { want: /frames in [\d.]+ seconds/, settle: 'finished' },
 };
 
 const exists = async (p) => access(p).then(() => true, () => false);
@@ -70,6 +88,15 @@ const REPORTER = `
   // A ping the moment this runs, so "nothing arrived" can be told from
   // "the page never loaded". They are the same output otherwise.
   post('status', 'reporter|installed|');
+  // And one every few seconds, carrying the terminal.
+  //
+  // A status change is not enough: a demo that reaches the running state and
+  // then stops changes nothing again, so the last thing reported is the last
+  // thing before the interesting part. That is exactly the failure this file
+  // is for, and it went unseen: the check passed the moment the status said
+  // the demo was running, while the demo did nothing at all.
+  let ticks = 0;
+  setInterval(() => post('status', 'tick|running ' + ++ticks * 5 + 's|' + term()), 5000);
   addEventListener('error', (e) => post('threw', String(e.message || e)));
   // In the capture phase as well, which is the only way a *resource* load
   // failure is heard -- a module script that 404s or is served as the wrong
@@ -141,8 +168,10 @@ for (const id of list) {
       const [statusKind, text, terminal] = body.split('|');
       last = `${statusKind || '-'} ${text}`;
       // Each status change is a line, so a run that takes minutes still says
-      // where it is rather than going quiet.
-      console.log(`     [${id}] ${text}`);
+      // where it is rather than going quiet. A tick carries the terminal's
+      // last line as well, because that is where the guest speaks.
+      const tail = (terminal || '').trim().split('\n').filter(Boolean).slice(-1)[0] || '';
+      console.log(`     [${id}] ${text}${statusKind === 'tick' && tail ? ` | ${tail}` : ''}`);
       if (want.test(terminal || '') || text === settle) {
         resolve({ how: 'reached', body: text });
       }

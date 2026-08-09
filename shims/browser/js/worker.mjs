@@ -47,6 +47,17 @@ async function channel() {
   };
 }
 
+// Statically, not by a name computed at run time.
+//
+// It used to be `import(msg.gexUrl ?? './gex.mjs')`, and a bundler cannot
+// resolve a specifier it only learns at run time -- so the built Worker chunk
+// carried a bare `./gex.mjs` that resolved to nothing, 404'd, and rejected
+// inside the message handler below where nobody was listening. Every demo on
+// the site unpacked its rootfs and then sat there. The paths all agreed
+// anyway: this file and `gex.mjs` are siblings under Node, in the flat
+// directory the graphics harness serves, and in the bundle.
+import { Gex, Env } from './gex.mjs';
+
 const port = await channel();
 
 // Standard input, as it arrives. A guest read that finds nothing asks the
@@ -69,7 +80,22 @@ let lflag = () => 0;
 let lastLflag = 0;
 let winsize = () => {};
 
-port.on(async (msg) => {
+// Nothing in here may fail quietly.
+//
+// The handler is asynchronous, so anything it throws becomes a rejected
+// promise nobody holds -- and a Worker that rejects on the way in looks
+// exactly like a Worker that is busy. That is how a Worker chunk importing a
+// module that did not exist went unnoticed: every demo on the site unpacked
+// its rootfs and then sat there, with no error anywhere.
+port.on((msg) => {
+  handle(msg).catch((e) => {
+    const what = e?.stack ?? e?.message ?? String(e);
+    if (typeof console !== 'undefined') console.error('gex: worker failed:', what);
+    port.post({ kind: 'threw', message: what });
+  });
+});
+
+async function handle(msg) {
   if (msg?.kind === 'stdin') {
     stdinWaiter?.(msg.bytes);
     stdinWaiter = null;
@@ -86,7 +112,6 @@ port.on(async (msg) => {
     return;
   }
   if (msg?.kind !== 'run' && msg?.kind !== 'adopt') return;
-  const { Gex, Env } = await import(msg.gexUrl ?? './gex.mjs');
 
   // Everything the guest writes goes back to whoever started this. Posted
   // rather than accumulated: a run that takes minutes should say what it is
@@ -261,6 +286,6 @@ port.on(async (msg) => {
     if (msg.debugExit) console.error(`gex: worker threw: ${e?.message ?? e}${where}`);
     port.post({ kind: 'threw', message: (e?.message ?? String(e)) + where });
   }
-});
+}
 
 port.post({ kind: 'ready' });
