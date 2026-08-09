@@ -2308,6 +2308,130 @@ pub extern "C" fn gex_paused_for_host() -> i32 {
 /// The wake counter as it read when this Worker last looked at its threads.
 static WAKE_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// How long a syscall waits where it stands before giving the stack back.
+///
+/// Short, and deliberately so. This is not how long the wait may take -- a
+/// wait another Worker ends is ended by its notify, in microseconds, and
+/// never reaches this bound. It is what a *misjudged* wait costs: something
+/// only the page can end, waited for here, is dead time until the bound
+/// passes and the stack goes back.
+///
+/// It was twenty milliseconds, on the reasoning that a sleeping Worker costs
+/// nothing, and that was the wrong reasoning about the wrong quantity. The
+/// gears demo booted to the same point and then crawled -- the X handshake is
+/// a great many small waits, and paying twenty milliseconds for each one that
+/// this could not classify is most of a minute of nothing.
+const PARK_HERE_NS: u64 = 2_000_000;
+
+/// Whether the page, rather than another Worker, is what ends this wait.
+///
+/// The distinction the whole of this turns on. A guest waiting for another
+/// guest process is waiting for a different Worker, which bumps the wake
+/// counter when it gets there. A guest waiting for a keystroke, or for bytes
+/// off a WebSocket, is waiting for a callback on *this* Worker's event loop,
+/// and a Worker that has not returned from a syscall is not running it.
+fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
+    let is_socket = |h: &Arc<dyn gex_kernel::vfs::FileHandle>| {
+        h.metadata()
+            .map(|m| m.file_type == gex_kernel::vfs::FileType::Socket)
+            .unwrap_or(false)
+    };
+    // A socket the *page* is the other end of.
+    //
+    // `remote_sockets` is exactly that set: the renderer's vtest socket is
+    // one, and a guest reading a reply off it is waiting for the page to run
+    // its half. Calling that a peer wait is what made this cost rather than
+    // save -- every such wait paid the bound here and then went out to
+    // JavaScript and waited again.
+    //
+    // Compared by address. The handle in a parked thread is the same `Arc`
+    // the table holds, upcast, and the data half of a fat pointer survives
+    // the cast.
+    let is_remote = |h: &Arc<dyn gex_kernel::vfs::FileHandle>| {
+        let p = Arc::as_ptr(h) as *const ();
+        kernel
+            .remote_sockets
+            .values()
+            .any(|r| Arc::as_ptr(r) as *const () == p)
+    };
+    match &t.waiting {
+        // A terminal: nobody but the page can type into it. Nor a socket
+        // whose far end is the page.
+        Waiting::Read(h) | Waiting::Write(h) => !is_socket(h) || is_remote(h),
+        Waiting::Accept(h) => is_remote(h),
+        // Every timed wait and every `poll` parks as this, whatever it is
+        // watching -- a Wisp socket whose bytes arrive on this thread, a
+        // descriptor the page serves, or a pipe between two guests. Telling
+        // them apart means looking at the poll set; until that is done the
+        // page keeps them all.
+        Waiting::Net(_) => true,
+        _ => false,
+    }
+}
+
+/// Wait, here, for the syscall that just parked.
+///
+/// The syscall path already finishes a parked call without leaving wasm:
+/// `gex_syscall` calls `schedule`, and `schedule` picks the thread up,
+/// finishes the operation and says where to carry on. What it could not do
+/// was *wait* -- with nothing ready it gave the stack back, and the wait
+/// happened in JavaScript, as a poll, at whatever interval that loop was
+/// turning at.
+///
+/// So this waits and does nothing else. It changes no kernel state, finishes
+/// no operation and picks no thread; it returns when `schedule` will find
+/// something ready, or when the bound passes and the page should have its
+/// stack back. Everything that was hard about finishing a parked call stays
+/// in the one place that already did it correctly.
+fn park_until_ready() {
+    if unsafe { k_present() } == 0 {
+        return;
+    }
+    // Only when this Worker has nothing else it could run. Threads sharing a
+    // Worker still take turns, and sleeping in a syscall would take the turn
+    // from the sibling that could have made this very wait come true.
+    if !thread_workers() && with_host(|h| h.threads.len() != 1) {
+        return;
+    }
+    if with_host(|h| h.threads.iter().any(|t| wait_needs_page(t, &h.kernel))) {
+        return;
+    }
+    let give_up = now_ns() + PARK_HERE_NS;
+    // The nearest deadline anything is holding, so a guest that asked to be
+    // woken in a hundred microseconds is not woken in twenty milliseconds.
+    let soonest = with_host(|h| {
+        h.threads
+            .iter()
+            .filter_map(|t| match &t.waiting {
+                Waiting::Sleep(at) => Some(*at),
+                Waiting::Futex { deadline, .. } => *deadline,
+                Waiting::Net(deadline) => *deadline,
+                _ => None,
+            })
+            .min()
+    });
+    loop {
+        // Read before asking, so a wake that lands between the question and
+        // the sleep is not slept through: the sleep is entered only while the
+        // counter still reads this.
+        let seq = unsafe { k_wake_seq() };
+        let now = now_ns();
+        if with_host(|h| h.threads.iter().any(|t| thread_ready(t, now))) {
+            return;
+        }
+        if now >= give_up {
+            return;
+        }
+        let mut ns = give_up - now;
+        if let Some(at) = soonest {
+            ns = ns.min(at.saturating_sub(now));
+        }
+        // A deadline already past subtracts to nothing, and a zero-nanosecond
+        // wait returns the instant it is made. Never spin here.
+        unsafe { k_park(seq, ns.max(1_000_000) as i64) };
+    }
+}
+
 /// Sleep until another Worker does something, or `max_ms` passes.
 ///
 /// The park loop used to be a poll: unwind out of wasm, ask "anything yet?",
@@ -2898,7 +3022,49 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // happen now.
     recompile_objects();
     // 3 means the running thread gave up the wasm stack: pick another.
-    let stop = if stop == 3 { schedule() } else { stop };
+    //
+    // With a wait first, when another Worker is what it is waiting for. See
+    // `park_until_ready`: the point of it is that `schedule` then finds the
+    // thread ready and finishes the call, so nothing has to unwind at all.
+    let stop = if stop == 3 {
+        // Ask first, wait second.
+        //
+        // Most parked calls are not waiting at all by the time they get here
+        // -- the pipe already has room, the child has already exited -- and
+        // `schedule` answers those without anything sleeping. Waiting first
+        // put a second readiness scan in front of every one of them, and that
+        // scan is not free: it asks each handle, and a handle on a shared
+        // socket is a call into the global kernel. Measured, that cost more
+        // than the unwinding it was there to avoid.
+        let mut picked = schedule();
+        if picked == 2 {
+            park_until_ready();
+            picked = schedule();
+        }
+        // The thread that carried on is the one that made this call, and the
+        // place it carries on from is the instruction after its `svc` -- which
+        // is the bottom of this very block. Returning to it is the same thing
+        // as being re-entered at it, minus the trap, the catch and the
+        // re-entry, and minus a round of the page's event loop.
+        //
+        // Only when it is exactly that. A signal delivered as the call
+        // finished resumes at a handler instead, and a different thread
+        // resumes with a different context; both of those are re-entries and
+        // have to go out through JavaScript the way they always did.
+        let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
+        if picked == 1
+            && resume() == Some(pc as u64 + 4)
+            && resume_ctx().unwrap_or(here) == here
+        {
+            set_resume_none();
+            set_resume_ctx_none();
+            0
+        } else {
+            picked
+        }
+    } else {
+        stop
+    };
     // What it answered, into the slot the entry took. The ring is written
     // before the call because a call that never returns is exactly the one
     // worth seeing; this fills the answer in for the ones that do.
