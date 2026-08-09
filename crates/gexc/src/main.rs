@@ -80,6 +80,8 @@ run options:
   --verbose       report translation statistics
   --env K=V       add an environment variable (repeatable)
   --sysroot DIR   present DIR as the guest's root filesystem
+  --pin FILE      place each object where FILE says, as written by
+                  `gexc closure --pins`, and report where they landed
   --uid N[:M]     the uid (and gid) the guest sees; `--uid 0` is root, which
                   is what a package manager inside a sysroot expects
   --sample        report the guest's hottest back-edges when it exits. Biased
@@ -217,6 +219,25 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 i += 1;
                 let v = args.get(i).context("--sysroot needs a directory")?;
                 opts.sysroot = Some(v.into());
+            }
+            // A layout written by `gexc closure --pins`. Every object named
+            // in it is placed exactly where the file says, which is what
+            // makes a module built against those addresses correct.
+            "--pin" => {
+                i += 1;
+                let v = args.get(i).context("--pin needs a manifest path")?;
+                let text = std::fs::read_to_string(v).with_context(|| format!("reading {v}"))?;
+                for line in text.lines() {
+                    let Some((base, path)) = line.split_once(' ') else {
+                        continue;
+                    };
+                    let base = base.trim().trim_start_matches("0x");
+                    let Ok(base) = u64::from_str_radix(base, 16) else {
+                        continue;
+                    };
+                    opts.pins.insert(path.trim().to_string(), base);
+                }
+                opts.report_pins = true;
             }
             "--no-jit" => no_jit = true,
             "--lazy" => lazy = true,
@@ -477,12 +498,17 @@ fn cmd_build(args: &[String]) -> Result<()> {
 fn cmd_closure(args: &[String]) -> Result<()> {
     let mut path = None;
     let mut sysroot: Option<String> = None;
+    let mut pins_out: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--sysroot" => {
                 i += 1;
                 sysroot = Some(args.get(i).context("--sysroot needs a directory")?.clone());
+            }
+            "--pins" => {
+                i += 1;
+                pins_out = Some(args.get(i).context("--pins needs a path")?.clone());
             }
             other => path = Some(other.to_string()),
         }
@@ -508,11 +534,33 @@ fn cmd_closure(args: &[String]) -> Result<()> {
     let exe = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
     // The same top-down placement the runtime's `mmap` makes, so these are
     // the addresses a real run produces. Page-aligned, one page of gap.
-    let mut next = gex_abi::MMAP_TOP;
+    // `ld.so` does not ask for the span. It asks for the span plus up to one
+    // maximum-alignment of slack, maps the segments MAP_FIXED inside, and
+    // trims both ends -- for libc, 0x1af000 of image against a 0x1be060
+    // reservation. So the gap has to cover the slack, or the reservation runs
+    // past the end of the arena, the address hint stops being free, and the
+    // pin is quietly ignored. That is exactly what the first attempt did.
+    //
+    // The base is 64 KiB aligned as well, which is the largest `p_align` any
+    // of these objects uses: `ld.so` rounds the reservation up to it, and a
+    // base that is already aligned makes the rounding a no-op, so the load
+    // bias is the address that was pinned rather than a little above it.
+    // Placed *up* from the bottom of the arena rather than down from its top.
+    //
+    // Down from the top is where the ordinary allocator goes, and the loader
+    // gets there first: a trace shows `ld.so` taking 8 KiB at 0x7fffe000 for
+    // its own bookkeeping before it reserves anything for libc. A pin into
+    // that region is not free, the address hint is dropped, and the object
+    // lands one page below where the build assumed -- silently, until the
+    // report says so. Starting at the bottom keeps pinned objects out of the
+    // way of everything the allocator does, because it fills from the far
+    // end and a whole program's libraries are a few tens of megabytes.
+    const SLACK: u64 = 0x10000;
+    let mut next = gex_abi::MMAP_BOTTOM;
     let mut place = |span: u64| -> u64 {
-        let span = (span + 0xfff) & !0xfff;
-        next -= span + 0x1000;
-        next
+        let base = (next + SLACK - 1) & !(SLACK - 1);
+        next = base + ((span + SLACK - 1) & !(SLACK - 1)) + SLACK;
+        base
     };
     // What `$ORIGIN` is relative to: the executable's path *in the guest*,
     // which inside a sysroot is the host path with the prefix taken off.
@@ -523,6 +571,7 @@ fn cmd_closure(args: &[String]) -> Result<()> {
             .to_string(),
         None => path.clone(),
     };
+    let interp_path = exe.interp.clone();
     let closure = gex_ld::closure::resolve(exe, &guest_path, &read, &mut place)?;
 
     for o in &closure.objects {
@@ -541,6 +590,26 @@ fn cmd_closure(args: &[String]) -> Result<()> {
         closure.objects.len(),
         closure.text_bytes() / 1024,
     );
+    // The manifest a run is given, so the layout it produces is the layout
+    // this build assumed. One line per object: base, then guest path. The
+    // executable is left out -- it is placed by the loader, not by `mmap`.
+    if let Some(out) = &pins_out {
+        // The interpreter is not in it. Nothing mmaps `ld.so`: gex's own
+        // loader places it, at INTERP_BASE, before the guest runs -- so there
+        // is no reservation to pin and a line for it would only ever be
+        // reported as "never reserved", which is what the first run of this
+        // said about it.
+        let interp = interp_path.as_deref();
+        let mut text = String::new();
+        for o in closure.objects.iter().skip(1) {
+            if Some(o.path.as_str()) == interp {
+                continue;
+            }
+            text.push_str(&format!("{:#x} {}\n", o.image.bias, o.path));
+        }
+        std::fs::write(out, text).with_context(|| format!("writing {out}"))?;
+        eprintln!("  pins written to {out}");
+    }
     for (name, asker) in &closure.missing {
         eprintln!("  not found: {name}, needed by {asker}");
     }

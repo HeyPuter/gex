@@ -106,6 +106,14 @@ pub struct RunOptions {
     pub identity: Option<(u32, u32)>,
     /// Sample the guest's back-edges and report the hottest at exit.
     pub sample: bool,
+    /// Where each object of the program's closure must be placed, by guest
+    /// path. See `Kernel::pins`: a module built ahead of time is only correct
+    /// if the object it was built from lands where the build assumed, and
+    /// since `ld.so` takes whatever address it is given, that is gex's to
+    /// decide rather than to predict.
+    pub pins: std::collections::HashMap<String, u64>,
+    /// Report at exit where each pinned object actually landed.
+    pub report_pins: bool,
     /// Run a Wayland compositor and bind it at this path in the guest, so a
     /// guest client can put a window on the screen. See `wayland`.
     pub wayland: Option<String>,
@@ -161,6 +169,8 @@ impl Default for RunOptions {
             sysroot: None,
             identity: None,
             sample: false,
+            pins: std::collections::HashMap::new(),
+            report_pins: false,
             wayland: None,
             // On unless the build cannot render or the caller says
             // `--no-virgl`.
@@ -669,7 +679,11 @@ fn run_program_with(
             (k, ps)
         }
         None => (
-            Kernel::new(ctx_addr, image.brk, exe_path.clone()),
+            {
+                let mut k = Kernel::new(ctx_addr, image.brk, exe_path.clone());
+                k.pins = opts.pins.clone();
+                k
+            },
             // `..Default::default()` for the rest, deliberately. This site
             // listed every field, so adding one to `ProcState` broke it --
             // and it broke the *native* shim only, which is how `gexc` sat
@@ -937,6 +951,43 @@ fn run_program_with(
 
     if let Some(s) = &sampler {
         s.report(&image.symbols, 20);
+    }
+
+    // Where the pinned objects actually landed.
+    //
+    // A pin that does not take is the worst outcome available: a module built
+    // for one address, code running at another, and the guest branching into
+    // whatever happens to be there. The hint `mmap` honours is only honoured
+    // when the range is free, so a pin can be dropped for reasons the caller
+    // cannot see -- the first attempt at this placed every object one span
+    // below the top of the arena, and `ld.so` asks for the span *plus*
+    // alignment slack, so every reservation ran past the end and every pin
+    // was silently ignored. Nothing said so. This does.
+    if opts.report_pins {
+        let landed = {
+            let k = store.data().kernel.lock().unwrap_or_else(|e| e.into_inner());
+            k.pin_landed.clone()
+        };
+        let mut wrong = 0;
+        for (path, want, got) in &landed {
+            if want == got {
+                eprintln!("[pin] {path} at {want:#x}");
+            } else {
+                wrong += 1;
+                eprintln!("[pin] {path} WANTED {want:#x} GOT {got:#x}");
+            }
+        }
+        let asked = opts.pins.len();
+        if landed.len() < asked {
+            eprintln!(
+                "[pin] {} of {} objects were never reserved",
+                asked - landed.len(),
+                asked
+            );
+        }
+        if wrong > 0 {
+            eprintln!("[pin] {wrong} landed somewhere else; a build against these is not valid");
+        }
     }
 
     if let Some(jit) = store.data().jit.as_ref() {

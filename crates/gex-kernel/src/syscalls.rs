@@ -428,6 +428,40 @@ pub struct Kernel {
     pub socket_names: Arc<unix::SocketNames>,
     /// Advisory whole-file locks, shared for the same reason.
     pub file_locks: Arc<unix::FileLocks>,
+    /// Where each object of a statically recompiled closure must be placed.
+    ///
+    /// A translated block has its guest addresses baked into it, so a module
+    /// built ahead of time is only correct if the object it was built from
+    /// lands where the build assumed. Nothing needs to *predict* that: the
+    /// guest's `ld.so` reserves each object with `mmap(NULL, ..)` and takes
+    /// whatever address it is given, so the layout is gex's to assign. This
+    /// is the assignment, by guest path.
+    ///
+    /// Empty unless a closure build asked for it, and then honoured only for
+    /// the reservation described at `armed_pin`.
+    pub pins: std::collections::HashMap<String, u64>,
+    /// The base the next anonymous reservation should get, and for what.
+    ///
+    /// `ld.so` does not map an object in one call. It opens the file, reads
+    /// the header, reserves the whole span with an *anonymous* `PROT_NONE`
+    /// mapping, and only then maps the segments into it with `MAP_FIXED`. The
+    /// reservation is the one address gex chooses and the only one worth
+    /// pinning -- and being anonymous it carries no file to key on. So the
+    /// `openat` immediately before it is the signal, and this is what that
+    /// signal sets.
+    ///
+    /// The predicate has to include `PROT_NONE`: a real trace of glibc's
+    /// loader shows a 8 KiB `PROT_READ|WRITE` allocation of its own between
+    /// the `fstat` and the reservation, so "the next anonymous mapping" would
+    /// pin the wrong one.
+    pub armed_pin: Option<(String, u64)>,
+    /// Where each pinned object actually landed, for checking afterwards.
+    ///
+    /// A pin that silently does not take is the worst outcome available: the
+    /// module is built for one address and the code runs at another, and the
+    /// guest branches into whatever is there. Recorded so a mismatch can be
+    /// reported rather than executed.
+    pub pin_landed: Vec<(String, u64, u64)>,
     /// File mappings whose writes are meant to reach the file.
     pub shared_maps: Vec<SharedMap>,
     /// Executable mappings made since the host last looked.
@@ -935,6 +969,9 @@ impl Kernel {
             retry_accept: None,
             restore_sigmask: None,
             started: 0,
+            pins: std::collections::HashMap::new(),
+            armed_pin: None,
+            pin_landed: Vec::new(),
             shared_maps: Vec::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
@@ -1157,6 +1194,9 @@ impl Kernel {
             restore_sigmask: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
+            pins: std::collections::HashMap::new(),
+            armed_pin: None,
+            pin_landed: Vec::new(),
             shared_maps: Vec::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
@@ -2377,6 +2417,12 @@ impl Kernel {
             let _ = self.vfs.unlink(&tmp);
             h
         } else {
+            // Arm a pin if this is an object of the closure. Before the open
+            // rather than after, because `open` moves `p` into the call and
+            // the path is what identifies the object.
+            if let Some(&base) = self.pins.get(&p) {
+                self.armed_pin = Some((p.clone(), base));
+            }
             self.vfs.open(&p, flags, mode)?
         };
         let acc = flags & oflags::ACCMODE;
@@ -3214,7 +3260,27 @@ impl Kernel {
             }
             return Ok(start);
         }
+        // The reservation an ELF loader makes for an object it is about to
+        // map: no address asked for, no permissions, anonymous. Handing it
+        // the pinned base makes every `MAP_FIXED` that follows land where the
+        // closure build assumed, because they are all relative to this one.
+        //
+        // Passed as a *hint*, which `mmap_from` honours only when the range
+        // is genuinely free -- so a pin that would collide is ignored rather
+        // than corrupting the map, and shows up in `pin_landed` as a
+        // mismatch instead of as a wrong answer.
+        let mut addr = addr;
+        let mut pinned = None;
+        if addr == 0 && prot_bits == 0 && flags & mflags::ANONYMOUS != 0 {
+            if let Some((path, base)) = self.armed_pin.take() {
+                addr = base;
+                pinned = Some((path, base));
+            }
+        }
         let start = self.mem.mmap(addr, len, prot_bits, flags, "")?;
+        if let Some((path, base)) = pinned {
+            self.pin_landed.push((path, base, start));
+        }
         // Anonymous memory is defined to read as zero.
         m.zero(start, crate::mem::page_align_up(len) as usize)?;
         Ok(start)
