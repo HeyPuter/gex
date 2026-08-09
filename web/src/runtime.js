@@ -313,7 +313,9 @@ export async function runProgram(
       // Every guest write mirrored to the console as well as posted, and a
       // crash narrated where it happens. A Worker that falls over takes its
       // last few messages with it, and those are the ones that say why.
-      debugExit: !!globalThis.GEX_DEBUG_EXIT,
+      debugExit:
+        !!globalThis.GEX_DEBUG_EXIT ||
+        (typeof process !== 'undefined' && !!process.env?.GEX_DEBUG_EXIT),
       // Statically recompile each object the guest maps once it proves hot,
       // rather than meeting it one dispatch miss at a time. This is the
       // feature the project exists for, and the page was not using it: every
@@ -332,7 +334,10 @@ export async function runProgram(
       if (m?.lflag !== undefined) tenv.lflag = m.lflag;
       term.write(text);
     },
-    readStdin: () => tenv.readStdin(),
+    readStdin: (lflag) => {
+      if (lflag !== undefined) tenv.lflag = lflag;
+      return tenv.readStdin();
+    },
     onMessage: (m) => {
       if (m.kind === 'virgl') serve?.();
       else if (m.kind === 'net') onNetEvent?.(m.event);

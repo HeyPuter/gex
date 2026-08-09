@@ -54,7 +54,19 @@ const port = await channel();
 let stdinWaiter = null;
 let stdinEof = false;
 // Set once the guest is loaded: how the page is told about the terminal.
+//
+// `lflag` may only be called from outside the shim. It reads the guest's
+// termios through `gex_tty_lflag`, which takes the kernel -- and the one
+// place it is tempting to call it from, the `write` import, is *inside* a
+// syscall with the kernel already taken. Asking there took the borrow twice,
+// which panics, and the panic handler writes to fd 2, which is the same
+// import again: a run that ended in a bare `unreachable` with nothing
+// printed and every later call into the shim trapping on the leaked borrow.
+//
+// So it is read where the run loop has given the stack back -- when the guest
+// parks for input -- and remembered for the writes in between.
 let lflag = () => 0;
+let lastLflag = 0;
 let winsize = () => {};
 
 port.on(async (msg) => {
@@ -94,7 +106,7 @@ port.on(async (msg) => {
         kind: 'output',
         fd,
         text: new TextDecoder().decode(bytes.slice()),
-        lflag: lflag(),
+        lflag: lastLflag,
       });
     }
     now() {
@@ -104,7 +116,10 @@ port.on(async (msg) => {
       if (stdinEof) return false;
       const bytes = await new Promise((r) => {
         stdinWaiter = r;
-        port.post({ kind: 'stdin', lflag: lflag() });
+        // Outside the shim: the run loop gave the stack back before calling
+        // this, so the kernel is free to be asked.
+        lastLflag = lflag();
+        port.post({ kind: 'stdin', lflag: lastLflag });
       });
       if (!bytes) return false;
       gex.pushStdin(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));

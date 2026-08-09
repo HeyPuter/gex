@@ -175,7 +175,7 @@ export class ProcessHost {
           w.postMessage({ kind: 'eof' });
           break;
         }
-        Promise.resolve(this.#readStdin()).then((bytes) => {
+        Promise.resolve(this.#readStdin(m.lflag)).then((bytes) => {
           if (bytes && bytes.length) w.postMessage({ kind: 'stdin', bytes });
           else w.postMessage({ kind: 'eof' });
         });

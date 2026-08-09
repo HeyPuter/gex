@@ -825,10 +825,28 @@ export class Gex {
         // whatever crashed -- so those calls fail with a second, misleading
         // error that buries the first.
         if (this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff()) {
+          // What can still be asked, each on its own, because after a crash
+          // the kernel may be borrowed by whatever crashed and a second
+          // question would trap on top of the first. Without this the
+          // message names the engine's word for every possible cause --
+          // "unreachable" -- and nothing else at all.
+          const ask = (f, how) => {
+            try {
+              return f ? how(f()) : '';
+            } catch {
+              return '';
+            }
+          };
+          const e = this.#shim.exports;
+          const at = ask(e.gex_current_pc, (pc) =>
+            `, guest pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}`);
+          const code = ask(e.gex_exit_code, (c) => (c ? `, exit code ${c}` : ''));
+          const heap = ask(e.gex_heap_used_kib, (k) =>
+            k >= 0 ? `, ${(k / 1024) | 0} MiB of shim heap in use` : '');
           throw new Error(
-            `the gex runtime trapped inside the shim (${err.message}). That is a ` +
-              'crash in the runtime, not a guest exit; anything printed above is ' +
-              'all the guest managed to do first.',
+            `the gex runtime trapped inside the shim (${err.message}${at}${code}` +
+              `${heap}). That is a crash in the runtime, not a guest exit; ` +
+              'anything printed above is all the guest managed to do first.',
           );
         }
         // A trap unwinds the engine's own frames, but the shim's shadow
