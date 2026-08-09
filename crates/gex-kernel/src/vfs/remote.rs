@@ -58,6 +58,13 @@ pub struct Remote {
     pub chmod: extern "C" fn(path: u32, path_len: u32, mode: u32) -> i32,
     pub symlink: extern "C" fn(target: u32, target_len: u32, path: u32, path_len: u32) -> i32,
     pub link: extern "C" fn(from: u32, from_len: u32, to: u32, to_len: u32) -> i32,
+    /// Put a socket node at a path.
+    ///
+    /// Not a file anything reads -- what it is for is being *seen*. Xvfb
+    /// binds `/tmp/.X11-unix/X0` and the script that starts it waits for that
+    /// path to exist before running a client; without the node the server was
+    /// listening, the client was never started, and nothing said why.
+    pub mksocket: extern "C" fn(path: u32, path_len: u32) -> i32,
 }
 
 /// How many bytes a serialised [`Metadata`] takes.
@@ -256,6 +263,11 @@ impl FileSystem for RemoteFs {
         let (ta, tn) = at(target.as_bytes());
         let (pa, pn) = at(path.as_bytes());
         ok((self.remote.symlink)(ta, tn, pa, pn)).map(|_| ())
+    }
+
+    fn mksocket(&self, path: &str) -> Result<(), Errno> {
+        let (a, n) = at(path.as_bytes());
+        ok((self.remote.mksocket)(a, n)).map(|_| ())
     }
 }
 

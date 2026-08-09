@@ -247,6 +247,7 @@ extern "C" {
     fn k_fs_chmod(path: u32, path_len: u32, mode: u32) -> i32;
     fn k_fs_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32;
     fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
+    fn k_fs_mksocket(path: u32, path_len: u32) -> i32;
     fn k_fs_add(path: u32, path_len: u32, at: u32, len: u32) -> i32;
     /// Has some process already filled the shared root? Only the first
     /// should: the rest would unpack the same rootfs over the top of it.
@@ -414,6 +415,9 @@ extern "C" fn rf_symlink(target: u32, target_len: u32, path: u32, path_len: u32)
 extern "C" fn rf_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32 {
     unsafe { k_fs_link(from, from_len, to, to_len) }
 }
+extern "C" fn rf_mksocket(path: u32, path_len: u32) -> i32 {
+    unsafe { k_fs_mksocket(path, path_len) }
+}
 
 extern "C" fn rp_new() -> i32 {
     unsafe { k_pipe_new() }
@@ -544,6 +548,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             chmod: rf_chmod,
             symlink: rf_symlink,
             link: rf_link,
+            mksocket: rf_mksocket,
         },
     )))
 }

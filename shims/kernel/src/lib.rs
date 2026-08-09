@@ -670,6 +670,19 @@ pub extern "C" fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i
     as_unit(rootfs().link(&path_of(from, from_len), &path_of(to, to_len)))
 }
 
+/// Put a socket node at a path, so the name can be *seen* as well as
+/// connected to.
+///
+/// Xvfb binds `/tmp/.X11-unix/X0`, and the script that starts it waits for
+/// that path to exist before it runs a client. Without the node the server
+/// was listening, the client was never started, and the run idled with three
+/// processes and nothing to say why.
+#[no_mangle]
+pub extern "C" fn k_fs_mksocket(path: u32, path_len: u32) -> i32 {
+    rootfs().add_socket(&path_of(path, path_len));
+    0
+}
+
 /// Put a file into the shared root before anything runs.
 ///
 /// How a page's bundle gets in: it is the host's, not a guest's, and it
