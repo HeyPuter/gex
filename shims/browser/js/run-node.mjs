@@ -313,6 +313,7 @@ if (process.env.GEX_RECOMPILE_OBJECTS) {
 //
 // Measured around `gex.run` alone: everything before it is loading, placing
 // the image and compiling; everything inside it is the guest.
+if (process.env.GEX_HOT) gex.shim.exports.gex_set_hot?.(1);
 const runStarted = process.env.GEX_TIME_GUEST ? process.hrtime.bigint() : 0n;
 const status = await gex.run(entry);
 // The guest is finished; nothing this process still holds should keep node
@@ -334,7 +335,15 @@ if (process.env.GEX_HOT && gex.shim.exports.gex_hot_blocks) {
   const at = e.gex_alloc(4096) >>> 0;
   const n = e.gex_hot_blocks(at, 4096) >>> 0;
   const text = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, n));
-  for (const line of text.trim().split('\n')) {
+  // An empty answer is a question about the run, not a crash. It used to be
+  // the latter: `undefined.padStart` on the first line of nothing.
+  const lines = text.trim() ? text.trim().split('\n') : [];
+  if (!lines.length) {
+    process.stderr.write(
+      '[hot] nothing counted. The shim may predate `gex_set_hot`; rebuild it.\n',
+    );
+  }
+  for (const line of lines) {
     const [pc, count] = line.split(' ');
     // Named where it can be: an address alone is a library and an offset
     // that nobody has worked out yet.

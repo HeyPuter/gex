@@ -406,6 +406,48 @@ regions already do that and cover about 1% of blocks, and `region.rs` records
 four attempts at more coverage that all measured worse. That is the honest
 place to push, and it is a harder problem than dataflow.
 
+## What perl actually spends its back edges on
+
+Added 2026-08-09, with `GEX_HOT=1` on statically recompiled perl running a
+40,000-key hash build, a sort with a Perl comparator and a regex over 12,000
+words. The twelve hottest back edges:
+
+    2593  [image] +0x10bb28          perl's own text
+    1876  [image] +0x10bb30            "  (the adjacent block)
+    1171  libc +0x95f48              memcmp / bcmp / __memcmpeq
+    1160  [image] +0x1065c0
+    1158  libc +0x95f68              memcmp, 0x20 further in
+    1154  [image] +0x4a610
+    ...   nine more, all [image], 1130-1153
+
+Two things to take from it, and one caution.
+
+**The only library code in the list is `memcmp`.** Not `memcpy` -- that is an
+intrinsic already and no longer appears -- and not `strlen` or `malloc`. perl
+compares hash keys, and glibc's aarch64 `memcmp` is a hand-written SIMD loop
+whose every iteration becomes a block and a dispatch here. That is the same
+argument that made `memcpy` an intrinsic, and section 71 is where it belongs.
+
+It is *not* the same fix. `memcpy` collapses to `memory.copy`, one wasm
+instruction; wasm has no `memcmp`. Serving it means either emitting a loop --
+which `intrinsic::block` cannot express today, since it builds a single
+straight-line block ending in `ret` -- or a host call, which on the short keys
+a hash table compares may cost more than the loop it replaces. Either way the
+replacement has to be measured against what it replaces.
+
+**Everything else is perl's own text**, spread over a dozen sites within a few
+hundred KiB of each other: an interpreter dispatch loop and the functions it
+reaches. That is the honest answer to "where does the time go" for this class
+of program -- nowhere in particular, which is why no single change has moved
+it.
+
+**The caution.** These counts come from a table of 4096 slots that *ages* on
+collision: a loser decrements the winner rather than taking the slot. The
+ranking is meaningful and the magnitudes are not. A flat cluster at 1130-1170
+is what aging produces when several addresses share slots, not twelve equally
+hot blocks. Read it as "these are the hot addresses", never as "this one is
+2.2x that one".
+
 # The test an item has to pass
 
 Added 2026-08-09, after one item on this list measured at exactly zero for a

@@ -4895,7 +4895,15 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // Translated code calls here on back-edges whether or not it makes a
     // syscall, so this says where the guest is when nothing else can.
     let every = unsafe { HEARTBEAT };
-    if every != 0 {
+    // Counting is its own switch, not a side effect of the heartbeat.
+    //
+    // It used to live inside `if every != 0`, so `GEX_HOT` on its own counted
+    // nothing and printed nothing -- and the reader then fell over formatting
+    // the empty answer. Two different questions were sharing one flag: "say
+    // where the guest is every N safepoints", which is for a run that appears
+    // stuck, and "which back edges are hot", which is for a run that works
+    // and is slow. Wanting the second almost never means wanting the first.
+    if every != 0 || unsafe { HOT_ON } {
         static mut BEAT: u64 = 0;
         let beat = unsafe {
             BEAT = BEAT.wrapping_add(1);
@@ -4922,7 +4930,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                 HOT_N[slot] -= 1;
             }
         }
-        if beat.is_multiple_of(every) {
+        if every != 0 && beat.is_multiple_of(every) {
             // With the threads, because a spin says nothing on its own. A
             // guest looping over three addresses for two million safepoints
             // is either the only thread there is -- in which case it is
@@ -6084,6 +6092,15 @@ pub extern "C" fn gex_module_len(i: u32) -> u32 {
 /// which costs accuracy on a flat profile and none at all on the peaked one
 /// this exists to find.
 const HOT_SLOTS: usize = 4096;
+/// Whether to count back edges at all. See `gex_set_hot`.
+static mut HOT_ON: bool = false;
+
+/// Start counting back edges, without asking for a heartbeat as well.
+#[no_mangle]
+pub extern "C" fn gex_set_hot(on: u32) {
+    unsafe { HOT_ON = on != 0 }
+}
+
 static mut HOT_PC: [u64; HOT_SLOTS] = [0; HOT_SLOTS];
 static mut HOT_N: [u64; HOT_SLOTS] = [0; HOT_SLOTS];
 
