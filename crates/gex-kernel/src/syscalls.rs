@@ -1557,13 +1557,37 @@ impl Kernel {
                 if !file.write_is_atomic() {
                     return None;
                 }
-                // Only when it cannot be done in one go. A file, a terminal
-                // and a socket all say `None` here and take the direct path,
-                // which is every write in the common case; a pipe says how
-                // much room it has, and only a write past that has to be
-                // carried in pieces.
-                if a[2] <= file.handle.write_room()? {
-                    return None;
+                // Only when it cannot be done in one go. A handle that can
+                // say how much room it has takes the direct path when the
+                // write fits, which is every write in the common case.
+                //
+                // A pipe cannot say: another Worker can change the answer
+                // between the claim and the write, so `write_room` returns
+                // `None` on purpose. That used to arrive here as `?` and
+                // return "this does not block" -- so a write to a *full*
+                // pipe never parked, went straight through, and came back
+                // `EAGAIN` on a descriptor the guest had every right to
+                // believe was blocking.
+                //
+                // What that looks like from the guest:
+                //
+                //     $ gzip -dc big.gz | sha256sum
+                //     gzip: stdout: Resource temporarily unavailable
+                //
+                // and a hash over a truncated stream. A program that handles
+                // short writes correctly still loses, because `EAGAIN` is not
+                // a short write -- it is an error, and gzip stops.
+                //
+                // So when the room is unknown, ask whether the descriptor is
+                // writable at all. Writable means go straight through and
+                // take whatever short count comes back, which is legal and
+                // which callers retry; full means park, and let the block op
+                // carry it a turn at a time as the reader drains.
+                match file.handle.write_room() {
+                    Some(room) if a[2] <= room => return None,
+                    Some(_) => {}
+                    None if !file.write_would_block() => return None,
+                    None => {}
                 }
                 Some(BlockOp::WriteStream {
                     handle: Arc::clone(&file.handle),
