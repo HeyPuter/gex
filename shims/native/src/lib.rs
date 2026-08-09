@@ -950,7 +950,13 @@ fn run_program_with(
     stop_other_threads(&spawn, opts.verbose);
 
     if let Some(s) = &sampler {
-        s.report(&image.symbols, 20);
+        // Through the vma table, so a hot address in libapt says so rather
+        // than printing as `?`.
+        let vmas = {
+            let k = store.data().kernel.lock().unwrap_or_else(|e| e.into_inner());
+            k.mem.vmas().to_vec()
+        };
+        s.report_mapped(&vmas, opts.sysroot.as_deref().and_then(|p| p.to_str()), 20);
     }
 
     // Where the pinned objects actually landed.
@@ -1851,6 +1857,95 @@ impl Sampler {
             .unwrap_or_else(|e| e.into_inner())
             .entry(pc)
             .or_insert(0) += 1;
+    }
+
+    /// Print the hottest addresses, naming them through whatever is mapped
+    /// there.
+    ///
+    /// The executable's own symbols are not enough and never were. A package
+    /// manager spends its time in libapt, libc and zlib, and every one of
+    /// those addresses printed as `?` -- twenty rows of question marks, which
+    /// is a profile nobody can act on. What names them is the vma table:
+    /// every mapping records the file it came from and the offset within it,
+    /// so a hot address gives up its object, and the object's own symbol
+    /// table gives up the function.
+    ///
+    /// `root` is the sysroot the guest paths are relative to, or `None` when
+    /// they are host paths. An object that cannot be read still gets its name
+    /// and offset, which is most of the answer.
+    pub fn report_mapped(
+        &self,
+        vmas: &[gex_kernel::mem::Vma],
+        root: Option<&str>,
+        top: usize,
+    ) {
+        let counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let total: u64 = counts.values().sum();
+        if total == 0 {
+            return;
+        }
+        let mut rows: Vec<(u64, u64)> = counts.iter().map(|(a, n)| (*a, *n)).collect();
+        rows.sort_by_key(|(a, n)| (std::cmp::Reverse(*n), *a));
+        rows.truncate(top);
+        eprintln!("[gex] {total} safepoint samples, hottest back-edges:");
+
+        let vma_of = |addr: u64| vmas.iter().find(|v| addr >= v.start && addr < v.end);
+
+        // Every object the hot rows land in, read once each. Loaded before
+        // anything is formatted so the borrow is simple: a table built, then
+        // a table used.
+        let mut want: Vec<String> = rows
+            .iter()
+            .filter_map(|(a, _)| vma_of(*a).and_then(|v| v.origin.as_ref()).map(|(p, _)| p.clone()))
+            .collect();
+        want.sort();
+        want.dedup();
+        let mut syms: std::collections::HashMap<String, Vec<gex_ld::elf::Symbol>> =
+            std::collections::HashMap::new();
+        for path in want {
+            let full = match root {
+                Some(r) => {
+                    format!("{}/{}", r.trim_end_matches('/'), path.trim_start_matches('/'))
+                }
+                None => path.clone(),
+            };
+            let mut v: Vec<gex_ld::elf::Symbol> = std::fs::read(&full)
+                .ok()
+                .and_then(|b| gex_ld::elf::load(&b, 0).ok())
+                .map(|img| img.symbols.into_iter().filter(|s| s.size > 0).collect())
+                .unwrap_or_default();
+            v.sort_by_key(|s| s.value);
+            syms.insert(path, v);
+        }
+
+        for (addr, n) in rows {
+            let pct = 100.0 * n as f64 / total as f64;
+            let where_ = match vma_of(addr) {
+                // Mapped from a file: the load base is the mapping's start
+                // less its offset into that file, and the symbol table is in
+                // the object's own address space.
+                Some(v) => match &v.origin {
+                    Some((path, off)) => {
+                        let vaddr = addr.wrapping_sub(v.start.wrapping_sub(*off));
+                        let short = path.rsplit('/').next().unwrap_or(path);
+                        let named = syms.get(path).and_then(|t| {
+                            let i = match t.binary_search_by(|s| s.value.cmp(&vaddr)) {
+                                Ok(i) => i,
+                                Err(0) => return None,
+                                Err(i) => i - 1,
+                            };
+                            let s = &t[i];
+                            (vaddr < s.value + s.size)
+                                .then(|| format!("{} {}+{:#x}", short, s.name, vaddr - s.value))
+                        });
+                        named.unwrap_or_else(|| format!("{short}+{vaddr:#x}"))
+                    }
+                    None => format!("[{}]+{:#x}", v.name, addr - v.start),
+                },
+                None => "unmapped".to_string(),
+            };
+            eprintln!("[gex]   {pct:5.1}%  {addr:#012x}  {where_}");
+        }
     }
 
     /// Print the hottest addresses, naming them where the image can.

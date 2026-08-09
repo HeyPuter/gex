@@ -99,8 +99,19 @@ function readStdin() {
   }
 }
 
+// The same file the page fetches, deliberately.
+//
+// This used to read `target/wasm32-unknown-unknown/release/gex_browser.wasm`
+// while the page fetched `/gex/gex_browser.wasm` out of `web/public`, and
+// only `web/build-assets.sh` connected the two. So this harness could pass
+// against a shim the demo was not running -- and it did, for hours, while
+// every boot of the page died with "Cannot set properties of undefined"
+// because its copy had been built without `--export=__stack_pointer`.
+//
+// `shims/browser/build.sh` installs here now, after checking the glue. One
+// artefact, one build, and a harness that tests what ships.
 const shimWasm = readFileSync(
-  new URL('../../../target/wasm32-unknown-unknown/release/gex_browser.wasm', import.meta.url),
+  new URL('../../../web/public/gex/gex_browser.wasm', import.meta.url),
 );
 
 // The global kernel: the process table, the filesystem and the pipes every

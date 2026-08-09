@@ -118,8 +118,36 @@ const skip = (why) => {
 if (!UPSTREAM && !(await exists(DIST))) skip(`no build at ${DIST} (npm run build)`);
 if (!(await exists(CHROME))) skip(`no browser at ${CHROME}`);
 
+// A stale `dist` is a test that proves nothing.
+//
+// `vite build` copies `web/public` into `web/dist`, so `dist` holds *another*
+// copy of the runtime -- and this test served it without ever checking how old
+// it was. The demo site ran for hours against a shim the harness had never
+// loaded, and the harness stayed green throughout. Refusing to run is the
+// least this can do about it.
+if (!UPSTREAM) {
+  const distShim = join(DIST, 'gex/gex_browser.wasm');
+  const pubShim = fileURLToPath(new URL('../public/gex/gex_browser.wasm', import.meta.url));
+  const [d, p] = await Promise.all([
+    stat(distShim).catch(() => null),
+    stat(pubShim).catch(() => null),
+  ]);
+  if (d && p && d.mtimeMs < p.mtimeMs) {
+    skip(
+      `${DIST} is older than the runtime it should contain `
+      + `(dist ${new Date(d.mtimeMs).toISOString()}, `
+      + `public ${new Date(p.mtimeMs).toISOString()}) -- run \`npm run build\`, `
+      + 'or point this at a dev server with GEX_SITE=http://localhost:5173',
+    );
+  }
+}
+
 const wanted = process.argv.slice(2).filter((a) => DEMOS[a]);
-const list = wanted.length ? wanted : ['busybox', 'gears'];
+// Debian by default, because that is the demo the site opens with and the one
+// a person means by "the web demo". It was defined here and never run: the
+// default set was busybox and gears, so every regression in the demo that
+// matters most went unnoticed by the test that exists to catch them.
+const list = wanted.length ? wanted : ['busybox', 'debian', 'gears'];
 
 const TYPES = {
   '.html': 'text/html',

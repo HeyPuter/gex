@@ -59,6 +59,28 @@ OUT=target/wasm32-unknown-unknown/release/gex_browser.wasm
 RUSTFLAGS="$LINK" cargo build -p gex-browser --target wasm32-unknown-unknown --release $FEATURES
 echo "shims/browser: $(stat -c%s "$OUT") bytes${FEATURES:+ (heap counters on)}"
 
+# Install it where *everything* loads it from, and check it before anything
+# does.
+#
+# There used to be two copies: `run-node.mjs` read the one in `target/`, the
+# page fetched `/gex/gex_browser.wasm` out of `web/public`, and only
+# `web/build-assets.sh` copied one to the other. So the debugging harness and
+# the demo could be built from different code, and were -- the page ran for
+# hours against a shim that a plain `cargo build` had produced without
+# `--export=__stack_pointer`, and every boot died with "Cannot set properties
+# of undefined (setting 'value')" while every harness run passed. A harness
+# that does not test what ships is not a harness.
+#
+# One artefact now, produced here, and the glue check is part of producing it
+# rather than of copying it.
+PUB=web/public/gex
+mkdir -p "$PUB"
+if ! node shims/browser/js/check-glue.mjs "$OUT" shims/browser/js/gex.mjs; then
+    echo "shims/browser: NOT installed -- the glue check failed" >&2
+    exit 1
+fi
+cp "$OUT" "$PUB/gex_browser.wasm"
+
 # And the same shim against a *shared* memory, when the toolchain can build
 # one. Two binaries rather than one because a memory import's `shared` flag is
 # part of its type: a module built against a shared memory will not

@@ -194,6 +194,26 @@ for (const name of calledExports(glue)) {
   if (!exported.has(name)) problems.push(`the shim has no export ${name}, and the glue calls it`);
 }
 
+// The globals the page *writes*, which the check above cannot see: it looks
+// for calls, and `__stack_pointer` is assigned rather than called.
+//
+// It is not a nicety. Each Worker moves the shim's stack to its own slice
+// before it runs anything, and a shim built without
+// `--export=__stack_pointer` -- which is what a plain `cargo build` produces
+// instead of `shims/browser/build.sh` -- fails that assignment with
+// "Cannot set properties of undefined (setting 'value')" on the *first* boot,
+// with nothing to connect it to the build. The demo site was broken this way
+// by a stale artefact and the message named nothing.
+for (const name of ['__stack_pointer']) {
+  if (!exported.has(name)) {
+    problems.push(
+      `the shim has no export ${name}: it was built without `
+      + '--export=__stack_pointer. Build it with shims/browser/build.sh, '
+      + 'not a plain cargo build.',
+    );
+  }
+}
+
 if (problems.length) {
   for (const p of problems) console.error(`  ${p}`);
   console.error(`glue check FAILED: ${wasmPath}`);

@@ -215,7 +215,16 @@ async function loadKernel() {
     const bytes = await fetchBytes(KERNEL_URL);
     kernelSpec = {
       module: await WebAssembly.compile(bytes),
-      memory: new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }),
+      // Four gigabytes, and it has to match `--max-memory` in
+      // `shims/kernel/build.sh` *exactly*: a shared memory carries its
+      // maximum in its type, so a host that offers a different one cannot
+      // instantiate the module at all. Raising one without the other is how
+      // this page stopped booting.
+      //
+      // The rootfs lives in this memory, so the ceiling is the largest
+      // machine a tab can boot. It reserves address space rather than pages;
+      // the memory still starts at 128 MiB and grows as files arrive.
+      memory: new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true }),
     };
   } catch {
     kernelSpec = false;
