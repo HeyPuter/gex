@@ -110,7 +110,17 @@ pub const STACK_SIZE: u64 = 8 * 1024 * 1024;
 /// Everything below [`MMAP_BOTTOM`] is a fixed layout that a process needs
 /// from the start; everything above it is handed out as it is asked for, and
 /// the memory is grown to match. So this is a limit rather than a cost.
-pub const MMAP_TOP: u64 = 0xF000_0000;
+///
+/// It is exactly the dispatch directory's reach, and that is not a
+/// coincidence -- it is the constraint. `ld.so` maps a shared library into
+/// this arena and then calls into it, so the arena is somewhere *code* lives,
+/// and code at an address the directory cannot name can never be translated.
+/// This used to be 0xF000_0000, which is 1.75 GiB past the end of the
+/// directory, and the consequence was that no dynamically linked program ran
+/// under the native host at all: the first call into libc landed on "branch
+/// to 0xefe25e80, which is not executable guest memory". The assertion below
+/// is what keeps the two numbers together.
+pub const MMAP_TOP: u64 = DISPATCH_MAX_PAGES * DISPATCH_PAGE;
 
 /// Lowest address the mmap allocator will hand out, and the bottom of the
 /// region that grows.
@@ -515,8 +525,12 @@ mod tests {
         // the fixed non-PIE link address.
         assert!(RESERVED_END <= DISPATCH_DIR);
         assert!(DISPATCH_DIR_END <= EXEC_BASE);
-        // Every address code may occupy must have a directory entry.
+        // Every address code may occupy must have a directory entry. That
+        // includes the mmap arena: `ld.so` maps libraries there and calls
+        // into them, so a directory that stops below the arena's ceiling
+        // leaves executable addresses it cannot name.
         assert!(DISPATCH_MAX_PAGES * DISPATCH_PAGE >= STACK_TOP);
+        assert!(DISPATCH_MAX_PAGES * DISPATCH_PAGE >= MMAP_TOP);
         assert!(EXEC_BASE < PIE_BASE);
         assert!(MMAP_BOTTOM < MMAP_TOP);
         // The stack sits at the top of the fixed low region, and the arena
