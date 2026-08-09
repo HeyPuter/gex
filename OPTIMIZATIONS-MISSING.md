@@ -1243,3 +1243,68 @@ emitter. The obvious candidates are what differs between the two paths rather
 than anything in codegen itself: block discovery from a cold start against
 whole-object discovery, the dispatch slots a miss allocates, and the module
 boundary a runtime translation draws around a handful of blocks.
+
+## What `apt-get update` actually spends its time on
+
+Not what #85 says. It is recorded there as guest CPU in libapt, and that was
+a guess; this is the measurement.
+
+**The cost does not scale with the index.** Same rootfs, same everything, only
+the number of packages in `Packages` changing:
+
+    300 packages    26,376 ms
+    1,000 packages  26,148 ms
+    3,000 packages  26,805 ms
+
+Ten times the data for four hundred milliseconds. Whatever apt update costs,
+parsing is almost none of it -- so the profile that pointed at
+`debListParser::ParseDepends` and `pkgTagSection::Find` was pointing at the
+only part that *is* work, which is a small part.
+
+**It is translating the same libraries ten times.** `--verbose` counts each
+process separately, and apt is made of processes:
+
+    14,531 blocks in   253 compilations
+    19,894 blocks in   525
+    19,754 blocks in   524
+    18,634 blocks in   508
+    33,957 blocks in   838
+    33,976 blocks in   876
+    35,365 blocks in   902
+    14,531 blocks in   253
+    14,531 blocks in   253
+    76,081 blocks in 2,824      <- apt-get itself
+    ------------------------
+    281,254 blocks in 7,756 Cranelift compilations
+
+The `file`, `copy` and `store` methods are separate processes and each one
+translates its own copy of libapt-pkg, libstdc++ and libc from a cold start.
+`14,531` appears three times because three of them do exactly the same work.
+
+That is the twenty-six seconds, and it is why the closure result matters
+beyond correctness. The same run in the browser against apt's exhaustive
+closure translated
+
+    pid 1     0     pid 2     0     pid 3   280     pid 4 1,817
+    pid 5   238     pid 6 1,789     pid 7   453     pid 8 2,029
+
+-- about 6,600 blocks in total against 281,254, **forty-two times less**,
+because every process installs the modules the build already made instead of
+lifting the library again.
+
+Two consequences worth stating.
+
+**#85 is wrong as filed** and should say this instead: apt update is slow
+because gex translates libapt once per process, and apt has ten processes.
+
+**Whole-object recompilation is worth measuring properly, and it loses.**
+`gexc run --recompile-objects`, which statically recompiles each object *as
+it is mapped* rather than ahead of time:
+
+    apt-get update, translating on demand    30,262 ms
+    apt-get update, --recompile-objects     134,477 ms
+
+Four and a half times worse, because it pays Cranelift for every block of
+every object and apt enters a few thousand of them. The value of static
+recompilation is not the granularity, it is that the work happens *before the
+run*. Doing the same work during the run is the worst of both.
