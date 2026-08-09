@@ -924,7 +924,7 @@ export class Gex {
    * modules would find those slots empty, or past the end of a table it had
    * never grown.
    */
-  async adoptProcess(shimWasm, guestWasm, child) {
+  async adoptProcess(shimWasm, guestWasm, child, opts = {}) {
     // Narrated when asked, because every step here is a place a child can
     // stop dead with nothing to show for it: a copy, two compiles, a kernel
     // and a table of code. A child that hangs is indistinguishable from one
@@ -1005,6 +1005,12 @@ export class Gex {
       e.gex_adopt_fds(p, child.fds.length);
       e.gex_free?.(p, child.fds.length);
     }
+    // The closure first: its slots sit below anything the parent translated,
+    // and a child's dispatch tables start empty however full its parent's
+    // were. The *directory* came with the adopted memory, so without this the
+    // child's branches point at slots nothing has filled.
+    this.#closureModules = opts?.closure ?? this.#closureModules;
+    await this.#installClosure();
     step(`installing ${child.modules?.length ?? 0} modules`);
     for (const m of child.modules ?? []) await this.#installModule(m.mod, m.need);
     step('running');

@@ -270,7 +270,7 @@ async function handle(msg) {
     if (msg.kind === 'thread') {
       ({ entry, ctx } = await gex.adoptThread(msg.shim, msg.guest, msg));
     } else if (msg.kind === 'adopt') {
-      entry = await gex.adoptProcess(msg.shim, msg.guest, msg.child);
+      entry = await gex.adoptProcess(msg.shim, msg.guest, msg.child, msg);
     } else {
       entry = await gex.load(
         msg.shim,
@@ -278,7 +278,10 @@ async function handle(msg) {
         msg.elf,
         msg.files ?? {},
         msg.args ?? [],
-        msg.opts ?? {},
+        // `closure` arrives at the top level, because it is in the host's
+        // `extra` so that a forked child gets it too; everything else about a
+        // run arrives in `opts`.
+        { ...(msg.opts ?? {}), closure: msg.closure ?? msg.opts?.closure },
       );
       if (!entry) throw new Error('the program could not be loaded');
     }

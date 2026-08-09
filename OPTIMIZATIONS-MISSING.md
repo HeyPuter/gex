@@ -944,3 +944,23 @@ What is not done: the closure is only installed for the process that
 `load`s. A forked child inherits its parent's translations as it always did,
 but an `execve` of a *different* program in the closure gets nothing, and
 that is the case apt is made of.
+
+### Across a fork and an execve
+
+Extended. `execve` does not rebuild the guest wasm instance -- it reloads the
+image into the same memory -- so the closure's functions are still sitting in
+the dispatch tables afterwards, and only the *directory* pointing at them was
+cleared. `CLOSURE_DIRS` replays it, and a forked child installs the closure
+modules itself, because a child adopts its parent's memory (and with it the
+directory) but its dispatch tables belong to its own instance and start
+empty.
+
+Measured on `dash -c 'echo $(ls /bin | wc -l)'` with dash's exhaustive
+closure, `ls` -- a program the closure was *not* built for, sharing only its
+libc -- translates 369 blocks where a cold process translates several
+thousand.
+
+The command does not complete, and the reason is not this: `wait4` returns
+ECHILD, which is #69, and the closure exposes it by making the child finish
+before the parent asks. The six-case substitution suite passes with this shim
+when no closure is loaded, so nothing here regressed the ordinary path.

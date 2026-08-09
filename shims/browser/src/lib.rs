@@ -2268,6 +2268,24 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     FILES.0.borrow_mut().push((name.to_string(), bytes));
 }
 
+/// The directory the closure's modules published, kept so an `execve` can
+/// have it back.
+///
+/// `do_exec` clears the guest's dispatch directory, because anything the old
+/// program left there is code at the same addresses doing something else.
+/// That is right for translations, which belong to one program, and wrong
+/// for a closure: its modules are already *in* the dispatch tables, which
+/// `execve` does not touch -- the guest module instance is not rebuilt, only
+/// the image in its memory -- so the functions are still there and only the
+/// directory pointing at them was thrown away.
+///
+/// Replaying it is safe because the layout is pinned. libc is at one address
+/// for the whole run, so a page this covers either holds the object the
+/// module was built from or holds nothing, and a branch into nothing faults
+/// whatever the directory says.
+static CLOSURE_DIRS: SingleThreaded<Vec<(u64, u32)>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
+
 /// Where the closure build says each object goes, staged until the kernel
 /// that will honour it exists.
 ///
@@ -2411,6 +2429,7 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
     let Some(meta) = gex_xlate::Metadata::decode(shim_slice(ptr, len)) else {
         return 0;
     };
+    CLOSURE_DIRS.0.borrow_mut().extend(meta.dir_entries.iter().copied());
     with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         for (page, base) in &meta.dir_entries {
@@ -4095,6 +4114,26 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // carries on from the high-water mark rather than restarting.
     h.jit.page_table = gex_xlate::PageTable::from_entries(&[], h.jit.page_table.slots());
     h.jit.translated.clear();
+    // Except the closure's. Those modules are still in the dispatch tables --
+    // `execve` rebuilds the image in this memory, not the wasm instance
+    // around it -- so the new program can have every library the build
+    // covered for nothing. See `CLOSURE_DIRS`.
+    let closure = CLOSURE_DIRS.0.borrow();
+    if !closure.is_empty() {
+        for (page, base) in closure.iter() {
+            h.jit.page_table.assign(*page, *base);
+            let at = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+            if at + 4 <= data.len() {
+                data[at..at + 4].copy_from_slice(&base.to_le_bytes());
+            }
+        }
+        trace_line(&format!(
+            "[gex] exec: {} closure pages kept, {} slots\n",
+            closure.len(),
+            h.jit.page_table.slots()
+        ));
+    }
+    drop(closure);
 
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     let c = ctx_addr as usize;

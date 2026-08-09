@@ -186,6 +186,16 @@ const host = new ProcessHost({
     // command line is a pipe, and `gzip -c` writes a deflate stream through
     // it that a UTF-8 round trip would fill with U+FFFD.
     rawOutput: true,
+    // GEX_CLOSURE names the stem a closure build wrote. Every
+    // `<stem>.NN.<name>.wasm` beside it is one library, translated ahead of
+    // time; the image module is `<stem>.wasm` and is passed as the guest.
+    //
+    // In `extra` rather than `opts`, so a forked child gets it too. A child
+    // adopts its parent's memory and with it the dispatch *directory*, but
+    // its own dispatch tables belong to its own guest instance and start
+    // empty -- so it has to instantiate the modules itself to have anything
+    // for the directory to point at.
+    closure: readClosure(),
     // GEX_NETWORK gives the guest a network made of real TCP sockets, so the
     // paths above Wisp -- apt's helper, a fetch, a parse -- are exercised here
     // rather than only in a browser with a proxy configured. Per process, and
@@ -344,10 +354,6 @@ try {
       // goes into the *global* placement table too, so every process of the
       // run agrees rather than only the first.
       pins: readPins(),
-      // GEX_CLOSURE names the stem a closure build wrote. Every
-      // `<stem>.NN.<name>.wasm` beside it is one library, translated ahead of
-      // time; the image module is `<stem>.wasm` and is passed as the guest.
-      closure: readClosure(),
     },
   });
 } catch (e) {
