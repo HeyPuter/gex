@@ -439,6 +439,18 @@ const virglGears = {
     ctx.term.writeln(ctx.ansi.red('them. What follows is the run, unedited, as far as it gets.'));
     ctx.term.writeln('');
 
+    // The budget the run is given, and it has to clear the cold start.
+    //
+    // The first frame arrives about forty seconds in: an X server, Mesa and
+    // glibc all reach the guest one basic block at a time before anything is
+    // drawn. Thirty seconds -- which these buttons used to offer -- ends the
+    // run with a blank canvas and code 124, which reads as a failure and is
+    // not one.
+    const gearsButtons = (go) => [
+      { label: 'Draw for 90s', primary: true, onClick: () => go(90) },
+      { label: 'Draw for 5 minutes', onClick: () => go(300) },
+    ];
+
     const start = async (seconds) => {
       ctx.actions([]);
       running(true);
@@ -493,17 +505,11 @@ const virglGears = {
       } finally {
         running(false);
         ctx.idle();
-        ctx.actions([
-          { label: 'Draw for 30s', primary: true, onClick: () => start(30) },
-          { label: 'Draw for 2 minutes', onClick: () => start(120) },
-        ]);
+        ctx.actions(gearsButtons(start));
       }
     };
 
-    ctx.actions([
-      { label: 'Draw for 30s', primary: true, onClick: () => start(30) },
-      { label: 'Draw for 2 minutes', onClick: () => start(120) },
-    ]);
+    ctx.actions(gearsButtons(start));
     ctx.hint('Xvfb and glxgears, as Debian built them');
   },
 };
