@@ -13,7 +13,7 @@
 //     --cwd <dir>               the directory the guest starts in
 //     --strace               narrate every syscall to stderr
 
-import { readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
@@ -64,8 +64,30 @@ const rest = [];
           } catch {
             continue;
           }
-          if (st.isDirectory()) walk(g, h);
-          else files[g] = readFileSync(h);
+          // A directory *symlink* is not descended into. Debian ships
+          // `/usr/bin/X11 -> .`, and `stat` says that is a directory, so this
+          // walked into it and re-read the whole of `/usr/bin` one level
+          // deeper, for ever: the path grew `X11/` per turn until an
+          // uncaught `readFileSync` blew up on a name too long, and took the
+          // whole apt run with it. Following the link buys nothing either --
+          // whatever it points at is already being walked under its real
+          // name.
+          if (st.isDirectory()) {
+            let link;
+            try {
+              link = lstatSync(h);
+            } catch {
+              continue;
+            }
+            if (!link.isSymbolicLink()) walk(g, h);
+          } else {
+            try {
+              files[g] = readFileSync(h);
+            } catch {
+              // Unreadable, or a name the host rejects. One file is not the
+              // run.
+            }
+          }
         }
       };
       walk(guestRoot.replace(/\/$/, ''), hostRoot.replace(/\/$/, ''));
