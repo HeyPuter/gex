@@ -16,6 +16,7 @@
 //!   block needs a handful of locals rather than one per SSA value.
 
 use crate::wasm::{FuncBody, ValType};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use gex_abi::{ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE, GUEST_LIMIT, POISON_ADDR};
 use gex_ir::*;
 use std::collections::HashMap;
@@ -166,10 +167,11 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
                 let members: Vec<String> = region.iter().map(|a| format!("{a:#x}")).collect();
                 eprintln!("[region] {}", members.join(" "));
             }
-            REGIONS.with(|c| {
-                let (n, b) = c.get();
-                c.set((n + 1, b + region.len()))
-            });
+            {
+                let mut r = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+                r.0 += 1;
+                r.1 += region.len();
+            }
             e.run_region(&region)
         }
         _ => e.run(block),
@@ -704,7 +706,7 @@ impl<'a> Emitter<'a> {
             Ty::V128 => self.f.simd_mem(simd::V128_LOAD, 4, Self::reg_offset(r)),
         }
         self.f.local_set(local);
-        CTX_BYTES.with(|c| c.set(c.get() + (self.f.code.len() - before)));
+        CTX_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
         note_traffic(r);
         self.regs.insert(
             r,
@@ -786,7 +788,7 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        CTX_BYTES.with(|c| c.set(c.get() + (self.f.code.len() - before)));
+        CTX_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
     }
 
     /// Forget every cached register, forcing later reads to reload. Used
@@ -1899,6 +1901,12 @@ impl<'a> Emitter<'a> {
     /// An indirect branch has flushed already and its target is in a local,
     /// so it needs the counter and the call and nothing else.
     fn emit_safepoint_no_flush(&mut self, pc: u64) {
+        let before = self.f.code.len();
+        self.emit_safepoint_no_flush_inner(pc);
+        SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
+    }
+
+    fn emit_safepoint_no_flush_inner(&mut self, pc: u64) {
         self.f.local_get(self.ctx_local);
         self.f.local_get(self.ctx_local);
         self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
@@ -1917,6 +1925,14 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_safepoint(&mut self, pc: u64) {
+        let before = self.f.code.len();
+        self.emit_safepoint_inner(pc);
+        // Not double-counted: `emit_safepoint` does its own work and does not
+        // call the no-flush form.
+        SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
+    }
+
+    fn emit_safepoint_inner(&mut self, pc: u64) {
         // Count down, and only call out when the counter runs out, so the
         // common case is a load, a subtract, a store and a not-taken branch.
         self.f.local_get(self.ctx_local);
@@ -1974,8 +1990,15 @@ impl<'a> Emitter<'a> {
     /// forever. Measured on a 300M-iteration loop: 16.9s without this, 7.8s
     /// with it.
     fn emit_loop_safepoint(&mut self, pc: u64) {
+        let before = self.f.code.len();
+        self.emit_loop_safepoint_inner(pc);
+        SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
+    }
+
+    fn emit_loop_safepoint_inner(&mut self, pc: u64) {
         let Some(counter) = self.reenter_local else {
-            self.emit_safepoint(pc);
+            // The inner form, so the wrapper above counts these bytes once.
+            self.emit_safepoint_inner(pc);
             return;
         };
         self.f.local_get(counter);
@@ -2103,6 +2126,12 @@ impl<'a> Emitter<'a> {
     /// start, because a value pushed outside a `block` cannot be consumed
     /// inside one.
     fn emit_dispatch_tail_call(&mut self) {
+        let before = self.f.code.len();
+        self.emit_dispatch_tail_call_inner();
+        DISPATCH_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
+    }
+
+    fn emit_dispatch_tail_call_inner(&mut self) {
         if gex_abi::DISPATCH_TABLES <= 1 {
             self.f.local_get(self.ctx_local);
             self.emit_dispatch_index();
@@ -2248,22 +2277,33 @@ fn lane_shift_op(op: VShiftOp, lane: VLane) -> u32 {
     }
 }
 
-thread_local! {
-    /// Regions formed, and how many blocks went into them.
-    pub static REGIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
-    /// Bytes emitted moving guest registers between the context and locals.
-    /// That traffic is the price of a block boundary, and `gexc build`
-    /// reports it as a share of the module.
-    pub static CTX_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// How often each guest register crosses a boundary, under
-    /// `GEX_REG_HISTOGRAM`. Which registers those are is the first question
-    /// anyone asks about that percentage.
-    pub static REG_TRAFFIC: std::cell::RefCell<HashMap<GuestReg, usize>> =
-        std::cell::RefCell::new(HashMap::new());
-}
+// What a block boundary costs, split three ways, and process-wide.
+//
+// These were thread-locals, and blocks are compiled on a pool -- so every
+// count landed on a worker thread and `gexc build` read its own, which is
+// near enough zero. It has been printing "0% of it register traffic across
+// block boundaries" for a metric that is nothing of the sort, about the one
+// number anybody would use to decide whether block boundaries are worth
+// attacking. Atomics are ample here: a few adds per block against the
+// milliseconds each block spends being lifted and encoded.
+/// Bytes emitted moving guest registers between the context and locals.
+pub static CTX_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Bytes emitted on the safepoint countdown and its call.
+pub static SAFEPOINT_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Bytes emitted choosing where to go next: the directory load, the slot
+/// arithmetic, the table selection and the indirect tail call.
+pub static DISPATCH_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Regions formed, and how many blocks went into them.
+pub static REGIONS: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+/// How often each guest register crosses a boundary, under
+/// `GEX_REG_HISTOGRAM`. Which registers those are is the first question
+/// anyone asks about that percentage.
+pub static REG_TRAFFIC: std::sync::Mutex<Option<HashMap<GuestReg, usize>>> =
+    std::sync::Mutex::new(None);
 
 fn note_traffic(r: GuestReg) {
-    REG_TRAFFIC.with(|t| *t.borrow_mut().entry(r).or_default() += 1);
+    let mut t = REG_TRAFFIC.lock().unwrap_or_else(|e| e.into_inner());
+    *t.get_or_insert_with(HashMap::new).entry(r).or_default() += 1;
 }
 
 /// Every guest register a block reads, and every one it writes.

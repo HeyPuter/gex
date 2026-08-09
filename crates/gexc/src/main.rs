@@ -393,17 +393,40 @@ fn cmd_build(args: &[String]) -> Result<()> {
         stats.instructions,
         stats.wasm_bytes / 1024,
         stats.wasm_bytes as f64 / (stats.instructions.max(1) * 4) as f64,
-        100.0 * gex_emit::tier1::CTX_BYTES.with(|c| c.get()) as f64 / stats.wasm_bytes as f64,
+        100.0 * gex_emit::tier1::CTX_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64
+            / stats.wasm_bytes as f64,
     );
+    // What a block boundary costs, split. The three together are what a
+    // straight-line block pays for being a block rather than four more
+    // instructions in the last one, and which of the three to attack is not
+    // obvious from the total.
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ctx = gex_emit::tier1::CTX_BYTES.load(Relaxed);
+        let sp = gex_emit::tier1::SAFEPOINT_BYTES.load(Relaxed);
+        let disp = gex_emit::tier1::DISPATCH_BYTES.load(Relaxed);
+        let total = stats.wasm_bytes.max(1);
+        eprintln!(
+            "  boundary: {:.0}% registers, {:.0}% safepoints, {:.0}% dispatch \
+             ({:.0}% together, {} bytes over {} blocks)",
+            100.0 * ctx as f64 / total as f64,
+            100.0 * sp as f64 / total as f64,
+            100.0 * disp as f64 / total as f64,
+            100.0 * (ctx + sp + disp) as f64 / total as f64,
+            ctx + sp + disp,
+            stats.blocks,
+        );
+    }
     // Which registers make up that percentage, for anyone considering doing
     // something about it.
     if std::env::var_os("GEX_REG_HISTOGRAM").is_some() {
-        let mut v: Vec<(String, usize)> = gex_emit::tier1::REG_TRAFFIC.with(|t| {
-            t.borrow()
-                .iter()
-                .map(|(r, n)| (format!("{r:?}"), *n))
-                .collect()
-        });
+        let mut v: Vec<(String, usize)> = gex_emit::tier1::REG_TRAFFIC
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|(r, n)| (format!("{r:?}"), *n))
+            .collect();
         v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
         let total: usize = v.iter().map(|(_, n)| n).sum::<usize>().max(1);
         let mut acc = 0;
@@ -416,7 +439,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
             );
         }
     }
-    let (regions, in_regions) = gex_emit::tier1::REGIONS.with(|c| c.get());
+    let (regions, in_regions) = *gex_emit::tier1::REGIONS.lock().unwrap();
     if regions > 0 {
         eprintln!(
             "{out}: {regions} loops emitted as one function each, {in_regions} blocks in them"
