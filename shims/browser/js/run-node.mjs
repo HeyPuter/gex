@@ -184,26 +184,38 @@ async function spawnChild(child, guestWasm) {
   // parent returns immediately and the whole point is what the child does
   // afterwards -- and with an unref'd Worker node left as soon as the parent
   // was done and the child's output never appeared.
-  const w = new Worker(new URL('./worker.mjs', import.meta.url));
+  // The payload goes in at construction as well as on the handshake.
+  //
+  // A child must be able to start while its parent is blocked, and under node
+  // the parent may be the main thread -- `k_park` calls `Atomics.wait`, which
+  // stops the event loop that would otherwise deliver `ready` and reply with
+  // `adopt`. See the note in worker.mjs. `workerData` is read the moment the
+  // thread exists, so the child no longer depends on its parent turning a
+  // loop it may never turn again.
+  const payload = {
+    kind: 'adopt',
+    child,
+    shim: shimWasm,
+    guest: guestWasm,
+    kernel,
+    kernelStack: kernelStacks
+      ? kernelStacks.area + ++kernelStacksTaken * kernelStacks.size
+      : undefined,
+    // A child inherits its parent's network, as it does on Linux. It was not
+    // carried once, and apt is the program that notices: it does its fetching
+    // in a forked helper, so the process that needed a network was the only
+    // one without one. `Temporary failure resolving 'deb.debian.org'` is what
+    // a resolver says when `socket` fails.
+    network: !!process.env.GEX_NETWORK,
+    debugExit: !!process.env.GEX_DEBUG_EXIT,
+  };
+  const w = new Worker(new URL('./worker.mjs', import.meta.url), {
+    workerData: { gexStart: payload },
+  });
   w.on('message', (m) => {
+    // `ready` needs no reply: the Worker started from `workerData`.
     if (m.kind === 'ready') {
-      w.postMessage({
-        kind: 'adopt',
-        child,
-        shim: shimWasm,
-        guest: guestWasm,
-        kernel,
-        kernelStack: kernelStacks
-          ? kernelStacks.area + ++kernelStacksTaken * kernelStacks.size
-          : undefined,
-        // A child inherits its parent's network, as it does on Linux. It was
-        // not carried, and apt is the program that notices: it does its
-        // fetching in a forked helper, so the process that needed a network
-        // was the only one without one. `Temporary failure resolving
-        // 'deb.debian.org'` is what a resolver says when `socket` fails.
-        network: !!process.env.GEX_NETWORK,
-        debugExit: !!process.env.GEX_DEBUG_EXIT,
-      });
+      // nothing to do
     } else if (m.kind === 'output') {
       (m.fd === 2 ? process.stderr : process.stdout).write(m.text);
     } else if (m.kind === 'fork') {

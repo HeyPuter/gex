@@ -354,4 +354,32 @@ async function handle(msg) {
   }
 }
 
+// A payload handed over at construction, if the host had one.
+//
+// The handshake this replaces -- post `ready`, be sent `adopt` -- costs one
+// turn of the *starting* thread's event loop, and under node the starting
+// thread may be a guest that is about to block. `bash -c 'echo $(echo hi)'`
+// is the case: bash forks for the substitution and immediately reads the
+// pipe, `k_park` calls `Atomics.wait` on node's main thread, the event loop
+// stops, `ready` is never delivered, `adopt` is never sent, and the child
+// that was going to write the pipe never starts.
+//
+// Passing the payload as `workerData` removes the dependency: the Worker has
+// everything it needs the moment the thread exists, and whether its parent
+// is running, blocked, or gone makes no difference to whether it starts.
+//
+// `ready` is still posted, because a browser host has no `workerData` and
+// still uses the handshake -- and because a host that sends both is harmless:
+// `start` ignores a second payload.
+const handed = await (async () => {
+  if (typeof self !== 'undefined') return null;
+  try {
+    const { workerData } = await import('node:worker_threads');
+    return workerData?.gexStart ?? null;
+  } catch {
+    return null;
+  }
+})();
+
 port.post({ kind: 'ready' });
+if (handed) handle(handed);
