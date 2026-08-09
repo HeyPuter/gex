@@ -315,6 +315,9 @@ if (process.env.GEX_RECOMPILE_OBJECTS) {
 // the image and compiling; everything inside it is the guest.
 const runStarted = process.env.GEX_TIME_GUEST ? process.hrtime.bigint() : 0n;
 const status = await gex.run(entry);
+// The guest is finished; nothing this process still holds should keep node
+// up. See `Gex.close`.
+gex.close?.();
 if (process.env.GEX_TIME_GUEST) {
   const ns = process.hrtime.bigint() - runStarted;
   process.stderr.write(`[gex] guest ran in ${Number(ns / 1000000n)}ms\n`);

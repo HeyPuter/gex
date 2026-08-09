@@ -324,6 +324,35 @@ export class Gex {
   get memory() { return this.#memory; }
 
   /** The shim instance, for diagnostics. */
+  /**
+   * Let go of everything that would keep a host's event loop alive.
+   *
+   * The yielding channel is the one that matters. `#tick` is a
+   * `MessageChannel` with `port1.start()` called on it, and in node a started
+   * port is an *active handle*: it keeps the process alive on its own, for as
+   * long as it is open. A page does not care, which is why this went
+   * unnoticed -- a tab is alive anyway.
+   *
+   * Under node it meant a run that ever yielded never exited. `echo hi`
+   * finished and left, because a single process that never waits never makes
+   * the channel; `ls /bin | head -3` made one the moment the shell waited for
+   * a child, and then node sat there with the pipeline's output already
+   * written and every process reaped. The run looked like a hang and was
+   * really a finished program the host would not let go of.
+   *
+   * Not `unref()`, which node's ports do have: unref'd, the channel stops
+   * being a reason to stay alive *while the run is still using it*, and a
+   * parent between ticks with no child running would have nothing ref'd at
+   * all. Closing it after the run is over says the right thing.
+   */
+  close() {
+    if (this.#tick) {
+      this.#tick.port1.close();
+      this.#tick.port2.close();
+      this.#tick = null;
+    }
+  }
+
   get shim() { return this.#shim; }
 
   /**

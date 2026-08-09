@@ -2822,8 +2822,14 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             nr::OPENAT | nr::UNLINKAT | nr::RENAMEAT => Some(path(g(1))),
             _ => None,
         };
+        // The pid, not only the thread. Every process in a run writes its
+        // trace to the same stderr, so without it a fork is unreadable: two
+        // clones, two execves and a wait4 all appear as one sequence and
+        // there is no way to say which process is waiting for which. That is
+        // what made #88 take three passes to localise.
+        let whose_pid = with_host(|h| h.kernel.pid);
         trace_line(&format!(
-            "[gex] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} ...\n",
+            "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} ...\n",
             gex_kernel::syscalls::syscall_name(n),
             g(0),
             g(1),
