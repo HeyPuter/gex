@@ -369,6 +369,43 @@ measurement, which is weaker than this file's usual standard and is flagged
 here as such. Re-run it on a quiet machine, interleaving the two sides
 within one run rather than one after the other, before believing any number.
 
+## Register liveness across block edges: worked out, not built
+
+Added 2026-08-09. The flush is the largest measured category -- 17% of gzip's
+emitted bytes, 17% of bash's, 18% of perl's -- and it is in the one bucket
+this file says actually pays. The obvious attack is a liveness fixpoint over
+the object's whole CFG: at a direct branch to a known block, flush only the
+registers that block or its successors read. Ahead-of-time translation is
+what makes it possible, so it looks like the flagship optimisation.
+
+It is worth much less than it looks, for two reasons, and both are visible
+without writing it.
+
+**Every `ret` is an unknown target.** Liveness is a backward analysis, so a
+block whose successor is unknown has `live_out = ALL`, and that floods
+backwards through the function. gzip has 138 `ret`s and 85 `br`s among 3286
+blocks -- roughly one indirect terminator per fourteen -- so almost no block
+is far enough from one to keep a small live set. Bounding `live_out` at a
+`ret` means asserting AAPCS: caller-saved registers are dead across a return.
+That is false for `ret`-as-indirect-jump, which is a real idiom in resolvers
+and trampolines, and this project has already been bitten once by assuming a
+computed branch behaves like a structured one.
+
+**The flush is already minimal.** It writes *dirty* registers only -- ones
+this block actually wrote. A basic block writes two to four. So liveness
+cannot remove a flush that a block needed; it can only remove a **dead
+store**, where a block computes a register that nothing downstream reads.
+Those exist but they are a minority of two-to-four.
+
+So the 17% is not 17% of removable work. It is 3286 blocks each storing the
+handful of registers they genuinely changed, which is close to the floor for
+a design where a block boundary is a function boundary.
+
+What would actually move it is not liveness but making fewer boundaries:
+regions already do that and cover about 1% of blocks, and `region.rs` records
+four attempts at more coverage that all measured worse. That is the honest
+place to push, and it is a harder problem than dataflow.
+
 # The test an item has to pass
 
 Added 2026-08-09, after one item on this list measured at exactly zero for a
