@@ -19,7 +19,7 @@
 
 #![forbid(unsafe_code)]
 
-use gex_emit::module::Linkage;
+pub use gex_emit::module::Linkage;
 pub use gex_emit::module::Metadata;
 /// Turn the per-block stack-pointer check on, for a host with no environment
 /// to read `GEX_CHECK_SP` from. See `gex_emit::tier1::set_check_sp`.
@@ -67,6 +67,15 @@ pub struct Options {
     /// Declare the imported memory shared. Off only for a single-threaded
     /// build whose host cannot import a shared memory.
     pub shared_memory: bool,
+    /// Whether this module declares the memory and dispatch table or imports
+    /// them.
+    ///
+    /// One module in a program owns them and the rest join it. That is already
+    /// how runtime translation works; a whole-closure build needs the same
+    /// distinction ahead of time, because a program is an executable *and* the
+    /// libraries it was placed alongside, and only one of them can declare the
+    /// address space they share.
+    pub linkage: Linkage,
 }
 
 impl Default for Options {
@@ -81,6 +90,7 @@ impl Default for Options {
             exhaustive: false,
             lazy: false,
             shared_memory: true,
+            linkage: Linkage::Own,
         }
     }
 }
@@ -329,7 +339,7 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     let view = CodeView::new(image);
     let (text_lo, text_hi) = image.text_range;
     let mut builder =
-        ModuleBuilder::with_linkage(text_lo, text_hi - text_lo, Linkage::Own, opts.shared_memory);
+        ModuleBuilder::with_linkage(text_lo, text_hi - text_lo, opts.linkage, opts.shared_memory);
     let mut stats = Stats::default();
 
     // Collect entry points. A BTreeSet keeps translation order deterministic,

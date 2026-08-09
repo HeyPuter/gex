@@ -63,7 +63,12 @@ usage:
                                    for a single-threaded host;
                                    --no-validate: write the module even if it
                                    is not valid wasm, for inspecting one that
-                                   is not)
+                                   is not;
+                                   --closure --sysroot DIR: translate the
+                                   program *and* every object it reaches
+                                   through DT_NEEDED, each at the base a
+                                   pinned run places it, writing one module
+                                   per object and the layout beside them)
   gexc seed   -o <out.wasm>        write a module that translates nothing, for
                                    a host that will translate at runtime and
                                    does not know the program in advance
@@ -375,6 +380,8 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut exhaustive = false;
     let mut shared_memory = true;
     let mut no_validate = false;
+    let mut closure = false;
+    let mut sysroot: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -391,6 +398,16 @@ fn cmd_build(args: &[String]) -> Result<()> {
             "--no-shared-memory" => shared_memory = false,
             // Only for looking at a module that is known not to validate.
             "--no-validate" => no_validate = true,
+            // Translate the whole program: the executable *and* every object
+            // it reaches through DT_NEEDED, each at the base a pinned run
+            // will place it. Without this a build translates the image it is
+            // handed, which on a normally linked program is the wrapper --
+            // `apt-get` is 36 KiB in front of a 9,775 KiB closure.
+            "--closure" => closure = true,
+            "--sysroot" => {
+                i += 1;
+                sysroot = Some(args.get(i).context("--sysroot needs a directory")?.clone());
+            }
             other => path = Some(other.to_string()),
         }
         i += 1;
@@ -398,6 +415,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let path = path.context("expected an input ELF")?;
     let out = out.unwrap_or_else(|| format!("{path}.wasm"));
 
+    if closure {
+        return build_closure(&path, sysroot.as_deref(), &out, exhaustive, shared_memory, no_validate);
+    }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
     let (module, stats) = gex_xlate::translate_image(
@@ -488,6 +508,138 @@ fn cmd_build(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Translate a program and every object it links against.
+///
+/// One module per object, all of them placed where a pinned run will put
+/// them: the executable declares the memory and the dispatch table, and every
+/// library imports them, which is the same division runtime translation
+/// already makes between the image module and the ones it adds later.
+///
+/// `out.wasm` is the executable and `out.NN.name.wasm` each library, with
+/// `out.pins` the layout they were built for. A run given anything else than
+/// that layout is running code compiled for addresses it is not at, so the
+/// manifest travels with the modules rather than being reconstructable.
+fn build_closure(
+    path: &str,
+    sysroot: Option<&str>,
+    out: &str,
+    exhaustive: bool,
+    shared_memory: bool,
+    no_validate: bool,
+) -> Result<()> {
+    let (closure, interp) = closure_of(path, sysroot)?;
+    for (name, asker) in &closure.missing {
+        eprintln!("gexc: {name} not found, needed by {asker} -- the build will be incomplete");
+    }
+    let stem = out.strip_suffix(".wasm").unwrap_or(out);
+    let mut pins = String::new();
+    let (mut blocks, mut insts, mut bytes_total) = (0usize, 0usize, 0usize);
+
+    for (n, o) in closure.objects.iter().enumerate() {
+        let opts = Options {
+            exhaustive,
+            shared_memory,
+            // The first object is the executable and owns the address space.
+            linkage: if n == 0 {
+                gex_xlate::Linkage::Own
+            } else {
+                gex_xlate::Linkage::Shared
+            },
+            ..Options::default()
+        };
+        let (module, stats) = gex_xlate::translate_image(&o.image, &opts);
+        let file = if n == 0 {
+            format!("{stem}.wasm")
+        } else {
+            format!("{stem}.{n:02}.{}.wasm", o.name)
+        };
+        std::fs::write(&file, &module.wasm).with_context(|| format!("writing {file}"))?;
+        if !no_validate {
+            gex_native::validate_module(&module.wasm)
+                .with_context(|| format!("{file} is not valid wasm"))?;
+        }
+        // The interpreter is placed by gex's own loader, not by `mmap`, so
+        // there is no reservation to pin and a line for it would only ever be
+        // reported as never reserved.
+        if n > 0 && Some(o.path.as_str()) != interp.as_deref() {
+            pins.push_str(&format!("{:#x} {}\n", o.image.bias, o.path));
+        }
+        blocks += stats.blocks;
+        insts += stats.instructions;
+        bytes_total += stats.wasm_bytes;
+        eprintln!(
+            "  {:<40} {:>7} blocks {:>7} KiB  at {:#x}",
+            o.name,
+            stats.blocks,
+            stats.wasm_bytes / 1024,
+            o.image.bias,
+        );
+    }
+    let pin_file = format!("{stem}.pins");
+    std::fs::write(&pin_file, pins).with_context(|| format!("writing {pin_file}"))?;
+    eprintln!(
+        "{} objects: {} blocks, {} guest instructions, {} KiB wasm; layout in {}",
+        closure.objects.len(),
+        blocks,
+        insts,
+        bytes_total / 1024,
+        pin_file,
+    );
+    Ok(())
+}
+
+/// Where the next object in a closure goes.
+///
+/// Placed *up* from the bottom of the arena rather than down from its top.
+/// Down from the top is where the ordinary allocator goes, and the loader
+/// gets there first: a trace shows `ld.so` taking 8 KiB at 0x7fffe000 for its
+/// own bookkeeping before it reserves anything for libc. A pin into that
+/// region is not free, the address hint is dropped, and the object lands
+/// somewhere else -- silently, until `--pin` reports it.
+///
+/// `ld.so` does not ask for the span either. It asks for the span plus up to
+/// one maximum-alignment of slack, maps the segments MAP_FIXED inside, and
+/// trims both ends: 0x1af000 of libc image against a 0x1be060 reservation. So
+/// the gap covers the slack, and the base is 64 KiB aligned -- the largest
+/// `p_align` these objects use -- which makes `ld.so`'s rounding of the
+/// reservation a no-op and the load bias the address that was pinned.
+fn place_object(next: &mut u64, span: u64) -> u64 {
+    const SLACK: u64 = 0x10000;
+    let base = (*next + SLACK - 1) & !(SLACK - 1);
+    *next = base + ((span + SLACK - 1) & !(SLACK - 1)) + SLACK;
+    base
+}
+
+/// Resolve a program's closure with the standard placement.
+fn closure_of(
+    path: &str,
+    sysroot: Option<&str>,
+) -> Result<(gex_ld::closure::Closure, Option<String>)> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+    let root = sysroot.map(str::to_string);
+    let read = move |p: &str| -> Option<Vec<u8>> {
+        let r = root.as_deref()?;
+        std::fs::read(format!(
+            "{}/{}",
+            r.trim_end_matches('/'),
+            p.trim_start_matches('/')
+        ))
+        .ok()
+    };
+    let exe = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    let interp = exe.interp.clone();
+    let guest_path = match sysroot {
+        Some(r) => path.strip_prefix(r.trim_end_matches('/')).unwrap_or(path).to_string(),
+        None => path.to_string(),
+    };
+    let mut next = gex_abi::MMAP_BOTTOM;
+    let mut place = |span: u64| place_object(&mut next, span);
+    Ok((
+        gex_ld::closure::resolve(exe, &guest_path, &read, &mut place)?,
+        interp,
+    ))
+}
+
 /// Report the transitive `DT_NEEDED` closure of a program.
 ///
 /// This exists because `gexc build` translates the image it is handed and
@@ -555,13 +707,8 @@ fn cmd_closure(args: &[String]) -> Result<()> {
     // report says so. Starting at the bottom keeps pinned objects out of the
     // way of everything the allocator does, because it fills from the far
     // end and a whole program's libraries are a few tens of megabytes.
-    const SLACK: u64 = 0x10000;
     let mut next = gex_abi::MMAP_BOTTOM;
-    let mut place = |span: u64| -> u64 {
-        let base = (next + SLACK - 1) & !(SLACK - 1);
-        next = base + ((span + SLACK - 1) & !(SLACK - 1)) + SLACK;
-        base
-    };
+    let mut place = |span: u64| place_object(&mut next, span);
     // What `$ORIGIN` is relative to: the executable's path *in the guest*,
     // which inside a sysroot is the host path with the prefix taken off.
     let guest_path = match &sysroot {
