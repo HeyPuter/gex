@@ -515,6 +515,62 @@ a compiler -- are at the STRING SORT end.
 every access has a different address, so this is not redundancy V8 can
 collapse -- it must emit all eight instructions, every time.
 
+## The indirect-dispatch path is not a cost, and sections 21 and 23 are dead
+
+Added 2026-08-09. Sections 21 and 22 sit at number two on the ranked list --
+"the highest-value dispatch change available", on the reasoning that `ret`
+takes the full indirect path and `ret` is a large share of indirect branches.
+That reasoning counts instructions, which is the mistake this file has now
+made three times. So it was priced first, and it is worth nothing.
+
+`GEX_DISPATCH_BALLAST=N` adds N load-and-store pairs to every indirect
+dispatch: a load from the dispatch directory beside the entry the path is
+about to read -- the same cache line, so the cheapest extra load there is and
+therefore a lower bound -- and a store into `ctx::BALLAST`, a slot nothing
+reads. The store is what makes it survive: an engine may delete a load whose
+value goes nowhere and may not delete a store, because it cannot prove nobody
+reads the address.
+
+perl, statically recompiled, `GEX_TIME_GUEST` around `gex.run`:
+
+    N=4    9 pairs   median ratio 1.133   4 of 7 favour A   p = 1.000
+    N=16   9 pairs   median ratio 0.897   5 of 9 favour B   p = 1.000
+
+Both unreadable, and -- more informative than either -- *four times the added
+work moved the estimate the other way*. That is what a perturbation below the
+noise floor looks like.
+
+So a positive control, to be sure the ballast executes at all. N=256 doubles
+the module, 17.8 MB to 37.5 MB, which proves it is emitted:
+
+    plain 6077ms   ballast256 7460ms
+    plain 6434ms   ballast256 6582ms
+    plain 6539ms   ballast256 6933ms      median about +6%
+
+**Five hundred and twelve memory operations on every indirect dispatch cost
+six per cent.** The real dispatch path is one directory load and about
+eighteen ALU operations -- three pair-units, generously. Removing all of it,
+on every indirect branch, is worth something like 0.1%, and that is an
+overestimate: at N=256 the module is twice the size, so part of the 6% is
+instruction cache and V8's compiler rather than executed work.
+
+Why so cheap, when perl is an interpreter and interpreters dispatch? Because
+most of perl's control flow never reaches this path. A branch to a constant
+target inside the same module is a `return_call` (`jump_to_constant`), a loop
+is fused, and a region branches among its members with a `br_table` over
+locals. `emit_dispatch_tail_call` is left with genuinely computed branches
+and cross-module calls, and those are rarer than the story suggests.
+
+That kills sections 21, 22 and 23 as performance work, and section 24 and
+section 77 with them: they all make the same path cheaper. It does not kill
+the *correctness* reasons to want them.
+
+The instrument generalises, and that is the part worth keeping. Any path can
+be priced before it is optimised, by adding work an optimiser may not remove
+and measuring the slope. Do that first, every time. Three items on this list
+have now been built or half-built before being priced -- guard caching,
+memory64, and nearly this -- and all three were worth nothing.
+
 ## memory64: built, measured, and deleted
 
 Section 16(d) proposed a 64-bit guest memory so the engine's own bounds
@@ -588,8 +644,10 @@ fraction of the program chases pointers, not 62%.
 
 1. **`cmp`+`b.cond` fusion** (§1–4) — largest pure-codegen win, touches every
    block.
-2. **Return-address stack + indirect inline caches** (§21–22) — PLAN specifies
-   both; `ret` is the hottest indirect branch in any program.
+2. ~~**Return-address stack + indirect inline caches** (§21–22)~~ — **dead.**
+   Priced with `GEX_DISPATCH_BALLAST`: 512 memory operations on every indirect
+   dispatch cost 6% of perl, so removing the whole path is worth about 0.1%.
+   §23, §24 and §77 die with it.
 3. **Browser code cache in IndexedDB** (§49) — not codegen, likely the largest
    user-visible improvement.
 4. **Library-call substitution** (§71) — beats codegen on exactly the kernels

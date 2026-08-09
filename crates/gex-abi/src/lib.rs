@@ -210,6 +210,16 @@ pub mod ctx {
     /// Guest thread id, as reported by `gettid`.
     pub const TID: usize = 42 * 8;
 
+    /// A slot nothing reads, for measurement only.
+    ///
+    /// `GEX_DISPATCH_BALLAST` adds load-and-store pairs to the indirect
+    /// dispatch path and puts the loaded value here. A store is the one thing
+    /// an engine may not delete -- it cannot prove nobody reads the address --
+    /// so this is work that definitely happens, and the slope of run time
+    /// against the number of pairs is how much a program cares about work on
+    /// that path. See `emit_dispatch_tail_call`.
+    pub const BALLAST: usize = 43 * 8;
+
     /// `v0`–`v31`, 16 bytes each. Reserved now so the layout does not move
     /// when NEON lands (PLAN M2).
     pub const V: usize = 48 * 8;

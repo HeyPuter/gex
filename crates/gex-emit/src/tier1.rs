@@ -2342,8 +2342,56 @@ impl<'a> Emitter<'a> {
     /// inside one.
     fn emit_dispatch_tail_call(&mut self) {
         let before = self.f.code.len();
+        self.emit_ballast();
         self.emit_dispatch_tail_call_inner();
         DISPATCH_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
+    }
+
+    /// How many load-and-store pairs `GEX_DISPATCH_BALLAST` asks for.
+    fn ballast() -> usize {
+        use std::sync::OnceLock;
+        static N: OnceLock<usize> = OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("GEX_DISPATCH_BALLAST")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    /// Work on the indirect-dispatch path that does nothing, for measurement.
+    ///
+    /// The question this answers is the one that should have been asked before
+    /// memory64 was built: *does this program care about the dispatch path at
+    /// all?* Ranking §21 by how many instructions it removes is ranking by
+    /// emitted bytes, and this file has already been wrong that way twice.
+    ///
+    /// Each pair is a load from the dispatch directory near the entry this
+    /// path is about to read -- so the same cache line, which makes it the
+    /// *cheapest* possible extra load and therefore a lower bound -- and a
+    /// store of the result into a context slot nothing reads. The store is
+    /// what makes it survive: an engine may delete a load whose value goes
+    /// nowhere, and may not delete a store, because it cannot prove nobody
+    /// reads the address.
+    ///
+    /// The slope of run time against `GEX_DISPATCH_BALLAST` is the answer. A
+    /// flat slope means no dispatch change can pay, whatever it removes.
+    fn emit_ballast(&mut self) {
+        let n = Self::ballast();
+        if n == 0 {
+            return;
+        }
+        for i in 0..n {
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(self.scratch_i64);
+            self.f.i64_const(DISPATCH_PAGE.trailing_zeros() as i64);
+            self.f.byte(0x88); // i64.shr_u
+            self.f.byte(0xa7); // i32.wrap_i64
+            self.f.i32_const(4);
+            self.f.byte(0x6c); // i32.mul
+            self.f.load(0x28, 2, DISPATCH_DIR as u32 + 4 * (i as u32 + 1));
+            self.f.store(0x36, 2, ctx::BALLAST as u32);
+        }
     }
 
     fn emit_dispatch_tail_call_inner(&mut self) {
