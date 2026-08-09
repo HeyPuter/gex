@@ -40,8 +40,42 @@ fn inline_fma() -> bool {
 pub const INST_BYTES: u64 = 4;
 
 /// Lifting state for one basic block.
+/// What the condition flags hold, when it is something a branch can ask for
+/// directly instead of reading them.
+///
+/// AArch64's most common two instructions in sequence are a comparison and a
+/// conditional branch, and the flags between them are almost always dead
+/// afterwards. Lifting them literally costs about eight wasm operations --
+/// materialise N as `r >> 63`, V as four operations of overflow algebra, then
+/// compare the two for equality -- where `i64.lt_s` is one. Remembering what
+/// the flags were computed *from* lets the branch ask the original question.
+///
+/// This is TCG's `cc_op` in the small: the flag writes still happen, because
+/// a successor block may read them, but nothing in this block reads them
+/// back, so dead-store elimination and cross-block flag liveness can delete
+/// the arithmetic that produced them.
+///
+/// Every write to N, Z, C or V must update this, and the ones that cannot be
+/// described set [`FlagSource::Unknown`]. A stale source would compile a
+/// branch on the wrong question, so the rule is that flags are unknown until
+/// something says otherwise -- a block starts that way, because its
+/// predecessor is not known here.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum FlagSource {
+    #[default]
+    Unknown,
+    /// NZCV are those of `a - b` at width `ty`, which is what `cmp`, `subs`
+    /// and `cmn`-with-negation leave behind.
+    Sub { a: Value, b: Value, ty: Ty },
+    /// N and Z are those of `v`, and C and V are zero: the logical-op rule.
+    Logic { v: Value, ty: Ty },
+}
+
 pub struct Lifter<'a> {
     b: &'a mut Builder,
+    /// What the flags mean right now. Carried in and out across the
+    /// instructions of one block.
+    flags: FlagSource,
     /// The instruction word being lifted.
     ///
     /// Only the decoder needs this normally, but an instruction the lifter has
@@ -50,6 +84,22 @@ pub struct Lifter<'a> {
     /// instead of a missing instruction. That happened: `ushl` reported itself
     /// as a zero word in the middle of libpython.
     raw: u32,
+}
+
+/// The comparison that is true exactly when this one is false.
+fn invert_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::Ne,
+        CmpOp::Ne => CmpOp::Eq,
+        CmpOp::LtU => CmpOp::GeU,
+        CmpOp::GeU => CmpOp::LtU,
+        CmpOp::LeU => CmpOp::GtU,
+        CmpOp::GtU => CmpOp::LeU,
+        CmpOp::LtS => CmpOp::GeS,
+        CmpOp::GeS => CmpOp::LtS,
+        CmpOp::LeS => CmpOp::GtS,
+        CmpOp::GtS => CmpOp::LeS,
+    }
 }
 
 /// What the lifter decided about control flow after one instruction.
@@ -116,7 +166,22 @@ struct Address {
 
 impl<'a> Lifter<'a> {
     pub fn new(b: &'a mut Builder) -> Lifter<'a> {
-        Lifter { b, raw: 0 }
+        Lifter {
+            b,
+            raw: 0,
+            flags: FlagSource::Unknown,
+        }
+    }
+
+    /// What the previous instruction in this block left the flags meaning.
+    pub fn with_flags(mut self, flags: FlagSource) -> Lifter<'a> {
+        self.flags = flags;
+        self
+    }
+
+    /// What this instruction leaves them meaning, for the next one.
+    pub fn flags(&self) -> FlagSource {
+        self.flags
     }
 
     /// The word `lift` is about to be given, so a SIGILL can name it.
@@ -261,6 +326,8 @@ impl<'a> Lifter<'a> {
     }
 
     fn set_nzcv(&mut self, r: &AddResult) {
+        // The default. `add_sub` knows the operands and says so afterwards.
+        self.flags = FlagSource::Unknown;
         self.b.write(GuestReg::N, r.n);
         self.b.write(GuestReg::Z, r.z);
         self.b.write(GuestReg::C, r.c);
@@ -277,12 +344,16 @@ impl<'a> Lifter<'a> {
         self.b.write(GuestReg::Z, z);
         self.b.write(GuestReg::C, zero32);
         self.b.write(GuestReg::V, zero32);
+        self.flags = FlagSource::Logic { v: value, ty };
     }
 
     /// Evaluate a condition code against the current flags, as an `I32` bool.
     fn eval_cond(&mut self, cond: Cond) -> Value {
         if cond.is_always() {
             return self.b.const_i32(1);
+        }
+        if let Some(v) = self.cond_direct(cond) {
+            return v;
         }
         let base = cond.0 >> 1;
         let invert = cond.0 & 1 == 1;
@@ -319,6 +390,52 @@ impl<'a> Lifter<'a> {
             self.b.bin(BinOp::Xor, Ty::I32, v, one)
         } else {
             v
+        }
+    }
+
+    /// The condition as a question about the values the flags came from.
+    ///
+    /// `None` when the flags are not something this can rewrite, and the
+    /// caller falls back to reading N, Z, C and V.
+    ///
+    /// The unsigned pairs are the ones worth double-checking: after `subs`,
+    /// AArch64's carry flag is *not borrow*, so C set means `a >= b`
+    /// unsigned, and HI -- C set and Z clear -- is `a > b`.
+    fn cond_direct(&mut self, cond: Cond) -> Option<Value> {
+        match self.flags {
+            FlagSource::Unknown => None,
+            FlagSource::Sub { a, b, ty } => {
+                let op = match cond.0 >> 1 {
+                    0b000 => CmpOp::Eq,  // EQ
+                    0b001 => CmpOp::GeU, // CS/HS
+                    0b100 => CmpOp::GtU, // HI
+                    0b101 => CmpOp::GeS, // GE
+                    0b110 => CmpOp::GtS, // GT
+                    // MI, PL, VS and VC are about the difference itself
+                    // rather than an ordering, and have no such form.
+                    _ => return None,
+                };
+                let op = if cond.0 & 1 == 1 { invert_cmp(op) } else { op };
+                Some(self.b.cmp(op, ty, a, b))
+            }
+            FlagSource::Logic { v, ty } => {
+                // C and V are zero, so four of the eight are constants.
+                let op = match cond.0 >> 1 {
+                    0b000 => CmpOp::Eq,  // EQ: v == 0
+                    0b010 => CmpOp::LtS, // MI: v < 0
+                    0b101 => CmpOp::GeS, // GE: N == V, and V is 0
+                    0b110 => CmpOp::GtS, // GT: v > 0
+                    0b001 | 0b011 | 0b100 => {
+                        // CS is false, VS is false, HI is false -- and each
+                        // inverse is true.
+                        return Some(self.b.const_i32(u32::from(cond.0 & 1 == 1)));
+                    }
+                    _ => return None,
+                };
+                let op = if cond.0 & 1 == 1 { invert_cmp(op) } else { op };
+                let zero = self.konst(ty, 0);
+                Some(self.b.cmp(op, ty, v, zero))
+            }
         }
     }
 
@@ -723,6 +840,9 @@ impl<'a> Lifter<'a> {
                 let z = self.b.select(c, r.z, alt_z, Ty::I32);
                 let cf = self.b.select(c, r.c, alt_c, Ty::I32);
                 let vf = self.b.select(c, r.v, alt_v, Ty::I32);
+                // A select between a comparison and a literal NZCV is not a
+                // comparison, so the next branch reads the flags.
+                self.flags = FlagSource::Unknown;
                 self.b.write(GuestReg::N, n);
                 self.b.write(GuestReg::Z, z);
                 self.b.write(GuestReg::C, cf);
@@ -1692,6 +1812,9 @@ impl<'a> Lifter<'a> {
                 // greater -> 0010, unordered -> 0011. That is exactly
                 // N = lt, Z = eq, C = NOT lt, V = unordered.
                 let (n, z, c, v) = self.fp_compare_flags(double, a, b);
+                // Floating-point NZCV does not follow the integer rule --
+                // unordered sets C and V -- so it gets no shortcut.
+                self.flags = FlagSource::Unknown;
                 self.b.write(GuestReg::N, n);
                 self.b.write(GuestReg::Z, z);
                 self.b.write(GuestReg::C, c);
@@ -2374,6 +2497,9 @@ impl<'a> Lifter<'a> {
                 let b = self.rd_fp(vm, sz);
                 let (n, z, c, v) = self.fp_compare_flags(double, a, b);
                 let taken = self.eval_cond(cond);
+                // Read the condition first, then forget: this writes all four
+                // flags from a floating-point comparison or a literal.
+                self.flags = FlagSource::Unknown;
                 let alt = [
                     (nzcv >> 3) as u32 & 1,
                     (nzcv >> 2) as u32 & 1,
@@ -3764,6 +3890,12 @@ impl<'a> Lifter<'a> {
         let r = self.add_with_carry(ty, a, operand, carry);
         self.wr_gp(rd, sz, r.value);
         self.set_nzcv(&r);
+        // After the writes, because `set_nzcv` clears it. `b` here is the
+        // original second operand: the negation the carry rule needs is
+        // `operand`, and asking "is a less than NOT b" would be nonsense.
+        if op == AddOp::Sub {
+            self.flags = FlagSource::Sub { a, b, ty };
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4141,6 +4273,7 @@ impl<'a> Lifter<'a> {
         match sysreg {
             SysReg::TpidrEl0 => self.b.write(GuestReg::Tpidr, v),
             SysReg::Nzcv => {
+                self.flags = FlagSource::Unknown;
                 let one = self.b.const_i64(1);
                 for (shift, reg) in [
                     (31u64, GuestReg::N),

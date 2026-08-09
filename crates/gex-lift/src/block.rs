@@ -1,6 +1,6 @@
 //! Assembling decoded instructions into a GIR basic block.
 
-use crate::{Flow, Lifter, INST_BYTES};
+use crate::{FlagSource, Flow, Lifter, INST_BYTES};
 use gex_ir::{pass, Block, Builder, Term};
 use gex_isa::decode;
 
@@ -32,6 +32,9 @@ pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockL
     let mut builder = Builder::new(start);
     let mut pc = start;
     let mut term = None;
+    // A block is entered from somewhere this cannot see, so it starts
+    // knowing nothing about the flags. See `FlagSource`.
+    let mut flags = FlagSource::Unknown;
 
     for _ in 0..limits.max_insts {
         let Some(raw) = fetch(pc) else {
@@ -40,8 +43,9 @@ pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockL
         };
         let inst = decode(raw, pc);
         let mark = builder.mark();
-        let mut lifter = Lifter::new(&mut builder).with_raw(raw);
+        let mut lifter = Lifter::new(&mut builder).with_raw(raw).with_flags(flags);
         let flow = lifter.lift(&inst, pc);
+        flags = lifter.flags();
         // An instruction the backend has no wasm form for is undone and
         // becomes a SIGILL here, where the preceding instructions have
         // already run. Exhaustive discovery decodes literal pools and
@@ -77,6 +81,69 @@ pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockL
 mod tests {
     use super::*;
     use gex_ir::{print, GuestReg, Stmt};
+
+    /// `cmp x0, x1` followed by `b.<cc>`, for every condition the fusion
+    /// claims to handle.
+    ///
+    /// The check is that nothing reads N, Z, C or V afterwards: the branch
+    /// asks about x0 and x1 directly, so the four flag writes are dead and
+    /// the passes can take the overflow algebra with them. MI, PL, VS and VC
+    /// are absent on purpose -- they ask about the difference rather than an
+    /// ordering, and still go the long way.
+    #[test]
+    fn compare_and_branch_does_not_read_the_flags() {
+        for cc in [
+            0b0000u32, 0b0001, 0b0010, 0b0011, 0b1000, 0b1001, 0b1010, 0b1011, 0b1100, 0b1101,
+        ] {
+            let code = vec![0xeb01001f_u32, 0x54000040 | cc];
+            let base = 0x1000u64;
+            let fetch = |pc: u64| -> Option<u32> {
+                if pc < base {
+                    return None;
+                }
+                code.get(((pc - base) / 4) as usize).copied()
+            };
+            let block = lift_block(fetch, base, BlockLimits::default());
+            let reads_flag = block.stmts.iter().any(|s| {
+                matches!(
+                    s,
+                    Stmt::Def {
+                        expr: gex_ir::Expr::ReadReg(
+                            GuestReg::N | GuestReg::Z | GuestReg::C | GuestReg::V
+                        ),
+                        ..
+                    }
+                )
+            });
+            assert!(!reads_flag, "condition {cc:#06b} still reads a flag");
+        }
+    }
+
+    /// The same, for the logical-op rule: `ands x0, x0, x1` sets N and Z from
+    /// the result and clears C and V, so `b.eq` is `result == 0`.
+    #[test]
+    fn logical_and_branch_does_not_read_the_flags() {
+        let code = vec![0xea010000_u32, 0x54000040];
+        let base = 0x1000u64;
+        let fetch = |pc: u64| -> Option<u32> {
+            if pc < base {
+                return None;
+            }
+            code.get(((pc - base) / 4) as usize).copied()
+        };
+        let block = lift_block(fetch, base, BlockLimits::default());
+        assert!(!block.stmts.iter().any(|s| {
+            matches!(
+                s,
+                Stmt::Def {
+                    expr: gex_ir::Expr::ReadReg(
+                        GuestReg::N | GuestReg::Z | GuestReg::C | GuestReg::V
+                    ),
+                    ..
+                }
+            )
+        }));
+    }
 
     /// Build a fetch closure over a slice of instruction words at `base`.
     fn words(base: u64, code: &'static [u32]) -> impl Fn(u64) -> Option<u32> {
