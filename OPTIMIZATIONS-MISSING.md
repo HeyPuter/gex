@@ -1163,3 +1163,83 @@ starts at 128 MiB and grows as files arrive. A 396 MB rootfs loads.
 
 That leaves exactly one thing between `apt-get update` and a browser, and it
 is the `free(2)` above.
+
+### Diffing the two hosts, syscall by syscall
+
+Now that native finishes and the browser does not, the two can be diffed
+directly. Both were traced on the same rootfs and apt's `file` method -- pid 4
+in both -- was aligned call by call, ignoring `mmap`/`munmap`/`mprotect`/`brk`
+because placement legitimately differs.
+
+**The first 148 calls are identical**, name, path and return value. That is
+the whole of `ld.so`, libgcrypt's initialisation, the capability drop, and
+apt's handshake. Then the method reads apt's configuration message and gets
+5,534 bytes natively against 5,520 in the browser -- fourteen short.
+
+Fourteen bytes looked like a pipe losing data, which would have explained
+everything. It is not. Dumping both blobs with
+`-o Debug::pkgAcquire::Worker=1` and diffing them line by line, the only
+difference is
+
+    CommandLine::AsString=/tmp/apt-small/usr/bin/apt-get ...   (native)
+    CommandLine::AsString=/usr/bin/apt-get ...                 (browser)
+
+which is `/tmp/apt-small`, exactly fourteen characters, and an artefact of
+invoking the native host with a host path and the browser host with `argv0`.
+The configurations are otherwise byte-identical. The method receives the same
+input on both hosts and crashes on only one.
+
+Two more things the diff settled:
+
+- The `/usr/bin/xz` stat is not the trigger. Native performs it **eight
+  times** and carries on; the browser does it once and dies.
+- The crash moves. With `-o Debug::pkgAcquire::Worker=1` -- which changes
+  nothing but the length of a string -- it stops being a trap at the `xz`
+  stat and becomes one inside `read`, at a different address, with a mapped
+  pointer. A fault that moves when an unrelated allocation moves is
+  corruption, not a wrong branch.
+
+So the difference is in how the browser *executes* what both hosts agree on.
+The hosts share the lifter and the kernel; what they do not share is the
+backend. Native goes through Cranelift, the browser emits wasm from tier-1.
+That makes a tier-1 codegen bug the standing suspect, and the closure is the
+instrument: `gexc` runs the emitter in a normal process, where
+`GEX_NO_LOOP_FUSION`, `GEX_NO_FLAG_LIVENESS` and `GEX_REGION` can be turned
+off one at a time and the resulting closure run in the browser. A closure
+built `--exhaustive` also answers a prior question -- whether the fault is in
+runtime translation at all -- because a run against one translates nothing.
+
+### The statically recompiled apt does not crash
+
+That last experiment answered it, and the answer is the best one available.
+
+`apt-get update` in the browser host, against apt's nineteen-object closure
+built `--exhaustive`:
+
+    [gex] pid 3:  28ms translating   280 blocks     (was 15,733, and a crash)
+    Get:1 file:/repo ./ InRelease [419 B]
+    Ign:1 file:/repo ./ InRelease
+    Get:2 file:/repo ./ Release [419 B]
+    Get:3 file:/repo ./ Release.gpg
+    Ign:3 file:/repo ./ Release.gpg
+    Get:4 file:/repo ./ Packages [587 kB]
+    Reading package lists...
+
+Nine processes, every pin landing, no trap. The `file` method -- which had
+died in `free` on every previous browser run -- fetches all four URIs and
+apt goes on to parse the index. The same host, the same rootfs, the same
+apt: the only change is that the code was translated ahead of time instead
+of at runtime.
+
+So the fault is in runtime translation, and the statically recompiled code
+is *correct where the JIT's is not*. That is worth stating plainly, because
+it is the project's own thesis arriving from an unexpected direction: static
+recompilation has been argued for on speed, and here it is the thing that
+makes a real program run at all.
+
+It also narrows the remaining bug to something the runtime translator does
+and `gexc` does not, on identical input, through the same lifter and the same
+emitter. The obvious candidates are what differs between the two paths rather
+than anything in codegen itself: block discovery from a cold start against
+whole-object discovery, the dispatch slots a miss allocates, and the module
+boundary a runtime translation draws around a handful of blocks.
