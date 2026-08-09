@@ -547,6 +547,9 @@ export class Gex {
       'k_fs_populate_done',
       'k_pipe_new', 'k_pipe_open_end', 'k_pipe_close_end', 'k_pipe_read',
       'k_pipe_write', 'k_pipe_readable', 'k_pipe_writable', 'k_pipe_buffered',
+      'k_sock_bind', 'k_sock_connect', 'k_sock_accept', 'k_sock_pending',
+      'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable',
+      'k_sock_available', 'k_sock_close', 'k_sock_shutdown', 'k_sock_exists',
     ];
     // Not imported by the shim -- the host reads it after a crash -- so it is
     // not in the list above and its absence is not a link error.

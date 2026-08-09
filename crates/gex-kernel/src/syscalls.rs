@@ -270,7 +270,14 @@ pub enum BlockOp {
     /// An `accept` on a listener with nothing waiting. The host only waits;
     /// the descriptor is made by the kernel afterwards, because only the
     /// kernel has a descriptor table. See `Kernel::retry_accept`.
-    AcceptWait { socket: Arc<unix::UnixSocket> },
+    ///
+    /// A `FileHandle` rather than a `UnixSocket`, because the socket may be
+    /// in the global kernel instead of this process -- and what the scheduler
+    /// wants of it is the one question both kinds answer the same way:
+    /// `poll_readable`, which for a listener means a connection is waiting.
+    AcceptWait {
+        socket: Arc<dyn crate::vfs::FileHandle>,
+    },
     /// A `poll` with nothing ready yet. The descriptors travel with it so the
     /// host can ask again without going back through the kernel.
     Poll {
@@ -361,6 +368,14 @@ pub struct Kernel {
     /// address spaces. `None` keeps the local `Pipe`, which is right whenever
     /// every process really is one process. See [`crate::pipe::Remote`].
     pub pipes: Option<crate::pipe::Remote>,
+    /// Where a unix socket lives when its two ends may be in different
+    /// address spaces. `None` keeps the local `UnixSocket`, which is right
+    /// whenever every process really is one process.
+    ///
+    /// It matters for exactly the case the switcher used to hide: an X server
+    /// binds a name in its own Worker and its client, another Worker, looks
+    /// in a name table that has never heard of it. See [`crate::unix::Remote`].
+    pub unix_remote: Option<crate::unix::Remote>,
     /// This process's parent, cached from the table so `getppid` is not a
     /// lock. It never changes for a live process except when the parent dies,
     /// and `getppid` re-reads the table in that case.
@@ -398,6 +413,11 @@ pub struct Kernel {
     pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
     /// The same trick for unix sockets, which are a different concrete type.
     pub unix_sockets: std::collections::HashMap<usize, Arc<unix::UnixSocket>>,
+    /// The same, for the ones that live in the global kernel. Two tables
+    /// rather than a trait object because the calls that need the concrete
+    /// type -- `accept`, `has_pending`, descriptor passing -- are exactly the
+    /// ones the two kinds do not share.
+    pub remote_sockets: std::collections::HashMap<usize, Arc<unix::RemoteUnix>>,
     /// And for epoll sets.
     pub epolls: std::collections::HashMap<usize, Arc<unix::EpollSet>>,
     /// And for anonymous shared files, which have seals.
@@ -908,6 +928,7 @@ impl Kernel {
             live_threads: 1,
             procs: Arc::new(ProcTable::new()),
             pipes: None,
+            unix_remote: None,
             ppid: 0,
             clock: system_clock,
             itimers: [None; 3],
@@ -923,6 +944,7 @@ impl Kernel {
             resolver: Arc::new(net::Resolver::new()),
             sockets: Default::default(),
             unix_sockets: Default::default(),
+            remote_sockets: Default::default(),
             epolls: Default::default(),
             memfds: Default::default(),
             socket_names: Arc::new(unix::SocketNames::new()),
@@ -1126,6 +1148,7 @@ impl Kernel {
             // The table is the system's, not the process's.
             procs: Arc::clone(&self.procs),
             pipes: self.pipes,
+            unix_remote: self.unix_remote,
             ppid: self.pid,
             clock: self.clock,
             // A fork does not inherit its parent's timers.
@@ -1143,6 +1166,7 @@ impl Kernel {
             resolver: Arc::clone(&self.resolver),
             sockets: self.sockets.clone(),
             unix_sockets: self.unix_sockets.clone(),
+            remote_sockets: self.remote_sockets.clone(),
             epolls: self.epolls.clone(),
             memfds: self.memfds.clone(),
             // Named sockets are system-wide: a forked child must still be
@@ -1549,8 +1573,8 @@ impl Kernel {
             }
             nr::ACCEPT | nr::ACCEPT4 => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                let socket = self.unix_of(a[0] as i32).ok()?;
-                if !file.would_block() || socket.has_pending() {
+                let socket: Arc<dyn crate::vfs::FileHandle> = Arc::clone(&file.handle);
+                if !file.would_block() || socket.poll_readable() {
                     return None;
                 }
                 let flags = if n == nr::ACCEPT4 { a[3] } else { 0 };
@@ -1843,7 +1867,12 @@ impl Kernel {
                 Err(Errno::ENOTSOCK) => self.fds.get(a[0] as i32).map(|_| 0),
                 other => other,
             },
-            nr::LISTEN => self.unix_of(a[0] as i32).and_then(|s| s.listen()),
+            // A socket in the global kernel was bound and listening in one
+            // call; there is nothing left for this to do but agree.
+            nr::LISTEN => match self.remote_unix_of(a[0] as i32) {
+                Ok(_) => Ok(0),
+                Err(_) => self.unix_of(a[0] as i32).and_then(|s| s.listen()),
+            },
             nr::ACCEPT => self.sys_unix_accept(m, a[0] as i32, a[1], a[2], 0),
             nr::ACCEPT4 => self.sys_unix_accept(m, a[0] as i32, a[1], a[2], a[3]),
             nr::SOCKETPAIR => self.sys_socketpair(m, a[0], a[1], a[3]),
@@ -3343,6 +3372,35 @@ impl Kernel {
         self.unix_sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
     }
 
+    /// The same for a socket that lives in the global kernel.
+    fn remote_unix_of(&self, fd: i32) -> Result<Arc<unix::RemoteUnix>, Errno> {
+        let file = self.fds.get(fd)?;
+        let key = Arc::as_ptr(&file.handle) as *const () as usize;
+        self.remote_sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+    }
+
+    /// Put a socket that lives in the global kernel at `fd`, replacing
+    /// whatever was there.
+    ///
+    /// Replacing, because a unix socket becomes remote only at `bind` or
+    /// `connect` -- `socket()` has no name to decide by, so the descriptor
+    /// starts as an ordinary local socket and is swapped when its name is
+    /// known.
+    fn install_remote_unix(
+        &mut self,
+        fd: i32,
+        sock: Arc<unix::RemoteUnix>,
+        flags: u64,
+        cloexec: bool,
+    ) -> Result<(), Errno> {
+        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+        self.fds.install(fd, file, cloexec)?;
+        self.remote_sockets.insert(key, sock);
+        Ok(())
+    }
+
     /// Put a unix socket in the descriptor table and remember the concrete
     /// type, the way `sys_socket` does for an internet one.
     fn install_unix(&mut self, sock: Arc<unix::UnixSocket>, flags: u64, cloexec: bool) -> SysResult {
@@ -3649,6 +3707,27 @@ impl Kernel {
         } else {
             self.vfs.absolute(&path)
         };
+        // In the global kernel when there is one, because the client that
+        // will connect is another process -- and with a Worker per process
+        // that is another memory, where a name bound here means nothing.
+        //
+        // Bound and listening in one call: what a guest does between `bind`
+        // and `listen` is local to itself, and what the far end can see is
+        // only whether the name answers.
+        if let Some(r) = self.unix_remote {
+            let id = (r.bind)(path.as_ptr() as u32, path.len() as u32);
+            if id < 0 {
+                return Err(Errno(-id));
+            }
+            let flags = self.fds.get(fd)?.flags();
+            let cloexec = self.fds.cloexec(fd).unwrap_or(false);
+            let remote = Arc::new(unix::RemoteUnix::new(id, true, Some(path.clone()), r));
+            self.install_remote_unix(fd, remote, flags, cloexec)?;
+            if !path.starts_with('\0') {
+                let _ = self.vfs.mksocket(&path);
+            }
+            return Ok(0);
+        }
         sock.bind(&path)?;
         self.socket_names.bind(&path, sock)?;
         // And a node in the filesystem, so the name can be seen as well as
@@ -3673,6 +3752,20 @@ impl Kernel {
         } else {
             self.vfs.absolute(&path)
         };
+        // The global kernel first, because that is where a name another
+        // process bound will be. A host-bound name -- the virtio-gpu socket --
+        // is in *this* process's table and never in the kernel's, so the
+        // local path is still tried when the kernel does not know the name.
+        if let Some(r) = self.unix_remote {
+            let id = (r.connect)(path.as_ptr() as u32, path.len() as u32);
+            if id >= 0 {
+                let flags = self.fds.get(fd)?.flags();
+                let cloexec = self.fds.cloexec(fd).unwrap_or(false);
+                let remote = Arc::new(unix::RemoteUnix::new(id, false, Some(path.clone()), r));
+                self.install_remote_unix(fd, remote, flags, cloexec)?;
+                return Ok(0);
+            }
+        }
         let names = Arc::clone(&self.socket_names);
         names.connect(&sock, &path)
     }
@@ -3687,6 +3780,22 @@ impl Kernel {
     ) -> SysResult {
         const SOCK_NONBLOCK: u64 = 0o4000;
         const SOCK_CLOEXEC: u64 = 0o2000000;
+        // A listener in the global kernel answers with an id, and the
+        // descriptor made from it is the same kind.
+        if let Ok(listener) = self.remote_unix_of(fd) {
+            let session = listener.accept()?;
+            let path = listener.bound_path().unwrap_or_default();
+            Self::write_sockaddr_un(m, addr, len_out, &path)?;
+            let nonblock = flags & SOCK_NONBLOCK != 0;
+            session.set_nonblocking(nonblock);
+            let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
+            let handle: Arc<dyn crate::vfs::FileHandle> = session.clone();
+            let key = Arc::as_ptr(&handle) as *const () as usize;
+            let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
+            let new_fd = self.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
+            self.remote_sockets.insert(key, session);
+            return Ok(new_fd);
+        }
         let listener = self.unix_of(fd)?;
         let session = listener.accept()?;
         let path = listener.bound_path().unwrap_or_default();

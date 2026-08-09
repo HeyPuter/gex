@@ -264,6 +264,22 @@ extern "C" {
     fn k_pipe_readable(id: i32) -> i32;
     fn k_pipe_writable(id: i32) -> i32;
     fn k_pipe_buffered(id: i32) -> i32;
+
+    // Unix sockets. An X server binds a name and its client connects to it,
+    // and with a Worker per process those are two memories -- so the name has
+    // to be somewhere neither of them owns.
+    fn k_sock_bind(path: u32, path_len: u32) -> i32;
+    fn k_sock_connect(path: u32, path_len: u32) -> i32;
+    fn k_sock_accept(listener: i32) -> i32;
+    fn k_sock_pending(listener: i32) -> i32;
+    fn k_sock_read(id: i32, at: u32, len: u32) -> i32;
+    fn k_sock_write(id: i32, at: u32, len: u32) -> i32;
+    fn k_sock_readable(id: i32) -> i32;
+    fn k_sock_writable(id: i32) -> i32;
+    fn k_sock_available(id: i32) -> i32;
+    fn k_sock_close(id: i32);
+    fn k_sock_shutdown(id: i32);
+    fn k_sock_exists(path: u32, path_len: u32) -> i32;
 }
 
 // A wasm import is `unsafe`, and `Remote` holds safe fn pointers, so each one
@@ -438,6 +454,65 @@ fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
         readable: rp_readable,
         writable: rp_writable,
         buffered: rp_buffered,
+    })
+}
+
+extern "C" fn rs_bind(path: u32, path_len: u32) -> i32 {
+    unsafe { k_sock_bind(path, path_len) }
+}
+extern "C" fn rs_connect(path: u32, path_len: u32) -> i32 {
+    unsafe { k_sock_connect(path, path_len) }
+}
+extern "C" fn rs_accept(listener: i32) -> i32 {
+    unsafe { k_sock_accept(listener) }
+}
+extern "C" fn rs_pending(listener: i32) -> i32 {
+    unsafe { k_sock_pending(listener) }
+}
+extern "C" fn rs_read(id: i32, at: u32, len: u32) -> i32 {
+    unsafe { k_sock_read(id, at, len) }
+}
+extern "C" fn rs_write(id: i32, at: u32, len: u32) -> i32 {
+    unsafe { k_sock_write(id, at, len) }
+}
+extern "C" fn rs_readable(id: i32) -> i32 {
+    unsafe { k_sock_readable(id) }
+}
+extern "C" fn rs_writable(id: i32) -> i32 {
+    unsafe { k_sock_writable(id) }
+}
+extern "C" fn rs_available(id: i32) -> i32 {
+    unsafe { k_sock_available(id) }
+}
+extern "C" fn rs_close(id: i32) {
+    unsafe { k_sock_close(id) }
+}
+extern "C" fn rs_shutdown(id: i32) {
+    unsafe { k_sock_shutdown(id) }
+}
+extern "C" fn rs_exists(path: u32, path_len: u32) -> i32 {
+    unsafe { k_sock_exists(path, path_len) }
+}
+
+/// Where a unix socket's two ends live, when there is a global kernel to put
+/// them in.
+fn global_sockets() -> Option<gex_kernel::unix::Remote> {
+    if unsafe { k_present() } == 0 {
+        return None;
+    }
+    Some(gex_kernel::unix::Remote {
+        bind: rs_bind,
+        connect: rs_connect,
+        accept: rs_accept,
+        pending: rs_pending,
+        read: rs_read,
+        write: rs_write,
+        readable: rs_readable,
+        writable: rs_writable,
+        available: rs_available,
+        close: rs_close,
+        shutdown: rs_shutdown,
+        exists: rs_exists,
     })
 }
 
@@ -877,7 +952,7 @@ enum Waiting {
     /// therefore got EAGAIN from a blocking `accept` and gave up. Nothing
     /// noticed because the only host-served socket was the virtio-gpu
     /// renderer, where the guest connects and never accepts.
-    Accept(Arc<gex_kernel::unix::UnixSocket>),
+    Accept(Arc<dyn gex_kernel::vfs::FileHandle>),
     /// Waiting in `wait4` for a child to finish.
     ///
     /// This used to be impossible: the parent was frozen until the child
@@ -1565,6 +1640,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         kernel.procs = procs;
     }
     kernel.pipes = global_pipes();
+    kernel.unix_remote = global_sockets();
     match &shared_root {
         Some(r) => kernel.vfs.mount("/", r.clone()),
         None => kernel.vfs.mount("/", root.clone()),
@@ -2695,6 +2771,7 @@ pub extern "C" fn gex_adopt_child(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls
         kernel.procs = procs;
     }
     kernel.pipes = global_pipes();
+    kernel.unix_remote = global_sockets();
     install_console(&mut kernel);
     kernel.pid = pid;
     kernel.tid = pid;
@@ -3055,7 +3132,7 @@ fn thread_ready(t: &Thread, now: u64) -> bool {
             }
             _ => true,
         },
-        Waiting::Accept(socket) => socket.has_pending(),
+        Waiting::Accept(socket) => socket.poll_readable(),
         Waiting::Exited => false,
     }
 }
@@ -3463,7 +3540,7 @@ fn finish_parked(
         // `accept` is finished by the kernel, which is the only thing with a
         // descriptor table; the wait here is only for a connection to arrive.
         gex_kernel::BlockOp::AcceptWait { socket } => {
-            if socket.has_pending() {
+            if socket.poll_readable() {
                 Ok(0)
             } else {
                 Err(Errno::EAGAIN)
@@ -3839,7 +3916,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                     // switch does not need to.
                     Waiting::Net(deadline) => deadline.is_some_and(|d| now >= d),
                     Waiting::Child => false,
-                    Waiting::Accept(socket) => socket.has_pending(),
+                    Waiting::Accept(socket) => socket.poll_readable(),
                     Waiting::Exited => false,
                 }
         });

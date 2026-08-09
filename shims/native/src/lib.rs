@@ -1164,7 +1164,7 @@ fn perform_block(
             // which is the one place that has a descriptor table.
             loop {
                 service(data);
-                if socket.has_pending() {
+                if socket.poll_readable() {
                     return Ok(0);
                 }
                 turn!();

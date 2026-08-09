@@ -552,6 +552,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/sigblocked" "$HERE/programs/signal-while-blocked.c"
 "$CC" -static -no-pie -O2 -o "$WORK/park" "$HERE/programs/park-across-switch.c"
 "$CC" -static -no-pie -O2 -o "$WORK/socket-server" "$HERE/programs/socket-server.c"
+"$CC" -static -no-pie -O2 -o "$WORK/socket-fork" "$HERE/programs/socket-fork.c"
 "$CC" -static -no-pie -O2 -o "$WORK/socket-client" "$HERE/programs/socket-client.c"
 "$CC" -static -no-pie -O2 -o "$WORK/exec" "$HERE/programs/exec.c"
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
@@ -1210,6 +1211,27 @@ if [ -n "$NODE" ] && [ -f web/public/gex/gex_kernel.wasm ]; then
     esac
 else
     echo "skip pipe-shared: no node, or shims/kernel/build.sh has not been run"
+fi
+
+# A unix socket whose two ends are in different processes -- which is what a
+# unix socket is for, and what stopped working the moment each process got a
+# Worker of its own. An X server binds a name in its own address space and its
+# client, two forks away, looks in a table that has never heard of it.
+if [ -n "$NODE" ] && [ -x "$WORK/socket-fork" ] && [ -f web/public/gex/gex_kernel.plain.wasm ]; then
+    out=$(timeout 300 "$NODE" shims/browser/js/run-node.mjs \
+              web/public/gex/seed.wasm "$WORK/socket-fork" 2>&1 || true)
+    if echo "$out" | grep -q "server: got ping" &&
+       echo "$out" | grep -q "child: got pong" &&
+       echo "$out" | grep -q "child exited 0"; then
+        echo "ok   socket-fork (a socket between a parent and a child in two Workers)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL socket-fork: the two ends of a socket could not find each other"
+        echo "$out" | sed 's/^/     /' | head -8
+        fail=$((fail + 1))
+    fi
+else
+    echo "skip socket-fork: no node, no program, or no global kernel"
 fi
 
 # One filesystem, two address spaces. The third thing processes share and the
