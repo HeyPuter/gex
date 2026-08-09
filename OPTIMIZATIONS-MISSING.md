@@ -341,6 +341,47 @@ stored and loaded one at a time, which is section 5 below. Packing them is a
 representation change with no ABI question in it, and it is the largest
 single item this measurement exposes.
 
+# The test an item has to pass
+
+Added 2026-08-09, after one item on this list measured at exactly zero for a
+reason that applies to several others.
+
+Caching the bounds guard per base (section 17) removed 18% of gzip's guard
+bytes and moved no kernel at all. The guard is pure arithmetic on a value
+that does not change, so **V8's own optimiser had already removed the
+duplicate** -- the emitted bytes were there, the work was not.
+
+So emitted bytes are not a cost model. Before building anything here, ask
+which of these it is:
+
+* **Redundancy an optimiser can see** -- a repeated pure computation, a mask
+  over a value already known to be masked, a `wrap`/`extend` round trip.
+  Expect zero. V8 does this already, and deleting it from the emitter only
+  makes the module smaller. Sections 6, 7, 8, 10, 17 and 20 are mostly this.
+* **Computation nothing downstream can recover** -- materialising N and Z and
+  C and V so that a branch can compare two of them, when the branch could
+  have asked about the operands. That is why `cmp`+`b.cond` fusion is worth
+  16-29% and this was worth nothing.
+* **Memory traffic an optimiser must keep** -- the register flush to the
+  context, the safepoint counter's load and store. V8 cannot prove the host
+  will not read those bytes, so it cannot elide them however redundant they
+  look. This is where the remaining real cost is.
+
+The measured split -- 16-18% registers, 5-9% safepoints, 4-7% dispatch,
+12-15% bounds guards -- is bytes. Read against the test above, the register
+flush and the safepoint are real, the duplicate half of the guards is not,
+and the per-base half of the guards is.
+
+## Why section 16(d) is not the way out of the guards
+
+`memory64` with a large reservation, so the engine's own bounds check
+subsumes the `select`, is the right shape and is currently unbuildable. The
+guest modules do not own the memory: they `import_memory` it from the shim,
+and the shim is Rust built for `wasm32-unknown-unknown`. A wasm32 module
+cannot export a 64-bit memory, so this needs the shim on
+`wasm64-unknown-unknown` -- a tier-3 target -- or the guest memory separated
+from the shim's, which is most of the runtime.
+
 # Ranked by expected value
 
 1. **`cmp`+`b.cond` fusion** (§1–4) — largest pure-codegen win, touches every
