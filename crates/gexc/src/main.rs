@@ -394,6 +394,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut shared_memory = true;
     let mut no_validate = false;
     let mut closure = false;
+    let mut also: Vec<String> = Vec::new();
     let mut sysroot: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -417,6 +418,26 @@ fn cmd_build(args: &[String]) -> Result<()> {
             // handed, which on a normally linked program is the wrapper --
             // `apt-get` is 36 KiB in front of a 9,775 KiB closure.
             "--closure" => closure = true,
+            // Another executable whose libraries belong in this closure.
+            // Repeatable, and `--with-dir` for a directory of them: a
+            // program's helpers are usually all in one place --
+            // `/usr/lib/apt/methods` is apt's.
+            "--with" => {
+                i += 1;
+                also.push(args.get(i).context("--with needs a path")?.clone());
+            }
+            "--with-dir" => {
+                i += 1;
+                let d = args.get(i).context("--with-dir needs a directory")?;
+                let mut found: Vec<String> = std::fs::read_dir(d)
+                    .with_context(|| format!("reading {d}"))?
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                    .map(|e| e.path().to_string_lossy().into_owned())
+                    .collect();
+                found.sort();
+                also.extend(found);
+            }
             "--sysroot" => {
                 i += 1;
                 sysroot = Some(args.get(i).context("--sysroot needs a directory")?.clone());
@@ -429,7 +450,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let out = out.unwrap_or_else(|| format!("{path}.wasm"));
 
     if closure {
-        return build_closure(&path, sysroot.as_deref(), &out, exhaustive, shared_memory, no_validate);
+        return build_closure(
+            &path, &also, sysroot.as_deref(), &out, exhaustive, shared_memory, no_validate,
+        );
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
@@ -534,13 +557,14 @@ fn cmd_build(args: &[String]) -> Result<()> {
 /// manifest travels with the modules rather than being reconstructable.
 fn build_closure(
     path: &str,
+    also: &[String],
     sysroot: Option<&str>,
     out: &str,
     exhaustive: bool,
     shared_memory: bool,
     no_validate: bool,
 ) -> Result<()> {
-    let (closure, interp) = closure_of(path, sysroot)?;
+    let (closure, interp) = closure_of_all(path, also, sysroot)?;
     for (name, asker) in &closure.missing {
         eprintln!("gexc: {name} not found, needed by {asker} -- the build will be incomplete");
     }
@@ -649,6 +673,27 @@ fn closure_of(
     path: &str,
     sysroot: Option<&str>,
 ) -> Result<(gex_ld::closure::Closure, Option<String>)> {
+    closure_of_all(path, &[], sysroot)
+}
+
+/// As [`closure_of`], plus the helpers the program forks.
+///
+/// A program is not only its executable. apt is `apt-get` and the `file`,
+/// `copy` and `store` methods it runs, and those need objects `apt-get` does
+/// not -- libseccomp, libselinux, libpcre2 -- so a closure built from
+/// `apt-get` alone leaves its helpers translating those at run time. On
+/// `apt-get update` that was 12,576 blocks of an otherwise fully recompiled
+/// run.
+///
+/// The helpers contribute their libraries, not their own text: they are
+/// separate executables and each would want the image module's base for
+/// itself. Their text is small -- apt's `file` method is 67 KiB -- and the
+/// libraries are what costs.
+fn closure_of_all(
+    path: &str,
+    also: &[String],
+    sysroot: Option<&str>,
+) -> Result<(gex_ld::closure::Closure, Option<String>)> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
     let root = sysroot.map(str::to_string);
     let read = move |p: &str| -> Option<Vec<u8>> {
@@ -681,8 +726,34 @@ fn closure_of(
         }
         place_object(&mut next, span)
     };
+    // The program first, so `objects[0]` is still the executable, then every
+    // helper. A helper that cannot be read is skipped with a word rather than
+    // failing the build: a rootfs missing one method should still get a
+    // closure for everything else.
+    let mut roots = vec![(exe, guest_path)];
+    for h in also {
+        let hb = match std::fs::read(h) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("gexc: skipping helper {h}: {e}");
+                continue;
+            }
+        };
+        let img = match gex_ld::elf::load(&hb, gex_abi::PIE_BASE) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("gexc: skipping helper {h}: {e:?}");
+                continue;
+            }
+        };
+        let gp = match sysroot {
+            Some(r) => h.strip_prefix(r.trim_end_matches('/')).unwrap_or(h).to_string(),
+            None => h.clone(),
+        };
+        roots.push((img, gp));
+    }
     Ok((
-        gex_ld::closure::resolve(exe, &guest_path, &read, &mut place)?,
+        gex_ld::closure::resolve_all(roots, &read, &mut place)?,
         interp,
     ))
 }

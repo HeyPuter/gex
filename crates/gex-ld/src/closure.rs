@@ -91,34 +91,70 @@ pub fn resolve(
     read: &dyn Fn(&str) -> Option<Vec<u8>>,
     place: &mut dyn FnMut(&str, u64) -> u64,
 ) -> Result<Closure, LoadError> {
+    resolve_all(vec![(exe, exe_path.to_string())], read, place)
+}
+
+/// Resolve the closure of several programs at once, sharing one layout.
+///
+/// A program is not only its executable. apt is `apt-get` and the `file`,
+/// `copy`, `store` and `gpgv` methods it forks, and each of those needs
+/// objects `apt-get` does not: libseccomp for the sandbox, libselinux,
+/// libpcre2. A closure built from `apt-get` alone therefore covers the
+/// libraries `apt-get` reaches and none of the ones its helpers reach, and
+/// the helpers pay full price for them at run time -- 12,576 blocks of an
+/// otherwise fully recompiled `apt-get update`.
+///
+/// Every root contributes its `DT_NEEDED` graph to one set, deduplicated by
+/// resolved path, and every object is placed once by the shared `place`. The
+/// roots themselves come first, in order, so `objects[0]` is still the
+/// program and the callers that assume that keep working.
+pub fn resolve_all(
+    roots: Vec<(Image, String)>,
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
+    place: &mut dyn FnMut(&str, u64) -> u64,
+) -> Result<Closure, LoadError> {
     let mut out = Closure::default();
     let mut seen: HashSet<String> = HashSet::new();
     // Name -> (asked by, depth), in the order they were first named. A
     // `BTreeMap` would sort them; the order `ld.so` resolves in is the order
     // they were named, so this is a queue.
     let mut queue: Vec<(String, String, u32)> = Vec::new();
-
-    for n in &exe.needed {
-        queue.push((n.clone(), exe_path.to_string(), 1));
-    }
-    let exe_runpath = expand_origin(&exe.runpath, exe_path);
+    let mut exe_runpath: Vec<String> = Vec::new();
     // Every object's runpath is in scope for what *it* names, and the
     // executable's is in scope for everything: that is `DT_RUNPATH`'s scoping
     // rule, and getting it wrong means finding the wrong libstdc++.
     let mut runpath_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
-    seen.insert(exe_path.to_string());
-    if let Some(s) = &exe.soname {
-        seen.insert(s.clone());
+    for (n_root, (exe, exe_path)) in roots.into_iter().enumerate() {
+        for n in &exe.needed {
+            queue.push((n.clone(), exe_path.clone(), 1));
+        }
+        exe_runpath.extend(expand_origin(&exe.runpath, &exe_path));
+        let fresh = seen.insert(exe_path.clone());
+        if let Some(s) = &exe.soname {
+            seen.insert(s.clone());
+        }
+        // Only the program becomes an object. The helpers are here for what
+        // they *need*, not for themselves: each is a separate executable and
+        // would want the image module's own base, which the program already
+        // has. Emitting them would put two objects at `PIE_BASE` and the
+        // second one's dispatch entries would land on the first's pages.
+        //
+        // Their own text is small next to what they pull in -- apt's `file`
+        // method is 67 KiB against libseccomp's 180 -- so the run translates
+        // it and nothing much is lost.
+        if n_root > 0 || !fresh {
+            continue;
+        }
+        let exe_span = exe.brk.saturating_sub(exe.bias);
+        out.objects.push(Object {
+            path: exe_path.clone(),
+            name: basename(&exe_path).to_string(),
+            image: exe,
+            span: exe_span,
+            depth: 0,
+        });
     }
-    let exe_span = exe.brk.saturating_sub(exe.bias);
-    out.objects.push(Object {
-        path: exe_path.to_string(),
-        name: basename(exe_path).to_string(),
-        image: exe,
-        span: exe_span,
-        depth: 0,
-    });
 
     let mut i = 0;
     while i < queue.len() {
