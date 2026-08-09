@@ -2342,10 +2342,24 @@ const PARK_HERE_NS: u64 = 2_000_000;
 /// off a WebSocket, is waiting for a callback on *this* Worker's event loop,
 /// and a Worker that has not returned from a syscall is not running it.
 fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
-    let is_socket = |h: &Arc<dyn gex_kernel::vfs::FileHandle>| {
-        h.metadata()
-            .map(|m| m.file_type == gex_kernel::vfs::FileType::Socket)
-            .unwrap_or(false)
+    // Something another guest process is the other end of: a socket or a
+    // pipe. A pipe is how apt talks to its http method and how a shell joins
+    // a pipeline, and whoever fills it is a Worker in this run.
+    //
+    // A socket only counts when this process has no network. `FileType`
+    // cannot tell a unix socket between two guests from a TCP socket carried
+    // over Wisp, and the two want opposite answers: the first is ended by
+    // another Worker, the second by a WebSocket message on this Worker's own
+    // event loop, which a Worker asleep is not running. Where there is no
+    // network there are no TCP sockets, so the question does not arise -- and
+    // that is the case the X server and its client are in.
+    let is_peer = |h: &Arc<dyn gex_kernel::vfs::FileHandle>| {
+        use gex_kernel::vfs::FileType;
+        match h.metadata().map(|m| m.file_type) {
+            Ok(FileType::Fifo) => true,
+            Ok(FileType::Socket) => kernel.net.is_none(),
+            _ => false,
+        }
     };
     // A socket the *page* is the other end of.
     //
@@ -2368,13 +2382,25 @@ fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
     match &t.waiting {
         // A terminal: nobody but the page can type into it. Nor a socket
         // whose far end is the page.
-        Waiting::Read(h) | Waiting::Write(h) => !is_socket(h) || is_remote(h),
+        Waiting::Read(h) | Waiting::Write(h) => !is_peer(h) || is_remote(h),
         Waiting::Accept(h) => is_remote(h),
         // Every timed wait and every `poll` parks as this, whatever it is
         // watching -- a Wisp socket whose bytes arrive on this thread, a
-        // descriptor the page serves, or a pipe between two guests. Telling
-        // them apart means looking at the poll set; until that is done the
-        // page keeps them all.
+        // descriptor the page serves, or a pipe between two guests. So look
+        // at what it is watching.
+        //
+        // This used to answer "the page" for all of them, which is most of
+        // what made apt slow: a `poll` over the pipes to its http method is
+        // how it waits between every message, and there are thousands of
+        // them. A poll whose whole set is pipes and guest sockets is ended by
+        // another Worker, and that Worker's notify can end it.
+        //
+        // A deadline is the clock's to end, and the clock is the page's.
+        // Every timed wait and every `poll` parks as this, whatever it is
+        // watching. Classifying them by their descriptors was tried and it
+        // stalled the gears demo halfway through -- glxgears drew for fifty
+        // seconds and then stopped with its shell in `wait4` -- so until that
+        // is understood the page keeps them all.
         Waiting::Net(_) => true,
         _ => false,
     }
@@ -2680,10 +2706,12 @@ fn count_syscall() {
         TOTAL = TOTAL.wrapping_add(1);
         TOTAL
     };
-    // From 4,096, not 65,536. A whole glxgears run makes fewer than
-    // sixty-five thousand syscalls, so the higher threshold meant the one
-    // workload this was built to explain never produced a single line.
-    if !total.is_power_of_two() || total < 4096 {
+    // From 512, and it has come down twice. It was 65,536, which a whole
+    // glxgears run never reached; then 4,096, which apt's http method --
+    // a process that lives for one download and makes a few hundred calls --
+    // never reached either. A census that only speaks for long-lived
+    // processes cannot say where a short one spent its time.
+    if !total.is_power_of_two() || total < 512 {
         return;
     }
     let mut top: Vec<(u32, usize)> = unsafe {
@@ -4083,16 +4111,51 @@ fn report_idle(why: u8) {
                     }
                     out.push(')');
                 }
+                // And, for a plain blocking read or write, what it is on.
+                //
+                // "read" on its own is the least useful thing this can say
+                // when the question is which of two processes is waiting for
+                // the other. The handle knows -- it is the same
+                // `debug_state` a polled descriptor prints -- and a pipe that
+                // says "0 buffered" is a different bug from a terminal that
+                // is waiting for a key nobody will press.
+                match &t.waiting {
+                    Waiting::Read(h) | Waiting::Write(h) | Waiting::Accept(h) => {
+                        let d = h.debug_state();
+                        if !d.is_empty() {
+                            out.push_str(&format!("({d})"));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         out
     });
-    let asked = match why {
-        0 => "nothing the page can supply",
-        1 => "a keystroke",
-        2 => "the event loop to turn",
-        _ => "a keystroke and the event loop",
-    };
+    // Built from the bits rather than matched on the whole.
+    //
+    // The match had arms for 0, 1 and 2 and a catch-all that said "a
+    // keystroke and the event loop". Once there was a third bit every mask
+    // carrying it fell into that arm, so a wait that had nothing to do with
+    // the keyboard was reported as one -- and it was read as a
+    // misclassification that was not there.
+    let mut asked = String::new();
+    if why == 0 {
+        asked.push_str("nothing the page can supply");
+    } else {
+        if why & 1 != 0 {
+            asked.push_str("a keystroke");
+        }
+        if why & 2 != 0 {
+            if !asked.is_empty() {
+                asked.push_str(" and ");
+            }
+            asked.push_str("the event loop to turn");
+        }
+        if why & 4 != 0 {
+            asked.push_str(" (only the page can end it)");
+        }
+    }
     trace_line(&format!(
         "[gex] {n} turns with nothing runnable, wanting {asked}, threads:{census}\n"
     ));
@@ -4223,11 +4286,27 @@ fn schedule() -> i32 {
             // shell in one process and a download in another wants both, and
             // reporting only one of them starves the other.
             let why = with_host(|h| {
-                let is_socket = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
-                    handle
-                        .metadata()
-                        .map(|m| m.file_type == gex_kernel::vfs::FileType::Socket)
-                        .unwrap_or(false)
+                // Only a terminal is a keystroke.
+                //
+                // This asked "is it a socket?" and called everything else a
+                // wait for the person at the keyboard. A *pipe* is everything
+                // else, and a pipe is how one guest process talks to another:
+                // apt to its http method, a shell to the program in a
+                // pipeline. Every one of those reads told the page to wait
+                // for a keystroke, so a message between two processes was
+                // delivered on whatever timer the page raced the keyboard
+                // with -- five milliseconds each, on a protocol that is
+                // hundreds of small messages. `apt-get update` fetched
+                // 14.9 MB in four minutes at 60 kB/s that way.
+                //
+                // A fifo, like a socket, is written by somebody else in this
+                // run; both want the event loop and neither wants a key.
+                let by_kind = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
+                    use gex_kernel::vfs::FileType;
+                    match handle.metadata().map(|m| m.file_type) {
+                        Ok(FileType::Socket) | Ok(FileType::Fifo) => 2,
+                        _ => 1,
+                    }
                 };
                 let mut mask = 0u8;
                 // Bit 2: the page, and only the page, can end this wait.
@@ -4253,7 +4332,12 @@ fn schedule() -> i32 {
                 // whatever exit code it happened to hold. Which is zero. A
                 // guest that stopped for a reason nobody recognised looked
                 // exactly like a program that had finished successfully.
-                if h.kernel.net.is_some() {
+                // Per wait, not per process. Asking only whether the process
+                // has a network at all condemned every wait it makes: apt has
+                // one, so its pipe to the http method -- which another Worker
+                // fills, and which a notify could end in microseconds -- was
+                // sent round the page's event loop like the download was.
+                if h.threads.iter().any(|t| wait_needs_page(t, &h.kernel)) {
                     mask |= 2 | 4;
                 }
                 // Every thread in the run, not just the ones in the process
@@ -4264,7 +4348,9 @@ fn schedule() -> i32 {
                 // below spun at full speed for as long as the run lasted.
                 for t in h.threads.iter() {
                     match &t.waiting {
-                        Waiting::Write(_) => mask |= 1,
+                        // The same question as a read: a pipe or a socket is
+                        // drained by another process, a terminal by the page.
+                        Waiting::Write(handle) => mask |= by_kind(handle),
                         // A listener waiting for a client. Whoever connects
                         // is outside this guest -- the page, or another
                         // Worker -- so the page's event loop has to turn for
@@ -4273,7 +4359,7 @@ fn schedule() -> i32 {
                         // loop went round for ever.
                         Waiting::Accept(_) => mask |= 2,
                         Waiting::Read(handle) => {
-                            mask |= if is_socket(handle) { 2 } else { 1 };
+                            mask |= by_kind(handle);
                         }
                         // Every timed wait and every poll parks as `Net`, but
                         // most of them are not the network. An interactive
@@ -4290,7 +4376,7 @@ fn schedule() -> i32 {
                                     let mut saw = false;
                                     for p in fds {
                                         if let Some(handle) = &p.handle {
-                                            mask |= if is_socket(handle) { 2 } else { 1 };
+                                            mask |= by_kind(handle);
                                             saw = true;
                                         }
                                     }
