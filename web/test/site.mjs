@@ -69,10 +69,17 @@ const DEMOS = {
   // stays black. `presented`, which the demo prints when the run ends, is
   // the number of blits that actually reached it.
   virgl: {
-    want: (t) => /frames in [\d.]+ seconds/.test(t) && Number(/presented=(\d+)/.exec(t)?.[1]) > 0,
+    // The count is read from the terminal with its wrapping taken out.
+    // xterm breaks a line at the window width and `innerText` keeps the
+    // break, so a summary wide enough to wrap splits `presented=7` across
+    // two rows and a pattern that spans it never matches -- a run that drew
+    // and presented sat there until the wall clock.
+    want: (t) =>
+      /frames in [\d.]+ seconds/.test(t) &&
+      Number(/presented=(\d+)/.exec(t.replace(/\s+/g, ''))?.[1]) > 0,
     // No `settle`: a run that finishes having presented nothing is the exact
     // failure this is for, and a status of `finished` would call it a pass.
-    fail: /presented=0\b/,
+    fail: (t) => /presented=0(?!\d)/.test(t.replace(/\s+/g, '')),
   },
 };
 
@@ -240,7 +247,10 @@ for (const id of list) {
       // A run that ended having proved the opposite. Without this the wait
       // runs to the wall clock, and fifteen minutes of nothing reads as a
       // hang rather than as the answer it already has.
-      if (fail?.test(terminal || '')) resolve({ how: 'bad', body: 'nothing reached the canvas' });
+      const failed = typeof fail === 'function' ? fail : (t) => fail?.test(t);
+      if (fail && failed(terminal || '')) {
+        resolve({ how: 'bad', body: 'nothing reached the canvas' });
+      }
       if (statusKind === 'bad') resolve({ how: 'bad', body: text });
     };
   });
