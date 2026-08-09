@@ -405,6 +405,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
         let ctx = gex_emit::tier1::CTX_BYTES.load(Relaxed);
         let sp = gex_emit::tier1::SAFEPOINT_BYTES.load(Relaxed);
         let disp = gex_emit::tier1::DISPATCH_BYTES.load(Relaxed);
+        let guard = gex_emit::tier1::GUARD_BYTES.load(Relaxed);
         let total = stats.wasm_bytes.max(1);
         eprintln!(
             "  boundary: {:.0}% registers, {:.0}% safepoints, {:.0}% dispatch \
@@ -415,6 +416,11 @@ fn cmd_build(args: &[String]) -> Result<()> {
             100.0 * (ctx + sp + disp) as f64 / total as f64,
             ctx + sp + disp,
             stats.blocks,
+        );
+        eprintln!(
+            "  bounds guards: {:.0}% ({} bytes)",
+            100.0 * guard as f64 / total as f64,
+            guard,
         );
     }
     // Which registers make up that percentage, for anyone considering doing

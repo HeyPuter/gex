@@ -285,6 +285,23 @@ Recorded in the code so this list is not read as 71 open opportunities.
   (`xlate::eliminate_dead_flags` doc).
 * **`--no-liftoff` (forcing V8's optimizing tier)** — bought nothing, so
   "fewer, bigger functions" is not by itself the prize.
+* **Caching the bounds guard per base value** (§17). The offset already
+  rides along as the access's static offset, so what gets guarded is the
+  base, and an SSA base guarded twice emits identical arithmetic twice.
+  Caching it in a local removed 18% of gzip's guard bytes (523,872 →
+  427,907) and shrank nbench's module 0.9%. It moved no kernel: over two
+  clean runs, NUMERIC SORT −4.5%, STRING SORT −1.0%, FOURIER −5.5%, IDEA
+  +1.0%.
+
+  The reason generalises, which is why it is here rather than in a commit
+  message. The guard is pure arithmetic on a value that does not change --
+  precisely what an optimiser removes unaided -- so the bytes deleted are
+  bytes V8 had already collapsed, while the extra local is real. **Fewer
+  emitted instructions is not less work once the engine has its own CSE.**
+  Anything on this list that only removes redundancy should be expected to
+  measure at zero; the items worth doing are the ones that remove
+  computation nothing downstream can recover, as `cmp`+`b.cond` fusion
+  removes the materialising of N and V.
 
 ---
 

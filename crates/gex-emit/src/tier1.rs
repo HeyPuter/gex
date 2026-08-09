@@ -828,6 +828,18 @@ impl<'a> Emitter<'a> {
             return 0;
         }
 
+        // Guarding the same base twice in a block emits the same arithmetic
+        // twice, and caching it in a local was tried: it removed 18% of the
+        // guard bytes on gzip and moved no kernel on nbench, in either
+        // direction, over two runs.
+        //
+        // The reason is worth keeping. The guard is pure arithmetic on a
+        // value that does not change, which is exactly what an optimiser
+        // eliminates by itself -- so the bytes it deletes are bytes V8 had
+        // already collapsed, and the local it adds is real. Fewer emitted
+        // instructions is not less work once the engine has its own CSE,
+        // and that is the difference between this and the `cmp`+`b.cond`
+        // fusion, which removes arithmetic nothing can recover.
         let static_off = if (0..=u32::MAX as i64).contains(&offset) {
             self.push(addr);
             offset as u32
@@ -843,6 +855,12 @@ impl<'a> Emitter<'a> {
 
     /// Consume an `i64` effective address and leave a bounds-safe `i32`.
     fn guard_to_i32(&mut self) {
+        let before = self.f.code.len();
+        self.guard_to_i32_inner();
+        GUARD_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
+    }
+
+    fn guard_to_i32_inner(&mut self) {
         let t = self.scratch_i64;
         self.f.local_set(t);
         self.f.local_get(t);
@@ -2290,6 +2308,9 @@ fn lane_shift_op(op: VShiftOp, lane: VLane) -> u32 {
 pub static CTX_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Bytes emitted on the safepoint countdown and its call.
 pub static SAFEPOINT_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Bytes emitted proving a guest address is inside guest memory, on every
+/// load and store whose address is not a literal constant.
+pub static GUARD_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Bytes emitted choosing where to go next: the directory load, the slot
 /// arithmetic, the table selection and the indirect tail call.
 pub static DISPATCH_BYTES: AtomicUsize = AtomicUsize::new(0);
