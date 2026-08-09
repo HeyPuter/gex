@@ -5563,28 +5563,39 @@ fn note_intrinsics(addr: u64) {
         return;
     };
     let (found, pending) = scan_intrinsics(&path, start);
-    with_host(|h| {
+    let added = with_host(|h| {
         // A scan with nothing left outstanding need never run again.
         let n = if pending { 1 } else { 8 };
         *h.jit.intrinsics_scanned.entry(path.clone()).or_insert(0) += n;
+        let before = h.jit.intrinsics.len();
         for (a, k) in found {
             h.jit.intrinsics.insert(a, k);
         }
+        h.jit.intrinsics.len() - before
     });
-    if tracing() {
+    // Only when it learned something, so this is a handful of lines a run
+    // rather than one per miss -- and it is on the heartbeat rather than
+    // `strace` because "did the substitution happen at all" is the first
+    // question asked of it, and answering that should not need every syscall
+    // narrated.
+    if added > 0 {
         let n = with_host(|h| h.jit.intrinsics.len());
-        trace_line(&format!("[gex] intrinsics: {n} after {path}\n"));
+        trace_line(&format!(
+            "[gex] intrinsics: +{added} from {path}, {n} total\n"
+        ));
     }
 }
 
-/// Whether a guest address is in some object's executable mapping.
-fn executable_guest_addr(a: u64) -> bool {
+/// Which object's executable mapping a guest address falls in, if any.
+fn executable_object_at(a: u64) -> Option<String> {
     with_host(|h| {
-        h.kernel
+        let v = h
+            .kernel
             .mem
             .vmas()
             .iter()
-            .any(|v| a >= v.start && a < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)
+            .find(|v| a >= v.start && a < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)?;
+        v.origin.as_ref().map(|(p, _)| p.clone())
     })
 }
 
@@ -5632,14 +5643,21 @@ fn scan_intrinsics(path: &str, start: u64) -> (Vec<(u64, gex_xlate::Intrinsic)>,
             pending = true;
             continue;
         };
-        // Not bound yet: a lazy slot still points at the resolver stub and an
-        // untouched one is zero. Neither is an answer, and binding `memcpy`
-        // to whatever happened to be there would be the worst kind of wrong.
-        if !executable_guest_addr(target) {
-            pending = true;
-            continue;
+        // A slot that is not bound yet points at this object's own PLT
+        // resolver stub, and an untouched one is zero. The stub is real
+        // executable code in a real mapping, so "is this an address" does not
+        // separate the two -- but *whose* code it is does: a resolver stub is
+        // always in the object whose GOT this is, and the `memcpy` being
+        // called is always somebody else's.
+        //
+        // Getting this wrong is not a missed optimisation. Binding the
+        // resolver stub to `memcpy` makes every lazily-resolved call in the
+        // object copy x1 to x0 for x2 bytes and return, which is how `ls`
+        // came to die of an out-of-bounds access inside `close`.
+        match executable_object_at(target) {
+            Some(obj) if obj != path => out.push((target, kind)),
+            _ => pending = true,
         }
-        out.push((target, kind));
     }
     (out, pending)
 }

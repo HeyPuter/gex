@@ -482,6 +482,7 @@ name = "gex-ld"
 version = "0.0.1"
 dependencies = [
  "gex-abi",
+ "gex-xlate",
 ]
 
 [[package]]

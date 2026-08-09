@@ -7,3 +7,6 @@ description = "gex dynamic loader: ELF images, relocations, process layout"
 
 [dependencies]
 gex-abi.workspace = true
+
+[dev-dependencies]
+gex-xlate.workspace = true
