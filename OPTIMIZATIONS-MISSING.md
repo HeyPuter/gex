@@ -587,11 +587,36 @@ Correct -- the substitution suite passes all six including the twenty-process
 loop, and apt completes with `Fetched 14.9 MB in 3min 11s` -- so it is not
 broken, it simply almost never applies. Reverted.
 
-**The prime suspect is the identity key.** `page_identity` names a mapping by
-file, offset and length, and the shortcut needs the key computed after the
-exec to equal the one recorded before it. If a re-mapped library hashes
-differently, `shared.get` misses and every number above follows. Count how
-often that lookup succeeds before building anything else on it.
+**Counted, and the suspect was wrong.** `gex_reuse_stat` reports per process
+how the lookup went. On a shell loop that execs `ls` and `wc` once an
+iteration -- apt's shape in seconds rather than four minutes:
+
+    pid 3:  20868 blocks   reuse have=445 hit=0 miss=13 noident=2
+    pid 6:  20868 blocks   reuse have=445 hit=0 miss=13 noident=2
+    pid 9:  20868 blocks   reuse have=445 hit=0 miss=13 noident=2
+
+`have` dwarfs everything: 445 of 460 misses are on a page this process
+already owns slots for, which are new blocks in a known page and not
+re-translation at all. The shortcut sat behind `lookup(page).is_none()` and
+was never reached -- which is why it moved 2.7%.
+
+And `hit=0` on the case that should hit. The third `ls` lifts exactly the
+20,868 blocks the first `ls` lifted: same program, same libc, same addresses.
+
+The cause is scope, not hashing. `Jit::shared` is documented as being "for
+the whole tab rather than for one process" and it is not -- it is a field of
+`Jit` in each Worker's own memory, and `#sharedMap()` is called in exactly
+one place, the fork record. It travels parent to child at `fork` and nowhere
+else, so a child's translations never reach its parent and never reach the
+next sibling. Each `ls` starts from dash's snapshot, and dash has never run
+`ls`.
+
+So the waste is siblings unable to reuse each other's work, not a child
+failing to reuse its parent's. The mechanism is right and the scope of one
+map is wrong: the identity map belongs in the global kernel, the module every
+Worker already instantiates against one shared memory for exactly this class
+of state, and the compiled modules belong in a host registry handed to each
+new Worker.
 
 **And a control worth keeping.** Per-process lifting was unchanged and wall
 clock did not move either. That says the 55.3s is not on the critical path:

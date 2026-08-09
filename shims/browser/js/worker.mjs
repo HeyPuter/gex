@@ -358,6 +358,13 @@ async function handle(msg) {
       extracted: (msg.extract ?? []).map((p) => [p, gex.readFile(p)]),
       blocks: Number(gex.shim.exports.gex_jit_blocks?.() ?? 0),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
+      // How the shared-slot lookup went: pages this process already had,
+      // pages the identity map knew, pages it did not, and pages with no
+      // identity at all. The question is why a child re-lifts its parent's
+      // libraries, and these four say which step loses them.
+      reuse: gex.shim.exports.gex_reuse_stat
+        ? [0, 1, 2, 3].map((i) => Number(gex.shim.exports.gex_reuse_stat(i)))
+        : null,
       // How much of this process's memory the shim ever used. It decides how
       // big a memory has to be, and a memory per process decides how many
       // processes a browser will hold at once -- which is the number that

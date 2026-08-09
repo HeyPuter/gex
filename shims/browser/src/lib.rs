@@ -1149,6 +1149,14 @@ struct Jit {
     /// Not part of a process's saved state. That is the point -- it outlives
     /// every `fork` and `execve`, which is where the waste was.
     shared: std::collections::HashMap<(u64, u64), u32>,
+    /// How the shared-slot lookup went, for the question of why a forked and
+    /// exec'd child re-lifts its parent's libraries. Three outcomes: the page
+    /// already had a base in *this* process's table, the identity map knew
+    /// it, or it did not. See `gex_reuse_stats`.
+    reuse_have: u64,
+    reuse_hit: u64,
+    reuse_miss: u64,
+    reuse_noident: u64,
     /// Guest addresses that are `memcpy` and friends, to be served by a wasm
     /// bulk-memory instruction rather than translated.
     ///
@@ -2114,6 +2122,10 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 translated: Default::default(),
                 registry: Vec::new(),
                 shared: Default::default(),
+                reuse_have: 0,
+                reuse_hit: 0,
+                reuse_miss: 0,
+                reuse_noident: 0,
                 intrinsics: Default::default(),
                 intrinsics_scanned: Default::default(),
                 candidates: Vec::new(),
@@ -3737,6 +3749,10 @@ pub extern "C" fn gex_adopt_child(
             translated: Default::default(),
             registry: Vec::new(),
             shared: Default::default(),
+            reuse_have: 0,
+            reuse_hit: 0,
+            reuse_miss: 0,
+            reuse_noident: 0,
             intrinsics: Default::default(),
             intrinsics_scanned: Default::default(),
             candidates: Vec::new(),
@@ -5190,8 +5206,20 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // identity is asked about an address, because that is what names a
         // mapping.
         let page = gex_abi::dispatch_page(pc);
+        if h.jit.page_table.lookup(page).is_some() {
+            h.jit.reuse_have += 1;
+        }
         if h.jit.page_table.lookup(page).is_none() {
-            if let Some(key) = page_identity(h, page * gex_abi::DISPATCH_PAGE) {
+            let ident = page_identity(h, page * gex_abi::DISPATCH_PAGE);
+            if ident.is_none() {
+                h.jit.reuse_noident += 1;
+            }
+            if let Some(key) = ident {
+                if h.jit.shared.contains_key(&(page, key)) {
+                    h.jit.reuse_hit += 1;
+                } else {
+                    h.jit.reuse_miss += 1;
+                }
                 if let Some(&base) = h.jit.shared.get(&(page, key)) {
                     h.jit.page_table.assign(page, base);
                     // And the guest's directory, which `execve` cleared.
@@ -6207,6 +6235,23 @@ pub extern "C" fn gex_jit_blocks() -> i64 {
 #[no_mangle]
 pub extern "C" fn gex_jit_compiles() -> i64 {
     with_host(|h| h.jit.compiles as i64)
+}
+
+/// How the shared-slot lookup went, packed so one call answers.
+///
+/// `(have, hit, miss, noident)` in four 16-bit fields is not enough for a
+/// program that misses a hundred thousand times, so this returns one of the
+/// four by index instead.
+#[no_mangle]
+pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
+    with_host(|h| {
+        (match which {
+            0 => h.jit.reuse_have,
+            1 => h.jit.reuse_hit,
+            2 => h.jit.reuse_miss,
+            _ => h.jit.reuse_noident,
+        }) as i64
+    })
 }
 
 /// Milliseconds the shim itself spent translating.

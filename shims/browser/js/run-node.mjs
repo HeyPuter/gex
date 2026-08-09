@@ -223,7 +223,16 @@ const host = new ProcessHost({
     // ahead of time is worth anything.
     if (process.env.GEX_TIME_JIT) {
       process.stderr.write(
-        `[gex] pid ${pid}: ${m.millis}ms translating ${m.blocks} blocks\n`,
+        `[gex] pid ${pid}: ${m.millis}ms translating ${m.blocks} blocks` +
+          // Where the shared-slot lookup went, when the shim reports it:
+          // pages this process already had, pages the identity map knew,
+          // pages it did not, and pages with no identity at all. The
+          // question these answer is why a forked and exec'd child lifts
+          // its parent's libraries again.
+          (m.reuse
+            ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]} noident=${m.reuse[3]}`
+            : '') +
+          '\n',
       );
     }
     if (pid !== 1) {
