@@ -654,7 +654,7 @@ impl ModuleBuilder {
     pub fn finish(mut self) -> TranslatedModule {
         let timing = std::env::var_os("GEX_TIMING").is_some();
         let started = crate::par::Stopwatch::start();
-        let compiled: Vec<(u32, Vec<u8>)> = {
+        let compiled: Vec<(u32, (Vec<u8>, Vec<u32>))> = {
             let gir: HashMap<u64, &Block> =
                 self.pending.iter().map(|(b, _)| (b.start, b)).collect();
             let cx = tier1::Context {
@@ -677,7 +677,7 @@ impl ModuleBuilder {
             // Cranelift waited behind it with the rest of the machine idle.
             // `compile` reads nothing it does not own, so the map spreads.
             crate::par::map(&self.pending, &|(block, f): &(Block, u32)| {
-                (*f, tier1::compile(block, &cx))
+                (*f, tier1::compile_with_relocs(block, &cx))
             })
         };
         let n_blocks = compiled.len();
@@ -685,8 +685,8 @@ impl ModuleBuilder {
             eprintln!("[timing]   tier-1 codegen: {:.2}s", started.secs());
         }
         let started = crate::par::Stopwatch::start();
-        for (f, body) in compiled {
-            self.m.define_func(f, body);
+        for (f, (body, relocs)) in compiled {
+            self.m.define_func_with_relocs(f, body, relocs);
         }
         if timing {
             eprintln!("[timing]   defining bodies: {:.2}s", started.secs());

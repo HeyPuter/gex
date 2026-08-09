@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+pub use gex_emit::merge;
 pub use gex_emit::module::Linkage;
 pub use gex_emit::module::Refill;
 pub use gex_emit::module::Metadata;

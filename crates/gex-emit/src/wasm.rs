@@ -33,6 +33,12 @@ impl ValType {
     }
 }
 
+/// Custom section naming every immediate that points at a local function.
+///
+/// Fixed-width LEBs at these payload offsets, so `gex_emit::merge` can add a
+/// function offset to each without a body changing length.
+pub const RELOC_SECTION: &str = "gex.reloc";
+
 /// A function signature.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FuncType {
@@ -49,6 +55,32 @@ impl FuncType {
 // ---------------------------------------------------------------------------
 // LEB128
 // ---------------------------------------------------------------------------
+
+/// A `u32` in exactly five LEB bytes, so it can be rewritten in place.
+///
+/// Wasm accepts a LEB longer than it needs to be as long as it is no longer
+/// than the type allows, and the cost is four bytes in the module and nothing
+/// at run time.
+pub fn write_u32_fixed(out: &mut Vec<u8>, v: u32) {
+    for i in 0..5 {
+        let mut byte = ((v >> (i * 7)) & 0x7f) as u8;
+        if i < 4 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+    }
+}
+
+/// Rewrite a five-byte LEB written by [`write_u32_fixed`].
+pub fn patch_u32_fixed(out: &mut [u8], at: usize, v: u32) {
+    for i in 0..5 {
+        let mut byte = ((v >> (i * 7)) & 0x7f) as u8;
+        if i < 4 {
+            byte |= 0x80;
+        }
+        out[at + i] = byte;
+    }
+}
 
 pub fn write_u32(out: &mut Vec<u8>, mut v: u32) {
     loop {
@@ -148,6 +180,15 @@ pub struct FuncBody {
     locals: Vec<ValType>,
     pub code: Vec<u8>,
     n_params: u32,
+    /// Offsets into `code` of every immediate naming a *local* function.
+    ///
+    /// A call to an import is fixed for ever -- every unit declares the same
+    /// imports in the same order -- but a call to another block is an index
+    /// into this module's own functions, and that index moves if the module is
+    /// concatenated with another. Recording the offsets here is what lets the
+    /// merger patch them without decoding an instruction stream: the emitter
+    /// already knows where it wrote them.
+    relocs: Vec<u32>,
 }
 
 impl FuncBody {
@@ -156,6 +197,7 @@ impl FuncBody {
             locals: Vec::new(),
             code: Vec::new(),
             n_params,
+            relocs: Vec::new(),
         }
     }
 
@@ -214,6 +256,25 @@ impl FuncBody {
     pub fn return_call(&mut self, func: u32) {
         self.byte(op::RETURN_CALL);
         self.u32(func);
+    }
+
+    /// A tail call to another block in this same module.
+    ///
+    /// Distinguished from [`Self::return_call`] only so the index can be
+    /// recorded and written at a fixed width: five bytes, which is the most a
+    /// `u32` LEB can take, so the merger may add an offset to it without the
+    /// body changing length. Non-canonical LEB is valid wasm and is decoded
+    /// once, when the module is compiled.
+    pub fn return_call_local(&mut self, func: u32) {
+        self.byte(op::RETURN_CALL);
+        self.relocs.push(self.code.len() as u32);
+        write_u32_fixed(&mut self.code, func);
+    }
+
+    /// Where this body names a local function, relative to the start of its
+    /// code.
+    pub fn relocs(&self) -> &[u32] {
+        &self.relocs
     }
 
     pub fn return_call_indirect(&mut self, ty: u32, table: u32) {
@@ -369,6 +430,20 @@ impl FuncBody {
     }
 
     /// Serialise the body into the code-section entry form.
+    /// Encode, and say where in the encoding each local-function immediate
+    /// ended up.
+    ///
+    /// The offsets [`Self::relocs`] holds are into `code`; the encoding puts a
+    /// size prefix and the local declarations in front of it, so they all move
+    /// by the same amount.
+    pub fn finish_with_relocs(self) -> (Vec<u8>, Vec<u32>) {
+        let relocs = self.relocs.clone();
+        let code_len = self.code.len();
+        let out = self.finish();
+        let shift = (out.len() - code_len - 1) as u32; // -1 for the trailing `end`
+        (out, relocs.into_iter().map(|r| r + shift).collect())
+    }
+
     pub fn finish(self) -> Vec<u8> {
         let mut body = Vec::with_capacity(self.code.len() + 16);
         // Run-length encode the local declarations.
@@ -447,6 +522,12 @@ pub struct Module {
     functions: Vec<u32>,
     /// Encoded bodies, parallel to `functions`.
     bodies: Vec<Vec<u8>>,
+    /// For each body, offsets within it that name a local function.
+    ///
+    /// Emitted as a custom section so a unit carries its own relocations:
+    /// the store keeps wasm and nothing else, and an engine ignores a
+    /// section it does not know.
+    body_relocs: Vec<Vec<u32>>,
     /// `(min, max)` in elements, for the single funcref table.
     /// Locally defined dispatch tables, in index order.
     tables: Vec<(u32, u32)>,
@@ -534,6 +615,7 @@ impl Module {
     pub fn declare_func(&mut self, ty: u32) -> u32 {
         self.functions.push(ty);
         self.bodies.push(Vec::new());
+        self.body_relocs.push(Vec::new());
         self.n_imports() + self.functions.len() as u32 - 1
     }
 
@@ -541,6 +623,15 @@ impl Module {
     pub fn define_func(&mut self, index: u32, body: Vec<u8>) {
         let local = (index - self.n_imports()) as usize;
         self.bodies[local] = body;
+    }
+
+    /// As [`Self::define_func`], recording where the body names a local
+    /// function so the merger can find those immediates without decoding
+    /// anything. See [`crate::merge`].
+    pub fn define_func_with_relocs(&mut self, index: u32, body: Vec<u8>, relocs: Vec<u32>) {
+        let local = (index - self.n_imports()) as usize;
+        self.bodies[local] = body;
+        self.body_relocs[local] = relocs;
     }
 
     /// Declare a locally defined dispatch table.
@@ -722,10 +813,18 @@ impl Module {
         }
 
         // 10: code
+        let mut code_relocs: Vec<u32> = Vec::new();
         if !self.bodies.is_empty() {
             let mut s = Vec::new();
             write_u32(&mut s, self.bodies.len() as u32);
-            for b in &self.bodies {
+            for (i, b) in self.bodies.iter().enumerate() {
+                // Where this body starts inside the section payload, so the
+                // recorded offsets become payload-relative and the merger can
+                // patch without knowing anything about bodies.
+                let base = s.len() as u32;
+                for r in &self.body_relocs[i] {
+                    code_relocs.push(base + r);
+                }
                 s.extend_from_slice(b);
             }
             section(&mut out, 10, &s);
@@ -746,6 +845,19 @@ impl Module {
                 s.extend_from_slice(&d.bytes);
             }
             section(&mut out, 11, &s);
+        }
+
+        // Where this module names its own functions. A custom section, so it
+        // travels with the bytes -- the shared store keeps wasm and nothing
+        // else -- and an engine ignores it.
+        if !code_relocs.is_empty() {
+            let mut sec = Vec::with_capacity(code_relocs.len() * 4 + 16);
+            write_name(&mut sec, RELOC_SECTION);
+            write_u32(&mut sec, code_relocs.len() as u32);
+            for r in &code_relocs {
+                sec.extend_from_slice(&r.to_le_bytes());
+            }
+            section(&mut out, 0, &sec);
         }
 
         for (name, bytes) in custom {

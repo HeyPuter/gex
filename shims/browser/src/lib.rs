@@ -5896,19 +5896,19 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // inside a library a process will miss all over it, and each
                 // of those is a module somebody has already built -- so take
                 // them all on the first miss and stop coming back.
-                // Bounded, because installing is not free. Once a forked
-                // child inherited its parent's code identities it began
-                // *finding* everything, and taking a whole object at a time
-                // meant seventeen hundred `WebAssembly.instantiate` calls per
-                // process -- about four seconds each, against three hundred
-                // milliseconds of translation. Finding the code became dearer
-                // than lifting it, and a shell loop over 21 processes stopped
-                // finishing inside two minutes.
+                // How many units one miss may take, and it matters far more
+                // than it looks. Merging makes a batch one module, so the
+                // obvious move is to take everything -- and that is ten times
+                // slower, measured:
                 //
-                // So take a few per miss and come back. The right answer is
-                // one module rather than a thousand -- the units are all this
-                // emitter's own output and could be merged -- and until that
-                // exists this keeps the cost proportional to the misses.
+                //     16 per miss      31,747 ms
+                //     4096 per miss   300,091 ms
+                //
+                // on the 21-process shell loop. Compiling one enormous module
+                // is worse than compiling several small ones by enough to
+                // swamp everything else, so the cap is not a safety valve, it
+                // is the setting. Sixteen is measured; the values between have
+                // not been.
                 const PER_MISS: usize = 16;
                 let mut ready = shared_modules_of_object(
                     h,
@@ -5922,18 +5922,47 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                             ready.len()
                         ));
                     }
-                    for (id, slots, dirs, wasm) in ready {
-                        h.jit.installed_mods.insert(id);
-                        // Every page it covers, before the install rather than
-                        // after: installing asks the shim which slot each block
-                        // belongs in, and the answer comes from here. A Worker
-                        // that assigned only the page it faulted on would place
-                        // one block and silently drop the rest.
-                        for (p, b) in &dirs {
+                    // One module out of however many were found. Installed
+                    // separately, each is a `WebAssembly.compile` and an
+                    // `instantiate`, and that -- not translation -- is what a
+                    // process spends its time on once it can identify its own
+                    // pages: about seventeen hundred of them, three and a half
+                    // seconds, against three hundred milliseconds of lifting.
+                    //
+                    // The merge copies bodies without reading them and patches
+                    // only the immediates the emitter recorded, so the code
+                    // that runs afterwards is byte-for-byte what it would have
+                    // been. See `gex_emit::merge`.
+                    let mut slots = 0u64;
+                    let mut dirs: Vec<(u64, u32)> = Vec::new();
+                    for (id, s, d, _) in &ready {
+                        h.jit.installed_mods.insert(*id);
+                        slots = slots.max(*s);
+                        // Every page they cover, before the install rather
+                        // than after: installing asks the shim which slot each
+                        // block belongs in, and the answer comes from here. A
+                        // Worker that assigned only the page it faulted on
+                        // would place one block and silently drop the rest.
+                        for (p, b) in d {
                             h.jit.page_table.assign(*p, *b);
                         }
+                        dirs.extend_from_slice(d);
                         h.jit.reuse_served += 1;
-                        h.jit.pending.push_back(PendingModule { dirs, slots, wasm });
+                    }
+                    let bytes: Vec<&[u8]> = ready.iter().map(|(_, _, _, w)| w.as_slice()).collect();
+                    match gex_xlate::merge::merge(&bytes) {
+                        Some(wasm) => h.jit.pending.push_back(PendingModule { dirs, slots, wasm }),
+                        None => {
+                            // Not the shape the merger expects. One at a time
+                            // rather than lose the code.
+                            for (_, s, d, w) in ready {
+                                h.jit.pending.push_back(PendingModule {
+                                    dirs: d,
+                                    slots: s,
+                                    wasm: w,
+                                });
+                            }
+                        }
                     }
                     publish_pending(h);
                     set_resume(pc);

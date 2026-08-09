@@ -122,6 +122,7 @@ pub struct Context<'a> {
     pub gir: &'a HashMap<u64, &'a Block>,
 }
 
+
 /// How many blocks may go into one region. One turns regions off.
 fn region_limit() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -161,12 +162,34 @@ fn check_sp() -> bool {
 ///
 /// When the block heads a loop, the loop's other blocks come with it: see
 /// [`Emitter::run_region`].
+/// As [`compile`], and where the body names a function of its own module.
+///
+/// Those immediates move if the module is concatenated with another, and
+/// `gex_emit::merge` patches them rather than decoding the instruction stream
+/// to find them. Written at a fixed width, so a patch cannot change a body's
+/// length.
+pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32>) {
+    let mut e = Emitter::new(cx);
+    if check_sp() {
+        e.emit_sp_check(block.start);
+    }
+    run_one(&mut e, block);
+    e.f.finish_with_relocs()
+}
+
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx);
     if check_sp() {
         e.emit_sp_check(block.start);
     }
-    match crate::region::grow(block.start, cx.gir, region_limit()) {
+    run_one(&mut e, block);
+    e.f.finish()
+}
+
+/// The body of both entry points: a region if one can be grown here,
+/// otherwise the block on its own.
+fn run_one(e: &mut Emitter<'_>, block: &Block) {
+    match crate::region::grow(block.start, e.cx.gir, region_limit()) {
         Some(region) if region_limit() > 1 => {
             if std::env::var_os("GEX_REGION_DEBUG").is_some() {
                 let members: Vec<String> = region.iter().map(|a| format!("{a:#x}")).collect();
@@ -181,7 +204,6 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
         }
         _ => e.run(block),
     }
-    e.f.finish()
 }
 
 /// Where a guest register currently lives.
@@ -2237,7 +2259,7 @@ impl<'a> Emitter<'a> {
     fn jump_to_constant(&mut self, target: u64) {
         if let Some(&func) = self.cx.blocks.get(&target) {
             self.f.local_get(self.ctx_local);
-            self.f.return_call(func);
+            self.f.return_call_local(func);
             return;
         }
         // Not in this module: record the PC and go through the table. The
