@@ -40,16 +40,34 @@ pub struct Vma {
     pub prot: u32,
     /// A short label for `/proc/self/maps`.
     pub name: String,
-    /// Where these bytes came from, when they came from somewhere nameable:
-    /// the file, and the offset within it that `start` corresponds to.
+    /// Where these bytes can be *rebuilt* from: the file, and the offset
+    /// within it that `start` corresponds to.
     ///
-    /// This is not for `/proc`. It is what lets two processes that map the
-    /// same library at the same address agree that the *code* is the same,
-    /// and so share the dispatch slots and the translations that went into
-    /// them. Without it every `execve` starts a fresh page table and pays for
-    /// libc again -- and in a browser tab, where the dispatch table cannot
-    /// grow past ten million slots, paying twice is not merely slow.
+    /// Only a mapping that has never been writable has one, because only that
+    /// one can be reconstructed by re-reading. Used by snapshot and restore.
     pub origin: Option<(String, u64)>,
+    /// Where these bytes were *loaded* from, whatever happened afterwards.
+    ///
+    /// This is what lets two processes that map the same library at the same
+    /// address agree that the *code* is the same, and so share the dispatch
+    /// slots and the translations that went into them. Without it every
+    /// `execve` starts a fresh page table and pays for libc again -- and in a
+    /// browser tab, where the dispatch table cannot grow past ten million
+    /// slots, paying twice is not merely slow.
+    ///
+    /// It is separate from `origin` because the two answer different
+    /// questions, and answering both with one field cost the whole mechanism.
+    /// `origin` asks "can this be rebuilt by re-reading the file", and the
+    /// answer is no for an image segment -- whose `mem_size` runs past the
+    /// file's bytes into a zeroed tail -- and no for anything `mprotect` has
+    /// touched, since `ld.so` relocates a RELRO region before making it
+    /// read-only. Both are true and neither has anything to do with whether
+    /// the *code* is the same code: a segment's executable bytes are exactly
+    /// `p_offset .. p_filesz`, and the zeroed tail is never executable.
+    ///
+    /// Losing it in those two places is why two thirds of the misses in a
+    /// second `ls` had no identity at all and were translated again.
+    pub code: Option<(String, u64)>,
 }
 
 impl Vma {
@@ -62,6 +80,10 @@ impl Vma {
             name: self.name.clone(),
             origin: self
                 .origin
+                .as_ref()
+                .map(|(id, off)| (id.clone(), off + (start - self.start))),
+            code: self
+                .code
                 .as_ref()
                 .map(|(id, off)| (id.clone(), off + (start - self.start))),
         }
@@ -218,6 +240,28 @@ impl MemoryMap {
         self.insert_from(start, end, prot, name, None);
     }
 
+    /// As [`Self::insert`], for bytes a loader placed rather than copied: the
+    /// file and offset name the *code*, but the mapping cannot be rebuilt by
+    /// re-reading, so it gets no `origin`.
+    ///
+    /// This is how an ELF segment arrives. Its `mem_size` runs past the file
+    /// into a zeroed tail, which is why it cannot be reconstructed -- and its
+    /// executable bytes are still exactly a range of the file, which is why it
+    /// can be recognised.
+    pub fn insert_loaded(
+        &mut self,
+        start: u64,
+        end: u64,
+        prot: u32,
+        name: &str,
+        code: Option<(String, u64)>,
+    ) {
+        self.insert_from(start, end, prot, name, code);
+        if let Some(v) = self.vmas.iter_mut().find(|v| v.start == page_align_down(start)) {
+            v.origin = None;
+        }
+    }
+
     /// As [`Self::insert`], recording where the bytes came from.
     pub fn insert_from(
         &mut self,
@@ -238,6 +282,7 @@ impl MemoryMap {
             end: page_align_up(end),
             prot,
             name: name.to_string(),
+            code: origin.clone(),
             origin,
         });
         self.vmas.sort_by_key(|v| v.start);
@@ -494,6 +539,13 @@ impl MemoryMap {
             // reconstructed them by re-reading would throw the relocations
             // away. Only a mapping that has never been writable can be
             // reconstructed, and that is exactly the one this never touches.
+            //
+            // `code` survives, because it answers a different question: what
+            // was loaded here, not what can be re-read. The relocated words
+            // are data -- a RELRO region is the GOT and the linkage tables --
+            // and the executable bytes of the segment are the file's. Two
+            // processes running the same program relocate them the same way,
+            // at the same addresses, because placement is pinned.
             let mut piece = v.slice(v.start.max(addr), v.end.min(end), new_prot);
             piece.origin = None;
             out.push(piece);

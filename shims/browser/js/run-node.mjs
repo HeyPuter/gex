@@ -303,7 +303,8 @@ const host = new ProcessHost({
           // question these answer is why a forked and exec'd child lifts
           // its parent's libraries again.
           (m.reuse
-            ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]} noident=${m.reuse[3]}`
+            ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]} noident=${m.reuse[3]}` +
+              ` served=${m.reuse[4]} stored=${m.reuse[5]} refused=${m.reuse[6]} unclaimed=${m.reuse[7]} allmine=${m.reuse[8]}`
             : '') +
           '\n',
       );

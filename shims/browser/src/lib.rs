@@ -280,7 +280,7 @@ extern "C" {
     /// shareable too, and between two wasm modules that means bytes.
     fn k_mod_store(ptr: u32, len: u32, slots: u64, dirs_ptr: u32, dirs_len: u32) -> u32;
     fn k_mod_claim(page: u64, key: u64, id: u32);
-    fn k_mod_for(page: u64, key: u64) -> u32;
+    fn k_mod_for(page: u64, key: u64, n: u32) -> u32;
     fn k_mod_slots(id: u32) -> u64;
     fn k_mod_len(id: u32) -> u32;
     fn k_mod_dirs_len(id: u32) -> u32;
@@ -1221,6 +1221,11 @@ struct Jit {
     reuse_noident: u64,
     /// Modules installed from the shared store instead of being lifted.
     reuse_served: u64,
+    /// Translation units the system-wide store accepted, and units it turned
+    /// away. A unit it refuses can never be shared, however well the identity
+    /// of its pages matches.
+    store_ok: u64,
+    store_full: u64,
     /// Guest addresses that are `memcpy` and friends, to be served by a wasm
     /// bulk-memory instruction rather than translated.
     ///
@@ -2205,6 +2210,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 reuse_miss: 0,
                 reuse_noident: 0,
                 reuse_served: 0,
+                store_ok: 0,
+                store_full: 0,
                 intrinsics: Default::default(),
                 intrinsics_scanned: Default::default(),
                 candidates: Vec::new(),
@@ -3955,6 +3962,8 @@ pub extern "C" fn gex_adopt_child(
             reuse_miss: 0,
             reuse_noident: 0,
             reuse_served: 0,
+            store_ok: 0,
+            store_full: 0,
             intrinsics: Default::default(),
             intrinsics_scanned: Default::default(),
             candidates: Vec::new(),
@@ -4100,7 +4109,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         if seg.executable {
             prot |= gex_kernel::mem::prot::EXEC;
         }
-        // No origin. An image segment is *built* by the loader rather than
+        // No origin: an image segment is *built* by the loader rather than
         // copied from a file at an offset -- `mem_size` runs past the file's
         // bytes and the tail is zeroed -- so it cannot be reconstructed by
         // re-reading, and a snapshot has to carry its bytes.
@@ -4109,9 +4118,22 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         // segment's vaddr rather than a file offset, and putting the process
         // back reported `[initial] is gone; 0x20000000 cannot be restored`
         // and left the guest executing zeroes.
-        h.kernel
-            .mem
-            .insert(seg.vaddr, seg.vaddr + seg.mem_size, prot, "[image]");
+        //
+        // It does get a code identity, which is a different claim: this
+        // program's segment at this address. Not a file offset, because
+        // nothing re-reads it -- only two processes comparing what they are
+        // about to translate, and for them "the same executable, the same
+        // segment" is the whole question. Leaving it out is what made every
+        // `ls` translate its own text again: two thirds of the misses in a
+        // second run were on pages the loader itself had placed and then
+        // declined to name.
+        h.kernel.mem.insert_loaded(
+            seg.vaddr,
+            seg.vaddr + seg.mem_size,
+            prot,
+            "[image]",
+            Some((path.to_string(), seg.vaddr)),
+        );
     }
     let layout = gex_ld::build_initial_stack(
         &program.exe,
@@ -4300,6 +4322,12 @@ fn share_module(wasm: &[u8], slots: u64, dirs: &[(u64, u32)]) -> u32 {
     }
 }
 
+thread_local! {
+    /// Why a page that the identity map recognised still had nothing to
+    /// serve: nobody claimed it, and every claim was already installed.
+    static SERVE_NONE: std::cell::RefCell<(u64, u64)> = const { std::cell::RefCell::new((0, 0)) };
+}
+
 /// The shared module holding this page's code, if there is one and this
 /// Worker has not installed it: `(id, slots, dirs, wasm)`.
 fn shared_module_at(
@@ -4314,9 +4342,32 @@ fn shared_module_at(
         if k_present() == 0 {
             return None;
         }
-        let id = k_mod_for(page, key);
-        if id == 0 || h.jit.installed_mods.contains(&id) {
-            return None;
+        // The first module covering this page that this Worker has not got.
+        // A page accumulates one claim per translation unit that reached it,
+        // and taking only the first left the rest of the page's blocks to be
+        // lifted again -- four hundred pages recognised, nineteen modules
+        // served, and the second `ls` still translating fifteen thousand
+        // blocks.
+        let mut id = 0;
+        let mut seen = 0;
+        for n in 0.. {
+            let candidate = k_mod_for(page, key, n);
+            if candidate == 0 {
+                SERVE_NONE.with(|c| {
+                    let mut c = c.borrow_mut();
+                    if seen == 0 {
+                        c.0 += 1;
+                    } else {
+                        c.1 += 1;
+                    }
+                });
+                return None;
+            }
+            seen += 1;
+            if !h.jit.installed_mods.contains(&candidate) {
+                id = candidate;
+                break;
+            }
         }
         let len = k_mod_len(id) as usize;
         if len == 0 {
@@ -4355,7 +4406,12 @@ fn page_identity(h: &Host, page: u64) -> Option<u64> {
     if v.prot & gex_kernel::mem::prot::WRITE != 0 {
         return None;
     }
-    let (id, off) = v.origin.as_ref()?;
+    // What was *loaded* here, not what could be re-read from disk. Those are
+    // different questions and one field was answering both: an image segment
+    // has no `origin` because its zeroed tail cannot be reconstructed, and an
+    // `mprotect`ed piece loses its `origin` because RELRO relocations are not
+    // the file's bytes. Both true, and neither says the code differs.
+    let (id, off) = v.code.as_ref()?;
     // The file and the offset within it, and nothing else.
     //
     // The extent of the mapping used to be in here too, and it made the key
@@ -5699,6 +5755,11 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // a fact about the process that produced the module, and the one
         // installing it has a different high-water mark.
         let mod_id = share_module(&unit.wasm, unit.table_slots, &unit.dir_entries);
+        if mod_id == 0 {
+            h.jit.store_full += 1;
+        } else {
+            h.jit.store_ok += 1;
+        }
         for (page, base) in &unit.dir_entries {
             if let Some(key) = page_identity(h, *page * gex_abi::DISPATCH_PAGE) {
                 record_shared_slot(h, *page, key, *base);
@@ -6771,6 +6832,10 @@ pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
             1 => h.jit.reuse_hit,
             2 => h.jit.reuse_miss,
             4 => h.jit.reuse_served,
+            5 => h.jit.store_ok,
+            6 => h.jit.store_full,
+            7 => SERVE_NONE.with(|c| c.borrow().0),
+            8 => SERVE_NONE.with(|c| c.borrow().1),
             _ => h.jit.reuse_noident,
         }) as i64
     })

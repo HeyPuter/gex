@@ -358,8 +358,16 @@ struct SharedModule {
 struct ModStore {
     /// By id. Index zero is never used: zero means "none".
     mods: Vec<SharedModule>,
-    /// Which module holds the code for a page of a given object.
-    by_page: BTreeMap<(u64, u64), u32>,
+    /// Which modules hold code for a page of a given object.
+    ///
+    /// Every one of them, not the first. A page is not translated once: the
+    /// translator discovers what it can reach from the block that missed, so
+    /// a page fills in over many units as the program takes new paths through
+    /// it. Keeping only the first claim meant a process could install one
+    /// unit's worth of a page and then had to translate the rest itself --
+    /// which is why sharing recognised four hundred pages and served
+    /// nineteen modules.
+    by_page: BTreeMap<(u64, u64), Vec<u32>>,
     /// What has been stored, against [`MOD_BUDGET`].
     total: usize,
 }
@@ -425,7 +433,9 @@ pub unsafe extern "C" fn k_mod_store(
     }
     m.total += len as usize;
     m.mods.push(SharedModule { wasm, slots, dirs });
-    (m.mods.len() - 1) as u32
+    // One-based. Zero is how every caller says "no module", so a module at
+    // index zero would be stored, claimed for nothing, and never found.
+    m.mods.len() as u32
 }
 
 /// Say that module `id` holds the code for page `page` of object `key`.
@@ -434,22 +444,27 @@ pub extern "C" fn k_mod_claim(page: u64, key: u64, id: u32) {
     if id == 0 {
         return;
     }
-    modules()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .by_page
-        .entry((page, key))
-        .or_insert(id);
+    let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    let claims = m.by_page.entry((page, key)).or_default();
+    if !claims.contains(&id) {
+        claims.push(id);
+    }
 }
 
-/// Which module holds it, or zero.
+/// The `n`th module holding code for this page, or zero past the end.
+///
+/// The caller walks `n` upwards until it finds one it has not installed. A
+/// page accumulates a claim per translation unit that touched it, so asking
+/// only for the first would hand back whichever unit happened to reach the
+/// page earliest and leave the rest of its blocks to be translated again.
 #[no_mangle]
-pub extern "C" fn k_mod_for(page: u64, key: u64) -> u32 {
+pub extern "C" fn k_mod_for(page: u64, key: u64, n: u32) -> u32 {
     modules()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .by_page
         .get(&(page, key))
+        .and_then(|v| v.get(n as usize))
         .copied()
         .unwrap_or(0)
 }
@@ -461,7 +476,7 @@ pub extern "C" fn k_mod_slots(id: u32) -> u64 {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .mods
-        .get(id as usize)
+        .get((id as usize).wrapping_sub(1))
         .map(|m| m.slots)
         .unwrap_or(0)
 }
@@ -473,7 +488,7 @@ pub extern "C" fn k_mod_len(id: u32) -> u32 {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .mods
-        .get(id as usize)
+        .get((id as usize).wrapping_sub(1))
         .map(|m| m.wasm.len() as u32)
         .unwrap_or(0)
 }
@@ -484,7 +499,7 @@ pub extern "C" fn k_mod_dirs_len(id: u32) -> u32 {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .mods
-        .get(id as usize)
+        .get((id as usize).wrapping_sub(1))
         .map(|m| (m.dirs.len() * 12) as u32)
         .unwrap_or(0)
 }
@@ -496,7 +511,7 @@ pub extern "C" fn k_mod_dirs_len(id: u32) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn k_mod_read(id: u32, out: u32, cap: u32) -> u32 {
     let m = modules().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sm) = m.mods.get(id as usize) else {
+    let Some(sm) = m.mods.get((id as usize).wrapping_sub(1)) else {
         return 0;
     };
     if sm.wasm.len() > cap as usize {
@@ -512,7 +527,7 @@ pub unsafe extern "C" fn k_mod_read(id: u32, out: u32, cap: u32) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn k_mod_dirs_read(id: u32, out: u32, cap: u32) -> u32 {
     let m = modules().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sm) = m.mods.get(id as usize) else {
+    let Some(sm) = m.mods.get((id as usize).wrapping_sub(1)) else {
         return 0;
     };
     let n = sm.dirs.len() * 12;
