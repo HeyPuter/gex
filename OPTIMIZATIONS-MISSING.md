@@ -1122,7 +1122,44 @@ What it is not, each ruled out by measurement rather than argument:
 - **Not the missing `/usr/bin/xz`.** The full Debian rootfs has no `xz`
   either, so that `ENOENT` is what apt expects; and with a proper flat-repo
   `Release` and `InRelease` in place the crash happens *earlier*.
-- **Not the browser shim.** `gexc run --sysroot` reaches
-  `Get:1 file:/repo ./ InRelease [419 B]` and then hangs the same way. A
-  different engine, the same fault, which puts it in the kernel or the lifter
-  -- and makes `--strace` on the native host the right next instrument.
+- **It *is* the browser shim.** This was recorded the other way round an hour
+  earlier and the earlier reading was wrong, for a reason worth keeping: the
+  rootfs it was measured on was incomplete, and the native host was failing
+  in it for a different reason. On a *complete* rootfs the two hosts differ
+  cleanly -- native finishes, the browser crashes.
+
+## apt-get update works
+
+    apt-get update: exit 0, 27879ms, 1 index file(s) written
+
+On the native host, against a local flat repository: four URIs fetched, the
+lists written, the index parsed. `tests/real-programs/apt-update.sh` is that
+run, and it is now part of the gate.
+
+What it took was not translation. It was a rootfs that is actually complete.
+apt is made of helpers -- `file`, `copy`, `store`, `gpgv` -- and a rootfs
+assembled by hand from apt-get's own `DT_NEEDED` closure is missing what
+*they* need: `libseccomp` for the methods, `/etc/passwd` and `/etc/group` for
+the privilege drop, and the binaries the fd-scanning and exec paths reach
+for. Every one of those failed as something else -- a trap in `newfstatat`, a
+method exiting 100 after `getdents64`, a `free` of a wild pointer -- and none
+of them said "your rootfs is short of a file".
+
+The lesson is cheap to state and was expensive to learn: **measure a package
+manager against a whole machine, not against a closure.** The closure is the
+right unit for *translation*; it is the wrong unit for a filesystem.
+
+## Where a rootfs stops fitting
+
+#91, fixed. The kernel's memory is where the rootfs lives -- the filesystem
+belongs to the kernel and every bundled file is copied into it -- and it was
+capped at 1 GiB by `--max-memory` in the kernel build and by the `maximum` the
+host passes. A complete Debian arm64 image did not fit, and the failure was a
+bare `unreachable` out of `rust_oom`.
+
+Both are 4 GiB now, which is all a wasm32 memory can be. It costs nothing:
+`maximum` reserves address space rather than pages, and the memory still
+starts at 128 MiB and grows as files arrive. A 396 MB rootfs loads.
+
+That leaves exactly one thing between `apt-get update` and a browser, and it
+is the `free(2)` above.

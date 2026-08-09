@@ -23,12 +23,22 @@ cd "$(dirname "$0")/../.."
 OUT=target/shared-kernel/wasm32-unknown-unknown/release/gex_kernel_wasm.wasm
 # A shared memory carries its maximum in its *type*, so the host's memory and
 # this module must agree on it exactly. The linker defaults the maximum to the
-# initial, which would freeze the kernel at its own data size; 1 GiB is the
+# initial, which would freeze the kernel at its own data size; this is the
 # ceiling on everything it will ever hold -- every process's file table, every
 # pipe's buffer, every byte of every tmpfs.
+#
+# Four gigabytes, which is all a wasm32 memory can be. It was one, and a
+# complete Debian arm64 rootfs did not fit: the rootfs is a tmpfs and a tmpfs
+# lives here, so the ceiling on this memory is the ceiling on how large a
+# machine gex can boot. The failure gave nothing to go on -- a bare
+# `unreachable` out of `rust_oom` -- and it is why `apt-get update` ran on the
+# native host and not in a browser. That is #91.
+#
+# It is a reservation, not an allocation: the host still creates the memory at
+# 128 MiB and it grows as files arrive.
 RUSTFLAGS="-C link-arg=--import-memory \
   -C link-arg=--shared-memory \
-  -C link-arg=--max-memory=1073741824 \
+  -C link-arg=--max-memory=4294967296 \
   -C link-arg=--export-table \
   -C link-arg=--export=__stack_pointer \
   -C target-feature=+atomics,+bulk-memory,+mutable-globals" \

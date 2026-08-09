@@ -112,7 +112,19 @@ try {
   const path = new URL('../../../web/public/gex/gex_kernel.plain.wasm', import.meta.url);
   kernel = {
     module: await WebAssembly.compile(readFileSync(path)),
-    memory: new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }),
+    // Four gigabytes, which is all a wasm32 memory can be.
+    //
+    // The rootfs lives in here -- the filesystem belongs to the kernel, and
+    // every file the host bundles is copied into this memory -- so this
+    // ceiling is the largest rootfs a run can have. At one gigabyte a
+    // complete Debian arm64 image did not fit, and the failure was a bare
+    // `unreachable` out of `rust_oom` with nothing said about why. That is
+    // #91, and it is what stops `apt-get update` running here rather than
+    // anything about apt.
+    //
+    // Raising it costs nothing: `maximum` reserves address space, not pages.
+    // The memory still starts at 128 MiB and grows as files arrive.
+    memory: new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true }),
   };
 } catch {
   // Not built. `shims/kernel/build.sh` makes it; a run that never forks will
