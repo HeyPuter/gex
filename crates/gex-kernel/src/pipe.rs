@@ -242,3 +242,130 @@ mod tests {
         assert_eq!(p.write(b"x").unwrap(), 1);
     }
 }
+
+/// A pipe that lives in another wasm module.
+///
+/// The buffer above is an ordinary Rust allocation, and a `Arc<Pipe>` is a
+/// pointer -- so the two ends of one can only ever be in the same memory.
+/// That single fact is most of why the snapshot switcher existed: a shell
+/// pipeline is two processes and a pipe, and apt is a process and four method
+/// workers on pairs of them, so under a pointer they all had to share an
+/// address space.
+///
+/// Here the pipe is a *number*. The buffer is in the global kernel, each end
+/// is an id, and the bytes cross by being copied out of one process's memory
+/// and into the other's. Both ends can be Workers that share nothing else.
+#[derive(Clone, Copy)]
+pub struct Remote {
+    /// Make a pipe with both ends open. Returns its id.
+    pub new: extern "C" fn() -> i32,
+    /// Another descriptor onto one end, as `dup` and `fork` both make.
+    pub open_end: extern "C" fn(id: i32, write: i32),
+    /// Drop a descriptor. The last one on an end is what a reader sees as EOF.
+    pub close_end: extern "C" fn(id: i32, write: i32),
+    /// Read into, or write out of, an address in the caller's memory.
+    pub read: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
+    pub write: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
+    pub readable: extern "C" fn(id: i32) -> i32,
+    pub writable: extern "C" fn(id: i32) -> i32,
+    pub buffered: extern "C" fn(id: i32) -> i32,
+}
+
+/// One end of a pipe in the global kernel.
+///
+/// Dropping closes that end there, which is what a reader downstream needs:
+/// the last writer going away is EOF, and a writer that went away because its
+/// Worker exited has to count the same as one that called `close`.
+pub struct RemotePipeEnd {
+    pub id: i32,
+    pub write: bool,
+    pub remote: Remote,
+}
+
+impl std::fmt::Debug for RemotePipeEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RemotePipeEnd({}, {})",
+            self.id,
+            if self.write { "w" } else { "r" }
+        )
+    }
+}
+
+impl Drop for RemotePipeEnd {
+    fn drop(&mut self) {
+        (self.remote.close_end)(self.id, self.write as i32);
+    }
+}
+
+impl crate::vfs::FileHandle for RemotePipeEnd {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
+        if self.write {
+            return Err(Errno::EBADF);
+        }
+        match (self.remote.read)(self.id, buf.as_mut_ptr() as u32, buf.len() as u32) {
+            n if n >= 0 => Ok(n as u64),
+            n => Err(Errno(-n)),
+        }
+    }
+
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        if !self.write {
+            return Err(Errno::EBADF);
+        }
+        match (self.remote.write)(self.id, buf.as_ptr() as u32, buf.len() as u32) {
+            n if n >= 0 => Ok(n as u64),
+            n => Err(Errno(-n)),
+        }
+    }
+
+    fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
+        Ok(crate::vfs::Metadata {
+            file_type: crate::vfs::FileType::Fifo,
+            size: 0,
+            mode: 0o600,
+            ino: 0,
+            mtime: 0,
+        })
+    }
+
+    fn is_stream(&self) -> bool {
+        true
+    }
+
+    /// A pipe with nothing in it is not readable, whatever the default says.
+    /// The default is "yes", which is right for a file and wrong here.
+    fn poll_readable(&self) -> bool {
+        self.write || (self.remote.readable)(self.id) != 0
+    }
+
+    fn poll_writable(&self) -> bool {
+        !self.write || (self.remote.writable)(self.id) != 0
+    }
+
+    fn available(&self) -> Option<u64> {
+        Some(if self.write {
+            0
+        } else {
+            (self.remote.buffered)(self.id).max(0) as u64
+        })
+    }
+
+    fn write_room(&self) -> Option<u64> {
+        // Not reported: the global kernel answers a short write with the
+        // count it took, and the syscall layer carries the rest. Claiming a
+        // number here that another Worker can invalidate between the claim
+        // and the write would be worse than not claiming one.
+        None
+    }
+
+    fn debug_state(&self) -> String {
+        format!(
+            "shared pipe {} {}, {} buffered",
+            self.id,
+            if self.write { "write" } else { "read" },
+            (self.remote.buffered)(self.id)
+        )
+    }
+}

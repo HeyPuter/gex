@@ -357,6 +357,10 @@ pub struct Kernel {
     /// every process, because reparenting an orphan and killing a process
     /// group are both questions no single process can answer. See [`crate::proc`].
     pub procs: Arc<ProcTable>,
+    /// Where a pipe's buffer goes when the two ends may be in different
+    /// address spaces. `None` keeps the local `Pipe`, which is right whenever
+    /// every process really is one process. See [`crate::pipe::Remote`].
+    pub pipes: Option<crate::pipe::Remote>,
     /// This process's parent, cached from the table so `getppid` is not a
     /// lock. It never changes for a live process except when the parent dies,
     /// and `getppid` re-reads the table in that case.
@@ -903,6 +907,7 @@ impl Kernel {
             next_ctx_slot: 1,
             live_threads: 1,
             procs: Arc::new(ProcTable::new()),
+            pipes: None,
             ppid: 0,
             clock: system_clock,
             itimers: [None; 3],
@@ -1120,6 +1125,7 @@ impl Kernel {
             live_threads: 1,
             // The table is the system's, not the process's.
             procs: Arc::clone(&self.procs),
+            pipes: self.pipes,
             ppid: self.pid,
             clock: self.clock,
             // A fork does not inherit its parent's timers.
@@ -2348,6 +2354,13 @@ impl Kernel {
     }
 
     fn sys_pipe2(&mut self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
+        // A pipe in the global kernel when there is one, because the whole
+        // point of a pipe is that another process holds the other end -- and
+        // with a Worker per process that other end is in another memory,
+        // where an `Arc<Pipe>` means nothing.
+        if let Some(r) = self.pipes {
+            return self.shared_pipe2(m, r, fds, flags);
+        }
         let pipe = Arc::new(Pipe::new());
         let cloexec = flags & oflags::O_CLOEXEC != 0;
         let read_end = OpenFile::new(
@@ -2377,6 +2390,54 @@ impl Kernel {
         );
         // Both ends start with one reference each, which `Pipe::new` already
         // accounted for.
+        let rfd = self.fds.insert(read_end, cloexec)?;
+        let wfd = self.fds.insert(write_end, cloexec)?;
+        m.write_u32(fds, rfd as u32)?;
+        m.write_u32(fds + 4, wfd as u32)?;
+        Ok(0)
+    }
+
+    /// `pipe2` with the buffer in the global kernel.
+    ///
+    /// The two descriptions are the same shape as the local ones -- the same
+    /// flags, the same access modes -- and differ only in what the handle is.
+    /// The path carries the id and the end, because that is what a `fork` has
+    /// to send across to rebuild the descriptor in the child: see
+    /// `gex_fork_fds` in the browser shim.
+    fn shared_pipe2(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        r: crate::pipe::Remote,
+        fds: u64,
+        flags: u64,
+    ) -> SysResult {
+        let id = (r.new)();
+        if id < 0 {
+            return Err(Errno::ENFILE);
+        }
+        let cloexec = flags & oflags::O_CLOEXEC != 0;
+        let read_end = OpenFile::new(
+            Arc::new(crate::pipe::RemotePipeEnd {
+                id,
+                write: false,
+                remote: r,
+            }),
+            format!("pipe:[{id}]"),
+            flags | oflags::O_RDONLY,
+            true,
+            false,
+        );
+        let write_end = OpenFile::new(
+            Arc::new(crate::pipe::RemotePipeEnd {
+                id,
+                write: true,
+                remote: r,
+            }),
+            format!("pipe:[{id}]"),
+            flags | oflags::O_WRONLY,
+            false,
+            true,
+        );
         let rfd = self.fds.insert(read_end, cloexec)?;
         let wfd = self.fds.insert(write_end, cloexec)?;
         m.write_u32(fds, rfd as u32)?;

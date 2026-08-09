@@ -122,9 +122,73 @@ class NodeEnv extends Env {
 const shimWasm = readFileSync(
   new URL('../../../target/wasm32-unknown-unknown/release/gex_browser.wasm', import.meta.url),
 );
-const gex = new Gex(new NodeEnv());
+
+// The global kernel: the process table, the filesystem and the pipes every
+// process shares, in a module every Worker instantiates against one shared
+// memory. Optional, because a run of one process needs none of it -- but
+// without it a program that forks gets as far as the fork and no further.
+let kernel = null;
+try {
+  const path = new URL('../../../web/public/gex/gex_kernel.plain.wasm', import.meta.url);
+  kernel = {
+    module: await WebAssembly.compile(readFileSync(path)),
+    memory: new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }),
+  };
+} catch {
+  // Not built. `shims/kernel/build.sh` makes it; a run that never forks will
+  // not notice, and one that does will say so when it tries.
+}
+
+/**
+ * Start a child the guest forked, in a `worker_thread` of its own.
+ *
+ * The same `worker.mjs` a page uses. What is different here is only that the
+ * *first* process is not in a Worker -- this file is the main thread and runs
+ * it directly -- so children are wired up one at a time rather than through
+ * `host.mjs`.
+ */
+async function spawnChild(child, guestWasm) {
+  const { Worker } = await import('node:worker_threads');
+  // Not unref'd: a child outlives the parent, and this process has to stay
+  // up while it does. `park-across-switch` is exactly that shape -- the
+  // parent returns immediately and the whole point is what the child does
+  // afterwards -- and with an unref'd Worker node left as soon as the parent
+  // was done and the child's output never appeared.
+  const w = new Worker(new URL('./worker.mjs', import.meta.url));
+  w.on('message', (m) => {
+    if (m.kind === 'ready') {
+      w.postMessage({ kind: 'adopt', child, shim: shimWasm, guest: guestWasm, kernel,
+        debugExit: !!process.env.GEX_DEBUG_EXIT });
+    } else if (m.kind === 'output') {
+      (m.fd === 2 ? process.stderr : process.stdout).write(m.text);
+    } else if (m.kind === 'fork') {
+      spawnChild(m.child, guestWasm);
+    } else if (m.kind === 'stdin') {
+      // A child inherits its descriptors; anything it reads from the terminal
+      // it reads through one of those, not through this.
+      w.postMessage({ kind: 'eof' });
+    } else if (m.kind === 'exit' || m.kind === 'threw') {
+      if (m.kind === 'threw') process.stderr.write(`gex: process ${child.pid}: ${m.message}\n`);
+      else if (process.env.GEX_DEBUG_EXIT) {
+        process.stderr.write(`[gex] process ${child.pid} exited ${m.status}\n`);
+      }
+      w.terminate();
+    }
+  });
+  w.on('error', (e) => {
+    process.stderr.write(`gex: process ${child.pid} failed: ${e.message}\n`);
+  });
+}
+
+const guestWasm = readFileSync(guestPath);
+class ForkingEnv extends NodeEnv {
+  async spawnProcess(child) {
+    await spawnChild(child, guestWasm);
+  }
+}
+const gex = new Gex(new ForkingEnv(), { kernel });
 const args = [argv0 ?? elfPath, ...guestArgs];
-const entry = await gex.load(shimWasm, readFileSync(guestPath), readFileSync(elfPath), files, args, {
+const entry = await gex.load(shimWasm, guestWasm, readFileSync(elfPath), files, args, {
   strace,
   // The suite compares this run against QEMU on the same machine, and QEMU
   // reports the real user.

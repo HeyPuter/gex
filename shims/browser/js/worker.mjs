@@ -100,6 +100,7 @@ port.on(async (msg) => {
     }
   }
 
+  if (msg.debugExit) globalThis.GEX_DEBUG_EXIT = 1;
   const gex = new Gex(new WorkerEnv(), { kernel: msg.kernel ?? null });
   try {
     let entry;

@@ -839,8 +839,11 @@ fi
 # because a memory import's `shared` flag is part of its type and cannot be
 # chosen at run time; the shared one is what will let a process's threads each
 # be a Worker. Skips where there is no nightly toolchain to build it with.
-if [ -n "$NODE" ] && [ -x "$WORK/park" ]; then
-    out=$(timeout 200 "$NODE" "$HERE/../../web/test/shared-memory.mjs" "$WORK/park" 2>&1 || true)
+# A single-process program, deliberately: what this compares is the two
+# *builds*, and one that forks would be comparing the host's Worker plumbing
+# instead -- which has tests of its own.
+if [ -n "$NODE" ] && [ -x "$WORK/loops" ]; then
+    out=$(timeout 200 "$NODE" "$HERE/../../web/test/shared-memory.mjs" "$WORK/loops" 2>&1 || true)
     case "$out" in
         ok*) echo "$out" | head -1; pass=$((pass + 1)) ;;
         skip*) echo "$out" | head -1 ;;

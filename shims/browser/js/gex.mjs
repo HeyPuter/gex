@@ -510,6 +510,8 @@ export class Gex {
       'k_fs_unlink', 'k_fs_mkdir', 'k_fs_rmdir', 'k_fs_rename', 'k_fs_chmod',
       'k_fs_symlink', 'k_fs_link', 'k_fs_add', 'k_fs_populated',
       'k_fs_populate_done',
+      'k_pipe_new', 'k_pipe_open_end', 'k_pipe_close_end', 'k_pipe_read',
+      'k_pipe_write', 'k_pipe_readable', 'k_pipe_writable', 'k_pipe_buffered',
     ];
     // Two of these return an i64, which JS has to answer with a BigInt.
     const BIG = new Set(['k_wait', 'k_take_signals']);
@@ -612,6 +614,14 @@ export class Gex {
         e.gex_adopt_page(dv.getBigUint64(i, true), dv.getUint32(i + 8, true));
       }
     }
+    // After the kernel exists and before the guest runs: the first thing a
+    // forked child does is read or write a descriptor it expects to have.
+    if (child.fds?.length && e.gex_adopt_fds) {
+      const p = e.gex_alloc(child.fds.length) >>> 0;
+      this.#u8.set(child.fds, p);
+      e.gex_adopt_fds(p, child.fds.length);
+      e.gex_free?.(p, child.fds.length);
+    }
     for (const m of child.modules ?? []) await this.#installModule(m.mod, m.need);
     return entry;
   }
@@ -648,6 +658,16 @@ export class Gex {
       pages: this.#pageMap(),
       modules: this.#compiled.slice(),
       opts: this.#opts,
+      // The descriptors the child inherits, described rather than cloned: an
+      // open file is an `Arc` in the parent's heap and the child's Worker has
+      // never seen that heap. Without this a shell pipeline's child cannot
+      // read the pipe it was forked to read.
+      fds: e.gex_fork_fds_len
+        ? this.#u8.slice(
+            e.gex_fork_fds_ptr() >>> 0,
+            (e.gex_fork_fds_ptr() >>> 0) + (e.gex_fork_fds_len() >>> 0),
+          )
+        : null,
     };
     e.gex_fork_taken();
     if (!this.#env.spawnProcess) {

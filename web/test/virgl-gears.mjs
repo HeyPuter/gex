@@ -358,7 +358,15 @@ const server = createServer(async (req, res) => {
         : name.endsWith('.tar')
           ? 'application/x-tar'
           : 'text/html';
-    res.writeHead(200, { 'content-type': type });
+    // Cross-origin isolation, because the runtime wants a
+    // `SharedArrayBuffer`: the global kernel's memory is one, and so is a
+    // process whose threads are Workers. Without these headers the
+    // constructor is not there at all.
+    res.writeHead(200, {
+      'content-type': type,
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    });
     res.end(body);
   } catch {
     res.writeHead(404).end();

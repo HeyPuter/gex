@@ -61,6 +61,14 @@ impl OpenFile {
         self.offset.load(Ordering::Relaxed)
     }
 
+    /// Put the cursor where another process's copy of this description had
+    /// it. For a `fork` whose child is a different address space: the two
+    /// share an open-file description on Linux, and the nearest this can get
+    /// is starting the child's from the same place.
+    pub fn set_offset(&self, at: u64) {
+        self.offset.store(at, Ordering::Relaxed);
+    }
+
     /// Whether a `read` on this descriptor would have to wait.
     ///
     /// A descriptor opened `O_NONBLOCK` never waits -- it is asking for the
@@ -335,6 +343,23 @@ impl FdTable {
     /// How many times the table has changed.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Every open descriptor, with its description.
+    ///
+    /// What `fork` needs when the child is another address space: the table
+    /// cannot be cloned there, because a cloned `Arc` names a memory the
+    /// child does not have. So the child is sent a *description* of each
+    /// descriptor and rebuilds it -- see `gex_fork_fds` in the browser shim.
+    pub fn entries(&self) -> Vec<(i32, Arc<OpenFile>, bool)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                e.as_ref()
+                    .map(|f| (i as i32, Arc::clone(f), self.cloexec[i]))
+            })
+            .collect()
     }
 
     /// Every open descriptor and the path behind it.

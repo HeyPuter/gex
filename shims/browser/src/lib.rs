@@ -245,6 +245,18 @@ extern "C" {
     /// should: the rest would unpack the same rootfs over the top of it.
     fn k_fs_populated() -> i32;
     fn k_fs_populate_done();
+
+    // Pipes. A shell pipeline is two processes and a pipe, and apt is a
+    // process and four method workers on pairs of them; with a Worker per
+    // process the other end is always in another memory.
+    fn k_pipe_new() -> i32;
+    fn k_pipe_open_end(id: i32, write: i32);
+    fn k_pipe_close_end(id: i32, write: i32);
+    fn k_pipe_read(id: i32, at: u32, len: u32) -> i32;
+    fn k_pipe_write(id: i32, at: u32, len: u32) -> i32;
+    fn k_pipe_readable(id: i32) -> i32;
+    fn k_pipe_writable(id: i32) -> i32;
+    fn k_pipe_buffered(id: i32) -> i32;
 }
 
 // A wasm import is `unsafe`, and `Remote` holds safe fn pointers, so each one
@@ -380,6 +392,48 @@ extern "C" fn rf_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32 {
     unsafe { k_fs_link(from, from_len, to, to_len) }
 }
 
+extern "C" fn rp_new() -> i32 {
+    unsafe { k_pipe_new() }
+}
+extern "C" fn rp_open_end(id: i32, write: i32) {
+    unsafe { k_pipe_open_end(id, write) }
+}
+extern "C" fn rp_close_end(id: i32, write: i32) {
+    unsafe { k_pipe_close_end(id, write) }
+}
+extern "C" fn rp_read(id: i32, at: u32, len: u32) -> i32 {
+    unsafe { k_pipe_read(id, at, len) }
+}
+extern "C" fn rp_write(id: i32, at: u32, len: u32) -> i32 {
+    unsafe { k_pipe_write(id, at, len) }
+}
+extern "C" fn rp_readable(id: i32) -> i32 {
+    unsafe { k_pipe_readable(id) }
+}
+extern "C" fn rp_writable(id: i32) -> i32 {
+    unsafe { k_pipe_writable(id) }
+}
+extern "C" fn rp_buffered(id: i32) -> i32 {
+    unsafe { k_pipe_buffered(id) }
+}
+
+/// Where a pipe's buffer goes, when there is a global kernel to put it in.
+fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
+    if unsafe { k_present() } == 0 {
+        return None;
+    }
+    Some(gex_kernel::pipe::Remote {
+        new: rp_new,
+        open_end: rp_open_end,
+        close_end: rp_close_end,
+        read: rp_read,
+        write: rp_write,
+        readable: rp_readable,
+        writable: rp_writable,
+        buffered: rp_buffered,
+    })
+}
+
 /// The root every process shares, if the host gave us a global kernel.
 ///
 /// Mounted at `/` in place of this process's own `TmpFs`. Without it a forked
@@ -513,6 +567,43 @@ impl FileHandle for StdinQueue {
     /// more.
     fn poll_readable(&self) -> bool {
         self.eof.get() || !self.bytes.borrow().is_empty()
+    }
+}
+
+/// Give a kernel the three standard descriptors, pointed at the page.
+///
+/// `Kernel::new` installs `gex-kernel`'s own, which write through `std::io`
+/// and on `wasm32-unknown-unknown` go nowhere at all. Every kernel this shim
+/// builds has to have them replaced, and there is more than one such kernel:
+/// the process `gex_load` places, and every child `gex_adopt_child` adopts.
+/// A forked child whose output vanished is exactly what happened when only
+/// the first of those did it -- the guest ran correctly and said nothing.
+fn install_console(kernel: &mut Kernel) {
+    let _ = kernel.fds.install(
+        0,
+        OpenFile::new(
+            Arc::clone(&*STDIN) as Arc<dyn FileHandle>,
+            "/dev/stdin".to_string(),
+            0,
+            true,
+            false,
+        ),
+        false,
+    );
+    for fd in [1, 2] {
+        let f = OpenFile::new(
+            Arc::new(Console { fd }),
+            if fd == 1 {
+                "/dev/stdout"
+            } else {
+                "/dev/stderr"
+            }
+            .to_string(),
+            0,
+            false,
+            true,
+        );
+        let _ = kernel.fds.install(fd, f, false);
     }
 }
 
@@ -1420,6 +1511,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     if let Some(procs) = global_procs() {
         kernel.procs = procs;
     }
+    kernel.pipes = global_pipes();
     match &shared_root {
         Some(r) => kernel.vfs.mount("/", r.clone()),
         None => kernel.vfs.mount("/", root.clone()),
@@ -1477,32 +1569,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     kernel.uid = unsafe { IDENTITY.0 };
     // Replace the descriptors `Kernel::new` opened on `std::io` with ones the
     // host can actually see.
-    let _ = kernel.fds.install(
-        0,
-        OpenFile::new(
-            Arc::clone(&*STDIN) as Arc<dyn FileHandle>,
-            "/dev/stdin".to_string(),
-            0,
-            true,
-            false,
-        ),
-        false,
-    );
-    for fd in [1, 2] {
-        let f = OpenFile::new(
-            Arc::new(Console { fd }),
-            if fd == 1 {
-                "/dev/stdout"
-            } else {
-                "/dev/stderr"
-            }
-            .to_string(),
-            0,
-            false,
-            true,
-        );
-        let _ = kernel.fds.install(fd, f, false);
-    }
+    install_console(&mut kernel);
 
     let data = guest_bytes();
     for seg in program.segments() {
@@ -2333,6 +2400,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     //
     // The host reads these, builds the Worker, and that Worker calls
     // `gex_adopt_child` to become the process.
+    stage_fork_fds(h);
     FORK[1].store(pc + 4, std::sync::atomic::Ordering::Relaxed);
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
@@ -2340,6 +2408,144 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     // Last, because it is what the host tests: the rest must be readable by
     // the time a non-zero pid appears.
     FORK[0].store(pid as u64, std::sync::atomic::Ordering::Release);
+}
+
+/// The child's descriptor table, as text, staged for the host to carry.
+///
+/// A `fork` on Linux gives the child the parent's open-file descriptions --
+/// the same offsets, the same pipe ends. `FdTable::clone_table` does exactly
+/// that when the child shares the memory, and means nothing when it does not:
+/// an `Arc<OpenFile>` is a pointer into a heap the child's Worker has never
+/// seen.
+///
+/// So the child is sent a *description* of each descriptor and rebuilds it.
+/// Only the ones that can be rebuilt travel, which is the honest limit of
+/// this: a file in the shared root and a pipe in the global kernel both can,
+/// because both are an id or a path that means the same thing in any process.
+/// A device node or a host socket cannot, and is left closed rather than
+/// silently replaced by something that is not it.
+///
+/// One line per descriptor:
+///
+///     <fd> <cloexec> <flags> <offset> <path>
+///
+/// Space-separated because a guest path may contain anything but a newline,
+/// so the path goes last and everything before it is a number.
+static FORK_FDS: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+
+/// Describe the calling process's descriptors for the child.
+fn stage_fork_fds(h: &Host) {
+    let mut out = String::new();
+    for (fd, file, cloexec) in h.kernel.fds.entries() {
+        // A pipe end has to be opened again in the global kernel, or the
+        // parent closing its copy would look like the last reference going
+        // away and the reader downstream would see an end of file that has
+        // not happened.
+        if let Some(id) = pipe_id(&file.path) {
+            let write = file.writable;
+            unsafe { k_pipe_open_end(id, write as i32) };
+        } else if !file.path.starts_with('/') {
+            // Not a path and not a pipe: standard input and output, a device,
+            // a socket. Nothing here can rebuild those from a name.
+            continue;
+        }
+        out.push_str(&format!(
+            "{} {} {} {} {}\n",
+            fd,
+            cloexec as i32,
+            file.flags(),
+            file.offset(),
+            file.path
+        ));
+    }
+    *FORK_FDS.0.borrow_mut() = out;
+}
+
+/// The pipe id in a path like `pipe:[7]`, if that is what it is.
+fn pipe_id(path: &str) -> Option<i32> {
+    path.strip_prefix("pipe:[")?.strip_suffix(']')?.parse().ok()
+}
+
+/// Where the child's descriptor table is staged, and how long it is.
+#[no_mangle]
+pub extern "C" fn gex_fork_fds_ptr() -> u32 {
+    FORK_FDS.0.borrow().as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_fds_len() -> u32 {
+    FORK_FDS.0.borrow().len() as u32
+}
+
+/// Rebuild the descriptors the parent had, in the child.
+///
+/// Called once, by the child's own Worker, straight after `gex_adopt_child`.
+/// Standard input, output and error are already there -- the kernel makes
+/// them -- so a line naming one of those replaces it, which is what a shell
+/// redirecting a child's output needs.
+#[no_mangle]
+pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
+    let Ok(text) = std::str::from_utf8(shim_slice(ptr, len)) else {
+        return -1;
+    };
+    let text = text.to_string();
+    with_host(|h| {
+        let mut n = 0;
+        for line in text.lines() {
+            let mut parts = line.splitn(5, ' ');
+            let Some(fd) = parts.next().and_then(|v| v.parse::<i32>().ok()) else {
+                continue;
+            };
+            let Some(cloexec) = parts.next().and_then(|v| v.parse::<i32>().ok()) else {
+                continue;
+            };
+            let Some(flags) = parts.next().and_then(|v| v.parse::<u64>().ok()) else {
+                continue;
+            };
+            let Some(offset) = parts.next().and_then(|v| v.parse::<u64>().ok()) else {
+                continue;
+            };
+            let Some(path) = parts.next() else { continue };
+            let file = if let Some(id) = pipe_id(path) {
+                let Some(r) = global_pipes() else { continue };
+                // The parent already opened this end on the child's behalf,
+                // before the copy was taken; nothing to open here.
+                let write = flags & gex_kernel::fs::oflags::ACCMODE
+                    != gex_kernel::fs::oflags::O_RDONLY;
+                gex_kernel::file::OpenFile::new(
+                    Arc::new(gex_kernel::pipe::RemotePipeEnd {
+                        id,
+                        write,
+                        remote: r,
+                    }),
+                    path.to_string(),
+                    flags,
+                    !write,
+                    write,
+                )
+            } else {
+                use gex_kernel::vfs::FileSystem;
+                let Some(root) = global_root() else { continue };
+                let Ok(handle) = root.open(path.trim_start_matches('/'), flags, 0) else {
+                    continue;
+                };
+                let acc = flags & gex_kernel::fs::oflags::ACCMODE;
+                let f = gex_kernel::file::OpenFile::new(
+                    handle,
+                    path.to_string(),
+                    flags,
+                    acc != gex_kernel::fs::oflags::O_WRONLY,
+                    acc != gex_kernel::fs::oflags::O_RDONLY,
+                );
+                f.set_offset(offset);
+                f
+            };
+            if h.kernel.fds.install(fd, file, cloexec != 0).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    })
 }
 
 /// A child `fork` has made that the host has not built a Worker for:
@@ -2437,6 +2643,8 @@ pub extern "C" fn gex_adopt_child(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls
     if let Some(procs) = global_procs() {
         kernel.procs = procs;
     }
+    kernel.pipes = global_pipes();
+    install_console(&mut kernel);
     kernel.pid = pid;
     kernel.tid = pid;
     // The system's filesystem, which the child could not otherwise have: its
