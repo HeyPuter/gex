@@ -313,6 +313,14 @@ if (process.env.GEX_RECOMPILE_OBJECTS) {
 //
 // Measured around `gex.run` alone: everything before it is loading, placing
 // the image and compiling; everything inside it is the guest.
+if (process.env.GEX_DEBUG_EXIT) {
+  // Before the guest has executed an instruction. A process's memory is what
+  // decides how many of them a browser will hold, so it matters whether the
+  // cost is placing the image or running it.
+  process.stderr.write(
+    `[gex] memory after load: ${(gex.memory.buffer.byteLength / (1 << 20)).toFixed(0)} MiB\n`,
+  );
+}
 if (process.env.GEX_HOT) gex.shim.exports.gex_set_hot?.(1);
 // GEX_NO_INTRINSICS translates glibc's own memcpy/memcmp/memset instead of
 // serving them, which is the only way to price the substitution.

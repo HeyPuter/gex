@@ -533,7 +533,24 @@ export class Gex {
     }
     // The bundle goes over before the program does: a dynamic executable
     // names an interpreter, and the loader reads it out of this filesystem.
+    // Freed, one file at a time.
+    //
+    // `gex_add_file` copies what it is given -- `shim_slice(..).to_vec()` --
+    // so the buffer handed over is dead the moment it returns, and nothing
+    // used to say so. Every file's bytes stayed allocated in this process's
+    // linear memory for the life of the process, on top of the copy the
+    // filesystem kept, so a rootfs cost twice its size and half of that was
+    // never read again.
+    //
+    // It is worth what it sounds like. A guest mounting Debian's 226 MB
+    // rootfs reached 560 MiB before executing an instruction; the same guest
+    // with a 1.9 MB rootfs reached 96 MiB. With the free, the allocator hands
+    // the same span back for the next file, so the peak is the largest single
+    // file rather than the sum of all of them -- and a browser holds one
+    // memory per process, which is what makes this the number that decides
+    // how many processes a tab can run.
     const enc = new TextEncoder();
+    const free = this.#shim.exports.gex_free;
     for (const [path, contents] of Object.entries(files)) {
       const p = enc.encode(path);
       const d = contents instanceof Uint8Array ? contents : enc.encode(contents);
@@ -542,6 +559,10 @@ export class Gex {
       this.#bytes().set(p, pp);
       this.#bytes().set(d, dp);
       this.#shim.exports.gex_add_file(pp, p.length, dp, d.length);
+      // Optional so that an older shim still loads; it simply keeps the old
+      // behaviour of never letting go.
+      free?.(pp, p.length);
+      free?.(dp, d.length);
     }
 
     const ptr = this.#shim.exports.gex_alloc(elf.length) >>> 0;
