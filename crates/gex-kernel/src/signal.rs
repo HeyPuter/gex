@@ -488,19 +488,21 @@ fn fault_code(signal: u32) -> u32 {
 
 /// Pack the four condition flags into a PSTATE word.
 fn read_pstate(m: &GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
-    let n = m.read_u32(ctx_addr + ctx::NF as u64)? as u64;
-    let z = m.read_u32(ctx_addr + ctx::ZF as u64)? as u64;
-    let c = m.read_u32(ctx_addr + ctx::CF as u64)? as u64;
-    let v = m.read_u32(ctx_addr + ctx::VF as u64)? as u64;
+    let (n, z, c, v) = ctx::unpack_nzcv(m.read_u32(ctx_addr + ctx::NZCV as u64)?);
     // EL0t with interrupts enabled, plus NZCV in their architectural places.
-    Ok((n << 31) | (z << 30) | (c << 29) | (v << 28))
+    Ok(((n as u64) << 31) | ((z as u64) << 30) | ((c as u64) << 29) | ((v as u64) << 28))
 }
 
 fn write_pstate(m: &mut GuestMem<'_>, ctx_addr: u64, pstate: u64) -> Result<(), Errno> {
-    m.write_u32(ctx_addr + ctx::NF as u64, ((pstate >> 31) & 1) as u32)?;
-    m.write_u32(ctx_addr + ctx::ZF as u64, ((pstate >> 30) & 1) as u32)?;
-    m.write_u32(ctx_addr + ctx::CF as u64, ((pstate >> 29) & 1) as u32)?;
-    m.write_u32(ctx_addr + ctx::VF as u64, ((pstate >> 28) & 1) as u32)?;
+    m.write_u32(
+        ctx_addr + ctx::NZCV as u64,
+        ctx::pack_nzcv(
+            (pstate >> 31) as u32,
+            (pstate >> 30) as u32,
+            (pstate >> 29) as u32,
+            (pstate >> 28) as u32,
+        ),
+    )?;
     Ok(())
 }
 
@@ -634,8 +636,8 @@ mod tests {
     fn flags_are_preserved_across_a_handler() {
         let (mut buf, mut s) = setup();
         let mut m = GuestMem::new(&mut buf);
-        m.write_u32(CTX + ctx::NF as u64, 1).unwrap();
-        m.write_u32(CTX + ctx::CF as u64, 1).unwrap();
+        m.write_u32(CTX + ctx::NZCV as u64, ctx::pack_nzcv(1, 0, 1, 0))
+            .unwrap();
         s.set_action(
             sig::SIGUSR1,
             SigAction {
@@ -647,13 +649,11 @@ mod tests {
         s.raise(sig::SIGUSR1);
         dispatch(&mut s, &mut m, CTX).unwrap();
         // The handler runs with whatever flags it likes.
-        m.write_u32(CTX + ctx::NF as u64, 0).unwrap();
-        m.write_u32(CTX + ctx::CF as u64, 0).unwrap();
-        m.write_u32(CTX + ctx::ZF as u64, 1).unwrap();
+        m.write_u32(CTX + ctx::NZCV as u64, ctx::pack_nzcv(0, 1, 0, 0))
+            .unwrap();
         sigreturn(&mut s, &mut m, CTX).unwrap();
-        assert_eq!(m.read_u32(CTX + ctx::NF as u64).unwrap(), 1);
-        assert_eq!(m.read_u32(CTX + ctx::CF as u64).unwrap(), 1);
-        assert_eq!(m.read_u32(CTX + ctx::ZF as u64).unwrap(), 0);
+        let (n, z, c, _) = ctx::unpack_nzcv(m.read_u32(CTX + ctx::NZCV as u64).unwrap());
+        assert_eq!((n, z, c), (1, 0, 1));
     }
 
     #[test]

@@ -460,6 +460,35 @@ The third row is the control and it is the answer: removing the guard
 gzip. So there was no 62% to collect here, and memory64's 4% is inside the
 spread.
 
+nbench, the benchmark the 62.9% came from, run the same way -- four kernels
+at five seconds, FOURIER as the floating-point control:
+
+    NUMERIC SORT   475.10 -> 395.57   -16.7%
+    STRING SORT    236.42 -> 322.59   +36.4%
+    IDEA          4018.7  -> 2917.4   -27.4%
+    FOURIER      13864    -> 14165     +2.2%   (control)
+
+The control moved 2.2%, so the rest are real. And they do not agree with
+each other: memory64 is a large win on the pointer-chasing kernel and a
+large *loss* on the two array-and-integer ones.
+
+That is the whole finding, and it is not the one #89 predicted. Two effects
+run in opposite directions:
+
+  * our guard goes away, which is worth a lot exactly where V8 could not
+    already see through it -- STRING SORT, +36% (against +62.9% for removing
+    it with nothing in its place, so V8's own check eats about half);
+  * V8's bounds check arrives, and it is *not* free the way the 32-bit one
+    is. A wasm32 memory gets a 4 GiB virtual reservation and the checks
+    become guard pages, costing nothing; a 64-bit memory does not, so every
+    access carries a real compare. NUMERIC SORT and IDEA touch memory
+    constantly with addresses V8 had already proven in range, and they pay
+    that compare for nothing.
+
+So memory64 should stay behind `GEX_MEMORY64` rather than become the
+default, and the honest summary is: it trades a guard V8 can often remove
+for one it never can. Whether that is a win is a property of the program.
+
 That is not a contradiction of the 62.9% above -- it is a scoping of it.
 That figure is nbench STRING SORT, which chases pointers; gzip indexes
 arrays with induction variables. The guard is pure arithmetic on the address

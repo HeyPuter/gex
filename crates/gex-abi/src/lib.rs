@@ -133,12 +133,49 @@ pub mod ctx {
     /// Program counter. Only meaningful at block boundaries and safepoints.
     pub const PC: usize = 32 * 8;
 
-    /// Condition flags, one 32-bit slot each. Kept unpacked because almost
-    /// every use is a single-flag test; `mrs x0, nzcv` reassembles them.
-    pub const NF: usize = 33 * 8;
-    pub const ZF: usize = NF + 4;
-    pub const CF: usize = NF + 8;
-    pub const VF: usize = NF + 12;
+    /// Condition flags: one **byte** each, inside a single 32-bit slot.
+    ///
+    /// They used to be a 32-bit slot each, "kept unpacked because almost every
+    /// use is a single-flag test". The `cmp`+`b.cond` fusion falsified the
+    /// premise: a fused branch asks the original operands, so the single-flag
+    /// *reads* mostly stopped happening and what is left is the *writes* --
+    /// and every flag-setting instruction in the architecture writes all four
+    /// at once. `GEX_REG_HISTOGRAM` on gzip puts the four together at 13.9% of
+    /// all register traffic, more than any register except X0.
+    ///
+    /// A byte each rather than a bit each so that nothing regresses: storing
+    /// one flag is still one `i32.store8`, exactly as cheap as the separate
+    /// slots were, while storing all four is one `i32.store` instead of four.
+    /// Bit-packing would have made the single-flag case a read-modify-write.
+    ///
+    /// Every flag holds 0 or 1 -- the lifter masks with `& 1` on every path
+    /// that writes one, and `adc` reads C as a numeric addend -- so a byte and
+    /// a 32-bit slot hold exactly the same values.
+    pub const NZCV: usize = 33 * 8;
+    pub const NF: usize = NZCV;
+    pub const ZF: usize = NZCV + 1;
+    pub const CF: usize = NZCV + 2;
+    pub const VF: usize = NZCV + 3;
+
+    /// Assemble the packed slot from four 0/1 flags, and take it apart.
+    ///
+    /// The host reaches the flags through these rather than through the byte
+    /// offsets, so the packing lives in one place.
+    #[inline]
+    pub const fn pack_nzcv(n: u32, z: u32, c: u32, v: u32) -> u32 {
+        (n & 1) | ((z & 1) << 8) | ((c & 1) << 16) | ((v & 1) << 24)
+    }
+
+    /// `(n, z, c, v)`, each 0 or 1.
+    #[inline]
+    pub const fn unpack_nzcv(packed: u32) -> (u32, u32, u32, u32) {
+        (
+            packed & 1,
+            (packed >> 8) & 1,
+            (packed >> 16) & 1,
+            (packed >> 24) & 1,
+        )
+    }
 
     /// `TPIDR_EL0` — the guest thread pointer.
     pub const TPIDR: usize = 35 * 8;

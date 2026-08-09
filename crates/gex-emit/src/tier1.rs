@@ -483,14 +483,43 @@ impl<'a> Emitter<'a> {
             .map(|(r, c)| (*r, c.local))
             .collect();
         all.sort_by_key(|(r, _)| Self::reg_offset(*r));
+        // Same packing as `flush_inner`, and the same reason it is safe: a
+        // flag with a local holds the current value whether or not this region
+        // wrote it. Note the byte store in the unpacked case -- a 32-bit store
+        // of one flag would write over the three that share its slot.
+        let flags = [GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V];
+        let packed = flags.iter().all(|r| self.regs.contains_key(r))
+            && flags.iter().any(|r| self.region_writes.contains(r));
+        if packed {
+            let locals: Vec<u32> = flags.iter().map(|r| self.regs[r].local).collect();
+            for r in flags {
+                note_traffic(r);
+            }
+            self.ctx_base();
+            self.f.local_get(locals[0]);
+            for (i, &l) in locals.iter().enumerate().skip(1) {
+                self.f.local_get(l);
+                self.f.i32_const((i * 8) as i32);
+                self.f.byte(0x74); // i32.shl
+                self.f.byte(0x72); // i32.or
+            }
+            self.f.store(0x36, 2, ctx::NZCV as u32);
+        }
         for (r, local) in all {
+            if Self::is_flag(r) && packed {
+                continue;
+            }
             note_traffic(r);
             self.ctx_base();
             self.f.local_get(local);
-            match r.ty() {
-                Ty::I32 => self.f.store(0x36, 2, Self::reg_offset(r)),
-                Ty::I64 => self.f.store(0x37, 3, Self::reg_offset(r)),
-                Ty::V128 => self.f.simd_mem(simd::V128_STORE, 4, Self::reg_offset(r)),
+            if Self::is_flag(r) {
+                self.f.store(0x3a, 0, Self::reg_offset(r)); // i32.store8
+            } else {
+                match r.ty() {
+                    Ty::I32 => self.f.store(0x36, 2, Self::reg_offset(r)),
+                    Ty::I64 => self.f.store(0x37, 3, Self::reg_offset(r)),
+                    Ty::V128 => self.f.simd_mem(simd::V128_STORE, 4, Self::reg_offset(r)),
+                }
             }
         }
     }
@@ -683,6 +712,14 @@ impl<'a> Emitter<'a> {
 
     // -- guest register cache ---------------------------------------------
 
+    /// The four condition flags share one 32-bit context slot, a byte each.
+    ///
+    /// So they load and store as bytes, not words -- `reg_offset` gives the
+    /// byte, and `flush_inner` writes all four at once when it can.
+    fn is_flag(r: GuestReg) -> bool {
+        matches!(r, GuestReg::N | GuestReg::Z | GuestReg::C | GuestReg::V)
+    }
+
     fn reg_offset(r: GuestReg) -> u32 {
         (match r {
             GuestReg::X(n) => ctx::x(n),
@@ -747,10 +784,16 @@ impl<'a> Emitter<'a> {
         let local = self.f.add_local(val_type(ty));
         let before = self.f.code.len();
         self.ctx_base();
-        match ty {
-            Ty::I32 => self.f.load(0x28, 2, Self::reg_offset(r)),
-            Ty::I64 => self.f.load(0x29, 3, Self::reg_offset(r)),
-            Ty::V128 => self.f.simd_mem(simd::V128_LOAD, 4, Self::reg_offset(r)),
+        if Self::is_flag(r) {
+            // i32.load8_u: the flag is one byte of the packed slot, and it is
+            // 0 or 1, so there is nothing to sign-extend or mask.
+            self.f.load(0x2d, 0, Self::reg_offset(r));
+        } else {
+            match ty {
+                Ty::I32 => self.f.load(0x28, 2, Self::reg_offset(r)),
+                Ty::I64 => self.f.load(0x29, 3, Self::reg_offset(r)),
+                Ty::V128 => self.f.simd_mem(simd::V128_LOAD, 4, Self::reg_offset(r)),
+            }
         }
         self.f.local_set(local);
         CTX_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
@@ -820,14 +863,62 @@ impl<'a> Emitter<'a> {
         // the content-addressed cache (PLAN §10) depends on.
         dirty.sort_by_key(|(r, _)| Self::reg_offset(*r));
         let before = self.f.code.len();
+
+        // The four flags in one store, when all four are in hand.
+        //
+        // Almost every flag-setting instruction writes all four, so this is
+        // the usual case, and it turns four stores into one plus six ALU ops
+        // that never touch memory. It is only correct when all four are
+        // *cached*: a cached flag that is not dirty still holds the current
+        // architectural value -- it was loaded from this very slot and not
+        // written since -- so storing it back changes nothing. A flag with no
+        // local at all is a different matter, and falls through to the
+        // per-flag path below, which is a byte store and costs what the
+        // separate slots used to.
+        let flags = [GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V];
+        let all_cached = flags.iter().all(|r| self.regs.contains_key(r));
+        let any_dirty = flags
+            .iter()
+            .any(|r| self.regs.get(r).is_some_and(|c| c.dirty));
+        let packed = all_cached && any_dirty;
+        if packed {
+            let locals: Vec<u32> = flags.iter().map(|r| self.regs[r].local).collect();
+            for r in flags {
+                note_traffic(r);
+            }
+            self.ctx_base();
+            self.f.local_get(locals[0]);
+            for (i, &l) in locals.iter().enumerate().skip(1) {
+                self.f.local_get(l);
+                self.f.i32_const((i * 8) as i32);
+                self.f.byte(0x74); // i32.shl
+                self.f.byte(0x72); // i32.or
+            }
+            self.f.store(0x36, 2, ctx::NZCV as u32);
+            if !keep_dirty {
+                for r in flags {
+                    if let Some(c) = self.regs.get_mut(&r) {
+                        c.dirty = false;
+                    }
+                }
+            }
+        }
+
         for (r, local) in dirty {
+            if packed && Self::is_flag(r) {
+                continue;
+            }
             note_traffic(r);
             self.ctx_base();
             self.f.local_get(local);
-            match r.ty() {
-                Ty::I32 => self.f.store(0x36, 2, Self::reg_offset(r)),
-                Ty::I64 => self.f.store(0x37, 3, Self::reg_offset(r)),
-                Ty::V128 => self.f.simd_mem(simd::V128_STORE, 4, Self::reg_offset(r)),
+            if Self::is_flag(r) {
+                self.f.store(0x3a, 0, Self::reg_offset(r)); // i32.store8
+            } else {
+                match r.ty() {
+                    Ty::I32 => self.f.store(0x36, 2, Self::reg_offset(r)),
+                    Ty::I64 => self.f.store(0x37, 3, Self::reg_offset(r)),
+                    Ty::V128 => self.f.simd_mem(simd::V128_STORE, 4, Self::reg_offset(r)),
+                }
             }
             if !keep_dirty {
                 if let Some(c) = self.regs.get_mut(&r) {
