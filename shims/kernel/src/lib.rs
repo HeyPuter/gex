@@ -702,3 +702,188 @@ pub extern "C" fn k_fs_populate_done() {
 }
 
 static POPULATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// -- unix sockets ------------------------------------------------------------
+//
+// The fourth thing processes share, and the one an X server and its client
+// are made of. A socket's two ends are by definition in two processes, and
+// with a Worker per process those are two memories -- so the name table one
+// binds in is invisible to the other. The gears demo sat at "listening on
+// /tmp/.X11-unix/X0, 0 waiting" forever, with the client in a third Worker
+// looking somewhere else entirely.
+//
+// Both ends live here instead, where they are local to each other, and the
+// implementation is `gex_kernel::unix` unchanged. Each process holds an id.
+
+use gex_kernel::unix::{SocketNames, UnixSocket};
+
+/// Every name a guest has bound, in the memory every Worker shares.
+fn names() -> &'static SocketNames {
+    note_panics();
+    static NAMES: OnceLock<SocketNames> = OnceLock::new();
+    NAMES.get_or_init(SocketNames::new)
+}
+
+/// Every socket end a process holds, by id.
+type Socks = std::sync::Mutex<Vec<Option<std::sync::Arc<UnixSocket>>>>;
+fn socks() -> &'static Socks {
+    note_panics();
+    static S: OnceLock<Socks> = OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn sock_at(id: i32) -> Option<std::sync::Arc<UnixSocket>> {
+    socks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id as usize)
+        .cloned()
+        .flatten()
+}
+
+fn keep(s: std::sync::Arc<UnixSocket>) -> i32 {
+    let mut t = socks().lock().unwrap_or_else(|e| e.into_inner());
+    match t.iter().position(|e| e.is_none()) {
+        Some(i) => {
+            t[i] = Some(s);
+            i as i32
+        }
+        None => {
+            t.push(Some(s));
+            (t.len() - 1) as i32
+        }
+    }
+}
+
+/// Bind and listen in one. Returns a listener id, or a negated errno.
+///
+/// One call because a remote socket has no state between `bind` and `listen`
+/// worth modelling: what a guest does between them is local to its own
+/// process, and what the other end can see is only whether the name answers.
+#[no_mangle]
+pub extern "C" fn k_sock_bind(path: u32, path_len: u32) -> i32 {
+    let p = path_of_raw(path, path_len);
+    let s = std::sync::Arc::new(UnixSocket::new(true));
+    if let Err(e) = s.bind(&p) {
+        return -e.0;
+    }
+    if let Err(e) = names().bind(&p, std::sync::Arc::clone(&s)) {
+        return -e.0;
+    }
+    if let Err(e) = s.listen() {
+        return -e.0;
+    }
+    keep(s)
+}
+
+/// Connect to a name. Returns this end's id, or a negated errno.
+#[no_mangle]
+pub extern "C" fn k_sock_connect(path: u32, path_len: u32) -> i32 {
+    let p = path_of_raw(path, path_len);
+    let s = std::sync::Arc::new(UnixSocket::new(true));
+    match names().connect(&s, &p) {
+        Ok(_) => keep(s),
+        Err(e) => -e.0,
+    }
+}
+
+/// Take a waiting connection. Returns the server end's id, or `-EAGAIN`.
+#[no_mangle]
+pub extern "C" fn k_sock_accept(listener: i32) -> i32 {
+    let Some(l) = sock_at(listener) else { return -9 };
+    match l.accept() {
+        Ok(s) => keep(s),
+        Err(e) => -e.0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_sock_pending(listener: i32) -> i32 {
+    sock_at(listener).is_some_and(|s| s.has_pending()) as i32
+}
+
+/// Read into the caller's memory. The bytes cross by `memory.copy`, which is
+/// what makes two ends in two address spaces possible at all.
+#[no_mangle]
+pub extern "C" fn k_sock_read(id: i32, at: u32, len: u32) -> i32 {
+    let Some(s) = sock_at(id) else { return -9 };
+    let mut buf = vec![0u8; len as usize];
+    match s.recv(&mut buf, 0, false) {
+        Ok(n) => {
+            if n > 0 {
+                unsafe { gex_kmem::push(at, buf.as_ptr(), n as u32) };
+            }
+            n as i32
+        }
+        Err(e) => -e.0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_sock_write(id: i32, at: u32, len: u32) -> i32 {
+    let Some(s) = sock_at(id) else { return -9 };
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull(buf.as_mut_ptr(), at, len) };
+    }
+    match s.send(&buf) {
+        Ok(n) => n as i32,
+        Err(e) => -e.0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_sock_readable(id: i32) -> i32 {
+    use gex_kernel::vfs::FileHandle;
+    sock_at(id).is_some_and(|s| s.poll_readable()) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn k_sock_writable(id: i32) -> i32 {
+    use gex_kernel::vfs::FileHandle;
+    sock_at(id).is_some_and(|s| s.poll_writable()) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn k_sock_available(id: i32) -> i32 {
+    use gex_kernel::vfs::FileHandle;
+    sock_at(id).map_or(0, |s| s.available().unwrap_or(0) as i32)
+}
+
+/// Drop an end. The last reference going is what the far end reads as an end
+/// of file, so a process whose Worker exits still releases its peer.
+#[no_mangle]
+pub extern "C" fn k_sock_close(id: i32) {
+    let mut t = socks().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = t.get_mut(id as usize) {
+        *slot = None;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_sock_shutdown(id: i32) {
+    if let Some(s) = sock_at(id) {
+        s.shutdown();
+    }
+}
+
+/// Whether anything is listening on a name -- which is what a client that
+/// looks before it leaps is asking. Xlib does; Mesa does not.
+#[no_mangle]
+pub extern "C" fn k_sock_exists(path: u32, path_len: u32) -> i32 {
+    names().exists(&path_of_raw(path, path_len)) as i32
+}
+
+/// A path exactly as the caller wrote it.
+///
+/// Unlike a filesystem path, a socket name is compared for equality and never
+/// looked up, so the leading slash has to survive: a server that binds
+/// `/tmp/.X11-unix/X0` and a client that connects to the same string must
+/// agree, and trimming one of them would make two different names.
+fn path_of_raw(at: u32, len: u32) -> String {
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull(buf.as_mut_ptr(), at, len) };
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}

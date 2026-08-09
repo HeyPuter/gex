@@ -1068,3 +1068,178 @@ mod epoll_tests {
         assert_eq!(e.ctl(epoll_op::MOD, 3, 0, 0), Err(Errno::ENOENT));
     }
 }
+
+/// Unix sockets that live in another wasm module.
+///
+/// A socket's two ends are, by definition, in two processes -- and with a
+/// Worker per process those are two memories, where the `Arc<Pipe>` above
+/// means nothing. The X server binds `/tmp/.X11-unix/X0` in its own Worker
+/// and its client, a third Worker, looks in a name table that has never
+/// heard of it.
+///
+/// So the socket lives in the global kernel and each end is a number. The
+/// implementation there is this same `UnixSocket` -- both ends are local to
+/// *it* -- and all that crosses is an id and, for a read or a write, the
+/// bytes.
+#[derive(Clone, Copy)]
+pub struct Remote {
+    /// Bind and listen in one: a remote socket has no state between the two
+    /// worth modelling. Returns a listener id or a negated errno.
+    pub bind: extern "C" fn(path: u32, path_len: u32) -> i32,
+    /// Connect to a name. Returns this end's id, or a negated errno.
+    pub connect: extern "C" fn(path: u32, path_len: u32) -> i32,
+    /// Take a waiting connection. Returns the server end's id, or -EAGAIN.
+    pub accept: extern "C" fn(listener: i32) -> i32,
+    pub pending: extern "C" fn(listener: i32) -> i32,
+    pub read: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
+    pub write: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
+    pub readable: extern "C" fn(id: i32) -> i32,
+    pub writable: extern "C" fn(id: i32) -> i32,
+    pub available: extern "C" fn(id: i32) -> i32,
+    pub close: extern "C" fn(id: i32),
+    pub shutdown: extern "C" fn(id: i32),
+    pub exists: extern "C" fn(path: u32, path_len: u32) -> i32,
+}
+
+/// One end of a socket in the global kernel.
+///
+/// Dropping closes it there, which is what the far end needs: a reader whose
+/// writer's Worker has gone must see end-of-file, not wait forever.
+pub struct RemoteUnix {
+    pub id: i32,
+    /// Set for a listener, so `accept` and `poll` know which question to ask.
+    pub listening: bool,
+    pub peer: Option<String>,
+    pub remote: Remote,
+    nonblocking: AtomicBool,
+}
+
+impl std::fmt::Debug for RemoteUnix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RemoteUnix({}, {})",
+            self.id,
+            if self.listening { "listening" } else { "connected" }
+        )
+    }
+}
+
+impl RemoteUnix {
+    pub fn new(id: i32, listening: bool, peer: Option<String>, remote: Remote) -> RemoteUnix {
+        RemoteUnix {
+            id,
+            listening,
+            peer,
+            remote,
+            nonblocking: AtomicBool::new(false),
+        }
+    }
+
+    pub fn set_nonblocking(&self, on: bool) {
+        self.nonblocking.store(on, Ordering::Relaxed);
+    }
+
+    pub fn is_nonblocking(&self) -> bool {
+        self.nonblocking.load(Ordering::Relaxed)
+    }
+
+    /// Take a waiting connection, as a handle of the same kind.
+    pub fn accept(&self) -> Result<Arc<RemoteUnix>, Errno> {
+        if !self.listening {
+            return Err(Errno::EINVAL);
+        }
+        match (self.remote.accept)(self.id) {
+            n if n >= 0 => Ok(Arc::new(RemoteUnix::new(n, false, None, self.remote))),
+            n => Err(Errno(-n)),
+        }
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.listening && (self.remote.pending)(self.id) != 0
+    }
+
+    pub fn shutdown(&self) {
+        (self.remote.shutdown)(self.id);
+    }
+
+    pub fn bound_path(&self) -> Option<String> {
+        self.peer.clone()
+    }
+}
+
+impl Drop for RemoteUnix {
+    fn drop(&mut self) {
+        (self.remote.close)(self.id);
+    }
+}
+
+impl crate::vfs::FileHandle for RemoteUnix {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
+        if self.listening {
+            return Err(Errno::ENOTCONN);
+        }
+        match (self.remote.read)(self.id, buf.as_mut_ptr() as u32, buf.len() as u32) {
+            n if n >= 0 => Ok(n as u64),
+            n => Err(Errno(-n)),
+        }
+    }
+
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        if self.listening {
+            return Err(Errno::ENOTCONN);
+        }
+        match (self.remote.write)(self.id, buf.as_ptr() as u32, buf.len() as u32) {
+            n if n >= 0 => Ok(n as u64),
+            n => Err(Errno(-n)),
+        }
+    }
+
+    fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
+        Ok(crate::vfs::Metadata {
+            file_type: crate::vfs::FileType::Socket,
+            size: 0,
+            mode: 0o600,
+            ino: 0,
+            mtime: 0,
+        })
+    }
+
+    fn is_stream(&self) -> bool {
+        true
+    }
+
+    fn poll_readable(&self) -> bool {
+        if self.listening {
+            return self.has_pending();
+        }
+        (self.remote.readable)(self.id) != 0
+    }
+
+    fn poll_writable(&self) -> bool {
+        self.listening || (self.remote.writable)(self.id) != 0
+    }
+
+    fn available(&self) -> Option<u64> {
+        if self.listening {
+            return Some(0);
+        }
+        Some((self.remote.available)(self.id).max(0) as u64)
+    }
+
+    fn debug_state(&self) -> String {
+        if self.listening {
+            format!(
+                "shared socket {} listening, {} waiting",
+                self.id,
+                (self.remote.pending)(self.id)
+            )
+        } else {
+            format!(
+                "shared socket {}, {} buffered",
+                self.id,
+                (self.remote.available)(self.id)
+            )
+        }
+    }
+}
