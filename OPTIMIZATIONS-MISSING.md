@@ -1004,3 +1004,39 @@ completes, and the blocks translated at runtime are
 Zero for both processes the closure was built for, and for the two it was
 not, only their own text and the libraries outside it -- libselinux and
 libpcre2, which are in `ls`'s closure and not in dash's.
+
+## Where apt update actually stops
+
+The closure work was meant to land on apt next. It cannot yet, and the reason
+is not translation.
+
+A 6.5 MB rootfs was built for it -- apt-get, its nineteen-object closure,
+`/usr/share/dpkg`, and a local `deb [trusted=yes] file:/repo ./` repository so
+no proxy is needed -- and `apt-get update` on the *plain seed module*, with no
+closure involved, does this:
+
+    [gex] pid 3: 419ms translating 15733 blocks
+    [proc] abandon 4: the Worker stopped without an exit
+    gex: process 4 failed: the gex runtime trapped inside the shim
+      (memory access out of bounds, guest pc=0x55f29c4, inside syscall 79)
+
+pid 4 is `/usr/lib/apt/methods/file`; syscall 79 is `newfstatat`. The trap is
+in the shim, not the guest. `GuestMem` bounds-checks every access against its
+own view, so the suspect is `gex-kmem`: `push` and `pull` are bare
+`memory.copy 0, 1` and the engine traps if the range is outside the process
+memory. A stat on the shared filesystem goes through `rf_path_meta` to
+`k_fs_path_meta`, which pulls the path out and pushes the metadata back.
+
+apt then reports `Get:1`, spins on `net+timeout`, and idles at 0% CPU
+forever. That second half should now be fixable for free: `gex_abandon`
+publishes the method's death, so the parent's wait has something to end on.
+
+This is #96, and it is what stands between the closure and the program this
+project keeps measuring itself against. Worth saying plainly: apt update's
+cost was recorded as guest CPU in libapt (#85), and that may well be true,
+but it cannot be measured until the run finishes at all.
+
+One more thing the attempt taught, which matters for the closure: apt-get's
+own closure does not cover its methods. The `file` method needs libseccomp
+and apt-get does not, so a closure built per executable is incomplete for any
+program that spawns helpers -- and apt is entirely made of helpers.
