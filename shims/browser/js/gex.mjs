@@ -430,7 +430,7 @@ export class Gex {
    * Against a plain memory those segments are active and a second
    * instantiation would quietly wipe the first thread's kernel.
    */
-  async attach(shimWasm, guestWasm) {
+  async attach(shimWasm, guestWasm, { devices = true } = {}) {
     await this.#startKernel();
     this.#shim = await WebAssembly.instantiate(await WebAssembly.compile(shimWasm), {
       env: { memory: this.#memory },
@@ -448,9 +448,17 @@ export class Gex {
     // made and the vtest socket is bound: a forked child told about its GPU
     // afterwards would have a `/dev` without one, and Mesa would find no
     // socket to draw through.
-    this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
-    this.#shim.exports.gex_set_virgl?.(this.#virgl ? (this.#virglTrace ? 2 : 1) : 0);
-    this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
+    // A *process* says what devices it has; a thread says nothing.
+    //
+    // These are process-wide flags in a memory the threads share, so a thread
+    // that answered for itself would answer for everybody: a Worker joining a
+    // process with a GPU and a network, having been given neither, turned
+    // both off underneath the threads that were using them.
+    if (devices) {
+      this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+      this.#shim.exports.gex_set_virgl?.(this.#virgl ? (this.#virglTrace ? 2 : 1) : 0);
+      this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
+    }
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
@@ -799,7 +807,7 @@ export class Gex {
    * what is already there.
    */
   async adoptThread(shimWasm, guestWasm, thread) {
-    await this.attach(shimWasm, guestWasm);
+    await this.attach(shimWasm, guestWasm, { devices: false });
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
     return { entry, ctx: Number(thread.ctx) };
