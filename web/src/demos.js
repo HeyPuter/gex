@@ -489,6 +489,11 @@ const virglGears = {
           tty: true,
           uid: 0,
           virgl: renderer,
+          // `?heartbeat=200000000` says where the guest is every so many
+          // safepoints. Thirty frames a second is not a bug with a place in
+          // the source; it is a question about which code is running, and
+          // this is what answers it.
+          heartbeat: Number(new URLSearchParams(location.search).get('heartbeat')) || 0,
         });
         const ms = (performance.now() - t0).toFixed(0);
         ctx.term.writeln('');

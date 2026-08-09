@@ -259,7 +259,16 @@ for (const id of list) {
       // tick line below carries one line; a demo that fails is worth twenty.
       lastTerminal = terminal || lastTerminal;
       for (const line of (terminal || '').split('\n')) {
-        if (line.trim()) seen.add(line);
+        if (!line.trim() || seen.has(line)) continue;
+        seen.add(line);
+        // `GEX_ECHO` prints every line the guest says, once, as it first
+        // appears. The tick below carries one line per five seconds, which
+        // is a progress indicator and not a transcript -- and a profile
+        // printed by the guest is exactly the thing that scrolls past
+        // between two ticks and is never seen.
+        if (process.env.GEX_ECHO && new RegExp(process.env.GEX_ECHO).test(line)) {
+          console.log(`     [${id}] ${line.trim()}`);
+        }
       }
       // Each status change is a line, so a run that takes minutes still says
       // where it is rather than going quiet. A tick carries the terminal's

@@ -248,8 +248,11 @@ async function handle(msg) {
     if (recompile) {
       gex.shim.exports.gex_set_recompile_objects?.(recompile);
     }
-    if (msg.heartbeat) {
-      gex.shim.exports.gex_set_heartbeat?.(BigInt(msg.heartbeat));
+    // In `opts` as well: the page passes everything it knows about a run
+    // through there, and a heartbeat asked for on a demo went nowhere.
+    const beat = msg.heartbeat || msg.opts?.heartbeat;
+    if (beat) {
+      gex.shim.exports.gex_set_heartbeat?.(BigInt(beat));
     }
     if (msg.winsize) {
       gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);

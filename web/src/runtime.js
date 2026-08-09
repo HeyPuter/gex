@@ -275,6 +275,11 @@ export async function runProgram(
     gl = null,
     virgl = null,
     uid,
+    // Every N safepoints, say where the guest is. A run that is merely slow
+    // says nothing about *what* is slow, and this is the only instrument that
+    // works in a page: the shim prints the guest pc, and which module that
+    // address lands in is the answer.
+    heartbeat = 0,
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
@@ -307,6 +312,10 @@ export async function runProgram(
     guest: seedBytes,
     kernel,
     extra: {
+      // In `extra`, so every Worker gets it and not only pid 1. The shell
+      // that starts a demo is never the interesting process: the questions
+      // are about the X server and the client it forks.
+      heartbeat: heartbeat || undefined,
       virgl: channel ?? undefined,
       wispUrl: network?.url ?? undefined,
       winsize: { rows: term.rows, cols: term.cols },
@@ -360,7 +369,7 @@ export async function runProgram(
       elf,
       files,
       args,
-      opts: { cwd, tty, uid, recompileObjects: 8192 },
+      opts: { cwd, tty, uid, recompileObjects: 8192, heartbeat },
     });
     return { status, host, tenv };
   } finally {

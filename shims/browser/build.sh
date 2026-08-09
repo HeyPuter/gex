@@ -87,6 +87,21 @@ if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | gre
         cp target/shared/wasm32-unknown-unknown/release/gex_browser.wasm "$SHARED"
         echo "shims/browser: $(stat -c%s "$SHARED") bytes (shared memory)"
     else
-        echo "shims/browser: no shared-memory build (needs nightly and rust-src)"
+        # Loudly, and with the reason.
+        #
+        # This used to swallow the output and blame a missing toolchain, and
+        # for a while it was wrong: the link was failing on a real error
+        # ("initial memory too small") and the message said to install rust-src.
+        # A build that reports someone else's problem is worse than one that
+        # fails, because the work carried on against a binary that was no
+        # longer being produced.
+        echo "shims/browser: the shared-memory build FAILED --"
+        RUSTFLAGS="$LINK \
+            -C link-arg=--shared-memory \
+            -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
+            cargo +nightly build -p gex-browser --target wasm32-unknown-unknown \
+              --release -Z build-std=std,panic_abort --features shared-memory \
+              --target-dir target/shared 2>&1 | grep -E "^error|error:" | head -5
+        echo "shims/browser: (if that is 'can't find crate for std', install rust-src)"
     fi
 fi

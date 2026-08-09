@@ -1458,8 +1458,24 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
 /// `CURRENT` and the same lock depth, which is the exact opposite of what a
 /// thread-local is for.
 ///
-/// In `.bss`, so it is address space in a memory that has four gigabytes of
-/// it and costs nothing until a Worker writes.
+/// Taken from the arena, one slot at a time, and never from `.bss`.
+///
+/// It was a static array of sixty-four slots, on the reasoning that `.bss` is
+/// address space and costs nothing until it is written. That is true of a
+/// memory that may grow and false of one that may not: `wasm-ld` will not
+/// link a `--shared-memory` module whose data does not fit inside
+/// `--initial-memory`, so sixty-eight megabytes of untouched slots became
+///
+///   rust-lld: error: initial memory too small, 146908720 bytes needed
+///
+/// and the shared build simply stopped being produced. Which is worse than
+/// it sounds: the build is silent about it, so the threads work went on
+/// against a shim that no longer existed.
+///
+/// A slot comes from the same growing arena as everything else now, claimed
+/// by the Worker that is about to stand on it. Sixty-four slots' worth of
+/// address space is never reserved, and a process running one thread pays
+/// for one stack.
 #[cfg(feature = "shared-memory")]
 mod slots {
     /// A megabyte of stack each. The shim's deepest call is a translation,
@@ -1468,7 +1484,6 @@ mod slots {
     /// And room for the thread-locals, which are a handful of words today.
     pub const TLS: usize = 1 << 16;
     pub const COUNT: usize = 64;
-    pub static mut AREA: [u8; COUNT * (STACK + TLS)] = [0; COUNT * (STACK + TLS)];
 }
 
 #[cfg(feature = "shared-memory")]
@@ -1495,11 +1510,17 @@ pub extern "C" fn gex_worker_init() -> u32 {
     if i >= slots::COUNT {
         return 0;
     }
-    // SAFETY: `i` is this Worker's alone -- the counter handed it out -- and
-    // the two regions it names are disjoint from every other Worker's.
+    // This Worker's own span of arena. The cursor is atomic and the bytes
+    // above it belong to nobody, so two Workers arriving together get two
+    // spans without a lock between them.
+    let Some(base) = arena_take((slots::STACK + slots::TLS) as u64) else {
+        return 0;
+    };
+    // SAFETY: `base` is this Worker's alone -- the arena cursor handed it out
+    // and will not hand it out again -- and the memory behind it has been
+    // grown to cover it.
     unsafe {
-        let base = core::ptr::addr_of_mut!(slots::AREA) as *mut u8;
-        let at = base.add(i * (slots::STACK + slots::TLS));
+        let at = base as u32 as *mut u8;
         __wasm_init_tls(at.add(slots::STACK));
         // The thread-locals exist now, so this is the first thing that can be
         // said about which Worker this is.
@@ -4444,10 +4465,41 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
             // waiting for something outside itself -- or it is waiting for a
             // sibling that is not being given a turn, and those want
             // completely different fixes.
+            // The three hottest back edges, symbolised, alongside the one
+            // that happened to be current.
+            //
+            // A single sample per beat answers "is it stuck" and nothing
+            // else. The counters underneath have always held the shape of
+            // the work -- `gex_hot_blocks` reads them, and only the native
+            // runner ever called it. A page has no way to run a command
+            // after the guest exits, so the beat carries it instead, and a
+            // run that is merely slow says which object it is slow in.
+            let mut top: Vec<(u64, u64)> = unsafe {
+                HOT_N
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &n)| n > 0)
+                    .map(|(i, &n)| (n, HOT_PC[i]))
+                    .collect()
+            };
+            top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            top.truncate(3);
             let (blocks, census, whose) = with_host(|h| {
                 let mut out = String::new();
                 for (i, t) in h.threads.iter().enumerate() {
                     out.push_str(&format!(" {i}={}", waiting_name(&t.waiting)));
+                }
+                let name = |addr: u64| {
+                    h.kernel
+                        .mem
+                        .vmas()
+                        .iter()
+                        .find(|v| addr >= v.start && addr < v.end)
+                        .map(|v| format!("{}+{:#x}", v.name, addr - v.start))
+                        .unwrap_or_else(|| format!("{addr:#x}"))
+                };
+                for (n, addr) in &top {
+                    out.push_str(&format!(" hot[{}]={n}", name(*addr)));
                 }
                 // And which object the pc is in. A bare address says a run
                 // is spinning; the library and the offset say where to look,
