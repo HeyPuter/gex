@@ -282,6 +282,13 @@ impl FuncBody {
         self.u32(depth);
     }
 
+    /// Branch to the label `depth` levels out when the `i32` on top is
+    /// non-zero, consuming it.
+    pub fn br_if(&mut self, depth: u32) {
+        self.byte(op::BR_IF);
+        self.u32(depth);
+    }
+
     pub fn else_(&mut self) {
         self.byte(op::ELSE);
     }

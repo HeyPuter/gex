@@ -227,6 +227,9 @@ pub fn block(b: &Block) -> String {
             Stmt::MemFill { dst, val, len } => {
                 let _ = writeln!(s, "  memfill [{dst:?}] = {val:?}, {len:?}");
             }
+            Stmt::MemCmp { dst, a, b, len } => {
+                let _ = writeln!(s, "  {dst:?} = memcmp [{a:?}], [{b:?}], {len:?}");
+            }
             Stmt::Fence => {
                 let _ = writeln!(s, "  fence");
             }

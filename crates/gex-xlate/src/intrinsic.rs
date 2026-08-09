@@ -45,6 +45,17 @@ pub enum Intrinsic {
     MemPCpy,
     /// `void *memset(void *dst, int c, size_t n)`.
     MemSet,
+    /// `int memcmp(const void *a, const void *b, size_t n)`.
+    ///
+    /// `bcmp` and `__memcmpeq` are the same code in glibc and are only ever
+    /// asked whether the answer is zero, so the stronger contract this
+    /// provides satisfies them too.
+    ///
+    /// The odd one out: there is no wasm instruction behind it, so the
+    /// backend emits a loop. It is here because a profile of perl -- which
+    /// compares a hash key on every lookup -- puts glibc's SIMD `memcmp` as
+    /// the only library code among the hottest back edges.
+    MemCmp,
 }
 
 /// The intrinsic a symbol names, if it names one.
@@ -83,6 +94,28 @@ pub fn recognise(name: &str) -> Option<Intrinsic> {
         "memcpy" | "memmove" => Some(Intrinsic::MemCpy),
         "mempcpy" => Some(Intrinsic::MemPCpy),
         "memset" => Some(Intrinsic::MemSet),
+        // `memcmp` is deliberately absent, and `Intrinsic::MemCmp` exists
+        // anyway. It is implemented, it is correct, and it did not pay:
+        //
+        //     perl, 30,000 hash lookups over a long common prefix plus a
+        //     string sort -- the workload that does nothing but compare keys.
+        //     Seven interleaved pairs, guest time only:
+        //         5 of 7 favour the *unsubstituted* build, p = 0.453
+        //         median per-pair ratio 1.17 against the substitution
+        //
+        //     Not readable at p = 0.453, so the honest reading is "no
+        //     measured benefit, direction unfavourable", not "17% worse".
+        //
+        // The reason is the one the lowering's comment predicts: this serves
+        // `memcmp` a byte at a time, and glibc's aarch64 `memcmp` is SIMD.
+        // Even paying a block per iteration, sixteen bytes at a time beats
+        // one. `memcpy` won because `memory.copy` is a single instruction
+        // that beats any loop; there is no such instruction here.
+        //
+        // Turning it on is adding `"memcmp" | "bcmp" | "memcmpeq"` to this
+        // match. What would make that worth doing is an eight-wide lowering
+        // -- `i64.load` both sides, compare, and only fall to bytes for the
+        // word that differs -- which is the experiment this leaves set up.
         _ => None,
     }
 }
@@ -112,6 +145,22 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
         // `val` is an `int` whose low byte is the fill; `memory.fill` takes
         // the same and ignores the rest, so no masking is needed here.
         Intrinsic::MemSet => b.stmt(Stmt::MemFill { dst, val: src, len }),
+        Intrinsic::MemCmp => {
+            // `dst`/`src` are this builder's names for x0 and x1, which for
+            // `memcmp` are simply the two buffers.
+            let r = b.fresh();
+            b.stmt(Stmt::MemCmp {
+                dst: r,
+                a: dst,
+                b: src,
+                len,
+            });
+            // The result is an `int`, and AAPCS64 returns it in w0 with the
+            // top half of x0 unspecified -- but a caller that reads x0 as a
+            // signed 64-bit value has to see the sign, so extend it.
+            let wide = b.extend(r, true);
+            b.write(GuestReg::X(0), wide);
+        }
     }
     let lr = b.read(GuestReg::X(30));
     b.finish(Term::Indirect {
@@ -145,7 +194,6 @@ mod tests {
         // Both of these are in Debian's libc and neither takes a pointer and
         // a length.
         assert_eq!(recognise("__mempcpy_small"), None);
-        assert_eq!(recognise("memcmp"), None);
         assert_eq!(recognise("memchr"), None);
         assert_eq!(recognise("memory_pool_init"), None);
         assert_eq!(recognise("my_memcpy"), None);
@@ -167,6 +215,25 @@ mod tests {
         // Nothing is written but the values it reads: a `memcpy` that
         // returned its first argument in x0 already has it there.
         assert!(!b.stmts.iter().any(|s| matches!(s, Stmt::WriteReg { .. })));
+    }
+
+    #[test]
+    fn memcmp_is_built_but_not_recognised() {
+        // Measured and not enabled -- see the note in `recognise`. The
+        // builder is kept working so that turning it on is one line and a
+        // measurement rather than a rewrite.
+        assert_eq!(recognise("memcmp"), None);
+        assert_eq!(recognise("bcmp"), None);
+    }
+
+    #[test]
+    fn memcmp_writes_its_answer_to_x0() {
+        let b = block(0x1000, Intrinsic::MemCmp);
+        assert!(b.stmts.iter().any(|s| matches!(s, Stmt::MemCmp { .. })));
+        assert!(b
+            .stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::WriteReg { reg: GuestReg::X(0), .. })));
     }
 
     #[test]

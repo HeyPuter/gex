@@ -314,6 +314,9 @@ if (process.env.GEX_RECOMPILE_OBJECTS) {
 // Measured around `gex.run` alone: everything before it is loading, placing
 // the image and compiling; everything inside it is the guest.
 if (process.env.GEX_HOT) gex.shim.exports.gex_set_hot?.(1);
+// GEX_NO_INTRINSICS translates glibc's own memcpy/memcmp/memset instead of
+// serving them, which is the only way to price the substitution.
+if (process.env.GEX_NO_INTRINSICS) gex.shim.exports.gex_set_intrinsics?.(0);
 const runStarted = process.env.GEX_TIME_GUEST ? process.hrtime.bigint() : 0n;
 const status = await gex.run(entry);
 // The guest is finished; nothing this process still holds should keep node

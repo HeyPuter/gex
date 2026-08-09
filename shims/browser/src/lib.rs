@@ -5575,7 +5575,25 @@ const MAX_OBJECT_BLOCKS: usize = 4_000_000;
 ///
 /// Called before either path translates anything, and outside `with_host`
 /// because reading the object takes the host itself.
+/// Whether library substitution is on. See `gex_set_intrinsics`.
+static mut INTRINSICS_ON: bool = true;
+
+/// Turn library substitution off, to price it.
+///
+/// The same shape as `GEX_UNSAFE_NO_GUARD`: the only way to know what
+/// replacing a library function is worth is to run the same program both
+/// ways, and the two builds have to be one binary or the comparison is
+/// measuring the compiler as well. Unlike the guard switch this one is safe
+/// -- it translates glibc's own code instead, which is what it did before.
+#[no_mangle]
+pub extern "C" fn gex_set_intrinsics(on: u32) {
+    unsafe { INTRINSICS_ON = on != 0 }
+}
+
 fn note_intrinsics(addr: u64) {
+    if !unsafe { INTRINSICS_ON } {
+        return;
+    }
     let Some((path, start)) = with_host(|h| {
         let v = h.kernel.mem.vmas().iter().find(|v| {
             addr >= v.start && addr < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0

@@ -1163,6 +1163,7 @@ impl<'a> Emitter<'a> {
                 self.f.u32(code::MEMORY_FILL);
                 self.f.byte(0); // memory
             }
+            Stmt::MemCmp { dst, a, b, len } => self.emit_memcmp(*dst, *a, *b, *len),
             Stmt::Fence => self.f.atomic_fence(),
         }
     }
@@ -1199,6 +1200,99 @@ impl<'a> Emitter<'a> {
             self.f.byte(code::I64_LT_U);
             self.f.select();
             self.f.local_set(n);
+        }
+    }
+
+    /// `dst = memcmp(a, b, len)` as an inline loop.
+    ///
+    /// There is no `memory.compare` in wasm, so unlike `MemCopy` this cannot
+    /// collapse to one instruction. What it replaces is glibc's aarch64
+    /// `memcmp`, a hand-written SIMD routine whose loop lifts to a block per
+    /// iteration -- and a profile of perl, which compares a hash key on every
+    /// lookup, puts it as the only library code among the hottest back edges.
+    ///
+    /// A byte at a time, deliberately. Eight-at-a-time needs a byte-swap to
+    /// find *which* byte differed (wasm is little-endian, the comparison is
+    /// big-endian by C's definition) and a second loop for the tail, and none
+    /// of that is worth writing before the simple version is measured against
+    /// the SIMD loop it replaces. If this wins, that is the next step; if it
+    /// does not, the eight-wide version would not have either.
+    ///
+    /// The addresses are guarded per access exactly as any other load is, so
+    /// a `memcmp` with a wild pointer faults where the guest's would.
+    fn emit_memcmp(&mut self, dst: Value, a: Value, b: Value, len: Value) {
+        let la = self.alloc(Ty::I64);
+        let lb = self.alloc(Ty::I64);
+        let llen = self.alloc(Ty::I64);
+        let idx = self.alloc(Ty::I64);
+        let res = self.alloc(Ty::I32);
+        let tb = self.alloc(Ty::I32);
+
+        self.push(a);
+        self.f.local_set(la);
+        self.push(b);
+        self.f.local_set(lb);
+        self.push(len);
+        self.f.local_set(llen);
+        self.f.i64_const(0);
+        self.f.local_set(idx);
+        self.f.i32_const(0);
+        self.f.local_set(res);
+
+        self.f.block_void();
+        self.f.loop_void();
+
+        // Done when the whole length has been walked without a difference.
+        self.f.local_get(idx);
+        self.f.local_get(llen);
+        self.f.byte(0x5a); // i64.ge_u
+        self.f.br_if(1);
+
+        // The two bytes. Each address is `base + idx`, guarded like any other.
+        self.f.local_get(la);
+        self.f.local_get(idx);
+        self.f.byte(0x7c); // i64.add
+        self.guarded_byte_address();
+        self.f.load(0x2d, 0, 0); // i32.load8_u
+        self.f.local_get(lb);
+        self.f.local_get(idx);
+        self.f.byte(0x7c);
+        self.guarded_byte_address();
+        self.f.load(0x2d, 0, 0);
+        self.f.local_set(tb);
+
+        // C's answer is the difference of the two as `unsigned char`, which
+        // is what `load8_u` already produced. Non-zero means done.
+        self.f.local_get(tb);
+        self.f.byte(0x6b); // i32.sub
+        self.f.local_tee(res);
+        self.f.br_if(1);
+
+        self.f.local_get(idx);
+        self.f.i64_const(1);
+        self.f.byte(0x7c);
+        self.f.local_set(idx);
+        self.f.br(0);
+
+        self.f.end(); // loop
+        self.f.end(); // block
+
+        let local = self.alloc(Ty::I32);
+        self.f.local_get(res);
+        self.f.local_set(local);
+        let i = dst.0 as usize;
+        self.value_ty[i] = Ty::I32;
+        self.value_local[i] = Some(local);
+    }
+
+    /// Turn an `i64` effective address on the stack into one a load can take.
+    ///
+    /// The same rule `emit_address` follows for a non-constant address: on a
+    /// 64-bit memory it is already the address, and on a 32-bit one it goes
+    /// through the bounds guard.
+    fn guarded_byte_address(&mut self) {
+        if !self.cx.memory64 {
+            self.guard_to_i32();
         }
     }
 

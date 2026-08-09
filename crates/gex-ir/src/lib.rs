@@ -819,6 +819,24 @@ pub enum Stmt {
     MemCopy { dst: Value, src: Value, len: Value },
     /// Set `len` bytes of guest memory at `dst` to the low byte of `val`.
     MemFill { dst: Value, val: Value, len: Value },
+    /// `dst = memcmp(a, b, len)`, as C defines it: negative, zero or positive
+    /// according to the first byte that differs, compared as `unsigned char`.
+    ///
+    /// A statement rather than an `Expr` because it lowers to a wasm *loop*,
+    /// and an expression is a thing the emitter pushes onto the stack in the
+    /// middle of building another one. `MemCopy` is a statement for the same
+    /// reason even though it needs no loop.
+    ///
+    /// Unlike `MemCopy` there is no single wasm instruction behind this. It
+    /// is here because glibc's aarch64 `memcmp` is a hand-written SIMD loop,
+    /// and a profile of perl -- which compares a hash key on every lookup --
+    /// puts it as the only library code among the hottest back edges.
+    MemCmp {
+        dst: Value,
+        a: Value,
+        b: Value,
+        len: Value,
+    },
     /// A memory fence.
     Fence,
 }
@@ -848,6 +866,12 @@ impl Stmt {
                 f(*val);
                 f(*len);
             }
+            // `dst` is defined here, not used, so it is not visited.
+            Stmt::MemCmp { a, b, len, .. } => {
+                f(*a);
+                f(*b);
+                f(*len);
+            }
             Stmt::Fence => {}
         }
     }
@@ -862,6 +886,7 @@ impl Stmt {
             | Stmt::VStore { .. }
             | Stmt::MemCopy { .. }
             | Stmt::MemFill { .. }
+            | Stmt::MemCmp { .. }
             | Stmt::Fence => true,
         }
     }
@@ -974,6 +999,17 @@ impl Builder {
         let v = Value(self.block.n_values);
         self.block.n_values += 1;
         self.block.stmts.push(Stmt::Def { dst: v, expr });
+        v
+    }
+
+    /// Allocate a value that a statement will define itself.
+    ///
+    /// `def` is for `Stmt::Def`, which pairs a value with an expression. A
+    /// statement like `MemCmp` produces a value without being an expression,
+    /// so it needs the number without the pairing.
+    pub fn fresh(&mut self) -> Value {
+        let v = Value(self.block.n_values);
+        self.block.n_values += 1;
         v
     }
 
