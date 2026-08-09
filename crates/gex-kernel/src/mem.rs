@@ -240,6 +240,30 @@ impl MemoryMap {
         self.insert_from(start, end, prot, name, None);
     }
 
+    /// Record a region exactly as another process had it.
+    ///
+    /// For `fork`: the child's bytes are its parent's, so its *map* should be
+    /// its parent's too -- the name it had, and the code identity it had.
+    /// Inserting a bare span instead loses both, and a child that cannot say
+    /// what code is at an address cannot find it in the shared store; it
+    /// re-translates the parent's libraries from cold, every time.
+    ///
+    /// No `origin`: that says the region can be rebuilt by re-reading a file,
+    /// which is a claim about a mapping this process made and not one to
+    /// inherit.
+    pub fn adopt(&mut self, start: u64, end: u64, prot: u32, name: &str, code: Option<(String, u64)>) {
+        self.generation += 1;
+        self.vmas.push(Vma {
+            start: page_align_down(start),
+            end: page_align_up(end),
+            prot,
+            name: name.to_string(),
+            origin: None,
+            code,
+        });
+        self.vmas.sort_by_key(|v| v.start);
+    }
+
     /// As [`Self::insert`], for bytes a loader placed rather than copied: the
     /// file and offset name the *code*, but the mapping cannot be rebuilt by
     /// re-reading, so it gets no `origin`.

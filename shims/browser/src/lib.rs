@@ -1893,6 +1893,113 @@ pub extern "C" fn gex_vma_count() -> i32 {
     with_host(|h| h.kernel.mem.vmas().len() as i32)
 }
 
+/// The whole memory map as bytes, for a child to rebuild from.
+///
+/// `gex_vma_at` gives three numbers per region, and three numbers is not a
+/// mapping. What a forked child needs to know is also what each region *is*:
+/// its name, and the file and offset its code came from. Without those the
+/// child's map is a single anonymous span -- it was literally called
+/// `[forked]` -- and nothing in it can be identified, so the child cannot
+/// find a page in the shared store and re-translates its parent's code from
+/// cold. In Chromium that was every miss of every process: `hit=0`,
+/// `served=0`, eight thousand blocks lifted again per command.
+///
+/// One blob rather than a call per field, because parent and child are
+/// different instances in different Workers and everything between them is
+/// bytes anyway.
+///
+///   u32 count, then per region:
+///   u64 start, u64 end, u32 prot,
+///   u32 name_len, name, u32 code_len, code, u64 code_off
+///
+/// A zero `code_len` means no code identity. `origin` is deliberately absent:
+/// it says a region can be rebuilt by re-reading a file, which is a claim
+/// about *this* process's mappings and not something to inherit.
+fn vma_blob(h: &Host) -> Vec<u8> {
+    let vmas = h.kernel.mem.vmas();
+    let mut out = Vec::with_capacity(64 * vmas.len());
+    out.extend_from_slice(&(vmas.len() as u32).to_le_bytes());
+    for v in vmas {
+        out.extend_from_slice(&v.start.to_le_bytes());
+        out.extend_from_slice(&v.end.to_le_bytes());
+        out.extend_from_slice(&v.prot.to_le_bytes());
+        out.extend_from_slice(&(v.name.len() as u32).to_le_bytes());
+        out.extend_from_slice(v.name.as_bytes());
+        match &v.code {
+            Some((id, off)) => {
+                out.extend_from_slice(&(id.len() as u32).to_le_bytes());
+                out.extend_from_slice(id.as_bytes());
+                out.extend_from_slice(&off.to_le_bytes());
+            }
+            None => {
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&0u64.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+#[no_mangle]
+pub extern "C" fn gex_vma_blob_len() -> u32 {
+    with_host(|h| vma_blob(h).len() as u32)
+}
+
+#[no_mangle]
+pub extern "C" fn gex_vma_blob_read(out: u32, cap: u32) -> u32 {
+    with_host(|h| {
+        let blob = vma_blob(h);
+        if blob.len() as u32 > cap {
+            return 0;
+        }
+        shim_slice_mut(out, blob.len() as u32).copy_from_slice(&blob);
+        blob.len() as u32
+    })
+}
+
+/// Rebuild the child's map from what [`vma_blob`] wrote.
+#[no_mangle]
+pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
+    let raw = shim_slice(ptr, len);
+    let mut p = 0usize;
+    let mut u32at = |p: &mut usize| -> u32 {
+        let v = u32::from_le_bytes(raw[*p..*p + 4].try_into().unwrap());
+        *p += 4;
+        v
+    };
+    if raw.len() < 4 {
+        return -1;
+    }
+    let count = u32at(&mut p);
+    with_host(|h| {
+        for _ in 0..count {
+            if p + 24 > raw.len() {
+                return -1;
+            }
+            let start = u64::from_le_bytes(raw[p..p + 8].try_into().unwrap());
+            let end = u64::from_le_bytes(raw[p + 8..p + 16].try_into().unwrap());
+            p += 16;
+            let prot = u32at(&mut p);
+            let nlen = u32at(&mut p) as usize;
+            let name = String::from_utf8_lossy(&raw[p..p + nlen]).into_owned();
+            p += nlen;
+            let clen = u32at(&mut p) as usize;
+            let code = if clen == 0 {
+                p += 8;
+                None
+            } else {
+                let id = String::from_utf8_lossy(&raw[p..p + clen]).into_owned();
+                p += clen;
+                let off = u64::from_le_bytes(raw[p..p + 8].try_into().unwrap());
+                p += 8;
+                Some((id, off))
+            };
+            h.kernel.mem.adopt(start, end, prot, &name, code);
+        }
+        0
+    })
+}
+
 /// Describe region `i`, writing `start`, `end` and `prot` as three `u64` at
 /// `out` in this module's own region.
 ///
@@ -4328,6 +4435,9 @@ thread_local! {
     /// Why a page that the identity map recognised still had nothing to
     /// serve: nobody claimed it, and every claim was already installed.
     static SERVE_NONE: std::cell::RefCell<(u64, u64)> = const { std::cell::RefCell::new((0, 0)) };
+    /// Why a page had no identity: the mapping was writable, or it had no
+    /// `code`.
+    static NOIDENT_WHY: std::cell::RefCell<(u64, u64)> = const { std::cell::RefCell::new((0, 0)) };
 }
 
 /// Which *object* a guest address belongs to, if it is one that was loaded
@@ -4477,8 +4587,29 @@ fn page_identity(h: &Host, page: u64) -> Option<u64> {
         .vmas()
         .iter()
         .find(|v| page >= v.start && page < v.end)?;
+    // Which of the two reasons a page has no identity, counted apart. They
+    // want different fixes -- a writable mapping is code the guest could have
+    // changed, a mapping with no `code` is one the loader declined to name --
+    // and "noident" alone could not tell them apart. Under Node this is
+    // mostly zero and in Chromium it was every miss.
     if v.prot & gex_kernel::mem::prot::WRITE != 0 {
+        NOIDENT_WHY.with(|c| c.borrow_mut().0 += 1);
         return None;
+    }
+    if v.code.is_none() {
+        NOIDENT_WHY.with(|c| {
+            let mut c = c.borrow_mut();
+            c.1 += 1;
+            // The first few, named. A count says how often a page could not be
+            // identified; only the mapping says which loader path left it
+            // unnamed, and those want different fixes.
+            if tracing() && c.1 <= 8 {
+                trace_line(&format!(
+                    "[gex] no code identity for {:#x}: vma {:#x}..{:#x} prot {} name {:?}\n",
+                    page, v.start, v.end, v.prot, v.name
+                ));
+            }
+        });
     }
     // What was *loaded* here, not what could be re-read from disk. Those are
     // different questions and one field was answering both: an image segment
@@ -5765,10 +5896,25 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // inside a library a process will miss all over it, and each
                 // of those is a module somebody has already built -- so take
                 // them all on the first miss and stop coming back.
-                let ready = shared_modules_of_object(
+                // Bounded, because installing is not free. Once a forked
+                // child inherited its parent's code identities it began
+                // *finding* everything, and taking a whole object at a time
+                // meant seventeen hundred `WebAssembly.instantiate` calls per
+                // process -- about four seconds each, against three hundred
+                // milliseconds of translation. Finding the code became dearer
+                // than lifting it, and a shell loop over 21 processes stopped
+                // finishing inside two minutes.
+                //
+                // So take a few per miss and come back. The right answer is
+                // one module rather than a thousand -- the units are all this
+                // emitter's own output and could be merged -- and until that
+                // exists this keeps the cost proportional to the misses.
+                const PER_MISS: usize = 16;
+                let mut ready = shared_modules_of_object(
                     h,
                     object_identity(h, page * gex_abi::DISPATCH_PAGE).unwrap_or(0),
                 );
+                ready.truncate(PER_MISS);
                 if !ready.is_empty() {
                     if tracing() {
                         trace_line(&format!(
@@ -6943,6 +7089,8 @@ pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
             6 => h.jit.store_full,
             7 => SERVE_NONE.with(|c| c.borrow().0),
             8 => SERVE_NONE.with(|c| c.borrow().1),
+            9 => NOIDENT_WHY.with(|c| c.borrow().0),
+            10 => NOIDENT_WHY.with(|c| c.borrow().1),
             _ => h.jit.reuse_noident,
         }) as i64
     })

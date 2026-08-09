@@ -325,6 +325,11 @@ export async function runProgram(
       // that starts a demo is never the interesting process: the questions
       // are about the X server and the client it forks.
       heartbeat: heartbeat || undefined,
+      // `?trace=1` turns on the shim's own narration, in every process. The
+      // Node harness has had this through an environment variable all along;
+      // the page had no way to ask for it, so a question that needed it could
+      // only be answered by editing the shim.
+      trace: new URLSearchParams(location.search).get('trace') ? 1 : undefined,
       virgl: channel ?? undefined,
       wispUrl: network?.url ?? undefined,
       winsize: { rows: term.rows, cols: term.cols },

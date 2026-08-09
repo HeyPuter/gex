@@ -740,6 +740,29 @@ export class Gex {
   }
 
   /**
+   * The memory map itself, whole: every region's name and the file its code
+   * came from, which the three numbers of `gex_vma_at` cannot carry.
+   *
+   * A child that gets only spans calls every region `[forked]` and can
+   * identify none of them, so it finds nothing in the shared module store and
+   * lifts its parent's libraries again. In Chromium that was every process:
+   * `hit=0`, `served=0`, eight thousand blocks per command, for ever.
+   */
+  #vmaBlob() {
+    const e = this.#shim.exports;
+    if (!e.gex_vma_blob_len || !e.gex_vma_blob_read) return null;
+    const len = e.gex_vma_blob_len() >>> 0;
+    if (!len) return null;
+    const buf = e.gex_alloc(len) >>> 0;
+    let blob = null;
+    if (e.gex_vma_blob_read(buf, len) === len) {
+      blob = new Uint8Array(this.#memory.buffer, buf, len).slice();
+    }
+    e.gex_free?.(buf, len);
+    return blob;
+  }
+
+  /**
    * Instantiate the global kernel against this process's memory.
    *
    * Every Worker does this, with the same module and the same *kernel*
@@ -978,8 +1001,19 @@ export class Gex {
     if (o.uid !== undefined) e.gex_set_identity(o.uid, o.gid ?? o.uid);
     // The map, which the bytes do not carry: without it the child's first
     // `mmap` hands out an address its own image is already at.
-    for (const r of child.image) {
-      if (r.end !== undefined) e.gex_adopt_vma(BigInt(r.at), BigInt(r.end), r.prot);
+    // Preferring the blob, which carries each region's name and the file its
+    // code came from as well as its span. The three-number form stays for a
+    // shim built before the blob existed.
+    const blob = child.vmaBlob;
+    if (blob && e.gex_adopt_vma_blob) {
+      const p = e.gex_alloc(blob.length) >>> 0;
+      new Uint8Array(this.#memory.buffer, p, blob.length).set(blob);
+      e.gex_adopt_vma_blob(p, blob.length);
+      e.gex_free?.(p, blob.length);
+    } else {
+      for (const r of child.image) {
+        if (r.end !== undefined) e.gex_adopt_vma(BigInt(r.at), BigInt(r.end), r.prot);
+      }
     }
     step(`${child.image.length} regions mapped`);
     // Before the modules, because installing one asks the shim which slot
@@ -1095,6 +1129,10 @@ export class Gex {
       // and grows one from address zero, over its own register contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
       image: this.#processImage(),
+      // The map, separately from the bytes it describes: names and code
+      // identities, which the child needs to recognise a page as belonging to
+      // a library somebody has already translated.
+      vmaBlob: this.#vmaBlob(),
       // The map from a guest page to the dispatch slots its blocks are in,
       // and the modules those slots point into. Neither is in the memory --
       // the map is Rust data in this Worker's heap and the modules are

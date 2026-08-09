@@ -295,7 +295,7 @@ export class ProcessHost {
             `[gex] pid ${pid}: ${m.millis}ms translating ${m.blocks} blocks` +
               (m.reuse
                 ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]}` +
-                  ` noident=${m.reuse[3]} served=${m.reuse[4]} stored=${m.reuse[5]}`
+                  ` noident=${m.reuse[3]} served=${m.reuse[4]} stored=${m.reuse[5]} writable=${m.reuse[9]} nocode=${m.reuse[10]}`
                 : ''),
           );
         }

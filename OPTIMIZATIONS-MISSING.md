@@ -1381,6 +1381,54 @@ Closing it needs one of two things, and both are real features:
 Worth the effort at roughly 12,000 blocks against 281,254 -- a twentieth of
 what is already saved -- but not before the run is confirmed end to end.
 
+## A forked child cannot say what code it is running
+
+The demo was reported slow -- seconds per `ls`, however many times you ran it
+-- while the same shim under Node converged to almost nothing. Both hosts run
+the same `gex_browser.wasm` and the same glue, so the disagreement was the
+finding, not the numbers.
+
+Getting at it needed a browser that stays up. `web/test/site.mjs` boots
+Chromium, serves the bundle, unpacks a rootfs tar into the guest filesystem
+and then runs *one* command: 295 seconds for three `ls`, against 20 under
+Node. `web/test/harness.mjs` pays that once and keeps the page alive, taking
+commands over HTTP against a rootfs streamed out of a real directory -- 38.7
+seconds for the same three, and about 1.2 seconds a command after the first.
+
+With it, one run said what a fortnight of guessing had not:
+
+    pid 2  9375 blocks  hit=0  miss=0  noident=28  served=0  stored=28
+    pid 4  8009 blocks  hit=0  miss=0  noident=27  served=0  stored=27
+
+Nothing is ever found again. Splitting `noident` into its two causes gave
+`writable=0, nocode=28`: the mappings are not writable, they simply have no
+code identity. Naming them:
+
+    no code identity for 0x1017000: vma 0x1000000..0x101e000 name "[forked]"
+    no code identity for 0x50bd000: vma 0x5000000..0x518c000 name "[forked]"
+
+A forked child's address space arrives as one anonymous span. The fork
+protocol carries `(start, end, prot)` per region and nothing else, so the
+names and the code identities never travel; the child calls the lot
+`[forked]`, cannot identify any page in it, finds nothing in the shared
+module store, and lifts its parent's libraries from cold. Every `ls`, every
+`wc`, every apt method.
+
+It also explains a shape that made no sense: 335 blocks per miss in the
+browser against Node's 52. A child with one undifferentiated span has no
+per-object structure for discovery to work against.
+
+The fix carries the map rather than the spans -- one blob holding each
+region's name, protection, and the file and offset its code came from, built
+by `gex_vma_blob_read` and rebuilt by `MemoryMap::adopt`. `origin` does not
+travel: it says a region can be reconstructed by re-reading a file, which is
+a claim about mappings this process made and not one to inherit.
+
+Worth noting what this does *not* fix. Translation was already a small part
+of the wall clock -- 4-8% of an `ls`, and 184ms of the 118 seconds an
+`apt-get update` takes against a closure. Sharing more of it cannot buy back
+time nobody is spending there.
+
 ## Why every `ls` in the demo costs a second
 
 Reported from the demo: running `ls` takes seconds, every time, however many

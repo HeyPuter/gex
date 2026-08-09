@@ -201,7 +201,8 @@ async function start(args) {
 
   const profile = mkdtempSync(join(tmpdir(), 'gex-harness-'));
   const url =
-    `http://127.0.0.1:${PORT}/?harness=1&shell=${encodeURIComponent(args.shell || '/bin/dash')}`;
+    `http://127.0.0.1:${PORT}/?harness=1&shell=${encodeURIComponent(args.shell || '/bin/dash')}` +
+    (args.trace ? '&trace=1' : '');
   const chrome = spawn(
     CHROME,
     [
@@ -250,6 +251,7 @@ const positional = [];
 for (let i = 0; i < rest.length; i++) {
   if (rest[i] === '--root') flags.root = rest[++i];
   else if (rest[i] === '--shell') flags.shell = rest[++i];
+  else if (rest[i] === '--trace') flags.trace = true;
   else positional.push(rest[i]);
 }
 

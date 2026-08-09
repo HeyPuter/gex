@@ -378,7 +378,7 @@ async function handle(msg) {
       // identity at all. The question is why a child re-lifts its parent's
       // libraries, and these four say which step loses them.
       reuse: gex.shim.exports.gex_reuse_stat
-        ? [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => Number(gex.shim.exports.gex_reuse_stat(i)))
+        ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((i) => Number(gex.shim.exports.gex_reuse_stat(i)))
         : null,
       // How much of this process's memory the shim ever used. It decides how
       // big a memory has to be, and a memory per process decides how many
