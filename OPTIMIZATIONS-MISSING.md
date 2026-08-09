@@ -341,6 +341,34 @@ stored and loaded one at a time, which is section 5 below. Packing them is a
 representation change with no ABI question in it, and it is the largest
 single item this measurement exposes.
 
+## Packing the flags: built, and the runtime effect is not readable here
+
+Added 2026-08-09. The four condition flags are one slot with a byte each now,
+and a flush that has all four packs them into one `i32.store` instead of
+four. Correctness is settled -- 300 differential-fuzz cases against QEMU with
+none differing, gzip byte-identical over 13 MB, 114 unit tests -- and the
+boundary bytes fall about 1.5% on gzip, bash and nbench alike.
+
+The runtime measurement failed, and it is worth saying how rather than
+quoting the number it produced:
+
+    NUMERIC SORT   475.10 -> 482.63   +1.6%
+    STRING SORT    236.42 -> 241.05   +2.0%
+    IDEA          4018.7  -> 3835.5   -4.6%
+    FOURIER      13864    -> 15406   +11.1%   (control)
+
+The control moved more than anything else. FOURIER is floating point and
+hardly touches NZCV, so an 11% gain there is not flag packing; it is the
+machine, which has a VM on it that comes and goes. `nbench-ab.cfg` says
+exactly this -- "an effect that appears in all four is the machine" -- and
+the case where the *control alone* moves most is the same warning louder.
+
+So: no readable runtime effect, on a machine that cannot currently resolve
+one this size. The change stands on the traffic argument rather than on a
+measurement, which is weaker than this file's usual standard and is flagged
+here as such. Re-run it on a quiet machine, interleaving the two sides
+within one run rather than one after the other, before believing any number.
+
 # The test an item has to pass
 
 Added 2026-08-09, after one item on this list measured at exactly zero for a
