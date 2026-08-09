@@ -94,7 +94,40 @@ impl TranslatedModule {
 pub struct PageTable {
     pages: std::collections::BTreeMap<u64, u32>,
     next_slot: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// End of the chunk `next_slot` is allocating from, when a refill is set.
+    chunk_end: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Highest slot any page in this table names, allocated here or adopted.
+    high: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    refill: Option<std::sync::Arc<Refill>>,
 }
+
+/// A source of slot numbers no other page table will hand out.
+///
+/// Without one, a table allocates from its own counter and two processes
+/// running the same program hand out *the same numbers for different code* --
+/// both start from the mark their image was built with and translate in
+/// whatever order they happen to reach. That is fine as long as nothing
+/// crosses between them, and fatal the moment one adopts a module the other
+/// built: the adopted code lands on slots this process has already filled,
+/// and this process's own directory entries still point there.
+///
+/// The host installs one that draws from a system-wide counter, so every
+/// range issued anywhere is issued once. Hosts with a single process do not
+/// need it and do not pay for it.
+pub struct Refill(pub Box<dyn Fn(u64) -> u64 + Send + Sync>);
+
+impl std::fmt::Debug for Refill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Refill")
+    }
+}
+
+/// Slots taken from the global counter at a time.
+///
+/// One round trip through the kernel per 256 pages of translated code, against
+/// a table that reaches a few hundred pages for a small program -- so a
+/// process pays for one or two.
+const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 256;
 
 impl Default for PageTable {
     fn default() -> PageTable {
@@ -127,15 +160,67 @@ impl PageTable {
         if let Some(&b) = self.pages.get(&page) {
             return b;
         }
-        let v = self
-            .next_slot
-            .fetch_add(SLOTS_PER_PAGE, std::sync::atomic::Ordering::SeqCst);
+        let v = self.take_slots();
         let entry = gex_abi::dispatch_entry(
             (v / Self::SLOTS_PER_TABLE) as usize,
             (v % Self::SLOTS_PER_TABLE) as u32,
         );
         self.pages.insert(page, entry);
+        self.high.fetch_max(
+            v + SLOTS_PER_PAGE,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         entry
+    }
+
+    /// One page's worth of slots, refilling from the global counter if this
+    /// table has one and its chunk is spent.
+    fn take_slots(&mut self) -> u64 {
+        let Some(refill) = self.refill.clone() else {
+            return self
+                .next_slot
+                .fetch_add(SLOTS_PER_PAGE, std::sync::atomic::Ordering::SeqCst);
+        };
+        loop {
+            let v = self.next_slot.load(std::sync::atomic::Ordering::SeqCst);
+            let end = self.chunk_end.load(std::sync::atomic::Ordering::SeqCst);
+            // A page's slots are written as a unit and indexed off one base,
+            // so a page must not straddle two tables either.
+            let straddles = v / Self::SLOTS_PER_TABLE
+                != (v + SLOTS_PER_PAGE - 1) / Self::SLOTS_PER_TABLE;
+            if v + SLOTS_PER_PAGE <= end && !straddles {
+                if self
+                    .next_slot
+                    .compare_exchange(
+                        v,
+                        v + SLOTS_PER_PAGE,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    return v;
+                }
+                continue;
+            }
+            let base = (refill.0)(REFILL_SLOTS);
+            self.next_slot
+                .store(base, std::sync::atomic::Ordering::SeqCst);
+            self.chunk_end
+                .store(base + REFILL_SLOTS, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Draw slot numbers from a counter shared with every other process.
+    ///
+    /// Install this before the table allocates anything it might publish. See
+    /// [`Refill`] for what goes wrong without it.
+    pub fn set_refill(&mut self, refill: std::sync::Arc<Refill>) {
+        self.refill = Some(refill);
+        // Spend whatever is left of the local chunk: the numbers below the
+        // mark were issued by this process alone and are not safe to share.
+        self.chunk_end
+            .store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Point a page at slots that already hold code for it.
@@ -161,8 +246,15 @@ impl PageTable {
         let end = gex_abi::dispatch_entry_table(entry) as u64 * Self::SLOTS_PER_TABLE
             + gex_abi::dispatch_entry_base(entry) as u64
             + SLOTS_PER_PAGE;
-        self.next_slot
-            .fetch_max(end, std::sync::atomic::Ordering::SeqCst);
+        self.high.fetch_max(end, std::sync::atomic::Ordering::SeqCst);
+        // Without a global counter the allocation mark has to move too, or
+        // this table hands the adopted slots out again. With one, the adopted
+        // range was issued to somebody else and this table's own chunk is
+        // untouched by it -- moving the mark would only waste the chunk.
+        if self.refill.is_none() {
+            self.next_slot
+                .fetch_max(end, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// The base slot for a page, if it already has one.
@@ -181,10 +273,12 @@ impl PageTable {
         self.pages.remove(&page)
     }
 
-    /// Total slots allocated so far, by this table and everything sharing its
-    /// mark.
+    /// How far the host has to grow its tables to contain what this table
+    /// names -- its own allocations and anything it has adopted.
     pub fn slots(&self) -> u64 {
-        self.next_slot.load(std::sync::atomic::Ordering::SeqCst)
+        self.high
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .max(self.next_slot.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Every page-to-base assignment made so far.
@@ -212,8 +306,11 @@ impl PageTable {
     /// and a page whose directory entry survived the restore would dispatch
     /// into whatever code now occupies its slots.
     pub fn advance_to(&mut self, slot: u64) {
-        self.next_slot
-            .fetch_max(slot, std::sync::atomic::Ordering::SeqCst);
+        self.high.fetch_max(slot, std::sync::atomic::Ordering::SeqCst);
+        if self.refill.is_none() {
+            self.next_slot
+                .fetch_max(slot, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Rebuild an assignment from the entries a previous run recorded.
@@ -228,6 +325,9 @@ impl PageTable {
         PageTable {
             pages: entries.iter().copied().collect(),
             next_slot: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(next_slot)),
+            chunk_end: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            high: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(next_slot)),
+            refill: None,
         }
     }
 }

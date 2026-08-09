@@ -260,6 +260,65 @@ pub extern "C" fn k_slot_put(page: u64, key: u64, base: u32) {
         .or_insert(base);
 }
 
+/// The system-wide slot allocation mark.
+///
+/// Dispatch slots have to be unique across *processes*, not just within one,
+/// because a module translated by one Worker can be installed in another. A
+/// page table that allocates from its own counter cannot give that: two
+/// processes running the same program start from the same mark -- the one
+/// their image was built with -- and issue the same numbers for different
+/// code.
+///
+/// So runtime translation draws from here instead. Ranges are handed out in
+/// chunks and never returned; the space is 8 tables of 9,999,360 slots and a
+/// page costs 1,024, which is 78,120 pages before it is spent.
+fn slot_mark() -> &'static core::sync::atomic::AtomicU64 {
+    static MARK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    &MARK
+}
+
+/// Reserve `count` slots for the caller alone, returning the first.
+///
+/// The range is aligned so that it cannot straddle two dispatch tables: a
+/// page's slots are written as a unit and reached from one base, so a base
+/// near the end of a table would index past it.
+#[no_mangle]
+pub extern "C" fn k_slot_alloc(count: u64) -> u64 {
+    // The same divisor the emitter uses to turn a slot number into a table
+    // index and an offset: whole pages only, so the two agree about which
+    // table a number is in.
+    let per_table =
+        (gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE;
+    let mut cur = slot_mark().load(core::sync::atomic::Ordering::SeqCst);
+    loop {
+        let mut base = cur;
+        // Do not let a reservation cross a table boundary.
+        if base / per_table != (base + count - 1) / per_table {
+            base = (base / per_table + 1) * per_table;
+        }
+        match slot_mark().compare_exchange(
+            cur,
+            base + count,
+            core::sync::atomic::Ordering::SeqCst,
+            core::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return base,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
+/// Raise the mark so nothing is handed out below `floor`.
+///
+/// Statically recompiled images carry slot numbers assigned when they were
+/// built, and those are the same in every process that runs the image -- which
+/// is right, because it is the same code. The global counter has to start
+/// above every such range, or a runtime allocation would land on one.
+#[no_mangle]
+pub extern "C" fn k_slot_floor(floor: u64) {
+    slot_mark().fetch_max(floor, core::sync::atomic::Ordering::SeqCst);
+}
+
 /// How many pages the map answers for. A diagnostic.
 #[no_mangle]
 pub extern "C" fn k_slot_count() -> u32 {

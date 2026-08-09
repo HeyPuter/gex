@@ -270,6 +270,10 @@ extern "C" {
     /// the second process to run `ls` finds what the first one did.
     fn k_slot_get(page: u64, key: u64) -> u32;
     fn k_slot_put(page: u64, key: u64, base: u32);
+    /// Slots nobody else will be given, and the mark that keeps runtime
+    /// allocation clear of what static recompilation already assigned.
+    fn k_slot_alloc(count: u64) -> u64;
+    fn k_slot_floor(floor: u64);
     /// Translated modules, once for the whole system. Knowing which slots a
     /// page's code is in does not let a Worker reach it -- a dispatch table
     /// belongs to a module instance -- so the module itself has to be
@@ -322,6 +326,31 @@ extern "C" {
     // process keeps for itself.
     fn k_virgl_take() -> i32;
     fn k_virgl_release(id: i32);
+}
+
+/// A page table whose runtime allocations come from the system-wide counter.
+///
+/// Every process gets one. The slots a statically recompiled image was built
+/// with stay exactly as built -- it is the same code in every process, so the
+/// same numbers are right -- and the mark is raised above them so nothing
+/// translated at runtime can land there. Everything after that is drawn in
+/// chunks from the kernel, which is what lets one process install a module
+/// another one translated: the range it occupies was issued once, to its
+/// translator, and no other process holds it.
+fn shared_page_table(entries: &[(u64, u32)], next_slot: u64) -> gex_xlate::PageTable {
+    let mut table = gex_xlate::PageTable::from_entries(entries, next_slot);
+    // Without a global kernel there is one process, and its own counter is
+    // already unique.
+    // SAFETY: both take scalars and borrow nothing from this side.
+    if unsafe { k_present() } == 0 {
+        return table;
+    }
+    unsafe { k_slot_floor(next_slot) };
+    table.set_refill(std::sync::Arc::new(gex_xlate::Refill(Box::new(|n| {
+        // SAFETY: as above.
+        unsafe { k_slot_alloc(n) }
+    }))));
+    table
 }
 
 /// Claim a renderer session number, or -1 when there is no global kernel to
@@ -2166,7 +2195,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             exit: None,
             jit: Jit {
                 described: meta.next_slot != 0,
-                page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
+                page_table: shared_page_table(&meta.dir_entries, meta.next_slot),
                 translated: Default::default(),
                 registry: Vec::new(),
                 shared: Default::default(),
@@ -3916,7 +3945,7 @@ pub extern "C" fn gex_adopt_child(
             let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
             Jit {
             described: meta.next_slot != 0,
-            page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
+            page_table: shared_page_table(&meta.dir_entries, meta.next_slot),
             translated: Default::default(),
             registry: Vec::new(),
             shared: Default::default(),
@@ -4141,7 +4170,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Slots already handed out are never reused -- a page that comes back
     // through a `fork` checkpoint still points at its own -- so allocation
     // carries on from the high-water mark rather than restarting.
-    h.jit.page_table = gex_xlate::PageTable::from_entries(&[], h.jit.page_table.slots());
+    h.jit.page_table = shared_page_table(&[], h.jit.page_table.slots());
     h.jit.translated.clear();
     // Except the closure's. Those modules are still in the dispatch tables --
     // `execve` rebuilds the image in this memory, not the wasm instance
@@ -5570,7 +5599,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         if h.jit.page_table.lookup(page).is_some() {
             h.jit.reuse_have += 1;
         }
-        if h.jit.page_table.lookup(page).is_none() {
+        // Ask even when the page already has a base. Having one does not mean
+        // having this block: discovery finds the blocks it can reach from
+        // where it started, so a page is filled in over many misses, and the
+        // gate that skipped a page with a base sent four hundred misses a
+        // process straight to the translator. `shared_module_at` refuses a
+        // module this Worker has already installed, so asking again after a
+        // real translation costs a lookup and nothing else.
+        {
             let ident = page_identity(h, page * gex_abi::DISPATCH_PAGE);
             if ident.is_none() {
                 h.jit.reuse_noident += 1;
