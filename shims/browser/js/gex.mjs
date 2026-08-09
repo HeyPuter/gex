@@ -393,6 +393,14 @@ export class Gex {
     // every Worker has to be told where it goes. Two threads sharing one stack
     // is the thing this design exists to avoid.
     this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
+    // The devices this process has, which `load` sets from the same fields.
+    // Before the kernel is built, because that is when the device nodes are
+    // made and the vtest socket is bound: a forked child told about its GPU
+    // afterwards would have a `/dev` without one, and Mesa would find no
+    // socket to draw through.
+    this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+    this.#shim.exports.gex_set_virgl?.(this.#virgl ? (this.#virglTrace ? 2 : 1) : 0);
+    this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
@@ -513,6 +521,8 @@ export class Gex {
       'k_pipe_new', 'k_pipe_open_end', 'k_pipe_close_end', 'k_pipe_read',
       'k_pipe_write', 'k_pipe_readable', 'k_pipe_writable', 'k_pipe_buffered',
     ];
+    // Not imported by the shim -- the host reads it after a crash -- so it is
+    // not in the list above and its absence is not a link error.
     // Two of these return an i64, which JS has to answer with a BigInt.
     const BIG = new Set(['k_wait', 'k_take_signals']);
     const out = { k_present: () => (k ? 1 : 0) };
@@ -587,14 +597,25 @@ export class Gex {
    * never grown.
    */
   async adoptProcess(shimWasm, guestWasm, child) {
+    // Narrated when asked, because every step here is a place a child can
+    // stop dead with nothing to show for it: a copy, two compiles, a kernel
+    // and a table of code. A child that hangs is indistinguishable from one
+    // that is merely slow to start, and it took a bisect to find out which.
+    const step = globalThis.GEX_DEBUG_EXIT
+      ? (s) => console.error(`[gex] adopt ${child.pid}: ${s}`)
+      : () => {};
+    step('copying the image');
     const u8 = new Uint8Array(this.#memory.buffer);
     for (const r of child.image) u8.set(new Uint8Array(r.bytes), r.at);
+    step('instantiating');
     await this.attach(shimWasm, guestWasm);
+    step('adopting');
     const e = this.#shim.exports;
     // Before the kernel is built, not after: the metadata is what the child's
     // dispatch table starts from, and `gex_adopt_child` reads it as it builds.
     this.#setMetadata(guestWasm);
     const entry = e.gex_adopt_child(child.pid, child.ctx, child.pc, child.sp, child.tls);
+    step('kernel built');
     // The kernel exists now, so everything that configures one can be said.
     const o = child.opts ?? {};
     this.#opts = o;
@@ -606,6 +627,7 @@ export class Gex {
     for (const r of child.image) {
       if (r.end !== undefined) e.gex_adopt_vma(BigInt(r.at), BigInt(r.end), r.prot);
     }
+    step(`${child.image.length} regions mapped`);
     // Before the modules, because installing one asks the shim which slot
     // each of its blocks belongs in and the answer is in this map.
     if (child.pages?.length && e.gex_adopt_page) {
@@ -614,6 +636,7 @@ export class Gex {
         e.gex_adopt_page(dv.getBigUint64(i, true), dv.getUint32(i + 8, true));
       }
     }
+    step('pages adopted');
     // After the kernel exists and before the guest runs: the first thing a
     // forked child does is read or write a descriptor it expects to have.
     if (child.fds?.length && e.gex_adopt_fds) {
@@ -622,7 +645,9 @@ export class Gex {
       e.gex_adopt_fds(p, child.fds.length);
       e.gex_free?.(p, child.fds.length);
     }
+    step(`installing ${child.modules?.length ?? 0} modules`);
     for (const m of child.modules ?? []) await this.#installModule(m.mod, m.need);
+    step('running');
     return entry;
   }
 
@@ -843,9 +868,14 @@ export class Gex {
           const code = ask(e.gex_exit_code, (c) => (c ? `, exit code ${c}` : ''));
           const heap = ask(e.gex_heap_used_kib, (k) =>
             k >= 0 ? `, ${(k / 1024) | 0} MiB of shim heap in use` : '');
+          // The one thing that still answers after the kernel is left
+          // borrowed: it is a plain static rather than a question for the
+          // kernel, and it narrows a crash to a single handler.
+          const nr = ask(e.gex_last_syscall, (n) =>
+            n === 0xffffffff ? '' : `, inside syscall ${n}`);
           throw new Error(
-            `the gex runtime trapped inside the shim (${err.message}${at}${code}` +
-              `${heap}). That is a crash in the runtime, not a guest exit; ` +
+            `the gex runtime trapped inside the shim (${err.message}${at}${nr}` +
+              `${code}${heap}). That is a crash in the runtime, not a guest exit; ` +
               'anything printed above is all the guest managed to do first.',
           );
         }

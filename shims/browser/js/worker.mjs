@@ -230,6 +230,22 @@ port.on(async (msg) => {
     } catch {
       // A shim too broken to ask. The engine's message is all there is.
     }
+    // And the global kernel, which has no console of its own: it imports two
+    // memories and nothing else, so a panic in there unwinds to a bare
+    // `unreachable`. Its message is in its own memory, which this Worker can
+    // read because it made the instance.
+    try {
+      const k = gex.kernel;
+      if (k?.k_panic_len?.()) {
+        const n = k.k_panic_len() >>> 0;
+        const at = k.k_panic_ptr() >>> 0;
+        where += ` -- the global kernel panicked: ${new TextDecoder().decode(
+          new Uint8Array(msg.kernel.memory.buffer, at, n),
+        )}`;
+      }
+    } catch {
+      // Nothing to add.
+    }
     if (msg.debugExit) console.error(`gex: worker threw: ${e?.message ?? e}${where}`);
     port.post({ kind: 'threw', message: (e?.message ?? String(e)) + where });
   }

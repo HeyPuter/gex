@@ -32,6 +32,48 @@ use std::sync::OnceLock;
 
 use gex_kernel::proc::ProcTable;
 
+/// What this module last panicked with, so a crash in here can be read.
+///
+/// It has no console: the browser shim writes through an import the page
+/// supplies, and this module imports nothing but two memories. So a panic in
+/// here unwound to a bare `unreachable` with no message at all -- and since
+/// the shim is mid-syscall when it happens, every later call into the shim
+/// found the kernel still borrowed and panicked on top of it. What a run
+/// showed was three re-entrancy complaints and no cause.
+///
+/// The host reads this straight out of the shared memory it created; see
+/// `k_panic_ptr`.
+static PANIC: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Install the hook, once. Called at the top of every export that could
+/// panic -- which is all of them, because any of them can be the first.
+fn note_panics() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let mut slot = PANIC.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = format!("{info}");
+        }));
+    });
+}
+
+/// Where the last panic message is, in *this* module's memory, and how long.
+///
+/// A host that made the memory can read it directly; nothing has to be
+/// copied. Zero length means this module has not panicked.
+#[no_mangle]
+pub extern "C" fn k_panic_ptr() -> u32 {
+    PANIC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn k_panic_len() -> u32 {
+    PANIC.lock().unwrap_or_else(|e| e.into_inner()).len() as u32
+}
+
 /// The system's processes, in the memory every Worker shares.
 ///
 /// A `static` rather than anything handed across a boundary: this module's
@@ -39,6 +81,7 @@ use gex_kernel::proc::ProcTable;
 /// static here is already the same bytes for every Worker that instantiated
 /// against it. That is the entire trick.
 fn procs() -> &'static ProcTable {
+    note_panics();
     static PROCS: OnceLock<ProcTable> = OnceLock::new();
     PROCS.get_or_init(ProcTable::new)
 }
@@ -219,6 +262,7 @@ pub extern "C" fn k_halt_code() -> i32 {
 
 /// Every pipe in the system, by id.
 fn pipes() -> &'static std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::pipe::Pipe>>> {
+    note_panics();
     static PIPES: OnceLock<std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::pipe::Pipe>>>> =
         OnceLock::new();
     PIPES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -340,6 +384,7 @@ use gex_kernel::vfs::{remote, FileHandle, FileSystem};
 
 /// The root every process sees.
 fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
+    note_panics();
     static ROOT: OnceLock<std::sync::Arc<gex_kernel::vfs::TmpFs>> = OnceLock::new();
     ROOT.get_or_init(|| {
         let fs = gex_kernel::vfs::TmpFs::new();
@@ -361,6 +406,7 @@ fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
 /// churn is not.
 type Handles = std::sync::Mutex<Vec<Option<std::sync::Arc<dyn FileHandle>>>>;
 fn handles() -> &'static Handles {
+    note_panics();
     static H: OnceLock<Handles> = OnceLock::new();
     H.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }

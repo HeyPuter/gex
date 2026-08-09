@@ -99,9 +99,16 @@ static mut HAVE_NET: bool = false;
 #[no_mangle]
 pub extern "C" fn gex_set_network(on: i32) {
     unsafe { HAVE_NET = on != 0 };
-    with_host(|h| {
-        h.kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
-    });
+    // Only when there is a kernel to tell. A Worker that has instantiated the
+    // shim but not yet been given a process -- everything between `attach`
+    // and `gex_adopt_child` -- has none, and every kernel built after this
+    // reads the flag on its way up anyway.
+    if gex_has_host() != 0 {
+        with_host(|h| {
+            h.kernel.net =
+                unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
+        });
+    }
 }
 
 /// One Wisp stream, as the kernel's [`net::Transport`].
@@ -2117,7 +2124,7 @@ fn count_syscall() {
 /// other way for a callee to say "abandon this stack", and it keeps JS out of
 /// the common path entirely.
 #[no_mangle]
-pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
+pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
         let base = with_host(|h| h.threads[h.current].kstate.ctx_addr);
@@ -2164,6 +2171,19 @@ pub extern "C" fn gex_syscall(_ctx: i32, pc: i64) {
         }
     }
     count_syscall();
+    // Recorded before the kernel is taken, and readable without taking it.
+    //
+    // A crash inside a syscall leaves the kernel borrowed, so every question
+    // asked afterwards -- which pc, which thread, which anything -- panics on
+    // the leaked borrow and answers nothing. This one number survives, and it
+    // is the one that narrows a crash from "somewhere in the runtime" to a
+    // single handler.
+    LAST_SYSCALL.store(
+        GuestMem::new(guest_bytes())
+            .read_u64(ctx as u32 as u64 + ctx::x(8) as u64)
+            .unwrap_or(!0) as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let stop = with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[h.current].kstate.clone();
@@ -3521,6 +3541,19 @@ fn finish_parked(
 fn trap() -> ! {
     HANDOFF.store(true, std::sync::atomic::Ordering::Relaxed);
     core::arch::wasm32::unreachable()
+}
+
+/// The syscall number the guest is inside, or the last one it was inside.
+///
+/// A plain static, deliberately: it is read after a crash, when the kernel
+/// may still be borrowed by whatever crashed, and anything that took the
+/// kernel to answer would panic instead of answering.
+static LAST_SYSCALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(!0);
+
+/// Which syscall the guest was in. `0xffffffff` if it has made none.
+#[no_mangle]
+pub extern "C" fn gex_last_syscall() -> u32 {
+    LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Set by [`trap`], cleared by [`gex_handoff`].

@@ -11,7 +11,6 @@
 //! through `Atomics.wait`.
 
 use crate::errno::{Errno, SysResult};
-use crate::fs::oflags;
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 

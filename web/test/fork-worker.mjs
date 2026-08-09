@@ -87,8 +87,10 @@ function run(child) {
       }
       const gex = new Gex(new E(), { kernel: workerData.kernel });
       if (process.env.GEX_STRACE) globalThis.__gexStrace = 1;
+      if (process.env.GEX_DEBUG_EXIT) globalThis.GEX_DEBUG_EXIT = 1;
       const c = workerData.child;
       let entry;
+      try {
       if (c) {
         // Everything a forked process is: the parent's memory, a shim and a
         // guest module over it, a kernel of its own, and the dispatch slots
@@ -100,6 +102,12 @@ function run(child) {
       }
       const status = await gex.run(entry);
       parentPort.postMessage({ kind: 'exit', status });
+      } catch (err) {
+        // Reported rather than left as an unhandled rejection: a child that
+        // throws on the way in is silent otherwise, and silence here reads
+        // exactly like a child that is running and slow.
+        parentPort.postMessage({ kind: 'threw', message: err?.stack ?? String(err) });
+      }
       `,
       { eval: true, workerData: { shim, seed, elf, child, kernel } },
     );
@@ -117,6 +125,10 @@ function run(child) {
         // The child is a process in its own right: start it and let it run
         // alongside the parent, which is the whole difference from a switch.
         run(m.child).catch(reject);
+      } else if (m.kind === 'threw') {
+        console.log(`[threw] ${child ? `pid ${child.pid}` : 'parent'}: ${m.message}`);
+        w.terminate();
+        reject(new Error(m.message));
       } else if (m.kind === 'exit') {
         console.log(`[exit] ${child ? `pid ${child.pid}` : 'parent'}: status ${m.status}`);
         w.terminate();
