@@ -853,8 +853,27 @@ impl<'a> Emitter<'a> {
         static_off
     }
 
+    /// Whether to emit the bounds guard at all.
+    ///
+    /// `GEX_UNSAFE_NO_GUARD=1` drops it, which is **not shippable**: a guest
+    /// that computes an address above `GUEST_LIMIT` then aliases low memory
+    /// silently instead of taking SIGSEGV. It exists to put a number on what
+    /// the guard costs, because the principled way to remove it -- a
+    /// `memory64` guest memory, so the engine's own bounds check subsumes it
+    /// -- needs the shim on a tier-3 Rust target, and nobody should start
+    /// that without knowing the size of the prize.
+    fn no_guard() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("GEX_UNSAFE_NO_GUARD").is_some())
+    }
+
     /// Consume an `i64` effective address and leave a bounds-safe `i32`.
     fn guard_to_i32(&mut self) {
+        if Self::no_guard() {
+            self.f.byte(code::I32_WRAP_I64);
+            return;
+        }
         let before = self.f.code.len();
         self.guard_to_i32_inner();
         GUARD_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);

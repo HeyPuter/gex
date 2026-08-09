@@ -372,10 +372,39 @@ The measured split -- 16-18% registers, 5-9% safepoints, 4-7% dispatch,
 flush and the safepoint are real, the duplicate half of the guards is not,
 and the per-base half of the guards is.
 
+## The bounds guard is the biggest single item here, measured
+
+`GEX_UNSAFE_NO_GUARD=1` builds without the guard at all -- not shippable,
+since a guest that computes an address above `GUEST_LIMIT` then aliases low
+memory instead of taking SIGSEGV. It exists to price the removal, because
+the principled way to do it needs a tier-3 Rust target and nobody should
+start that blind.
+
+nbench, statically recompiled both ways, two runs each:
+
+    STRING SORT   240.21 -> 388.5   +61.7%
+    NUMERIC SORT  488.73 -> 528.5    +8.1%
+    IDEA         3828.4  -> 4102.8   +7.2%
+    FOURIER     15861    -> 16046    +1.2%
+
+and the module falls from 7673 KiB to 6820 KiB.
+
+The spread is the mechanism showing: STRING SORT chases pointers and bytes,
+so almost every instruction is a guarded access, while FOURIER strides
+through doubles and does far less addressing per unit of arithmetic. Real
+programs that move strings and structures -- apt parsing an index, a shell,
+a compiler -- are at the STRING SORT end.
+
+**Nothing else on this list is close.** It also passes the test above:
+every access has a different address, so this is not redundancy V8 can
+collapse -- it must emit all eight instructions, every time.
+
 ## Why section 16(d) is not the way out of the guards
 
 `memory64` with a large reservation, so the engine's own bounds check
-subsumes the `select`, is the right shape and is currently unbuildable. The
+subsumes the `select`, is the right shape and is not buildable *as things
+stand* -- which, given the number above, is a reason to change how things
+stand rather than to drop it. The
 guest modules do not own the memory: they `import_memory` it from the shim,
 and the shim is Rust built for `wasm32-unknown-unknown`. A wasm32 module
 cannot export a 64-bit memory, so this needs the shim on
