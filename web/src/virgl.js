@@ -18,6 +18,34 @@
 // space to allocate in, which is exactly what it must not have.
 
 /** Load the renderer and point it at a canvas. */
+/**
+ * Load the renderer's emscripten glue, whatever the server thinks of it.
+ *
+ * It is a build artifact rather than source: it lives in `public/` next to
+ * the wasm it loads, and both are copied as-is. Importing it directly works
+ * on the built site and fails on the dev server, which answers
+ *
+ *   Failed to load url /gex/gexvirgl.mjs. This file is in /public and will be
+ *   copied as-is during build without going through the plugin transforms,
+ *   and therefore should not be imported from source code.
+ *
+ * -- a rule about *source*, which this is not. So it is fetched as text and
+ * turned into a module here. The one thing that costs is the glue's idea of
+ * where its wasm is, and `locateFile` says so explicitly.
+ */
+async function loadGlue(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
+  const blob = URL.createObjectURL(
+    new Blob([await res.text()], { type: 'text/javascript' }),
+  );
+  try {
+    return (await import(/* @vite-ignore */ blob)).default;
+  } finally {
+    URL.revokeObjectURL(blob);
+  }
+}
+
 export class VirglRenderer {
   #module = null;
   #canvas = null;
@@ -43,8 +71,12 @@ export class VirglRenderer {
     // id the module asks for.
     canvas.id = 'gex-gl';
     try {
-      const Module = (await import(/* @vite-ignore */ url)).default;
+      const Module = await loadGlue(url);
       r.#module = await Module({
+        // Where the renderer's own wasm is, said rather than inferred. The
+        // glue works it out from `import.meta.url`, which is a blob when it
+        // is loaded the way `loadGlue` has to load it.
+        locateFile: (file) => new URL(file, new URL(url, location.href)).href,
         // virglrenderer explains itself on stderr and says nothing through a
         // return value beyond "no", so this is the only diagnostic there is.
         printErr: (s) => (onLog ? onLog(s) : console.warn('[virgl]', s)),
