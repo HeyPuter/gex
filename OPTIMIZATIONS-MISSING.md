@@ -515,6 +515,52 @@ a compiler -- are at the STRING SORT end.
 every access has a different address, so this is not redundancy V8 can
 collapse -- it must emit all eight instructions, every time.
 
+## apt has never been statically recompiled, and when it is, it is 2.3x slower
+
+Added 2026-08-09, after a question that should have been asked months ago:
+has apt's four minutes ever been measured with the feature this project is
+for?
+
+It has not. `gexc build <elf>` translates the *image* and follows no
+DT_NEEDED, and `apt-get` is a 67 KB wrapper:
+
+    apt.wasm: 212 blocks, 914 guest instructions, 51 KiB wasm
+
+All of apt is in `libapt-pkg.so`, 1.9 MB, which that build never sees. perl
+only looked like a whole-program build because Debian links libperl into the
+3.7 MB `/usr/bin/perl`. So every apt number in this file, including today's
+3min 42s, is the runtime translator end to end.
+
+The static path for a library is `GEX_RECOMPILE_OBJECTS`, which translates a
+whole object once it proves hot rather than a block per dispatch miss. With
+it, at the usual 8 MB cap:
+
+    runtime translation      Fetched 14.9 MB in 3min 13s   wall 222s
+    whole-object recompile   Fetched 14.9 MB in 7min 54s   wall 520s
+
+2.34x slower, and the slowdown is in the fetch phase, which is where apt
+decompresses and hashes.
+
+Three candidate reasons, none yet separated:
+
+  * **Translating code that never runs.** The cap recompiles every object
+    under 8 MB of text -- libapt-pkg, libstdc++, libc, libgcrypt, liblzma,
+    libzstd, libsystemd -- and apt update executes a small fraction of any of
+    them. A dispatch miss translates exactly what is reached.
+  * **Per process.** apt forks a helper to fetch and more to verify, and each
+    child maps the same libraries and pays the same whole-object translation
+    again. Section 54's cache is per store.
+  * **The module, not the code.** Thirty megabytes of extra wasm per process
+    is V8 compile time and instruction cache, which is the same effect that
+    made the N=256 dispatch ballast cost 6% while executing nothing.
+
+This does not say static recompilation is wrong. It says whole-object
+recompilation, triggered by a hotness threshold on the *object*, is the wrong
+granularity for a short-lived fork-heavy program: it pays for a library and
+uses a function. The measurement to make next is how much of each object apt
+actually reaches -- if it is a few per cent, the answer is per-function
+recompilation seeded from what the profile already knows, not a bigger cap.
+
 ## The indirect-dispatch path is not a cost, and sections 21 and 23 are dead
 
 Added 2026-08-09. Sections 21 and 22 sit at number two on the ranked list --
