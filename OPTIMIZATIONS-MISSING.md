@@ -439,6 +439,43 @@ What remains is mechanical:
   * `ModuleBuilder::import_memory` sets the 64-bit flag.
   * the glue constructs the memory with `index: 'u64'`.
 
+## What memory64 actually bought, measured
+
+Built and run. `GEX_MEMORY64=1 gexc build` emits a module importing a 64-bit
+memory; `shims/browser/build64.sh` builds the shim for
+`wasm64-unknown-unknown`; gzip 1.12, a dynamically linked Debian binary,
+runs through ld.so to a byte-identical result on both. Bounds guards go from
+13% of the emitted module to 0%, and the module from 793 KiB to 712 KiB.
+
+The speed did not follow. gzip -6 over 13 MB, six runs a side, alternating,
+on a shared machine with a VM busy on it -- all three producing identical
+output:
+
+    guarded wasm32     9563  9609  9840 10168 10206 11048   median 10004 ms
+    memory64           9027  9060  9469  9645 10916 11363   median  9557 ms
+    wasm32, no guard   9925 10017 11441                     median 10017 ms
+
+The third row is the control and it is the answer: removing the guard
+*entirely*, unsafely, with nothing put in its place, changes nothing on
+gzip. So there was no 62% to collect here, and memory64's 4% is inside the
+spread.
+
+That is not a contradiction of the 62.9% above -- it is a scoping of it.
+That figure is nbench STRING SORT, which chases pointers; gzip indexes
+arrays with induction variables. The guard is pure arithmetic on the address
+V8 is about to use anyway, so when V8 can see the range it folds the guard
+into the load and the bytes cost nothing. When it cannot -- an address
+loaded from memory, as in a linked list -- the guard survives to run time
+and costs what it costs. Which is the cost model this file already argues
+for elsewhere: *redundancy an optimiser can see is worth nothing to remove*.
+
+So the honest expected value of memory64 is "whatever fraction of the
+program chases pointers", not 62%, and gzip's fraction is near zero.
+
+What it is unambiguously worth, independent of speed: 13% smaller modules,
+and it restores protection the guard never gave -- a wild pointer below
+4 GiB reads zeros from the flat mapping today and traps under memory64.
+
 ## The old note, kept because the reasoning was wrong in an instructive way
 
 `memory64` with a large reservation, so the engine's own bounds check
