@@ -7,5 +7,6 @@ edition.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+gex-abi.workspace = true
 gex-kmem.workspace = true
 gex-kernel.workspace = true

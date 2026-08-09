@@ -126,6 +126,52 @@ pub const MMAP_TOP: u64 = DISPATCH_MAX_PAGES * DISPATCH_PAGE;
 /// region that grows.
 pub const MMAP_BOTTOM: u64 = 0x0500_0000;
 
+/// The bottom of the region shared objects are placed in.
+///
+/// A translated block has its guest addresses baked into it, so one process
+/// can only use another's translation of a library if both have that library
+/// at the same address. Nothing about the guest requires that they differ --
+/// `ld.so` reserves each object with `mmap(NULL, ..)` and takes what it is
+/// handed -- but a per-process bump allocator gives a different answer
+/// depending on what was mapped before it, so the same libc lands at
+/// `0x6010000` in one process and `0x6060000` in the next.
+///
+/// So a window is set aside at a fixed place, and a system-wide table says
+/// which object owns which part of it. See `ObjectPlace`.
+pub const PLACE_BOTTOM: u64 = MMAP_BOTTOM;
+
+/// How much of the address space that window is.
+///
+/// It has to be a constant, and it has to be reserved from the start. The
+/// runtime's own heap takes from the same monotonic cursor the arena does,
+/// so an address the placement table hands out later can be one the heap has
+/// already used -- and a placement is only safe if nothing in any process
+/// could ever have been put there. There is no way to learn the right size
+/// during a run and no way to take it back afterwards.
+///
+/// The cost is real but smaller than it looks: it is address space, and the
+/// memory only grows to what is touched, but [`ARENA_BOTTOM`] sits above the
+/// whole window so every process pays all of it once it allocates anything.
+/// Against that, the libraries it holds are ones the process was going to map
+/// somewhere regardless -- so the true cost is the objects *other* programs
+/// placed, and for a pipeline running the same few programs that is nearly
+/// nothing.
+///
+/// Sixty-four megabytes is apt's whole closure with room over. A run whose
+/// objects do not fit gets no placement for the overflow, translates them
+/// per-process as it did before, and is otherwise unaffected.
+pub const PLACE_WINDOW: u64 = 64 << 20;
+
+/// One past the top of the placement window.
+pub const PLACE_TOP: u64 = PLACE_BOTTOM + PLACE_WINDOW;
+
+/// Lowest address the growing arena -- guest mappings and the runtime's own
+/// heap alike -- will hand out.
+///
+/// Above the placement window, because the two must never overlap and only
+/// this one can be made to move.
+pub const ARENA_BOTTOM: u64 = PLACE_TOP;
+
 // ---------------------------------------------------------------------------
 // Thread context (PLAN §4)
 // ---------------------------------------------------------------------------

@@ -325,6 +325,31 @@ pub mod clone_flags {
     pub const CHILD_SETTID: u64 = 0x0100_0000;
 }
 
+/// Whether a path names a shared object, by the only thing available at
+/// `openat`: its name.
+///
+/// `libc.so.6`, `ld-linux-aarch64.so.1`, `libfoo.so` -- the component is a
+/// shared object when it ends in `.so` or has `.so.` in it. Reading the ELF
+/// header would be exact, but an `openat` has no bytes yet and the cost of
+/// being wrong is small: the mapping goes somewhere no other process will
+/// look, which is where every mapping went before this existed.
+fn is_shared_object(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.ends_with(".so") || name.contains(".so.")
+}
+
+/// Somewhere that knows where a shared object belongs.
+///
+/// Implemented by the host, because the answer has to be the same in every
+/// process and a process's kernel state is its own. The browser answers out
+/// of the global kernel every Worker shares; a host with nothing to share
+/// leaves it unset and the arena allocates as it always did.
+pub trait ObjectPlace: Send + Sync {
+    /// Where `path` goes, given how long the reservation for it is. `None`
+    /// is no opinion.
+    fn place(&self, path: &str, len: u64) -> Option<u64>;
+}
+
 /// One guest process's kernel state.
 pub struct Kernel {
     pub fds: FdTable,
@@ -455,6 +480,21 @@ pub struct Kernel {
     /// the `fstat` and the reservation, so "the next anonymous mapping" would
     /// pin the wrong one.
     pub armed_pin: Option<(String, u64)>,
+    /// Who decides where a shared object goes, when anybody does.
+    ///
+    /// [`Self::pins`] is the same idea decided ahead of time by a closure
+    /// build. This one is decided as the run goes: the first process to map
+    /// an object fixes its address and every later one is given the same,
+    /// which is what makes a translated module worth sharing between them.
+    pub place: Option<Arc<dyn ObjectPlace>>,
+    /// Which object the next anonymous reservation is for.
+    ///
+    /// The same signal [`Self::armed_pin`] uses and for the same reason: the
+    /// reservation carries no file, so the `openat` before it is what names
+    /// the object. Kept separate because a pin knows its address already and
+    /// this one has to ask, and can only ask once the reservation says how
+    /// long the object is.
+    pub armed_place: Option<String>,
     /// Where each pinned object actually landed, for checking afterwards.
     ///
     /// A pin that silently does not take is the worst outcome available: the
@@ -970,6 +1010,8 @@ impl Kernel {
             restore_sigmask: None,
             started: 0,
             pins: std::collections::HashMap::new(),
+            place: None,
+            armed_place: None,
             armed_pin: None,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
@@ -1195,6 +1237,10 @@ impl Kernel {
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
             pins: std::collections::HashMap::new(),
+            // The placement outlives any one process: a child that maps the
+            // same library must be given the same address its parent was.
+            place: self.place.clone(),
+            armed_place: None,
             armed_pin: None,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
@@ -2423,7 +2469,19 @@ impl Kernel {
             if let Some(&base) = self.pins.get(&p) {
                 self.armed_pin = Some((p.clone(), base));
             }
-            self.vfs.open(&p, flags, mode)?
+            let h = self.vfs.open(&p, flags, mode)?;
+            // And arm a placement, for an object nobody pinned. Only for a
+            // shared object: the executable's own base is fixed by the
+            // loader rather than reserved, and arming on every open would
+            // hand the next unrelated reservation somebody else's address.
+            //
+            // After the open rather than before, so a path that does not
+            // exist -- `ld.so` probes several directories for every library
+            // it loads -- leaves nothing armed.
+            if self.place.is_some() && is_shared_object(&p) {
+                self.armed_place = Some(p.clone());
+            }
+            h
         };
         let acc = flags & oflags::ACCMODE;
         let readable = acc == oflags::O_RDONLY || acc == oflags::O_RDWR;
@@ -3273,8 +3331,20 @@ impl Kernel {
         let mut pinned = None;
         if addr == 0 && prot_bits == 0 && flags & mflags::ANONYMOUS != 0 {
             if let Some((path, base)) = self.armed_pin.take() {
+                self.armed_place = None;
                 addr = base;
                 pinned = Some((path, base));
+            } else if let Some(path) = self.armed_place.take() {
+                // The reservation is the first thing that says how long the
+                // object is, which is why the question is asked here and not
+                // at the `openat` that armed it.
+                if let Some(base) = self
+                    .place
+                    .as_ref()
+                    .and_then(|p| p.place(&path, crate::mem::page_align_up(len)))
+                {
+                    addr = base;
+                }
             }
         }
         let start = self.mem.mmap(addr, len, prot_bits, flags, "")?;

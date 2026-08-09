@@ -284,6 +284,7 @@ extern "C" {
     fn k_mod_dirs_read(id: u32, out: u32, cap: u32) -> u32;
     /// Has some process already filled the shared root? Only the first
     /// should: the rest would unpack the same rootfs over the top of it.
+    fn k_place(key: u64, len: u64) -> u64;
     fn k_fs_populated() -> i32;
     fn k_fs_populate_done();
 
@@ -993,7 +994,12 @@ static ARENA_NEXT: std::sync::atomic::AtomicU64 =
 /// Take `len` bytes of arena for this module's heap.
 fn arena_take(len: u64) -> Option<u64> {
     let at = ARENA_NEXT.load(std::sync::atomic::Ordering::Relaxed);
-    let at = if at == 0 { gex_abi::MMAP_BOTTOM } else { at };
+    // Above the placement window, never inside it. The window is where
+    // shared objects go so that every process has them at the same address,
+    // and this cursor is the one thing that could put something else there:
+    // the heap and the arena both take from it, and neither is visible to
+    // the memory map's own idea of what is free.
+    let at = if at == 0 { gex_abi::ARENA_BOTTOM } else { at };
     let end = at.checked_add(len)?;
     if end > gex_abi::MMAP_TOP || !grow_memory_to(end) {
         return None;
@@ -1995,6 +2001,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // global table's `INIT_PID` is the same 1.
     if let Some(procs) = global_procs() {
         kernel.procs = procs;
+        // And the layout they share. Only with a global kernel: without one
+        // this process is the whole system and has nobody to agree with.
+        kernel.place = Some(std::sync::Arc::new(SharedPlaces));
     }
     kernel.pipes = global_pipes();
     kernel.unix_remote = global_sockets();
@@ -3729,6 +3738,9 @@ pub extern "C" fn gex_adopt_child(
     // Workers are calling into, and the parent parked on exactly that.
     if let Some(procs) = global_procs() {
         kernel.procs = procs;
+        // And the layout they share. Only with a global kernel: without one
+        // this process is the whole system and has nobody to agree with.
+        kernel.place = Some(std::sync::Arc::new(SharedPlaces));
     }
     kernel.pipes = global_pipes();
     kernel.unix_remote = global_sockets();
@@ -4037,6 +4049,29 @@ fn record_shared_slot(h: &mut Host, page: u64, key: u64, base: u32) {
     // SAFETY: as above.
     if unsafe { k_present() } != 0 {
         unsafe { k_slot_put(page, key, base) };
+    }
+}
+
+/// Where every process puts a shared object, so a translation of it means
+/// the same thing in all of them.
+///
+/// A guest address is baked into a translated block, so two processes only
+/// share a module when they have the object at the same base -- and until
+/// this existed they did not, because the arena hands out addresses in the
+/// order things are mapped and no two processes map the same things in the
+/// same order. The answer lives in the global kernel, keyed by a hash of the
+/// path: the caller is a different wasm memory, and a scalar crosses that
+/// boundary without a copy.
+struct SharedPlaces;
+
+impl gex_kernel::syscalls::ObjectPlace for SharedPlaces {
+    fn place(&self, path: &str, len: u64) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut h);
+        // SAFETY: a call into the global kernel taking two scalars.
+        let base = unsafe { k_place(h.finish(), len) };
+        (base != 0).then_some(base)
     }
 }
 

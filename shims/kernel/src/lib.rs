@@ -469,6 +469,75 @@ pub unsafe extern "C" fn k_mod_dirs_read(id: u32, out: u32, cap: u32) -> u32 {
     n as u32
 }
 
+/// Where each shared object goes, the same in every process.
+///
+/// A translated block has its guest addresses baked into it, so a module is
+/// only worth sharing between two processes if the object it was lifted from
+/// sits at the same address in both. Nothing about the guest requires that
+/// they differ -- `ld.so` reserves each object with `mmap(NULL, ..)` and
+/// takes whatever it is handed -- but the per-process bump allocator gives a
+/// different answer depending on what was mapped before, so the same libc
+/// lands at `0x6010000` in one process and `0x6060000` in the next, and the
+/// two translations have nothing in common.
+///
+/// This is the assignment, made once and kept system-wide. First to ask for
+/// an object fixes it; everyone after gets the same base.
+struct Places {
+    /// By a hash of the guest path, because the caller is a different wasm
+    /// memory and a scalar crosses that boundary without a copy.
+    by_obj: BTreeMap<u64, u64>,
+    /// The bottom of the unassigned region.
+    next: u64,
+}
+
+/// The window objects are placed in: `gex-abi`'s, because every process's
+/// arena is arranged around it and the two have to be the same number.
+use gex_abi::{PLACE_BOTTOM, PLACE_TOP};
+
+/// Enough that two objects never share a 64 KiB page, and the slack after
+/// each one absorbs the alignment `ld.so` asks for on top of the span.
+const PLACE_ALIGN: u64 = 0x1_0000;
+
+fn places() -> &'static Mutex<Places> {
+    note_panics();
+    static PLACES: OnceLock<Mutex<Places>> = OnceLock::new();
+    PLACES.get_or_init(|| {
+        Mutex::new(Places {
+            by_obj: BTreeMap::new(),
+            next: PLACE_BOTTOM,
+        })
+    })
+}
+
+/// Where object `key` goes, assigning it a home if it has none. Zero when
+/// the window is full, which means "no opinion" and the caller allocates as
+/// it did before.
+#[no_mangle]
+pub extern "C" fn k_place(key: u64, len: u64) -> u64 {
+    let mut p = places().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&base) = p.by_obj.get(&key) {
+        return base;
+    }
+    let base = p.next.next_multiple_of(PLACE_ALIGN);
+    // The span, rounded up, and a page of slack after it: `ld.so` reserves
+    // the span *plus* whatever alignment the object's segments ask for, and
+    // a reservation that runs into the next object's home would be refused
+    // as not free.
+    let Some(end) = len
+        .checked_next_multiple_of(PLACE_ALIGN)
+        .and_then(|n| base.checked_add(n))
+        .and_then(|e| e.checked_add(PLACE_ALIGN))
+    else {
+        return 0;
+    };
+    if end > PLACE_TOP {
+        return 0;
+    }
+    p.next = end;
+    p.by_obj.insert(key, base);
+    base
+}
+
 /// Somewhere to stage a guest buffer copied out of a process's memory.
 static mut SCRATCH: [u8; 4096] = [0; 4096];
 

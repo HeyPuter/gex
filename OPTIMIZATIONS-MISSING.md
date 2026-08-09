@@ -809,3 +809,76 @@ fraction of the program chases pointers, not 62%.
 6. **Guard elision via range facts** (§16) — five instructions off every
    memory access. Range facts only: `memory64` was built and measured and
    lost on four programs out of five, and has been deleted.
+
+## Deterministic object placement: built, and it is a prerequisite rather than a win
+
+A sibling can now install the module a sibling translated, and on the two-`ls`
+loop it serves five modules in the first round and sixteen in the second. It
+saves almost no work, and the reason is in the addresses.
+
+`ld.so` reserves each object with `mmap(NULL, span)` and takes whatever it is
+handed. The arena hands out addresses in the order things are asked for, and
+no two processes ask in the same order, so the same libc landed at
+`0x6010000` in one process and `0x6060000` in the next. A translated block has
+its guest addresses baked into it, so those are two different translations of
+the same bytes with nothing in common -- different dispatch pages, different
+identities, no sharing possible even in principle.
+
+So the placement is now gex's to make rather than the arena's, and it makes it
+once: `k_place` in the global kernel maps a hash of the guest path to a base,
+first asker fixes it, everyone after is handed the same. The signal is the
+`openat` immediately before the reservation -- the same one the closure pins
+already used, because an anonymous `PROT_NONE` mapping carries no file to key
+on -- and it is armed only for a name that looks like a shared object, since
+the executable's own base is fixed by the loader rather than reserved.
+
+Measured: libc lands at `0x5000000` in every process of the run, which is what
+was wanted.
+
+The cost is a reserved window, and it could not be avoided. A process's memory
+grows to the highest address it touches, and the runtime's own heap takes from
+the same monotonic cursor the guest arena does -- so an address the placement
+table hands out later can be one the heap has already used, and the first
+attempt zeroed the shim's own allocations and trapped inside `mmap`. Nothing
+learns the right size during a run and nothing can take it back afterwards, so
+`ARENA_BOTTOM` sits above a fixed 64 MiB window and every process pays all of
+it. Measured at 104 MiB per process before, 168 MiB after. The true cost is
+smaller than that looks -- the libraries in the window are ones each process
+was going to map anyway -- but it is not nothing, and it buys nothing until
+the sharing above it can actually use it.
+
+## Why the sharing still cannot use it: the module fixes its own slots
+
+The obvious next step is to stop serving a page only its *first* module. A
+page's code is spread over as many modules as it took misses to translate it,
+the block cap sees to that, and the first is a small part of the whole; that
+is why `blocks` barely moves while `serve` fires sixteen times.
+
+It does not work, and the reason is `Linkage::Shared`'s element segments. A
+runtime-translated module used to export every block by name and let the host
+place them one at a time, which cost half a minute per shared library, so it
+now fills the imported table itself with active element segments whose offsets
+were fixed when it was built. That makes the producer's slot assignment part
+of the module rather than a hint: installing it writes *those* slots whatever
+the installing process would have preferred.
+
+Three attempts, all measured, none kept:
+
+* Adopt the producer's bases for every page it touches. Segfaults: the base
+  that names one process's libc page is the base another gave to something
+  else, and the segment writes the wrong functions over it.
+* Same, but decline any module whose bases collide with pages already placed
+  here -- and store *every* page the module holds blocks for, not just the
+  ones it was first to claim, since the fresh ones do not show the collision.
+  Still segfaults, then wedges.
+* Ignore the producer's bases and allocate locally. `WebAssembly.instantiate`
+  refuses it outright: the element-segment offsets are past the end of a table
+  grown to this process's high-water mark.
+
+The way to earn this is to make the two processes agree by construction rather
+than by luck: one system-wide dispatch-slot allocator, keyed by the page
+identity that already names a translation, instead of one counter per process.
+Then every process gives the same object page the same base, every module's
+segments land where they were built to land, and the whole collision class
+stops existing. That is a change to `PageTable::base` and a counter in the
+global kernel, not to any of the three things above. See #95.

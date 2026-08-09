@@ -469,6 +469,7 @@ dependencies = [
 name = "gex-kernel-wasm"
 version = "0.0.1"
 dependencies = [
+ "gex-abi",
  "gex-kernel",
  "gex-kmem",
 ]
