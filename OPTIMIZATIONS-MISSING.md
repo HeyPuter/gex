@@ -528,7 +528,11 @@ have gained like STRING SORT. Fourteen interleaved pairs, `tests/ab.sh`:
     11 of 14 pairs favour wasm32, p = 0.057 by sign test
     median per-pair ratio: memory64 is 13% *slower*
 
-Suggestive rather than established at p = 0.057, and stated that way. But it
+Suggestive rather than established at p = 0.057, and stated that way. If
+anything it understates the penalty: those pairs ran A first every time, and
+first place turned out to be a disadvantage worth about 29% -- see the
+ordering bias in `tests/ab.sh` -- so memory64 was getting the *easier* slot
+and still lost. But it
 points the wrong way for the story, and the story should be weakened
 accordingly: the honest summary is not "memory64 wins on pointer-chasing
 code". It is that **STRING SORT gains and everything else measured so far

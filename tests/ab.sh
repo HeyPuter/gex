@@ -19,11 +19,22 @@
 # judging against it would call everything unreadable on a machine like this
 # one. That was this script's first mistake.
 #
-#   usage: tests/ab.sh N -- cmd-A... -- cmd-B...
+#   usage: tests/ab.sh [--metric RE] N -- cmd-A... -- cmd-B...
 #   e.g.   tests/ab.sh 5 -- ./run 32.wasm -- ./run 64.wasm
 set -eu
 
-N="${1:?usage: ab.sh N -- cmd-A... -- cmd-B...}"
+# --metric RE reads the number matched by RE out of the command's stderr and
+# uses that instead of wall-clock. The point is to measure the thing under
+# test rather than the process around it: a statically recompiled perl is nine
+# seconds of which two to four are V8 compiling the module, so a codegen change
+# measured on wall-clock is a third diluted before it starts.
+METRIC=""
+if [ "${1:-}" = "--metric" ]; then
+    METRIC="$2"
+    shift 2
+fi
+
+N="${1:?usage: ab.sh [--metric RE] N -- cmd-A... -- cmd-B...}"
 shift
 [ "${1:-}" = "--" ] || { echo "expected -- before command A" >&2; exit 2; }
 shift
@@ -55,17 +66,44 @@ timed() {
         exit 1
     fi
     _e=$(date +%s%N)
-    echo $(( (_e - _s) / 1000000 ))
+    if [ -n "$METRIC" ]; then
+        # First number on the first matching line. A run that did not print it
+        # is a broken invocation, not a fast one, and says so.
+        _m=$(grep -m1 -E "$METRIC" "$WORK/err" 2>/dev/null |
+             grep -oE '[0-9]+' | head -1)
+        if [ -z "$_m" ]; then
+            echo "no line matching '$METRIC' on stderr" >&2
+            tail -3 "$WORK/err" >&2
+            exit 1
+        fi
+        echo "$_m"
+    else
+        echo $(( (_e - _s) / 1000000 ))
+    fi
 }
 
+# ABBA, not ABAB.
+#
+# Running A first in every pair is a bias, and a large one. Feeding this script
+# the *same command* as both sides -- which should give a ratio of 1 -- gave
+# B a 29% advantage over three pairs, consistently, because whatever the first
+# run of a pair warms (the on-disk translation cache, the page cache holding a
+# multi-megabyte module) the second run gets for free.
+#
+# So the order flips every pair: A B, then B A. Whatever second place is worth
+# is then paid equally by both sides, and the identical-command test comes back
+# to 1.00 as it should.
 i=1
 : > "$WORK/a"; : > "$WORK/b"
 while [ "$i" -le "$N" ]; do
-    ta=$(timed "$A")
-    tb=$(timed "$B")
+    if [ $((i % 2)) -eq 1 ]; then
+        ta=$(timed "$A"); tb=$(timed "$B"); order="AB"
+    else
+        tb=$(timed "$B"); ta=$(timed "$A"); order="BA"
+    fi
     echo "$ta" >> "$WORK/a"
     echo "$tb" >> "$WORK/b"
-    printf 'pair %d: A %sms  B %sms  ratio %s\n' "$i" "$ta" "$tb" \
+    printf 'pair %d (%s): A %sms  B %sms  ratio %s\n' "$i" "$order" "$ta" "$tb" \
         "$(awk "BEGIN{printf \"%.3f\", $tb/$ta}")"
     i=$((i + 1))
 done

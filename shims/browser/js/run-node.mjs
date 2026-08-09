@@ -299,7 +299,26 @@ if (process.env.GEX_RECOMPILE_OBJECTS) {
 // translation makes a profile of the *host* nearly useless -- it is all
 // `wasm-function[N]` across thousands of modules -- so the question "which
 // guest code is hot" needs asking of the guest.
+// GEX_TIME_GUEST prints how long the guest itself ran, which is not the same
+// question as how long this process took.
+//
+// A run of statically recompiled perl is about nine seconds of wall clock, of
+// which two to four is V8 compiling a seventeen-megabyte module before the
+// guest executes an instruction. Comparing two *codegen* changes through that
+// total means comparing a quantity where a third of the signal is module size
+// and V8's compiler, not the code being measured -- and on a machine with a
+// noisy neighbour it buries an effect that the paired A/B could otherwise
+// resolve. `tests/ab.sh --metric` reads this line instead of timing the
+// process.
+//
+// Measured around `gex.run` alone: everything before it is loading, placing
+// the image and compiling; everything inside it is the guest.
+const runStarted = process.env.GEX_TIME_GUEST ? process.hrtime.bigint() : 0n;
 const status = await gex.run(entry);
+if (process.env.GEX_TIME_GUEST) {
+  const ns = process.hrtime.bigint() - runStarted;
+  process.stderr.write(`[gex] guest ran in ${Number(ns / 1000000n)}ms\n`);
+}
 // What this process's memory actually grew to. One memory per process, so
 // this is the number multiplied by however many processes a run has.
 if (process.env.GEX_DEBUG_EXIT) {
