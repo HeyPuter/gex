@@ -38,6 +38,7 @@ fn real_main() -> Result<ExitCode> {
         "run" => cmd_run(&argv[2..]),
         "build" => cmd_build(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "seed" => cmd_seed(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
@@ -66,6 +67,11 @@ usage:
   gexc seed   -o <out.wasm>        write a module that translates nothing, for
                                    a host that will translate at runtime and
                                    does not know the program in advance
+  gexc closure <elf> --sysroot DIR
+                                   what the program actually consists of:
+                                   every object reached through DT_NEEDED,
+                                   where it would be placed, and how much
+                                   text a whole-program build would face
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
 
@@ -457,6 +463,88 @@ fn cmd_build(args: &[String]) -> Result<()> {
              reaching one raises SIGILL",
             stats.illegal_blocks
         );
+    }
+    Ok(())
+}
+
+/// Report the transitive `DT_NEEDED` closure of a program.
+///
+/// This exists because `gexc build` translates the image it is handed and
+/// nothing else, and on a normally linked program that is the wrapper rather
+/// than the work. Before anything can be done about that, the closure has to
+/// be nameable without running the program -- and checkable against `ldd`,
+/// which is what this is for.
+fn cmd_closure(args: &[String]) -> Result<()> {
+    let mut path = None;
+    let mut sysroot: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--sysroot" => {
+                i += 1;
+                sysroot = Some(args.get(i).context("--sysroot needs a directory")?.clone());
+            }
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = path.context("expected an input ELF")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+
+    // Guest paths resolve inside the sysroot, exactly as they would when the
+    // program runs. Without one there is nowhere to look, and saying so beats
+    // reporting a closure of one object as though that were the answer.
+    let root = sysroot.clone();
+    let read = move |p: &str| -> Option<Vec<u8>> {
+        let r = root.as_deref()?;
+        std::fs::read(format!(
+            "{}/{}",
+            r.trim_end_matches('/'),
+            p.trim_start_matches('/')
+        ))
+        .ok()
+    };
+
+    let exe = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    // The same top-down placement the runtime's `mmap` makes, so these are
+    // the addresses a real run produces. Page-aligned, one page of gap.
+    let mut next = gex_abi::MMAP_TOP;
+    let mut place = |span: u64| -> u64 {
+        let span = (span + 0xfff) & !0xfff;
+        next -= span + 0x1000;
+        next
+    };
+    // What `$ORIGIN` is relative to: the executable's path *in the guest*,
+    // which inside a sysroot is the host path with the prefix taken off.
+    let guest_path = match &sysroot {
+        Some(r) => path
+            .strip_prefix(r.trim_end_matches('/'))
+            .unwrap_or(&path)
+            .to_string(),
+        None => path.clone(),
+    };
+    let closure = gex_ld::closure::resolve(exe, &guest_path, &read, &mut place)?;
+
+    for o in &closure.objects {
+        let (lo, hi) = o.image.text_range;
+        println!(
+            "{:>2}  {:<40} {:>8} KiB text  at 0x{:x}",
+            o.depth,
+            o.name,
+            (hi.saturating_sub(lo)) / 1024,
+            o.image.bias,
+        );
+    }
+    println!(
+        "{} objects, {} KiB of text in total",
+        closure.objects.len(),
+        closure.text_bytes() / 1024,
+    );
+    for (name, asker) in &closure.missing {
+        eprintln!("  not found: {name}, needed by {asker}");
+    }
+    if sysroot.is_none() {
+        eprintln!("  (no --sysroot, so nothing could be looked up)");
     }
     Ok(())
 }

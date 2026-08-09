@@ -930,6 +930,9 @@ mod tests {
         }
         let len = bytes.len() as u64;
         Image {
+            soname: None,
+            needed: Vec::new(),
+            runpath: Vec::new(),
             bias: 0,
             entry: base,
             code: vec![(base, base + len)],

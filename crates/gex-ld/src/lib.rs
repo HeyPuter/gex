@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod closure;
 pub mod dynamic;
 pub mod elf;
 pub mod stack;

@@ -26,6 +26,7 @@ const STT_FUNC: u8 = 2;
 const STT_GNU_IFUNC: u8 = 10;
 
 const DT_NULL: i64 = 0;
+const DT_NEEDED: i64 = 1;
 const DT_PLTRELSZ: i64 = 2;
 const DT_STRTAB: i64 = 5;
 const DT_SYMTAB: i64 = 6;
@@ -34,6 +35,9 @@ const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
 const DT_SYMENT: i64 = 11;
 const DT_JMPREL: i64 = 23;
+const DT_SONAME: i64 = 14;
+const DT_RPATH: i64 = 15;
+const DT_RUNPATH: i64 = 29;
 
 const R_AARCH64_RELATIVE: u32 = 1027;
 const R_AARCH64_IRELATIVE: u32 = 1032;
@@ -163,6 +167,19 @@ pub struct Image {
     pub pie: bool,
     /// The `PT_INTERP` path, when the image asks for a dynamic linker.
     pub interp: Option<String>,
+    /// `DT_SONAME`, the name other objects link against. Absent on
+    /// executables and on a library linked without one.
+    pub soname: Option<String>,
+    /// `DT_NEEDED`, in order: the objects this one names as dependencies.
+    ///
+    /// Read so that the closure of a program can be worked out without
+    /// running it. `gexc build` translated the image and nothing else, which
+    /// on any normally linked program is the wrapper and not the work:
+    /// `apt-get` is 67 KB in front of 1.9 MB of `libapt-pkg.so`.
+    pub needed: Vec<String>,
+    /// `DT_RUNPATH`, or `DT_RPATH` when there is no runpath, split on `:` and
+    /// with `$ORIGIN` left as it stands for the caller to expand.
+    pub runpath: Vec<String>,
 }
 
 struct Reader<'a> {
@@ -317,15 +334,70 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         code: Vec::new(),
         pie,
         interp,
+        soname: None,
+        needed: Vec::new(),
+        runpath: Vec::new(),
     };
 
     if let Some((dyn_vaddr, dyn_size)) = dynamic {
         apply_relative_relocations(&mut image, dyn_vaddr, dyn_size);
         image.named_relocs = read_named_relocs(&image, dyn_vaddr, dyn_size);
+        read_needed(&mut image, dyn_vaddr, dyn_size);
     }
     image.symbols = read_symbols(&r, e_shoff, e_shentsize, e_shnum, bias);
     image.code = read_code_sections(&r, e_shoff, e_shentsize, e_shnum, bias);
     Ok(image)
+}
+
+/// `DT_SONAME`, `DT_NEEDED` and the search path, out of the dynamic section.
+///
+/// Two passes, because every one of these is an offset into `DT_STRTAB` and
+/// the dynamic section does not promise to name the string table first.
+fn read_needed(image: &mut Image, dyn_vaddr: u64, dyn_size: u64) {
+    let mut strtab = None;
+    let mut entries: Vec<(i64, u64)> = Vec::new();
+    for i in 0..dyn_size / 16 {
+        let at = dyn_vaddr + i * 16;
+        let (Some(tag), Some(val)) = (read_u64(image, at), read_u64(image, at + 8)) else {
+            break;
+        };
+        let tag = tag as i64;
+        if tag == DT_NULL {
+            break;
+        }
+        if tag == DT_STRTAB {
+            strtab = Some(val + image.bias);
+        }
+        entries.push((tag, val));
+    }
+    let Some(strtab) = strtab else { return };
+    let mut rpath = Vec::new();
+    let mut runpath = Vec::new();
+    for (tag, val) in entries {
+        let s = || read_cstr(image, strtab + val);
+        match tag {
+            DT_NEEDED => {
+                let n = s();
+                if !n.is_empty() {
+                    image.needed.push(n);
+                }
+            }
+            DT_SONAME => {
+                let n = s();
+                if !n.is_empty() {
+                    image.soname = Some(n);
+                }
+            }
+            // `$ORIGIN` is left alone: expanding it needs the object's own
+            // path, which this function does not have and the caller does.
+            DT_RPATH => rpath = s().split(':').map(str::to_string).collect(),
+            DT_RUNPATH => runpath = s().split(':').map(str::to_string).collect(),
+            _ => {}
+        }
+    }
+    // A runpath, when present, replaces the rpath entirely -- that is the
+    // whole point of the newer tag.
+    image.runpath = if runpath.is_empty() { rpath } else { runpath };
 }
 
 /// Which GOT slot each named relocation writes to, and the name it writes.

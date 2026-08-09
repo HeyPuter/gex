@@ -199,6 +199,9 @@ mod tests {
 
     fn dummy_image() -> Image {
         Image {
+            soname: None,
+            needed: Vec::new(),
+            runpath: Vec::new(),
             bias: 0,
             entry: 0x400000,
             code: vec![(0x400000, 0x400010)],
