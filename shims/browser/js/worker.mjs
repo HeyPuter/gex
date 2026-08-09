@@ -194,7 +194,14 @@ async function handle(msg) {
     }
   }
 
-  if (msg.debugExit) globalThis.GEX_DEBUG_EXIT = 1;
+  if (msg.debugExit) {
+    globalThis.GEX_DEBUG_EXIT = 1;
+    // And the engine's own stack for a trap, before the shim rewraps it into
+    // a plain Error. The rewrapped one says *what* went wrong and the wasm
+    // frames say *where*, and losing them meant a trap inside a syscall could
+    // only be located by bisecting the handler.
+    globalThis.GEX_TRAP_STACK = 1;
+  }
   // `kernelStack` is this Worker's slice of the global kernel's stack array.
   // Absent for the first Worker, which keeps the stack the module was linked
   // with and is the one that reads the numbers out for everybody else.

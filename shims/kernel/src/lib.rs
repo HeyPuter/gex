@@ -353,10 +353,10 @@ pub unsafe extern "C" fn k_mod_store(
         return 0;
     }
     let mut wasm = vec![0u8; len as usize];
-    unsafe { gex_kmem::pull(wasm.as_mut_ptr(), ptr, len) };
+    unsafe { gex_kmem::pull_checked(wasm.as_mut_ptr(), ptr, len) };
     let mut raw = vec![0u8; dirs_len as usize];
     if dirs_len > 0 {
-        unsafe { gex_kmem::pull(raw.as_mut_ptr(), dirs_ptr, dirs_len) };
+        unsafe { gex_kmem::pull_checked(raw.as_mut_ptr(), dirs_ptr, dirs_len) };
     }
     let mut dirs = Vec::with_capacity(raw.len() / 12);
     for c in raw.chunks_exact(12) {
@@ -443,7 +443,7 @@ pub unsafe extern "C" fn k_mod_read(id: u32, out: u32, cap: u32) -> u32 {
     if sm.wasm.len() > cap as usize {
         return 0;
     }
-    unsafe { gex_kmem::push(out, sm.wasm.as_ptr(), sm.wasm.len() as u32) };
+    unsafe { gex_kmem::push_checked(out, sm.wasm.as_ptr(), sm.wasm.len() as u32) };
     sm.wasm.len() as u32
 }
 
@@ -465,7 +465,7 @@ pub unsafe extern "C" fn k_mod_dirs_read(id: u32, out: u32, cap: u32) -> u32 {
         buf[i * 12..i * 12 + 8].copy_from_slice(&page.to_le_bytes());
         buf[i * 12 + 8..i * 12 + 12].copy_from_slice(&base.to_le_bytes());
     }
-    unsafe { gex_kmem::push(out, buf.as_ptr(), n as u32) };
+    unsafe { gex_kmem::push_checked(out, buf.as_ptr(), n as u32) };
     n as u32
 }
 
@@ -784,7 +784,7 @@ pub extern "C" fn k_pipe_close_end(id: i32, write: i32) {
 pub extern "C" fn k_pipe_write(id: i32, at: u32, len: u32) -> i32 {
     let Some(p) = pipe_at(id) else { return -9 }; // EBADF
     let mut buf = vec![0u8; len as usize];
-    unsafe { gex_kmem::pull(buf.as_mut_ptr(), at, len) };
+    unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     match p.write(&buf) {
         Ok(n) => n as i32,
         Err(e) => -(e.0 as i32),
@@ -798,7 +798,7 @@ pub extern "C" fn k_pipe_read(id: i32, at: u32, len: u32) -> i32 {
     let mut buf = vec![0u8; len as usize];
     match p.read(&mut buf) {
         Ok(n) => {
-            unsafe { gex_kmem::push(at, buf.as_ptr(), n as u32) };
+            unsafe { gex_kmem::push_checked(at, buf.as_ptr(), n as u32) };
             n as i32
         }
         Err(e) => -(e.0 as i32),
@@ -833,7 +833,7 @@ pub extern "C" fn k_pipe_buffered(id: i32) -> i32 {
 pub extern "C" fn k_checksum(at: u32, len: u32) -> u32 {
     let n = (len as usize).min(4096);
     let buf = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
-    unsafe { gex_kmem::pull(buf.as_mut_ptr(), at, n as u32) };
+    unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, n as u32) };
     let mut sum: u32 = 0;
     for b in &buf[..n] {
         sum = sum.wrapping_mul(31).wrapping_add(*b as u32);
@@ -899,7 +899,7 @@ fn handle_at(id: i32) -> Option<std::sync::Arc<dyn FileHandle>> {
 fn path_of(at: u32, len: u32) -> String {
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
-        unsafe { gex_kmem::pull(buf.as_mut_ptr(), at, len) };
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
     // Leading slashes go. A mount hands its filesystem a relative path and a
     // host handing one in from outside naturally writes the absolute one, and
@@ -968,7 +968,7 @@ pub extern "C" fn k_fs_read(handle: i32, offset: u64, at: u32, len: u32) -> i32 
     match h.read_at(offset, &mut buf) {
         Ok(n) => {
             if n > 0 {
-                unsafe { gex_kmem::push(at, buf.as_ptr(), n as u32) };
+                unsafe { gex_kmem::push_checked(at, buf.as_ptr(), n as u32) };
             }
             n as i32
         }
@@ -982,7 +982,7 @@ pub extern "C" fn k_fs_write(handle: i32, offset: u64, at: u32, len: u32) -> i32
     let Some(h) = handle_at(handle) else { return -9 };
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
-        unsafe { gex_kmem::pull(buf.as_mut_ptr(), at, len) };
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
     as_ret(h.write_at(offset, &buf))
 }
@@ -994,7 +994,7 @@ pub extern "C" fn k_fs_meta(handle: i32, at: u32) -> i32 {
     match h.metadata() {
         Ok(m) => {
             let b = remote::encode_meta(&m);
-            unsafe { gex_kmem::push(at, b.as_ptr(), b.len() as u32) };
+            unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
             0
         }
         Err(e) => -e.0,
@@ -1018,7 +1018,7 @@ pub extern "C" fn k_fs_read_dir(handle: i32, at: u32, cap: u32) -> i32 {
                 return -34; // ERANGE
             }
             if !b.is_empty() {
-                unsafe { gex_kmem::push(at, b.as_ptr(), b.len() as u32) };
+                unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
             }
             b.len() as i32
         }
@@ -1034,7 +1034,7 @@ pub extern "C" fn k_fs_path_meta(path: u32, path_len: u32, at: u32) -> i32 {
     match rootfs().metadata(&p) {
         Ok(m) => {
             let b = remote::encode_meta(&m);
-            unsafe { gex_kmem::push(at, b.as_ptr(), b.len() as u32) };
+            unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
             0
         }
         Err(e) => -e.0,
@@ -1051,7 +1051,7 @@ pub extern "C" fn k_fs_read_link(path: u32, path_len: u32, at: u32, cap: u32) ->
                 return -34; // ERANGE
             }
             if !b.is_empty() {
-                unsafe { gex_kmem::push(at, b.as_ptr(), b.len() as u32) };
+                unsafe { gex_kmem::push_checked(at, b.as_ptr(), b.len() as u32) };
             }
             b.len() as i32
         }
@@ -1117,7 +1117,7 @@ pub extern "C" fn k_fs_add(path: u32, path_len: u32, at: u32, len: u32) -> i32 {
     let p = path_of(path, path_len);
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
-        unsafe { gex_kmem::pull(buf.as_mut_ptr(), at, len) };
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
     rootfs().add_file(&p, buf);
     0
@@ -1248,7 +1248,7 @@ pub extern "C" fn k_sock_read(id: i32, at: u32, len: u32) -> i32 {
     match s.recv(&mut buf, 0, false) {
         Ok(n) => {
             if n > 0 {
-                unsafe { gex_kmem::push(at, buf.as_ptr(), n as u32) };
+                unsafe { gex_kmem::push_checked(at, buf.as_ptr(), n as u32) };
             }
             n as i32
         }
@@ -1261,7 +1261,7 @@ pub extern "C" fn k_sock_write(id: i32, at: u32, len: u32) -> i32 {
     let Some(s) = sock_at(id) else { return -9 };
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
-        unsafe { gex_kmem::pull(buf.as_mut_ptr(), at, len) };
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
     match s.send(&buf) {
         Ok(n) => n as i32,
@@ -1320,7 +1320,7 @@ pub extern "C" fn k_sock_exists(path: u32, path_len: u32) -> i32 {
 fn path_of_raw(at: u32, len: u32) -> String {
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
-        unsafe { gex_kmem::pull(buf.as_mut_ptr(), at, len) };
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
     String::from_utf8_lossy(&buf).into_owned()
 }

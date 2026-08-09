@@ -1040,3 +1040,44 @@ One more thing the attempt taught, which matters for the closure: apt-get's
 own closure does not cover its methods. The `file` method needs libseccomp
 and apt-get does not, so a closure built per executable is incomplete for any
 program that spawns helpers -- and apt is entirely made of helpers.
+
+### What apt's closure is worth, measured
+
+`apt-get update` still does not finish, but `apt-get --version` does, and it
+is not a toy: it loads every one of the nineteen objects, initialises libapt
+and prints the index-type table, which is most of what a run pays before it
+fetches anything.
+
+    apt-get --version, seed module          32,033 blocks   948 ms
+    apt-get --version, whole closure        16,743 blocks   683 ms
+
+Half the blocks and a third of the time, and every pin lands:
+
+    [gex] pin ok: libapt-private.so.0.0  wanted 0x5000000, landed 0x5000000
+    [gex] pin ok: libapt-pkg.so.6.0      wanted 0x50a0000, landed 0x50a0000
+    ... seventeen of them, all ok
+
+Not zero, because this closure was built with ordinary discovery rather than
+`--exhaustive`; dash's closure only reached zero exhaustively. Nineteen
+objects exhaustively is a much larger build than dash's three, and whether it
+is worth making is #93's question rather than this one's.
+
+### What the hunt for the crash left behind
+
+Three things, all worth keeping whatever the crash turns out to be.
+
+`GuestMem` checked every guest pointer against `view().len()`, and in the
+browser that view is a slice over the whole address space a guest pointer may
+name rather than over the memory that exists. It now reads `memory.size`
+live, on every access, because the bound *moves during a syscall*: `mmap`
+grows the memory and then zeroes what it just mapped.
+
+The kernel's cross-memory copies are checked. `push` and `pull` are bare
+`memory.copy 0, 1` and the engine traps rather than returning, so a bad
+pointer from a guest killed the Worker inside a syscall while it held the
+kernel lock. `memory.size 1` says how big the calling process's memory is,
+which is the one thing that makes an `EFAULT` possible instead.
+
+And the trace decodes `newfstatat`'s path, which is what turned "a trap in
+syscall 79" into "a trap stat-ing `/usr/bin/xz`" -- a file that is not in the
+rootfs, which is how the search got as far as it did.

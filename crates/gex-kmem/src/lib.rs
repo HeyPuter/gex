@@ -29,6 +29,42 @@
 /// the index space, so it lands at 1.
 pub const PROCESS_MEMORY: u32 = 1;
 
+/// How many 64 KiB pages the calling process's memory has.
+///
+/// `memory.size` can name a memory index, so unlike a load this one is
+/// expressible -- and it is the only way the kernel can tell a pointer a
+/// process handed it from a pointer that is off the end. Without it every
+/// bad address a guest passes to a syscall is a trap that kills the Worker
+/// mid-call, with the kernel lock still held and nothing said about which
+/// call it was. With it, the answer is `EFAULT`, which is what Linux says.
+#[inline]
+pub fn process_pages() -> u32 {
+    let n: u32;
+    unsafe {
+        core::arch::asm!(
+            "memory.size 1",
+            "local.set {n}",
+            n = out(local) n,
+        );
+    }
+    n
+}
+
+/// Whether `at..at+len` is inside the calling process's memory.
+///
+/// Every `push` and `pull` should be guarded by this. The copy itself cannot
+/// check -- `memory.copy` traps rather than returning -- and a trap inside a
+/// syscall is the worst shape of failure available: the Worker dies holding
+/// the kernel lock, and the only evidence is `memory access out of bounds`.
+#[inline]
+pub fn in_process(at: u32, len: u32) -> bool {
+    let end = match at.checked_add(len) {
+        Some(e) => e as u64,
+        None => return false,
+    };
+    end <= (process_pages() as u64) << 16
+}
+
 /// Copy `len` bytes from the calling process's memory into this one.
 ///
 /// # Safety
@@ -93,4 +129,37 @@ pub unsafe fn read_u64(at: u32) -> u64 {
 pub unsafe fn write_u64(at: u32, v: u64) {
     let buf = v.to_le_bytes();
     unsafe { push(at, buf.as_ptr(), 8) };
+}
+
+/// [`pull`], but answering `false` instead of trapping on a bad range.
+///
+/// The kernel is called with addresses a guest chose. `memory.copy` traps on
+/// an out-of-range one, and a trap here is the worst failure this system has:
+/// the Worker dies inside a syscall, still holding the kernel lock, and the
+/// only evidence is `memory access out of bounds` with no idea which call it
+/// was. apt's `file` method died exactly that way, inside `newfstatat`.
+///
+/// # Safety
+/// `dst` must be valid for `len` bytes in the kernel's own memory. The
+/// process side is checked here.
+#[inline]
+pub unsafe fn pull_checked(dst: *mut u8, src: u32, len: u32) -> bool {
+    if !in_process(src, len) {
+        return false;
+    }
+    unsafe { pull(dst, src, len) };
+    true
+}
+
+/// [`push`], but answering `false` instead of trapping. See [`pull_checked`].
+///
+/// # Safety
+/// `src` must be valid for `len` bytes in the kernel's own memory.
+#[inline]
+pub unsafe fn push_checked(dst: u32, src: *const u8, len: u32) -> bool {
+    if !in_process(dst, len) {
+        return false;
+    }
+    unsafe { push(dst, src, len) };
+    true
 }

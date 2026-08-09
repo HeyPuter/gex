@@ -84,10 +84,37 @@ impl<'a> GuestMem<'a> {
     fn range(&self, addr: u64, len: usize) -> Result<std::ops::Range<usize>, Errno> {
         let start = addr as usize;
         let end = start.checked_add(len).ok_or(Errno::EFAULT)?;
-        if addr > usize::MAX as u64 || end > self.view().len() {
+        if addr > usize::MAX as u64 || end > self.limit() {
             return Err(Errno::EFAULT);
         }
         Ok(start..end)
+    }
+
+    /// The last address this memory really has, read live.
+    ///
+    /// Not `view().len()`. In the browser the view is a slice made over the
+    /// whole address space a guest pointer may name -- two gigabytes -- while
+    /// the memory itself starts far smaller and grows as the guest maps. A
+    /// check against the view therefore passed for addresses that were not
+    /// backed yet, and the access that followed trapped: `memory access out
+    /// of bounds`, inside a syscall, with the Worker dying mid-call. apt's
+    /// `file` method died that way in `newfstatat`.
+    ///
+    /// Live rather than captured, because it moves *during* a syscall: an
+    /// `mmap` grows the memory and then zeroes what it just mapped, and a
+    /// length taken when the `GuestMem` was built would refuse the write it
+    /// had itself just made room for.
+    #[inline(always)]
+    fn limit(&self) -> usize {
+        #[cfg(target_family = "wasm")]
+        {
+            let live = (core::arch::wasm32::memory_size(0) as u64) << 16;
+            (live as usize).min(self.view().len())
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.view().len()
+        }
     }
 
     pub fn read(&self, addr: u64, len: usize) -> Result<&[u8], Errno> {
@@ -128,10 +155,15 @@ impl<'a> GuestMem<'a> {
     /// Read a NUL-terminated guest string, bounded by `max` bytes.
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
         let start = addr as usize;
-        if start >= self.view().len() {
+        let limit = self.limit();
+        if start >= limit {
             return Err(Errno::EFAULT);
         }
-        let end = (start + max).min(self.view().len());
+        // Clamped to what exists, not to what the view claims. A path near the
+        // top of the guest's stack is within a page of the end of memory, and
+        // scanning `max` bytes from it ran off into pages the engine had never
+        // been asked for.
+        let end = (start + max).min(limit);
         let slice = &self.view()[start..end];
         match slice.iter().position(|b| *b == 0) {
             Some(n) => Ok(slice[..n].to_vec()),

@@ -1332,6 +1332,11 @@ fn guest_bytes() -> &'static mut [u8] {
     // what it believes the pointer's allocation to be -- nothing -- and folds
     // slice bounds checks to "always out of range": the same read succeeded
     // from a small function and returned EFAULT from inside the kernel.
+    // The slice spans the whole address space a guest pointer may name. What
+    // actually *exists* is smaller and moves -- the memory is created at
+    // `GUEST_INITIAL_BYTES` and grown as the guest maps -- so the real bound
+    // is `memory.size`, and `GuestMem` reads it live on every access rather
+    // than trusting this length. See `GuestMem::limit`.
     let len = std::hint::black_box(GUEST_LIMIT as usize);
     unsafe { std::slice::from_raw_parts_mut(p, len) }
 }
@@ -2999,7 +3004,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         use gex_kernel::syscalls::nr;
         let named = match n {
             nr::EXECVE | nr::STATX => Some(path(g(0))),
-            nr::OPENAT | nr::UNLINKAT | nr::RENAMEAT => Some(path(g(1))),
+            nr::OPENAT | nr::UNLINKAT | nr::RENAMEAT | nr::NEWFSTATAT => Some(path(g(1))),
             _ => None,
         };
         // The pid, not only the thread. Every process in a run writes its
