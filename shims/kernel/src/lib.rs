@@ -368,6 +368,16 @@ struct ModStore {
     /// which is why sharing recognised four hundred pages and served
     /// nineteen modules.
     by_page: BTreeMap<(u64, u64), Vec<u32>>,
+    /// Which modules hold code for an *object*, whatever page it is on.
+    ///
+    /// Per page is the wrong grain to install at. A translation unit holds
+    /// what was reachable from the block that faulted, so another process
+    /// entering the same page at a different block installs the page's module
+    /// and misses anyway -- measured, 361 of 381 recognised pages had every
+    /// covering module already installed and still had to translate. Asking
+    /// per object instead lets the second process to enter libc take
+    /// everything the first one ever lifted of it, in one go.
+    by_object: BTreeMap<u64, Vec<u32>>,
     /// What has been stored, against [`MOD_BUDGET`].
     total: usize,
 }
@@ -392,6 +402,7 @@ fn modules() -> &'static Mutex<ModStore> {
                 dirs: Vec::new(),
             }],
             by_page: BTreeMap::new(),
+            by_object: BTreeMap::new(),
             total: 0,
         })
     })
@@ -449,6 +460,32 @@ pub extern "C" fn k_mod_claim(page: u64, key: u64, id: u32) {
     if !claims.contains(&id) {
         claims.push(id);
     }
+}
+
+/// Say that module `id` holds code somewhere in object `obj`.
+#[no_mangle]
+pub extern "C" fn k_mod_claim_object(obj: u64, id: u32) {
+    if id == 0 {
+        return;
+    }
+    let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    let claims = m.by_object.entry(obj).or_default();
+    if claims.last() != Some(&id) {
+        claims.push(id);
+    }
+}
+
+/// The `n`th module holding code for this object, or zero past the end.
+#[no_mangle]
+pub extern "C" fn k_mod_for_object(obj: u64, n: u32) -> u32 {
+    modules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_object
+        .get(&obj)
+        .and_then(|v| v.get(n as usize))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// The `n`th module holding code for this page, or zero past the end.

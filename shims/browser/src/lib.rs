@@ -281,6 +281,8 @@ extern "C" {
     fn k_mod_store(ptr: u32, len: u32, slots: u64, dirs_ptr: u32, dirs_len: u32) -> u32;
     fn k_mod_claim(page: u64, key: u64, id: u32);
     fn k_mod_for(page: u64, key: u64, n: u32) -> u32;
+    fn k_mod_claim_object(obj: u64, id: u32);
+    fn k_mod_for_object(obj: u64, n: u32) -> u32;
     fn k_mod_slots(id: u32) -> u64;
     fn k_mod_len(id: u32) -> u32;
     fn k_mod_dirs_len(id: u32) -> u32;
@@ -4328,6 +4330,78 @@ thread_local! {
     static SERVE_NONE: std::cell::RefCell<(u64, u64)> = const { std::cell::RefCell::new((0, 0)) };
 }
 
+/// Which *object* a guest address belongs to, if it is one that was loaded
+/// from somewhere nameable.
+///
+/// The coarse half of [`page_identity`]: the file and nothing else. A page
+/// identity says "the same code at the same address"; this says "the same
+/// library", which is the grain a process wants to install at. Having missed
+/// once inside libc, it will miss all over libc, and every one of those is a
+/// module somebody has already built.
+fn object_identity(h: &Host, addr: u64) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let v = h
+        .kernel
+        .mem
+        .vmas()
+        .iter()
+        .find(|v| addr >= v.start && addr < v.end)?;
+    if v.prot & gex_kernel::mem::prot::WRITE != 0 {
+        return None;
+    }
+    let (id, _) = v.code.as_ref()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// Every module any process has stored for this object that this Worker has
+/// not got: `(id, slots, dirs, wasm)` each.
+fn shared_modules_of_object(h: &Host, obj: u64) -> Vec<(u32, u64, Vec<(u64, u32)>, Vec<u8>)> {
+    let mut out = Vec::new();
+    // SAFETY: scalars in, and the readers below size their buffers from the
+    // kernel's own answer before asking it to fill them.
+    unsafe {
+        if k_present() == 0 {
+            return out;
+        }
+        for n in 0.. {
+            let id = k_mod_for_object(obj, n);
+            if id == 0 {
+                break;
+            }
+            if h.jit.installed_mods.contains(&id) || out.iter().any(|(i, ..)| *i == id) {
+                continue;
+            }
+            let len = k_mod_len(id) as usize;
+            if len == 0 {
+                continue;
+            }
+            let mut wasm = vec![0u8; len];
+            if k_mod_read(id, wasm.as_mut_ptr() as u32, len as u32) as usize != len {
+                continue;
+            }
+            let dlen = k_mod_dirs_len(id) as usize;
+            let mut raw = vec![0u8; dlen];
+            if dlen > 0 && k_mod_dirs_read(id, raw.as_mut_ptr() as u32, dlen as u32) as usize != dlen
+            {
+                continue;
+            }
+            let dirs = raw
+                .chunks_exact(12)
+                .map(|c| {
+                    (
+                        u64::from_le_bytes(c[0..8].try_into().unwrap()),
+                        u32::from_le_bytes(c[8..12].try_into().unwrap()),
+                    )
+                })
+                .collect();
+            out.push((id, k_mod_slots(id), dirs, wasm));
+        }
+    }
+    out
+}
+
 /// The shared module holding this page's code, if there is one and this
 /// Worker has not installed it: `(id, slots, dirs, wasm)`.
 fn shared_module_at(
@@ -5679,30 +5753,42 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // fresh translation uses, so JavaScript installs it by the
                 // path that already exists, and the branch is retried once it
                 // resolves.
-                if let Some((id, slots, dirs, wasm)) = shared_module_at(h, page, key) {
-                    h.jit.installed_mods.insert(id);
-                    // Every page it covers, before the install rather than
-                    // after: installing asks the shim which slot each block
-                    // belongs in, and the answer comes from here. A Worker
-                    // that assigned only the page it faulted on would place
-                    // one block and silently drop the rest.
-                    for (p, b) in &dirs {
-                        h.jit.page_table.assign(*p, *b);
-                    }
-                    h.jit.reuse_served += 1;
+                // Everything anybody has translated of the object this
+                // address is in, not the one module that covers this page.
+                //
+                // Per page did not work and the counters said exactly why:
+                // 361 of 381 recognised pages had every covering module
+                // already installed, and the block missed anyway. A unit
+                // holds what was reachable from the block that faulted in the
+                // process that built it, so arriving at the same page by a
+                // different route gets nothing from it. Having missed once
+                // inside a library a process will miss all over it, and each
+                // of those is a module somebody has already built -- so take
+                // them all on the first miss and stop coming back.
+                let ready = shared_modules_of_object(
+                    h,
+                    object_identity(h, page * gex_abi::DISPATCH_PAGE).unwrap_or(0),
+                );
+                if !ready.is_empty() {
                     if tracing() {
                         trace_line(&format!(
-                            "[gex] serve mod {id} for page {page:#x} pc={pc:#x}: {} dirs, {} slots, {} bytes\n",
-                            dirs.len(),
-                            slots,
-                            wasm.len()
+                            "[gex] serve {} module(s) of the object at pc={pc:#x}\n",
+                            ready.len()
                         ));
                     }
-                    h.jit.pending.push_back(PendingModule {
-                        dirs,
-                        slots,
-                        wasm,
-                    });
+                    for (id, slots, dirs, wasm) in ready {
+                        h.jit.installed_mods.insert(id);
+                        // Every page it covers, before the install rather than
+                        // after: installing asks the shim which slot each block
+                        // belongs in, and the answer comes from here. A Worker
+                        // that assigned only the page it faulted on would place
+                        // one block and silently drop the rest.
+                        for (p, b) in &dirs {
+                            h.jit.page_table.assign(*p, *b);
+                        }
+                        h.jit.reuse_served += 1;
+                        h.jit.pending.push_back(PendingModule { dirs, slots, wasm });
+                    }
                     publish_pending(h);
                     set_resume(pc);
                     set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
@@ -5766,6 +5852,12 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 if mod_id != 0 {
                     // SAFETY: a call into the kernel taking no borrow here.
                     unsafe { k_mod_claim(*page, key, mod_id) };
+                    // And against the object as a whole, which is the grain
+                    // another process installs at.
+                    if let Some(obj) = object_identity(h, *page * gex_abi::DISPATCH_PAGE) {
+                        // SAFETY: as above.
+                        unsafe { k_mod_claim_object(obj, mod_id) };
+                    }
                 }
             }
         }
