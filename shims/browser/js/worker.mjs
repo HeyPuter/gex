@@ -304,6 +304,10 @@ async function handle(msg) {
       // processes a browser will hold at once -- which is the number that
       // makes a demo work on somebody else's machine or not.
       heapKib: Number(gex.shim.exports.gex_heap_used_kib?.() ?? -1),
+      // What this process's memory actually grew to. One memory per process,
+      // so the interesting question is not what the *first* process costs --
+      // it is whether a forked child pays the same again.
+      memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)),
     });
   } catch (e) {
     // Where the guest was, not only what the engine said. A crash inside the

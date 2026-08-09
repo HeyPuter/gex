@@ -600,22 +600,13 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
 /// megabytes of rootfs each time and unpacking it per process would be both
 /// slow and pointless.
 fn install_bundle_remote() {
-    if unsafe { k_fs_populated() } != 0 {
-        FILES.0.borrow_mut().clear();
-        return;
+    // The files went in as they arrived -- see `gex_add_file` -- so all that
+    // is left is to say the bundle is complete. `FILES` is empty on this path
+    // and clearing it is only tidiness.
+    FILES.0.borrow_mut().clear();
+    if unsafe { k_fs_populated() } == 0 {
+        unsafe { k_fs_populate_done() };
     }
-    for (name, bytes) in std::mem::take(&mut *FILES.0.borrow_mut()) {
-        let p = name.as_bytes();
-        unsafe {
-            k_fs_add(
-                p.as_ptr() as u32,
-                p.len() as u32,
-                bytes.as_ptr() as u32,
-                bytes.len() as u32,
-            )
-        };
-    }
-    unsafe { k_fs_populate_done() };
 }
 
 /// Back-edges a guest may take between safepoint calls, matching the native
@@ -2149,11 +2140,29 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
         return;
     };
+    // Straight into the shared root when there is one, rather than staged.
+    //
+    // Staging the whole bundle first meant it sat in *this process's* memory
+    // before any of it reached the filesystem that was going to own it, and a
+    // wasm memory never gives anything back -- so a rootfs cost its own size
+    // in every process that mounted it, including the later ones that find it
+    // already filled and drop their copy unread. Debian's 226 MB rootfs put a
+    // four-process pipeline at 1.3 GB.
+    //
+    // The bundle still exists before the program is loaded, which is all the
+    // ordering requires: `k_fs_add` installs each file in the shared root as
+    // it arrives, and the loader reads the interpreter back out of that same
+    // filesystem in `gex_load`.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            unsafe { k_fs_add(path, path_len, data, data_len) };
+        }
+        return;
+    }
+    // No global kernel: this process is the whole system and its own `TmpFs`
+    // is the filesystem. Staged as before, because that `TmpFs` does not
+    // exist yet -- `gex_load` builds it.
     let bytes = shim_slice(data, data_len).to_vec();
-    // Staged rather than installed. The bundle has to exist before the
-    // program is loaded, not after: a dynamic executable names its
-    // interpreter and the loader has to read it out of the same filesystem
-    // the guest will see.
     FILES.0.borrow_mut().push((name.to_string(), bytes));
 }
 

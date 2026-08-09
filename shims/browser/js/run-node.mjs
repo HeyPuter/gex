@@ -215,7 +215,8 @@ async function spawnChild(child, guestWasm) {
     } else if (m.kind === 'exit' || m.kind === 'threw') {
       if (m.kind === 'threw') process.stderr.write(`gex: process ${child.pid}: ${m.message}\n`);
       else if (process.env.GEX_DEBUG_EXIT) {
-        process.stderr.write(`[gex] process ${child.pid} exited ${m.status}\n`);
+        const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB`;
+        process.stderr.write(`[gex] process ${child.pid} exited ${m.status}${mem}\n`);
       }
       w.terminate();
     }
