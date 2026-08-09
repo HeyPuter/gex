@@ -570,6 +570,52 @@ impl FileHandle for StdinQueue {
     }
 }
 
+/// Mount `/dev`, and bind the virtio-gpu socket if the page brought a
+/// renderer. Returns the device, which the `Host` holds.
+///
+/// A function because every kernel this shim builds needs it, and there is
+/// more than one: the process `gex_load` places, and every child
+/// `gex_adopt_child` adopts. A child given only the root filesystem has no
+/// `/dev/null` to redirect into and no GPU to draw on, and the gears demo is
+/// a shell script that wants both in its first two lines.
+fn mount_devices(kernel: &mut Kernel) -> Option<crate::virgl::VirglDevice> {
+    let mut devfs = gex_kernel::vfs::DevFs::new();
+    if crate::gl::have_gl() {
+        devfs.add("gex-gl", crate::gl::GlDevice::new());
+    }
+    kernel.vfs.mount("/dev", Arc::new(devfs));
+    // Only when the page brought one: a guest that connects to a socket
+    // nobody serves is worse off than one that finds no socket, because
+    // Mesa's winsys does not fall back -- it writes its handshake into the
+    // dead descriptor and blocks reading a reply that cannot come.
+    crate::virgl::have_virgl().then(|| {
+        let device = crate::virgl::VirglDevice::new();
+        kernel.socket_names.bind_host(
+            crate::virgl::DEFAULT_SOCKET,
+            Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
+        );
+        device
+    })
+}
+
+/// Mount `/proc`. Returns the source it reads from, which the `Host` holds
+/// and the scheduler keeps up to date.
+///
+/// It matters more than it looks: a program that cannot open
+/// `/proc/self/maps` gets a null `FILE*` back, and the next `fgets` calls
+/// through it. That surfaces as a jump to address zero -- a dispatch miss at
+/// pc=0 -- with nothing to say the filesystem was the cause.
+fn mount_procfs(kernel: &mut Kernel) -> Arc<gex_kernel::KernelProcSource> {
+    let proc_state: Arc<gex_kernel::KernelProcSource> = Arc::new(gex_kernel::KernelProcSource(
+        std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+    ));
+    kernel.vfs.mount(
+        "/proc",
+        Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
+    );
+    proc_state
+}
+
 /// Give a kernel the three standard descriptors, pointed at the page.
 ///
 /// `Kernel::new` installs `gex-kernel`'s own, which write through `std::io`
@@ -1519,28 +1565,13 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // The graphics device, when the page said it has a canvas to draw on.
     // Absent otherwise, so a guest sees a machine with no GL rather than one
     // whose drawing vanishes.
-    let mut devfs = gex_kernel::vfs::DevFs::new();
-    if crate::gl::have_gl() {
-        devfs.add("gex-gl", crate::gl::GlDevice::new());
-    }
-    kernel.vfs.mount("/dev", Arc::new(devfs));
-    // The virtio-gpu renderer, bound where Mesa's vtest winsys looks. Only
-    // when the page brought one: a guest that connects to a socket nobody
-    // serves is worse off than one that finds no socket, because Mesa's
-    // winsys does not fall back -- it writes its handshake into the dead
-    // descriptor and blocks reading a reply that cannot come.
-    let virgl = crate::virgl::have_virgl().then(|| {
-        let device = crate::virgl::VirglDevice::new();
-        kernel.socket_names.bind_host(
-            crate::virgl::DEFAULT_SOCKET,
-            Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
-        );
-        // And in the filesystem, so a guest that looks before it connects
-        // finds it. `connect` goes through the name table and never needed
-        // this; `test -e` does.
+    let virgl = mount_devices(&mut kernel);
+    // And the socket in the filesystem, so a guest that looks before it
+    // connects finds it. `connect` goes through the name table and never
+    // needed this; `test -e` does.
+    if virgl.is_some() {
         root.add_socket(crate::virgl::DEFAULT_SOCKET);
-        device
-    });
+    }
     // `/tmp` is part of the root filesystem rather than a mount of its own,
     // so a page can bundle a file at any path at all. A mount there meant a
     // bundled `/tmp/x` went into the root and every lookup of it went to the
@@ -2654,13 +2685,20 @@ pub extern "C" fn gex_adopt_child(pid: i32, ctx_addr: i64, pc: i64, sp: i64, tls
     if let Some(r) = global_root() {
         kernel.vfs.mount("/", r);
     }
+    // And the mounts that are not files at all. A child inherits its parent's
+    // whole namespace on Linux, and here every process builds its own -- so a
+    // forked child that was given only the root had no `/dev/null` for a
+    // shell to redirect into and no `/proc/self/maps` for libc to read. The
+    // gears demo is a script that does both in its first two lines.
+    let virgl = mount_devices(&mut kernel);
+    let proc_state = mount_procfs(&mut kernel);
+    kernel.clock = browser_clock;
+    kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
     set_host(Host {
         kernel,
-        virgl: None,
+        virgl,
         root: Arc::new(gex_kernel::vfs::TmpFs::new()),
-        proc_state: Arc::new(gex_kernel::KernelProcSource(Arc::new(
-            std::sync::Mutex::new(Default::default()),
-        ))),
+        proc_state,
         // The child is one thread: `fork` does not carry the parent's others
         // across, and in this design they were never in this Worker anyway.
         threads: vec![Thread {

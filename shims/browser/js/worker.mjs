@@ -146,7 +146,7 @@ port.on(async (msg) => {
   // is missing -- it writes its handshake into the dead descriptor and blocks
   // on a reply that cannot come.
   if (msg.virgl) {
-    const { VirglProxy } = await import(msg.virglUrl ?? '../../../web/src/virgl-bridge.js');
+    const { VirglProxy } = await import('./virgl-bridge.mjs');
     gex.useVirgl(new VirglProxy(msg.virgl, () => port.post({ kind: 'virgl' })), !!msg.virglTrace);
   }
   // A network of this process's own. Each Worker opens its own connection to
@@ -154,7 +154,11 @@ port.on(async (msg) => {
   // on a real machine too, and a relay would put the page in the path of
   // every byte a download takes.
   if (msg.wispUrl) {
-    const { WispNetwork } = await import(msg.netUrl ?? '../../../web/src/net.js');
+    // The site's, because it is built on a Wisp client the site depends on
+    // and this directory has no dependencies at all. Imported only when a
+    // proxy was named, so a Node run that never asks for a network never
+    // looks for it.
+    const { WispNetwork } = await import('../../../web/src/net.js');
     gex.useNetwork(new WispNetwork(msg.wispUrl, (e) => port.post({ kind: 'net', event: e })));
   }
   try {

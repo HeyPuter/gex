@@ -61,6 +61,10 @@ for (const [from, to] of [
   [seed, 'seed.wasm'],
   [TAR, 'graphics.tar'],
   [join(ROOT, 'shims/browser/js/gex.mjs'), 'gex.mjs'],
+  [join(ROOT, 'shims/browser/js/host.mjs'), 'host.mjs'],
+  [join(ROOT, 'shims/browser/js/worker.mjs'), 'worker.mjs'],
+  [join(ROOT, 'shims/browser/js/virgl-bridge.mjs'), 'virgl-bridge.mjs'],
+  [join(ROOT, 'web/public/gex/gex_kernel.plain.wasm'), 'gex_kernel.plain.wasm'],
   [join(ROOT, 'web/src/virgl.js'), 'virgl.js'],
   [join(ROOT, 'web/src/tar.js'), 'tar.js'],
 ]) {
@@ -79,7 +83,8 @@ const process_HEARTBEAT = __HEARTBEAT__;
 const WANT_REPORTS = __REPORTS__;
 const __MISSES__ = __TRACEMISS__;
 const __RECOMPILE__ = __RECOMPILEKIB__;
-import { Gex, Env } from './gex.mjs';
+import { Env } from './gex.mjs';
+import { ProcessHost } from './host.mjs';
 import { VirglRenderer } from './virgl.js';
 import { untar } from './tar.js';
 const el = document.getElementById('out');
@@ -111,7 +116,6 @@ function syncReport(line) {
 }
 const rates = [];
 let report = () => {};
-let hotDump = () => {};
 let drew = () => {};
 class PageEnv extends Env {
   write(fd, bytes) {
@@ -120,7 +124,7 @@ class PageEnv extends Env {
     // it interleaves correctly with the renderer's own lines. Two channels
     // with different latencies produce a plausible ordering that is not the
     // real one, and the whole point of this trace is what came last.
-    if (TRACE && fd === 2) { syncReport(text.trimEnd()); hotDump(); }
+    if (TRACE && fd === 2) syncReport(text.trimEnd());
     output += text;
     paint();
     for (const line of text.split('\\n')) {
@@ -185,116 +189,76 @@ try {
     'GEARS_SECONDS=' + SECONDS + '\\nexport GEARS_SECONDS\\n. /gears.sh\\n');
   output += Object.keys(files).length + ' files in the image\\n';
 
-  const gex = new Gex(new PageEnv());
-  gex.useVirgl(renderer, TRACE);
+  // The guest runs in Workers -- one per process, which is what replaced the
+  // snapshot switcher. That matters here more than anywhere: this demo is a
+  // shell that starts an X server in the background and then runs glxgears,
+  // so the process that draws is two forks and an execve away from pid 1.
+  //
+  // The renderer stays on this thread, because it is the thread with the
+  // canvas. What crosses is a SharedArrayBuffer: the drawing process writes
+  // its command stream into it, wakes this page, and blocks on
+  // Atomics.wait until the reply is there.
+  const { makeChannel, serveVirgl } = await import('./virgl-bridge.mjs');
+  const channel = makeChannel();
+  const serve = serveVirgl(renderer, channel);
   if (TRACE) renderer.traceCommands(true);
+
   mark('loading the guest');
-  const entry = await gex.load(
-    await grab('./shim.wasm'), await grab('./seed.wasm'), files['/bin/sh'],
-    files, ['/bin/sh', '/run.sh'], { uid: 0, gid: 0, cwd: '/' });
-  mark('running the guest');
-  // A sample every few seconds, into the same element. A run that does not
-  // finish inside the budget is dumped where it stands, and without this the
-  // page says only "at running the guest" -- which is true of a guest that
-  // has drawn a thousand frames and of one that never opened the socket.
+  const t0 = Date.now();
   const post = (kind, body) =>
     fetch('/report?kind=' + kind, { method: 'POST', body }).catch(() => {});
-  const t0 = Date.now();
-  // Fire and forget: awaiting here would hand the event loop back in the
-  // middle of a guest write, which is not a safe place to give up the stack.
-  // Blocks translated is the honest progress meter. The renderer's pump
-  // count is not: the scheduler ticks whether or not the guest advances, so
-  // a guest wedged on a socket and a guest translating libGL look identical
-  // through it.
-  //
-  // Read in a microtask, not here. This runs inside the guest's write,
-  // which the shim calls while it still holds its own state borrowed --
-  // asking it anything from in here is a re-entrant borrow, and the run died
-  // with 'RefCell already borrowed' before the X server had finished
-  // starting. A microtask runs once the stack has unwound back to the page,
-  // by which time the borrow is gone.
-  const e = gex.shim.exports;
-  // A line roughly once a second while the guest is executing, which is the
-  // only window into a stretch that makes no syscalls and runs no JavaScript.
-  e.gex_set_heartbeat?.(BigInt(process_HEARTBEAT));
-  if (__MISSES__) e.gex_set_trace_misses?.(1);
-  // The guest's hottest back edges, every so often, on the synchronous
-  // channel. This is the browser's answer to the native host's --sample:
-  // the heartbeat alone reports whichever address happened to be current,
-  // which for a regular loop is the same two or three forever and says
-  // nothing about the shape of the work.
-  if (TRACE && e.gex_hot_blocks) {
-    let n = 0;
-    // One buffer, allocated once. And wrapped, because this is called from
-    // inside the guest's own write: anything thrown here unwinds the guest
-    // rather than the reporter, which ended three runs early and made the
-    // samples look frozen when they were simply the last before the crash.
-    let at = 0;
-    hotDump = () => {
-      if (++n % 4) return;
-      try {
-        if (!at) at = e.gex_alloc(2048) >>> 0;
-        const slen = e.gex_recent_syscalls ? e.gex_recent_syscalls(at, 2048) >>> 0 : 0;
-        if (slen) {
-          syncReport('[last syscalls] ' +
-            new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, slen))
-              .trim().split('\\n').join(' | '));
-        }
-        const len2 = e.gex_hot_blocks(at, 2048) >>> 0;
-        if (len2) {
-          syncReport('[hot] ' +
-            new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, len2))
-              .trim().split('\\n').join(' | '));
-        }
-      } catch (err) {
-        syncReport('[hot] sampling failed: ' + (err?.message || err));
-        hotDump = () => {};
-      }
-    };
-  }
-  // Static recompilation: translate each shared object whole as the guest
-  // maps it, rather than meeting it a dispatch miss at a time. The value is
-  // a cap in KiB of mapped text -- see run-node.mjs for why 8192.
-  if (__RECOMPILE__) e.gex_set_recompile_objects?.(__RECOMPILE__);
+  const env = new PageEnv();
+
+  const kernelBytes = await grab('./gex_kernel.plain.wasm');
+  const host = new ProcessHost({
+    makeWorker: () => new Worker('./worker.mjs', { type: 'module' }),
+    shim: await grab('./shim.wasm'),
+    guest: await grab('./seed.wasm'),
+    kernel: {
+      module: await WebAssembly.compile(kernelBytes),
+      memory: new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }),
+    },
+    extra: {
+      virgl: channel,
+      virglTrace: TRACE,
+      recompileObjects: __RECOMPILE__ || undefined,
+      heartbeat: process_HEARTBEAT || undefined,
+    },
+    onOutput: (fd, text) => env.write(fd, new TextEncoder().encode(text)),
+    onMessage: (m) => {
+      // The drawing process is asking for the renderer. It is blocked on
+      // Atomics.wait until this returns, so nothing may be awaited here.
+      if (m.kind === 'virgl') serve();
+    },
+  });
+
+  mark('running the guest');
   // A pulse from the page itself, on the clock, owing nothing to the guest.
   //
-  // Every other report in this harness is produced from inside the run: the
-  // heartbeat needs a safepoint, the histogram needs a syscall, the census
-  // needs the scheduler. A guest that stops reaching any of them goes silent,
-  // and a silent run at 100% of a core has two completely different causes
-  // that no existing instrument separates -- the guest is inside one long
-  // stretch of translated code and JavaScript is not running at all, or
-  // JavaScript is running perfectly well and something out here is spinning.
-  //
-  // This tells them apart by construction. The entry point does not return
-  // until the guest traps, so while the guest holds the wasm stack no timer
-  // can fire:
-  // these lines stopping *is* the proof that the run is inside wasm, and
-  // these lines continuing while nothing else reports puts the loop out here.
+  // It means something different now that the guest is in a Worker: this
+  // thread is free, so these lines continuing proves only that the page is
+  // alive. What they carry -- the renderer's command histogram -- is the
+  // real progress meter, because every one of those commands came from the
+  // guest and crossed through here.
   setInterval(() => {
     const at = ((Date.now() - t0) / 1000).toFixed(0);
-    post('progress', at + 's | [page] the event loop is still turning | ' +
-      Number(e.gex_jit_blocks()) + ' blocks | ' + renderer.commands());
+    post('progress', at + 's | [page] ' + host.pids.length + ' processes | ' +
+      renderer.commands());
   }, 5000);
-  const queued = [];
   report = (line) => {
-    queued.push([((Date.now() - t0) / 1000).toFixed(0), line]);
-    queueMicrotask(() => {
-      const blocks = Number(e.gex_jit_blocks());
-      const ms = Number(e.gex_jit_millis());
-      while (queued.length) {
-        const [at, l] = queued.shift();
-        post('progress', at + 's | ' + l + ' | ' + blocks + ' blocks in ' + ms +
-          'ms | ' + renderer.glState() + '\\n        ' + renderer.commands() +
-          (rlog.length ? '\\n        renderer: ' + rlog.join(' / ') : ''));
-      }
-    });
+    post('progress', ((Date.now() - t0) / 1000).toFixed(0) + 's | ' + line +
+      ' | ' + renderer.glState() + '\\n        ' + renderer.commands() +
+      (rlog.length ? '\\n        renderer: ' + rlog.join(' / ') : ''));
   };
   // Whichever comes first: the guest finishing, or the guest drawing.
   const firstFrame = new Promise((r) => {
     drew = (line) => r('DREW ' + line);
   });
-  const status = await Promise.race([gex.run(entry), firstFrame]);
+  const status = await Promise.race([
+    host.start({ elf: files['/bin/sh'], files, args: ['/bin/sh', '/run.sh'],
+                 opts: { uid: 0, gid: 0, cwd: '/' } }),
+    firstFrame,
+  ]);
   const result = 'EXIT ' + status + '\\n' + output.trim() +
       '\\nrenderer: ' + renderer.describe() +
       '\\nstate: ' + renderer.glState() +
