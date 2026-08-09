@@ -274,7 +274,17 @@ for (const id of list) {
   const done = new Promise((resolve) => {
     onReport = (kind, body) => {
       if (kind === 'threw') return resolve({ how: 'threw', body });
-      const [statusKind, text, terminal] = body.split('|');
+      // Not `split('|')`. The terminal is the last field and the guest
+      // puts pipes in it -- `echo x | cat` is a pipe on the command line,
+      // and so is any program that draws a table -- so splitting on every
+      // separator threw away everything the guest said after the first one.
+      // The harness then judged the run on the truncated remainder, which is
+      // how a pipeline could appear to produce no output at all.
+      const first = body.indexOf('|');
+      const second = body.indexOf('|', first + 1);
+      const statusKind = body.slice(0, first);
+      const text = body.slice(first + 1, second);
+      const terminal = body.slice(second + 1);
       last = `${statusKind || '-'} ${text}`;
       // Kept so that a failure can show what the guest actually said. The
       // tick line below carries one line; a demo that fails is worth twenty.
