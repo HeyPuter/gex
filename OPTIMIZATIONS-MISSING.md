@@ -377,17 +377,26 @@ and the per-base half of the guards is.
 `GEX_UNSAFE_NO_GUARD=1` builds without the guard at all -- not shippable,
 since a guest that computes an address above `GUEST_LIMIT` then aliases low
 memory instead of taking SIGSEGV. It exists to price the removal, because
-the principled way to do it needs a tier-3 Rust target and nobody should
+the principled way to do it needs a custom Rust target and nobody should
 start that blind.
 
 nbench, statically recompiled both ways, two runs each:
 
-    STRING SORT   240.21 -> 388.5   +61.7%
-    NUMERIC SORT  488.73 -> 528.5    +8.1%
-    IDEA         3828.4  -> 4102.8   +7.2%
-    FOURIER     15861    -> 16046    +1.2%
+    STRING SORT   240.21 -> 391.33  +62.9%
+    IDEA         3828.4  -> 4154.7   +8.5%
+    NUMERIC SORT  488.73 -> 525.98   +7.6%
+    FOURIER     15861    -> 16128    +1.7%
 
-and the module falls from 7673 KiB to 6820 KiB.
+three runs each, and the module falls from 7673 KiB to 6820 KiB.
+
+What the guard protects is less than it looks, which matters when weighing
+that number. `GUEST_MEM_BYTES` is `0xFFFF_0000` and the wasm memory covers
+all of it, so a wild guest pointer *below* 4 GiB does not fault today
+either -- it reads zeros from a part of the flat mapping nothing mapped.
+The guard catches only addresses at or above `0xFFFF_0000`, meaning those
+with high bits set. It buys detection of one class of wild pointer, while
+the other already goes undetected, for 62% on string code. The host is safe
+either way: every access stays inside the wasm memory.
 
 The spread is the mechanism showing: STRING SORT chases pointers and bytes,
 so almost every instruction is a guarded access, while FOURIER strides
@@ -408,8 +417,17 @@ stand rather than to drop it. The
 guest modules do not own the memory: they `import_memory` it from the shim,
 and the shim is Rust built for `wasm32-unknown-unknown`. A wasm32 module
 cannot export a 64-bit memory, so this needs the shim on
-`wasm64-unknown-unknown` -- a tier-3 target -- or the guest memory separated
-from the shim's, which is most of the runtime.
+wasm64 -- and `rustup target list` has no wasm64 entry at all, on stable or
+nightly, so that means a custom target JSON plus `-Z build-std` rather than
+`rustup target add` -- or the guest memory separated from the shim's, which
+is most of the runtime.
+
+Against 62% that is worth attempting. The emitter side is the easy half: it
+already computes addresses as `i64` and *narrows* them to `i32`, so memory64
+deletes the narrowing rather than adding anything. And memory64 restores
+*more* protection than the guard gives today, since an address beyond the
+guest's address space traps -- including the sub-4 GiB wild pointers that
+currently read zeros unnoticed.
 
 # Ranked by expected value
 
