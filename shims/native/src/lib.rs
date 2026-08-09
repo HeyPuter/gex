@@ -2863,6 +2863,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             // synchronously; the next miss picks up where this stopped.
             4096,
             true,
+            &Default::default(),
         )
     };
     if translated_module.exported_blocks.is_empty() {
@@ -3368,6 +3369,7 @@ fn recompile_object(
             limits,
             MAX_OBJECT_BLOCKS,
             true,
+            &Default::default(),
         )
     };
     if modules.iter().all(|m| m.exported_blocks.is_empty()) {

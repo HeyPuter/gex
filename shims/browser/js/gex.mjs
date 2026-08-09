@@ -767,6 +767,25 @@ export class Gex {
   }
 
   /**
+   * Which object each translated page belongs to, as identities.
+   *
+   * The companion to `#pageMap`, and the one that matters after an `execve`:
+   * the page map describes an address space that is about to be replaced,
+   * this describes the libraries in it.
+   */
+  #sharedMap() {
+    const e = this.#shim.exports;
+    if (!e.gex_shared_count) return [];
+    const n = e.gex_shared_count() >>> 0;
+    if (!n) return [];
+    const p = e.gex_alloc(n * 20) >>> 0;
+    const wrote = e.gex_shared_dump(p, n * 20);
+    const out = wrote > 0 ? this.#bytes().slice(p, p + wrote * 20) : new Uint8Array(0);
+    e.gex_free?.(p, n * 20);
+    return out;
+  }
+
+  /**
    * Become the child a `fork` in another Worker produced.
    *
    * Everything a process is, in the order the pieces depend on each other:
@@ -843,6 +862,17 @@ export class Gex {
       for (let i = 0; i + 12 <= child.pages.byteLength; i += 12) {
         e.gex_adopt_page(dv.getBigUint64(i, true), dv.getUint32(i + 8, true));
       }
+    }
+    // And the identity map, which is what is left of all this once the child
+    // execs. Nothing reads it until a translation misses, and the miss path
+    // checks each key against what this process has really mapped, so
+    // seeding it early costs nothing and claims nothing.
+    if (child.shared?.length && e.gex_shared_seed) {
+      const n = (child.shared.byteLength / 20) | 0;
+      const p = e.gex_alloc(n * 20) >>> 0;
+      this.#bytes().set(child.shared.subarray(0, n * 20), p);
+      e.gex_shared_seed(p, n);
+      e.gex_free?.(p, n * 20);
     }
     step('pages adopted');
     // After the kernel exists and before the guest runs: the first thing a
@@ -941,6 +971,10 @@ export class Gex {
       // these costs nothing: it links them against its own memory and tables
       // without compiling a line.
       pages: this.#pageMap(),
+      // And which object each of those pages belongs to, which is the only
+      // part of it that outlives the child's first `execve`. See
+      // `gex_shared_dump`.
+      shared: this.#sharedMap(),
       modules: this.#compiled.slice(),
       opts: this.#opts,
       // The descriptors the child inherits, described rather than cloned: an

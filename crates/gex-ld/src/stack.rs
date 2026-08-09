@@ -217,6 +217,8 @@ mod tests {
             text_range: (0x400000, 0x400010),
             tls: None,
             symbols: Vec::new(),
+            named_relocs: Vec::new(),
+            irelative: Vec::new(),
             pie: false,
             interp: None,
         }

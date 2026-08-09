@@ -21,14 +21,24 @@ const PF_R: u32 = 4;
 const SHT_DYNSYM: u32 = 11;
 const SHT_SYMTAB: u32 = 2;
 const STT_FUNC: u8 = 2;
+/// A function whose address is decided at load time by running a resolver.
+/// The symbol's value is the *resolver*, not the implementation.
+const STT_GNU_IFUNC: u8 = 10;
 
 const DT_NULL: i64 = 0;
+const DT_PLTRELSZ: i64 = 2;
+const DT_STRTAB: i64 = 5;
+const DT_SYMTAB: i64 = 6;
 const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
+const DT_SYMENT: i64 = 11;
+const DT_JMPREL: i64 = 23;
 
 const R_AARCH64_RELATIVE: u32 = 1027;
 const R_AARCH64_IRELATIVE: u32 = 1032;
+const R_AARCH64_GLOB_DAT: u32 = 1025;
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
 
 /// Why an image could not be loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,8 +98,14 @@ pub struct Segment {
 #[derive(Clone, Debug)]
 pub struct Symbol {
     pub name: String,
+    /// For an ordinary function, where it is. For an indirect one, where its
+    /// *resolver* is -- see [`Symbol::ifunc`].
     pub value: u64,
     pub size: u64,
+    /// `STT_GNU_IFUNC`: the implementation is whatever the resolver returns
+    /// at startup, so `value` is not an address anything should be called
+    /// at. aarch64 glibc defines `memcpy`, `memmove` and `memset` this way.
+    pub ifunc: bool,
 }
 
 /// A loaded process image.
@@ -126,6 +142,23 @@ pub struct Image {
     pub tls: Option<(u64, u64, u64, u64)>,
     /// Function symbols, when a symbol table survives.
     pub symbols: Vec<Symbol>,
+    /// Relocations that name a symbol, as `(slot, name)` with `slot` biased.
+    ///
+    /// A call to another object's function goes through one of these: the
+    /// slot is in this object's GOT, and the dynamic linker writes the
+    /// definition's address into it before the call happens. Reading the slot
+    /// afterwards is how the address of a function that has no address until
+    /// the guest runs -- an `STT_GNU_IFUNC` such as glibc's `memcpy` -- can
+    /// be discovered.
+    pub named_relocs: Vec<(u64, String)>,
+    /// `R_AARCH64_IRELATIVE` relocations, as `(slot, resolver)`, both biased.
+    ///
+    /// Left unapplied on purpose -- running a resolver is the guest's job at
+    /// startup -- which is exactly what makes them useful afterwards: once
+    /// the guest has run, `slot` holds the address the resolver chose, and
+    /// that is the only way to learn where an `STT_GNU_IFUNC` such as
+    /// `memcpy` actually ended up.
+    pub irelative: Vec<(u64, u64)>,
     /// True for `ET_DYN` images.
     pub pie: bool,
     /// The `PT_INTERP` path, when the image asks for a dynamic linker.
@@ -279,6 +312,8 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         text_range: (text_lo, text_hi),
         tls,
         symbols: Vec::new(),
+        named_relocs: Vec::new(),
+        irelative: Vec::new(),
         code: Vec::new(),
         pie,
         interp,
@@ -286,10 +321,88 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
 
     if let Some((dyn_vaddr, dyn_size)) = dynamic {
         apply_relative_relocations(&mut image, dyn_vaddr, dyn_size);
+        image.named_relocs = read_named_relocs(&image, dyn_vaddr, dyn_size);
     }
     image.symbols = read_symbols(&r, e_shoff, e_shentsize, e_shnum, bias);
     image.code = read_code_sections(&r, e_shoff, e_shentsize, e_shnum, bias);
     Ok(image)
+}
+
+/// Which GOT slot each named relocation writes to, and the name it writes.
+///
+/// The dynamic linker fills these in before the guest's own code runs, so
+/// afterwards the slot holds the address the call will actually reach. That
+/// is the only way to find an indirect function: `memcpy` on aarch64 glibc is
+/// an `STT_GNU_IFUNC` whose symbol value is a resolver, and which
+/// implementation it picked is a fact about the run, not about the file.
+///
+/// Both relocation tables, because `DT_JMPREL` holds the lazy PLT entries and
+/// `DT_RELA` the eagerly-bound ones, and which of the two a given call uses
+/// depends on how the object was linked.
+fn read_named_relocs(image: &Image, dyn_vaddr: u64, dyn_size: u64) -> Vec<(u64, String)> {
+    let (mut rela, mut relasz, mut relaent) = (None, 0u64, 24u64);
+    let (mut jmprel, mut pltrelsz) = (None, 0u64);
+    let (mut symtab, mut strtab, mut syment) = (None, None, 24u64);
+    for i in 0..dyn_size / 16 {
+        let at = dyn_vaddr + i * 16;
+        let (Some(tag), Some(val)) = (read_u64(image, at), read_u64(image, at + 8)) else {
+            break;
+        };
+        match tag as i64 {
+            DT_NULL => break,
+            DT_RELA => rela = Some(val + image.bias),
+            DT_RELASZ => relasz = val,
+            DT_RELAENT => relaent = val,
+            DT_JMPREL => jmprel = Some(val + image.bias),
+            DT_PLTRELSZ => pltrelsz = val,
+            DT_SYMTAB => symtab = Some(val + image.bias),
+            DT_STRTAB => strtab = Some(val + image.bias),
+            DT_SYMENT => syment = val,
+            _ => {}
+        }
+    }
+    let (Some(symtab), Some(strtab)) = (symtab, strtab) else {
+        return Vec::new();
+    };
+    if syment == 0 || relaent < 24 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (table, size) in [(rela, relasz), (jmprel, pltrelsz)] {
+        let Some(base) = table else { continue };
+        for i in 0..size / relaent {
+            let at = base + i * relaent;
+            let (Some(r_offset), Some(r_info)) = (read_u64(image, at), read_u64(image, at + 8))
+            else {
+                continue;
+            };
+            let r_type = (r_info & 0xffff_ffff) as u32;
+            if r_type != R_AARCH64_JUMP_SLOT && r_type != R_AARCH64_GLOB_DAT {
+                continue;
+            }
+            let sym = r_info >> 32;
+            let Some(st_name) = read_u32(image, symtab + sym * syment) else {
+                continue;
+            };
+            let name = read_cstr(image, strtab + st_name as u64);
+            if !name.is_empty() {
+                out.push((r_offset + image.bias, name));
+            }
+        }
+    }
+    out
+}
+
+/// A NUL-terminated string from the placed image.
+fn read_cstr(image: &Image, vaddr: u64) -> String {
+    let mut out = Vec::new();
+    for i in 0..256u64 {
+        match read_u8(image, vaddr + i) {
+            Some(0) | None => break,
+            Some(b) => out.push(b),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Apply the relocations a static-PIE image needs before its own code runs.
@@ -342,8 +455,14 @@ fn apply_relative_relocations(image: &mut Image, dyn_vaddr: u64, dyn_size: u64) 
             let value = image.bias.wrapping_add(r_addend);
             write_u64(image, target, value);
         }
-        // R_AARCH64_IRELATIVE is deliberately left to guest startup.
-        let _ = R_AARCH64_IRELATIVE;
+        // Applying an IRELATIVE means running guest code, which is the
+        // guest's own job at startup. Recorded so that whoever wants the
+        // answer can read the slot once the guest has done it.
+        if r_type == R_AARCH64_IRELATIVE {
+            image
+                .irelative
+                .push((r_offset + image.bias, image.bias.wrapping_add(r_addend)));
+        }
     }
 }
 
@@ -356,6 +475,28 @@ fn read_u64(image: &Image, vaddr: u64) -> Option<u64> {
             return Some(u64::from_le_bytes([
                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
             ]));
+        }
+    }
+    None
+}
+
+/// Read a word from the placed image.
+fn read_u32(image: &Image, vaddr: u64) -> Option<u32> {
+    for seg in &image.segments {
+        if vaddr >= seg.vaddr && vaddr + 4 <= seg.vaddr + seg.bytes.len() as u64 {
+            let off = (vaddr - seg.vaddr) as usize;
+            let b = &seg.bytes[off..off + 4];
+            return Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+    }
+    None
+}
+
+/// Read a byte from the placed image.
+fn read_u8(image: &Image, vaddr: u64) -> Option<u8> {
+    for seg in &image.segments {
+        if vaddr >= seg.vaddr && vaddr < seg.vaddr + seg.bytes.len() as u64 {
+            return Some(seg.bytes[(vaddr - seg.vaddr) as usize]);
         }
     }
     None
@@ -468,13 +609,15 @@ fn read_symbols(
             else {
                 continue;
             };
-            if st_info & 0xf != STT_FUNC || st_value == 0 {
+            let kind = st_info & 0xf;
+            if (kind != STT_FUNC && kind != STT_GNU_IFUNC) || st_value == 0 {
                 continue;
             }
             out.push(Symbol {
                 name: r.cstr(str_off + st_name as usize),
                 value: st_value + bias,
                 size: st_size,
+                ifunc: kind == STT_GNU_IFUNC,
             });
         }
     }

@@ -808,6 +808,17 @@ pub enum Stmt {
         val: Value,
         bytes: u32,
     },
+    /// Copy `len` bytes of guest memory from `src` to `dst`, overlap-safe.
+    ///
+    /// A whole guest `memcpy`/`memmove` as one statement, so the backend can
+    /// emit wasm's `memory.copy` rather than the hundreds of blocks glibc's
+    /// hand-written NEON loop lifts to. Nothing in the lifter produces this:
+    /// it comes from recognising a library function by name, which is why the
+    /// semantics here are the C ones -- `memory.copy` is defined to behave as
+    /// if through a temporary, which is `memmove`, and so serves both.
+    MemCopy { dst: Value, src: Value, len: Value },
+    /// Set `len` bytes of guest memory at `dst` to the low byte of `val`.
+    MemFill { dst: Value, val: Value, len: Value },
     /// A memory fence.
     Fence,
 }
@@ -827,6 +838,16 @@ impl Stmt {
                 f(*addr);
                 f(*val);
             }
+            Stmt::MemCopy { dst, src, len } => {
+                f(*dst);
+                f(*src);
+                f(*len);
+            }
+            Stmt::MemFill { dst, val, len } => {
+                f(*dst);
+                f(*val);
+                f(*len);
+            }
             Stmt::Fence => {}
         }
     }
@@ -836,7 +857,12 @@ impl Stmt {
         match self {
             Stmt::Def { expr, .. } => !expr.is_pure(),
             Stmt::WriteReg { .. } => true,
-            Stmt::Store { .. } | Stmt::HostCall { .. } | Stmt::VStore { .. } | Stmt::Fence => true,
+            Stmt::Store { .. }
+            | Stmt::HostCall { .. }
+            | Stmt::VStore { .. }
+            | Stmt::MemCopy { .. }
+            | Stmt::MemFill { .. }
+            | Stmt::Fence => true,
         }
     }
 }

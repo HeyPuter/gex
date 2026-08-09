@@ -221,6 +221,12 @@ pub fn block(b: &Block) -> String {
                     off(*offset)
                 );
             }
+            Stmt::MemCopy { dst, src, len } => {
+                let _ = writeln!(s, "  memcopy [{dst:?}] <- [{src:?}], {len:?}");
+            }
+            Stmt::MemFill { dst, val, len } => {
+                let _ = writeln!(s, "  memfill [{dst:?}] = {val:?}, {len:?}");
+            }
             Stmt::Fence => {
                 let _ = writeln!(s, "  fence");
             }

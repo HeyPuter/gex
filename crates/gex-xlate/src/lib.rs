@@ -32,10 +32,17 @@ use gex_ld::Image;
 use gex_lift::{lift_block, BlockLimits};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+pub mod intrinsic;
+pub use intrinsic::Intrinsic;
+
 /// Knobs for a translation run.
 #[derive(Clone, Debug)]
 pub struct Options {
     pub limits: BlockLimits,
+    /// Guest addresses that are library functions with a wasm instruction
+    /// behind them, so the translator emits that instead of lifting the
+    /// function's own code. See [`intrinsic`].
+    pub intrinsics: HashMap<u64, Intrinsic>,
     /// Extra guest addresses to treat as block entry points.
     pub extra_entries: Vec<u64>,
     /// Scan data for values that look like code pointers.
@@ -66,6 +73,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             limits: BlockLimits::default(),
+            intrinsics: HashMap::new(),
             extra_entries: Vec::new(),
             scan_pointers: true,
             // Off by default now that runtime translation covers the gaps;
@@ -537,6 +545,7 @@ pub fn seed_module(shared_memory: bool) -> TranslatedModule {
 /// but it no longer depends on which address the guest happened to reach
 /// first, which is what made the demand-driven output differ between runs.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn translate_object(
     memory: &[u8],
     lo: u64,
@@ -548,6 +557,7 @@ pub fn translate_object(
     limits: BlockLimits,
     max_blocks: usize,
     shared_memory: bool,
+    intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (Vec<TranslatedModule>, Stats) {
     // Addresses that do not begin a decodable instruction are skipped rather
     // than translated into a block that can only report SIGILL. On a static
@@ -577,7 +587,14 @@ pub fn translate_object(
     };
     stage("seeds", seeds.len());
     let (blocks, mut stats) = discover(
-        memory, lo, seeds, executable, known, limits, max_blocks,
+        memory,
+        lo,
+        seeds,
+        executable,
+        known,
+        limits,
+        max_blocks,
+        intrinsics,
     );
     stage("discovered", blocks.len());
     let modules = emit_modules(blocks, lo, page_table, shared_memory, MAX_FUNCS_PER_MODULE);
@@ -708,6 +725,7 @@ fn emit_modules(
     modules
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_runtime(
     memory: &[u8],
     entry: u64,
@@ -717,6 +735,7 @@ pub fn translate_runtime(
     limits: BlockLimits,
     max_blocks: usize,
     shared_memory: bool,
+    intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (TranslatedModule, Stats) {
     translate_seeded(
         memory,
@@ -728,6 +747,7 @@ pub fn translate_runtime(
         limits,
         max_blocks,
         shared_memory,
+        intrinsics,
     )
 }
 
@@ -745,9 +765,11 @@ fn translate_seeded(
     limits: BlockLimits,
     max_blocks: usize,
     shared_memory: bool,
+    intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (TranslatedModule, Stats) {
-    let (blocks, mut stats) =
-        discover(memory, entry, seeds, executable, known, limits, max_blocks);
+    let (blocks, mut stats) = discover(
+        memory, entry, seeds, executable, known, limits, max_blocks, intrinsics,
+    );
     let mut modules = emit_modules(blocks, entry, page_table, shared_memory, usize::MAX);
     let module = modules.pop().expect("an unbounded budget emits one module");
     stats.wasm_bytes = module.wasm.len();
@@ -767,6 +789,7 @@ fn discover(
     known: &(dyn Fn(u64) -> bool + Sync),
     limits: BlockLimits,
     max_blocks: usize,
+    intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (Vec<Block>, Stats) {
     let mut stats = Stats::default();
     let mut seen: HashSet<u64> = HashSet::new();
@@ -794,7 +817,14 @@ fn discover(
         if frontier.len() + stats.blocks > max_blocks {
             frontier.truncate(max_blocks - stats.blocks);
         }
-        let lifted = gex_emit::par::map(&frontier, &|&a| lift_one(a, memory, executable, limits));
+        let lifted = gex_emit::par::map(&frontier, &|&a| {
+            match intrinsics.get(&a) {
+                // Not lifted at all, so discovery never walks into the
+                // function's body and the module never carries it.
+                Some(&k) => intrinsic::block(a, k),
+                None => lift_one(a, memory, executable, limits),
+            }
+        });
 
         let mut next: Vec<u64> = Vec::new();
         for block in lifted {
@@ -918,6 +948,8 @@ mod tests {
             text_range: (base, base + len),
             tls: None,
             symbols: Vec::new(),
+            named_relocs: Vec::new(),
+            irelative: Vec::new(),
             pie: false,
             interp: None,
         }
@@ -954,6 +986,7 @@ mod tests {
             &|_| false,
             BlockLimits::default(),
             usize::MAX,
+            &HashMap::new(),
         );
         let total = blocks.len();
         assert_eq!(total, seeds.len(), "every `ret` is its own block");

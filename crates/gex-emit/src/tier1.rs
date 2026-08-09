@@ -81,6 +81,10 @@ mod code {
     pub const I64_EXTEND16_S: u8 = 0xc3;
     pub const I64_EXTEND32_S: u8 = 0xc4;
     pub const I64_LT_U: u8 = 0x54;
+    pub const I64_SUB: u8 = 0x7d;
+    /// Second byte of the `0xfc` bulk-memory pair, after the prefix.
+    pub const MEMORY_COPY: u32 = 10;
+    pub const MEMORY_FILL: u32 = 11;
 }
 
 /// Everything tier-1 needs to know about the module it is emitting into.
@@ -899,7 +903,72 @@ impl<'a> Emitter<'a> {
                     self.f.simd_mem_lane(sub, align, static_off, 0);
                 }
             }
+            Stmt::MemCopy { dst, src, len } => {
+                // Both addresses first: `guard_to_i32` borrows the i64
+                // scratch, and the length wants it afterwards.
+                let d = self.scratch_i32;
+                let s = self.scratch_entry;
+                self.emit_address(*dst, 0);
+                self.f.local_set(d);
+                self.emit_address(*src, 0);
+                self.f.local_set(s);
+                self.clamp_len(*len, &[d, s]);
+                self.f.local_get(d);
+                self.f.local_get(s);
+                self.f.local_get(self.scratch_i64);
+                self.f.byte(code::I32_WRAP_I64);
+                self.f.byte(crate::wasm::op::MISC_PREFIX);
+                self.f.u32(code::MEMORY_COPY);
+                self.f.byte(0); // destination memory
+                self.f.byte(0); // source memory
+            }
+            Stmt::MemFill { dst, val, len } => {
+                let d = self.scratch_i32;
+                self.emit_address(*dst, 0);
+                self.f.local_set(d);
+                self.clamp_len(*len, &[d]);
+                self.f.local_get(d);
+                self.push(*val);
+                self.f.byte(code::I32_WRAP_I64);
+                self.f.local_get(self.scratch_i64);
+                self.f.byte(code::I32_WRAP_I64);
+                self.f.byte(crate::wasm::op::MISC_PREFIX);
+                self.f.u32(code::MEMORY_FILL);
+                self.f.byte(0); // memory
+            }
             Stmt::Fence => self.f.atomic_fence(),
+        }
+    }
+
+    /// Leave in the i64 scratch a length that cannot run off the end of guest
+    /// memory from any of `bases`.
+    ///
+    /// `memory.copy` and `memory.fill` *trap* when they would run past the
+    /// end of the wasm memory, and a trap is the whole process gone rather
+    /// than the guest fault a bad `memcpy` should be. Every base has already
+    /// been through the address guard, so each is below `GUEST_LIMIT` and the
+    /// room above it cannot be negative; clamping the length to the smallest
+    /// of them makes the bulk op unable to trap, and leaves any guest that
+    /// really did ask for something absurd writing into the poison page
+    /// exactly as the per-access path would have it.
+    fn clamp_len(&mut self, len: Value, bases: &[u32]) {
+        let n = self.scratch_i64;
+        let room = self.scratch_page;
+        self.push(len);
+        self.f.local_set(n);
+        for &b in bases {
+            self.f.i64_const(GUEST_LIMIT as i64);
+            self.f.local_get(b);
+            self.f.byte(code::I64_EXTEND_I32_U);
+            self.f.byte(code::I64_SUB);
+            self.f.local_set(room);
+            self.f.local_get(n);
+            self.f.local_get(room);
+            self.f.local_get(n);
+            self.f.local_get(room);
+            self.f.byte(code::I64_LT_U);
+            self.f.select();
+            self.f.local_set(n);
         }
     }
 

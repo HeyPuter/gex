@@ -1155,6 +1155,19 @@ struct Jit {
     /// Not part of a process's saved state. That is the point -- it outlives
     /// every `fork` and `execve`, which is where the waste was.
     shared: std::collections::HashMap<(u64, u64), u32>,
+    /// Guest addresses that are `memcpy` and friends, to be served by a wasm
+    /// bulk-memory instruction rather than translated.
+    ///
+    /// Filled from an object's symbol table and relocations the first time a
+    /// dispatch miss lands anywhere in that object -- not when it is mapped,
+    /// because a mapping is not evidence anything in it will run, and not
+    /// from the recompiler, because the runtime translator needs the same
+    /// answers and the page may never have asked for bulk recompilation.
+    intrinsics: std::collections::HashMap<u64, gex_xlate::Intrinsic>,
+    /// How many times each object has been through [`note_intrinsics`], so a
+    /// library is parsed once when the answer is settled and a bounded number
+    /// of times while it is not.
+    intrinsics_scanned: std::collections::HashMap<String, u32>,
     /// Objects the guest has mapped that have not been recompiled yet, and
     /// how many dispatch misses have landed in each.
     ///
@@ -2097,6 +2110,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 translated: Default::default(),
                 registry: Vec::new(),
                 shared: Default::default(),
+                intrinsics: Default::default(),
+                intrinsics_scanned: Default::default(),
                 candidates: Vec::new(),
                 pending: Default::default(),
                 blocks: 0,
@@ -3694,6 +3709,8 @@ pub extern "C" fn gex_adopt_child(
             translated: Default::default(),
             registry: Vec::new(),
             shared: Default::default(),
+            intrinsics: Default::default(),
+            intrinsics_scanned: Default::default(),
             candidates: Vec::new(),
             pending: Default::default(),
             blocks: 0,
@@ -5053,9 +5070,12 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             MISSES
         };
         if n.is_multiple_of(200) {
-            let (blocks, ms) = with_host(|h| (h.jit.blocks, h.jit.nanos / 1_000_000));
+            let (blocks, ms, intr) = with_host(|h| {
+                (h.jit.blocks, h.jit.nanos / 1_000_000, h.jit.intrinsics.len())
+            });
             trace_line(&format!(
-                "[beat] miss {n} at pc={pc:#x}, {blocks} blocks, {ms}ms lifting\n"
+                "[beat] miss {n} at pc={pc:#x}, {blocks} blocks, {ms}ms lifting, \
+                 {intr} intrinsics\n"
             ));
         }
     }
@@ -5097,6 +5117,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         trap();
     }
     // Before translating one block: has this object been missed often
+    // Which of this object's functions the backend can serve itself. Before
+    // either path translates anything.
+    note_intrinsics(pc);
     // enough to be worth translating whole? If so it is now queued, and the
     // block this miss asked for is in it.
     if maybe_recompile_at(pc) {
@@ -5164,6 +5187,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             // guest runs in. The plain build says no and the shared build
             // says yes, which is exactly what the feature means.
             cfg!(feature = "shared-memory"),
+            &h.jit.intrinsics,
         );
         h.jit.translated = known;
         if stats.blocks == 0 {
@@ -5432,6 +5456,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         return 0;
     }
     let seeds = object_seeds(map);
+    let intrinsics = with_host(|h| h.jit.intrinsics.clone());
     let (exec, page_table, known) = with_host(|h| {
         let exec: Vec<(u64, u64)> = h
             .kernel
@@ -5454,6 +5479,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         Default::default(),
         MAX_OBJECT_BLOCKS,
         cfg!(feature = "shared-memory"),
+        &intrinsics,
     );
     with_host(|h| {
         h.jit.translated = known;
@@ -5513,6 +5539,111 @@ const MAX_OBJECT_BLOCKS: usize = 4_000_000;
 /// the L instructions of a basic block emits L blocks totalling L(L+1)/2
 /// instructions. Empty when the file cannot be read, which tells
 /// `translate_object` to scan instead.
+/// Note the library functions in whichever object `addr` falls in, so the
+/// translator can serve them itself.
+///
+/// Called before either path translates anything, and outside `with_host`
+/// because reading the object takes the host itself.
+fn note_intrinsics(addr: u64) {
+    let Some((path, start)) = with_host(|h| {
+        let v = h.kernel.mem.vmas().iter().find(|v| {
+            addr >= v.start && addr < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0
+        })?;
+        let (path, _) = v.origin.as_ref()?;
+        // Retried rather than answered once, because the answer does not
+        // exist yet the first time: `memcpy`'s slot is filled by the dynamic
+        // linker, and a miss inside `ld.so` itself happens before that.
+        // Bounded, so an object whose slots are never bound stops being
+        // re-parsed.
+        if h.jit.intrinsics_scanned.get(path).copied().unwrap_or(0) >= 8 {
+            return None;
+        }
+        Some((path.clone(), v.start))
+    }) else {
+        return;
+    };
+    let (found, pending) = scan_intrinsics(&path, start);
+    with_host(|h| {
+        // A scan with nothing left outstanding need never run again.
+        let n = if pending { 1 } else { 8 };
+        *h.jit.intrinsics_scanned.entry(path.clone()).or_insert(0) += n;
+        for (a, k) in found {
+            h.jit.intrinsics.insert(a, k);
+        }
+    });
+    if tracing() {
+        let n = with_host(|h| h.jit.intrinsics.len());
+        trace_line(&format!("[gex] intrinsics: {n} after {path}\n"));
+    }
+}
+
+/// Whether a guest address is in some object's executable mapping.
+fn executable_guest_addr(a: u64) -> bool {
+    with_host(|h| {
+        h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .any(|v| a >= v.start && a < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)
+    })
+}
+
+/// The library functions one object offers or calls, and whether any answer
+/// is still outstanding.
+///
+/// Two sources, and the second is the one that matters on Debian. A plain
+/// `STT_FUNC` symbol names its own code, so its address is its address --
+/// which is the whole story for a static binary. But glibc exports `memcpy`,
+/// `memmove` and `memset` as `STT_GNU_IFUNC`, whose symbol value is a
+/// *resolver*: which implementation the machine gets is chosen at startup and
+/// written into the calling object's GOT. So the address is not in any symbol
+/// table at all, and the only way to learn it is to read the slot the dynamic
+/// linker wrote, out of live guest memory, after it has run.
+fn scan_intrinsics(path: &str, start: u64) -> (Vec<(u64, gex_xlate::Intrinsic)>, bool) {
+    let Some(bytes) = with_host(|h| h.kernel.read_file(path)) else {
+        return (Vec::new(), false);
+    };
+    let Ok(image) = gex_ld::elf::load(&bytes, 0) else {
+        return (Vec::new(), false);
+    };
+    let Some(text) = image.segments.iter().find(|s| s.executable) else {
+        return (Vec::new(), false);
+    };
+    // The same bias `object_seeds` computes, and for the same reason: the
+    // image is parsed at its own addresses and mapped at others.
+    let bias = start.wrapping_sub(text.vaddr & !0xfff);
+    let (lo, hi) = (text.vaddr, text.vaddr + text.bytes.len() as u64);
+    let gm = GuestMem::new(guest_bytes());
+    let mut out = Vec::new();
+    let mut pending = false;
+    for s in &image.symbols {
+        if s.ifunc || s.value < lo || s.value >= hi {
+            continue;
+        }
+        if let Some(kind) = gex_xlate::intrinsic::recognise(&s.name) {
+            out.push((s.value.wrapping_add(bias), kind));
+        }
+    }
+    for (slot, name) in &image.named_relocs {
+        let Some(kind) = gex_xlate::intrinsic::recognise(name) else {
+            continue;
+        };
+        let Ok(target) = gm.read_u64(slot.wrapping_add(bias)) else {
+            pending = true;
+            continue;
+        };
+        // Not bound yet: a lazy slot still points at the resolver stub and an
+        // untouched one is zero. Neither is an answer, and binding `memcpy`
+        // to whatever happened to be there would be the worst kind of wrong.
+        if !executable_guest_addr(target) {
+            pending = true;
+            continue;
+        }
+        out.push((target, kind));
+    }
+    (out, pending)
+}
+
 fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {
     let Some(bytes) = with_host(|h| h.kernel.read_file(&map.path)) else {
         return Vec::new();
@@ -5682,6 +5813,80 @@ pub extern "C" fn gex_page_dump(out: u32, cap: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_adopt_page(page: i64, entry: u32) {
     with_host(|h| h.jit.page_table.assign(page as u64, entry));
+}
+
+/// How many pages the identity map answers for.
+///
+/// The page table says where *this* process's translated pages are; the
+/// identity map says which pages of which mapped object those slots hold
+/// code for, and it is the only one of the two that survives an `execve`.
+/// See [`gex_shared_dump`] for why the child needs it.
+#[no_mangle]
+pub extern "C" fn gex_shared_count() -> u32 {
+    with_host(|h| h.jit.shared.len() as u32)
+}
+
+/// Write the identity map to `out`: a `u64` page, a `u64` key and a `u32`
+/// base, twenty bytes each, returning how many were written. -1 if `cap` will
+/// not hold them.
+///
+/// A forked child adopts the parent's page table, which is what stops it
+/// translating a page the inherited directory already points at. But `execve`
+/// throws that table away -- it must, because the addresses in it describe
+/// the image being replaced -- and the identity map is what would have said
+/// that the slots it just discarded still hold libc, mapped from the same
+/// file at the same offset, and answer perfectly well for the new image's
+/// copy of it. A child that arrives without the map has no way to know that,
+/// so every `fork`+`execve` -- which is every command a shell runs --
+/// re-translated the whole of libc into fresh slots.
+///
+/// Handed over as identities rather than as page assignments because that is
+/// what makes it safe to give to a process that is *not* a copy of this one:
+/// the key names the object, the offset in it and its size, so a page that
+/// holds different code has a different key, and the miss path that reads
+/// this compares the key against what the receiving process has actually
+/// mapped before it believes a word of it.
+#[no_mangle]
+pub extern "C" fn gex_shared_dump(out: u32, cap: u32) -> i32 {
+    with_host(|h| {
+        let n = h.jit.shared.len();
+        if (n * 20) as u32 > cap {
+            return -1;
+        }
+        let dst = shim_slice_mut(out, (n * 20) as u32);
+        for (i, ((page, key), base)) in h.jit.shared.iter().enumerate() {
+            dst[i * 20..i * 20 + 8].copy_from_slice(&page.to_le_bytes());
+            dst[i * 20 + 8..i * 20 + 16].copy_from_slice(&key.to_le_bytes());
+            dst[i * 20 + 16..i * 20 + 20].copy_from_slice(&base.to_le_bytes());
+        }
+        n as i32
+    })
+}
+
+/// Take the identity map from the process this one was forked from.
+///
+/// `count` records in the layout [`gex_shared_dump`] writes. Recorded rather
+/// than overwritten, like every other way this map is filled: a page that
+/// already has an owner in this process keeps it, because code already
+/// emitted names whichever base it was given.
+#[no_mangle]
+pub extern "C" fn gex_shared_seed(ptr: u32, count: u32) -> u32 {
+    let src = shim_slice(ptr, count.saturating_mul(20));
+    with_host(|h| {
+        let mut n = 0u32;
+        for r in src.chunks_exact(20) {
+            let page = u64::from_le_bytes(r[0..8].try_into().unwrap());
+            let key = u64::from_le_bytes(r[8..16].try_into().unwrap());
+            let base = u32::from_le_bytes(r[16..20].try_into().unwrap());
+            if let std::collections::hash_map::Entry::Vacant(v) =
+                h.jit.shared.entry((page, key))
+            {
+                v.insert(base);
+                n += 1;
+            }
+        }
+        n
+    })
 }
 
 /// Slots one dispatch table holds, so the glue knows where each one ends.

@@ -107,6 +107,7 @@ fn main() {
             Default::default(),
             max_blocks,
             false,
+            &Default::default(),
         );
         println!(
             "{} blocks in {} module(s), {:.2}s",
@@ -138,6 +139,7 @@ fn main() {
         Default::default(),
         max_blocks,
         false,
+        &Default::default(),
     );
     println!(
         "{} blocks, {} instructions, {} KiB of wasm, in {:.2}s",
