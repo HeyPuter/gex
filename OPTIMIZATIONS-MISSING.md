@@ -288,6 +288,42 @@ Recorded in the code so this list is not read as 71 open opportunities.
 
 ---
 
+# What a block boundary actually costs, measured
+
+Added 2026-08-09. `gexc build` now reports this, and did not before: the
+counters behind it were `thread_local!` and the blocks are compiled on a
+pool, so every count landed on a worker thread and the main thread printed
+its own, which was zero. The "19-20% register traffic" quoted throughout
+this file came from somewhere else; this is the first time the build has
+measured it.
+
+    gzip     18% registers,  7% safepoints,  5% dispatch  (31% of the module)
+    nbench   16% registers,  5% safepoints,  4% dispatch  (25%)
+    bash     18% registers,  9% safepoints,  7% dispatch  (34%)
+
+**This reorders the list below.** A return-address stack and inline caches
+(sections 21-23) are ranked second here and attack the 4-7%. The 16-18% is
+the flush, and the mechanism that already avoids it -- regions -- covers 149
+of gzip's 15,338 blocks, 366 of nbench's 27,594 and 1,155 of bash's 211,979.
+About one percent, and `region.rs` records four separate attempts at more
+coverage that all measured worse.
+
+Bytes are not seconds. A dispatch byte carries an indirect call and a
+directory load and may cost more at run time than a `local.set`. But 4-7% of
+emitted code is a ceiling on what deleting dispatch entirely could save.
+
+`GEX_REG_HISTOGRAM` works now too, and says what the 18% is made of on gzip:
+
+    X0 12.8%  X1 9.0%  X2 6.7%  X30 5.8%  Sp 5.0%  X19 4.6%  X3 4.4%
+    Z 4.3%    C 3.4%   N 3.1%   V 3.1%
+
+The four condition flags together are **13.9%** -- more than any register but
+X0, and that is *after* the `cmp`+`b.cond` fusion, which removes the reads
+but not the writes. They are four separate `i32` slots in the context,
+stored and loaded one at a time, which is section 5 below. Packing them is a
+representation change with no ABI question in it, and it is the largest
+single item this measurement exposes.
+
 # Ranked by expected value
 
 1. **`cmp`+`b.cond` fusion** (§1–4) — largest pure-codegen win, touches every
