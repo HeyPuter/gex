@@ -48,7 +48,8 @@ export class Env {
    * parent's mapped memory as `{ at, bytes }` records. A host implements this
    * by making a `WebAssembly.Memory`, writing every record into it,
    * instantiating the shim and guest module against it, calling
-   * `gex_adopt_child(pid, ctx, pc, sp, tls)` and entering at what it returns.
+   * `gex_adopt_child(pid, ctx, pc, sp, tls, brk)` and entering at what it
+   * returns.
    *
    * There is no default, because the answer differs by host -- a page makes a
    * Worker, Node makes a `worker_thread` -- and because a silent default here
@@ -60,6 +61,21 @@ export class Env {
       `this environment cannot start guest process ${child.pid}: no spawnProcess`,
     );
   }
+
+  /**
+   * Start a guest thread the guest itself cloned.
+   *
+   * `thread` is `{ tid, ctx, pc, memory }`. A host implements this by making
+   * a Worker, constructing a `Gex` on the *same* memory, and calling
+   * `adoptThread`. Nothing is copied: that is the difference between this and
+   * `spawnProcess`, and the reason a thread needs a shared memory and a
+   * process does not.
+   *
+   * Declared here and deliberately not defined: a class *field* is set on
+   * the instance at construction and would shadow a subclass's method of the
+   * same name, which is how `WorkerEnv.spawnThread` came to be invisible to
+   * the very code looking for it. `Gex` asks whether the method exists.
+   */
 }
 
 /**
@@ -133,6 +149,8 @@ export class Gex {
   // Null is a run of one process, which needs none of that.
   #kernelSpec = null;
   #kernel = null;
+  // This Worker's shim stack, claimed on the way in. See `#workerStack`.
+  #stackTop = null;
 
   /**
    * `shared` asks for a SharedArrayBuffer, which needs the shim and guest
@@ -153,6 +171,30 @@ export class Gex {
     this.#memory =
       memory ?? new WebAssembly.Memory({ initial: PAGES, maximum: PAGES, shared });
     this.#kernelSpec = kernel;
+  }
+
+  /**
+   * Where this Worker's shim stack goes.
+   *
+   * A wasm global belongs to an instance, so every Worker has a stack pointer
+   * of its own -- and pointing all of them at the same address is fine right
+   * up until two Workers share a memory, which is what a thread is. The
+   * shared build hands out a stack and a thread-local block per Worker;
+   * `gex_worker_init` claims a pair and answers with the stack.
+   *
+   * The plain build has no such export and needs none: one Worker, one
+   * memory, one stack.
+   */
+  #workerStack() {
+    // Claimed once and remembered. This is asked again after every trap --
+    // the stack pointer has to go back to the top, because a trap abandons
+    // the stack rather than unwinding it -- and claiming a fresh slot each
+    // time would exhaust sixty-four of them in the first second of a run.
+    if (this.#stackTop === null) {
+      const at = this.#shim.exports.gex_worker_init?.();
+      this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
+    }
+    return this.#stackTop;
   }
 
   get memory() { return this.#memory; }
@@ -261,6 +303,14 @@ export class Gex {
       gex_k: this.#kernelImports(),
     });
     this.#u8 = new Uint8Array(this.#memory.buffer);
+    // First, before any call into the shim.
+    //
+    // `gex_worker_init` is what gives this Worker its own thread-local block,
+    // and until it has run `__tls_base` is zero -- so a shim function that
+    // touches a thread-local before it writes through a null base, into the
+    // bottom of the guest's address space, which is where the register
+    // contexts live. Every call below is such a function.
+    this.#shim.exports.__stack_pointer.value = this.#workerStack();
     // A shim older than this file still loads and still instantiates, and
     // then fails on the first call to something it does not have -- which
     // surfaces as `e.gex_paused_for_net is not a function` at the moment the
@@ -289,7 +339,7 @@ export class Gex {
     // wasm-ld puts the shim's stack at address zero regardless of
     // --global-base, which is the guest's image. Move it into the shim's own
     // region, above everything the guest maps. Nothing has run yet.
-    this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
+    this.#shim.exports.__stack_pointer.value = this.#workerStack();
     this.#opts = { strace: opts.strace, tty: opts.tty, uid: opts.uid, gid: opts.gid };
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
     // A terminal changes how libc buffers and whether a shell prints a
@@ -392,7 +442,7 @@ export class Gex {
     // instance rather than to the memory -- so every Worker has its own and
     // every Worker has to be told where it goes. Two threads sharing one stack
     // is the thing this design exists to avoid.
-    this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
+    this.#shim.exports.__stack_pointer.value = this.#workerStack();
     // The devices this process has, which `load` sets from the same fields.
     // Before the kernel is built, because that is when the device nodes are
     // made and the vtest socket is bound: a forked child told about its GPU
@@ -638,15 +688,31 @@ export class Gex {
     step('copying the image');
     const u8 = new Uint8Array(this.#memory.buffer);
     for (const r of child.image) u8.set(new Uint8Array(r.bytes), r.at);
-    step('instantiating');
+    // How much of the context survives each step. A child that enters at zero
+    // arrived with a context of zeros, and the only question worth asking is
+    // which of the three steps below emptied it.
+    const live = () => {
+      let n = 0;
+      const at = Number(child.ctx);
+      for (let i = at; i < at + 512; i++) if (u8[i]) n++;
+      return n;
+    };
+    step(`image copied, ${live()} non-zero bytes in the context`);
     await this.attach(shimWasm, guestWasm);
-    step('adopting');
+    step(`instantiated, ${live()} non-zero bytes in the context`);
     const e = this.#shim.exports;
     // Before the kernel is built, not after: the metadata is what the child's
     // dispatch table starts from, and `gex_adopt_child` reads it as it builds.
     this.#setMetadata(guestWasm);
-    const entry = e.gex_adopt_child(child.pid, child.ctx, child.pc, child.sp, child.tls);
-    step('kernel built');
+    const entry = e.gex_adopt_child(
+      child.pid,
+      child.ctx,
+      child.pc,
+      child.sp,
+      child.tls,
+      child.brk ?? 0n,
+    );
+    step(`kernel built, entry 0x${entry.toString(16)}, ${live()} non-zero bytes in the context`);
     // The kernel exists now, so everything that configures one can be said.
     const o = child.opts ?? {};
     this.#opts = o;
@@ -691,6 +757,48 @@ export class Gex {
    * and Node disagree -- so all that happens here is describing the process
    * that needs one.
    */
+  /**
+   * Hand the host any thread `clone` has just made.
+   *
+   * A thread is not a process: nothing is copied, because everything it has
+   * -- the memory, the kernel inside it, the file table, the thread table --
+   * is already there and shared. All that crosses is which entry of the
+   * thread table the new Worker is to run.
+   *
+   * Only ever non-empty when the shim has been told its threads get Workers,
+   * which needs a shared memory; otherwise `clone` schedules on this stack
+   * as it always did and there is nothing here to drain.
+   */
+  async #drainThread() {
+    const e = this.#shim.exports;
+    if (!e.gex_thread_pending) return;
+    const tid = e.gex_thread_pending();
+    if (!tid) return;
+    const thread = { tid, ctx: e.gex_thread_ctx(), pc: e.gex_thread_pc(), memory: this.#memory };
+    e.gex_thread_taken();
+    if (typeof this.#env.spawnThread !== 'function') {
+      throw new Error(
+        `the guest started thread ${tid} and this environment cannot run one. ` +
+          'Give the Env a `spawnThread`, or the thread will never run.',
+      );
+    }
+    await this.#env.spawnThread(thread);
+  }
+
+  /**
+   * Join a process as one of its threads, and say where to enter.
+   *
+   * The counterpart of `adoptProcess` and much smaller, which is the point: a
+   * process has to be rebuilt from a copy, a thread only has to be pointed at
+   * what is already there.
+   */
+  async adoptThread(shimWasm, guestWasm, thread) {
+    await this.attach(shimWasm, guestWasm);
+    const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
+    if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
+    return entry;
+  }
+
   async #drainFork() {
     const e = this.#shim.exports;
     if (!e.gex_fork_pending) return;
@@ -702,6 +810,10 @@ export class Gex {
       ctx: e.gex_fork_ctx(),
       sp: e.gex_fork_sp(),
       tls: e.gex_fork_tls(),
+      // Where the parent's heap had reached. The bytes come over in the
+      // image; without the number the child's kernel believes it has no heap
+      // and grows one from address zero, over its own register contexts.
+      brk: e.gex_fork_brk?.() ?? 0n,
       image: this.#processImage(),
       // The map from a guest page to the dispatch slots its blocks are in,
       // and the modules those slots point into. Neither is in the memory --
@@ -726,6 +838,16 @@ export class Gex {
         : null,
     };
     e.gex_fork_taken();
+    if (globalThis.GEX_DEBUG_EXIT) {
+      // The record as it leaves, not as the child reports it. A child that
+      // enters at zero was either handed a zero or lost it on the way, and
+      // those are different bugs in different files.
+      console.error(
+        `[gex] fork -> pid ${child.pid} pc=0x${child.pc.toString(16)} ` +
+          `ctx=0x${child.ctx.toString(16)} sp=0x${child.sp.toString(16)} ` +
+          `${child.image.length} regions, ${child.modules.length} modules`,
+      );
+    }
     if (!this.#env.spawnProcess) {
       throw new Error(
         `the guest forked pid ${pid} and this environment cannot start a process. ` +
@@ -796,7 +918,13 @@ export class Gex {
    */
   useNetwork(net) {
     this.#net = net;
-    this.#shim.exports.gex_set_network(net ? 1 : 0);
+    // Before the shim exists as well as after, which is when a forked child
+    // is told: a Worker is given its devices between construction and
+    // `adoptProcess`, and `load` and `attach` both set this from `#net` on
+    // their way through. Reaching for the exports unconditionally made a
+    // child with a network fail with `Cannot read properties of undefined`
+    // before it ran an instruction.
+    this.#shim?.exports?.gex_set_network?.(net ? 1 : 0);
   }
 
   /**
@@ -922,7 +1050,7 @@ export class Gex {
         // the top of the guest's own stack, where it overwrote saved
         // registers: a thread would return through a link register holding
         // an address out of the shim's heap.
-        this.#shim.exports.__stack_pointer.value = SHIM_STACK_TOP | 0;
+        this.#shim.exports.__stack_pointer.value = this.#workerStack();
         const e = this.#shim.exports;
         // Drained, not taken one at a time. Statically recompiling a whole
         // object emits as many modules as it needs -- a wasm module holds a
@@ -935,6 +1063,7 @@ export class Gex {
         // and before the memory is touched again, because what the child gets
         // is a copy of it as `fork` left it.
         await this.#drainFork();
+        await this.#drainThread();
         const next = e.gex_resume_pc();
         if (next !== 0n) {
           pc = next;
@@ -1051,7 +1180,22 @@ export class Gex {
           // wasm stack. `enter` never returns in that case, so this is the
           // path a finished program actually takes.
           if (globalThis.GEX_DEBUG_EXIT) {
-            console.error(`[gex] run ended: shim trapped out, code ${e.gex_exit_code()}`);
+            // With where it was, because this path is taken by a program that
+            // finished *and* by one that crashed with no status set -- and
+            // those look identical otherwise. apt's forked helper came
+            // through here as "code 0" while apt sat reading the pipe it
+            // never wrote to.
+            const say = (fn, f) => {
+              try {
+                return fn ? f(fn()) : '';
+              } catch {
+                return '';
+              }
+            };
+            const where =
+              say(e.gex_current_pc, (pc) => `, pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}`) +
+              say(e.gex_last_syscall, (n) => (n === 0xffffffff ? '' : `, in syscall ${n}`));
+            console.error(`[gex] run ended: shim trapped out, code ${e.gex_exit_code()}${where}`);
           }
           return e.gex_exit_code();
         }

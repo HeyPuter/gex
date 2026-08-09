@@ -36,6 +36,7 @@ export class ProcessHost {
   #pending = new Map();
   #first = null;
   #forked = 0;
+  #threads = 0;
   // The global kernel's per-Worker stacks, as the first Worker reported them,
   // and how many have been handed out.
   //
@@ -45,6 +46,13 @@ export class ProcessHost {
   // Workers in the kernel writing their locals over each other.
   #stacks = null;
   #stacksTaken = 0;
+  // Slices handed back by Workers that have ended, and which slice each live
+  // Worker holds. A run that starts a hundred short-lived threads uses as
+  // many slices as it has threads *at once*, not as many as it ever made --
+  // without which a pthread program exhausted the array while it was still
+  // starting up.
+  #stacksFree = [];
+  #stackOf = new Map();
 
   constructor({
     makeWorker,
@@ -76,6 +84,9 @@ export class ProcessHost {
 
   /** How many children the guest has forked. */
   get forked() { return this.#forked; }
+
+  /** How many threads its processes have started in Workers of their own. */
+  get threads() { return this.#threads; }
 
   /** Every live process, by pid. Pid 1 is the one `start` was given. */
   get pids() { return [...this.#workers.keys()]; }
@@ -150,12 +161,18 @@ export class ProcessHost {
    * first -- which keeps the stack the module was linked with, and is the one
    * that reports where the array is.
    */
-  #nextKernelStack() {
+  #nextKernelStack(key) {
     if (!this.#stacks) return undefined;
+    const reuse = this.#stacksFree.pop();
+    if (reuse !== undefined) {
+      this.#stackOf.set(key, reuse);
+      return this.#stacks.area + reuse * this.#stacks.size;
+    }
     // Slice 0 belongs to nobody: the first Worker is already using the
     // linked-in stack, and leaving a gap costs half a megabyte of address
     // space in a memory that has a gigabyte of it.
     const n = ++this.#stacksTaken;
+    this.#stackOf.set(key, n);
     if (n >= this.#stacks.count) {
       throw new Error(
         `the global kernel has ${this.#stacks.count} stacks and this is Worker ${n + 1}. ` +
@@ -163,6 +180,17 @@ export class ProcessHost {
       );
     }
     return this.#stacks.area + n * this.#stacks.size;
+  }
+
+  /** A Worker has ended: stop it, and put its kernel stack back. */
+  #release(key, w) {
+    this.#workers.delete(key);
+    const slice = this.#stackOf.get(key);
+    if (slice !== undefined) {
+      this.#stackOf.delete(key);
+      this.#stacksFree.push(slice);
+    }
+    w.terminate();
   }
 
   #onMessage(pid, w, m, resolve, reject) {
@@ -174,7 +202,7 @@ export class ProcessHost {
           w.postMessage({
             ...this.#extra,
             ...msg,
-            kernelStack: this.#nextKernelStack(),
+            kernelStack: this.#nextKernelStack(pid),
             shim: this.#shim,
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
@@ -197,6 +225,41 @@ export class ProcessHost {
           this.#onOutput(2, `gex: process ${m.child.pid} failed: ${e.message}\n`, pid);
         });
         break;
+      case 'thread': {
+        // A thread of a process that is already running: same memory, same
+        // kernel, a Worker of its own. Nothing waits for it -- a thread ends
+        // when it ends, and its process is what the caller asked about.
+        this.#threads++;
+        const key = `${pid}:${m.thread.tid}`;
+        const w2 = this.#makeWorker();
+        this.#workers.set(key, w2);
+        // Keyed by the thread, so that when it ends the right Worker is
+        // stopped and the right kernel stack goes back on the free list.
+        const deliver = (mm) => this.#onMessage(key, w2, mm, () => {}, () => {});
+        w2.addEventListener?.('message', (e) => deliver(e.data));
+        w2.on?.('message', deliver);
+        this.#pending.set(key, { kind: 'thread', ...m.thread });
+        // `ready` arrives keyed by the *process*, so the start message is
+        // looked up by pid. A thread's is keyed by tid, so it is handed over
+        // here instead, once.
+        const start = (mm) => {
+          if (mm?.kind !== 'ready') return;
+          this.#pending.delete(key);
+          w2.postMessage({
+            ...this.#extra,
+            kind: 'thread',
+            tid: m.thread.tid,
+            memory: m.thread.memory,
+            kernelStack: this.#nextKernelStack(key),
+            shim: this.#shim,
+            guest: this.#guest,
+            kernel: this.#kernel ?? undefined,
+          });
+        };
+        w2.addEventListener?.('message', (e) => start(e.data));
+        w2.on?.('message', start);
+        break;
+      }
       case 'stdin': {
         // Only pid 1 has a terminal behind it; a child that reads standard
         // input reads the descriptor it inherited, which is the kernel's
@@ -212,13 +275,11 @@ export class ProcessHost {
         break;
       }
       case 'exit':
-        this.#workers.delete(pid);
-        w.terminate();
+        this.#release(pid, w);
         resolve(m.status);
         break;
       case 'threw':
-        this.#workers.delete(pid);
-        w.terminate();
+        this.#release(pid, w);
         reject(new Error(m.message));
         break;
       default:

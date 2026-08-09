@@ -111,7 +111,7 @@ async function handle(msg) {
     stdinWaiter = null;
     return;
   }
-  if (msg?.kind !== 'run' && msg?.kind !== 'adopt') return;
+  if (msg?.kind !== 'run' && msg?.kind !== 'adopt' && msg?.kind !== 'thread') return;
 
   // Everything the guest writes goes back to whoever started this. Posted
   // rather than accumulated: a run that takes minutes should say what it is
@@ -156,6 +156,13 @@ async function handle(msg) {
     async spawnProcess(child) {
       port.post({ kind: 'fork', child });
     }
+    // And a thread, which carries the memory rather than a copy of it. A
+    // shared `WebAssembly.Memory` crosses a `postMessage` as itself, so the
+    // Worker on the other side is on this process's address space and not on
+    // a picture of it.
+    async spawnThread(thread) {
+      port.post({ kind: 'thread', thread });
+    }
   }
 
   if (msg.debugExit) globalThis.GEX_DEBUG_EXIT = 1;
@@ -164,6 +171,11 @@ async function handle(msg) {
   // with and is the one that reads the numbers out for everybody else.
   const gex = new Gex(new WorkerEnv(), {
     kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,
+    // A thread joins the memory its process already has; a process makes one.
+    // `shared` only matters for the second case, and only decides whether the
+    // memory this Worker builds can have threads of its own later.
+    memory: msg.memory ?? null,
+    shared: !!msg.shared,
   });
 
   // The guest's GPU. The renderer is where the canvas is -- the page -- and
@@ -183,6 +195,13 @@ async function handle(msg) {
   // the proxy rather than relaying through the page: a socket is per process
   // on a real machine too, and a relay would put the page in the path of
   // every byte a download takes.
+  // The Node fast lane's network: real TCP sockets rather than Wisp. Same
+  // seven calls, so everything above them -- apt's helper, the fetch, the
+  // parse -- is exercised here in two minutes instead of twenty.
+  if (msg.network) {
+    const { NodeNetwork } = await import('./net-node.mjs');
+    gex.useNetwork(new NodeNetwork());
+  }
   if (msg.wispUrl) {
     // The site's, because it is built on a Wisp client the site depends on
     // and this directory has no dependencies at all. Imported only when a
@@ -193,7 +212,9 @@ async function handle(msg) {
   }
   try {
     let entry;
-    if (msg.kind === 'adopt') {
+    if (msg.kind === 'thread') {
+      entry = await gex.adoptThread(msg.shim, msg.guest, msg);
+    } else if (msg.kind === 'adopt') {
       entry = await gex.adoptProcess(msg.shim, msg.guest, msg.child);
     } else {
       entry = await gex.load(
@@ -213,6 +234,13 @@ async function handle(msg) {
     // For a forked child too: it inherits its parent's *translated* code, but
     // the first thing a shell's child does is `execve`, and what it maps then
     // has never been seen by anyone.
+    // Threads of this process become Workers, when the memory allows it.
+    // Told rather than guessed: the shim cannot see whether its memory is a
+    // `SharedArrayBuffer`, and a `clone` staged for a host that cannot start
+    // a Worker is a thread that never runs.
+    if (msg.shared || msg.kind === 'thread') {
+      gex.shim.exports.gex_set_thread_workers?.(1);
+    }
     const recompile = msg.opts?.recompileObjects ?? msg.recompileObjects;
     if (recompile) {
       gex.shim.exports.gex_set_recompile_objects?.(recompile);

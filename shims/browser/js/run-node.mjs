@@ -173,6 +173,12 @@ async function spawnChild(child, guestWasm) {
         kernelStack: kernelStacks
           ? kernelStacks.area + ++kernelStacksTaken * kernelStacks.size
           : undefined,
+        // A child inherits its parent's network, as it does on Linux. It was
+        // not carried, and apt is the program that notices: it does its
+        // fetching in a forked helper, so the process that needed a network
+        // was the only one without one. `Temporary failure resolving
+        // 'deb.debian.org'` is what a resolver says when `socket` fails.
+        network: !!process.env.GEX_NETWORK,
         debugExit: !!process.env.GEX_DEBUG_EXIT,
       });
     } else if (m.kind === 'output') {

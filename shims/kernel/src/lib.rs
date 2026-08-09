@@ -53,10 +53,15 @@ pub const STACK_BYTES: u32 = 256 * 1024;
 /// As many as there are guest processes plus their threads.
 ///
 /// It is not free: `.bss` counts towards the module's *declared* initial
-/// memory, so this is eight megabytes a host must provide before the kernel
-/// will link at all. Thirty-two is past what a page will run and still small
-/// enough that the number is not the reason a memory has to be big.
-pub const STACK_COUNT: u32 = 32;
+/// memory, so every slice here is memory a host must provide before the
+/// kernel will link at all.
+///
+/// A hundred and twenty-eight, because threads made thirty-two too few
+/// straight away: a program with eight workers and a few detached ones
+/// exhausted them before it had finished starting. The host hands a slice
+/// back when a Worker ends, so this bounds what runs *at once* rather than
+/// what a run may ever start.
+pub const STACK_COUNT: u32 = 128;
 static mut STACKS: [u8; (STACK_BYTES * STACK_COUNT) as usize] =
     [0; (STACK_BYTES * STACK_COUNT) as usize];
 
