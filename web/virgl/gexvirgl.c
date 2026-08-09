@@ -186,6 +186,12 @@ static int gex_presented;
  * costs four words and turns a day of guessing into a glance. */
 static int gex_present_no_info, gex_present_no_tex, gex_present_small,
     gex_present_incomplete, gex_present_no_handle;
+/* Presents whose source texture had a pixel in it, and the brightest byte
+ * ever seen. `presented` counts blits, which is not the same thing: a
+ * renderer that draws nothing still blits, and the canvas stays black while
+ * every counter says the frame arrived. This is what tells those apart. */
+static int gex_lit;
+static int gex_brightest;
 static uint32_t gex_present_last_w, gex_present_last_h;
 
 static void gex_present(uint32_t handle) {
@@ -222,6 +228,20 @@ static void gex_present(uint32_t handle) {
     if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDisable(GL_SCISSOR_TEST);
+        /* A look at what is about to be blitted, from the middle of it. Four
+         * hundred pixels is enough to tell a picture from a black rectangle
+         * and small enough to cost nothing at thirty frames a second. */
+        unsigned char px[20 * 20 * 4];
+        GLint sx = (GLint)info.width / 2 - 10, sy = (GLint)info.height / 2 - 10;
+        if (sx < 0) sx = 0;
+        if (sy < 0) sy = 0;
+        glReadPixels(sx, sy, 20, 20, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        for (size_t i = 0; i < sizeof px; i += 4) {
+            int v = px[i] > px[i + 1] ? px[i] : px[i + 1];
+            if (px[i + 2] > v) v = px[i + 2];
+            if (v > gex_brightest) gex_brightest = v;
+        }
+        if (gex_brightest > 8) gex_lit++;
         glBlitFramebuffer(0, 0, (GLint)info.width, (GLint)info.height,
                           0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         gex_presented++;
@@ -517,8 +537,9 @@ const char *gex_virgl_gl_state(void) {
     }
     snprintf(out, sizeof out,
              "draw_fbo=%d read_fbo=%d viewport=%d,%d,%dx%d fbo_status=0x%x gl_error=0x%x "
-             "presented=%d",
-             draw_fbo, read_fbo, vp[0], vp[1], vp[2], vp[3], status, err, gex_presented);
+             "presented=%d lit=%d brightest=%d",
+             draw_fbo, read_fbo, vp[0], vp[1], vp[2], vp[3], status, err, gex_presented,
+             gex_lit, gex_brightest);
     return out;
 }
 

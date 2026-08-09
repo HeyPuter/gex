@@ -74,12 +74,17 @@ const DEMOS = {
     // break, so a summary wide enough to wrap splits `presented=7` across
     // two rows and a pattern that spans it never matches -- a run that drew
     // and presented sat there until the wall clock.
+    // `lit`, not `presented`. A blit happens whether or not there was
+    // anything in the frame, so `presented` counts arrivals at the canvas and
+    // says nothing about what arrived -- which is how a run that drew nothing
+    // at all passed while the canvas was black. `lit` counts the blits whose
+    // source texture had a pixel in it.
     want: (t) =>
       /frames in [\d.]+ seconds/.test(t) &&
-      Number(/presented=(\d+)/.exec(t.replace(/\s+/g, ''))?.[1]) > 0,
+      Number(/lit=(\d+)/.exec(t.replace(/\s+/g, ''))?.[1]) > 0,
     // No `settle`: a run that finishes having presented nothing is the exact
     // failure this is for, and a status of `finished` would call it a pass.
-    fail: (t) => /presented=0(?!\d)/.test(t.replace(/\s+/g, '')),
+    fail: (t) => /lit=0(?!\d)/.test(t.replace(/\s+/g, '')),
   },
 };
 

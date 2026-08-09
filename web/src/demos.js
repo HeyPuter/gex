@@ -492,7 +492,17 @@ const virglGears = {
         // server reads its pixels back and never looks at a screen -- so a
         // run can draw perfectly with a blank canvas, and this says which
         // happened.
-        ctx.term.writeln(ctx.ansi.dim(`  ${renderer.glState()}`));
+        const gl = renderer.glState();
+        // The three numbers that say whether anything was drawn, on a line
+        // short enough to survive the terminal's wrapping. `presented` counts
+        // blits; `lit` counts blits whose source had a pixel in it. A run
+        // where those differ is a black canvas with every other counter
+        // saying the frame arrived.
+        const nums = ['presented', 'lit', 'brightest']
+          .map((k) => `${k}=${/=(\d+)/.exec(gl.slice(gl.indexOf(k)))?.[1] ?? '?'}`)
+          .join(' ');
+        ctx.term.writeln(ctx.ansi.dim(`  ${nums}`));
+        ctx.term.writeln(ctx.ansi.dim(`  ${gl}`));
         ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
       } catch (e) {
         ctx.term.writeln(ctx.ansi.red(`\r\n${e.message}`));
