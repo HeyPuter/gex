@@ -1326,10 +1326,57 @@ a 678 MB module, which is load rather than run, and load is not what this
 project is optimising. What is comparable is the work removed, and it is
 nearly all of it.
 
-The 12,576 that remain are the interesting number now. They are what the
-closure does not cover, and they are covered by the same mechanism: apt-get's
-closure is built from *apt-get's* `DT_NEEDED`, and its methods need objects
-apt-get does not -- libseccomp for the sandbox, libselinux, libpcre2. A
-closure built from the union of the executable's closure and its helpers'
-would take that towards zero. `gexc closure` already answers the question per
-binary; nothing yet merges the answers.
+The 12,576 that remain are the interesting number now.
+
+### The union closure, and why it did not help
+
+The obvious explanation for those 12,576 was that apt-get's closure is built
+from *apt-get's* `DT_NEEDED`, and its methods need objects apt-get does not.
+`gexc build --closure --with PATH` was built to test it: several roots, one
+placement, one deduplicated set.
+
+It found exactly one missing library -- `libseccomp`, for the methods'
+sandbox -- and rebuilding with it changed nothing:
+
+    closure of apt-get alone          12,576 blocks over ten processes
+    closure of apt-get + its methods  12,540 blocks over ten processes
+
+So the hypothesis was wrong, and the per-process figures say what is actually
+left:
+
+    pid 1  apt-get        0        <- the closure covers it completely
+    pid 2  dpkg       2,004
+    pid 3               269
+    pid 4             1,812
+    pid 5               233
+    pid 6             1,784
+    pid 7               448
+    pid 8             2,024
+    pid 9             1,983
+    pid 10            1,983
+
+Every one of those is an *executable's own text*. pid 1 is the only process
+running a program the closure has an image module for; every other process
+has `execve`d something else -- dpkg, or a method -- and is lifting its
+`.text` from cold. The libraries are all covered; the programs are not.
+
+That is a design limit rather than an oversight, and it is worth stating
+where it comes from. The closure has one image module, at `PIE_BASE`, chosen
+when the process is loaded. A helper is a separate executable that wants that
+same base, so it cannot simply be another object in the set: two objects at
+`PIE_BASE` and the second one's dispatch entries land on the first one's
+pages. `--with` therefore takes a helper's *libraries* and not the helper.
+
+Closing it needs one of two things, and both are real features:
+
+- **Place executables like libraries.** They are PIE, so they can go anywhere;
+  what stops it is that gex's loader puts the executable at `PIE_BASE` itself
+  rather than through `mmap`, so a pin does not reach it -- the same reason
+  `ld.so` had to be special-cased.
+- **Swap the image module at `execve`.** The host instantiates one guest
+  module per process; letting a process adopt a different prebuilt image when
+  it execs is the general answer, and also what would let a closure cover a
+  whole shell session rather than one program.
+
+Worth the effort at roughly 12,000 blocks against 281,254 -- a twentieth of
+what is already saved -- but not before the run is confirmed end to end.
