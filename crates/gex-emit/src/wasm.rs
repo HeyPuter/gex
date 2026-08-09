@@ -403,6 +403,9 @@ pub enum ImportKind {
         min: u64,
         max: u64,
         shared: bool,
+        /// The index type is `i64`, so an address is a guest address and
+        /// the engine bounds-checks it directly. See `tier1::emit_address`.
+        memory64: bool,
     },
     /// A funcref table with the given minimum size.
     Table {
@@ -502,7 +505,12 @@ impl Module {
         self.imports.push(Import {
             module: module.to_string(),
             name: name.to_string(),
-            kind: ImportKind::Memory { min, max, shared },
+            kind: ImportKind::Memory {
+                min,
+                max,
+                shared,
+                memory64: crate::tier1::memory64_enabled(),
+            },
         });
     }
 
@@ -609,11 +617,25 @@ impl Module {
                         s.push(0x00);
                         write_u32(&mut s, *ty);
                     }
-                    ImportKind::Memory { min, max, shared } => {
+                    ImportKind::Memory {
+                        min,
+                        max,
+                        shared,
+                        memory64,
+                    } => {
                         s.push(0x02);
-                        // A shared memory must declare a maximum, and says so
-                        // with bit 1 of the limits flags.
-                        s.push(if *shared { 0x03 } else { 0x01 });
+                        // Limits flags: bit 0 says a maximum follows, bit 1
+                        // shared, bit 2 that the index type is `i64`. A
+                        // shared memory must declare a maximum, and both of
+                        // the other two are independent of that.
+                        let mut flags = 0x01;
+                        if *shared {
+                            flags |= 0x02;
+                        }
+                        if *memory64 {
+                            flags |= 0x04;
+                        }
+                        s.push(flags);
                         write_u64(&mut s, *min);
                         write_u64(&mut s, *max);
                     }

@@ -557,6 +557,7 @@ impl ModuleBuilder {
             let gir: HashMap<u64, &Block> =
                 self.pending.iter().map(|(b, _)| (b.start, b)).collect();
             let cx = tier1::Context {
+                memory64: tier1::memory64_enabled(),
                 syscall: self.imports.syscall,
                 illegal: self.imports.illegal,
                 breakpoint: self.imports.breakpoint,

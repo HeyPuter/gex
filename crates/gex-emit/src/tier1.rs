@@ -88,6 +88,19 @@ mod code {
     pub const MEMORY_FILL: u32 = 11;
 }
 
+/// Whether the guest memory is 64-bit.
+///
+/// `GEX_MEMORY64=1` while the migration is in progress. It has to agree with
+/// the shim's own target and with the memory JavaScript hands both of them,
+/// so it is a property of the build rather than of one translation, and an
+/// environment switch is the cheapest thing that says so until it becomes a
+/// real option.
+pub fn memory64_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_MEMORY64").is_some())
+}
+
 /// Everything tier-1 needs to know about the module it is emitting into.
 pub struct Context<'a> {
     /// Import index of `gex.syscall`.
@@ -115,6 +128,11 @@ pub struct Context<'a> {
     pub blocks: &'a HashMap<u64, u32>,
     /// Guest address -> the block's GIR, for growing a region around a loop.
     pub gir: &'a HashMap<u64, &'a Block>,
+    /// The guest memory is 64-bit, so a guest address is a memory offset
+    /// with no narrowing and no proof obligation: an address past the end
+    /// is the engine's business, and the trap it raises is the SIGSEGV the
+    /// guard was emitting eight instructions to produce.
+    pub memory64: bool,
 }
 
 /// How many blocks may go into one region. One turns regions off.
@@ -820,11 +838,31 @@ impl<'a> Emitter<'a> {
         // references) and need no guard at all.
         if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
             let ea = c.wrapping_add(offset as u64);
+            if self.cx.memory64 {
+                // No poison and no clamp: an address past the end of the
+                // memory traps by itself, which is the outcome the poison
+                // page was arranged to produce.
+                self.f.i64_const(ea as i64);
+                return 0;
+            }
             if ea < GUEST_LIMIT {
                 self.f.i32_const(ea as i32);
                 return 0;
             }
             self.f.i32_const(POISON_ADDR as i32);
+            return 0;
+        }
+        // A 64-bit memory takes the guest address as it stands. This is the
+        // whole of the memory64 win: the eight instructions below become
+        // none, on every load and store whose address is not a constant.
+        if self.cx.memory64 {
+            if (0..=u32::MAX as i64).contains(&offset) {
+                self.push(addr);
+                return offset as u32;
+            }
+            self.push(addr);
+            self.f.i64_const(offset);
+            self.f.byte(0x7c); // i64.add
             return 0;
         }
 
