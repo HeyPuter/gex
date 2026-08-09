@@ -127,3 +127,7 @@ if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | gre
         echo "shims/browser: (if that is 'can't find crate for std', install rust-src)"
     fi
 fi
+
+# And the site, which is a copy of public/ and will otherwise keep serving
+# the shim that was here a moment ago.
+web/refresh-dist.sh

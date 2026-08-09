@@ -52,3 +52,7 @@ RUSTFLAGS="-C link-arg=--import-memory \
 # file that matches the processes it is running.
 node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.wasm env process "" 1
 node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.plain.wasm env process "" 0
+
+# And the site, which is a copy of public/ and will otherwise keep serving
+# the module that was here a moment ago.
+web/refresh-dist.sh
