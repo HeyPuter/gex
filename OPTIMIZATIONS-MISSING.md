@@ -561,6 +561,47 @@ uses a function. The measurement to make next is how much of each object apt
 actually reaches -- if it is a few per cent, the answer is per-function
 recompilation seeded from what the profile already knows, not a bigger cap.
 
+## Reusing a translation across `execve`: built, does not fire
+
+Added 2026-08-09. `apt update` lifts two million blocks across 112 processes
+for a closure of 348,056 -- the same code 5.7 times over, 55.3s of a 224s run
+(commit 0b0194a). The obvious cause is `execve`: the address space is
+replaced, the dispatch directory is cleared and `page_table` is reset, but
+the Worker is the same Worker and its tables still hold every function it
+installed. `shared` already knows which slots a page's code went into. So the
+miss path ought to be able to restore the directory entry and send the branch
+round again instead of lifting into slots that already contain the code.
+
+Built. An `installed` set of `(page, base)` describing the *tables* rather
+than the program, not cleared by `execve`, seeded when a translation
+publishes and again in `gex_adopt_page` so a forked child inherits its
+parent's. A `shortcut` set to take the path at most once per page, since a
+page whose slots are installed but whose particular block was never
+translated would otherwise miss and shortcut forever.
+
+    before   112 processes, 55.3s lifting, 2,000,204 blocks, 224s wall
+    after    112 processes, 55.3s lifting, 1,946,469 blocks, 220s wall
+
+2.7% of the blocks and a wall difference inside this machine's noise.
+Correct -- the substitution suite passes all six including the twenty-process
+loop, and apt completes with `Fetched 14.9 MB in 3min 11s` -- so it is not
+broken, it simply almost never applies. Reverted.
+
+**The prime suspect is the identity key.** `page_identity` names a mapping by
+file, offset and length, and the shortcut needs the key computed after the
+exec to equal the one recorded before it. If a re-mapped library hashes
+differently, `shared.get` misses and every number above follows. Count how
+often that lookup succeeds before building anything else on it.
+
+**And a control worth keeping.** Per-process lifting was unchanged and wall
+clock did not move either. That says the 55.3s is not on the critical path:
+those processes lift concurrently while apt waits on the network. Summing
+per-process translation time and subtracting it from wall clock -- which is
+how "a closure build is worth at least 25%" was derived one commit earlier --
+is not valid when the processes run in parallel. The 55.3s is CPU, and CPU
+matters in a tab with one core to share; it is not four minutes becoming
+three.
+
 ## The indirect-dispatch path is not a cost, and sections 21 and 23 are dead
 
 Added 2026-08-09. Sections 21 and 22 sit at number two on the ranked list --
