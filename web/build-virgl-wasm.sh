@@ -166,6 +166,181 @@ if 'GEX_NO_UNSYNCHRONIZED' not in s:
 #endif''', 1)
     assert 'GEX_NO_UNSYNCHRONIZED' in s, 'the unsynchronized map did not match'
     open(p, 'w').write(s)
+
+# An index buffer of its own, because WebGL will not let one buffer be both.
+#
+# WebGL fixes a buffer's kind at its first bind: a buffer bound to
+# ELEMENT_ARRAY_BUFFER may never be bound to anything else, and one bound to
+# anything else may never be an element buffer. Gallium buffers are typeless,
+# and Mesa's upload manager suballocates vertex *and* index data out of one
+# resource, so the draw path asked for exactly what WebGL forbids:
+#
+#   bindBuffer: element array buffers can not be bound to a different target
+#   vertexAttribPointer: no ARRAY_BUFFER is bound and offset is non-zero
+#   drawElementsInstanced: no buffer is bound to enabled attribute
+#
+# and the draw produced nothing. glxgears ran at thirty frames a second with
+# every frame empty -- `presented=6 lit=0`.
+#
+# So a resource asked to be an index buffer that was not created as one gets a
+# second GL buffer, and the contents are copied into it before the draw.
+# COPY_READ and COPY_WRITE are the one pair WebGL lets either kind bind to,
+# which is what makes the copy expressible at all.
+p = f'{src}/src/vrend_renderer.h'
+s = open(p).read()
+if 'gex_elem_id' not in s:
+    s = s.replace(
+        "   GLuint id;\n   GLenum target;\n",
+        "   GLuint id;\n   GLenum target;\n\n"
+        "   /* A second buffer holding this resource's contents to be drawn as\n"
+        "    * indices. WebGL will not let one buffer be both an element array\n"
+        "    * and anything else; see web/build-virgl-wasm.sh. */\n"
+        "   GLuint gex_elem_id;\n"
+        "   GLsizeiptr gex_elem_size;\n", 1)
+    assert 'gex_elem_id' in s, 'the resource struct did not match'
+    open(p, 'w').write(s)
+
+p = f'{src}/src/vrend_renderer.c'
+s = open(p).read()
+if 'gex_elem_buffer' not in s:
+    s = s.replace(
+        "      glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, res->id);",
+        "      glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gex_elem_buffer(res));", 1)
+    assert 'gex_elem_buffer(res)' in s, 'the indexed draw bind did not match'
+    helper = (
+        "/* Copy between two GL buffers of different kinds, through the CPU.\n"
+        " *\n"
+        " * `glCopyBufferSubData` cannot do it: WebGL refuses a copy whose two\n"
+        " * ends are not both element buffers or both not --\n"
+        " *\n"
+        " *   copyBufferSubData: Cannot copy into an element buffer destination\n"
+        " *   from a non-element buffer source\n"
+        " *\n"
+        " * -- which is the same rule that made the mirror necessary. So the\n"
+        " * bytes come back to the host and go out again. */\n"
+        "static void gex_mirror_copy(GLuint from, GLuint to, GLenum to_target,\n"
+        "                           GLsizeiptr size)\n"
+        "{\n"
+        "   static void *scratch;\n"
+        "   static GLsizeiptr scratch_size;\n"
+        "   if (size > scratch_size) {\n"
+        "      void *p = realloc(scratch, (size_t)size);\n"
+        "      if (!p)\n"
+        "         return;\n"
+        "      scratch = p;\n"
+        "      scratch_size = size;\n"
+        "   }\n"
+        "   /* `glMapBufferRange` cannot read here either -- emscripten answers\n"
+        "    * `glMapBufferRange access does not support MAP_READ`, because WebGL\n"
+        "    * has no mapping at all and the emulation only writes. `getBufferSubData`\n"
+        "    * is the one way to get bytes out of a WebGL buffer. */\n"
+        "   glBindBuffer(GL_COPY_READ_BUFFER, from);\n"
+        "   glGetBufferSubData(GL_COPY_READ_BUFFER, 0, size, scratch);\n"
+        "   glBindBuffer(GL_COPY_READ_BUFFER, 0);\n"
+        "   glBindBuffer(to_target, to);\n"
+        "   glBufferSubData(to_target, 0, size, scratch);\n"
+        "}\n\n"
+        "/* The buffer to bind as this resource's element array.\n"
+        " *\n"
+        " * WebGL fixes a buffer's kind at its first bind, so a resource created\n"
+        " * for anything else needs a second buffer to be indices in, kept up to\n"
+        " * date from the first. See web/build-virgl-wasm.sh. */\n"
+        "static GLuint gex_elem_buffer(struct vrend_resource *res)\n"
+        "{\n"
+        "   if (res->target == GL_ELEMENT_ARRAY_BUFFER)\n"
+        "      return res->id;\n"
+        "   GLsizeiptr size = (GLsizeiptr)res->base.width0;\n"
+        "   if (size <= 0)\n"
+        "      return res->id;\n"
+        "   if (!res->gex_elem_id || res->gex_elem_size != size) {\n"
+        "      if (!res->gex_elem_id)\n"
+        "         glGenBuffers(1, &res->gex_elem_id);\n"
+        "      glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, res->gex_elem_id);\n"
+        "      glBufferData(GL_ELEMENT_ARRAY_BUFFER, size, NULL, GL_DYNAMIC_DRAW);\n"
+        "      res->gex_elem_size = size;\n"
+        "   }\n"
+        "   /* Every draw, rather than when the source changes: the guest writes\n"
+        "    * into these constantly and tracking that is a second bug waiting to\n"
+        "    * happen. A few kilobytes per draw is not what costs anything. */\n"
+        "   gex_mirror_copy(res->id, res->gex_elem_id, GL_ELEMENT_ARRAY_BUFFER, size);\n"
+        "   return res->gex_elem_id;\n"
+        "}\n\n")
+    marker = "static void vrend_draw_bind_vertex_legacy(struct vrend_context *ctx,"
+    assert marker in s, 'no place to put the helper'
+    s = s.replace(marker, helper + marker, 1)
+    open(p, 'w').write(s)
+
+# BGRA is not a thing in WebGL, and the fallback reached for it.
+#
+# `vrend_transfer_write` uses GL_BGRA whenever the format table has no host
+# entry for a resource's format. On GLES there is no BGRA at all -- which is
+# why the swizzle-on-upload path immediately below it exists -- so the
+# fallback asks for a format the driver has just been told it does not have:
+#
+#   54x texImage2D: invalid internalformat
+#   23x texImage2D: invalid format
+p = f'{src}/src/vrend_renderer.c'
+s = open(p).read()
+if 'GEX_NO_BGRA_FALLBACK' not in s:
+    s = s.replace(
+        "            glformat = GL_BGRA;\n            gltype = GL_UNSIGNED_BYTE;",
+        "            /* GEX_NO_BGRA_FALLBACK: GLES has no BGRA. */\n"
+        "            glformat = vrend_state.use_gles ? GL_RGBA : GL_BGRA;\n"
+        "            gltype = GL_UNSIGNED_BYTE;", 1)
+    assert 'GEX_NO_BGRA_FALLBACK' in s, 'the bgra fallback did not match'
+    open(p, 'w').write(s)
+
+# And the same in the other direction.
+#
+# A resource whose bind flags were exactly VIRGL_BIND_INDEX_BUFFER is created
+# as an element buffer, and Mesa then uses the same resource for vertices --
+# so the vertex path hits the identical wall from the other side:
+#
+#   bindBuffer: element array buffers can not be bound to a different target
+#   vertexAttribPointer: no ARRAY_BUFFER is bound and offset is non-zero
+p = f'{src}/src/vrend_renderer.c'
+s = open(p).read()
+if 'gex_array_buffer' not in s:
+    s = s.replace(
+        "      glBindBuffer(GL_ARRAY_BUFFER, res->id);",
+        "      glBindBuffer(GL_ARRAY_BUFFER, gex_array_buffer(res));", 1)
+    assert 'gex_array_buffer(res)' in s, 'the vertex bind did not match'
+    helper = (
+        "/* The buffer to bind as this resource's vertex array.\n"
+        " *\n"
+        " * The mirror of `gex_elem_buffer`, for a resource that was created as\n"
+        " * an element buffer and is being used for vertices. */\n"
+        "static GLuint gex_array_buffer(struct vrend_resource *res)\n"
+        "{\n"
+        "   if (res->target != GL_ELEMENT_ARRAY_BUFFER)\n"
+        "      return res->id;\n"
+        "   GLsizeiptr size = (GLsizeiptr)res->base.width0;\n"
+        "   if (size <= 0)\n"
+        "      return res->id;\n"
+        "   if (!res->gex_array_id || res->gex_array_size != size) {\n"
+        "      if (!res->gex_array_id)\n"
+        "         glGenBuffers(1, &res->gex_array_id);\n"
+        "      glBindBuffer(GL_ARRAY_BUFFER, res->gex_array_id);\n"
+        "      glBufferData(GL_ARRAY_BUFFER, size, NULL, GL_DYNAMIC_DRAW);\n"
+        "      res->gex_array_size = size;\n"
+        "   }\n"
+        "   gex_mirror_copy(res->id, res->gex_array_id, GL_ARRAY_BUFFER, size);\n"
+        "   return res->gex_array_id;\n"
+        "}\n\n")
+    marker = "static GLuint gex_elem_buffer(struct vrend_resource *res)"
+    assert marker in s, 'no place to put the vertex helper'
+    s = s.replace(marker, helper + marker, 1)
+    open(p, 'w').write(s)
+
+p = f'{src}/src/vrend_renderer.h'
+s = open(p).read()
+if 'gex_array_id' not in s:
+    s = s.replace(
+        "   GLuint gex_elem_id;\n   GLsizeiptr gex_elem_size;\n",
+        "   GLuint gex_elem_id;\n   GLsizeiptr gex_elem_size;\n"
+        "   GLuint gex_array_id;\n   GLsizeiptr gex_array_size;\n", 1)
+    assert 'gex_array_id' in s, 'the resource struct did not match'
+    open(p, 'w').write(s)
 PATCH
 
 # -- the epoxy stand-in -----------------------------------------------------
