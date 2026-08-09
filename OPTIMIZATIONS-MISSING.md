@@ -1308,3 +1308,28 @@ Four and a half times worse, because it pays Cranelift for every block of
 every object and apt enters a few thousand of them. The value of static
 recompilation is not the granularity, it is that the work happens *before the
 run*. Doing the same work during the run is the worst of both.
+
+### The whole update, in a browser, against the closure
+
+The complete Debian rootfs, apt's nineteen-object closure built
+`--exhaustive`, and `apt-get update` from `InRelease` to `Reading package
+lists`:
+
+    ten processes, 12,576 blocks translated in total
+
+against **281,254** for the same work on the native host. Twenty-two times
+less, and every process ends `code 0`. pid 1 -- apt-get itself, which does
+most of the work -- translates **nothing at all**.
+
+The wall clock is not the comparison to make yet: most of it is V8 compiling
+a 678 MB module, which is load rather than run, and load is not what this
+project is optimising. What is comparable is the work removed, and it is
+nearly all of it.
+
+The 12,576 that remain are the interesting number now. They are what the
+closure does not cover, and they are covered by the same mechanism: apt-get's
+closure is built from *apt-get's* `DT_NEEDED`, and its methods need objects
+apt-get does not -- libseccomp for the sandbox, libselinux, libpcre2. A
+closure built from the union of the executable's closure and its helpers'
+would take that towards zero. `gexc closure` already answers the question per
+binary; nothing yet merges the answers.
