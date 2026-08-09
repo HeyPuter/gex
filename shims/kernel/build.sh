@@ -30,6 +30,7 @@ RUSTFLAGS="-C link-arg=--import-memory \
   -C link-arg=--shared-memory \
   -C link-arg=--max-memory=1073741824 \
   -C link-arg=--export-table \
+  -C link-arg=--export=__stack_pointer \
   -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
   cargo +nightly build -p gex-kernel-wasm --target wasm32-unknown-unknown \
     --release -Z build-std=std,panic_abort --target-dir target/shared-kernel

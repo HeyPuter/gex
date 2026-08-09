@@ -32,6 +32,51 @@ use std::sync::OnceLock;
 
 use gex_kernel::proc::ProcTable;
 
+/// Stacks, one per Worker.
+///
+/// A wasm global belongs to an *instance*, and every Worker makes its own
+/// instance of this module -- so each has its own `__stack_pointer`, and
+/// wasm-ld initialises every one of them to the same address. The memory
+/// underneath is shared. Two Workers inside this module at the same moment
+/// therefore write their locals over each other, which is as bad as it
+/// sounds: the failures were an unaligned atomic, a hang, and a fork that
+/// worked whenever tracing slowed the child down enough to miss the overlap.
+///
+/// So each Worker gets a slice of this array and points its stack pointer at
+/// the top of it. The array is in `.bss` -- it costs address space in the
+/// kernel memory and nothing else until it is written.
+///
+/// Half a megabyte each. This module's deepest call is a `TmpFs` lookup and
+/// a `Vec` grow; the browser shim, which does real work, gets eight.
+pub const STACK_BYTES: u32 = 512 * 1024;
+/// As many as there are guest processes plus their threads. Sixty-four is
+/// well past what a page will run and costs nothing until it is touched.
+pub const STACK_COUNT: u32 = 64;
+static mut STACKS: [u8; (STACK_BYTES * STACK_COUNT) as usize] =
+    [0; (STACK_BYTES * STACK_COUNT) as usize];
+
+/// Where the stacks start, and how big each is.
+///
+/// Asked by the *first* Worker, which is the one that safely can: it holds
+/// the stack wasm-ld gave the module, and nobody else is in here yet. It
+/// hands the numbers to the host, and the host tells every later Worker which
+/// slice is its own -- which that Worker installs before it calls anything.
+#[no_mangle]
+pub extern "C" fn k_stack_area() -> u32 {
+    // SAFETY: an address, not a read.
+    unsafe { core::ptr::addr_of!(STACKS) as u32 }
+}
+
+#[no_mangle]
+pub extern "C" fn k_stack_size() -> u32 {
+    STACK_BYTES
+}
+
+#[no_mangle]
+pub extern "C" fn k_stack_count() -> u32 {
+    STACK_COUNT
+}
+
 /// What this module last panicked with, so a crash in here can be read.
 ///
 /// It has no console: the browser shim writes through an import the page

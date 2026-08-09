@@ -36,6 +36,15 @@ export class ProcessHost {
   #pending = new Map();
   #first = null;
   #forked = 0;
+  // The global kernel's per-Worker stacks, as the first Worker reported them,
+  // and how many have been handed out.
+  //
+  // A wasm global belongs to an instance, so every Worker's kernel instance
+  // has a `__stack_pointer` of its own -- all pointing at the same address in
+  // the memory they share. Handing each one its own slice is what stops two
+  // Workers in the kernel writing their locals over each other.
+  #stacks = null;
+  #stacksTaken = 0;
 
   constructor({
     makeWorker,
@@ -138,6 +147,26 @@ export class ProcessHost {
     });
   }
 
+  /**
+   * The next Worker's slice of the kernel's stack array, or undefined for the
+   * first -- which keeps the stack the module was linked with, and is the one
+   * that reports where the array is.
+   */
+  #nextKernelStack() {
+    if (!this.#stacks) return undefined;
+    // Slice 0 belongs to nobody: the first Worker is already using the
+    // linked-in stack, and leaving a gap costs half a megabyte of address
+    // space in a memory that has a gigabyte of it.
+    const n = ++this.#stacksTaken;
+    if (n >= this.#stacks.count) {
+      throw new Error(
+        `the global kernel has ${this.#stacks.count} stacks and this is Worker ${n + 1}. ` +
+          'Raise STACK_COUNT in shims/kernel.',
+      );
+    }
+    return this.#stacks.area + n * this.#stacks.size;
+  }
+
   #onMessage(pid, w, m, resolve, reject) {
     switch (m?.kind) {
       case 'ready': {
@@ -147,6 +176,7 @@ export class ProcessHost {
           w.postMessage({
             ...this.#extra,
             ...msg,
+            kernelStack: this.#nextKernelStack(),
             gexUrl: this.#gexUrl ?? undefined,
             shim: this.#shim,
             guest: this.#guest,
@@ -155,6 +185,9 @@ export class ProcessHost {
         }
         break;
       }
+      case 'kernelStacks':
+        this.#stacks = m;
+        break;
       case 'output':
         this.#onOutput(m.fd, m.text, pid, m);
         break;

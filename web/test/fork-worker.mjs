@@ -58,6 +58,17 @@ if (!existsSync(KERNEL)) {
 const kernelModule = await WebAssembly.compile(new Uint8Array(readFileSync(KERNEL)));
 const kernelMemory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 const kernel = { module: kernelModule, memory: kernelMemory };
+// Where the per-Worker stacks are. Read here rather than from a Worker: this
+// file makes the memory, so it can instantiate the module once and ask.
+const probe = (await WebAssembly.instantiate(kernelModule, {
+  env: {
+    memory: kernelMemory,
+    process: new WebAssembly.Memory({ initial: 0xffff0000 / 65536, maximum: 0xffff0000 / 65536 }),
+  },
+})).exports;
+const STACK_AREA = probe.k_stack_area() >>> 0;
+const STACK_SIZE = probe.k_stack_size() >>> 0;
+let taken = 0;
 
 // Every Worker's output, in arrival order, so a child's writes are visible
 // even though it is not the process the harness started.
@@ -85,7 +96,13 @@ function run(child) {
         // make another Worker, and only it has this file.
         async spawnProcess(c) { parentPort.postMessage({ kind: 'fork', child: c }); }
       }
-      const gex = new Gex(new E(), { kernel: workerData.kernel });
+      // stackTop is this Worker's slice of the global kernel's stack array.
+      // Every Worker's kernel instance has a stack pointer of its own, all
+      // starting at the same address in the memory they share; without a
+      // slice each, two Workers in the kernel write over each other.
+      const gex = new Gex(new E(), {
+        kernel: { ...workerData.kernel, stackTop: workerData.stackTop },
+      });
       if (process.env.GEX_STRACE) globalThis.__gexStrace = 1;
       if (process.env.GEX_DEBUG_EXIT) globalThis.GEX_DEBUG_EXIT = 1;
       const c = workerData.child;
@@ -109,7 +126,15 @@ function run(child) {
         parentPort.postMessage({ kind: 'threw', message: err?.stack ?? String(err) });
       }
       `,
-      { eval: true, workerData: { shim, seed, elf, child, kernel } },
+      {
+        eval: true,
+        workerData: {
+          shim, seed, elf, child, kernel,
+          // Slice 0 is nobody's: the first Worker keeps the stack the module
+          // was linked with.
+          stackTop: child ? STACK_AREA + ++taken * STACK_SIZE : 0,
+        },
+      },
     );
     w.on('message', (m) => {
       if (m.kind === 'out') {

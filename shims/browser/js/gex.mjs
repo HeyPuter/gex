@@ -481,14 +481,41 @@ export class Gex {
    */
   async #startKernel() {
     if (!this.#kernelSpec || this.#kernel) return;
-    const { module, memory } = this.#kernelSpec;
+    const { module, memory, stackTop } = this.#kernelSpec;
     const mod = module instanceof WebAssembly.Module
       ? module
       : await WebAssembly.compile(module);
     const inst = await WebAssembly.instantiate(mod, {
       env: { memory, process: this.#memory },
     });
+    // The stack, before anything is called.
+    //
+    // A wasm global belongs to an instance and every Worker makes its own, so
+    // each has a `__stack_pointer` of its own -- and wasm-ld initialises
+    // every one of them to the same address in a memory they all share. Two
+    // Workers inside the kernel at once therefore write their locals over
+    // each other. It showed up as an unaligned atomic, as a hang, and as a
+    // fork that passed whenever tracing slowed the child enough to miss the
+    // overlap.
+    //
+    // `stackTop` is a slice of the array the kernel reserves for exactly
+    // this. The first Worker has no `stackTop` and keeps the stack the module
+    // was linked with; it is also the one that reads the numbers out, because
+    // it is the only one that can safely make a call at all.
+    if (stackTop) inst.exports.__stack_pointer.value = stackTop | 0;
     this.#kernel = inst.exports;
+  }
+
+  /**
+   * Where the global kernel's per-Worker stacks are, for the host to hand
+   * out. Null when there is no global kernel or it is too old to say.
+   *
+   * Read from this Worker, which must be the first: see `#startKernel`.
+   */
+  kernelStacks() {
+    const k = this.#kernel;
+    if (!k?.k_stack_area) return null;
+    return { area: k.k_stack_area() >>> 0, size: k.k_stack_size() >>> 0, count: k.k_stack_count() >>> 0 };
   }
 
   /** The global kernel's exports, or null. */

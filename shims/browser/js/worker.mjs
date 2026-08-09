@@ -134,7 +134,12 @@ port.on(async (msg) => {
   }
 
   if (msg.debugExit) globalThis.GEX_DEBUG_EXIT = 1;
-  const gex = new Gex(new WorkerEnv(), { kernel: msg.kernel ?? null });
+  // `kernelStack` is this Worker's slice of the global kernel's stack array.
+  // Absent for the first Worker, which keeps the stack the module was linked
+  // with and is the one that reads the numbers out for everybody else.
+  const gex = new Gex(new WorkerEnv(), {
+    kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,
+  });
 
   // The guest's GPU. The renderer is where the canvas is -- the page -- and
   // this is a Worker, so the calls cross a `SharedArrayBuffer` and block on
@@ -192,6 +197,13 @@ port.on(async (msg) => {
     }
     if (msg.winsize) {
       gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);
+    }
+    // Where the kernel's per-Worker stacks are, so the host can give the next
+    // Worker one. Only the first Worker can ask: every other is already
+    // running on a slice the host handed it.
+    if (!msg.kernelStack) {
+      const stacks = gex.kernelStacks?.();
+      if (stacks) port.post({ kind: 'kernelStacks', ...stacks });
     }
     winsize = (rows, cols) => gex.shim.exports.gex_set_winsize?.(rows, cols);
     // The line discipline is the guest's choice, read out of its termios --

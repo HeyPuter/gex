@@ -147,6 +147,13 @@ try {
  * it directly -- so children are wired up one at a time rather than through
  * `host.mjs`.
  */
+// The global kernel's per-Worker stacks: every Worker's instance has a stack
+// pointer of its own, and wasm-ld starts all of them at the same address in
+// the memory they share. This process holds the first; every child gets a
+// slice of the array the kernel reserves.
+let kernelStacks = null;
+let kernelStacksTaken = 0;
+
 async function spawnChild(child, guestWasm) {
   const { Worker } = await import('node:worker_threads');
   // Not unref'd: a child outlives the parent, and this process has to stay
@@ -157,8 +164,17 @@ async function spawnChild(child, guestWasm) {
   const w = new Worker(new URL('./worker.mjs', import.meta.url));
   w.on('message', (m) => {
     if (m.kind === 'ready') {
-      w.postMessage({ kind: 'adopt', child, shim: shimWasm, guest: guestWasm, kernel,
-        debugExit: !!process.env.GEX_DEBUG_EXIT });
+      w.postMessage({
+        kind: 'adopt',
+        child,
+        shim: shimWasm,
+        guest: guestWasm,
+        kernel,
+        kernelStack: kernelStacks
+          ? kernelStacks.area + ++kernelStacksTaken * kernelStacks.size
+          : undefined,
+        debugExit: !!process.env.GEX_DEBUG_EXIT,
+      });
     } else if (m.kind === 'output') {
       (m.fd === 2 ? process.stderr : process.stdout).write(m.text);
     } else if (m.kind === 'fork') {
@@ -197,6 +213,9 @@ const entry = await gex.load(shimWasm, guestWasm, readFileSync(elfPath), files, 
   stdin: readStdin(),
   cwd,
 });
+// This process is the first Worker, so it is the one that can safely ask
+// where the kernel's per-Worker stacks are. Every child gets a slice.
+kernelStacks = gex.kernelStacks?.() ?? null;
 // GEX_NETWORK gives the guest a network made of real TCP sockets, so the
 // paths above Wisp -- apt's helper, a fetch, a parse -- can be exercised here
 // rather than only in a browser with a proxy configured.
