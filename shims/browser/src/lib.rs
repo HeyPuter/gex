@@ -4102,6 +4102,28 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             interp_base: program.interp_base(),
         },
     );
+    // Zero first, then lay the new stack out on top of it.
+    //
+    // `execve` gives a program a *fresh* stack, and on Linux fresh anonymous
+    // pages read as zero. gex was inserting the vma and writing only the
+    // layout -- argv, envp, auxv -- leaving everything below it exactly as
+    // the previous image had left it. A program that reads an uninitialised
+    // local therefore read the *last program's* data instead of the zero
+    // Linux would have given it.
+    //
+    // That is not a theoretical difference. apt's `file` method does
+    //
+    //     ldr x0, [sp, #0xa8]
+    //     bl  free
+    //
+    // on a slot it never wrote. On Linux that slot is zero and `free(NULL)`
+    // returns at its first instruction; under gex it held 2, left over from
+    // the shell that forked it, and `free(2)` dereferenced a chunk header
+    // sixteen bytes below address two. In wasm that is not a signal, it is a
+    // trap that takes the Worker with it -- which is how `apt-get update`
+    // came to die with `memory access out of bounds` and no other evidence.
+    let stack_lo = (gex_abi::STACK_TOP - gex_abi::STACK_SIZE) as usize;
+    data[stack_lo..gex_abi::STACK_TOP as usize].fill(0);
     let start = layout.low as usize;
     data[start..start + layout.bytes.len()].copy_from_slice(&layout.bytes);
     h.kernel.mem.insert(
@@ -6412,6 +6434,51 @@ pub extern "C" fn gex_jit_installed() {
         #[cfg(feature = "shared-memory")]
         h.jit.registry.push(done.wasm);
         publish_pending(h);
+    });
+}
+
+/// Say where the guest was when everything stopped.
+///
+/// A trap out of the shim reaches JavaScript as `RuntimeError` with no wasm
+/// frames and no address, which is not enough to act on -- and the guest's
+/// own registers are the only other evidence there is. A wild pointer in a
+/// `free` and a stack that has run off its mapping look identical from
+/// outside and completely different here.
+///
+/// Deliberately tolerant: this runs on the way out of a crash, so anything
+/// it cannot read it prints as zero rather than failing a second time.
+#[no_mangle]
+pub extern "C" fn gex_dump_state() {
+    if gex_has_host() == 0 {
+        return;
+    }
+    with_host(|h| {
+        let gm = GuestMem::new(guest_bytes());
+        let c = h.threads[cur()].kstate.ctx_addr;
+        let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
+        let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+        trace_line(&format!(
+            "gex: pid {} thread {} sp={sp:#x} x0={:#x} x1={:#x} x2={:#x} x30={:#x}\n",
+            h.kernel.pid,
+            cur(),
+            r(0),
+            r(1),
+            r(2),
+            r(30),
+        ));
+        // Which mapping each of those addresses is in, if any. An address
+        // with no vma is the whole diagnosis: the guest followed a pointer
+        // into nothing, which on Linux is `SIGSEGV` and here is a trap that
+        // takes the Worker with it.
+        let where_is = |a: u64| -> String {
+            match h.kernel.mem.vmas().iter().find(|v| a >= v.start && a < v.end) {
+                Some(v) => format!("{:#x}..{:#x} {}", v.start, v.end, v.name),
+                None => "UNMAPPED".to_string(),
+            }
+        };
+        for (name, a) in [("sp", sp), ("x0", r(0)), ("x1", r(1))] {
+            trace_line(&format!("gex:   {name}={a:#x} in {}\n", where_is(a)));
+        }
     });
 }
 

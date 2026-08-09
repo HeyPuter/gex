@@ -2708,10 +2708,11 @@ impl Kernel {
         }
         let p = self.at_path(m, dirfd, path)?;
         let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            self.vfs.metadata_nofollow(&p)?
+            self.vfs.metadata_nofollow(&p)
         } else {
-            self.vfs.metadata(&p)?
+            self.vfs.metadata(&p)
         };
+        let md = md?;
         m.write(buf, &Self::stat_from(&md).encode())?;
         Ok(0)
     }

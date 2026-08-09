@@ -1096,3 +1096,33 @@ which is the one thing that makes an `EFAULT` possible instead.
 And the trace decodes `newfstatat`'s path, which is what turned "a trap in
 syscall 79" into "a trap stat-ing `/usr/bin/xz`" -- a file that is not in the
 rootfs, which is how the search got as far as it did.
+
+### What apt's method actually dies of
+
+`gex_dump_state` answers it. On the way out of any trap the Worker now prints
+the guest's registers and, for each of them, which mapping it points into:
+
+    gex: pid 4 thread 0 sp=0x3fff390 x0=0x2 x1=0x0 x2=0x2 x30=0x511cb18
+    gex:   sp=0x3fff390 in 0x3800000..0x4000000 [stack]
+    gex:   x0=0x2 in UNMAPPED
+
+`x30` is `libapt-pkg + 0x7cb18`, and the instruction before it is a call
+whose argument comes from `ldr x0, [sp, #0xa8]`. So libapt loads a pointer
+out of a stack slot and frees it, and the pointer is **2**. `__libc_free`
+dereferences a chunk header sixteen bytes below it; on Linux that is
+`SIGSEGV`, and in wasm it is a trap that takes the Worker with it.
+
+What it is not, each ruled out by measurement rather than argument:
+
+- **Not a leftover stack.** `execve` was handing the new program the previous
+  image's stack instead of the zero page Linux gives it -- a real bug, fixed
+  here, and `free(NULL)` would have been a no-op. The value is still 2, so
+  something computes it.
+- **Not the intrinsics.** `GEX_NO_INTRINSICS=1` crashes identically.
+- **Not the missing `/usr/bin/xz`.** The full Debian rootfs has no `xz`
+  either, so that `ENOENT` is what apt expects; and with a proper flat-repo
+  `Release` and `InRelease` in place the crash happens *earlier*.
+- **Not the browser shim.** `gexc run --sysroot` reaches
+  `Get:1 file:/repo ./ InRelease [419 B]` and then hangs the same way. A
+  different engine, the same fault, which puts it in the kernel or the lifter
+  -- and makes `--strace` on the native host the right next instrument.

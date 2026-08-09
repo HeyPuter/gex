@@ -446,6 +446,10 @@ async function handle(msg) {
     // never report. See `gex_abandon` -- this is #69, and a crash in a child
     // used to wedge the whole run rather than end it.
     try {
+      // Where the guest was, before anything else: a trap gives JavaScript no
+      // address and no frames, and the guest's registers are the rest of the
+      // evidence.
+      gex?.shim?.exports?.gex_dump_state?.();
       gex?.shim?.exports?.gex_abandon?.(-9);
     } catch {
       // The shim is what just fell over; there may be nothing left to call.
