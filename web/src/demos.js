@@ -425,18 +425,13 @@ const virglGears = {
     );
     ctx.term.writeln('');
     ctx.term.writeln(
-      ctx.ansi.red('This one does not draw yet. The X server starts and runs; what stops'),
+      ctx.ansi.dim('The first frame is about forty seconds away and the frame rate is'),
     );
     ctx.term.writeln(
-      ctx.ansi.red('it is the dispatch table, which a browser will not grow past ten'),
+      ctx.ansi.dim('around thirty a second after that. glxgears prints its own count'),
     );
-    ctx.term.writeln(
-      ctx.ansi.red('million entries. A slot is claimed per 4 KiB of guest text and none is'),
-    );
-    ctx.term.writeln(
-      ctx.ansi.red('ever given back, so an X server, Mesa and the LLVM inside it exhaust'),
-    );
-    ctx.term.writeln(ctx.ansi.red('them. What follows is the run, unedited, as far as it gets.'));
+    ctx.term.writeln(ctx.ansi.dim('every five seconds; the line at the end says how many of those'));
+    ctx.term.writeln(ctx.ansi.dim('frames were actually put on the canvas above.'));
     ctx.term.writeln('');
 
     // The budget the run is given, and it has to clear the cold start.

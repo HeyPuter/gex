@@ -48,9 +48,20 @@ const DEMOS = {
   // The guest's own evidence, not the page's. "graphics rootfs -- N files"
   // and a status of `running` were both true of a demo that unpacked the
   // image and then did nothing at all, which is how this test passed while
-  // the demo did not boot. What has to be true is that Xvfb came up, its
-  // client reached it, and glxgears drew.
-  virgl: { want: /frames in [\d.]+ seconds/, settle: 'finished' },
+  // the demo did not boot.
+  //
+  // Two things have to be true and only one of them is about the guest.
+  // glxgears' frame rate says Mesa completed frames and got them back, but
+  // vtest has no present -- the X server reads its pixels back and never
+  // looks at a screen -- so a run can draw perfectly onto a canvas that
+  // stays black. `presented`, which the demo prints when the run ends, is
+  // the number of blits that actually reached it.
+  virgl: {
+    want: (t) => /frames in [\d.]+ seconds/.test(t) && Number(/presented=(\d+)/.exec(t)?.[1]) > 0,
+    // No `settle`: a run that finishes having presented nothing is the exact
+    // failure this is for, and a status of `finished` would call it a pass.
+    fail: /presented=0\b/,
+  },
 };
 
 const exists = async (p) => access(p).then(() => true, () => false);
@@ -159,7 +170,11 @@ const port = server.address().port;
 
 let failures = 0;
 for (const id of list) {
-  const { want, settle } = DEMOS[id];
+  const { want, settle, fail } = DEMOS[id];
+  // A regular expression or a predicate. A demo whose evidence is two things
+  // at once -- the guest drew *and* the frames reached the canvas -- cannot
+  // say so in one pattern.
+  const reached = typeof want === 'function' ? want : (t) => want.test(t);
   const url = `http://127.0.0.1:${port}/?demo=${id}&run=1`;
   let last = '';
   const done = new Promise((resolve) => {
@@ -172,9 +187,13 @@ for (const id of list) {
       // last line as well, because that is where the guest speaks.
       const tail = (terminal || '').trim().split('\n').filter(Boolean).slice(-1)[0] || '';
       console.log(`     [${id}] ${text}${statusKind === 'tick' && tail ? ` | ${tail}` : ''}`);
-      if (want.test(terminal || '') || text === settle) {
+      if (reached(terminal || '') || text === settle) {
         resolve({ how: 'reached', body: text });
       }
+      // A run that ended having proved the opposite. Without this the wait
+      // runs to the wall clock, and fifteen minutes of nothing reads as a
+      // hang rather than as the answer it already has.
+      if (fail?.test(terminal || '')) resolve({ how: 'bad', body: 'nothing reached the canvas' });
       if (statusKind === 'bad') resolve({ how: 'bad', body: text });
     };
   });

@@ -208,7 +208,14 @@ echo "gex: loading Mesa and drawing"
 # whether the gears had drawn. That is a real defect with its own task, but it
 # is not this demo's, and having it in the way made every run ambiguous.
 if [ -n "${GEARS_SECONDS:-}" ] && [ "${GEARS_SECONDS}" != "0" ]; then
-  exec timeout "$GEARS_SECONDS" glxgears.aarch64-linux-gnu
+  timeout "$GEARS_SECONDS" glxgears.aarch64-linux-gnu
+  s=$?
+  # 124 is `timeout` saying it stopped the program, which for a run given a
+  # budget is how it is *supposed* to end. It used to be `exec`ed and passed
+  # straight out, so a demo that drew for ninety seconds at thirty frames a
+  # second reported "exit 124" and coloured itself a failure.
+  [ "$s" = 124 ] && s=0
+  exit "$s"
 fi
 exec glxgears.aarch64-linux-gnu
 EOF
