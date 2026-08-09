@@ -538,6 +538,28 @@ pub extern "C" fn k_place(key: u64, len: u64) -> u64 {
     base
 }
 
+/// Fix where an object goes, rather than letting the counter choose.
+///
+/// For a closure that was statically recompiled: every module in it has the
+/// addresses of the object it came from baked in, so the layout is not a
+/// preference but a precondition. The build writes it out and the host
+/// replays it here before anything runs.
+///
+/// The counter is pushed past whatever is pinned, so an object the build did
+/// not cover -- one the guest `dlopen`s, say -- is placed after the pinned
+/// ones rather than on top of them.
+#[no_mangle]
+pub extern "C" fn k_place_set(key: u64, base: u64, len: u64) {
+    let mut p = places().lock().unwrap_or_else(|e| e.into_inner());
+    p.by_obj.insert(key, base);
+    let end = base
+        .saturating_add(len.next_multiple_of(PLACE_ALIGN))
+        .saturating_add(PLACE_ALIGN);
+    if p.next < end {
+        p.next = end;
+    }
+}
+
 /// Somewhere to stage a guest buffer copied out of a process's memory.
 static mut SCRATCH: [u8; 4096] = [0; 4096];
 

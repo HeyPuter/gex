@@ -79,7 +79,8 @@ const DEFAULT_DIRS: &[&str] = &[
 /// `read` maps a guest path to file contents, so this walks the guest's
 /// namespace -- the sysroot -- and never the host's.
 ///
-/// `place` is asked where to put each dependency, given how much space it
+/// `place` is asked where to put each dependency, given its guest path and
+/// how much space it
 /// needs. The executable keeps whatever base it was loaded with. Handing the
 /// decision out rather than making it here is what lets a build and a run
 /// agree on the layout: both call this, and the caller supplies the same
@@ -88,7 +89,7 @@ pub fn resolve(
     exe: Image,
     exe_path: &str,
     read: &dyn Fn(&str) -> Option<Vec<u8>>,
-    place: &mut dyn FnMut(u64) -> u64,
+    place: &mut dyn FnMut(&str, u64) -> u64,
 ) -> Result<Closure, LoadError> {
     let mut out = Closure::default();
     let mut seen: HashSet<String> = HashSet::new();
@@ -140,7 +141,7 @@ pub fn resolve(
         // way to ask the placer for the right amount.
         let probe = load(&bytes, 0)?;
         let span = probe.brk;
-        let base = place(span);
+        let base = place(&path, span);
         let image = load(&bytes, base)?;
         for n in &image.needed {
             queue.push((n.clone(), path.clone(), depth + 1));

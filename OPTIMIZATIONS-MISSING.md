@@ -882,3 +882,65 @@ Then every process gives the same object page the same base, every module's
 segments land where they were built to land, and the whole collision class
 stops existing. That is a change to `PageTable::base` and a counter in the
 global kernel, not to any of the three things above. See #95.
+
+## A whole closure, statically recompiled, and a run that translates nothing
+
+Built and landed. `gexc build --closure` translated a program's transitive
+`DT_NEEDED` closure before this session, but nothing could instantiate the
+result, so the modules had never been run. Now they are.
+
+Three things had to agree before a library module could be correct, and all
+three were wrong:
+
+**The address.** A module has its object's guest addresses baked in, so the
+object has to be *there*. `gexc build --closure` writes a `.pins` manifest,
+`gex_pin_object` seeds it before the loader runs, and `ld.so` cooperates
+without knowing it, because `mmap(NULL, span)` takes whatever it is handed.
+The pin also goes into the global placement table, so a `fork` and an
+`execve` place the library identically rather than only the first process
+being right. `gex_pin_report` says where each one landed, because a pin that
+silently does not take means the guest branches into whatever is at the
+address the module was built for.
+
+**The interpreter.** `ld.so` is not placed by `mmap` at all -- gex's own
+loader puts it at `INTERP_BASE` -- so it cannot be pinned, and the build was
+placing it in the mmap arena instead. The build now places it where the
+loader will. Two constants had drifted apart as well: `gexc` had its own
+`INTERP_BASE` of `0x2800_0000`, which is *inside* the arena, against the
+abi's `0x0300_0000`. They are one constant now. Matching by `PT_INTERP` path
+was not enough to notice: dash's is `/lib/ld-linux-aarch64.so.1` and the same
+object arrives again through libc's `DT_NEEDED` as
+`/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1`, so the comparison matched
+neither and the interpreter was translated for an address it never occupies.
+
+**The slots.** Each object was translated by its own `translate_image` call,
+and each call started a fresh `PageTable` -- so every module in the closure
+claimed dispatch slots from the same place. libc's blocks and the
+executable's blocks were in the same slots, and the program branched into
+whichever module had been installed last. `Options::first_slot` threads the
+high-water through, so the closure is allocated as if by one allocator.
+
+Measured, `dash -c 'echo hello'` on the small rootfs, blocks translated *at
+runtime*:
+
+    seed module, no closure                   15,816 blocks   594 ms
+    closure's own image module alone          15,708 blocks   567 ms
+    whole closure, ordinary discovery         10,326 blocks   357 ms
+    whole closure, --exhaustive                    0 blocks     0 ms
+
+Zero. Not "nearly none" -- the guest takes no dispatch miss at all, and the
+runtime translator is never entered. That is the thing this project is for,
+and it had never happened before.
+
+The cost is the build: exhaustive translation of dash's closure is 346,888
+blocks and 75 MB of wasm against 69,313 blocks and 15 MB for ordinary
+discovery. Binary size does not matter here and sustained runtime does, so
+the trade is the right way round -- but 75 MB for three objects says what
+#93 already suspected, that whole-object translation is the wrong
+granularity once the closure is apt's nineteen objects rather than dash's
+three.
+
+What is not done: the closure is only installed for the process that
+`load`s. A forked child inherits its parent's translations as it always did,
+but an `execve` of a *different* program in the closure gets nothing, and
+that is the case apt is made of.

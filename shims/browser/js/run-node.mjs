@@ -14,6 +14,7 @@
 //     --strace               narrate every syscall to stderr
 
 import { readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
 
@@ -137,6 +138,41 @@ try {
 const guestWasm = readFileSync(guestPath);
 const elf = readFileSync(elfPath);
 const args = [argv0 ?? elfPath, ...guestArgs];
+
+/// Read a `.pins` manifest into `{ path: base }`.
+///
+/// The same file `gexc run --pin` takes, and the same format the closure
+/// build writes: a hex base, a space, a guest path.
+function readPins() {
+  const path = process.env.GEX_PINS;
+  if (!path) return undefined;
+  const out = {};
+  for (const line of readFileSync(path, 'utf8').split('\n')) {
+    const at = line.indexOf(' ');
+    if (at < 0) continue;
+    const base = Number(line.slice(0, at).trim());
+    if (!Number.isFinite(base) || base <= 0) continue;
+    out[line.slice(at + 1).trim()] = base;
+  }
+  return out;
+}
+
+/// Every library module of a closure build, in build order.
+///
+/// Order matters only in that it is the order `gexc` allocated slots in, and
+/// installing them in it keeps the trace readable; the modules themselves are
+/// independent.
+function readClosure() {
+  const stem = process.env.GEX_CLOSURE;
+  if (!stem) return undefined;
+  const dir = dirname(stem);
+  const base = basename(stem);
+  const names = readdirSync(dir)
+    // Not the image module itself: that is the guest, not a library.
+    .filter((n) => n.startsWith(base + '.') && n.endsWith('.wasm') && n !== base + '.wasm')
+    .sort();
+  return names.map((n) => readFileSync(join(dir, n)));
+}
 
 const host = new ProcessHost({
   makeWorker: () => new Worker(new URL('./worker.mjs', import.meta.url)),
@@ -302,6 +338,16 @@ try {
       gid: process.getgid?.(),
       stdin: readStdin(),
       cwd,
+      // GEX_PINS names a layout written by `gexc build --closure`. Every
+      // object in it is placed exactly where the build assumed, which is
+      // what makes a module built against those addresses correct -- and it
+      // goes into the *global* placement table too, so every process of the
+      // run agrees rather than only the first.
+      pins: readPins(),
+      // GEX_CLOSURE names the stem a closure build wrote. Every
+      // `<stem>.NN.<name>.wasm` beside it is one library, translated ahead of
+      // time; the image module is `<stem>.wasm` and is passed as the guest.
+      closure: readClosure(),
     },
   });
 } catch (e) {

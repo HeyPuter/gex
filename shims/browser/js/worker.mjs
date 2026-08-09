@@ -344,6 +344,11 @@ async function handle(msg) {
     const runStarted = performance.now();
     const status = await gex.run(entry, ctx);
     const guestMillis = Math.round(performance.now() - runStarted);
+    // Where each pinned object landed. A pin that does not take is the worst
+    // outcome available -- the module was built for one address and the code
+    // runs at another, so the guest branches into whatever is there -- and it
+    // can only be known after the run, because `ld.so` maps the libraries.
+    if (msg.opts?.pins) ex.gex_pin_report?.();
     // `close` before the reporting, not after: it drops the tick channel,
     // which is a live handle that would otherwise keep a Node Worker up.
     gex.close?.();

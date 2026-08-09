@@ -287,6 +287,9 @@ export class Gex {
     this.#u8 = null;
   }
 
+  /** Closure library modules waiting for the guest instance to exist. */
+  #closureModules = [];
+
   #bytes() {
     if (!this.#u8 || this.#u8.byteLength === 0) {
       this.#u8 = new Uint8Array(this.#memory.buffer);
@@ -532,6 +535,21 @@ export class Gex {
       free?.(dp, d.length);
     }
 
+    // The layout a closure build assumed, before the program is loaded and
+    // long before `ld.so` reserves anything. Every module in a statically
+    // recompiled closure has its object's guest addresses baked in, so this
+    // is a precondition rather than a hint -- and the guest cooperates
+    // without knowing it, because `mmap(NULL, span)` takes what it is given.
+    const pin = this.#shim.exports.gex_pin_object;
+    for (const [path, base] of Object.entries(opts.pins ?? {})) {
+      if (!pin) break;
+      const b = enc.encode(path);
+      const bp = this.#shim.exports.gex_alloc(b.length) >>> 0;
+      this.#bytes().set(b, bp);
+      pin(bp, b.length, BigInt(base));
+      free?.(bp, b.length);
+    }
+
     const ptr = this.#shim.exports.gex_alloc(elf.length) >>> 0;
     this.#bytes().set(elf, ptr);
     const argvBlob = new TextEncoder().encode(args.join('\0'));
@@ -542,6 +560,17 @@ export class Gex {
     }
     const entry = this.#shim.exports.gex_load(ptr, elf.length, ap, argvBlob.length);
     if (entry === 0n) throw new Error('gex: could not load the program');
+
+    // The rest of the closure: one module per shared library, translated
+    // ahead of time by the same `gexc` run that produced the image module
+    // above. Held back until now because the image has to be placed first --
+    // its metadata is what says how far the dispatch tables already reach --
+    // and installed before the guest runs, so `ld.so` never takes a dispatch
+    // miss in a library at all.
+    //
+    // Deferred one step: the tables the modules import belong to the guest
+    // instance, which is built below. `#closure` is what installs them.
+    this.#closureModules = opts.closure ?? [];
 
 
     const e = this.#shim.exports;
@@ -560,7 +589,42 @@ export class Gex {
     this.#guest = await WebAssembly.instantiate(await WebAssembly.compile(guestWasm), {
       gex: this.#imports,
     });
+    await this.#installClosure();
     return entry;
+  }
+
+  /**
+   * Install the closure's library modules, now that the tables exist.
+   *
+   * Each was built by the same `gexc` run as the image module, against one
+   * page table, so their slots cannot collide with each other or with the
+   * image. The shim reads each one's `gex.meta` for the pages it covers and
+   * the reach it needs, writes the guest's dispatch directory, and answers
+   * with the figure the tables must be grown to.
+   *
+   * A module whose metadata will not read is skipped rather than installed:
+   * its blocks would go into slots nothing had claimed, and the failure would
+   * surface as a branch into the wrong function much later.
+   */
+  async #installClosure() {
+    const add = this.#shim.exports.gex_add_closure_module;
+    if (!add) return;
+    for (const wasm of this.#closureModules) {
+      const mp = this.#shim.exports.gex_alloc(wasm.length) >>> 0;
+      this.#bytes().set(wasm, mp);
+      const meta = metadataSection(wasm);
+      let need = 0;
+      if (meta && meta.length) {
+        const gp = this.#shim.exports.gex_alloc(meta.length) >>> 0;
+        this.#bytes().set(meta, gp);
+        need = add(gp, meta.length) >>> 0;
+        this.#shim.exports.gex_free?.(gp, meta.length);
+      }
+      this.#shim.exports.gex_free?.(mp, wasm.length);
+      if (!need) continue;
+      await this.#installModule(wasm, need);
+    }
+    this.#closureModules = [];
   }
 
   /**
@@ -762,7 +826,7 @@ export class Gex {
       // whole system rather than for one Worker. Without a kernel these
       // answer nought, which is exactly right: a run of one process has no
       // sibling to share with, and the shim keeps its own map anyway.
-      'k_slot_get', 'k_slot_put', 'k_place',
+      'k_slot_get', 'k_slot_put', 'k_place', 'k_place_set',
       'k_mod_store', 'k_mod_claim', 'k_mod_for', 'k_mod_slots',
       'k_mod_len', 'k_mod_dirs_len', 'k_mod_read', 'k_mod_dirs_read',
     ];

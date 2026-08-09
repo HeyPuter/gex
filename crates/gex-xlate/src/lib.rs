@@ -76,6 +76,16 @@ pub struct Options {
     /// libraries it was placed alongside, and only one of them can declare the
     /// address space they share.
     pub linkage: Linkage,
+    /// Where this module's page allocations begin in the shared dispatch
+    /// table.
+    ///
+    /// Zero means "start where a lone module would". It is not zero for a
+    /// closure: every object of one is translated separately but they all run
+    /// in the same process against the same table, so each has to continue
+    /// where the last stopped. Translating them all from the same start meant
+    /// libc's blocks and the executable's blocks claimed the same slots, and
+    /// the program branched into whichever had been installed last.
+    pub first_slot: u64,
 }
 
 impl Default for Options {
@@ -91,6 +101,7 @@ impl Default for Options {
             lazy: false,
             shared_memory: true,
             linkage: Linkage::Own,
+            first_slot: 0,
         }
     }
 }
@@ -338,8 +349,17 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     let mut phases = Phases::start();
     let view = CodeView::new(image);
     let (text_lo, text_hi) = image.text_range;
-    let mut builder =
-        ModuleBuilder::with_linkage(text_lo, text_hi - text_lo, opts.linkage, opts.shared_memory);
+    let mut builder = if opts.first_slot == 0 {
+        ModuleBuilder::with_linkage(text_lo, text_hi - text_lo, opts.linkage, opts.shared_memory)
+    } else {
+        ModuleBuilder::with_pages(
+            text_lo,
+            text_hi - text_lo,
+            opts.linkage,
+            gex_emit::module::PageTable::from_entries(&[], opts.first_slot),
+            opts.shared_memory,
+        )
+    };
     let mut stats = Stats::default();
 
     // Collect entry points. A BTreeSet keeps translation order deterministic,

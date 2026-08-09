@@ -16,7 +16,13 @@ use std::process::ExitCode;
 
 /// Where the dynamic linker is placed, well above a PIE executable so their
 /// mappings cannot overlap.
-const INTERP_BASE: u64 = 0x2800_0000;
+///
+/// The abi's, not a number of its own. It used to be `0x2800_0000`, which is
+/// inside the mmap arena and so could in principle collide with anything the
+/// allocator handed out -- but the reason it matters now is the closure
+/// build: a module for `ld.so` is only correct at the address the host's
+/// loader actually uses, and the host uses this one.
+const INTERP_BASE: u64 = gex_abi::INTERP_BASE;
 
 fn main() -> ExitCode {
     match real_main() {
@@ -535,8 +541,13 @@ fn build_closure(
     let mut pins = String::new();
     let (mut blocks, mut insts, mut bytes_total) = (0usize, 0usize, 0usize);
 
+    // Where the next object's slots start. Every object of the closure runs
+    // in one process against one dispatch table, so they have to be allocated
+    // as if by one allocator even though they are translated one at a time.
+    let mut first_slot = 0u64;
     for (n, o) in closure.objects.iter().enumerate() {
         let opts = Options {
+            first_slot,
             exhaustive,
             shared_memory,
             // The first object is the executable and owns the address space.
@@ -561,9 +572,13 @@ fn build_closure(
         // The interpreter is placed by gex's own loader, not by `mmap`, so
         // there is no reservation to pin and a line for it would only ever be
         // reported as never reserved.
-        if n > 0 && Some(o.path.as_str()) != interp.as_deref() {
+        // Not the interpreter: it is placed by the loader rather than by a
+        // reservation, so there is nothing to pin and a line for it would
+        // only ever be reported as never reserved.
+        if n > 0 && Some(o.path.as_str()) != interp.as_deref() && !is_interp_name(&o.name) {
             pins.push_str(&format!("{:#x} {}\n", o.image.bias, o.path));
         }
+        first_slot = module.metadata().next_slot;
         blocks += stats.blocks;
         insts += stats.instructions;
         bytes_total += stats.wasm_bytes;
@@ -603,6 +618,18 @@ fn build_closure(
 /// the gap covers the slack, and the base is 64 KiB aligned -- the largest
 /// `p_align` these objects use -- which makes `ld.so`'s rounding of the
 /// reservation a no-op and the load bias the address that was pinned.
+/// Whether a file name is a dynamic linker.
+///
+/// By name rather than by `PT_INTERP`, because they need not agree: dash's
+/// `PT_INTERP` is `/lib/ld-linux-aarch64.so.1`, and the same object arrives
+/// again through libc's `DT_NEEDED` as
+/// `/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1`. Comparing paths matched
+/// neither, so the interpreter was placed in the mmap arena and translated
+/// for an address it never occupies.
+fn is_interp_name(name: &str) -> bool {
+    name.starts_with("ld-linux") || name.starts_with("ld-musl") || name == "ld.so"
+}
+
 fn place_object(next: &mut u64, span: u64) -> u64 {
     const SLACK: u64 = 0x10000;
     let base = (*next + SLACK - 1) & !(SLACK - 1);
@@ -633,7 +660,20 @@ fn closure_of(
         None => path.to_string(),
     };
     let mut next = gex_abi::MMAP_BOTTOM;
-    let mut place = |span: u64| place_object(&mut next, span);
+    // The interpreter is not placed by `mmap` and so cannot be pinned: gex's
+    // own loader puts it at `INTERP_BASE` before the guest runs. A module
+    // built for it anywhere else is a module whose every address is wrong,
+    // and since nothing reserves that range there is no pin report to say so
+    // -- the run simply branches into the middle of nowhere, which is what
+    // the first closure that included `ld.so` did.
+    let interp_for_place = interp.clone();
+    let mut place = |path: &str, span: u64| {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if Some(path) == interp_for_place.as_deref() || is_interp_name(name) {
+            return INTERP_BASE;
+        }
+        place_object(&mut next, span)
+    };
     Ok((
         gex_ld::closure::resolve(exe, &guest_path, &read, &mut place)?,
         interp,
@@ -708,7 +748,14 @@ fn cmd_closure(args: &[String]) -> Result<()> {
     // way of everything the allocator does, because it fills from the far
     // end and a whole program's libraries are a few tens of megabytes.
     let mut next = gex_abi::MMAP_BOTTOM;
-    let mut place = |span: u64| place_object(&mut next, span);
+    // The interpreter goes where the loader will put it, not in the arena.
+    // See `closure_of`.
+    let mut place = |path: &str, span: u64| {
+        if is_interp_name(path.rsplit('/').next().unwrap_or(path)) {
+            return INTERP_BASE;
+        }
+        place_object(&mut next, span)
+    };
     // What `$ORIGIN` is relative to: the executable's path *in the guest*,
     // which inside a sysroot is the host path with the prefix taken off.
     let guest_path = match &sysroot {
@@ -749,7 +796,7 @@ fn cmd_closure(args: &[String]) -> Result<()> {
         let interp = interp_path.as_deref();
         let mut text = String::new();
         for o in closure.objects.iter().skip(1) {
-            if Some(o.path.as_str()) == interp {
+            if Some(o.path.as_str()) == interp || is_interp_name(&o.name) {
                 continue;
             }
             text.push_str(&format!("{:#x} {}\n", o.image.bias, o.path));

@@ -285,6 +285,7 @@ extern "C" {
     /// Has some process already filled the shared root? Only the first
     /// should: the rest would unpack the same rootfs over the top of it.
     fn k_place(key: u64, len: u64) -> u64;
+    fn k_place_set(key: u64, base: u64, len: u64);
     fn k_fs_populated() -> i32;
     fn k_fs_populate_done();
 
@@ -1993,6 +1994,11 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
 
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
+    // The staged layout, now that there is somewhere to put it. Taken rather
+    // than copied: this runs once, and a second `gex_load` in the same Worker
+    // is an `execve`, which gets its placement from the global table like
+    // every other process.
+    kernel.pins = std::mem::take(&mut *PINS.0.borrow_mut()).into_iter().collect();
     // This host's memory has to be allocated up to whatever the map hands
     // out, so the map asks before it hands anything out.
     kernel.mem.grows_on_demand(arena_grow, arena_back);
@@ -2177,6 +2183,55 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     entry
 }
 
+/// Place `path` at `base`, because something was built assuming it is there.
+///
+/// The layout a closure build wrote out. Every module in a statically
+/// recompiled closure has the guest addresses of the object it came from
+/// baked into it, so those addresses are a precondition rather than a
+/// preference -- and `ld.so` will take whatever `mmap(NULL, span)` hands it,
+/// so gex is free to hand it the right one.
+///
+/// Two places have to agree and both are set here. `Kernel::pins` is what
+/// the reservation in *this* process consults; the global placement table is
+/// what every other process consults, so a `fork` and an `execve` of the same
+/// program land the library in the same place and can share what was built
+/// for it. Without the second, only the first process would be right.
+#[no_mangle]
+pub extern "C" fn gex_pin_object(path: u32, path_len: u32, base: u64) {
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return;
+    };
+    PINS.0.borrow_mut().push((name.to_string(), base));
+    // SAFETY: `k_present` takes no borrow, and `k_place_set` takes scalars.
+    unsafe {
+        if k_present() != 0 {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            name.hash(&mut hasher);
+            // The span is not known here and does not need to be: the
+            // reservation that follows carries it, and all this has to do is
+            // keep the automatic counter from handing the same address out
+            // to something else. One page of separation does that, because
+            // the pinned bases came from a build that spaced them already.
+            k_place_set(hasher.finish(), base, 0);
+        }
+    }
+}
+
+/// Where each pinned object actually landed, as `path base landed` lines.
+///
+/// A pin that silently does not take is the worst outcome available: the
+/// module was built for one address, the code runs at another, and the guest
+/// branches into whatever is there. Written to stderr so a mismatch is loud.
+#[no_mangle]
+pub extern "C" fn gex_pin_report() {
+    let landed = with_host(|h| h.kernel.pin_landed.clone());
+    for (path, want, got) in landed {
+        let how = if want == got { "ok" } else { "MISPLACED" };
+        trace_line(&format!("[gex] pin {how}: {path} wanted {want:#x}, landed {got:#x}\n"));
+    }
+}
+
 /// Put a file into the guest's filesystem, before it runs.
 ///
 /// A browser has no filesystem to pass through to, so the page bundles what
@@ -2212,6 +2267,16 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     let bytes = shim_slice(data, data_len).to_vec();
     FILES.0.borrow_mut().push((name.to_string(), bytes));
 }
+
+/// Where the closure build says each object goes, staged until the kernel
+/// that will honour it exists.
+///
+/// `gex_pin_object` is called before `gex_load`, because the layout has to be
+/// in place before the loader maps anything -- and at that moment there is no
+/// `Host` to put it in. The global placement table can be told straight away,
+/// since it lives in the kernel module rather than here.
+static PINS: SingleThreaded<Vec<(String, u64)>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
 
 /// Files bundled by the page, in the order they arrived.
 type Bundle = Vec<(String, Vec<u8>)>;
@@ -2321,6 +2386,44 @@ static METADATA: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(V
 #[no_mangle]
 pub extern "C" fn gex_set_metadata(ptr: u32, len: u32) {
     *METADATA.0.borrow_mut() = shim_slice(ptr, len).to_vec();
+}
+
+/// Take a module the closure build made for one of this program's libraries.
+///
+/// The whole point of the project, finally reaching the browser: the object
+/// was translated ahead of time, so the guest never pays a dispatch miss for
+/// it at all. The module is `Linkage::Shared` -- it imports the memory and
+/// the dispatch tables and fills them itself, exactly as a runtime
+/// translation does -- so nothing new is needed to install it. What is
+/// needed is the metadata: which pages it covers and at which base, and how
+/// far the table must reach.
+///
+/// The bases are the build's, and they are safe to take without checking
+/// because one `PageTable` in `gexc` allocated every object of the closure
+/// including the image module this process is running. They cannot collide
+/// with each other and they cannot collide with the image.
+///
+/// Returns the slot count the table must be grown to, or zero if the
+/// metadata could not be read -- in which case the caller must not install
+/// the module, since its blocks would land in slots nothing has claimed.
+#[no_mangle]
+pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
+    let Some(meta) = gex_xlate::Metadata::decode(shim_slice(ptr, len)) else {
+        return 0;
+    };
+    with_host(|h| {
+        let mut gm = GuestMem::new(guest_bytes());
+        for (page, base) in &meta.dir_entries {
+            h.jit.page_table.assign(*page, *base);
+            // And the guest's own directory, which is what a branch reads.
+            // The image module publishes its own as a data segment; a
+            // `Shared` module has no memory of its own to put one in, so the
+            // host writes them.
+            let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, *base);
+        }
+        h.jit.page_table.advance_to(meta.next_slot);
+        h.jit.page_table.slots() as u32
+    })
 }
 
 /// The directory the guest starts in, staged until it is loaded.
