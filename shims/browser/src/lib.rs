@@ -281,6 +281,28 @@ extern "C" {
     fn k_sock_close(id: i32);
     fn k_sock_shutdown(id: i32);
     fn k_sock_exists(path: u32, path_len: u32) -> i32;
+
+    // The GPU's client numbers. One renderer, one canvas, and every drawing
+    // process a client of it -- so the number cannot come from a table each
+    // process keeps for itself.
+    fn k_virgl_take() -> i32;
+    fn k_virgl_release(id: i32);
+}
+
+/// Claim a renderer session number, or -1 when there is no global kernel to
+/// claim it from -- in which case the caller falls back to its own table,
+/// which is right when there is only one process.
+pub(crate) fn virgl_take_session() -> i32 {
+    if unsafe { k_present() } == 0 {
+        return -1;
+    }
+    unsafe { k_virgl_take() }
+}
+
+pub(crate) fn virgl_release_session(id: i32) {
+    if unsafe { k_present() } != 0 {
+        unsafe { k_virgl_release(id) };
+    }
 }
 
 // A wasm import is `unsafe`, and `Remote` holds safe fn pointers, so each one
@@ -1459,7 +1481,10 @@ pub extern "C" fn gex_host_bind(path: u32, path_len: u32) -> i32 {
         // but anything that checks the path exists first is told there is
         // nothing there. Mesa connects without looking; Xlib does not, and
         // neither does a shell script guarding on `test -S`.
-        h.root.add_socket(name);
+        //
+        // Through the mount, because with a global kernel `h.root` is this
+        // process's own `TmpFs` and nothing is mounted on it.
+        let _ = h.kernel.vfs.mksocket(name);
     });
     let mut table = HOST_LISTENERS.0.borrow_mut();
     table.push(listener);
@@ -1656,9 +1681,13 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     let virgl = mount_devices(&mut kernel);
     // And the socket in the filesystem, so a guest that looks before it
     // connects finds it. `connect` goes through the name table and never
-    // needed this; `test -e` does.
+    // needed this; `test -e` does, and so does the gears script.
+    //
+    // Through the mount rather than into `root` directly: with a global
+    // kernel `root` is this process's own `TmpFs` and is not mounted
+    // anywhere, so a node added to it is a node nothing can see.
     if virgl.is_some() {
-        root.add_socket(crate::virgl::DEFAULT_SOCKET);
+        let _ = kernel.vfs.mksocket(crate::virgl::DEFAULT_SOCKET);
     }
     // `/tmp` is part of the root filesystem rather than a mount of its own,
     // so a page can bundle a file at any path at all. A mount there meant a

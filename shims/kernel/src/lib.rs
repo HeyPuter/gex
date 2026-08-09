@@ -900,3 +900,43 @@ fn path_of_raw(at: u32, len: u32) -> String {
     }
     String::from_utf8_lossy(&buf).into_owned()
 }
+
+// -- the GPU's session numbers -----------------------------------------------
+//
+// There is one renderer and one canvas, and every guest process that draws is
+// a client of it. The number identifying a client is the renderer's own
+// context id, so two processes must never pick the same one -- and each
+// process builds its own device object, so scanning a local table gave both
+// of them zero. What that looked like was two guests announcing "session 1"
+// and the renderer refusing the stream: a second client had claimed the
+// first's resources, which is corruption rather than contention.
+//
+// So the numbers come from here, where there is one of them.
+
+/// Which client numbers the renderer has out. Sixteen, matching the shim's
+/// `MAX_SESSIONS` -- the renderer keeps a fixed table, so a long run that
+/// opens and closes windows gives numbers back rather than counting upwards.
+static VIRGL_TAKEN: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+
+/// Claim a session number, or -1 if the renderer has no room.
+#[no_mangle]
+pub extern "C" fn k_virgl_take() -> i32 {
+    note_panics();
+    let mut bits = VIRGL_TAKEN.lock().unwrap_or_else(|e| e.into_inner());
+    for i in 0..16u32 {
+        if *bits & (1 << i) == 0 {
+            *bits |= 1 << i;
+            return i as i32;
+        }
+    }
+    -1
+}
+
+/// Give one back, when the client's socket closes.
+#[no_mangle]
+pub extern "C" fn k_virgl_release(id: i32) {
+    note_panics();
+    if (0..16).contains(&id) {
+        *VIRGL_TAKEN.lock().unwrap_or_else(|e| e.into_inner()) &= !(1u32 << id);
+    }
+}

@@ -230,6 +230,7 @@ impl VirglDevice {
         });
         for id in freed {
             inner.taken[id as usize] = false;
+            crate::virgl_release_session(id as i32);
         }
     }
 }
@@ -238,7 +239,17 @@ impl HostListener for VirglDevice {
     fn accept(&self, peer: Arc<UnixSocket>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.accepted += 1;
-        let Some(id) = (0..MAX_SESSIONS).find(|&i| !inner.taken[i]) else {
+        // From the global kernel when there is one: the number is the
+        // renderer's own context id, there is one renderer, and every drawing
+        // process is a client of it. A table each process keeps for itself
+        // gave two of them zero.
+        let shared = crate::virgl_take_session();
+        let picked = if shared >= 0 {
+            Some(shared as usize)
+        } else {
+            (0..MAX_SESSIONS).find(|&i| !inner.taken[i])
+        };
+        let Some(id) = picked else {
             // Refused out loud. A client given a number already in use would
             // render into another program's resources, which looks like
             // corruption rather than like being turned away.

@@ -550,6 +550,7 @@ export class Gex {
       'k_sock_bind', 'k_sock_connect', 'k_sock_accept', 'k_sock_pending',
       'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable',
       'k_sock_available', 'k_sock_close', 'k_sock_shutdown', 'k_sock_exists',
+      'k_virgl_take', 'k_virgl_release',
     ];
     // Not imported by the shim -- the host reads it after a crash -- so it is
     // not in the list above and its absence is not a link error.
