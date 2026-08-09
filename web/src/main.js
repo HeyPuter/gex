@@ -198,6 +198,16 @@ DEMOS.forEach((d, i) => {
 // -- start ----------------------------------------------------------------
 
 (async function start() {
+  // `?harness=1` is not a demo. It boots the runtime against a rootfs served
+  // from a real directory and then answers commands over HTTP for as long as
+  // the driver is there -- see `web/test/harness.mjs`. Nothing of the site's
+  // UI is involved, because the point is to pay for the browser once and ask
+  // many questions, rather than reload the page for each one.
+  if (new URLSearchParams(location.search).get('harness')) {
+    const { start: harness } = await import('./harness.js');
+    await harness();
+    return;
+  }
   ui.engine.textContent = navigator.userAgent.includes('Firefox') ? 'spidermonkey' : 'v8';
   term.writeln(ansi.bold('gex') + ansi.dim(' — AArch64 Linux programs, recompiled to WebAssembly'));
   term.writeln('');

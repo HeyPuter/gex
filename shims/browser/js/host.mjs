@@ -282,6 +282,23 @@ export class ProcessHost {
         break;
       }
       case 'exit':
+        // What each process paid, to the console, in the browser.
+        //
+        // The page passes no `onExit`, so these numbers -- how long a process
+        // spent translating, how many blocks it lifted, how much it took from
+        // what other processes had already done -- were computed and thrown
+        // away. Only the Node harness ever printed them, and when the two
+        // hosts disagreed there was nothing to compare. The Node side prints
+        // its own, hence the guard.
+        if (typeof window !== 'undefined' && m.millis !== undefined) {
+          console.log(
+            `[gex] pid ${pid}: ${m.millis}ms translating ${m.blocks} blocks` +
+              (m.reuse
+                ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]}` +
+                  ` noident=${m.reuse[3]} served=${m.reuse[4]} stored=${m.reuse[5]}`
+                : ''),
+          );
+        }
         // Before the release, because releasing terminates the Worker and a
         // handler that wanted to ask it anything else would be too late.
         this.#onExit(m, pid);
