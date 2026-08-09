@@ -231,6 +231,12 @@ static void gex_present(uint32_t handle) {
         /* A look at what is about to be blitted, from the middle of it. Four
          * hundred pixels is enough to tell a picture from a black rectangle
          * and small enough to cost nothing at thirty frames a second. */
+        /* Not every frame. `glReadPixels` waits for the GPU, and a stall per
+         * present is a real cost for a number whose whole job is to say
+         * whether anything is ever drawn. The first few answer that, and one
+         * in sixty-four keeps answering it. */
+        static int seen;
+        if (seen < 8 || seen % 64 == 0) {
         unsigned char px[20 * 20 * 4];
         GLint sx = (GLint)info.width / 2 - 10, sy = (GLint)info.height / 2 - 10;
         if (sx < 0) sx = 0;
@@ -242,6 +248,8 @@ static void gex_present(uint32_t handle) {
             if (v > gex_brightest) gex_brightest = v;
         }
         if (gex_brightest > 8) gex_lit++;
+        }
+        seen++;
         glBlitFramebuffer(0, 0, (GLint)info.width, (GLint)info.height,
                           0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         gex_presented++;

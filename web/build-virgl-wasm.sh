@@ -341,6 +341,69 @@ if 'gex_array_id' not in s:
         "   GLuint gex_array_id;\n   GLsizeiptr gex_array_size;\n", 1)
     assert 'gex_array_id' in s, 'the resource struct did not match'
     open(p, 'w').write(s)
+
+# The mirrors are only refilled when the guest has written the buffer.
+#
+# The copy is a round trip through the host -- out with `getBufferSubData`,
+# back with `glBufferSubData` -- and doing it per draw cost about a third of
+# the frame rate. Almost none of those copies were needed: a mesh is uploaded
+# once and drawn every frame, so the mirror is already right.
+#
+# `vrend_transfer_write` is the only way a guest changes a buffer's contents,
+# so a counter bumped there and remembered by each mirror is exact.
+p = f'{src}/src/vrend_renderer.h'
+s = open(p).read()
+if 'gex_writes' not in s:
+    s = s.replace(
+        "   GLuint gex_array_id;\n   GLsizeiptr gex_array_size;\n",
+        "   GLuint gex_array_id;\n   GLsizeiptr gex_array_size;\n"
+        "   /* Bumped by every write to this buffer; each mirror remembers the\n"
+        "    * value it was filled at, so an unchanged buffer is not copied. */\n"
+        "   uint64_t gex_writes;\n"
+        "   uint64_t gex_elem_writes;\n"
+        "   uint64_t gex_array_writes;\n", 1)
+    assert 'gex_writes' in s, 'the resource struct did not match'
+    open(p, 'w').write(s)
+
+p = f'{src}/src/vrend_renderer.c'
+s = open(p).read()
+if 'gex_writes++' not in s:
+    s = s.replace(
+        "      glBindBufferARB(res->target, res->id);\n"
+        "      data = glMapBufferRange(res->target, info->box->x, info->box->width, map_flags);",
+        "      res->gex_writes++;\n"
+        "      glBindBufferARB(res->target, res->id);\n"
+        "      data = glMapBufferRange(res->target, info->box->x, info->box->width, map_flags);", 1)
+    assert 'gex_writes++' in s, 'the buffer write did not match'
+    # And the two mirrors consult it.
+    s = s.replace(
+        "   gex_mirror_copy(res->id, res->gex_elem_id, GL_ELEMENT_ARRAY_BUFFER, size);",
+        "   if (res->gex_elem_writes != res->gex_writes + 1) {\n"
+        "      gex_mirror_copy(res->id, res->gex_elem_id, GL_ELEMENT_ARRAY_BUFFER, size);\n"
+        "      res->gex_elem_writes = res->gex_writes + 1;\n"
+        "   }", 1)
+    s = s.replace(
+        "   gex_mirror_copy(res->id, res->gex_array_id, GL_ARRAY_BUFFER, size);",
+        "   if (res->gex_array_writes != res->gex_writes + 1) {\n"
+        "      gex_mirror_copy(res->id, res->gex_array_id, GL_ARRAY_BUFFER, size);\n"
+        "      res->gex_array_writes = res->gex_writes + 1;\n"
+        "   }", 1)
+    # A resized mirror is empty whatever the counters say.
+    s = s.replace(
+        "      glBufferData(GL_ELEMENT_ARRAY_BUFFER, size, NULL, GL_DYNAMIC_DRAW);\n"
+        "      res->gex_elem_size = size;",
+        "      glBufferData(GL_ELEMENT_ARRAY_BUFFER, size, NULL, GL_DYNAMIC_DRAW);\n"
+        "      res->gex_elem_size = size;\n"
+        "      res->gex_elem_writes = 0;", 1)
+    s = s.replace(
+        "      glBufferData(GL_ARRAY_BUFFER, size, NULL, GL_DYNAMIC_DRAW);\n"
+        "      res->gex_array_size = size;",
+        "      glBufferData(GL_ARRAY_BUFFER, size, NULL, GL_DYNAMIC_DRAW);\n"
+        "      res->gex_array_size = size;\n"
+        "      res->gex_array_writes = 0;", 1)
+    assert 'gex_elem_writes = res->gex_writes + 1' in s, 'the elem mirror did not match'
+    assert 'gex_array_writes = res->gex_writes + 1' in s, 'the array mirror did not match'
+    open(p, 'w').write(s)
 PATCH
 
 # -- the epoxy stand-in -----------------------------------------------------
