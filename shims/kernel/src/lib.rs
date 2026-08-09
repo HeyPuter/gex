@@ -1,3 +1,6 @@
+// `memory.atomic.wait32` and `memory.atomic.notify` are still unstable in
+// core; this module is nightly-only already, for the same reason.
+#![feature(stdarch_wasm_atomic_wait)]
 //! The global kernel module.
 //!
 //! One module, one memory, shared by every Worker of every guest process.
@@ -85,6 +88,67 @@ pub extern "C" fn k_stack_size() -> u32 {
 #[no_mangle]
 pub extern "C" fn k_stack_count() -> u32 {
     STACK_COUNT
+}
+
+/// The word every Worker waits on, and every Worker bumps.
+///
+/// A guest that blocks -- reading a socket the other end of which is another
+/// process, waiting for a child, waiting on a futex -- used to be woken by
+/// nothing at all. Its Worker unwound out of wasm and the JavaScript around
+/// it asked "is anything runnable yet?" over and over, once a millisecond,
+/// until the answer changed. Nobody told it. That millisecond was the floor
+/// on every interaction between two guest processes, and an X client and an
+/// X server pay it twice a frame.
+///
+/// This is where the telling happens. It has to be here and nowhere else:
+/// `memory.atomic.wait32` and `memory.atomic.notify` act on the memory the
+/// module addresses, and this module's memory is the one every Worker of
+/// every process shares. A word in a *process's* memory can only be seen by
+/// that process's own threads, which is the wrong scope entirely.
+///
+/// A counter rather than a flag, so a wake that arrives between deciding to
+/// park and parking is not lost: the parker samples the value first and asks
+/// to sleep only while it is still that value.
+static WAKE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn wake_addr() -> *mut i32 {
+    &WAKE as *const std::sync::atomic::AtomicI32 as *mut i32
+}
+
+/// What the counter reads now. Sampled before a Worker decides to park.
+#[no_mangle]
+pub extern "C" fn k_wake_seq() -> i32 {
+    WAKE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Something happened that another Worker may have been waiting for.
+///
+/// Called after every syscall rather than at the handful of places that
+/// obviously make someone else runnable. Deciding *which* calls those are is
+/// a judgement that has to be right every time -- a socket write, a pipe
+/// write, an exit, a futex wake, a signal, a file created where somebody is
+/// waiting for it to appear -- and being wrong once is a process that sleeps
+/// through its wake-up. A notify with nobody waiting is a few nanoseconds.
+#[no_mangle]
+pub extern "C" fn k_wake() {
+    WAKE.fetch_add(1, std::sync::atomic::Ordering::Release);
+    // SAFETY: the address of a static in this module's own shared memory,
+    // which is what this instruction requires.
+    unsafe {
+        core::arch::wasm32::memory_atomic_notify(wake_addr(), u32::MAX);
+    }
+}
+
+/// Sleep until the counter leaves `seq`, or `ns` nanoseconds pass.
+///
+/// Returns 0 woken, 1 "the value had already moved", 2 timed out -- the
+/// instruction's own answers. A negative `ns` waits for ever, which nothing
+/// here asks for: a bound is what keeps a Worker answerable to the page.
+#[no_mangle]
+pub extern "C" fn k_park(seq: i32, ns: i64) -> i32 {
+    // SAFETY: as above. Blocking is allowed here because every guest runs in
+    // a Worker; the page's own thread never enters this module.
+    unsafe { core::arch::wasm32::memory_atomic_wait32(wake_addr(), seq, ns) }
 }
 
 /// What this module last panicked with, so a crash in here can be read.

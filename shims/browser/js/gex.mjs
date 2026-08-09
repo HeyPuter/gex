@@ -131,6 +131,8 @@ const TABLE_NAMES = [
 
 export class Gex {
   #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #virgl = null; #virglTrace = false;
+  // The channel `#turn` posts to itself on, made once and kept.
+  #tick = null;
   // How many of the process's translated modules *this* Worker has put into
   // its own dispatch tables. Per Worker, not per process: the tables belong to
   // a module instance and instances are not shared, so every thread starts
@@ -167,6 +169,61 @@ export class Gex {
    * time. Processes still never share memory with each other; that is what
    * keeps two of them from putting libraries at the same addresses.
    */
+  /**
+   * A millisecond that is actually a millisecond.
+   *
+   * `setTimeout(…, 1)` is not one. Once five timers nest, the HTML spec has
+   * the browser clamp the delay to four milliseconds, and a park loop is
+   * nothing but nested timers -- so every park cost four milliseconds no
+   * matter how quickly the thing being waited for arrived. glxgears is the
+   * case: a frame is a handful of parks, the client writing to the X server
+   * and waiting, the server answering and waiting, and at four milliseconds
+   * each that is a frame time of thirty-odd milliseconds. Which is exactly
+   * the thirty frames a second the demo held whatever else changed --
+   * nine times fewer pixels did not move it, and neither did halving the
+   * round trips to the renderer, because neither was what it was spending.
+   *
+   * The nesting level comes from the task the timer is *set* in, and a
+   * message is not a timer: going through a `MessageChannel` first puts the
+   * level back to zero, so the millisecond asked for is the millisecond
+   * given.
+   *
+   * Not a bare message task, tempting as it is. That spins: this loop would
+   * turn as fast as the Worker can post to itself, and a page running four
+   * guest processes has four Workers doing it, which starves the one thread
+   * that serves the renderer. Measured, that is 0.4 frames a second -- far
+   * worse than the clamp it removes.
+   */
+  /**
+   * One turn of the event loop and nothing more.
+   *
+   * For after a `gex_park`, which has already done the waiting: what is
+   * wanted here is only to let the messages that arrived while this Worker
+   * was asleep be delivered. A message task rather than a timer because
+   * there is nothing to wait for, and once per park is not a spin.
+   */
+  #turn() {
+    if (!this.#tick) {
+      this.#tick = new MessageChannel();
+      this.#tick.port1.start();
+    }
+    return new Promise((r) => {
+      this.#tick.port1.onmessage = () => r();
+      this.#tick.port2.postMessage(0);
+    });
+  }
+
+  #nap() {
+    if (!this.#tick) {
+      this.#tick = new MessageChannel();
+      this.#tick.port1.start();
+    }
+    return new Promise((r) => {
+      this.#tick.port1.onmessage = () => setTimeout(r, 1);
+      this.#tick.port2.postMessage(0);
+    });
+  }
+
   constructor(env = new Env(), { shared = false, memory = null, kernel = null } = {}) {
     this.#env = env;
     // `memory` adopts a process's existing address space rather than making
@@ -357,7 +414,8 @@ export class Gex {
     // instead, once, where it says what to do about it.
     const required = [
       'gex_alloc', 'gex_load', 'gex_add_file', 'gex_push_stdin', 'gex_wake',
-      'gex_paused_for_input', 'gex_paused_for_net', 'gex_resume_pc',
+      'gex_paused_for_input', 'gex_paused_for_net', 'gex_paused_for_host',
+      'gex_park', 'gex_resume_pc',
       'gex_resume_ctx', 'gex_exit_code', 'gex_jit_pending_len',
     ];
     const missing = required.filter((n) => typeof this.#shim.exports[n] !== 'function');
@@ -648,6 +706,7 @@ export class Gex {
       'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable',
       'k_sock_available', 'k_sock_close', 'k_sock_shutdown', 'k_sock_exists',
       'k_virgl_take', 'k_virgl_release',
+      'k_wake_seq', 'k_wake', 'k_park',
     ];
     // Not imported by the shim -- the host reads it after a crash -- so it is
     // not in the list above and its absence is not a link error.
@@ -1190,9 +1249,31 @@ export class Gex {
                 await new Promise((r) => setTimeout(r, 1));
               }
             } else {
-              // A timer rather than a microtask: a microtask would run before
-              // the socket callbacks this is waiting for.
-              await new Promise((r) => setTimeout(r, 1));
+              // A task rather than a microtask: a microtask would run before
+              // Asleep on the shared word, when nothing here is waiting on
+              // the page.
+              //
+              // `gex_park` blocks this Worker inside the global kernel's
+              // memory until another Worker bumps the wake counter -- which
+              // every syscall does -- or the bound passes. That is a wake
+              // rather than a poll: the X server answering its client makes
+              // the client runnable in microseconds instead of at whatever
+              // interval this loop happened to be turning at.
+              //
+              // The bound is what keeps the Worker answerable. It is asleep,
+              // so the messages the host posts it -- a keystroke, a window
+              // size, a child to adopt -- are queued rather than delivered,
+              // and the turn below is when that queue runs.
+              //
+              // -1 is "there is no global kernel to sleep on", and a guest
+              // waiting on the network cannot sleep at all: the bytes it
+              // wants arrive on this Worker's own event loop.
+              if (e.gex_paused_for_host() || e.gex_park(20) < 0) {
+                // See `#nap` for why this is not a bare `setTimeout`.
+                await this.#nap();
+              } else {
+                await this.#turn();
+              }
             }
             woke = e.gex_wake();
             if (woke === 1) break;

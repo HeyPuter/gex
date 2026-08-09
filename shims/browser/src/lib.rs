@@ -214,6 +214,11 @@ impl net::NetStack for WispNet {
 extern "C" {
     /// Is there a global kernel behind these calls at all?
     fn k_present() -> i32;
+    /// The wake counter in the shared memory: read it, bump it, sleep on it.
+    /// See `k_wake` in the kernel module for why it lives over there.
+    fn k_wake_seq() -> i32;
+    fn k_wake();
+    fn k_park(seq: i32, ns: i64) -> i32;
     fn k_spawn(ppid: i32) -> i32;
     fn k_exit(pid: i32, status: i32);
     fn k_reap(pid: i32);
@@ -2283,9 +2288,80 @@ pub extern "C" fn gex_paused_for_net() -> i32 {
     with_host(|h| (paused() & 2 != 0) as i32)
 }
 
+/// Whether ending this wait needs the page's own event loop to turn.
+///
+/// The narrow half of `gex_paused_for_net`. A guest waiting on another guest
+/// process is waiting on a different Worker, which will bump the shared wake
+/// word when it gets there -- so this Worker can sleep on that word and be
+/// woken in microseconds. A guest waiting on the network is waiting on a
+/// callback that runs on *this* Worker's event loop, and sleeping is exactly
+/// how it never arrives.
+#[no_mangle]
+pub extern "C" fn gex_paused_for_host() -> i32 {
+    with_host(|h| (paused() & 4 != 0) as i32)
+}
+
 /// Carry on after input has arrived: pick a thread and say where to re-enter.
 ///
 /// Returns 1 when there is somewhere to go, 2 when the guest is finished.
+#[no_mangle]
+/// The wake counter as it read when this Worker last looked at its threads.
+static WAKE_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Sleep until another Worker does something, or `max_ms` passes.
+///
+/// The park loop used to be a poll: unwind out of wasm, ask "anything yet?",
+/// go round the event loop, ask again. Nothing ever told it, so the interval
+/// it asked at was the latency of every interaction between two guest
+/// processes -- and an X client and an X server pay that twice a frame.
+///
+/// This blocks instead, on a word in the global kernel's memory that every
+/// Worker of every process can see and that every syscall bumps. The wait is
+/// bounded so a Worker still comes back to its event loop for the things only
+/// the page can deliver, and it is cut short by anything with a deadline: a
+/// guest asleep for a hundred microseconds must not be woken in fifty
+/// milliseconds because that was the bound.
+///
+/// Returns the instruction's own answer: 0 woken, 1 the counter had already
+/// moved, 2 timed out. -1 means there is no global kernel to wait on, and
+/// the caller should go round its event loop as before.
+#[no_mangle]
+pub extern "C" fn gex_park(max_ms: u32) -> i32 {
+    if unsafe { k_present() } == 0 {
+        return -1;
+    }
+    let mut ns = max_ms as u64 * 1_000_000;
+    // The nearest deadline any thread of this process is holding. A `sleep`
+    // and a `poll` with a timeout are both waits the clock ends rather than
+    // another Worker, and sleeping past them is how a program that asks to be
+    // woken in a millisecond gets woken in fifty.
+    let now = now_ns();
+    let soonest = with_host(|h| {
+        h.threads
+            .iter()
+            .filter_map(|t| match &t.waiting {
+                Waiting::Sleep(at) => Some(*at),
+                Waiting::Futex { deadline, .. } => *deadline,
+                Waiting::Net(deadline) => *deadline,
+                _ => None,
+            })
+            .min()
+    });
+    if let Some(at) = soonest {
+        ns = ns.min(at.saturating_sub(now));
+    }
+    // And never nothing.
+    //
+    // A deadline already in the past subtracts to zero, and a zero-nanosecond
+    // wait returns the instant it is made -- so a thread holding an expired
+    // deadline that the scheduler has not yet acted on turns this loop as
+    // fast as the Worker can go. Measured, a million turns in a minute. The
+    // floor is what the old poll interval was, so a wait the clock ends is no
+    // worse than it was, while a wait another Worker ends is still immediate.
+    ns = ns.max(1_000_000);
+    unsafe { k_park(WAKE_SEEN.load(std::sync::atomic::Ordering::Relaxed), ns as i64) }
+}
+
 #[no_mangle]
 pub extern "C" fn gex_wake() -> i32 {
     // Counted, because the shape that hides is not a stall but a cycle. A
@@ -2436,6 +2512,9 @@ pub extern "C" fn gex_recent_syscalls(out: u32, max: u32) -> u32 {
     n as u32
 }
 
+/// Nanoseconds spent inside each syscall number, filled in by `gex_syscall`.
+static mut SYS_NS: [u64; 512] = [0; 512];
+
 fn count_syscall() {
     if unsafe { HEARTBEAT } == 0 {
         return;
@@ -2487,6 +2566,30 @@ fn count_syscall() {
         line.push_str(&format!(
             " {}={c}",
             gex_kernel::syscalls::syscall_name(nr as u64)
+        ));
+    }
+    line.push('\n');
+    trace_line(&line);
+    // And the same list ordered by time rather than by count. The two answer
+    // different questions, and for a run that is slow rather than busy it is
+    // always this one: a single call made twice a frame and taking fifteen
+    // milliseconds is invisible in a census and is the whole story here.
+    let mut slow: Vec<(u64, usize)> = unsafe {
+        SYS_NS
+            .iter()
+            .enumerate()
+            .filter(|(_, &t)| t > 0)
+            .map(|(i, &t)| (t, i))
+            .collect()
+    };
+    slow.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    slow.truncate(8);
+    let mut line = String::from("[gex] syscall ms:");
+    for (t, nr) in slow {
+        line.push_str(&format!(
+            " {}={}",
+            gex_kernel::syscalls::syscall_name(nr as u64),
+            t / 1_000_000
         ));
     }
     line.push('\n');
@@ -2561,6 +2664,14 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             .unwrap_or(!0) as u32,
         std::sync::atomic::Ordering::Relaxed,
     );
+    // How long each kind of syscall takes, when there is a heartbeat.
+    //
+    // Counts alone cannot answer the question glxgears asks: it holds a
+    // steady thirty frames a second while making only a few hundred calls,
+    // so whatever the frame is spending is spent *inside* one of them and
+    // the census says every one is rare. A blocking call parks the Worker
+    // in here, so this covers the waiting as well as the work.
+    let began = if unsafe { HEARTBEAT } != 0 { now_ns() } else { 0 };
     let stop = with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
@@ -2737,6 +2848,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         }
     });
+    if began != 0 {
+        let nr = LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        if nr < 512 {
+            unsafe { SYS_NS[nr] = SYS_NS[nr].saturating_add(now_ns() - began) };
+        }
+    }
+    // Whatever that call did, somebody else may have been waiting for it.
+    //
+    // After every syscall rather than after the ones that obviously matter.
+    // A write into a socket, a write into a pipe, an exit, a signal, a futex
+    // wake, a file appearing where another process is waiting for it -- the
+    // list is long, it is not obviously closed, and being wrong about one
+    // entry is a process that sleeps through its wake-up and a run that
+    // stops. The notify costs nothing when nobody is parked.
+    if unsafe { k_present() } != 0 {
+        unsafe { k_wake() };
+    }
     // Objects the guest has just mapped, statically recompiled in bulk
     // before it can branch into one.
     //
@@ -3794,6 +3922,13 @@ fn report_idle(why: u8) {
 }
 
 fn schedule() -> i32 {
+    // What the wake counter read *before* anything was asked about what is
+    // runnable, so that a wake arriving while this makes up its mind cannot
+    // be slept through. `gex_park` sleeps only while the counter is still
+    // this, and a bump between here and there makes the sleep return at once.
+    if unsafe { k_present() } != 0 {
+        WAKE_SEEN.store(unsafe { k_wake_seq() }, std::sync::atomic::Ordering::Relaxed);
+    }
     // Unconditional, and at the top, because every other counter in this file
     // sits on a path that can be missed. A run has now spent seven minutes
     // pinning a core while producing no safepoint, no dispatch miss, no
@@ -3918,6 +4053,23 @@ fn schedule() -> i32 {
                         .unwrap_or(false)
                 };
                 let mut mask = 0u8;
+                // Bit 2: the page, and only the page, can end this wait.
+                //
+                // Bit 1 has always meant "give the stack back and turn the
+                // event loop", and it covers two quite different things: a
+                // wait another Worker will satisfy, and a wait the page will.
+                // The first can be slept on -- the Worker that satisfies it
+                // bumps a word in the shared memory and the sleeper wakes at
+                // once. The second cannot: the bytes arrive on this Worker's
+                // own event loop, and a Worker asleep is a Worker not running
+                // the callback that delivers them.
+                //
+                // Wisp is the whole of that second case here. A process with
+                // no network has nothing the page delivers except keystrokes,
+                // which are bit 0 and have their own path.
+                if h.kernel.net.is_some() {
+                    mask |= 4;
+                }
                 // Every thread in the run, not just the ones in the process
                 // that happens to be loaded. A shell blocked in `wait4` for a
                 // child in another process contributes nothing here, and the
