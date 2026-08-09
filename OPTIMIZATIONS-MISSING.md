@@ -517,6 +517,28 @@ So memory64 should stay behind `GEX_MEMORY64` rather than become the
 default, and the honest summary is: it trades a guard V8 can often remove
 for one it never can. Whether that is a win is a property of the program.
 
+And then perl, which was supposed to be the confirming case and is not.
+
+The reading above says memory64 wins where a program chases pointers. A
+language interpreter is the pointer-chasing program: a dispatch loop over a
+switch reached through a function pointer, hot data two hops away, a
+comparator called back from C a few hundred thousand times. So perl should
+have gained like STRING SORT. Fourteen interleaved pairs, `tests/ab.sh`:
+
+    11 of 14 pairs favour wasm32, p = 0.057 by sign test
+    median per-pair ratio: memory64 is 13% *slower*
+
+Suggestive rather than established at p = 0.057, and stated that way. But it
+points the wrong way for the story, and the story should be weakened
+accordingly: the honest summary is not "memory64 wins on pointer-chasing
+code". It is that **STRING SORT gains and everything else measured so far
+loses** -- NUMERIC SORT -16.7%, IDEA -27.4%, perl -13%, gzip nothing. One
+kernel out of five programs is not a rule, it is an exception waiting for an
+explanation, and I do not have one. Do not build on it.
+
+What survives regardless: memory64 modules are 11-14% smaller, and it traps
+on wild pointers below 4 GiB that the guard lets through.
+
 That is not a contradiction of the 62.9% above -- it is a scoping of it.
 That figure is nbench STRING SORT, which chases pointers; gzip indexes
 arrays with induction variables. The guard is pure arithmetic on the address

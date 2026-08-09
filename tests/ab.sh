@@ -12,10 +12,12 @@
 # rather than the ratio of medians. A pair where the machine stalled moves
 # both sides and its ratio stays near 1.
 #
-# It also prints the spread of A against itself, which is the number that
-# says whether any of this is readable. If A's own runs spread 20%, a 10%
-# difference between A and B means nothing, and the tool says so rather than
-# leaving it to be noticed.
+# The verdict is a sign test over the pairs -- how often did B lose? -- which
+# is exact under the null and assumes nothing about how run times are
+# distributed. A's raw spread is printed too, but deliberately not used as the
+# threshold: it contains all the drift that pairing exists to remove, so
+# judging against it would call everything unreadable on a machine like this
+# one. That was this script's first mistake.
 #
 #   usage: tests/ab.sh N -- cmd-A... -- cmd-B...
 #   e.g.   tests/ab.sh 5 -- ./run 32.wasm -- ./run 64.wasm
@@ -113,13 +115,38 @@ printf 'B median %sms\n' "$bmed"
 printf 'median per-pair ratio B/A: %s  (%s%%)\n' "$ratio" \
     "$(awk "BEGIN{printf \"%+.1f\", 100*($ratio-1)}")"
 
-# The honest verdict. A change smaller than A's own spread is not a result,
-# and saying so here is cheaper than remembering to ask every time.
-awk -v spread="$(awk "BEGIN{print 100*($amax-$amin)/$amed}")" \
-    -v change="$(awk "BEGIN{print 100*($ratio-1)}")" 'BEGIN {
-    c = change < 0 ? -change : change
-    if (c < spread)
-        printf "NOT READABLE: the %.1f%% difference is inside A'\''s own %.1f%% spread.\n", c, spread
-    else
-        printf "readable: %.1f%% is outside A'\''s own %.1f%% spread.\n", c, spread
-}'
+# The honest verdict, by sign test on the pairs.
+#
+# Not by comparing the change to A's raw spread, which is what this did first
+# and which is the wrong test for a paired design: A's spread includes all the
+# drift that pairing exists to cancel, so it would call everything unreadable
+# on a machine like this one. What pairing buys is that each pair is its own
+# controlled experiment, and the question becomes "how often did B lose?" --
+# which has an exact answer under the null with no assumption about the
+# distribution of times.
+#
+# Two-sided binomial tail on the number of pairs favouring one side.
+paste "$WORK/a" "$WORK/b" | awk '
+    function choose(n, k,   i, r) {
+        if (k < 0 || k > n) return 0
+        r = 1
+        for (i = 0; i < k; i++) r = r * (n - i) / (i + 1)
+        return r
+    }
+    { n++; if ($2 > $1) wins++; else if ($2 < $1) losses++ }
+    END {
+        k = wins > losses ? wins : losses
+        tail = 0
+        for (i = k; i <= n; i++) tail += choose(n, i)
+        p = 2 * tail / (2 ^ n)
+        if (p > 1) p = 1
+        printf "%d of %d pairs favour %s (p = %.3f by sign test)\n",
+            k, n, (wins > losses ? "A" : "B"), p
+        if (p <= 0.05)
+            print "readable: the sides differ."
+        else if (p <= 0.15)
+            printf "SUGGESTIVE ONLY: p = %.3f. Run more pairs before believing it.\n", p
+        else
+            printf "NOT READABLE: p = %.3f, which is what a coin does.\n", p
+    }
+'
