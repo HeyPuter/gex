@@ -239,9 +239,35 @@ async function bootDebian(ctx) {
       ctx.setNet('off');
     }
 
+    // A statically recompiled closure, when one has been built for this
+    // rootfs.
+    //
+    // This is the configuration the project exists for and the site has never
+    // run in it: only the harness page could be given a closure, so every
+    // measurement of the demo has been of the runtime translator, which is
+    // the secondary path. Trying costs nothing -- `loadClosure` answers
+    // `null` when there is no manifest, and the demo then runs exactly as it
+    // did before.
+    //
+    // No image module. pid 1 here is `bash`, and an image module is one
+    // program's own text: hand `bash` the one built for `apt-get` and it
+    // starts inside another program's code and exits without making a
+    // syscall. The libraries are the point anyway -- libapt, libstdc++ and
+    // libc are what every one of apt's fifty processes pays to translate.
+    ctx.busy('loading the closure');
+    const { loadClosure } = await import('./closure.js');
+    const closure = await loadClosure('/closure/debian', {
+      log: (s) => ctx.term.writeln(ctx.ansi.dim(s)),
+    });
+
     ctx.idle();
     ctx.term.reset();
     ctx.term.writeln(ctx.ansi.dim(`rootfs: ${Object.keys(files).length} files`));
+    if (closure) {
+      ctx.term.writeln(
+        ctx.ansi.dim(`closure: ${closure.libs.length} libraries, translated ahead of time`),
+      );
+    }
     ctx.term.writeln(
       ctx.ansi.dim(network ? 'network: wisp' : 'network: none -- apt will not reach a mirror'),
     );
@@ -264,6 +290,7 @@ async function bootDebian(ctx) {
       args: cmd ? ['/bin/bash', '/cmd.sh'] : ['/bin/bash', '-i'],
       cwd: '/root',
       tty: true,
+      closure,
       network,
       onNetEvent: (e) => ctx.setNet(e.split(' ')[0]),
       // Root, because that is who /root belongs to and who a package
