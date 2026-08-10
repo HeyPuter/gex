@@ -1763,6 +1763,20 @@ export class Gex {
             // past its end, which is a diagnosis pointing at the wrong thing.
             const at = slot + ((Number(guest) & 0xfff) >> 2);
             const len = tables[idx]?.length ?? 0;
+            // Asked, not computed. Every report so far has worked out an
+            // index, compared it against a length, found it comfortably
+            // inside and said so -- while the engine insisted the same
+            // dispatch was out of bounds. One of the two is wrong about which
+            // table this is, and `get` settles it: a `RangeError` means the
+            // table really is short and the length here is not the length the
+            // branch met; a function back means the branch would have worked
+            // and the trap belongs to some other table operation entirely.
+            let probe;
+            try {
+              probe = tables[idx].get(at) ? 'holds a function' : 'is empty';
+            } catch (e) {
+              probe = `cannot be read: ${e.message}`;
+            }
             // And when that entry is fine, the whole directory.
             //
             // A dispatch is for the branch's *target*, not for the address
@@ -1805,7 +1819,7 @@ export class Gex {
               `${target ? '' : ' (no target recorded, so this is where enter was called)'}` +
               `, page ${page} of the directory says table ${idx} slot ${slot}` +
               `, so this branch wants ${idx}[${at}] and that table is ${len} long` +
-              ` (${at < len ? 'in range, so the trap is elsewhere' : 'past the end'})` +
+              ` (${at < len ? 'in range' : 'past the end'}, and reading it says it ${probe})` +
               survey +
               `, and this process has ${tables.length} tables of ` +
               `[${tables.map((t) => t.length).join(', ')}]` +

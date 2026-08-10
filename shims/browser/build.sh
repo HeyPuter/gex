@@ -138,6 +138,23 @@ if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | gre
     fi
 fi
 
+# The seed module too, because `enter` lives in it and `enter` is emitted by
+# `gex-emit` -- the same crate this shim is built from.
+#
+# It is produced by `gexc`, not by this script, so it sat a day stale while
+# every emitter change of the day went into the shim beside it. A fix to
+# `enter`'s dispatch was written, built, and run four times against a seed
+# that did not contain it, and the crash came back byte-identical each time
+# and was read as the fix not working. `cargo build -p gex-emit` compiles the
+# library and not the binary that emits this, so even rebuilding the crate
+# does not help; `gexc` has to be rebuilt.
+#
+# Cheap: the seed translates nothing and is under two kilobytes.
+cargo build --release -p gexc 2>&1 | grep -E "^error" && exit 1
+target/release/gexc seed -o web/public/gex/seed.wasm --no-shared-memory >/dev/null
+target/release/gexc seed -o web/public/gex/seed.shared.wasm >/dev/null
+echo "  seed: rebuilt from this emitter"
+
 # And the site, which is a copy of public/ and will otherwise keep serving
 # the shim that was here a moment ago.
 web/refresh-dist.sh
