@@ -4937,7 +4937,23 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // covered for nothing. See `CLOSURE_DIRS`.
     let closure = CLOSURE_DIRS.0.borrow();
     if !closure.is_empty() {
+        let mut kept = 0usize;
         for (page, base) in closure.iter() {
+            // Not the image's pages. A closure library is pinned to an
+            // address of its own and covers the same code whatever the
+            // process goes on to run; the *image* sits at `PIE_BASE` and is
+            // replaced by this very call.
+            //
+            // Since `--shared-image` the image is a closure library like any
+            // other, so it arrived here with the rest and its entries
+            // survived the exec -- pointing the new program's pages at the
+            // old program's translated blocks. `ls | wc -l` died with
+            // `code 132, pc=0x1003f44`: SIGILL inside `ls`, executing bash.
+            // Everything below `INTERP_BASE` is the executable and its break.
+            if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+                continue;
+            }
+            kept += 1;
             h.jit.page_table.assign(*page, *base);
             let at = (gex_abi::DISPATCH_DIR + page * 4) as usize;
             if at + 4 <= data.len() {
@@ -4945,7 +4961,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             }
         }
         trace_line(&format!(
-            "[gex] exec: {} closure pages kept, {} slots\n",
+            "[gex] exec: {} closure pages kept of {}, {} slots\n",
+            kept,
             closure.len(),
             h.jit.page_table.slots()
         ));

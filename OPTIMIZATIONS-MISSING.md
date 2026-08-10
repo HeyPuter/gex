@@ -2499,3 +2499,72 @@ The manifest now names the program its image module was built from, and
 failure it prevents is silent -- the guest starts inside another program's
 code and exits without making a syscall, which reads as a program that decided
 to do nothing.
+
+### The three costs that were left, and what they turned out to be
+
+With the closure finally reachable, `bash -c /bin/true` on the demo site had
+three costs left and none of them was translation.
+
+**The image module was the guest module.** A closure's first object is emitted
+`Linkage::Own` -- it declares the memory and the tables everything else
+imports -- so in a browser it replaces the seed, and every process
+instantiates it. `bash` whole is 42 MB and 212,000 functions, and a forked
+child on its way to `execve` apt's http method paid 256ms for a shell it never
+enters. The seed already is an `Own` module that translates nothing, so
+`gexc --shared-image` emits the image as an ordinary `Shared` library:
+registered for its pages, instantiated by the first branch that lands in one.
+Worker start 293ms -> 14ms.
+
+**Registration published.** Writing a directory entry commits the table to
+being long enough to hold the slot it names, so registering all thirty-three
+libraries grew every process to the closure's 2,850,816 slots: 405ms in pid 1,
+524ms in a child, 22 MB of table each. Publication is now separate and happens
+in `fillSlot`, for the one library a branch has asked about. Four libraries
+get published in a `/bin/true`, not thirty-three.
+
+**Runtime slots forced it anyway.** The global slot counter started at zero and
+was advanced past the closure's reservation, so the first block a process
+lifted sat above 2.85M and the table had to be that long regardless -- and
+every process lifts something, if only its own program's text. The space is
+now partitioned: closures own tables 0..3 with their numbers baked in at build
+time, the run translates into tables 4..7 from a counter starting at
+`RUNTIME_SLOT_BASE`. Growth became per table to match, since one running total
+across the virtual space turns "table 4's base plus 2,048" into ten million
+entries in each of tables 0..3.
+
+    /bin/true   lived 2014ms -> 965ms
+    adopt        715ms -> 81ms, of which 30ms is a debug-only checksum
+    grow         405-524ms -> 155ms once, then 0-1ms per library
+
+What is left in the child, measured: 155ms growing, 67ms installing fourteen
+modules, 36ms for the parent's image copy, 26ms lifting `true`'s own 201
+blocks, 11ms of Worker start. Roughly 375ms of 965 accounted for; the rest is
+not yet attributed and is the next thing to instrument.
+
+### An image is not a library: what `--shared-image` broke
+
+`execve` keeps the closure's directory entries, on the reasoning that "a
+closure library covers the object it was built from whatever the process goes
+on to run". That is true of a library, which is pinned to an address of its
+own. It is false of the *image*, which sits at `PIE_BASE` and is replaced by
+the very call that keeps it -- and since `--shared-image` the image arrives
+here as a library like any other.
+
+So after `bash` forked and the child exec'd `ls`, the directory still pointed
+the pages at `0x1000000` -- now `ls` -- at bash's translated blocks. `ls | wc -l`
+died with `code 132, pc=0x1003f44`: SIGILL, inside `ls`, executing a shell.
+Then `wc` waited on a pipe nobody would write to and pid 1 waited on `wait4`,
+which is what "1024 turns with nothing runnable" was reporting.
+
+`/bin/true` hid it, twice over: it exits 0 whatever it executes, and the
+marker the test greps for is printed by bash rather than by the command. A
+check that passes without the guest doing the right thing is the same defect
+this file already records twice.
+
+`apt-get update` failed the same way and looked entirely different -- two
+processes, a stalled pipe, no output at all -- which is why it read as a
+scaling problem. A `ls | wc -l` reproduces it in ninety seconds; the apt run
+takes fifteen minutes to say less.
+
+Everything below `INTERP_BASE` is the executable and its break, so that is
+what `execve` now drops.
