@@ -2179,3 +2179,83 @@ Two lessons for the next investigation of a hang:
   nothing, and it nearly bought a codegen hunt that was not needed.
 * A byte-exact prefix is a different failure from a wrong byte, and `cmp`
   tells the two apart in one command.
+
+## What a process in the browser actually costs, measured end to end
+
+Every number below is from the demo site, and each one contradicts something
+that was believed before it was taken. The workload is ten `apt-config dump`
+in one page -- twenty processes, no network, the same shape as apt-key's tail.
+
+    pid 21 (the tenth):  797ms translating 25,006 blocks
+                        2393ms installing 815 modules
+                             (1550ms compile, 484ms instantiate, 317ms grow)
+
+And the parts no counter had ever covered:
+
+    worker exists, bundle loaded      25-28ms
+    fork image copy, 15.4 MiB         39ms
+    adopt (was 356ms)                 66ms
+
+### Instantiation is not the cost, and never was
+
+"Installing" was one number and is three. Instantiating is the *smallest* --
+about 110ms for a process's translated modules, and **2-5ms** for the nine
+megabyte shim plus the guest module together, which every Worker does. A
+`WebAssembly.Module` is structured-cloneable and the engine shares the code
+behind it, so an instance is only its own tables and globals.
+
+What looked like instantiation cost was **growing the dispatch tables**: 269ms
+per process, allocating and stub-filling 1.3 million entries before the guest
+ran an instruction. That came from making every forked child grow to its
+parent's whole slot total, which was a wrong fix for #114 -- the real cause
+there was `enter` failing to mask the table index. Deferred adoption skips it
+entirely and a child now starts in 66ms.
+
+### Byte-identical modules would buy nothing: V8 has no content-keyed cache
+
+Compiling the same 6.7 MiB module four times, under V8:
+
+    56ms, 52ms, 55ms, 46ms
+
+and a copy with one byte changed: 63ms. There is no dedupe. Chrome's wasm code
+cache is tied to *streaming* compilation from a URL and persisted in the HTTP
+cache; it does not apply to `WebAssembly.compile(bytes)` on freshly generated
+bytes inside a Worker. So #99 -- making every process emit the same bytes --
+cannot pay for itself through compile, however deterministic the slots are
+made. Worth knowing before building deterministic slot assignment, which is
+days of work.
+
+### Compile is per *module*, not per byte
+
+    6.7 MiB in one module           50ms
+    815 small modules, one process  1550ms      (~1.9ms each)
+
+Nearly all of it is fixed overhead. That points at fewer and larger modules --
+but raising `PER_MISS` from 16 to 64 moved the count only from 815 to 793 and
+the wall clock not at all, because most of those modules are not served
+batches. They are units *this process translated itself*.
+
+### The open question: 25,000 blocks lifted with the object already in the store
+
+That is what is left. A process reports `reuse have=273 hit=241 miss=0
+served=958` -- it finds what earlier processes published, installs nearly a
+thousand of their modules -- and still lifts twenty-five thousand blocks. The
+two facts together say the served units do not contain the addresses being
+branched to, which is what the miss path's own comment says of them: a unit
+holds what was reachable from the block that faulted in the process that built
+it, so arriving at the same page by another route gets nothing from it.
+
+Whole-object recompilation is what used to cover that, at 78,000 blocks a
+process. It is now done once and recorded (`k_obj_translated`), so later
+processes no longer redo it -- three `ls` went from fifteen seconds to five --
+but they fall back to the miss path rather than picking the finished object
+up. Making a process that meets a fully translated object take *all* of it,
+rather than sixteen units at a time that mostly miss, is the next thing worth
+measuring.
+
+### It is not the network
+
+With no HTTP anywhere, `apt-config` plus its forked `dpkg` still cost about
+ten seconds an iteration. An earlier reading of the apt logs -- lots of
+`nothing runnable, wanting the event loop` -- suggested waiting on Wisp, and
+that was wrong.

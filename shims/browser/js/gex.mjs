@@ -609,6 +609,10 @@ export class Gex {
     this.#shim.exports.__stack_pointer.value = this.#workerStack();
     this.#opts = { strace: opts.strace, tty: opts.tty, uid: opts.uid, gid: opts.gid };
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
+    // How many of an object's stored units one miss may take. Swept rather
+    // than assumed: the 16 it defaults to was chosen against 4096, which only
+    // ruled out unbounded.
+    if (opts.perMiss) this.#shim.exports.gex_set_per_miss?.(opts.perMiss);
     // A terminal changes how libc buffers and whether a shell prints a
     // prompt, so a page with xterm.js in it has to say so.
     if (opts.tty) this.#shim.exports.gex_set_tty(1);
@@ -1330,6 +1334,7 @@ export class Gex {
     const o = child.opts ?? {};
     this.#opts = o;
     if (o.strace) e.gex_set_trace(1);
+    if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
     if (o.tty) e.gex_set_tty(1);
     if (o.uid !== undefined) e.gex_set_identity(o.uid, o.gid ?? o.uid);
     // The map, which the bytes do not carry: without it the child's first

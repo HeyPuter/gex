@@ -422,7 +422,11 @@ export async function runProgram(
       // The layout the closure was built against. Without it the placer hands
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
-      opts: { cwd, tty, uid, recompileObjects, heartbeat, pins: closure?.pins },
+      opts: {
+        cwd, tty, uid, recompileObjects, heartbeat, pins: closure?.pins,
+        // `?permiss=N`: how many stored units one dispatch miss may take.
+        perMiss: typeof globalThis.GEX_PER_MISS === 'number' ? globalThis.GEX_PER_MISS : undefined,
+      },
     });
     return { status, host, tenv };
   } finally {

@@ -275,6 +275,7 @@ for (const [event, describe] of [
   // whole-object recompilation redoing work already stored cannot be decided
   // without turning it off.
   if (params.has('recompile')) globalThis.GEX_RECOMPILE_OBJECTS = Number(params.get('recompile'));
+  if (params.has('permiss')) globalThis.GEX_PER_MISS = Number(params.get('permiss'));
   if (params.get('debug')) {
     globalThis.GEX_DEBUG_EXIT = 1;
     globalThis.GEX_TRAP_STACK = 1;

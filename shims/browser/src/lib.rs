@@ -1105,6 +1105,19 @@ fn grow_memory_to(end: u64) -> bool {
 /// and a fixed ceiling is memory a process pays for whether it uses it or
 /// not. Anything the guest unmaps goes back to the kernel's own free list;
 /// this only ever moves up.
+/// How many of an object's stored units one dispatch miss may take, merged
+/// into a single module. See the use site in the miss path.
+static PER_MISS_N: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(16);
+
+/// Set that, from the host.
+#[no_mangle]
+pub extern "C" fn gex_set_per_miss(n: u32) {
+    if n > 0 {
+        PER_MISS_N.store(n as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 static ARENA_NEXT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -6522,12 +6535,25 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // swamp everything else, so the cap is not a safety valve, it
                 // is the setting. Sixteen is measured; the values between have
                 // not been.
-                const PER_MISS: usize = 16;
+                // Settable, so it can be swept. Sixteen came from comparing
+                // it against 4096 -- every unit of an object merged into one
+                // module -- which was 31,747ms against 300,091ms. That ruled
+                // out *unbounded*; it did not establish that sixteen is the
+                // best bounded value, and the numbers have moved since.
+                // Compiling is per *module* far more than per byte: a 6.7 MiB
+                // module compiles in 50ms, while a process installing 815
+                // small ones spends 1550ms compiling -- about 1.9ms each,
+                // nearly all of it fixed overhead.
+                //
+                // Not an environment variable: `std::env::var` always fails
+                // on `wasm32-unknown-unknown`, which is why
+                // `GEX_DISPATCH_BALLAST` has never done anything in a page.
+                let per_miss = PER_MISS_N.load(std::sync::atomic::Ordering::Relaxed);
                 let mut ready = shared_modules_of_object(
                     h,
                     object_identity(h, page * gex_abi::DISPATCH_PAGE).unwrap_or(0),
                 );
-                ready.truncate(PER_MISS);
+                ready.truncate(per_miss);
                 if !ready.is_empty() {
                     if tracing() {
                         trace_line(&format!(
