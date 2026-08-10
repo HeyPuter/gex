@@ -1128,6 +1128,53 @@ What it is not, each ruled out by measurement rather than argument:
   in it for a different reason. On a *complete* rootfs the two hosts differ
   cleanly -- native finishes, the browser crashes.
 
+#### And what in the shim it was: the child's heap, over the parent's memory
+
+A pointer whose value is **2**, loaded from a stack slot, is the far end of
+memory corruption, and this is the near end of it.
+
+`ARENA_NEXT` is the cursor that both the guest's mappings and the shim's own
+Rust heap take from. It is a static of the shim *module instance*, so a
+forked child -- which instantiates a fresh shim -- starts it at zero, and
+`arena_take` then begins at `ARENA_BOTTOM`. But the child's memory already
+holds its parent's entire address space, and every byte of that was handed
+out from `ARENA_BOTTOM` upwards. The child's first claim is land the parent
+is still using. Nothing catches it, because `MemoryMap::mmap` inserts an
+arena-extended range without asking whether it is free: the arena is supposed
+to be the one allocator that cannot collide.
+
+Talc usually gets there first, so the shim's own allocator bookkeeping lands
+inside the guest's heap, and the guest meets the damage later and somewhere
+else -- as a `free` of 2, or as `malloc_consolidate(): invalid chunk size`.
+
+This is also the whole reason the closure appeared to fix it, and why #96 was
+filed against the runtime translator. A child running code somebody else
+compiled barely allocates, so it never claims a span, so it never collides.
+The translator was not doing anything wrong; it was simply the only thing in
+the process allocating enough to hit the bug.
+
+Two measurements that pinned it, both worth keeping as tools:
+
+- A forked child checksums every region it was handed and reports the ones
+  that do not match. All 87 guest regions verify byte for byte; only the
+  register contexts and the dispatch directory differ, and the child rebuilds
+  both. That ruled out the copy, which had been the standing theory.
+- After the fix the child's memory goes from 161 MiB to 177 MiB at the same
+  point in the run -- exactly one 16 MiB Talc chunk. That is the heap that
+  used to be placed inside the parent's mappings, now taking fresh space.
+
+Fixed by taking the floor from the memory the process actually has rather
+than from a static that resets. `apt-get update` then runs to completion
+under the Node host and exits 0.
+
+`LAST_SYSCALL` cost most of the three days on its own. It was set on syscall
+entry and never cleared, so the crash reported "inside syscall 99" --
+`set_robust_list`, whose handler is `Ok(0)` and reads no memory at all. It
+was merely the last call the child had made before returning into translated
+code. A diagnostic that cannot be wrong in a quiet way is worth more than one
+that is usually right: it now says "after" unless the call is still on the
+stack.
+
 ## apt-get update works
 
     apt-get update: exit 0, 27879ms, 1 index file(s) written
