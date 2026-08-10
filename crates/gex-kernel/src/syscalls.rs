@@ -2491,7 +2491,7 @@ impl Kernel {
             // Arm a pin if this is an object of the closure. Before the open
             // rather than after, because `open` moves `p` into the call and
             // the path is what identifies the object.
-            if let Some(&base) = self.pins.get(&p) {
+            if let Some(base) = self.pin_for(&p) {
                 self.armed_pin = Some((p.clone(), base));
             }
             let h = self.vfs.open(&p, flags, mode)?;
@@ -3277,6 +3277,32 @@ impl Kernel {
             m.zero(addr + old_len, (new_len - old_len) as usize)?;
         }
         Ok(dst)
+    }
+
+    /// The pinned base for a path a closure build named, if there is one.
+    ///
+    /// Exact spelling first, then the file's name alone. A closure records the
+    /// path `gexc` walked in its sysroot and the guest's `ld.so` opens
+    /// whatever `/etc/ld.so.cache` gives it, and on Debian those differ by a
+    /// symlinked prefix -- `/lib/aarch64-linux-gnu/libc.so.6` against
+    /// `/usr/lib/aarch64-linux-gnu/libc.so.6`. A `HashMap::get` on the whole
+    /// path answers "no pin" to that, silently: the object is placed by the
+    /// bump allocator instead, every module built for it is addressed wrong,
+    /// and the run lifts the library again having loaded a statically
+    /// recompiled copy of it. There is no error anywhere, only a slow run.
+    ///
+    /// The fallback is safe because a pin is a claim about one object and a
+    /// rootfs does not ship two libraries of the same name that a single
+    /// program loads both of. If it ever did, the exact match still wins.
+    pub fn pin_for(&self, path: &str) -> Option<u64> {
+        if let Some(&base) = self.pins.get(path) {
+            return Some(base);
+        }
+        let want = path.rsplit('/').next()?;
+        self.pins
+            .iter()
+            .find(|(k, _)| k.rsplit('/').next() == Some(want))
+            .map(|(_, &v)| v)
     }
 
     fn sys_mmap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {

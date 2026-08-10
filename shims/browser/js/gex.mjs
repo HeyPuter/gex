@@ -458,6 +458,17 @@ export class Gex {
   get compileMillis() { return Math.round(this.#compileMs); }
   get instantiateMillis() { return Math.round(this.#instantiateMs); }
   get growMillis() { return Math.round(this.#growMs); }
+  /// Which objects this process lifted blocks from, `name=count` separated.
+  get blocksByObject() {
+    const e = this.#shim?.exports;
+    if (!e?.gex_jit_by_object) return '';
+    const max = 512;
+    const p = e.gex_alloc(max) >>> 0;
+    const n = e.gex_jit_by_object(p, max) >>> 0;
+    const s = new TextDecoder().decode(this.#bytes().subarray(p, p + n));
+    e.gex_free?.(p, max);
+    return s;
+  }
   get shimCompileMillis() { return Math.round(this.#shimCompileMs); }
   get shimInstantiateMillis() { return Math.round(this.#shimInstantiateMs); }
   get guestInstantiateMillis() { return Math.round(this.#guestInstantiateMs); }

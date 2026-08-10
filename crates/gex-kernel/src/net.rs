@@ -398,8 +398,10 @@ impl FileHandle for Socket {
     /// started, so `apt` asked immediately, was told `EINPROGRESS`, and
     /// reported it as the reason it could not connect:
     ///
-    ///     Could not connect to deb.debian.org:80 (240.0.0.1).
-    ///       - connect (115: Operation now in progress)
+    /// ```text
+    /// Could not connect to deb.debian.org:80 (240.0.0.1).
+    ///   - connect (115: Operation now in progress)
+    /// ```
     ///
     /// which reads like a network failure and is really a socket answering a
     /// question before it knew.

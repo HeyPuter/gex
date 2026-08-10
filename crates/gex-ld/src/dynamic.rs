@@ -51,6 +51,28 @@ impl Program {
             .chain(self.interp.iter().flat_map(|i| i.segments.iter()))
     }
 
+    /// Every segment to place, paired with the interpreter's path when the
+    /// segment is the interpreter's.
+    ///
+    /// [`Self::segments`] loses that distinction, and a caller that records
+    /// where a segment's bytes came from then records the executable for both
+    /// -- so `ld.so`'s text is identified as `("/bin/ls", 0x3000000)` under
+    /// `ls` and `("/bin/true", 0x3000000)` under `true`. Two processes
+    /// running the same linker at the same address never agree that it is the
+    /// same code, and every distinct executable in a run lifts the whole
+    /// dynamic linker again. That is a floor of some four thousand blocks on
+    /// every process, and a shell running forty commands pays it forty times.
+    pub fn placements(&self) -> impl Iterator<Item = (&crate::elf::Segment, Option<&str>)> {
+        let interp = self.exe.interp.as_deref();
+        self.exe
+            .segments
+            .iter()
+            .map(|s| (s, None))
+            .chain(self.interp.iter().flat_map(move |i| {
+                i.segments.iter().map(move |s| (s, interp))
+            }))
+    }
+
     /// First address above everything loaded, where `brk` starts.
     pub fn brk(&self) -> u64 {
         let interp_end = self.interp.as_ref().map(|i| i.brk).unwrap_or(0);

@@ -2403,3 +2403,45 @@ out of the directory until its library is filled.
 Together those are ~850ms of the ~1500, and what remains -- 120ms of fork
 copy, Worker start and adopt, plus what the guest actually executes -- is
 inside the target.
+
+### Every executable lifts the whole dynamic linker again
+
+`/bin/true` on the demo site translates 4,312 blocks and attributes all of them
+to a region named `[image]`. The name is the tell. Two places load an ELF, and
+both hand the interpreter's segments the *executable's* identity:
+
+```rust
+for seg in program.segments() { ... }        // exe.segments.chain(interp.segments)
+h.kernel.mem.insert_loaded(..., Some((path.to_string(), seg.vaddr)));
+```
+
+`Program::segments` flattens the executable and its interpreter into one
+iterator, so `ld.so`'s text at `INTERP_BASE` is recorded as
+`("/bin/true", 0x3000000)` under `true` and `("/bin/ls", 0x3000000)` under
+`ls`. The shared module store keys on exactly that pair. Two processes running
+*the same linker at the same address* therefore never agree that it is the same
+code, and every distinct executable in a run lifts the entire dynamic linker
+from scratch. A shell that runs forty commands pays for it forty times.
+
+`gex_load` is worse than wrong, it is absent: it uses plain `insert`, so
+process 1's image *and* its interpreter carry no code identity at all. `gex_load`
+is handed bytes and no path so the image genuinely cannot be named -- but the
+interpreter can, and the interpreter is the one object every other process in
+the run also loads.
+
+`Program::placements()` yields `(segment, Option<&interpreter path>)` and both
+load sites use it.
+
+### A pin that does not take was invisible in the only configuration that matters
+
+`gex_pin_report` is called from `worker.mjs` after `gex.run` returns. In a shell
+demo process 1 is the shell and it does not return, and adopted children never
+call it at all -- so the report that says "the module was built for one address
+and the code runs at another" printed in the isolated Node run and never once on
+the demo site. Days of "is the closure even being used" had an answer that was
+being computed and thrown away.
+
+`report_new_pins` now runs from the syscall entry beside `check_host_magic`, on
+the same terms: a load and a compare, once per syscall, saying each pin once.
+A misplacement is loud regardless of tracing, because the guest is about to
+branch into code built for a different address.

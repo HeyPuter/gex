@@ -1393,6 +1393,20 @@ struct Jit {
     /// starting point.
     pending: std::collections::VecDeque<PendingModule>,
     blocks: u64,
+    /// Blocks lifted, by the object they were lifted from.
+    ///
+    /// The total alone cannot say whether a closure is missing something. A
+    /// `/bin/true` against a closure with libc whole still lifts 4,308
+    /// blocks, and its own text is 714 of them -- so 3,600 come from
+    /// somewhere the closure was supposed to cover, and nothing said where.
+    /// Blocks lifted on a page a closure library already claims.
+    lift_in_closure: u64,
+    /// Blocks lifted per object, with the address range they came from.
+    ///
+    /// The range is what says whether a closure is missing an object or
+    /// missing part of one: `libc.so.6=10239` reads the same whether the
+    /// closure covers none of libc or all of it but the last page.
+    by_object: std::collections::BTreeMap<String, (u64, u64, u64)>,
     compiles: u64,
     /// Nanoseconds spent lifting and encoding, which is the shim's own share
     /// of a miss -- the engine's compile of what comes out is JS's.
@@ -2390,7 +2404,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     install_console(&mut kernel);
 
     let data = guest_bytes();
-    for seg in program.segments() {
+    for (seg, from) in program.placements() {
         let (a, b) = (seg.vaddr as usize, (seg.vaddr + seg.mem_size) as usize);
         data[a..b].fill(0);
         data[a..a + seg.bytes.len()].copy_from_slice(&seg.bytes);
@@ -2406,9 +2420,20 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         }
         // See `do_exec`: an image segment is built, not mapped, so it has
         // no file to be reconstructed from.
-        kernel
-            .mem
-            .insert(seg.vaddr, seg.vaddr + seg.mem_size, p, "[image]");
+        //
+        // It still gets a code identity when there is one to give. `gex_load`
+        // is handed bytes and no path, so process 1's own text cannot be
+        // named -- but its *interpreter* can, and the interpreter is the one
+        // object every other process in the run also loads. Without this,
+        // pid 1 lifts `ld.so` and stores it under no identity at all, and the
+        // next process lifts the same linker over again.
+        kernel.mem.insert_loaded(
+            seg.vaddr,
+            seg.vaddr + seg.mem_size,
+            p,
+            "[image]",
+            from.map(|f| (f.to_string(), seg.vaddr)),
+        );
     }
 
     // argv arrives as a NUL-separated blob in the shim's own region.
@@ -2507,6 +2532,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 candidates: Vec::new(),
                 pending: Default::default(),
                 blocks: 0,
+                lift_in_closure: 0,
+            by_object: Default::default(),
                 compiles: 0,
                 nanos: 0,
             },
@@ -2548,6 +2575,39 @@ pub extern "C" fn gex_pin_object(path: u32, path_len: u32, base: u64, span: u64)
             // `ls` segfaulted on that, and the pin report said so:
             // "wanted 0x5000000, landed 0xde42000".
             k_place_set(hasher.finish(), base, span);
+        }
+    }
+}
+
+/// Pins already reported, so each is said once and not once per syscall.
+static PINS_SAID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Say where any newly reserved pin landed, the moment it has landed.
+///
+/// A misplacement is loud whatever the tracing settings, because the guest is
+/// about to branch into code built for a different address; a pin that took
+/// is only worth a line when something is listening.
+fn report_new_pins() {
+    let said = PINS_SAID.load(std::sync::atomic::Ordering::Relaxed);
+    let fresh = with_host(|h| {
+        if h.kernel.pin_landed.len() <= said {
+            return Vec::new();
+        }
+        h.kernel.pin_landed[said..].to_vec()
+    });
+    if fresh.is_empty() {
+        return;
+    }
+    PINS_SAID.fetch_add(fresh.len(), std::sync::atomic::Ordering::Relaxed);
+    for (path, want, got) in fresh {
+        if want == got {
+            if tracing() || unsafe { TRACE_MISSES } {
+                trace_line(&format!("[gex] pin ok: {path} at {got:#x}\n"));
+            }
+        } else {
+            trace_line(&format!(
+                "[gex] pin MISPLACED: {path} wanted {want:#x}, landed {got:#x}\n"
+            ));
         }
     }
 }
@@ -3632,6 +3692,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // And whether the kernel this call is about to run against is still
     // intact. A load and a compare, once per syscall.
     check_host_magic("a syscall");
+    // And whether a pinned library landed where the closure built it. Same
+    // shape and same reason: a load and a compare, once per syscall.
+    //
+    // `gex_pin_report` runs after `gex.run` returns, which in a shell demo is
+    // never -- process 1 is the shell and it does not exit -- and adopted
+    // children do not call it at all. So the one report that says "the module
+    // was built for one address and the code runs at another" was invisible
+    // in exactly the configuration the project exists for.
+    report_new_pins();
     // How long each kind of syscall takes, when there is a heartbeat.
     //
     // Counts alone cannot answer the question glxgears asks: it holds a
@@ -4573,6 +4642,8 @@ pub extern "C" fn gex_adopt_child(
             candidates: Vec::new(),
             pending: Default::default(),
             blocks: 0,
+            lift_in_closure: 0,
+            by_object: Default::default(),
             compiles: 0,
             nanos: 0,
         }},
@@ -4697,7 +4768,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let data = guest_bytes();
     // The new image goes where its own headers say, which for a static
     // executable is the same place the old one was.
-    for seg in program.segments() {
+    for (seg, from) in program.placements() {
         let (a, b) = (seg.vaddr as usize, (seg.vaddr + seg.mem_size) as usize);
         if b > data.len() {
             return 0;
@@ -4737,7 +4808,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             seg.vaddr + seg.mem_size,
             prot,
             "[image]",
-            Some((path.to_string(), seg.vaddr)),
+            Some((from.unwrap_or(path).to_string(), seg.vaddr)),
         );
     }
     let layout = gex_ld::build_initial_stack(
@@ -6447,6 +6518,26 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             trap();
         }
     }
+    // Past the fill, and a closure library still claims this page.
+    //
+    // That is the case worth counting, because everything about it looks
+    // right from outside: the pin took, the module covers the page, the
+    // directory names it -- and the block is lifted anyway. Either the fill
+    // was never asked for, or it was asked and the module had no block at
+    // this address. The count says how much the closure is failing to save;
+    // `[closure] page unfilled` says where to look.
+    if gex_closure_owner(gex_abi::dispatch_page(pc)) >= 0 {
+        let n = with_host(|h| {
+            h.jit.lift_in_closure += 1;
+            h.jit.lift_in_closure
+        });
+        if n <= 8 || (tracing() && n % 1000 == 0) {
+            trace_line(&format!(
+                "[closure] page unfilled: lifting {pc:#x}, page {} is claimed ({n} so far)\n",
+                gex_abi::dispatch_page(pc)
+            ));
+        }
+    }
     if maybe_recompile_at(pc) {
         // The same resume the ordinary path uses: come back at the address
         // that missed, once JavaScript has instantiated what was queued and
@@ -6758,6 +6849,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         publish_pending(h);
         h.jit.blocks += stats.blocks as u64;
+        let whose = object_name_at(h, pc);
+        note_blocks(&mut h.jit.by_object, whose, pc, stats.blocks as u64);
         h.jit.compiles += 1;
         h.jit.nanos += now_ns().saturating_sub(started);
         if tracing() {
@@ -7099,6 +7192,10 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
             }
         }
         h.jit.blocks += stats.blocks as u64;
+        {
+            let whose = map.path.rsplit('/').next().unwrap_or(&map.path).to_string();
+            note_blocks(&mut h.jit.by_object, whose, map.start, stats.blocks as u64);
+        }
         h.jit.nanos += object_nanos;
         let produced = modules.len();
         // And what this claimed, so the next process to map the same library
@@ -7296,6 +7393,51 @@ fn note_process_syscall(base: u64, pc: i64) {
 }
 
 /// Which object's executable mapping a guest address falls in, if any.
+/// The short name of whatever object holds this address, for a counter.
+///
+/// Takes the host it already has, because the caller is inside `with_host`
+/// and asking again would be a second borrow of a `RefCell` -- which is a
+/// panic, not an error, and the way three crashes this session were reported
+/// instead of the ones that caused them.
+/// Add `n` blocks lifted at `a` to what `whose` has cost so far.
+fn note_blocks(
+    m: &mut std::collections::BTreeMap<String, (u64, u64, u64)>,
+    whose: String,
+    a: u64,
+    n: u64,
+) {
+    let e = m.entry(whose).or_insert((0, u64::MAX, 0));
+    e.0 += n;
+    e.1 = e.1.min(a);
+    e.2 = e.2.max(a);
+}
+
+fn object_name_at(h: &Host, a: u64) -> String {
+    h.kernel
+        .mem
+        .vmas()
+        .iter()
+        .find(|v| a >= v.start && a < v.end)
+        .map(|v| {
+            // `code`, not `origin`: the code identity is the thing the shared
+            // store keys on, and `origin` is deliberately `None` for anything
+            // the loader built rather than mapped -- which is every image and
+            // every interpreter, so attribution reported `[image]` for all of
+            // them and could not tell a program's own text from `ld.so`'s.
+            let n = v.code.as_ref().map(|(p, _)| p.as_str()).unwrap_or(&v.name);
+            let n = n.rsplit('/').next().unwrap_or(n);
+            // A built region is named by where it is as well as what it is:
+            // an executable and its interpreter share one path and differ
+            // only by address.
+            if v.name == "[image]" {
+                format!("{n}@{:#x}", v.start)
+            } else {
+                n.to_string()
+            }
+        })
+        .unwrap_or_else(|| "unmapped".to_string())
+}
+
 fn executable_object_at(a: u64) -> Option<String> {
     with_host(|h| {
         let v = h
@@ -7970,6 +8112,27 @@ pub extern "C" fn gex_set_heartbeat(every: i64) {
 }
 
 /// Blocks translated at run time, and how many times the translator ran.
+/// Blocks lifted, by object, as `name=count name=count`, into `out`.
+///
+/// The total says a process lifted 4,308 blocks; this says which objects they
+/// came from, which is the difference between a closure that is missing
+/// something and a program that genuinely has its own code to translate.
+#[no_mangle]
+pub extern "C" fn gex_jit_by_object(out: u32, max: u32) -> u32 {
+    let text = with_host(|h| {
+        let mut v: Vec<(&String, &(u64, u64, u64))> = h.jit.by_object.iter().collect();
+        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        v.iter()
+            .take(8)
+            .map(|(k, (n, lo, hi))| format!("{k}={n}@{lo:#x}..{hi:#x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    let n = text.len().min(max as usize);
+    shim_slice_mut(out, n as u32).copy_from_slice(&text.as_bytes()[..n]);
+    n as u32
+}
+
 #[no_mangle]
 pub extern "C" fn gex_jit_blocks() -> i64 {
     with_host(|h| h.jit.blocks as i64)
