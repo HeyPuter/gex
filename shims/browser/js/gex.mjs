@@ -691,7 +691,7 @@ export class Gex {
   async #installClosure() {
     const add = this.#shim.exports.gex_add_closure_module;
     if (!add) return;
-    for (const entry of this.#closureModules) {
+    for (const [i, entry] of this.#closureModules.entries()) {
       // Either the raw wasm, or the pair the page prepared: the metadata
       // section on its own and the module already compiled.
       //
@@ -712,7 +712,13 @@ export class Gex {
         this.#shim.exports.gex_free?.(gp, meta.length);
       }
       if (!need) continue;
+      // Timed per library, because "the page never became ready" needed
+      // splitting further. Fetching and compiling all 694 MB of apt's closure
+      // takes six seconds; the shell then never reaches a prompt, and this
+      // loop is the only thing between the two.
+      const began = performance.now();
       await this.#installModule(paired ? entry.mod : wasm, need);
+      console.error(`[gex] closure install ${i}: ${need} slots, ${Math.round(performance.now() - began)}ms`);
     }
     this.#closureModules = [];
   }
