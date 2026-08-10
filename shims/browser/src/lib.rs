@@ -2855,6 +2855,24 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
     let Some(meta) = gex_xlate::Metadata::decode(shim_slice(ptr, len)) else {
         return 0;
     };
+    // From here this process holds a module that can fill pages, so the miss
+    // path may spend a trap asking.
+    //
+    // This used to be armed only by `#installModule`, when a module with
+    // passive segments was *instantiated* -- and a closure library is
+    // deliberately never instantiated until a fill asks for it. Nothing
+    // instantiated, so nothing armed; nothing armed, so no miss ever asked;
+    // no miss ever asked, so nothing was instantiated. Every branch into
+    // `libc` and `ld.so` fell straight through to the translator, and the
+    // closure that covers them whole -- pinned to the right address, its
+    // pages in the directory, its blocks in the module -- did nothing at all.
+    // pid 1 lifted 10,239 blocks of libc and 6,141 of ld.so with both of them
+    // sitting statically recompiled in the process.
+    //
+    // Registration is the honest moment: a page this module claims can be
+    // filled from now on, whether or not the instance exists yet, because
+    // `fillSlot` instantiates it on the way.
+    FILL_POSSIBLE.store(true, std::sync::atomic::Ordering::Relaxed);
     CLOSURE_DIRS.0.borrow_mut().extend(meta.dir_entries.iter().copied());
     {
         let idx = CLOSURE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2897,6 +2915,10 @@ pub extern "C" fn gex_add_lazy_module(ptr: u32, len: u32) -> u32 {
     let Some(meta) = gex_xlate::Metadata::decode(shim_slice(ptr, len)) else {
         return 0;
     };
+    // And the same for a module inherited from a parent: it is registered
+    // now and instantiated on the branch that wants it, so the miss path has
+    // somewhere to ask from this moment on.
+    FILL_POSSIBLE.store(true, std::sync::atomic::Ordering::Relaxed);
     let idx = LAZY_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
