@@ -1643,3 +1643,49 @@ twenty seconds here, which is a fifth of the measurement. Either
 The second is the real answer, and it applies well beyond this: every table in
 this file that compares two configurations by one wall-clock run each is worth
 exactly as much as the four rows above.
+
+## The fill never fired: a packed entry matched against a bare slot
+
+`gexfillat(entry)` is how a miss asks a deferred module for the slots of the
+page it wants. It was handed what `page_table.lookup` returns -- a *directory
+entry*, a table index packed above a within-table slot -- and range-tested it
+against the segment's `offset`, which is the slot half only, and only of the
+segment's first translated block. Not the page base unless that block happens
+to start the page.
+
+Two different quantities, so the test essentially never matched. Nothing was
+ever filled; the branch that asked missed again; and each of those misses fell
+through to serving the object, sixteen modules at a time.
+
+The tell was never in the clock, and this is the part worth keeping:
+
+|  | wall | module installs |
+|---|---|---|
+| before | 93,770 / 93,378 ms | 52,708 |
+| with the bug | 118,963 / 114,786 ms | **179,538** |
+| fixed | 86,309 / 86,650 ms | 50,073 |
+
+The install count moved 3.4x. The clock moved 25%, on a machine where the same
+committed code had already read 82.1s and 98.1s on different hours -- which is
+why three earlier diagnoses of this same regression were wrong. Counting the
+thing the change acts on found in one run what four timed runs had missed.
+
+A segment now carries the entry of the page it covers and the test is
+equality: exact, immune to another table holding the same slot number, and one
+instruction where the range test was three.
+
+Deferral is also structural now instead of a size guess. Only a closure
+library defers -- installed at process start, before the guest has asked for
+anything, mostly never reached. A unit the runtime translator built exists
+*because* a branch missed on it, so deferring that guarantees a second miss on
+the address that caused the first. Above the block gate such a unit still has
+passive segments and is written with one `gexfillall()`.
+
+Net, alternating A/B/A/B in one sitting: **93.6s to 86.5s**, `rc=0`, one index
+written, zero crashes. The spread within each arm was under half a second.
+
+What this does not yet show is the thing demand filling was built for. apt's
+closure predates passive segments, so the run above still translates at
+runtime. The closure is where instantiate was 1.2-2.2s *per process* for code
+the process never reaches -- that measurement is next, and it needs the
+closure rebuilt with the current emitter.
