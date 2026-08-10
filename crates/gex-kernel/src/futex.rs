@@ -45,9 +45,17 @@ struct Queue {
 pub struct Parked {
     queue: Arc<Queue>,
     at: u64,
+    /// The guest address parked on, so a deadlock can be named rather than
+    /// just counted.
+    addr: u64,
 }
 
 impl Parked {
+    /// The guest address this is parked on.
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
     /// Whether anything has woken this address since the park.
     pub fn woken(&self) -> bool {
         *self.queue.generation.lock().unwrap() != self.at
@@ -149,7 +157,7 @@ impl FutexTable {
     pub fn park(&self, addr: u64) -> Parked {
         let queue = self.queue(addr);
         let at = *queue.generation.lock().unwrap();
-        Parked { queue, at }
+        Parked { queue, at, addr }
     }
 
     /// Wake every waiter on every queue.

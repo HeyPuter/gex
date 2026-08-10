@@ -5488,8 +5488,40 @@ fn schedule() -> i32 {
                     .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
             }) {
                 // Every remaining thread is parked on a futex nothing will
-                // ever wake. On Linux this hangs; saying so is more useful.
+                // ever wake. On Linux this hangs; saying so is more useful --
+                // and saying *which* futex, and where the guest is standing,
+                // is what turns it from a symptom into something to look up.
+                //
+                // Without the addresses, `zstd` reported this twice and left
+                // nothing to go on but the word "futex": see #113, where the
+                // output turned out to be a byte-exact prefix of QEMU's and
+                // the only defect was whatever parks here.
+                let who = with_host(|h| {
+                    let mut s = String::new();
+                    let gm = GuestMem::new(guest_bytes());
+                    for (i, t) in h.threads.iter().enumerate() {
+                        if let Waiting::Futex { parked, .. } = &t.waiting {
+                            let pc = gm
+                                .read_u64(t.kstate.ctx_addr + ctx::PC as u64)
+                                .unwrap_or(0);
+                            s.push_str(&format!(
+                                "gex:   thread {i} parked on {:#x}, pc {:#x}{}\n",
+                                parked.addr(),
+                                pc,
+                                h.kernel
+                                    .mem
+                                    .vmas()
+                                    .iter()
+                                    .find(|v| pc >= v.start && pc < v.end)
+                                    .map(|v| format!(" in {} +{:#x}", v.name, pc - v.start))
+                                    .unwrap_or_default(),
+                            ));
+                        }
+                    }
+                    s
+                });
                 trace_line("gex: every thread is blocked on a futex\n");
+                trace_line(&who);
                 with_host(|h| set_exit(h, 128 + 31));
                 return 2;
             }
