@@ -1601,3 +1601,45 @@ trimming it to what is reached is the only lever that touches the term that
 now dominates: merging cannot help with nineteen modules, and a faster lifter
 cannot help with 224 milliseconds of lifting. The prize is bounded by the
 table above -- most of sixteen seconds in an eighty-second run.
+
+## The apt number moves 16s by itself, and four conclusions rest on it
+
+Identical committed code, measured twice: **82.1s**, then **98.1s**. Nothing
+changed between them but the hours. This is a shared host -- two KVMs, an
+OpenSearch, a Docker daemon -- and a browser run of `apt-get update` is at the
+mercy of all of it.
+
+Everything this session concluded about passive element segments was drawn
+from single runs against the 82.1s figure:
+
+| what was changed | one run | what was concluded |
+|---|---|---|
+| passive segments + host fills each | 114.5s | "the fill-request trap costs 32s" |
+| ...gate the trap until a module defers | 112.5s | "wrong; it is the per-segment crossing" |
+| ...one `gexfillall()` per module | 114.4s | "wrong; it is compiling the helpers" |
+| ...helpers only above 4096 blocks | 117.0s | wrong again -- and it *cannot* be |
+
+The last row is what gives it away. Every runtime unit in an apt run is about
+twenty blocks, so the 4096-block gate turns the emitter change off entirely:
+that configuration produces the same bytes on the runtime path as the
+baseline, and it still read three seconds *worse* than the run that supposedly
+proved the helpers expensive.
+
+So the effect being chased is smaller than the noise, and three of these
+diagnoses were noise wearing a hypothesis. None of the three is disproved
+either -- they were never tested.
+
+**What to do about it.** A single run cannot resolve anything under about
+twenty seconds here, which is a fifth of the measurement. Either
+
+* alternate A/B/A/B in one script, which cancels drift over the ten minutes
+  four runs take -- cheap, and enough for a change this size; or
+* stop timing the whole run and count the thing the change is supposed to
+  affect. `installMs` per process is already reported and is a sum of
+  `instantiate` calls, not wall clock, so it is far less exposed to what else
+  the host is doing. A change that means to cut instantiation should be judged
+  on instantiation.
+
+The second is the real answer, and it applies well beyond this: every table in
+this file that compares two configurations by one wall-clock run each is worth
+exactly as much as the four rows above.

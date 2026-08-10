@@ -706,7 +706,7 @@ export class Gex {
         this.#shim.exports.gex_free?.(gp, meta.length);
       }
       if (!need) continue;
-      await this.#installModule(paired ? entry.mod : wasm, need);
+      await this.#installModule(paired ? entry.mod : wasm, need, 64, true);
     }
     this.#closureModules = [];
   }
@@ -1916,11 +1916,11 @@ export class Gex {
    * installed modules differently from the thread that made them would
    * dispatch to different code.
    */
-  async #installModule(bytes, need, segments = 64) {
+  async #installModule(bytes, need, segments = 64, defer = false) {
     const t0 = performance.now();
     this.#installs++;
     try {
-      await this.#installModuleInner(bytes, need, segments);
+      await this.#installModuleInner(bytes, need, segments, defer);
     } finally {
       this.#installMs += performance.now() - t0;
     }
@@ -1936,7 +1936,7 @@ export class Gex {
    * installs upward of two thousand shared modules. Compiling and
    * instantiating those is work no existing counter could see.
    */
-  async #installModuleInner(bytes, need, segments = 64) {
+  async #installModuleInner(bytes, need, segments = 64, defer = false) {
     const t0 = performance.now();
     const e = this.#shim.exports;
     const tables = this.#growTables(need);
@@ -1995,18 +1995,24 @@ export class Gex {
     }
     // Written now, or when a branch asks for them.
     //
-    // The module decides, not the host: `gexfillat` exists only on one whose
-    // segments are passive, and a module that exports it must not be written
-    // eagerly or the deferral buys nothing. Two thresholds would eventually
-    // disagree, and the failure is a guest branching into a slot nobody
-    // wrote.
+    // Only a closure library defers, and that is a property of where the
+    // module came from rather than of how big it is. A closure is installed
+    // at process start, before the guest has asked for anything, and is
+    // mostly never reached -- that is the case demand filling exists for. A
+    // unit the runtime translator produced exists *because* a branch missed
+    // on it: it is wanted immediately, so deferring it only guarantees a
+    // second miss on the address that caused it.
+    //
+    // Above the block gate a runtime unit still has passive segments, since
+    // that is decided when it is emitted. It is written here in one
+    // `gexfillall()` call, which costs what an active segment would have.
     //
     // A big module is the whole reason the segments are passive: it is
     // instantiated once per guest process, and writing every block of it into
     // every process's table is 1.2 to 2.2 seconds of an apt run, nearly all
     // of it slots for code that process never reaches. A small unit is wanted
     // immediately and costs nothing, so it is written here and forgotten.
-    if (typeof inst.exports[FILL_AT] === 'function') {
+    if (typeof inst.exports[FILL_AT] === 'function' && defer) {
       this.#unfilled.unshift(inst);
       // And tell the shim there is now something worth asking for. Until a
       // module is deferred, the miss path must not spend a trap per page

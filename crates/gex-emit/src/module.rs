@@ -771,6 +771,9 @@ impl ModuleBuilder {
                     offset: 0,
                     funcs,
                     passive: false,
+                    // The image module's one segment covers the whole table,
+                    // not a page, and is never demand filled.
+                    page_entry: 0,
                 });
             }
             Linkage::Shared => {
@@ -856,6 +859,9 @@ impl ModuleBuilder {
                         // its segments passive cost `apt-get update` 32
                         // seconds against 82 -- see the helpers below.
                         passive: n_blocks > BIG_BLOCKS,
+                        // What `gexfillat` matches a request against. The
+                        // whole entry, table index included: see the field.
+                        page_entry: entry,
                     });
                 }
             }

@@ -518,6 +518,19 @@ pub struct ElementSegment {
     /// `gexfill` when it wants the slots, which is the seam a demand-filled
     /// table needs.
     pub passive: bool,
+    /// The dispatch directory entry of the guest page this segment covers, or
+    /// zero if it covers no single page.
+    ///
+    /// This is what `gexfillat` matches on, and it has to be the whole entry
+    /// rather than `offset`. An entry packs a table index above a within-table
+    /// slot; `offset` is only the slot half, and only of the *first translated
+    /// block*, which is not the page base unless that block happens to start
+    /// the page. Matching a caller's entry against `offset` therefore compares
+    /// two different quantities: it missed on essentially every page, so no
+    /// deferred slot was ever written, every branch into one missed again, and
+    /// each of those misses re-served sixteen modules. An `apt-get update`
+    /// installed 179,538 modules instead of 52,708 and took 23 seconds longer.
+    pub page_entry: u32,
 }
 
 /// A memory initialiser.
@@ -730,12 +743,14 @@ impl Module {
     /// Answers 1 if this module held the slot and filled its segment, 0 if
     /// the slot is somebody else's.
     pub fn add_fill_at(&mut self, ty: u32) -> Option<u32> {
-        let passive: Vec<(u32, u32, u32, u32)> = self
+        let passive: Vec<(u32, u32, u32, u32, u32)> = self
             .elements
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.passive)
-            .map(|(i, e)| (i as u32, e.table, e.offset, e.funcs.len() as u32))
+            .filter(|(_, e)| e.passive && e.page_entry != 0)
+            .map(|(i, e)| {
+                (i as u32, e.table, e.offset, e.funcs.len() as u32, e.page_entry)
+            })
             .collect();
         if passive.is_empty() {
             return None;
@@ -743,19 +758,20 @@ impl Module {
         let idx = self.declare_func(ty);
         let mut b = Vec::new();
         b.push(0x00); // no locals
-        for (seg, table, offset, len) in &passive {
-            // if (slot >= offset && slot < offset + len)
+        for (seg, table, offset, len, page_entry) in &passive {
+            // if (entry == page_entry)
+            //
+            // Equality on the whole directory entry, not a range test on
+            // `offset`. `offset` is the within-table slot of this segment's
+            // first *translated block*, which is not the page base, and it
+            // carries no table index -- so a range test both missed the page
+            // it wanted and could have matched a different table's. Comparing
+            // entries is exact and is one instruction instead of three.
             b.push(op::LOCAL_GET);
             write_u32(&mut b, 0);
             b.push(op::I32_CONST);
-            write_i32(&mut b, *offset as i32);
-            b.push(0x4f); // i32.ge_u
-            b.push(op::LOCAL_GET);
-            write_u32(&mut b, 0);
-            b.push(op::I32_CONST);
-            write_i32(&mut b, (*offset + *len) as i32);
-            b.push(0x49); // i32.lt_u
-            b.push(0x71); // i32.and
+            write_i32(&mut b, *page_entry as i32);
+            b.push(0x46); // i32.eq
             b.push(op::IF);
             b.push(0x40); // void
             b.push(op::I32_CONST);
