@@ -18,6 +18,7 @@
 // two hosts are measured against identical bytes.
 import { untar } from './tar.js';
 import { fetchBytes, runProgram } from './runtime.js';
+import { metadataSection } from '../../shims/browser/js/gex.mjs';
 
 /** An xterm-shaped object that keeps the bytes instead of drawing them. */
 function collector(rows = 40, cols = 120) {
@@ -119,6 +120,15 @@ export async function start() {
   // switched off from outside the bundle.
   const recompileObjects = params.has('recompile') ? Number(params.get('recompile')) : 8192;
   if (params.get('debug')) globalThis.GEX_DEBUG_EXIT = 1;
+  // \`?adopt=N\`: how many traps a forked child takes before it stops waiting
+  // to be an execve and takes its parent's modules in bulk. 1 is the old
+  // eager behaviour, which is what a bisect needs.
+  if (params.has('adopt')) globalThis.GEX_ADOPT_AFTER = Number(params.get('adopt'));
+  // And the engine's own stack for a trap, which names the wasm function the
+  // trap happened in. The rewrapped error says what went wrong and where the
+  // *guest* was; when the fault is in the shim rather than in translated
+  // code, only this says which of the shim's own functions was running.
+  if (params.get('debug')) globalThis.GEX_TRAP_STACK = 1;
   // A page cannot open a TCP socket, so the guest's network is carried over
   // Wisp to a proxy. Without one `apt-get update` reaches no mirror, which is
   // the only command anybody wants to measure here.
@@ -144,6 +154,37 @@ export async function start() {
   const elf = files[shell];
   if (!elf) throw new Error(`the rootfs has no ${shell}`);
 
+  // The closure, when the driver was given one: the image module, every
+  // library beside it, and the layout they were placed at. This is the
+  // configuration the project exists for, and no page could be given one
+  // before -- so the browser had only ever been measured translating at
+  // runtime, which is the secondary path.
+  let closure = null;
+  if (params.get('closure')) {
+    const m = await (await fetch('/harness/closure.json')).json();
+    // The libraries, compiled here and once. A closure is hundreds of
+    // megabytes and every Worker would otherwise be sent the bytes and
+    // compile them itself; a `WebAssembly.Module` structured-clones as
+    // itself and the engine shares the code behind it, so all a Worker needs
+    // besides the module is the small `gex.meta` section that says which
+    // pages it covers.
+    const libs = await Promise.all(
+      m.libs.map(async (n) => {
+        const bytes = await fetchBytes(`/harness/closure/${encodeURIComponent(n)}`);
+        return { meta: metadataSection(bytes), mod: await WebAssembly.compile(bytes) };
+      }),
+    );
+    // The image module is one program's own text, and pid 1 here is a shell.
+    // Handing dash a module built for `apt-get` starts the shell inside
+    // another program's code, and it exits without a syscall -- which is
+    // exactly what the first attempt did. Only on request, and only when the
+    // driver knows the shell *is* that program.
+    const image = params.get('image')
+      ? await fetchBytes(`/harness/closure/${encodeURIComponent(m.image)}`)
+      : null;
+    closure = { image, libs, pins: m.pins };
+  }
+
   const io = collector();
   const unpacked = performance.now() - t0;
   // Not awaited: an interactive shell does not exit, and this is the process
@@ -157,6 +198,7 @@ export async function start() {
     uid: 0,
     recompileObjects,
     network,
+    closure,
   });
   done.catch((e) => report({ fatal: String(e && e.message) }));
 
@@ -188,6 +230,12 @@ export async function start() {
     // line is the terminal echoing what was typed -- and when the shell does
     // not echo, that is the answer being thrown away: `echo alive` reported
     // nothing at all.
+    // A rebuilt bundle: drop everything and come back as a new page. The
+    // driver is waiting on `/harness/ready`, which `start` posts again.
+    if (job.reload) {
+      location.reload();
+      return;
+    }
     const mark = `__GEX_${n}_DONE__`;
     const typed = `__GEX_${n}_DO""NE__`;
     const startMark = `__GEX_${n}_HERE__`;

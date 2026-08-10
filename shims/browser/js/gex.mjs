@@ -22,7 +22,37 @@ const SHIM_STACK_TOP = 0x04800000;
 // context to enter and no directory to dispatch through.
 //
 // `DISPATCH_DIR + DISPATCH_MAX_PAGES * 4`, from `gex_abi`.
-const LOW_END = 0x00100000 + 0x80000 * 4;
+// Where the directory itself starts: one `u32` per 4 KiB guest page, holding
+// the packed table index and slot a branch into that page dispatches to.
+// How many traps a forked child takes before it gives up on being an
+// `execve` and takes its parent's modules in bulk. Zero or one is the old
+// eager behaviour, deferred by a trap.
+// Read where it is used, not here.
+//
+// As a module-level constant this was evaluated when the module was first
+// imported, which is before the page has had a chance to set the global --
+// so `?adopt=0` selected nothing and every run that was supposed to be
+// comparing eager against deferred was comparing deferred against itself.
+// Three bisect conclusions were drawn from that before the bug was noticed.
+function adoptAfterTraps() {
+  // Zero -- eager -- until deferring is finished. The mechanism below is
+  // complete and the measurement that motivates it is not in doubt: install
+  // is 3182ms a process against 159ms of translating, and 924 of every 933
+  // of that is `instantiate`, so a child that will `execve` should not pay
+  // it. What is not finished is the other half. A child that installs
+  // nothing must not inherit a directory claiming its parent's slots, and
+  // three ways of removing that claim were tried: clear it late, clear it
+  // before the guest module is instantiated, and rebuild it from the
+  // module's own metadata. The first two crash a grandchild in an unrelated
+  // syscall; the third leaves a child that adopts and then never runs, even
+  // with the serve fix that makes a miss resolve in one turn. Something else
+  // a child needs travels in that directory, and until it is known, eager is
+  // the only setting that is correct.
+  return Number(globalThis.GEX_ADOPT_AFTER ?? 0);
+}
+
+const DISPATCH_DIR = 0x00100000;
+const LOW_END = DISPATCH_DIR + 0x80000 * 4;
 const PAGES = GUEST_BYTES / 65536;
 const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
 
@@ -89,7 +119,7 @@ export class Env {
  * that one file is enough to run a program. Walking the section headers is
  * cheap -- each is a byte and a length -- and stops at the first match.
  */
-function metadataSection(wasm) {
+export function metadataSection(wasm) {
   const dv = new DataView(wasm.buffer, wasm.byteOffset, wasm.byteLength);
   let i = 8;
   const leb = () => {
@@ -138,6 +168,13 @@ export class Gex {
   // a module instance and instances are not shared, so every thread starts
   // with empty tables however much the process has already translated.
   #installed = 0;
+  // What compiling and instantiating shared modules costs this process, and
+  // how many there were. See `#installModuleInner`.
+  #installMs = 0;
+  #installs = 0;
+  // The parent's modules, held rather than installed. See `#maybeAdopt`.
+  #inherited = [];
+  #traps = 0;
   // What `load` was told, so a forked child can be told the same. A child is
   // the same program with the same terminal and the same user; rebuilding its
   // kernel without them gave it a pipe where the parent had a tty, which is
@@ -340,6 +377,10 @@ export class Gex {
    * already points at.
    */
   get installedModules() { return this.#installed; }
+  /** Milliseconds this process spent compiling and instantiating modules. */
+  get installMillis() { return Math.round(this.#installMs); }
+  /** How many modules that was. */
+  get installCount() { return this.#installs; }
 
   /**
    * Read a file back out of the guest's filesystem, or null if it is not
@@ -623,10 +664,19 @@ export class Gex {
   async #installClosure() {
     const add = this.#shim.exports.gex_add_closure_module;
     if (!add) return;
-    for (const wasm of this.#closureModules) {
-      const mp = this.#shim.exports.gex_alloc(wasm.length) >>> 0;
-      this.#bytes().set(wasm, mp);
-      const meta = metadataSection(wasm);
+    for (const entry of this.#closureModules) {
+      // Either the raw wasm, or the pair the page prepared: the metadata
+      // section on its own and the module already compiled.
+      //
+      // The pair is what a page should send. A closure is hundreds of
+      // megabytes -- apt's is 680 -- and the bytes exist only to be compiled
+      // and to have one custom section read out of them. Sending them to
+      // every Worker meant structured-cloning that per process and compiling
+      // it per process, for ten processes, when `WebAssembly.Module` crosses
+      // a `postMessage` as itself and the engine shares the code behind it.
+      const paired = !(entry instanceof Uint8Array);
+      const wasm = paired ? null : entry;
+      const meta = paired ? entry.meta : metadataSection(entry);
       let need = 0;
       if (meta && meta.length) {
         const gp = this.#shim.exports.gex_alloc(meta.length) >>> 0;
@@ -634,9 +684,8 @@ export class Gex {
         need = add(gp, meta.length) >>> 0;
         this.#shim.exports.gex_free?.(gp, meta.length);
       }
-      this.#shim.exports.gex_free?.(mp, wasm.length);
       if (!need) continue;
-      await this.#installModule(wasm, need);
+      await this.#installModule(paired ? entry.mod : wasm, need);
     }
     this.#closureModules = [];
   }
@@ -1031,6 +1080,16 @@ export class Gex {
     // Before the kernel is built, not after: the metadata is what the child's
     // dispatch table starts from, and `gex_adopt_child` reads it as it builds.
     this.#setMetadata(guestWasm);
+    // A deferred child must not claim its parent's slots. See
+    // `gex_reset_directory`: the inherited directory names one for every page
+    // the parent translated, this child has filled none of them, and every
+    // branch is then a bet on what the slot holds. Rebuilt rather than
+    // erased, because the guest module's own entries came from a passive data
+    // segment that the copied memory has already marked as applied, so they
+    // are never written again and a child that loses them cannot run at all.
+    if (adoptAfterTraps() > 0 && (child.modules?.length ?? 0) > 0 && e.gex_reset_directory) {
+      step(`directory rebuilt: ${e.gex_reset_directory() >>> 0} entries kept`);
+    }
     const entry = e.gex_adopt_child(
       child.pid,
       child.ctx,
@@ -1097,8 +1156,44 @@ export class Gex {
     // child's branches point at slots nothing has filled.
     this.#closureModules = opts?.closure ?? this.#closureModules;
     await this.#installClosure();
-    step(`installing ${child.modules?.length ?? 0} modules`);
-    for (const m of child.modules ?? []) await this.#installModule(m.mod, m.need);
+    // Reachable, not filled.
+    //
+    // A child used to instantiate every module its parent had -- three
+    // thousand of them for a shell that has been running a while, two to five
+    // seconds of a browser's time -- and then, in almost every case,
+    // `execve` something else and throw the entire image away. Every command
+    // a shell runs was paying to wire up libraries it was about to discard.
+    //
+    // Growing the tables is the part that cannot be skipped: the directory
+    // arrived with the adopted memory and names slots by number, and a branch
+    // to a slot past the end of a table is a trap rather than a miss. Grown
+    // slots hold the miss stub, so a branch into one asks for its code and
+    // gets it from the shared store -- which is where the parent put it, and
+    // where a fork is no longer the only way to find it.
+    //
+    // What this costs is a child that does *not* exec: it re-serves what it
+    // touches instead of arriving with it. What it saves is every child that
+    // does.
+    let need = 0;
+    for (const m of child.modules ?? []) need = Math.max(need, m.need);
+    if (need) this.#growTables(need);
+    // Kept, not dropped: a child that turns out to be staying wants them
+    // after all, and by then its parent's Worker may be gone. See
+    // `#maybeAdopt`.
+    this.#inherited = child.modules ?? [];
+    // Zero means the old behaviour: install them all here, before the child
+    // runs a single instruction. Kept so the two can be compared without
+    // rebuilding, because "deferred" and "eager" differ in more than timing
+    // -- a deferred child starts with empty tables and meets its parent's
+    // code through the miss path, which is a different code path entirely.
+    if (adoptAfterTraps() <= 0) {
+      step(`installing ${this.#inherited.length} modules`);
+      const mine = this.#inherited;
+      this.#inherited = [];
+      for (const m of mine) await this.#installModule(m.mod, m.need);
+    } else {
+      step(`${this.#inherited.length} modules reachable, ${need} slots`);
+    }
     step('running');
     return entry;
   }
@@ -1193,7 +1288,16 @@ export class Gex {
       // part of it that outlives the child's first `execve`. See
       // `gex_shared_dump`.
       shared: this.#sharedMap(),
-      modules: this.#compiled.slice(),
+      // What this process *holds*, not what it has instantiated.
+      //
+      // A child that defers takes its parent's modules without installing
+      // them, so `#compiled` -- which only records installs -- stays empty
+      // for its whole life. Forking from there handed the grandchild an
+      // empty list and a slot count of zero, so it grew no dispatch tables
+      // at all while inheriting a directory that names its grandparent's
+      // slots. The chain has to carry what was inherited as well as what was
+      // built, or deferring once breaks every descendant.
+      modules: [...this.#inherited, ...this.#compiled],
       opts: this.#opts,
       // The descriptors the child inherits, described rather than cloned: an
       // open file is an `Arc` in the parent's heap and the child's Worker has
@@ -1416,9 +1520,32 @@ export class Gex {
           const nr = ask(e.gex_last_syscall, (n) =>
             n === 0xffffffff ? '' : `, inside syscall ${n}`);
           if (globalThis.GEX_TRAP_STACK) console.error(err.stack ?? err);
+          // "table index is out of bounds" says a branch reached a slot past
+          // the end of the table it lives in, and nothing else in the message
+          // says which slot or which table. Both are knowable here: the
+          // directory entry for the failing pc holds the packed slot, and the
+          // tables can be measured. Without this the only way to tell a slot
+          // that was never grown to from a slot that was never filled is to
+          // guess, and they have completely different causes.
+          const where = ask(e.gex_current_pc, (pc) => {
+            if (!/table index/.test(err.message)) return '';
+            const guest = pc < 0n ? pc + (1n << 64n) : pc;
+            const page = Number(guest >> 12n);
+            const dir = new DataView(this.#memory.buffer).getUint32(DISPATCH_DIR + page * 4, true);
+            const tables = this.#dispatchTables();
+            const packed = dir >>> 0;
+            const idx = packed >>> 24;
+            const slot = packed & 0xffffff;
+            return (
+              `. page ${page} of the directory says table ${idx} slot ${slot}` +
+              `, and this process has ${tables.length} tables of ` +
+              `[${tables.map((t) => t.length).join(', ')}]` +
+              `, ${this.#installs} modules installed`
+            );
+          });
           throw new Error(
             `the gex runtime trapped inside the shim (${err.message}${at}${nr}` +
-              `${code}${heap}). That is a crash in the runtime, not a guest exit; ` +
+              `${code}${heap}${where}). That is a crash in the runtime, not a guest exit; ` +
               'anything printed above is all the guest managed to do first.',
           );
         }
@@ -1442,6 +1569,16 @@ export class Gex {
         // go in in the order they were emitted, because each one's page
         // assignments are the next one's starting point.
         while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
+        // The parent's modules go in *after* this Worker's own queue, never
+        // between a translation and its install.
+        //
+        // The comment above is the reason: a module's page assignments are
+        // the next one's starting point, and the shim hands them out in the
+        // order the modules were emitted. Bulk-installing two thousand
+        // inherited modules while a freshly translated one was still queued
+        // interleaved two orderings, and the process that hit it faulted on
+        // guest memory inside a syscall several forks later.
+        await this.#maybeAdopt();
         // And anything another Worker of this process translated.
         //
         // The queue above is one queue for the whole process, because the
@@ -1642,36 +1779,20 @@ export class Gex {
   }
 
   /**
-   * Instantiate the module a dispatch miss left behind, and put its blocks in
-   * the table the guest dispatches through.
+   * Make every dispatch table long enough to hold `need` slots, and return
+   * them.
    *
-   * The shim lifted and encoded it; only the engine can compile it, and only
-   * JS can ask the engine. The order matters: blocks go into the table first
-   * and the shim publishes the page directory afterwards, so a branch into a
-   * half-installed page keeps reaching the miss stub instead of a hole.
-   */
-  async #installTranslation() {
-    const e = this.#shim.exports;
-    const ptr = e.gex_jit_pending_ptr() >>> 0;
-    const len = e.gex_jit_pending_len() >>> 0;
-    await this.#installModule(this.#bytes().slice(ptr, ptr + len), e.gex_jit_slots() >>> 0);
-    e.gex_jit_installed();
-    // This Worker translated it, so it is already the newest one installed
-    // here; the registry entry `gex_jit_installed` just added is the same
-    // module and must not be replayed on top of itself.
-    this.#installed = e.gex_module_count ? e.gex_module_count() >>> 0 : this.#installed;
-  }
-
-  /**
-   * Put one translated module's blocks into this Worker's dispatch tables.
+   * Separated from installing a module because growing is the cheap half and
+   * the two are needed apart. A forked child has to be able to *reach* every
+   * slot its parent's directory names -- otherwise a branch into one is a
+   * trap, not a miss -- without instantiating the modules that fill them.
    *
-   * Shared by the two ways a module arrives: this Worker translated it, or
-   * another thread did and this one is catching up. The work is the same
-   * either way, which is the point of it being one function -- a thread that
-   * installed modules differently from the thread that made them would
-   * dispatch to different code.
+   * An unfilled slot holds the miss stub, so a branch into one asks the host
+   * for the code instead of finding a hole. That is what makes growing
+   * without filling safe, and it is why the stub is what a grown table is
+   * filled with rather than null.
    */
-  async #installModule(bytes, need) {
+  #growTables(need) {
     const e = this.#shim.exports;
     const tables = this.#dispatchTables();
     // The shim allocates in one slot space that spans every table, so the
@@ -1702,11 +1823,142 @@ export class Gex {
         );
       }
     }
+    return tables;
+  }
+
+  /**
+   * Take the parent's modules after all, if this child turns out to be
+   * staying.
+   *
+   * A forked child is handed every module its parent had. Instantiating them
+   * costs two to five seconds -- 924ms of every 933 is `instantiate`, because
+   * a module carries its blocks in element segments -- and almost every child
+   * a shell forks spends that and then `execve`s something else, throwing the
+   * whole image away. So a child now arrives with its tables *grown* and
+   * nothing filled: an unfilled slot holds the miss stub, so a branch asks
+   * for its code rather than trapping, and a child that execs pays nothing.
+   *
+   * The other kind of child is the reason for this method. One that keeps
+   * running its parent's code meets it a miss at a time, and there are
+   * thousands of pages; past a few dozen misses it is plainly not about to
+   * exec, and taking the parent's modules in one go is cheaper than
+   * continuing to fault. The threshold is deliberately low -- a child that
+   * execs takes only a handful of misses on the way there, in the few
+   * hundred instructions between `fork` returning and `execve`.
+   */
+  async #maybeAdopt() {
+    if (!this.#inherited.length) return;
+    if (++this.#traps < adoptAfterTraps()) return;
+    const mine = this.#inherited;
+    this.#inherited = [];
+    for (const m of mine) await this.#installModule(m.mod, m.need);
+  }
+
+  /**
+   * Instantiate the module a dispatch miss left behind, and put its blocks in
+   * the table the guest dispatches through.
+   *
+   * The shim lifted and encoded it; only the engine can compile it, and only
+   * JS can ask the engine. The order matters: blocks go into the table first
+   * and the shim publishes the page directory afterwards, so a branch into a
+   * half-installed page keeps reaching the miss stub instead of a hole.
+   */
+  async #installTranslation() {
+    const e = this.#shim.exports;
+    const ptr = e.gex_jit_pending_ptr() >>> 0;
+    const len = e.gex_jit_pending_len() >>> 0;
+    await this.#installModule(this.#bytes().slice(ptr, ptr + len), e.gex_jit_slots() >>> 0);
+    e.gex_jit_installed();
+    // This Worker translated it, so it is already the newest one installed
+    // here; the registry entry `gex_jit_installed` just added is the same
+    // module and must not be replayed on top of itself.
+    this.#installed = e.gex_module_count ? e.gex_module_count() >>> 0 : this.#installed;
+  }
+
+  /**
+   * Put one translated module's blocks into this Worker's dispatch tables.
+   *
+   * Shared by the two ways a module arrives: this Worker translated it, or
+   * another thread did and this one is catching up. The work is the same
+   * either way, which is the point of it being one function -- a thread that
+   * installed modules differently from the thread that made them would
+   * dispatch to different code.
+   */
+  async #installModule(bytes, need) {
+    const t0 = performance.now();
+    this.#installs++;
+    try {
+      await this.#installModuleInner(bytes, need);
+    } finally {
+      this.#installMs += performance.now() - t0;
+    }
+  }
+
+  /**
+   * The install itself, timed by the wrapper above.
+   *
+   * Timed because the counter this project steers by -- `millis translating`
+   * -- measures only the lifting, and lifting turned out not to be what a run
+   * costs. The second `apt-get update` in one browser lifts for 0.4 seconds
+   * across ten processes and still takes 69, and each of those processes
+   * installs upward of two thousand shared modules. Compiling and
+   * instantiating those is work no existing counter could see.
+   */
+  async #installModuleInner(bytes, need) {
+    const t0 = performance.now();
+    const e = this.#shim.exports;
+    const tables = this.#growTables(need);
+    // The shim allocates in one slot space that spans every table, so the
+    // figure it reports is a running total and each table's share is that
+    // total clamped to its own window. Several tables exist because V8 caps
+    // one at ten million entries, which is 38 MiB of guest text -- less than
+    // half the graphics rootfs. See #64.
+    //
+    // Finite, not `Infinity`: the window arithmetic multiplies this by the
+    // table index, and `0 * Infinity` is `NaN`, which reaches `Table.grow`
+    // as "Argument 0 must be convertible to a valid number" and says nothing
+    // about where it came from. A shim from before this export existed has
+    // one table, so any number too large to reach is the right answer.
     const mod = bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
     this.#compiled.push({ mod, need });
     const imports = { ...this.#imports };
     for (let i = 0; i < tables.length; i++) imports[TABLE_NAMES[i]] = tables[i];
-    const inst = await WebAssembly.instantiate(mod, { gex: imports });
+    // Instantiating is where a module's blocks reach the tables: it carries
+    // element segments that write them, so a slot past the end of a table is
+    // a trap *here* rather than at the branch that would have used it. The
+    // engine's message says only "table index is out of bounds", which reads
+    // like a guest dispatch and is not one, so the numbers that distinguish
+    // them are attached here.
+    let inst;
+    try {
+      inst = await WebAssembly.instantiate(mod, { gex: imports });
+    } catch (err) {
+      throw new Error(
+        `installing a module of ${need} slots failed: ${err.message}. ` +
+          `tables are [${tables.map((t) => t.length).join(', ')}], ` +
+          `${(e.gex_slots_per_table?.() ?? 0) >>> 0} slots per table, ` +
+          `${this.#installs} modules in so far`,
+      );
+    }
+    // The two halves, separately. A module costs a fixed amount to
+    // instantiate and a variable amount to wire up -- one directory lookup
+    // and one table write per block it holds -- and which of the two
+    // dominates decides the fix. If it is the fixed part, merging many
+    // modules into one is the answer; if it is the per-block part, merging
+    // changes nothing because the blocks are the same either way.
+    // Nothing to wire up here, for a module this translator built.
+    //
+    // Worth stating because it was measured rather than assumed, and because
+    // it decides which optimisation is worth doing. A translated module
+    // exports one function, `enter`, and installs its blocks into the
+    // imported tables through its own element segments -- so the table is
+    // filled by `instantiate` itself, and the loop below writes nothing. Of
+    // 933ms of installing, 924 were `instantiate`.
+    //
+    // Which means the cost is per *module* and not per block: merging many
+    // modules into one removes it, and anything that makes each module
+    // cheaper to wire up cannot, because that part is already free. The loop
+    // stays for modules of the older shape, which name each block.
     for (const name of Object.keys(inst.exports)) {
       if (name[0] !== 'b') continue;
       // The shim packs the table index into the top eight bits, the same way

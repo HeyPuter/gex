@@ -197,6 +197,32 @@ DEMOS.forEach((d, i) => {
 
 // -- start ----------------------------------------------------------------
 
+// Anything that throws where nobody is catching, into the terminal.
+//
+// The site reports what a demo's own promise rejects with, and nothing else.
+// A throw in a Worker, in the page's own code, or in a promise nobody awaited
+// went to a console that a person watching a terminal never opens -- so a run
+// that died looked like a run that had gone quiet, and the demo sat at its
+// last heartbeat with the guest's pc frozen where the Worker had left it.
+// "apt update crashes and there's a throw that never gets printed" is exactly
+// this, and it stayed unidentified for as long as it did because the evidence
+// was one panel away from the failure.
+for (const [event, describe] of [
+  ['error', (e) => `${e.message} at ${e.filename}:${e.lineno}`],
+  ['unhandledrejection', (e) => `unhandled rejection: ${e.reason?.stack || e.reason?.message || String(e.reason)}`],
+]) {
+  self.addEventListener(event, (e) => {
+    const text = describe(e);
+    try {
+      term.writeln('');
+      term.writeln(ansi.red(`gex: ${text}`));
+    } catch {
+      // The terminal is the nicety; the console is the guarantee.
+    }
+    console.error(`[gex] ${text}`);
+  });
+}
+
 (async function start() {
   // `?harness=1` is not a demo. It boots the runtime against a rootfs served
   // from a real directory and then answers commands over HTTP for as long as

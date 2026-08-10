@@ -373,6 +373,11 @@ async function handle(msg) {
       extracted: (msg.extract ?? []).map((p) => [p, gex.readFile(p)]),
       blocks: Number(gex.shim.exports.gex_jit_blocks?.() ?? 0),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
+      // And what the *engine* cost, which the line above does not cover:
+      // compiling and instantiating every module this process installed,
+      // whether it lifted them or took them from another process.
+      installMs: gex.installMillis,
+      installs: gex.installCount,
       // How the shared-slot lookup went: pages this process already had,
       // pages the identity map knew, pages it did not, and pages with no
       // identity at all. The question is why a child re-lifts its parent's

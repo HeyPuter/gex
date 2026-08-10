@@ -23,8 +23,8 @@
 // no rebuild.
 import { spawn } from 'node:child_process';
 import { createServer, request as httpRequest } from 'node:http';
-import { readFile, stat } from 'node:fs/promises';
-import { join, dirname, extname, resolve as resolvePath } from 'node:path';
+import { readFile, readdir, stat } from 'node:fs/promises';
+import { join, dirname, basename, extname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -34,6 +34,16 @@ const WEB = join(HERE, '..');
 const DIST = join(WEB, 'dist');
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
 const PORT = Number(process.env.GEX_HARNESS_PORT || 39900);
+
+// The kernel's memory is a SharedArrayBuffer, and a page only gets one when it
+// is cross-origin isolated. Every response the page reads needs these, not
+// only the document: without them the harness silently runs a one-process
+// world, which is not what anything here wants to measure.
+const ISOLATED = {
+  'cross-origin-opener-policy': 'same-origin',
+  'cross-origin-embedder-policy': 'require-corp',
+  'cross-origin-resource-policy': 'cross-origin',
+};
 
 const TYPES = {
   '.html': 'text/html',
@@ -95,7 +105,35 @@ function body(req) {
   });
 }
 
-function makeServer(root) {
+/**
+ * A closure build, as the page needs it.
+ *
+ * `gexc build --closure -o <stem>.wasm` writes the image module at
+ * `<stem>.wasm`, one `<stem>.NN.<name>.wasm` per library beside it, and
+ * `<stem>.pins` saying where each object was placed. `run-node.mjs` reads all
+ * of that off the disk through `GEX_CLOSURE`; a page cannot, so the server
+ * hands over a manifest and the files.
+ */
+async function closureManifest(stem) {
+  const dir = dirname(stem);
+  const base = basename(stem);
+  const libs = (await readdir(dir))
+    .filter((n) => n.startsWith(`${base}.`) && n.endsWith('.wasm') && n !== `${base}.wasm`)
+    .sort();
+  // `base span path` per line, the same three fields `gexc run --pin` takes.
+  const pins = {};
+  const text = await readFile(`${stem}.pins`, 'utf8').catch(() => '');
+  for (const line of text.split('\n')) {
+    const f = line.split(' ');
+    if (f.length < 3) continue;
+    const at = Number(f[0]);
+    if (!Number.isFinite(at) || at <= 0) continue;
+    pins[f.slice(2).join(' ').trim()] = { base: at, span: Number(f[1]) || 0 };
+  }
+  return { image: `${base}.wasm`, libs, pins };
+}
+
+function makeServer(root, closureStem) {
   // Commands waiting for the page, and the HTTP responses waiting for their
   // results.
   const queue = [];
@@ -118,6 +156,28 @@ function makeServer(root) {
     const p = url.pathname;
 
     if (p === '/harness/rootfs.tar') return streamRootfs(root, res);
+
+    // The closure: what it is made of, and then each piece by name.
+    if (p === '/harness/closure.json') {
+      if (!closureStem) return res.writeHead(404).end('no closure');
+      const m = await closureManifest(closureStem);
+      return res
+        .writeHead(200, { 'content-type': 'application/json', ...ISOLATED })
+        .end(JSON.stringify(m));
+    }
+    if (p.startsWith('/harness/closure/')) {
+      // The name comes from the manifest this server wrote, but it arrives
+      // over the wire: anything with a separator in it is not ours.
+      const name = decodeURIComponent(p.slice('/harness/closure/'.length));
+      if (!closureStem || name.includes('/') || name.includes('..')) {
+        return res.writeHead(404).end('not found');
+      }
+      const bytes = await readFile(join(dirname(closureStem), name)).catch(() => null);
+      if (!bytes) return res.writeHead(404).end('not found');
+      return res
+        .writeHead(200, { 'content-type': 'application/wasm', ...ISOLATED })
+        .end(bytes);
+    }
 
     if (p === '/harness/ready') {
       ready = JSON.parse((await body(req)) || '{}');
@@ -153,6 +213,21 @@ function makeServer(root) {
 
     // The driver asking for a command to be run. Held open until the page
     // answers, so `run` is one request and no polling.
+    // Pick up a rebuilt bundle without losing the browser.
+    //
+    // A new shim means the page has to fetch `dist` again, and the way that
+    // was done was to stop the whole run and start another -- a fresh
+    // Chromium, a fresh rootfs unpack, thirty seconds before the first
+    // command. The browser is the expensive part and none of it needs
+    // replacing: the page reloads, re-reads the bundle, boots a new shell,
+    // and says it is ready again.
+    if (p === '/control/reload') {
+      ready = null;
+      queue.push({ id: nextId++, reload: true });
+      handOut();
+      return res.writeHead(204).end();
+    }
+
     if (p === '/control/run') {
       const cmd = url.searchParams.get('cmd') || '';
       const id = nextId++;
@@ -198,7 +273,7 @@ async function start(args) {
     process.exit(2);
   });
 
-  const server = makeServer(root);
+  const server = makeServer(root, args.closure ? resolvePath(args.closure) : null);
   await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
   process.stderr.write(`harness: serving ${DIST} and ${root} on :${PORT}\n`);
 
@@ -207,7 +282,9 @@ async function start(args) {
     `http://127.0.0.1:${PORT}/?harness=1&shell=${encodeURIComponent(args.shell || '/bin/dash')}` +
     (args.trace ? '&trace=1' : '') +
     (args.debug ? '&debug=1' : '') +
+    (args.adopt ? `&adopt=${encodeURIComponent(args.adopt)}` : '') +
     (args.wisp ? `&wisp=${encodeURIComponent(args.wisp)}` : '') +
+    (args.closure ? '&closure=1' : '') +
     (args.recompile !== undefined ? `&recompile=${encodeURIComponent(args.recompile)}` : '');
   const chrome = spawn(
     CHROME,
@@ -235,7 +312,16 @@ async function start(args) {
   });
   const bye = () => {
     chrome.kill('SIGKILL');
-    rmSync(profile, { recursive: true, force: true });
+    // The kill has been sent, not waited for, and Chromium writes its profile
+    // out as it goes: the directory can gain a file between the walk and the
+    // unlink, which is `ENOTEMPTY` -- and thrown from an `exit` handler that
+    // turns a finished run into a crash. A leftover directory in the
+    // temporary space is not worth reporting an error over.
+    try {
+      rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    } catch {
+      /* the run is over; a stale profile directory is not a failure */
+    }
   };
   process.on('exit', bye);
   process.on('SIGINT', () => process.exit(0));
@@ -282,6 +368,14 @@ for (let i = 0; i < rest.length; i++) {
   else if (rest[i] === '--trace') flags.trace = true;
   else if (rest[i] === '--debug') flags.debug = true;
   else if (rest[i] === '--wisp') flags.wisp = rest[++i];
+  // How long to let one command run before giving up on it and
+  // returning whatever it printed. The default is fifteen minutes, which
+  // is right for a slow-but-working `apt-get update` and exactly wrong
+  // for chasing a hang: every iteration cost the full fifteen before
+  // saying anything. The output collected so far comes back either way.
+  else if (rest[i] === '--wait') flags.wait = rest[++i];
+  else if (rest[i] === '--adopt') flags.adopt = rest[++i];
+  else if (rest[i] === '--closure') flags.closure = rest[++i];
   else if (rest[i] === '--recompile') flags.recompile = rest[++i];
   else positional.push(rest[i]);
 }
@@ -289,12 +383,20 @@ for (let i = 0; i < rest.length; i++) {
 if (verb === 'start') {
   await start(flags);
 } else if (verb === 'run') {
-  const r = await control('/control/run', { cmd: positional.join(' ') });
+  const r = await control('/control/run', {
+    cmd: positional.join(' '),
+    ...(flags.wait ? { timeout: flags.wait } : {}),
+  });
   if (r.error) process.stderr.write(`harness: ${r.error}\n`);
   process.stdout.write(r.out || '');
   for (const l of r.log || []) process.stderr.write(`${l}\n`);
   process.stderr.write(`harness: ${r.ms}ms\n`);
   process.exit(r.error ? 1 : 0);
+} else if (verb === 'reload') {
+  await control('/control/reload');
+  // And wait for the page to come back up, so the next `run` is not sent
+  // into a browser that is still unpacking.
+  console.log(JSON.stringify(await control('/control/ready')));
 } else if (verb === 'ready') {
   console.log(JSON.stringify(await control('/control/ready')));
 } else if (verb === 'stop') {
@@ -304,7 +406,10 @@ if (verb === 'start') {
   await start(flags);
   await control('/control/ready');
   for (const cmd of positional) {
-    const r = await control('/control/run', { cmd });
+    const r = await control('/control/run', {
+      cmd,
+      ...(flags.wait ? { timeout: flags.wait } : {}),
+    });
     process.stdout.write(`--- ${cmd}\n${r.out || ''}`);
     for (const l of r.log || []) process.stderr.write(`${l}\n`);
     if (r.error) process.stderr.write(`harness: ${r.error}\n`);
@@ -313,8 +418,9 @@ if (verb === 'start') {
   process.exit(0);
 } else {
   console.error(
-    'usage: harness.mjs start|run|ready|stop|once [--root DIR] [--shell PATH]\n' +
-      '                   [--trace] [--debug] [--recompile KIB] [cmd...]',
+    'usage: harness.mjs start|run|ready|reload|stop|once [--root DIR] [--shell PATH]\n' +
+      '                   [--trace] [--debug] [--recompile KIB] [--wisp URL]\n' +
+      '                   [--closure STEM] [--wait MS] [cmd...]',
   );
   process.exit(2);
 }

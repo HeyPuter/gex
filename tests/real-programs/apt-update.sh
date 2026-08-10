@@ -56,10 +56,47 @@ if [ -f "$CLOSURE.wasm" ] && [ -f "$CLOSURE.pins" ]; then
     blocks=$(grep -oE 'translating [0-9]+ blocks' /tmp/gex-apt-browser.log \
         | awk '{s+=$2} END {print s+0}')
     procs=$(grep -c 'translating' /tmp/gex-apt-browser.log || true)
-    echo "apt-get update, browser + closure: exit $brc, ${bms}ms, \
+    echo "apt-get update, node + closure: exit $brc, ${bms}ms, \
 $blocks blocks over $procs processes"
-    [ "$brc" = 0 ] || { echo "FAIL: browser run exited $brc"; exit 1; }
+    [ "$brc" = 0 ] || { echo "FAIL: node closure run exited $brc"; exit 1; }
 else
-    echo "apt-get update, browser + closure: skipped (no closure at $CLOSURE.wasm)"
+    echo "apt-get update, node + closure: skipped (no closure at $CLOSURE.wasm)"
+fi
+
+# And in an actual browser.
+#
+# The leg above was labelled "browser" for months and runs `run-node.mjs`:
+# the same shim, on Node, with the same wasm. That is a fair test of the
+# translator and no test at all of the host -- and the difference turned out
+# to matter more than anything the label implied. `run-node.mjs` starts the
+# program as pid 1, so nothing above it ever forked; in a page the demo runs
+# a shell, the shell forks, and until #101 the child died in job control
+# before it reached `execve`. Every external command in a browser had been
+# broken for as long as there had been one, and this suite reported "browser"
+# passing throughout.
+#
+# So this leg drives Chromium: real Workers, real SharedArrayBuffer, a real
+# interactive dash forking apt and apt forking its methods.
+if [ -d web/dist ] && [ -x "${CHROME:-/usr/bin/chromium}" ]; then
+    rm -rf "$ROOT/var/lib/apt/lists"
+    mkdir -p "$ROOT/var/lib/apt/lists/partial"
+    started=$(date +%s%N)
+    node web/test/harness.mjs once --root "$ROOT" \
+        'apt-get update >/dev/null 2>&1; echo "gate rc=$? lists=$(ls /var/lib/apt/lists | grep -c _Packages)"' \
+        > /tmp/gex-apt-chromium.log 2>&1
+    wms=$(( ($(date +%s%N) - started) / 1000000 ))
+    gate=$(grep -o 'gate rc=[0-9]* lists=[0-9]*' /tmp/gex-apt-chromium.log | tail -1)
+    wblocks=$(grep -oE 'translating [0-9]+ blocks' /tmp/gex-apt-chromium.log \
+        | awk '{s+=$2} END {print s+0}')
+    wprocs=$(grep -c 'translating' /tmp/gex-apt-chromium.log || true)
+    echo "apt-get update, in a browser: $gate, ${wms}ms including browser start, \
+$wblocks blocks over $wprocs processes"
+    case "$gate" in
+        "gate rc=0 lists=0") echo "FAIL: browser apt wrote no index"; exit 1 ;;
+        "gate rc=0 lists="*) : ;;
+        *) echo "FAIL: browser apt did not finish -- see /tmp/gex-apt-chromium.log"; exit 1 ;;
+    esac
+else
+    echo "apt-get update, in a browser: skipped (no web/dist or no chromium)"
 fi
 echo "matches"

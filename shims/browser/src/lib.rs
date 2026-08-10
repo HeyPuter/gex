@@ -2680,6 +2680,45 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
     })
 }
 
+/// Throw away a forked child's inherited dispatch directory and put back
+/// only the entries it can honour.
+///
+/// A child that defers installing its parent's modules must not claim its
+/// parent's slots. The directory arrives with the copied memory naming one
+/// for every page the parent had translated, and a child that installed none
+/// of them has filled none of those slots -- so every branch is a bet on
+/// what the slot happens to hold, and the run dies later in an unrelated
+/// syscall with a corrupted pointer. Moving the bulk install earlier or
+/// later does not remove the bet; only forgetting the claims does.
+///
+/// Zeroing alone is not enough, and the reason is worth stating: the guest
+/// module publishes its *own* entries from a data segment, and in the shared
+/// build those segments are passive and guarded by an atomic that the copied
+/// memory already has set. So the child's module will never re-publish them.
+/// Erase them and the child cannot execute its first instruction -- which is
+/// exactly what happened: the shell forked, the child printed nothing, and
+/// the parent sat in `wait4` until the harness gave up.
+///
+/// So: erase everything, then write back what the module's own metadata says
+/// this image covers. What remains is a directory that claims only what this
+/// process can dispatch to, which is the invariant deferring needs.
+#[no_mangle]
+pub extern "C" fn gex_reset_directory() -> u32 {
+    let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
+    let data = guest_bytes();
+    let from = gex_abi::DISPATCH_DIR as usize;
+    let to = LOW_END as usize;
+    data[from..to].fill(0);
+    let mut gm = GuestMem::new(guest_bytes());
+    let mut n = 0u32;
+    for (page, base) in &meta.dir_entries {
+        if gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, *base).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// The directory the guest starts in, staged until it is loaded.
 static CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
 
@@ -6113,6 +6152,23 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         dirs.extend_from_slice(d);
                         h.jit.reuse_served += 1;
                     }
+                    // Does any of this answer the block that faulted?
+                    //
+                    // A unit holds what was reachable from the block that
+                    // faulted in the process that built it, so an object's
+                    // stored modules mostly do not contain any given address
+                    // in it. Serving a batch and going back to the guest was
+                    // therefore not progress: the branch missed again, the
+                    // next miss took the next batch, and one address cost 306
+                    // misses and five thousand modules before the translator
+                    // produced the block in eleven milliseconds.
+                    //
+                    // It matters far more now than when it was first found. A
+                    // forked child that defers arrives with an empty
+                    // directory *by design*, so every page it touches is a
+                    // miss -- and at three hundred misses each, a child made
+                    // no measurable progress in two and a half minutes.
+                    let covers = dirs.iter().any(|(p, _)| *p == page);
                     let bytes: Vec<&[u8]> = ready.iter().map(|(_, _, _, w)| w.as_slice()).collect();
                     match gex_xlate::merge::merge(&bytes) {
                         Some(wasm) => h.jit.pending.push_back(PendingModule { dirs, slots, wasm }),
@@ -6129,9 +6185,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         }
                     }
                     publish_pending(h);
-                    set_resume(pc);
-                    set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-                    return true;
+                    if covers {
+                        set_resume(pc);
+                        set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+                        return true;
+                    }
+                    // Otherwise fall through and lift the block in this same
+                    // turn. What was served is queued either way, and the
+                    // trap at the end of translation installs all of it.
                 }
                 if let Some(base) = shared_slot(h, page, key) {
                     h.jit.page_table.assign(page, base);

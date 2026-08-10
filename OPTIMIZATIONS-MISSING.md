@@ -1481,3 +1481,84 @@ mapping in four steps and every one of them splits a vma, and the RELRO
 not a fact about the code and changes during a process's life. Removing it is
 right on its own terms. It moved nothing: `hit` stayed at 12, blocks stayed at
 15,725. The binding constraint is the guard, not the key.
+
+
+## A miss that serves sixteen modules and retries the same branch
+
+Added 2026-08-09, from the first trace of `apt-get update` taken inside a
+browser rather than under Node.
+
+The loop, verbatim from the trace:
+
+    miss at pc=0x503a7d0
+    serve 16 module(s) of the object at pc=0x503a7d0
+    miss at pc=0x503a7d0
+    serve 16 module(s) of the object at pc=0x503a7d0
+    ... nineteen times ...
+    serve 7 module(s) of the object at pc=0x503a7d0
+    miss at pc=0x503a7d0
+    translated 272 blocks in 11 ms
+
+306 misses at one address. Roughly five thousand modules taken out of the
+shared store, compiled and instantiated, to discover that none of them held
+the block -- which the translator then produced in eleven milliseconds.
+
+The cause is a mismatch between what a translation unit *is* and what the
+serve path assumed it was. A unit holds what was reachable from the block
+that faulted **in the process that built it**. Arriving at the same object by
+a different route, its stored modules mostly do not contain your address. So
+serving a batch and returning to the guest is not progress: the branch misses
+again, and the next miss takes the next batch.
+
+Taking the modules was never wrong -- this process wants them and will branch
+into them shortly. Going back to the guest *expecting the branch to resolve*
+was wrong. The fix is one condition: if none of the served modules covers the
+faulting page, lift the block in the same turn rather than trapping and
+retrying. One trap instead of nineteen.
+
+### Why it stayed hidden
+
+A forked child used to arrive with every module its parent had already
+instantiated, so there was nothing left in the store to drain and the loop
+never ran. It appeared the moment children stopped doing that -- which makes
+it look like a regression in the change that exposed it, and it is not. Any
+process meeting an object it does not have pays this, and in a ten-process
+`apt-get update` that is all of them.
+
+The general lesson is the one this file keeps relearning: a counter that says
+"served 2540 modules" reads like the sharing working well. It was the sharing
+failing repeatedly and being retried.
+
+
+## "apt hangs" was a child crashing, and the timeout was the symptom
+
+Added 2026-08-10, after eight bisect runs that all reported the same thing
+and none of which was read properly.
+
+Every failing run ended `harness: 120002ms` -- the command hit its cap -- and
+that was taken as a hang. It is not. Further up the same log:
+
+    gex: process 11 failed: the gex runtime trapped inside the shim
+         (memory access out of bounds, guest pc=0x50bbd20, inside syscall 99)
+         in /lib/aarch64-linux-gnu/libc.so.6 +0xbbd20
+    [proc] abandon 11: the Worker stopped without an exit
+
+A forked child faults on guest memory inside `set_robust_list`, apt waits for
+a method that is never going to answer, and the harness gives up two minutes
+later. The run that passes -- 82 seconds, the committed tree -- contains no
+such line at all, so the crash is the whole difference and the wall-clock
+figure carries no information beyond "something died".
+
+Two habits caused the waste, both worth naming:
+
+  * The greps were `rc=` and `harness: [0-9]+ms`. Neither can ever match a
+    crash. A filter that cannot express the failure you are hunting will
+    report every failure identically, and eight runs looked like one bug.
+
+  * A timeout was treated as a measurement. It is the absence of one. The
+    useful signal was three lines above it and arrived in seconds, which
+    also makes it a far cheaper thing to bisect on than a cap.
+
+The general rule the harness now follows: when watching for an outcome, match
+the failure signatures as well as the success ones. Silence and a timer
+expiring look identical, and they mean completely different things.

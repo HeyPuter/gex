@@ -296,6 +296,13 @@ export async function runProgram(
     // and the Node harness has it off by default -- so a fault that appears in
     // only one of the two hosts cannot be attributed until it can be switched.
     recompileObjects = 8192,
+    // A closure built ahead of time by `gexc build --closure`: the image
+    // module, every library module beside it, and the layout that says where
+    // each one was placed. This is what the project is *for* -- the guest
+    // arrives already translated and lifts almost nothing at runtime -- and
+    // until now no page could be given one, so the browser had only ever been
+    // measured in the configuration that matters least.
+    closure = null,
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
@@ -325,13 +332,21 @@ export async function runProgram(
   const host = new ProcessHost({
     makeWorker: makeGuestWorker,
     shim: shimBytes,
-    guest: seedBytes,
+    // The closure's image module in place of the seed: it holds the program's
+    // own text, already lifted.
+    guest: closure?.image ?? seedBytes,
     kernel,
     extra: {
       // In `extra`, so every Worker gets it and not only pid 1. The shell
       // that starts a demo is never the interesting process: the questions
       // are about the X server and the client it forks.
       heartbeat: heartbeat || undefined,
+      // The closure's libraries, in `extra` rather than `opts` so a forked
+      // child gets them too: a child adopts its parent's memory and with it
+      // the dispatch *directory*, but its dispatch tables belong to its own
+      // guest instance and start empty, so it has to instantiate the modules
+      // itself to have anything for the directory to point at.
+      closure: closure?.libs,
       // `?trace=1` turns on the shim's own narration, in every process. The
       // Node harness has had this through an environment variable all along;
       // the page had no way to ask for it, so a question that needed it could
@@ -390,7 +405,10 @@ export async function runProgram(
       elf,
       files,
       args,
-      opts: { cwd, tty, uid, recompileObjects, heartbeat },
+      // The layout the closure was built against. Without it the placer hands
+      // out an address inside a pinned object and the image lands somewhere
+      // its own translated code does not expect.
+      opts: { cwd, tty, uid, recompileObjects, heartbeat, pins: closure?.pins },
     });
     return { status, host, tenv };
   } finally {

@@ -285,6 +285,19 @@ export class ProcessHost {
         const deliver = (mm) => this.#onMessage(key, w2, mm, () => {}, () => {});
         w2.addEventListener?.('message', (e) => deliver(e.data));
         w2.on?.('message', deliver);
+        // A thread that throws, said out loud.
+        //
+        // A process Worker has had an `error` listener since it was written,
+        // and its rejection is reported. A thread's had none: nothing was
+        // listening, so an exception in a guest thread was swallowed whole
+        // and the process it belonged to simply stopped making progress --
+        // which reads as a hang, and is the hardest kind of failure to find
+        // because the evidence is destroyed with the Worker that had it.
+        const threadFailed = (e) => {
+          this.#onOutput(2, `gex: thread ${key} failed: ${e?.message ?? String(e)}\n`, pid);
+        };
+        w2.addEventListener?.('error', threadFailed);
+        w2.on?.('error', threadFailed);
         this.#pending.set(key, { kind: 'thread', ...m.thread });
         // `ready` arrives keyed by the *process*, so the start message is
         // looked up by pid. A thread's is keyed by tid, so it is handed over
@@ -335,6 +348,7 @@ export class ProcessHost {
         if (typeof window !== 'undefined' && m.millis !== undefined) {
           console.log(
             `[gex] pid ${pid}: ${m.millis}ms translating ${m.blocks} blocks` +
+              (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` : '') +
               (m.reuse
                 ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]}` +
                   ` noident=${m.reuse[3]} served=${m.reuse[4]} stored=${m.reuse[5]} writable=${m.reuse[9]} nocode=${m.reuse[10]}`
