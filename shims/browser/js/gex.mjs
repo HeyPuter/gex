@@ -853,6 +853,7 @@ export class Gex {
       // answer nought, which is exactly right: a run of one process has no
       // sibling to share with, and the shim keeps its own map anyway.
       'k_slot_get', 'k_slot_put', 'k_slot_alloc', 'k_slot_floor',
+      'k_stdin_write', 'k_stdin_read', 'k_stdin_ready', 'k_stdin_eof',
       'k_mod_claim_object', 'k_mod_for_object',
       'k_place', 'k_place_set',
       'k_mod_store', 'k_mod_claim', 'k_mod_for', 'k_mod_slots',

@@ -270,6 +270,13 @@ extern "C" {
     /// the second process to run `ls` finds what the first one did.
     fn k_slot_get(page: u64, key: u64) -> u32;
     fn k_slot_put(page: u64, key: u64, base: u32);
+    /// Standard input, shared. Whoever has a keystroke writes it here and
+    /// wakes a parked reader, rather than posting a message to a Worker that
+    /// is asleep inside wasm and cannot receive one.
+    fn k_stdin_write(at: u32, len: u32) -> i32;
+    fn k_stdin_read(at: u32, len: u32) -> i32;
+    fn k_stdin_ready() -> i32;
+    fn k_stdin_eof();
     /// Slots nobody else will be given, and the mark that keeps runtime
     /// allocation clear of what static recompilation already assigned.
     fn k_slot_alloc(count: u64) -> u64;
@@ -697,12 +704,37 @@ unsafe impl Sync for StdinQueue {}
 
 impl FileHandle for StdinQueue {
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
-        let mut q = self.bytes.borrow_mut();
-        let n = buf.len().min(q.len());
-        for (i, b) in q.drain(..n).enumerate() {
-            buf[i] = b;
+        // What this Worker was handed directly first -- a host that gives the
+        // whole of stdin up front still does, and a run of one process needs
+        // no kernel at all.
+        {
+            let mut q = self.bytes.borrow_mut();
+            let n = buf.len().min(q.len());
+            if n > 0 {
+                for (i, b) in q.drain(..n).enumerate() {
+                    buf[i] = b;
+                }
+                return Ok(n as u64);
+            }
         }
-        Ok(n as u64)
+        // Then the shared queue, which is where a keystroke goes now. It is
+        // in the kernel rather than here so that whoever has it can write it
+        // and wake a *parked* reader: a Worker asleep inside wasm is not
+        // running the event loop a `postMessage` would arrive on, which is
+        // the whole reason waits used to be sorted into "the page ends this"
+        // and "another Worker ends this".
+        // SAFETY: scalars, and the kernel refuses a range outside this
+        // process's memory rather than writing it.
+        if unsafe { k_present() } != 0 {
+            let n = unsafe { k_stdin_read(buf.as_mut_ptr() as u32, buf.len() as u32) };
+            if n > 0 {
+                return Ok(n as u64);
+            }
+            if n == 0 {
+                return Ok(0); // end of input
+            }
+        }
+        Ok(0)
     }
 
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> SysResult {
@@ -732,7 +764,11 @@ impl FileHandle for StdinQueue {
     /// Nothing typed yet is a wait, unless the page has said there will be no
     /// more.
     fn poll_readable(&self) -> bool {
-        self.eof.get() || !self.bytes.borrow().is_empty()
+        if self.eof.get() || !self.bytes.borrow().is_empty() {
+            return true;
+        }
+        // SAFETY: takes and returns scalars.
+        unsafe { k_present() != 0 && k_stdin_ready() != 0 }
     }
 }
 
@@ -2694,7 +2730,19 @@ static WAKE_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::n
 /// gears demo booted to the same point and then crawled -- the X handshake is
 /// a great many small waits, and paying twenty milliseconds for each one that
 /// this could not classify is most of a minute of nothing.
-const PARK_HERE_NS: u64 = 2_000_000;
+///
+/// It was then two milliseconds, which is not a wait at all: nothing that
+/// reaches here sleeps, it wakes and re-parks five hundred times a second.
+/// `apt-get update` spent 34 seconds of a 115 second run in `k_park` doing
+/// exactly that, and 40 seconds of system time on the futex traffic.
+///
+/// A hundred is affordable now because a wait only reaches this bound if it
+/// was misjudged, and the misjudgement that used to be common -- calling a
+/// poll over pipes a page wait -- is gone: the only thing that arrives as a
+/// message to a guest's own Worker is a Wisp socket, and a process with a
+/// network is excluded above. So this is a backstop against a wake that was
+/// never sent, not a polling interval.
+const PARK_HERE_NS: u64 = 100_000_000;
 
 /// Whether the page, rather than another Worker, is what ends this wait.
 ///
@@ -2717,6 +2765,16 @@ fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
     // that is the case the X server and its client are in.
     let is_peer = |h: &Arc<dyn gex_kernel::vfs::FileHandle>| {
         use gex_kernel::vfs::FileType;
+        // Standard input, which is now a queue in the kernel rather than one
+        // in this Worker's own shim. Whoever has the keystroke writes it and
+        // wakes; nothing arrives by a message this Worker has to be awake to
+        // receive. Compared by address, as `is_remote` does -- the handle in
+        // a parked thread is the same `Arc` the table holds, upcast, and the
+        // data half of a fat pointer survives the cast.
+        let stdin_p = Arc::as_ptr(&*STDIN) as *const ();
+        if Arc::as_ptr(h) as *const () == stdin_p {
+            return true;
+        }
         match h.metadata().map(|m| m.file_type) {
             Ok(FileType::Fifo) => true,
             Ok(FileType::Socket) => kernel.net.is_none(),
@@ -2757,13 +2815,32 @@ fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
         // them. A poll whose whole set is pipes and guest sockets is ended by
         // another Worker, and that Worker's notify can end it.
         //
-        // A deadline is the clock's to end, and the clock is the page's.
-        // Every timed wait and every `poll` parks as this, whatever it is
-        // watching. Classifying them by their descriptors was tried and it
-        // stalled the gears demo halfway through -- glxgears drew for fifty
-        // seconds and then stopped with its shell in `wait4` -- so until that
-        // is understood the page keeps them all.
-        Waiting::Net(_) => true,
+        // A deadline is the clock's to end, and the clock is the page's -- so
+        // a *timed* wait still belongs to the page. An untimed one does not,
+        // unless this process has a network.
+        //
+        // The only thing a guest can wait for that arrives as a message to
+        // its own Worker is a Wisp socket: the WebSocket is constructed in
+        // the guest's Worker, so its bytes land on that thread's event loop,
+        // and a Worker parked inside wasm is not running it. Everything else
+        // a poll can name -- a pipe, a unix socket, another process -- is
+        // ended by another Worker, whose `k_wake` reaches a parked one.
+        //
+        // So the question is whether this process has a network at all, which
+        // is a property of the process and not of the descriptors in the set.
+        // Asking about the descriptors is what was tried before and it
+        // stalled the gears demo; this cannot make that mistake, because it
+        // does not look at them.
+        //
+        // What it costs when the answer is wrong is nothing: the deadline
+        // still ends the wait, and a process with a network keeps exactly the
+        // behaviour it had.
+        //
+        // Measured on `apt-get update`, which has no network: the park loop
+        // was 34 seconds of a 115 second run, waking and re-parking every two
+        // milliseconds because it dared not sleep longer.
+        Waiting::Net(Some(_)) => true,
+        Waiting::Net(None) => kernel.net.is_some(),
         _ => false,
     }
 }

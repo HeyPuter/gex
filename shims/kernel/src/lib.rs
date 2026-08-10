@@ -260,6 +260,66 @@ pub extern "C" fn k_slot_put(page: u64, key: u64, base: u32) {
         .or_insert(base);
 }
 
+/// Standard input, in the memory every Worker shares.
+///
+/// It used to be a queue in each guest Worker's own shim, filled by a message
+/// from the host: the Worker asked for input, gave the wasm stack back, and
+/// the answer arrived as a `postMessage`. That is why a guest waiting for a
+/// keystroke could not be parked -- a Worker asleep inside wasm is not
+/// running the event loop the answer arrives on -- and why every wait had to
+/// be classified into "the page ends this" and "another Worker ends this".
+///
+/// Here instead, so whoever has the keystroke writes it and calls
+/// [`k_wake`], and a parked reader is woken by the same counter a pipe write
+/// would have bumped. No classification, and nothing to misclassify.
+fn stdin() -> &'static Mutex<(std::collections::VecDeque<u8>, bool)> {
+    note_panics();
+    static Q: OnceLock<Mutex<(std::collections::VecDeque<u8>, bool)>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new((std::collections::VecDeque::new(), false)))
+}
+
+/// Append what was typed, from the caller's process memory.
+#[no_mangle]
+pub extern "C" fn k_stdin_write(at: u32, len: u32) -> i32 {
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: the same copy every pipe write makes, and `pull_checked`
+    // refuses a range outside the process memory rather than reading it.
+    unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    let mut s = stdin().lock().unwrap_or_else(|e| e.into_inner());
+    s.0.extend(buf);
+    len as i32
+}
+
+/// There will be no more input.
+#[no_mangle]
+pub extern "C" fn k_stdin_eof() {
+    stdin().lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+}
+
+/// Bytes waiting, or -1 once there will be no more and none are left.
+#[no_mangle]
+pub extern "C" fn k_stdin_ready() -> i32 {
+    let s = stdin().lock().unwrap_or_else(|e| e.into_inner());
+    if s.0.is_empty() && s.1 {
+        return -1;
+    }
+    s.0.len() as i32
+}
+
+/// Take up to `len` bytes into the caller's process memory.
+#[no_mangle]
+pub extern "C" fn k_stdin_read(at: u32, len: u32) -> i32 {
+    let mut s = stdin().lock().unwrap_or_else(|e| e.into_inner());
+    let n = (len as usize).min(s.0.len());
+    if n == 0 {
+        return if s.1 { 0 } else { -11 }; // EOF, or EAGAIN
+    }
+    let bytes: Vec<u8> = s.0.drain(..n).collect();
+    // SAFETY: as above, in the other direction.
+    unsafe { gex_kmem::push_checked(at, bytes.as_ptr(), n as u32) };
+    n as i32
+}
+
 /// The system-wide slot allocation mark.
 ///
 /// Dispatch slots have to be unique across *processes*, not just within one,
