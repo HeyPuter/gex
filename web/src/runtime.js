@@ -358,6 +358,12 @@ export async function runProgram(
       // the page had no way to ask for it, so a question that needed it could
       // only be answered by editing the shim.
       trace: new URLSearchParams(location.search).get('trace') ? 1 : undefined,
+      // `?hot=1` asks every process to dump its hottest back edges when it
+      // ends. Only `run-node.mjs` could ask before, so the question "what is
+      // the guest actually doing" could not be put to a browser at all --
+      // and now that install and translation are 17 of a 57 second
+      // `apt-get update`, the rest of it is the only thing left to ask about.
+      hot: new URLSearchParams(location.search).get('hot') ? 1 : undefined,
       virgl: channel ?? undefined,
       wispUrl: network?.url ?? undefined,
       winsize: { rows: term.rows, cols: term.cols },

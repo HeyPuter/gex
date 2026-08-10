@@ -396,6 +396,16 @@ export class ProcessHost {
                 : ''),
           );
         }
+        // The guest's own hot spots, when `?hot=1` asked for them.
+        //
+        // Only `run-node.mjs` could ask before, through `GEX_HOT`, so "what
+        // is the guest actually doing" was a question the browser could not
+        // be put. It matters now: install and translation are 17 seconds of a
+        // 57 second `apt-get update` from a closure, and everything else is
+        // the guest running.
+        for (const line of m.hot ?? []) {
+          this.#onOutput(2, `[hot] pid ${pid}: ${line}\n`, pid);
+        }
         // Before the release, because releasing terminates the Worker and a
         // handler that wanted to ask it anything else would be too late.
         this.#onExit(m, pid);

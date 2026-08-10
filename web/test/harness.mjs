@@ -341,6 +341,7 @@ async function start(args) {
     `http://127.0.0.1:${PORT}/?harness=1&shell=${encodeURIComponent(args.shell || '/bin/dash')}` +
     (args.trace ? '&trace=1' : '') +
     (args.debug ? '&debug=1' : '') +
+    (args.hot ? '&hot=1' : '') +
     (args.adopt ? `&adopt=${encodeURIComponent(args.adopt)}` : '') +
     (args.wisp ? `&wisp=${encodeURIComponent(args.wisp)}` : '') +
     (args.closure ? '&closure=1' : '') +
@@ -434,6 +435,7 @@ for (let i = 0; i < rest.length; i++) {
   else if (rest[i] === '--shell') flags.shell = rest[++i];
   else if (rest[i] === '--trace') flags.trace = true;
   else if (rest[i] === '--debug') flags.debug = true;
+  else if (rest[i] === '--hot') flags.hot = true;
   else if (rest[i] === '--wisp') flags.wisp = rest[++i];
   // How long to let one command run before giving up on it and
   // returning whatever it printed. The default is fifteen minutes, which
