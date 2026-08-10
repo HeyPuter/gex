@@ -326,6 +326,7 @@ const host = new ProcessHost({
         `[gex] pid ${pid}: ${m.guestMillis ?? '?'}ms total, ${m.millis}ms translating ${m.blocks} blocks` +
           (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
             ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
+          `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
           // Where the shared-slot lookup went, when the shim reports it:
           // pages this process already had, pages the identity map knew,
           // pages it did not, and pages with no identity at all. The

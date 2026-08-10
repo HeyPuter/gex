@@ -35,20 +35,31 @@ const SHIM_STACK_TOP = 0x04800000;
 // comparing eager against deferred was comparing deferred against itself.
 // Three bisect conclusions were drawn from that before the bug was noticed.
 function adoptAfterTraps() {
-  // Zero -- eager -- until deferring is finished. The mechanism below is
-  // complete and the measurement that motivates it is not in doubt: install
-  // is 3182ms a process against 159ms of translating, and 924 of every 933
-  // of that is `instantiate`, so a child that will `execve` should not pay
-  // it. What is not finished is the other half. A child that installs
-  // nothing must not inherit a directory claiming its parent's slots, and
-  // three ways of removing that claim were tried: clear it late, clear it
-  // before the guest module is instantiated, and rebuild it from the
-  // module's own metadata. The first two crash a grandchild in an unrelated
-  // syscall; the third leaves a child that adopts and then never runs, even
-  // with the serve fix that makes a miss resolve in one turn. Something else
-  // a child needs travels in that directory, and until it is known, eager is
-  // the only setting that is correct.
-  return Number(globalThis.GEX_ADOPT_AFTER ?? 0);
+  // One -- deferred. A forked child takes its parent's modules without
+  // installing them, and picks up what it actually branches into.
+  //
+  // This was zero for a long time, and the note here said eager was "the only
+  // setting that is correct": rebuilding the inherited directory had been
+  // tried three ways and each ended with a grandchild crashing in an
+  // unrelated syscall, or a child that adopted and then never ran. The
+  // conclusion drawn was that something a child needs travels in that
+  // directory.
+  //
+  // It does not. Those were `enter` failing to mask the table index out of a
+  // directory entry -- a rebuilt directory hands out entries in table 1, and
+  // `enter` indexed table 0 with the table number still in the top eight
+  // bits, which is a branch 16.8 million slots past the end. Every one of the
+  // three attempts was correct and every one of them tripped the same bug.
+  // With that fixed (3ecbb8a, and actually shipped in d0795fd) deferring
+  // works, and a forked child costs
+  //
+  //     66ms to adopt, against 356ms
+  //
+  // because it neither grows its dispatch tables to hold 1,121 inherited
+  // modules -- 269ms of allocating and stub-filling before it runs an
+  // instruction -- nor installs them, when almost every child `execve`s
+  // something else immediately and throws the lot away.
+  return Number(globalThis.GEX_ADOPT_AFTER ?? 1);
 }
 
 // What a module calls the function that writes its passive element segments
@@ -214,6 +225,16 @@ export class Gex {
   #compileMs = 0;
   #instantiateMs = 0;
   #growMs = 0;
+  /// What every Worker pays before the guest runs an instruction.
+  ///
+  /// The shim is nine megabytes and the guest module is its own, and both are
+  /// instantiated per Worker -- one Worker being one guest process. None of
+  /// it was in any counter: `installMs` covers translated modules only, so
+  /// the floor under every process has been assumed small rather than
+  /// measured.
+  #shimCompileMs = 0;
+  #shimInstantiateMs = 0;
+  #guestInstantiateMs = 0;
   #installs = 0;
   // Instances whose slots have not been written, newest first: a miss asks
   // each in turn whether it holds the slot. See `fillSlot`.
@@ -437,6 +458,9 @@ export class Gex {
   get compileMillis() { return Math.round(this.#compileMs); }
   get instantiateMillis() { return Math.round(this.#instantiateMs); }
   get growMillis() { return Math.round(this.#growMs); }
+  get shimCompileMillis() { return Math.round(this.#shimCompileMs); }
+  get shimInstantiateMillis() { return Math.round(this.#shimInstantiateMs); }
+  get guestInstantiateMillis() { return Math.round(this.#guestInstantiateMs); }
   /** How many modules that was. */
   get installCount() { return this.#installs; }
 
@@ -712,9 +736,12 @@ export class Gex {
       safepoint: e.gex_safepoint,
       fma: e.gex_fma,
     };
-    this.#guest = await WebAssembly.instantiate(await WebAssembly.compile(guestWasm), {
-      gex: this.#imports,
-    });
+    const tGuest = performance.now();
+    this.#guest = await WebAssembly.instantiate(
+      guestWasm instanceof WebAssembly.Module ? guestWasm : await WebAssembly.compile(guestWasm),
+      { gex: this.#imports },
+    );
+    this.#guestInstantiateMs = performance.now() - tGuest;
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: instantiated, installing');
     await this.#installClosure();
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: done');
@@ -876,13 +903,17 @@ export class Gex {
     //
     // A compiled module is structured-cloneable and the engine shares the
     // code behind it, so passing one costs a message and saves the compile.
+    const tShimC = performance.now();
     const shimMod =
       shimWasm instanceof WebAssembly.Module ? shimWasm : await WebAssembly.compile(shimWasm);
+    this.#shimCompileMs = performance.now() - tShimC;
+    const tShimI = performance.now();
     this.#shim = await WebAssembly.instantiate(shimMod, {
       env: { memory: this.#memory },
       gex_env: this.#hostImports(),
       gex_k: this.#kernelImports(shimMod),
     });
+    this.#shimInstantiateMs = performance.now() - tShimI;
     this.#u8 = null;
     // The shim's stack pointer is a mutable *global*, which belongs to the
     // instance rather than to the memory -- so every Worker has its own and
@@ -918,9 +949,12 @@ export class Gex {
       safepoint: e.gex_safepoint,
       fma: e.gex_fma,
     };
-    this.#guest = await WebAssembly.instantiate(await WebAssembly.compile(guestWasm), {
-      gex: this.#imports,
-    });
+    const tGuest = performance.now();
+    this.#guest = await WebAssembly.instantiate(
+      guestWasm instanceof WebAssembly.Module ? guestWasm : await WebAssembly.compile(guestWasm),
+      { gex: this.#imports },
+    );
+    this.#guestInstantiateMs = performance.now() - tGuest;
     // Everything the process translated before this thread existed.
     await this.#catchUp();
   }
@@ -951,6 +985,7 @@ export class Gex {
    * `fork`, instead of a copy on every switch for the life of both.
    */
   #processImage() {
+    const t0 = performance.now();
     const e = this.#shim.exports;
     const out = [{ at: 0, bytes: this.#bytes().slice(0, LOW_END) }];
     const scratch = e.gex_alloc(24) >>> 0;
@@ -976,6 +1011,17 @@ export class Gex {
     // disagrees about where the heap ends are completely different bugs and
     // look identical from outside, which is where #96 sat for three days.
     if (globalThis.GEX_DEBUG_EXIT) for (const r of out) r.sum = sum32(r.bytes);
+    // What a fork costs the parent, which is not free and has never been
+    // timed: every mapped region is copied out of the memory, and the copy
+    // then crosses to the child's Worker. `apt-get update` forks eighty-five
+    // times.
+    if (globalThis.GEX_DEBUG_EXIT) {
+      const bytes = out.reduce((n, r) => n + r.bytes.byteLength, 0);
+      console.error(
+        `[gex] fork image: ${out.length} regions, ${(bytes / 1048576).toFixed(1)} MiB, `
+        + `${Math.round(performance.now() - t0)}ms to copy`,
+      );
+    }
     return out;
   }
 
@@ -1221,8 +1267,21 @@ export class Gex {
     // stop dead with nothing to show for it: a copy, two compiles, a kernel
     // and a table of code. A child that hangs is indistinguishable from one
     // that is merely slow to start, and it took a bisect to find out which.
+    // Timed, not just narrated. Eighty-five processes at ten seconds of wall
+    // clock each, translating half a second apiece, means the cost is in
+    // getting a process *started* -- and every step here was a place that
+    // could be spending it with nothing to say so.
+    const began = performance.now();
+    let last = began;
     const step = globalThis.GEX_DEBUG_EXIT
-      ? (s) => console.error(`[gex] adopt ${child.pid}: ${s}`)
+      ? (s) => {
+          const now = performance.now();
+          console.error(
+            `[gex] adopt ${child.pid}: ${s} (+${Math.round(now - last)}ms, `
+            + `${Math.round(now - began)}ms in)`,
+          );
+          last = now;
+        }
       : () => {};
     step('copying the image');
     // The parent's memory had grown to hold what it mapped; this one has
@@ -1342,8 +1401,31 @@ export class Gex {
     // What this costs is a child that does *not* exec: it re-serves what it
     // touches instead of arriving with it. What it saves is every child that
     // does.
-    let need = (child.slots ?? 0) >>> 0;
-    for (const m of child.modules ?? []) need = Math.max(need, m.need);
+    // Only as far as the directory this child will actually dispatch through.
+    //
+    // A deferred child rebuilds the directory (`gex_reset_directory` above),
+    // keeping only the image module's own entries -- so the parent's slot
+    // total is not a bound on anything it can branch to, and growing to it is
+    // 272ms of allocating and stub-filling 1.3 million table entries before
+    // the child runs an instruction. Eighty-five processes in an `apt-get
+    // update` is twenty-three seconds of it.
+    //
+    // Growing to the parent's total came from #114, on the theory that a
+    // branch was running off the end of a table. It was not: `enter` was
+    // failing to mask the table index out of a directory entry, and the
+    // tables were never too small. The theory was wrong and this is what it
+    // cost.
+    //
+    // A child that does *not* defer installs its parent's modules here and
+    // each of those grows the tables to its own `need`, which is what the
+    // maximum below is for.
+    let need = 0;
+    if (adoptAfterTraps() <= 0) {
+      // Eager: every inherited module is installed below, so the tables have
+      // to hold all of them.
+      for (const m of child.modules ?? []) need = Math.max(need, m.need);
+      need = Math.max(need, (child.slots ?? 0) >>> 0);
+    }
     if (need) this.#growTables(need);
     // Kept, not dropped: a child that turns out to be staying wants them
     // after all, and by then its parent's Worker may be gone. See

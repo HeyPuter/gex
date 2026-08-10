@@ -36,6 +36,8 @@ export class ProcessHost {
   #pending = new Map();
   #first = null;
   #forked = 0;
+  /// When each process was asked for. See `#spawn`.
+  #asked = new Map();
   #threads = 0;
   // The global kernel's per-Worker stacks, as the first Worker reported them,
   // and how many have been handed out.
@@ -177,6 +179,16 @@ export class ProcessHost {
    * differ between the two.
    */
   #spawn(pid, msg) {
+    // When this process was asked for, so the gap between asking and it
+    // running can be seen.
+    //
+    // Everything measured so far is what a process does *once it is up*:
+    // translating, installing, adopting. Those add to one or two seconds and
+    // an `apt-get update` spends nine per process, so most of a process's
+    // life is in none of them -- and nothing timed the part in between:
+    // making a Worker, loading the bundle into it, and getting fifteen
+    // megabytes of image across.
+    this.#asked.set(pid, performance.now());
     return new Promise((resolve, reject) => {
       const w = this.#makeWorker();
       this.#workers.set(pid, w);
@@ -252,6 +264,12 @@ export class ProcessHost {
   #onMessage(pid, w, m, resolve, reject) {
     switch (m?.kind) {
       case 'ready': {
+        // How long the Worker took to exist and load its bundle, before it
+        // has been given anything to do.
+        if (this.#extra?.debugExit && this.#asked.has(pid)) {
+          const t = performance.now() - this.#asked.get(pid);
+          this.#onOutput(2, `[gex] pid ${pid}: worker ready after ${Math.round(t)}ms\n`, pid);
+        }
         const msg = this.#pending.get(pid);
         this.#pending.delete(pid);
         if (msg) {
@@ -388,6 +406,7 @@ export class ProcessHost {
             `[gex] pid ${pid}: ${m.millis}ms translating ${m.blocks} blocks` +
               (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
             ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
+          `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
               (m.fill && (m.fill.filled || m.fill.unanswered)
                 ? `, fill ${m.fill.filled} answered ${m.fill.unanswered} not`
                 : '') +

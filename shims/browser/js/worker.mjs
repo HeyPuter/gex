@@ -452,6 +452,12 @@ async function handle(msg) {
       compileMs: gex.compileMillis,
       instantiateMs: gex.instantiateMillis,
       growMs: gex.growMillis,
+      // What a Worker pays before the guest runs at all: the shim and the
+      // guest module are instantiated per Worker, and one Worker is one guest
+      // process. Never counted anywhere until now.
+      shimCompileMs: gex.shimCompileMillis,
+      shimInstMs: gex.shimInstantiateMillis,
+      guestInstMs: gex.guestInstantiateMillis,
       installs: gex.installCount,
       fill: gex.fillStats,
       // How the shared-slot lookup went: pages this process already had,
