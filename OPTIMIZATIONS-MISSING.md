@@ -2065,3 +2065,39 @@ So the 24 per cent is not mostly recoverable by folding more blocks together.
 What remains of it is register traffic at genuine boundaries, and attacking
 that means keeping guest registers in wasm locals across calls -- which is
 #15, and a different piece of work from region formation.
+
+### The non-monotonicity is load-bearing
+
+Fixing it made things worse, which settles the question.
+
+`grow` was changed to drop the block heading a second loop and re-narrow,
+instead of rejecting the whole region. That restores monotonicity -- at the
+default limit it formed **223 regions over 598 blocks** against 145 over 366 --
+and nbench got worse on five kernels of ten:
+
+| KERNEL | rejecting | shrinking |
+|---|---|---|
+| NUMERIC SORT | 1.12x | **0.84x** |
+| FP EMULATION | 1.01x | **0.80x** |
+| BITFIELD | 1.95x | 1.75x |
+| HUFFMAN | 1.61x | 1.47x |
+| ASSIGNMENT | 1.01x | 0.94x |
+| LU DECOMPOSITION | 8.16x | 8.38x |
+| NEURAL NET | 18.08x | 18.32x |
+| STRING SORT | 2.86x | 2.98x |
+
+Reverted. The regions the defect was refusing are regions not worth forming,
+so the refusal is doing the job `worth_forming` was written to do -- its own
+comment says as much: *the small accidental regions the forward walk found
+were the ones worth forming*.
+
+That is three experiments now saying the same thing from three directions:
+raising the limit, allowing nesting, and fixing the rejection all form more
+regions and all cost more than they save. **Region coverage is not the lever
+on the 24 per cent.** Anyone returning to this should treat "only 366 of
+27,594 blocks are in a region" as the intended state and not as a shortfall.
+
+The remaining honest target is the register traffic itself -- keeping guest
+registers in wasm locals across a call rather than writing them to the
+context and reading them back -- which is #15 and is a change to what crosses
+a boundary, not to how many boundaries there are.
