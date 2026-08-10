@@ -290,7 +290,7 @@ extern "C" {
     fn k_mod_for(page: u64, key: u64, n: u32) -> u32;
     fn k_mod_claim_object(obj: u64, id: u32);
     fn k_obj_translating(obj: u64, pid: u32) -> u32;
-    fn k_obj_translated(obj: u64);
+    fn k_obj_translated(obj: u64, produced: u32);
     fn k_mod_for_object(obj: u64, n: u32) -> u32;
     fn k_mod_slots(id: u32) -> u64;
     fn k_mod_len(id: u32) -> u32;
@@ -7025,10 +7025,10 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         &intrinsics,
     );
     let object_nanos = now_ns().saturating_sub(object_started);
-    with_host(|h| {
+    let produced = with_host(|h| {
         h.jit.translated = known;
         if modules.iter().all(|m| m.exported_blocks.is_empty()) {
-            return;
+            return 0usize;
         }
         // In emitted order. Each module's page assignments are the next
         // one's starting point, so installing them out of order hands two
@@ -7041,6 +7041,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         }
         h.jit.blocks += stats.blocks as u64;
         h.jit.nanos += object_nanos;
+        let produced = modules.len();
         // And what this claimed, so the next process to map the same library
         // finds it rather than translating it again. The miss path does this
         // for what it translates; without the same here, the second process
@@ -7062,10 +7063,15 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
             });
         }
         publish_pending(h);
+        produced
     });
-    // Released whether or not anything came of it. A translation that
-    // produced nothing must not stop the next process from trying.
-    unsafe { k_obj_translated(obj) };
+    // Released whether or not anything came of it -- a translation that
+    // produced nothing must not stop the next process from trying -- and
+    // recorded as *done* when it did, so the next process serves the object
+    // out of the store instead of lifting it again. That second half is the
+    // difference between an `ls` that costs 78,000 blocks and one that costs
+    // 23,000.
+    unsafe { k_obj_translated(obj, produced as u32) };
     stats.blocks
 }
 

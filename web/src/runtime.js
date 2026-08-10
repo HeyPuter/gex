@@ -295,7 +295,9 @@ export async function runProgram(
     // the page and `run-node.mjs` disagree -- the page has always had it on
     // and the Node harness has it off by default -- so a fault that appears in
     // only one of the two hosts cannot be attributed until it can be switched.
-    recompileObjects = 8192,
+    recompileObjects = typeof globalThis.GEX_RECOMPILE_OBJECTS === 'number'
+      ? globalThis.GEX_RECOMPILE_OBJECTS
+      : 8192,
     // A closure built ahead of time by `gexc build --closure`: the image
     // module, every library module beside it, and the layout that says where
     // each one was placed. This is what the project is *for* -- the guest

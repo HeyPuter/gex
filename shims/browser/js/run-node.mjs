@@ -324,7 +324,8 @@ const host = new ProcessHost({
         // whether a slow run is translation or everything else, and until now
         // the second was computed, posted and thrown away.
         `[gex] pid ${pid}: ${m.guestMillis ?? '?'}ms total, ${m.millis}ms translating ${m.blocks} blocks` +
-          (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` : '') +
+          (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
+            ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           // Where the shared-slot lookup went, when the shim reports it:
           // pages this process already had, pages the identity map knew,
           // pages it did not, and pages with no identity at all. The

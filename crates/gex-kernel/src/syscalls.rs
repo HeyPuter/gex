@@ -1708,6 +1708,24 @@ impl Kernel {
                 if operation != futex::op::WAIT && operation != futex::op::WAIT_BITSET {
                     return None;
                 }
+                // A futex word outside the process's memory map is not
+                // something to wait on. Linux answers `EFAULT`; parking
+                // instead is a hang with no way out, because the wake would
+                // have to come from an address nothing can write.
+                //
+                // Checked against the map rather than with `GuestMem::read`,
+                // which is the trap here: a guest address *is* a linear
+                // memory offset, so reading address zero succeeds and tells
+                // you nothing. Only the map knows there is nothing mapped
+                // there.
+                //
+                // zstd deadlocks with two of its four threads parked on
+                // address zero -- #113. Waiting on it can only be permanent,
+                // and an error is what lets the guest report rather than
+                // stop.
+                if !self.mem.vmas().iter().any(|v| a[0] >= v.start && a[0] + 4 <= v.end) {
+                    return None;
+                }
                 let deadline = if a[3] == 0 {
                     None
                 } else {
@@ -2094,9 +2112,16 @@ impl Kernel {
         // space, and the timeout is treated as relative either way.
         let operation = raw_op & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
         match operation {
-            // The waiting forms never reach here: `blocking_op` takes them
-            // before dispatch so the host can run them unlocked.
-            futex::op::WAIT | futex::op::WAIT_BITSET => Err(Errno::EINVAL),
+            // The waiting forms reach here only when `blocking_op` refused
+            // them, which it does for a futex word the process cannot read.
+            futex::op::WAIT | futex::op::WAIT_BITSET => {
+                let mapped = self
+                    .mem
+                    .vmas()
+                    .iter()
+                    .any(|v| uaddr >= v.start && uaddr + 4 <= v.end);
+                Err(if mapped { Errno::EINVAL } else { Errno::EFAULT })
+            }
             futex::op::WAKE | futex::op::WAKE_BITSET => Ok(self.futexes.wake(uaddr, val)),
             // Requeue is an optimisation for condition variables; waking
             // everyone is correct, if less efficient.

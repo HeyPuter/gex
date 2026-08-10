@@ -203,6 +203,17 @@ export class Gex {
   // What compiling and instantiating shared modules costs this process, and
   // how many there were. See `#installModuleInner`.
   #installMs = 0;
+  /// `WebAssembly.compile` and `WebAssembly.instantiate`, separately.
+  ///
+  /// "Installing" has been one number, and it is two very different costs
+  /// with two entirely different fixes. Compiling is per *bytes* and V8 will
+  /// skip it for a module it has seen before -- if the bytes are identical.
+  /// Instantiating is per *module* and is paid every time whatever the bytes
+  /// are. Which of them dominates decides whether the answer is a code cache
+  /// or fewer, larger modules, and no counter here could tell them apart.
+  #compileMs = 0;
+  #instantiateMs = 0;
+  #growMs = 0;
   #installs = 0;
   // Instances whose slots have not been written, newest first: a miss asks
   // each in turn whether it holds the slot. See `fillSlot`.
@@ -423,6 +434,9 @@ export class Gex {
   get installedModules() { return this.#installed; }
   /** Milliseconds this process spent compiling and instantiating modules. */
   get installMillis() { return Math.round(this.#installMs); }
+  get compileMillis() { return Math.round(this.#compileMs); }
+  get instantiateMillis() { return Math.round(this.#instantiateMs); }
+  get growMillis() { return Math.round(this.#growMs); }
   /** How many modules that was. */
   get installCount() { return this.#installs; }
 
@@ -2204,7 +2218,9 @@ export class Gex {
   async #installModuleInner(bytes, need, segments = 64) {
     const t0 = performance.now();
     const e = this.#shim.exports;
+    const tg = performance.now();
     const tables = this.#growTables(need);
+    this.#growMs += performance.now() - tg;
     // The shim allocates in one slot space that spans every table, so the
     // figure it reports is a running total and each table's share is that
     // total clamped to its own window. Several tables exist because V8 caps
@@ -2216,7 +2232,9 @@ export class Gex {
     // as "Argument 0 must be convertible to a valid number" and says nothing
     // about where it came from. A shim from before this export existed has
     // one table, so any number too large to reach is the right answer.
+    const tc = performance.now();
     const mod = bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
+    this.#compileMs += performance.now() - tc;
     // With its metadata, when there is any to read.
     //
     // A fork hands the child `#compiled`, and until now that was `{mod, need}`
@@ -2238,8 +2256,10 @@ export class Gex {
     // like a guest dispatch and is not one, so the numbers that distinguish
     // them are attached here.
     let inst;
+    const ti = performance.now();
     try {
       inst = await WebAssembly.instantiate(mod, { gex: imports });
+      this.#instantiateMs += performance.now() - ti;
     } catch (err) {
       throw new Error(
         `installing a module of ${need} slots failed: ${err.message}. ` +

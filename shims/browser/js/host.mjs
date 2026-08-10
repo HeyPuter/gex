@@ -386,7 +386,8 @@ export class ProcessHost {
         if (typeof window !== 'undefined' && m.millis !== undefined) {
           console.log(
             `[gex] pid ${pid}: ${m.millis}ms translating ${m.blocks} blocks` +
-              (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` : '') +
+              (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
+            ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
               (m.fill && (m.fill.filled || m.fill.unanswered)
                 ? `, fill ${m.fill.filled} answered ${m.fill.unanswered} not`
                 : '') +

@@ -431,6 +431,17 @@ for (const id of list) {
   child.kill('SIGKILL');
   onReport = () => {};
 
+  // `GEX_STDERR=all` on a *passing* run too.
+  //
+  // It was printed only on failure, which is backwards for the thing it is
+  // most used for: the per-process timings the runtime logs to the console
+  // are how a run is measured, and a measurement run is one that passes. A
+  // three-`ls` loop completed, threw its own numbers away, and had to be run
+  // again to get them.
+  const noisy = /Fontconfig|GPU|gpu|Registration|Vulkan|dawn/;
+  if (process.env.GEX_STDERR === 'all' && result.how === 'reached') {
+    for (const l of err.split('\n')) if (l && !noisy.test(l)) console.log(`     ${l}`);
+  }
   if (result.how === 'reached') {
     console.log(`ok   site-${id}`);
   } else {

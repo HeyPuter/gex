@@ -31,7 +31,7 @@
 //! a second memory and cannot address with a pointer; `gex-kmem` copies
 //! across the two with `memory.copy`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
 use gex_kernel::proc::ProcTable;
@@ -447,6 +447,20 @@ struct ModStore {
     /// blocks in one `apt-get update` against 1,724,482 for the entire
     /// decodable text of every library it touches.
     translating: BTreeMap<u64, u32>,
+    /// Objects somebody has already translated whole, and published.
+    ///
+    /// The claim above is released the moment its owner finishes, which makes
+    /// it a guard against two processes doing the work *at the same time* and
+    /// nothing else. The next process to start finds no claim, and lifts the
+    /// whole object again -- so three `ls` in one page lift 78,000 blocks
+    /// each while the store reports `hit=241 miss=0`, which is to say they
+    /// find what was published and re-translate it anyway.
+    ///
+    /// Recorded separately from the claim because the two answer different
+    /// questions: "is anyone doing this right now" and "has this ever been
+    /// done". Only the second survives its owner exiting, and only the second
+    /// is what a later process needs to know.
+    translated: BTreeSet<u64>,
     /// What has been stored, against [`MOD_BUDGET`].
     total: usize,
 }
@@ -473,6 +487,7 @@ fn modules() -> &'static Mutex<ModStore> {
             by_page: BTreeMap::new(),
             by_object: BTreeMap::new(),
             translating: BTreeMap::new(),
+            translated: BTreeSet::new(),
             total: 0,
         })
     })
@@ -556,6 +571,12 @@ pub extern "C" fn k_mod_claim_object(obj: u64, id: u32) {
 #[no_mangle]
 pub extern "C" fn k_obj_translating(obj: u64, pid: u32) -> u32 {
     let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    // Already done, by somebody who has since exited. Its modules are in the
+    // store and the miss path will serve them; lifting the object again
+    // produces the same code and throws the first copy away.
+    if m.translated.contains(&obj) {
+        return 0;
+    }
     match m.translating.get(&obj) {
         Some(&who) if who != pid => 0,
         _ => {
@@ -565,18 +586,23 @@ pub extern "C" fn k_obj_translating(obj: u64, pid: u32) -> u32 {
     }
 }
 
-/// Done with it, whether or not anything came of it.
+/// Done with it. `produced` is how many modules came of it.
 ///
-/// Released rather than left standing, because a translation that produced
-/// nothing -- an object over the size cap, a process that died -- must not
-/// stop the next process from trying.
+/// The claim is released either way, because a translation that produced
+/// nothing -- an object over the size cap, a process that died holding it --
+/// must not stop the next process from trying.
+///
+/// It is recorded as *done* only when something came of it. That is the part
+/// that makes the next `ls` cheap: the object is in the store, the miss path
+/// will serve it, and lifting it a second time produces identical code and
+/// discards the first copy.
 #[no_mangle]
-pub extern "C" fn k_obj_translated(obj: u64) {
-    modules()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .translating
-        .remove(&obj);
+pub extern "C" fn k_obj_translated(obj: u64, produced: u32) {
+    let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    m.translating.remove(&obj);
+    if produced > 0 {
+        m.translated.insert(obj);
+    }
 }
 
 /// The `n`th module holding code for this object, or zero past the end.

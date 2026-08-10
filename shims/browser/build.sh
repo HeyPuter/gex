@@ -138,6 +138,19 @@ if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | gre
     fi
 fi
 
+# The global kernel too, because the shim imports from it and the two have to
+# agree about the *types* of what it imports, not only the names.
+#
+# `check-kernel.mjs` compares names and passed while `k_obj_translated` had
+# gained a second parameter on one side and not the other; the page then died
+# at instantiation with `imported function does not match the expected type`.
+# Building both from one command is the only thing that makes them agree by
+# construction.
+if [ -x shims/kernel/build.sh ]; then
+    shims/kernel/build.sh >/dev/null 2>&1 && echo "  kernel: rebuilt alongside the shim" \
+        || echo "  kernel: NOT rebuilt (needs nightly) -- imports may not match"
+fi
+
 # The seed module too, because `enter` lives in it and `enter` is emitted by
 # `gex-emit` -- the same crate this shim is built from.
 #

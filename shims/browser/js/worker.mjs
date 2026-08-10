@@ -446,6 +446,12 @@ async function handle(msg) {
       // compiling and instantiating every module this process installed,
       // whether it lifted them or took them from another process.
       installMs: gex.installMillis,
+      // Split, because "installing" is two costs with two different fixes:
+      // compiling is per bytes and V8 can skip it for bytes it has seen
+      // before, instantiating is per module and is paid every time.
+      compileMs: gex.compileMillis,
+      instantiateMs: gex.instantiateMillis,
+      growMs: gex.growMillis,
       installs: gex.installCount,
       fill: gex.fillStats,
       // How the shared-slot lookup went: pages this process already had,

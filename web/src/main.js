@@ -266,6 +266,15 @@ for (const [event, describe] of [
   // on every run. A switch that cannot be reached where the failure happens
   // is not a switch.
   if (params.has('adopt')) globalThis.GEX_ADOPT_AFTER = Number(params.get('adopt'));
+  // `?recompile=N`: KiB of mapped text per object to statically recompile
+  // once it proves hot, and 0 to leave the guest to arrive one dispatch miss
+  // at a time. It is on by default here and off by default under
+  // `run-node.mjs`, which is exactly the kind of difference that has to be
+  // switchable from outside: three `ls` in this page lift 78,000 blocks each
+  // while the shared store reports `hit=241 miss=0`, and whether that is
+  // whole-object recompilation redoing work already stored cannot be decided
+  // without turning it off.
+  if (params.has('recompile')) globalThis.GEX_RECOMPILE_OBJECTS = Number(params.get('recompile'));
   if (params.get('debug')) {
     globalThis.GEX_DEBUG_EXIT = 1;
     globalThis.GEX_TRAP_STACK = 1;
