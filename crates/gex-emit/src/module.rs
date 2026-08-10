@@ -135,61 +135,28 @@ const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 256;
 /// The two kinds of module want opposite things. A closure library is
 /// instantiated once per guest process and mostly never reached -- 303 MiB of
 /// `libgcrypt` for the sliver of it apt calls -- so writing its slots on
-/// demand is worth a great deal. A unit the runtime translator emits is small
-/// and immediately wanted, and there are thousands of them in a run, so the
-/// helpers are pure compile cost: emitting them everywhere took `apt-get
-/// update` from 82 seconds to 114.
+/// demand is worth a great deal. A unit the runtime translator emits is about
+/// twenty blocks, wanted immediately, and an `apt-get update` installs
+/// thousands of them a process, so the helpers there are pure compile cost:
+/// emitting them everywhere took that run from 82 seconds to 114.
 ///
-/// Out of reach because the mechanism is correct but not yet profitable, on
-/// the same 19-object `--exhaustive` build of apt's closure:
+/// On, because it is measured. Alternating, one shim, only the artifact
+/// changing, on the 19-object `--exhaustive` closure of apt-get:
 ///
-///     fill keyed on an entry      SIGILL after two processes
-///     keyed on the page           66,204ms, install 46,888ms,   407,588 blocks
-///     ...and children defer too   87,736ms, install 22,470ms, 2,639,578 blocks
-///     active (this)               55,714ms, install 29,050ms,    17,462 blocks
+///     active    54,889ms / 57,125ms   install 29,102ms / 31,658ms
+///     deferred  51,198ms / 52,081ms   install 17,100ms / 15,862ms
 ///
-/// The third row is the mechanism working and still losing. Install is 6.6
-/// seconds *under* the active build, which is what demand filling was for --
-/// but the run pays that back four times over in lifting, because a page is
-/// asked about once, and only ever while `FILL_POSSIBLE` is true -- which it
-/// is not until a deferred module has been installed *in that Worker*. A
-/// forked child begins executing while its inherited modules are still
-/// arriving, so its early misses never ask; they translate, and an address
-/// once translated never needs the closure again. Forgiving unfillable pages
-/// changed nothing (83,456ms, 2,639,596 blocks) because only 2 to 17 asks a
-/// process go unanswered.
+/// Instantiate falls 46 percent and blocks translated are unchanged, so
+/// nothing is lifted that the closure already held.
 ///
-/// Treat that block count with suspicion, though: 2,639,578 blocks in 986ms
-/// is 2,675 a millisecond, against 41 a millisecond on the active build. It
-/// cannot be measuring the same work, so something in the deferred path is
-/// counting blocks it did not lift. Wall clock and `installMs` are the two
-/// numbers here that have been checked against each other
-///
-/// Keying the fill on the guest page fixed the crash -- a miss always knows
-/// its page and almost never knows an entry -- but the asks still go
-/// unanswered, because only the process that installed the closure keeps its
-/// modules deferred. A forked child installs by another path that fills
-/// eagerly, so its deferred list is empty and every miss it takes asks a
-/// question nobody in that Worker can answer, then translates. 407,588 blocks
-/// against 17,462. The remaining work is in #106: a child has to defer too
-///
-/// The last is indistinguishable from the closure built before any of this
-/// existed (exit 0, 56,563ms), so nothing else in the emitter is implicated.
-/// It is not a short fill either: `gexfillall` provably carries one
-/// `table.init` per segment on every library -- 99/99, 413/413, 429/429,
-/// 355/355 -- so every slot an active segment would have written is written,
-/// in the same order, just after instantiation instead of during it.
-///
-/// That difference is now the whole question, and it is #106. Everything the
-/// mechanism needs is here and correct: the helpers, the entry matching that
-/// `gexfillat` needs, and the host side that asks on a miss. Restoring the
-/// gate to 4096 turns it all back on.
-///
-/// The runtime-translation path is unaffected either way. Its units are about
-/// twenty blocks, far below any plausible gate, so they emit active segments
-/// and no helpers exactly as they always did -- which is the configuration
-/// that measured 93.6s to 86.5s.
-const BIG_BLOCKS: usize = usize::MAX;
+/// Getting there took four defects, each of which made the mechanism look
+/// like a bad idea: `gexfillat` matching a packed directory entry against a
+/// bare slot offset so it never fired; the host rather than the module
+/// deciding what defers, which left a forked child filling eagerly; a page
+/// whose module had not arrived yet written off for ever; and the ask sitting
+/// below `maybe_recompile_at`, so a deferred process recompiled whole
+/// libraries it already held.
+const BIG_BLOCKS: usize = 4096;
 
 impl Default for PageTable {
     fn default() -> PageTable {

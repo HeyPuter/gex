@@ -1730,3 +1730,48 @@ Three things this cost, worth not repeating:
   host is a debug adapter and not what this project optimises, but it runs the
   same glue, and "works there, fails in the browser" is worth more than four
   browser runs.
+
+## Demand filling pays: instantiate down 46 percent on the closure
+
+The closure path is what this project is for, and instantiation was most of
+it: 29 seconds of a 55-second `apt-get update`, nearly all of it writing table
+slots for code the process never executes. Deferring those writes now works.
+
+Alternating, one shim, only the artifact changing:
+
+| | wall | install | blocks translated |
+|---|---|---|---|
+| active segments | 54,889 / 57,125 ms | 29,102 / 31,658 ms | 17,462 |
+| deferred | 51,198 / 52,081 ms | 17,100 / 15,862 ms | 17,436 |
+
+Instantiate falls from 30.4s to 16.5s. Translation is unchanged, so nothing is
+being lifted that the closure already held -- which is the check that matters,
+because every failed version of this cost exactly that.
+
+Four defects stood between the idea and the number, and each one made the idea
+look wrong:
+
+1. `gexfillat` matched a *packed directory entry* against a segment's bare
+   within-table offset. Two different quantities, so it never fired once. The
+   symptom was 179,538 module installs against 52,708 and 23 seconds, on the
+   runtime path, which got blamed on passive segments being slow.
+2. The *host* decided what to defer. A forked child inherits its parent's
+   modules through another path entirely and filled the same libraries
+   eagerly, so nineteen of twenty processes had nothing deferred while every
+   miss they took still asked. The module decides now: only one built passive
+   exports `gexfillat`, so the test is its presence.
+3. A page whose module had not been installed *yet* was written off for ever.
+   That is the ordinary case for a child, which installs progressively while
+   the guest runs. Failures are now forgiven when the next deferred module
+   arrives.
+4. The ask sat below `maybe_recompile_at`, so a process recompiled whole
+   libraries it already held before asking whether it held them. The most
+   expensive path in the miss handler, taken to avoid the cheapest.
+
+The fourth was invisible because the whole-object path added to `jit.blocks`
+and never to `jit.nanos`: "2,639,578 blocks in 986ms" is 2,675 a millisecond
+against 41 elsewhere. Not a fast translator, an untimed one. That is the third
+time today a counter that did not add up was the whole story -- after the
+82.1s baseline that had drifted to 98.1s, and the harness that waited eleven
+minutes on a result id nothing would send. **A number that is impossible is
+worth more attention than a number that is merely bad.**

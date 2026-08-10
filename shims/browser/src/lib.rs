@@ -6109,6 +6109,30 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     note_intrinsics(pc);
     // enough to be worth translating whole? If so it is now queued, and the
     // block this miss asked for is in it.
+    //
+    // But first: does a module this process already holds cover this page and
+    // simply have its slots unwritten? Filling one page is microseconds;
+    // recompiling the object around it took 56 seconds across an
+    // `apt-get update` under a deferred closure, against 0.4 for the same run
+    // with active segments. The ask used to sit *below* this, so a deferred
+    // process recompiled whole libraries it already had, and the mechanism
+    // meant to avoid work bought the most expensive kind.
+    //
+    // Once per page: a page nobody can fill falls through on the next miss to
+    // everything below, which is what happened before any of this existed.
+    if FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+        let fresh = FILL_ASKED.0.borrow_mut().insert(gex_abi::dispatch_page(pc));
+        if fresh {
+            let page = gex_abi::dispatch_page(pc);
+            FILL_WANTED.store(page as i64, std::sync::atomic::Ordering::Relaxed);
+            FILL_PENDING.store(page as i64, std::sync::atomic::Ordering::Relaxed);
+            with_host(|h| {
+                set_resume(pc);
+                set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+            });
+            trap();
+        }
+    }
     if maybe_recompile_at(pc) {
         // The same resume the ordinary path uses: come back at the address
         // that missed, once JavaScript has instantiated what was queued and
@@ -6164,15 +6188,6 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         //
         // Once per page: a page nobody can fill falls through on the next
         // miss to what happened before any of this existed.
-        if FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed)
-            && FILL_ASKED.0.borrow_mut().insert(page)
-        {
-            FILL_WANTED.store(page as i64, std::sync::atomic::Ordering::Relaxed);
-            FILL_PENDING.store(page as i64, std::sync::atomic::Ordering::Relaxed);
-            set_resume(pc);
-            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-            return true;
-        }
         // Ask even when the page already has a base. Having one does not mean
         // having this block: discovery finds the blocks it can reach from
         // where it started, so a page is filled in over many misses, and the
@@ -6654,6 +6669,16 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
             .collect();
         (exec, h.jit.page_table.clone(), std::mem::take(&mut h.jit.translated))
     });
+    // Timed, like the block path is.
+    //
+    // It was not, and the two counters it feeds disagreed by sixty-five
+    // times: `blocks` counted what this lifted and `nanos` did not, so a
+    // deferred closure run read "2,639,578 blocks in 986ms" -- 2,675 a
+    // millisecond against the 41 a millisecond the same machine manages on
+    // the block path. That is not a fast translator, it is an untimed one,
+    // and the missing time was most of the twenty-eight seconds a deferred
+    // closure could not account for.
+    let object_started = now_ns();
     let (modules, stats) = gex_xlate::translate_object(
         guest_bytes(),
         map.start,
@@ -6667,6 +6692,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         cfg!(feature = "shared-memory"),
         &intrinsics,
     );
+    let object_nanos = now_ns().saturating_sub(object_started);
     with_host(|h| {
         h.jit.translated = known;
         if modules.iter().all(|m| m.exported_blocks.is_empty()) {
@@ -6682,6 +6708,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
             }
         }
         h.jit.blocks += stats.blocks as u64;
+        h.jit.nanos += object_nanos;
         // And what this claimed, so the next process to map the same library
         // finds it rather than translating it again. The miss path does this
         // for what it translates; without the same here, the second process
