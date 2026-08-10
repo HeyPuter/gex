@@ -285,7 +285,18 @@ const port = server.address().port;
 
 let failures = 0;
 for (const id of list) {
-  const { want, settle, fail } = DEMOS[id];
+  const { settle, fail } = DEMOS[id];
+  // `GEX_WANT=<regex>` says what the guest has to print, overriding the
+  // demo's own pattern.
+  //
+  // `debian-cmd` passes on `GEX-CMD-DONE`, which the *shell* prints after the
+  // command, so a run in which the command did entirely the wrong thing still
+  // passes. That is not hypothetical: for hours `bash -c /bin/true` reported
+  // a healthy 208-block run while the child was branching into bash's
+  // translated code at `PIE_BASE` and only surviving because `/bin/true`
+  // exits 0 whatever it executes. A command whose output is checked --
+  // `GEX_WANT='^22$'` for `ls / | wc -l` -- cannot pass that way.
+  const want = process.env.GEX_WANT ? new RegExp(process.env.GEX_WANT, 'm') : DEMOS[id].want;
   // A regular expression or a predicate. A demo whose evidence is two things
   // at once -- the guest drew *and* the frames reached the canvas -- cannot
   // say so in one pattern.
