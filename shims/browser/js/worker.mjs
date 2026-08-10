@@ -122,6 +122,14 @@ function hotBlocks(gex) {
 }
 
 async function handle(msg) {
+  // The first thing this side says. A 694 MB closure never got here: the page
+  // had eighteen compiled modules, posted them, and nothing in this Worker
+  // ever ran -- so the transfer itself is the suspect, and this is how to
+  // tell a slow `postMessage` from a Worker that never woke.
+  if (msg?.kind !== 'stdin') {
+    console.error(`[worker] got ${msg?.kind ?? 'load'}, `
+      + `${(msg?.closure ?? []).length} closure modules`);
+  }
   if (msg?.kind === 'stdin') {
     stdinWaiter?.(msg.bytes);
     stdinWaiter = null;

@@ -207,6 +207,12 @@ function makeServer(root, closureStem, oneShot = false) {
         waiter(r);
       } else if (r.fatal) {
         process.stderr.write(`harness: the page died: ${r.fatal}\n`);
+        // And stop waiting for it. The page reported a `DataCloneError` two
+        // and a half minutes before the readiness deadline gave up, and those
+        // 150 seconds bought nothing: a page that has said it is dead is not
+        // going to become ready. Every waiter hears it.
+        ready = ready ?? { fatal: r.fatal };
+        for (const w of readyWaiters.splice(0)) w(ready);
       }
       return res.writeHead(204).end();
     }
@@ -479,6 +485,10 @@ if (verb === 'start') {
   // Start, run each command in turn, stop. Still one browser for all of them.
   await start(flags);
   const up = await control('/control/ready', flags.wait ? { timeout: flags.wait } : {});
+  if (up && up.fatal) {
+    process.stderr.write(`harness: the page died before it was ready: ${up.fatal}\n`);
+    process.exit(1);
+  }
   if (up && up.never) {
     process.stderr.write(
       `harness: the page never became ready in ${up.waitedMs}ms -- it is still `

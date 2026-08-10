@@ -238,8 +238,10 @@ export class ProcessHost {
         if (msg) {
           // Awaited, because compiling the shim cannot be synchronous in a
           // browser. The Worker is idle until this arrives either way.
-          this.#shimModule().then((shimMod) =>
-          w.postMessage({
+          this.#shimModule().then((shimMod) => {
+          console.error(`[host] pid ${pid}: posting ${(this.#extra.closure ?? []).length}`
+            + ' closure modules to the Worker');
+          return w.postMessage({
             ...this.#extra,
             ...msg,
             kernelStack: this.#nextKernelStack(pid),
@@ -252,7 +254,8 @@ export class ProcessHost {
             shim: shimMod,
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
-          }),
+          });
+          },
           );
         }
         break;
