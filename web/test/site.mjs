@@ -254,7 +254,14 @@ const server = createServer(async (req, res) => {
   // query afterwards and asked for the directory -- which is not a file, so
   // the server answered 404 to its own page. Every demo then "timed out with
   // no status", which is exactly what a page that was never served does.
-  const name = req.url.split('?')[0] === '/' ? '/index.html' : req.url.split('?')[0];
+  // Decoded, because a URL path is not a file name.
+  //
+  // `libstdc++.so.6` reaches the server as `libstdc%2B%2B.so.6`: the closure
+  // loader percent-encodes each component, as it must, and every real static
+  // server decodes before it looks on disk. This one did not, so the first
+  // closure the site ever tried to load 404'd on the third library.
+  const raw = req.url.split('?')[0];
+  const name = raw === '/' ? '/index.html' : decodeURIComponent(raw);
   const path = join(DIST, name);
   try {
     if (!(await stat(path)).isFile()) throw new Error('not a file');
