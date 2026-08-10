@@ -243,9 +243,34 @@ function makeServer(root, closureStem, oneShot = false) {
       // Fifteen minutes by default. Two was chosen for `ls`; `apt-get update`
       // takes nearly two on its own under Node and more in a browser, and a
       // measurement that gives up before the guest does is not a measurement.
-      queue.push({ id, cmd, timeoutMs: Number(url.searchParams.get('timeout') || 900000) });
+      const limitMs = Number(url.searchParams.get('timeout') || 900000);
+      queue.push({ id, cmd, timeoutMs: limitMs });
       handOut();
-      const r = await answer;
+      // The deadline lives here, in node, and not in the page.
+      //
+      // The page cannot enforce one on itself: a guest that blocks the main
+      // thread blocks the event loop with it, so no timer there will ever
+      // fire. That is not hypothetical -- a deadline was added to the
+      // one-shot page and sat unfired through an eleven-minute wedge. Node is
+      // the only side that is still running when the browser is not.
+      const r = await Promise.race([
+        answer,
+        new Promise((done) => {
+          const fire = () => {
+            pending.delete(id);
+            done({
+              id,
+              out: '',
+              status: -1,
+              ms: limitMs,
+              error: `nothing came back in ${limitMs}ms -- the guest is wedged `
+                + 'or the page never took the job',
+              log: [],
+            });
+          };
+          globalThis.setTimeout(fire, limitMs).unref?.();
+        }),
+      ]);
       return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(r));
     }
 
@@ -253,7 +278,23 @@ function makeServer(root, closureStem, oneShot = false) {
       if (ready) {
         return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(ready));
       }
-      const r = await new Promise((w) => readyWaiters.push(w));
+      // With a deadline, because "the page never became ready" is a real
+      // outcome and it used to be indistinguishable from a slow boot.
+      //
+      // A 694 MB closure under a shell sits here: the page fetches it,
+      // compiles it, installs it on the main thread and never posts ready, so
+      // `once` waits for ever before it has even sent a command -- past the
+      // deadline on `/control/run`, which cannot help because no run has
+      // started. Ten minutes a try, and the same ten minutes whether the
+      // cause is size or something worse.
+      const waitMs = Number(url.searchParams.get('timeout') || 300000);
+      const r = await Promise.race([
+        new Promise((w) => readyWaiters.push(w)),
+        new Promise((w) => {
+          const fire = () => w({ never: true, waitedMs: waitMs });
+          globalThis.setTimeout(fire, waitMs).unref?.();
+        }),
+      ]);
       return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(r));
     }
 
@@ -437,7 +478,14 @@ if (verb === 'start') {
 } else if (verb === 'once') {
   // Start, run each command in turn, stop. Still one browser for all of them.
   await start(flags);
-  await control('/control/ready');
+  const up = await control('/control/ready', flags.wait ? { timeout: flags.wait } : {});
+  if (up && up.never) {
+    process.stderr.write(
+      `harness: the page never became ready in ${up.waitedMs}ms -- it is still `
+      + 'fetching, compiling or installing, and no command has been sent\n',
+    );
+    process.exit(1);
+  }
   for (const cmd of positional) {
     const r = await control('/control/run', {
       cmd,
