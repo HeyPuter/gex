@@ -1906,3 +1906,32 @@ time by translating more, and this one buys nothing back.
 Of the 57 seconds, 15.9 are install summed over 26 processes and 1.5 are
 translation. Install has stopped being the question. What the guest actually
 spends its time on is next: #86 (decompression) and #72 (memcpy inside libc).
+
+### What is left is apt parsing its index, not the runtime
+
+The browser could not be asked what the guest was doing -- `GEX_HOT` existed
+only for the Node adapter. It can now (`--hot`), and with install and
+translation down to 17 seconds of 57, the answer is the only thing left that
+matters:
+
+    357  libapt-pkg  debStringPackageIndex::debStringPackageIndex
+    312  libapt-pkg  vector<HashString>::_M_realloc_insert
+    271  libxxhash
+    247  libapt-pkg  debListParser::ParseDepends
+    109  libapt-pkg  pkgTagSection::Find
+
+apt parsing a 3,000-package index and hashing it. **Not decompression and not
+memcpy inside libc**, which are #86 and #72 and were the two standing
+candidates for where a run goes. Neither is where it goes.
+
+Two things to know before using these numbers. `gex_hot_blocks` is a
+Misra-Gries table, not a counter: a block landing on an occupied slot
+decrements the incumbent instead of counting itself, so colliding hot blocks
+suppress each other and only the ranking is meaningful. And profiling costs
+about six per cent -- 60,583 ms against 57,130 ms.
+
+This changes what the next question is. The time is real work rather than an
+emulation pathology, so what matters is the multiplier over native, and
+nothing here measures that: the rootfs is aarch64 and the host is x86, so a
+ratio needs real hardware or qemu-user. Without it there is no telling forty
+seconds of guest time from four seconds of work done ten times too slowly.
