@@ -1841,3 +1841,37 @@ Which is also why the two configurations that work, work: pid 1 of a dash
 closure never execs before the prompt, and the 51.6s one-shot path runs a
 single program with no exec in it. Neither has ever exercised the thing that
 is broken. See #107.
+
+### And then it is faster: 60.8s against 79.6s
+
+The child had the closure's code and no record that it was a closure.
+
+`execve` clears the dispatch directory -- the new program's pages are somebody
+else's code at the same addresses -- and keeps exactly one thing: the pages
+`CLOSURE_DIRS` names, whose modules are still in the tables. That static is
+per-Worker and only `gex_add_closure_module` fills it, and only the closure
+install path calls that. A forked child gets its parent's modules through the
+fork record and installs them by the ordinary path, so it had every library
+and no idea any of it was a closure's. The shell exec'd `apt-get`, the
+directory was cleared, and twenty-five processes translated libapt from
+nothing.
+
+Giving the adopt path the same install as a fresh process:
+
+| | wall | blocks translated | lifting |
+|---|---|---|---|
+| runtime translation | 79,622 ms | 3,121,058 | 81,628 ms |
+| closure, before | 121,980 ms | 3,431,098 | 89,516 ms |
+| **closure, after** | **60,803 ms** | **58,826** | **1,488 ms** |
+
+`exec: 3689 closure pages kept`, where that line had never appeared once.
+rc=0, one index written, zero crashes.
+
+**Static recompilation is now the faster path in the configuration the demo
+site uses**, and not only in a one-shot benchmark that never execs anything.
+
+What remains is instantiation: 37,122 ms of the 60.8 s, the closure being
+instantiated in twenty-six processes. Demand filling already cuts that 46 per
+cent on the one-shot path and should apply here unchanged -- which would put
+apt in a browser somewhere near 40 seconds, against the 82 this file opened
+with.
