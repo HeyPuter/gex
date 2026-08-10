@@ -309,8 +309,9 @@ extern "C" {
     // process and four method workers on pairs of them; with a Worker per
     // process the other end is always in another memory.
     fn k_pipe_new() -> i32;
-    fn k_pipe_open_end(id: i32, write: i32);
-    fn k_pipe_close_end(id: i32, write: i32);
+    fn k_pipe_open_end(id: i32, write: i32, pid: i32);
+    fn k_pipe_close_end(id: i32, write: i32, pid: i32);
+    fn k_pipe_forget(pid: i32) -> u32;
     fn k_pipe_read(id: i32, at: u32, len: u32) -> i32;
     fn k_pipe_write(id: i32, at: u32, len: u32) -> i32;
     fn k_pipe_readable(id: i32) -> i32;
@@ -520,11 +521,25 @@ extern "C" fn rf_mksocket(path: u32, path_len: u32) -> i32 {
 extern "C" fn rp_new() -> i32 {
     unsafe { k_pipe_new() }
 }
+/// This process's pid, for the calls that have to name it.
+///
+/// A plain static, because the shim's memory belongs to one guest process --
+/// one Worker per process is the whole design. The first attempt put this in
+/// the *global* kernel, which every Worker shares, so an end opened under one
+/// pid was closed under whichever pid happened to have made a syscall most
+/// recently. The removal missed, `k_pipe_forget` closed the end a second
+/// time, a reader saw end-of-file early and `bash` died of SIGABRT.
+static MY_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn my_pid() -> i32 {
+    MY_PID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 extern "C" fn rp_open_end(id: i32, write: i32) {
-    unsafe { k_pipe_open_end(id, write) }
+    unsafe { k_pipe_open_end(id, write, my_pid()) }
 }
 extern "C" fn rp_close_end(id: i32, write: i32) {
-    unsafe { k_pipe_close_end(id, write) }
+    unsafe { k_pipe_close_end(id, write, my_pid()) }
 }
 extern "C" fn rp_read(id: i32, at: u32, len: u32) -> i32 {
     unsafe { k_pipe_read(id, at, len) }
@@ -3753,6 +3768,14 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // And whether the kernel this call is about to run against is still
     // intact. A load and a compare, once per syscall.
     check_host_magic("a syscall");
+    // Whose process this is, for the calls that have to name it.
+    //
+    // Set here rather than at `load` and `adopt` and `execve` because every
+    // one of those is a place it could be missed, and it is one store.
+    MY_PID.store(
+        with_host(|h| h.kernel.pid),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // And whether a pinned library landed where the closure built it. Same
     // shape and same reason: a load and a compare, once per syscall.
     //
@@ -4161,7 +4184,7 @@ fn stage_fork_fds(h: &Host) {
         // not happened.
         if let Some(id) = pipe_id(&file.path) {
             let write = file.writable;
-            unsafe { k_pipe_open_end(id, write as i32) };
+            unsafe { k_pipe_open_end(id, write as i32, my_pid()) };
         } else if !file.path.starts_with('/') {
             // Not a path, not a pipe, and not the terminal: a socket. Nothing
             // here can rebuild that from a name.
@@ -4756,6 +4779,15 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
     // end-of-file that nothing was ever going to send.
     h.kernel.fds = gex_kernel::file::FdTable::new();
     h.kernel.remote_sockets.clear();
+    // And anything the table did not account for. See `k_pipe_forget`: a
+    // guest that leaves by a trap rather than by `exit_group` never reaches
+    // the line above, so the global kernel keeps its own list.
+    // SAFETY: takes a scalar and no borrow of anything here.
+    unsafe {
+        if k_present() != 0 {
+            k_pipe_forget(pid);
+        }
+    }
     h.kernel.procs.exit(pid, code);
     // This Worker ran one process and that process is over, so the Worker is
     // over. There is nothing to hand the stack to: the other processes are

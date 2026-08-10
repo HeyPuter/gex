@@ -1022,6 +1022,43 @@ fn pipes() -> &'static std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::pipe::Pip
     PIPES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// Which pipe ends each process still holds, so a process that dies without
+/// closing them does not hold a reader's end-of-file for ever.
+///
+/// `exit_process` clears a process's descriptor table, and `RemotePipeEnd`'s
+/// `Drop` is what tells this module an end has gone. Neither runs when a
+/// guest leaves by any route other than `exit_group`: a trap does not unwind
+/// and a terminated Worker drops nothing. `dpkg` trapped out inside `openat`
+/// with no resume address, so `apt` sat on `read` waiting for an end-of-file
+/// that nothing was ever going to send, and an `apt-get update` deadlocked
+/// two processes in.
+///
+/// A real kernel closes a dead process's descriptors however it died. This is
+/// where that has to happen, because by then the process's own memory -- and
+/// the table in it -- belongs to a Worker that is gone.
+fn pipe_holders() -> &'static std::sync::Mutex<BTreeMap<i32, Vec<(i32, bool)>>> {
+    note_panics();
+    static HELD: OnceLock<std::sync::Mutex<BTreeMap<i32, Vec<(i32, bool)>>>> = OnceLock::new();
+    HELD.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Close every pipe end `pid` still holds. Called when a process ends, by
+/// whatever route.
+#[no_mangle]
+pub extern "C" fn k_pipe_forget(pid: i32) -> u32 {
+    let held = {
+        let mut h = pipe_holders().lock().unwrap_or_else(|e| e.into_inner());
+        h.remove(&pid).unwrap_or_default()
+    };
+    let n = held.len() as u32;
+    for (id, write) in held {
+        if let Some(p) = pipe_at(id) {
+            p.close_end(write);
+        }
+    }
+    n
+}
+
 fn pipe_at(id: i32) -> Option<std::sync::Arc<gex_kernel::pipe::Pipe>> {
     pipes()
         .lock()
@@ -1040,17 +1077,25 @@ pub extern "C" fn k_pipe_new() -> i32 {
 
 /// Another descriptor onto one end, as `dup` and `fork` both make.
 #[no_mangle]
-pub extern "C" fn k_pipe_open_end(id: i32, write: i32) {
+pub extern "C" fn k_pipe_open_end(id: i32, write: i32, pid: i32) {
     if let Some(p) = pipe_at(id) {
         p.open_end(write != 0);
+        let mut h = pipe_holders().lock().unwrap_or_else(|e| e.into_inner());
+        h.entry(pid).or_default().push((id, write != 0));
     }
 }
 
 /// Drop a descriptor. The last one on an end is what a reader sees as EOF.
 #[no_mangle]
-pub extern "C" fn k_pipe_close_end(id: i32, write: i32) {
+pub extern "C" fn k_pipe_close_end(id: i32, write: i32, pid: i32) {
     if let Some(p) = pipe_at(id) {
         p.close_end(write != 0);
+        let mut h = pipe_holders().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = h.get_mut(&pid) {
+            if let Some(i) = v.iter().position(|e| *e == (id, write != 0)) {
+                v.swap_remove(i);
+            }
+        }
     }
 }
 
