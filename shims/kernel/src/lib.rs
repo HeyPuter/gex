@@ -332,8 +332,29 @@ pub extern "C" fn k_stdin_read(at: u32, len: u32) -> i32 {
 /// So runtime translation draws from here instead. Ranges are handed out in
 /// chunks and never returned; the space is 8 tables of 9,999,360 slots and a
 /// page costs 1,024, which is 78,120 pages before it is spent.
+/// Where runtime-translated slots start: the first slot of table 4.
+///
+/// Tables 0..3 belong to statically recompiled closures, whose slot numbers
+/// are baked into their modules at build time and start at zero. Tables 4..7
+/// belong to whatever the run translates.
+///
+/// The two must not share a table, and not because they would collide -- the
+/// counter used to be advanced past the closure's reservation, which stopped
+/// that. It is because a wasm table is per *instance*, so it is grown per
+/// guest process, and growing to slot N means allocating N entries. With one
+/// shared space, the first block a process lifted took a slot above the whole
+/// closure's 2.85M and the table had to be that long: 405ms and 22 MB in
+/// every process, a hundred of them in an `apt-get update`, whether or not
+/// the process ever entered a single closure library.
+///
+/// Split, a process grows table 0 for the libraries it actually reaches and
+/// table 4 for the handful of blocks it lifts.
+const RUNTIME_SLOT_BASE: u64 =
+    4 * ((gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE);
+
 fn slot_mark() -> &'static core::sync::atomic::AtomicU64 {
-    static MARK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static MARK: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(RUNTIME_SLOT_BASE);
     &MARK
 }
 

@@ -892,7 +892,10 @@ export class Gex {
           );
         }
       }
-      if (!need) continue;
+      // `need` is 0 now: registration reserves nothing and publishes
+      // nothing, so there is nothing to grow for yet. The metadata is kept
+      // because `fillSlot` publishes from it.
+      void need;
       // Registered and reserved, not instantiated.
       //
       // The directory now points at this library's pages and the tables are
@@ -913,22 +916,19 @@ export class Gex {
       // short-lived process more than it saved: `/bin/true` lived 1966ms with
       // the closure and 1378ms without.
       most = Math.max(most, need);
-      this.#lazyClosure.push({ mod: paired ? entry.mod : wasm, need, inst: null });
+      this.#lazyClosure.push({
+        mod: paired ? entry.mod : wasm, need, inst: null, meta, published: false,
+      });
     }
-    if (most) {
-      // Timed, because it is the one step here whose cost is not per library
-      // but per *slot*, and the closure's slot total has grown from 1.6M to
-      // 2.85M. Whether that is 20ms or half a second decides whether the
-      // directory entries are worth deferring per library, and guessing at it
-      // is how the last three sessions went.
-      const t0 = performance.now();
-      this.#growTables(most);
-      if (globalThis.GEX_DEBUG_EXIT) {
-        console.error(
-          `[closure] tables grown to ${most} slots in ${Math.round(performance.now() - t0)}ms`,
-        );
-      }
-    }
+    // Nothing is grown here any more.
+    //
+    // It used to grow to the highest slot any registered library needed --
+    // the whole closure -- and that was the single largest per-process cost
+    // left: 405ms in pid 1 and 524ms in a forked child, for 2,850,816 slots
+    // and 22 MB of table, in every one of the hundred processes an
+    // `apt-get update` starts. `#publish` grows for a library when a branch
+    // asks for one of its pages.
+    void most;
     this.#closureModules = [];
   }
 
@@ -2269,13 +2269,20 @@ export class Gex {
     // about where it came from. A shim from before this export existed has
     // one table, so any number too large to reach is the right answer.
     const per = (e.gex_slots_per_table?.() ?? 0) >>> 0 || Number.MAX_SAFE_INTEGER;
+    // Each table's own need, when the shim can say. One running total across
+    // the whole virtual slot space cannot express "table 0 wants 400,000 and
+    // table 4 wants 2,048" -- read as a total that is table 4's base plus
+    // 2,048, and the clamp below grows tables 0..3 to ten million each.
+    const need_of = e.gex_table_need
+      ? (i) => e.gex_table_need(i) >>> 0
+      : (i) => Math.min(Math.max(need - i * per, 0), per);
     // Table 0's slot 0 is the miss stub, and it is what an unfilled slot in
     // any table must hold: a branch to an address nothing has translated has
     // to reach the host, not a stale function. Tables past the first start
     // empty, so they have no element 0 of their own to grow from.
     const stub = tables[0].get(0);
     for (let i = 0; i < tables.length; i++) {
-      const want = Math.min(Math.max(need - i * per, 0), per);
+      const want = need_of(i);
       if (tables[i].length >= want) continue;
       try {
         tables[i].grow(want - tables[i].length, stub);
@@ -2525,6 +2532,31 @@ export class Gex {
   }
 
   /**
+   * Put a registered closure library into the directory, and grow for it.
+   *
+   * The pair that has to happen together: an entry names a slot, and a branch
+   * to a slot past the end of a table traps rather than missing. Doing both
+   * for every library at registration is what cost each process the whole
+   * closure's slots; doing them here costs a process only the libraries it
+   * enters.
+   */
+  #publish(lazy, i) {
+    const e = this.#shim.exports;
+    if (!lazy.meta || !lazy.meta.length || !e.gex_publish_closure_module) return;
+    const t0 = performance.now();
+    const gp = e.gex_alloc(lazy.meta.length) >>> 0;
+    this.#bytes().set(lazy.meta, gp);
+    e.gex_publish_closure_module(gp, lazy.meta.length);
+    e.gex_free?.(gp, lazy.meta.length);
+    this.#growTables(lazy.need);
+    if (globalThis.GEX_DEBUG_EXIT) {
+      console.error(
+        `[closure] library ${i} published in ${Math.round(performance.now() - t0)}ms`,
+      );
+    }
+  }
+
+  /**
    * Write the slots around `slot`, from whichever unfilled module holds them.
    *
    * Answers whether anybody did. A module that has never been asked for a
@@ -2545,6 +2577,10 @@ export class Gex {
       : -1;
     if (owner >= 0) {
       const lazy = this.#lazyClosure[owner];
+      if (lazy && !lazy.published) {
+        lazy.published = true;
+        this.#publish(lazy, owner);
+      }
       if (lazy && !lazy.inst) {
         lazy.inst = true;
         await this.#installModule(lazy.mod, lazy.need);

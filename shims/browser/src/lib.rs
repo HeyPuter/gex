@@ -2873,7 +2873,6 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
     // filled from now on, whether or not the instance exists yet, because
     // `fillSlot` instantiates it on the way.
     FILL_POSSIBLE.store(true, std::sync::atomic::Ordering::Relaxed);
-    CLOSURE_DIRS.0.borrow_mut().extend(meta.dir_entries.iter().copied());
     {
         let idx = CLOSURE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut owner = CLOSURE_OWNER.0.borrow_mut();
@@ -2881,6 +2880,36 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
             owner.insert(*page, idx);
         }
     }
+    // Registered, not published. See `gex_publish_closure_module`.
+    0
+}
+
+/// Put a registered closure library's pages into the dispatch directory.
+///
+/// Split from registration because publishing is what costs. A directory
+/// entry names a slot, and a branch to a slot past the end of a table traps
+/// rather than missing -- so an entry written is a table that has to be grown
+/// to hold it. Publishing all thirty-three libraries at once meant every
+/// process grew its tables to the whole closure's 2,850,816 slots before the
+/// guest ran an instruction: 405ms in pid 1, 524ms in a forked child, and
+/// 22 MB of table each. An `apt-get update` starts a hundred processes and
+/// enters a handful of libraries in each.
+///
+/// Unpublished is not unreachable. The directory entry stays zero, which
+/// points at the miss span that table 0 reserves for exactly this, so a
+/// branch into an unpublished page reaches the miss stub, asks for a fill,
+/// and `fillSlot` publishes, grows, instantiates and fills before resuming.
+/// That path already existed for the instantiate; this adds the entry and the
+/// growth to it.
+#[no_mangle]
+pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32) -> u32 {
+    let Some(meta) = gex_xlate::Metadata::decode(shim_slice(ptr, len)) else {
+        return 0;
+    };
+    // Kept, because `execve` republishes them: the modules are still in this
+    // instance's tables, so the new program gets every library the old one
+    // reached for nothing.
+    CLOSURE_DIRS.0.borrow_mut().extend(meta.dir_entries.iter().copied());
     with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         for (page, base) in &meta.dir_entries {
@@ -2891,9 +2920,19 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
             // host writes them.
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, *base);
         }
-        h.jit.page_table.advance_to(meta.next_slot);
-        h.jit.page_table.slots() as u32
-    })
+    });
+    1
+}
+
+/// How long dispatch table `i` has to be for what this process has published.
+///
+/// One running total across all eight tables cannot answer this any more.
+/// Closures own tables 0..3 with their slot numbers baked in at build time
+/// and the run translates into tables 4..7, so a total of "table 4's base
+/// plus twelve" would grow tables 0..3 to ten million entries each.
+#[no_mangle]
+pub extern "C" fn gex_table_need(i: u32) -> u32 {
+    with_host(|h| h.jit.page_table.table_need(i as usize) as u32)
 }
 
 /// Register a module a forked child inherited, without instantiating it.

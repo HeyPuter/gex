@@ -98,6 +98,16 @@ pub struct PageTable {
     chunk_end: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Highest slot any page in this table names, allocated here or adopted.
     high: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The highest slot wanted in each dispatch table, separately.
+    ///
+    /// [`Self::slots`] is one running total across the whole virtual slot
+    /// space, and growing a table from it means growing every table below it
+    /// to its full ten million. That is fine while everything allocates
+    /// linearly from zero and ruinous once the space is partitioned -- which
+    /// it is: closures own tables 0..3 with their numbers baked in at build
+    /// time, and the run translates into tables 4..7. See `RUNTIME_SLOT_BASE`
+    /// in the global kernel for why.
+    highs: std::sync::Arc<Vec<std::sync::atomic::AtomicU64>>,
     refill: Option<std::sync::Arc<Refill>>,
 }
 
@@ -199,7 +209,26 @@ impl PageTable {
             v + SLOTS_PER_PAGE,
             std::sync::atomic::Ordering::SeqCst,
         );
+        self.note_virtual(v);
         entry
+    }
+
+    /// Record that virtual slot `v` and the page above it are wanted, so the
+    /// table holding them knows how long it has to be.
+    fn note_virtual(&self, v: u64) {
+        let t = (v / Self::SLOTS_PER_TABLE) as usize;
+        let within = v % Self::SLOTS_PER_TABLE + SLOTS_PER_PAGE;
+        if let Some(h) = self.highs.get(t) {
+            h.fetch_max(within, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// How long dispatch table `i` has to be for what has been assigned.
+    pub fn table_need(&self, i: usize) -> u64 {
+        self.highs
+            .get(i)
+            .map(|h| h.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
     }
 
     /// One page's worth of slots, refilling from the global counter if this
@@ -276,6 +305,7 @@ impl PageTable {
             + gex_abi::dispatch_entry_base(entry) as u64
             + SLOTS_PER_PAGE;
         self.high.fetch_max(end, std::sync::atomic::Ordering::SeqCst);
+        self.note_virtual(end - SLOTS_PER_PAGE);
         // Without a global counter the allocation mark has to move too, or
         // this table hands the adopted slots out again. With one, the adopted
         // range was issued to somebody else and this table's own chunk is
@@ -351,13 +381,27 @@ impl PageTable {
     /// This starts a *new* mark. Everything cloned from the result shares it;
     /// nothing already in flight does.
     pub fn from_entries(entries: &[(u64, u32)], next_slot: u64) -> PageTable {
-        PageTable {
+        let t = PageTable {
             pages: entries.iter().copied().collect(),
             next_slot: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(next_slot)),
             chunk_end: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             high: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(next_slot)),
+            highs: std::sync::Arc::new(
+                (0..gex_abi::DISPATCH_TABLES)
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
+            ),
             refill: None,
+        };
+        // The mark says where allocation carries on, so the table holding it
+        // has to be long enough for the page it will hand out next.
+        t.note_virtual(next_slot.saturating_sub(SLOTS_PER_PAGE.min(next_slot)));
+        for (_, e) in entries {
+            let v = gex_abi::dispatch_entry_table(*e) as u64 * Self::SLOTS_PER_TABLE
+                + gex_abi::dispatch_entry_base(*e) as u64;
+            t.note_virtual(v);
         }
+        t
     }
 }
 
