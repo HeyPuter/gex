@@ -197,6 +197,8 @@ export class Gex {
   #streamed = 0;
   /** Closure libraries registered but not yet instantiated, in shim order. */
   #lazyClosure = [];
+  /** Inherited modules registered but not yet instantiated, in shim order. */
+  #lazyInherited = [];
   // Fill requests answered, and requests nobody could answer.
   #filled = 0;
   #unanswered = 0;
@@ -685,6 +687,38 @@ export class Gex {
     await this.#installClosure();
     console.error('[gex] load: done');
     return entry;
+  }
+
+  /**
+   * Take one module a fork handed over, without instantiating it yet.
+   *
+   * A child inherits its parent's whole history and branches into almost
+   * none of it: about 485 modules in an `apt-get update`, and 19 seconds of
+   * `WebAssembly.instantiate` across twenty-six processes. The directory it
+   * inherited already names these pages, so the entries have to be published
+   * now -- but the instance can wait for a branch, exactly as a closure
+   * library does.
+   *
+   * Without metadata there is nothing to publish and nothing to key a later
+   * fill on, so those install the old way. A module built before this existed
+   * has none, and so does the image.
+   */
+  async #adoptModule(m) {
+    const e = this.#shim.exports;
+    if (!m.meta || !m.meta.length || !e.gex_add_lazy_module) {
+      await this.#installModule(m.mod, m.need);
+      return;
+    }
+    const gp = e.gex_alloc(m.meta.length) >>> 0;
+    this.#bytes().set(m.meta, gp);
+    const need = e.gex_add_lazy_module(gp, m.meta.length) >>> 0;
+    e.gex_free?.(gp, m.meta.length);
+    if (!need) {
+      await this.#installModule(m.mod, m.need);
+      return;
+    }
+    this.#growTables(need);
+    this.#lazyInherited.push({ mod: m.mod, need: m.need, inst: null, meta: m.meta });
   }
 
   /**
@@ -1283,7 +1317,7 @@ export class Gex {
       step(`installing ${this.#inherited.length} modules`);
       const mine = this.#inherited;
       this.#inherited = [];
-      for (const m of mine) await this.#installModule(m.mod, m.need);
+      for (const m of mine) await this.#adoptModule(m);
     } else {
       step(`${this.#inherited.length} modules reachable, ${need} slots`);
     }
@@ -1958,7 +1992,7 @@ export class Gex {
     if (++this.#traps < adoptAfterTraps()) return;
     const mine = this.#inherited;
     this.#inherited = [];
-    for (const m of mine) await this.#installModule(m.mod, m.need);
+    for (const m of mine) await this.#adoptModule(m);
   }
 
   /**
@@ -2027,7 +2061,18 @@ export class Gex {
     // about where it came from. A shim from before this export existed has
     // one table, so any number too large to reach is the right answer.
     const mod = bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
-    this.#compiled.push({ mod, need });
+    // With its metadata, when there is any to read.
+    //
+    // A fork hands the child `#compiled`, and until now that was `{mod, need}`
+    // -- enough to instantiate and nothing else. The child therefore had to
+    // instantiate all of them, about 485 in an `apt-get update`, because it
+    // had no way to know which module covered which page. The metadata is
+    // sitting in the bytes as a custom section and costs a parse to keep.
+    this.#compiled.push({
+      mod,
+      need,
+      meta: bytes instanceof Uint8Array ? metadataSection(bytes) : undefined,
+    });
     const imports = { ...this.#imports };
     for (let i = 0; i < tables.length; i++) imports[TABLE_NAMES[i]] = tables[i];
     // Instantiating is where a module's blocks reach the tables: it carries
@@ -2155,6 +2200,23 @@ export class Gex {
       if (lazy && !lazy.inst) {
         lazy.inst = true;
         await this.#installModule(lazy.mod, lazy.need);
+      }
+    }
+    // And the same for a module this process inherited from its parent.
+    //
+    // These are ordinary runtime units: their element segments are active, so
+    // instantiating writes their slots and there is nothing further to fill.
+    // Asking is still worth it -- the alternative is the miss path serving or
+    // lifting code this process is already holding.
+    const heir = this.#shim.exports.gex_lazy_owner
+      ? this.#shim.exports.gex_lazy_owner(BigInt(slot))
+      : -1;
+    if (heir >= 0) {
+      const lazy = this.#lazyInherited[heir];
+      if (lazy && !lazy.inst) {
+        lazy.inst = true;
+        await this.#installModule(lazy.mod, lazy.need);
+        return true;
       }
     }
     for (const inst of this.#unfilled) {

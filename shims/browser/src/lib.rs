@@ -2538,6 +2538,12 @@ static CLOSURE_OWNER: SingleThreaded<std::collections::BTreeMap<u64, u32>> =
 /// hears back indexes its own list.
 static CLOSURE_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The same, for modules a fork handed over rather than a closure build.
+/// Separate from `CLOSURE_OWNER` because `execve` keeps one and not the other.
+static LAZY_OWNER: SingleThreaded<std::collections::BTreeMap<u64, u32>> =
+    SingleThreaded(const { RefCell::new(std::collections::BTreeMap::new()) });
+static LAZY_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// The closure library covering this page, or -1.
 #[no_mangle]
 pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
@@ -2713,6 +2719,50 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
         h.jit.page_table.advance_to(meta.next_slot);
         h.jit.page_table.slots() as u32
     })
+}
+
+/// Register a module a forked child inherited, without instantiating it.
+///
+/// The same shape as `gex_add_closure_module` and deliberately *not* the same
+/// list. A closure library covers the object it was built from whatever the
+/// process goes on to run, which is why `execve` keeps its pages; a unit the
+/// runtime translator produced covers whatever the old program had mapped
+/// there, and keeping those across an exec would point the directory at code
+/// belonging to a program that is gone.
+///
+/// This exists because a fork hands the child its parent's whole history --
+/// about 485 modules in an `apt-get update`, 19 seconds of instantiate across
+/// twenty-six processes -- and the child branches into almost none of it. The
+/// directory entries have to be published now, since the child's inherited
+/// directory already names these pages; the *instance* can wait for a branch.
+#[no_mangle]
+pub extern "C" fn gex_add_lazy_module(ptr: u32, len: u32) -> u32 {
+    let Some(meta) = gex_xlate::Metadata::decode(shim_slice(ptr, len)) else {
+        return 0;
+    };
+    let idx = LAZY_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    with_host(|h| {
+        let mut gm = GuestMem::new(guest_bytes());
+        let mut owner = LAZY_OWNER.0.borrow_mut();
+        for (page, base) in &meta.dir_entries {
+            h.jit.page_table.assign(*page, *base);
+            let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, *base);
+            owner.insert(*page, idx);
+        }
+        h.jit.page_table.advance_to(meta.next_slot);
+        h.jit.page_table.slots() as u32
+    })
+}
+
+/// The inherited module covering this page, or -1.
+#[no_mangle]
+pub extern "C" fn gex_lazy_owner(page: u64) -> i32 {
+    LAZY_OWNER
+        .0
+        .borrow()
+        .get(&page)
+        .map(|v| *v as i32)
+        .unwrap_or(-1)
 }
 
 /// Throw away a forked child's inherited dispatch directory and put back
