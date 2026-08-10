@@ -1989,3 +1989,40 @@ So the question is which accesses can provably not exceed 2^32:
 3. Anything else wants real value-range tracking, which is #15's territory.
 
 (2) is the one to do, and the measurement above says what it is worth.
+
+### ...but not the guards on the stack, which were already free
+
+The obvious way to bank that 54 per cent is to stop guarding accesses that
+cannot fail. `sp` can be clamped where it is *written* -- steered to
+`POISON_ADDR` if it ever leaves the guest's range, so a wild stack pointer
+still faults rather than aliasing -- and then every `[sp, #imm]` is provably
+in range and needs nothing. Writes to `sp` are rare; reads through it are
+everywhere.
+
+Built, measured, reverted. It removed 29 per cent of the guard bytes
+(926,109 to 655,061) and made nbench slightly *worse*:
+
+| KERNEL | guarded | sp-clamped |
+|---|---|---|
+| BITFIELD | 1.95x | 1.80x |
+| HUFFMAN | 1.61x | 1.42x |
+| FOURIER | 17.90x | 16.77x |
+| FP EMULATION | 1.01x | 0.88x |
+| LU DECOMPOSITION | 8.16x | 8.65x |
+| STRING SORT | 2.86x | 2.82x |
+
+The comment already in `tier1.rs` says why, and it was right: *the guard is
+pure arithmetic on a value that does not change, which is exactly what an
+optimiser eliminates by itself.* A stack-relative guard is loop-invariant and
+V8 hoists it, so those bytes cost nothing at run time -- while the clamp added
+to every `sp` write lands in every function prologue and epilogue, where it is
+real.
+
+**So the 54 per cent is in guards on pointers V8 cannot reason about**: heap
+traffic, chased structures, anything whose base changes each iteration. Those
+are the ones to eliminate, and eliminating them needs to know a *dynamic*
+value is in range, which is #15's territory and not a peephole.
+
+Worth remembering as a shape: "fewer emitted instructions" and "less work"
+are different claims once the engine has its own optimiser, and this file now
+has two experiments saying so.
