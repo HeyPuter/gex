@@ -482,6 +482,12 @@ pub mod exports {
     pub const MEMORY: &str = "memory";
     /// The PC-indexed dispatch table of translated block entry points.
     pub const DISPATCH_TABLE: &str = "dispatch";
+    /// Writes one of the module's passive element segments into the tables
+    /// it imports, chosen by index. See `Module::add_fill`: a passive segment
+    /// costs nothing at instantiation, and instantiation happens once per
+    /// guest process, so this is how a module's blocks reach a table without
+    /// every process paying for every block.
+    pub const FILL: &str = "gexfill";
 
     /// The rest of them. There is more than one because V8 caps a table at
     /// ten million entries and a real application needs more; see

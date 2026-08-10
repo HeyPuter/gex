@@ -51,6 +51,10 @@ function adoptAfterTraps() {
   return Number(globalThis.GEX_ADOPT_AFTER ?? 0);
 }
 
+// What a module calls the function that writes its passive element segments
+// into the tables it imports. See `Module::add_fill`.
+const FILL = 'gexfill';
+
 const DISPATCH_DIR = 0x00100000;
 const LOW_END = DISPATCH_DIR + 0x80000 * 4;
 const PAGES = GUEST_BYTES / 65536;
@@ -1884,11 +1888,11 @@ export class Gex {
    * installed modules differently from the thread that made them would
    * dispatch to different code.
    */
-  async #installModule(bytes, need) {
+  async #installModule(bytes, need, segments = 64) {
     const t0 = performance.now();
     this.#installs++;
     try {
-      await this.#installModuleInner(bytes, need);
+      await this.#installModuleInner(bytes, need, segments);
     } finally {
       this.#installMs += performance.now() - t0;
     }
@@ -1904,7 +1908,7 @@ export class Gex {
    * installs upward of two thousand shared modules. Compiling and
    * instantiating those is work no existing counter could see.
    */
-  async #installModuleInner(bytes, need) {
+  async #installModuleInner(bytes, need, segments = 64) {
     const t0 = performance.now();
     const e = this.#shim.exports;
     const tables = this.#growTables(need);
@@ -1940,13 +1944,28 @@ export class Gex {
           `${this.#installs} modules in so far`,
       );
     }
-    // The two halves, separately. A module costs a fixed amount to
-    // instantiate and a variable amount to wire up -- one directory lookup
-    // and one table write per block it holds -- and which of the two
-    // dominates decides the fix. If it is the fixed part, merging many
-    // modules into one is the answer; if it is the per-block part, merging
-    // changes nothing because the blocks are the same either way.
-    // Nothing to wire up here, for a module this translator built.
+    // Write the module's blocks into the tables.
+    //
+    // Its element segments are passive, so instantiating wrote nothing. That
+    // is deliberate: a module is instantiated once per guest *process* --
+    // a table belongs to an instance and every process has its own -- and an
+    // active segment makes every process write a slot for every block the
+    // module holds. For a closure library that is every block of a whole
+    // object: `libgcrypt` is 303 MiB of wasm, and instantiating the closure
+    // cost between 1.2 and 2.2 seconds a process, nearly all of it slots for
+    // code that process never reached.
+    //
+    // Every segment is filled here, which is the same work as before, only
+    // moved out of instantiation and under the host's control. That control
+    // is the point: the next step is to fill the segment covering a page
+    // when a branch first reaches it, and never to fill the rest.
+    //
+    // `gexfill` is absent from a module built before this existed, and from
+    // the image module, whose table is its own and still active.
+    if (typeof inst.exports[FILL] === 'function') {
+      for (let seg = 0; seg < segments; seg++) inst.exports[FILL](seg);
+    }
+    // Nothing to wire up below, for a module this translator built.
     //
     // Worth stating because it was measured rather than assumed, and because
     // it decides which optimisation is worth doing. A translated module

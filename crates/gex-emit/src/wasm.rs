@@ -669,6 +669,81 @@ impl Module {
         self.elements.push(seg);
     }
 
+    /// Declare, define and export `gexfill`, which writes this module's
+    /// passive element segments into the tables it imports.
+    ///
+    /// A passive segment costs nothing at instantiation, which is the point:
+    /// a module is instantiated once per guest *process*, and an active
+    /// segment writes one table entry per block every time -- for a closure
+    /// library, every block of a whole object, mostly code the process never
+    /// runs. What a passive segment needs instead is somebody to ask for it,
+    /// and `table.init` is the only instruction that can write a funcref into
+    /// an imported table, so the asking has to be done from inside the
+    /// module.
+    ///
+    /// `gexfill(seg)` fills one segment whole, chosen by a `br_table` over
+    /// the segments this module has. The host calls it for the segment
+    /// covering a page when a branch first reaches that page; a segment
+    /// nobody branches into is never written.
+    ///
+    /// Returns the exported function's index, or `None` when the module has
+    /// no passive segments and needs no filling.
+    pub fn add_fill(&mut self, void_ty: u32) -> Option<u32> {
+        let passive: Vec<(u32, u32, u32, u32)> = self
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.passive)
+            .map(|(i, e)| (i as u32, e.table, e.offset, e.funcs.len() as u32))
+            .collect();
+        if passive.is_empty() {
+            return None;
+        }
+        let idx = self.declare_func(void_ty);
+        let mut b = Vec::new();
+        b.push(0x00); // no locals
+        // One block per segment, closed in order, so `br_table` can pick.
+        for _ in 0..=passive.len() {
+            b.push(op::BLOCK);
+            b.push(0x40); // void
+        }
+        b.push(op::LOCAL_GET);
+        write_u32(&mut b, 0);
+        b.push(op::BR_TABLE);
+        write_u32(&mut b, passive.len() as u32);
+        for i in 0..passive.len() {
+            write_u32(&mut b, i as u32);
+        }
+        write_u32(&mut b, passive.len() as u32); // default: fall out, do nothing
+        for (seg, table, offset, len) in &passive {
+            b.push(op::END);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, *offset as i32);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, 0);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, *len as i32);
+            b.push(op::MISC_PREFIX);
+            write_u32(&mut b, 12); // table.init
+            write_u32(&mut b, *seg);
+            write_u32(&mut b, *table);
+            b.push(op::RETURN);
+        }
+        b.push(op::END); // the outermost block
+        b.push(op::END); // the function
+        // A body carries its own length: the code section writes each one
+        // verbatim, with no size of its own. Leaving it off made the section
+        // 270 bytes shorter than its header claimed, and V8 said so --
+        // "section was shorter than expected size" -- which is a better error
+        // than most, but only after the whole page had failed to boot.
+        let mut sized = Vec::with_capacity(b.len() + 5);
+        write_u32(&mut sized, b.len() as u32);
+        sized.extend_from_slice(&b);
+        self.define_func(idx, sized);
+        self.export(gex_abi::exports::FILL, ExportKind::Func, idx);
+        Some(idx)
+    }
+
     pub fn data(&mut self, seg: DataSegment) {
         self.data.push(seg);
     }

@@ -827,6 +827,24 @@ impl ModuleBuilder {
                         table,
                         offset: start as u32,
                         funcs,
+                        // Written by `gexfill`, not by instantiation.
+                        //
+                        // These are the modules instantiated once per guest
+                        // process against an imported table, and an active
+                        // segment makes every process write every block --
+                        // for a closure library, every block of a whole
+                        // object. `libgcrypt` is 303 MiB of wasm and cost
+                        // between 1.2 and 2.2 seconds a process to
+                        // instantiate, nearly all of it slots for code the
+                        // process never reached.
+                        //
+                        // Active for now. The encoding is right -- the module
+                        // compiles and `gexfill` is generated and called --
+                        // but a guest reaches a slot the fill did not write
+                        // and traps on `unreachable`, so the mapping from a
+                        // segment to the slots it covers is still wrong
+                        // somewhere. Flipping this word is the whole switch,
+                        // and apt works with it off.
                         passive: false,
                     });
                 }
@@ -848,6 +866,9 @@ impl ModuleBuilder {
             next_slot: self.page_table.slots(),
             n_blocks,
         };
+        // The filler, now that every segment this module has is known.
+        let void_ty = self.m.func_type(FuncType::new(vec![ValType::I32], vec![]));
+        self.m.add_fill(void_ty);
         let started = crate::par::Stopwatch::start();
         let wasm = self
             .m
