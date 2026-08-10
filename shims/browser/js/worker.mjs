@@ -325,7 +325,21 @@ async function handle(msg) {
     if (msg.kind === 'thread') {
       ({ entry, ctx } = await gex.adoptThread(msg.shim, msg.guest, msg));
     } else if (msg.kind === 'adopt') {
-      entry = await gex.adoptProcess(msg.shim, msg.guest, msg.child, msg);
+      // With the closure, the same as a fresh process gets it.
+      //
+      // A child already receives its parent's modules through the fork
+      // record, so it has the *code*; what it does not have is any record
+      // that those pages are a closure's. `CLOSURE_DIRS` is a per-Worker
+      // static filled by `gex_add_closure_module`, which only the closure
+      // install path calls -- and it is the one thing `execve` keeps when it
+      // clears the dispatch directory. Without it the shell execs `apt-get`
+      // and every library the build covered is thrown away: a dash closure
+      // prints `exec: 394 closure pages kept` and an apt run never printed
+      // that line once, then translated 3.5 million blocks.
+      entry = await gex.adoptProcess(msg.shim, msg.guest, msg.child, {
+        ...msg,
+        closure: msg.closure ?? (await closureModules(msg.closureCount ?? 0)),
+      });
     } else {
       entry = await gex.load(
         msg.shim,
