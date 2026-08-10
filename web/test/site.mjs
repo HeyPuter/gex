@@ -445,8 +445,16 @@ for (const id of list) {
   // are how a run is measured, and a measurement run is one that passes. A
   // three-`ls` loop completed, threw its own numbers away, and had to be run
   // again to get them.
+  // On a failing run too, which is the whole point of asking for it.
+  //
+  // This said `&& result.how === 'reached'`, having been changed from "only
+  // on failure" to "on a passing run as well" and landed on "only on a
+  // passing run". So every run that timed out or died printed twenty lines of
+  // terminal and nothing else -- no per-process timings, no `[gex]` trace, no
+  // wasm stack -- and a whole session of debugging a deadlock was done by
+  // reading the one row of the terminal that a tick happened to catch.
   const noisy = /Fontconfig|GPU|gpu|Registration|Vulkan|dawn/;
-  if (process.env.GEX_STDERR === 'all' && result.how === 'reached') {
+  if (process.env.GEX_STDERR === 'all') {
     for (const l of err.split('\n')) if (l && !noisy.test(l)) console.log(`     ${l}`);
   }
   if (result.how === 'reached') {
