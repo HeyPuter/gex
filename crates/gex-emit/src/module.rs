@@ -139,7 +139,32 @@ const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 256;
 /// and immediately wanted, and there are thousands of them in a run, so the
 /// helpers are pure compile cost: emitting them everywhere took `apt-get
 /// update` from 82 seconds to 114.
-const BIG_BLOCKS: usize = 4096;
+///
+/// Set out of reach for now, because a closure whose libraries have passive
+/// segments does not run. Measured, three ways, on the same 19-object
+/// `--exhaustive` build of apt's closure:
+///
+///     passive, filled on demand    SIGILL after two processes
+///     passive, filled eagerly      three processes, then blocked
+///     active (this)                exit 0, 55,714ms
+///
+/// The last is indistinguishable from the closure built before any of this
+/// existed (exit 0, 56,563ms), so nothing else in the emitter is implicated.
+/// It is not a short fill either: `gexfillall` provably carries one
+/// `table.init` per segment on every library -- 99/99, 413/413, 429/429,
+/// 355/355 -- so every slot an active segment would have written is written,
+/// in the same order, just after instantiation instead of during it.
+///
+/// That difference is now the whole question, and it is #106. Everything the
+/// mechanism needs is here and correct: the helpers, the entry matching that
+/// `gexfillat` needs, and the host side that asks on a miss. Restoring the
+/// gate to 4096 turns it all back on.
+///
+/// The runtime-translation path is unaffected either way. Its units are about
+/// twenty blocks, far below any plausible gate, so they emit active segments
+/// and no helpers exactly as they always did -- which is the configuration
+/// that measured 93.6s to 86.5s.
+const BIG_BLOCKS: usize = usize::MAX;
 
 impl Default for PageTable {
     fn default() -> PageTable {
