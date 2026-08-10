@@ -6644,8 +6644,20 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
                 missing += 1;
                 continue;
             };
-            match h.jit.shared.get(&(page, key)) {
-                Some(&base) => {
+            // Through `shared_slot`, which asks the *global* kernel before it
+            // asks this process's own mirror.
+            //
+            // Reading `h.jit.shared` directly is why an `apt-get update`
+            // translated 3,279,636 blocks -- nearly twice the entire
+            // decodable text of every library it touches. The mirror holds
+            // only what *this* process stored, so a process that started
+            // after another had already translated and published libapt
+            // looked, found nothing of its own, and translated it again. The
+            // store, the identity map and `k_mod_for_object` all exist to
+            // stop exactly that, and this path was the one place that did not
+            // consult them. The miss path always has.
+            match shared_slot(h, page, key) {
+                Some(base) => {
                     h.jit.page_table.assign(page, base);
                     // And the guest's directory, which `execve` cleared.
                     let mut gm = GuestMem::new(guest_bytes());
@@ -6753,7 +6765,9 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         for m in &modules {
             for (page, base) in &m.dir_entries {
                 if let Some(key) = page_identity(h, *page * gex_abi::DISPATCH_PAGE) {
-                    h.jit.shared.entry((*page, key)).or_insert(*base);
+                    // And in the global kernel, not only this process's
+                    // mirror, or the next process cannot find it either.
+                    record_shared_slot(h, *page, key, *base);
                 }
             }
         }
