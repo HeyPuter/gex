@@ -2427,6 +2427,13 @@ impl<'a> Emitter<'a> {
         let entry = self.scratch_entry;
         let index = self.scratch_index;
 
+        // Where this branch is going, before it goes. See `ctx::LAST_TARGET`:
+        // the tail call below replaces this frame, so afterwards there is no
+        // way left to ask.
+        self.f.local_get(self.ctx_local);
+        self.f.local_get(self.scratch_i64);
+        self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
+
         self.emit_dispatch_entry();
         self.f.local_tee(entry);
         self.mask_slot_bits();

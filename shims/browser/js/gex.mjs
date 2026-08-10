@@ -1735,7 +1735,19 @@ export class Gex {
           // rounds of this hunt were spent on entries that were in range
           // because they belonged to a page that was not the one being
           // dispatched.
-          const where = ask(() => pc, (entered) => {
+          // The target of the last indirect branch, in preference to
+          // anything else.
+          //
+          // The dispatch ends in `return_call_indirect`, so blocks replace
+          // each other's frames: by the time this runs, `enter` is long gone,
+          // the engine's stack has no wasm frames at all, and every address
+          // still obtainable -- the argument `enter` was called with, the PC
+          // in the saved context -- belongs to somewhere the guest has
+          // already left. Three crash reports were written against three such
+          // addresses. This one is stored by the dispatch itself, immediately
+          // before the branch.
+          const target = ask(e.gex_last_target, (v) => v) || 0n;
+          const where = ask(() => (target ? target : pc), (entered) => {
             if (!/table index/.test(err.message)) return '';
             const raw = BigInt(entered);
             const guest = raw < 0n ? raw + (1n << 64n) : raw;
@@ -1789,7 +1801,9 @@ export class Gex {
                 `reach, ${highTable} of them in a table above 1: ${sample.join('; ')}`
               : '. every other directory entry is reachable';
             return (
-              `. page ${page} of the directory says table ${idx} slot ${slot}` +
+              `. the last indirect branch was to 0x${guest.toString(16)}` +
+              `${target ? '' : ' (no target recorded, so this is where enter was called)'}` +
+              `, page ${page} of the directory says table ${idx} slot ${slot}` +
               `, so this branch wants ${idx}[${at}] and that table is ${len} long` +
               ` (${at < len ? 'in range, so the trap is elsewhere' : 'past the end'})` +
               survey +

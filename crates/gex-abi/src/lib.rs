@@ -266,6 +266,24 @@ pub mod ctx {
     /// that path. See `emit_dispatch_tail_call`.
     pub const BALLAST: usize = 43 * 8;
 
+    /// The address of the last indirect branch the guest took.
+    ///
+    /// Written just before the `br_table` that picks a dispatch table, so it
+    /// names the *target* -- which is the one thing a crash on that path
+    /// cannot otherwise be told.
+    ///
+    /// The dispatch ends in `return_call_indirect`, a tail call, so blocks
+    /// replace each other's frames: `enter` is not on the stack by the time
+    /// anything goes wrong, the engine's stack has no wasm frames in it at
+    /// all, and the address in `PC` is whatever the guest last wrote there
+    /// rather than where it was going. Three separate crash reports were
+    /// built on three different addresses, each in range, none of them the
+    /// one being dispatched.
+    ///
+    /// One store per indirect branch. Direct branches use `return_call` and
+    /// never come here.
+    pub const LAST_TARGET: usize = 44 * 8;
+
     /// `v0`–`v31`, 16 bytes each. Reserved now so the layout does not move
     /// when NEON lands (PLAN M2).
     pub const V: usize = 48 * 8;

@@ -5923,6 +5923,22 @@ pub extern "C" fn gex_in_syscall() -> u32 {
     IN_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as u32
 }
 
+/// The address of the last indirect branch the guest took.
+///
+/// The only address worth reporting for a trap on the dispatch path, and the
+/// only one that survives it: see [`gex_abi::ctx::LAST_TARGET`]. Read without
+/// the kernel, because a crash may have left it borrowed.
+#[no_mangle]
+pub extern "C" fn gex_last_target() -> i64 {
+    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    if at == 0 {
+        return 0;
+    }
+    GuestMem::new(guest_bytes())
+        .read_u64(at + ctx::LAST_TARGET as u64)
+        .unwrap_or(0) as i64
+}
+
 /// Set by [`trap`], cleared by [`gex_handoff`].
 /// Per Worker, not per process. It says "*this* Worker meant to give the
 /// stack back", and a static in a shared memory meant one Worker's trap flag
