@@ -168,12 +168,39 @@ export async function start() {
     // itself and the engine shares the code behind it, so all a Worker needs
     // besides the module is the small `gex.meta` section that says which
     // pages it covers.
-    const libs = await Promise.all(
-      m.libs.map(async (n) => {
-        const bytes = await fetchBytes(`/harness/closure/${encodeURIComponent(n)}`);
-        return { meta: metadataSection(bytes), mod: await WebAssembly.compile(bytes) };
-      }),
-    );
+    // A few at a time, not all nineteen at once.
+    //
+    // `Promise.all` over the lot had every library in flight together: 694 MB
+    // of wasm fetched and handed to `WebAssembly.compile` concurrently, on
+    // the main thread, before the shell has run an instruction. A 77 MB
+    // closure boots a shell in 1.65s; the 694 MB one never posted ready at
+    // all, and nothing said whether it was fetching, compiling or installing.
+    //
+    // Four is a guess and the log below is how to improve on it. What is not
+    // a guess is that unbounded was wrong: the peak is what matters here, and
+    // the peak was all of it.
+    const AT_A_TIME = 4;
+    const libs = [];
+    const began = performance.now();
+    for (let i = 0; i < m.libs.length; i += AT_A_TIME) {
+      const batch = m.libs.slice(i, i + AT_A_TIME);
+      const done = await Promise.all(
+        batch.map(async (n) => {
+          const t0 = performance.now();
+          const bytes = await fetchBytes(`/harness/closure/${encodeURIComponent(n)}`);
+          const fetched = performance.now();
+          const mod = await WebAssembly.compile(bytes);
+          console.log(
+            `closure ${n}: ${(bytes.length / 1048576).toFixed(1)} MiB, `
+            + `${Math.round(fetched - t0)}ms fetching, `
+            + `${Math.round(performance.now() - fetched)}ms compiling`,
+          );
+          return { meta: metadataSection(bytes), mod };
+        }),
+      );
+      libs.push(...done);
+    }
+    console.log(`closure ready: ${libs.length} libraries in ${Math.round(performance.now() - began)}ms`);
     // The image module is one program's own text, and pid 1 here is a shell.
     // Handing dash a module built for `apt-get` starts the shell inside
     // another program's code, and it exits without a syscall -- which is
