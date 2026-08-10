@@ -2304,3 +2304,43 @@ the programs an `apt-get update` actually runs: `dpkg`, `apt-config`, `sed`,
 layout, so a union closure over a set of programs is buildable rather than
 blocked -- assign every object in the union a base once, then build each
 program against that file.
+
+## The closure is a net loss for a short-lived child, and by how much
+
+Three `/bin/true` on the demo site, with the apt closure and without it:
+
+                        blocks   translating   lived
+    with the closure      9800         435ms   1966ms
+    without               13031        368ms   1378ms
+
+It is being consulted -- a quarter to a third of the blocks go away, and bash
+drops from 34,015 to 20,961 -- and the process is *six hundred milliseconds
+slower for it*. The reason is one line of the child's own narration:
+
+    adopt 3: directory rebuilt: 0 entries kept   (+1ms)
+    adopt 3: 720 modules reachable, 0 slots      (+399ms)   <- installClosure
+    adopt 3: running                             485ms in
+
+Every forked child re-registers all eighteen libraries, and that costs 399ms
+against the ~100ms of translation it saves. An `apt-get update` forks
+eighty-five times: thirty-four seconds of registering a closure that is
+already described by the memory the child was handed.
+
+### Why it is re-registered at all
+
+A deferred child rebuilds its dispatch directory, because the slots its parent
+*translated* belong to modules the child has not installed. That clears the
+closure's entries too, and `#installClosure` puts them back -- which is where
+the 399ms goes.
+
+Preserving them across the rebuild is the obvious fix and does not work as
+written: `CLOSURE_DIRS` is a per-Worker static filled by
+`gex_add_closure_module`, and a freshly forked child's shim has never called
+it, so there is nothing to preserve. Re-applying it there changes the block
+counts by exactly zero, which is how that attempt was caught.
+
+What would work is carrying the closure's page list across the fork, the way
+`pages` and `shared` already travel, so the child can keep those entries
+instead of rebuilding them from eighteen metadata sections. The entries are
+already in the copied memory; only the knowledge of *which* of them are the
+closure's is missing.
