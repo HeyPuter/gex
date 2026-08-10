@@ -345,9 +345,37 @@ for (const id of list) {
       // by looking at the line alone. Every fragment of the echo *is* a
       // substring of the command, though, and nothing the guest prints has to
       // be.
+      // Only the echo, and only until it ends. Filtering *every* line that
+      // the command happens to contain throws away real output too: a command
+      // ending `; echo GEX-CMD-DONE` contains the marker it exists to print,
+      // so the run went from passing before the guest started to never
+      // passing at all. Both are the same mistake -- deciding what a line
+      // means by its text rather than by where it is.
+      //
+      // The echo begins at `command:` and continues while each row is a
+      // fragment of the command; the first row that is not ends it, and
+      // everything after counts. Recomputed per snapshot because the reporter
+      // re-reads the whole terminal each tick.
+      // Consumed positionally rather than by `includes`, so the echo ends
+      // exactly where the command does. Matching anywhere swallowed the first
+      // real line the guest printed whenever the command happened to contain
+      // it -- `echo START` prints `START`, which is in the command, so it
+      // vanished.
+      let echoAt = -1;
       for (const line of (terminal || '').split('\n')) {
+        const t = line.trim();
+        if (/^command:/.test(t)) {
+          echoAt = 0;
+          continue;
+        }
+        if (echoAt >= 0 && echoAt < cmdText.length) {
+          if (t && cmdText.startsWith(t, echoAt)) {
+            echoAt += t.length;
+            continue;
+          }
+          echoAt = cmdText.length;
+        }
         if (!line.trim() || seen.has(line)) continue;
-        if (cmdText && cmdText.includes(line.trim())) continue;
         seen.add(line);
         // `GEX_ECHO` prints every line the guest says, once, as it first
         // appears. The tick below carries one line per five seconds, which
