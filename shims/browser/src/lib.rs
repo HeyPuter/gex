@@ -1385,7 +1385,32 @@ struct Jit {
     nanos: u64,
 }
 
+/// Written at both ends of [`Host`] and checked on the way into every
+/// syscall. See [`HOST_MAGIC_HEAD`].
+const HOST_MAGIC: u64 = 0x6765_785f_484f_5354;
+
 struct Host {
+    /// A canary, because the failures this shim has are memory corruption and
+    /// they are always found somewhere other than where they happened.
+    ///
+    /// The arena overlap in 02fd80b was a forked child's own heap handed
+    /// addresses its parent was using: it wrote through the guest's heap and
+    /// surfaced, minutes later, as `malloc_consolidate(): invalid chunk size`
+    /// in a program that had done nothing wrong. The one the demo site still
+    /// dies of is `table index is out of bounds` inside `execve`, with a
+    /// dispatch directory that verifies clean in all 524,288 entries -- so
+    /// the index is not the guest's, it is one of this module's own funcref
+    /// calls, and the only way to get one of those wrong is for the `Host`
+    /// holding it to have been written over. `kernel.net` is an
+    /// `Arc<dyn NetStack>`, `kernel.place` an `Arc<dyn ...>`, `kernel.clock` a
+    /// function pointer; all three live in here.
+    ///
+    /// Two words, one at each end, so a write that lands anywhere across the
+    /// structure is caught by one of them. Checked at syscall entry, which is
+    /// a load and a compare against a constant and costs nothing measurable,
+    /// and which turns "something is wrong, elsewhere, later" into "the call
+    /// before this one did it".
+    magic_head: u64,
     kernel: Kernel,
     /// The virtio-gpu renderer, when the page brought one. Held here rather
     /// than in the kernel because the scheduler is what pumps it, and the
@@ -1409,6 +1434,34 @@ struct Host {
     /// makes the bytes arrive. Either way the page is expected to call
     /// `gex_wake`; the difference is what it should do first.
     jit: Jit,
+    /// The other end of the canary. See `magic_head`.
+    magic_tail: u64,
+}
+
+/// Check the canary, and say so loudly once if it has gone.
+///
+/// Reported rather than trapped: the run is already wrong by the time this
+/// notices, and a trap here would replace the crash that is being diagnosed
+/// with a different one at a different place. Once, because a corrupted
+/// `Host` will fail this on every syscall afterwards and a flood is not a
+/// diagnosis.
+fn check_host_magic(where_: &str) {
+    if gex_has_host() == 0 {
+        return;
+    }
+    let (head, tail) = with_host(|h| (h.magic_head, h.magic_tail));
+    if head == HOST_MAGIC && tail == HOST_MAGIC {
+        return;
+    }
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    trace_line(&format!(
+        "gex: the host structure has been written over, seen at {where_}: \
+         head={head:#x} tail={tail:#x}, both should be {HOST_MAGIC:#x}. \
+         Whatever runs after this is running on a corrupt kernel.\n"
+    ));
 }
 
 // Against a plain memory the shim is single-threaded and one Worker owns
@@ -2409,6 +2462,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
     let entry = program.entry();
     set_host(Host {
+        magic_head: HOST_MAGIC,
             kernel,
             virgl,
             root,
@@ -2442,6 +2496,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 compiles: 0,
                 nanos: 0,
             },
+        magic_tail: HOST_MAGIC,
     });
     entry
 }
@@ -3560,6 +3615,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if !tracing() {
         note_process_syscall(ctx as u32 as u64, pc);
     }
+    // And whether the kernel this call is about to run against is still
+    // intact. A load and a compare, once per syscall.
+    check_host_magic("a syscall");
     // How long each kind of syscall takes, when there is a heartbeat.
     //
     // Counts alone cannot answer the question glxgears asks: it holds a
@@ -4460,6 +4518,7 @@ pub extern "C" fn gex_adopt_child(
     kernel.clock = browser_clock;
     kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
     set_host(Host {
+        magic_head: HOST_MAGIC,
         kernel,
         virgl,
         root: Arc::new(gex_kernel::vfs::TmpFs::new()),
@@ -4503,6 +4562,7 @@ pub extern "C" fn gex_adopt_child(
             compiles: 0,
             nanos: 0,
         }},
+        magic_tail: HOST_MAGIC,
     });
     pc
 }
