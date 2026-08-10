@@ -1875,3 +1875,34 @@ instantiated in twenty-six processes. Demand filling already cuts that 46 per
 cent on the one-shot path and should apply here unchanged -- which would put
 apt in a browser somewhere near 40 seconds, against the 82 this file opened
 with.
+
+### Instantiate a library when a branch reaches it: install down 57 percent
+
+The slots were written on demand and the instances were not. A process built
+all twenty-nine of apt's libraries at boot -- 37 of a 61 second run -- to
+reach a handful.
+
+Installing one now registers its metadata, grows the tables to its slot count
+and stops. The directory points at its pages, so a branch resolves and faults
+where it should, and the fill builds the instance then. The shim answers
+`gex_closure_owner(page)` because a page is what a miss knows.
+
+| | wall | install | blocks translated |
+|---|---|---|---|
+| eager instantiate | 60,803 ms | 37,122 ms | 58,826 |
+| **lazy instantiate** | **57,130 ms** | **15,880 ms** | 58,826 |
+
+The block count is identical to the digit. That is the number to check on any
+change of this kind: every earlier version of demand filling bought install
+time by translating more, and this one buys nothing back.
+
+**Where `apt-get update` in a browser stands, both under a shell:**
+
+| | wall | blocks translated |
+|---|---|---|
+| runtime translation | 79,622 ms | 3,121,058 |
+| statically recompiled closure | **57,130 ms** | **58,826** |
+
+Of the 57 seconds, 15.9 are install summed over 26 processes and 1.5 are
+translation. Install has stopped being the question. What the guest actually
+spends its time on is next: #86 (decompression) and #72 (memcpy inside libc).
