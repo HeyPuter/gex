@@ -79,11 +79,19 @@ if ! node shims/browser/js/check-glue.mjs "$OUT" shims/browser/js/gex.mjs; then
     echo "shims/browser: NOT installed -- the glue check failed" >&2
     exit 1
 fi
-# And against the other side. The kernel is a separate artefact that nothing
-# here rebuilds, and a shim importing a function it does not export fails to
-# instantiate inside a Worker: no error anybody reads, no guest output, a run
-# that looks wedged. Adding one kernel function and rebuilding only the shim
-# cost exactly that, against a kernel seven hours stale.
+# The kernel is a separate artefact and the shim imports from it, so it is
+# rebuilt here -- before the check below, which would otherwise be run against
+# the previous one and pass on a mismatch that is about to matter.
+if [ -x shims/kernel/build.sh ]; then
+    shims/kernel/build.sh >/dev/null 2>&1 && echo "  kernel: rebuilt alongside the shim" \
+        || echo "  kernel: NOT rebuilt (needs nightly) -- imports may not match"
+fi
+# And against the other side. A shim importing a function the kernel does not
+# export -- or exports with a different signature -- fails to instantiate
+# inside a Worker: no error anybody reads, no guest output, a run that looks
+# wedged. Adding one kernel function and rebuilding only the shim cost exactly
+# that, against a kernel seven hours stale; giving one an extra parameter cost
+# it again, against a check that compared names only.
 if [ -f "$PUB/gex_kernel.plain.wasm" ] \
    && ! node shims/browser/js/check-kernel.mjs "$OUT" "$PUB/gex_kernel.plain.wasm"; then
     echo "shims/browser: NOT installed -- the kernel check failed" >&2
@@ -136,19 +144,6 @@ if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | gre
               --target-dir target/shared 2>&1 | grep -E "^error|error:" | head -5
         echo "shims/browser: (if that is 'can't find crate for std', install rust-src)"
     fi
-fi
-
-# The global kernel too, because the shim imports from it and the two have to
-# agree about the *types* of what it imports, not only the names.
-#
-# `check-kernel.mjs` compares names and passed while `k_obj_translated` had
-# gained a second parameter on one side and not the other; the page then died
-# at instantiation with `imported function does not match the expected type`.
-# Building both from one command is the only thing that makes them agree by
-# construction.
-if [ -x shims/kernel/build.sh ]; then
-    shims/kernel/build.sh >/dev/null 2>&1 && echo "  kernel: rebuilt alongside the shim" \
-        || echo "  kernel: NOT rebuilt (needs nightly) -- imports may not match"
 fi
 
 # The seed module too, because `enter` lives in it and `enter` is emitted by
