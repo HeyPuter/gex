@@ -1328,7 +1328,7 @@ export class Gex {
     // What this costs is a child that does *not* exec: it re-serves what it
     // touches instead of arriving with it. What it saves is every child that
     // does.
-    let need = 0;
+    let need = (child.slots ?? 0) >>> 0;
     for (const m of child.modules ?? []) need = Math.max(need, m.need);
     if (need) this.#growTables(need);
     // Kept, not dropped: a child that turns out to be staying wants them
@@ -1457,6 +1457,18 @@ export class Gex {
       // A `WebAssembly.Module` is structured-cloneable, so handing the child
       // these costs nothing: it links them against its own memory and tables
       // without compiling a line.
+      // Every slot this process has claimed, which is not the same as the
+      // highest any of its modules needed.
+      //
+      // The child sizes its tables so that the directory it inherits cannot
+      // name a slot past their end -- and the directory is written when a
+      // page is *claimed*, not when its module is installed. Taking the
+      // maximum over the inherited modules therefore misses anything claimed
+      // after the last install: a translation still in the queue at `fork`,
+      // or a page whose module went to another Worker of this process. A
+      // branch into one of those is `table index is out of bounds`, which is
+      // a trap rather than a miss, so it cannot be recovered from. See #114.
+      slots: e.gex_jit_slots_total?.() ?? 0,
       pages: this.#pageMap(),
       // And which object each of those pages belongs to, which is the only
       // part of it that outlives the child's first `execve`. See
@@ -1697,8 +1709,14 @@ export class Gex {
           // and reads nothing -- for three days. The guest had returned from
           // it and run on into translated code, which is where it died.
           const within = ask(e.gex_in_syscall, (v) => v) === 1;
+          // `!0` reaches JavaScript as -1, not 0xffffffff: the export is a
+          // `u32` in Rust and an `i32` in wasm, and there is no unsigned. The
+          // sentinel check never matched, so a crash before the guest had made
+          // any syscall at all reported "after syscall -1".
           const nr = ask(e.gex_last_syscall, (n) =>
-            n === 0xffffffff ? '' : `, ${within ? 'inside' : 'after'} syscall ${n}`);
+            n === -1 || n === 0xffffffff
+              ? ''
+              : `, ${within ? 'inside' : 'after'} syscall ${n}`);
           if (globalThis.GEX_TRAP_STACK) console.error(err.stack ?? err);
           // "table index is out of bounds" says a branch reached a slot past
           // the end of the table it lives in, and nothing else in the message
@@ -1716,8 +1734,16 @@ export class Gex {
             const packed = dir >>> 0;
             const idx = packed >>> 24;
             const slot = packed & 0xffffff;
+            // The page's base is not the index the branch uses: the block's
+            // offset within the page is added to it. Reporting the base alone
+            // showed a slot comfortably inside the table while the branch was
+            // past its end, which is a diagnosis pointing at the wrong thing.
+            const at = slot + ((Number(guest) & 0xfff) >> 2);
+            const len = tables[idx]?.length ?? 0;
             return (
               `. page ${page} of the directory says table ${idx} slot ${slot}` +
+              `, so this branch wants ${idx}[${at}] and that table is ${len} long` +
+              ` (${at < len ? 'in range, so the trap is elsewhere' : 'past the end'})` +
               `, and this process has ${tables.length} tables of ` +
               `[${tables.map((t) => t.length).join(', ')}]` +
               `, ${this.#installs} modules installed`

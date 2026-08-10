@@ -3554,6 +3554,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     );
     IN_SYSCALL.store(true, std::sync::atomic::Ordering::Relaxed);
     let _in_syscall = InSyscall;
+    CTX_ADDR.store(ctx as u32 as u64, std::sync::atomic::Ordering::Relaxed);
     // How long each kind of syscall takes, when there is a heartbeat.
     //
     // Counts alone cannot answer the question glxgears asks: it holds a
@@ -4201,8 +4202,25 @@ fn resume_ctx() -> Option<u64> {
 }
 
 fn set_resume_ctx(v: u64) {
+    CTX_ADDR.store(v, std::sync::atomic::Ordering::Relaxed);
     RESUME_CTX.with(|c| c.set(Some(v)));
 }
+
+/// Where the running thread's register context is, without asking the kernel.
+///
+/// Every question the crash reporter asks used to go through `with_host`, and
+/// a crash inside a `with_host` closure leaves the kernel borrowed -- so each
+/// question panicked on the leaked borrow instead of answering, and the
+/// report arrived with no pc at all:
+///
+///     the kernel was re-entered at lib.rs:7178 while lib.rs:6321 holds it
+///     RefCell already mutably borrowed
+///     process 14 failed: memory access out of bounds, after syscall -1
+///
+/// A crash in the dispatch-miss path is exactly the case that needs a pc, and
+/// exactly the case that could not produce one. A plain static can always be
+/// read.
+static CTX_ADDR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn set_resume_ctx_none() {
     RESUME_CTX.with(|c| c.set(None));
@@ -7175,6 +7193,14 @@ pub extern "C" fn gex_current_ctx() -> i64 {
 
 #[no_mangle]
 pub extern "C" fn gex_current_pc() -> i64 {
+    // Without the kernel when there is a remembered context, because the
+    // crash this most needs to describe is one that left the kernel borrowed.
+    // See `CTX_ADDR`.
+    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    if at != 0 {
+        let gm = GuestMem::new(guest_bytes());
+        return gm.read_u64(at + ctx::PC as u64).unwrap_or(0) as i64;
+    }
     with_host(|h| {
         let gm = GuestMem::new(guest_bytes());
         let at = h.threads[cur()].kstate.ctx_addr;
