@@ -1603,8 +1603,11 @@ export class Gex {
         // object, in every process.
         const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
         if (want >= 0) {
-          this.fillSlot(want >>> 0);
-          e.gex_fill_done();
+          // Whether anybody answered matters: a page nobody holds *yet* must
+          // be askable again once another module arrives, and a page nobody
+          // will ever hold must stop trapping. The shim cannot tell those
+          // apart on its own.
+          e.gex_fill_done(this.fillSlot(want >>> 0) ? 1 : 0);
         }
         while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
         // The parent's modules go in *after* this Worker's own queue, never

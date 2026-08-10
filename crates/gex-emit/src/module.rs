@@ -151,10 +151,13 @@ const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 256;
 /// The third row is the mechanism working and still losing. Install is 6.6
 /// seconds *under* the active build, which is what demand filling was for --
 /// but the run pays that back four times over in lifting, because a page is
-/// asked about once and any ask that does not end in a fill leaves every
-/// block on that page to be translated. 85 to 234 fills answered per process
-/// against 132,000 blocks translated per process says most pages never get
-/// filled at all
+/// asked about once, and only ever while `FILL_POSSIBLE` is true -- which it
+/// is not until a deferred module has been installed *in that Worker*. A
+/// forked child begins executing while its inherited modules are still
+/// arriving, so its early misses never ask; they translate, and an address
+/// once translated never needs the closure again. Forgiving unfillable pages
+/// changed nothing (83,456ms, 2,639,596 blocks) because only 2 to 17 asks a
+/// process go unanswered. The asks that are missing are the ones never made
 ///
 /// Keying the fill on the guest page fixed the crash -- a miss always knows
 /// its page and almost never knows an entry -- but the asks still go

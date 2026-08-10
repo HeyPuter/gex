@@ -2746,10 +2746,35 @@ static FILL_ASKED: SingleThreaded<std::collections::BTreeSet<u64>> =
 static FILL_POSSIBLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Pages asked about that nobody could fill, and the page being asked now.
+///
+/// A failure is not permanent. The module covering a page may simply not be
+/// installed *in this process* yet -- which is the ordinary case for a forked
+/// child, since it installs what it inherited one module at a time while the
+/// guest is already running. Recording the ask as final meant such a page was
+/// asked once, found nowhere, and then had every one of its blocks lifted
+/// instead: 132,000 blocks a process against 234 fills.
+static FILL_FAILED: SingleThreaded<std::collections::BTreeSet<u64>> =
+    SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
+
+/// The page the host is being asked about, so the answer can be attributed.
+static FILL_PENDING: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
 /// The host is holding a module whose slots are not written yet.
+///
+/// Turning this on also forgives every page that could not be filled before,
+/// because the module just installed may be the one that covers them.
 #[no_mangle]
 pub extern "C" fn gex_fill_possible(on: i32) {
     FILL_POSSIBLE.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+    if on != 0 {
+        let failed = std::mem::take(&mut *FILL_FAILED.0.borrow_mut());
+        let mut asked = FILL_ASKED.0.borrow_mut();
+        for page in failed {
+            asked.remove(&page);
+        }
+    }
 }
 
 /// The slot the host should write, or -1 if it is not being asked.
@@ -2758,11 +2783,20 @@ pub extern "C" fn gex_fill_wanted() -> i64 {
     FILL_WANTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The host has answered. Nothing rides on whether it succeeded: a page it
-/// could not fill has been recorded as asked, so the next miss on it takes
-/// the ordinary path.
+/// The host has answered, and whether it found anybody.
+///
+/// A page nobody could fill is remembered as such, so the next miss on it
+/// takes the ordinary path rather than trapping again -- but only until the
+/// next deferred module arrives, which may be the one that covers it. A page
+/// that *was* filled stays in `FILL_ASKED` and is never asked twice; if a
+/// branch on it misses again the fill did not cover that block, and asking
+/// once more would only spin.
 #[no_mangle]
-pub extern "C" fn gex_fill_done() {
+pub extern "C" fn gex_fill_done(ok: i32) {
+    let page = FILL_PENDING.swap(-1, std::sync::atomic::Ordering::Relaxed);
+    if ok == 0 && page >= 0 {
+        FILL_FAILED.0.borrow_mut().insert(page as u64);
+    }
     FILL_WANTED.store(-1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -6134,6 +6168,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             && FILL_ASKED.0.borrow_mut().insert(page)
         {
             FILL_WANTED.store(page as i64, std::sync::atomic::Ordering::Relaxed);
+            FILL_PENDING.store(page as i64, std::sync::atomic::Ordering::Relaxed);
             set_resume(pc);
             set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
             return true;
