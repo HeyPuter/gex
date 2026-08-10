@@ -1562,3 +1562,42 @@ Two habits caused the waste, both worth naming:
 The general rule the harness now follows: when watching for an outcome, match
 the failure signatures as well as the success ones. Silence and a timer
 expiring look identical, and they mean completely different things.
+
+
+## The closure in a browser: translation gone, instantiate is everything
+
+Added 2026-08-10. The first measurement of a statically recompiled closure in
+a page, and it needed a new harness mode to take at all -- a closure pins
+every object it reaches starting at 0x5000000, which is where a shell's own
+image goes, so booting `dash` and handing it apt's pins killed the shell
+before it printed a prompt. `harness.mjs program` runs one ELF as pid 1
+instead.
+
+`apt-get update` against a local repository, ten processes either way:
+
+                       runtime translation      closure
+    blocks translated      70k - 230k each      233 - 2004 each
+    ms translating          ~5000 total         224 total
+    modules installed      1900 - 3448 each     57 - 82 each
+    ms installing          ~30000 total         16167 total
+
+Two things follow.
+
+**The feature works.** Translation falls by two orders of magnitude. 224
+milliseconds of lifting for a whole `apt-get update` is the thing this
+project is for, and it had never been shown in the host that matters.
+
+**And it moves the cost rather than removing it.** Install halves and is now
+essentially the entire run. It did not fall in proportion to the module
+count: 57 modules cost about what 3,448 did. A closure's modules are enormous
+-- `libgcrypt` is 318 MB of wasm on its own -- so `instantiate` scales with
+bytes as much as with count. The page already compiles each library once and
+hands every Worker a `WebAssembly.Module`, so compilation is shared; what
+remains is per-process instantiation, which is not.
+
+Which promotes #93 from a suspicion to the obvious next step. The closure
+recompiles whole objects and apt reaches a small fraction of each, and
+trimming it to what is reached is the only lever that touches the term that
+now dominates: merging cannot help with nineteen modules, and a faster lifter
+cannot help with 224 milliseconds of lifting. The prize is bounded by the
+table above -- most of sixteen seconds in an eighty-second run.

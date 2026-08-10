@@ -758,6 +758,7 @@ impl ModuleBuilder {
                     table: 0,
                     offset: 0,
                     funcs,
+                    passive: false,
                 });
             }
             Linkage::Shared => {
@@ -826,6 +827,7 @@ impl ModuleBuilder {
                         table,
                         offset: start as u32,
                         funcs,
+                        passive: false,
                     });
                 }
             }

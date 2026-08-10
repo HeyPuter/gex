@@ -504,6 +504,20 @@ pub struct ElementSegment {
     pub table: u32,
     pub offset: u32,
     pub funcs: Vec<u32>,
+    /// Filled by a call rather than by instantiation.
+    ///
+    /// An active segment writes its funcrefs into the table every time the
+    /// module is instantiated, and a module is instantiated once per guest
+    /// *process* -- a table belongs to an instance, and every process has its
+    /// own. For a closure library that is one table write per block in the
+    /// whole object, repeated for every process, overwhelmingly for code the
+    /// process never runs: `libgcrypt` is 303 MiB of wasm and instantiating
+    /// it cost between 1.2 and 2.2 seconds a process.
+    ///
+    /// Passive segments write nothing at instantiation. The host calls
+    /// `gexfill` when it wants the slots, which is the seam a demand-filled
+    /// table needs.
+    pub passive: bool,
 }
 
 /// A memory initialiser.
@@ -792,16 +806,21 @@ impl Module {
             let mut s = Vec::new();
             write_u32(&mut s, self.elements.len() as u32);
             for e in &self.elements {
-                if e.table == 0 {
+                if e.passive {
+                    // Form 1: passive, elemkind funcref, a vector of indices.
+                    s.push(0x01);
                     s.push(0x00);
+                } else if e.table == 0 {
+                    s.push(0x00);
+                    s.push(op::I32_CONST);
+                    write_i32(&mut s, e.offset as i32);
+                    s.push(op::END);
                 } else {
                     s.push(0x02);
                     write_u32(&mut s, e.table);
-                }
-                s.push(op::I32_CONST);
-                write_i32(&mut s, e.offset as i32);
-                s.push(op::END);
-                if e.table != 0 {
+                    s.push(op::I32_CONST);
+                    write_i32(&mut s, e.offset as i32);
+                    s.push(op::END);
                     s.push(0x00); // elemkind: funcref
                 }
                 write_u32(&mut s, e.funcs.len() as u32);
