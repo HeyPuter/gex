@@ -429,7 +429,7 @@ export class Gex {
       env: { memory: this.#memory },
       // The shim asks JS for exactly the two things wasm has no way to do.
       gex_env: this.#hostImports(),
-      gex_k: this.#kernelImports(),
+      gex_k: this.#kernelImports(shimMod),
     });
     this.#u8 = null;
     // First, before any call into the shim.
@@ -647,10 +647,11 @@ export class Gex {
    */
   async attach(shimWasm, guestWasm, { devices = true } = {}) {
     await this.#startKernel();
-    this.#shim = await WebAssembly.instantiate(await WebAssembly.compile(shimWasm), {
+    const shimMod = await WebAssembly.compile(shimWasm);
+    this.#shim = await WebAssembly.instantiate(shimMod, {
       env: { memory: this.#memory },
       gex_env: this.#hostImports(),
-      gex_k: this.#kernelImports(),
+      gex_k: this.#kernelImports(shimMod),
     });
     this.#u8 = null;
     // The shim's stack pointer is a mutable *global*, which belongs to the
@@ -825,13 +826,29 @@ export class Gex {
    * as it did before any of this existed. So the stubs below are never
    * called -- they exist because a wasm import cannot be absent, only unused.
    */
-  #kernelImports() {
+  #kernelImports(shimMod) {
     const k = this.#kernel;
     const absent = () => 0;
-    // Named once, so a call added on one side and forgotten on the other is
-    // a link error at instantiation rather than a stub that quietly answers
-    // nought for the life of the run.
-    const NAMES = [
+    // What the shim actually imports, asked of the shim.
+    //
+    // This was a list written by hand, and the list is a third place to keep
+    // in step with the other two. Adding `k_stdin_ready` to the kernel and to
+    // the shim and not to the list cost a round: every run died with "Import
+    // #80 gex_k k_stdin_ready: function import requires a callable", and
+    // `check-glue.mjs` did not catch it because it checks this file against
+    // the *shim's* imports and these arrive through the kernel.
+    //
+    // `WebAssembly.Module.imports` is the only authority on what a module
+    // needs, so ask it. A name the kernel does not have still fails loudly
+    // below; a name nobody imports costs nothing.
+    const asked = shimMod
+      ? WebAssembly.Module.imports(shimMod)
+          .filter((i) => i.module === 'gex_k' && i.kind === 'function')
+          .map((i) => i.name)
+      : [];
+    // Kept only for a caller that has no module to ask -- there is none in
+    // this file, and this list is not to be extended.
+    const LEGACY_NAMES = [
       'k_spawn', 'k_exit', 'k_reap', 'k_wait', 'k_wait_ready',
       'k_has_children', 'k_kill', 'k_take_signals', 'k_has_signals',
       'k_ppid', 'k_pgid', 'k_sid', 'k_setsid', 'k_setpgid',
@@ -859,12 +876,19 @@ export class Gex {
       'k_mod_store', 'k_mod_claim', 'k_mod_for', 'k_mod_slots',
       'k_mod_len', 'k_mod_dirs_len', 'k_mod_read', 'k_mod_dirs_read',
     ];
+    const NAMES = asked.length ? asked : LEGACY_NAMES;
     // Not imported by the shim -- the host reads it after a crash -- so it is
     // not in the list above and its absence is not a link error.
     // Two of these return an i64, which JS has to answer with a BigInt.
     const BIG = new Set(['k_wait', 'k_take_signals']);
     const out = { k_present: () => (k ? 1 : 0) };
     for (const n of NAMES) {
+      // Some of what the shim imports from `gex_k` is answered here rather
+      // than by the kernel -- `k_present` is the negotiation itself, and the
+      // kernel has no such export. Deriving the list from the shim's imports
+      // therefore turns up names this file already owns, and demanding them
+      // of the kernel fails every run.
+      if (n in out) continue;
       if (k) {
         if (typeof k[n] !== 'function') {
           throw new Error(
