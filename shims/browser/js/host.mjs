@@ -89,6 +89,25 @@ export class ProcessHost {
     this.#onOther = onMessage;
   }
 
+  /**
+   * The shim, compiled once for every Worker that will ever need it.
+   *
+   * Two things this saves, and it is worth being clear that only the second
+   * is certain. V8 keeps a cache of compiled wasm keyed on the wire bytes and
+   * shares it between Isolates in a process, so ten Workers compiling the
+   * same 8.7 MB may already have been one compilation and nine lookups --
+   * that is measurable, and measured below rather than assumed. What is not
+   * in doubt is the copying: `postMessage` structured-clones a `Uint8Array`,
+   * so every Worker was handed its own 8.7 MB, while a `WebAssembly.Module`
+   * clones as a reference to the code already compiled.
+   */
+  #shimModule() {
+    if (!(this.#shim instanceof WebAssembly.Module)) {
+      this.#shim = new WebAssembly.Module(this.#shim);
+    }
+    return this.#shim;
+  }
+
   /** How many children the guest has forked. */
   get forked() { return this.#forked; }
 
@@ -210,7 +229,13 @@ export class ProcessHost {
             ...this.#extra,
             ...msg,
             kernelStack: this.#nextKernelStack(pid),
-            shim: this.#shim,
+            // Compiled once, here, rather than from bytes in every Worker.
+            // The shim is 8.7 MB and a run of `apt-get update` makes ten
+            // processes; compiling it ten times was most of that run's CPU,
+            // spread over V8's background threads where a profile of the
+            // main thread could not see it. A `WebAssembly.Module` is
+            // structured-cloneable and the engine shares the code behind it.
+            shim: this.#shimModule(),
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
           });
@@ -258,7 +283,7 @@ export class ProcessHost {
             tid: m.thread.tid,
             memory: m.thread.memory,
             kernelStack: this.#nextKernelStack(key),
-            shim: this.#shim,
+            shim: this.#shimModule(),
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
           });

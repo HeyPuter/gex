@@ -423,7 +423,18 @@ export class Gex {
    * pass through to, so whatever the program needs to read is bundled here.
    */
   async load(shimWasm, guestWasm, elf, files = {}, args = [], opts = {}) {
-    const shimMod = await WebAssembly.compile(shimWasm);
+    // A `WebAssembly.Module` if the host has one, bytes if it has not.
+    //
+    // The shim is 8.7 MB, and this used to compile it in every Worker: ten
+    // guest processes meant ten compilations of the same module, which is
+    // most of what `apt-get update` spent its CPU on -- four background
+    // threads at 28 seconds each, matched to a tenth of a second, which is a
+    // thread pool and not a guest.
+    //
+    // A compiled module is structured-cloneable and the engine shares the
+    // code behind it, so passing one costs a message and saves the compile.
+    const shimMod =
+      shimWasm instanceof WebAssembly.Module ? shimWasm : await WebAssembly.compile(shimWasm);
     await this.#startKernel();
     this.#shim = await WebAssembly.instantiate(shimMod, {
       env: { memory: this.#memory },
@@ -647,7 +658,18 @@ export class Gex {
    */
   async attach(shimWasm, guestWasm, { devices = true } = {}) {
     await this.#startKernel();
-    const shimMod = await WebAssembly.compile(shimWasm);
+    // A `WebAssembly.Module` if the host has one, bytes if it has not.
+    //
+    // The shim is 8.7 MB, and this used to compile it in every Worker: ten
+    // guest processes meant ten compilations of the same module, which is
+    // most of what `apt-get update` spent its CPU on -- four background
+    // threads at 28 seconds each, matched to a tenth of a second, which is a
+    // thread pool and not a guest.
+    //
+    // A compiled module is structured-cloneable and the engine shares the
+    // code behind it, so passing one costs a message and saves the compile.
+    const shimMod =
+      shimWasm instanceof WebAssembly.Module ? shimWasm : await WebAssembly.compile(shimWasm);
     this.#shim = await WebAssembly.instantiate(shimMod, {
       env: { memory: this.#memory },
       gex_env: this.#hostImports(),
