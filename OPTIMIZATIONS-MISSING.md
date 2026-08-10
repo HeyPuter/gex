@@ -1775,3 +1775,23 @@ time today a counter that did not add up was the whole story -- after the
 82.1s baseline that had drifted to 98.1s, and the harness that waited eleven
 minutes on a result id nothing would send. **A number that is impossible is
 worth more attention than a number that is merely bad.**
+
+### And the same counter was hiding the runtime path's real cost
+
+With the whole-object path finally timed, the ordinary runtime-translation
+`apt-get update` -- no closure -- reports:
+
+    translate 91,466ms   install 29,992ms   3,381,964 blocks   80,252ms wall
+
+It used to report 13,720ms of translation. The other 78 seconds were whole-object
+recompiles that added blocks to the counter and nothing to the clock. Summed
+across 26 processes that overlap in parallel Workers, so it is not 91 seconds
+of wall -- but it is three times the install cost that this file has spent
+weeks treating as the main event.
+
+That reorders the list. **#93 -- measure what fraction of each object apt
+actually reaches, and recompile only that -- is now the top runtime-path
+idea**, not a speculative one: recompiling a whole library to satisfy one
+miss is the single largest measured cost in the run. The closure work just
+finished is the same insight arrived at from the other side: it wins by never
+writing slots for code the process does not reach.
