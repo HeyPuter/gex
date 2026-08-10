@@ -2344,3 +2344,62 @@ What would work is carrying the closure's page list across the fork, the way
 instead of rebuilding them from eighteen metadata sections. The entries are
 already in the copied memory; only the knowledge of *which* of them are the
 closure's is missing.
+
+## What it would take for `/bin/true` to cost under 200ms
+
+The target. It currently costs 1400-1900ms in the demo, and every term is now
+measured rather than guessed.
+
+    translating 9,800 blocks   ~330ms
+    growing the tables         ~310ms
+    installing                 ~210ms
+    adopt, the rest             ~56ms
+    fork image copy              39ms
+    worker exists, bundle in     26ms
+
+### The 9,800 blocks are coverage, not mechanism
+
+`/bin/true` as pid 1, against a closure built **for it**, under the Node host:
+
+    [gex] load: 1 pins, 2 closure modules to install
+    [gex] pin ok: /lib/aarch64-linux-gnu/libc.so.6 wanted 0x5000000, landed 0x5000000
+    [gex] run ended: code 0
+
+and not one block translated. The whole run is fifteen lines.
+
+So the closure machinery is right and the artefact was wrong. Apt's closure
+and true's closure both contain libc -- 61,664 blocks of it for true -- but a
+non-exhaustive build holds only what is *reachable from its own program*, and
+the 9,800 blocks are libc paths that `apt-get` never walks. Building one
+closure for apt and expecting it to serve `dpkg`, `sed`, `cat` and `/bin/true`
+was the mistake.
+
+The fix is a closure over the *set* of programs a demo runs. `gexc --pin FILE`
+already exists to impose a shared layout, which is the blocker: placement is a
+bump allocator within one closure, so `true`'s puts libc at `0x5000000` where
+apt's puts it at `0x5520000`, and a translated block has its addresses baked
+in. Assign every object in the union a base once, build each program against
+that file, and their library modules become interchangeable.
+
+Pointing the page at a closure built for another program is worth avoiding
+loudly: `/bin/true`'s pins place its image at `0x1000000`, which is where the
+page's `bash` already is, and the run dies with `memory access out of bounds`
+inside a syscall. A manifest should probably name the program it was built
+for, and the loader refuse one that does not match pid 1.
+
+### And growing the tables lazily
+
+310ms of every process is sizing the dispatch tables for the entire closure --
+1,607,680 slots -- before the guest runs an instruction. That defeats the
+laziness the closure already has: it defers *instantiating* the eighteen
+libraries and then grows for all of them anyway.
+
+The coupling to break: a page's directory entry has to be written for the miss
+path to find its owner, and a branch into a page whose slot is past the end of
+a table traps rather than missing. `gex_closure_owner` already answers "which
+library covers this page" without the entry being there, so a page can be left
+out of the directory until its library is filled.
+
+Together those are ~850ms of the ~1500, and what remains -- 120ms of fork
+copy, Worker start and adopt, plus what the guest actually executes -- is
+inside the target.
