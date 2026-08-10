@@ -682,9 +682,16 @@ impl Module {
     /// module.
     ///
     /// `gexfill(seg)` fills one segment whole, chosen by a `br_table` over
-    /// the segments this module has. The host calls it for the segment
-    /// covering a page when a branch first reaches that page; a segment
-    /// nobody branches into is never written.
+    /// the segments this module has, and returns 1 if there was such a
+    /// segment and 0 if `seg` is past the end. The host calls it for the
+    /// segment covering a page when a branch first reaches that page; a
+    /// segment nobody branches into is never written.
+    ///
+    /// It returns that flag because the count is not a number the host can
+    /// guess. A first attempt had the host loop to sixty-four, which is fine
+    /// for the image module -- one segment -- and wrong for `libc`, which has
+    /// 355: the other 291 were never written, and the guest trapped on
+    /// `unreachable` the first time it branched into one.
     ///
     /// Returns the exported function's index, or `None` when the module has
     /// no passive segments and needs no filling.
@@ -727,9 +734,13 @@ impl Module {
             write_u32(&mut b, 12); // table.init
             write_u32(&mut b, *seg);
             write_u32(&mut b, *table);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, 1);
             b.push(op::RETURN);
         }
         b.push(op::END); // the outermost block
+        b.push(op::I32_CONST);
+        write_i32(&mut b, 0);
         b.push(op::END); // the function
         // A body carries its own length: the code section writes each one
         // verbatim, with no size of its own. Leaving it off made the section

@@ -1962,8 +1962,15 @@ export class Gex {
     //
     // `gexfill` is absent from a module built before this existed, and from
     // the image module, whose table is its own and still active.
+    if (globalThis.GEX_DEBUG_EXIT && this.#installs <= 2) {
+      console.error(`[fill] module ${this.#installs}: gexfill ${typeof inst.exports[FILL]}, exports ${Object.keys(inst.exports).slice(0, 4).join(',')}`);
+    }
     if (typeof inst.exports[FILL] === 'function') {
-      for (let seg = 0; seg < segments; seg++) inst.exports[FILL](seg);
+      // Until it says there are no more. The count is the module's to know:
+      // the image module has one segment and libc's closure module has 355,
+      // and a host that guessed sixty-four left 291 of them unwritten -- the
+      // guest trapped on `unreachable` the first time it branched into one.
+      for (let seg = 0; inst.exports[FILL](seg); seg++);
     }
     // Nothing to wire up below, for a module this translator built.
     //

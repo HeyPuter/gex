@@ -281,12 +281,24 @@ pub fn merge(units: &[&[u8]]) -> Option<Vec<u8>> {
             if flag == 0x02 {
                 read_u32(payload, &mut p);
             }
-            // The offset expression: `i32.const N end`.
-            p += 1;
-            read_u32(payload, &mut p);
-            p += 1;
-            if flag == 0x02 {
+            if flag == 0x01 {
+                // Passive: an elemkind and then the vector, with no offset
+                // expression -- there is nowhere for it to go until somebody
+                // calls `table.init`. Skipping the three bytes an active
+                // segment spends on `i32.const N end` reads them out of the
+                // funcref vector instead, and the parse walks off the end of
+                // the section a few segments later. That is what a `ls`
+                // turned into: an index panic in this function, surfacing as
+                // `unreachable` inside a syscall.
                 p += 1; // elemkind
+            } else {
+                // The offset expression: `i32.const N end`.
+                p += 1;
+                read_u32(payload, &mut p);
+                p += 1;
+                if flag == 0x02 {
+                    p += 1; // elemkind
+                }
             }
             elems.extend_from_slice(&payload[start..p]);
             let count = read_u32(payload, &mut p);

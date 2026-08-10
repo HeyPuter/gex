@@ -838,14 +838,7 @@ impl ModuleBuilder {
                         // instantiate, nearly all of it slots for code the
                         // process never reached.
                         //
-                        // Active for now. The encoding is right -- the module
-                        // compiles and `gexfill` is generated and called --
-                        // but a guest reaches a slot the fill did not write
-                        // and traps on `unreachable`, so the mapping from a
-                        // segment to the slots it covers is still wrong
-                        // somewhere. Flipping this word is the whole switch,
-                        // and apt works with it off.
-                        passive: false,
+                        passive: true,
                     });
                 }
             }
@@ -867,7 +860,7 @@ impl ModuleBuilder {
             n_blocks,
         };
         // The filler, now that every segment this module has is known.
-        let void_ty = self.m.func_type(FuncType::new(vec![ValType::I32], vec![]));
+        let void_ty = self.m.func_type(FuncType::new(vec![ValType::I32], vec![ValType::I32]));
         self.m.add_fill(void_ty);
         let started = crate::par::Stopwatch::start();
         let wasm = self
