@@ -2101,3 +2101,34 @@ The remaining honest target is the register traffic itself -- keeping guest
 registers in wasm locals across a call rather than writing them to the
 context and reading them back -- which is #15 and is a change to what crosses
 a boundary, not to how many boundaries there are.
+
+## zstd: one deadlock, and the translated code is right
+
+`zstd.sh` is the only real-program test failing, with `every thread is blocked
+on a futex`. It predates this session -- bisected to 5694f33 with the kernel
+wasm rebuilt for each arm, since the shim and the kernel are separate
+artefacts and mismatching them gives a confusing import-type error instead.
+
+The interesting part is what it is *not*. With identical flags gex writes
+243,531 bytes where QEMU writes 269,300, which reads like wrong output until
+the two are compared:
+
+    cmp: EOF on gref.zst after byte 243531, in line 968
+
+No differing byte before the end. gex's output is a byte-exact **prefix** of
+QEMU's: the compression is correct and the tail is lost because the process
+deadlocks before flushing. One defect, not two, and nothing wrong with the
+lifter.
+
+Also worth having: `-T1 --single-thread` still prints the message. So the
+parking is not the worker pool failing to make progress -- with one thread the
+work finishes and something still ends up parked, late, between the last write
+and exit. Teardown of a pool created regardless of the flag is the best guess.
+
+Two lessons for the next investigation of a hang:
+
+* Compare with *matched arguments* before concluding anything about
+  correctness. A size difference between two runs with different flags says
+  nothing, and it nearly bought a codegen hunt that was not needed.
+* A byte-exact prefix is a different failure from a wrong byte, and `cmp`
+  tells the two apart in one command.
