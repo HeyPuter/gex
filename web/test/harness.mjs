@@ -133,7 +133,7 @@ async function closureManifest(stem) {
   return { image: `${base}.wasm`, libs, pins };
 }
 
-function makeServer(root, closureStem) {
+function makeServer(root, closureStem, oneShot = false) {
   // Commands waiting for the page, and the HTTP responses waiting for their
   // results.
   const queue = [];
@@ -230,7 +230,15 @@ function makeServer(root, closureStem) {
 
     if (p === '/control/run') {
       const cmd = url.searchParams.get('cmd') || '';
-      const id = nextId++;
+      // The one-shot page reports id 0 and never pulls a job -- it runs the
+      // program named in its URL and posts the result directly. `nextId`
+      // starts at 1, so waiting on a fresh id there waits for ever:
+      // `apt-get update` against a closure ran its whole ten-process tree,
+      // printed every per-process line, exited, and the harness sat for
+      // eleven more minutes waiting on a result id that nothing would ever
+      // send. It looked exactly like a wedged guest. It was a number that did
+      // not match.
+      const id = oneShot ? 0 : nextId++;
       const answer = new Promise((r) => pending.set(id, r));
       // Fifteen minutes by default. Two was chosen for `ls`; `apt-get update`
       // takes nearly two on its own under Node and more in a browser, and a
@@ -273,7 +281,11 @@ async function start(args) {
     process.exit(2);
   });
 
-  const server = makeServer(root, args.closure ? resolvePath(args.closure) : null);
+  const server = makeServer(
+    root,
+    args.closure ? resolvePath(args.closure) : null,
+    !!args.program,
+  );
   await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
   process.stderr.write(`harness: serving ${DIST} and ${root} on :${PORT}\n`);
 
