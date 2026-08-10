@@ -54,6 +54,20 @@ function adoptAfterTraps() {
 // What a module calls the function that writes its passive element segments
 // into the tables it imports. See `Module::add_fill`.
 const FILL = 'gexfill';
+// And the one a miss can ask for: fill whichever segment holds this slot.
+const FILL_AT = 'gexfillat';
+const FILL_ALL = 'gexfillall';
+
+// Above this, a module's slots are written when a branch asks for them
+// rather than when it is instantiated.
+//
+// Small units are wanted immediately and cost almost nothing to write; the
+// closure's libraries are the expensive ones and are mostly never reached.
+// `libgcrypt` is 303 MiB of wasm and apt runs a sliver of it. Four megabytes
+// is provisional and wants a measurement of what a fill costs per byte --
+// the last number picked without one was sixty-four, against libc's 355
+// segments.
+const FILL_ON_DEMAND_BYTES = 4 << 20;
 
 const DISPATCH_DIR = 0x00100000;
 const LOW_END = DISPATCH_DIR + 0x80000 * 4;
@@ -176,6 +190,9 @@ export class Gex {
   // how many there were. See `#installModuleInner`.
   #installMs = 0;
   #installs = 0;
+  // Instances whose slots have not been written, newest first: a miss asks
+  // each in turn whether it holds the slot. See `fillSlot`.
+  #unfilled = [];
   // The parent's modules, held rather than installed. See `#maybeAdopt`.
   #inherited = [];
   #traps = 0;
@@ -1572,6 +1589,17 @@ export class Gex {
         // million functions and gex emits one per block -- and they have to
         // go in in the order they were emitted, because each one's page
         // assignments are the next one's starting point.
+        // A slot the shim wants written before the guest goes back to it.
+        //
+        // Its module is instantiated and its segments are passive, so the
+        // code is present and simply not in the table yet. Filling here costs
+        // one segment; filling at instantiation cost every block of the
+        // object, in every process.
+        const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
+        if (want >= 0) {
+          this.fillSlot(want >>> 0);
+          e.gex_fill_done();
+        }
         while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
         // The parent's modules go in *after* this Worker's own queue, never
         // between a translation and its install.
@@ -1965,11 +1993,36 @@ export class Gex {
     if (globalThis.GEX_DEBUG_EXIT && this.#installs <= 2) {
       console.error(`[fill] module ${this.#installs}: gexfill ${typeof inst.exports[FILL]}, exports ${Object.keys(inst.exports).slice(0, 4).join(',')}`);
     }
-    if (typeof inst.exports[FILL] === 'function') {
-      // Until it says there are no more. The count is the module's to know:
-      // the image module has one segment and libc's closure module has 355,
-      // and a host that guessed sixty-four left 291 of them unwritten -- the
-      // guest trapped on `unreachable` the first time it branched into one.
+    // Written now, or when a branch asks for them.
+    //
+    // The module decides, not the host: `gexfillat` exists only on one whose
+    // segments are passive, and a module that exports it must not be written
+    // eagerly or the deferral buys nothing. Two thresholds would eventually
+    // disagree, and the failure is a guest branching into a slot nobody
+    // wrote.
+    //
+    // A big module is the whole reason the segments are passive: it is
+    // instantiated once per guest process, and writing every block of it into
+    // every process's table is 1.2 to 2.2 seconds of an apt run, nearly all
+    // of it slots for code that process never reaches. A small unit is wanted
+    // immediately and costs nothing, so it is written here and forgotten.
+    if (typeof inst.exports[FILL_AT] === 'function') {
+      this.#unfilled.unshift(inst);
+      // And tell the shim there is now something worth asking for. Until a
+      // module is deferred, the miss path must not spend a trap per page
+      // asking a host that has nothing to give: that cost `apt-get update`
+      // 114 seconds against 82.
+      e.gex_fill_possible?.(1);
+    } else if (typeof inst.exports[FILL_ALL] === 'function') {
+      // One crossing, not one per segment. A module has as many as 355, and
+      // calling in for each cost apt 30 seconds against instantiation doing
+      // the same writes inside the engine.
+      inst.exports[FILL_ALL]();
+    } else if (typeof inst.exports[FILL] === 'function') {
+      // Until it says there are no more. The count is the module's own: the
+      // image module has one segment and libc's closure module has 355, and a
+      // host that guessed sixty-four left 291 of them unwritten -- the guest
+      // trapped on `unreachable` the first time it branched into one.
       for (let seg = 0; inst.exports[FILL](seg); seg++);
     }
     // Nothing to wire up below, for a module this translator built.
@@ -1993,6 +2046,23 @@ export class Gex {
       if (packed < 0) continue;
       tables[packed >>> 24].set(packed & 0xffffff, inst.exports[name]);
     }
+  }
+
+  /**
+   * Write the slots around `slot`, from whichever unfilled module holds them.
+   *
+   * Answers whether anybody did. A module that has never been asked for a
+   * slot it holds is the point of the exercise -- 303 MiB of `libgcrypt`
+   * whose blocks this process will never branch into stays unwritten.
+   *
+   * Newest first, because a process that has just installed a module is
+   * usually about to branch into it.
+   */
+  fillSlot(slot) {
+    for (const inst of this.#unfilled) {
+      if (inst.exports[FILL_AT](slot)) return true;
+    }
+    return false;
   }
 
   /** Every dispatch table the guest module exports, in index order. */

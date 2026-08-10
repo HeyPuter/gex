@@ -669,6 +669,121 @@ impl Module {
         self.elements.push(seg);
     }
 
+    /// Declare, define and export `gexfillall`, which writes every one of this
+    /// module's passive segments in a single call.
+    ///
+    /// One call, not one per segment. Filling by segment index costs a
+    /// crossing into wasm for each, and a module has as many as 355 of them:
+    /// `apt-get update` went from 82 seconds to 112 filling that way, because
+    /// what an active segment did inside the engine was now thousands of
+    /// calls from JavaScript. This is what an eager fill should use; the
+    /// per-slot form is for the demand path, where the crossing is paid once
+    /// per page that is actually reached.
+    pub fn add_fill_all(&mut self, void_ty: u32) -> Option<u32> {
+        let passive: Vec<(u32, u32, u32, u32)> = self
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.passive)
+            .map(|(i, e)| (i as u32, e.table, e.offset, e.funcs.len() as u32))
+            .collect();
+        if passive.is_empty() {
+            return None;
+        }
+        let idx = self.declare_func(void_ty);
+        let mut b = Vec::new();
+        b.push(0x00); // no locals
+        for (seg, table, offset, len) in &passive {
+            b.push(op::I32_CONST);
+            write_i32(&mut b, *offset as i32);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, 0);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, *len as i32);
+            b.push(op::MISC_PREFIX);
+            write_u32(&mut b, 12); // table.init
+            write_u32(&mut b, *seg);
+            write_u32(&mut b, *table);
+        }
+        b.push(op::END);
+        let mut sized = Vec::with_capacity(b.len() + 5);
+        write_u32(&mut sized, b.len() as u32);
+        sized.extend_from_slice(&b);
+        self.define_func(idx, sized);
+        self.export(gex_abi::exports::FILL_ALL, ExportKind::Func, idx);
+        Some(idx)
+    }
+
+    /// Declare, define and export `gexfillat`, which writes whichever of this
+    /// module's passive segments holds a given slot.
+    ///
+    /// The companion to `gexfill`, and the one a demand-filled table wants.
+    /// A dispatch miss knows a slot, not a segment index, and which segment
+    /// holds a slot is the module's business -- the host asking that question
+    /// is how the first attempt at this got a count of sixty-four against
+    /// `libc`'s 355.
+    ///
+    /// A linear scan over the segments: perhaps 355 compares, once per page
+    /// that is actually branched into, against writing every block of the
+    /// object into a table in every process that maps it.
+    ///
+    /// Answers 1 if this module held the slot and filled its segment, 0 if
+    /// the slot is somebody else's.
+    pub fn add_fill_at(&mut self, ty: u32) -> Option<u32> {
+        let passive: Vec<(u32, u32, u32, u32)> = self
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.passive)
+            .map(|(i, e)| (i as u32, e.table, e.offset, e.funcs.len() as u32))
+            .collect();
+        if passive.is_empty() {
+            return None;
+        }
+        let idx = self.declare_func(ty);
+        let mut b = Vec::new();
+        b.push(0x00); // no locals
+        for (seg, table, offset, len) in &passive {
+            // if (slot >= offset && slot < offset + len)
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 0);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, *offset as i32);
+            b.push(0x4f); // i32.ge_u
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 0);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, (*offset + *len) as i32);
+            b.push(0x49); // i32.lt_u
+            b.push(0x71); // i32.and
+            b.push(op::IF);
+            b.push(0x40); // void
+            b.push(op::I32_CONST);
+            write_i32(&mut b, *offset as i32);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, 0);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, *len as i32);
+            b.push(op::MISC_PREFIX);
+            write_u32(&mut b, 12); // table.init
+            write_u32(&mut b, *seg);
+            write_u32(&mut b, *table);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, 1);
+            b.push(op::RETURN);
+            b.push(op::END); // if
+        }
+        b.push(op::I32_CONST);
+        write_i32(&mut b, 0);
+        b.push(op::END); // the function
+        let mut sized = Vec::with_capacity(b.len() + 5);
+        write_u32(&mut sized, b.len() as u32);
+        sized.extend_from_slice(&b);
+        self.define_func(idx, sized);
+        self.export(gex_abi::exports::FILL_AT, ExportKind::Func, idx);
+        Some(idx)
+    }
+
     /// Declare, define and export `gexfill`, which writes this module's
     /// passive element segments into the tables it imports.
     ///

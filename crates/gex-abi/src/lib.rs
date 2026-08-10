@@ -488,6 +488,12 @@ pub mod exports {
     /// guest process, so this is how a module's blocks reach a table without
     /// every process paying for every block.
     pub const FILL: &str = "gexfill";
+    /// Writes whichever passive segment holds a given dispatch slot, which is
+    /// the question a miss can actually ask. See `Module::add_fill_at`.
+    pub const FILL_AT: &str = "gexfillat";
+    /// Writes every passive segment in one call, which is what an eager fill
+    /// wants: a crossing per segment costs more than the writes.
+    pub const FILL_ALL: &str = "gexfillall";
 
     /// The rest of them. There is more than one because V8 caps a table at
     /// ten million entries and a real application needs more; see

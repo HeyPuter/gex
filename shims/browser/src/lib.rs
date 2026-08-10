@@ -2719,6 +2719,53 @@ pub extern "C" fn gex_reset_directory() -> u32 {
     n
 }
 
+/// A dispatch slot the host is being asked to write, or -1.
+///
+/// A module's element segments are passive, so its blocks reach the table
+/// only when somebody calls `gexfillat`. When a branch misses on a page this
+/// process already has a base for, the code exists in a module this process
+/// holds and simply has not been written down: the right answer is to ask for
+/// that slot, not to serve the object again or lift the block a second time.
+static FILL_WANTED: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+/// Pages already asked about, so one nobody can fill is asked once and then
+/// falls through to the ordinary path. Without this a page whose base came
+/// from a module this process does not hold would ask for ever.
+static FILL_ASKED: SingleThreaded<std::collections::BTreeSet<u64>> =
+    SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
+
+/// Whether the host is holding any module unwritten.
+///
+/// Without this the miss path asks for a fill on the first miss of every
+/// page whose base it already has -- a trap and a round trip into JavaScript
+/// -- and on the runtime path there is never anything to fill, because those
+/// units are small and written the moment they are installed. It cost
+/// `apt-get update` 114 seconds against 82. The host sets it when it first
+/// defers a module, so a run with nothing deferred behaves exactly as it did.
+static FILL_POSSIBLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The host is holding a module whose slots are not written yet.
+#[no_mangle]
+pub extern "C" fn gex_fill_possible(on: i32) {
+    FILL_POSSIBLE.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The slot the host should write, or -1 if it is not being asked.
+#[no_mangle]
+pub extern "C" fn gex_fill_wanted() -> i64 {
+    FILL_WANTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The host has answered. Nothing rides on whether it succeeded: a page it
+/// could not fill has been recorded as asked, so the next miss on it takes
+/// the ordinary path.
+#[no_mangle]
+pub extern "C" fn gex_fill_done() {
+    FILL_WANTED.store(-1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The directory the guest starts in, staged until it is loaded.
 static CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
 
@@ -6060,8 +6107,24 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // identity is asked about an address, because that is what names a
         // mapping.
         let page = gex_abi::dispatch_page(pc);
-        if h.jit.page_table.lookup(page).is_some() {
+        if let Some(base) = h.jit.page_table.lookup(page) {
             h.jit.reuse_have += 1;
+            // This process has a base for the page, so a module it holds
+            // covers this code and the slot is merely unwritten -- the
+            // segments are passive and nobody has asked for them yet. Ask,
+            // and come back to the same address once the host has.
+            //
+            // Once per page: if no module the host holds answers to that
+            // slot, the next miss falls through to serving or lifting, which
+            // is what happened before any of this existed.
+            if FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed)
+                && FILL_ASKED.0.borrow_mut().insert(page)
+            {
+                FILL_WANTED.store(base as i64, std::sync::atomic::Ordering::Relaxed);
+                set_resume(pc);
+                set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+                return true;
+            }
         }
         // Ask even when the page already has a base. Having one does not mean
         // having this block: discovery finds the blocks it can reach from

@@ -129,6 +129,18 @@ impl std::fmt::Debug for Refill {
 /// process pays for one or two.
 const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 256;
 
+/// Above this many blocks, a module's element segments are passive and it
+/// carries the fill helpers; below it, they are active and it carries none.
+///
+/// The two kinds of module want opposite things. A closure library is
+/// instantiated once per guest process and mostly never reached -- 303 MiB of
+/// `libgcrypt` for the sliver of it apt calls -- so writing its slots on
+/// demand is worth a great deal. A unit the runtime translator emits is small
+/// and immediately wanted, and there are thousands of them in a run, so the
+/// helpers are pure compile cost: emitting them everywhere took `apt-get
+/// update` from 82 seconds to 114.
+const BIG_BLOCKS: usize = 4096;
+
 impl Default for PageTable {
     fn default() -> PageTable {
         PageTable::from_entries(&[], 0)
@@ -838,7 +850,12 @@ impl ModuleBuilder {
                         // instantiate, nearly all of it slots for code the
                         // process never reached.
                         //
-                        passive: true,
+                        // Only on a module big enough for that to be the
+                        // shape of the cost. A runtime unit is a couple of
+                        // thousand blocks, wanted immediately, and making
+                        // its segments passive cost `apt-get update` 32
+                        // seconds against 82 -- see the helpers below.
+                        passive: n_blocks > BIG_BLOCKS,
                     });
                 }
             }
@@ -859,9 +876,21 @@ impl ModuleBuilder {
             next_slot: self.page_table.slots(),
             n_blocks,
         };
-        // The filler, now that every segment this module has is known.
-        let void_ty = self.m.func_type(FuncType::new(vec![ValType::I32], vec![ValType::I32]));
-        self.m.add_fill(void_ty);
+        // The fillers, now that every segment this module has is known --
+        // and only on a module whose segments are passive, because they are
+        // three more functions for the engine to compile in every process
+        // that instantiates it. `gexfillat` on libc is 355 range compares.
+        // An `apt-get update` installs thousands of runtime units, and
+        // carrying the helpers on all of them was the whole of the 32-second
+        // regression: not the passive segments, not the crossing per
+        // segment, both of which were measured and cleared.
+        if n_blocks > BIG_BLOCKS {
+            let void_ty = self.m.func_type(FuncType::new(vec![ValType::I32], vec![ValType::I32]));
+            self.m.add_fill(void_ty);
+            self.m.add_fill_at(void_ty);
+            let no_args = self.m.func_type(FuncType::new(vec![], vec![]));
+            self.m.add_fill_all(no_args);
+        }
         let started = crate::par::Stopwatch::start();
         let wasm = self
             .m
