@@ -1725,9 +1725,20 @@ export class Gex {
           // tables can be measured. Without this the only way to tell a slot
           // that was never grown to from a slot that was never filled is to
           // guess, and they have completely different causes.
-          const where = ask(e.gex_current_pc, (pc) => {
+          // The address `enter` was *called with*, not the one in the saved
+          // context.
+          //
+          // `enter(ctx, pc)` dispatches on its argument, so when it traps on
+          // a table the entry that failed is that page's -- and the context's
+          // PC field is whatever the guest last wrote there, which after an
+          // `execve` or a thread switch is a different address entirely. Two
+          // rounds of this hunt were spent on entries that were in range
+          // because they belonged to a page that was not the one being
+          // dispatched.
+          const where = ask(() => pc, (entered) => {
             if (!/table index/.test(err.message)) return '';
-            const guest = pc < 0n ? pc + (1n << 64n) : pc;
+            const raw = BigInt(entered);
+            const guest = raw < 0n ? raw + (1n << 64n) : raw;
             const page = Number(guest >> 12n);
             const dir = new DataView(this.#memory.buffer).getUint32(DISPATCH_DIR + page * 4, true);
             const tables = this.#dispatchTables();

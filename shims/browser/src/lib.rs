@@ -5868,6 +5868,17 @@ fn finish_parked(
 /// visible; `gex_handoff` reads and clears it.
 fn trap() -> ! {
     HANDOFF.with(|c| c.set(true));
+    // This *is* how a syscall returns when it redirects, so the guest is no
+    // longer inside one.
+    //
+    // `InSyscall`'s `Drop` cannot say so: a wasm trap aborts rather than
+    // unwinds, which is exactly the property that makes the flag trustworthy
+    // for a *crash* inside a handler -- and exactly what makes it a lie here,
+    // where trapping is the ordinary way out of `execve`, a dispatch miss and
+    // a thread switch. Left unset, every crash after the first `execve`
+    // reported itself as being inside syscall 221, and that sent the hunt for
+    // the demo site's crash into `do_exec` twice.
+    IN_SYSCALL.store(false, std::sync::atomic::Ordering::Relaxed);
     warch::unreachable()
 }
 
