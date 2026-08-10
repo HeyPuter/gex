@@ -193,6 +193,9 @@ export class Gex {
   // Instances whose slots have not been written, newest first: a miss asks
   // each in turn whether it holds the slot. See `fillSlot`.
   #unfilled = [];
+  // Fill requests answered, and requests nobody could answer.
+  #filled = 0;
+  #unanswered = 0;
   // The parent's modules, held rather than installed. See `#maybeAdopt`.
   #inherited = [];
   #traps = 0;
@@ -402,6 +405,9 @@ export class Gex {
   get installMillis() { return Math.round(this.#installMs); }
   /** How many modules that was. */
   get installCount() { return this.#installs; }
+
+  /** Fill requests answered, and requests nobody could answer. */
+  get fillStats() { return { filled: this.#filled, unanswered: this.#unanswered }; }
 
   /**
    * Read a file back out of the guest's filesystem, or null if it is not
@@ -2066,7 +2072,23 @@ export class Gex {
    */
   fillSlot(slot) {
     for (const inst of this.#unfilled) {
-      if (inst.exports[FILL_AT](slot)) return true;
+      if (inst.exports[FILL_AT](slot)) {
+        this.#filled++;
+        return true;
+      }
+    }
+    // A request nobody can answer is the interesting one, and there should be
+    // almost none: the shim only asks about a page it already has a base for,
+    // which means a module it holds covers that code. If these are common the
+    // deferred set is wrong -- a module was installed somewhere its slots are
+    // wanted and not kept, or a forked child inherited a directory naming
+    // pages no module of its own can fill. Capped, because a flood of them
+    // would be the failure rather than the diagnosis.
+    if (this.#unanswered++ < 24) {
+      console.error(
+        `[fill] nothing holds entry ${slot >>> 0}: ` +
+          `${this.#unfilled.length} deferred modules, ${this.#filled} filled`,
+      );
     }
     return false;
   }

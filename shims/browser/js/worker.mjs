@@ -390,6 +390,7 @@ async function handle(msg) {
       // whether it lifted them or took them from another process.
       installMs: gex.installMillis,
       installs: gex.installCount,
+      fill: gex.fillStats,
       // How the shared-slot lookup went: pages this process already had,
       // pages the identity map knew, pages it did not, and pages with no
       // identity at all. The question is why a child re-lifts its parent's

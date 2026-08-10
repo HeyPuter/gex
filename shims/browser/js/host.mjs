@@ -349,6 +349,9 @@ export class ProcessHost {
           console.log(
             `[gex] pid ${pid}: ${m.millis}ms translating ${m.blocks} blocks` +
               (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` : '') +
+              (m.fill && (m.fill.filled || m.fill.unanswered)
+                ? `, fill ${m.fill.filled} answered ${m.fill.unanswered} not`
+                : '') +
               (m.reuse
                 ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]}` +
                   ` noident=${m.reuse[3]} served=${m.reuse[4]} stored=${m.reuse[5]} writable=${m.reuse[9]} nocode=${m.reuse[10]}`
