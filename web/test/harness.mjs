@@ -286,6 +286,12 @@ async function start(args) {
     (args.wisp ? `&wisp=${encodeURIComponent(args.wisp)}` : '') +
     (args.closure ? '&closure=1' : '') +
     (args.program ? `&program=${encodeURIComponent(args.program)}` : '') +
+    // The one-shot path awaits the guest and nothing else, so without a
+    // deadline a wedged program never reports and the run has to be found and
+    // killed by hand. Three closure attempts cost ten minutes each that way,
+    // and `--wait` looked like it was being ignored because on that path it
+    // was: it reached `/control/run`, which the one-shot page never asks.
+    (args.wait ? `&wait=${encodeURIComponent(args.wait)}` : '') +
     (args.progArgs || []).map((a) => `&arg=${encodeURIComponent(a)}`).join('') +
     (args.recompile !== undefined ? `&recompile=${encodeURIComponent(args.recompile)}` : '');
   const chrome = spawn(

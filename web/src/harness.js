@@ -208,7 +208,12 @@ export async function start() {
     let status = -1;
     let failed = null;
     try {
-      const r = await runProgram(io.term, {
+      // Against a deadline, because this path awaits the guest and nothing
+      // else. A program that wedges -- and a closure run does, see #105 --
+      // otherwise leaves the harness waiting for ever with no output and no
+      // diagnosis, which is a worse failure than a wrong answer: the run has
+      // to be noticed, found and killed by hand.
+      const running = runProgram(io.term, {
         elf: exe,
         files,
         args: argv,
@@ -219,6 +224,16 @@ export async function start() {
         network,
         closure,
       });
+      const limitMs = Number(params.get('wait') || 0);
+      const r = limitMs
+        ? await Promise.race([
+            running,
+            new Promise((_, bad) => {
+              const fire = () => bad(new Error(`the program did not finish in ${limitMs}ms`));
+              globalThis.setTimeout(fire, limitMs);
+            }),
+          ])
+        : await running;
       status = r.status;
     } catch (e) {
       failed = String((e && e.stack) || e);
