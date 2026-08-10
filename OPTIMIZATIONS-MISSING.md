@@ -1935,3 +1935,57 @@ emulation pathology, so what matters is the multiplier over native, and
 nothing here measures that: the rootfs is aarch64 and the host is x86, so a
 ratio needs real hardware or qemu-user. Without it there is no telling forty
 seconds of guest time from four seconds of work done ten times too slowly.
+
+## The bounds guard costs up to 54 per cent
+
+`GEX_UNSAFE_NO_GUARD=1` exists to price the guard and had not been priced on
+the browser. It is expensive. Same host, same session, nbench ratios against
+QEMU measured in each run:
+
+| KERNEL | with guard | without | |
+|---|---|---|---|
+| STRING SORT | 2.86x | **4.40x** | +54% |
+| BITFIELD | 1.95x | 2.41x | +24% |
+| HUFFMAN | 1.61x | 1.99x | +24% |
+| LU DECOMPOSITION | 8.16x | 9.76x | +20% |
+| FOURIER | 17.90x | 20.30x | +13% |
+| NEURAL NET | 18.08x | 20.48x | +13% |
+| NUMERIC SORT | 1.12x | 1.25x | +12% |
+| ASSIGNMENT | 1.01x | 1.08x | +7% |
+| IDEA | 1.14x | 1.16x | +2% |
+| FP EMULATION | 1.01x | 1.01x | 0 |
+
+The note in `tier1.rs` says removing the guard "bought nothing", and that is
+true of **memory64** -- the engine emits its own check, so the trade was even.
+It is not true of the guard itself, and the two had collapsed into one claim.
+Dropping it is worth more than any single change measured this week.
+
+`GEX_UNSAFE_NO_GUARD` is still not shippable: an address above `GUEST_LIMIT`
+would alias low memory silently instead of faulting.
+
+### Why it costs that much, and where the safe version is
+
+Eight instructions per access -- `local.set`, `local.get`, `i32.wrap`,
+`i32.const`, `local.get`, `i64.const`, `i64.lt_u`, `select` -- and the scratch
+local is the expensive part, not the arithmetic: it forces a value through
+memory-shaped state that V8 would otherwise keep in a register and reason
+about.
+
+Making it cheaper instruction-by-instruction is not the answer; several
+encodings were considered and none beat eight. **Eliminating it where it
+cannot fire is.** The guard exists only to catch an effective address that
+does not fit in 32 bits: for anything below 2^32 the `i32.wrap` is the
+identity and the engine's own bounds check already faults, because the
+memory is exactly `GUEST_LIMIT` bytes.
+
+So the question is which accesses can provably not exceed 2^32:
+
+1. **Constants already skip it** -- `emit_address` folds them.
+2. **Stack-relative accesses are the bulk of the rest**, and they can be made
+   provable rather than proved: mask `sp` (and `x29`) to `GUEST_LIMIT` on
+   every *write*. Writes to the stack pointer are rare; reads through it are
+   everywhere. After that `[sp, #imm]` is a constant offset from a value known
+   to be in range and needs no guard at all.
+3. Anything else wants real value-range tracking, which is #15's territory.
+
+(2) is the one to do, and the measurement above says what it is worth.
