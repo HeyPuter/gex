@@ -157,7 +157,18 @@ function suppliedArities(source) {
 /** Everything the glue reaches for by name, less what it guards with `?.`. */
 function calledExports(source) {
   const out = new Set();
-  for (const m of source.matchAll(/exports\.(gex_[a-z0-9_]+)(\??)\.?/g)) {
+  // `e.gex_...` as well as `exports.gex_...`.
+  //
+  // The glue almost always aliases -- `const e = this.#shim.exports` -- and
+  // there are 133 calls through `e` against 46 through `exports`, so matching
+  // only the long form checked a quarter of them and reported the count as
+  // though it were all. A misplaced `#[no_mangle]` silently un-exported
+  // `gex_jit_pending_ptr`, this check said "21 exports present" and passed,
+  // and the page died on the first dispatch miss.
+  //
+  // Optional calls -- `e.gex_thing?.()` -- are deliberately skipped: they are
+  // how the glue tolerates an older shim that does not have the export yet.
+  for (const m of source.matchAll(/\b(?:e|exports)\.(gex_[a-z0-9_]+)(\??)/g)) {
     if (m[2] !== '?') out.add(m[1]);
   }
   return out;
