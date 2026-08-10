@@ -1795,3 +1795,49 @@ idea**, not a speculative one: recompiling a whole library to satisfy one
 miss is the single largest measured cost in the run. The closure work just
 finished is the same insight arrived at from the other side: it wins by never
 writing slots for code the process does not reach.
+
+## A shell can boot on a closure now, and then execve throws it away
+
+`harness.mjs once --closure` had never worked. Three things were wrong and
+each hid the next.
+
+**The build flag.** The closure was built with a shared memory while the
+browser runs every process on a plain one -- the shared shim is for guest
+threads, which are not Workers yet. Every library failed to instantiate with
+`mismatch in shared state of memory, declared = 1, imported = 0`. The note on
+file said the pins collided with the shell's placement; they never did.
+Rebuilt `--no-shared-memory`, a 77 MB dash closure boots a shell and answers
+`echo` and `ls /bin` in 153ms.
+
+**The transfer.** 694 MB of `WebAssembly.Module` in one `postMessage` is
+`DataCloneError: Data cannot be cloned, out of memory`. A `Module` is
+structured-cloneable and the engine shares the compiled code, which is why
+the design sends modules rather than bytes -- true, and it does not make the
+clone free. One library per message crosses fine, and the Worker waits for
+the count it was promised before running the guest. Installing them *after*
+the guest starts was tried first and broke the case that already worked: the
+shell begins executing against a layout whose libraries have no slots, and
+the 1.65s dash boot became no prompt at all. The clone needed splitting; the
+sequence did not.
+
+**And what is left.** `apt-get update` now runs under a shell from a closure
+-- rc=0, one index, zero crashes -- and is *slower* than not using one:
+
+| | wall | blocks translated |
+|---|---|---|
+| runtime translation | 79,622 ms | 3,121,058 |
+| dash+apt-get closure | 112,904 ms | 3,584,956 |
+| ...plus the five methods | 121,980 ms | 3,431,098 |
+
+Adding ten more objects to the closure moved the block count four percent,
+which is how the last theory died. The log says what is actually happening:
+a dash-only closure prints `exec: 394 closure pages kept` when the shell execs
+something, and in both apt runs **that line never appears at all**. The
+libraries are installed at boot, the shell execs `apt-get`, and the directory
+entries pointing at them are gone. Every process then translates libapt from
+nothing.
+
+Which is also why the two configurations that work, work: pid 1 of a dash
+closure never execs before the prompt, and the 51.6s one-shot path runs a
+single program with no exec in it. Neither has ever exercised the thing that
+is broken. See #107.
