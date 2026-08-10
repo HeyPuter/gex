@@ -6107,24 +6107,36 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // identity is asked about an address, because that is what names a
         // mapping.
         let page = gex_abi::dispatch_page(pc);
-        if let Some(base) = h.jit.page_table.lookup(page) {
+        if h.jit.page_table.lookup(page).is_some() {
             h.jit.reuse_have += 1;
-            // This process has a base for the page, so a module it holds
-            // covers this code and the slot is merely unwritten -- the
-            // segments are passive and nobody has asked for them yet. Ask,
-            // and come back to the same address once the host has.
-            //
-            // Once per page: if no module the host holds answers to that
-            // slot, the next miss falls through to serving or lifting, which
-            // is what happened before any of this existed.
-            if FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed)
-                && FILL_ASKED.0.borrow_mut().insert(page)
-            {
-                FILL_WANTED.store(base as i64, std::sync::atomic::Ordering::Relaxed);
-                set_resume(pc);
-                set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-                return true;
-            }
+        }
+        // Before anything else, ask whether a module this process already
+        // holds covers this page and has simply not written its slots.
+        //
+        // The page, not a directory entry. A miss knows the address it
+        // faulted on and therefore always knows the page; it knows an entry
+        // only for a page some module has already claimed here, and that is a
+        // tiny minority -- 109 of them against 116,442 misses in an
+        // `apt-get update` against a closure. Gating the ask on an entry left
+        // every other miss to serve or lift, so a process re-translated the
+        // code its own closure held, and then had two sets of blocks for one
+        // address range: a directory naming one and a table holding the
+        // other, which is an illegal instruction rather than a clean trap.
+        //
+        // Before, not after, the ordinary paths. Filling a slot from a module
+        // already in this process is strictly cheaper than serving an object
+        // or lifting a block, and it is also the only one of the three that
+        // cannot introduce a second translation of the same address.
+        //
+        // Once per page: a page nobody can fill falls through on the next
+        // miss to what happened before any of this existed.
+        if FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed)
+            && FILL_ASKED.0.borrow_mut().insert(page)
+        {
+            FILL_WANTED.store(page as i64, std::sync::atomic::Ordering::Relaxed);
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+            return true;
         }
         // Ask even when the page already has a base. Having one does not mean
         // having this block: discovery finds the blocks it can reach from

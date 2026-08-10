@@ -140,13 +140,20 @@ const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 256;
 /// helpers are pure compile cost: emitting them everywhere took `apt-get
 /// update` from 82 seconds to 114.
 ///
-/// Set out of reach for now, because a closure whose libraries have passive
-/// segments does not run. Measured, three ways, on the same 19-object
-/// `--exhaustive` build of apt's closure:
+/// Out of reach because the mechanism is correct but not yet profitable, on
+/// the same 19-object `--exhaustive` build of apt's closure:
 ///
-///     passive, filled on demand    SIGILL after two processes
-///     passive, filled eagerly      three processes, then blocked
-///     active (this)                exit 0, 55,714ms
+///     passive, fill keyed on an entry   SIGILL after two processes
+///     passive, fill keyed on the page   exit 0, 66,204ms, install 46,888ms
+///     active (this)                     exit 0, 55,714ms, install 29,050ms
+///
+/// Keying the fill on the guest page fixed the crash -- a miss always knows
+/// its page and almost never knows an entry -- but the asks still go
+/// unanswered, because only the process that installed the closure keeps its
+/// modules deferred. A forked child installs by another path that fills
+/// eagerly, so its deferred list is empty and every miss it takes asks a
+/// question nobody in that Worker can answer, then translates. 407,588 blocks
+/// against 17,462. The remaining work is in #106: a child has to defer too
 ///
 /// The last is indistinguishable from the closure built before any of this
 /// existed (exit 0, 56,563ms), so nothing else in the emitter is implicated.
@@ -798,7 +805,7 @@ impl ModuleBuilder {
                     passive: false,
                     // The image module's one segment covers the whole table,
                     // not a page, and is never demand filled.
-                    page_entry: 0,
+                    guest_page: 0,
                 });
             }
             Linkage::Shared => {
@@ -886,7 +893,7 @@ impl ModuleBuilder {
                         passive: n_blocks > BIG_BLOCKS,
                         // What `gexfillat` matches a request against. The
                         // whole entry, table index included: see the field.
-                        page_entry: entry,
+                        guest_page: page as u32,
                     });
                 }
             }

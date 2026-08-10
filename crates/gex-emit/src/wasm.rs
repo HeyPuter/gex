@@ -518,19 +518,22 @@ pub struct ElementSegment {
     /// `gexfill` when it wants the slots, which is the seam a demand-filled
     /// table needs.
     pub passive: bool,
-    /// The dispatch directory entry of the guest page this segment covers, or
-    /// zero if it covers no single page.
+    /// The guest page this segment covers -- `pc / DISPATCH_PAGE` -- or zero
+    /// if it covers no single page.
     ///
-    /// This is what `gexfillat` matches on, and it has to be the whole entry
-    /// rather than `offset`. An entry packs a table index above a within-table
-    /// slot; `offset` is only the slot half, and only of the *first translated
-    /// block*, which is not the page base unless that block happens to start
-    /// the page. Matching a caller's entry against `offset` therefore compares
-    /// two different quantities: it missed on essentially every page, so no
-    /// deferred slot was ever written, every branch into one missed again, and
-    /// each of those misses re-served sixteen modules. An `apt-get update`
-    /// installed 179,538 modules instead of 52,708 and took 23 seconds longer.
-    pub page_entry: u32,
+    /// This is what `gexfillat` matches on, and it is deliberately the guest
+    /// page rather than anything about the table. A miss knows the address it
+    /// faulted on and therefore always knows this; it does *not* always know a
+    /// dispatch entry, because an entry only exists once some module of this
+    /// process has claimed the page. Keying the fill on an entry meant a
+    /// process could only ask about pages it had already been told about --
+    /// 109 of them in an `apt-get update` -- and every other miss fell through
+    /// and re-translated code the closure already held, 116,442 blocks of it.
+    ///
+    /// Two sets of blocks for one address range is also why that failed as an
+    /// illegal instruction rather than a clean trap: the directory named one
+    /// and the table held the other.
+    pub guest_page: u32,
 }
 
 /// A memory initialiser.
@@ -747,9 +750,9 @@ impl Module {
             .elements
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.passive && e.page_entry != 0)
+            .filter(|(_, e)| e.passive && e.guest_page != 0)
             .map(|(i, e)| {
-                (i as u32, e.table, e.offset, e.funcs.len() as u32, e.page_entry)
+                (i as u32, e.table, e.offset, e.funcs.len() as u32, e.guest_page)
             })
             .collect();
         if passive.is_empty() {
@@ -758,8 +761,8 @@ impl Module {
         let idx = self.declare_func(ty);
         let mut b = Vec::new();
         b.push(0x00); // no locals
-        for (seg, table, offset, len, page_entry) in &passive {
-            // if (entry == page_entry)
+        for (seg, table, offset, len, guest_page) in &passive {
+            // if (page == guest_page)
             //
             // Equality on the whole directory entry, not a range test on
             // `offset`. `offset` is the within-table slot of this segment's
@@ -770,7 +773,7 @@ impl Module {
             b.push(op::LOCAL_GET);
             write_u32(&mut b, 0);
             b.push(op::I32_CONST);
-            write_i32(&mut b, *page_entry as i32);
+            write_i32(&mut b, *guest_page as i32);
             b.push(0x46); // i32.eq
             b.push(op::IF);
             b.push(0x40); // void
