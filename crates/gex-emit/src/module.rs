@@ -157,7 +157,13 @@ const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 256;
 /// arriving, so its early misses never ask; they translate, and an address
 /// once translated never needs the closure again. Forgiving unfillable pages
 /// changed nothing (83,456ms, 2,639,596 blocks) because only 2 to 17 asks a
-/// process go unanswered. The asks that are missing are the ones never made
+/// process go unanswered.
+///
+/// Treat that block count with suspicion, though: 2,639,578 blocks in 986ms
+/// is 2,675 a millisecond, against 41 a millisecond on the active build. It
+/// cannot be measuring the same work, so something in the deferred path is
+/// counting blocks it did not lift. Wall clock and `installMs` are the two
+/// numbers here that have been checked against each other
 ///
 /// Keying the fill on the guest page fixed the crash -- a miss always knows
 /// its page and almost never knows an entry -- but the asks still go
