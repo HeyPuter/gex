@@ -121,14 +121,42 @@ function hotBlocks(gex) {
   });
 }
 
+// Closure libraries arrive in their own messages, because all of them in the
+// start message will not cross a `postMessage`: eighteen compiled modules is
+// 694 MB and Chromium answers `DataCloneError, out of memory`.
+//
+// They are collected here and installed by `load`, before the guest runs.
+// Installing them *after* it starts was tried and is wrong: the shell begins
+// executing against a layout whose libraries have no slots, and a dash
+// closure that booted in 1.65s stopped printing a prompt at all. The clone
+// had to be split up; the ordering did not.
+const arrived = [];
+let expected = 0;
+let allHere = null;
+let allHereIs = null;
+
+function noteClosureModule(entry) {
+  arrived.push(entry);
+  if (allHereIs && arrived.length >= expected) allHereIs();
+}
+
+/** Every closure library this Worker was promised, once they are all in. */
+function closureModules(n) {
+  expected = n;
+  if (!n || arrived.length >= n) return Promise.resolve(arrived);
+  allHere = allHere ?? new Promise((r) => { allHereIs = r; });
+  if (arrived.length >= expected) allHereIs();
+  return allHere.then(() => arrived);
+}
+
 async function handle(msg) {
   // The first thing this side says. A 694 MB closure never got here: the page
   // had eighteen compiled modules, posted them, and nothing in this Worker
   // ever ran -- so the transfer itself is the suspect, and this is how to
   // tell a slow `postMessage` from a Worker that never woke.
-  if (msg?.kind !== 'stdin') {
-    console.error(`[worker] got ${msg?.kind ?? 'load'}, `
-      + `${(msg?.closure ?? []).length} closure modules`);
+  if (msg?.kind === 'closureModule') {
+    noteClosureModule(msg.entry);
+    return;
   }
   if (msg?.kind === 'stdin') {
     stdinWaiter?.(msg.bytes);
@@ -308,10 +336,17 @@ async function handle(msg) {
         // `closure` arrives at the top level, because it is in the host's
         // `extra` so that a forked child gets it too; everything else about a
         // run arrives in `opts`.
-        { ...(msg.opts ?? {}), closure: msg.closure ?? msg.opts?.closure },
+        {
+          ...(msg.opts ?? {}),
+          // Whatever came in its own message, waited for here rather than
+          // taken from the start message.
+          closure: msg.closure ?? msg.opts?.closure
+            ?? (await closureModules(msg.closureCount ?? 0)),
+        },
       );
       if (!entry) throw new Error('the program could not be loaded');
     }
+
     // Statically recompile each object the guest maps once it proves hot,
     // rather than meeting it one dispatch miss at a time. This is the feature
     // the project exists for and it is off unless asked for.

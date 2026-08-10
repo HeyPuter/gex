@@ -198,6 +198,25 @@ export class ProcessHost {
    * first -- which keeps the stack the module was linked with, and is the one
    * that reports where the array is.
    */
+  /**
+   * Hand a Worker the closure's libraries, one message each.
+   *
+   * Sent after the start message rather than inside it, and never awaited:
+   * the process is already loading, and a library that arrives late costs a
+   * few dispatch misses rather than a boot. Failure of one is reported and
+   * does not stop the others -- a closure short one library still saves
+   * eighteen nineteenths of the translation.
+   */
+  #streamClosure(w, closure) {
+    for (const entry of closure ?? []) {
+      try {
+        w.postMessage({ kind: 'closureModule', entry });
+      } catch (e) {
+        this.#onOutput(2, `gex: a closure library did not reach a worker: ${e.message}\n`, 0);
+      }
+    }
+  }
+
   #nextKernelStack(key) {
     if (!this.#stacks) return undefined;
     const reuse = this.#stacksFree.pop();
@@ -239,10 +258,25 @@ export class ProcessHost {
           // Awaited, because compiling the shim cannot be synchronous in a
           // browser. The Worker is idle until this arrives either way.
           this.#shimModule().then((shimMod) => {
-          console.error(`[host] pid ${pid}: posting ${(this.#extra.closure ?? []).length}`
-            + ' closure modules to the Worker');
-          return w.postMessage({
-            ...this.#extra,
+          // The closure goes after, one library per message.
+          //
+          // All of them at once does not cross: eighteen compiled modules is
+          // 694 MB of `WebAssembly.Module` and Chromium answers
+          // `DataCloneError: Data cannot be cloned, out of memory`, which
+          // arrives as a rejected promise in the page and leaves the Worker
+          // having never woken. A 77 MB closure crossed and a shell booted on
+          // it, so it is size and not the idea.
+          //
+          // The guest runs while they arrive. That is safe because the miss
+          // path already forgives a page whose module has not landed: it asks
+          // once, nobody can fill it, and it asks again when the next
+          // deferred module shows up.
+          const { closure, ...extra } = this.#extra;
+          w.postMessage({
+            ...extra,
+            // How many to wait for. The Worker installs them before it runs
+            // the guest, so it has to know when it has them all.
+            closureCount: (closure ?? []).length,
             ...msg,
             kernelStack: this.#nextKernelStack(pid),
             // Compiled once, here, rather than from bytes in every Worker.
@@ -255,6 +289,7 @@ export class ProcessHost {
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
           });
+          this.#streamClosure(w, closure);
           },
           );
         }

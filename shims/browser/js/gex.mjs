@@ -193,6 +193,8 @@ export class Gex {
   // Instances whose slots have not been written, newest first: a miss asks
   // each in turn whether it holds the slot. See `fillSlot`.
   #unfilled = [];
+  /** Closure libraries that arrived after this process started. */
+  #streamed = 0;
   // Fill requests answered, and requests nobody could answer.
   #filled = 0;
   #unanswered = 0;
@@ -696,6 +698,33 @@ export class Gex {
    * its blocks would go into slots nothing had claimed, and the failure would
    * surface as a branch into the wrong function much later.
    */
+  /**
+   * Install one closure library, arriving after the process is already up.
+   *
+   * The whole closure cannot be handed to a Worker at once: eighteen compiled
+   * modules is 694 MB of `WebAssembly.Module` and `postMessage` answers
+   * `DataCloneError: Data cannot be cloned, out of memory`. They come one at a
+   * time instead, and the guest runs while they arrive -- which is safe
+   * because a page whose module has not landed yet is exactly what the miss
+   * path forgives: it asks once, nobody can fill it, and it asks again when
+   * the next deferred module shows up.
+   */
+  async installClosureModule(entry) {
+    if (!this.#shim || !entry) return false;
+    const meta = entry instanceof Uint8Array ? metadataSection(entry) : entry.meta;
+    if (!meta || !meta.length) return false;
+    const add = this.#shim.exports.gex_add_closure_module;
+    if (!add) return false;
+    const gp = this.#shim.exports.gex_alloc(meta.length) >>> 0;
+    this.#bytes().set(meta, gp);
+    const need = add(gp, meta.length) >>> 0;
+    this.#shim.exports.gex_free?.(gp, meta.length);
+    if (!need) return false;
+    await this.#installModule(entry instanceof Uint8Array ? entry : entry.mod, need);
+    this.#streamed++;
+    return true;
+  }
+
   async #installClosure() {
     const add = this.#shim.exports.gex_add_closure_module;
     if (!add) return;
