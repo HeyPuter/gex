@@ -287,6 +287,16 @@ for (const id of list) {
   // changes one thing about a run should not need a code change to run.
   const extra = process.env.GEX_QUERY ? `&${process.env.GEX_QUERY}` : '';
   const url = `http://127.0.0.1:${port}/?demo=${DEMOS[id].demo ?? id}&run=1${extra}`;
+  // The command the page was told to run, decoded the way the page decodes
+  // it, so the echo of it can be told apart from what the guest says. See
+  // where `seen` is filled.
+  //
+  // `URLSearchParams` is what the page uses, and it turns `+` into a space --
+  // so `i=$((i+1))` reaches the guest as `i=$((i 1))` and a shell loop
+  // written with one never increments. Two repro runs "passed" that way
+  // before this was noticed, which is worth knowing whenever a `?cmd=`
+  // behaves as though it did nothing.
+  const cmdText = new URLSearchParams(extra.slice(1)).get('cmd') || '';
   let last = '';
   let lastTerminal = '';
   // Every line the terminal has ever shown, in the order it first appeared.
@@ -317,8 +327,27 @@ for (const id of list) {
       // Kept so that a failure can show what the guest actually said. The
       // tick line below carries one line; a demo that fails is worth twenty.
       lastTerminal = terminal || lastTerminal;
+      // The page's own echo of the command is not the guest saying anything.
+      //
+      // `bootDebian` prints `command: <cmd>` before it runs, and the history
+      // below is what every `want` is tested against -- so a demo driven with
+      // `?cmd=...; echo GEX-CMD-DONE` passes the instant the page prints the
+      // command line, before the guest has run an instruction. Every
+      // `debian-cmd` result taken that way is worthless, including two that
+      // were being used to rule a crash out.
+      //
+      // This is the same defect the file already records for `debian`'s `$`
+      // prompt, in a second place: a check that can pass without the guest is
+      // worse than no check.
+      // Matched by content rather than by position, because xterm wraps: the
+      // command runs over several rows and every row after the first starts
+      // at column zero, so there is no way to tell a continuation from output
+      // by looking at the line alone. Every fragment of the echo *is* a
+      // substring of the command, though, and nothing the guest prints has to
+      // be.
       for (const line of (terminal || '').split('\n')) {
         if (!line.trim() || seen.has(line)) continue;
+        if (cmdText && cmdText.includes(line.trim())) continue;
         seen.add(line);
         // `GEX_ECHO` prints every line the guest says, once, as it first
         // appears. The tick below carries one line per five seconds, which
