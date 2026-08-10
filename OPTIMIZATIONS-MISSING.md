@@ -1689,3 +1689,44 @@ closure predates passive segments, so the run above still translates at
 runtime. The closure is where instantiate was 1.2-2.2s *per process* for code
 the process never reaches -- that measurement is next, and it needs the
 closure rebuilt with the current emitter.
+
+## The closure is the fast path, and demand filling works everywhere but the browser
+
+With the emitter's passive-segment gate lifted, `apt-get update` against a
+19-object `--exhaustive` closure runs in Chromium in **55.7s** against the
+runtime-translation path's **81.7s**. Static recompilation wins by a third,
+which is the claim this project exists to make, and it is now measured rather
+than assumed.
+
+Of those 55.7 seconds, **29.0** are instantiation. That is what demand filling
+is for: a closure library is instantiated once per guest process and almost
+none of it is ever reached.
+
+The mechanism is built and it is correct. Under `run-node.mjs` -- the same
+glue, deferral on, the same passive closure -- apt completes with `rc=0`, all
+ten processes, the 587 kB index fetched and read, and **zero blocks
+translated**. Every branch found its slot.
+
+In Chromium the same artifact dies: SIGILL after two processes with deferral,
+a stall after three without. Two processes is the first fork, and the browser
+is the only host that gives each guest process its own Worker, its own memory
+and its own tables. A forked child adopts the parent's dispatch directory --
+so the child *knows* page X is at entry E -- while its own copy of the module
+is deferred and unfilled, and `FILL_ASKED` in the parent has already recorded
+that page as asked. A branch into it is an unwritten slot, which is an illegal
+instruction. That is #106 and it is one experiment from being settled.
+
+Three things this cost, worth not repeating:
+
+* The measurement had to be `--exhaustive`. A closure built without it covers
+  so little that the run falls back to translating 225,722 blocks -- against
+  17,414 for the exhaustive one -- and then trips #96 and exits -1. The
+  artifact was blamed for the code twice.
+* `gexfillall` was suspected of filling short. `tools/segcheck.py` settles that
+  kind of question offline in a second: it parses a module and reports segments
+  against `table.init` count. Every library is exact -- 99/99, 413/413,
+  429/429, 355/355.
+* Reproducing under node first would have been faster than any of it. The node
+  host is a debug adapter and not what this project optimises, but it runs the
+  same glue, and "works there, fails in the browser" is worth more than four
+  browser runs.
