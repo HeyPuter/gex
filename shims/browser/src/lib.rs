@@ -782,6 +782,7 @@ impl FileHandle for StdinQueue {
 /// a shell script that wants both in its first two lines.
 fn mount_devices(kernel: &mut Kernel) -> Option<crate::virgl::VirglDevice> {
     let mut devfs = gex_kernel::vfs::DevFs::new();
+    devfs.add("tty", Arc::new(Tty));
     if crate::gl::have_gl() {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
     }
@@ -852,6 +853,52 @@ fn install_console(kernel: &mut Kernel) {
             true,
         );
         let _ = kernel.fds.install(fd, f, false);
+    }
+}
+
+/// `/dev/tty`: the process's controlling terminal, readable and writable.
+///
+/// A shell with job control opens this before it will run anything. dash's
+/// `setjobctl` opens `_PATH_TTY`, and when the open fails it falls back to
+/// whichever of the first three descriptors is a terminal and dups that out
+/// of the way -- and *that* is the descriptor a forked child could not
+/// rebuild. Providing the device is the honest fix as well as the cheaper
+/// one: `/dev/tty` is what `less`, `ssh` and `sudo` reach for too, and none
+/// of them accepts a substitute.
+#[derive(Debug)]
+struct Tty;
+
+impl FileHandle for Tty {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        STDIN.read_at(offset, buf)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> SysResult {
+        Console { fd: 1 }.write_at(offset, buf)
+    }
+
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata {
+            file_type: gex_kernel::vfs::FileType::CharDevice,
+            size: 0,
+            mode: 0o620,
+            ino: 3,
+            mtime: 0,
+        })
+    }
+
+    fn is_stream(&self) -> bool {
+        true
+    }
+
+    /// The whole point of the device: the kernel answers `TIOCSPGRP` and the
+    /// rest only for a descriptor that says it is a terminal.
+    fn is_tty(&self) -> bool {
+        unsafe { STDIN_TTY }
+    }
+
+    fn poll_readable(&self) -> bool {
+        STDIN.poll_readable()
     }
 }
 
@@ -3673,8 +3720,8 @@ fn stage_fork_fds(h: &Host) {
             let write = file.writable;
             unsafe { k_pipe_open_end(id, write as i32) };
         } else if !file.path.starts_with('/') {
-            // Not a path and not a pipe: standard input and output, a device,
-            // a socket. Nothing here can rebuild those from a name.
+            // Not a path, not a pipe, and not the terminal: a socket. Nothing
+            // here can rebuild that from a name.
             continue;
         }
         out.push_str(&format!(
@@ -3687,6 +3734,34 @@ fn stage_fork_fds(h: &Host) {
         ));
     }
     *FORK_FDS.0.borrow_mut() = out;
+}
+
+/// The console descriptors, rebuilt in a child from the name alone.
+///
+/// A fork stages each descriptor as a path and the child opens it again, and
+/// that works for a file because a file is bytes on a filesystem both of them
+/// can see. The terminal is not: it is a Worker's own `Console`, and the
+/// three the kernel installs are named after it -- `/dev/stdin` and the rest
+/// -- rather than existing anywhere to be opened.
+///
+/// So a child rebuilt only the descriptors it could *find*, and any other
+/// descriptor pointing at the terminal was dropped on the floor. dash dups
+/// its terminal to fd 10 for job control, and in the child fd 10 was not
+/// there: `tcsetpgrp` returned `EBADF`, and dash treats that as fatal rather
+/// than as a warning. The child died -- at exit status 2, having printed
+/// nothing -- *before* reaching the `execve` it was forked to do.
+///
+/// Which is why no external command has ever run under a shell in the
+/// browser. Every `ls` in a page was a shell that forked, died in the child,
+/// and printed a job-control complaint that read like a cosmetic one.
+fn console_handle(path: &str) -> Option<(Arc<dyn FileHandle>, bool, bool)> {
+    Some(match path {
+        "/dev/stdin" => (Arc::clone(&*STDIN) as Arc<dyn FileHandle>, true, false),
+        "/dev/stdout" => (Arc::new(Console { fd: 1 }), false, true),
+        "/dev/stderr" => (Arc::new(Console { fd: 2 }), false, true),
+        "/dev/tty" => (Arc::new(Tty), true, true),
+        _ => return None,
+    })
 }
 
 /// The pipe id in a path like `pipe:[7]`, if that is what it is.
@@ -3751,12 +3826,24 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                     !write,
                     write,
                 )
+            } else if let Some((handle, readable, writable)) = console_handle(path) {
+                // The terminal, which is this Worker's and not a file. A dup
+                // of it in the parent has to be a dup of it here.
+                gex_kernel::file::OpenFile::new(handle, path.to_string(), flags, readable, writable)
             } else {
+                // Through the child's *own* mounts, not the bare root: `/dev`
+                // and `/proc` are mounted per process, so a descriptor on
+                // `/dev/null` or `/proc/self/maps` could not be found by name
+                // in the filesystem alone and went the same way as the
+                // terminal.
                 use gex_kernel::vfs::FileSystem;
-                let Some(root) = global_root() else { continue };
-                let Ok(handle) = root.open(path.trim_start_matches('/'), flags, 0) else {
-                    continue;
-                };
+                let handle = h.kernel.vfs.open(path, flags, 0).or_else(|e| {
+                    match global_root() {
+                        Some(root) => root.open(path.trim_start_matches('/'), flags, 0),
+                        None => Err(e),
+                    }
+                });
+                let Ok(handle) = handle else { continue };
                 let acc = flags & gex_kernel::fs::oflags::ACCMODE;
                 let f = gex_kernel::file::OpenFile::new(
                     handle,
