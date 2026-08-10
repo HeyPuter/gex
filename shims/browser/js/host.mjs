@@ -219,13 +219,32 @@ export class ProcessHost {
    * does not stop the others -- a closure short one library still saves
    * eighteen nineteenths of the translation.
    */
+  /// Send what a Worker needs to *register* the closure: metadata only.
+  ///
+  /// The compiled modules used to go too, one message each, and the Worker
+  /// waited for all of them before it ran anything. Thirty-three of them is
+  /// 549ms between a parent finishing its fork image and the child starting
+  /// to adopt -- and a process enters four. Registration wants only the
+  /// `gex.meta` section, which is 516 bytes for the dynamic linker and 4 KB
+  /// for libc; the module itself is wanted by the branch that lands in it,
+  /// and `wantLibrary` fetches it then.
   #streamClosure(w, closure) {
-    for (const entry of closure ?? []) {
-      try {
-        w.postMessage({ kind: 'closureModule', entry });
-      } catch (e) {
-        this.#onOutput(2, `gex: a closure library did not reach a worker: ${e.message}\n`, 0);
-      }
+    const metas = (closure ?? []).map((e) => (e instanceof Uint8Array ? e : e.meta));
+    try {
+      w.postMessage({ kind: 'closureMeta', metas });
+    } catch (e) {
+      this.#onOutput(2, `gex: the closure metadata did not reach a worker: ${e.message}\n`, 0);
+    }
+  }
+
+  /// Hand one compiled closure library to the Worker that asked for it.
+  #sendLibrary(w, i) {
+    const entry = (this.#extra?.closure ?? [])[i];
+    if (!entry) return;
+    try {
+      w.postMessage({ kind: 'closureModule', i, mod: entry instanceof Uint8Array ? entry : entry.mod });
+    } catch (e) {
+      this.#onOutput(2, `gex: closure library ${i} did not reach a worker: ${e.message}\n`, 0);
     }
   }
 
@@ -307,12 +326,30 @@ export class ProcessHost {
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
           });
+          // Timed separately, because the gap between a parent finishing its
+          // fork image and a child starting to adopt is 549ms and none of it
+          // is accounted for anywhere. The candidates are this `postMessage`
+          // -- which carries the 15.4 MiB image copy -- and the thirty-three
+          // compiled modules below, one message each, of which a process
+          // enters four.
+          const tSent = performance.now();
           this.#streamClosure(w, closure);
+          if (this.#extra?.debugExit) {
+            this.#onOutput(
+              2,
+              `[gex] pid ${pid}: sent ${(closure ?? []).length} closure modules in `
+                + `${Math.round(performance.now() - tSent)}ms\n`,
+              pid,
+            );
+          }
           },
           );
         }
         break;
       }
+      case 'wantLibrary':
+        this.#sendLibrary(w, m.i);
+        break;
       case 'kernelStacks':
         this.#stacks = m;
         break;

@@ -140,6 +140,28 @@ function noteClosureModule(entry) {
   if (allHereIs && arrived.length >= expected) allHereIs();
 }
 
+/// Compiled libraries this Worker has asked the host for, by index.
+const wanted = new Map();
+
+/// Ask the host for closure library `i`, and answer when it lands.
+///
+/// The modules used to arrive unasked, all of them, and this Worker waited
+/// for every one before running anything: 549ms between a parent finishing
+/// its fork image and its child starting to adopt, for thirty-three modules
+/// of which a process enters four. Registration needs only the metadata,
+/// which is a few kilobytes and arrives in one message; this is for the
+/// branch that actually lands in a library.
+function wantLibrary(i) {
+  let w = wanted.get(i);
+  if (!w) {
+    let settle;
+    w = { p: new Promise((r) => { settle = r; }), settle };
+    wanted.set(i, w);
+    port.post({ kind: 'wantLibrary', i });
+  }
+  return w.p;
+}
+
 /** Every closure library this Worker was promised, once they are all in. */
 function closureModules(n) {
   expected = n;
@@ -154,7 +176,22 @@ async function handle(msg) {
   // had eighteen compiled modules, posted them, and nothing in this Worker
   // ever ran -- so the transfer itself is the suspect, and this is how to
   // tell a slow `postMessage` from a Worker that never woke.
+  if (msg?.kind === 'closureMeta') {
+    // Registration only: which library owns which page. The compiled module
+    // for each is asked for when a branch lands in it.
+    for (const meta of msg.metas ?? []) noteClosureModule({ meta, mod: null });
+    expected = arrived.length;
+    allHereIs?.();
+    return;
+  }
   if (msg?.kind === 'closureModule') {
+    // The answer to a `wantLibrary`.
+    if (typeof msg.i === 'number') {
+      const w = wanted.get(msg.i);
+      if (arrived[msg.i]) arrived[msg.i].mod = msg.mod;
+      w?.settle(msg.mod);
+      return;
+    }
     noteClosureModule(msg.entry);
     return;
   }
@@ -339,6 +376,7 @@ async function handle(msg) {
       entry = await gex.adoptProcess(msg.shim, msg.guest, msg.child, {
         ...msg,
         closure: msg.closure ?? (await closureModules(msg.closureCount ?? 0)),
+        wantLibrary,
       });
     } else {
       entry = await gex.load(
@@ -356,6 +394,7 @@ async function handle(msg) {
           // taken from the start message.
           closure: msg.closure ?? msg.opts?.closure
             ?? (await closureModules(msg.closureCount ?? 0)),
+          wantLibrary,
         },
       );
       if (!entry) throw new Error('the program could not be loaded');

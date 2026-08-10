@@ -402,6 +402,10 @@ export class Gex {
 
   /** Closure library modules waiting for the guest instance to exist. */
   #closureModules = [];
+  /// Ask whoever holds the closure for library `i`, compiled. Null when the
+  /// caller handed the modules over up front, which the page still does for
+  /// pid 1 -- it compiled them itself and has nowhere to ask.
+  #wantLibrary = null;
 
   #bytes() {
     if (!this.#u8 || this.#u8.byteLength === 0) {
@@ -736,6 +740,7 @@ export class Gex {
     // Deferred one step: the tables the modules import belong to the guest
     // instance, which is built below. `#closure` is what installs them.
     this.#closureModules = opts.closure ?? [];
+    this.#wantLibrary = opts.wantLibrary ?? this.#wantLibrary;
 
 
     const e = this.#shim.exports;
@@ -1440,6 +1445,7 @@ export class Gex {
     // were. The *directory* came with the adopted memory, so without this the
     // child's branches point at slots nothing has filled.
     this.#closureModules = opts?.closure ?? this.#closureModules;
+    this.#wantLibrary = opts?.wantLibrary ?? this.#wantLibrary;
     await this.#installClosure();
     // Reachable, not filled.
     //
@@ -2583,7 +2589,18 @@ export class Gex {
       }
       if (lazy && !lazy.inst) {
         lazy.inst = true;
-        await this.#installModule(lazy.mod, lazy.need);
+        // The compiled module, fetched now if registration only brought its
+        // metadata. A Worker is sent thirty-three metadata blobs at once --
+        // a few kilobytes -- and asks for a module when a branch lands in it.
+        const mod = lazy.mod ?? (this.#wantLibrary ? await this.#wantLibrary(owner) : null);
+        if (mod) {
+          lazy.mod = mod;
+          await this.#installModule(mod, lazy.need);
+        } else {
+          // Nothing to install; let the miss fall through and be lifted
+          // rather than wedging on a library that never arrives.
+          lazy.inst = false;
+        }
       }
     }
     // And the same for a module this process inherited from its parent.
