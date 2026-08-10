@@ -100,3 +100,59 @@ else
     echo "apt-get update, in a browser: skipped (no web/dist or no chromium)"
 fi
 echo "matches"
+
+# And the configuration this project is actually for: a shell, in a browser,
+# against a statically recompiled closure.
+#
+# Everything above translates at run time, which is the *secondary* path. This
+# one lifts almost nothing -- the libraries were compiled by `gexc` before the
+# page loaded -- and it is the only leg that measures what static
+# recompilation is worth where it is meant to be used.
+#
+# It did not work at all until four separate things were fixed: the closure
+# was built with a shared memory the browser never uses; 694 MB of
+# `WebAssembly.Module` will not cross a `postMessage`; the libraries have to
+# be installed before the guest's first instruction; and a forked child had
+# the closure's code with no record that it *was* a closure, so `execve` threw
+# all of it away. Each hid the next, and the whole path is easy to break
+# again without noticing, because it fails by being merely slower.
+#
+# Hence the gate on blocks translated as well as on the exit status. Under a
+# working closure an `apt-get update` lifts about 59,000 blocks; translating
+# at run time it lifts 3,100,000. Anything above a few hundred thousand means
+# the closure is not being used, whatever the clock says.
+#
+# `CLOSURE_SHELL` is a stem built with dash *and* apt-get as roots:
+#
+#   gexc build --closure --exhaustive --no-shared-memory --sysroot $ROOT \
+#       $ROOT/bin/dash --with $ROOT/usr/bin/apt-get -o $STEM.wasm
+CLOSURE_SHELL=${CLOSURE_SHELL:-/tmp/gex-full/all}
+if [ -f "$CLOSURE_SHELL.wasm" ] && [ -d web/dist ] \
+   && [ -x "${CHROME:-/usr/bin/chromium}" ]; then
+    rm -rf "$ROOT/var/lib/apt/lists"
+    mkdir -p "$ROOT/var/lib/apt/lists/partial"
+    started=$(date +%s%N)
+    node web/test/harness.mjs once --root "$ROOT" --closure "$CLOSURE_SHELL" \
+        --wait 300000 \
+        'apt-get update >/dev/null 2>&1; echo "gate rc=$? lists=$(ls /var/lib/apt/lists | grep -c _Packages)"' \
+        > /tmp/gex-apt-closure.log 2>&1
+    cms=$(( ($(date +%s%N) - started) / 1000000 ))
+    cgate=$(grep -o 'gate rc=[0-9]* lists=[0-9]*' /tmp/gex-apt-closure.log | tail -1)
+    cblocks=$(grep -oE 'translating [0-9]+ blocks' /tmp/gex-apt-closure.log \
+        | awk '{s+=$2} END {print s+0}')
+    echo "apt-get update, browser + closure: $cgate, ${cms}ms including browser \
+start, $cblocks blocks lifted"
+    case "$cgate" in
+        "gate rc=0 lists=0") echo "FAIL: closure apt wrote no index"; exit 1 ;;
+        "gate rc=0 lists="*) : ;;
+        *) echo "FAIL: closure apt did not finish -- see /tmp/gex-apt-closure.log"; exit 1 ;;
+    esac
+    if [ "$cblocks" -gt 400000 ]; then
+        echo "FAIL: $cblocks blocks lifted -- the closure is not being used."
+        echo "      A working closure lifts about 59,000; runtime translation"
+        echo "      lifts 3,100,000. See #107 and #108."
+        exit 1
+    fi
+else
+    echo "apt-get update, browser + closure: skipped (no $CLOSURE_SHELL.wasm)"
+fi
