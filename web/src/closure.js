@@ -80,8 +80,14 @@ export async function loadClosure(base, { image = false, log = () => {} } = {}) 
   // manifest says which program the module was built from. Checked rather
   // than trusted: the failure is silent and looks like a program that decided
   // to do nothing, so a mismatch is worth a line and no image module.
+  //
+  // A manifest with no image module at all is the `--shared-image` shape: the
+  // program's own text is an ordinary library in `libs`, registered for its
+  // pages and instantiated by the first branch that lands in one, and the
+  // seed stays the module that owns the memory and the tables. Asking for
+  // `manifest.image` there fetched the string "null" and 404ed.
   let img = null;
-  if (image) {
+  if (image && manifest.image) {
     const want = typeof image === 'string' ? image : manifest.program;
     if (manifest.program && want !== manifest.program) {
       log(`closure: image module is ${manifest.program}, not ${want} -- running without it`);

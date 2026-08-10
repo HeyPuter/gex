@@ -399,6 +399,20 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut shared_memory = true;
     let mut no_validate = false;
     let mut closure = false;
+    // Emit the program's own image as a `Shared` module like every other
+    // object, rather than the one `Own` module that declares the memory and
+    // the tables.
+    //
+    // In a browser the seed already is that module -- 1,680 bytes that
+    // translate nothing and own everything -- so an image module built `Own`
+    // has to *replace* it, which means every process instantiates it whether
+    // or not it runs that program. `bash` whole is 42 MB and 212,000
+    // functions, and a forked child that is about to `execve` apt's http
+    // method pays 256ms to instantiate a shell it will never enter.
+    //
+    // Built `Shared`, the image is just another deferred library: registered
+    // for its pages, instantiated by the first branch that lands in one.
+    let mut shared_image = false;
     let mut also: Vec<String> = Vec::new();
     let mut sysroot: Option<String> = None;
     let mut i = 0;
@@ -467,6 +481,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
                 found.sort();
                 also.extend(found);
             }
+            "--shared-image" => shared_image = true,
             "--sysroot" => {
                 i += 1;
                 sysroot = Some(args.get(i).context("--sysroot needs a directory")?.clone());
@@ -481,7 +496,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     if closure {
         return build_closure(
             &path, &also, sysroot.as_deref(), &out, exhaustive, &exhaustive_for, shared_memory,
-            no_validate,
+            no_validate, shared_image,
         );
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
@@ -594,6 +609,7 @@ fn build_closure(
     exhaustive_for: &[String],
     shared_memory: bool,
     no_validate: bool,
+    shared_image: bool,
 ) -> Result<()> {
     let (closure, interp) = closure_of_all(path, also, sysroot)?;
     for (name, asker) in &closure.missing {
@@ -615,8 +631,9 @@ fn build_closure(
             first_slot,
             exhaustive: whole,
             shared_memory,
-            // The first object is the executable and owns the address space.
-            linkage: if n == 0 {
+            // The first object is the executable and owns the address space
+            // -- unless something else already does. See `--shared-image`.
+            linkage: if n == 0 && !shared_image {
                 gex_xlate::Linkage::Own
             } else {
                 gex_xlate::Linkage::Shared
@@ -624,7 +641,9 @@ fn build_closure(
             ..Options::default()
         };
         let (module, stats) = gex_xlate::translate_image(&o.image, &opts);
-        let file = if n == 0 {
+        // Named like a library when it is one, so a manifest that collects
+        // `c.NN.*.wasm` picks it up and the loader has nothing special to do.
+        let file = if n == 0 && !shared_image {
             format!("{stem}.wasm")
         } else {
             format!("{stem}.{n:02}.{}.wasm", o.name)

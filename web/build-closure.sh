@@ -62,7 +62,7 @@ echo "building the closure for $program..."
 # dozens of programs from one closure.
 target/release/gexc build --closure --sysroot "$sysroot" --no-shared-memory \
     --exhaustive-for "${GEX_WHOLE:-libc.so,ld-linux}" \
-    $withs "$sysroot$program" -o "$work/c.wasm"
+    --shared-image $withs "$sysroot$program" -o "$work/c.wasm"
 
 mkdir -p "$out"
 rm -f "$out"/*.wasm "$out"/closure.json
@@ -95,7 +95,16 @@ for line in open(os.path.join(work, 'c.pins')):
 # whose pid 1 is a different program starts the guest inside somebody else's
 # code -- it exits without making a syscall, which is exactly what the first
 # attempt at this did. Named here so the loader can check rather than trust.
-json.dump({'image': 'c.wasm', 'program': sys.argv[3],
+# No image module: `--shared-image` emits the program's own text as an
+# ordinary library, so it is registered for its pages and instantiated by the
+# first branch that lands in one, like everything else. The seed stays the one
+# module that owns the memory and the tables.
+#
+# What that buys is the forked child that immediately `execve`s something
+# else. It used to instantiate the image module because the image module *was*
+# the guest module -- 42 MB and 212,000 functions of `bash` in every one of
+# the hundred processes an `apt-get update` starts, none of which run a shell.
+json.dump({'image': None, 'program': sys.argv[3],
            'libs': libs, 'pins': pins},
           open(os.path.join(out, 'closure.json'), 'w'))
 print(f"  {len(libs)} libraries, {len(pins)} pins")

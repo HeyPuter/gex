@@ -915,7 +915,20 @@ export class Gex {
       most = Math.max(most, need);
       this.#lazyClosure.push({ mod: paired ? entry.mod : wasm, need, inst: null });
     }
-    if (most) this.#growTables(most);
+    if (most) {
+      // Timed, because it is the one step here whose cost is not per library
+      // but per *slot*, and the closure's slot total has grown from 1.6M to
+      // 2.85M. Whether that is 20ms or half a second decides whether the
+      // directory entries are worth deferring per library, and guessing at it
+      // is how the last three sessions went.
+      const t0 = performance.now();
+      this.#growTables(most);
+      if (globalThis.GEX_DEBUG_EXIT) {
+        console.error(
+          `[closure] tables grown to ${most} slots in ${Math.round(performance.now() - t0)}ms`,
+        );
+      }
+    }
     this.#closureModules = [];
   }
 
