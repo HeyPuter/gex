@@ -841,6 +841,8 @@ export class Gex {
   async #installClosure() {
     const add = this.#shim.exports.gex_add_closure_module;
     if (!add) return;
+    // The highest slot total any of them needs, so the tables grow once.
+    let most = 0;
     for (const [i, entry] of this.#closureModules.entries()) {
       // Either the raw wasm, or the pair the page prepared: the metadata
       // section on its own and the module already compiled.
@@ -856,10 +858,27 @@ export class Gex {
       const meta = paired ? entry.meta : metadataSection(entry);
       let need = 0;
       if (meta && meta.length) {
+        // Timed per library. Registering a closure costs a forked child
+        // 399ms -- more than the translation the closure saves it -- and
+        // eighteen libraries across the eighty-five processes of an
+        // `apt-get update` is thirty-four seconds. Which of the three steps
+        // it is (allocating and copying the metadata into guest memory,
+        // decoding it, or writing a directory entry per covered page)
+        // decides the fix, and none of them had been measured.
+        const t0 = performance.now();
         const gp = this.#shim.exports.gex_alloc(meta.length) >>> 0;
         this.#bytes().set(meta, gp);
+        const tCopied = performance.now();
         need = add(gp, meta.length) >>> 0;
+        const tAdded = performance.now();
         this.#shim.exports.gex_free?.(gp, meta.length);
+        if (globalThis.GEX_DEBUG_EXIT) {
+          console.error(
+            `[closure] library ${i}: ${(meta.length / 1024) | 0} KiB of metadata, `
+            + `${Math.round(tCopied - t0)}ms copying, `
+            + `${Math.round(tAdded - tCopied)}ms registering, ${need} slots`,
+          );
+        }
       }
       if (!need) continue;
       // Registered and reserved, not instantiated.
@@ -874,9 +893,17 @@ export class Gex {
       // `fillSlot` builds one when a branch wants a page it covers. The wait
       // is already tolerated: a page nobody can fill yet is forgiven and
       // asked again when something new arrives.
-      this.#growTables(need);
+      // Grown once, after the loop. `Table.grow` reallocates, and `need` is
+      // a running total that reaches 1,607,680 across eighteen libraries --
+      // so growing per library copies an ever-larger table eighteen times.
+      // That is the 399ms every forked child was spending here, against 1ms
+      // of actually registering them, and it is what made the closure cost a
+      // short-lived process more than it saved: `/bin/true` lived 1966ms with
+      // the closure and 1378ms without.
+      most = Math.max(most, need);
       this.#lazyClosure.push({ mod: paired ? entry.mod : wasm, need, inst: null });
     }
+    if (most) this.#growTables(most);
     this.#closureModules = [];
   }
 
