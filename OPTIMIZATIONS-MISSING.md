@@ -2026,3 +2026,42 @@ value is in range, which is #15's territory and not a peephole.
 Worth remembering as a shape: "fewer emitted instructions" and "less work"
 are different claims once the engine has its own optimiser, and this file now
 has two experiments saying so.
+
+## Bigger regions are not the answer either, and one knob is not monotonic
+
+The other 24 per cent of the module is block-boundary cost -- 15 per cent
+register traffic, 5 safepoints, 4 dispatch -- and regions are what remove it,
+so the obvious move is to form more of them. Only 366 of nbench's 27,594
+blocks are inside one.
+
+Two sweeps, against a baseline of 145 regions over 366 blocks:
+
+| | regions | blocks in them | boundary |
+|---|---|---|---|
+| `GEX_REGION=8` (default) | 145 | 366 | 24% |
+| `GEX_REGION=32` | 113 | 282 | 24% |
+| `GEX_REGION=32 GEX_REGION_NESTED=1` | 316 | 2,761 | 23% |
+
+**Raising the limit forms fewer regions.** That is not a tuning result, it is
+a defect: `grow` explores up to `limit` blocks and then rejects the whole
+region if it finds a back edge that does not reach the entry. A bigger budget
+reaches a *second* loop that a smaller one never sees, so a region that formed
+at 8 fails outright at 32. It should shrink the set to the one loop it can
+form rather than give up -- the narrowing pass immediately above already knows
+how.
+
+**And 7.5x more region coverage moves the boundary cost by one point.** With
+nesting allowed, 2,761 blocks are in regions instead of 366, and the result is
+mixed: IDEA 1.14x to 1.30x, NUMERIC SORT 1.12x to 1.19x, STRING SORT 2.86x to
+3.00x, against BITFIELD 1.95x to **1.22x** and NEURAL NET 18.08x to 17.42x.
+Five better, four worse, one flat.
+
+Nesting is also not shippable, and the code says why: a region polls for
+signals and thread switches at its entry only, so a guest cycling inside an
+inner loop never reaches a poll and never yields. The flag exists to price the
+shape, and the price is "not obviously worth it".
+
+So the 24 per cent is not mostly recoverable by folding more blocks together.
+What remains of it is register traffic at genuine boundaries, and attacking
+that means keeping guest registers in wasm locals across calls -- which is
+#15, and a different piece of work from region formation.
