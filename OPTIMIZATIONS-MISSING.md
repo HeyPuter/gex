@@ -2259,3 +2259,48 @@ With no HTTP anywhere, `apt-config` plus its forked `dpkg` still cost about
 ten seconds an iteration. An earlier reading of the apt logs -- lots of
 `nothing runnable, wanting the event loop` -- suggested waiting on Wisp, and
 that was wrong.
+
+## `/bin/true` costs 1.5 seconds and nine thousand blocks
+
+The floor under every process, measured on the demo site with the apt closure
+loaded. `/bin/true` does nothing whatever between `execve` and `exit`:
+
+    pid 3: lived 1966ms,  435ms translating  9800 blocks,  260ms installing
+    pid 4: lived 1774ms,  337ms translating  7895 blocks,  220ms installing
+    pid 5: lived 1568ms,  250ms translating  9645 blocks,  189ms installing
+
+Nine thousand blocks cannot be its own text -- `/bin/true` is about thirty
+kilobytes. It is `ld.so` and libc, and **both are in the closure**. So the
+closure is not reaching forked children, and that is worth more than anything
+else on this list: it is the same libc that all eighty-five of apt's processes
+re-translate.
+
+Two things it is *not*, both checked rather than assumed:
+
+- Not `gex_reset_directory` discarding the closure's entries. It runs before
+  `#installClosure`, so `CLOSURE_DIRS` is empty when it would read them, and
+  `#installClosure` writes its own entries afterwards regardless. Re-applying
+  them there changes the block counts by exactly zero -- 20961, 9800, 7895 in
+  both runs, byte for byte.
+- Not the pins. The closure's libraries are placed where its manifest says and
+  `exec: 1566 closure pages kept` shows those pages surviving `execve`.
+
+Also unaccounted: about seventy per cent of a process's life. Adding up
+everything measurable -- worker ready 26ms, fork image copy 39ms, adopt 66ms,
+translating, installing -- reaches 500-900ms of a 1.5-2.0 second process, and
+that is with the guest doing nothing. Whatever the rest is, it is not
+translation, not compilation, not instantiation, and not the network.
+
+### Closures cannot currently be combined
+
+`cat`'s closure places libc at `0x5000000`; apt's places it at `0x5520000`.
+Placement is a bump allocator within one closure, so two closures disagree
+about where the same library lives, and a translated block has its addresses
+baked in -- their modules are not interchangeable.
+
+That is what stands between the current single-program closure and covering
+the programs an `apt-get update` actually runs: `dpkg`, `apt-config`, `sed`,
+`cat`, `base64`, `find`, `sort`. `gexc --pin FILE` already exists to impose a
+layout, so a union closure over a set of programs is buildable rather than
+blocked -- assign every object in the union a base once, then build each
+program against that file.
