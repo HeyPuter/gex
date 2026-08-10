@@ -187,6 +187,56 @@ export async function start() {
 
   const io = collector();
   const unpacked = performance.now() - t0;
+
+  // `?program=` runs one program instead of opening a shell.
+  //
+  // A closure is a layout for one program: `gexc build --closure` pins every
+  // object it reaches at a fixed address, and those addresses start at
+  // 0x5000000 -- which is exactly where a shell's own image and libraries
+  // land. Booting dash and then handing it apt's pins put two programs at one
+  // address and the shell died before it printed a prompt. So the
+  // configuration this project exists for cannot be measured through a
+  // persistent shell at all, and this is the mode that measures it: the page
+  // boots, runs the program, and reports what it printed and what it exited
+  // with.
+  if (params.get('program')) {
+    const path = params.get('program');
+    const argv = [path, ...(params.getAll('arg') || [])];
+    const exe = files[path];
+    if (!exe) throw new Error(`the rootfs has no ${path}`);
+    const began = performance.now();
+    let status = -1;
+    let failed = null;
+    try {
+      const r = await runProgram(io.term, {
+        elf: exe,
+        files,
+        args: argv,
+        cwd: '/',
+        tty: false,
+        uid: 0,
+        recompileObjects,
+        network,
+        closure,
+      });
+      status = r.status;
+    } catch (e) {
+      failed = String((e && e.stack) || e);
+    }
+    await fetch('/harness/ready', {
+      method: 'POST',
+      body: JSON.stringify({ unpackMs: Math.round(unpacked), files: Object.keys(files).length }),
+    });
+    await report({
+      id: 0,
+      out: io.take(),
+      error: failed,
+      status,
+      ms: Math.round(performance.now() - began),
+      log: logs.slice(),
+    });
+    return;
+  }
   // Not awaited: an interactive shell does not exit, and this is the process
   // every command runs inside.
   const done = runProgram(io.term, {

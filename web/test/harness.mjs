@@ -285,6 +285,8 @@ async function start(args) {
     (args.adopt ? `&adopt=${encodeURIComponent(args.adopt)}` : '') +
     (args.wisp ? `&wisp=${encodeURIComponent(args.wisp)}` : '') +
     (args.closure ? '&closure=1' : '') +
+    (args.program ? `&program=${encodeURIComponent(args.program)}` : '') +
+    (args.progArgs || []).map((a) => `&arg=${encodeURIComponent(a)}`).join('') +
     (args.recompile !== undefined ? `&recompile=${encodeURIComponent(args.recompile)}` : '');
   const chrome = spawn(
     CHROME,
@@ -375,6 +377,10 @@ for (let i = 0; i < rest.length; i++) {
   // saying anything. The output collected so far comes back either way.
   else if (rest[i] === '--wait') flags.wait = rest[++i];
   else if (rest[i] === '--adopt') flags.adopt = rest[++i];
+  // One program instead of a shell, which is the only way to measure a
+  // closure: its pins are a layout for that program and collide with a
+  // shell's own placement.
+  else if (rest[i] === '--program') flags.program = rest[++i];
   else if (rest[i] === '--closure') flags.closure = rest[++i];
   else if (rest[i] === '--recompile') flags.recompile = rest[++i];
   else positional.push(rest[i]);
@@ -397,6 +403,15 @@ if (verb === 'start') {
   // And wait for the page to come back up, so the next `run` is not sent
   // into a browser that is still unpacking.
   console.log(JSON.stringify(await control('/control/ready')));
+} else if (verb === 'program') {
+  flags.progArgs = positional;
+  await start(flags);
+  const r = await control('/control/run', { cmd: '', ...(flags.wait ? { timeout: flags.wait } : {}) });
+  process.stdout.write(r.out || '');
+  for (const l of r.log || []) process.stderr.write(`${l}\n`);
+  if (r.error) process.stderr.write(`harness: ${r.error}\n`);
+  process.stderr.write(`harness: exit ${r.status}, ${r.ms}ms\n`);
+  process.exit(r.status === 0 ? 0 : 1);
 } else if (verb === 'ready') {
   console.log(JSON.stringify(await control('/control/ready')));
 } else if (verb === 'stop') {
