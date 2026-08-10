@@ -6629,9 +6629,10 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     //
     // Whole pages, because that is the unit the identity map is keyed by. An
     // object whose every page is already answered for is skipped outright.
-    let adopted = with_host(|h| {
+    let (adopted, pages) = with_host(|h| {
         let first = gex_abi::dispatch_page(map.start);
         let last = gex_abi::dispatch_page(map.end.saturating_sub(1));
+        let pages = (last - first + 1) as usize;
         let mut missing = 0usize;
         for page in first..=last {
             if h.jit.page_table.lookup(page).is_some() {
@@ -6651,11 +6652,23 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
                 None => missing += 1,
             }
         }
-        missing
+        (missing, pages)
     });
     if adopted == 0 {
         return 0;
     }
+    // Not gated on how much of the object is unclaimed. That was tried --
+    // skip unless a quarter of the pages are missing -- on the theory that a
+    // few stragglers were dragging whole libraries through the translator.
+    // It changed the block count by twenty out of 3,381,964, because the
+    // premise was wrong: when a process reaches this, nearly every page of
+    // the object really is unclaimed.
+    //
+    // The reason is that apt's processes run at once, in parallel Workers,
+    // and all of them start with an empty store. Twenty-six processes look
+    // for libapt, none of them find it, and all of them translate it. The
+    // sharing works perfectly and arrives too late to matter. See #93.
+    let _ = pages;
     let seeds = object_seeds(map);
     let intrinsics = with_host(|h| h.jit.intrinsics.clone());
     let (exec, page_table, known) = with_host(|h| {
