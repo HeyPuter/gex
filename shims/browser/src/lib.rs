@@ -4763,6 +4763,9 @@ pub extern "C" fn gex_adopt_vma(start: i64, end: i64, prot: i32) {
 /// is enough to keep them apart without widening everything that passes a
 /// status along.
 fn exit_process(h: &mut Host, code: i32) -> i32 {
+    // See `gex_exited`: this is what tells the host apart a program that
+    // finished from one that abandoned the wasm stack with no status set.
+    EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
     // Published before anything else, because the table is shared between
     // every kernel and this is the record a parent's `wait4` will find --
     // and the parent may be parked on exactly that.

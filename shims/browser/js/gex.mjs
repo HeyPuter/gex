@@ -2236,7 +2236,12 @@ export class Gex {
             const heap = say(e.gex_heap_used_kib, (k) =>
               k >= 0 ? `, shim heap ${(k / 1024).toFixed(1)} MiB` : '');
             console.error(
-              `[gex] run ended: shim trapped out, code ${e.gex_exit_code()}${where}${heap}`,
+              // `exited` or `ABANDONED`, because `unreachable` and code 0
+              // are what both a finished program and a crashed shim produce.
+              // `gex_exited` has known the difference all along and this line
+              // did not print it.
+              `[gex] run ended: ${e.gex_exited?.() ? 'exited' : 'ABANDONED'}`
+              + `, code ${e.gex_exit_code()}${where}${heap}`,
             );
           }
           return e.gex_exit_code();

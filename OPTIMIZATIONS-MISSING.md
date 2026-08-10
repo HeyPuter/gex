@@ -2568,3 +2568,40 @@ takes fifteen minutes to say less.
 
 Everything below `INTERP_BASE` is the executable and its break, so that is
 what `execve` now drops.
+
+### apt's deadlock is one child crashing inside a syscall
+
+`apt-get update` stalls two processes in, with `apt-get` blocked on `read` of a
+pipe holding nothing and pid 1 blocked on `wait4` behind it. The reason is not
+scale, not the pipe, and not anything about the closure.
+
+    [gex] run ended: ABANDONED, code 0, pc=0x0, in syscall 56
+    [gex] pid 3: lived 2418ms, 80ms translating 1844 blocks [dpkg@0x1000000=1826 ...]
+
+pid 3 is `dpkg`, which apt runs first. It does not exit: it abandons the wasm
+stack inside `openat`, with no status and no resume address. So `exit_process`
+never runs, its end of the pipe stays open, and the reader waits for an
+end-of-file nothing will send.
+
+Three facts narrow it a long way:
+
+- `trap()` clears `IN_SYSCALL`, and the report says `in syscall 56`. So the
+  guest did not leave through the shim's own redirect. It died *inside* the
+  `openat` handler.
+- `InSyscall`'s `Drop` clears the flag on a normal return, so the handler did
+  not return either.
+- The shim's panic hook writes `gex: panic in the shim:` to fd 2 and nothing
+  did. So it is not a Rust panic.
+
+A wasm trap that is neither `trap()` nor a panic is a fault: an out-of-bounds
+access, an indirect call type mismatch, or a stack overflow. `openat` on this
+path goes through the remote filesystem into the *global kernel*, which runs
+on a per-Worker stack slice handed out by `#nextKernelStack`, and a slice that
+is too small traps exactly like this with nothing said.
+
+Two things made this take as long as it did, and both are now fixed:
+`GEX_STDERR=all` printed only on a *passing* run, so every failing run showed
+twenty lines of terminal and none of the runtime's own account; and
+`run ended: shim trapped out, code 0` was printed identically for a program
+that finished and one that died with no status set -- the flag that knows the
+difference, `gex_exited`, has existed all along and was not being read.
