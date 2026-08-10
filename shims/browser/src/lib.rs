@@ -3555,6 +3555,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     IN_SYSCALL.store(true, std::sync::atomic::Ordering::Relaxed);
     let _in_syscall = InSyscall;
     CTX_ADDR.store(ctx as u32 as u64, std::sync::atomic::Ordering::Relaxed);
+    // The process tree, always. Stood down under `GEX_TRACE`, which narrates
+    // these along with everything else.
+    if !tracing() {
+        note_process_syscall(ctx as u32 as u64, pc);
+    }
     // How long each kind of syscall takes, when there is a heartbeat.
     //
     // Counts alone cannot answer the question glxgears asks: it holds a
@@ -7049,17 +7054,93 @@ fn note_intrinsics(addr: u64) {
         }
         h.jit.intrinsics.len() - before
     });
-    // Only when it learned something, so this is a handful of lines a run
-    // rather than one per miss -- and it is on the heartbeat rather than
-    // `strace` because "did the substitution happen at all" is the first
-    // question asked of it, and answering that should not need every syscall
-    // narrated.
-    if added > 0 {
-        let n = with_host(|h| h.jit.intrinsics.len());
-        trace_line(&format!(
-            "[gex] intrinsics: +{added} from {path}, {n} total\n"
-        ));
+    let _ = added;
+}
+
+/// Narrate the calls that change what is running: `clone` and `execve`.
+///
+/// On by default, which nothing else about the guest is. A run's shape is its
+/// process tree -- who forked, who exec'd what, in which order -- and every
+/// interesting failure this host has had was located by reconstructing that:
+/// a child crashing and its parent waiting for ever, a method that never
+/// started, a fork storm that produced fifty processes and one line of
+/// output. Reconstructing it from a full `strace` means reading past every
+/// `read` and `mmap` in between, and reconstructing it from nothing at all is
+/// what most of those cost their time to.
+///
+/// Only these two, and only their arguments. `GEX_TRACE` still narrates
+/// everything and this stands down when it is on, so the two never double up.
+///
+/// AArch64 has no `fork`: glibc's `fork` is `clone` with `SIGCHLD` and no
+/// `CLONE_THREAD`, so the two are told apart here rather than by number --
+/// which is the distinction that matters, because one makes a process and the
+/// other makes a thread.
+fn note_process_syscall(base: u64, pc: i64) {
+    use gex_kernel::syscalls::{clone_flags, nr};
+    let gm = GuestMem::new(guest_bytes());
+    let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
+    let n = g(8);
+    if n != nr::CLONE && n != nr::EXECVE {
+        return;
     }
+    let cstr = |at: u64, cap: usize| {
+        gm.read_cstr(at, cap)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+    let pid = with_host(|h| h.kernel.pid);
+    let what = if n == nr::EXECVE {
+        // The program and how it was called. A trace saying only that an
+        // `execve` happened is what made "apt's method does not start"
+        // unanswerable for as long as it was: the argv is the difference
+        // between the wrong program and the right program with wrong
+        // arguments.
+        let mut argv = String::new();
+        for i in 0..8u64 {
+            let p = gm.read_u64(g(1) + i * 8).unwrap_or(0);
+            if p == 0 {
+                break;
+            }
+            if i > 0 {
+                argv.push(' ');
+            }
+            argv.push_str(&cstr(p, 64));
+        }
+        format!("execve \"{}\" [{argv}]", cstr(g(0), 255))
+    } else {
+        let f = g(0);
+        // Named where a name exists and hex otherwise, because the flags are
+        // the whole content of a `clone`: the same call number makes a
+        // thread, a process, or something sharing half a process's state.
+        let mut named = Vec::new();
+        for (bit, name) in [
+            (clone_flags::VM, "VM"),
+            (clone_flags::THREAD, "THREAD"),
+            (clone_flags::SETTLS, "SETTLS"),
+            (clone_flags::PARENT_SETTID, "PARENT_SETTID"),
+            (clone_flags::CHILD_CLEARTID, "CHILD_CLEARTID"),
+            (clone_flags::CHILD_SETTID, "CHILD_SETTID"),
+        ] {
+            if f & bit != 0 {
+                named.push(name);
+            }
+        }
+        let kind = if f & clone_flags::THREAD != 0 {
+            "clone/thread"
+        } else {
+            "clone/fork"
+        };
+        format!(
+            "{kind} flags={f:#x} [{}] sig={} stack={:#x} ptid={:#x} tls={:#x} ctid={:#x}",
+            named.join("|"),
+            f & 0xff,
+            g(1),
+            g(2),
+            g(3),
+            g(4),
+        )
+    };
+    trace_line(&format!("[gex:{pid}] t{} pc={pc:#x} {what}\n", cur()));
 }
 
 /// Which object's executable mapping a guest address falls in, if any.

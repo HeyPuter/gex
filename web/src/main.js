@@ -255,6 +255,21 @@ for (const [event, describe] of [
   // `?demo=` as well as `#demo`, so a link can carry the demo's own options
   // in the query alongside it.
   const params = new URLSearchParams(location.search);
+  // The same switches the harness page has, on the demo page too.
+  //
+  // These existed only inside `harness.js`, so the one page a test can
+  // actually drive -- the built site, with its own rootfs and its own
+  // network -- could not be told to defer differently or to narrate a crash.
+  // Every question about the demo had to be answered on a different page
+  // running a different program, and the two disagreed: the harness ran apt
+  // against a `file:` repository and passed for days while the site crashed
+  // on every run. A switch that cannot be reached where the failure happens
+  // is not a switch.
+  if (params.has('adopt')) globalThis.GEX_ADOPT_AFTER = Number(params.get('adopt'));
+  if (params.get('debug')) {
+    globalThis.GEX_DEBUG_EXIT = 1;
+    globalThis.GEX_TRAP_STACK = 1;
+  }
   const asked = params.get('demo') || location.hash.slice(1);
   const want = DEMOS.find((d) => d.id === asked) || DEMOS[0];
   await select(want);
