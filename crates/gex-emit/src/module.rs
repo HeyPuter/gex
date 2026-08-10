@@ -143,9 +143,18 @@ const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 256;
 /// Out of reach because the mechanism is correct but not yet profitable, on
 /// the same 19-object `--exhaustive` build of apt's closure:
 ///
-///     passive, fill keyed on an entry   SIGILL after two processes
-///     passive, fill keyed on the page   exit 0, 66,204ms, install 46,888ms
-///     active (this)                     exit 0, 55,714ms, install 29,050ms
+///     fill keyed on an entry      SIGILL after two processes
+///     keyed on the page           66,204ms, install 46,888ms,   407,588 blocks
+///     ...and children defer too   87,736ms, install 22,470ms, 2,639,578 blocks
+///     active (this)               55,714ms, install 29,050ms,    17,462 blocks
+///
+/// The third row is the mechanism working and still losing. Install is 6.6
+/// seconds *under* the active build, which is what demand filling was for --
+/// but the run pays that back four times over in lifting, because a page is
+/// asked about once and any ask that does not end in a fill leaves every
+/// block on that page to be translated. 85 to 234 fills answered per process
+/// against 132,000 blocks translated per process says most pages never get
+/// filled at all
 ///
 /// Keying the fill on the guest page fixed the crash -- a miss always knows
 /// its page and almost never knows an entry -- but the asks still go
