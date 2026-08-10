@@ -438,6 +438,15 @@ struct ModStore {
     /// per object instead lets the second process to enter libc take
     /// everything the first one ever lifted of it, in one go.
     by_object: BTreeMap<u64, Vec<u32>>,
+    /// Objects some process is translating right now.
+    ///
+    /// The store answers "who has already done this"; nothing answered "who
+    /// is doing it". apt runs its ten processes at once in parallel Workers,
+    /// so all of them reach `libapt` before any of them has published it,
+    /// all of them find nothing, and all of them translate it: 3,381,984
+    /// blocks in one `apt-get update` against 1,724,482 for the entire
+    /// decodable text of every library it touches.
+    translating: BTreeMap<u64, u32>,
     /// What has been stored, against [`MOD_BUDGET`].
     total: usize,
 }
@@ -463,6 +472,7 @@ fn modules() -> &'static Mutex<ModStore> {
             }],
             by_page: BTreeMap::new(),
             by_object: BTreeMap::new(),
+            translating: BTreeMap::new(),
             total: 0,
         })
     })
@@ -533,6 +543,40 @@ pub extern "C" fn k_mod_claim_object(obj: u64, id: u32) {
     if claims.last() != Some(&id) {
         claims.push(id);
     }
+}
+
+/// Claim an object to translate, or find out who already has.
+///
+/// Returns 1 to the process that may go ahead and 0 to everyone else, which
+/// is a claim rather than a lock: the loser does not wait, it returns to the
+/// miss path and lifts the handful of blocks it actually needs, and it picks
+/// up the whole object from the store once the winner publishes. Waiting
+/// would be the other design and it trades duplicated work for a stall on
+/// whichever process happens to be slowest.
+#[no_mangle]
+pub extern "C" fn k_obj_translating(obj: u64, pid: u32) -> u32 {
+    let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
+    match m.translating.get(&obj) {
+        Some(&who) if who != pid => 0,
+        _ => {
+            m.translating.insert(obj, pid);
+            1
+        }
+    }
+}
+
+/// Done with it, whether or not anything came of it.
+///
+/// Released rather than left standing, because a translation that produced
+/// nothing -- an object over the size cap, a process that died -- must not
+/// stop the next process from trying.
+#[no_mangle]
+pub extern "C" fn k_obj_translated(obj: u64) {
+    modules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .translating
+        .remove(&obj);
 }
 
 /// The `n`th module holding code for this object, or zero past the end.

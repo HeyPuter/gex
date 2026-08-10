@@ -289,6 +289,8 @@ extern "C" {
     fn k_mod_claim(page: u64, key: u64, id: u32);
     fn k_mod_for(page: u64, key: u64, n: u32) -> u32;
     fn k_mod_claim_object(obj: u64, id: u32);
+    fn k_obj_translating(obj: u64, pid: u32) -> u32;
+    fn k_obj_translated(obj: u64);
     fn k_mod_for_object(obj: u64, n: u32) -> u32;
     fn k_mod_slots(id: u32) -> u64;
     fn k_mod_len(id: u32) -> u32;
@@ -6669,6 +6671,28 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     // for libapt, none of them find it, and all of them translate it. The
     // sharing works perfectly and arrives too late to matter. See #93.
     let _ = pages;
+    // One process translates an object, not all of them.
+    //
+    // The store answers "has anybody already done this"; until now nothing
+    // answered "is anybody doing it". apt's ten processes run at once in
+    // parallel Workers, so all of them reach `libapt` before any has
+    // published it, all find nothing, and all translate it -- 3,381,984
+    // blocks against the 1,724,482 that are the entire decodable text of
+    // every library the run touches.
+    //
+    // A claim, not a lock. The process that loses does not wait: it returns
+    // to the miss path, which lifts the handful of blocks it actually needs
+    // and is shared in its own right, and it picks the object up from the
+    // store once the winner publishes. Waiting would trade duplicated work
+    // for a stall behind whichever process is slowest, which is the same
+    // trade the `PER_MISS` cap already refused.
+    let (obj, me) = with_host(|h| (object_identity(h, map.start), h.kernel.pid));
+    let Some(obj) = obj else {
+        return 0;
+    };
+    if unsafe { k_obj_translating(obj, me as u32) } == 0 {
+        return 0;
+    }
     let seeds = object_seeds(map);
     let intrinsics = with_host(|h| h.jit.intrinsics.clone());
     let (exec, page_table, known) = with_host(|h| {
@@ -6742,6 +6766,9 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         }
         publish_pending(h);
     });
+    // Released whether or not anything came of it. A translation that
+    // produced nothing must not stop the next process from trying.
+    unsafe { k_obj_translated(obj) };
     stats.blocks
 }
 

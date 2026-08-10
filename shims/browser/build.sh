@@ -79,6 +79,16 @@ if ! node shims/browser/js/check-glue.mjs "$OUT" shims/browser/js/gex.mjs; then
     echo "shims/browser: NOT installed -- the glue check failed" >&2
     exit 1
 fi
+# And against the other side. The kernel is a separate artefact that nothing
+# here rebuilds, and a shim importing a function it does not export fails to
+# instantiate inside a Worker: no error anybody reads, no guest output, a run
+# that looks wedged. Adding one kernel function and rebuilding only the shim
+# cost exactly that, against a kernel seven hours stale.
+if [ -f "$PUB/gex_kernel.plain.wasm" ] \
+   && ! node shims/browser/js/check-kernel.mjs "$OUT" "$PUB/gex_kernel.plain.wasm"; then
+    echo "shims/browser: NOT installed -- the kernel check failed" >&2
+    exit 1
+fi
 cp "$OUT" "$PUB/gex_browser.wasm"
 
 # And the same shim against a *shared* memory, when the toolchain can build
