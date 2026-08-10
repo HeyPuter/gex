@@ -31,7 +31,15 @@ trap 'rm -rf "$work"' EXIT
 
 cargo build --release -p gexc 2>&1 | grep -E "^error" && exit 1
 echo "building the closure for $program..."
+# libc and the dynamic linker whole; everything else reachable-only.
+#
+# "Reachable" means reachable *from this program*, so a closure built for
+# `apt-get` holds only the libc paths apt walks -- and `/bin/true` against it
+# lifts 9,800 blocks where against a closure built for itself it lifts none.
+# libc and ld.so are what every program in a rootfs shares, and a demo runs
+# dozens of programs from one closure.
 target/release/gexc build --closure --sysroot "$sysroot" --no-shared-memory \
+    --exhaustive-for "${GEX_WHOLE:-libc.so,ld-linux}" \
     "$sysroot$program" -o "$work/c.wasm"
 
 mkdir -p "$out"

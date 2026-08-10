@@ -134,6 +134,10 @@ run options:
                   program -- measured at five to six seconds on bash and
                   busybox, for no measurable gain once both settle
   --exhaustive    translate every decodable text address ahead of time
+  --exhaustive-for NAME[,NAME]
+                  do that for these objects of a closure only. libc is what
+                  every program shares, and a closure built for one program
+                  holds only the libc paths that program walks
   --no-jit        no runtime translation; implies --exhaustive
   --lazy          discover only from the entry point, leaving the rest to
                   runtime translation; much faster to start on a big binary
@@ -391,6 +395,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut path = None;
     let mut out = None;
     let mut exhaustive = false;
+    let mut exhaustive_for: Vec<String> = Vec::new();
     let mut shared_memory = true;
     let mut no_validate = false;
     let mut closure = false;
@@ -406,6 +411,30 @@ fn cmd_build(args: &[String]) -> Result<()> {
             // A built module has no runtime translator behind it, so anything
             // discovery misses is a dispatch miss with nowhere to go.
             "--exhaustive" => exhaustive = true,
+            // Exhaustive for *these* objects only.
+            //
+            // `--exhaustive` on a whole closure is unusable: apt's is 678 MB
+            // against 82, and a 694 MB closure never became ready in a page
+            // at all. Reachable-only is the right default because the browser
+            // has a translator behind the module and lifts whatever the build
+            // missed.
+            //
+            // But "reachable" means reachable *from this program*, and a
+            // closure built for `apt-get` therefore holds only the libc paths
+            // apt walks. `/bin/true` against it lifts 9,800 blocks; against a
+            // closure built for itself it lifts none. libc and the dynamic
+            // linker are what every program in a rootfs shares, so those are
+            // worth having whole while everything else stays reachable-only.
+            "--exhaustive-for" => {
+                i += 1;
+                exhaustive_for = args
+                    .get(i)
+                    .context("--exhaustive-for needs a comma-separated list of object names")?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             // A host that cannot import a shared memory -- a Rust shim built
             // without `+atomics`, which is every stable-toolchain build --
             // needs the guest module to declare a plain one.
@@ -451,7 +480,8 @@ fn cmd_build(args: &[String]) -> Result<()> {
 
     if closure {
         return build_closure(
-            &path, &also, sysroot.as_deref(), &out, exhaustive, shared_memory, no_validate,
+            &path, &also, sysroot.as_deref(), &out, exhaustive, &exhaustive_for, shared_memory,
+            no_validate,
         );
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
@@ -561,6 +591,7 @@ fn build_closure(
     sysroot: Option<&str>,
     out: &str,
     exhaustive: bool,
+    exhaustive_for: &[String],
     shared_memory: bool,
     no_validate: bool,
 ) -> Result<()> {
@@ -577,9 +608,12 @@ fn build_closure(
     // as if by one allocator even though they are translated one at a time.
     let mut first_slot = 0u64;
     for (n, o) in closure.objects.iter().enumerate() {
+        // Whole, for the objects named. Matched on the start of the name so
+        // `libc.so.6` catches `libc.so.6` and `libc` catches it too.
+        let whole = exhaustive || exhaustive_for.iter().any(|w| o.name.starts_with(w.as_str()));
         let opts = Options {
             first_slot,
-            exhaustive,
+            exhaustive: whole,
             shared_memory,
             // The first object is the executable and owns the address space.
             linkage: if n == 0 {
