@@ -7569,7 +7569,26 @@ pub extern "C" fn gex_dump_state() {
                 None => "UNMAPPED".to_string(),
             }
         };
-        for (name, a) in [("sp", sp), ("x0", r(0)), ("x1", r(1))] {
+        // `x16` and `x17` as well, because a PLT stub is where indirect
+        // branches actually come from and those are the two registers it
+        // uses. The whole of `libc+0x27200` is
+        //
+        //     stp x16, x30, [sp, #-0x10]!
+        //     adrp x16, <got>
+        //     ldr  x17, [x16, #0xff8]
+        //     br   x17
+        //
+        // so a dispatch that traps there is dispatching on whatever the GOT
+        // held, not on the page the pc is in -- which is why a report built
+        // from `dispatch_page(pc)` kept describing an entry that was
+        // perfectly in range while the branch was somewhere else entirely.
+        for (name, a) in [
+            ("sp", sp),
+            ("x0", r(0)),
+            ("x1", r(1)),
+            ("x16", r(16)),
+            ("x17", r(17)),
+        ] {
             trace_line(&format!("gex:   {name}={a:#x} in {}\n", where_is(a)));
         }
     });

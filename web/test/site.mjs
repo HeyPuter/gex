@@ -385,9 +385,19 @@ for (const id of list) {
     }
     console.log(`FAIL site-${id}: ${result.how}${result.body ? ` (${result.body})` : ''}`);
     console.log(`     last status: ${last || '(none)'}`);
+    // Eight lines of the browser's own stderr is enough to say a page threw
+    // and never enough to say where. A wasm `RuntimeError` reaches the
+    // console with the engine's stack under it -- the one thing that names
+    // the function that trapped -- and it is tens of lines long, so the tail
+    // that survived was always the part after the answer.
+    //
+    // `GEX_STDERR=all` keeps the lot. It is off by default because a passing
+    // run has nothing worth reading here and a failing one usually does not
+    // either; it is the crash in the runtime that needs it.
+    const noise = /Fontconfig|GPU|gpu|Registration|Vulkan|dawn/;
+    const lines = err.split('\n').filter((l) => l && !noise.test(l));
     console.log(
-      err.split('\n').filter((l) => l && !/Fontconfig|GPU|gpu|Registration|Vulkan|dawn/.test(l))
-        .slice(-8)
+      (process.env.GEX_STDERR === 'all' ? lines : lines.slice(-8))
         .map((l) => `     ${l}`).join('\n'),
     );
   }

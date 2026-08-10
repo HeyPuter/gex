@@ -1740,10 +1740,48 @@ export class Gex {
             // past its end, which is a diagnosis pointing at the wrong thing.
             const at = slot + ((Number(guest) & 0xfff) >> 2);
             const len = tables[idx]?.length ?? 0;
+            // And when that entry is fine, the whole directory.
+            //
+            // A dispatch is for the branch's *target*, not for the address
+            // the guest is standing on, so the entry at `dispatch_page(pc)`
+            // is usually a different entry from the one that trapped -- which
+            // is why reporting only that one said "in range, so the trap is
+            // elsewhere" and stopped. Every entry is checkable against the
+            // tables this process actually has, and an unusable one is the
+            // answer whether or not the pc happens to name it.
+            //
+            // Tables 2 to 7 are typically length zero, so an entry whose top
+            // eight bits decode to a table that high traps on its first use
+            // however small its slot. Those are worth separating from an
+            // entry naming a real table past its end: one is a corrupt or
+            // stale directory write, the other is a table that was not grown.
+            let bad = 0;
+            let highTable = 0;
+            const sample = [];
+            const dv = new DataView(this.#memory.buffer);
+            for (let p = 0; p < 0x80000; p++) {
+              const v = dv.getUint32(DISPATCH_DIR + p * 4, true) >>> 0;
+              if (v === 0) continue;
+              const t = v >>> 24;
+              const b = v & 0xffffff;
+              const cap = tables[t]?.length ?? 0;
+              // The whole page, because any block in it may be branched to.
+              if (t < tables.length && b + 1024 <= cap) continue;
+              bad++;
+              if (t >= 2) highTable++;
+              if (sample.length < 6) {
+                sample.push(`page ${p} -> ${t}[${b}] (table is ${cap})`);
+              }
+            }
+            const survey = bad
+              ? `. ${bad} directory entries name a slot this process cannot ` +
+                `reach, ${highTable} of them in a table above 1: ${sample.join('; ')}`
+              : '. every other directory entry is reachable';
             return (
               `. page ${page} of the directory says table ${idx} slot ${slot}` +
               `, so this branch wants ${idx}[${at}] and that table is ${len} long` +
               ` (${at < len ? 'in range, so the trap is elsewhere' : 'past the end'})` +
+              survey +
               `, and this process has ${tables.length} tables of ` +
               `[${tables.map((t) => t.length).join(', ')}]` +
               `, ${this.#installs} modules installed`
