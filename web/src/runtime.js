@@ -341,6 +341,12 @@ export async function runProgram(
       // that starts a demo is never the interesting process: the questions
       // are about the X server and the client it forks.
       heartbeat: heartbeat || undefined,
+      // How many traps a forked child takes before it stops waiting to be an
+      // `execve` and installs its parent's modules. In `extra`, so it
+      // reaches the Worker that acts on it.
+      adoptAfter: typeof globalThis.GEX_ADOPT_AFTER === "number"
+        ? globalThis.GEX_ADOPT_AFTER
+        : undefined,
       // The closure's libraries, in `extra` rather than `opts` so a forked
       // child gets them too: a child adopts its parent's memory and with it
       // the dispatch *directory*, but its dispatch tables belong to its own

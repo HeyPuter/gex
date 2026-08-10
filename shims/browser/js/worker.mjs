@@ -139,6 +139,18 @@ async function handle(msg) {
   }
   if (msg?.kind !== 'run' && msg?.kind !== 'adopt' && msg?.kind !== 'thread') return;
 
+  // How many traps a forked child takes before it installs its parent's
+  // modules, carried in the start message rather than read off a global.
+  //
+  // It was set on `globalThis` in the page and read on `globalThis` here,
+  // and those are different contexts, so `?adopt=N` selected nothing: every
+  // run that claimed to compare eager against deferred compared the default
+  // against itself, and three bisect conclusions were drawn from it. Set
+  // before anything looks at it, which is what the first attempt at this got
+  // wrong -- it landed inside `WorkerEnv.write`, so it took effect only once
+  // the guest had already written something, long after the child adopted.
+  if (msg.adoptAfter !== undefined) globalThis.GEX_ADOPT_AFTER = msg.adoptAfter;
+
   // Everything the guest writes goes back to whoever started this. Posted
   // rather than accumulated: a run that takes minutes should say what it is
   // doing while it takes them, which is the whole lesson of the harness work.
