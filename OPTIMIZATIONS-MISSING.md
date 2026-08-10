@@ -2445,3 +2445,57 @@ being computed and thrown away.
 the same terms: a load and a compare, once per syscall, saying each pin once.
 A misplacement is loud regardless of tracing, because the guest is about to
 branch into code built for a different address.
+
+### The closure was unreachable, and every part of it checked out
+
+A miss asks the host to fill a page only when `FILL_POSSIBLE` says a module of
+this process can answer. That flag was set in exactly one place --
+`#installModule`, when a module with passive segments is *instantiated* -- and
+a closure library is deliberately never instantiated until a fill asks for it.
+
+Nothing instantiated, so nothing armed. Nothing armed, so no miss asked.
+No miss asked, so nothing was instantiated. Every branch into libc and into
+`ld.so` fell straight through to the runtime translator while a closure
+covering both of them whole sat in the process doing nothing.
+
+It survived this long because each part of it verifies:
+
+- the pin lands -- `pin ok: libc.so.6 wanted 0x5520000, landed 0x5520000`;
+- the module claims the pages -- every address lifted in libc and in ld.so is
+  on a page the module's own `gex.meta` names, checked entry by entry;
+- the blocks are in the module -- libc is 355 pages and 295,294 blocks, and
+  the linker 39 pages and 30,627 for a `.text` only 28,813 addresses long;
+- `--exhaustive-for` matched: `libc.so.6`.starts_with(`libc.so`) is true, and
+  the module is 67.9 MB.
+
+Four theories died against those facts before the flag came into view. What
+finally pointed at it was counting the lifts that happen on a page some
+closure library already claims -- there should be none, and there were 16,380.
+That counter (`[closure] page unfilled`) stays.
+
+Measured, `bash -c /bin/true` on the demo site:
+
+    pid 1       34,998 blocks -> 18,618    6712ms -> 4987ms   765 modules -> 343
+                libc 10,239 -> 0, ld.so 6,141 -> 0
+    /bin/true   10,308 blocks ->  4,307    1950ms -> 1568ms    85 modules ->  18
+
+### A closure has one image, so build it for the program that is pid 1
+
+`resolve_all` makes only the first root's image an object: two images would
+both want `PIE_BASE` and the second's dispatch entries would land on the
+first's pages. The demo's closure was built for `apt-get` while its pid 1 is
+`bash`, so bash was the one program in the run with no module at all -- and
+once libc and ld.so were reachable, bash was *everything* that was left:
+18,595 blocks in pid 1 and another 4,106 in every child it forks.
+
+Built with `bash` as the first root and apt, dpkg, apt-key, gpgv and
+`/usr/lib/apt/methods` as extra roots, the closure is 33 objects and 190 MB
+against 82, and covers the union of what the demo executes. The extra roots
+contribute their libraries, which is where their code actually is: apt's
+`file` method is 67 KiB against libseccomp's 180.
+
+The manifest now names the program its image module was built from, and
+`loadClosure` is given the path pid 1 will run and checks the two match. The
+failure it prevents is silent -- the guest starts inside another program's
+code and exits without making a syscall, which reads as a program that decided
+to do nothing.

@@ -249,14 +249,24 @@ async function bootDebian(ctx) {
     // `null` when there is no manifest, and the demo then runs exactly as it
     // did before.
     //
-    // No image module. pid 1 here is `bash`, and an image module is one
-    // program's own text: hand `bash` the one built for `apt-get` and it
-    // starts inside another program's code and exits without making a
-    // syscall. The libraries are the point anyway -- libapt, libstdc++ and
-    // libc are what every one of apt's fifty processes pays to translate.
+    // With the image module, because pid 1 here is `bash` and the closure is
+    // built with `bash` as its first root.
+    //
+    // An image module is one program's own text, so asking for the wrong one
+    // starts the guest inside somebody else's code -- it exits without making
+    // a syscall, which is exactly what the first attempt at this did. The
+    // path is passed so `loadClosure` can check it against the manifest
+    // rather than take the caller's word.
+    //
+    // It was built for `apt-get` before, which left `bash` as the one program
+    // in the run with no module at all: 18,595 blocks in pid 1 and another
+    // 4,106 in every child it forks, by then *all* of what either lifted.
+    // apt and its methods are still in the closure -- as extra roots, which
+    // contributes their libraries, which is where their code actually is.
     ctx.busy('loading the closure');
     const { loadClosure } = await import('./closure.js');
     const closure = await loadClosure('/closure/debian', {
+      image: '/bin/bash',
       log: (s) => ctx.term.writeln(ctx.ansi.dim(s)),
     });
 

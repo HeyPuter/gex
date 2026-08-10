@@ -21,9 +21,31 @@
 set -e
 cd "$(dirname "$0")/.."
 
-name=${1:?usage: build-closure.sh <name> <sysroot> <program>}
-sysroot=${2:?usage: build-closure.sh <name> <sysroot> <program>}
-program=${3:?usage: build-closure.sh <name> <sysroot> <program>}
+name=${1:?usage: build-closure.sh <name> <sysroot> <program> [more...]}
+sysroot=${2:?usage: build-closure.sh <name> <sysroot> <program> [more...]}
+program=${3:?usage: build-closure.sh <name> <sysroot> <program> [more...]}
+shift 3
+
+# Everything after the program is another root of the same closure.
+#
+# Only the first program's *image* becomes a module -- two images would both
+# want `PIE_BASE` and the second's dispatch entries would land on the first's
+# pages -- but every root's libraries do. So the first argument should be the
+# program the page runs as pid 1, and the rest are what it goes on to exec.
+#
+# This is what the demo was missing. Its closure was built for `apt-get` while
+# pid 1 is `bash`, so bash was the one program in the run with no module: 18,595
+# blocks in pid 1 and another 4,106 in every child it forks, which by then was
+# *all* of what either of them lifted. A directory of helpers goes in whole --
+# `/usr/lib/apt/methods` is apt's.
+withs=""
+for w in "$@"; do
+    if [ -d "$sysroot$w" ]; then
+        withs="$withs --with-dir $sysroot$w"
+    else
+        withs="$withs --with $sysroot$w"
+    fi
+done
 
 out="web/public/closure/$name"
 work=$(mktemp -d)
@@ -40,7 +62,7 @@ echo "building the closure for $program..."
 # dozens of programs from one closure.
 target/release/gexc build --closure --sysroot "$sysroot" --no-shared-memory \
     --exhaustive-for "${GEX_WHOLE:-libc.so,ld-linux}" \
-    "$sysroot$program" -o "$work/c.wasm"
+    $withs "$sysroot$program" -o "$work/c.wasm"
 
 mkdir -p "$out"
 rm -f "$out"/*.wasm "$out"/closure.json
@@ -54,7 +76,7 @@ cp "$work"/*.wasm "$out/"
 # manifest with no layout at all, the libraries land wherever the loader puts
 # them, and every block in them has its address baked in. A closure that loads
 # and then runs the wrong code is worse than one that does not load.
-python3 - "$work" "$out" <<'PY'
+python3 - "$work" "$out" "$program" <<'PY'
 import json, os, sys
 work, out = sys.argv[1], sys.argv[2]
 libs = sorted(n for n in os.listdir(out)
@@ -67,7 +89,14 @@ for line in open(os.path.join(work, 'c.pins')):
     at = int(f[0], 0)
     if at > 0:
         pins[' '.join(f[2:])] = {'base': at, 'span': int(f[1], 0)}
-json.dump({'image': 'c.wasm', 'libs': libs, 'pins': pins},
+# The program the image module was built from.
+#
+# `c.wasm` is one program's own text at `PIE_BASE`, and handing it to a page
+# whose pid 1 is a different program starts the guest inside somebody else's
+# code -- it exits without making a syscall, which is exactly what the first
+# attempt at this did. Named here so the loader can check rather than trust.
+json.dump({'image': 'c.wasm', 'program': sys.argv[3],
+           'libs': libs, 'pins': pins},
           open(os.path.join(out, 'closure.json'), 'w'))
 print(f"  {len(libs)} libraries, {len(pins)} pins")
 PY

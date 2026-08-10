@@ -75,6 +75,19 @@ export async function loadClosure(base, { image = false, log = () => {} } = {}) 
   // module built for `apt-get` starts it inside another program's code, and
   // it exits without making a syscall -- which is exactly what the first
   // attempt at this did.
-  const img = image ? await fetchBytes(`${base}/${encodeURIComponent(manifest.image)}`) : null;
-  return { image: img, libs, pins: manifest.pins };
+  //
+  // `image` is the guest path the caller is about to run as pid 1, and the
+  // manifest says which program the module was built from. Checked rather
+  // than trusted: the failure is silent and looks like a program that decided
+  // to do nothing, so a mismatch is worth a line and no image module.
+  let img = null;
+  if (image) {
+    const want = typeof image === 'string' ? image : manifest.program;
+    if (manifest.program && want !== manifest.program) {
+      log(`closure: image module is ${manifest.program}, not ${want} -- running without it`);
+    } else {
+      img = await fetchBytes(`${base}/${encodeURIComponent(manifest.image)}`);
+    }
+  }
+  return { image: img, program: manifest.program, libs, pins: manifest.pins };
 }

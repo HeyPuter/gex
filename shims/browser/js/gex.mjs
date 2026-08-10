@@ -757,6 +757,7 @@ export class Gex {
       { gex: this.#imports },
     );
     this.#guestInstantiateMs = performance.now() - tGuest;
+    this.#offerToFill(this.#guest);
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: instantiated, installing');
     await this.#installClosure();
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: done');
@@ -997,6 +998,7 @@ export class Gex {
       { gex: this.#imports },
     );
     this.#guestInstantiateMs = performance.now() - tGuest;
+    this.#offerToFill(this.#guest);
     // Everything the process translated before this thread existed.
     await this.#catchUp();
   }
@@ -2486,6 +2488,27 @@ export class Gex {
       if (packed < 0) continue;
       tables[packed >>> 24].set(packed & 0xffffff, inst.exports[name]);
     }
+  }
+
+  /**
+   * Let a module that is already instantiated answer fills.
+   *
+   * `#installModule` does this for every module it installs, and the *image*
+   * module does not go through it: it is the guest module itself, built with
+   * `Linkage::Own`, instantiated by `load` because it owns the memory and the
+   * tables everything else imports. So its element segments -- passive, like
+   * any module past the block gate -- were never written by anybody, and a
+   * page's slots stayed on the miss stub while the module holding its blocks
+   * sat instantiated in the same process.
+   *
+   * `bash` translated whole is 211,979 blocks and 42 MB of module, and with
+   * it in place pid 1 lifted exactly as many blocks as without: 15,351, to
+   * the block. A module nothing can fill from is a module that does nothing.
+   */
+  #offerToFill(inst) {
+    if (typeof inst?.exports?.[FILL_AT] !== 'function') return;
+    this.#unfilled.unshift(inst);
+    this.#shim.exports.gex_fill_possible?.(1);
   }
 
   /**
