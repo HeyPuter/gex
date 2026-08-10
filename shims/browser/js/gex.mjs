@@ -640,8 +640,14 @@ export class Gex {
       ap = this.#shim.exports.gex_alloc(argvBlob.length) >>> 0;
       this.#bytes().set(argvBlob, ap);
     }
+    // Phase markers, because a boot that never finishes says nothing about
+    // where it stopped. A 694 MB closure under a shell reaches none of these.
+    console.error(`[gex] load: ${Object.keys(opts.pins ?? {}).length} pins, `
+      + `${Object.keys(files).length} files staged, loading the program`);
     const entry = this.#shim.exports.gex_load(ptr, elf.length, ap, argvBlob.length);
     if (entry === 0n) throw new Error('gex: could not load the program');
+    console.error(`[gex] load: program at ${entry}, `
+      + `${(opts.closure ?? []).length} closure modules to install`);
 
     // The rest of the closure: one module per shared library, translated
     // ahead of time by the same `gexc` run that produced the image module
@@ -671,7 +677,9 @@ export class Gex {
     this.#guest = await WebAssembly.instantiate(await WebAssembly.compile(guestWasm), {
       gex: this.#imports,
     });
+    console.error('[gex] load: guest instantiated, installing the closure');
     await this.#installClosure();
+    console.error('[gex] load: done');
     return entry;
   }
 
