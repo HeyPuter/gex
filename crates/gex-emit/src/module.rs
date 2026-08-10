@@ -960,7 +960,8 @@ impl ModuleBuilder {
         f.local_get(1);
         f.store(0x37, 3, ctx::PC as u32);
 
-        f.local_get(0); // ctx argument for the target block
+        let entry = f.add_local(ValType::I32);
+        let index = f.add_local(ValType::I32);
 
         // The same branchless two-level lookup tier-1 emits: page directory,
         // then instruction slot within the page.
@@ -979,6 +980,28 @@ impl ModuleBuilder {
         f.i64_const(DISPATCH_MAX_PAGES as i64);
         f.byte(0x54); // i64.lt_u
         f.select();
+        f.local_tee(entry);
+
+        // The slot half only. Without this the table index rides along in the
+        // top eight bits and is *added to the slot*, which is how the demo
+        // site died: an entry naming table 1 is `(1 << 24) | slot`, so a
+        // branch to a page in table 1 asked table 0 for element 16,790,416 --
+        // against a table 9,999,360 long -- and the engine said `table index
+        // is out of bounds`.
+        //
+        // `enter` was written when there was one table, where the top bits
+        // are always zero and this mask would be an instruction that could
+        // never change anything. #64 added eight of them and taught
+        // `emit_dispatch_tail_call_inner` to mask and select; this copy of
+        // the same lookup was not touched, and stayed wrong for as long as no
+        // run used more than one table's worth of slots. `apt-get update` in
+        // the browser is the first thing that does: forty processes drawing
+        // from one global slot counter exhaust table 0, and the next `enter`
+        // -- which is every `fork` and every `execve` -- traps.
+        if gex_abi::DISPATCH_TABLES > 1 {
+            f.i32_const(gex_abi::DISPATCH_SLOT_MASK as i32);
+            f.byte(0x71); // i32.and
+        }
 
         f.local_get(1);
         f.i64_const((DISPATCH_PAGE - 1) as i64);
@@ -987,8 +1010,36 @@ impl ModuleBuilder {
         f.byte(0x88); // i64.shr_u
         f.byte(0xa7); // i32.wrap_i64
         f.byte(0x6a); // i32.add
+        f.local_set(index);
 
-        f.return_call_indirect(self.block_ty, 0);
+        if gex_abi::DISPATCH_TABLES <= 1 {
+            f.local_get(0); // ctx argument for the target block
+            f.local_get(index);
+            f.return_call_indirect(self.block_ty, 0);
+            return f.finish();
+        }
+
+        // And the table the entry names, selected the way tier-1 selects it:
+        // `n` blocks, table k breaking to depth `n-1-k`, the default being
+        // table 0 so an entry naming a table that does not exist reaches the
+        // miss stub rather than the engine.
+        let n = gex_abi::DISPATCH_TABLES as u32;
+        f.local_get(entry);
+        f.i32_const(gex_abi::DISPATCH_SLOT_BITS as i32);
+        f.byte(0x76); // i32.shr_u
+        f.local_set(entry);
+        for _ in 0..n {
+            f.block_void();
+        }
+        f.local_get(entry);
+        let targets: Vec<u32> = (0..n).map(|k| n - 1 - k).collect();
+        f.br_table(&targets, n - 1);
+        for k in (0..n).rev() {
+            f.end();
+            f.local_get(0); // ctx argument for the target block
+            f.local_get(index);
+            f.return_call_indirect(self.block_ty, k);
+        }
         f.finish()
     }
 }
