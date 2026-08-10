@@ -605,6 +605,24 @@ pub extern "C" fn k_obj_translated(obj: u64, produced: u32) {
     }
 }
 
+/// Has this object been translated whole and published?
+///
+/// The miss path asks so it can take *all* of a finished object in one go
+/// rather than sixteen units at a time. Sixteen is right for an object being
+/// discovered a block at a time -- a stored unit holds only what was
+/// reachable from the block that faulted in the process that built it, so
+/// most of them do not contain the address this process wants. When the whole
+/// object is there, that reasoning stops applying: everything is covered, and
+/// the process should stop missing in it entirely.
+#[no_mangle]
+pub extern "C" fn k_obj_is_translated(obj: u64) -> u32 {
+    modules()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .translated
+        .contains(&obj) as u32
+}
+
 /// The `n`th module holding code for this object, or zero past the end.
 #[no_mangle]
 pub extern "C" fn k_mod_for_object(obj: u64, n: u32) -> u32 {

@@ -291,6 +291,7 @@ extern "C" {
     fn k_mod_claim_object(obj: u64, id: u32);
     fn k_obj_translating(obj: u64, pid: u32) -> u32;
     fn k_obj_translated(obj: u64, produced: u32);
+    fn k_obj_is_translated(obj: u64) -> u32;
     fn k_mod_for_object(obj: u64, n: u32) -> u32;
     fn k_mod_slots(id: u32) -> u64;
     fn k_mod_len(id: u32) -> u32;
@@ -4962,6 +4963,21 @@ fn object_identity(h: &Host, addr: u64) -> Option<u64> {
 
 /// Every module any process has stored for this object that this Worker has
 /// not got: `(id, slots, dirs, wasm)` each.
+/// Whether the object covering this page has been translated whole.
+fn obj_finished(h: &Host, page: u64) -> bool {
+    // SAFETY: a scalar in, a scalar out, and no borrow of anything this
+    // module owns.
+    unsafe {
+        if k_present() == 0 {
+            return false;
+        }
+        match object_identity(h, page * gex_abi::DISPATCH_PAGE) {
+            Some(obj) => k_obj_is_translated(obj) != 0,
+            None => false,
+        }
+    }
+}
+
 fn shared_modules_of_object(h: &Host, obj: u64) -> Vec<(u32, u64, Vec<(u64, u32)>, Vec<u8>)> {
     let mut out = Vec::new();
     // SAFETY: scalars in, and the readers below size their buffers from the
@@ -6553,7 +6569,24 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     h,
                     object_identity(h, page * gex_abi::DISPATCH_PAGE).unwrap_or(0),
                 );
-                ready.truncate(per_miss);
+                // All of it, when the object has been translated whole.
+                //
+                // The cap exists because a stored unit holds only what was
+                // reachable from the block that faulted in the process that
+                // built it, so most units do not contain the address this
+                // process wants and taking hundreds of them is hundreds of
+                // compiles for nothing. That reasoning stops applying the
+                // moment the object is complete: everything is covered, so
+                // taking the lot ends the misses in that object outright.
+                //
+                // Measured before this: a process finds what earlier ones
+                // published -- `hit=241 miss=0`, 958 modules served -- and
+                // still lifts twenty-five thousand blocks, because sixteen at
+                // a time is a lottery over a set that mostly does not answer.
+                let whole = obj_finished(h, page);
+                if !whole {
+                    ready.truncate(per_miss);
+                }
                 if !ready.is_empty() {
                     if tracing() {
                         trace_line(&format!(
@@ -7425,6 +7458,18 @@ pub extern "C" fn gex_object_at(addr: i64, out: u32, max: u32) -> u32 {
     let dst = shim_slice_mut(out, n as u32);
     dst.copy_from_slice(&name.as_bytes()[..n]);
     n as u32
+}
+
+/// The highest slot total any queued module needs.
+///
+/// So the host can grow its dispatch tables **once** for a batch instead of
+/// once per module. `Table.grow` reallocates, so growing four hundred times
+/// by a little is quadratic in the table's size: serving a whole object took
+/// table growth from 317ms to 1741ms a process and gave back more than the
+/// compile it saved.
+#[no_mangle]
+pub extern "C" fn gex_jit_pending_slots() -> u32 {
+    with_host(|h| h.jit.pending.iter().map(|p| p.slots).max().unwrap_or(0) as u32)
 }
 
 /// The module JS has to instantiate, or zero length if there is none.

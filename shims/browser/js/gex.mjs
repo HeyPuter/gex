@@ -1966,6 +1966,17 @@ export class Gex {
           // apart on its own.
           e.gex_fill_done((await this.fillSlot(want >>> 0)) ? 1 : 0);
         }
+        // One grow for the whole queue, before any of it is installed.
+        //
+        // `#installModule` grows to its own module's need, and `Table.grow`
+        // reallocates -- so a batch of four hundred modules with a rising
+        // need grows four hundred times, each copying a larger table. When
+        // the miss path started serving a finished object whole, that turned
+        // 317ms of growing into 1741ms and swallowed the compile it saved.
+        if (e.gex_jit_pending_len() >>> 0) {
+          const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+          if (need) this.#growTables(need);
+        }
         while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
         // The parent's modules go in *after* this Worker's own queue, never
         // between a translation and its install.
