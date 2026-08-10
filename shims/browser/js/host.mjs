@@ -52,6 +52,8 @@ export class ProcessHost {
   // without which a pthread program exhausted the array while it was still
   // starting up.
   #stacksFree = [];
+  /// The shim compiling, once, so no Worker waits on a second compile.
+  #shimCompiling = null;
   #stackOf = new Map();
 
   constructor({
@@ -102,10 +104,19 @@ export class ProcessHost {
    * clones as a reference to the code already compiled.
    */
   #shimModule() {
-    if (!(this.#shim instanceof WebAssembly.Module)) {
-      this.#shim = new WebAssembly.Module(this.#shim);
-    }
-    return this.#shim;
+    if (this.#shim instanceof WebAssembly.Module) return Promise.resolve(this.#shim);
+    // Asynchronously, and this is not a preference.
+    //
+    // `new WebAssembly.Module(bytes)` compiles synchronously, and Chromium
+    // refuses to do that on the main thread for a buffer over 8 MB -- the
+    // shim is 8.7. Node has no such rule, so the synchronous form passed
+    // every test here and killed the page at boot with `RangeError:
+    // WebAssembly.Compile is disallowed on the main thread`. The one
+    // instrument that caught it was an `unhandledrejection` handler added
+    // minutes earlier; before that the page simply stopped and the driver
+    // waited.
+    this.#shimCompiling ??= WebAssembly.compile(this.#shim).then((m) => (this.#shim = m));
+    return this.#shimCompiling;
   }
 
   /** How many children the guest has forked. */
@@ -225,6 +236,9 @@ export class ProcessHost {
         const msg = this.#pending.get(pid);
         this.#pending.delete(pid);
         if (msg) {
+          // Awaited, because compiling the shim cannot be synchronous in a
+          // browser. The Worker is idle until this arrives either way.
+          this.#shimModule().then((shimMod) =>
           w.postMessage({
             ...this.#extra,
             ...msg,
@@ -235,10 +249,11 @@ export class ProcessHost {
             // spread over V8's background threads where a profile of the
             // main thread could not see it. A `WebAssembly.Module` is
             // structured-cloneable and the engine shares the code behind it.
-            shim: this.#shimModule(),
+            shim: shimMod,
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
-          });
+          }),
+          );
         }
         break;
       }
@@ -277,16 +292,18 @@ export class ProcessHost {
         const start = (mm) => {
           if (mm?.kind !== 'ready') return;
           this.#pending.delete(key);
+          this.#shimModule().then((shimMod) =>
           w2.postMessage({
             ...this.#extra,
             kind: 'thread',
             tid: m.thread.tid,
             memory: m.thread.memory,
             kernelStack: this.#nextKernelStack(key),
-            shim: this.#shimModule(),
+            shim: shimMod,
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
-          });
+          }),
+          );
         };
         w2.addEventListener?.('message', (e) => start(e.data));
         w2.on?.('message', start);

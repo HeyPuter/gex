@@ -95,8 +95,39 @@ function captureConsole() {
 
 export async function start() {
   captureConsole();
+  // Anything that throws where nobody is catching, said out loud.
+  //
+  // `runProgram`'s rejection was the only failure this reported, so a throw
+  // in the page's own code, in a Worker, or in a promise nobody awaited left
+  // the driver waiting for an answer that could not come -- and the run
+  // looked like a slow one rather than a broken one. `apt-get update` has
+  // apparently never worked in a browser, and this is why nobody could see
+  // what it does.
+  self.addEventListener('error', (e) => {
+    report({ fatal: `${e.message} at ${e.filename}:${e.lineno}` });
+  });
+  self.addEventListener('unhandledrejection', (e) => {
+    const r = e.reason;
+    report({ fatal: `unhandled rejection: ${(r && (r.stack || r.message)) || String(r)}` });
+  });
   const params = new URLSearchParams(location.search);
   const shell = params.get('shell') || '/bin/dash';
+  // `?recompile=0` runs the browser the way `run-node.mjs` runs by default,
+  // and `?debug=1` mirrors every guest write to the console and narrates a
+  // crash where it happens. Both exist because the two hosts disagreed about
+  // whether a child process works at all, and neither difference could be
+  // switched off from outside the bundle.
+  const recompileObjects = params.has('recompile') ? Number(params.get('recompile')) : 8192;
+  if (params.get('debug')) globalThis.GEX_DEBUG_EXIT = 1;
+  // A page cannot open a TCP socket, so the guest's network is carried over
+  // Wisp to a proxy. Without one `apt-get update` reaches no mirror, which is
+  // the only command anybody wants to measure here.
+  let network = null;
+  if (params.get('wisp')) {
+    const { WispNetwork } = await import('./net.js');
+    network = new WispNetwork(params.get('wisp'));
+    await network.start();
+  }
   const t0 = performance.now();
 
   const tar = await fetchBytes('/harness/rootfs.tar');
@@ -124,6 +155,8 @@ export async function start() {
     cwd: '/',
     tty: true,
     uid: 0,
+    recompileObjects,
+    network,
   });
   done.catch((e) => report({ fatal: String(e && e.message) }));
 
@@ -150,18 +183,28 @@ export async function start() {
     // spell the marker -- the terminal echoes input back in cooked mode, and a
     // literal marker in the command line matched the instant it was sent.
     // Every command then "finished" in 0ms with no output.
+    // Bracketed, not trimmed. The output used to be everything before the end
+    // marker with its first line dropped, on the assumption that the first
+    // line is the terminal echoing what was typed -- and when the shell does
+    // not echo, that is the answer being thrown away: `echo alive` reported
+    // nothing at all.
     const mark = `__GEX_${n}_DONE__`;
     const typed = `__GEX_${n}_DO""NE__`;
+    const startMark = `__GEX_${n}_HERE__`;
+    const startTyped = `__GEX_${n}_HE""RE__`;
     logs.length = 0;
     const started = performance.now();
     let out;
     let error = null;
     try {
       io.take();
-      io.send(`${job.cmd}; echo ${typed}\n`);
+      io.send(`echo ${startTyped}; ${job.cmd}; echo ${typed}\n`);
       const raw = await io.until((t) => t.includes(mark), job.timeoutMs || 120000);
-      // Drop the echoed command and the marker itself.
-      out = raw.split(mark)[0].replace(/^.*\n/, '');
+      // Between the markers, and nothing else: whatever the terminal did or
+      // did not echo falls outside them.
+      const from = raw.indexOf(startMark);
+      const body = from < 0 ? raw : raw.slice(from + startMark.length);
+      out = body.split(mark)[0].replace(/^\r?\n/, '');
     } catch (e) {
       out = '';
       error = String(e.message);

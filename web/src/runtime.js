@@ -289,6 +289,13 @@ export async function runProgram(
     // works in a page: the shim prints the guest pc, and which module that
     // address lands in is the answer.
     heartbeat = 0,
+    // KiB of mapped text per object to statically recompile once it proves
+    // hot; 0 turns it off and leaves the guest to arrive one dispatch miss at
+    // a time. A parameter because it is the one guest-visible setting on which
+    // the page and `run-node.mjs` disagree -- the page has always had it on
+    // and the Node harness has it off by default -- so a fault that appears in
+    // only one of the two hosts cannot be attributed until it can be switched.
+    recompileObjects = 8192,
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
@@ -351,7 +358,7 @@ export async function runProgram(
       // and it covers every library these demos run except Mesa's software
       // rasteriser, which nothing here wants because the renderer is on the
       // other side of the vtest socket.
-      recompileObjects: 8192,
+      recompileObjects,
     },
     onOutput: (fd, text, pid, m) => {
       if (m?.lflag !== undefined) tenv.lflag = m.lflag;
@@ -383,7 +390,7 @@ export async function runProgram(
       elf,
       files,
       args,
-      opts: { cwd, tty, uid, recompileObjects: 8192, heartbeat },
+      opts: { cwd, tty, uid, recompileObjects, heartbeat },
     });
     return { status, host, tenv };
   } finally {

@@ -22,7 +22,7 @@
 // the two hosts are measured against identical bytes and a changed file needs
 // no rebuild.
 import { spawn } from 'node:child_process';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { join, dirname, extname, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -157,7 +157,10 @@ function makeServer(root) {
       const cmd = url.searchParams.get('cmd') || '';
       const id = nextId++;
       const answer = new Promise((r) => pending.set(id, r));
-      queue.push({ id, cmd, timeoutMs: Number(url.searchParams.get('timeout') || 120000) });
+      // Fifteen minutes by default. Two was chosen for `ls`; `apt-get update`
+      // takes nearly two on its own under Node and more in a browser, and a
+      // measurement that gives up before the guest does is not a measurement.
+      queue.push({ id, cmd, timeoutMs: Number(url.searchParams.get('timeout') || 900000) });
       handOut();
       const r = await answer;
       return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(r));
@@ -202,7 +205,10 @@ async function start(args) {
   const profile = mkdtempSync(join(tmpdir(), 'gex-harness-'));
   const url =
     `http://127.0.0.1:${PORT}/?harness=1&shell=${encodeURIComponent(args.shell || '/bin/dash')}` +
-    (args.trace ? '&trace=1' : '');
+    (args.trace ? '&trace=1' : '') +
+    (args.debug ? '&debug=1' : '') +
+    (args.wisp ? `&wisp=${encodeURIComponent(args.wisp)}` : '') +
+    (args.recompile !== undefined ? `&recompile=${encodeURIComponent(args.recompile)}` : '');
   const chrome = spawn(
     CHROME,
     [
@@ -236,11 +242,33 @@ async function start(args) {
   process.on('SIGTERM', () => process.exit(0));
 }
 
-async function control(path, params = {}) {
+/**
+ * Ask the server, and wait as long as it takes.
+ *
+ * `fetch` will not do: the control endpoints are held open until the page has
+ * an answer, and undici gives up on a response whose headers have not
+ * arrived within its own timeout. A command that runs for minutes -- which is
+ * every interesting one, `apt-get update` among them -- died with
+ * `UND_ERR_HEADERS_TIMEOUT` before the guest had finished. `http.request` has
+ * no such limit.
+ */
+function control(path, params = {}) {
   const q = new URLSearchParams(params).toString();
-  const r = await fetch(`http://127.0.0.1:${PORT}${path}${q ? `?${q}` : ''}`);
-  if (r.status === 204) return null;
-  return r.json();
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      { host: '127.0.0.1', port: PORT, path: `${path}${q ? `?${q}` : ''}` },
+      (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => (body += c));
+        res.on('end', () => resolve(res.statusCode === 204 ? null : JSON.parse(body || 'null')));
+      },
+    );
+    req.on('error', reject);
+    // No socket timeout at all: the answer arrives when the guest is done.
+    req.setTimeout(0);
+    req.end();
+  });
 }
 
 // ------------------------------------------------------------------- the CLI
@@ -252,6 +280,9 @@ for (let i = 0; i < rest.length; i++) {
   if (rest[i] === '--root') flags.root = rest[++i];
   else if (rest[i] === '--shell') flags.shell = rest[++i];
   else if (rest[i] === '--trace') flags.trace = true;
+  else if (rest[i] === '--debug') flags.debug = true;
+  else if (rest[i] === '--wisp') flags.wisp = rest[++i];
+  else if (rest[i] === '--recompile') flags.recompile = rest[++i];
   else positional.push(rest[i]);
 }
 
@@ -282,7 +313,8 @@ if (verb === 'start') {
   process.exit(0);
 } else {
   console.error(
-    'usage: harness.mjs start|run|ready|stop|once [--root DIR] [--shell PATH] [cmd...]',
+    'usage: harness.mjs start|run|ready|stop|once [--root DIR] [--shell PATH]\n' +
+      '                   [--trace] [--debug] [--recompile KIB] [cmd...]',
   );
   process.exit(2);
 }
