@@ -2523,6 +2523,32 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
 static CLOSURE_DIRS: SingleThreaded<Vec<(u64, u32)>> =
     SingleThreaded(const { RefCell::new(Vec::new()) });
 
+/// Which closure library covers each page, by the order they were added.
+///
+/// The host needs this to instantiate a library only when a branch reaches
+/// it. Slots are already written on demand -- see the fill helpers -- but the
+/// *instances* were still all built at process start: 37 seconds of an apt
+/// run that takes 61, for twenty-nine libraries of which apt touches a
+/// handful. `libgcrypt` is 304 MiB and this run calls almost none of it.
+static CLOSURE_OWNER: SingleThreaded<std::collections::BTreeMap<u64, u32>> =
+    SingleThreaded(const { RefCell::new(std::collections::BTreeMap::new()) });
+
+/// How many closure libraries have been registered, which is the ordinal the
+/// next one gets. The host adds them in the same order, so the number it
+/// hears back indexes its own list.
+static CLOSURE_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The closure library covering this page, or -1.
+#[no_mangle]
+pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
+    CLOSURE_OWNER
+        .0
+        .borrow()
+        .get(&page)
+        .map(|v| *v as i32)
+        .unwrap_or(-1)
+}
+
 /// Where the closure build says each object goes, staged until the kernel
 /// that will honour it exists.
 ///
@@ -2667,6 +2693,13 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
         return 0;
     };
     CLOSURE_DIRS.0.borrow_mut().extend(meta.dir_entries.iter().copied());
+    {
+        let idx = CLOSURE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut owner = CLOSURE_OWNER.0.borrow_mut();
+        for (page, _) in &meta.dir_entries {
+            owner.insert(*page, idx);
+        }
+    }
     with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         for (page, base) in &meta.dir_entries {

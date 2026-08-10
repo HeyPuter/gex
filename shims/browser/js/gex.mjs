@@ -195,6 +195,8 @@ export class Gex {
   #unfilled = [];
   /** Closure libraries that arrived after this process started. */
   #streamed = 0;
+  /** Closure libraries registered but not yet instantiated, in shim order. */
+  #lazyClosure = [];
   // Fill requests answered, and requests nobody could answer.
   #filled = 0;
   #unanswered = 0;
@@ -720,7 +722,21 @@ export class Gex {
     const need = add(gp, meta.length) >>> 0;
     this.#shim.exports.gex_free?.(gp, meta.length);
     if (!need) return false;
-    await this.#installModule(entry instanceof Uint8Array ? entry : entry.mod, need);
+    const mod = entry instanceof Uint8Array ? entry : entry.mod;
+    // Registered and reserved, not instantiated.
+    //
+    // The directory now points at this library's pages and the tables are
+    // long enough to hold its slots, so a branch into it resolves and faults
+    // where it should. What has not happened is `WebAssembly.instantiate`,
+    // and that is the point: apt's closure is twenty-nine libraries and a
+    // process instantiated all of them at boot -- 37 seconds of a 61 second
+    // run -- to reach a handful. `libgcrypt` alone is 304 MiB.
+    //
+    // `fillSlot` builds the instance when a branch actually wants one of
+    // these pages. Everything downstream already tolerates the wait: a page
+    // nobody can fill yet is forgiven and asked again.
+    this.#growTables(need);
+    this.#lazyClosure.push({ mod, need, inst: null });
     this.#streamed++;
     return true;
   }
@@ -749,13 +765,20 @@ export class Gex {
         this.#shim.exports.gex_free?.(gp, meta.length);
       }
       if (!need) continue;
-      // Timed per library, because "the page never became ready" needed
-      // splitting further. Fetching and compiling all 694 MB of apt's closure
-      // takes six seconds; the shell then never reaches a prompt, and this
-      // loop is the only thing between the two.
-      const began = performance.now();
-      await this.#installModule(paired ? entry.mod : wasm, need);
-      console.error(`[gex] closure install ${i}: ${need} slots, ${Math.round(performance.now() - began)}ms`);
+      // Registered and reserved, not instantiated.
+      //
+      // The directory now points at this library's pages and the tables are
+      // long enough for its slots, so a branch into it resolves and faults
+      // where it should. What has not happened is the instantiate, and that
+      // is the point: apt's closure is twenty-nine libraries, a process built
+      // every one of them at boot -- 37 of a 61 second run -- and apt reaches
+      // a handful. `libgcrypt` alone is 304 MiB.
+      //
+      // `fillSlot` builds one when a branch wants a page it covers. The wait
+      // is already tolerated: a page nobody can fill yet is forgiven and
+      // asked again when something new arrives.
+      this.#growTables(need);
+      this.#lazyClosure.push({ mod: paired ? entry.mod : wasm, need, inst: null });
     }
     this.#closureModules = [];
   }
@@ -1650,7 +1673,7 @@ export class Gex {
           // be askable again once another module arrives, and a page nobody
           // will ever hold must stop trapping. The shim cannot tell those
           // apart on its own.
-          e.gex_fill_done(this.fillSlot(want >>> 0) ? 1 : 0);
+          e.gex_fill_done((await this.fillSlot(want >>> 0)) ? 1 : 0);
         }
         while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
         // The parent's modules go in *after* this Worker's own queue, never
@@ -2118,7 +2141,22 @@ export class Gex {
    * Newest first, because a process that has just installed a module is
    * usually about to branch into it.
    */
-  fillSlot(slot) {
+  async fillSlot(slot) {
+    // The library that covers this page, instantiated now if it has not been.
+    //
+    // The shim answers by page because that is what a miss knows, and its
+    // ordinals are the order the libraries were registered -- the same order
+    // they went into `#lazyClosure`.
+    const owner = this.#shim.exports.gex_closure_owner
+      ? this.#shim.exports.gex_closure_owner(BigInt(slot))
+      : -1;
+    if (owner >= 0) {
+      const lazy = this.#lazyClosure[owner];
+      if (lazy && !lazy.inst) {
+        lazy.inst = true;
+        await this.#installModule(lazy.mod, lazy.need);
+      }
+    }
     for (const inst of this.#unfilled) {
       if (inst.exports[FILL_AT](slot)) {
         this.#filled++;
