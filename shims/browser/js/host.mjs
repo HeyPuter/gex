@@ -402,8 +402,19 @@ export class ProcessHost {
         // hosts disagreed there was nothing to compare. The Node side prints
         // its own, hence the guard.
         if (typeof window !== 'undefined' && m.millis !== undefined) {
+          // How long the process existed, against what it can account for.
+          //
+          // Everything else here is work the runtime did. A process that
+          // lived five seconds and can name one and a half of them is
+          // spending the rest somewhere nothing measures -- guest code
+          // running, or waiting -- and without the total there is no way to
+          // see that the two do not add up.
+          const lived = this.#asked.has(pid)
+            ? Math.round(performance.now() - this.#asked.get(pid))
+            : 0;
+          this.#asked.delete(pid);
           console.log(
-            `[gex] pid ${pid}: ${m.millis}ms translating ${m.blocks} blocks` +
+            `[gex] pid ${pid}: lived ${lived}ms, ${m.millis}ms translating ${m.blocks} blocks` +
               (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
             ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
