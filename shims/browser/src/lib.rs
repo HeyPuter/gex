@@ -1116,7 +1116,35 @@ fn arena_take(len: u64) -> Option<u64> {
     // and this cursor is the one thing that could put something else there:
     // the heap and the arena both take from it, and neither is visible to
     // the memory map's own idea of what is free.
-    let at = if at == 0 { gex_abi::ARENA_BOTTOM } else { at };
+    //
+    // And above whatever the memory already reaches, which is the part that
+    // took three days to find. This cursor is a static of *this module
+    // instance*, so it is zero in every freshly instantiated shim -- but a
+    // forked child instantiates a fresh shim over a memory that already holds
+    // its parent's entire address space, every byte of it handed out from
+    // `ARENA_BOTTOM` upwards. Starting at `ARENA_BOTTOM` there hands the
+    // child's first claim a span the parent is still using, and nothing
+    // notices: `MemoryMap::mmap` inserts an arena-extended range without
+    // asking whether it is free, because the arena is meant to be the one
+    // allocator that cannot collide.
+    //
+    // What claims it first is usually this module's own heap, so the damage
+    // lands wherever the parent's mappings happen to be -- and the guest
+    // meets it later as heap corruption somewhere else entirely. `apt update`
+    // died in `malloc_consolidate(): invalid chunk size` in a forked child,
+    // moved when an unrelated string changed length, and did not happen under
+    // a closure at all: a child running code somebody else translated barely
+    // allocates, so it never claimed a span. See #96.
+    //
+    // The memory is grown to cover the whole inherited image before this
+    // module is instantiated, so its size is exactly the floor wanted. For a
+    // process that was not forked it is below `ARENA_BOTTOM` and this is the
+    // behaviour it always had.
+    let at = if at == 0 {
+        gex_abi::ARENA_BOTTOM.max(warch::memory_size(0) as u64 * 65536)
+    } else {
+        at
+    };
     let end = at.checked_add(len)?;
     if end > gex_abi::MMAP_TOP || !grow_memory_to(end) {
         return None;
@@ -3524,6 +3552,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             .unwrap_or(!0) as u32,
         std::sync::atomic::Ordering::Relaxed,
     );
+    IN_SYSCALL.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _in_syscall = InSyscall;
     // How long each kind of syscall takes, when there is a heartbeat.
     //
     // Counts alone cannot answer the question glxgears asks: it holds a
@@ -5765,10 +5795,38 @@ fn trap() -> ! {
 /// kernel to answer would panic instead of answering.
 static LAST_SYSCALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(!0);
 
+/// Whether the guest is *still* inside that syscall, rather than past it.
+///
+/// `LAST_SYSCALL` alone cannot tell the two apart, and the difference is the
+/// whole value of the number. `apt update` crashed on a `ret` in a forked
+/// child and reported "inside syscall 99" -- `set_robust_list`, whose handler
+/// is `Ok(0)` and touches nothing. It was simply the last call the child had
+/// made before running on into translated code. Days were spent inside a
+/// handler that could not fault.
+///
+/// Cleared by dropping [`InSyscall`], which a trap does not run: a wasm trap
+/// aborts rather than unwinds, so a crash genuinely inside a handler leaves
+/// this set, which is exactly what it should say.
+static IN_SYSCALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct InSyscall;
+
+impl Drop for InSyscall {
+    fn drop(&mut self) {
+        IN_SYSCALL.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Which syscall the guest was in. `0xffffffff` if it has made none.
 #[no_mangle]
 pub extern "C" fn gex_last_syscall() -> u32 {
     LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether [`gex_last_syscall`] names a call still on the stack.
+#[no_mangle]
+pub extern "C" fn gex_in_syscall() -> u32 {
+    IN_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as u32
 }
 
 /// Set by [`trap`], cleared by [`gex_handoff`].

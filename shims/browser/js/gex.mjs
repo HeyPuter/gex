@@ -74,6 +74,20 @@ const LOW_END = DISPATCH_DIR + 0x80000 * 4;
 const PAGES = GUEST_BYTES / 65536;
 const INITIAL_PAGES = GUEST_INITIAL_BYTES / 65536;
 
+/**
+ * A cheap content hash, for saying whether two copies of a region agree.
+ *
+ * FNV-1a over words rather than bytes: this runs over a whole process image
+ * and only ever answers same-or-different, so a quarter of the reads is worth
+ * more than the collision resistance it gives up.
+ */
+function sum32(buf) {
+  const u = new Uint32Array(buf.buffer ?? buf, buf.byteOffset ?? 0, (buf.byteLength / 4) | 0);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < u.length; i++) h = Math.imul(h ^ u[i], 0x01000193);
+  return h >>> 0;
+}
+
 /** Everything the host has to supply that wasm cannot do for itself. */
 export class Env {
   /** Called with the bytes of a guest write to fd 1 or 2. */
@@ -939,6 +953,15 @@ export class Gex {
       if (end > start) out.push({ at: start, end, prot, bytes: this.#bytes().slice(start, end) });
     }
     e.gex_free?.(scratch, 24);
+    // What each region looked like as it left, so the child can say whether
+    // what it is running on is what was sent.
+    //
+    // `apt update` corrupts a forked child's heap -- glibc catches it itself,
+    // `malloc_consolidate(): invalid chunk size`, and aborts. A copy that
+    // arrives wrong and a copy that arrives right under a kernel that
+    // disagrees about where the heap ends are completely different bugs and
+    // look identical from outside, which is where #96 sat for three days.
+    if (globalThis.GEX_DEBUG_EXIT) for (const r of out) r.sum = sum32(r.bytes);
     return out;
   }
 
@@ -1325,6 +1348,26 @@ export class Gex {
     } else {
       step(`${this.#inherited.length} modules reachable, ${need} slots`);
     }
+    // Last of all, because everything above writes to this memory: growing it,
+    // instantiating two modules against it, building a kernel in it and
+    // installing a couple of thousand modules whose element segments the
+    // engine applies. Any of those can land on the parent's bytes, and the
+    // guest would meet the damage later and somewhere else.
+    if (globalThis.GEX_DEBUG_EXIT && child.image?.[0]?.sum !== undefined) {
+      const now = this.#bytes();
+      let bad = 0;
+      for (const r of child.image) {
+        const end = r.at + r.bytes.byteLength;
+        if (sum32(now.subarray(r.at, end)) === r.sum) continue;
+        if (bad++ < 8) {
+          console.error(
+            `[adopt] region ${r.at.toString(16)}..${end.toString(16)} ` +
+              `(${r.prot ?? '-'}) is not what the parent sent`,
+          );
+        }
+      }
+      step(bad ? `${bad} of ${child.image.length} regions differ` : 'image verified');
+    }
     step('running');
     return entry;
   }
@@ -1648,8 +1691,14 @@ export class Gex {
           // The one thing that still answers after the kernel is left
           // borrowed: it is a plain static rather than a question for the
           // kernel, and it narrows a crash to a single handler.
+          // "inside" only when the call is still on the stack. It used to say
+          // "inside" for the last call the guest had *ever* made, which sent
+          // this crash into `set_robust_list` -- a handler that returns zero
+          // and reads nothing -- for three days. The guest had returned from
+          // it and run on into translated code, which is where it died.
+          const within = ask(e.gex_in_syscall, (v) => v) === 1;
           const nr = ask(e.gex_last_syscall, (n) =>
-            n === 0xffffffff ? '' : `, inside syscall ${n}`);
+            n === 0xffffffff ? '' : `, ${within ? 'inside' : 'after'} syscall ${n}`);
           if (globalThis.GEX_TRAP_STACK) console.error(err.stack ?? err);
           // "table index is out of bounds" says a branch reached a slot past
           // the end of the table it lives in, and nothing else in the message
