@@ -385,6 +385,20 @@ pub const DISPATCH_SLOT_BITS: u32 = 24;
 /// Mask of the slot half of a directory entry.
 pub const DISPATCH_SLOT_MASK: u32 = (1u32 << DISPATCH_SLOT_BITS) - 1;
 
+/// Blocks above which a module's element segments are passive.
+///
+/// The emitter's choice and the host's question, so it lives where both can
+/// see it. A module past this size gets passive segments and a fill helper,
+/// because writing every block of it into every process's table is most of
+/// what a process costs; below it, the segments are active and instantiating
+/// does the writing.
+///
+/// The host needs the same number to know which libraries it may number for
+/// itself. A page of an active-segment module lands at the slot the build
+/// chose, at instantiation, before anything can be claimed -- so those keep
+/// the closure's numbering and only the demand-filled ones move.
+pub const BIG_BLOCKS: usize = 4096;
+
 /// Pack a table index and a base slot into a directory entry.
 ///
 /// Entry zero has to keep meaning "no translation, table 0, the miss span",

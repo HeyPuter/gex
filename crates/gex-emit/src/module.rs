@@ -166,7 +166,7 @@ const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 256;
 /// whose module had not arrived yet written off for ever; and the ask sitting
 /// below `maybe_recompile_at`, so a deferred process recompiled whole
 /// libraries it already held.
-const BIG_BLOCKS: usize = 4096;
+use gex_abi::BIG_BLOCKS;
 
 impl Default for PageTable {
     fn default() -> PageTable {

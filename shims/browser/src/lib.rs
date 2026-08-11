@@ -3316,6 +3316,19 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len
         }
         let mut owner = CLOSURE_OWNER.0.borrow_mut();
         let mut images = IMAGE_PAGES.0.borrow_mut();
+        {
+            let mut high = IMAGE_HIGH.0.borrow_mut();
+            for (page, base) in &meta.dir_entries {
+                if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+                    let t = gex_abi::dispatch_entry_table(*base);
+                    let end = (*base & gex_abi::DISPATCH_SLOT_MASK)
+                        + gex_abi::SLOTS_PER_PAGE as u32;
+                    if let Some(h) = high.get_mut(t) {
+                        *h = (*h).max(end);
+                    }
+                }
+            }
+        }
         for (page, _) in &meta.dir_entries {
             // An image's pages are claimed by program, not by page: every
             // root of the closure is at `PIE_BASE` and they all claim these.
@@ -3324,6 +3337,27 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len
             } else {
                 owner.insert(*page, idx as u32);
             }
+        }
+        // The table `gexc` chose for each page, kept so a claim can put the
+        // page back in it.
+        //
+        // Only the table survives the move to per-process numbering:
+        // `table.init` takes it as an immediate, so a page cannot leave the
+        // table it was built for, while its offset within that table is this
+        // process's to choose.
+        //
+        // Demand-filled libraries only. A module small enough to keep active
+        // element segments writes its slots at instantiation, at the numbers
+        // the build chose, so there is nothing left to claim and its table
+        // has to be that long before it is instantiated.
+        if meta.n_blocks > gex_abi::BIG_BLOCKS {
+            let mut tables = CLOSURE_TABLE.0.borrow_mut();
+            for (page, base) in &meta.dir_entries {
+                if page * gex_abi::DISPATCH_PAGE >= gex_abi::INTERP_BASE {
+                    tables.insert(*page, gex_abi::dispatch_entry_table(*base) as u32);
+                }
+            }
+            LIB_LAZY.0.borrow_mut().insert(idx as u32);
         }
     }
     // Registered, not published. See `gex_publish_closure_module`.
@@ -3418,6 +3452,25 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
             if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE && !ours {
                 continue;
             }
+            // A library's pages are not written here any more.
+            //
+            // `gexc` numbers slots in one sequence across the whole closure,
+            // so writing a library's entries means growing the table to the
+            // highest slot that library names -- 2.7 million for a process
+            // that runs `cat /dev/null`, and `Table.grow` writes the miss stub
+            // into every one at five million a second. Measured: 1087ms of a
+            // 1499ms process, all of it inside the engine.
+            //
+            // Instead the entry stays zero, which is the miss stub, until a
+            // branch actually lands in the page. `gex_claim_page` then gives
+            // it a base from this process's own numbering. An image keeps the
+            // old path: its segment is active and writes absolute slots at
+            // instantiation, so its pages are where the build put them.
+            if page * gex_abi::DISPATCH_PAGE >= gex_abi::INTERP_BASE
+                && meta.n_blocks > gex_abi::BIG_BLOCKS
+            {
+                continue;
+            }
             CLOSURE_DIRS.0.borrow_mut().push((*page, *base));
             h.jit.page_table.assign(*page, *base);
             // And the guest's own directory, which is what a branch reads.
@@ -3428,6 +3481,77 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
         }
     });
     1
+}
+
+/// The first slot in each table that no image can write.
+///
+/// An image's element segment is active and absolute: instantiating it writes
+/// its blocks at the slots `gexc` chose, whenever that happens. A claim that
+/// started at `table.length` handed out slots below that, and the next
+/// `exec` wrote its image over them -- `debian-fs` mode=1, `debian-deb` xz=1
+/// big=1 real=1, every one of them a branch reaching the wrong function.
+///
+/// Every image in the closure is registered before any guest runs, so the
+/// highest slot any of them can reach is known by then. Claims start above
+/// it.
+static IMAGE_HIGH: SingleThreaded<[u32; gex_abi::DISPATCH_TABLES]> =
+    SingleThreaded(std::cell::RefCell::new([0; gex_abi::DISPATCH_TABLES]));
+
+/// Where this process may start handing out slots in table `i`.
+#[no_mangle]
+pub extern "C" fn gex_claim_floor(i: u32) -> u32 {
+    IMAGE_HIGH.0.borrow().get(i as usize).copied().unwrap_or(0)
+}
+
+/// Libraries whose slots are claimed a page at a time.
+///
+/// The big ones, which `gexc` gives passive element segments and a fill
+/// helper. A small one writes its slots at instantiation and has to keep the
+/// numbering it was built with.
+static LIB_LAZY: SingleThreaded<std::collections::BTreeSet<u32>> =
+    SingleThreaded(std::cell::RefCell::new(std::collections::BTreeSet::new()));
+
+/// Whether library `idx` is claimed page by page, for a host deciding how
+/// long its table must be before instantiating it.
+#[no_mangle]
+pub extern "C" fn gex_lib_lazy(idx: u32) -> i32 {
+    LIB_LAZY.0.borrow().contains(&idx) as i32
+}
+
+/// Which dispatch table `gexc` built each closure page for.
+static CLOSURE_TABLE: SingleThreaded<std::collections::BTreeMap<u64, u32>> =
+    SingleThreaded(std::cell::RefCell::new(std::collections::BTreeMap::new()));
+
+/// The table a page has to be claimed in, or -1 if this page is not a
+/// closure library's.
+#[no_mangle]
+pub extern "C" fn gex_page_table(page: u64) -> i32 {
+    CLOSURE_TABLE
+        .0
+        .borrow()
+        .get(&page)
+        .map(|t| *t as i32)
+        .unwrap_or(-1)
+}
+
+/// Give a page a base in this process's numbering and write its entry.
+///
+/// The caller has already grown the table, so `base` is a slot span nothing
+/// else holds. Returns the entry written.
+#[no_mangle]
+pub extern "C" fn gex_claim_page(page: u64, base: u32) -> u32 {
+    let table = match gex_page_table(page) {
+        t if t >= 0 => t as u32,
+        _ => return 0,
+    };
+    let entry = gex_abi::dispatch_entry(table as usize, base);
+    with_host(|h| {
+        h.jit.page_table.assign(page, entry);
+        let mut gm = GuestMem::new(guest_bytes());
+        let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, entry);
+    });
+    CLOSURE_DIRS.0.borrow_mut().push((page, entry));
+    entry
 }
 
 /// The slot a page's dispatch entry points at, in this process.

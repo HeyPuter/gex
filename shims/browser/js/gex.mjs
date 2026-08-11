@@ -67,6 +67,10 @@ function adoptAfterTraps() {
 const FILL = 'gexfill';
 // And the one a miss can ask for: fill whichever segment holds this slot.
 const FILL_AT = 'gexfillat';
+// Dispatch slots one 4 KiB page of guest text covers: one per
+// instruction. `gex_abi::SLOTS_PER_PAGE`, and the unit a page is
+// claimed in.
+const SLOTS_PER_PAGE = 1024;
 const FILL_ALL = 'gexfillall';
 
 // Above this, a module's slots are written when a branch asks for them
@@ -290,6 +294,8 @@ export class Gex {
   #slowMs = 0;
   #publishMs = 0;
   #publishes = 0;
+  #pubGrowMs = 0;
+  #pubGrewSlots = 0;
   // The parent's modules, held rather than installed. See `#maybeAdopt`.
   #inherited = [];
   #traps = 0;
@@ -587,6 +593,8 @@ export class Gex {
       slowMs: Math.round(this.#slowMs),
       pub: this.#publishes,
       pubMs: Math.round(this.#publishMs),
+      growMs: Math.round(this.#pubGrowMs),
+      grew: this.#pubGrewSlots,
     };
   }
 
@@ -2988,7 +2996,16 @@ export class Gex {
     this.#bytes().set(lazy.meta, gp);
     e.gex_publish_closure_module(gp, lazy.meta.length, i);
     e.gex_free?.(gp, lazy.meta.length);
-    this.#growTables(lazy.need);
+    // Ours and the engine's, counted apart.
+    //
+    // Publishing writes a directory entry per page of the library; growing
+    // hands `Table.grow` a delta and it writes the miss stub into every new
+    // slot. Both were inside one number, and which of them a second of
+    // `cat /dev/null` belongs to decides whether the fix is in how slots are
+    // numbered or in how many pages get published.
+    // No grow here. A library's pages reach the table one at a time, as
+    // `#pageBase` claims them, so there is nothing to make room for until a
+    // branch asks.
     // Always counted, not only under a debug flag. Publishing is where a
     // library's dispatch pages reach this process's table, and that table
     // is 2.7 million slots -- #125 measured growing one at 300-500ms. A
@@ -3039,9 +3056,38 @@ export class Gex {
    * the numbering can be too.
    */
   #pageBase(page) {
-    return this.#shim.exports.gex_page_base
-      ? this.#shim.exports.gex_page_base(page >>> 0) >>> 0
-      : 0;
+    const e = this.#shim.exports;
+    if (!e.gex_page_base) return -1;
+    const have = e.gex_page_base(page >>> 0) >>> 0;
+    if (have !== 0) return have;
+    if (!e.gex_claim_page) return -1;
+    // Unclaimed: give it a base at the end of its table.
+    //
+    // The end, because everything below it is already spoken for -- the
+    // image's active segment wrote its own region at instantiation, and every
+    // page claimed before this one took the slots it was given. So the table
+    // grows by exactly one page's worth per page a guest actually enters,
+    // instead of once to the highest slot the closure names.
+    //
+    // A base of zero cannot come back from this: a table is never shorter
+    // than the reserved miss span, so the first claim is above it, and zero
+    // keeps meaning "no translation" the way the branchless lookup needs.
+    const t = e.gex_page_table ? e.gex_page_table(BigInt(page >>> 0)) : -1;
+    if (t < 0) return 0;
+    const tables = this.#dispatchTables();
+    if (t >= tables.length) return 0;
+    // Above anything an image can write: images keep the build's numbering
+    // and write it at instantiation, which can happen after this claim.
+    const floor = e.gex_claim_floor ? e.gex_claim_floor(t) >>> 0 : 0;
+    const base = Math.max(tables[t].length, floor);
+    const delta = base + SLOTS_PER_PAGE - tables[t].length;
+    const stub = tables[0].get(0);
+    const g0 = performance.now();
+    tables[t].grow(delta, stub);
+    this.#pubGrewSlots += delta;
+    this.#pubGrowMs += performance.now() - g0;
+    e.gex_claim_page(BigInt(page >>> 0), base >>> 0);
+    return base >>> 0;
   }
 
   fillSlotNow(page) {
@@ -3061,15 +3107,18 @@ export class Gex {
       // helper: instantiating it wrote its slots, so there is nothing to ask
       // for and the page is already answered.
       if (typeof lazy.instObj.exports[FILL_AT] !== 'function') return true;
-      if (lazy.instObj.exports[FILL_AT](page, this.#pageBase(page))) {
+      const at = this.#pageBase(page);
+      if (at >= 0 && lazy.instObj.exports[FILL_AT](page, at)) {
         this.#filled++;
         return true;
       }
       return null;
     }
     if (page * 4096 < 0x0300_0000) return null;
+    const where = this.#pageBase(page);
+    if (where < 0) return null;
     for (const inst of this.#unfilled) {
-      if (inst.exports[FILL_AT](page, this.#pageBase(page))) {
+      if (inst.exports[FILL_AT](page, where)) {
         this.#filled++;
         return true;
       }
@@ -3103,7 +3152,12 @@ export class Gex {
           // Remembered by index. `fillSlotNow` addresses a library by name
           // rather than searching, which is what makes the page below
           // `INTERP_BASE` answerable by its own image and no other.
-          lazy.instObj = await this.#installModule(mod, lazy.need);
+          // Not `lazy.need` for a demand-filled library: that is the highest
+          // slot it names in the closure's numbering, and growing to it is
+          // the cost this change removes. Its pages are claimed one at a
+          // time, and `gex_table_need` reports what those came to.
+          const claimed = this.#shim.exports.gex_lib_lazy?.(owner >>> 0);
+          lazy.instObj = await this.#installModule(mod, claimed ? 0 : lazy.need);
         } else {
           // Nothing to install; let the miss fall through and be lifted
           // rather than wedging on a library that never arrives.
@@ -3132,13 +3186,14 @@ export class Gex {
     // belong to every image at once and only one of them is ours.
     const mine = owner >= 0 ? this.#lazyClosure[owner]?.instObj : null;
     if (mine && typeof mine.exports[FILL_AT] !== 'function') return true;
-    if (mine && mine.exports[FILL_AT](slot, this.#pageBase(slot))) {
+    const at = this.#pageBase(slot);
+    if (mine && at >= 0 && mine.exports[FILL_AT](slot, at)) {
       this.#filled++;
       return true;
     }
     if (slot * 4096 >= 0x0300_0000) {
       for (const inst of this.#unfilled) {
-        if (inst.exports[FILL_AT](slot, this.#pageBase(slot))) {
+        if (at >= 0 && inst.exports[FILL_AT](slot, at)) {
           this.#filled++;
           return true;
         }
