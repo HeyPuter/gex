@@ -3833,7 +3833,8 @@ pub extern "C" fn gex_fill_possible(on: i32) {
     if on != 0 {
         let failed = std::mem::take(&mut *FILL_FAILED.0.borrow_mut());
         let mut asked = FILL_ASKED.0.borrow_mut();
-        let spans = gex_abi::SLOTS_PER_PAGE as u64 / gex_abi::FILL_SPAN as u64;
+        let spans = gex_abi::SLOTS_PER_PAGE as u64
+            / FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed) as u64;
         for page in failed {
             // Every span of it: the module that has just arrived may cover
             // parts of the page this one could not.
@@ -3849,6 +3850,24 @@ pub extern "C" fn gex_fill_possible(on: i32) {
 /// A fill writes `FILL_SPAN` slots from here rather than the whole page. See
 /// `gex_abi::FILL_SPAN` for why.
 static FILL_FROM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Slots a fill is expected to write, as the host found them.
+///
+/// `FILL_SPAN` normally, and a whole page when the modules in this run are
+/// older than the span. A closure built before `gexfillat` took a `from`
+/// ignores the argument and writes all 1,024 slots, so asking once per span
+/// would ask eight times for a page and write the whole thing each time --
+/// eight times the work the change was meant to save. The host can see the
+/// arity of the export and says so; this keeps a new shim usable against a
+/// closure somebody has not rebuilt.
+static FILL_WIDTH: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(gex_abi::FILL_SPAN);
+
+#[no_mangle]
+pub extern "C" fn gex_set_fill_width(n: u32) {
+    let n = if n == 0 { gex_abi::FILL_SPAN } else { n };
+    FILL_WIDTH.store(n.min(gex_abi::SLOTS_PER_PAGE as u32), std::sync::atomic::Ordering::Relaxed);
+}
 
 #[no_mangle]
 pub extern "C" fn gex_fill_from() -> u32 {
@@ -8229,9 +8248,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // and asking twice for one span would loop for ever, which is what
         // this set prevents. Eight spans to a page at 128 slots.
         let page = gex_abi::dispatch_page(pc);
-        let from = ((pc & 0xfff) >> 2) as u32 & !(gex_abi::FILL_SPAN - 1);
-        let spans = gex_abi::SLOTS_PER_PAGE as u32 / gex_abi::FILL_SPAN;
-        let key = page * spans as u64 + (from / gex_abi::FILL_SPAN) as u64;
+        let width = FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
+        let from = ((pc & 0xfff) >> 2) as u32 & !(width - 1);
+        let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
+        let key = page * spans as u64 + (from / width) as u64;
         let fresh = FILL_ASKED.0.borrow_mut().insert(key);
         if fresh {
             FILL_FROM.store(from, std::sync::atomic::Ordering::Relaxed);

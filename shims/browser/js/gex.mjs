@@ -357,6 +357,7 @@ export class Gex {
   /// how many slots `Table.grow` had to copy to do it.
   #faBaseMs = 0;
   #faInitMs = 0;
+  #fillWidthTold = false;
   #nowFills = 0;
   #nowMs = 0;
   #bigGrows = [];
@@ -3416,6 +3417,19 @@ export class Gex {
       // helper: instantiating it wrote its slots, so there is nothing to ask
       // for and the page is already answered.
       if (typeof lazy.instObj.exports[FILL_AT] !== 'function') return true;
+      // A closure older than the span writes whole pages whatever it is told.
+      //
+      // `gexfillat` used to be `(page, base)`; it is `(page, base, from)` now.
+      // JavaScript drops the extra argument silently when calling the old
+      // one, so nothing breaks -- it just fills all 1,024 slots. The shim
+      // would still ask once per span, which is eight asks a page each doing
+      // the whole page: eight times the work this change removes. The arity
+      // of the export is the honest signal, and it is checked once.
+      if (!this.#fillWidthTold) {
+        this.#fillWidthTold = true;
+        const wide = lazy.instObj.exports[FILL_AT].length < 3;
+        if (wide) this.#shim.exports.gex_set_fill_width?.(SLOTS_PER_PAGE);
+      }
       // The three parts, separately. A fast fill costs 1.4ms and the comment
       // above calls it "a directory write and a table grow"; 1,024 table
       // writes should be microseconds, so one of these is not what it looks
