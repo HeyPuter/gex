@@ -195,8 +195,12 @@ const DEMOS = {
   },
   // The control for `ld.so`: the same twenty forks, from a static binary.
   //
-  // busybox is `static-pie` linked, so a forked `busybox true` runs no
-  // dynamic linker and initialises no shared libc. Everything else matches
+  // busybox is `static-pie` linked, so a forked `busybox cat` runs no dynamic
+  // linker and initialises no shared libc. `cat /dev/null` and not `true`,
+  // because the Debian side of the comparison is `cat /dev/null` and a
+  // program that opens a file does more than one that returns: the first
+  // version of this measured `true` against `cat` and charged the difference
+  // to the linker. Everything else matches
   // `debian-forks` -- same host, same shim, same fork path, same exhaustive
   // recompilation from a closure. The difference between the two is what
   // dynamic linking costs, which is the premise #121 rests on and which
@@ -204,7 +208,7 @@ const DEMOS = {
   'busybox-forks': {
     demo: 'busybox',
     cmd:
-      'i=0; while [ $i -lt 20 ]; do busybox true; i=$((i+1)); done; echo bbforks=done',
+      'i=0; while [ $i -lt 20 ]; do busybox cat /dev/null; i=$((i+1)); done; echo bbforks=done',
     want: /bbforks=done/,
   },
   // How fast does the browser decompress? The same `dpkg-deb` the native
