@@ -42,6 +42,16 @@ export async function loadClosure(base, { image = false, log = () => {} } = {}) 
   // Four is a guess; the timings logged below are how to improve on it. What
   // is not a guess is that unbounded was wrong -- the peak is what matters,
   // and the peak was all of it.
+  // `?libs=N` loads only the first N libraries.
+  //
+  // For bisecting. A closure library's slot numbers are absolute and baked in
+  // at build time, so leaving some out is safe: the pages they would claim
+  // are simply never claimed, and the runtime translator meets that code the
+  // way it did before any of this existed. Which makes "which library breaks
+  // apt" a binary search over thirty-three, at thirty seconds a question,
+  // instead of a ten-minute closure rebuild per guess.
+  const only = Number(new URLSearchParams(location.search).get('libs') || 0);
+  if (only > 0) manifest.libs = manifest.libs.slice(0, only);
   const AT_A_TIME = 4;
   const libs = [];
   const began = performance.now();
