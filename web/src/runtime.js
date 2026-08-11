@@ -42,7 +42,16 @@ function checkWasm(url, res, bytes) {
 }
 
 async function fetchBytes(url, onProgress) {
-  const res = await fetch(url);
+  // Revalidated, never taken from cache on faith.
+  //
+  // `/gex/gex_browser.wasm` and the seed have fixed URLs with no content
+  // hash, so a browser will happily keep serving a build it fetched hours
+  // ago. That is fine until a broken one is published for a few minutes, and
+  // then a reload does not fix it: the page keeps running the broken shim and
+  // the guest traps instantly -- 133, SIGTRAP, from a dispatch table that no
+  // longer matches the closure beside it. Cheap insurance: one conditional
+  // request, and a 304 for the common case.
+  const res = await fetch(url, { cache: 'no-cache' });
   if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
   const total = Number(res.headers.get('content-length')) || 0;
   if (!onProgress || !res.body) {
