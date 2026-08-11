@@ -241,13 +241,44 @@ export class ProcessHost {
     }
   }
 
-  /// Hand one compiled closure library to the Worker that asked for it.
-  #sendLibrary(w, i) {
+  /// Hand one compiled closure library to the Worker that asked for it,
+  /// fetching and compiling it now if this is the first time anybody has.
+  ///
+  /// A closure entry may arrive with only its metadata and a `url`: the page
+  /// registers sixty-two libraries from a few hundred kilobytes and leaves
+  /// 239 MB of wasm on the server until a branch lands in one. The compile
+  /// is kept, because the next process to ask wants the same module and a
+  /// `WebAssembly.Module` clones by reference.
+  async #sendLibrary(w, i) {
     const entry = (this.#extra?.closure ?? [])[i];
     if (!entry) return;
     try {
-      w.postMessage({ kind: 'closureModule', i, mod: entry instanceof Uint8Array ? entry : entry.mod });
+      if (!(entry instanceof Uint8Array) && !entry.mod && entry.url) {
+        entry.fetching ??= (async () => {
+          const t0 = performance.now();
+          const res = await fetch(entry.url);
+          if (!res.ok) throw new Error(`${entry.url}: ${res.status} ${res.statusText}`);
+          const bytes = new Uint8Array(await res.arrayBuffer());
+          const mod = await WebAssembly.compile(bytes);
+          this.#onOutput(
+            2,
+            `[closure] library ${i}: ${(bytes.length / 1048576).toFixed(1)} MiB fetched `
+            + `and compiled in ${Math.round(performance.now() - t0)}ms\n`,
+            0,
+          );
+          return mod;
+        })();
+        entry.mod = await entry.fetching;
+      }
+      w.postMessage({
+        kind: 'closureModule',
+        i,
+        mod: entry instanceof Uint8Array ? entry : entry.mod,
+      });
     } catch (e) {
+      // Loud, and not fatal: a library that never arrives costs the guest
+      // the translation it would have saved, and nothing else.
+      console.error(`[gex] closure library ${i} did not reach a worker:`, e);
       this.#onOutput(2, `gex: closure library ${i} did not reach a worker: ${e.message}\n`, 0);
     }
   }

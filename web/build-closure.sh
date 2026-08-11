@@ -127,6 +127,45 @@ for line in open(os.path.join(work, 'c.pins')):
 # actually running. Without this map it could not tell them apart, and `ls`
 # would get `bash`'s blocks -- which is the failure that kept image objects
 # down to one per closure in the first place.
+# The `gex.meta` section of each module, written out beside it.
+#
+# Registering a library needs only its metadata -- which pages it covers and
+# how far into the slot space it reaches -- and that is a few kilobytes. The
+# module itself is wanted by the branch that lands in it. Until this existed
+# the page had no way to get one without the other, so it fetched all 239 MB
+# of a closure and compiled it before pid 1 ran an instruction, and the load
+# was longer than the run.
+def section(path):
+    b = open(path, 'rb').read()
+    at = 8
+    while at < len(b):
+        sid = b[at]; at += 1
+        n = 0; sh = 0
+        while True:
+            byte = b[at]; at += 1
+            n |= (byte & 0x7f) << sh; sh += 7
+            if not byte & 0x80:
+                break
+        end = at + n
+        if sid == 0:
+            p, ln, sh = at, 0, 0
+            while True:
+                byte = b[p]; p += 1
+                ln |= (byte & 0x7f) << sh; sh += 7
+                if not byte & 0x80:
+                    break
+            if b[p:p + ln] == b'gex.meta':
+                return b[p + ln:end]
+        at = end
+    return b''
+
+metas = []
+for n in libs:
+    d = section(os.path.join(out, n))
+    m = n[:-len('.wasm')] + '.meta'
+    open(os.path.join(out, m), 'wb').write(d)
+    metas.append(m if d else '')
+
 images = {}
 ipath = os.path.join(work, 'c.images')
 if os.path.exists(ipath):
@@ -135,7 +174,7 @@ if os.path.exists(ipath):
         if len(f) >= 2:
             images[f[0]] = ' '.join(f[1:])
 json.dump({'image': None, 'program': sys.argv[3], 'images': images,
-           'libs': libs, 'pins': pins},
+           'libs': libs, 'metas': metas, 'pins': pins},
           open(os.path.join(out, 'closure.json'), 'w'))
 print(f"  {len(libs)} libraries, {len(pins)} pins, {len(images)} images")
 PY

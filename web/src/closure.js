@@ -51,7 +51,49 @@ export async function loadClosure(base, { image = false, log = () => {} } = {}) 
   // apt" a binary search over thirty-three, at thirty seconds a question,
   // instead of a ten-minute closure rebuild per guess.
   const only = Number(new URLSearchParams(location.search).get('libs') || 0);
-  if (only > 0) manifest.libs = manifest.libs.slice(0, only);
+  if (only > 0) {
+    manifest.libs = manifest.libs.slice(0, only);
+    if (manifest.metas) manifest.metas = manifest.metas.slice(0, only);
+  }
+
+  // The metadata alone, when the build wrote it out separately.
+  //
+  // Registering a library needs which pages it covers and how far into the
+  // slot space it reaches -- a few kilobytes. The module is wanted by the
+  // branch that lands in it, and `wantLibrary` fetches it then. Fetching and
+  // compiling all of it first meant a 239 MB download and a million blocks
+  // of wasm compiled before pid 1 ran an instruction: an `ls` enters three
+  // of sixty-two libraries and waited for all of them.
+  //
+  // A manifest without `metas` is one built before this existed, and takes
+  // the old path below.
+  if (manifest.metas && manifest.metas.every((m) => m)) {
+    const began = performance.now();
+    const libs = [];
+    for (let i = 0; i < manifest.libs.length; i += 8) {
+      const batch = manifest.libs.slice(i, i + 8);
+      const done = await Promise.all(
+        batch.map(async (n, j) => ({
+          meta: await fetchBytes(`${base}/${encodeURI(manifest.metas[i + j])}`),
+          // Where to get the module, for the host to fetch on demand.
+          url: `${base}/${encodeURI(n)}`,
+          mod: null,
+        })),
+      );
+      libs.push(...done);
+    }
+    const kib = libs.reduce((n, l) => n + l.meta.length, 0) / 1024;
+    log(
+      `closure: ${libs.length} libraries registered from ${Math.round(kib)} KiB `
+      + `of metadata in ${Math.round(performance.now() - began)}ms, `
+      + 'modules fetched on first branch',
+    );
+    const images = manifest.images ?? {};
+    for (const [i, n] of manifest.libs.entries()) {
+      if (images[n]) libs[i].program = images[n];
+    }
+    return { image: null, program: manifest.program, libs, pins: manifest.pins };
+  }
   const AT_A_TIME = 4;
   const libs = [];
   const began = performance.now();
