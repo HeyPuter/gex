@@ -540,6 +540,10 @@ pub struct ModuleBuilder {
     imports: Imports,
     data: Vec<DataSegment>,
     linkage: Linkage,
+    /// Emit passive segments and the fill helpers whatever the block count.
+    /// See `Options::demand_fill`.
+    demand_fill: bool,
+
     /// Blocks to export by name, for a shared-linkage module.
     exports_by_addr: Vec<(u64, u32)>,
 }
@@ -558,6 +562,15 @@ struct Imports {
 }
 
 impl ModuleBuilder {
+    /// Emit passive segments and the fill helpers whatever the block count.
+    ///
+    /// Set for a closure object, whose slots the build numbers in one sequence
+    /// across every object and which a process therefore has to be able to
+    /// place for itself. See `Options::demand_fill`.
+    pub fn set_demand_fill(&mut self, on: bool) {
+        self.demand_fill = on;
+    }
+
     /// Start an image module: it owns the memory and the dispatch table.
     pub fn new(text_base: u64, text_size: u64) -> ModuleBuilder {
         Self::with_linkage(text_base, text_size, Linkage::Own, true)
@@ -685,6 +698,7 @@ impl ModuleBuilder {
             data: Vec::new(),
             linkage,
             exports_by_addr: Vec::new(),
+            demand_fill: false,
         };
 
         let stub_body = b.build_miss_stub();
@@ -947,7 +961,7 @@ impl ModuleBuilder {
                         // thousand blocks, wanted immediately, and making
                         // its segments passive cost `apt-get update` 32
                         // seconds against 82 -- see the helpers below.
-                        passive: n_blocks > BIG_BLOCKS,
+                        passive: self.demand_fill || n_blocks > BIG_BLOCKS,
                         // What `gexfillat` matches a request against. The
                         // whole entry, table index included: see the field.
                         guest_page: page as u32,
@@ -979,7 +993,7 @@ impl ModuleBuilder {
         // carrying the helpers on all of them was the whole of the 32-second
         // regression: not the passive segments, not the crossing per
         // segment, both of which were measured and cleared.
-        if n_blocks > BIG_BLOCKS {
+        if self.demand_fill || n_blocks > BIG_BLOCKS {
             let void_ty = self.m.func_type(FuncType::new(vec![ValType::I32], vec![ValType::I32]));
             self.m.add_fill(void_ty);
             // `(page, base) -> filled`. The second argument is where the

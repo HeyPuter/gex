@@ -3174,7 +3174,30 @@ export class Gex {
     const e = this.#shim.exports;
     if (!e.gex_page_base) return -1;
     const have = e.gex_page_base(page >>> 0) >>> 0;
-    if (have !== 0) return have;
+    if (have !== 0) {
+      // Somebody already numbered this page -- and it may not have been this
+      // process. The dispatch directory lives in guest memory, so a `fork`
+      // copies it: a child inherits every base its parent claimed, and keeping
+      // them is right, because it is the same code at the same addresses.
+      //
+      // What does not come across is the table. A table belongs to an
+      // instance, so the child's is its own and starts empty, and a branch
+      // into a page the parent claimed but the child has not reaches a slot
+      // past the end of it. That was invisible while every process grew its
+      // tables to the closure's whole 3.8 million slots -- any inherited base
+      // was in range by accident. With the grow gone it is
+      // `table index is out of bounds at guest pc=0x5b37bf0 in libselinux`,
+      // in the first child a shell forks.
+      const ti = e.gex_page_table ? e.gex_page_table(BigInt(page >>> 0)) : -1;
+      if (ti >= 0) {
+        this.#reach(ti, have + SLOTS_PER_PAGE);
+        // And do not hand the same slots out again to a later claim.
+        if (this.#claimed[ti] === undefined || this.#claimed[ti] < have + SLOTS_PER_PAGE) {
+          this.#claimed[ti] = have + SLOTS_PER_PAGE;
+        }
+      }
+      return have;
+    }
     if (!e.gex_claim_page) return -1;
     // `gex_page_table` answers -1 when claiming is off, and the caller skips.
     // Unclaimed: give it a base at the end of its table.
@@ -3205,23 +3228,33 @@ export class Gex {
     }
     const base = this.#claimed[t];
     this.#claimed[t] = base + SLOTS_PER_PAGE;
-    if (this.#claimed[t] > tables[t].length) {
-      // In chunks, not doubling. The watermark advances a page at a time, so
-      // doubling overshoots enormously -- it took 67,584 slots of demand to
-      // 3,732,480 grown, and 190ms to 540ms. A fixed chunk amortises the
-      // reallocation over sixteen pages and wastes at most that much.
-      const per = (e.gex_slots_per_table?.() ?? 0) >>> 0 || Number.MAX_SAFE_INTEGER;
-      const CHUNK = SLOTS_PER_PAGE * 16;
-      const want = Math.min(Math.ceil(this.#claimed[t] / CHUNK) * CHUNK, per);
-      const stub = tables[0].get(0);
-      const delta = want - tables[t].length;
-      const g0 = performance.now();
-      tables[t].grow(delta, stub);
-      this.#pubGrewSlots += delta;
-      this.#pubGrowMs += performance.now() - g0;
-    }
+    this.#reach(t, this.#claimed[t]);
     e.gex_claim_page(BigInt(page >>> 0), base >>> 0);
     return base >>> 0;
+  }
+
+  /**
+   * Make dispatch table `t` at least `end` slots long.
+   *
+   * In chunks, not doubling. The watermark advances a page at a time, so
+   * doubling overshoots enormously -- it took 67,584 slots of demand to
+   * 3,732,480 grown, and 190ms to 540ms. A fixed chunk amortises the
+   * reallocation over sixteen pages and wastes at most that much.
+   */
+  #reach(t, end) {
+    const e = this.#shim.exports;
+    const tables = this.#dispatchTables();
+    if (t < 0 || t >= tables.length || tables[t].length >= end) return;
+    const per = (e.gex_slots_per_table?.() ?? 0) >>> 0 || Number.MAX_SAFE_INTEGER;
+    const CHUNK = SLOTS_PER_PAGE * 16;
+    const want = Math.min(Math.ceil(end / CHUNK) * CHUNK, per);
+    const stub = tables[0].get(0);
+    const delta = want - tables[t].length;
+    if (delta <= 0) return;
+    const g0 = performance.now();
+    tables[t].grow(delta, stub);
+    this.#pubGrewSlots += delta;
+    this.#pubGrowMs += performance.now() - g0;
   }
 
   fillSlotNow(page) {

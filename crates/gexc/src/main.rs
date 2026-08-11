@@ -676,6 +676,16 @@ fn build_closure(
             first_slot,
             exhaustive: whole,
             shared_memory,
+            // Every object of a closure, whatever its size.
+            //
+            // The build numbers slots in one sequence across all of them, so a
+            // small object's pages sit as far into table 0 as its position in
+            // the closure puts them -- 3,634,176 for `stat`, object 65 of 173.
+            // Published there, one such object makes every process grow the
+            // table that far before its guest runs an instruction. Ninety-two
+            // of the Debian closure's objects fall under `BIG_BLOCKS`, which
+            // was measured on runtime units and does not reach these.
+            demand_fill: true,
             // The first object is the executable and owns the address space
             // -- unless something else already does. See `--shared-image`.
             linkage: if n == 0 && !shared_image {

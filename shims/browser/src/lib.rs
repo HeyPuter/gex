@@ -3358,7 +3358,11 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len
         // hold them, and `Table.grow` reallocates and copies, which came to
         // 790ms of an 815ms install. Per-page claiming already covered every
         // library. The image was the one thing still numbered by the build.
-        if meta.n_blocks <= gex_abi::BIG_BLOCKS {
+        // Only when this process is *not* numbering its own pages. Every
+        // object of a closure is built demand-filled now, whatever its block
+        // count, so nothing in one writes absolute slots at instantiation and
+        // nothing needs a floor. See `Options::demand_fill`.
+        if !claim_pages() {
             let mut high = IMAGE_HIGH.0.borrow_mut();
             for (page, base) in &meta.dir_entries {
                 if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
@@ -3392,7 +3396,7 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len
         // element segments writes its slots at instantiation, at the numbers
         // the build chose, so there is nothing left to claim and its table
         // has to be that long before it is instantiated.
-        if meta.n_blocks > gex_abi::BIG_BLOCKS {
+        if claim_pages() {
             let mut tables = CLOSURE_TABLE.0.borrow_mut();
             let mut image_tables = IMAGE_TABLE.0.borrow_mut();
             for (page, base) in &meta.dir_entries {
@@ -3526,7 +3530,7 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
             // 34 of 66 in one global numbering, `assign` took the high-water
             // from the build's entry, and `Table.grow` reallocates and copies
             // -- 790ms of an 815ms install, unchanged by anything else tried.
-            if claim_pages() && meta.n_blocks > gex_abi::BIG_BLOCKS {
+            if claim_pages() {
                 continue;
             }
             CLOSURE_DIRS.0.borrow_mut().push((*page, *base));

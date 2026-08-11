@@ -69,6 +69,18 @@ pub struct Options {
     /// Declare the imported memory shared. Off only for a single-threaded
     /// build whose host cannot import a shared memory.
     pub shared_memory: bool,
+    /// Emit passive element segments and the fill helpers whatever the block
+    /// count, so a process can put this module's pages wherever it likes.
+    ///
+    /// For a closure object, which is instantiated once per process and
+    /// numbered by the build in one sequence across the whole closure. The
+    /// size rule this overrides -- `BIG_BLOCKS` -- was measured on *runtime*
+    /// units, where three fill helpers on each of thousands of tiny modules
+    /// cost `apt-get update` 32 seconds. A closure is 173 objects and 92 of
+    /// them fall under that rule; published at the bases the build chose,
+    /// they reach 3,634,176 in table 0, and one of them is enough to make
+    /// every process grow the table that far before its guest runs.
+    pub demand_fill: bool,
     /// Whether this module declares the memory and dispatch table or imports
     /// them.
     ///
@@ -102,6 +114,7 @@ impl Default for Options {
             exhaustive: false,
             lazy: false,
             shared_memory: true,
+            demand_fill: false,
             linkage: Linkage::Own,
             first_slot: 0,
         }
@@ -362,6 +375,7 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
             opts.shared_memory,
         )
     };
+    builder.set_demand_fill(opts.demand_fill);
     let mut stats = Stats::default();
 
     // Collect entry points. A BTreeSet keeps translation order deterministic,
