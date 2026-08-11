@@ -32,7 +32,7 @@ function octal(bytes, off, len) {
 }
 
 /**
- * Unpack a tar into `{ files, dirs, links, modes }`.
+ * Unpack a tar into `{ files, dirs, links, hard, modes }`.
  *
  * `files` maps an absolute guest path to its bytes, `dirs` lists directories
  * (so an empty one still exists), and `links` maps a symlink's path to its
@@ -53,6 +53,7 @@ export function untar(buf, root = '') {
   // from the default keeps this to the few hundred binaries in a rootfs
   // rather than an entry per file.
   const modes = Object.create(null);
+  const hard = Object.create(null);
   let off = 0;
   let longName = null;
 
@@ -86,10 +87,21 @@ export function untar(buf, root = '') {
     } else if (type === '5') {
       const p = path(name);
       if (p) dirs.push(p);
-    } else if (type === '2' || type === '1') {
+    } else if (type === '2') {
       const p = path(name);
       const target = str(b, off + 157, 100);
       if (p) links[p] = target;
+    } else if (type === '1') {
+      // A hard link, which is *not* a symlink and does not resolve the same
+      // way: its target is a path relative to the root of the archive, where
+      // a symlink's is relative to the directory the link is in. Treating
+      // the two alike sent `./usr/bin/perl link to ./usr/bin/perl5.36.0` to
+      // `/usr/bin/usr/bin/perl5.36.0`, so `/usr/bin/perl` was never created
+      // -- and every `#!/usr/bin/perl` script in the rootfs then failed as
+      // "not found", naming the script rather than the interpreter.
+      const p = path(name);
+      const target = str(b, off + 157, 100);
+      if (p && target) hard[p] = `/${target.replace(/^\.\//, '')}`;
     } else if (type === '0' || type === '\0' || type === '7') {
       const p = path(name);
       if (p) {
@@ -100,5 +112,5 @@ export function untar(buf, root = '') {
     }
     off = next;
   }
-  return { files, dirs, links, modes };
+  return { files, dirs, links, hard, modes };
 }

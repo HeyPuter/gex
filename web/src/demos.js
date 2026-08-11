@@ -171,6 +171,14 @@ async function boot(ctx) {
         if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
       }
     }
+    // Hard links resolve against the root of the archive, not against the
+    // directory the link is in. `/usr/bin/perl` is one.
+    for (const [path, target] of Object.entries(tree.hard ?? {})) {
+      if (files[target]) {
+        files[path] = files[target];
+        if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
+      }
+    }
     const elf = files['/bin/busybox'];
     if (!elf) throw new Error('the rootfs has no /bin/busybox');
     ctx.idle();
@@ -265,6 +273,14 @@ async function bootDebian(ctx) {
       if (files[abs]) {
         files[path] = files[abs];
         if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
+      }
+    }
+    // Hard links resolve against the root of the archive, not against the
+    // directory the link is in. `/usr/bin/perl` is one.
+    for (const [path, target] of Object.entries(tree.hard ?? {})) {
+      if (files[target]) {
+        files[path] = files[target];
+        if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
       }
     }
     if (cmd) {
@@ -599,6 +615,14 @@ const virglGears = {
       if (files[abs]) {
         files[path] = files[abs];
         if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
+      }
+    }
+    // Hard links resolve against the root of the archive, not against the
+    // directory the link is in. `/usr/bin/perl` is one.
+    for (const [path, target] of Object.entries(tree.hard ?? {})) {
+      if (files[target]) {
+        files[path] = files[target];
+        if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
       }
         }
         // The loader passes no environment, so the bound is written into a
