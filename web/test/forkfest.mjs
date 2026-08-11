@@ -187,8 +187,56 @@ const CASES = [
 ];
 
 const rootfsName = process.env.GEX_FORKFEST_ROOTFS || 'debian';
-const only = process.argv.slice(2);
+const only = process.argv.slice(2).filter((a) => !a.startsWith('-'));
 const cases = only.length ? CASES.filter((c) => only.includes(c.name)) : CASES;
+
+// The same battery as one shell line, for the host that matters.
+//
+//   node web/test/forkfest.mjs --emit
+//   GEX_QUERY="cmd=$(node web/test/forkfest.mjs --emit)" node web/test/site.mjs debian-cmd
+//
+// Node runs this against the translator; the page runs it against the
+// statically recompiled closure, in Workers, which is what ships. Those are
+// different enough that a pass in one says little about the other -- the
+// whole of #101 was a fault only the browser had. One list, both hosts.
+//
+// The markers bracket each command so the output can be cut apart afterwards
+// and the *same* regular expressions applied. They carry no answer in
+// themselves: `FF>name` says a command started, not that it worked.
+if (process.argv.includes('--emit')) {
+  const parts = cases.map((c) => `echo FF-${c.name}-BEGIN; { ${c.cmd} ; } 2>&1; echo FF-${c.name}-END`);
+  process.stdout.write(`${parts.join('; ')}; echo GEX-CMD-DONE\n`);
+  process.exit(0);
+}
+
+/// Apply the battery's patterns to a terminal dump some other host produced.
+///
+///   node web/test/forkfest.mjs --judge < terminal.txt
+if (process.argv.includes('--judge')) {
+  const text = readFileSync(0, 'utf8');
+  let ok = 0;
+  const bad = [];
+  for (const c of cases) {
+    const a = text.indexOf(`FF-${c.name}-BEGIN`);
+    const b = text.indexOf(`FF-${c.name}-END`, a + 1);
+    if (a < 0 || b < 0) {
+      bad.push([c.name, a < 0 ? 'never started' : 'never finished']);
+      console.log(`FAIL ${c.name.padEnd(22)} ${a < 0 ? 'never started' : 'never finished'}`);
+      continue;
+    }
+    const body = text.slice(a + `FF-${c.name}-BEGIN`.length, b);
+    if (c.want.test(body)) {
+      ok += 1;
+      console.log(`ok   ${c.name}`);
+    } else {
+      bad.push([c.name, JSON.stringify(body.slice(0, 200))]);
+      console.log(`FAIL ${c.name.padEnd(22)} wanted ${c.want}`);
+    }
+  }
+  console.log(`\n${ok}/${cases.length} passed`);
+  for (const [n, why] of bad) console.log(`  ${n}: ${why}`);
+  process.exit(bad.length ? 1 : 0);
+}
 
 const tarBytes = readFileSync(join(WEB, 'public', 'rootfs', `${rootfsName}.tar`));
 const tree = untar(
@@ -263,7 +311,12 @@ for (const c of cases) {
   const mark = term.out.length;
   const t0 = Date.now();
   term.type(`${c.cmd}\r`);
-  const out = await prompt(mark, c.seconds ?? 120);
+  // Forty-five seconds, not two minutes. A case that wedges costs its whole
+  // cap and there are twenty-eight of them, so a generous bound turns one
+  // hang into an hour of nothing -- and the interesting part of a wedge is
+  // *that* it wedged, which forty-five seconds establishes as well as any
+  // larger number. A case that genuinely needs longer says so itself.
+  const out = await prompt(mark, c.seconds ?? 45);
   const ms = Date.now() - t0;
   if (out === null) {
     failed.push({ ...c, why: died ? `the guest died: ${died}` : 'no prompt came back', ms });
