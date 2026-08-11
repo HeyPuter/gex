@@ -32,6 +32,14 @@ struct State {
     /// rather than leaving it to be argued about.
     short: u64,
     refused: u64,
+    /// Every write that put a byte in, and how many bytes in all.
+    ///
+    /// The census shows a pipe as empty whether nobody has written to it or
+    /// somebody wrote and the reader took it. During apt's stall every pipe
+    /// reads `0 buffered` and the two possibilities have opposite causes: a
+    /// method that never reported, or a report that went somewhere else.
+    writes: u64,
+    written: u64,
 }
 
 /// One pipe, shared by both ends.
@@ -57,6 +65,8 @@ impl Pipe {
                 writers: 1,
                 short: 0,
                 refused: 0,
+                writes: 0,
+                written: 0,
             }),
             ready: Condvar::new(),
         }
@@ -137,6 +147,8 @@ impl Pipe {
             if room > 0 {
                 let n = room.min(buf.len() - written);
                 s.buf.extend(&buf[written..written + n]);
+                s.writes += 1;
+                s.written += n as u64;
                 written += n;
                 self.ready.notify_all();
                 if written == buf.len() {
@@ -161,6 +173,12 @@ impl Pipe {
     pub fn write_stats(&self) -> (u64, u64) {
         let s = self.state.lock().unwrap();
         (s.short, s.refused)
+    }
+
+    /// How many writes have put bytes in, and how many bytes in all.
+    pub fn write_totals(&self) -> (u64, u64) {
+        let s = self.state.lock().unwrap();
+        (s.writes, s.written)
     }
 
     /// How many descriptors are open on each end, as `(readers, writers)`.
@@ -294,6 +312,8 @@ pub struct Remote {
     pub ends: extern "C" fn(id: i32) -> i32,
     /// Short writes and refused writes, `(short << 16) | refused`.
     pub write_stats: extern "C" fn(id: i32) -> i32,
+    /// How many writes have ever put bytes in. Negative when the pipe is gone.
+    pub writes: extern "C" fn(id: i32) -> i32,
     /// Drop a descriptor. The last one on an end is what a reader sees as EOF.
     pub close_end: extern "C" fn(id: i32, write: i32),
     /// Read into, or write out of, an address in the caller's memory.
@@ -414,8 +434,9 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         } else {
             String::new()
         };
+        let n = (self.remote.writes)(self.id);
         format!(
-            "shared pipe {} {}, {} buffered, {r} readers {w} writers{wrote}",
+            "shared pipe {} {}, {} buffered, {r} readers {w} writers, {n} writes ever{wrote}",
             self.id,
             if self.write { "write" } else { "read" },
             (self.remote.buffered)(self.id)

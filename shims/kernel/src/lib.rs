@@ -1191,6 +1191,15 @@ pub extern "C" fn k_pipe_new() -> i32 {
 /// have nothing in common as bugs.
 /// Short writes and refused writes, `(short << 16) | refused`. See
 /// `Pipe::write_stats`.
+/// How many writes have ever put bytes into this pipe. See
+/// `Pipe::write_totals`.
+#[no_mangle]
+pub extern "C" fn k_pipe_writes(id: i32) -> i32 {
+    let Some(p) = pipe_at(id) else { return -1 };
+    let (writes, _) = p.write_totals();
+    writes.min(i32::MAX as u64) as i32
+}
+
 #[no_mangle]
 pub extern "C" fn k_pipe_write_stats(id: i32) -> i32 {
     let Some(p) = pipe_at(id) else { return -1 };
