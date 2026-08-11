@@ -355,6 +355,10 @@ export class Gex {
   /// or fewer, larger modules, and no counter here could tell them apart.
   /// Grows in the install path: how many, how many slots they added, and
   /// how many slots `Table.grow` had to copy to do it.
+  #faBaseMs = 0;
+  #faInitMs = 0;
+  #nowFills = 0;
+  #nowMs = 0;
   #bigGrows = [];
   /// `gex_table_need(0)` at named moments, so the step that raises it is
   /// visible rather than guessed at. Three fixes aimed at it have now missed.
@@ -705,6 +709,10 @@ export class Gex {
       // Worth separating because a trivial process -- `cat /dev/null`, one
       // block translated, thirty milliseconds of install, twenty of syscalls
       // -- takes 1.5 seconds, and none of the other counters accounts for it.
+      now: this.#nowFills,
+      nowMs: Math.round(this.#nowMs),
+      faBase: Math.round(this.#faBaseMs),
+      faInit: Math.round(this.#faInitMs),
       slow: this.#slowFills,
       slowMs: Math.round(this.#slowMs),
       pub: this.#publishes,
@@ -2438,7 +2446,17 @@ export class Gex {
           // be askable again once another module arrives, and a page nobody
           // will ever hold must stop trapping. The shim cannot tell those
           // apart on its own.
+          // Timed, because until now it was not. A process takes 79 to 137
+          // fills and only the handful that go the slow way were measured;
+          // the rest disappeared into `guest`, which is time inside `gex.run`
+          // and therefore includes every trap out of it. 150ms of "guest
+          // code" for `cat /dev/null` is not credible -- a million
+          // instructions is single digits -- so the question is what the
+          // other hundred-odd fills cost.
+          const q0 = performance.now();
           const quick = this.fillSlotNow(want >>> 0);
+          this.#nowFills++;
+          this.#nowMs += performance.now() - q0;
           let answer = quick;
           if (answer === null || answer === undefined) {
             const t0 = performance.now();
@@ -3386,8 +3404,17 @@ export class Gex {
       // helper: instantiating it wrote its slots, so there is nothing to ask
       // for and the page is already answered.
       if (typeof lazy.instObj.exports[FILL_AT] !== 'function') return true;
+      // The three parts, separately. A fast fill costs 1.4ms and the comment
+      // above calls it "a directory write and a table grow"; 1,024 table
+      // writes should be microseconds, so one of these is not what it looks
+      // like.
+      const b0 = performance.now();
       const at = this.#pageBase(page);
-      if (at >= 0 && lazy.instObj.exports[FILL_AT](page, at)) {
+      const b1 = performance.now();
+      this.#faBaseMs += b1 - b0;
+      const did = at >= 0 && lazy.instObj.exports[FILL_AT](page, at);
+      this.#faInitMs += performance.now() - b1;
+      if (did) {
         this.#filled++;
         return true;
       }
