@@ -2753,3 +2753,41 @@ closure with `?libs=N` turned "which of thirty-three libraries" into six
 runs of thirty seconds. And `?closure=0` -- run the same thing on the runtime
 translator alone -- is the question that separates "the guest is wrong" from
 "what we handed the guest is wrong", which nothing else could answer.
+
+### Warm `ls`: translation was never the cost
+
+An image per program in the closure removes the translation from a warm `ls`
+entirely:
+
+    blocks    3,140 / 3,554 / 3,579   ->   23 / 14 / 14
+    lifting     260ms                 ->   1-6ms
+    lived     2,083ms                 ->   1,970-2,477ms
+
+The wall time did not move. That is the whole finding: `ls` was being
+translated from scratch on every invocation, which was worth fixing on its own
+terms, and it was not what made a warm `ls` take two seconds.
+
+What is left, measured on a warm run:
+
+    installing 17 modules      86ms
+    adopt + the parent's copy ~100ms
+    worker start                9ms
+    translating                 4ms
+    ------------------------------
+    accounted                 ~200ms
+    lived                    2,078ms
+    fill 129 answered
+
+129 dispatch-fill round trips. Each is a trap out of wasm into an `async`
+function that yields the Worker's event loop with the guest stopped, and 129
+of them is the missing 1.8 seconds. A warm `ls` should be a Worker, an
+instantiate and a run -- ten milliseconds of work -- and the shape that stops
+it is asking JavaScript 129 times for a page of slots.
+
+Removing them is not a tuning exercise and one attempt has already failed.
+`gexfillat` matches on the guest page, and with an image per program every
+image claims the pages at `PIE_BASE` -- so *any* image answers for another's
+page and `ls` is handed `bash`'s blocks. Gating it needs the fill path to know
+which instance belongs to which library on every install path, not just the
+one that fetches a module on demand; wired on one path only, the fast path
+missed and translation came back at 6,169 blocks. Reverted.
