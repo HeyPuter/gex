@@ -411,7 +411,7 @@ pub const BIG_BLOCKS: usize = 4096;
 /// Writing a span around the miss instead trades entries for misses. It wins
 /// unless a page is entered at more than `1024 / FILL_SPAN` scattered points,
 /// and code entered at eight separate places in one 4 KiB page is unusual.
-pub const FILL_SPAN: u32 = 128;
+pub const FILL_SPAN: u32 = 32;
 
 /// Pack a table index and a base slot into a directory entry.
 ///
