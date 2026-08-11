@@ -358,6 +358,9 @@ export class Gex {
   #faBaseMs = 0;
   #faInitMs = 0;
   #fillWidthTold = false;
+  #imageMs = 0;
+  #imageBytes = 0;
+  #imageRegions = 0;
   #nowFills = 0;
   #nowMs = 0;
   #bigGrows = [];
@@ -2028,7 +2031,19 @@ export class Gex {
       // image; without the number the child's kernel believes it has no heap
       // and grows one from address zero, over its own register contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
-      image: this.#processImage(),
+      image: (() => {
+        // What a fork actually costs to hand over. `lived - guest` is about
+        // 150ms a process and the Worker is only 20 of it, so the rest is
+        // this record: built here, structured-cloned to the host, and cloned
+        // again to the child. Nobody has measured either the bytes or the
+        // hops.
+        const t0 = performance.now();
+        const img = this.#processImage();
+        this.#imageMs = performance.now() - t0;
+        this.#imageBytes = img.reduce((n, r) => n + (r.bytes?.byteLength ?? 0), 0);
+        this.#imageRegions = img.length;
+        return img;
+      })(),
       // The map, separately from the bytes it describes: names and code
       // identities, which the child needs to recognise a page as belonging to
       // a library somebody has already translated.
@@ -2079,6 +2094,16 @@ export class Gex {
             (e.gex_fork_fds_ptr() >>> 0) + (e.gex_fork_fds_len() >>> 0),
           )
         : null,
+    };
+    child.forkCost = {
+      buildMs: Math.round(this.#imageMs),
+      bytes: this.#imageBytes,
+      regions: this.#imageRegions,
+      // Absolute, not `performance.now()`: a Worker and the page have
+      // different time origins, so the raw reading compared across them
+      // is the skew between the two and not a duration. It read 2,330ms
+      // for a hop that cannot be more than a few.
+      sentAt: performance.timeOrigin + performance.now(),
     };
     e.gex_fork_taken();
     if (globalThis.GEX_DEBUG_EXIT) {

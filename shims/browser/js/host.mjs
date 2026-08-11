@@ -29,6 +29,37 @@
  * is a callback rather than a branch because this file has no business
  * knowing which it is running under.
  */
+/**
+ * The buffers in a fork record, so `postMessage` can hand them over instead
+ * of copying them.
+ *
+ * A fork image is 15.4 MiB in twenty regions and it crosses twice -- the
+ * parent's Worker to the page, the page to the child's Worker -- because the
+ * page is only a relay. Each crossing is a structured clone, measured at
+ * 82ms. Neither side reads the bytes again after passing them on, which is
+ * exactly the condition a transfer needs.
+ *
+ * Views on a `SharedArrayBuffer` are skipped: a shared buffer cannot be
+ * transferred, and the guest's memory is shared when threads are on. The
+ * regions are made with `slice`, so they are ordinary buffers and each owns
+ * its own -- transferring one cannot detach another.
+ */
+function forkTransfer(child) {
+  const out = [];
+  const add = (v) => {
+    if (!ArrayBuffer.isView(v)) return;
+    const b = v.buffer;
+    if (!(b instanceof ArrayBuffer) || out.includes(b)) return;
+    out.push(b);
+  };
+  for (const r of child?.image ?? []) add(r?.bytes);
+  add(child?.vmaBlob);
+  add(child?.fds);
+  add(child?.pages);
+  add(child?.shared);
+  return out;
+}
+
 /// Where a pooled Worker's early messages are kept until somebody owns it.
 const EARLY = Symbol('gex.early');
 
@@ -439,7 +470,7 @@ export class ProcessHost {
             shim: shimMod,
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
-          });
+          }, forkTransfer(msg.child));
           // Timed separately, because the gap between a parent finishing its
           // fork image and a child starting to adopt is 549ms and none of it
           // is accounted for anywhere. The candidates are this `postMessage`
@@ -470,7 +501,19 @@ export class ProcessHost {
       case 'output':
         this.#onOutput(m.fd, m.text, pid, m);
         break;
-      case 'fork':
+      case 'fork': {
+        // Three moments: the parent finished building the record, this
+        // message arrived, and the child's Worker is about to be given it.
+        const c = m.child?.forkCost;
+        if (c) {
+          const hop1 = Math.round(performance.timeOrigin + performance.now() - c.sentAt);
+          console.log(
+            `[gex] fork -> pid ${m.child.pid}: image ${(c.bytes / 1048576).toFixed(1)} MiB`
+              + ` in ${c.regions} regions, built ${c.buildMs}ms,`
+              + ` ${hop1}ms to reach the host`,
+          );
+          c.atHost = performance.now();
+        }
         this.#forked++;
         this.#onFork(m.child, pid);
         // Started and then let run. A child is a process in its own right;
@@ -479,6 +522,7 @@ export class ProcessHost {
           this.#onOutput(2, `gex: process ${m.child.pid} failed: ${e.message}\n`, pid);
         });
         break;
+      }
       case 'thread': {
         // A thread of a process that is already running: same memory, same
         // kernel, a Worker of its own. Nothing waits for it -- a thread ends
