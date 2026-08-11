@@ -40,6 +40,14 @@ struct State {
     /// method that never reported, or a report that went somewhere else.
     writes: u64,
     written: u64,
+    /// Writes that found no reader.
+    ///
+    /// Counted apart from the refused ones because they are a different
+    /// event: `EAGAIN` means "not now" and the caller carries the rest,
+    /// `EPIPE` means the message is gone. A message lost this way between
+    /// apt and its method is a deadlock until somebody's timeout, and the
+    /// count returned before ever reaching the counters below it.
+    broken: u64,
 }
 
 /// One pipe, shared by both ends.
@@ -67,6 +75,7 @@ impl Pipe {
                 refused: 0,
                 writes: 0,
                 written: 0,
+                broken: 0,
             }),
             ready: Condvar::new(),
         }
@@ -137,6 +146,7 @@ impl Pipe {
             if s.readers == 0 {
                 // Linux also raises SIGPIPE; with the default disposition the
                 // process dies before it ever sees this return value.
+                s.broken += 1;
                 return if written > 0 {
                     Ok(written as u64)
                 } else {
@@ -169,10 +179,13 @@ impl Pipe {
         }
     }
 
-    /// Short writes and refused writes, for the census.
+    /// Short writes, refused writes and writes that found no reader.
     pub fn write_stats(&self) -> (u64, u64) {
         let s = self.state.lock().unwrap();
-        (s.short, s.refused)
+        // `broken` rides in the high half: a write with nowhere to go is the
+        // one of the three that loses a message outright, so it must not be
+        // the one that goes unreported for want of a field.
+        (s.short + (s.broken << 8), s.refused)
     }
 
     /// How many writes have put bytes in, and how many bytes in all.
@@ -429,8 +442,10 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         };
         let ws = (self.remote.write_stats)(self.id);
         let (short, refused) = if ws < 0 { (-1i32, -1i32) } else { ((ws >> 16) & 0xffff, ws & 0xffff) };
-        let wrote = if short > 0 || refused > 0 {
-            format!(", {short} short {refused} refused")
+        let broken = (short >> 8) & 0xff;
+        let short = short & 0xff;
+        let wrote = if short > 0 || refused > 0 || broken > 0 {
+            format!(", {short} short {refused} refused {broken} broken")
         } else {
             String::new()
         };
