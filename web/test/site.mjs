@@ -469,6 +469,17 @@ for (const id of list) {
     for (const l of err.split('\n')) if (l && !noisy.test(l)) console.log(`     ${l}`);
   }
   if (result.how === 'reached') {
+    // The terminal on a passing run too, when it was asked for. Everything
+    // the *shim* narrates -- `trace_line`, and so every `[gex]`, `[closure]`
+    // and `[link]` line -- is written to the guest's stderr and arrives here
+    // rather than on the browser's console, and this printed it only when a
+    // run failed. A diagnostic added to answer "did this fire at all" then
+    // says nothing on the run where it fired, which cost two runs to notice.
+    if (process.env.GEX_STDERR === 'all') {
+      for (const line of lastTerminal.trim().split('\n').slice(-60)) {
+        console.log(`     | ${line}`);
+      }
+    }
     console.log(`ok   site-${id}`);
   } else {
     failures++;

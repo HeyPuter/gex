@@ -147,6 +147,38 @@ pub struct DynSym {
     pub tls: bool,
 }
 
+/// An image with nothing in it but the numbers the auxiliary vector reports.
+///
+/// For a process that is *restored* rather than loaded: the layout it needs
+/// was decided by the process that linked it, and re-parsing the executable
+/// to recover four integers is the whole of what the load path would have
+/// been for.
+pub fn headers_only(phdr_vaddr: u64, phentsize: u64, phnum: u64, entry: u64) -> Image {
+    Image {
+        bias: 0,
+        entry,
+        segments: Vec::new(),
+        phdr_vaddr,
+        phentsize,
+        phnum,
+        brk: 0,
+        text_range: (0, 0),
+        tls: None,
+        symbols: Vec::new(),
+        named_relocs: Vec::new(),
+        relocs: Vec::new(),
+        init_array: Vec::new(),
+        dynsyms: Vec::new(),
+        irelative: Vec::new(),
+        code: Vec::new(),
+        pie: true,
+        interp: None,
+        soname: None,
+        needed: Vec::new(),
+        runpath: Vec::new(),
+    }
+}
+
 /// A loaded process image.
 #[derive(Clone, Debug)]
 pub struct Image {

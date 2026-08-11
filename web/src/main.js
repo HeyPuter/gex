@@ -276,6 +276,11 @@ for (const [event, describe] of [
   // without turning it off.
   if (params.has('recompile')) globalThis.GEX_RECOMPILE_OBJECTS = Number(params.get('recompile'));
   if (params.has('permiss')) globalThis.GEX_PER_MISS = Number(params.get('permiss'));
+  // `?link=1`: keep the address space the guest's `ld.so` produced and start
+  // the next process of the same program from it. Through a global for the
+  // same reason as the rest of these -- the page's demos call `runProgram`
+  // with their own arguments and there is no seam to pass one through.
+  if (params.get('link') === '1') globalThis.GEX_LINK = 1;
   // `?heartbeat=N`: every N syscalls, print the census -- how many of each
   // kind and how long was spent inside them. The one instrument that says
   // whether a process's time is in its syscalls or between them, and it was

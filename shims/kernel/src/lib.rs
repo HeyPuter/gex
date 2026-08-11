@@ -840,6 +840,69 @@ pub extern "C" fn k_place_set(key: u64, base: u64, len: u64) {
     }
 }
 
+/// Linked address spaces, keyed by a hash of the program and the environment
+/// that was linked for it.
+///
+/// A dynamically linked program spends its first half-second running the
+/// guest's `ld.so`, which maps its libraries, hashes their symbols and
+/// applies their relocations -- and reaches, every time, the same answer,
+/// because a closure pins every object at an address decided at build time.
+/// The first process of a program pays for it and leaves the result here;
+/// every process after it starts from the result.
+///
+/// Bounded, because a run that execs forty distinct programs would otherwise
+/// keep forty address spaces alive for the sake of the one process each that
+/// might follow.
+const SNAP_BUDGET: usize = 96 * 1024 * 1024;
+
+fn snaps() -> &'static Mutex<(BTreeMap<u64, Vec<u8>>, usize)> {
+    note_panics();
+    static SNAPS: OnceLock<Mutex<(BTreeMap<u64, Vec<u8>>, usize)>> = OnceLock::new();
+    SNAPS.get_or_init(|| Mutex::new((BTreeMap::new(), 0)))
+}
+
+/// Keep the linked image of `key`. Silently declines when the budget is
+/// spent or the key is already known: the first process to finish linking
+/// wins, and a second one arriving with the same answer has nothing to add.
+///
+/// SAFETY: `ptr` names the calling process's memory, not the kernel's, so
+/// the bytes are pulled across rather than read. See `k_mod_store`.
+#[no_mangle]
+pub unsafe extern "C" fn k_snap_store(key: u64, ptr: u32, len: u32) {
+    let mut s = snaps().lock().unwrap_or_else(|e| e.into_inner());
+    if len == 0 || s.0.contains_key(&key) || s.1 + len as usize > SNAP_BUDGET {
+        return;
+    }
+    let mut blob = vec![0u8; len as usize];
+    if !unsafe { gex_kmem::pull_checked(blob.as_mut_ptr(), ptr, len) } {
+        return;
+    }
+    s.1 += len as usize;
+    s.0.insert(key, blob);
+}
+
+/// How many bytes the linked image of `key` takes, or zero if there is none.
+#[no_mangle]
+pub extern "C" fn k_snap_len(key: u64) -> u32 {
+    let s = snaps().lock().unwrap_or_else(|e| e.into_inner());
+    s.0.get(&key).map(|b| b.len() as u32).unwrap_or(0)
+}
+
+/// Copy the linked image of `key` into the caller's memory. Returns how many
+/// bytes were written.
+#[no_mangle]
+pub unsafe extern "C" fn k_snap_get(key: u64, at: u32, cap: u32) -> u32 {
+    let s = snaps().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(blob) = s.0.get(&key) else { return 0 };
+    if blob.len() > cap as usize {
+        return 0;
+    }
+    if !unsafe { gex_kmem::push_checked(at, blob.as_ptr(), blob.len() as u32) } {
+        return 0;
+    }
+    blob.len() as u32
+}
+
 /// Somewhere to stage a guest buffer copied out of a process's memory.
 static mut SCRATCH: [u8; 4096] = [0; 4096];
 

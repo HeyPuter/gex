@@ -70,6 +70,15 @@ pub struct Identity {
     /// static image must see zero, which is how libc decides no interpreter
     /// ran.
     pub interp_base: u64,
+    /// Where to send the interpreter instead of the program's own entry, or
+    /// zero for the honest answer.
+    ///
+    /// `AT_ENTRY` is what glibc's `_dl_start_user` branches to once it has
+    /// finished linking, which makes it the one place a host can get control
+    /// at the exact moment the linking is done and nothing of the program has
+    /// run yet. gex points it at a two-instruction stub of its own so that it
+    /// can keep what the linker produced; see `SNAP_STUB` in the browser shim.
+    pub entry_hook: u64,
 }
 
 impl Default for Identity {
@@ -78,6 +87,7 @@ impl Default for Identity {
             uid: 1000,
             gid: 1000,
             interp_base: 0,
+            entry_hook: 0,
         }
     }
 }
@@ -174,7 +184,10 @@ pub fn build_initial_stack(
         (auxv::AT_PAGESZ, 4096),
         (auxv::AT_BASE, id.interp_base),
         (auxv::AT_FLAGS, 0),
-        (auxv::AT_ENTRY, image.entry),
+        (
+            auxv::AT_ENTRY,
+            if id.entry_hook != 0 { id.entry_hook } else { image.entry },
+        ),
         (auxv::AT_UID, id.uid as u64),
         (auxv::AT_EUID, id.uid as u64),
         (auxv::AT_GID, id.gid as u64),

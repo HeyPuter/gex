@@ -851,6 +851,7 @@ fn run_program_with(
             uid,
             gid,
             interp_base: program.interp_base(),
+            entry_hook: 0,
         },
     )?;
 

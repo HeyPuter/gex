@@ -395,6 +395,10 @@ async function handle(msg) {
           // taken from the start message.
           closure: msg.closure ?? msg.opts?.closure
             ?? (await closureModules(msg.closureCount ?? 0)),
+          // Top level as well as `opts`, for the same reason `closure` is:
+          // a child's Worker is sent the host's `extra` and pid 1's `opts`
+          // never reach it.
+          link: msg.link ?? msg.opts?.link,
           wantLibrary,
         },
       );
@@ -450,6 +454,9 @@ async function handle(msg) {
     if (msg.trace) ex.gex_set_trace?.(1);
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
     if (msg.checkSp) ex.gex_set_check_sp?.(1);
+    // A forked or exec'd child never calls `load`, so the switch that `load`
+    // reads never reaches it -- and the child is the process this is for.
+    if (msg.link ?? msg.opts?.link) ex.gex_set_snapshot?.(1);
     if (msg.debugExit) {
       // Before the guest has executed an instruction: a process's memory is
       // what decides how many of them a browser will hold, so it matters

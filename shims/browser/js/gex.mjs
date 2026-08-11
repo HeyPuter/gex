@@ -476,7 +476,17 @@ export class Gex {
   get loader() {
     const e = this.#shim?.exports;
     if (!e?.gex_loader_calls) return null;
-    return { calls: Number(e.gex_loader_calls()), doneMs: Number(e.gex_loader_done_ms()) };
+    return {
+      calls: Number(e.gex_loader_calls()),
+      doneMs: Number(e.gex_loader_done_ms()),
+      // What the linked-image store did for this process, if anything. On
+      // this line because it is the one that always reaches the console: the
+      // shim's own narration goes to the guest's stderr, and the arming
+      // happens before a test's terminal has twenty lines of scrollback.
+      link: ['off', 'no-kernel', 'armed', 'kept', 'restored', 'asked'][
+        Number(e.gex_link_state?.() ?? 0)
+      ],
+    };
   }
   /// Which objects this process lifted blocks from, `name=count` separated.
   get blocksByObject() {
@@ -644,6 +654,9 @@ export class Gex {
     // than assumed: the 16 it defaults to was chosen against 4096, which only
     // ruled out unbounded.
     if (opts.perMiss) this.#shim.exports.gex_set_per_miss?.(opts.perMiss);
+    // Keep what the guest's dynamic linker produces, and start the next
+    // process of the same program from it instead of linking again.
+    if (opts.link) this.#shim.exports.gex_set_snapshot?.(1);
     // A terminal changes how libc buffers and whether a shell prints a
     // prompt, so a page with xterm.js in it has to say so.
     if (opts.tty) this.#shim.exports.gex_set_tty(1);

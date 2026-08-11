@@ -302,6 +302,11 @@ extern "C" {
     /// should: the rest would unpack the same rootfs over the top of it.
     fn k_place(key: u64, len: u64) -> u64;
     fn k_place_set(key: u64, base: u64, len: u64);
+    /// The linked address space of a program, kept so the next process of it
+    /// does not have to run the dynamic linker again.
+    fn k_snap_store(key: u64, ptr: u32, len: u32);
+    fn k_snap_len(key: u64) -> u32;
+    fn k_snap_get(key: u64, at: u32, cap: u32) -> u32;
     fn k_fs_populated() -> i32;
     fn k_fs_populate_done();
 
@@ -2493,6 +2498,14 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
     kernel.argv = args.clone();
     kernel.envp = env.to_vec();
+    // Process one links for itself and leaves the answer for whoever runs the
+    // same program next. There is nothing to restore from: it is the first.
+    let hook = if snapshots_on() && program.interp.is_some() {
+        SNAP_STUB
+    } else {
+        0
+    };
+    let snap_key_1 = snap_key(&kernel.exe_path, &kernel.envp);
     let layout = gex_ld::build_initial_stack(
         &program.exe,
         // `STACK_TOP`, not the top of the guest's addressable range.
@@ -2510,6 +2523,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             gid: unsafe { IDENTITY.1 },
             // Where the interpreter ended up, which is how it finds itself.
             interp_base: program.interp_base(),
+            entry_hook: hook,
         },
     );
     let start = layout.low as usize;
@@ -2528,6 +2542,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         .copy_from_slice(&1024i32.to_le_bytes());
     for i in 0..31u8 {
         write_u64(data, c + ctx::x(i), 0);
+    }
+    if hook != 0 {
+        snap_arm(&mut kernel, snap_key_1, &program.exe, program.interp_base());
     }
 
     let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
@@ -3958,6 +3975,34 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             let st = Arc::clone(&h.proc_state);
             h.kernel.refresh_proc(&st.0);
         }
+        // The dynamic linker has finished and jumped to what it was told was
+        // the entry, which is gex's stub. Keep what it built and carry on at
+        // the program's real entry, with every register but `x8` as the
+        // linker left it -- nothing writes a return value for this one.
+        if nr == SNAP_SYSCALL && SNAP_PENDING.0.borrow().1 != 0 {
+            let (key, entry) = *SNAP_PENDING.0.borrow();
+            *SNAP_PENDING.0.borrow_mut() = (0, 0);
+            if key != 0 {
+                let blob = snap_take(h, kstate.ctx_addr, entry);
+                // SAFETY: the pointer names this module's memory, which is
+                // what the kernel copies across from, and the slice outlives
+                // the call.
+                unsafe { k_snap_store(key, blob.as_ptr() as u32, blob.len() as u32) };
+                link_state(3);
+                trace_line(&format!(
+                    "[link] {} linked, {} KiB kept at {}ms\n",
+                    h.kernel.exe_path,
+                    blob.len() / 1024,
+                    (now_ns() - PROCESS_STARTED.load(std::sync::atomic::Ordering::Relaxed))
+                        / 1_000_000
+                ));
+            }
+            h.kernel.leave_thread(&mut h.threads[cur()].kstate);
+            h.threads[cur()].pc = entry;
+            set_resume(entry);
+            set_resume_ctx(kstate.ctx_addr);
+            return 1;
+        }
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
         h.kernel.leave_thread(&mut h.threads[cur()].kstate);
         match outcome {
@@ -4984,13 +5029,29 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
 /// Returns the entry point, or zero if the program could not be loaded, in
 /// which case the caller has already been given an errno.
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
-    let Some(bytes) = h.kernel.read_file(path) else {
-        return 0;
+    // Has this program been linked already, in this run, in this
+    // environment? Then there is nothing to load: the answer is an address
+    // space, and it goes back byte for byte.
+    let key = snap_key(path, envp);
+    let linked = snap_lookup(key);
+    let program = if linked.is_some() {
+        None
+    } else {
+        let Some(bytes) = h.kernel.read_file(path) else {
+            return 0;
+        };
+        let read = |p: &str| h.kernel.read_file(p);
+        match gex_ld::load_program(&bytes, gex_abi::PIE_BASE, INTERP_BASE, &read) {
+            Ok(p) => Some(p),
+            Err(_) => return 0,
+        }
     };
-    let read = |p: &str| h.kernel.read_file(p);
-    let program = match gex_ld::load_program(&bytes, gex_abi::PIE_BASE, INTERP_BASE, &read) {
-        Ok(p) => p,
-        Err(_) => return 0,
+    // Record, when this is the first process to run the program and there is
+    // a linker to catch.
+    let hook = if program.as_ref().and_then(|p| p.interp.as_ref()).is_some() && snapshots_on() {
+        SNAP_STUB
+    } else {
+        0
     };
     h.kernel.close_on_exec();
     // Handlers are addresses in the image being replaced; see Signals::exec.
@@ -5009,7 +5070,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // to do, and the first call through the PLT branched to 0x15c0 -- the
     // unbiased PLT0 -- and died in unmapped memory.
     let old: Vec<(u64, u64)> = h.kernel.mem.vmas().iter().map(|v| (v.start, v.end)).collect();
-    h.kernel.mem = gex_kernel::mem::MemoryMap::new(program.brk());
+    h.kernel.mem =
+        gex_kernel::mem::MemoryMap::new(program.as_ref().map(|p| p.brk()).unwrap_or(0));
     // A fresh map for a fresh image, and it grows the same way.
     h.kernel.mem.grows_on_demand(arena_grow, arena_back);
     {
@@ -5032,7 +5094,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let data = guest_bytes();
     // The new image goes where its own headers say, which for a static
     // executable is the same place the old one was.
-    for (seg, from) in program.placements() {
+    for (seg, from) in program.iter().flat_map(|p| p.placements()) {
         let (a, b) = (seg.vaddr as usize, (seg.vaddr + seg.mem_size) as usize);
         if b > data.len() {
             return 0;
@@ -5075,8 +5137,46 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             Some((from.unwrap_or(path).to_string(), seg.vaddr)),
         );
     }
+
+    // The recorded address space, when there is one. It replaces the map
+    // this function just built, because the map is part of what was
+    // recorded.
+    let restored = match &linked {
+        Some(blob) => match snap_put(h, blob) {
+            Some(l) => Some(l),
+            // A file the recording named has gone, or the blob is from
+            // another build. Nothing has been loaded, so there is nothing to
+            // run: say `ENOEXEC` rather than enter a half-built image.
+            None => {
+                trace_line(&format!("[link] {path}: recorded image would not go back\n"));
+                return 0;
+            }
+        },
+        None => None,
+    };
+
+    // What the auxiliary vector says about the executable: from the image
+    // when one was loaded, and from the recording when one was restored.
+    let facts = match (&program, &restored) {
+        (Some(p), _) => gex_ld::elf::headers_only(
+            p.exe.phdr_vaddr,
+            p.exe.phentsize,
+            p.exe.phnum,
+            p.exe.entry,
+        ),
+        (None, Some(l)) => gex_ld::elf::headers_only(l.phdr, l.phent, l.phnum, l.entry),
+        (None, None) => return 0,
+    };
+    let interp_base = match (&program, &restored) {
+        (Some(p), _) => p.interp_base(),
+        (None, Some(l)) => l.interp_base,
+        (None, None) => 0,
+    };
+    // A restored process is past the linker, so `AT_ENTRY` is the honest
+    // answer and the stub is not armed.
+    let hook = if restored.is_some() { 0 } else { hook };
     let layout = gex_ld::build_initial_stack(
-        &program.exe,
+        &facts,
         // `STACK_TOP`, not the top of the guest's addressable range.
         //
         // A stack at the top makes the top load-bearing, and a linear memory
@@ -5090,7 +5190,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         gex_ld::Identity {
             uid: unsafe { IDENTITY.0 },
             gid: unsafe { IDENTITY.1 },
-            interp_base: program.interp_base(),
+            interp_base,
+            entry_hook: hook,
         },
     );
     // Zero first, then lay the new stack out on top of it.
@@ -5174,22 +5275,46 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
 
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     let c = ctx_addr as usize;
+    // A loaded program starts with clear registers. A restored one starts
+    // with the registers the linker left, because `x0` holds the address of
+    // `_dl_fini` -- what `__libc_start_main` registers with `atexit` -- and
+    // the thread pointer names the TLS block the linker allocated.
     for i in 0..31u8 {
-        write_u64(data, c + ctx::x(i), 0);
+        let v = restored.as_ref().map(|l| l.x[i as usize]).unwrap_or(0);
+        write_u64(data, c + ctx::x(i), v);
     }
+    if let Some(l) = &restored {
+        write_u64(data, c + ctx::TPIDR, l.tpidr);
+    }
+    // `sp` is the stack just built, not the recorded one: the two are the
+    // same address by construction -- see `BLOB_RESERVE` -- and the argv on
+    // it is this process's.
     write_u64(data, c + ctx::SP, layout.sp);
-    write_u64(data, c + ctx::PC, program.entry());
+    let entry = match (&program, &restored) {
+        (Some(p), _) => p.entry(),
+        (None, Some(l)) => l.entry,
+        (None, None) => return 0,
+    };
+    write_u64(data, c + ctx::PC, entry);
     write_u64(data, c + ctx::MON_SIZE, 0);
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
     h.threads = vec![Thread {
         kstate: ThreadState::new(ctx_addr, h.kernel.pid),
-        pc: program.entry(),
+        pc: entry,
         waiting: Waiting::Runnable,
         blocked_on: None,
     }];
     set_current(h, 0);
-    program.entry()
+    if let (Some(p), None) = (&program, &restored) {
+        if hook != 0 {
+            snap_arm(&mut h.kernel, key, &p.exe, p.interp_base());
+        }
+    }
+    if restored.is_some() {
+        link_state(4);
+    }
+    entry
 }
 
 /// What identifies the code at `page`, when anything does.
@@ -5241,6 +5366,348 @@ fn record_shared_slot(h: &mut Host, page: u64, key: u64, base: u32) {
 /// same order. The answer lives in the global kernel, keyed by a hash of the
 /// path: the caller is a different wasm memory, and a scalar crosses that
 /// boundary without a copy.
+/// The page holding the stub that catches the dynamic linker's last jump.
+///
+/// Just above the stack, which grows down from [`gex_abi::STACK_TOP`], and
+/// below [`gex_abi::MMAP_BOTTOM`], so it is inside the fixed low layout every
+/// process has and cannot collide with anything the guest maps.
+const SNAP_STUB: u64 = gex_abi::STACK_TOP;
+
+/// The syscall number the stub uses to hand control back. Above every number
+/// Linux has assigned on aarch64, so no guest can reach it by accident.
+const SNAP_SYSCALL: u64 = 0x6765_7801;
+
+/// `movz x8, #0x7801` / `movk x8, #0x6765, lsl #16` / `svc #0`.
+///
+/// Three instructions and no registers touched but `x8`, which is
+/// caller-saved and which `_start` does not read -- so `x0`, holding the
+/// address of `_dl_fini` that glibc's `__libc_start_main` will register with
+/// `atexit`, arrives at the entry exactly as the linker left it.
+const SNAP_STUB_CODE: [u32; 3] = [0xd28f0028, 0xf2aceca8, 0xd4000001];
+
+/// Whether to keep the linked image of a program and start the next process
+/// of it from the result.
+static SNAPSHOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The program being linked in this process, as `(key, real entry)`.
+///
+/// Set when the stack is built with `AT_ENTRY` pointing at [`SNAP_STUB`], and
+/// read when the stub calls in. Zero means this process is not recording.
+static SNAP_PENDING: SingleThreaded<(u64, u64)> = SingleThreaded(const { RefCell::new((0, 0)) });
+
+/// What the linked-image store did for this process.
+///
+/// Reported on the per-process line rather than traced, because the arming
+/// happens in the first milliseconds of a process and the terminal a test
+/// reads keeps only its last twenty lines -- so the one message that says
+/// whether the mechanism engaged at all was always the one that had scrolled
+/// away.
+///
+/// 0 off, 1 asked for with no global kernel to keep the answer in, 2 armed
+/// and the program then ran its own linker, 3 kept, 4 restored, 5 asked for
+/// and nothing since -- which is what a process that never reached the arming
+/// point reports, and is the difference between "the switch did not arrive"
+/// and "the switch arrived and did nothing".
+static LINK_STATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_link_state() -> u32 {
+    LINK_STATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn link_state(v: u32) {
+    LINK_STATE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Turn the linked-image store on or off. Off is what a run with no global
+/// kernel gets, since there would be nowhere to keep the answer.
+#[no_mangle]
+pub extern "C" fn gex_set_snapshot(on: u32) {
+    SNAPSHOT.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+    if on != 0 {
+        link_state(5);
+    }
+    // SAFETY: `k_present` takes no borrow.
+    let kernel = unsafe { k_present() != 0 };
+    if on != 0 && !kernel {
+        link_state(1);
+    }
+}
+
+fn snapshots_on() -> bool {
+    // SAFETY: `k_present` takes no borrow.
+    SNAPSHOT.load(std::sync::atomic::Ordering::Relaxed) && unsafe { k_present() != 0 }
+}
+
+/// What identifies a linked address space.
+///
+/// The program, and the environment it was linked in: `LD_LIBRARY_PATH` and
+/// `LD_PRELOAD` change which objects are loaded and where, and a snapshot
+/// taken under one and restored under another would be a different program's
+/// libraries at this one's addresses. The whole environment rather than the
+/// `LD_` part of it, because it costs a hash either way and a run whose
+/// commands all share an environment -- which is every shell -- still hits.
+fn snap_key(path: &str, envp: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    for e in envp {
+        e.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Put the catcher stub in the address space and say where the program's own
+/// entry is, so the syscall it makes can be answered.
+fn snap_arm(kernel: &mut Kernel, key: u64, exe: &gex_ld::Image, interp_base: u64) {
+    *SNAP_FACTS.0.borrow_mut() = (exe.phdr_vaddr, exe.phentsize, exe.phnum, interp_base);
+    let entry = exe.entry;
+    let data = guest_bytes();
+    let at = SNAP_STUB as usize;
+    for (i, w) in SNAP_STUB_CODE.iter().enumerate() {
+        data[at + i * 4..at + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    kernel.mem.insert_loaded(
+        SNAP_STUB,
+        SNAP_STUB + 4096,
+        gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC,
+        "[gex-link]",
+        None,
+    );
+    *SNAP_PENDING.0.borrow_mut() = (key, entry);
+    link_state(2);
+}
+
+/// The bytes of one mapping, or a note saying where to re-read them.
+///
+/// A library's text is the file's bytes and nothing has touched it, so the
+/// snapshot carries eight bytes and a path rather than two megabytes. What it
+/// must carry is everything the linker *wrote*: the GOTs, the relocated
+/// `.data`, the TLS template it copied and its own bookkeeping -- which is
+/// exactly the set of mappings that have been writable, and is a few hundred
+/// kilobytes rather than a few megabytes.
+fn snap_write_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn snap_read_str(raw: &[u8], p: &mut usize) -> Option<String> {
+    let n = u32::from_le_bytes(raw.get(*p..*p + 4)?.try_into().ok()?) as usize;
+    *p += 4;
+    let s = String::from_utf8_lossy(raw.get(*p..*p + n)?).into_owned();
+    *p += n;
+    Some(s)
+}
+
+fn snap_read_u64(raw: &[u8], p: &mut usize) -> Option<u64> {
+    let v = u64::from_le_bytes(raw.get(*p..*p + 8)?.try_into().ok()?);
+    *p += 8;
+    Some(v)
+}
+
+fn snap_read_u32(raw: &[u8], p: &mut usize) -> Option<u32> {
+    let v = u32::from_le_bytes(raw.get(*p..*p + 4)?.try_into().ok()?);
+    *p += 4;
+    Some(v)
+}
+
+/// A program as its dynamic linker left it, ready to be entered.
+struct LinkedImage {
+    entry: u64,
+    /// What the auxiliary vector has to say about the executable, so that a
+    /// restored process needs no ELF parse at all.
+    phdr: u64,
+    phent: u64,
+    phnum: u64,
+    interp_base: u64,
+    x: [u64; 31],
+    sp: u64,
+    tpidr: u64,
+}
+
+/// What the recording process knew about its own executable.
+static SNAP_FACTS: SingleThreaded<(u64, u64, u64, u64)> =
+    SingleThreaded(const { RefCell::new((0, 0, 0, 0)) });
+
+/// Serialise this process's address space, as the dynamic linker left it.
+fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(b"SNP1");
+    out.extend_from_slice(&entry.to_le_bytes());
+    let (phdr, phent, phnum, interp_base) = *SNAP_FACTS.0.borrow();
+    for v in [phdr, phent, phnum, interp_base] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&h.kernel.mem.brk_current().to_le_bytes());
+    {
+        let gm = GuestMem::new(guest_bytes());
+        for i in 0..31u8 {
+            let v = gm.read_u64(ctx_addr + ctx::x(i) as u64).unwrap_or(0);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for f in [ctx::SP, ctx::TPIDR] {
+            let v = gm.read_u64(ctx_addr + f as u64).unwrap_or(0);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    // Which mappings, and in which form. The stack is rebuilt for whatever
+    // arguments the next process has rather than carried, and the catcher
+    // stub belongs to the process that recorded, not to the one that
+    // restores.
+    let regions: Vec<(u64, u64, u32, String, Option<(String, u64)>, Option<(String, u64)>)> = h
+        .kernel
+        .mem
+        .vmas()
+        .iter()
+        .filter(|v| v.name != "[stack]" && v.start != SNAP_STUB)
+        .map(|v| {
+            (
+                v.start,
+                v.end,
+                v.prot,
+                v.name.clone(),
+                v.code.clone(),
+                // Re-readable only if it has never been writable, which is
+                // the invariant `origin` already carries.
+                v.origin.clone(),
+            )
+        })
+        .collect();
+    out.extend_from_slice(&(regions.len() as u32).to_le_bytes());
+    let data = guest_bytes();
+    for (start, end, prot, name, code, origin) in regions {
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&end.to_le_bytes());
+        out.extend_from_slice(&prot.to_le_bytes());
+        snap_write_str(&mut out, &name);
+        match &code {
+            Some((id, off)) => {
+                out.extend_from_slice(&1u32.to_le_bytes());
+                snap_write_str(&mut out, id);
+                out.extend_from_slice(&off.to_le_bytes());
+            }
+            None => out.extend_from_slice(&0u32.to_le_bytes()),
+        }
+        match &origin {
+            Some((id, off)) => {
+                out.extend_from_slice(&1u32.to_le_bytes());
+                snap_write_str(&mut out, id);
+                out.extend_from_slice(&off.to_le_bytes());
+            }
+            None => {
+                out.extend_from_slice(&0u32.to_le_bytes());
+                let (a, b) = (start as usize, (end as usize).min(data.len()));
+                let bytes: &[u8] = if a < b { &data[a..b] } else { &[] };
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
+        }
+    }
+    out
+}
+
+/// Put a recorded address space back, and answer with the entry to resume at.
+///
+/// Zero if the blob cannot be read or a file it names has gone, in which case
+/// the caller loads the program the long way.
+fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
+    let mut p = 0usize;
+    if raw.get(0..4)? != b"SNP1" {
+        return None;
+    }
+    p += 4;
+    let entry = snap_read_u64(raw, &mut p)?;
+    let phdr = snap_read_u64(raw, &mut p)?;
+    let phent = snap_read_u64(raw, &mut p)?;
+    let phnum = snap_read_u64(raw, &mut p)?;
+    let interp_base = snap_read_u64(raw, &mut p)?;
+    let brk = snap_read_u64(raw, &mut p)?;
+    let mut x = [0u64; 31];
+    for slot in x.iter_mut() {
+        *slot = snap_read_u64(raw, &mut p)?;
+    }
+    let sp = snap_read_u64(raw, &mut p)?;
+    let tpidr = snap_read_u64(raw, &mut p)?;
+    let n = snap_read_u32(raw, &mut p)?;
+
+    h.kernel.mem = gex_kernel::mem::MemoryMap::new(brk);
+    h.kernel.mem.grows_on_demand(arena_grow, arena_back);
+    // One read per file, not one per mapping. A library arrives as four
+    // mappings -- text, rodata, relro, data -- and re-reading `libc.so.6` for
+    // each of them is seven megabytes of filesystem for one and three
+    // quarters of library.
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for _ in 0..n {
+        let start = snap_read_u64(raw, &mut p)?;
+        let end = snap_read_u64(raw, &mut p)?;
+        let prot = snap_read_u32(raw, &mut p)?;
+        let name = snap_read_str(raw, &mut p)?;
+        let code = if snap_read_u32(raw, &mut p)? == 1 {
+            let id = snap_read_str(raw, &mut p)?;
+            Some((id, snap_read_u64(raw, &mut p)?))
+        } else {
+            None
+        };
+        let from_file = snap_read_u32(raw, &mut p)? == 1;
+        // The memory has to reach the mapping before anything is written
+        // into it: a restored process starts with the fixed low layout and
+        // nothing above it, and every library is above it.
+        if !arena_back(end) {
+            return None;
+        }
+        if from_file {
+            let path = snap_read_str(raw, &mut p)?;
+            let off = snap_read_u64(raw, &mut p)?;
+            if !files.iter().any(|(k, _)| *k == path) {
+                files.push((path.clone(), h.kernel.read_file(&path)?));
+            }
+            let bytes = &files.iter().find(|(k, _)| *k == path)?.1;
+            let data = guest_bytes();
+            let (a, b) = (start as usize, (end as usize).min(data.len()));
+            if a >= b {
+                return None;
+            }
+            data[a..b].fill(0);
+            let take = (b - a).min(bytes.len().saturating_sub(off as usize));
+            data[a..a + take].copy_from_slice(&bytes[off as usize..off as usize + take]);
+            h.kernel.mem.insert_from(start, end, prot, &name, Some((path, off)));
+        } else {
+            let len = snap_read_u32(raw, &mut p)? as usize;
+            let payload = raw.get(p..p + len)?;
+            p += len;
+            let data = guest_bytes();
+            let (a, b) = (start as usize, (end as usize).min(data.len()));
+            if a >= b {
+                return None;
+            }
+            data[a..b].fill(0);
+            let take = (b - a).min(len);
+            data[a..a + take].copy_from_slice(&payload[..take]);
+            h.kernel.mem.adopt(start, end, prot, &name, code);
+        }
+    }
+    Some(LinkedImage { entry, phdr, phent, phnum, interp_base, x, sp, tpidr })
+}
+
+/// Fetch the linked image of `key` out of the global kernel.
+fn snap_lookup(key: u64) -> Option<Vec<u8>> {
+    if !snapshots_on() {
+        return None;
+    }
+    // SAFETY: both calls take scalars, and the second is handed a pointer
+    // into this module's memory with the length the first reported.
+    unsafe {
+        let len = k_snap_len(key);
+        if len == 0 {
+            return None;
+        }
+        let mut blob = vec![0u8; len as usize];
+        let got = k_snap_get(key, blob.as_mut_ptr() as u32, len);
+        (got == len).then_some(blob)
+    }
+}
+
 struct SharedPlaces;
 
 impl gex_kernel::syscalls::ObjectPlace for SharedPlaces {

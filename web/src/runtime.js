@@ -305,6 +305,10 @@ export async function runProgram(
     // until now no page could be given one, so the browser had only ever been
     // measured in the configuration that matters least.
     closure = null,
+    // Keep the address space the guest's dynamic linker produced, so the next
+    // process of the same program starts at its own entry with every
+    // relocation already applied.
+    link = !!globalThis.GEX_LINK,
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
@@ -388,6 +392,11 @@ export async function runProgram(
       // rasteriser, which nothing here wants because the renderer is on the
       // other side of the vtest socket.
       recompileObjects,
+      // In `extra` rather than `opts`: the shell that starts a demo is not
+      // the process this is for. What pays for the dynamic linker is the
+      // forty commands it runs, and each of those is a Worker of its own
+      // that never sees `opts`.
+      link: link || undefined,
     },
     onOutput: (fd, text, pid, m) => {
       if (m?.lflag !== undefined) tenv.lflag = m.lflag;
@@ -423,7 +432,7 @@ export async function runProgram(
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
       opts: {
-        cwd, tty, uid, recompileObjects, heartbeat, pins: closure?.pins,
+        cwd, tty, uid, recompileObjects, heartbeat, link, pins: closure?.pins,
         program: closure?.program,
         // `?permiss=N`: how many stored units one dispatch miss may take.
         perMiss: typeof globalThis.GEX_PER_MISS === 'number' ? globalThis.GEX_PER_MISS : undefined,

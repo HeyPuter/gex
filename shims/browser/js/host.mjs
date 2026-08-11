@@ -469,6 +469,9 @@ export class ProcessHost {
               (m.loader && m.loader.calls
                 ? `, ld.so ${m.loader.calls} syscalls, last at ${m.loader.doneMs}ms`
                 : '') +
+              (m.loader && m.loader.link && m.loader.link !== 'off'
+                ? `, link ${m.loader.link}`
+                : '') +
               (m.fill && (m.fill.filled || m.fill.unanswered)
                 ? `, fill ${m.fill.filled} answered ${m.fill.unanswered} not`
                 : '') +
