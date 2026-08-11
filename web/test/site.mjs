@@ -104,39 +104,56 @@ const DEMOS = {
     want: /Fetched .* in |Reading package lists\.\.\. Done/,
     fail: /Temporary failure|Could not resolve|Failed to fetch/,
   },
-  // dpkg-deb's own read path, on an archive it built seconds earlier, with
-  // no network and no apt.
+  // dpkg-deb reading a `.deb` this file carries in, as base64.
   //
-  //     tar: This does not look like a tar archive
-  //     dpkg-deb: error: tar subprocess returned error exit status 2
+  // The same two archives run correctly under the native adapter, xz
+  // included, so the lifter decompresses both. In the browser the gzip and
+  // zstd round trips pass and xz does not, which makes it a question about
+  // Workers, fork and pipes rather than about liblzma -- and the archives
+  // apt downloads are all xz, so this is what stops `apt-get install`.
   //
-  // is where `apt-get install` stops, and that message is what tar prints
-  // when it is handed *nothing* -- `: | tar tf -` says exactly this and
-  // exits 2. So the bytes are not corrupt, they are absent.
-  //
-  // `--control` forks twice with a pipe between: one child decompresses
-  // into the write end, the other dup2s the read end onto stdin and execs
-  // tar. The decompressing child inherits the archive's descriptor at the
-  // offset its parent left it after reading the `ar` header. Reading
-  // through a symlink, a 133 KB shell pipeline and `tar tf` of a local
-  // archive all pass, so what is left is that fork, that pipe and that
-  // offset.
+  // Carried in rather than downloaded so the check needs no network and
+  // takes seconds. Six hundred bytes of `ar` is cheaper than a mirror.
   'debian-deb': {
     demo: 'debian',
     cmd:
-      // One round trip per compressor. A `.deb` from the archive is xz;
-      // `dpkg-deb -b` defaults to zstd on Debian 12, so a round trip that
-      // does not say which one is measuring the wrong decompressor -- and
-      // zstd has a known hang of its own (#113), which would look like this
-      // failing rather than that one.
-      'mkdir -p /tmp/p/DEBIAN; printf "Package: t\\nVersion: 1\\n'
-      + 'Architecture: all\\nMaintainer: x\\nDescription: t\\n" > /tmp/p/DEBIAN/control; '
-      + 'for z in gzip xz zstd; do '
-      + 'dpkg-deb -Z$z -b /tmp/p /tmp/t-$z.deb > /dev/null; echo build-$z=$?; '
-      + 'dpkg-deb --info /tmp/t-$z.deb > /dev/null; echo info-$z=$?; '
-      + 'done; '
+      'mkdir -p /var/tmp; echo ITxhcmNoPgpkZWJpYW4tYmluYXJ5LyAgMCAgICAgICAgICAgMCAgICAgMCAgICAgNjQ0ICAgICA0ICAgICAgICAgYAoyLjAKY29udHJvbC50YXIuZ3ovIDAgICAgICAgICAgIDAgICAgIDAgICAgIDY0NCAgICAgMTc4ICAgICAgIGAKH4sIAAAAAAAAA+3PsQrCMBSF4c55ijxCok0L3QRXwck9xKDB0Eqago9vLC4O4lRE/D+43OGc4V439DkNsVqSKpq6fmzdmpc908pU2qzWjTGq0apSWrelLtWiVz1NY7ZJyspFOx39+96n/EftrbvYk+9kFgefxjD0ndRik9w5ZO/ylEpkYxQ7G/pcxqdO3sTWjy6Fa57rWXz7CQAAAAAAAAAAAAAAAAD4Q3dAm9ZwACgAAGRhdGEudGFyLmd6LyAgICAwICAgICAgICAgICAwICAgICAwICAgICA2NDQgICAgIDEyMyAgICAgICBgCh+LCAAAAAAAAAPtzrEKwkAQhOGt8xT3CLvJ7fo8h55YHAjqvX8SsLEQSRFF+L9miplizrI/XUTOa9rBX/IpxHycwl3DVNTUzSTpF75Jvz/KLSU5ttJP9f3uU/+nLrW16/DrFwAAAAAAAAAAAAAAAACArWYUPsaHACgAAAo= | base64 -d > /var/tmp/g.deb; '
+      + 'echo ITxhcmNoPgpkZWJpYW4tYmluYXJ5LyAgMCAgICAgICAgICAgMCAgICAgMCAgICAgNjQ0ICAgICA0ICAgICAgICAgYAoyLjAKY29udHJvbC50YXIueHovIDAgICAgICAgICAgIDAgICAgIDAgICAgIDY0NCAgICAgMjM2ICAgICAgIGAK/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4Cf/AKpdADGbyhnbre+8GtxPrcaFT++rAjB/GkFNFgOm6VBpMA/Wk+GmL4DsY9923ZZlddS/nxFWoSR6utejD4OnYkiWbMXd2xl7yC6hji1I15Q1b0jslXWFAOutNxR5+KQM7Pm/Gt6oSbzHhH6BuMQY7N746W6unVxwT2G0kc/+tcp+PZFiI7SkqddI4q5rcH/QpyHQ4R52izaunn5LGqAzn3VPEzV/Mym0SdFzYToAAAAA3ulgv1Lac9MAAcYBgFAAAE+YYbixxGf7AgAAAAAEWVpkYXRhLnRhci54ei8gICAgMCAgICAgICAgICAgMCAgICAgMCAgICAgNjQ0ICAgICAxNzIgICAgICAgYAr9N3pYWgAABObWtEYCACEBFgAAAHQv5aPgJ/8AbF0AMwAzUBhoiYMB69bC9ZSe3K+9VyTKNDeVKuOE6q2pSZGdrE0ZtncO44v9udaLmMbY5oeEs6UeLUIVsAJqEJRT9SxkRLY485yHbIy8i5WG5laO+4Ibqg/4CQOkrEGMR1SXCVSino0b46KIte8AAJc7oVjYBFpmAAGIAYBQAABT8zONscRn+wIAAAAABFla | base64 -d > /var/tmp/x.deb; '
+      + 'ls -l /var/tmp; '
+      + 'dpkg-deb --info /var/tmp/g.deb > /dev/null; echo gzip=$?; '
+      + 'dpkg-deb --info /var/tmp/x.deb > /dev/null; echo xz=$?; '
+      // A control member that decompresses to 320 KB, five times the
+      // pipe's 65536 bytes, so the decompressing child has to fill it,
+      // block, and be resumed. The 600-byte archives above fit in one
+      // write and never test that. Still 712 bytes on the wire,
+      // because it is all one character.
+      + 'echo ITxhcmNoPgpkZWJpYW4tYmluYXJ5LyAgMCAgICAgICAgICAgMCAgICAgMCAgICAgNjQ0ICAgICA0ICAgICAgICAgYAoyLjAKY29udHJvbC50YXIueHovIDAgICAgICAgICAgIDAgICAgIDAgICAgIDY0NCAgICAgMzQ4ICAgICAgIGAK/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj5P//ARtdADGbyhnbre+8GtxPrcaFT++rAjB/GkFNFgOm6VBpMA/Wk+GmL4DsY9923ZZlddS/nxFWoSR6utejD4OnYkiWbMXd2xl7yC6hji1I15Q1b0jslXWFAOutNxR5+KQM7Pm/Gt6oSbzHhH6BuMQY7N746W6unVxwT2G0kc/+tcp+PZFiI7REUBLm94dVnFerpfTSgzVpceEv4oYua28TqSbkkII6ZLaZswE7ld59cWfaWUToepq872ywNUz4EcqGyzfX/steKt46lLisiZXrseHTYUfOEdeBfJHPhjX6fMK1RyGGR3x8iwPar0fM05MzKOJLuyFrt84iCjOxsWF6kNSIX8vMz0BOmNH7Uit0zR5bIEL5xtBvfhc6HQBsYAAAANz9em8slnU4AAG3AoCAFACe3picscRn+wIAAAAABFlaZGF0YS50YXIueHovICAgIDAgICAgICAgICAgIDAgICAgIDAgICAgIDY0NCAgICAgMTcyICAgICAgIGAK/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4Cf/AGxdADMAM1AYaImDAevWwvWUntyvvVckyjQ3lSrjhOqtqUmRnaxNGbZ3DuOL/bnWi5jG2OaHhLOlHi1CFbACahCUU/UsZES2OPOch2yMvIuVhuZWjvuCG6oP+AkDpKxBjEdUlwlUop6NG+OiiLXvAACXO6FY2ARaZgABiAGAUAAAU/MzjbHEZ/sCAAAAAARZWg== | base64 -d > /var/tmp/b.deb; '
+      + 'dpkg-deb --info /var/tmp/b.deb > /dev/null; echo big=$?; '
+      // And through dpkg rather than straight from the shell, which
+      // is how apt reaches it: one more fork, and a parent holding
+      // its database and locks open. Its warnings about every package
+      // in the rootfs go to /dev/null: ninety lines of them push the
+      // answers off the top of what the page can hand back.
+      + 'dpkg --unpack /var/tmp/x.deb > /dev/null 2>/dev/null; echo unpack=$?; '
       + 'echo deb=done',
-    want: /info-gzip=0[\s\S]*info-xz=0/,
+    want: /gzip=0[\s\S]*xz=0[\s\S]*big=0/,
+  },
+  // Does a byte written come back? A 1.2 MB file copied through the shell
+  // and checksummed both ways.
+  //
+  // apt downloads a 63,520-byte archive, writes it, and dpkg cannot read
+  // it -- while the same archive taken from the mirror by hand reads
+  // perfectly under the native adapter, and archives built inside the guest
+  // read fine in the browser. The file is the right length and starts with
+  // a valid `!<arch>`, so what is left is the middle of it.
+  'debian-io': {
+    demo: 'debian',
+    cmd:
+      'a=$(md5sum < /bin/bash); cat /bin/bash > /var/tmp/b; '
+      + 'b=$(md5sum < /var/tmp/b); echo A=$a; echo B=$b; '
+      + 'test "$a" = "$b"; echo same=$?; '
+      + 'wc -c < /bin/bash; wc -c < /var/tmp/b; echo io=done',
+    want: /same=0/,
   },
   gears: { want: /exit 0 in \d+ ms/, settle: 'finished' },
   // The guest's own evidence, not the page's. "graphics rootfs -- N files"
