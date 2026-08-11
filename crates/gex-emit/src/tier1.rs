@@ -324,11 +324,11 @@ impl<'a> Emitter<'a> {
     /// writes them all too, for the same reason -- but deliberately does not
     /// read them back afterwards, because the host only changes a register on
     /// a path that does not return here, and reading them back is what made a
-    /// loop with a `continue` and a `break` in it never finish. And a region
-    /// holds exactly one loop, through its entry, so the poll at that entry
-    /// is on every cycle; polling at an inner back edge instead left a guest
-    /// thread the browser preempted there resuming with another thread's
-    /// registers.
+    /// loop with a `continue` and a `break` in it never finish. Every back
+    /// edge inside the region polls -- with the default growth rule that is
+    /// the entry's and no other, since a region holds one loop and it passes
+    /// through the entry, but it is what lets `GEX_REGION_NESTED` be measured
+    /// without an inner loop the browser cannot preempt.
     ///
     /// # What it is worth
     ///
@@ -530,9 +530,17 @@ impl<'a> Emitter<'a> {
         match st.index.get(&target).copied() {
             Some(k) => {
                 let (idx_local, depth) = (st.idx_local, st.depth);
-                // The region's only back edge goes to its entry, by
-                // construction, so this is the poll for the whole loop.
-                if k == 0 && target <= from {
+                // Every back edge inside the region polls, not only the one to
+                // the entry.
+                //
+                // With the default growth rule this changes nothing: a region
+                // holds exactly one loop and it passes through the entry, so
+                // `k != 0` with a backwards target cannot occur. It is what
+                // makes `GEX_REGION_NESTED` safe rather than merely bigger --
+                // a nested inner loop reaches no poll otherwise, and the
+                // browser host preempts guests cooperatively, so a guest that
+                // never polls is a guest nothing can switch away from.
+                if target <= from {
                     self.emit_safepoint(target);
                 }
                 self.f.i32_const(k as i32);

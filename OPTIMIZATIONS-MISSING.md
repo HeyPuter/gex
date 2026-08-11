@@ -1223,45 +1223,89 @@ and then dies of SIGABRT, which is the forked-child abort that also stops
 `apt-get install`. A minute-long probe reaching the same bug an
 `apt-get update` takes six minutes to reach.
 
-## Decompression is 23.7x native, and it is what `apt-get update` costs
+## Decompression is 5.7x native; the 23.7x was a cold cache
 
-    dpkg-deb --fsys-tarfile libc6.deb     2.4 MB xz -> 10.4 MB
+Corrected the same day it was written. The claim was:
 
-      gex   11598 ms
-      host    490 ms
+    dpkg-deb --fsys-tarfile libc6.deb    2.4 MB xz -> 10.4 MB
+      gex   11598 ms      host 490 ms      23.7x
 
-No network, no browser, no apt: twelve seconds against half a second, and
-it is the whole of what an `apt-get update` spends its six minutes on.
+Run five times with the compiled-module cache warm, which is the state the
+number was supposed to describe:
 
-The ratio is the finding. This project's usual distance from native is
-3.8x to 8.6x -- LU decomposition, measured in both hosts. Decompression is
-23.7x, three to six times worse than everything around it.
+      gex    2733 ms      host 480 ms       5.7x
+      gex    7591 ms with the cache moved aside
 
-Getting here took most of a day and almost none of it was spent on the
-recompiler, because the symptom pointed everywhere else first. What the
-run actually looks like: apt fetches an index in two tenths of a second,
-hands it to its `store` method to decompress, and that method takes five
-minutes. From outside, that is a socket that goes quiet, a run loop that
-spins, pipes that sit empty and an average of 44 kB/s -- and each of those
-was measured, and each was consistent with the truth, and none of them
-named it.
+So decompression sits inside this project's usual 3.8x-8.6x, and the
+"three to six times worse than everything around it" that made it look
+like a lead does not exist. The 11598 ms was one run, cold, and a cold run
+pays about five seconds of Cranelift on the way in.
 
-What named it was recording the *content* of what crossed apt's pipes
-rather than counting it. The last line on the third pipe was
+What went wrong is worth naming because it is cheap to repeat: a single
+timing of a command that has a cache behind it measures the cache, not the
+command. One run is not a measurement. Five runs and a stated warm-or-cold
+state is.
+
+What survives from that investigation is the *route*, not the ratio.
+`apt-get update` really does spend its last five minutes inside apt's
+`store` method, and what named it was recording the content of what
+crossed apt's pipes rather than counting bytes: the last line on the third
+pipe was
 
     200 URI Start|URI: store:/var/lib/apt/lists/partial/...Translation-en.xz
 
-with no `201 URI Done` after it. Everything else followed at once: the
-network is idle because nothing is being fetched, apt waits because it has
-a job outstanding, the pipes are empty because nobody owes a line.
+with no `201 URI Done` after it. When a run is slow and every counter looks
+reasonable, log what the processes are *saying* to each other; a protocol
+in text will tell you where it stopped and a byte total never can.
 
-So: when a run is slow and every counter looks reasonable, log what the
-processes are *saying* to each other. A protocol in text will tell you
-where it stopped; a byte total never can.
+But five minutes of browser time against a library that is 5.7x native
+here means the gap is not in the recompiled code as such. Either the
+browser's decompression is much worse than the native host's -- which is
+the thing to measure next, and #86 now asks for that -- or the index is
+far larger than this deb.
 
-The benchmark above is the one to iterate against -- twelve seconds, no
-network, and it moves with the recompiler. See #86, and #126 for the
-forked child that dies inside the same library.
+### Where the time goes inside liblzma, and what folding it is worth
+
+Profiling the warm benchmark, `gexc run --sample`:
+
+    9.7%  liblzma.so.5 lzma_crc64+0x68
+    8.4%  liblzma.so.5+0x1a788
+    8.2%  liblzma.so.5+0x1a780
+    6.6%  liblzma.so.5+0x1c320
+    ...   about twenty more, all inside 0x1a780..0x1c608
+
+The two eight-per-cent entries are eight bytes apart, which is the shape of
+the whole thing: at 0x1a780 the code is `ldr w0,[sp,#116]; cbnz w0, ...`
+and then another two instructions and another conditional branch. The
+range decoder is a chain of two-instruction blocks.
+
+Against a library-wide average of 5.3 instructions a block and a boundary
+cost of 31% of emitted wasm (15% registers, 7% safepoints, 9% dispatch),
+that is the worst case for a block-at-a-time translator -- and only 106
+blocks of 3065 are inside a region.
+
+Widening region formation does help, and less than the coverage suggests
+(best of two runs each, warm):
+
+    regions off                  3609 ms
+    GEX_REGION=8 (default)       3420 ms    47 loops, 106 blocks
+    GEX_REGION=32                3500 ms    43 loops, 118 blocks
+    GEX_REGION=32  nested        3018 ms    89 loops, 563 blocks
+    GEX_REGION=128 nested        3001 ms    89 loops, 648 blocks
+
+Six times the coverage for twelve per cent, and the twelve per cent is
+barely outside the run-to-run spread. Nesting is also the setting the
+region note measures as a 34% *loss* on crunch, and it is unsafe in the
+browser for a reason that is structural rather than incidental: a region
+polls only at its entry, so a nested inner loop can spin without ever
+reaching a poll, and cooperative preemption is how the browser host
+switches guests at all.
+
+That makes the honest next step a narrow one: allow nesting only if a
+region polls at every internal back edge, and find out whether the
+resume bug that killed that idea before (#27, since closed) is still
+there. If it is not, nesting becomes a measurable option rather than an
+unsafe one.
 
 ## Reachable-only discovery finds a quarter of a C++ library
 

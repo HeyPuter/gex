@@ -293,9 +293,13 @@ fn max_live() -> usize {
 
 /// Whether a region may contain a loop that does not pass through its entry.
 ///
-/// The rule against it is a safety rule: the entry is the only place a region
-/// polls, so a guest cycling inside without reaching the entry would never
-/// see a signal or a thread switch. It is also what keeps regions tiny --
+/// The rule against it was a safety rule: the entry used to be the only place
+/// a region polled, so a guest cycling inside without reaching the entry would
+/// never see a signal or a thread switch. `region_goto` now polls on every
+/// back edge inside the region, which costs the default growth rule nothing --
+/// it has no such edge -- and leaves this a question of speed alone.
+///
+/// It is also what keeps regions tiny --
 /// growing the walk from 8 blocks to 512 finds *fewer* regions, because a
 /// wider walk pulls in nested loops and every one of them disqualifies the
 /// whole candidate.

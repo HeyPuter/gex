@@ -154,6 +154,25 @@ const DEMOS = {
       + 'echo deb=done',
     want: /gzip=0[\s\S]*xz=0[\s\S]*big=0[\s\S]*real=0/,
   },
+  // How fast does the browser decompress? The same `dpkg-deb` the native
+  // adapter runs in 2.7 seconds, on the same 2.4 MB archive.
+  //
+  // Worth carrying the 2.4 MB in the rootfs for. `apt-get update` spends its
+  // last five minutes inside apt's `store` method decompressing an index,
+  // and the same library measured under the native adapter comes out at
+  // 5.7x native -- ordinary. So either the browser is much worse than that
+  // or the index is much bigger than this, and only a browser number can
+  // say which. Nothing else here measures guest CPU on real work: every
+  // other Debian case is a correctness check that finishes in milliseconds.
+  'debian-lzma': {
+    demo: 'debian',
+    cmd:
+      's=$(date +%s%N); dpkg-deb --fsys-tarfile /var/libc6.deb > /var/o.tar 2>/var/e.txt; '
+      + 'rc=$?; e=$(date +%s%N); '
+      + 'echo lzma_rc=$rc ms=$(( (e-s)/1000000 )) size=$(stat -c%s /var/o.tar); '
+      + 'cat /var/e.txt; echo lzma=done',
+    want: /lzma_rc=0 ms=[0-9]+ size=10373120/,
+  },
   // Does a byte written come back? A 1.2 MB file copied through the shell
   // and checksummed both ways.
   //

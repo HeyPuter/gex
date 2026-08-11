@@ -147,6 +147,14 @@ for d in "$WORK"/debs/*.deb; do
     (cd "$WORK" && ar x "$d" && tar -C "$R" -xf data.tar.* && rm -f data.tar.* control.tar.* debian-binary)
 done
 
+# One archive kept whole, as a benchmark rather than as a package.
+#
+# 2.4 MB of xz that decompresses to 10.4 MB: enough guest CPU to measure,
+# and the same library `apt-get update` spends its time in. `site.mjs
+# debian-lzma` times it. Every other Debian case in that harness finishes
+# in milliseconds and measures correctness; this one measures speed.
+cp "$(ls "$WORK"/debs/libc6_*.deb | head -1)" "$R/var/libc6.deb"
+
 echo "writing dpkg's idea of what is installed..."
 python3 - "$WORK" "$R" <<'PYEOF'
 import json, sys
