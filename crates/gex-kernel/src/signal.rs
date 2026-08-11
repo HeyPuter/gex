@@ -454,9 +454,25 @@ pub fn dispatch(
         signals.pending &= !bit(signal);
         return Ok(match default_action(signal) {
             DefaultAction::Ignore => Delivery::None,
-            // Stopping needs a scheduler to resume from; until then it ends
-            // the process, which is at least visible rather than a silent
-            // hang.
+            // The three the *terminal* raises, with nothing to handle them.
+            //
+            // Stopping needs a scheduler to resume from and there is none, so
+            // the choice is between ending the process and doing nothing.
+            // For these three, doing nothing is right: a `^Z` at a shell with
+            // no job control does nothing on a real machine too, and a
+            // background process reading the terminal being *killed* rather
+            // than paused is not a degraded version of the rule -- it is a
+            // different and much worse one. A shell that wants them handles
+            // them, and a handler is dispatched above without reaching here.
+            //
+            // `SIGSTOP` is not in this list. It cannot be handled, so nobody
+            // sends it expecting a handler, and ending the process at least
+            // says something happened.
+            DefaultAction::Stop
+                if matches!(signal, sig::SIGTSTP | 21 | 22) =>
+            {
+                Delivery::None
+            }
             DefaultAction::Core | DefaultAction::Stop => Delivery::Terminate { signal, core: true },
             _ => Delivery::Terminate {
                 signal,

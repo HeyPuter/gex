@@ -320,6 +320,266 @@ pub extern "C" fn k_stdin_read(at: u32, len: u32) -> i32 {
     n as i32
 }
 
+/// The terminal, in the memory every Worker shares.
+///
+/// One `struct termios`, one window size, one foreground process group, and
+/// one line discipline for the whole system -- which is what a terminal is.
+/// See [`gex_kernel::tty`] for why none of that can live in a process.
+///
+/// The page is the other end of it: it pushes keystrokes into [`k_tty_input`]
+/// and writes back whatever comes out as echo. It can do that because it
+/// instantiates this module too, so a keystroke reaches the discipline by a
+/// call rather than by a message to a Worker that may be parked inside wasm
+/// and not running an event loop at all.
+fn tty() -> &'static gex_kernel::tty::Tty {
+    note_panics();
+    static T: OnceLock<gex_kernel::tty::Tty> = OnceLock::new();
+    T.get_or_init(gex_kernel::tty::Tty::new)
+}
+
+/// What the terminal owes the screen: echoed keystrokes, not yet drawn.
+fn echoed() -> &'static Mutex<std::collections::VecDeque<u8>> {
+    static E: OnceLock<Mutex<std::collections::VecDeque<u8>>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+/// Who a `^C` reaches: the foreground process group, as a `kill` target.
+///
+/// Before any shell has called `tcsetpgrp` there is no foreground group, and
+/// the answer has to be pid 1's group rather than "everybody" -- `kill(-1)`
+/// spares init, and in these demos init *is* the shell. A `^C` at a `bash -i`
+/// running as pid 1 would have gone to nobody at all.
+///
+/// Pid 1's group also covers the case that matters next: a shell without job
+/// control leaves its children in its own group, so the command it is running
+/// is signalled with it, which is exactly what a terminal is meant to do.
+fn fg_group() -> i32 {
+    let fg = tty().fg();
+    if fg > 0 {
+        return fg;
+    }
+    procs()
+        .pgid(gex_kernel::INIT_PID, gex_kernel::INIT_PID)
+        .unwrap_or(gex_kernel::INIT_PID)
+}
+
+/// Keystrokes, through the line discipline.
+///
+/// Everything a key can mean happens here: it may join a line being edited,
+/// complete one, erase part of one, stop the output, end the input, or -- and
+/// this is the one that could not be done anywhere else -- signal the
+/// foreground process group. `^C` is `SIGINT` to a set of processes, and the
+/// process table is next door.
+///
+/// Returns how many bytes of echo are queued, so the caller knows whether to
+/// bother draining.
+#[no_mangle]
+pub extern "C" fn k_tty_input(at: u32, len: u32) -> i32 {
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: the same copy `k_stdin_write` makes, and `pull_checked` refuses
+    // a range outside the caller's memory rather than reading it.
+    unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    let r = tty().input(&buf);
+    {
+        let mut s = stdin().lock().unwrap_or_else(|e| e.into_inner());
+        // A signal character throws away what was typed and not yet read.
+        // Without this, `^C` at a shell prompt interrupts the shell and then
+        // hands it the half-line that was abandoned.
+        if r.flush {
+            s.0.clear();
+        }
+        s.0.extend(r.to_reader);
+        if r.eof {
+            s.1 = true;
+        }
+    }
+    if !r.echo.is_empty() {
+        echoed()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(r.echo);
+    }
+    for sig in r.signals {
+        let _ = procs().kill_group(gex_kernel::INIT_PID, fg_group(), sig);
+    }
+    // A reader parked inside wasm is not running an event loop, so the wake
+    // has to be the counter every other cross-process delivery uses.
+    k_wake();
+    echoed().lock().unwrap_or_else(|e| e.into_inner()).len() as i32
+}
+
+/// Take what the terminal should display, into the caller's memory.
+#[no_mangle]
+pub extern "C" fn k_tty_echo(at: u32, cap: u32) -> i32 {
+    let mut q = echoed().lock().unwrap_or_else(|e| e.into_inner());
+    let n = (cap as usize).min(q.len());
+    if n == 0 {
+        return 0;
+    }
+    let bytes: Vec<u8> = q.drain(..n).collect();
+    // SAFETY: as above, in the other direction.
+    unsafe { gex_kmem::push_checked(at, bytes.as_ptr(), n as u32) };
+    n as i32
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_get_termios(at: u32, len: u32) -> i32 {
+    let t = tty().termios();
+    let n = (len as usize).min(t.len());
+    unsafe { gex_kmem::push_checked(at, t.as_ptr(), n as u32) };
+    n as i32
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_set_termios(at: u32, len: u32) -> i32 {
+    let mut buf = vec![0u8; (len as usize).min(60)];
+    let n = buf.len() as u32;
+    unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, n) };
+    tty().set_termios(&buf);
+    n as i32
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_get_locked(at: u32, len: u32) -> i32 {
+    let t = tty().locked_termios();
+    let n = (len as usize).min(t.len());
+    unsafe { gex_kmem::push_checked(at, t.as_ptr(), n as u32) };
+    n as i32
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_set_locked(at: u32, len: u32) -> i32 {
+    let mut buf = vec![0u8; (len as usize).min(60)];
+    let n = buf.len() as u32;
+    unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, n) };
+    tty().set_locked_termios(&buf);
+    n as i32
+}
+
+/// `rows << 48 | cols << 32 | xpixel << 16 | ypixel`.
+#[no_mangle]
+pub extern "C" fn k_tty_winsize() -> u64 {
+    gex_kernel::tty::pack_ws(tty().winsize())
+}
+
+/// Returns 1 when the size actually changed, which is when `SIGWINCH` is owed.
+#[no_mangle]
+pub extern "C" fn k_tty_set_winsize(packed: u64) -> i32 {
+    tty().set_winsize(gex_kernel::tty::unpack_ws(packed)) as i32
+}
+
+/// Resize from the page, which also owes the foreground group its `SIGWINCH`.
+///
+/// Separate from [`k_tty_set_winsize`] because a guest doing this through
+/// `TIOCSWINSZ` signals from its own kernel, where the calling pid is known;
+/// the page has no pid and signals as init.
+#[no_mangle]
+pub extern "C" fn k_tty_resize(packed: u64) -> i32 {
+    if !tty().set_winsize(gex_kernel::tty::unpack_ws(packed)) {
+        return 0;
+    }
+    k_tty_signal(gex_kernel::signal::sig::SIGWINCH);
+    1
+}
+
+/// Signal the foreground process group, for a page with no pid of its own.
+///
+/// The page needs this for what the discipline does not own -- there is no
+/// `c_cc` entry for "the tab was closed" -- and a test needs it to prove the
+/// path without going through a keystroke.
+#[no_mangle]
+pub extern "C" fn k_tty_signal(signo: u32) -> i32 {
+    if signo == 0 || signo > gex_kernel::signal::sig::MAX {
+        return -22;
+    }
+    let n = match procs().kill_group(gex_kernel::INIT_PID, fg_group(), signo) {
+        Ok(n) => n as i32,
+        Err(e) => -(e.0 as i32),
+    };
+    k_wake();
+    n
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_fg() -> i32 {
+    tty().fg()
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_set_fg(pgrp: i32) {
+    tty().set_fg(pgrp);
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_sid() -> i32 {
+    tty().sid()
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_set_sid(sid: i32) {
+    tty().set_sid(sid);
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_ldisc() -> i32 {
+    tty().ldisc()
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_set_ldisc(n: i32) -> i32 {
+    tty().set_ldisc(n) as i32
+}
+
+/// Exclusive use, soft carrier and stopped-by-`^S`, packed: three booleans
+/// are not worth three imports each way. See `gex_kernel::tty::BIT_EXCL`.
+#[no_mangle]
+pub extern "C" fn k_tty_bits() -> i32 {
+    use gex_kernel::tty::{BIT_EXCL, BIT_SOFTCAR, BIT_STOPPED};
+    let t = tty();
+    (t.exclusive() as i32) * BIT_EXCL
+        + (t.softcar() as i32) * BIT_SOFTCAR
+        + (t.stopped() as i32) * BIT_STOPPED
+}
+
+#[no_mangle]
+pub extern "C" fn k_tty_set_bits(which: i32, on: i32) {
+    use gex_kernel::tty::{BIT_EXCL, BIT_SOFTCAR};
+    let t = tty();
+    match which {
+        BIT_EXCL => t.set_exclusive(on != 0),
+        BIT_SOFTCAR => t.set_softcar(on != 0),
+        _ => t.set_stopped(on != 0),
+    }
+}
+
+/// `TCFLSH`: throw away what has been typed and not read. Returns how many
+/// bytes went.
+#[no_mangle]
+pub extern "C" fn k_tty_flush(which: i32) -> i32 {
+    if which == gex_kernel::tty::TCOFLUSH {
+        return 0;
+    }
+    tty().flush_line();
+    let mut s = stdin().lock().unwrap_or_else(|e| e.into_inner());
+    let n = s.0.len();
+    s.0.clear();
+    n as i32
+}
+
+/// Bytes typed and not yet read, for `FIONREAD`.
+#[no_mangle]
+pub extern "C" fn k_tty_queued() -> i32 {
+    stdin().lock().unwrap_or_else(|e| e.into_inner()).0.len() as i32
+}
+
+/// `TIOCSTI`: bytes into the input queue as though they had been typed. They
+/// go through the discipline, because that is what "as though typed" means --
+/// a `\n` pushed this way completes a line.
+#[no_mangle]
+pub extern "C" fn k_tty_push(at: u32, len: u32) -> i32 {
+    k_tty_input(at, len)
+}
+
 /// The system-wide slot allocation mark.
 ///
 /// Dispatch slots have to be unique across *processes*, not just within one,
@@ -1024,7 +1284,50 @@ pub extern "C" fn k_has_children(ppid: i32) -> i32 {
 /// is what makes this safe to call from another process's Worker.
 #[no_mangle]
 pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
+    if signo != 0 {
+        note_signal();
+    }
     match procs().kill(caller, target, signo) {
+        Ok(n) => n as i32,
+        Err(e) => -(e.0 as i32),
+    }
+}
+
+/// How many signals have been *sent* to anyone, ever.
+///
+/// A guest in a loop with no syscall in it can only be interrupted at a
+/// safepoint, and a safepoint that asks "is anything pending for me" through
+/// the process table takes this module's lock and walks every process -- once
+/// per thousand back edges, in every Worker at once. That is a contended lock
+/// on the hottest path there is.
+///
+/// So the question is asked in two steps. This counter is one relaxed atomic
+/// load and answers "has anybody sent anything at all since I last looked";
+/// only when it moves does a safepoint pay for the real answer. Signals are
+/// rare and back edges are not.
+static SIGNAL_SEQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn note_signal() {
+    SIGNAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The counter above, for a safepoint to compare against what it last saw.
+#[no_mangle]
+pub extern "C" fn k_signal_seq() -> i32 {
+    SIGNAL_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Signal every process in a group, naming the group positively.
+///
+/// `k_kill` cannot do this for group 1: a negative target of -1 is "every
+/// process", so the one group with no negative spelling is exactly the one a
+/// shell running as pid 1 is in.
+#[no_mangle]
+pub extern "C" fn k_kill_group(caller: i32, pgid: i32, signo: u32) -> i32 {
+    if signo != 0 {
+        note_signal();
+    }
+    match procs().kill_group(caller, pgid, signo) {
         Ok(n) => n as i32,
         Err(e) => -(e.0 as i32),
     }

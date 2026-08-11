@@ -1617,7 +1617,7 @@ export class Gex {
     // Not imported by the shim -- the host reads it after a crash -- so it is
     // not in the list above and its absence is not a link error.
     // Two of these return an i64, which JS has to answer with a BigInt.
-    const BIG = new Set(['k_wait', 'k_take_signals']);
+    const BIG = new Set(['k_wait', 'k_take_signals', 'k_tty_winsize']);
     const out = { k_present: () => (k ? 1 : 0) };
     for (const n of NAMES) {
       // Some of what the shim imports from `gex_k` is answered here rather

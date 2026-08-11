@@ -68,6 +68,14 @@ pub struct Remote {
     pub wait: extern "C" fn(ppid: i32, want: i32) -> i64,
     pub has_children: extern "C" fn(ppid: i32) -> i32,
     pub kill: extern "C" fn(caller: i32, target: i32, signo: u32) -> i32,
+    /// Signal every process in a group, naming the group *positively*.
+    ///
+    /// `kill(-pgid)` cannot express this. A negative target of -1 is
+    /// POSIX's "every process", so it is exactly the one process group that
+    /// cannot be named -- and group 1 is not hypothetical here: the demos run
+    /// a shell as pid 1, so the foreground group of the terminal is group 1
+    /// and `^C` went to every process except the one that wanted it.
+    pub kill_group: extern "C" fn(caller: i32, pgid: i32, signo: u32) -> i32,
     pub take_signals: extern "C" fn(pid: i32) -> u64,
     pub has_signals: extern "C" fn(pid: i32) -> i32,
     pub ppid: extern "C" fn(pid: i32) -> i32,
@@ -452,6 +460,31 @@ impl ProcTable {
         Ok(hits.len())
     }
 
+    /// Signal every process in group `pgid`, which is named positively.
+    ///
+    /// See [`Remote::kill_group`] for why this is not `kill(-pgid)`.
+    pub fn kill_group(&self, caller: i32, pgid: i32, signo: u32) -> Result<usize, Errno> {
+        if let Some(r) = self.remote {
+            return errno_or((r.kill_group)(caller, pgid, signo)).map(|n| n as usize);
+        }
+        if signo > 64 {
+            return Err(Errno::EINVAL);
+        }
+        let t = self.lock();
+        let hits: Vec<&Arc<AtomicU64>> =
+            t.procs.iter().filter(|p| p.pgid == pgid).map(|p| &p.pending).collect();
+        if hits.is_empty() {
+            return Err(Errno::ESRCH);
+        }
+        if signo > 0 {
+            let bit = 1u64 << (signo - 1);
+            for p in &hits {
+                p.fetch_or(bit, Ordering::AcqRel);
+            }
+        }
+        Ok(hits.len())
+    }
+
     /// Take everything sent to `pid` since the last call.
     pub fn take_signals(&self, pid: i32) -> u64 {
         if let Some(r) = self.remote {
@@ -659,6 +692,20 @@ mod tests {
         assert_eq!(t.take_signals(b), 0);
         // And taking is destructive.
         assert_eq!(t.take_signals(a), 0);
+    }
+
+    #[test]
+    fn a_group_can_be_named_even_when_it_is_group_one() {
+        // The case `kill(-pgid)` cannot express: -1 is "everyone", so group 1
+        // has no negative spelling. It is the shell's group in every demo.
+        let t = ProcTable::new();
+        let child = t.spawn(INIT_PID);
+        let outsider = t.spawn(INIT_PID);
+        t.setsid(outsider).unwrap();
+        assert_eq!(t.kill_group(INIT_PID, INIT_PID, 2), Ok(2));
+        assert_eq!(t.take_signals(INIT_PID), 1 << 1);
+        assert_eq!(t.take_signals(child), 1 << 1);
+        assert_eq!(t.take_signals(outsider), 0, "a different session is untouched");
     }
 
     #[test]

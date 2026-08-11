@@ -300,6 +300,12 @@ async function handle(msg) {
         lastLflag = lflag();
         port.post({ kind: 'stdin', lflag: lastLflag });
       });
+      // `true` rather than bytes: with a shared terminal the keystrokes went
+      // into the kernel's input queue as they were typed -- through the line
+      // discipline, which is where a `^C` became a signal -- and this process
+      // reads that same queue. Pushing them again here would deliver every
+      // line twice.
+      if (bytes === true) return true;
       if (!bytes) return false;
       gex.pushStdin(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
       return true;

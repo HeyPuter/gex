@@ -243,6 +243,11 @@ extern "C" {
     fn k_wait_ready(ppid: i32, want: i32) -> i32;
     fn k_has_children(ppid: i32) -> i32;
     fn k_kill(caller: i32, target: i32, signo: u32) -> i32;
+    fn k_kill_group(caller: i32, pgid: i32, signo: u32) -> i32;
+    /// How many signals have been sent to anyone. One relaxed load, so a
+    /// safepoint can ask "has anything happened" without taking the process
+    /// table's lock a thousand times a second.
+    fn k_signal_seq() -> i32;
     fn k_take_signals(pid: i32) -> u64;
     fn k_has_signals(pid: i32) -> i32;
     fn k_ppid(pid: i32) -> i32;
@@ -291,6 +296,26 @@ extern "C" {
     fn k_stdin_read(at: u32, len: u32) -> i32;
     fn k_stdin_ready() -> i32;
     fn k_stdin_eof();
+    /// The terminal: one `struct termios`, one size, one foreground process
+    /// group and one line discipline, for every process at once. The page
+    /// pushes keystrokes straight into it; these are the guest's half.
+    fn k_tty_get_termios(at: u32, len: u32) -> i32;
+    fn k_tty_set_termios(at: u32, len: u32) -> i32;
+    fn k_tty_get_locked(at: u32, len: u32) -> i32;
+    fn k_tty_set_locked(at: u32, len: u32) -> i32;
+    fn k_tty_winsize() -> u64;
+    fn k_tty_set_winsize(packed: u64) -> i32;
+    fn k_tty_fg() -> i32;
+    fn k_tty_set_fg(pgrp: i32);
+    fn k_tty_sid() -> i32;
+    fn k_tty_set_sid(sid: i32);
+    fn k_tty_ldisc() -> i32;
+    fn k_tty_set_ldisc(n: i32) -> i32;
+    fn k_tty_bits() -> i32;
+    fn k_tty_set_bits(which: i32, on: i32);
+    fn k_tty_flush(which: i32) -> i32;
+    fn k_tty_queued() -> i32;
+    fn k_tty_push(at: u32, len: u32) -> i32;
     /// Slots nobody else will be given, and the mark that keeps runtime
     /// allocation clear of what static recompilation already assigned.
     fn k_slot_alloc(count: u64) -> u64;
@@ -459,6 +484,9 @@ extern "C" fn r_has_children(ppid: i32) -> i32 {
 extern "C" fn r_kill(caller: i32, target: i32, signo: u32) -> i32 {
     unsafe { k_kill(caller, target, signo) }
 }
+extern "C" fn r_kill_group(caller: i32, pgid: i32, signo: u32) -> i32 {
+    unsafe { k_kill_group(caller, pgid, signo) }
+}
 extern "C" fn r_take_signals(pid: i32) -> u64 {
     unsafe { k_take_signals(pid) }
 }
@@ -505,6 +533,7 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             wait_ready: r_wait_ready,
             has_children: r_has_children,
             kill: r_kill,
+            kill_group: r_kill_group,
             take_signals: r_take_signals,
             has_signals: r_has_signals,
             ppid: r_ppid,
@@ -622,6 +651,109 @@ extern "C" fn rp_writable(id: i32) -> i32 {
 }
 extern "C" fn rp_buffered(id: i32) -> i32 {
     unsafe { k_pipe_buffered(id) }
+}
+
+// The terminal, which is one object for the whole system and not one per
+// process. See `gex_kernel::tty`.
+extern "C" fn rt_get_termios(at: u32, len: u32) -> i32 {
+    unsafe { k_tty_get_termios(at, len) }
+}
+extern "C" fn rt_set_termios(at: u32, len: u32) -> i32 {
+    unsafe { k_tty_set_termios(at, len) }
+}
+extern "C" fn rt_get_locked(at: u32, len: u32) -> i32 {
+    unsafe { k_tty_get_locked(at, len) }
+}
+extern "C" fn rt_set_locked(at: u32, len: u32) -> i32 {
+    unsafe { k_tty_set_locked(at, len) }
+}
+extern "C" fn rt_winsize() -> u64 {
+    unsafe { k_tty_winsize() }
+}
+extern "C" fn rt_set_winsize(packed: u64) -> i32 {
+    unsafe { k_tty_set_winsize(packed) }
+}
+extern "C" fn rt_fg() -> i32 {
+    unsafe { k_tty_fg() }
+}
+extern "C" fn rt_set_fg(pgrp: i32) {
+    unsafe { k_tty_set_fg(pgrp) }
+}
+extern "C" fn rt_sid() -> i32 {
+    unsafe { k_tty_sid() }
+}
+extern "C" fn rt_set_sid(sid: i32) {
+    unsafe { k_tty_set_sid(sid) }
+}
+extern "C" fn rt_ldisc() -> i32 {
+    unsafe { k_tty_ldisc() }
+}
+extern "C" fn rt_set_ldisc(n: i32) -> i32 {
+    unsafe { k_tty_set_ldisc(n) }
+}
+extern "C" fn rt_bits() -> i32 {
+    unsafe { k_tty_bits() }
+}
+extern "C" fn rt_set_bits(which: i32, on: i32) {
+    unsafe { k_tty_set_bits(which, on) }
+}
+extern "C" fn rt_flush(which: i32) -> i32 {
+    unsafe { k_tty_flush(which) }
+}
+extern "C" fn rt_queued() -> i32 {
+    unsafe { k_tty_queued() }
+}
+extern "C" fn rt_push(at: u32, len: u32) -> i32 {
+    unsafe { k_tty_push(at, len) }
+}
+
+/// The terminal, reachable without a kernel in hand.
+///
+/// `Console::write_at` needs the output flags and is called from *inside* the
+/// kernel, so it cannot borrow the host to find them. The same object either
+/// way: `global_tty` hands this out rather than making a second one, because
+/// two terminals disagreeing about `ONLCR` is a bug nobody would look for.
+struct TtyHandle(std::sync::LazyLock<Arc<gex_kernel::tty::TtyRef>>);
+unsafe impl Sync for TtyHandle {}
+static CONSOLE_TTY: TtyHandle = TtyHandle(std::sync::LazyLock::new(make_tty));
+
+fn console_tty() -> &'static gex_kernel::tty::TtyRef {
+    &CONSOLE_TTY.0
+}
+
+/// The terminal every process shares, if the host gave us one.
+///
+/// Without a global kernel a process keeps a terminal of its own, which is
+/// exactly right for the one case that has no global kernel: a page running a
+/// single program that never forks, where "the system's terminal" and "this
+/// process's terminal" are the same object.
+fn global_tty() -> Arc<gex_kernel::tty::TtyRef> {
+    Arc::clone(&CONSOLE_TTY.0)
+}
+
+fn make_tty() -> Arc<gex_kernel::tty::TtyRef> {
+    if unsafe { k_present() } == 0 {
+        return Arc::new(gex_kernel::tty::TtyRef::new());
+    }
+    Arc::new(gex_kernel::tty::TtyRef::shared(gex_kernel::tty::Remote {
+        get_termios: rt_get_termios,
+        set_termios: rt_set_termios,
+        get_locked: rt_get_locked,
+        set_locked: rt_set_locked,
+        winsize: rt_winsize,
+        set_winsize: rt_set_winsize,
+        fg: rt_fg,
+        set_fg: rt_set_fg,
+        sid: rt_sid,
+        set_sid: rt_set_sid,
+        ldisc: rt_ldisc,
+        set_ldisc: rt_set_ldisc,
+        bits: rt_bits,
+        set_bits: rt_set_bits,
+        flush: rt_flush,
+        queued: rt_queued,
+        push: rt_push,
+    }))
 }
 
 /// Where a pipe's buffer goes, when there is a global kernel to put it in.
@@ -1010,6 +1142,23 @@ impl FileHandle for Console {
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        // `c_oflag` first, when this console is a terminal. `ONLCR` is why a
+        // Unix program can write `\n` and have the cursor come back to the
+        // left margin; without it every line starts one column further right
+        // than the last, which is the staircase a serial terminal gives you.
+        // A program that turns `OPOST` off -- `less`, `vi`, anything that
+        // places its own cursor -- gets its bytes through untouched, which is
+        // exactly why this cannot be hard-coded in the page.
+        if unsafe { STDIN_TTY } {
+            if let Some(cooked) = console_tty().output(buf) {
+                unsafe { write(self.fd, cooked.as_ptr() as u32, cooked.len() as u32) };
+                // The count returned is what the guest asked to write, not
+                // what the translation made of it: a `write` that says it
+                // wrote more bytes than it was given sends libc into a loop
+                // over a buffer that has already gone.
+                return Ok(buf.len() as u64);
+            }
+        }
         // The buffer is already in the shared memory the host can see, so its
         // address is all that has to cross.
         unsafe { write(self.fd, buf.as_ptr() as u32, buf.len() as u32) };
@@ -2623,6 +2772,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     }
     kernel.pipes = global_pipes();
     kernel.unix_remote = global_sockets();
+    kernel.tty = global_tty();
     match &shared_root {
         Some(r) => kernel.vfs.mount("/", r.clone()),
         None => kernel.vfs.mount("/", root.clone()),
@@ -3981,6 +4131,22 @@ pub extern "C" fn gex_paused_for_host() -> i32 {
 /// The wake counter as it read when this Worker last looked at its threads.
 static WAKE_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// Whether a safepoint delivers signals. See `gex_safepoint`.
+///
+/// A constant rather than a switch because it exists to be flipped while
+/// bisecting: this is the newest thing on the hottest path in the runtime,
+/// and "is the crash in here" has no cheaper answer than building it both
+/// ways. It has been asked once already and the answer was no -- a forked
+/// child trapped at the same rate with this off.
+const SAFEPOINT_SIGNALS: bool = true;
+
+/// The global signal counter as this Worker last saw it at a safepoint.
+///
+/// See the two-step check in `gex_safepoint`. Per Worker, and a plain static
+/// rather than a thread-local because a Worker is one thread of one process
+/// and the cost of asking has to be a single load.
+static SIGNAL_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// How long a syscall waits where it stands before giving the stack back.
 ///
 /// Short, and deliberately so. This is not how long the wait may take -- a
@@ -4273,28 +4439,53 @@ pub extern "C" fn gex_set_stdin(ptr: u32, len: u32) {
     STDIN.eof.set(true);
 }
 
-/// The guest's current `c_lflag`, so the page can follow it between cooked
-/// and raw mode.
+/// The terminal's current `c_lflag`.
 ///
-/// Bit 1 is ICANON and bit 3 is ECHO. While they are set the page does the
-/// line editing -- collect a line, echo it, deliver it on Enter. When the
-/// guest clears them it has taken over, and the page must pass keystrokes
-/// through untouched and echo nothing.
+/// Bit 1 is ICANON and bit 3 is ECHO. A page with a global kernel does not
+/// need to ask -- the discipline that obeys these is in there with them, and
+/// the page reads them directly. This is for the page that has no global
+/// kernel and therefore no shared terminal, and must do its own line editing
+/// against whatever this process last set.
 #[no_mangle]
 pub extern "C" fn gex_tty_lflag() -> u32 {
-    with_host(|h| u32::from_le_bytes(h.kernel.termios[12..16].try_into().unwrap()))
+    with_host(|h| u32::from_le_bytes(h.kernel.tty.termios()[12..16].try_into().unwrap()))
 }
 
-/// Tell the guest how big the terminal is.
+/// Tell the guest how big the terminal is, and signal whoever is using it.
+///
+/// A resize is `SIGWINCH` to the foreground process group and nothing else:
+/// a program that has drawn a full-screen interface has no other way to
+/// learn that the screen changed under it. Sent only when the size actually
+/// changed -- see `Tty::set_winsize`.
 #[no_mangle]
 pub extern "C" fn gex_set_winsize(rows: u32, cols: u32) {
-    with_host(|h| h.kernel.winsize = (rows as u16, cols as u16));
+    with_host(|h| {
+        let (_, _, x, y) = h.kernel.tty.winsize();
+        if h.kernel.tty.set_winsize((rows as u16, cols as u16, x, y)) {
+            let fg = h.kernel.tty.fg();
+            let g = if fg > 0 { fg } else { h.kernel.pid };
+            let _ = h
+                .kernel
+                .procs
+                .kill_group(h.kernel.pid, g, gex_kernel::signal::sig::SIGWINCH);
+        }
+    });
 }
 
 /// Say that stdin is a terminal, which is what makes a shell print a prompt.
+///
+/// And claim it, if nobody has. On Linux a session leader that opens a
+/// terminal with no owner becomes its controlling process and its group
+/// becomes the foreground group -- which is the whole reason `^C` reaches
+/// anything before a shell has called `tcsetpgrp`. Without this the terminal
+/// has no foreground group at all for the first command of every run, and
+/// that is the command someone is most likely to interrupt.
 #[no_mangle]
 pub extern "C" fn gex_set_tty(on: i32) {
     unsafe { STDIN_TTY = on != 0 };
+    if on != 0 && console_tty().sid() == 0 {
+        console_tty().set_sid(gex_kernel::INIT_PID);
+    }
 }
 
 #[no_mangle]
@@ -5711,6 +5902,7 @@ pub extern "C" fn gex_adopt_child(
     }
     kernel.pipes = global_pipes();
     kernel.unix_remote = global_sockets();
+    kernel.tty = global_tty();
     install_console(&mut kernel);
     kernel.pid = pid;
     kernel.tid = pid;
@@ -8097,6 +8289,80 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                 pc as u64
             ));
         }
+    }
+    // A signal, if one is pending for this process.
+    //
+    // Every other host has done this since signals landed and the browser
+    // never has: here a signal was only ever noticed on the way out of a
+    // syscall. That is enough for a program doing I/O and no use at all for
+    // one that is not -- and "not" is precisely the case someone reaches for
+    // `^C` in. A guest in a loop with no syscall in it could not be
+    // interrupted by anything, so `while :; do :; done` at a shell owned the
+    // tab until it was closed.
+    //
+    // Cheap to ask: `has_signals` is one atomic load on a word in the shared
+    // kernel, and this runs once per SLICES_PER_SWITCH safepoints at most.
+    // Off is a bisect, not a retreat: this is the newest thing on the
+    // hottest path, and the question "is the crash in here" has no cheaper
+    // answer than building it both ways.
+    if SAFEPOINT_SIGNALS {
+    // Two steps, because this runs once per thousand back edges in every
+    // Worker at once. `k_signal_seq` is one relaxed load of a counter every
+    // `kill` bumps; the real question -- which walks the process table behind
+    // its lock -- is only asked when that counter has moved. A signal raised
+    // in this process (a timer, `raise`) is a field read behind the host's
+    // `RefCell` and costs nothing either way.
+    let sent = if unsafe { k_present() } != 0 { unsafe { k_signal_seq() } } else { 0 };
+    let anything = SIGNAL_SEEN.swap(sent, std::sync::atomic::Ordering::Relaxed) != sent
+        || with_host(|h| h.kernel.signals.has_pending());
+    // A thread table with this thread in it. A safepoint can fire in a child
+    // that is still being built, and the preemption below only indexes
+    // `threads` after establishing there are at least two of them -- this had
+    // no such guard, and an empty table is a panic rather than an answer.
+    let have_thread = with_host(|h| cur() < h.threads.len());
+    if have_thread
+        && anything
+        && with_host(|h| h.kernel.procs.has_signals(h.kernel.pid) || h.kernel.signals.has_pending())
+    {
+        let delivered = with_host(|h| {
+            let a = h.threads[cur()].kstate.ctx_addr;
+            let mut gm = GuestMem::new(guest_bytes());
+            // The context's pc has to be exact before a handler frame is
+            // built on top of it: the frame records where to return to, and a
+            // plain branch does not store the pc anywhere.
+            let _ = gm.write_u64(a + ctx::PC as u64, pc as u64);
+            h.threads[cur()].pc = pc as u64;
+            h.kernel.enter_thread(&h.threads[cur()].kstate);
+            let d = h.kernel.deliver_pending(&mut gm);
+            h.kernel.leave_thread(&mut h.threads[cur()].kstate);
+            match d {
+                gex_kernel::signal::Delivery::None => 0,
+                // Where the handler starts. Left for the *scheduler* to act
+                // on, exactly as the preemption below does: this thread is
+                // runnable at a new pc, and `schedule` is what turns that
+                // into a resume the host understands. Setting the resume
+                // state here instead looks equivalent and is not -- it skips
+                // the wake bookkeeping at the top of `schedule` and the
+                // thread choice underneath it, and the run ends without a
+                // word.
+                gex_kernel::signal::Delivery::Resume(target) => {
+                    h.threads[cur()].pc = target;
+                    h.threads[cur()].waiting = Waiting::Runnable;
+                    1
+                }
+                gex_kernel::signal::Delivery::Terminate { signal, .. } => {
+                    exit_process(h, -(signal as i32));
+                    2
+                }
+            }
+        });
+        if delivered == 1 && schedule() != 0 {
+            trap();
+        }
+        if delivered == 2 {
+            trap();
+        }
+    }
     }
     // Leaving wasm is not free -- it is a trap, a JS catch and a re-entry --
     // so a thread gets several intervals' worth of machine before it is asked

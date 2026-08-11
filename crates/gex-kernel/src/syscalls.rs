@@ -524,18 +524,16 @@ pub struct Kernel {
     /// it replaced, and a build system that does not get one back concludes
     /// the mask was zero and re-runs itself.
     pub umask: u32,
-    /// The terminal's size, as rows and columns. A page resizes.
-    pub winsize: (u16, u16),
-    /// The terminal settings, when there is a terminal.
+    /// The terminal: flags, size, foreground process group, and the line
+    /// discipline behind them. See [`crate::tty`].
     ///
-    /// A `struct termios` as the guest sees it, kept whole rather than
-    /// decoded: nothing here acts on the flags, but the *host* does. A page
-    /// with a terminal has to know whether the guest has turned off echo and
-    /// canonical input, because if it has then the guest is doing its own
-    /// line editing and the page must stop doing its own -- otherwise every
-    /// keystroke appears twice. Returning success from `TCSETS` while
-    /// discarding what it set is how that goes wrong quietly.
-    pub termios: [u8; 60],
+    /// Shared, not copied, and that is the point of it. There is one terminal
+    /// and its settings outlive any process using it: `stty -echo` in one
+    /// command must still be off in the next, a shell that puts the terminal
+    /// in raw mode and dies must leave it that way for whoever cleans up, and
+    /// `^C` goes to the *foreground group* -- which is a fact about the
+    /// system, not about the process that happened to type it.
+    pub tty: Arc<crate::tty::TtyRef>,
 }
 
 /// One armed interval timer.
@@ -634,52 +632,12 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
     }
 }
 
-/// A terminal in the mode a shell finds it in: echo on, input line at a time.
+/// The terminal's settings and how much of them the kernel exchanges.
 ///
-/// The flag words are what Linux hands back for a fresh pty. libc reads
-/// `c_lflag` to decide whether a descriptor is a terminal at all, and musl
-/// line-buffers stdout when it is.
-/// How much of `struct termios` the kernel actually exchanges.
-///
-/// Four flag words, `c_line`, and `c_cc[19]`: `NCCS` is 19 in the kernel's
-/// asm-generic definition, not the 32 a C library declares for its own
-/// structure. Every `TCGETS`/`TCSETS` is this size and no more.
-pub const KERNEL_TERMIOS: usize = 4 * 4 + 1 + 19;
+/// Both live in [`crate::tty`] now, next to the discipline that obeys them --
+/// there is no second definition here to fall out of step with it.
+pub use crate::tty::{lflag::ECHO, lflag::ICANON, COOKED as COOKED_TERMIOS, KERNEL_TERMIOS};
 
-pub const COOKED_TERMIOS: [u8; 60] = {
-    let mut t = [0u8; 60];
-    // c_iflag: ICRNL | IXON | BRKINT | ...
-    let iflag = 0x2502u32.to_le_bytes();
-    let oflag = 0x5u32.to_le_bytes(); // OPOST | ONLCR
-    let cflag = 0xbfu32.to_le_bytes(); // B38400 | CS8 | CREAD
-    let lflag = 0x8a3bu32.to_le_bytes(); // ISIG | ICANON | ECHO | ECHOE | ...
-    t[0] = iflag[0]; t[1] = iflag[1]; t[2] = iflag[2]; t[3] = iflag[3];
-    t[4] = oflag[0]; t[5] = oflag[1]; t[6] = oflag[2]; t[7] = oflag[3];
-    t[8] = cflag[0]; t[9] = cflag[1]; t[10] = cflag[2]; t[11] = cflag[3];
-    t[12] = lflag[0]; t[13] = lflag[1]; t[14] = lflag[2]; t[15] = lflag[3];
-    // c_line is 0 (N_TTY), and then c_cc. Leaving these zero is not
-    // harmless: an interactive shell reads its erase, interrupt and
-    // end-of-file characters from here, and a zero erase character means
-    // backspace does nothing. These are the kernel's own INIT_C_CC.
-    //
-    //     VINTR ^C   VQUIT ^\   VERASE DEL  VKILL ^U   VEOF ^D
-    //     VTIME 0    VMIN 1     VSWTC 0     VSTART ^Q  VSTOP ^S
-    //     VSUSP ^Z   VEOL 0     VREPRINT ^R VDISCARD ^O
-    //     VWERASE ^W VLNEXT ^V  VEOL2 0
-    let cc = [
-        3u8, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0,
-    ];
-    let mut i = 0;
-    while i < 19 {
-        t[17 + i] = cc[i];
-        i += 1;
-    }
-    t
-};
-
-/// `c_lflag`'s ICANON and ECHO, the two the host has to follow.
-pub const ICANON: u32 = 0x2;
-pub const ECHO: u32 = 0x8;
 
 /// One entry of a `poll` set, kept so the host can re-check it without going
 /// back through the kernel.
@@ -1029,8 +987,7 @@ impl Kernel {
             memfds: Default::default(),
             socket_names: Arc::new(unix::SocketNames::new()),
             file_locks: Arc::new(unix::FileLocks::new()),
-            winsize: (24, 80),
-            termios: COOKED_TERMIOS,
+            tty: Arc::new(crate::tty::TtyRef::new()),
         }
     }
 
@@ -1260,8 +1217,9 @@ impl Kernel {
             // able to reach a server its parent could.
             socket_names: Arc::clone(&self.socket_names),
             file_locks: Arc::clone(&self.file_locks),
-            winsize: self.winsize,
-            termios: self.termios,
+            // The terminal is the system's, not this process's: a child
+            // shares it rather than inheriting a copy.
+            tty: Arc::clone(&self.tty),
         }
     }
 
@@ -2848,15 +2806,66 @@ impl Kernel {
     }
 
     fn sys_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> SysResult {
+        use crate::tty::{self, lflag};
+        // The terminal's own requests. `_IOC` encodes direction and size into
+        // the number, which is why the four `termios2` calls and the pty ones
+        // look nothing like the rest: they are not arbitrary, they are
+        // `_IOR('T', 0x2a, struct termios2)` and so on.
         const TCGETS: u64 = 0x5401;
         const TCSETS: u64 = 0x5402;
         const TCSETSW: u64 = 0x5403;
         const TCSETSF: u64 = 0x5404;
-        const TIOCGWINSZ: u64 = 0x5413;
-        const FIONREAD: u64 = 0x541b;
+        const TCGETA: u64 = 0x5405;
+        const TCSETA: u64 = 0x5406;
+        const TCSETAW: u64 = 0x5407;
+        const TCSETAF: u64 = 0x5408;
+        const TCSBRK: u64 = 0x5409;
+        const TCXONC: u64 = 0x540a;
+        const TCFLSH: u64 = 0x540b;
+        const TIOCEXCL: u64 = 0x540c;
+        const TIOCNXCL: u64 = 0x540d;
+        const TIOCSCTTY: u64 = 0x540e;
         const TIOCGPGRP: u64 = 0x540f;
         const TIOCSPGRP: u64 = 0x5410;
+        const TIOCOUTQ: u64 = 0x5411;
+        const TIOCSTI: u64 = 0x5412;
+        const TIOCGWINSZ: u64 = 0x5413;
         const TIOCSWINSZ: u64 = 0x5414;
+        const TIOCMGET: u64 = 0x5415;
+        const TIOCMBIS: u64 = 0x5416;
+        const TIOCMBIC: u64 = 0x5417;
+        const TIOCMSET: u64 = 0x5418;
+        const TIOCGSOFTCAR: u64 = 0x5419;
+        const TIOCSSOFTCAR: u64 = 0x541a;
+        const FIONREAD: u64 = 0x541b; // and TIOCINQ, which is the same number
+        const TIOCLINUX: u64 = 0x541c;
+        const TIOCGSERIAL: u64 = 0x541e;
+        const TIOCSSERIAL: u64 = 0x541f;
+        const FIONBIO: u64 = 0x5421;
+        const TIOCNOTTY: u64 = 0x5422;
+        const TIOCSETD: u64 = 0x5423;
+        const TIOCGETD: u64 = 0x5424;
+        const TCSBRKP: u64 = 0x5425;
+        const TIOCGSID: u64 = 0x5429;
+        const TCGETS2: u64 = 0x802c_542a;
+        const TCSETS2: u64 = 0x402c_542b;
+        const TCSETSW2: u64 = 0x402c_542c;
+        const TCSETSF2: u64 = 0x402c_542d;
+        const TIOCGPTN: u64 = 0x8004_5430;
+        const TIOCSPTLCK: u64 = 0x4004_5431;
+        const TIOCGDEV: u64 = 0x8004_5432;
+        const TIOCSIG: u64 = 0x4004_5436;
+        const TIOCVHANGUP: u64 = 0x5437;
+        const TIOCGPKT: u64 = 0x8004_5438;
+        const TIOCGPTLCK: u64 = 0x8004_5439;
+        const TIOCGEXCL: u64 = 0x8004_5440;
+        const TIOCGPTPEER: u64 = 0x5441;
+        const FIONCLEX: u64 = 0x5450;
+        const FIOCLEX: u64 = 0x5451;
+        const FIOASYNC: u64 = 0x5452;
+        const TIOCGLCKTRMIOS: u64 = 0x5456;
+        const TIOCSLCKTRMIOS: u64 = 0x5457;
+
         let file = self.fds.get(fd)?;
         // A device the host provides answers its own ioctls, and knows things
         // the kernel does not. Asked first, because the request numbers below
@@ -2864,60 +2873,387 @@ impl Kernel {
         if let Some(r) = file.handle.ioctl(m, req, arg) {
             return r;
         }
-        let is_tty = file.is_tty();
+        // The close-on-exec pair are properties of the descriptor and say
+        // nothing about the device, so they answer for any file at all --
+        // which is what `FIOCLEX` on a pipe expects.
         match req {
-            TCGETS if is_tty => {
-                // Only the kernel's part of the structure. This is not a
-                // detail: glibc's `tcgetattr` passes a `struct
-                // __kernel_termios` that lives on the caller's stack, and on
-                // this architecture that is 36 bytes because NCCS is 19.
-                // Writing the 60-byte userspace shape into it overruns by 24
-                // and lands on the stack canary -- which is exactly what
-                // `bash -i` did, and why it reported stack smashing before it
-                // had printed a prompt. musl hides the bug by passing its own
-                // larger struct straight through.
-                m.write(arg, &self.termios[..KERNEL_TERMIOS])?;
+            FIOCLEX => {
+                self.fds.set_cloexec(fd, true)?;
+                return Ok(0);
+            }
+            FIONCLEX => {
+                self.fds.set_cloexec(fd, false)?;
+                return Ok(0);
+            }
+            FIONBIO => {
+                let on = m.read_u32(arg)? != 0;
+                let f = self.fds.get(fd)?;
+                let flags = f.flags();
+                f.set_flags(if on { flags | oflags::O_NONBLOCK } else { flags & !oflags::O_NONBLOCK });
+                return Ok(0);
+            }
+            _ => {}
+        }
+        let is_tty = file.is_tty();
+        if !is_tty {
+            // Everything below is a terminal's. `FIONREAD` is the one that is
+            // also asked of pipes and sockets, so it is answered for those
+            // before the terminal cases begin.
+            return match req {
+                FIONREAD => {
+                    let n = match file.handle.available() {
+                        Some(n) => n,
+                        None => {
+                            let md = file.metadata()?;
+                            md.size.saturating_sub(file.offset())
+                        }
+                    };
+                    m.write_u32(arg, n as u32)?;
+                    Ok(0)
+                }
+                FIOASYNC => Ok(0),
+                _ => Err(Errno::ENOTTY),
+            };
+        }
+        let tty = Arc::clone(&self.tty);
+        match req {
+            // Only the kernel's part of the structure. This is not a detail:
+            // glibc's `tcgetattr` passes a `struct __kernel_termios` that
+            // lives on the caller's stack, and on this architecture that is
+            // 36 bytes because NCCS is 19. Writing the 60-byte userspace
+            // shape into it overruns by 24 and lands on the stack canary --
+            // which is exactly what `bash -i` did, and why it reported stack
+            // smashing before it had printed a prompt. musl hides the bug by
+            // passing its own larger struct straight through.
+            TCGETS => {
+                m.write(arg, &tty.termios()[..KERNEL_TERMIOS])?;
                 Ok(0)
             }
             // Kept, not discarded. A shell that turns off ICANON and ECHO is
-            // taking over line editing, and the host has to stop doing its
-            // own or every keystroke lands twice.
-            TCSETS | TCSETSW | TCSETSF if is_tty => {
+            // taking over line editing, and the terminal has to stop doing
+            // its own or every keystroke lands twice.
+            //
+            // The three differ only in when they take effect -- now, after
+            // the output drains, and after discarding pending input. There is
+            // no output queue to drain here, so the first two are the same
+            // call; the third flushes, because a program that asked for a
+            // clean slate and did not get one reads the keys typed at the
+            // prompt it just replaced.
+            TCSETS | TCSETSW | TCSETSF => {
                 // The same shape in the other direction: the caller gave a
                 // kernel-sized structure, so reading past it would read the
                 // caller's stack.
                 let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
-                self.termios[..KERNEL_TERMIOS].copy_from_slice(&src);
+                if req == TCSETSF {
+                    tty.flush(tty::TCIFLUSH);
+                }
+                tty.set_termios(&src);
                 Ok(0)
             }
-            TIOCGWINSZ if is_tty => {
+            // `termios2`, which adds the two `c_ispeed`/`c_ospeed` words
+            // after `c_cc`. Nothing here has a baud rate, so they are the
+            // 38400 the flags already say, and the rest of the structure is
+            // the one above.
+            TCGETS2 => {
+                let t = tty.termios();
+                let mut out = [0u8; KERNEL_TERMIOS + 8];
+                out[..KERNEL_TERMIOS].copy_from_slice(&t[..KERNEL_TERMIOS]);
+                out[KERNEL_TERMIOS..KERNEL_TERMIOS + 4].copy_from_slice(&38400u32.to_le_bytes());
+                out[KERNEL_TERMIOS + 4..].copy_from_slice(&38400u32.to_le_bytes());
+                m.write(arg, &out)?;
+                Ok(0)
+            }
+            TCSETS2 | TCSETSW2 | TCSETSF2 => {
+                let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
+                if req == TCSETSF2 {
+                    tty.flush(tty::TCIFLUSH);
+                }
+                tty.set_termios(&src);
+                Ok(0)
+            }
+            // The `termio` of System V, which is `termios` with one-byte
+            // flags. Ancient, and still what `busybox stty` falls back to on
+            // a kernel that refuses `TCGETS`.
+            TCGETA => {
+                let t = tty.termios();
+                let mut out = [0u8; 8 + 8];
+                out[0..2].copy_from_slice(&t[0..2]);
+                out[2..4].copy_from_slice(&t[4..6]);
+                out[4..6].copy_from_slice(&t[8..10]);
+                out[6..8].copy_from_slice(&t[12..14]);
+                out[8] = t[16]; // c_line
+                out[9..9 + 7].copy_from_slice(&t[17..17 + 7]);
+                m.write(arg, &out)?;
+                Ok(0)
+            }
+            TCSETA | TCSETAW | TCSETAF => {
+                let src = m.read(arg, 16)?.to_vec();
+                let mut t = tty.termios();
+                t[0..2].copy_from_slice(&src[0..2]);
+                t[2..4].fill(0);
+                t[4..6].copy_from_slice(&src[2..4]);
+                t[6..8].fill(0);
+                t[8..10].copy_from_slice(&src[4..6]);
+                t[10..12].fill(0);
+                t[12..14].copy_from_slice(&src[6..8]);
+                t[14..16].fill(0);
+                t[16] = src[8];
+                t[17..17 + 7].copy_from_slice(&src[9..9 + 7]);
+                tty.set_termios(&t);
+                Ok(0)
+            }
+            // The lock is answered and not enforced. A program that reads it
+            // back is checking whether it may change a setting; all-zero says
+            // it may, which is true.
+            TIOCGLCKTRMIOS => {
+                m.write(arg, &tty.locked_termios()[..KERNEL_TERMIOS])?;
+                Ok(0)
+            }
+            TIOCSLCKTRMIOS => {
+                let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
+                tty.set_locked_termios(&src);
+                Ok(0)
+            }
+            TIOCGWINSZ => {
+                let (rows, cols, x, y) = tty.winsize();
                 let mut ws = [0u8; 8];
-                ws[0..2].copy_from_slice(&self.winsize.0.to_le_bytes());
-                ws[2..4].copy_from_slice(&self.winsize.1.to_le_bytes());
+                ws[0..2].copy_from_slice(&rows.to_le_bytes());
+                ws[2..4].copy_from_slice(&cols.to_le_bytes());
+                ws[4..6].copy_from_slice(&x.to_le_bytes());
+                ws[6..8].copy_from_slice(&y.to_le_bytes());
                 m.write(arg, &ws)?;
                 Ok(0)
             }
-            TIOCGPGRP if is_tty => {
-                m.write_u32(arg, self.procs.pgid(self.pid, 0).unwrap_or(self.pid) as u32)?;
+            // A program may resize the terminal too -- `resize` does, and so
+            // does a terminal multiplexer telling its children how big their
+            // pane is. Everyone in the foreground group hears about it.
+            TIOCSWINSZ => {
+                let ws = m.read(arg, 8)?.to_vec();
+                let g = |n: usize| u16::from_le_bytes([ws[n], ws[n + 1]]);
+                if tty.set_winsize((g(0), g(2), g(4), g(6))) {
+                    self.signal_foreground(crate::signal::sig::SIGWINCH);
+                }
                 Ok(0)
             }
-            // A shell claiming the terminal for a job. There is one terminal
-            // and no contest for it, so this only has to not fail.
-            TIOCSPGRP if is_tty => Ok(0),
-            TIOCSWINSZ if is_tty => Ok(0),
+            // Who is in the foreground. Zero before any shell has claimed the
+            // terminal, and Linux answers with a group that does not exist
+            // rather than with an error -- but the caller is a better guess
+            // than a lie, and it is what `tcgetpgrp` in a script wants.
+            TIOCGPGRP => {
+                let fg = tty.fg();
+                let g = if fg > 0 {
+                    fg
+                } else {
+                    self.procs.pgid(self.pid, 0).unwrap_or(self.pid)
+                };
+                m.write_u32(arg, g as u32)?;
+                Ok(0)
+            }
+            // A shell handing the terminal to a job. This is what makes job
+            // control real: the group named here is the one `^C` reaches, so
+            // a shell that backgrounds a pipeline stops it being interrupted
+            // and the shell itself starts being.
+            TIOCSPGRP => {
+                let pgrp = m.read_u32(arg)? as i32;
+                if pgrp <= 0 {
+                    return Err(Errno::EINVAL);
+                }
+                tty.set_fg(pgrp);
+                Ok(0)
+            }
+            TIOCGSID => {
+                let sid = tty.sid();
+                let s = if sid > 0 { sid } else { self.procs.sid(self.pid, 0).unwrap_or(1) };
+                m.write_u32(arg, s as u32)?;
+                Ok(0)
+            }
+            // Claiming the terminal. A session leader that has none takes it,
+            // and becomes the foreground group by doing so.
+            TIOCSCTTY => {
+                let sid = self.procs.sid(self.pid, 0).unwrap_or(self.pid);
+                let held = tty.sid();
+                // `arg` non-zero is the steal-it-anyway form, which only root
+                // may use -- and here everybody is root often enough that
+                // refusing it would be the surprising answer.
+                if held != 0 && held != sid && arg == 0 {
+                    return Err(Errno::EPERM);
+                }
+                tty.set_sid(sid);
+                Ok(0)
+            }
+            TIOCNOTTY => {
+                if tty.sid() == self.procs.sid(self.pid, 0).unwrap_or(-1) {
+                    tty.set_sid(0);
+                }
+                Ok(0)
+            }
+            // Throw away what has been typed and not read, what has been
+            // written and not displayed, or both. There is no output queue --
+            // a write reaches the page before the call returns -- so only the
+            // input half does anything.
+            TCFLSH => {
+                let which = arg as i32;
+                if which == tty::TCIFLUSH || which == tty::TCIOFLUSH {
+                    tty.flush(tty::TCIFLUSH);
+                }
+                Ok(0)
+            }
+            // Send a break, or wait for output to drain. Both are `tcdrain`
+            // and `tcsendbreak` underneath, and both are satisfied the moment
+            // they are asked: there is nothing in flight.
+            TCSBRK | TCSBRKP | TIOCVHANGUP => Ok(0),
+            // Flow control by hand: `tcflow(TCOOFF)` and friends. The same
+            // switch `^S` throws, which is why it is the terminal's and not
+            // this process's.
+            TCXONC => {
+                const TCOOFF: u64 = 0;
+                const TCOON: u64 = 1;
+                const TCIOFF: u64 = 2;
+                const TCION: u64 = 3;
+                match arg {
+                    TCOOFF => tty.set_stopped(true),
+                    TCOON => tty.set_stopped(false),
+                    // Sending the stop and start characters upstream. There
+                    // is no upstream: the keyboard is the page.
+                    TCIOFF | TCION => {}
+                    _ => return Err(Errno::EINVAL),
+                }
+                Ok(0)
+            }
+            // Bytes typed and not yet read. The terminal knows, because the
+            // queue is its own; the descriptor's own answer is the fallback
+            // for a run with no shared terminal.
             FIONREAD => {
-                let n = match file.handle.available() {
-                    Some(n) => n,
-                    None => {
-                        let md = file.metadata()?;
-                        md.size.saturating_sub(file.offset())
-                    }
+                let n = match tty.queued() {
+                    Some(n) if n >= 0 => n as u64,
+                    _ => file.handle.available().unwrap_or(0),
                 };
                 m.write_u32(arg, n as u32)?;
                 Ok(0)
             }
-            _ => Err(Errno::ENOTTY),
+            // Bytes written and not yet displayed, which is always none.
+            TIOCOUTQ => {
+                m.write_u32(arg, 0)?;
+                Ok(0)
+            }
+            // Push a byte back as though it had been typed. `TIOCSTI` is how
+            // a shell puts a command on the next prompt, and how `su` used to
+            // be escaped from -- Linux now wants `CAP_SYS_ADMIN` for it. Here
+            // there is one terminal and one person at it.
+            TIOCSTI => {
+                let b = m.read(arg, 1)?.to_vec();
+                tty.push(&b);
+                Ok(0)
+            }
+            // Exclusive use. Nothing enforces it -- there is one page and one
+            // terminal -- but a program that sets it reads it back.
+            TIOCEXCL => {
+                tty.set_exclusive(true);
+                Ok(0)
+            }
+            TIOCNXCL => {
+                tty.set_exclusive(false);
+                Ok(0)
+            }
+            TIOCGEXCL => {
+                m.write_u32(arg, tty.exclusive() as u32)?;
+                Ok(0)
+            }
+            // The line discipline. `N_TTY` and nothing else; see
+            // `TtyRef::set_ldisc` for why the others are refused rather than
+            // accepted and ignored.
+            TIOCGETD => {
+                m.write_u32(arg, tty.ldisc() as u32)?;
+                Ok(0)
+            }
+            TIOCSETD => {
+                let n = m.read_u32(arg)? as i32;
+                if tty.set_ldisc(n) {
+                    Ok(0)
+                } else {
+                    Err(Errno::EINVAL)
+                }
+            }
+            // Modem lines. There is no modem, and the honest answer for a
+            // terminal that is always connected is carrier plus the two
+            // ready lines: DTR | RTS | CTS | CAR | DSR.
+            TIOCMGET => {
+                const TIOCM_DTR: u32 = 0x002;
+                const TIOCM_RTS: u32 = 0x004;
+                const TIOCM_CTS: u32 = 0x020;
+                const TIOCM_CAR: u32 = 0x040;
+                const TIOCM_DSR: u32 = 0x100;
+                m.write_u32(arg, TIOCM_DTR | TIOCM_RTS | TIOCM_CTS | TIOCM_CAR | TIOCM_DSR)?;
+                Ok(0)
+            }
+            TIOCMSET | TIOCMBIS | TIOCMBIC => Ok(0),
+            TIOCGSOFTCAR => {
+                m.write_u32(arg, tty.softcar() as u32)?;
+                Ok(0)
+            }
+            TIOCSSOFTCAR => {
+                tty.set_softcar(m.read_u32(arg)? != 0);
+                Ok(0)
+            }
+            // Send a signal to the foreground group, which is what the master
+            // end of a pty does for `^C`. Reachable here because the page is
+            // the master end.
+            TIOCSIG => {
+                let signo = m.read_u32(arg)?;
+                if signo == 0 || signo > crate::signal::sig::MAX {
+                    return Err(Errno::EINVAL);
+                }
+                self.signal_foreground(signo);
+                Ok(0)
+            }
+            // Asynchronous I/O by SIGIO. Accepted and not armed: nothing here
+            // has ever sent one, and a program that asks is asking to be told
+            // sooner, not to be told differently.
+            FIOASYNC => Ok(0),
+            // The pty ones. This terminal is not one half of a pair -- it is
+            // the console -- so the number and the lock have no meaning, and
+            // `EINVAL` is what Linux says for them on a console too.
+            TIOCGPTN | TIOCSPTLCK | TIOCGPTLCK | TIOCGPTPEER | TIOCGPKT => Err(Errno::EINVAL),
+            // The device number, for a program tracking which terminal it is
+            // on. `/dev/console` is 5:1.
+            TIOCGDEV => {
+                m.write_u32(arg, (5 << 8) | 1)?;
+                Ok(0)
+            }
+            // A serial port's parameters. There is no serial port; refusing
+            // is what `setserial` on a console gets.
+            TIOCGSERIAL | TIOCSSERIAL => Err(Errno::ENOTTY),
+            // The console multiplexer's own call: screen dumps, selection,
+            // keyboard mode. Only the "is the console blanked" subcode has an
+            // answer here, and it is no.
+            TIOCLINUX => Err(Errno::EINVAL),
+            _ => {
+                // Worth saying rather than swallowing: an unknown terminal
+                // request is usually a feature the guest wanted and quietly
+                // did without. `stty` asking for something absent looks
+                // exactly like `stty` reporting the wrong thing.
+                let _ = lflag::ISIG;
+                Err(Errno::ENOTTY)
+            }
         }
+    }
+
+    /// Raise `signo` on whoever holds the terminal.
+    ///
+    /// The foreground process group if a shell has set one, and otherwise
+    /// this process's own group -- which is right for the case that has no
+    /// shell in it at all, a program started directly on the terminal.
+    fn signal_foreground(&mut self, signo: u32) {
+        let fg = self.tty.fg();
+        let g = if fg > 0 {
+            fg
+        } else {
+            self.procs.pgid(self.pid, 0).unwrap_or(self.pid)
+        };
+        // `kill_group` and not `kill(-g)`: a negative target of -1 is
+        // POSIX's "every process", so group 1 is the one group that cannot
+        // be named negatively -- and a shell running as pid 1 is in it.
+        let _ = self.procs.kill_group(self.pid, g, signo);
     }
 
     fn sys_faccessat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> SysResult {
@@ -4897,6 +5233,147 @@ mod tests {
         k.vfs.mount("/", Arc::new(TmpFs::new()));
         k.vfs.mount("/dev", Arc::new(crate::vfs::DevFs::new()));
         (mem, k)
+    }
+
+    /// The terminal, as a program sees it through `ioctl`.
+    ///
+    /// These are the calls every interactive program makes before it draws
+    /// anything, and the ones a shell makes to run a job. They were three --
+    /// `TCGETS`, `TIOCGWINSZ`, `TIOCGPGRP` -- and everything else answered
+    /// `ENOTTY`, which is how `stty`, `tcflush` and job control quietly did
+    /// nothing.
+    mod terminal {
+        use super::*;
+        use crate::tty;
+
+        const TCGETS: u64 = 0x5401;
+        const TCSETS: u64 = 0x5402;
+        const TIOCGWINSZ: u64 = 0x5413;
+        const TIOCSWINSZ: u64 = 0x5414;
+        const TIOCGPGRP: u64 = 0x540f;
+        const TIOCSPGRP: u64 = 0x5410;
+        const TIOCGSID: u64 = 0x5429;
+        const TIOCOUTQ: u64 = 0x5411;
+        const TIOCGETD: u64 = 0x5424;
+        const TIOCSETD: u64 = 0x5423;
+        const TIOCEXCL: u64 = 0x540c;
+        const TIOCGEXCL: u64 = 0x8004_5440;
+        const TIOCMGET: u64 = 0x5415;
+        const TCGETS2: u64 = 0x802c_542a;
+        const TIOCGPTN: u64 = 0x8004_5430;
+        const AT: u64 = 0x2000;
+
+        /// A kernel whose standard input is a terminal, which is what the
+        /// browser and the native host both build for an interactive run.
+        ///
+        /// Reinstalled rather than asked for: `Kernel::new` copies whether
+        /// the *host's* stdin is a terminal, and a test runner's is a pipe.
+        fn tty_kernel() -> (Vec<u8>, Kernel) {
+            let mem = vec![0u8; 0x40000];
+            let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
+            k.vfs.mount("/", Arc::new(TmpFs::new()));
+            k.fds = FdTable::new();
+            for (stream, name, r, w) in [
+                (Stream::In, "/dev/stdin", true, false),
+                (Stream::Out, "/dev/stdout", false, true),
+                (Stream::Err, "/dev/stderr", false, true),
+            ] {
+                let h = Arc::new(StdStream::new(stream, true));
+                let _ = k.fds.insert(OpenFile::new(h, name.to_string(), 0, r, w), false);
+            }
+            (mem, k)
+        }
+
+        fn ioctl(k: &mut Kernel, mem: &mut Vec<u8>, req: u64, arg: u64) -> Result<u64, Errno> {
+            let mut m = GuestMem::new(mem);
+            k.sys_ioctl(&mut m, 0, req, arg)
+        }
+
+        #[test]
+        fn termios_round_trips_through_the_kernel_shape() {
+            let (mut mem, mut k) = tty_kernel();
+            assert_eq!(ioctl(&mut k, &mut mem, TCGETS, AT), Ok(0));
+            // 36 bytes and not one more: glibc's `tcgetattr` passes a
+            // `struct __kernel_termios` on the stack, and the 24 bytes past
+            // it are the caller's, ending at the stack canary.
+            assert_eq!(&mem[AT as usize..AT as usize + 4], &0x6502u32.to_le_bytes());
+            assert_eq!(mem[AT as usize + tty::KERNEL_TERMIOS], 0, "wrote past the kernel struct");
+            // `intr` is `^C`, which is where a shell reads it from.
+            assert_eq!(mem[AT as usize + 17], 3);
+
+            // Raw mode, as a line editor sets it, and read back.
+            let mut t = tty::COOKED;
+            let l = u32::from_le_bytes([t[12], t[13], t[14], t[15]])
+                & !(tty::lflag::ICANON | tty::lflag::ECHO);
+            t[12..16].copy_from_slice(&l.to_le_bytes());
+            mem[AT as usize..AT as usize + 60].copy_from_slice(&t);
+            assert_eq!(ioctl(&mut k, &mut mem, TCSETS, AT), Ok(0));
+            assert_eq!(k.tty.termios()[12..16], l.to_le_bytes());
+        }
+
+        #[test]
+        fn the_window_size_is_read_written_and_shared() {
+            let (mut mem, mut k) = tty_kernel();
+            let ws = [40u16, 100, 0, 0];
+            for (i, v) in ws.iter().enumerate() {
+                mem[AT as usize + i * 2..AT as usize + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+            }
+            assert_eq!(ioctl(&mut k, &mut mem, TIOCSWINSZ, AT), Ok(0));
+            mem[AT as usize..AT as usize + 8].fill(0);
+            assert_eq!(ioctl(&mut k, &mut mem, TIOCGWINSZ, AT), Ok(0));
+            assert_eq!(u16::from_le_bytes([mem[AT as usize], mem[AT as usize + 1]]), 40);
+            assert_eq!(u16::from_le_bytes([mem[AT as usize + 2], mem[AT as usize + 3]]), 100);
+        }
+
+        #[test]
+        fn the_foreground_group_is_settable_and_is_what_a_shell_reads_back() {
+            let (mut mem, mut k) = tty_kernel();
+            let mut m = GuestMem::new(&mut mem);
+            m.write_u32(AT, 42).unwrap();
+            assert_eq!(k.sys_ioctl(&mut m, 0, TIOCSPGRP, AT), Ok(0));
+            m.write_u32(AT, 0).unwrap();
+            assert_eq!(k.sys_ioctl(&mut m, 0, TIOCGPGRP, AT), Ok(0));
+            assert_eq!(m.read_u32(AT).unwrap(), 42);
+            // Zero is not a process group, and accepting it would silently
+            // point `^C` at nobody.
+            m.write_u32(AT, 0).unwrap();
+            assert_eq!(k.sys_ioctl(&mut m, 0, TIOCSPGRP, AT), Err(Errno::EINVAL));
+        }
+
+        #[test]
+        fn the_rest_of_the_surface_answers_rather_than_saying_enotty() {
+            let (mut mem, mut k) = tty_kernel();
+            // Every one of these was ENOTTY before, and every one of them is
+            // asked by something in a Debian rootfs.
+            assert_eq!(ioctl(&mut k, &mut mem, TIOCGSID, AT), Ok(0), "TIOCGSID");
+            assert_eq!(ioctl(&mut k, &mut mem, TIOCOUTQ, AT), Ok(0), "TIOCOUTQ");
+            assert_eq!(ioctl(&mut k, &mut mem, TIOCGETD, AT), Ok(0), "TIOCGETD");
+            assert_eq!(ioctl(&mut k, &mut mem, TCGETS2, AT), Ok(0), "TCGETS2");
+            assert_eq!(ioctl(&mut k, &mut mem, TIOCMGET, AT), Ok(0), "TIOCMGET");
+            assert_eq!(ioctl(&mut k, &mut mem, TIOCEXCL, AT), Ok(0), "TIOCEXCL");
+            assert_eq!(ioctl(&mut k, &mut mem, TIOCGEXCL, AT), Ok(0), "TIOCGEXCL");
+            let mut m = GuestMem::new(&mut mem);
+            assert_eq!(m.read_u32(AT).unwrap(), 1, "TIOCEXCL is read back");
+            // A line discipline that is not N_TTY is refused rather than
+            // accepted and ignored: a program told yes would then write SLIP
+            // frames into a terminal.
+            m.write_u32(AT, 1).unwrap();
+            assert_eq!(k.sys_ioctl(&mut m, 0, TIOCSETD, AT), Err(Errno::EINVAL));
+            m.write_u32(AT, 0).unwrap();
+            assert_eq!(k.sys_ioctl(&mut m, 0, TIOCSETD, AT), Ok(0));
+            // And this terminal is a console, not half of a pty pair. Saying
+            // so is the honest answer and the one Linux gives.
+            assert_eq!(k.sys_ioctl(&mut m, 0, TIOCGPTN, AT), Err(Errno::EINVAL));
+        }
+
+        #[test]
+        fn a_pipe_is_still_not_a_terminal() {
+            let (mut mem, mut k) = setup();
+            let mut m = GuestMem::new(&mut mem);
+            // fd 0 here is a plain stream, not a tty.
+            assert_eq!(k.sys_ioctl(&mut m, 0, TCGETS, AT), Err(Errno::ENOTTY));
+            assert_eq!(k.sys_ioctl(&mut m, 0, TIOCGWINSZ, AT), Err(Errno::ENOTTY));
+        }
     }
 
     fn set_args(m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, args: &[u64]) {

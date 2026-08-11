@@ -582,7 +582,11 @@ export class ProcessHost {
           break;
         }
         Promise.resolve(this.#readStdin(m.lflag)).then((bytes) => {
-          if (bytes && bytes.length) w.postMessage({ kind: 'stdin', bytes });
+          // `true` is "there is input, and it is already in the shared
+          // queue you read from" -- the answer a page with a real terminal
+          // gives, because the discipline put it there when it was typed.
+          if (bytes === true) w.postMessage({ kind: 'stdin', bytes: true });
+          else if (bytes && bytes.length) w.postMessage({ kind: 'stdin', bytes });
           else w.postMessage({ kind: 'eof' });
         });
         break;

@@ -29,8 +29,16 @@ ARCH=arm64
 # Overridable, because the same closure-resolver builds the graphics rootfs
 # the virtio-gpu tests need -- that one wants Mesa and mesa-utils-bin on top,
 # and there is no reason for a second copy of this script to say so.
+#
+# `ncurses-base` is not optional and its absence was invisible. It ships
+# `/lib/terminfo`, and without a terminfo database `TERM=xterm-256color` names
+# a terminal nothing can describe: `clear`, `tput`, `less`, `top` and every
+# other curses program either refuse to start or fall back to `dumb` and
+# scroll. The rootfs had no terminfo file of any kind, and `TERM` was being
+# set to a value nothing in it could read.
 ROOTS="${GEX_DEBIAN_ROOTS:-apt dash bash coreutils dpkg findutils grep sed tar gzip diffutils \
        debianutils base-files base-passwd hostname ca-certificates \
+       ncurses-base ncurses-bin less procps \
        libc-bin perl-base debian-archive-keyring}"
 
 mkdir -p "$WORK/debs" "$WORK/root"

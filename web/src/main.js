@@ -33,7 +33,15 @@ const term = new Terminal({
   fontSize: 13,
   lineHeight: 1.25,
   cursorBlink: true,
-  convertEol: true,
+  // `convertEol` is off, and that is the change rather than an omission.
+  //
+  // It turns every `\n` into `\r\n` unconditionally, which is the terminal
+  // doing the kernel's job: `ONLCR` in `c_oflag` is what a Unix program is
+  // relying on when it writes a bare `\n`, and a program that *clears*
+  // `OPOST` -- `less`, `vi`, anything placing its own cursor -- is asking for
+  // the opposite and was not getting it. The guest's terminal now honours the
+  // flag it was always told about; see `gex_kernel::tty::Tty::output`.
+  convertEol: false,
   scrollback: 5000,
   theme: {
     background: '#0b0d10',

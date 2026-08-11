@@ -8,6 +8,7 @@
 
 import { Env } from '../../shims/browser/js/gex.mjs';
 import { ProcessHost } from '../../shims/browser/js/host.mjs';
+import { PageTty } from '../../shims/browser/js/tty.mjs';
 
 const ICANON = 0x2;
 const ECHO = 0x8;
@@ -86,6 +87,24 @@ export async function loadRuntime(onProgress) {
 export { fetchBytes };
 
 /**
+ * A `?name=` switch, from wherever this is running.
+ *
+ * `location` does not exist under Node, and this file is deliberately
+ * runnable there -- the terminal test drives it, because the alternative is a
+ * twenty-minute cycle in a browser for a change to the line discipline. Three
+ * bare `location.search` reads had crept back in, and they threw before the
+ * guest was started, so the test reported `ReferenceError: location is not
+ * defined` and nothing else.
+ */
+function flag(name) {
+  const search = globalThis.location?.search;
+  if (search) return new URLSearchParams(search).get(name);
+  // Under Node the same switches arrive as environment variables, spelled
+  // the way the rest of the harness spells them: `GEX_TRACE`, `GEX_HOT`.
+  return globalThis.process?.env?.[`GEX_${name.toUpperCase()}`] ?? null;
+}
+
+/**
  * An `Env` whose output goes to a terminal and whose input comes from one.
  *
  * The awkward part is that a guest read has to be able to wait. gex gives the
@@ -93,9 +112,18 @@ export { fetchBytes };
  * `readStdin` -- so this is where a promise sits until a key arrives.
  */
 class TerminalEnv extends Env {
-  constructor(term) {
+  constructor(term, tty = null) {
     super();
     this.term = term;
+    // The system's terminal, when there is a global kernel to hold one.
+    //
+    // With it, none of the line editing below runs: a keystroke goes into the
+    // discipline in the kernel and comes back as echo, the bytes a program
+    // reads are already in the queue that program reads from, and `^C` has
+    // become `SIGINT` to the foreground group before this returns. Without
+    // it there is one process and no process table, and the fallback below is
+    // exactly right for that.
+    this.tty = tty;
     this.pending = [];
     this.line = [];
     this.waiter = null;
@@ -132,6 +160,28 @@ class TerminalEnv extends Env {
   /** A keystroke from xterm. */
   onKey(data) {
     if (this.closed) return;
+    if (this.tty) {
+      // Straight into the discipline. What comes back is what a terminal
+      // shows: the character in cooked mode, `^C` and a fresh line for an
+      // interrupt, backspace-space-backspace for an erase -- and nothing at
+      // all when the program has taken echo over.
+      if (this.tty.input(data)) {
+        const echo = this.tty.drainEcho();
+        if (echo) this.term.write(echo);
+      }
+      // A guest already parked waiting for input is woken inside the kernel;
+      // one that gave the stack back to JavaScript is waiting on this.
+      const ready = this.tty.ready();
+      if (ready !== 0 && this.waiter) {
+        const w = this.waiter;
+        this.waiter = null;
+        // `true` rather than the bytes: they are already in the queue the
+        // guest reads from, and handing them over here would deliver them
+        // twice.
+        w(ready < 0 ? false : true);
+      }
+      return;
+    }
     if (this.#raw()) {
       this.#deliver(data);
       return;
@@ -195,6 +245,14 @@ class TerminalEnv extends Env {
    * line.
    */
   async readStdin() {
+    if (this.tty) {
+      const ready = this.tty.ready();
+      if (ready < 0) return false;
+      if (ready > 0) return true;
+      return new Promise((resolve) => {
+        this.waiter = resolve;
+      });
+    }
     if (this.closed) return false;
     if (this.pending.length) {
       const total = this.pending.reduce((n, b) => n + b.length, 0);
@@ -351,7 +409,16 @@ export async function runProgram(
   const { shimBytes, seedBytes } = await loadRuntime();
   const kernel = await loadKernel();
   const makeGuestWorker = await guestWorkerFactory();
-  const tenv = new TerminalEnv(term);
+  // The system's terminal, instantiated here so that a keystroke reaches the
+  // line discipline and the process table by a call rather than by a message
+  // to a Worker. Null without a shared memory, and `TerminalEnv` then does
+  // its own line editing -- see its constructor.
+  const sharedTty = tty ? await PageTty.open(kernel) : null;
+  const tenv = new TerminalEnv(term, sharedTty);
+  // Before pid 1 runs, so the first `TIOCGWINSZ` is the truth. A shell asks
+  // once at startup and then only on `SIGWINCH`, so a wrong answer here is
+  // one that lasts.
+  sharedTty?.resize(term.rows, term.cols);
 
   // The GPU, if this demo has one. The renderer stays here, with the canvas;
   // the guest reaches it across a `SharedArrayBuffer` and blocks on
@@ -400,13 +467,13 @@ export async function runProgram(
       // Node harness has had this through an environment variable all along;
       // the page had no way to ask for it, so a question that needed it could
       // only be answered by editing the shim.
-      trace: new URLSearchParams(location.search).get('trace') ? 1 : undefined,
+      trace: flag('trace') ? 1 : undefined,
       // `?hot=1` asks every process to dump its hottest back edges when it
       // ends. Only `run-node.mjs` could ask before, so the question "what is
       // the guest actually doing" could not be put to a browser at all --
       // and now that install and translation are 17 of a 57 second
       // `apt-get update`, the rest of it is the only thing left to ask about.
-      hot: new URLSearchParams(location.search).get('hot') ? 1 : undefined,
+      hot: flag('hot') ? 1 : undefined,
       // `?inlinethreads=1` keeps a guest's threads on the process's own
       // Worker instead of giving each one a Worker of its own.
       //
@@ -417,12 +484,18 @@ export async function runProgram(
       // to compare: liblzma's decoder spawns a worker, and `dpkg-deb` dies of
       // `free(): invalid pointer` in the browser while the same archive comes
       // out whole under the native adapter three times for three.
-      inlineThreads: new URLSearchParams(location.search).get('inlinethreads')
-        ? 1
-        : undefined,
+      inlineThreads: flag('inlinethreads') ? 1 : undefined,
       virgl: channel ?? undefined,
       wispUrl: network?.url ?? undefined,
-      winsize: { rows: term.rows, cols: term.cols },
+      // The size, but only when there is no terminal to hold it.
+      //
+      // With a shared terminal this must not be sent. It is captured when
+      // `runProgram` is called and every Worker writes it on startup -- so a
+      // process forked *after* a resize set the system's terminal back to the
+      // size it had at boot. `stty size` in a command run from a resized
+      // window reported the old size, and the window that reported it was the
+      // one that had just been resized.
+      winsize: sharedTty ? undefined : { rows: term.rows, cols: term.cols },
       // Every guest write mirrored to the console as well as posted, and a
       // crash narrated where it happens. A Worker that falls over takes its
       // last few messages with it, and those are the ones that say why.
@@ -476,7 +549,13 @@ export async function runProgram(
   // body. So a program would start, print its prompt, and ignore every key
   // until the person thought to click on the terminal.
   term.focus?.();
-  const resize = term.onResize(({ rows, cols }) => host.resize(rows, cols));
+  // A resize is `SIGWINCH` to the foreground group and one write to the
+  // terminal every process shares -- not a message to each of them, which is
+  // what it was when each process had a window size of its own.
+  const resize = term.onResize(({ rows, cols }) => {
+    if (sharedTty) sharedTty.resize(rows, cols);
+    else host.resize(rows, cols);
+  });
   try {
     const status = await host.start({
       elf,

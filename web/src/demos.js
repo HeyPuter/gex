@@ -141,7 +141,7 @@ const busybox = {
 
   async enter(ctx) {
     ctx.actions([{ label: 'Boot', primary: true, id: 'boot', onClick: () => boot(ctx) }]);
-    ctx.hint('a real shell: try `ls -l /bin`, `ps`, `echo hi | wc -c`');
+    ctx.hint('a real shell: try `ls -l /bin`, `stty -a`, `echo hi | wc -c`, ^C');
     ctx.term.writeln('A BusyBox rootfs, about 1 MB, unpacked into an in-memory filesystem.');
     ctx.term.writeln('');
     ctx.term.writeln(ctx.ansi.dim('Press Boot. The first command is slow -- the whole binary has'));
@@ -221,6 +221,11 @@ async function boot(ctx) {
       modes: tree.modes,
       args: bbCmd ? ['/bin/sh', '/cmd.sh'] : ['/bin/sh', '-i'],
       cwd: '/root',
+      // The terminal is an xterm and has been all along; nothing said so, and
+      // a shell with no `TERM` assumes a glass teletype. BusyBox carries no
+      // terminfo, so this buys the ANSI its applets emit unconditionally
+      // rather than a curses lookup -- but it is still what the terminal is.
+      env: ['TERM=xterm-256color', 'PATH=/bin:/usr/bin:/sbin:/usr/sbin', 'HOME=/root'],
       tty: true,
       closure,
     });
