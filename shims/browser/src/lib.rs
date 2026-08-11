@@ -3508,7 +3508,7 @@ pub extern "C" fn gex_claim_floor(i: u32) -> u32 {
 ///
 /// Off by default. See `gex_set_claim_pages`.
 static CLAIM_PAGES: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Turn per-process page numbering on.
 ///

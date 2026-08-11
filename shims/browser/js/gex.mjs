@@ -300,6 +300,11 @@ export class Gex {
   #wants = 0;
   #instMs = 0;
   #tailMs = 0;
+  /// Modules that only instantiated after growing every table the
+  /// running total implies. Worth watching: if it is common, the
+  /// loose reading is the wrong default.
+  #strictGrows = 0;
+  #strictSlots = 0;
   /// Next free slot in each table, for pages this process claims.
   #claimed = [];
   // The parent's modules, held rather than installed. See `#maybeAdopt`.
@@ -605,6 +610,8 @@ export class Gex {
       wantMs: Math.round(this.#wantMs),
       instMs: Math.round(this.#instMs),
       tailMs: Math.round(this.#tailMs),
+      strictGrows: this.#strictGrows,
+      strictSlots: this.#strictSlots,
     };
   }
 
@@ -2880,13 +2887,50 @@ export class Gex {
       // `await` here goes to the back of this Worker's task queue.
       inst = new WebAssembly.Instance(mod, { gex: imports });
       this.#instantiateMs += performance.now() - ti;
-    } catch (err) {
-      throw new Error(
-        `installing a module of ${need} slots failed: ${err.message}. ` +
-          `tables are [${tables.map((t) => t.length).join(', ')}], ` +
-          `${(e.gex_slots_per_table?.() ?? 0) >>> 0} slots per table, ` +
-          `${this.#installs} modules in so far`,
-      );
+    } catch (first) {
+      // Grow to everything the module could possibly need, and try once more.
+      //
+      // `need` is one running total across the whole slot space and a module
+      // carries no per-table breakdown -- `Metadata` records a single number.
+      // Read strictly it means "every table below the top one is full", and
+      // growing four tables to ten million entries each is most of what a
+      // process used to cost. Read loosely -- only the table the total lands
+      // in -- it is right for every module whose segments live in one table,
+      // which is nearly all of them, and wrong for the rest.
+      //
+      // So read it loosely and let the engine say. "table index is out of
+      // bounds" at instantiation is exact and cheap, and paying the strict
+      // reading only when it happens beats paying it always.
+      //
+      // Per-page claiming is what made this necessary: publishing a library
+      // used to assign every one of its pages, which grew the lower tables as
+      // a side effect. Nothing does that now, so a module whose slots were
+      // numbered by an *earlier* process -- the second `ls` in a shell -- can
+      // land in a table this one never touched.
+      const per = (e.gex_slots_per_table?.() ?? 0) >>> 0 || Number.MAX_SAFE_INTEGER;
+      const stub = tables[0].get(0);
+      let grew = 0;
+      for (let i = 0; i < tables.length; i++) {
+        const want = Math.min(Math.max(need - i * per, 0), per);
+        if (tables[i].length < want) {
+          grew += want - tables[i].length;
+          tables[i].grow(want - tables[i].length, stub);
+        }
+      }
+      try {
+        inst = new WebAssembly.Instance(mod, { gex: imports });
+        this.#instantiateMs += performance.now() - ti;
+        this.#strictGrows++;
+        this.#strictSlots += grew;
+      } catch (err) {
+        throw new Error(
+          `installing a module of ${need} slots failed: ${err.message}. ` +
+            `tables are [${tables.map((t) => t.length).join(', ')}], ` +
+            `${(e.gex_slots_per_table?.() ?? 0) >>> 0} slots per table, ` +
+            `${this.#installs} modules in so far, ` +
+            `${grew} slots grown on retry after: ${first.message}`,
+        );
+      }
     }
     // Write the module's blocks into the tables.
     //
