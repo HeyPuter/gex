@@ -4382,6 +4382,21 @@ pub extern "C" fn gex_recent_syscalls(out: u32, max: u32) -> u32 {
     n as u32
 }
 
+/// Nanoseconds spent inside syscalls, and how many there were. Always kept.
+static SYS_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SYS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long this process has spent in syscalls, in microseconds.
+#[no_mangle]
+pub extern "C" fn gex_sys_us() -> u64 {
+    SYS_TOTAL_NS.load(std::sync::atomic::Ordering::Relaxed) / 1000
+}
+
+#[no_mangle]
+pub extern "C" fn gex_sys_calls() -> u64 {
+    SYS_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Nanoseconds spent inside each syscall number, filled in by `gex_syscall`.
 static mut SYS_NS: [u64; 512] = [0; 512];
 
@@ -4585,7 +4600,16 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // so whatever the frame is spending is spent *inside* one of them and
     // the census says every one is rare. A blocking call parks the Worker
     // in here, so this covers the waiting as well as the work.
-    let began = if unsafe { HEARTBEAT } != 0 { now_ns() } else { 0 };
+    // Always, not only under the heartbeat.
+    //
+    // `guest` is now the majority of a warm process -- 240ms of a 330ms
+    // `cat /dev/null` -- and the two things inside it are executing
+    // translated code and servicing syscalls. Thirty-four calls a process is
+    // far too few for a clock read each to matter, and without this the
+    // split is a guess. The per-number census above stays behind the
+    // heartbeat, which is where the cost would be.
+    let began = now_ns();
+    SYS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let stop = with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
@@ -4920,10 +4944,14 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         }
     });
-    if began != 0 {
-        let nr = LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        if nr < 512 {
-            unsafe { SYS_NS[nr] = SYS_NS[nr].saturating_add(now_ns() - began) };
+    {
+        let took = now_ns().saturating_sub(began);
+        SYS_TOTAL_NS.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
+        if unsafe { HEARTBEAT } != 0 {
+            let nr = LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as usize;
+            if nr < 512 {
+                unsafe { SYS_NS[nr] = SYS_NS[nr].saturating_add(took) };
+            }
         }
     }
     // Whatever that call did, somebody else may have been waiting for it.

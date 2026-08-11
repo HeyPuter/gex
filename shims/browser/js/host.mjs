@@ -640,6 +640,7 @@ export class ProcessHost {
                 : '') +
               (m.fill && (m.fill.filled || m.fill.unanswered)
                 ? `, fill ${m.fill.filled} answered ${m.fill.unanswered} not`
+                  + (m.fill.sysN ? `, sys ${m.fill.sysN}x ${m.fill.sysMs}ms` : '')
                   + ` (${m.fill.now ?? 0} fast, ${m.fill.nowMs ?? 0}ms[base ${m.fill.faBase ?? 0} init ${m.fill.faInit ?? 0}];`
                   + ` ${m.fill.slow ?? 0} slow, ${m.fill.slowMs ?? 0}ms;`
                   + ` ${m.fill.pub ?? 0} published, ${m.fill.pubMs ?? 0}ms,`

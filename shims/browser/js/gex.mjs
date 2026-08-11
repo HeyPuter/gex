@@ -715,6 +715,8 @@ export class Gex {
       // -- takes 1.5 seconds, and none of the other counters accounts for it.
       now: this.#nowFills,
       nowMs: Math.round(this.#nowMs),
+      sysMs: Math.round(Number(this.#shim.exports.gex_sys_us?.() ?? 0n) / 1000),
+      sysN: Number(this.#shim.exports.gex_sys_calls?.() ?? 0n),
       faBase: Math.round(this.#faBaseMs),
       faInit: Math.round(this.#faInitMs),
       slow: this.#slowFills,
