@@ -199,10 +199,26 @@ export class WispNetwork {
     // are waiting on the network. So either the request leaves late, which
     // is ours, or it leaves promptly and the answer is late, which is the
     // proxy's or the mirror's. One number each way settles it.
-    if (!s.firstSend) {
-      s.firstSend = performance.now();
-      console.error(`[wisp] stream ${id}: request out at ${(s.firstSend / 1000).toFixed(1)}s`);
-    }
+    // Every send, not just the first.
+    //
+    // The stall is a fixed 318 seconds -- 318.1 and 318.4 across runs -- after
+    // about a hundred kilobytes, and it survives the Worker polling fifty
+    // times a second instead of thirty-two thousand, so it is not contention
+    // and not starvation. A fixed five minutes that ends by itself is
+    // somebody's idle timeout.
+    //
+    // apt keeps the connection alive and sends its next request on it. The
+    // probe that does *not* stall sends one request and `Connection: close`.
+    // So the question is whether the second request leaves at all: if apt
+    // sends at three seconds and the answer arrives at three hundred and
+    // twenty, the send is being lost and the server is idling until it gives
+    // up.
+    s.sends = (s.sends ?? 0) + 1;
+    if (!s.firstSend) s.firstSend = performance.now();
+    console.error(
+      `[wisp] stream ${id}: send ${s.sends}, ${bytes.length} bytes at `
+      + `${(performance.now() / 1000).toFixed(1)}s`,
+    );
     s.wisp.send(bytes.slice());
     return bytes.length;
   }
