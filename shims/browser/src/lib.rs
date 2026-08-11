@@ -2125,6 +2125,33 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     })
 }
 
+/// The host, but only if nobody is inside it.
+///
+/// For the questions a crash reporter asks. Everything else must use
+/// `with_host` and be told loudly when it re-enters, because re-entry is a
+/// real bug; a reporter is the one caller for which re-entry is *expected* --
+/// it runs after a trap, and a trap leaves whatever it interrupted holding
+/// the borrow forever. `None` means "cannot say", which is a worse answer
+/// than the address and a far better one than a panic that replaces the
+/// crash with a complaint about the reporter.
+#[cfg(not(feature = "shared-memory"))]
+fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+    HOST.with(|h| match h.try_borrow_mut() {
+        Ok(mut b) => b.as_mut().map(f),
+        Err(_) => None,
+    })
+}
+
+/// As above. The shared build has no `RefCell` to ask -- it borrows a static
+/// in place under `KLock` -- so the honest answer is the same one `with_host`
+/// gives, minus the initialisation panic.
+#[cfg(feature = "shared-memory")]
+fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+    // SAFETY: as `with_host`. Read-mostly and only from a reporter, which
+    // runs when the guest has already stopped.
+    unsafe { (*core::ptr::addr_of_mut!(HOST)).as_mut().map(f) }
+}
+
 /// The same, holding the lock for the duration.
 ///
 /// Re-entrancy is a real hazard and not a theoretical one: a host call that
@@ -9731,7 +9758,22 @@ fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {
 /// means a wild context pointer, and the two are told apart by looking.
 #[no_mangle]
 pub extern "C" fn gex_current_ctx() -> i64 {
-    with_host(|h| h.threads[cur()].kstate.ctx_addr as i64)
+    // The remembered address first, and only then the kernel.
+    //
+    // This is a *crash reporter's* question, so the case that matters is the
+    // one where the kernel is not available: a wasm trap aborts rather than
+    // unwinds, so the borrow taken by whatever trapped is still held when JS
+    // asks where the guest was. Asking through `with_host` then panics on top
+    // of the crash, and the message that reaches the console is "the kernel
+    // was re-entered at gex_current_ctx while gex_dispatch_miss holds it" --
+    // which describes the reporter and says nothing whatever about the fault.
+    // Two rounds of chasing an out-of-bounds access were spent reading that
+    // sentence as though it were the bug.
+    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    if at != 0 {
+        return at as i64;
+    }
+    with_host_free(|h| h.threads.get(cur()).map_or(0, |t| t.kstate.ctx_addr as i64)).unwrap_or(0)
 }
 
 #[no_mangle]
@@ -9744,11 +9786,12 @@ pub extern "C" fn gex_current_pc() -> i64 {
         let gm = GuestMem::new(guest_bytes());
         return gm.read_u64(at + ctx::PC as u64).unwrap_or(0) as i64;
     }
-    with_host(|h| {
+    with_host_free(|h| {
         let gm = GuestMem::new(guest_bytes());
-        let at = h.threads[cur()].kstate.ctx_addr;
+        let at = h.threads.get(cur()).map_or(0, |t| t.kstate.ctx_addr);
         gm.read_u64(at + ctx::PC as u64).unwrap_or(0) as i64
     })
+    .unwrap_or(0)
 }
 
 /// Which mapped object an address belongs to, written into `out` as bytes.
