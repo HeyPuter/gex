@@ -1196,6 +1196,33 @@ The lesson is cheap to state and was expensive to learn: **measure a package
 manager against a whole machine, not against a closure.** The closure is the
 right unit for *translation*; it is the wrong unit for a filesystem.
 
+## The dev server serves stale JavaScript, and two results here were wrong
+
+`GEX_SITE=http://127.0.0.1:5173` points `web/test/site.mjs` at the vite dev
+server, which runs `--no-hmr` and does not re-read edited JavaScript. Edits
+to `shims/browser/js/*.mjs` reached the page only when vite happened to
+restart. Proved by curling the served file and grepping for a marker that
+was on disk and not in what the browser got.
+
+Two throughput experiments were reported as "no effect" on that basis and
+had never run. The same edit against `web/dist` behaved differently the
+first time it was actually executed.
+
+Measure against `web/dist`, which `sh shims/browser/build.sh` rebuilds and
+which `site.mjs` uses when `GEX_SITE` is unset. When a browser result is
+surprising, curl the served file before believing it.
+
+What it was hiding: `load` set two of three device flags and not
+`gex_set_network`, so pid 1 -- which is loaded, while a forked child is
+adopted -- never had a network. Against `dist` with that fixed, bash in the
+Debian demo opens a socket instead of
+
+    /cmd.sh: socket: Address family not supported by protocol
+
+and then dies of SIGABRT, which is the forked-child abort that also stops
+`apt-get install`. A minute-long probe reaching the same bug an
+`apt-get update` takes six minutes to reach.
+
 ## Reachable-only discovery finds a quarter of a C++ library
 
 Measured 2026-08-11, `apt-get update`, per process:
