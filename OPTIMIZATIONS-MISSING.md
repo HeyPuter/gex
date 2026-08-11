@@ -1196,6 +1196,40 @@ The lesson is cheap to state and was expensive to learn: **measure a package
 manager against a whole machine, not against a closure.** The closure is the
 right unit for *translation*; it is the wrong unit for a filesystem.
 
+## Reachable-only discovery finds a quarter of a C++ library
+
+Measured 2026-08-11, `apt-get update`, per process:
+
+    before   1871ms translating 84091 blocks  [libapt-pkg=78938 ...]
+    after     212ms translating  4123 blocks  [libgcrypt=2084
+                                               libgpg-error=1764 ...]
+
+libapt-pkg does not appear in the breakdown at all after. The closure was
+built `--exhaustive-for libc.so,ld-linux,bash` and everything else got
+reachable-only discovery, so libapt-pkg's module was present, fetched and
+instantiated -- and the code the guest actually ran was not in it.
+
+The number that settles it: translating libapt-pkg alone, reachable-only,
+gives 78,293 blocks, and the run was lifting 78,938. The process was
+re-deriving the entire library out of a closure that contained it. Not a
+fill failure, not a slot problem: discovery had simply not found the code,
+and the demand path found it one miss at a time.
+
+What discovery misses is not vtables -- only 709 `R_AARCH64_RELATIVE`
+addends in libapt-pkg point into executable sections, and the pointer scan
+already follows those. It is the ordinary bulk of a C++ library:
+everything reached only through a computed call the scanner cannot fold.
+
+So `--exhaustive-for` is not a tuning knob, it is the difference between a
+library being statically recompiled and not. `GEX_WHOLE=all` on
+`web/build-closure.sh` now passes `--exhaustive`; the Debian closure names
+libapt-pkg and libapt-private and comes to 317 MB against 259, and the
+page fetches a library only when a guest branches into it, so the size is
+not paid by a run that never touches it.
+
+The same measurement names what is left: libgcrypt at 2,084 blocks and
+libgpg-error at 1,764 are now the whole of what apt-get lifts.
+
 ## Where a rootfs stops fitting
 
 #91, fixed. The kernel's memory is where the rootfs lives -- the filesystem

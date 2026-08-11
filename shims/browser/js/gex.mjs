@@ -364,6 +364,26 @@ export class Gex {
     });
   }
 
+  /**
+   * Consecutive turns taken for a wait that is only on the network.
+   *
+   * Counted so the loop can yield cheaply while bytes are moving and still
+   * fall back to a timer when they are not: see the run loop.
+   */
+  #netTurns = 0;
+
+  /**
+   * How the run loop waited, by kind.
+   *
+   * `park` is a sleep on the shared word that another Worker ends; `turn` is
+   * a MessageChannel task; `nap` is a timer. A download that moves 835 bytes
+   * per wait wants to know which of the three it is paying for, and reading
+   * the code did not settle it -- the three conditions are `paused_for_host`,
+   * `paused_for_net` and what `gex_park` returns, and they do not mean what
+   * their names suggest in every combination.
+   */
+  waits = { park: 0, turn: 0, nap: 0 };
+
   #nap() {
     if (!this.#tick) {
       this.#tick = new MessageChannel();
@@ -2337,9 +2357,47 @@ export class Gex {
               // waiting on the network cannot sleep at all: the bytes it
               // wants arrive on this Worker's own event loop.
               if (e.gex_paused_for_host() || e.gex_park(20) < 0) {
-                // See `#nap` for why this is not a bare `setTimeout`.
-                await this.#nap();
+                // A wait on the network is a wait on this Worker's own event
+                // loop, so it cannot sleep -- but it does not need a *timer*
+                // either. A MessageChannel turn returns to the event loop
+                // just as a timer does, and the WebSocket message carrying
+                // the bytes runs there; the difference is that a turn costs
+                // microseconds and `setTimeout(_, 1)` costs a millisecond,
+                // or four once timers nest deeply enough for the browser to
+                // clamp them.
+                //
+                // That timer was the whole speed of a download. `apt-get
+                // update` fetched 14.9 MB at 41.9 kB/s while the same
+                // machine pulls the same file from the same mirror at 10.6
+                // MB/s -- two hundred and fifty times faster -- and every
+                // process in the run translated for under two seconds
+                // between them. The transfer was not waiting on the network
+                // or on translation. It was waiting on a timer, once per
+                // read.
+                //
+                // Still a nap every so often. A turn is a task and the
+                // browser will run it as fast as it is posted, so a socket
+                // that stays empty would spin this Worker at full speed;
+                // the periodic timer is what keeps that idle rather than
+                // hot, and it also lets anything genuinely timer-driven run.
+                // `gex_paused_for_host` *is* the network case: it says the
+                // wait ends on a callback that runs on this Worker's own
+                // event loop. So it is the condition for turning rather than
+                // the reason to avoid it -- the first version of this tested
+                // for its negation, which is never true here, and the change
+                // measured as doing nothing because it never ran.
+                const onLoop = !!e.gex_paused_for_host();
+                this.#netTurns = onLoop ? this.#netTurns + 1 : 0;
+                if (onLoop && (this.#netTurns & 63) !== 0) {
+                  this.waits.turn++;
+                  await this.#turn();
+                } else {
+                  this.waits.nap++;
+                  // See `#nap` for why this is not a bare `setTimeout`.
+                  await this.#nap();
+                }
               } else {
+                this.waits.park++;
                 await this.#turn();
               }
             }
