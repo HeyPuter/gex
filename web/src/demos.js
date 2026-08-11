@@ -181,6 +181,33 @@ async function boot(ctx) {
     }
     const elf = files['/bin/busybox'];
     if (!elf) throw new Error('the rootfs has no /bin/busybox');
+    // `?cmd=` runs one line and exits, rather than opening a shell -- the
+    // same contract the Debian demo has, and what the test harness drives
+    // every measured case through.
+    const bbCmd = new URLSearchParams(location.search).get('cmd');
+    if (bbCmd) files['/cmd.sh'] = new TextEncoder().encode(`${bbCmd}\n`);
+    // Statically recompiled, when a closure has been built for it.
+    //
+    // busybox is `static-pie` linked, so this demo is the only one that runs
+    // a program with no dynamic linker and no shared libc -- and that makes
+    // it the control the Debian demo cannot be. Everything else is the same:
+    // the same shim, the same fork, the same dispatch and the same exhaustive
+    // recompilation. What differs is `ld.so`, so what the two costs differ by
+    // is `ld.so`.
+    ctx.busy('loading the closure');
+    const { loadClosure } = await import('./closure.js');
+    const wantClosure = new URLSearchParams(location.search).get('closure') !== '0';
+    let closure = null;
+    try {
+      closure = !wantClosure ? null : await loadClosure('/closure/busybox', {
+        image: '/bin/busybox',
+        log: (m) => console.debug(`[gex] ${m}`),
+      });
+    } catch (e) {
+      // A rootfs with no closure built for it is the ordinary case for this
+      // demo and always has been: it runs on the translator alone.
+      console.debug(`[gex] no busybox closure: ${e.message}`);
+    }
     ctx.idle();
     ctx.term.reset();
     ctx.term.writeln(ctx.ansi.dim(`rootfs: ${Object.keys(files).length} files`));
@@ -192,9 +219,10 @@ async function boot(ctx) {
       files,
       dirs: tree.dirs,
       modes: tree.modes,
-      args: ['/bin/sh', '-i'],
+      args: bbCmd ? ['/bin/sh', '/cmd.sh'] : ['/bin/sh', '-i'],
       cwd: '/root',
       tty: true,
+      closure,
     });
     ctx.term.writeln(ctx.ansi.dim(`\r\n[shell exited ${status}]`));
     ctx.status('finished', 'good');

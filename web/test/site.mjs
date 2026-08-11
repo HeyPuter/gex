@@ -193,6 +193,20 @@ const DEMOS = {
       + 'e=$(date +%s%N); echo forks_ms=$(( (e-s)/1000000 )) n=$i; echo forks=done',
     want: /forks_ms=[0-9]+ n=20/,
   },
+  // The control for `ld.so`: the same twenty forks, from a static binary.
+  //
+  // busybox is `static-pie` linked, so a forked `busybox true` runs no
+  // dynamic linker and initialises no shared libc. Everything else matches
+  // `debian-forks` -- same host, same shim, same fork path, same exhaustive
+  // recompilation from a closure. The difference between the two is what
+  // dynamic linking costs, which is the premise #121 rests on and which
+  // nothing has yet measured.
+  'busybox-forks': {
+    demo: 'busybox',
+    cmd:
+      'i=0; while [ $i -lt 20 ]; do busybox true; i=$((i+1)); done; echo bbforks=done',
+    want: /bbforks=done/,
+  },
   // How fast does the browser decompress? The same `dpkg-deb` the native
   // adapter runs in 2.7 seconds, on the same 2.4 MB archive.
   //
