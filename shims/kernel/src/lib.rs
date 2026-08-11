@@ -1189,6 +1189,15 @@ pub extern "C" fn k_pipe_new() -> i32 {
 /// missed an end-of-file; one parked on a pipe that still has a writer is
 /// waiting on that writer. The two look identical from the reader's side and
 /// have nothing in common as bugs.
+/// Short writes and refused writes, `(short << 16) | refused`. See
+/// `Pipe::write_stats`.
+#[no_mangle]
+pub extern "C" fn k_pipe_write_stats(id: i32) -> i32 {
+    let Some(p) = pipe_at(id) else { return -1 };
+    let (short, refused) = p.write_stats();
+    (((short as i32) & 0xffff) << 16) | ((refused as i32) & 0xffff)
+}
+
 #[no_mangle]
 pub extern "C" fn k_pipe_ends(id: i32) -> i32 {
     let Some(p) = pipe_at(id) else { return -1 };

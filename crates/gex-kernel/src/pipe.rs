@@ -22,6 +22,16 @@ struct State {
     buf: VecDeque<u8>,
     readers: usize,
     writers: usize,
+    /// Writes that took less than they were given, and writes that took
+    /// nothing at all.
+    ///
+    /// A short write is correct and ordinary -- the caller carries the rest --
+    /// but a caller that treats it as the whole write loses the tail, and a
+    /// status line lost between apt and its method is a download apt waits
+    /// five minutes for. Counted so the census can say whether that happened
+    /// rather than leaving it to be argued about.
+    short: u64,
+    refused: u64,
 }
 
 /// One pipe, shared by both ends.
@@ -45,6 +55,8 @@ impl Pipe {
                 buf: VecDeque::new(),
                 readers: 1,
                 writers: 1,
+                short: 0,
+                refused: 0,
             }),
             ready: Condvar::new(),
         }
@@ -136,12 +148,19 @@ impl Pipe {
             // the pipe needs that lock. A partial write is what the caller
             // gets, or `EAGAIN` if nothing fitted, and the syscall layer
             // parks a descriptor that should block.
-            return if written > 0 {
-                Ok(written as u64)
-            } else {
-                Err(Errno::EAGAIN)
-            };
+            if written > 0 {
+                s.short += 1;
+                return Ok(written as u64);
+            }
+            s.refused += 1;
+            return Err(Errno::EAGAIN);
         }
+    }
+
+    /// Short writes and refused writes, for the census.
+    pub fn write_stats(&self) -> (u64, u64) {
+        let s = self.state.lock().unwrap();
+        (s.short, s.refused)
     }
 
     /// How many descriptors are open on each end, as `(readers, writers)`.
@@ -273,6 +292,8 @@ pub struct Remote {
     /// How many descriptors hold each end, as `(readers << 16) | writers`.
     /// Negative when the pipe is gone. For the stall census only.
     pub ends: extern "C" fn(id: i32) -> i32,
+    /// Short writes and refused writes, `(short << 16) | refused`.
+    pub write_stats: extern "C" fn(id: i32) -> i32,
     /// Drop a descriptor. The last one on an end is what a reader sees as EOF.
     pub close_end: extern "C" fn(id: i32, write: i32),
     /// Read into, or write out of, an address in the caller's memory.
@@ -386,8 +407,15 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         } else {
             ((e >> 16) & 0xffff, e & 0xffff)
         };
+        let ws = (self.remote.write_stats)(self.id);
+        let (short, refused) = if ws < 0 { (-1i32, -1i32) } else { ((ws >> 16) & 0xffff, ws & 0xffff) };
+        let wrote = if short > 0 || refused > 0 {
+            format!(", {short} short {refused} refused")
+        } else {
+            String::new()
+        };
         format!(
-            "shared pipe {} {}, {} buffered, {r} readers {w} writers",
+            "shared pipe {} {}, {} buffered, {r} readers {w} writers{wrote}",
             self.id,
             if self.write { "write" } else { "read" },
             (self.remote.buffered)(self.id)
