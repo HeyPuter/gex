@@ -850,42 +850,80 @@ pub extern "C" fn k_place_set(key: u64, base: u64, len: u64) {
 /// The first process of a program pays for it and leaves the result here;
 /// every process after it starts from the result.
 ///
-/// Bounded, because a run that execs forty distinct programs would otherwise
-/// keep forty address spaces alive for the sake of the one process each that
-/// might follow.
-const SNAP_BUDGET: usize = 96 * 1024 * 1024;
+/// A fixed arena and a fixed index, with no allocation anywhere on the path.
+/// The first version kept a `BTreeMap<u64, Vec<u8>>` and let the megabyte and
+/// a half come from the kernel's heap, and storing one image from a child
+/// killed the *parent* -- a wasm trap in a Worker that had not called this at
+/// all. Every Worker instantiates this module against one shared memory, so
+/// they share its allocator's state as well as its data, and a heap grown
+/// from two Workers at once is not a heap either of them can trust. Nothing
+/// here allocates: the bytes go at a bump offset in `.bss` and the index is
+/// an array.
+const SNAP_ARENA_BYTES: usize = 48 * 1024 * 1024;
+const SNAP_MAX: usize = 64;
 
-fn snaps() -> &'static Mutex<(BTreeMap<u64, Vec<u8>>, usize)> {
-    note_panics();
-    static SNAPS: OnceLock<Mutex<(BTreeMap<u64, Vec<u8>>, usize)>> = OnceLock::new();
-    SNAPS.get_or_init(|| Mutex::new((BTreeMap::new(), 0)))
+static mut SNAP_ARENA: [u8; SNAP_ARENA_BYTES] = [0; SNAP_ARENA_BYTES];
+
+/// `(key, offset, len)` for each image kept, and how much of the arena is
+/// spent. Zero-keyed entries are free.
+struct Snaps {
+    at: [(u64, u32, u32); SNAP_MAX],
+    used: usize,
+    n: usize,
 }
 
-/// Keep the linked image of `key`. Silently declines when the budget is
-/// spent or the key is already known: the first process to finish linking
-/// wins, and a second one arriving with the same answer has nothing to add.
+fn snaps() -> &'static Mutex<Snaps> {
+    note_panics();
+    static SNAPS: OnceLock<Mutex<Snaps>> = OnceLock::new();
+    SNAPS.get_or_init(|| {
+        Mutex::new(Snaps {
+            at: [(0, 0, 0); SNAP_MAX],
+            used: 0,
+            n: 0,
+        })
+    })
+}
+
+/// Keep the linked image of `key`. Silently declines when the arena is full
+/// or the key is already known: the first process to finish linking wins, and
+/// a second one arriving with the same answer has nothing to add.
 ///
 /// SAFETY: `ptr` names the calling process's memory, not the kernel's, so
 /// the bytes are pulled across rather than read. See `k_mod_store`.
 #[no_mangle]
 pub unsafe extern "C" fn k_snap_store(key: u64, ptr: u32, len: u32) {
     let mut s = snaps().lock().unwrap_or_else(|e| e.into_inner());
-    if len == 0 || s.0.contains_key(&key) || s.1 + len as usize > SNAP_BUDGET {
+    if key == 0 || len == 0 || s.n == SNAP_MAX {
         return;
     }
-    let mut blob = vec![0u8; len as usize];
-    if !unsafe { gex_kmem::pull_checked(blob.as_mut_ptr(), ptr, len) } {
+    if s.at[..s.n].iter().any(|(k, _, _)| *k == key) {
         return;
     }
-    s.1 += len as usize;
-    s.0.insert(key, blob);
+    let at = s.used;
+    let Some(end) = at.checked_add(len as usize) else { return };
+    if end > SNAP_ARENA_BYTES {
+        return;
+    }
+    // SAFETY: the range is inside the arena, and the lock this holds is the
+    // only thing that hands out arena offsets.
+    let dst = unsafe { (&raw mut SNAP_ARENA).cast::<u8>().add(at) };
+    if !unsafe { gex_kmem::pull_checked(dst, ptr, len) } {
+        return;
+    }
+    s.used = end;
+    s.at[s.n] = (key, at as u32, len);
+    s.n += 1;
 }
 
 /// How many bytes the linked image of `key` takes, or zero if there is none.
 #[no_mangle]
 pub extern "C" fn k_snap_len(key: u64) -> u32 {
     let s = snaps().lock().unwrap_or_else(|e| e.into_inner());
-    s.0.get(&key).map(|b| b.len() as u32).unwrap_or(0)
+    s.at[..s.n]
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .map(|(_, _, len)| *len)
+        .unwrap_or(0)
 }
 
 /// Copy the linked image of `key` into the caller's memory. Returns how many
@@ -893,14 +931,19 @@ pub extern "C" fn k_snap_len(key: u64) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn k_snap_get(key: u64, at: u32, cap: u32) -> u32 {
     let s = snaps().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(blob) = s.0.get(&key) else { return 0 };
-    if blob.len() > cap as usize {
+    let Some(&(_, off, len)) = s.at[..s.n].iter().find(|(k, _, _)| *k == key) else {
+        return 0;
+    };
+    if len > cap {
         return 0;
     }
-    if !unsafe { gex_kmem::push_checked(at, blob.as_ptr(), blob.len() as u32) } {
+    // SAFETY: the range was written by `k_snap_store` under this same lock
+    // and nothing ever moves or frees it.
+    let src = unsafe { (&raw const SNAP_ARENA).cast::<u8>().add(off as usize) };
+    if !unsafe { gex_kmem::push_checked(at, src, len) } {
         return 0;
     }
-    blob.len() as u32
+    len
 }
 
 /// Somewhere to stage a guest buffer copied out of a process's memory.

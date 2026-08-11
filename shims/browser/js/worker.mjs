@@ -456,7 +456,8 @@ async function handle(msg) {
     if (msg.checkSp) ex.gex_set_check_sp?.(1);
     // A forked or exec'd child never calls `load`, so the switch that `load`
     // reads never reaches it -- and the child is the process this is for.
-    if (msg.link ?? msg.opts?.link) ex.gex_set_snapshot?.(1);
+    const link = msg.link ?? msg.opts?.link;
+    if (link) ex.gex_set_snapshot?.(Number(link));
     if (msg.debugExit) {
       // Before the guest has executed an instruction: a process's memory is
       // what decides how many of them a browser will hold, so it matters

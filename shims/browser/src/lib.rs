@@ -3982,12 +3982,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         if nr == SNAP_SYSCALL && SNAP_PENDING.0.borrow().1 != 0 {
             let (key, entry) = *SNAP_PENDING.0.borrow();
             *SNAP_PENDING.0.borrow_mut() = (0, 0);
-            if key != 0 {
+            if key != 0 && snapshots_stored() {
                 let blob = snap_take(h, kstate.ctx_addr, entry);
                 // SAFETY: the pointer names this module's memory, which is
                 // what the kernel copies across from, and the slice outlives
                 // the call.
-                unsafe { k_snap_store(key, blob.as_ptr() as u32, blob.len() as u32) };
+                if snapshots_shared() {
+                    let n = blob.len().min(snapshot_share_cap()) as u32;
+                    unsafe { k_snap_store(key, blob.as_ptr() as u32, n) };
+                }
                 link_state(3);
                 trace_line(&format!(
                     "[link] {} linked, {} KiB kept at {}ms\n",
@@ -5387,7 +5390,18 @@ const SNAP_STUB_CODE: [u32; 3] = [0xd28f0028, 0xf2aceca8, 0xd4000001];
 
 /// Whether to keep the linked image of a program and start the next process
 /// of it from the result.
-static SNAPSHOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 0 off, 1 record and restore, 2 catch the linker's last jump and throw the
+/// result away, 3 serialise the address space and then drop it on the floor
+/// without handing it to the global kernel, 4 hand the global kernel the
+/// first four kilobytes of it and no more -- which separates "calling across
+/// into the kernel here is wrong" from "writing a megabyte and a half into
+/// the kernel's memory is wrong".
+///
+/// The middle setting exists to split the mechanism in half. Catching is a
+/// stub page, an auxiliary value and a resume; storing walks the whole
+/// address space and pulls a megabyte and a half into another wasm memory.
+/// When a run that has both goes wrong, one run with 2 says which half.
+static SNAPSHOT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The program being linked in this process, as `(key, real entry)`.
 ///
@@ -5423,7 +5437,7 @@ fn link_state(v: u32) {
 /// kernel gets, since there would be nowhere to keep the answer.
 #[no_mangle]
 pub extern "C" fn gex_set_snapshot(on: u32) {
-    SNAPSHOT.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+    SNAPSHOT.store(on, std::sync::atomic::Ordering::Relaxed);
     if on != 0 {
         link_state(5);
     }
@@ -5436,7 +5450,28 @@ pub extern "C" fn gex_set_snapshot(on: u32) {
 
 fn snapshots_on() -> bool {
     // SAFETY: `k_present` takes no borrow.
-    SNAPSHOT.load(std::sync::atomic::Ordering::Relaxed) && unsafe { k_present() != 0 }
+    SNAPSHOT.load(std::sync::atomic::Ordering::Relaxed) != 0 && unsafe { k_present() != 0 }
+}
+
+/// Whether a caught linked image is worth keeping, or is being thrown away to
+/// find out which half of the mechanism a failure is in.
+fn snapshots_stored() -> bool {
+    matches!(SNAPSHOT.load(std::sync::atomic::Ordering::Relaxed), 1 | 3)
+}
+
+/// Whether the serialised image is handed across to the global kernel, which
+/// is the one step that touches a memory another Worker also uses.
+fn snapshots_shared() -> bool {
+    matches!(SNAPSHOT.load(std::sync::atomic::Ordering::Relaxed), 1 | 4)
+}
+
+/// How much of a serialised image is handed across.
+fn snapshot_share_cap() -> usize {
+    if SNAPSHOT.load(std::sync::atomic::Ordering::Relaxed) == 4 {
+        4096
+    } else {
+        usize::MAX
+    }
 }
 
 /// What identifies a linked address space.
@@ -5569,8 +5604,13 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
                 v.name.clone(),
                 v.code.clone(),
                 // Re-readable only if it has never been writable, which is
-                // the invariant `origin` already carries.
-                v.origin.clone(),
+                // the invariant `origin` carries -- and which is asked for
+                // again here rather than trusted, because the whole image
+                // turns on it: re-reading a page the linker wrote is how a
+                // restored process gets an unrelocated GOT.
+                v.origin
+                    .clone()
+                    .filter(|_| v.prot & gex_kernel::mem::prot::WRITE == 0),
             )
         })
         .collect();

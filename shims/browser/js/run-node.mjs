@@ -278,7 +278,7 @@ const host = new ProcessHost({
     // GEX_LINK keeps the address space the guest's `ld.so` produced and
     // hands it to the next process of the same program, which then starts at
     // its own entry with every relocation already applied.
-    link: !!process.env.GEX_LINK,
+    link: Number(process.env.GEX_LINK || 0),
     trace: !!process.env.GEX_TRACE,
     traceMisses: !!process.env.GEX_TRACE_MISSES,
     // GEX_CHECK_SP puts a stack-pointer check at the top of every block the

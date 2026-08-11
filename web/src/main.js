@@ -280,7 +280,7 @@ for (const [event, describe] of [
   // the next process of the same program from it. Through a global for the
   // same reason as the rest of these -- the page's demos call `runProgram`
   // with their own arguments and there is no seam to pass one through.
-  if (params.get('link') === '1') globalThis.GEX_LINK = 1;
+  if (params.has('link')) globalThis.GEX_LINK = Number(params.get('link'));
   // `?heartbeat=N`: every N syscalls, print the census -- how many of each
   // kind and how long was spent inside them. The one instrument that says
   // whether a process's time is in its syscalls or between them, and it was

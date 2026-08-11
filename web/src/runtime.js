@@ -308,7 +308,7 @@ export async function runProgram(
     // Keep the address space the guest's dynamic linker produced, so the next
     // process of the same program starts at its own entry with every
     // relocation already applied.
-    link = !!globalThis.GEX_LINK,
+    link = Number(globalThis.GEX_LINK ?? 0),
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();

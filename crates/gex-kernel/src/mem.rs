@@ -300,13 +300,31 @@ impl MemoryMap {
         // The offset moves with the start: the caller names the offset of the
         // address it asked for, and rounding down to a page boundary walks
         // backwards into the file by the same amount.
-        let origin = origin.map(|(id, off)| (id, off.saturating_sub(start - aligned)));
+        let code = origin.map(|(id, off)| (id, off.saturating_sub(start - aligned)));
+        // `origin` is for a mapping that has *never* been writable, and
+        // [`Self::protect`] enforces that for one that becomes writable
+        // later. It was not enforced for one that starts that way -- and
+        // `ld.so` maps every library's data segment `PROT_READ|PROT_WRITE`
+        // from the file, so libc's `.data` and its GOT claimed to be
+        // reconstructable by re-reading the very bytes the linker was about
+        // to overwrite.
+        //
+        // Nothing had ever re-read one, so nothing had noticed. Restoring a
+        // linked process did, and the symptom named the cause exactly: `ls`
+        // came up with an unrelocated GOT and branched to `0x27200`, a
+        // link-time offset, with `nothing to translate at pc=0x27200`.
+        //
+        // `code` is a different claim -- where these bytes were loaded from,
+        // whatever happened afterwards -- and survives, because two processes
+        // mapping the same library at the same address are still looking at
+        // the same code.
+        let origin = if prot & prot::WRITE != 0 { None } else { code.clone() };
         self.vmas.push(Vma {
             start: aligned,
             end: page_align_up(end),
             prot,
             name: name.to_string(),
-            code: origin.clone(),
+            code,
             origin,
         });
         self.vmas.sort_by_key(|v| v.start);

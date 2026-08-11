@@ -121,7 +121,7 @@ export async function start() {
   const recompileObjects = params.has('recompile') ? Number(params.get('recompile')) : 8192;
   // `?link=1` keeps the address space the guest's `ld.so` produced and starts
   // the next process of the same program from it, rather than linking again.
-  const link = params.get('link') === '1';
+  const link = Number(params.get('link') ?? 0);
   if (params.get('debug')) globalThis.GEX_DEBUG_EXIT = 1;
   // \`?adopt=N\`: how many traps a forked child takes before it stops waiting
   // to be an execve and takes its parent's modules in bulk. 1 is the old

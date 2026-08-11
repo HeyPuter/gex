@@ -656,7 +656,7 @@ export class Gex {
     if (opts.perMiss) this.#shim.exports.gex_set_per_miss?.(opts.perMiss);
     // Keep what the guest's dynamic linker produces, and start the next
     // process of the same program from it instead of linking again.
-    if (opts.link) this.#shim.exports.gex_set_snapshot?.(1);
+    if (opts.link) this.#shim.exports.gex_set_snapshot?.(Number(opts.link));
     // A terminal changes how libc buffers and whether a shell prints a
     // prompt, so a page with xterm.js in it has to say so.
     if (opts.tty) this.#shim.exports.gex_set_tty(1);
