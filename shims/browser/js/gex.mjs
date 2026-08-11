@@ -296,6 +296,10 @@ export class Gex {
   #publishes = 0;
   #pubGrowMs = 0;
   #pubGrewSlots = 0;
+  #wantMs = 0;
+  #wants = 0;
+  /// Next free slot in each table, for pages this process claims.
+  #claimed = [];
   // The parent's modules, held rather than installed. See `#maybeAdopt`.
   #inherited = [];
   #traps = 0;
@@ -595,6 +599,8 @@ export class Gex {
       pubMs: Math.round(this.#publishMs),
       growMs: Math.round(this.#pubGrowMs),
       grew: this.#pubGrewSlots,
+      wants: this.#wants,
+      wantMs: Math.round(this.#wantMs),
     };
   }
 
@@ -3079,13 +3085,31 @@ export class Gex {
     // Above anything an image can write: images keep the build's numbering
     // and write it at instantiation, which can happen after this claim.
     const floor = e.gex_claim_floor ? e.gex_claim_floor(t) >>> 0 : 0;
-    const base = Math.max(tables[t].length, floor);
-    const delta = base + SLOTS_PER_PAGE - tables[t].length;
-    const stub = tables[0].get(0);
-    const g0 = performance.now();
-    tables[t].grow(delta, stub);
-    this.#pubGrewSlots += delta;
-    this.#pubGrowMs += performance.now() - g0;
+    // The watermark is the only source of a base. Taking `tables[t].length`
+    // again after a geometric grow made every claim see a table longer than
+    // the watermark, double it, and eventually hand out a base past the end
+    // of a table already capped at its maximum -- "table index is out of
+    // bounds", from the image, several claims later.
+    if (this.#claimed[t] === undefined) {
+      this.#claimed[t] = Math.max(tables[t].length, floor);
+    }
+    const base = this.#claimed[t];
+    this.#claimed[t] = base + SLOTS_PER_PAGE;
+    if (this.#claimed[t] > tables[t].length) {
+      // In chunks, not doubling. The watermark advances a page at a time, so
+      // doubling overshoots enormously -- it took 67,584 slots of demand to
+      // 3,732,480 grown, and 190ms to 540ms. A fixed chunk amortises the
+      // reallocation over sixteen pages and wastes at most that much.
+      const per = (e.gex_slots_per_table?.() ?? 0) >>> 0 || Number.MAX_SAFE_INTEGER;
+      const CHUNK = SLOTS_PER_PAGE * 16;
+      const want = Math.min(Math.ceil(this.#claimed[t] / CHUNK) * CHUNK, per);
+      const stub = tables[0].get(0);
+      const delta = want - tables[t].length;
+      const g0 = performance.now();
+      tables[t].grow(delta, stub);
+      this.#pubGrewSlots += delta;
+      this.#pubGrowMs += performance.now() - g0;
+    }
     e.gex_claim_page(BigInt(page >>> 0), base >>> 0);
     return base >>> 0;
   }
@@ -3146,7 +3170,14 @@ export class Gex {
         // The compiled module, fetched now if registration only brought its
         // metadata. A Worker is sent thirty-three metadata blobs at once --
         // a few kilobytes -- and asks for a module when a branch lands in it.
+        // Timed apart from the rest of the slow path. Installing a library
+        // reports 33ms of compile and instantiate, and the slow fill costs a
+        // second, so the difference is this: asking the host for the compiled
+        // module and waiting for it to come back.
+        const w0 = performance.now();
         const mod = lazy.mod ?? (this.#wantLibrary ? await this.#wantLibrary(owner) : null);
+        this.#wants++;
+        this.#wantMs += performance.now() - w0;
         if (mod) {
           lazy.mod = mod;
           // Remembered by index. `fillSlotNow` addresses a library by name
