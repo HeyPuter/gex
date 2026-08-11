@@ -519,6 +519,12 @@ export class ProcessHost {
                   + ` ${m.fill.pub ?? 0} published, ${m.fill.pubMs ?? 0}ms,`
                   + ` grew ${m.fill.grew ?? 0} slots in ${m.fill.growMs ?? 0}ms,`
                   + ` want ${m.fill.wantMs ?? 0}ms inst ${m.fill.instMs ?? 0}ms`
+                  + ` (grow ${m.fill.iGrow ?? 0} comp ${m.fill.iComp ?? 0}`
+                  + ` inst ${m.fill.iInst ?? 0};`
+                  + ` ${m.fill.iGrows ?? 0} grows +${m.fill.iAdded ?? 0}`
+                  + ` copying ${m.fill.iCopied ?? 0}, tables ${m.fill.tlen ?? ''})`
+                  + (m.fill.bigGrows ? `, big [${m.fill.bigGrows}]` : '')
+                  + (m.fill.tn ? `, tn [${m.fill.tn}]` : '')
                   + ` tail ${m.fill.tailMs ?? 0}ms`
                   + (m.fill.strictGrows ? ` retry ${m.fill.strictGrows}x/${m.fill.strictSlots}` : '')
                   + `)`

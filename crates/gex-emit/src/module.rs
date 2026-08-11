@@ -223,6 +223,32 @@ impl PageTable {
         }
     }
 
+    /// Forget how long the tables have to be, keeping the assignment itself.
+    ///
+    /// For a process that numbers its own pages. `from_entries` records two
+    /// things a claiming process must not be charged for: the allocation mark,
+    /// which with a global kernel is not where this table allocates anyway --
+    /// `set_refill` draws every chunk from `k_slot_alloc` -- and the build's
+    /// entry for each page, which is where those pages sit only if somebody
+    /// publishes them there. A claiming process publishes none of them.
+    ///
+    /// Left alone, the mark alone makes every process grow table 0 to the
+    /// whole closure's slot count -- 3,800,064 for the Debian closure, two
+    /// `Table.grow`s and 790ms of an 815ms install -- before the guest runs
+    /// an instruction, for a table that then hands out fifty thousand slots.
+    pub fn forget_mark_high(&self) {
+        for h in self.highs.iter() {
+            h.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        // The entries stay: a page published at the build's base really does
+        // need its table to reach it. Only the mark goes.
+        for e in self.pages.values() {
+            let v = gex_abi::dispatch_entry_table(*e) as u64 * Self::SLOTS_PER_TABLE
+                + gex_abi::dispatch_entry_base(*e) as u64;
+            self.note_virtual(v);
+        }
+    }
+
     /// How long dispatch table `i` has to be for what has been assigned.
     pub fn table_need(&self, i: usize) -> u64 {
         self.highs

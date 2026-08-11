@@ -373,7 +373,11 @@ extern "C" {
 /// chunks from the kernel, which is what lets one process install a module
 /// another one translated: the range it occupies was issued once, to its
 /// translator, and no other process holds it.
-fn shared_page_table(entries: &[(u64, u32)], next_slot: u64) -> gex_xlate::PageTable {
+fn shared_page_table(
+    entries: &[(u64, u32)],
+    next_slot: u64,
+    n_blocks: usize,
+) -> gex_xlate::PageTable {
     let mut table = gex_xlate::PageTable::from_entries(entries, next_slot);
     // Without a global kernel there is one process, and its own counter is
     // already unique.
@@ -386,6 +390,31 @@ fn shared_page_table(entries: &[(u64, u32)], next_slot: u64) -> gex_xlate::PageT
         // SAFETY: as above.
         unsafe { k_slot_alloc(n) }
     }))));
+    // And now that allocation comes from the kernel, forget how long
+    // `from_entries` thought the tables had to be.
+    //
+    // It recorded two things, and with a refill in place neither is this
+    // process's to pay for. The allocation mark is where *the build* stopped
+    // numbering, and this table does not allocate there any more -- every
+    // chunk comes from `k_slot_alloc`. The build's entry for each image page
+    // is where that page sits only if somebody publishes it there, and a
+    // claiming process publishes none of them: it numbers its own.
+    //
+    // Left in, the mark alone made `gex_table_need(0)` report the whole
+    // closure's 3,800,064 slots from the moment a Worker started, so the
+    // first install grew table 0 to hold them -- two `Table.grow`s, 790ms of
+    // an 815ms install, for a process that goes on to use fifty thousand.
+    //
+    // The entries are kept -- a page published at the build's base needs its
+    // table to reach it -- so this is safe whatever the image looks like. The
+    // first attempt gated on `n_blocks > BIG_BLOCKS`, reasoning that a small
+    // image writes absolute slots at instantiation; but the metadata here is
+    // the *seed* module's, which is small, so the gate was never true and the
+    // number never moved. The entries carry that requirement anyway.
+    if claim_pages() {
+        table.forget_mark_high();
+    }
+    let _ = n_blocks;
     table
 }
 
@@ -2804,7 +2833,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             exit: None,
             jit: Jit {
                 described: meta.next_slot != 0,
-                page_table: shared_page_table(&meta.dir_entries, meta.next_slot),
+                page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
                 translated: Default::default(),
                 registry: Vec::new(),
                 shared: Default::default(),
@@ -3316,7 +3345,20 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len
         }
         let mut owner = CLOSURE_OWNER.0.borrow_mut();
         let mut images = IMAGE_PAGES.0.borrow_mut();
-        {
+        // Only a module that writes its slots at instantiation sets the floor.
+        //
+        // The floor exists so a claim cannot land on a slot an image's active
+        // element segment is about to write at the number the build chose. A
+        // demand-filled image writes nothing at instantiation, so it fixes
+        // nothing in place and needs no floor -- and charging one anyway is
+        // what made a warm process grow table 0 to 3,730,432 slots before the
+        // guest ran an instruction. `gexc` numbers slots in one sequence
+        // across all sixty-six objects of the closure, so `bash`'s image
+        // pages sit almost four million in; the table had to be that long to
+        // hold them, and `Table.grow` reallocates and copies, which came to
+        // 790ms of an 815ms install. Per-page claiming already covered every
+        // library. The image was the one thing still numbered by the build.
+        if meta.n_blocks <= gex_abi::BIG_BLOCKS {
             let mut high = IMAGE_HIGH.0.borrow_mut();
             for (page, base) in &meta.dir_entries {
                 if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
@@ -3352,9 +3394,18 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len
         // has to be that long before it is instantiated.
         if meta.n_blocks > gex_abi::BIG_BLOCKS {
             let mut tables = CLOSURE_TABLE.0.borrow_mut();
+            let mut image_tables = IMAGE_TABLE.0.borrow_mut();
             for (page, base) in &meta.dir_entries {
+                let t = gex_abi::dispatch_entry_table(*base) as u32;
                 if page * gex_abi::DISPATCH_PAGE >= gex_abi::INTERP_BASE {
-                    tables.insert(*page, gex_abi::dispatch_entry_table(*base) as u32);
+                    tables.insert(*page, t);
+                } else {
+                    // Keyed by module too. Every root of the closure is an
+                    // image at `PIE_BASE`, so several modules name the same
+                    // page and only one of them is this process's; which one
+                    // is `image_is_ours`, the same question `gex_closure_owner`
+                    // already answers for the fill itself.
+                    image_tables.insert((idx, *page), t);
                 }
             }
             LIB_LAZY.0.borrow_mut().insert(idx as u32);
@@ -3463,13 +3514,19 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
             //
             // Instead the entry stays zero, which is the miss stub, until a
             // branch actually lands in the page. `gex_claim_page` then gives
-            // it a base from this process's own numbering. An image keeps the
-            // old path: its segment is active and writes absolute slots at
-            // instantiation, so its pages are where the build put them.
-            if claim_pages()
-                && page * gex_abi::DISPATCH_PAGE >= gex_abi::INTERP_BASE
-                && meta.n_blocks > gex_abi::BIG_BLOCKS
-            {
+            // it a base from this process's own numbering.
+            //
+            // Images too, and that was the last thing still numbered by the
+            // build. An image only has to sit where the build put it if its
+            // element segments are active, because those write absolute slots
+            // at instantiation -- which is exactly what `n_blocks` decides. A
+            // demand-filled image writes nothing until a fill asks, so its
+            // pages can be claimed like any library's. Excluding them cost
+            // every process two grows of 3.73 million slots: `bash` is object
+            // 34 of 66 in one global numbering, `assign` took the high-water
+            // from the build's entry, and `Table.grow` reallocates and copies
+            // -- 790ms of an 815ms install, unchanged by anything else tried.
+            if claim_pages() && meta.n_blocks > gex_abi::BIG_BLOCKS {
                 continue;
             }
             CLOSURE_DIRS.0.borrow_mut().push((*page, *base));
@@ -3556,6 +3613,20 @@ pub extern "C" fn gex_page_table(page: u64) -> i32 {
     if !claim_pages() {
         return -1;
     }
+    // An image page belongs to whichever root of the closure this process is
+    // actually running, so it is looked up by module and not by page alone.
+    if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+        let owner = gex_closure_owner(page);
+        if owner < 0 {
+            return -1;
+        }
+        return IMAGE_TABLE
+            .0
+            .borrow()
+            .get(&(owner as usize, page))
+            .map(|t| *t as i32)
+            .unwrap_or(-1);
+    }
     CLOSURE_TABLE
         .0
         .borrow()
@@ -3563,6 +3634,13 @@ pub extern "C" fn gex_page_table(page: u64) -> i32 {
         .map(|t| *t as i32)
         .unwrap_or(-1)
 }
+
+/// Which dispatch table `gexc` built each image page for, per image.
+///
+/// Separate from `CLOSURE_TABLE` because image pages collide: every root of
+/// the closure sits at `PIE_BASE` and names the same pages.
+static IMAGE_TABLE: SingleThreaded<std::collections::BTreeMap<(usize, u64), u32>> =
+    SingleThreaded(std::cell::RefCell::new(std::collections::BTreeMap::new()));
 
 /// Give a page a base in this process's numbering and write its entry.
 ///
@@ -5619,7 +5697,7 @@ pub extern "C" fn gex_adopt_child(
             let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
             Jit {
             described: meta.next_slot != 0,
-            page_table: shared_page_table(&meta.dir_entries, meta.next_slot),
+            page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
             translated: Default::default(),
             registry: Vec::new(),
             shared: Default::default(),
@@ -5944,7 +6022,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Slots already handed out are never reused -- a page that comes back
     // through a `fork` checkpoint still points at its own -- so allocation
     // carries on from the high-water mark rather than restarting.
-    h.jit.page_table = shared_page_table(&[], h.jit.page_table.slots());
+    // No entries at all, so the only thing `from_entries` can record is the
+    // mark -- and a claiming process does not allocate there. `usize::MAX`
+    // says "nothing here has active segments to place", which is true of an
+    // empty entry list whatever the new program turns out to be.
+    h.jit.page_table = shared_page_table(&[], h.jit.page_table.slots(), usize::MAX);
     h.jit.translated.clear();
     // Except the closure's. Those modules are still in the dispatch tables --
     // `execve` rebuilds the image in this memory, not the wasm instance

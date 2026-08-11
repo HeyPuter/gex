@@ -264,6 +264,22 @@ export class Gex {
   /// Instantiating is per *module* and is paid every time whatever the bytes
   /// are. Which of them dominates decides whether the answer is a code cache
   /// or fewer, larger modules, and no counter here could tell them apart.
+  /// Grows in the install path: how many, how many slots they added, and
+  /// how many slots `Table.grow` had to copy to do it.
+  #bigGrows = [];
+  /// `gex_table_need(0)` at named moments, so the step that raises it is
+  /// visible rather than guessed at. Three fixes aimed at it have now missed.
+  #tn = [];
+  #tnAt(tag) {
+    const e = this.#shim?.exports;
+    if (!e?.gex_table_need || this.#tn.length > 24) return;
+    const v = e.gex_table_need(0) >>> 0;
+    const last = this.#tn[this.#tn.length - 1];
+    if (!last || !last.endsWith(`:${v}`)) this.#tn.push(`${tag}:${v}`);
+  }
+  #iGrows = 0;
+  #iAdded = 0;
+  #iCopied = 0;
   #compileMs = 0;
   #instantiateMs = 0;
   #growMs = 0;
@@ -609,6 +625,22 @@ export class Gex {
       wants: this.#wants,
       wantMs: Math.round(this.#wantMs),
       instMs: Math.round(this.#instMs),
+      // And what `instMs` is made of. It has been one opaque number for as
+      // long as it has been the largest, and the three things inside it want
+      // completely different fixes: `iGrow` is `Table.grow`, `iComp` is
+      // `WebAssembly.compile` -- which should be zero, because the host
+      // compiles a library once and a `WebAssembly.Module` structured-clones
+      // by reference -- and `iInst` is `new WebAssembly.Instance`, which on a
+      // 62 MiB libc measures 6-17ms outside the browser.
+      iGrow: Math.round(this.#growMs),
+      iComp: Math.round(this.#compileMs),
+      iInst: Math.round(this.#instantiateMs),
+      iGrows: this.#iGrows,
+      iAdded: this.#iAdded,
+      iCopied: this.#iCopied,
+      bigGrows: this.#bigGrows.slice(0, 6).join(' | '),
+      tn: this.#tn.join(' '),
+      tlen: this.#shim ? this.#dispatchTables().map((t) => t.length).join('/') : '',
       tailMs: Math.round(this.#tailMs),
       strictGrows: this.#strictGrows,
       strictSlots: this.#strictSlots,
@@ -980,6 +1012,7 @@ export class Gex {
       { gex: this.#imports },
     );
     this.#guestInstantiateMs = performance.now() - tGuest;
+    this.#tnAt('boot');
     this.#offerToFill(this.#guest);
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: instantiated, installing');
     await this.#installClosure();
@@ -1018,7 +1051,7 @@ export class Gex {
       await this.#installModule(m.mod, truly);
       return;
     }
-    this.#growTables(Math.max(need, truly));
+    this.#growTables(Math.max(need, truly), 'adopt');
     this.#lazyInherited.push({ mod: m.mod, need: truly, inst: null, meta: m.meta });
   }
 
@@ -1070,7 +1103,7 @@ export class Gex {
     // `fillSlot` builds the instance when a branch actually wants one of
     // these pages. Everything downstream already tolerates the wait: a page
     // nobody can fill yet is forgiven and asked again.
-    this.#growTables(need);
+    this.#growTables(need, 'closure');
     this.#lazyClosure.push({ mod, need, inst: null });
     this.#streamed++;
     return true;
@@ -1783,7 +1816,7 @@ export class Gex {
       for (const m of child.modules ?? []) need = Math.max(need, m.need);
       need = Math.max(need, (child.slots ?? 0) >>> 0);
     }
-    if (need) this.#growTables(need);
+    if (need) this.#growTables(need, 'a1806');
     // Kept, not dropped: a child that turns out to be staying wants them
     // after all, and by then its parent's Worker may be gone. See
     // `#maybeAdopt`.
@@ -2335,7 +2368,7 @@ export class Gex {
         // 317ms of growing into 1741ms and swallowed the compile it saved.
         if (e.gex_jit_pending_len() >>> 0) {
           const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
-          if (need) this.#growTables(need);
+          if (need) this.#growTables(need, 'a2358');
         }
         while (e.gex_jit_pending_len() >>> 0) await this.#installTranslation();
         // The parent's modules go in *after* this Worker's own queue, never
@@ -2678,7 +2711,8 @@ export class Gex {
    * without filling safe, and it is why the stub is what a grown table is
    * filled with rather than null.
    */
-  #growTables(need) {
+  #growTables(need, who = '?') {
+    this.#tnAt(`grow-${who}`);
     const e = this.#shim.exports;
     const tables = this.#dispatchTables();
     // The shim allocates in one slot space that spans every table, so the
@@ -2745,6 +2779,23 @@ export class Gex {
       // is up to twice the table in address space, which is eight bytes a
       // slot of a `WebAssembly.Table` that is mostly the miss stub.
       const want = Math.min(Math.max(need_i, tables[i].length * 2), per);
+      // Every grow, with what asked for it. `Table.grow` reallocates and
+      // copies the whole table, so its cost is the table's *length*, not the
+      // slots added -- 52,224 slots took 193ms, which is 270k slots a second
+      // against the 5M a second a grow of a small table manages. That only
+      // makes sense if what is being paid for is the copy, and if so the
+      // doubling below is charging a warm process for the whole history.
+      this.#iGrows++;
+      this.#iAdded += want - tables[i].length;
+      this.#iCopied += want;
+      // Who asked for a big one. A Worker's `console` does not reach the
+      // page, so this is tallied and shipped with the fill stats instead.
+      if (want - tables[i].length > 100000) {
+        this.#bigGrows.push(
+          `${who}:t${i}:${tables[i].length}->${want}:need${need}`
+            + `:ni${need_i}:tn${e.gex_table_need ? e.gex_table_need(i) >>> 0 : -1}`,
+        );
+      }
       try {
         tables[i].grow(want - tables[i].length, stub);
       } catch (err) {
@@ -2838,7 +2889,7 @@ export class Gex {
     const t0 = performance.now();
     const e = this.#shim.exports;
     const tg = performance.now();
-    const tables = this.#growTables(need);
+    const tables = this.#growTables(need, 'install');
     this.#growMs += performance.now() - tg;
     // The shim allocates in one slot space that spans every table, so the
     // figure it reports is a running total and each table's share is that
@@ -2851,6 +2902,7 @@ export class Gex {
     // as "Argument 0 must be convertible to a valid number" and says nothing
     // about where it came from. A shim from before this export existed has
     // one table, so any number too large to reach is the right answer.
+    this.#tnAt('pre-inst');
     const tc = performance.now();
     const mod = bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
     this.#compileMs += performance.now() - tc;
@@ -3051,6 +3103,7 @@ export class Gex {
    * enters.
    */
   #publish(lazy, i) {
+    this.#tnAt('pre-pub');
     const e = this.#shim.exports;
     if (!lazy.meta || !lazy.meta.length || !e.gex_publish_closure_module) return;
     const t0 = performance.now();
