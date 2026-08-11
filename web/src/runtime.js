@@ -23,11 +23,31 @@ const KERNEL_URL = '/gex/gex_kernel.plain.wasm';
 let shimBytes = null;
 let seedBytes = null;
 
+/// Four bytes that say a response is a wasm module and not a web page.
+///
+/// A dev server that cannot find a file answers with `index.html` and status
+/// *200*, so `res.ok` proves nothing. Handing that to `WebAssembly.compile`
+/// reports a magic-word error against the module, which sends the reader
+/// looking at the build rather than at the request -- and the build is fine.
+function checkWasm(url, res, bytes) {
+  if (!url.endsWith('.wasm')) return bytes;
+  const m = bytes.subarray(0, 4);
+  if (m[0] === 0x00 && m[1] === 0x61 && m[2] === 0x73 && m[3] === 0x6d) return bytes;
+  const head = [...m].map((b) => b.toString(16).padStart(2, '0')).join(' ');
+  throw new Error(
+    `${url} is not a wasm module: ${bytes.length} bytes of `
+    + `${res.headers.get('content-type') || 'unknown type'} beginning ${head}`
+    + (head === '3c 21 64 6f' ? ' -- that is an HTML page, so the server did not find it' : ''),
+  );
+}
+
 async function fetchBytes(url, onProgress) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
   const total = Number(res.headers.get('content-length')) || 0;
-  if (!onProgress || !res.body) return new Uint8Array(await res.arrayBuffer());
+  if (!onProgress || !res.body) {
+    return checkWasm(url, res, new Uint8Array(await res.arrayBuffer()));
+  }
   const reader = res.body.getReader();
   const chunks = [];
   let got = 0;
@@ -44,7 +64,7 @@ async function fetchBytes(url, onProgress) {
     out.set(c, at);
     at += c.length;
   }
-  return out;
+  return checkWasm(url, res, out);
 }
 
 /** The two wasm modules every demo needs, fetched once for the page's life. */

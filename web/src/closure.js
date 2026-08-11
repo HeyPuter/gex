@@ -60,7 +60,22 @@ export async function loadClosure(base, { image = false, log = () => {} } = {}) 
     const done = await Promise.all(
       batch.map(async (n) => {
         const t0 = performance.now();
-        const bytes = await fetchBytes(`${base}/${encodeURIComponent(n)}`);
+        // `encodeURI`, not `encodeURIComponent`.
+        //
+        // A module is named after its soname, and `libstdc++.so.6` has two
+        // characters that are perfectly legal in a URL path and that
+        // `encodeURIComponent` escapes anyway. Vite's dev server does not
+        // decode `%2B` back, so the request missed and its SPA fallback
+        // answered `index.html` -- with status *200*, which is why the `ok`
+        // check above let it through and `WebAssembly.compile` reported
+        // "expected magic word 00 61 73 6d, found 3c 21 64 6f". Those four
+        // bytes are `<!do`.
+        //
+        // Invisible to every test here, because `web/test/site.mjs` serves
+        // through its own static server and that one calls
+        // `decodeURIComponent`. The demo anyone actually opens is the dev
+        // server, and it was the only thing that broke.
+        const bytes = await fetchBytes(`${base}/${encodeURI(n)}`);
         const fetched = performance.now();
         // Compiled once here and structured-cloned to every Worker. A
         // `WebAssembly.Module` clones as itself and the engine shares the
@@ -102,7 +117,7 @@ export async function loadClosure(base, { image = false, log = () => {} } = {}) 
     if (manifest.program && want !== manifest.program) {
       log(`closure: image module is ${manifest.program}, not ${want} -- running without it`);
     } else {
-      img = await fetchBytes(`${base}/${encodeURIComponent(manifest.image)}`);
+      img = await fetchBytes(`${base}/${encodeURI(manifest.image)}`);
     }
   }
   // `images` maps a library file to the program whose image it is. The
