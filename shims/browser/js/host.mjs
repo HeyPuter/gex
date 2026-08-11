@@ -455,7 +455,13 @@ export class ProcessHost {
             : 0;
           this.#asked.delete(pid);
           console.log(
-            `[gex] pid ${pid}: lived ${lived}ms, ${m.millis}ms translating ${m.blocks} blocks` +
+            // `guest` is the time inside `gex.run`, which is the guest
+            // actually executing plus every trap out of it. `lived` minus
+            // `guest` is Worker creation, adoption and the wait for a start
+            // message -- and the two have to be separable, because twice now
+            // a cost has been attributed to the wrong side of that line.
+            `[gex] pid ${pid}: lived ${lived}ms (guest ${m.guestMillis ?? -1}ms)` +
+              `, ${m.millis}ms translating ${m.blocks} blocks` +
               (m.byObject ? ` [${m.byObject}]` : '') +
               (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
             ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +

@@ -177,7 +177,15 @@ export function metadataSection(wasm) {
     if (id === 0) {
       const nameLen = leb();
       const name = new TextDecoder().decode(wasm.subarray(i, i + nameLen));
-      if (name === 'gex.meta') return wasm.subarray(i + nameLen, end);
+      // A copy, not a view.
+      //
+      // `subarray` shares the module's `ArrayBuffer`, and `postMessage`
+      // clones a typed array by cloning the buffer *behind* it -- so sending
+      // a closure's metadata to a Worker sent all 49 compiled modules with
+      // it, 231 MB, once per process. It measured as 432ms and 856ms in a
+      // line that claims to send "49 closure modules" and was supposed to be
+      // sending fifty kilobytes of page tables.
+      if (name === 'gex.meta') return wasm.slice(i + nameLen, end);
     }
     i = end;
   }
@@ -2043,7 +2051,8 @@ export class Gex {
           // be askable again once another module arrives, and a page nobody
           // will ever hold must stop trapping. The shim cannot tell those
           // apart on its own.
-          e.gex_fill_done((await this.fillSlot(want >>> 0)) ? 1 : 0);
+          const quick = this.fillSlotNow(want >>> 0);
+          e.gex_fill_done((quick ?? (await this.fillSlot(want >>> 0))) ? 1 : 0);
         }
         // One grow for the whole queue, before any of it is installed.
         //
@@ -2438,7 +2447,7 @@ export class Gex {
     const t0 = performance.now();
     this.#installs++;
     try {
-      await this.#installModuleInner(bytes, need, segments);
+      return await this.#installModuleInner(bytes, need, segments);
     } finally {
       this.#installMs += performance.now() - t0;
     }
@@ -2589,6 +2598,10 @@ export class Gex {
       if (packed < 0) continue;
       tables[packed >>> 24].set(packed & 0xffffff, inst.exports[name]);
     }
+    // The instance, so the caller can remember which library it belongs to.
+    // With an image per program, "which module may answer for this page" has
+    // an answer and the fill path needs it by name rather than by search.
+    return inst;
   }
 
   /**
@@ -2647,6 +2660,55 @@ export class Gex {
    * Newest first, because a process that has just installed a module is
    * usually about to branch into it.
    */
+  /**
+   * Fill a page without waiting, or answer `null` if that is impossible.
+   *
+   * The common case by a wide margin: the page belongs to a library this
+   * process has already built, and writing its slots is a call into wasm.
+   * The `await` it replaces was not free -- it yields the Worker's event loop
+   * with the guest stopped, and a warm `ls` asks 129 times, which was 1.8 of
+   * its 2.0 seconds. Removing every block of translation from that run did
+   * not move it; this is what the time was.
+   *
+   * Below `INTERP_BASE` the owner is consulted and nobody else, ever. Every
+   * image in a closure sits at `PIE_BASE` and `gexfillat` matches on the
+   * guest page, so a scan there hands `ls` whichever image answers first --
+   * `bash`'s, in practice. Above it, page numbers are unique to an object and
+   * a scan is safe: that is where runtime units and inherited modules live.
+   */
+  fillSlotNow(page) {
+    const e = this.#shim.exports;
+    const owner = e.gex_closure_owner ? e.gex_closure_owner(BigInt(page)) : -1;
+    if (owner >= 0) {
+      const lazy = this.#lazyClosure[owner];
+      if (!lazy) return null;
+      // Publishing is synchronous -- a directory write and a table grow --
+      // so it belongs on this side of the fence.
+      if (!lazy.published) {
+        lazy.published = true;
+        this.#publish(lazy, owner);
+      }
+      if (!lazy.instObj) return null;
+      // A module below the block gate has *active* segments and no fill
+      // helper: instantiating it wrote its slots, so there is nothing to ask
+      // for and the page is already answered.
+      if (typeof lazy.instObj.exports[FILL_AT] !== 'function') return true;
+      if (lazy.instObj.exports[FILL_AT](page)) {
+        this.#filled++;
+        return true;
+      }
+      return null;
+    }
+    if (page * 4096 < 0x0300_0000) return null;
+    for (const inst of this.#unfilled) {
+      if (inst.exports[FILL_AT](page)) {
+        this.#filled++;
+        return true;
+      }
+    }
+    return null;
+  }
+
   async fillSlot(slot) {
     // The library that covers this page, instantiated now if it has not been.
     //
@@ -2670,7 +2732,10 @@ export class Gex {
         const mod = lazy.mod ?? (this.#wantLibrary ? await this.#wantLibrary(owner) : null);
         if (mod) {
           lazy.mod = mod;
-          await this.#installModule(mod, lazy.need);
+          // Remembered by index. `fillSlotNow` addresses a library by name
+          // rather than searching, which is what makes the page below
+          // `INTERP_BASE` answerable by its own image and no other.
+          lazy.instObj = await this.#installModule(mod, lazy.need);
         } else {
           // Nothing to install; let the miss fall through and be lifted
           // rather than wedging on a library that never arrives.
@@ -2695,10 +2760,20 @@ export class Gex {
         return true;
       }
     }
-    for (const inst of this.#unfilled) {
-      if (inst.exports[FILL_AT](slot)) {
-        this.#filled++;
-        return true;
+    // The owner first, and below `INTERP_BASE` the owner only: those pages
+    // belong to every image at once and only one of them is ours.
+    const mine = owner >= 0 ? this.#lazyClosure[owner]?.instObj : null;
+    if (mine && typeof mine.exports[FILL_AT] !== 'function') return true;
+    if (mine && mine.exports[FILL_AT](slot)) {
+      this.#filled++;
+      return true;
+    }
+    if (slot * 4096 >= 0x0300_0000) {
+      for (const inst of this.#unfilled) {
+        if (inst.exports[FILL_AT](slot)) {
+          this.#filled++;
+          return true;
+        }
       }
     }
     // A request nobody can answer is the interesting one, and there should be
