@@ -4322,7 +4322,10 @@ fn park_until_ready() {
         // counter still reads this.
         let seq = unsafe { k_wake_seq() };
         let now = now_ns();
-        if with_host(|h| h.threads.iter().any(|t| thread_ready(t, now))) {
+        if with_host(|h| {
+            let sig = any_signal(h);
+            h.threads.iter().any(|t| thread_ready(t, now, sig))
+        }) {
             return;
         }
         if now >= give_up {
@@ -7144,8 +7147,9 @@ fn now_ns() -> u64 {
 ///
 /// What the scheduler decided.
 enum Pick {
-    /// Run this thread, having timed out or not.
-    Thread(usize, bool),
+    /// Run this thread: which one, whether its deadline passed, and whether
+    /// what woke it was a signal rather than the thing it was waiting for.
+    Thread(usize, bool, bool),
     /// Nothing in this process can run yet.
     Idle,
     /// This process has finished.
@@ -7159,7 +7163,32 @@ enum Pick {
 /// it consults -- handles, sockets, futexes, the clock -- is reference-counted
 /// and lives outside guest memory, so the answer does not depend on whose
 /// image is currently in it.
-fn thread_ready(t: &Thread, now: u64) -> bool {
+/// Whether anything is pending for this process, from either side.
+///
+/// `procs` is the shared table another process writes into; `signals` is what
+/// this process raised for itself -- a timer, a fault, `raise`.
+fn any_signal(h: &Host) -> bool {
+    h.kernel.procs.has_signals(h.kernel.pid) || h.kernel.signals.has_pending()
+}
+
+fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
+    // A signal ends a wait -- every interruptible one, which here is all of
+    // them but a thread that has exited or is running in another Worker.
+    //
+    // Nothing did this, and it is the whole of why `^C` reached the
+    // foreground group and nothing happened. A guest in `nanosleep` parks as
+    // `Waiting::Sleep(deadline)` and becomes runnable when the deadline
+    // passes and at no other moment, so a SIGINT sat in the process table for
+    // thirty seconds and was collected by a process that was about to exit
+    // anyway. The same for a read on a pipe, a `wait4` on a child, a poll:
+    // this host could interrupt none of them.
+    //
+    // Becoming runnable is all that is needed. The picked thread finishes its
+    // parked call, and the code that follows already asks `deliver_pending`,
+    // which either builds the handler's frame or ends the process.
+    if signalled && !matches!(t.waiting, Waiting::Exited | Waiting::Elsewhere) {
+        return true;
+    }
     match &t.waiting {
         Waiting::Runnable => true,
         Waiting::Futex { parked, deadline } => {
@@ -7404,14 +7433,18 @@ fn schedule() -> i32 {
             // -- a thread came back from a futex, took the main thread's
             // context because it happened to be runnable, and the pc that
             // came out was two half-words of two different threads.
+            let sig = any_signal(h);
             if thread_workers() {
                 let i = cur();
-                return if thread_ready(&h.threads[i], now) {
+                return if thread_ready(&h.threads[i], now, sig) {
                     let timed_out = match &h.threads[i].waiting {
                         Waiting::Futex { parked, .. } => !parked.woken(),
                         _ => false,
                     };
-                    Pick::Thread(i, timed_out)
+                    // Woken by the signal and not by the wait: ask the same
+                    // question with the signal taken away.
+                    let by_signal = sig && !thread_ready(&h.threads[i], now, false);
+                    Pick::Thread(i, timed_out, by_signal)
                 } else if matches!(h.threads[i].waiting, Waiting::Exited) {
                     // This Worker's thread is done. The process is not: the
                     // others are Workers of their own, and whoever joins this
@@ -7426,12 +7459,13 @@ fn schedule() -> i32 {
             let n = h.threads.len();
             for step in 1..=n {
                 let i = (cur() + step) % n;
-                if thread_ready(&h.threads[i], now) {
+                if thread_ready(&h.threads[i], now, sig) {
                     let timed_out = match &h.threads[i].waiting {
                         Waiting::Futex { parked, .. } => !parked.woken(),
                         _ => false,
                     };
-                    return Pick::Thread(i, timed_out);
+                    let by_signal = sig && !thread_ready(&h.threads[i], now, false);
+                    return Pick::Thread(i, timed_out, by_signal);
                 }
             }
             // Nothing in this process can run. Another process might, and
@@ -7452,7 +7486,7 @@ fn schedule() -> i32 {
         if matches!(pick, Pick::Over) {
             return 2;
         }
-        let Pick::Thread(i, timed_out) = pick else {
+        let Pick::Thread(i, timed_out, by_signal) = pick else {
             // A thread waiting for input is not stuck: the page will deliver
             // some. Give the stack back to JS so it can, and come back here
             // when it has.
@@ -7689,7 +7723,7 @@ fn schedule() -> i32 {
                 // whichever thread it thinks is running.
                 let mut gm = GuestMem::new(guest_bytes());
                 h.kernel.enter_thread(&kstate);
-                let r = finish_parked(&op, timed_out, &mut gm);
+                let r = finish_parked(&op, timed_out, by_signal, &mut gm);
                 // A parked call's answer never reaches the syscall ring: the
                 // ring is written when the call is made, and a call that
                 // blocks has not produced one yet. An error here is therefore
@@ -7789,8 +7823,22 @@ fn schedule() -> i32 {
 fn finish_parked(
     op: &gex_kernel::BlockOp,
     timed_out: bool,
+    by_signal: bool,
     gm: &mut GuestMem<'_>,
 ) -> Result<u64, Errno> {
+    // A wait that a *signal* ended did not get what it was waiting for, and
+    // saying otherwise is worse than saying nothing: a blocking read finished
+    // this way re-attempts the read, finds the pipe still empty and hands the
+    // guest `EAGAIN` on a descriptor that is not non-blocking. `EINTR` is
+    // what Linux returns and what every caller already has a branch for.
+    //
+    // It matters most for the signals that change nothing. `SIGCHLD` is
+    // ignored by default and is sent on every child exit, so without this
+    // every shell waiting on a pipe would be woken by its own children and
+    // told something untrue about the pipe.
+    if by_signal {
+        return Err(Errno::EINTR);
+    }
     match op {
         gex_kernel::BlockOp::FutexWait { deadline, .. } if timed_out => {
             // Loud, because glibc treats this as fatal when it did not ask

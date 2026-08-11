@@ -50,8 +50,25 @@ RUSTFLAGS="-C link-arg=--import-memory \
 # has a plain memory; a memory import's `shared` flag is part of its type, so
 # which one this module declares is not a runtime choice. The host picks the
 # file that matches the processes it is running.
-node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.wasm env process "" 1
-node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.plain.wasm env process "" 0
+# One page as the declared minimum for the *process* memory, not the guest's
+# 1280.
+#
+# A memory import's minimum is a requirement on whoever supplies it, and this
+# module has no such requirement: it never assumes a size, it asks with
+# `memory.size 1` and refuses an address past the end (`gex_kmem::in_process`).
+# Declaring the guest's initial size therefore constrained hosts that are not
+# guests -- and the page is one. It instantiates this module too, so that a
+# keystroke reaches the line discipline and the process table by a call rather
+# than by a message to a Worker; it has no address space of its own and offers
+# a page of scratch. `memory import has 1 pages which is smaller than the
+# declared initial of 1280` was the whole of why the shared terminal never
+# opened, and the page fell back to editing lines itself -- which looks almost
+# right, because the only thing the fallback cannot do is `^C`.
+#
+# A Worker still hands over the guest's memory, which is far larger than one
+# page and satisfies the minimum as it always did.
+node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.wasm env process 1 1
+node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.plain.wasm env process 1 0
 
 # And the site, which is a copy of public/ and will otherwise keep serving
 # the module that was here a moment ago.

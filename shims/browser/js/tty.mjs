@@ -47,20 +47,33 @@ export class PageTty {
     const mod = spec.module instanceof WebAssembly.Module
       ? spec.module
       : await WebAssembly.compile(spec.module);
-    const scratch = new WebAssembly.Memory({ initial: 1 });
+    // One page, and a maximum, because a memory import's limits are part of
+    // its *type*: a memory with no maximum does not satisfy an import that
+    // declares one, however small the memory is. 65535 is what
+    // `tools/add-memory.mjs` writes for the process import -- the whole of a
+    // wasm32 address space.
+    const scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535 });
     let inst;
     try {
       inst = await WebAssembly.instantiate(mod, {
         env: { memory: spec.memory, process: scratch },
       });
-    } catch {
+    } catch (e) {
       // A module that will not take a plain process memory is the shared
       // build, which is not what a page loads. Nothing here is worth failing
-      // a boot for.
+      // a boot for -- but silence is worse: with no terminal the page falls
+      // back to its own line editing, which looks *almost* right. Backspace
+      // works, `stty` works, and only `^C` is quietly gone, because that is
+      // the one thing the fallback cannot do. So say so.
+      console.warn(`[gex] no shared terminal: ${e.message}`);
       return null;
     }
     const k = inst.exports;
-    if (typeof k.k_tty_input !== 'function') return null;
+    if (typeof k.k_tty_input !== 'function') {
+      console.warn('[gex] no shared terminal: the global kernel has no k_tty_input, '
+        + 'so it is older than this glue. Rebuild it with shims/kernel/build.sh.');
+      return null;
+    }
     // A stack of this instance's own, before anything is called.
     //
     // Every instance of this module gets its own `__stack_pointer` global,

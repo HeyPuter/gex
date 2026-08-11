@@ -415,6 +415,15 @@ export async function runProgram(
   // its own line editing -- see its constructor.
   const sharedTty = tty ? await PageTty.open(kernel) : null;
   const tenv = new TerminalEnv(term, sharedTty);
+  // The terminal, reachable from a console or a test.
+  //
+  // The same affordance as `window.gexTerminalText`, and for the same reason:
+  // when `^C` does nothing there are three places it can have been lost --
+  // the discipline did not raise it, the foreground group is wrong, or the
+  // target never collected it -- and `gexTty.fg()` separates the second from
+  // the other two in one line. Null when there is no shared terminal, which
+  // is itself the first thing worth knowing.
+  globalThis.gexTty = sharedTty;
   // Before pid 1 runs, so the first `TIOCGWINSZ` is the truth. A shell asks
   // once at startup and then only on `SIGWINCH`, so a wrong answer here is
   // one that lasts.

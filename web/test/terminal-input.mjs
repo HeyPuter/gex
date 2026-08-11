@@ -213,9 +213,14 @@ try {
   // `^C` at a prompt: the terminal shows it, the half-typed line is thrown
   // away rather than delivered with whatever is typed next, and the shell is
   // still there.
+  //
+  // Against the *slice*, not the whole buffer. `stty -a` printed `intr = ^C`
+  // a few commands ago, so a wait for `^C` anywhere in the terminal returns
+  // instantly and the check that follows reads a buffer the echo has not
+  // reached yet.
   let mark2 = term.out.length;
   term.type('this-is-abandoned\x03');
-  await waitFor(term, /\^C/, 'the interrupt echo', 10);
+  for (let i = 0; i < 200 && !/\^C/.test(term.out.slice(mark2)); i += 1) await pause(50);
   check(/\^C/.test(term.out.slice(mark2)), 'the terminal shows ^C');
   term.type('echo still-here\r');
   await waitFor(term, /still-here/, 'the shell after ^C');
@@ -241,7 +246,7 @@ try {
   let back = 0;
   for (let i = 0; i < 300; i += 1) {
     if (/[#$] $/.test(term.out.slice(mark2))) { back = Date.now() - sentAt; break; }
-    await sleep(50);
+    await pause(50);
   }
   check(back > 0 && back < 10_000,
     `^C interrupts a running command (prompt back after ${back || '>15000'}ms)`);
