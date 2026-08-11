@@ -288,7 +288,7 @@ export async function runProgram(
     // says nothing about *what* is slow, and this is the only instrument that
     // works in a page: the shim prints the guest pc, and which module that
     // address lands in is the answer.
-    heartbeat = 0,
+    heartbeat = globalThis.GEX_HEARTBEAT ?? 0,
     // KiB of mapped text per object to statically recompile once it proves
     // hot; 0 turns it off and leaves the guest to arrive one dispatch miss at
     // a time. A parameter because it is the one guest-visible setting on which

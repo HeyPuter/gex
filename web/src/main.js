@@ -276,6 +276,11 @@ for (const [event, describe] of [
   // without turning it off.
   if (params.has('recompile')) globalThis.GEX_RECOMPILE_OBJECTS = Number(params.get('recompile'));
   if (params.has('permiss')) globalThis.GEX_PER_MISS = Number(params.get('permiss'));
+  // `?heartbeat=N`: every N syscalls, print the census -- how many of each
+  // kind and how long was spent inside them. The one instrument that says
+  // whether a process's time is in its syscalls or between them, and it was
+  // reachable only by editing the page.
+  if (params.has('heartbeat')) globalThis.GEX_HEARTBEAT = Number(params.get('heartbeat'));
   if (params.get('debug')) {
     globalThis.GEX_DEBUG_EXIT = 1;
     globalThis.GEX_TRAP_STACK = 1;
