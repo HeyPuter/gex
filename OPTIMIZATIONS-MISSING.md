@@ -2684,3 +2684,22 @@ crash. The next thing to check is whether dpkg loads an object the closure
 does *not* cover into an address the closure pinned for something else --
 `pin MISPLACED` would say so and does not appear, but a library placed by the
 bump allocator over a pinned range would not be a pin at all.
+
+### A thirty-second repro for the apt crash
+
+apt forks `dpkg` before it touches the network, so the proxy is not needed and
+`debian-cmd` will do:
+
+    GEX_STDERR=all GEX_WALL=110 \
+      GEX_QUERY='cmd=apt-get%20update%3B%20echo%20GEX-CMD-DONE&debug=1&recompile=0' \
+      node web/test/site.mjs debian-cmd
+
+It reproduces every symptom in about thirty seconds against seven minutes for
+the networked run, and it shows more than the networked one did: two children
+crash, not one, and some processes end `code 134, in syscall 131` -- a guest
+calling `abort` -- rather than abandoning the stack.
+
+Worth writing down as a method, not just a command. Every question asked of
+this failure so far has cost a full `apt-get update`, and most of them did not
+need the network, the mirror, or the download. The expensive part of the run
+was not the part under investigation.
