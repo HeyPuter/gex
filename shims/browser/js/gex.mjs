@@ -196,6 +196,95 @@ export class Env {
  * that one file is enough to run a program. Walking the section headers is
  * cheap -- each is a byte and a length -- and stops at the first match.
  */
+/**
+ * What each dispatch table must be long enough to hold, for this module.
+ *
+ * `Metadata` records one running total -- `next_slot` -- and a total cannot
+ * say "table 0 wants 200,000 and table 4 wants 2,048". Read strictly it means
+ * every table below the top is full, which is 10,000,000 entries each; read
+ * loosely, only the top table, which is wrong for a module with segments in
+ * two. The entries say exactly, and they are right here: each is a `(page,
+ * base)` and the base carries its table in the top eight bits.
+ *
+ * Returns a sparse array of lengths, indexed by table.
+ */
+export function metaTableNeeds(meta) {
+  if (!meta || meta.byteLength < 48) return [];
+  const dv = new DataView(meta.buffer, meta.byteOffset, meta.byteLength);
+  const count = Number(dv.getBigUint64(40, true));
+  const needs = [];
+  let at = 48;
+  for (let i = 0; i < count && at + 12 <= meta.byteLength; i++, at += 12) {
+    const base = dv.getUint32(at + 8, true);
+    const t = base >>> 24;
+    const end = (base & 0x00ffffff) + SLOTS_PER_PAGE;
+    if (!(needs[t] >= end)) needs[t] = end;
+  }
+  return needs;
+}
+
+/**
+ * What each dispatch table must hold, read from the module's own element
+ * segments -- the only authority there is.
+ *
+ * `Metadata` cannot answer this. Its `dir_entries` list the pages a module was
+ * the *first* to claim, so a runtime unit that writes slots for pages some
+ * earlier unit assigned carries an empty list: 48 bytes, header and nothing
+ * else. Its `next_slot` is one running total, which cannot distinguish "table
+ * 4 wants 2,048" from "tables 0 to 3 are full". An active element segment
+ * says the table it writes and the offset it writes at, exactly, and that is
+ * what instantiation is about to do.
+ *
+ * Returns a sparse array of lengths, indexed by table. Passive segments write
+ * nothing at instantiation and are skipped.
+ */
+export function elementTableNeeds(wasm) {
+  if (!(wasm instanceof Uint8Array) || wasm.length < 8) return [];
+  const dv = new DataView(wasm.buffer, wasm.byteOffset, wasm.byteLength);
+  let i = 8;
+  const leb = () => {
+    let n = 0, shift = 0, b;
+    do { b = dv.getUint8(i++); n |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+    return n >>> 0;
+  };
+  const needs = [];
+  try {
+    while (i < wasm.length) {
+      const id = dv.getUint8(i++);
+      const size = leb();
+      const end = i + size;
+      if (id !== 9) { i = end; continue; }
+      const count = leb();
+      for (let seg = 0; seg < count; seg++) {
+        const flags = leb();
+        let table = 0;
+        if (flags === 2 || flags === 6) table = leb();
+        let off = -1;
+        if ((flags & 3) === 0 || flags === 2 || flags === 6) {
+          // The offset expression. Only a constant is understood; anything
+          // else leaves this segment out rather than guessing at it.
+          if (dv.getUint8(i) === 0x41) { i++; off = leb(); }
+          while (dv.getUint8(i) !== 0x0b) i++;
+          i++;
+        }
+        if (flags === 1 || flags === 2 || flags === 3) leb();
+        else if (flags >= 5) leb();
+        const n = leb();
+        for (let k = 0; k < n; k++) {
+          if (flags & 4) { while (dv.getUint8(i) !== 0x0b) i++; i++; } else leb();
+        }
+        // Passive and declared segments write nothing now.
+        const active = flags === 0 || flags === 2 || flags === 4 || flags === 6;
+        if (active && off >= 0 && !(needs[table] >= off + n)) needs[table] = off + n;
+      }
+      i = end;
+    }
+  } catch {
+    return needs;
+  }
+  return needs;
+}
+
 export function metadataSection(wasm) {
   const dv = new DataView(wasm.buffer, wasm.byteOffset, wasm.byteLength);
   let i = 8;
@@ -1040,7 +1129,7 @@ export class Gex {
     // `slotsNeeded`: a closure library arrives here claiming zero.
     const truly = Math.max(m.need >>> 0, slotsNeeded(m.meta));
     if (!m.meta || !m.meta.length || !e.gex_add_lazy_module) {
-      await this.#installModule(m.mod, truly);
+      await this.#installModule(m.mod, truly, 64, m.meta, 'adopt-nometa');
       return;
     }
     const gp = e.gex_alloc(m.meta.length) >>> 0;
@@ -1048,7 +1137,7 @@ export class Gex {
     const need = e.gex_add_lazy_module(gp, m.meta.length) >>> 0;
     e.gex_free?.(gp, m.meta.length);
     if (!need) {
-      await this.#installModule(m.mod, truly);
+      await this.#installModule(m.mod, truly, 64, m.meta, 'adopt-noneed');
       return;
     }
     this.#growTables(Math.max(need, truly), 'adopt');
@@ -2019,7 +2108,7 @@ export class Gex {
       if (!len) continue;
       // Copied out before compiling: the registry is in the guest's memory,
       // and another thread allocating can move it.
-      await this.#installModule(this.#bytes().slice(ptr, ptr + len), need);
+      await this.#installModule(this.#bytes().slice(ptr, ptr + len), need, 64, null, 'jit2049');
     }
   }
 
@@ -2848,7 +2937,7 @@ export class Gex {
     const e = this.#shim.exports;
     const ptr = e.gex_jit_pending_ptr() >>> 0;
     const len = e.gex_jit_pending_len() >>> 0;
-    await this.#installModule(this.#bytes().slice(ptr, ptr + len), e.gex_jit_slots() >>> 0);
+    await this.#installModule(this.#bytes().slice(ptr, ptr + len), e.gex_jit_slots() >>> 0, 64, null, 'jit2878');
     e.gex_jit_installed();
     // This Worker translated it, so it is already the newest one installed
     // here; the registry entry `gex_jit_installed` just added is the same
@@ -2865,11 +2954,11 @@ export class Gex {
    * installed modules differently from the thread that made them would
    * dispatch to different code.
    */
-  async #installModule(bytes, need, segments = 64) {
+  async #installModule(bytes, need, segments = 64, meta = null, who = '?') {
     const t0 = performance.now();
     this.#installs++;
     try {
-      return await this.#installModuleInner(bytes, need, segments);
+      return await this.#installModuleInner(bytes, need, segments, meta, who);
     } finally {
       this.#installMs += performance.now() - t0;
     }
@@ -2885,7 +2974,7 @@ export class Gex {
    * installs upward of two thousand shared modules. Compiling and
    * instantiating those is work no existing counter could see.
    */
-  async #installModuleInner(bytes, need, segments = 64) {
+  async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?') {
     const t0 = performance.now();
     const e = this.#shim.exports;
     const tg = performance.now();
@@ -2926,6 +3015,28 @@ export class Gex {
     // engine's message says only "table index is out of bounds", which reads
     // like a guest dispatch and is not one, so the numbers that distinguish
     // them are attached here.
+    // Exactly what this module's own entries need, where they are known.
+    //
+    // This is what the loose-versus-strict guess below was standing in for.
+    // A module inherited from a parent has active segments at absolute slots,
+    // and `need` alone cannot say which tables they fall in: the loose reading
+    // grows only the table the total lands in, so a module with segments in
+    // two of them fails to instantiate and takes the strict path, which grows
+    // tables 0 to 3 to ten million entries each. Measured, once per forked
+    // child: `retry 1x/39735296`, and five to seven seconds of `instantiate`.
+    // Where it was not handed in, a module carries it. The runtime translator
+    // installs from bytes -- `RETRY:jit2878:need39998464:meta-1:+39735296`,
+    // once per forked child, five and a half seconds of it -- and those bytes
+    // have the `gex.meta` section in them. Reading it turns "the total lands
+    // in table 4, so grow tables 0 to 3 to ten million each" into "table 4
+    // needs 2,048 slots".
+    const own = meta ?? (bytes instanceof Uint8Array ? metadataSection(bytes) : null);
+    // The segments first, where the bytes are here: they say what
+    // instantiation will really write. `Metadata` is the fallback for a module
+    // that arrived already compiled.
+    const seg = elementTableNeeds(bytes);
+    const needs = seg.length ? seg : own ? metaTableNeeds(own) : [];
+    for (let t = 0; t < needs.length; t++) if (needs[t]) this.#reach(t, needs[t]);
     let inst;
     const ti = performance.now();
     try {
@@ -2974,6 +3085,7 @@ export class Gex {
         this.#instantiateMs += performance.now() - ti;
         this.#strictGrows++;
         this.#strictSlots += grew;
+        this.#bigGrows.push(`RETRY:${who}:need${need}:own${own ? own.length : -1}:needs[${needs.join(',')}]:+${grew}`);
       } catch (err) {
         throw new Error(
           `installing a module of ${need} slots failed: ${err.message}. ` +
@@ -3332,7 +3444,22 @@ export class Gex {
           // time, and `gex_table_need` reports what those came to.
           const claimed = this.#shim.exports.gex_lib_lazy?.(owner >>> 0);
           const i0 = performance.now();
-          lazy.instObj = await this.#installModule(mod, claimed ? 0 : lazy.need);
+          lazy.instObj = await this.#installModule(
+            mod,
+            claimed ? 0 : lazy.need,
+            64,
+            // No metadata for a claimed module, and this is the whole point of
+            // claiming. A closure object's `dir_entries` carry the bases the
+            // *build* chose -- up to 3,634,176 in table 0 -- and a claiming
+            // process does not put its pages there; it numbers its own and
+            // fills at them. Handing those entries to `metaTableNeeds` asks
+            // for a table long enough for a layout nobody is using: measured,
+            // it grew 2,717,696 slots in 839ms and put every table back to
+            // 3.2 million. Only a module that really does write absolute slots
+            // at instantiation -- an inherited runtime unit -- wants this.
+            claimed ? null : lazy.meta,
+            'closure',
+          );
           this.#instMs += performance.now() - i0;
         } else {
           // Nothing to install; let the miss fall through and be lifted
@@ -3363,7 +3490,7 @@ export class Gex {
       const lazy = this.#lazyInherited[heir];
       if (lazy && !lazy.inst) {
         lazy.inst = true;
-        await this.#installModule(lazy.mod, lazy.need);
+        await this.#installModule(lazy.mod, lazy.need, 64, lazy.meta, 'inherit');
         return true;
       }
     }
