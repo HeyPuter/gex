@@ -3079,6 +3079,7 @@ export class Gex {
     const have = e.gex_page_base(page >>> 0) >>> 0;
     if (have !== 0) return have;
     if (!e.gex_claim_page) return -1;
+    // `gex_page_table` answers -1 when claiming is off, and the caller skips.
     // Unclaimed: give it a base at the end of its table.
     //
     // The end, because everything below it is already spoken for -- the

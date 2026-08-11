@@ -154,6 +154,25 @@ const DEMOS = {
       + 'echo deb=done',
     want: /gzip=0[\s\S]*xz=0[\s\S]*big=0[\s\S]*real=0/,
   },
+  // The same command twice, which is not the same as once.
+  //
+  // A second `ls` reuses what the first translated: modules reach a process
+  // from the global kernel with slot numbers the *earlier* process chose. A
+  // dispatch change can therefore be perfectly correct for one run of a
+  // program and wrong for the next, and every other Debian case here runs
+  // each command once.
+  //
+  // It exists because per-page slot claiming passed everything else and then
+  // died here: "installing a module of 39998464 slots failed ... tables are
+  // [3784704, 0, 0, 0, 1024, 0, 0, 0]", on the second `ls` and never the
+  // first, reported by a person using the shell rather than by any test.
+  'debian-twice': {
+    demo: 'debian',
+    cmd:
+      'ls / > /dev/null; echo one=$?; ls / > /dev/null; echo two=$?; '
+      + 'ls /usr > /dev/null; echo three=$?; echo twice=done',
+    want: /one=0[\s\S]*two=0[\s\S]*three=0/,
+  },
   // What does a process cost when it does nothing?
   //
   // Twenty runs of `cat /dev/null`, which reads no bytes and writes none, so

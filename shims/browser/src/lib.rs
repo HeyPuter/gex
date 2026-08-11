@@ -3466,7 +3466,8 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
             // it a base from this process's own numbering. An image keeps the
             // old path: its segment is active and writes absolute slots at
             // instantiation, so its pages are where the build put them.
-            if page * gex_abi::DISPATCH_PAGE >= gex_abi::INTERP_BASE
+            if claim_pages()
+                && page * gex_abi::DISPATCH_PAGE >= gex_abi::INTERP_BASE
                 && meta.n_blocks > gex_abi::BIG_BLOCKS
             {
                 continue;
@@ -3503,6 +3504,32 @@ pub extern "C" fn gex_claim_floor(i: u32) -> u32 {
     IMAGE_HIGH.0.borrow().get(i as usize).copied().unwrap_or(0)
 }
 
+/// Whether pages are numbered by this process or by the build.
+///
+/// Off by default. See `gex_set_claim_pages`.
+static CLAIM_PAGES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn per-process page numbering on.
+///
+/// It exists because the build numbers dispatch slots in one sequence across
+/// the whole closure, so a process that branches into a late-numbered library
+/// grows its table to that length whatever it uses -- 2.7 million slots for
+/// `cat /dev/null`, about a second of `Table.grow`. Claiming a page at a time
+/// takes that to 52,224.
+///
+/// It is off because it is not finished: a module reused from an earlier
+/// process carries slot numbers from *that* process's numbering, and nothing
+/// reconciles the two. The second `ls` in a shell dies instantiating one.
+#[no_mangle]
+pub extern "C" fn gex_set_claim_pages(on: i32) {
+    CLAIM_PAGES.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn claim_pages() -> bool {
+    CLAIM_PAGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Libraries whose slots are claimed a page at a time.
 ///
 /// The big ones, which `gexc` gives passive element segments and a fill
@@ -3526,6 +3553,9 @@ static CLOSURE_TABLE: SingleThreaded<std::collections::BTreeMap<u64, u32>> =
 /// closure library's.
 #[no_mangle]
 pub extern "C" fn gex_page_table(page: u64) -> i32 {
+    if !claim_pages() {
+        return -1;
+    }
     CLOSURE_TABLE
         .0
         .borrow()
