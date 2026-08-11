@@ -171,6 +171,32 @@ const DEMOS = {
       + 'wc -c < /bin/bash; wc -c < /var/tmp/b; echo io=done',
     want: /same=0/,
   },
+  // Wisp throughput, in seconds rather than the six minutes an `apt-get
+  // update` takes.
+  //
+  // The same fetch under the Node host, over real TCP, runs at about
+  // 3.8 MB/s; the browser fetches 14.9 MB at 41.7 kB/s. Same kernel, same
+  // socket syscalls, same run loop -- so the transport is the difference and
+  // this is the smallest thing that exercises it.
+  //
+  // bash speaks `/dev/tcp` itself, so no downloader is needed in the rootfs.
+  // A literal address because the guest's resolver does not answer bash
+  // (`Temporary failure in name resolution`), which is its own gap; removing
+  // DNS from a throughput measurement is right regardless.
+  //
+  // This could not run at all until `load` learned to set the network flag:
+  // pid 1 is loaded, not adopted, and only the adopt path set it, so bash
+  // got `Address family not supported by protocol` while apt's forked
+  // methods downloaded happily.
+  'debian-net': {
+    demo: 'debian',
+    cmd:
+      's=$SECONDS; exec 3<>/dev/tcp/151.101.2.132/80; '
+      + 'printf "GET /debian/dists/bookworm/main/binary-arm64/Packages.gz '
+      + 'HTTP/1.0\\r\\nHost: deb.debian.org\\r\\n\\r\\n" >&3; '
+      + 'n=$(cat <&3 | wc -c); echo bytes=$n secs=$((SECONDS-s)); echo net=done',
+    want: /bytes=[0-9]{6,}/,
+  },
   gears: { want: /exit 0 in \d+ ms/, settle: 'finished' },
   // The guest's own evidence, not the page's. "graphics rootfs -- N files"
   // and a status of `running` were both true of a demo that unpacked the
