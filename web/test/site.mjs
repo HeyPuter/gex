@@ -89,21 +89,54 @@ const DEMOS = {
   // chmods it and renames it into place, and the mode used to stay behind.
   'debian-fs': {
     demo: 'debian',
-    query:
-      'cmd=d=$(mktemp -d); ln -s /bin/dash $d/l; test -x $d/l && echo LINK""OK; '
-      + 'cp /bin/dash $d/n; chmod 755 $d/n; mv $d/n $d/m; test -x $d/m && echo MODE""OK; '
-      + 'echo FS""DONE',
-    // The markers are written split so that the page's own echo of the
-    // command cannot match them. A `want` a command line can satisfy is a
-    // test that passes with no guest at all, which this file has been
-    // caught by twice.
-    want: /LINKOK[\s\S]*MODEOK/,
+    cmd:
+      'd=$(mktemp -d); ln -s /bin/dash $d/l; test -x $d/l; echo link=$?; '
+      + 'cp /bin/dash $d/n; chmod 755 $d/n; mv $d/n $d/m; test -x $d/m; echo mode=$?; '
+      + 'echo fs=done',
+    // `link=0`, not `LINK-OK`: the page echoes the command it was given, so
+    // a marker that appears in the command line is a test that passes with
+    // no guest at all. `echo link=$?` cannot contain `link=0`.
+    want: /link=0[\s\S]*mode=0/,
   },
   'debian-apt': {
     // The page has no such demo: this is the Debian one, run differently.
     demo: 'debian',
     want: /Fetched .* in |Reading package lists\.\.\. Done/,
     fail: /Temporary failure|Could not resolve|Failed to fetch/,
+  },
+  // dpkg-deb's own read path, on an archive it built seconds earlier, with
+  // no network and no apt.
+  //
+  //     tar: This does not look like a tar archive
+  //     dpkg-deb: error: tar subprocess returned error exit status 2
+  //
+  // is where `apt-get install` stops, and that message is what tar prints
+  // when it is handed *nothing* -- `: | tar tf -` says exactly this and
+  // exits 2. So the bytes are not corrupt, they are absent.
+  //
+  // `--control` forks twice with a pipe between: one child decompresses
+  // into the write end, the other dup2s the read end onto stdin and execs
+  // tar. The decompressing child inherits the archive's descriptor at the
+  // offset its parent left it after reading the `ar` header. Reading
+  // through a symlink, a 133 KB shell pipeline and `tar tf` of a local
+  // archive all pass, so what is left is that fork, that pipe and that
+  // offset.
+  'debian-deb': {
+    demo: 'debian',
+    cmd:
+      // One round trip per compressor. A `.deb` from the archive is xz;
+      // `dpkg-deb -b` defaults to zstd on Debian 12, so a round trip that
+      // does not say which one is measuring the wrong decompressor -- and
+      // zstd has a known hang of its own (#113), which would look like this
+      // failing rather than that one.
+      'mkdir -p /tmp/p/DEBIAN; printf "Package: t\\nVersion: 1\\n'
+      + 'Architecture: all\\nMaintainer: x\\nDescription: t\\n" > /tmp/p/DEBIAN/control; '
+      + 'for z in gzip xz zstd; do '
+      + 'dpkg-deb -Z$z -b /tmp/p /tmp/t-$z.deb > /dev/null; echo build-$z=$?; '
+      + 'dpkg-deb --info /tmp/t-$z.deb > /dev/null; echo info-$z=$?; '
+      + 'done; '
+      + 'echo deb=done',
+    want: /info-gzip=0[\s\S]*info-xz=0/,
   },
   gears: { want: /exit 0 in \d+ ms/, settle: 'finished' },
   // The guest's own evidence, not the page's. "graphics rootfs -- N files"
@@ -335,10 +368,16 @@ for (const id of list) {
   // `GEX_QUERY=gears_size=100x100` reaches the demo. An experiment that only
   // changes one thing about a run should not need a code change to run.
   const extra = process.env.GEX_QUERY ? `&${process.env.GEX_QUERY}` : '';
-  // A demo may carry its own query, for a check that is about the runtime
+  // A demo may carry its own command, for a check that is about the runtime
   // rather than about the page: `debian-fs` is the Debian rootfs told to run
   // one shell line. `GEX_QUERY` still wins, because it comes after.
-  const own = DEMOS[id].query ? `&${DEMOS[id].query}` : '';
+  //
+  // Encoded, not pasted. A query is split on `&`, so a command containing
+  // `&&` or `2>&1` reaches the page cut in half -- three separate runs were
+  // spent on that, each one looking like the guest failing rather than the
+  // harness truncating the question. `GEX_QUERY` is still raw, because it
+  // carries several parameters at once and only a person writes it.
+  const own = DEMOS[id].cmd ? `&cmd=${encodeURIComponent(DEMOS[id].cmd)}` : '';
   const url = `http://127.0.0.1:${port}/?demo=${DEMOS[id].demo ?? id}&run=1${own}${extra}`;
   // The command the page was told to run, decoded the way the page decodes
   // it, so the echo of it can be told apart from what the guest says. See

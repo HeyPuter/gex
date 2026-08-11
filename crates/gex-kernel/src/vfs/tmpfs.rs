@@ -399,8 +399,23 @@ impl FileSystem for TmpFs {
 
     fn rmdir(&self, path: &str) -> Result<(), Errno> {
         let mut inner = self.inner.lock().unwrap();
-        if !matches!(inner.nodes.get(path), Some(Node::Dir)) {
-            return Err(Errno::ENOTDIR);
+        // A name that is not there is `ENOENT`; a name that is there and is
+        // not a directory is `ENOTDIR`. Answering `ENOTDIR` to both is what
+        // Linux does not do, and dpkg reads the difference: making sure a
+        // path is absent, it calls `rmdir`, takes `ENOTDIR` to mean "it is a
+        // file", unlinks, gets `ENOENT` -- and that value survives to a
+        // check that fires on anything but `ENOTEMPTY`:
+        //
+        //     unable to securely remove '/var/lib/dpkg/tmp.ci':
+        //       No such file or directory
+        //
+        // which ends every `apt-get install` at the unpack. The directory
+        // dpkg is removing had never been created, which is the ordinary
+        // case and the one it handles.
+        match inner.nodes.get(path) {
+            Some(Node::Dir) => {}
+            Some(_) => return Err(Errno::ENOTDIR),
+            None => return Err(Errno::ENOENT),
         }
         let prefix = format!("{path}/");
         if inner.nodes.keys().any(|k| k.starts_with(&prefix)) {
@@ -541,6 +556,28 @@ mod tests {
         assert!(names.contains(&"b".to_string()));
         assert!(names.contains(&"top.txt".to_string()));
         assert!(!names.contains(&"deep.txt".to_string()));
+    }
+
+    #[test]
+    fn rmdir_tells_a_missing_name_from_one_that_is_not_a_directory() {
+        // dpkg reads the difference. Making sure `/var/lib/dpkg/tmp.ci` is
+        // absent it calls `rmdir`, and `ENOTDIR` sends it down the "it is a
+        // file" path, where the `ENOENT` from the unlink becomes fatal.
+        let fs = TmpFs::new();
+        fs.add_file("f", b"x".to_vec());
+        assert_eq!(fs.rmdir("nothing-here").err(), Some(Errno::ENOENT));
+        assert_eq!(fs.rmdir("f").err(), Some(Errno::ENOTDIR));
+    }
+
+    #[test]
+    fn a_renamed_file_keeps_its_mode() {
+        // What dpkg does with every program it installs: unpack to
+        // `.dpkg-new`, chmod, rename into place.
+        let fs = TmpFs::new();
+        fs.add_file("p.dpkg-new", b"ELF".to_vec());
+        fs.chmod("p.dpkg-new", 0o755).unwrap();
+        fs.rename("p.dpkg-new", "p").unwrap();
+        assert_eq!(fs.metadata("p").unwrap().mode, 0o755);
     }
 
     #[test]
