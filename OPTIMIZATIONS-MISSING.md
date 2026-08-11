@@ -2637,3 +2637,27 @@ What the run is waiting on, in its own words:
 method has exited 100 -- which is what apt's methods return when they fail.
 So two defects remain and they are separate: `dpkg`'s fault inside `openat`,
 which is now survivable, and a method that gives up.
+
+### The fault follows the process, not the syscall
+
+`/var/lib/dpkg/arch` does not exist in the demo rootfs. Creating it first --
+`touch /var/lib/dpkg/arch; apt-get update` -- does not stop dpkg faulting, but
+it *moves* the fault:
+
+    ABANDONED, code 0, pc=0x0, in syscall 56   (openat)   without the file
+    ABANDONED, code 0, pc=0x0, in syscall 57   (close)    with it
+
+Same process, same last path, different syscall. So the syscall is not the
+cause: dpkg is dying at whichever call it happens to be in. That rules out the
+`openat` handler as a site and points at the process itself.
+
+It is not the adopted image either. The per-region survey says `1 of 88
+regions differ` for every one of apt's children, and the one that differs is
+`0..300000`, the shim's own low memory, which is expected and documented. The
+copy is faithful.
+
+Two things did improve. With the file present apt reaches ten processes rather
+than three, and the run keeps going after dpkg dies -- so the missing file is
+worth putting in the rootfs on its own merits, quite apart from the fault.
+What is left in that run is methods ending oddly: `exited, code 100`, `code
+111`, and `code 130` at `pselect6`.
