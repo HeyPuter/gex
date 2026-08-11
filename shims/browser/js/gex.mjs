@@ -100,6 +100,36 @@ function sum32(buf) {
 }
 
 /** Everything the host has to supply that wasm cannot do for itself. */
+
+/**
+ * How far into the slot space a module's element segments reach, read from
+ * its own `gex.meta`.
+ *
+ * The number a caller passes as `need` cannot be trusted, because for a
+ * closure library it is deliberately zero: registration reserves nothing and
+ * `#publish` grows the tables when a branch first wants one of its pages.
+ * That is fine for the library itself and wrong for everyone who inherits
+ * it. A forked child adopts its parent's modules with the parent's `need`,
+ * so a closure library reaches `#adoptModule` claiming zero slots, nothing
+ * grows, and instantiating it writes past the end of the table:
+ *
+ *   installing a module of 0 slots failed: table index is out of bounds.
+ *   tables are [1133568, 0, 0, 0, 283648, 0, 0, 0]
+ *
+ * 1,133,568 is exactly `libapt-pkg`'s `next_slot`, so the tables had grown
+ * for the libraries that were published and stopped there. apt-key forks,
+ * the child adopts, and the run ends.
+ *
+ * The metadata is beside the module in every one of these paths and says the
+ * truth: magic, text base, table slots, then `next_slot` at offset 24.
+ */
+function slotsNeeded(meta) {
+  if (!meta || meta.length < 32) return 0;
+  const v = new DataView(meta.buffer, meta.byteOffset, meta.byteLength);
+  return Number(v.getBigUint64(24, true));
+}
+
+
 export class Env {
   /** Called with the bytes of a guest write to fd 1 or 2. */
   write(fd, bytes) {
@@ -835,8 +865,11 @@ export class Gex {
    */
   async #adoptModule(m) {
     const e = this.#shim.exports;
+    // What this module actually reaches, whatever the caller said. See
+    // `slotsNeeded`: a closure library arrives here claiming zero.
+    const truly = Math.max(m.need >>> 0, slotsNeeded(m.meta));
     if (!m.meta || !m.meta.length || !e.gex_add_lazy_module) {
-      await this.#installModule(m.mod, m.need);
+      await this.#installModule(m.mod, truly);
       return;
     }
     const gp = e.gex_alloc(m.meta.length) >>> 0;
@@ -844,11 +877,11 @@ export class Gex {
     const need = e.gex_add_lazy_module(gp, m.meta.length) >>> 0;
     e.gex_free?.(gp, m.meta.length);
     if (!need) {
-      await this.#installModule(m.mod, m.need);
+      await this.#installModule(m.mod, truly);
       return;
     }
-    this.#growTables(need);
-    this.#lazyInherited.push({ mod: m.mod, need: m.need, inst: null, meta: m.meta });
+    this.#growTables(Math.max(need, truly));
+    this.#lazyInherited.push({ mod: m.mod, need: truly, inst: null, meta: m.meta });
   }
 
   /**
@@ -982,7 +1015,15 @@ export class Gex {
       // the closure and 1378ms without.
       most = Math.max(most, need);
       this.#lazyClosure.push({
-        mod: paired ? entry.mod : wasm, need, inst: null, meta, published: false,
+        mod: paired ? entry.mod : wasm,
+        // From the metadata, not from `need`, which registration returns as
+        // zero on purpose. `#publish` grows the tables when a page of this
+        // library is first wanted, and every other route to instantiating it
+        // has to grow for itself.
+        need: Math.max(need, slotsNeeded(meta)),
+        inst: null,
+        meta,
+        published: false,
       });
     }
     // Nothing is grown here any more.
@@ -2410,8 +2451,31 @@ export class Gex {
     // the whole virtual slot space cannot express "table 0 wants 400,000 and
     // table 4 wants 2,048" -- read as a total that is table 4's base plus
     // 2,048, and the clamp below grows tables 0..3 to ten million each.
+    // Which table the highest slot this module writes falls in, and how far
+    // into it. Slot indices are global and the mapping is arithmetic --
+    // table `slot / per`, offset `slot % per` -- so a slot in table 4 does
+    // not require tables 0 to 3 to be full. Only the table it lands in has
+    // to be long enough.
+    const top = need > 0 ? need - 1 : -1;
+    const topTable = top >= 0 ? Math.floor(top / per) : -1;
+    const topWants = top >= 0 ? (top % per) + 1 : 0;
+    // The shim's per-table high-water, *and* what the module about to be
+    // instantiated reaches. Neither alone is enough.
+    //
+    // `gex_table_need` counts only the slots this shim allocated in this
+    // process. A closure library's slots were allocated by `gexc` at build
+    // time and a forked child's by its parent, so a module handed in from
+    // JavaScript is invisible to it: table 4 reads 0 while the module's
+    // element segments write at 39,998,464, and instantiating answers
+    // "table index is out of bounds" with
+    // `tables are [2886656, 0, 0, 0, 0, 0, 0, 0]`. That is `apt-key`'s
+    // child, and it ends the run.
+    //
+    // The old fallback is not the answer either: read as a running total,
+    // 39,998,464 asks for tables 0 to 3 at ten million entries each, which
+    // is 320 MB of table for a module that wants 1,024 slots in table 4.
     const need_of = e.gex_table_need
-      ? (i) => e.gex_table_need(i) >>> 0
+      ? (i) => Math.max(e.gex_table_need(i) >>> 0, i === topTable ? topWants : 0)
       : (i) => Math.min(Math.max(need - i * per, 0), per);
     // Table 0's slot 0 is the miss stub, and it is what an unfilled slot in
     // any table must hold: a branch to an address nothing has translated has
