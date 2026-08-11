@@ -4457,10 +4457,28 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // itself.
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
                 warn_line(&format!(
-                    "[gex] pid {} killed by signal {} at pc={at:#x}\n  last calls:{}\n  \
-                     address space:{}\n  futexes:{}",
+                    "[gex] pid {} killed by signal {} at pc={at:#x}\n  threads:{}\n  \
+                     last calls:{}\n  address space:{}\n  futexes:{}",
                     h.kernel.pid,
                     signal,
+                    // Every thread, not only the one that died. Two threads
+                    // sharing a register context would clobber each other and
+                    // everything downstream of that looks like corruption
+                    // somewhere else entirely -- which is the shape #126 has.
+                    // Cheap to rule in or out, and never recorded before.
+                    h.threads
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| {
+                            format!(
+                                " t{i}(tid={} ctx={:#x} pc={:#x} {})",
+                                t.kstate.tid,
+                                t.kstate.ctx_addr,
+                                t.pc,
+                                waiting_name(&t.waiting),
+                            )
+                        })
+                        .collect::<String>(),
                     sys_recent(),
                     mem_recent(),
                     ftx_recent(),

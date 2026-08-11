@@ -154,6 +154,26 @@ const DEMOS = {
       + 'echo deb=done',
     want: /gzip=0[\s\S]*xz=0[\s\S]*big=0[\s\S]*real=0/,
   },
+  // What does a process cost when it does nothing?
+  //
+  // Twenty runs of `cat /dev/null`, which reads no bytes and writes none, so
+  // everything the clock sees is this runtime starting a process: a Worker,
+  // a shim instance, and the guest modules installed into dispatch tables
+  // that belong to that instance and start empty.
+  //
+  // This is the shape of the remaining cost in `apt-get update`. #115 has
+  // `apt-key` forking about forty processes, and the per-process figures in
+  // a run range from 89ms to 917ms of install alone. A benchmark that is
+  // only process creation says what that is made of, without a guest doing
+  // real work on top of it.
+  'debian-forks': {
+    demo: 'debian',
+    cmd:
+      's=$(date +%s%N); i=0; '
+      + 'while [ $i -lt 20 ]; do cat /dev/null; i=$((i+1)); done; '
+      + 'e=$(date +%s%N); echo forks_ms=$(( (e-s)/1000000 )) n=$i; echo forks=done',
+    want: /forks_ms=[0-9]+ n=20/,
+  },
   // How fast does the browser decompress? The same `dpkg-deb` the native
   // adapter runs in 2.7 seconds, on the same 2.4 MB archive.
   //

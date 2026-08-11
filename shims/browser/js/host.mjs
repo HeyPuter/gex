@@ -515,6 +515,8 @@ export class ProcessHost {
                 : '') +
               (m.fill && (m.fill.filled || m.fill.unanswered)
                 ? `, fill ${m.fill.filled} answered ${m.fill.unanswered} not`
+                  + ` (${m.fill.slow ?? 0} slow, ${m.fill.slowMs ?? 0}ms;`
+                  + ` ${m.fill.pub ?? 0} published, ${m.fill.pubMs ?? 0}ms)`
                 : '') +
               (m.reuse
                 ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]}` +

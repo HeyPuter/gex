@@ -286,6 +286,10 @@ export class Gex {
   // Fill requests answered, and requests nobody could answer.
   #filled = 0;
   #unanswered = 0;
+  #slowFills = 0;
+  #slowMs = 0;
+  #publishMs = 0;
+  #publishes = 0;
   // The parent's modules, held rather than installed. See `#maybeAdopt`.
   #inherited = [];
   #traps = 0;
@@ -567,7 +571,24 @@ export class Gex {
   get installCount() { return this.#installs; }
 
   /** Fill requests answered, and requests nobody could answer. */
-  get fillStats() { return { filled: this.#filled, unanswered: this.#unanswered }; }
+  get fillStats() {
+    return {
+      filled: this.#filled,
+      unanswered: this.#unanswered,
+      // How many misses could not be answered on this side of the fence, and
+      // what that cost. `fillSlotNow` is a directory write and a table grow;
+      // `fillSlot` is an `await`, and an await inside a Worker is a turn of
+      // its event loop however little work is behind it.
+      //
+      // Worth separating because a trivial process -- `cat /dev/null`, one
+      // block translated, thirty milliseconds of install, twenty of syscalls
+      // -- takes 1.5 seconds, and none of the other counters accounts for it.
+      slow: this.#slowFills,
+      slowMs: Math.round(this.#slowMs),
+      pub: this.#publishes,
+      pubMs: Math.round(this.#publishMs),
+    };
+  }
 
   /**
    * Read a file back out of the guest's filesystem, or null if it is not
@@ -2271,7 +2292,14 @@ export class Gex {
           // will ever hold must stop trapping. The shim cannot tell those
           // apart on its own.
           const quick = this.fillSlotNow(want >>> 0);
-          e.gex_fill_done((quick ?? (await this.fillSlot(want >>> 0))) ? 1 : 0);
+          let answer = quick;
+          if (answer === null || answer === undefined) {
+            const t0 = performance.now();
+            answer = await this.fillSlot(want >>> 0);
+            this.#slowFills++;
+            this.#slowMs += performance.now() - t0;
+          }
+          e.gex_fill_done(answer ? 1 : 0);
         }
         // One grow for the whole queue, before any of it is installed.
         //
@@ -2961,6 +2989,13 @@ export class Gex {
     e.gex_publish_closure_module(gp, lazy.meta.length, i);
     e.gex_free?.(gp, lazy.meta.length);
     this.#growTables(lazy.need);
+    // Always counted, not only under a debug flag. Publishing is where a
+    // library's dispatch pages reach this process's table, and that table
+    // is 2.7 million slots -- #125 measured growing one at 300-500ms. A
+    // `cat /dev/null` publishes ten libraries and takes 1.5 seconds that
+    // no other counter accounts for.
+    this.#publishes++;
+    this.#publishMs += performance.now() - t0;
     if (globalThis.GEX_DEBUG_EXIT) {
       console.error(
         `[closure] library ${i} published in ${Math.round(performance.now() - t0)}ms`,
