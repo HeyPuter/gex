@@ -50,6 +50,9 @@ class Stream {
  * `wispUrl` is the proxy's endpoint and must end in a slash, which is what
  * the Wisp client insists on.
  */
+/// What the proxy delivers, counted. See the `onmessage` below.
+const meter = { n: 0, bytes: 0, last: 0 };
+
 export class WispNetwork {
   #conn = null;
   #streams = new Map();
@@ -123,6 +126,34 @@ export class WispNetwork {
     };
     w.onmessage = (data) => {
       const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+      // When the bytes stop, and for how long.
+      //
+      // `apt-get update` reports 14.9 MB at 44 kB/s, which reads like a slow
+      // transport and is not one. The timeline says otherwise:
+      //
+      //     16 messages,  0.0 MiB in   2.3s
+      //     32 messages,  0.1 MiB in   2.3s
+      //     48 messages,  0.2 MiB in 320.9s
+      //    384 messages,  7.5 MiB in 321.7s
+      //
+      // One stall of 318 seconds after about a hundred kilobytes, and then
+      // seven megabytes in eight tenths of a second -- nine megabytes a
+      // second, which is the speed of the machine. The average was hiding a
+      // hang, and a hang of about five minutes that ends by itself is a
+      // timeout expiring rather than a bandwidth problem.
+      //
+      // So this reports gaps rather than rates: silence is the signal.
+      const now = performance.now();
+      if (meter.last && now - meter.last > 1000) {
+        console.error(
+          `[wisp] nothing for ${((now - meter.last) / 1000).toFixed(1)}s `
+          + `after ${meter.n} messages and `
+          + `${(meter.bytes / 1048576).toFixed(1)} MiB`,
+        );
+      }
+      meter.last = now;
+      meter.n += 1;
+      meter.bytes += bytes.length;
       if (s.buffered > HIGH_WATER) return;
       s.chunks.push(bytes);
       s.buffered += bytes.length;
