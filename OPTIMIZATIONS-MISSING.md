@@ -1223,6 +1223,46 @@ and then dies of SIGABRT, which is the forked-child abort that also stops
 `apt-get install`. A minute-long probe reaching the same bug an
 `apt-get update` takes six minutes to reach.
 
+## Decompression is 23.7x native, and it is what `apt-get update` costs
+
+    dpkg-deb --fsys-tarfile libc6.deb     2.4 MB xz -> 10.4 MB
+
+      gex   11598 ms
+      host    490 ms
+
+No network, no browser, no apt: twelve seconds against half a second, and
+it is the whole of what an `apt-get update` spends its six minutes on.
+
+The ratio is the finding. This project's usual distance from native is
+3.8x to 8.6x -- LU decomposition, measured in both hosts. Decompression is
+23.7x, three to six times worse than everything around it.
+
+Getting here took most of a day and almost none of it was spent on the
+recompiler, because the symptom pointed everywhere else first. What the
+run actually looks like: apt fetches an index in two tenths of a second,
+hands it to its `store` method to decompress, and that method takes five
+minutes. From outside, that is a socket that goes quiet, a run loop that
+spins, pipes that sit empty and an average of 44 kB/s -- and each of those
+was measured, and each was consistent with the truth, and none of them
+named it.
+
+What named it was recording the *content* of what crossed apt's pipes
+rather than counting it. The last line on the third pipe was
+
+    200 URI Start|URI: store:/var/lib/apt/lists/partial/...Translation-en.xz
+
+with no `201 URI Done` after it. Everything else followed at once: the
+network is idle because nothing is being fetched, apt waits because it has
+a job outstanding, the pipes are empty because nobody owes a line.
+
+So: when a run is slow and every counter looks reasonable, log what the
+processes are *saying* to each other. A protocol in text will tell you
+where it stopped; a byte total never can.
+
+The benchmark above is the one to iterate against -- twelve seconds, no
+network, and it moves with the recompiler. See #86, and #126 for the
+forked child that dies inside the same library.
+
 ## Reachable-only discovery finds a quarter of a C++ library
 
 Measured 2026-08-11, `apt-get update`, per process:
