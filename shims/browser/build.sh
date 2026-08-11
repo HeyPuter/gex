@@ -82,9 +82,28 @@ fi
 # The kernel is a separate artefact and the shim imports from it, so it is
 # rebuilt here -- before the check below, which would otherwise be run against
 # the previous one and pass on a mismatch that is about to matter.
+#
+# A failure here stops the build. It used to be swallowed -- output to
+# /dev/null, and every outcome reported as "NOT rebuilt (needs nightly)" --
+# so a borrow error in the kernel's own source was indistinguishable from a
+# machine without a nightly toolchain, and the shim went on being rebuilt
+# against a kernel binary from before the change. Six runs were spent
+# measuring a fix that was not in the artefact, and one of them was written up
+# as having fixed something.
+#
+# Missing nightly is still only a warning: a machine without it should get
+# every demo that does not fork. Anything else is an error with the
+# compiler's own words under it.
 if [ -x shims/kernel/build.sh ]; then
-    shims/kernel/build.sh >/dev/null 2>&1 && echo "  kernel: rebuilt alongside the shim" \
-        || echo "  kernel: NOT rebuilt (needs nightly) -- imports may not match"
+    if ! rustup toolchain list 2>/dev/null | grep -q nightly; then
+        echo "  kernel: NOT rebuilt (no nightly toolchain) -- imports may not match"
+    elif kerr=$(shims/kernel/build.sh 2>&1); then
+        echo "  kernel: rebuilt alongside the shim"
+    else
+        echo "$kerr" | grep -E "^(error|warning: unused)" -A 6 || echo "$kerr" | tail -20
+        echo "  kernel: FAILED to build -- the shim would import a stale one" >&2
+        exit 1
+    fi
 fi
 # And against the other side. A shim importing a function the kernel does not
 # export -- or exports with a different signature -- fails to instantiate

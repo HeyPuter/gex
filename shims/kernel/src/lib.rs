@@ -911,8 +911,9 @@ pub unsafe extern "C" fn k_snap_store(key: u64, ptr: u32, len: u32) {
         return;
     }
     s.used = end;
-    s.at[s.n] = (key, at as u32, len);
-    s.n += 1;
+    let n = s.n;
+    s.at[n] = (key, at as u32, len);
+    s.n = n + 1;
 }
 
 /// How many bytes the linked image of `key` takes, or zero if there is none.
