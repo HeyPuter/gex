@@ -2351,6 +2351,9 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
 
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
+    // And the same for the first process, which opens its console before it
+    // makes a syscall. See the note beside the other one.
+    MY_PID.store(kernel.pid, std::sync::atomic::Ordering::Relaxed);
     // The staged layout, now that there is somewhere to put it. Taken rather
     // than copied: this runs once, and a second `gex_load` in the same Worker
     // is an `execve`, which gets its placement from the global table like
@@ -4668,6 +4671,14 @@ pub extern "C" fn gex_adopt_child(
     install_console(&mut kernel);
     kernel.pid = pid;
     kernel.tid = pid;
+    // Before anything opens a descriptor.
+    //
+    // A forked child rebuilds its parent's descriptor table here, *before* it
+    // makes a single syscall -- and the syscall entry was the only place this
+    // was set. So every inherited pipe end was recorded against pid 0, and
+    // when the child crashed `k_pipe_forget` had nothing to release for it:
+    // "pid 3 crashed; 0 pipe ends released".
+    MY_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
     // The system's filesystem, which the child could not otherwise have: its
     // parent's `TmpFs` was Rust data in a memory this Worker cannot see, so
     // without this a forked child's root is empty and its `execve` cannot
@@ -8059,6 +8070,44 @@ fn set_exit(h: &mut Host, code: i32) {
 /// so a shim that crashed mid-translation was reported as a program that
 /// exited cleanly with status 0 -- which is how `apt update` came to say
 /// nothing, write no lists, and return success.
+/// Record that this process is gone, for a process that did not say so.
+///
+/// `exit_process` publishes the exit status and releases the descriptors, and
+/// it is exactly the path a crashed guest does not take: a wasm fault
+/// abandons the stack without running anything. So `dpkg` faulted inside
+/// `openat`, and *both* halves of an `apt-get update` deadlock followed from
+/// the same omission -- `apt` waited on a `read` for an end-of-file its dead
+/// child's pipe end was still holding shut, and pid 1 waited on `wait4` for a
+/// status nothing had published.
+///
+/// Called from the Worker after `run` returns, where the shim instance is
+/// still alive and can still reach the global kernel. A process that crashed
+/// should take itself down and nothing else with it, which is what a real
+/// kernel arranges and the only reason a guest is allowed to crash at all.
+///
+/// `status` is what the parent will see. A fault is not an exit code, so it
+/// is reported as a signal the way a real one would be.
+#[no_mangle]
+pub extern "C" fn gex_process_gone(status: i32) -> u32 {
+    if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let pid = my_pid();
+    let n = unsafe {
+        if k_present() != 0 {
+            k_pipe_forget(pid)
+        } else {
+            0
+        }
+    };
+    with_host(|h| h.kernel.procs.exit(pid, status));
+    trace_line(&format!(
+        "[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"
+    ));
+    n
+}
+
 #[no_mangle]
 pub extern "C" fn gex_exited() -> i32 {
     // Deliberately not `with_host`: this is asked on the way out of a trap,

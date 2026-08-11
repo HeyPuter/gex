@@ -2243,6 +2243,17 @@ export class Gex {
               `[gex] run ended: ${e.gex_exited?.() ? 'exited' : 'ABANDONED'}`
               + `, code ${e.gex_exit_code()}${where}${heap}`,
             );
+            // And the wasm stack, when nobody set a status.
+            //
+            // A program that finished throws `unreachable` on purpose and its
+            // stack says nothing worth reading. A shim that faulted throws the
+            // same thing, and its stack names the function that did it --
+            // which is the one fact that turns "dpkg abandoned the stack
+            // inside openat" into a line of Rust. It was being thrown away on
+            // exactly the path that needed it.
+            if (!e.gex_exited?.()) {
+              console.error(`[gex] the stack under it:\n${err.stack ?? String(err)}`);
+            }
           }
           return e.gex_exit_code();
         }

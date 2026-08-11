@@ -467,6 +467,19 @@ async function handle(msg) {
     // runs at another, so the guest branches into whatever is there -- and it
     // can only be known after the run, because `ld.so` maps the libraries.
     if (msg.opts?.pins) ex.gex_pin_report?.();
+    // A process that crashed still has to die properly.
+    //
+    // `exit_process` publishes the exit status and releases the descriptors,
+    // and a wasm fault abandons the stack without running it -- so a crashed
+    // child left its pipe ends held shut and no status for its parent to
+    // find. Both halves of an `apt-get update` deadlock were that: `apt`
+    // waiting on a `read` for an end-of-file, and pid 1 on `wait4` for a
+    // status. Here, because this is the last moment the crashed process's
+    // own shim instance exists and can reach the global kernel.
+    //
+    // 134 is what a shell reports for a process killed by `SIGABRT`, which is
+    // the nearest true thing to say about a fault.
+    ex.gex_process_gone?.(134);
     // `close` before the reporting, not after: it drops the tick channel,
     // which is a live handle that would otherwise keep a Node Worker up.
     gex.close?.();
