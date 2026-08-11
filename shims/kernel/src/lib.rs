@@ -1183,6 +1183,19 @@ pub extern "C" fn k_pipe_new() -> i32 {
 }
 
 /// Another descriptor onto one end, as `dup` and `fork` both make.
+/// How many descriptors hold each end, `(readers << 16) | writers`.
+///
+/// For the stall census. A reader parked on a pipe with no writers left has
+/// missed an end-of-file; one parked on a pipe that still has a writer is
+/// waiting on that writer. The two look identical from the reader's side and
+/// have nothing in common as bugs.
+#[no_mangle]
+pub extern "C" fn k_pipe_ends(id: i32) -> i32 {
+    let Some(p) = pipe_at(id) else { return -1 };
+    let (r, w) = p.ends();
+    (((r as i32) & 0xffff) << 16) | ((w as i32) & 0xffff)
+}
+
 #[no_mangle]
 pub extern "C" fn k_pipe_open_end(id: i32, write: i32, pid: i32) {
     if let Some(p) = pipe_at(id) {

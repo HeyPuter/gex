@@ -329,6 +329,7 @@ extern "C" {
     // process the other end is always in another memory.
     fn k_pipe_new() -> i32;
     fn k_pipe_open_end(id: i32, write: i32, pid: i32);
+    fn k_pipe_ends(id: i32) -> i32;
     fn k_pipe_close_end(id: i32, write: i32, pid: i32);
     fn k_pipe_forget(pid: i32) -> u32;
     fn k_pipe_read(id: i32, at: u32, len: u32) -> i32;
@@ -560,6 +561,9 @@ fn my_pid() -> i32 {
 extern "C" fn rp_open_end(id: i32, write: i32) {
     unsafe { k_pipe_open_end(id, write, my_pid()) }
 }
+extern "C" fn rp_ends(id: i32) -> i32 {
+    unsafe { k_pipe_ends(id) }
+}
 extern "C" fn rp_close_end(id: i32, write: i32) {
     unsafe { k_pipe_close_end(id, write, my_pid()) }
 }
@@ -587,6 +591,7 @@ fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
     Some(gex_kernel::pipe::Remote {
         new: rp_new,
         open_end: rp_open_end,
+        ends: rp_ends,
         close_end: rp_close_end,
         read: rp_read,
         write: rp_write,

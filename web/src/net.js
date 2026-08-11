@@ -144,6 +144,14 @@ export class WispNetwork {
       //
       // So this reports gaps rather than rates: silence is the signal.
       const now = performance.now();
+      if (!s.firstRecv) {
+        s.firstRecv = now;
+        const waited = s.firstSend ? (now - s.firstSend) / 1000 : -1;
+        console.error(
+          `[wisp] stream ${id}: first reply at ${(now / 1000).toFixed(1)}s, `
+          + `${waited.toFixed(1)}s after the request`,
+        );
+      }
       if (meter.last && now - meter.last > 1000) {
         console.error(
           `[wisp] nothing for ${((now - meter.last) / 1000).toFixed(1)}s `
@@ -183,6 +191,18 @@ export class WispNetwork {
     if (!s || !s.wisp || s.state === CLOSED || s.state === REFUSED) return -1;
     // A copy, because the argument is a view into the guest's memory and the
     // client keeps it until the socket drains.
+    // When the request went out, against when the first byte came back.
+    //
+    // The stall is 318 seconds of silence on a transport that then runs at
+    // nine megabytes a second, and the guest side is accounted for: apt is
+    // polling its methods' pipes (1 reader, 1 writer, empty) and the methods
+    // are waiting on the network. So either the request leaves late, which
+    // is ours, or it leaves promptly and the answer is late, which is the
+    // proxy's or the mirror's. One number each way settles it.
+    if (!s.firstSend) {
+      s.firstSend = performance.now();
+      console.error(`[wisp] stream ${id}: request out at ${(s.firstSend / 1000).toFixed(1)}s`);
+    }
     s.wisp.send(bytes.slice());
     return bytes.length;
   }

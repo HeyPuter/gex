@@ -270,6 +270,9 @@ pub struct Remote {
     pub new: extern "C" fn() -> i32,
     /// Another descriptor onto one end, as `dup` and `fork` both make.
     pub open_end: extern "C" fn(id: i32, write: i32),
+    /// How many descriptors hold each end, as `(readers << 16) | writers`.
+    /// Negative when the pipe is gone. For the stall census only.
+    pub ends: extern "C" fn(id: i32) -> i32,
     /// Drop a descriptor. The last one on an end is what a reader sees as EOF.
     pub close_end: extern "C" fn(id: i32, write: i32),
     /// Read into, or write out of, an address in the caller's memory.
@@ -370,8 +373,21 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
     }
 
     fn debug_state(&self) -> String {
+        // With the ends, because "0 buffered" alone cannot tell the two
+        // stalls apart. A reader waiting on a pipe with no writers left
+        // should have seen end-of-file, so that is a lost wake or a
+        // miscounted close; a reader waiting on a pipe that still has a
+        // writer is waiting on whatever that writer is doing, which is
+        // somewhere else entirely. `apt-get update` hangs for 318 seconds
+        // with exactly this line in the census and no way to say which.
+        let e = (self.remote.ends)(self.id);
+        let (r, w) = if e < 0 {
+            (-1i32, -1i32)
+        } else {
+            ((e >> 16) & 0xffff, e & 0xffff)
+        };
         format!(
-            "shared pipe {} {}, {} buffered",
+            "shared pipe {} {}, {} buffered, {r} readers {w} writers",
             self.id,
             if self.write { "write" } else { "read" },
             (self.remote.buffered)(self.id)
