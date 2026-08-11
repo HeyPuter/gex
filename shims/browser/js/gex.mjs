@@ -298,6 +298,8 @@ export class Gex {
   #pubGrewSlots = 0;
   #wantMs = 0;
   #wants = 0;
+  #instMs = 0;
+  #tailMs = 0;
   /// Next free slot in each table, for pages this process claims.
   #claimed = [];
   // The parent's modules, held rather than installed. See `#maybeAdopt`.
@@ -601,6 +603,8 @@ export class Gex {
       grew: this.#pubGrewSlots,
       wants: this.#wants,
       wantMs: Math.round(this.#wantMs),
+      instMs: Math.round(this.#instMs),
+      tailMs: Math.round(this.#tailMs),
     };
   }
 
@@ -2866,7 +2870,15 @@ export class Gex {
     let inst;
     const ti = performance.now();
     try {
-      inst = await WebAssembly.instantiate(mod, { gex: imports });
+      // Synchronously. `mod` is already a compiled `Module`, so this is
+      // legal -- only compiling a large buffer is refused, and only on the
+      // main thread -- and it does not yield.
+      //
+      // The await was costing 819ms across four closure libraries while the
+      // counters wrapped around it reported 30ms of instantiate, which is
+      // the signature of time spent not-running rather than working: an
+      // `await` here goes to the back of this Worker's task queue.
+      inst = new WebAssembly.Instance(mod, { gex: imports });
       this.#instantiateMs += performance.now() - ti;
     } catch (err) {
       throw new Error(
@@ -3188,7 +3200,9 @@ export class Gex {
           // the cost this change removes. Its pages are claimed one at a
           // time, and `gex_table_need` reports what those came to.
           const claimed = this.#shim.exports.gex_lib_lazy?.(owner >>> 0);
+          const i0 = performance.now();
           lazy.instObj = await this.#installModule(mod, claimed ? 0 : lazy.need);
+          this.#instMs += performance.now() - i0;
         } else {
           // Nothing to install; let the miss fall through and be lifted
           // rather than wedging on a library that never arrives.
@@ -3196,6 +3210,15 @@ export class Gex {
         }
       }
     }
+    const tail0 = performance.now();
+    try {
+      return await this.#fillSlotTail(slot, owner);
+    } finally {
+      this.#tailMs += performance.now() - tail0;
+    }
+  }
+
+  async #fillSlotTail(slot, owner) {
     // And the same for a module this process inherited from its parent.
     //
     // These are ordinary runtime units: their element segments are active, so
