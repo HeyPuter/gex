@@ -7099,6 +7099,17 @@ fn schedule() -> i32 {
                 let mut gm = GuestMem::new(guest_bytes());
                 h.kernel.enter_thread(&kstate);
                 let r = finish_parked(&op, timed_out, &mut gm);
+                // A parked call's answer never reaches the syscall ring: the
+                // ring is written when the call is made, and a call that
+                // blocks has not produced one yet. An error here is therefore
+                // invisible, and for a futex that matters -- glibc aborts the
+                // process over answers it does not expect.
+                if let (gex_kernel::BlockOp::FutexWait { uaddr, .. }, Err(e)) = (&op, &r) {
+                    warn_line(&format!(
+                        "[gex] pid {} futex wait on {uaddr:#x} resumed with {e:?}",
+                        h.kernel.pid,
+                    ));
+                }
                 let outcome = h.kernel.finish_blocking(&mut gm, r);
                 h.kernel.leave_thread(&mut h.threads[cur()].kstate);
                 match outcome {

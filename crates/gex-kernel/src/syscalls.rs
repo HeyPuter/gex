@@ -1727,6 +1727,20 @@ impl Kernel {
                 if !self.mem.vmas().iter().any(|v| a[0] >= v.start && a[0] + 4 <= v.end) {
                     return None;
                 }
+                // The word has to still hold what the caller expects.
+                //
+                // That comparison is the whole point of the call: the caller
+                // read the word, decided to wait, and asks the kernel to make
+                // the decision atomic by refusing if it has changed since.
+                // Parking unconditionally loses the wake-up that changed it --
+                // the waker has already been and gone -- and the thread then
+                // sleeps on a condition that has already happened.
+                //
+                // `EAGAIN` is what Linux answers, and it is what `sys_futex`
+                // now gives a declined wait on memory the process has.
+                if m.read_u32(a[0]).ok()? != a[2] as u32 {
+                    return None;
+                }
                 let deadline = if a[3] == 0 {
                     None
                 } else {
