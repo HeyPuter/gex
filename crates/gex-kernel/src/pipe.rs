@@ -40,6 +40,14 @@ struct State {
     /// method that never reported, or a report that went somewhere else.
     writes: u64,
     written: u64,
+    /// The last thing written, truncated.
+    ///
+    /// Every pipe reads `0 buffered` during apt's stall and no write ever
+    /// failed, so the plumbing is exhausted and the question is what was
+    /// said. apt's method protocol is lines of text -- `600 URI Acquire`,
+    /// `201 URI Done` -- so the last message on each pipe names where the
+    /// conversation stopped, which no count can.
+    last: Vec<u8>,
     /// Writes that found no reader.
     ///
     /// Counted apart from the refused ones because they are a different
@@ -75,6 +83,7 @@ impl Pipe {
                 refused: 0,
                 writes: 0,
                 written: 0,
+                last: Vec::new(),
                 broken: 0,
             }),
             ready: Condvar::new(),
@@ -159,6 +168,10 @@ impl Pipe {
                 s.buf.extend(&buf[written..written + n]);
                 s.writes += 1;
                 s.written += n as u64;
+                // Bounded, and the *first* bytes rather than the last: a
+                // protocol line says what it is in its first word.
+                s.last.clear();
+                s.last.extend(buf[written..written + n].iter().take(160));
                 written += n;
                 self.ready.notify_all();
                 if written == buf.len() {
@@ -186,6 +199,19 @@ impl Pipe {
         // one of the three that loses a message outright, so it must not be
         // the one that goes unreported for want of a field.
         (s.short + (s.broken << 8), s.refused)
+    }
+
+    /// The last message written, printable characters only.
+    pub fn last_message(&self) -> String {
+        let s = self.state.lock().unwrap();
+        s.last
+            .iter()
+            .map(|&b| match b {
+                b'\n' => '|',
+                0x20..=0x7e => b as char,
+                _ => '.',
+            })
+            .collect()
     }
 
     /// How many writes have put bytes in, and how many bytes in all.
@@ -327,6 +353,8 @@ pub struct Remote {
     pub write_stats: extern "C" fn(id: i32) -> i32,
     /// How many writes have ever put bytes in. Negative when the pipe is gone.
     pub writes: extern "C" fn(id: i32) -> i32,
+    /// The last message written, into the caller's memory. Returns its length.
+    pub last_message: extern "C" fn(id: i32, at: u32, cap: u32) -> i32,
     /// Drop a descriptor. The last one on an end is what a reader sees as EOF.
     pub close_end: extern "C" fn(id: i32, write: i32),
     /// Read into, or write out of, an address in the caller's memory.
@@ -450,8 +478,15 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
             String::new()
         };
         let n = (self.remote.writes)(self.id);
+        let mut buf = [0u8; 180];
+        let got = (self.remote.last_message)(self.id, buf.as_mut_ptr() as u32, buf.len() as u32);
+        let said = if got > 0 {
+            format!(", last {:?}", String::from_utf8_lossy(&buf[..got as usize]))
+        } else {
+            String::new()
+        };
         format!(
-            "shared pipe {} {}, {} buffered, {r} readers {w} writers, {n} writes ever{wrote}",
+            "shared pipe {} {}, {} buffered, {r} readers {w} writers, {n} writes ever{wrote}{said}",
             self.id,
             if self.write { "write" } else { "read" },
             (self.remote.buffered)(self.id)

@@ -1193,6 +1193,19 @@ pub extern "C" fn k_pipe_new() -> i32 {
 /// `Pipe::write_stats`.
 /// How many writes have ever put bytes into this pipe. See
 /// `Pipe::write_totals`.
+/// The last message written to a pipe, into the caller's memory. See
+/// `Pipe::last_message`.
+#[no_mangle]
+pub extern "C" fn k_pipe_last_message(id: i32, at: u32, cap: u32) -> i32 {
+    let Some(p) = pipe_at(id) else { return -1 };
+    let text = p.last_message();
+    let n = text.len().min(cap as usize);
+    if n > 0 {
+        unsafe { gex_kmem::push_checked(at, text.as_ptr(), n as u32) };
+    }
+    n as i32
+}
+
 #[no_mangle]
 pub extern "C" fn k_pipe_writes(id: i32) -> i32 {
     let Some(p) = pipe_at(id) else { return -1 };

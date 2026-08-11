@@ -332,6 +332,7 @@ extern "C" {
     fn k_pipe_ends(id: i32) -> i32;
     fn k_pipe_write_stats(id: i32) -> i32;
     fn k_pipe_writes(id: i32) -> i32;
+    fn k_pipe_last_message(id: i32, at: u32, cap: u32) -> i32;
     fn k_pipe_close_end(id: i32, write: i32, pid: i32);
     fn k_pipe_forget(pid: i32) -> u32;
     fn k_pipe_read(id: i32, at: u32, len: u32) -> i32;
@@ -572,6 +573,9 @@ extern "C" fn rp_write_stats(id: i32) -> i32 {
 extern "C" fn rp_writes(id: i32) -> i32 {
     unsafe { k_pipe_writes(id) }
 }
+extern "C" fn rp_last_message(id: i32, at: u32, cap: u32) -> i32 {
+    unsafe { k_pipe_last_message(id, at, cap) }
+}
 extern "C" fn rp_close_end(id: i32, write: i32) {
     unsafe { k_pipe_close_end(id, write, my_pid()) }
 }
@@ -602,6 +606,7 @@ fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
         ends: rp_ends,
         write_stats: rp_write_stats,
         writes: rp_writes,
+        last_message: rp_last_message,
         close_end: rp_close_end,
         read: rp_read,
         write: rp_write,
