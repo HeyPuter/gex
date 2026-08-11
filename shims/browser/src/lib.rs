@@ -4143,7 +4143,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     //
     // The host reads these, builds the Worker, and that Worker calls
     // `gex_adopt_child` to become the process.
-    stage_fork_fds(h);
+    stage_fork_fds(h, pid);
     FORK[1].store(pc + 4, std::sync::atomic::Ordering::Relaxed);
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
@@ -4178,7 +4178,14 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
 static FORK_FDS: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
 
 /// Describe the calling process's descriptors for the child.
-fn stage_fork_fds(h: &Host) {
+///
+/// `child` is who the reopened pipe ends belong to. They were being opened
+/// under the *parent's* pid, so the global kernel's record said the parent
+/// held two of each and the child none -- and when the child crashed,
+/// `k_pipe_forget` had nothing to release for it: "pid 3 crashed; 0 pipe ends
+/// released", with the reader still waiting on an end-of-file the dead
+/// child's end was holding shut.
+fn stage_fork_fds(h: &Host, child: i32) {
     let mut out = String::new();
     for (fd, file, cloexec) in h.kernel.fds.entries() {
         // A pipe end has to be opened again in the global kernel, or the
@@ -4187,7 +4194,7 @@ fn stage_fork_fds(h: &Host) {
         // not happened.
         if let Some(id) = pipe_id(&file.path) {
             let write = file.writable;
-            unsafe { k_pipe_open_end(id, write as i32, my_pid()) };
+            unsafe { k_pipe_open_end(id, write as i32, child) };
         } else if !file.path.starts_with('/') {
             // Not a path, not a pipe, and not the terminal: a socket. Nothing
             // here can rebuild that from a name.
