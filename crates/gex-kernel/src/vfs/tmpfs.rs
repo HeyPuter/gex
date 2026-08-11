@@ -417,8 +417,24 @@ impl FileSystem for TmpFs {
             return Err(Errno::ENOENT);
         };
         let ino = inner.inos.remove(from).unwrap_or(1);
+        // The mode travels with the name. `dpkg` unpacks a program to
+        // `foo.dpkg-new`, chmods it, and renames it into place; leaving the
+        // mode behind here means every binary a package installs arrives
+        // without its execute bit, and the failure surfaces later as a shell
+        // saying the program does not exist.
+        let mode = inner.modes.remove(from);
         inner.nodes.insert(to.to_string(), node);
         inner.inos.insert(to.to_string(), ino);
+        match mode {
+            Some(m) => {
+                inner.modes.insert(to.to_string(), m);
+            }
+            // The destination may have had a mode of its own, and this is a
+            // different file now.
+            None => {
+                inner.modes.remove(to);
+            }
+        }
         Ok(())
     }
 
@@ -441,8 +457,14 @@ impl FileSystem for TmpFs {
             return Err(Errno::EEXIST);
         }
         let ino = inner.inos.get(from).copied().unwrap_or(1);
+        // Two names for one inode, so one mode: `/usr/bin/perl` is a hard
+        // link and has to be as executable as `perl5.36.0` is.
+        let mode = inner.modes.get(from).copied();
         inner.nodes.insert(to.to_string(), node);
         inner.inos.insert(to.to_string(), ino);
+        if let Some(m) = mode {
+            inner.modes.insert(to.to_string(), m);
+        }
         Ok(())
     }
 

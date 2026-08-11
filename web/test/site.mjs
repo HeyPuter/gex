@@ -37,6 +37,10 @@ const CHROME = process.env.CHROME || '/usr/bin/chromium';
 // server sends; only the HTML is touched, to add the reporter.
 const UPSTREAM = process.env.GEX_SITE || '';
 const WALL = Number(process.env.GEX_WALL || 900) * 1000;
+// How much of the terminal to print. The page hands over its whole
+// scrollback now, so the only reason not to print all of it is that most
+// runs do not need it: `GEX_TAIL=0` means everything.
+const TAIL = process.env.GEX_TAIL === undefined ? 60 : Number(process.env.GEX_TAIL);
 
 // Which demos to drive, and what counts as having worked. A demo that needs a
 // network or a GPU that this machine may not have says so rather than failing.
@@ -71,6 +75,30 @@ const DEMOS = {
   // the guest had done anything. A check that can pass without the guest is
   // worse than no check.
   'debian-cmd': { demo: 'debian', want: /GEX-CMD-DONE/ },
+  // The filesystem a package manager needs, in one shell line and no network.
+  //
+  // `ln -s` with an absolute target was stored *relative*: the global
+  // kernel ran the target through the same helper that strips a leading
+  // slash off a path being created. Every `apt-get install` died on it --
+  // apt links its downloaded archives into a temporary directory by
+  // absolute path and dpkg reports "cannot stat pathname" on names that
+  // are plainly there. `test -x` follows the link, so it fails when the
+  // link dangles and again if the mode did not survive.
+  //
+  // The rename is the second half: dpkg unpacks a program to `.dpkg-new`,
+  // chmods it and renames it into place, and the mode used to stay behind.
+  'debian-fs': {
+    demo: 'debian',
+    query:
+      'cmd=d=$(mktemp -d); ln -s /bin/dash $d/l; test -x $d/l && echo LINK""OK; '
+      + 'cp /bin/dash $d/n; chmod 755 $d/n; mv $d/n $d/m; test -x $d/m && echo MODE""OK; '
+      + 'echo FS""DONE',
+    // The markers are written split so that the page's own echo of the
+    // command cannot match them. A `want` a command line can satisfy is a
+    // test that passes with no guest at all, which this file has been
+    // caught by twice.
+    want: /LINKOK[\s\S]*MODEOK/,
+  },
   'debian-apt': {
     // The page has no such demo: this is the Debian one, run differently.
     demo: 'debian',
@@ -165,7 +193,10 @@ const REPORTER = `
 (() => {
   const post = (kind, body) =>
     fetch('/report?kind=' + kind, { method: 'POST', body }).catch(() => {});
-  const term = () => document.querySelector('.xterm-rows')?.innerText || '';
+  // The page's own reader gives the whole scrollback; the DOM query is the
+  // viewport, which is the last two dozen rows of a run that scrolled.
+  const term = () =>
+    window.gexTerminalText?.() || document.querySelector('.xterm-rows')?.innerText || '';
   addEventListener('gex:status', (e) => {
     post('status', e.detail.kind + '|' + e.detail.text + '|' + term());
   });
@@ -304,7 +335,11 @@ for (const id of list) {
   // `GEX_QUERY=gears_size=100x100` reaches the demo. An experiment that only
   // changes one thing about a run should not need a code change to run.
   const extra = process.env.GEX_QUERY ? `&${process.env.GEX_QUERY}` : '';
-  const url = `http://127.0.0.1:${port}/?demo=${DEMOS[id].demo ?? id}&run=1${extra}`;
+  // A demo may carry its own query, for a check that is about the runtime
+  // rather than about the page: `debian-fs` is the Debian rootfs told to run
+  // one shell line. `GEX_QUERY` still wins, because it comes after.
+  const own = DEMOS[id].query ? `&${DEMOS[id].query}` : '';
+  const url = `http://127.0.0.1:${port}/?demo=${DEMOS[id].demo ?? id}&run=1${own}${extra}`;
   // The command the page was told to run, decoded the way the page decodes
   // it, so the echo of it can be told apart from what the guest says. See
   // where `seen` is filled.
@@ -476,7 +511,7 @@ for (const id of list) {
     // run failed. A diagnostic added to answer "did this fire at all" then
     // says nothing on the run where it fired, which cost two runs to notice.
     if (process.env.GEX_STDERR === 'all') {
-      for (const line of lastTerminal.trim().split('\n').slice(-60)) {
+      for (const line of (TAIL ? lastTerminal.trim().split('\n').slice(-TAIL) : lastTerminal.trim().split('\n'))) {
         console.log(`     | ${line}`);
       }
     }
@@ -489,7 +524,7 @@ for (const id of list) {
     // Twenty was less than the run that failed had to say: a demo that gets
     // most of the way through prints its progress and then its stall, and
     // the twenty lines that survived were all stall.
-    for (const line of lastTerminal.trim().split('\n').slice(-60)) {
+    for (const line of (TAIL ? lastTerminal.trim().split('\n').slice(-TAIL) : lastTerminal.trim().split('\n'))) {
       console.log(`     | ${line}`);
     }
     console.log(`FAIL site-${id}: ${result.how}${result.body ? ` (${result.body})` : ''}`);

@@ -1516,9 +1516,24 @@ pub extern "C" fn k_fs_chmod(path: u32, path_len: u32, mode: u32) -> i32 {
     as_unit(rootfs().chmod(&path_of(path, path_len), mode))
 }
 
+/// A symlink's target is text, not a path.
+///
+/// `path_of` strips leading slashes, because a mount hands its filesystem a
+/// relative path -- right for the name being created, wrong for what the
+/// link says. `ln -s /var/cache/apt/archives/x.deb d/00-x.deb` stored
+/// `var/cache/apt/archives/x.deb`, which resolves against the link's own
+/// directory and reaches nothing:
+///
+///     lrwxrwxrwx 00-x.deb -> var/cache/apt/archives/x.deb
+///     ls: cannot access '/tmp/apt-dpkg-install-wiWg4U/00-x.deb'
+///
+/// which is where every `apt-get install` stopped. apt links the archives it
+/// downloaded into a temporary directory by absolute path and hands dpkg the
+/// directory; dpkg stats each name and reports "cannot stat pathname". The
+/// link was there and pointed at nothing.
 #[no_mangle]
 pub extern "C" fn k_fs_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
-    as_unit(rootfs().symlink(&path_of(target, target_len), &path_of(path, path_len)))
+    as_unit(rootfs().symlink(&path_of_raw(target, target_len), &path_of(path, path_len)))
 }
 
 #[no_mangle]
