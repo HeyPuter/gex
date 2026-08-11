@@ -1755,6 +1755,51 @@ static MEM_RET: [std::sync::atomic::AtomicU64; MEM_RING] =
     [const { std::sync::atomic::AtomicU64::new(0) }; MEM_RING];
 static MEM_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Every futex, with what it was told.
+///
+/// glibc's `futex_wait` tolerates 0, EAGAIN, EINTR and ETIMEDOUT and calls
+/// `futex_fatal_error` for everything else -- EFAULT, EINVAL and ENOSYS
+/// included -- so "the futex facility returned an unexpected error code" can
+/// come from four different answers and the process aborts without saying
+/// which. Guessing them one at a time excluded three and found nothing;
+/// this records all of them, resumptions included, and prints them when a
+/// process dies.
+const FTX_RING: usize = 24;
+static FTX_OP: [std::sync::atomic::AtomicU64; FTX_RING] =
+    [const { std::sync::atomic::AtomicU64::new(!0) }; FTX_RING];
+static FTX_ADDR: [std::sync::atomic::AtomicU64; FTX_RING] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; FTX_RING];
+static FTX_RET: [std::sync::atomic::AtomicI64; FTX_RING] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; FTX_RING];
+static FTX_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `op` is the raw futex operation, or `!0` for the resumption of a wait
+/// that had parked -- the answer the syscall itself never recorded.
+fn ftx_note(op: u64, addr: u64, ret: i64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let i = FTX_AT.fetch_add(1, Relaxed) % FTX_RING;
+    FTX_OP[i].store(op, Relaxed);
+    FTX_ADDR[i].store(addr, Relaxed);
+    FTX_RET[i].store(ret, Relaxed);
+}
+
+fn ftx_recent() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = FTX_AT.load(Relaxed);
+    let mut out = String::new();
+    for j in n.saturating_sub(FTX_RING)..n {
+        let i = j % FTX_RING;
+        let op = FTX_OP[i].load(Relaxed);
+        let (addr, ret) = (FTX_ADDR[i].load(Relaxed), FTX_RET[i].load(Relaxed));
+        if op == !0 {
+            out.push_str(&format!(" resume({addr:#x})={ret}"));
+        } else {
+            out.push_str(&format!(" {addr:#x} op={op:#x} = {ret}"));
+        }
+    }
+    out
+}
+
 /// `brk`, `munmap`, `mremap`, `mmap`.
 fn is_mem_call(nr: u64) -> bool {
     matches!(nr, 214 | 215 | 216 | 222)
@@ -4338,12 +4383,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // or which code. The ring cannot say either, because a call that
         // blocks has not written `x0` when it is recorded. These are rare
         // enough to print whole.
-        if nr == 98 && (ret as i64) < 0 {
-            warn_line(&format!(
-                "[gex] pid {} futex({a0:#x}, op={a1:#x}) = {}",
-                h.kernel.pid,
-                ret as i64,
-            ));
+        if nr == 98 {
+            ftx_note(a1, a0, ret as i64);
         }
         // What the guest was trying to say when it could not say it.
         //
@@ -4417,11 +4458,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
                 warn_line(&format!(
                     "[gex] pid {} killed by signal {} at pc={at:#x}\n  last calls:{}\n  \
-                     address space:{}",
+                     address space:{}\n  futexes:{}",
                     h.kernel.pid,
                     signal,
                     sys_recent(),
                     mem_recent(),
+                    ftx_recent(),
                 ));
                 exit_process(h, -(signal as i32))
             }
@@ -5171,6 +5213,11 @@ fn thread_workers() -> bool {
 #[no_mangle]
 pub extern "C" fn gex_set_thread_workers(on: i32) {
     THREAD_WORKERS.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+    // Said out loud, because it decides whether two Workers share this
+    // shim's statics and it is set by a message that has been sent to the
+    // wrong field once already. An experiment that turns it off and does not
+    // is an exclusion that never happened.
+    warn_line(&format!("[gex] threads get Workers of their own: {}", on != 0));
 }
 
 fn stage_thread(tid: i32, ctx_addr: u64, pc: u64) {
@@ -7089,8 +7136,22 @@ fn schedule() -> i32 {
         let resume = with_host(|h| {
             set_current(h, i);
             let t = &mut h.threads[i];
+            let was_futex = matches!(t.waiting, Waiting::Futex { .. });
             t.waiting = Waiting::Runnable;
             let op = t.blocked_on.take();
+            // A thread that parked in a futex and arrives here with nothing
+            // to finish is resumed with no return value written, so the guest
+            // reads whatever `x0` last held -- which for `futex(uaddr, op)` is
+            // `uaddr`, a large positive number. glibc takes the negation of
+            // that as an errno, does not recognise it, and calls
+            // `futex_fatal_error`. Exactly the shape of #126, so it is worth
+            // knowing whether it ever happens rather than assuming.
+            if was_futex && op.is_none() {
+                warn_line(&format!(
+                    "[gex] pid {} resumed thread {i} from a futex with no result to write",
+                    h.kernel.pid,
+                ));
+            }
             let (mut pc, kstate) = (t.pc, t.kstate.clone());
             if let Some(op) = op {
                 // The syscall that parked this thread still owes it a return
@@ -7104,13 +7165,34 @@ fn schedule() -> i32 {
                 // blocks has not produced one yet. An error here is therefore
                 // invisible, and for a futex that matters -- glibc aborts the
                 // process over answers it does not expect.
-                if let (gex_kernel::BlockOp::FutexWait { uaddr, .. }, Err(e)) = (&op, &r) {
-                    warn_line(&format!(
-                        "[gex] pid {} futex wait on {uaddr:#x} resumed with {e:?}",
-                        h.kernel.pid,
-                    ));
+                if let gex_kernel::BlockOp::FutexWait { uaddr, .. } = &op {
+                    ftx_note(
+                        !0,
+                        *uaddr,
+                        match &r {
+                            Ok(v) => *v as i64,
+                            Err(e) => -(e.0 as i64),
+                        },
+                    );
                 }
                 let outcome = h.kernel.finish_blocking(&mut gm, r);
+                // Did the answer actually land in the register the guest will
+                // read? Every futex answer this runtime produces is legal --
+                // 0, or a count -- and glibc still says it was given one it
+                // does not recognise, so the remaining possibility is that
+                // what was written is not what is there. `finish_blocking`
+                // writes into whichever thread the kernel currently thinks is
+                // running, and with two threads that is a claim worth
+                // checking rather than assuming.
+                if let (gex_kernel::BlockOp::FutexWait { .. }, Ok(v)) = (&op, &r) {
+                    let got = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(!0);
+                    if got != *v {
+                        warn_line(&format!(
+                            "[gex] pid {} wrote {v} for a futex wait and x0 holds {got:#x}",
+                            h.kernel.pid,
+                        ));
+                    }
+                }
                 h.kernel.leave_thread(&mut h.threads[cur()].kstate);
                 match outcome {
                     // One process, not the run -- the same distinction the
