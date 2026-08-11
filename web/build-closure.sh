@@ -76,9 +76,21 @@ echo "building the closure for $program..."
 # lifts 9,800 blocks where against a closure built for itself it lifts none.
 # libc and ld.so are what every program in a rootfs shares, and a demo runs
 # dozens of programs from one closure.
+#
+# `GEX_WHOLE=all` translates every object whole. Reachable-only discovery
+# cannot follow a virtual call, so a C++ library comes out mostly missing:
+# apt-get lifts 78,938 blocks of libapt-pkg at run time -- 1.9 seconds --
+# from a closure that contains libapt-pkg, because almost everything in it
+# is reached through a vtable. The whole build is larger and nothing else
+# changes; the page fetches a library only when a guest branches into it.
+whole="${GEX_WHOLE:-libc.so,ld-linux,$(basename "$program")}"
+if [ "$whole" = all ]; then
+    mode="--exhaustive"
+else
+    mode="--exhaustive-for $whole"
+fi
 target/release/gexc build --closure --sysroot "$sysroot" --no-shared-memory \
-    --exhaustive-for "${GEX_WHOLE:-libc.so,ld-linux,$(basename "$program")}" \
-    --shared-image $withs "$sysroot$program" -o "$work/c.wasm"
+    $mode --shared-image $withs "$sysroot$program" -o "$work/c.wasm"
 
 mkdir -p "$out"
 rm -f "$out"/*.wasm "$out"/closure.json

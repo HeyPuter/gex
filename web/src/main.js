@@ -44,6 +44,19 @@ const term = new Terminal({
     blue: '#7aa2f7', magenta: '#bb9af7', cyan: '#7dcfff', white: '#c0caf5',
   },
 });
+// The whole scrollback, for something other than a person reading the page.
+// `.xterm-rows` is the viewport and nothing else, so a run that scrolls --
+// which is every interesting one -- loses everything above the fold, which
+// is where a failure's first line always is.
+window.gexTerminalText = () => {
+  const b = term.buffer.active;
+  const out = [];
+  for (let i = 0; i < b.length; i++) {
+    out.push(b.getLine(i)?.translateToString(true) ?? '');
+  }
+  return out.join('\n');
+};
+
 const fit = new FitAddon();
 term.loadAddon(fit);
 term.loadAddon(new WebLinksAddon());

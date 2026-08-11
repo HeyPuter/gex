@@ -509,6 +509,9 @@ async function handle(msg) {
       fmaCalls: msg.fmaCount ? Number(ex.gex_fma_calls?.() ?? -1) : undefined,
       extracted: (msg.extract ?? []).map((p) => [p, gex.readFile(p)]),
       blocks: Number(gex.shim.exports.gex_jit_blocks?.() ?? 0),
+      // Of those, the ones on a page a closure library claims: work the
+      // static recompiler already did and this process did again.
+      liftInClosure: Number(gex.shim.exports.gex_lift_in_closure?.() ?? 0),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
       // And what the *engine* cost, which the line above does not cover:
       // compiling and instantiating every module this process installed,

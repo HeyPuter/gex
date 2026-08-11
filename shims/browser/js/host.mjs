@@ -491,6 +491,10 @@ export class ProcessHost {
             // a cost has been attributed to the wrong side of that line.
             `[gex] pid ${pid}: lived ${lived}ms (guest ${m.guestMillis ?? -1}ms)` +
               `, ${m.millis}ms translating ${m.blocks} blocks` +
+              // How many of those the closure already had. A run where this
+              // is most of `blocks` is not a coverage problem in the static
+              // recompiler -- it is the fill failing to reach the guest.
+              (m.liftInClosure ? ` (${m.liftInClosure} on closure pages)` : '') +
               (m.byObject ? ` [${m.byObject}]` : '') +
               (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
             ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +

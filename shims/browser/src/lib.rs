@@ -9264,6 +9264,19 @@ pub extern "C" fn gex_jit_compiles() -> i64 {
     with_host(|h| h.jit.compiles as i64)
 }
 
+/// Blocks lifted on a page a closure library already claims.
+///
+/// Counted since the demand-fill path went in and never reported, which left
+/// the only interesting question about a closure run unanswerable from a
+/// summary: a process that lifts 78,938 blocks of a library it holds whole is
+/// either failing to ask for the fill or asking and being told no, and those
+/// have different fixes. Every one of these is a block the static
+/// recompilation already produced and the run paid for again.
+#[no_mangle]
+pub extern "C" fn gex_lift_in_closure() -> i64 {
+    with_host(|h| h.jit.lift_in_closure as i64)
+}
+
 /// How the shared-slot lookup went, packed so one call answers.
 ///
 /// `(have, hit, miss, noident)` in four 16-bit fields is not enough for a
