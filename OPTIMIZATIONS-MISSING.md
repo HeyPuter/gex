@@ -1223,6 +1223,48 @@ and then dies of SIGABRT, which is the forked-child abort that also stops
 `apt-get install`. A minute-long probe reaching the same bug an
 `apt-get update` takes six minutes to reach.
 
+## Number dispatch slots per process, not per closure
+
+The measurement is in the section below: a `cat /dev/null` costs 1.76s, and
+a second of that is `Table.grow` writing the miss stub into 2,718,720 slots.
+The table is that long because `gexc` numbers slots in one sequence across
+all sixty-six libraries of the closure, so a process that branches into a
+late-numbered one must grow to that length whatever it uses.
+
+The directory is per process -- it is guest memory -- so the numbering can
+be too. Half of that is done: a fill is now told the base to write at rather
+than baking it, `table.init`'s destination being a stack operand. What
+remains is to hand out those bases densely, on the miss that wants a page
+rather than when its library is published, so a table is as long as the
+pages a process actually entered. `cat` enters tens, not thousands.
+
+Four things constrain it, and the fourth is the one that will bite:
+
+  * a page must stay in the table `gexc` gave it. `table.init` takes the
+    table as an *immediate*, so only the offset within it can move.
+
+  * more tables is not the answer. `DISPATCH_TABLES` is 8 and the dispatch
+    sequence emits a `block` and a `return_call_indirect` per table on every
+    indirect branch -- 9% of emitted code already. Sixty-six would be
+    ruinous, and the entry has room for 256.
+
+  * run-time translation must keep allocating from the system-wide counter
+    into tables 4..7. Two processes that share a translated module have to
+    agree about where its blocks are, which is what `Refill` is for. Only
+    the closure's own pages, in tables 0..3, can be numbered locally.
+
+  * **the image module writes table 0 from slot 0 at instantiation.** Its
+    segment is active, `table: 0, offset: 0`, covering the whole region --
+    see `module.rs`. A dense allocator that starts at zero in table 0 lands
+    on top of the running program. It has to begin above the image's reach,
+    or leave table 0 to images and put libraries in 1..3.
+
+The failure mode if that is got wrong is the one the emitter already warns
+about: slots written into a region nothing claimed, surfacing as a branch
+into the wrong function much later. So it wants doing deliberately, with
+`debian-forks` as the measurement and `debian-fs`, `debian-deb` and
+`debian-lzma` as the correctness check.
+
 ## Three instruments, because a guest that dies said nothing at all
 
 A browser guest killed by a signal used to leave *nothing* on the console.
