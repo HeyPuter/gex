@@ -84,6 +84,20 @@ pub struct Linked {
     pub entry: u64,
     /// `(slot, resolver)` pairs the guest must run and store, in order.
     pub irelative: Vec<(u64, u64)>,
+    /// `(slot, offset)` pairs for TLS descriptors, where `slot` is the
+    /// two-word descriptor and `offset` is the value its resolver must
+    /// return: the symbol's position relative to the thread pointer.
+    ///
+    /// The caller writes both words. The second is `offset`; the first is the
+    /// address of a resolver that returns it, which the caller supplies
+    /// because it is guest code and this crate does not place guest code.
+    /// Two instructions do it -- `ldr x0, [x0, #8]` then `ret` -- which is
+    /// what glibc's own `_dl_tlsdesc_return` is.
+    ///
+    /// Only the static case, which is the only one a program that does not
+    /// `dlopen` produces: every object is present at start, so every offset
+    /// is known now and no resolver has to allocate anything.
+    pub tlsdesc: Vec<(u64, u64)>,
     /// Initialisers to call before `main`, dependencies first.
     pub init: Vec<u64>,
     /// How much static TLS the program needs, and how it is aligned.
@@ -192,6 +206,8 @@ pub fn link(
     }
 
     let mut irelative = Vec::new();
+
+    let mut tlsdesc: Vec<(u64, u64)> = Vec::new();
     let mut unhandled: HashMap<(String, u32), usize> = HashMap::new();
     let mut missing = Vec::new();
     let mut writes: Vec<(usize, u64, u64)> = Vec::new();
@@ -256,9 +272,21 @@ pub fn link(
                     // Two words: a resolver and its argument. The static case
                     // is the only one a non-`dlopen` program produces, and
                     // its resolver returns the argument unchanged -- so the
-                    // guest must still call it, and it is left for the caller
-                    // alongside the ifuncs.
-                    *unhandled.entry((o.path.clone(), r.kind)).or_insert(0) += 1;
+                    // argument *is* the answer, and it is the same thread
+                    // pointer offset `TPREL64` computes.
+                    //
+                    // The caller writes the pair, because the resolver is
+                    // guest code and this crate places none. Left unhandled,
+                    // these are what stopped `ls` and `apt-get` linking:
+                    // four in libselinux, nineteen across apt's twenty
+                    // objects, and nothing else missing from either.
+                    let (base, off) = match found {
+                        Some(d) if d.tls => {
+                            (objects[d.obj].tls_offset.unwrap_or(0), d.value)
+                        }
+                        _ => (o.tls_offset.unwrap_or(0), 0),
+                    };
+                    tlsdesc.push((r.at, base + off + r.addend as u64));
                 }
                 other => {
                     *unhandled.entry((o.path.clone(), other)).or_insert(0) += 1;
@@ -319,7 +347,17 @@ pub fn link(
     unhandled.sort();
     missing.sort();
     missing.dedup();
-    Ok(Linked { objects, entry, irelative, init, tls_size, tls_align, unhandled, missing })
+    Ok(Linked {
+        objects,
+        entry,
+        irelative,
+        tlsdesc,
+        init,
+        tls_size,
+        tls_align,
+        unhandled,
+        missing,
+    })
 }
 
 /// Find a library by soname, the way `ld.so` would.
