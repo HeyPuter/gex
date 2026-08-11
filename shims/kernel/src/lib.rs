@@ -1382,6 +1382,42 @@ pub extern "C" fn k_fs_open(path: u32, path_len: u32, flags: u64, mode: u32) -> 
     }
 }
 
+/// A second id for one open file.
+///
+/// `fork` gives the child the parent's descriptors, and it used to do that by
+/// reopening each one by name. `dpkg-deb` builds its tar members in files it
+/// creates and unlinks immediately, so the child found nothing at the name,
+/// dropped the descriptor without saying so, and the first write in the
+/// compressing child came back `EBADF`:
+///
+/// ```text
+/// dpkg-deb (subprocess): compressing tar member:
+///   internal gzip write error: Bad file descriptor
+/// ```
+///
+/// Two ids onto one `Arc` is what a descriptor shared across a fork is: the
+/// file is the same file, and either side closing its own id leaves the
+/// other's alone. The offset is not shared -- it lives in each process's own
+/// file table -- which is where this stops short of what Linux does.
+#[no_mangle]
+pub extern "C" fn k_fs_dup(handle: i32) -> i32 {
+    let mut t = handles().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Some(h)) = t.get(handle as usize).map(|s| s.as_ref().map(std::sync::Arc::clone))
+    else {
+        return -9;
+    };
+    match t.iter().position(|s| s.is_none()) {
+        Some(i) => {
+            t[i] = Some(h);
+            i as i32
+        }
+        None => {
+            t.push(Some(h));
+            (t.len() - 1) as i32
+        }
+    }
+}
+
 /// Drop a handle. Called from the client's `Drop`, so a process that exits
 /// without closing still frees what it held.
 #[no_mangle]

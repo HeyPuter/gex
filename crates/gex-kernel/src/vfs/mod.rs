@@ -118,6 +118,17 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         Err(Errno::EBADF)
     }
     fn metadata(&self) -> Result<Metadata, Errno>;
+    /// The id this handle has in the global kernel, when it has one.
+    ///
+    /// `fork` has to give the child the parent's descriptors, and the only
+    /// way it could was to reopen each one by name. A name is not enough:
+    /// `dpkg-deb` builds its tar members in files it creates and unlinks at
+    /// once, so by the time the child looks there is nothing to open, the
+    /// descriptor is quietly missing and the first write to it is `EBADF`.
+    /// An id can be handed over; a path cannot.
+    fn remote_id(&self) -> Option<i32> {
+        None
+    }
     /// List a directory. Only directories implement this.
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         Err(Errno::ENOTDIR)

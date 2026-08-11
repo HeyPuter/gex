@@ -259,6 +259,7 @@ extern "C" {
     // the two layouts that cross.
     fn k_fs_open(path: u32, path_len: u32, flags: u64, mode: u32) -> i32;
     fn k_fs_close(handle: i32);
+    fn k_fs_dup(handle: i32) -> i32;
     fn k_fs_read(handle: i32, offset: u64, at: u32, len: u32) -> i32;
     fn k_fs_write(handle: i32, offset: u64, at: u32, len: u32) -> i32;
     fn k_fs_meta(handle: i32, at: u32) -> i32;
@@ -490,6 +491,9 @@ extern "C" fn rf_open(path: u32, path_len: u32, flags: u64, mode: u32) -> i32 {
 extern "C" fn rf_close(handle: i32) {
     unsafe { k_fs_close(handle) }
 }
+extern "C" fn rf_dup(handle: i32) -> i32 {
+    unsafe { k_fs_dup(handle) }
+}
 extern "C" fn rf_read(handle: i32, offset: u64, at: u32, len: u32) -> i32 {
     unsafe { k_fs_read(handle, offset, at, len) }
 }
@@ -665,6 +669,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
         gex_kernel::vfs::remote::Remote {
             open: rf_open,
             close: rf_close,
+            dup: rf_dup,
             read: rf_read,
             write: rf_write,
             meta: rf_meta,
@@ -4530,9 +4535,26 @@ fn stage_fork_fds(h: &Host, child: i32) {
         // parent closing its copy would look like the last reference going
         // away and the reader downstream would see an end of file that has
         // not happened.
+        // What the child is told to reopen. A path by default -- and an id
+        // when the global kernel holds the open file, because a path is not
+        // enough. `dpkg-deb` builds its tar members in files it creates and
+        // unlinks at once, so a child reopening by name found nothing, the
+        // descriptor went missing without a word, and the first write in the
+        // compressing child was `EBADF`. An id survives an unlink.
+        let mut name = file.path.clone();
         if let Some(id) = pipe_id(&file.path) {
             let write = file.writable;
             unsafe { k_pipe_open_end(id, write as i32, child) };
+        } else if let Some(id) = file.handle.remote_id() {
+            let dup = unsafe { k_fs_dup(id) };
+            if dup < 0 {
+                warn_line(&format!(
+                    "gex: fork could not hand fd {fd} ({}) to pid {child}\n",
+                    file.path
+                ));
+                continue;
+            }
+            name = format!("#{dup}");
         } else if !file.path.starts_with('/') {
             // Not a path, not a pipe, and not the terminal: a socket. Nothing
             // here can rebuild that from a name.
@@ -4544,7 +4566,7 @@ fn stage_fork_fds(h: &Host, child: i32) {
             cloexec as i32,
             file.flags(),
             file.offset(),
-            file.path
+            name
         ));
     }
     *FORK_FDS.0.borrow_mut() = out;
@@ -4640,6 +4662,21 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                     !write,
                     write,
                 )
+            } else if let Some(id) = path.strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
+                // An id the parent already asked the global kernel to
+                // duplicate, so this file is the parent's file whatever has
+                // happened to its name since.
+                let Some(root) = global_root() else { continue };
+                let acc = flags & gex_kernel::fs::oflags::ACCMODE;
+                let f = gex_kernel::file::OpenFile::new(
+                    gex_kernel::vfs::remote::adopt(root.remote(), id),
+                    String::new(),
+                    flags,
+                    acc != gex_kernel::fs::oflags::O_WRONLY,
+                    acc != gex_kernel::fs::oflags::O_RDONLY,
+                );
+                f.set_offset(offset);
+                f
             } else if let Some((handle, readable, writable)) = console_handle(path) {
                 // The terminal, which is this Worker's and not a file. A dup
                 // of it in the parent has to be a dup of it here.
@@ -4657,7 +4694,19 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                         None => Err(e),
                     }
                 });
-                let Ok(handle) = handle else { continue };
+                let handle = match handle {
+                    Ok(h) => h,
+                    Err(e) => {
+                        // Never quietly. A descriptor that does not arrive is
+                        // an `EBADF` at the child's first use of it, a long
+                        // way from here and with nothing pointing back.
+                        warn_line(&format!(
+                            "gex: fork left fd {fd} ({path}) behind: errno {}\n",
+                            e.0
+                        ));
+                        continue;
+                    }
+                };
                 let acc = flags & gex_kernel::fs::oflags::ACCMODE;
                 let f = gex_kernel::file::OpenFile::new(
                     handle,

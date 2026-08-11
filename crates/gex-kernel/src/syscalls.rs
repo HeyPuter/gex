@@ -40,6 +40,7 @@ pub mod nr {
     pub const FTRUNCATE: u64 = 46;
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
+    pub const FCHDIR: u64 = 50;
     pub const FCHMOD: u64 = 52;
     pub const FCHMODAT: u64 = 53;
     pub const OPENAT: u64 = 56;
@@ -1859,6 +1860,7 @@ impl Kernel {
             nr::READLINKAT => self.sys_readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.sys_getcwd(m, a[0], a[1]),
             nr::CHDIR => self.sys_chdir(m, a[0]),
+            nr::FCHDIR => self.sys_fchdir(a[0] as i32),
             nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
             nr::UNLINKAT => self.sys_unlinkat(m, a[0] as i32, a[1], a[2]),
             nr::RENAMEAT => self.sys_renameat(m, a[0] as i32, a[1], a[2] as i32, a[3]),
@@ -2903,6 +2905,38 @@ impl Kernel {
         let raw = m.read_cstr(path, 4096)?;
         let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
         self.vfs.set_cwd(&p).map(|_| 0)
+    }
+
+    /// `fchdir`: the working directory named by a descriptor.
+    ///
+    /// This was not implemented at all, so it reached the default and
+    /// answered `ENOSYS`, and the program that noticed was `mkdir -p`:
+    ///
+    /// ```text
+    /// mkdir /tmp/p        -> 0
+    /// mkdir -p /tmp/q/r   -> cannot create directory /tmp/q:
+    ///                        Function not implemented
+    /// ```
+    ///
+    /// Only when there is an ancestor to create, because that is the path
+    /// where coreutils uses gnulib's `savewd` -- it keeps the working
+    /// directory as an open descriptor and returns to it with `fchdir`
+    /// between components. dpkg builds directory trees the same way, so
+    /// this stopped `apt-get install` as surely as anything downstream of
+    /// it did.
+    ///
+    /// A descriptor here already knows the absolute path it was opened as,
+    /// and `set_cwd` re-checks that it is a directory, which is the error a
+    /// descriptor on a regular file has to produce.
+    fn sys_fchdir(&mut self, fd: i32) -> SysResult {
+        let file = self.fds.get(fd)?;
+        let path = file.path.clone();
+        // A pipe or a socket has a name that is not a path. `ENOTDIR` is
+        // what Linux says about a descriptor that is not a directory.
+        if !path.starts_with('/') {
+            return Err(Errno::ENOTDIR);
+        }
+        self.vfs.set_cwd(&path).map(|_| 0)
     }
 
     fn sys_mkdirat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
@@ -4682,6 +4716,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::FTRUNCATE => "ftruncate",
         nr::FACCESSAT | nr::FACCESSAT2 => "faccessat",
         nr::CHDIR => "chdir",
+        nr::FCHDIR => "fchdir",
         nr::FCHMOD => "fchmod",
         nr::FCHMODAT => "fchmodat",
         nr::OPENAT => "openat",

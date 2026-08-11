@@ -42,6 +42,9 @@ pub struct Remote {
     /// Open, returning a handle id or a negated errno.
     pub open: extern "C" fn(path: u32, path_len: u32, flags: u64, mode: u32) -> i32,
     pub close: extern "C" fn(handle: i32),
+    /// A second id for one open file, for a child to inherit. Returns the
+    /// new id or a negated errno.
+    pub dup: extern "C" fn(handle: i32) -> i32,
     pub read: extern "C" fn(handle: i32, offset: u64, at: u32, len: u32) -> i32,
     pub write: extern "C" fn(handle: i32, offset: u64, at: u32, len: u32) -> i32,
     /// Write this handle's metadata as [`META_BYTES`] bytes at `at`.
@@ -185,6 +188,12 @@ impl RemoteFs {
     pub fn new(remote: Remote) -> RemoteFs {
         RemoteFs { remote }
     }
+
+    /// The calls this filesystem is reached by, for a caller that has an id
+    /// rather than a path -- a child adopting a descriptor across a fork.
+    pub fn remote(&self) -> Remote {
+        self.remote
+    }
 }
 
 impl std::fmt::Debug for RemoteFs {
@@ -294,7 +303,20 @@ impl Drop for RemoteHandle {
     }
 }
 
+/// A handle onto an id the global kernel already holds.
+///
+/// What `fork` hands a child: the parent asks the global kernel for a second
+/// id onto the same open file and the child wraps it, so an unlinked file --
+/// or one whose name now means something else -- crosses intact.
+pub fn adopt(remote: Remote, id: i32) -> Arc<dyn FileHandle> {
+    Arc::new(RemoteHandle { id, remote })
+}
+
 impl FileHandle for RemoteHandle {
+    fn remote_id(&self) -> Option<i32> {
+        Some(self.id)
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         let n = ok((self.remote.read)(
             self.id,
