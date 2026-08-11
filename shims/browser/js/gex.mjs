@@ -727,6 +727,24 @@ export class Gex {
     // handshake into the dead descriptor and blocks on a reply that cannot
     // come.
     this.#shim.exports.gex_set_virgl?.(this.#virgl ? (this.#virglTrace ? 2 : 1) : 0);
+    // And the network, which was the one of the three this path did not set.
+    //
+    // `attach` sets all three, and `attach` is how a *forked child* starts.
+    // `load` is how pid 1 starts, and it set the GPU and virgl and stopped --
+    // so a network reached every process a run forked and never the one it
+    // began with. In the Debian demo that is apt's methods downloading
+    // happily while bash, in the same run with the same proxy, cannot open a
+    // socket at all:
+    //
+    //     /cmd.sh: socket: Address family not supported by protocol
+    //
+    // `kernel.net` is decided inside `gex_load` from this flag, so it has to
+    // be set before it and not merely before the guest runs.
+    //
+    // It has to be here rather than in `useNetwork`, which is called before
+    // the shim exists and says so itself. The same reasoning already applies
+    // to the two lines above; the network was simply left out of it.
+    this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
     // wasm-ld puts the shim's stack at address zero regardless of
     // --global-base, which is the guest's image. Move it into the shim's own
     // region, above everything the guest maps. Nothing has run yet.

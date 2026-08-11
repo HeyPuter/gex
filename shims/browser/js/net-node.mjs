@@ -74,6 +74,16 @@ export class NodeNetwork {
   recv(id, out) {
     const s = this.#sockets.get(id);
     if (!s) return 0;
+    // Nothing buffered is not the end of the stream.
+    //
+    // Zero means end of stream in this interface and -1 means "not yet", and
+    // this returned zero for both -- so a guest reading faster than the
+    // socket delivers, which is every guest, saw the connection finish the
+    // first time it got ahead. busybox wget: `connection closed
+    // prematurely`, on a file that was still arriving. `web/src/net.js` has
+    // the distinction right; this is the Node half of the same interface and
+    // never did.
+    if (!s.rx.length) return s.eof || s.status === REFUSED ? 0 : -1;
     let n = 0;
     while (n < out.length && s.rx.length) {
       const head = s.rx[0];
