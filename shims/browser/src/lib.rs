@@ -1702,6 +1702,68 @@ pub extern "C" fn gex_has_host() -> i32 {
 /// that succeeded, so the message can name both.
 static HOST_HOLDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The last few syscalls this process made, for the report when it dies.
+///
+/// A process that dies of a signal it raised itself says nothing about why:
+/// `abort` is `raise(SIGABRT)` and glibc prints a diagnostic only for the
+/// cases that have one, so `dpkg-deb`'s decompressing child aborting after
+/// exactly 157 pipe-fulls left the whole run with one line of evidence and
+/// it was written by the *parent*. What led there is the last thing the
+/// child asked the kernel for -- a short read, a failed mapping, a write
+/// that returned something it did not expect -- and that was not recorded
+/// anywhere.
+///
+/// Four words an entry, packed into one atomic each: number, first two
+/// arguments, and what came back. Sixteen entries is a screenful and costs
+/// four stores on a path that already does far more than that.
+const SYS_RING: usize = 16;
+static SYS_NR: [std::sync::atomic::AtomicU64; SYS_RING] =
+    [const { std::sync::atomic::AtomicU64::new(!0) }; SYS_RING];
+static SYS_A0: [std::sync::atomic::AtomicU64; SYS_RING] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; SYS_RING];
+static SYS_A1: [std::sync::atomic::AtomicU64; SYS_RING] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; SYS_RING];
+static SYS_RET: [std::sync::atomic::AtomicU64; SYS_RING] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; SYS_RING];
+static SYS_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Record a syscall on entry, and return where to put its result.
+fn sys_note(nr: u64, a0: u64, a1: u64) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let i = SYS_AT.fetch_add(1, Relaxed) % SYS_RING;
+    SYS_NR[i].store(nr, Relaxed);
+    SYS_A0[i].store(a0, Relaxed);
+    SYS_A1[i].store(a1, Relaxed);
+    SYS_RET[i].store(!0, Relaxed);
+    i
+}
+
+fn sys_ret(i: usize, ret: u64) {
+    SYS_RET[i].store(ret, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The ring, oldest first, as `name(a0, a1) = ret`.
+fn sys_recent() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = SYS_AT.load(Relaxed);
+    let mut out = String::new();
+    for k in 0..SYS_RING.min(n) {
+        let i = (n + k) % SYS_RING;
+        let nr = SYS_NR[i].load(Relaxed);
+        if nr == !0 {
+            continue;
+        }
+        out.push_str(&format!(
+            " {}({:#x}, {:#x})={:#x}",
+            gex_kernel::syscalls::syscall_name(nr),
+            SYS_A0[i].load(Relaxed),
+            SYS_A1[i].load(Relaxed),
+            SYS_RET[i].load(Relaxed),
+        ));
+    }
+    out
+}
+
 /// The last few `with_host` call sites, oldest first, for the message below.
 ///
 /// A location alone says who is holding the kernel and not how it got there,
@@ -4172,7 +4234,72 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             set_resume_ctx(kstate.ctx_addr);
             return 1;
         }
+        // Recorded before the call, because the kernel writes the result over
+        // `x0` and a report read afterwards would show every call taking its
+        // own return value as its first argument.
+        // A syscall from a process that has already exited.
+        //
+        // `exit_process` tears the descriptor table down, so anything the
+        // guest does after this point fails in ways that look like ordinary
+        // bugs somewhere else -- `dpkg-deb`'s child was seen calling
+        // `exit_group(0)` and then writing a diagnostic to a stderr that no
+        // longer existed. Whether the guest truly runs on or the record is
+        // misleading is exactly what this says.
+        if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+            warn_line(&format!(
+                "[gex] pid {} made a {} after exiting",
+                h.kernel.pid,
+                gex_kernel::syscalls::syscall_name(nr),
+            ));
+        }
+        let a0 = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
+        let a1 = gm.read_u64(kstate.ctx_addr + ctx::x(1) as u64).unwrap_or(0);
+        let a2 = gm.read_u64(kstate.ctx_addr + ctx::x(2) as u64).unwrap_or(0);
+        let slot = sys_note(nr, a0, a1);
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
+        let ret = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
+        sys_ret(slot, ret);
+        // What the guest was trying to say when it could not say it.
+        //
+        // glibc reports a fatal condition by writing to fd 2 and then calling
+        // `abort`, so a diagnostic that fails to arrive turns a named failure
+        // into "killed by signal 6". `dpkg-deb`'s decompressing child does
+        // exactly that: `writev(2, ...)` comes back EBADF in one child and 0
+        // in the other, and the run is left with no idea what either of them
+        // found. Only on a write to stderr that did not go through whole, so
+        // a working program is silent.
+        if a0 == 2 && (nr == 64 || nr == 66) {
+            // (base, length) pairs: one for `write`, `a2` of them for
+            // `writev`, so the two cases differ only in where the list is.
+            let parts: Vec<(u64, u64)> = if nr == 64 {
+                vec![(a1, a2)]
+            } else {
+                (0..a2.min(16))
+                    .filter_map(|i| {
+                        Some((
+                            gm.read_u64(a1 + i * 16).ok()?,
+                            gm.read_u64(a1 + i * 16 + 8).ok()?,
+                        ))
+                    })
+                    .collect()
+            };
+            let want: u64 = parts.iter().map(|p| p.1).sum();
+            if ret != want {
+                let mut said = Vec::new();
+                for (p, n) in parts {
+                    if let Ok(b) = gm.read(p, n.min(200) as usize) {
+                        said.extend_from_slice(b);
+                    }
+                }
+                warn_line(&format!(
+                    "[gex] pid {} could not reach stderr ({} of {want} bytes in {} parts): {}",
+                    h.kernel.pid,
+                    ret as i64,
+                    a2,
+                    String::from_utf8_lossy(&said).trim_end(),
+                ));
+            }
+        }
         h.kernel.leave_thread(&mut h.threads[cur()].kstate);
         match outcome {
             SyscallOutcome::Continue => 0,
@@ -4187,7 +4314,29 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             // shutdown, and the method installs no handler -- and the whole
             // guest went down with it, after the download had succeeded.
             // Negative for "died of a signal"; see `exit_process`.
-            SyscallOutcome::Killed { signal, .. } => exit_process(h, -(signal as i32)),
+            SyscallOutcome::Killed { signal, .. } => {
+                // Loudly, and whatever the tracing settings.
+                //
+                // A guest that dies of a signal used to leave nothing at all
+                // on the console: the process simply stopped and its parent
+                // reported whatever it made of the wait status. `dpkg-deb`
+                // saying "<decompress> subprocess was killed by signal
+                // (Aborted)" was the only evidence that anything had happened
+                // in the child, and it names neither the pid nor where it was.
+                // The call it died in, by number and arguments, because
+                // "killed by signal 6" is true of every `abort` and says
+                // nothing about which one. A guest raises its own SIGABRT
+                // through `tgkill`, and the arguments say whether it aimed at
+                // itself.
+                let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                warn_line(&format!(
+                    "[gex] pid {} killed by signal {} at pc={at:#x}, last calls:{}",
+                    h.kernel.pid,
+                    signal,
+                    sys_recent(),
+                ));
+                exit_process(h, -(signal as i32))
+            }
             SyscallOutcome::SpawnThread {
                 ctx_addr,
                 tid,
@@ -5239,6 +5388,20 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
     if tracing() {
         trace_line(&format!("[proc] exit {pid} with {code}\n"));
     }
+    // And nowhere to resume, which has to be said rather than assumed.
+    //
+    // The host's loop reads `gex_resume_pc` after every trap and re-enters the
+    // guest when it is set, so a resume left over from an earlier parked call
+    // -- a `write` that waited for room in a pipe, say -- sends a process that
+    // has just called `exit_group` back into its own code with its descriptor
+    // table already emptied. `dpkg-deb`'s decompressing child did exactly
+    // that: `exit_group(0)`, then six more syscalls, then glibc found a heap
+    // it had already torn down, printed `free(): invalid pointer` to a stderr
+    // that was now EBADF, and aborted. The parent reported "<decompress>
+    // subprocess was killed by signal (Aborted)" and every `apt install` died
+    // on it.
+    set_resume_none();
+    set_resume_ctx_none();
     // A shell reports a signal death as 128 + the signal, and so does this.
     set_exit(h, if code < 0 { 128 - code } else { code });
     2

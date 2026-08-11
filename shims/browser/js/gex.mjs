@@ -2312,7 +2312,12 @@ export class Gex {
         // is a copy of it as `fork` left it.
         await this.#drainFork();
         await this.#drainThread();
-        const next = e.gex_resume_pc();
+        // A process that has exited is not resumed, whatever the shim left in
+        // the resume slot. The shim clears it in `exit_process` now, and this
+        // is the same rule stated on the side that acts on it: re-entering a
+        // guest whose descriptors have been released produces failures that
+        // read as bugs anywhere but here.
+        const next = e.gex_exited?.() ? 0n : e.gex_resume_pc();
         if (next !== 0n) {
           pc = next;
           const nextCtx = e.gex_resume_ctx() >>> 0;

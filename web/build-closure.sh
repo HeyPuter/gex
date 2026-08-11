@@ -83,7 +83,17 @@ echo "building the closure for $program..."
 # from a closure that contains libapt-pkg, because almost everything in it
 # is reached through a vtable. The whole build is larger and nothing else
 # changes; the page fetches a library only when a guest branches into it.
-whole="${GEX_WHOLE:-libc.so,ld-linux,$(basename "$program")}"
+#
+# The compressors are in the default list for the same reason and it is not
+# a C++ reason: liblzma reaches every coder through `lzma_next_coder.code`,
+# a function pointer installed when the filter chain is built, so a scanner
+# that follows calls finds the setup and none of the decoding. Measured on
+# `dpkg-deb --fsys-tarfile libc6.deb` in the browser, the decompressing child
+# lifted 1,537 blocks of liblzma at run time with only 15 of its translations
+# landing on a closure page -- from a closure that contains liblzma. They are
+# small enough that naming them costs almost nothing, and every archive apt
+# unpacks goes through one of them.
+whole="${GEX_WHOLE:-libc.so,ld-linux,liblzma,libz.so,libbz2,libzstd,$(basename "$program")}"
 if [ "$whole" = all ]; then
     mode="--exhaustive"
 else
