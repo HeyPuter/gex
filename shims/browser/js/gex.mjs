@@ -896,7 +896,17 @@ export class Gex {
         const gp = this.#shim.exports.gex_alloc(meta.length) >>> 0;
         this.#bytes().set(meta, gp);
         const tCopied = performance.now();
-        need = add(gp, meta.length) >>> 0;
+        // With the program this library is the image of, when it is one.
+        // Every root of a closure is an image and they all claim `PIE_BASE`,
+        // so the runtime tells them apart by program rather than by page.
+        const prog = new TextEncoder().encode(paired ? (entry.program ?? '') : '');
+        let pp = 0;
+        if (prog.length) {
+          pp = this.#shim.exports.gex_alloc(prog.length) >>> 0;
+          this.#bytes().set(prog, pp);
+        }
+        need = add(gp, meta.length, pp, prog.length) >>> 0;
+        if (pp) this.#shim.exports.gex_free?.(pp, prog.length);
         const tAdded = performance.now();
         this.#shim.exports.gex_free?.(gp, meta.length);
         if (globalThis.GEX_DEBUG_EXIT) {
@@ -2617,7 +2627,7 @@ export class Gex {
     const t0 = performance.now();
     const gp = e.gex_alloc(lazy.meta.length) >>> 0;
     this.#bytes().set(lazy.meta, gp);
-    e.gex_publish_closure_module(gp, lazy.meta.length);
+    e.gex_publish_closure_module(gp, lazy.meta.length, i);
     e.gex_free?.(gp, lazy.meta.length);
     this.#growTables(lazy.need);
     if (globalThis.GEX_DEBUG_EXIT) {

@@ -105,5 +105,12 @@ export async function loadClosure(base, { image = false, log = () => {} } = {}) 
       img = await fetchBytes(`${base}/${encodeURIComponent(manifest.image)}`);
     }
   }
+  // `images` maps a library file to the program whose image it is. The
+  // loader passes it through so the shim can decide, per process, whether the
+  // pages at `PIE_BASE` belong to the program actually running.
+  const images = manifest.images ?? {};
+  for (const [i, n] of manifest.libs.entries()) {
+    if (images[n]) libs[i].program = images[n];
+  }
   return { image: img, program: manifest.program, libs, pins: manifest.pins };
 }

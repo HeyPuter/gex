@@ -617,6 +617,7 @@ fn build_closure(
     }
     let stem = out.strip_suffix(".wasm").unwrap_or(out);
     let mut pins = String::new();
+    let mut images = String::new();
     let (mut blocks, mut insts, mut bytes_total) = (0usize, 0usize, 0usize);
 
     // Where the next object's slots start. Every object of the closure runs
@@ -659,8 +660,17 @@ fn build_closure(
         // Not the interpreter: it is placed by the loader rather than by a
         // reservation, so there is nothing to pin and a line for it would
         // only ever be reported as never reserved.
-        if n > 0 && Some(o.path.as_str()) != interp.as_deref() && !is_interp_name(&o.name) {
+        // An image is not pinned either: every root sits at `PIE_BASE` and
+        // gex's own loader puts it there, so there is no reservation to
+        // catch and a pin line would only ever be reported as never
+        // reserved. `depth == 0` is what makes an object a root.
+        if o.depth > 0 && Some(o.path.as_str()) != interp.as_deref() && !is_interp_name(&o.name) {
             pins.push_str(&format!("{:#x} {:#x} {}\n", o.image.bias, o.span, o.path));
+        }
+        // And which file holds which program's image, so the loader can tell
+        // a process the pages at `PIE_BASE` are or are not its own.
+        if o.depth == 0 {
+            images.push_str(&format!("{} {}\n", file.rsplit('/').next().unwrap_or(&file), o.path));
         }
         first_slot = module.metadata().next_slot;
         blocks += stats.blocks;
@@ -676,6 +686,8 @@ fn build_closure(
     }
     let pin_file = format!("{stem}.pins");
     std::fs::write(&pin_file, pins).with_context(|| format!("writing {pin_file}"))?;
+    let image_file = format!("{stem}.images");
+    std::fs::write(&image_file, images).with_context(|| format!("writing {image_file}"))?;
     eprintln!(
         "{} objects: {} blocks, {} guest instructions, {} KiB wasm; layout in {}",
         closure.objects.len(),

@@ -2735,6 +2735,18 @@ static LAZY_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
 /// The closure library covering this page, or -1.
 #[no_mangle]
 pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
+    if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+        let claims = IMAGE_PAGES.0.borrow();
+        let Some(idxs) = claims.get(&page) else {
+            return -1;
+        };
+        return with_host(|h| {
+            idxs.iter()
+                .find(|i| image_is_ours(h, **i))
+                .map(|i| *i as i32)
+                .unwrap_or(-1)
+        });
+    }
     CLOSURE_OWNER
         .0
         .borrow()
@@ -2881,8 +2893,46 @@ pub extern "C" fn gex_set_metadata(ptr: u32, len: u32) {
 /// Returns the slot count the table must be grown to, or zero if the
 /// metadata could not be read -- in which case the caller must not install
 /// the module, since its blocks would land in slots nothing has claimed.
+/// The program each closure library is the image of, by registration order.
+/// Empty for a shared library, which is every object that is not a root.
+static LIB_PROGRAM: SingleThreaded<Vec<String>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
+
+/// Which image libraries claim each page below `INTERP_BASE`.
+///
+/// Every root of a closure is an image and every image sits at `PIE_BASE`, so
+/// they all claim the same pages. Which one a process may have is decided by
+/// the program it is running, not by the page.
+static IMAGE_PAGES: SingleThreaded<std::collections::BTreeMap<u64, Vec<usize>>> =
+    SingleThreaded(const { RefCell::new(std::collections::BTreeMap::new()) });
+
+/// The program whose image this process is running, from the identity the
+/// loader recorded for the mapping at `PIE_BASE`.
+fn current_image_program(h: &Host) -> Option<String> {
+    h.kernel
+        .mem
+        .vmas()
+        .iter()
+        .find(|v| v.start <= gex_abi::PIE_BASE && gex_abi::PIE_BASE < v.end)
+        .and_then(|v| v.code.as_ref().map(|(p, _)| p.clone()))
+}
+
+/// Whether image library `idx` is the one this process is running.
+fn image_is_ours(h: &Host, idx: usize) -> bool {
+    let progs = LIB_PROGRAM.0.borrow();
+    let Some(want) = progs.get(idx).filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    match current_image_program(h) {
+        Some(have) => have == *want,
+        // An identity this side does not know is not evidence of anything;
+        // see the note on `image_pages_are_ours`.
+        None => true,
+    }
+}
+
 #[no_mangle]
-pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
+pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len: u32) -> u32 {
     let Some(meta) = gex_xlate::Metadata::decode(shim_slice(ptr, len)) else {
         return 0;
     };
@@ -2905,10 +2955,27 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
     // `fillSlot` instantiates it on the way.
     FILL_POSSIBLE.store(true, std::sync::atomic::Ordering::Relaxed);
     {
-        let idx = CLOSURE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let idx = CLOSURE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+        let program = std::str::from_utf8(shim_slice(prog, prog_len))
+            .unwrap_or("")
+            .to_string();
+        {
+            let mut progs = LIB_PROGRAM.0.borrow_mut();
+            if progs.len() <= idx {
+                progs.resize(idx + 1, String::new());
+            }
+            progs[idx] = program.clone();
+        }
         let mut owner = CLOSURE_OWNER.0.borrow_mut();
+        let mut images = IMAGE_PAGES.0.borrow_mut();
         for (page, _) in &meta.dir_entries {
-            owner.insert(*page, idx);
+            // An image's pages are claimed by program, not by page: every
+            // root of the closure is at `PIE_BASE` and they all claim these.
+            if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+                images.entry(*page).or_default().push(idx);
+            } else {
+                owner.insert(*page, idx as u32);
+            }
         }
     }
     // Registered, not published. See `gex_publish_closure_module`.
@@ -2986,7 +3053,7 @@ fn image_pages_are_ours(h: &Host) -> bool {
 }
 
 #[no_mangle]
-pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32) -> u32 {
+pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u32 {
     let Some(meta) = gex_xlate::Metadata::decode(shim_slice(ptr, len)) else {
         return 0;
     };
@@ -2994,9 +3061,10 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32) -> u32 {
     // instance's tables, so the new program gets every library the old one
     // reached for nothing.
     with_host(|h| {
-        // Not the image's pages, unless this process is running the image's
-        // program. See `image_pages_are_ours`.
-        let ours = image_pages_are_ours(h);
+        // Not the image's pages, unless this process is running *this*
+        // image's program. Every root of the closure is an image and they all
+        // sit at `PIE_BASE`, so the question is which one, not whether.
+        let ours = image_is_ours(h, idx as usize);
         let mut gm = GuestMem::new(guest_bytes());
         for (page, base) in &meta.dir_entries {
             if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE && !ours {

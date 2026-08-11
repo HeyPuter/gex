@@ -179,7 +179,8 @@ async function handle(msg) {
   if (msg?.kind === 'closureMeta') {
     // Registration only: which library owns which page. The compiled module
     // for each is asked for when a branch lands in it.
-    for (const meta of msg.metas ?? []) noteClosureModule({ meta, mod: null });
+    (msg.metas ?? []).forEach((meta, i) =>
+      noteClosureModule({ meta, mod: null, program: (msg.programs ?? [])[i] ?? '' }));
     expected = arrived.length;
     allHereIs?.();
     return;

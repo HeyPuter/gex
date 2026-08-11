@@ -230,8 +230,12 @@ export class ProcessHost {
   /// and `wantLibrary` fetches it then.
   #streamClosure(w, closure) {
     const metas = (closure ?? []).map((e) => (e instanceof Uint8Array ? e : e.meta));
+    // And which program each library is the image of, where it is one. Every
+    // root of a closure is an image and they all claim `PIE_BASE`, so this is
+    // how a Worker tells `ls`'s pages from `bash`'s.
+    const programs = (closure ?? []).map((e) => (e instanceof Uint8Array ? '' : (e.program ?? '')));
     try {
-      w.postMessage({ kind: 'closureMeta', metas });
+      w.postMessage({ kind: 'closureMeta', metas, programs });
     } catch (e) {
       this.#onOutput(2, `gex: the closure metadata did not reach a worker: ${e.message}\n`, 0);
     }

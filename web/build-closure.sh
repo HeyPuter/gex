@@ -120,10 +120,24 @@ for line in open(os.path.join(work, 'c.pins')):
 # else. It used to instantiate the image module because the image module *was*
 # the guest module -- 42 MB and 212,000 functions of `bash` in every one of
 # the hundred processes an `apt-get update` starts, none of which run a shell.
-json.dump({'image': None, 'program': sys.argv[3],
+# Which library holds which program's image.
+#
+# Every root of the closure is an image now, all of them at `PIE_BASE`, and
+# the runtime hands a process the pages of the one whose program it is
+# actually running. Without this map it could not tell them apart, and `ls`
+# would get `bash`'s blocks -- which is the failure that kept image objects
+# down to one per closure in the first place.
+images = {}
+ipath = os.path.join(work, 'c.images')
+if os.path.exists(ipath):
+    for line in open(ipath):
+        f = line.split()
+        if len(f) >= 2:
+            images[f[0]] = ' '.join(f[1:])
+json.dump({'image': None, 'program': sys.argv[3], 'images': images,
            'libs': libs, 'pins': pins},
           open(os.path.join(out, 'closure.json'), 'w'))
-print(f"  {len(libs)} libraries, {len(pins)} pins")
+print(f"  {len(libs)} libraries, {len(pins)} pins, {len(images)} images")
 PY
 
 echo "web/public/closure/$name: $(du -sh "$out" | cut -f1)"

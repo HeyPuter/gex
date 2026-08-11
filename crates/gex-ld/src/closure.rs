@@ -134,18 +134,26 @@ pub fn resolve_all(
         if let Some(s) = &exe.soname {
             seen.insert(s.clone());
         }
-        // Only the program becomes an object. The helpers are here for what
-        // they *need*, not for themselves: each is a separate executable and
-        // would want the image module's own base, which the program already
-        // has. Emitting them would put two objects at `PIE_BASE` and the
-        // second one's dispatch entries would land on the first's pages.
+        // Every root becomes an object, not just the first.
         //
-        // Their own text is small next to what they pull in -- apt's `file`
-        // method is 67 KiB against libseccomp's 180 -- so the run translates
-        // it and nothing much is lost.
-        if n_root > 0 || !fresh {
+        // It used to be only the first, because two images both want
+        // `PIE_BASE` and the second one's dispatch entries would land on the
+        // first's pages. That is true of the *directory*, which is per
+        // process, and the runtime now arbitrates it: an image's pages are
+        // published only to a process whose own image identity matches the
+        // program that module was built from. The dispatch *table* never
+        // collided -- slots are handed out by one allocator across the whole
+        // closure, so each image has a range of its own.
+        //
+        // What it cost to leave them out was the whole point of the project.
+        // `ls` is not in the closure, so a warm `ls` lifts 3,126 blocks of
+        // its own text, and the next one lifts 3,554: every command a shell
+        // runs is translated from scratch, every time, while the shell and
+        // the libraries around it are statically recompiled.
+        if !fresh {
             continue;
         }
+        let _ = n_root;
         let exe_span = exe.brk.saturating_sub(exe.bias);
         out.objects.push(Object {
             path: exe_path.clone(),
