@@ -2727,3 +2727,29 @@ exists for.
 libc is one of the two objects built `--exhaustive-for`, so the next question
 is whether it is "whole" that is wrong or "static": a closure with libc
 reachable-only separates them.
+
+### Resolved: exhaustive discovery trusted segment permissions
+
+`is_executable` exists to say which bytes in a `PF_X` mapping are really
+instructions -- its own comment records discovery disassembling "MESA" and
+"PIPE" into blocks that end in SIGILL, which is #46. Every discovery pass asks
+it. The exhaustive seed loop did not: it walked every four-byte address in the
+segment, and for a shared library that segment holds the string tables, the
+relocations and `.rodata` alongside the code.
+
+The cost is not a wasted block. An address in `.rodata` that happens to decode
+becomes a block; a block starting inside an instruction is wrong code; and
+region folding lets such a block cover the slot of a real entry point, so a
+real call reaches it. That is why the fault appeared at a different syscall
+when the workload changed and why it vanished under `?closure=0`.
+
+    libc whole, before   295,294 blocks   apt: 3 children die
+    libc whole, after    282,079 blocks   apt: 0, run passes
+
+13,215 blocks -- 4.5% of the module -- were never instructions.
+
+Two habits paid for themselves here and are worth keeping. Bisecting the
+closure with `?libs=N` turned "which of thirty-three libraries" into six
+runs of thirty seconds. And `?closure=0` -- run the same thing on the runtime
+translator alone -- is the question that separates "the guest is wrong" from
+"what we handed the guest is wrong", which nothing else could answer.
