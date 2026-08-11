@@ -585,12 +585,15 @@ async function handle(msg) {
     } catch {
       // Nothing to add.
     }
-    // The stack too, under GEX_DEBUG_EXIT. A trap out of the shim reaches
-    // here as `unreachable` and nothing else; which export was on the stack
-    // is the only thing that says where to look, and it is readable here.
-    if (msg.debugExit) {
-      console.error(`gex: worker threw: ${e?.message ?? e}${where}\n${e?.stack ?? ''}`);
-    }
+    // Always, not under a flag.
+    //
+    // Everything gathered above -- the guest's pc, the object it is in, the
+    // global kernel's panic text -- was printed only when `GEX_DEBUG_EXIT`
+    // was set, and posted to the host as a bare message otherwise. So the
+    // default way to meet a crash was a single short line with none of the
+    // evidence, and the evidence existed and was thrown away. A debug switch
+    // should add detail to a failure, never be the condition for seeing one.
+    console.error(`gex: worker threw: ${e?.message ?? e}${where}\n${e?.stack ?? ''}`);
     // Before the message: this process has stopped existing, and until the
     // table knows that, its parent's `wait4` is parked on a child that will
     // never report. See `gex_abandon` -- this is #69, and a crash in a child
@@ -604,7 +607,11 @@ async function handle(msg) {
     } catch {
       // The shim is what just fell over; there may be nothing left to call.
     }
-    port.post({ kind: 'threw', message: (e?.message ?? String(e)) + where });
+    port.post({
+      kind: 'threw',
+      message: (e?.message ?? String(e)) + where,
+      stack: e?.stack ?? '',
+    });
   }
 }
 

@@ -12,6 +12,37 @@ function rule(ctx, label) {
   ctx.term.writeln(ctx.ansi.dim(`── ${label} ${'─'.repeat(w)}`));
 }
 
+
+/**
+ * A demo that failed, said as loudly as this page can say anything.
+ *
+ * Every one of these used to write `e.message` to the terminal and nothing
+ * else: one line, no stack, no cause, and no way to tell a wasm trap from a
+ * fetch that answered with a web page. The console got nothing at all,
+ * because the only console line on the failure path was behind `?debug=1` --
+ * so a report of "it crashes with an install fail" could not be acted on, and
+ * the run that produced it could not be reproduced from what it printed.
+ *
+ * The console gets the error object itself, so devtools can expand it and the
+ * stack is real rather than a string. The terminal gets the message and the
+ * top of the stack, because the terminal is what a person is looking at.
+ */
+function failed(ctx, e) {
+  const msg = e?.message ?? String(e);
+  console.error('[gex] the demo failed:', e);
+  try {
+    ctx.term.writeln('');
+    ctx.term.writeln(ctx.ansi.red(`gex: ${msg}`));
+    for (const line of String(e?.stack ?? '').split('\n').slice(1, 9)) {
+      if (line.trim()) ctx.term.writeln(ctx.ansi.dim(`    ${line.trim()}`));
+    }
+    if (e?.cause) ctx.term.writeln(ctx.ansi.dim(`    caused by ${e.cause}`));
+  } catch {
+    // The terminal is the nicety; the console above is the guarantee.
+  }
+  ctx.status(msg, 'bad');
+}
+
 // -- 1: any binary --------------------------------------------------------
 
 const upload = {
@@ -76,8 +107,7 @@ const upload = {
         rule(ctx, `exit ${status} in ${ms} ms`);
         ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
       } catch (e) {
-        ctx.term.writeln(ctx.ansi.red(`\r\n${e.message}`));
-        ctx.status(e.message, 'bad');
+        failed(ctx, e);
       } finally {
         running(false);
       }
@@ -152,8 +182,7 @@ async function boot(ctx) {
     ctx.term.writeln(ctx.ansi.dim(`\r\n[shell exited ${status}]`));
     ctx.status('finished', 'good');
   } catch (e) {
-    ctx.term.writeln(ctx.ansi.red(`\r\n${e.message}`));
-    ctx.status(e.message, 'bad');
+    failed(ctx, e);
   } finally {
     running(false);
     ctx.idle();
@@ -319,8 +348,7 @@ async function bootDebian(ctx) {
     ctx.term.writeln(ctx.ansi.dim(`\r\n[bash exited ${status}]`));
     ctx.status('finished', 'good');
   } catch (e) {
-    ctx.term.writeln(ctx.ansi.red(`\r\n${e.message}`));
-    ctx.status(e.message, 'bad');
+    failed(ctx, e);
   } finally {
     running(false);
     ctx.idle();
@@ -417,8 +445,7 @@ const gears = {
         rule(ctx, `exit ${status} in ${ms} ms`);
         ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
       } catch (e) {
-        ctx.term.writeln(ctx.ansi.red(`\r\n${e.message}`));
-        ctx.status(e.message, 'bad');
+        failed(ctx, e);
       } finally {
         running(false);
         ctx.idle();
@@ -585,8 +612,7 @@ const virglGears = {
         }
         ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
       } catch (e) {
-        ctx.term.writeln(ctx.ansi.red(`\r\n${e.message}`));
-        ctx.status(e.message, 'bad');
+        failed(ctx, e);
       } finally {
         running(false);
         ctx.idle();

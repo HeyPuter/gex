@@ -504,7 +504,13 @@ export class ProcessHost {
         break;
       case 'threw':
         this.#release(pid, w);
-        reject(new Error(m.message));
+        // Said here as well as in the Worker, because only this side knows
+        // *which process* fell over -- and because a child's promise often
+        // has nobody awaiting it, so rejecting alone can be silent.
+        console.error(`[gex] pid ${pid} threw: ${m.message}\n${m.stack ?? ''}`);
+        reject(
+          Object.assign(new Error(`pid ${pid}: ${m.message}`), { guestStack: m.stack }),
+        );
         break;
       default:
         this.#onOther(m, pid, w);
