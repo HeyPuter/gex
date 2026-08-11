@@ -747,6 +747,21 @@ export class Gex {
     // how many processes a tab can run.
     const enc = new TextEncoder();
     const free = this.#shim.exports.gex_free;
+    // Empty directories first, so a file arriving under one finds it.
+    //
+    // `gex_add_file` makes the directories on the way to each file, so a
+    // tree with content in it arrives intact and an empty directory arrives
+    // not at all. `web/src/tar.js` collects them into `dirs` precisely so
+    // this can exist, and until now nothing passed them: apt met
+    // "Archives directory /var/cache/apt/archives/partial is missing" for a
+    // directory that is in the tar.
+    for (const path of opts.dirs ?? []) {
+      const p = enc.encode(path);
+      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+      this.#bytes().set(p, pp);
+      this.#shim.exports.gex_add_dir?.(pp, p.length);
+      free?.(pp, p.length);
+    }
     for (const [path, contents] of Object.entries(files)) {
       const p = enc.encode(path);
       const d = contents instanceof Uint8Array ? contents : enc.encode(contents);
@@ -2483,8 +2498,22 @@ export class Gex {
     // empty, so they have no element 0 of their own to grow from.
     const stub = tables[0].get(0);
     for (let i = 0; i < tables.length; i++) {
-      const want = need_of(i);
-      if (tables[i].length >= want) continue;
+      const need_i = need_of(i);
+      if (tables[i].length >= need_i) continue;
+      // Geometrically, not exactly.
+      //
+      // `Table.grow` reallocates and copies, so growing by what one module
+      // happens to want means copying an ever-larger table once per module.
+      // An `apt-key` process installs two hundred, and this went from 1ms to
+      // 747ms of a 1047ms install -- more than compiling and instantiating
+      // them put together. The closure path already knew this and grew once
+      // after its loop; the runtime path did not, and could not, because it
+      // meets its modules one at a time.
+      //
+      // Doubling makes the total copying linear in the final size. The cost
+      // is up to twice the table in address space, which is eight bytes a
+      // slot of a `WebAssembly.Table` that is mostly the miss stub.
+      const want = Math.min(Math.max(need_i, tables[i].length * 2), per);
       try {
         tables[i].grow(want - tables[i].length, stub);
       } catch (err) {

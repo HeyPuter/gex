@@ -682,6 +682,7 @@ fn install_bundle_remote() {
     // is left is to say the bundle is complete. `FILES` is empty on this path
     // and clearing it is only tidiness.
     FILES.0.borrow_mut().clear();
+    DIRS.0.borrow_mut().clear();
     if unsafe { k_fs_populated() } == 0 {
         unsafe { k_fs_populate_done() };
     }
@@ -2711,6 +2712,35 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     FILES.0.borrow_mut().push((name.to_string(), bytes));
 }
 
+/// A directory the bundle contains, whether or not anything is in it.
+///
+/// `gex_add_file` creates the directories on the way to each file, so a tree
+/// with content in it arrives intact. An *empty* directory has no file to
+/// carry it and simply did not exist in the guest -- and a program that
+/// expects one gets an error naming a path the rootfs plainly contains:
+///
+///   E: Archives directory /var/cache/apt/archives/partial is missing.
+///   W: Unable to read /etc/apt/preferences.d/ - DirectoryExists (2: ...)
+///
+/// Both of those are in the tar. `web/src/tar.js` even collects the
+/// directory entries into `dirs` -- and every caller dropped them on the
+/// floor, because there was nothing here to hand them to.
+#[no_mangle]
+pub extern "C" fn gex_add_dir(path: u32, path_len: u32) {
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return;
+    };
+    // SAFETY: the same shape as `gex_add_file` above -- scalars naming a
+    // range of this module's memory, and no borrow held across the call.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            unsafe { k_fs_mkdir(path, path_len, 0o755) };
+        }
+        return;
+    }
+    DIRS.0.borrow_mut().push(name.to_string());
+}
+
 /// The directory the closure's modules published, kept so an `execve` can
 /// have it back.
 ///
@@ -2787,9 +2817,23 @@ static PINS: SingleThreaded<Vec<(String, u64)>> =
 type Bundle = Vec<(String, Vec<u8>)>;
 static FILES: SingleThreaded<Bundle> = SingleThreaded(const { RefCell::new(Vec::new()) });
 
+/// Directories bundled by the page. See `gex_add_dir`: an empty one has no
+/// file to carry it and would otherwise not exist in the guest at all.
+static DIRS: SingleThreaded<Vec<String>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+
 /// Put the staged bundle into a filesystem, creating the directories on the
 /// way to each file.
 fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
+    // The empty ones first, so a file arriving under one of them finds it
+    // rather than making it again.
+    for name in std::mem::take(&mut *DIRS.0.borrow_mut()) {
+        let mut at = String::new();
+        for part in name.trim_start_matches('/').split('/').filter(|p| !p.is_empty()) {
+            at.push('/');
+            at.push_str(part);
+            root.add_dir(&at);
+        }
+    }
     for (name, bytes) in std::mem::take(&mut *FILES.0.borrow_mut()) {
         let mut at = String::new();
         for part in name

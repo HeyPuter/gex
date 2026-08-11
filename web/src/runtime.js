@@ -296,6 +296,10 @@ export async function runProgram(
   {
     elf,
     files = {},
+    // Directories the rootfs contains that hold no files. `gex_add_file`
+    // makes the ones on the way to a file, so only the empty ones need
+    // saying -- and they are exactly the ones apt looks for.
+    dirs = [],
     args,
     cwd = '/',
     tty = true,
@@ -447,12 +451,13 @@ export async function runProgram(
     const status = await host.start({
       elf,
       files,
+      dirs,
       args,
       // The layout the closure was built against. Without it the placer hands
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
       opts: {
-        cwd, tty, uid, recompileObjects, heartbeat, link, pins: closure?.pins,
+        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, pins: closure?.pins,
         program: closure?.program,
         // `?permiss=N`: how many stored units one dispatch miss may take.
         perMiss: typeof globalThis.GEX_PER_MISS === 'number' ? globalThis.GEX_PER_MISS : undefined,

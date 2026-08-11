@@ -31,7 +31,7 @@ ARCH=arm64
 # and there is no reason for a second copy of this script to say so.
 ROOTS="${GEX_DEBIAN_ROOTS:-apt dash bash coreutils dpkg findutils grep sed tar gzip diffutils \
        debianutils base-files base-passwd hostname ca-certificates \
-       libc-bin perl-base}"
+       libc-bin perl-base debian-archive-keyring}"
 
 mkdir -p "$WORK/debs" "$WORK/root"
 R="$WORK/root"
@@ -126,8 +126,23 @@ done
 
 echo "unpacking..."
 rm -rf "$R"
-mkdir -p "$R/var/lib/dpkg/info" "$R/etc/apt/sources.list.d" "$R/var/cache/apt/archives/partial" \
-         "$R/var/lib/apt/lists/partial" "$R/var/log" "$R/tmp" "$R/proc" "$R/dev" "$R/run"
+# Every directory apt and dpkg expect to find, whether or not anything in the
+# closure puts a file in one. apt does not create these and says so in a way
+# that reads like a broken rootfs rather than a missing directory:
+#
+#   E: Archives directory /var/cache/apt/archives/partial is missing.
+#   W: Unable to read /etc/apt/preferences.d/ - DirectoryExists (2: ...)
+#
+# `preferences.d` was never made at all; the rest were made here and then lost
+# on the way into the guest, because an empty directory has no file to carry
+# it. See `gex_add_dir`.
+mkdir -p "$R/var/lib/dpkg/info" "$R/var/lib/dpkg/updates" "$R/var/lib/dpkg/triggers" \
+         "$R/etc/apt/sources.list.d" "$R/etc/apt/preferences.d" "$R/etc/apt/apt.conf.d" \
+         "$R/etc/apt/trusted.gpg.d" "$R/etc/apt/keyrings" "$R/etc/dpkg/dpkg.cfg.d" \
+         "$R/var/cache/apt/archives/partial" "$R/var/cache/debconf" \
+         "$R/var/lib/apt/lists/partial" "$R/var/lib/apt/periodic" \
+         "$R/var/log/apt" "$R/var/log" "$R/tmp" "$R/proc" "$R/dev" "$R/run" \
+         "$R/var/tmp" "$R/usr/share/keyrings"
 for d in "$WORK"/debs/*.deb; do
     (cd "$WORK" && ar x "$d" && tar -C "$R" -xf data.tar.* && rm -f data.tar.* control.tar.* debian-binary)
 done

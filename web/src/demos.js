@@ -175,6 +175,7 @@ async function boot(ctx) {
     const { status } = await ctx.runProgram(ctx.term, {
       elf,
       files,
+      dirs: tree.dirs,
       args: ['/bin/sh', '-i'],
       cwd: '/root',
       tty: true,
@@ -325,6 +326,11 @@ async function bootDebian(ctx) {
     const { status } = await ctx.runProgram(ctx.term, {
       elf,
       files,
+      // The empty directories too. apt wants
+      // `/var/cache/apt/archives/partial` and `/etc/apt/preferences.d` to
+      // exist and holds no files in either, so without these it reports a
+      // rootfs missing directories that are in the tar.
+      dirs: tree.dirs,
       // `?cmd=apt-get update` runs one command and exits, instead of opening
       // a shell. A prompt is what a person wants and is exactly what nothing
       // else can drive: the demo that proves apt works could only be run by
@@ -574,6 +580,7 @@ const virglGears = {
         const { status } = await ctx.runProgram(ctx.term, {
           elf: files['/bin/sh'],
           files,
+          dirs: tree.dirs,
           args: ['/bin/sh', '/run.sh'],
           cwd: '/',
           tty: true,

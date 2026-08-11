@@ -485,7 +485,11 @@ for (const id of list) {
     failures++;
     // The end of the terminal, not just its last line: what a demo printed on
     // its way to failing is the only account of why.
-    for (const line of lastTerminal.trim().split('\n').slice(-20)) {
+    // Sixty lines, the same as a passing run gets under `GEX_STDERR=all`.
+    // Twenty was less than the run that failed had to say: a demo that gets
+    // most of the way through prints its progress and then its stall, and
+    // the twenty lines that survived were all stall.
+    for (const line of lastTerminal.trim().split('\n').slice(-60)) {
       console.log(`     | ${line}`);
     }
     console.log(`FAIL site-${id}: ${result.how}${result.body ? ` (${result.body})` : ''}`);
