@@ -486,6 +486,17 @@ export class Gex {
       link: ['off', 'no-kernel', 'armed', 'kept', 'restored', 'asked'][
         Number(e.gex_link_state?.() ?? 0)
       ],
+      // What putting the address space back cost, when one was put back:
+      // regions, bytes re-read from files, bytes copied out of the image,
+      // and the milliseconds in each. The restored process turned out to
+      // spend about what the linker it skipped had spent, and nothing said
+      // where.
+      cost: e.gex_link_cost ? (() => {
+        const p = e.gex_alloc(40) >>> 0;
+        e.gex_link_cost(p);
+        const v = new BigUint64Array(this.#bytes().buffer, p, 5);
+        return [Number(v[0]), Number(v[1]), Number(v[2]), Number(v[3]), Number(v[4])];
+      })() : null,
     };
   }
   /// Which objects this process lifted blocks from, `name=count` separated.

@@ -5636,11 +5636,29 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
                 out.extend_from_slice(&off.to_le_bytes());
             }
             None => {
+                // By the page, with a bitmap of which ones hold anything.
+                //
+                // Most of a linked address space is zero: `.bss`, the tail of
+                // the break, the part of a TLS block nothing has written.
+                // Carried whole, `ls` came to 1682 KiB; the bytes that are
+                // actually the linker's answer are a fraction of that, and
+                // every one of them is in a page some store has touched.
                 out.extend_from_slice(&0u32.to_le_bytes());
                 let (a, b) = (start as usize, (end as usize).min(data.len()));
                 let bytes: &[u8] = if a < b { &data[a..b] } else { &[] };
+                let pages = bytes.len().div_ceil(4096);
                 out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                out.extend_from_slice(bytes);
+                let bitmap_at = out.len();
+                out.resize(bitmap_at + pages.div_ceil(8), 0);
+                for p in 0..pages {
+                    let lo = p * 4096;
+                    let hi = (lo + 4096).min(bytes.len());
+                    if bytes[lo..hi].iter().all(|b| *b == 0) {
+                        continue;
+                    }
+                    out[bitmap_at + p / 8] |= 1 << (p % 8);
+                    out.extend_from_slice(&bytes[lo..hi]);
+                }
             }
         }
     }
@@ -5651,6 +5669,21 @@ fn snap_take(h: &mut Host, ctx_addr: u64, entry: u64) -> Vec<u8> {
 ///
 /// Zero if the blob cannot be read or a file it names has gone, in which case
 /// the caller loads the program the long way.
+/// What putting the last address space back cost: regions, bytes re-read
+/// from files, bytes copied out of the image, and milliseconds in each.
+static SNAP_COST: SingleThreaded<(u64, u64, u64, u64, u64)> =
+    SingleThreaded(const { RefCell::new((0, 0, 0, 0, 0)) });
+
+#[no_mangle]
+pub extern "C" fn gex_link_cost(out: u32) -> u32 {
+    let c = *SNAP_COST.0.borrow();
+    let dst = shim_slice_mut(out, 40);
+    for (i, v) in [c.0, c.1, c.2, c.3, c.4].iter().enumerate() {
+        dst[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    40
+}
+
 fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
     let mut p = 0usize;
     if raw.get(0..4)? != b"SNP1" {
@@ -5678,6 +5711,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
     // each of them is seven megabytes of filesystem for one and three
     // quarters of library.
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let (mut n_read, mut n_copy, mut ms_read, mut ms_copy) = (0u64, 0u64, 0u64, 0u64);
     for _ in 0..n {
         let start = snap_read_u64(raw, &mut p)?;
         let end = snap_read_u64(raw, &mut p)?;
@@ -5699,9 +5733,12 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
         if from_file {
             let path = snap_read_str(raw, &mut p)?;
             let off = snap_read_u64(raw, &mut p)?;
+            let began = now_ns();
             if !files.iter().any(|(k, _)| *k == path) {
                 files.push((path.clone(), h.kernel.read_file(&path)?));
             }
+            ms_read += now_ns() - began;
+            n_read += end - start;
             let bytes = &files.iter().find(|(k, _)| *k == path)?.1;
             let data = guest_bytes();
             let (a, b) = (start as usize, (end as usize).min(data.len()));
@@ -5714,19 +5751,45 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
             h.kernel.mem.insert_from(start, end, prot, &name, Some((path, off)));
         } else {
             let len = snap_read_u32(raw, &mut p)? as usize;
-            let payload = raw.get(p..p + len)?;
-            p += len;
+            let pages = len.div_ceil(4096);
+            let began = now_ns();
+            let bitmap = raw.get(p..p + pages.div_ceil(8))?.to_vec();
+            p += pages.div_ceil(8);
             let data = guest_bytes();
             let (a, b) = (start as usize, (end as usize).min(data.len()));
             if a >= b {
                 return None;
             }
+            // Zero first: a page the bitmap says nothing about is a page the
+            // recording found zero, and this memory is a fresh Worker's but
+            // not necessarily untouched -- an `execve` runs in the Worker
+            // that had the previous program.
             data[a..b].fill(0);
-            let take = (b - a).min(len);
-            data[a..a + take].copy_from_slice(&payload[..take]);
+            for q in 0..pages {
+                if bitmap[q / 8] & (1 << (q % 8)) == 0 {
+                    continue;
+                }
+                let lo = q * 4096;
+                let hi = (lo + 4096).min(len);
+                let payload = raw.get(p..p + (hi - lo))?;
+                p += hi - lo;
+                let (da, db) = (a + lo, (a + hi).min(b));
+                if da < db {
+                    data[da..db].copy_from_slice(&payload[..db - da]);
+                }
+            }
             h.kernel.mem.adopt(start, end, prot, &name, code);
+            ms_copy += now_ns() - began;
+            n_copy += end - start;
         }
     }
+    *SNAP_COST.0.borrow_mut() = (
+        n as u64,
+        n_read,
+        n_copy,
+        ms_read / 1_000_000,
+        ms_copy / 1_000_000,
+    );
     Some(LinkedImage { entry, phdr, phent, phnum, interp_base, x, sp, tpidr })
 }
 

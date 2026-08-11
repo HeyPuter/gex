@@ -470,7 +470,12 @@ export class ProcessHost {
                 ? `, ld.so ${m.loader.calls} syscalls, last at ${m.loader.doneMs}ms`
                 : '') +
               (m.loader && m.loader.link && m.loader.link !== 'off'
-                ? `, link ${m.loader.link}`
+                ? `, link ${m.loader.link}` +
+                  (m.loader.cost && m.loader.cost[0]
+                    ? ` (${m.loader.cost[0]} regions, ` +
+                      `${Math.round(m.loader.cost[1] / 1024)} KiB reread in ${m.loader.cost[3]}ms, ` +
+                      `${Math.round(m.loader.cost[2] / 1024)} KiB copied in ${m.loader.cost[4]}ms)`
+                    : '')
                 : '') +
               (m.fill && (m.fill.filled || m.fill.unanswered)
                 ? `, fill ${m.fill.filled} answered ${m.fill.unanswered} not`
