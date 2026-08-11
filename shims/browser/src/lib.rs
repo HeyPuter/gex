@@ -1714,9 +1714,13 @@ static HOST_HOLDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// anywhere.
 ///
 /// Four words an entry, packed into one atomic each: number, first two
-/// arguments, and what came back. Sixteen entries is a screenful and costs
-/// four stores on a path that already does far more than that.
-const SYS_RING: usize = 16;
+/// arguments, and what came back. Costs four stores on a path that already
+/// does far more than that, so it is always on -- the run worth recording is
+/// never the one you thought to ask about beforehand.
+///
+/// Long enough to hold a process's whole conversation with the kernel when
+/// the process is short, which the ones that die usually are.
+const SYS_RING: usize = 256;
 static SYS_NR: [std::sync::atomic::AtomicU64; SYS_RING] =
     [const { std::sync::atomic::AtomicU64::new(!0) }; SYS_RING];
 static SYS_A0: [std::sync::atomic::AtomicU64; SYS_RING] =

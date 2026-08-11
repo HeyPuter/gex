@@ -398,6 +398,19 @@ export async function runProgram(
       // and now that install and translation are 17 of a 57 second
       // `apt-get update`, the rest of it is the only thing left to ask about.
       hot: new URLSearchParams(location.search).get('hot') ? 1 : undefined,
+      // `?inlinethreads=1` keeps a guest's threads on the process's own
+      // Worker instead of giving each one a Worker of its own.
+      //
+      // Both shapes exist already -- a memory that is not shared cannot have
+      // Worker threads and has always run them inline -- and which one a run
+      // gets was decided by the memory rather than by anyone choosing. That
+      // makes the one real threaded program in the Debian rootfs impossible
+      // to compare: liblzma's decoder spawns a worker, and `dpkg-deb` dies of
+      // `free(): invalid pointer` in the browser while the same archive comes
+      // out whole under the native adapter three times for three.
+      inlineThreads: new URLSearchParams(location.search).get('inlinethreads')
+        ? 1
+        : undefined,
       virgl: channel ?? undefined,
       wispUrl: network?.url ?? undefined,
       winsize: { rows: term.rows, cols: term.cols },

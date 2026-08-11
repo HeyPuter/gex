@@ -1223,6 +1223,58 @@ and then dies of SIGABRT, which is the forked-child abort that also stops
 `apt-get install`. A minute-long probe reaching the same bug an
 `apt-get update` takes six minutes to reach.
 
+## Three instruments, because a guest that dies said nothing at all
+
+A browser guest killed by a signal used to leave *nothing* on the console.
+`dpkg-deb` printing "<decompress> subprocess was killed by signal
+(Aborted)" was the entire evidence that anything had happened inside its
+child, and it names neither the pid, nor where it was, nor why.
+
+Three additions, all always-on, and between them they took that bug from
+"a forked child aborts intermittently" to a named cause in one afternoon:
+
+  * **a killed guest is reported**, with its pid and pc. The pc resolved to
+    `libc+0x83c18`, the static function before `pthread_kill` -- glibc's
+    `__pthread_kill_implementation`, reached from `raise`. So the guest was
+    aborting itself rather than being trapped by the runtime, which is the
+    first fork in the road and had never been settled.
+
+  * **the last 256 syscalls of every process**, as `name(a0, a1)=ret`,
+    recorded unconditionally on the syscall path. Four atomic stores where
+    there was already a kernel call. This is what turned "killed by signal
+    6" into a readable trail on the first run, and the trail immediately
+    showed something nobody was looking for: `exit_group(0)` followed by six
+    more syscalls.
+
+  * **a write to stderr that does not go through prints what it said**.
+    glibc reports a fatal condition by writing to fd 2 and then aborting, so
+    a diagnostic that fails to arrive turns a named failure into a bare
+    signal. Here it was `free(): invalid pointer`, lost every time because
+    the process had already released its descriptors.
+
+The general lesson is the third one. A runtime that swallows the guest's
+own error messages is strictly worse than one that crashes loudly, because
+the information was *there* -- generated, formatted, and handed to the
+kernel -- and the kernel dropped it.
+
+## exit_group did not end a process
+
+Found by the ring above. The host's loop re-enters the guest whenever
+`gex_resume_pc` is set; `exit_process` released the descriptor table, set
+the exit status, and left the resume slot holding whatever an earlier
+parked call had put there. A `write` that had waited for room in a pipe was
+enough.
+
+So a process that called `exit_group(0)` went back into its own code with
+no descriptors, ran glibc's exit path over a heap that had been torn down,
+and aborted -- and its diagnostic went to a stderr that was now EBADF.
+From outside, a program that finished perfectly looked like a program
+killed by SIGABRT, and its parent reported that.
+
+Cleared in `exit_process`, and the host's loop refuses to resume an exited
+guest whatever the slot holds. Two places, because the rule is worth
+stating on both sides.
+
 ## Decompression is 5.7x native; the 23.7x was a cold cache
 
 Corrected the same day it was written. The claim was:

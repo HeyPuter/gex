@@ -423,7 +423,7 @@ async function handle(msg) {
     // Told rather than guessed: the shim cannot see whether its memory is a
     // `SharedArrayBuffer`, and a `clone` staged for a host that cannot start
     // a Worker is a thread that never runs.
-    if (msg.shared || msg.kind === 'thread') {
+    if ((msg.shared || msg.kind === 'thread') && !(msg.inlineThreads ?? msg.opts?.inlineThreads)) {
       gex.shim.exports.gex_set_thread_workers?.(1);
     }
     const recompile = msg.opts?.recompileObjects ?? msg.recompileObjects;
