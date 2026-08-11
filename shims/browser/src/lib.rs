@@ -3779,7 +3779,15 @@ fn count_syscall() {
     // a process that lives for one download and makes a few hundred calls --
     // never reached either. A census that only speaks for long-lived
     // processes cannot say where a short one spent its time.
-    if !total.is_power_of_two() || total < 512 {
+    // Every `HEARTBEAT` calls, which is what the setting says and did not
+    // mean. The rule was "a power of two, and at least 512", and it has come
+    // down twice for the same reason both times -- 65,536 that a glxgears run
+    // never reached, then 4,096 that apt's http method never reached. A warm
+    // `ls` makes about 130 and never reached 512 either, so the census still
+    // could not speak for the processes it was lowered for. The threshold is
+    // the caller's now.
+    let every = unsafe { HEARTBEAT }.max(1);
+    if total as u64 % every != 0 {
         return;
     }
     let mut top: Vec<(u32, usize)> = unsafe {
