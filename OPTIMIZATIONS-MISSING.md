@@ -2703,3 +2703,27 @@ Worth writing down as a method, not just a command. Every question asked of
 this failure so far has cost a full `apt-get update`, and most of them did not
 need the network, the mirror, or the download. The expensive part of the run
 was not the part under investigation.
+
+### It is the closure's libc
+
+Bisected with `?libs=N`, on the thirty-second repro, counting crashed children:
+
+    ?closure=0                              0
+    first 2   bash, libtinfo                0
+    first 3   + libc                        3
+    first 4   + ld-linux                    4-6
+    first 8                                 3
+    all 33                                  3
+
+libc. Adding the dynamic linker on top of it changes nothing.
+
+The important part is what the `libs=2` row means. With only bash and libtinfo
+statically recompiled, the guest *runtime-translates* libc -- and nothing
+crashes. Add the closure's libc and children start dying. So the statically
+recompiled build of the same code behaves differently from the runtime
+translation of it, which is a correctness difference in the path this project
+exists for.
+
+libc is one of the two objects built `--exhaustive-for`, so the next question
+is whether it is "whole" that is wrong or "static": a closure with libc
+reachable-only separates them.
