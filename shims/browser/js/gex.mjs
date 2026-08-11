@@ -1523,6 +1523,27 @@ export class Gex {
     this.#growTo(child.image.reduce((n, r) => Math.max(n, r.at + r.bytes.byteLength), 0));
     const u8 = this.#bytes();
     for (const r of child.image) u8.set(new Uint8Array(r.bytes), r.at);
+    // Checked here, before anything else writes to this memory.
+    //
+    // The check further down runs after the module is instantiated, the
+    // directory is rebuilt and the kernel is built, and the child rewrites
+    // the low region itself on the way -- the fork return value, `sp`, the
+    // thread pointer. So it reports region 0..300000 as differing on a
+    // perfectly good copy, and cannot tell a damaged copy from a deliberate
+    // rewrite. This one can: nothing has run yet.
+    if (globalThis.GEX_DEBUG_EXIT && child.image?.[0]?.sum !== undefined) {
+      let bad = 0;
+      for (const r of child.image) {
+        const end = r.at + r.bytes.byteLength;
+        if (sum32(u8.subarray(r.at, end)) === r.sum) continue;
+        bad++;
+        console.error(
+          `[adopt] on arrival, region ${r.at.toString(16)}..${end.toString(16)} `
+            + `(${r.prot ?? '-'}) is not what the parent sent`,
+        );
+      }
+      step(bad ? `${bad} regions arrived wrong` : 'image arrived intact');
+    }
     // How much of the context survives each step. A child that enters at zero
     // arrived with a context of zeros, and the only question worth asking is
     // which of the three steps below emptied it.

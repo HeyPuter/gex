@@ -135,8 +135,24 @@ const DEMOS = {
       // in the rootfs go to /dev/null: ninety lines of them push the
       // answers off the top of what the page can hand back.
       + 'dpkg --unpack /var/tmp/x.deb > /dev/null 2>/dev/null; echo unpack=$?; '
+      // And the real thing: krb5-locales' own control member, lifted out
+      // of the archive apt downloads and wrapped in a 1,188-byte deb.
+      // That download is byte-perfect in the guest -- md5 matches the
+      // mirror and md5sum reads all 63,520 bytes -- and the same file
+      // reads perfectly under the native adapter, so what is left is
+      // this member and this browser. 824 bytes compressed, 10 KiB out,
+      // where the archives built here compress 236 bytes.
+      + 'echo ITxhcmNoPgpkZWJpYW4tYmluYXJ5LyAgMCAgICAgICAgICAgMCAgICAgMCAgICAgNjQ0ICAgICA0ICAgICAgICAgYAoyLjAKY29udHJvbC50YXIueHovIDAgICAgICAgICAgIDAgICAgIDAgICAgIDY0NCAgICAgODI0ICAgICAgIGAK/Td6WFoAAATm1rRGBMD2BYBQIQEWAAAAAAAAANPeTiXgJ/8C7l0AFwu8HH0BlcAdSj55FcLMJqNjGNOjUET0IGysmtCfcXBMwWvX7Tk2J3yGcpaNT3YzR3VtUXAtNr3EwvvUHj6RAejWzT+bDi4VxhlhIOF/3nwcr45h86MrKpsLGvHgd32f/7BKFArxMiB4yCLKKwqhiOq51FP8gBqo51bJVcV7JkiPly2C6g7b5tsaiYXzsN1MXB3UH+ChbylXgE086VwmQqcndu/fNeKwz5aT23P5AdTTUlNrGqXY5x5rQnm3JyC3H9sk8l26FfB9IxnXVEnkXcs018kUTljQ38NCheJRV4IuDMJF581EZSgsSI13nONjelx8GnV8hnDGqJGLLKF3zZoGbzYsRz/46r3XoEVSBhqsFgFyiwTT/friCQgKuqKVD2ZP375jM1of6/3qVz5PGYNo9TGo8xOBWdz4pEma6KDPKeXFFzYGMjaYSdt0m5Kc5hHJ0nUzx66wsRe6JT5219quCwcrG7RJPvC2g8NOZU6jRbv6x4FzvUUcQQZxRnj93oaIWlmuN03vETi/n3iD/0O7pKUTCbwm4XX2/jQz42MUpQg9Dxgn5mgEbCejVhoe9RJ+Fo7GSDCGV3hiVqkQfQazeVxTkCgXpvND6abEe6mC4ROE5m5cUg67trbhEyV1OXqOUQQir8Cmjo4u/qcOC4DUo4yNuqvZ/5MzyxEb5ZTVNnwLxhzrHZEpiCuHFyjpeak62at7Ig83FhlyJjf356ayFKLOhOxHGPWAgTDGEivnAS3eNYj2j/en4d1EA0WkU3SADbRloUirkTq6Yu2ONuSEbQOwomSsxWtSRNp5a2dgHX+HXSqfkbks3DVUDCWcdyls0Bks6hvI+9lk7pjMOZo2Cn+1hCk4AkFSSEIHts9cZ9SxMZvkU0m9vTNGKqaHiLNioxYoBnDIcR3rxdGNn9b8Ou+htUbeqnwCkhIovMwrD7h9Md+GYAqzot3AyPmN8dzICL25ZrxFU45uK2rrWB4AuS791vOuygY07CsnAAAAERa3z0RiJLgAAZIGgFAAAL4OXp2xxGf7AgAAAAAEWVpkYXRhLnRhci54ei8gICAgMCAgICAgICAgICAgMCAgICAgMCAgICAgNjQ0ICAgICAxNzIgICAgICAgYAr9N3pYWgAABObWtEYCACEBFgAAAHQv5aPgJ/8AbF0AMwAzUBhoiYMB69bC9ZSe3K+9VyTKNDeVKuOE6q2pSZGdrE0ZtncO44v9udaLmMbY5oeEs6UeLUIVsAJqEJRT9SxkRLY485yHbIy8i5WG5laO+4Ibqg/4CQOkrEGMR1SXCVSino0b46KIte8AAJc7oVjYBFpmAAGIAYBQAABT8zONscRn+wIAAAAABFla | base64 -d > /var/tmp/r.deb; '
+      + 'dpkg-deb --info /var/tmp/r.deb > /dev/null; echo real=$?; '
+      // How many bytes came out of the decompressor, with no tar in
+      // the way: `--ctrl-tarfile` writes the tar to stdout itself.
+      // 10240 means liblzma worked and the fork is at fault; 0 means
+      // it did not. The working archive is measured the same way, so
+      // the two numbers can be compared rather than judged.
+      + 'dpkg-deb --ctrl-tarfile /var/tmp/x.deb | wc -c; '
+      + 'dpkg-deb --ctrl-tarfile /var/tmp/r.deb | wc -c; '
       + 'echo deb=done',
-    want: /gzip=0[\s\S]*xz=0[\s\S]*big=0/,
+    want: /gzip=0[\s\S]*xz=0[\s\S]*big=0[\s\S]*real=0/,
   },
   // Does a byte written come back? A 1.2 MB file copied through the shell
   // and checksummed both ways.
@@ -395,7 +411,17 @@ for (const id of list) {
   // harness truncating the question. `GEX_QUERY` is still raw, because it
   // carries several parameters at once and only a person writes it.
   const own = DEMOS[id].cmd ? `&cmd=${encodeURIComponent(DEMOS[id].cmd)}` : '';
-  const url = `http://127.0.0.1:${port}/?demo=${DEMOS[id].demo ?? id}&run=1${own}${extra}`;
+  // `GEX_CMD=<shell line>` is the same thing from outside, encoded here so
+  // it survives. Hand-writing `cmd=` inside `GEX_QUERY` means hand-encoding
+  // it: `&&` ends the parameter, `2>&1` ends the parameter, and `+` decodes
+  // to a space -- which silently turned `1.20.1-2+deb12u5` into two words
+  // and cost a seven-minute run to notice. Four runs went to that family
+  // of mistake before this existed.
+  const cmd = process.env.GEX_CMD
+    ? `&cmd=${encodeURIComponent(process.env.GEX_CMD)}`
+    : '';
+  const url =
+    `http://127.0.0.1:${port}/?demo=${DEMOS[id].demo ?? id}&run=1${own}${extra}${cmd}`;
   // The command the page was told to run, decoded the way the page decodes
   // it, so the echo of it can be told apart from what the guest says. See
   // where `seen` is filled.
