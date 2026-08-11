@@ -2445,12 +2445,25 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         // object every other process in the run also loads. Without this,
         // pid 1 lifts `ld.so` and stores it under no identity at all, and the
         // next process lifts the same linker over again.
+        // The image's own identity comes from the manifest when there is one.
+        //
+        // `gex_load` is handed bytes and no path, so the executable could not
+        // be named -- and `image_pages_are_ours` asks exactly that question
+        // before handing a process the closure's image pages. Unnamed, pid 1
+        // would be refused the pages built for it and would lift all 18,595
+        // blocks of its own text. The page told us which program this is when
+        // it set `IMAGE_PROGRAM`; that is the honest answer and the only one
+        // available here.
+        let whose = from.map(|f| f.to_string()).or_else(|| {
+            let w = IMAGE_PROGRAM.0.borrow();
+            (!w.is_empty()).then(|| w.clone())
+        });
         kernel.mem.insert_loaded(
             seg.vaddr,
             seg.vaddr + seg.mem_size,
             p,
             "[image]",
-            from.map(|f| (f.to_string(), seg.vaddr)),
+            whose.map(|f| (f, seg.vaddr)),
         );
     }
 
@@ -2919,6 +2932,59 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32) -> u32 {
 /// and `fillSlot` publishes, grows, instantiates and fills before resuming.
 /// That path already existed for the instantiate; this adds the entry and the
 /// growth to it.
+/// The program the closure's image module was built from, as the manifest
+/// names it. Empty when the closure has no image.
+static IMAGE_PROGRAM: SingleThreaded<String> =
+    SingleThreaded(const { RefCell::new(String::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_set_image_program(ptr: u32, len: u32) {
+    if let Ok(s) = std::str::from_utf8(shim_slice(ptr, len)) {
+        *IMAGE_PROGRAM.0.borrow_mut() = s.to_string();
+    }
+}
+
+/// Whether this process is running the program the image module was built
+/// from, and may therefore be given its pages.
+///
+/// An image sits at `PIE_BASE` and every program lands there, so the image
+/// library's pages are the one part of a closure that is *not* true whatever
+/// the process goes on to run. `execve` was taught to drop them; publishing
+/// them was not, and publishing happens on the first branch into a claimed
+/// page -- which for a process running `apt-get`, also at `PIE_BASE`, points
+/// apt-get's pages at bash's translated blocks. It then runs a few blocks of
+/// somebody else's code and dies at whatever syscall it reaches, which is why
+/// the fault moved from `openat` to `close` when the workload changed and why
+/// it vanishes entirely with `?closure=0`.
+///
+/// Asked of the image's own code identity rather than tracked as a flag,
+/// because a forked child that has not exec'd yet *is* still running its
+/// parent's program and the answer has to stay true across the fork.
+///
+/// Refused only on a *positive* mismatch. An identity this side does not know
+/// -- a child whose adopted map did not carry one, a program loaded before
+/// the manifest said anything -- is not evidence of anything, and treating it
+/// as one is worse than the bug: the first attempt returned `false` whenever
+/// the identity was missing, and a forked shell was refused its own pages and
+/// stopped making progress at all.
+fn image_pages_are_ours(h: &Host) -> bool {
+    let want = IMAGE_PROGRAM.0.borrow();
+    if want.is_empty() {
+        return true;
+    }
+    match h
+        .kernel
+        .mem
+        .vmas()
+        .iter()
+        .find(|v| v.start <= gex_abi::PIE_BASE && gex_abi::PIE_BASE < v.end)
+        .and_then(|v| v.code.as_ref())
+    {
+        Some((p, _)) => p.as_str() == want.as_str(),
+        None => true,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32) -> u32 {
     let Some(meta) = gex_xlate::Metadata::decode(shim_slice(ptr, len)) else {
@@ -2927,10 +2993,16 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32) -> u32 {
     // Kept, because `execve` republishes them: the modules are still in this
     // instance's tables, so the new program gets every library the old one
     // reached for nothing.
-    CLOSURE_DIRS.0.borrow_mut().extend(meta.dir_entries.iter().copied());
     with_host(|h| {
+        // Not the image's pages, unless this process is running the image's
+        // program. See `image_pages_are_ours`.
+        let ours = image_pages_are_ours(h);
         let mut gm = GuestMem::new(guest_bytes());
         for (page, base) in &meta.dir_entries {
+            if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE && !ours {
+                continue;
+            }
+            CLOSURE_DIRS.0.borrow_mut().push((*page, *base));
             h.jit.page_table.assign(*page, *base);
             // And the guest's own directory, which is what a branch reads.
             // The image module publishes its own as a data segment; a

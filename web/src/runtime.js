@@ -424,6 +424,7 @@ export async function runProgram(
       // its own translated code does not expect.
       opts: {
         cwd, tty, uid, recompileObjects, heartbeat, pins: closure?.pins,
+        program: closure?.program,
         // `?permiss=N`: how many stored units one dispatch miss may take.
         perMiss: typeof globalThis.GEX_PER_MISS === 'number' ? globalThis.GEX_PER_MISS : undefined,
       },

@@ -696,6 +696,16 @@ export class Gex {
     // recompiled closure has its object's guest addresses baked in, so this
     // is a precondition rather than a hint -- and the guest cooperates
     // without knowing it, because `mmap(NULL, span)` takes what it is given.
+    // Which program the image module was built from, so the shim can refuse
+    // to hand its pages to a process running something else. See
+    // `image_pages_are_ours`.
+    if (opts.program && this.#shim.exports.gex_set_image_program) {
+      const b = enc.encode(opts.program);
+      const bp = this.#shim.exports.gex_alloc(b.length) >>> 0;
+      this.#bytes().set(b, bp);
+      this.#shim.exports.gex_set_image_program(bp, b.length);
+      free?.(bp, b.length);
+    }
     const pin = this.#shim.exports.gex_pin_object;
     for (const [path, where] of Object.entries(opts.pins ?? {})) {
       if (!pin) break;
