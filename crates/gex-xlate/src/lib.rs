@@ -426,6 +426,26 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
                 // same thing without emitting a wasm function for it. This
                 // is what keeps exhaustive mode affordable — on a static
                 // musl binary it removes about three quarters of the slots.
+                // Sections, not the segment. This loop walked every address
+                // in a `PF_X` mapping, and for a shared library that mapping
+                // holds the string tables, the relocations and `.rodata` as
+                // well as the code. `is_executable` exists to say which bytes
+                // are really instructions and every other discovery pass asks
+                // it; this one did not.
+                //
+                // What that costs is not a wasted block. An address inside
+                // `.rodata` that happens to decode becomes a block, and a
+                // block that starts inside an instruction is wrong code --
+                // harmless while nothing branches to it, and not harmless
+                // once a region folded from it covers the slot of a real
+                // entry point. Built this way, libc broke `apt-get update`:
+                // children died at whatever syscall they were in, and the
+                // same libc translated at run time was fine. See #46, which
+                // is this mistake in the pass above.
+                if !view.is_executable(a) {
+                    a += 4;
+                    continue;
+                }
                 match view.fetch(a).map(|raw| gex_isa::decode(raw, a)) {
                     Some(gex_isa::Inst::Unknown { .. })
                     | Some(gex_isa::Inst::Undefined { .. })
