@@ -2791,3 +2791,44 @@ page and `ls` is handed `bash`'s blocks. Gating it needs the fill path to know
 which instance belongs to which library on every install path, not just the
 one that fetches a module on demand; wired on one path only, the fast path
 missed and translation came back at 6,169 blocks. Reverted.
+
+### Every process spawn cloned the whole closure
+
+`metadataSection` returned `wasm.subarray(...)`: a view into the module's
+`ArrayBuffer`. `postMessage` clones a typed array by cloning the buffer behind
+it, so handing a Worker the closure's metadata handed it all 49 compiled
+modules -- 231 MB -- once per process.
+
+    sent 49 closure modules   432-856ms -> 1ms
+    warm ls          lived  2,072ms -> 971-1,109ms
+    pid 1            lived  8,748ms -> 5,380ms
+
+The log line said "sent 49 closure modules", which is exactly what it was
+doing, while meaning to send fifty kilobytes of page tables.
+
+Two attributions were wrong before this one, and both were tested rather than
+argued:
+
+- An image per program took a warm `ls` from 3,140 blocks of translation to
+  14. The wall clock did not move.
+- Making the fill path synchronous, so a page already held is written without
+  yielding the event loop, did not move it either.
+
+What found it was splitting `lived` into the time inside `gex.run` and the
+time outside: 1.3 seconds of 2.0 were outside the guest, where no per-process
+counter looked. That split is now printed on every process line.
+
+Where a warm `ls` stands, and what is left:
+
+    lived 971ms (guest 780ms)
+      2ms translating 14 blocks
+     27ms installing 17 modules
+      3ms worker start
+    ~100ms adopt and the parent's image copy
+    fill 129 answered
+
+So ~190ms of machinery and 780ms inside the guest, for a command that lists
+fifteen directory entries. The next question is what the guest is doing --
+`ls` is dynamically linked and `ld.so` relocates libc, libselinux and
+libpcre2 before `main` -- and whether 129 fills still cost anything now that
+they no longer yield.
