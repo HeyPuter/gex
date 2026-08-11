@@ -82,6 +82,31 @@ impl Default for Identity {
     }
 }
 
+/// How much room the strings are given below the stack top.
+///
+/// The layout is anchored rather than packed: the string blob starts at a
+/// fixed address and grows *up*, and the vectors start at a fixed `sp` and
+/// grow up towards it, with the slack in between. A packed layout puts
+/// `argc` wherever the total length of the arguments happens to leave it, so
+/// two processes running the same program with different arguments have
+/// their `argv` array, their `envp` array and their whole auxiliary vector at
+/// different addresses.
+///
+/// That matters because the dynamic linker stores addresses from this region
+/// into libc's data -- `_dl_argv` is the address of the `argv` array,
+/// `GLRO(dl_random)` is the address of the `AT_RANDOM` bytes -- and a
+/// snapshot of a linked process is only reusable by a process whose stack
+/// puts those things where the snapshot expects them. Anchoring costs a few
+/// kilobytes of zeroes and makes the answer stable.
+///
+/// Exceeded, the layout falls back to packing: a correct stack at an
+/// unstable address beats a stable one that has run out of room.
+pub const BLOB_RESERVE: u64 = 32 * 1024;
+
+/// Room for `argc`, the two pointer arrays and the auxiliary vector: 1024
+/// words, which is more entries than any real command line has.
+pub const VECTOR_RESERVE: u64 = 8 * 1024;
+
 /// Where the initial stack ended up.
 #[derive(Clone, Debug)]
 pub struct StackLayout {
@@ -107,7 +132,15 @@ pub fn build_initial_stack(
 ) -> StackLayout {
     // Lay the variable-length data out first, from the top down, so that the
     // fixed-size vectors below can point at it.
+    //
+    // `AT_RANDOM` and `AT_PLATFORM` come first, at fixed offsets, because the
+    // linker keeps their addresses; the strings follow and may land wherever
+    // their own lengths put them, because nothing keeps those.
     let mut blob: Vec<u8> = Vec::new();
+    let random_off = blob.len();
+    blob.extend_from_slice(&random);
+    let platform_off = blob.len();
+    blob.extend_from_slice(b"aarch64\0");
     let mut offsets_argv = Vec::with_capacity(args.len());
     let mut offsets_env = Vec::with_capacity(env.len());
 
@@ -122,18 +155,17 @@ pub fn build_initial_stack(
         blob.push(0);
     }
     let execfn_off = offsets_argv.first().copied().unwrap_or(0);
-    // AT_RANDOM must point at 16 readable bytes.
     while !blob.len().is_multiple_of(8) {
         blob.push(0);
     }
-    let random_off = blob.len();
-    blob.extend_from_slice(&random);
-    // "aarch64" for AT_PLATFORM.
-    let platform_off = blob.len();
-    blob.extend_from_slice(b"aarch64\0");
 
-    // Place the blob directly below the stack top, 16-byte aligned.
-    let blob_addr = (stack_top - blob.len() as u64) & !0xf;
+    // Anchored when it fits, packed when it does not. See `BLOB_RESERVE`.
+    let fits = blob.len() as u64 <= BLOB_RESERVE;
+    let blob_addr = if fits {
+        stack_top - BLOB_RESERVE
+    } else {
+        (stack_top - blob.len() as u64) & !0xf
+    };
 
     let auxv_pairs: Vec<(u64, u64)> = vec![
         (auxv::AT_PHDR, image.phdr_vaddr),
@@ -160,9 +192,13 @@ pub fn build_initial_stack(
 
     // words = argc + argv + NULL + envp + NULL + 2*auxv
     let n_words = 1 + args.len() + 1 + env.len() + 1 + 2 * auxv_pairs.len();
-    let vector_bytes = n_words * 8;
-    // `sp` must be 16-byte aligned at entry.
-    let sp = (blob_addr - vector_bytes as u64) & !0xf;
+    let vector_bytes = n_words as u64 * 8;
+    // `sp` must be 16-byte aligned at entry, and stays put when it can.
+    let sp = if fits && vector_bytes <= VECTOR_RESERVE {
+        blob_addr - VECTOR_RESERVE
+    } else {
+        (blob_addr - vector_bytes) & !0xf
+    };
 
     let mut words: Vec<u64> = Vec::with_capacity(n_words);
     words.push(args.len() as u64);
@@ -222,6 +258,9 @@ mod tests {
             symbols: Vec::new(),
             named_relocs: Vec::new(),
             irelative: Vec::new(),
+            relocs: Vec::new(),
+            init_array: Vec::new(),
+            dynsyms: Vec::new(),
             pie: false,
             interp: None,
         }
@@ -289,6 +328,33 @@ mod tests {
         let random = seen_random.expect("AT_RANDOM present");
         let roff = (random - l.low) as usize;
         assert_eq!(&l.bytes[roff..roff + 16], &[3u8; 16]);
+    }
+
+    #[test]
+    fn two_command_lines_put_argv_and_at_random_in_the_same_place() {
+        let at = |args: &[String], env: &[String]| {
+            let l = build_initial_stack(&dummy_image(), 0x8000_0000, args, env, [3; 16], Identity::default());
+            let mut random = 0;
+            let mut a = l.sp + 8 + (args.len() as u64 + 1 + env.len() as u64 + 1) * 8;
+            loop {
+                let (k, v) = (read_u64(&l, a), read_u64(&l, a + 8));
+                if k == auxv::AT_RANDOM {
+                    random = v;
+                }
+                if k == auxv::AT_NULL {
+                    break;
+                }
+                a += 16;
+            }
+            (l.sp, random)
+        };
+        let short = at(&["ls".into()], &["PATH=/bin".into()]);
+        let long = at(
+            &["ls".into(), "-la".into(), "/usr/share/doc".into()],
+            &["PATH=/bin".into(), "HOME=/root".into()],
+        );
+        assert_eq!(short.0, long.0, "sp");
+        assert_eq!(short.1, long.1, "AT_RANDOM");
     }
 
     #[test]

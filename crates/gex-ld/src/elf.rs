@@ -38,6 +38,9 @@ const DT_JMPREL: i64 = 23;
 const DT_SONAME: i64 = 14;
 const DT_RPATH: i64 = 15;
 const DT_RUNPATH: i64 = 29;
+const DT_INIT_ARRAY: i64 = 25;
+const DT_INIT_ARRAYSZ: i64 = 27;
+const DT_INIT: i64 = 12;
 
 const R_AARCH64_RELATIVE: u32 = 1027;
 const R_AARCH64_IRELATIVE: u32 = 1032;
@@ -112,6 +115,38 @@ pub struct Symbol {
     pub ifunc: bool,
 }
 
+/// One relocation, ready to apply.
+#[derive(Clone, Debug)]
+pub struct Reloc {
+    /// Where the fixup goes, biased.
+    pub at: u64,
+    /// `R_AARCH64_*`.
+    pub kind: u32,
+    /// Index into [`Image::dynsyms`], or zero for the kinds that name none.
+    pub sym: u32,
+    pub addend: i64,
+}
+
+/// A dynamic symbol, as a linker needs it.
+#[derive(Clone, Debug)]
+pub struct DynSym {
+    pub name: String,
+    /// Unbiased: an undefined symbol has no address in this object at all,
+    /// and a defined one is only an address once the bias is known.
+    pub value: u64,
+    pub size: u64,
+    /// `st_shndx == SHN_UNDEF`: this object references it and does not
+    /// define it.
+    pub undefined: bool,
+    /// `STB_WEAK`: an undefined weak that nothing defines resolves to zero
+    /// rather than failing the link.
+    pub weak: bool,
+    pub ifunc: bool,
+    /// `STT_TLS`: the value is an offset in the defining object's TLS block,
+    /// not an address.
+    pub tls: bool,
+}
+
 /// A loaded process image.
 #[derive(Clone, Debug)]
 pub struct Image {
@@ -146,6 +181,20 @@ pub struct Image {
     pub tls: Option<(u64, u64, u64, u64)>,
     /// Function symbols, when a symbol table survives.
     pub symbols: Vec<Symbol>,
+    /// Every relocation, with enough to apply it: where, what kind, which
+    /// symbol and what to add.
+    ///
+    /// [`Self::named_relocs`] keeps only the two kinds code discovery cares
+    /// about and throws the type and the addend away. A linker needs all of
+    /// them -- `RELATIVE` is most of a shared library's relocations and names
+    /// no symbol at all.
+    pub relocs: Vec<Reloc>,
+    /// `DT_INIT_ARRAY`, biased, and how many entries: the functions that must
+    /// run before `main`, in order.
+    pub init_array: Vec<u64>,
+    /// Every symbol the dynamic table defines or references, in index order,
+    /// so a relocation's symbol index resolves without a second parse.
+    pub dynsyms: Vec<DynSym>,
     /// Relocations that name a symbol, as `(slot, name)` with `slot` biased.
     ///
     /// A call to another object's function goes through one of these: the
@@ -330,6 +379,9 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         tls,
         symbols: Vec::new(),
         named_relocs: Vec::new(),
+        relocs: Vec::new(),
+        init_array: Vec::new(),
+        dynsyms: Vec::new(),
         irelative: Vec::new(),
         code: Vec::new(),
         pie,
@@ -342,6 +394,10 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     if let Some((dyn_vaddr, dyn_size)) = dynamic {
         apply_relative_relocations(&mut image, dyn_vaddr, dyn_size);
         image.named_relocs = read_named_relocs(&image, dyn_vaddr, dyn_size);
+        let (syms, relocs, inits) = read_dynamic(&image, dyn_vaddr, dyn_size);
+        image.dynsyms = syms;
+        image.relocs = relocs;
+        image.init_array = inits;
         read_needed(&mut image, dyn_vaddr, dyn_size);
     }
     image.symbols = read_symbols(&r, e_shoff, e_shentsize, e_shnum, bias);
@@ -411,6 +467,114 @@ fn read_needed(image: &mut Image, dyn_vaddr: u64, dyn_size: u64) {
 /// Both relocation tables, because `DT_JMPREL` holds the lazy PLT entries and
 /// `DT_RELA` the eagerly-bound ones, and which of the two a given call uses
 /// depends on how the object was linked.
+/// Everything a linker needs out of the dynamic section: the symbol table,
+/// every relocation with its type and addend, and the initialisers.
+///
+/// The existing `read_named_relocs` answers a different question -- which
+/// slots hold the address of a named function, for code discovery -- and
+/// keeps two relocation kinds out of a dozen. This is the whole table.
+pub(crate) fn read_dynamic(image: &Image, dyn_vaddr: u64, dyn_size: u64)
+    -> (Vec<DynSym>, Vec<Reloc>, Vec<u64>) {
+    const STT_GNU_IFUNC: u8 = 10;
+    const STT_TLS: u8 = 6;
+    const STB_WEAK: u8 = 2;
+    let (mut rela, mut relasz, mut relaent) = (None, 0u64, 24u64);
+    let (mut jmprel, mut pltrelsz) = (None, 0u64);
+    let (mut symtab, mut strtab, mut syment) = (None, None, 24u64);
+    let (mut init_array, mut init_arraysz, mut init) = (None, 0u64, None);
+    for i in 0..dyn_size / 16 {
+        let at = dyn_vaddr + i * 16;
+        let (Some(tag), Some(val)) = (read_u64(image, at), read_u64(image, at + 8)) else {
+            break;
+        };
+        match tag as i64 {
+            DT_NULL => break,
+            DT_RELA => rela = Some(val + image.bias),
+            DT_RELASZ => relasz = val,
+            DT_RELAENT => relaent = val,
+            DT_JMPREL => jmprel = Some(val + image.bias),
+            DT_PLTRELSZ => pltrelsz = val,
+            DT_SYMTAB => symtab = Some(val + image.bias),
+            DT_STRTAB => strtab = Some(val + image.bias),
+            DT_SYMENT => syment = val,
+            DT_INIT_ARRAY => init_array = Some(val + image.bias),
+            DT_INIT_ARRAYSZ => init_arraysz = val,
+            DT_INIT => init = Some(val + image.bias),
+            _ => {}
+        }
+    }
+    let (Some(symtab), Some(strtab)) = (symtab, strtab) else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+    if syment == 0 || relaent < 24 {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+
+    // How many symbols there are is not written down anywhere: the table runs
+    // to the end of `.dynstr`, which conventionally follows it. Reading until
+    // the entry stops making sense is what every loader does.
+    let mut syms = Vec::new();
+    let limit = if strtab > symtab { (strtab - symtab) / syment } else { 4096 };
+    for i in 0..limit {
+        let at = symtab + i * syment;
+        let (Some(st_name), Some(st_info), Some(st_shndx)) =
+            (read_u32(image, at), read_u8(image, at + 4), read_u16(image, at + 6))
+        else {
+            break;
+        };
+        let (Some(value), Some(size)) = (read_u64(image, at + 8), read_u64(image, at + 16)) else {
+            break;
+        };
+        let kind = st_info & 0xf;
+        syms.push(DynSym {
+            name: read_cstr(image, strtab + st_name as u64),
+            value,
+            size,
+            undefined: st_shndx == 0,
+            weak: (st_info >> 4) == STB_WEAK,
+            ifunc: kind == STT_GNU_IFUNC,
+            tls: kind == STT_TLS,
+        });
+    }
+
+    let mut relocs = Vec::new();
+    for (table, size) in [(rela, relasz), (jmprel, pltrelsz)] {
+        let Some(base) = table else { continue };
+        for i in 0..size / relaent {
+            let at = base + i * relaent;
+            let (Some(r_offset), Some(r_info), Some(r_addend)) = (
+                read_u64(image, at),
+                read_u64(image, at + 8),
+                read_u64(image, at + 16),
+            ) else {
+                continue;
+            };
+            relocs.push(Reloc {
+                at: r_offset + image.bias,
+                kind: (r_info & 0xffff_ffff) as u32,
+                sym: (r_info >> 32) as u32,
+                addend: r_addend as i64,
+            });
+        }
+    }
+
+    let mut inits = Vec::new();
+    if let Some(f) = init {
+        inits.push(f);
+    }
+    if let Some(base) = init_array {
+        for i in 0..init_arraysz / 8 {
+            if let Some(f) = read_u64(image, base + i * 8) {
+                // Unrelocated in the file and relocated in memory; before the
+                // relocations are applied it is the file's value that is
+                // there, so bias it here and let `RELATIVE` overwrite it.
+                inits.push(if f < image.bias { f + image.bias } else { f });
+            }
+        }
+    }
+    (syms, relocs, inits)
+}
+
 fn read_named_relocs(image: &Image, dyn_vaddr: u64, dyn_size: u64) -> Vec<(u64, String)> {
     let (mut rela, mut relasz, mut relaent) = (None, 0u64, 24u64);
     let (mut jmprel, mut pltrelsz) = (None, 0u64);
@@ -559,6 +723,17 @@ fn read_u32(image: &Image, vaddr: u64) -> Option<u32> {
             let off = (vaddr - seg.vaddr) as usize;
             let b = &seg.bytes[off..off + 4];
             return Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+    }
+    None
+}
+
+/// Read a halfword from the placed image.
+fn read_u16(image: &Image, vaddr: u64) -> Option<u16> {
+    for seg in &image.segments {
+        if vaddr >= seg.vaddr && vaddr + 2 <= seg.vaddr + seg.bytes.len() as u64 {
+            let off = (vaddr - seg.vaddr) as usize;
+            return Some(u16::from_le_bytes([seg.bytes[off], seg.bytes[off + 1]]));
         }
     }
     None

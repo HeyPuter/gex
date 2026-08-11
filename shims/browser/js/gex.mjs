@@ -1115,8 +1115,23 @@ export class Gex {
     // times.
     if (globalThis.GEX_DEBUG_EXIT) {
       const bytes = out.reduce((n, r) => n + r.bytes.byteLength, 0);
+      // And how much of it the child could have re-read instead. See
+      // `gex_vma_reloadable`: a read-only mapping with an origin is library
+      // text, identical to the file it came from, and copying it to the child
+      // is copying something the child could open.
+      let again = 0;
+      if (e.gex_vma_reloadable) {
+        for (let i = 0; i < n; i++) {
+          if (e.gex_vma_at(i, scratch) !== 0) continue;
+          if (!e.gex_vma_reloadable(i)) continue;
+          const a = Number(dv.getBigUint64(scratch, true));
+          const b = Number(dv.getBigUint64(scratch + 8, true));
+          if (b > a) again += b - a;
+        }
+      }
       console.error(
         `[gex] fork image: ${out.length} regions, ${(bytes / 1048576).toFixed(1)} MiB, `
+        + `${(again / 1048576).toFixed(1)} MiB of it re-readable, `
         + `${Math.round(performance.now() - t0)}ms to copy`,
       );
     }

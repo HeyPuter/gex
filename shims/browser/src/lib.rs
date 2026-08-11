@@ -7552,6 +7552,26 @@ pub extern "C" fn gex_set_intrinsics(on: u32) {
     unsafe { INTRINSICS_ON = on != 0 }
 }
 
+/// Whether region `i` could be rebuilt by re-reading its file rather than
+/// copied.
+///
+/// A fork copies every mapped region -- 15.4 MiB for a shell -- and most of
+/// that is library text the child could map from the same file it came from.
+/// `origin` records exactly that and only for a mapping that has never been
+/// writable, which is the condition for the bytes still matching the file.
+/// Reported before the mechanism is built, so the mechanism is justified.
+#[no_mangle]
+pub extern "C" fn gex_vma_reloadable(i: u32) -> i32 {
+    with_host(|h| {
+        let vmas = h.kernel.mem.vmas();
+        let Some(v) = vmas.get(i as usize) else {
+            return 0;
+        };
+        let writable = v.prot & gex_kernel::mem::prot::WRITE != 0;
+        (!writable && v.origin.is_some()) as i32
+    })
+}
+
 fn note_intrinsics(addr: u64) {
     if !unsafe { INTRINSICS_ON } {
         return;
