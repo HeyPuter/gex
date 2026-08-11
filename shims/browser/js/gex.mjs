@@ -3029,6 +3029,21 @@ export class Gex {
    * `bash`'s, in practice. Above it, page numbers are unique to an object and
    * a scan is safe: that is where runtime units and inherited modules live.
    */
+  /**
+   * Where this process's dispatch directory says a page's slots live.
+   *
+   * `gexfillat` is told this rather than using the slot numbers baked into
+   * it at build time, because those are one sequence across the whole
+   * closure: a process that enters a late-numbered library has to grow its
+   * table to that length whatever it uses. The directory is per process, so
+   * the numbering can be too.
+   */
+  #pageBase(page) {
+    return this.#shim.exports.gex_page_base
+      ? this.#shim.exports.gex_page_base(page >>> 0) >>> 0
+      : 0;
+  }
+
   fillSlotNow(page) {
     const e = this.#shim.exports;
     const owner = e.gex_closure_owner ? e.gex_closure_owner(BigInt(page)) : -1;
@@ -3046,7 +3061,7 @@ export class Gex {
       // helper: instantiating it wrote its slots, so there is nothing to ask
       // for and the page is already answered.
       if (typeof lazy.instObj.exports[FILL_AT] !== 'function') return true;
-      if (lazy.instObj.exports[FILL_AT](page)) {
+      if (lazy.instObj.exports[FILL_AT](page, this.#pageBase(page))) {
         this.#filled++;
         return true;
       }
@@ -3054,7 +3069,7 @@ export class Gex {
     }
     if (page * 4096 < 0x0300_0000) return null;
     for (const inst of this.#unfilled) {
-      if (inst.exports[FILL_AT](page)) {
+      if (inst.exports[FILL_AT](page, this.#pageBase(page))) {
         this.#filled++;
         return true;
       }
@@ -3117,13 +3132,13 @@ export class Gex {
     // belong to every image at once and only one of them is ours.
     const mine = owner >= 0 ? this.#lazyClosure[owner]?.instObj : null;
     if (mine && typeof mine.exports[FILL_AT] !== 'function') return true;
-    if (mine && mine.exports[FILL_AT](slot)) {
+    if (mine && mine.exports[FILL_AT](slot, this.#pageBase(slot))) {
       this.#filled++;
       return true;
     }
     if (slot * 4096 >= 0x0300_0000) {
       for (const inst of this.#unfilled) {
-        if (inst.exports[FILL_AT](slot)) {
+        if (inst.exports[FILL_AT](slot, this.#pageBase(slot))) {
           this.#filled++;
           return true;
         }

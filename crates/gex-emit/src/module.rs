@@ -830,6 +830,7 @@ impl ModuleBuilder {
                 self.m.element(ElementSegment {
                     table: 0,
                     offset: 0,
+                    page_base: 0,
                     funcs,
                     passive: false,
                     // The image module's one segment covers the whole table,
@@ -902,6 +903,7 @@ impl ModuleBuilder {
                     self.m.element(ElementSegment {
                         table,
                         offset: start as u32,
+                        page_base: (entry & gex_abi::DISPATCH_SLOT_MASK) as u32,
                         funcs,
                         // Written by `gexfill`, not by instantiation.
                         //
@@ -954,7 +956,13 @@ impl ModuleBuilder {
         if n_blocks > BIG_BLOCKS {
             let void_ty = self.m.func_type(FuncType::new(vec![ValType::I32], vec![ValType::I32]));
             self.m.add_fill(void_ty);
-            self.m.add_fill_at(void_ty);
+            // `(page, base) -> filled`. The second argument is where the
+            // process asking wants this page's slots, which is not where the
+            // build put them once a process numbers its own.
+            let at_ty = self
+                .m
+                .func_type(FuncType::new(vec![ValType::I32, ValType::I32], vec![ValType::I32]));
+            self.m.add_fill_at(at_ty);
             let no_args = self.m.func_type(FuncType::new(vec![], vec![]));
             self.m.add_fill_all(no_args);
         }

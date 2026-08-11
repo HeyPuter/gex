@@ -3430,6 +3430,23 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
     1
 }
 
+/// The slot a page's dispatch entry points at, in this process.
+///
+/// What `gexfillat` has to be told. A module's segments are numbered as
+/// `gexc` laid the closure out, in one sequence across sixty-six libraries,
+/// and a process that enters a late-numbered one has to grow its table to
+/// that length -- 2.7 million slots for `cat /dev/null`, filled with the miss
+/// stub at four million a second. The directory is per process, so the
+/// numbering can be too; a fill writes where the directory says rather than
+/// where the build guessed.
+#[no_mangle]
+pub extern "C" fn gex_page_base(page: u32) -> u32 {
+    let gm = GuestMem::new(guest_bytes());
+    gm.read_u32(gex_abi::DISPATCH_DIR + page as u64 * 4)
+        .unwrap_or(0)
+        & gex_abi::DISPATCH_SLOT_MASK
+}
+
 /// How long dispatch table `i` has to be for what this process has published.
 ///
 /// One running total across all eight tables cannot answer this any more.

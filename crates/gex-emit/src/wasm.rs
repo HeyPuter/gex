@@ -503,6 +503,12 @@ pub struct Import {
 pub struct ElementSegment {
     pub table: u32,
     pub offset: u32,
+    /// The base slot of the page this segment belongs to, as `gexc` numbered
+    /// it. `offset - page_base` is where this segment starts *within* its
+    /// page, and that distance is all a fill needs to be told: given the base
+    /// the page has in the process doing the filling, it can write there
+    /// instead of where the build happened to put it.
+    pub page_base: u32,
     pub funcs: Vec<u32>,
     /// Filled by a call rather than by instantiation.
     ///
@@ -752,7 +758,15 @@ impl Module {
             .enumerate()
             .filter(|(_, e)| e.passive && e.guest_page != 0)
             .map(|(i, e)| {
-                (i as u32, e.table, e.offset, e.funcs.len() as u32, e.guest_page)
+                (
+                    i as u32,
+                    e.table,
+                    // Where this segment starts inside its page, rather than
+                    // the absolute slot the build chose.
+                    e.offset.wrapping_sub(e.page_base),
+                    e.funcs.len() as u32,
+                    e.guest_page,
+                )
             })
             .collect();
         if passive.is_empty() {
@@ -761,7 +775,7 @@ impl Module {
         let idx = self.declare_func(ty);
         let mut b = Vec::new();
         b.push(0x00); // no locals
-        for (seg, table, offset, len, guest_page) in &passive {
+        for (seg, table, within, len, guest_page) in &passive {
             // if (page == guest_page)
             //
             // Equality on the whole directory entry, not a range test on
@@ -777,8 +791,14 @@ impl Module {
             b.push(0x46); // i32.eq
             b.push(op::IF);
             b.push(0x40); // void
+            // dest = base + (offset - page_base). The base is the caller's,
+            // so a process that numbers its own pages gets its slots written
+            // where its directory says they are.
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 1);
             b.push(op::I32_CONST);
-            write_i32(&mut b, *offset as i32);
+            write_i32(&mut b, *within as i32);
+            b.push(0x6a); // i32.add
             b.push(op::I32_CONST);
             write_i32(&mut b, 0);
             b.push(op::I32_CONST);
