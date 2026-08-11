@@ -680,6 +680,14 @@ export class Gex {
     // instead, once, where it says what to do about it.
     const required = [
       'gex_alloc', 'gex_load', 'gex_add_file', 'gex_push_stdin', 'gex_wake',
+      // The bundle's shape, not just its bytes. Each of these is called
+      // through `?.` at its use site so that a shim which predates it still
+      // loads -- and that is exactly how a stale runtime turns into a silent
+      // wrong answer: no `gex_chmod` means every file stays 0644 and dpkg
+      // reports seven programs "not found in PATH or not executable" with no
+      // hint that the runtime is old. Named here so the skew is a sentence
+      // rather than a mystery.
+      'gex_chmod', 'gex_add_dir', 'gex_add_env',
       'gex_paused_for_input', 'gex_paused_for_net', 'gex_paused_for_host',
       'gex_park', 'gex_resume_pc',
       'gex_resume_ctx', 'gex_exit_code', 'gex_jit_pending_len',
@@ -776,6 +784,20 @@ export class Gex {
       this.#shim.exports.gex_add_dir?.(pp, p.length);
       free?.(pp, p.length);
     }
+    // Which of them are executable. The VFS makes every file 0644, and the
+    // tar's mode never travelled with its bytes, so `dpkg` reported `sh`,
+    // `rm`, `tar`, `diff` and `dpkg-deb` as "not found in PATH or not
+    // executable" for programs that are all plainly there.
+    const modes = opts.modes ?? {};
+    // The environment, when the page has one in mind. Empty leaves the
+    // shim's default, which is Debian's PATH for root plus HOME.
+    for (const kv of opts.env ?? []) {
+      const e = enc.encode(kv);
+      const ep = this.#shim.exports.gex_alloc(e.length) >>> 0;
+      this.#bytes().set(e, ep);
+      this.#shim.exports.gex_add_env?.(ep, e.length);
+      free?.(ep, e.length);
+    }
     for (const [path, contents] of Object.entries(files)) {
       const p = enc.encode(path);
       const d = contents instanceof Uint8Array ? contents : enc.encode(contents);
@@ -786,6 +808,9 @@ export class Gex {
       this.#shim.exports.gex_add_file(pp, p.length, dp, d.length);
       // Optional so that an older shim still loads; it simply keeps the old
       // behaviour of never letting go.
+      if (modes[path] !== undefined) {
+        this.#shim.exports.gex_chmod?.(pp, p.length, modes[path]);
+      }
       free?.(pp, p.length);
       free?.(dp, d.length);
     }

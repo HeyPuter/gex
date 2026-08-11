@@ -162,7 +162,14 @@ async function boot(ctx) {
       const abs = target.startsWith('/')
         ? target
         : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
-      if (files[abs]) files[path] = files[abs];
+      // The mode travels with the bytes. A symlink materialised as a copy
+      // has no tar entry of its own, so it had no mode -- and `/bin/sh` is a
+      // symlink to dash, which is exactly the program dpkg reported as
+      // "not found in PATH or not executable".
+      if (files[abs]) {
+        files[path] = files[abs];
+        if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
+      }
     }
     const elf = files['/bin/busybox'];
     if (!elf) throw new Error('the rootfs has no /bin/busybox');
@@ -176,6 +183,7 @@ async function boot(ctx) {
       elf,
       files,
       dirs: tree.dirs,
+      modes: tree.modes,
       args: ['/bin/sh', '-i'],
       cwd: '/root',
       tty: true,
@@ -250,7 +258,14 @@ async function bootDebian(ctx) {
       const abs = target.startsWith('/')
         ? target
         : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
-      if (files[abs]) files[path] = files[abs];
+      // The mode travels with the bytes. A symlink materialised as a copy
+      // has no tar entry of its own, so it had no mode -- and `/bin/sh` is a
+      // symlink to dash, which is exactly the program dpkg reported as
+      // "not found in PATH or not executable".
+      if (files[abs]) {
+        files[path] = files[abs];
+        if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
+      }
     }
     if (cmd) {
       files['/cmd.sh'] = new TextEncoder().encode(`${cmd}\n`);
@@ -333,6 +348,20 @@ async function bootDebian(ctx) {
       // exist and holds no files in either, so without these it reports a
       // rootfs missing directories that are in the tar.
       dirs: tree.dirs,
+      modes: tree.modes,
+      // What a Debian root shell expects to find. `PATH` has to carry the
+      // `sbin` directories: dpkg looks for `ldconfig` and
+      // `start-stop-daemon`, both of which live in `/sbin`, and says so.
+      // `DEBIAN_FRONTEND` keeps maintainer scripts from waiting on a
+      // debconf dialogue nobody can answer.
+      env: [
+        'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        'HOME=/root',
+        'TERM=xterm-256color',
+        'DEBIAN_FRONTEND=noninteractive',
+        'LC_ALL=C',
+        'LANG=C',
+      ],
       // `?cmd=apt-get update` runs one command and exits, instead of opening
       // a shell. A prompt is what a person wants and is exactly what nothing
       // else can drive: the demo that proves apt works could only be run by
@@ -563,7 +592,14 @@ const virglGears = {
           const abs = target.startsWith('/')
             ? target
             : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
-          if (files[abs]) files[path] = files[abs];
+          // The mode travels with the bytes. A symlink materialised as a copy
+      // has no tar entry of its own, so it had no mode -- and `/bin/sh` is a
+      // symlink to dash, which is exactly the program dpkg reported as
+      // "not found in PATH or not executable".
+      if (files[abs]) {
+        files[path] = files[abs];
+        if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
+      }
         }
         // The loader passes no environment, so the bound is written into a
         // script rather than exported around one.
@@ -583,6 +619,8 @@ const virglGears = {
           elf: files['/bin/sh'],
           files,
           dirs: tree.dirs,
+          modes: tree.modes,
+      modes: tree.modes,
           args: ['/bin/sh', '/run.sh'],
           cwd: '/',
           tty: true,

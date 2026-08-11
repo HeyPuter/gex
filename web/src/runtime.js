@@ -300,6 +300,10 @@ export async function runProgram(
     // makes the ones on the way to a file, so only the empty ones need
     // saying -- and they are exactly the ones apt looks for.
     dirs = [],
+    // Which bundled files are executable; see `untar`.
+    modes = {},
+    /// `KEY=VALUE` strings for pid 1. Empty takes the shim's default.
+    env = [],
     args,
     cwd = '/',
     tty = true,
@@ -456,12 +460,14 @@ export async function runProgram(
       elf,
       files,
       dirs,
+      modes,
+      env,
       args,
       // The layout the closure was built against. Without it the placer hands
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
       opts: {
-        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, pins: closure?.pins,
+        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, env, pins: closure?.pins,
         program: closure?.program,
         // `?permiss=N`: how many stored units one dispatch miss may take.
         perMiss: typeof globalThis.GEX_PER_MISS === 'number' ? globalThis.GEX_PER_MISS : undefined,

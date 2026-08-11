@@ -171,6 +171,26 @@ PYEOF
 cat > "$R/etc/apt/sources.list" <<EOF
 deb $MIRROR $SUITE main
 EOF
+# The account database, which no package installs.
+#
+# `base-passwd` ships `passwd.master` and `group.master` and its postinst
+# copies them into place -- and nothing here runs maintainer scripts, so a
+# rootfs built this way has no `/etc/passwd` at all. `ls -l` then prints bare
+# numbers, `id` has no names for them, and anything that looks up a user by
+# name fails in a way that reads as a missing account rather than a missing
+# file.
+if [ -f "$R/usr/share/base-passwd/passwd.master" ]; then
+    cp "$R/usr/share/base-passwd/passwd.master" "$R/etc/passwd"
+    cp "$R/usr/share/base-passwd/group.master" "$R/etc/group"
+else
+    printf 'root:x:0:0:root:/root:/bin/bash\n' > "$R/etc/passwd"
+    printf 'root:x:0:\n' > "$R/etc/group"
+fi
+# The shadow file the passwd entries point at, with no password set: nothing
+# here authenticates, and its absence is what makes `su` and `chpasswd` fail
+# rather than refuse.
+awk -F: '{ print $1 ":*:19000:0:99999:7:::" }' "$R/etc/passwd" > "$R/etc/shadow"
+chmod 640 "$R/etc/shadow"
 cat > "$R/etc/resolv.conf" <<'EOF'
 nameserver 1.1.1.1
 EOF

@@ -40,6 +40,17 @@ struct Inner {
     nodes: BTreeMap<String, Node>,
     next_ino: u64,
     inos: BTreeMap<String, u64>,
+    /// Modes for the files that are not the 0644 default.
+    ///
+    /// Sparse on purpose: a rootfs is thousands of files and a few hundred
+    /// binaries, and only the binaries differ. Kept because `chmod` used to
+    /// be the trait's default -- "filesystems that do not model permissions
+    /// accept it and do nothing" -- and dpkg does not accept it:
+    ///
+    ///   dpkg: warning: 'sh' not found in PATH or not executable
+    ///
+    /// for a `/bin/sh` that is present, the right size, and 0644.
+    modes: BTreeMap<String, u32>,
 }
 
 /// An in-memory filesystem.
@@ -200,7 +211,7 @@ impl FileHandle for TmpHandle {
             Some(Node::File(f)) => Ok(Metadata {
                 file_type: FileType::Regular,
                 size: f.data.lock().unwrap().len() as u64,
-                mode: 0o644,
+                mode: inner.modes.get(&self.path).copied().unwrap_or(0o644),
                 ino,
                 mtime: 0,
             }),
@@ -337,6 +348,20 @@ impl FileSystem for TmpFs {
             file: None,
         };
         handle.metadata()
+    }
+
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.nodes.contains_key(path) {
+            return Err(Errno::ENOENT);
+        }
+        let mode = mode & 0o7777;
+        if mode == 0o644 {
+            inner.modes.remove(path);
+        } else {
+            inner.modes.insert(path.to_string(), mode);
+        }
+        Ok(())
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {

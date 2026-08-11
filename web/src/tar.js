@@ -32,7 +32,7 @@ function octal(bytes, off, len) {
 }
 
 /**
- * Unpack a tar into `{ files, dirs, links }`.
+ * Unpack a tar into `{ files, dirs, links, modes }`.
  *
  * `files` maps an absolute guest path to its bytes, `dirs` lists directories
  * (so an empty one still exists), and `links` maps a symlink's path to its
@@ -44,6 +44,15 @@ export function untar(buf, root = '') {
   const files = Object.create(null);
   const dirs = [];
   const links = Object.create(null);
+  // Only the executable ones. Every file in the guest is 0644 by default, so
+  // what has to survive the tar is the execute bit -- and dpkg checks it:
+  //
+  //   dpkg: warning: 'sh' not found in PATH or not executable
+  //
+  // for a `/bin/sh` that is plainly there. Keeping only the modes that differ
+  // from the default keeps this to the few hundred binaries in a rootfs
+  // rather than an entry per file.
+  const modes = Object.create(null);
   let off = 0;
   let longName = null;
 
@@ -83,9 +92,13 @@ export function untar(buf, root = '') {
       if (p) links[p] = target;
     } else if (type === '0' || type === '\0' || type === '7') {
       const p = path(name);
-      if (p) files[p] = b.slice(body, body + size);
+      if (p) {
+        files[p] = b.slice(body, body + size);
+        const mode = octal(b, off + 100, 8) & 0o7777;
+        if (mode & 0o111) modes[p] = mode;
+      }
     }
     off = next;
   }
-  return { files, dirs, links };
+  return { files, dirs, links, modes };
 }

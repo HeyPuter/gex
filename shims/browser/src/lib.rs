@@ -696,6 +696,7 @@ fn install_bundle_remote() {
     // and clearing it is only tidiness.
     FILES.0.borrow_mut().clear();
     DIRS.0.borrow_mut().clear();
+    MODES.0.borrow_mut().clear();
     if unsafe { k_fs_populated() } == 0 {
         unsafe { k_fs_populate_done() };
     }
@@ -2503,7 +2504,31 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect()
     };
-    let env = ["PATH=/usr/bin:/bin".to_string(), "HOME=/root".to_string()];
+    // The environment pid 1 starts with, and so the one every process in the
+    // run inherits.
+    //
+    // It was `PATH=/usr/bin:/bin`, which has no `sbin` in it at all -- and
+    // dpkg looks for `ldconfig` and `start-stop-daemon`, both of which live
+    // in `/sbin`. It says so, and the advice is exactly right:
+    //
+    //   dpkg: warning: 'ldconfig' not found in PATH or not executable
+    //   Note: root's PATH should usually contain /usr/local/sbin,
+    //         /usr/sbin and /sbin
+    //
+    // This is Debian's own default for root. A page that wants something
+    // else says so with `gex_add_env`, which is how `TERM` and
+    // `DEBIAN_FRONTEND` arrive rather than being guessed at here.
+    let env: Vec<String> = {
+        let given = std::mem::take(&mut *ENV.0.borrow_mut());
+        if given.is_empty() {
+            vec![
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+                "HOME=/root".to_string(),
+            ]
+        } else {
+            given
+        }
+    };
     // `/proc/self/{cmdline,exe}` read these. A relative argv[0] is resolved
     // against the root, which is where a bundled program lives.
     kernel.exe_path = if args[0].starts_with('/') {
@@ -2726,6 +2751,33 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     FILES.0.borrow_mut().push((name.to_string(), bytes));
 }
 
+/// Make a bundled file executable.
+///
+/// Every file in the guest is 0644, because that is the VFS default and the
+/// tar's mode never travelled with its bytes. dpkg checks, and says so about
+/// programs that are plainly present:
+///
+///   dpkg: warning: 'sh' not found in PATH or not executable
+///   dpkg: error: 7 expected programs not found in PATH or not executable
+///
+/// Only the modes that differ from the default are sent, so this is the few
+/// hundred binaries in a rootfs rather than a call per file.
+#[no_mangle]
+pub extern "C" fn gex_chmod(path: u32, path_len: u32, mode: u32) {
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return;
+    };
+    // SAFETY: scalars naming a range of this module's memory, with no borrow
+    // held across the call. See `gex_add_file`.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            unsafe { k_fs_chmod(path, path_len, mode) };
+        }
+        return;
+    }
+    MODES.0.borrow_mut().push((name.to_string(), mode));
+}
+
 /// A directory the bundle contains, whether or not anything is in it.
 ///
 /// `gex_add_file` creates the directories on the way to each file, so a tree
@@ -2835,6 +2887,22 @@ static FILES: SingleThreaded<Bundle> = SingleThreaded(const { RefCell::new(Vec::
 /// file to carry it and would otherwise not exist in the guest at all.
 static DIRS: SingleThreaded<Vec<String>> = SingleThreaded(const { RefCell::new(Vec::new()) });
 
+/// The environment the page wants pid 1 to start with, if it says. Empty
+/// means the default below in `gex_load`.
+static ENV: SingleThreaded<Vec<String>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+
+/// Add one `KEY=VALUE` to pid 1's environment. Said before `gex_load`.
+#[no_mangle]
+pub extern "C" fn gex_add_env(ptr: u32, len: u32) {
+    if let Ok(s) = std::str::from_utf8(shim_slice(ptr, len)) {
+        ENV.0.borrow_mut().push(s.to_string());
+    }
+}
+
+/// Modes for bundled files that are not the 0644 default. See `gex_chmod`.
+static MODES: SingleThreaded<Vec<(String, u32)>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
+
 /// Put the staged bundle into a filesystem, creating the directories on the
 /// way to each file.
 fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
@@ -2864,6 +2932,10 @@ fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
             root.add_dir(&at);
         }
         root.add_file(&name, bytes);
+    }
+    // And the modes, after the files exist to carry them.
+    for (name, mode) in std::mem::take(&mut *MODES.0.borrow_mut()) {
+        let _ = gex_kernel::vfs::FileSystem::chmod(root, &name, mode);
     }
 }
 
