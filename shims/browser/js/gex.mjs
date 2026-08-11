@@ -2243,6 +2243,19 @@ export class Gex {
               `[gex] run ended: ${e.gex_exited?.() ? 'exited' : 'ABANDONED'}`
               + `, code ${e.gex_exit_code()}${where}${heap}`,
             );
+            // And the file it was asking for, when it died inside `openat`.
+            if (!e.gex_exited?.() && e.gex_last_open && e.gex_alloc) {
+              try {
+                const max = 256;
+                const p = e.gex_alloc(max) >>> 0;
+                const n = e.gex_last_open(p, max) >>> 0;
+                const path = new TextDecoder().decode(this.#bytes().subarray(p, p + n));
+                e.gex_free?.(p, max);
+                if (path) console.error(`[gex] the last path it opened: ${path}`);
+              } catch {
+                // A crash report must not crash.
+              }
+            }
             // And the wasm stack, when nobody set a status.
             //
             // A program that finished throws `unreachable` on purpose and its

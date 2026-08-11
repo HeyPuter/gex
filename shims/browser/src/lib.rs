@@ -7455,11 +7455,33 @@ fn note_intrinsics(addr: u64) {
 /// `CLONE_THREAD`, so the two are told apart here rather than by number --
 /// which is the distinction that matters, because one makes a process and the
 /// other makes a thread.
+/// The path of the most recent `openat`, for the crash report.
+static LAST_OPEN: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+
+/// How many bytes of it there are, written into the shim's own buffer.
+#[no_mangle]
+pub extern "C" fn gex_last_open(out: u32, max: u32) -> u32 {
+    let s = LAST_OPEN.0.borrow();
+    let n = s.len().min(max as usize);
+    shim_slice_mut(out, n as u32).copy_from_slice(&s.as_bytes()[..n]);
+    n as u32
+}
+
 fn note_process_syscall(base: u64, pc: i64) {
     use gex_kernel::syscalls::{clone_flags, nr};
     let gm = GuestMem::new(guest_bytes());
     let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
     let n = g(8);
+    // The last path this process asked to open, kept for the crash report.
+    //
+    // A guest that faults inside `openat` says only that it faulted inside
+    // `openat`. Which file it was asking for is the whole question, and it is
+    // one bounded read of a string the handler is about to read anyway.
+    if n == nr::OPENAT {
+        if let Ok(b) = gm.read_cstr(g(1), 256) {
+            *LAST_OPEN.0.borrow_mut() = String::from_utf8_lossy(&b).into_owned();
+        }
+    }
     if n != nr::CLONE && n != nr::EXECVE {
         return;
     }
