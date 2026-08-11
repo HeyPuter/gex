@@ -2613,8 +2613,12 @@ recorded against the child, `apt-get update` gets past `dpkg` and downloads:
 
     Get:1 http://deb.debian.org/debian bookworm InRelease [151 kB]
 
-No process crashes in that run at all -- which says the `openat` fault was
-downstream of the bookkeeping rather than a fault of its own. The parent
+`dpkg` still faults -- `run ended: ABANDONED, code 0, pc=0x0, in syscall 56`,
+followed now by `pid 3 crashed; 1 pipe ends released, status 134` where it
+used to say `0`. What changed is that the run survives it. (An earlier reading
+of this run said no process crashed; that grep ran before the stderr dump was
+written, and the dump is the only place a failing run says anything.) The
+parent
 reopens a forked child's pipe ends in the global kernel and was recording them
 under its own pid, so `k_pipe_forget` had every process releasing ends that
 belonged to somebody else, and a descriptor could be shut under a process that
@@ -2622,6 +2626,14 @@ was still using it.
 
 The stall has moved from pipe 0, which is `dpkg`'s, to pipe 9, which is the
 http method's, after the method has reported the size and before it reports
-the download done. That is either the method blocked on the network or the
-same wake problem #100 describes. It is a much later failure than two
-processes and no output.
+the download done. A much later failure than two processes and no output.
+
+What the run is waiting on, in its own words:
+
+    2.0=net([5 shared pipe 1 read, 0 buffered want0x1 have0x0])
+    run ended: exited, code 100
+
+`apt-get` is polling a method's pipe for readable and getting nothing, and a
+method has exited 100 -- which is what apt's methods return when they fail.
+So two defects remain and they are separate: `dpkg`'s fault inside `openat`,
+which is now survivable, and a method that gives up.
