@@ -1731,6 +1731,65 @@ static SYS_RET: [std::sync::atomic::AtomicU64; SYS_RING] =
     [const { std::sync::atomic::AtomicU64::new(0) }; SYS_RING];
 static SYS_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The last few things a process did to its address space.
+///
+/// A ring of everything is the wrong instrument for a memory question: a
+/// decompressing child's last 256 calls are 147 futexes and 102 writes, and
+/// the `mmap` that decided its fate was thousands of calls earlier.
+///
+/// The question this exists for is `free(): invalid pointer`, which is what
+/// glibc says when a chunk's address does not resolve to a heap it knows.
+/// A non-main arena is a 64 MiB-aligned region that glibc builds by mapping
+/// twice that and unmapping the misaligned ends, and `heap_for_ptr` is a
+/// mask -- so an `mmap` that ignores the length it was asked for, or a
+/// `munmap` that will not release part of a mapping, produces exactly that
+/// message and nothing else.
+const MEM_RING: usize = 32;
+static MEM_NR: [std::sync::atomic::AtomicU64; MEM_RING] =
+    [const { std::sync::atomic::AtomicU64::new(!0) }; MEM_RING];
+static MEM_A0: [std::sync::atomic::AtomicU64; MEM_RING] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MEM_RING];
+static MEM_A1: [std::sync::atomic::AtomicU64; MEM_RING] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MEM_RING];
+static MEM_RET: [std::sync::atomic::AtomicU64; MEM_RING] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MEM_RING];
+static MEM_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `brk`, `munmap`, `mremap`, `mmap`.
+fn is_mem_call(nr: u64) -> bool {
+    matches!(nr, 214 | 215 | 216 | 222)
+}
+
+fn mem_note(nr: u64, a0: u64, a1: u64, ret: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let i = MEM_AT.fetch_add(1, Relaxed) % MEM_RING;
+    MEM_NR[i].store(nr, Relaxed);
+    MEM_A0[i].store(a0, Relaxed);
+    MEM_A1[i].store(a1, Relaxed);
+    MEM_RET[i].store(ret, Relaxed);
+}
+
+fn mem_recent() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = MEM_AT.load(Relaxed);
+    let mut out = String::new();
+    for j in n.saturating_sub(MEM_RING)..n {
+        let i = j % MEM_RING;
+        let nr = MEM_NR[i].load(Relaxed);
+        if nr == !0 {
+            continue;
+        }
+        out.push_str(&format!(
+            " {}({:#x}, {:#x})={:#x}",
+            gex_kernel::syscalls::syscall_name(nr),
+            MEM_A0[i].load(Relaxed),
+            MEM_A1[i].load(Relaxed),
+            MEM_RET[i].load(Relaxed),
+        ));
+    }
+    out
+}
+
 /// Record a syscall on entry, and return where to put its result.
 fn sys_note(nr: u64, a0: u64, a1: u64) -> usize {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1751,8 +1810,13 @@ fn sys_recent() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let n = SYS_AT.load(Relaxed);
     let mut out = String::new();
-    for k in 0..SYS_RING.min(n) {
-        let i = (n + k) % SYS_RING;
+    // From the oldest entry still held, which is not `n % RING` until the
+    // ring has wrapped: a process that made three calls has them at 0, 1, 2
+    // and starting at 3 reads nothing but empty slots. The syscall ring hid
+    // that because its count is always far past its size; the memory ring
+    // beside it printed nothing at all and that is how it was found.
+    for j in n.saturating_sub(SYS_RING)..n {
+        let i = j % SYS_RING;
         let nr = SYS_NR[i].load(Relaxed);
         if nr == !0 {
             continue;
@@ -4263,6 +4327,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
         let ret = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
+        if is_mem_call(nr) {
+            mem_note(nr, a0, a1, ret);
+        }
         // What the guest was trying to say when it could not say it.
         //
         // glibc reports a fatal condition by writing to fd 2 and then calling
@@ -4334,10 +4401,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // itself.
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
                 warn_line(&format!(
-                    "[gex] pid {} killed by signal {} at pc={at:#x}, last calls:{}",
+                    "[gex] pid {} killed by signal {} at pc={at:#x}\n  last calls:{}\n  \
+                     address space:{}",
                     h.kernel.pid,
                     signal,
                     sys_recent(),
+                    mem_recent(),
                 ));
                 exit_process(h, -(signal as i32))
             }
