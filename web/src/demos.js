@@ -305,7 +305,9 @@ async function bootDebian(ctx) {
     const wantClosure = new URLSearchParams(location.search).get('closure') !== '0';
     const closure = !wantClosure ? null : await loadClosure('/closure/debian', {
       image: '/bin/bash',
-      log: (s) => ctx.term.writeln(ctx.ansi.dim(s)),
+      // The console, not the terminal. How the closure loaded is a fact
+      // about the runtime, and the terminal belongs to the guest.
+      log: (s) => console.debug(`[gex] ${s}`),
     });
 
     ctx.idle();

@@ -260,11 +260,9 @@ export class ProcessHost {
           if (!res.ok) throw new Error(`${entry.url}: ${res.status} ${res.statusText}`);
           const bytes = new Uint8Array(await res.arrayBuffer());
           const mod = await WebAssembly.compile(bytes);
-          this.#onOutput(
-            2,
-            `[closure] library ${i}: ${(bytes.length / 1048576).toFixed(1)} MiB fetched `
-            + `and compiled in ${Math.round(performance.now() - t0)}ms\n`,
-            0,
+          console.debug(
+            `[gex] closure library ${i}: ${(bytes.length / 1048576).toFixed(1)} MiB `
+            + `fetched and compiled in ${Math.round(performance.now() - t0)}ms`,
           );
           return mod;
         })();

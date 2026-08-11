@@ -421,6 +421,10 @@ export async function runProgram(
       // forty commands it runs, and each of those is a Worker of its own
       // that never sees `opts`.
       link: link || undefined,
+      // Who the guest is, in `extra` so a forked child gets it: identity is
+      // fixed when a kernel is built and a child builds its own.
+      uid,
+      gid: uid,
     },
     onOutput: (fd, text, pid, m) => {
       if (m?.lflag !== undefined) tenv.lflag = m.lflag;

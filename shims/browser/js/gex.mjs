@@ -577,6 +577,20 @@ export class Gex {
     return {
         write: (fd, ptr, len) =>
           this.#env.write(fd, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0))),
+        // The shim's own narration, to the console -- never to the guest's
+        // output. See `debug` in the shim: fd 2 is the terminal a person is
+        // reading, and a diagnostic interleaved with the program's output is
+        // noise in the one place it must not be.
+        debug: (ptr, len) => console.debug(
+          new TextDecoder().decode(
+            this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
+          ).replace(/\n$/, ''),
+        ),
+        warn: (ptr, len) => console.error(
+          new TextDecoder().decode(
+            this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
+          ).replace(/\n$/, ''),
+        ),
         now: () => this.#env.now(),
         // The network. Every one of these must return without waiting: the
         // guest's thread is parked by the kernel, not by JS, because there is
@@ -1510,6 +1524,24 @@ export class Gex {
     if (adoptAfterTraps() > 0 && (child.modules?.length ?? 0) > 0 && e.gex_reset_directory) {
       step(`directory rebuilt: ${e.gex_reset_directory() >>> 0} entries kept`);
     }
+    // Before the kernel is built, not after.
+    //
+    // `Kernel::new` takes a uid of 1000 and `getuid` answers with it, so a
+    // process's identity is decided at construction -- and this was said
+    // afterwards, under a comment claiming the kernel had to exist first.
+    // It does for the terminal and the tracing; it is exactly wrong for
+    // this. Every forked child therefore ran as 1000 whatever the page
+    // asked for, and dpkg is always a child:
+    //
+    //   dpkg: error: requested operation requires superuser privilege
+    //
+    // `gex_adopt_child` reads the identity as it builds, so this has to be
+    // in place by the time it is called.
+    {
+      const o0 = child.opts ?? {};
+      const uid = o0.uid ?? child.uid;
+      if (uid !== undefined) e.gex_set_identity(uid, o0.gid ?? child.gid ?? uid);
+    }
     const entry = e.gex_adopt_child(
       child.pid,
       child.ctx,
@@ -1525,7 +1557,7 @@ export class Gex {
     if (o.strace) e.gex_set_trace(1);
     if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
     if (o.tty) e.gex_set_tty(1);
-    if (o.uid !== undefined) e.gex_set_identity(o.uid, o.gid ?? o.uid);
+    // Identity was already said above, before the kernel was built.
     // The map, which the bytes do not carry: without it the child's first
     // `mmap` hands out an address its own image is already at.
     // Preferring the blob, which carries each region's name and the file its

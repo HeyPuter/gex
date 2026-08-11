@@ -374,6 +374,13 @@ async function handle(msg) {
       // and every library the build covered is thrown away: a dash closure
       // prints `exec: 394 closure pages kept` and an apt run never printed
       // that line once, then translated 3.5 million blocks.
+      // The identity too. A forked child never calls `load`, which is where
+      // `gex_set_identity` is normally said, so without this it runs as the
+      // default 1000 and every `dpkg` refuses.
+      if (msg.child) {
+        msg.child.uid = msg.uid ?? msg.opts?.uid;
+        msg.child.gid = msg.gid ?? msg.opts?.gid;
+      }
       entry = await gex.adoptProcess(msg.shim, msg.guest, msg.child, {
         ...msg,
         closure: msg.closure ?? (await closureModules(msg.closureCount ?? 0)),

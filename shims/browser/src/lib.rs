@@ -72,6 +72,19 @@ extern "C" {
     /// Write `len` bytes at `ptr` -- an address in the shared memory -- to the
     /// host's console for `fd`.
     fn write(fd: i32, ptr: u32, len: u32);
+    /// The shim's own narration, to the host's debug console.
+    ///
+    /// Not fd 2. Everything this file traces used to go to the guest's
+    /// standard error, which is the terminal a person is reading -- so a
+    /// closure diagnostic, a syscall trace and the program's own output
+    /// arrived interleaved on the same stream, and turning the noise off
+    /// meant finding and gating each site. The guest's stderr belongs to the
+    /// guest; this is a channel of our own.
+    fn debug(ptr: u32, len: u32);
+    /// The same channel at error level, for the few things a person must see
+    /// whatever else is switched off: a misplaced pin, a corrupt signal
+    /// frame, a process that crashed.
+    fn warn(ptr: u32, len: u32);
     /// Nanoseconds since an arbitrary epoch.
     fn now() -> i64;
 
@@ -2424,6 +2437,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         }
     }
     kernel.uid = unsafe { IDENTITY.0 };
+    kernel.gid = unsafe { IDENTITY.1 };
     // Replace the descriptors `Kernel::new` opened on `std::io` with ones the
     // host can actually see.
     install_console(&mut kernel);
@@ -2655,7 +2669,7 @@ fn report_new_pins() {
                 trace_line(&format!("[gex] pin ok: {path} at {got:#x}\n"));
             }
         } else {
-            trace_line(&format!(
+            warn_line(&format!(
                 "[gex] pin MISPLACED: {path} wanted {want:#x}, landed {got:#x}\n"
             ));
         }
@@ -3746,9 +3760,15 @@ fn tracing() -> bool {
     unsafe { TRACE }
 }
 
-/// Write a line to fd 2 without going through the guest's descriptor table.
+/// Something a person must see whatever the tracing settings, on the host's
+/// console at error level rather than in the guest's output.
+fn warn_line(s: &str) {
+    unsafe { warn(s.as_ptr() as u32, s.len() as u32) };
+}
+
+/// Write a line to the host's debug console, not the guest's stderr.
 fn trace_line(s: &str) {
-    unsafe { write(2, s.as_ptr() as u32, s.len() as u32) };
+    unsafe { debug(s.as_ptr() as u32, s.len() as u32) };
 }
 
 /// Which syscalls a run is making, and how many of each.
@@ -4036,13 +4056,18 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     unsafe { k_snap_store(key, blob.as_ptr() as u32, n) };
                 }
                 link_state(3);
-                trace_line(&format!(
-                    "[link] {} linked, {} KiB kept at {}ms\n",
-                    h.kernel.exe_path,
-                    blob.len() / 1024,
-                    (now_ns() - PROCESS_STARTED.load(std::sync::atomic::Ordering::Relaxed))
-                        / 1_000_000
-                ));
+                // Under tracing only. `trace_line` writes to the guest's
+                // stderr, which is the terminal a person is reading, and the
+                // per-process line already says `link kept`.
+                if tracing() {
+                    trace_line(&format!(
+                        "[link] {} linked, {} KiB kept at {}ms\n",
+                        h.kernel.exe_path,
+                        blob.len() / 1024,
+                        (now_ns() - PROCESS_STARTED.load(std::sync::atomic::Ordering::Relaxed))
+                            / 1_000_000
+                    ));
+                }
             }
             h.kernel.leave_thread(&mut h.threads[cur()].kstate);
             h.threads[cur()].pc = entry;
@@ -4903,6 +4928,17 @@ pub extern "C" fn gex_adopt_child(
     // `malloc` an address at the bottom of the address space, which is where
     // the register contexts are.
     let mut kernel = Kernel::new(ctx_addr, brk as u64, String::new());
+    // Who this process is. `Kernel::new` takes 1000 and `getuid` answers with
+    // it, so a child that does not say otherwise is not root -- and every
+    // `dpkg` a shell or apt forks then refuses:
+    //
+    //   dpkg: error: requested operation requires superuser privilege
+    //
+    // `gex_load` has always done this and `gex_adopt_child` never did, so it
+    // was invisible to anything that did not fork. `apt-get update` forks
+    // eighty times and needs root for none of it.
+    kernel.uid = unsafe { IDENTITY.0 };
+    kernel.gid = unsafe { IDENTITY.1 };
     kernel.mem.grows_on_demand(arena_grow, arena_back);
     // The same table the parent has, because it is not in either of their
     // memories. This is what makes the parent's `wait4` able to find a child
@@ -7374,7 +7410,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     true
                 }
                 Err(_) => {
-                    trace_line("gex: corrupt signal frame on sigreturn\n");
+                    warn_line("gex: corrupt signal frame on sigreturn\n");
                     set_exit(h, 128 + 11);
                     false
                 }
@@ -8953,7 +8989,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         }
     };
     with_host(|h| h.kernel.procs.exit(pid, status));
-    trace_line(&format!(
+    warn_line(&format!(
         "[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"
     ));
     n

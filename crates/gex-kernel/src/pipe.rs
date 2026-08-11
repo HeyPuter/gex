@@ -144,6 +144,16 @@ impl Pipe {
         }
     }
 
+    /// How many descriptors are open on each end, as `(readers, writers)`.
+    ///
+    /// For the census: a reader that never sees end-of-file is a pipe whose
+    /// writer count never reached zero, and the only way to tell that from a
+    /// writer that simply has not written yet is to look.
+    pub fn ends(&self) -> (usize, usize) {
+        let s = self.state.lock().unwrap();
+        (s.readers, s.writers)
+    }
+
     /// Bytes available to read, for `poll` and `FIONREAD`.
     pub fn available(&self) -> usize {
         self.state.lock().unwrap().buf.len()
