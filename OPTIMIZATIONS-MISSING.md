@@ -2605,3 +2605,23 @@ twenty lines of terminal and none of the runtime's own account; and
 `run ended: shim trapped out, code 0` was printed identically for a program
 that finished and one that died with no status set -- the flag that knows the
 difference, `gex_exited`, has existed all along and was not being read.
+
+### apt reaches the network
+
+With a crashed process taking itself down and a forked child's pipe ends
+recorded against the child, `apt-get update` gets past `dpkg` and downloads:
+
+    Get:1 http://deb.debian.org/debian bookworm InRelease [151 kB]
+
+No process crashes in that run at all -- which says the `openat` fault was
+downstream of the bookkeeping rather than a fault of its own. The parent
+reopens a forked child's pipe ends in the global kernel and was recording them
+under its own pid, so `k_pipe_forget` had every process releasing ends that
+belonged to somebody else, and a descriptor could be shut under a process that
+was still using it.
+
+The stall has moved from pipe 0, which is `dpkg`'s, to pipe 9, which is the
+http method's, after the method has reported the size and before it reports
+the download done. That is either the method blocked on the network or the
+same wake problem #100 describes. It is a much later failure than two
+processes and no output.
