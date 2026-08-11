@@ -2661,3 +2661,26 @@ than three, and the run keeps going after dpkg dies -- so the missing file is
 worth putting in the rootfs on its own merits, quite apart from the fault.
 What is left in that run is methods ending oddly: `exited, code 100`, `code
 111`, and `code 130` at `pselect6`.
+
+### The image pages were a real bug and not dpkg's
+
+`?closure=0` produces no crash at all; with the closure, dpkg dies. That says
+the fault is in what the guest is handed, and the obvious candidate was the
+image library: it claims `PIE_BASE`, every program lands there, and `#publish`
+wrote its pages on the first branch into a claimed page even in a process
+running something else. That is fixed and it was worth fixing.
+
+It is not why dpkg dies. With the pages refused -- dpkg's attribution is
+`dpkg@0x1000000=1826` and nothing else, so it is lifting its own text as it
+should -- the fault is unchanged:
+
+    run ended: ABANDONED, code 0, pc=0x0, in syscall 56
+    pid 3 crashed; 1 pipe ends released, status 134
+
+So something else the closure supplies is wrong for dpkg, and the libraries
+are the only thing left: dpkg loads libmd, libselinux, libpcre2, libzstd,
+liblzma, libbz2 and libz, all pinned and all shared with programs that do not
+crash. The next thing to check is whether dpkg loads an object the closure
+does *not* cover into an address the closure pinned for something else --
+`pin MISPLACED` would say so and does not appear, but a library placed by the
+bump allocator over a pinned range would not be a pin at all.
