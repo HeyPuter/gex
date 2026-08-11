@@ -1732,9 +1732,27 @@ impl Kernel {
                 } else {
                     let secs = m.read_u64(a[3]).ok()?;
                     let nanos = m.read_u64(a[3] + 8).ok()?;
+                    let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
+                    // `FUTEX_WAIT_BITSET` names a moment, not a length, and
+                    // `CLOCK_REALTIME` says which clock it is on. Read as a
+                    // length it is about fifty-five years, and clamping that
+                    // to an hour turned a `pthread_cond_timedwait` of ten
+                    // milliseconds into an hour's sleep -- which is not a
+                    // hang the guest can report, only one it sits in.
+                    //
+                    // Plain `FUTEX_WAIT` really is relative, and keeps the
+                    // reading it always had.
+                    let absolute = (a[1] as u32) & !futex::op::PRIVATE_FLAG
+                        == futex::op::WAIT_BITSET | futex::op::CLOCK_REALTIME;
+                    let left = if absolute {
+                        want.saturating_sub(self.now_nanos())
+                    } else {
+                        want
+                    };
+                    let left = left.min(3600 * 1_000_000_000);
                     Some(std::time::Duration::new(
-                        secs.min(3600),
-                        (nanos % 1_000_000_000) as u32,
+                        (left / 1_000_000_000) as u64,
+                        (left % 1_000_000_000) as u32,
                     ))
                 };
                 Some(BlockOp::FutexWait {
@@ -2122,7 +2140,25 @@ impl Kernel {
                     .vmas()
                     .iter()
                     .any(|v| uaddr >= v.start && uaddr + 4 <= v.end);
-                Err(if mapped { Errno::EINVAL } else { Errno::EFAULT })
+                // `EAGAIN`, not `EINVAL`, for a wait on memory the process
+                // has.
+                //
+                // glibc treats a futex answer it does not recognise as
+                // unrecoverable: `futex_fatal_error` writes "The futex
+                // facility returned an unexpected error code." and aborts.
+                // `EAGAIN` is on its list -- it means the word no longer
+                // holds the value the caller expected -- so the caller
+                // re-reads and loops, which is the behaviour a spurious
+                // wake-up already has to survive. `EINVAL` is not, and
+                // `dpkg-deb`'s decompressing child died of it every time:
+                // liblzma's threaded decoder is the one thing in a Debian
+                // rootfs that waits on a condition variable, and every
+                // `apt install` goes through it.
+                //
+                // An address the process does not have is still `EFAULT`,
+                // which is what Linux says and what lets #113 report a wait
+                // on address zero rather than hang on it.
+                Err(if mapped { Errno::EAGAIN } else { Errno::EFAULT })
             }
             futex::op::WAKE | futex::op::WAKE_BITSET => Ok(self.futexes.wake(uaddr, val)),
             // Requeue is an optimisation for condition variables; waking

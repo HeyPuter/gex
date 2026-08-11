@@ -4330,6 +4330,21 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         if is_mem_call(nr) {
             mem_note(nr, a0, a1, ret);
         }
+        // Every futex answer that is an error, by name.
+        //
+        // glibc calls `futex_fatal_error` -- "The futex facility returned an
+        // unexpected error code." -- for anything outside the short list each
+        // of its wrappers tolerates, and then aborts with no clue which call
+        // or which code. The ring cannot say either, because a call that
+        // blocks has not written `x0` when it is recorded. These are rare
+        // enough to print whole.
+        if nr == 98 && (ret as i64) < 0 {
+            warn_line(&format!(
+                "[gex] pid {} futex({a0:#x}, op={a1:#x}) = {}",
+                h.kernel.pid,
+                ret as i64,
+            ));
+        }
         // What the guest was trying to say when it could not say it.
         //
         // glibc reports a fatal condition by writing to fd 2 and then calling
@@ -7154,7 +7169,17 @@ fn finish_parked(
     gm: &mut GuestMem<'_>,
 ) -> Result<u64, Errno> {
     match op {
-        gex_kernel::BlockOp::FutexWait { .. } if timed_out => Err(Errno::ETIMEDOUT),
+        gex_kernel::BlockOp::FutexWait { deadline, .. } if timed_out => {
+            // Loud, because glibc treats this as fatal when it did not ask
+            // for a timeout: `futex_wait_simple` tolerates 0, EAGAIN and
+            // EINTR and calls `futex_fatal_error` for anything else. A wait
+            // with no deadline that comes back timed out is this runtime
+            // inventing an error the caller has no branch for.
+            if deadline.is_none() {
+                warn_line("[gex] a futex wait with no deadline came back timed out");
+            }
+            Err(Errno::ETIMEDOUT)
+        }
         gex_kernel::BlockOp::FutexWait { .. } | gex_kernel::BlockOp::Sleep(_) => Ok(0),
         // The read the guest asked for happens now, into the buffer it named.
         // Doing it here rather than re-executing the instruction is what keeps
