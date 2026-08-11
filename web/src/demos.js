@@ -263,9 +263,17 @@ async function bootDebian(ctx) {
     // 4,106 in every child it forks, by then *all* of what either lifted.
     // apt and its methods are still in the closure -- as extra roots, which
     // contributes their libraries, which is where their code actually is.
+    // `?closure=0` runs the same demo on the runtime translator alone.
+    //
+    // Not a preference: it is the one switch that separates "the guest is
+    // wrong" from "what we handed the guest is wrong". A child of apt dies at
+    // an arbitrary syscall and every other explanation has been eliminated;
+    // whether it still dies with nothing statically recompiled decides
+    // whether to look at the syscall or at the dispatch.
     ctx.busy('loading the closure');
     const { loadClosure } = await import('./closure.js');
-    const closure = await loadClosure('/closure/debian', {
+    const wantClosure = new URLSearchParams(location.search).get('closure') !== '0';
+    const closure = !wantClosure ? null : await loadClosure('/closure/debian', {
       image: '/bin/bash',
       log: (s) => ctx.term.writeln(ctx.ansi.dim(s)),
     });

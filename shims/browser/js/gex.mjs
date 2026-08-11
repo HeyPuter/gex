@@ -2243,6 +2243,32 @@ export class Gex {
               `[gex] run ended: ${e.gex_exited?.() ? 'exited' : 'ABANDONED'}`
               + `, code ${e.gex_exit_code()}${where}${heap}`,
             );
+            // And what the global kernel has to say, which is where the
+            // answer has been sitting.
+            //
+            // That module imports two memories and nothing else, so it has no
+            // console: its panic hook writes the message into its own memory
+            // for a host to read. `worker.mjs` reads it -- but only on the
+            // path where the error *propagates*, and a guest that abandons
+            // the stack does not take that path. So a kernel panic during a
+            // syscall reported as `ABANDONED, in syscall 57` and nothing
+            // else, with the reason recorded and unread a function call away.
+            if (!e.gex_exited?.()) {
+              try {
+                const k = this.#kernel;
+                const n = k?.k_panic_len?.() >>> 0;
+                if (n) {
+                  const at = k.k_panic_ptr() >>> 0;
+                  const mem = this.#kernelSpec.memory;
+                  console.error(
+                    '[gex] the global kernel panicked: '
+                    + new TextDecoder().decode(new Uint8Array(mem.buffer, at, n)),
+                  );
+                }
+              } catch {
+                // A crash report must not crash.
+              }
+            }
             // And the file it was asking for, when it died inside `openat`.
             if (!e.gex_exited?.() && e.gex_last_open && e.gex_alloc) {
               try {
