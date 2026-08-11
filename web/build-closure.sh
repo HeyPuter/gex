@@ -53,7 +53,18 @@ trap 'rm -rf "$work"' EXIT
 
 cargo build --release -p gexc 2>&1 | grep -E "^error" && exit 1
 echo "building the closure for $program..."
-# libc and the dynamic linker whole; everything else reachable-only.
+# The dynamic linker whole; everything else reachable-only.
+#
+# *Not* libc, and this is a correctness bound rather than a size one. Built
+# whole, libc breaks `apt-get update`: children die at whatever syscall they
+# are in, and bisecting the closure with `?libs=N` puts it on libc alone --
+# `?libs=2` runtime-translates libc and crashes nothing, `?libs=3` adds the
+# closure's libc and three children die. Reachable-only libc, same closure,
+# same command: zero crashes and the run passes. The linker stays whole in
+# that build, so it is not whole-object translation in general.
+#
+# Whole is what every program in a rootfs wants from libc, so this costs
+# real coverage and should come back when the exhaustive path is fixed.
 #
 # "Reachable" means reachable *from this program*, so a closure built for
 # `apt-get` holds only the libc paths apt walks -- and `/bin/true` against it
@@ -61,7 +72,7 @@ echo "building the closure for $program..."
 # libc and ld.so are what every program in a rootfs shares, and a demo runs
 # dozens of programs from one closure.
 target/release/gexc build --closure --sysroot "$sysroot" --no-shared-memory \
-    --exhaustive-for "${GEX_WHOLE:-libc.so,ld-linux}" \
+    --exhaustive-for "${GEX_WHOLE:-ld-linux}" \
     --shared-image $withs "$sysroot$program" -o "$work/c.wasm"
 
 mkdir -p "$out"
