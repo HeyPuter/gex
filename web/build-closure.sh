@@ -53,7 +53,14 @@ trap 'rm -rf "$work"' EXIT
 
 cargo build --release -p gexc 2>&1 | grep -E "^error" && exit 1
 echo "building the closure for $program..."
-# libc and the dynamic linker whole; everything else reachable-only.
+# libc, the dynamic linker and the program itself whole; the rest
+# reachable-only.
+#
+# The program is in the list because it is pid 1 and every run pays for it.
+# Left out by hand once, `bash` came back reachable-only at 50,961 blocks
+# against 197,853, and pid 1 went from lifting 7 blocks to lifting 13,851 --
+# which read like a regression in the translator and was a missing word in a
+# build command. Derived from `$program` now rather than remembered.
 #
 # libc whole was briefly impossible: it broke `apt-get update`, whose children
 # died at whatever syscall they were in. Bisecting with `?libs=N` put it on
@@ -70,7 +77,7 @@ echo "building the closure for $program..."
 # libc and ld.so are what every program in a rootfs shares, and a demo runs
 # dozens of programs from one closure.
 target/release/gexc build --closure --sysroot "$sysroot" --no-shared-memory \
-    --exhaustive-for "${GEX_WHOLE:-libc.so,ld-linux}" \
+    --exhaustive-for "${GEX_WHOLE:-libc.so,ld-linux,$(basename "$program")}" \
     --shared-image $withs "$sysroot$program" -o "$work/c.wasm"
 
 mkdir -p "$out"
