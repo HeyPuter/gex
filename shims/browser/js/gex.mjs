@@ -2406,7 +2406,26 @@ export class Gex {
                 // measured as doing nothing because it never ran.
                 const onLoop = !!e.gex_paused_for_host();
                 this.#netTurns = onLoop ? this.#netTurns + 1 : 0;
-                if (onLoop && (this.#netTurns & 63) !== 0) {
+                // Every 1024th, not every 64th -- and this did *not* make a
+                // download faster, which is worth recording where the next
+                // person will look.
+                //
+                // At 64 an `apt-get update` took 5,583,885 turns and 88,633
+                // naps in the http method, and 88,633 clamped timers at four
+                // milliseconds is 354 seconds against the 343 the process
+                // lived. That arithmetic says the timer is the whole cost, and
+                // it is wrong: at 1024 the naps fell to 10,835 and the
+                // transfer took 5min42s against 5min43s. The naps overlap with
+                // waiting for bytes rather than serialising it.
+                //
+                // What the counters do say is that 11,084,773 turns moved
+                // 14.9 MB -- 1.4 bytes a turn, thirty-two thousand turns a
+                // second. The loop is running flat out and the data is not
+                // arriving, so the limit is under the transport and not here.
+                //
+                // Kept at 1024: the same throughput for a sixteenth of the
+                // timers.
+                if (onLoop && (this.#netTurns & 1023) !== 0) {
                   this.waits.turn++;
                   await this.#turn();
                 } else {
