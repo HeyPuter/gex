@@ -470,6 +470,14 @@ export class Gex {
   get compileMillis() { return Math.round(this.#compileMs); }
   get instantiateMillis() { return Math.round(this.#instantiateMs); }
   get growMillis() { return Math.round(this.#growMs); }
+  /// How many syscalls the guest's dynamic linker made, and when it made its
+  /// last one. See `gex_loader_calls`: a closure knows the layout at build
+  /// time and the run rediscovers it.
+  get loader() {
+    const e = this.#shim?.exports;
+    if (!e?.gex_loader_calls) return null;
+    return { calls: Number(e.gex_loader_calls()), doneMs: Number(e.gex_loader_done_ms()) };
+  }
   /// Which objects this process lifted blocks from, `name=count` separated.
   get blocksByObject() {
     const e = this.#shim?.exports;

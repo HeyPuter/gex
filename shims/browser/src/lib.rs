@@ -2351,6 +2351,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
 
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
+    PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
     // And the same for the first process, which opens its console before it
     // makes a syscall. See the note beside the other one.
     MY_PID.store(kernel.pid, std::sync::atomic::Ordering::Relaxed);
@@ -4818,6 +4819,7 @@ pub extern "C" fn gex_adopt_child(
     install_console(&mut kernel);
     kernel.pid = pid;
     kernel.tid = pid;
+    PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
     // Before anything opens a descriptor.
     //
     // A forked child rebuilds its parent's descriptor table here, *before* it
@@ -7595,6 +7597,30 @@ fn note_intrinsics(addr: u64) {
 /// `CLONE_THREAD`, so the two are told apart here rather than by number --
 /// which is the distinction that matters, because one makes a process and the
 /// other makes a thread.
+/// Syscalls made from the dynamic linker's text, and when the last one was.
+static LOADER_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOADER_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many syscalls came from the interpreter, and how long after the
+/// process started it made its last one -- roughly, when linking finished.
+#[no_mangle]
+pub extern "C" fn gex_loader_calls() -> u64 {
+    LOADER_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[no_mangle]
+pub extern "C" fn gex_loader_done_ms() -> u64 {
+    let last = LOADER_LAST.load(std::sync::atomic::Ordering::Relaxed);
+    let start = PROCESS_STARTED.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 || start == 0 || last < start {
+        return 0;
+    }
+    (last - start) / 1_000_000
+}
+
+/// When this process began, for the measurement above.
+static PROCESS_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The path of the most recent `openat`, for the crash report.
 static LAST_OPEN: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
 
@@ -7612,6 +7638,20 @@ fn note_process_syscall(base: u64, pc: i64) {
     let gm = GuestMem::new(guest_bytes());
     let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
     let n = g(8);
+    // How much of a process is its dynamic linker.
+    //
+    // gex loads the image and the interpreter and then jumps to the guest's
+    // `ld.so`, which does the actual linking -- search, `openat`, `mmap`,
+    // symbol hashing, relocation -- in translated code, once per process.
+    // A closure pins every library at build time, so all of that recomputes
+    // an answer the build already had. Counting the syscalls it makes, and
+    // when it makes its last one, says what that is worth before anything is
+    // built to avoid it.
+    let pc = pc as u64;
+    if pc >= gex_abi::INTERP_BASE && pc < gex_abi::INTERP_BASE + 0x0010_0000 {
+        LOADER_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LOADER_LAST.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
+    }
     // The last path this process asked to open, kept for the crash report.
     //
     // A guest that faults inside `openat` says only that it faulted inside

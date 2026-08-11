@@ -466,6 +466,9 @@ export class ProcessHost {
               (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
             ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
+              (m.loader && m.loader.calls
+                ? `, ld.so ${m.loader.calls} syscalls, last at ${m.loader.doneMs}ms`
+                : '') +
               (m.fill && (m.fill.filled || m.fill.unanswered)
                 ? `, fill ${m.fill.filled} answered ${m.fill.unanswered} not`
                 : '') +

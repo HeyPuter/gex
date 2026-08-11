@@ -506,6 +506,7 @@ async function handle(msg) {
       instantiateMs: gex.instantiateMillis,
       growMs: gex.growMillis,
       byObject: gex.blocksByObject,
+      loader: gex.loader,
       // What a Worker pays before the guest runs at all: the shim and the
       // guest module are instantiated per Worker, and one Worker is one guest
       // process. Never counted anywhere until now.
