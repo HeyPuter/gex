@@ -29,6 +29,9 @@
  * is a callback rather than a branch because this file has no business
  * knowing which it is running under.
  */
+/// Where a pooled Worker's early messages are kept until somebody owns it.
+const EARLY = Symbol('gex.early');
+
 export class ProcessHost {
   #makeWorker; #shim; #guest; #kernel; #extra;
   #onOutput; #onFork; #onExit; #readStdin; #onOther;
@@ -56,6 +59,21 @@ export class ProcessHost {
   #stacksFree = [];
   /// The shim compiling, once, so no Worker waits on a second compile.
   #shimCompiling = null;
+  /// Workers made before anybody asked for one.
+  ///
+  /// A forked process costs about 500ms and 170ms of that is `lived - guest`:
+  /// making a Worker, loading the bundle into it, and getting to the point
+  /// where it can read a start message. None of that depends on *which*
+  /// process it will run, so none of it has to happen while somebody waits.
+  ///
+  /// The cost does not go away -- a Worker still starts, on some other core
+  /// -- it stops being on the path. One spare is enough for a shell running
+  /// commands one at a time; a pipeline wants more, and taking the last one
+  /// falls back to making a Worker exactly as before.
+  #warm = [];
+  #warmWanted = 2;
+  #warmMade = 0;
+  #warmUsed = 0;
   #stackOf = new Map();
 
   constructor({
@@ -169,6 +187,11 @@ export class ProcessHost {
   stop() {
     for (const w of this.#workers.values()) w.terminate();
     this.#workers.clear();
+    // Including the ones nobody asked for. A page that has finished with its
+    // guest has finished with the Workers it started for a next process that
+    // never came.
+    for (const w of this.#warm) w.terminate();
+    this.#warm = [];
   }
 
   /**
@@ -190,7 +213,7 @@ export class ProcessHost {
     // megabytes of image across.
     this.#asked.set(pid, performance.now());
     return new Promise((resolve, reject) => {
-      const w = this.#makeWorker();
+      const w = this.#takeWorker();
       this.#workers.set(pid, w);
       if (pid === 1) this.#first = w;
       w.addEventListener?.('message', (e) => this.#onMessage(pid, w, e.data, resolve, reject));
@@ -202,7 +225,65 @@ export class ProcessHost {
       w.addEventListener?.('error', fail);
       w.on?.('error', fail);
       this.#pending.set(pid, { ...msg, pid });
+      // And now whatever it said while it was still in the pool.
+      const held = w[EARLY];
+      if (held) {
+        delete w[EARLY];
+        w.removeEventListener?.('message', held.buf);
+        w.off?.('message', held.buf);
+        for (const m of held.early) this.#onMessage(pid, w, m, resolve, reject);
+      }
     });
+  }
+
+  /**
+   * A Worker, from the pool if one is warm.
+   *
+   * Topping up is deliberately *after* the take, so the Worker being started
+   * now is the one for the process after this one, not this one.
+   */
+  #takeWorker() {
+    const w = this.#warm.shift();
+    if (w) this.#warmUsed++;
+    const got = w ?? this.#makeWorker();
+    this.#topUp();
+    return got;
+  }
+
+  /// Start Workers up to the pool size, one per call so a burst of forks does
+  /// not spend its first moments making Workers it will not reach.
+  #topUp() {
+    if (this.#warm.length >= this.#warmWanted) return;
+    try {
+      const w = this.#makeWorker();
+      // Everything it says before `#spawn` gets to it.
+      //
+      // A Worker made inside `#spawn` has its listener attached in the same
+      // synchronous block, so nothing it posts can arrive first. One made
+      // ahead of time does not: it loads the bundle and announces itself
+      // while the pool is still sitting in an array, and that message is
+      // delivered to nobody and dropped. The process then never receives its
+      // program and the run waits for a guest that was never started --
+      // measured as `debian-forks` going from 15 seconds to over 460 with no
+      // error of any kind, which is exactly what a dropped message looks
+      // like.
+      const early = [];
+      const buf = (e) => early.push(e && e.data !== undefined ? e.data : e);
+      w.addEventListener?.('message', buf);
+      w.on?.('message', buf);
+      w[EARLY] = { early, buf };
+      this.#warm.push(w);
+      this.#warmMade++;
+    } catch {
+      // A page that cannot make another Worker is not a failure here: the
+      // next `#takeWorker` makes one itself and the caller sees what it
+      // always saw.
+    }
+  }
+
+  /// How the pool is doing, for the per-run line.
+  get warmStats() {
+    return { made: this.#warmMade, used: this.#warmUsed, idle: this.#warm.length };
   }
 
   /**
