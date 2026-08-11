@@ -399,6 +399,20 @@ pub const DISPATCH_SLOT_MASK: u32 = (1u32 << DISPATCH_SLOT_BITS) - 1;
 /// the closure's numbering and only the demand-filled ones move.
 pub const BIG_BLOCKS: usize = 4096;
 
+/// Slots a dispatch fill writes around the one that missed.
+///
+/// A fill used to write a whole page -- 1,024 entries -- and that is the
+/// largest single cost in a warm process. `table.init` materialises a
+/// `funcref` per entry and V8 caches them in the *instance*, so the first
+/// fill of a page costs ten times a repeat and every process pays the first
+/// price: 1,741us a page on libc against 165us for the same page again, and
+/// 79 fills is 134ms of a 500ms `cat /dev/null`.
+///
+/// Writing a span around the miss instead trades entries for misses. It wins
+/// unless a page is entered at more than `1024 / FILL_SPAN` scattered points,
+/// and code entered at eight separate places in one 4 KiB page is unusual.
+pub const FILL_SPAN: u32 = 128;
+
 /// Pack a table index and a base slot into a directory entry.
 ///
 /// Entry zero has to keep meaning "no translation, table 0, the miss span",

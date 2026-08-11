@@ -3833,10 +3833,26 @@ pub extern "C" fn gex_fill_possible(on: i32) {
     if on != 0 {
         let failed = std::mem::take(&mut *FILL_FAILED.0.borrow_mut());
         let mut asked = FILL_ASKED.0.borrow_mut();
+        let spans = gex_abi::SLOTS_PER_PAGE as u64 / gex_abi::FILL_SPAN as u64;
         for page in failed {
-            asked.remove(&page);
+            // Every span of it: the module that has just arrived may cover
+            // parts of the page this one could not.
+            for i in 0..spans {
+                asked.remove(&(page * spans + i));
+            }
         }
     }
+}
+
+/// How far into the page the fill should start, in slots.
+///
+/// A fill writes `FILL_SPAN` slots from here rather than the whole page. See
+/// `gex_abi::FILL_SPAN` for why.
+static FILL_FROM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_fill_from() -> u32 {
+    FILL_FROM.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The slot the host should write, or -1 if it is not being asked.
@@ -8207,9 +8223,18 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // Once per page: a page nobody can fill falls through on the next miss to
     // everything below, which is what happened before any of this existed.
     if FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed) {
-        let fresh = FILL_ASKED.0.borrow_mut().insert(gex_abi::dispatch_page(pc));
+        // Once per *span*, not once per page. A fill writes `FILL_SPAN` slots
+        // around the one that missed rather than the whole page, so a later
+        // branch elsewhere in the same page has to be able to ask again --
+        // and asking twice for one span would loop for ever, which is what
+        // this set prevents. Eight spans to a page at 128 slots.
+        let page = gex_abi::dispatch_page(pc);
+        let from = ((pc & 0xfff) >> 2) as u32 & !(gex_abi::FILL_SPAN - 1);
+        let spans = gex_abi::SLOTS_PER_PAGE as u32 / gex_abi::FILL_SPAN;
+        let key = page * spans as u64 + (from / gex_abi::FILL_SPAN) as u64;
+        let fresh = FILL_ASKED.0.borrow_mut().insert(key);
         if fresh {
-            let page = gex_abi::dispatch_page(pc);
+            FILL_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
             FILL_WANTED.store(page as i64, std::sync::atomic::Ordering::Relaxed);
             FILL_PENDING.store(page as i64, std::sync::atomic::Ordering::Relaxed);
             with_host(|h| {

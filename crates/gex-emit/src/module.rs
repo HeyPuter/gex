@@ -996,12 +996,15 @@ impl ModuleBuilder {
         if self.demand_fill || n_blocks > BIG_BLOCKS {
             let void_ty = self.m.func_type(FuncType::new(vec![ValType::I32], vec![ValType::I32]));
             self.m.add_fill(void_ty);
-            // `(page, base) -> filled`. The second argument is where the
-            // process asking wants this page's slots, which is not where the
-            // build put them once a process numbers its own.
-            let at_ty = self
-                .m
-                .func_type(FuncType::new(vec![ValType::I32, ValType::I32], vec![ValType::I32]));
+            // `(page, base, from) -> filled`. The second argument is where
+            // the process asking wants this page's slots, which is not where
+            // the build put them once a process numbers its own; the third is
+            // how far into the page to start writing, so a fill can cover the
+            // span around the miss rather than all 1,024 slots.
+            let at_ty = self.m.func_type(FuncType::new(
+                vec![ValType::I32, ValType::I32, ValType::I32],
+                vec![ValType::I32],
+            ));
             self.m.add_fill_at(at_ty);
             let no_args = self.m.func_type(FuncType::new(vec![], vec![]));
             self.m.add_fill_all(no_args);

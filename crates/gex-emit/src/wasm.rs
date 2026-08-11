@@ -774,7 +774,12 @@ impl Module {
         }
         let idx = self.declare_func(ty);
         let mut b = Vec::new();
-        b.push(0x00); // no locals
+        // Two i32 locals: the first slot this call writes and the last, both
+        // clamped to what the segment actually covers. Locals 3 and 4, after
+        // the three parameters.
+        b.push(0x01);
+        write_u32(&mut b, 2);
+        b.push(0x7f); // i32
         for (seg, table, within, len, guest_page) in &passive {
             // if (page == guest_page)
             //
@@ -791,26 +796,85 @@ impl Module {
             b.push(0x46); // i32.eq
             b.push(op::IF);
             b.push(0x40); // void
-            // dest = base + (offset - page_base). The base is the caller's,
-            // so a process that numbers its own pages gets its slots written
-            // where its directory says they are.
+            // A span around the slot that missed, not the whole page.
+            //
+            // `from` is where the caller wants writing to start, relative to
+            // the page. This segment covers `[within, within + len)` of that
+            // page, so the intersection is what gets written:
+            //
+            //     s = max(from, within)
+            //     e = min(from + FILL_SPAN, within + len)
+            //
+            // and nothing at all when the span misses this segment. Writing
+            // the whole page cost 1,741us on libc, because `table.init`
+            // materialises a `funcref` per entry and the instance's cache
+            // starts empty in every process.
+            let span = gex_abi::FILL_SPAN as i32;
+            let end = (*within as i32).wrapping_add(*len as i32);
+            // s = (from > within) ? from : within
             b.push(op::LOCAL_GET);
-            write_u32(&mut b, 1);
+            write_u32(&mut b, 2);
             b.push(op::I32_CONST);
             write_i32(&mut b, *within as i32);
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 2);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, *within as i32);
+            b.push(0x4b); // i32.gt_u
+            b.push(0x1b); // select
+            b.push(0x21); // local.set
+            write_u32(&mut b, 3);
+            // e = (from + span < within + len) ? from + span : within + len
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 2);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, span);
             b.push(0x6a); // i32.add
             b.push(op::I32_CONST);
-            write_i32(&mut b, 0);
+            write_i32(&mut b, end);
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 2);
             b.push(op::I32_CONST);
-            write_i32(&mut b, *len as i32);
+            write_i32(&mut b, span);
+            b.push(0x6a); // i32.add
+            b.push(op::I32_CONST);
+            write_i32(&mut b, end);
+            b.push(0x49); // i32.lt_u
+            b.push(0x1b); // select
+            b.push(0x21); // local.set
+            write_u32(&mut b, 4);
+            // if (e > s) table.init(dest = base + s, src = s - within, e - s)
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 4);
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 3);
+            b.push(0x4b); // i32.gt_u
+            b.push(op::IF);
+            b.push(0x40); // void
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 1);
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 3);
+            b.push(0x6a); // i32.add
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 3);
+            b.push(op::I32_CONST);
+            write_i32(&mut b, *within as i32);
+            b.push(0x6b); // i32.sub
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 4);
+            b.push(op::LOCAL_GET);
+            write_u32(&mut b, 3);
+            b.push(0x6b); // i32.sub
             b.push(op::MISC_PREFIX);
             write_u32(&mut b, 12); // table.init
             write_u32(&mut b, *seg);
             write_u32(&mut b, *table);
+            b.push(op::END); // if (e > s)
             b.push(op::I32_CONST);
             write_i32(&mut b, 1);
             b.push(op::RETURN);
-            b.push(op::END); // if
+            b.push(op::END); // if (page == guest_page)
         }
         b.push(op::I32_CONST);
         write_i32(&mut b, 0);

@@ -3387,6 +3387,18 @@ export class Gex {
     this.#pubGrowMs += performance.now() - g0;
   }
 
+  /**
+   * Where in the page the fill should start, in slots.
+   *
+   * The shim records it from the pc that missed, rounded down to a multiple
+   * of `FILL_SPAN`. A shim from before this existed answers with zero, which
+   * asks for the span at the start of the page -- wrong but not unsafe, and
+   * only reachable with a stale build.
+   */
+  #fillFrom() {
+    return this.#shim.exports.gex_fill_from ? this.#shim.exports.gex_fill_from() >>> 0 : 0;
+  }
+
   fillSlotNow(page) {
     const e = this.#shim.exports;
     const owner = e.gex_closure_owner ? e.gex_closure_owner(BigInt(page)) : -1;
@@ -3412,7 +3424,7 @@ export class Gex {
       const at = this.#pageBase(page);
       const b1 = performance.now();
       this.#faBaseMs += b1 - b0;
-      const did = at >= 0 && lazy.instObj.exports[FILL_AT](page, at);
+      const did = at >= 0 && lazy.instObj.exports[FILL_AT](page, at, this.#fillFrom());
       this.#faInitMs += performance.now() - b1;
       if (did) {
         this.#filled++;
@@ -3424,7 +3436,7 @@ export class Gex {
     const where = this.#pageBase(page);
     if (where < 0) return null;
     for (const inst of this.#unfilled) {
-      if (inst.exports[FILL_AT](page, where)) {
+      if (inst.exports[FILL_AT](page, where, this.#fillFrom())) {
         this.#filled++;
         return true;
       }
@@ -3526,13 +3538,13 @@ export class Gex {
     const mine = owner >= 0 ? this.#lazyClosure[owner]?.instObj : null;
     if (mine && typeof mine.exports[FILL_AT] !== 'function') return true;
     const at = this.#pageBase(slot);
-    if (mine && at >= 0 && mine.exports[FILL_AT](slot, at)) {
+    if (mine && at >= 0 && mine.exports[FILL_AT](slot, at, this.#fillFrom())) {
       this.#filled++;
       return true;
     }
     if (slot * 4096 >= 0x0300_0000) {
       for (const inst of this.#unfilled) {
-        if (at >= 0 && inst.exports[FILL_AT](slot, at)) {
+        if (at >= 0 && inst.exports[FILL_AT](slot, at, this.#fillFrom())) {
           this.#filled++;
           return true;
         }
