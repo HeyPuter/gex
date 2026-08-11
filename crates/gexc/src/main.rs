@@ -624,7 +624,51 @@ fn build_closure(
     // in one process against one dispatch table, so they have to be allocated
     // as if by one allocator even though they are translated one at a time.
     let mut first_slot = 0u64;
-    for (n, o) in closure.objects.iter().enumerate() {
+    // Lowest slots to the objects the most processes will enter.
+    //
+    // A process must grow its dispatch table to the *highest* slot it
+    // touches, and `Table.grow` initialises every new element with the miss
+    // stub -- 4.3 million slots a second, measured. So the cost is the
+    // highest index, not the number of slots used, and the index is decided
+    // here, by the order objects are emitted in.
+    //
+    // Breadth-first from the roots put libc at position 30 of 62 and the
+    // dynamic linker at 31, behind bash's 197,853 blocks and every apt
+    // method. Every process uses libc and ld.so, so every process grew past
+    // all of that: 1,133,568 slots and 249ms, eighty times over in an
+    // `apt-get update`.
+    //
+    // In-degree is the proxy for "how many processes will enter this": the
+    // more objects name it in `DT_NEEDED`, the more of the run's programs
+    // reach it. libc is named by everything. Ties keep breadth-first order,
+    // so the layout stays deterministic and a rebuild does not reshuffle
+    // slots for no reason.
+    //
+    // Only the numbering changes. Addresses are pinned separately, and the
+    // manifest is written from this same sequence.
+    let order: Vec<usize> = {
+        let mut in_degree = vec![0usize; closure.objects.len()];
+        for o in &closure.objects {
+            for need in &o.image.needed {
+                if let Some(i) = closure
+                    .objects
+                    .iter()
+                    .position(|c| c.name == *need || c.path.ends_with(need.as_str()))
+                {
+                    in_degree[i] += 1;
+                }
+            }
+        }
+        let mut idx: Vec<usize> = (0..closure.objects.len()).collect();
+        // Without `--shared-image` the first object owns the memory and the
+        // tables, and that one cannot move.
+        let fixed = if shared_image { 0 } else { 1 };
+        idx[fixed..].sort_by_key(|&i| (std::cmp::Reverse(in_degree[i]), i));
+        idx
+    };
+    let ordered: Vec<&gex_ld::closure::Object> =
+        order.iter().map(|&i| &closure.objects[i]).collect();
+    for (n, o) in ordered.into_iter().enumerate() {
         // Whole, for the objects named. Matched on the start of the name so
         // `libc.so.6` catches `libc.so.6` and `libc` catches it too.
         let whole = exhaustive || exhaustive_for.iter().any(|w| o.name.starts_with(w.as_str()));
