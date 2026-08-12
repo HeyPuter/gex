@@ -651,6 +651,11 @@ export class ProcessHost {
               // is most of `blocks` is not a coverage problem in the static
               // recompiler -- it is the fill failing to reach the guest.
               (m.liftInClosure ? ` (${m.liftInClosure} on closure pages)` : '') +
+              // Why those misses translated rather than being filled. The
+              // comment above guesses between two causes; this measures.
+              (m.liftWhy && m.liftWhy.some((n) => n)
+                ? ` why[nofill=${m.liftWhy[0]} unowned=${m.liftWhy[1]} asked=${m.liftWhy[2]} fresh=${m.liftWhy[3]}]`
+                : '') +
               (m.waits && (m.waits.park || m.waits.turn || m.waits.nap)
                 ? `, waited park=${m.waits.park} turn=${m.waits.turn} nap=${m.waits.nap}`
                 : '') +

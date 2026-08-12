@@ -4222,6 +4222,22 @@ pub extern "C" fn gex_fill_possible(on: i32) {
 /// `gex_abi::FILL_SPAN` for why.
 static FILL_FROM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The address that missed, for the fill the host is about to run.
+///
+/// `FILL_FROM` is that address rounded down to a span, which is what the
+/// module needs but not what the *guest* needs: the question that matters is
+/// whether the one slot this pc dispatches through comes back written, and a
+/// span read-back cannot answer it. Every miss that reaches the translator is
+/// one whose span was already filled -- `why[asked=379]` in #136 -- so the
+/// fill is writing something the guest does not read, and this is how to see
+/// which slot.
+static FILL_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_fill_pc() -> u64 {
+    FILL_PC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Slots a fill is expected to write, as the host found them.
 ///
 /// `FILL_SPAN` normally, and a whole page when the modules in this run are
@@ -8829,6 +8845,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let fresh = FILL_ASKED.0.borrow_mut().insert(key);
         if fresh {
             FILL_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
+            FILL_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
             FILL_WANTED.store(page as i64, std::sync::atomic::Ordering::Relaxed);
             FILL_PENDING.store(page as i64, std::sync::atomic::Ordering::Relaxed);
             with_host(|h| {
@@ -8857,6 +8874,33 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 gex_abi::dispatch_page(pc)
             ));
         }
+    }
+    // Why this miss is about to translate, counted at the moment it does.
+    //
+    // Every count in #136 says *where* blocks came from and none says *why*,
+    // and three plausible causes -- a thin closure, a narrow fill span, the
+    // bulk recompiler -- were each eliminated by a full build-and-measure
+    // cycle that a counter here would have settled in one.
+    //
+    //   0  filling is not possible yet: no closure module has registered
+    //   1  the page has no closure owner, so nothing could have filled it
+    //   2  owned, and this span was already asked for -- the fill ran and
+    //      the guest missed here anyway, which is the interesting one
+    //   3  owned, span fresh, and it still arrived here
+    {
+        let why = if !FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+            0
+        } else if gex_closure_owner(gex_abi::dispatch_page(pc)) < 0 {
+            1
+        } else {
+            let width = FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
+            let page = gex_abi::dispatch_page(pc);
+            let from = ((pc & 0xfff) >> 2) as u32 & !(width - 1);
+            let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
+            let key = page * spans as u64 + (from / width) as u64;
+            if FILL_ASKED.0.borrow().contains(&key) { 2 } else { 3 }
+        };
+        LIFT_WHY[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if maybe_recompile_at(pc) {
         // The same resume the ordinary path uses: come back at the address
@@ -10638,6 +10682,22 @@ pub extern "C" fn gex_jit_by_object(out: u32, max: u32) -> u32 {
     let n = text.len().min(max as usize);
     shim_slice_mut(out, n as u32).copy_from_slice(&text.as_bytes()[..n]);
     n as u32
+}
+
+/// Why misses reached the translator. See the note at the increment.
+static LIFT_WHY: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[no_mangle]
+pub extern "C" fn gex_lift_why(i: u32) -> i64 {
+    LIFT_WHY
+        .get(i as usize)
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as i64)
+        .unwrap_or(-1)
 }
 
 #[no_mangle]

@@ -559,6 +559,12 @@ async function handle(msg) {
       // Of those, the ones on a page a closure library claims: work the
       // static recompiler already did and this process did again.
       liftInClosure: Number(gex.shim.exports.gex_lift_in_closure?.() ?? 0),
+      // And *why* each miss reached the translator, which no other counter
+      // says. See `gex_lift_why`: 0 filling not possible yet, 1 no closure
+      // owner, 2 owned and the span was already asked, 3 owned and fresh.
+      liftWhy: gex.shim.exports.gex_lift_why
+        ? [0, 1, 2, 3].map((i) => Number(gex.shim.exports.gex_lift_why(i)))
+        : undefined,
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
       // And what the *engine* cost, which the line above does not cover:
       // compiling and instantiating every module this process installed,

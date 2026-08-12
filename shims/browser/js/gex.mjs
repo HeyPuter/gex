@@ -637,6 +637,9 @@ export class Gex {
   static #whyNo = 0;
   /// And how many times it has said what the fill itself answered.
   static #whyDid = 0;
+  /// Report the exact slot a missing pc dispatches through. See `fillSlotNow`.
+  static watchSlot = true;
+  static #whySlot = 0;
 
   #bytes() {
     // Rebuilt when the memory has grown, not only when it has been detached.
@@ -3645,6 +3648,29 @@ export class Gex {
       // remaining question is which of the two halves fails: `at < 0`, no
       // base for the page in this process, or `did` false, the module holding
       // no block at that address. See #136.
+      // The one slot the guest will dispatch through, read back after the
+      // fill. A span read-back says the fill wrote *something*; this says
+      // whether it wrote the slot that missed, which is the only one that
+      // decides whether the guest comes back here. Every lift in #136 is a
+      // span that was already filled, so one of these two must disagree.
+      if (Gex.watchSlot && at >= 0) {
+        const mpc = Number(this.#shim.exports.gex_fill_pc?.() ?? 0n);
+        if (mpc && Gex.#whySlot < 12) {
+          Gex.#whySlot++;
+          const want = at + ((mpc & 0xfff) >>> 2);
+          const tn2 = this.#shim.exports.gex_page_table
+            ? this.#shim.exports.gex_page_table(BigInt(page >>> 0)) : -1;
+          const tabs2 = this.#dispatchTables();
+          let set = 'no table';
+          if (tn2 >= 0 && tn2 < tabs2.length) {
+            set = want < tabs2[tn2].length
+              ? (tabs2[tn2].get(want) !== tabs2[0].get(0) ? 'WRITTEN' : 'still stub')
+              : `past end (${tabs2[tn2].length})`;
+          }
+          console.error(`[closure] pc ${mpc.toString(16)} page ${page} slot ${want}`
+            + ` (base ${at} + ${(mpc & 0xfff) >>> 2}) t=${tn2}: ${set}`);
+        }
+      }
       if (Gex.watchPages.has(page) && Gex.#whyDid < 24) {
         Gex.#whyDid++;
         // `did` only says the module wrote *something* in the span. What
