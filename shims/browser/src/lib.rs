@@ -1368,6 +1368,9 @@ pub extern "C" fn gex_set_per_miss(n: u32) {
 static ARENA_SPENT: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Bytes held by `Jit::registry`, for the arena report. See #140.
+static REGISTRY_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn arena_note(who: usize, len: u64) {
     ARENA_SPENT[who].fetch_add(len, std::sync::atomic::Ordering::Relaxed);
     ARENA_SPENT[3].fetch_max(len, std::sync::atomic::Ordering::Relaxed);
@@ -1452,8 +1455,9 @@ fn arena_take(len: u64) -> Option<u64> {
             "[gex] the arena cannot grow: wanted {len} at {at:#x}, ceiling \
              {:#x}. Spent: {} MiB on guest mappings, {} MiB on this module's \
              heap, {} MiB on Worker stacks; largest single claim {}. Live in \
-             the heap right now: {} MiB (-1 KiB means the counters are off; \
-             build with GEX_HEAP_COUNTERS=1). An abort here is not a panic \
+             the heap right now: {} MiB, of which {} MiB is kept module \
+             bytes (-1 KiB means the counters are off; build with \
+             GEX_HEAP_COUNTERS=1). An abort here is not a panic \
              and prints nothing of its own.\n",
             gex_abi::MMAP_TOP,
             ARENA_SPENT[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
@@ -1461,6 +1465,7 @@ fn arena_take(len: u64) -> Option<u64> {
             ARENA_SPENT[2].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[3].load(std::sync::atomic::Ordering::Relaxed),
             gex_heap_used_kib() / 1024,
+            REGISTRY_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
         );
         // SAFETY: `warn` reads the bytes and keeps none of them.
         unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
@@ -10473,6 +10478,13 @@ pub extern "C" fn gex_jit_installed() {
         // much a threaded process may translate and the next thing to bound
         // -- by dropping a module once every live Worker has installed it.
         #[cfg(feature = "shared-memory")]
+        // Counted for the arena report, which cannot borrow the host: it
+        // runs inside the allocator's refill path. `registry` keeps every
+        // module's bytes for the life of the process so a joining Worker can
+        // instantiate them, and nothing trims it -- the first thing to rule
+        // in or out for the 1,861 MiB an `apt-get update` holds live. See
+        // #140.
+        REGISTRY_BYTES.fetch_add(done.wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
         h.jit.registry.push(done.wasm);
         publish_pending(h);
     });
