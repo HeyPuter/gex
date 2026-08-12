@@ -312,6 +312,25 @@ impl FileHandle for Socket {
         };
         match t.status() {
             Status::Refused => Err(Errno::ECONNREFUSED),
+            // Closed and drained is end of file, not "try again".
+            //
+            // A transport reports "nothing right now" as `EAGAIN` and cannot
+            // tell a connection that is empty from one that is over --
+            // `status` is what knows. Without this a peer that closes to mark
+            // the end of a body leaves the reader polling a descriptor that
+            // says ready, reading `EAGAIN`, and going round for ever. That is
+            // the failure the note on `available` below describes, on the
+            // half of the path that never got the fix, and it is what an
+            // `apt-get update` in the browser does thirty times without
+            // finishing one index.
+            //
+            // `send` has always answered `Status::Closed` with `EPIPE`. This
+            // is its counterpart.
+            Status::Closed => match t.recv(buf) {
+                Ok(n) => Ok(n as u64),
+                Err(Errno::EAGAIN) => Ok(0),
+                Err(e) => Err(e),
+            },
             _ => t.recv(buf).map(|n| n as u64),
         }
     }

@@ -1368,6 +1368,40 @@ pub extern "C" fn gex_set_per_miss(n: u32) {
 static ARENA_SPENT: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// The syscall number this thread is inside, or `u64::MAX` between calls.
+/// Distinct from `IN_SYSCALL`, which is a bool about re-entry.
+static SYSCALL_NR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Which syscall each counter in `HEAP_BY_CALL` is for; `u64::MAX - 1` is
+/// an unused slot.
+static HEAP_CALL_NR: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(u64::MAX - 1),
+    std::sync::atomic::AtomicU64::new(u64::MAX - 1),
+    std::sync::atomic::AtomicU64::new(u64::MAX - 1),
+    std::sync::atomic::AtomicU64::new(u64::MAX - 1),
+    std::sync::atomic::AtomicU64::new(u64::MAX - 1),
+    std::sync::atomic::AtomicU64::new(u64::MAX - 1),
+    std::sync::atomic::AtomicU64::new(u64::MAX - 1),
+    std::sync::atomic::AtomicU64::new(u64::MAX - 1),
+];
+
+/// Refills, counted by the syscall that was running, paired with
+/// `HEAP_CALL_NR`.
+static HEAP_BY_CALL: [std::sync::atomic::AtomicU64; 16] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+/// The syscall number of the last refill, exactly rather than folded.
+static HEAP_LAST_CALL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// Bytes in `Jit::pending`, and the longest that queue has ever been.
 static PENDING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PENDING_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1473,7 +1507,7 @@ fn arena_take(len: u64) -> Option<u64> {
              biggest allocation {} (-1 KiB means the counters are off; build \
              with GEX_HEAP_COUNTERS=1). {} MiB queued for the host in {} \
              modules at most. An abort here is not a panic and prints \
-             nothing of its own.\n",
+             nothing of its own. Last refill in syscall {}, most in syscall {}.\n",
             gex_abi::MMAP_TOP,
             ARENA_SPENT[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[1].load(std::sync::atomic::Ordering::Relaxed) >> 20,
@@ -1490,6 +1524,20 @@ fn arena_take(len: u64) -> Option<u64> {
             HEAP_BIGGEST.load(std::sync::atomic::Ordering::Relaxed),
             PENDING_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
             PENDING_MAX.load(std::sync::atomic::Ordering::Relaxed),
+            HEAP_LAST_CALL.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            {
+                let mut best = (u64::MAX, 0u64);
+                for i in 0..8 {
+                    let v = HEAP_BY_CALL[i].load(std::sync::atomic::Ordering::Relaxed);
+                    if v > best.1 {
+                        best = (
+                            HEAP_CALL_NR[i].load(std::sync::atomic::Ordering::Relaxed),
+                            v,
+                        );
+                    }
+                }
+                best.0 as i64
+            },
         );
         // SAFETY: `warn` reads the bytes and keeps none of them.
         unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
@@ -1553,6 +1601,36 @@ unsafe impl talc::source::Source for ShimRegion {
         // separates one buffer growing by doubling from many live objects.
         // See #140.
         HEAP_REFILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            // Exact syscall numbers, not folded.
+            //
+            // The first version kept `nr % 15`, and slot 3 is `read` (63),
+            // `readlinkat` (78) and `socket` (198) at once -- which read as
+            // "the read path" and sent a fix to the wrong function. Eight
+            // pairs, first come first served.
+            let n = SYSCALL_NR.load(std::sync::atomic::Ordering::Relaxed);
+            HEAP_LAST_CALL.store(n, std::sync::atomic::Ordering::Relaxed);
+            for i in 0..8 {
+                let who = HEAP_CALL_NR[i].load(std::sync::atomic::Ordering::Relaxed);
+                if who == n {
+                    HEAP_BY_CALL[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+                if who == u64::MAX - 1
+                    && HEAP_CALL_NR[i]
+                        .compare_exchange(
+                            u64::MAX - 1,
+                            n,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    HEAP_BY_CALL[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
         HEAP_BIGGEST.fetch_max(_layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
         let base = arena_take(len).ok_or(())? as *mut u8;
         // Extend the last span when this one abuts it, rather than claiming a
@@ -5053,6 +5131,17 @@ fn count_syscall() {
 /// the common path entirely.
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
+    // Which syscall is running, so the allocator can say who was asking.
+    //
+    // wasm has no backtrace, so a refill cannot name its caller the way a
+    // native profiler would. What it can do is read the work in progress.
+    // See `HEAP_BY_CALL` and #140.
+    {
+        let gm = GuestMem::new(guest_bytes());
+        let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
+        let n = gm.read_u64(base + ctx::x(8) as u64).unwrap_or(u64::MAX);
+        SYSCALL_NR.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
         let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
@@ -8303,10 +8392,16 @@ fn finish_parked(
         // the guest's pc moving forward: a syscall that parks is finished by
         // the scheduler, never retried.
         gex_kernel::BlockOp::ReadStream { handle, buf, len } => {
-            let mut tmp = vec![0u8; *len];
-            let n = handle.read_at(0, &mut tmp)?;
-            gm.write(*buf, &tmp[..n as usize])?;
-            Ok(n)
+            // Into the guest's buffer, with nothing in between.
+            //
+            // This is the read that parked, finished by the scheduler, and it
+            // allocated the length the guest asked for -- up to 16 MiB, which
+            // is exactly the arena's chunk, so each one made the allocator
+            // claim a fresh span. Counting refills against the syscall in
+            // flight put almost all of them in nr 63. `sys_read` had the same
+            // shape and was fixed with it. See task 140.
+            let dst = gm.read_mut(*buf, *len)?;
+            handle.read_at(0, dst)
         }
         gex_kernel::BlockOp::WriteStream { handle, buf, len } => {
             // One turn's worth; the scheduler brings the thread back while

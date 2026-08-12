@@ -123,6 +123,21 @@ impl<'a> GuestMem<'a> {
         Ok(&self.view()[r])
     }
 
+    /// A writable slice of the guest's memory, for a caller that fills it
+    /// itself.
+    ///
+    /// The counterpart of `read`. Without it a `read` syscall has to allocate
+    /// a buffer the size the guest asked for, fill that, and copy it in --
+    /// and the guest chooses the size. `sys_read` capped it at 16 MiB, which
+    /// is also the arena's chunk, so every large read made the allocator
+    /// claim another span: 117 of them, 1,872 MiB, in an `apt-get update`
+    /// that had not finished one index. See task 140, and the note on
+    /// `sys_write`, which is this same fix made on the writing side.
+    pub fn read_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], Errno> {
+        let r = self.range(addr, len)?;
+        Ok(&mut self.view_mut()[r])
+    }
+
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
         let r = self.range(addr, data.len())?;
         self.view_mut()[r].copy_from_slice(data);

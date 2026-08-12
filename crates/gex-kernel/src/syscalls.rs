@@ -2350,11 +2350,19 @@ impl Kernel {
     }
 
     fn sys_read(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
+        // Into the guest's memory, with no buffer in between.
+        //
+        // The guest picks the length and this allocated that much on every
+        // call. The cap is 16 MiB, which is exactly the arena's chunk, so a
+        // reader asking for a large block made the allocator claim a fresh
+        // span each time: 117 spans and 1,872 MiB in an `apt-get update` that
+        // had not finished one index. Attributed by counting refills against
+        // the syscall in flight -- almost all of them were nr 63. See task
+        // 140. `sys_write` has read straight out of guest memory since the
+        // copy there turned out to be most of a browser run.
         let len = len.min(1 << 24) as usize;
-        let mut tmp = vec![0u8; len];
-        let n = self.fds.get(fd)?.read(&mut tmp)?;
-        m.write(buf, &tmp[..n as usize])?;
-        Ok(n)
+        let dst = m.read_mut(buf, len)?;
+        self.fds.get(fd)?.read(dst)
     }
 
     fn sys_pread(
@@ -2365,11 +2373,10 @@ impl Kernel {
         len: u64,
         off: u64,
     ) -> SysResult {
+        // As `sys_read`: the guest's buffer is the destination already.
         let len = len.min(1 << 24) as usize;
-        let mut tmp = vec![0u8; len];
-        let n = self.fds.get(fd)?.pread(off, &mut tmp)?;
-        m.write(buf, &tmp[..n as usize])?;
-        Ok(n)
+        let dst = m.read_mut(buf, len)?;
+        self.fds.get(fd)?.pread(off, dst)
     }
 
     fn sys_pwrite(&mut self, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
