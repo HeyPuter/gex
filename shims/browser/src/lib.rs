@@ -1491,6 +1491,13 @@ fn arena_grow(len: u64) -> u64 {
 
 // SAFETY: `acquire` claims a region of this module's own linear memory and
 // touches no other allocator.
+/// Where this module's heap currently ends, so a new span can extend it.
+///
+/// `talc` keeps each claimed span separate; only `extend` joins new memory to
+/// one it already owns, and that needs the old end. Zero means nothing has
+/// been claimed yet.
+static HEAP_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 unsafe impl talc::source::Source for ShimRegion {
     fn acquire<B: talc::base::binning::Binning>(
         talc: &mut talc::base::Talc<Self, B>,
@@ -1508,9 +1515,37 @@ unsafe impl talc::source::Source for ShimRegion {
         let len = len.next_multiple_of(65536);
         arena_note(1, len);
         let base = arena_take(len).ok_or(())? as *mut u8;
-        // SAFETY: `arena_take` handed this span out to nobody else and grew
-        // the memory to cover it.
-        unsafe { talc.claim(base, len as usize).ok_or(())? };
+        // Extend the last span when this one abuts it, rather than claiming a
+        // second one beside it.
+        //
+        // `claim` gives talc a span it keeps separate from every other, so a
+        // request larger than any single span cannot be served from two of
+        // them however adjacent they are -- and `arena_take` hands out one
+        // cursor that only goes up, so they usually *are* adjacent. A buffer
+        // that grows by doubling therefore walked the arena upwards, taking a
+        // fresh chunk each time and stranding everything behind it.
+        //
+        // Measured on `apt-get update`: 1,882 MiB of a 2 GiB arena spent by
+        // this heap, in about 117 chunks, with the largest single request
+        // 33.9 MiB. The guest's own mappings were 8 MiB of it.
+        //
+        // Not assumed adjacent: the guest's mappings and the per-Worker
+        // stacks draw from the same cursor, so a claim can land above one of
+        // theirs. The pointers are compared rather than trusted.
+        let end = HEAP_END.load(std::sync::atomic::Ordering::Relaxed);
+        let new_end = unsafe {
+            if end != 0 && end == base as usize {
+                // SAFETY: the span starts exactly where the heap ended, the
+                // arena handed it to nobody else, and the memory behind it
+                // has been grown.
+                let old = std::ptr::NonNull::new_unchecked(end as *mut u8);
+                talc.extend(old, base.add(len as usize))
+            } else {
+                // SAFETY: as above, minus the abutment.
+                talc.claim(base, len as usize).ok_or(())?
+            }
+        };
+        HEAP_END.store(new_end.as_ptr() as usize, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }
