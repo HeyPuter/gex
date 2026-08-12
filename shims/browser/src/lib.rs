@@ -1398,6 +1398,13 @@ static HEAP_BY_CALL: [std::sync::atomic::AtomicU64; 16] = [
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
 ];
+/// The syscall that was running for the largest allocation, and which refill
+/// it was. See the note where they are set.
+static HEAP_BIGGEST_CALL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+static HEAP_BIGGEST_AT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The syscall number of the last refill, exactly rather than folded.
 static HEAP_LAST_CALL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
@@ -1507,7 +1514,7 @@ fn arena_take(len: u64) -> Option<u64> {
              biggest allocation {} (-1 KiB means the counters are off; build \
              with GEX_HEAP_COUNTERS=1). {} MiB queued for the host in {} \
              modules at most. An abort here is not a panic and prints \
-             nothing of its own. Last refill in syscall {}, most in syscall {}.\n",
+             nothing of its own. Last refill in syscall {}, most in syscall {}; biggest was refill {} in syscall {}.\n",
             gex_abi::MMAP_TOP,
             ARENA_SPENT[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[1].load(std::sync::atomic::Ordering::Relaxed) >> 20,
@@ -1538,6 +1545,8 @@ fn arena_take(len: u64) -> Option<u64> {
                 }
                 best.0 as i64
             },
+            HEAP_BIGGEST_AT.load(std::sync::atomic::Ordering::Relaxed),
+            HEAP_BIGGEST_CALL.load(std::sync::atomic::Ordering::Relaxed) as i64,
         );
         // SAFETY: `warn` reads the bytes and keeps none of them.
         unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
@@ -1631,7 +1640,30 @@ unsafe impl talc::source::Source for ShimRegion {
                 }
             }
         }
-        HEAP_BIGGEST.fetch_max(_layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        {
+            // And who asked for the biggest one.
+            //
+            // The count of refills per syscall says only which syscall is
+            // most common -- `SYSCALL_NR` is set on entry and never cleared,
+            // so it is the most *recent* call, not the one in flight. This
+            // does not have that problem: a new maximum is a single event,
+            // and whatever was last entered is the best name available for
+            // it. 23.25 MiB is bigger than either read buffer could be, so
+            // the caller is something else. See task 140.
+            let sz = _layout.size() as u64;
+            let prev =
+                HEAP_BIGGEST.fetch_max(sz, std::sync::atomic::Ordering::Relaxed);
+            if sz > prev {
+                HEAP_BIGGEST_CALL.store(
+                    SYSCALL_NR.load(std::sync::atomic::Ordering::Relaxed),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                HEAP_BIGGEST_AT.store(
+                    HEAP_REFILLS.load(std::sync::atomic::Ordering::Relaxed),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
         let base = arena_take(len).ok_or(())? as *mut u8;
         // Extend the last span when this one abuts it, rather than claiming a
         // second one beside it.
