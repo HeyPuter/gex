@@ -384,6 +384,17 @@ const REPORTER = `
   // backtick here ends the string and kills the harness at import -- which
   // the file warns about a hundred lines below and which I did anyway.
   if (location.search.includes('debugexit=1')) globalThis.GEX_DEBUG_EXIT = true;
+  // ?recompile=N sets the object recompiler's budget in KiB; 0 turns it off.
+  //
+  // The page has it on at 8192 and the Node harness has it off by default,
+  // and that difference was reachable from neither side at run time. It
+  // decides whether a process translates a whole object in bulk after a few
+  // misses, which is a different account of where a run's blocks come from
+  // than the dispatch miss path. See task 136.
+  {
+    const m = /[?&]recompile=([0-9]+)/.exec(location.search);
+    if (m) globalThis.GEX_RECOMPILE_OBJECTS = Number(m[1]);
+  }
   const post = (kind, body) =>
     fetch('/report?kind=' + kind, { method: 'POST', body }).catch(() => {});
   // The page's own reader gives the whole scrollback; the DOM query is the
