@@ -356,6 +356,17 @@ const TYPES = {
 
 // Injected into the page. It reports what the status line says and what the
 // terminal holds, so a failure names the stage rather than the exit code.
+/// The reporter, with whatever `GEX_TYPE` asked to be typed baked in.
+///
+/// A function rather than a constant because the lines have to be JSON --
+/// they contain quotes, `$`, and backslashes, and a shell command pasted into
+/// a template literal is a shell command that arrives changed.
+const reporter = () =>
+  REPORTER.replace(
+    '%TYPE%',
+    JSON.stringify((process.env.GEX_TYPE || '').split(';;').filter(Boolean)),
+  );
+
 const REPORTER = `
 <script>
 (() => {
@@ -368,6 +379,40 @@ const REPORTER = `
   addEventListener('gex:status', (e) => {
     post('status', e.detail.kind + '|' + e.detail.text + '|' + term());
   });
+  // Typing, for the shape a cmd= query cannot reach: an interactive shell.
+  //
+  // No backticks anywhere in here. This whole block lives inside a template
+  // literal, so one backtick in a comment ends the string and the harness
+  // dies at import with a syntax error pointing at prose -- which is exactly
+  // what it did, twice, while the runs it was meant to drive reported
+  // nothing at all.
+  //
+  // A cmd= query writes a script and runs it, which is a different program
+  // from a person at a prompt: an interactive shell turns on job control --
+  // setpgid, tcsetpgrp, a raw-mode line editor -- and a script turns on none
+  // of them. The fault this exists for appears on the *second* command typed
+  // at a prompt, and nothing here could type a first one.
+  //
+  // GEX_TYPE is lines separated by two semicolons, each sent once the
+  // terminal has been quiet for a moment. Quiet rather than a prompt
+  // pattern: prompts differ per shell and are often drawn with escapes.
+  const toType = %TYPE%;
+  if (toType.length) {
+    let last = '';
+    let still = 0;
+    const feed = setInterval(() => {
+      const now = term();
+      still = now === last ? still + 1 : 0;
+      last = now;
+      // Three quiet ticks: the guest has stopped producing and is waiting.
+      if (still < 3) return;
+      const line = toType.shift();
+      if (line === undefined) { clearInterval(feed); return; }
+      still = 0;
+      post('status', 'typing|' + line + '|');
+      window.gexType?.(line + '\r');
+    }, 700);
+  }
   // A ping the moment this runs, so "nothing arrived" can be told from
   // "the page never loaded". They are the same output otherwise.
   post('status', 'reporter|installed|');
@@ -442,7 +487,7 @@ const server = createServer(async (req, res) => {
         'Cross-Origin-Opener-Policy': 'same-origin',
         'Cross-Origin-Embedder-Policy': 'require-corp',
       });
-      res.end(html ? Buffer.from(body.toString() + REPORTER) : body);
+      res.end(html ? Buffer.from(body.toString() + reporter()) : body);
     } catch (e) {
       res.writeHead(502).end(String(e?.message ?? e));
     }
@@ -465,7 +510,7 @@ const server = createServer(async (req, res) => {
   try {
     if (!(await stat(path)).isFile()) throw new Error('not a file');
     let body = await readFile(path);
-    if (name === '/index.html') body = Buffer.from(body.toString() + REPORTER);
+    if (name === '/index.html') body = Buffer.from(body.toString() + reporter());
     // Cross-origin isolation, as the dev server and the deployed site send.
     // The page needs a `SharedArrayBuffer` for the global kernel's memory,
     // and without these headers the constructor is not there at all.

@@ -65,6 +65,19 @@ window.gexTerminalText = () => {
   return out.join('\n');
 };
 
+// Typing, for something other than a person.
+//
+// The sibling of `gexTerminalText`: that one reads the screen, this one puts
+// keystrokes in. `?cmd=` writes a script and runs it, which is a different
+// program from a person at a prompt -- `bash -i` turns on job control,
+// `tcsetpgrp` and a raw-mode line editor, and a script turns on none of them.
+// A fault that only shows on the *second* command typed at a prompt was
+// therefore beyond every test here.
+//
+// `term.input` is xterm's own entry point for input, so this goes through the
+// line discipline exactly as a keypress does rather than around it.
+window.gexType = (text) => term.input(text, true);
+
 const fit = new FitAddon();
 term.loadAddon(fit);
 term.loadAddon(new WebLinksAddon());
