@@ -1863,7 +1863,19 @@ fn set_host(host: Host) {
 pub extern "C" fn gex_has_host() -> i32 {
     #[cfg(not(feature = "shared-memory"))]
     {
-        HOST.with(|h| h.borrow().is_some()) as i32
+        // `try_borrow`, because this is asked *after* a crash and a wasm trap
+        // does not unwind: whatever trapped still holds the borrow. `borrow`
+        // panics there, and the panic replaces the crash report with
+        // "RefCell already mutably borrowed" -- which is what every trace of
+        // the nested-subshell wedge ended with, one line before the part
+        // that would have said where the guest was.
+        //
+        // A host that cannot be borrowed is a host that exists, so the
+        // honest answer to "is there one" is yes.
+        HOST.with(|h| match h.try_borrow() {
+            Ok(b) => b.is_some(),
+            Err(_) => true,
+        }) as i32
     }
     #[cfg(feature = "shared-memory")]
     {
@@ -4157,6 +4169,16 @@ pub extern "C" fn gex_paused_for_host() -> i32 {
 #[no_mangle]
 /// The wake counter as it read when this Worker last looked at its threads.
 static WAKE_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Whether a pending signal makes a parked thread runnable. See
+/// `thread_ready`.
+///
+/// A constant beside `SAFEPOINT_SIGNALS` and for the same reason: it is on
+/// the path everything blocking goes through, so "did this cause it" is a
+/// question worth being able to answer in one build rather than one argument.
+/// Measured, not assumed: nested command substitution wedges 3 runs of 3
+/// with this off, exactly as it does with it on. The wedge is not this.
+const SIGNAL_ENDS_WAIT: bool = true;
 
 /// Whether a safepoint delivers signals. See `gex_safepoint`.
 ///
@@ -7190,12 +7212,21 @@ enum Pick {
 /// it consults -- handles, sockets, futexes, the clock -- is reference-counted
 /// and lives outside guest memory, so the answer does not depend on whose
 /// image is currently in it.
-/// Whether anything is pending for this process, from either side.
+/// Whether a pending signal would actually *do* something to this process.
 ///
-/// `procs` is the shared table another process writes into; `signals` is what
-/// this process raised for itself -- a timer, a fault, `raise`.
-fn any_signal(h: &Host) -> bool {
-    h.kernel.procs.has_signals(h.kernel.pid) || h.kernel.signals.has_pending()
+/// Two steps, and the second is the one that matters. First the inbox other
+/// processes write into is drained into this process's own pending set --
+/// idempotent, and it puts the bits where the dispatcher reads them anyway.
+/// Then the question is asked of the *disposition*, not of the bit.
+///
+/// "Is a bit set" is the wrong question for ending a wait. An ignored signal
+/// interrupts nothing on Linux, and `SIGCHLD` is ignored by default and
+/// arrives every time a child exits -- so a shell waiting on a pipe would be
+/// woken by its own children, told `EINTR`, and sent round again for nothing.
+/// Nested command substitution is that shape three deep.
+fn any_signal(h: &mut Host) -> bool {
+    h.kernel.collect_signals();
+    h.kernel.signals.would_deliver()
 }
 
 fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
@@ -7213,7 +7244,7 @@ fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
     // Becoming runnable is all that is needed. The picked thread finishes its
     // parked call, and the code that follows already asks `deliver_pending`,
     // which either builds the handler's frame or ends the process.
-    if signalled && !matches!(t.waiting, Waiting::Exited | Waiting::Elsewhere) {
+    if SIGNAL_ENDS_WAIT && signalled && !matches!(t.waiting, Waiting::Exited | Waiting::Elsewhere) {
         return true;
     }
     match &t.waiting {

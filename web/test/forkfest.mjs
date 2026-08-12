@@ -84,8 +84,18 @@ const CASES = [
   { name: 'exit-status', cmd: 'false; echo st$?', want: /st1/ },
   { name: 'pipeline-2', cmd: 'ls /bin | wc -l | tr -d " " | sed "s/^/n=/"', want: /n=[1-9]/ },
   {
+    // Six processes and a payload large enough that the head of the pipeline
+    // has to block on a full pipe -- `sort` reads to the end before it writes
+    // anything, so everything upstream of it stops.
+    //
+    // The input is `ls /bin`, not `/etc/services`. The file is a Debian one
+    // and BusyBox's rootfs has no such thing, so `grep` counted nothing, the
+    // marker demanded a non-zero count, and the case reported a failure that
+    // was entirely mine. It cost a bisect of the pipe code to find that out.
+    // What a battery meant to run against several rootfs may depend on is
+    // what all of them have.
     name: 'pipeline-5',
-    cmd: 'cat /etc/services | grep -v "^#" | sort | uniq | wc -l | sed "s/^/five=/"',
+    cmd: 'ls /bin | grep -v "^Z" | sort | uniq | wc -l | sed "s/^/five=/"',
     want: /five=[1-9]/,
   },
   {
@@ -204,8 +214,21 @@ const cases = only.length ? CASES.filter((c) => only.includes(c.name)) : CASES;
 // and the *same* regular expressions applied. They carry no answer in
 // themselves: `FF>name` says a command started, not that it worked.
 if (process.argv.includes('--emit')) {
-  const parts = cases.map((c) => `echo FF-${c.name}-BEGIN; { ${c.cmd} ; } 2>&1; echo FF-${c.name}-END`);
-  process.stdout.write(`${parts.join('; ')}; echo GEX-CMD-DONE\n`);
+  const parts = cases.map(
+    (c) => `echo FF-${c.name}-BEGIN; { ${c.cmd} ; } 2>&1; echo FF-${c.name}-END`,
+  );
+  const line = `${parts.join('; ')}; echo GEX-CMD-DONE`;
+  // Percent-encoded, because this goes into a *query string* and half the
+  // battery is made of characters a query string owns. `2>&1` ends the
+  // parameter at the ampersand, so the page received a command that stopped
+  // mid-redirect and bash answered
+  //
+  //     /cmd.sh: line 1: `echo FF-exec-BEGIN; { true; echo ex$? ; } 2>'
+  //
+  // which reads like a fault in the runtime and is a fault in the plumbing.
+  // `&` is also the backgrounding operator and `#` starts a fragment, so
+  // there is no subset of shell worth restricting the battery to.
+  process.stdout.write(`${process.argv.includes('--raw') ? line : encodeURIComponent(line)}\n`);
   process.exit(0);
 }
 

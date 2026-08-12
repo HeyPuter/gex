@@ -273,6 +273,35 @@ impl Signals {
         self.pending & !self.blocked != 0
     }
 
+    /// Whether a pending signal would actually *do* something.
+    ///
+    /// `has_pending` answers "is a bit set that is not blocked", which is the
+    /// right question for whether to run the dispatcher and the wrong one for
+    /// whether to end a wait. An ignored signal ends no syscall on Linux, and
+    /// `SIGCHLD` is ignored by default and arrives every time a child exits
+    /// -- so a shell waiting on a pipe would be interrupted by its own
+    /// children, over and over, for nothing.
+    ///
+    /// "Something" means a handler, or a default disposition that is not
+    /// `Ignore`. Both of those change what the process does next; nothing
+    /// else does.
+    pub fn would_deliver(&self) -> bool {
+        let mut ready = self.pending & !self.blocked;
+        while ready != 0 {
+            let signal = ready.trailing_zeros() + 1;
+            ready &= ready - 1;
+            let action = self.action(signal);
+            if action.handler == SIG_IGN {
+                continue;
+            }
+            if action.handler == SIG_DFL && default_action(signal) == DefaultAction::Ignore {
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
     /// The lowest-numbered deliverable signal, if any.
     fn next_deliverable(&self) -> Option<u32> {
         let ready = self.pending & !self.blocked;
