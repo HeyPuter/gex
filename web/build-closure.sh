@@ -9,6 +9,19 @@
 #
 #   web/build-closure.sh debian /tmp/gex-debroot /usr/bin/apt-get
 #
+# What the demo site is actually built with, which was written down nowhere
+# and cost a day of bisecting a closure nobody could reproduce:
+#
+#   web/build-closure.sh debian /tmp/gex-debian/root \
+#       /bin/bash /usr/bin/apt-get /usr/bin/dpkg /usr/bin/apt-config \
+#       /usr/bin/gpgv /bin/true /bin/ls /usr/lib/apt/methods
+#
+# `bash` first because it is pid 1. A closure and the shim that loads it are
+# one artifact in two files: the shim reads a `metas` list the older script
+# did not write, and an old closure under a new shim starts pid 1 and traps
+# in `ld.so`. If you check out an older commit to test it, rebuild this too,
+# and if you check back out, rebuild it again.
+#
 # writes `web/public/closure/<name>/` with one module per object, plus the
 # manifest `web/src/closure.js` reads.
 #
@@ -103,7 +116,13 @@ target/release/gexc build --closure --sysroot "$sysroot" --no-shared-memory \
     $mode --shared-image $withs "$sysroot$program" -o "$work/c.wasm"
 
 mkdir -p "$out"
-rm -f "$out"/*.wasm "$out"/closure.json
+# The metadata too. Clearing the modules and the manifest but leaving the
+# `.meta` files behind leaves a directory that looks rebuilt and is not: the
+# names are derived from the object index, so `c.19.*.meta` from an older
+# build with a different object order survives under a name the new manifest
+# also uses, and the page registers one object's pages against another's
+# slots. Every stray file here has cost a day at least once.
+rm -f "$out"/*.wasm "$out"/*.meta "$out"/closure.json
 cp "$work"/*.wasm "$out/"
 
 # The manifest, as `loadClosure` wants it: the image module's name, the

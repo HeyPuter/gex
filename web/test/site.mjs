@@ -420,7 +420,14 @@ const REPORTER = `
       if (line === undefined) { clearInterval(feed); return; }
       still = 0;
       post('status', 'typing|' + line + '|');
-      window.gexType?.(line + '\r');
+      // Doubled, because this line is inside a template literal. Written
+      // once, the backslash-r is consumed *here* and a raw carriage return
+      // goes into the page inside a single-quoted string -- which no JS
+      // string may contain, so the whole reporter died at parse with
+      // "Invalid or unexpected token" and every run since reported
+      // "last status: (none)". The typing feeder has therefore never run,
+      // and neither has the status channel it shares a script with.
+      window.gexType?.(line + '\\r');
     }, 700);
   }
   // A ping the moment this runs, so "nothing arrived" can be told from
