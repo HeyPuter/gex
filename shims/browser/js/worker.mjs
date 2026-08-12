@@ -408,6 +408,7 @@ async function handle(msg) {
     if (msg.kind === 'thread') {
       ({ entry, ctx } = await gex.adoptThread(msg.shim, msg.guest, msg));
     } else if (msg.kind === 'adopt') {
+    console.debug(`[worker] pid ${msg.child?.pid}: adopt arrived`);
       // With the closure, the same as a fresh process gets it.
       //
       // A child already receives its parent's modules through the fork

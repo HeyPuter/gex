@@ -256,6 +256,12 @@ export class ProcessHost {
       w.addEventListener?.('error', fail);
       w.on?.('error', fail);
       this.#pending.set(pid, { ...msg, pid });
+      // One line per process, to `debug` so a page hides it and a terminal
+      // shows it. A process that never starts leaves no other trace at all:
+      // the fork is logged by the *parent*, the exit by the child, and a
+      // child that does neither is invisible. That is the whole of what a
+      // nested subshell looks like from here -- #137.
+      console.debug(`[host] pid ${pid}: worker taken, ${msg.kind} held for ready`);
       // And now whatever it said while it was still in the pool.
       const held = w[EARLY];
       if (held) {
@@ -436,6 +442,7 @@ export class ProcessHost {
         }
         const msg = this.#pending.get(pid);
         this.#pending.delete(pid);
+        console.debug(`[host] pid ${pid}: ready, ${msg ? `sending ${msg.kind}` : 'NOTHING HELD'}`);
         if (msg) {
           // Awaited, because compiling the shim cannot be synchronous in a
           // browser. The Worker is idle until this arrives either way.

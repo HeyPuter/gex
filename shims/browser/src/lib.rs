@@ -7309,6 +7309,59 @@ fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
 /// Written out rather than derived: `Waiting` carries file handles and futex
 /// parks, and none of those are worth printing -- what matters when a run
 /// stops is the shape of the wait, not its contents.
+/// What every thread of this process is waiting for, on demand.
+///
+/// The two censuses that existed both fire on a counter -- 1024 idle spins,
+/// 4096 wakes -- and a deadlock reaches neither. Nothing spins, because every
+/// thread is parked on something it believes will arrive; nothing wakes,
+/// because nothing does. So the one state that most needs describing was the
+/// one state no instrument could see, and a wedged run printed *nothing at
+/// all*: no output, no exit, no idle report.
+///
+/// Written into the caller's memory as ASCII, returning the length. The host
+/// asks when a run has gone quiet.
+#[no_mangle]
+pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
+    // Why the run loop cannot proceed, alongside what the threads want.
+    //
+    // A thread that says `runnable` and a loop that parks anyway is a
+    // contradiction, and the two numbers that resolve it are the pause mask
+    // -- which decides *which* way the loop waits -- and the resume address,
+    // which is what it would need to carry on. Neither is reachable from the
+    // thread table, and without them "t0=runnable" is a fact with no
+    // explanation attached.
+    let why = paused();
+    let resume = resume().unwrap_or(0);
+    let text = with_host_free(|h| {
+        let mut s = format!("pid {} paused={why:#x} resume={resume:#x}:", h.kernel.pid);
+        for (i, t) in h.threads.iter().enumerate() {
+            s.push_str(&format!(" t{i}={}@{:#x}", waiting_name(&t.waiting), t.pc));
+            // A name says a thread is in `read`; it does not say what it is
+            // reading, which is the whole question when two processes are
+            // waiting for each other.
+            match &t.waiting {
+                Waiting::Read(h) | Waiting::Write(h) | Waiting::Accept(h) => {
+                    let d = h.debug_state();
+                    if !d.is_empty() {
+                        s.push_str(&format!("({d})"));
+                    }
+                }
+                _ => {}
+            }
+            if let Some(gex_kernel::BlockOp::WaitChild { want, .. }) = &t.blocked_on {
+                s.push_str(&format!("(want {want})"));
+            }
+        }
+        s
+    })
+    .unwrap_or_else(|| "pid ?: the kernel is held".to_string());
+    let b = text.as_bytes();
+    let n = (b.len() as u32).min(max);
+    let mut gm = GuestMem::new(guest_bytes());
+    let _ = gm.write(out as u64, &b[..n as usize]);
+    n
+}
+
 fn waiting_name(w: &Waiting) -> &'static str {
     match w {
         Waiting::Runnable => "runnable",

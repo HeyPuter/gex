@@ -441,6 +441,7 @@ export class Gex {
   // memory, so its Rust data structures are one set of bytes for all of them.
   // Null is a run of one process, which needs none of that.
   #kernelSpec = null;
+  #census = null;
   #kernel = null;
   // This Worker's shim stack, claimed on the way in. See `#workerStack`.
   #stackTop = null;
@@ -1552,6 +1553,42 @@ export class Gex {
     return { area: k.k_stack_area() >>> 0, size: k.k_stack_size() >>> 0, count: k.k_stack_count() >>> 0 };
   }
 
+  /// Armed once: every few seconds, say what this process is waiting for.
+  ///
+  /// A deadlock reaches neither census the shim already had -- one fires
+  /// after 1024 idle spins and nothing spins, the other after 4096 wakes and
+  /// nothing wakes. So the single state that most needs describing was the
+  /// only one no instrument could see: a wedged run printed nothing at all,
+  /// no output, no exit, no report, and the first move was always a guess.
+  ///
+  /// Around the whole run loop rather than inside the branch that waits on
+  /// the page. A process parked on a pipe another *process* fills takes a
+  /// different route out of the loop entirely -- which is exactly the half of
+  /// a deadlock that was missing, because the waiter that reported was pid 1
+  /// and the ones holding it never spoke.
+  #armCensus() {
+    if (this.#census) return;
+    const e = this.#shim?.exports;
+    if (!e?.gex_wait_census) return;
+    let last = '';
+    this.#census = setInterval(() => {
+      const p = e.gex_alloc(512) >>> 0;
+      const n = e.gex_wait_census(p, 512) >>> 0;
+      if (n) {
+        const text = new TextDecoder().decode(this.#bytes().slice(p, p + n));
+        // Only when it has stopped changing. A busy process passes through
+        // a dozen waits a second and none of them is interesting; a wedged
+        // one says the same thing for ever, which is the whole signal.
+        if (text === last) console.debug(`[gex] quiet: ${text}`);
+        last = text;
+      }
+      e.gex_free?.(p, 512);
+    }, 3000);
+    // Node keeps a process alive for a pending timer; this must not be the
+    // reason a Worker outlives its guest.
+    this.#census.unref?.();
+  }
+
   /** The global kernel's exports, or null. */
   get kernel() { return this.#kernel; }
 
@@ -2526,6 +2563,7 @@ export class Gex {
         // which is what a thread of a threaded program did within a second
         // of starting. `#catchUp` compares this Worker's count against the
         // process's and is a comparison when there is nothing to do.
+        this.#armCensus();
         await this.#catchUp();
         // A `fork` leaves a child here for the host to start. Drained before
         // the parent runs on, so the two are only ever one process apart --
