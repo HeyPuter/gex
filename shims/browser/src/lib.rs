@@ -1410,13 +1410,38 @@ fn arena_take(len: u64) -> Option<u64> {
         //
         // which names the guest's pc and says nothing about the arena being
         // the thing that ran out. This is the only place that knows.
-        warn_line(&format!(
-            "[gex] the arena cannot grow: wanted {len} bytes at {at:#x}, \
-             end {end:#x}, MMAP_TOP {:#x}, memory {} bytes -- the next \
-             allocation in the shim will abort\n",
+        // Without allocating, which is the whole difficulty.
+        //
+        // This *is* the allocator's refill path: `ShimRegion::acquire` calls
+        // it, and `format!` asks the allocator for a string. Written the
+        // obvious way, a failure formatted a message, which allocated, which
+        // refilled, which failed, which formatted -- and `apt-get update`
+        // went from aborting with no reason to hanging with no reason, which
+        // is worse. A fixed buffer on the stack and `core::fmt` into it
+        // touches no allocator at all.
+        use core::fmt::Write as _;
+        struct Buf([u8; 224], usize);
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let room = self.0.len() - self.1;
+                let n = s.len().min(room);
+                self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+                self.1 += n;
+                Ok(())
+            }
+        }
+        let mut b = Buf([0; 224], 0);
+        let _ = write!(
+            b,
+            "[gex] the arena cannot grow: wanted {len} bytes at {at:#x}, end \
+             {end:#x}, ceiling {:#x}, memory {} bytes. The next allocation in \
+             the shim aborts, and an abort here is not a panic -- it prints \
+             nothing of its own.\n",
             gex_abi::MMAP_TOP,
             warch::memory_size(0) as u64 * 65536,
-        ));
+        );
+        // SAFETY: `warn` reads the bytes and keeps none of them.
+        unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
         return None;
     }
     ARENA_NEXT.store(end, std::sync::atomic::Ordering::Relaxed);
