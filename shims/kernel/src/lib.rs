@@ -260,6 +260,20 @@ pub extern "C" fn k_slot_put(page: u64, key: u64, base: u32) {
         .or_insert(base);
 }
 
+/// How many pages the slot map holds.
+///
+/// One number, to settle whether this map is shared at all. Every Worker
+/// instantiates its own copy of this module, and the map is a Rust `static`
+/// with a heap `BTreeMap` behind it -- so it is shared only if the data
+/// segment that holds the `OnceLock` is applied once across instances rather
+/// than once per instance. Two processes that each store eight pages should
+/// both then see sixteen; if they each see eight, every Worker has its own
+/// map and no process has ever reused another's work.
+#[no_mangle]
+pub extern "C" fn k_slot_len() -> u32 {
+    slots().lock().unwrap_or_else(|e| e.into_inner()).len() as u32
+}
+
 /// Standard input, in the memory every Worker shares.
 ///
 /// It used to be a queue in each guest Worker's own shim, filled by a message

@@ -289,6 +289,7 @@ extern "C" {
     /// the second process to run `ls` finds what the first one did.
     fn k_slot_get(page: u64, key: u64) -> u32;
     fn k_slot_put(page: u64, key: u64, base: u32);
+    fn k_slot_len() -> u32;
     /// Standard input, shared. Whoever has a keystroke writes it here and
     /// wakes a parked reader, rather than posting a message to a Worker that
     /// is asleep inside wasm and cannot receive one.
@@ -3610,7 +3611,28 @@ fn image_is_ours(h: &Host, idx: usize) -> bool {
     let Some(want) = progs.get(idx).filter(|p| !p.is_empty()) else {
         return false;
     };
-    match current_image_program(h) {
+    let have = current_image_program(h);
+    // Once per process, what the two sides actually think.
+    //
+    // Closure roots translate their own images -- `http` lifted 2,067 blocks
+    // of an image the closure contains -- and the question is whether this
+    // comparison ever has two names to compare. `Vma::code` is derived from
+    // `origin` in `insert_from`, and its own documentation says the two must
+    // stay separate because an image segment has no `origin`; if that is what
+    // happens here, `have` is `None` and the match below is not a match at
+    // all, it is the permissive branch.
+    {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn_line(&format!(
+                "[gex] image match: this process is running {:?}, the closure \
+                 offers {:?} for library {idx}\n",
+                have.as_deref().unwrap_or("<no code identity on the PIE_BASE mapping>"),
+                want,
+            ));
+        }
+    }
+    match have {
         Some(have) => have == *want,
         // An identity this side does not know is not evidence of anything;
         // see the note on `image_pages_are_ours`.
@@ -6553,6 +6575,28 @@ fn record_shared_slot(h: &mut Host, page: u64, key: u64, base: u32) {
     // SAFETY: as above.
     if unsafe { k_present() } != 0 {
         unsafe { k_slot_put(page, key, base) };
+        // Every store, with what was stored and how big the map became.
+        //
+        // One-shot was not enough: it printed once in a three-process run and
+        // reported a map of one page while the metrics claimed `stored=8`, so
+        // three explanations remained open -- a private map per Worker, a key
+        // that differs between store and lookup, or almost nothing reaching
+        // the global map at all. Naming pid, page and key separates them:
+        // whether the length accumulates across processes answers the first,
+        // and whether a later process looks up a pair an earlier one wrote
+        // answers the second.
+        //
+        // Capped, because a run that stores thousands would drown the log and
+        // the question is answered by the first dozen.
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let nth = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if nth < 12 {
+            let n = unsafe { k_slot_len() };
+            warn_line(&format!(
+                "[gex] slot store pid={} page={page:#x} key={key:#x} base={base} -> map {n}\n",
+                h.kernel.pid,
+            ));
+        }
     }
 }
 
@@ -9020,13 +9064,39 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // lifting the same code again. The slot count travels with it: it is
         // a fact about the process that produced the module, and the one
         // installing it has a different high-water mark.
-        let mod_id = share_module(&unit.wasm, unit.table_slots, &unit.dir_entries);
+        // Published by what this unit *covers*, not by what it happened to
+        // allocate. See the note on `TranslatedModule::covered`: handed the
+        // allocation list, nine of ten units published nothing at all.
+        let mod_id = share_module(&unit.wasm, unit.table_slots, &unit.covered);
         if mod_id == 0 {
             h.jit.store_full += 1;
         } else {
             h.jit.store_ok += 1;
         }
-        for (page, base) in &unit.dir_entries {
+        // How many of this unit's pages could be named, against how many
+        // there are.
+        //
+        // `noident` counts only the *miss* path, so a page that has an
+        // identity when it faults and none when its translation is stored is
+        // invisible -- and the whole store happens here. One run of two `ls`
+        // processes made a single global store between them while the metrics
+        // claimed eight per process, so the entries are being dropped
+        // somewhere and this is the only place they can go.
+        {
+            let total = unit.covered.len();
+            let named = unit
+                .covered
+                .iter()
+                .filter(|(pg, _)| page_identity(h, *pg * gex_abi::DISPATCH_PAGE).is_some())
+                .count();
+            static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                warn_line(&format!(
+                    "[gex] storing a unit: {named} of {total} pages can be named\n"
+                ));
+            }
+        }
+        for (page, base) in &unit.covered {
             if let Some(key) = page_identity(h, *page * gex_abi::DISPATCH_PAGE) {
                 record_shared_slot(h, *page, key, *base);
                 if mod_id != 0 {
@@ -9423,7 +9493,11 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
         // for what it translates; without the same here, the second process
         // to load libc pays for all 62,085 blocks of it a second time.
         for m in &modules {
-            for (page, base) in &m.dir_entries {
+            // Covered, not allocated -- the same distinction as the miss path
+            // above. This loop's own comment says the cost of getting it
+            // wrong: "the second process to load libc pays for all 62,085
+            // blocks of it a second time". It was getting it wrong.
+            for (page, base) in &m.covered {
                 if let Some(key) = page_identity(h, *page * gex_abi::DISPATCH_PAGE) {
                     // And in the global kernel, not only this process's
                     // mirror, or the next process cannot find it either.

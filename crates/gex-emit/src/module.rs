@@ -42,6 +42,23 @@ pub struct TranslatedModule {
     /// Pages this module was the first to claim, as `(page, base slot)`. The
     /// host publishes them into the guest's dispatch directory.
     pub dir_entries: Vec<(u64, u32)>,
+    /// Every page this module's blocks land on, claimed here or already
+    /// known, as `(page, base slot)`.
+    ///
+    /// Not the same question as `dir_entries` and it cost the whole sharing
+    /// mechanism to answer both with one field. `dir_entries` is "pages this
+    /// module *allocated* slots for", which is what its data segment must
+    /// write and no more -- the gaps belong to other modules and a zero
+    /// there erases them. Publishing a translation to other processes needs
+    /// "pages this module *covers*", because a page whose slots some earlier
+    /// translation already numbered is exactly the page a second process
+    /// wants to be told about.
+    ///
+    /// Handed the allocation list, sharing published almost nothing: nine of
+    /// ten units stored in a two-`ls` run had no entries at all, the global
+    /// slot map ended a whole run with one page in it, and every process
+    /// lifted everything again. See #93.
+    pub covered: Vec<(u64, u32)>,
     /// The updated page assignment, to carry into the next translation.
     pub page_table: PageTable,
     /// Number of guest basic blocks translated.
@@ -531,6 +548,8 @@ pub struct ModuleBuilder {
     page_table: PageTable,
     /// Pages this module allocated, which the host must publish.
     new_pages: Vec<(u64, u32)>,
+    /// Every page a block landed on, whether or not this module claimed it.
+    covered: Vec<(u64, u32)>,
     block_ty: u32,
     miss_stub: u32,
     /// Guest block address -> wasm function index.
@@ -690,6 +709,7 @@ impl ModuleBuilder {
             text_base,
             page_table,
             new_pages: Vec::new(),
+            covered: Vec::new(),
             block_ty,
             miss_stub,
             blocks: HashMap::new(),
@@ -739,6 +759,11 @@ impl ModuleBuilder {
         let base = self.page_table.base(page);
         if fresh {
             self.new_pages.push((page, base));
+        }
+        // Always, whether or not this module claimed the slots. See the note
+        // on `TranslatedModule::covered`.
+        if self.covered.last().map(|&(p, _)| p) != Some(page) {
+            self.covered.push((page, base));
         }
         base
     }
@@ -808,6 +833,9 @@ impl ModuleBuilder {
         let mut exported_blocks = Vec::new();
         let table_slots = self.page_table.slots();
         let dir_entries = std::mem::take(&mut self.new_pages);
+        let mut covered = std::mem::take(&mut self.covered);
+        covered.sort_unstable();
+        covered.dedup();
 
         if self.linkage == Linkage::Own {
             // Publish the page directory as data, so a module is usable
@@ -1021,6 +1049,7 @@ impl ModuleBuilder {
             text_base: self.text_base,
             table_slots,
             dir_entries,
+            covered,
             page_table: self.page_table.clone(),
             n_blocks,
             exported_blocks,
