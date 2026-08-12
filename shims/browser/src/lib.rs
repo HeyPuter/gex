@@ -1357,6 +1357,21 @@ pub extern "C" fn gex_set_per_miss(n: u32) {
     }
 }
 
+/// What the arena has been spent on, by whoever asked.
+///
+/// Three consumers share one cursor and only one of them goes through the
+/// memory map, which is how a fix aimed at the map turned out to be inert on
+/// the path that actually fails. These say which is which before anything is
+/// changed again: `[0]` the guest's mappings, `[1]` this module's heap, `[2]`
+/// the per-Worker stacks. `[3]` is the largest single claim.
+static ARENA_SPENT: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn arena_note(who: usize, len: u64) {
+    ARENA_SPENT[who].fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+    ARENA_SPENT[3].fetch_max(len, std::sync::atomic::Ordering::Relaxed);
+}
+
 static ARENA_NEXT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1420,7 +1435,7 @@ fn arena_take(len: u64) -> Option<u64> {
         // is worse. A fixed buffer on the stack and `core::fmt` into it
         // touches no allocator at all.
         use core::fmt::Write as _;
-        struct Buf([u8; 224], usize);
+        struct Buf([u8; 320], usize);
         impl core::fmt::Write for Buf {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
                 let room = self.0.len() - self.1;
@@ -1430,15 +1445,18 @@ fn arena_take(len: u64) -> Option<u64> {
                 Ok(())
             }
         }
-        let mut b = Buf([0; 224], 0);
+        let mut b = Buf([0; 320], 0);
         let _ = write!(
             b,
-            "[gex] the arena cannot grow: wanted {len} bytes at {at:#x}, end \
-             {end:#x}, ceiling {:#x}, memory {} bytes. The next allocation in \
-             the shim aborts, and an abort here is not a panic -- it prints \
-             nothing of its own.\n",
+            "[gex] the arena cannot grow: wanted {len} at {at:#x}, ceiling \
+             {:#x}. Spent: {} MiB on guest mappings, {} MiB on this module's \
+             heap, {} MiB on Worker stacks; largest single claim {}. An abort \
+             here is not a panic and prints nothing of its own.\n",
             gex_abi::MMAP_TOP,
-            warch::memory_size(0) as u64 * 65536,
+            ARENA_SPENT[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
+            ARENA_SPENT[1].load(std::sync::atomic::Ordering::Relaxed) >> 20,
+            ARENA_SPENT[2].load(std::sync::atomic::Ordering::Relaxed) >> 20,
+            ARENA_SPENT[3].load(std::sync::atomic::Ordering::Relaxed),
         );
         // SAFETY: `warn` reads the bytes and keeps none of them.
         unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
@@ -1467,6 +1485,7 @@ fn arena_back(end: u64) -> bool {
 /// The same cursor this module's heap takes from, so the two can never hand
 /// out the same bytes. Zero means the memory would not grow.
 fn arena_grow(len: u64) -> u64 {
+    arena_note(0, len);
     arena_take(len).unwrap_or(0)
 }
 
@@ -1487,6 +1506,7 @@ unsafe impl talc::source::Source for ShimRegion {
         const CHUNK: u64 = 16 * 1024 * 1024;
         let len = (_layout.size() as u64 + _layout.align() as u64).max(CHUNK);
         let len = len.next_multiple_of(65536);
+        arena_note(1, len);
         let base = arena_take(len).ok_or(())? as *mut u8;
         // SAFETY: `arena_take` handed this span out to nobody else and grew
         // the memory to cover it.
@@ -2333,6 +2353,7 @@ pub extern "C" fn gex_worker_init() -> u32 {
     // This Worker's own span of arena. The cursor is atomic and the bytes
     // above it belong to nobody, so two Workers arriving together get two
     // spans without a lock between them.
+    arena_note(2, (slots::STACK + slots::TLS) as u64);
     let Some(base) = arena_take((slots::STACK + slots::TLS) as u64) else {
         return 0;
     };
