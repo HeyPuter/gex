@@ -639,6 +639,8 @@ export class Gex {
   static #whyDid = 0;
   /// Report the exact slot a missing pc dispatches through. See `fillSlotNow`.
   static watchSlot = true;
+  /// What each ask saw, keyed `page:from`. See `fillSlotNow` and `liftSlots`.
+  static askState = new Map();
   static #whySlot = 0;
 
   #bytes() {
@@ -3617,9 +3619,15 @@ export class Gex {
           if (typeof fill === 'function') {
             const mine = ((pc & 0xfff) >>> 2) & ~31;
             const said = fill(page, base, mine);
+            const then = Gex.askState.get(`${page}:${mine}`);
+            const now = `at=${base} len=${tabs[tn].length}`;
+            const was = then
+              ? `at=${then.at} len=${then.len} pub=${then.published ? 1 : 0}`
+                + `${then.inst === inst ? '' : ' DIFFERENT-INSTANCE'}`
+              : 'never asked for this span';
             what = tabs[tn].get(slot) !== stub
-              ? `stub->written(from=${mine} said=${said ? 1 : 0})`
-              : `stub->stub(from=${mine} said=${said ? 1 : 0})`;
+              ? `stub->written(was[${was}] now[${now}] said=${said ? 1 : 0})`
+              : `stub->stub(was[${was}] now[${now}] said=${said ? 1 : 0})`;
           } else {
             what = `stub, owner=${owner} no fill`;
           }
@@ -3712,7 +3720,25 @@ export class Gex {
       // answered and the guest misses at that address for the rest of its
       // life. In pid 4 of the `ls`-under-bash run, all 16 recorded
       // fall-throughs are pages with no base. See #136.
-      let did = at > 0 && lazy.instObj.exports[FILL_AT](page, at, this.#fillFrom());
+      // What the module and its table looked like at this ask, kept so the
+      // retry in `liftSlots` can be compared against it.
+      //
+      // The same call writes the span later that it declines to write here,
+      // so the difference is state, not arguments. Table length first: the
+      // fill writes at `at + from` and `#reach` grows only to
+      // `at + SLOTS_PER_PAGE`. See #136.
+      const askFrom = this.#fillFrom();
+      if (Gex.askState.size < 4096) {
+        const tn0 = e.gex_page_table ? e.gex_page_table(BigInt(page >>> 0)) : -1;
+        const tabs0 = this.#dispatchTables();
+        Gex.askState.set(`${page}:${askFrom}`, {
+          at,
+          len: tn0 >= 0 && tn0 < tabs0.length ? tabs0[tn0].length : -1,
+          published: !!lazy.published,
+          inst: lazy.instObj,
+        });
+      }
+      let did = at > 0 && lazy.instObj.exports[FILL_AT](page, at, askFrom);
       // Experiment, ?wholepage=1: fill an image page entirely on the first
       // ask instead of the 32-slot span around the miss.
       //
