@@ -3944,6 +3944,7 @@ pub extern "C" fn gex_publish_closure_module(ptr: u32, len: u32, idx: u32) -> u3
             // The image module publishes its own as a data segment; a
             // `Shared` module has no memory of its own to put one in, so the
             // host writes them.
+            dir_note(*page, *base, "pin-meta");
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, *base);
         }
     });
@@ -4062,6 +4063,7 @@ pub extern "C" fn gex_claim_page(page: u64, base: u32) -> u32 {
         _ => return 0,
     };
     let entry = gex_abi::dispatch_entry(table as usize, base);
+    dir_note(page, entry, "claim-page");
     with_host(|h| {
         h.jit.page_table.assign(page, entry);
         let mut gm = GuestMem::new(guest_bytes());
@@ -4080,6 +4082,40 @@ pub extern "C" fn gex_claim_page(page: u64, base: u32) -> u32 {
 /// stub at four million a second. The directory is per process, so the
 /// numbering can be too; a fill writes where the directory says rather than
 /// where the build guessed.
+/// The dispatch page whose directory writes should be narrated, or -1.
+static DIR_WATCH: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+#[no_mangle]
+pub extern "C" fn gex_watch_dir(page: i64) {
+    DIR_WATCH.store(page, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Say who is about to change a watched page's directory entry.
+///
+/// A page filled at one base is later dispatched through another -- measured,
+/// `1085580 was[at=188416] now[at=302080]` -- and the slots written at the
+/// first base are then unreachable. `gex_claim_page` only allocates when the
+/// entry reads zero, so one of the other writers is overwriting a live entry
+/// or clearing it. This names which. See #136.
+fn dir_note(page: u64, entry: u32, who: &str) {
+    let want = DIR_WATCH.load(std::sync::atomic::Ordering::Relaxed);
+    if want < 0 || want as u64 != page {
+        return;
+    }
+    let gm = GuestMem::new(guest_bytes());
+    let had = gm.read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(0);
+    if had != entry {
+        warn_line(&format!(
+            "[gex] dir page {page}: {:#x} -> {:#x} by {who}\n",
+            had & gex_abi::DISPATCH_SLOT_MASK,
+            entry & gex_abi::DISPATCH_SLOT_MASK,
+        ));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gex_watch_dir_marker() {}
+
 #[no_mangle]
 pub extern "C" fn gex_page_base(page: u32) -> u32 {
     let gm = GuestMem::new(guest_bytes());
@@ -4128,6 +4164,7 @@ pub extern "C" fn gex_add_lazy_module(ptr: u32, len: u32) -> u32 {
         let mut owner = LAZY_OWNER.0.borrow_mut();
         for (page, base) in &meta.dir_entries {
             h.jit.page_table.assign(*page, *base);
+            dir_note(*page, *base, "register-module");
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, *base);
             owner.insert(*page, idx);
         }
@@ -4179,6 +4216,7 @@ pub extern "C" fn gex_reset_directory() -> u32 {
     let mut gm = GuestMem::new(guest_bytes());
     let mut n = 0u32;
     for (page, base) in &meta.dir_entries {
+        dir_note(*page, *base, "restore-dirs");
         if gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, *base).is_ok() {
             n += 1;
         }
@@ -9212,6 +9250,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     // misses again on the very next instruction, translating
                     // one block per turn forever.
                     let mut gm = GuestMem::new(guest_bytes());
+                    dir_note(page, base, "miss-shared-slot");
                     let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
                 }
             }
@@ -10382,6 +10421,7 @@ pub extern "C" fn gex_jit_installed() {
         };
         let mut gm = GuestMem::new(guest_bytes());
         for (page, base) in done.dirs {
+            dir_note(page, base, "install-done");
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
         }
         // Kept, not dropped. A dispatch table belongs to a module *instance*

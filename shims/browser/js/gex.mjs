@@ -641,6 +641,12 @@ export class Gex {
   static watchSlot = true;
   /// What each ask saw, keyed `page:from`. See `fillSlotNow` and `liftSlots`.
   static askState = new Map();
+  /// A dispatch page whose directory writes should be narrated, or -1.
+  ///
+  /// 4229 holds `0x1085580`, which is filled at one base and dispatched
+  /// through another. Every writer of `DISPATCH_DIR` reports itself for this
+  /// page, which is how the one that moves it gets named. See #136.
+  static watchDir = 4229;
   static #whySlot = 0;
 
   #bytes() {
@@ -994,6 +1000,8 @@ export class Gex {
     // the shim exists and says so itself. The same reasoning already applies
     // to the two lines above; the network was simply left out of it.
     this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
+    // Narrate one page's directory writes, in every process. See #136.
+    if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     // wasm-ld puts the shim's stack at address zero regardless of
     // --global-base, which is the guest's image. Move it into the shim's own
     // region, above everything the guest maps. Nothing has run yet.
@@ -1439,6 +1447,8 @@ export class Gex {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
       this.#shim.exports.gex_set_virgl?.(this.#virgl ? (this.#virglTrace ? 2 : 1) : 0);
       this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
+    // Narrate one page's directory writes, in every process. See #136.
+    if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     }
     const e = this.#shim.exports;
     this.#imports = {
