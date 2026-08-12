@@ -3644,6 +3644,40 @@ fn current_image_program(h: &Host) -> Option<String> {
         .and_then(|v| v.code.as_ref().map(|(p, _)| p.clone()))
 }
 
+/// Say everything this process knows about one image page.
+///
+/// The chain behind a page with no dispatch base is `#pageBase` returning 0
+/// because `gex_page_table` returned -1 because `IMAGE_TABLE` has no
+/// `(owner, page)` -- while `IMAGE_PAGES` does have the page, or the owner
+/// would not have resolved. Both maps are written from the same list in the
+/// same call, so the two must be disagreeing about *which* index owns the
+/// page. This prints the candidates and what each answers. See #136.
+#[no_mangle]
+pub extern "C" fn gex_explain_page(page: u64) {
+    let claims = IMAGE_PAGES.0.borrow();
+    let idxs = claims.get(&page).cloned().unwrap_or_default();
+    let tables = IMAGE_TABLE.0.borrow();
+    let progs = LIB_PROGRAM.0.borrow();
+    with_host(|h| {
+        let have = current_image_program(h);
+        let mut s = format!(
+            "[gex] page {page}: running {:?}, {} candidate(s):",
+            have.as_deref().unwrap_or("<none>"),
+            idxs.len()
+        );
+        for i in &idxs {
+            s.push_str(&format!(
+                " [{i} {:?} ours={} table={:?}]",
+                progs.get(*i).map(|p| p.as_str()).unwrap_or("<unnamed>"),
+                image_is_ours(h, *i),
+                tables.get(&(*i, page)),
+            ));
+        }
+        s.push('\n');
+        warn_line(&s);
+    });
+}
+
 /// Whether image library `idx` is the one this process is running.
 fn image_is_ours(h: &Host, idx: usize) -> bool {
     let progs = LIB_PROGRAM.0.borrow();
@@ -8914,6 +8948,19 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             let n = LIFT_PC_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
             if n < LIFT_PCS.len() {
                 LIFT_PCS[n].store(pc, std::sync::atomic::Ordering::Relaxed);
+                // And the base *now*, because by the time anything reads this
+                // the process may be a different program.
+                //
+                // A forked child runs its parent's code until it execs. pid 4
+                // of the `ls`-under-bash run lifts 6,864 blocks of bash's text
+                // while it is still bash, then becomes `/bin/ls` -- so a probe
+                // that reads at exit asks about `ls` and gets "no owner" for
+                // pages that are bash's, which says nothing about the moment
+                // the block was lifted. See #136.
+                LIFT_BASES[n].store(
+                    gex_page_base(gex_abi::dispatch_page(pc) as u32),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
     }
@@ -10719,6 +10766,26 @@ static LIFT_PCS: [std::sync::atomic::AtomicU64; 16] = [
     std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
 ];
 static LIFT_PC_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The dispatch base each of those pages had at the moment it was lifted.
+static LIFT_BASES: [std::sync::atomic::AtomicU32; 16] = [
+    std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0),
+];
+
+#[no_mangle]
+pub extern "C" fn gex_lift_base(i: u32) -> u32 {
+    LIFT_BASES
+        .get(i as usize)
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
 
 #[no_mangle]
 pub extern "C" fn gex_lift_pc(i: u32) -> u64 {

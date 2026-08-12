@@ -3571,14 +3571,28 @@ export class Gex {
     const tabs = this.#dispatchTables();
     if (!tabs.length) return undefined;
     const stub = tabs[0].get(0);
+    const seen = new Set();
     for (let i = 0; i < 16; i++) {
       const pc = Number(e.gex_lift_pc(i));
       if (!pc) break;
       const page = Math.floor(pc / 4096);
-      const base = e.gex_page_base(page >>> 0) >>> 0;
+      // The base the shim recorded when the block was lifted, not the one
+      // this page has now: a forked child lifts its parent's code and then
+      // execs, so asking afterwards asks about a different program.
+      const then = e.gex_lift_base ? e.gex_lift_base(i) >>> 0 : 0;
+      const base = then || (e.gex_page_base(page >>> 0) >>> 0);
       const tn = e.gex_page_table ? e.gex_page_table(BigInt(page >>> 0)) : -1;
       let what;
-      if (!base) what = 'no base';
+      if (!base) {
+        what = 'no base';
+        // And why there is none: which images claim this page, which one
+        // `image_is_ours` picks, and whether that one has a table for it.
+        // Only the shim can see any of that. See #136.
+        if (seen.size < 3 && !seen.has(page)) {
+          seen.add(page);
+          e.gex_explain_page?.(BigInt(page));
+        }
+      }
       else if (tn < 0 || tn >= tabs.length) what = 'no table';
       else {
         const slot = base + ((pc & 0xfff) >>> 2);
