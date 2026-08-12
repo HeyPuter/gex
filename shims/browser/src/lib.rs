@@ -1368,6 +1368,11 @@ pub extern "C" fn gex_set_per_miss(n: u32) {
 static ARENA_SPENT: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// How many times talc has asked the arena for another span, and the largest
+/// allocation that forced one. See #140.
+static HEAP_REFILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HEAP_BIGGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Bytes held by `Jit::registry`, for the arena report. See #140.
 static REGISTRY_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1456,9 +1461,10 @@ fn arena_take(len: u64) -> Option<u64> {
              {:#x}. Spent: {} MiB on guest mappings, {} MiB on this module's \
              heap, {} MiB on Worker stacks; largest single claim {}. Live in \
              the heap right now: {} MiB, of which {} MiB is kept module \
-             bytes and {} MiB is files the kernel holds (-1 KiB means the \
-             counters are off; build with GEX_HEAP_COUNTERS=1). An abort \
-             here is not a panic and prints nothing of its own.\n",
+             bytes and {} MiB is files the kernel holds. {} refills, \
+             biggest allocation {} (-1 KiB means the counters are off; build \
+             with GEX_HEAP_COUNTERS=1). An abort here is not a panic and \
+             prints nothing of its own.\n",
             gex_abi::MMAP_TOP,
             ARENA_SPENT[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[1].load(std::sync::atomic::Ordering::Relaxed) >> 20,
@@ -1471,6 +1477,8 @@ fn arena_take(len: u64) -> Option<u64> {
             gex_kernel::vfs::tmpfs::TMPFS_BYTES
                 .load(std::sync::atomic::Ordering::Relaxed)
                 >> 20,
+            HEAP_REFILLS.load(std::sync::atomic::Ordering::Relaxed),
+            HEAP_BIGGEST.load(std::sync::atomic::Ordering::Relaxed),
         );
         // SAFETY: `warn` reads the bytes and keeps none of them.
         unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
@@ -1528,6 +1536,13 @@ unsafe impl talc::source::Source for ShimRegion {
         let len = (_layout.size() as u64 + _layout.align() as u64).max(CHUNK);
         let len = len.next_multiple_of(65536);
         arena_note(1, len);
+        // How many refills, and the biggest single allocation that forced
+        // one. 1,880 MiB in 16 MiB chunks is about 117 refills whatever the
+        // shape, so the count alone says little -- but the largest *layout*
+        // separates one buffer growing by doubling from many live objects.
+        // See #140.
+        HEAP_REFILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HEAP_BIGGEST.fetch_max(_layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
         let base = arena_take(len).ok_or(())? as *mut u8;
         // Extend the last span when this one abuts it, rather than claiming a
         // second one beside it.
