@@ -1399,6 +1399,24 @@ fn arena_take(len: u64) -> Option<u64> {
     };
     let end = at.checked_add(len)?;
     if end > gex_abi::MMAP_TOP || !grow_memory_to(end) {
+        // Out loud, because the caller cannot say it.
+        //
+        // Both callers turn `None` into an allocation failure, and Rust's
+        // allocation failure is not a panic: `handle_alloc_error` aborts
+        // without going near the panic hook, so the run ends as a bare
+        // `unreachable` with nothing printed. `apt-get update` reported only
+        //
+        //     trapped inside the shim (unreachable, after syscall 63)
+        //
+        // which names the guest's pc and says nothing about the arena being
+        // the thing that ran out. This is the only place that knows.
+        warn_line(&format!(
+            "[gex] the arena cannot grow: wanted {len} bytes at {at:#x}, \
+             end {end:#x}, MMAP_TOP {:#x}, memory {} bytes -- the next \
+             allocation in the shim will abort\n",
+            gex_abi::MMAP_TOP,
+            warch::memory_size(0) as u64 * 65536,
+        ));
         return None;
     }
     ARENA_NEXT.store(end, std::sync::atomic::Ordering::Relaxed);
@@ -1834,7 +1852,26 @@ fn install_panic_hook() {
     ONCE.call_once(|| {
         std::panic::set_hook(Box::new(|info| {
             let text = format!("gex: panic in the shim: {info}\n");
-            // SAFETY: the one thread a page has, and `write` only reads.
+            // Straight to the host's console, not through fd 2.
+            //
+            // `write` is a *syscall*: it takes the kernel. Almost every panic
+            // worth reading happens with the kernel already taken -- that is
+            // what `with_host` panics about -- so the hook took the borrow a
+            // second time, panicked inside the panic, and the run ended as a
+            // bare `unreachable` with nothing said. Which is how
+            // `apt-get update` reported only
+            //
+            //     trapped inside the shim (unreachable, after syscall 63)
+            //
+            // for a panic that knew its own file, line and message.
+            //
+            // `warn` is a direct import to `console.error` and touches no
+            // kernel, so it cannot re-enter. Nothing here may take a borrow.
+            warn_line(&text);
+            // And fd 2 as well, so a run whose output is the terminal still
+            // shows it -- but only after the console has it, because this is
+            // the call that can die.
+            // SAFETY: the bytes are read, not kept.
             unsafe { write(2, text.as_ptr() as u32, text.len() as u32) };
         }));
     });
