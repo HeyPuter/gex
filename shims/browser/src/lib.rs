@@ -3409,6 +3409,45 @@ pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
         .unwrap_or(-1)
 }
 
+/// The `k`th closure object that covers `page` and belongs to this process.
+///
+/// `gex_closure_owner` answers with the *first* one, and for an image that is
+/// not enough. A program's translation is split into batched units (#98), and
+/// the split is by block, not by page: page 4099 of `/bin/bash` is covered by
+/// object 38, which holds four of its blocks, while the rest of that page
+/// lives in sibling objects. Asking only the first owner fills those four
+/// slots and leaves the page looking answered, so every other block on it
+/// falls past the fill to the translator for the life of the process --
+/// 15,306 blocks of bash in a process that execs, against 6 in the one that
+/// does not. See #136.
+#[no_mangle]
+pub extern "C" fn gex_closure_owner_at(page: u64, k: u32) -> i32 {
+    if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+        let claims = IMAGE_PAGES.0.borrow();
+        let Some(idxs) = claims.get(&page) else {
+            return -1;
+        };
+        return with_host(|h| {
+            idxs.iter()
+                .filter(|i| image_is_ours(h, **i))
+                .nth(k as usize)
+                .map(|i| *i as i32)
+                .unwrap_or(-1)
+        });
+    }
+    // Above the interpreter a page number is unique to an object, so there is
+    // never a second owner to ask.
+    if k != 0 {
+        return -1;
+    }
+    CLOSURE_OWNER
+        .0
+        .borrow()
+        .get(&page)
+        .map(|v| *v as i32)
+        .unwrap_or(-1)
+}
+
 /// Where the closure build says each object goes, staged until the kernel
 /// that will honour it exists.
 ///

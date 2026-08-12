@@ -492,6 +492,10 @@ export async function runProgram(
       // and now that install and translation are 17 of a 57 second
       // `apt-get update`, the rest of it is the only thing left to ask about.
       hot: flag('hot') ? 1 : undefined,
+      // `?wholepage=1` fills an image page entirely on the first ask instead
+      // of the 32-slot span around the miss. An experiment for #136: it says
+      // whether the closure has the blocks an exec'd process lifts anyway.
+      wholePage: flag('wholepage') ? 1 : undefined,
       // Every process gets a memory two Workers can hold, so a `clone` that
       // asks for a thread can be given one. `worker.mjs` reads this as
       // `shared` and passes it to the `Gex` constructor, which is what

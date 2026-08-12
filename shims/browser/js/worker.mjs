@@ -505,6 +505,7 @@ async function handle(msg) {
     if (msg.hot) ex.gex_set_hot?.(1);
     if (msg.noIntrinsics) ex.gex_set_intrinsics?.(0);
     if (msg.trace) ex.gex_set_trace?.(1);
+    if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
     if (msg.checkSp) ex.gex_set_check_sp?.(1);
     // A forked or exec'd child never calls `load`, so the switch that `load`

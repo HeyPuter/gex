@@ -618,6 +618,21 @@ export class Gex {
   /// caller handed the modules over up front, which the page still does for
   /// pid 1 -- it compiled them itself and has nowhere to ask.
   #wantLibrary = null;
+  /// The dispatch pages to narrate. Empty in a normal run; the gate is the
+  /// set itself, because `opts.strace` never reaches a Worker -- gating on
+  /// it silences the probe in every process, which is the shape of bug this
+  /// set exists to catch.
+  ///
+  /// Narrating anything else is how three
+  /// probes in a row missed. `?trace=1` prints for these only.
+  ///
+  /// A cap of eight reports over "image pages" spent all eight on 4145..4255,
+  /// which fill correctly, while the pages that actually fall through to the
+  /// translator -- 4099 and 4121, from `page unfilled: lifting 0x1003850` --
+  /// never appeared. Watch the failing pages by number instead. See #136.
+  static watchPages = new Set([4099, 4121]);
+  /// Fill a whole image page on first ask. See `fillSlotNow`.
+  static wholePage = false;
   /// How many times the fill has said why it gave up. See `fillSlotNow`.
   static #whyNo = 0;
   /// And how many times it has said what the fill itself answered.
@@ -3533,8 +3548,22 @@ export class Gex {
 
   fillSlotNow(page) {
     const e = this.#shim.exports;
-    const owner = e.gex_closure_owner ? e.gex_closure_owner(BigInt(page)) : -1;
-    if (owner >= 0) {
+    // Every object that covers this page, not just the first.
+    //
+    // A program's translation is split into batched units and the split is by
+    // block, so one image page can be covered by several objects. Filling
+    // from the first alone writes the handful of blocks it holds and leaves
+    // the rest of the page to the translator. See #136 and
+    // `gex_closure_owner_at`.
+    let owned = false;
+    let filled = false;
+    for (let k = 0; ; k++) {
+      const owner = e.gex_closure_owner_at
+        ? e.gex_closure_owner_at(BigInt(page), k)
+        : (k === 0 && e.gex_closure_owner ? e.gex_closure_owner(BigInt(page)) : -1);
+      if (owner < 0) break;
+      owned = true;
+      {
       const lazy = this.#lazyClosure[owner];
       // Which of the three ways this gives up, for the first few.
       //
@@ -3550,7 +3579,7 @@ export class Gex {
       // spent on `ld.so` and `libc` before an image page came up -- the
       // second time a cap has hidden the case it was built for. An image
       // sits below `INTERP_BASE`; a library never does.
-      if (page * 4096 < 0x3000000 && Gex.#whyNo < 8) {
+      if (Gex.watchPages.has(page) && Gex.#whyNo < 24) {
         Gex.#whyNo++;
         const why = !lazy ? 'no lazy entry'
           : !lazy.instObj ? 'module not instantiated'
@@ -3558,18 +3587,18 @@ export class Gex {
           : 'reached the fill';
         console.error(`[closure] fill page ${page} owner ${owner}: ${why}`);
       }
-      if (!lazy) return null;
+      if (!lazy) continue;
       // Publishing is synchronous -- a directory write and a table grow --
       // so it belongs on this side of the fence.
       if (!lazy.published) {
         lazy.published = true;
         this.#publish(lazy, owner);
       }
-      if (!lazy.instObj) return null;
+      if (!lazy.instObj) continue;
       // A module below the block gate has *active* segments and no fill
       // helper: instantiating it wrote its slots, so there is nothing to ask
       // for and the page is already answered.
-      if (typeof lazy.instObj.exports[FILL_AT] !== 'function') return true;
+      if (typeof lazy.instObj.exports[FILL_AT] !== 'function') { filled = true; continue; }
       // A closure older than the span writes whole pages whatever it is told.
       //
       // `gexfillat` used to be `(page, base)`; it is `(page, base, from)` now.
@@ -3591,7 +3620,22 @@ export class Gex {
       const at = this.#pageBase(page);
       const b1 = performance.now();
       this.#faBaseMs += b1 - b0;
-      const did = at >= 0 && lazy.instObj.exports[FILL_AT](page, at, this.#fillFrom());
+      let did = at >= 0 && lazy.instObj.exports[FILL_AT](page, at, this.#fillFrom());
+      // Experiment, ?wholepage=1: fill an image page entirely on the first
+      // ask instead of the 32-slot span around the miss.
+      //
+      // `FILL_ASKED` keys a span once, so a block that is not in the 32 the
+      // fill wrote can never be asked for again -- the miss falls past the
+      // fill to the translator for the rest of the process's life. This says
+      // which of the two is true: if bash's 15,306 blocks drop, the module
+      // had them and the span never reached them; if they do not, the module
+      // genuinely has no block there and it is a discovery gap in `gexc`.
+      if (Gex.wholePage && at >= 0 && page * 4096 < 0x3000000 && !lazy.wholeDone?.has(page)) {
+        (lazy.wholeDone ??= new Set()).add(page);
+        for (let f = 0; f < SLOTS_PER_PAGE; f += 32) {
+          if (lazy.instObj.exports[FILL_AT](page, at, f)) did = true;
+        }
+      }
       this.#faInitMs += performance.now() - b1;
       // What the fill answered, for an image page.
       //
@@ -3601,7 +3645,7 @@ export class Gex {
       // remaining question is which of the two halves fails: `at < 0`, no
       // base for the page in this process, or `did` false, the module holding
       // no block at that address. See #136.
-      if (page * 4096 < 0x3000000 && Gex.#whyDid < 8) {
+      if (Gex.watchPages.has(page) && Gex.#whyDid < 24) {
         Gex.#whyDid++;
         // `did` only says the module wrote *something* in the span. What
         // decides this is whether the slot that actually missed is filled,
@@ -3624,10 +3668,14 @@ export class Gex {
       }
       if (did) {
         this.#filled++;
-        return true;
+        filled = true;
       }
-      return null;
+      }
     }
+    if (filled) return true;
+    // Owned but unfillable: the caller's fallback scan cannot help, because
+    // the objects that claim this page are the only ones that hold its code.
+    if (owned) return null;
     if (page * 4096 < 0x0300_0000) return null;
     const where = this.#pageBase(page);
     if (where < 0) return null;
