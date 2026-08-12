@@ -53,7 +53,16 @@ LINK="-C link-arg=--import-memory \
 # Not the default because counting charges every allocation and free, and the
 # runtime translator allocates constantly.
 FEATURES=""
-[ -n "${GEX_HEAP_COUNTERS:-}" ] && FEATURES="--features heap-counters"
+# And the same list for the shared build below, which takes `shared-memory`
+# as well and so cannot reuse the `--features` string verbatim.
+#
+# It did not take them at all until now: `GEX_HEAP_COUNTERS=1` built a plain
+# shim with counters and a shared shim without, and the page loads the shared
+# one -- so the counters were on in the artefact nothing runs and off in the
+# artefact everything runs. The build even said "heap counters on", about the
+# wrong file.
+EXTRA=""
+[ -n "${GEX_HEAP_COUNTERS:-}" ] && { FEATURES="--features heap-counters"; EXTRA=",heap-counters"; }
 
 OUT=target/wasm32-unknown-unknown/release/gex_browser.wasm
 RUSTFLAGS="$LINK" cargo build -p gex-browser --target wasm32-unknown-unknown --release $FEATURES
@@ -141,7 +150,7 @@ if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | gre
         -C link-arg=--shared-memory \
         -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
         cargo +nightly build -p gex-browser --target wasm32-unknown-unknown \
-          --release -Z build-std=std,panic_abort --features shared-memory \
+          --release -Z build-std=std,panic_abort --features "shared-memory$EXTRA" \
           --target-dir target/shared >/dev/null 2>&1; then
         cp target/shared/wasm32-unknown-unknown/release/gex_browser.wasm "$SHARED"
         # And where the page can fetch it.
@@ -166,7 +175,7 @@ if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | gre
             -C link-arg=--shared-memory \
             -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
             cargo +nightly build -p gex-browser --target wasm32-unknown-unknown \
-              --release -Z build-std=std,panic_abort --features shared-memory \
+              --release -Z build-std=std,panic_abort --features "shared-memory$EXTRA" \
               --target-dir target/shared 2>&1 | grep -E "^error|error:" | head -5
         echo "shims/browser: (if that is 'can't find crate for std', install rust-src)"
     fi

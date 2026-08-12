@@ -1435,7 +1435,7 @@ fn arena_take(len: u64) -> Option<u64> {
         // is worse. A fixed buffer on the stack and `core::fmt` into it
         // touches no allocator at all.
         use core::fmt::Write as _;
-        struct Buf([u8; 320], usize);
+        struct Buf([u8; 448], usize);
         impl core::fmt::Write for Buf {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
                 let room = self.0.len() - self.1;
@@ -1445,18 +1445,21 @@ fn arena_take(len: u64) -> Option<u64> {
                 Ok(())
             }
         }
-        let mut b = Buf([0; 320], 0);
+        let mut b = Buf([0; 448], 0);
         let _ = write!(
             b,
             "[gex] the arena cannot grow: wanted {len} at {at:#x}, ceiling \
              {:#x}. Spent: {} MiB on guest mappings, {} MiB on this module's \
-             heap, {} MiB on Worker stacks; largest single claim {}. An abort \
-             here is not a panic and prints nothing of its own.\n",
+             heap, {} MiB on Worker stacks; largest single claim {}. Live in \
+             the heap right now: {} MiB (-1 KiB means the counters are off; \
+             build with GEX_HEAP_COUNTERS=1). An abort here is not a panic \
+             and prints nothing of its own.\n",
             gex_abi::MMAP_TOP,
             ARENA_SPENT[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[1].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[2].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[3].load(std::sync::atomic::Ordering::Relaxed),
+            gex_heap_used_kib() / 1024,
         );
         // SAFETY: `warn` reads the bytes and keeps none of them.
         unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
