@@ -212,6 +212,25 @@ impl MemoryMap {
         }
     }
 
+    /// How much of the top of the arena is free.
+    ///
+    /// The bytes between the highest mapping and the end of the highest span.
+    /// A fresh claim continues from here rather than above it, so the tail
+    /// the last user gave back is spent before any more is taken.
+    fn free_tail(&self) -> u64 {
+        let Some(&(lo, hi)) = self.arena.last() else {
+            return 0;
+        };
+        let top = self
+            .vmas
+            .iter()
+            .filter(|v| v.end > lo && v.start < hi)
+            .map(|v| v.end)
+            .max()
+            .unwrap_or(lo);
+        hi.saturating_sub(top.max(lo))
+    }
+
     /// Claim `len` more bytes of arena, growing the memory behind it.
     fn extend_arena(&mut self, len: u64) -> Result<u64, Errno> {
         let Some(take) = self.take else {
@@ -220,10 +239,52 @@ impl MemoryMap {
         // A chunk at a time, so a guest that maps a page at a time does not
         // ask the host to grow its memory once per page.
         const CHUNK: u64 = 8 * 1024 * 1024;
-        let want = page_align_up(len).max(CHUNK);
+        let need = page_align_up(len);
+        // Carry on from the free tail at the top of the arena instead of
+        // starting above it.
+        //
+        // The arena's highest span usually ends in free space, because the
+        // last thing to use it gave some back. Claiming a whole `len` above
+        // that leaves the tail stranded: it is too small for the next request
+        // of the same size, and the request after that strands another one.
+        //
+        // glibc makes this the common case rather than a rare one. `new_heap`
+        // maps two `HEAP_MAX_SIZE`s, keeps the aligned middle and frees the
+        // rest, so every heap hands back most of a `HEAP_MAX_SIZE` and then
+        // asks for two more. Each 64 MiB of heap cost 128 MiB of arena;
+        // `apt-get update` reached the 2 GiB ceiling and aborted, in a memory
+        // that may be nearly 4 GiB. Continuing from the tail makes the steady
+        // state one `HEAP_MAX_SIZE` per heap instead of two.
+        let tail = self.free_tail();
+        let want = need.saturating_sub(tail).max(CHUNK);
         let start = take(want);
         if start == 0 {
             return Err(Errno::ENOMEM);
+        }
+        // Joined to the span below when it touches it, rather than recorded
+        // as a second box.
+        //
+        // The cursor these come from only goes up, so consecutive claims are
+        // adjacent and the arena is really one region -- but the search for a
+        // free hole runs `while candidate + len <= hi` *within* a span, so a
+        // hole that straddles a boundary is invisible to it. That is not a
+        // corner case, it is glibc's ordinary behaviour: `new_heap` maps two
+        // `HEAP_MAX_SIZE`s, keeps a `HEAP_MAX_SIZE`-aligned span and frees
+        // the head and the tail. The freed tail of one claim and the freed
+        // head of the next are adjacent and together are exactly the size of
+        // the next request -- and each alone is too small, so every heap
+        // extended the arena again.
+        //
+        // Measured on `apt-get update`: the arena reached the 2 GiB ceiling
+        // and the next 16 MiB aborted the process, in a memory that may be
+        // nearly 4 GiB. Sixteen heaps at 128 MiB of cursor apiece.
+        if let Some(last) = self.arena.last_mut() {
+            if last.1 == start {
+                // The claim continues the span, so the free tail inside it is
+                // usable and the mapping starts there.
+                last.1 = start + want;
+                return Ok(start - tail);
+            }
         }
         self.arena.push((start, start + want));
         Ok(start)
@@ -652,6 +713,66 @@ impl MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// glibc's heap pattern must not leak the arena a claim at a time.
+    ///
+    /// `new_heap` maps two `HEAP_MAX_SIZE`s, keeps the aligned middle and
+    /// frees the head and the tail. The freed tail of one claim and the freed
+    /// head of the next are adjacent, and together they are exactly the size
+    /// of the next request -- so the second heap must land in them rather
+    /// than extending the arena again.
+    ///
+    /// It did extend, every time, because the search for a hole runs inside
+    /// one recorded span and these two halves were in different spans.
+    /// `apt-get update` reached the 2 GiB ceiling and aborted.
+    #[test]
+    fn a_freed_tail_and_the_next_head_are_one_hole() {
+        // A cursor that only goes up, which is what the browser shim has.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x1000_0000);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(_end: u64) -> bool {
+            true
+        }
+        NEXT.store(0x1000_0000, std::sync::atomic::Ordering::SeqCst);
+
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+
+        const HEAP: u64 = 64 * 1024 * 1024;
+        let mut kept = Vec::new();
+        for _ in 0..4 {
+            // Two heaps' worth, then trim to alignment, as glibc does.
+            let got = m.mmap(0, HEAP * 2, 0, 0, "heap").unwrap() as u64;
+            let aligned = (got + HEAP - 1) & !(HEAP - 1);
+            if aligned > got {
+                m.unmap(got, aligned - got).unwrap();
+            }
+            let tail = aligned + HEAP;
+            if got + HEAP * 2 > tail {
+                m.unmap(tail, got + HEAP * 2 - tail).unwrap();
+            }
+            kept.push(aligned);
+        }
+
+        // Four heaps of 64 MiB kept. Reusing the holes, the cursor should
+        // have moved a little over 256 MiB; extending every time it is 512.
+        let used = NEXT.load(std::sync::atomic::Ordering::SeqCst) - 0x1000_0000;
+        assert!(
+            used <= HEAP * 6,
+            "the arena grew {} MiB for four 64 MiB heaps -- the freed head \
+             and tail are not being reused",
+            used / (1024 * 1024),
+        );
+        // And the heaps are all distinct and aligned.
+        kept.sort();
+        kept.dedup();
+        assert_eq!(kept.len(), 4);
+        for k in kept {
+            assert_eq!(k % HEAP, 0);
+        }
+    }
 
     #[test]
     fn brk_grows_and_reports() {
