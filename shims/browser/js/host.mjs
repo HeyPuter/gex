@@ -563,9 +563,23 @@ export class ProcessHost {
         const start = (mm) => {
           if (mm?.kind !== 'ready') return;
           this.#pending.delete(key);
+          // Without the closure, and this is the same rule the fork path
+          // follows two hundred lines up: `extra` carries `closure`, whose
+          // entries are the libraries, and a library is fetched on the first
+          // branch that lands in it -- so most of them are still promises.
+          // A promise is not structured-cloneable, and the whole message is
+          // refused: "Failed to execute 'postMessage' on 'Worker':
+          // #<Promise> could not be cloned". The thread never starts and the
+          // process it belongs to waits for a sibling that does not exist.
+          //
+          // A count instead, exactly as a forked child gets one; the Worker
+          // asks for what it needs. Nothing noticed until now because no
+          // guest thread had ever been started.
+          const { closure: _closure, ...extra } = this.#extra ?? {};
           this.#shimModule().then((shimMod) =>
           w2.postMessage({
-            ...this.#extra,
+            ...extra,
+            closureCount: (this.#extra?.closure ?? []).length,
             kind: 'thread',
             tid: m.thread.tid,
             memory: m.thread.memory,
