@@ -656,6 +656,7 @@ export class ProcessHost {
               (m.liftWhy && m.liftWhy.some((n) => n)
                 ? ` why[nofill=${m.liftWhy[0]} unowned=${m.liftWhy[1]} asked=${m.liftWhy[2]} fresh=${m.liftWhy[3]}]`
                 : '') +
+              (m.liftSlots ? ` slots[${m.liftSlots}]` : '') +
               (m.waits && (m.waits.park || m.waits.turn || m.waits.nap)
                 ? `, waited park=${m.waits.park} turn=${m.waits.turn} nap=${m.waits.nap}`
                 : '') +

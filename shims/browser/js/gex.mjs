@@ -3549,6 +3549,48 @@ export class Gex {
     return this.#shim.exports.gex_fill_from ? this.#shim.exports.gex_fill_from() >>> 0 : 0;
   }
 
+  /**
+   * For each address that translated although its span had been filled,
+   * whether its dispatch slot is written.
+   *
+   * This is the reading #136 turns on and the one no earlier probe could
+   * take. `why[asked]` accounts for every lift in the demo -- the fill ran
+   * for that span and the guest missed there anyway -- and the two
+   * explanations want opposite fixes. If the slot is written, dispatch is
+   * reading somewhere other than where the fill wrote. If it is a stub, the
+   * module holds no block at that address even where the closure is
+   * exhaustive.
+   *
+   * The shim collects the addresses because the fall-through is in Rust and
+   * calls nothing; the table can only be read from here, after the fact.
+   */
+  liftSlots() {
+    const e = this.#shim.exports;
+    if (!e.gex_lift_pc || !e.gex_page_base) return undefined;
+    const out = [];
+    const tabs = this.#dispatchTables();
+    if (!tabs.length) return undefined;
+    const stub = tabs[0].get(0);
+    for (let i = 0; i < 16; i++) {
+      const pc = Number(e.gex_lift_pc(i));
+      if (!pc) break;
+      const page = Math.floor(pc / 4096);
+      const base = e.gex_page_base(page >>> 0) >>> 0;
+      const tn = e.gex_page_table ? e.gex_page_table(BigInt(page >>> 0)) : -1;
+      let what;
+      if (!base) what = 'no base';
+      else if (tn < 0 || tn >= tabs.length) what = 'no table';
+      else {
+        const slot = base + ((pc & 0xfff) >>> 2);
+        what = slot >= tabs[tn].length
+          ? `past end ${tabs[tn].length}`
+          : tabs[tn].get(slot) !== stub ? 'written' : 'stub';
+      }
+      out.push(`${pc.toString(16)}:${what}`);
+    }
+    return out.length ? out.join(' ') : undefined;
+  }
+
   fillSlotNow(page) {
     const e = this.#shim.exports;
     // Every object that covers this page, not just the first.
@@ -3623,7 +3665,15 @@ export class Gex {
       const at = this.#pageBase(page);
       const b1 = performance.now();
       this.#faBaseMs += b1 - b0;
-      let did = at >= 0 && lazy.instObj.exports[FILL_AT](page, at, this.#fillFrom());
+      // `> 0`, not `>= 0`. Zero is `#pageBase`'s sentinel for "this process
+      // has no translation for this page" -- its own comment says so, and a
+      // real base is always above the reserved miss span. Accepting it called
+      // the fill with base 0, which writes the module's funcrefs over the
+      // bottom of table 0 and reports success; the shim then marks the span
+      // answered and the guest misses at that address for the rest of its
+      // life. In pid 4 of the `ls`-under-bash run, all 16 recorded
+      // fall-throughs are pages with no base. See #136.
+      let did = at > 0 && lazy.instObj.exports[FILL_AT](page, at, this.#fillFrom());
       // Experiment, ?wholepage=1: fill an image page entirely on the first
       // ask instead of the 32-slot span around the miss.
       //
@@ -3633,7 +3683,7 @@ export class Gex {
       // which of the two is true: if bash's 15,306 blocks drop, the module
       // had them and the span never reached them; if they do not, the module
       // genuinely has no block there and it is a discovery gap in `gexc`.
-      if (Gex.wholePage && at >= 0 && page * 4096 < 0x3000000 && !lazy.wholeDone?.has(page)) {
+      if (Gex.wholePage && at > 0 && page * 4096 < 0x3000000 && !lazy.wholeDone?.has(page)) {
         (lazy.wholeDone ??= new Set()).add(page);
         for (let f = 0; f < SLOTS_PER_PAGE; f += 32) {
           if (lazy.instObj.exports[FILL_AT](page, at, f)) did = true;
@@ -3653,7 +3703,7 @@ export class Gex {
       // whether it wrote the slot that missed, which is the only one that
       // decides whether the guest comes back here. Every lift in #136 is a
       // span that was already filled, so one of these two must disagree.
-      if (Gex.watchSlot && at >= 0) {
+      if (Gex.watchSlot && at > 0) {
         const mpc = Number(this.#shim.exports.gex_fill_pc?.() ?? 0n);
         if (mpc && Gex.#whySlot < 12) {
           Gex.#whySlot++;
@@ -3704,7 +3754,8 @@ export class Gex {
     if (owned) return null;
     if (page * 4096 < 0x0300_0000) return null;
     const where = this.#pageBase(page);
-    if (where < 0) return null;
+    // Same sentinel as above: zero is "no translation", not slot zero.
+    if (where <= 0) return null;
     for (const inst of this.#unfilled) {
       if (inst.exports[FILL_AT](page, where, this.#fillFrom())) {
         this.#filled++;
@@ -3808,13 +3859,13 @@ export class Gex {
     const mine = owner >= 0 ? this.#lazyClosure[owner]?.instObj : null;
     if (mine && typeof mine.exports[FILL_AT] !== 'function') return true;
     const at = this.#pageBase(slot);
-    if (mine && at >= 0 && mine.exports[FILL_AT](slot, at, this.#fillFrom())) {
+    if (mine && at > 0 && mine.exports[FILL_AT](slot, at, this.#fillFrom())) {
       this.#filled++;
       return true;
     }
     if (slot * 4096 >= 0x0300_0000) {
       for (const inst of this.#unfilled) {
-        if (at >= 0 && inst.exports[FILL_AT](slot, at, this.#fillFrom())) {
+        if (at > 0 && inst.exports[FILL_AT](slot, at, this.#fillFrom())) {
           this.#filled++;
           return true;
         }

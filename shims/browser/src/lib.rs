@@ -8901,6 +8901,21 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             if FILL_ASKED.0.borrow().contains(&key) { 2 } else { 3 }
         };
         LIFT_WHY[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // And keep the addresses of the interesting case, because only this
+        // side ever sees them.
+        //
+        // `why == 2` is a span the fill already answered, and every lift in
+        // the demo is one. Whether the slot such an address dispatches
+        // through is written at this moment decides between a dispatch fault
+        // and a disagreement about block addresses -- and JavaScript, which
+        // is the only thing that can read a table, is not called here. So
+        // record them and let the Worker look afterwards.
+        if why == 2 {
+            let n = LIFT_PC_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+            if n < LIFT_PCS.len() {
+                LIFT_PCS[n].store(pc, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
     if maybe_recompile_at(pc) {
         // The same resume the ordinary path uses: come back at the address
@@ -10691,6 +10706,27 @@ static LIFT_WHY: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+
+/// The first few addresses that translated despite their span being filled.
+static LIFT_PCS: [std::sync::atomic::AtomicU64; 16] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+];
+static LIFT_PC_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_lift_pc(i: u32) -> u64 {
+    LIFT_PCS
+        .get(i as usize)
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+}
 
 #[no_mangle]
 pub extern "C" fn gex_lift_why(i: u32) -> i64 {

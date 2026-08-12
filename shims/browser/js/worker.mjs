@@ -565,6 +565,11 @@ async function handle(msg) {
       liftWhy: gex.shim.exports.gex_lift_why
         ? [0, 1, 2, 3].map((i) => Number(gex.shim.exports.gex_lift_why(i)))
         : undefined,
+      // For each address that translated although its span had been filled,
+      // whether the slot it dispatches through is written *now*. The shim
+      // records the addresses because it is the only side that sees them,
+      // and a table can only be read from here. See #136.
+      liftSlots: gex.liftSlots?.(),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
       // And what the *engine* cost, which the line above does not cover:
       // compiling and instantiating every module this process installed,
