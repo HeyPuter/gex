@@ -618,6 +618,10 @@ export class Gex {
   /// caller handed the modules over up front, which the page still does for
   /// pid 1 -- it compiled them itself and has nowhere to ask.
   #wantLibrary = null;
+  /// How many times the fill has said why it gave up. See `fillSlotNow`.
+  static #whyNo = 0;
+  /// And how many times it has said what the fill itself answered.
+  static #whyDid = 0;
 
   #bytes() {
     // Rebuilt when the memory has grown, not only when it has been detached.
@@ -3532,6 +3536,28 @@ export class Gex {
     const owner = e.gex_closure_owner ? e.gex_closure_owner(BigInt(page)) : -1;
     if (owner >= 0) {
       const lazy = this.#lazyClosure[owner];
+      // Which of the three ways this gives up, for the first few.
+      //
+      // A miss on a claimed, owned page whose metadata covers it should be
+      // answered here, and after an `execve` it is not: the same page comes
+      // back three times unfilled and the guest lifts its own image --
+      // 15,306 blocks of bash where pid 1 lifts none. Everything upstream is
+      // verified present, so the give-up is one of the returns below and
+      // each wants a different fix. See #136.
+      // Image pages only, and that filter is the point.
+      //
+      // The first version took the first eight reports and they were all
+      // spent on `ld.so` and `libc` before an image page came up -- the
+      // second time a cap has hidden the case it was built for. An image
+      // sits below `INTERP_BASE`; a library never does.
+      if (page * 4096 < 0x3000000 && Gex.#whyNo < 8) {
+        Gex.#whyNo++;
+        const why = !lazy ? 'no lazy entry'
+          : !lazy.instObj ? 'module not instantiated'
+          : typeof lazy.instObj.exports[FILL_AT] !== 'function' ? 'no fill export'
+          : 'reached the fill';
+        console.error(`[closure] fill page ${page} owner ${owner}: ${why}`);
+      }
       if (!lazy) return null;
       // Publishing is synchronous -- a directory write and a table grow --
       // so it belongs on this side of the fence.
@@ -3567,6 +3593,35 @@ export class Gex {
       this.#faBaseMs += b1 - b0;
       const did = at >= 0 && lazy.instObj.exports[FILL_AT](page, at, this.#fillFrom());
       this.#faInitMs += performance.now() - b1;
+      // What the fill answered, for an image page.
+      //
+      // The give-up probe above showed the fill is *reached* for an image
+      // after an `execve` -- there is a lazy entry, the module instantiates,
+      // the export exists -- and the guest lifts the block regardless. So the
+      // remaining question is which of the two halves fails: `at < 0`, no
+      // base for the page in this process, or `did` false, the module holding
+      // no block at that address. See #136.
+      if (page * 4096 < 0x3000000 && Gex.#whyDid < 8) {
+        Gex.#whyDid++;
+        // `did` only says the module wrote *something* in the span. What
+        // decides this is whether the slot that actually missed is filled,
+        // so count the span rather than trusting the return.
+        const from = this.#fillFrom();
+        const tn = this.#shim.exports.gex_page_table
+          ? this.#shim.exports.gex_page_table(BigInt(page >>> 0)) : -1;
+        const tabs = this.#dispatchTables();
+        let wrote = -1, len = -1;
+        if (tn >= 0 && tn < tabs.length) {
+          const stub = tabs[0].get(0);
+          len = tabs[tn].length;
+          wrote = 0;
+          for (let i = from; i < from + 128 && at + i < len; i++) {
+            if (tabs[tn].get(at + i) !== stub) wrote++;
+          }
+        }
+        console.error(`[closure] fill page ${page} owner ${owner}: at=${at} did=${did} `
+          + `t=${tn} from=${from} wrote=${wrote}/128 tlen=${len}`);
+      }
       if (did) {
         this.#filled++;
         return true;
