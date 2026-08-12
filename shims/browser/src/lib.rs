@@ -4105,8 +4105,14 @@ fn dir_note(page: u64, entry: u32, who: &str) {
     let gm = GuestMem::new(guest_bytes());
     let had = gm.read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(0);
     if had != entry {
+        // With the pid: three claims of three different bases for one page
+        // are either one process losing its numbering over and over, or
+        // three processes numbering independently and a fill landing in the
+        // wrong one. `my_pid` reads a static, which matters -- this is
+        // called from inside `with_host` closures and must not borrow.
         warn_line(&format!(
-            "[gex] dir page {page}: {:#x} -> {:#x} by {who}\n",
+            "[gex] pid {} dir page {page}: {:#x} -> {:#x} by {who}\n",
+            my_pid(),
             had & gex_abi::DISPATCH_SLOT_MASK,
             entry & gex_abi::DISPATCH_SLOT_MASK,
         ));
@@ -6574,7 +6580,28 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // the old one left in the directory is code at the same addresses doing
     // something else entirely. Clearing it sends every branch back through
     // the miss stub, which is where a fresh translation comes from.
+    if DIR_WATCH.load(std::sync::atomic::Ordering::Relaxed) >= 0 {
+        warn_line(&format!("[gex] pid {} dir cleared by exec\n", my_pid()));
+    }
     data[gex_abi::DISPATCH_DIR as usize..LOW_END as usize].fill(0);
+    // And forget which spans have been asked for, because the answers went
+    // with the directory.
+    //
+    // `FILL_ASKED` holds a span so it is never asked twice: a second ask for
+    // a block the module does not have would spin. That reasoning holds only
+    // while the fill's answer is still reachable, and the line above has just
+    // made it unreachable -- the base a span was filled against is gone, and
+    // the page will be numbered somewhere else.
+    //
+    // Measured in `/bin/ls / ; bash -c "/bin/ls /usr"`. pid 3 claims page
+    // 4229 at 188416 and fills it, execs, and the page comes back at 302080
+    // where nothing is written. The span is still marked, so nothing re-asks
+    // it, and every block on that page goes to the translator for the rest of
+    // the process's life -- `why[asked]` for every lift in the run, and
+    // 15,306 blocks of bash in a process that has bash statically
+    // recompiled. See #136.
+    FILL_ASKED.0.borrow_mut().clear();
+    FILL_FAILED.0.borrow_mut().clear();
     // Slots already handed out are never reused -- a page that comes back
     // through a `fork` checkpoint still points at its own -- so allocation
     // carries on from the high-water mark rather than restarting.

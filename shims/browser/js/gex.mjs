@@ -646,7 +646,7 @@ export class Gex {
   /// 4229 holds `0x1085580`, which is filled at one base and dispatched
   /// through another. Every writer of `DISPATCH_DIR` reports itself for this
   /// page, which is how the one that moves it gets named. See #136.
-  static watchDir = 4229;
+  static watchDir = -1;
   static #whySlot = 0;
 
   #bytes() {
