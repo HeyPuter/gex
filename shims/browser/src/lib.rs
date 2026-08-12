@@ -1456,9 +1456,9 @@ fn arena_take(len: u64) -> Option<u64> {
              {:#x}. Spent: {} MiB on guest mappings, {} MiB on this module's \
              heap, {} MiB on Worker stacks; largest single claim {}. Live in \
              the heap right now: {} MiB, of which {} MiB is kept module \
-             bytes (-1 KiB means the counters are off; build with \
-             GEX_HEAP_COUNTERS=1). An abort here is not a panic \
-             and prints nothing of its own.\n",
+             bytes and {} MiB is files the kernel holds (-1 KiB means the \
+             counters are off; build with GEX_HEAP_COUNTERS=1). An abort \
+             here is not a panic and prints nothing of its own.\n",
             gex_abi::MMAP_TOP,
             ARENA_SPENT[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[1].load(std::sync::atomic::Ordering::Relaxed) >> 20,
@@ -1466,6 +1466,11 @@ fn arena_take(len: u64) -> Option<u64> {
             ARENA_SPENT[3].load(std::sync::atomic::Ordering::Relaxed),
             gex_heap_used_kib() / 1024,
             REGISTRY_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
+            // A static in the kernel, read directly: this runs inside the
+            // allocator's refill path and must not borrow the host.
+            gex_kernel::vfs::tmpfs::TMPFS_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >> 20,
         );
         // SAFETY: `warn` reads the bytes and keeps none of them.
         unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };

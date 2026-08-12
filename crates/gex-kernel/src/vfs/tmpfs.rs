@@ -16,6 +16,27 @@ use std::sync::{Arc, Mutex};
 /// nicety: SQLite creates its temporary files, unlinks them immediately and
 /// then writes through the descriptor it still holds. A handle that resolved
 /// its path on every access answered `ENOENT`, which SQLite reports as a disk
+/// Bytes this filesystem is holding, capacity rather than length.
+///
+/// Nothing reported what the kernel keeps, and `apt-get update` dies with
+/// 1,861 MiB live on the shim's heap while the same shell without apt holds
+/// 3 MiB. The files apt writes come to about 100 MB, so if this accounts for
+/// the difference something is keeping many copies, and if it does not the
+/// memory is somewhere else entirely -- pipe buffers being the other
+/// candidate. See task 140.
+///
+/// Capacity, because that is what the allocator is holding: a `Vec` that
+/// grew geometrically keeps the larger buffer whatever its length says.
+pub static TMPFS_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn note_capacity(before: usize, after: usize) {
+    if after >= before {
+        TMPFS_BYTES.fetch_add((after - before) as u64, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        TMPFS_BYTES.fetch_sub((before - after) as u64, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// I/O error.
 #[derive(Debug, Default)]
 pub struct FileNode {
@@ -187,7 +208,9 @@ impl FileHandle for TmpHandle {
         let mut data = file.data.lock().unwrap();
         let start = offset as usize;
         if start + buf.len() > data.len() {
+            let was = data.capacity();
             data.resize(start + buf.len(), 0);
+            note_capacity(was, data.capacity());
         }
         data[start..start + buf.len()].copy_from_slice(buf);
         Ok(buf.len() as u64)
@@ -285,7 +308,12 @@ impl FileHandle for TmpHandle {
         let Some(file) = &self.file else {
             return Err(Errno::EINVAL);
         };
-        file.data.lock().unwrap().resize(len as usize, 0);
+        {
+            let mut data = file.data.lock().unwrap();
+            let was = data.capacity();
+            data.resize(len as usize, 0);
+            note_capacity(was, data.capacity());
+        }
         Ok(())
     }
 }
@@ -302,7 +330,13 @@ impl FileSystem for TmpFs {
                     }
                     if flags & oflags::O_TRUNC != 0 {
                         if let Some(Node::File(f)) = inner.nodes.get(&path) {
-                            f.data.lock().unwrap().clear();
+                            {
+                                let mut data = f.data.lock().unwrap();
+                                let was = data.capacity();
+                                data.clear();
+                                data.shrink_to_fit();
+                                note_capacity(was, data.capacity());
+                            }
                         }
                     }
                     match inner.nodes.get(&path) {
