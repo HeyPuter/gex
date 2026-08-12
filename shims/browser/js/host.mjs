@@ -640,6 +640,12 @@ export class ProcessHost {
             // message -- and the two have to be separable, because twice now
             // a cost has been attributed to the wrong side of that line.
             `[gex] pid ${pid}: lived ${lived}ms (guest ${m.guestMillis ?? -1}ms)` +
+              // What the runtime still held when the process left. The
+              // worker has posted this all along and nothing printed it,
+              // which is why `apt-get update` running out of address space
+              // took four theories: the number that says so was already
+              // crossing the wire. -1 without GEX_HEAP_COUNTERS=1.
+              (m.heapKib >= 0 ? `, runtime holds ${Math.round(m.heapKib / 1024)} MiB` : '') +
               `, ${m.millis}ms translating ${m.blocks} blocks` +
               // How many of those the closure already had. A run where this
               // is most of `blocks` is not a coverage problem in the static
