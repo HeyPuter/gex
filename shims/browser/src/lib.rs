@@ -1368,6 +1368,10 @@ pub extern "C" fn gex_set_per_miss(n: u32) {
 static ARENA_SPENT: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Bytes in `Jit::pending`, and the longest that queue has ever been.
+static PENDING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PENDING_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// How many times talc has asked the arena for another span, and the largest
 /// allocation that forced one. See #140.
 static HEAP_REFILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1444,7 +1448,7 @@ fn arena_take(len: u64) -> Option<u64> {
         // is worse. A fixed buffer on the stack and `core::fmt` into it
         // touches no allocator at all.
         use core::fmt::Write as _;
-        struct Buf([u8; 448], usize);
+        struct Buf([u8; 768], usize);
         impl core::fmt::Write for Buf {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
                 let room = self.0.len() - self.1;
@@ -1454,7 +1458,11 @@ fn arena_take(len: u64) -> Option<u64> {
                 Ok(())
             }
         }
-        let mut b = Buf([0; 448], 0);
+        // 768, because the report has grown. `write!` into a full buffer
+        // stops silently, and the last thing added is the first thing lost --
+        // the queue high-water mark vanished off the end of a 448-byte one
+        // and read as absent rather than as truncated.
+        let mut b = Buf([0; 768], 0);
         let _ = write!(
             b,
             "[gex] the arena cannot grow: wanted {len} at {at:#x}, ceiling \
@@ -1463,8 +1471,9 @@ fn arena_take(len: u64) -> Option<u64> {
              the heap right now: {} MiB, of which {} MiB is kept module \
              bytes and {} MiB is files the kernel holds. {} refills, \
              biggest allocation {} (-1 KiB means the counters are off; build \
-             with GEX_HEAP_COUNTERS=1). An abort here is not a panic and \
-             prints nothing of its own.\n",
+             with GEX_HEAP_COUNTERS=1). {} MiB queued for the host in {} \
+             modules at most. An abort here is not a panic and prints \
+             nothing of its own.\n",
             gex_abi::MMAP_TOP,
             ARENA_SPENT[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[1].load(std::sync::atomic::Ordering::Relaxed) >> 20,
@@ -1479,6 +1488,8 @@ fn arena_take(len: u64) -> Option<u64> {
                 >> 20,
             HEAP_REFILLS.load(std::sync::atomic::Ordering::Relaxed),
             HEAP_BIGGEST.load(std::sync::atomic::Ordering::Relaxed),
+            PENDING_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
+            PENDING_MAX.load(std::sync::atomic::Ordering::Relaxed),
         );
         // SAFETY: `warn` reads the bytes and keeps none of them.
         unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
@@ -10688,6 +10699,25 @@ static PENDING: [std::sync::atomic::AtomicU32; 3] =
 
 /// Republish the head of the queue. Call after every push and pop.
 fn publish_pending(h: &Host) {
+    // What the queue is holding, for the arena report -- which runs inside
+    // the allocator's refill path and can neither allocate nor borrow the
+    // host, so it has to be a static and this is the one place with `h` that
+    // every push and the pop both pass through.
+    //
+    // `publish_pending` shows the host only the *front* of the queue. If the
+    // host installs more slowly than the guest queues, or stops, the rest
+    // piles up holding whole module images. An `apt-get update` fills a 2 GiB
+    // arena with ~23 MiB objects it never frees, which is that shape exactly.
+    // O(n) per publish is fine for a diagnostic, and if n is large that is
+    // the finding. See #140.
+    PENDING_BYTES.store(
+        h.jit.pending.iter().map(|m| m.wasm.len() as u64).sum(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    PENDING_MAX.fetch_max(
+        h.jit.pending.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let (p, l, s) = h.jit.pending.front().map_or((0, 0, 0), |m| {
         (m.wasm.as_ptr() as u32, m.wasm.len() as u32, m.slots as u32)
     });
