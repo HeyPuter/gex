@@ -144,6 +144,13 @@ if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | gre
           --release -Z build-std=std,panic_abort --features shared-memory \
           --target-dir target/shared >/dev/null 2>&1; then
         cp target/shared/wasm32-unknown-unknown/release/gex_browser.wasm "$SHARED"
+        # And where the page can fetch it.
+        #
+        # It was built and left in `target/` for as long as the shared build
+        # has existed, so the one artifact that lets a guest thread be a
+        # Worker was the one artifact the site could not load. The page ran
+        # every thread inline instead and nothing said so.
+        cp "$SHARED" "$PUB/gex_browser.shared.wasm"
         echo "shims/browser: $(stat -c%s "$SHARED") bytes (shared memory)"
     else
         # Loudly, and with the reason.

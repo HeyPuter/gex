@@ -112,7 +112,21 @@ if [ "$whole" = all ]; then
 else
     mode="--exhaustive-for $whole"
 fi
-target/release/gexc build --closure --sysroot "$sysroot" --no-shared-memory \
+# A shared memory, because a guest thread is a Worker and two Workers need
+# one memory between them.
+#
+# The `shared` flag of a memory *import* is part of its type, so this is not a
+# runtime choice: a closure built plain and a page that hands it a
+# `SharedArrayBuffer` do not link, and neither does the reverse. The three
+# have to agree -- this, `SEED_URL` in `web/src/runtime.js`, and the `shared`
+# the host passes each Worker -- and while they disagreed the page ran every
+# guest thread inline, which is the only shape anything was ever tested on.
+#
+# Measured before changing it, because a shared memory cannot be relocated and
+# so reserves its maximum up front, once per process: 64 of them at the full
+# `GUEST_MEM_BYTES` maximum allocate without complaint. The reservation is
+# address space, not pages.
+target/release/gexc build --closure --sysroot "$sysroot" \
     $mode --shared-image $withs "$sysroot$program" -o "$work/c.wasm"
 
 mkdir -p "$out"

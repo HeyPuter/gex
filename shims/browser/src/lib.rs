@@ -4342,12 +4342,10 @@ fn park_until_ready() {
     if unsafe { k_present() } == 0 {
         return;
     }
-    // Only when this Worker has nothing else it could run. Threads sharing a
-    // Worker still take turns, and sleeping in a syscall would take the turn
-    // from the sibling that could have made this very wait come true.
-    if !thread_workers() && with_host(|h| h.threads.len() != 1) {
-        return;
-    }
+    // A Worker owns exactly one thread, so there is never a sibling whose
+    // turn this would take. While threads could share a Worker this had to
+    // ask, because sleeping in a syscall would take the turn from the very
+    // thread that could have made the wait come true.
     if with_host(|h| h.threads.iter().any(|t| wait_needs_page(t, &h.kernel))) {
         return;
     }
@@ -5048,14 +5046,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // The kernel has already written the child's context; it
                 // starts at the pc that context carries.
                 let start = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
-                // A Worker of its own, when the host can make one.
+                // A Worker of its own. Always: a thread is a Worker here.
                 //
-                // Both shapes keep the same table entry: `join`, the futexes
-                // and `live_threads` are all counted here whether the thread
-                // runs on this stack or another. What differs is who picks it
-                // up -- `Elsewhere` is the state that says "not me", and
-                // without it two Workers would run the same context.
-                let elsewhere = thread_workers();
+                // The table entry is still this process's -- `join`, the
+                // futexes and `live_threads` are all counted here -- but the
+                // thread runs on another stack, and `Elsewhere` is the state
+                // that says "not me". Without it two Workers would run the
+                // same context.
                 h.threads.push(Thread {
                     kstate: ThreadState {
                         ctx_addr,
@@ -5063,26 +5060,16 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         clear_child_tid,
                     },
                     pc: start,
-                    waiting: if elsewhere {
-                        Waiting::Elsewhere
-                    } else {
-                        Waiting::Runnable
-                    },
+                    waiting: Waiting::Elsewhere,
                     blocked_on: None,
                 });
-                if elsewhere {
-                    stage_thread(tid, ctx_addr, start);
-                    // The stack goes back so the host can see the record and
-                    // start the Worker, exactly as a `fork` does. The parent
-                    // resumes where it was: `clone` returns the tid to it.
-                    set_resume(pc as u64 + 4);
-                    set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
-                    return 1;
-                }
-                // The parent carries straight on, as it does on Linux. The
-                // child waits for the first time the parent gives up the
-                // stack, which is what a safepoint or a blocking call is.
-                0
+                stage_thread(tid, ctx_addr, start);
+                // The stack goes back so the host can see the record and
+                // start the Worker, exactly as a `fork` does. The parent
+                // resumes where it was: `clone` returns the tid to it.
+                set_resume(pc as u64 + 4);
+                set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+                1
             }
             SyscallOutcome::ThreadExit => {
                 h.threads[cur()].waiting = Waiting::Exited;
@@ -5771,31 +5758,19 @@ fn set_current(_h: &mut Host, i: usize) {
 static THREAD: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Whether the host will make a Worker per thread.
-///
-/// Off unless said otherwise, because it needs a memory every Worker can
-/// share -- which is the shared build, and not what a page loads by default.
-/// With it off, `clone` schedules on this Worker's stack as it always did.
-static THREAD_WORKERS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-fn thread_workers() -> bool {
-    THREAD_WORKERS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Say whether this process's threads get Workers of their own.
-///
-/// Told rather than guessed: only the host knows whether the memory it built
-/// is shared and whether it can make a Worker at all.
-#[no_mangle]
-pub extern "C" fn gex_set_thread_workers(on: i32) {
-    THREAD_WORKERS.store(on != 0, std::sync::atomic::Ordering::Relaxed);
-    // Said out loud, because it decides whether two Workers share this
-    // shim's statics and it is set by a message that has been sent to the
-    // wrong field once already. An experiment that turns it off and does not
-    // is an exclusion that never happened.
-    warn_line(&format!("[gex] threads get Workers of their own: {}", on != 0));
-}
+// A thread is a Worker. There is no second shape.
+//
+// There used to be a `THREAD_WORKERS` switch and, behind it, a scheduler that
+// ran a process's threads by turns on one Worker's stack. Both are gone. The
+// two shapes were chosen by whether the memory happened to be shared rather
+// than by anyone deciding, which made the one real threaded program in the
+// Debian rootfs impossible to compare against itself -- and the inline shape
+// was the one nothing was tested on.
+//
+// What that costs: a build whose memory is not a `SharedArrayBuffer` can no
+// longer run a `clone` that asks for a thread. It stages one and the host
+// cannot start it. That is a loud failure rather than a quiet one, which is
+// the trade -- see `gex_thread_stage` and the host's side of it.
 
 fn stage_thread(tid: i32, ctx_addr: u64, pc: u64) {
     THREAD[1].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
@@ -7554,48 +7529,27 @@ fn schedule() -> i32 {
             // context because it happened to be runnable, and the pc that
             // came out was two half-words of two different threads.
             let sig = any_signal(h);
-            if thread_workers() {
-                let i = cur();
-                return if thread_ready(&h.threads[i], now, sig) {
-                    let timed_out = match &h.threads[i].waiting {
-                        Waiting::Futex { parked, .. } => !parked.woken(),
-                        _ => false,
-                    };
-                    // Woken by the signal and not by the wait: ask the same
-                    // question with the signal taken away.
-                    let by_signal = sig && !thread_ready(&h.threads[i], now, false);
-                    Pick::Thread(i, timed_out, by_signal)
-                } else if matches!(h.threads[i].waiting, Waiting::Exited) {
-                    // This Worker's thread is done. The process is not: the
-                    // others are Workers of their own, and whoever joins this
-                    // one is already parked on its futex.
-                    Pick::Over
-                } else {
-                    Pick::Idle
+            let i = cur();
+            if thread_ready(&h.threads[i], now, sig) {
+                let timed_out = match &h.threads[i].waiting {
+                    Waiting::Futex { parked, .. } => !parked.woken(),
+                    _ => false,
                 };
+                // Woken by the signal and not by the wait: ask the same
+                // question with the signal taken away.
+                let by_signal = sig && !thread_ready(&h.threads[i], now, false);
+                Pick::Thread(i, timed_out, by_signal)
+            } else if matches!(h.threads[i].waiting, Waiting::Exited) {
+                // This Worker's thread is done. The process is not: the
+                // others are Workers of their own, and whoever joins this one
+                // is already parked on its futex.
+                Pick::Over
+            } else {
+                // Nothing this Worker owns can run. Everything else in the
+                // process is a Worker the engine is already running, and it
+                // makes its own progress without being switched to.
+                Pick::Idle
             }
-            // Round-robin from the one after the current, so a thread that
-            // yields does not immediately get the stack back.
-            let n = h.threads.len();
-            for step in 1..=n {
-                let i = (cur() + step) % n;
-                if thread_ready(&h.threads[i], now, sig) {
-                    let timed_out = match &h.threads[i].waiting {
-                        Waiting::Futex { parked, .. } => !parked.woken(),
-                        _ => false,
-                    };
-                    let by_signal = sig && !thread_ready(&h.threads[i], now, false);
-                    return Pick::Thread(i, timed_out, by_signal);
-                }
-            }
-            // Nothing in this process can run. Another process might, and
-            // that is no longer this scheduler's problem: every other process
-            // is a Worker the engine is already running, and it will make its
-            // own progress without being switched to.
-            // Everything is asleep or parked with a deadline. There is no
-            // other thread to advance the clock, so spinning is the only way
-            // to reach the earliest one.
-            Pick::Idle
         });
         // A switch installs a process but chooses nothing. Going round again
         // is what picks a thread out of it -- and, crucially, what finishes
@@ -8532,76 +8486,13 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
         }
     }
     }
-    // Leaving wasm is not free -- it is a trap, a JS catch and a re-entry --
-    // so a thread gets several intervals' worth of machine before it is asked
-    // to give it up. The slice is still short enough that a spin loop waiting
-    // on another thread makes progress promptly.
-    const SLICES_PER_SWITCH: u32 = 4;
-    static mut TICK: u32 = 0;
-    let due = unsafe {
-        TICK = TICK.wrapping_add(1);
-        TICK.is_multiple_of(SLICES_PER_SWITCH)
-    };
-    if !due {
-        return;
-    }
-    // A Worker that owns one thread has nobody to hand the stack to.
+    // Preemption is the engine's job now.
     //
-    // The check below asks whether another thread of this process could run,
-    // which is exactly the wrong question once each of them is a Worker: the
-    // answer is yes, and taking it means two Workers on one context. The
-    // engine does the preempting now.
-    if thread_workers() {
-        return;
-    }
-    let switch = with_host(|h| {
-        if h.threads.len() < 2 {
-            return false;
-        }
-        let now = now_ns();
-        let runnable = h.threads.iter().enumerate().any(|(i, t)| {
-            i != cur()
-                && match &t.waiting {
-                    Waiting::Runnable => true,
-                    Waiting::Futex { parked, deadline } => {
-                        parked.woken() || deadline.is_some_and(|d| now >= d)
-                    }
-                    Waiting::Sleep(d) => now >= *d,
-                    Waiting::Read(handle) => handle.poll_readable(),
-                    Waiting::Write(handle) => handle.poll_writable(),
-                    // Only the scheduler proper re-checks these; a safepoint
-                    // switch does not need to.
-                    Waiting::Net(deadline) => deadline.is_some_and(|d| now >= d),
-                    // Running in a Worker of its own, so there is nothing
-                    // here to hand the stack to.
-                    Waiting::Elsewhere => false,
-                    Waiting::Child => false,
-                    Waiting::Accept(socket) => socket.poll_readable(),
-                    Waiting::Exited => false,
-                }
-        });
-        if runnable {
-            if tracing() {
-                trace_line(&format!(
-                    "[gex] preempt t{} at pc={:#x}\n",
-                    cur(), pc as u64
-                ));
-            }
-            // The context's own PC has to be exact too: a plain branch does
-            // not store it, and the next thing to read it -- a signal frame,
-            // a `clone` copying this context -- would otherwise see wherever
-            // the guest last happened to leave it.
-            let a = h.threads[cur()].kstate.ctx_addr;
-            let mut gm = GuestMem::new(guest_bytes());
-            let _ = gm.write_u64(a + ctx::PC as u64, pc as u64);
-            h.threads[cur()].pc = pc as u64;
-            h.threads[cur()].waiting = Waiting::Runnable;
-        }
-        runnable
-    });
-    if switch && schedule() != 0 {
-        trap();
-    }
+    // This used to count safepoints and hand the stack to another thread of
+    // this process every fourth slice. There is no other thread here to hand
+    // it to: each one is a Worker, and the check that asked "could another
+    // thread run?" answered yes about a thread already running somewhere
+    // else -- which put two Workers on one set of registers.
 }
 
 /// A dispatch miss: translate the block at `pc`, and everything reachable

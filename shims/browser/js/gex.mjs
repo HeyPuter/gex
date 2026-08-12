@@ -12,6 +12,25 @@
 // is paid for the moment the process exists. See
 // `gex_abi::GUEST_MEM_INITIAL_BYTES`.
 const GUEST_BYTES = 0xffff0000;
+
+/**
+ * Decode UTF-8 out of guest memory.
+ *
+ * `TextDecoder.decode` refuses a view backed by a `SharedArrayBuffer` --
+ * "The provided ArrayBufferView value must not be shared" -- because the
+ * bytes could change under it mid-decode. Every string the runtime reads out
+ * of a guest is such a view, so with a shared memory the first one thrown is
+ * the first message anything tries to print, and the process dies inside its
+ * own logging.
+ *
+ * A copy is the whole fix. `slice` gives a Uint8Array over an ordinary
+ * buffer; it is only paid when the memory really is shared, which keeps the
+ * plain build exactly as it was.
+ */
+const DECODER = new TextDecoder();
+export function utf8(view) {
+  return DECODER.decode(view.buffer instanceof SharedArrayBuffer ? view.slice() : view);
+}
 const GUEST_INITIAL_BYTES = 0x05000000;
 // The shim's world starts where the guest's ends (`STACK_TOP`); its stack sits
 // at the bottom of that, below its data.
@@ -137,7 +156,7 @@ function slotsNeeded(meta) {
 export class Env {
   /** Called with the bytes of a guest write to fd 1 or 2. */
   write(fd, bytes) {
-    const text = new TextDecoder().decode(bytes);
+    const text = utf8(bytes);
     if (fd === 2) console.error(text);
     else console.log(text);
   }
@@ -299,7 +318,7 @@ export function metadataSection(wasm) {
     const end = i + size;
     if (id === 0) {
       const nameLen = leb();
-      const name = new TextDecoder().decode(wasm.subarray(i, i + nameLen));
+      const name = utf8(wasm.subarray(i, i + nameLen));
       // A copy, not a view.
       //
       // `subarray` shares the module's `ArrayBuffer`, and `postMessage`
@@ -691,7 +710,7 @@ export class Gex {
     const max = 512;
     const p = e.gex_alloc(max) >>> 0;
     const n = e.gex_jit_by_object(p, max) >>> 0;
-    const s = new TextDecoder().decode(this.#bytes().subarray(p, p + n));
+    const s = utf8(this.#bytes().subarray(p, p + n));
     e.gex_free?.(p, max);
     return s;
   }
@@ -784,12 +803,12 @@ export class Gex {
         // reading, and a diagnostic interleaved with the program's output is
         // noise in the one place it must not be.
         debug: (ptr, len) => console.debug(
-          new TextDecoder().decode(
+          utf8(
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
           ).replace(/\n$/, ''),
         ),
         warn: (ptr, len) => console.error(
-          new TextDecoder().decode(
+          utf8(
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
           ).replace(/\n$/, ''),
         ),
@@ -799,7 +818,7 @@ export class Gex {
         // one wasm stack and blocking here would take it.
         net_open: () => (this.#net ? this.#net.open() : 0),
         net_connect: (id, host, len, port) => {
-          const name = new TextDecoder().decode(
+          const name = utf8(
             this.#bytes().subarray(host >>> 0, (host >>> 0) + (len >>> 0)),
           );
           this.#net?.connect(id, name, port);
@@ -1575,7 +1594,7 @@ export class Gex {
       const p = e.gex_alloc(512) >>> 0;
       const n = e.gex_wait_census(p, 512) >>> 0;
       if (n) {
-        const text = new TextDecoder().decode(this.#bytes().slice(p, p + n));
+        const text = utf8(this.#bytes().slice(p, p + n));
         // Only when it has stopped changing. A busy process passes through
         // a dozen waits a second and none of them is interesting; a wedged
         // one says the same thing for ever, which is the whole signal.
@@ -2015,9 +2034,9 @@ export class Gex {
    * is already there and shared. All that crosses is which entry of the
    * thread table the new Worker is to run.
    *
-   * Only ever non-empty when the shim has been told its threads get Workers,
-   * which needs a shared memory; otherwise `clone` schedules on this stack
-   * as it always did and there is nothing here to drain.
+   * Non-empty after any `clone` that asked for a thread. There is no second
+   * shape to fall back on: the shim stages every thread here and the host
+   * runs it in a Worker or the guest does not get one.
    */
   async #drainThread() {
     const e = this.#shim.exports;
@@ -2026,6 +2045,25 @@ export class Gex {
     if (!tid) return;
     const thread = { tid, ctx: e.gex_thread_ctx(), pc: e.gex_thread_pc(), memory: this.#memory };
     e.gex_thread_taken();
+    // A thread needs a memory two Workers can both hold.
+    //
+    // Posting a memory that is not a `SharedArrayBuffer` does not fail: the
+    // structured clone *copies* it, and the thread comes up on its own
+    // private image of the address space. It runs, it writes, and none of it
+    // is visible to the process it belongs to -- a futex the sibling is
+    // parked on is never woken, and a mutex is held by nobody. That is the
+    // quietest possible wrong answer, so it is refused here instead.
+    //
+    // Reached only when a run was built without shared memory. While the
+    // inline scheduler existed this was where it took over; nothing takes
+    // over now, and saying so is the point.
+    if (!(this.#memory?.buffer instanceof SharedArrayBuffer)) {
+      throw new Error(
+        `the guest started thread ${tid} on a memory that is not shared. ` +
+          'A guest thread is a Worker and a Worker needs a SharedArrayBuffer: ' +
+          'serve the page with COOP/COEP and load the shared build.',
+      );
+    }
     if (globalThis.GEX_DEBUG_EXIT) {
       console.error(
         `[gex] thread -> tid ${thread.tid} pc=0x${thread.pc.toString(16)} ` +
@@ -2743,7 +2781,7 @@ export class Gex {
           if (e.gex_object_at) {
             const at = e.gex_alloc(160) >>> 0;
             const n = e.gex_object_at(pc, at, 160) >>> 0;
-            if (n) where = ' in ' + new TextDecoder().decode(this.#bytes().subarray(at, at + n));
+            if (n) where = ' in ' + utf8(this.#bytes().subarray(at, at + n));
           }
           const ctx = e.gex_current_ctx ? e.gex_current_ctx() : 0n;
           // And how full the shim's own heap was. That heap is a fixed region
@@ -2831,7 +2869,7 @@ export class Gex {
                   const mem = this.#kernelSpec.memory;
                   console.error(
                     '[gex] the global kernel panicked: '
-                    + new TextDecoder().decode(new Uint8Array(mem.buffer, at, n)),
+                    + utf8(new Uint8Array(mem.buffer, at, n)),
                   );
                 }
               } catch {
@@ -2844,7 +2882,7 @@ export class Gex {
                 const max = 256;
                 const p = e.gex_alloc(max) >>> 0;
                 const n = e.gex_last_open(p, max) >>> 0;
-                const path = new TextDecoder().decode(this.#bytes().subarray(p, p + n));
+                const path = utf8(this.#bytes().subarray(p, p + n));
                 e.gex_free?.(p, max);
                 if (path) console.error(`[gex] the last path it opened: ${path}`);
               } catch {

@@ -701,6 +701,22 @@ for (const id of list) {
         resolve({ how: 'bad', body: 'nothing reached the canvas' });
       }
       if (statusKind === 'bad') resolve({ how: 'bad', body: text });
+      // The guest's process is gone and what was wanted never appeared.
+      //
+      // Nothing further can print, so waiting out the wall clock buys
+      // nothing and costs the whole wall: an `apt-get update` that dies at
+      // ten seconds reported "timeout" three minutes later, which reads as a
+      // hang and is a failure that already finished. The exit line is the
+      // page's, added so the terminal says whether the process left rather
+      // than leaving a silent tail to be guessed at.
+      //
+      // After the `reached` test above, so a run that printed what was
+      // wanted and *then* exited is a pass. A promise settles once, so the
+      // order is the whole of the precedence.
+      const gone = /\[[\w.+-]+ exited (\d+)\]/.exec(terminal || '');
+      if (gone) {
+        resolve({ how: 'bad', body: `the guest exited ${gone[1]} without printing what was wanted` });
+      }
     };
   });
 

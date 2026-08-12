@@ -95,7 +95,7 @@ function forkTransfer(child) {
 // the site unpacked its rootfs and then sat there. The paths all agreed
 // anyway: this file and `gex.mjs` are siblings under Node, in the flat
 // directory the graphics harness serves, and in the bundle.
-import { Gex, Env } from './gex.mjs';
+import { Gex, Env, utf8 } from './gex.mjs';
 
 const port = await channel();
 
@@ -146,7 +146,7 @@ function hotBlocks(gex) {
   if (!e.gex_hot_blocks) return [];
   const at = e.gex_alloc(4096) >>> 0;
   const n = e.gex_hot_blocks(at, 4096) >>> 0;
-  const text = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, at, n)).trim();
+  const text = utf8(new Uint8Array(gex.memory.buffer, at, n)).trim();
   if (!text) return [];
   return text.split('\n').map((line) => {
     const [pc, count] = line.split(' ');
@@ -154,7 +154,7 @@ function hotBlocks(gex) {
     const nameAt = e.gex_alloc(160) >>> 0;
     const len = e.gex_object_at ? e.gex_object_at(BigInt(pc), nameAt, 160) >>> 0 : 0;
     const where = len
-      ? new TextDecoder().decode(new Uint8Array(gex.memory.buffer, nameAt, len))
+      ? utf8(new Uint8Array(gex.memory.buffer, nameAt, len))
       : pc;
     return `${String(count).padStart(10)}  ${where}`;
   });
@@ -276,7 +276,7 @@ async function handle(msg) {
         // Straight out as well as posted. A Worker that crashes takes its
         // last few messages with it, and the last few are exactly the ones
         // that say why -- the shim's panic goes to fd 2 and then it traps.
-        console.error(new TextDecoder().decode(bytes.slice()));
+        console.error(utf8(bytes.slice()));
       }
       // A page wants text, because it has a terminal to put it in. A command
       // line wants the bytes: `gzip -c` writes a deflate stream to standard
@@ -285,7 +285,7 @@ async function handle(msg) {
       port.post(
         msg.rawOutput
           ? { kind: 'output', fd, bytes: bytes.slice(), lflag: lastLflag }
-          : { kind: 'output', fd, text: new TextDecoder().decode(bytes.slice()), lflag: lastLflag },
+          : { kind: 'output', fd, text: utf8(bytes.slice()), lflag: lastLflag },
       );
     }
     now() {
@@ -465,13 +465,13 @@ async function handle(msg) {
     // For a forked child too: it inherits its parent's *translated* code, but
     // the first thing a shell's child does is `execve`, and what it maps then
     // has never been seen by anyone.
-    // Threads of this process become Workers, when the memory allows it.
-    // Told rather than guessed: the shim cannot see whether its memory is a
-    // `SharedArrayBuffer`, and a `clone` staged for a host that cannot start
-    // a Worker is a thread that never runs.
-    if ((msg.shared || msg.kind === 'thread') && !(msg.inlineThreads ?? msg.opts?.inlineThreads)) {
-      gex.shim.exports.gex_set_thread_workers?.(1);
-    }
+    // Threads of this process are Workers. Always, and so nothing is said
+    // here: the shim has no second shape to be switched into.
+    //
+    // This used to call `gex_set_thread_workers(1)` when the memory was
+    // shared and the run had not asked for `inlineThreads`. Both are gone.
+    // A `clone` on a host that cannot start a Worker now fails where it is
+    // staged instead of quietly running the thread on this stack.
     const recompile = msg.opts?.recompileObjects ?? msg.recompileObjects;
     if (recompile) {
       gex.shim.exports.gex_set_recompile_objects?.(recompile);
@@ -618,7 +618,7 @@ async function handle(msg) {
           const at = ex.gex_alloc(160) >>> 0;
           const n = ex.gex_object_at(pc, at, 160) >>> 0;
           if (n) {
-            where += ` in ${new TextDecoder().decode(
+            where += ` in ${utf8(
               new Uint8Array(gex.memory.buffer, at, n),
             )}`;
           }
@@ -636,7 +636,7 @@ async function handle(msg) {
       if (k?.k_panic_len?.()) {
         const n = k.k_panic_len() >>> 0;
         const at = k.k_panic_ptr() >>> 0;
-        where += ` -- the global kernel panicked: ${new TextDecoder().decode(
+        where += ` -- the global kernel panicked: ${utf8(
           new Uint8Array(msg.kernel.memory.buffer, at, n),
         )}`;
       }

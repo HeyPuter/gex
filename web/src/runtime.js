@@ -14,12 +14,21 @@ const ICANON = 0x2;
 const ECHO = 0x8;
 
 /** Where the built runtime lives, relative to the site root. */
-const SHIM_URL = '/gex/gex_browser.wasm';
-const SEED_URL = '/gex/seed.wasm';
-// The global kernel. `.plain` because each process's own memory is an
-// ordinary `ArrayBuffer` here: a memory import's `shared` flag is part of its
-// type, and a process whose threads are not yet Workers does not need one.
-const KERNEL_URL = '/gex/gex_kernel.plain.wasm';
+// The shared build of the shim too. It imports the guest's memory, so it is
+// the fourth thing whose import type has to agree -- and it had been built
+// into `target/` and never copied anywhere the page could fetch it.
+const SHIM_URL = '/gex/gex_browser.shared.wasm';
+// The shared build, and it has to be the shared one everywhere at once.
+//
+// A memory import's `shared` flag is part of its type, so the seed, the
+// kernel, the closure and the memory the host makes either all say shared or
+// none of them link. That coupling is why this was plain: there was no way to
+// turn threads on for one process, so the page turned them on for nobody and
+// ran every guest thread inline instead -- the shape that was never tested.
+const SEED_URL = '/gex/seed.shared.wasm';
+// The global kernel, likewise: it imports each process's memory, so its
+// import type has to match the memory the process was built with.
+const KERNEL_URL = '/gex/gex_kernel.wasm';
 
 let shimBytes = null;
 let seedBytes = null;
@@ -483,17 +492,22 @@ export async function runProgram(
       // and now that install and translation are 17 of a 57 second
       // `apt-get update`, the rest of it is the only thing left to ask about.
       hot: flag('hot') ? 1 : undefined,
-      // `?inlinethreads=1` keeps a guest's threads on the process's own
-      // Worker instead of giving each one a Worker of its own.
+      // Every process gets a memory two Workers can hold, so a `clone` that
+      // asks for a thread can be given one. `worker.mjs` reads this as
+      // `shared` and passes it to the `Gex` constructor, which is what
+      // decides the `WebAssembly.Memory` it builds.
+      shared: true,
+      // There is no `?inlinethreads=1`. A guest's threads are Workers, and
+      // that is the only shape the shim has.
       //
-      // Both shapes exist already -- a memory that is not shared cannot have
-      // Worker threads and has always run them inline -- and which one a run
-      // gets was decided by the memory rather than by anyone choosing. That
-      // makes the one real threaded program in the Debian rootfs impossible
-      // to compare: liblzma's decoder spawns a worker, and `dpkg-deb` dies of
-      // `free(): invalid pointer` in the browser while the same archive comes
-      // out whole under the native adapter three times for three.
-      inlineThreads: flag('inlinethreads') ? 1 : undefined,
+      // It was a flag while both shapes existed, and which one a run got was
+      // decided by whether the memory happened to be shared rather than by
+      // anyone choosing -- so the one real threaded program in the Debian
+      // rootfs could not be compared against itself. liblzma's decoder spawns
+      // a worker, and `dpkg-deb` dies of `free(): invalid pointer` in the
+      // browser while the same archive comes out whole under the native
+      // adapter three times for three. Keeping one shape is what makes that
+      // question answerable.
       virgl: channel ?? undefined,
       wispUrl: network?.url ?? undefined,
       // The size, but only when there is no terminal to hold it.
