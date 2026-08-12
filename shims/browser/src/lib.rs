@@ -3623,7 +3623,7 @@ fn image_is_ours(h: &Host, idx: usize) -> bool {
     // all, it is the permissive branch.
     {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if tracing() && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
             warn_line(&format!(
                 "[gex] image match: this process is running {:?}, the closure \
                  offers {:?} for library {idx}\n",
@@ -6461,6 +6461,23 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // `execve` rebuilds the image in this memory, not the wasm instance
     // around it -- so the new program can have every library the build
     // covered for nothing. See `CLOSURE_DIRS`.
+    // What this process has to work with when it becomes a new program.
+    //
+    // An exec'd bash lifts 15,307 blocks where pid 1 lifts 6, and the lookup
+    // that should cover an image page -- `gex_closure_owner` -> `image_is_ours`
+    // -- is never reached after an exec, which happens only when
+    // `IMAGE_PAGES` has no entry for the page. So print what this process
+    // actually holds. See #136.
+    if tracing() {
+        let imgs = IMAGE_PAGES.0.borrow().len();
+        let dirs = CLOSURE_DIRS.0.borrow().len();
+        let progs = LIB_PROGRAM.0.borrow().iter().filter(|p| !p.is_empty()).count();
+        warn_line(&format!(
+            "[gex] exec in pid {}: {imgs} image pages, {dirs} closure dirs, \
+             {progs} libraries with a program\n",
+            h.kernel.pid,
+        ));
+    }
     let closure = CLOSURE_DIRS.0.borrow();
     if !closure.is_empty() {
         let mut kept = 0usize;
@@ -6590,7 +6607,7 @@ fn record_shared_slot(h: &mut Host, page: u64, key: u64, base: u32) {
         // the question is answered by the first dozen.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let nth = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if nth < 12 {
+        if tracing() && nth < 12 {
             let n = unsafe { k_slot_len() };
             warn_line(&format!(
                 "[gex] slot store pid={} page={page:#x} key={key:#x} base={base} -> map {n}\n",
@@ -8865,6 +8882,29 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // module this Worker has already installed, so asking again after a
         // real translation costs a lookup and nothing else.
         {
+            // The first few misses of each process, in full.
+            //
+            // An exec'd bash lifts 15,307 blocks where pid 1 lifts 6, and
+            // `image_is_ours` is never reached after an exec even though
+            // `IMAGE_PAGES` holds 245 pages in every process. Either this
+            // path does not consult `gex_closure_owner` for these pages, or
+            // the misses are not landing where they look. This says which.
+            {
+                static NTH: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if tracing() && NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    let addr = page * gex_abi::DISPATCH_PAGE;
+                    let in_images = IMAGE_PAGES.0.borrow().contains_key(&page);
+                    let below = addr < gex_abi::INTERP_BASE;
+                    warn_line(&format!(
+                        "[gex] miss pid={} addr={addr:#x} page={page:#x} \
+                         below_interp={below} in_image_pages={in_images} \
+                         owner={}\n",
+                        h.kernel.pid,
+                        gex_closure_owner(page),
+                    ));
+                }
+            }
             let ident = page_identity(h, page * gex_abi::DISPATCH_PAGE);
             if ident.is_none() {
                 h.jit.reuse_noident += 1;
@@ -9090,7 +9130,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 .filter(|(pg, _)| page_identity(h, *pg * gex_abi::DISPATCH_PAGE).is_some())
                 .count();
             static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            if tracing() && NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
                 warn_line(&format!(
                     "[gex] storing a unit: {named} of {total} pages can be named\n"
                 ));
