@@ -132,8 +132,21 @@ function readStdin() {
 //
 // `shims/browser/build.sh` installs here now, after checking the glue. One
 // artefact, one build, and a harness that tests what ships.
+//
+// `GEX_SHARED=1` picks the shared-memory pair instead. It is not a variation
+// on the same run: a memory import's `shared` flag is part of its type, so
+// the shim, the seed, the global kernel and every closure module have to be
+// the shared ones together or nothing links. That is exactly the
+// configuration the page ships now, and it is the one a fork breaks in --
+// so it needs to be reachable from here, where a cycle is seconds rather
+// than a browser's minute.
+const SHARED = !!process.env.GEX_SHARED;
 const shimWasm = readFileSync(
-  new URL('../../../web/public/gex/gex_browser.wasm', import.meta.url),
+  new URL(
+    SHARED ? '../../../web/public/gex/gex_browser.shared.wasm'
+           : '../../../web/public/gex/gex_browser.wasm',
+    import.meta.url,
+  ),
 );
 
 // The global kernel: the process table, the filesystem and the pipes every
@@ -142,7 +155,11 @@ const shimWasm = readFileSync(
 // without it a program that forks gets as far as the fork and no further.
 let kernel = null;
 try {
-  const path = new URL('../../../web/public/gex/gex_kernel.plain.wasm', import.meta.url);
+  const path = new URL(
+    SHARED ? '../../../web/public/gex/gex_kernel.wasm'
+           : '../../../web/public/gex/gex_kernel.plain.wasm',
+    import.meta.url,
+  );
   kernel = {
     module: await WebAssembly.compile(readFileSync(path)),
     // Four gigabytes, which is all a wasm32 memory can be.
@@ -235,6 +252,10 @@ const host = new ProcessHost({
     // command line is a pipe, and `gzip -c` writes a deflate stream through
     // it that a UTF-8 round trip would fill with U+FFFD.
     rawOutput: true,
+    // Which memory every process gets, and it has to match the artefacts
+    // chosen above. `worker.mjs` reads this as `shared` and hands it to the
+    // `Gex` constructor.
+    shared: SHARED,
     // GEX_CLOSURE names the stem a closure build wrote. Every
     // `<stem>.NN.<name>.wasm` beside it is one library, translated ahead of
     // time; the image module is `<stem>.wasm` and is passed as the guest.

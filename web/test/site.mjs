@@ -370,6 +370,20 @@ const reporter = () =>
 const REPORTER = `
 <script>
 (() => {
+  // debugexit=1 turns on the runtime's own narration of a fork: the
+  // per-region checksums adoptProcess takes, and the step-by-step of
+  // copying, instantiating and mapping the image.
+  //
+  // The page reads globalThis.GEX_DEBUG_EXIT and nothing ever set it, so the
+  // one instrument that says whether a forked child's memory arrived intact
+  // could be reached from Node and not from a browser -- which is where
+  // forks actually break. This script is parsed before the module runs, so
+  // the flag is there when runProgram looks.
+  //
+  // No backticks in this comment. It is inside a template literal, and one
+  // backtick here ends the string and kills the harness at import -- which
+  // the file warns about a hundred lines below and which I did anyway.
+  if (location.search.includes('debugexit=1')) globalThis.GEX_DEBUG_EXIT = true;
   const post = (kind, body) =>
     fetch('/report?kind=' + kind, { method: 'POST', body }).catch(() => {});
   // The page's own reader gives the whole scrollback; the DOM query is the

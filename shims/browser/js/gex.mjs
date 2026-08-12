@@ -620,8 +620,32 @@ export class Gex {
   #wantLibrary = null;
 
   #bytes() {
-    if (!this.#u8 || this.#u8.byteLength === 0) {
-      this.#u8 = new Uint8Array(this.#memory.buffer);
+    // Rebuilt when the memory has grown, not only when it has been detached.
+    //
+    // `byteLength === 0` alone was the test, and it worked because growing a
+    // *plain* `WebAssembly.Memory` detaches the old `ArrayBuffer`: the view
+    // goes to zero length and this notices. A **shared** memory never
+    // detaches. The old `SharedArrayBuffer` stays perfectly valid at its old,
+    // shorter length, so the check never fires and this view stays stale for
+    // the rest of the process's life.
+    //
+    // `#growTo` clears it, so growth from JavaScript was covered. The memory
+    // also grows from inside the shim -- `grow_memory_to`, under `arena_take`
+    // and `extend_arena`, on every guest `mmap` -- and nothing there can
+    // reach this cache. With a plain memory that cost nothing, because the
+    // detach did the invalidating for free.
+    //
+    // What it costs with a shared one: a forked child maps its malloc heap
+    // (glibc asks for 128 MiB and trims to a 64 MiB-aligned span), the shim
+    // grows the memory to cover it, and every later read or write through
+    // this view is bounded by the old length. `slice` above it returns an
+    // empty array -- "WebAssembly.compile(): BufferSource argument is empty"
+    // when that array was a module -- and `subarray` silently reads nothing.
+    // The guest meets it as `free(): invalid pointer` in every process that
+    // forks, while pid 1, which never outgrows the view, is fine.
+    const buf = this.#memory.buffer;
+    if (!this.#u8 || this.#u8.buffer !== buf || this.#u8.byteLength !== buf.byteLength) {
+      this.#u8 = new Uint8Array(buf);
     }
     return this.#u8;
   }
