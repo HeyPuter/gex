@@ -3599,6 +3599,31 @@ export class Gex {
         what = slot >= tabs[tn].length
           ? `past end ${tabs[tn].length}`
           : tabs[tn].get(slot) !== stub ? 'written' : 'stub';
+        // A stub, asked again for exactly this address's span.
+        //
+        // `FILL_ASKED` keys a span once, at the ask, and the fill runs
+        // afterwards with whatever `FILL_FROM` and base it then finds. If
+        // those disagree, the range written and the range marked answered
+        // are different, and every address in the gap is lost for the life
+        // of the process. Refilling here separates that from the module
+        // simply not holding a block at the address: `stub->written` means
+        // the span was mismatched, `stub->stub` means there is nothing to
+        // write. See #136.
+        if (what === 'stub') {
+          const owner = e.gex_closure_owner
+            ? e.gex_closure_owner(BigInt(page >>> 0)) : -1;
+          const inst = owner >= 0 ? this.#lazyClosure[owner]?.instObj : null;
+          const fill = inst?.exports?.[FILL_AT];
+          if (typeof fill === 'function') {
+            const mine = ((pc & 0xfff) >>> 2) & ~31;
+            const said = fill(page, base, mine);
+            what = tabs[tn].get(slot) !== stub
+              ? `stub->written(from=${mine} said=${said ? 1 : 0})`
+              : `stub->stub(from=${mine} said=${said ? 1 : 0})`;
+          } else {
+            what = `stub, owner=${owner} no fill`;
+          }
+        }
       }
       out.push(`${pc.toString(16)}:${what}`);
     }
