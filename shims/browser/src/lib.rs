@@ -7332,8 +7332,17 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
     // explanation attached.
     let why = paused();
     let resume = resume().unwrap_or(0);
+    // Whether this process is over. The run loop asks it before anything
+    // else -- `gex_exited() ? 0 : gex_resume_pc()` -- so a process that has
+    // finished takes the waiting branch however runnable its threads look,
+    // and that is the only reading that fits `paused=0`, a resume address
+    // that is set, and a thread that says runnable.
+    let over = with_host_free(|h| h.exit.is_some()).unwrap_or(false);
     let text = with_host_free(|h| {
-        let mut s = format!("pid {} paused={why:#x} resume={resume:#x}:", h.kernel.pid);
+        let mut s = format!(
+            "pid {} paused={why:#x} resume={resume:#x} exited={over}:",
+            h.kernel.pid
+        );
         for (i, t) in h.threads.iter().enumerate() {
             s.push_str(&format!(" t{i}={}@{:#x}", waiting_name(&t.waiting), t.pc));
             // A name says a thread is in `read`; it does not say what it is

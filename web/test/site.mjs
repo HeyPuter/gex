@@ -400,7 +400,17 @@ const REPORTER = `
   if (toType.length) {
     let last = '';
     let still = 0;
+    // Not before the demo is running. A demo spends its first minutes
+    // fetching a rootfs and a closure, during which the terminal is quiet in
+    // exactly the way this watches for -- so the first lines went into a page
+    // with no guest behind it, and the run timed out having typed into
+    // nothing.
+    let live = false;
+    addEventListener('gex:status', (e) => {
+      if (e.detail.text === 'running') live = true;
+    });
     const feed = setInterval(() => {
+      if (!live) return;
       const now = term();
       still = now === last ? still + 1 : 0;
       last = now;
