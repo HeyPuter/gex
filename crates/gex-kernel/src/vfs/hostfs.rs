@@ -79,6 +79,7 @@ fn convert(md: &std::fs::Metadata) -> Metadata {
         mode: md.mode() & 0o7777,
         ino: md.ino(),
         mtime: md.mtime(),
+        nlink: md.nlink() as u32,
     }
 }
 

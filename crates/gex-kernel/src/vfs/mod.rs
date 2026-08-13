@@ -74,6 +74,12 @@ pub struct Metadata {
     pub mode: u32,
     pub ino: u64,
     pub mtime: i64,
+    /// Hard-link count. A regular file with one name is 1; a directory is
+    /// `2 + immediate subdirectories` (its own `.`, its entry in the parent,
+    /// and a `..` from each child). Reported to the guest as `st_nlink`, which
+    /// tar, cp -a and rsync read to spot hard links, and which `find` reads to
+    /// skip stat'ing the children of a leaf directory.
+    pub nlink: u32,
 }
 
 impl Metadata {
@@ -84,6 +90,7 @@ impl Metadata {
             mode: 0o644,
             ino: 1,
             mtime: 0,
+            nlink: 1,
         }
     }
     pub fn dir() -> Metadata {
@@ -93,6 +100,7 @@ impl Metadata {
             mode: 0o755,
             ino: 1,
             mtime: 0,
+            nlink: 2,
         }
     }
 }
@@ -415,6 +423,7 @@ impl Vfs {
                 mode: 0o777,
                 ino: 1,
                 mtime: 0,
+                nlink: 1,
             });
         }
         fs.metadata(&rel)

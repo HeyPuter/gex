@@ -171,6 +171,28 @@ impl TmpFs {
     fn ino_of(inner: &Inner, path: &str) -> u64 {
         inner.inos.get(path).copied().unwrap_or(1)
     }
+
+    /// A directory's link count: `.`, its name in the parent, and a `..` from
+    /// each immediate subdirectory -- i.e. `2 + immediate subdirs`. An empty
+    /// directory is 2, which is what programs test to decide it has no
+    /// subdirectories without reading it.
+    fn dir_nlink(inner: &Inner, path: &str) -> u32 {
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{path}/")
+        };
+        let subdirs = inner
+            .nodes
+            .iter()
+            .filter(|(k, v)| {
+                matches!(v, Node::Dir)
+                    && k.strip_prefix(&prefix)
+                        .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+            })
+            .count();
+        2 + subdirs as u32
+    }
 }
 
 impl Default for TmpFs {
@@ -226,6 +248,7 @@ impl FileHandle for TmpHandle {
                 mode: 0o644,
                 ino: file.ino,
                 mtime: 0,
+                nlink: 1,
             });
         }
         let inner = self.inner.lock().unwrap();
@@ -237,9 +260,12 @@ impl FileHandle for TmpHandle {
                 mode: inner.modes.get(&self.path).copied().unwrap_or(0o644),
                 ino,
                 mtime: 0,
+                // Every name that maps to this inode is a hard link to it.
+                nlink: inner.inos.values().filter(|&&v| v == ino).count() as u32,
             }),
             Some(Node::Dir) => Ok(Metadata {
                 ino,
+                nlink: TmpFs::dir_nlink(&inner, &self.path),
                 ..Metadata::dir()
             }),
             Some(Node::Symlink(t)) => Ok(Metadata {
@@ -248,6 +274,7 @@ impl FileHandle for TmpHandle {
                 mode: 0o777,
                 ino,
                 mtime: 0,
+                nlink: 1,
             }),
             Some(Node::Socket) => Ok(Metadata {
                 file_type: FileType::Socket,
@@ -255,6 +282,7 @@ impl FileHandle for TmpHandle {
                 mode: 0o755,
                 ino,
                 mtime: 0,
+                nlink: 1,
             }),
             None => Err(Errno::ENOENT),
         }

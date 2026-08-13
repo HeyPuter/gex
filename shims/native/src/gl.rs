@@ -151,6 +151,7 @@ impl FileHandle for GlDevice {
             mode: 0o666,
             ino: 0,
             mtime: 0,
+            nlink: 1,
         })
     }
 

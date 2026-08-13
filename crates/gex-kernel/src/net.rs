@@ -360,6 +360,7 @@ impl FileHandle for Socket {
             mode: 0o600,
             ino: 3,
             mtime: 0,
+            nlink: 1,
         })
     }
 

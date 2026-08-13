@@ -2976,7 +2976,7 @@ impl Kernel {
         Stat {
             ino: md.ino,
             mode: md.file_type.mode_bits() | md.mode,
-            nlink: 1,
+            nlink: md.nlink.max(1),
             size: md.size as i64,
             blksize: 4096,
             blocks: (md.size as i64 + 511) / 512,

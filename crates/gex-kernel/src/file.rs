@@ -455,6 +455,7 @@ impl FileHandle for PipeEnd {
             mode: 0o600,
             ino: 1,
             mtime: 0,
+            nlink: 1,
         })
     }
 

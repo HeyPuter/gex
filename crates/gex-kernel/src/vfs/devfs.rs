@@ -61,6 +61,7 @@ impl FileHandle for DevHandle {
             mode: 0o666,
             ino: 1,
             mtime: 0,
+            nlink: 1,
         })
     }
 
@@ -140,6 +141,7 @@ impl FileSystem for DevFs {
                 mode: 0o666,
                 ino: 1,
                 mtime: 0,
+                nlink: 1,
             });
         }
         if matches!(path, "stdin" | "stdout" | "stderr" | "fd") {
@@ -149,6 +151,7 @@ impl FileSystem for DevFs {
                 mode: 0o777,
                 ino: 1,
                 mtime: 0,
+                nlink: 1,
             });
         }
         Err(Errno::ENOENT)
@@ -295,6 +298,7 @@ mod tests {
                     mode: 0o666,
                     ino: 0,
                     mtime: 0,
+                    nlink: 1,
                 })
             }
             fn ioctl(

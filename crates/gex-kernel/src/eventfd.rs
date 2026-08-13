@@ -107,6 +107,7 @@ impl FileHandle for EventFd {
             mode: 0o600,
             ino: 0,
             mtime: 0,
+            nlink: 1,
         })
     }
 

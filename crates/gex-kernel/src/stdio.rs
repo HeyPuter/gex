@@ -71,6 +71,7 @@ impl FileHandle for StdStream {
             mode: 0o620,
             ino: 1,
             mtime: 0,
+            nlink: 1,
         })
     }
 

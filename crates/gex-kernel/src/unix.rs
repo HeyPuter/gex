@@ -371,6 +371,7 @@ impl FileHandle for UnixSocket {
             mode: 0o755,
             ino: 1,
             mtime: 0,
+            nlink: 1,
         })
     }
 
@@ -802,6 +803,7 @@ impl FileHandle for MemFd {
             mode: 0o600,
             ino: 0,
             mtime: 0,
+            nlink: 1,
         })
     }
 }
@@ -1046,6 +1048,7 @@ impl FileHandle for EpollSet {
             mode: 0o600,
             ino: 0,
             mtime: 0,
+            nlink: 1,
         })
     }
 }
@@ -1202,6 +1205,7 @@ impl crate::vfs::FileHandle for RemoteUnix {
             mode: 0o600,
             ino: 0,
             mtime: 0,
+            nlink: 1,
         })
     }
 

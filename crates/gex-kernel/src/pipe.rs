@@ -428,6 +428,7 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
             mode: 0o600,
             ino: 0,
             mtime: 0,
+            nlink: 1,
         })
     }
 

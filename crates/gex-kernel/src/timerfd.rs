@@ -148,6 +148,7 @@ impl FileHandle for TimerFd {
             mode: 0o600,
             ino: 0,
             mtime: 0,
+            nlink: 1,
         })
     }
 

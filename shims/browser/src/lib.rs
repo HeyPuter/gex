@@ -1002,6 +1002,7 @@ impl FileHandle for StdinQueue {
             mode: 0o600,
             ino: 2,
             mtime: 0,
+            nlink: 1,
         })
     }
 
@@ -1138,6 +1139,7 @@ impl FileHandle for Tty {
             mode: 0o620,
             ino: 3,
             mtime: 0,
+            nlink: 1,
         })
     }
 
@@ -1202,6 +1204,7 @@ impl FileHandle for Console {
             mode: 0o600,
             ino: 1,
             mtime: 0,
+            nlink: 1,
         })
     }
 
