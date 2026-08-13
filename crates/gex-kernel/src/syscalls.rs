@@ -93,6 +93,7 @@ pub mod nr {
     pub const RT_SIGSUSPEND: u64 = 133;
     pub const RT_SIGACTION: u64 = 134;
     pub const RT_SIGPROCMASK: u64 = 135;
+    pub const RT_SIGPENDING: u64 = 136;
     pub const RT_SIGRETURN: u64 = 139;
     pub const SIGALTSTACK: u64 = 132;
     pub const RT_SIGTIMEDWAIT: u64 = 137;
@@ -2081,6 +2082,7 @@ impl Kernel {
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
             nr::RT_SIGTIMEDWAIT => self.sys_rt_sigtimedwait(m, a),
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(m, a[0] as u32, a[1], a[2]),
+            nr::RT_SIGPENDING => self.sys_rt_sigpending(m, a[0]),
             nr::SIGALTSTACK => self.sys_sigaltstack(m, a[0], a[1]),
             // One process and one thread for now, so any target is us.
             // `raise` goes through tkill, which is why it needs its own entry
@@ -2213,6 +2215,16 @@ impl Kernel {
                 mask: m.read_u64(act + 24)?,
             };
             self.signals.set_action(signo, a)?;
+        }
+        Ok(0)
+    }
+
+    /// `rt_sigpending`: the signals raised on this process while blocked, which
+    /// have not been delivered. Written as a `sigset_t` -- a bitmask with bit
+    /// `signal-1` set, which is exactly the shape `Signals::pending` holds.
+    fn sys_rt_sigpending(&self, m: &mut GuestMem<'_>, set: u64) -> SysResult {
+        if set != 0 {
+            m.write_u64(set, self.signals.pending_raw())?;
         }
         Ok(0)
     }
@@ -5312,6 +5324,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::TGKILL => "tgkill",
         nr::RT_SIGACTION => "rt_sigaction",
         nr::RT_SIGPROCMASK => "rt_sigprocmask",
+        nr::RT_SIGPENDING => "rt_sigpending",
         nr::RT_SIGRETURN => "rt_sigreturn",
         nr::SIGALTSTACK => "sigaltstack",
         nr::TIMES => "times",
