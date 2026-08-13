@@ -23,6 +23,7 @@ pub mod proc;
 pub mod signal;
 pub mod stdio;
 pub mod syscalls;
+pub mod timerfd;
 pub mod tty;
 pub mod vfs;
 pub mod unix;

@@ -211,6 +211,20 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn write_room(&self) -> Option<u64> {
         None
     }
+
+    /// Arm or disarm a `timerfd`, returning the previous `(remaining, interval)`
+    /// in nanoseconds. `None` means this handle is not a timerfd, which the
+    /// `timerfd_settime` syscall reports as `EINVAL`.
+    fn timerfd_set(&self, value_ns: u64, interval_ns: u64, abstime: bool) -> Option<(u64, u64)> {
+        let _ = (value_ns, interval_ns, abstime);
+        None
+    }
+
+    /// The current `(remaining, interval)` in nanoseconds of a `timerfd`, or
+    /// `None` when this handle is not one.
+    fn timerfd_get(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// A descriptor that names a file without opening it: `O_PATH`.

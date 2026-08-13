@@ -65,6 +65,9 @@ pub mod nr {
     pub const FUTEX: u64 = 98;
     pub const SET_ROBUST_LIST: u64 = 99;
     pub const GET_ROBUST_LIST: u64 = 100;
+    pub const TIMERFD_CREATE: u64 = 85;
+    pub const TIMERFD_SETTIME: u64 = 86;
+    pub const TIMERFD_GETTIME: u64 = 87;
     pub const NANOSLEEP: u64 = 101;
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_GETRES: u64 = 114;
@@ -1855,6 +1858,9 @@ impl Kernel {
             nr::DUP3 => self.sys_dup3(a[0] as i32, a[1] as i32, a[2]),
             nr::PIPE2 => self.sys_pipe2(m, a[0], a[1]),
             nr::EVENTFD2 => self.sys_eventfd2(a[0], a[1]),
+            nr::TIMERFD_CREATE => self.sys_timerfd_create(a[0], a[1]),
+            nr::TIMERFD_SETTIME => self.sys_timerfd_settime(m, a[0] as i32, a[1], a[2], a[3]),
+            nr::TIMERFD_GETTIME => self.sys_timerfd_gettime(m, a[0] as i32, a[1]),
             nr::GETDENTS64 => self.sys_getdents(m, a[0] as i32, a[1], a[2]),
             nr::FSTAT => self.sys_fstat(m, a[0] as i32, a[1]),
             nr::NEWFSTATAT => self.sys_fstatat(m, a[0] as i32, a[1], a[2], a[3]),
@@ -2590,6 +2596,68 @@ impl Kernel {
             true,
         );
         self.fds.insert(file, cloexec)
+    }
+
+    /// `timerfd_create`: a clock as a descriptor for an event loop to poll.
+    fn sys_timerfd_create(&mut self, _clockid: u64, flags: u64) -> SysResult {
+        let handle = Arc::new(crate::timerfd::TimerFd::new(self.clock));
+        let cloexec = flags & oflags::O_CLOEXEC != 0;
+        let file = OpenFile::new(
+            handle,
+            "anon_inode:[timerfd]".to_string(),
+            (flags & oflags::O_NONBLOCK) | oflags::O_RDONLY,
+            true,
+            false,
+        );
+        self.fds.insert(file, cloexec)
+    }
+
+    /// `timerfd_settime`: arm or disarm the timer from an `itimerspec`.
+    ///
+    /// The struct is two `timespec`s -- `it_interval` then `it_value`, sixteen
+    /// bytes each. `it_value` of zero disarms; the `TFD_TIMER_ABSTIME` flag
+    /// makes it an absolute time on the clock. The old setting is written back
+    /// through `old` when it is non-null, the same shape the kernel returns.
+    fn sys_timerfd_settime(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        fd: i32,
+        flags: u64,
+        new: u64,
+        old: u64,
+    ) -> SysResult {
+        let read_ns = |m: &GuestMem<'_>, at: u64| -> Result<u64, Errno> {
+            let secs = m.read_u64(at)?;
+            let nanos = m.read_u64(at + 8)?;
+            Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
+        };
+        let interval = read_ns(m, new)?;
+        let value = read_ns(m, new + 16)?;
+        let handle = self.fds.get(fd)?.handle.clone();
+        let (rem, prev_int) = handle
+            .timerfd_set(value, interval, flags & crate::timerfd::TFD_TIMER_ABSTIME != 0)
+            .ok_or(Errno::EINVAL)?;
+        if old != 0 {
+            m.write_u64(old, prev_int / 1_000_000_000)?;
+            m.write_u64(old + 8, prev_int % 1_000_000_000)?;
+            m.write_u64(old + 16, rem / 1_000_000_000)?;
+            m.write_u64(old + 24, rem % 1_000_000_000)?;
+        }
+        Ok(0)
+    }
+
+    /// `timerfd_gettime`: write the time to the next expiry and the interval.
+    fn sys_timerfd_gettime(&mut self, m: &mut GuestMem<'_>, fd: i32, curr: u64) -> SysResult {
+        if curr == 0 {
+            return Ok(0);
+        }
+        let handle = self.fds.get(fd)?.handle.clone();
+        let (rem, interval) = handle.timerfd_get().ok_or(Errno::EINVAL)?;
+        m.write_u64(curr, interval / 1_000_000_000)?;
+        m.write_u64(curr + 8, interval % 1_000_000_000)?;
+        m.write_u64(curr + 16, rem / 1_000_000_000)?;
+        m.write_u64(curr + 24, rem % 1_000_000_000)?;
+        Ok(0)
     }
 
     fn sys_pipe2(&mut self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
@@ -5156,6 +5224,9 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::CLOSE => "close",
         nr::PIPE2 => "pipe2",
         nr::EVENTFD2 => "eventfd2",
+        nr::TIMERFD_CREATE => "timerfd_create",
+        nr::TIMERFD_SETTIME => "timerfd_settime",
+        nr::TIMERFD_GETTIME => "timerfd_gettime",
         nr::GETDENTS64 => "getdents64",
         nr::LSEEK => "lseek",
         nr::READ => "read",
