@@ -1,21 +1,16 @@
 //! The virtual filesystem: a mount table over pluggable backends.
 //!
-//! PLAN §8 calls for `tmpfs`, `hostfs`, `opfs`, `httpfs`, `overlayfs` and the
-//! synthetic `procfs`/`devfs`/`sysfs`. The [`FileSystem`] trait is the seam
-//! they all fit into; this module ships the four the native runtime needs
-//! today, and the browser backends implement the same trait.
-//!
-//! Paths are resolved against a mount table by longest prefix, so a guest
-//! sees one namespace regardless of which backend answers.
+//! The [`FileSystem`] trait is the seam every backend fits into; paths are
+//! resolved against the mount table by longest prefix, so a guest sees one
+//! namespace regardless of which backend answers.
 
 use crate::errno::{Errno, SysResult};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod devfs;
-// Passthrough to the host's own filesystem, which only exists where there is
-// one to pass through to. The browser gets `opfs` and `httpfs` instead
-// (PLAN §8); everything above this line is portable.
+// Passthrough to the host's own filesystem; the browser gets `opfs`/`httpfs`
+// instead.
 #[cfg(unix)]
 pub mod hostfs;
 pub mod procfs;
@@ -74,11 +69,8 @@ pub struct Metadata {
     pub mode: u32,
     pub ino: u64,
     pub mtime: i64,
-    /// Hard-link count. A regular file with one name is 1; a directory is
-    /// `2 + immediate subdirectories` (its own `.`, its entry in the parent,
-    /// and a `..` from each child). Reported to the guest as `st_nlink`, which
-    /// tar, cp -a and rsync read to spot hard links, and which `find` reads to
-    /// skip stat'ing the children of a leaf directory.
+    /// Hard-link count, reported as `st_nlink`. A file with one name is 1; a
+    /// directory is `2 + immediate subdirectories`.
     pub nlink: u32,
 }
 
@@ -126,14 +118,9 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         Err(Errno::EBADF)
     }
     fn metadata(&self) -> Result<Metadata, Errno>;
-    /// The id this handle has in the global kernel, when it has one.
-    ///
-    /// `fork` has to give the child the parent's descriptors, and the only
-    /// way it could was to reopen each one by name. A name is not enough:
-    /// `dpkg-deb` builds its tar members in files it creates and unlinks at
-    /// once, so by the time the child looks there is nothing to open, the
-    /// descriptor is quietly missing and the first write to it is `EBADF`.
-    /// An id can be handed over; a path cannot.
+    /// The id this handle has in the global kernel, when it has one. `fork`
+    /// hands the child an id rather than a path, because a file the parent
+    /// created and unlinked (as dpkg-deb does) has no name left to reopen.
     fn remote_id(&self) -> Option<i32> {
         None
     }
@@ -154,26 +141,16 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn is_tty(&self) -> bool {
         false
     }
-    /// Whether a read would return without waiting.
-    ///
-    /// Only streams that can genuinely be empty answer no -- a terminal
-    /// nobody has typed at, a socket with nothing arrived. Everything else
-    /// keeps the default, because a read from a file is never a wait.
-    ///
-    /// This is asked *before* the read rather than turning an `EAGAIN` into a
-    /// wait afterwards, because the two are different answers: a descriptor
-    /// the guest opened `O_NONBLOCK` is supposed to see the `EAGAIN`.
+    /// Whether a read would return without waiting. Only streams that can be
+    /// empty answer no; a file never waits. Asked *before* the read so an
+    /// `O_NONBLOCK` descriptor still sees its own `EAGAIN`.
     fn poll_readable(&self) -> bool {
         true
     }
 
-    /// How many bytes a read would return right now, for `FIONREAD`.
-    ///
-    /// `None` means "work it out from the size and the offset", which is the
-    /// right answer for a file and no answer at all for a socket. glibc's
-    /// resolver asks this to size the buffer it will read a datagram into,
-    /// so a socket that says nothing is available gets read with a
-    /// zero-length buffer and its answer is thrown away.
+    /// How many bytes a read would return now, for `FIONREAD`. `None` means
+    /// "work it out from size and offset", right for a file but no answer for
+    /// a socket -- glibc's resolver sizes its datagram buffer by this.
     fn available(&self) -> Option<u64> {
         None
     }
@@ -184,38 +161,25 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         true
     }
 
-    /// A short description of this handle's state, for a diagnostic.
-    ///
-    /// Two processes waiting on each other is the hardest thing to read from
-    /// outside: a descriptor number says which slot, and the path says
-    /// "socket", and neither says whether the buffer behind it is empty or
-    /// full or which way it points. The handle knows.
+    /// A short description of this handle's state, for a diagnostic: the
+    /// buffer behind a descriptor -- empty, full, which way it points -- that
+    /// the fd number and path cannot show.
     fn debug_state(&self) -> String {
         String::new()
     }
 
-    /// An `ioctl` this handle answers itself.
-    ///
-    /// `None` means "not mine", and the kernel's own handling runs -- which
-    /// is what every ordinary file wants, since the kernel knows about
-    /// terminals and this does not.
-    ///
-    /// Guest memory is passed because an `ioctl` argument is almost always a
-    /// pointer to a structure the device has to read, write, or both. A
-    /// device the host provides -- the graphics device is the one that
-    /// matters -- also uses it to reach the buffers the caller is pointing at,
-    /// which is how a command stream crosses without being copied.
+    /// An `ioctl` this handle answers itself. `None` means "not mine" and the
+    /// kernel's own handling runs. Guest memory is passed because an ioctl arg
+    /// is usually a pointer to a struct the device reads or writes -- and a
+    /// host device reaches the caller's buffers through it uncopied.
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
         let _ = (m, request, arg);
         None
     }
 
-    /// How many bytes a write can take right now, when that is bounded.
-    ///
-    /// `None` means it is not -- a file, a terminal, a socket -- and a write
-    /// there either completes or is the caller's business. A pipe is the case
-    /// that is bounded, and a blocking write larger than its free space has
-    /// to be carried to completion by the syscall layer.
+    /// How many bytes a write can take now, when bounded. `None` means it is
+    /// not (file, terminal, socket). A pipe is bounded, and a blocking write
+    /// larger than its free space is carried to completion by the syscall layer.
     fn write_room(&self) -> Option<u64> {
         None
     }
@@ -235,12 +199,9 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// A descriptor that names a file without opening it: `O_PATH`.
-///
-/// It answers `fstat` and carries its path for the `*at` calls, and refuses
-/// everything else, which is what Linux does. The point of it is that it is
-/// legal on things an ordinary open is not -- a symlink, and in particular a
-/// symlink whose target does not exist.
+/// A descriptor that names a file without opening it: `O_PATH`. Answers
+/// `fstat`, carries its path for `*at` calls, refuses the rest. Legal on
+/// things an ordinary open is not, e.g. a dangling symlink.
 #[derive(Debug)]
 pub struct PathHandle(pub Metadata);
 
@@ -300,13 +261,9 @@ pub trait FileSystem: Send + Sync {
         Err(Errno::EROFS)
     }
 
-    /// Place a node that `stat` reports as a socket.
-    ///
-    /// A UNIX socket bound to a path exists in two places: the socket
-    /// namespace, where `connect` finds it, and the filesystem, where
-    /// everything else does. gex had only the first, so a bound socket was
-    /// invisible -- `test -e /tmp/.X11-unix/X0` said no while the X server
-    /// was listening on exactly that name.
+    /// Place a node that `stat` reports as a socket. A bound UNIX socket must
+    /// exist in the filesystem too, not just the socket namespace, or
+    /// `test -e /tmp/.X11-unix/X0` says no while the X server is listening.
     fn mksocket(&self, path: &str) -> Result<(), Errno> {
         let _ = path;
         Err(Errno::EROFS)

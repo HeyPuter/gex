@@ -2,19 +2,9 @@
 //
 //   node web/test/terminal-input.mjs
 //
-// `runProgram` and `TerminalEnv` are the only parts of the browser path that
-// no other test covers: the shim has its own tests, and node's `run-node.mjs`
-// exercises the same run loop against a pipe. What is untested in between is
-// the line discipline -- the page collects a line, echoes it, and delivers it
-// only when the guest is not doing that itself -- and the promise that parks a
-// guest read until a key arrives.
-//
-// It is worth having a test for exactly because the failure is silent. A
-// keystroke that never reaches the guest looks like a hung program, and a
-// terminal that is not listening looks the same as one that is.
-//
-// So: a fake xterm with a `type()` method, a real BusyBox shell, and a check
-// that what was typed came back out.
+// Covers what no other test does: the line discipline and the promise that
+// parks a guest read until a key arrives. A fake xterm with a `type()` method,
+// a real BusyBox shell, and a check that what was typed came back out.
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -98,11 +88,8 @@ const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 /**
  * Type a command and give back everything it printed.
  *
- * The waiting is on a *fresh prompt*, not on the output, and that is the
- * point. Waiting for a pattern in the output returns on the first line that
- * matches -- so a check against the rest of `stty -a`, which is eight lines,
- * ran against a buffer holding one of them. It failed about half the time and
- * looked exactly like the terminal dropping flags.
+ * Waits on a fresh prompt, not on the output: matching a pattern returns on the
+ * first line, so a multi-line check (`stty -a`) would race its own output.
  */
 async function run(term, cmd, seconds = 60) {
   const mark = term.out.length;
@@ -180,12 +167,9 @@ try {
   await waitFor(term, /second-line/, 'a line typed ahead');
   check(true, 'input typed before the guest reads is not lost');
 
-  // The line discipline, which is the kernel's now and not this page's.
-  //
-  // Erase has two halves and they have to agree: rub the character off the
-  // screen, and take the byte back out of the line. A terminal that echoes
-  // the rub-out and keeps the byte hands the guest `echo xyhello`, which
-  // looks like the shell's fault and is not.
+  // The line discipline, which is the kernel's now, not this page's. Erase has
+  // two halves that must agree: rub the character off the screen and take the
+  // byte back out of the line.
   term.type('echo x');
   term.type('y\x7f\x7fhello-edited\r');
   await waitFor(term, /hello-edited/, 'an edited line');
@@ -210,14 +194,9 @@ try {
   const named = await run(term, 'echo TERM=$TERM');
   check(/TERM=xterm-256color/.test(named), 'TERM names a real terminal');
 
-  // `^C` at a prompt: the terminal shows it, the half-typed line is thrown
-  // away rather than delivered with whatever is typed next, and the shell is
-  // still there.
-  //
-  // Against the *slice*, not the whole buffer. `stty -a` printed `intr = ^C`
-  // a few commands ago, so a wait for `^C` anywhere in the terminal returns
-  // instantly and the check that follows reads a buffer the echo has not
-  // reached yet.
+  // `^C` at a prompt: the terminal shows it, the half-typed line is dropped,
+  // and the shell is still there. Against the slice, not the whole buffer --
+  // `stty -a` already printed `intr = ^C`, so a whole-buffer wait returns early.
   let mark2 = term.out.length;
   term.type('this-is-abandoned\x03');
   for (let i = 0; i < 200 && !/\^C/.test(term.out.slice(mark2)); i += 1) await pause(50);
@@ -229,15 +208,9 @@ try {
     'the abandoned line is not delivered later',
   );
 
-  // And `^C` to a *running* command, which is the one that cannot be done by
-  // handing over a keystroke: nothing is reading, so there is nobody to hand
-  // it to. It has to become SIGINT to the foreground process group.
-  //
-  // `sleep 60` is the whole test: an external command in the foreground
-  // group, nothing reading the terminal, and a minute of patience if the
-  // signal does not arrive. The measurement is *how long* the prompt takes
-  // to come back -- anything near a minute means the command ran to the end
-  // and the interrupt did nothing.
+  // `^C` to a running command: nothing is reading, so it must become SIGINT to
+  // the foreground process group. `sleep 60` is the test -- the prompt coming
+  // back fast means the interrupt landed; near a minute means it did nothing.
   mark2 = term.out.length;
   term.type('sleep 60\r');
   await new Promise((r) => setTimeout(r, 1500));

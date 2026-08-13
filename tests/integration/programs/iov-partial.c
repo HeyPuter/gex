@@ -1,18 +1,7 @@
-/* A vectored read that fills one buffer and finds the next empty.
- *
- * `readv` must report the bytes it took. gex used to propagate the `EAGAIN`
- * from the second vector, discarding the count for bytes it had already
- * consumed from the socket and written into the caller's memory. They are
- * gone: nothing can put them back, and the caller -- told nothing arrived --
- * waits for data it is already holding.
- *
- * That is an X server deadlocking. It reads a request header into the first
- * vector, loses it, and waits forever for a request the client believes it
- * sent. glxgears rendered exactly one frame that way.
- *
- * `writev` has the mirror image: reporting an error after earlier vectors
- * were accepted makes the caller send them a second time.
- */
+/* A vectored read that fills one buffer and finds the next empty: `readv` must
+ * report the bytes it already took, not the `EAGAIN` from the empty second
+ * vector. `writev` has the mirror image -- a partial write must be reported,
+ * not turned into an error the caller retries. */
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>

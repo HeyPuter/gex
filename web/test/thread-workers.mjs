@@ -2,25 +2,17 @@
 //
 //   node web/test/thread-workers.mjs <static-aarch64-program-that-uses-pthreads>
 //
-// This is the other half of "one Worker per process". A process gets a Worker
-// and a memory of its own; its *threads* used to get neither -- `clone` put an
-// entry in a table and the shim scheduled them cooperatively, one at a time,
-// on the single wasm stack a Worker has. Correct, and never more than one core.
+// The other half of "one Worker per process": a thread is a second Worker on
+// the memory the process already has. The shim's state (heap, statics, the
+// `Host` owning the file table and memory map) lives in that memory, so an
+// attaching Worker finds the kernel there; only which thread-table entry it
+// runs is kept per Worker. (Threads used to be scheduled cooperatively on one
+// Worker's single wasm stack -- correct, but never more than one core.)
 //
-// A thread here is a second Worker on the memory the process already has.
-// Nothing is copied: the shim's own state -- its heap, its statics, the
-// `Host` that owns the file table and the memory map -- lives in that same
-// linear memory, so a Worker that attaches to it finds the kernel already
-// there. What cannot be shared is which *entry of the thread table* a Worker
-// is running, and that is the one thing kept per Worker.
-//
-// Three things have to be true and each would break differently:
-//
-//   1. the program's answers are right -- the sums, the TLS, the condition
-//      variable. A thread that ran on the wrong context or lost a futex wake
-//      gets these wrong rather than crashing,
+// Checked, each breaking differently:
+//   1. the program's answers -- sums, TLS, condition variable -- are right,
 //   2. more than one Worker existed, or this tested the old path,
-//   3. the process exits 0, which means every thread was joined.
+//   3. the process exits 0, so every thread was joined.
 import { Worker } from 'node:worker_threads';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -29,9 +21,8 @@ import { ProcessHost } from '../../shims/browser/js/host.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..', '..');
-// The shared variants, and they have to agree: a memory import's `shared`
-// flag is part of its type, so a plain shim will not instantiate against the
-// memory a shared guest module wants, or the other way round.
+// The shared variants: the `shared` flag is part of a memory import's type, so
+// a plain shim will not instantiate against a shared guest module.
 const SHIM = join(ROOT, 'target/wasm32-unknown-unknown/release/gex_browser.shared.wasm');
 const SEED = join(ROOT, 'web/public/gex/seed.shared.wasm');
 const KERNEL = join(ROOT, 'web/public/gex/gex_kernel.wasm');
@@ -59,11 +50,9 @@ const host = new ProcessHost({
   shim,
   guest: seed,
   kernel,
-  // What tells the shim its threads get Workers, and what makes the memory
-  // one they can share.
-  // The heartbeat says where each Worker is every so many safepoints. A run
-  // with several Workers that stops has to say which one stopped and where,
-  // or the only fact available is that nothing came out.
+  // `shared` tells the shim its threads get Workers on a shared memory. The
+  // heartbeat reports where each Worker is every so many safepoints, so a run
+  // that stops can say which Worker stopped.
   extra: {
     shared: true,
     debugExit: !!process.env.GEX_DEBUG_EXIT,

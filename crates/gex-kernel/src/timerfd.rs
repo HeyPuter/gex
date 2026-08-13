@@ -1,24 +1,15 @@
-//! `timerfd`.
-//!
-//! A clock as a descriptor, and the other half of what an event loop reaches
-//! for. libuv arms one `TFD_NONBLOCK|TFD_CLOEXEC` timerfd for its whole timer
-//! heap, sets it to the nearest deadline, and lets `epoll_wait` return it when
-//! it fires; a daemon that schedules work does the same. Without it those
-//! programs fall back to `epoll_wait` timeouts at best and fail at worst.
+//! `timerfd`: a clock as a descriptor, for event loops (libuv arms one per
+//! timer heap and lets `epoll_wait` return it).
 //!
 //! The object is a monotonic count of expirations. `timerfd_settime` arms it
-//! with an initial delay and an optional interval; once the deadline passes it
-//! is readable, and a `read` returns how many times it has fired since the
-//! last read (one for a one-shot, one-or-more for a periodic timer that the
-//! reader fell behind) and clears that count. Readiness is time-based rather
-//! than counter-based -- [`poll_readable`] asks the clock -- which is why the
-//! handle carries a [`ClockFn`] of its own.
+//! with an initial delay and optional interval; a `read` returns how many
+//! times it fired since the last read and clears that count. Readiness is
+//! time-based -- [`poll_readable`] asks the clock -- so the handle carries its
+//! own [`ClockFn`].
 //!
-//! What is NOT wired: a *blocking* read does not wake precisely at the
-//! deadline, because the scheduler only re-checks a parked stream reader when
-//! something else wakes it. The supported path is the one libuv uses --
-//! `TFD_NONBLOCK` plus `epoll` -- where the loop's own `epoll_wait` timeout
-//! carries the timing and the read is a non-blocking drain.
+//! Not wired: a *blocking* read does not wake precisely at the deadline; the
+//! supported path is `TFD_NONBLOCK` plus `epoll`, where the loop's own
+//! `epoll_wait` timeout carries the timing.
 //!
 //! [`poll_readable`]: crate::vfs::FileHandle::poll_readable
 //! [`ClockFn`]: crate::syscalls::ClockFn

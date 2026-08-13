@@ -182,12 +182,10 @@ pub struct FuncBody {
     n_params: u32,
     /// Offsets into `code` of every immediate naming a *local* function.
     ///
-    /// A call to an import is fixed for ever -- every unit declares the same
-    /// imports in the same order -- but a call to another block is an index
-    /// into this module's own functions, and that index moves if the module is
-    /// concatenated with another. Recording the offsets here is what lets the
-    /// merger patch them without decoding an instruction stream: the emitter
-    /// already knows where it wrote them.
+    /// Import calls are fixed for ever, but a call to another block indexes
+    /// this module's own functions and moves when the module is concatenated
+    /// with another. Recording the offsets lets the merger patch them without
+    /// decoding the stream.
     relocs: Vec<u32>,
 }
 
@@ -429,7 +427,6 @@ impl FuncBody {
         self.byte(0x00);
     }
 
-    /// Serialise the body into the code-section entry form.
     /// Encode, and say where in the encoding each local-function immediate
     /// ended up.
     ///
@@ -444,6 +441,7 @@ impl FuncBody {
         (out, relocs.into_iter().map(|r| r + shift).collect())
     }
 
+    /// Serialise the body into the code-section entry form.
     pub fn finish(self) -> Vec<u8> {
         let mut body = Vec::with_capacity(self.code.len() + 16);
         // Run-length encode the local declarations.
@@ -512,33 +510,19 @@ pub struct ElementSegment {
     pub funcs: Vec<u32>,
     /// Filled by a call rather than by instantiation.
     ///
-    /// An active segment writes its funcrefs into the table every time the
-    /// module is instantiated, and a module is instantiated once per guest
-    /// *process* -- a table belongs to an instance, and every process has its
-    /// own. For a closure library that is one table write per block in the
-    /// whole object, repeated for every process, overwhelmingly for code the
-    /// process never runs: `libgcrypt` is 303 MiB of wasm and instantiating
-    /// it cost between 1.2 and 2.2 seconds a process.
-    ///
-    /// Passive segments write nothing at instantiation. The host calls
-    /// `gexfill` when it wants the slots, which is the seam a demand-filled
-    /// table needs.
+    /// An active segment writes its funcrefs on every instantiation, once per
+    /// guest process, mostly for code the process never runs. A passive
+    /// segment writes nothing until the host calls `gexfill` -- the seam a
+    /// demand-filled table needs.
     pub passive: bool,
     /// The guest page this segment covers -- `pc / DISPATCH_PAGE` -- or zero
     /// if it covers no single page.
     ///
-    /// This is what `gexfillat` matches on, and it is deliberately the guest
-    /// page rather than anything about the table. A miss knows the address it
-    /// faulted on and therefore always knows this; it does *not* always know a
-    /// dispatch entry, because an entry only exists once some module of this
-    /// process has claimed the page. Keying the fill on an entry meant a
-    /// process could only ask about pages it had already been told about --
-    /// 109 of them in an `apt-get update` -- and every other miss fell through
-    /// and re-translated code the closure already held, 116,442 blocks of it.
-    ///
-    /// Two sets of blocks for one address range is also why that failed as an
-    /// illegal instruction rather than a clean trap: the directory named one
-    /// and the table held the other.
+    /// What `gexfillat` matches on, deliberately the guest page rather than a
+    /// dispatch entry: a miss always knows the address it faulted on, but not
+    /// always an entry, which exists only once some module has claimed the
+    /// page. Keying on an entry left every other miss re-translating code the
+    /// closure already held.
     pub guest_page: u32,
 }
 
@@ -564,8 +548,8 @@ pub struct Module {
     /// the store keeps wasm and nothing else, and an engine ignores a
     /// section it does not know.
     body_relocs: Vec<Vec<u32>>,
-    /// `(min, max)` in elements, for the single funcref table.
-    /// Locally defined dispatch tables, in index order.
+    /// `(min, max)` in elements for each locally defined dispatch table, in
+    /// index order.
     tables: Vec<(u32, u32)>,
     /// `(min, max)` in pages.
     memory: Option<(u64, u64)>,
@@ -613,15 +597,12 @@ impl Module {
         self.n_func_imports - 1
     }
 
-    /// Import the guest memory instead of declaring one.
     /// Import a memory instead of defining one.
     ///
-    /// A defined memory belongs to its instance, so two stores instantiating
-    /// the same module would get two of them. Every guest thread has to see
-    /// the same bytes, which means the host owns the memory and every module
-    /// imports it.
-    /// `min` is what the host must allocate; `max` is how far it may grow.
-    /// They differ because a process pays for `min` the moment it exists.
+    /// A defined memory belongs to its instance, so two stores would get two
+    /// of them; every guest thread must see the same bytes, so the host owns
+    /// the memory and every module imports it. `min` is what the host must
+    /// allocate, `max` how far it may grow.
     pub fn import_memory(&mut self, module: &str, name: &str, min: u64, max: u64, shared: bool) {
         self.imports.push(Import {
             module: module.to_string(),
@@ -694,13 +675,9 @@ impl Module {
     /// Declare, define and export `gexfillall`, which writes every one of this
     /// module's passive segments in a single call.
     ///
-    /// One call, not one per segment. Filling by segment index costs a
-    /// crossing into wasm for each, and a module has as many as 355 of them:
-    /// `apt-get update` went from 82 seconds to 112 filling that way, because
-    /// what an active segment did inside the engine was now thousands of
-    /// calls from JavaScript. This is what an eager fill should use; the
-    /// per-slot form is for the demand path, where the crossing is paid once
-    /// per page that is actually reached.
+    /// One call, not one per segment: a module has hundreds of segments and a
+    /// crossing into wasm for each is thousands of JS calls. This is what an
+    /// eager fill uses; the per-page form is for the demand path.
     pub fn add_fill_all(&mut self, void_ty: u32) -> Option<u32> {
         let passive: Vec<(u32, u32, u32, u32)> = self
             .elements
@@ -737,20 +714,13 @@ impl Module {
     }
 
     /// Declare, define and export `gexfillat`, which writes whichever of this
-    /// module's passive segments holds a given slot.
+    /// module's passive segments covers a given guest page.
     ///
-    /// The companion to `gexfill`, and the one a demand-filled table wants.
-    /// A dispatch miss knows a slot, not a segment index, and which segment
-    /// holds a slot is the module's business -- the host asking that question
-    /// is how the first attempt at this got a count of sixty-four against
-    /// `libc`'s 355.
-    ///
-    /// A linear scan over the segments: perhaps 355 compares, once per page
-    /// that is actually branched into, against writing every block of the
-    /// object into a table in every process that maps it.
-    ///
-    /// Answers 1 if this module held the slot and filled its segment, 0 if
-    /// the slot is somebody else's.
+    /// The companion to `gexfill` and the one a demand-filled table wants: a
+    /// miss knows a page, not a segment index, and which segment covers it is
+    /// the module's business. A linear scan over the segments, once per page
+    /// actually branched into. Answers 1 if this module filled a segment, 0 if
+    /// the page is somebody else's.
     pub fn add_fill_at(&mut self, ty: u32) -> Option<u32> {
         let passive: Vec<(u32, u32, u32, u32, u32)> = self
             .elements
@@ -781,14 +751,10 @@ impl Module {
         write_u32(&mut b, 2);
         b.push(0x7f); // i32
         for (seg, table, within, len, guest_page) in &passive {
-            // if (page == guest_page)
-            //
-            // Equality on the whole directory entry, not a range test on
-            // `offset`. `offset` is the within-table slot of this segment's
-            // first *translated block*, which is not the page base, and it
-            // carries no table index -- so a range test both missed the page
-            // it wanted and could have matched a different table's. Comparing
-            // entries is exact and is one instruction instead of three.
+            // if (page == guest_page): exact page equality, not a range test
+            // on `offset` -- `offset` is the slot of this segment's first
+            // block, not the page base, and carries no table index, so a range
+            // test could miss the page or match a different table's.
             b.push(op::LOCAL_GET);
             write_u32(&mut b, 0);
             b.push(op::I32_CONST);
@@ -796,19 +762,15 @@ impl Module {
             b.push(0x46); // i32.eq
             b.push(op::IF);
             b.push(0x40); // void
-            // A span around the slot that missed, not the whole page.
-            //
-            // `from` is where the caller wants writing to start, relative to
-            // the page. This segment covers `[within, within + len)` of that
-            // page, so the intersection is what gets written:
+            // A span around the slot that missed, not the whole page: `from`
+            // is where the caller wants writing to start, this segment covers
+            // `[within, within + len)`, so write the intersection
             //
             //     s = max(from, within)
             //     e = min(from + FILL_SPAN, within + len)
             //
-            // and nothing at all when the span misses this segment. Writing
-            // the whole page cost 1,741us on libc, because `table.init`
-            // materialises a `funcref` per entry and the instance's cache
-            // starts empty in every process.
+            // and nothing when the span misses. `table.init` materialises a
+            // funcref per entry, so writing the whole page is dear.
             let span = gex_abi::FILL_SPAN as i32;
             let end = (*within as i32).wrapping_add(*len as i32);
             // s = (from > within) ? from : within
@@ -890,29 +852,14 @@ impl Module {
     /// Declare, define and export `gexfill`, which writes this module's
     /// passive element segments into the tables it imports.
     ///
-    /// A passive segment costs nothing at instantiation, which is the point:
-    /// a module is instantiated once per guest *process*, and an active
-    /// segment writes one table entry per block every time -- for a closure
-    /// library, every block of a whole object, mostly code the process never
-    /// runs. What a passive segment needs instead is somebody to ask for it,
-    /// and `table.init` is the only instruction that can write a funcref into
-    /// an imported table, so the asking has to be done from inside the
-    /// module.
+    /// `table.init` is the only instruction that can write a funcref into an
+    /// imported table, so a passive segment has to be filled from inside the
+    /// module. `gexfill(seg)` fills one segment whole, chosen by a `br_table`,
+    /// and returns 1 if there was such a segment and 0 if `seg` is past the end
+    /// -- the flag is there because the host cannot guess the segment count.
     ///
-    /// `gexfill(seg)` fills one segment whole, chosen by a `br_table` over
-    /// the segments this module has, and returns 1 if there was such a
-    /// segment and 0 if `seg` is past the end. The host calls it for the
-    /// segment covering a page when a branch first reaches that page; a
-    /// segment nobody branches into is never written.
-    ///
-    /// It returns that flag because the count is not a number the host can
-    /// guess. A first attempt had the host loop to sixty-four, which is fine
-    /// for the image module -- one segment -- and wrong for `libc`, which has
-    /// 355: the other 291 were never written, and the guest trapped on
-    /// `unreachable` the first time it branched into one.
-    ///
-    /// Returns the exported function's index, or `None` when the module has
-    /// no passive segments and needs no filling.
+    /// Returns the exported function's index, or `None` when the module has no
+    /// passive segments and needs no filling.
     pub fn add_fill(&mut self, void_ty: u32) -> Option<u32> {
         let passive: Vec<(u32, u32, u32, u32)> = self
             .elements
@@ -960,11 +907,9 @@ impl Module {
         b.push(op::I32_CONST);
         write_i32(&mut b, 0);
         b.push(op::END); // the function
-        // A body carries its own length: the code section writes each one
-        // verbatim, with no size of its own. Leaving it off made the section
-        // 270 bytes shorter than its header claimed, and V8 said so --
-        // "section was shorter than expected size" -- which is a better error
-        // than most, but only after the whole page had failed to boot.
+        // A body carries its own length prefix; the code section writes each
+        // one verbatim. Leaving it off makes the section shorter than its
+        // header claims and the module fails to load.
         let mut sized = Vec::with_capacity(b.len() + 5);
         write_u32(&mut sized, b.len() as u32);
         sized.extend_from_slice(&b);

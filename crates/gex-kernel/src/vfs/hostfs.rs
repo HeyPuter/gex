@@ -90,10 +90,8 @@ struct HostHandle {
 }
 
 impl FileHandle for HostHandle {
-    /// `ftruncate`. Without this the trait's default answered `EINVAL`, which
-    /// is what a caller sees when it truncates a file it has just opened to
-    /// rewrite -- apt does exactly that before hashing a download, and
-    /// reported it as "Unable to truncate to 0".
+    /// `ftruncate`. The trait default answers `EINVAL`; apt truncates a file to
+    /// 0 before hashing a download and reported that as "Unable to truncate".
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         self.file
             .lock()
@@ -191,15 +189,9 @@ impl FileSystem for HostFs {
         opts.read(acc == oflags::O_RDONLY || acc == oflags::O_RDWR)
             .write(want_write);
         if flags & oflags::O_CREAT != 0 {
-            // The guest's mode, but never without owner read and write.
-            //
-            // gex does not enforce permissions -- there is one user and the
-            // guest is root -- so the mode on disk is advisory. The host
-            // process is not root, though, and a file it creates with mode 0
-            // is a file it cannot open again. dpkg does exactly that: it
-            // unpacks into a `.dpkg-new` created with mode 0 so a
-            // half-written binary is never executable, chmods it at the end,
-            // and reopens it in between.
+            // The guest's mode but never without owner rw: gex does not enforce
+            // permissions, but the host process is not root, and a file it
+            // creates mode 0 (as dpkg does for `.dpkg-new`) it cannot reopen.
             opts.create(true).mode(mode | 0o600);
         }
         if flags & oflags::O_EXCL != 0 {
@@ -265,9 +257,8 @@ impl FileSystem for HostFs {
         std::fs::rename(self.host_path(from)?, self.host_path(to)?).map_err(|e| Errno::from_io(&e))
     }
 
-    /// `chmod`, with the same floor as creation: the mode is the guest's
-    /// except that the host must keep being able to read and write what it
-    /// owns on the guest's behalf.
+    /// `chmod`, same floor as creation: the host must keep owner rw on what it
+    /// owns for the guest.
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);
@@ -296,13 +287,8 @@ impl FileSystem for HostFs {
             .map_err(|e| Errno::from_io(&e))
     }
 
-    /// A real socket node, made the only way the standard library can: bind a
-    /// listener and let it go.
-    ///
-    /// Dropping a `UnixListener` closes the descriptor but leaves the node --
-    /// which here is the point, since the guest's own socket is the one that
-    /// will serve it. The alternative is `mknod`, which would mean a libc
-    /// dependency for one call.
+    /// A real socket node, made by binding a `UnixListener` and dropping it,
+    /// which leaves the node. `mknod` would mean a libc dependency for one call.
     fn mksocket(&self, path: &str) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);

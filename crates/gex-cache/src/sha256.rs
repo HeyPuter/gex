@@ -1,8 +1,5 @@
-//! SHA-256, for cache keys.
-//!
-//! Written out rather than pulled in as a dependency: the cache needs exactly
-//! one hash of one byte string, and a content-addressed key is only as good as
-//! its collision resistance, so a fast non-cryptographic hash would not do.
+//! SHA-256, for cache keys. Written out rather than pulled in as a dependency;
+//! a content-addressed key needs the collision resistance.
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,

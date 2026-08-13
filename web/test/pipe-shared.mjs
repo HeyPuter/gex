@@ -2,24 +2,16 @@
 //
 //   node web/test/pipe-shared.mjs
 //
-// A shell pipeline is two processes and a pipe; apt is a process and four
-// method workers, each on a pair of them. Under the snapshot switcher those
-// processes have to share an address space, because a pipe is an `Arc<Pipe>`
-// -- a pointer, and a pointer means a memory. That single fact is most of why
-// the switcher exists.
+// In the global kernel a pipe is a number: the buffer lives in the shared
+// kernel memory, each process's file table holds an id, and the bytes cross by
+// being copied through the process's own memory. So writer and reader can be
+// Workers that share nothing else. (Under the old switcher a pipe was an
+// `Arc<Pipe>` -- a pointer, hence a shared address space -- which was most of
+// why it existed.)
 //
-// In the global kernel a pipe is a *number*. The buffer lives in the memory
-// every Worker instantiates against; each process's file table holds an id.
-// So the writer and the reader can be Workers that share nothing else, and
-// the bytes cross by being copied out of one process's memory and into the
-// other's -- which is what the second imported memory is for.
-//
-// What is checked is the behaviour a pipeline actually depends on:
-//
-//   * bytes written in one address space are read in the other, intact,
-//   * a reader sees nothing waiting before the write and everything after,
-//   * closing the last writer is EOF rather than a block, which is how the
-//     downstream half of `a | b` learns to finish.
+// Checked: bytes written in one address space read intact in the other; a
+// reader sees nothing before the write and everything after; closing the last
+// writer is EOF, not a block, so `a | b` can finish.
 import { Worker } from 'node:worker_threads';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -35,9 +27,8 @@ const bytes = new Uint8Array(readFileSync(KERNEL));
 const GUEST_PAGES = 0xffff0000 / 65536;
 const kernel = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 
-// Where the kernel's per-Worker stacks are. Probed here, from a throwaway
-// instance, because this file makes the memory and can ask before any Worker
-// exists. Every Worker below installs its own slice.
+// Where the kernel's per-Worker stacks are. Probed from a throwaway instance
+// here, before any Worker exists; each Worker below installs its own slice.
 const probe = (await WebAssembly.instantiate(
   await WebAssembly.compile(bytes),
   {
@@ -64,9 +55,8 @@ const WORKER = `
     await WebAssembly.compile(workerData.bytes),
     { env: { memory: workerData.kernel, process: proc } },
   )).exports;
-  // This Worker's own stack in the kernel module. A wasm global belongs to an
-  // instance, so each Worker has a stack pointer of its own -- and wasm-ld
-  // starts every one of them at the same address in the memory they share.
+  // This Worker's own stack. A wasm global belongs to an instance, but wasm-ld
+  // starts every one at the same shared address.
   if (workerData.stackTop) k.__stack_pointer.value = workerData.stackTop | 0;
   const u8 = new Uint8Array(proc.buffer);
   const AT = 0x40000;

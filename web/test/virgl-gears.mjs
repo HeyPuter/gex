@@ -2,29 +2,18 @@
 //
 //   node web/test/virgl-gears.mjs
 //
-// `virgl-guest.mjs` proved the negotiation: a translated aarch64 program
-// asked a page what its GPU could do and got an answer from WebGL 2 rather
-// than from a recording. That is the handshake and only the handshake --
-// nothing had ever been drawn through it.
+// `virgl-guest.mjs` proved the handshake; this proves the drawing. Debian's
+// aarch64 glxgears against Debian's Mesa, with Xvfb, all translated in the page:
+// Mesa's `virgl` driver writes the GPU command stream and virglrenderer (wasm)
+// executes it on the canvas.
 //
-// This is the drawing. The guest is Debian's own aarch64 `glxgears` against
-// Debian's own Mesa, with an `Xvfb` beside it, all of it translated in the
-// page. Mesa's `virgl` Gallium driver writes the command stream it would
-// write to a real GPU, and virglrenderer -- compiled to wasm -- executes it
-// on the canvas.
+// Passes only if both hold, failing differently:
+//   * glxgears prints a frame rate -- Mesa completed frames and got its pixels,
+//   * the renderer reports `presented` -- TRANSFER_GET is a readback, not a
+//     present, so a guest can render and leave the canvas black.
 //
-// Two things have to be true for this to pass, and they fail differently:
-//
-//   * glxgears prints a frame rate. That means Mesa completed frames and got
-//     its pixels back, which is the whole guest half of the chain.
-//   * the renderer reports having presented. TRANSFER_GET is a readback, not
-//     a present, so a guest can render perfectly and leave the canvas black
-//     forever; `presented` counts the blits that put a frame on it.
-//
-// It is slow. A cold run translates Mesa, an X server and glibc through the
-// runtime translator, and that is minutes rather than seconds -- which is
-// exactly the argument for the static recompiler, and is why the budget
-// below is what it is.
+// Slow: a cold run translates Mesa, an X server and glibc, which is minutes --
+// the argument for the static recompiler, and why the budget below is large.
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, rm, copyFile, access, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -97,16 +86,8 @@ addEventListener('error', (e) => say('ERROR at ' + step + ': ' + (e.message || e
 addEventListener('unhandledrejection', (e) =>
   say('REJECTED at ' + step + ': ' + (e.reason?.message || e.reason)));
 
-// Progress is reported from the guest's own writes, not from a timer.
-//
-// A timer cannot work here: the run loop yields to the event loop only when
-// it pauses, and while it is translating Mesa it does not pause for minutes
-// at a time -- so setInterval fired twice, at ten and twenty seconds, and
-// then said nothing for the rest of the run. Silence from a harness is worse
-// than no harness: it cannot tell slow from wedged.
-//
-// The guest writes a line each time it reaches a stage, and those writes come
-// through here.
+// A blocking XHR, so a line lands even when the event loop cannot turn --
+// which is the state the guest's stderr must survive when tracing.
 function syncReport(line) {
   try {
     const x = new XMLHttpRequest();
@@ -120,22 +101,16 @@ let drew = () => {};
 class PageEnv extends Env {
   write(fd, bytes) {
     const text = new TextDecoder().decode(bytes);
-    // When tracing, the guest's stderr goes out synchronously too, so that
-    // it interleaves correctly with the renderer's own lines. Two channels
-    // with different latencies produce a plausible ordering that is not the
-    // real one, and the whole point of this trace is what came last.
+    // When tracing, stderr goes out synchronously too, so it interleaves
+    // correctly with the renderer's lines -- the trace is about what came last.
     if (TRACE && fd === 2) syncReport(text.trimEnd());
     output += text;
     paint();
     for (const line of text.split('\\n')) {
       if (line.trim()) report(line.trim());
-      // glxgears never stops on its own, and the question this answers is
-      // whether it draws at all -- so the first frame rate it prints is the
-      // result, not something to wait past.
-      // glxgears prints a rate every five seconds. The first one is a cold
-      // run -- it counts the frames drawn while Mesa, an X server and glibc
-      // were still being translated a basic block at a time -- so waiting
-      // for a later one is the only way to see sustained speed.
+      // glxgears prints a rate every 5s; the first is a cold run (counted while
+      // Mesa/X/glibc were still translating), so WANT_REPORTS can wait for a
+      // later, sustained one.
       if (/frames in .* seconds/.test(line)) {
         rates.push(line.trim());
         if (rates.length >= WANT_REPORTS) drew(rates.join(' ; '));
@@ -147,18 +122,11 @@ class PageEnv extends Env {
 
 try {
   mark('creating the renderer');
-  // The renderer's diagnostics through this harness's own channel, not the
-  // console. It is a separate wasm module with its own libc and cannot reach
-  // the shim's stderr, and the headless browser's console is unreliable
-  // under load -- four lines of twenty arrived, which reads like the whole
-  // trace and is not.
-  // Delivered synchronously when tracing, with a blocking XMLHttpRequest.
-  //
-  // Everything else in this harness reports through fetch, which needs the
-  // event loop to turn. That is fine until the thing being diagnosed is a
-  // call that does not return: the line naming it is written, queued, and
-  // never sent, so the last thing reported is always the last thing before
-  // the interesting one. A synchronous request is slow and rude and arrives.
+  // The renderer's diagnostics through this channel, not the console (a
+  // separate wasm module, and the headless console drops lines under load).
+  // Synchronous when tracing: a fetch needs the event loop, which a
+  // non-returning call starves, so the last line reported is never the
+  // interesting one. A blocking XHR is slow and rude and arrives.
   const rsend = (s) => syncReport('[virgl] ' + s);
 
   const rlog = [];
@@ -189,15 +157,11 @@ try {
     'GEARS_SECONDS=' + SECONDS + '\\nexport GEARS_SECONDS\\n. /gears.sh\\n');
   output += Object.keys(files).length + ' files in the image\\n';
 
-  // The guest runs in Workers -- one per process, which is what replaced the
-  // snapshot switcher. That matters here more than anywhere: this demo is a
-  // shell that starts an X server in the background and then runs glxgears,
-  // so the process that draws is two forks and an execve away from pid 1.
-  //
-  // The renderer stays on this thread, because it is the thread with the
-  // canvas. What crosses is a SharedArrayBuffer: the drawing process writes
-  // its command stream into it, wakes this page, and blocks on
-  // Atomics.wait until the reply is there.
+  // The guest runs in Workers, one per process (what replaced the switcher):
+  // the drawing process is two forks and an execve from pid 1. The renderer
+  // stays on this thread, with the canvas; the drawing process writes its
+  // command stream into a SharedArrayBuffer, wakes this page, and blocks on
+  // Atomics.wait for the reply.
   const { makeChannel, serveVirgl } = await import('./virgl-bridge.mjs');
   const channel = makeChannel();
   const serve = serveVirgl(renderer, channel);
@@ -233,13 +197,9 @@ try {
   });
 
   mark('running the guest');
-  // A pulse from the page itself, on the clock, owing nothing to the guest.
-  //
-  // It means something different now that the guest is in a Worker: this
-  // thread is free, so these lines continuing proves only that the page is
-  // alive. What they carry -- the renderer's command histogram -- is the
-  // real progress meter, because every one of those commands came from the
-  // guest and crossed through here.
+  // A pulse from the page on the clock. The guest is in a Worker, so this
+  // thread is free and these lines only prove the page is alive -- what matters
+  // is the renderer's command histogram they carry, one per guest command.
   setInterval(() => {
     const at = ((Date.now() - t0) / 1000).toFixed(0);
     post('progress', at + 's | [page] ' + host.pids.length + ' processes | ' +
@@ -289,19 +249,16 @@ const finished = new Promise((r) => (finish = r));
 const server = createServer(async (req, res) => {
   const name = (req.url === '/' ? '/index.html' : req.url).split('?')[0];
   // The page reports rather than being dumped. `--virtual-time-budget` was
-  // the wrong tool: it advances the clock for every timer, so a five-second
-  // sampler burned 1,750 seconds of a half-hour budget in two minutes of real
-  // time and the browser was killed with the X server still starting. Real
-  // time and a report make the run as long as it needs to be, and say where
-  // it is while it lasts.
+  // wrong: it advances the clock per timer, so a sampler burned the budget in
+  // real minutes. Real time plus a report lets the run take as long as it needs.
   if (name === '/report') {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const body = Buffer.concat(chunks).toString();
     const kind = new URL(req.url, 'http://x').searchParams.get('kind');
     if (kind === 'progress') {
-      // Every line, indented under the first. This took the first only, and
-      // silently ate the command histogram it was asked to print.
+      // Every line, indented under the first (taking only the first ate the
+      // command histogram).
       if (!process.env.GEX_QUIET) {
         const [first, ...rest] = body.split('\n');
         console.log(`     ... ${first}`);
@@ -322,10 +279,8 @@ const server = createServer(async (req, res) => {
         : name.endsWith('.tar')
           ? 'application/x-tar'
           : 'text/html';
-    // Cross-origin isolation, because the runtime wants a
-    // `SharedArrayBuffer`: the global kernel's memory is one, and so is a
-    // process whose threads are Workers. Without these headers the
-    // constructor is not there at all.
+    // Cross-origin isolation for SharedArrayBuffer (the kernel memory, and any
+    // process whose threads are Workers); without these the constructor is gone.
     res.writeHead(200, {
       'content-type': type,
       'Cross-Origin-Opener-Policy': 'same-origin',
@@ -346,17 +301,13 @@ const child = spawn(
     '--no-sandbox',
     '--disable-gpu-sandbox',
     '--enable-unsafe-swiftshader',
-    // Without this the page's console goes nowhere. `console.warn` is where
-    // the renderer's own diagnostics come out -- it is a separate wasm
-    // module with its own libc, so it cannot reach the shim's stderr -- and
-    // a trace that is never delivered is worse than no trace.
+    // Without this the page console goes nowhere, and console.warn is where the
+    // renderer's diagnostics come out.
     '--enable-logging=stderr',
     '--v=0',
-    // GEX_PROFILE=1 turns on V8's sampling profiler. It samples from a signal
-    // handler, so it reports where a run is even while the guest holds the
-    // wasm stack and nothing in this harness can say anything -- which is the
-    // one state where every other instrument here is silent by construction.
-    // The log lands in the served directory, next to the page.
+    // GEX_PROFILE=1 turns on V8's sampling profiler: it samples from a signal
+    // handler, so it reports even while the guest holds the wasm stack and
+    // every other instrument here is silent. Log lands in the served directory.
     ...(process.env.GEX_PROFILE
       ? [`--js-flags=--prof --logfile=${process.env.GEX_PROFILE}`]
       : []),

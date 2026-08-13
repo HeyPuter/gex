@@ -1,23 +1,10 @@
 //! Spread a pure map over the machine.
 //!
-//! Static recompilation is two passes over a very large list of independent
-//! items -- lift every block, then generate wasm for every block -- and both
-//! ran on one core. That was invisible while the programs were small and
-//! became the whole cost when they stopped being: Cranelift already uses
-//! every core (once `parallel-compilation` was turned on), so a big object
-//! spent its time with twenty-three of twenty-four idle, waiting for the
-//! passes that feed it.
-//!
-//! The contract is deliberately narrow. `f` must be pure -- the results are
-//! returned in the order the inputs were given, never in completion order --
-//! because both callers produce a wasm module whose bytes are the key of a
-//! content-addressed cache. A translation that varied with thread scheduling
-//! would be correct and would never hit that cache.
+//! `f` must be pure: results come back in input order, never completion order,
+//! because the callers produce wasm whose bytes key a content-addressed cache,
+//! and a translation that varied with thread scheduling would never hit it.
 
 /// How wide to go, honouring `GEX_LIFT_THREADS`.
-///
-/// The override exists to measure this against the serial code it replaced,
-/// and to reproduce a translation bug without the scheduling in the way.
 #[cfg(feature = "parallel")]
 pub fn threads() -> usize {
     match std::env::var("GEX_LIFT_THREADS")
@@ -39,20 +26,16 @@ where
     R: Send,
     F: Fn(&T) -> R + Sync,
 {
-    // Below this the threads cost more than the work does. Most levels of a
-    // breadth-first walk are small; it is the first one -- seeded from a few
-    // thousand symbols, or from every decodable address in the text -- that
-    // is worth spreading.
+    // Below this the threads cost more than the work does.
     const MIN_PARALLEL: usize = 64;
     let threads = threads();
     if threads < 2 || items.len() < MIN_PARALLEL {
         return items.iter().map(f).collect();
     }
 
-    // Several chunks per thread rather than one each: the items are not equal
-    // -- a block that heads a loop drags a whole region into its compilation,
-    // a two-instruction stub does not -- and one chunk per thread leaves the
-    // machine waiting on whichever slice drew the expensive ones.
+    // Several chunks per thread rather than one each: the items are far from
+    // equal, so one chunk per thread leaves the machine waiting on whichever
+    // slice drew the expensive ones.
     let chunk = items.len().div_ceil(threads * 8).max(1);
     let chunks: Vec<&[T]> = items.chunks(chunk).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -73,9 +56,8 @@ where
             })
             .collect();
         for h in handles {
-            // A panic in the lifter or the emitter is a bug in gex, not
-            // something to paper over: let it out rather than quietly
-            // translating less than was asked for.
+            // A panic in the lifter or the emitter is a bug: let it out rather
+            // than quietly translating less than was asked for.
             if let Err(e) = h.join() {
                 std::panic::resume_unwind(e);
             }
@@ -188,13 +170,10 @@ mod tests {
 
 /// A stopwatch that exists only where there is a clock.
 ///
-/// `std::time::Instant::now()` does not merely return something useless on
-/// wasm32-unknown-unknown -- it panics, "time not implemented on this
-/// platform". Timing added to a shared crate for the native build therefore
-/// takes the browser down with it, and on wasm32 a Rust panic is a bare
-/// `unreachable`: what the page sees is `RuntimeError: unreachable`, with no
-/// file, no line and no message. One `Instant::now` in `ModuleBuilder::finish`
-/// broke every runtime translation in the browser and cost a bisect to find.
+/// `std::time::Instant::now()` *panics* on wasm32-unknown-unknown ("time not
+/// implemented on this platform"), and a wasm panic is a bare `unreachable`
+/// with no file, line or message -- so a stray `Instant::now` in shared code
+/// takes the browser down. Hence the target-gated field.
 pub struct Stopwatch(#[cfg(not(target_family = "wasm"))] std::time::Instant);
 
 impl Stopwatch {

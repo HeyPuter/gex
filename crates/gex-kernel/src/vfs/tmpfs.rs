@@ -10,23 +10,9 @@ use crate::fs::oflags;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-/// A file's contents, held separately from any name for it.
-///
-/// This is what makes an open descriptor survive `unlink`, which is not a
-/// nicety: SQLite creates its temporary files, unlinks them immediately and
-/// then writes through the descriptor it still holds. A handle that resolved
-/// its path on every access answered `ENOENT`, which SQLite reports as a disk
-/// Bytes this filesystem is holding, capacity rather than length.
-///
-/// Nothing reported what the kernel keeps, and `apt-get update` dies with
-/// 1,861 MiB live on the shim's heap while the same shell without apt holds
-/// 3 MiB. The files apt writes come to about 100 MB, so if this accounts for
-/// the difference something is keeping many copies, and if it does not the
-/// memory is somewhere else entirely -- pipe buffers being the other
-/// candidate. See task 140.
-///
-/// Capacity, because that is what the allocator is holding: a `Vec` that
-/// grew geometrically keeps the larger buffer whatever its length says.
+/// Bytes tmpfs is holding, summed as `Vec` capacity rather than length: a
+/// buffer that grew geometrically keeps the larger allocation whatever its
+/// length says. For the memory census.
 pub static TMPFS_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn note_capacity(before: usize, after: usize) {
@@ -37,7 +23,9 @@ fn note_capacity(before: usize, after: usize) {
     }
 }
 
-/// I/O error.
+/// A file's contents, held apart from any name so an open descriptor survives
+/// `unlink`: SQLite unlinks its temp files at once and keeps writing through
+/// the descriptor it still holds.
 #[derive(Debug, Default)]
 pub struct FileNode {
     data: Mutex<Vec<u8>>,
@@ -61,16 +49,9 @@ struct Inner {
     nodes: BTreeMap<String, Node>,
     next_ino: u64,
     inos: BTreeMap<String, u64>,
-    /// Modes for the files that are not the 0644 default.
-    ///
-    /// Sparse on purpose: a rootfs is thousands of files and a few hundred
-    /// binaries, and only the binaries differ. Kept because `chmod` used to
-    /// be the trait's default -- "filesystems that do not model permissions
-    /// accept it and do nothing" -- and dpkg does not accept it:
-    ///
-    ///   dpkg: warning: 'sh' not found in PATH or not executable
-    ///
-    /// for a `/bin/sh` that is present, the right size, and 0644.
+    /// Modes for the files that are not the 0644 default. Sparse: only the
+    /// few hundred binaries in a rootfs differ. Needed because dpkg rejects a
+    /// `/bin/sh` whose execute bit was silently dropped.
     modes: BTreeMap<String, u32>,
 }
 
@@ -119,14 +100,9 @@ impl TmpFs {
         inner.nodes.entry(path).or_insert(Node::Dir);
     }
 
-    /// A socket node the host serves.
-    ///
-    /// A guest that binds a socket gets one of these from `bind`; one the
-    /// *host* binds -- the virtio-gpu renderer, at `/tmp/.virgl_test` --
-    /// lived only in the name table, so `connect` found it and `stat` did
-    /// not. Mesa connects without looking, so nothing broke, but anything
-    /// that checks first was told there was no renderer and the demo's own
-    /// script said so on screen.
+    /// A socket node the host serves, e.g. the virtio-gpu renderer at
+    /// `/tmp/.virgl_test`. Must be visible to `stat`, not just `connect`, so
+    /// a program that checks for the renderer before connecting finds it.
     pub fn add_socket(&self, path: &str) {
         let path = path.trim_start_matches('/').to_string();
         let mut inner = self.inner.lock().unwrap();
@@ -461,19 +437,10 @@ impl FileSystem for TmpFs {
 
     fn rmdir(&self, path: &str) -> Result<(), Errno> {
         let mut inner = self.inner.lock().unwrap();
-        // A name that is not there is `ENOENT`; a name that is there and is
-        // not a directory is `ENOTDIR`. Answering `ENOTDIR` to both is what
-        // Linux does not do, and dpkg reads the difference: making sure a
-        // path is absent, it calls `rmdir`, takes `ENOTDIR` to mean "it is a
-        // file", unlinks, gets `ENOENT` -- and that value survives to a
-        // check that fires on anything but `ENOTEMPTY`:
-        //
-        //     unable to securely remove '/var/lib/dpkg/tmp.ci':
-        //       No such file or directory
-        //
-        // which ends every `apt-get install` at the unpack. The directory
-        // dpkg is removing had never been created, which is the ordinary
-        // case and the one it handles.
+        // ENOENT for a missing name, ENOTDIR for a name that is not a
+        // directory -- Linux distinguishes them and dpkg relies on it:
+        // ENOTDIR sends it down its "it is a file" path where a later ENOENT
+        // is fatal and ends `apt-get install` at the unpack.
         match inner.nodes.get(path) {
             Some(Node::Dir) => {}
             Some(_) => return Err(Errno::ENOTDIR),

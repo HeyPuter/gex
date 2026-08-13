@@ -1,13 +1,6 @@
-// Just enough tar to unpack a root filesystem.
-//
-// A rootfs is a few thousand files, and fetching them one at a time would be
-// a few thousand requests. One tar is one request, and the format is simple
-// enough that reading it costs less than a dependency: 512-byte headers, a
-// name, an octal size, and the contents padded to the next block.
-//
-// Handles what GNU tar emits for a directory tree: ustar and the two GNU
-// long-name extensions, plus the `prefix` field, which is how ustar stores a
-// path longer than a hundred characters without an extension at all.
+// Just enough tar to unpack a root filesystem in one request. Handles what GNU
+// tar emits for a directory tree: ustar, the two GNU long-name extensions, and
+// the `prefix` field (how ustar stores a path over 100 characters).
 
 const BLOCK = 512;
 
@@ -44,14 +37,9 @@ export function untar(buf, root = '') {
   const files = Object.create(null);
   const dirs = [];
   const links = Object.create(null);
-  // Only the executable ones. Every file in the guest is 0644 by default, so
-  // what has to survive the tar is the execute bit -- and dpkg checks it:
-  //
-  //   dpkg: warning: 'sh' not found in PATH or not executable
-  //
-  // for a `/bin/sh` that is plainly there. Keeping only the modes that differ
-  // from the default keeps this to the few hundred binaries in a rootfs
-  // rather than an entry per file.
+  // Only the modes that differ from the 0644 default, i.e. the execute bit --
+  // which dpkg checks: "'sh' not found in PATH or not executable" for a
+  // `/bin/sh` that is plainly there. Keeps this to the few hundred binaries.
   const modes = Object.create(null);
   const hard = Object.create(null);
   let off = 0;
@@ -92,13 +80,9 @@ export function untar(buf, root = '') {
       const target = str(b, off + 157, 100);
       if (p) links[p] = target;
     } else if (type === '1') {
-      // A hard link, which is *not* a symlink and does not resolve the same
-      // way: its target is a path relative to the root of the archive, where
-      // a symlink's is relative to the directory the link is in. Treating
-      // the two alike sent `./usr/bin/perl link to ./usr/bin/perl5.36.0` to
-      // `/usr/bin/usr/bin/perl5.36.0`, so `/usr/bin/perl` was never created
-      // -- and every `#!/usr/bin/perl` script in the rootfs then failed as
-      // "not found", naming the script rather than the interpreter.
+      // A hard link's target is relative to the root of the archive, not the
+      // link's directory (a symlink's is). Resolving it like a symlink would
+      // lose `/usr/bin/perl` and break every `#!/usr/bin/perl` script.
       const p = path(name);
       const target = str(b, off + 157, 100);
       if (p && target) hard[p] = `/${target.replace(/^\.\//, '')}`;

@@ -1,8 +1,6 @@
-// Run the browser runtime under Node.
-//
-// The same `gex.mjs` a page would load; Node only supplies the file reads and
-// a console. If this works, the browser path works, because nothing below is
-// Node-specific.
+// Run the browser runtime under Node: the same `gex.mjs` a page loads, with
+// Node supplying the file reads and a console. If this works, the browser path
+// works -- nothing below is Node-specific.
 //
 //   node shims/browser/js/run-node.mjs [opts] <guest.wasm> <program.elf> [args...]
 //
@@ -43,9 +41,8 @@ const rest = [];
       if (eq <= 0) { console.error('--dir wants <guest>=<host>'); process.exit(2); }
       const [guestRoot, hostRoot] = [spec.slice(0, eq), spec.slice(eq + 1)];
       const walk = (guest, host) => {
-        // Unreadable directories are ordinary in a root filesystem --
-        // /usr/lib/ssl/private is mode 0700 and owned by root -- and one of
-        // them must not take the whole run down.
+        // Unreadable directories are ordinary in a rootfs (mode 0700, root),
+        // and one must not take the whole run down.
         let names;
         try {
           names = readdirSync(host);
@@ -54,24 +51,19 @@ const rest = [];
         }
         for (const name of names) {
           const h = `${host}/${name}`, g = `${guest}/${name}`;
-          // A real root filesystem has dangling symlinks in it -- Debian's
-          // has /usr/bin/ld.so pointing at a package that is not installed --
-          // and `stat` follows links, so it throws on them. Skipping is what
-          // a guest sees anyway: the link resolves to nothing there too.
+          // A rootfs has dangling symlinks (Debian's /usr/bin/ld.so), and
+          // `stat` follows links so it throws on them. Skipping matches what a
+          // guest sees: the link resolves to nothing there too.
           let st;
           try {
             st = statSync(h);
           } catch {
             continue;
           }
-          // A directory *symlink* is not descended into. Debian ships
-          // `/usr/bin/X11 -> .`, and `stat` says that is a directory, so this
-          // walked into it and re-read the whole of `/usr/bin` one level
-          // deeper, for ever: the path grew `X11/` per turn until an
-          // uncaught `readFileSync` blew up on a name too long, and took the
-          // whole apt run with it. Following the link buys nothing either --
-          // whatever it points at is already being walked under its real
-          // name.
+          // A directory *symlink* is not descended into: Debian's
+          // `/usr/bin/X11 -> .` reads as a directory, so this walked into it
+          // forever until a too-long path blew up. The target is already
+          // walked under its real name.
           if (st.isDirectory()) {
             let link;
             try {
@@ -110,9 +102,8 @@ if (!guestPath || !elfPath) {
   process.exit(2);
 }
 
-// Everything on stdin, up front -- the browser host has no way to block for
-// more later. Nothing on a terminal, so an interactive run is not left
-// waiting for a pipe that will never close.
+// Everything on stdin up front -- the browser host cannot block for more
+// later. Nothing on a terminal, so an interactive run does not wait forever.
 function readStdin() {
   try {
     return process.stdin.isTTY ? null : readFileSync(0);
@@ -121,25 +112,13 @@ function readStdin() {
   }
 }
 
-// The same file the page fetches, deliberately.
+// The same file the page fetches -- `shims/browser/build.sh` installs it here,
+// so the harness tests what ships rather than a separately-built copy.
 //
-// This used to read `target/wasm32-unknown-unknown/release/gex_browser.wasm`
-// while the page fetched `/gex/gex_browser.wasm` out of `web/public`, and
-// only `web/build-assets.sh` connected the two. So this harness could pass
-// against a shim the demo was not running -- and it did, for hours, while
-// every boot of the page died with "Cannot set properties of undefined"
-// because its copy had been built without `--export=__stack_pointer`.
-//
-// `shims/browser/build.sh` installs here now, after checking the glue. One
-// artefact, one build, and a harness that tests what ships.
-//
-// `GEX_SHARED=1` picks the shared-memory pair instead. It is not a variation
-// on the same run: a memory import's `shared` flag is part of its type, so
-// the shim, the seed, the global kernel and every closure module have to be
-// the shared ones together or nothing links. That is exactly the
-// configuration the page ships now, and it is the one a fork breaks in --
-// so it needs to be reachable from here, where a cycle is seconds rather
-// than a browser's minute.
+// `GEX_SHARED=1` picks the shared-memory pair instead: a memory import's
+// `shared` flag is part of its type, so the shim, seed, kernel and every
+// closure module must be the shared ones together. That is the configuration
+// the page ships and the one a fork breaks in.
 const SHARED = !!process.env.GEX_SHARED;
 const shimWasm = readFileSync(
   new URL(
@@ -149,10 +128,10 @@ const shimWasm = readFileSync(
   ),
 );
 
-// The global kernel: the process table, the filesystem and the pipes every
-// process shares, in a module every Worker instantiates against one shared
-// memory. Optional, because a run of one process needs none of it -- but
-// without it a program that forks gets as far as the fork and no further.
+// The global kernel: the process table, filesystem and pipes every process
+// shares, in a module every Worker instantiates against one shared memory.
+// Optional -- a single-process run needs none of it, but a program that forks
+// gets as far as the fork and no further without it.
 let kernel = null;
 try {
   const path = new URL(
@@ -162,18 +141,10 @@ try {
   );
   kernel = {
     module: await WebAssembly.compile(readFileSync(path)),
-    // Four gigabytes, which is all a wasm32 memory can be.
-    //
-    // The rootfs lives in here -- the filesystem belongs to the kernel, and
-    // every file the host bundles is copied into this memory -- so this
-    // ceiling is the largest rootfs a run can have. At one gigabyte a
-    // complete Debian arm64 image did not fit, and the failure was a bare
-    // `unreachable` out of `rust_oom` with nothing said about why. That is
-    // #91, and it is what stops `apt-get update` running here rather than
-    // anything about apt.
-    //
-    // Raising it costs nothing: `maximum` reserves address space, not pages.
-    // The memory still starts at 128 MiB and grows as files arrive.
+    // Four gigabytes, all a wasm32 memory can be. The rootfs lives here (the
+    // filesystem belongs to the kernel), so this ceiling is the largest rootfs
+    // a run can have -- at one gigabyte a full Debian arm64 image did not fit
+    // (#91). `maximum` reserves address space, not pages, so raising it is free.
     memory: new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true }),
   };
 } catch {
@@ -181,22 +152,11 @@ try {
   // not notice, and one that does will say so when it tries.
 }
 
-// Everything past here is the host, and it is `host.mjs` -- the same file the
-// page uses, with a Node `Worker` in place of a Web one.
-//
-// It used to be a copy: this file ran pid 1 itself, on the main thread, and
-// wired children up one at a time. That was not only duplication. `k_park` is
-// `Atomics.wait`, and a guest that parks on the main thread stops the event
-// loop -- so the loop that starts children, delivers their output and answers
-// their forks stopped exactly when a child was most needed. `bash -c 'echo
-// $(echo hi)'` hung: bash forked and read the pipe, and the process that was
-// going to write it had not been created yet.
-//
-// Pid 1 in a Worker removes the case rather than working around it. Nothing
-// the guest system needs happens on the thread a guest can block, because no
-// guest is on it. It also makes this runner's claim true -- if a program works
-// here the browser path works -- which it was not while the two hosts ran
-// different process models.
+// Everything past here is the host -- `host.mjs`, the same file the page uses,
+// with a Node `Worker` in place of a Web one. Pid 1 runs in a Worker, not on
+// the main thread: `k_park` is `Atomics.wait`, and a guest parking on the main
+// thread would stop the loop that starts its children (`bash -c 'echo $(echo
+// hi)'` hung this way). No guest is on the thread the host runs on.
 const guestWasm = readFileSync(guestPath);
 const elf = readFileSync(elfPath);
 const args = [argv0 ?? elfPath, ...guestArgs];
@@ -210,8 +170,7 @@ function readPins() {
   if (!path) return undefined;
   const out = {};
   for (const line of readFileSync(path, 'utf8').split('\n')) {
-    // `base span path`: three fields, and the span matters as much as the
-    // base -- it is what stops the automatic placer handing out an address
+    // `base span path`: the span stops the placer handing out an address
     // inside a pinned object.
     const f = line.split(' ');
     if (f.length < 3) continue;
@@ -223,11 +182,8 @@ function readPins() {
   return out;
 }
 
-/// Every library module of a closure build, in build order.
-///
-/// Order matters only in that it is the order `gexc` allocated slots in, and
-/// installing them in it keeps the trace readable; the modules themselves are
-/// independent.
+/// Every library module of a closure build, in build order (the order `gexc`
+/// allocated slots in; the modules themselves are independent).
 function readClosure() {
   const stem = process.env.GEX_CLOSURE;
   if (!stem) return undefined;
@@ -248,88 +204,59 @@ const host = new ProcessHost({
   // Merged into every process's start message, because on a real machine
   // every process gets the same of all of this.
   extra: {
-    // The bytes, not a string. A page has a terminal and wants text; a
-    // command line is a pipe, and `gzip -c` writes a deflate stream through
-    // it that a UTF-8 round trip would fill with U+FFFD.
+    // Bytes, not a string: a command line is a pipe, and `gzip -c` writes a
+    // deflate stream that a UTF-8 round trip would fill with U+FFFD.
     rawOutput: true,
-    // Which memory every process gets, and it has to match the artefacts
-    // chosen above. `worker.mjs` reads this as `shared` and hands it to the
-    // `Gex` constructor.
+    // Which memory every process gets; must match the artefacts chosen above.
     shared: SHARED,
-    // GEX_CLOSURE names the stem a closure build wrote. Every
-    // `<stem>.NN.<name>.wasm` beside it is one library, translated ahead of
-    // time; the image module is `<stem>.wasm` and is passed as the guest.
-    //
-    // In `extra` rather than `opts`, so a forked child gets it too. A child
-    // adopts its parent's memory and with it the dispatch *directory*, but
-    // its own dispatch tables belong to its own guest instance and start
-    // empty -- so it has to instantiate the modules itself to have anything
-    // for the directory to point at.
+    // GEX_CLOSURE names the stem a closure build wrote; each
+    // `<stem>.NN.<name>.wasm` is one prebuilt library. In `extra` so a forked
+    // child gets it too: a child's own dispatch tables start empty, so it must
+    // instantiate the modules itself.
     closure: readClosure(),
-    // GEX_NETWORK gives the guest a network made of real TCP sockets, so the
-    // paths above Wisp -- apt's helper, a fetch, a parse -- are exercised here
-    // rather than only in a browser with a proxy configured. Per process, and
-    // inherited: apt does its fetching in a forked helper, and when that was
-    // not carried the one process that needed a network was the only one
-    // without one.
+    // GEX_NETWORK gives the guest a network of real TCP sockets. Inherited:
+    // apt fetches in a forked helper, so the one process needing a network was
+    // the only one without one when this was not carried.
     network: !!process.env.GEX_NETWORK,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
-    // GEX_HEARTBEAT asks the shim to say where the guest is every N safepoints
-    // and every 200 dispatch misses. Nothing else runs while translated code
-    // does, so without it a run that is merely slow cannot be told from one
-    // that is stuck.
+    // GEX_HEARTBEAT: say where the guest is every N safepoints and every 200
+    // dispatch misses, so a slow run can be told from a stuck one.
     heartbeat: process.env.GEX_HEARTBEAT ? Number(process.env.GEX_HEARTBEAT) : 0,
-    // GEX_RECOMPILE_OBJECTS makes the runtime statically recompile each shared
-    // object once it proves hot, instead of meeting it a dispatch miss at a
-    // time. That is what the native host does with `--recompile-objects`, and
-    // it is the feature this project exists for.
-    //
-    // The value is a cap in KiB of mapped text. Eight megabytes is not a
-    // principled number -- it is the largest that works: every one of the 57
-    // libraries in the graphics rootfs is under it, and the one object above
-    // it, Mesa's software rasteriser at 15 MB of text and 471,205 blocks,
-    // brings the run down inside ld.so shortly after it is mapped. See #73.
+    // GEX_RECOMPILE_OBJECTS statically recompiles each shared object once it
+    // proves hot -- the feature this project exists for. The value is a cap in
+    // KiB of mapped text; 8 MB is the largest that works (Mesa's rasteriser
+    // above it brings the run down inside ld.so). See #73.
     recompileObjects: process.env.GEX_RECOMPILE_OBJECTS
       ? Number(process.env.GEX_RECOMPILE_OBJECTS) || 8192
       : 0,
-    // GEX_TRACE is the syscall log. Large -- a run that translates Mesa
-    // produces hundreds of megabytes of it -- so it is for a question already
-    // narrowed to a few seconds of guest time, like which process sent the
-    // signal that ended a run.
-    // GEX_LINK keeps the address space the guest's `ld.so` produced and
-    // hands it to the next process of the same program, which then starts at
-    // its own entry with every relocation already applied.
+    // GEX_LINK keeps the address space the guest's `ld.so` produced and hands
+    // it to the next process of the same program, relocations already applied.
     link: Number(process.env.GEX_LINK || 0),
+    // GEX_TRACE is the syscall log, large enough to want a question already
+    // narrowed to a few seconds of guest time.
     trace: !!process.env.GEX_TRACE,
     traceMisses: !!process.env.GEX_TRACE_MISSES,
-    // GEX_CHECK_SP puts a stack-pointer check at the top of every block the
-    // shim translates from here on. A corrupt `sp` is invisible until
-    // something dereferences it, and by then the guest is deep inside an
-    // innocent function -- #73 ends in an ordinary prologue faulting on its
-    // own first store. This names the block that arrives with the bad value
-    // instead of the one that dies on it.
+    // GEX_CHECK_SP checks `sp` at the top of every block: a corrupt `sp` is
+    // invisible until dereferenced, so this names the block that arrives with
+    // the bad value, not the one that dies on it. See #73.
     checkSp: !!process.env.GEX_CHECK_SP,
-    // GEX_HOT dumps the guest's hottest back edges when the run ends, which is
-    // the browser's answer to the native host's `--sample`. A block-per-
-    // function translation makes a profile of the *host* nearly useless -- it
-    // is all `wasm-function[N]` across thousands of modules -- so the question
-    // "which guest code is hot" needs asking of the guest.
+    // GEX_HOT dumps the guest's hottest back edges on exit -- the browser's
+    // answer to `--sample`, since a host profile is all `wasm-function[N]`.
     hot: !!process.env.GEX_HOT,
     // GEX_NO_INTRINSICS translates glibc's own memcpy/memcmp/memset instead of
-    // serving them, which is the only way to price the substitution.
+    // serving them, the only way to price the substitution.
     noIntrinsics: !!process.env.GEX_NO_INTRINSICS,
-    // GEX_FMA_COUNT reports how many fused multiply-adds crossed out of the
-    // guest module. wasm has no FMA, so each one is a call into the shim's.
+    // GEX_FMA_COUNT: how many fused multiply-adds crossed out of the guest
+    // module. wasm has no FMA, so each is a call into the shim's.
     fmaCount: !!process.env.GEX_FMA_COUNT,
-    // Anything the program is asked to leave behind, read out of its address
-    // space by the Worker that owns it -- this thread has no view of it.
+    // Anything the program leaves behind, read out by the Worker that owns its
+    // address space -- this thread has no view of it.
     extract: extract.map(([guest]) => guest),
   },
   onOutput: (fd, text, pid, m) => {
-    // Through `process.stdout` rather than `writeSync(1, ...)`: this runner is
-    // itself sometimes inside a Worker, and a Worker's fd 1 is the *process's*
-    // fd 1 -- output went straight past the piped stream and interleaved with
-    // the parent's, out of order and unfilterable.
+    // Through `process.stdout`, not `writeSync(1, ...)`: this runner is itself
+    // sometimes inside a Worker, whose fd 1 is the process's fd 1 -- writing it
+    // directly interleaved with the parent's output out of order.
     const bytes = m?.bytes ? Buffer.from(m.bytes) : text;
     const s = fd === 1 ? process.stdout : fd === 2 ? process.stderr : null;
     // Anything above 2 is a real descriptor and still goes to the fd.
@@ -337,26 +264,18 @@ const host = new ProcessHost({
     else writeSync(fd, typeof bytes === 'string' ? Buffer.from(bytes) : bytes);
   },
   onExit: (m, pid) => {
-    // How much of the run was translating, as opposed to running what was
-    // translated. Every process separately, because a program that forks
-    // pays it again -- which is the whole question about whether translating
-    // ahead of time is worth anything.
+    // How much of the run was translating vs. running translated code. Per
+    // process, because a program that forks pays it again.
     if (process.env.GEX_TIME_JIT) {
       process.stderr.write(
-        // `guestMillis` is the whole time this Worker was inside the guest --
-        // loading the image, installing modules, and running. Beside it,
-        // `millis` is only the translator. The two together are what say
-        // whether a slow run is translation or everything else, and until now
-        // the second was computed, posted and thrown away.
+        // `guestMillis` is the whole time inside the guest (load, install,
+        // run); `millis` is only the translator.
         `[gex] pid ${pid}: ${m.guestMillis ?? '?'}ms total, ${m.millis}ms translating ${m.blocks} blocks` +
           (m.installs ? `, ${m.installMs}ms installing ${m.installs} modules` +
             ` (${m.compileMs}ms compile, ${m.instantiateMs}ms instantiate, ${m.growMs}ms grow)` : '') +
           `, worker start ${(m.shimCompileMs ?? 0) + (m.shimInstMs ?? 0) + (m.guestInstMs ?? 0)}ms` + ` (shim ${m.shimCompileMs}c/${m.shimInstMs}i, guest ${m.guestInstMs}i)` +
-          // Where the shared-slot lookup went, when the shim reports it:
-          // pages this process already had, pages the identity map knew,
-          // pages it did not, and pages with no identity at all. The
-          // question these answer is why a forked and exec'd child lifts
-          // its parent's libraries again.
+          // Where the shared-slot lookup went, to say why a forked and exec'd
+          // child lifts its parent's libraries again.
           (m.reuse
             ? `, reuse have=${m.reuse[0]} hit=${m.reuse[1]} miss=${m.reuse[2]} noident=${m.reuse[3]}` +
               ` served=${m.reuse[4]} stored=${m.reuse[5]} refused=${m.reuse[6]} unclaimed=${m.reuse[7]} allmine=${m.reuse[8]}`
@@ -371,21 +290,13 @@ const host = new ProcessHost({
       }
       return;
     }
-    // GEX_TIME_GUEST prints how long the guest itself ran, which is not the
-    // same question as how long this process took.
-    //
-    // A run of statically recompiled perl is about nine seconds of wall clock,
-    // of which two to four is V8 compiling a seventeen-megabyte module before
-    // the guest executes an instruction. Comparing two *codegen* changes
-    // through that total means comparing a quantity where a third of the
-    // signal is module size and V8's compiler, and on a machine with a noisy
-    // neighbour it buries an effect the paired A/B could otherwise resolve.
-    // `tests/ab.sh --metric` reads this line instead of timing the process.
+    // GEX_TIME_GUEST prints how long the guest itself ran, not how long the
+    // process took: a third of the total is V8 compiling the module, which
+    // buries a codegen A/B. `tests/ab.sh --metric` reads this line.
     if (process.env.GEX_TIME_GUEST) {
       process.stderr.write(`[gex] guest ran in ${m.guestMillis}ms\n`);
     }
-    // What this process's memory actually grew to. One memory per process, so
-    // this is the number multiplied by however many processes a run has.
+    // What this process's memory grew to; a run costs this times its process count.
     if (process.env.GEX_DEBUG_EXIT && m.memoryMib !== undefined) {
       process.stderr.write(`[gex] memory ${m.memoryMib} MiB\n`);
     }
@@ -408,9 +319,8 @@ const host = new ProcessHost({
     }
   },
   onMessage: (m, pid) => {
-    // Before the guest has executed an instruction. A process's memory is what
-    // decides how many of them a browser will hold, so it matters whether the
-    // cost is placing the image or running it.
+    // Memory before the guest runs an instruction: whether the cost is placing
+    // the image or running it.
     if (m?.kind === 'loaded' && pid === 1 && process.env.GEX_DEBUG_EXIT) {
       process.stderr.write(`[gex] memory after load: ${m.memoryMib.toFixed(0)} MiB\n`);
     }
@@ -443,13 +353,7 @@ try {
   process.stderr.write(`gex: ${e?.message ?? e}\n`);
   status = 1;
 }
-// `process.exitCode`, not `process.exit`. The guest's output goes through
-// `process.stdout`/`process.stderr` -- it has to, so that this runner works
-// inside a Worker, whose fd 1 is the *process's* -- and those are asynchronous
-// when they are a pipe. `process.exit` does not wait for them, so whatever had
-// not drained was thrown away: `apt update` appeared to stop after its first
-// download, with the rest of its output and its error message both lost, and
-// the run looked like a hang that had exited 0.
-//
-// Setting the code instead lets node finish the writes and leave on its own.
+// `process.exitCode`, not `process.exit`: the guest's output goes through
+// `process.stdout`/`process.stderr` (async when a pipe), and `process.exit`
+// does not wait for them to drain. Setting the code lets node finish the writes.
 process.exitCode = status;

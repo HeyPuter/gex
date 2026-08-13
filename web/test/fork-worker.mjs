@@ -2,23 +2,10 @@
 //
 //   node web/test/fork-worker.mjs <static-aarch64-program-that-forks>
 //
-// This is the switcher's replacement, end to end. There is no snapshot and no
-// switch: the parent keeps running in its Worker, and the child gets a Worker
-// with a *copy* of the parent's mapped memory -- once, at `fork`, rather than
-// twice on every switch for the life of both.
-//
-// What the host has to do is small, which is the point of having moved the
-// shared state out first:
-//
-//   * make a memory and write the parent's regions into it,
-//   * instantiate the shim and the guest module against it,
-//   * `gex_adopt_child(pid, ctx, pc, sp, tls)` -- the child's own Worker
-//     writes the few context words that differ, because the parent must not
-//     touch a context it is still using,
-//   * enter at what that returns.
-//
-// The process table is already shared, so the parent's `wait4` finds the
-// child's status without either of them being switched to.
+// The switcher's replacement: no snapshot, no switch. The parent keeps running
+// in its Worker; the child gets a Worker with a copy of the parent's mapped
+// memory, made once at `fork`. The process table is already shared, so the
+// parent's `wait4` finds the child's status without a switch.
 import { Worker } from 'node:worker_threads';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -29,10 +16,9 @@ const ROOT = join(HERE, '..', '..');
 const SHIM = join(ROOT, 'target/wasm32-unknown-unknown/release/gex_browser.wasm');
 const SEED = join(ROOT, 'web/public/gex/seed.wasm');
 const GEX = join(ROOT, 'shims/browser/js/gex.mjs');
-// The plain variant: these processes each have a memory of their own that is
-// not a SharedArrayBuffer, and a memory import's `shared` flag is part of its
-// type. The kernel's *own* memory is shared in both variants -- that is the
-// one every Worker looks at.
+// The plain variant: each process's memory is not a SharedArrayBuffer (the
+// `shared` flag is part of the import type). The kernel's own memory is shared
+// in both variants -- that is the one every Worker looks at.
 const KERNEL = join(ROOT, 'web/public/gex/gex_kernel.plain.wasm');
 
 const [elfPath] = process.argv.slice(2);
@@ -47,10 +33,9 @@ const shim = new Uint8Array(readFileSync(SHIM));
 const seed = new Uint8Array(readFileSync(SEED));
 const elf = new Uint8Array(readFileSync(elfPath));
 
-// The global kernel: compiled once here and handed to every Worker, against
-// one shared memory. That memory is where the process table lives, so the
-// parent's `wait4` and the child's `exit_group` are talking about the same
-// bytes even though neither can see the other's address space.
+// The global kernel: compiled once and handed to every Worker against one
+// shared memory, where the process table lives -- so the parent's `wait4` and
+// the child's `exit_group` touch the same bytes.
 if (!existsSync(KERNEL)) {
   console.log('skip fork-worker: run shims/kernel/build.sh first');
   process.exit(0);
@@ -96,10 +81,9 @@ function run(child) {
         // make another Worker, and only it has this file.
         async spawnProcess(c) { parentPort.postMessage({ kind: 'fork', child: c }); }
       }
-      // stackTop is this Worker's slice of the global kernel's stack array.
-      // Every Worker's kernel instance has a stack pointer of its own, all
-      // starting at the same address in the memory they share; without a
-      // slice each, two Workers in the kernel write over each other.
+      // This Worker's slice of the kernel's stack array. Every kernel instance
+      // starts its stack pointer at the same shared address, so without a slice
+      // each, two Workers overwrite each other.
       const gex = new Gex(new E(), {
         kernel: { ...workerData.kernel, stackTop: workerData.stackTop },
       });
@@ -109,9 +93,7 @@ function run(child) {
       let entry;
       try {
       if (c) {
-        // Everything a forked process is: the parent's memory, a shim and a
-        // guest module over it, a kernel of its own, and the dispatch slots
-        // the parent's code already branches into.
+        // A forked process: the parent's memory, shim, guest module and kernel.
         entry = await gex.adoptProcess(workerData.shim, workerData.seed, c);
       } else {
         entry = await gex.load(workerData.shim, workerData.seed, workerData.elf,

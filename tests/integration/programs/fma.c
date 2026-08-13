@@ -1,22 +1,8 @@
-/* Fused multiply-add, against the hardware.
- *
- * wasm has no FMA, so gex used to send every guest `fmadd`/`fmsub` out of the
- * translated module to a host function. That call is expensive enough to
- * dominate floating-point code -- nbench's LU decomposition makes seven
- * hundred million of them -- so it is emitted inline now: Dekker's method
- * behind an exponent guard for double precision, and a promote-to-double with
- * round-to-odd for single.
- *
- * Both are exact, and "exact" is the entire claim, so it needs checking
- * against something that has the instruction. Every value below is printed as
- * its bit pattern rather than as a decimal, because a fused multiply-add
- * differs from an unfused one in the last place and `%f` would hide it.
- *
- * The interesting inputs are not the pretty ones. The guard admits zeros by a
- * special case and rejects the extremes, so the fallback path only runs for
- * huge, tiny and non-finite operands -- which is exactly where a wrong guard
- * would go unnoticed if the test used ordinary numbers.
- */
+/* Fused multiply-add against the hardware: fmadd/fmsub/fnmadd must round
+ * exactly once. Every value is printed as its bit pattern, since an FMA
+ * differs from an unfused product in the last place and `%f` would hide it.
+ * Inputs cover the extremes (huge, tiny, non-finite, zeros), where the inline
+ * implementation's exponent guard would show a mistake. */
 #include <stdint.h>
 #include <stdio.h>
 

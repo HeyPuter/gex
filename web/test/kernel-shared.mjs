@@ -2,27 +2,18 @@
 //
 //   node web/test/kernel-shared.mjs
 //
-// This is the architecture the switcher is being replaced by, at its smallest.
+// The architecture that replaced the switcher, at its smallest. One global
+// kernel module: every Worker instantiates it against the same shared memory,
+// so the file table, process table and pipes are the same bytes and a syscall
+// stays a direct call. Each Worker also hands the kernel its own process's
+// memory, shared only with that process's threads -- which is why two processes
+// can no longer collide on library addresses. A guest buffer thus lives where
+// the kernel cannot address it, and `memory.copy` naming both memories reaches
+// it.
 //
-// There is one *global* kernel module. Every Worker instantiates it, and every
-// instance is given the same memory -- a `SharedArrayBuffer` -- so the file
-// table, the process table and the pipes are not copied, messaged or
-// synchronised between processes. They are simply the same bytes. A syscall
-// stays a direct call.
-//
-// Each Worker also hands the kernel *its own process's* memory, as a second
-// import. That memory is not shared with any other process, which is the whole
-// reason the snapshot switcher can go: two processes can no longer put their
-// libraries at the same addresses, so there is nothing to save and restore.
-// A guest buffer therefore lives somewhere the kernel cannot address with a
-// pointer, and `memory.copy` -- naming both memories -- is how it is reached.
-//
-// What is checked here is exactly the three properties everything above will
-// assume:
-//
+// Checked here:
 //   1. two Workers' kernel instances share state (a counter, and a note),
-//   2. neither can see the other's process memory -- both are shared, but a
-//      process's is shared only with its own threads,
+//   2. neither can see the other's process memory,
 //   3. the kernel can pull a buffer out of whichever process called it.
 import { Worker } from 'node:worker_threads';
 import { readFileSync, existsSync } from 'node:fs';
@@ -40,27 +31,18 @@ const bytes = new Uint8Array(readFileSync(KERNEL));
 /** The guest's address space in wasm pages: `GUEST_MEM_BYTES / WASM_PAGE`. */
 const GUEST_PAGES = 0xffff0000 / 65536;
 
-// The one shared memory. Created once, here, and handed to every Worker --
-// which is what "global kernel" means concretely.
-//
-// It must start at least as large as the module's own data and stack, which
-// the linker fixed when it built it; a shared memory also has to declare a
-// maximum, and that maximum is the ceiling on everything the kernel will ever
-// hold -- every process's file table, every pipe's buffer.
+// The one shared memory, created once and handed to every Worker. Its maximum
+// is the ceiling on everything the kernel will ever hold; its initial must
+// cover the module's own data and stack.
 const kernel = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 
 const WORKER = `
   import { parentPort, workerData } from 'node:worker_threads';
-  // Each Worker builds its *own* process memory. Not shared, not seen by
-  // anyone else: this is one guest process's address space.
-  // Shared, not plain: this is one process's address space and every thread
-  // of that process is a Worker running on it. Both memories are shared; what
-  // differs is scope -- the kernel's spans every process, this one spans only
-  // this process's threads.
-  //
-  // The full guest address space, because the kernel module's import declares
-  // it and a memory import's bounds are part of its type. It is reserved, not
-  // committed: what a process has actually touched is what it costs.
+  // Each Worker builds its own process memory: shared (its threads are Workers
+  // on it), but scoped to this process -- the kernel's memory spans every
+  // process, this one only this process's threads. The full guest address
+  // space, because the import's bounds are part of its type; reserved, not
+  // committed, so a process costs what it touches.
   const proc = new WebAssembly.Memory({
     initial: workerData.guestPages, maximum: workerData.guestPages, shared: true,
   });
@@ -127,9 +109,8 @@ if (!seen.yes) {
   fail(`process ${spawned.pid} is missing in the other Worker -- the kernel memory is not shared`);
 }
 
-// 2. And the process memories are *not* shared. A wrote 0xbeef at 0x1000 of
-//    its own; B's 0x1000 must be untouched. If this fails, two guests are
-//    sharing an address space and the whole separation is imaginary.
+// 2. The process memories are not shared: B's 0x1000 is untouched. If this
+//    fails, two guests share an address space and the separation is imaginary.
 const peek = await b.ask({ kind: 'peek', at: 0x1000 }, 'peeked');
 if (peek.byte !== 0) {
   fail(`process B sees ${peek.byte} at an address only A wrote -- the process memories are shared`);

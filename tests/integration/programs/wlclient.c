@@ -1,18 +1,10 @@
-/* A Wayland client that speaks the wire protocol directly.
- *
- * No libwayland: the point is to test gex's compositor without also testing
- * whether a particular libwayland is present, and the protocol is small enough
- * to write by hand. Every message is an object id, then a word holding the
- * opcode in its low half and the byte length in its high half, then arguments,
- * all little-endian and 32-bit aligned.
- *
- * What it does is what any client does. Get the registry, bind the compositor,
- * the shared-memory allocator and the window-management interface, make a
- * surface, give it a toplevel role, allocate a buffer in a `memfd`, draw
- * something recognisable into it, attach it, and commit. The compositor is in
- * the host, so the pixels never leave the guest's address space -- the host
- * reads them where they lie.
- */
+/* A Wayland client that speaks the wire protocol directly (no libwayland), to
+ * test gex's compositor. Each message is an object id, a word holding the
+ * opcode (low half) and byte length (high half), then arguments, all
+ * little-endian and 32-bit aligned. Does what any client does: get the
+ * registry, bind the compositor/shm/xdg_wm_base, make a surface with a toplevel
+ * role, draw into a memfd buffer, attach, and commit. The compositor is in the
+ * host and reads the pixels in place. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

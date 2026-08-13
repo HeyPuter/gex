@@ -1,27 +1,15 @@
-//! The terminal.
+//! The terminal: everything `struct termios` describes -- flags, window size,
+//! foreground process group, and the line discipline that turns keystrokes into
+//! what a program reads.
 //!
-//! Everything a `struct termios` describes and nothing a page can decide for
-//! itself: the flags, the window size, the foreground process group, and the
-//! line discipline that turns keystrokes into what a program reads.
+//! It is one shared object because its state outlives any process: `^C` signals
+//! the foreground group (only the process table knows it), and `stty` in one
+//! process must be visible to the next. In a browser run it lives in the global
+//! kernel module, not in any process's memory (see [`Remote`]).
 //!
-//! It lives here rather than in the page because of what it has to reach. A
-//! `^C` is not an input event -- it is `SIGINT` to the *foreground process
-//! group*, and only the process table knows which processes those are. A
-//! `^D` on an empty line is end of input to whoever is reading, which is not
-//! necessarily the process that set the flags. And `stty` in one process must
-//! be visible to the next, because there is one terminal and its settings
-//! outlive any of them: that is why the page's copy of `c_lflag`, sent along
-//! with each write, could never be more than a guess about echo.
-//!
-//! So there is one of these for the whole system, in the memory every process
-//! shares, and both ends talk to it: the page pushes keystrokes in with
-//! [`Tty::input`] and displays what comes back, and the guest's `ioctl` reads
-//! and writes the same flags the discipline is obeying.
-//!
-//! What is deliberately not modelled: parity and framing errors (`PARMRK`,
-//! `INPCK`, `IGNPAR` -- there is no wire to get them wrong on), the delay bits
-//! in `c_oflag`, modem control beyond answering that the line is up, and
-//! `pty` pairs. `xterm.js` is the terminal, and it is always connected.
+//! Not modelled: parity/framing errors, `c_oflag` delay bits, modem control
+//! beyond "line is up", and `pty` pairs -- `xterm.js` is the terminal and is
+//! always connected.
 
 use std::sync::Mutex;
 
@@ -125,10 +113,9 @@ pub const COOKED: [u8; 60] = {
     t[4] = o[0]; t[5] = o[1]; t[6] = o[2]; t[7] = o[3];
     t[8] = c[0]; t[9] = c[1]; t[10] = c[2]; t[11] = c[3];
     t[12] = l[0]; t[13] = l[1]; t[14] = l[2]; t[15] = l[3];
-    // `c_line` is 0 (N_TTY), and then `c_cc`. Leaving these zero is not
-    // harmless: an interactive shell reads its erase, interrupt and
-    // end-of-file characters from here, and a zero erase character means
-    // backspace does nothing. These are the kernel's own `INIT_C_CC`.
+    // `c_line` is 0 (N_TTY), then `c_cc` -- the kernel's `INIT_C_CC`. Not
+    // harmless to leave zero: a zero erase character means backspace does
+    // nothing.
     //
     //     VINTR ^C   VQUIT ^\   VERASE DEL  VKILL ^U   VEOF ^D
     //     VTIME 0    VMIN 1     VSWTC 0     VSTART ^Q  VSTOP ^S
@@ -150,11 +137,8 @@ pub const TCIFLUSH: i32 = 0;
 pub const TCOFLUSH: i32 = 1;
 pub const TCIOFLUSH: i32 = 2;
 
-/// What one push of keystrokes produced.
-///
-/// Returned rather than acted on, because two of the four things a keystroke
-/// can do reach outside this file: a signal goes to the process table, and
-/// what is echoed goes to whatever is drawing the terminal.
+/// What one push of keystrokes produced. Returned rather than acted on: signals
+/// go to the process table and echo goes to whatever draws the terminal.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Input {
     /// Bytes a reader may now take.
@@ -174,8 +158,7 @@ pub struct Input {
 
 struct State {
     termios: [u8; 60],
-    /// `TIOCGLCKTRMIOS`: which bits a caller may not change. All-zero, which
-    /// is "nothing is locked", and is what anybody who asks wants to hear.
+    /// `TIOCGLCKTRMIOS`: locked bits. All-zero -- nothing is locked.
     locked: [u8; 60],
     /// Rows, columns, and the pixel dimensions nobody fills in but `resize`
     /// asks for.
@@ -248,9 +231,7 @@ impl State {
             out.push(b'\t');
             return 1;
         }
-        // A control character is shown as `^X` when `ECHOCTL` says so, and
-        // otherwise sent through -- which for `^[` is how a program that
-        // wants the escape sequence on screen gets it.
+        // Shown as `^X` when `ECHOCTL` is set, else sent through untouched.
         if (b < 0x20 || b == 0x7f) && l & lflag::ECHOCTL != 0 {
             out.push(b'^');
             out.push(if b == 0x7f { b'?' } else { b + b'@' });
@@ -288,8 +269,7 @@ impl Tty {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        // A panic in here would poison the terminal for the whole run and
-        // there is nothing to recover to, so carry on with what is there.
+        // A poisoned terminal has nothing to recover to; carry on with what is there.
         self.st.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -321,8 +301,7 @@ impl Tty {
         s.locked[..n].copy_from_slice(&src[..n]);
     }
 
-    /// `c_lflag`, which is what a page needs to know whether the guest has
-    /// taken over echo and line editing.
+    /// `c_lflag`: lets a page tell whether the guest took over echo/line editing.
     pub fn lflag(&self) -> u32 {
         self.lock().lflag()
     }
@@ -331,10 +310,8 @@ impl Tty {
         self.lock().winsize
     }
 
-    /// Resize. Returns whether anything changed, because `SIGWINCH` is owed
-    /// only when it did -- a page that reports its size on every animation
-    /// frame would otherwise signal the foreground group sixty times a
-    /// second, and `bash` redraws its prompt for each one.
+    /// Resize. Returns whether anything changed, since `SIGWINCH` is owed only
+    /// then -- a page reporting size every frame would otherwise signal 60x/s.
     pub fn set_winsize(&self, ws: (u16, u16, u16, u16)) -> bool {
         let mut s = self.lock();
         if s.winsize == ws {
@@ -371,9 +348,7 @@ impl Tty {
     pub fn ldisc(&self) -> i32 {
         self.lock().ldisc
     }
-    /// Only `N_TTY` exists here. Refusing the others is the honest answer:
-    /// a program that sets `N_SLIP` and is told yes will then write frames
-    /// into a terminal.
+    /// Only `N_TTY` exists; others are refused rather than accepted and ignored.
     pub fn set_ldisc(&self, n: i32) -> bool {
         if n != 0 {
             return false;
@@ -405,37 +380,25 @@ impl Tty {
         self.lock().stopped = on;
     }
 
-    /// Abandon the part-typed line. `TCFLSH` with `TCIFLUSH` empties the
-    /// input queue, which the caller does, and the line being edited, which
-    /// is here.
+    /// Abandon the part-typed line -- the half of `TCFLSH`/`TCIFLUSH` that lives here.
     pub fn flush_line(&self) {
         self.lock().line.clear();
     }
 
-    /// `c_oflag` output processing, on the way from a program to the screen.
+    /// `c_oflag` output processing (program -> screen). `None` when there is
+    /// nothing to do, so the common `OPOST | ONLCR` block of text is not copied.
     ///
-    /// `None` when there is nothing to do, so that the overwhelmingly common
-    /// case -- a program writing a block of text with `OPOST | ONLCR` and no
-    /// bare carriage returns -- does not copy it.
-    ///
-    /// This is not cosmetic. A terminal is a device that moves a cursor, and
-    /// `\n` moves it down and not back; `ONLCR` is why a Unix program can
-    /// write `\n` and not stair-step down the screen. Every other emulator
-    /// hard-codes the translation, which is fine until a program clears
-    /// `ONLCR` -- `less` and `vi` do, precisely so that they can place the
-    /// cursor themselves.
+    /// `ONLCR` must be honoured, not hardcoded: `less` and `vi` clear it to
+    /// place the cursor themselves.
     pub fn output(&self, buf: &[u8]) -> Option<Vec<u8>> {
         let o = self.lock().oflag();
         output_with(o, buf)
     }
 }
 
-/// [`Tty::output`], against `c_oflag` on its own.
-///
-/// Separate because the caller that matters has the flags and not the
-/// terminal: in the browser the flags are in the global kernel and every
-/// `write` to a terminal comes through here, so building a `Tty` to ask would
-/// be a mutex and two heap allocations per `write` -- for a `printf`.
+/// [`Tty::output`] against a bare `c_oflag`. Separate because the browser caller
+/// has the flag word but not the `Tty`, and every terminal `write` comes through
+/// here -- building a `Tty` to ask would cost a mutex and allocations per `write`.
 pub fn output_with(o: u32, buf: &[u8]) -> Option<Vec<u8>> {
     {
         if o & oflag::OPOST == 0 {
@@ -487,11 +450,8 @@ pub fn output_with(o: u32, buf: &[u8]) -> Option<Vec<u8>> {
 }
 
 impl Tty {
-    /// Keystrokes, through the line discipline.
-    ///
-    /// The whole of N_TTY that a terminal on a screen can mean: input
-    /// mapping, flow control, signal characters, and -- in canonical mode --
-    /// a line the person can edit before any program sees a byte of it.
+    /// Keystrokes through the line discipline: input mapping, flow control,
+    /// signal characters, and canonical-mode line editing.
     pub fn input(&self, bytes: &[u8]) -> Input {
         let mut out = Input::default();
         let mut s = self.lock();
@@ -554,9 +514,7 @@ impl Tty {
                 if let Some(sig) = sig {
                     if l & lflag::ECHO != 0 {
                         s.echo_of(b, &mut out.echo);
-                        // Onto a line of its own, as a terminal does: what
-                        // follows is a shell's next prompt, not the rest of
-                        // the line that was abandoned.
+                        // Onto its own line: what follows is the next prompt.
                         out.echo.extend_from_slice(b"\r\n");
                     }
                     if l & lflag::NOFLSH == 0 {
@@ -571,9 +529,7 @@ impl Tty {
             }
 
             if l & lflag::ICANON == 0 {
-                // Raw. The program is doing its own editing, so every byte
-                // goes through untouched -- and is still echoed if the
-                // program left `ECHO` on, which `read -n1` does.
+                // Raw: every byte through untouched, still echoed if `ECHO` is on.
                 if l & lflag::ECHO != 0 {
                     s.echo_of(b, &mut out.echo);
                 }
@@ -637,17 +593,15 @@ impl Tty {
                 if s.is(cc::VLNEXT, b) {
                     s.literal = true;
                     if l & lflag::ECHO != 0 {
-                        // A caret with nothing after it yet, and the cursor
-                        // put back on it, is what Linux shows.
+                        // A caret with the cursor put back on it, as Linux shows.
                         out.echo.extend_from_slice(b"^\x08");
                     }
                     continue;
                 }
             }
             if s.is(cc::VEOF, b) {
-                // End of input if the line is empty, and otherwise the same
-                // as Return without the newline -- which is what makes
-                // `printf x | cat` see an `x` with no trailing `\n`.
+                // Empty line: end of input. Otherwise Return without the
+                // newline, so `printf x | cat` sees `x` with no trailing `\n`.
                 if s.line.is_empty() {
                     out.eof = true;
                 } else {
@@ -684,14 +638,10 @@ impl Tty {
     }
 }
 
-/// The terminal when it is not in this process's memory.
-///
-/// The same arrangement as [`crate::proc::Remote`] and for the same reason:
-/// in the browser every guest process is a Worker with its own memory, and
-/// the one terminal they share lives in a module all of them instantiated
-/// against. It is reached by calling, not by pointing, so everything here is
-/// a scalar and a buffer is an address in the *caller's* memory that the
-/// other side copies across.
+/// The terminal when it is not in this process's memory. Every guest process is
+/// a Worker with its own memory; the shared terminal lives in the global kernel
+/// module. Reached by calling, not pointing, so a buffer is an address in the
+/// *caller's* memory the other side copies across.
 #[derive(Clone, Copy)]
 pub struct Remote {
     /// Write the 60-byte structure to `at`.
@@ -721,10 +671,8 @@ pub struct Remote {
     pub push: extern "C" fn(at: u32, len: u32) -> i32,
 }
 
-/// The terminal, wherever it is.
-///
-/// A run with no global kernel keeps one in its own memory and behaves as it
-/// always did; a browser run points every process at the shared one.
+/// The terminal, wherever it is: a local `Tty` with no global kernel, or the
+/// shared one in a browser run.
 pub struct TtyRef {
     local: Tty,
     remote: Option<Remote>,

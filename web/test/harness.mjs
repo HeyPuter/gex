@@ -3,24 +3,13 @@
 //   node web/test/harness.mjs start [--root DIR] [--shell /bin/dash]
 //   node web/test/harness.mjs run 'ls /bin | wc -l'
 //   node web/test/harness.mjs stop
-//
-// `start` runs in the foreground and holds the browser open; `run` and `stop`
-// talk to it over a control port. Or in one shot:
-//
 //   node web/test/harness.mjs once 'ls /bin' 'ls /bin' 'ls /bin'
 //
-// Why this exists. `web/test/site.mjs` boots Chromium, serves the bundle,
-// fetches a rootfs tar and unpacks it into the guest filesystem -- and then
-// the demo runs one command and exits. Three `ls` measured that way cost 295
-// seconds against 20 under Node, and nearly all of the difference is setup
-// that is identical every time. Ask the same question twice and you pay for
-// Chromium twice.
-//
-// So the page boots once and answers commands over HTTP (see
-// `web/src/harness.js`), and the rootfs is streamed from a real directory
-// rather than a built image -- the same tree `run-node.mjs --dir` reads, so
-// the two hosts are measured against identical bytes and a changed file needs
-// no rebuild.
+// `start` holds the browser open in the foreground; `run`/`stop`/`once` talk to
+// it over a control port. Booting once amortises Chromium and the rootfs unpack,
+// which otherwise dominate (three `ls` cost 295s this way vs 20s under Node).
+// The rootfs is streamed from a real directory (the tree `run-node.mjs --dir`
+// reads), so a changed file needs no rebuild. See `web/src/harness.js`.
 import { spawn } from 'node:child_process';
 import { createServer, request as httpRequest } from 'node:http';
 import { readFile, readdir, stat } from 'node:fs/promises';
@@ -35,10 +24,9 @@ const DIST = join(WEB, 'dist');
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
 const PORT = Number(process.env.GEX_HARNESS_PORT || 39900);
 
-// The kernel's memory is a SharedArrayBuffer, and a page only gets one when it
-// is cross-origin isolated. Every response the page reads needs these, not
-// only the document: without them the harness silently runs a one-process
-// world, which is not what anything here wants to measure.
+// The kernel's memory is a SharedArrayBuffer, which needs cross-origin
+// isolation. Every response needs these headers, not just the document, or the
+// harness silently runs a one-process world.
 const ISOLATED = {
   'cross-origin-opener-policy': 'same-origin',
   'cross-origin-embedder-policy': 'require-corp',
@@ -65,10 +53,7 @@ async function serveStatic(req, res) {
     const body = await readFile(file);
     res.writeHead(200, {
       'content-type': TYPES[extname(file)] || 'application/octet-stream',
-      // The kernel's memory is a SharedArrayBuffer, and a page only gets one
-      // when it is cross-origin isolated. Without these two headers the
-      // harness silently runs a one-process world, which is not what anything
-      // here wants to measure.
+      // Cross-origin isolation for SharedArrayBuffer; see ISOLATED above.
       'cross-origin-opener-policy': 'same-origin',
       'cross-origin-embedder-policy': 'require-corp',
       'cross-origin-resource-policy': 'cross-origin',
@@ -87,9 +72,8 @@ function streamRootfs(root, res) {
     'cross-origin-embedder-policy': 'require-corp',
     'cross-origin-resource-policy': 'cross-origin',
   });
-  // `-h` so symlinks arrive as the files they point at: the guest filesystem
-  // holds bytes, and a dangling link in a real rootfs -- Debian has several --
-  // must not stop the stream.
+  // `-h` so symlinks arrive as their target's bytes; a dangling link (Debian
+  // has several) must not stop the stream.
   const tar = spawn('tar', ['-C', root, '-cf', '-', '.'], {
     stdio: ['ignore', 'pipe', 'ignore'],
   });
@@ -207,26 +191,17 @@ function makeServer(root, closureStem, oneShot = false) {
         waiter(r);
       } else if (r.fatal) {
         process.stderr.write(`harness: the page died: ${r.fatal}\n`);
-        // And stop waiting for it. The page reported a `DataCloneError` two
-        // and a half minutes before the readiness deadline gave up, and those
-        // 150 seconds bought nothing: a page that has said it is dead is not
-        // going to become ready. Every waiter hears it.
+        // And stop waiting for it: a page that has said it is dead will not
+        // become ready. Every waiter hears it.
         ready = ready ?? { fatal: r.fatal };
         for (const w of readyWaiters.splice(0)) w(ready);
       }
       return res.writeHead(204).end();
     }
 
-    // The driver asking for a command to be run. Held open until the page
-    // answers, so `run` is one request and no polling.
-    // Pick up a rebuilt bundle without losing the browser.
-    //
-    // A new shim means the page has to fetch `dist` again, and the way that
-    // was done was to stop the whole run and start another -- a fresh
-    // Chromium, a fresh rootfs unpack, thirty seconds before the first
-    // command. The browser is the expensive part and none of it needs
-    // replacing: the page reloads, re-reads the bundle, boots a new shell,
-    // and says it is ready again.
+    // Pick up a rebuilt bundle without losing the browser: the page reloads,
+    // re-reads `dist`, boots a new shell and reports ready -- cheaper than a
+    // fresh Chromium and rootfs unpack.
     if (p === '/control/reload') {
       ready = null;
       queue.push({ id: nextId++, reload: true });
@@ -236,29 +211,17 @@ function makeServer(root, closureStem, oneShot = false) {
 
     if (p === '/control/run') {
       const cmd = url.searchParams.get('cmd') || '';
-      // The one-shot page reports id 0 and never pulls a job -- it runs the
-      // program named in its URL and posts the result directly. `nextId`
-      // starts at 1, so waiting on a fresh id there waits for ever:
-      // `apt-get update` against a closure ran its whole ten-process tree,
-      // printed every per-process line, exited, and the harness sat for
-      // eleven more minutes waiting on a result id that nothing would ever
-      // send. It looked exactly like a wedged guest. It was a number that did
-      // not match.
+      // The one-shot page reports id 0 and never pulls a job. `nextId` starts
+      // at 1, so a one-shot run must wait on id 0, not a fresh id nothing sends.
       const id = oneShot ? 0 : nextId++;
       const answer = new Promise((r) => pending.set(id, r));
-      // Fifteen minutes by default. Two was chosen for `ls`; `apt-get update`
-      // takes nearly two on its own under Node and more in a browser, and a
-      // measurement that gives up before the guest does is not a measurement.
+      // Fifteen minutes by default: `apt-get update` alone takes nearly two,
+      // and a deadline shorter than the guest is not a measurement.
       const limitMs = Number(url.searchParams.get('timeout') || 900000);
       queue.push({ id, cmd, timeoutMs: limitMs });
       handOut();
-      // The deadline lives here, in node, and not in the page.
-      //
-      // The page cannot enforce one on itself: a guest that blocks the main
-      // thread blocks the event loop with it, so no timer there will ever
-      // fire. That is not hypothetical -- a deadline was added to the
-      // one-shot page and sat unfired through an eleven-minute wedge. Node is
-      // the only side that is still running when the browser is not.
+      // The deadline lives in node, not the page: a guest that blocks the main
+      // thread blocks the event loop, so no timer in the page would fire.
       const r = await Promise.race([
         answer,
         new Promise((done) => {
@@ -284,15 +247,9 @@ function makeServer(root, closureStem, oneShot = false) {
       if (ready) {
         return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(ready));
       }
-      // With a deadline, because "the page never became ready" is a real
-      // outcome and it used to be indistinguishable from a slow boot.
-      //
-      // A 694 MB closure under a shell sits here: the page fetches it,
-      // compiles it, installs it on the main thread and never posts ready, so
-      // `once` waits for ever before it has even sent a command -- past the
-      // deadline on `/control/run`, which cannot help because no run has
-      // started. Ten minutes a try, and the same ten minutes whether the
-      // cause is size or something worse.
+      // With a deadline: "the page never became ready" is a real outcome (a
+      // huge closure can compile and never post ready) and must be
+      // distinguishable from a slow boot.
       const waitMs = Number(url.searchParams.get('timeout') || 300000);
       const r = await Promise.race([
         new Promise((w) => readyWaiters.push(w)),
@@ -346,11 +303,8 @@ async function start(args) {
     (args.wisp ? `&wisp=${encodeURIComponent(args.wisp)}` : '') +
     (args.closure ? '&closure=1' : '') +
     (args.program ? `&program=${encodeURIComponent(args.program)}` : '') +
-    // The one-shot path awaits the guest and nothing else, so without a
-    // deadline a wedged program never reports and the run has to be found and
-    // killed by hand. Three closure attempts cost ten minutes each that way,
-    // and `--wait` looked like it was being ignored because on that path it
-    // was: it reached `/control/run`, which the one-shot page never asks.
+    // The one-shot path awaits only the guest, so a wedge never reports without
+    // a deadline; `--wait` reaches `/control/run`, which this path never asks.
     (args.wait ? `&wait=${encodeURIComponent(args.wait)}` : '') +
     (args.progArgs || []).map((a) => `&arg=${encodeURIComponent(a)}`).join('') +
     (args.recompile !== undefined ? `&recompile=${encodeURIComponent(args.recompile)}` : '');
@@ -380,11 +334,8 @@ async function start(args) {
   });
   const bye = () => {
     chrome.kill('SIGKILL');
-    // The kill has been sent, not waited for, and Chromium writes its profile
-    // out as it goes: the directory can gain a file between the walk and the
-    // unlink, which is `ENOTEMPTY` -- and thrown from an `exit` handler that
-    // turns a finished run into a crash. A leftover directory in the
-    // temporary space is not worth reporting an error over.
+    // Chromium keeps writing its profile as it dies, so the rmdir can race a
+    // new file (ENOTEMPTY); a stale profile dir is not worth crashing the run.
     try {
       rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     } catch {
@@ -399,12 +350,9 @@ async function start(args) {
 /**
  * Ask the server, and wait as long as it takes.
  *
- * `fetch` will not do: the control endpoints are held open until the page has
- * an answer, and undici gives up on a response whose headers have not
- * arrived within its own timeout. A command that runs for minutes -- which is
- * every interesting one, `apt-get update` among them -- died with
- * `UND_ERR_HEADERS_TIMEOUT` before the guest had finished. `http.request` has
- * no such limit.
+ * Not `fetch`: undici times out a response whose headers have not arrived,
+ * killing minutes-long commands with UND_ERR_HEADERS_TIMEOUT. `http.request`
+ * has no such limit.
  */
 function control(path, params = {}) {
   const q = new URLSearchParams(params).toString();
@@ -437,16 +385,13 @@ for (let i = 0; i < rest.length; i++) {
   else if (rest[i] === '--debug') flags.debug = true;
   else if (rest[i] === '--hot') flags.hot = true;
   else if (rest[i] === '--wisp') flags.wisp = rest[++i];
-  // How long to let one command run before giving up on it and
-  // returning whatever it printed. The default is fifteen minutes, which
-  // is right for a slow-but-working `apt-get update` and exactly wrong
-  // for chasing a hang: every iteration cost the full fifteen before
-  // saying anything. The output collected so far comes back either way.
+  // How long to let a command run before giving up and returning what it
+  // printed. Default fifteen minutes -- right for `apt-get update`, wrong for
+  // chasing a hang.
   else if (rest[i] === '--wait') flags.wait = rest[++i];
   else if (rest[i] === '--adopt') flags.adopt = rest[++i];
-  // One program instead of a shell, which is the only way to measure a
-  // closure: its pins are a layout for that program and collide with a
-  // shell's own placement.
+  // One program instead of a shell: the only way to measure a closure, whose
+  // pins are a layout for that program.
   else if (rest[i] === '--program') flags.program = rest[++i];
   else if (rest[i] === '--closure') flags.closure = rest[++i];
   else if (rest[i] === '--recompile') flags.recompile = rest[++i];

@@ -1,20 +1,6 @@
-/* A guest that serves a unix socket, so the host can connect into it.
- *
- * Two things are being checked, and the second one is why this exists.
- *
- * The host can reach a socket the *guest* serves. A guest reaching one the
- * host serves already worked -- that is how the virtio-gpu renderer is found
- * -- but the other direction had no route, and it is the direction that
- * matters once each process has its own Worker: an X server in one and its
- * client in another need a socket between them.
- *
- * And a blocking `accept` has to block. It used to park as runnable, so the
- * scheduler asked again immediately and was told EAGAIN -- the right answer
- * for a non-blocking accept, handed to a caller that never asked for one. Any
- * guest that served a socket got it and gave up. Nothing noticed because the
- * only host-served socket was the renderer, where the guest connects and
- * never accepts. Xvfb accepts.
- */
+/* A guest that serves a unix socket, so the host can connect into it. Checks
+ * both that the host can reach a socket the *guest* serves, and that a
+ * blocking `accept` actually blocks rather than returning EAGAIN. */
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>

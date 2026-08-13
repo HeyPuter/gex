@@ -1,22 +1,13 @@
 //! Can `gex-ld` link a real program by itself, without the guest's `ld.so`?
 //!
-//! `link` has been in this crate since dynamic linking landed and nothing has
-//! ever called it: the browser shim uses `load_program`, which loads the
-//! executable and the interpreter and lets the guest enter `ld.so` to do the
-//! work. That costs 157ms of emulated time in every process -- measured
-//! against the same program linked static-pie, which forks in 133ms against
-//! Debian's 330ms.
-//!
-//! Before wiring `link` into the runtime, the question is whether it can
-//! honestly claim to have linked these binaries. `Linked::unhandled` and
-//! `Linked::missing` are the answer and cost nothing to ask for.
+//! Checks whether [`gex_ld::link`] can honestly claim to have linked a binary:
+//! `Linked::unhandled` and `Linked::missing` are the answer.
 //!
 //!     cargo run -p gex-ld --example linkcheck -- <sysroot> <program>...
 //!
-//! Prints, per program: the entry it would jump to, how many IFUNC resolvers
-//! the guest would have to run, how many initialisers, the static TLS it
-//! needs, and -- the two that decide it -- relocations no rule covers and
-//! symbols nothing defined.
+//! Prints, per program: the entry, the IFUNC resolver and initialiser counts,
+//! the static TLS needed, and — the two that decide it — relocations no rule
+//! covers and symbols nothing defined.
 
 use std::path::PathBuf;
 

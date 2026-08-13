@@ -1,24 +1,11 @@
-// One guest process, in its own Worker, with its own address space.
+// One guest process, in its own Worker, with its own address space. The
+// Worker's side of things; `host.mjs` is the other half.
 //
-// This is the switcher's replacement, from the Worker's side; `host.mjs` is
-// the other half. That switcher existed because the page has one wasm stack
-// and one address space: a process that blocks is written out and another is
-// written in. It was measured at 223 MiB per switch during the gears demo --
-// 4.4 GiB in eight seconds -- and the cost was not really copying speed.
-// Every process's allocator starts at the same address, so two processes'
-// libraries land on each other, which is why those regions could not simply
-// be left alone.
-//
-// A Worker per process removes the cause rather than the cost. `Gex` builds
-// its own `WebAssembly.Memory`, so a Worker that holds one has a private two
-// gigabytes -- which is what a kernel gives a process. Nothing collides,
-// nothing is snapshotted, and a process that blocks blocks its own Worker
-// rather than handing the page's only stack back.
-//
-// What processes *do* share -- the process table, the filesystem, the pipes
-// -- is in the global kernel, a second wasm module every Worker instantiates
-// against one shared memory. So a syscall stays a call: none of it comes back
-// through here as a message, which would be slower than the switcher was.
+// `Gex` builds its own `WebAssembly.Memory`, so a Worker has a private address
+// space -- nothing collides, and a process that blocks blocks its own Worker.
+// What processes share -- the process table, filesystem, pipes -- is in the
+// global kernel, a second wasm module every Worker instantiates against one
+// shared memory, so a syscall stays a call rather than a message back here.
 //
 // Two ways in:
 //
@@ -26,17 +13,15 @@
 //   `adopt`   become a child some other Worker's guest forked, from the
 //             record that fork produced.
 //
-// The same file runs under a browser Worker and under Node's
-// `worker_threads`, because the fast lane for anything in this project is
-// Node -- a browser cycle is twenty minutes and a Node cycle is two.
+// The same file runs under a browser Worker and under Node's `worker_threads`,
+// because Node is the fast lane -- a browser cycle is twenty minutes, Node two.
 
 /** The one difference between a Web Worker and a Node one, hidden here. */
 async function channel() {
   if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
     return {
-      // `transfer` is optional and passed only when there is something to
-      // hand over: `postMessage(m, [])` is legal but `postMessage(m,
-      // undefined)` is not, in either host.
+      // `transfer` is optional: `postMessage(m, [])` is legal but
+      // `postMessage(m, undefined)` is not, in either host.
       post: (m, transfer) =>
         transfer && transfer.length ? self.postMessage(m, transfer) : self.postMessage(m),
       on: (f) => {
@@ -55,19 +40,11 @@ async function channel() {
 }
 
 /**
- * The buffers in a fork record, so `postMessage` can hand them over instead
- * of copying them.
- *
- * A fork image is 15.4 MiB in twenty regions and it crosses twice -- the
- * parent's Worker to the page, the page to the child's Worker -- because the
- * page is only a relay. Each crossing is a structured clone, measured at
- * 82ms. Neither side reads the bytes again after passing them on, which is
- * exactly the condition a transfer needs.
- *
- * Views on a `SharedArrayBuffer` are skipped: a shared buffer cannot be
- * transferred, and the guest's memory is shared when threads are on. The
- * regions are made with `slice`, so they are ordinary buffers and each owns
- * its own -- transferring one cannot detach another.
+ * The buffers in a fork record, so `postMessage` transfers them instead of
+ * copying. Views on a `SharedArrayBuffer` are skipped -- shared buffers cannot
+ * be transferred, and the guest's memory is shared when threads are on; the
+ * regions are `slice`d, so each owns its buffer and transferring one cannot
+ * detach another.
  */
 function forkTransfer(child) {
   const out = [];
@@ -86,15 +63,9 @@ function forkTransfer(child) {
 }
 
 
-// Statically, not by a name computed at run time.
-//
-// It used to be `import(msg.gexUrl ?? './gex.mjs')`, and a bundler cannot
-// resolve a specifier it only learns at run time -- so the built Worker chunk
-// carried a bare `./gex.mjs` that resolved to nothing, 404'd, and rejected
-// inside the message handler below where nobody was listening. Every demo on
-// the site unpacked its rootfs and then sat there. The paths all agreed
-// anyway: this file and `gex.mjs` are siblings under Node, in the flat
-// directory the graphics harness serves, and in the bundle.
+// Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
+// so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
+// nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { Gex, Env, utf8 } from './gex.mjs';
 
 const port = await channel();
@@ -103,29 +74,18 @@ const port = await channel();
 // host and waits here; `readStdin` below is what the run loop awaits.
 let stdinWaiter = null;
 let stdinEof = false;
-// Set once the guest is loaded: how the page is told about the terminal.
-//
-// `lflag` may only be called from outside the shim. It reads the guest's
-// termios through `gex_tty_lflag`, which takes the kernel -- and the one
-// place it is tempting to call it from, the `write` import, is *inside* a
-// syscall with the kernel already taken. Asking there took the borrow twice,
-// which panics, and the panic handler writes to fd 2, which is the same
-// import again: a run that ended in a bare `unreachable` with nothing
-// printed and every later call into the shim trapping on the leaked borrow.
-//
-// So it is read where the run loop has given the stack back -- when the guest
-// parks for input -- and remembered for the writes in between.
+// `lflag` reads the guest's termios through `gex_tty_lflag`, which takes the
+// kernel -- so it may only be called from outside the shim. Calling it from the
+// `write` import (inside a syscall, kernel already borrowed) took the borrow
+// twice and panicked. It is read when the guest parks for input and remembered
+// for the writes in between.
 let lflag = () => 0;
 let lastLflag = 0;
 let winsize = () => {};
 
-// Nothing in here may fail quietly.
-//
-// The handler is asynchronous, so anything it throws becomes a rejected
-// promise nobody holds -- and a Worker that rejects on the way in looks
-// exactly like a Worker that is busy. That is how a Worker chunk importing a
-// module that did not exist went unnoticed: every demo on the site unpacked
-// its rootfs and then sat there, with no error anywhere.
+// Nothing in here may fail quietly: the handler is async, so a throw becomes a
+// rejected promise nobody holds, and a Worker that rejects on the way in looks
+// exactly like one that is busy.
 port.on((msg) => {
   handle(msg).catch((e) => {
     const what = e?.stack ?? e?.message ?? String(e);
@@ -135,11 +95,8 @@ port.on((msg) => {
 });
 
 /**
- * The guest's hottest back edges, as lines of `count  where`.
- *
- * Read here rather than by whoever started this Worker, because naming an
- * address needs the shim that has the object table and the memory the answer
- * is written into -- both of which belong to this thread.
+ * The guest's hottest back edges, as lines of `count  where`. Read here
+ * because naming an address needs this thread's shim and memory.
  */
 function hotBlocks(gex) {
   const e = gex.shim.exports;
@@ -160,15 +117,11 @@ function hotBlocks(gex) {
   });
 }
 
-// Closure libraries arrive in their own messages, because all of them in the
-// start message will not cross a `postMessage`: eighteen compiled modules is
-// 694 MB and Chromium answers `DataCloneError, out of memory`.
-//
-// They are collected here and installed by `load`, before the guest runs.
-// Installing them *after* it starts was tried and is wrong: the shell begins
-// executing against a layout whose libraries have no slots, and a dash
-// closure that booted in 1.65s stopped printing a prompt at all. The clone
-// had to be split up; the ordering did not.
+// Closure libraries arrive in their own messages -- all of them in the start
+// message will not cross a `postMessage` (Chromium `DataCloneError, out of
+// memory`). Collected here and installed by `load` before the guest runs:
+// installing them after it starts left libraries without slots and the shell
+// never printed a prompt.
 const arrived = [];
 let expected = 0;
 let allHere = null;
@@ -182,14 +135,9 @@ function noteClosureModule(entry) {
 /// Compiled libraries this Worker has asked the host for, by index.
 const wanted = new Map();
 
-/// Ask the host for closure library `i`, and answer when it lands.
-///
-/// The modules used to arrive unasked, all of them, and this Worker waited
-/// for every one before running anything: 549ms between a parent finishing
-/// its fork image and its child starting to adopt, for thirty-three modules
-/// of which a process enters four. Registration needs only the metadata,
-/// which is a few kilobytes and arrives in one message; this is for the
-/// branch that actually lands in a library.
+/// Ask the host for closure library `i`, and answer when it lands. The module
+/// is fetched only for the branch that lands in it; registration needs only
+/// the metadata. Sending all modules up front cost 549ms per fork.
 function wantLibrary(i) {
   let w = wanted.get(i);
   if (!w) {
@@ -211,10 +159,6 @@ function closureModules(n) {
 }
 
 async function handle(msg) {
-  // The first thing this side says. A 694 MB closure never got here: the page
-  // had eighteen compiled modules, posted them, and nothing in this Worker
-  // ever ran -- so the transfer itself is the suspect, and this is how to
-  // tell a slow `postMessage` from a Worker that never woke.
   if (msg?.kind === 'closureMeta') {
     // Registration only: which library owns which page. The compiled module
     // for each is asked for when a branch lands in it.
@@ -252,54 +196,36 @@ async function handle(msg) {
   }
   if (msg?.kind !== 'run' && msg?.kind !== 'adopt' && msg?.kind !== 'thread') return;
 
-  // How many traps a forked child takes before it installs its parent's
-  // modules, carried in the start message rather than read off a global.
-  //
-  // It was set on `globalThis` in the page and read on `globalThis` here,
-  // and those are different contexts, so `?adopt=N` selected nothing: every
-  // run that claimed to compare eager against deferred compared the default
-  // against itself, and three bisect conclusions were drawn from it. Set
-  // before anything looks at it, which is what the first attempt at this got
-  // wrong -- it landed inside `WorkerEnv.write`, so it took effect only once
-  // the guest had already written something, long after the child adopted.
+  // How many traps a forked child takes before installing its parent's
+  // modules. Carried in the start message, not read off a global: the page's
+  // global is a different context, so `?adopt=N` selected nothing. Set before
+  // anything reads it.
   if (msg.adoptAfter !== undefined) globalThis.GEX_ADOPT_AFTER = msg.adoptAfter;
-  // Mark this Worker's console errors, because the browser will not.
-  //
-  // Chrome logs every console level as INFO on stderr, so a Worker that
-  // reports a fault is indistinguishable from one reporting progress by the
-  // time anything outside reads it. A Worker cannot reach the page's
-  // reporter either -- separate global, separate context -- so the marker in
-  // the text is the only thing that crosses. Guarded so it is applied once
-  // however many messages a Worker receives.
+  // Mark this Worker's console errors: Chrome logs every level as INFO, so a
+  // fault is indistinguishable from progress once read outside, and a Worker
+  // cannot reach the page's reporter. Guarded so it is applied once.
   if (!globalThis.__gexMarkedConsole) {
     globalThis.__gexMarkedConsole = true;
     const realError = console.error.bind(console);
     console.error = (...a) => realError('[gex-console-error]', ...a);
   }
-  // Same reasoning, same place: set before anything reads it. `forkModules()`
-  // is evaluated in the Worker that *builds* the fork record, so the page's
-  // global never reached it and the first run of `?forkmods=0` measured the
-  // default against itself. See task 145.
+  // Set before anything reads it, for the same reason as `adoptAfter`:
+  // `forkModules()` runs in the Worker that builds the fork record, so the
+  // page's global never reached it. See task 145.
   if (msg.forkMods !== undefined) globalThis.GEX_FORK_MODULES = msg.forkMods;
 
-  // Everything the guest writes goes back to whoever started this. Posted
-  // rather than accumulated: a run that takes minutes should say what it is
-  // doing while it takes them, which is the whole lesson of the harness work.
+  // Everything the guest writes goes back to whoever started this, posted
+  // rather than accumulated so a long run says what it is doing as it runs.
   class WorkerEnv extends Env {
     write(fd, bytes) {
-      // Copied: `bytes` is a view on the guest's memory, and posting a view
-      // of a memory the guest is still running in is posting whatever it
-      // writes next.
+      // Copied: `bytes` is a view on the memory the guest is still running in.
       if (msg.debugExit) {
-        // Straight out as well as posted. A Worker that crashes takes its
-        // last few messages with it, and the last few are exactly the ones
-        // that say why -- the shim's panic goes to fd 2 and then it traps.
+        // Straight out as well as posted: a crashing Worker takes its last few
+        // messages with it, and those are the ones that say why.
         console.error(utf8(bytes.slice()));
       }
-      // A page wants text, because it has a terminal to put it in. A command
-      // line wants the bytes: `gzip -c` writes a deflate stream to standard
-      // output, and a decode-and-re-encode round trip through UTF-8 turns
-      // every byte that is not a character into U+FFFD.
+      // A page wants text; a command line wants the bytes: `gzip -c` writes a
+      // deflate stream that a UTF-8 round trip would fill with U+FFFD.
       port.post(
         msg.rawOutput
           ? { kind: 'output', fd, bytes: bytes.slice(), lflag: lastLflag }
@@ -313,31 +239,25 @@ async function handle(msg) {
       if (stdinEof) return false;
       const bytes = await new Promise((r) => {
         stdinWaiter = r;
-        // Outside the shim: the run loop gave the stack back before calling
-        // this, so the kernel is free to be asked.
+        // Outside the shim, so the kernel is free to be asked.
         lastLflag = lflag();
         port.post({ kind: 'stdin', lflag: lastLflag });
       });
-      // `true` rather than bytes: with a shared terminal the keystrokes went
-      // into the kernel's input queue as they were typed -- through the line
-      // discipline, which is where a `^C` became a signal -- and this process
-      // reads that same queue. Pushing them again here would deliver every
-      // line twice.
+      // `true` rather than bytes: a shared terminal already put the keystrokes
+      // in the kernel's input queue this process reads, so pushing them again
+      // here would deliver every line twice.
       if (bytes === true) return true;
       if (!bytes) return false;
       gex.pushStdin(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
       return true;
     }
-    // The guest forked. Handed up rather than done here: only the host knows
-    // how to make a Worker, and a Worker that made its own children would
-    // have to outlive them.
+    // The guest forked. Handed up: only the host makes Workers.
     async spawnProcess(child) {
       port.post({ kind: 'fork', child }, forkTransfer(child));
     }
-    // And a thread, which carries the memory rather than a copy of it. A
-    // shared `WebAssembly.Memory` crosses a `postMessage` as itself, so the
-    // Worker on the other side is on this process's address space and not on
-    // a picture of it.
+    // A thread carries the memory itself, not a copy: a shared
+    // `WebAssembly.Memory` crosses `postMessage` as itself, so the other Worker
+    // is on this process's address space.
     async spawnThread(thread) {
       port.post({ kind: 'thread', thread });
     }
@@ -345,72 +265,44 @@ async function handle(msg) {
 
   if (msg.debugExit) {
     globalThis.GEX_DEBUG_EXIT = 1;
-    // And the engine's own stack for a trap, before the shim rewraps it into
-    // a plain Error. The rewrapped one says *what* went wrong and the wasm
-    // frames say *where*, and losing them meant a trap inside a syscall could
-    // only be located by bisecting the handler.
+    // Keep the engine's wasm-frame stack for a trap, before the shim rewraps it
+    // into a plain Error: the wasm frames say *where* a syscall trap happened.
     globalThis.GEX_TRAP_STACK = 1;
   }
-  // `kernelStack` is this Worker's slice of the global kernel's stack array.
-  // Absent for the first Worker, which keeps the stack the module was linked
-  // with and is the one that reads the numbers out for everybody else.
+  // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
+  // the first Worker, which keeps the linked-in stack and reads the numbers out.
   const gex = new Gex(new WorkerEnv(), {
     kernel: msg.kernel ? { ...msg.kernel, stackTop: msg.kernelStack } : null,
-    // A thread joins the memory its process already has; a process makes one.
-    // `shared` only matters for the second case, and only decides whether the
-    // memory this Worker builds can have threads of its own later.
+    // A thread joins its process's memory; a process makes one. `shared` only
+    // decides whether the memory a process builds can have threads later.
     memory: msg.memory ?? null,
     shared: !!msg.shared,
   });
 
-  // The guest's GPU. The renderer is where the canvas is -- the page -- and
-  // this is a Worker, so the calls cross a `SharedArrayBuffer` and block on
-  // `Atomics.wait`. They have to be synchronous: `virgl_submit` is called
-  // from inside a syscall, with the guest's thread on the wasm stack.
-  //
-  // Before `load`, for a sharp reason: the vtest socket is bound while the
-  // guest's namespace is built, and Mesa's winsys does not fall back when it
-  // is missing -- it writes its handshake into the dead descriptor and blocks
-  // on a reply that cannot come.
+  // The guest's GPU. The renderer is on the page, so calls cross a
+  // `SharedArrayBuffer` and block on `Atomics.wait` -- they must be synchronous
+  // (`virgl_submit` is called from inside a syscall). Before `load`: the vtest
+  // socket is bound while the namespace is built, and Mesa's winsys does not
+  // fall back when it is missing.
   if (msg.virgl) {
     const { VirglProxy } = await import('./virgl-bridge.mjs');
     gex.useVirgl(new VirglProxy(msg.virgl, () => port.post({ kind: 'virgl' })), !!msg.virglTrace);
   }
-  // A network of this process's own. Each Worker opens its own connection to
-  // the proxy rather than relaying through the page: a socket is per process
-  // on a real machine too, and a relay would put the page in the path of
-  // every byte a download takes.
-  // The Node fast lane's network: real TCP sockets rather than Wisp. Same
-  // seven calls, so everything above them -- apt's helper, the fetch, the
-  // parse -- is exercised here in two minutes instead of twenty.
+  // The Node fast lane's network: real TCP sockets rather than Wisp, so the
+  // paths above them -- apt's helper, the fetch, the parse -- run here in two
+  // minutes instead of twenty.
   if (msg.network) {
     const { NodeNetwork } = await import('./net-node.mjs');
     gex.useNetwork(new NodeNetwork());
   }
   if (msg.wispUrl) {
-    // The site's, because it is built on a Wisp client the site depends on
-    // and this directory has no dependencies at all. Imported only when a
-    // proxy was named, so a Node run that never asks for a network never
-    // looks for it.
+    // The site's Wisp client, imported only when a proxy was named.
     const { WispNetwork } = await import('../../../web/src/net.js');
     const net = new WispNetwork(msg.wispUrl, (e) => port.post({ kind: 'net', event: e }));
-    // Opened here, and waited for.
-    //
-    // Constructing one only remembers the address; until the WebSocket has
-    // said hello there is no connection, and `open` answers zero. Zero is
-    // what the shim turns into `ENETUNREACH`, so every guest in every Worker
-    // had a network that could not reach anything:
-    //
-    //   Cannot initiate the connection to deb.debian.org:80 (240.0.0.1).
-    //     - connect (101: Network is unreachable)
-    //
-    // The page opens its own and always has, which is why the proxy showed a
-    // connection per run and never a single stream: the connection was the
-    // page's, and nothing that wanted to fetch anything was on it.
-    //
-    // A proxy that cannot be reached is not a reason to refuse to run. The
-    // guest gets a network that fails, which is what it would get from a
-    // machine with no route, and the page says so.
+    // Opened and waited for: constructing one only remembers the address, and
+    // until the WebSocket has said hello `open` answers zero -- which the shim
+    // turns into `ENETUNREACH`. A proxy that cannot be reached is not a reason
+    // to refuse to run; the guest gets a network that fails and the page says so.
     try {
       await net.start();
     } catch (e) {
@@ -420,27 +312,20 @@ async function handle(msg) {
   }
   try {
     let entry;
-    // Which registers to enter with. A process enters on its first thread,
-    // which is where `run` starts by default; a thread has one of its own.
+    // A process enters on its first thread (where `run` starts); a thread has
+    // registers of its own.
     let ctx;
     if (msg.kind === 'thread') {
       ({ entry, ctx } = await gex.adoptThread(msg.shim, msg.guest, msg));
     } else if (msg.kind === 'adopt') {
     console.debug(`[worker] pid ${msg.child?.pid}: adopt arrived`);
-      // With the closure, the same as a fresh process gets it.
-      //
-      // A child already receives its parent's modules through the fork
-      // record, so it has the *code*; what it does not have is any record
-      // that those pages are a closure's. `CLOSURE_DIRS` is a per-Worker
-      // static filled by `gex_add_closure_module`, which only the closure
-      // install path calls -- and it is the one thing `execve` keeps when it
-      // clears the dispatch directory. Without it the shell execs `apt-get`
-      // and every library the build covered is thrown away: a dash closure
-      // prints `exec: 394 closure pages kept` and an apt run never printed
-      // that line once, then translated 3.5 million blocks.
-      // The identity too. A forked child never calls `load`, which is where
-      // `gex_set_identity` is normally said, so without this it runs as the
-      // default 1000 and every `dpkg` refuses.
+      // With the closure, as a fresh process gets it: a child inherits its
+      // parent's code through the fork record but no record that those pages
+      // are a closure's, so without this an exec'd `apt-get` throws every
+      // covered library away and re-translates millions of blocks.
+      // The identity too: a forked child never calls `load` (where
+      // `gex_set_identity` is said), so without this it runs as uid 1000 and
+      // `dpkg` refuses.
       if (msg.child) {
         msg.child.uid = msg.uid ?? msg.opts?.uid;
         msg.child.gid = msg.gid ?? msg.opts?.gid;
@@ -457,18 +342,15 @@ async function handle(msg) {
         msg.elf,
         msg.files ?? {},
         msg.args ?? [],
-        // `closure` arrives at the top level, because it is in the host's
-        // `extra` so that a forked child gets it too; everything else about a
-        // run arrives in `opts`.
+        // `closure` arrives at the top level (it is in the host's `extra` so a
+        // forked child gets it too); everything else about a run is in `opts`.
         {
           ...(msg.opts ?? {}),
-          // Whatever came in its own message, waited for here rather than
-          // taken from the start message.
+          // Whatever arrived in its own message, waited for here.
           closure: msg.closure ?? msg.opts?.closure
             ?? (await closureModules(msg.closureCount ?? 0)),
-          // Top level as well as `opts`, for the same reason `closure` is:
-          // a child's Worker is sent the host's `extra` and pid 1's `opts`
-          // never reach it.
+          // Top level as well as `opts`: a child's Worker gets the host's
+          // `extra`, and pid 1's `opts` never reach it.
           link: msg.link ?? msg.opts?.link,
           wantLibrary,
         },
@@ -476,26 +358,15 @@ async function handle(msg) {
       if (!entry) throw new Error('the program could not be loaded');
     }
 
-    // Statically recompile each object the guest maps once it proves hot,
-    // rather than meeting it one dispatch miss at a time. This is the feature
-    // the project exists for and it is off unless asked for.
-    //
-    // For a forked child too: it inherits its parent's *translated* code, but
-    // the first thing a shell's child does is `execve`, and what it maps then
-    // has never been seen by anyone.
-    // Threads of this process are Workers. Always, and so nothing is said
-    // here: the shim has no second shape to be switched into.
-    //
-    // This used to call `gex_set_thread_workers(1)` when the memory was
-    // shared and the run had not asked for `inlineThreads`. Both are gone.
-    // A `clone` on a host that cannot start a Worker now fails where it is
-    // staged instead of quietly running the thread on this stack.
+    // Statically recompile each object once it proves hot, rather than meeting
+    // it one dispatch miss at a time. The feature the project exists for, off
+    // unless asked for. For a forked child too: its first act is `execve`, and
+    // what it maps then has never been seen.
     const recompile = msg.opts?.recompileObjects ?? msg.recompileObjects;
     if (recompile) {
       gex.shim.exports.gex_set_recompile_objects?.(recompile);
     }
-    // In `opts` as well: the page passes everything it knows about a run
-    // through there, and a heartbeat asked for on a demo went nowhere.
+    // In `opts` as well: the page passes what it knows about a run through there.
     const beat = msg.heartbeat || msg.opts?.heartbeat;
     if (beat) {
       gex.shim.exports.gex_set_heartbeat?.(BigInt(beat));
@@ -503,22 +374,17 @@ async function handle(msg) {
     if (msg.winsize) {
       gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);
     }
-    // Where the kernel's per-Worker stacks are, so the host can give the next
-    // Worker one. Only the first Worker can ask: every other is already
-    // running on a slice the host handed it.
+    // Where the kernel's per-Worker stacks are, so the host can hand out the
+    // next slice. Only the first Worker can ask; the rest run on a slice already.
     if (!msg.kernelStack) {
       const stacks = gex.kernelStacks?.();
       if (stacks) port.post({ kind: 'kernelStacks', ...stacks });
     }
     winsize = (rows, cols) => gex.shim.exports.gex_set_winsize?.(rows, cols);
-    // The line discipline is the guest's choice, read out of its termios --
-    // and the page is what does the echoing and the line editing, so it has
-    // to be told. Sent with every write because that is when it changes in
-    // practice: a shell sets its terminal up and then prints a prompt.
+    // The line discipline is the guest's choice, read from its termios; the page
+    // does the echoing so it has to be told, and it is sent with every write
+    // because that is when it changes (a shell sets up then prints a prompt).
     lflag = () => gex.shim.exports.gex_tty_lflag?.() ?? 0;
-    // The rest of the switches. These used to be set by `run-node.mjs`, which
-    // held the first guest itself; now that every process is in a Worker the
-    // runner holds none of them and asks for them here instead.
     const ex = gex.shim.exports;
     if (msg.hot) ex.gex_set_hot?.(1);
     if (msg.noIntrinsics) ex.gex_set_intrinsics?.(0);
@@ -526,57 +392,37 @@ async function handle(msg) {
     if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
     if (msg.checkSp) ex.gex_set_check_sp?.(1);
-    // A forked or exec'd child never calls `load`, so the switch that `load`
-    // reads never reaches it -- and the child is the process this is for.
+    // A forked or exec'd child never calls `load`, so set the switch here.
     const link = msg.link ?? msg.opts?.link;
     if (link) ex.gex_set_snapshot?.(Number(link));
     if (msg.debugExit) {
-      // Before the guest has executed an instruction: a process's memory is
-      // what decides how many of them a browser will hold, so it matters
-      // whether the cost is placing the image or running it.
+      // Before the guest runs an instruction: memory decides how many processes
+      // a browser holds, so whether the cost is placing the image or running it.
       port.post({ kind: 'loaded', memoryMib: gex.memory.buffer.byteLength / (1 << 20) });
     }
-    // Around `gex.run` alone. Everything before it is loading, placing the
-    // image and letting the engine compile a seventeen-megabyte module;
-    // everything inside it is the guest. A codegen A/B measured through the
-    // total is a third module size and V8's compiler.
+    // Around `gex.run` alone: everything before it is loading and module
+    // compilation, so a codegen A/B measured through the total is a third
+    // module size and V8's compiler.
     const runStarted = performance.now();
     const status = await gex.run(entry, ctx);
     const guestMillis = Math.round(performance.now() - runStarted);
-    // Where each pinned object landed. A pin that does not take is the worst
-    // outcome available -- the module was built for one address and the code
-    // runs at another, so the guest branches into whatever is there -- and it
-    // can only be known after the run, because `ld.so` maps the libraries.
+    // Where each pinned object landed. A pin that does not take runs code built
+    // for one address at another; only knowable after `ld.so` maps the libraries.
     if (msg.opts?.pins) ex.gex_pin_report?.();
-    // A process that crashed still has to die properly.
+    // A crashed process still has to die properly: `exit_process` publishes the
+    // status and releases descriptors, and a wasm fault abandons the stack
+    // without running it -- so a crashed child left its pipe ends shut and no
+    // status for its parent, deadlocking `apt-get update`. 134 is `SIGABRT`.
     //
-    // `exit_process` publishes the exit status and releases the descriptors,
-    // and a wasm fault abandons the stack without running it -- so a crashed
-    // child left its pipe ends held shut and no status for its parent to
-    // find. Both halves of an `apt-get update` deadlock were that: `apt`
-    // waiting on a `read` for an end-of-file, and pid 1 on `wait4` for a
-    // status. Here, because this is the last moment the crashed process's
-    // own shim instance exists and can reach the global kernel.
-    //
-    // 134 is what a shell reports for a process killed by `SIGABRT`, which is
-    // the nearest true thing to say about a fault.
-    //
-    // But only for a *process* Worker, never a thread's. `gex_process_gone`
-    // sets the process-wide `EXITED` flag and calls `procs.exit`, and a thread
-    // reaching here has merely finished -- the process lives on in its other
-    // Workers. Calling it anyway let the first thread to exit mark the whole
-    // process gone: every sibling then read `gex_exited()` true and stopped
-    // resuming, so a thread whose Worker had started a moment later was
-    // stranded `runnable` forever and the main thread hung joining it. Which
-    // thread lost the race varied run to run. A thread's own exit already did
-    // the one thing a joiner needs -- cleared its `child_tid` and woke the
-    // futex -- back in the guest's `exit` syscall; a thread that *faults*
-    // throws out of `gex.run` and is handled by the Worker's error path, never
-    // reaching here. Process teardown belongs to the main Worker, whose
-    // `gex.run` returns when the guest calls `exit_group`.
+    // Only for a process Worker, never a thread's: `gex_process_gone` sets the
+    // process-wide `EXITED` flag, and letting the first thread to exit call it
+    // marked the whole process gone -- siblings read `gex_exited()` true, a
+    // late-starting thread was stranded `runnable`, and the main thread hung
+    // joining it. A thread's own exit already woke its joiner's futex; a thread
+    // that faults is handled by the Worker's error path and never reaches here.
     if (msg.kind !== 'thread') ex.gex_process_gone?.(134);
-    // `close` before the reporting, not after: it drops the tick channel,
-    // which is a live handle that would otherwise keep a Node Worker up.
+    // `close` before reporting: it drops the tick channel, a live handle that
+    // would otherwise keep a Node Worker up.
     gex.close?.();
     port.post({
       kind: 'exit',
@@ -588,28 +434,23 @@ async function handle(msg) {
       fmaCalls: msg.fmaCount ? Number(ex.gex_fma_calls?.() ?? -1) : undefined,
       extracted: (msg.extract ?? []).map((p) => [p, gex.readFile(p)]),
       blocks: Number(gex.shim.exports.gex_jit_blocks?.() ?? 0),
-      // Of those, the ones on a page a closure library claims: work the
-      // static recompiler already did and this process did again.
+      // Of those, ones on a page a closure library claims: work the recompiler
+      // already did and this process did again.
       liftInClosure: Number(gex.shim.exports.gex_lift_in_closure?.() ?? 0),
-      // And *why* each miss reached the translator, which no other counter
-      // says. See `gex_lift_why`: 0 filling not possible yet, 1 no closure
-      // owner, 2 owned and the span was already asked, 3 owned and fresh.
+      // Why each miss reached the translator. See `gex_lift_why`: 0 fill not
+      // possible yet, 1 no closure owner, 2 owned and already asked, 3 owned/fresh.
       liftWhy: gex.shim.exports.gex_lift_why
         ? [0, 1, 2, 3].map((i) => Number(gex.shim.exports.gex_lift_why(i)))
         : undefined,
-      // For each address that translated although its span had been filled,
-      // whether the slot it dispatches through is written *now*. The shim
-      // records the addresses because it is the only side that sees them,
-      // and a table can only be read from here. See #136.
+      // For each address that translated although its span was filled, whether
+      // the slot it dispatches through is written now. See #136.
       liftSlots: gex.liftSlots?.(),
       millis: Number(gex.shim.exports.gex_jit_millis?.() ?? 0),
-      // And what the *engine* cost, which the line above does not cover:
-      // compiling and instantiating every module this process installed,
-      // whether it lifted them or took them from another process.
+      // What the engine cost, which `millis` does not: compiling and
+      // instantiating every module this process installed.
       installMs: gex.installMillis,
-      // Split, because "installing" is two costs with two different fixes:
-      // compiling is per bytes and V8 can skip it for bytes it has seen
-      // before, instantiating is per module and is paid every time.
+      // Split: compiling is per bytes and V8 can skip seen bytes, instantiating
+      // is per module and paid every time.
       compileMs: gex.compileMillis,
       instantiateMs: gex.instantiateMillis,
       growMs: gex.growMillis,
@@ -617,44 +458,36 @@ async function handle(msg) {
       // How this process waited, by kind. See `Gex.waits`.
       waits: gex.waits,
       loader: gex.loader,
-      // What a Worker pays before the guest runs at all: the shim and the
-      // guest module are instantiated per Worker, and one Worker is one guest
-      // process. Never counted anywhere until now.
+      // What a Worker pays before the guest runs: shim and guest module are
+      // instantiated per Worker.
       shimCompileMs: gex.shimCompileMillis,
       shimInstMs: gex.shimInstantiateMillis,
       guestInstMs: gex.guestInstantiateMillis,
       installs: gex.installCount,
       fill: gex.fillStats,
-      // How the shared-slot lookup went: pages this process already had,
-      // pages the identity map knew, pages it did not, and pages with no
-      // identity at all. The question is why a child re-lifts its parent's
-      // libraries, and these four say which step loses them.
+      // How the shared-slot lookup went, to say why a child re-lifts its
+      // parent's libraries: pages it already had, pages the identity map knew,
+      // pages it did not, pages with no identity.
       reuse: gex.shim.exports.gex_reuse_stat
         ? [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((i) => Number(gex.shim.exports.gex_reuse_stat(i)))
         : null,
-      // How much of this process's memory the shim ever used. It decides how
-      // big a memory has to be, and a memory per process decides how many
-      // processes a browser will hold at once -- which is the number that
-      // makes a demo work on somebody else's machine or not.
+      // How much of this process's memory the shim used: a memory per process
+      // decides how many processes a browser holds at once.
       heapKib: Number(gex.shim.exports.gex_heap_used_kib?.() ?? -1),
-      // What this process's memory actually grew to. One memory per process,
-      // so the interesting question is not what the *first* process costs --
-      // it is whether a forked child pays the same again.
+      // What this process's memory grew to -- the question is whether a forked
+      // child pays the same again.
       memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)),
     });
   } catch (e) {
-    // Where the guest was, not only what the engine said. A crash inside the
-    // shim reaches the host as `unreachable` and nothing else; the address
-    // and the object it is in are the only things that name the cause, and
-    // they are readable here and nowhere else.
+    // Where the guest was, not only what the engine said: a crash inside the
+    // shim reaches the host as `unreachable`, and the guest pc and object are
+    // readable here and nowhere else.
     let where = '';
     try {
       const ex = gex.shim?.exports;
-      // Only if this Worker got as far as having a kernel. `gex_has_host`
-      // exists for this and was not being asked: a failure *during* load left
-      // no host, `gex_current_pc` panicked on the way in, and the trap that
-      // panic became replaced the real error with a bare `unreachable`. The
-      // diagnostic was taking down the thing it was diagnosing.
+      // Only if this Worker got as far as having a kernel: a failure during
+      // load left no host, and `gex_current_pc` panicking on the way in
+      // replaced the real error with a bare `unreachable`.
       if (ex?.gex_current_pc && ex.gex_has_host?.()) {
         const pc = ex.gex_current_pc();
         where = ` at guest pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}`;
@@ -671,10 +504,9 @@ async function handle(msg) {
     } catch {
       // A shim too broken to ask. The engine's message is all there is.
     }
-    // And the global kernel, which has no console of its own: it imports two
-    // memories and nothing else, so a panic in there unwinds to a bare
-    // `unreachable`. Its message is in its own memory, which this Worker can
-    // read because it made the instance.
+    // The global kernel has no console of its own, so a panic there unwinds to
+    // a bare `unreachable`. Its message is in its own memory, readable here
+    // because this Worker made the instance.
     try {
       const k = gex.kernel;
       if (k?.k_panic_len?.()) {
@@ -687,23 +519,15 @@ async function handle(msg) {
     } catch {
       // Nothing to add.
     }
-    // Always, not under a flag.
-    //
-    // Everything gathered above -- the guest's pc, the object it is in, the
-    // global kernel's panic text -- was printed only when `GEX_DEBUG_EXIT`
-    // was set, and posted to the host as a bare message otherwise. So the
-    // default way to meet a crash was a single short line with none of the
-    // evidence, and the evidence existed and was thrown away. A debug switch
-    // should add detail to a failure, never be the condition for seeing one.
+    // Always, not under a flag: the evidence above was printed only under
+    // `GEX_DEBUG_EXIT` and thrown away otherwise. A debug switch should add
+    // detail to a failure, never be the condition for seeing one.
     console.error(`gex: worker threw: ${e?.message ?? e}${where}\n${e?.stack ?? ''}`);
-    // Before the message: this process has stopped existing, and until the
-    // table knows that, its parent's `wait4` is parked on a child that will
-    // never report. See `gex_abandon` -- this is #69, and a crash in a child
-    // used to wedge the whole run rather than end it.
+    // Before the message: until the table knows this process is gone, its
+    // parent's `wait4` is parked on a child that will never report. See
+    // `gex_abandon` -- #69.
     try {
-      // Where the guest was, before anything else: a trap gives JavaScript no
-      // address and no frames, and the guest's registers are the rest of the
-      // evidence.
+      // Dump guest registers first: a trap gives JavaScript no address.
       gex?.shim?.exports?.gex_dump_state?.();
       gex?.shim?.exports?.gex_abandon?.(-9);
     } catch {
@@ -717,23 +541,12 @@ async function handle(msg) {
   }
 }
 
-// A payload handed over at construction, if the host had one.
-//
-// The handshake this replaces -- post `ready`, be sent `adopt` -- costs one
-// turn of the *starting* thread's event loop, and under node the starting
-// thread may be a guest that is about to block. `bash -c 'echo $(echo hi)'`
-// is the case: bash forks for the substitution and immediately reads the
-// pipe, `k_park` calls `Atomics.wait` on node's main thread, the event loop
-// stops, `ready` is never delivered, `adopt` is never sent, and the child
-// that was going to write the pipe never starts.
-//
-// Passing the payload as `workerData` removes the dependency: the Worker has
-// everything it needs the moment the thread exists, and whether its parent
-// is running, blocked, or gone makes no difference to whether it starts.
-//
-// `ready` is still posted, because a browser host has no `workerData` and
-// still uses the handshake -- and because a host that sends both is harmless:
-// `start` ignores a second payload.
+// A payload handed over at construction, if the host had one. The handshake it
+// replaces -- post `ready`, be sent `adopt` -- costs one turn of the starting
+// thread's event loop, and under Node that thread may be a guest about to block
+// (`bash -c 'echo $(echo hi)'`), so `ready` never gets delivered and the child
+// never starts. `workerData` removes the dependency. `ready` is still posted
+// because a browser host has no `workerData`; sending both is harmless.
 const handed = await (async () => {
   if (typeof self !== 'undefined') return null;
   try {

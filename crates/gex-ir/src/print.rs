@@ -29,7 +29,6 @@ fn ty(t: Ty) -> &'static str {
     }
 }
 
-/// Name a floating-point width.
 fn fw(double: bool) -> &'static str {
     if double {
         "f64"

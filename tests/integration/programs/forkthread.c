@@ -1,15 +1,6 @@
-/* Threads inside a process that was forked and then exec'd.
- *
- * Each of those works on its own and the suite already covers them; the
- * combination is what a package manager does. dpkg unpacks a .deb by forking
- * a decompressor, which execs, which starts worker threads -- and that is
- * where `apt-get install` stopped, with the worker trapping on an empty
- * dispatch table slot.
- *
- * The child is reached by exec rather than by fork alone on purpose: an
- * exec'd process has a fresh translation of everything, so its threads are
- * the case where nothing has been translated for the address they start at.
- */
+/* Threads inside a process that was forked and then exec'd (what dpkg's
+ * decompressor does). The exec is deliberate: an exec'd process has a fresh
+ * translation, so its threads start where nothing has been translated yet. */
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -55,8 +46,7 @@ static int role_worker(void) {
 }
 
 /* A pipeline: this process writes, a forked-and-exec'd child reads. The
-   decompressor case in miniature -- the reader has to still be running when
-   the writer's bytes arrive, which is what a lost thread breaks. */
+   reader must still be running when the writer's bytes arrive. */
 static int role_sink(void) {
     unsigned long sum = 0;
     long n;

@@ -1,31 +1,18 @@
 // Does the proxy stall on its own, with no guest in the way?
 //
-// `apt-get update` in the browser fetches 14.9 MB at 44 kB/s, and that average
-// hides one stall: a stream flows for about a hundred kilobytes, stops dead for
-// 318 seconds, and then finishes at nine megabytes a second. Everything on the
-// guest's side of it has been measured and excluded -- translation, syscalls,
-// the run loop, the pipes between apt and its methods.
-//
-// This drives the same proxy with the same client library and no gex at all. If
-// it stalls here, the stall is the proxy's or the library's and nothing in the
-// runtime needs to change. If it does not, the difference is how gex drives the
-// client, and that is a much smaller place to look.
-//
 //   node web/test/wisp-probe.mjs [ws://127.0.0.1:5111/] [host] [path]
+//
+// `apt-get update` stalls mid-fetch (~100 kB in, dead for 318s, then fast).
+// Everything on the guest's side has been excluded. This drives the same proxy
+// and client library with no gex: a stall here is the proxy's or library's, not
+// the runtime's.
 import { ClientConnection } from '../node_modules/@mercuryworkshop/wisp-js/src/client/connection.mjs';
 
-// `--spin` keeps the event loop as busy as gex's Worker keeps its own.
-//
-// The plain probe moves 11.4 MiB in 1.2 seconds through this proxy, and gex
-// stalls for 318 seconds on the same fetch. The proxy and the library are
-// therefore not the cause, and the loudest remaining difference is that gex's
-// Worker turns its event loop tens of thousands of times a second waiting for
-// the guest, while this probe sits idle. If starving the loop the same way
-// reproduces the stall, that is the mechanism.
-//
-// Two flavours, because gex has used both: `--spin` posts through a
-// MessageChannel as the run loop does now, `--spin=timer` uses
-// `setTimeout(_, 1)` as it did before.
+// `--spin` keeps the event loop as busy as gex's Worker does. The plain probe
+// moves 11.4 MiB in 1.2s; gex stalls 318s on the same fetch. If starving the
+// loop the same way reproduces the stall, that is the mechanism. Two flavours:
+// `--spin` posts through a MessageChannel (as now), `--spin=timer` uses
+// setTimeout(_, 1) (as before).
 const spin = process.argv.includes('--spin') ? 'turn'
   : process.argv.includes('--spin=timer') ? 'timer'
   : null;

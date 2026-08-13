@@ -1,19 +1,15 @@
 //! Signals (PLAN §8).
 //!
-//! Delivery works because of the tail-call design: every host call flushes
-//! the guest's registers to the thread context first, so at any syscall or
-//! safepoint the architectural state is complete and a handler frame can be
-//! built from it exactly. Resuming is then just re-entering translated code
-//! at a different PC — there is no wasm stack to unwind, because guest call
-//! depth never became wasm call depth.
+//! Delivery works because of the tail-call design: every host call flushes the
+//! guest's registers to the thread context first, so at any syscall or safepoint
+//! the architectural state is complete and a handler frame can be built from it.
+//! Resuming is just re-entering translated code at a different PC -- there is no
+//! wasm stack to unwind.
 //!
-//! Returning from a handler happens one of two ways. A libc that sets
-//! `SA_RESTORER` returns to its own trampoline, which issues `rt_sigreturn`
-//! like any other syscall. Otherwise the return address is
-//! [`SIGRETURN_TRAMPOLINE`], a reserved address with no translation: branching
-//! to it lands in the dispatch-miss handler, which recognises it and restores
-//! the frame. That avoids having to synthesise and translate a code page just
-//! to hold two instructions.
+//! Returning from a handler: a libc that sets `SA_RESTORER` returns to its own
+//! trampoline, which issues `rt_sigreturn`. Otherwise the return address is
+//! [`SIGRETURN_TRAMPOLINE`], a reserved address with no translation, so
+//! branching to it lands in the dispatch-miss handler, which restores the frame.
 
 use crate::errno::Errno;
 use crate::GuestMem;
@@ -65,11 +61,9 @@ pub const SIG_DFL: u64 = 0;
 /// `SIG_IGN`.
 pub const SIG_IGN: u64 = 1;
 
-/// Return address installed when the guest supplies no `sa_restorer`.
-///
-/// Inside the runtime-reserved region, four-byte aligned, and deliberately
-/// without a translation so that returning to it reaches the dispatch-miss
-/// handler.
+/// Return address installed when the guest supplies no `sa_restorer`. In the
+/// reserved region and deliberately without a translation, so returning to it
+/// reaches the dispatch-miss handler.
 pub const SIGRETURN_TRAMPOLINE: u64 = gex_abi::RESERVED_END - 16;
 
 /// What the kernel should do when a signal has no handler.
@@ -145,14 +139,11 @@ pub struct Signals {
     pub in_handler: bool,
     /// The mask a signal frame should record instead of the current one.
     ///
-    /// `rt_sigsuspend` runs with a mask of the caller's choosing and has to
-    /// put the old one back *after* the handler returns, not before -- and
-    /// the frame is what carries a mask across a handler. So the suspend
-    /// leaves the old mask here, `setup_frame` writes that into the frame,
-    /// and `sigreturn` restores it. Without it the woken signal is blocked
-    /// again before it can be delivered, stays pending forever, and every
-    /// later suspend returns instantly: `timeout` spun 2.2 million times
-    /// that way.
+    /// `rt_sigsuspend` runs with a caller-chosen mask and must restore the old
+    /// one *after* the handler returns; the frame carries the mask across. So
+    /// suspend leaves the old mask here, `setup_frame` writes it into the frame,
+    /// and `sigreturn` restores it -- without it the woken signal stays blocked
+    /// and pending forever (`timeout` spun 2.2 million times).
     pub suspend_restore: Option<u64>,
 }
 
@@ -181,19 +172,12 @@ impl Signals {
 
     /// The signal state after `execve`.
     ///
-    /// A handler is an address in the image that installed it, and `execve`
-    /// replaces the image -- so every caught signal has to go back to its
-    /// default. Nothing did that, and the consequence is worse than a wrong
-    /// disposition: a shell installs handlers, forks, and execs, and the new
-    /// program inherited the *address* of a handler that no longer exists.
-    /// The first signal sent to it jumped there. `timeout 3 sleep 30` died
-    /// that way -- not in `sleep`, which has no handlers at all, but in
-    /// dash's, resurrected in an address space where it is not code.
-    ///
-    /// What survives is what POSIX says survives: ignored stays ignored,
-    /// because a shell relies on that to protect a child it started in the
-    /// background; the blocked mask carries over; and so do pending signals.
-    /// The alternate stack does not -- it pointed into the old image too.
+    /// A handler is an address in the old image, so every caught signal reverts
+    /// to default -- otherwise the new program inherits the address of a handler
+    /// that no longer exists (`timeout 3 sleep 30` jumped into dash's old
+    /// handler). Ignored stays ignored, the blocked mask and pending signals
+    /// carry over, per POSIX; the alternate stack does not -- it too pointed into
+    /// the old image.
     pub fn exec(&mut self) {
         for action in self.actions.iter_mut() {
             if action.handler != SIG_DFL && action.handler != SIG_IGN {
@@ -247,13 +231,10 @@ impl Signals {
         }
     }
 
-    /// Take the lowest-numbered pending signal that is in `set`, whether or
-    /// not it is blocked.
+    /// Take the lowest-numbered pending signal in `set`, blocked or not.
     ///
-    /// `sigwaitinfo` is used precisely on signals the caller has blocked --
-    /// blocking them is how it stops the default action from running before
-    /// the wait -- so this deliberately ignores the mask that
-    /// [`Signals::next_deliverable`] respects.
+    /// `sigwaitinfo` is used precisely on signals the caller has blocked, so
+    /// this deliberately ignores the mask [`Signals::next_deliverable`] respects.
     pub fn take_pending_in(&mut self, set: u64) -> Option<u32> {
         let ready = self.pending & set;
         if ready == 0 {
@@ -273,18 +254,11 @@ impl Signals {
         self.pending & !self.blocked != 0
     }
 
-    /// Whether a pending signal would actually *do* something.
-    ///
-    /// `has_pending` answers "is a bit set that is not blocked", which is the
-    /// right question for whether to run the dispatcher and the wrong one for
-    /// whether to end a wait. An ignored signal ends no syscall on Linux, and
-    /// `SIGCHLD` is ignored by default and arrives every time a child exits
-    /// -- so a shell waiting on a pipe would be interrupted by its own
-    /// children, over and over, for nothing.
-    ///
-    /// "Something" means a handler, or a default disposition that is not
-    /// `Ignore`. Both of those change what the process does next; nothing
-    /// else does.
+    /// Whether a pending signal would actually *do* something -- a handler, or a
+    /// non-`Ignore` default. `has_pending` only asks whether an unblocked bit is
+    /// set, which is wrong for ending a wait: `SIGCHLD` is ignored by default and
+    /// arrives on every child exit, and would otherwise interrupt a shell's wait
+    /// for nothing.
     pub fn would_deliver(&self) -> bool {
         let mut ready = self.pending & !self.blocked;
         while ready != 0 {
@@ -483,20 +457,11 @@ pub fn dispatch(
         signals.pending &= !bit(signal);
         return Ok(match default_action(signal) {
             DefaultAction::Ignore => Delivery::None,
-            // The three the *terminal* raises, with nothing to handle them.
-            //
-            // Stopping needs a scheduler to resume from and there is none, so
-            // the choice is between ending the process and doing nothing.
-            // For these three, doing nothing is right: a `^Z` at a shell with
-            // no job control does nothing on a real machine too, and a
-            // background process reading the terminal being *killed* rather
-            // than paused is not a degraded version of the rule -- it is a
-            // different and much worse one. A shell that wants them handles
-            // them, and a handler is dispatched above without reaching here.
-            //
-            // `SIGSTOP` is not in this list. It cannot be handled, so nobody
-            // sends it expecting a handler, and ending the process at least
-            // says something happened.
+            // The three a terminal raises, with no handler and no scheduler to
+            // resume from: doing nothing matches a shell with no job control (a
+            // `^Z` there does nothing on real hardware too), and is far better
+            // than killing a backgrounded reader. `SIGSTOP` is excluded -- it
+            // can't be handled, so ending the process at least does something.
             DefaultAction::Stop
                 if matches!(signal, sig::SIGTSTP | 21 | 22) =>
             {

@@ -1,21 +1,9 @@
-// A page that boots the runtime once and then answers commands for ever.
+// A page that boots the runtime once and then answers commands over HTTP for
+// ever, so the browser is paid for once instead of per measured command.
 //
-// The demo site is the wrong shape for development. Every measurement means a
-// page load, and a page load means Chromium starting, the bundle parsing, and
-// a rootfs tar being fetched and unpacked into the guest filesystem -- and
-// then the demo runs *one* command and exits. Three `ls` cost 295 seconds
-// that way, against 20 under Node, so every question about the browser was
-// asked through a five-minute keyhole and most were not asked at all.
-//
-// Almost all of that is setup, and setup is the same every time. So: boot
-// once, keep an interactive shell alive, and take commands over HTTP from
-// whatever is driving. The second command costs what the guest costs and
-// nothing else.
-//
-// The rootfs comes from a real directory on the host, streamed as a tar the
-// server makes on demand (`/harness/rootfs.tar`). No image to rebuild when a
-// file changes, and the same tree the Node harness passes to `--dir`, so the
-// two hosts are measured against identical bytes.
+// The rootfs comes from a real host directory streamed as a tar the server
+// makes on demand (`/harness/rootfs.tar`) -- the same tree the Node harness
+// passes to `--dir`, so the two hosts are measured against identical bytes.
 import { untar } from './tar.js';
 import { fetchBytes, runProgram } from './runtime.js';
 import { metadataSection } from '../../shims/browser/js/gex.mjs';
@@ -96,14 +84,9 @@ function captureConsole() {
 
 export async function start() {
   captureConsole();
-  // Anything that throws where nobody is catching, said out loud.
-  //
-  // `runProgram`'s rejection was the only failure this reported, so a throw
-  // in the page's own code, in a Worker, or in a promise nobody awaited left
-  // the driver waiting for an answer that could not come -- and the run
-  // looked like a slow one rather than a broken one. `apt-get update` has
-  // apparently never worked in a browser, and this is why nobody could see
-  // what it does.
+  // Anything that throws where nobody is catching, reported -- otherwise a
+  // throw in a Worker or an unawaited promise leaves the driver waiting for an
+  // answer that never comes, and the run looks slow rather than broken.
   self.addEventListener('error', (e) => {
     report({ fatal: `${e.message} at ${e.filename}:${e.lineno}` });
   });
@@ -113,28 +96,21 @@ export async function start() {
   });
   const params = new URLSearchParams(location.search);
   const shell = params.get('shell') || '/bin/dash';
-  // `?recompile=0` runs the browser the way `run-node.mjs` runs by default,
-  // and `?debug=1` mirrors every guest write to the console and narrates a
-  // crash where it happens. Both exist because the two hosts disagreed about
-  // whether a child process works at all, and neither difference could be
-  // switched off from outside the bundle.
+  // `?recompile=0` runs the browser the way `run-node.mjs` does by default.
   const recompileObjects = params.has('recompile') ? Number(params.get('recompile')) : 8192;
   // `?link=1` keeps the address space the guest's `ld.so` produced and starts
   // the next process of the same program from it, rather than linking again.
   const link = Number(params.get('link') ?? 0);
   if (params.get('debug')) globalThis.GEX_DEBUG_EXIT = 1;
-  // \`?adopt=N\`: how many traps a forked child takes before it stops waiting
-  // to be an execve and takes its parent's modules in bulk. 1 is the old
-  // eager behaviour, which is what a bisect needs.
+  // `?adopt=N`: how many traps a forked child takes before it stops waiting to
+  // be an execve and takes its parent's modules in bulk. 1 is the old eager
+  // behaviour, which is what a bisect needs.
   if (params.has('adopt')) globalThis.GEX_ADOPT_AFTER = Number(params.get('adopt'));
-  // And the engine's own stack for a trap, which names the wasm function the
-  // trap happened in. The rewrapped error says what went wrong and where the
-  // *guest* was; when the fault is in the shim rather than in translated
-  // code, only this says which of the shim's own functions was running.
+  // `GEX_TRAP_STACK`: the engine's own stack for a trap, which names the wasm
+  // function it happened in -- the only thing that says which of the shim's own
+  // functions was running when the fault is in the shim, not translated code.
   if (params.get('debug')) globalThis.GEX_TRAP_STACK = 1;
-  // A page cannot open a TCP socket, so the guest's network is carried over
-  // Wisp to a proxy. Without one `apt-get update` reaches no mirror, which is
-  // the only command anybody wants to measure here.
+  // A page cannot open a TCP socket, so the network is carried over Wisp.
   let network = null;
   if (params.get('wisp')) {
     const { WispNetwork } = await import('./net.js');
@@ -158,30 +134,15 @@ export async function start() {
   if (!elf) throw new Error(`the rootfs has no ${shell}`);
 
   // The closure, when the driver was given one: the image module, every
-  // library beside it, and the layout they were placed at. This is the
-  // configuration the project exists for, and no page could be given one
-  // before -- so the browser had only ever been measured translating at
-  // runtime, which is the secondary path.
+  // library beside it, and the layout they were placed at.
   let closure = null;
   if (params.get('closure')) {
     const m = await (await fetch('/harness/closure.json')).json();
-    // The libraries, compiled here and once. A closure is hundreds of
-    // megabytes and every Worker would otherwise be sent the bytes and
-    // compile them itself; a `WebAssembly.Module` structured-clones as
-    // itself and the engine shares the code behind it, so all a Worker needs
-    // besides the module is the small `gex.meta` section that says which
-    // pages it covers.
-    // A few at a time, not all nineteen at once.
-    //
-    // `Promise.all` over the lot had every library in flight together: 694 MB
-    // of wasm fetched and handed to `WebAssembly.compile` concurrently, on
-    // the main thread, before the shell has run an instruction. A 77 MB
-    // closure boots a shell in 1.65s; the 694 MB one never posted ready at
-    // all, and nothing said whether it was fetching, compiling or installing.
-    //
-    // Four is a guess and the log below is how to improve on it. What is not
-    // a guess is that unbounded was wrong: the peak is what matters here, and
-    // the peak was all of it.
+    // Compiled here and once: a `WebAssembly.Module` structured-clones as
+    // itself with the engine sharing the code behind it, so a Worker needs only
+    // the module and the `gex.meta` section saying which pages it covers.
+    // A few at a time, not all at once: `Promise.all` over the lot had 694 MB of
+    // wasm compiling concurrently on the main thread and never posted ready.
     const AT_A_TIME = 4;
     const libs = [];
     const began = performance.now();
@@ -204,11 +165,9 @@ export async function start() {
       libs.push(...done);
     }
     console.log(`closure ready: ${libs.length} libraries in ${Math.round(performance.now() - began)}ms`);
-    // The image module is one program's own text, and pid 1 here is a shell.
-    // Handing dash a module built for `apt-get` starts the shell inside
-    // another program's code, and it exits without a syscall -- which is
-    // exactly what the first attempt did. Only on request, and only when the
-    // driver knows the shell *is* that program.
+    // The image module is one program's own text: only on request, and only
+    // when the driver knows pid 1 *is* that program, or the shell starts inside
+    // another program's code and exits without a syscall.
     const image = params.get('image')
       ? await fetchBytes(`/harness/closure/${encodeURIComponent(m.image)}`)
       : null;
@@ -220,15 +179,10 @@ export async function start() {
 
   // `?program=` runs one program instead of opening a shell.
   //
-  // A closure is a layout for one program: `gexc build --closure` pins every
-  // object it reaches at a fixed address, and those addresses start at
-  // 0x5000000 -- which is exactly where a shell's own image and libraries
-  // land. Booting dash and then handing it apt's pins put two programs at one
-  // address and the shell died before it printed a prompt. So the
-  // configuration this project exists for cannot be measured through a
-  // persistent shell at all, and this is the mode that measures it: the page
-  // boots, runs the program, and reports what it printed and what it exited
-  // with.
+  // A closure pins every object at a fixed address starting at 0x5000000, which
+  // is where a shell's own image lands too -- so a closure cannot be measured
+  // through the persistent shell without two programs colliding at one address.
+  // This mode boots, runs the program, and reports its output and exit.
   if (params.get('program')) {
     const path = params.get('program');
     const argv = [path, ...(params.getAll('arg') || [])];
@@ -238,11 +192,8 @@ export async function start() {
     let status = -1;
     let failed = null;
     try {
-      // Against a deadline, because this path awaits the guest and nothing
-      // else. A program that wedges -- and a closure run does, see #105 --
-      // otherwise leaves the harness waiting for ever with no output and no
-      // diagnosis, which is a worse failure than a wrong answer: the run has
-      // to be noticed, found and killed by hand.
+      // Against a deadline (`?wait=`): a program that wedges -- a closure run
+      // does, see #105 -- otherwise leaves the harness waiting for ever.
       const running = runProgram(io.term, {
         elf: exe,
         files,
@@ -318,17 +269,11 @@ export async function start() {
       // The driver stopped. Nothing useful left to do.
       return;
     }
-    // Split across a pair of empty quotes, so the characters *typed* never
-    // spell the marker -- the terminal echoes input back in cooked mode, and a
-    // literal marker in the command line matched the instant it was sent.
-    // Every command then "finished" in 0ms with no output.
-    // Bracketed, not trimmed. The output used to be everything before the end
-    // marker with its first line dropped, on the assumption that the first
-    // line is the terminal echoing what was typed -- and when the shell does
-    // not echo, that is the answer being thrown away: `echo alive` reported
-    // nothing at all.
-    // A rebuilt bundle: drop everything and come back as a new page. The
-    // driver is waiting on `/harness/ready`, which `start` posts again.
+    // Markers are split across empty quotes so the characters *typed* never
+    // spell them (the terminal echoes input in cooked mode), and the answer is
+    // taken bracketed between them rather than trimmed.
+    // `job.reload`: drop everything and come back as a new page. The driver is
+    // waiting on `/harness/ready`, which `start` posts again.
     if (job.reload) {
       location.reload();
       return;
@@ -345,8 +290,7 @@ export async function start() {
       io.take();
       io.send(`echo ${startTyped}; ${job.cmd}; echo ${typed}\n`);
       const raw = await io.until((t) => t.includes(mark), job.timeoutMs || 120000);
-      // Between the markers, and nothing else: whatever the terminal did or
-      // did not echo falls outside them.
+      // Between the markers: whatever the terminal echoed falls outside them.
       const from = raw.indexOf(startMark);
       const body = from < 0 ? raw : raw.slice(from + startMark.length);
       out = body.split(mark)[0].replace(/^\r?\n/, '');

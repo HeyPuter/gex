@@ -1,34 +1,10 @@
-/* Threads reaching *different* untranslated library code at the same moment.
+/* Threads reaching *different* untranslated library code at the same moment,
+ * so their first dispatch misses overlap and race the translator's slot
+ * allocation. Each thread starts in a different corner of libc.
  *
- * Only the executable is translated ahead of time; every shared library
- * arrives through the runtime translator, one dispatch miss at a time. A miss
- * hands the missing page a base slot in the dispatch table by bumping a
- * counter -- and that counter used to be read, spent milliseconds of lifting
- * and seconds of Cranelift, and only then written back. Two threads missing at
- * once both allocated from the same mark, so two different guest pages were
- * given the same slots, and an indirect branch to one of them landed in the
- * middle of a function belonging to the other.
- *
- * dpkg's xz decompressor found it: an `exit` handler returned into the wrong
- * code and failed its stack canary, having already written a correct 5 MB of
- * output.
- *
- * Threads all running the same function miss the same pages, and the first one
- * to arrive translates for everybody, so each thread here starts in a
- * different corner of libc and the misses land on different pages.
- *
- * Being honest about what this does not do: it did not reproduce the bug. With
- * the fix reverted, eight runs of this passed and every run of the
- * decompressor failed. musl's libc is small enough that six threads still do
- * not overlap two translations often, where glibc plus liblzma does it
- * reliably. What actually guards the invariant is the check in the host's
- * `publish_unit`, which notices the first base slot claimed by two guest pages
- * and says so; this is a concurrency test that happens to cover the same
- * ground, not the thing standing between the bug and a release.
- *
- * Correctness is checked by running the same work again afterwards, on one
- * thread, with everything already translated: a thread that ran the wrong code
- * disagrees even if it does not crash.
+ * Correctness is checked by rerunning the same work afterwards on one thread,
+ * everything already translated: a thread that ran the wrong code disagrees
+ * even if it did not crash.
  */
 #define _GNU_SOURCE
 #include <ctype.h>

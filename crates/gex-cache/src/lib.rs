@@ -1,46 +1,28 @@
 //! A content-addressed cache of compiled modules (PLAN §10).
 //!
-//! Translating a program to wasm is cheap — under two seconds for SQLite's
-//! quarter of a million instructions. Compiling that wasm to machine code is
-//! not: Cranelift takes half a minute over it, which is most of what a large
-//! program's startup costs. The work is the same on every run of the same
-//! binary, so it is worth doing once.
-//!
-//! The key is a hash of everything that could change the answer: the guest
-//! image, the translation options, and a format version bumped whenever gex's
-//! own output changes. What the key deliberately does *not* have to cover is
-//! the engine's configuration, because [`wasmtime::Module::deserialize`]
-//! checks that itself and fails rather than loading an artifact built for a
-//! different wasmtime.
+//! Compiling translated wasm to machine code is the slow part of startup
+//! (Cranelift takes ~30s on a large program) and is identical on every run of
+//! the same binary, so it is cached. The key hashes the guest image, the
+//! translation options, and a format version. It need not cover the engine's
+//! configuration: [`wasmtime::Module::deserialize`] checks that itself.
 //!
 //! # Safety
 //!
 //! Deserialising a compiled module is unsafe: the bytes become executable code
-//! with only a header check between them and the CPU. gex trusts them for the
-//! same reason it trusts its own executable — they live in a
-//! per-user-writable cache directory, and anyone who can write there can
-//! already replace the binary that reads it. That is the whole of the
-//! argument, and it is why this crate exists rather than the `unsafe` living
-//! in the host, which forbids it.
+//! behind only a header check. gex trusts them because they live in a
+//! per-user-writable cache directory — anyone who can write there can already
+//! replace the binary that reads it. The `unsafe` lives here so the host can
+//! forbid it.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use wasmtime::{Engine, Module};
 
-/// How much disk the cache may use, before it starts discarding the entries
-/// it has gone longest without reading.
-///
-/// It needs a limit because most of what lands here is never read again. A
-/// whole program keys on its own bytes and hits on every later run, which is
-/// the case this cache was built for; a batch of runtime-translated blocks
-/// keys on *which blocks were in the batch*, and that depends on the order
-/// discovery happened to reach them, so it almost never recurs. Those entries
-/// are written once and read never.
-///
-/// Measured on this machine after a few days of graphics work: 247,684
-/// entries, 21 GB, of which 88% were under 64 KB -- runtime batches. Nothing
-/// removed any of them.
+/// How much disk the cache may use before evicting least-recently-read
+/// entries. A limit is needed because most of what lands here is never read
+/// again: a whole program hits on every later run, but a runtime-translated
+/// batch keys on which blocks it held and almost never recurs.
 const DEFAULT_BUDGET: u64 = 4 << 30;
 
 /// Sweeping means listing the directory, so it is not done on every store.
@@ -54,16 +36,11 @@ fn budget() -> u64 {
         .unwrap_or(DEFAULT_BUDGET)
 }
 
-/// Delete the least recently used entries until the cache is comfortably
-/// under budget.
+/// Delete least-recently-used entries until the cache is under budget.
 ///
-/// "Least recently used" is the metadata file's modification time, which
-/// [`load_or_compile`] refreshes on a hit. Sorting by it therefore keeps the
-/// modules that are actually being reused and drops the ones that are not,
-/// which is precisely the split between whole programs and runtime batches.
-///
-/// Down to 80% rather than exactly to the limit, so a run does not sweep on
-/// every store once it is full.
+/// "Least recently used" is the metadata file's mtime, which
+/// [`load_or_compile`] refreshes on a hit. Evicts down to 80% of budget, not
+/// exactly to it, so a full cache does not sweep on every store.
 fn evict(dir: &Path, budget: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -112,19 +89,13 @@ pub mod sha256;
 /// by this.
 const FORMAT_VERSION: u32 = 2;
 
-/// Identifies the running gex build, so a change to the translator cannot be
-/// served stale code from a previous one.
+/// Identifies the running gex build, so a translator change is not served
+/// stale code. Required: a decoder fix changes nothing else the key can see,
+/// so without it the fixed binary reuses the broken module.
 ///
-/// This is not optional. A decoder fix that makes an instruction translatable
-/// changes nothing else the key can see — not the guest image, not the
-/// options — so without it the fixed binary reuses the broken module. That is
-/// exactly what happened the first time this cache existed, and the failure
-/// looked like the fix had not worked.
-///
-/// The executable's size and modification time rather than a hash of it: gexc
-/// is tens of megabytes, and a rebuild always changes both. `None` means the
-/// cache must not be used at all, because a build that cannot be identified
-/// cannot be told apart from a different one.
+/// Uses the executable's size and mtime (a rebuild changes both) rather than
+/// hashing tens of megabytes. `None` means the cache must not be used, since
+/// an unidentifiable build cannot be told from a different one.
 pub fn build_fingerprint() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let meta = std::fs::metadata(&exe).ok()?;
@@ -160,15 +131,11 @@ pub fn profile_dir() -> Option<PathBuf> {
 
 /// Read the entry points a previous run of this image discovered.
 ///
-/// Static discovery cannot follow a computed goto, so on a program built
-/// around an interpreter loop -- SQLite's VDBE, most language runtimes -- it
-/// leaves thousands of blocks to be translated on demand, every run. Recording
-/// where execution actually went lets the next run translate them ahead of
-/// time, which then gets compiled once and cached like everything else.
-///
-/// The profile is a hint, never a requirement: a stale or corrupt one costs a
-/// few wasted translations, and an address that is no longer code is dropped
-/// by the discovery loop's own executability check.
+/// Static discovery cannot follow a computed goto, so an interpreter-loop
+/// program leaves thousands of blocks to translate on demand every run.
+/// Recording where execution went lets the next run translate them ahead of
+/// time. A hint, never a requirement: a stale or corrupt profile only wastes
+/// a few translations.
 pub fn read_profile(dir: &Path, key: &str) -> Vec<u64> {
     let Ok(bytes) = std::fs::read(dir.join(format!("{key}.profile"))) else {
         return Vec::new();
@@ -179,12 +146,9 @@ pub fn read_profile(dir: &Path, key: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Record entry points for the next run, merged with what is already there.
-///
-/// Merging matters because two runs of the same program exercise different
-/// paths; the profile should converge on their union rather than flip between
-/// them. `limit` bounds that union so a pathological program cannot grow the
-/// file without end.
+/// Record entry points for the next run, merged with what is already there so
+/// the profile converges on the union of the paths different runs take.
+/// `limit` bounds that union.
 pub fn write_profile(dir: &Path, key: &str, found: &[u64], limit: usize) {
     let mut all: Vec<u64> = read_profile(dir, key);
     let before = all.len();
@@ -203,15 +167,10 @@ pub fn write_profile(dir: &Path, key: &str, found: &[u64], limit: usize) {
     store(dir, &path, &bytes);
 }
 
-/// The cache key for one translation.
-///
-/// `fields` must cover everything that changes the emitted wasm: the bytes of
-/// every loaded segment, where they were placed, and the translation options.
-/// The caller assembles them because the types involved live in crates this
-/// one does not depend on.
-///
-/// Each field is length-prefixed, so no regrouping of the same bytes across
-/// fields can produce the same key.
+/// The cache key for one translation. `fields` must cover everything that
+/// changes the emitted wasm (segment bytes, placement, options); the caller
+/// assembles them. Each field is length-prefixed, so regrouping the same
+/// bytes across fields cannot collide.
 pub fn key<'a>(build: &str, fields: impl IntoIterator<Item = &'a [u8]>) -> String {
     let mut h = sha256::Sha256::new();
     h.update(&FORMAT_VERSION.to_le_bytes());
@@ -233,16 +192,10 @@ pub struct Loaded {
     pub hit: bool,
 }
 
-/// Get the compiled form of a translation, using `dir` as the cache.
-///
-/// `build` is called only on a miss, and returns the wasm together with
-/// whatever the caller needs to remember about the translation. That is the
-/// reason for the closure: translating is over a second on a large program,
-/// and a hit should not pay it.
-///
-/// A cache that cannot be read or written is not an error: the module is
-/// compiled and the run proceeds. That matters for a read-only home directory
-/// and for two gex processes racing on the same entry.
+/// Get the compiled form of a translation, using `dir` as the cache. `build`
+/// runs only on a miss, returning the wasm plus caller metadata. A cache that
+/// cannot be read or written is not an error — the module is compiled and the
+/// run proceeds (read-only home, or two processes racing on one entry).
 pub fn load_or_compile(
     engine: &Engine,
     dir: &Path,
@@ -260,19 +213,10 @@ pub fn load_or_compile(
         // failure path below simply rebuilds.
         match unsafe { Module::deserialize(engine, &bytes) } {
             Ok(module) => {
-                // Rewriting the metadata refreshes its modification time,
-                // which is what eviction sorts by. It is a few hundred bytes
-                // and it is the difference between keeping the modules that
-                // get reused and keeping whichever happen to be newest.
-                //
-                // Through `store`, not `fs::write`, because this is the one
-                // write that happens on the *common* path -- every hit, in
-                // every process -- and `fs::write` truncates before it fills.
-                // Two runs of the same program at once and one of them reads
-                // the other's empty file: "cached module metadata is
-                // unreadable", from a cache entry that is perfectly good.
-                // Thirty concurrent runs of one binary failed twenty-three
-                // times that way.
+                // Rewriting the metadata refreshes its mtime, which eviction
+                // sorts by. Via `store`, not `fs::write`: this runs on every
+                // hit, and `fs::write` truncates before it fills, so a
+                // concurrent reader could see an empty file.
                 store(dir, &meta_path, &metadata);
                 return Ok(Loaded {
                     module,
@@ -316,10 +260,8 @@ fn store(dir: &Path, path: &Path, bytes: &[u8]) {
         return;
     }
     // Unique per *write*, not per process: two threads storing the same key
-    // -- which happens whenever two guest threads translate at once -- would
-    // otherwise share one temp file, and one would rename the other's
-    // half-written bytes into place. Atomic-by-rename is only atomic if
-    // nobody else is writing the thing being renamed.
+    // would otherwise share one temp file and one would rename the other's
+    // half-written bytes into place.
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = dir.join(format!(
         "tmp-{}-{}-{}",
@@ -334,12 +276,9 @@ fn store(dir: &Path, path: &Path, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    /// A hit must never leave the metadata visible in a partial state.
-    ///
-    /// Refreshing the mtime used to truncate-and-rewrite it in place, so two
-    /// processes running the same program at once raced and one of them read
-    /// an empty file. It is the *hit* path, so it is the path every run takes
-    /// once the cache is warm.
+    /// A hit must never leave the metadata visible in a partial state:
+    /// refreshing the mtime used to truncate-and-rewrite in place and race a
+    /// concurrent reader.
     #[test]
     fn a_concurrent_reader_never_sees_half_a_meta_file() {
         let dir = std::env::temp_dir().join(format!("gex-meta-race-{}", std::process::id()));

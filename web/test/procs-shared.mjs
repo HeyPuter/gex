@@ -2,32 +2,16 @@
 //
 //   node web/test/procs-shared.mjs
 //
-// This is what the snapshot switcher exists to fake, done properly.
+// What the snapshot switcher existed to fake, done properly. The shared half --
+// `gex_kernel::ProcTable`, exit statuses, pending signals -- lives in the
+// global kernel's own memory that every Worker instantiates against, so two
+// processes with separate memories can still fork, wait and signal each other.
+// The switcher had kept them in one address space (33 MiB a switch) only so
+// they could share that state.
 //
-// The switcher keeps every guest process in one address space, because that is
-// the only way they can share a kernel: the process table, the exit statuses
-// and the pending signals are ordinary Rust data structures, and Rust data
-// structures live in a memory. Running a second process therefore means
-// writing the first out and reading the second in -- 33 MiB a switch, and the
-// address collisions that make it necessary in the first place.
-//
-// The way out is not a cheaper copy. It is to put the shared half somewhere
-// that is not any one process's memory: the global kernel module, whose own
-// memory every Worker instantiates against. `gex_kernel::ProcTable` moves in
-// unchanged -- it was already written for this, with its state behind a lock
-// and signals left for the target to collect rather than delivered by the
-// sender.
-//
-// So this test has two Workers with *separate* process memories, standing in
-// for two guest processes, and checks that between them they can do the three
-// things the switcher is currently required for:
-//
-//   * one forks and the other is the child,
-//   * the child exits and the parent's `wait4` collects the right status,
-//   * one signals the other and the signal is there to be taken.
-//
-// If those hold, nothing about `fork`, `wait4` or `kill` needs the two
-// processes to share an address space, and the switcher has no remaining job.
+// Checked: one forks and the other is the child; the child exits and the
+// parent's `wait4` collects the right status; one signals the other and the
+// signal is there to be taken.
 import { Worker } from 'node:worker_threads';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -49,9 +33,8 @@ const GUEST_PAGES = 0xffff0000 / 65536;
 // memory carries its bounds in its type.
 const kernel = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 
-// Where the kernel's per-Worker stacks are. Probed here, from a throwaway
-// instance, because this file makes the memory and can ask before any Worker
-// exists. Every Worker below installs its own slice.
+// Where the kernel's per-Worker stacks are. Probed from a throwaway instance
+// here, before any Worker exists; each Worker below installs its own slice.
 const probe = (await WebAssembly.instantiate(
   await WebAssembly.compile(bytes),
   {
@@ -69,8 +52,8 @@ let stacksTaken = 0;
 
 const WORKER = `
   import { parentPort, workerData } from 'node:worker_threads';
-  // This Worker's own process memory. Not shared with the other Worker --
-  // that separation is the point, and is what the switcher gives up.
+  // This Worker's own process memory, not shared with the other Worker -- that
+  // separation is the point, and is what the switcher gave up.
   const proc = new WebAssembly.Memory({
     initial: workerData.guestPages, maximum: workerData.guestPages, shared: true,
   });
@@ -78,9 +61,8 @@ const WORKER = `
     await WebAssembly.compile(workerData.bytes),
     { env: { memory: workerData.kernel, process: proc } },
   )).exports;
-  // This Worker's own stack in the kernel module. A wasm global belongs to an
-  // instance, so each Worker has a stack pointer of its own -- and wasm-ld
-  // starts every one of them at the same address in the memory they share.
+  // This Worker's own stack. A wasm global belongs to an instance, but wasm-ld
+  // starts every one at the same shared address.
   if (workerData.stackTop) k.__stack_pointer.value = workerData.stackTop | 0;
   parentPort.on('message', (m) => {
     const r = k[m.fn](...(m.args ?? []));
@@ -148,11 +130,9 @@ if (!(await child.call('k_has_signals', pid))) {
 const taken = await child.call('k_take_signals', pid);
 if (taken !== 1 << 1) fail(`took ${taken}, expected ${1 << 1} for SIGINT`);
 
-// The child exits, in its own Worker, and the parent collects it in the
-// other. This is `wait4` across two address spaces, which is the call the
-// switcher exists to make possible.
-// `k_exit` takes an exit *code*; `k_wait` is where it becomes the word a
-// parent reads, with the pid packed above it.
+// The child exits in its own Worker; the parent collects it in the other --
+// `wait4` across two address spaces. `k_exit` takes an exit code; `k_wait`
+// packs it into the word a parent reads, with the pid above it.
 await child.call('k_exit', pid, 42);
 if (!(await parent.call('k_wait_ready', 1, -1))) fail('a finished child was not ready to collect');
 const packed = BigInt(await parent.call('k_wait', 1, -1));

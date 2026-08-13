@@ -1,26 +1,11 @@
-// The guest's GPU, reached from a Worker.
-//
-// virglrenderer runs where the canvas is, and a canvas belongs to the page.
-// The guest process that draws is a Worker -- and, in the gears demo, not
-// even the first one: pid 1 is a shell, and `glxgears` is two forks and an
-// `execve` further on. So the drawing process and the renderer are in
-// different agents, and the calls between them have to cross.
-//
-// They have to cross *synchronously*. `virgl_submit` is a wasm import called
-// from inside a syscall: the guest's thread is on the wasm stack, holding it,
-// and there is nothing to await with. A message would need the shim to be
-// able to suspend mid-syscall, which is exactly what it cannot do.
-//
-// So: a `SharedArrayBuffer` and `Atomics.wait`. The Worker writes its request
-// into shared memory, wakes the page, and blocks; the page runs the renderer
-// and wakes it back. The Worker's thread is stopped for the duration, which
-// is right -- the guest is inside a syscall and has nothing else to do -- and
-// the page's is not, which is also right, because it is the one that has to
-// keep drawing.
-//
-// The page cannot use `Atomics.wait` at all (the main thread is not allowed
-// to block), and does not need to: it is woken by an ordinary message and
-// replies by storing and notifying.
+// The guest's GPU, reached from a Worker. virglrenderer runs on the page
+// (where the canvas is) and the drawing guest is a Worker, so the calls
+// between them cross a `SharedArrayBuffer` with `Atomics.wait`: the Worker
+// writes its request, wakes the page, and blocks; the page runs the renderer
+// and wakes it back. It must be synchronous -- `virgl_submit` is a wasm import
+// called from inside a syscall, with the guest's thread holding the wasm stack
+// and nothing to await. The page cannot `Atomics.wait` (the main thread may
+// not block) and need not: it is woken by a message and replies by storing.
 
 // Control words, by index.
 const STATE = 0; // 0 idle, 1 request waiting, 2 reply ready
@@ -45,19 +30,15 @@ export function makeChannel() {
 }
 
 /**
- * The page's half: run the renderer when a Worker asks.
- *
- * Call the returned function with each `{kind:'virgl'}` message a Worker
- * posts. Nothing else is needed -- the request is already in shared memory by
- * the time the message arrives, and the reply goes back the same way.
+ * The page's half: run the renderer when a Worker asks. Call the returned
+ * function with each `{kind:'virgl'}` message a Worker posts; the request is
+ * already in shared memory by the time it arrives.
  */
 export function serveVirgl(renderer, channel) {
   const ctl = new Int32Array(channel.control);
   const data = new Uint8Array(channel.data);
-  // The renderer reads and writes through a `WebAssembly.Memory`, because
-  // that is what it is handed by the shim on the direct path. Here the bytes
-  // are in a plain buffer instead, so it is handed something that looks the
-  // same and is.
+  // The renderer expects a `WebAssembly.Memory` (what the shim hands it on the
+  // direct path); here the bytes are in a plain buffer, so hand it a lookalike.
   const asMemory = { buffer: channel.data };
   return function serve() {
     if (Atomics.load(ctl, STATE) !== REQUEST) return;
@@ -77,8 +58,8 @@ export function serveVirgl(renderer, channel) {
         renderer?.close(session);
       }
     } catch (e) {
-      // A renderer that throws must not leave the Worker blocked forever: it
-      // is inside a syscall and nothing else will ever wake it.
+      // A renderer that throws must still reply, or the Worker blocks forever
+      // inside its syscall.
       console.error('[virgl] the renderer threw', e);
       result = -1;
     }
@@ -90,12 +71,9 @@ export function serveVirgl(renderer, channel) {
 }
 
 /**
- * The Worker's half: something with `submit`, `take` and `close`, which is
- * all `Gex.useVirgl` asks for.
- *
- * `wake` is how the page is told there is a request -- a `postMessage`. It is
- * a callback rather than a port because a Worker started by `host.mjs` talks
- * to its own parent, which may itself not be the page.
+ * The Worker's half: `submit`, `take` and `close`, all `Gex.useVirgl` asks
+ * for. `wake` (a `postMessage`) tells the page there is a request -- a callback
+ * rather than a port, because a Worker's parent may not be the page.
  */
 export class VirglProxy {
   #ctl; #data; #wake;
@@ -114,10 +92,9 @@ export class VirglProxy {
     ctl[LEN] = len;
     Atomics.store(ctl, STATE, REQUEST);
     this.#wake();
-    // A timeout, so a page that has gone away or a renderer that has died
-    // ends the guest rather than wedging its Worker for the life of the tab.
-    // Thirty seconds is far longer than any single command: the slowest are
-    // readbacks, which are milliseconds.
+    // A timeout, so a dead page or renderer ends the guest rather than wedging
+    // its Worker for the life of the tab. Thirty seconds is far longer than any
+    // single command (the slowest, readbacks, are milliseconds).
     while (Atomics.load(ctl, STATE) === REQUEST) {
       if (Atomics.wait(ctl, STATE, REQUEST, 30000) === 'timed-out') {
         throw new Error('the renderer did not answer in thirty seconds');

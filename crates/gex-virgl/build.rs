@@ -1,16 +1,7 @@
-//! Find libvirglrenderer, or tell the rest of the build it is not here.
-//!
-//! virglrenderer is a system library that gex does not vendor, so a machine
-//! without it must still build everything else. The switch is a cfg rather
-//! than a cargo feature because whether the library exists is a property of
-//! the machine, not a choice made on the command line.
-//!
-//! The FFI declarations are hand-written, so the header is never needed --
-//! only the shared object. That is worth knowing because distributions split
-//! the two: the runtime library is installed far more often than the `-dev`
-//! package that carries the header, the `.pc` file and the bare `.so`
-//! symlink. Linking against the soname directly, with `-l:`, means a machine
-//! that can *run* virglrenderer can also build against it.
+//! Find libvirglrenderer, or set no cfg so the rest of the build knows it is
+//! absent. A cfg rather than a cargo feature: whether the library exists is a
+//! property of the machine. The FFI is hand-written, so only the `.so` is
+//! needed, not the `-dev` package's header and `.pc` file.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,13 +27,10 @@ fn main() {
         return;
     };
 
-    // `-lvirglrenderer` needs an unversioned `libvirglrenderer.so`, and that
-    // symlink belongs to the -dev package, which a machine that can happily
-    // *run* virglrenderer often does not have. Making our own in OUT_DIR
-    // costs nothing and keeps the build working on both kinds of machine.
-    //
-    // It has to be `rustc-link-lib` rather than `rustc-link-arg`: only the
-    // former is carried to whatever binary eventually links this crate.
+    // `-lvirglrenderer` needs an unversioned `libvirglrenderer.so`, which
+    // belongs to the -dev package; make our own symlink in OUT_DIR so a
+    // machine that can only *run* virglrenderer still links. `rustc-link-lib`,
+    // not `rustc-link-arg`: only the former carries to the final binary.
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let link = out.join("libvirglrenderer.so");
     let _ = std::fs::remove_file(&link);

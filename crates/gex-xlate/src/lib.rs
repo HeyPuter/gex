@@ -58,47 +58,25 @@ pub struct Options {
     /// for a deployment that must not compile code later, and as a way to
     /// isolate a suspected runtime-translation bug.
     pub exhaustive: bool,
-    /// Seed discovery from the entry point alone, ignoring the symbol table.
-    ///
-    /// Ahead-of-time discovery is thorough, and on a large program that is the
-    /// wrong trade: it hands the host a module with tens of thousands of
-    /// functions to compile, most of which the run will never enter. Runtime
-    /// translation reaches everything anyway, so this makes the up-front
-    /// module small and lets execution pull in the rest.
+    /// Seed discovery from the entry point alone, ignoring the symbol table,
+    /// to keep the up-front module small and let runtime translation pull in
+    /// the rest rather than compiling functions the run may never enter.
     pub lazy: bool,
     /// Declare the imported memory shared. Off only for a single-threaded
     /// build whose host cannot import a shared memory.
     pub shared_memory: bool,
     /// Emit passive element segments and the fill helpers whatever the block
     /// count, so a process can put this module's pages wherever it likes.
-    ///
-    /// For a closure object, which is instantiated once per process and
-    /// numbered by the build in one sequence across the whole closure. The
-    /// size rule this overrides -- `BIG_BLOCKS` -- was measured on *runtime*
-    /// units, where three fill helpers on each of thousands of tiny modules
-    /// cost `apt-get update` 32 seconds. A closure is 173 objects and 92 of
-    /// them fall under that rule; published at the bases the build chose,
-    /// they reach 3,634,176 in table 0, and one of them is enough to make
-    /// every process grow the table that far before its guest runs.
+    /// Needed for closure objects; overrides the `BIG_BLOCKS` size rule, which
+    /// was measured on runtime units rather than a whole-closure build.
     pub demand_fill: bool,
     /// Whether this module declares the memory and dispatch table or imports
-    /// them.
-    ///
-    /// One module in a program owns them and the rest join it. That is already
-    /// how runtime translation works; a whole-closure build needs the same
-    /// distinction ahead of time, because a program is an executable *and* the
-    /// libraries it was placed alongside, and only one of them can declare the
-    /// address space they share.
+    /// them: one module in a program owns them and the rest join it.
     pub linkage: Linkage,
     /// Where this module's page allocations begin in the shared dispatch
-    /// table.
-    ///
-    /// Zero means "start where a lone module would". It is not zero for a
-    /// closure: every object of one is translated separately but they all run
-    /// in the same process against the same table, so each has to continue
-    /// where the last stopped. Translating them all from the same start meant
-    /// libc's blocks and the executable's blocks claimed the same slots, and
-    /// the program branched into whichever had been installed last.
+    /// table. Zero starts where a lone module would; a closure's objects each
+    /// continue where the last stopped, so their blocks do not claim the same
+    /// slots and overwrite one another.
     pub first_slot: u64,
 }
 
@@ -167,11 +145,9 @@ impl<'a> CodeView<'a> {
     }
 
     fn is_executable(&self, addr: u64) -> bool {
-        // Sections first. A segment's `PF_X` covers everything read-only in
-        // the same mapping, which for a shared library means the string
-        // tables and relocations as well as the code -- and discovery that
-        // trusts it disassembles "MESA" and "PIPE" into blocks that end in
-        // SIGILL. The section flags say which bytes are really instructions.
+        // Section flags, not `PF_X`: a segment's executable bit also covers
+        // the string tables and relocations mapped alongside the code, which
+        // discovery would otherwise disassemble into SIGILL blocks.
         if !self.image.code.is_empty() {
             return self
                 .image
@@ -190,45 +166,21 @@ impl<'a> CodeView<'a> {
 
 /// Delete flag writes that no reachable block ever reads.
 ///
-/// Every `cmp`, `adds` and `subs` writes all four of NZCV, and the branch that
-/// follows reads one or two. Within a single block the other three have to be
-/// kept, because a successor might want them; across the whole graph they are
-/// almost always dead, and dropping the write lets [`pass::dce`] delete the
-/// arithmetic that produced it. On a vectorised inner loop that is a third of
-/// the block.
+/// Every `cmp`, `adds` and `subs` writes all four of NZCV and the following
+/// branch reads one or two; across the whole graph the rest are almost always
+/// dead, and dropping the write lets [`pass::dce`] delete the arithmetic that
+/// produced it.
 ///
-/// The analysis is an ordinary backwards liveness fixpoint over the blocks in
-/// hand. A successor that is not among them -- an indirect branch, a call into
-/// a function translated later, an address outside this module -- is assumed
-/// to read every flag, so an incomplete graph loses the optimisation rather
-/// than producing wrong code.
-/// The general-register analogue of this pass is not here, and that is a
-/// result rather than an omission.
+/// An ordinary backwards liveness fixpoint. A successor not among the blocks
+/// in hand is assumed to read every flag, so an incomplete graph loses the
+/// optimisation rather than producing wrong code.
 ///
-/// Twenty percent of emitted code is guest registers going out to the context
-/// at a block boundary and coming back at the next, so removing the writes
-/// that no successor reads looks like the obvious whole-object optimisation:
-/// it needs every successor in hand, which a static recompilation has and a
-/// demand-driven translation of a few thousand blocks does not.
-///
-/// Built and measured: it removes 44 statements out of 27,614 guest
-/// instructions. Nothing. The reason is that the guest was compiled by GCC,
-/// which allocated its registers already -- a value written near the end of a
-/// basic block is written because something downstream reads it, and dead
-/// stores across a boundary essentially do not occur in optimised code.
-///
-/// A return had to be modelled before the analysis found even that much:
-/// treating `ret` as opaque floods every function body with live registers
-/// from its own exit, and the pass removes exactly zero. Assuming the
-/// procedure call standard there -- x9 to x18 are caller-saved and dead at a
-/// return -- cut the opaque blocks from 1514 to 1096 and changed the number
-/// of statements removed not at all. So the assumption buys nothing either,
-/// which is worth knowing before anyone trades soundness for it.
-///
-/// The traffic is not dead writes. It is live values that a block boundary
-/// forces out of locals, and the only things that help are the ones that keep
-/// them in locals across the boundary: regions, and passing registers as
-/// block parameters. Both already exist.
+/// The general-register analogue was built and measured: it removed 44
+/// statements out of 27,614 instructions, because GCC had already allocated
+/// its registers and dead cross-block stores essentially do not occur in
+/// optimised code. Not worth it -- the register traffic is live values a
+/// block boundary forces out of locals, which only regions and block
+/// parameters help.
 fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
     // A kill switch, so the transform can be measured against its absence and
     // a suspected miscompilation bisected.
@@ -242,23 +194,14 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
         .collect();
     let effects: Vec<(u8, u8)> = blocks.iter().map(pass::flag_effects).collect();
 
-    // Successors as block indices, in one flat array rather than a `Vec` per
-    // block.
+    // Successors as block indices in one flat array, resolved once: the
+    // fixpoint walks them every round, so a fresh `Vec` and hash lookup per
+    // round made flag liveness the largest phase on a 410,000-block run.
     //
-    // The fixpoint below walks every block's successors on every round, and
-    // this used to build a fresh `Vec<u64>` and hash each address back to an
-    // index each time it did. On a 410,000-block exhaustive translation that
-    // was millions of allocations and tens of millions of hash lookups, and
-    // it made flag liveness the largest phase in the whole pipeline --
-    // larger than lifting and larger than code generation. Resolving the
-    // edges once turns the inner loop into two array reads.
-    //
-    // A call's `call_return` is a successor here even though it is not a
-    // control-flow edge out of the block: a call's flags are live if either
-    // the callee reads them or the code it returns to does. Without it a
-    // hand-written `cmp; bl f; b.eq` -- legal whenever `f` preserves the
-    // flags, which the ABI permits though no compiler relies on it -- would
-    // lose its compare.
+    // A call's `call_return` counts as a successor even though it is not a
+    // control-flow edge out: a call's flags are live if the callee or the
+    // code it returns to reads them. Without it a `cmp; bl f; b.eq` (legal
+    // when `f` preserves the flags) would lose its compare.
     let mut succ_at: Vec<u32> = Vec::with_capacity(blocks.len() + 1);
     let mut succ_of: Vec<u32> = Vec::new();
     // A block that can leave the graph keeps everything live, and so does one
@@ -334,11 +277,7 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
 
 
 /// Print how long each phase of a translation took, when `GEX_TIMING` is set.
-///
-/// Static recompilation is a pipeline of a few large passes and the balance
-/// between them is not obvious -- and it moves. Lifting was the whole cost
-/// until it was spread over the cores, and then wasm encoding was. Without a
-/// breakdown the next round of that is guesswork.
+/// The balance between passes is not obvious and it moves as they change.
 struct Phases {
     on: bool,
     last: gex_emit::par::Stopwatch,
@@ -385,13 +324,10 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     let mut seen: HashSet<u64> = HashSet::new();
     let mut collected: Vec<Block> = Vec::new();
 
-    // A shared library has no entry point: its `e_entry` is zero, so
-    // `image.entry` is just the load bias and points at the ELF header. gex
-    // seeded it anyway and disassembled "\x7fELF" as an instruction, which is
-    // one block per library that could only ever raise SIGILL.
-    //
-    // Executables always have one, and it is never at offset zero, so
-    // comparing against the bias tells the two apart.
+    // A shared library's `e_entry` is zero, so `image.entry` is the load bias
+    // and points at the ELF header; only an executable has a real entry point,
+    // never at offset zero. Comparing against the bias tells them apart and
+    // avoids disassembling "\x7fELF".
     if image.entry != image.bias && view.is_executable(image.entry) {
         worklist.insert(image.entry);
     }
@@ -433,29 +369,14 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
             let end = seg.vaddr + seg.bytes.len() as u64;
             let mut a = seg.vaddr;
             while a + 4 <= end {
-                // Skip addresses that do not start a decodable instruction.
-                // Executable segments are full of alignment padding and
-                // literal pools; a block there could only ever end in
-                // SIGILL, and leaving the slot on the miss stub reports the
-                // same thing without emitting a wasm function for it. This
-                // is what keeps exhaustive mode affordable — on a static
-                // musl binary it removes about three quarters of the slots.
-                // Sections, not the segment. This loop walked every address
-                // in a `PF_X` mapping, and for a shared library that mapping
-                // holds the string tables, the relocations and `.rodata` as
-                // well as the code. `is_executable` exists to say which bytes
-                // are really instructions and every other discovery pass asks
-                // it; this one did not.
-                //
-                // What that costs is not a wasted block. An address inside
-                // `.rodata` that happens to decode becomes a block, and a
-                // block that starts inside an instruction is wrong code --
-                // harmless while nothing branches to it, and not harmless
-                // once a region folded from it covers the slot of a real
-                // entry point. Built this way, libc broke `apt-get update`:
-                // children died at whatever syscall they were in, and the
-                // same libc translated at run time was fine. See #46, which
-                // is this mistake in the pass above.
+                // Skip addresses that are not really instructions: an
+                // executable segment is full of padding and literal pools, and
+                // for a shared library also holds string tables, relocations
+                // and `.rodata`. `is_executable` uses the section flags to say
+                // which bytes are code. Skipping the rest keeps exhaustive mode
+                // affordable (three quarters of the slots on a static musl
+                // binary) and avoids folding a `.rodata` block over a real
+                // entry point's slot -- the bug in #46 that broke `apt` on libc.
                 if !view.is_executable(a) {
                     a += 4;
                     continue;
@@ -476,14 +397,9 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     phases.mark("seeding");
 
     // Breadth-first, a level at a time, because a level lifts in parallel and
-    // an address-ordered worklist does not. In `--exhaustive` mode the first
-    // level is every decodable address in the text, which is the whole job:
-    // the run that translates all of Debian used to spend it on one core
-    // while Cranelift waited for it with twenty-three idle.
-    //
-    // Each level is sorted, so the block order -- and with it the module's
-    // hash, which the compiled-module cache is keyed on -- is the same on
-    // every run regardless of how the threads were scheduled.
+    // an address-ordered worklist does not. Each level is sorted, so block
+    // order -- and the module hash the compiled-module cache is keyed on -- is
+    // the same on every run regardless of thread scheduling.
     let mut frontier: Vec<u64> = worklist.iter().copied().collect();
     seen.extend(frontier.iter().copied());
     let show_illegal = std::env::var_os("GEX_SHOW_ILLEGAL").is_some();
@@ -501,10 +417,8 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
             stats.instructions += ((block.end - block.start) / 4) as usize;
             if matches!(block.term, Term::Illegal { .. }) {
                 stats.illegal_blocks += 1;
-                // Which instruction, so the gap can be closed rather than
-                // counted. The lifter reaching one of these is a hole in the
-                // static recompilation: the block is emitted, it is
-                // dispatched to, and it raises SIGILL.
+                // Name the instruction so the gap can be closed: a block that
+                // reaches this is emitted, dispatched to, and raises SIGILL.
                 if show_illegal {
                     if let Term::Illegal { raw, pc } = block.term {
                         eprintln!("[illegal] {raw:#010x} at {pc:#x}");
@@ -529,11 +443,9 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 
     phases.mark("lifting");
 
-    // Back into address order, which is what the worklist used to produce.
-    // Emission order fixes the function indices and therefore the module's
-    // bytes, which the compiled-module cache is keyed on; it also decides
-    // which blocks tier-1 considers together when it folds regions. Neither
-    // should change because the lifting was spread over more cores.
+    // Address order: emission order fixes the function indices and so the
+    // module bytes (cache key), and decides which blocks tier-1 folds into a
+    // region. Neither should depend on how the lifting was scheduled.
     collected.sort_unstable_by_key(|b| b.start);
 
     // Flag liveness needs the whole graph, so it runs once discovery has
@@ -553,18 +465,10 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 }
 
 /// A module that translates nothing: the entry stub, the miss stub, and an
-/// empty dispatch table.
-///
-/// Every branch it takes misses, so the runtime translator behind it produces
-/// the whole program. That makes it usable with *any* guest, which is the
-/// point: a web page cannot run the ahead-of-time compiler, so a page that
-/// lets a visitor supply their own binary needs one module it can ship in
-/// advance and use for all of them. The dispatch directory is indexed by
-/// guest page across the whole address space, so nothing in here depends on
-/// where the program it will end up running is linked.
-///
-/// The trade is the one the ahead-of-time path exists to avoid: the first
-/// execution of every block goes through a miss, a lift and a compile.
+/// empty dispatch table. Every branch misses, so the runtime translator
+/// produces the whole program -- usable with *any* guest, which a page that
+/// lets a visitor supply their own binary needs. The trade is that the first
+/// execution of every block pays a miss, a lift and a compile.
 pub fn seed_module(shared_memory: bool) -> TranslatedModule {
     // A text range is still declared because the builder wants one; with no
     // blocks in it, nothing reads it back.
@@ -577,39 +481,18 @@ pub fn seed_module(shared_memory: bool) -> TranslatedModule {
     .finish()
 }
 
-/// Translate code that is not in the image, reading it from live guest
-/// memory (PLAN §6.2).
-///
-/// This is the completeness guarantee: an address with no translation gets
-/// one on demand, whether it was missed by static discovery, produced by a
-/// guest JIT, or brought in by a library loaded after startup. Discovery
-/// still runs recursively from the entry point, so the first miss inside a
-/// function usually translates the whole function and the next branch in it
-/// costs nothing.
-///
-/// `known` names the addresses that already have translations, so the work
-/// list does not redo them.
 /// Statically recompile a whole mapped object: every decodable address in
 /// `[lo, hi)`, not just what one entry point reaches.
 ///
-/// This is the static recompiler applied to shared libraries. Only the
-/// executable is translated ahead of time from its ELF, because only the
-/// executable is loaded by gex -- the interpreter maps everything else itself,
-/// at run time, from guest code. So for a dynamically linked program almost
-/// nothing was statically recompiled: the executable is a stub and ld.so,
-/// libc and the rest all arrived one dispatch miss at a time.
-///
 /// `seeds` says where to start; empty means every decodable address in the
-/// range. Empty is right for an object with no symbols left and wrong for one
-/// that has them -- a shipped library's `.dynsym` names a few thousand entry
-/// points, and scanning instead finds two hundred thousand, most of them the
-/// middle of a function that a block starting earlier already covers.
+/// range. Empty is right for a stripped object and wrong for one with a
+/// `.dynsym`, whose few thousand entry points beat scanning's two hundred
+/// thousand -- most of them mid-function addresses an earlier block covers.
 ///
-/// Seeding from the object rather than from one entry point is what makes
-/// it static. Discovery still runs -- a block's successors are followed, and
-/// a PLT's GOT load is folded so its indirect branch becomes a known target --
-/// but it no longer depends on which address the guest happened to reach
-/// first, which is what made the demand-driven output differ between runs.
+/// Discovery still runs (successors are followed, a PLT's GOT load is folded
+/// so its indirect branch becomes a known target), but seeding from the whole
+/// object rather than one entry point is what stops the output depending on
+/// which address the guest reached first.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn translate_object(
@@ -669,17 +552,10 @@ pub fn translate_object(
     (modules, stats)
 }
 
-/// Announce where a whole-object lift has got to, when asked.
-///
-/// Set `GEX_XLATE_STAGES=1` to get a line per stage on stderr. This exists
-/// because the largest object in the graphics rootfs -- Mesa's software
-/// rasteriser, 471,205 blocks -- lifts to a peak working set of 2109 MiB,
-/// against a shim heap of 2039 MiB, and a total at the end says nothing about
-/// which stage holds the peak. Off by default and one `getenv` when it is on,
-/// so it costs nothing in the runtime that cannot afford it.
-///
-/// The resident figure is read from `/proc` and is therefore native-only; in
-/// the shim it prints the count alone, which is still the useful half.
+/// Announce where a whole-object lift has got to, one line per stage on
+/// stderr, when `GEX_XLATE_STAGES=1`. Helps locate which stage holds the
+/// memory peak on a large object. The resident figure comes from `/proc` and
+/// is native-only; the shim prints the count alone.
 fn stage(what: &str, n: usize) {
     if std::env::var_os("GEX_XLATE_STAGES").is_none() {
         return;
@@ -700,29 +576,18 @@ fn stage(what: &str, n: usize) {
 
 /// How many block functions gex will put in one wasm module.
 ///
-/// wasmtime refuses a module with more than a million functions, and Mesa and
-/// libz3 both have more blocks than that -- `--recompile-objects` failed on
-/// them and quietly fell back to translating at run time, which is the one
-/// outcome static recompilation exists to avoid. So an object that does not
-/// fit in one module is emitted as several.
-///
-/// The number is well under the ceiling on purpose. Splitting is not free:
-/// `tier1` emits a direct tail call for an edge whose target is in the same
-/// module and a table dispatch for one that is not, so every split turns some
-/// direct calls into indirect ones. Fewer, fuller modules are faster, and the
-/// chunking below keeps consecutive pages together so that the edges that do
-/// cross a boundary are the rare long-range ones rather than a function's own
-/// fallthrough.
+/// wasmtime refuses a module with more than a million functions, so an object
+/// with more blocks (Mesa, libz3) is split into several. Well under the
+/// ceiling on purpose: a split turns same-module direct tail calls into table
+/// dispatches, so fewer, fuller modules are faster, and the chunking keeps
+/// consecutive pages together so crossing edges are the rare long-range ones.
 pub const MAX_FUNCS_PER_MODULE: usize = 500_000;
 
-/// Encode discovered blocks as one module, or as several if there are too
-/// many for one.
+/// Encode discovered blocks as one module, or several if too many for one.
 ///
-/// The split is by dispatch page, never within one: a page's slots are
-/// allocated as a unit and its element segment is written by whichever module
-/// claimed it, so two modules sharing a page would each hold half its slots
-/// and the second to be installed would overwrite the first's with the stub.
-/// Whole pages, in address order, keeps each module's slot range its own.
+/// The split is by dispatch page, never within one: a page's element segment
+/// is written whole by whichever module claims it, so two modules sharing a
+/// page would have the second overwrite the first's slots with the stub.
 fn emit_modules(
     blocks: Vec<Block>,
     text_base: u64,
@@ -744,10 +609,8 @@ fn emit_modules(
         return vec![builder.finish()];
     }
 
-    // Group by page first, then walk the pages in address order filling one
-    // chunk at a time. A page is never split, so a chunk may overshoot the
-    // budget by up to one page's worth of blocks -- 1024 at the very most,
-    // against a budget of half a million.
+    // Group by page, then fill one chunk at a time in address order. A page is
+    // never split, so a chunk may overshoot the budget by one page's blocks.
     let mut by_page: BTreeMap<u64, Vec<Block>> = BTreeMap::new();
     for block in blocks {
         by_page
@@ -861,15 +724,9 @@ fn discover(
     let mut seen: HashSet<u64> = HashSet::new();
     let mut collected: Vec<Block> = Vec::new();
 
-    // Breadth-first rather than the address-ordered worklist this used to be,
-    // because a level can be lifted in parallel and an arbitrary worklist
-    // cannot. Lifting is the serial half of static recompilation: Cranelift
-    // uses every core, and until this changed the pass that feeds it used
-    // one, so a large object spent minutes at 4% of the machine.
-    //
-    // The seeds are the first level. Each level is sorted, so the output is
-    // the same on every run -- the compiled-module cache is content-addressed
-    // and a translation that varied between runs would never hit it.
+    // Breadth-first, a level at a time, because a level lifts in parallel and
+    // an arbitrary worklist does not. Each level is sorted, so the output is
+    // identical across runs, which the content-addressed module cache needs.
     let mut frontier: Vec<u64> = seeds
         .iter()
         .copied()
@@ -910,18 +767,11 @@ fn discover(
                 }
             }
             for succ in targets {
-                // Deliberately *not* skipping an address that falls inside a
-                // block already lifted.
-                //
-                // Doing so is a large saving -- it takes libc from 200,000
-                // blocks to a few tens of thousands -- and it is wrong. An
-                // interior address is still a legal target for an indirect
-                // branch, and dispatch needs a block that starts exactly
-                // there; entering the containing block would re-run the
-                // instructions before it. With runtime translation behind it
-                // that is only a miss. Without, it is where the program dies,
-                // which is what `ld.so` did at 0x2801ae40 the first time this
-                // was tried.
+                // Deliberately *not* skipping an address inside a block
+                // already lifted: an interior address is still a legal
+                // indirect-branch target, and dispatch needs a block starting
+                // exactly there. Entering the containing block would re-run
+                // the instructions before it.
                 if fetchable(memory, executable, succ)
                     && !seen.contains(&succ)
                     // Never re-translate something the table already answers
@@ -1024,16 +874,9 @@ mod tests {
         }
     }
 
-    /// An object too large for one module comes back as several, and the
-    /// split respects the one boundary that matters.
-    ///
-    /// A dispatch page's slots are allocated as a unit and written by
-    /// whichever module claimed the page. Two modules holding blocks from the
-    /// same page would each write that page's whole element segment, and the
-    /// second installed would overwrite the first's entries with the miss
-    /// stub -- every block in the first module would then be silently
-    /// unreachable, which is the kind of failure that shows up as a
-    /// mysterious dispatch miss a long way from here.
+    /// An object too large for one module splits into several, and no dispatch
+    /// page is split across two modules (which would have the second overwrite
+    /// the first's slots with the miss stub).
     #[test]
     fn a_large_object_splits_on_page_boundaries() {
         // Eight pages of `ret`, every word a seed, so the blocks spread

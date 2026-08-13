@@ -39,27 +39,14 @@ fn inline_fma() -> bool {
 /// Guest instruction width. A64 is fixed-width; the whole design leans on it.
 pub const INST_BYTES: u64 = 4;
 
-/// Lifting state for one basic block.
 /// What the condition flags hold, when it is something a branch can ask for
-/// directly instead of reading them.
+/// directly instead of reading N/Z/C/V. Lets `cmp`+`b.cc` compare the operands
+/// directly; the flag writes still happen for successors, but flag liveness
+/// then deletes the ones nobody reads.
 ///
-/// AArch64's most common two instructions in sequence are a comparison and a
-/// conditional branch, and the flags between them are almost always dead
-/// afterwards. Lifting them literally costs about eight wasm operations --
-/// materialise N as `r >> 63`, V as four operations of overflow algebra, then
-/// compare the two for equality -- where `i64.lt_s` is one. Remembering what
-/// the flags were computed *from* lets the branch ask the original question.
-///
-/// This is TCG's `cc_op` in the small: the flag writes still happen, because
-/// a successor block may read them, but nothing in this block reads them
-/// back, so dead-store elimination and cross-block flag liveness can delete
-/// the arithmetic that produced them.
-///
-/// Every write to N, Z, C or V must update this, and the ones that cannot be
-/// described set [`FlagSource::Unknown`]. A stale source would compile a
-/// branch on the wrong question, so the rule is that flags are unknown until
-/// something says otherwise -- a block starts that way, because its
-/// predecessor is not known here.
+/// Invariant: every write to N, Z, C or V must update this, and any it cannot
+/// describe sets [`FlagSource::Unknown`]. A stale source compiles a branch on
+/// the wrong question.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum FlagSource {
     #[default]
@@ -76,13 +63,8 @@ pub struct Lifter<'a> {
     /// What the flags mean right now. Carried in and out across the
     /// instructions of one block.
     flags: FlagSource,
-    /// The instruction word being lifted.
-    ///
-    /// Only the decoder needs this normally, but an instruction the lifter has
-    /// no wasm form for becomes a SIGILL naming the word, and a SIGILL that
-    /// names `0x00000000` sends the reader looking for memory corruption
-    /// instead of a missing instruction. That happened: `ushl` reported itself
-    /// as a zero word in the middle of libpython.
+    /// The instruction word being lifted, so a SIGILL for an inexpressible
+    /// instruction can name the actual word rather than `0x00000000`.
     raw: u32,
 }
 
@@ -157,10 +139,9 @@ struct AddResult {
 struct Address {
     base: Value,
     offset: i64,
-    /// Post-index writeback to apply after the access: the register to
-    /// update and how much to add to it. A value rather than a constant
-    /// because the register-offset form exists, and there the amount is only
-    /// known at run time.
+    /// Post-index writeback applied after the access. A `Value`, not a
+    /// constant, because the register-offset form's amount is only known at
+    /// run time.
     post: Option<(RegSel, Value)>,
 }
 
@@ -395,12 +376,10 @@ impl<'a> Lifter<'a> {
 
     /// The condition as a question about the values the flags came from.
     ///
-    /// `None` when the flags are not something this can rewrite, and the
-    /// caller falls back to reading N, Z, C and V.
+    /// `None` when the caller must fall back to reading N/Z/C/V.
     ///
-    /// The unsigned pairs are the ones worth double-checking: after `subs`,
-    /// AArch64's carry flag is *not borrow*, so C set means `a >= b`
-    /// unsigned, and HI -- C set and Z clear -- is `a > b`.
+    /// Gotcha: after `subs` AArch64's carry is *not borrow*, so C set means
+    /// `a >= b` unsigned and HI (C set, Z clear) is `a > b`.
     fn cond_direct(&mut self, cond: Cond) -> Option<Value> {
         match self.flags {
             FlagSource::Unknown => None,
@@ -586,10 +565,8 @@ impl<'a> Lifter<'a> {
         match *inst {
             Inst::Unknown { raw } | Inst::Undefined { raw } => Flow::End(Term::Illegal { raw, pc }),
 
-            // Hints are architecturally no-ops for us. That includes the
-            // pointer-authentication hints: with PAC unimplemented, signing
-            // and authenticating are both the identity, so a program that
-            // signs a pointer and later authenticates it still gets it back.
+            // Hints are no-ops for us, including the PAC hints: with PAC
+            // unimplemented, sign and authenticate are both the identity.
             Inst::Hint { .. } => Flow::Next,
 
             // Clearing the monitor makes the next store-exclusive fail, which
@@ -1388,13 +1365,9 @@ impl<'a> Lifter<'a> {
                 neg_product,
                 neg_addend,
             } => {
-                // AArch64 fuses this: one rounding for the whole expression.
-                // Wasm has no fused multiply-add, and rounding the product
-                // first is not a small difference -- it is enough to make
-                // musl's `pow` answer 1024.0000000000002 for `2^10`, because
-                // musl builds its double-double arithmetic out of exactly
-                // this instruction. So the host is asked; every one of them
-                // has an FMA (PLAN §5.7).
+                // AArch64 fuses this (one rounding); wasm has no FMA and
+                // rounding the product first is enough to break musl's `pow`,
+                // which is built on it. So the host's FMA is called (PLAN §5.7).
                 let double = sz.is_double();
                 let a = self.rd_fp(vn, sz);
                 let b = self.rd_fp(vm, sz);
@@ -1419,12 +1392,9 @@ impl<'a> Lifter<'a> {
                 } else {
                     c
                 };
-                // GEX_INLINE_FMA emits a multiply and an add instead of the
-                // fused call. It is *not* correct -- fusing rounds once and
-                // this rounds twice, which is a different number -- and it
-                // exists only to size the prize: nbench's LU decomposition
-                // makes 706 million of these calls, and the question is what
-                // fraction of the kernel that actually costs.
+                // GEX_INLINE_FMA emits a multiply and an add instead. Not
+                // correct -- it rounds twice -- and exists only to measure
+                // what the fused host call costs.
                 if inline_fma() {
                     let prod = self.b.def(Expr::FpBin {
                         op: FpBinOp::Mul,
@@ -1525,12 +1495,9 @@ impl<'a> Lifter<'a> {
                 vn,
                 vm,
             } => {
-                // Add or subtract at the source width, then keep the top half
-                // of each result. wasm has no narrowing that truncates -- its
-                // `narrow` instructions saturate, which is a different answer
-                // -- so the halves are picked out with a byte shuffle, which
-                // is what "keep the high half of each lane" means once the
-                // lanes are laid out in memory order.
+                // Add/subtract at source width, then keep each result's high
+                // half via a byte shuffle: wasm's `narrow` saturates rather
+                // than truncating.
                 let src = VArr {
                     lane_bytes: dst_bytes * 2,
                     q: true,
@@ -1872,13 +1839,9 @@ impl<'a> Lifter<'a> {
                     dst_wide: sz.is_double(),
                     a,
                 });
-                // The fixed-point form reads the integer as a value scaled by
-                // 2^fbits, so dividing it back out finishes the job. Scaling
-                // by a power of two is exact, and it commutes with the
-                // rounding the conversion already did, so this is the single
-                // correctly-rounded result the architecture asks for -- barring
-                // an underflow into subnormals, which no caller of this form
-                // is arranging for.
+                // Fixed-point: the integer is scaled by 2^fbits, so divide it
+                // back out. Scaling by a power of two is exact, so the result
+                // stays correctly rounded.
                 let v = self.scale_by_power_of_two(v, sz.is_double(), -(fbits as i32));
                 self.wr_fp(vd, sz, v);
                 Flow::Next
@@ -2659,12 +2622,8 @@ impl<'a> Lifter<'a> {
             return Flow::Next;
         }
 
-        // `cmhi`/`cmhs` on 64-bit lanes. wasm's i64x2 comparisons are signed
-        // only, so the operands are biased into signed order first: flipping
-        // the top bit of each lane maps the unsigned range onto the signed
-        // one monotonically, and `a >u b` becomes `(a ^ min) >s (b ^ min)`.
-        // Two extra xors, no branches, and it keeps Mesa's 64-bit compares
-        // out of SIGILL -- which is where they were.
+        // `cmhi`/`cmhs` on 64-bit lanes. wasm's i64x2 compares are signed
+        // only, so bias into signed order: `a >u b` == `(a^min) >s (b^min)`.
         if matches!(op, VOp3::CmHi | VOp3::CmHs) && lane == VLane::I64 {
             let mut bytes = [0u8; 16];
             bytes[7] = 0x80;
@@ -2737,11 +2696,7 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
-            // Absolute difference: max - min avoids a signed overflow that a
-            // subtract-then-abs would hit at the extremes.
-            // `|a - b|`, which for floating point is a subtract and an
-            // absolute value rather than the compare-and-select the integer
-            // forms below need.
+            // `|a - b|`: for floating point, a subtract and an absolute value.
             VOp3::FAbd => {
                 let diff = self.b.def(Expr::VLaneBin {
                     op: VLaneBinOp::Sub,
@@ -2757,6 +2712,7 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
+            // max - min, which cannot overflow the way subtract-then-abs can.
             VOp3::SAbd | VOp3::UAbd => {
                 let signed = op == VOp3::SAbd;
                 let hi = self.b.def(Expr::VLaneBin {
@@ -2822,20 +2778,11 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
-            // The register-variable shifts. wasm has no per-lane shift count
-            // -- `i64x2.shl` takes one scalar for the whole vector -- so each
-            // lane is done on its own, which is two extracts, a handful of
-            // scalar operations and a replace.
-            //
-            // AArch64 reads the count from the *low byte* of the second
-            // operand's lane, as a signed value: negative shifts right. A
-            // count at or past the lane width is not undefined here the way it
-            // is in wasm, it means everything is shifted out -- zero, or for a
-            // signed right shift the sign bit replicated -- so each direction
-            // needs its own out-of-range case rather than wasm's modulo.
-            //
-            // libpython reaches this in its integer code, which is where it
-            // was found: `ushl v0.2d, v0.2d, v5.2d`.
+            // Register-variable shifts, done per lane since wasm has no
+            // per-lane count. The count is the low byte of the second
+            // operand's lane, signed: negative shifts right, and a count at or
+            // past the lane width shifts everything out (zero, or the
+            // replicated sign bit) rather than wrapping as wasm would.
             VOp3::UShl | VOp3::SShl => {
                 let signed = op == VOp3::SShl;
                 let bits = arr.lane_bytes * 8;
@@ -2963,14 +2910,9 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
-            // `saddlp`/`uaddlp` and the accumulating `sadalp`/`uadalp`.
-            // The encoding's `size` is the *source* width, so the result has
-            // half as many lanes of twice the width.
-            //
-            // wasm has the byte and halfword steps outright. The word step it
-            // does not, so that one is a pair of shuffles against a zero
-            // vector -- which is how a lane gets zero-extended without an
-            // extend instruction -- and an add.
+            // `saddlp`/`uaddlp` and accumulating `sadalp`/`uadalp`: pairwise
+            // add into lanes of twice the width. Byte and halfword steps are
+            // wasm builtins; the word step is two shuffles and an add.
             VOp2::Saddlp | VOp2::Uaddlp | VOp2::Sadalp | VOp2::Uadalp => {
                 let signed = matches!(op, VOp2::Saddlp | VOp2::Sadalp);
                 let accumulate = matches!(op, VOp2::Sadalp | VOp2::Uadalp);
@@ -3053,17 +2995,9 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
-            // wasm has no vector count-leading-zeros at any lane width, so
-            // it is built from one it does have. Smearing every set bit down
-            // to the bottom of its lane turns the leading-zero count into a
-            // population count: after `x |= x >> 1 … >> w/2`, the lane holds
-            // exactly as many ones as it had bits at or below its highest
-            // set one, and `w - popcount` is the answer. Zero smears to zero
-            // and gives `w`, which is right.
-            //
-            // The population count itself comes back per byte, so for wider
-            // lanes it is summed with pairwise adds -- one for halfwords, two
-            // for words.
+            // No vector CLZ in wasm. Smear every set bit down its lane, then
+            // popcount: `w - popcount` is the leading-zero count. The byte
+            // popcount is summed up to the lane width with pairwise adds.
             VOp2::Clz => {
                 let bits = arr.lane_bytes * 8;
                 let lane = Self::lane_of(arr);
@@ -3123,11 +3057,10 @@ impl<'a> Lifter<'a> {
                     VOp2::Rev32 => 4,
                     _ => 8,
                 };
-                // The decoder rejects an element at least as wide as its
-                // group, which is what would make the arithmetic below
-                // underflow. Checked again here because a permutation with a
-                // wrapped index does not produce a wrong answer, it produces a
-                // module that will not load.
+                // An element as wide as its group would underflow the
+                // arithmetic below; the decoder rejects it, rechecked here
+                // because a wrapped shuffle index yields a module that will
+                // not load.
                 if arr.lane_bytes >= group {
                     return Flow::End(Term::Illegal { raw: self.raw, pc });
                 }
@@ -3275,16 +3208,9 @@ impl<'a> Lifter<'a> {
         }
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
-        // A right shift by the whole element width is legal on AArch64 and
-        // means what it says: every bit shifted out, so zero unsigned and the
-        // replicated sign bit signed. wasm does not have that shift -- it
-        // takes the count modulo the lane width, so a count of 32 on a 32-bit
-        // lane is a shift by zero and returns the input unchanged.
-        //
-        // Quietly returning the input is the worst possible answer, and it is
-        // what gex did: `ushr v0.4s, v0.4s, #32` came back with its operand.
-        // dpkg-deb decompressing a package overran a buffer and glibc's stack
-        // protector aborted it, several hundred files into the archive.
+        // A right shift by the whole element width is legal on AArch64 (every
+        // bit out: zero, or the replicated sign bit) but wasm takes the count
+        // modulo the lane width, which would instead return the input.
         let bits = arr.lane_bytes * 8;
         let shift = if matches!(op, VShiftImmOp::SShr | VShiftImmOp::UShr) && shift >= bits {
             if op == VShiftImmOp::UShr {
@@ -3301,15 +3227,9 @@ impl<'a> Lifter<'a> {
         let amount = self.b.const_i32(shift);
         let sop = match op {
             VShiftImmOp::Shl => VShiftOp::Shl,
-            // Shift and insert. The bits the shift vacates come from the
-            // destination, so this is a splice: shift the source, and keep the
-            // part of the destination the shift did not reach. A shift by the
-            // whole width cannot be encoded for either of these, so the mask
-            // below is never all-ones or all-zeroes.
-            //
-            // libpython's hashing reaches `sli`, which is where these turned
-            // up. A width-independent mask would be nice; each lane's mask is
-            // the same, so building the constant once is enough.
+            // Shift-and-insert: the vacated bits come from the destination.
+            // Shift the source, then splice in the part of the destination the
+            // shift did not reach.
             VShiftImmOp::Sli | VShiftImmOp::Sri => {
                 let old = self.b.read(GuestReg::V128(vd.0));
                 let left = op == VShiftImmOp::Sli;
@@ -3354,9 +3274,7 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 return Flow::Next;
             }
-            // Shift right and accumulate. The shift itself is the ordinary
-            // one, including its behaviour at the full element width, and the
-            // result is added to what the destination already holds.
+            // Shift right, then add to what the destination already holds.
             VShiftImmOp::SSra | VShiftImmOp::USra => {
                 let signed = op == VShiftImmOp::SSra;
                 let old = self.b.read(GuestReg::V128(vd.0));
@@ -3489,18 +3407,11 @@ impl<'a> Lifter<'a> {
         Flow::Next
     }
 
-    /// `ld3`/`ld4` and `st3`/`st4`: three or four registers interleaved.
-    ///
-    /// Memory holds lane 0 of every register, then lane 1 of every register,
-    /// and so on, so both directions are a byte gather. The block is
-    /// `regs * bytes` long -- 64 for the four-register full-width forms --
-    /// and is moved as whole vectors, with a trailing eight-byte access when
-    /// the total is not a multiple of sixteen (`ld3` on the 64-bit
-    /// arrangements is 24 bytes).
-    ///
-    /// Two registers get their own instruction because a single shuffle
-    /// reaches two inputs; beyond that the gather needs a tree, which is what
-    /// [`Self::gather_bytes`] is.
+    /// `ld3`/`ld4` and `st3`/`st4`: three or four registers interleaved in
+    /// memory (lane 0 of each, then lane 1, ...), so both directions are a
+    /// byte gather over whole vectors plus a trailing 8-byte access when the
+    /// `regs * bytes` block is not a multiple of 16. Three or more sources
+    /// need a gather tree; see [`Self::gather_bytes`].
     fn load_store_n(
         &mut self,
         load: bool,
@@ -3585,14 +3496,10 @@ impl<'a> Lifter<'a> {
         Flow::Next
     }
 
-    /// Build one vector by taking each byte from a numbered position in a
-    /// concatenation of up to four source vectors.
-    ///
-    /// `want[i]` is that position, counting sixteen bytes per source. wasm's
-    /// shuffle reaches two vectors, so three or four sources take a tree: one
-    /// shuffle per pair, then one to choose between the pairs. Positions that
-    /// are not wanted from a given pair select byte zero of it, which is
-    /// harmless because the final shuffle never picks them.
+    /// Gather each byte from `want[i]`, a position in the concatenation of up
+    /// to four sources (16 bytes each). wasm shuffle reaches two vectors, so
+    /// three or four sources take a tree: one shuffle per pair, then one to
+    /// choose between them.
     fn gather_bytes(&mut self, srcs: &[Value], want: &[u8; 16]) -> Value {
         debug_assert!(!srcs.is_empty() && srcs.len() <= 4);
         let pair = |lift: &mut Self, base: usize| -> Value {
@@ -3633,20 +3540,12 @@ impl<'a> Lifter<'a> {
         })
     }
 
-    /// Convert every lane between integer and floating point.
-    ///
-    /// wasm's SIMD conversions only cover 32-bit lanes: there is no
-    /// `f64x2.convert_i64x2_s` and no `i64x2.trunc_sat_f64x2_s`. For the
-    /// 64-bit arrangements the two lanes are therefore converted one at a
-    /// time with the scalar instructions, which is still branch-free.
     /// `scvtf`/`ucvtf`/`fcvtzs`/`fcvtzu` with a fractional-bit count.
     ///
     /// The lane holds a fixed-point number with `fbits` fractional bits, so
     /// the conversion is the ordinary one with a scale either side of it:
     /// dividing by `2^fbits` on the way out of an integer, multiplying by it
-    /// on the way in. Scaling by a power of two is exact in binary floating
-    /// point, so nothing is lost by doing it as a separate multiply rather
-    /// than folding it into the conversion the way the hardware does.
+    /// on the way in. Scaling by a power of two is exact, so nothing is lost.
     fn fixed_convert(
         &mut self,
         op: VShiftImmOp,
@@ -3703,6 +3602,9 @@ impl<'a> Lifter<'a> {
         Flow::Next
     }
 
+    /// Convert every lane between integer and floating point. wasm's SIMD
+    /// conversions only cover 32-bit lanes, so 64-bit arrangements convert
+    /// their two lanes one at a time with the scalar instructions.
     fn lane_convert(&mut self, arr: VArr, a: Value, kind: FpConvert, signed: bool) -> Value {
         if arr.lane_bytes != 8 {
             let to_fp = matches!(kind, FpConvert::IntToFp { .. });
@@ -3890,9 +3792,8 @@ impl<'a> Lifter<'a> {
         let r = self.add_with_carry(ty, a, operand, carry);
         self.wr_gp(rd, sz, r.value);
         self.set_nzcv(&r);
-        // After the writes, because `set_nzcv` clears it. `b` here is the
-        // original second operand: the negation the carry rule needs is
-        // `operand`, and asking "is a less than NOT b" would be nonsense.
+        // After the writes, since `set_nzcv` clears it. `b` is the original
+        // second operand, not the negated `operand` the carry rule used.
         if op == AddOp::Sub {
             self.flags = FlagSource::Sub { a, b, ty };
         }

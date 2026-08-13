@@ -1,26 +1,14 @@
-//! Run the *runtime* translator on one address, natively.
+//! Run the *runtime* translator on one address, natively, for profiling and
+//! debugging it where a browser run cannot be looked inside.
 //!
 //!   cargo run --release -p gex-xlate --example translate-at -- <elf> <addr> [max-blocks]
 //!
-//! `gexc build` exercises `translate_image`, which walks a whole binary with
-//! every symbol and relocation in hand. The browser never does that: there is
-//! no ahead-of-time step in a page, so every block arrives through
+//! The browser has no ahead-of-time step, so every block arrives through
 //! `translate_runtime`, which starts from one address in live memory and
-//! follows only what it can reach. The two take different paths through the
-//! lifter and they fail differently.
-//!
-//! That difference cost most of a day. Xvfb builds statically in three
-//! seconds -- 367,171 blocks, all of it -- and in the browser the translator
-//! went into the block at `Xvfb+0x1826f8` and never came out, with the whole
-//! run silent behind it because nothing else can run while a translation is
-//! in progress. A forty-second browser run to reproduce, and no way to look
-//! inside it.
-//!
-//! So: the same entry point, on the host, where it takes a second and a
-//! profiler works. The memory image is approximated by mapping the ELF's
-//! PT_LOADs at `PIE_BASE`, which is what the loader does for the pages that
-//! matter here -- code and rodata. Nothing is relocated, because lifting
-//! reads instructions rather than pointers.
+//! follows only what it reaches -- a different path than `translate_image`.
+//! The memory image is approximated by mapping the ELF's PT_LOADs at
+//! `PIE_BASE`; nothing is relocated, because lifting reads instructions rather
+//! than pointers.
 use std::io::Write;
 
 fn main() {
@@ -33,8 +21,7 @@ fn main() {
     let addr = if args[2] == "object" { 0 } else { u64::from_str_radix(args[2].trim_start_matches("0x"), 16).expect("hex address") };
     let max_blocks: usize = args.get(3).map_or(2048, |s| s.parse().expect("a number"));
 
-    // Just enough of the address space to hold the image. The guest's is two
-    // gigabytes; this only needs to reach the end of the last segment.
+    // Just enough of the address space to reach the end of the last segment.
     let base = gex_abi::PIE_BASE;
     let mut segments: Vec<(u64, u64, usize, usize)> = Vec::new();
     let phoff = u64::from_le_bytes(elf[0x20..0x28].try_into().unwrap()) as usize;
@@ -67,9 +54,8 @@ fn main() {
         memory[*start as usize..*start as usize + filesz]
             .copy_from_slice(&elf[*offset..*offset + *filesz]);
     }
-    // Which addresses hold instructions. The lifter asks before every fetch,
-    // and answering yes for everything is how a run ends up disassembling
-    // .rodata.
+    // Which addresses hold instructions; the lifter asks before every fetch,
+    // and a blanket yes ends up disassembling .rodata.
     let exec: Vec<(u64, u64)> = {
         let mut v = Vec::new();
         for i in 0..phnum {
@@ -88,10 +74,8 @@ fn main() {
     };
 
     // `object` recompiles the whole executable segment the way the runtime
-    // does when the guest maps a library, rather than following one address.
-    // That is the path a browser now takes, and the one that breaks on
-    // Mesa's software rasteriser: 471,205 blocks, which is the first object
-    // in the graphics rootfs big enough to need more than one wasm module.
+    // does when the guest maps a library, rather than following one address --
+    // the path that needs more than one wasm module on a large object.
     if args[2] == "object" {
         let (lo, hi) = exec.first().copied().unwrap_or((base, base));
         let mut seeds: Vec<u64> = Vec::new();

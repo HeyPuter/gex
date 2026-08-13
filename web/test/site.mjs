@@ -1,19 +1,10 @@
-// The demo site itself, in a real browser.
+// The demo site in a real browser -- tests the *page* (vite bundle, assets,
+// button->guest wiring), not the runtime.
 //
 //   node web/test/site.mjs [demo-id ...]
 //
-// Everything else here tests the runtime. This tests the *page*: the bundle
-// vite built, the assets it ships, the wiring between a button and a guest.
-// All of that has broken independently of the runtime -- a stale
-// `gex_browser.wasm` missing an export the glue called, a rootfs tar that was
-// never built, a demo that threw before it ran a byte -- and none of it showed
-// up in any other test.
-//
-// The page is not modified to be testable. It gains two things a person can
-// use as well: `?demo=<id>` picks a demo, `?run=1` presses its first button,
-// and `status()` announces itself as a `gex:status` event. The reporter below
-// is injected by this server into the served HTML, so what runs is the built
-// bundle and nothing else.
+// The page gains `?demo=<id>`, `?run=1`, and a `gex:status` event; the
+// REPORTER below is injected into the served HTML.
 import { spawn } from 'node:child_process';
 import { readFile, access, stat } from 'node:fs/promises';
 import { join, dirname, extname } from 'node:path';
@@ -24,96 +15,49 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB = join(HERE, '..');
 const DIST = join(WEB, 'dist');
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
-// A site to test other than the built one.
+// A site to test other than the built one; requests are passed through and
+// only the HTML is touched, to add the reporter.
 //
 //   GEX_SITE=http://localhost:5173 node web/test/site.mjs virgl
-//
-// `dist` and `npm run dev` are not the same page: the dev server serves the
-// module graph rather than a bundle, transforms on the fly, and starts its
-// Workers from source. Everything here had only ever been proved against
-// `dist`, which is the one nobody develops against.
-//
-// The requests are passed through so the page under test is exactly what that
-// server sends; only the HTML is touched, to add the reporter.
 const UPSTREAM = process.env.GEX_SITE || '';
 const WALL = Number(process.env.GEX_WALL || 900) * 1000;
-// How much of the terminal to print. The page hands over its whole
-// scrollback now, so the only reason not to print all of it is that most
-// runs do not need it: `GEX_TAIL=0` means everything.
+// How many terminal lines to print; `GEX_TAIL=0` means all of the scrollback.
 const TAIL = process.env.GEX_TAIL === undefined ? 60 : Number(process.env.GEX_TAIL);
 
-// Which demos to drive, and what counts as having worked. A demo that needs a
-// network or a GPU that this machine may not have says so rather than failing.
-// Every `want` is something the *guest* wrote. The page's own lines --
-// "rootfs: N files", a status of running -- were what these used to look for,
-// and both are true of a demo that unpacks an image and then does nothing at
-// all. That is how every one of these passed while no guest ran: the Worker
-// chunk imported a module that did not exist, 404'd, and rejected where
-// nobody was listening.
-//
-// `settle` is the status that ends the wait when there is one. An interactive
-// shell never finishes, so those demos have no settle and must produce their
-// prompt.
+// Which demos to drive, and what counts as having worked. Every `want` must be
+// something the *guest* wrote, not a page line true of a demo that unpacked an
+// image and did nothing. `settle` is the status that ends the wait; an
+// interactive shell has none and must produce its prompt.
 const DEMOS = {
-  // The prompt each shell actually prints, taken from a run rather than
-  // guessed: xterm's `innerText` drops the trailing space, so a pattern
-  // anchored on "$ " never matches a prompt that is plainly there.
+  // Prompt patterns taken from a real run: xterm's `innerText` drops the
+  // trailing space, so a pattern anchored on "$ " never matches.
   busybox: { want: /~ \$/ },
   debian: { want: /[#$]/ },
-  // The same demo, told to run `apt-get update` and exit rather than open a
-  // shell. Needs a proxy: `GEX_QUERY='wisp=ws://127.0.0.1:5111/&cmd=apt-get
-  // update'`, with `wisp-js-server` on that port.
-  //
-  // `Fetched` is the line apt prints when it has the index and has read it.
-  // Not `Get:`, which only says a download started -- the run this exists to
-  // catch got as far as one `Get:` and then stopped forever.
-  // A command in the Debian rootfs, judged by a marker the command itself
-  // prints. Not by `debian`'s prompt pattern: that is `/[#$]/`, which matches
-  // a `$` anywhere -- including in the demo's own echo of the command it was
-  // given. Several runs "passed" at the first tick on the strength of a `$?`
-  // in the command line, and the browser was killed five seconds in, before
-  // the guest had done anything. A check that can pass without the guest is
-  // worse than no check.
+  // A command in the Debian rootfs, judged by a marker the command prints, not
+  // by `debian`'s `/[#$]/` prompt (which matches the page's echo of the command
+  // -- a check that can pass without the guest is worse than no check).
   'debian-cmd': { demo: 'debian', want: /GEX-CMD-DONE/ },
-  // The filesystem a package manager needs, in one shell line and no network.
-  //
-  // `ln -s` with an absolute target was stored *relative*: the global
-  // kernel ran the target through the same helper that strips a leading
-  // slash off a path being created. Every `apt-get install` died on it --
-  // apt links its downloaded archives into a temporary directory by
-  // absolute path and dpkg reports "cannot stat pathname" on names that
-  // are plainly there. `test -x` follows the link, so it fails when the
-  // link dangles and again if the mode did not survive.
-  //
-  // The rename is the second half: dpkg unpacks a program to `.dpkg-new`,
-  // chmods it and renames it into place, and the mode used to stay behind.
+  // The filesystem a package manager needs, in one shell line and no network:
+  // an absolute symlink target must stay absolute, and a mode must survive a
+  // rename (`test -x` follows the link and checks the mode).
   'debian-fs': {
     demo: 'debian',
     cmd:
       'd=$(mktemp -d); ln -s /bin/dash $d/l; test -x $d/l; echo link=$?; '
       + 'cp /bin/dash $d/n; chmod 755 $d/n; mv $d/n $d/m; test -x $d/m; echo mode=$?; '
       + 'echo fs=done',
-    // `link=0`, not `LINK-OK`: the page echoes the command it was given, so
-    // a marker that appears in the command line is a test that passes with
-    // no guest at all. `echo link=$?` cannot contain `link=0`.
+    // `link=0`, not a literal marker: the page echoes the command, so a marker
+    // in the command line would pass with no guest. `echo link=$?` cannot.
     want: /link=0[\s\S]*mode=0/,
   },
   'debian-apt': {
-    // The page has no such demo: this is the Debian one, run differently.
     demo: 'debian',
     want: /Fetched .* in |Reading package lists\.\.\. Done/,
     fail: /Temporary failure|Could not resolve|Failed to fetch/,
   },
-  // dpkg-deb reading a `.deb` this file carries in, as base64.
-  //
-  // The same two archives run correctly under the native adapter, xz
-  // included, so the lifter decompresses both. In the browser the gzip and
-  // zstd round trips pass and xz does not, which makes it a question about
-  // Workers, fork and pipes rather than about liblzma -- and the archives
-  // apt downloads are all xz, so this is what stops `apt-get install`.
-  //
-  // Carried in rather than downloaded so the check needs no network and
-  // takes seconds. Six hundred bytes of `ar` is cheaper than a mirror.
+  // dpkg-deb reading `.deb` archives carried in as base64 (no network). xz is
+  // the interesting case: apt's downloads are all xz, and if it fails only in
+  // the browser the fault is in Workers/fork/pipes rather than liblzma.
   'debian-deb': {
     demo: 'debian',
     cmd:
@@ -122,50 +66,29 @@ const DEMOS = {
       + 'ls -l /var/tmp; '
       + 'dpkg-deb --info /var/tmp/g.deb > /dev/null; echo gzip=$?; '
       + 'dpkg-deb --info /var/tmp/x.deb > /dev/null; echo xz=$?; '
-      // A control member that decompresses to 320 KB, five times the
-      // pipe's 65536 bytes, so the decompressing child has to fill it,
-      // block, and be resumed. The 600-byte archives above fit in one
-      // write and never test that. Still 712 bytes on the wire,
-      // because it is all one character.
+      // A control member that decompresses to 320 KB (5x the pipe's 65536
+      // bytes), so the decompressing child must fill, block and resume -- which
+      // the 600-byte archives above never test.
       + 'echo ITxhcmNoPgpkZWJpYW4tYmluYXJ5LyAgMCAgICAgICAgICAgMCAgICAgMCAgICAgNjQ0ICAgICA0ICAgICAgICAgYAoyLjAKY29udHJvbC50YXIueHovIDAgICAgICAgICAgIDAgICAgIDAgICAgIDY0NCAgICAgMzQ4ICAgICAgIGAK/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj5P//ARtdADGbyhnbre+8GtxPrcaFT++rAjB/GkFNFgOm6VBpMA/Wk+GmL4DsY9923ZZlddS/nxFWoSR6utejD4OnYkiWbMXd2xl7yC6hji1I15Q1b0jslXWFAOutNxR5+KQM7Pm/Gt6oSbzHhH6BuMQY7N746W6unVxwT2G0kc/+tcp+PZFiI7REUBLm94dVnFerpfTSgzVpceEv4oYua28TqSbkkII6ZLaZswE7ld59cWfaWUToepq872ywNUz4EcqGyzfX/steKt46lLisiZXrseHTYUfOEdeBfJHPhjX6fMK1RyGGR3x8iwPar0fM05MzKOJLuyFrt84iCjOxsWF6kNSIX8vMz0BOmNH7Uit0zR5bIEL5xtBvfhc6HQBsYAAAANz9em8slnU4AAG3AoCAFACe3picscRn+wIAAAAABFlaZGF0YS50YXIueHovICAgIDAgICAgICAgICAgIDAgICAgIDAgICAgIDY0NCAgICAgMTcyICAgICAgIGAK/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4Cf/AGxdADMAM1AYaImDAevWwvWUntyvvVckyjQ3lSrjhOqtqUmRnaxNGbZ3DuOL/bnWi5jG2OaHhLOlHi1CFbACahCUU/UsZES2OPOch2yMvIuVhuZWjvuCG6oP+AkDpKxBjEdUlwlUop6NG+OiiLXvAACXO6FY2ARaZgABiAGAUAAAU/MzjbHEZ/sCAAAAAARZWg== | base64 -d > /var/tmp/b.deb; '
       + 'dpkg-deb --info /var/tmp/b.deb > /dev/null; echo big=$?; '
-      // And through dpkg rather than straight from the shell, which
-      // is how apt reaches it: one more fork, and a parent holding
-      // its database and locks open. Its warnings about every package
-      // in the rootfs go to /dev/null: ninety lines of them push the
-      // answers off the top of what the page can hand back.
+      // Through dpkg as apt reaches it: one more fork, a parent holding its
+      // database and locks open; its per-package warnings go to /dev/null.
       + 'dpkg --unpack /var/tmp/x.deb > /dev/null 2>/dev/null; echo unpack=$?; '
-      // And the real thing: krb5-locales' own control member, lifted out
-      // of the archive apt downloads and wrapped in a 1,188-byte deb.
-      // That download is byte-perfect in the guest -- md5 matches the
-      // mirror and md5sum reads all 63,520 bytes -- and the same file
-      // reads perfectly under the native adapter, so what is left is
-      // this member and this browser. 824 bytes compressed, 10 KiB out,
-      // where the archives built here compress 236 bytes.
+      // The real thing: krb5-locales' own control member, byte-perfect in the
+      // guest and fine under the native adapter -- 824 bytes in, 10 KiB out.
       + 'echo ITxhcmNoPgpkZWJpYW4tYmluYXJ5LyAgMCAgICAgICAgICAgMCAgICAgMCAgICAgNjQ0ICAgICA0ICAgICAgICAgYAoyLjAKY29udHJvbC50YXIueHovIDAgICAgICAgICAgIDAgICAgIDAgICAgIDY0NCAgICAgODI0ICAgICAgIGAK/Td6WFoAAATm1rRGBMD2BYBQIQEWAAAAAAAAANPeTiXgJ/8C7l0AFwu8HH0BlcAdSj55FcLMJqNjGNOjUET0IGysmtCfcXBMwWvX7Tk2J3yGcpaNT3YzR3VtUXAtNr3EwvvUHj6RAejWzT+bDi4VxhlhIOF/3nwcr45h86MrKpsLGvHgd32f/7BKFArxMiB4yCLKKwqhiOq51FP8gBqo51bJVcV7JkiPly2C6g7b5tsaiYXzsN1MXB3UH+ChbylXgE086VwmQqcndu/fNeKwz5aT23P5AdTTUlNrGqXY5x5rQnm3JyC3H9sk8l26FfB9IxnXVEnkXcs018kUTljQ38NCheJRV4IuDMJF581EZSgsSI13nONjelx8GnV8hnDGqJGLLKF3zZoGbzYsRz/46r3XoEVSBhqsFgFyiwTT/friCQgKuqKVD2ZP375jM1of6/3qVz5PGYNo9TGo8xOBWdz4pEma6KDPKeXFFzYGMjaYSdt0m5Kc5hHJ0nUzx66wsRe6JT5219quCwcrG7RJPvC2g8NOZU6jRbv6x4FzvUUcQQZxRnj93oaIWlmuN03vETi/n3iD/0O7pKUTCbwm4XX2/jQz42MUpQg9Dxgn5mgEbCejVhoe9RJ+Fo7GSDCGV3hiVqkQfQazeVxTkCgXpvND6abEe6mC4ROE5m5cUg67trbhEyV1OXqOUQQir8Cmjo4u/qcOC4DUo4yNuqvZ/5MzyxEb5ZTVNnwLxhzrHZEpiCuHFyjpeak62at7Ig83FhlyJjf356ayFKLOhOxHGPWAgTDGEivnAS3eNYj2j/en4d1EA0WkU3SADbRloUirkTq6Yu2ONuSEbQOwomSsxWtSRNp5a2dgHX+HXSqfkbks3DVUDCWcdyls0Bks6hvI+9lk7pjMOZo2Cn+1hCk4AkFSSEIHts9cZ9SxMZvkU0m9vTNGKqaHiLNioxYoBnDIcR3rxdGNn9b8Ou+htUbeqnwCkhIovMwrD7h9Md+GYAqzot3AyPmN8dzICL25ZrxFU45uK2rrWB4AuS791vOuygY07CsnAAAAERa3z0RiJLgAAZIGgFAAAL4OXp2xxGf7AgAAAAAEWVpkYXRhLnRhci54ei8gICAgMCAgICAgICAgICAgMCAgICAgMCAgICAgNjQ0ICAgICAxNzIgICAgICAgYAr9N3pYWgAABObWtEYCACEBFgAAAHQv5aPgJ/8AbF0AMwAzUBhoiYMB69bC9ZSe3K+9VyTKNDeVKuOE6q2pSZGdrE0ZtncO44v9udaLmMbY5oeEs6UeLUIVsAJqEJRT9SxkRLY485yHbIy8i5WG5laO+4Ibqg/4CQOkrEGMR1SXCVSino0b46KIte8AAJc7oVjYBFpmAAGIAYBQAABT8zONscRn+wIAAAAABFla | base64 -d > /var/tmp/r.deb; '
       + 'dpkg-deb --info /var/tmp/r.deb > /dev/null; echo real=$?; '
-      // How many bytes came out of the decompressor, with no tar in
-      // the way: `--ctrl-tarfile` writes the tar to stdout itself.
-      // 10240 means liblzma worked and the fork is at fault; 0 means
-      // it did not. The working archive is measured the same way, so
-      // the two numbers can be compared rather than judged.
+      // Bytes out of the decompressor, no tar in the way (`--ctrl-tarfile`
+      // writes the tar to stdout): 10240 means liblzma worked and the fork is
+      // at fault; 0 means it did not. The working archive is measured the same.
       + 'dpkg-deb --ctrl-tarfile /var/tmp/x.deb | wc -c; '
       + 'dpkg-deb --ctrl-tarfile /var/tmp/r.deb | wc -c; '
       + 'echo deb=done',
     want: /gzip=0[\s\S]*xz=0[\s\S]*big=0[\s\S]*real=0/,
   },
-  // The same command twice, which is not the same as once.
-  //
-  // A second `ls` reuses what the first translated: modules reach a process
-  // from the global kernel with slot numbers the *earlier* process chose. A
-  // dispatch change can therefore be perfectly correct for one run of a
-  // program and wrong for the next, and every other Debian case here runs
-  // each command once.
-  //
-  // It exists because per-page slot claiming passed everything else and then
-  // died here: "installing a module of 39998464 slots failed ... tables are
-  // [3784704, 0, 0, 0, 1024, 0, 0, 0]", on the second `ls` and never the
-  // first, reported by a person using the shell rather than by any test.
+  // The same command twice: a second `ls` reuses what the first translated
+  // (modules reach a process with slot numbers the *earlier* process chose),
+  // so a dispatch change can be correct once and wrong the next run.
   'debian-twice': {
     demo: 'debian',
     cmd:
@@ -173,18 +96,9 @@ const DEMOS = {
       + 'ls /usr > /dev/null; echo three=$?; echo twice=done',
     want: /one=0[\s\S]*two=0[\s\S]*three=0/,
   },
-  // What does a process cost when it does nothing?
-  //
-  // Twenty runs of `cat /dev/null`, which reads no bytes and writes none, so
-  // everything the clock sees is this runtime starting a process: a Worker,
-  // a shim instance, and the guest modules installed into dispatch tables
-  // that belong to that instance and start empty.
-  //
-  // This is the shape of the remaining cost in `apt-get update`. #115 has
-  // `apt-key` forking about forty processes, and the per-process figures in
-  // a run range from 89ms to 917ms of install alone. A benchmark that is
-  // only process creation says what that is made of, without a guest doing
-  // real work on top of it.
+  // What a process costs when it does nothing: twenty `cat /dev/null`, so the
+  // clock sees only process startup (Worker, shim instance, guest modules into
+  // empty dispatch tables) -- the shape of the remaining cost in `apt-get update`.
   'debian-forks': {
     demo: 'debian',
     cmd:
@@ -193,34 +107,19 @@ const DEMOS = {
       + 'e=$(date +%s%N); echo forks_ms=$(( (e-s)/1000000 )) n=$i; echo forks=done',
     want: /forks_ms=[0-9]+ n=20/,
   },
-  // The control for `ld.so`: the same twenty forks, from a static binary.
-  //
-  // busybox is `static-pie` linked, so a forked `busybox cat` runs no dynamic
-  // linker and initialises no shared libc. `cat /dev/null` and not `true`,
-  // because the Debian side of the comparison is `cat /dev/null` and a
-  // program that opens a file does more than one that returns: the first
-  // version of this measured `true` against `cat` and charged the difference
-  // to the linker. Everything else matches
-  // `debian-forks` -- same host, same shim, same fork path, same exhaustive
-  // recompilation from a closure. The difference between the two is what
-  // dynamic linking costs, which is the premise #121 rests on and which
-  // nothing has yet measured.
+  // The control for `ld.so`: the same twenty forks from a static binary.
+  // busybox is `static-pie`, so `busybox cat` runs no dynamic linker; the gap
+  // from `debian-forks` is what dynamic linking costs. `cat /dev/null` not
+  // `true`, so both sides open a file and the difference is only the linker.
   'busybox-forks': {
     demo: 'busybox',
     cmd:
       'i=0; while [ $i -lt 20 ]; do busybox cat /dev/null; i=$((i+1)); done; echo bbforks=done',
     want: /bbforks=done/,
   },
-  // How fast does the browser decompress? The same `dpkg-deb` the native
-  // adapter runs in 2.7 seconds, on the same 2.4 MB archive.
-  //
-  // Worth carrying the 2.4 MB in the rootfs for. `apt-get update` spends its
-  // last five minutes inside apt's `store` method decompressing an index,
-  // and the same library measured under the native adapter comes out at
-  // 5.7x native -- ordinary. So either the browser is much worse than that
-  // or the index is much bigger than this, and only a browser number can
-  // say which. Nothing else here measures guest CPU on real work: every
-  // other Debian case is a correctness check that finishes in milliseconds.
+  // How fast the browser decompresses: `dpkg-deb` on a 2.4 MB archive (2.7s
+  // under the native adapter). The only case here that measures guest CPU on
+  // real work rather than correctness.
   'debian-lzma': {
     demo: 'debian',
     cmd:
@@ -230,14 +129,8 @@ const DEMOS = {
       + 'cat /var/e.txt; echo lzma=done',
     want: /lzma_rc=0 ms=[0-9]+ size=10373120/,
   },
-  // Does a byte written come back? A 1.2 MB file copied through the shell
-  // and checksummed both ways.
-  //
-  // apt downloads a 63,520-byte archive, writes it, and dpkg cannot read
-  // it -- while the same archive taken from the mirror by hand reads
-  // perfectly under the native adapter, and archives built inside the guest
-  // read fine in the browser. The file is the right length and starts with
-  // a valid `!<arch>`, so what is left is the middle of it.
+  // Does a byte written come back? A 1.2 MB file copied through the shell and
+  // checksummed both ways -- the shape of apt writing an archive dpkg can't read.
   'debian-io': {
     demo: 'debian',
     cmd:
@@ -247,23 +140,10 @@ const DEMOS = {
       + 'wc -c < /bin/bash; wc -c < /var/tmp/b; echo io=done',
     want: /same=0/,
   },
-  // Wisp throughput, in seconds rather than the six minutes an `apt-get
-  // update` takes.
-  //
-  // The same fetch under the Node host, over real TCP, runs at about
-  // 3.8 MB/s; the browser fetches 14.9 MB at 41.7 kB/s. Same kernel, same
-  // socket syscalls, same run loop -- so the transport is the difference and
-  // this is the smallest thing that exercises it.
-  //
-  // bash speaks `/dev/tcp` itself, so no downloader is needed in the rootfs.
-  // A literal address because the guest's resolver does not answer bash
-  // (`Temporary failure in name resolution`), which is its own gap; removing
-  // DNS from a throughput measurement is right regardless.
-  //
-  // This could not run at all until `load` learned to set the network flag:
-  // pid 1 is loaded, not adopted, and only the adopt path set it, so bash
-  // got `Address family not supported by protocol` while apt's forked
-  // methods downloaded happily.
+  // Wisp throughput: the smallest thing that exercises the transport (Node host
+  // ~3.8 MB/s vs browser 41.7 kB/s over the same syscalls). bash speaks
+  // `/dev/tcp`, and a literal address because the guest resolver does not
+  // answer bash -- removing DNS from a throughput measurement is right anyway.
   'debian-net': {
     demo: 'debian',
     cmd:
@@ -274,33 +154,19 @@ const DEMOS = {
     want: /bytes=[0-9]{6,}/,
   },
   gears: { want: /exit 0 in \d+ ms/, settle: 'finished' },
-  // The guest's own evidence, not the page's. "graphics rootfs -- N files"
-  // and a status of `running` were both true of a demo that unpacked the
-  // image and then did nothing at all, which is how this test passed while
-  // the demo did not boot.
-  //
-  // Two things have to be true and only one of them is about the guest.
-  // glxgears' frame rate says Mesa completed frames and got them back, but
-  // vtest has no present -- the X server reads its pixels back and never
-  // looks at a screen -- so a run can draw perfectly onto a canvas that
-  // stays black. `presented`, which the demo prints when the run ends, is
-  // the number of blits that actually reached it.
+  // Two things must be true: glxgears' frame rate (Mesa completed frames) and
+  // that the frames reached the canvas -- vtest has no present, so a run can
+  // draw perfectly onto a canvas that stays black.
   virgl: {
-    // The count is read from the terminal with its wrapping taken out.
-    // xterm breaks a line at the window width and `innerText` keeps the
-    // break, so a summary wide enough to wrap splits `presented=7` across
-    // two rows and a pattern that spans it never matches -- a run that drew
-    // and presented sat there until the wall clock.
-    // `lit`, not `presented`. A blit happens whether or not there was
-    // anything in the frame, so `presented` counts arrivals at the canvas and
-    // says nothing about what arrived -- which is how a run that drew nothing
-    // at all passed while the canvas was black. `lit` counts the blits whose
-    // source texture had a pixel in it.
+    // Wrapping stripped before matching: xterm breaks a line at the window
+    // width and `innerText` keeps the break, splitting `lit=7` across rows.
+    // `lit`, not `presented`: a blit counts as presented whether or not the
+    // frame had anything in it; `lit` counts blits whose texture had a pixel.
     want: (t) =>
       /frames in [\d.]+ seconds/.test(t) &&
       Number(/lit=(\d+)/.exec(t.replace(/\s+/g, ''))?.[1]) > 0,
-    // No `settle`: a run that finishes having presented nothing is the exact
-    // failure this is for, and a status of `finished` would call it a pass.
+    // No `settle`: a run that finishes having lit nothing is the exact failure
+    // this is for, and `finished` would call it a pass.
     fail: (t) => /lit=0(?!\d)/.test(t.replace(/\s+/g, '')),
   },
 };
@@ -314,13 +180,8 @@ const skip = (why) => {
 if (!UPSTREAM && !(await exists(DIST))) skip(`no build at ${DIST} (npm run build)`);
 if (!(await exists(CHROME))) skip(`no browser at ${CHROME}`);
 
-// A stale `dist` is a test that proves nothing.
-//
-// `vite build` copies `web/public` into `web/dist`, so `dist` holds *another*
-// copy of the runtime -- and this test served it without ever checking how old
-// it was. The demo site ran for hours against a shim the harness had never
-// loaded, and the harness stayed green throughout. Refusing to run is the
-// least this can do about it.
+// A stale `dist` proves nothing: `vite build` copies `web/public` into `dist`,
+// so refuse to run if the dist shim is older than the one in public.
 if (!UPSTREAM) {
   const distShim = join(DIST, 'gex/gex_browser.wasm');
   const pubShim = fileURLToPath(new URL('../public/gex/gex_browser.wasm', import.meta.url));
@@ -339,10 +200,7 @@ if (!UPSTREAM) {
 }
 
 const wanted = process.argv.slice(2).filter((a) => DEMOS[a]);
-// Debian by default, because that is the demo the site opens with and the one
-// a person means by "the web demo". It was defined here and never run: the
-// default set was busybox and gears, so every regression in the demo that
-// matters most went unnoticed by the test that exists to catch them.
+// Debian included by default: it is the demo the site opens with.
 const list = wanted.length ? wanted : ['busybox', 'debian', 'gears'];
 
 const TYPES = {
@@ -354,13 +212,8 @@ const TYPES = {
   '.tar': 'application/x-tar',
 };
 
-// Injected into the page. It reports what the status line says and what the
-// terminal holds, so a failure names the stage rather than the exit code.
-/// The reporter, with whatever `GEX_TYPE` asked to be typed baked in.
-///
-/// A function rather than a constant because the lines have to be JSON --
-/// they contain quotes, `$`, and backslashes, and a shell command pasted into
-/// a template literal is a shell command that arrives changed.
+// The reporter injected into the page, with `GEX_TYPE` baked in as JSON (a
+// function, not a constant, because those lines contain quotes/`$`/backslashes).
 const reporter = () =>
   REPORTER.replace(
     '%TYPE%',
@@ -554,10 +407,8 @@ const server = createServer(async (req, res) => {
     res.writeHead(204).end();
     return;
   }
-  // A server of somebody else's, passed through.
-  //
-  // Only the HTML is rewritten, and only to add the reporter: what runs has
-  // to be that server's page, or this proves nothing about it.
+  // An upstream server passed through; only the HTML is rewritten, to add the
+  // reporter.
   if (UPSTREAM) {
     try {
       const target = new URL(req.url, UPSTREAM);
@@ -567,9 +418,8 @@ const server = createServer(async (req, res) => {
       const html = type.includes('text/html');
       res.writeHead(up.status, {
         'content-type': type,
-        // Added here rather than assumed: a dev server that forgets them
-        // has no `SharedArrayBuffer`, which is a different failure and one
-        // worth telling apart from this one.
+        // Added here so a dev server that forgets them still gets a
+        // `SharedArrayBuffer` -- a different failure, worth telling apart.
         'Cross-Origin-Opener-Policy': 'same-origin',
         'Cross-Origin-Embedder-Policy': 'require-corp',
       });
@@ -579,17 +429,9 @@ const server = createServer(async (req, res) => {
     }
     return;
   }
-  // The query goes first, then the check for the root. The other order
-  // compared `/?demo=busybox&run=1` against `/`, did not match, stripped the
-  // query afterwards and asked for the directory -- which is not a file, so
-  // the server answered 404 to its own page. Every demo then "timed out with
-  // no status", which is exactly what a page that was never served does.
-  // Decoded, because a URL path is not a file name.
-  //
-  // `libstdc++.so.6` reaches the server as `libstdc%2B%2B.so.6`: the closure
-  // loader percent-encodes each component, as it must, and every real static
-  // server decodes before it looks on disk. This one did not, so the first
-  // closure the site ever tried to load 404'd on the third library.
+  // Strip the query before matching the root, and decode: the closure loader
+  // percent-encodes each path component (`libstdc++.so.6` arrives as
+  // `libstdc%2B%2B.so.6`), so the path must be decoded before it hits disk.
   const raw = req.url.split('?')[0];
   const name = raw === '/' ? '/index.html' : decodeURIComponent(raw);
   const path = join(DIST, name);
@@ -597,9 +439,8 @@ const server = createServer(async (req, res) => {
     if (!(await stat(path)).isFile()) throw new Error('not a file');
     let body = await readFile(path);
     if (name === '/index.html') body = Buffer.from(body.toString() + reporter());
-    // Cross-origin isolation, as the dev server and the deployed site send.
-    // The page needs a `SharedArrayBuffer` for the global kernel's memory,
-    // and without these headers the constructor is not there at all.
+    // Cross-origin isolation: the page needs a `SharedArrayBuffer` for the
+    // global kernel's memory, and without these headers it is not defined.
     res.writeHead(200, {
       'content-type': TYPES[extname(name)] || 'application/octet-stream',
       'Cross-Origin-Opener-Policy': 'same-origin',
@@ -616,119 +457,55 @@ const port = server.address().port;
 let failures = 0;
 for (const id of list) {
   const { settle, fail } = DEMOS[id];
-  // `GEX_WANT=<regex>` says what the guest has to print, overriding the
-  // demo's own pattern.
-  //
-  // `debian-cmd` passes on `GEX-CMD-DONE`, which the *shell* prints after the
-  // command, so a run in which the command did entirely the wrong thing still
-  // passes. That is not hypothetical: for hours `bash -c /bin/true` reported
-  // a healthy 208-block run while the child was branching into bash's
-  // translated code at `PIE_BASE` and only surviving because `/bin/true`
-  // exits 0 whatever it executes. A command whose output is checked --
-  // `GEX_WANT='^22$'` for `ls / | wc -l` -- cannot pass that way.
+  // `GEX_WANT=<regex>` overrides the demo's pattern with what the guest must
+  // print -- e.g. `GEX_WANT='^22$'` for `ls / | wc -l`, which a marker printed
+  // by the shell after the command cannot fake.
   const want = process.env.GEX_WANT ? new RegExp(process.env.GEX_WANT, 'm') : DEMOS[id].want;
-  // A regular expression or a predicate. A demo whose evidence is two things
-  // at once -- the guest drew *and* the frames reached the canvas -- cannot
-  // say so in one pattern.
+  // A regex or a predicate (a demo whose evidence is two things at once cannot
+  // say so in one pattern).
   const reached = typeof want === 'function' ? want : (t) => want.test(t);
-  // `GEX_QUERY=gears_size=100x100` reaches the demo. An experiment that only
-  // changes one thing about a run should not need a code change to run.
+  // `GEX_QUERY=gears_size=100x100` reaches the demo without a code change.
   const extra = process.env.GEX_QUERY ? `&${process.env.GEX_QUERY}` : '';
-  // A demo may carry its own command, for a check that is about the runtime
-  // rather than about the page: `debian-fs` is the Debian rootfs told to run
-  // one shell line. `GEX_QUERY` still wins, because it comes after.
-  //
-  // Encoded, not pasted. A query is split on `&`, so a command containing
-  // `&&` or `2>&1` reaches the page cut in half -- three separate runs were
-  // spent on that, each one looking like the guest failing rather than the
-  // harness truncating the question. `GEX_QUERY` is still raw, because it
-  // carries several parameters at once and only a person writes it.
+  // A demo may carry its own command (`debian-fs` runs one shell line);
+  // `GEX_QUERY` still wins because it comes after. Encoded, since a query splits
+  // on `&` and a command with `&&` or `2>&1` would arrive cut in half.
   const own = DEMOS[id].cmd ? `&cmd=${encodeURIComponent(DEMOS[id].cmd)}` : '';
-  // `GEX_CMD=<shell line>` is the same thing from outside, encoded here so
-  // it survives. Hand-writing `cmd=` inside `GEX_QUERY` means hand-encoding
-  // it: `&&` ends the parameter, `2>&1` ends the parameter, and `+` decodes
-  // to a space -- which silently turned `1.20.1-2+deb12u5` into two words
-  // and cost a seven-minute run to notice. Four runs went to that family
-  // of mistake before this existed.
+  // `GEX_CMD=<shell line>` is the same from outside, encoded here so `&&`,
+  // `2>&1` and `+` survive (`+` decodes to a space).
   const cmd = process.env.GEX_CMD
     ? `&cmd=${encodeURIComponent(process.env.GEX_CMD)}`
     : '';
   const url =
     `http://127.0.0.1:${port}/?demo=${DEMOS[id].demo ?? id}&run=1${own}${extra}${cmd}`;
-  // The command the page was told to run, decoded the way the page decodes
-  // it, so the echo of it can be told apart from what the guest says. See
-  // where `seen` is filled.
-  //
-  // `URLSearchParams` is what the page uses, and it turns `+` into a space --
-  // so `i=$((i+1))` reaches the guest as `i=$((i 1))` and a shell loop
-  // written with one never increments. Two repro runs "passed" that way
-  // before this was noticed, which is worth knowing whenever a `?cmd=`
-  // behaves as though it did nothing.
+  // The command decoded the way the page decodes it, so its echo can be told
+  // apart from guest output. `URLSearchParams` turns `+` into a space, so
+  // `i=$((i+1))` reaches the guest as `i=$((i 1))` -- watch for that.
   const cmdText = new URLSearchParams(extra.slice(1)).get('cmd') || '';
   let last = '';
   let lastTerminal = '';
-  // Every line the terminal has ever shown, in the order it first appeared.
-  //
-  // The reporter can only read the rows on screen, and a run long enough to
-  // scroll loses the top of what it said. That is fatal for evidence made of
-  // two things far apart in time: glxgears prints its frame rate while it
-  // runs and its pixel counts after it exits, and by the time the counts
-  // arrive the frame rates are gone. A snapshot holds one or the other and
-  // never both, so a run that had proved everything sat until the wall.
+  // Every terminal line ever shown, in first-appearance order: the reporter
+  // reads only the on-screen rows, and a scrolling run loses evidence far
+  // apart in time (glxgears' frame rate while it runs, pixel counts after).
   const seen = new Set();
   const history = () => [...seen].join('\n');
   const done = new Promise((resolve) => {
     onReport = (kind, body) => {
       if (kind === 'threw') return resolve({ how: 'threw', body });
-      // Not `split('|')`. The terminal is the last field and the guest
-      // puts pipes in it -- `echo x | cat` is a pipe on the command line,
-      // and so is any program that draws a table -- so splitting on every
-      // separator threw away everything the guest said after the first one.
-      // The harness then judged the run on the truncated remainder, which is
-      // how a pipeline could appear to produce no output at all.
+      // Not `split('|')`: the terminal is the last field and the guest puts
+      // pipes in it, so only the first two separators are boundaries.
       const first = body.indexOf('|');
       const second = body.indexOf('|', first + 1);
       const statusKind = body.slice(0, first);
       const text = body.slice(first + 1, second);
       const terminal = body.slice(second + 1);
       last = `${statusKind || '-'} ${text}`;
-      // Kept so that a failure can show what the guest actually said. The
-      // tick line below carries one line; a demo that fails is worth twenty.
       lastTerminal = terminal || lastTerminal;
-      // The page's own echo of the command is not the guest saying anything.
-      //
-      // `bootDebian` prints `command: <cmd>` before it runs, and the history
-      // below is what every `want` is tested against -- so a demo driven with
-      // `?cmd=...; echo GEX-CMD-DONE` passes the instant the page prints the
-      // command line, before the guest has run an instruction. Every
-      // `debian-cmd` result taken that way is worthless, including two that
-      // were being used to rule a crash out.
-      //
-      // This is the same defect the file already records for `debian`'s `$`
-      // prompt, in a second place: a check that can pass without the guest is
-      // worse than no check.
-      // Matched by content rather than by position, because xterm wraps: the
-      // command runs over several rows and every row after the first starts
-      // at column zero, so there is no way to tell a continuation from output
-      // by looking at the line alone. Every fragment of the echo *is* a
-      // substring of the command, though, and nothing the guest prints has to
-      // be.
-      // Only the echo, and only until it ends. Filtering *every* line that
-      // the command happens to contain throws away real output too: a command
-      // ending `; echo GEX-CMD-DONE` contains the marker it exists to print,
-      // so the run went from passing before the guest started to never
-      // passing at all. Both are the same mistake -- deciding what a line
-      // means by its text rather than by where it is.
-      //
-      // The echo begins at `command:` and continues while each row is a
-      // fragment of the command; the first row that is not ends it, and
-      // everything after counts. Recomputed per snapshot because the reporter
-      // re-reads the whole terminal each tick.
-      // Consumed positionally rather than by `includes`, so the echo ends
-      // exactly where the command does. Matching anywhere swallowed the first
-      // real line the guest printed whenever the command happened to contain
-      // it -- `echo START` prints `START`, which is in the command, so it
-      // vanished.
+      // Skip the page's echo of the command (`bootDebian` prints `command:
+      // <cmd>` before running), so a `?cmd=...; echo MARKER` demo cannot pass
+      // on the echoed marker before the guest runs. Consumed positionally --
+      // xterm wraps, so the echo is matched by walking `cmdText`, and it ends
+      // exactly where the command does; everything after counts. Recomputed
+      // per snapshot because the reporter re-reads the whole terminal.
       let echoAt = -1;
       for (const line of (terminal || '').split('\n')) {
         const t = line.trim();
@@ -745,43 +522,28 @@ for (const id of list) {
         }
         if (!line.trim() || seen.has(line)) continue;
         seen.add(line);
-        // `GEX_ECHO` prints every line the guest says, once, as it first
-        // appears. The tick below carries one line per five seconds, which
-        // is a progress indicator and not a transcript -- and a profile
-        // printed by the guest is exactly the thing that scrolls past
-        // between two ticks and is never seen.
+        // `GEX_ECHO=<regex>` prints every matching guest line once, as a full
+        // transcript -- the tick below is one line per five seconds, not one.
         if (process.env.GEX_ECHO && new RegExp(process.env.GEX_ECHO).test(line)) {
           console.log(`     [${id}] ${line.trim()}`);
         }
       }
-      // Each status change is a line, so a run that takes minutes still says
-      // where it is rather than going quiet. A tick carries the terminal's
-      // last line as well, because that is where the guest speaks.
+      // One line per status change so a slow run still shows progress; a tick
+      // also carries the terminal's last line.
       const tail = (terminal || '').trim().split('\n').filter(Boolean).slice(-1)[0] || '';
       console.log(`     [${id}] ${text}${statusKind === 'tick' && tail ? ` | ${tail}` : ''}`);
       if (reached(history()) || text === settle) {
         resolve({ how: 'reached', body: text });
       }
-      // A run that ended having proved the opposite. Without this the wait
-      // runs to the wall clock, and fifteen minutes of nothing reads as a
-      // hang rather than as the answer it already has.
+      // A run that proved the opposite, so the wait need not run to the wall.
       const failed = typeof fail === 'function' ? fail : (t) => fail?.test(t);
       if (fail && failed(terminal || '')) {
         resolve({ how: 'bad', body: 'nothing reached the canvas' });
       }
       if (statusKind === 'bad') resolve({ how: 'bad', body: text });
-      // The guest's process is gone and what was wanted never appeared.
-      //
-      // Nothing further can print, so waiting out the wall clock buys
-      // nothing and costs the whole wall: an `apt-get update` that dies at
-      // ten seconds reported "timeout" three minutes later, which reads as a
-      // hang and is a failure that already finished. The exit line is the
-      // page's, added so the terminal says whether the process left rather
-      // than leaving a silent tail to be guessed at.
-      //
-      // After the `reached` test above, so a run that printed what was
-      // wanted and *then* exited is a pass. A promise settles once, so the
-      // order is the whole of the precedence.
+      // The guest process exited without printing what was wanted -- nothing
+      // more can print, so stop rather than waiting out the wall. After the
+      // `reached` test above, so a run that printed it and *then* exited passes.
       const gone = /\[[\w.+-]+ exited (\d+)\]/.exec(terminal || '');
       if (gone) {
         resolve({ how: 'bad', body: `the guest exited ${gone[1]} without printing what was wanted` });
@@ -796,19 +558,12 @@ for (const id of list) {
       '--no-sandbox',
       '--disable-gpu-sandbox',
       '--enable-unsafe-swiftshader',
-      // Without this the page's console goes nowhere, and a demo that throws
-      // before it runs a byte fails as "timeout, last status: (none)" with
-      // nothing else to say. That is the failure this file exists to catch.
+      // Without this the page's console goes nowhere, so a demo that throws
+      // before running a byte fails as "timeout, last status: (none)".
       '--enable-logging=stderr',
       '--v=0',
-      // `performance.memory` exists only behind this, and without it the
-      // JavaScript heap cannot be measured from inside a Worker at all:
-      // `measureUserAgentSpecificMemory` is absent here even with
-      // cross-origin isolation on, and `performance.memory` reads
-      // `undefined`. Three attempts at a heap census returned nothing for
-      // that reason alone, which is indistinguishable from a census that
-      // ran and found nothing. `apt update` dies of a V8 OOM (#145) and
-      // the only account of where the bytes are is this counter.
+      // `performance.memory` exists only behind this -- the only way to measure
+      // the JS heap from a Worker here, and the only account of the V8 OOM (#145).
       '--enable-precise-memory-info',
       url,
     ],
@@ -817,8 +572,7 @@ for (const id of list) {
   let err = '';
   child.stderr.on('data', (d) => (err += d));
 
-  // `let`, because a crash found in the browser's console below demotes a
-  // "reached" to a failure. See the check after the console is collected.
+  // `let`, because a crash found in the console below demotes a "reached".
   let result = await Promise.race([
     done,
     new Promise((r) => setTimeout(() => r({ how: 'timeout' }), WALL)),
@@ -826,37 +580,16 @@ for (const id of list) {
   child.kill('SIGKILL');
   onReport = () => {};
 
-  // `GEX_STDERR=all` on a *passing* run too.
-  //
-  // It was printed only on failure, which is backwards for the thing it is
-  // most used for: the per-process timings the runtime logs to the console
-  // are how a run is measured, and a measurement run is one that passes. A
-  // three-`ls` loop completed, threw its own numbers away, and had to be run
-  // again to get them.
-  // On a failing run too, which is the whole point of asking for it.
-  //
-  // This said `&& result.how === 'reached'`, having been changed from "only
-  // on failure" to "on a passing run as well" and landed on "only on a
-  // passing run". So every run that timed out or died printed twenty lines of
-  // terminal and nothing else -- no per-process timings, no `[gex]` trace, no
-  // wasm stack -- and a whole session of debugging a deadlock was done by
-  // reading the one row of the terminal that a tick happened to catch.
+  // `GEX_STDERR=all` prints the browser's stderr on both passing and failing
+  // runs (the per-process timings are wanted on a measurement run, which passes).
   const noisy = /Fontconfig|GPU|gpu|Registration|Vulkan|dawn/;
   if (process.env.GEX_STDERR === 'all') {
     for (const l of err.split('\n')) if (l && !noisy.test(l)) console.log(`     ${l}`);
   }
-  // Every console error the run produced, listed, and fatal if there were
-  // any.
-  //
-  // The marker is put on by the page's reporter and by each Worker, because
-  // Chrome logs all console levels as INFO and the level is otherwise gone
-  // by the time it reaches this stream. Listed in full rather than counted:
-  // these carry the guest pc, the syscall, the dispatch page and the table
-  // sizes, and that detail is the whole diagnosis.
-  //
-  // Fatal even when the wanted text appeared. A run in which a process
-  // trapped has not passed, and the reason this check exists is that one
-  // did, printed exactly this, and the harness said `ok` over the top of it.
+  // Every console error, listed in full and fatal even when the wanted text
+  // appeared: the `[gex-console-error]` marker is added by the reporter and
+  // each Worker because Chrome logs all levels as INFO. A trapped process has
+  // not passed.
   const consoleErrors = err
     .split('\n')
     .filter((l) => l.includes('[gex-console-error]'));
@@ -871,12 +604,8 @@ for (const id of list) {
     }
   }
   if (result.how === 'reached') {
-    // The terminal on a passing run too, when it was asked for. Everything
-    // the *shim* narrates -- `trace_line`, and so every `[gex]`, `[closure]`
-    // and `[link]` line -- is written to the guest's stderr and arrives here
-    // rather than on the browser's console, and this printed it only when a
-    // run failed. A diagnostic added to answer "did this fire at all" then
-    // says nothing on the run where it fired, which cost two runs to notice.
+    // The terminal on a passing run too, when asked for: the shim's `[gex]`,
+    // `[closure]` and `[link]` narration goes to the guest's stderr, here.
     if (process.env.GEX_STDERR === 'all') {
       for (const line of (TAIL ? lastTerminal.trim().split('\n').slice(-TAIL) : lastTerminal.trim().split('\n'))) {
         console.log(`     | ${line}`);
@@ -885,26 +614,15 @@ for (const id of list) {
     console.log(`ok   site-${id}`);
   } else {
     failures++;
-    // The end of the terminal, not just its last line: what a demo printed on
+    // The tail of the terminal, not just its last line: what a demo printed on
     // its way to failing is the only account of why.
-    // Sixty lines, the same as a passing run gets under `GEX_STDERR=all`.
-    // Twenty was less than the run that failed had to say: a demo that gets
-    // most of the way through prints its progress and then its stall, and
-    // the twenty lines that survived were all stall.
     for (const line of (TAIL ? lastTerminal.trim().split('\n').slice(-TAIL) : lastTerminal.trim().split('\n'))) {
       console.log(`     | ${line}`);
     }
     console.log(`FAIL site-${id}: ${result.how}${result.body ? ` (${result.body})` : ''}`);
     console.log(`     last status: ${last || '(none)'}`);
-    // Eight lines of the browser's own stderr is enough to say a page threw
-    // and never enough to say where. A wasm `RuntimeError` reaches the
-    // console with the engine's stack under it -- the one thing that names
-    // the function that trapped -- and it is tens of lines long, so the tail
-    // that survived was always the part after the answer.
-    //
-    // `GEX_STDERR=all` keeps the lot. It is off by default because a passing
-    // run has nothing worth reading here and a failing one usually does not
-    // either; it is the crash in the runtime that needs it.
+    // Last eight lines of the browser's stderr by default; `GEX_STDERR=all`
+    // keeps the lot, which a wasm `RuntimeError`'s long engine stack needs.
     const noise = /Fontconfig|GPU|gpu|Registration|Vulkan|dawn/;
     const lines = err.split('\n').filter((l) => l && !noise.test(l));
     console.log(

@@ -51,15 +51,11 @@ impl<'a> GuestMem<'a> {
 
     /// The backing bytes, hidden from the optimiser on wasm.
     ///
-    /// In the browser host this slice covers the guest's whole address space,
-    /// which is the host's *own* linear memory reached through a pointer made
-    /// from an integer. LLVM sees a pointer with no provenance, decides the
-    /// allocation behind it has size zero, and folds the bounds checks below
-    /// to "always out of range" -- but only at some call sites, so the same
-    /// read succeeded from one function and returned `EFAULT` from another a
-    /// microsecond later. A barrier at each use leaves it nothing to fold.
-    ///
-    /// Native hosts get a real slice from wasmtime and need none of this.
+    /// In the browser this slice spans the guest's whole address space via a
+    /// pointer made from an integer. LLVM sees no provenance, assumes size zero,
+    /// and folds the bounds checks below to "always out of range" at some call
+    /// sites but not others. A barrier at each use leaves it nothing to fold;
+    /// native hosts get a real slice and need none of this.
     #[inline(always)]
     fn view(&self) -> &[u8] {
         #[cfg(target_family = "wasm")]
@@ -95,18 +91,11 @@ impl<'a> GuestMem<'a> {
 
     /// The last address this memory really has, read live.
     ///
-    /// Not `view().len()`. In the browser the view is a slice made over the
-    /// whole address space a guest pointer may name -- two gigabytes -- while
-    /// the memory itself starts far smaller and grows as the guest maps. A
-    /// check against the view therefore passed for addresses that were not
-    /// backed yet, and the access that followed trapped: `memory access out
-    /// of bounds`, inside a syscall, with the Worker dying mid-call. apt's
-    /// `file` method died that way in `newfstatat`.
-    ///
-    /// Live rather than captured, because it moves *during* a syscall: an
-    /// `mmap` grows the memory and then zeroes what it just mapped, and a
-    /// length taken when the `GuestMem` was built would refuse the write it
-    /// had itself just made room for.
+    /// Not `view().len()`: in the browser the view spans the whole 2 GiB a
+    /// guest pointer may name, while the memory starts smaller and grows as the
+    /// guest maps, so a check against the view passed for unbacked addresses and
+    /// the access trapped. Live because it moves during a syscall -- an `mmap`
+    /// grows the memory then zeroes what it just mapped.
     #[inline(always)]
     fn limit(&self) -> usize {
         #[cfg(target_family = "wasm")]
@@ -125,16 +114,11 @@ impl<'a> GuestMem<'a> {
         Ok(&self.view()[r])
     }
 
-    /// A writable slice of the guest's memory, for a caller that fills it
-    /// itself.
+    /// A writable slice of guest memory, for a caller that fills it itself.
     ///
-    /// The counterpart of `read`. Without it a `read` syscall has to allocate
-    /// a buffer the size the guest asked for, fill that, and copy it in --
-    /// and the guest chooses the size. `sys_read` capped it at 16 MiB, which
-    /// is also the arena's chunk, so every large read made the allocator
-    /// claim another span: 117 of them, 1,872 MiB, in an `apt-get update`
-    /// that had not finished one index. See task 140, and the note on
-    /// `sys_write`, which is this same fix made on the writing side.
+    /// Without it a `read` allocates a guest-sized buffer, fills it, and copies
+    /// in -- and the guest chooses the size; that made one `apt-get update`
+    /// claim 117 arena spans (1,872 MiB). See task 140.
     pub fn read_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], Errno> {
         let r = self.range(addr, len)?;
         Ok(&mut self.view_mut()[r])
@@ -177,10 +161,9 @@ impl<'a> GuestMem<'a> {
         if start >= limit {
             return Err(Errno::EFAULT);
         }
-        // Clamped to what exists, not to what the view claims. A path near the
-        // top of the guest's stack is within a page of the end of memory, and
-        // scanning `max` bytes from it ran off into pages the engine had never
-        // been asked for.
+        // Clamped to what exists, not what the view claims: a path near the top
+        // of the stack is within a page of memory's end, and scanning `max`
+        // bytes ran off into pages never mapped.
         let end = (start + max).min(limit);
         let slice = &self.view()[start..end];
         match slice.iter().position(|b| *b == 0) {

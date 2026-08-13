@@ -70,14 +70,10 @@ pub struct Identity {
     /// static image must see zero, which is how libc decides no interpreter
     /// ran.
     pub interp_base: u64,
-    /// Where to send the interpreter instead of the program's own entry, or
-    /// zero for the honest answer.
-    ///
-    /// `AT_ENTRY` is what glibc's `_dl_start_user` branches to once it has
-    /// finished linking, which makes it the one place a host can get control
-    /// at the exact moment the linking is done and nothing of the program has
-    /// run yet. gex points it at a two-instruction stub of its own so that it
-    /// can keep what the linker produced; see `SNAP_STUB` in the browser shim.
+    /// `AT_ENTRY` override, or zero for the real entry. glibc's
+    /// `_dl_start_user` branches here once linking is done, so pointing it at a
+    /// stub is how the host gets control before any program code runs (see
+    /// `SNAP_STUB` in the browser shim).
     pub entry_hook: u64,
 }
 
@@ -94,23 +90,11 @@ impl Default for Identity {
 
 /// How much room the strings are given below the stack top.
 ///
-/// The layout is anchored rather than packed: the string blob starts at a
-/// fixed address and grows *up*, and the vectors start at a fixed `sp` and
-/// grow up towards it, with the slack in between. A packed layout puts
-/// `argc` wherever the total length of the arguments happens to leave it, so
-/// two processes running the same program with different arguments have
-/// their `argv` array, their `envp` array and their whole auxiliary vector at
-/// different addresses.
-///
-/// That matters because the dynamic linker stores addresses from this region
-/// into libc's data -- `_dl_argv` is the address of the `argv` array,
-/// `GLRO(dl_random)` is the address of the `AT_RANDOM` bytes -- and a
-/// snapshot of a linked process is only reusable by a process whose stack
-/// puts those things where the snapshot expects them. Anchoring costs a few
-/// kilobytes of zeroes and makes the answer stable.
-///
-/// Exceeded, the layout falls back to packing: a correct stack at an
-/// unstable address beats a stable one that has run out of room.
+/// The layout is anchored, not packed: the blob starts at a fixed address so
+/// that `argc`, the vectors and `AT_RANDOM` land at the same addresses
+/// regardless of argument length. That stability is what lets a snapshot of a
+/// linked process (whose libc stored those addresses) be reused. Falls back to
+/// packing when the blob does not fit.
 pub const BLOB_RESERVE: u64 = 32 * 1024;
 
 /// Room for `argc`, the two pointer arrays and the auxiliary vector: 1024

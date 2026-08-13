@@ -1,16 +1,8 @@
-/* Unix domain sockets and descriptor passing.
- *
- * This is the floor Wayland stands on. A display server and its clients talk
- * over `AF_UNIX`, and every buffer they share travels as a descriptor in a
- * `SCM_RIGHTS` control message: the client allocates memory, draws into it,
- * and sends the *descriptor* so the compositor can map the same pages.
- *
- * The awkward part, and the reason this test reads the way it does, is that
- * descriptors on a stream socket are attached to a byte rather than to a
- * message. A reader that takes one byte gets the descriptors sent with that
- * byte and leaves the rest queued. libwayland depends on it exactly: it reads
- * a fixed-size header first and expects the descriptors to still be there.
- */
+/* Unix domain sockets and descriptor passing, the floor Wayland stands on:
+ * buffers travel as descriptors in `SCM_RIGHTS` control messages. The awkward
+ * part this test turns on: descriptors on a stream socket attach to a byte, not
+ * a message, so a reader taking one byte gets the descriptors sent with it and
+ * leaves the rest queued. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

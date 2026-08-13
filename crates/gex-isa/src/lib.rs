@@ -1,18 +1,14 @@
 //! `gex-isa` — AArch64 A64 instruction decoder.
 //!
-//! The decoder turns a 32-bit little-endian A64 encoding into a structured
-//! [`Inst`]. Design rules that the rest of the compiler depends on:
+//! Turns a 32-bit little-endian A64 encoding into a structured [`Inst`].
+//! Invariants the rest of the compiler depends on:
 //!
-//! * **Total.** Every one of the 2^32 encodings maps to *some* `Inst`; anything
-//!   not understood becomes [`Inst::Unknown`] (translate-time error / SIGILL)
-//!   or [`Inst::Undefined`] (architecturally UNDEFINED → SIGILL). The decoder
-//!   never panics and never silently misdecodes into a wrong opcode.
-//! * **Register roles resolved at decode time.** Encoding bit patterns say
-//!   `Rn = 31`; whether that means the zero register or the stack pointer is a
-//!   per-encoding rule. Resolving it here (into [`RegSel`]) keeps that rule out
-//!   of the lifter, where getting it wrong is a silent miscompile.
-//! * **Immediates fully decoded.** Bitmask immediates, scaled load offsets and
-//!   branch displacements are decoded to final values, not raw fields.
+//! * **Total.** Every encoding maps to some `Inst`; the unrecognised become
+//!   [`Inst::Unknown`] or [`Inst::Undefined`] (both → SIGILL). Never panics,
+//!   never misdecodes into a wrong opcode.
+//! * **Register roles resolved at decode time** into [`RegSel`], so the lifter
+//!   never has to re-derive whether `Rn = 31` is the zero register or SP.
+//! * **Immediates fully decoded** to final values, not raw fields.
 
 #![forbid(unsafe_code)]
 
@@ -345,11 +341,8 @@ pub enum AddrMode {
     Offset { rn: RegSel, off: i64 },
     /// `[rn], #off` — access at `rn`, then `rn += off`.
     PostIndex { rn: RegSel, off: i64 },
-    /// `[rn], rm` — access at `rn`, then `rn += rm`.
-    ///
-    /// Only the SIMD structure loads and stores have this form, and only
-    /// there because the stride of an image row is not a constant. Mesa's
-    /// pixel loops use it heavily.
+    /// `[rn], rm` — access at `rn`, then `rn += rm`. Only the SIMD structure
+    /// loads and stores use it, where the stride is not a constant.
     PostIndexReg { rn: RegSel, rm: RegSel },
     /// `[rn, #off]!` — `rn += off`, then access at `rn`.
     PreIndex { rn: RegSel, off: i64 },
@@ -628,7 +621,7 @@ pub enum Inst {
         order: Ordering,
     },
     /// A SIMD&FP load of `bytes` bytes into the low lanes of `vt`, zeroing
-    /// the rest of the register — which is what every such load does.
+    /// the rest of the register.
     VLoad {
         bytes: u32,
         vt: VReg,
@@ -661,13 +654,9 @@ pub enum Inst {
         /// False selects the 64-bit form, which zeroes the upper half.
         q: bool,
     },
-    /// `movi`/`mvni`, with the immediate already expanded to the full
-    /// 128-bit register value.
-    ///
-    /// `inverted` records which of the two it was. The lifter does not need
-    /// it — the value is already final — but without it the disassembler
-    /// cannot tell the two apart, and bulk validation against binutils would
-    /// lose sight of the whole family.
+    /// `movi`/`mvni`, immediate already expanded to the full 128-bit value.
+    /// `inverted` records which it was — needed only so the disassembler can
+    /// tell them apart.
     VMoveImm {
         vd: VReg,
         value: u128,
@@ -794,9 +783,8 @@ pub enum Inst {
         vd: VReg,
     },
 
-    /// `ld1`/`st1` with one to four consecutive registers. Element size does
-    /// not change which bytes move, only how the guest interprets them, so
-    /// this is `regs` back-to-back vector accesses.
+    /// `ld1`/`st1` with one to four consecutive registers: `regs` back-to-back
+    /// vector accesses, since element size does not change which bytes move.
     VLoadMulti {
         regs: u8,
         vt: VReg,
@@ -834,11 +822,8 @@ pub enum Inst {
         addr: AddrMode,
     },
     /// `ld3`/`st3`/`ld4`/`st4` — three or four registers interleaved in
-    /// memory.
-    ///
-    /// The same shape as [`Inst::VLoadStore2`] with a wider stride. Kept
-    /// separate rather than folded in because two registers fit a single
-    /// shuffle and more do not, so the lowering differs.
+    /// memory. Like [`Inst::VLoadStore2`] but lowered separately, since more
+    /// than two registers do not fit a single shuffle.
     VLoadStoreN {
         load: bool,
         /// How many registers are interleaved: 3 or 4.
@@ -1218,9 +1203,7 @@ pub enum VOp3 {
     CmTst,
     /// Pairwise add of the concatenation of both operands.
     AddP,
-    /// Pairwise maximum and minimum. glibc's `strlen` and `memchr` reduce a
-    /// comparison mask with these, so a dynamic glibc program reaches them
-    /// before it reaches `main`.
+    /// Pairwise maximum and minimum.
     SMaxP,
     UMaxP,
     SMinP,
@@ -1234,7 +1217,7 @@ pub enum VOp3 {
     FMul,
     /// `fmulx`: like `fmul` except that zero times infinity is two.
     FMulx,
-    /// `|a - b|` per lane. Xwayland's font code reaches this one.
+    /// `|a - b|` per lane.
     FAbd,
     FDiv,
     FMax,

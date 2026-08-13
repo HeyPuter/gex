@@ -1,26 +1,16 @@
 //! Sockets.
 //!
-//! A page cannot open a TCP connection, and neither can wasm. What a page can
-//! do is talk to a proxy over a WebSocket, and Wisp is a protocol for
-//! multiplexing streams down one. So the kernel does not implement TCP: it
-//! implements the *shape* of a socket -- descriptors, `connect`, `send`,
-//! `recv`, and the blocking each of those implies -- and hands the carrying
-//! to whatever the host has. Natively that is a real socket; in a page it is
-//! a Wisp stream.
+//! A page cannot open TCP; it can talk to a proxy over a WebSocket, and Wisp
+//! multiplexes streams down one. So the kernel implements the *shape* of a
+//! socket -- descriptors, `connect`, `send`, `recv` and their blocking -- and
+//! hands the carrying to the host: a real socket natively, a Wisp stream in a
+//! page.
 //!
-//! # Names
-//!
-//! The awkward part is DNS. A Wisp stream is opened *by hostname*, because
-//! the proxy is the thing that can resolve; but a guest resolves first and
-//! connects to an address, and by then the name is gone. glibc's resolver is
-//! not something to reimplement, and neither is DNS-over-UDP-to-a-real-server.
-//!
-//! So the kernel answers DNS itself. A query for a name gets back an address
-//! out of a private range, and the name is remembered against it. When the
-//! guest then connects to that address, the name comes back and the host is
-//! asked for a stream to it. The guest believes it resolved; the proxy gets
-//! the name it needs; nothing in between has to understand DNS beyond
-//! reading a question and writing an answer.
+//! DNS is the awkward part: a Wisp stream opens by hostname, but a guest
+//! resolves first and connects to an address. So the kernel answers DNS
+//! itself, handing back an address from a private range and remembering the
+//! name against it; when the guest connects to that address the name comes
+//! back and the host is asked for a stream to it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -74,12 +64,8 @@ pub trait NetStack: Send + Sync + std::fmt::Debug {
 
 // -- names ------------------------------------------------------------------
 
-/// The private range the synthetic answers come from.
-///
-/// 240.0.0.0/4 is reserved and unroutable, which is the point: an address
-/// from here can only ever be one of these, so a guest that somehow reaches
-/// the real network with one gets an immediate failure rather than a
-/// connection to a stranger.
+/// The private range the synthetic answers come from. 240.0.0.0/4 is reserved
+/// and unroutable, so one of these addresses can only ever be a synthetic one.
 const FAKE_BASE: u32 = 0xf000_0001;
 
 /// Names the guest has asked about, and what it was told.
@@ -222,24 +208,16 @@ impl Socket {
         *self.peer.lock().unwrap()
     }
 
-    /// Remember where a datagram went, so the reply can be reported as
-    /// having come from there.
-    ///
-    /// A resolver checks that: it compares the source address of every reply
-    /// against the nameserver it asked, and drops anything else as a
-    /// spoofing attempt. Reporting 0.0.0.0 made every answer look forged and
-    /// `getaddrinfo` timed out with EAI_AGAIN on a reply it had in hand.
+    /// Remember where a datagram went, so the reply can be reported as coming
+    /// from there: a resolver drops replies whose source is not the nameserver
+    /// it asked, so 0.0.0.0 made every answer look spoofed.
     pub fn set_peer(&self, addr: u32, port: u16) {
         *self.peer.lock().unwrap() = Some((addr, port));
     }
 
-    /// `connect`. Returns `EINPROGRESS` while it is still being set up, which
-    /// is what a non-blocking connect is supposed to say; the kernel turns
-    /// that into a wait for a descriptor that is not non-blocking.
-    ///
-    /// Idempotent: asking twice does not open a second connection. The kernel
-    /// calls this once to start the connection and may reach it again on the
-    /// path that reports how it went.
+    /// `connect`. Returns `EINPROGRESS` while still connecting; the kernel
+    /// turns that into a wait for a blocking descriptor. Idempotent: asking
+    /// twice does not open a second connection.
     pub fn connect(&self, addr: u32, port: u16) -> Result<(), Errno> {
         if let Some(t) = self.transport.lock().unwrap().as_ref() {
             return match t.status() {
@@ -312,20 +290,11 @@ impl FileHandle for Socket {
         };
         match t.status() {
             Status::Refused => Err(Errno::ECONNREFUSED),
-            // Closed and drained is end of file, not "try again".
-            //
-            // A transport reports "nothing right now" as `EAGAIN` and cannot
-            // tell a connection that is empty from one that is over --
-            // `status` is what knows. Without this a peer that closes to mark
-            // the end of a body leaves the reader polling a descriptor that
-            // says ready, reading `EAGAIN`, and going round for ever. That is
-            // the failure the note on `available` below describes, on the
-            // half of the path that never got the fix, and it is what an
-            // `apt-get update` in the browser does thirty times without
-            // finishing one index.
-            //
-            // `send` has always answered `Status::Closed` with `EPIPE`. This
-            // is its counterpart.
+            // Closed and drained is end of file, not "try again": a transport
+            // reports "nothing right now" as EAGAIN and cannot tell an empty
+            // connection from a finished one, so `status` decides. Without
+            // this a reader spins on EAGAIN forever. Counterpart of `send`
+            // answering Closed with EPIPE.
             Status::Closed => match t.recv(buf) {
                 Ok(n) => Ok(n as u64),
                 Err(Errno::EAGAIN) => Ok(0),
@@ -368,15 +337,9 @@ impl FileHandle for Socket {
         true
     }
 
-    /// Whether a read would return something.
-    ///
-    /// Deliberately not affected by `O_NONBLOCK`: that decides whether the
-    /// *caller* waits, which the descriptor answers, and conflating the two
-    /// here made `poll` report a socket ready whenever the guest had asked
-    /// not to block. A resolver polled, was told yes, read `EAGAIN`, and went
-    /// round until it timed out.
-    /// For a datagram socket this has to be exact: it is the length of the
-    /// next datagram, and a caller sizes its buffer by it.
+    /// Bytes available to read, for `FIONREAD`. For a datagram socket this
+    /// must be exact -- the length of the next datagram, which a caller uses
+    /// to size its buffer.
     fn available(&self) -> Option<u64> {
         if self.kind == Kind::Udp {
             return Some(
@@ -408,23 +371,10 @@ impl FileHandle for Socket {
         }
     }
 
-    /// Writable, which for a socket in the middle of `connect` means the
-    /// connect has finished -- one way or the other.
-    ///
-    /// This is the whole of how a non-blocking connect reports itself. The
-    /// caller gets `EINPROGRESS`, waits for the descriptor to become
-    /// writable, and only then asks `SO_ERROR` whether it worked. Inheriting
-    /// the trait's `true` said "finished" the instant the connection was
-    /// started, so `apt` asked immediately, was told `EINPROGRESS`, and
-    /// reported it as the reason it could not connect:
-    ///
-    /// ```text
-    /// Could not connect to deb.debian.org:80 (240.0.0.1).
-    ///   - connect (115: Operation now in progress)
-    /// ```
-    ///
-    /// which reads like a network failure and is really a socket answering a
-    /// question before it knew.
+    /// Writable, which for a socket mid-`connect` means the connect has
+    /// finished either way. This is how a non-blocking connect reports itself:
+    /// the caller waits for writable, then asks `SO_ERROR`. The trait's
+    /// default `true` would signal "finished" before it was.
     fn poll_writable(&self) -> bool {
         if self.kind == Kind::Udp {
             return true;

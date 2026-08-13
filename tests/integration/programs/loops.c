@@ -1,15 +1,6 @@
-/* Loops of every shape, checked by their results.
- *
- * The rest of the suite is mostly straight-line: it exercises instructions,
- * and a loop only appears as scaffolding. That left a hole. A change to how
- * loops are translated -- emitting a whole loop as one function, say -- can
- * pass every other program here and still lose six rows out of three hundred
- * thousand in SQLite, which is how this file came to exist.
- *
- * Everything below reduces to one number per shape, so a wrong iteration
- * count or a register that did not survive a back edge shows up as a
- * different number rather than as a crash.
- */
+/* Loops of every shape, each reduced to one number, so a wrong iteration count
+ * or a register that did not survive a back edge shows up as a different
+ * number rather than a crash. */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>

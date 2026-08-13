@@ -1,21 +1,8 @@
-/* How much of `struct termios` does TCGETS write?
- *
- * The answer has to be `sizeof(struct __kernel_termios)` -- four flag words,
- * c_line, and c_cc[19], so 36 bytes on this architecture -- and not the
- * larger structure a C library declares for its own use, which has c_cc[32]
- * and two speed fields.
- *
- * This is not a detail. glibc's tcgetattr puts a kernel-sized structure on
- * the caller's stack and passes that; a kernel writing the userspace shape
- * into it overruns by 24 bytes and lands on the stack canary. `bash -i` died
- * that way, reporting stack smashing before it had printed a prompt, while
- * every musl program was fine -- musl passes its own larger structure, so the
- * overrun landed on its own padding.
- *
- * So the check is deliberately made the way glibc makes it: a buffer of
- * exactly the kernel's size, with a known pattern after it, and a look at
- * whether the pattern survived.
- */
+/* How much of `struct termios` does TCGETS write? It must be
+ * `sizeof(struct __kernel_termios)` -- 36 bytes here -- not the larger
+ * structure a C library declares. Writing the userspace shape overruns glibc's
+ * kernel-sized stack buffer onto its canary. Checked the way glibc does it: a
+ * kernel-sized buffer with a known guard pattern after it. */
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -27,8 +14,7 @@
 
 int main(void) {
     if (!isatty(0)) {
-        /* Nothing to ask. Said out loud so a run that silently checked
-           nothing cannot be mistaken for a pass. */
+        /* Nothing to ask. Said out loud so a no-op run is not read as a pass. */
         printf("not a tty\n");
         return 0;
     }

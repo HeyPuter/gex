@@ -147,12 +147,8 @@ pub struct DynSym {
     pub tls: bool,
 }
 
-/// An image with nothing in it but the numbers the auxiliary vector reports.
-///
-/// For a process that is *restored* rather than loaded: the layout it needs
-/// was decided by the process that linked it, and re-parsing the executable
-/// to recover four integers is the whole of what the load path would have
-/// been for.
+/// An image holding only the numbers the auxiliary vector reports, for a
+/// process that is restored rather than loaded.
 pub fn headers_only(phdr_vaddr: u64, phentsize: u64, phnum: u64, entry: u64) -> Image {
     Image {
         bias: 0,
@@ -195,31 +191,20 @@ pub struct Image {
     pub brk: u64,
     /// Executable address range, as `[start, end)`.
     pub text_range: (u64, u64),
-    /// The sections that actually hold instructions, biased, as
-    /// `[start, end)`.
+    /// The sections that actually hold instructions, biased, as `[start, end)`.
     ///
-    /// Segment permissions are too coarse to discover code with. A shared
-    /// library is commonly linked with one `R E` LOAD covering everything
-    /// read-only -- Mesa's 23 MB driver has exactly one, and it spans
-    /// `.dynsym`, `.dynstr`, the relocations and 4.6 MB of `.rodata` as well
-    /// as `.text`. Walking that whole range disassembles string tables as
-    /// instructions: the literals "MESA", "PIPE" and "GL_A" each decode to
-    /// something, and each becomes a block that ends in SIGILL.
-    ///
-    /// Empty when the section headers are gone, and then the segments are all
-    /// there is to go on.
+    /// Segment permissions are too coarse to discover code with: an `R E` LOAD
+    /// spans `.rodata` and the string tables too, which disassemble into blocks
+    /// that end in SIGILL. Empty when the section headers are gone, and then
+    /// the segments are all there is to go on.
     pub code: Vec<(u64, u64)>,
     /// `PT_TLS`, if present: `(vaddr, filesz, memsz, align)`.
     pub tls: Option<(u64, u64, u64, u64)>,
     /// Function symbols, when a symbol table survives.
     pub symbols: Vec<Symbol>,
     /// Every relocation, with enough to apply it: where, what kind, which
-    /// symbol and what to add.
-    ///
-    /// [`Self::named_relocs`] keeps only the two kinds code discovery cares
-    /// about and throws the type and the addend away. A linker needs all of
-    /// them -- `RELATIVE` is most of a shared library's relocations and names
-    /// no symbol at all.
+    /// symbol and what to add. ([`Self::named_relocs`] keeps only the two kinds
+    /// code discovery needs.)
     pub relocs: Vec<Reloc>,
     /// `DT_INIT_ARRAY`, biased, and how many entries: the functions that must
     /// run before `main`, in order.
@@ -228,21 +213,12 @@ pub struct Image {
     /// so a relocation's symbol index resolves without a second parse.
     pub dynsyms: Vec<DynSym>,
     /// Relocations that name a symbol, as `(slot, name)` with `slot` biased.
-    ///
-    /// A call to another object's function goes through one of these: the
-    /// slot is in this object's GOT, and the dynamic linker writes the
-    /// definition's address into it before the call happens. Reading the slot
-    /// afterwards is how the address of a function that has no address until
-    /// the guest runs -- an `STT_GNU_IFUNC` such as glibc's `memcpy` -- can
-    /// be discovered.
+    /// The linker fills the GOT slot before the call; reading it afterwards is
+    /// how an `STT_GNU_IFUNC` such as `memcpy` gets an address.
     pub named_relocs: Vec<(u64, String)>,
     /// `R_AARCH64_IRELATIVE` relocations, as `(slot, resolver)`, both biased.
-    ///
-    /// Left unapplied on purpose -- running a resolver is the guest's job at
-    /// startup -- which is exactly what makes them useful afterwards: once
-    /// the guest has run, `slot` holds the address the resolver chose, and
-    /// that is the only way to learn where an `STT_GNU_IFUNC` such as
-    /// `memcpy` actually ended up.
+    /// Left unapplied on purpose (the resolver is guest code); afterwards
+    /// `slot` holds the address the resolver chose.
     pub irelative: Vec<(u64, u64)>,
     /// True for `ET_DYN` images.
     pub pie: bool,
@@ -251,12 +227,8 @@ pub struct Image {
     /// `DT_SONAME`, the name other objects link against. Absent on
     /// executables and on a library linked without one.
     pub soname: Option<String>,
-    /// `DT_NEEDED`, in order: the objects this one names as dependencies.
-    ///
-    /// Read so that the closure of a program can be worked out without
-    /// running it. `gexc build` translated the image and nothing else, which
-    /// on any normally linked program is the wrapper and not the work:
-    /// `apt-get` is 67 KB in front of 1.9 MB of `libapt-pkg.so`.
+    /// `DT_NEEDED`, in order: the objects this one names as dependencies, read
+    /// so a program's closure can be worked out without running it.
     pub needed: Vec<String>,
     /// `DT_RUNPATH`, or `DT_RPATH` when there is no runpath, split on `:` and
     /// with `$ORIGIN` left as it stands for the caller to expand.
@@ -488,23 +460,9 @@ fn read_needed(image: &mut Image, dyn_vaddr: u64, dyn_size: u64) {
     image.runpath = if runpath.is_empty() { rpath } else { runpath };
 }
 
-/// Which GOT slot each named relocation writes to, and the name it writes.
-///
-/// The dynamic linker fills these in before the guest's own code runs, so
-/// afterwards the slot holds the address the call will actually reach. That
-/// is the only way to find an indirect function: `memcpy` on aarch64 glibc is
-/// an `STT_GNU_IFUNC` whose symbol value is a resolver, and which
-/// implementation it picked is a fact about the run, not about the file.
-///
-/// Both relocation tables, because `DT_JMPREL` holds the lazy PLT entries and
-/// `DT_RELA` the eagerly-bound ones, and which of the two a given call uses
-/// depends on how the object was linked.
 /// Everything a linker needs out of the dynamic section: the symbol table,
 /// every relocation with its type and addend, and the initialisers.
-///
-/// The existing `read_named_relocs` answers a different question -- which
-/// slots hold the address of a named function, for code discovery -- and
-/// keeps two relocation kinds out of a dozen. This is the whole table.
+/// ([`read_named_relocs`] answers a narrower question for code discovery.)
 pub(crate) fn read_dynamic(image: &Image, dyn_vaddr: u64, dyn_size: u64)
     -> (Vec<DynSym>, Vec<Reloc>, Vec<u64>) {
     const STT_GNU_IFUNC: u8 = 10;
@@ -675,16 +633,10 @@ fn read_cstr(image: &Image, vaddr: u64) -> String {
 
 /// Apply the relocations a static-PIE image needs before its own code runs.
 ///
-/// Only `R_AARCH64_RELATIVE` is handled here. `R_AARCH64_IRELATIVE` resolvers
-/// are guest code and must run after entry (PLAN §6.4), so they are left to
-/// the image's own startup path — which is exactly what musl's `rcrt1` does.
-/// Applying `RELATIVE` twice is harmless, because it writes an absolute value
-/// rather than adding to one, so an image that also self-relocates stays
-/// correct.
-///
-/// Reads happen through the *placed* segments rather than the file, so the
-/// dynamic table and relocation entries are seen exactly as the guest will
-/// see them.
+/// Only `R_AARCH64_RELATIVE`; `IRELATIVE` resolvers are guest code and are
+/// deferred to startup (PLAN §6.4). Applying `RELATIVE` twice is harmless (it
+/// writes an absolute value), so an image that also self-relocates stays
+/// correct. Reads go through the *placed* segments, not the file.
 fn apply_relative_relocations(image: &mut Image, dyn_vaddr: u64, dyn_size: u64) {
     let mut rela: Option<u64> = None;
     let mut relasz: u64 = 0;
@@ -857,10 +809,9 @@ fn read_symbols(
         let Ok(sh_type) = r.u32(off + 4) else {
             continue;
         };
-        // `.dynsym` as well as `.symtab`. A shipped shared library has been
-        // stripped of the second and keeps the first, and its exported
-        // functions are exactly the entry points a static recompiler wants to
-        // start from.
+        // `.dynsym` as well as `.symtab`: a stripped shared library keeps only
+        // the former, and its exported functions are the entry points to start
+        // discovery from.
         if sh_type != SHT_SYMTAB && sh_type != SHT_DYNSYM {
             continue;
         }

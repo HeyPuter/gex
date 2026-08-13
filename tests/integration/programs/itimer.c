@@ -1,17 +1,7 @@
-/* Interval timers, which are how a program puts a bound on its own work.
- *
- * `setitimer` used to be accepted and dropped: it returned success and the
- * signal never came. That is worse than refusing, because a program that
- * cannot arm a timeout knows it has none, while a program whose timeout never
- * fires waits forever. `openssl speed` runs its measurement loop until SIGALRM
- * arrives and has no other stopping condition, so a two-second benchmark
- * became an infinite one.
- *
- * The counts here are deliberately not compared -- how many times a repeating
- * timer fires in a fixed wall-clock window is not reproducible under an
- * emulator -- only that it fired at all, that it stopped when disarmed, and
- * that what `getitimer` reports is inside the interval it was given.
- */
+/* Interval timers (setitimer/getitimer). Fire counts are not compared -- how
+ * often a repeating timer fires in a wall-clock window is not reproducible --
+ * only that it fired, stopped when disarmed, and that getitimer's remaining
+ * time is inside the interval asked for. */
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>

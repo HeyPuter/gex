@@ -1,21 +1,8 @@
-/* Fixed-point conversions in the SIMD shift-by-immediate encoding.
- *
- *     scvtf  s0, s0, #16        ucvtf  s19, s19, #2
- *     fcvtzs v0.4s, v0.4s, #16  fcvtzs v0.2d, v0.2d, #16
- *
- * The lane holds a number with a given count of fractional bits, so the
- * conversion carries a scale: an integer divided by 2^fbits on the way to a
- * float, multiplied by it on the way back. These share the shift-immediate
- * encoding with `shl` and `sshr`, which is why gex decoded them as neither
- * and raised SIGILL -- Mesa's driver has ten of them.
- *
- * Inline assembly, because no intrinsic reaches the scalar forms and the
- * compiler will not choose the vector ones on its own.
- *
- * The values include negatives and a saturating case: `fcvtzs` clamps rather
- * than wrapping, and getting that wrong is invisible until something
- * overflows.
- */
+/* Fixed-point conversions in the SIMD shift-by-immediate encoding (scvtf,
+ * ucvtf, fcvtzs at #fbits): the lane carries a scale of 2^fbits. They share
+ * the shift-immediate encoding with `shl`/`sshr`. Inline assembly, since no
+ * intrinsic reaches the scalar forms. Values include negatives and a
+ * saturating case, since `fcvtzs` clamps rather than wraps. */
 #include <stdint.h>
 #include <stdio.h>
 

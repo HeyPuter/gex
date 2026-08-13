@@ -2,23 +2,18 @@
 //
 //   node web/test/threads-shared.mjs
 //
-// This is the question underneath "real threads". A thread is a second Worker
-// running on the memory a process already has. Because the shim's own state --
-// its heap, its statics, the `Host` that owns the file table and the process
-// table -- lives in that same linear memory, two Workers on it should see one
-// kernel rather than two. That only became true when `HOST` stopped being a
-// thread-local: with `+atomics` each Worker gets its own TLS block, so a
-// thread-local kernel is a *fork*, silently, and every file one thread opened
-// would be missing from the other.
+// A thread is a second Worker on the memory a process already has. The shim's
+// own state -- heap, statics, the `Host` owning the file and process tables --
+// lives in that linear memory, so two Workers on it should see one kernel. That
+// needed `HOST` to stop being a thread-local: with `+atomics` each Worker gets
+// its own TLS block, so a thread-local kernel would silently fork.
 //
-// What is checked, in order of how badly each would break things:
-//
-//   1. a second Worker can instantiate against a memory already in use --
-//      wasm data segments are applied at instantiation, and a second one
-//      re-running them would wipe the first Worker's kernel out from under it,
+// Checked, worst break first:
+//   1. a second Worker can instantiate against a memory in use -- re-running
+//      the data segments would wipe the first Worker's kernel,
 //   2. the second Worker sees the guest's memory as the first left it,
-//   3. the second Worker sees the first's *kernel* state, which is the whole
-//      claim: a file created through one is open through the other.
+//   3. the second Worker sees the first's kernel state: a file created through
+//      one is open through the other.
 import { Worker } from 'node:worker_threads';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -161,10 +156,9 @@ if (text !== 'thread A was here') {
 }
 
 // The replay. A dispatch table belongs to a module instance, so this Worker
-// began with empty ones while the page directory -- which is shared -- already
-// pointed at slots. Attaching must have put every module the process
-// translated into this Worker's own tables; a thread short of even one of them
-// would dispatch into a slot that has never been filled.
+// began empty while the shared page directory already pointed at slots.
+// Attaching must install every translated module into this Worker's tables, or
+// a thread would dispatch into an unfilled slot.
 const mods = await b.ask({ kind: 'modules' }, 'modules');
 if (mods.n !== ran.modules) {
   console.log(

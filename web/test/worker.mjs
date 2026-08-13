@@ -2,20 +2,11 @@
 //
 //   node web/test/worker.mjs [program ...]
 //
-// The first step of replacing the process switcher (task #24). What it proves
-// is narrow and worth proving: the shim, the runtime translator and a real
-// program all work in a Worker with their own `WebAssembly.Memory`, which is
-// what gives each process a private address space and so removes the reason
-// two processes' libraries collide.
-//
-// Two processes are started at once and both are checked, because the point
-// is that they do not share memory: run separately they would pass whatever
-// happens, and the interesting failure is the one where they tread on each
-// other.
-//
-// Node's Worker rather than a browser's, deliberately. The code under test is
-// the same file a page loads; what differs is only how a message is posted,
-// and Node turns a twenty-minute cycle into a two-minute one.
+// The first step of replacing the process switcher: the shim, translator and a
+// real program all work in a Worker with their own `WebAssembly.Memory`, giving
+// each process a private address space. Two processes run at once and both are
+// checked -- the interesting failure is when they tread on each other. Node's
+// Worker, not a browser's: the same file a page loads, but a faster cycle.
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from '../../shims/browser/js/host.mjs';
 import { readFile, access } from 'node:fs/promises';
@@ -37,9 +28,8 @@ const skip = (why) => {
 if (!(await exists(SHIM))) skip('no browser shim (shims/browser/build.sh)');
 if (!(await exists(SEED))) skip('no seed module (web/build-assets.sh)');
 
-// `--dir /=<path>` bundles a tree, so a Worker can run a dynamically linked
-// program with its libraries -- which is what every real demo is. Without it
-// this could only ever prove a static binary works.
+// `--dir /=<path>` bundles a tree so a Worker can run a dynamically linked
+// program with its libraries, not just a static binary.
 let root = null;
 const argv = process.argv.slice(2);
 const dirAt = argv.indexOf('--dir');
@@ -60,10 +50,9 @@ for (const p of programs) {
 const shim = new Uint8Array(await readFile(SHIM));
 const seed = new Uint8Array(await readFile(SEED));
 
-// The global kernel, if it has been built: the process table and the
-// filesystem every process shares. Without it a guest that forks gets as far
-// as the fork and no further, because the child would have neither a place in
-// the process table nor a root to `execve` out of.
+// The global kernel, if built: the process table and filesystem every process
+// shares. Without it a forked child has no place in the table and no root to
+// `execve` out of.
 const KERNEL = join(ROOT, 'web/public/gex/gex_kernel.plain.wasm');
 const kernel = (await exists(KERNEL))
   ? {

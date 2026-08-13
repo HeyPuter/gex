@@ -711,14 +711,9 @@ pub fn poll_revents(p: &PollFd) -> u16 {
     if p.events & POLLIN != 0 && h.poll_readable() {
         r |= POLLIN;
     }
-    // Asked of the handle, not remembered. `p.writable` is the descriptor's
-    // open mode, which cannot change; whether a write would block can, and
-    // a parked poll is re-evaluated long after it was built.
-    //
-    // Freezing it was a real hang: a poll made while the socket was full
-    // stored "not writable", the other end drained the buffer, and the
-    // stored answer never moved. POLLIN was always asked live, which is why
-    // only this direction could get stuck.
+    // Whether a write would block is asked of the handle every time, not
+    // frozen: a parked poll outlives the state it was built from, and a
+    // stored "not writable" never moved once the reader drained the buffer.
     if p.events & POLLOUT != 0 && p.writable && h.poll_writable() {
         r |= POLLOUT;
     }
@@ -729,8 +724,6 @@ pub fn poll_ready(fds: &[PollFd]) -> bool {
     fds.iter().any(|p| poll_revents(p) != 0)
 }
 
-/// Write the answer back and count what is ready. Shared by the immediate
-/// reply and the one a parked wait gives when it wakes.
 /// Read-ready and write-ready counts from the last `select`. See the note
 /// where they are set.
 pub static SELECT_READY: [core::sync::atomic::AtomicU64; 2] = [
@@ -1025,20 +1018,9 @@ impl Kernel {
         }
     }
 
-    /// Read a whole file out of the guest's namespace.
-    ///
-    /// Used to load an `execve` target and its interpreter, so the program
-    /// that runs is the one the guest can see -- the sysroot's `/bin/sh`, not
-    /// the host's.
-    /// Read one range of a file straight into `out`, returning how many
-    /// bytes were filled. The rest of `out` is left alone.
-    ///
-    /// `read_file` reads the whole thing, which is the wrong shape when the
-    /// caller wants a page of it: restoring a suspended process's read-only
-    /// mappings from their files reads libc for a 4 KiB mapping of libc, and
-    /// Mesa's driver is fifteen megabytes. That showed up as a third of the
-    /// remaining `memcpy` in a profile of the gears demo -- the copy the
-    /// switcher no longer does, done again one layer down.
+    /// Read one range of a file into `out`, returning bytes filled; the rest
+    /// of `out` is left alone. Unlike `read_file`, this serves a caller that
+    /// wants only a page of a large file rather than the whole thing.
     pub fn read_file_at(&self, path: &str, offset: u64, out: &mut [u8]) -> Option<usize> {
         let h = self.vfs.open(path, 0, 0).ok()?;
         let mut done = 0usize;
@@ -1267,8 +1249,8 @@ impl Kernel {
     /// starts clear because a monitor is per-thread and the parent's says
     /// nothing about the child's.
     ///
-    /// A `clone` without `CLONE_THREAD` is `fork`, which gex does not
-    /// implement -- one address space, one process.
+    /// A `clone` without `CLONE_THREAD` never reaches here; the new-process
+    /// case is handled in `syscall`.
     fn sys_clone(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> Result<SpawnRequest, Errno> {
         let (flags, child_stack, parent_tid, tls, child_tid) = (a[0], a[1], a[2], a[3], a[4]);
         if flags & clone_flags::THREAD == 0 {
@@ -1363,8 +1345,6 @@ impl Kernel {
             };
         }
 
-        // `clone` and a thread's `exit` change which threads exist, so they
-        // answer with an outcome rather than a return value.
         // Someone has halted the machine. Every process notices here and
         // stops, however deep in its own work it was.
         if let Some(code) = self.procs.halt_code() {
@@ -1651,32 +1631,14 @@ impl Kernel {
                 if !file.write_is_atomic() {
                     return None;
                 }
-                // Only when it cannot be done in one go. A handle that can
-                // say how much room it has takes the direct path when the
-                // write fits, which is every write in the common case.
-                //
-                // A pipe cannot say: another Worker can change the answer
-                // between the claim and the write, so `write_room` returns
-                // `None` on purpose. That used to arrive here as `?` and
-                // return "this does not block" -- so a write to a *full*
-                // pipe never parked, went straight through, and came back
-                // `EAGAIN` on a descriptor the guest had every right to
-                // believe was blocking.
-                //
-                // What that looks like from the guest:
-                //
-                //     $ gzip -dc big.gz | sha256sum
-                //     gzip: stdout: Resource temporarily unavailable
-                //
-                // and a hash over a truncated stream. A program that handles
-                // short writes correctly still loses, because `EAGAIN` is not
-                // a short write -- it is an error, and gzip stops.
-                //
-                // So when the room is unknown, ask whether the descriptor is
-                // writable at all. Writable means go straight through and
-                // take whatever short count comes back, which is legal and
-                // which callers retry; full means park, and let the block op
-                // carry it a turn at a time as the reader drains.
+                // A handle that can report its room takes the direct path
+                // when the write fits (the common case). A pipe cannot --
+                // another Worker can change the answer between the claim and
+                // the write, so `write_room` returns `None` -- so when the
+                // room is unknown, park only if the descriptor is not writable
+                // at all; writable takes the short count, which callers retry.
+                // Getting this wrong sent a full-pipe write straight through
+                // to `EAGAIN`, truncating a `gzip -dc | sha256sum` stream.
                 match file.handle.write_room() {
                     Some(room) if a[2] <= room => return None,
                     Some(_) => {}
@@ -1716,35 +1678,19 @@ impl Kernel {
                 if operation != futex::op::WAIT && operation != futex::op::WAIT_BITSET {
                     return None;
                 }
-                // A futex word outside the process's memory map is not
-                // something to wait on. Linux answers `EFAULT`; parking
-                // instead is a hang with no way out, because the wake would
-                // have to come from an address nothing can write.
-                //
-                // Checked against the map rather than with `GuestMem::read`,
-                // which is the trap here: a guest address *is* a linear
-                // memory offset, so reading address zero succeeds and tells
-                // you nothing. Only the map knows there is nothing mapped
-                // there.
-                //
-                // zstd deadlocks with two of its four threads parked on
-                // address zero -- #113. Waiting on it can only be permanent,
-                // and an error is what lets the guest report rather than
-                // stop.
+                // A futex word outside the process's memory map is `EFAULT`,
+                // not a wait: the wake would have to come from an address
+                // nothing can write. Checked against the map, not with
+                // `GuestMem::read` -- a guest address is a linear-memory
+                // offset, so reading address zero succeeds and proves nothing
+                // (#113).
                 if !self.mem.vmas().iter().any(|v| a[0] >= v.start && a[0] + 4 <= v.end) {
                     return None;
                 }
-                // The word has to still hold what the caller expects.
-                //
-                // That comparison is the whole point of the call: the caller
-                // read the word, decided to wait, and asks the kernel to make
-                // the decision atomic by refusing if it has changed since.
-                // Parking unconditionally loses the wake-up that changed it --
-                // the waker has already been and gone -- and the thread then
-                // sleeps on a condition that has already happened.
-                //
-                // `EAGAIN` is what Linux answers, and it is what `sys_futex`
-                // now gives a declined wait on memory the process has.
+                // The word must still hold what the caller expects, or the
+                // wake that changed it has already been and gone and the wait
+                // would be permanent. A mismatch declines the wait (EAGAIN via
+                // `sys_futex`).
                 if m.read_u32(a[0]).ok()? != a[2] as u32 {
                     return None;
                 }
@@ -1754,15 +1700,9 @@ impl Kernel {
                     let secs = m.read_u64(a[3]).ok()?;
                     let nanos = m.read_u64(a[3] + 8).ok()?;
                     let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
-                    // `FUTEX_WAIT_BITSET` names a moment, not a length, and
-                    // `CLOCK_REALTIME` says which clock it is on. Read as a
-                    // length it is about fifty-five years, and clamping that
-                    // to an hour turned a `pthread_cond_timedwait` of ten
-                    // milliseconds into an hour's sleep -- which is not a
-                    // hang the guest can report, only one it sits in.
-                    //
-                    // Plain `FUTEX_WAIT` really is relative, and keeps the
-                    // reading it always had.
+                    // `FUTEX_WAIT_BITSET | CLOCK_REALTIME` names an absolute
+                    // moment; read as a relative length it is ~55 years.
+                    // Plain `FUTEX_WAIT` really is relative.
                     let absolute = (a[1] as u32) & !futex::op::PRIVATE_FLAG
                         == futex::op::WAIT_BITSET | futex::op::CLOCK_REALTIME;
                     let left = if absolute {
@@ -2065,7 +2005,6 @@ impl Kernel {
             nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.sys_epoll_wait(m, a[0] as i32, a[1], a[2] as u32),
             nr::CLOSE_RANGE => self.sys_close_range(a[0], a[1], a[2]),
             nr::MEMBARRIER => self.sys_membarrier(a[0]),
-            // No listening, though: a page cannot be connected to.
             nr::SET_TID_ADDRESS => {
                 self.clear_child_tid = a[0];
                 Ok(self.tid as u64)
@@ -2108,9 +2047,6 @@ impl Kernel {
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(m, a[0] as u32, a[1], a[2]),
             nr::RT_SIGPENDING => self.sys_rt_sigpending(m, a[0]),
             nr::SIGALTSTACK => self.sys_sigaltstack(m, a[0], a[1]),
-            // One process and one thread for now, so any target is us.
-            // `raise` goes through tkill, which is why it needs its own entry
-            // rather than falling into the unimplemented bucket.
             // `tkill` and `tgkill` address a thread, and every thread of a
             // process shares this kernel, so they raise here directly.
             nr::TKILL | nr::TGKILL => {
@@ -2172,8 +2108,8 @@ impl Kernel {
 
     fn sys_futex(&mut self, _m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         let (uaddr, raw_op, val) = (a[0], a[1] as u32, a[2] as u32);
-        // The private and clock bits change nothing here: gex has one address
-        // space, and the timeout is treated as relative either way.
+        // The private and clock bits change nothing here: the timeout is
+        // treated as relative either way.
         let operation = raw_op & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
         match operation {
             // The waiting forms reach here only when `blocking_op` refused
@@ -2185,23 +2121,10 @@ impl Kernel {
                     .iter()
                     .any(|v| uaddr >= v.start && uaddr + 4 <= v.end);
                 // `EAGAIN`, not `EINVAL`, for a wait on memory the process
-                // has.
-                //
-                // glibc treats a futex answer it does not recognise as
-                // unrecoverable: `futex_fatal_error` writes "The futex
-                // facility returned an unexpected error code." and aborts.
-                // `EAGAIN` is on its list -- it means the word no longer
-                // holds the value the caller expected -- so the caller
-                // re-reads and loops, which is the behaviour a spurious
-                // wake-up already has to survive. `EINVAL` is not, and
-                // `dpkg-deb`'s decompressing child died of it every time:
-                // liblzma's threaded decoder is the one thing in a Debian
-                // rootfs that waits on a condition variable, and every
-                // `apt install` goes through it.
-                //
-                // An address the process does not have is still `EFAULT`,
-                // which is what Linux says and what lets #113 report a wait
-                // on address zero rather than hang on it.
+                // has: glibc aborts on a futex error it does not recognise,
+                // and `EAGAIN` (word changed, so re-read and loop) is on its
+                // recognised list while `EINVAL` is not. An address the
+                // process lacks is still `EFAULT` (#113).
                 Err(if mapped { Errno::EAGAIN } else { Errno::EFAULT })
             }
             futex::op::WAKE | futex::op::WAKE_BITSET => Ok(self.futexes.wake(uaddr, val)),
@@ -2330,14 +2253,8 @@ impl Kernel {
     ///
     /// `kill` cannot reach into another process's kernel -- each has its own
     /// -- so it leaves the signal on a shared per-process word and the target
-    /// picks it up here. Nothing did: `ProcState::take_signals` existed, was
-    /// tested, and had no caller outside its own tests, so `kill(pid, sig)`
-    /// recorded a signal that was never delivered to anything.
-    ///
-    /// A child asleep in `nanosleep` therefore ran its full thirty seconds
-    /// and exited normally when its parent had sent it `SIGTERM` a second in;
-    /// a spinning one never stopped at all. That is `timeout`, job control,
-    /// and every supervisor.
+    /// picks it up here. This is what makes `timeout`, job control and every
+    /// supervisor work.
     pub fn collect_signals(&mut self) {
         let inbox = self.procs.take_signals(self.pid);
         if inbox == 0 {
@@ -2433,28 +2350,18 @@ impl Kernel {
     // -- I/O -----------------------------------------------------------------
 
     fn sys_write(&mut self, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
-        // Straight out of the guest's memory, with no copy in between.
-        //
-        // Guest virtual address equals byte offset here, so the bytes are
-        // already a slice; taking `.to_vec()` of them bought nothing and cost
-        // an allocation and a copy of every byte written. See `sys_writev`,
-        // where the same copy was most of a browser run.
+        // Straight out of the guest's memory: a guest address is already a
+        // linear-memory offset, so the bytes are a slice and a copy would be
+        // pure overhead.
         let data = m.read(buf, len as usize)?;
         let file = self.fds.get(fd)?;
         file.write(data)
     }
 
     fn sys_read(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
-        // Into the guest's memory, with no buffer in between.
-        //
-        // The guest picks the length and this allocated that much on every
-        // call. The cap is 16 MiB, which is exactly the arena's chunk, so a
-        // reader asking for a large block made the allocator claim a fresh
-        // span each time: 117 spans and 1,872 MiB in an `apt-get update` that
-        // had not finished one index. Attributed by counting refills against
-        // the syscall in flight -- almost all of them were nr 63. See task
-        // 140. `sys_write` has read straight out of guest memory since the
-        // copy there turned out to be most of a browser run.
+        // Straight into the guest's memory, no intermediate buffer: the guest
+        // picks the length and a copy would allocate that much on every call.
+        // Capped at 16 MiB.
         let len = len.min(1 << 24) as usize;
         let dst = m.read_mut(buf, len)?;
         self.fds.get(fd)?.read(dst)
@@ -2678,20 +2585,10 @@ impl Kernel {
     ) -> SysResult {
         let p = self.at_path(m, dirfd, path)?;
         // `O_TMPFILE` names a directory and asks for an unnamed file inside
-        // it. Ignoring the bit opens the directory, and every write to it
-        // then fails with `EISDIR` -- which is what apt saw while writing its
-        // package cache.
-        //
-        // The file is made, opened, and its name removed straight away, which
-        // is what "unnamed" means: the handle keeps it alive and nothing else
-        // can find it. A later `linkat` to give it a name would fail, and
-        // that is honest -- the alternative is leaving litter in the guest's
-        // filesystem under a name it never chose.
-        // `O_PATH` opens the name, not the file. tar uses it to get a handle
-        // on a symlink it has just created so it can set the mode through
-        // it, and the symlink's target very often does not exist yet -- so
-        // opening it the ordinary way follows the link and answers `ENOENT`,
-        // which tar reports as a failure to unpack the archive.
+        // it: made, opened, and unlinked at once, so the handle is the only
+        // way to it. `O_PATH` opens the name, not the file, so it does not
+        // follow a dangling symlink to `ENOENT` -- which is how tar sets the
+        // mode on a symlink whose target does not exist yet.
         let handle = if flags & oflags::O_PATH != 0 {
             let md = if flags & oflags::O_NOFOLLOW != 0 {
                 self.vfs.metadata_nofollow(&p)?
@@ -2990,14 +2887,11 @@ impl Kernel {
         }
     }
 
-    /// `statx`, which is how glibc stats a file on any kernel new enough to
-    /// have it.
+    /// `statx`, how glibc stats a file on a modern kernel.
     ///
-    /// Answering `ENOSYS` is supposed to be safe -- glibc falls back to
-    /// `fstatat` -- and it very nearly is: the fallback runs, returns the
-    /// right answer, and then `ls` branches into padding. Rather than find
-    /// out why a path that is barely exercised on any real system goes wrong,
-    /// this is the path glibc wants.
+    /// Implemented rather than left to answer `ENOSYS`: the `fstatat` fallback
+    /// returned the right answer but `ls` then branched into padding, so serve
+    /// the path glibc actually wants.
     fn sys_statx(
         &mut self,
         m: &mut GuestMem<'_>,
@@ -3245,14 +3139,10 @@ impl Kernel {
         }
         let tty = Arc::clone(&self.tty);
         match req {
-            // Only the kernel's part of the structure. This is not a detail:
-            // glibc's `tcgetattr` passes a `struct __kernel_termios` that
-            // lives on the caller's stack, and on this architecture that is
-            // 36 bytes because NCCS is 19. Writing the 60-byte userspace
-            // shape into it overruns by 24 and lands on the stack canary --
-            // which is exactly what `bash -i` did, and why it reported stack
-            // smashing before it had printed a prompt. musl hides the bug by
-            // passing its own larger struct straight through.
+            // Only the kernel's part of the structure: glibc's `tcgetattr`
+            // passes a 36-byte `struct __kernel_termios` on the stack, and
+            // writing the 60-byte userspace shape overruns it onto the stack
+            // canary -- `bash -i` reported stack smashing before its prompt.
             TCGETS => {
                 m.write(arg, &tty.termios()[..KERNEL_TERMIOS])?;
                 Ok(0)
@@ -3623,25 +3513,10 @@ impl Kernel {
 
     /// `fchdir`: the working directory named by a descriptor.
     ///
-    /// This was not implemented at all, so it reached the default and
-    /// answered `ENOSYS`, and the program that noticed was `mkdir -p`:
-    ///
-    /// ```text
-    /// mkdir /tmp/p        -> 0
-    /// mkdir -p /tmp/q/r   -> cannot create directory /tmp/q:
-    ///                        Function not implemented
-    /// ```
-    ///
-    /// Only when there is an ancestor to create, because that is the path
-    /// where coreutils uses gnulib's `savewd` -- it keeps the working
-    /// directory as an open descriptor and returns to it with `fchdir`
-    /// between components. dpkg builds directory trees the same way, so
-    /// this stopped `apt-get install` as surely as anything downstream of
-    /// it did.
-    ///
-    /// A descriptor here already knows the absolute path it was opened as,
-    /// and `set_cwd` re-checks that it is a directory, which is the error a
-    /// descriptor on a regular file has to produce.
+    /// The descriptor already knows the absolute path it was opened as, and
+    /// `set_cwd` re-checks it is a directory (the error a descriptor on a
+    /// regular file must produce). coreutils' `mkdir -p` needs this: gnulib's
+    /// `savewd` returns between components with `fchdir`.
     fn sys_fchdir(&mut self, fd: i32) -> SysResult {
         let file = self.fds.get(fd)?;
         let path = file.path.clone();
@@ -3718,13 +3593,10 @@ impl Kernel {
 
     /// `utimensat(dirfd, path, times, flags)`: set a file's timestamps.
     ///
-    /// gex does not persist file times, but it must still answer honestly for
-    /// *existence*. A NULL path is the `futimens` form and validates the
-    /// descriptor; a real path must resolve or the call is `ENOENT`. This was a
-    /// blanket `Ok(0)`, and that quiet success broke `touch`: busybox touch
-    /// calls `utimensat` first and only creates a new file when it *fails*, so
-    /// pretending the timestamp update worked made `touch <newfile>` a no-op
-    /// that created nothing yet exited 0. Checking existence restores it.
+    /// gex does not persist file times, but must still answer honestly for
+    /// *existence*: a NULL path validates the descriptor (`futimens`); a real
+    /// path must resolve or the call is `ENOENT`. A blanket `Ok(0)` broke
+    /// `touch`, which creates a file only when `utimensat` fails.
     fn sys_utimensat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u32) -> SysResult {
         const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
         if path == 0 {
@@ -3741,15 +3613,9 @@ impl Kernel {
         Ok(0)
     }
 
-    /// `symlinkat(target, newdirfd, linkpath)`.
-    ///
-    /// The directory descriptor is the third argument and it was being
-    /// ignored: every symlink resolved against the working directory
-    /// instead. A program that opens its destination and works relative to it
-    /// -- which is what tar does, and what anything careful about races does
-    /// -- got `ENOENT`, because the parent it had just created is not there
-    /// relative to the cwd. Unpacking any Debian package containing a symlink
-    /// failed on it.
+    /// `symlinkat(target, newdirfd, linkpath)`. The link path resolves
+    /// against `newdirfd`, not the working directory -- tar works relative to
+    /// a descriptor it just created, and against the cwd that is `ENOENT`.
     fn sys_symlinkat(
         &mut self,
         m: &GuestMem<'_>,
@@ -3762,12 +3628,6 @@ impl Kernel {
         self.vfs.symlink(&t, &p).map(|_| 0)
     }
 
-    /// `ppoll` over the descriptors gex can answer for.
-    ///
-    /// Regular files are always ready, which is what Linux reports; pipes
-    /// answer from their buffer state. There is no waiting yet, so a poll
-    /// that would block returns zero ready descriptors after the timeout is
-    /// checked, which callers handle as a spurious wakeup.
     /// Read the guest's `pollfd` array into something the host can re-check.
     fn collect_pollfds(&self, m: &GuestMem<'_>, fds: u64, nfds: u64) -> Option<Vec<PollFd>> {
         let mut out = Vec::with_capacity(nfds.min(1024) as usize);
@@ -3874,19 +3734,10 @@ impl Kernel {
         } else {
             (self.at_path(m, a[0] as i32, a[1])?, a[2] as u32, a[3])
         };
-        // `AT_SYMLINK_NOFOLLOW` on a symlink is not something Linux supports:
-        // a symlink has no mode of its own, and the call reports
-        // `EOPNOTSUPP`. Following the link instead is both wrong and
-        // dangerous -- it changes a different file -- and here it produced a
-        // stranger failure, because a symlink is very often created before
-        // its target exists.
-        //
-        // GNU tar unpacking a package does exactly that, and `chmod`
-        // following the link answered `ENOENT`. tar reports that as a real
-        // error, dpkg-deb reports tar's failure, and a Debian package with a
-        // dangling symlink in it -- which `libpython3.11-minimal` has, the
-        // last entry in the archive -- fails to install after unpacking
-        // perfectly.
+        // `chmod` on a symlink itself is `EOPNOTSUPP`, as on Linux: a symlink
+        // has no mode of its own. Following the link would change a different
+        // file, and answers `ENOENT` when the target does not exist yet --
+        // which tar hits unpacking a package with a dangling symlink.
         if self
             .vfs
             .metadata_nofollow(&path)
@@ -3904,18 +3755,10 @@ impl Kernel {
         secs as u128 * 1_000_000_000 + nanos as u128
     }
 
-    /// `setitimer` and `getitimer`.
-    ///
-    /// A `struct itimerval` is two `timeval`s -- reload interval then time
-    /// remaining -- and a `timeval` is two 64-bit words, seconds and
-    /// *microseconds*. Thirty-two bytes in all.
-    ///
-    /// These used to be accepted and dropped, on the reasoning that a program
-    /// that cannot arm a timeout is worse off than one whose timeout never
-    /// fires. That reasoning is wrong for the programs that actually use
-    /// them: `openssl speed` runs its measurement loop until SIGALRM arrives
-    /// and nothing else ever stops it, so accepting the call and never firing
-    /// turned a two-second benchmark into an infinite one.
+    /// `setitimer` and `getitimer`. A `struct itimerval` is two `timeval`s
+    /// (reload interval then time remaining), each two 64-bit words of seconds
+    /// and *microseconds*: 32 bytes. These actually fire -- `openssl speed`
+    /// runs its loop until SIGALRM and nothing else stops it.
     fn sys_itimer(
         &mut self,
         m: &mut GuestMem<'_>,
@@ -3960,17 +3803,10 @@ impl Kernel {
 
     /// Fire any timer whose deadline has passed, and reload it if it repeats.
     ///
-    /// Called wherever a signal could be delivered, which on this design is
-    /// every back-edge safepoint. That is the right granularity for a timer
-    /// whose job is to interrupt a loop, and the wrong one for a process
-    /// asleep in `read` -- a guest blocked in the host has no back-edges, so
-    /// its timer waits for the read to finish. Worth knowing before relying on
-    /// one of these as a watchdog.
-    ///
-    /// `ITIMER_VIRTUAL` and `ITIMER_PROF` are meant to count the process's own
-    /// CPU time rather than wall clock. They are driven from the same clock
-    /// here, which for a guest that is mostly running is nearly the same
-    /// number and for one that is mostly blocked is not.
+    /// Called at every back-edge safepoint -- so a timer does not fire while
+    /// the guest is blocked in the host (no back-edges until the call
+    /// returns). `ITIMER_VIRTUAL`/`ITIMER_PROF` should count CPU time but are
+    /// driven from the same wall clock as the rest.
     pub fn check_timers(&mut self) {
         if self.itimers.iter().all(|t| t.is_none()) {
             return;
@@ -4090,19 +3926,12 @@ impl Kernel {
 
     /// The pinned base for a path a closure build named, if there is one.
     ///
-    /// Exact spelling first, then the file's name alone. A closure records the
-    /// path `gexc` walked in its sysroot and the guest's `ld.so` opens
-    /// whatever `/etc/ld.so.cache` gives it, and on Debian those differ by a
-    /// symlinked prefix -- `/lib/aarch64-linux-gnu/libc.so.6` against
-    /// `/usr/lib/aarch64-linux-gnu/libc.so.6`. A `HashMap::get` on the whole
-    /// path answers "no pin" to that, silently: the object is placed by the
-    /// bump allocator instead, every module built for it is addressed wrong,
-    /// and the run lifts the library again having loaded a statically
-    /// recompiled copy of it. There is no error anywhere, only a slow run.
-    ///
-    /// The fallback is safe because a pin is a claim about one object and a
-    /// rootfs does not ship two libraries of the same name that a single
-    /// program loads both of. If it ever did, the exact match still wins.
+    /// Exact spelling first, then the file's name alone: `gexc` records the
+    /// path it walked in its sysroot while `ld.so` opens what `ld.so.cache`
+    /// gives it, and on Debian those differ by a symlinked prefix. The
+    /// name-only fallback is safe because a rootfs does not ship two libraries
+    /// of one name that a single program loads both of; the exact match still
+    /// wins.
     pub fn pin_for(&self, path: &str) -> Option<u64> {
         if let Some(&base) = self.pins.get(path) {
             return Some(base);
@@ -4124,14 +3953,10 @@ impl Kernel {
             let file = self.fds.get(fd)?;
             let name = file.path.clone();
             // A second `MAP_SHARED` of the same open file must see the first
-            // one's writes -- that is what shared means -- and the way to
-            // arrange that in a single address space is to hand back the same
-            // pages. A Wayland client maps a buffer and sends the descriptor;
-            // whoever maps it next has to be looking at the same pixels, and
-            // with a copy they were looking at zeroes.
-            //
-            // The mapping is not reference counted, so unmapping one alias
-            // unmaps both. Nothing that does this unmaps early.
+            // one's writes, so hand back the same pages -- a Wayland client
+            // maps a buffer and sends the descriptor, and the next mapper must
+            // see the same pixels, not a zeroed copy. Not reference counted:
+            // unmapping one alias unmaps both, and nothing here unmaps early.
             if flags & crate::mem::flags::SHARED != 0 {
                 if let Some(existing) = self.shared_maps.iter().find(|s| {
                     Arc::ptr_eq(&s.file, &file) && s.offset == offset && s.len >= len_aligned
@@ -4155,13 +3980,10 @@ impl Kernel {
             let n = file.pread(offset, &mut tmp)? as usize;
             m.zero(start, len_aligned as usize)?;
             m.write(start, &tmp[..n])?;
-            // A shared mapping is expected to reach the file. The copy above
-            // is the whole of the mapping, so nothing does until it is
-            // written back -- at `msync`, and at `munmap`, which is where a
-            // program that never calls `msync` expects its changes to land.
-            // An executable file mapping is a shared library arriving. Tell
-            // the host, so the static recompiler gets a whole object at once
-            // rather than the runtime translator getting it a miss at a time.
+            // A shared mapping is written back at `msync` and `munmap` (where
+            // a program that never calls `msync` expects its changes to land).
+            // An executable file mapping is a shared library arriving: tell the
+            // host so the static recompiler gets the whole object at once.
             if prot_bits & crate::mem::prot::EXEC != 0 {
                 self.new_code.push(CodeMap {
                     start,
@@ -4179,15 +4001,10 @@ impl Kernel {
             }
             return Ok(start);
         }
-        // The reservation an ELF loader makes for an object it is about to
-        // map: no address asked for, no permissions, anonymous. Handing it
-        // the pinned base makes every `MAP_FIXED` that follows land where the
-        // closure build assumed, because they are all relative to this one.
-        //
-        // Passed as a *hint*, which `mmap_from` honours only when the range
-        // is genuinely free -- so a pin that would collide is ignored rather
-        // than corrupting the map, and shows up in `pin_landed` as a
-        // mismatch instead of as a wrong answer.
+        // The anonymous PROT_NONE reservation an ELF loader makes before it
+        // maps an object: hand it the pinned base and every `MAP_FIXED` that
+        // follows lands where the closure build assumed. Passed as a hint, so
+        // a collision is ignored and recorded in `pin_landed`, not forced.
         let mut addr = addr;
         let mut pinned = None;
         if addr == 0 && prot_bits == 0 && flags & mflags::ANONYMOUS != 0 {
@@ -4307,14 +4124,9 @@ impl Kernel {
         }
     }
 
-    /// `rt_sigtimedwait`, for a signal already pending.
-    ///
-    /// The blocking case is not implemented: a caller that asks to wait gets
-    /// `EAGAIN` as though the timeout had expired. That is a real limitation
-    /// and it is visible -- `sigwaitinfo` with no timeout is supposed never to
-    /// return empty-handed -- but the alternative is a fifth kind of
-    /// [`BlockOp`], and every caller seen so far uses this to drain signals it
-    /// has blocked rather than to sleep on them.
+    /// `rt_sigtimedwait`, for a signal already pending. The blocking case is
+    /// not implemented: a caller that asks to wait gets `EAGAIN`, which suits
+    /// every caller seen so far (draining blocked signals, not sleeping).
     fn sys_rt_sigtimedwait(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         let set = if a[0] == 0 { 0 } else { m.read_u64(a[0])? };
         match self.signals.take_pending_in(set) {
@@ -4478,19 +4290,13 @@ impl Kernel {
         Ok(())
     }
 
-    /// `socketpair`, which is a connected pair with no name.
-    /// `memfd_create`: an anonymous file with no name in any filesystem.
-    ///
-    /// A Wayland client's buffers are these. The `path` recorded is what
-    /// Linux shows in `/proc/self/fd`, which is where a program looks to work
-    /// out what a descriptor it was handed actually is.
     /// `close`, which also drops any advisory lock the description held.
     ///
     /// Only when this was the last descriptor onto it: `dup` and `fork` share
     /// one description and one lock, so closing a copy releases nothing. And
-    /// it has to happen, because the lock is keyed by the description's
-    /// address and a freed one's address is handed straight back to the next
-    /// open -- a stale lock would then belong to an unrelated file.
+    /// the lock is keyed by the description's address, which is handed
+    /// straight back to the next open -- a stale one would belong to an
+    /// unrelated file.
     fn sys_close(&mut self, fd: i32) -> SysResult {
         let file = self.fds.get(fd)?;
         let key = Arc::as_ptr(&file) as *const () as usize;
@@ -5090,12 +4896,9 @@ impl Kernel {
     /// One `struct mmsghdr` is a `msghdr` and the length it carried.
     const MMSGHDR: u64 = 64;
 
-    /// `sendmmsg`: several datagrams in one call.
-    ///
-    /// glibc's resolver sends its A and AAAA queries this way, and answering
-    /// `ENOSYS` does not send it back to `sendto` -- it reports the name as
-    /// unresolvable, which is how `apt-get update` failed with "Temporary
-    /// failure resolving".
+    /// `sendmmsg`: several datagrams in one call. glibc's resolver sends its A
+    /// and AAAA queries this way and does not fall back to `sendto` on
+    /// `ENOSYS`, so it must be real or name resolution fails.
     fn sys_sendmmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, vec: u64, n: u64) -> SysResult {
         let mut sent = 0u64;
         for i in 0..n.min(1024) {
@@ -5240,24 +5043,16 @@ impl Kernel {
         }
         let secs = m.read_u64(req)?;
         let nanos = m.read_u64(req + 8)?;
-        // A cap keeps a guest from parking the runtime indefinitely before
-        // signals exist to interrupt it.
         let _ = (secs, nanos);
         // The sleep itself is `BlockOp::Sleep`, run by the host with the
         // kernel unlocked; reaching here means a zero request.
         Ok(0)
     }
 
-    /// How much time this process has used, in nanoseconds.
-    ///
-    /// Wall clock since it started, not processor time: nothing here measures
-    /// how much of that the guest was actually scheduled for, and on a host
-    /// where the guest is one thread of one process there is no portable way
-    /// to ask. For a guest that is computing it is very nearly the same
-    /// number, and for one that spends its life blocked it is not.
-    ///
-    /// The alternative was what this used to do, which is report zero.
-    /// `openssl speed` divides by it, and printed every throughput as `infk`.
+    /// How much time this process has used, in nanoseconds: wall clock since
+    /// it started, not true processor time (which there is no portable way to
+    /// ask for here). `openssl speed` divides by it, so zero printed every
+    /// throughput as `infk`.
     pub fn cpu_nanos(&mut self) -> u128 {
         let now = self.now_nanos();
         if self.started == 0 {

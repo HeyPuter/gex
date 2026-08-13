@@ -1,32 +1,22 @@
-// The page's end of the terminal.
+// The page's end of the terminal. The terminal itself -- flags, size,
+// foreground group, line discipline -- lives in the global kernel's shared
+// memory (see `gex_kernel::tty`); this holds an `xterm.js`, calls `input` with
+// what was typed and writes back what `drainEcho` returns.
 //
-// The terminal itself -- the flags, the size, the foreground process group,
-// the line discipline -- is in the global kernel, in the memory every guest
-// process shares. See `gex_kernel::tty` for why it has to be there. This is
-// the other end of it: the thing holding an `xterm.js` calls `input` with what
-// was typed and writes back whatever `drainEcho` returns.
+// It reaches the kernel by instantiating it directly, rather than messaging a
+// Worker: a `^C` must interrupt a program that may not be reading or running
+// and may be one of a dozen Workers, and only the process table (in this
+// module's memory) knows the foreground group. So a keystroke becomes a signal
+// in the same turn it was typed, waking a parked guest by the same counter
+// every cross-process delivery uses.
 //
-// It reaches the kernel by *instantiating it*, which is the whole trick here.
-// Everything else the page knows about a guest arrives as a message to a
-// Worker, and a keystroke cannot: a `^C` has to interrupt a program that is
-// not reading, may not be running, and may be one of a dozen Workers -- and
-// the only thing that knows which processes are in the foreground group is
-// the process table, which is in this module's memory. So the page makes its
-// own instance and calls in directly. A keystroke becomes a signal in the
-// same turn it was typed, and a Worker parked inside wasm is woken by the
-// same counter every other cross-process delivery uses.
-//
-// Without a `SharedArrayBuffer` there is no global kernel, and there is
-// nothing here: `open` answers null and the caller keeps its own line
-// discipline, which is right for the one process it can then be running.
+// Without a `SharedArrayBuffer` there is no global kernel: `open` answers null
+// and the caller keeps its own line discipline.
 
-/// Where the page writes bytes for the kernel to copy out of.
-///
-/// The kernel imports a second memory -- the calling *process's* -- and
-/// addresses it with `memory.copy` rather than a pointer. The page is not a
-/// guest process and has none, so it provides a page of scratch and passes
-/// offsets into it. One page: the largest thing that crosses is a 60-byte
-/// `termios`, and keystrokes arrive a few at a time.
+/// Where the page writes bytes for the kernel to copy out of. The kernel
+/// imports the calling process's memory and addresses it with `memory.copy`;
+/// the page has none, so it provides a page of scratch and passes offsets. One
+/// page suffices -- the largest thing that crosses is a 60-byte `termios`.
 const SCRATCH = 0x100;
 const SCRATCH_BYTES = 0x1000;
 
@@ -36,22 +26,19 @@ export class PageTty {
   #scratch;
 
   /**
-   * Instantiate the global kernel here, for the terminal's sake.
-   *
-   * `spec` is what `ProcessHost` was given: `{ module, memory }`. Null when
-   * the page has no shared memory, and null out if the module is older than
-   * this file -- an absent export is a rebuild, not a reason to fail a boot.
+   * Instantiate the global kernel here, for the terminal's sake. `spec` is
+   * `{ module, memory }`; returns null when the page has no shared memory or
+   * the module predates this file (an absent export is a rebuild, not a boot
+   * failure).
    */
   static async open(spec) {
     if (!spec?.module || !spec?.memory) return null;
     const mod = spec.module instanceof WebAssembly.Module
       ? spec.module
       : await WebAssembly.compile(spec.module);
-    // One page, and a maximum, because a memory import's limits are part of
-    // its *type*: a memory with no maximum does not satisfy an import that
-    // declares one, however small the memory is. 65535 is what
-    // `tools/add-memory.mjs` writes for the process import -- the whole of a
-    // wasm32 address space.
+    // A maximum, because a memory import's limits are part of its type: one
+    // with no maximum does not satisfy an import that declares one. 65535 is
+    // what `tools/add-memory.mjs` writes for the process import.
     const scratch = new WebAssembly.Memory({ initial: 1, maximum: 65535 });
     let inst;
     try {
@@ -59,12 +46,9 @@ export class PageTty {
         env: { memory: spec.memory, process: scratch },
       });
     } catch (e) {
-      // A module that will not take a plain process memory is the shared
-      // build, which is not what a page loads. Nothing here is worth failing
-      // a boot for -- but silence is worse: with no terminal the page falls
-      // back to its own line editing, which looks *almost* right. Backspace
-      // works, `stty` works, and only `^C` is quietly gone, because that is
-      // the one thing the fallback cannot do. So say so.
+      // A module that will not take a plain process memory is the shared build,
+      // not what a page loads. Warn rather than fail silently: the fallback
+      // line editing looks almost right, but `^C` is quietly gone.
       console.warn(`[gex] no shared terminal: ${e.message}`);
       return null;
     }
@@ -74,33 +58,15 @@ export class PageTty {
         + 'so it is older than this glue. Rebuild it with shims/kernel/build.sh.');
       return null;
     }
-    // A stack of this instance's own, before anything is called.
+    // A stack of this instance's own: every instance's `__stack_pointer` starts
+    // at the same shared address, so two in the kernel at once overwrite each
+    // other's locals. The kernel reserves an array of slices for this.
     //
-    // Every instance of this module gets its own `__stack_pointer` global,
-    // and wasm-ld initialises all of them to the same address in a memory
-    // they share -- so two instances inside the kernel at once write over
-    // each other's locals. The kernel reserves an array of slices for
-    // exactly this.
-    //
-    // The *last* slice, and the arithmetic is the whole of why. `ProcessHost`
-    // gives Worker n the value `area + n * size` as its stack *top*, counting
-    // from 1, so that Worker owns the bytes below it -- `[area+(n-1)*size,
-    // area+n*size)`. Taking `area + size` here reads like "slice 0, which
-    // nobody has" and is in fact the exact top the first Worker is handed:
-    // the page and that Worker then grow down through the same quarter
-    // megabyte.
-    //
-    // It failed the way a stack collision does, rarely and somewhere else. A
-    // forked child would trap with `memory access out of bounds` in the
-    // middle of translating a block, but only when the fork landed close
-    // enough to a keystroke for the two to be inside the kernel together.
-    // Four runs of the same commands: two clean, two dead.
-    //
-    // `area + count * size` is above every top the host will ever hand out.
-    //
-    // Reading where the array is uses the linked-in stack, which is safe here
-    // and nowhere else: the page instantiates before any Worker exists, so
-    // there is nobody to collide with yet.
+    // `area + count * size` is above every top the host hands out. `area + size`
+    // would collide with the first Worker (which is handed exactly that top),
+    // and it failed as stack collisions do -- rarely, and somewhere else.
+    // Reading where the array is uses the linked-in stack, safe only because
+    // the page instantiates before any Worker exists.
     if (k.k_stack_area && inst.exports.__stack_pointer) {
       const area = k.k_stack_area() >>> 0;
       const size = k.k_stack_size() >>> 0;
@@ -117,9 +83,8 @@ export class PageTty {
   }
 
   #bytes() {
-    // A memory that grew has a detached buffer behind it. This one never
-    // grows, but reading it back costs nothing and a stale view is a silent
-    // wrong answer rather than an error.
+    // A grown memory detaches its buffer. This one never grows, but re-reading
+    // is free and a stale view is a silent wrong answer.
     if (this.#mem.buffer !== this.#scratch.buffer) {
       this.#mem = new Uint8Array(this.#scratch.buffer);
     }

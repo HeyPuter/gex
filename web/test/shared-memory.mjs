@@ -2,23 +2,15 @@
 //
 //   node web/test/shared-memory.mjs <static-aarch64-elf>
 //
-// Two builds exist because a memory import's `shared` flag is part of its
-// type: a module built for a shared memory will not instantiate against a
-// plain one, or the other way round, so this cannot be a runtime choice. The
-// page picks by whether it is cross-origin isolated.
+// The `shared` flag is part of a memory import's type, so a module built for
+// one will not instantiate against the other; it cannot be a runtime choice,
+// and the page picks by whether it is cross-origin isolated. The shared build
+// is for threads -- a process's threads are Workers on its one shared memory.
 //
-// What the shared build is *for* is threads. A process gets one memory, and if
-// that memory is shared then each of its threads can be its own Worker and run
-// at the same time -- the only way real parallelism happens in a tab.
-// Processes still never share memory with each other; that is what stops two
-// of them putting libraries at the same addresses, which is what the snapshot
-// switcher died of.
-//
-// Running the same program both ways is the point. The shared build has a
-// different allocator (a spinlock rather than a cell, because more than one
-// thread can be inside the module) and its runtime translator has to emit
-// modules that import a shared memory too -- a mismatch there is a LinkError
-// at the first dispatch miss, not at load, which is a long way from the cause.
+// Running the same program both ways is the point: the shared build has a
+// different allocator (a spinlock, since more than one thread can be inside the
+// module) and its translator must emit modules that import a shared memory too
+// -- a mismatch is a LinkError at the first dispatch miss, far from the cause.
 import { readFile, access } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';

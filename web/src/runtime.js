@@ -1,10 +1,9 @@
 // A gex runtime bound to an xterm.js terminal.
 //
-// The seam is `Env`: gex hands the page every write and asks it for input.
-// What this adds on top is the part a terminal needs and a pipe does not --
-// a line discipline. Whether the page does the line editing or the guest does
-// is the guest's choice, made by clearing ICANON in its termios, and the page
-// has to follow it or every keystroke appears twice.
+// The seam is `Env`: gex hands the page every write and asks it for input. What
+// this adds is a line discipline. Whether the page or the guest does the line
+// editing is the guest's choice (ICANON in its termios), and the page has to
+// follow it or every keystroke appears twice.
 
 import { Env } from '../../shims/browser/js/gex.mjs';
 import { ProcessHost } from '../../shims/browser/js/host.mjs';
@@ -14,31 +13,19 @@ const ICANON = 0x2;
 const ECHO = 0x8;
 
 /** Where the built runtime lives, relative to the site root. */
-// The shared build of the shim too. It imports the guest's memory, so it is
-// the fourth thing whose import type has to agree -- and it had been built
-// into `target/` and never copied anywhere the page could fetch it.
+// A memory import's `shared` flag is part of its type, so the shim, seed,
+// kernel, closure and host-made memory must all be the shared build or nothing
+// links.
 const SHIM_URL = '/gex/gex_browser.shared.wasm';
-// The shared build, and it has to be the shared one everywhere at once.
-//
-// A memory import's `shared` flag is part of its type, so the seed, the
-// kernel, the closure and the memory the host makes either all say shared or
-// none of them link. That coupling is why this was plain: there was no way to
-// turn threads on for one process, so the page turned them on for nobody and
-// ran every guest thread inline instead -- the shape that was never tested.
 const SEED_URL = '/gex/seed.shared.wasm';
-// The global kernel, likewise: it imports each process's memory, so its
-// import type has to match the memory the process was built with.
 const KERNEL_URL = '/gex/gex_kernel.wasm';
 
 let shimBytes = null;
 let seedBytes = null;
 
-/// Four bytes that say a response is a wasm module and not a web page.
-///
-/// A dev server that cannot find a file answers with `index.html` and status
-/// *200*, so `res.ok` proves nothing. Handing that to `WebAssembly.compile`
-/// reports a magic-word error against the module, which sends the reader
-/// looking at the build rather than at the request -- and the build is fine.
+/// Guard the wasm magic bytes: a dev server that cannot find a file answers
+/// `index.html` with status 200, so `res.ok` proves nothing and the reader
+/// would blame the build for a magic-word error that is really a bad request.
 function checkWasm(url, res, bytes) {
   if (!url.endsWith('.wasm')) return bytes;
   const m = bytes.subarray(0, 4);
@@ -52,15 +39,9 @@ function checkWasm(url, res, bytes) {
 }
 
 async function fetchBytes(url, onProgress) {
-  // Revalidated, never taken from cache on faith.
-  //
-  // `/gex/gex_browser.wasm` and the seed have fixed URLs with no content
-  // hash, so a browser will happily keep serving a build it fetched hours
-  // ago. That is fine until a broken one is published for a few minutes, and
-  // then a reload does not fix it: the page keeps running the broken shim and
-  // the guest traps instantly -- 133, SIGTRAP, from a dispatch table that no
-  // longer matches the closure beside it. Cheap insurance: one conditional
-  // request, and a 304 for the common case.
+  // Revalidated, never taken from cache on faith: the shim and seed have fixed
+  // URLs with no content hash, so a browser would keep serving a broken build
+  // across reloads. One conditional request, a 304 for the common case.
   const res = await fetch(url, { cache: 'no-cache' });
   if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
   const total = Number(res.headers.get('content-length')) || 0;
@@ -96,60 +77,45 @@ export async function loadRuntime(onProgress) {
 export { fetchBytes };
 
 /**
- * A `?name=` switch, from wherever this is running.
- *
- * `location` does not exist under Node, and this file is deliberately
- * runnable there -- the terminal test drives it, because the alternative is a
- * twenty-minute cycle in a browser for a change to the line discipline. Three
- * bare `location.search` reads had crept back in, and they threw before the
- * guest was started, so the test reported `ReferenceError: location is not
- * defined` and nothing else.
+ * A `?name=` switch, from wherever this is running. `location` does not exist
+ * under Node (where the terminal test drives this file), so the same switches
+ * arrive there as `GEX_*` environment variables.
  */
 function flag(name) {
   const search = globalThis.location?.search;
   if (search) return new URLSearchParams(search).get(name);
-  // Under Node the same switches arrive as environment variables, spelled
-  // the way the rest of the harness spells them: `GEX_TRACE`, `GEX_HOT`.
   return globalThis.process?.env?.[`GEX_${name.toUpperCase()}`] ?? null;
 }
 
 /**
  * An `Env` whose output goes to a terminal and whose input comes from one.
  *
- * The awkward part is that a guest read has to be able to wait. gex gives the
- * wasm stack back to JS when every thread is blocked on input, and calls
- * `readStdin` -- so this is where a promise sits until a key arrives.
+ * A guest read has to be able to wait: gex gives the wasm stack back to JS when
+ * every thread is blocked on input and calls `readStdin`, so this is where a
+ * promise sits until a key arrives.
  */
 class TerminalEnv extends Env {
   constructor(term, tty = null) {
     super();
     this.term = term;
-    // The system's terminal, when there is a global kernel to hold one.
-    //
-    // With it, none of the line editing below runs: a keystroke goes into the
-    // discipline in the kernel and comes back as echo, the bytes a program
-    // reads are already in the queue that program reads from, and `^C` has
-    // become `SIGINT` to the foreground group before this returns. Without
-    // it there is one process and no process table, and the fallback below is
-    // exactly right for that.
+    // The system's terminal, when a global kernel holds one: a keystroke goes
+    // into the discipline in the kernel and `^C` becomes `SIGINT` to the
+    // foreground group before this returns. Without it there is one process and
+    // the line-editing fallback below runs instead.
     this.tty = tty;
     this.pending = [];
     this.line = [];
     this.waiter = null;
     this.closed = false;
-    // The guest's terminal flags, as its Worker last reported them.
-    //
-    // Read rather than asked for, because the guest is in a Worker now and
-    // `gex_tty_lflag` is a synchronous call into its shim. Every process
-    // sends its flags with each write and each request for input, which is
-    // when they change in practice: a shell sets its terminal up and then
-    // prints a prompt.
+    // The guest's terminal flags, as its Worker last reported them: read rather
+    // than asked for, since the guest is in a Worker and every process sends its
+    // flags with each write and read.
     this.lflag = ICANON | ECHO;
   }
 
   write(fd, bytes) {
-    // xterm wants \r\n; a Unix program writes \n. Nothing else in the byte
-    // stream is touched, so colour and cursor control pass through.
+    // Straight through, untouched: the kernel's tty has already done ONLCR, and
+    // colour and cursor control pass unchanged.
     this.term.write(bytes.slice());
   }
 
@@ -170,10 +136,8 @@ class TerminalEnv extends Env {
   onKey(data) {
     if (this.closed) return;
     if (this.tty) {
-      // Straight into the discipline. What comes back is what a terminal
-      // shows: the character in cooked mode, `^C` and a fresh line for an
-      // interrupt, backspace-space-backspace for an erase -- and nothing at
-      // all when the program has taken echo over.
+      // Straight into the discipline; what comes back as echo is what a terminal
+      // shows, and nothing when the program has taken echo over.
       if (this.tty.input(data)) {
         const echo = this.tty.drainEcho();
         if (echo) this.term.write(echo);
@@ -184,9 +148,8 @@ class TerminalEnv extends Env {
       if (ready !== 0 && this.waiter) {
         const w = this.waiter;
         this.waiter = null;
-        // `true` rather than the bytes: they are already in the queue the
-        // guest reads from, and handing them over here would deliver them
-        // twice.
+        // `true` rather than the bytes: they are already in the guest's read
+        // queue, and handing them over here would deliver them twice.
         w(ready < 0 ? false : true);
       }
       return;
@@ -246,12 +209,9 @@ class TerminalEnv extends Env {
   }
 
   /**
-   * The next thing typed, as bytes, or false at end of input.
-   *
-   * The bytes are *returned* rather than pushed into a shim: the guest is in
-   * a Worker and this is the page, so what crosses is a message. Everything
-   * waiting is joined into one, because a guest reading a line wants the
-   * line.
+   * The next thing typed, as bytes, or false at end of input. Returned rather
+   * than pushed into a shim (the guest is in a Worker), and everything waiting
+   * is joined into one.
    */
   async readStdin() {
     if (this.tty) {
@@ -281,28 +241,20 @@ class TerminalEnv extends Env {
 }
 
 /**
- * Run one program to completion.
- *
- * `files` is the guest's filesystem as a path-to-bytes map, `args` its argv.
- * Returns the exit status. The caller owns the terminal; nothing here clears
- * it, so a demo can print its own banner first.
- */
-/**
  * The global kernel, fetched once and instantiated per Worker.
  *
  * Everything guest processes share and no single process can own: the process
- * table, the filesystem, the pipes. Its memory is a `SharedArrayBuffer`, so
- * the page has to be cross-origin isolated -- see the COOP/COEP headers in
- * `vite.config.js`. A page that is not gets no kernel and one process, which
- * still runs anything that does not fork.
+ * table, the filesystem, the pipes. Its memory is a `SharedArrayBuffer`, so the
+ * page has to be cross-origin isolated (COOP/COEP headers in `vite.config.js`).
+ * A page that is not gets no kernel and one process, which still runs anything
+ * that does not fork.
  */
 let kernelSpec = null;
 async function loadKernel() {
   if (kernelSpec !== null) return kernelSpec || null;
-  // The direct question, rather than `crossOriginIsolated`: what is needed is
-  // a `SharedArrayBuffer`, and in a page that flag is only how the browser
-  // says whether there is one. Asking for the constructor works under Node
-  // too, which is what lets the terminal test drive this same file.
+  // Test for `SharedArrayBuffer` directly, not `crossOriginIsolated`: it is
+  // what is actually needed, and asking for the constructor works under Node
+  // too (which lets the terminal test drive this same file).
   if (typeof SharedArrayBuffer !== 'function') {
     kernelSpec = false;
     return null;
@@ -310,16 +262,12 @@ async function loadKernel() {
   try {
     const bytes = await fetchBytes(KERNEL_URL);
     kernelSpec = {
+      // The maximum must match `--max-memory` in `shims/kernel/build.sh`
+      // exactly: a shared memory carries its maximum in its type, so a host
+      // offering a different one cannot instantiate the module. It reserves
+      // address space, not pages -- the rootfs lives here and grows as files
+      // arrive.
       module: await WebAssembly.compile(bytes),
-      // Four gigabytes, and it has to match `--max-memory` in
-      // `shims/kernel/build.sh` *exactly*: a shared memory carries its
-      // maximum in its type, so a host that offers a different one cannot
-      // instantiate the module at all. Raising one without the other is how
-      // this page stopped booting.
-      //
-      // The rootfs lives in this memory, so the ceiling is the largest
-      // machine a tab can boot. It reserves address space rather than pages;
-      // the memory still starts at 128 MiB and grows as files arrive.
       memory: new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true }),
     };
   } catch {
@@ -330,17 +278,10 @@ async function loadKernel() {
 }
 
 /**
- * How to make a Worker running one guest process.
- *
- * A page has `Worker`; Node has `worker_threads`. Both are here because the
- * terminal test drives this same file under Node -- the line discipline and
- * the promise that parks a guest read are page code, and running them in a
- * browser to test them would be a twenty-minute cycle instead of a two-minute
- * one.
- *
- * The browser branch is written out in full and inline because that is the
- * shape vite recognises and bundles; the Node one keeps its path out of a
- * literal so that the bundler leaves it alone.
+ * How to make a Worker running one guest process. A page has `Worker`, Node has
+ * `worker_threads` (the terminal test drives this file under Node). The browser
+ * branch is spelled out inline because that is the shape vite bundles; the Node
+ * path is kept out of a literal so the bundler leaves it alone.
  */
 async function guestWorkerFactory() {
   if (typeof Worker === 'function') {
@@ -355,17 +296,13 @@ async function guestWorkerFactory() {
 }
 
 /**
- * Run one program to completion.
+ * Run one program to completion. `files` is the guest's filesystem as a
+ * path-to-bytes map, `args` its argv; returns the exit status. The caller owns
+ * the terminal, so a demo can print its own banner first.
  *
- * `files` is the guest's filesystem as a path-to-bytes map, `args` its argv.
- * Returns the exit status. The caller owns the terminal; nothing here clears
- * it, so a demo can print its own banner first.
- *
- * The program runs in a Worker, and so does everything it forks. That is the
- * whole of what replaced the snapshot switcher: each process has a memory of
- * its own, nothing collides, nothing is written out and read back. What they
- * share is in the global kernel, which every one of them instantiates against
- * one shared memory.
+ * The program runs in a Worker, and so does everything it forks -- what
+ * replaced the snapshot switcher. Each process has its own memory; what they
+ * share is in the global kernel, instantiated against one shared memory.
  */
 export async function runProgram(
   term,
@@ -388,26 +325,18 @@ export async function runProgram(
     gl = null,
     virgl = null,
     uid,
-    // Every N safepoints, say where the guest is. A run that is merely slow
-    // says nothing about *what* is slow, and this is the only instrument that
-    // works in a page: the shim prints the guest pc, and which module that
-    // address lands in is the answer.
+    // Every N safepoints, print the guest pc -- the only instrument for
+    // locating what is slow in a page.
     heartbeat = globalThis.GEX_HEARTBEAT ?? 0,
-    // KiB of mapped text per object to statically recompile once it proves
-    // hot; 0 turns it off and leaves the guest to arrive one dispatch miss at
-    // a time. A parameter because it is the one guest-visible setting on which
-    // the page and `run-node.mjs` disagree -- the page has always had it on
-    // and the Node harness has it off by default -- so a fault that appears in
-    // only one of the two hosts cannot be attributed until it can be switched.
+    // KiB of mapped text per object to statically recompile once hot; 0 leaves
+    // the guest to arrive one dispatch miss at a time. A parameter because the
+    // page (on) and `run-node.mjs` (off) disagree, so a host-specific fault
+    // cannot be attributed until it can be switched.
     recompileObjects = typeof globalThis.GEX_RECOMPILE_OBJECTS === 'number'
       ? globalThis.GEX_RECOMPILE_OBJECTS
       : 8192,
     // A closure built ahead of time by `gexc build --closure`: the image
-    // module, every library module beside it, and the layout that says where
-    // each one was placed. This is what the project is *for* -- the guest
-    // arrives already translated and lifts almost nothing at runtime -- and
-    // until now no page could be given one, so the browser had only ever been
-    // measured in the configuration that matters least.
+    // module, every library beside it, and the layout they were placed at.
     closure = null,
     // Keep the address space the guest's dynamic linker produced, so the next
     // process of the same program starts at its own entry with every
@@ -418,24 +347,17 @@ export async function runProgram(
   const { shimBytes, seedBytes } = await loadRuntime();
   const kernel = await loadKernel();
   const makeGuestWorker = await guestWorkerFactory();
-  // The system's terminal, instantiated here so that a keystroke reaches the
-  // line discipline and the process table by a call rather than by a message
-  // to a Worker. Null without a shared memory, and `TerminalEnv` then does
-  // its own line editing -- see its constructor.
+  // The system's terminal, instantiated here so a keystroke reaches the line
+  // discipline by a call rather than a message to a Worker. Null without a
+  // shared memory, and `TerminalEnv` then does its own line editing.
   const sharedTty = tty ? await PageTty.open(kernel) : null;
   const tenv = new TerminalEnv(term, sharedTty);
-  // The terminal, reachable from a console or a test.
-  //
-  // The same affordance as `window.gexTerminalText`, and for the same reason:
-  // when `^C` does nothing there are three places it can have been lost --
-  // the discipline did not raise it, the foreground group is wrong, or the
-  // target never collected it -- and `gexTty.fg()` separates the second from
-  // the other two in one line. Null when there is no shared terminal, which
-  // is itself the first thing worth knowing.
+  // The terminal, reachable from a console or a test (see `gexTerminalText`):
+  // `gexTty.fg()` tells whether a lost `^C` was a wrong foreground group. Null
+  // when there is no shared terminal.
   globalThis.gexTty = sharedTty;
-  // Before pid 1 runs, so the first `TIOCGWINSZ` is the truth. A shell asks
-  // once at startup and then only on `SIGWINCH`, so a wrong answer here is
-  // one that lasts.
+  // Before pid 1 runs, so the first `TIOCGWINSZ` is the truth: a shell asks
+  // once at startup and then only on `SIGWINCH`.
   sharedTty?.resize(term.rows, term.cols);
 
   // The GPU, if this demo has one. The renderer stays here, with the canvas;
@@ -465,102 +387,61 @@ export async function runProgram(
     guest: closure?.image ?? seedBytes,
     kernel,
     extra: {
-      // In `extra`, so every Worker gets it and not only pid 1. The shell
-      // that starts a demo is never the interesting process: the questions
-      // are about the X server and the client it forks.
+      // In `extra` so every Worker gets it, not only pid 1: the interesting
+      // process is the X server and the client it forks, not the demo's shell.
       heartbeat: heartbeat || undefined,
       // How many traps a forked child takes before it stops waiting to be an
-      // `execve` and installs its parent's modules. In `extra`, so it
-      // reaches the Worker that acts on it.
+      // `execve` and installs its parent's modules.
       adoptAfter: typeof globalThis.GEX_ADOPT_AFTER === "number"
         ? globalThis.GEX_ADOPT_AFTER
         : undefined,
-      // The closure's libraries, in `extra` rather than `opts` so a forked
-      // child gets them too: a child adopts its parent's memory and with it
-      // the dispatch *directory*, but its dispatch tables belong to its own
-      // guest instance and start empty, so it has to instantiate the modules
-      // itself to have anything for the directory to point at.
+      // The closure's libraries, in `extra` so a forked child gets them too: a
+      // child adopts its parent's dispatch directory but its own tables start
+      // empty, so it must instantiate the modules itself for the directory to
+      // point at.
       closure: closure?.libs,
-      // `?trace=1` turns on the shim's own narration, in every process. The
-      // Node harness has had this through an environment variable all along;
-      // the page had no way to ask for it, so a question that needed it could
-      // only be answered by editing the shim.
+      // `?trace=1` turns on the shim's narration in every process.
       trace: flag('trace') ? 1 : undefined,
-      // `?hot=1` asks every process to dump its hottest back edges when it
-      // ends. Only `run-node.mjs` could ask before, so the question "what is
-      // the guest actually doing" could not be put to a browser at all --
-      // and now that install and translation are 17 of a 57 second
-      // `apt-get update`, the rest of it is the only thing left to ask about.
+      // `?hot=1` asks every process to dump its hottest back edges when it ends.
       hot: flag('hot') ? 1 : undefined,
       // `?wholepage=1` fills an image page entirely on the first ask instead
       // of the 32-slot span around the miss. An experiment for #136: it says
       // whether the closure has the blocks an exec'd process lifts anyway.
       wholePage: flag('wholepage') ? 1 : undefined,
-      // Every process gets a memory two Workers can hold, so a `clone` that
-      // asks for a thread can be given one. `worker.mjs` reads this as
-      // `shared` and passes it to the `Gex` constructor, which is what
-      // decides the `WebAssembly.Memory` it builds.
+      // Every process gets a memory two Workers can hold, so a `clone` asking
+      // for a thread can be given one. `worker.mjs` passes this to the `Gex`
+      // constructor as `shared`. A guest's threads are Workers -- the only
+      // shape the shim has now.
       shared: true,
-      // There is no `?inlinethreads=1`. A guest's threads are Workers, and
-      // that is the only shape the shim has.
-      //
-      // It was a flag while both shapes existed, and which one a run got was
-      // decided by whether the memory happened to be shared rather than by
-      // anyone choosing -- so the one real threaded program in the Debian
-      // rootfs could not be compared against itself. liblzma's decoder spawns
-      // a worker, and `dpkg-deb` dies of `free(): invalid pointer` in the
-      // browser while the same archive comes out whole under the native
-      // adapter three times for three. Keeping one shape is what makes that
-      // question answerable.
       virgl: channel ?? undefined,
       wispUrl: network?.url ?? undefined,
-      // The size, but only when there is no terminal to hold it.
-      //
-      // With a shared terminal this must not be sent. It is captured when
-      // `runProgram` is called and every Worker writes it on startup -- so a
-      // process forked *after* a resize set the system's terminal back to the
-      // size it had at boot. `stty size` in a command run from a resized
-      // window reported the old size, and the window that reported it was the
-      // one that had just been resized.
+      // Only when there is no shared terminal to hold the size. With one this
+      // must not be sent: it is captured at `runProgram` time and every Worker
+      // writes it on startup, so a process forked after a resize would reset the
+      // terminal to its boot size.
       winsize: sharedTty ? undefined : { rows: term.rows, cols: term.cols },
-      // Every guest write mirrored to the console as well as posted, and a
-      // crash narrated where it happens. A Worker that falls over takes its
-      // last few messages with it, and those are the ones that say why.
+      // Every guest write mirrored to the console and a crash narrated where it
+      // happens, since a Worker that falls over takes its last messages with it.
       debugExit:
         !!globalThis.GEX_DEBUG_EXIT ||
         (typeof process !== 'undefined' && !!process.env?.GEX_DEBUG_EXIT),
-      // Statically recompile each object the guest maps once it proves hot,
-      // rather than meeting it one dispatch miss at a time. This is the
-      // feature the project exists for, and the page was not using it: every
-      // block on this site arrived through a miss, so glxgears spent 11.8 of
-      // its first 34 seconds inside the translator and drew at a third of a
-      // frame a second.
-      //
-      // A cap in KiB of mapped text per object. Eight megabytes is the
-      // largest that works today -- above it the graphics rootfs meets #73 --
-      // and it covers every library these demos run except Mesa's software
-      // rasteriser, which nothing here wants because the renderer is on the
-      // other side of the vtest socket.
+      // KiB of mapped text per object to statically recompile once hot. Eight
+      // megabytes is the largest that works today (above it the graphics rootfs
+      // meets #73) and covers every library these demos run except Mesa's
+      // software rasteriser, which nothing here wants.
       recompileObjects,
-      // Whether a fork hands the child its parent's compiled modules.
-      //
-      // In `extra`, which the Host spreads into every Worker message, and
-      // *not* on `globalThis`: the list is built in the forking Worker, and
-      // a global set here is set in the page. That is the same mismatch that
-      // left `?adopt=N` selecting nothing for three bisects, and it silently
-      // invalidated the first measurement of this switch too -- the run
-      // still shipped 2,977 modules per fork. See task 145.
+      // Whether a fork hands the child its parent's compiled modules. In `extra`
+      // (spread into every Worker message), not on `globalThis`: the list is
+      // built in the forking Worker, so a global set here is set in the page.
+      // See task 145.
       forkMods:
         globalThis.GEX_FORK_MODULES === undefined
           ? undefined
           : Number(globalThis.GEX_FORK_MODULES),
-      // In `extra` rather than `opts`: the shell that starts a demo is not
-      // the process this is for. What pays for the dynamic linker is the
-      // forty commands it runs, and each of those is a Worker of its own
-      // that never sees `opts`.
+      // In `extra` so every forked command gets it, not just the shell that
+      // starts the demo (which never sees `opts`).
       link: link || undefined,
-      // Who the guest is, in `extra` so a forked child gets it: identity is
-      // fixed when a kernel is built and a child builds its own.
+      // Who the guest is, in `extra` so a forked child gets it.
       uid,
       gid: uid,
     },
@@ -579,18 +460,15 @@ export async function runProgram(
   });
 
   // Keystrokes go to the environment, not straight to the guest: whether they
-  // are echoed, and whether they are delivered a line at a time, is the
-  // guest's choice, read out of its termios and reported by its Worker.
+  // are echoed and line-buffered is the guest's choice, read from its termios.
   const keys = term.onData((d) => tenv.onKey(d));
-  // xterm only hears the keyboard through a hidden textarea, which has to
-  // hold the focus. Nothing gives it that on its own, and the button that
-  // starts a demo disables itself on the way -- which drops focus to the
-  // body. So a program would start, print its prompt, and ignore every key
-  // until the person thought to click on the terminal.
+  // xterm hears the keyboard only through a hidden textarea that must hold
+  // focus; the Boot button disables itself and drops focus to the body, so
+  // without this a program would ignore every key until the terminal was
+  // clicked.
   term.focus?.();
-  // A resize is `SIGWINCH` to the foreground group and one write to the
-  // terminal every process shares -- not a message to each of them, which is
-  // what it was when each process had a window size of its own.
+  // A resize is `SIGWINCH` to the foreground group and one write to the shared
+  // terminal, not a message to each process.
   const resize = term.onResize(({ rows, cols }) => {
     if (sharedTty) sharedTty.resize(rows, cols);
     else host.resize(rows, cols);

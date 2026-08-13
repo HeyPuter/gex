@@ -1,22 +1,8 @@
-/* Single-lane load and store with a register post-index.
- *
- *     ld1 {v0.d}[0], [x6], x3
- *     st1 {v0.d}[0], [x6], x1
- *
- * The amount added afterwards is in a register, not in the instruction,
- * because the stride of an image row is not known when the code is compiled.
- * gex used to reject the form outright -- the decoder said it "does not
- * appear in compiler output" -- and Mesa emits it twelve times in a single
- * driver.
- *
- * Written in inline assembly on purpose. The intrinsics compile to the
- * immediate-offset form, so a C version of this test passes without ever
- * encoding the instruction it is supposed to be about; that was tried first.
- *
- * A stride wider than the element is the whole point: a post-index that
- * advanced by the element size instead of by the register would still walk a
- * contiguous array correctly.
- */
+/* Single-lane load/store with a register post-index (`ld1 {v0.d}[0], [x6], x3`),
+ * as Mesa emits for image rows. Inline assembly, since the intrinsics compile
+ * to the immediate-offset form instead. The stride is deliberately wider than
+ * the element, so advancing by the element size would still pass on a
+ * contiguous array. */
 #include <stdint.h>
 #include <stdio.h>
 

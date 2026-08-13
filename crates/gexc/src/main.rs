@@ -15,13 +15,8 @@ use gex_xlate::Options;
 use std::process::ExitCode;
 
 /// Where the dynamic linker is placed, well above a PIE executable so their
-/// mappings cannot overlap.
-///
-/// The abi's, not a number of its own. It used to be `0x2800_0000`, which is
-/// inside the mmap arena and so could in principle collide with anything the
-/// allocator handed out -- but the reason it matters now is the closure
-/// build: a module for `ld.so` is only correct at the address the host's
-/// loader actually uses, and the host uses this one.
+/// mappings cannot overlap. A closure module for `ld.so` is only correct at the
+/// address the host's loader uses, and it uses this one.
 const INTERP_BASE: u64 = gex_abi::INTERP_BASE;
 
 fn main() -> ExitCode {
@@ -164,9 +159,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut path = None;
     let mut guest_args = Vec::new();
     let mut opts = RunOptions::default();
-    // Ahead-of-time discovery is best-effort; runtime translation fills the
-    // gaps. Translating every decodable address up front is the fallback for
-    // when it is turned off.
+    // Discovery is best-effort; runtime translation fills the gaps.
+    // `exhaustive` is the fallback when that is off.
     let mut exhaustive = false;
     let mut no_jit = false;
     let mut lazy = false;
@@ -187,9 +181,6 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--sample" => opts.sample = true,
             "--recompile-objects" => opts.recompile_objects = true,
             "--profile" => opts.profile = true,
-            // A display server for the guest, bound at a path in its own
-            // unix-socket namespace. Clients find it through WAYLAND_DISPLAY
-            // and XDG_RUNTIME_DIR, which are set below if the caller did not.
             "--wayland" => {
                 i += 1;
                 opts.wayland = Some(args.get(i).context("--wayland needs a path")?.clone());
@@ -202,8 +193,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             }
             "--wayland-gpu" => opts.wayland_gpu = true,
             "--virgl" => {
-                // The path is optional: Mesa has a default and almost nobody
-                // overrides it, so requiring it would be noise.
+                // The path is optional: Mesa has a default nobody overrides.
                 let next = args.get(i + 1);
                 let path = match next {
                     Some(p) if !p.starts_with('-') => {
@@ -235,19 +225,16 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 let v = args.get(i).context("--sysroot needs a directory")?;
                 opts.sysroot = Some(v.into());
             }
-            // A layout written by `gexc closure --pins`. Every object named
-            // in it is placed exactly where the file says, which is what
-            // makes a module built against those addresses correct.
+            // A layout written by `gexc closure --pins`: every object is placed
+            // exactly where the file says, so a module built against those
+            // addresses is correct.
             "--pin" => {
                 i += 1;
                 let v = args.get(i).context("--pin needs a manifest path")?;
                 let text = std::fs::read_to_string(v).with_context(|| format!("reading {v}"))?;
                 for line in text.lines() {
-                    // `base span path`. The span is what keeps the automatic
-                    // placer from handing out an address inside a pinned
-                    // object: without it the counter moved one alignment past
-                    // each base, and the next library landed in the middle of
-                    // libc.
+                    // `base span path`. The span keeps the placer from handing
+                    // out an address inside a pinned object.
                     let mut f = line.splitn(3, ' ');
                     let (Some(base), Some(_span), Some(path)) = (f.next(), f.next(), f.next())
                     else {
@@ -302,9 +289,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let mut ra = parse_run_args(args)?;
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
-    // The interpreter is resolved through the guest's namespace — the sysroot
-    // when one is given — so a program links against the libraries its own
-    // root provides rather than the host's.
+    // Resolved through the guest's namespace (the sysroot when given), so a
+    // program links against its own root's libraries, not the host's.
     let sysroot = ra.opts.sysroot.clone();
     let program = gex_ld::load_program(&bytes, gex_abi::PIE_BASE, INTERP_BASE, &|guest_path| {
         let host = match &sysroot {
@@ -320,9 +306,8 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let mut argv = vec![ra.argv0.clone().unwrap_or_else(|| ra.path.clone())];
     argv.append(&mut ra.guest_args);
     ra.opts.args = argv;
-    // A client finds the display by joining these two together, so a guest
-    // given a compositor and not told where it is would never connect. Only
-    // defaulted: a caller that set either of them meant it.
+    // A client finds the display by joining these two, so default them when a
+    // compositor is given. Only defaulted: a caller that set either meant it.
     if let Some(path) = ra.opts.wayland.clone() {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
         for (k, v) in [("XDG_RUNTIME_DIR", dir), ("WAYLAND_DISPLAY", name)] {
@@ -345,17 +330,12 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
             detail,
             internal,
         } => {
-            // A process killed by an ordinary signal says nothing itself —
-            // Linux prints nothing and the shell reports the status. Only a
-            // gex limitation is worth a message, since nothing else would
-            // explain it.
+            // An ordinary signal says nothing itself, as on Linux. Only a gex
+            // limitation is worth a message.
             if *internal {
-                // Not a guest crash, whatever the signal number says. gex
-                // delivers its own failures as SIGSEGV because that is the
-                // only way to stop a running guest, and calling that
-                // "terminated by signal 11" sent one investigation looking
-                // for a miscompile when the real answer was a resource
-                // limit. Say which side failed.
+                // Not a guest crash: gex delivers its own failures as SIGSEGV
+                // (the only way to stop a running guest), so say which side
+                // failed rather than let it read as "terminated by signal 11".
                 eprintln!("gexc: gex failed at guest pc=0x{pc:x}: {detail}");
             } else if ra.opts.verbose {
                 eprintln!("gexc: guest terminated by signal {signal} at pc=0x{pc:x}: {detail}");
@@ -399,19 +379,12 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut shared_memory = true;
     let mut no_validate = false;
     let mut closure = false;
-    // Emit the program's own image as a `Shared` module like every other
-    // object, rather than the one `Own` module that declares the memory and
-    // the tables.
-    //
-    // In a browser the seed already is that module -- 1,680 bytes that
-    // translate nothing and own everything -- so an image module built `Own`
-    // has to *replace* it, which means every process instantiates it whether
-    // or not it runs that program. `bash` whole is 42 MB and 212,000
-    // functions, and a forked child that is about to `execve` apt's http
-    // method pays 256ms to instantiate a shell it will never enter.
-    //
-    // Built `Shared`, the image is just another deferred library: registered
-    // for its pages, instantiated by the first branch that lands in one.
+    // Emit the program's image as a `Shared` module rather than the one `Own`
+    // module that declares the memory and tables. An `Own` image module has to
+    // replace the seed, so every process instantiates it whether or not it runs
+    // that program (a forked child about to `execve` pays to instantiate a
+    // whole shell it never enters). Built `Shared`, it is just another deferred
+    // library, instantiated by the first branch that lands in it.
     let mut shared_image = false;
     let mut also: Vec<String> = Vec::new();
     let mut sysroot: Option<String> = None;
@@ -425,20 +398,11 @@ fn cmd_build(args: &[String]) -> Result<()> {
             // A built module has no runtime translator behind it, so anything
             // discovery misses is a dispatch miss with nowhere to go.
             "--exhaustive" => exhaustive = true,
-            // Exhaustive for *these* objects only.
-            //
-            // `--exhaustive` on a whole closure is unusable: apt's is 678 MB
-            // against 82, and a 694 MB closure never became ready in a page
-            // at all. Reachable-only is the right default because the browser
-            // has a translator behind the module and lifts whatever the build
-            // missed.
-            //
-            // But "reachable" means reachable *from this program*, and a
-            // closure built for `apt-get` therefore holds only the libc paths
-            // apt walks. `/bin/true` against it lifts 9,800 blocks; against a
-            // closure built for itself it lifts none. libc and the dynamic
-            // linker are what every program in a rootfs shares, so those are
-            // worth having whole while everything else stays reachable-only.
+            // Exhaustive for *these* objects only. `--exhaustive` on a whole
+            // closure is unusable (apt's is 678 MB against 82). Reachable-only
+            // is the default since the browser lifts what the build missed, but
+            // "reachable" means reachable from *this* program -- libc and ld.so
+            // are shared by everything, so those are worth having whole.
             "--exhaustive-for" => {
                 i += 1;
                 exhaustive_for = args
@@ -449,22 +413,17 @@ fn cmd_build(args: &[String]) -> Result<()> {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
-            // A host that cannot import a shared memory -- a Rust shim built
-            // without `+atomics`, which is every stable-toolchain build --
-            // needs the guest module to declare a plain one.
+            // A host that cannot import a shared memory (a shim built without
+            // `+atomics`, i.e. every stable-toolchain build) needs a plain one.
             "--no-shared-memory" => shared_memory = false,
             // Only for looking at a module that is known not to validate.
             "--no-validate" => no_validate = true,
-            // Translate the whole program: the executable *and* every object
-            // it reaches through DT_NEEDED, each at the base a pinned run
-            // will place it. Without this a build translates the image it is
-            // handed, which on a normally linked program is the wrapper --
-            // `apt-get` is 36 KiB in front of a 9,775 KiB closure.
+            // Translate the whole program: the executable and every DT_NEEDED
+            // object, each at its pinned base. Without this a build translates
+            // only the image handed to it, which is usually the wrapper.
             "--closure" => closure = true,
             // Another executable whose libraries belong in this closure.
-            // Repeatable, and `--with-dir` for a directory of them: a
-            // program's helpers are usually all in one place --
-            // `/usr/lib/apt/methods` is apt's.
+            // Repeatable; `--with-dir` for a directory of them.
             "--with" => {
                 i += 1;
                 also.push(args.get(i).context("--with needs a path")?.clone());
@@ -524,10 +483,8 @@ fn cmd_build(args: &[String]) -> Result<()> {
         100.0 * gex_emit::tier1::CTX_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64
             / stats.wasm_bytes as f64,
     );
-    // What a block boundary costs, split. The three together are what a
-    // straight-line block pays for being a block rather than four more
-    // instructions in the last one, and which of the three to attack is not
-    // obvious from the total.
+    // What a block boundary costs, split three ways: which of the three to
+    // attack is not obvious from the total.
     {
         use std::sync::atomic::Ordering::Relaxed;
         let ctx = gex_emit::tier1::CTX_BYTES.load(Relaxed);
@@ -551,8 +508,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
             guard,
         );
     }
-    // Which registers make up that percentage, for anyone considering doing
-    // something about it.
+    // Which registers make up that percentage.
     if std::env::var_os("GEX_REG_HISTOGRAM").is_some() {
         let mut v: Vec<(String, usize)> = gex_emit::tier1::REG_TRAFFIC
             .lock()
@@ -591,15 +547,11 @@ fn cmd_build(args: &[String]) -> Result<()> {
 
 /// Translate a program and every object it links against.
 ///
-/// One module per object, all of them placed where a pinned run will put
-/// them: the executable declares the memory and the dispatch table, and every
-/// library imports them, which is the same division runtime translation
-/// already makes between the image module and the ones it adds later.
-///
-/// `out.wasm` is the executable and `out.NN.name.wasm` each library, with
-/// `out.pins` the layout they were built for. A run given anything else than
-/// that layout is running code compiled for addresses it is not at, so the
-/// manifest travels with the modules rather than being reconstructable.
+/// One module per object, placed where a pinned run will: the executable
+/// declares the memory and dispatch table, every library imports them.
+/// `out.wasm` is the executable, `out.NN.name.wasm` each library, `out.pins`
+/// the layout they were built for. That layout must travel with the modules --
+/// a run given any other is running code compiled for addresses it is not at.
 fn build_closure(
     path: &str,
     also: &[String],
@@ -620,32 +572,17 @@ fn build_closure(
     let mut images = String::new();
     let (mut blocks, mut insts, mut bytes_total) = (0usize, 0usize, 0usize);
 
-    // Where the next object's slots start. Every object of the closure runs
-    // in one process against one dispatch table, so they have to be allocated
-    // as if by one allocator even though they are translated one at a time.
+    // Where the next object's slots start. All objects share one dispatch
+    // table in one process, so they are numbered as if by one allocator even
+    // though translated one at a time.
     let mut first_slot = 0u64;
-    // Lowest slots to the objects the most processes will enter.
-    //
-    // A process must grow its dispatch table to the *highest* slot it
-    // touches, and `Table.grow` initialises every new element with the miss
-    // stub -- 4.3 million slots a second, measured. So the cost is the
-    // highest index, not the number of slots used, and the index is decided
-    // here, by the order objects are emitted in.
-    //
-    // Breadth-first from the roots put libc at position 30 of 62 and the
-    // dynamic linker at 31, behind bash's 197,853 blocks and every apt
-    // method. Every process uses libc and ld.so, so every process grew past
-    // all of that: 1,133,568 slots and 249ms, eighty times over in an
-    // `apt-get update`.
-    //
-    // In-degree is the proxy for "how many processes will enter this": the
-    // more objects name it in `DT_NEEDED`, the more of the run's programs
-    // reach it. libc is named by everything. Ties keep breadth-first order,
-    // so the layout stays deterministic and a rebuild does not reshuffle
-    // slots for no reason.
-    //
-    // Only the numbering changes. Addresses are pinned separately, and the
-    // manifest is written from this same sequence.
+    // Lowest slots to the objects the most processes will enter. A process must
+    // grow its table to the *highest* slot it touches, and `Table.grow` fills
+    // each new slot with the miss stub, so the cost is the highest index, not
+    // the count used. In-degree (how many objects name it in `DT_NEEDED`) is
+    // the proxy for how many processes reach it; libc is named by everything.
+    // Ties keep breadth-first order so a rebuild does not reshuffle slots.
+    // Only numbering changes here; addresses are pinned separately.
     let order: Vec<usize> = {
         let mut in_degree = vec![0usize; closure.objects.len()];
         for o in &closure.objects {
@@ -676,18 +613,12 @@ fn build_closure(
             first_slot,
             exhaustive: whole,
             shared_memory,
-            // Every object of a closure, whatever its size.
-            //
-            // The build numbers slots in one sequence across all of them, so a
-            // small object's pages sit as far into table 0 as its position in
-            // the closure puts them -- 3,634,176 for `stat`, object 65 of 173.
-            // Published there, one such object makes every process grow the
-            // table that far before its guest runs an instruction. Ninety-two
-            // of the Debian closure's objects fall under `BIG_BLOCKS`, which
-            // was measured on runtime units and does not reach these.
+            // On for every object regardless of size: slots are numbered in one
+            // sequence, so a small object's pages can sit far into table 0 and
+            // otherwise make every process grow the table that far up front.
             demand_fill: true,
-            // The first object is the executable and owns the address space
-            // -- unless something else already does. See `--shared-image`.
+            // The first object is the executable and owns the address space,
+            // unless `--shared-image` gives that to a library instead.
             linkage: if n == 0 && !shared_image {
                 gex_xlate::Linkage::Own
             } else {
@@ -708,16 +639,9 @@ fn build_closure(
             gex_native::validate_module(&module.wasm)
                 .with_context(|| format!("{file} is not valid wasm"))?;
         }
-        // The interpreter is placed by gex's own loader, not by `mmap`, so
-        // there is no reservation to pin and a line for it would only ever be
-        // reported as never reserved.
-        // Not the interpreter: it is placed by the loader rather than by a
-        // reservation, so there is nothing to pin and a line for it would
-        // only ever be reported as never reserved.
-        // An image is not pinned either: every root sits at `PIE_BASE` and
-        // gex's own loader puts it there, so there is no reservation to
-        // catch and a pin line would only ever be reported as never
-        // reserved. `depth == 0` is what makes an object a root.
+        // Neither the interpreter nor a root image is pinned: gex's loader
+        // places both (ld.so at INTERP_BASE, roots at PIE_BASE), so there is no
+        // mmap reservation to catch. `depth == 0` marks a root.
         if o.depth > 0 && Some(o.path.as_str()) != interp.as_deref() && !is_interp_name(&o.name) {
             pins.push_str(&format!("{:#x} {:#x} {}\n", o.image.bias, o.span, o.path));
         }
@@ -753,29 +677,13 @@ fn build_closure(
     Ok(())
 }
 
-/// Where the next object in a closure goes.
-///
-/// Placed *up* from the bottom of the arena rather than down from its top.
-/// Down from the top is where the ordinary allocator goes, and the loader
-/// gets there first: a trace shows `ld.so` taking 8 KiB at 0x7fffe000 for its
-/// own bookkeeping before it reserves anything for libc. A pin into that
-/// region is not free, the address hint is dropped, and the object lands
-/// somewhere else -- silently, until `--pin` reports it.
-///
-/// `ld.so` does not ask for the span either. It asks for the span plus up to
-/// one maximum-alignment of slack, maps the segments MAP_FIXED inside, and
-/// trims both ends: 0x1af000 of libc image against a 0x1be060 reservation. So
-/// the gap covers the slack, and the base is 64 KiB aligned -- the largest
-/// `p_align` these objects use -- which makes `ld.so`'s rounding of the
-/// reservation a no-op and the load bias the address that was pinned.
 /// Whether a file name is a dynamic linker.
 ///
-/// By name rather than by `PT_INTERP`, because they need not agree: dash's
-/// `PT_INTERP` is `/lib/ld-linux-aarch64.so.1`, and the same object arrives
-/// again through libc's `DT_NEEDED` as
-/// `/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1`. Comparing paths matched
-/// neither, so the interpreter was placed in the mmap arena and translated
-/// for an address it never occupies.
+/// By name rather than `PT_INTERP`, because they need not agree: dash's
+/// `PT_INTERP` is `/lib/ld-linux-aarch64.so.1`, but libc's `DT_NEEDED` names
+/// the same object `/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1`. Comparing
+/// paths matched neither, so the interpreter was placed in the arena and
+/// translated for an address it never occupies.
 fn is_interp_name(name: &str) -> bool {
     name.starts_with("ld-linux") || name.starts_with("ld-musl") || name == "ld.so"
 }
@@ -797,17 +705,10 @@ fn closure_of(
 
 /// As [`closure_of`], plus the helpers the program forks.
 ///
-/// A program is not only its executable. apt is `apt-get` and the `file`,
-/// `copy` and `store` methods it runs, and those need objects `apt-get` does
-/// not -- libseccomp, libselinux, libpcre2 -- so a closure built from
-/// `apt-get` alone leaves its helpers translating those at run time. On
-/// `apt-get update` that was 12,576 blocks of an otherwise fully recompiled
-/// run.
-///
-/// The helpers contribute their libraries, not their own text: they are
-/// separate executables and each would want the image module's base for
-/// itself. Their text is small -- apt's `file` method is 67 KiB -- and the
-/// libraries are what costs.
+/// A program is not only its executable: apt is `apt-get` plus the `file`,
+/// `copy` and `store` methods it runs, which pull in objects `apt-get` does not.
+/// The helpers contribute only their libraries, not their own text -- each is a
+/// separate executable that would want the image module's base for itself.
 fn closure_of_all(
     path: &str,
     also: &[String],
@@ -831,12 +732,8 @@ fn closure_of_all(
         None => path.to_string(),
     };
     let mut next = gex_abi::MMAP_BOTTOM;
-    // The interpreter is not placed by `mmap` and so cannot be pinned: gex's
-    // own loader puts it at `INTERP_BASE` before the guest runs. A module
-    // built for it anywhere else is a module whose every address is wrong,
-    // and since nothing reserves that range there is no pin report to say so
-    // -- the run simply branches into the middle of nowhere, which is what
-    // the first closure that included `ld.so` did.
+    // The interpreter is placed by gex's loader at `INTERP_BASE`, not by
+    // `mmap`, so it is given that address here rather than a pinned one.
     let interp_for_place = interp.clone();
     let mut place = |path: &str, span: u64| {
         let name = path.rsplit('/').next().unwrap_or(path);
@@ -845,10 +742,8 @@ fn closure_of_all(
         }
         place_object(&mut next, span)
     };
-    // The program first, so `objects[0]` is still the executable, then every
-    // helper. A helper that cannot be read is skipped with a word rather than
-    // failing the build: a rootfs missing one method should still get a
-    // closure for everything else.
+    // The program first, so `objects[0]` is the executable, then helpers. A
+    // helper that cannot be read is skipped with a word, not a failed build.
     let mut roots = vec![(exe, guest_path)];
     for h in also {
         let hb = match std::fs::read(h) {
@@ -877,13 +772,8 @@ fn closure_of_all(
     ))
 }
 
-/// Report the transitive `DT_NEEDED` closure of a program.
-///
-/// This exists because `gexc build` translates the image it is handed and
-/// nothing else, and on a normally linked program that is the wrapper rather
-/// than the work. Before anything can be done about that, the closure has to
-/// be nameable without running the program -- and checkable against `ldd`,
-/// which is what this is for.
+/// Report the transitive `DT_NEEDED` closure of a program, without running it
+/// and checkable against `ldd`.
 fn cmd_closure(args: &[String]) -> Result<()> {
     let mut path = None;
     let mut sysroot: Option<String> = None;
@@ -906,9 +796,8 @@ fn cmd_closure(args: &[String]) -> Result<()> {
     let path = path.context("expected an input ELF")?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
 
-    // Guest paths resolve inside the sysroot, exactly as they would when the
-    // program runs. Without one there is nowhere to look, and saying so beats
-    // reporting a closure of one object as though that were the answer.
+    // Guest paths resolve inside the sysroot, as they would when the program
+    // runs. Without one there is nowhere to look.
     let root = sysroot.clone();
     let read = move |p: &str| -> Option<Vec<u8>> {
         let r = root.as_deref()?;
@@ -921,32 +810,15 @@ fn cmd_closure(args: &[String]) -> Result<()> {
     };
 
     let exe = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
-    // The same top-down placement the runtime's `mmap` makes, so these are
-    // the addresses a real run produces. Page-aligned, one page of gap.
-    // `ld.so` does not ask for the span. It asks for the span plus up to one
-    // maximum-alignment of slack, maps the segments MAP_FIXED inside, and
-    // trims both ends -- for libc, 0x1af000 of image against a 0x1be060
-    // reservation. So the gap has to cover the slack, or the reservation runs
-    // past the end of the arena, the address hint stops being free, and the
-    // pin is quietly ignored. That is exactly what the first attempt did.
-    //
-    // The base is 64 KiB aligned as well, which is the largest `p_align` any
-    // of these objects uses: `ld.so` rounds the reservation up to it, and a
-    // base that is already aligned makes the rounding a no-op, so the load
-    // bias is the address that was pinned rather than a little above it.
-    // Placed *up* from the bottom of the arena rather than down from its top.
-    //
-    // Down from the top is where the ordinary allocator goes, and the loader
-    // gets there first: a trace shows `ld.so` taking 8 KiB at 0x7fffe000 for
-    // its own bookkeeping before it reserves anything for libc. A pin into
-    // that region is not free, the address hint is dropped, and the object
-    // lands one page below where the build assumed -- silently, until the
-    // report says so. Starting at the bottom keeps pinned objects out of the
-    // way of everything the allocator does, because it fills from the far
-    // end and a whole program's libraries are a few tens of megabytes.
+    // Placed *up* from the bottom of the arena, so pins stay clear of the
+    // allocator, which fills down from the top. `ld.so` reserves the span plus
+    // up to one max-alignment of slack, maps the segments MAP_FIXED inside, and
+    // trims both ends; `place_object`'s gap covers that slack, or the pin's
+    // address hint stops being free and is quietly ignored. The base is 64 KiB
+    // aligned (the largest `p_align` here) so ld.so's rounding is a no-op and
+    // the load bias is exactly the pinned address.
     let mut next = gex_abi::MMAP_BOTTOM;
     // The interpreter goes where the loader will put it, not in the arena.
-    // See `closure_of`.
     let mut place = |path: &str, span: u64| {
         if is_interp_name(path.rsplit('/').next().unwrap_or(path)) {
             return INTERP_BASE;
@@ -981,15 +853,10 @@ fn cmd_closure(args: &[String]) -> Result<()> {
         closure.objects.len(),
         closure.text_bytes() / 1024,
     );
-    // The manifest a run is given, so the layout it produces is the layout
-    // this build assumed. One line per object: base, then guest path. The
-    // executable is left out -- it is placed by the loader, not by `mmap`.
+    // The manifest a run is given, so its layout matches this build's. One line
+    // per object: base, then guest path. The executable and the interpreter are
+    // left out -- gex's loader places both, so neither is pinned.
     if let Some(out) = &pins_out {
-        // The interpreter is not in it. Nothing mmaps `ld.so`: gex's own
-        // loader places it, at INTERP_BASE, before the guest runs -- so there
-        // is no reservation to pin and a line for it would only ever be
-        // reported as "never reserved", which is what the first run of this
-        // said about it.
         let interp = interp_path.as_deref();
         let mut text = String::new();
         for o in closure.objects.iter().skip(1) {

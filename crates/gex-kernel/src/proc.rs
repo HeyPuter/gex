@@ -1,30 +1,13 @@
 //! The process table: pids, parents, process groups and sessions.
 //!
-//! Every process in the system shares one of these. It has to be shared
-//! because three of the things a process table is for cannot be answered from
-//! inside a single process:
+//! Shared across every process, because three things cannot be answered from
+//! inside a single process: pids must be unique system-wide (a per-kernel
+//! counter offset by a thousand collides for a long-lived init); orphans must
+//! be reparented to pid 1 and reaped there; and groups and sessions span
+//! processes by definition (`kill(-pgid)`).
 //!
-//!   * **Pids must be unique system-wide.** Before this existed each forked
-//!     kernel carried its own counter, offset from its parent's by a thousand,
-//!     which avoids collisions for a shallow tree and stops doing so for a
-//!     long-lived one. An init system is precisely the long-lived case: it
-//!     respawns for as long as the machine is up.
-//!
-//!   * **Orphans are reparented to pid 1.** When a process exits its surviving
-//!     children become init's, and init reaps them. That is most of what an
-//!     init system is for. A child list owned by each parent cannot express
-//!     it: the exiting process would have to reach into init's kernel, which
-//!     is behind another lock held by another thread.
-//!
-//!   * **Groups and sessions span processes by definition.** `kill(-pgid)`
-//!     asks a question about processes the caller may not be related to.
-//!
-//! So the table owns the [`Child`] record for every process, and a kernel asks
-//! it for the children rather than holding them.
-//!
-//! What is deliberately not modelled: controlling terminals, orphaned process
-//! group handling (the SIGHUP/SIGCONT dance in POSIX 3.1.2.2), and session
-//! keyrings. A guest that asks gets plausible answers, not Linux's.
+//! Not modelled: controlling terminals, orphaned-process-group handling, and
+//! session keyrings. A guest that asks gets plausible answers, not Linux's.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
@@ -40,41 +23,30 @@ pub const INIT_PID: i32 = 1;
 
 /// The process table when it is not in this process's memory.
 ///
-/// The table above is shared between the *threads* of one process, because
-/// they are threads and share everything. Between processes it is shared by
-/// being somewhere else: in the browser, a second wasm module that every
-/// Worker instantiates against one `SharedArrayBuffer`, so its `Vec<Proc>` is
-/// literally the same bytes for all of them.
-///
-/// A process reaches that module through calls, not pointers -- it is a
-/// different memory and no `Arc` in it means anything here. So this is the
-/// call surface, as plain function pointers a host fills in. Everything is a
-/// scalar for the same reason: a `ChildHandle` is an `Arc` and an `Arc` is an
-/// address in a memory the other side cannot read.
-///
-/// `None` is the single-process case, and is the default: a run with no
-/// second module keeps the table it already had, in its own memory, and
-/// behaves exactly as it did before this existed.
+/// Between the *threads* of one process the table above is shared directly.
+/// Between processes it lives elsewhere: a second wasm module every Worker
+/// instantiates against one `SharedArrayBuffer`, so its `Vec<Proc>` is the same
+/// bytes for all of them. A process reaches it through calls, not pointers -- so
+/// this is the call surface, plain function pointers a host fills in, every
+/// argument a scalar because an `Arc` is an address in a memory the other side
+/// cannot read. `None` is the single-process default.
 #[derive(Clone, Copy)]
 pub struct Remote {
     pub spawn: extern "C" fn(ppid: i32) -> i32,
     pub exit: extern "C" fn(pid: i32, status: i32),
     pub reap: extern "C" fn(pid: i32),
-    /// Collect a finished child: the pid in the high 32 bits and the wait
-    /// status in the low 32, or zero if none is ready. Packed into one return
-    /// rather than split across two calls because two Workers can be
-    /// collecting at the same moment, and a status left somewhere between
-    /// calls belongs to whichever of them asked last.
+    /// Collect a finished child: pid in the high 32 bits, wait status in the low
+    /// 32, or zero if none. Packed into one return because two Workers may
+    /// collect at once and a status left between calls belongs to whoever asked
+    /// last.
     pub wait: extern "C" fn(ppid: i32, want: i32) -> i64,
     pub has_children: extern "C" fn(ppid: i32) -> i32,
     pub kill: extern "C" fn(caller: i32, target: i32, signo: u32) -> i32,
-    /// Signal every process in a group, naming the group *positively*.
+    /// Signal every process in a group, naming it *positively*.
     ///
-    /// `kill(-pgid)` cannot express this. A negative target of -1 is
-    /// POSIX's "every process", so it is exactly the one process group that
-    /// cannot be named -- and group 1 is not hypothetical here: the demos run
-    /// a shell as pid 1, so the foreground group of the terminal is group 1
-    /// and `^C` went to every process except the one that wanted it.
+    /// `kill(-pgid)` cannot: a target of -1 is POSIX's "everyone", so group 1
+    /// has no negative spelling -- and the demos run a shell as pid 1, so `^C`
+    /// to the foreground group is exactly this case.
     pub kill_group: extern "C" fn(caller: i32, pgid: i32, signo: u32) -> i32,
     pub take_signals: extern "C" fn(pid: i32) -> u64,
     pub has_signals: extern "C" fn(pid: i32) -> i32,
@@ -100,15 +72,12 @@ struct Proc {
     /// The exit-status cell a `wait4` collects. The root process has one too,
     /// so nothing has to special-case it, even though nobody waits on it.
     child: Child,
-    /// Signals sent to this process by another one, as a bitmask of
-    /// `1 << (signo - 1)`.
+    /// Signals sent to this process by another, as a bitmask of `1 << (signo-1)`.
     ///
-    /// A signal cannot be delivered by the sender -- the target's signal state
-    /// lives in its own kernel, behind its own lock, and it may be running,
-    /// blocked in the host, or between the two. So the sender leaves it here
-    /// and the target picks it up at its next syscall, which is the same
-    /// arrangement Linux has: a signal becomes pending immediately and is
-    /// delivered at a point the target chooses.
+    /// The sender can't deliver -- the target's signal state is behind its own
+    /// lock and it may be running or blocked -- so it leaves the bit here and the
+    /// target picks it up at its next syscall, as Linux delivers at a point the
+    /// target chooses.
     pending: Arc<AtomicU64>,
 }
 
@@ -122,13 +91,9 @@ pub struct ProcTable {
     inner: Mutex<Table>,
     /// Set once some process has called `reboot` with a shutdown command.
     ///
-    /// A halt is the one event that is not addressed to a process: it stops
-    /// the machine, and every process on it. Rather than a signal to each --
-    /// which would need a delivery path into processes blocked in the host --
-    /// each process notices at its next syscall and exits, and the ones parked
-    /// in `wait4` notice on the poll they already do. So a shutdown takes
-    /// effect at the next place a guest asks the kernel for anything, which is
-    /// soon, and never in the middle of one.
+    /// A halt is not addressed to a process: rather than signal each, every
+    /// process notices at its next syscall and exits, and waiters notice on the
+    /// poll they already do. So it takes effect soon, and never mid-syscall.
     halting: AtomicBool,
     halt_code: AtomicI32,
     /// Where the table really is, when it is not here. See [`Remote`].
@@ -177,11 +142,9 @@ impl ProcTable {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Register a child of `ppid` and return its pid.
-    ///
-    /// A new process joins its parent's group and session, which is what
-    /// `fork` does and what lets a shell put a whole pipeline in one group by
-    /// calling `setpgid` afterwards.
+    /// Register a child of `ppid` and return its pid. It joins its parent's
+    /// group and session, so a shell can later `setpgid` a whole pipeline into
+    /// one group.
     pub fn spawn(&self, ppid: i32) -> i32 {
         if let Some(r) = self.remote {
             return (r.spawn)(ppid);
@@ -243,13 +206,10 @@ impl ProcTable {
         }
         let (cell, done) = {
             let mut t = self.lock();
-            // The parent is owed a SIGCHLD. A `wait4` that parks on the
-            // condvar below does not need one, which is why this was missing
-            // and nothing noticed -- but a parent that polls with `WNOHANG`
-            // and sleeps in `sigsuspend` between polls has nothing else to
-            // wake it. coreutils `timeout` installs an empty SIGCHLD handler
-            // for exactly that purpose, and without the signal it waited for
-            // a child that had already exited.
+            // The parent is owed a SIGCHLD. A `wait4` parked on the condvar
+            // doesn't need one, but a parent that polls `WNOHANG` and sleeps in
+            // `sigsuspend` between polls has nothing else to wake it -- coreutils
+            // `timeout` does exactly that.
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
             if let Some(ppid) = ppid {
                 if let Some(parent) = t.procs.iter().find(|p| p.pid == ppid) {
@@ -268,15 +228,14 @@ impl ProcTable {
                 None => return,
             }
         };
-        // Published outside the table lock: a waiter wakes on `done` and then
-        // wants the table, and holding both here in the other order is how
-        // that becomes a deadlock.
+        // Published outside the table lock: a waiter wakes on `done` then wants
+        // the table, so holding both here in the other order deadlocks.
         *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
         done.notify_all();
     }
 
-    /// Forget a process that has been collected, so a long-lived init does not
-    /// accumulate a record per respawn for the life of the machine.
+    /// Forget a collected process, so a long-lived init doesn't accumulate a
+    /// record per respawn.
     pub fn reap(&self, pid: i32) {
         if let Some(r) = self.remote {
             return (r.reap)(pid);
@@ -324,12 +283,9 @@ impl ProcTable {
             .ok_or(Errno::ESRCH)
     }
 
-    /// `setsid`: become the leader of a new session and a new group.
-    ///
-    /// Fails with `EPERM` if the caller already leads a group, because that
-    /// group would end up split across two sessions. A shell forks before
-    /// calling this precisely so the child is not a leader and the call can
-    /// succeed.
+    /// `setsid`: become leader of a new session and group. `EPERM` if the caller
+    /// already leads a group (it would split across two sessions) -- a shell
+    /// forks first so the child is not a leader.
     pub fn setsid(&self, pid: i32) -> Result<i32, Errno> {
         if let Some(r) = self.remote {
             return errno_or((r.setsid)(pid));
@@ -348,10 +304,8 @@ impl ProcTable {
         }
     }
 
-    /// `setpgid(target, pgid)`, where either being zero means the caller.
-    ///
-    /// The rules enforced are the ones a shell depends on: you may only move
-    /// yourself or a child, never across a session boundary, and never a
+    /// `setpgid(target, pgid)`, either zero meaning the caller. You may move
+    /// only yourself or a child, never across a session boundary, never a
     /// session leader.
     pub fn setpgid(&self, caller: i32, target: i32, pgid: i32) -> Result<(), Errno> {
         if let Some(r) = self.remote {
@@ -398,12 +352,9 @@ impl ProcTable {
             .collect()
     }
 
-    /// Deliver `signo` the way `kill` addresses it: to one process, to a
-    /// process group, or to everything.
-    ///
-    /// Returns the number of processes it reached. A `signo` of zero sends
-    /// nothing and only reports whether there was anyone to send to, which is
-    /// what `kill(pid, 0)` is for.
+    /// Deliver `signo` as `kill` addresses it: to one process, a group, or
+    /// everything. Returns how many it reached. `signo` zero sends nothing and
+    /// only reports whether there was anyone -- what `kill(pid, 0)` is for.
     pub fn kill(&self, caller: i32, target: i32, signo: u32) -> Result<usize, Errno> {
         if let Some(r) = self.remote {
             return errno_or((r.kill)(caller, target, signo)).map(|n| n as usize);
@@ -413,11 +364,8 @@ impl ProcTable {
         }
         let t = self.lock();
         let hits: Vec<&Arc<AtomicU64>> = match target {
-            // Everything the caller may signal, which here is everything but
-            // init -- killing pid 1 stops the machine, and a guest that means
-            // that has `reboot`. The caller is included, as Linux includes
-            // it: a shutdown script that signals everything expects to be
-            // signalled too.
+            // Everything but init: killing pid 1 stops the machine (use `reboot`
+            // for that). The caller is included, as Linux includes it.
             -1 => t
                 .procs
                 .iter()
@@ -536,15 +484,9 @@ impl ProcTable {
         self.lock().procs.iter().any(|p| p.pid == pid)
     }
 
-    /// Whether a `wait4` by `ppid` for `want` would answer now.
-    ///
-    /// Two things count as an answer: a child with a status ready, and no
-    /// matching child at all -- the second is `ECHILD`, which is a result and
-    /// not a reason to sleep forever.
-    ///
-    /// Separate from `collect` because collecting *takes* the child: asking
-    /// whether one is ready must not be the same call as reaping it, or every
-    /// poll of the run queue would consume a status nobody asked for.
+    /// Whether a `wait4` by `ppid` for `want` would answer now: a child with a
+    /// status ready, or no matching child at all (`ECHILD`). Separate from
+    /// `collect`, which *takes* the child -- asking must not reap.
     pub fn wait_ready(&self, ppid: i32, want: i32) -> bool {
         if let Some(r) = self.remote {
             return (r.wait_ready)(ppid, want) != 0;
@@ -563,11 +505,9 @@ impl ProcTable {
         !any
     }
 
-    /// A table that is really somewhere else. See [`Remote`].
-    ///
-    /// The local `Table` is still built, and still holds init -- it costs one
-    /// allocation and it means every method that has no remote counterpart
-    /// keeps working rather than having to be reasoned about twice.
+    /// A table that is really somewhere else. See [`Remote`]. The local `Table`
+    /// is still built and still holds init, so methods with no remote
+    /// counterpart keep working.
     pub fn shared(remote: Remote) -> ProcTable {
         ProcTable {
             remote: Some(remote),
@@ -575,22 +515,16 @@ impl ProcTable {
         }
     }
 
-    /// Whether this table's answers come from somewhere else.
-    ///
-    /// The one thing a caller has to know, because `wait4` cannot be
-    /// expressed the same way both ways round: a local table hands out
-    /// `ChildHandle`s to park on, and a remote one has no handles to hand --
-    /// its children are in another memory. See [`ProcTable::collect`].
+    /// Whether this table's answers come from somewhere else. Callers must know
+    /// because `wait4` differs: a local table hands out `ChildHandle`s to park
+    /// on, a remote one has none -- its children are in another memory.
     pub fn is_shared(&self) -> bool {
         self.remote.is_some()
     }
 
-    /// Collect a finished child of `ppid` from a remote table.
-    ///
-    /// `Some((pid, wait status))` when one was ready, `None` when none was --
-    /// the caller tells "nothing yet" from `ECHILD` with `wait_ready`, as it
-    /// does locally. `None` also when the table is local, which no caller
-    /// should reach: check `is_shared` first.
+    /// Collect a finished child of `ppid` from a remote table. `Some((pid,
+    /// status))` when ready, `None` when none -- distinguish `ECHILD` with
+    /// `wait_ready`. Also `None` if the table is local: check `is_shared` first.
     pub fn collect(&self, ppid: i32, want: i32) -> Option<(i32, i32)> {
         let r = self.remote?;
         let packed = (r.wait)(ppid, want);

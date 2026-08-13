@@ -3,29 +3,12 @@
 #![feature(stdarch_wasm_atomic_wait)]
 //! The global kernel module.
 //!
-//! One module, one memory, shared by every Worker of every guest process.
-//! That is the whole point of it: the process table, and in time the
-//! filesystem, the pipes and the sockets, live *here* -- in a memory every
-//! Worker instantiated against -- so a syscall stays a direct call rather
-//! than becoming a message and a wait.
-//!
-//! It is what lets the snapshot switcher go. The switcher exists because
-//! every process shares one address space, so running a second one means
-//! writing the first out and reading the second in. Give each process its own
-//! memory and nothing collides and nothing needs saving -- but then the
-//! things processes are *supposed* to share stop being shared too, and this
-//! is where they go instead.
-//!
-//! The process table is first because it is what `fork`, `wait4` and `kill`
-//! need across processes, and those are exactly the calls the switcher
-//! currently fakes by keeping every process in one place.
-//!
-//! `gex_kernel::ProcTable` moves in unchanged. It was already written for
-//! this: its state is behind a lock, signals are left for the target to
-//! collect rather than delivered by the sender, and its comments describe a
-//! world where "the target's signal state lives in its own kernel". The only
-//! thing that was missing was somewhere for the shared half to live that is
-//! not one process's memory.
+//! One module, one memory, shared by every Worker of every guest process. The
+//! state processes share -- the process table, filesystem, pipes, sockets --
+//! lives *here*, so a syscall stays a direct call rather than a message and a
+//! wait. This is what let the snapshot switcher go: each process now has its
+//! own memory instead of one shared address space, so shared state needs
+//! somewhere to live that is not one process's memory.
 //!
 //! A guest buffer is in the *process's* memory, which this module imports as
 //! a second memory and cannot address with a pointer; `gex-kmem` copies
@@ -36,45 +19,22 @@ use std::sync::{Mutex, OnceLock};
 
 use gex_kernel::proc::ProcTable;
 
-/// Stacks, one per Worker.
-///
-/// A wasm global belongs to an *instance*, and every Worker makes its own
-/// instance of this module -- so each has its own `__stack_pointer`, and
-/// wasm-ld initialises every one of them to the same address. The memory
-/// underneath is shared. Two Workers inside this module at the same moment
-/// therefore write their locals over each other, which is as bad as it
-/// sounds: the failures were an unaligned atomic, a hang, and a fork that
-/// worked whenever tracing slowed the child down enough to miss the overlap.
-///
-/// So each Worker gets a slice of this array and points its stack pointer at
-/// the top of it. The array is in `.bss` -- it costs address space in the
-/// kernel memory and nothing else until it is written.
-///
-/// A quarter of a megabyte each. This module's deepest call is a `TmpFs`
-/// lookup and a `Vec` grow; the browser shim, which does real work, gets
-/// eight megabytes.
+/// Stacks, one per Worker. Every Worker instantiates this module and shares its
+/// memory but has its own `__stack_pointer`, all initialised to the same
+/// address by wasm-ld -- so without a distinct slice each, two Workers here at
+/// once overwrite each other's locals. Each gets a slice and points its stack
+/// pointer at the top. In `.bss`, so it costs address space until written.
 pub const STACK_BYTES: u32 = 256 * 1024;
-/// As many as there are guest processes plus their threads.
-///
-/// It is not free: `.bss` counts towards the module's *declared* initial
-/// memory, so every slice here is memory a host must provide before the
-/// kernel will link at all.
-///
-/// A hundred and twenty-eight, because threads made thirty-two too few
-/// straight away: a program with eight workers and a few detached ones
-/// exhausted them before it had finished starting. The host hands a slice
-/// back when a Worker ends, so this bounds what runs *at once* rather than
-/// what a run may ever start.
+/// Bounds Workers running *at once* (a slice is handed back when one ends).
+/// `.bss` counts towards the module's declared initial memory, so each slice is
+/// memory a host must provide before the kernel links. 32 was too few once
+/// threads existed.
 pub const STACK_COUNT: u32 = 128;
 static mut STACKS: [u8; (STACK_BYTES * STACK_COUNT) as usize] =
     [0; (STACK_BYTES * STACK_COUNT) as usize];
 
-/// Where the stacks start, and how big each is.
-///
-/// Asked by the *first* Worker, which is the one that safely can: it holds
-/// the stack wasm-ld gave the module, and nobody else is in here yet. It
-/// hands the numbers to the host, and the host tells every later Worker which
-/// slice is its own -- which that Worker installs before it calls anything.
+/// Where the stacks start, and how big each is. Asked by the first Worker (the
+/// only one that safely can); the host then assigns every later Worker a slice.
 #[no_mangle]
 pub extern "C" fn k_stack_area() -> u32 {
     // SAFETY: an address, not a read.
@@ -91,25 +51,14 @@ pub extern "C" fn k_stack_count() -> u32 {
     STACK_COUNT
 }
 
-/// The word every Worker waits on, and every Worker bumps.
+/// The word every Worker waits on and bumps, so a blocked guest is woken by a
+/// wake rather than by JS polling once a millisecond. It lives here because
+/// `memory.atomic.wait32`/`notify` act on the addressed memory, and only this
+/// module's is shared across every process; a word in a process's memory is
+/// visible only to that process's own threads.
 ///
-/// A guest that blocks -- reading a socket the other end of which is another
-/// process, waiting for a child, waiting on a futex -- used to be woken by
-/// nothing at all. Its Worker unwound out of wasm and the JavaScript around
-/// it asked "is anything runnable yet?" over and over, once a millisecond,
-/// until the answer changed. Nobody told it. That millisecond was the floor
-/// on every interaction between two guest processes, and an X client and an
-/// X server pay it twice a frame.
-///
-/// This is where the telling happens. It has to be here and nowhere else:
-/// `memory.atomic.wait32` and `memory.atomic.notify` act on the memory the
-/// module addresses, and this module's memory is the one every Worker of
-/// every process shares. A word in a *process's* memory can only be seen by
-/// that process's own threads, which is the wrong scope entirely.
-///
-/// A counter rather than a flag, so a wake that arrives between deciding to
-/// park and parking is not lost: the parker samples the value first and asks
-/// to sleep only while it is still that value.
+/// A counter, not a flag, so a wake between deciding to park and parking is not
+/// lost: the parker samples the value and sleeps only while it is unchanged.
 static WAKE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn wake_addr() -> *mut i32 {
@@ -122,14 +71,9 @@ pub extern "C" fn k_wake_seq() -> i32 {
     WAKE.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Something happened that another Worker may have been waiting for.
-///
-/// Called after every syscall rather than at the handful of places that
-/// obviously make someone else runnable. Deciding *which* calls those are is
-/// a judgement that has to be right every time -- a socket write, a pipe
-/// write, an exit, a futex wake, a signal, a file created where somebody is
-/// waiting for it to appear -- and being wrong once is a process that sleeps
-/// through its wake-up. A notify with nobody waiting is a few nanoseconds.
+/// Something happened that another Worker may have been waiting for. Called
+/// after every syscall, not at hand-picked spots: missing one wake-up strands a
+/// process, and a notify with nobody waiting costs a few nanoseconds.
 #[no_mangle]
 pub extern "C" fn k_wake() {
     WAKE.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -140,33 +84,24 @@ pub extern "C" fn k_wake() {
     }
 }
 
-/// Sleep until the counter leaves `seq`, or `ns` nanoseconds pass.
-///
-/// Returns 0 woken, 1 "the value had already moved", 2 timed out -- the
-/// instruction's own answers. A negative `ns` waits for ever, which nothing
-/// here asks for: a bound is what keeps a Worker answerable to the page.
+/// Sleep until the counter leaves `seq`, or `ns` nanoseconds pass. Returns 0
+/// woken, 1 value already moved, 2 timed out. A bounded wait keeps a Worker
+/// answerable to the page.
 #[no_mangle]
 pub extern "C" fn k_park(seq: i32, ns: i64) -> i32 {
-    // SAFETY: as above. Blocking is allowed here because every guest runs in
-    // a Worker; the page's own thread never enters this module.
+    // SAFETY: as above. Blocking is allowed because every guest runs in a
+    // Worker; the page's own thread never enters this module.
     unsafe { core::arch::wasm32::memory_atomic_wait32(wake_addr(), seq, ns) }
 }
 
-/// What this module last panicked with, so a crash in here can be read.
-///
-/// It has no console: the browser shim writes through an import the page
-/// supplies, and this module imports nothing but two memories. So a panic in
-/// here unwound to a bare `unreachable` with no message at all -- and since
-/// the shim is mid-syscall when it happens, every later call into the shim
-/// found the kernel still borrowed and panicked on top of it. What a run
-/// showed was three re-entrancy complaints and no cause.
-///
-/// The host reads this straight out of the shared memory it created; see
+/// What this module last panicked with. It has no console (it imports nothing
+/// but two memories), so without this a panic unwound to a bare `unreachable`
+/// with no message. The host reads it straight out of shared memory; see
 /// `k_panic_ptr`.
 static PANIC: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
-/// Install the hook, once. Called at the top of every export that could
-/// panic -- which is all of them, because any of them can be the first.
+/// Install the hook, once. Called at the top of every export that could panic
+/// -- which is all of them, since any can be the first.
 fn note_panics() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -194,37 +129,22 @@ pub extern "C" fn k_panic_len() -> u32 {
     PANIC.lock().unwrap_or_else(|e| e.into_inner()).len() as u32
 }
 
-/// The system's processes, in the memory every Worker shares.
-///
-/// A `static` rather than anything handed across a boundary: this module's
-/// data lives in its own memory, that memory is the global one, and so a
-/// static here is already the same bytes for every Worker that instantiated
-/// against it. That is the entire trick.
+/// The system's processes. A `static` here is already the same bytes for every
+/// Worker, because this module's memory is the shared one -- that is the trick.
 fn procs() -> &'static ProcTable {
     note_panics();
     static PROCS: OnceLock<ProcTable> = OnceLock::new();
     PROCS.get_or_init(ProcTable::new)
 }
 
-/// Which dispatch slots the code of a given identity was translated into.
+/// Which dispatch slots the code of a given identity was translated into. Keyed
+/// by dispatch page and by what the bytes there *are* (file, offset, length),
+/// so two processes mapping the same library at the same address agree without
+/// knowing about each other. One system-wide map, so a second process reuses
+/// the first's work; per-Worker it could not, and `hit=0` every time.
 ///
-/// Keyed by the dispatch page and by what the bytes there *are* -- the file,
-/// the offset within it, the length of the mapping -- so two processes that
-/// map the same library at the same address agree without either knowing the
-/// other exists.
-///
-/// This lived in the shim, per Worker, and travelled parent to child in the
-/// fork record and nowhere else. That made sibling reuse impossible: a shell
-/// loop that execs `ls` three times lifted the same 20,868 blocks three
-/// times, because each `ls` started from the shell's snapshot and the shell
-/// has never run `ls`. Counted with `gex_reuse_stat`: `hit=0`, every time.
-///
-/// Here it is one map for the whole system, for the same reason the process
-/// table and the filesystem are: this module's data lives in the memory every
-/// Worker instantiates against, so a static is already shared bytes.
-///
-/// Base zero means absent. A real base never is -- slot zero and the span
-/// above it are the miss stubs, reserved before anything is handed out.
+/// Base zero means absent -- a real base never is, since slot zero and above
+/// are the miss stubs.
 fn slots() -> &'static Mutex<BTreeMap<(u64, u64), u32>> {
     note_panics();
     static SLOTS: OnceLock<Mutex<BTreeMap<(u64, u64), u32>>> = OnceLock::new();
@@ -243,11 +163,8 @@ pub extern "C" fn k_slot_get(page: u64, key: u64) -> u32 {
         .unwrap_or(0)
 }
 
-/// Record it, if nothing has claimed that page and identity already.
-///
-/// First writer wins, which is the same rule the per-Worker map used: a page
-/// that already has an owner keeps it, because the code that was emitted
-/// names whichever base it was given.
+/// Record it, unless that page and identity are already claimed. First writer
+/// wins: emitted code names whichever base it was given.
 #[no_mangle]
 pub extern "C" fn k_slot_put(page: u64, key: u64, base: u32) {
     if base == 0 {
@@ -260,32 +177,17 @@ pub extern "C" fn k_slot_put(page: u64, key: u64, base: u32) {
         .or_insert(base);
 }
 
-/// How many pages the slot map holds.
-///
-/// One number, to settle whether this map is shared at all. Every Worker
-/// instantiates its own copy of this module, and the map is a Rust `static`
-/// with a heap `BTreeMap` behind it -- so it is shared only if the data
-/// segment that holds the `OnceLock` is applied once across instances rather
-/// than once per instance. Two processes that each store eight pages should
-/// both then see sixteen; if they each see eight, every Worker has its own
-/// map and no process has ever reused another's work.
+/// How many pages the slot map holds. A diagnostic to confirm the map is shared:
+/// two processes each storing eight pages should both then see sixteen.
 #[no_mangle]
 pub extern "C" fn k_slot_len() -> u32 {
     slots().lock().unwrap_or_else(|e| e.into_inner()).len() as u32
 }
 
-/// Standard input, in the memory every Worker shares.
-///
-/// It used to be a queue in each guest Worker's own shim, filled by a message
-/// from the host: the Worker asked for input, gave the wasm stack back, and
-/// the answer arrived as a `postMessage`. That is why a guest waiting for a
-/// keystroke could not be parked -- a Worker asleep inside wasm is not
-/// running the event loop the answer arrives on -- and why every wait had to
-/// be classified into "the page ends this" and "another Worker ends this".
-///
-/// Here instead, so whoever has the keystroke writes it and calls
-/// [`k_wake`], and a parked reader is woken by the same counter a pipe write
-/// would have bumped. No classification, and nothing to misclassify.
+/// Standard input, shared. Whoever has the keystroke writes it and calls
+/// [`k_wake`], so a parked reader is woken by the same counter a pipe write
+/// bumps -- rather than by a `postMessage` a Worker parked inside wasm cannot
+/// receive.
 fn stdin() -> &'static Mutex<(std::collections::VecDeque<u8>, bool)> {
     note_panics();
     static Q: OnceLock<Mutex<(std::collections::VecDeque<u8>, bool)>> = OnceLock::new();
@@ -334,17 +236,9 @@ pub extern "C" fn k_stdin_read(at: u32, len: u32) -> i32 {
     n as i32
 }
 
-/// The terminal, in the memory every Worker shares.
-///
-/// One `struct termios`, one window size, one foreground process group, and
-/// one line discipline for the whole system -- which is what a terminal is.
-/// See [`gex_kernel::tty`] for why none of that can live in a process.
-///
-/// The page is the other end of it: it pushes keystrokes into [`k_tty_input`]
-/// and writes back whatever comes out as echo. It can do that because it
-/// instantiates this module too, so a keystroke reaches the discipline by a
-/// call rather than by a message to a Worker that may be parked inside wasm
-/// and not running an event loop at all.
+/// The terminal, shared: one termios, window size, foreground group and line
+/// discipline for the whole system. The page instantiates this module too, so
+/// it reaches the discipline by a call rather than a message to a parked Worker.
 fn tty() -> &'static gex_kernel::tty::Tty {
     note_panics();
     static T: OnceLock<gex_kernel::tty::Tty> = OnceLock::new();
@@ -357,16 +251,10 @@ fn echoed() -> &'static Mutex<std::collections::VecDeque<u8>> {
     E.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
 }
 
-/// Who a `^C` reaches: the foreground process group, as a `kill` target.
-///
-/// Before any shell has called `tcsetpgrp` there is no foreground group, and
-/// the answer has to be pid 1's group rather than "everybody" -- `kill(-1)`
-/// spares init, and in these demos init *is* the shell. A `^C` at a `bash -i`
-/// running as pid 1 would have gone to nobody at all.
-///
-/// Pid 1's group also covers the case that matters next: a shell without job
-/// control leaves its children in its own group, so the command it is running
-/// is signalled with it, which is exactly what a terminal is meant to do.
+/// Who a `^C` reaches: the foreground process group. Before any `tcsetpgrp`
+/// there is none, and the fallback is pid 1's group, not "everybody" -- init is
+/// the shell here, and a shell without job control keeps its children in its
+/// own group, so the running command is signalled with it.
 fn fg_group() -> i32 {
     let fg = tty().fg();
     if fg > 0 {
@@ -377,16 +265,9 @@ fn fg_group() -> i32 {
         .unwrap_or(gex_kernel::INIT_PID)
 }
 
-/// Keystrokes, through the line discipline.
-///
-/// Everything a key can mean happens here: it may join a line being edited,
-/// complete one, erase part of one, stop the output, end the input, or -- and
-/// this is the one that could not be done anywhere else -- signal the
-/// foreground process group. `^C` is `SIGINT` to a set of processes, and the
-/// process table is next door.
-///
-/// Returns how many bytes of echo are queued, so the caller knows whether to
-/// bother draining.
+/// Keystrokes, through the line discipline. `^C` signalling the foreground
+/// group is what could only be done here, next to the process table. Returns
+/// how many bytes of echo are queued, so the caller knows whether to drain.
 #[no_mangle]
 pub extern "C" fn k_tty_input(at: u32, len: u32) -> i32 {
     let mut buf = vec![0u8; len as usize];
@@ -396,9 +277,8 @@ pub extern "C" fn k_tty_input(at: u32, len: u32) -> i32 {
     let r = tty().input(&buf);
     {
         let mut s = stdin().lock().unwrap_or_else(|e| e.into_inner());
-        // A signal character throws away what was typed and not yet read.
-        // Without this, `^C` at a shell prompt interrupts the shell and then
-        // hands it the half-line that was abandoned.
+        // A signal character discards what was typed and not yet read, so the
+        // abandoned half-line is not handed to the shell after the `^C`.
         if r.flush {
             s.0.clear();
         }
@@ -416,8 +296,7 @@ pub extern "C" fn k_tty_input(at: u32, len: u32) -> i32 {
     for sig in r.signals {
         let _ = procs().kill_group(gex_kernel::INIT_PID, fg_group(), sig);
     }
-    // A reader parked inside wasm is not running an event loop, so the wake
-    // has to be the counter every other cross-process delivery uses.
+    // Wake a reader parked inside wasm, which runs no event loop.
     k_wake();
     echoed().lock().unwrap_or_else(|e| e.into_inner()).len() as i32
 }
@@ -483,10 +362,8 @@ pub extern "C" fn k_tty_set_winsize(packed: u64) -> i32 {
 }
 
 /// Resize from the page, which also owes the foreground group its `SIGWINCH`.
-///
-/// Separate from [`k_tty_set_winsize`] because a guest doing this through
-/// `TIOCSWINSZ` signals from its own kernel, where the calling pid is known;
-/// the page has no pid and signals as init.
+/// Separate from [`k_tty_set_winsize`]: the page has no pid, so it signals as
+/// init, where a guest's `TIOCSWINSZ` would signal from its own kernel.
 #[no_mangle]
 pub extern "C" fn k_tty_resize(packed: u64) -> i32 {
     if !tty().set_winsize(gex_kernel::tty::unpack_ws(packed)) {
@@ -496,11 +373,9 @@ pub extern "C" fn k_tty_resize(packed: u64) -> i32 {
     1
 }
 
-/// Signal the foreground process group, for a page with no pid of its own.
-///
-/// The page needs this for what the discipline does not own -- there is no
-/// `c_cc` entry for "the tab was closed" -- and a test needs it to prove the
-/// path without going through a keystroke.
+/// Signal the foreground process group, for a page with no pid of its own --
+/// used for what the discipline does not own (there is no `c_cc` for "tab
+/// closed").
 #[no_mangle]
 pub extern "C" fn k_tty_signal(signo: u32) -> i32 {
     if signo == 0 || signo > gex_kernel::signal::sig::MAX {
@@ -594,35 +469,17 @@ pub extern "C" fn k_tty_push(at: u32, len: u32) -> i32 {
     k_tty_input(at, len)
 }
 
-/// The system-wide slot allocation mark.
+/// Where runtime-translated slots start: the first slot of table 4. Slots must
+/// be unique across *processes* (a module one Worker translates can install in
+/// another), so runtime translation draws from one system-wide mark.
 ///
-/// Dispatch slots have to be unique across *processes*, not just within one,
-/// because a module translated by one Worker can be installed in another. A
-/// page table that allocates from its own counter cannot give that: two
-/// processes running the same program start from the same mark -- the one
-/// their image was built with -- and issue the same numbers for different
-/// code.
-///
-/// So runtime translation draws from here instead. Ranges are handed out in
-/// chunks and never returned; the space is 8 tables of 9,999,360 slots and a
-/// page costs 1,024, which is 78,120 pages before it is spent.
-/// Where runtime-translated slots start: the first slot of table 4.
-///
-/// Tables 0..3 belong to statically recompiled closures, whose slot numbers
-/// are baked into their modules at build time and start at zero. Tables 4..7
-/// belong to whatever the run translates.
-///
-/// The two must not share a table, and not because they would collide -- the
-/// counter used to be advanced past the closure's reservation, which stopped
-/// that. It is because a wasm table is per *instance*, so it is grown per
-/// guest process, and growing to slot N means allocating N entries. With one
-/// shared space, the first block a process lifted took a slot above the whole
-/// closure's 2.85M and the table had to be that long: 405ms and 22 MB in
-/// every process, a hundred of them in an `apt-get update`, whether or not
-/// the process ever entered a single closure library.
-///
-/// Split, a process grows table 0 for the libraries it actually reaches and
-/// table 4 for the handful of blocks it lifts.
+/// Tables 0..3 hold statically recompiled closures, slot numbers baked in at
+/// build time from zero; tables 4..7 hold what the run translates. They must
+/// not share a table because a wasm table is per-instance and grown to slot N
+/// means N entries: mixing them made every process grow table 0 past the whole
+/// closure's 2.85M slots (405ms, 22 MB) whether or not it entered a closure
+/// library. Split, a process grows table 0 for libraries it reaches and table 4
+/// for the blocks it lifts.
 const RUNTIME_SLOT_BASE: u64 =
     4 * ((gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE);
 
@@ -632,16 +489,12 @@ fn slot_mark() -> &'static core::sync::atomic::AtomicU64 {
     &MARK
 }
 
-/// Reserve `count` slots for the caller alone, returning the first.
-///
-/// The range is aligned so that it cannot straddle two dispatch tables: a
-/// page's slots are written as a unit and reached from one base, so a base
-/// near the end of a table would index past it.
+/// Reserve `count` slots for the caller alone, returning the first. Aligned so
+/// the range cannot straddle two dispatch tables (a page is reached from one
+/// base).
 #[no_mangle]
 pub extern "C" fn k_slot_alloc(count: u64) -> u64 {
-    // The same divisor the emitter uses to turn a slot number into a table
-    // index and an offset: whole pages only, so the two agree about which
-    // table a number is in.
+    // Whole pages only, matching the emitter's slot-to-table divisor.
     let per_table =
         (gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE;
     let mut cur = slot_mark().load(core::sync::atomic::Ordering::SeqCst);
@@ -663,12 +516,9 @@ pub extern "C" fn k_slot_alloc(count: u64) -> u64 {
     }
 }
 
-/// Raise the mark so nothing is handed out below `floor`.
-///
-/// Statically recompiled images carry slot numbers assigned when they were
-/// built, and those are the same in every process that runs the image -- which
-/// is right, because it is the same code. The global counter has to start
-/// above every such range, or a runtime allocation would land on one.
+/// Raise the mark so nothing is handed out below `floor` -- above every
+/// statically recompiled image's baked-in slot range, or a runtime allocation
+/// would land on one.
 #[no_mangle]
 pub extern "C" fn k_slot_floor(floor: u64) {
     slot_mark().fetch_max(floor, core::sync::atomic::Ordering::SeqCst);
@@ -680,93 +530,50 @@ pub extern "C" fn k_slot_count() -> u32 {
     slots().lock().unwrap_or_else(|e| e.into_inner()).len() as u32
 }
 
-/// Every translated module, once, and which object's pages each one covers.
-///
-/// The slot map above lets a Worker learn *where* code of a given identity
-/// was put. That is not enough to use it: a dispatch table belongs to a
-/// module instance, so a Worker that has not instantiated the module cannot
-/// reach the code however well it knows the slot number. This is the other
-/// half -- the module itself, in the memory everybody shares, so the second
-/// process to run `ls` installs what the first one produced instead of
-/// lifting it again.
-///
-/// Bytes rather than anything compiled, because compiled code is a JavaScript
-/// object and this is a wasm memory. The Worker copies them out and hands
-/// them to the same `pending` queue a fresh translation goes through, which
-/// is why this needs no new path through the host at all.
+/// Every translated module, once, and which object's pages each one covers. The
+/// slot map says *where* code went; a Worker also needs the module itself,
+/// since a dispatch table belongs to a module instance. Shared here so the
+/// second process to run `ls` installs what the first produced. Bytes, not
+/// compiled code (that is a JS object): the Worker feeds them to the same
+/// `pending` queue a fresh translation uses.
 struct SharedModule {
     wasm: Vec<u8>,
-    /// How large the dispatch table must be for it.
-    ///
-    /// Kept here rather than recomputed because it is a fact about the
-    /// process that *produced* the module, and the one installing it has a
-    /// different high-water mark. Passing the local number understates it,
-    /// the table is not grown far enough, and the install throws -- which is
-    /// how the first attempt at this wedged.
+    /// How large the dispatch table must be. A fact about the *producing*
+    /// process; the installer's own high-water mark understates it, and the
+    /// install then throws.
     slots: u64,
-    /// Which pages it holds code for, and at which base. The installing
-    /// Worker has to assign these before the install, or the blocks resolve
-    /// to no slot and are silently dropped.
+    /// Which pages it holds code for, and at which base. The installing Worker
+    /// must assign these first, or the blocks resolve to no slot and are dropped.
     dirs: Vec<(u64, u32)>,
 }
 
 struct ModStore {
     /// By id. Index zero is never used: zero means "none".
     mods: Vec<SharedModule>,
-    /// Which modules hold code for a page of a given object.
-    ///
-    /// Every one of them, not the first. A page is not translated once: the
-    /// translator discovers what it can reach from the block that missed, so
-    /// a page fills in over many units as the program takes new paths through
-    /// it. Keeping only the first claim meant a process could install one
-    /// unit's worth of a page and then had to translate the rest itself --
-    /// which is why sharing recognised four hundred pages and served
-    /// nineteen modules.
+    /// Every module holding code for a page of an object, not just the first: a
+    /// page fills in over many translation units, so keeping only the first
+    /// claim left a process translating the rest itself.
     by_page: BTreeMap<(u64, u64), Vec<u32>>,
-    /// Which modules hold code for an *object*, whatever page it is on.
-    ///
-    /// Per page is the wrong grain to install at. A translation unit holds
-    /// what was reachable from the block that faulted, so another process
-    /// entering the same page at a different block installs the page's module
-    /// and misses anyway -- measured, 361 of 381 recognised pages had every
-    /// covering module already installed and still had to translate. Asking
-    /// per object instead lets the second process to enter libc take
-    /// everything the first one ever lifted of it, in one go.
+    /// Every module holding code for an *object*, whatever page. Per-page is too
+    /// fine: entering the same page at a different block still missed 361 of 381
+    /// times. Per object, the second process to enter libc takes it all at once.
     by_object: BTreeMap<u64, Vec<u32>>,
-    /// Objects some process is translating right now.
-    ///
-    /// The store answers "who has already done this"; nothing answered "who
-    /// is doing it". apt runs its ten processes at once in parallel Workers,
-    /// so all of them reach `libapt` before any of them has published it,
-    /// all of them find nothing, and all of them translate it: 3,381,984
-    /// blocks in one `apt-get update` against 1,724,482 for the entire
-    /// decodable text of every library it touches.
+    /// Objects some process is translating right now. Without this, apt's ten
+    /// parallel processes all reach `libapt` before any publishes it and all
+    /// translate it.
     translating: BTreeMap<u64, u32>,
-    /// Objects somebody has already translated whole, and published.
-    ///
-    /// The claim above is released the moment its owner finishes, which makes
-    /// it a guard against two processes doing the work *at the same time* and
-    /// nothing else. The next process to start finds no claim, and lifts the
-    /// whole object again -- so three `ls` in one page lift 78,000 blocks
-    /// each while the store reports `hit=241 miss=0`, which is to say they
-    /// find what was published and re-translate it anyway.
-    ///
-    /// Recorded separately from the claim because the two answer different
-    /// questions: "is anyone doing this right now" and "has this ever been
-    /// done". Only the second survives its owner exiting, and only the second
-    /// is what a later process needs to know.
+    /// Objects translated whole and published. The claim above is released when
+    /// its owner finishes, so it only guards against *concurrent* work; only
+    /// this survives the owner exiting and tells a later process not to re-lift.
     translated: BTreeSet<u64>,
     /// What has been stored, against [`MOD_BUDGET`].
     total: usize,
 }
 
-/// How much translated wasm to keep for sharing.
-///
-/// The kernel's memory is capped at 1 GiB and the filesystem is in it too, so
-/// this cannot be unbounded. A quarter is enough for the libraries a forking
-/// program shares -- apt's whole closure is 80 MB of wasm and it only ever
-/// translates the part it reaches -- and running out means falling back to
-/// translating, which is what happened before this existed.
+/// How much translated wasm to keep for sharing. The kernel memory is capped at
+/// 1 GiB with the filesystem in it too, so this cannot be unbounded; a quarter
+/// covers the libraries a forking program shares. Running out falls back to
+/// translating.
 const MOD_BUDGET: usize = 256 << 20;
 
 fn modules() -> &'static Mutex<ModStore> {
@@ -788,16 +595,11 @@ fn modules() -> &'static Mutex<ModStore> {
     })
 }
 
-/// Keep a module. Returns its id, or zero when the budget is spent.
+/// Keep a module. Returns its id, or zero when the budget is spent. `dirs` is
+/// `(u64 page, u32 base)` pairs, twelve bytes each, little-endian.
 ///
-/// `dirs` is `(u64 page, u32 base)` pairs, twelve bytes each, little-endian.
-///
-/// SAFETY: every pointer names the *calling process's* memory, not the
-/// kernel's. The two are different wasm memories and a Rust pointer here
-/// means the kernel's, so the bytes have to be pulled across rather than
-/// read -- reading them directly is how this first shipped, and it stored a
-/// module of zeros that `WebAssembly.compile` then rejected for its magic
-/// word.
+/// SAFETY: every pointer names the *calling process's* memory, a different wasm
+/// memory, so the bytes must be pulled across rather than read directly.
 #[no_mangle]
 pub unsafe extern "C" fn k_mod_store(
     ptr: u32,
@@ -824,8 +626,7 @@ pub unsafe extern "C" fn k_mod_store(
     }
     m.total += len as usize;
     m.mods.push(SharedModule { wasm, slots, dirs });
-    // One-based. Zero is how every caller says "no module", so a module at
-    // index zero would be stored, claimed for nothing, and never found.
+    // One-based: zero is how every caller says "no module".
     m.mods.len() as u32
 }
 
@@ -855,20 +656,14 @@ pub extern "C" fn k_mod_claim_object(obj: u64, id: u32) {
     }
 }
 
-/// Claim an object to translate, or find out who already has.
-///
-/// Returns 1 to the process that may go ahead and 0 to everyone else, which
-/// is a claim rather than a lock: the loser does not wait, it returns to the
-/// miss path and lifts the handful of blocks it actually needs, and it picks
-/// up the whole object from the store once the winner publishes. Waiting
-/// would be the other design and it trades duplicated work for a stall on
-/// whichever process happens to be slowest.
+/// Claim an object to translate, or find out who already has. Returns 1 to the
+/// process that may go ahead, 0 to everyone else -- a claim, not a lock: the
+/// loser lifts the few blocks it needs from the miss path and picks up the
+/// whole object from the store once the winner publishes.
 #[no_mangle]
 pub extern "C" fn k_obj_translating(obj: u64, pid: u32) -> u32 {
     let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
-    // Already done, by somebody who has since exited. Its modules are in the
-    // store and the miss path will serve them; lifting the object again
-    // produces the same code and throws the first copy away.
+    // Already done by someone since exited; the store serves its modules.
     if m.translated.contains(&obj) {
         return 0;
     }
@@ -881,16 +676,9 @@ pub extern "C" fn k_obj_translating(obj: u64, pid: u32) -> u32 {
     }
 }
 
-/// Done with it. `produced` is how many modules came of it.
-///
-/// The claim is released either way, because a translation that produced
-/// nothing -- an object over the size cap, a process that died holding it --
-/// must not stop the next process from trying.
-///
-/// It is recorded as *done* only when something came of it. That is the part
-/// that makes the next `ls` cheap: the object is in the store, the miss path
-/// will serve it, and lifting it a second time produces identical code and
-/// discards the first copy.
+/// Done with it. `produced` is how many modules came of it. The claim is
+/// released either way (so a translation that produced nothing does not block
+/// the next process), but recorded as *done* only when something came of it.
 #[no_mangle]
 pub extern "C" fn k_obj_translated(obj: u64, produced: u32) {
     let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
@@ -900,15 +688,9 @@ pub extern "C" fn k_obj_translated(obj: u64, produced: u32) {
     }
 }
 
-/// Has this object been translated whole and published?
-///
-/// The miss path asks so it can take *all* of a finished object in one go
-/// rather than sixteen units at a time. Sixteen is right for an object being
-/// discovered a block at a time -- a stored unit holds only what was
-/// reachable from the block that faulted in the process that built it, so
-/// most of them do not contain the address this process wants. When the whole
-/// object is there, that reasoning stops applying: everything is covered, and
-/// the process should stop missing in it entirely.
+/// Has this object been translated whole and published? The miss path asks so
+/// it can take *all* of a finished object at once, rather than the sixteen
+/// units at a time that suit an object still being discovered a block at a time.
 #[no_mangle]
 pub extern "C" fn k_obj_is_translated(obj: u64) -> u32 {
     modules()
@@ -931,12 +713,9 @@ pub extern "C" fn k_mod_for_object(obj: u64, n: u32) -> u32 {
         .unwrap_or(0)
 }
 
-/// The `n`th module holding code for this page, or zero past the end.
-///
-/// The caller walks `n` upwards until it finds one it has not installed. A
-/// page accumulates a claim per translation unit that touched it, so asking
-/// only for the first would hand back whichever unit happened to reach the
-/// page earliest and leave the rest of its blocks to be translated again.
+/// The `n`th module holding code for this page, or zero past the end. The
+/// caller walks `n` upwards for every unit that touched the page, since one
+/// page accumulates a claim per translation unit.
 #[no_mangle]
 pub extern "C" fn k_mod_for(page: u64, key: u64, n: u32) -> u32 {
     modules()
@@ -1023,33 +802,25 @@ pub unsafe extern "C" fn k_mod_dirs_read(id: u32, out: u32, cap: u32) -> u32 {
     n as u32
 }
 
-/// Where each shared object goes, the same in every process.
-///
-/// A translated block has its guest addresses baked into it, so a module is
-/// only worth sharing between two processes if the object it was lifted from
-/// sits at the same address in both. Nothing about the guest requires that
-/// they differ -- `ld.so` reserves each object with `mmap(NULL, ..)` and
-/// takes whatever it is handed -- but the per-process bump allocator gives a
-/// different answer depending on what was mapped before, so the same libc
-/// lands at `0x6010000` in one process and `0x6060000` in the next, and the
-/// two translations have nothing in common.
-///
-/// This is the assignment, made once and kept system-wide. First to ask for
-/// an object fixes it; everyone after gets the same base.
+/// Where each shared object goes, the same base in every process. A translated
+/// block bakes in guest addresses, so a module is only shareable if its object
+/// sits at the same address in both processes -- which the per-process bump
+/// allocator does not guarantee. Assigned once, system-wide: first to ask fixes
+/// it, everyone after gets the same base.
 struct Places {
-    /// By a hash of the guest path, because the caller is a different wasm
-    /// memory and a scalar crosses that boundary without a copy.
+    /// Keyed by a hash of the guest path (a scalar crosses the memory boundary
+    /// without a copy).
     by_obj: BTreeMap<u64, u64>,
     /// The bottom of the unassigned region.
     next: u64,
 }
 
-/// The window objects are placed in: `gex-abi`'s, because every process's
-/// arena is arranged around it and the two have to be the same number.
+/// The window objects are placed in: `gex-abi`'s, which every process's arena
+/// is arranged around.
 use gex_abi::{PLACE_BOTTOM, PLACE_TOP};
 
-/// Enough that two objects never share a 64 KiB page, and the slack after
-/// each one absorbs the alignment `ld.so` asks for on top of the span.
+/// Enough that two objects never share a 64 KiB page; the slack after each
+/// absorbs the alignment `ld.so` asks for on top of the span.
 const PLACE_ALIGN: u64 = 0x1_0000;
 
 fn places() -> &'static Mutex<Places> {
@@ -1073,10 +844,8 @@ pub extern "C" fn k_place(key: u64, len: u64) -> u64 {
         return base;
     }
     let base = p.next.next_multiple_of(PLACE_ALIGN);
-    // The span, rounded up, and a page of slack after it: `ld.so` reserves
-    // the span *plus* whatever alignment the object's segments ask for, and
-    // a reservation that runs into the next object's home would be refused
-    // as not free.
+    // The span plus a page of slack: `ld.so` reserves the span *plus* its
+    // segments' alignment, and a reservation into the next home would be refused.
     let Some(end) = len
         .checked_next_multiple_of(PLACE_ALIGN)
         .and_then(|n| base.checked_add(n))
@@ -1092,16 +861,10 @@ pub extern "C" fn k_place(key: u64, len: u64) -> u64 {
     base
 }
 
-/// Fix where an object goes, rather than letting the counter choose.
-///
-/// For a closure that was statically recompiled: every module in it has the
-/// addresses of the object it came from baked in, so the layout is not a
-/// preference but a precondition. The build writes it out and the host
-/// replays it here before anything runs.
-///
-/// The counter is pushed past whatever is pinned, so an object the build did
-/// not cover -- one the guest `dlopen`s, say -- is placed after the pinned
-/// ones rather than on top of them.
+/// Fix where an object goes, rather than letting the counter choose. For a
+/// statically recompiled closure, whose modules bake in their object's address,
+/// so the layout is a precondition. The counter is pushed past whatever is
+/// pinned, so a later `dlopen`ed object lands after the pinned ones.
 #[no_mangle]
 pub extern "C" fn k_place_set(key: u64, base: u64, len: u64) {
     let mut p = places().lock().unwrap_or_else(|e| e.into_inner());
@@ -1114,25 +877,15 @@ pub extern "C" fn k_place_set(key: u64, base: u64, len: u64) {
     }
 }
 
-/// Linked address spaces, keyed by a hash of the program and the environment
-/// that was linked for it.
+/// Linked address spaces, keyed by a hash of the program and its environment. A
+/// dynamically linked program spends its first half-second in `ld.so` reaching
+/// the same layout every time; the first process pays for it and leaves the
+/// result here for the rest.
 ///
-/// A dynamically linked program spends its first half-second running the
-/// guest's `ld.so`, which maps its libraries, hashes their symbols and
-/// applies their relocations -- and reaches, every time, the same answer,
-/// because a closure pins every object at an address decided at build time.
-/// The first process of a program pays for it and leaves the result here;
-/// every process after it starts from the result.
-///
-/// A fixed arena and a fixed index, with no allocation anywhere on the path.
-/// The first version kept a `BTreeMap<u64, Vec<u8>>` and let the megabyte and
-/// a half come from the kernel's heap, and storing one image from a child
-/// killed the *parent* -- a wasm trap in a Worker that had not called this at
-/// all. Every Worker instantiates this module against one shared memory, so
-/// they share its allocator's state as well as its data, and a heap grown
-/// from two Workers at once is not a heap either of them can trust. Nothing
-/// here allocates: the bytes go at a bump offset in `.bss` and the index is
-/// an array.
+/// A fixed arena and index, allocating nothing: every Worker shares this
+/// module's allocator state as well as its data, so a heap grown from two
+/// Workers at once is untrustworthy -- storing from a child once trapped the
+/// parent. The bytes go at a bump offset in `.bss` and the index is an array.
 const SNAP_ARENA_BYTES: usize = 48 * 1024 * 1024;
 const SNAP_MAX: usize = 64;
 
@@ -1158,12 +911,11 @@ fn snaps() -> &'static Mutex<Snaps> {
     })
 }
 
-/// Keep the linked image of `key`. Silently declines when the arena is full
-/// or the key is already known: the first process to finish linking wins, and
-/// a second one arriving with the same answer has nothing to add.
+/// Keep the linked image of `key`. Silently declines when the arena is full or
+/// the key is already known: first to finish linking wins.
 ///
-/// SAFETY: `ptr` names the calling process's memory, not the kernel's, so
-/// the bytes are pulled across rather than read. See `k_mod_store`.
+/// SAFETY: `ptr` names the calling process's memory, pulled across not read. See
+/// `k_mod_store`.
 #[no_mangle]
 pub unsafe extern "C" fn k_snap_store(key: u64, ptr: u32, len: u32) {
     let mut s = snaps().lock().unwrap_or_else(|e| e.into_inner());
@@ -1230,26 +982,20 @@ pub extern "C" fn k_spawn(ppid: i32) -> i32 {
     procs().spawn(ppid)
 }
 
-/// Record that `pid` has exited with `status`.
-///
-/// `status` is an exit *code*, or the negated signal number when the process
-/// died of one -- the same convention `ProcTable::exit` takes. The two are
-/// different things to `wait4`, and [`k_wait`] is where they become the one
-/// word a parent reads.
+/// Record that `pid` has exited. `status` is an exit code, or the negated
+/// signal number when it died of one (the `ProcTable::exit` convention);
+/// [`k_wait`] turns the two into the one word a parent reads.
 #[no_mangle]
 pub extern "C" fn k_exit(pid: i32, status: i32) {
     procs().exit(pid, status);
 }
 
-/// Collect a finished child of `ppid`. Zero if none is ready.
+/// Collect a finished child of `ppid`. Zero if none is ready. `want` is a
+/// specific pid, or -1 for any.
 ///
-/// Returns the pid in the high 32 bits and the wait status in the low 32:
-/// one call and two results, rather than a second call for the status. The
-/// pairing has to be atomic, because two processes in two Workers can be
-/// collecting from this table at the same moment and a status left in a
-/// static between calls belongs to whichever of them asked last.
-///
-/// `want` is a specific pid, or -1 for any.
+/// Returns pid in the high 32 bits, wait status in the low 32 -- paired
+/// atomically, since two Workers can collect at once and a status left in a
+/// static between calls would go to whichever asked last.
 #[no_mangle]
 pub extern "C" fn k_wait(ppid: i32, want: i32) -> i64 {
     for c in procs().children(ppid) {
@@ -1291,11 +1037,9 @@ pub extern "C" fn k_has_children(ppid: i32) -> i32 {
     procs().has_children(ppid) as i32
 }
 
-/// Send a signal, leaving it pending for the target to collect.
-///
-/// Returns the number of processes signalled, or a negative errno. The
-/// sender never delivers: the target picks it up at its next syscall, which
-/// is what makes this safe to call from another process's Worker.
+/// Send a signal, left pending for the target to collect at its next syscall --
+/// which is what makes this safe to call from another process's Worker. Returns
+/// the number signalled, or a negative errno.
 #[no_mangle]
 pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
     if signo != 0 {
@@ -1307,18 +1051,11 @@ pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
     }
 }
 
-/// How many signals have been *sent* to anyone, ever.
-///
-/// A guest in a loop with no syscall in it can only be interrupted at a
-/// safepoint, and a safepoint that asks "is anything pending for me" through
-/// the process table takes this module's lock and walks every process -- once
-/// per thousand back edges, in every Worker at once. That is a contended lock
-/// on the hottest path there is.
-///
-/// So the question is asked in two steps. This counter is one relaxed atomic
-/// load and answers "has anybody sent anything at all since I last looked";
-/// only when it moves does a safepoint pay for the real answer. Signals are
-/// rare and back edges are not.
+/// How many signals have been *sent* to anyone, ever. A safepoint fires once per
+/// thousand back edges in every Worker at once, so it cannot take this module's
+/// lock and walk every process each time; one relaxed load of this counter says
+/// "has anybody sent anything since I last looked", and only a change pays for
+/// the real check.
 static SIGNAL_SEQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn note_signal() {
@@ -1331,11 +1068,9 @@ pub extern "C" fn k_signal_seq() -> i32 {
     SIGNAL_SEQ.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Signal every process in a group, naming the group positively.
-///
-/// `k_kill` cannot do this for group 1: a negative target of -1 is "every
-/// process", so the one group with no negative spelling is exactly the one a
-/// shell running as pid 1 is in.
+/// Signal every process in a group, naming the group positively. `k_kill`
+/// cannot reach group 1: target -1 means "every process", so the group a shell
+/// running as pid 1 is in has no negative spelling.
 #[no_mangle]
 pub extern "C" fn k_kill_group(caller: i32, pgid: i32, signo: u32) -> i32 {
     if signo != 0 {
@@ -1429,14 +1164,9 @@ pub extern "C" fn k_halt_code() -> i32 {
 
 // -- pipes -------------------------------------------------------------------
 //
-// The second thing processes share, and the one a shell pipeline and apt's
-// method workers are made of. A pipe is a buffer with two ends and a pair of
-// counts, which is exactly the kind of state that forced every process into
-// one address space: `Arc<Pipe>` is a pointer, and a pointer means a memory.
-//
-// Here it is a *number* instead. Each process's file table holds an id and the
+// A pipe crosses processes as a *number*: each file table holds an id and the
 // buffer lives in the global memory, so the two ends can be in Workers that
-// share nothing else.
+// share nothing else. An `Arc<Pipe>` could not -- a pointer means a memory.
 
 /// Every pipe in the system, by id.
 fn pipes() -> &'static std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::pipe::Pipe>>> {
@@ -1447,19 +1177,10 @@ fn pipes() -> &'static std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::pipe::Pip
 }
 
 /// Which pipe ends each process still holds, so a process that dies without
-/// closing them does not hold a reader's end-of-file for ever.
-///
-/// `exit_process` clears a process's descriptor table, and `RemotePipeEnd`'s
-/// `Drop` is what tells this module an end has gone. Neither runs when a
-/// guest leaves by any route other than `exit_group`: a trap does not unwind
-/// and a terminated Worker drops nothing. `dpkg` trapped out inside `openat`
-/// with no resume address, so `apt` sat on `read` waiting for an end-of-file
-/// that nothing was ever going to send, and an `apt-get update` deadlocked
-/// two processes in.
-///
-/// A real kernel closes a dead process's descriptors however it died. This is
-/// where that has to happen, because by then the process's own memory -- and
-/// the table in it -- belongs to a Worker that is gone.
+/// closing them does not strand a reader on a missing end-of-file. `Drop` and
+/// `exit_process` do not run when a guest leaves by a trap (which does not
+/// unwind), so a real kernel's "close descriptors however it died" has to
+/// happen here -- by then the process's own table belongs to a gone Worker.
 fn pipe_holders() -> &'static std::sync::Mutex<BTreeMap<i32, Vec<(i32, bool)>>> {
     note_panics();
     static HELD: OnceLock<std::sync::Mutex<BTreeMap<i32, Vec<(i32, bool)>>>> = OnceLock::new();
@@ -1491,20 +1212,8 @@ fn pipe_at(id: i32) -> Option<std::sync::Arc<gex_kernel::pipe::Pipe>> {
         .cloned()
 }
 
-/// Make a pipe with both ends open, both held by `pid`. Returns its id.
-///
-/// The holder record matters as much as the pipe. `k_pipe_forget` is the
-/// backstop for a process that leaves by a trap -- which does not unwind, so
-/// no `Drop` runs and no `close_end` is called -- and it can only release
-/// what `pipe_holders` knows about. This used to register nothing, so the two
-/// ends a process got from its own `pipe2` were precisely the case the
-/// backstop could not see: they stayed held for the life of the tab, the
-/// writer count never reached zero, and a reader on the far side waited for
-/// an end-of-file nobody would ever send. Ends taken by `fork` and `dup` were
-/// covered, because those go through `k_pipe_open_end`.
-///
-/// `Pipe::new` already starts each end at one reference, so this records the
-/// holder without touching the counts.
+/// Make a pipe with both ends open. Returns its id. `Pipe::new` starts each end
+/// at one reference.
 #[no_mangle]
 pub extern "C" fn k_pipe_new(pid: i32) -> i32 {
     let id = {
@@ -1512,37 +1221,15 @@ pub extern "C" fn k_pipe_new(pid: i32) -> i32 {
         t.push(std::sync::Arc::new(gex_kernel::pipe::Pipe::new()));
         (t.len() - 1) as i32
     };
-    // The holder registration that belongs here is disabled while it is
-    // under suspicion.
-    //
-    // Registering both ends makes `k_pipe_forget` release them at exit,
-    // which is behaviour that did not exist before and lands at exactly the
-    // moment `ls | cat` traps: "memory access out of bounds ... after
-    // syscall 94", and 94 is `exit_group`. That is a coincidence worth
-    // ruling out before anything is built on top of it, and this is the
-    // one-line way to rule it out. The pid stays in the signature so the
-    // ABI does not churn between the two runs being compared.
-    //
-    // If the trap survives this, the hole #143 describes is real and still
-    // wants closing -- but by then it is known not to be what breaks a
-    // pipeline. See tasks 143 and 146.
+    // Holder registration for these two ends is disabled while a trap after
+    // `exit_group` on `ls | cat` is ruled out; `pid` stays in the signature so
+    // the ABI does not churn. See tasks 143 and 146.
     let _ = pid;
     id
 }
 
-/// Another descriptor onto one end, as `dup` and `fork` both make.
-/// How many descriptors hold each end, `(readers << 16) | writers`.
-///
-/// For the stall census. A reader parked on a pipe with no writers left has
-/// missed an end-of-file; one parked on a pipe that still has a writer is
-/// waiting on that writer. The two look identical from the reader's side and
-/// have nothing in common as bugs.
-/// Short writes and refused writes, `(short << 16) | refused`. See
-/// `Pipe::write_stats`.
-/// How many writes have ever put bytes into this pipe. See
-/// `Pipe::write_totals`.
-/// The last message written to a pipe, into the caller's memory. See
-/// `Pipe::last_message`.
+/// The last message written to a pipe, into the caller's memory. A diagnostic;
+/// see `Pipe::last_message`.
 #[no_mangle]
 pub extern "C" fn k_pipe_last_message(id: i32, at: u32, cap: u32) -> i32 {
     let Some(p) = pipe_at(id) else { return -1 };
@@ -1598,12 +1285,9 @@ pub extern "C" fn k_pipe_close_end(id: i32, write: i32, pid: i32) {
     }
 }
 
-/// Write `len` bytes of the caller's memory into the pipe.
-///
-/// The bytes are copied out of the calling process's memory first, because
-/// this module cannot address it -- that copy is what makes the two ends able
-/// to live in different address spaces at all. Returns bytes written, or a
-/// negative errno.
+/// Write `len` bytes of the caller's memory into the pipe. The bytes are copied
+/// out first (this module cannot address the process's memory) -- which is what
+/// lets the two ends live in different address spaces. Returns bytes or -errno.
 #[no_mangle]
 pub extern "C" fn k_pipe_write(id: i32, at: u32, len: u32) -> i32 {
     let Some(p) = pipe_at(id) else { return -9 }; // EBADF
@@ -1647,12 +1331,8 @@ pub extern "C" fn k_pipe_buffered(id: i32) -> i32 {
     pipe_at(id).map_or(0, |p| p.buffered() as i32)
 }
 
-/// Copy `len` bytes of the calling process's memory in, and report their sum.
-///
-/// The shape every syscall taking a pointer will use: the argument names an
-/// address in a memory this module cannot dereference, so it is copied here
-/// first. Kept as a live check that the two-memory path works from inside the
-/// real kernel and not only from the toy one it replaced.
+/// Copy `len` bytes of the calling process's memory in, and report their sum. A
+/// live check that the two-memory pull path works.
 #[no_mangle]
 pub extern "C" fn k_checksum(at: u32, len: u32) -> u32 {
     let n = (len as usize).min(4096);
@@ -1667,16 +1347,11 @@ pub extern "C" fn k_checksum(at: u32, len: u32) -> u32 {
 
 // -- the filesystem ----------------------------------------------------------
 //
-// The third thing processes share, and the one without which the other two do
-// not help. A shell that unpacks a rootfs and forks hands its child an empty
-// root; the child's `execve` cannot find the program it was forked to run.
-// Under the switcher the child got the parent's whole address space and the
-// question never arose.
-//
-// So the files live here. Each process mounts a `RemoteFs` -- an id and
-// nothing else -- and every call arrives as an address in that process's
-// memory, which `gex-kmem` copies across. The layouts on the wire are in
-// `gex_kernel::vfs::remote`, written once and used by both sides.
+// Shared, so a forked child's `execve` can find its program -- under the
+// switcher the child inherited the parent's whole address space and the
+// question never arose. Each process mounts a `RemoteFs` (just an id); every
+// call arrives as an address `gex-kmem` copies across. Wire layouts are in
+// `gex_kernel::vfs::remote`.
 
 use gex_kernel::vfs::{remote, FileHandle, FileSystem};
 
@@ -1686,10 +1361,8 @@ fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
     static ROOT: OnceLock<std::sync::Arc<gex_kernel::vfs::TmpFs>> = OnceLock::new();
     ROOT.get_or_init(|| {
         let fs = gex_kernel::vfs::TmpFs::new();
-        // The directories a guest expects to be there before anything has
-        // been bundled. `/tmp` above all: a shell, a compiler and apt all
-        // write into it, and `open(O_CREAT)` under a directory that does not
-        // exist is `ENOENT` rather than a directory being made.
+        // Directories a guest expects before anything is bundled: `open(O_CREAT)`
+        // under a missing directory is `ENOENT`, not a directory being made.
         for d in ["/tmp", "/proc", "/dev", "/run", "/var", "/var/tmp"] {
             fs.add_dir(d);
         }
@@ -1697,11 +1370,8 @@ fn rootfs() -> &'static std::sync::Arc<gex_kernel::vfs::TmpFs> {
     })
 }
 
-/// Every file a process has open here, by id.
-///
-/// A `Vec` with holes rather than a map: an id is handed straight back to a
-/// process and used on every read, so the lookup is the hot part and the
-/// churn is not.
+/// Every file a process has open here, by id. A `Vec` with holes, not a map:
+/// lookup is the hot path, churn is not.
 type Handles = std::sync::Mutex<Vec<Option<std::sync::Arc<dyn FileHandle>>>>;
 fn handles() -> &'static Handles {
     note_panics();
@@ -1718,18 +1388,15 @@ fn handle_at(id: i32) -> Option<std::sync::Arc<dyn FileHandle>> {
         .flatten()
 }
 
-/// A path argument: copied out of the caller's memory, because this module
-/// cannot dereference an address in it.
+/// A path argument, copied out of the caller's memory (this module cannot
+/// dereference an address in it).
 fn path_of(at: u32, len: u32) -> String {
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
-    // Leading slashes go. A mount hands its filesystem a relative path and a
-    // host handing one in from outside naturally writes the absolute one, and
-    // `TmpFs` keys on the relative form -- so accepting both here is the
-    // difference between a bundle that is readable and one that is only
-    // writable.
+    // `TmpFs` keys on the relative form, so leading slashes go -- accept both an
+    // absolute path from the host and a relative one from a mount.
     String::from_utf8_lossy(&buf)
         .trim_start_matches('/')
         .to_string()
@@ -1757,8 +1424,7 @@ pub extern "C" fn k_fs_open(path: u32, path_len: u32, flags: u64, mode: u32) -> 
     match rootfs().open(&p, flags, mode) {
         Ok(h) => {
             let mut t = handles().lock().unwrap_or_else(|e| e.into_inner());
-            // The first free slot, so a process that opens and closes in a
-            // loop does not grow this without bound.
+            // First free slot, so an open/close loop does not grow this unbounded.
             match t.iter().position(|s| s.is_none()) {
                 Some(i) => {
                     t[i] = Some(h);
@@ -1774,23 +1440,11 @@ pub extern "C" fn k_fs_open(path: u32, path_len: u32, flags: u64, mode: u32) -> 
     }
 }
 
-/// A second id for one open file.
-///
-/// `fork` gives the child the parent's descriptors, and it used to do that by
-/// reopening each one by name. `dpkg-deb` builds its tar members in files it
-/// creates and unlinks immediately, so the child found nothing at the name,
-/// dropped the descriptor without saying so, and the first write in the
-/// compressing child came back `EBADF`:
-///
-/// ```text
-/// dpkg-deb (subprocess): compressing tar member:
-///   internal gzip write error: Bad file descriptor
-/// ```
-///
-/// Two ids onto one `Arc` is what a descriptor shared across a fork is: the
-/// file is the same file, and either side closing its own id leaves the
-/// other's alone. The offset is not shared -- it lives in each process's own
-/// file table -- which is where this stops short of what Linux does.
+/// A second id for one open file: two ids onto one `Arc`, which is what a
+/// descriptor shared across a `fork` is. Either side closing its own id leaves
+/// the other's alone. The offset is *not* shared (it lives in each process's
+/// file table), which is where this stops short of Linux. Reopening by name
+/// instead broke on files `dpkg-deb` creates and immediately unlinks.
 #[no_mangle]
 pub extern "C" fn k_fs_dup(handle: i32) -> i32 {
     let mut t = handles().lock().unwrap_or_else(|e| e.into_inner());
@@ -1944,21 +1598,10 @@ pub extern "C" fn k_fs_chmod(path: u32, path_len: u32, mode: u32) -> i32 {
     as_unit(rootfs().chmod(&path_of(path, path_len), mode))
 }
 
-/// A symlink's target is text, not a path.
-///
-/// `path_of` strips leading slashes, because a mount hands its filesystem a
-/// relative path -- right for the name being created, wrong for what the
-/// link says. `ln -s /var/cache/apt/archives/x.deb d/00-x.deb` stored
-/// `var/cache/apt/archives/x.deb`, which resolves against the link's own
-/// directory and reaches nothing:
-///
-///     lrwxrwxrwx 00-x.deb -> var/cache/apt/archives/x.deb
-///     ls: cannot access '/tmp/apt-dpkg-install-wiWg4U/00-x.deb'
-///
-/// which is where every `apt-get install` stopped. apt links the archives it
-/// downloaded into a temporary directory by absolute path and hands dpkg the
-/// directory; dpkg stats each name and reports "cannot stat pathname". The
-/// link was there and pointed at nothing.
+/// A symlink's target is text, not a path, so it uses `path_of_raw`: `path_of`
+/// strips leading slashes (right for the name being created, wrong for what an
+/// absolute-path target says, which would then resolve against the link's own
+/// directory and reach nothing).
 #[no_mangle]
 pub extern "C" fn k_fs_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
     as_unit(rootfs().symlink(&path_of_raw(target, target_len), &path_of(path, path_len)))
@@ -1969,24 +1612,17 @@ pub extern "C" fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i
     as_unit(rootfs().link(&path_of(from, from_len), &path_of(to, to_len)))
 }
 
-/// Put a socket node at a path, so the name can be *seen* as well as
-/// connected to.
-///
-/// Xvfb binds `/tmp/.X11-unix/X0`, and the script that starts it waits for
-/// that path to exist before it runs a client. Without the node the server
-/// was listening, the client was never started, and the run idled with three
-/// processes and nothing to say why.
+/// Put a socket node at a path, so the name can be *seen*, not only connected
+/// to: Xvfb binds `/tmp/.X11-unix/X0` and its start script waits for that path
+/// to exist before running a client.
 #[no_mangle]
 pub extern "C" fn k_fs_mksocket(path: u32, path_len: u32) -> i32 {
     rootfs().add_socket(&path_of(path, path_len));
     0
 }
 
-/// Put a file into the shared root before anything runs.
-///
-/// How a page's bundle gets in: it is the host's, not a guest's, and it
-/// arrives once rather than through a process that would then be the only one
-/// able to see it.
+/// Put a file into the shared root before anything runs -- how a page's bundle
+/// gets in, once, rather than through one process only it could then see.
 #[no_mangle]
 pub extern "C" fn k_fs_add(path: u32, path_len: u32, at: u32, len: u32) -> i32 {
     let p = path_of(path, path_len);
@@ -1998,10 +1634,8 @@ pub extern "C" fn k_fs_add(path: u32, path_len: u32, at: u32, len: u32) -> i32 {
     0
 }
 
-/// Whether the shared root has anything in it yet.
-///
-/// The first Worker fills it and the rest must not: they would each unpack
-/// the same rootfs over the top, at some cost and to no effect.
+/// Whether the shared root is filled yet, so only the first Worker unpacks the
+/// rootfs.
 #[no_mangle]
 pub extern "C" fn k_fs_populated() -> i32 {
     POPULATED.load(std::sync::atomic::Ordering::Acquire) as i32
@@ -2017,15 +1651,10 @@ static POPULATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 
 // -- unix sockets ------------------------------------------------------------
 //
-// The fourth thing processes share, and the one an X server and its client
-// are made of. A socket's two ends are by definition in two processes, and
-// with a Worker per process those are two memories -- so the name table one
-// binds in is invisible to the other. The gears demo sat at "listening on
-// /tmp/.X11-unix/X0, 0 waiting" forever, with the client in a third Worker
-// looking somewhere else entirely.
-//
-// Both ends live here instead, where they are local to each other, and the
-// implementation is `gex_kernel::unix` unchanged. Each process holds an id.
+// A socket's two ends are in two processes, so with a Worker per process the
+// name table one binds in would be invisible to the other. Both ends live here
+// instead, local to each other (`gex_kernel::unix` unchanged); each process
+// holds an id.
 
 use gex_kernel::unix::{SocketNames, UnixSocket};
 
@@ -2067,11 +1696,8 @@ fn keep(s: std::sync::Arc<UnixSocket>) -> i32 {
     }
 }
 
-/// Bind and listen in one. Returns a listener id, or a negated errno.
-///
-/// One call because a remote socket has no state between `bind` and `listen`
-/// worth modelling: what a guest does between them is local to its own
-/// process, and what the other end can see is only whether the name answers.
+/// Bind and listen in one: a remote socket has no state between `bind` and
+/// `listen` worth modelling. Returns a listener id, or a negated errno.
 #[no_mangle]
 pub extern "C" fn k_sock_bind(path: u32, path_len: u32) -> i32 {
     let p = path_of_raw(path, path_len);
@@ -2186,12 +1812,9 @@ pub extern "C" fn k_sock_exists(path: u32, path_len: u32) -> i32 {
     names().exists(&path_of_raw(path, path_len)) as i32
 }
 
-/// A path exactly as the caller wrote it.
-///
-/// Unlike a filesystem path, a socket name is compared for equality and never
-/// looked up, so the leading slash has to survive: a server that binds
-/// `/tmp/.X11-unix/X0` and a client that connects to the same string must
-/// agree, and trimming one of them would make two different names.
+/// A path exactly as the caller wrote it. A socket name is compared for
+/// equality, never looked up, so the leading slash must survive -- trimming one
+/// end's would make two different names.
 fn path_of_raw(at: u32, len: u32) -> String {
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
@@ -2202,19 +1825,13 @@ fn path_of_raw(at: u32, len: u32) -> String {
 
 // -- the GPU's session numbers -----------------------------------------------
 //
-// There is one renderer and one canvas, and every guest process that draws is
-// a client of it. The number identifying a client is the renderer's own
-// context id, so two processes must never pick the same one -- and each
-// process builds its own device object, so scanning a local table gave both
-// of them zero. What that looked like was two guests announcing "session 1"
-// and the renderer refusing the stream: a second client had claimed the
-// first's resources, which is corruption rather than contention.
-//
-// So the numbers come from here, where there is one of them.
+// One renderer, one canvas; every drawing process is a client of it. A client's
+// number is the renderer's own context id, so two processes must never pick the
+// same -- and a per-process table gave both zero. Allocated here, where there
+// is one of them.
 
 /// Which client numbers the renderer has out. Sixteen, matching the shim's
-/// `MAX_SESSIONS` -- the renderer keeps a fixed table, so a long run that
-/// opens and closes windows gives numbers back rather than counting upwards.
+/// `MAX_SESSIONS`; numbers are given back rather than counting upwards.
 static VIRGL_TAKEN: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
 
 /// Claim a session number, or -1 if the renderer has no room.

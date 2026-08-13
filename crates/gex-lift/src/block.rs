@@ -7,12 +7,8 @@ use gex_isa::decode;
 /// Bounds on how much a single block may cover.
 #[derive(Copy, Clone, Debug)]
 pub struct BlockLimits {
-    /// Stop and fall through after this many instructions.
-    ///
-    /// Long straight-line runs are split so that no single wasm function
-    /// becomes pathologically large, which matters both for engine
-    /// compilation time and for the per-module function-count budget
-    /// (PLAN §9).
+    /// Stop and fall through after this many instructions, so no single wasm
+    /// function grows pathologically large (PLAN §9).
     pub max_insts: usize,
 }
 
@@ -24,16 +20,14 @@ impl Default for BlockLimits {
 
 /// Lift the basic block starting at `start`.
 ///
-/// `fetch` returns the instruction word at a guest address, or `None` when the
-/// address is not backed by translatable memory. An unfetchable address ends
-/// the block with [`Term::Illegal`] rather than failing the build: correctness
-/// never depends on translation succeeding ahead of time (PLAN §6.1).
+/// `fetch` returns the instruction word at a guest address, or `None` when it
+/// is not backed by translatable memory; an unfetchable address ends the block
+/// with [`Term::Illegal`] rather than failing the build (PLAN §6.1).
 pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockLimits) -> Block {
     let mut builder = Builder::new(start);
     let mut pc = start;
     let mut term = None;
-    // A block is entered from somewhere this cannot see, so it starts
-    // knowing nothing about the flags. See `FlagSource`.
+    // A block's predecessor is unknown here, so the flags start unknown.
     let mut flags = FlagSource::Unknown;
 
     for _ in 0..limits.max_insts {
@@ -46,13 +40,9 @@ pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockL
         let mut lifter = Lifter::new(&mut builder).with_raw(raw).with_flags(flags);
         let flow = lifter.lift(&inst, pc);
         flags = lifter.flags();
-        // An instruction the backend has no wasm form for is undone and
-        // becomes a SIGILL here, where the preceding instructions have
-        // already run. Exhaustive discovery decodes literal pools and
-        // padding, so `sqadd v0.2d` -- which the architecture defines and
-        // wasm SIMD has no instruction for -- turns up in programs that would
-        // never execute it, and a panic in the backend would refuse to build
-        // them at all.
+        // An instruction with no wasm form is undone and becomes a SIGILL,
+        // rather than panicking the backend: exhaustive discovery lifts
+        // padding and literal pools a program would never execute.
         if builder.has_inexpressible(mark) {
             builder.rewind(mark);
             term = Some(Term::Illegal { raw, pc });
@@ -82,14 +72,9 @@ mod tests {
     use super::*;
     use gex_ir::{print, GuestReg, Stmt};
 
-    /// `cmp x0, x1` followed by `b.<cc>`, for every condition the fusion
-    /// claims to handle.
-    ///
-    /// The check is that nothing reads N, Z, C or V afterwards: the branch
-    /// asks about x0 and x1 directly, so the four flag writes are dead and
-    /// the passes can take the overflow algebra with them. MI, PL, VS and VC
-    /// are absent on purpose -- they ask about the difference rather than an
-    /// ordering, and still go the long way.
+    /// `cmp x0, x1` then `b.<cc>`: nothing should read N/Z/C/V afterwards,
+    /// since the branch asks about x0 and x1 directly. MI, PL, VS and VC are
+    /// absent on purpose -- they have no direct form (see `cond_direct`).
     #[test]
     fn compare_and_branch_does_not_read_the_flags() {
         for cc in [

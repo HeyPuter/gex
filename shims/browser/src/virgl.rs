@@ -1,34 +1,15 @@
 //! A virtio-gpu renderer in a browser tab.
 //!
-//! The same device the native host provides, and deliberately the same
-//! protocol: the guest runs Debian's own Mesa with its Gallium `virgl`
-//! driver, which connects to a UNIX socket and speaks vtest over it. Nothing
-//! in the guest knows which side is listening, or that it is a web page.
+//! Same protocol as the native device: the guest runs Debian's own Mesa Gallium
+//! `virgl` driver, which connects to a UNIX socket and speaks vtest. Here the
+//! other end is libvirglrenderer compiled to wasm, replaying the stream onto a
+//! WebGL 2 context (`web/build-virgl-wasm.sh` builds it, `web/src/virgl.js` is
+//! the page side). The guest must negotiate with the renderer that will serve
+//! it -- WebGL 2 offers only capset version 1 (308 bytes) against native's
+//! version 2 (5,508) -- so a recorded stream cannot substitute for this.
 //!
-//! Natively the other end is the host's libvirglrenderer on the host's real
-//! OpenGL. Here it is the same renderer compiled to WebAssembly, replaying
-//! the same stream onto a WebGL 2 context -- `web/build-virgl-wasm.sh` builds
-//! it and `web/src/virgl.js` is the page's side.
-//!
-//! # Why this is the only way to know whether it works
-//!
-//! A recorded stream can be replayed into the browser renderer, and that
-//! proves the transport, the framing and the dispatch. It cannot prove a
-//! picture, and no recording ever will: the guest's Mesa asks what the host
-//! can do before it does anything, and every shader, format and draw follows
-//! from the answer. Natively the answer is capability set version 2, 5,508
-//! bytes of it; WebGL 2 can offer only version 1, 308 bytes. A stream
-//! recorded against one is not a valid input to the other, whichever host API
-//! was used -- forcing the native side onto GLES does not change the capset
-//! version. So the guest has to negotiate with the renderer that will serve
-//! it, which means this file.
-//!
-//! # Shape
-//!
-//! The compositor's, and for the same reason: a client writes a request and
-//! then waits for the reply, and the write is a syscall, so the pump has to
-//! run between the syscall that sends and the one that waits. A guest blocked
-//! with nobody servicing its socket is a guest that never wakes.
+//! Pump between the send syscall and the wait: a guest blocked with nobody
+//! servicing its socket never wakes.
 
 use gex_kernel::unix::{HostListener, UnixSocket};
 use std::sync::{Arc, Mutex};
@@ -45,12 +26,9 @@ extern "C" {
     fn virgl_close(session: u32);
 }
 
-/// Set when the page said it brought a renderer.
-///
-/// Off by default. A guest that connects to a socket nobody serves is worse
-/// off than one that finds no socket at all: Mesa's vtest winsys does not
-/// fall back, it writes its handshake into the dead descriptor and then
-/// blocks reading a reply that cannot come.
+/// Set when the page said it brought a renderer. Off by default: Mesa's vtest
+/// winsys does not fall back, so a socket nobody serves leaves it blocked
+/// reading a reply that cannot come -- worse than finding no socket at all.
 static mut HAVE_VIRGL: bool = false;
 
 /// Say that the page has a renderer behind the imports above.
@@ -79,26 +57,16 @@ pub const DEFAULT_SOCKET: &str = "/tmp/.virgl_test";
 const MAX_SESSIONS: usize = 16;
 
 struct Session {
-    /// Which of the renderer's clients this is.
-    ///
-    /// Each one has its own vtest context, its own resource handles and its
-    /// own stream, and the renderer keeps them apart by this number. They
-    /// used to share one of each, which held up for exactly as long as there
-    /// was one client: the second's `CREATE_RENDERER` arrived at a renderer
-    /// that already had a context, was refused as an unknown command, and
-    /// took the stream down with it. Nothing said so -- the guest simply
-    /// waited for a reply for ever.
+    /// Which of the renderer's clients this is: its own vtest context, resource
+    /// handles and stream, kept apart by this number. Sharing one across clients
+    /// took the whole stream down when the second's `CREATE_RENDERER` hit a
+    /// renderer that already had a context.
     id: u32,
     socket: Arc<UnixSocket>,
-    /// Reply bytes the guest's socket had no room for yet, and how much of
-    /// them has gone.
-    ///
-    /// A UNIX socket holds 256 KB and a vtest reply can be larger: reading
-    /// back a 300x300 framebuffer is 360,000 bytes in one `TRANSFER_GET`.
-    /// The native device dropped that remainder once, and what it looked like
-    /// was not an error -- Mesa read what arrived and blocked forever waiting
-    /// for the rest, so glxgears drew exactly one frame and stopped with
-    /// every component reporting success.
+    /// Reply bytes the guest's socket had no room for yet, and how many have
+    /// gone. A vtest reply can exceed the socket's 256 KB (a 300x300
+    /// `TRANSFER_GET` read-back is 360,000 bytes); dropping the remainder does
+    /// not fail, it leaves Mesa blocked forever waiting for the rest.
     out: Vec<u8>,
     sent: usize,
 }
@@ -131,11 +99,8 @@ impl VirglDevice {
         VirglDevice::default()
     }
 
-    /// Narrate a pump, when `gex_set_virgl(2)` asked for it.
-    ///
-    /// Through the same import the guest's output uses, because in a page
-    /// that is the only channel there is -- and a pump that never produces
-    /// anything is indistinguishable from a pump that never runs.
+    /// Narrate a pump, when `gex_set_virgl(2)` asked for it. Through stderr
+    /// because in a page that is the only channel there is.
     fn trace(text: &str) {
         if unsafe { HAVE_VIRGL } {
             // SAFETY: the one thread a page has, and `write` only reads.
@@ -145,10 +110,8 @@ impl VirglDevice {
 
     /// Move bytes in both directions for every client.
     pub fn pump(&self) {
-        // Counted, and reported on a curve, because the two failures this has
-        // to tell apart are "never ran" and "ran a million times without
-        // getting anywhere" -- and a trace that only prints when there are
-        // bytes to move cannot distinguish them.
+        // Reported on a curve to tell "never ran" from "ran a million times
+        // without getting anywhere".
         if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -239,10 +202,8 @@ impl HostListener for VirglDevice {
     fn accept(&self, peer: Arc<UnixSocket>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.accepted += 1;
-        // From the global kernel when there is one: the number is the
-        // renderer's own context id, there is one renderer, and every drawing
-        // process is a client of it. A table each process keeps for itself
-        // gave two of them zero.
+        // From the global kernel: the number is the renderer's own context id,
+        // shared across processes. A per-process table gave two of them zero.
         let shared = crate::virgl_take_session();
         let picked = if shared >= 0 {
             Some(shared as usize)
@@ -250,18 +211,15 @@ impl HostListener for VirglDevice {
             (0..MAX_SESSIONS).find(|&i| !inner.taken[i])
         };
         let Some(id) = picked else {
-            // Refused out loud. A client given a number already in use would
-            // render into another program's resources, which looks like
-            // corruption rather than like being turned away.
+            // Refused rather than given a number in use: a collision renders
+            // into another program's resources, which looks like corruption.
             Self::trace("[virgl] no free session: refusing a client\n");
             return;
         };
         inner.taken[id] = true;
-        // Said out loud, and not only under the verbose flag. This is the
-        // moment the guest's Mesa finds the GPU, and it is the one event that
-        // separates "still translating libGL" from "talking to the renderer"
-        // -- which is a distinction that cost a day of watching a pump report
-        // zero sessions with nothing to say why.
+        // Not only under the verbose flag: this is the moment Mesa finds the
+        // GPU, which separates "still translating libGL" from "talking to the
+        // renderer".
         Self::trace(&format!(
             "[virgl] a guest connected: session {}\n",
             inner.accepted

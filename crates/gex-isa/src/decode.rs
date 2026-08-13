@@ -1,10 +1,7 @@
 //! The A64 decoder.
 //!
-//! Dispatch follows the encoding-group tree in the Arm ARM (section C4.1):
-//! bits `[28:25]` select the top-level group, then each group is discriminated
-//! by exact bit tests. Tests are written as explicit mask/value comparisons
-//! rather than nested matches so they can be checked line-by-line against the
-//! manual.
+//! Dispatch follows the Arm ARM encoding-group tree (C4.1): bits `[28:25]`
+//! select the top-level group, then exact bit tests within each.
 
 use crate::*;
 
@@ -717,9 +714,7 @@ fn decode_load_store(raw: u32, pc: u64) -> Inst {
             addr: pc.wrapping_add(off as u64),
         };
         if v == 1 {
-            // A float constant fetched from the pool the compiler puts next
-            // to the code. Every arrangement is a plain load of 4, 8 or 16
-            // bytes into a vector register; only the reserved size is not.
+            // Literal load of 4, 8 or 16 bytes into a vector register.
             let bytes = match opc {
                 0b00 => 4,
                 0b01 => 8,
@@ -798,10 +793,8 @@ fn decode_load_store(raw: u32, pc: u64) -> Inst {
     Inst::Unknown { raw }
 }
 
-/// `ld1`/`st1` (multiple structures), with and without post-index.
-///
-/// The interleaving variants (`ld2`/`ld3`/`ld4`) share this space but permute
-/// lanes as they go, so only the `ld1`/`st1` opcodes are accepted here.
+/// `ld1`/`st1` (multiple structures), plus the interleaving `ld2`/`ld3`/`ld4`
+/// forms, which share this space and are lowered separately.
 fn decode_simd_ldst_multi(raw: u32) -> Inst {
     let q = bit(raw, 30) == 1;
     let post_index = bit(raw, 23) == 1;
@@ -809,12 +802,8 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
     let rm = bits(raw, 20, 16);
     let opcode = bits(raw, 15, 12);
 
-    // The register count is encoded in the opcode rather than as a field.
-    // `ld2`/`st2` (opcode 1000) also live here but interleave, so they get
-    // their own instruction below.
-    // Non-interleaving `ld1`/`st1` in one to four registers, plus the
-    // interleaving forms, which are reported as zero and named separately
-    // below because they lower differently.
+    // Register count is in the opcode. The interleaving forms report zero
+    // registers here and are named separately below.
     let regs: u8 = match opcode {
         0b0111 => 1,
         0b1010 => 2,
@@ -837,12 +826,9 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
     let bytes = if q { 16 } else { 8 };
     let rn = RegSel::sp(bits(raw, 9, 5));
     let addr = if post_index {
-        // Rm == 31 means the immediate form: advance by the total size.
-        // Anything else is a register holding the stride, which Mesa's pixel
-        // loops use because an image row is not a compile-time constant.
+        // Rm == 31 is the immediate form (advance by the total size); any
+        // other register holds the stride.
         if rm == 0b11111 {
-            // The interleaving forms report zero registers but move as many
-            // as they name.
             let off = (if regs == 0 {
                 interleave as i64
             } else {
@@ -896,10 +882,8 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
     }
 }
 
-/// `ld1`/`st1` on one lane, and `ld1r`.
-///
-/// The lane index is scattered across Q, S and `size` in a way that depends on
-/// the element width, because a byte arrangement has sixteen lanes to name.
+/// `ld1`/`st1` on one lane, and `ld1r`. The lane index is scattered across Q,
+/// S and `size`, differently per element width.
 fn decode_simd_ldst_single(raw: u32) -> Inst {
     let q = bit(raw, 30) == 1;
     let post_index = bit(raw, 23) == 1;
@@ -928,8 +912,8 @@ fn decode_simd_ldst_single(raw: u32) -> Inst {
     }
     let rn = RegSel::sp(bits(raw, 9, 5));
     let addr = if post_index {
-        // Rm == 31 is the immediate form, advancing by exactly the element
-        // just transferred; any other register holds the amount.
+        // Rm == 31 is the immediate form (advance by the element size); any
+        // other register holds the amount.
         if rm == 0b11111 {
             AddrMode::PostIndex {
                 rn,
@@ -956,8 +940,7 @@ fn decode_simd_ldst_single(raw: u32) -> Inst {
 }
 
 /// Interpret the `size`/`opc` pair shared by the register load/store forms.
-///
-/// Returns `None` for SIMD&FP variants and reserved combinations.
+/// Returns `None` for reserved combinations.
 enum LdSt {
     Load {
         sz: MemSz,
@@ -1330,16 +1313,15 @@ fn decode_atomic_memop(raw: u32) -> Inst {
 }
 
 // ---------------------------------------------------------------------------
-// SIMD & FP — decoded as Unknown until the NEON milestone (PLAN M2).
+// SIMD & FP
 // ---------------------------------------------------------------------------
 
 fn decode_simd_fp(raw: u32) -> Inst {
     let q = bit(raw, 30) == 1;
     let u = bit(raw, 29);
 
-    // Advanced SIMD copy: 0 Q op 01110000 imm5 0 imm4 1 Rn Rd, and its
-    // scalar sibling, which differs only in bit 28 and takes the single-lane
-    // `dup` out of it.
+    // Advanced SIMD copy: 0 Q op 01110000 imm5 0 imm4 1 Rn Rd, and its scalar
+    // sibling (bit 28 set).
     if bit(raw, 31) == 0
         && bits(raw, 27, 21) == 0b111_0000
         && bit(raw, 15) == 0
@@ -1359,16 +1341,11 @@ fn decode_simd_fp(raw: u32) -> Inst {
     {
         let cmode = bits(raw, 15, 12);
         let imm8 = (bits(raw, 18, 16) << 5) | bits(raw, 9, 5);
-        // An odd `cmode` below 1100 is not a move at all: it reads the
-        // destination and combines the immediate into it. `orr` for op=0 and
-        // `bic` for op=1. This is checked before the move expansion, which
-        // has its own idea of what an inverted immediate means and rejects
-        // these outright.
+        // An odd `cmode` below 1100 is `orr`/`bic` with the immediate, not a
+        // move: it reads the destination. Checked before the move expansion,
+        // which rejects these.
         if cmode & 1 == 1 && cmode < 0b1100 {
-            // The immediate expands exactly as the move one bit below does:
-            // `cmode` 0xx1 is the 32-bit-lane shifted form, 10x1 the
-            // 16-bit-lane one. Asking for the odd `cmode` itself gets
-            // nothing, because the expander only knows the move encodings.
+            // The immediate expands as the move one `cmode` bit below does.
             let Some(plain) = expand_simd_immediate(imm8, cmode & !1, false, q) else {
                 return Inst::Unknown { raw };
             };
@@ -1397,8 +1374,7 @@ fn decode_simd_fp(raw: u32) -> Inst {
     }
 
     // Advanced SIMD vector x indexed element: 0 Q U 01111 size L M Rm opcode
-    // H 0 Rn Rd. Bit 10 is what separates it from the shift-by-immediate and
-    // modified-immediate groups above, which both set it.
+    // H 0 Rn Rd. Bit 10 clear separates it from the two groups above.
     if bit(raw, 31) == 0 && bits(raw, 28, 24) == 0b01111 && bit(raw, 10) == 0 {
         if let Some(inst) = decode_simd_by_element(raw, q, u) {
             return inst;
@@ -1414,8 +1390,7 @@ fn decode_simd_fp(raw: u32) -> Inst {
     }
 
     // Advanced SIMD three different: 0 Q U 01110 size 1 Rm opcode 00 Rn Rd.
-    // Bits 11:10 being zero is what marks it out from the three-same group,
-    // which shares everything above them.
+    // Bits 11:10 zero marks it out from the three-same group.
     if bit(raw, 31) == 0
         && bits(raw, 28, 24) == 0b01110
         && bit(raw, 21) == 1
@@ -1437,12 +1412,9 @@ fn decode_simd_fp(raw: u32) -> Inst {
             && bit(raw, 10) == 0
         {
             let index = bits(raw, 14, 11);
-            // With Q clear the window is eight bytes wide, so the top bit of
-            // imm4 must be zero; the architecture leaves the rest undefined.
-            // Exhaustive discovery decodes literal pools and padding, so this
-            // does come up -- and an out-of-range window would become an
-            // `i8x16.shuffle` whose lane indices exceed 31, which V8 rejects
-            // when it compiles the *module*, poisoning code that is never run.
+            // With Q clear the window is 8 bytes, so imm4's top bit must be
+            // zero. An out-of-range window would lower to an i8x16.shuffle V8
+            // rejects at module-compile time, poisoning code never run.
             if !q && index >= 8 {
                 return Inst::Undefined { raw };
             }
@@ -1511,12 +1483,9 @@ fn decode_simd_fp(raw: u32) -> Inst {
         }
     }
 
-    // Scalar Advanced SIMD. Bit 30 is what separates it from scalar floating
-    // point, which shares the `11110` group: the SIMD forms set it, the
-    // floating-point ones clear it. The group is matched only down to bit 25,
-    // because the shift-by-immediate forms sit at `11111` rather than
-    // `11110` -- testing bit 24 here would hide the whole family, which is
-    // what made `shl d1, d1, #52` undecodable.
+    // Scalar Advanced SIMD. Bit 30 separates it from scalar floating point,
+    // which shares the group. Matched only down to bit 25: the shift-by-imm
+    // forms sit at `11111`, so testing bit 24 would hide them.
     if bit(raw, 31) == 0 && bit(raw, 30) == 1 && bits(raw, 28, 25) == 0b1111 {
         if let Some(inst) = decode_simd_scalar(raw, u) {
             return inst;
@@ -1526,12 +1495,9 @@ fn decode_simd_fp(raw: u32) -> Inst {
     decode_scalar_fp(raw)
 }
 
-/// The scalar members of the Advanced SIMD families.
-///
-/// Every one operates on lane 0 and zeroes the rest of the register, so they
-/// reuse the vector decoders with a scalar arrangement and the lifter masks
-/// the result. Returning `None` falls through to the floating-point decoder
-/// rather than claiming an encoding this does not model.
+/// The scalar members of the Advanced SIMD families. Each operates on lane 0,
+/// so they reuse the vector decoders with a scalar arrangement. `None` falls
+/// through to the floating-point decoder.
 fn decode_simd_scalar(raw: u32, u: u32) -> Option<Inst> {
     let scalarise = |mut inst: Inst| -> Inst {
         match &mut inst {
@@ -1722,10 +1688,8 @@ fn decode_simd_copy(raw: u32, q: bool, u: u32, scalar: bool) -> Inst {
 }
 
 /// The three-different group, whose results are twice as wide as its inputs.
-///
-/// `Q` here does not select the register width -- the destination is always
-/// 128 bits -- but which half of the narrow sources is read, which is the `2`
-/// suffix in the assembly.
+/// `Q` selects which half of the narrow sources is read (the `2` suffix), not
+/// the register width; the destination is always 128 bits.
 fn decode_simd_three_different(raw: u32, q: bool, u: u32) -> Option<Inst> {
     let op = match bits(raw, 15, 12) {
         0b0000 => VWidenOp::AddL,
@@ -1738,9 +1702,7 @@ fn decode_simd_three_different(raw: u32, q: bool, u: u32) -> Option<Inst> {
         0b1010 => VWidenOp::MlsL,
         0b1100 => VWidenOp::MulL,
         // The narrowing forms: two vectors of one width giving one of half
-        // that width, keeping the top halves of the results. glibc's `strlen`
-        // folds a byte mask to a scalar with `addhn`, so a dynamic glibc
-        // program reaches this before it reaches `main`.
+        // that width, keeping the top halves of the results.
         0b0100 | 0b0110 => {
             let narrow = match (bits(raw, 15, 12), u) {
                 (0b0100, 0) => VNarrowOp::AddHn,
@@ -1759,9 +1721,8 @@ fn decode_simd_three_different(raw: u32, q: bool, u: u32) -> Option<Inst> {
             return Some(Inst::VNarrow {
                 op: narrow,
                 dst_bytes,
-                // `Q` names which half of the destination is written, not the
-                // width of anything: `addhn2` fills the top and leaves the
-                // bottom as it was.
+                // `Q` names which half of the destination is written
+                // (`addhn2` fills the top, leaving the bottom).
                 upper: q,
                 vd: VReg(bits(raw, 4, 0) as u8),
                 vn: VReg(bits(raw, 9, 5) as u8),
@@ -1943,13 +1904,9 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
     let vd = VReg(bits(raw, 4, 0) as u8);
     let vn = VReg(bits(raw, 9, 5) as u8);
 
-    // Bit 23 belongs to `size` for the integer members of this group, so the
-    // floating-point half has to be picked out by opcode: everything at or
-    // above 0b11000, plus the compare-with-zero and sign block when bit 23
-    // marks it as the second size pair. `rev64 v0.4s` has size = 10 and would
-    // be misread as floating point by a bit-23 test alone.
-    // `fcvtl`/`fcvtn` change the lane width, so they cannot share the
-    // same-shape lowering the rest of this group uses.
+    // Bit 23 is part of `size` for the integer members, so the FP half is
+    // picked out by opcode instead: a bit-23 test alone misreads `rev64
+    // v0.4s`. `fcvtl`/`fcvtn` change lane width and are split out first.
     if u == 0 && matches!(opcode, 0b10110 | 0b10111) {
         return Inst::VFpCvtPrecision {
             widen: opcode == 0b10111,
@@ -2036,16 +1993,10 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
         (0b10100, _) => VOp2::UqXtn,
         _ => return Inst::Unknown { raw },
     };
-    // The reverse family reverses elements *inside* a group of a fixed width,
-    // so an element at least as wide as its group is not an instruction. The
-    // architecture reserves those encodings; `rev16 v0.4s` does not exist.
-    //
-    // Worth rejecting properly rather than letting the lifter cope, because
-    // the lifter did not: it computes `group / lane_bytes - 1` and that
-    // underflows, giving a byte permutation with lane indices of 248. wasm
-    // rejects the whole module for one of those, so a reserved encoding in the
-    // middle of a library nothing executes made the library unloadable.
-    // Exhaustive translation of libhogweed found it; nothing runs it.
+    // The reverse family reverses elements within a fixed-width group, so an
+    // element at least as wide as its group is reserved (`rev16 v0.4s` does
+    // not exist). Rejected here because the lifter's `group / lane_bytes - 1`
+    // underflows into a shuffle wasm rejects at module-compile time.
     let group = match op {
         VOp2::Rev16 => 2,
         VOp2::Rev32 => 4,
@@ -2182,10 +2133,8 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
     } else {
         (2 * esize).wrapping_sub(imm)
     };
-    // A left shift can move by at most one less than the element width; a
-    // right shift may move by the whole of it, which for the narrowing forms
-    // is the common case -- `shrn v0.2s, v0.2d, #32` takes the top half of
-    // each doubleword, and rejecting it made apt's hash table unreachable.
+    // A left shift moves by at most element width minus one; a right shift
+    // may move by the whole width (the narrowing forms need it).
     if (left && shift >= esize) || (!left && shift > esize) {
         return Inst::Undefined { raw };
     }
@@ -2203,19 +2152,8 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
     }
 }
 
-/// Scalar floating-point.
-///
-/// Only single and double precision are decoded; half precision needs
-/// FEAT_FP16, which the guest is told it does not have. Discrimination
-/// follows the Arm ARM tables C4-25 onwards: the `11111` sub-group is
-/// multiply-add, and within `11110` bits `[11:10]` choose the family, with
-/// integer conversion recognised first because it is the only member whose
-/// bit 31 is `sf` rather than a fixed zero.
-/// The by-element multiply family.
-///
-/// The lane index is spread across three fields and assembled differently for
-/// each element width, because a 16-bit arrangement has eight lanes to address
-/// and only five register bits to spare.
+/// The by-element multiply family. The lane index is spread across three
+/// fields and assembled differently for each element width.
 fn decode_simd_by_element(raw: u32, q: bool, u: u32) -> Option<Inst> {
     let opcode = bits(raw, 15, 12);
     let float = matches!(opcode, 0b0001 | 0b0101 | 0b1001);
@@ -2375,9 +2313,7 @@ fn decode_scalar_fp(raw: u32) -> Inst {
 }
 
 /// Decode an `imm5` lane specifier into `(lane size in bytes, lane index)`.
-///
-/// The lowest set bit selects the element width and the bits above it are
-/// the index, so a wider element simply consumes more of the field.
+/// The lowest set bit selects the element width; the bits above it are the index.
 fn decode_lane(imm5: u32) -> Option<(u32, u32)> {
     if imm5 & 1 != 0 {
         Some((1, (imm5 >> 1) & 0xf))
@@ -2427,10 +2363,8 @@ fn decode_fp_one_source(raw: u32, sz: FpSz, vd: VReg, vn: VReg) -> Inst {
         0b001010 => FpOp1::RoundMinus,
         0b001011 => FpOp1::RoundZero,
         0b001100 => FpOp1::RoundAway,
-        // FRINTX and FRINTI honour the FPCR rounding mode and FRINTX also
-        // reports inexact. gex tracks neither in fast mode (PLAN §5.7), so
-        // both behave as round-to-nearest — but they keep their own
-        // identities so the disassembler stays faithful.
+        // FRINTX/FRINTI honour the FPCR mode (and FRINTX reports inexact),
+        // which gex does not track; kept distinct for the disassembler.
         0b001110 => FpOp1::RoundExact,
         0b001111 => FpOp1::RoundCurrent,
         _ => return Inst::Unknown { raw },
@@ -2466,11 +2400,8 @@ fn decode_fp_madd(raw: u32) -> Inst {
     }
 }
 
-/// Conversion between a floating-point register and a *fixed-point* integer.
-///
-/// The same opcodes as the integer forms with bit 21 clear, plus a scale
-/// field: the integer is read (or written) as a value with `64 - scale`
-/// fractional bits, so `scvtf d0, w0, #2` divides by four.
+/// Conversion between a floating-point register and a *fixed-point* integer:
+/// the integer scaled by `64 - scale` fractional bits.
 fn decode_fp_fixed_convert(raw: u32, sz: Option<FpSz>) -> Inst {
     let Some(sz) = sz else {
         return Inst::Unknown { raw };
@@ -2611,10 +2542,7 @@ fn expand_fp_immediate(imm8: u32, sz: FpSz) -> u64 {
 }
 
 /// `AdvSIMDExpandImm`: turn `imm8` and `cmode` into the full register value.
-///
-/// Returns `None` for the encodings gex does not model yet (the
-/// floating-point forms), which keeps the mapping honest rather than
-/// approximate.
+/// Returns `None` for the odd `cmode` orr/bic forms, which the caller handles.
 fn expand_simd_immediate(imm8: u32, cmode: u32, op: bool, q: bool) -> Option<u128> {
     let imm8 = imm8 as u64;
     let lane: u64;

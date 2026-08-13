@@ -2,10 +2,9 @@
 //!
 //!     cargo run -p gex-ld --example dump-relocs -- <elf>...
 //!
-//! Prints the `STT_GNU_IFUNC` symbols and the named GOT slots, which together
-//! are how `gex_xlate::intrinsic` finds a `memcpy` that has no address until
-//! the dynamic linker has run. Written to answer "is this matching anything
-//! at all on a real Debian library", where the answer was no.
+//! Prints the `STT_GNU_IFUNC` symbols and named GOT slots, which is how
+//! `gex_xlate::intrinsic` finds a `memcpy` that has no address until the
+//! dynamic linker has run.
 
 fn main() {
     for path in std::env::args().skip(1) {

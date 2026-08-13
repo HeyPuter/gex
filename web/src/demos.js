@@ -1,8 +1,5 @@
-// The demos.
-//
-// Each is an object with an `enter(ctx)` that owns the terminal until the
-// next one is chosen. `ctx` carries the page's chrome -- the terminal, the
-// overlay, the status line -- so a demo never touches the DOM itself.
+// The demos. Each has an `enter(ctx)` that owns the terminal until the next is
+// chosen; `ctx` carries the page's chrome so a demo never touches the DOM.
 
 const running = (on) => window.dispatchEvent(new CustomEvent('gex:running', { detail: on }));
 
@@ -13,20 +10,8 @@ function rule(ctx, label) {
 }
 
 
-/**
- * A demo that failed, said as loudly as this page can say anything.
- *
- * Every one of these used to write `e.message` to the terminal and nothing
- * else: one line, no stack, no cause, and no way to tell a wasm trap from a
- * fetch that answered with a web page. The console got nothing at all,
- * because the only console line on the failure path was behind `?debug=1` --
- * so a report of "it crashes with an install fail" could not be acted on, and
- * the run that produced it could not be reproduced from what it printed.
- *
- * The console gets the error object itself, so devtools can expand it and the
- * stack is real rather than a string. The terminal gets the message and the
- * top of the stack, because the terminal is what a person is looking at.
- */
+// A demo that failed. The console gets the error object itself so devtools can
+// expand a real stack; the terminal gets the message and the top of the stack.
 function failed(ctx, e) {
   const msg = e?.message ?? String(e);
   console.error('[gex] the demo failed:', e);
@@ -156,23 +141,20 @@ async function boot(ctx) {
   try {
     const tree = await ctx.rootfs('/rootfs/busybox.tar');
     const files = { ...tree.files };
-    // The applet links are the whole of what makes a BusyBox rootfs a
-    // userspace: one binary answering to eighty names.
+    // A symlink becomes a copy of the target's bytes, and the mode must travel
+    // with them: without it `/bin/sh` (a symlink to dash) has no execute bit
+    // and dpkg reports "not found in PATH or not executable".
     for (const [path, target] of Object.entries(tree.links)) {
       const abs = target.startsWith('/')
         ? target
         : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
-      // The mode travels with the bytes. A symlink materialised as a copy
-      // has no tar entry of its own, so it had no mode -- and `/bin/sh` is a
-      // symlink to dash, which is exactly the program dpkg reported as
-      // "not found in PATH or not executable".
       if (files[abs]) {
         files[path] = files[abs];
         if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
       }
     }
-    // Hard links resolve against the root of the archive, not against the
-    // directory the link is in. `/usr/bin/perl` is one.
+    // Hard links resolve against the root of the archive, not the link's
+    // directory. `/usr/bin/perl` is one.
     for (const [path, target] of Object.entries(tree.hard ?? {})) {
       if (files[target]) {
         files[path] = files[target];
@@ -181,19 +163,13 @@ async function boot(ctx) {
     }
     const elf = files['/bin/busybox'];
     if (!elf) throw new Error('the rootfs has no /bin/busybox');
-    // `?cmd=` runs one line and exits, rather than opening a shell -- the
-    // same contract the Debian demo has, and what the test harness drives
-    // every measured case through.
+    // `?cmd=` runs one line and exits instead of opening a shell -- what the
+    // test harness drives every measured case through.
     const bbCmd = new URLSearchParams(location.search).get('cmd');
     if (bbCmd) files['/cmd.sh'] = new TextEncoder().encode(`${bbCmd}\n`);
-    // Statically recompiled, when a closure has been built for it.
-    //
-    // busybox is `static-pie` linked, so this demo is the only one that runs
-    // a program with no dynamic linker and no shared libc -- and that makes
-    // it the control the Debian demo cannot be. Everything else is the same:
-    // the same shim, the same fork, the same dispatch and the same exhaustive
-    // recompilation. What differs is `ld.so`, so what the two costs differ by
-    // is `ld.so`.
+    // busybox is `static-pie` linked, so this is the only demo that runs with no
+    // dynamic linker and no shared libc -- the control the Debian demo cannot
+    // be, differing from it only by `ld.so`.
     ctx.busy('loading the closure');
     const { loadClosure } = await import('./closure.js');
     const wantClosure = new URLSearchParams(location.search).get('closure') !== '0';
@@ -204,8 +180,7 @@ async function boot(ctx) {
         log: (m) => console.debug(`[gex] ${m}`),
       });
     } catch (e) {
-      // A rootfs with no closure built for it is the ordinary case for this
-      // demo and always has been: it runs on the translator alone.
+      // No closure is the ordinary case; the demo runs on the translator alone.
       console.debug(`[gex] no busybox closure: ${e.message}`);
     }
     ctx.idle();
@@ -221,10 +196,8 @@ async function boot(ctx) {
       modes: tree.modes,
       args: bbCmd ? ['/bin/sh', '/cmd.sh'] : ['/bin/sh', '-i'],
       cwd: '/root',
-      // The terminal is an xterm and has been all along; nothing said so, and
-      // a shell with no `TERM` assumes a glass teletype. BusyBox carries no
-      // terminfo, so this buys the ANSI its applets emit unconditionally
-      // rather than a curses lookup -- but it is still what the terminal is.
+      // The terminal is an xterm; a shell with no `TERM` assumes a glass
+      // teletype.
       env: ['TERM=xterm-256color', 'PATH=/bin:/usr/bin:/sbin:/usr/sbin', 'HOME=/root'],
       tty: true,
       closure,
@@ -271,9 +244,8 @@ const debian = {
 };
 
 const WISP_KEY = 'gex.wisp';
-// `?wisp=ws://…` ahead of what was typed in, so a link can carry a proxy and
-// a harness can hand one over. Typing it into a prompt is fine for a person
-// and is exactly what nothing else can do.
+// `?wisp=ws://…` takes precedence over what was typed in, so a link or harness
+// can carry a proxy.
 const wispUrl = () =>
   new URLSearchParams(location.search).get('wisp') || localStorage.getItem(WISP_KEY) || '';
 
@@ -299,17 +271,15 @@ async function bootDebian(ctx) {
       const abs = target.startsWith('/')
         ? target
         : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
-      // The mode travels with the bytes. A symlink materialised as a copy
-      // has no tar entry of its own, so it had no mode -- and `/bin/sh` is a
-      // symlink to dash, which is exactly the program dpkg reported as
-      // "not found in PATH or not executable".
+      // A symlink becomes a copy; the mode must travel with the bytes or
+      // `/bin/sh` (a symlink to dash) loses its execute bit.
       if (files[abs]) {
         files[path] = files[abs];
         if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
       }
     }
-    // Hard links resolve against the root of the archive, not against the
-    // directory the link is in. `/usr/bin/perl` is one.
+    // Hard links resolve against the root of the archive, not the link's
+    // directory. `/usr/bin/perl` is one.
     for (const [path, target] of Object.entries(tree.hard ?? {})) {
       if (files[target]) {
         files[path] = files[target];
@@ -333,44 +303,18 @@ async function bootDebian(ctx) {
       ctx.setNet('off');
     }
 
-    // A statically recompiled closure, when one has been built for this
-    // rootfs.
-    //
-    // This is the configuration the project exists for and the site has never
-    // run in it: only the harness page could be given a closure, so every
-    // measurement of the demo has been of the runtime translator, which is
-    // the secondary path. Trying costs nothing -- `loadClosure` answers
-    // `null` when there is no manifest, and the demo then runs exactly as it
-    // did before.
-    //
-    // With the image module, because pid 1 here is `bash` and the closure is
-    // built with `bash` as its first root.
-    //
-    // An image module is one program's own text, so asking for the wrong one
-    // starts the guest inside somebody else's code -- it exits without making
-    // a syscall, which is exactly what the first attempt at this did. The
-    // path is passed so `loadClosure` can check it against the manifest
-    // rather than take the caller's word.
-    //
-    // It was built for `apt-get` before, which left `bash` as the one program
-    // in the run with no module at all: 18,595 blocks in pid 1 and another
-    // 4,106 in every child it forks, by then *all* of what either lifted.
-    // apt and its methods are still in the closure -- as extra roots, which
-    // contributes their libraries, which is where their code actually is.
+    // A statically recompiled closure, when one has been built. `loadClosure`
+    // answers `null` when there is no manifest, so trying costs nothing. The
+    // image path is passed so it can be checked against the manifest: pid 1
+    // here is `bash`, and handing it a module built for another program starts
+    // the guest inside someone else's code and it exits without a syscall.
     // `?closure=0` runs the same demo on the runtime translator alone.
-    //
-    // Not a preference: it is the one switch that separates "the guest is
-    // wrong" from "what we handed the guest is wrong". A child of apt dies at
-    // an arbitrary syscall and every other explanation has been eliminated;
-    // whether it still dies with nothing statically recompiled decides
-    // whether to look at the syscall or at the dispatch.
     ctx.busy('loading the closure');
     const { loadClosure } = await import('./closure.js');
     const wantClosure = new URLSearchParams(location.search).get('closure') !== '0';
     const closure = !wantClosure ? null : await loadClosure('/closure/debian', {
       image: '/bin/bash',
-      // The console, not the terminal. How the closure loaded is a fact
-      // about the runtime, and the terminal belongs to the guest.
+      // The console, not the terminal, which belongs to the guest.
       log: (s) => console.debug(`[gex] ${s}`),
     });
 
@@ -392,17 +336,13 @@ async function bootDebian(ctx) {
     const { status } = await ctx.runProgram(ctx.term, {
       elf,
       files,
-      // The empty directories too. apt wants
-      // `/var/cache/apt/archives/partial` and `/etc/apt/preferences.d` to
-      // exist and holds no files in either, so without these it reports a
-      // rootfs missing directories that are in the tar.
+      // The empty directories too: apt wants `.../archives/partial` and
+      // `/etc/apt/preferences.d` to exist and holds no files in either.
       dirs: tree.dirs,
       modes: tree.modes,
-      // What a Debian root shell expects to find. `PATH` has to carry the
-      // `sbin` directories: dpkg looks for `ldconfig` and
-      // `start-stop-daemon`, both of which live in `/sbin`, and says so.
-      // `DEBIAN_FRONTEND` keeps maintainer scripts from waiting on a
-      // debconf dialogue nobody can answer.
+      // `PATH` must carry the `sbin` dirs (dpkg looks for `ldconfig` and
+      // `start-stop-daemon`); `DEBIAN_FRONTEND` keeps maintainer scripts from
+      // waiting on a debconf dialogue nobody can answer.
       env: [
         'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
         'HOME=/root',
@@ -411,24 +351,17 @@ async function bootDebian(ctx) {
         'LC_ALL=C',
         'LANG=C',
       ],
-      // `?cmd=apt-get update` runs one command and exits, instead of opening
-      // a shell. A prompt is what a person wants and is exactly what nothing
-      // else can drive: the demo that proves apt works could only be run by
-      // hand, so it was not run.
-      //
-      // Through a file rather than `-c`. `bash -lc '…'` came back with exit 0
-      // having printed nothing and run nothing, which is a worse answer than
-      // an error -- it looks like a command that succeeded. A script is what
-      // the graphics demo already does and it works.
+      // `?cmd=apt-get update` runs one command and exits instead of opening a
+      // shell, so a test can drive it. Through a file rather than `-c`: `bash
+      // -lc '…'` came back exit 0 having printed and run nothing.
       args: cmd ? ['/bin/bash', '/cmd.sh'] : ['/bin/bash', '-i'],
       cwd: '/root',
       tty: true,
       closure,
       network,
       onNetEvent: (e) => ctx.setNet(e.split(' ')[0]),
-      // Root, because that is who /root belongs to and who a package
-      // manager expects to be. Without it the guest is some uid with no
-      // passwd entry, and bash greets you with "I have no name!".
+      // Root: who /root belongs to and who apt expects to be. Without it the
+      // guest is a uid with no passwd entry and bash greets "I have no name!".
       uid: 0,
     });
     ctx.term.writeln(ctx.ansi.dim(`\r\n[bash exited ${status}]`));
@@ -457,9 +390,8 @@ const gears = {
   async enter(ctx) {
     const { GlDevice } = await import('./gl.js');
 
-    // The canvas lives above the terminal for as long as this demo is
-    // chosen. It is made here rather than in the page's markup so nothing
-    // else has to know the demo exists.
+    // The canvas lives above the terminal while this demo is chosen, made here
+    // rather than in the markup so nothing else has to know the demo exists.
     const wrap = document.createElement('div');
     wrap.className = 'canvas-wrap';
     const canvas = document.createElement('canvas');
@@ -548,8 +480,7 @@ const gears = {
     ]);
     ctx.hint('every GL call crosses to this page and runs on WebGL');
 
-    // `?frames=N` starts it straight away, so a link can show someone the
-    // thing rather than a button that shows it.
+    // `?frames=N` starts it straight away, so a link can carry the demo.
     const asked = Number(new URLSearchParams(location.search).get('frames'));
     if (Number.isFinite(asked) && asked > 0) {
       await start(Math.min(asked, 2000));
@@ -610,13 +541,8 @@ const virglGears = {
     ctx.term.writeln(ctx.ansi.dim('frames were actually put on the canvas above.'));
     ctx.term.writeln('');
 
-    // The budget the run is given, and it has to clear the cold start.
-    //
-    // The first frame arrives about forty seconds in: an X server, Mesa and
-    // glibc all reach the guest one basic block at a time before anything is
-    // drawn. Thirty seconds -- which these buttons used to offer -- ends the
-    // run with a blank canvas and code 124, which reads as a failure and is
-    // not one.
+    // The budget has to clear the cold start: the first frame is ~40s in, so a
+    // 30s run ends with a blank canvas and code 124 that reads as a failure.
     const gearsButtons = (go) => [
       { label: 'Draw for 90s', primary: true, onClick: () => go(90) },
       { label: 'Draw for 5 minutes', onClick: () => go(300) },
@@ -641,29 +567,25 @@ const virglGears = {
           const abs = target.startsWith('/')
             ? target
             : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
-          // The mode travels with the bytes. A symlink materialised as a copy
-      // has no tar entry of its own, so it had no mode -- and `/bin/sh` is a
-      // symlink to dash, which is exactly the program dpkg reported as
-      // "not found in PATH or not executable".
+          // A symlink becomes a copy; the mode must travel with the bytes or
+      // `/bin/sh` (a symlink to dash) loses its execute bit.
       if (files[abs]) {
         files[path] = files[abs];
         if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
       }
     }
-    // Hard links resolve against the root of the archive, not against the
-    // directory the link is in. `/usr/bin/perl` is one.
+    // Hard links resolve against the root of the archive, not the link's
+    // directory. `/usr/bin/perl` is one.
     for (const [path, target] of Object.entries(tree.hard ?? {})) {
       if (files[target]) {
         files[path] = files[target];
         if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
       }
         }
-        // The loader passes no environment, so the bound is written into a
-        // script rather than exported around one.
+        // The loader passes no environment, so the bounds go into a script.
+        // `?gears_size=100x100` shrinks the screen, to tell whether a frame
+        // costs by the pixel or by the call.
         files['/run.sh'] = new TextEncoder().encode(
-          // `?gears_size=100x100` shrinks the screen. The frame rate question
-          // is whether a frame costs by the pixel or by the call, and the
-          // answer is whichever number moves when this one does.
           `GEARS_SECONDS=${seconds}\nexport GEARS_SECONDS\n` +
             `GEARS_SIZE=${/^\d+x\d+$/.test(new URLSearchParams(location.search).get('gears_size') ?? '') ? new URLSearchParams(location.search).get('gears_size') : '300x300'}\nexport GEARS_SIZE\n` +
             `. /gears.sh\n`,
@@ -683,34 +605,25 @@ const virglGears = {
           tty: true,
           uid: 0,
           virgl: renderer,
-          // `?heartbeat=200000000` says where the guest is every so many
-          // safepoints. Thirty frames a second is not a bug with a place in
-          // the source; it is a question about which code is running, and
-          // this is what answers it.
+          // `?heartbeat=N` says where the guest is every N safepoints.
           heartbeat: Number(new URLSearchParams(location.search).get('heartbeat')) || 0,
         });
         const ms = (performance.now() - t0).toFixed(0);
         ctx.term.writeln('');
         rule(ctx, `exit ${status} in ${ms} ms`);
-        // `presented` is the honest number. vtest has no present -- the X
-        // server reads its pixels back and never looks at a screen -- so a
-        // run can draw perfectly with a blank canvas, and this says which
-        // happened.
+        // vtest has no present -- the X server reads its pixels back and never
+        // looks at a screen -- so a run can draw perfectly with a blank canvas.
         const gl = renderer.glState();
-        // The three numbers that say whether anything was drawn, on a line
-        // short enough to survive the terminal's wrapping. `presented` counts
-        // blits; `lit` counts blits whose source had a pixel in it. A run
-        // where those differ is a black canvas with every other counter
-        // saying the frame arrived.
+        // `presented` counts blits; `lit` counts blits whose source had a pixel
+        // in it. Those differing is a black canvas with the frame reported to
+        // have arrived.
         const nums = ['presented', 'lit', 'brightest']
           .map((k) => `${k}=${/=(\d+)/.exec(gl.slice(gl.indexOf(k)))?.[1] ?? '?'}`)
           .join(' ');
         ctx.term.writeln(ctx.ansi.dim(`  ${nums}`));
         ctx.term.writeln(ctx.ansi.dim(`  ${gl}`));
-        // What the guest actually asked the renderer to do. A frame that
-        // arrives empty is either a frame nothing was drawn into or a frame
-        // drawn somewhere else, and the command counts are what tell those
-        // apart.
+        // The command counts say whether an empty frame had nothing drawn into
+        // it or was drawn somewhere else.
         for (const part of renderer.commands().split('|')) {
           ctx.term.writeln(ctx.ansi.dim(`  ${part.trim()}`));
         }

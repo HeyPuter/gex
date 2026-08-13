@@ -2,27 +2,13 @@
  * Does the global kernel export everything the shim imports from it, with the
  * types the shim expects?
  *
- * The shim imports the process table, the filesystem, the pipes and the
- * shared module store from `gex_k`, which is a *separate wasm artefact* built
- * by `shims/kernel/build.sh`. For a long time nothing rebuilt it when the
- * shim was rebuilt, and nothing checked that the two agree.
- *
- * The failure that produced this is worth stating, because it looks like
- * nothing else: adding one kernel function and rebuilding only the shim gave
- * a run with no output at all. No error, no guest line, a renderer at half a
- * percent of one core. Instantiating the shim had failed on a missing import,
- * in a Worker, and whatever reported that was not being read. Seven hours of
- * staleness in a file nobody had thought about since.
- *
- * Names were not enough. Giving `k_obj_translated` a second parameter and
- * rebuilding only the shim passed this check -- every name was present -- and
- * then died in the browser with `imported function does not match the
- * expected type`, which is the same silent-wedge shape one level down. So the
- * signatures are compared too.
- *
- * The glue is checked against the shim already, by `check-glue.mjs`. The
- * three together mean a mismatch is a build error rather than a run that
- * produces nothing.
+ * The shim imports the process table, filesystem, pipes and module store from
+ * `gex_k`, a separate wasm artefact built by `shims/kernel/build.sh`. Left
+ * stale, the shim fails to instantiate inside a Worker and the run produces no
+ * output at all. Names are not enough -- a changed signature passes a name
+ * check and then dies with `imported function does not match the expected
+ * type` -- so signatures are compared too. `check-glue.mjs` does the shim/glue
+ * half.
  */
 import { readFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
@@ -52,13 +38,11 @@ const VAL = { 0x7f: 'i32', 0x7e: 'i64', 0x7d: 'f32', 0x7c: 'f64', 0x7b: 'v128' }
 const val = (b) => VAL[b] || `?${b.toString(16)}`;
 
 /**
- * The parts of a module this needs: its function types, which type each
- * function has, and its imports and exports.
- *
- * A function's index counts imported functions first, so an export naming
- * index `i` is an import when `i` is below the imported count and a defined
- * function otherwise. Getting that wrong reads every signature off by the
- * number of imports, which is a check that fails on correct builds.
+ * A module's function types, which type each function has, and its imports and
+ * exports. Function indices count imported functions first, so an export
+ * naming index `i` is an import when `i < importedCount` and a defined
+ * function otherwise -- getting that wrong reads every signature off by the
+ * import count.
  */
 function parse(bytes) {
   let at = 8;

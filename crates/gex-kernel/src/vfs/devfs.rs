@@ -30,7 +30,6 @@ struct DevHandle {
 impl FileHandle for DevHandle {
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         match self.device {
-            // Reading /dev/null is immediate end of file.
             Device::Null => Ok(0),
             Device::Zero | Device::Full => {
                 buf.fill(0);
@@ -48,7 +47,6 @@ impl FileHandle for DevHandle {
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
         match self.device {
-            // /dev/full exists precisely so that writes fail this way.
             Device::Full => Err(Errno::ENOSPC),
             _ => Ok(buf.len() as u64),
         }
@@ -85,12 +83,8 @@ impl DevFs {
         DevFs { extra: Vec::new() }
     }
 
-    /// Add a device the host provides.
-    ///
-    /// The handle is shared, not cloned per open, because a device is one
-    /// thing however many descriptors point at it -- which is what lets a
-    /// graphics device keep a context across the several times a program
-    /// opens it.
+    /// Add a device the host provides. The handle is shared, not cloned per
+    /// open, so a device keeps state (e.g. a graphics context) across opens.
     pub fn add(&mut self, name: &str, handle: Arc<dyn FileHandle>) {
         self.extra.retain(|(n, _)| n != name);
         self.extra.push((name.to_string(), handle));

@@ -1,18 +1,9 @@
-//! The EGL display and contexts gex hands to virglrenderer.
+//! The surfaceless EGL display and contexts gex hands to virglrenderer.
 //!
-//! virglrenderer can bring up its own EGL from a DRM render node, but that
-//! wants a device, and a sandbox often has none -- this machine cannot even
-//! open `/dev/dri/card0`. Its `VIRGL_RENDERER_USE_SURFACELESS` flag is meant
-//! for exactly that and does not work here either.
-//!
-//! So gex supplies the winsys: a surfaceless EGL display, and the three
-//! callbacks that make contexts on it. That path is real but easy to get
-//! subtly wrong -- see the note in `Virgl::new` about what happens when the
-//! callbacks structure is declared one version too old.
-//!
-//! Nothing is ever drawn to a surface here. Every resource virglrenderer
-//! renders into is a texture or renderbuffer it owns, and pixels leave through
-//! a transfer, not a swap.
+//! virglrenderer's own DRM and `VIRGL_RENDERER_USE_SURFACELESS` paths both want
+//! a device a sandbox may lack (no openable `/dev/dri/card0`), so gex supplies
+//! the winsys instead. Nothing is drawn to a surface: virglrenderer renders
+//! into textures it owns and pixels leave through a transfer, not a swap.
 
 use std::os::raw::{c_int, c_void};
 use std::ptr;
@@ -76,13 +67,9 @@ pub struct Winsys {
     root: EGLContext,
     /// Whether the display gave us desktop GL rather than GLES.
     pub desktop_gl: bool,
-    /// The context virglrenderer last asked for.
-    ///
-    /// An EGL context is current on *a thread*, and gex pumps the renderer
-    /// from whichever host thread the guest process happens to be running
-    /// on -- a shell on one, the program it started on another. Making a
-    /// context current on one thread leaves every other thread with none, and
-    /// virglrenderer then issues GL calls into nothing.
+    /// The context virglrenderer last asked for. An EGL context is current per
+    /// thread, and the renderer is pumped from whichever host thread the guest
+    /// runs on, so it must be rebound there before use.
     last: EGLContext,
 }
 
@@ -92,9 +79,8 @@ unsafe impl Send for Winsys {}
 impl Winsys {
     /// Bring up surfaceless EGL, preferring desktop GL.
     ///
-    /// Desktop first because virglrenderer's GL backend is the complete one:
-    /// its GLES path works, but it emulates what GLES lacks, and there is no
-    /// reason to take that on when the host has the real thing.
+    /// Desktop first because virglrenderer's GL backend is the complete one;
+    /// its GLES path only emulates what GLES lacks.
     pub fn new() -> Result<Winsys, String> {
         unsafe {
             let p = eglGetProcAddress(b"eglGetPlatformDisplayEXT\0".as_ptr());
@@ -117,16 +103,9 @@ impl Winsys {
                 return Err(format!("eglInitialize failed: {:#x}", eglGetError()));
             }
 
-            // Desktop unless `GEX_VIRGL_GLES` says otherwise.
-            //
-            // The override is for recording. A vtest stream is what the
-            // guest's Mesa emits *having been told what the host can do*, so
-            // a stream recorded against desktop GL 4.3 asks for things a
-            // GLES 3.0 renderer was never offered -- which makes it useless
-            // for testing the browser port, where the renderer is WebGL 2.
-            // Forcing GLES here records a stream the browser could plausibly
-            // serve, and gets a picture out of a replay instead of a
-            // correctly blank frame.
+            // Desktop unless `GEX_VIRGL_GLES` says otherwise. The override is
+            // for recording: a stream is emitted against what the host offers,
+            // so forcing GLES records one the browser's WebGL 2 could replay.
             let want_gles = std::env::var_os("GEX_VIRGL_GLES").is_some();
             let desktop_gl = !want_gles && eglBindAPI(EGL_OPENGL_API) != 0;
             if !desktop_gl && eglBindAPI(EGL_OPENGL_ES_API) == 0 {
@@ -180,8 +159,8 @@ impl Winsys {
                 minor,
             ];
             if self.desktop_gl {
-                // Core from 3.2 up, compatibility below it -- a core profile
-                // below 3.2 is not a thing, and Mesa refuses to make one.
+                // Core from 3.2 up, compatibility below: Mesa refuses a core
+                // profile below 3.2.
                 attrs.push(EGL_CONTEXT_OPENGL_PROFILE_MASK);
                 attrs.push(if (major, minor) >= (3, 2) {
                     EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT
@@ -215,10 +194,9 @@ impl Winsys {
         }
     }
 
-    /// Re-bind the last context on the calling thread.
-    ///
-    /// Cheap when it is already current, and the only thing standing between
-    /// a multi-process guest and a segfault inside the driver.
+    /// Re-bind the last context on the calling thread. Cheap when already
+    /// current, and the only thing between a multi-process guest and a segfault
+    /// inside the driver.
     pub fn rebind(&self) {
         if self.last.is_null() {
             return;
@@ -235,11 +213,9 @@ impl Winsys {
 
     /// Let go of the context so another thread can take it.
     ///
-    /// EGL allows a context to be current on exactly one thread. Binding it
-    /// on a second while the first still holds it fails with `BAD_ACCESS`,
-    /// and that thread is then left with no context at all -- which is a
-    /// crash the moment virglrenderer issues a GL call. So every stretch of
-    /// work brackets itself: take it, use it, put it back.
+    /// A context is current on exactly one thread; binding it on a second while
+    /// the first holds it fails with `BAD_ACCESS`. So work brackets itself:
+    /// take it, use it, put it back.
     pub fn release(&self) {
         unsafe {
             eglMakeCurrent(

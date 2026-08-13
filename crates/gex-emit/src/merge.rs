@@ -1,30 +1,17 @@
 //! Concatenating translation units into one module.
 //!
-//! A process that can identify its own pages finds, in the shared store, every
-//! unit anybody has translated of the libraries it is running. Installing them
-//! one at a time means a `WebAssembly.compile` and an `instantiate` each:
-//! measured at about seventeen hundred per process and three and a half
-//! seconds, against three hundred milliseconds of actual translation. Finding
-//! the code had become dearer than lifting it.
-//!
-//! These are not arbitrary modules, so this is concatenation rather than
-//! linking. Every unit is [`crate::module::ModuleBuilder`]'s output with the
-//! same imports in the same order and one function type for every block. A
-//! body *may* name another block directly -- that tail call is worth keeping,
-//! and forbidding it was measured at twice the translation work -- so each
-//! unit carries a `gex.reloc` custom section giving the offset of every such
-//! immediate, written at a fixed five bytes so patching cannot change a
-//! body's length. So:
+//! Every unit is [`crate::module::ModuleBuilder`]'s output with the same
+//! imports in the same order and one function type for every block, so units
+//! concatenate rather than link. A body may name another block directly, and
+//! each unit carries a `gex.reloc` custom section giving the offset of every
+//! such immediate (written at a fixed five bytes so patching cannot change a
+//! body's length). So:
 //!
 //!   * types, imports, tables, memory and data come from the first unit,
 //!     because they are identical in all of them;
 //!   * function and code sections concatenate verbatim;
 //!   * exports and element segments carry local function indices, which shift
 //!     as bodies are appended, so those are renumbered.
-//!
-//! Bodies are copied without inspection. That is the whole point of the
-//! position-independent flag: without it a body can `return_call` a sibling
-//! block by index, and a merge would have to rewrite instruction streams.
 
 /// Section ids we have to understand. The rest are copied from unit zero.
 const SEC_FUNCTION: u8 = 3;
@@ -159,10 +146,8 @@ fn import_funcs(secs: &[(u8, &[u8])]) -> u32 {
 /// Merge `units` into one module, or `None` if any of them is not the shape
 /// this expects.
 ///
-/// The first unit decides everything but the functions: its types, imports,
-/// tables, memory and data are the merged module's. That is safe because they
-/// are emitted by one builder from one ABI, and it is checked to the extent
-/// that a mismatch shows up as a different import count.
+/// The first unit's types, imports, tables, memory and data become the merged
+/// module's; a mismatch shows up as a differing import count and is rejected.
 pub fn merge(units: &[&[u8]]) -> Option<Vec<u8>> {
     if units.is_empty() {
         return None;
@@ -283,13 +268,9 @@ pub fn merge(units: &[&[u8]]) -> Option<Vec<u8>> {
             }
             if flag == 0x01 {
                 // Passive: an elemkind and then the vector, with no offset
-                // expression -- there is nowhere for it to go until somebody
-                // calls `table.init`. Skipping the three bytes an active
-                // segment spends on `i32.const N end` reads them out of the
-                // funcref vector instead, and the parse walks off the end of
-                // the section a few segments later. That is what a `ls`
-                // turned into: an index panic in this function, surfacing as
-                // `unreachable` inside a syscall.
+                // expression. Treating it like an active segment's
+                // `i32.const N end` reads three bytes out of the funcref
+                // vector and walks the parse off the end of the section.
                 p += 1; // elemkind
             } else {
                 // The offset expression: `i32.const N end`.

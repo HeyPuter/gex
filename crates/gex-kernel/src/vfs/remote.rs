@@ -1,31 +1,16 @@
 //! A filesystem that lives in another wasm module.
 //!
-//! Every guest process is a Worker with a memory of its own, so a `TmpFs` in
-//! one of them is invisible to all the others: a shell that unpacks a rootfs
-//! and forks would hand its child an empty root, and the child's `execve`
-//! would fail to find the program it was forked to run. The files have to be
-//! somewhere neither process owns.
+//! Each guest process is a Worker with its own memory, so a `TmpFs` in one is
+//! invisible to the others; shared files instead live in the global kernel
+//! module every Worker instantiates against one shared memory. This is the
+//! client half: a `FileSystem`/`FileHandle` holding only an id and forwarding
+//! every call, like [`crate::proc::Remote`].
 //!
-//! That somewhere is the global kernel -- a second wasm module every Worker
-//! instantiates against one shared memory. This is the client half: a
-//! `FileSystem` and a `FileHandle` that hold nothing but an id and forward
-//! every call, the same shape as [`crate::proc::Remote`] and for the same
-//! reason.
-//!
-//! Two things follow from the boundary being a *memory* boundary rather than
-//! a lock:
-//!
-//!   * Paths and bytes cross by address, not by pointer. Every call passes an
-//!     offset into the calling process's memory, and the other side copies
-//!     with `memory.copy` naming two memories. That is what `gex-kmem` is for
-//!     and it is why the buffers below are ordinary `Vec<u8>` -- a Rust
-//!     allocation in this process is exactly the kind of address the other
-//!     side can reach.
-//!
-//!   * Structures cross as bytes, in the two layouts written out here. A
-//!     `Metadata` is [`META_BYTES`] bytes and a directory listing is a run of entries;
-//!     both sides encode them with the same functions, which is why those
-//!     functions are in this file rather than in either module.
+//! Addresses, not pointers, cross the boundary: every call passes an offset
+//! into the caller's memory and the other side copies with `memory.copy` over
+//! two memories, which is why the buffers here are ordinary `Vec<u8>`.
+//! Structures cross as bytes in the layouts encoded below; both modules
+//! compile these same functions.
 
 use std::sync::Arc;
 
@@ -63,17 +48,13 @@ pub struct Remote {
     pub link: extern "C" fn(from: u32, from_len: u32, to: u32, to_len: u32) -> i32,
     /// Put a socket node at a path.
     ///
-    /// Not a file anything reads -- what it is for is being *seen*. Xvfb
-    /// binds `/tmp/.X11-unix/X0` and the script that starts it waits for that
-    /// path to exist before running a client; without the node the server was
-    /// listening, the client was never started, and nothing said why.
+    /// Not read -- only stat'd: Xvfb binds `/tmp/.X11-unix/X0` and its startup
+    /// script waits for that path to exist before launching a client.
     pub mksocket: extern "C" fn(path: u32, path_len: u32) -> i32,
 }
 
-/// How many bytes a serialised [`Metadata`] takes. Both the kernel module (which
-/// encodes) and the shim (which decodes) compile from this file, so the two
-/// agree by construction -- but they are separate wasm artefacts, so a change
-/// here means rebuilding *both* or they will read past/short of each other.
+/// Serialised [`Metadata`] size. Both modules compile this file so they agree,
+/// but they are separate wasm artefacts -- a change here means rebuilding both.
 pub const META_BYTES: usize = 36;
 
 /// `Metadata` as bytes, in the one layout both modules read.
@@ -129,10 +110,8 @@ pub fn file_type_of(code: u32) -> FileType {
     }
 }
 
-/// A directory listing as bytes: for each entry, a 16-byte header of name
-/// length, type code and inode, then the name. No padding and no count -- the
-/// reader stops when it runs out of bytes, which is the only thing both sides
-/// can agree on without a length prefix nobody has a use for.
+/// A directory listing as bytes: per entry a 16-byte header (name length, type
+/// code, inode) then the name. No count -- the reader stops at end of bytes.
 pub fn encode_dir(entries: &[DirEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in entries {
@@ -175,11 +154,8 @@ fn ok(v: i32) -> Result<i32, Errno> {
     }
 }
 
-/// Where a path is staged so the other side can copy it out.
-///
-/// A `Vec<u8>` rather than a fixed buffer because the address has to be a
-/// real one in this process's memory and has to stay valid for the length of
-/// the call -- which is exactly what a local binding gives.
+/// Where a path is staged for the other side to copy out. The address must be
+/// real in this process's memory and stay valid across the call.
 fn at(b: &[u8]) -> (u32, u32) {
     (b.as_ptr() as u32, b.len() as u32)
 }
@@ -285,12 +261,8 @@ impl FileSystem for RemoteFs {
     }
 }
 
-/// One open file in the global kernel.
-///
-/// The id is the whole of it. Dropping it closes there, which is what makes
-/// the other side's table finite -- a process that exits without closing
-/// still has its handles dropped, because they are behind the `Arc`s in its
-/// file table and its file table goes with it.
+/// One open file in the global kernel; the id is the whole of it. Dropping it
+/// closes there, so a process that exits drops its handles with its file table.
 struct RemoteHandle {
     id: i32,
     remote: Remote,
@@ -308,11 +280,8 @@ impl Drop for RemoteHandle {
     }
 }
 
-/// A handle onto an id the global kernel already holds.
-///
-/// What `fork` hands a child: the parent asks the global kernel for a second
-/// id onto the same open file and the child wraps it, so an unlinked file --
-/// or one whose name now means something else -- crosses intact.
+/// A handle onto an id the global kernel already holds -- what `fork` hands a
+/// child, so an unlinked or renamed file crosses intact.
 pub fn adopt(remote: Remote, id: i32) -> Arc<dyn FileHandle> {
     Arc::new(RemoteHandle { id, remote })
 }
@@ -349,9 +318,8 @@ impl FileHandle for RemoteHandle {
     }
 
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
-        // Grown rather than asked for: a directory listing has no bound the
-        // caller knows, and asking for its size first would be a second call
-        // whose answer can go stale between the two.
+        // Grown rather than sized up front: a listing has no bound the caller
+        // knows, and asking its size first is a second call that can go stale.
         let mut cap = 4096;
         loop {
             let mut buf = vec![0u8; cap];

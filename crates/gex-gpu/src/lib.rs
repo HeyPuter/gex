@@ -1,33 +1,19 @@
 //! Compositing gex's Wayland surfaces on the GPU.
 //!
-//! The compositor in [`gex_wayland`] produces [`Frame`]s: rectangles of client
-//! pixels. Something has to put them on a screen. Doing it on the CPU means
-//! touching every pixel of every frame every time anything moves, which is
-//! exactly the work a graphics processor exists to avoid.
+//! The compositor in [`gex_wayland`] produces [`Frame`]s of client pixels;
+//! this puts them on a screen without touching every pixel on the CPU. Built
+//! on wgpu (the WebGPU API): native it targets Vulkan or GL, `wasm32` it
+//! targets the browser's WebGPU, so the compositor is written once.
 //!
-//! This is wgpu, which *is* the WebGPU API. Built natively it goes to Vulkan
-//! or GL; built for `wasm32` it goes to the browser's own WebGPU
-//! implementation. That is the whole reason for choosing it: the browser is
-//! gex's first-class target, and a compositor written against anything
-//! platform-specific would have to be written twice.
-//!
-//! # What it does not do
-//!
-//! It composites on the GPU. It does not give the *guest* a GPU: a client
-//! still draws its pixels with its own CPU into shared memory, and this
-//! uploads them. Letting the guest's own OpenGL reach hardware needs a DRM
-//! device inside the guest and a device model behind it, which is a different
-//! and much larger piece of work. What this removes is the compositor's half
+//! It does not give the *guest* a GPU: a client still draws its own pixels
+//! into shared memory and this uploads them. It removes the compositor's half
 //! of the cost, not the client's.
 
 use gex_wayland::Frame;
 use std::collections::HashMap;
 
-/// Why a GPU backend could not be started.
-///
-/// Every one of these is a reason to fall back to compositing on the CPU
-/// rather than to fail: a machine with no graphics adapter is a machine gex
-/// should still run on.
+/// Why a GPU backend could not be started. Each is a reason to fall back to
+/// CPU compositing rather than to fail.
 #[derive(Debug)]
 pub enum GpuError {
     /// Nothing on this machine implements WebGPU, Vulkan or GL.
@@ -61,11 +47,8 @@ struct SurfaceUniform {
     _pad: f32,
 }
 
-/// One client buffer, kept as a texture between frames.
-///
-/// Keyed by the surface, because a client redraws the same surface over and
-/// over and reallocating its texture every frame would give back most of what
-/// the GPU was for. The texture is recreated only when the size changes.
+/// One client buffer, kept as a texture between frames and keyed by surface so
+/// a redraw reuses it; recreated only when the size changes.
 struct Cached {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -102,11 +85,8 @@ fn padded_row(width: u32) -> u32 {
 }
 
 impl Compositor {
-    /// Start a compositor for a screen of this size.
-    ///
-    /// Blocks while the adapter and device are requested. Both are futures in
-    /// WebGPU because a browser has to ask the user's machine, and both
-    /// resolve immediately in practice.
+    /// Start a compositor for a screen of this size. Blocks while the adapter
+    /// and device are requested (futures in WebGPU, but immediate in practice).
     #[cfg(not(target_family = "wasm"))]
     pub fn new(width: u32, height: u32) -> Result<Compositor, GpuError> {
         pollster::block_on(Compositor::new_async(width, height))
@@ -201,9 +181,8 @@ impl Compositor {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    // A surface above another must show what is under it
-                    // where it is transparent, which is the whole reason a
-                    // compositor is a compositor.
+                    // Alpha blend, so a surface shows what is under it where
+                    // it is transparent.
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -270,12 +249,8 @@ impl Compositor {
     }
 
     /// Upload a frame's pixels into the surface's texture, making one if the
-    /// size changed.
-    ///
-    /// The rows arrive with the client's stride, which is not necessarily the
-    /// width: a client is free to pad. `write_texture` takes a stride, so the
-    /// padding travels to the GPU and is never looked at, rather than being
-    /// stripped out row by row here.
+    /// size changed. Rows arrive with the client's (possibly padded) stride,
+    /// which `write_texture` takes directly rather than stripping here.
     fn upload(&mut self, frame: &Frame) -> Result<(), GpuError> {
         let width = frame.width.max(0) as u32;
         let height = frame.height.max(0) as u32;
@@ -347,12 +322,9 @@ impl Compositor {
         Ok(())
     }
 
-    /// Draw the given surfaces, in order, onto a cleared screen.
-    ///
-    /// Placement is the compositor's to decide and there is no window manager
-    /// here, so a surface is centred on the output, and a later one is drawn
-    /// over an earlier one. A surface larger than the screen is pinned to the
-    /// corner rather than centred off the edge.
+    /// Draw the given surfaces, in order, onto a cleared screen. With no window
+    /// manager, each surface is centred (larger-than-screen ones pinned to the
+    /// corner) and a later one draws over an earlier one.
     pub fn draw(&mut self, frames: &[Frame]) -> Result<(), GpuError> {
         for frame in frames {
             self.upload(frame)?;
@@ -444,11 +416,9 @@ impl Compositor {
         Ok(())
     }
 
-    /// Copy the screen back to the CPU as tightly packed RGBA.
-    ///
-    /// Only for a host that has nowhere to present to -- a test, or a file.
-    /// A host with a window or a canvas draws into its swapchain instead and
-    /// never pays for this.
+    /// Copy the screen back to the CPU as tightly packed RGBA. Only for a host
+    /// with nowhere to present to (a test, or a file); one with a window draws
+    /// into its swapchain instead.
     #[cfg(not(target_family = "wasm"))]
     pub fn read_back(&self) -> Result<Vec<u8>, GpuError> {
         pollster::block_on(self.read_back_async())

@@ -1,32 +1,26 @@
 //! Executing a guest's GL command stream on the host's GL.
 //!
-//! Every entry point here is a thin wrapper over the real thing. That is the
-//! design: this crate is a transport, not an implementation of OpenGL. What
-//! makes a guest's `glDrawArrays` work is the host's `glDrawArrays`, and what
-//! makes an obscure extension work is that the host's driver has it.
+//! Every entry point is a thin wrapper over the real call: this crate is a
+//! transport, not an implementation of OpenGL.
 //!
 //! # Names
 //!
-//! The guest chooses object names without asking. For buffers and textures
-//! that is free, because GL lets you bind a name it has never seen. For
-//! shaders and programs GL insists on choosing, so [`Names`] maps the guest's
-//! number onto the host's. The map is the only bookkeeping in here.
+//! The guest chooses object names. For buffers and textures that is free (GL
+//! binds a name it has never seen); for shaders and programs GL insists on
+//! choosing, so [`Names`] maps the guest's number onto the host's.
 //!
 //! # Errors
 //!
-//! A command that fails does not stop the batch. GL is a state machine with
-//! its own error latch, and an application that wants to know asks
-//! `glGetError`; stopping early would produce a different failure from the one
-//! it would see natively. Only a malformed *stream* stops the batch, because
-//! after that the host does not know where the next command begins.
+//! A failing command does not stop the batch -- GL has its own error latch that
+//! `glGetError` reads, and stopping early would diverge from native behaviour.
+//! Only a malformed *stream* stops it, since then the next command's start is
+//! unknown.
 
 use crate::proto::{error, op, Args, Commands, Header};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 
-// The host's GL and EGL. Declared rather than bound through a crate: the list
-// is short, the ABI has not changed since 2007, and a generated binding would
-// be more code than this.
+// The host's GL and EGL, declared by hand: the list is short and the ABI stable.
 #[allow(non_snake_case)]
 mod ffi {
     use super::*;
@@ -235,22 +229,14 @@ struct Names {
     programs: HashMap<u32, GLuint>,
 }
 
-/// A GL context and the state needed to run commands against it.
-///
 /// # Threads
 ///
-/// The fields are EGL handles, which are pointers the driver hands out and
-/// nothing more. What belongs to a thread is not the handle but the
-/// *current* context, and EGL is explicit that a context may be made current
-/// on another thread once it is not current anywhere. [`Gl::make_current`]
-/// does exactly that, so moving one of these between threads is sound
-/// provided every use is preceded by making it current -- which [`Gl::run`]
-/// does.
-///
-/// This matters because the alternative is keeping GL on a thread of its own
-/// and posting to it, and a channel round trip between two threads measured
-/// 23 of the 24 microseconds a synchronous GL call cost. A guest that calls
-/// `glGetError` in its draw loop pays that per call.
+/// The fields are EGL handles (bare pointers). What belongs to a thread is the
+/// *current* context, and EGL allows a context to be made current on another
+/// thread once it is not current anywhere. [`Gl::run`] makes it current before
+/// every use, so moving one of these between threads is sound. The alternative,
+/// a dedicated GL thread posted to over a channel, cost 23 of the 24 µs a
+/// synchronous GL call took -- paid per `glGetError` in a draw loop.
 unsafe impl Send for Gl {}
 /// A GL context and the state needed to run commands against it.
 pub struct Gl {
@@ -261,11 +247,9 @@ pub struct Gl {
     names: Names,
     width: i32,
     height: i32,
-    /// Which thread the context is current on, so it is only moved when it
-    /// has to be.
+    /// Which thread the context is current on, so it is only moved when needed.
     current_on: Option<std::thread::ThreadId>,
-    /// Set once, because an application asks for them and the answer never
-    /// changes.
+    /// Read once at startup; the answer never changes.
     pub vendor: String,
     pub renderer: String,
     pub version: String,
@@ -305,12 +289,10 @@ unsafe fn gl_string(name: GLenum) -> String {
 }
 
 impl Gl {
-    /// Bring up a context on the host, offscreen.
+    /// Bring up an offscreen context on the host.
     ///
-    /// Surfaceless on purpose: what the guest renders goes to a texture or
-    /// gets read back, and the host decides separately whether any of it
-    /// reaches a screen. Asking for a window here would tie the device to
-    /// having one.
+    /// Surfaceless on purpose: the guest renders to a texture or reads back, and
+    /// the host decides separately whether any of it reaches a screen.
     pub fn new(width: i32, height: i32) -> Result<Gl, String> {
         unsafe {
             let get_platform_display: Option<
@@ -399,10 +381,8 @@ impl Gl {
         }
     }
 
-    /// Give the context a differently sized surface.
-    ///
-    /// EGL has no way to resize a pbuffer, so this makes another and moves
-    /// the context onto it. Everything in the context survives; only the
+    /// Give the context a differently sized surface. EGL cannot resize a
+    /// pbuffer, so this makes another and moves the context onto it; only the
     /// default framebuffer changes.
     pub fn resize(&mut self, width: i32, height: i32) -> Result<(), String> {
         if width == self.width && height == self.height {
@@ -431,19 +411,16 @@ impl Gl {
 
     /// Make this context current on the calling thread, if it is not already.
     ///
-    /// A no-op after the first call for a guest with one thread, which is the
-    /// case that matters. A guest with several pays one `eglMakeCurrent` when
-    /// the thread that draws changes, which is what a native application with
-    /// several drawing threads pays too.
+    /// A no-op after the first call for a single-threaded guest; one with
+    /// several pays an `eglMakeCurrent` when the drawing thread changes.
     pub fn make_current(&mut self) -> Result<(), String> {
         let me = std::thread::current().id();
         if self.current_on == Some(me) {
             return Ok(());
         }
         unsafe {
-            // Release it from wherever it was. A context that is current on
-            // another thread cannot be taken, and EGL says so rather than
-            // doing something surprising.
+            // Fails if the context is still current on another thread; EGL
+            // reports that rather than doing something surprising.
             if eglMakeCurrent(self.display, self.surface, self.surface, self.context) == 0 {
                 return Err(format!("makeCurrent failed: {:#x}", eglGetError()));
             }
@@ -576,8 +553,8 @@ impl Gl {
                 }
 
                 op::GEN_BUFFERS | op::GEN_TEXTURES => {
-                    // Nothing to do: the guest picked the names and GL is
-                    // happy to be told one it has not seen at bind time.
+                    // Nothing to do: the guest picked the names, and GL accepts
+                    // an unseen one at bind time.
                 }
                 op::DELETE_BUFFERS => {
                     let n = a.u32().unwrap_or(0);
@@ -936,10 +913,8 @@ impl Gl {
                     else {
                         return true;
                     };
-                    // Four bytes a pixel covers RGBA/UNSIGNED_BYTE, which is
-                    // the only combination GLES2 guarantees; anything else
-                    // the host accepts is the host's business and this is
-                    // large enough for it.
+                    // Four bytes a pixel: RGBA/UNSIGNED_BYTE is the only combo
+                    // GLES2 guarantees, and this is large enough for it.
                     let n = (w.max(0) as usize) * (h.max(0) as usize) * 4;
                     let mut px = vec![0u8; n];
                     glReadPixels(x, y, w, h, format, ty, px.as_mut_ptr() as *mut c_void);

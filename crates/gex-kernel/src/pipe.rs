@@ -2,9 +2,8 @@
 //!
 //! A bounded ring buffer with the blocking rules Linux specifies: a read on
 //! an empty pipe waits until data arrives or every writer is gone, a write to
-//! a full pipe waits for room, and a write with no readers left raises
-//! `EPIPE` (the kernel also sends SIGPIPE, which the signal layer does once
-//! it exists).
+//! a full pipe waits for room, and a write with no readers left returns
+//! `EPIPE` (gex does not raise SIGPIPE here, so the guest sees the error).
 //!
 //! Blocking uses a condition variable, which works because a guest thread is
 //! a real host thread (PLAN §2.5). The browser runtime blocks the same way
@@ -22,39 +21,20 @@ struct State {
     buf: VecDeque<u8>,
     readers: usize,
     writers: usize,
-    /// Writes that took less than they were given, and writes that took
-    /// nothing at all.
-    ///
-    /// A short write is correct and ordinary -- the caller carries the rest --
-    /// but a caller that treats it as the whole write loses the tail, and a
-    /// status line lost between apt and its method is a download apt waits
-    /// five minutes for. Counted so the census can say whether that happened
-    /// rather than leaving it to be argued about.
+    /// Short writes (took less than offered) and refused writes (took
+    /// nothing). Counted for the stall census.
     short: u64,
     refused: u64,
-    /// Every write that put a byte in, and how many bytes in all.
-    ///
-    /// The census shows a pipe as empty whether nobody has written to it or
-    /// somebody wrote and the reader took it. During apt's stall every pipe
-    /// reads `0 buffered` and the two possibilities have opposite causes: a
-    /// method that never reported, or a report that went somewhere else.
+    /// Writes that put bytes in, and total bytes. For the census: a `0
+    /// buffered` pipe could be one never written or one already drained.
     writes: u64,
     written: u64,
-    /// The last thing written, truncated.
-    ///
-    /// Every pipe reads `0 buffered` during apt's stall and no write ever
-    /// failed, so the plumbing is exhausted and the question is what was
-    /// said. apt's method protocol is lines of text -- `600 URI Acquire`,
-    /// `201 URI Done` -- so the last message on each pipe names where the
-    /// conversation stopped, which no count can.
+    /// The last thing written, truncated. For the census: apt's method
+    /// protocol is text lines, so this names where a stalled conversation
+    /// stopped.
     last: Vec<u8>,
-    /// Writes that found no reader.
-    ///
-    /// Counted apart from the refused ones because they are a different
-    /// event: `EAGAIN` means "not now" and the caller carries the rest,
-    /// `EPIPE` means the message is gone. A message lost this way between
-    /// apt and its method is a deadlock until somebody's timeout, and the
-    /// count returned before ever reaching the counters below it.
+    /// Writes that found no reader (EPIPE). Distinct from refused (EAGAIN):
+    /// here the message is gone, not merely deferred.
     broken: u64,
 }
 
@@ -133,14 +113,10 @@ impl Pipe {
             if s.writers == 0 {
                 return Ok(0);
             }
-            // Never wait here. This runs with the kernel locked, and the
-            // process that would supply the data needs that lock to write --
-            // so waiting is not slow, it is a deadlock. A descriptor that
-            // should block is parked by the syscall layer instead, outside
-            // the lock, which is what `BlockOp::ReadStream` is for.
-            //
-            // apt's download helper found this: it read its control pipe,
-            // the pipe was momentarily empty, and the whole guest stopped.
+            // Never wait here: this runs with the kernel locked and the writer
+            // that would supply data needs that lock, so waiting is a
+            // deadlock. A descriptor that should block is parked by the
+            // syscall layer outside the lock (`BlockOp::ReadStream`).
             return Err(Errno::EAGAIN);
         }
     }
@@ -153,8 +129,7 @@ impl Pipe {
         let mut written = 0usize;
         loop {
             if s.readers == 0 {
-                // Linux also raises SIGPIPE; with the default disposition the
-                // process dies before it ever sees this return value.
+                // Linux also raises SIGPIPE; gex does not, so the guest sees EPIPE.
                 s.broken += 1;
                 return if written > 0 {
                     Ok(written as u64)
@@ -220,11 +195,8 @@ impl Pipe {
         (s.writes, s.written)
     }
 
-    /// How many descriptors are open on each end, as `(readers, writers)`.
-    ///
-    /// For the census: a reader that never sees end-of-file is a pipe whose
-    /// writer count never reached zero, and the only way to tell that from a
-    /// writer that simply has not written yet is to look.
+    /// Open descriptors on each end, as `(readers, writers)`. For the census:
+    /// a reader stuck without EOF means the writer count never hit zero.
     pub fn ends(&self) -> (usize, usize) {
         let s = self.state.lock().unwrap();
         (s.readers, s.writers)
@@ -330,26 +302,16 @@ mod tests {
 
 /// A pipe that lives in another wasm module.
 ///
-/// The buffer above is an ordinary Rust allocation, and a `Arc<Pipe>` is a
-/// pointer -- so the two ends of one can only ever be in the same memory.
-/// That single fact is most of why the snapshot switcher existed: a shell
-/// pipeline is two processes and a pipe, and apt is a process and four method
-/// workers on pairs of them, so under a pointer they all had to share an
-/// address space.
-///
-/// Here the pipe is a *number*. The buffer is in the global kernel, each end
-/// is an id, and the bytes cross by being copied out of one process's memory
-/// and into the other's. Both ends can be Workers that share nothing else.
+/// An `Arc<Pipe>` is a pointer, so both ends of such a pipe must share one
+/// memory. Here the pipe is instead a *number*: the buffer lives in the global
+/// kernel, each end is an id, and bytes cross by being copied between the two
+/// processes' memories. So both ends can be Workers that share nothing else.
 #[derive(Clone, Copy)]
 pub struct Remote {
     /// Make a pipe with both ends open, held by `pid`. Returns its id.
     ///
-    /// The pid is not decoration. The global kernel tracks who holds each
-    /// end so that a process leaving by a trap -- which does not unwind, so
-    /// no `Drop` runs -- can have its ends released by `k_pipe_forget`.
-    /// Without it the two ends a process gets from its own `pipe2` were the
-    /// one case that backstop could not see, and a reader on the far side
-    /// waited for an end-of-file that nobody would send.
+    /// The pid lets the global kernel release a process's ends via
+    /// `k_pipe_forget` when it leaves by a trap (no unwind, so no `Drop`).
     pub new: extern "C" fn(pid: i32) -> i32,
     /// Another descriptor onto one end, as `dup` and `fork` both make.
     pub open_end: extern "C" fn(id: i32, write: i32),
@@ -372,11 +334,8 @@ pub struct Remote {
     pub buffered: extern "C" fn(id: i32) -> i32,
 }
 
-/// One end of a pipe in the global kernel.
-///
-/// Dropping closes that end there, which is what a reader downstream needs:
-/// the last writer going away is EOF, and a writer that went away because its
-/// Worker exited has to count the same as one that called `close`.
+/// One end of a pipe in the global kernel. Dropping closes that end there, so
+/// a writer whose Worker exited counts as EOF just like a `close`.
 pub struct RemotePipeEnd {
     pub id: i32,
     pub write: bool,
@@ -455,21 +414,16 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
     }
 
     fn write_room(&self) -> Option<u64> {
-        // Not reported: the global kernel answers a short write with the
-        // count it took, and the syscall layer carries the rest. Claiming a
-        // number here that another Worker can invalidate between the claim
-        // and the write would be worse than not claiming one.
+        // Not reported: a number here could be invalidated by another Worker
+        // between the claim and the write. Short writes are carried by the
+        // syscall layer instead.
         None
     }
 
     fn debug_state(&self) -> String {
-        // With the ends, because "0 buffered" alone cannot tell the two
-        // stalls apart. A reader waiting on a pipe with no writers left
-        // should have seen end-of-file, so that is a lost wake or a
-        // miscounted close; a reader waiting on a pipe that still has a
-        // writer is waiting on whatever that writer is doing, which is
-        // somewhere else entirely. `apt-get update` hangs for 318 seconds
-        // with exactly this line in the census and no way to say which.
+        // With the ends: "0 buffered" alone cannot tell a reader stuck with
+        // no writers left (a lost wake or miscounted close) from one whose
+        // writer simply has not written.
         let e = (self.remote.ends)(self.id);
         let (r, w) = if e < 0 {
             (-1i32, -1i32)

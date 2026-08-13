@@ -1,22 +1,13 @@
-//! Loading a dynamically linked program.
+//! Loading a dynamically linked program (PLAN §6.4 *cooperative mode*).
 //!
-//! PLAN §6.4 describes two strategies. **Full replacement**, where gex-ld does
-//! everything the interpreter would, is what glibc needs, because `libc.so.6`
-//! reaches into `ld.so` through private symbols. **Cooperative mode** loads
-//! the guest's own interpreter and lets it run translated, which is what musl
-//! needs, because its loader state is fused into `libc.so` with no symbolic
-//! interface to stand in for.
+//! Places the executable and its own interpreter and enters the interpreter,
+//! letting it run translated. This is what musl needs (its loader state has no
+//! symbolic interface), and the always-correct fallback for an unrecognised
+//! `PT_INTERP`. [`crate::link`] is the alternative for glibc and static-PIE.
 //!
-//! Cooperative mode is what this module implements, and it is the one that
-//! also serves as the always-correct fallback for an unrecognised
-//! `PT_INTERP`. It only works because runtime translation exists: the
-//! interpreter maps its libraries with `mmap`, and the code in those mappings
-//! has no translation until it is branched to.
-//!
-//! What the loader must get exactly right is the auxiliary vector. The
-//! interpreter is entered rather than the program, so it needs `AT_BASE` to
-//! find itself, `AT_PHDR`/`AT_PHENT`/`AT_PHNUM` describing the *executable*,
-//! and `AT_ENTRY` naming where to jump once relocation is done.
+//! The auxiliary vector must be exact: the interpreter is entered rather than
+//! the program, so it needs `AT_BASE` to find itself, `AT_PHDR`/`AT_PHENT`/
+//! `AT_PHNUM` describing the *executable*, and `AT_ENTRY` to jump to when done.
 
 use crate::elf::{load, Image, LoadError};
 
@@ -52,16 +43,9 @@ impl Program {
     }
 
     /// Every segment to place, paired with the interpreter's path when the
-    /// segment is the interpreter's.
-    ///
-    /// [`Self::segments`] loses that distinction, and a caller that records
-    /// where a segment's bytes came from then records the executable for both
-    /// -- so `ld.so`'s text is identified as `("/bin/ls", 0x3000000)` under
-    /// `ls` and `("/bin/true", 0x3000000)` under `true`. Two processes
-    /// running the same linker at the same address never agree that it is the
-    /// same code, and every distinct executable in a run lifts the whole
-    /// dynamic linker again. That is a floor of some four thousand blocks on
-    /// every process, and a shell running forty commands pays it forty times.
+    /// segment is the interpreter's. [`Self::segments`] loses that distinction,
+    /// which makes two processes fail to recognise `ld.so` as shared code and
+    /// re-lift the whole dynamic linker per executable.
     pub fn placements(&self) -> impl Iterator<Item = (&crate::elf::Segment, Option<&str>)> {
         let interp = self.exe.interp.as_deref();
         self.exe

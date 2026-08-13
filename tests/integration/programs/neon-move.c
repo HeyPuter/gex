@@ -1,29 +1,9 @@
-/* Moving lanes between the vector and general register files.
- *
- * `smov` sign-extends a lane into a general register, and it may name a
- * 64-bit destination for a byte, halfword or word lane. In wasm every lane
- * extract narrower than 64 bits produces an i32, so the 64-bit forms need an
- * explicit widening that the narrower ones do not -- and without it the module
- * does not validate at all.
- *
- * That is the interesting part: this was not a wrong answer, it was a module
- * gex could not load, and only in a translation exhaustive enough to reach an
- * `smov x` at all. It turned up 182 MB into an exhaustive translation of
- * CPython and nowhere else, because nothing gex had run before used one.
- *
- * Inline assembly rather than intrinsics, because which of `smov x`, `umov w`
- * or `smov w` a compiler picks for a widening lane read is its own business
- * and the point here is to reach each encoding on purpose.
- *
- * The reverse family is here for the opposite reason. `rev16`, `rev32` and
- * `rev64` reverse elements inside a group of fixed width, so an element at
- * least as wide as its group is a reserved encoding -- `rev16 v0.4s` is not an
- * instruction. gex decoded those anyway and the lifter computed
- * `group / lane_bytes - 1`, which underflowed into a byte permutation with
- * lane indices of 248, and wasm rejects a whole module for one of those. So
- * every *valid* combination is listed below, to make sure rejecting the
- * reserved ones did not take any real ones with it.
- */
+/* Moving lanes between the vector and general register files: smov/umov/ins,
+ * and the rev16/rev32/rev64 reverse family. Inline assembly, to reach each
+ * encoding on purpose rather than let the compiler choose. Only the *valid*
+ * reverse combinations are listed (an element as wide as its group is a
+ * reserved encoding), to confirm rejecting the reserved ones spared the real
+ * ones. */
 #include <arm_neon.h>
 #include <stdint.h>
 #include <stdio.h>

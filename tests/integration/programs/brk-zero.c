@@ -1,18 +1,8 @@
-/* Heap the break has just moved over must read as zero.
- *
- * Linux guarantees it, and libc does not merely rely on that, it *skips work*
- * because of it: glibc's `calloc` omits its memset for the part of a chunk
- * that came from a fresh `sbrk`, since the kernel has already done it. A
- * `brk` that hands back whatever was last written there makes `calloc` return
- * uninitialised memory, and what notices first is something like the dynamic
- * loader finding a garbage field in a structure it just allocated.
- *
- * gex's `brk` moved the break and zeroed nothing. Growing into never-touched
- * memory hid that, because a fresh wasm memory is zero to begin with -- and a
- * new program gets a new one, so even an `execve` did not expose it. Lowering
- * the break and raising it again does: those bytes have been written, and
- * Linux clears them on the way back up.
- */
+/* Heap the break has just moved over must read as zero, which Linux
+ * guarantees and glibc's `calloc` relies on to skip its memset. Growing into
+ * fresh memory hides a non-zeroing `brk` (a new wasm memory starts zero), so
+ * this lowers the break over dirtied bytes and raises it again, where Linux
+ * must clear them. */
 #include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>

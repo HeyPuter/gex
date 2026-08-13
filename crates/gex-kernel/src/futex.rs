@@ -23,7 +23,8 @@ pub mod op {
     pub const CMP_REQUEUE: u32 = 4;
     pub const WAIT_BITSET: u32 = 9;
     pub const WAKE_BITSET: u32 = 10;
-    /// `FUTEX_PRIVATE_FLAG`; gex has one address space, so it changes nothing.
+    /// `FUTEX_PRIVATE_FLAG`; these queues are per-process and all waiters share
+    /// its memory, so it changes nothing.
     pub const PRIVATE_FLAG: u32 = 128;
     pub const CLOCK_REALTIME: u32 = 256;
 }
@@ -51,7 +52,6 @@ pub struct Parked {
 }
 
 impl Parked {
-    /// The guest address this is parked on.
     pub fn addr(&self) -> u64 {
         self.addr
     }
@@ -143,17 +143,10 @@ impl FutexTable {
         }
     }
 
-    /// Take a place on `addr`'s queue without blocking on it.
-    ///
-    /// For a host that has no threads to block -- the browser's, where every
-    /// guest thread shares one wasm stack and the scheduler is cooperative.
-    /// Such a host cannot call [`Self::wait`], because there is nothing to
-    /// wake it; instead it parks here and asks [`Parked::woken`] each time it
-    /// looks for something to run.
-    ///
-    /// There is no race to close, unlike in [`Self::wait`]: a host with one
-    /// thread of execution cannot have a waker slip between the caller's
-    /// comparison and this call.
+    /// Take a place on `addr`'s queue without blocking, for the browser host
+    /// where all guest threads share one wasm stack and the scheduler is
+    /// cooperative: it parks here and polls [`Parked::woken`]. No race to close
+    /// as in [`Self::wait`] -- a single-threaded host cannot be raced.
     pub fn park(&self, addr: u64) -> Parked {
         let queue = self.queue(addr);
         let at = *queue.generation.lock().unwrap();

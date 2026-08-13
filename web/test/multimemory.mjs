@@ -2,25 +2,18 @@
 //
 //   node web/test/multimemory.mjs
 //
-// The plan is one *global* kernel module -- the VFS, the process table, pipes,
-// signals -- instantiated once per Worker but always against the same shared
-// memory, so every process's every thread sees one kernel and a syscall is a
-// direct call rather than a message. Each process's address space is a second,
-// separate memory: shared between that process's threads, never between
-// processes. That is what removes the address collisions the snapshot switcher
-// exists to work around.
+// Checked cheaply, before the kernel was built: one global kernel module
+// instantiated per Worker against the same shared memory (so a syscall is a
+// direct call), plus a second, separate memory per process, shared only among
+// that process's threads -- which is what removed the address collisions the
+// switcher had to work around.
 //
-// It rests on three things this checks, cheaply, before any of it is built:
-//
-//   1. a module may *import* two memories at once,
-//   2. both may be shared -- they are, and with different scopes: the kernel's
-//      spans every process, a process's spans only its own threads,
+//   1. a module may import two memories at once,
+//   2. both may be shared, with different scopes,
 //   3. `memory.copy` may name both, so the kernel can reach a guest buffer
-//      that is not in its own address space.
+//      not in its own address space.
 //
-// The module is assembled by hand rather than compiled, because the question
-// is about the engine and not about Rust: if V8 refuses this, no amount of
-// toolchain work will help, and if it accepts it the rest is ordinary code.
+// Assembled by hand, not compiled: the question is about the engine, not Rust.
 const enc = (...bytes) => bytes.flat(Infinity);
 
 /** LEB128, unsigned. Every length and index in a wasm binary is one. */

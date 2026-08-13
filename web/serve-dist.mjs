@@ -1,24 +1,15 @@
 // Serve the built site, cross-origin isolated, on a fixed port.
 //
-// Not `vite dev` and not `vite preview`. The dev server compiles the sources
-// again on its own terms and has served stale JavaScript against a freshly
-// built shim more than once -- a measurement taken against it is a
-// measurement of something nobody shipped. `web/dist` is what the test
-// harness runs and what a deploy copies, so it is what a number should come
-// from.
-//
-// The two headers are not optional: without them the page has no
-// `SharedArrayBuffer`, the guest cannot have a shared memory, and threads and
-// the global kernel are gone. That failure is quiet -- the page loads and
-// then behaves like a different system -- so they are set here rather than
-// assumed of whatever is serving.
-//
 //     node web/serve-dist.mjs [port]
 //
-// Then open the URL it prints, choose a demo, and read the per-process lines
-// in the browser console: `[gex] pid N: lived Xms (guest Yms)`. Guest-side
-// timing does not work -- see #134, `date +%s%N` around a 370ms command
-// reads zero -- so the console is where the numbers are.
+// Not `vite dev`/`preview`: the dev server has served stale JavaScript against
+// a freshly built shim, so a measurement against it means nothing. `web/dist`
+// is what the harness runs and a deploy copies. The two isolation headers are
+// set here, not assumed of the server -- without them there is no
+// SharedArrayBuffer, and threads and the global kernel silently vanish.
+//
+// Open the URL it prints, choose a demo, and read the per-process console lines
+// `[gex] pid N: lived Xms (guest Yms)` -- guest-side timing reads zero (#134).
 
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
@@ -57,9 +48,8 @@ const server = createServer(async (req, res) => {
     // What buys `SharedArrayBuffer`. See the note at the top.
     'Cross-Origin-Opener-Policy': 'same-origin',
     'Cross-Origin-Embedder-Policy': 'require-corp',
-    // The closure is hundreds of megabytes and none of it is content-hashed,
-    // so a browser that caches it will happily serve yesterday's libc against
-    // today's shim. That combination has already cost an afternoon.
+    // The closure is hundreds of MB and not content-hashed, so a cache would
+    // serve yesterday's libc against today's shim.
     'Cache-Control': 'no-store',
   };
   try {

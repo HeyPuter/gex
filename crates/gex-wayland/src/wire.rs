@@ -1,16 +1,13 @@
 //! The Wayland wire format.
 //!
-//! Every message is an object id, then a word holding the opcode in its low
-//! half and the total byte length in its high half, then arguments. Everything
-//! is 32-bit aligned and little-endian, and the length counts the eight-byte
-//! header. That is the whole format; there is no negotiation and no framing
-//! beyond it, which is why a stream socket is enough.
+//! Every message is an object id, then a word with the opcode in its low half
+//! and the total byte length in its high half, then arguments. All 32-bit
+//! aligned and little-endian; the length counts the eight-byte header.
 //!
-//! Descriptors do not appear in the byte stream at all. They travel in the
-//! `SCM_RIGHTS` control message of whichever `sendmsg` carried the bytes, and
-//! the reader pairs them up by order: the *n*th descriptor received belongs to
-//! the *n*th `fd` argument read. That is the only thing about this format that
-//! is easy to get wrong, and it is why [`Reader`] takes the descriptor queue.
+//! Descriptors are not in the byte stream: they travel in the `SCM_RIGHTS`
+//! control message of the `sendmsg` that carried the bytes, paired by order
+//! (the *n*th descriptor belongs to the *n*th `fd` argument). That is the easy
+//! thing to get wrong, and why [`Reader`] takes the descriptor queue.
 
 /// A signed 24.8 fixed-point number, which is how Wayland says "a coordinate".
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -69,8 +66,8 @@ impl<'a> Reader<'a> {
         self.word()
     }
 
-    /// A length-prefixed string. The length counts a trailing NUL and the
-    /// whole thing is padded out to a word.
+    /// A length-prefixed string; the length counts a trailing NUL and the
+    /// whole is padded to a word.
     pub fn string(&mut self) -> Option<String> {
         let len = self.word()? as usize;
         if len == 0 {

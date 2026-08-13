@@ -2,30 +2,17 @@
 //
 //   node web/test/worker-parallel.mjs <module.wasm> <elf> [args...]
 //
-// The whole reason for one Worker per guest process is parallelism. Today a
-// page runs every guest process on one wasm stack and switches between them
-// by snapshotting memory, so two processes never run at once no matter how
-// many cores the machine has -- `make -j4` inside the guest is `make -j1`
-// with bookkeeping.
+// The whole reason for one Worker per guest process is parallelism: the old
+// switcher ran every process on one wasm stack, so two never ran at once and
+// `make -j4` in the guest was `make -j1` with bookkeeping. This measured
+// whether the seam was worth building -- the same CPU-bound guest in 1, 2 and 4
+// Workers, wall clock compared.
 //
-// The transport that lets two Workers talk is built (`web/test/two-workers.mjs`),
-// but transport is not the point; throughput is. So before building anything
-// else on that seam, measure whether the seam is worth having: run the same
-// CPU-bound guest in 1, 2 and 4 Workers and compare wall clock.
+//   * near 1.0x scaling -- N Workers do N times the work; the design pays off.
+//   * near 1/N -- something serializes, to be found before more Worker code.
 //
-// What the numbers mean:
-//
-//   * **Scaling near 1.0x** -- N Workers finish N times the work in the time
-//     one Worker takes one. The design pays off and the remaining work is
-//     kernel state.
-//   * **Scaling near 1/N** -- something serializes. That would be the thing
-//     to find before writing another line of Worker code, because no amount
-//     of shared-process-table work fixes it.
-//
-// This measures the *runtime*, not the switcher: each Worker loads its own
-// module and runs its own guest, so nothing is shared and nothing is being
-// snapshotted. It is the ceiling the design is aiming at, which is exactly
-// what is worth knowing first.
+// Each Worker loads its own module and runs its own guest, so this measures the
+// runtime's ceiling, nothing shared or snapshotted.
 import { Worker } from 'node:worker_threads';
 import { readFile, access } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
@@ -51,23 +38,15 @@ for (const p of [wasm, elf, RUNNER]) {
 /**
  * One guest, in its own Worker, timed from inside.
  *
- * The Worker times itself rather than being timed from here, because what
- * matters is how long a guest takes when N of them are running -- not how
- * long the parent waited, which includes N Worker startups the parent
- * serialized by issuing them in a loop.
- *
- * Timed around `import` and not around the guest's own clock: the guest has
- * no clock unless the program prints one, and a program that prints nothing
- * is exactly the sort this should be able to measure. So the number includes
- * compiling the module, which every Worker pays and which parallelizes the
- * same way the guest does.
+ * The Worker times itself: what matters is how long a guest takes when N run,
+ * not how long the parent waited (which includes serialized Worker startups).
+ * Timed around `import`, so the number includes compiling the module, which
+ * every Worker pays and which parallelizes the same way the guest does.
  */
 function runOne() {
   return new Promise((resolve, reject) => {
-    // `process.argv` is what `run-node.mjs` reads, so it is set before the
-    // import rather than passed -- the runner is a script, not a module with
-    // an entry point, and rewriting it to have one would change the thing
-    // every other measurement in the tree was taken with.
+    // `run-node.mjs` reads `process.argv`, so set it before importing: the
+    // runner is a script, not a module with an entry point.
     const w = new Worker(
       `
       import { parentPort, workerData } from 'node:worker_threads';
@@ -108,9 +87,8 @@ for (const n of COUNTS) {
   const { secs, each } = await round(n);
   const slowest = Math.max(...each);
   if (n === 1) baseline = slowest;
-  // Perfect scaling means each of the N guests takes as long as the single
-  // guest did: N times the work in the same wall clock. What degrades under
-  // serialization is per-guest time, not the count.
+  // Perfect scaling: each of N guests takes as long as one did. Serialization
+  // shows up as per-guest time, not the count.
   const scale = baseline / slowest;
   worst = Math.min(worst, scale);
   console.log(
@@ -120,10 +98,9 @@ for (const n of COUNTS) {
   );
 }
 
-// A generous bar, on purpose: this runs on a shared machine, and the point is
-// to catch serialization -- a lock, a shared table, a single-threaded
-// translator -- not to grade the scheduler. Half is what a badly contended
-// run looks like; 1/N is what a serialized one looks like.
+// A generous bar, on purpose: on a shared machine the point is to catch
+// serialization, not grade the scheduler. Half is heavy contention; 1/N is
+// serialized.
 if (worst >= 0.5) {
   console.log(`ok   worker-parallel (${worst.toFixed(2)}x at the worst, nothing serializes)`);
   process.exit(0);

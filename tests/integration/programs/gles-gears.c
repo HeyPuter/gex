@@ -1,21 +1,8 @@
-/* Gears, on OpenGL ES 2.0.
- *
- * The same three interlocking gears everyone has seen since glxgears in 1996,
- * written against EGL and GLES2 like any other application. Nothing here knows
- * about gex: it includes the standard headers, links against libEGL and
- * libGLESv2 by their usual sonames, and would run unchanged on a phone.
- *
- * Under gex those two libraries are marshallers and the drawing happens on the
- * host's GL, so this is the demonstration that a real program with real
- * geometry, real shaders and real per-frame uniforms gets there.
- *
- * Deliberately not glxgears itself: that one is GLX over X11, which under
- * Xwayland renders with swrast on the guest's own processor. It would look the
- * same and prove the opposite.
- *
- * It renders a fixed number of frames and writes the last one out, so a test
- * can check pixels rather than a person having to watch it.
- */
+/* Three interlocking gears on OpenGL ES 2.0, written against EGL and GLES2
+ * like any application (no gex-specific code) so the drawing goes through to
+ * the host's GL with real geometry, shaders and per-frame uniforms. Renders a
+ * fixed number of frames and writes the last one out, so a test checks pixels.
+ * Not glxgears itself: that is GLX/X11 and renders with swrast on the guest. */
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <math.h>

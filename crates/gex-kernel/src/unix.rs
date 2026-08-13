@@ -1,31 +1,14 @@
-//! Unix domain sockets, and the descriptor passing that comes with them.
+//! Unix domain sockets and `SCM_RIGHTS` descriptor passing (needed by Wayland,
+//! D-Bus, X11, and `socketpair`).
 //!
-//! These exist because of Wayland. A display server and its clients talk over
-//! `AF_UNIX`, and every interesting thing they say involves a file descriptor
-//! travelling with the message: a client allocates a shared-memory buffer,
-//! draws into it, and sends the *descriptor* so the compositor can look at the
-//! same pages. Without `SCM_RIGHTS` there is no Wayland, and without
-//! `AF_UNIX` there is no `SCM_RIGHTS`.
+//! A passed descriptor is an `Arc<OpenFile>` moved between process tables: the
+//! receiver shares the open file description, which is what makes a shared
+//! [`crate::fs::MemFd`] show both sides' writes.
 //!
-//! They are also what a great deal of ordinary Linux software expects: D-Bus,
-//! X11, syslog, systemd's notification socket, and `socketpair` as a
-//! general-purpose channel between a parent and a child.
-//!
-//! # What a descriptor is here
-//!
-//! A passed descriptor is an `Arc<OpenFile>` moved from one process's table to
-//! another's. That is what Linux does -- the receiving process gets a
-//! reference to the same open file description, not a copy of the file -- and
-//! it is what makes shared memory work: two processes mapping the same
-//! [`crate::fs::MemFd`] see each other's writes because there is one buffer
-//! behind both descriptors.
-//!
-//! Ancillary data is attached to a *position* in the byte stream rather than
-//! to a message, because a stream socket has no messages. Linux delivers a
-//! descriptor to whichever `recvmsg` picks up the byte it was sent with, and a
-//! reader that reads less than a message leaves the rest of the descriptors
-//! for the next call. Wayland depends on this precisely: it reads its
-//! fixed-size header first and the descriptors have to still be there.
+//! Ancillary data attaches to a byte *position* in the stream, not to a
+//! message: a descriptor is delivered to whichever `recvmsg` takes the byte it
+//! was sent with. Wayland depends on this -- it reads its fixed header first and
+//! the descriptors must still be queued.
 
 use crate::errno::{Errno, SysResult};
 use crate::file::OpenFile;
@@ -34,25 +17,17 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// How much a stream socket buffers before a write has to wait.
-///
-/// Linux's default is 208 KiB for `AF_UNIX`. The number matters for Wayland:
-/// a compositor that stops reading must not deadlock a client that is still
-/// sending, and a buffer this size means neither side blocks in practice.
+/// How much a stream socket buffers before a write blocks. Sized so a slow
+/// Wayland compositor cannot deadlock a client still sending.
 pub const SOCK_BUF: usize = 256 * 1024;
 
-/// One end of a connected pair, or one side of a `socketpair`.
-///
-/// The two directions are separate queues. Each end writes to one and reads
-/// from the other, so a socket is a pair of `Arc<Pipe>` swapped between the
-/// ends rather than anything cleverer.
+/// One direction of a connection. A socket is a pair of `Arc<Pipe>`, each end
+/// writing one and reading the other.
 #[derive(Debug, Default)]
 struct Stream {
     bytes: VecDeque<u8>,
-    /// Descriptors in flight, each with the byte offset they were sent at.
-    ///
-    /// The offset counts from the start of the connection, not from the head
-    /// of `bytes`, so draining the queue does not disturb it.
+    /// Descriptors in flight, each tagged with the absolute byte offset it was
+    /// sent at (from connection start, so draining `bytes` does not disturb it).
     fds: VecDeque<(u64, Arc<OpenFile>)>,
     /// Total bytes ever written to this direction.
     written: u64,
@@ -80,8 +55,7 @@ impl Pipe {
             return Err(Errno::EAGAIN);
         }
         let n = buf.len().min(room);
-        // Attach at the first byte of this write, which is where Linux puts
-        // them and what a reader taking one byte at a time expects.
+        // Attach at the first byte of this write, as Linux does.
         let at = s.written;
         for fd in fds {
             s.fds.push_back((at, fd));
@@ -93,15 +67,13 @@ impl Pipe {
 
     /// Read bytes, and the descriptors that belong to them.
     ///
-    /// `max_fds` is how many the caller left room for; the rest stay queued,
-    /// which is what Linux does when the control buffer is too small and
-    /// `MSG_CMSG_CLOEXEC` is not in play.
+    /// `max_fds` is the room the caller left; the rest stay queued, as Linux
+    /// does with a short control buffer.
     fn recv(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>), Errno> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.bytes.is_empty() {
-            // A descriptor can arrive with no bytes at all only if the sender
-            // sent none, which Linux forbids for a stream socket, so an empty
-            // buffer means either end-of-file or nothing yet.
+            // Empty buffer means end-of-file or nothing yet: a stream socket
+            // never carries descriptors without bytes.
             return if s.closed { Ok((0, Vec::new())) } else { Err(Errno::EAGAIN) };
         }
         let n = buf.len().min(s.bytes.len());
@@ -109,9 +81,8 @@ impl Pipe {
             *slot = s.bytes[i];
         }
         if peek {
-            // A peek must not consume descriptors either; report none rather
-            // than handing out a reference the next real read would hand out
-            // again.
+            // A peek must not consume descriptors, or the next real read hands
+            // out the same reference again.
             return Ok((n as u64, Vec::new()));
         }
         s.bytes.drain(..n);
@@ -174,9 +145,8 @@ enum Role {
 pub struct UnixSocket {
     role: Mutex<Role>,
     nonblocking: AtomicBool,
-    /// Sequenced-packet and datagram sockets exist; only streams are
-    /// implemented, and the type is kept so the difference can be reported
-    /// rather than silently ignored.
+    /// Only stream sockets are implemented; the flag is kept so the others can
+    /// be reported rather than silently treated as streams.
     pub stream: bool,
     /// Descriptors handed to `sendmsg` and not yet given to the stream, so
     /// the syscall layer can move them across in one step.
@@ -381,8 +351,7 @@ impl FileHandle for UnixSocket {
 
     fn poll_readable(&self) -> bool {
         match &*self.role.lock().unwrap() {
-            // A listener is "readable" when a connection is waiting, which is
-            // how `poll` reports one.
+            // A listener is "readable" when a connection is waiting.
             Role::Listening { backlog, .. } => !backlog.lock().unwrap().is_empty(),
             Role::Connected { rx, .. } => rx.readable(),
             _ => false,
@@ -412,42 +381,27 @@ impl FileHandle for UnixSocket {
     fn poll_writable(&self) -> bool {
         match &*self.role.lock().unwrap() {
             Role::Connected { tx, .. } => tx.writable(),
-            // Anything not connected has no buffer to fill, so a write on it
-            // cannot *block* -- it fails with ENOTCONN, which is a different
-            // thing and one the caller finds out by writing.
-            //
-            // This said `false`, which was harmless while `poll` answered
-            // POLLOUT from the descriptor's open mode and never asked. Now
-            // that it asks, saying no here means a socket that is not yet
-            // connected is never reported writable, and the usual
-            // non-blocking connect -- connect, then poll for POLLOUT to
-            // learn it finished -- waits for ever.
+            // Not-connected has no buffer to block on, and a non-blocking
+            // connect polls for POLLOUT to learn it finished -- so report
+            // writable rather than stranding it.
             _ => true,
         }
     }
 }
 
-/// Where listening sockets are found by name.
-///
-/// A path in the filesystem is how a client finds a server, and both may be
-/// in different processes, so this is shared the way the process table is.
-/// It is deliberately *not* the VFS: a bound socket is not a file anything
-/// reads, and putting one in the filesystem would make it openable.
+/// Where listening sockets are found by name. Deliberately not the VFS: a bound
+/// socket is not a file anything reads, and a VFS entry would make it openable.
 #[derive(Debug, Default)]
 pub struct SocketNames {
     bound: Mutex<Vec<(String, Arc<UnixSocket>)>>,
-    /// Sockets the host, rather than a guest process, is listening on. The
-    /// compositor is one of these.
+    /// Sockets the host (e.g. the compositor), not a guest, listens on.
     hosted: Mutex<Vec<(String, Arc<dyn HostListener>)>>,
     next_inode: AtomicUsize,
 }
 
-/// A listener the host implements.
-///
-/// The Wayland compositor lives in the host, so a guest client connecting to
-/// `$XDG_RUNTIME_DIR/wayland-0` has to reach something that is not a guest
-/// process. The host binds a name, and every guest connection to it produces
-/// a socket pair whose far end the host drives.
+/// A listener the host implements: the Wayland compositor lives in the host, so
+/// a guest connecting to `wayland-0` produces a socket pair whose far end the
+/// host drives.
 pub trait HostListener: Send + Sync + std::fmt::Debug {
     /// A guest has connected. The far end of its socket is handed over; the
     /// host keeps it and services it.
@@ -513,8 +467,6 @@ impl SocketNames {
             host.accept(theirs);
             return Ok(0);
         }
-        // Linux distinguishes "no such file" from "nothing listening", and a
-        // client that gets the wrong one retries differently.
         Err(Errno::ECONNREFUSED)
     }
 
@@ -669,29 +621,20 @@ mod tests {
     }
 }
 
-/// An anonymous file that lives only in memory: `memfd_create`.
+/// An anonymous in-memory file: `memfd_create`. How a Wayland client allocates
+/// a buffer -- create, `ftruncate`, map shared, draw, send the descriptor.
 ///
-/// This is how a Wayland client allocates a buffer. It creates one, sizes it
-/// with `ftruncate`, maps it shared, draws into the mapping, and sends the
-/// descriptor to the compositor. Nothing ever gives it a name.
-///
-/// The bytes live here, and a `MAP_SHARED` mapping of one is recorded in the
-/// kernel's shared-map list, which is what lets the compositor find the
-/// pixels: it looks up the mapping this descriptor has in the guest's address
-/// space and reads them out of guest memory directly, with no copy. The
-/// `Vec` below is what `read`, `write` and `ftruncate` see before that
-/// mapping exists.
+/// A `MAP_SHARED` mapping is recorded in the kernel's shared-map list so the
+/// compositor can read the pixels out of guest memory with no copy. The `Vec`
+/// is what `read`/`write`/`ftruncate` see before such a mapping exists.
 #[derive(Debug, Default)]
 pub struct MemFd {
     pub name: String,
     data: Mutex<Vec<u8>>,
-    /// Seals applied with `F_ADD_SEALS`. See [`seal`].
-    ///
-    /// Enforced rather than recorded. A caller seals a buffer precisely so it
-    /// can stop checking -- Xwayland seals its shared memory against
-    /// shrinking so the compositor cannot be made to read off the end of it --
-    /// and accepting the seal while ignoring it hands back the guarantee
-    /// without the safety.
+    /// Seals applied with `F_ADD_SEALS`, enforced rather than recorded:
+    /// Xwayland seals shared memory against shrinking so the compositor cannot
+    /// read off the end, and an ignored seal hands back the guarantee without
+    /// the safety.
     seals: Mutex<u32>,
 }
 
@@ -810,22 +753,13 @@ impl FileHandle for MemFd {
 
 /// Whole-file advisory locks: `flock`.
 ///
-/// A lock belongs to the *open file description*, not to the descriptor and
-/// not to the process, so `dup` and `fork` share one lock and two separate
-/// `open`s of the same path contend. That is the rule that makes `flock`
-/// usable as a mutex between a parent and a child, which is what most callers
-/// want it for.
+/// A lock belongs to the *open file description*, so `dup`/`fork` share one and
+/// two separate `open`s of a path contend -- the rule that makes `flock` a
+/// parent/child mutex.
 ///
-/// Debconf found the absence of this: perl's `flock` returned ENOSYS, and
-/// debconf reported it as "locked by another process", so configuring
-/// `x11-common` failed and everything depending on it stayed unconfigured.
-///
-/// One deviation, deliberate and narrow. A blocking request that cannot be
-/// granted returns `EWOULDBLOCK` rather than waiting, because waiting needs
-/// the syscall to be suspended and resumed and there is nothing here that
-/// contends in practice. A spurious `EWOULDBLOCK` is a caller retrying; the
-/// alternative -- granting every lock, which is what "always succeed" does --
-/// is two processes writing the same file believing they are alone.
+/// Deliberate deviation: a blocking request that cannot be granted returns
+/// `EWOULDBLOCK` rather than waiting (nothing here contends in practice), since
+/// granting it anyway would let two writers believe they are alone.
 #[derive(Debug, Default)]
 pub struct FileLocks {
     held: Mutex<Vec<Held>>,
@@ -853,13 +787,9 @@ impl FileLocks {
         FileLocks::default()
     }
 
-    /// Apply an operation on behalf of one open file description.
-    ///
-    /// `file` names the resource and `key` the owner. Both are needed and
-    /// leaving out the first is a mistake worth naming: with the conflict
-    /// test written over owners alone, a lock on one file refused a lock on
-    /// every other, and debconf -- which locks four unrelated databases in a
-    /// row -- got as far as the second.
+    /// Apply an operation for one open file description. `file` names the
+    /// resource, `key` the owner -- both matter, or a lock on one file wrongly
+    /// conflicts with every other.
     pub fn flock(&self, file: &str, key: usize, op: u64) -> SysResult {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         if op & lock_op::UN != 0 {
@@ -876,8 +806,7 @@ impl FileLocks {
         if conflict {
             return Err(Errno::EWOULDBLOCK);
         }
-        // Re-locking the same description converts the mode, which is what
-        // Linux does rather than stacking two locks.
+        // Re-locking the same description converts the mode, not stacks a lock.
         held.retain(|h| !(h.file == file && h.key == key));
         held.push(Held {
             file: file.to_string(),
@@ -959,18 +888,9 @@ mod lock_tests {
     }
 }
 
-/// An `epoll` set: the descriptors a program is watching, and what it wants
-/// to be told about each.
-///
-/// `poll` hands the kernel its whole list on every call; `epoll` keeps the
-/// list in the kernel and the call only asks what has happened. For a program
-/// watching a handful of descriptors the two are the same amount of work, and
-/// this implementation makes that literal -- an `epoll_wait` turns the
-/// registrations back into the list `poll` already knows how to answer.
-///
-/// It exists because every serious event loop uses it. Xwayland's was the one
-/// that forced the issue: `epoll_create1` returned ENOSYS and it stopped with
-/// "failed to allocate poll structure" before printing anything else.
+/// An `epoll` set: the descriptors a program watches and what it wants told
+/// about each. `epoll_wait` turns the registrations back into the list `poll`
+/// already knows how to answer.
 #[derive(Debug, Default)]
 pub struct EpollSet {
     watched: Mutex<Vec<Watch>>,
@@ -981,8 +901,7 @@ pub struct EpollSet {
 pub struct Watch {
     pub fd: i32,
     pub events: u32,
-    /// The opaque word the caller wants handed back, which is how it finds
-    /// its own state again. Usually a pointer.
+    /// Opaque word handed back to the caller (usually a pointer to its state).
     pub data: u64,
 }
 
@@ -1072,22 +991,13 @@ mod epoll_tests {
     }
 }
 
-/// Unix sockets that live in another wasm module.
-///
-/// A socket's two ends are, by definition, in two processes -- and with a
-/// Worker per process those are two memories, where the `Arc<Pipe>` above
-/// means nothing. The X server binds `/tmp/.X11-unix/X0` in its own Worker
-/// and its client, a third Worker, looks in a name table that has never
-/// heard of it.
-///
-/// So the socket lives in the global kernel and each end is a number. The
-/// implementation there is this same `UnixSocket` -- both ends are local to
-/// *it* -- and all that crosses is an id and, for a read or a write, the
-/// bytes.
+/// Unix sockets that live in the global kernel module. With a Worker (and its
+/// own memory) per process, the two ends of a socket sit in two memories where
+/// the `Arc<Pipe>` above means nothing, so the socket lives in the shared
+/// kernel and each end is just an id; only the id and the bytes cross.
 #[derive(Clone, Copy)]
 pub struct Remote {
-    /// Bind and listen in one: a remote socket has no state between the two
-    /// worth modelling. Returns a listener id or a negated errno.
+    /// Bind and listen in one. Returns a listener id or a negated errno.
     pub bind: extern "C" fn(path: u32, path_len: u32) -> i32,
     /// Connect to a name. Returns this end's id, or a negated errno.
     pub connect: extern "C" fn(path: u32, path_len: u32) -> i32,

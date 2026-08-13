@@ -1,8 +1,5 @@
-// The demo page.
-//
-// Three demos, one terminal, one runtime. Each demo says what it needs (a
-// binary, a root filesystem, a network) and the shell around it handles the
-// fetching, the progress and the terminal.
+// The demo page: several demos, one terminal, one runtime. Each demo says what
+// it needs and the chrome around it handles fetching, progress and the terminal.
 
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
@@ -33,14 +30,9 @@ const term = new Terminal({
   fontSize: 13,
   lineHeight: 1.25,
   cursorBlink: true,
-  // `convertEol` is off, and that is the change rather than an omission.
-  //
-  // It turns every `\n` into `\r\n` unconditionally, which is the terminal
-  // doing the kernel's job: `ONLCR` in `c_oflag` is what a Unix program is
-  // relying on when it writes a bare `\n`, and a program that *clears*
-  // `OPOST` -- `less`, `vi`, anything placing its own cursor -- is asking for
-  // the opposite and was not getting it. The guest's terminal now honours the
-  // flag it was always told about; see `gex_kernel::tty::Tty::output`.
+  // Off deliberately: it would turn every `\n` into `\r\n`, doing the kernel's
+  // `ONLCR` job and overriding a program that clears `OPOST` (`less`, `vi`).
+  // The guest's tty honours the flag itself; see `gex_kernel::tty::Tty::output`.
   convertEol: false,
   scrollback: 5000,
   theme: {
@@ -52,10 +44,8 @@ const term = new Terminal({
     blue: '#7aa2f7', magenta: '#bb9af7', cyan: '#7dcfff', white: '#c0caf5',
   },
 });
-// The whole scrollback, for something other than a person reading the page.
-// `.xterm-rows` is the viewport and nothing else, so a run that scrolls --
-// which is every interesting one -- loses everything above the fold, which
-// is where a failure's first line always is.
+// The whole scrollback, for a test rather than a person: reading `.xterm-rows`
+// would lose everything above the fold, where a failure's first line is.
 window.gexTerminalText = () => {
   const b = term.buffer.active;
   const out = [];
@@ -65,17 +55,9 @@ window.gexTerminalText = () => {
   return out.join('\n');
 };
 
-// Typing, for something other than a person.
-//
-// The sibling of `gexTerminalText`: that one reads the screen, this one puts
-// keystrokes in. `?cmd=` writes a script and runs it, which is a different
-// program from a person at a prompt -- `bash -i` turns on job control,
-// `tcsetpgrp` and a raw-mode line editor, and a script turns on none of them.
-// A fault that only shows on the *second* command typed at a prompt was
-// therefore beyond every test here.
-//
-// `term.input` is xterm's own entry point for input, so this goes through the
-// line discipline exactly as a keypress does rather than around it.
+// Typing, for a test: the sibling of `gexTerminalText`, letting one drive a
+// prompt (with job control and a raw-mode line editor) rather than `?cmd=`'s
+// script. `term.input` goes through the line discipline as a keypress does.
 window.gexType = (text) => term.input(text, true);
 
 const fit = new FitAddon();
@@ -103,10 +85,8 @@ const ansi = {
 function status(text, kind = '') {
   ui.status.textContent = text;
   ui.status.className = kind;
-  // Announced as well as displayed, so something other than a person can
-  // tell whether a demo got where it was going. `web/test/site.mjs` drives
-  // the built bundle through a real browser and listens for this; without it
-  // the only way to check the page was to look at it.
+  // Announced as well as displayed, so `web/test/site.mjs` can tell whether a
+  // demo got where it was going.
   window.dispatchEvent(new CustomEvent('gex:status', { detail: { text, kind } }));
 }
 
@@ -162,10 +142,9 @@ const ctx = {
       const b = document.createElement('button');
       b.className = `act${a.primary ? ' primary' : ''}`;
       b.textContent = a.label;
-      // Hand the keyboard back to the terminal. A button keeps the focus
-      // after it is clicked, and one that disables itself -- which the Boot
-      // buttons do -- drops it to the body instead, where keystrokes go
-      // nowhere at all.
+      // Hand the keyboard back to the terminal: a button that disables itself
+      // (the Boot buttons do) drops focus to the body, where keystrokes go
+      // nowhere.
       b.onclick = (ev) => {
         const r = a.onClick(ev);
         term.focus();
@@ -178,9 +157,8 @@ const ctx = {
   hint(text) {
     ui.hint.textContent = text;
   },
-  /// Undo something when the demo is left. A demo that puts anything on the
-  /// page -- the gears put a canvas there -- has to take it away again, and
-  /// doing that here means the demo does not have to know when it happens.
+  /// Undo something when the demo is left, so a demo that adds to the page (the
+  /// gears' canvas) need not know when the teardown happens.
   onLeave(fn) {
     leaving.push(fn);
   },
@@ -231,16 +209,9 @@ DEMOS.forEach((d, i) => {
 
 // -- start ----------------------------------------------------------------
 
-// Anything that throws where nobody is catching, into the terminal.
-//
-// The site reports what a demo's own promise rejects with, and nothing else.
-// A throw in a Worker, in the page's own code, or in a promise nobody awaited
-// went to a console that a person watching a terminal never opens -- so a run
-// that died looked like a run that had gone quiet, and the demo sat at its
-// last heartbeat with the guest's pc frozen where the Worker had left it.
-// "apt update crashes and there's a throw that never gets printed" is exactly
-// this, and it stayed unidentified for as long as it did because the evidence
-// was one panel away from the failure.
+// Anything that throws where nobody is catching, into the terminal as well as
+// the console: a demo's own rejection was all the site reported, so a throw in
+// a Worker or an unawaited promise made a dead run look like a quiet one.
 for (const [event, describe] of [
   ['error', (e) => `${e.message} at ${e.filename}:${e.lineno}`],
   ['unhandledrejection', (e) => `unhandled rejection: ${e.reason?.stack || e.reason?.message || String(e.reason)}`],
@@ -258,11 +229,8 @@ for (const [event, describe] of [
 }
 
 (async function start() {
-  // `?harness=1` is not a demo. It boots the runtime against a rootfs served
-  // from a real directory and then answers commands over HTTP for as long as
-  // the driver is there -- see `web/test/harness.mjs`. Nothing of the site's
-  // UI is involved, because the point is to pay for the browser once and ask
-  // many questions, rather than reload the page for each one.
+  // `?harness=1` is not a demo: it answers commands over HTTP with no site UI
+  // involved -- see `web/test/harness.mjs` and `harness.js`.
   if (new URLSearchParams(location.search).get('harness')) {
     const { start: harness } = await import('./harness.js');
     await harness();
@@ -286,39 +254,23 @@ for (const [event, describe] of [
   } finally {
     idle();
   }
-  // `?demo=` as well as `#demo`, so a link can carry the demo's own options
-  // in the query alongside it.
+  // `?demo=` as well as `#demo`, so a link can carry the demo's options.
   const params = new URLSearchParams(location.search);
-  // The same switches the harness page has, on the demo page too.
-  //
-  // These existed only inside `harness.js`, so the one page a test can
-  // actually drive -- the built site, with its own rootfs and its own
-  // network -- could not be told to defer differently or to narrate a crash.
-  // Every question about the demo had to be answered on a different page
-  // running a different program, and the two disagreed: the harness ran apt
-  // against a `file:` repository and passed for days while the site crashed
-  // on every run. A switch that cannot be reached where the failure happens
-  // is not a switch.
+  // The same switches the harness page has, through globals because the demos
+  // call `runProgram` with their own arguments and there is no seam to pass one
+  // through.
   if (params.has('adopt')) globalThis.GEX_ADOPT_AFTER = Number(params.get('adopt'));
-  // `?recompile=N`: KiB of mapped text per object to statically recompile
-  // once it proves hot, and 0 to leave the guest to arrive one dispatch miss
-  // at a time. It is on by default here and off by default under
-  // `run-node.mjs`, which is exactly the kind of difference that has to be
-  // switchable from outside: three `ls` in this page lift 78,000 blocks each
-  // while the shared store reports `hit=241 miss=0`, and whether that is
-  // whole-object recompilation redoing work already stored cannot be decided
-  // without turning it off.
+  // `?recompile=N`: KiB of mapped text per object to statically recompile once
+  // hot, 0 to arrive one dispatch miss at a time. On by default here, off under
+  // `run-node.mjs` -- a difference that has to be switchable to attribute a
+  // fault to one host.
   if (params.has('recompile')) globalThis.GEX_RECOMPILE_OBJECTS = Number(params.get('recompile'));
   if (params.has('permiss')) globalThis.GEX_PER_MISS = Number(params.get('permiss'));
   // `?link=1`: keep the address space the guest's `ld.so` produced and start
-  // the next process of the same program from it. Through a global for the
-  // same reason as the rest of these -- the page's demos call `runProgram`
-  // with their own arguments and there is no seam to pass one through.
+  // the next process of the same program from it.
   if (params.has('link')) globalThis.GEX_LINK = Number(params.get('link'));
-  // `?heartbeat=N`: every N syscalls, print the census -- how many of each
-  // kind and how long was spent inside them. The one instrument that says
-  // whether a process's time is in its syscalls or between them, and it was
-  // reachable only by editing the page.
+  // `?heartbeat=N`: every N syscalls, print the census -- how many of each kind
+  // and how long was spent inside them.
   if (params.has('heartbeat')) globalThis.GEX_HEARTBEAT = Number(params.get('heartbeat'));
   if (params.get('debug')) {
     globalThis.GEX_DEBUG_EXIT = 1;
@@ -327,16 +279,12 @@ for (const [event, describe] of [
   const asked = params.get('demo') || location.hash.slice(1);
   const want = DEMOS.find((d) => d.id === asked) || DEMOS[0];
   await select(want);
-  // `?run=1` presses the demo's own first button. A link that shows someone
-  // the thing rather than a button that shows it -- and the only way a test
-  // can drive the page without reaching inside it.
+  // `?run=1` presses the demo's own first button, so a test can drive the page
+  // without reaching inside it.
   if (params.get('run')) {
-    // Waited for, not assumed. A demo registers its actions during setup,
-    // and setup may await a fetch first -- so clicking the instant `select`
-    // resolves finds nothing, and `?.click()` on nothing is a silent no-op.
-    // Every demo on the site then sat there doing exactly what it was asked
-    // to do, which was nothing, and the page test reported "timeout, last
-    // status: (none)" for all of them.
+    // Waited for, not assumed: a demo registers its actions during setup, which
+    // may await a fetch first, so clicking the instant `select` resolves finds
+    // nothing.
     for (let i = 0; i < 100; i++) {
       const b = document.querySelector('#actions .act.primary');
       if (b) {

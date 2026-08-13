@@ -2,10 +2,8 @@
 //!
 //!     cargo run -p gex-virgl --example probe
 //!
-//! Worth having as a program rather than a note in a README: "the guest sees
-//! no GPU" has several causes -- no library, no EGL, no driver behind the EGL
-//! -- and they need different fixes. This says which one it is before anyone
-//! starts translating a binary to find out.
+//! "The guest sees no GPU" has several causes -- no library, no EGL, no driver
+//! behind it -- with different fixes. This says which one it is.
 
 fn main() {
     if !gex_virgl::AVAILABLE {
@@ -15,9 +13,6 @@ fn main() {
     match gex_virgl::Virgl::new() {
         Ok(mut v) => {
             println!("virgl: {}", v.describe());
-            // The capability set is what the guest's Mesa reads to decide
-            // which GL version it can offer. An empty one means the host
-            // context came up but has nothing behind it.
             // A renderer context is the first thing any client asks for, so
             // failing here means nothing else can be tried.
             match v.context_create("probe") {

@@ -2,17 +2,11 @@
 //
 //   node web/test/fs-shared.mjs
 //
-// The third thing processes share, and the one without which the other two do
-// not help. A shell that unpacks a rootfs and forks hands its child an empty
-// root, and the child's `execve` cannot find the program it was forked to
-// run. Under the snapshot switcher the child got the parent's whole address
-// space and the question never came up.
-//
-// So the files live in the global kernel, and each process mounts a handle
-// onto them. What is checked here is exactly the part that could not work
-// before: a file written through one process's memory and read back through
-// another's, with the bytes crossing twice through a memory neither of them
-// owns.
+// The files live in the global kernel; each process mounts a handle onto them.
+// Checked here: a file written through one process's memory and read back
+// through another's, the bytes crossing a memory neither of them owns. Under
+// the old snapshot switcher the child inherited the parent's whole address
+// space, so this question never came up.
 import { Worker } from 'node:worker_threads';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -28,9 +22,8 @@ const bytes = new Uint8Array(readFileSync(KERNEL));
 const GUEST_PAGES = 0xffff0000 / 65536;
 const kernel = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 
-// Where the kernel's per-Worker stacks are. Probed here, from a throwaway
-// instance, because this file makes the memory and can ask before any Worker
-// exists. Every Worker below installs its own slice.
+// Where the kernel's per-Worker stacks are. Probed from a throwaway instance
+// here, before any Worker exists; each Worker below installs its own slice.
 const probe = (await WebAssembly.instantiate(
   await WebAssembly.compile(bytes),
   {
@@ -57,9 +50,8 @@ const WORKER = `
     await WebAssembly.compile(workerData.bytes),
     { env: { memory: workerData.kernel, process: proc } },
   )).exports;
-  // This Worker's own stack in the kernel module. A wasm global belongs to an
-  // instance, so each Worker has a stack pointer of its own -- and wasm-ld
-  // starts every one of them at the same address in the memory they share.
+  // This Worker's own stack. A wasm global belongs to an instance, but wasm-ld
+  // starts every one at the same shared address.
   if (workerData.stackTop) k.__stack_pointer.value = workerData.stackTop | 0;
   const u8 = new Uint8Array(proc.buffer);
   const enc = new TextEncoder();
@@ -75,9 +67,8 @@ const WORKER = `
     if (m.kind === 'write') {
       const [pa, pn] = path(m.path);
       const [da, dn] = put(DATA, enc.encode(m.text));
-      // The flags argument is an i64 in the module's type, so JS has to
-      // hand it a BigInt: a Number is a TypeError, thrown inside the Worker
-      // where nothing was looking, which reads from outside as a hang.
+      // flags is an i64 in the module type, so it must be a BigInt: a Number
+      // throws inside the Worker, which reads from outside as a hang.
       const h = k.k_fs_open(pa, pn, BigInt(m.flags ?? 0o101), 0o644); // O_WRONLY|O_CREAT
       r.handle = h;
       if (h >= 0) {

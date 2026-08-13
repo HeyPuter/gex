@@ -1,8 +1,6 @@
-/* Does a fatal signal from another process kill it?
- *
- * `timeout` sends SIGTERM to its child and then waits. If the child does not
- * die, the wait never ends -- which is what `timeout 3 sleep 30` does now
- * that the timer itself works. */
+/* Does a fatal signal from another process kill it? SIGTERM to a child asleep
+ * in nanosleep, and to one spinning (so the signal lands at a back-edge, not a
+ * syscall). */
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,8 +28,6 @@ int main(void) {
     printf("spinning child: r=%s signalled=%d\n", r == p ? "ok" : "BAD",
            WIFSIGNALED(st) ? WTERMSIG(st) : 0);
 
-    /* 3. kill(0, sig) goes to the whole process group, which is what
-       coreutils `timeout` does to re-raise on itself. */
     printf("done\n");
     return 0;
 }

@@ -1,19 +1,8 @@
-/* `saddlp`/`uaddlp` and the accumulating `sadalp`/`uadalp`.
- *
- *     uadalp v4.8h, v6.16b
- *     uaddlp v4.4s, v4.8h
- *
- * Adjacent lanes are added into lanes of twice the width, so nothing
- * overflows. libgmp's bignum kernels use them -- they were the last real
- * instruction gap in a 219-binary graphics root filesystem.
- *
- * The arrangement in the mnemonic names the destination, which is the part
- * that is easy to get backwards: `uaddlp v4.4s, v4.8h` reads eight halfwords
- * and writes four words.
- *
- * The word-to-doubleword step has no wasm instruction behind it and is built
- * from shuffles, so it gets its own case here.
- */
+/* `saddlp`/`uaddlp` and the accumulating `sadalp`/`uadalp`: adjacent lanes
+ * added into lanes of twice the width. The mnemonic's arrangement names the
+ * destination (`uaddlp v4.4s, v4.8h` reads eight halfwords, writes four words).
+ * The word-to-doubleword step has no wasm instruction and is built from
+ * shuffles, so it gets its own case. */
 #include <arm_neon.h>
 #include <stdio.h>
 #include <stdint.h>

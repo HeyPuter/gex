@@ -1,15 +1,9 @@
 //! Bulk decoder validation against binutils.
 //!
-//! Reads `objdump -d` output on stdin, re-decodes each raw encoding with
-//! `gex-isa`, and reports where we disagree. This gives coverage over millions
-//! of *real* instructions from real binaries, which no hand-written test suite
-//! matches.
-//!
 //!   aarch64-linux-musl-objdump -d /path/to/bin | cargo run --example objdump-diff
 //!
-//! Exit code is non-zero if any instruction fails to decode. Operand-text
-//! mismatches are reported but not fatal: binutils has alias spellings we do
-//! not need to reproduce exactly, whereas a mnemonic mismatch is a real bug.
+//! Exits non-zero on a mnemonic mismatch (a real bug); operand-text diffs are
+//! reported but tolerated, since binutils has alias spellings we need not match.
 
 use gex_isa::{decode, fmt::disasm, Inst};
 use std::collections::BTreeMap;
@@ -132,11 +126,8 @@ fn main() {
     }
 }
 
-/// Mnemonic pairs that name the same operation.
-///
-/// The unscaled-offset forms (`ldur`/`stur`) are a distinct *encoding* but not
-/// a distinct *semantic*: gex deliberately folds them into the plain
-/// offset addressing mode, so binutils' spelling difference is expected.
+/// Mnemonic pairs that name the same operation. gex folds the unscaled-offset
+/// forms (`ldur`/`stur`) into the plain offset mode, so their spelling differs.
 fn alias_equivalent(expect: &str, got: &str) -> bool {
     let unscaled = |m: &str| -> Option<&'static str> {
         Some(match m {
@@ -163,16 +154,13 @@ fn alias_equivalent(expect: &str, got: &str) -> bool {
             _ => return None,
         })
     };
-    // The `E` compare variants differ only in whether a quiet NaN raises an
-    // invalid-operation exception, which gex does not model.
+    // `fcmpe` vs `fcmp` differ only in NaN exception behaviour, unmodelled.
     if expect == "fcmpe" && got == "fcmp" {
         return true;
     }
     unscaled(expect) == Some(got)
 }
 
-/// Normalise for comparison, optionally dropping the mnemonic when the two
-/// sides use equivalent-but-differently-spelled mnemonics.
 fn normalize_cmp(s: &str, drop_mnemonic: bool) -> String {
     let n = normalize(s);
     if drop_mnemonic {
@@ -184,12 +172,8 @@ fn normalize_cmp(s: &str, drop_mnemonic: bool) -> String {
     }
 }
 
-/// Canonicalise assembly text so only *semantic* operand differences survive.
-///
-/// Three families of spelling difference are folded away:
-///   * hex vs decimal (`#0x10` and `#16`),
-///   * gex printing branch targets as `0x1234` where binutils prints `1234`,
-///   * gex folding `add x0, x0, #0x24, lsl #12` into the final immediate.
+/// Canonicalise assembly text so only semantic operand differences survive:
+/// folds hex/decimal, branch-target `0x` prefixes, and shifted immediates.
 fn normalize(s: &str) -> String {
     let s = s.to_ascii_lowercase().replace(['\t', ','], " ");
     let raw: Vec<&str> = s.split_whitespace().collect();
@@ -197,11 +181,9 @@ fn normalize(s: &str) -> String {
         return String::new();
     }
 
-    // binutils prints branch and pc-relative targets as bare hex; gex prefixes
-    // them with `0x`. Read the final token as hex for those mnemonics so both
-    // spellings land on the same number. This must happen before the generic
-    // decimalisation below, which would otherwise read `4cc` as a non-number
-    // and `0x4cc` as decimal 1228.
+    // binutils prints branch/pc-relative targets as bare hex, gex with `0x`.
+    // Read the final token as hex for those mnemonics; must run before the
+    // generic decimalisation, which would misread `4cc` and `0x4cc`.
     let m = raw[0];
     let pc_rel = matches!(m, "b" | "bl" | "adr" | "adrp")
         || m.starts_with("b.")
@@ -222,8 +204,7 @@ fn normalize(s: &str) -> String {
         }
     }
 
-    // Fold a trailing `lsl #12` shift into the preceding immediate, which is
-    // how gex represents `add/sub/cmp (immediate, shifted)`.
+    // Fold a trailing `lsl #12` into the preceding immediate, as gex prints it.
     if toks.len() >= 3 && toks[toks.len() - 2] == "lsl" {
         if let (Ok(base), Ok(sh)) = (
             toks[toks.len() - 3].parse::<i128>(),
@@ -240,8 +221,7 @@ fn normalize(s: &str) -> String {
     toks.join(" ")
 }
 
-/// Rewrite one token to a canonical form: numbers become decimal, register
-/// and mnemonic tokens pass through unchanged.
+/// Rewrite numbers to decimal; register and mnemonic tokens pass through.
 fn canon_number(tok: &str) -> String {
     let t = tok.trim_matches(|c| c == '[' || c == ']' || c == '!' || c == '#');
     let brackets: String = tok.chars().filter(|c| "[]!".contains(*c)).collect();

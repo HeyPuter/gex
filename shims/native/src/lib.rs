@@ -1,10 +1,5 @@
-//! The native host: wasmtime plus the kernel bindings.
-//!
-//! This is the CI workhorse of PLAN §9. It owns the wasm engine, wires the
-//! `gex.*` imports to `gex-kernel`, places the guest image and initial stack
-//! in linear memory, and calls `enter`. The browser shim will do the same
-//! things through Workers and a SharedArrayBuffer; keeping the two hosts thin
-//! is what makes a single kernel implementation serve both.
+//! The native host: wasmtime plus the kernel bindings. A debug-only adapter;
+//! the browser is the real target.
 
 #![forbid(unsafe_code)]
 
@@ -32,11 +27,9 @@ pub enum Exit {
         signal: i32,
         pc: u64,
         detail: String,
-        /// True when the signal reflects a gex limitation rather than the
-        /// guest's own behaviour — an instruction we cannot execute, an
-        /// address with no translation. Those deserve a message on stderr; an
-        /// ordinary fatal signal does not, because Linux prints nothing
-        /// either and the shell reports the exit status.
+        /// True when the signal reflects a gex limitation, not the guest's own
+        /// behaviour — those get a stderr message, an ordinary fatal signal
+        /// does not.
         internal: bool,
     },
 }
@@ -50,16 +43,9 @@ impl Exit {
         }
     }
 
-    /// The status `wait4` reports, which is not the same number.
-    ///
-    /// A shell shows `128 + signal` for a death by signal, and that is what
-    /// [`Exit::code`] gives. The kernel's own encoding is different: the
-    /// signal goes in the low seven bits, with `0x80` set if a core would
-    /// have been written, and a normal exit puts its code in bits 8 to 15.
-    /// `WIFSIGNALED` tests the low bits, so storing `128 + signal` makes a
-    /// killed child look like one that exited normally with a large code --
-    /// which is what gex reported, and why `timeout` could not tell that the
-    /// program it killed had been killed.
+    /// The status `wait4` reports, in the kernel's encoding: signal in the low
+    /// seven bits, exit code in bits 8..15. Not [`Exit::code`]'s `128 + signal`,
+    /// which would make a killed child look like a normal exit to `WIFSIGNALED`.
     pub fn wait_status(&self) -> i32 {
         match self {
             Exit::Status(c) => (c & 0xff) << 8,
@@ -98,19 +84,14 @@ pub struct RunOptions {
     /// Host directory presented as the guest's root. Without one the guest
     /// sees the host filesystem directly.
     pub sysroot: Option<std::path::PathBuf>,
-    /// Who the guest thinks it is. `None` reports the host's own ids, which
-    /// is what a passthrough filesystem needs to stay consistent -- a guest
-    /// that stats a file it owns and then calls `getuid` must get the same
-    /// answer. A sysroot is a different situation: it is the guest's whole
-    /// world, and a package manager in it expects to be root.
+    /// Who the guest thinks it is. `None` reports the host's own ids, which a
+    /// passthrough filesystem needs for consistent stat/getuid answers.
     pub identity: Option<(u32, u32)>,
     /// Sample the guest's back-edges and report the hottest at exit.
     pub sample: bool,
     /// Where each object of the program's closure must be placed, by guest
-    /// path. See `Kernel::pins`: a module built ahead of time is only correct
-    /// if the object it was built from lands where the build assumed, and
-    /// since `ld.so` takes whatever address it is given, that is gex's to
-    /// decide rather than to predict.
+    /// path. See `Kernel::pins`: an AOT module is only correct if its object
+    /// lands where the build assumed.
     pub pins: std::collections::HashMap<String, u64>,
     /// Report at exit where each pinned object actually landed.
     pub report_pins: bool,
@@ -132,19 +113,9 @@ pub struct RunOptions {
     /// on the host's GL. See the `gl` module.
     pub gl: bool,
     /// Statically recompile each shared library as it is mapped, instead of
-    /// letting the runtime translator find it a dispatch miss at a time.
-    ///
-    /// Off by default, and the reason is measured rather than assumed. On
-    /// `dpkg --version` the demand-driven path costs 0.60s warm; recompiling
-    /// every object costs 32s warm and three and a half minutes cold. The
-    /// modules are the problem: seeding from every decodable address gives
-    /// 200,000 blocks for libc alone, and instantiating that into each store
-    /// swamps everything, while the program touches a few thousand of them.
-    ///
-    /// It is kept because the *approach* is right and the seeding is wrong.
-    /// Seeding from the dynamic symbol table instead of from every address
-    /// would cut it by an order of magnitude, and a tier-2 pass over a whole
-    /// object can see things a demand-driven one cannot.
+    /// letting the runtime translator find it a dispatch miss at a time. Off
+    /// by default: measured slower (32s vs 0.60s warm on `dpkg --version`)
+    /// because scanning seeds far more blocks than the program touches.
     pub recompile_objects: bool,
     /// Feed the previous run's discovered entry points into this one's
     /// translation. Off by default; see the note in `run_program_with`.
@@ -172,21 +143,10 @@ impl Default for RunOptions {
             pins: std::collections::HashMap::new(),
             report_pins: false,
             wayland: None,
-            // On unless the build cannot render or the caller says
-            // `--no-virgl`.
-            //
-            // It costs nothing until something connects: the name is bound,
-            // and the host renderer -- which is a Mesa initialisation -- is
-            // not brought up until a client arrives. What it buys is that an
-            // unmodified OpenGL program in the guest simply works, which is
-            // the whole point of serving VirGL rather than an API of our own.
-            //
-            // Off-by-default was worse than it looks. Mesa's vtest winsys
-            // does not fall back when the socket is missing: it takes the
-            // ECONNREFUSED, writes its handshake into the dead descriptor
-            // anyway, and then blocks reading a reply that cannot come.
-            // `glxinfo` under a forgotten `--virgl` does not fail, it hangs
-            // in `read` forever, and nothing on the way there says why.
+            // On unless the build cannot render. Costs nothing until a client
+            // connects (the renderer is brought up lazily). On by default
+            // because Mesa's vtest winsys hangs forever in `read` when the
+            // socket is missing rather than failing.
             virgl: virgl::VirglDevice::available()
                 .then(|| virgl::DEFAULT_SOCKET.to_string()),
             wayland_size: (640, 480),
@@ -197,8 +157,7 @@ impl Default for RunOptions {
             profile: false,
             jit: false,
             cwd: None,
-            // On by default: it is the difference between half a minute and
-            // half a second on a program the size of SQLite, and a cache miss
+            // On by default: half a minute vs half a second on SQLite; a miss
             // costs only the write.
             cache: true,
         }
@@ -302,13 +261,10 @@ struct Jit {
     shared: Arc<Mutex<JitShared>>,
     engine: Engine,
     linker: Linker<HostState>,
-    /// Every dispatch table, in index order; `tables[0]` is the one that
-    /// holds the miss span and everything a program this size ever needs.
-    ///
-    /// There are several because V8 caps a table at ten million entries, and
-    /// the emitted code selects between them with a `br_table`, so every
-    /// index the code names has to exist even here where nothing reaches the
-    /// second. Natively there is no such cap and tables 1 and up stay empty.
+    /// Every dispatch table, in index order; `tables[0]` holds the miss span
+    /// and everything a program this size needs. Several exist only because V8
+    /// caps a table at 10M entries and the code `br_table`s between them;
+    /// natively tables 1+ stay empty but must exist because the code names them.
     tables: Vec<Table>,
     /// Where compiled runtime translations are kept, and the build they
     /// belong to. `None` when the cache is off or this build cannot name
@@ -367,13 +323,9 @@ impl HostState {
     }
 }
 
-/// A trap used to unwind out of translated code.
-///
-/// Both stopping and *redirecting* use it. Redirecting is what signal
-/// delivery needs: the guest's registers are already in the context at every
-/// host call, so abandoning the wasm stack and re-entering at a new PC loses
-/// nothing (PLAN §2.4). Unwinding this way also keeps the common syscall path
-/// free of a return-value check.
+/// A trap used to unwind out of translated code, for both stopping and
+/// redirecting. Redirecting works because the guest's registers live in the
+/// context at every host call, so re-entering at a new PC loses nothing.
 #[derive(Debug)]
 struct StopExecution;
 
@@ -385,12 +337,9 @@ impl std::fmt::Display for StopExecution {
 
 impl std::error::Error for StopExecution {}
 
-/// The cache key for an image: everything that determines the wasm.
-///
-/// The *placed* segments rather than the file, because that is what the
-/// translator reads -- two builds of the same program that differ only in a
-/// section the loader drops should share an entry, and the same file loaded at
-/// a different bias must not.
+/// The cache key for an image: everything that determines the wasm — the
+/// placed segments rather than the file, because that is what the translator
+/// reads.
 fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
     let mut fields: Vec<Vec<u8>> = vec![
         image.bias.to_le_bytes().into(),
@@ -410,16 +359,9 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
     gex_cache::key(build, fields.iter().map(|f| f.as_slice()))
 }
 
-/// Build, instantiate and run a guest image to completion.
 /// Check that a module is well-formed wasm, without compiling or running it.
-///
-/// Emitting a module that does not validate is never useful, and the lifter
-/// can produce one: an `smov x0, v0.h[2]` asked for a 64-bit value from a lane
-/// extract that yields a 32-bit one, and nothing noticed until wasmtime
-/// refused the module 182 MB in. Validation is a fraction of the cost of
-/// translating, so `gexc build` does it every time, and an exhaustive
-/// translation of a large real binary is the best lifter test there is --
-/// it reaches encodings no program gex has ever run would execute.
+/// Cheap next to translating, so `gexc build` does it every time; catches
+/// lifter bugs wasmtime would otherwise only reject deep into a module.
 pub fn validate_module(wasm: &[u8]) -> Result<()> {
     let mut config = Config::new();
     config.wasm_tail_call(true);
@@ -445,22 +387,11 @@ pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Res
     run_program_with(program, opts, xlate, None)
 }
 
-/// `run_program`, optionally reusing a kernel from a process that `execve`d.
-///
-/// Exec keeps the process: its pid, its descriptors, its working directory.
-/// What it replaces is the address space and the program in it, which from
-/// here is the same work as starting fresh -- so this is the same function,
-/// told not to build a new kernel.
-/// What survives an `execve`.
-///
-/// The kernel and the process table, obviously. Less obviously the host-side
-/// devices: the compositor and the virtio-gpu renderer each bind a name in
-/// the guest's socket namespace, and `execve` re-enters the function that
-/// created them. Building a second one rebinds the name, so a client that
-/// connects afterwards is accepted by the new device while the process that
-/// would service it holds the old -- which is a guest blocked forever on a
-/// reply nobody is going to write. A shell's fork-then-exec hits this every
-/// time; `glxinfo` under Xvfb was the case that found it.
+/// What survives an `execve`: the kernel, the process table, and the host-side
+/// devices. The devices must be kept because rebinding their socket name would
+/// leave a later client talking to a device the old process still services.
+/// (`run_program_with` keeps the process — pid, descriptors, cwd — and replaces
+/// the address space and program, which is the same work as starting fresh.)
 struct Inherited {
     kernel: Kernel,
     proc_state: Arc<Mutex<ProcState>>,
@@ -476,51 +407,21 @@ fn run_program_with(
 ) -> Result<(Exit, Stats)> {
     let image = &program.exe;
 
-    // A profile records where a previous run's execution actually went, which
-    // is how gex learns the entry points static discovery cannot reach. It
-    // feeds `extra_entries`, so it changes the translation and therefore the
-    // cache key: a run that discovers something new compiles once more and
-    // then settles.
+    // A profile records where a previous run went, feeding `extra_entries` so
+    // discovery reaches entry points static analysis cannot. It changes the
+    // cache key, so a run that discovers something new recompiles once.
     //
-    // Worth knowing before measuring anything: "once more" is a whole
-    // recompilation, and Cranelift on a megabyte of guest text is tens of
-    // seconds. A binary with many independent entry points pays it once per
-    // path. `busybox md5sum` took 29 seconds and then 0.148; `busybox wget`
-    // took 27 and then 0.656. Both look exactly like a runtime problem in the
-    // program being measured, and neither is -- so warm the path first, or
-    // pass --no-cache and measure the build honestly.
-    // A build that cannot identify itself must not use the cache: it cannot
-    // be distinguished from a different one, and reusing another build's
-    // compiled code is how a fixed translator serves broken output.
+    // A build that cannot identify itself must not use the cache: reusing
+    // another build's compiled code would serve stale translations.
     let build = gex_cache::build_fingerprint();
     let use_cache = opts.cache && build.is_some();
     let build = build.unwrap_or_default();
     let profile_dir = use_cache.then(gex_cache::profile_dir).flatten();
     let image_key = cache_key(image, &Options::default(), &build);
     let mut xlate = xlate.clone();
-    // Off unless asked for, because it was measured and did not pay.
-    //
-    // The profile records where execution actually went, so the next
-    // translation can include entry points static discovery cannot reach.
-    // The catch is that it changes the translation and therefore the cache
-    // key, so the second run of every program recompiles from scratch --
-    // for, on Debian bash, 230 extra blocks out of 51,000.
-    //
-    // Measured four consecutive runs, wall clock, with compilation parallel:
-    //
-    //     bash            with 9s 6s 0s 1s     without 8s 1s 1s 2s
-    //     busybox md5sum  with 6s 5s 0s 0s     without 5s 1s 0s 0s
-    //
-    // Both reach the same steady state. The profile costs five or six
-    // seconds on the second run and buys nothing measurable after it. The
-    // coverage is real -- fewer dispatch misses -- it just does not pay for
-    // its own recompilation on programs of this size, and those are the
-    // programs people run.
-    //
-    // Still written on every run, so turning it on costs nothing but the
-    // recompile it asks for. Kept rather than deleted because a long-running
-    // program with many cold indirect branches is the case that could still
-    // want it, and that case has not been measured.
+    // Off unless asked for: measured, the profile costs a recompile on the
+    // second run and buys nothing measurable after it on programs this size.
+    // Still written every run, so turning it on costs only the recompile.
     let use_profile = opts.profile;
     if let Some(dir) = profile_dir.as_ref().filter(|_| use_profile) {
         let learned = gex_cache::read_profile(dir, &image_key);
@@ -540,12 +441,10 @@ fn run_program_with(
     config.wasm_tail_call(true);
     config.wasm_threads(true);
     config.wasm_bulk_memory(true);
-    // gex's own output is already the optimised form -- the register cache,
-    // dead-flag elimination and loop fusion have run. What Cranelift adds on
-    // top is register allocation and peepholes, and on a large program the
-    // time it takes to add them dominates everything else: a 14 MB module out
-    // of SQLite costs half a minute to compile and under two seconds to
-    // translate. `GEX_OPT_LEVEL` picks the trade.
+    // gex's output is already optimised; Cranelift only adds register
+    // allocation and peepholes, whose time dominates on a large program (half
+    // a minute to compile SQLite vs under two seconds to translate).
+    // `GEX_OPT_LEVEL` picks the trade.
     config.cranelift_opt_level(match std::env::var("GEX_OPT_LEVEL").as_deref() {
         Ok("none") => wasmtime::OptLevel::None,
         Ok("speed_and_size") => wasmtime::OptLevel::SpeedAndSize,
@@ -553,14 +452,10 @@ fn run_program_with(
     });
     let engine = Engine::new(&config).context("creating the wasm engine")?;
 
-    // Only the executable is translated ahead of time. The interpreter and
-    // everything it maps arrive through runtime translation, which is both
-    // simpler and correct: at build time we do not know where they land.
-    //
-    // Translation happens inside the cache's miss path, so a hit skips it
-    // outright -- on SQLite that is another second and a half. The `stats`
-    // a hit reports are therefore empty apart from the block count the
-    // sidecar carries, because nothing recomputed them.
+    // Only the executable is translated ahead of time; the interpreter and its
+    // libraries arrive through runtime translation, because at build time we do
+    // not know where they land. Translation is inside the cache miss path, so a
+    // hit skips it and reports empty stats apart from the sidecar block count.
     let mut stats = Stats::default();
     let translate = || {
         let (m, s) = gex_xlate::translate_image(image, xlate);
@@ -684,11 +579,8 @@ fn run_program_with(
                 k.pins = opts.pins.clone();
                 k
             },
-            // `..Default::default()` for the rest, deliberately. This site
-            // listed every field, so adding one to `ProcState` broke it --
-            // and it broke the *native* shim only, which is how `gexc` sat
-            // unbuilt for hours while the browser target compiled fine and
-            // every check came back green.
+            // `..Default::default()` for the rest: listing every field means a
+            // new `ProcState` field breaks only this native site.
             Arc::new(Mutex::new(ProcState {
                 pid: 1,
                 ppid: 0,
@@ -715,10 +607,9 @@ fn run_program_with(
     if fresh {
         mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;
     }
-    // The compositor binds a name in the guest's unix-socket namespace, which
-    // is shared across the process tree, so a client the guest forks later
-    // finds it. Bound before anything runs, because a client that connects
-    // before the name exists gets ECONNREFUSED and gives up.
+    // The compositor binds a name in the guest's unix-socket namespace (shared
+    // across the process tree). Bound before anything runs, or a client that
+    // connects first gets ECONNREFUSED and gives up.
     let compositor = kept_wayland.or_else(|| opts.wayland.as_ref().map(|path| {
         let w = wayland::Wayland::new(opts.wayland_size.0, opts.wayland_size.1);
         if let Some(out) = &opts.wayland_out {
@@ -813,15 +704,13 @@ fn run_program_with(
     store.data_mut().memory = Some(memory.clone());
 
     // Runtime translation needs the table to patch and the engine and linker
-    // to build new modules with. Holding them here is what lets a dispatch
-    // miss become a translation rather than an error.
+    // to build modules with; holding them here turns a dispatch miss into a
+    // translation.
     let tables = dispatch_tables(&mut store, &instance)?;
     let table = tables[0];
-    // The machinery here is "install a translated module into this store": a
-    // table, a linker, a registry other stores replay from. Translating on a
-    // dispatch miss is one user of it; statically recompiling a whole object
-    // the moment it is mapped is another, and that one is not runtime
-    // translation at all. `--no-jit` turns off the miss handler, not this.
+    // The machinery here installs a translated module into this store. The
+    // miss handler is one user; static object recompilation is another.
+    // `--no-jit` turns off the miss handler, not this.
     if opts.jit || opts.recompile_objects {
         store.data_mut().jit = Some(Jit {
             shared: Arc::new(Mutex::new(JitShared {
@@ -942,12 +831,9 @@ fn run_program_with(
         unreachable!()
     };
 
-    // The process is over. Every other thread has to stop before the stores
-    // and the memory they are using go away: set the flag their safepoints
-    // watch, and release anyone parked on a futex, since no guest code is
-    // going to wake them now. They are given a bounded moment to notice --
-    // long enough for a thread between safepoints, short enough that a thread
-    // wedged in a host call cannot hold up the exit.
+    // The process is over. Every other thread must stop before the stores and
+    // memory go away: set the stopping flag and wake anyone parked on a futex,
+    // then give them a bounded moment to notice.
     stop_other_threads(&spawn, opts.verbose);
 
     if let Some(s) = &sampler {
@@ -960,16 +846,9 @@ fn run_program_with(
         s.report_mapped(&vmas, opts.sysroot.as_deref().and_then(|p| p.to_str()), 20);
     }
 
-    // Where the pinned objects actually landed.
-    //
-    // A pin that does not take is the worst outcome available: a module built
-    // for one address, code running at another, and the guest branching into
-    // whatever happens to be there. The hint `mmap` honours is only honoured
-    // when the range is free, so a pin can be dropped for reasons the caller
-    // cannot see -- the first attempt at this placed every object one span
-    // below the top of the arena, and `ld.so` asks for the span *plus*
-    // alignment slack, so every reservation ran past the end and every pin
-    // was silently ignored. Nothing said so. This does.
+    // Where the pinned objects actually landed. A pin that silently does not
+    // take means code running at the wrong address, so report each one: the
+    // `mmap` hint is only honoured when the range is free.
     if opts.report_pins {
         let landed = {
             let k = store.data().kernel.lock().unwrap_or_else(|e| e.into_inner());
@@ -1049,22 +928,11 @@ fn stop_other_threads(spawn: &SpawnContext, verbose: bool) {
     }
 }
 
-/// Perform a syscall's blocking half with the kernel unlocked.
-/// What one store may hold.
-///
-/// wasmtime defaults to ten thousand instances per store, which is a sensible
-/// number for a program that instantiates a few modules and a fatal one here:
-/// gex adds an instance per runtime translation, so the ceiling is a bound on
-/// how much guest code a process may execute. `cc1` compiling SQLite's
-/// amalgamation reached it and died -- and died as a segmentation fault at a
-/// guest address, because a translation that cannot be instantiated is
-/// reported to the guest as a fault. A 9 MB translation unit looked like a
-/// miscompile; a 900 KB one worked, which made it look like one that depended
-/// on size. It was a resource limit all along.
-///
-/// The numbers are deliberately far above anything real rather than merely
-/// above what SQLite needed. Tables and memories are raised with instances
-/// because every instance may bring one.
+/// What one store may hold. wasmtime defaults to 10,000 instances, but gex
+/// adds one per runtime translation, so the default bounds how much guest code
+/// a process may execute (and overrunning it surfaces as a guest SIGSEGV).
+/// Raised far above anything real; tables and memories with it, since each
+/// instance may bring one.
 fn store_limits() -> wasmtime::StoreLimits {
     wasmtime::StoreLimitsBuilder::new()
         .instances(1 << 20)
@@ -1073,23 +941,12 @@ fn store_limits() -> wasmtime::StoreLimits {
         .build()
 }
 
-/// Run a blocking operation with the kernel unlocked.
+/// Run a syscall's blocking half outside the kernel lock.
 ///
-/// `service` is called on every turn of every wait loop. It is how anything
-/// the host provides keeps running while the guest is asleep -- and without
-/// it the compositor is a deadlock: a client writes a request, blocks waiting
-/// for the reply, and the only thing that would produce the reply runs when
-/// the guest makes a syscall, which it will not do again until the reply
-/// arrives. Xwayland found that, and found it intermittently, because a guest
-/// that happens to poll for other reasons breaks the cycle by accident.
-/// Run a syscall that had to wait, outside the kernel lock.
-///
-/// `interrupted` asks whether a signal has arrived that the guest can see. A
-/// blocking syscall has to give up when one has, with `EINTR`, or the handler
-/// only runs once the wait finishes on its own -- which is not a signal
-/// arriving late, it is the signal not working. `timeout 3 sleep 30` came
-/// back after thirty seconds reporting success; `alarm` could not bound
-/// anything; nothing could interrupt a read.
+/// `service` runs on every turn so host devices keep working while the guest
+/// sleeps — without it the compositor deadlocks. `interrupted` reports a
+/// pending signal so a blocking syscall gives up with `EINTR` rather than
+/// running its full wait.
 fn perform_block(
     op: BlockOp,
     data: &mut [u8],
@@ -1137,12 +994,7 @@ fn perform_block(
             }
             Ok(0)
         }
-        // Natively this is nearly unreachable: the host's own stdin blocks, so
-        // a stream is only ever "not readable yet" for a pipe whose writer has
-        // not written. Polling is enough for that, and it keeps the kernel
-        // unlocked while it happens.
-        // Both of these are polls. Natively there is a real thread here, so
-        // sleeping in it costs nothing anyone else needs.
+        // Both are polls; natively a real thread sleeps here, costing nobody.
         BlockOp::Connect { socket } => loop {
             match socket.status() {
                 gex_kernel::net::Status::Connecting => {
@@ -1234,9 +1086,8 @@ fn perform_block(
             want,
             wstatus,
             nohang,
-            // Which process is waiting, for a table shared between address
-            // spaces. There is one address space here, so the children list
-            // above is the whole answer.
+            // The children list passed in is already this process's, so ppid
+            // is redundant here.
             ppid: _,
         } => {
             let candidates: Vec<_> = children
@@ -1267,10 +1118,8 @@ fn perform_block(
                 if nohang {
                     return Ok(0);
                 }
-                // A halt reaches a parked `wait4` here. `EINTR` is what the
-                // guest would see if a signal had arrived, and it sends every
-                // caller back round to a syscall -- where the halt check
-                // stops it.
+                // A halt reaches a parked `wait4` here; `EINTR` sends it back
+                // to a syscall where the halt check stops it.
                 if procs.halt_code().is_some() {
                     return Err(Errno::EINTR);
                 }
@@ -1340,16 +1189,9 @@ fn run_thread_loop(
                 .spawn(move || {
                     if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
                         eprintln!("gexc: thread {} failed: {e:#}", child.tid);
-                        // A thread that fails takes its process with it. On
-                        // Linux an unhandled fault is fatal to the whole
-                        // thread group, and here it also has to be: the other
-                        // threads would otherwise sit in a futex forever, the
-                        // process would never exit, and every descriptor it
-                        // holds would stay open. A reader waiting on the other
-                        // end of one of its pipes waits for good.
-                        //
-                        // That is how a trap in dpkg's decompressor turned
-                        // into `apt-get install` hanging rather than failing.
+                        // A thread that fails takes its process with it, as on
+                        // Linux: otherwise the other threads sit in a futex
+                        // forever and every descriptor it holds stays open.
                         stop_other_threads(&cx, false);
                         cx.kernel
                             .lock()
@@ -1380,20 +1222,12 @@ fn run_thread_loop(
                 if let Some(x) = store.data().exit.clone() {
                     return Ok(Stopped::Exited(x));
                 }
-                // A dispatch through a slot this thread's table has not
-                // reached yet.
-                //
-                // Every thread of a process shares the dispatch directory --
-                // it is in guest memory -- but each has its own wasm table,
-                // filled only when its own store installs a translation. So
-                // one thread can publish a directory entry naming slot N
-                // while another's table is still shorter than N, and that
-                // thread's next branch is not a recoverable miss but a trap.
-                //
-                // It is recoverable here, and exactly, because both indirect
-                // transfers write the target into the context before they
-                // take it: the guest made no progress, and its own record of
-                // where it was going is correct. Catch up and re-enter there.
+                // A dispatch through a slot this thread's table has not reached
+                // yet. Every thread shares the dispatch directory (in guest
+                // memory) but has its own table, so one thread can publish a
+                // slot another's table is still too short for. Recoverable
+                // exactly: both indirect transfers write the target into the
+                // context before taking it, so no progress was lost.
                 if is_stale_table_trap(&e) {
                     if let Some(next) = catch_up_and_resume(store, ctx_addr)? {
                         pc = next;
@@ -1408,12 +1242,10 @@ fn run_thread_loop(
 
 /// Build and start a child process.
 ///
-/// A forked child is the same program at the same addresses, so it can reuse
-/// every module the parent has translated -- what it cannot share is the
-/// memory those modules act on. It gets a fresh one with the parent's mapped
-/// regions copied into it, which is the whole of what `fork` means here: one
-/// address space per process, and no copy-on-write, because wasm gives the
-/// host no way to fault on a write.
+/// A forked child is the same program at the same addresses, so it reuses
+/// every module the parent translated. What it cannot share is the memory: it
+/// gets a fresh one with the parent's mapped regions copied in — one address
+/// space per process, no copy-on-write, since wasm cannot fault on a write.
 fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
     let pid = req.pid;
     let cx = store
@@ -1534,14 +1366,9 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
                 Ok(exit) => (exit.code(), exit.wait_status()),
                 Err(e) => {
                     eprintln!("gexc: child {pid} failed: {e:#}");
-                    // A process that dies takes its threads and its
-                    // descriptors with it. Without this the threads sit in a
-                    // futex nobody will wake, they hold the last references
-                    // to the kernel, and every pipe the process had stays
-                    // open -- so whoever is reading the other end waits for
-                    // an end of file that cannot come. A trap in dpkg's
-                    // decompressor hung `apt-get install` that way rather
-                    // than failing it.
+                    // A process that dies takes its threads and descriptors
+                    // with it: otherwise its threads park in a futex nobody
+                    // wakes and its pipes never reach EOF for their readers.
                     stop_other_threads(&cleanup, false);
                     cleanup
                         .kernel
@@ -1834,17 +1661,8 @@ fn mount_filesystems(
     Ok(())
 }
 
-/// A `/proc` source over the snapshot the host refreshes.
-/// Where the guest spends its time, sampled at back-edge safepoints.
-///
-/// A safepoint fires every thousand-odd back-edges, so the sample is biased
-/// towards loops -- which is exactly the bias wanted. A program that is
-/// spinning is a program taking back-edges, and this says which ones.
-///
-/// It is not a general profiler: straight-line code between loops is
-/// invisible to it, and so is anything the guest does without looping. What
-/// it is good at is answering "what is it doing" when the answer is "going
-/// round and round somewhere".
+/// Where the guest spends its time, sampled at back-edge safepoints. Biased
+/// towards loops, which is the point; straight-line code is invisible to it.
 #[derive(Debug, Default)]
 pub struct Sampler {
     counts: Mutex<std::collections::HashMap<u64, u64>>,
@@ -1860,20 +1678,10 @@ impl Sampler {
             .or_insert(0) += 1;
     }
 
-    /// Print the hottest addresses, naming them through whatever is mapped
-    /// there.
-    ///
-    /// The executable's own symbols are not enough and never were. A package
-    /// manager spends its time in libapt, libc and zlib, and every one of
-    /// those addresses printed as `?` -- twenty rows of question marks, which
-    /// is a profile nobody can act on. What names them is the vma table:
-    /// every mapping records the file it came from and the offset within it,
-    /// so a hot address gives up its object, and the object's own symbol
-    /// table gives up the function.
-    ///
-    /// `root` is the sysroot the guest paths are relative to, or `None` when
-    /// they are host paths. An object that cannot be read still gets its name
-    /// and offset, which is most of the answer.
+    /// Print the hottest addresses, naming them through the vma table so a hot
+    /// address in a library resolves to its object and function rather than
+    /// `?`. `root` is the sysroot guest paths are relative to, or `None` for
+    /// host paths.
     pub fn report_mapped(
         &self,
         vmas: &[gex_kernel::mem::Vma],
@@ -1997,23 +1805,15 @@ static RECOMPILE_OBJECTS: std::sync::atomic::AtomicBool =
 /// installation machinery exists.
 static JIT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Whether to print the guest's registers and stack when it aborts.
-///
-/// `abort` is the end of the road for a guest: it raises SIGABRT at itself and
-/// nothing runs afterwards, so unless the state is captured at the syscall it
-/// is gone. glibc's `__stack_chk_fail` arrives here, and the interesting
-/// question -- which function's canary failed -- is answerable only from the
-/// return addresses still on the stack.
+/// Whether to print the guest's registers and stack when it aborts. `abort`
+/// unwinds nothing, so the state must be captured at the syscall or it is gone
+/// (e.g. which function's canary failed, from the stack's return addresses).
 static DUMP_ABORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// A watch on a range of guest memory: `GEX_WATCH=<hex addr>[+<hex len>]`.
-///
-/// Corruption is found by asking who wrote to a place, and a translated guest
-/// has no hardware watchpoint to ask with. This is the next best thing: the
-/// bytes are remembered, and every safepoint and every syscall compares them
-/// and reports the first pc at which they differ. A back-edge poll is a coarse
-/// net -- the write happened somewhere in the loop, not at the pc printed --
-/// but it narrows a whole program down to one loop, which is the hard part.
+/// A watch on a range of guest memory: `GEX_WATCH=<hex addr>[+<hex len>]`. A
+/// software watchpoint: every safepoint and syscall compares the bytes and
+/// reports the first pc they differ at. Coarse (the pc is the poll, not the
+/// write) but narrows corruption to one loop.
 static WATCH: std::sync::Mutex<Option<(u64, usize, Vec<u8>)>> = std::sync::Mutex::new(None);
 
 fn watch_check(gm: &GuestMem<'_>, pc: u64, tid: i32) {
@@ -2078,13 +1878,9 @@ fn watch_arm(gm: &GuestMem<'_>, slot: &mut Option<(u64, usize, Vec<u8>)>) {
     *slot = Some((addr, len, bytes));
 }
 
-/// Print the register file and the return addresses on the stack.
-///
-/// There is no unwind information here and none is wanted: a scan of the stack
-/// for words that point just after a `bl` in an executable mapping finds the
-/// call chain and some noise, and the noise is easy to read past. Each hit is
-/// reported against the mapping that contains it, so an address in a library
-/// is a name and an offset rather than a bare number.
+/// Print the register file and the return addresses on the stack. No unwind
+/// info: scanning for words that point just after a `bl` in executable memory
+/// finds the call chain plus some easily-ignored noise.
 fn dump_guest(gm: &mut GuestMem<'_>, ctx_addr: u64, tid: i32, vmas: &[gex_kernel::mem::Vma]) {
     let at = |a: u64| -> Option<&gex_kernel::mem::Vma> {
         vmas.iter().find(|v| a >= v.start && a < v.end)
@@ -2159,12 +1955,8 @@ fn sampler_for(opts: &RunOptions) -> Option<Arc<Sampler>> {
         .clone()
 }
 
-/// The guest's network, as the host's real sockets.
-///
-/// The kernel wants a transport that never blocks -- it does the waiting
-/// itself, because it is what can park a guest thread -- so the socket is put
-/// in non-blocking mode and a background reader is not needed: the kernel
-/// polls, and polling a non-blocking socket is a syscall.
+/// The guest's network, as the host's real sockets. The kernel does its own
+/// waiting, so the socket is non-blocking and the kernel polls it.
 #[derive(Debug)]
 struct HostNet;
 
@@ -2273,11 +2065,8 @@ impl gex_kernel::net::Transport for HostStream {
         let Some(sock) = guard.as_mut() else {
             return true;
         };
-        // A zero-length read cannot say whether anything is there, so this
-        // peeks one byte and puts it back by never taking it: `MSG_PEEK` is
-        // not in std, so the socket is asked to read into a scratch buffer
-        // the caller will read again -- which would lose the byte. Instead,
-        // ask whether a read would block, which is what `WouldBlock` means.
+        // Peek one byte to tell whether data is there; a zero-length read
+        // cannot, and there is no `MSG_PEEK` in std.
         let mut probe = [0u8; 1];
         match sock.peek(&mut probe) {
             Ok(_) => true,
@@ -2421,19 +2210,12 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::SYSCALL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
-            // Every thread of a process shares the dispatch directory -- it
-            // is in guest memory -- but each has its own wasm table, and a
-            // table only gains a translation when its own store installs it.
-            // So a thread can be told by the directory to call slot N while
-            // its table is still shorter than N, which is not a dispatch miss
-            // it can recover from but a hard trap with nowhere to land.
-            //
-            // dpkg's decompressor hit this: two threads entering the same
-            // freshly translated loop, one of them a moment behind.
-            //
-            // Catching up here costs a comparison of two integers on the
-            // common path and closes the window to whatever a thread can
-            // execute between one syscall and the next.
+            // Every thread shares the dispatch directory (guest memory) but has
+            // its own table, filled only when its own store installs a
+            // translation. So a thread can be told to call slot N while its
+            // table is still shorter than N — a hard trap, not a recoverable
+            // miss. Catching up here closes that window; dpkg's decompressor
+            // hit it with two threads a moment apart.
             catch_up_in_caller(&mut caller)?;
             let memory = caller
                 .data()
@@ -2540,13 +2322,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(v) = caller.data().virgl.clone() {
                 v.pump();
             }
-            // A shared library has just been mapped. Recompile the whole
-            // object now rather than letting the runtime translator find it
-            // one dispatch miss at a time.
-            // Code that has gone away. Done before the newly mapped code
-            // below, because a `dlclose` followed by a `dlopen` lands the new
-            // object on the addresses the old one had, and retiring after
-            // would throw away the translation just made for it.
+            // Code that has gone away, retired before the newly mapped code
+            // below: a `dlclose`+`dlopen` reuses addresses, and retiring after
+            // would throw away the fresh translation.
             let retired: Vec<(u64, u64)> = caller
                 .data_mut()
                 .with_kernel(|k| std::mem::take(&mut k.retired_code));
@@ -2558,25 +2336,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .with_kernel(|k| std::mem::take(&mut k.new_code));
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {
-                // Seeded from what the object says about itself: its
-                // exported symbols, and every address its own data takes.
-                //
-                // A block at every decodable address is the only *complete*
-                // seeding, and it is quadratic -- starting a block at each of
-                // the L instructions in a basic block emits L blocks totalling
-                // L(L+1)/2 instructions. libc comes out at 297,215 blocks and
-                // a 217 MB compiled module, 128 times its own text, and ten
-                // seconds to map. Leaders give 62,085 blocks.
-                //
-                // What leaders cannot give is certainty. An indirect branch
-                // can go to an address no symbol names and no data holds, and
-                // in a stripped object built without branch protection --
-                // which bookworm's libc is -- nothing in the file says where.
-                // That residue is what the runtime translator is for.
-                // Which seeding depends on whether anything is behind this.
-                // With the runtime translator on, leaders are enough and far
-                // cheaper. With it off, the static pass is the only pass and
-                // has to be complete, whatever that costs.
+                // Which seeds depend on whether the runtime translator is
+                // behind this. With it on, leaders (symbols + address-taken
+                // data) are enough and far cheaper than a block at every
+                // decodable address, which is complete but quadratic. With it
+                // off, the static pass is the only pass and must be complete.
                 let seeds = if JIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
                     object_seeds(&mut caller, &m)
                 } else {
@@ -2814,19 +2578,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     data[start..end].fill(0);
                 }
             }
-            // `ic ivau` is the guest saying, in the only way the architecture
-            // gives it, that the bytes at this address are no longer the
-            // instructions that were there. It is what every code generator
-            // emits after writing, and the one hook a translator cannot
-            // ignore: a dispatch slot answers for an address, so without this
-            // the guest calls its newly compiled function and runs the
-            // previous one.
-            //
-            // Retirement is by dispatch page rather than by the cache line
-            // the instruction names. Coarser than it needs to be, and cheap
-            // in the shape this actually arrives in: a generator writes a
-            // whole function, then sweeps it with one `ic ivau` per line, and
-            // every line after the first in a page finds it already retired.
+            // `ic ivau` tells the translator the bytes here are no longer the
+            // instructions that were translated; without honouring it the guest
+            // runs the previous compilation. Retired by dispatch page rather
+            // than cache line — coarser, but a generator sweeps a whole
+            // function so later lines find the page already retired.
             if op == gex_abi::cache_op::IC_INVALIDATE {
                 let addr = addr as u64;
                 let page = addr / gex_abi::DISPATCH_PAGE;
@@ -3021,17 +2777,10 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         let jit = caller.data().jit.as_ref().unwrap();
         jit.engine.clone()
     };
-    // Cranelift is the expensive half of a miss -- the lift above takes
-    // milliseconds and this takes seconds -- and its output is a pure
-    // function of the wasm handed to it. So it is cached by the hash of
-    // exactly that, across runs and across processes.
-    //
-    // This matters far more than it looks. Only the executable is translated
-    // ahead of time; the interpreter and every shared library arrive through
-    // this path. Without the cache, every run of every dynamic program
-    // recompiles ld.so and libc from scratch -- `dpkg --version` loads its
-    // own module in 0.03s and then spends eight seconds here -- and a package
-    // manager forks a dozen such processes.
+    // Cranelift is the expensive half of a miss and its output is a pure
+    // function of the wasm, so it is cached by that hash across runs and
+    // processes. Without the cache every dynamic program recompiles ld.so and
+    // libc from scratch (eight seconds on `dpkg --version`).
     let cache = caller.data().jit.as_ref().and_then(|j| j.cache.clone());
     let module = match cache {
         Some((dir, build)) => {
@@ -3065,15 +2814,9 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     Ok(true)
 }
 
-/// Instantiate any registry entries this store has not seen yet.
-///
-/// Returns whether anything was replayed. The registry is append-only and
-/// ordered, so a store catches up by walking forward from its own watermark;
-/// two stores that have replayed the same count hold the same code.
-/// Replay anything this store has not seen, cheaply enough to call often.
-///
-/// The check is a length comparison; the work only happens when another
-/// thread has translated something since.
+/// Replay anything this store has not seen, cheaply enough to call often: the
+/// check is a length comparison, and the registry is append-only so a store
+/// catches up by walking forward from its own watermark.
 fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> {
     let behind = match caller.data().jit.as_ref() {
         Some(jit) => {
@@ -3109,15 +2852,9 @@ fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
     Ok(true)
 }
 
-/// Merge a finished translation into the shared state.
-///
-/// Page bases come from a mark shared by every clone of the page table (see
-/// `PageTable`), so two translations running at once cannot be handed the same
-/// slots however long either of them takes. This is the check that the
-/// property still holds: if a base ever turns up owned by two different guest
-/// pages, an indirect branch to one of them will land inside a function
-/// belonging to the other, and the guest will fail somewhere else entirely --
-/// which is how this cost a day to find the first time.
+/// Merge a finished translation into the shared state, checking the invariant
+/// that no dispatch base is owned by two guest pages — if it were, an indirect
+/// branch would land inside the wrong function and fail somewhere unrelated.
 fn publish_unit(
     shared: &Arc<Mutex<JitShared>>,
     translated: &gex_xlate::TranslatedModule,
@@ -3221,12 +2958,9 @@ fn install_unit(
         .instantiate(cx.as_context_mut(), &unit.module)
         .context("instantiating a runtime-translated module")?;
 
-    // Nothing to install by hand: the module carries element segments for
-    // the table it imports, so instantiating it above already filled every
-    // slot it owns. This loop used to be a name lookup and a table write per
-    // block, and on a whole shared library it cost more than the compile.
-    // Idempotent: the directory lives in shared guest memory, so a second
-    // store writing the same entries changes nothing.
+    // The module carries element segments for the table it imports, so
+    // instantiating it already filled its slots. Writing the directory is
+    // idempotent: it lives in shared guest memory.
     write_dispatch_dir(memory, &unit.dir_entries)?;
     cx.as_context_mut()
         .data_mut()
@@ -3239,11 +2973,8 @@ fn install_unit(
 }
 
 /// Every dispatch table a translated image module exports, in index order.
-///
-/// There is more than one because V8 caps a table at ten million entries and
-/// the emitted code selects between them with a `br_table`; natively there is
-/// no such cap and every table past the first stays empty, but they still
-/// have to exist and be linked, because the code names them.
+/// Several because V8 caps a table at 10M entries; natively tables past the
+/// first stay empty but must exist because the code names them.
 fn dispatch_tables(
     store: &mut Store<HostState>,
     instance: &wasmtime::Instance,
@@ -3262,28 +2993,15 @@ fn dispatch_tables(
     Ok(out)
 }
 
-/// Forget the translations of code the guest has unmapped.
+/// Forget the translations of code the guest has unmapped. A dispatch slot
+/// answers for an address, not the bytes at it, so after a `dlclose`+`dlopen`
+/// reuses the range the guest would run the old library's code.
 ///
-/// A dispatch slot answers for a guest address, not for the bytes that were
-/// at it. `dlclose` unmaps a library; a later `dlopen` maps a different one
-/// over the same range; and the directory still points the old translations
-/// at those addresses. The guest calls into the new library and runs the old
-/// one's code. Nothing reports an error -- an X server resetting after its
-/// last client disconnects simply dies somewhere unrelated, inside its own
-/// dynamic loader, several dlopens later.
-///
-/// Three things have to go, together:
-///
-///   * the page's directory entry, so a branch there misses;
-///   * the page's slot assignment, so the next translation is given fresh
-///     slots rather than rewriting the ones an older unit still owns;
-///   * the addresses in `translated`, so discovery does not skip them as
-///     already done.
-///
-/// The old slots are abandoned rather than reused. Reuse would mean a stale
-/// unit replayed into a new store could refill them, and the ordering that
-/// makes replay safe -- newest wins -- only holds while a base belongs to one
-/// page for the life of the run.
+/// Three things go together: the page's directory entry (so a branch misses),
+/// its slot assignment (so the next translation gets fresh slots), and its
+/// addresses in `translated` (so discovery does not skip them). Old slots are
+/// abandoned, not reused: replay safety (newest wins) needs a base to belong
+/// to one page for the whole run.
 fn retire_translations(
     caller: &mut impl wasmtime::AsContextMut<Data = HostState>,
     ranges: &[(u64, u64)],
@@ -3342,7 +3060,6 @@ fn write_dispatch_dir(memory: gex_mem::GuestMemory, entries: &[(u64, u32)]) -> R
     Ok(())
 }
 
-/// Turn a wasm trap into a guest signal.
 /// The exported entry points of the object mapped at `map`, biased to where
 /// it actually landed.
 ///
@@ -3378,21 +3095,9 @@ fn object_seeds(
     seeds.push(image.entry.wrapping_add(bias));
 
     // Every word in the object's own data that points into its own text.
-    //
-    // This is what makes symbol seeding complete enough to run without a
-    // runtime translator behind it. Discovery finds what a block branches to;
-    // symbols find what another object can call. Neither finds a function
-    // whose address was only ever taken -- a vtable, a jump table, an
-    // initialiser array, a callback stored in a struct -- and those are
-    // exactly the targets of the indirect branches that were dying.
-    //
-    // The alternative is starting a block at every decodable address, which
-    // is complete and costs 200,000 blocks for libc against a few tens of
-    // thousands here, nearly all of them interior addresses nothing ever
-    // jumps to.
-    //
-    // The values are unrelocated, so they are the library's own vaddrs and
-    // the same bias applies.
+    // Symbols and discovery miss a function whose address was only taken (a
+    // vtable, jump table, callback), which is exactly what indirect branches
+    // reach. Values are unrelocated, so the same bias applies.
     for seg in &image.segments {
         if seg.executable {
             continue;
@@ -3416,42 +3121,17 @@ fn object_seeds(
 /// would be a long pause for nothing.
 const MAX_OBJECT_BYTES: u64 = 64 << 20;
 
-/// A cap on one object, high enough not to bind on anything real: a megabyte
-/// of guest text is a quarter of a million instructions and so at most that
-/// many blocks. It exists only so a mapping of something that is not code
-/// cannot run away.
-///
-/// It used to be 200,000, which libc exceeded -- and with no runtime
-/// translator behind it, a capped object is an object the guest dies in.
-/// This path always has one: `recompile_object` returns early without it.
-///
-/// It was 900,000 for a while, and that number came from wasm rather than
-/// from taste: a module may hold a million functions, gex emits one per block
-/// plus one per region, and libz3 -- 22 MB of guest text, 993,645 blocks and
-/// 18,583 regions -- came to about 1,012,000. It missed by one percent, and
-/// the whole 37-second translation was thrown away for it. Capping kept most
-/// of the work but left the tail to the runtime translator, which is exactly
-/// what static recompilation is for.
-///
-/// Objects are now split across as many modules as they need
-/// ([`gex_xlate::MAX_FUNCS_PER_MODULE`]), so the per-module ceiling no longer
-/// bounds the object. What is left is the runaway guard the constant was
-/// originally for: a range that decodes as code but is not, or a discovery
-/// bug, should stop rather than translate forever.
+/// A runaway guard on one object, high enough not to bind on anything real: it
+/// exists only so a range that decodes as code but is not cannot translate
+/// forever. Objects split across as many modules as they need
+/// ([`gex_xlate::MAX_FUNCS_PER_MODULE`]), so this no longer bounds a real
+/// object's size.
 const MAX_OBJECT_BLOCKS: usize = 4_000_000;
 
-/// Statically recompile a shared library the guest has just mapped.
-///
-/// The point of doing it here, all at once, is that it is *static*: the whole
-/// object is translated from its own bytes, so the result depends on the
-/// library and where it was loaded and on nothing else. The demand-driven
-/// path produces a different module depending on which address the guest
-/// reached first, which is why its output never settled and its cache never
-/// quite hit.
-///
-/// Cached by the hash of exactly what was translated -- the mapped bytes and
-/// the base address -- so the second run of any program using the library
-/// pays nothing.
+/// Statically recompile a shared library the guest has just mapped. Doing the
+/// whole object at once makes the output depend only on the library and its
+/// load address (unlike the demand-driven path, whose result varied with which
+/// address was reached first), so it caches and settles.
 fn recompile_object(
     caller: &mut impl wasmtime::AsContextMut<Data = HostState>,
     map: &gex_kernel::CodeMap,
@@ -3492,16 +3172,10 @@ fn recompile_object(
             .map(|v| (v.start, v.end))
             .collect()
     });
-    // Where to start: the library's own exported functions. A shipped object
-    // keeps `.dynsym` even when it has been stripped of `.symtab`, and those
-    // symbols are exactly the addresses anything outside can call. Discovery
-    // does the rest -- successors, and the folded target of a PLT's indirect
-    // branch.
-    //
-    // Falling back to scanning every decodable address is correct but not
-    // affordable: on libc it finds 200,000 blocks where the symbols find a
-    // small fraction of that, and the difference is all interior addresses
-    // that a block starting at the function entry already covers.
+    // Start from the library's exported functions (`.dynsym` survives
+    // stripping): those are the addresses anything outside can call, and
+    // discovery does the rest. Scanning every decodable address is complete
+    // but finds ~200,000 interior blocks in libc that entry blocks cover.
     let started = std::time::Instant::now();
     let (modules, stats) = {
         let data = memory.bytes();

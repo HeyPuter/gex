@@ -3,35 +3,16 @@
 // The guest runs Debian's own Mesa with its Gallium `virgl` driver, which
 // speaks the vtest protocol over a UNIX socket. `shims/browser/src/virgl.rs`
 // serves that socket and hands the bytes here; here hands them to
-// virglrenderer, compiled to WebAssembly by `web/build-virgl-wasm.sh` and
-// pointed at a WebGL 2 context.
-//
-// Two wasm modules, so the bytes cross through JavaScript. That is the whole
-// of what this file is: a copy in, a copy out, and the canvas.
-//
-// # Why a second module rather than one
-//
-// virglrenderer is a hundred thousand lines of C that wants a libc, a GL
-// binding and its own heap. The shim is Rust sharing the *guest's* memory --
-// that is what makes a syscall a direct read of the guest's buffers. Putting
-// both in one module would mean giving virglrenderer the guest's address
-// space to allocate in, which is exactly what it must not have.
+// virglrenderer (compiled to wasm by `web/build-virgl-wasm.sh`, pointed at a
+// WebGL 2 context). It is a second module -- a copy in, a copy out, the canvas
+// -- so virglrenderer allocates in its own heap and never in the guest's
+// address space, which the shim shares to read syscall buffers directly.
 
-/** Load the renderer and point it at a canvas. */
 /**
- * Load the renderer's emscripten glue, whatever the server thinks of it.
- *
- * It is a build artifact rather than source: it lives in `public/` next to
- * the wasm it loads, and both are copied as-is. Importing it directly works
- * on the built site and fails on the dev server, which answers
- *
- *   Failed to load url /gex/gexvirgl.mjs. This file is in /public and will be
- *   copied as-is during build without going through the plugin transforms,
- *   and therefore should not be imported from source code.
- *
- * -- a rule about *source*, which this is not. So it is fetched as text and
- * turned into a module here. The one thing that costs is the glue's idea of
- * where its wasm is, and `locateFile` says so explicitly.
+ * Load the renderer's emscripten glue. It is a build artifact in `public/`, so
+ * importing it directly fails on the dev server (a rule about source, which
+ * this is not); fetched as text and turned into a module instead, with
+ * `locateFile` naming where its wasm is.
  */
 async function loadGlue(url) {
   const res = await fetch(url);
@@ -54,15 +35,9 @@ export class VirglRenderer {
   /**
    * @param {HTMLCanvasElement} canvas the drawing surface
    * @param {string} url where gexvirgl.mjs was published
-   */
-  /**
-   * @param {HTMLCanvasElement} canvas the drawing surface
-   * @param {string} url where gexvirgl.mjs was published
-   * @param {(s: string) => void} [onLog] where the renderer's own diagnostics
-   *   go. The default is the console, which in a headless browser goes
-   *   nowhere useful and is dropped under load -- a trace that arrives four
-   *   lines out of twenty is worse than none, because it reads like the
-   *   twentieth. A harness that has a channel of its own should pass it.
+   * @param {(s: string) => void} [onLog] where the renderer's diagnostics go;
+   *   the console default is dropped under load in a headless browser, so a
+   *   harness with its own channel should pass one.
    */
   static async create(canvas, url = '/gex/gexvirgl.mjs', onLog = null) {
     const r = new VirglRenderer();
@@ -106,24 +81,18 @@ export class VirglRenderer {
   }
 
   /**
-   * The renderer's GL state, and how many frames it has put on the canvas.
-   *
-   * `presented` is the one worth reading. vtest has no present -- the guest
-   * reads its pixels back and never looks at a screen -- so a run can be
-   * drawing perfectly with nothing visible, and this is what tells the two
-   * apart.
+   * The renderer's GL state, and how many frames it put on the canvas.
+   * `presented` is the one to read: vtest has no present, so a run can draw
+   * perfectly with nothing visible.
    */
   glState() {
     return this.ok ? this.#module.UTF8ToString(this.#module._gex_virgl_gl_state()) : this.#failed;
   }
 
   /**
-   * Every command the guest has sent, by name and count, and every reason a
-   * readback did not become a picture.
-   *
-   * This is the one to read when the canvas is black. `presented` says only
-   * that nothing arrived; this says whether the guest drew at all, whether
-   * it ever read back, and if it did, what was wrong with what it read.
+   * Every command the guest sent, by name and count, and every reason a
+   * readback did not become a picture -- the one to read when the canvas is
+   * black, since it says whether the guest drew at all.
    */
   commands() {
     return this.ok ? this.#module.UTF8ToString(this.#module._gex_virgl_commands()) : this.#failed;
@@ -142,9 +111,8 @@ export class VirglRenderer {
     this.#module._gex_virgl_feed(session, buf, len);
     this.#module._free(buf);
     const ran = this.#module._gex_virgl_pump(session);
-    // A refusal is the end of the connection, not of this call: a stream
-    // protocol cannot resynchronise after a command of unknown length, and
-    // pretending otherwise turns one bad command into a stream of garbage.
+    // A refusal ends the connection: a stream protocol cannot resynchronise
+    // after a command of unknown length.
     if (ran < 0) {
       this.#failed = 'the renderer refused the stream';
       return -1;
@@ -170,12 +138,9 @@ export class VirglRenderer {
   }
 
   /**
-   * Narrate every command as it starts.
-   *
-   * For the case where the renderer does not come back: it is called from
-   * JavaScript, so a command that loops takes the page with it -- no timer
-   * fires, the shim's counters stop, and the guest is not running. The last
-   * line printed names the command it went into.
+   * Narrate every command as it starts, for when the renderer does not come
+   * back: it runs on the page's thread, so a command that loops freezes
+   * everything, and the last line printed names the command it went into.
    */
   traceCommands(on) {
     if (this.ok) this.#module._gex_virgl_trace_commands(on ? 1 : 0);

@@ -1,10 +1,8 @@
 //! Disassembly text for [`Inst`].
 //!
-//! The output follows binutils syntax closely enough to diff against
-//! `objdump -d` over real binaries, which is how the decoder is validated in
-//! bulk (`tests/diff-fuzz`). Preferred aliases (`mov`, `cmp`, `lsl`, `ubfx`, …)
-//! are reproduced, because objdump prints them and a raw `orr`/`subs`/`ubfm`
-//! would show up as a spurious diff.
+//! Output follows binutils syntax so it can be diffed against `objdump -d`.
+//! Preferred aliases (`mov`, `cmp`, `lsl`, `ubfx`, …) are reproduced, since a
+//! raw `orr`/`subs`/`ubfm` would show up as a spurious diff.
 
 use crate::*;
 use core::fmt::Write;
@@ -115,9 +113,8 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
     match *inst {
         Inst::Unknown { raw } => format!(".inst 0x{raw:08x} ; undecoded"),
         Inst::Undefined { raw } => format!("udf ; 0x{raw:08x}"),
-        // Hint space. The pointer-authentication hints (`paciasp`, `autiasp`,
-        // …) are genuine no-ops on a PAC-less implementation: signing and
-        // authenticating are both the identity, so they stay consistent.
+        // Hint space. The PAC hints (`paciasp`, `autiasp`, …) are no-ops here:
+        // sign and authenticate are both the identity without PAC.
         Inst::Hint { imm: h } => match h {
             0 => "nop".into(),
             1 => "yield".into(),

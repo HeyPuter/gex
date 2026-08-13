@@ -2,24 +2,13 @@
 //
 //   node web/test/virgl-guest.mjs
 //
-// This is the end of the chain the rest of the virgl work has been building,
-// and the first test of it that means anything.
-//
-// `web/test/virgl-webgl.mjs` replays a recorded stream, which proves the
-// transport and can never prove more: the guest's Mesa asks what the host can
-// do before it does anything, and every shader, format and draw follows from
-// the answer. Recorded natively that answer is capability set version 2,
-// 5,508 bytes of it; WebGL 2 can only answer version 1. A recording made
-// against one host is not a valid input to the other, whichever API was used.
-//
-// So the guest has to ask for itself, and it does that here: translated
-// aarch64 running in a page, opening a UNIX socket the browser shim serves,
-// speaking vtest to virglrenderer compiled to wasm, and getting back an
-// answer from the WebGL 2 context on the canvas. Nothing is recorded and
-// nothing is replayed. What the program prints is what the renderer said.
-//
-// The number it prints is the point: a different capability set from the
-// native one means the negotiation is live.
+// `virgl-webgl.mjs` replays a recording, which can only prove transport: Mesa's
+// answer depends on the host's capability set (native is v2, 5,508 bytes; WebGL
+// 2 answers v1), so a recording is not a valid input to the other host. Here
+// the guest asks for itself -- translated aarch64 in a page, a UNIX socket the
+// shim serves, vtest to virglrenderer (wasm), an answer from WebGL 2. Nothing
+// is recorded. A capability set different from the native one means the
+// negotiation is live.
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, rm, copyFile, access, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -71,14 +60,11 @@ import { Gex, Env } from './gex.mjs';
 import { VirglRenderer } from './virgl.js';
 const el = document.getElementById('out');
 const say = (s) => { el.textContent = s; document.title = s.split('\\n')[0]; };
-// A module that fails to load runs none of its own error handling, and a
-// page that reports "pending" says nothing about which of the four things it
-// loads was the problem. These do.
+// A module that fails to load runs no error handling of its own; these marks
+// say which of the four loads was the problem.
 let step = 'start';
-// Additive, because the marks and the guest's output share one element and
-// a mark that replaced it threw away everything written so far -- which made
-// the reported step wander depending on when the browser was dumped, and
-// sent one investigation after a hang in the wrong function.
+// Additive: the marks and the guest's output share one element, and a
+// replacing mark would throw away everything written so far.
 const mark = (s) => { step = s; el.textContent = 'at ' + s + '\\n' + output; };
 addEventListener('error', (e) => say('ERROR at ' + step + ': ' + (e.message || e)));
 addEventListener('unhandledrejection', (e) =>
@@ -87,10 +73,9 @@ addEventListener('unhandledrejection', (e) =>
 // Everything the guest writes, so the answer it got is the answer reported.
 let output = '';
 class PageEnv extends Env {
-  // Straight into the DOM as well as the buffer. A hang reports whatever is
-  // in the document when the browser is dumped, and the guest's own output is
-  // the only thing that says how far it got -- setting textContent needs no
-  // repaint, so it survives a page that never yields again.
+  // Into the DOM as well as the buffer: a hang reports whatever the document
+  // holds when dumped, and textContent needs no repaint, so it survives a page
+  // that never yields again.
   write(fd, bytes) {
     output += new TextDecoder().decode(bytes);
     el.textContent = 'at ' + step + '\\n' + output;
@@ -107,24 +92,19 @@ try {
   mark('fetching the modules');
   const grab = async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer());
   const gex = new Gex(new PageEnv());
-  // Before load: the socket is bound while the guest's namespace is built,
-  // and a guest that connects to a socket nobody serves does not fail, it
-  // hangs -- Mesa's winsys writes into the dead descriptor and waits.
-  // Tracing on: a stall then says where it stalled, through the guest's
-  // own stderr, which in a page is the only channel there is.
-  // GEX_VIRGL_OFF runs the identical page with the renderer not attached.
-  // The guest then finds no socket and says so, which is a complete run --
-  // so it separates a harness that cannot load a guest at all from one that
-  // only fails when a renderer is present.
+  // Bound before load: a guest connecting to a socket nobody serves hangs
+  // rather than failing (Mesa's winsys waits on the dead descriptor). Tracing
+  // routes stalls through the guest's stderr, the only channel in a page.
+  // GEX_VIRGL_OFF runs the same page with no renderer: the guest finds no
+  // socket and says so, separating a load failure from a renderer failure.
   if (!OFF) gex.useVirgl(renderer, TRACE);
   mark('loading the guest');
   const entry = await gex.load(
     await grab('./shim.wasm'), await grab('./guest.wasm'), await grab('./guest.elf'),
     {}, ['/virgl-handshake'], { uid: 0, gid: 0, cwd: '/' });
   mark('running the guest');
-  // No watchdog. One here read a slow run as a stuck one and cost an
-  // afternoon; the browser's own virtual-time budget already bounds this,
-  // and whatever the guest printed is in the document either way.
+  // No watchdog: the browser's virtual-time budget already bounds this, and
+  // whatever the guest printed is in the document either way.
   const status = await gex.run(entry);
   say('EXIT ' + status + '\\n' + output.trim() + '\\nrenderer: ' + renderer.describe());
 } catch (e) {
@@ -163,12 +143,9 @@ const dom = await new Promise((resolve, reject) => {
       '--disable-gpu-sandbox',
       '--enable-unsafe-swiftshader',
       '--use-gl=swiftshader',
-      // Ten minutes of virtual time, which is not generosity. The clock only
-      // advances while the page is idle, and this page is not: it translates
-      // an aarch64 program and runs it. At sixty seconds the browser was
-      // dumped mid-run and the result read exactly like a hang -- the guest
-      // had printed the size of the capability set and appeared to stall
-      // draining it. It had not stalled. It was still going.
+      // Ten minutes of virtual time: the clock only advances while the page is
+      // idle, and this page is busy translating and running an aarch64 program,
+      // so a short budget dumps mid-run and reads as a hang.
       '--virtual-time-budget=' + (process.env.GEX_BUDGET || 600000),
       '--dump-dom',
       url,

@@ -1,33 +1,16 @@
 //! Library functions the backend serves itself, instead of translating them.
 //!
-//! glibc's `memcpy` is a hand-written NEON loop with a dozen entry paths for
-//! different sizes and alignments. Lifting it is correct and slow: every
-//! iteration becomes a block, every block a dispatch, and the whole thing
-//! competes with a wasm instruction -- `memory.copy` -- that does the same
-//! work in one. Decompression and hashing, which is what `apt update` and
-//! `xz` are, spend most of their time in exactly these functions.
+//! glibc's `memcpy` is a hand-written NEON loop; lifting it is correct but
+//! slow, where wasm's `memory.copy` does the same work in one instruction.
+//! Decompression and hashing (`apt update`, `xz`) spend most of their time
+//! here. So, as box64 and FEX do, the function is recognised by name -- from
+//! the symbol table discovery already reads -- and bound to a host builtin.
 //!
-//! This is the trade box64 and FEX make: recognise the function by name and
-//! bind it to a host implementation rather than translating it. The names
-//! come from the object's own symbol table, which discovery already reads for
-//! seeds.
-//!
-//! # Why a name is enough to be sure
-//!
-//! Substituting the wrong function would be a very bad bug, so the claim
-//! being made is worth stating. A symbol here is `STT_FUNC` in the object's
-//! symbol table -- `elf::load` keeps no other kind -- and it names a
-//! *definition* in that object's text at that address. The names below are
-//! reserved by the C standard or are glibc's own internal implementations of
-//! them, whose behaviour is fixed by the standard.
-//!
-//! The exclusion of every other symbol type is what makes this safe against
-//! IFUNCs, and aarch64 glibc resolves `memcpy` through one: `STT_GNU_IFUNC`'s
-//! value is the address of the *resolver*, a function taking hwcaps and
-//! returning a pointer, and serving that as a `memcpy` would be nonsense.
-//! Those symbols never reach this table. What does reach it is
-//! `__memcpy_generic` and its siblings, the real implementations, which is
-//! what the resolver returns and what the guest actually calls.
+//! Safety against substituting the wrong function: a symbol here is `STT_FUNC`
+//! (`elf::load` keeps no other kind), naming a definition in this object's
+//! text. aarch64 glibc resolves `memcpy` through an IFUNC, whose
+//! `STT_GNU_IFUNC` resolver symbol never reaches this table; what reaches it
+//! is the real `__memcpy_generic` and siblings the resolver returns.
 
 use gex_ir::*;
 
@@ -47,45 +30,27 @@ pub enum Intrinsic {
     MemSet,
     /// `int memcmp(const void *a, const void *b, size_t n)`.
     ///
-    /// `bcmp` and `__memcmpeq` are the same code in glibc and are only ever
-    /// asked whether the answer is zero, so the stronger contract this
-    /// provides satisfies them too.
-    ///
-    /// The odd one out: there is no wasm instruction behind it, so the
-    /// backend emits a loop. It is here because a profile of perl -- which
-    /// compares a hash key on every lookup -- puts glibc's SIMD `memcmp` as
-    /// the only library code among the hottest back edges.
+    /// `bcmp` and `__memcmpeq` only ask whether the result is zero, so this
+    /// stronger contract satisfies them too. The odd one out: no wasm
+    /// instruction backs it, so the backend emits a loop (see `recognise`).
     MemCmp,
 }
 
-/// The intrinsic a symbol names, if it names one.
-///
-/// Both the public name and glibc's private implementations of it, because on
-/// aarch64 the public one is an IFUNC and never appears as a `STT_FUNC`
-/// symbol at all -- so matching only the plain names would silently do
-/// nothing on the C library that matters most.
+/// The intrinsic a symbol names, if it names one. Matches both the public name
+/// and glibc's private `__memcpy_*` implementations, since on aarch64 the
+/// public name is an IFUNC and never appears as a `STT_FUNC` symbol.
 pub fn recognise(name: &str) -> Option<Intrinsic> {
-    // Two families of glibc helper share a stem with the function they help
-    // and do not share its signature, so the shape match below must not
-    // reach them:
-    //
-    // * `__memcpy_chk` takes a fourth argument -- the size the compiler
-    //   believes the destination to be -- and aborts when the copy would
-    //   overrun it. Throwing away a bounds check is not this pass's decision.
-    // * `__mempcpy_small` is the out-of-line half of an inline expansion in
-    //   glibc's own `string2.h`, and takes the bytes to store as separate
-    //   arguments rather than a pointer and a length.
-    //
-    // Both are real symbols in Debian's libc, so this is a list of what was
-    // actually there rather than a precaution.
+    // Two glibc helper families share a stem with the function they help but
+    // not its signature, so the shape match below must not reach them:
+    // `__memcpy_chk` takes a fourth bounds argument, and `__mempcpy_small`
+    // takes the bytes to store rather than a pointer and length. Both are real
+    // symbols in Debian's libc.
     if name.ends_with("_chk") || name.ends_with("_small") {
         return None;
     }
-    // `__memcpy_generic`, `__memcpy_simd`, `__memcpy_thunderx`,
-    // `__memcpy_a64fx`, ... -- the set differs by glibc version and by which
-    // cores it was built to know about, so the variant suffix is matched by
-    // shape. Only under a leading `__`, which is what makes it glibc's
-    // private namespace rather than some other library's `memcpy_from_page`.
+    // `__memcpy_generic`, `__memcpy_simd`, ... -- the variant suffix differs
+    // by glibc version and target core, so match it by shape, but only under a
+    // leading `__` (glibc's private namespace, not some `memcpy_from_page`).
     let stem = match name.strip_prefix("__") {
         Some(rest) => rest.split_once('_').map_or(rest, |(s, _)| s),
         None => name,
@@ -94,39 +59,20 @@ pub fn recognise(name: &str) -> Option<Intrinsic> {
         "memcpy" | "memmove" => Some(Intrinsic::MemCpy),
         "mempcpy" => Some(Intrinsic::MemPCpy),
         "memset" => Some(Intrinsic::MemSet),
-        // `memcmp` is deliberately absent, and `Intrinsic::MemCmp` exists
-        // anyway. It is implemented, it is correct, and it did not pay:
-        //
-        //     perl, 30,000 hash lookups over a long common prefix plus a
-        //     string sort -- the workload that does nothing but compare keys.
-        //     Seven interleaved pairs, guest time only:
-        //         5 of 7 favour the *unsubstituted* build, p = 0.453
-        //         median per-pair ratio 1.17 against the substitution
-        //
-        //     Not readable at p = 0.453, so the honest reading is "no
-        //     measured benefit, direction unfavourable", not "17% worse".
-        //
-        // The reason is the one the lowering's comment predicts: this serves
-        // `memcmp` a byte at a time, and glibc's aarch64 `memcmp` is SIMD.
-        // Even paying a block per iteration, sixteen bytes at a time beats
-        // one. `memcpy` won because `memory.copy` is a single instruction
-        // that beats any loop; there is no such instruction here.
-        //
-        // Turning it on is adding `"memcmp" | "bcmp" | "memcmpeq"` to this
-        // match. What would make that worth doing is an eight-wide lowering
-        // -- `i64.load` both sides, compare, and only fall to bytes for the
-        // word that differs -- which is the experiment this leaves set up.
+        // `memcmp` is deliberately absent though `Intrinsic::MemCmp` exists
+        // and works: measured on perl (a pure key-compare workload) it showed
+        // no benefit, because the loop this emits runs a byte at a time while
+        // glibc's aarch64 `memcmp` is SIMD -- unlike `memcpy`, there is no
+        // single wasm instruction to beat it. Enabling it is adding
+        // `"memcmp" | "bcmp" | "memcmpeq"` here, worth doing only with a
+        // wider, word-at-a-time lowering.
         _ => None,
     }
 }
 
-/// The whole function as one block: read the arguments, do it, return.
-///
-/// The AAPCS64 argument registers are `x0`, `x1`, `x2` and the return address
-/// is in `x30`, so this is the entire body. Registers a real implementation
-/// would clobber are left alone, which no caller can object to -- the
-/// procedure call standard lets a callee keep them, it does not require the
-/// mess.
+/// The whole function as one block: read the AAPCS64 arguments (`x0`-`x2`),
+/// do it, and return through `x30`. Registers a real implementation would
+/// clobber are left alone, which the procedure call standard permits.
 pub fn block(addr: u64, which: Intrinsic) -> Block {
     let mut b = Builder::new(addr);
     let dst = b.read(GuestReg::X(0));
@@ -136,9 +82,7 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
         Intrinsic::MemCpy => b.stmt(Stmt::MemCopy { dst, src, len }),
         Intrinsic::MemPCpy => {
             b.stmt(Stmt::MemCopy { dst, src, len });
-            // The one difference, and the reason it is a separate kind: it
-            // returns where the copy ended, and glibc's own string code uses
-            // it precisely for that.
+            // The one difference: it returns where the copy ended.
             let end = b.bin(BinOp::Add, Ty::I64, dst, len);
             b.write(GuestReg::X(0), end);
         }
@@ -146,8 +90,8 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
         // the same and ignores the rest, so no masking is needed here.
         Intrinsic::MemSet => b.stmt(Stmt::MemFill { dst, val: src, len }),
         Intrinsic::MemCmp => {
-            // `dst`/`src` are this builder's names for x0 and x1, which for
-            // `memcmp` are simply the two buffers.
+            // `dst`/`src` here are just this builder's names for x0 and x1,
+            // the two buffers.
             let r = b.fresh();
             b.stmt(Stmt::MemCmp {
                 dst: r,
@@ -155,9 +99,8 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
                 b: src,
                 len,
             });
-            // The result is an `int`, and AAPCS64 returns it in w0 with the
-            // top half of x0 unspecified -- but a caller that reads x0 as a
-            // signed 64-bit value has to see the sign, so extend it.
+            // Result is an `int` in w0; sign-extend so a caller reading x0 as
+            // a signed 64-bit value sees the sign.
             let wide = b.extend(r, true);
             b.write(GuestReg::X(0), wide);
         }
@@ -219,9 +162,7 @@ mod tests {
 
     #[test]
     fn memcmp_is_built_but_not_recognised() {
-        // Measured and not enabled -- see the note in `recognise`. The
-        // builder is kept working so that turning it on is one line and a
-        // measurement rather than a rewrite.
+        // Measured and not enabled -- see the note in `recognise`.
         assert_eq!(recognise("memcmp"), None);
         assert_eq!(recognise("bcmp"), None);
     }

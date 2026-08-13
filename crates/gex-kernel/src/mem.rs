@@ -41,32 +41,18 @@ pub struct Vma {
     /// A short label for `/proc/self/maps`.
     pub name: String,
     /// Where these bytes can be *rebuilt* from: the file, and the offset
-    /// within it that `start` corresponds to.
-    ///
-    /// Only a mapping that has never been writable has one, because only that
-    /// one can be reconstructed by re-reading. Used by snapshot and restore.
+    /// within it that `start` corresponds to. Only a mapping that has never
+    /// been writable has one, because only that one can be reconstructed by
+    /// re-reading.
     pub origin: Option<(String, u64)>,
     /// Where these bytes were *loaded* from, whatever happened afterwards.
     ///
-    /// This is what lets two processes that map the same library at the same
-    /// address agree that the *code* is the same, and so share the dispatch
-    /// slots and the translations that went into them. Without it every
-    /// `execve` starts a fresh page table and pays for libc again -- and in a
-    /// browser tab, where the dispatch table cannot grow past ten million
-    /// slots, paying twice is not merely slow.
-    ///
-    /// It is separate from `origin` because the two answer different
-    /// questions, and answering both with one field cost the whole mechanism.
-    /// `origin` asks "can this be rebuilt by re-reading the file", and the
-    /// answer is no for an image segment -- whose `mem_size` runs past the
-    /// file's bytes into a zeroed tail -- and no for anything `mprotect` has
-    /// touched, since `ld.so` relocates a RELRO region before making it
-    /// read-only. Both are true and neither has anything to do with whether
-    /// the *code* is the same code: a segment's executable bytes are exactly
-    /// `p_offset .. p_filesz`, and the zeroed tail is never executable.
-    ///
-    /// Losing it in those two places is why two thirds of the misses in a
-    /// second `ls` had no identity at all and were translated again.
+    /// Lets two processes that map the same library at the same address agree
+    /// the code is the same and share the translations for it. Separate from
+    /// `origin`: `origin` asks "can this be rebuilt by re-reading the file"
+    /// (no, for an image segment with a zeroed tail, and no once `mprotect`
+    /// has touched it), which is a different question from whether the code is
+    /// the same code.
     pub code: Option<(String, u64)>,
 }
 
@@ -100,35 +86,21 @@ pub struct MemoryMap {
     mmap_next: u64,
     /// How far up the arena has been claimed, and who to ask for more.
     ///
-    /// A native host owns a whole address space and can hand out anything
-    /// between [`MMAP_BOTTOM`] and [`MMAP_TOP`] straight away. A guest in a
-    /// browser lives in a `WebAssembly.Memory` that has to be *allocated* up
-    /// to its highest used address, and there is one per process -- so the
-    /// arena is claimed as it is needed and the memory grown to match.
-    /// `None` is the native case: everything is available already.
-    ///
-    /// `arena` is the spans this map has been given, in the order it got
-    /// them. It only ever hands out addresses inside them, because the same
-    /// growing region also feeds the runtime's own heap and the two must not
-    /// pick the same bytes.
+    /// A guest in a browser lives in a `WebAssembly.Memory` allocated up to its
+    /// highest used address, one per process, so the arena is claimed as needed
+    /// and the memory grown to match. `None` is the native case: everything is
+    /// available already. `arena` is the spans handed out, in order; addresses
+    /// only ever come from inside them, because the same growing region also
+    /// feeds the runtime's own heap.
     arena: Vec<(u64, u64)>,
     take: Option<fn(u64) -> u64>,
     /// Make the host's memory reach an address, for a mapping the guest
     /// placed itself rather than one the arena handed out.
     back: Option<fn(u64) -> bool>,
-    /// Bumped by every change to the map.
-    ///
-    /// `/proc/self/maps` is built by formatting this whole tree as hex text,
-    /// and the snapshot that backs it was rebuilt before every syscall that
-    /// could resolve a path. For an X server -- which polls, reads and writes
-    /// in a tight loop with several hundred mappings live -- that put half of
-    /// all execution into `core::fmt`. Measured: 11.7% in `fmt::write`, 8.7%
-    /// in `write_str`, 7.2% in `format_inner`, 6.1% in the allocator serving
-    /// them, and `proc_maps` itself underneath.
-    ///
-    /// A counter costs one increment per `mmap` and turns the rebuild into a
-    /// comparison. The map changes thousands of times in a run; it is read
-    /// millions.
+    /// Bumped by every change to the map. `/proc/self/maps` is derived from the
+    /// tree; a counter lets a cached rendering be reused unchanged instead of
+    /// reformatting on every read (measured half of an X server's time in
+    /// `core::fmt` before this).
     generation: u64,
 }
 
@@ -165,12 +137,8 @@ impl MemoryMap {
         &self.vmas
     }
 
-    /// Hand out arena addresses from the bottom up, asking `grow` before
-    /// using any that are not backed yet.
-    ///
-    /// Called by a host whose memory has to be allocated up to whatever it
-    /// hands out. `grow` is given the address one past the highest byte the
-    /// map is about to use and answers whether the memory now covers it.
+    /// Hand out arena addresses bottom-up, for a host whose memory must be
+    /// allocated up to whatever it hands out.
     pub fn grows_on_demand(&mut self, take: fn(u64) -> u64, back: fn(u64) -> bool) {
         self.take = Some(take);
         self.back = Some(back);
@@ -189,12 +157,8 @@ impl MemoryMap {
     }
 
     /// Make sure the host's memory reaches `end`, for a mapping placed at an
-    /// address the guest chose rather than one the arena handed out.
-    ///
-    /// `MAP_FIXED` and an honoured address hint both put a mapping where the
-    /// caller said, which may be above anything the arena has claimed. A
-    /// pthread stack is the common one, and without this the guest's first
-    /// write to it trapped on memory that had never been grown.
+    /// address the guest chose (MAP_FIXED or an honoured hint) which may be
+    /// above anything the arena has claimed -- a pthread stack, commonly.
     fn ensure_backed(&mut self, end: u64) -> Result<(), Errno> {
         let Some(take) = self.take else {
             return Ok(());
@@ -203,20 +167,15 @@ impl MemoryMap {
             return Ok(());
         }
         let _ = take;
-        // A fixed address the guest chose: the memory has to reach it, but
-        // nothing is claimed from the arena -- the guest named the range and
-        // this map records it as an ordinary mapping.
         match self.back {
             Some(back) if end <= MMAP_TOP && back(end) => Ok(()),
             _ => Err(Errno::ENOMEM),
         }
     }
 
-    /// How much of the top of the arena is free.
-    ///
-    /// The bytes between the highest mapping and the end of the highest span.
-    /// A fresh claim continues from here rather than above it, so the tail
-    /// the last user gave back is spent before any more is taken.
+    /// How much of the top of the arena is free: the bytes between the highest
+    /// mapping and the end of the highest span. A fresh claim continues from
+    /// here so the tail the last user gave back is spent first.
     fn free_tail(&self) -> u64 {
         let Some(&(lo, hi)) = self.arena.last() else {
             return 0;
@@ -240,48 +199,23 @@ impl MemoryMap {
         // ask the host to grow its memory once per page.
         const CHUNK: u64 = 8 * 1024 * 1024;
         let need = page_align_up(len);
-        // Carry on from the free tail at the top of the arena instead of
-        // starting above it.
-        //
-        // The arena's highest span usually ends in free space, because the
-        // last thing to use it gave some back. Claiming a whole `len` above
-        // that leaves the tail stranded: it is too small for the next request
-        // of the same size, and the request after that strands another one.
-        //
-        // glibc makes this the common case rather than a rare one. `new_heap`
-        // maps two `HEAP_MAX_SIZE`s, keeps the aligned middle and frees the
-        // rest, so every heap hands back most of a `HEAP_MAX_SIZE` and then
-        // asks for two more. Each 64 MiB of heap cost 128 MiB of arena;
-        // `apt-get update` reached the 2 GiB ceiling and aborted, in a memory
-        // that may be nearly 4 GiB. Continuing from the tail makes the steady
-        // state one `HEAP_MAX_SIZE` per heap instead of two.
+        // Carry on from the free tail instead of above it: glibc's `new_heap`
+        // frees most of a `HEAP_MAX_SIZE` back and then asks for more, so
+        // claiming a full `len` above the tail strands it every time. `apt-get
+        // update` hit the 2 GiB ceiling this way.
         let tail = self.free_tail();
         let want = need.saturating_sub(tail).max(CHUNK);
         let start = take(want);
         if start == 0 {
             return Err(Errno::ENOMEM);
         }
-        // Joined to the span below when it touches it, rather than recorded
-        // as a second box.
-        //
-        // The cursor these come from only goes up, so consecutive claims are
-        // adjacent and the arena is really one region -- but the search for a
-        // free hole runs `while candidate + len <= hi` *within* a span, so a
-        // hole that straddles a boundary is invisible to it. That is not a
-        // corner case, it is glibc's ordinary behaviour: `new_heap` maps two
-        // `HEAP_MAX_SIZE`s, keeps a `HEAP_MAX_SIZE`-aligned span and frees
-        // the head and the tail. The freed tail of one claim and the freed
-        // head of the next are adjacent and together are exactly the size of
-        // the next request -- and each alone is too small, so every heap
-        // extended the arena again.
-        //
-        // Measured on `apt-get update`: the arena reached the 2 GiB ceiling
-        // and the next 16 MiB aborted the process, in a memory that may be
-        // nearly 4 GiB. Sixteen heaps at 128 MiB of cursor apiece.
+        // Join to the span below when adjacent rather than recording a second
+        // box: the take-cursor only goes up, so consecutive claims are really
+        // one region, but the free-hole search runs within a single span and
+        // would miss a hole straddling a boundary -- glibc's ordinary heap
+        // pattern, which reached the 2 GiB ceiling and aborted.
         if let Some(last) = self.arena.last_mut() {
             if last.1 == start {
-                // The claim continues the span, so the free tail inside it is
-                // usable and the mapping starts there.
                 last.1 = start + want;
                 return Ok(start - tail);
             }
@@ -301,17 +235,10 @@ impl MemoryMap {
         self.insert_from(start, end, prot, name, None);
     }
 
-    /// Record a region exactly as another process had it.
-    ///
-    /// For `fork`: the child's bytes are its parent's, so its *map* should be
-    /// its parent's too -- the name it had, and the code identity it had.
-    /// Inserting a bare span instead loses both, and a child that cannot say
-    /// what code is at an address cannot find it in the shared store; it
-    /// re-translates the parent's libraries from cold, every time.
-    ///
-    /// No `origin`: that says the region can be rebuilt by re-reading a file,
-    /// which is a claim about a mapping this process made and not one to
-    /// inherit.
+    /// Record a region exactly as another process had it, for `fork`: keep the
+    /// parent's name and code identity so the child can still find the code in
+    /// the shared store instead of re-translating from cold. No `origin`: that
+    /// is a claim about a mapping this process made, not one to inherit.
     pub fn adopt(&mut self, start: u64, end: u64, prot: u32, name: &str, code: Option<(String, u64)>) {
         self.generation += 1;
         self.vmas.push(Vma {
@@ -325,14 +252,11 @@ impl MemoryMap {
         self.vmas.sort_by_key(|v| v.start);
     }
 
-    /// As [`Self::insert`], for bytes a loader placed rather than copied: the
-    /// file and offset name the *code*, but the mapping cannot be rebuilt by
-    /// re-reading, so it gets no `origin`.
-    ///
-    /// This is how an ELF segment arrives. Its `mem_size` runs past the file
-    /// into a zeroed tail, which is why it cannot be reconstructed -- and its
-    /// executable bytes are still exactly a range of the file, which is why it
-    /// can be recognised.
+    /// As [`Self::insert`], for bytes a loader placed: the file and offset name
+    /// the *code*, but the mapping cannot be rebuilt by re-reading so it gets no
+    /// `origin`. This is how an ELF segment arrives -- its `mem_size` runs past
+    /// the file into a zeroed tail, yet its executable bytes are exactly a range
+    /// of the file.
     pub fn insert_loaded(
         &mut self,
         start: u64,
@@ -358,27 +282,14 @@ impl MemoryMap {
     ) {
         self.generation += 1;
         let aligned = page_align_down(start);
-        // The offset moves with the start: the caller names the offset of the
-        // address it asked for, and rounding down to a page boundary walks
-        // backwards into the file by the same amount.
+        // The offset moves with the start: rounding down to a page boundary
+        // walks backwards into the file by the same amount.
         let code = origin.map(|(id, off)| (id, off.saturating_sub(start - aligned)));
-        // `origin` is for a mapping that has *never* been writable, and
-        // [`Self::protect`] enforces that for one that becomes writable
-        // later. It was not enforced for one that starts that way -- and
-        // `ld.so` maps every library's data segment `PROT_READ|PROT_WRITE`
-        // from the file, so libc's `.data` and its GOT claimed to be
-        // reconstructable by re-reading the very bytes the linker was about
-        // to overwrite.
-        //
-        // Nothing had ever re-read one, so nothing had noticed. Restoring a
-        // linked process did, and the symptom named the cause exactly: `ls`
-        // came up with an unrelocated GOT and branched to `0x27200`, a
-        // link-time offset, with `nothing to translate at pc=0x27200`.
-        //
-        // `code` is a different claim -- where these bytes were loaded from,
-        // whatever happened afterwards -- and survives, because two processes
-        // mapping the same library at the same address are still looking at
-        // the same code.
+        // `origin` is only for a mapping that has *never* been writable. `ld.so`
+        // maps a library's data segment RW from the file, so libc's GOT would
+        // otherwise claim to be reconstructable by re-reading the very bytes the
+        // linker overwrites. `code` is the different, surviving claim: where the
+        // bytes were loaded, whatever happened after.
         let origin = if prot & prot::WRITE != 0 { None } else { code.clone() };
         self.vmas.push(Vma {
             start: aligned,
@@ -415,25 +326,17 @@ impl MemoryMap {
         (addr, grew)
     }
 
-    /// Move the break without zeroing what it exposed.
-    ///
-    /// Only for callers with no guest memory to hand -- tests, mostly. A
-    /// syscall must use [`Self::brk_grow`] and zero the range: Linux
-    /// guarantees that memory reads as zero, and glibc's `calloc` *relies* on
-    /// it, skipping its own memset for the part of a chunk that came from a
-    /// fresh `sbrk`. Handing back the previous program's bytes instead means
-    /// `calloc` returns uninitialised memory, and the first thing that
-    /// notices is the dynamic loader finding a garbage field in a structure
-    /// it just allocated.
+    /// Move the break without zeroing what it exposed. Only for callers with no
+    /// guest memory to hand (tests); a syscall must use [`Self::brk_grow`] and
+    /// zero the range, because glibc's `calloc` skips its own memset for fresh
+    /// `sbrk` memory and relies on Linux's zero guarantee.
     pub fn brk(&mut self, addr: u64) -> u64 {
         self.generation += 1;
         self.brk_grow(addr).0
     }
 
-    /// Find and reserve a free range of `len` bytes.
-    ///
-    /// Allocation is top-down from [`MMAP_TOP`], matching Linux's default
-    /// layout, so the heap growing up and mappings growing down stay apart.
+    /// Find and reserve a free range of `len` bytes. Top-down from [`MMAP_TOP`],
+    /// matching Linux, so the heap and mappings grow apart.
     pub fn mmap(&mut self, addr: u64, len: u64, prot: u32, flags: u64, name: &str) -> SysResult {
         self.generation += 1;
         self.mmap_from(addr, len, prot, flags, name, None)
@@ -479,13 +382,10 @@ impl MemoryMap {
             }
         }
 
-        // Bottom-up when the host's memory grows with the arena, so the
-        // highest address in use stays as low as the run allows. A hole left
-        // by `munmap` is reused before any more is claimed; only when nothing
-        // fits does the arena -- and the memory behind it -- get bigger.
+        // Bottom-up when the host's memory grows with the arena, so the highest
+        // address in use stays low: a `munmap` hole is reused before the arena
+        // -- and the memory behind it -- gets bigger.
         if self.take.is_some() {
-            // Bottom-up inside what this map already owns, so a hole left by
-            // `munmap` is reused before the host is asked to grow.
             let chunks = self.arena.clone();
             for (lo, hi) in chunks {
                 let mut candidate = page_align_up(lo);
@@ -535,15 +435,10 @@ impl MemoryMap {
         }
     }
 
-    /// Grow or shrink an existing mapping, as `mremap` does.
-    ///
-    /// Returns the new base, which is the old one when the mapping could be
-    /// extended in place and a fresh range otherwise. The caller moves the
-    /// bytes: this map knows about ranges, not contents.
-    ///
-    /// musl's `realloc` calls this for anything mmap-backed, and a plain
-    /// `ENOSYS` sends it down a malloc-copy-free path instead -- correct, but
-    /// it copies every time a large buffer grows.
+    /// Grow or shrink an existing mapping. Returns the new base -- the old one
+    /// when extended in place, a fresh range otherwise; the caller moves the
+    /// bytes. musl's `realloc` calls this for mmap-backed buffers, so `ENOSYS`
+    /// would make it copy on every growth.
     pub fn mremap(
         &mut self,
         addr: u64,
@@ -634,21 +529,11 @@ impl MemoryMap {
             if v.start < addr {
                 out.push(v.slice(v.start, addr, v.prot));
             }
-            // The piece whose protection changed loses its origin, and that
-            // is not tidiness: a mapping that is read-only *now* may have
-            // been written while it was writable. `ld.so` maps a library,
-            // relocates its RELRO region, and mprotects it read-only -- the
-            // bytes there are no longer the file's, so a host that
-            // reconstructed them by re-reading would throw the relocations
-            // away. Only a mapping that has never been writable can be
-            // reconstructed, and that is exactly the one this never touches.
-            //
-            // `code` survives, because it answers a different question: what
-            // was loaded here, not what can be re-read. The relocated words
-            // are data -- a RELRO region is the GOT and the linkage tables --
-            // and the executable bytes of the segment are the file's. Two
-            // processes running the same program relocate them the same way,
-            // at the same addresses, because placement is pinned.
+            // The changed piece loses its origin: a mapping read-only *now* may
+            // have been written while writable (`ld.so` relocates a RELRO region
+            // then mprotects it read-only), so it cannot be rebuilt by
+            // re-reading. `code` survives -- the executable bytes are still the
+            // file's, and two processes relocate them identically.
             let mut piece = v.slice(v.start.max(addr), v.end.min(end), new_prot);
             piece.origin = None;
             out.push(piece);
@@ -716,15 +601,9 @@ mod tests {
 
     /// glibc's heap pattern must not leak the arena a claim at a time.
     ///
-    /// `new_heap` maps two `HEAP_MAX_SIZE`s, keeps the aligned middle and
-    /// frees the head and the tail. The freed tail of one claim and the freed
-    /// head of the next are adjacent, and together they are exactly the size
-    /// of the next request -- so the second heap must land in them rather
-    /// than extending the arena again.
-    ///
-    /// It did extend, every time, because the search for a hole runs inside
-    /// one recorded span and these two halves were in different spans.
-    /// `apt-get update` reached the 2 GiB ceiling and aborted.
+    /// `new_heap` frees the head and tail of each claim; the freed tail of one
+    /// and head of the next are adjacent and together fit the next request, so
+    /// the second heap must land in them rather than extend the arena again.
     #[test]
     fn a_freed_tail_and_the_next_head_are_one_hole() {
         // A cursor that only goes up, which is what the browser shim has.

@@ -1,23 +1,8 @@
-/* Ask the GPU what it can do, over the wire the guest's Mesa would use.
- *
- * This is the vtest handshake and nothing else: connect to the socket, name
- * yourself, ask for the capability set, print how big it is. Mesa does the
- * same four things before it does anything at all, and everything it does
- * afterwards -- every shader it compiles, every format it picks -- follows
- * from the answer.
- *
- * Which is why this exists as a program rather than a recording. A recorded
- * stream carries the answer the *recording* host gave, so replaying it into a
- * different renderer asks for features that were never offered: the native
- * host answers with capability set version 2, 5,508 bytes of it, and a WebGL 2
- * host can only answer version 1, 308 bytes. There is no way to make a
- * recording valid for both. A guest that asks the question itself gets a true
- * answer from whichever renderer is behind the socket, and printing the size
- * says which one it was.
- *
- * 30 lines of socket code stands in for 25 MB of Mesa, and proves the same
- * path: guest socket, host device, renderer, and the reply all the way back.
- */
+/* The vtest handshake Mesa runs before anything else: connect to the socket,
+ * name yourself, ask for the capability set, print its size. A live program
+ * rather than a recording, because the caps reply differs by renderer (native
+ * host vs WebGL 2) and printing the size says which answered. Proves the path
+ * guest socket -> host device -> renderer -> reply. */
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -92,11 +77,8 @@ int main(void) {
         printf("no answer\n");
         return 1;
     }
-    /* The caps reply is the one whose length field is a *byte* count, and
-     * one more than the truth at that. Every other command's is in dwords.
-     * Reading it as dwords asks for four times what is coming and waits
-     * forever for the rest -- which looks exactly like a renderer that
-     * stopped answering, and is not. */
+    /* The caps reply's length field is a *byte* count, one more than the
+     * truth; every other command's is in dwords. */
     unsigned int size = reply[0] ? reply[0] - 1 : 0;
     printf("capset reply %u bytes\n", size);
 

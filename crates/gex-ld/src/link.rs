@@ -1,53 +1,19 @@
-//! Linking a program instead of running its dynamic linker.
+//! Linking a program on the host instead of running its dynamic linker.
 //!
-//! [`crate::dynamic`] implements PLAN §6.4's *cooperative mode*: gex places
-//! the executable and the interpreter and then jumps to the interpreter,
-//! which does the real work -- searching for libraries, mapping them, hashing
-//! symbols and applying relocations -- as translated guest code, once per
-//! process.
+//! Loads the executable and everything it needs, assigns each object an
+//! address, builds one symbol table across the lot, and applies every
+//! relocation in native code. The guest then starts at the executable's entry
+//! with its GOT already filled in, avoiding the per-process cost of
+//! [`crate::dynamic`]'s cooperative mode.
 //!
-//! Measured on the demo site, that is half of a warm `ls`: 420ms of a 925ms
-//! process, of which only about twenty milliseconds is inside syscalls. The
-//! rest is glibc's linker computing, one emulated instruction at a time, an
-//! answer gex already has. A closure pins every library at a fixed address at
-//! build time; the layout is not discovered at run time, it is decided before
-//! the run exists.
+//! Two things are guest code and are left for the caller to run at startup:
+//! `STT_GNU_IFUNC` resolvers (collected as `IRELATIVE`) and the `DT_INIT_ARRAY`
+//! initialisers.
 //!
-//! So this module does the linking on the host. It loads the executable and
-//! everything it needs, assigns each object an address, builds one symbol
-//! table across the lot, and applies every relocation in native code. The
-//! guest starts at the executable's entry with its GOT already filled in.
-//!
-//! Two things it cannot do, and does not pretend to:
-//!
-//! * **`STT_GNU_IFUNC`**. glibc resolves `memcpy`, `memmove` and `memset`
-//!   through a resolver function chosen by the hardware it finds. The
-//!   resolver is guest code and has to run, so `IRELATIVE` relocations are
-//!   collected here and left for the caller to call at startup. There are a
-//!   few dozen, against tens of thousands of ordinary relocations.
-//! * **The initialisers**. `DT_INIT_ARRAY` is guest code too, and the same
-//!   applies: collected in order, run by the caller before `main`.
-//!
-//! And one it cannot do at all, which is worth writing down because it is
-//! what PLAN §6.4 was pointing at and it is not a matter of effort.
-//!
-//! glibc's `libc.so.6` reads `_rtld_global` and `_rtld_global_ro`, two
-//! structures that live in `ld.so`. Resolving them is easy -- they are
-//! ordinary symbols, and the linker loads the interpreter like any other
-//! library so that it can define them. *Filling them in* is not: `GLRO
-//! (dl_pagesize)`, which `malloc` divides by, is a field at some offset
-//! inside `_rtld_global_ro`, and a field is not a symbol. Nothing in the ELF
-//! says where it is. The same goes for `struct pthread`, which the thread
-//! pointer must point just past, and for `__libc_early_init`, which `ld.so`
-//! calls to bring stdio and locale up. All three are private layouts that
-//! change between glibc releases and are readable only by being glibc.
-//!
-//! So on a Debian rootfs this module links every relocation correctly and the
-//! program still dies in `malloc`. It replaces the loader for static-PIE and
-//! for musl, where the loader state has no such private interface. For glibc
-//! the way to stop paying for the interpreter is not to reimplement it but to
-//! run it once and keep what it produced, and this module is the half of that
-//! which decides where everything goes.
+//! What it cannot do: glibc's `libc.so.6` reads fields of `_rtld_global(_ro)`
+//! that live in `ld.so`, and a field at an offset is not a symbol the ELF
+//! locates. So on Debian this links every relocation and still dies in
+//! `malloc`; it replaces the loader only for static-PIE and musl.
 
 use crate::elf::{load, DynSym, Image, LoadError, Reloc};
 use std::collections::HashMap;
@@ -84,19 +50,11 @@ pub struct Linked {
     pub entry: u64,
     /// `(slot, resolver)` pairs the guest must run and store, in order.
     pub irelative: Vec<(u64, u64)>,
-    /// `(slot, offset)` pairs for TLS descriptors, where `slot` is the
-    /// two-word descriptor and `offset` is the value its resolver must
-    /// return: the symbol's position relative to the thread pointer.
-    ///
-    /// The caller writes both words. The second is `offset`; the first is the
-    /// address of a resolver that returns it, which the caller supplies
-    /// because it is guest code and this crate does not place guest code.
-    /// Two instructions do it -- `ldr x0, [x0, #8]` then `ret` -- which is
-    /// what glibc's own `_dl_tlsdesc_return` is.
-    ///
-    /// Only the static case, which is the only one a program that does not
-    /// `dlopen` produces: every object is present at start, so every offset
-    /// is known now and no resolver has to allocate anything.
+    /// `(slot, offset)` pairs for TLS descriptors: `slot` is the two-word
+    /// descriptor, `offset` the thread-pointer-relative value its resolver
+    /// returns. The caller writes both words (the resolver is guest code, a
+    /// two-instruction `_dl_tlsdesc_return`). Static case only, which is all a
+    /// non-`dlopen` program produces.
     pub tlsdesc: Vec<(u64, u64)>,
     /// Initialisers to call before `main`, dependencies first.
     pub init: Vec<u64>,
@@ -269,17 +227,11 @@ pub fn link(
                     // which is why this is a second pass below.
                 }
                 R_AARCH64_TLSDESC => {
-                    // Two words: a resolver and its argument. The static case
-                    // is the only one a non-`dlopen` program produces, and
-                    // its resolver returns the argument unchanged -- so the
-                    // argument *is* the answer, and it is the same thread
-                    // pointer offset `TPREL64` computes.
-                    //
-                    // The caller writes the pair, because the resolver is
-                    // guest code and this crate places none. Left unhandled,
-                    // these are what stopped `ls` and `apt-get` linking:
-                    // four in libselinux, nineteen across apt's twenty
-                    // objects, and nothing else missing from either.
+                    // Two words: a resolver and its argument. In the static
+                    // case the resolver returns the argument unchanged, so the
+                    // argument is the same thread-pointer offset `TPREL64`
+                    // computes. The caller writes the pair (resolver is guest
+                    // code).
                     let (base, off) = match found {
                         Some(d) if d.tls => {
                             (objects[d.obj].tls_offset.unwrap_or(0), d.value)

@@ -1,20 +1,5 @@
-/* Three things a Linux program assumes exist, and gex did not have.
- *
- * All three turned up trying to run Xwayland, one after the other, each
- * hiding the next.
- *
- * `#!` interpreter scripts. Linux resolves these in `execve`, not in the
- * shell: the kernel reads the first line and runs the named interpreter with
- * the script's path inserted as an argument. Without it, Debian's
- * `x11-common` postinst ran a Perl script through debconf, dash got ENOENT,
- * fell back to reading the file as shell, and reported `use: not found`.
- *
- * `flock`. Missing entirely, so perl's `flock` returned ENOSYS and debconf
- * read that as "locked by another process".
- *
- * `epoll`. Missing entirely, so Xwayland stopped with "failed to allocate
- * poll structure" before printing anything else.
- */
+/* Three facilities a Linux program assumes: `#!` interpreter scripts (resolved
+ * by the kernel in execve, not the shell), `flock`, and `epoll`. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -40,12 +25,9 @@ static void write_script(const char *path, const char *body) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    /* The interpreter half: print what the kernel passed and stop. */
-    /* `strncmp`, not `strcmp`: the second script's `#!` line is
-       `--interp with two words`, and Linux passes all of that as a *single*
-       argument. Comparing the whole string missed it, the child fell through
-       to the top of the test, and it re-ran itself forever -- which is a
-       tidy demonstration of the rule. */
+    /* The interpreter half: print what the kernel passed and stop.
+       `strncmp`, not `strcmp`: the second script's `#!` line is
+       `--interp with two words`, which Linux passes as a *single* argument. */
     if (argc > 1 && strncmp(argv[1], "--interp", 8) == 0) {
         printf("interp arg1 [%s]\n", argv[1]);
         printf("interp got:");
@@ -62,11 +44,8 @@ int main(int argc, char **argv) {
 
     /* -- shebang ------------------------------------------------------- */
 
-    /* The interpreter is this program itself, so the test needs nothing in
-       the filesystem but the scripts. Run with `--interp` it prints the
-       arguments the kernel handed it, which is the whole question: Linux
-       inserts the script's path, and everything after the first space on the
-       `#!` line is a single argument however many spaces it contains. */
+    /* The interpreter is this program itself. Linux inserts the script's path,
+       and everything after the first space on the `#!` line is one argument. */
     char me[4096];
     ssize_t len = readlink("/proc/self/exe", me, sizeof me - 1);
     if (len <= 0) {
@@ -108,9 +87,7 @@ int main(int argc, char **argv) {
        contends. */
     printf("second on the same file: %d %s\n", flock(b, LOCK_EX | LOCK_NB),
            errno == EWOULDBLOCK ? "EWOULDBLOCK" : "?");
-    /* A different file does not. This is the one that was wrong: with the
-       conflict test written over owners alone, locking anything locked
-       everything. */
+    /* A different file does not contend. */
     printf("a different file: %d\n", flock(other, LOCK_EX | LOCK_NB));
     /* A duplicate shares the description, so it may lock again. */
     int dup_a = dup(a);

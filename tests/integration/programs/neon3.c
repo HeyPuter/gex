@@ -1,19 +1,8 @@
-/* The NEON instructions a glibc program reaches before `main`.
- *
- * glibc's aarch64 string routines are hand-written, and three of the things
- * they use were not implemented: `addhn`, which folds a comparison mask down
- * to a scalar in `strlen`; `umaxp`, which reduces one in `memchr`; and the
- * read-modify-write forms of the modified-immediate group, `bic vd, #imm`,
- * which `strchrnul` uses to mask a mask.
- *
- * The last of those was the interesting one. It shares its encoding with
- * `movi` and differs only in the low bit of `cmode`, so decoding it as a move
- * did not fail -- it silently replaced a register that was meant to be
- * masked. A wrong answer, not a trap.
- *
- * Intrinsics rather than inline assembly, so the compiler picks registers and
- * the comparison against qemu is of the whole sequence.
- */
+/* The NEON instructions glibc's hand-written aarch64 string routines reach:
+ * `addhn` (folds a compare mask to a scalar in strlen), `umaxp` (reduces one
+ * in memchr), and the read-modify-write modified-immediate forms `bic/orr
+ * vd, #imm`, which share an encoding with `movi` and differ only in a `cmode`
+ * bit. Plus full-width vector shifts, which wasm takes modulo the lane width. */
 #include <arm_neon.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -89,12 +78,9 @@ int main(void) {
     { uint32x2_t r = vget_low_u32(a32); r = vorr_u32(r, vdup_n_u32(0x0000ff00));
       printf("orr_2s     %08x\n", hash(&r, 8)); }
 
-    /* A right shift by the whole element width. Legal, and it means what it
-       says: everything shifted out, so zero unsigned and the replicated sign
-       bit signed. wasm has no such shift -- it takes the count modulo the
-       lane width, so 32 on a 32-bit lane is a shift by nothing at all and
-       hands back the operand. Quietly returning the input is the worst
-       available answer and is what gex did until this was written. */
+    /* A right shift by the whole element width: everything shifted out (zero
+       unsigned, replicated sign bit signed). wasm takes the count modulo the
+       lane width, where 32 on a 32-bit lane would be a shift by nothing. */
     { uint32x4_t r = a32;
       __asm__ volatile("ushr %0.4s, %1.4s, #32" : "=w"(r) : "w"(a32));
       printf("ushr_full  %08x\n", hash(&r, 16)); }

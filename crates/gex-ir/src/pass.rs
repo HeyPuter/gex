@@ -1,17 +1,7 @@
-//! Block-local GIR optimisation passes.
+//! Block-local GIR optimisation passes: [`const_fold`], [`dead_store_elim`]
+//! (mostly dead-flag elimination), and [`dce`].
 //!
-//! These are the passes PLAN §5.4 lists as mattering most for static binary
-//! translation, restricted to what is sound inside a single basic block:
-//!
-//! 1. [`const_fold`] — lifted semantics generate a lot of constant
-//!    arithmetic (shifted immediates, sign-extension chains, flag constants).
-//! 2. [`dead_store_elim`] — kills redundant guest-register writes, which for
-//!    AArch64 is overwhelmingly *dead flag elimination*: a run of `cmp`s and
-//!    `adds`es where only the last one's NZCV is observed.
-//! 3. [`dce`] — drops the now-unused expressions feeding those stores.
-//!
-//! Everything here is conservative at block boundaries: guest state is
-//! assumed live-out. Cross-block flag liveness is a tier-2 concern.
+//! Conservative at block boundaries: guest state is assumed live-out.
 
 use crate::*;
 
@@ -39,22 +29,18 @@ pub fn const_value(block: &Block, v: Value) -> Option<u64> {
 
 /// Constant-fold with an oracle that can read initialised guest memory.
 ///
-/// This is what makes dynamically linked code discoverable. A PLT entry ends
-/// in `br x17`, where `x17` was loaded from a GOT slot the linker has already
-/// filled in, so the branch target is a constant *if* you are willing to read
-/// memory. Static translation is not, but runtime translation is.
-///
-/// Reading a slot that later changes cannot cause a wrong answer, only a
-/// wasted translation: discovery never decides where a branch actually goes,
-/// the dispatch table does (PLAN §6.1).
+/// Makes dynamically linked code discoverable: a PLT `br x17` becomes a
+/// constant once the GOT slot it loads is read. Reading a slot that later
+/// changes only wastes a translation; the dispatch table decides the real
+/// target (PLAN §6.1).
 pub fn const_fold_with_memory(block: &mut Block, read: &dyn Fn(u64, u32) -> Option<u64>) {
     let mut known: Vec<Option<u64>> = vec![None; block.n_values as usize];
     for stmt in &mut block.stmts {
         let Stmt::Def { dst, expr } = stmt else {
             continue;
         };
-        // A plain, unsigned load from an address we know is the one case the
-        // ordinary evaluator cannot handle on its own.
+        // A plain unsigned load from a known address: the one case `eval`
+        // cannot handle on its own.
         let folded = if let Expr::Load {
             addr,
             offset,
@@ -203,9 +189,8 @@ fn eval_bin(op: BinOp, ty: Ty, a: u64, b: u64) -> Option<u64> {
             Ty::I32 => (a as u32).rotate_right(sh) as u64,
             Ty::I64 | Ty::V128 => a.rotate_right(sh),
         },
-        // Division is left to run time: folding it here would have to
-        // reproduce wasm's trapping behaviour exactly, and the lifter has
-        // already inserted guards that make the folded form unreachable.
+        // Left to run time: reproducing wasm's trap behaviour isn't worth it,
+        // and the lifter's guards make the folded form unreachable anyway.
         BinOp::DivU | BinOp::DivS | BinOp::RemU | BinOp::RemS => return None,
     };
     Some(v & m)
@@ -274,13 +259,9 @@ pub fn flags_of_mask(mask: u8) -> Vec<GuestReg> {
         .collect()
 }
 
-/// A block's effect on the flags: which it reads before writing, and which it
-/// writes on every path through it.
-///
-/// These are the `use` and `def` sets of a backwards liveness analysis. `def`
-/// is what a flag must be overwritten by for a write upstream to be dead, so
-/// it may only include writes the block always performs -- which, since a GIR
-/// block is straight-line, is all of them.
+/// A block's effect on the flags: which it reads before writing (`use`), and
+/// which it writes (`def`), the sets of a backwards liveness analysis. A
+/// straight-line block always performs every write, so all count toward `def`.
 pub fn flag_effects(block: &Block) -> (u8, u8) {
     let (mut uses, mut defs) = (0u8, 0u8);
     for s in &block.stmts {
@@ -315,10 +296,8 @@ pub fn flag_effects(block: &Block) -> (u8, u8) {
     (uses, defs)
 }
 
-/// Whether a block's terminator can reach code this analysis cannot see.
-///
-/// An indirect branch, a syscall's return into the kernel, or a SIGILL all
-/// leave the graph, so everything must be assumed live across them.
+/// Whether a block's terminator can reach code this analysis cannot see, so
+/// everything must be assumed live across it.
 pub fn escapes(block: &Block) -> bool {
     matches!(
         block.term,
@@ -330,35 +309,21 @@ pub fn escapes(block: &Block) -> bool {
 // Dead guest-register store elimination
 // ---------------------------------------------------------------------------
 
-/// Remove writes to guest registers that are provably overwritten before any
-/// read, within this block.
+/// Remove writes to guest registers provably overwritten before any read,
+/// within this block. Mostly dead-flag elimination.
 ///
-/// This is where dead-flag elimination happens. A sequence like
-/// `cmp x0,#1 ; cmp x1,#2 ; b.eq` writes NZCV twice; only the second write is
-/// observable, and dropping the first lets [`dce`] delete the whole first
-/// flag computation.
-///
-/// Conservative rules:
-/// * every register is live at the block terminator, since a successor may
-///   read it;
-/// * a host call that clobbers guest state is treated as reading everything,
-///   because the kernel inspects the context.
+/// Conservative: every register is live at the terminator (a successor may
+/// read it), and a host call that clobbers guest state reads everything.
 pub fn dead_store_elim(block: &mut Block) {
     dead_store_elim_with(block, &[]);
 }
 
 /// `dead_store_elim`, told which registers are already dead at the block's
-/// exit.
-///
-/// Within one block the terminator has to be treated as reading everything,
-/// because a successor might. Once the whole control-flow graph is known that
-/// is answerable, and for the flags the answer is almost always "nothing reads
-/// them": AArch64 sets all four of NZCV on every `cmp`, `adds` and `subs`, and
-/// the branch that follows consumes one or two. See [`flag_effects`].
+/// exit — which cross-block analysis can supply once the CFG is known (for
+/// the flags, usually "nothing reads them"). See [`flag_effects`].
 pub fn dead_store_elim_with(block: &mut Block, dead_out: &[GuestReg]) {
-    // Walk backwards, tracking which registers are already known to be
-    // overwritten later in the block. A register dead at the exit behaves
-    // exactly like one overwritten just past the terminator.
+    // Walk backwards tracking registers known to be overwritten later. A
+    // register dead at exit behaves like one overwritten past the terminator.
     let mut overwritten: Vec<GuestReg> = dead_out.to_vec();
     let mut drop_at: Vec<bool> = vec![false; block.stmts.len()];
 
@@ -552,10 +517,8 @@ mod tests {
 
     #[test]
     fn a_dead_out_flag_read_earlier_in_the_block_still_survives() {
-        // `adcs` reads C and then writes it. Even with C dead on exit, the
-        // read must see the incoming value, so the write cannot be hoisted
-        // away in a manner that disturbs it -- and the read keeps the
-        // *incoming* C live, which is the caller's problem, not this one's.
+        // `adcs` reads C then writes it. With C dead on exit the write is
+        // dead, but the read of the incoming C must survive.
         let mut b = Builder::new(0);
         let c = b.read(GuestReg::C);
         b.write(GuestReg::X(0), c);

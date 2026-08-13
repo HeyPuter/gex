@@ -1,24 +1,9 @@
-/* An init system, in the shape a real one has.
+/* An init running as pid 1: starts services (fork/exec/wait), gives each its
+ * own session, adopts and reaps orphans, and signals a whole process group.
  *
- * This runs as pid 1 and does the four things that make pid 1 different from
- * every other process, each of which needs machinery no ordinary program
- * exercises:
- *
- *   1. It starts services, which is fork and exec and wait.
- *   2. It gives each service its own session, so a service is not in init's.
- *   3. It adopts orphans -- a process whose own parent has exited becomes
- *      init's child, and init is the one that reaps it.
- *   4. It signals a whole process group, which is how it stops a service that
- *      forked workers of its own.
- *
- * The transcript is fixed, so every pid in it is a claim: under gex the first
- * process is pid 1 and the rest are handed out in order, and a number landing
- * in the wrong place means the process table lost track of somebody. Nothing
- * a child prints appears here; children report through their exit status
- * instead, so the order of the output does not depend on scheduling.
- *
- * Not run against qemu: `compare` would have to agree about pid 1, and under
- * qemu-user the guest's pids are the host's.
+ * The transcript is fixed, so every pid is a claim: pid 1 first, the rest in
+ * order. Children report through exit status, not stdout, so output order does
+ * not depend on scheduling. Not run against qemu, which cannot agree on pid 1.
  */
 #include <errno.h>
 #include <signal.h>
@@ -31,9 +16,8 @@
 
 static char self[4096];
 
-/* Re-exec this program in a given role. Roles are separate execs rather than
-   plain forks on purpose: exec is what an init does, and a child that only
-   forked would keep the parent's translated state and prove less. */
+/* Re-exec this program in a given role. Separate execs, not plain forks: exec
+   is what an init does, and gives each role a fresh translation. */
 static pid_t spawn(const char *role) {
     pid_t pid = fork();
     if (pid < 0) {
@@ -162,11 +146,8 @@ static int role_init(void) {
     printf("group: both joined -> %s\n",
            getpgid(lead) == lead && getpgid(second) == lead ? "yes" : "no");
     printf("group: kill(-%d, SIGTERM) -> %d\n", (int)lead, kill(-lead, SIGTERM));
-    /* Two children signalled at once, reaped in whichever order they happen
-       to die. Which comes back first is not something Linux promises and not
-       something this test is about, so they are collected and reported in a
-       fixed order -- reporting them as they arrive made this fail whenever
-       anything changed the timing of a wait. */
+    /* Two children signalled at once, reaped in whichever order they die.
+       Collected and reported sorted, since arrival order is not fixed. */
     {
         int lines = 0;
         char seen[2][64];

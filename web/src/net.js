@@ -1,14 +1,9 @@
-// The guest's network, carried over Wisp.
-//
-// A page cannot open a TCP connection. Wisp multiplexes streams down one
-// WebSocket to a proxy that can, and `@mercuryworkshop/wisp-js` speaks it.
-// What this adds is the shape the shim asks for: small integer stream ids,
-// a receive buffer per stream, and seven calls that never wait.
-//
-// Never waiting is the whole constraint. The guest thread that asked for the
-// bytes is parked by the kernel, and the page's event loop is what makes the
-// bytes arrive -- so if any of these blocked, nothing would ever deliver
-// them.
+// The guest's network, carried over Wisp: a page cannot open a TCP connection,
+// so `@mercuryworkshop/wisp-js` multiplexes streams down one WebSocket to a
+// proxy that can. This adds the shape the shim asks for: integer stream ids, a
+// receive buffer per stream, and seven calls that never wait -- they must not,
+// because the page's event loop is what delivers the bytes the parked guest is
+// waiting on.
 
 import { client } from '@mercuryworkshop/wisp-js/client';
 
@@ -44,13 +39,8 @@ class Stream {
   }
 }
 
-/**
- * A network for `Gex.useNetwork`.
- *
- * `wispUrl` is the proxy's endpoint and must end in a slash, which is what
- * the Wisp client insists on.
- */
-/// What the proxy delivers, counted. See the `onmessage` below.
+// A network for `Gex.useNetwork`. `wispUrl` must end in a slash (the Wisp
+// client insists). `meter` counts what the proxy delivers; see `onmessage`.
 const meter = { n: 0, bytes: 0, last: 0 };
 
 export class WispNetwork {
@@ -65,19 +55,14 @@ export class WispNetwork {
     this.#onEvent = onEvent;
   }
 
-  /** Open the WebSocket. Resolves once the proxy has said hello. */
-  /**
-   * The proxy this was pointed at, normalised.
-   *
-   * A guest process is a Worker now, and each opens its own connection to
-   * the proxy rather than relaying through the page -- a socket is per
-   * process on a real machine too. So the address is what travels, and this
-   * is where a page that has already made one gets it from.
-   */
+  /** The proxy this was pointed at, normalised. Each guest process (a Worker)
+   * opens its own connection to it, so the address is what travels between
+   * them. */
   get url() {
     return this.#url;
   }
 
+  /** Open the WebSocket. Resolves once the proxy has said hello. */
   async start() {
     if (this.#conn) return;
     await new Promise((resolve, reject) => {
@@ -126,23 +111,8 @@ export class WispNetwork {
     };
     w.onmessage = (data) => {
       const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-      // When the bytes stop, and for how long.
-      //
-      // `apt-get update` reports 14.9 MB at 44 kB/s, which reads like a slow
-      // transport and is not one. The timeline says otherwise:
-      //
-      //     16 messages,  0.0 MiB in   2.3s
-      //     32 messages,  0.1 MiB in   2.3s
-      //     48 messages,  0.2 MiB in 320.9s
-      //    384 messages,  7.5 MiB in 321.7s
-      //
-      // One stall of 318 seconds after about a hundred kilobytes, and then
-      // seven megabytes in eight tenths of a second -- nine megabytes a
-      // second, which is the speed of the machine. The average was hiding a
-      // hang, and a hang of about five minutes that ends by itself is a
-      // timeout expiring rather than a bandwidth problem.
-      //
-      // So this reports gaps rather than rates: silence is the signal.
+      // Report gaps, not rates: a low average was hiding a fixed ~318s stall
+      // (an idle timeout), so silence is the signal worth logging.
       const now = performance.now();
       if (!s.firstRecv) {
         s.firstRecv = now;
@@ -189,30 +159,11 @@ export class WispNetwork {
   send(id, bytes) {
     const s = this.#streams.get(id);
     if (!s || !s.wisp || s.state === CLOSED || s.state === REFUSED) return -1;
-    // A copy, because the argument is a view into the guest's memory and the
-    // client keeps it until the socket drains.
-    // When the request went out, against when the first byte came back.
-    //
-    // The stall is 318 seconds of silence on a transport that then runs at
-    // nine megabytes a second, and the guest side is accounted for: apt is
-    // polling its methods' pipes (1 reader, 1 writer, empty) and the methods
-    // are waiting on the network. So either the request leaves late, which
-    // is ours, or it leaves promptly and the answer is late, which is the
-    // proxy's or the mirror's. One number each way settles it.
-    // Every send, not just the first.
-    //
-    // The stall is a fixed 318 seconds -- 318.1 and 318.4 across runs -- after
-    // about a hundred kilobytes, and it survives the Worker polling fifty
-    // times a second instead of thirty-two thousand, so it is not contention
-    // and not starvation. A fixed five minutes that ends by itself is
-    // somebody's idle timeout.
-    //
-    // apt keeps the connection alive and sends its next request on it. The
-    // probe that does *not* stall sends one request and `Connection: close`.
-    // So the question is whether the second request leaves at all: if apt
-    // sends at three seconds and the answer arrives at three hundred and
-    // twenty, the send is being lost and the server is idling until it gives
-    // up.
+    // Log every send with its timestamp: paired against the first-reply time in
+    // `onmessage`, it says whether the ~318s stall is a late request (ours) or
+    // a late answer (the proxy's or mirror's). The copy below is because the
+    // argument is a view into guest memory the client keeps until the socket
+    // drains.
     s.sends = (s.sends ?? 0) + 1;
     if (!s.firstSend) s.firstSend = performance.now();
     console.error(

@@ -2,15 +2,11 @@
 //
 //   node web/test/host-socket.mjs <socket-server-elf>
 //
-// The other direction of the seam the virtio-gpu renderer uses. A guest that
-// *connects* to a host-served socket has worked for a while; a guest that
-// *serves* one had no way to be reached from outside, and that is the
-// direction a Worker per process needs -- an X server in one Worker and its
-// client in another have to have a socket between them, and a relay in
-// JavaScript can only be that if it can reach both ends.
-//
-// `SocketNames::connect` already did the work. It only needed a host-owned
-// socket to do it with, which is what `gex_host_connect` supplies.
+// The other direction of the renderer's seam: a guest that *serves* a socket
+// had no way to be reached from outside, which one-Worker-per-process needs
+// (an X server and its client in separate Workers, relayed in JS). The work is
+// `SocketNames::connect`; it only needed a host-owned socket, via
+// `gex_host_connect`.
 import { readFile, access } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';

@@ -1,11 +1,6 @@
-/* A parent that polls with WNOHANG and sleeps in sigsuspend between polls.
- *
- * This is how coreutils `timeout` waits, and it needs the SIGCHLD a child's
- * exit owes it: nothing else will end the sigsuspend. gex published the exit
- * status and woke the condvar a blocking `wait4` parks on, which is why the
- * gap went unnoticed -- a parent that waits the other way sat forever for a
- * child that had already exited.
- */
+/* A parent that polls with WNOHANG and sleeps in sigsuspend between polls, the
+ * way coreutils `timeout` waits: a child's exit must deliver SIGCHLD, since
+ * nothing else ends the sigsuspend. */
 #include <signal.h>
 #include <stdio.h>
 #include <sys/wait.h>

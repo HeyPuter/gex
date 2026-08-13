@@ -2,22 +2,14 @@
 //
 //   node web/test/virgl-webgl.mjs
 //
-// The native path is settled: unmodified Debian glxgears renders through the
-// host's libvirglrenderer on real OpenGL. The page cannot use that renderer,
-// so the renderer itself is compiled to wasm and pointed at a WebGL 2 context
-// instead -- WebGL 2 being GLES 3.0, and virglrenderer having a GLES backend
-// because that is how it runs on phones.
+// The renderer is compiled to wasm and pointed at a WebGL 2 context (GLES 3.0,
+// which virglrenderer has a backend for). This loads it in headless Chromium
+// and prints the capability set it would offer a guest -- the point is *what*:
+// WebGL 2 has no compute, geometry/tessellation shaders or texture buffers, and
+// the size of that reduction decides which programs can be served.
 //
-// Whether that actually stands up is a question about a browser, so this asks
-// one. It loads the module in headless Chromium, initialises the renderer,
-// and prints the capability set it would offer a guest. The interesting part
-// is not that it returns something: it is *what*. WebGL 2 has no compute, no
-// geometry or tessellation shaders and no texture buffers, so the capability
-// set is a reduced one, and the size of the reduction decides which programs
-// can be served at all.
-//
-// Chromium needs --enable-unsafe-swiftshader for WebGL without a GPU. That is
-// a software rasteriser, so nothing here is a performance measurement.
+// Needs --enable-unsafe-swiftshader (software rasteriser), so nothing here is a
+// performance measurement.
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, rm, copyFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -47,10 +39,8 @@ await copyFile(join(BUILD, 'gexvirgl.wasm'), join(dir, 'gexvirgl.wasm'));
 //
 //   GEX_VTEST_RECORD=gears.vtest gexc run ... glxgears
 //
-// It is every byte unmodified Mesa asked of a GPU while glxgears ran, so
-// replaying it here asks the only question that matters about the port --
-// not whether the renderer starts, but whether WebGL 2 can execute what Mesa
-// actually emits. No guest, no rootfs and no translator are involved.
+// It is every byte Mesa asked of a GPU while glxgears ran; replaying it asks
+// whether WebGL 2 can execute what Mesa emits. No guest, rootfs or translator.
 const STREAM = process.env.GEX_VTEST_STREAM || '';
 let replay = false;
 if (STREAM && (await exists(STREAM))) {
@@ -60,29 +50,12 @@ if (STREAM && (await exists(STREAM))) {
 
 // The native renderer's answers to the same stream, from GEX_VTEST_REPLIES.
 //
-// This compares, and it is worth being clear about how far it can mean
-// anything. The replies agree exactly up to reply byte 32, and then diverge
-// on the capability set -- 5,508 bytes of it natively against 308 here,
-// because that host is desktop GL 4.3 and this one is GLES 3.0.
-//
-// That divergence is correct. What it costs is the rest of the comparison,
-// and more than the comparison. The recorded stream is what the guest's Mesa
-// emits *having been told it has GL 4.3*: every shader, format and draw after
-// the capability exchange was chosen on that basis. Replaying it into a
-// renderer with a smaller capability set asks for features that were never
-// offered, so a blank frame from here is not evidence of a defect in the
-// port -- it is what should happen.
-//
-// Forcing the native host onto its GLES path (GEX_VIRGL_GLES) does not
-// rescue it. Both native configurations advertise capability set version 2,
-// 5,508 bytes of it; WebGL 2 can only offer version 1, 308 bytes. The guest
-// asked for v2 and got it, so every recording made against this stack is
-// unreplayable here, and no amount of matching the host API fixes that.
-//
-// So this is a smoke test with a hard boundary: it proves the transport, the
-// framing and the command dispatch, and it cannot prove a picture. A picture
-// needs the guest negotiating live against the renderer that will serve it.
-// The pixel count below is reported, never asserted, for that reason.
+// The replies agree up to byte 32, then diverge on the capability set (5,508
+// bytes native vs 308 here): the recording is what Mesa emits having been told
+// it has GL 4.3, so replaying it into a smaller capability set asks for
+// features never offered, and a blank frame here is expected, not a defect.
+// This is a smoke test for transport, framing and dispatch; it cannot prove a
+// picture, so the pixel count below is reported, never asserted.
 const REPLIES = process.env.GEX_VTEST_REPLIES || '';
 let compare = false;
 if (replay && REPLIES && (await exists(REPLIES))) {
@@ -102,12 +75,9 @@ const REPLAY = __REPLAY__;
 const COMPARE = __COMPARE__;
 import Module from './gexvirgl.mjs';
 const say = (s) => { document.getElementById('out').textContent = s; document.title = s; };
-// virglrenderer explains itself on stderr and says nothing through its return
-// value beyond "no". Collect it, or a failure is just a number.
-//
-// Deduplicated, and that is not tidiness: a shader that will not compile is
-// reported once and a buffer map that will not map is reported for every
-// draw, so the tail of the log is guaranteed to be the harmless one.
+// virglrenderer explains itself on stderr; collect it or a failure is a number.
+// Deduplicated: a per-draw error would otherwise bury the one-time cause at the
+// tail of the log.
 const log = [];
 const seen = new Set();
 const note = (t) => { const k = String(t).slice(0, 120); if (!seen.has(k)) { seen.add(k); log.push(k); } };
@@ -146,11 +116,9 @@ try {
         }
         at += got;
       }
-      // Keep the biggest reply. A TRANSFER_GET of the frame is far larger
-      // than anything else on the wire -- 300x300 RGBA is 360,000 bytes
-      // against a few dozen for a fence or a capability answer -- so the
-      // largest one is the picture, and the picture is the only thing that
-      // says whether any of this actually drew.
+      // Keep the biggest reply: a TRANSFER_GET of the frame (300x300 RGBA is
+      // 360,000 bytes) dwarfs a fence or capability answer, so the largest is
+      // the picture -- the only thing that says whether it drew.
       if (got > biggest.length) {
         biggest = m.HEAPU8.slice(m._gex_virgl_replies(), m._gex_virgl_replies() + got);
       }
@@ -163,11 +131,9 @@ try {
       say('PUMP REFUSED after ' + ran + ' commands, ' + fed + ' of '
           + stream.length + ' bytes :: ' + tail);
     } else {
-      // The frame, as a PNG, so it can be looked at rather than counted.
-      // Counted across the whole reply, not a slice of it. A pump can answer
-      // two TRANSFER_GETs at once -- 729,648 bytes is two 300x300 frames and
-      // some fences -- so any fixed offset into it is a guess, and a guess
-      // that lands wrong reads zeros for the wrong reason.
+      // The frame as a PNG, so it can be looked at. Counted across the whole
+      // reply: a pump can answer two TRANSFER_GETs at once, so a fixed offset
+      // is a guess that reads zeros for the wrong reason.
       let nz = 0;
       for (let i = 0; i < biggest.length; i++) if (biggest[i]) nz++;
       let drawn = 'biggest reply ' + biggest.length + 'B, ' + nz + ' non-zero bytes';

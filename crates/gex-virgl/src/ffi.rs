@@ -1,16 +1,13 @@
 //! The parts of `virglrenderer.h` gex uses.
 //!
-//! Hand-written rather than bindgen-generated: the surface is about twenty
-//! functions and three structs, and the layouts are stable ABI that
-//! virglrenderer versions carefully. A generator would be a build dependency
-//! and a moving target for no gain.
+//! Hand-written rather than bindgen-generated: about twenty functions and three
+//! structs of stable, carefully-versioned ABI.
 //!
-//! Everything here matches virglrenderer 0.10.x with `VIRGL_RENDERER_UNSTABLE_APIS`
-//! *undefined*, which is how distributions build it. That choice fixes
-//! `VIRGL_RENDERER_CALLBACKS_VERSION` at 2 and stops the callbacks struct
-//! after `get_drm_fd`; a struct declared longer than the library expects is
-//! harmless, but one declared shorter is not, so this stops where the library
-//! stops.
+//! The callbacks struct is declared through the version-4 fields (`get_egl_display`
+//! and friends), which the library exports only when built with
+//! `VIRGL_RENDERER_UNSTABLE_APIS` -- see [`VIRGL_RENDERER_CALLBACKS_VERSION`].
+//! Declaring the struct longer than the library expects is harmless; shorter is
+//! not.
 
 #[allow(unused_imports)]
 use std::os::raw::{c_char, c_int, c_uint, c_void};
@@ -41,24 +38,18 @@ pub struct VirglRendererCallbacks {
         unsafe extern "C" fn(cookie: *mut c_void, scanout_idx: c_int, ctx: VirglGlContext) -> c_int,
     >,
     pub get_drm_fd: Option<unsafe extern "C" fn(cookie: *mut c_void) -> c_int>,
-    // Version 3 and 4. Present only when virglrenderer was built with
-    // `VIRGL_RENDERER_UNSTABLE_APIS`, which is how Debian builds it -- the
-    // library exports `virgl_renderer_context_create_fence` and friends, and
-    // that is the tell.
+    // Version 3 and 4 fields, present only when built with
+    // `VIRGL_RENDERER_UNSTABLE_APIS` (as Debian does).
     pub write_context_fence:
         Option<unsafe extern "C" fn(cookie: *mut c_void, ctx_id: u32, ring_idx: u32, fence_id: u64)>,
     pub get_server_fd: Option<unsafe extern "C" fn(cookie: *mut c_void, version: u32) -> c_int>,
     pub get_egl_display: Option<unsafe extern "C" fn(cookie: *mut c_void) -> *mut c_void>,
 }
 
-/// Four, not two, and the difference is not cosmetic.
-///
-/// virglrenderer only takes the caller's EGL display -- the whole
-/// external-winsys path -- when the structure says version 4 *and*
-/// `get_egl_display` is set. Declare version 2 and that block is skipped, no
-/// winsys is initialised at all, and `virgl_renderer_init` still returns
-/// success. The failure surfaces later, as a segfault in the first
-/// `virgl_renderer_context_create`, with nothing in between to suggest why.
+/// Must be 4: virglrenderer takes the caller's EGL display (the external-winsys
+/// path) only when the struct says version 4 *and* `get_egl_display` is set.
+/// Any lower and the winsys block is silently skipped -- `virgl_renderer_init`
+/// still succeeds, then the first `virgl_renderer_context_create` segfaults.
 pub const VIRGL_RENDERER_CALLBACKS_VERSION: c_int = 4;
 
 #[repr(C)]

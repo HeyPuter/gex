@@ -1,20 +1,11 @@
-//! `eventfd`.
+//! `eventfd`: a counter with a descriptor, used to wake an event loop from
+//! another thread (libuv/libevent add one to their epoll set).
 //!
-//! A counter with a descriptor, and the one primitive an event loop reaches
-//! for that gex did not have: libuv (so Node) creates an
-//! `EFD_NONBLOCK|EFD_CLOEXEC` eventfd, adds it to its epoll set, and pokes it
-//! to wake the loop from another thread. A daemon that multiplexes with
-//! libevent does the same. Without it every one of them fails at
-//! initialisation with `ENOSYS`.
-//!
-//! The object is a single `u64`. A `write` adds its argument to the counter; a
-//! `read` returns the counter and clears it, or -- in semaphore mode --
-//! returns 1 and decrements. A read of a zero counter waits (or answers
-//! `EAGAIN` when non-blocking), and a write that would carry the counter past
-//! `u64::MAX - 1` waits likewise. Both waits are the ordinary stream-blocking
-//! path: [`poll_readable`]/[`poll_writable`] gate them, so the syscall layer
-//! parks on the same machinery a pipe uses and another thread's write releases
-//! it.
+//! The object is a single `u64`. A `write` adds to the counter; a `read`
+//! returns and clears it, or in semaphore mode returns 1 and decrements. A
+//! read of zero waits (or `EAGAIN` non-blocking); a write past `u64::MAX - 1`
+//! waits likewise. Both gate on [`poll_readable`]/[`poll_writable`], the same
+//! stream-blocking path a pipe uses.
 //!
 //! [`poll_readable`]: crate::vfs::FileHandle::poll_readable
 //! [`poll_writable`]: crate::vfs::FileHandle::poll_writable
@@ -61,9 +52,8 @@ impl FileHandle for EventFd {
         }
         let mut c = self.count.lock().unwrap();
         if *c == 0 {
-            // The layer above only calls this once `poll_readable` said yes, or
-            // on a non-blocking descriptor; either way an empty counter now is
-            // `EAGAIN`. Another thread drained it between the poll and here.
+            // Empty now means another thread drained it between the poll and
+            // here: `EAGAIN`.
             return Err(Errno::EAGAIN);
         }
         let val = if self.semaphore {
@@ -97,10 +87,8 @@ impl FileHandle for EventFd {
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
-        // An anonymous inode. Reported as a fifo because that is the closest
-        // real type -- a nameless, stream-like object another thread feeds --
-        // and because the browser scheduler keys "a wait another Worker will
-        // satisfy" off exactly that, rather than off "a person will type".
+        // Anonymous inode reported as a fifo: the closest real type, and the
+        // browser scheduler keys "a wait another Worker satisfies" off fifo.
         Ok(Metadata {
             file_type: FileType::Fifo,
             size: 0,

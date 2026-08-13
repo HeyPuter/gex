@@ -2,27 +2,19 @@
 //
 //   node web/test/two-workers.mjs <socket-server-elf> <socket-client-elf>
 //
-// This is the seam the whole Worker-per-process design rests on, and the
-// first thing to cross it.
+// The seam the Worker-per-process design rests on, and the first thing to cross
+// it. Each Worker is its own guest -- own memory, kernel, filesystem -- which
+// is what stopped two processes colliding on library addresses, and also means
+// a client in one Worker cannot see a socket bound in the other.
 //
-// Each Worker is its own guest: its own `WebAssembly.Memory`, its own kernel,
-// its own filesystem. That is the point -- it is what stops two processes
-// putting their libraries at the same addresses, which is what the snapshot
-// switcher exists to work around. It also means a client in one Worker
-// cannot see a socket a server bound in the other. Nothing is shared.
+// What crosses is the stream, in two halves built separately:
+//   * `gex_host_connect` reaches into the server's Worker, to a socket the
+//     guest bound (already existed),
+//   * `gex_host_bind` serves a path inside the client's Worker, so a guest
+//     connecting out is answered by the host (new).
 //
-// What crosses is the stream, in two halves that had to be built separately:
-//
-//   * `gex_host_connect` reaches *into* the server's Worker, to a socket the
-//     guest bound. That half already existed.
-//   * `gex_host_bind` serves a path *inside* the client's Worker, so a guest
-//     connecting out is answered by the host. That half is new; without it
-//     only one of the two directions had a route.
-//
-// The relay in the middle is ordinary JavaScript moving bytes between two
-// handles. It is deliberately dumb: if this works, the hard part is the
-// kernel state two processes share -- the process table, pipes, signals --
-// and not the transport.
+// The relay between them is dumb JavaScript moving bytes: if this works, the
+// hard part is the kernel state two processes share, not the transport.
 import { Worker } from 'node:worker_threads';
 import { readFile, access } from 'node:fs/promises';
 import { join, dirname } from 'node:path';

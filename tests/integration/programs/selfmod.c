@@ -1,26 +1,14 @@
-/* A program that writes its own machine code, three ways.
- *
- * This is what every code generator in the guest does -- a JVM, a JavaScript
- * engine, LuaJIT, a regex compiler -- and it is the case a translator gets
- * wrong most quietly. A dispatch slot answers for a guest *address*, not for
- * the bytes that were at it. Put different instructions at an address that
- * has already been executed and, without invalidation, the guest calls its
- * new function and runs the old one. Nothing faults. The answer is just
- * wrong, and it is wrong in a way that looks like a miscompile of code that
- * is in fact translated perfectly.
- *
- * The three ways are the three ways real code does it:
+/* A program that writes its own machine code three ways, so a translation
+ * cached against a guest *address* must be invalidated when the bytes there
+ * change:
  *
  *   1. mmap a page, write, execute.
- *   2. unmap it and map a fresh one at the same address -- a plugin host
- *      dlclosing and dlopening, which is what an X server does every time
- *      its last client disconnects.
- *   3. keep the page and rewrite it in place, flipping W^X with mprotect
- *      and announcing it with `ic ivau` -- what a JIT does for every method
- *      it recompiles.
+ *   2. unmap it and map a fresh one at the same address.
+ *   3. keep the page and rewrite it in place, flipping W^X and announcing it
+ *      with `ic ivau`.
  *
- * Each round returns a different constant, so a stale translation shows up
- * as the previous round's answer rather than as a crash.
+ * Each round returns a different constant, so a stale translation shows up as
+ * the previous round's answer rather than as a crash.
  */
 #include <stdio.h>
 #include <string.h>

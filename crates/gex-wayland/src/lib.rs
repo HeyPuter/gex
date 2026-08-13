@@ -1,31 +1,19 @@
 //! A Wayland compositor, as a state machine over the wire protocol.
 //!
-//! The guest is a Linux userspace with no display hardware, so the display
-//! server cannot live inside it: there is no DRM device to drive and no
-//! keyboard to read. It lives in the host instead. A guest client connects to
-//! `$XDG_RUNTIME_DIR/wayland-0`, the kernel routes that unix socket to here,
-//! and what comes out the other side is a list of surfaces with pixels in
-//! them that the host can draw however it likes -- a window natively, a canvas
-//! in a browser, a PNG in a test.
-//!
-//! Nothing in this crate knows how to draw or where the pixels are. It takes
+//! The guest has no display hardware, so the display server lives in the host.
+//! A guest client connects to `$XDG_RUNTIME_DIR/wayland-0`, the kernel routes
+//! that unix socket here, and out comes a list of surfaces with pixels the host
+//! can draw however it likes. This crate knows nothing about drawing: it takes
 //! bytes and descriptors in, produces bytes out, and reports commits as
-//! [`Frame`]s naming a buffer. The host resolves a buffer to memory through
-//! [`Buffers`], which is the only thing it has to implement.
+//! [`Frame`]s naming a buffer, which the host resolves through [`Buffers`].
 //!
 //! # What is here
 //!
-//! Enough of the protocol for a real client to map a window and show pixels:
-//! `wl_display`, `wl_registry`, `wl_callback`, `wl_compositor`, `wl_shm` and
-//! its pools and buffers, `wl_surface`, `wl_region`, `wl_seat` with a keyboard
-//! and a pointer, `wl_output`, and the `xdg_shell` trio that every toolkit
-//! now requires. Shared memory only: there is no `linux-dmabuf` and no
-//! `wl_drm`, so a client that insists on a GPU buffer will not find one.
-//!
-//! That is about how a *client* gets its pixels in, and is separate from how
-//! they get drawn: [`gex_gpu`](../gex_gpu/index.html) composites these frames
-//! through WebGPU. A client still paints with its own CPU; giving the guest
-//! itself a graphics device is a different piece of work again.
+//! Enough for a real client to map a window and show pixels: `wl_display`,
+//! `wl_registry`, `wl_callback`, `wl_compositor`, `wl_shm` with pools and
+//! buffers, `wl_surface`, `wl_region`, `wl_seat` (keyboard and pointer),
+//! `wl_output`, and the `xdg_shell` trio. Shared memory only: no `linux-dmabuf`
+//! or `wl_drm`, so a client insisting on a GPU buffer finds none.
 
 pub mod wire;
 
@@ -34,10 +22,8 @@ use wire::{header, Reader, Writer};
 
 /// Where a buffer's pixels are.
 ///
-/// A `wl_shm_pool` is made from a descriptor the client sent, and the pixels
-/// live wherever the host put that descriptor's memory. In gex that is inside
-/// the guest's own address space, so this hands back a slice of it and no
-/// copy happens anywhere.
+/// A `wl_shm_pool` is made from a descriptor the client sent; in gex its memory
+/// is inside the guest's address space, so this hands back a slice of it.
 pub trait Buffers {
     /// The bytes of the memory behind a descriptor, if it has any.
     fn map(&self, fd: u32, size: usize) -> Option<Vec<u8>>;
@@ -50,9 +36,8 @@ pub struct Frame {
     pub width: i32,
     pub height: i32,
     pub stride: i32,
-    /// A `wl_shm` format code. 0 is ARGB8888, 1 is XRGB8888; those two are
-    /// the only ones every client is required to support and the only ones
-    /// advertised here.
+    /// A `wl_shm` format code. 0 is ARGB8888, 1 is XRGB8888 -- the two
+    /// mandatory formats, and the only ones advertised here.
     pub format: u32,
     /// The pixels, already copied out of the client's pool.
     pub pixels: Vec<u8>,
@@ -60,12 +45,10 @@ pub struct Frame {
     pub title: String,
 }
 
-/// Interfaces the registry advertises, with the version offered.
-///
-/// Version numbers matter: a toolkit binds at the highest version it and the
-/// compositor share and then uses requests that only exist at that version.
-/// Offering a version whose requests are not implemented is worse than
-/// offering a lower one, so these are deliberately conservative.
+/// Interfaces the registry advertises, with the version offered. A toolkit
+/// binds at the highest shared version and uses requests only that version has,
+/// so offering one whose requests are unimplemented is worse than a lower one:
+/// these are deliberately conservative.
 const GLOBALS: &[(&str, u32)] = &[
     ("wl_compositor", 4),
     ("wl_shm", 1),
@@ -98,13 +81,9 @@ enum Object {
 
 #[derive(Clone, Debug)]
 struct BufferSpec {
-    /// The descriptor the pool was made from, and how big it was.
-    ///
-    /// Held here rather than looked up through the pool, because destroying a
-    /// `wl_shm_pool` does not destroy the buffers made from it -- the memory
-    /// lives until the last buffer goes. Xwayland creates a pool, creates one
-    /// buffer, and destroys the pool immediately, so a buffer that pointed at
-    /// its pool pointed at nothing by the time it was drawn.
+    /// The pool's descriptor and size, held here rather than looked up through
+    /// the pool: destroying a `wl_shm_pool` does not destroy its buffers, and
+    /// Xwayland destroys the pool immediately after making one buffer.
     fd: u32,
     pool_size: usize,
     offset: i32,
@@ -114,15 +93,14 @@ struct BufferSpec {
     format: u32,
 }
 
-/// The pending and current state of one surface, as Wayland's double-buffered
-/// model requires: everything a client says takes effect at `commit` and not
-/// before.
+/// One surface's pending and current state: everything a client says takes
+/// effect at `commit`, per Wayland's double-buffered model.
 #[derive(Clone, Debug, Default)]
 struct SurfaceState {
     pending_buffer: Option<u32>,
     committed_buffer: Option<u32>,
-    /// Frame callbacks the client asked for, delivered after the commit they
-    /// belong to. A client that does not get these back stops drawing.
+    /// Frame callbacks, delivered after the commit they belong to. A client
+    /// that does not get these back stops drawing.
     pending_callbacks: Vec<u32>,
     title: String,
     /// The `xdg_surface` that gave this surface a role, if any.
@@ -144,11 +122,10 @@ pub struct Client {
     outbox: Vec<u8>,
     /// Commits since the host last looked.
     frames: Vec<Frame>,
-    /// Ids the server allocates for itself, counting down from the top of the
-    /// server range so they cannot collide with a client's.
+    /// Event serials, handed out with sync/configure/frame callbacks, counting
+    /// up.
     next_serial: u32,
-    /// Whether the registry has been advertised, so `bind` can be checked
-    /// against something.
+    /// The size a toplevel is told it is.
     default_size: (i32, i32),
     /// Set when the protocol has been violated and the connection is over.
     pub failed: Option<String>,
@@ -184,9 +161,8 @@ impl Client {
         }
     }
 
-    /// The size a toplevel is told to be. A real compositor decides this from
-    /// its layout; here it is fixed and configurable so a test can ask for a
-    /// particular window.
+    /// The size a toplevel is told to be, fixed and configurable so a test can
+    /// ask for a particular window.
     pub fn set_default_size(&mut self, w: i32, h: i32) {
         self.default_size = (w, h);
     }
@@ -236,11 +212,9 @@ impl Client {
         self.send(w);
     }
 
-    /// Whether to report every request, and every one that is refused.
-    ///
-    /// A client that stops has usually asked for something it did not get,
-    /// and from the outside that looks like it stopped for no reason. This is
-    /// how Xwayland's requirements were found rather than guessed at.
+    /// Whether to report every request and every refusal. A stalled client has
+    /// usually asked for something it did not get; this is how Xwayland's
+    /// requirements were found.
     fn tracing() -> bool {
         std::env::var_os("GEX_WL_TRACE").is_some()
     }
@@ -316,8 +290,8 @@ impl Client {
 
     fn display(&mut self, _object: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
         match opcode {
-            // sync(callback): answer at once. A client uses this as a
-            // round-trip barrier and blocks until the `done` comes back.
+            // sync(callback): answer at once; a client uses it as a round-trip
+            // barrier.
             0 => {
                 let Some(id) = r.new_id() else { return false };
                 let serial = self.serial();
@@ -369,8 +343,7 @@ impl Client {
             }
             "wl_shm" => {
                 self.objects.insert(id, Object::Shm);
-                // A client picks its format from what the compositor says it
-                // can show. Both of these are mandatory for every compositor.
+                // The two mandatory formats: ARGB8888 and XRGB8888.
                 for fmt in [0u32, 1] {
                     let w = Writer::new(id, 0).uint(fmt);
                     self.send(w);
@@ -378,8 +351,8 @@ impl Client {
             }
             "wl_seat" => {
                 self.objects.insert(id, Object::Seat);
-                // A pointer and a keyboard, which is what a toolkit checks
-                // for before it will build input handling at all.
+                // Pointer and keyboard capabilities, which a toolkit checks
+                // before building input handling.
                 let w = Writer::new(id, 0).uint(0b11);
                 self.send(w);
                 let w = Writer::new(id, 1).string("gex-seat0");
@@ -541,8 +514,8 @@ impl Client {
                 }
                 true
             }
-            // damage(x, y, width, height): what changed, which matters to a
-            // compositor that avoids redrawing and not to one that does not.
+            // damage(x, y, width, height): irrelevant to a compositor that
+            // always redraws.
             2 => true,
             // frame(callback)
             3 => {
@@ -566,8 +539,7 @@ impl Client {
         }
     }
 
-    /// Apply a surface's pending state, which is the only moment anything a
-    /// client said becomes visible.
+    /// Apply a surface's pending state, the only moment anything becomes visible.
     fn commit(&mut self, surface: u32, buffers: &dyn Buffers) {
         let Some(state) = self.surfaces.get(&surface).cloned() else {
             return;
@@ -612,9 +584,9 @@ impl Client {
             }
             None => {}
         }
-        // The frame callbacks belong to the commit that carried them. The
-        // timestamp is meant to be milliseconds of some monotonic clock; a
-        // client uses it only for deltas, and a serial counts up the same way.
+        // Frame callbacks belong to the commit that carried them. The argument
+        // is meant to be a monotonic millisecond timestamp, used only for
+        // deltas; a serial counts up the same way.
         let serial = self.serial();
         for cb in &state.pending_callbacks {
             let w = Writer::new(*cb, 0).uint(serial);
@@ -630,11 +602,9 @@ impl Client {
         }
     }
 
-    /// Copy a buffer's rectangle out of its pool.
-    ///
-    /// Returns `None` rather than a short buffer when the pool does not hold
-    /// what the client said it does; a compositor that reads past the end of a
-    /// client's pool is a compositor a client can crash.
+    /// Copy a buffer's rectangle out of its pool. `None` when the pool does not
+    /// hold what the client claimed: reading past the end lets a client crash
+    /// the compositor.
     fn cut(pool: &[u8], spec: &BufferSpec) -> Option<Vec<u8>> {
         if spec.width <= 0 || spec.height <= 0 || spec.stride < spec.width.checked_mul(4)? {
             return None;
@@ -705,10 +675,9 @@ impl Client {
                         xdg_surface: object,
                     },
                 );
-                // A toplevel is not allowed to draw until it has been
-                // configured, so the size goes out immediately. Zero width and
-                // height would mean "you choose"; a real size is friendlier
-                // and is what a tiling compositor sends.
+                // A toplevel may not draw until configured, so the size goes out
+                // at once. A real size (not 0x0, "you choose") is what a tiling
+                // compositor sends.
                 let (w, h) = self.default_size;
                 let ev = Writer::new(id, 0).int(w).int(h).array(&[]);
                 self.send(ev);
@@ -788,9 +757,7 @@ impl Client {
             1 => {
                 let Some(id) = r.new_id() else { return false };
                 self.objects.insert(id, Object::Keyboard);
-                // A keyboard with no keymap is legal only at version 7 and
-                // above; below that a client waits for one. Format 0 means
-                // "no keymap", which every client handles.
+                // Format 0 ("no keymap"), which every client handles.
                 let w = Writer::new(id, 0).uint(0).uint(0).uint(0);
                 self.send(w);
                 true
@@ -808,11 +775,8 @@ impl Client {
     }
 }
 
-/// Convert a frame to 8-bit RGB rows, for a host that wants to write an image.
-///
-/// Wayland's two mandatory formats are both little-endian 32-bit words with
-/// the blue byte first in memory, which is why this looks byte-swapped and is
-/// not.
+/// Convert a frame to 8-bit RGB rows. Wayland's two mandatory formats put the
+/// blue byte first in memory, which is why this looks byte-swapped and is not.
 pub fn to_rgb(frame: &Frame) -> Vec<u8> {
     let mut out = Vec::with_capacity((frame.width * frame.height * 3) as usize);
     for y in 0..frame.height {

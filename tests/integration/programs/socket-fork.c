@@ -1,16 +1,8 @@
-/* A unix socket whose two ends are in different processes.
- *
- * Which is what a unix socket is *for*, and what stopped working the moment
- * each process got a Worker of its own: the name table a server binds in is
- * Rust data in its own address space, and the client is somewhere else
- * entirely. An X server bound /tmp/.X11-unix/X0 and sat at "0 waiting" while
- * its client, two forks away, looked in a table that had never heard of it.
- *
- * So: bind and listen, fork, have the child connect and speak, and have the
- * parent accept and answer. Every line is ordered by an event -- an accept, a
- * read, a write, an exit status -- and never by which process happens to be
- * running, because with real Workers that order is not fixed.
- */
+/* A unix socket whose two ends are in different processes: bind and listen,
+ * fork, the child connects and speaks, the parent accepts and answers. Each
+ * process has its own Worker and address space, so the server's name table is
+ * out of the client's reach except through the host. Every line is ordered by
+ * an event -- accept, read, write, exit status -- never by scheduling. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -44,8 +36,8 @@ int main(void) {
     pid_t kid = fork();
     if (kid < 0) die("fork");
     if (kid == 0) {
-        /* The child is a different process and, in a browser, a different
-         * address space -- so this connect is the whole point of the test. */
+        /* The child is a different process with its own address space, so this
+         * connect is the whole point of the test. */
         int c = socket(AF_UNIX, SOCK_STREAM, 0);
         if (c < 0) die("child socket");
         struct sockaddr_un to = {.sun_family = AF_UNIX};

@@ -1,54 +1,23 @@
 //! The command stream between a guest's GL driver and the host's.
 //!
-//! # Why the guest does not run a GL driver
+//! The split is at the API, not at a virtual GPU. virtio-gpu/VirGL would run
+//! Mesa's state tracker as translated aarch64 (tens of thousands of
+//! instructions per draw) and compile each shader twice. Instead the guest's
+//! `libGLESv2.so.2` is a pure marshaller: a call becomes a few dozen bytes
+//! appended to a buffer, and the host's native driver runs them. This is what
+//! Android's emulator does.
 //!
-//! The usual way to give a virtual machine a GPU is virtio-gpu: the guest runs
-//! ordinary Mesa, which encodes a VirGL command stream, and the host decodes
-//! it back into GL. That is complete and it is the wrong trade here. Every
-//! instruction the guest executes is translated aarch64, so guest cycles cost
-//! more than host cycles -- and Mesa's state tracker is tens of thousands of
-//! instructions per draw. VirGL also compiles each shader twice, GLSL to TGSI
-//! in the guest and TGSI back to GLSL on the host.
-//!
-//! So the split is at the API instead. The guest's `libGLESv2.so.2` is a
-//! marshaller and nothing else: it turns a call into a few dozen bytes and
-//! appends them to a buffer. The real driver is the host's, which is native
-//! code that was going to run anyway. Shaders cross as the GLSL the
-//! application wrote and are compiled once.
-//!
-//! This is what Android's emulator does, and for the same reason.
-//!
-//! # Why there is no syscall per call
-//!
-//! The commands go in a buffer the guest allocated and the host can read
-//! directly -- the host already has every byte of guest memory mapped, which
-//! is the same property the compositor uses for client buffers. So
-//! `glDrawArrays` is a memcpy into that buffer and nothing else: no syscall,
-//! no ioctl, no host call out of wasm, which is the expensive thing here.
-//!
-//! One kick per flush hands the whole batch over. A batch is only forced early
-//! when the application asks something that needs an answer.
-//!
-//! # Names
-//!
-//! The guest allocates them. `glGenBuffers` does not ask the host what the
-//! names are; it makes some up and tells it. GL is happy to be told which name
-//! to use, and for the few objects where it is not -- shaders, programs -- the
-//! host keeps a map from the guest's number to its own. That turns what would
-//! be a round trip per object into nothing at all.
+//! The buffer is guest memory the host already has mapped, so a call is a memcpy
+//! with no syscall or host call out of wasm (the expensive thing). One kick per
+//! flush hands over the whole batch, forced early only when a call needs an
+//! answer. Names are guest-allocated: GL accepts an unseen name, and for shaders
+//! and programs, where it will not, the host keeps a guest-to-host map.
 
-/// Marks the head of a ring so a host can tell it is looking at one.
-///
-/// The bytes "GEXG" in memory, which little-endian makes this number. It is
-/// generated into the guest's header rather than written there by hand: the
-/// first version of this had one value on each side, and what that looks like
-/// is every call failing with EINVAL for no visible reason.
+/// Marks the head of a ring. The bytes "GEXG", little-endian.
 pub const MAGIC: u32 = 0x4758_4547;
 
-/// The fixed header at the start of the shared buffer.
-///
-/// Laid out for C as well as Rust, because the guest half of this is a C
-/// library. Every field is 32 bits and the whole thing is 32 bytes.
+/// The fixed header at the start of the shared buffer. `repr(C)` for the C
+/// guest half; every field 32 bits, 32 bytes total.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Header {
@@ -85,14 +54,12 @@ pub mod error {
     pub const NO_CONTEXT: u32 = 4;
 }
 
-/// Opcodes.
-///
-/// Numbered in blocks so that adding to one group does not renumber another,
-/// which would silently break a guest library built against an older header.
+/// Opcodes, numbered in blocks so adding to one group does not renumber
+/// another and break a guest built against an older header.
 pub mod op {
     // -- the device itself ------------------------------------------------
-    /// `{}` -- make a context and make it current. Replies with three
-    /// strings: vendor, renderer, version.
+    /// `{}` -- make a context and make it current. Replies: vendor, renderer,
+    /// version.
     pub const CONTEXT_CREATE: u32 = 1;
     /// `{ width, height }` -- the offscreen surface everything draws to.
     pub const SURFACE_RESIZE: u32 = 2;
@@ -131,17 +98,14 @@ pub mod op {
     pub const USE_PROGRAM: u32 = 55; // { program }
     pub const DELETE_SHADER: u32 = 56; // { name }
     pub const DELETE_PROGRAM: u32 = 57; // { name }
-    /// `{ program, len, name }` -- replies with the location, because an
-    /// application looks one up and then keeps it.
+    /// `{ program, len, name }` -- replies with the location.
     pub const GET_UNIFORM_LOCATION: u32 = 58;
     /// `{ program, len, name }` -- replies with the location.
     pub const GET_ATTRIB_LOCATION: u32 = 59;
-    /// `{ name, pname }` -- replies with the value. Used for compile and link
-    /// status, which an application checks and must be told the truth about.
+    /// `{ name, pname }` -- replies with the value (compile/link status).
     pub const GET_SHADER_IV: u32 = 60;
     pub const GET_PROGRAM_IV: u32 = 61;
-    /// `{ name }` -- replies with the info log, so a failed compile can say
-    /// why in the guest's own error message.
+    /// `{ name }` -- replies with the info log.
     pub const GET_SHADER_INFO_LOG: u32 = 62;
     pub const GET_PROGRAM_INFO_LOG: u32 = 63;
 
@@ -156,10 +120,9 @@ pub mod op {
     // -- vertex attributes -------------------------------------------------
     pub const ENABLE_VERTEX_ATTRIB_ARRAY: u32 = 80; // { index }
     pub const DISABLE_VERTEX_ATTRIB_ARRAY: u32 = 81; // { index }
-    /// `{ index, size, type, normalized, stride, offset }` -- the offset is
-    /// into the bound buffer. Client-side arrays are handled in the guest by
-    /// uploading them first, because a pointer into guest memory means
-    /// nothing to the host's GL.
+    /// `{ index, size, type, normalized, stride, offset }` -- offset into the
+    /// bound buffer. Client-side arrays are uploaded in the guest first, since a
+    /// guest pointer means nothing to the host's GL.
     pub const VERTEX_ATTRIB_POINTER: u32 = 82;
 
     // -- textures ----------------------------------------------------------
@@ -178,23 +141,18 @@ pub mod op {
 
     // -- reading back --------------------------------------------------------
     /// `{ x, y, w, h, format, type }` -- replies with the pixels. The only
-    /// command that moves a lot of data the wrong way, and an application
-    /// that calls it every frame will feel it, exactly as it would natively.
+    /// command that moves a lot of data back, and slow if called every frame.
     pub const READ_PIXELS: u32 = 128;
     /// `{ name }` -- one of GL's strings, replied as bytes.
     pub const GET_STRING: u32 = 129;
     /// `{ pname }` -- replies with up to four integers.
     pub const GET_INTEGERV: u32 = 130;
-    /// `{}` -- replies with the error code. An application in a loop calling
-    /// this is asking for a round trip a frame and will get one.
+    /// `{}` -- replies with the error code, one round trip per call.
     pub const GET_ERROR: u32 = 131;
 }
 
-/// Writes commands into a batch.
-///
-/// The guest half of this is C, so this exists for the host's tests: a Rust
-/// test can build the same bytes the C library would and check the executor
-/// against them.
+/// Writes commands into a batch. For the host's tests: the guest half is C,
+/// and this builds the same bytes to check the executor against.
 #[derive(Default)]
 pub struct Batch {
     bytes: Vec<u8>,
@@ -209,11 +167,9 @@ impl Batch {
         self.raw(opcode, args, &[])
     }
 
-    /// A command with trailing bytes: shader source, buffer contents.
-    ///
-    /// The length is padded to four so the next command starts aligned; the
-    /// declared length is the padded one, and the payload's own length word
-    /// says how much of it is real.
+    /// A command with trailing bytes (shader source, buffer contents). Padded
+    /// to four so the next command stays aligned; the payload's own length word
+    /// says how much is real.
     pub fn raw(&mut self, opcode: u32, args: &[u32], tail: &[u8]) -> &mut Batch {
         let padded = tail.len().div_ceil(4) * 4;
         let len = 8 + args.len() * 4 + padded;

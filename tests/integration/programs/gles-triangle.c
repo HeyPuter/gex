@@ -1,14 +1,6 @@
-/* An ordinary OpenGL ES 2.0 program.
- *
- * Nothing here knows about gex. It includes the standard headers, calls the
- * standard functions in the standard order, and links against libEGL and
- * libGLESv2 by their usual names. It is the test that the guest's GL driver
- * can be swapped for one that runs on the host without the application
- * being able to tell.
- *
- * It draws a green triangle over the lower-left half of a blue field and
- * reads the pixels back, which is checkable without a screen.
- */
+/* An ordinary OpenGL ES 2.0 program (standard EGL/GLES2, no gex-specific code):
+ * draws a green triangle over the lower-left half of a blue field and reads the
+ * pixels back, checkable without a screen. */
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <stdio.h>

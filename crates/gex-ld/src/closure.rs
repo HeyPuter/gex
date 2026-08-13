@@ -1,24 +1,12 @@
 //! Which objects a program actually consists of.
 //!
-//! `gexc build` translated the image it was given and nothing else, and on a
-//! normally linked program that is the wrapper rather than the work:
-//! `apt-get` is 67 KB of argument parsing in front of 1.9 MB of
-//! `libapt-pkg.so`. Statically recompiling it produced 212 blocks. perl only
-//! ever looked like a whole-program build because Debian links libperl into
-//! the executable, which is a fact about Debian's packaging and not about
-//! this compiler.
+//! Reads `DT_NEEDED` transitively — the walk `ld.so` does, but here without
+//! running anything, so the whole closure (not just the wrapper executable)
+//! can be recompiled ahead of time.
 //!
-//! So: read `DT_NEEDED` transitively and say what the program is. This is
-//! the same walk `ld.so` does, and it is done here without running anything,
-//! which is what "ahead of time" has to mean.
-//!
-//! The search order is `ld.so`'s, minus the parts that cannot matter here:
-//! there is no `/etc/ld.so.cache` in a sysroot that was unpacked rather than
-//! installed -- the trace of a real run shows the guest's loader looking for
-//! one and being told `-2` -- and the hardware-capability subdirectories
-//! (`tls/`, `atomics/`, `aarch64/`) never contain anything in a Debian
-//! rootfs, so a miss there costs a `stat` and finds nothing. What is left is
-//! `DT_RUNPATH`, then the multiarch directories, then `/lib` and `/usr/lib`.
+//! Search order is `ld.so`'s: `DT_RUNPATH`, then the multiarch directories,
+//! then `/lib` and `/usr/lib`. The `ld.so.cache` and hardware-capability
+//! subdirectories are skipped, as an unpacked sysroot has nothing in them.
 
 use crate::elf::{load, Image, LoadError};
 use std::collections::{BTreeMap, HashSet};
@@ -76,15 +64,9 @@ const DEFAULT_DIRS: &[&str] = &[
 
 /// Resolve a program's closure.
 ///
-/// `read` maps a guest path to file contents, so this walks the guest's
-/// namespace -- the sysroot -- and never the host's.
-///
-/// `place` is asked where to put each dependency, given its guest path and
-/// how much space it
-/// needs. The executable keeps whatever base it was loaded with. Handing the
-/// decision out rather than making it here is what lets a build and a run
-/// agree on the layout: both call this, and the caller supplies the same
-/// policy.
+/// `read` maps a guest path to file contents (the sysroot, never the host).
+/// `place` is asked where each dependency goes; handing that decision to the
+/// caller is what lets a build and a run agree on the layout.
 pub fn resolve(
     exe: Image,
     exe_path: &str,
@@ -96,18 +78,11 @@ pub fn resolve(
 
 /// Resolve the closure of several programs at once, sharing one layout.
 ///
-/// A program is not only its executable. apt is `apt-get` and the `file`,
-/// `copy`, `store` and `gpgv` methods it forks, and each of those needs
-/// objects `apt-get` does not: libseccomp for the sandbox, libselinux,
-/// libpcre2. A closure built from `apt-get` alone therefore covers the
-/// libraries `apt-get` reaches and none of the ones its helpers reach, and
-/// the helpers pay full price for them at run time -- 12,576 blocks of an
-/// otherwise fully recompiled `apt-get update`.
-///
-/// Every root contributes its `DT_NEEDED` graph to one set, deduplicated by
-/// resolved path, and every object is placed once by the shared `place`. The
-/// roots themselves come first, in order, so `objects[0]` is still the
-/// program and the callers that assume that keep working.
+/// A program is not only its executable: apt also forks helpers that pull in
+/// libraries `apt-get` never touches. Every root contributes its `DT_NEEDED`
+/// graph to one set, deduplicated by resolved path and placed once by the
+/// shared `place`. The roots come first, in order, so `objects[0]` is still
+/// the program.
 pub fn resolve_all(
     roots: Vec<(Image, String)>,
     read: &dyn Fn(&str) -> Option<Vec<u8>>,
@@ -134,22 +109,8 @@ pub fn resolve_all(
         if let Some(s) = &exe.soname {
             seen.insert(s.clone());
         }
-        // Every root becomes an object, not just the first.
-        //
-        // It used to be only the first, because two images both want
-        // `PIE_BASE` and the second one's dispatch entries would land on the
-        // first's pages. That is true of the *directory*, which is per
-        // process, and the runtime now arbitrates it: an image's pages are
-        // published only to a process whose own image identity matches the
-        // program that module was built from. The dispatch *table* never
-        // collided -- slots are handed out by one allocator across the whole
-        // closure, so each image has a range of its own.
-        //
-        // What it cost to leave them out was the whole point of the project.
-        // `ls` is not in the closure, so a warm `ls` lifts 3,126 blocks of
-        // its own text, and the next one lifts 3,554: every command a shell
-        // runs is translated from scratch, every time, while the shell and
-        // the libraries around it are statically recompiled.
+        // Every root becomes an object, not just the first: a root left out of
+        // the closure is translated from scratch on every run.
         if !fresh {
             continue;
         }

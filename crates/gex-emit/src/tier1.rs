@@ -136,15 +136,10 @@ fn region_limit() -> usize {
 
 /// Whether every block should check the guest's stack pointer on entry.
 ///
-/// Off unless asked for: `GEX_CHECK_SP=1` natively, or `gex_set_check_sp(1)`
-/// in the browser, where there is no environment to read. Costs a load, a
-/// compare and a never-taken branch per block.
-///
-/// It exists because a corrupt `sp` is invisible until something dereferences
-/// it, and by then the guest is deep inside an innocent function. #73 ends in
-/// `stp x29, x30, [sp, #-32]!` -- a perfectly ordinary prologue, faulting on
-/// its own first store because control reached it with `sp` already wild. The
-/// address in the crash names the victim; this names the writer.
+/// Off unless asked for: `GEX_CHECK_SP=1` natively, or `gex_set_check_sp(1)` in
+/// the browser. Costs a load, a compare and a never-taken branch per block. It
+/// exists because a corrupt `sp` is invisible until something dereferences it,
+/// by which point the crash names the victim rather than the writer.
 static CHECK_SP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Turn the stack-pointer check on or off for blocks compiled after this.
@@ -158,16 +153,13 @@ fn check_sp() -> bool {
         || CHECK_SP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Compile one GIR block into a wasm function body.
+/// Compile one GIR block into a wasm function body, plus the offsets of every
+/// immediate naming a local function.
 ///
 /// When the block heads a loop, the loop's other blocks come with it: see
-/// [`Emitter::run_region`].
-/// As [`compile`], and where the body names a function of its own module.
-///
-/// Those immediates move if the module is concatenated with another, and
-/// `gex_emit::merge` patches them rather than decoding the instruction stream
-/// to find them. Written at a fixed width, so a patch cannot change a body's
-/// length.
+/// [`Emitter::run_region`]. The reloc offsets let `gex_emit::merge` patch those
+/// immediates without decoding the stream; they are written at a fixed width so
+/// a patch cannot change a body's length.
 pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32>) {
     let mut e = Emitter::new(cx);
     if check_sp() {
@@ -250,7 +242,7 @@ struct Emitter<'a> {
     /// depth to branch to. `None` when the block is not fused.
     loop_depth: Option<u32>,
     /// Counts down to the next re-entry through the dispatcher, inside a
-    /// fused loop. See `emit_reentry`.
+    /// fused loop. See [`Self::emit_loop_safepoint`].
     reenter_local: Option<u32>,
     /// Set while emitting a member of a region.
     region: Option<RegionState>,
@@ -302,57 +294,19 @@ impl<'a> Emitter<'a> {
 
     /// Emit a whole loop as one function.
     ///
-    /// The members become the arms of a `br_table` inside a `loop`, so an
-    /// edge between them is a branch and an assignment rather than a tail
-    /// call, and every guest register the loop touches is loaded once at the
-    /// top and stays in a local until control leaves. That is the difference
-    /// between a loop costing a context round-trip per edge and costing
-    /// nothing per edge, and it is also what gives V8 one function worth
-    /// optimising instead of half a dozen it will not bother with.
+    /// The members become the arms of a `br_table` inside a `loop`, so an edge
+    /// between them is a branch and an assignment rather than a tail call, and
+    /// every guest register the loop touches stays in a local from the top
+    /// until control leaves. Laid out as the usual nest: the table is in the
+    /// innermost block, and breaking out of the *k*th lands on the *k*th body.
     ///
-    /// Laid out as the usual nest: the table is in the innermost block, and
-    /// breaking out of the *k*th lands on the *k*th body.
-    ///
-    /// # What makes this awkward
-    ///
-    /// Three things, all of which follow from the same fact: within a region
-    /// the emitter walks the members in one order and the guest reaches them
-    /// in another.
-    ///
-    /// Which registers are *dirty* is a fact about emission order, so every
-    /// exit writes all of them rather than the dirty ones. The safepoint
-    /// writes them all too, for the same reason -- but deliberately does not
-    /// read them back afterwards, because the host only changes a register on
-    /// a path that does not return here, and reading them back is what made a
-    /// loop with a `continue` and a `break` in it never finish. Every back
-    /// edge inside the region polls -- with the default growth rule that is
-    /// the entry's and no other, since a region holds one loop and it passes
-    /// through the entry, but it is what lets `GEX_REGION_NESTED` be measured
-    /// without an inner loop the browser cannot preempt.
-    ///
-    /// # What it is worth
-    ///
-    /// Only leaf loops qualify -- a call in the body ends the region, because
-    /// the callee returns through the table -- so this fires on a few hundred
-    /// loops in a large program: 195 in Lua, 638 in zstd, 1287 in SQLite. On
-    /// nbench in the browser, against the same module built without it:
-    ///
-    /// ```text
-    ///     ASSIGNMENT   +15%      FOURIER        +3%
-    ///     NUMERIC SORT +13%      IDEA           -3%
-    ///     STRING SORT  +10%      FP EMULATION   -7%
-    ///     BITFIELD      +3%      geometric mean +5%
-    /// ```
-    ///
-    /// Assignment and numeric sort are two of the kernels where gex was
-    /// behind QEMU. zstd compressing at level 9 is 13% faster; at level 19,
-    /// unchanged. Lua, matmul and a call microbenchmark are unchanged, which
-    /// is what a transform reaching only leaf loops should look like.
-    ///
-    /// FP emulation reads as a loss above and is not one: nbench's kernel
-    /// pulled out into a program of its own and measured the same way comes
-    /// out at 1.06, 1.04 and 0.91 across three runs. It straddles even, and
-    /// what the table shows is this machine's spread, which is about 8%.
+    /// The emitter walks the members in one order and the guest reaches them in
+    /// another, so which registers are *dirty* is not knowable here: every exit
+    /// writes all of them, and so does the safepoint -- which deliberately does
+    /// not read them back, since the host only changes a register on a path
+    /// that does not return here (reading them back made a loop with a
+    /// `continue` and a `break` never finish). Only leaf loops qualify: a call
+    /// in the body ends the region.
     fn run_region(&mut self, region: &[u64]) {
         let n = region.len();
         let index: HashMap<u64, u32> = region
@@ -362,12 +316,9 @@ impl<'a> Emitter<'a> {
             .collect();
 
         // Every register the loop touches starts in a local holding the
-        // context's value -- including one the loop only ever writes, because
-        // an exit taken on a path that has not reached the write yet still
-        // stores the local, and an uninitialised one would put a zero in the
-        // context. What the two sets are actually for is the way *out*: a
-        // register the loop only reads is already correct in the context and
-        // needs no store, and a region pays that store on every exit.
+        // context's value -- even one the loop only writes, since an exit
+        // reached before the write still stores the local. The two sets are
+        // for the way out: a register only read needs no store on exit.
         let (mut reads, mut writes): (Vec<GuestReg>, Vec<GuestReg>) = (Vec::new(), Vec::new());
         for a in region {
             let (r, w) = registers_read_and_written(self.cx.gir[a]);
@@ -446,15 +397,9 @@ impl<'a> Emitter<'a> {
         self.f.unreachable();
     }
 
-    /// Write every register the region holds back to the context.
-    ///
-    /// Not just the dirty ones. Which registers are dirty is a fact about the
-    /// order the emitter walked the members in, and at run time control
-    /// reaches them in whatever order the guest's branches take -- a register
-    /// written by a member emitted later can already have been written by the
-    /// time this exit is taken. Storing all of them is the only version of
-    /// this that does not depend on emission order, and it costs stores only
-    /// where control leaves the loop.
+    /// Write every register the region writes back to the context -- all of
+    /// them, not the dirty ones, since dirtiness depends on emission order and
+    /// the guest reaches the members in another. Costs stores only on exit.
     fn flush_region_exit(&mut self) {
         let mut all: Vec<(GuestReg, u32)> = self
             .regs
@@ -463,10 +408,9 @@ impl<'a> Emitter<'a> {
             .map(|(r, c)| (*r, c.local))
             .collect();
         all.sort_by_key(|(r, _)| Self::reg_offset(*r));
-        // Same packing as `flush_inner`, and the same reason it is safe: a
-        // flag with a local holds the current value whether or not this region
-        // wrote it. Note the byte store in the unpacked case -- a 32-bit store
-        // of one flag would write over the three that share its slot.
+        // Same packing as `flush_inner`: a cached flag holds the current value
+        // whether or not this region wrote it. The unpacked case stores a byte,
+        // since a 32-bit store would clobber the three flags sharing its slot.
         let flags = [GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V];
         let packed = flags.iter().all(|r| self.regs.contains_key(r))
             && flags.iter().any(|r| self.region_writes.contains(r));
@@ -531,15 +475,10 @@ impl<'a> Emitter<'a> {
             Some(k) => {
                 let (idx_local, depth) = (st.idx_local, st.depth);
                 // Every back edge inside the region polls, not only the one to
-                // the entry.
-                //
-                // With the default growth rule this changes nothing: a region
-                // holds exactly one loop and it passes through the entry, so
-                // `k != 0` with a backwards target cannot occur. It is what
-                // makes `GEX_REGION_NESTED` safe rather than merely bigger --
-                // a nested inner loop reaches no poll otherwise, and the
-                // browser host preempts guests cooperatively, so a guest that
-                // never polls is a guest nothing can switch away from.
+                // the entry. Changes nothing under the default growth rule (a
+                // region holds one loop, through the entry); it is what makes
+                // `GEX_REGION_NESTED` safe, since a nested inner loop would
+                // otherwise reach no poll and be unpreemptable.
                 if target <= from {
                     self.emit_safepoint(target);
                 }
@@ -592,11 +531,9 @@ impl<'a> Emitter<'a> {
         let last_use = compute_last_use(block);
 
         // A block whose only successor is itself becomes a real wasm loop, so
-        // the guest registers it carries stay in locals across the back-edge
-        // instead of round-tripping through the context every iteration. That
-        // is only sound if every register the body reads is loaded *before*
-        // the loop -- otherwise a second iteration would read a context that
-        // the first iteration deliberately did not write back.
+        // its guest registers stay in locals across the back-edge. Sound only
+        // if every register the body reads is loaded *before* the loop, or a
+        // second iteration reads a context the first did not write back.
         if self.can_fuse_self_loop(block) {
             let mut reads = live_in_registers(block);
             reads.sort_by_key(|r| Self::reg_offset(*r));
@@ -641,11 +578,8 @@ impl<'a> Emitter<'a> {
             } => taken == block.start || not_taken == block.start,
             _ => false,
         };
-        // A single-block loop that is also its own only successor would spin
-        // forever with no exit; `Goto` to itself is exactly that, but it still
-        // needs the safepoint, which the fused form emits.
-        // A kill switch, so the fused and unfused forms can be compared
-        // directly and a suspected miscompilation can be bisected.
+        // A kill switch, so the fused and unfused forms can be compared and a
+        // suspected miscompilation bisected.
         if std::env::var_os("GEX_NO_LOOP_FUSION").is_some() {
             return false;
         }
@@ -726,30 +660,13 @@ impl<'a> Emitter<'a> {
         }) as u32
     }
 
-    /// The local holding `r`, loading it from the context on first use.
     /// Trap into the host if the guest's stack pointer is not a stack address.
     ///
     /// Emitted before anything else in the body, so the value tested is what
-    /// the *previous* block left behind rather than anything this one did.
-    ///
-    ///     local.get ctx
-    ///     i64.load  offset=SP
-    ///     i64.const STACK_TOP
-    ///     i64.ge_u                 ; unsigned: a negative sp is a huge one
-    ///     if
-    ///       local.get ctx
-    ///       i64.const <this block's guest address>
-    ///       i32.const BRK_BAD_SP
-    ///       call      breakpoint
-    ///     end
-    ///
-    /// One bound, not two. Above `STACK_TOP` is the shim's own world and no
-    /// guest `sp` is ever there, which catches a wild value however it went
-    /// wrong; a lower bound would have to know where this thread's stack was
-    /// mapped, and the emitter does not and should not.
-    ///
-    /// The register cache is untouched on purpose -- this reads the context
-    /// directly rather than through `reg_local`, so it cannot make the body
+    /// the *previous* block left behind. One bound, not two: above `STACK_TOP`
+    /// is the shim's own world where no guest `sp` ever is, and a lower bound
+    /// would need to know where this thread's stack is mapped. Reads the
+    /// context directly, not through `reg_local`, so it does not make the body
     /// that follows believe `sp` is already in a local.
     fn emit_sp_check(&mut self, pc: u64) {
         self.f.local_get(self.ctx_local);
@@ -764,6 +681,7 @@ impl<'a> Emitter<'a> {
         self.f.end();
     }
 
+    /// The local holding `r`, loading it from the context on first use.
     fn reg_local(&mut self, r: GuestReg) -> u32 {
         if let Some(c) = self.regs.get(&r) {
             return c.local;
@@ -809,24 +727,9 @@ impl<'a> Emitter<'a> {
 
     /// Write every dirty cached register back to the context.
     ///
-    /// This is the traffic `gexc build` reports as a share of the module --
-    /// 19% for SQLite, 20% for Lua -- and carrying the hottest of those
-    /// registers in the block's *parameters* instead was tried and reverted.
-    /// A tail call can pass arguments, so four of them can ride across a
-    /// boundary in machine registers rather than through memory, and on a
-    /// microbenchmark whose loop body is one call that is 20% faster.
-    ///
-    /// It does not carry over. tcc compiling its largest source was 27%
-    /// *slower*, and Lua and SQLite were indistinguishable from unchanged
-    /// across six interleaved A/B rounds. The context is one 896-byte
-    /// structure that never leaves L1, so these stores and loads are nearly
-    /// free in cycles however much of the module they are; what the change
-    /// really did was hold four more values live across every function, and
-    /// on real blocks -- which are bigger than a microbenchmark's -- that
-    /// costs more in spills than the memory traffic ever cost. It also made
-    /// modules 6% larger, because a register carried in a parameter still
-    /// has to be spilled to the context before every host call and every
-    /// safepoint.
+    /// Carrying the hot registers in block *parameters* instead was tried and
+    /// reverted: the context never leaves L1, so it held more values live
+    /// across every function and cost more in spills than it saved in traffic.
     fn flush(&mut self) {
         self.flush_inner(false);
     }
@@ -852,17 +755,10 @@ impl<'a> Emitter<'a> {
         dirty.sort_by_key(|(r, _)| Self::reg_offset(*r));
         let before = self.f.code.len();
 
-        // The four flags in one store, when all four are in hand.
-        //
-        // Almost every flag-setting instruction writes all four, so this is
-        // the usual case, and it turns four stores into one plus six ALU ops
-        // that never touch memory. It is only correct when all four are
-        // *cached*: a cached flag that is not dirty still holds the current
-        // architectural value -- it was loaded from this very slot and not
-        // written since -- so storing it back changes nothing. A flag with no
-        // local at all is a different matter, and falls through to the
-        // per-flag path below, which is a byte store and costs what the
-        // separate slots used to.
+        // The four flags in one store, when all four are cached (the usual
+        // case, since almost every flag-setting instruction writes all four).
+        // Safe because a cached-but-not-dirty flag still holds the current
+        // value. A flag with no local falls through to the per-flag byte store.
         let flags = [GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V];
         let all_cached = flags.iter().all(|r| self.regs.contains_key(r));
         let any_dirty = flags
@@ -953,18 +849,10 @@ impl<'a> Emitter<'a> {
             self.f.i32_const(POISON_ADDR as i32);
             return 0;
         }
-        // Guarding the same base twice in a block emits the same arithmetic
-        // twice, and caching it in a local was tried: it removed 18% of the
-        // guard bytes on gzip and moved no kernel on nbench, in either
-        // direction, over two runs.
-        //
-        // The reason is worth keeping. The guard is pure arithmetic on a
-        // value that does not change, which is exactly what an optimiser
-        // eliminates by itself -- so the bytes it deletes are bytes V8 had
-        // already collapsed, and the local it adds is real. Fewer emitted
-        // instructions is not less work once the engine has its own CSE,
-        // and that is the difference between this and the `cmp`+`b.cond`
-        // fusion, which removes arithmetic nothing can recover.
+        // Caching a repeated base's guard in a local was tried and bought
+        // nothing: the guard is pure arithmetic on an unchanging value, which
+        // V8's own CSE already collapses, so the emitted bytes it removes cost
+        // nothing while the local it adds is real.
         let static_off = if (0..=u32::MAX as i64).contains(&offset) {
             self.push(addr);
             offset as u32
@@ -981,13 +869,8 @@ impl<'a> Emitter<'a> {
     /// Whether to emit the bounds guard at all.
     ///
     /// `GEX_UNSAFE_NO_GUARD=1` drops it, which is **not shippable**: a guest
-    /// that computes an address above `GUEST_LIMIT` then aliases low memory
-    /// silently instead of taking SIGSEGV. It exists to put a number on what
-    /// the guard costs, because the principled way to remove it -- a
-    /// 64-bit guest memory, so the engine's own bounds check subsumes it --
-    /// was built and measured and bought nothing: V8 emits a check of its own,
-    /// and a 32-bit memory already gets a free one from the 4 GiB reservation.
-    /// See OPTIMIZATIONS-MISSING.md. This stays as the way to price the guard.
+    /// address above `GUEST_LIMIT` then aliases low memory silently instead of
+    /// taking SIGSEGV. It exists only to price the guard.
     fn no_guard() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
@@ -1108,14 +991,10 @@ impl<'a> Emitter<'a> {
     /// Leave in the i64 scratch a length that cannot run off the end of guest
     /// memory from any of `bases`.
     ///
-    /// `memory.copy` and `memory.fill` *trap* when they would run past the
-    /// end of the wasm memory, and a trap is the whole process gone rather
-    /// than the guest fault a bad `memcpy` should be. Every base has already
-    /// been through the address guard, so each is below `GUEST_LIMIT` and the
-    /// room above it cannot be negative; clamping the length to the smallest
-    /// of them makes the bulk op unable to trap, and leaves any guest that
-    /// really did ask for something absurd writing into the poison page
-    /// exactly as the per-access path would have it.
+    /// `memory.copy`/`memory.fill` *trap* past the end of the wasm memory,
+    /// which would take the whole process rather than fault the guest. Each
+    /// base is already below `GUEST_LIMIT` (address-guarded), so clamping the
+    /// length to the smallest room above them makes the bulk op unable to trap.
     fn clamp_len(&mut self, len: Value, bases: &[u32]) {
         let n = self.scratch_i64;
         let room = self.scratch_page;
@@ -1139,21 +1018,11 @@ impl<'a> Emitter<'a> {
 
     /// `dst = memcmp(a, b, len)` as an inline loop.
     ///
-    /// There is no `memory.compare` in wasm, so unlike `MemCopy` this cannot
-    /// collapse to one instruction. What it replaces is glibc's aarch64
-    /// `memcmp`, a hand-written SIMD routine whose loop lifts to a block per
-    /// iteration -- and a profile of perl, which compares a hash key on every
-    /// lookup, puts it as the only library code among the hottest back edges.
-    ///
-    /// A byte at a time, deliberately. Eight-at-a-time needs a byte-swap to
-    /// find *which* byte differed (wasm is little-endian, the comparison is
-    /// big-endian by C's definition) and a second loop for the tail, and none
-    /// of that is worth writing before the simple version is measured against
-    /// the SIMD loop it replaces. If this wins, that is the next step; if it
-    /// does not, the eight-wide version would not have either.
-    ///
-    /// The addresses are guarded per access exactly as any other load is, so
-    /// a `memcmp` with a wild pointer faults where the guest's would.
+    /// wasm has no `memory.compare`, so unlike `MemCopy` this cannot collapse
+    /// to one instruction. A byte at a time, deliberately: eight-at-a-time
+    /// needs a byte-swap to find which byte differed and a tail loop, not worth
+    /// writing before the simple version is measured. Addresses are guarded per
+    /// access, so a wild pointer faults where the guest's would.
     fn emit_memcmp(&mut self, dst: Value, a: Value, b: Value, len: Value) {
         let la = self.alloc(Ty::I64);
         let lb = self.alloc(Ty::I64);
@@ -1494,12 +1363,10 @@ impl<'a> Emitter<'a> {
                     _ => simd::I64X2_EXTRACT_LANE,
                 };
                 self.f.simd_lane(sub, *lane as u8);
-                // Every lane extract narrower than 64 bits produces an i32,
-                // whatever the node says its type is. `smov x0, v0.h[2]` wants
-                // the halfword sign-extended into a 64-bit register, and asked
-                // for `I64`; without this the module fails validation, which
-                // is how it was found -- in an exhaustive translation of
-                // CPython, 182 MB into the wasm.
+                // Every lane extract narrower than 64 bits produces an i32
+                // whatever the node's type says, so an `I64` result (e.g.
+                // `smov x0, v0.h[2]`) must be widened or the module fails
+                // validation.
                 if *ty == Ty::I64 && *lane_bytes < 8 {
                     self.f.byte(if *signed {
                         code::I64_EXTEND_I32_S
@@ -1695,21 +1562,12 @@ impl<'a> Emitter<'a> {
         self.value_ty.get(v.0 as usize).copied().unwrap_or(Ty::I64)
     }
 
-    /// Emit a host call whose result stays on the stack.
     /// A fused multiply-add, without leaving the module.
     ///
-    /// wasm has no FMA, so this would otherwise be a call to the shim's --
-    /// and nbench's LU decomposition makes 706 million of them in one kernel.
-    /// Removing the call is worth 6x on that kernel in the browser, 3.2x on
-    /// NEURAL NET and 1.2x on FOURIER.
-    ///
-    /// The arithmetic and its guard are in [`crate::fma`], with the fuzzing
-    /// that establishes them; this emits the same steps in wasm. Inlining at
-    /// the site rather than calling a shared function is affordable because
-    /// the sites are few even when the executions are not -- nbench's whole
-    /// binary has about thirty-five.
-    ///
-    /// Returns false when the caller should emit the call after all.
+    /// wasm has no FMA, so this would otherwise call the shim's. The arithmetic
+    /// and its guard are in [`crate::fma`], with the fuzzing that establishes
+    /// them; this emits the same steps inline (the sites are few even when the
+    /// executions are not). Returns false when the caller should emit the call.
     fn emit_fma(&mut self, args: &[Value]) -> bool {
         if args.len() != 4 {
             return false;
@@ -2081,27 +1939,13 @@ impl<'a> Emitter<'a> {
                 self.f.local_get(self.scratch_i64);
                 self.f.store(0x37, 3, ctx::PC as u32);
                 self.flush();
-                // Poll here too, and not only on a backward direct branch.
-                //
-                // A backward direct branch is the cheap approximation of a
-                // loop, and it misses the loop that matters most: one whose
-                // back edge is computed. A bytecode interpreter's dispatch
-                // is `br <reg>` through a table, and so is anything
-                // jump-threaded -- CPython's, Mesa's. A thread inside one
-                // reached no poll at all, which means it could not be
-                // preempted, could not take a signal, could not be
-                // interrupted by a timer, and did not appear in any trace.
-                //
-                // Measured: two hundred million iterations of a loop closed
-                // only by `br x16` produced zero safepoints. The same loop
-                // with a target the compiler could fold to a direct branch
-                // produced 195. That difference is the bug, and it is why
-                // glxgears went quiet at a full core with nothing to say.
-                //
-                // The context PC is already the target, stored above, and
-                // the registers are already flushed -- so the slow path may
-                // deliver a signal and unwind from here safely. The pc
-                // passed is this branch's own, which is what a trace wants.
+                // Poll on indirect branches too, not only backward direct ones:
+                // a computed back edge (a bytecode interpreter's `br <reg>`
+                // dispatch, anything jump-threaded) is exactly the loop a
+                // guest can spin in forever, reaching no poll and so unable to
+                // be preempted or take a signal. Safe here because the PC is
+                // already the target (stored above) and the registers are
+                // flushed, so the slow path may deliver a signal and unwind.
                 self.emit_safepoint_no_flush(block.end - 4);
                 self.emit_dispatch_tail_call();
             }
@@ -2131,20 +1975,12 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Poll for a pending signal before a backward jump.
-    ///
-    /// PLAN §5.6 puts safepoints on loop back-edges and a periodic counter.
-    /// A backward direct branch is the cheap, sound approximation of a loop:
-    /// it means no program can spin without reaching a poll, while
-    /// straight-line code pays nothing. Forward branches and calls are left
-    /// alone, and syscalls are already delivery points.
     /// The safepoint countdown, for a caller that has already flushed and
-    /// that carries on rather than jumping.
+    /// carries on rather than jumping.
     ///
-    /// `emit_safepoint` is written for a direct branch: it may flush inside
-    /// a fused loop, and its caller follows it with a jump to a constant.
-    /// An indirect branch has flushed already and its target is in a local,
-    /// so it needs the counter and the call and nothing else.
+    /// Unlike [`Self::emit_safepoint`] this never flushes -- an indirect branch
+    /// has flushed already and its target is in a local -- so it emits only the
+    /// counter and the call.
     fn emit_safepoint_no_flush(&mut self, pc: u64) {
         let before = self.f.code.len();
         self.emit_safepoint_no_flush_inner(pc);
@@ -2169,11 +2005,15 @@ impl<'a> Emitter<'a> {
         self.f.end();
     }
 
+    /// Poll for a pending signal before a backward jump.
+    ///
+    /// A backward direct branch is the cheap, sound approximation of a loop:
+    /// no program can spin without reaching a poll, while straight-line code,
+    /// forward branches and calls pay nothing (syscalls are delivery points
+    /// already). PLAN §5.6.
     fn emit_safepoint(&mut self, pc: u64) {
         let before = self.f.code.len();
         self.emit_safepoint_inner(pc);
-        // Not double-counted: `emit_safepoint` does its own work and does not
-        // call the no-flush form.
         SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
     }
 
@@ -2193,47 +2033,28 @@ impl<'a> Emitter<'a> {
         self.f.byte(0x4c); // i32.le_s
         self.f.if_void();
         // Inside a fused loop the registers live only in locals, so the slow
-        // path -- which may deliver a signal and unwind -- has to write them
-        // back. It runs once every few thousand iterations, so the cost does
-        // not show up.
-        // Inside a fused loop the registers live only in locals, so the slow
-        // path -- which may deliver a signal and unwind -- has to write them
-        // back. It runs once every few thousand iterations, so the cost does
-        // not show up.
+        // path -- which may deliver a signal and unwind -- must write them back.
         if self.loop_depth.is_some() {
             self.flush_conditional();
         }
         self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);
         self.f.call(self.cx.safepoint);
-        // Written out above but deliberately not read back. The host only
-        // changes a register on a path that does not come back here -- a
-        // signal unwinds, a thread switch on the browser host traps out --
-        // and every one of those resumes through the context. Reading them
-        // back was tried and is what made a loop with a `continue` and a
-        // `break` in it never finish.
+        // Written out above but deliberately not read back: the host only
+        // changes a register on a path that does not return here, and every
+        // one resumes through the context. Reading them back made a loop with
+        // a `continue` and a `break` never finish.
         self.f.end();
     }
 
     /// The safepoint on a fused loop's own back-edge.
     ///
-    /// Two differences from [`Self::emit_safepoint`], both of which matter
-    /// only because a fused loop is the one place gex emits that a guest can
-    /// spend all its time inside.
-    ///
-    /// The countdown is a local rather than the counter in the context, so
-    /// the hot path is a subtract and a branch with no memory traffic at all.
-    /// The context's copy is only reloaded on entry and written back on the
-    /// way out, which keeps the cadence honest across entries.
-    ///
-    /// And when it expires the loop does not resume: it goes back through the
-    /// dispatcher, which re-enters this same block. That is for V8, which is
-    /// what a page runs. Its baseline compiler handles a module first and
-    /// promotes a function to the optimising one on a budget that counts
-    /// *calls* -- so a loop entered once and iterated a hundred million times
-    /// is never promoted, and the hottest code in the program stays baseline
-    /// forever. Measured on a 300M-iteration loop: 16.9s without this, 7.8s
-    /// with it.
+    /// Two differences from [`Self::emit_safepoint`]. The countdown is a local,
+    /// not the context counter, so the hot path is a subtract and a branch with
+    /// no memory traffic. And on expiry the loop does not resume: it goes back
+    /// through the dispatcher, which re-enters this block. That is for V8,
+    /// whose baseline compiler promotes on a budget counting *calls* -- so a
+    /// loop entered once and iterated forever would never be promoted.
     fn emit_loop_safepoint(&mut self, pc: u64) {
         let before = self.f.code.len();
         self.emit_loop_safepoint_inner(pc);
@@ -2345,31 +2166,14 @@ impl<'a> Emitter<'a> {
     /// Tail-call the block at the address in `scratch_i64`, through whichever
     /// dispatch table its page lives in.
     ///
-    /// With one table this is what it always was: compute the index, then a
-    /// single `return_call_indirect`. One table cannot hold a real
-    /// application, though -- see `DISPATCH_TABLES` -- so the entry also
-    /// carries which of several it means, in the eight bits above the slot,
-    /// and the choice is a `br_table` over one tail call per table:
-    ///
-    ///     block            ; falls through to table 0, and is the default
-    ///       block          ; ... to table 1
-    ///         ...
-    ///           local.get tbl
-    ///           br_table N-1 ... 1 0 N-1
-    ///         end
-    ///         ; table N-1: ctx, index, return_call_indirect ty N-1
-    ///       end
-    ///       ...
-    ///
-    /// Entry zero still means "no translation": table 0, and a slot inside
-    /// the reserved miss span at the bottom of it. So an untranslated page,
-    /// an address past the directory's reach and a genuine table-0 block all
-    /// take the same path with no test between them, which is the property
-    /// the single-table version had and the one worth keeping.
-    ///
-    /// The index and the table are computed into locals before the blocks
-    /// start, because a value pushed outside a `block` cannot be consumed
-    /// inside one.
+    /// With one table: compute the index, then a single
+    /// `return_call_indirect`. With several (see `DISPATCH_TABLES`), the entry
+    /// also carries the table index in the bits above the slot, and the choice
+    /// is a `br_table` over one tail call per table. Entry zero still means "no
+    /// translation" -- table 0, a slot in the reserved miss span -- so an
+    /// untranslated page, an out-of-range address and a real table-0 block all
+    /// take the same path with no test between them. Index and table go into
+    /// locals first: a value pushed outside a `block` cannot be consumed inside.
     fn emit_dispatch_tail_call(&mut self) {
         let before = self.f.code.len();
         self.emit_ballast();
@@ -2389,23 +2193,14 @@ impl<'a> Emitter<'a> {
         })
     }
 
-    /// Work on the indirect-dispatch path that does nothing, for measurement.
+    /// Work on the indirect-dispatch path that does nothing, for measurement:
+    /// does this program care about the dispatch path at all?
     ///
-    /// The question this answers is the one that should have been asked before
-    /// memory64 was built: *does this program care about the dispatch path at
-    /// all?* Ranking §21 by how many instructions it removes is ranking by
-    /// emitted bytes, and this file has already been wrong that way twice.
-    ///
-    /// Each pair is a load from the dispatch directory near the entry this
-    /// path is about to read -- so the same cache line, which makes it the
-    /// *cheapest* possible extra load and therefore a lower bound -- and a
-    /// store of the result into a context slot nothing reads. The store is
-    /// what makes it survive: an engine may delete a load whose value goes
-    /// nowhere, and may not delete a store, because it cannot prove nobody
-    /// reads the address.
-    ///
-    /// The slope of run time against `GEX_DISPATCH_BALLAST` is the answer. A
-    /// flat slope means no dispatch change can pay, whatever it removes.
+    /// Each pair is a load from the dispatch directory near the entry this path
+    /// reads (same cache line, so the cheapest possible extra load and thus a
+    /// lower bound) and a store into a context slot nothing reads. The store is
+    /// what makes it survive the engine's dead-code elimination. The slope of
+    /// run time against `GEX_DISPATCH_BALLAST` is the answer.
     fn emit_ballast(&mut self) {
         let n = Self::ballast();
         if n == 0 {
@@ -2557,12 +2352,6 @@ fn cmp_op(op: CmpOp, ty: Ty) -> u8 {
     }
 }
 
-/// Wasm SIMD sub-opcode for a lane-wise binary operation.
-///
-/// The tables are irregular enough — `i64x2` has no unsigned comparisons, no
-/// min/max and no saturating forms — that spelling each case out is clearer
-/// than deriving them from a base plus an offset.
-
 fn lane_shift_op(op: VShiftOp, lane: VLane) -> u32 {
     let base = match lane {
         VLane::I8 => 0x6b,
@@ -2577,15 +2366,10 @@ fn lane_shift_op(op: VShiftOp, lane: VLane) -> u32 {
     }
 }
 
-// What a block boundary costs, split three ways, and process-wide.
-//
-// These were thread-locals, and blocks are compiled on a pool -- so every
-// count landed on a worker thread and `gexc build` read its own, which is
-// near enough zero. It has been printing "0% of it register traffic across
-// block boundaries" for a metric that is nothing of the sort, about the one
-// number anybody would use to decide whether block boundaries are worth
-// attacking. Atomics are ample here: a few adds per block against the
-// milliseconds each block spends being lifted and encoded.
+// What a block boundary costs, split three ways, and process-wide. These were
+// thread-locals, so every count landed on a compile-pool worker and `gexc
+// build` read its own near-zero copy. Atomics are ample against the time each
+// block spends being lifted and encoded.
 /// Bytes emitted moving guest registers between the context and locals.
 pub static CTX_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Bytes emitted on the safepoint countdown and its call.
@@ -2611,14 +2395,11 @@ fn note_traffic(r: GuestReg) {
 
 /// Every guest register a block reads, and every one it writes.
 ///
-/// Unlike [`live_in_registers`] this does not care about order within the
-/// block: a region holds its registers in locals from entry to exit, so what
-/// matters is only whether a register is read at all -- in which case the
-/// local has to start out holding the context's value -- and whether it is
-/// written at all -- in which case the context has to be caught up when
-/// control leaves. Keeping the two apart is worth doing: a register the loop
-/// only reads needs no store on the way out, and one it only writes needs no
-/// load on the way in, and a region pays those on every entry and exit.
+/// Unlike [`live_in_registers`] this ignores order: a region holds its
+/// registers in locals from entry to exit, so only whether a register is read
+/// (needs a load in) and whether it is written (needs a store out) matters.
+/// Keeping the two apart saves the store on a read-only register and the load
+/// on a write-only one, paid on every entry and exit.
 pub(crate) fn registers_read_and_written(block: &Block) -> (Vec<GuestReg>, Vec<GuestReg>) {
     let (mut read, mut written) = (Vec::new(), Vec::new());
     for s in &block.stmts {
@@ -2642,15 +2423,11 @@ pub(crate) fn registers_read_and_written(block: &Block) -> (Vec<GuestReg>, Vec<G
     (read, written)
 }
 
-/// Whether a statement can leave the register cache stale.
-
 /// Iterations of a fused loop between trips through the dispatcher.
 ///
-/// The same cadence the context's safepoint counter uses off a fused loop, so
-/// the time a guest can spend between signal polls does not depend on which
-/// shape its loop happened to take. Overridable to bisect a suspected
-/// scheduling problem; the value made no measurable difference anywhere
-/// between 1024 and a million.
+/// The same cadence the context's safepoint counter uses, so the time between
+/// signal polls does not depend on the loop's shape. Overridable to bisect a
+/// scheduling problem; no measurable difference between 1024 and a million.
 fn loop_poll() -> i32 {
     static POLL: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *POLL.get_or_init(|| {
@@ -2661,6 +2438,7 @@ fn loop_poll() -> i32 {
     })
 }
 
+/// Whether a statement can leave the register cache stale.
 pub fn clobbers_guest_state(s: &Stmt) -> bool {
     match s {
         Stmt::HostCall { func, .. } => func.clobbers_guest_state(),
@@ -2674,13 +2452,10 @@ pub fn clobbers_guest_state(s: &Stmt) -> bool {
 
 /// The architectural registers a block reads before writing.
 ///
-/// These are exactly the ones the fused loop form must load before the loop:
-/// inside it the context is deliberately left stale, so a read that reaches
-/// past the loop's top would see a value one or more iterations old. A
-/// register the block writes before reading needs no preload, and leaving it
-/// out matters -- every preloaded register is live across the whole loop, and
-/// wasm locals that stay live become machine registers the host's allocator
-/// cannot use for anything else.
+/// Exactly the ones the fused loop form must load before the loop, since the
+/// context is left stale inside it. A register written before reading needs no
+/// preload, and leaving it out matters: every preloaded register stays live
+/// across the whole loop, costing the host's allocator a machine register.
 fn live_in_registers(block: &Block) -> Vec<GuestReg> {
     let mut live_in = Vec::new();
     let mut written = Vec::new();

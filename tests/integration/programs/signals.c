@@ -21,7 +21,7 @@ static void h_info(int s, siginfo_t *si, void *uc){
 }
 static sigjmp_buf jb;
 static void h_jmp(int s){ (void)s; siglongjmp(jb,7); }
-/* A caught SIGSEGV: the handler jumps out, proving the fault reaches guest
+/* A caught SIGILL: the handler jumps out, proving the fault reaches guest
  * code with a usable context rather than just killing the process. */
 static sigjmp_buf segv_jb;
 static void h_segv(int s){ (void)s; siglongjmp(segv_jb, 9); }

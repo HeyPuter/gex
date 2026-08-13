@@ -1,43 +1,31 @@
 //! The vtest protocol, as a stream state machine.
 //!
-//! vtest is the transport Mesa's virgl driver uses when there is no DRM
-//! device: the driver connects to a UNIX socket and speaks a small
-//! request/response protocol. gex serves that socket, so the guest runs stock
-//! Mesa -- no gex-specific driver, no patched loader -- and its Gallium
-//! command stream arrives here to be executed by virglrenderer on the host's
-//! real OpenGL.
-//!
-//! That is the whole reason for choosing this transport first: the guest side
-//! is code nobody has to write. The DRM render node is faster and is the next
-//! step, but it needs `DRM_IOCTL_VIRTGPU_*` and a shared-memory path before a
-//! single triangle appears; this needs nothing.
+//! vtest is the transport Mesa's virgl driver uses when there is no DRM device:
+//! it connects to a UNIX socket and speaks a small request/response protocol.
+//! gex serves that socket, so the guest runs stock Mesa and its Gallium command
+//! stream is executed here by virglrenderer. Chosen first because the guest side
+//! needs no code written.
 //!
 //! # Protocol version
 //!
 //! Version 0 is negotiated deliberately. From version 2 the driver expects
-//! `RESOURCE_CREATE2` to hand back a shared-memory descriptor over
-//! `SCM_RIGHTS`, and every transfer then becomes a memcpy into that mapping.
-//! Version 0 puts transfer payloads in the stream instead. It copies more, and
-//! it is the reason this path will never be the fast one -- but it needs no
-//! descriptor passing at all, and correctness comes first.
+//! `RESOURCE_CREATE2` to hand back a shared-memory descriptor over `SCM_RIGHTS`;
+//! version 0 puts transfer payloads in the stream instead -- more copying, but
+//! no descriptor passing.
 //!
 //! # Framing
 //!
-//! Every command is a two-word header -- a length and a command id -- then a
-//! payload. The length is in dwords for `SUBMIT_CMD` and in bytes for
-//! `CREATE_RENDERER`, and most other commands ignore it entirely and read a
-//! fixed-size struct. That is not a description of a good protocol, it is a
-//! description of this one, and the sizes below follow the reference server
-//! rather than the header file's constants.
+//! Every command is a two-word header -- length, command id -- then a payload.
+//! The length is in dwords for `SUBMIT_CMD`, bytes for `CREATE_RENDERER`, and
+//! ignored by most others, which read a fixed-size struct. The sizes below
+//! follow the reference server, not the header file's constants.
 
 use crate::Virgl;
 use std::sync::OnceLock;
 
-/// Whether to narrate the command stream.
-///
-/// A protocol this stateful fails by crashing somewhere inside the renderer
-/// several commands after the mistake, so knowing which command was last
-/// accepted is most of the diagnosis.
+/// Whether to narrate the command stream. A mistake here crashes inside the
+/// renderer commands later, so the last accepted command is most of the
+/// diagnosis.
 fn tracing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GEX_VIRGL_TRACE").is_some())
@@ -87,35 +75,22 @@ fn dw(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
 }
 
-/// One connected guest client.
 /// Append everything the guest sends to the file named by `GEX_VTEST_RECORD`.
-///
-/// A vtest stream is the whole of what a guest asks of a GPU, and it is
-/// exactly reproducible: the same program draws the same commands. Capturing
-/// one here means the browser port can be handed a real glxgears frame --
-/// unmodified Mesa's own output -- without a guest, a rootfs or a translator
-/// anywhere near it. That is the difference between "the renderer
-/// initialises" and "the renderer can draw what Mesa asks for".
+/// A recorded stream replays a real Mesa frame into the browser port with no
+/// guest, rootfs or translator involved.
 fn record(bytes: &[u8]) {
     record_to("GEX_VTEST_RECORD", bytes);
 }
 
-/// And what was sent back, under `GEX_VTEST_REPLIES`.
-///
-/// The replies are the answer key. Feeding the same stream to another
-/// renderer and comparing what comes out is how to tell a port that draws
-/// from one that only runs -- a blank frame and a correct frame execute the
-/// same commands and differ only here.
+/// And what was sent back, under `GEX_VTEST_REPLIES` -- the answer key a replay
+/// is compared against, since a blank and a correct frame differ only here.
 pub fn record_replies(bytes: &[u8]) {
     record_to("GEX_VTEST_REPLIES", bytes);
 }
 
-/// How much to keep, from `GEX_VTEST_LIMIT`. Default 8 MB.
-///
-/// Not a nicety. The replies are almost entirely framebuffer read-back --
-/// 360,000 bytes per frame at 43 frames a second -- and an unbounded
-/// recording of a few minutes of glxgears is 1.6 GB. Both files stop at the
-/// same command, so they stay comparable.
+/// How much to keep, from `GEX_VTEST_LIMIT`. Default 8 MB: replies are mostly
+/// framebuffer read-back and grow without bound (1.6 GB for a few minutes of
+/// glxgears). Both files stop at the same command so they stay comparable.
 fn limit() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -160,10 +135,9 @@ pub struct Session {
     input: Vec<u8>,
     /// The renderer context this client owns, once it has asked for one.
     ctx_id: Option<u32>,
-    /// Set when the client has said something this server cannot answer. The
-    /// connection is then dead: a stream protocol has no way to resynchronise
-    /// after a command of unknown length, and pretending otherwise turns one
-    /// bad command into a stream of garbage.
+    /// Set when the client sent something unanswerable. The connection is then
+    /// dead: a stream has no way to resynchronise after a command of unknown
+    /// length.
     pub failed: Option<String>,
 }
 
@@ -196,8 +170,8 @@ impl Session {
             if self.input.len() < HDR + len {
                 break;
             }
-            // Taken out of the buffer before dispatch, so an early return
-            // cannot leave a half-consumed command behind.
+            // Taken out before dispatch, so an early return cannot leave a
+            // half-consumed command behind.
             let body: Vec<u8> = self.input[HDR..HDR + len].to_vec();
             let cmd = dw(&self.input, 1);
             let length = dw(&self.input, 0);
@@ -268,9 +242,8 @@ impl Session {
             }
 
             VCMD_PING_PROTOCOL_VERSION => {
-                // A bare header. The client uses whether this is answered at
-                // all to decide the server is new enough to ask about
-                // versions, so the reply carries no payload.
+                // A bare header: the client only cares whether it is answered
+                // at all, so the reply carries no payload.
                 push_hdr(out, 0, VCMD_PING_PROTOCOL_VERSION);
             }
 
@@ -284,19 +257,16 @@ impl Session {
             VCMD_GET_CAPS | VCMD_GET_CAPS2 => {
                 let set = if cmd == VCMD_GET_CAPS { 1 } else { 2 };
                 let caps = virgl.caps(set);
-                // The reference sends `size + 1` as the length. It is not a
-                // count of anything -- the client reads `size` bytes -- but it
-                // is what the client expects to see.
+                // The reference sends `size + 1` as the length; the client
+                // reads `size` bytes but expects to see this.
                 push_hdr(out, caps.len() as u32 + 1, set);
                 out.extend_from_slice(&caps);
             }
 
             VCMD_RESOURCE_CREATE | VCMD_RESOURCE_CREATE2 => {
                 let ctx = self.ctx()?;
-                // create2 adds a shared-memory size at the end. At protocol
-                // version 0 the client never sends it, and if it somehow did,
-                // ignoring it means the transfers still work -- just through
-                // the stream, which is where they already are.
+                // create2's trailing shared-memory size is never sent at
+                // version 0, and ignoring it leaves transfers on the stream.
                 virgl.resource_create(ctx, body)?;
             }
 
@@ -326,9 +296,8 @@ impl Session {
             }
 
             VCMD_RESOURCE_BUSY_WAIT => {
-                // Everything this server does is synchronous -- a command has
-                // finished by the time its reply is written -- so nothing is
-                // ever busy. The client still has to be told so.
+                // Everything is synchronous, so nothing is ever busy; the
+                // client still has to be told so.
                 virgl.poll();
                 push_hdr(out, 1, VCMD_RESOURCE_BUSY_WAIT);
                 out.extend_from_slice(&0u32.to_le_bytes());

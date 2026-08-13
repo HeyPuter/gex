@@ -1,24 +1,12 @@
-// Running a guest's OpenGL ES on the page's WebGL 2.
+// The browser's half of the graphics device: the guest marshals each GL call
+// into a buffer in its own memory, the shim hands this the address, and every
+// command becomes a real WebGL call on a real canvas.
 //
-// This is the browser's half of the graphics device. The guest's
-// libGLESv2.so.2 marshals each call into a buffer inside the guest's own
-// memory; the shim hands this the address; and every command becomes a real
-// WebGL call on a real canvas.
-//
-// WebGL 2 *is* OpenGL ES 3.0, so almost nothing here is a translation. The
-// exceptions are the two places the web deliberately differs from native GL,
-// and both are about the same thing -- a page may not be handed a raw
-// pointer:
-//
-//   * Object names. Native GL uses integers the guest chose; WebGL uses
-//     opaque objects. So there is a table per kind, indexed by the guest's
-//     number.
-//   * Buffer data. Native GL takes a pointer; WebGL takes a typed array. The
-//     bytes are already in the guest's memory, so a subarray view is passed
-//     and nothing is copied.
-//
-// The command encoding is generated from the Rust definition, so the guest,
-// the native host and this cannot drift apart.
+// WebGL 2 *is* OpenGL ES 3.0, so almost nothing here is a translation. The two
+// exceptions are where the web refuses a raw pointer: object names (a table per
+// kind, indexed by the guest's integer) and buffer data (a subarray view into
+// guest memory, not a copy). The command encoding is generated from the Rust
+// definition in gl-proto.js, so guest, native host and this cannot drift apart.
 
 import { op, MAGIC, HEADER_BYTES, error } from './gl-proto.js';
 

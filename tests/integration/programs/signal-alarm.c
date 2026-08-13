@@ -1,9 +1,5 @@
-/* Does ITIMER_REAL fire, and does it wake a blocked process?
- *
- * musl has no `alarm` syscall on this architecture: alarm() is setitimer with
- * ITIMER_REAL. gex grew interval timers so `openssl speed` could measure
- * itself, which is a program that *polls* a flag. Nothing there checks that
- * the signal also reaches a process that is asleep. */
+/* Does ITIMER_REAL (alarm()) fire, both when the process is spinning and when
+ * it is asleep in nanosleep, which the signal must cut short? */
 #include <signal.h>
 #include <stdio.h>
 #include <sys/time.h>

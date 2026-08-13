@@ -1,15 +1,7 @@
-/* Flags living across basic-block boundaries.
- *
- * Cross-block flag liveness deletes a flag write when no reachable block
- * reads it. Every shape below deliberately reads a flag in a *different*
- * block from the one that set it, which is exactly what the analysis must
- * not break. A compiler will not emit most of these; hand-written assembly
- * does, and the architecture permits all of them.
- *
- * Each case appends one character to a buffer, and the buffer is written to
- * stdout at the end, so a wrong branch shows up as a wrong string rather
- * than as a crash.
- */
+/* Flags living across basic-block boundaries: every case below reads a flag in
+ * a different block from the one that set it, which cross-block flag-liveness
+ * analysis must not optimise away. Each case appends one character to a buffer
+ * written at the end, so a wrong branch shows up as a wrong string. */
     .text
     .global _start
 

@@ -1,73 +1,32 @@
 // The page's half of a guest system: one Worker per guest process.
 //
-// This is what replaced the snapshot switcher. That switcher existed because
-// the page had one wasm stack and one address space, so running a second
-// process meant writing the first one out and reading the second one in --
-// 223 MiB per switch during the gears demo. A Worker per process removes the
-// cause rather than the cost: each has a `WebAssembly.Memory` of its own, so
-// nothing collides and nothing is snapshotted.
-//
-// What the host has to do is small, and it is all here:
-//
-//   * make the first Worker and give it a program,
-//   * make another whenever a Worker says its guest forked, and hand that one
-//     the record the fork produced,
-//   * carry output out and input in,
-//   * hold the run open until the *first* process exits, which is the one the
-//     caller asked for.
-//
-// Everything the processes share -- the process table, the filesystem, the
-// pipes -- is in the global kernel, a second wasm module every Worker
-// instantiates against one shared memory. None of it passes through here.
-// That is deliberate: a syscall that had to be a message to this file and a
-// wait for the answer would be slower than the switcher it replaced.
+// Each Worker has its own `WebAssembly.Memory`, so nothing collides and
+// nothing is snapshotted. Shared state -- the process table, filesystem, pipes
+// -- lives in the global kernel, a second wasm module every Worker
+// instantiates against one shared memory, so a syscall stays a call rather
+// than a message back through here. This file starts pid 1, makes a Worker per
+// fork, relays I/O, and holds the run open until pid 1 exits.
 
 /**
- * A guest system: one process, and whatever it forks.
- *
- * `makeWorker` is the only part that differs between a page and Node, and it
- * is a callback rather than a branch because this file has no business
- * knowing which it is running under.
- */
-/**
- * A guest process or thread died, announced once, in one place.
- *
- * Both call sites already write a line to the guest's stderr, and that is
- * right for a person watching a terminal. It is not enough for anything
- * *automated* watching the run: these failures are caught -- the spawn's
- * promise is rejected and handled -- so no `error` event fires, and a test
- * that has already seen the text it was waiting for has stopped reading by
- * the time the line appears.
- *
- * A hook rather than a pattern. Scraping the prose was tried and is the
- * wrong mechanism: it fails *open*, so rewording a message disables the
- * check silently, and the pattern ends up duplicated in the places that
- * read it and drifts between them. Nothing is imposed on a host that does
- * not set the hook. See task 146.
+ * Announce a crash to an automated watcher. These failures are caught (the
+ * spawn promise is rejected and handled), so no `error` event fires and a test
+ * that already matched its output has stopped reading. A hook, not prose
+ * scraping, which fails open. See task 146.
  */
 function crashed(what) {
   try {
     globalThis.GEX_ON_CRASH?.(what);
   } catch {
-    // A reporter that throws must not take the run down with it: the point
-    // of this is to make a failure visible, not to add one.
+    // A reporter that throws must not add a failure to the one it reports.
   }
 }
 
 /**
- * The buffers in a fork record, so `postMessage` can hand them over instead
- * of copying them.
- *
- * A fork image is 15.4 MiB in twenty regions and it crosses twice -- the
- * parent's Worker to the page, the page to the child's Worker -- because the
- * page is only a relay. Each crossing is a structured clone, measured at
- * 82ms. Neither side reads the bytes again after passing them on, which is
- * exactly the condition a transfer needs.
- *
- * Views on a `SharedArrayBuffer` are skipped: a shared buffer cannot be
- * transferred, and the guest's memory is shared when threads are on. The
- * regions are made with `slice`, so they are ordinary buffers and each owns
- * its own -- transferring one cannot detach another.
+ * The buffers in a fork record, so `postMessage` transfers them instead of
+ * copying. Views on a `SharedArrayBuffer` are skipped -- shared buffers cannot
+ * be transferred, and the guest's memory is shared when threads are on; the
+ * regions are `slice`d, so each owns its buffer and transferring one cannot
+ * detach another.
  */
 function forkTransfer(child) {
   const out = [];
@@ -98,34 +57,21 @@ export class ProcessHost {
   /// When each process was asked for. See `#spawn`.
   #asked = new Map();
   #threads = 0;
-  // The global kernel's per-Worker stacks, as the first Worker reported them,
-  // and how many have been handed out.
-  //
-  // A wasm global belongs to an instance, so every Worker's kernel instance
-  // has a `__stack_pointer` of its own -- all pointing at the same address in
-  // the memory they share. Handing each one its own slice is what stops two
-  // Workers in the kernel writing their locals over each other.
+  // The global kernel's per-Worker stacks, as the first Worker reported them.
+  // Each Worker's kernel instance has its own `__stack_pointer` global, all
+  // pointing into the shared memory, so each needs its own slice or two Workers
+  // in the kernel overwrite each other's locals.
   #stacks = null;
   #stacksTaken = 0;
-  // Slices handed back by Workers that have ended, and which slice each live
-  // Worker holds. A run that starts a hundred short-lived threads uses as
-  // many slices as it has threads *at once*, not as many as it ever made --
-  // without which a pthread program exhausted the array while it was still
-  // starting up.
+  // Slices handed back by ended Workers, and which slice each live Worker
+  // holds: a run of many short-lived threads uses as many slices as run at
+  // once, not as many as it ever made.
   #stacksFree = [];
   /// The shim compiling, once, so no Worker waits on a second compile.
   #shimCompiling = null;
-  /// Workers made before anybody asked for one.
-  ///
-  /// A forked process costs about 500ms and 170ms of that is `lived - guest`:
-  /// making a Worker, loading the bundle into it, and getting to the point
-  /// where it can read a start message. None of that depends on *which*
-  /// process it will run, so none of it has to happen while somebody waits.
-  ///
-  /// The cost does not go away -- a Worker still starts, on some other core
-  /// -- it stops being on the path. One spare is enough for a shell running
-  /// commands one at a time; a pipeline wants more, and taking the last one
-  /// falls back to making a Worker exactly as before.
+  /// Workers made before anybody asks, so a fork's ~170ms of Worker startup is
+  /// off the path. One spare suits a shell; a pipeline wants more, and an empty
+  /// pool falls back to making a Worker inline.
   #warm = [];
   #warmWanted = 2;
   #warmMade = 0;
@@ -137,22 +83,16 @@ export class ProcessHost {
     shim,
     guest,
     kernel = null,
-    // Merged into every Worker's start message. Everything a process needs
-    // that is not the program itself: the GPU channel, the proxy's address,
-    // the terminal's size. Every process gets the same, because on a real
-    // machine every process does.
+    // Merged into every Worker's start message: everything a process needs
+    // that is not the program -- GPU channel, proxy address, terminal size.
     extra = {},
     onOutput = () => {},
     onFork = () => {},
     // Every process's exit message, whole. `start` resolves with pid 1's
-    // status, which is what a caller usually wants; this is for the rest of
-    // what a Worker reports on its way out -- how long its guest ran, what
-    // its memory grew to, anything read out of its address space before the
-    // thread that owns it goes away.
+    // status; this hands a host the rest of what a Worker reports on exit.
     onExit = () => {},
     readStdin = null,
-    // Anything a Worker posts that this file has no meaning for -- the GPU
-    // asking to be served, a network event for the page's status line.
+    // Anything a Worker posts that this file has no meaning for.
     onMessage = () => {},
   }) {
     this.#makeWorker = makeWorker;
@@ -168,29 +108,14 @@ export class ProcessHost {
   }
 
   /**
-   * The shim, compiled once for every Worker that will ever need it.
-   *
-   * Two things this saves, and it is worth being clear that only the second
-   * is certain. V8 keeps a cache of compiled wasm keyed on the wire bytes and
-   * shares it between Isolates in a process, so ten Workers compiling the
-   * same 8.7 MB may already have been one compilation and nine lookups --
-   * that is measurable, and measured below rather than assumed. What is not
-   * in doubt is the copying: `postMessage` structured-clones a `Uint8Array`,
-   * so every Worker was handed its own 8.7 MB, while a `WebAssembly.Module`
-   * clones as a reference to the code already compiled.
+   * The shim, compiled once and shared to every Worker. `postMessage` clones a
+   * `Uint8Array` (8.7 MB each) but clones a `WebAssembly.Module` by reference.
    */
   #shimModule() {
     if (this.#shim instanceof WebAssembly.Module) return Promise.resolve(this.#shim);
-    // Asynchronously, and this is not a preference.
-    //
-    // `new WebAssembly.Module(bytes)` compiles synchronously, and Chromium
-    // refuses to do that on the main thread for a buffer over 8 MB -- the
-    // shim is 8.7. Node has no such rule, so the synchronous form passed
-    // every test here and killed the page at boot with `RangeError:
-    // WebAssembly.Compile is disallowed on the main thread`. The one
-    // instrument that caught it was an `unhandledrejection` handler added
-    // minutes earlier; before that the page simply stopped and the driver
-    // waited.
+    // Async, not a preference: Chromium refuses a synchronous compile over 8 MB
+    // on the main thread and the shim is 8.7. Node allows it, so the sync form
+    // passed every test here and killed the page at boot.
     this.#shimCompiling ??= WebAssembly.compile(this.#shim).then((m) => (this.#shim = m));
     return this.#shimCompiling;
   }
@@ -205,12 +130,8 @@ export class ProcessHost {
   get pids() { return [...this.#workers.keys()]; }
 
   /**
-   * Run `elf` as pid 1 and resolve with its exit status.
-   *
-   * Children outlive it only as long as it takes to stop them: a page that
-   * has finished with a program has finished with the daemons it started,
-   * and leaving a Worker running would leave the guest's clock ticking in a
-   * tab nobody is looking at.
+   * Run `elf` as pid 1 and resolve with its exit status. Children are stopped
+   * when it exits -- a page done with a program is done with its daemons.
    */
   async start({ elf, files = {}, args = [], opts = {} }) {
     const status = await this.#spawn(1, {
@@ -243,30 +164,17 @@ export class ProcessHost {
   stop() {
     for (const w of this.#workers.values()) w.terminate();
     this.#workers.clear();
-    // Including the ones nobody asked for. A page that has finished with its
-    // guest has finished with the Workers it started for a next process that
-    // never came.
+    // Including the warm ones nobody claimed.
     for (const w of this.#warm) w.terminate();
     this.#warm = [];
   }
 
   /**
-   * One process in one Worker.
-   *
-   * `msg` is either `run` -- load a program -- or `adopt`, which is what a
-   * forked child gets: a copy of its parent's memory and the few words that
-   * differ between the two.
+   * One process in one Worker. `msg` is `run` (load a program) or `adopt` (a
+   * forked child, from its parent's fork record).
    */
   #spawn(pid, msg) {
-    // When this process was asked for, so the gap between asking and it
-    // running can be seen.
-    //
-    // Everything measured so far is what a process does *once it is up*:
-    // translating, installing, adopting. Those add to one or two seconds and
-    // an `apt-get update` spends nine per process, so most of a process's
-    // life is in none of them -- and nothing timed the part in between:
-    // making a Worker, loading the bundle into it, and getting fifteen
-    // megabytes of image across.
+    // When this process was asked for, to measure the gap before it runs.
     this.#asked.set(pid, performance.now());
     return new Promise((resolve, reject) => {
       const w = this.#takeWorker();
@@ -281,11 +189,9 @@ export class ProcessHost {
       w.addEventListener?.('error', fail);
       w.on?.('error', fail);
       this.#pending.set(pid, { ...msg, pid });
-      // How much is pinned here, and by how many records. `#pending` holds
-      // the whole fork record, image bytes included, until the child reports
-      // ready and `#pending.delete(pid)` runs. A child that never starts
-      // leaves ~19 MB pinned, and nine of those is the 166 MB heap that
-      // `apt update` dies on. See task 145.
+      // `#pending` pins the whole fork record (image bytes included) until the
+      // child reports ready. A child that never starts leaves ~19 MB pinned.
+      // See task 145.
       if (this.#extra?.debugExit) {
         let held = 0;
         for (const r of this.#pending.values()) {
@@ -295,11 +201,9 @@ export class ProcessHost {
           `[pending] ${this.#pending.size} records holding ${held} bytes`,
         );
       }
-      // One line per process, to `debug` so a page hides it and a terminal
-      // shows it. A process that never starts leaves no other trace at all:
-      // the fork is logged by the *parent*, the exit by the child, and a
-      // child that does neither is invisible. That is the whole of what a
-      // nested subshell looks like from here -- #137.
+      // One line per process, to `debug`: a process that never starts leaves
+      // no other trace -- the fork is logged by the parent, the exit by the
+      // child. #137.
       console.debug(`[host] pid ${pid}: worker taken, ${msg.kind} held for ready`);
       // And now whatever it said while it was still in the pool.
       const held = w[EARLY];
@@ -313,10 +217,8 @@ export class ProcessHost {
   }
 
   /**
-   * A Worker, from the pool if one is warm.
-   *
-   * Topping up is deliberately *after* the take, so the Worker being started
-   * now is the one for the process after this one, not this one.
+   * A Worker, from the pool if one is warm. Tops up after the take, so the
+   * Worker started now serves the next process, not this one.
    */
   #takeWorker() {
     const w = this.#warm.shift();
@@ -332,17 +234,9 @@ export class ProcessHost {
     if (this.#warm.length >= this.#warmWanted) return;
     try {
       const w = this.#makeWorker();
-      // Everything it says before `#spawn` gets to it.
-      //
-      // A Worker made inside `#spawn` has its listener attached in the same
-      // synchronous block, so nothing it posts can arrive first. One made
-      // ahead of time does not: it loads the bundle and announces itself
-      // while the pool is still sitting in an array, and that message is
-      // delivered to nobody and dropped. The process then never receives its
-      // program and the run waits for a guest that was never started --
-      // measured as `debian-forks` going from 15 seconds to over 460 with no
-      // error of any kind, which is exactly what a dropped message looks
-      // like.
+      // Buffer whatever it says before `#spawn` attaches its listener: a
+      // pooled Worker announces itself while still sitting in the array, and
+      // that message would otherwise be delivered to nobody and dropped.
       const early = [];
       const buf = (e) => early.push(e && e.data !== undefined ? e.data : e);
       w.addEventListener?.('message', buf);
@@ -351,9 +245,7 @@ export class ProcessHost {
       this.#warm.push(w);
       this.#warmMade++;
     } catch {
-      // A page that cannot make another Worker is not a failure here: the
-      // next `#takeWorker` makes one itself and the caller sees what it
-      // always saw.
+      // Cannot make another Worker: the next `#takeWorker` makes one itself.
     }
   }
 
@@ -362,34 +254,13 @@ export class ProcessHost {
     return { made: this.#warmMade, used: this.#warmUsed, idle: this.#warm.length };
   }
 
-  /**
-   * The next Worker's slice of the kernel's stack array, or undefined for the
-   * first -- which keeps the stack the module was linked with, and is the one
-   * that reports where the array is.
-   */
-  /**
-   * Hand a Worker the closure's libraries, one message each.
-   *
-   * Sent after the start message rather than inside it, and never awaited:
-   * the process is already loading, and a library that arrives late costs a
-   * few dispatch misses rather than a boot. Failure of one is reported and
-   * does not stop the others -- a closure short one library still saves
-   * eighteen nineteenths of the translation.
-   */
-  /// Send what a Worker needs to *register* the closure: metadata only.
-  ///
-  /// The compiled modules used to go too, one message each, and the Worker
-  /// waited for all of them before it ran anything. Thirty-three of them is
-  /// 549ms between a parent finishing its fork image and the child starting
-  /// to adopt -- and a process enters four. Registration wants only the
-  /// `gex.meta` section, which is 516 bytes for the dynamic linker and 4 KB
-  /// for libc; the module itself is wanted by the branch that lands in it,
-  /// and `wantLibrary` fetches it then.
+  /// Send a Worker the closure metadata only -- which library owns which
+  /// pages. Sending all compiled modules up front cost 549ms per fork; each
+  /// module is fetched later, when a branch lands in it (`#sendLibrary`).
   #streamClosure(w, closure) {
     const metas = (closure ?? []).map((e) => (e instanceof Uint8Array ? e : e.meta));
-    // And which program each library is the image of, where it is one. Every
-    // root of a closure is an image and they all claim `PIE_BASE`, so this is
-    // how a Worker tells `ls`'s pages from `bash`'s.
+    // Which program each library images, where it is one: every closure root
+    // claims `PIE_BASE`, so this tells `ls`'s pages from `bash`'s.
     const programs = (closure ?? []).map((e) => (e instanceof Uint8Array ? '' : (e.program ?? '')));
     try {
       w.postMessage({ kind: 'closureMeta', metas, programs });
@@ -398,14 +269,9 @@ export class ProcessHost {
     }
   }
 
-  /// Hand one compiled closure library to the Worker that asked for it,
-  /// fetching and compiling it now if this is the first time anybody has.
-  ///
-  /// A closure entry may arrive with only its metadata and a `url`: the page
-  /// registers sixty-two libraries from a few hundred kilobytes and leaves
-  /// 239 MB of wasm on the server until a branch lands in one. The compile
-  /// is kept, because the next process to ask wants the same module and a
-  /// `WebAssembly.Module` clones by reference.
+  /// Hand one compiled closure library to the Worker that asked, fetching and
+  /// compiling it now on first ask. A closure entry may arrive with only
+  /// metadata and a `url`; the compile is kept and reused by reference.
   async #sendLibrary(w, i) {
     const entry = (this.#extra?.closure ?? [])[i];
     if (!entry) return;
@@ -431,8 +297,8 @@ export class ProcessHost {
         mod: entry instanceof Uint8Array ? entry : entry.mod,
       });
     } catch (e) {
-      // Loud, and not fatal: a library that never arrives costs the guest
-      // the translation it would have saved, and nothing else.
+      // Loud, not fatal: a missing library costs the guest the translation it
+      // would have saved, nothing else.
       console.error(`[gex] closure library ${i} did not reach a worker:`, e);
       this.#onOutput(2, `gex: closure library ${i} did not reach a worker: ${e.message}\n`, 0);
     }
@@ -445,9 +311,7 @@ export class ProcessHost {
       this.#stackOf.set(key, reuse);
       return this.#stacks.area + reuse * this.#stacks.size;
     }
-    // Slice 0 belongs to nobody: the first Worker is already using the
-    // linked-in stack, and leaving a gap costs half a megabyte of address
-    // space in a memory that has a gigabyte of it.
+    // Slice 0 belongs to nobody: the first Worker uses the linked-in stack.
     const n = ++this.#stacksTaken;
     this.#stackOf.set(key, n);
     if (n >= this.#stacks.count) {
@@ -473,8 +337,7 @@ export class ProcessHost {
   #onMessage(pid, w, m, resolve, reject) {
     switch (m?.kind) {
       case 'ready': {
-        // How long the Worker took to exist and load its bundle, before it
-        // has been given anything to do.
+        // How long the Worker took to exist and load its bundle.
         if (this.#extra?.debugExit && this.#asked.has(pid)) {
           const t = performance.now() - this.#asked.get(pid);
           this.#onOutput(2, `[gex] pid ${pid}: worker ready after ${Math.round(t)}ms\n`, pid);
@@ -483,22 +346,12 @@ export class ProcessHost {
         this.#pending.delete(pid);
         console.debug(`[host] pid ${pid}: ready, ${msg ? `sending ${msg.kind}` : 'NOTHING HELD'}`);
         if (msg) {
-          // Awaited, because compiling the shim cannot be synchronous in a
-          // browser. The Worker is idle until this arrives either way.
+          // Awaited: compiling the shim cannot be synchronous in a browser.
           this.#shimModule().then((shimMod) => {
-          // The closure goes after, one library per message.
-          //
-          // All of them at once does not cross: eighteen compiled modules is
-          // 694 MB of `WebAssembly.Module` and Chromium answers
-          // `DataCloneError: Data cannot be cloned, out of memory`, which
-          // arrives as a rejected promise in the page and leaves the Worker
-          // having never woken. A 77 MB closure crossed and a shell booted on
-          // it, so it is size and not the idea.
-          //
-          // The guest runs while they arrive. That is safe because the miss
-          // path already forgives a page whose module has not landed: it asks
-          // once, nobody can fill it, and it asks again when the next
-          // deferred module shows up.
+          // The closure goes after, one library per message: all at once does
+          // not cross (Chromium `DataCloneError, out of memory`). The guest
+          // runs while they arrive -- the miss path forgives a module not yet
+          // landed and asks again when it shows up.
           const { closure, ...extra } = this.#extra;
           w.postMessage({
             ...extra,
@@ -507,22 +360,13 @@ export class ProcessHost {
             closureCount: (closure ?? []).length,
             ...msg,
             kernelStack: this.#nextKernelStack(pid),
-            // Compiled once, here, rather than from bytes in every Worker.
-            // The shim is 8.7 MB and a run of `apt-get update` makes ten
-            // processes; compiling it ten times was most of that run's CPU,
-            // spread over V8's background threads where a profile of the
-            // main thread could not see it. A `WebAssembly.Module` is
-            // structured-cloneable and the engine shares the code behind it.
+            // Compiled once here, not from bytes in every Worker.
             shim: shimMod,
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
           }, forkTransfer(msg.child));
-          // Timed separately, because the gap between a parent finishing its
-          // fork image and a child starting to adopt is 549ms and none of it
-          // is accounted for anywhere. The candidates are this `postMessage`
-          // -- which carries the 15.4 MiB image copy -- and the thirty-three
-          // compiled modules below, one message each, of which a process
-          // enters four.
+          // Timed separately: the fork-to-adopt gap is 549ms and unaccounted --
+          // this `postMessage` (the 15.4 MiB image copy) or the closure below.
           const tSent = performance.now();
           this.#streamClosure(w, closure);
           if (this.#extra?.debugExit) {
@@ -548,8 +392,6 @@ export class ProcessHost {
         this.#onOutput(m.fd, m.text, pid, m);
         break;
       case 'fork': {
-        // Three moments: the parent finished building the record, this
-        // message arrived, and the child's Worker is about to be given it.
         const c = m.child?.forkCost;
         if (c) {
           const hop1 = Math.round(performance.timeOrigin + performance.now() - c.sentAt);
@@ -562,41 +404,29 @@ export class ProcessHost {
         }
         this.#forked++;
         this.#onFork(m.child, pid);
-        // Started and then let run. A child is a process in its own right;
-        // the difference from a switch is exactly that nobody waits for it.
+        // Started and let run -- nobody waits for a child.
         this.#spawn(m.child.pid, { kind: 'adopt', child: m.child }).catch((e) => {
           this.#onOutput(2, `gex: process ${m.child.pid} failed: ${e.message}\n`, pid);
-          // And as an event, for anything watching the run rather than
-          // reading it. This is caught, so no `error` event fires and a
-          // harness sees only the line above -- which it may well miss,
-          // because a test that has already matched what it wanted has
-          // stopped reading. A whole session was spent calling those runs
-          // "stalls". See task 146.
+          // As an event too: this is caught, so no `error` fires and a harness
+          // may miss the line above. See task 146.
           crashed(`pid ${m.child.pid}: ${e.message}`);
         });
         break;
       }
       case 'thread': {
-        // A thread of a process that is already running: same memory, same
-        // kernel, a Worker of its own. Nothing waits for it -- a thread ends
-        // when it ends, and its process is what the caller asked about.
+        // A thread of a running process: same memory, same kernel, its own
+        // Worker. Nothing waits for it.
         this.#threads++;
         const key = `${pid}:${m.thread.tid}`;
         const w2 = this.#makeWorker();
         this.#workers.set(key, w2);
-        // Keyed by the thread, so that when it ends the right Worker is
-        // stopped and the right kernel stack goes back on the free list.
+        // Keyed by the thread, so its end stops the right Worker and frees the
+        // right kernel stack.
         const deliver = (mm) => this.#onMessage(key, w2, mm, () => {}, () => {});
         w2.addEventListener?.('message', (e) => deliver(e.data));
         w2.on?.('message', deliver);
-        // A thread that throws, said out loud.
-        //
-        // A process Worker has had an `error` listener since it was written,
-        // and its rejection is reported. A thread's had none: nothing was
-        // listening, so an exception in a guest thread was swallowed whole
-        // and the process it belonged to simply stopped making progress --
-        // which reads as a hang, and is the hardest kind of failure to find
-        // because the evidence is destroyed with the Worker that had it.
+        // A thread that throws, said out loud: a thread Worker had no `error`
+        // listener, so an exception was swallowed and read as a hang.
         const threadFailed = (e) => {
           this.#onOutput(2, `gex: thread ${key} failed: ${e?.message ?? String(e)}\n`, pid);
           crashed(`thread ${key}: ${e?.message ?? String(e)}`);
@@ -604,24 +434,14 @@ export class ProcessHost {
         w2.addEventListener?.('error', threadFailed);
         w2.on?.('error', threadFailed);
         this.#pending.set(key, { kind: 'thread', ...m.thread });
-        // `ready` arrives keyed by the *process*, so the start message is
-        // looked up by pid. A thread's is keyed by tid, so it is handed over
-        // here instead, once.
+        // A thread's start message is keyed by tid and handed over here, once.
         const start = (mm) => {
           if (mm?.kind !== 'ready') return;
           this.#pending.delete(key);
-          // Without the closure, and this is the same rule the fork path
-          // follows two hundred lines up: `extra` carries `closure`, whose
-          // entries are the libraries, and a library is fetched on the first
-          // branch that lands in it -- so most of them are still promises.
-          // A promise is not structured-cloneable, and the whole message is
-          // refused: "Failed to execute 'postMessage' on 'Worker':
-          // #<Promise> could not be cloned". The thread never starts and the
-          // process it belongs to waits for a sibling that does not exist.
-          //
-          // A count instead, exactly as a forked child gets one; the Worker
-          // asks for what it needs. Nothing noticed until now because no
-          // guest thread had ever been started.
+          // Without the closure, as the fork path: `closure` entries are mostly
+          // promises (a library is fetched on first branch into it), and a
+          // promise is not structured-cloneable. A count instead; the Worker
+          // asks for what it needs.
           const { closure: _closure, ...extra } = this.#extra ?? {};
           this.#shimModule().then((shimMod) =>
           w2.postMessage({
@@ -629,16 +449,10 @@ export class ProcessHost {
             closureCount: (this.#extra?.closure ?? []).length,
             kind: 'thread',
             tid: m.thread.tid,
-            // The registers the thread enters on, which the parent worked out
-            // in `#drainThread` and every other field here is forwarded but
-            // these two were not. `adoptThread` re-derives the entry pc from
-            // `gex_adopt_thread(tid)`, so a dropped `pc` was invisible -- but
-            // `ctx` has no such fallback: it arrived as `undefined`, became
-            // `Number(undefined)` = NaN, and `enter(ctx, pc)` coerced NaN to
-            // 0, so the thread read its registers from guest address 0 and
-            // branched through a zeroed x30 to `pc=0x0`. Every guest thread
-            // died at its first instruction, which read as the process simply
-            // never making progress.
+            // `ctx` and `pc` are forwarded explicitly: `adoptThread` re-derives
+            // `pc`, but a dropped `ctx` became NaN -> 0, so every guest thread
+            // read its registers from address 0 and died at its first
+            // instruction.
             ctx: m.thread.ctx,
             pc: m.thread.pc,
             memory: m.thread.memory,
@@ -649,33 +463,22 @@ export class ProcessHost {
           }),
           );
         };
-        // Deliberately NOT registered as a second message listener. A thread's
-        // `ready` is already routed through `#onMessage` by `deliver` above --
-        // it finds this thread in `#pending` (keyed `pid:tid`, the argument
-        // `#onMessage` reads as the pid) and sends the start message, once.
-        // Registering `start` as well sent it twice, so the Worker ran
-        // `gex.run` twice on one thread: two interleaved loops sharing one set
-        // of guest registers, each advancing sp past the other's, and now and
-        // then a thread loaded a stack word where `__clone` had put its start
-        // function and branched into it. That double-adoption was a crutch for
-        // a startup race since fixed in `Gex.adoptThread` (a thread now
-        // installs the process's modules before it runs), and with the race
-        // gone the second run only corrupts. One record, one path, one start.
+        // NOT registered as a second listener: `start` is already reached
+        // through `deliver` (which finds this thread in `#pending`). Registering
+        // it too sent the start message twice and ran `gex.run` twice on one
+        // thread. One record, one path, one start.
         void start;
         break;
       }
       case 'stdin': {
-        // Only pid 1 has a terminal behind it; a child that reads standard
-        // input reads the descriptor it inherited, which is the kernel's
-        // business rather than this file's.
+        // Only pid 1 has a terminal; a child reads the inherited descriptor,
+        // which is the kernel's business, not this file's.
         if (!this.#readStdin) {
           w.postMessage({ kind: 'eof' });
           break;
         }
         Promise.resolve(this.#readStdin(m.lflag)).then((bytes) => {
-          // `true` is "there is input, and it is already in the shared
-          // queue you read from" -- the answer a page with a real terminal
-          // gives, because the discipline put it there when it was typed.
+          // `true` means "input is already in the shared queue you read from".
           if (bytes === true) w.postMessage({ kind: 'stdin', bytes: true });
           else if (bytes && bytes.length) w.postMessage({ kind: 'stdin', bytes });
           else w.postMessage({ kind: 'eof' });
@@ -683,46 +486,28 @@ export class ProcessHost {
         break;
       }
       case 'exit':
-        // What each process paid, to the console, in the browser.
-        //
-        // The page passes no `onExit`, so these numbers -- how long a process
-        // spent translating, how many blocks it lifted, how much it took from
-        // what other processes had already done -- were computed and thrown
-        // away. Only the Node harness ever printed them, and when the two
-        // hosts disagreed there was nothing to compare. The Node side prints
-        // its own, hence the guard.
+        // The page passes no `onExit`, so these per-process numbers were
+        // computed and thrown away. Printed here, guarded so the Node harness
+        // (which prints its own) does not double up.
         if (typeof window !== 'undefined' && m.millis !== undefined) {
           // How long the process existed, against what it can account for.
-          //
-          // Everything else here is work the runtime did. A process that
-          // lived five seconds and can name one and a half of them is
-          // spending the rest somewhere nothing measures -- guest code
-          // running, or waiting -- and without the total there is no way to
-          // see that the two do not add up.
           const lived = this.#asked.has(pid)
             ? Math.round(performance.now() - this.#asked.get(pid))
             : 0;
           this.#asked.delete(pid);
           console.log(
-            // `guest` is the time inside `gex.run`, which is the guest
-            // actually executing plus every trap out of it. `lived` minus
-            // `guest` is Worker creation, adoption and the wait for a start
-            // message -- and the two have to be separable, because twice now
-            // a cost has been attributed to the wrong side of that line.
+            // `guest` is the time inside `gex.run`; `lived` minus `guest` is
+            // Worker creation, adoption and the wait for a start message. The
+            // two must be separable -- a cost has been blamed on the wrong side.
             `[gex] pid ${pid}: lived ${lived}ms (guest ${m.guestMillis ?? -1}ms)` +
-              // What the runtime still held when the process left. The
-              // worker has posted this all along and nothing printed it,
-              // which is why `apt-get update` running out of address space
-              // took four theories: the number that says so was already
-              // crossing the wire. -1 without GEX_HEAP_COUNTERS=1.
+              // What the runtime still held on exit. -1 without GEX_HEAP_COUNTERS=1.
               (m.heapKib >= 0 ? `, runtime holds ${Math.round(m.heapKib / 1024)} MiB` : '') +
               `, ${m.millis}ms translating ${m.blocks} blocks` +
-              // How many of those the closure already had. A run where this
-              // is most of `blocks` is not a coverage problem in the static
-              // recompiler -- it is the fill failing to reach the guest.
+              // Of those, ones on a page the closure already had: if most of
+              // `blocks`, the fill is failing to reach the guest, not a
+              // recompiler coverage gap.
               (m.liftInClosure ? ` (${m.liftInClosure} on closure pages)` : '') +
-              // Why those misses translated rather than being filled. The
-              // comment above guesses between two causes; this measures.
+              // Why those misses translated rather than being filled.
               (m.liftWhy && m.liftWhy.some((n) => n)
                 ? ` why[nofill=${m.liftWhy[0]} unowned=${m.liftWhy[1]} asked=${m.liftWhy[2]} fresh=${m.liftWhy[3]}]`
                 : '') +
@@ -770,34 +555,21 @@ export class ProcessHost {
           );
         }
         // The guest's own hot spots, when `?hot=1` asked for them.
-        //
-        // Only `run-node.mjs` could ask before, through `GEX_HOT`, so "what
-        // is the guest actually doing" was a question the browser could not
-        // be put. It matters now: install and translation are 17 seconds of a
-        // 57 second `apt-get update` from a closure, and everything else is
-        // the guest running.
         for (const line of m.hot ?? []) {
           this.#onOutput(2, `[hot] pid ${pid}: ${line}\n`, pid);
         }
-        // Before the release, because releasing terminates the Worker and a
-        // handler that wanted to ask it anything else would be too late.
+        // Before the release: releasing terminates the Worker.
         this.#onExit(m, pid);
         this.#release(pid, w);
         resolve(m.status);
         break;
       case 'threw':
         this.#release(pid, w);
-        // Said here as well as in the Worker, because only this side knows
-        // *which process* fell over -- and because a child's promise often
-        // has nobody awaiting it, so rejecting alone can be silent.
+        // Here as well as in the Worker: only this side knows which process
+        // fell over, and a child's promise often has nobody awaiting it.
         console.error(`[gex] pid ${pid} threw: ${m.message}\n${m.stack ?? ''}`);
-        // And as an event. The console line above is captured by anything
-        // watching the browser's stderr, but capture is not the same as
-        // noticing: every console level arrives as INFO, so nothing can tell
-        // this apart from progress chatter by severity, and a run that has
-        // already seen the text it wanted will print `ok` over the top of it.
-        // This is the process saying it died, in a form a harness can fail
-        // on. See task 146.
+        // As an event: the console line is INFO to a watcher and easy to miss.
+        // See task 146.
         crashed(`pid ${pid} threw: ${m.message}`);
         reject(
           Object.assign(new Error(`pid ${pid}: ${m.message}`), { guestStack: m.stack }),

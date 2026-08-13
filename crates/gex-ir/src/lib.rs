@@ -1,19 +1,8 @@
-//! GIR — gex's intermediate representation for binary translation.
-//!
-//! GIR is deliberately small and *not* a general-purpose compiler IR (PLAN
-//! §15). It models exactly what a machine-code translator needs:
-//!
-//! * guest register reads and writes as first-class nodes, so register
-//!   caching and dead-store elimination are ordinary IR passes;
-//! * condition flags as four independent one-bit registers, because that is
-//!   how AArch64 consumes them and it makes dead-flag elimination trivial;
-//! * memory operations with explicit ordering, kept in program order;
-//! * terminators that name *guest* addresses, so a block never needs to know
-//!   how the backend will reach its successors.
+//! GIR — gex's small IR for binary translation.
 //!
 //! A [`Block`] is a straight-line list of [`Stmt`]s ending in one [`Term`].
 //! Values are SSA: each [`Value`] is defined exactly once, by the `Stmt::Def`
-//! that introduces it.
+//! that introduces it. Terminators name *guest* addresses, not backend labels.
 
 #![forbid(unsafe_code)]
 
@@ -22,7 +11,6 @@ pub mod print;
 
 use std::fmt;
 
-/// A GIR value.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Value(pub u32);
 
@@ -32,8 +20,7 @@ impl fmt::Debug for Value {
     }
 }
 
-/// GIR is typed with exactly the two integer types wasm gives us. Guest
-/// 8- and 16-bit values live zero- or sign-extended inside an `I32`.
+/// Guest 8- and 16-bit values live zero- or sign-extended inside an `I32`.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Ty {
     I32,
@@ -43,7 +30,6 @@ pub enum Ty {
 }
 
 impl Ty {
-    /// Width in bits.
     pub fn bits(self) -> u32 {
         match self {
             Ty::I32 => 32,
@@ -52,8 +38,7 @@ impl Ty {
         }
     }
 
-    /// All-ones mask for this width, as a `u64`. Only meaningful for the
-    /// scalar types; vectors are never handled as a single integer.
+    /// All-ones mask for this width, as a `u64`. Scalar types only.
     pub fn mask(self) -> u64 {
         match self {
             Ty::I32 => 0xffff_ffff,
@@ -63,9 +48,6 @@ impl Ty {
 }
 
 /// A piece of architectural guest state addressable as a register.
-///
-/// Everything here lives in the thread context struct; the backend decides
-/// whether a given access hits memory or a cached wasm local.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum GuestReg {
     /// `x0`–`x30`.
@@ -97,7 +79,6 @@ pub enum GuestReg {
 }
 
 impl GuestReg {
-    /// Width of this register's storage.
     pub fn ty(self) -> Ty {
         match self {
             GuestReg::N | GuestReg::Z | GuestReg::C | GuestReg::V => Ty::I32,
@@ -121,8 +102,7 @@ pub enum BinOp {
     And,
     Or,
     Xor,
-    /// Shift left; the amount is masked to the operand width, which is what
-    /// both wasm and AArch64's variable-shift instructions do.
+    /// Shift left; the amount is masked to the operand width (as wasm does).
     Shl,
     /// Logical shift right.
     ShrU,
@@ -130,8 +110,8 @@ pub enum BinOp {
     ShrS,
     /// Rotate right.
     Rotr,
-    /// Unsigned division. AArch64 defines division by zero as producing zero
-    /// while wasm traps, so the lifter guards the divisor.
+    /// Unsigned division. AArch64 returns 0 on divide-by-zero where wasm
+    /// traps, so the lifter guards the divisor.
     DivU,
     /// Signed division. Also needs guarding for `INT_MIN / -1`.
     DivS,
@@ -194,9 +174,8 @@ impl MemSz {
 pub enum Order {
     /// Plain access. Guest data races stay data races (PLAN §5.8).
     Relaxed,
-    /// Sequentially consistent — used for every *ordered* guest access, since
-    /// seq-cst is stronger than AArch64 acquire/release and is therefore
-    /// always a correct over-approximation.
+    /// Used for every *ordered* guest access: seq-cst is stronger than
+    /// AArch64 acquire/release, so it is always a correct over-approximation.
     SeqCst,
 }
 
@@ -292,7 +271,6 @@ pub enum Expr {
     },
 
     /// Load `bytes` bytes into the low lanes of a vector, zeroing the rest.
-    /// This is how every SIMD&FP load works: writing `s0` clears bits 32-127.
     VLoad {
         addr: Value,
         offset: i64,
@@ -336,11 +314,8 @@ pub enum Expr {
         a: Value,
         amount: Value,
     },
-    /// Byte-level permutation of two vectors.
-    ///
-    /// This single node covers `trn`, `uzp`, `zip`, `ext`, the `rev` family
-    /// and element `dup`/`ins`, because every one of them is a fixed byte
-    /// permutation and wasm has exactly that instruction.
+    /// Byte-level permutation of two vectors by a fixed index. Covers `trn`,
+    /// `uzp`, `zip`, `ext`, the `rev` family and element `dup`/`ins`.
     VShuffle {
         a: Value,
         b: Value,
@@ -419,10 +394,7 @@ pub enum Expr {
 /// Scalar floating-point operations.
 ///
 /// FP values travel through GIR as their integer *bit patterns* (`I32` for
-/// single, `I64` for double), and the backend reinterprets around each
-/// operation. That keeps the type lattice at three entries and matches how
-/// AArch64 itself stores them — a `d` register is just the low half of a `v`
-/// register.
+/// single, `I64` for double); the backend reinterprets around each operation.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FpBinOp {
     Add,
@@ -468,19 +440,15 @@ pub enum FpCmpOp {
 pub enum FpConvert {
     /// Integer to float. `signed` selects the interpretation of the source.
     IntToFp { signed: bool },
-    /// Float to integer, rounding toward zero and *saturating* — which is
-    /// what AArch64's `FCVTZ*` does, and why the lifter uses wasm's
-    /// non-trapping conversions rather than the trapping ones.
+    /// Float to integer, rounding toward zero and *saturating*, matching
+    /// AArch64's `FCVTZ*` (hence wasm's non-trapping conversions).
     FpToInt { signed: bool },
     /// Single to double, or double to single.
     FpToFp,
 }
 
-/// The lane type a vector operation works on.
-///
-/// AArch64 spells this as an arrangement (`v0.4s`); GIR keeps only the lane
-/// type, because the number of lanes follows from the 128-bit register and
-/// the 64-bit forms are handled by masking the result.
+/// The lane type a vector operation works on. Lane count follows from the
+/// 128-bit register; 64-bit forms are handled by masking the result.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum VLane {
     I8,
@@ -588,11 +556,8 @@ pub enum VCvtOp {
 pub enum VUnOp {
     /// Per-byte population count.
     PopcntBytes,
-    /// Add adjacent bytes into 16-bit lanes, and adjacent 16-bit lanes into
-    /// 32-bit ones, signed or unsigned.
-    ///
-    /// These exist twice over: to sum a population count back up to the lane
-    /// width it came from, and because `saddlp`/`uaddlp` are exactly them.
+    /// Add adjacent lanes pairwise into lanes of twice the width, signed or
+    /// unsigned. Used to sum a popcount back up, and to lift `saddlp`/`uaddlp`.
     ExtAddPairwiseU8,
     ExtAddPairwiseU16,
     ExtAddPairwiseS8,
@@ -610,10 +575,8 @@ pub enum VBinOp {
 }
 
 impl Expr {
-    /// True when the expression can be reordered or deleted freely.
-    ///
-    /// Loads are *not* pure: they must keep their position relative to stores
-    /// and to other ordered accesses.
+    /// True when the expression can be reordered or deleted freely. Loads are
+    /// *not* pure: they must keep their position relative to stores.
     pub fn is_pure(&self) -> bool {
         !matches!(
             self,
@@ -653,8 +616,7 @@ impl Expr {
             | Expr::VBitSelect { .. }
             | Expr::VCvt { .. }
             | Expr::VReplace { .. } => Ty::V128,
-            // Floating-point results are the bit pattern of the value, so
-            // the width follows the precision.
+            // FP results are bit patterns, so width follows precision.
             Expr::FpBin { double, .. } | Expr::FpUn { double, .. } => {
                 if double {
                     Ty::I64
@@ -810,27 +772,17 @@ pub enum Stmt {
     },
     /// Copy `len` bytes of guest memory from `src` to `dst`, overlap-safe.
     ///
-    /// A whole guest `memcpy`/`memmove` as one statement, so the backend can
-    /// emit wasm's `memory.copy` rather than the hundreds of blocks glibc's
-    /// hand-written NEON loop lifts to. Nothing in the lifter produces this:
-    /// it comes from recognising a library function by name, which is why the
-    /// semantics here are the C ones -- `memory.copy` is defined to behave as
-    /// if through a temporary, which is `memmove`, and so serves both.
+    /// Lowers to wasm's `memory.copy` (which behaves as if through a
+    /// temporary, so it serves both `memcpy` and `memmove`). Produced only by
+    /// recognising a library function by name, not by the lifter.
     MemCopy { dst: Value, src: Value, len: Value },
     /// Set `len` bytes of guest memory at `dst` to the low byte of `val`.
     MemFill { dst: Value, val: Value, len: Value },
     /// `dst = memcmp(a, b, len)`, as C defines it: negative, zero or positive
     /// according to the first byte that differs, compared as `unsigned char`.
     ///
-    /// A statement rather than an `Expr` because it lowers to a wasm *loop*,
-    /// and an expression is a thing the emitter pushes onto the stack in the
-    /// middle of building another one. `MemCopy` is a statement for the same
-    /// reason even though it needs no loop.
-    ///
-    /// Unlike `MemCopy` there is no single wasm instruction behind this. It
-    /// is here because glibc's aarch64 `memcmp` is a hand-written SIMD loop,
-    /// and a profile of perl -- which compares a hash key on every lookup --
-    /// puts it as the only library code among the hottest back edges.
+    /// A statement rather than an `Expr` because it lowers to a wasm *loop*;
+    /// there is no single wasm instruction behind it.
     MemCmp {
         dst: Value,
         a: Value,
@@ -892,11 +844,8 @@ impl Stmt {
     }
 }
 
-/// How a block transfers control.
-///
-/// Terminators name guest addresses, never backend labels; choosing between a
-/// direct tail call, a dispatch-table lookup and an inline cache is the
-/// backend's business.
+/// How a block transfers control. Terminators name guest addresses, never
+/// backend labels.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Term {
     /// Continue at a statically known guest address.
@@ -932,13 +881,9 @@ pub struct Block {
     pub term: Term,
     /// Number of SSA values defined; value indices are `0..n_values`.
     pub n_values: u32,
-    /// Where a call in this block is expected to return to.
-    ///
-    /// Set for `bl` and `blr`. It is not a control-flow successor — the block
-    /// transfers to the callee — but it *is* an entry point, because the
-    /// callee's `ret` will branch straight to it. Code discovery would miss
-    /// every return site without it, and tier-2's return-address prediction
-    /// (PLAN §5.6) is built on the same information.
+    /// Where a call in this block is expected to return to (set for `bl`,
+    /// `blr`). Not a control-flow successor, but an entry point the callee's
+    /// `ret` branches to; without it code discovery misses every return site.
     pub call_return: Option<u64>,
 }
 
@@ -1002,11 +947,8 @@ impl Builder {
         v
     }
 
-    /// Allocate a value that a statement will define itself.
-    ///
-    /// `def` is for `Stmt::Def`, which pairs a value with an expression. A
-    /// statement like `MemCmp` produces a value without being an expression,
-    /// so it needs the number without the pairing.
+    /// Allocate a value that a statement will define itself, e.g. `MemCmp`,
+    /// which produces a value without being an `Expr`.
     pub fn fresh(&mut self) -> Value {
         let v = Value(self.block.n_values);
         self.block.n_values += 1;
@@ -1025,7 +967,7 @@ impl Builder {
         self.def(Expr::ConstI64(v))
     }
 
-    /// A `ty`-typed constant. Vectors have no scalar constant form.
+    /// A `ty`-typed constant; for `V128`, `v` fills the low 8 bytes.
     pub fn const_ty(&mut self, ty: Ty, v: u64) -> Value {
         match ty {
             Ty::I32 => self.const_i32(v as u32),
@@ -1085,22 +1027,16 @@ impl Builder {
         self.block.stmts.len()
     }
 
-    /// Drop everything appended since `mark`.
-    ///
-    /// Values defined by the dropped statements keep their numbers -- a value
-    /// counter that only goes up costs nothing and means no live handle can
-    /// ever be reused for something else.
+    /// Drop everything appended since `mark`. Values defined by the dropped
+    /// statements keep their numbers: the counter only ever goes up, so no
+    /// live handle is reused.
     pub fn rewind(&mut self, mark: usize) {
         self.block.stmts.truncate(mark);
     }
 
     /// Whether any statement since `mark` uses a lane operation wasm cannot
-    /// express.
-    ///
-    /// The backend has no way to decline: by the time it sees the block the
-    /// terminator is decided, so it can only panic. Checking here means an
-    /// instruction that decodes but has no wasm form becomes a precise SIGILL
-    /// at exactly its address, the same as one that does not decode at all.
+    /// express. Checking here lets the lifter turn it into a precise SIGILL at
+    /// the instruction's address rather than a backend panic later.
     pub fn has_inexpressible(&self, mark: usize) -> bool {
         self.block.stmts[mark..].iter().any(|s| match s {
             Stmt::Def {
@@ -1127,15 +1063,11 @@ impl Builder {
 }
 
 impl VLaneBinOp {
-    /// The wasm SIMD opcode for this operation at this lane width, if wasm
-    /// has one.
+    /// The wasm SIMD opcode for this operation at this lane width.
     ///
-    /// `None` is not a gap to fill in the backend: it means wasm cannot
-    /// express the operation at all -- there is no `i64x2` saturating add,
-    /// no `i8x16.mul` -- so the lifter has to refuse the instruction and let
-    /// it become a precise SIGILL. Both crates ask this one table, because a
-    /// lifter that thinks an operation is expressible and a backend that does
-    /// not is a panic in the middle of a build.
+    /// `None` means wasm cannot express it at all (e.g. no `i64x2` saturating
+    /// add, no `i8x16.mul`), so the lifter must refuse the instruction. Lifter
+    /// and backend both consult this one table so they never disagree.
     pub fn wasm_opcode(self, lane: VLane) -> Option<u32> {
         use VLane::*;
         use VLaneBinOp::*;
@@ -1243,15 +1175,10 @@ impl VLaneBinOp {
 }
 
 impl VLaneUnOp {
-    /// The wasm SIMD opcode for this operation at this lane width, if wasm
-    /// has one.
+    /// The wasm SIMD opcode for this operation at this lane width.
     ///
-    /// `None` is not a gap to fill in the backend: it means wasm cannot
-    /// express the operation at all -- there is no `i64x2` saturating add,
-    /// no `i8x16.mul` -- so the lifter has to refuse the instruction and let
-    /// it become a precise SIGILL. Both crates ask this one table, because a
-    /// lifter that thinks an operation is expressible and a backend that does
-    /// not is a panic in the middle of a build.
+    /// `None` means wasm cannot express it at all, so the lifter must refuse
+    /// the instruction. Lifter and backend both consult this one table.
     pub fn wasm_opcode(self, lane: VLane) -> Option<u32> {
         use VLane::*;
         use VLaneUnOp::*;

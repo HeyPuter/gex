@@ -1,23 +1,11 @@
-// A fork-heavy pass over the Debian rootfs.
+// A fork-heavy pass over the Debian rootfs: one shell, many small commands.
 //
 //   node web/test/forkfest.mjs [name ...]
 //   GEX_FORKFEST_ROOTFS=busybox node web/test/forkfest.mjs
 //
-// Everything else here tests one thing at a time. This tests the shape real
-// software actually has: a shell starting programs, joining them with pipes,
-// substituting their output into its own command line, backgrounding them,
-// waiting for them and signalling them. `apt-get update` is forty processes
-// arranged that way, and when it fails the question is always which of the
-// forty arrangements broke -- which a single apt run cannot answer.
-//
-// So: one shell, many small commands, each judged by a marker the *guest*
-// prints. Never by an exit status alone, and never by a pattern that could
-// appear in the shell's echo of the command it was given -- that is how a
-// check passes with no guest running at all.
-//
-// The whole battery runs in one process tree, deliberately. A fresh boot per
-// case would hide exactly the faults this exists to find: state left behind
-// by process seventeen is what process eighteen trips over.
+// Each case is judged by a marker the *guest* prints, never by an exit status
+// or a pattern the command echo could satisfy. The battery runs in one process
+// tree on purpose: state one process leaves behind is what the next trips over.
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -71,29 +59,18 @@ class Term {
   type(t) { for (const f of this.keys.slice()) f(t); }
 }
 
-// The battery.
-//
-// `want` is a regular expression over what the command printed, and every one
-// of them is written so that the *command line* cannot satisfy it -- markers
-// are built by the shell from a status or a count, never quoted literally.
-// `skip` marks a case whose failure is already recorded elsewhere, so that a
-// known fault does not hide a new one behind it.
+// `want` matches what the command printed; each is built so the command line
+// itself cannot satisfy it -- markers come from a status or count, never a
+// literal.
 const CASES = [
   // -- the shapes a shell makes ------------------------------------------
   { name: 'exec', cmd: 'true; echo ex$?', want: /ex0/ },
   { name: 'exit-status', cmd: 'false; echo st$?', want: /st1/ },
   { name: 'pipeline-2', cmd: 'ls /bin | wc -l | tr -d " " | sed "s/^/n=/"', want: /n=[1-9]/ },
   {
-    // Six processes and a payload large enough that the head of the pipeline
-    // has to block on a full pipe -- `sort` reads to the end before it writes
-    // anything, so everything upstream of it stops.
-    //
-    // The input is `ls /bin`, not `/etc/services`. The file is a Debian one
-    // and BusyBox's rootfs has no such thing, so `grep` counted nothing, the
-    // marker demanded a non-zero count, and the case reported a failure that
-    // was entirely mine. It cost a bisect of the pipe code to find that out.
-    // What a battery meant to run against several rootfs may depend on is
-    // what all of them have.
+    // Six processes with a payload big enough that `sort` blocks on a full
+    // pipe. Input is `ls /bin`, not a Debian-only file, so it exists in every
+    // rootfs this may run against.
     name: 'pipeline-5',
     cmd: 'ls /bin | grep -v "^Z" | sort | uniq | wc -l | sed "s/^/five=/"',
     want: /five=[1-9]/,
@@ -132,8 +109,8 @@ const CASES = [
   // -- signals, which had no way to reach a parked process ---------------
   {
     name: 'kill-a-child',
-    // The child parks in a read that nothing will ever write to. Before
-    // signals could interrupt a wait this hung until the shell gave up.
+    // The child parks in a read nothing will write to; the signal must
+    // interrupt the wait.
     cmd: 'sh -c "read x < /dev/null; echo unreachable" & p=$!; kill -TERM $p 2>/dev/null; '
       + 'wait $p; echo killed=$?',
     want: /killed=\d/,
@@ -200,34 +177,20 @@ const rootfsName = process.env.GEX_FORKFEST_ROOTFS || 'debian';
 const only = process.argv.slice(2).filter((a) => !a.startsWith('-'));
 const cases = only.length ? CASES.filter((c) => only.includes(c.name)) : CASES;
 
-// The same battery as one shell line, for the host that matters.
+// The same battery as one shell line, for running against the page.
 //
 //   node web/test/forkfest.mjs --emit
 //   GEX_QUERY="cmd=$(node web/test/forkfest.mjs --emit)" node web/test/site.mjs debian-cmd
 //
-// Node runs this against the translator; the page runs it against the
-// statically recompiled closure, in Workers, which is what ships. Those are
-// different enough that a pass in one says little about the other -- the
-// whole of #101 was a fault only the browser had. One list, both hosts.
-//
-// The markers bracket each command so the output can be cut apart afterwards
-// and the *same* regular expressions applied. They carry no answer in
-// themselves: `FF>name` says a command started, not that it worked.
+// The markers bracket each command so the output can be cut apart and the same
+// regexes applied. They say a command started, not that it worked.
 if (process.argv.includes('--emit')) {
   const parts = cases.map(
     (c) => `echo FF-${c.name}-BEGIN; { ${c.cmd} ; } 2>&1; echo FF-${c.name}-END`,
   );
   const line = `${parts.join('; ')}; echo GEX-CMD-DONE`;
-  // Percent-encoded, because this goes into a *query string* and half the
-  // battery is made of characters a query string owns. `2>&1` ends the
-  // parameter at the ampersand, so the page received a command that stopped
-  // mid-redirect and bash answered
-  //
-  //     /cmd.sh: line 1: `echo FF-exec-BEGIN; { true; echo ex$? ; } 2>'
-  //
-  // which reads like a fault in the runtime and is a fault in the plumbing.
-  // `&` is also the backgrounding operator and `#` starts a fragment, so
-  // there is no subset of shell worth restricting the battery to.
+  // Percent-encoded: this goes into a query string, and `&` (redirect and
+  // background), `#` and others would otherwise truncate the command.
   process.stdout.write(`${process.argv.includes('--raw') ? line : encodeURIComponent(line)}\n`);
   process.exit(0);
 }
@@ -334,11 +297,8 @@ for (const c of cases) {
   const mark = term.out.length;
   const t0 = Date.now();
   term.type(`${c.cmd}\r`);
-  // Forty-five seconds, not two minutes. A case that wedges costs its whole
-  // cap and there are twenty-eight of them, so a generous bound turns one
-  // hang into an hour of nothing -- and the interesting part of a wedge is
-  // *that* it wedged, which forty-five seconds establishes as well as any
-  // larger number. A case that genuinely needs longer says so itself.
+  // 45s, not two minutes: with this many cases a generous cap would turn one
+  // hang into an hour. A case that needs longer sets `c.seconds` itself.
   const out = await prompt(mark, c.seconds ?? 45);
   const ms = Date.now() - t0;
   if (out === null) {
@@ -348,8 +308,7 @@ for (const c of cases) {
     if (died) break;
     continue;
   }
-  // Only what the command printed, with its own echo removed: the first line
-  // of the slice is the shell repeating what was typed.
+  // Drop the first line: the shell's echo of what was typed.
   const printed = out.slice(out.indexOf('\n') + 1);
   if (c.want.test(printed)) {
     pass += 1;

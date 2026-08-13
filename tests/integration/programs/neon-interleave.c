@@ -1,21 +1,8 @@
-/* `ld3`/`st3` and `ld4`/`st4`: three or four registers interleaved in memory.
- *
- *     ld4 {v4.16b-v7.16b}, [x4], #64
- *     st4 {v4.16b-v7.16b}, [x5], #64
- *     ld4 {v4.4s-v7.4s}, [x6]
- *
- * Memory holds lane 0 of every register, then lane 1 of every register, and
- * so on -- which is exactly how pixels are stored, so Mesa de-interleaves
- * RGBA with these. gex decoded `ld1` in one to four registers and `ld2`, but
- * not `ld3` or `ld4`: their opcodes were missing from the table, so the whole
- * instruction was unknown and the block ended in SIGILL.
- *
- * A single wasm shuffle reaches two vectors, so four sources need a tree of
- * them. The arrangements below are chosen to exercise every shape of that
- * tree: 16b needs four source vectors, 4s needs four, 8b needs two, and
- * `ld3` on 8b needs a trailing eight-byte access because 24 is not a whole
- * number of vectors.
- */
+/* `ld3`/`st3` and `ld4`/`st4`: three or four registers interleaved in memory
+ * (lane 0 of every register, then lane 1, ...), the RGBA de-interleave Mesa
+ * uses. Built from a tree of wasm shuffles, so the arrangements below exercise
+ * every shape of that tree -- including `ld3` on 8b, whose 24 bytes are not a
+ * whole number of vectors and need a trailing partial access. */
 #include <arm_neon.h>
 #include <stdio.h>
 #include <stdint.h>

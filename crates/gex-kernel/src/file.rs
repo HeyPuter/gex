@@ -61,31 +61,17 @@ impl OpenFile {
         self.offset.load(Ordering::Relaxed)
     }
 
-    /// Put the cursor where another process's copy of this description had
-    /// it. For a `fork` whose child is a different address space: the two
-    /// share an open-file description on Linux, and the nearest this can get
-    /// is starting the child's from the same place.
+    /// Put the cursor where another process's copy had it. A forked child is a
+    /// separate address space, so it cannot truly share the open-file
+    /// description; starting from the same offset is the nearest to it.
     pub fn set_offset(&self, at: u64) {
         self.offset.store(at, Ordering::Relaxed);
     }
 
-    /// Whether a `read` on this descriptor would have to wait.
-    ///
-    /// A descriptor opened `O_NONBLOCK` never waits -- it is asking for the
-    /// `EAGAIN` -- so it answers no however empty the stream is.
-    /// Whether a `write` on this descriptor has to be carried to completion
-    /// by the syscall layer rather than issued once.
-    ///
-    /// A blocking `write` to a pipe returns only when the whole buffer is in,
-    /// which is what every caller expects and what Linux does. The pipe
-    /// itself cannot deliver that -- it must not wait, because it runs with
-    /// the kernel locked and the reader needs that lock -- so it takes what
-    /// fits and says how much. Somebody has to do the rest, outside the lock.
-    ///
-    /// Leaving the short count to the caller looks defensible and is not: a
-    /// program that ignores it loses the tail of every large write silently.
-    /// dpkg piping a package into tar produced "this does not look like a tar
-    /// archive".
+    /// Whether a blocking `write` must be carried to completion by the syscall
+    /// layer rather than issued once. A pipe must not wait (it runs with the
+    /// kernel locked, and the reader needs that lock), so it takes what fits
+    /// and reports a short count; something outside the lock writes the rest.
     pub fn write_is_atomic(&self) -> bool {
         self.writable
             && self.flags.load(Ordering::Relaxed) & crate::fs::oflags::O_NONBLOCK == 0
@@ -199,13 +185,8 @@ impl OpenFile {
 pub struct FdTable {
     entries: Vec<Option<Arc<OpenFile>>>,
     cloexec: Vec<bool>,
-    /// Bumped by every change to the table.
-    ///
-    /// The same story as `MemoryMap::generation`: `/proc/self/fd` is served
-    /// from a snapshot, the snapshot listed every descriptor and cloned every
-    /// path before each syscall, and a guest opens files a few thousand times
-    /// while making millions of syscalls. A counter turns the rebuild into a
-    /// comparison.
+    /// Bumped by every change, so `/proc/self/fd` can skip rebuilding its
+    /// listing when nothing changed -- as `MemoryMap::generation` does.
     generation: u64,
 }
 
@@ -282,11 +263,8 @@ impl FdTable {
         Ok(fd as u64)
     }
 
-    /// Drop every descriptor, as the kernel does when a process dies.
-    ///
-    /// What matters is not the tidiness: a pipe end held by a process nobody
-    /// will ever reap keeps the pipe open, and whoever is reading the other
-    /// end waits for an end of file that cannot come.
+    /// Drop every descriptor, as the kernel does when a process dies. A pipe
+    /// end left open would leave a reader waiting for an EOF that never comes.
     pub fn close_all(&mut self) {
         self.generation += 1;
         self.entries.clear();
@@ -294,11 +272,8 @@ impl FdTable {
     }
 
     /// Close (or mark close-on-exec) every open descriptor in `[first, last]`.
-    ///
-    /// `close_range` does not fault on the gaps -- a range that spans closed
-    /// descriptors is the ordinary case, since the whole point of it is "shut
-    /// everything from here up" without the caller knowing which are open.
-    /// `posix_spawn` and daemons that sanitise their descriptors use it.
+    /// Gaps in the range are skipped, not faulted -- the point is "shut
+    /// everything from here up" without knowing which are open.
     pub fn close_range(&mut self, first: u32, last: u32, cloexec_only: bool) {
         self.generation += 1;
         let hi = (last as usize).min(self.entries.len().saturating_sub(1));
@@ -340,10 +315,9 @@ impl FdTable {
     }
 
     pub fn cloexec(&self, fd: i32) -> Result<bool, Errno> {
-        // A closed descriptor still has a slot in the flag vector, so the
-        // entry has to be checked too -- otherwise `F_GETFD` answers for a
-        // descriptor that is not there, which is how a program decides an
-        // `execve` failed to close what it asked to be closed.
+        // A closed descriptor still has a slot in the flag vector, so check
+        // the entry too -- otherwise `F_GETFD` answers for a descriptor that
+        // is not there.
         if fd < 0
             || fd as usize >= self.cloexec.len()
             || self.entries.get(fd as usize).is_none_or(|e| e.is_none())
@@ -368,12 +342,10 @@ impl FdTable {
         self.generation
     }
 
-    /// Every open descriptor, with its description.
-    ///
-    /// What `fork` needs when the child is another address space: the table
-    /// cannot be cloned there, because a cloned `Arc` names a memory the
-    /// child does not have. So the child is sent a *description* of each
-    /// descriptor and rebuilds it -- see `gex_fork_fds` in the browser shim.
+    /// Every open descriptor, with its description. `fork` needs this when the
+    /// child is a separate address space: a cloned `Arc` names a memory the
+    /// child lacks, so it is sent a description of each fd and rebuilds it
+    /// (`gex_fork_fds` in the browser shim).
     pub fn entries(&self) -> Vec<(i32, Arc<OpenFile>, bool)> {
         self.entries
             .iter()
@@ -413,11 +385,8 @@ pub struct PipeEnd {
 }
 
 impl FileHandle for PipeEnd {
-    /// A pipe with nothing in it is not readable, whatever the default says.
-    ///
-    /// The default is "yes", which is right for a file and wrong here, and it
-    /// is what a `select` on an empty pipe was told: ready, read nothing, ask
-    /// again. apt waits for its download helper's greeting exactly that way.
+    /// An empty pipe is not readable -- the trait default "yes" is right for a
+    /// file and wrong here, and a `select` on it would spin ready/read-nothing.
     fn poll_readable(&self) -> bool {
         self.write || self.pipe.readable()
     }
