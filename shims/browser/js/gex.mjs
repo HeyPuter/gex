@@ -2240,6 +2240,23 @@ export class Gex {
     await this.attach(shimWasm, guestWasm, { devices: false });
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
+    // Install every module the process has already translated into this
+    // Worker's own dispatch tables BEFORE it runs a single instruction.
+    //
+    // A thread's funcref tables are its own -- a wasm table is not shareable --
+    // while the directory that says which slot a page lives in is in the
+    // shared memory and already written by the Workers that came before. So a
+    // fresh thread enters `__clone`'s child trampoline, `blr`s into musl's
+    // thread `start` (a page main translated long ago), and dispatches through
+    // the shared directory to a slot its *own* table has never filled. On-
+    // demand catch-up on the next trap was racing the branch: whichever
+    // threads reached an already-translated page before catching up stalled
+    // there -- runnable but idle -- and the process deadlocked on the join of
+    // one that never ran. Which threads lost varied run to run, and the double
+    // thread-adoption was a retry papering over it. Catching up here, once,
+    // makes the first run deterministic: the tables hold what the directory
+    // names before any branch consults it.
+    await this.#catchUp();
     return { entry, ctx: Number(thread.ctx) };
   }
 

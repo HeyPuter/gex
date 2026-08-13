@@ -649,8 +649,19 @@ export class ProcessHost {
           }),
           );
         };
-        w2.addEventListener?.('message', (e) => start(e.data));
-        w2.on?.('message', start);
+        // Deliberately NOT registered as a second message listener. A thread's
+        // `ready` is already routed through `#onMessage` by `deliver` above --
+        // it finds this thread in `#pending` (keyed `pid:tid`, the argument
+        // `#onMessage` reads as the pid) and sends the start message, once.
+        // Registering `start` as well sent it twice, so the Worker ran
+        // `gex.run` twice on one thread: two interleaved loops sharing one set
+        // of guest registers, each advancing sp past the other's, and now and
+        // then a thread loaded a stack word where `__clone` had put its start
+        // function and branched into it. That double-adoption was a crutch for
+        // a startup race since fixed in `Gex.adoptThread` (a thread now
+        // installs the process's modules before it runs), and with the race
+        // gone the second run only corrupts. One record, one path, one start.
+        void start;
         break;
       }
       case 'stdin': {
