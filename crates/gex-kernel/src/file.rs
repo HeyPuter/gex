@@ -293,6 +293,29 @@ impl FdTable {
         self.cloexec.clear();
     }
 
+    /// Close (or mark close-on-exec) every open descriptor in `[first, last]`.
+    ///
+    /// `close_range` does not fault on the gaps -- a range that spans closed
+    /// descriptors is the ordinary case, since the whole point of it is "shut
+    /// everything from here up" without the caller knowing which are open.
+    /// `posix_spawn` and daemons that sanitise their descriptors use it.
+    pub fn close_range(&mut self, first: u32, last: u32, cloexec_only: bool) {
+        self.generation += 1;
+        let hi = (last as usize).min(self.entries.len().saturating_sub(1));
+        for fd in (first as usize)..=hi {
+            if self.entries.get(fd).is_none_or(|e| e.is_none()) {
+                continue;
+            }
+            if cloexec_only {
+                if fd < self.cloexec.len() {
+                    self.cloexec[fd] = true;
+                }
+            } else {
+                self.entries[fd] = None;
+            }
+        }
+    }
+
     pub fn close(&mut self, fd: i32) -> Result<(), Errno> {
         self.generation += 1;
         if fd < 0 {

@@ -137,6 +137,9 @@ pub mod nr {
     pub const EPOLL_CREATE1: u64 = 20;
     pub const EPOLL_CTL: u64 = 21;
     pub const EPOLL_PWAIT: u64 = 22;
+    pub const EPOLL_PWAIT2: u64 = 441;
+    pub const CLOSE_RANGE: u64 = 436;
+    pub const MEMBARRIER: u64 = 283;
     pub const CONNECT: u64 = 203;
     pub const GETSOCKNAME: u64 = 204;
     pub const GETPEERNAME: u64 = 205;
@@ -1553,22 +1556,37 @@ impl Kernel {
             // at once turned every event loop into a spin. Xwayland's is the
             // one that showed it: it made progress, but only when the timing
             // happened to suit it.
-            nr::EPOLL_PWAIT => {
+            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => {
                 let set = self.epoll_of(a[0] as i32).ok()?;
                 let fds = self.epoll_pollfds(&set);
                 if poll_ready(&fds) {
                     return None;
                 }
-                // The timeout is milliseconds here rather than a `timespec`,
-                // and negative means wait forever.
-                let millis = a[3] as i32;
-                if millis == 0 {
-                    return None;
-                }
-                let deadline = if millis < 0 {
-                    None
+                // `epoll_pwait` takes the timeout as a millisecond count with a
+                // negative for "forever"; `epoll_pwait2` takes a `timespec`
+                // pointer instead, null for "forever". Both fold to the same
+                // deadline, and a zero timeout is a non-blocking poll either way.
+                let deadline = if n == nr::EPOLL_PWAIT2 {
+                    if a[3] == 0 {
+                        None // null timespec: wait forever
+                    } else {
+                        let secs = m.read_u64(a[3]).ok()?;
+                        let nanos = m.read_u64(a[3] + 8).ok()?;
+                        if secs == 0 && nanos == 0 {
+                            return None; // {0,0}: non-blocking
+                        }
+                        Some(std::time::Duration::new(secs, (nanos % 1_000_000_000) as u32))
+                    }
                 } else {
-                    Some(std::time::Duration::from_millis(millis as u64))
+                    let millis = a[3] as i32;
+                    if millis == 0 {
+                        return None;
+                    }
+                    if millis < 0 {
+                        None
+                    } else {
+                        Some(std::time::Duration::from_millis(millis as u64))
+                    }
                 };
                 Some(BlockOp::Poll {
                     fds,
@@ -2027,7 +2045,9 @@ impl Kernel {
             nr::FALLOCATE => self.sys_fallocate(a[0] as i32, a[1], a[2], a[3]),
             nr::EPOLL_CREATE1 => self.sys_epoll_create(a[0]),
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
-            nr::EPOLL_PWAIT => self.sys_epoll_wait(m, a[0] as i32, a[1], a[2] as u32),
+            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.sys_epoll_wait(m, a[0] as i32, a[1], a[2] as u32),
+            nr::CLOSE_RANGE => self.sys_close_range(a[0], a[1], a[2]),
+            nr::MEMBARRIER => self.sys_membarrier(a[0]),
             // No listening, though: a page cannot be connected to.
             nr::SET_TID_ADDRESS => {
                 self.clear_child_tid = a[0];
@@ -4229,6 +4249,33 @@ impl Kernel {
         Ok(0)
     }
 
+    /// `close_range`: shut every open descriptor in a span at once.
+    fn sys_close_range(&mut self, first: u64, last: u64, flags: u64) -> SysResult {
+        // `CLOSE_RANGE_CLOEXEC` marks the span close-on-exec instead of closing
+        // it now; `CLOSE_RANGE_UNSHARE` asks for a private descriptor table
+        // first, which is a no-op here because a process already has its own.
+        const CLOSE_RANGE_CLOEXEC: u64 = 4;
+        if first > last {
+            return Err(Errno::EINVAL);
+        }
+        self.fds
+            .close_range(first as u32, last as u32, flags & CLOSE_RANGE_CLOEXEC != 0);
+        Ok(0)
+    }
+
+    /// `membarrier`: force a memory barrier across the process's threads.
+    ///
+    /// A no-op that succeeds. Every gex thread runs against one shared linear
+    /// memory and the runtime already emits the atomic accesses the guest asks
+    /// for, so there is no per-thread view to reconcile -- which is the whole
+    /// job of this call. The `MEMBARRIER_CMD_QUERY` (cmd 0) case returns the
+    /// bitmask of supported commands, and reporting none is honest and is what
+    /// a caller that falls back to a heavier barrier expects.
+    fn sys_membarrier(&mut self, cmd: u64) -> SysResult {
+        let _ = cmd;
+        Ok(0)
+    }
+
     /// `epoll_create1`.
     fn sys_epoll_create(&mut self, flags: u64) -> SysResult {
         const EPOLL_CLOEXEC: u64 = 0o2000000;
@@ -5304,6 +5351,9 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::EPOLL_CREATE1 => "epoll_create1",
         nr::EPOLL_CTL => "epoll_ctl",
         nr::EPOLL_PWAIT => "epoll_pwait",
+        nr::EPOLL_PWAIT2 => "epoll_pwait2",
+        nr::CLOSE_RANGE => "close_range",
+        nr::MEMBARRIER => "membarrier",
         nr::ACCEPT => "accept",
         nr::GETSOCKNAME => "getsockname",
         nr::GETPEERNAME => "getpeername",
