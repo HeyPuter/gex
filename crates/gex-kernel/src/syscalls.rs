@@ -130,6 +130,7 @@ pub mod nr {
     pub const MEMFD_CREATE: u64 = 279;
     pub const FLOCK: u64 = 32;
     pub const FALLOCATE: u64 = 47;
+    pub const EVENTFD2: u64 = 19;
     pub const EPOLL_CREATE1: u64 = 20;
     pub const EPOLL_CTL: u64 = 21;
     pub const EPOLL_PWAIT: u64 = 22;
@@ -1853,6 +1854,7 @@ impl Kernel {
             nr::DUP => self.sys_dup(a[0] as i32),
             nr::DUP3 => self.sys_dup3(a[0] as i32, a[1] as i32, a[2]),
             nr::PIPE2 => self.sys_pipe2(m, a[0], a[1]),
+            nr::EVENTFD2 => self.sys_eventfd2(a[0], a[1]),
             nr::GETDENTS64 => self.sys_getdents(m, a[0] as i32, a[1], a[2]),
             nr::FSTAT => self.sys_fstat(m, a[0] as i32, a[1]),
             nr::NEWFSTATAT => self.sys_fstatat(m, a[0] as i32, a[1], a[2], a[3]),
@@ -2568,6 +2570,26 @@ impl Kernel {
         let from = self.at_path(m, a[0] as i32, a[1])?;
         let to = self.at_path(m, a[2] as i32, a[3])?;
         self.vfs.link(&from, &to).map(|_| 0)
+    }
+
+    /// `eventfd2`: a counting descriptor an event loop pokes to wake itself.
+    ///
+    /// One descriptor, readable and writable, over a single `EventFd`. The
+    /// `EFD_NONBLOCK`/`EFD_CLOEXEC` flags are `O_NONBLOCK`/`O_CLOEXEC` by
+    /// another name, so they go straight into the open flags and the
+    /// close-on-exec bit; only `EFD_SEMAPHORE` changes the object.
+    fn sys_eventfd2(&mut self, initval: u64, flags: u64) -> SysResult {
+        use crate::eventfd::{flags as efd, EventFd};
+        let handle = Arc::new(EventFd::new(initval, flags & efd::SEMAPHORE != 0));
+        let cloexec = flags & oflags::O_CLOEXEC != 0;
+        let file = OpenFile::new(
+            handle,
+            "anon_inode:[eventfd]".to_string(),
+            (flags & oflags::O_NONBLOCK) | oflags::O_RDWR,
+            true,
+            true,
+        );
+        self.fds.insert(file, cloexec)
     }
 
     fn sys_pipe2(&mut self, m: &mut GuestMem<'_>, fds: u64, flags: u64) -> SysResult {
@@ -5133,6 +5155,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::OPENAT => "openat",
         nr::CLOSE => "close",
         nr::PIPE2 => "pipe2",
+        nr::EVENTFD2 => "eventfd2",
         nr::GETDENTS64 => "getdents64",
         nr::LSEEK => "lseek",
         nr::READ => "read",

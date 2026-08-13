@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod errno;
+pub mod eventfd;
 pub mod file;
 pub mod fs;
 pub mod futex;
