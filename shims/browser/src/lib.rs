@@ -10775,18 +10775,18 @@ pub extern "C" fn gex_jit_pending_slots() -> u32 {
 /// The module JS has to instantiate, or zero length if there is none.
 #[no_mangle]
 pub extern "C" fn gex_jit_pending_ptr() -> u32 {
-    PENDING[0].load(std::sync::atomic::Ordering::Relaxed)
+    PENDING.with(|p| p[0].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 #[no_mangle]
 pub extern "C" fn gex_jit_pending_len() -> u32 {
-    PENDING[1].load(std::sync::atomic::Ordering::Relaxed)
+    PENDING.with(|p| p[1].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// How many slots the dispatch table must hold for the pending module.
 #[no_mangle]
 pub extern "C" fn gex_jit_slots() -> u32 {
-    PENDING[2].load(std::sync::atomic::Ordering::Relaxed)
+    PENDING.with(|p| p[2].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Where a translated block belongs: the table in the top eight bits, the
@@ -11188,8 +11188,21 @@ static EXITED: std::sync::atomic::AtomicBool =
 ///
 /// Written wherever the queue is, read without a borrow. Three words that
 /// only the kernel writes and only JS reads need no more than that.
-static PENDING: [std::sync::atomic::AtomicU32; 3] =
-    [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+///
+/// Thread-local, not a shared static, and that is the whole point of it here:
+/// `Jit::pending` lives in the thread-local `Host`, so every Worker has a queue
+/// of its own, and the front this publishes is one queue's. A single shared
+/// slot let two Workers translating at the same moment overwrite each other's
+/// `(ptr, len, slots)` between the JS `while (gex_jit_pending_len())` check and
+/// the `gex_jit_pending_ptr()` read a microtask later -- so the loser sliced
+/// the winner's bytes, or an emptied slot, and it reached `WebAssembly.compile`
+/// as "BufferSource argument is empty", killing the thread and with it the
+/// process it was joined into. Each export reads its own TLS because the export
+/// runs on the Worker whose queue it is asking about.
+thread_local! {
+    static PENDING: [std::sync::atomic::AtomicU32; 3] =
+        const { [const { std::sync::atomic::AtomicU32::new(0) }; 3] };
+}
 
 /// Republish the head of the queue. Call after every push and pop.
 fn publish_pending(h: &Host) {
@@ -11215,9 +11228,11 @@ fn publish_pending(h: &Host) {
     let (p, l, s) = h.jit.pending.front().map_or((0, 0, 0), |m| {
         (m.wasm.as_ptr() as u32, m.wasm.len() as u32, m.slots as u32)
     });
-    PENDING[0].store(p, std::sync::atomic::Ordering::Relaxed);
-    PENDING[1].store(l, std::sync::atomic::Ordering::Relaxed);
-    PENDING[2].store(s, std::sync::atomic::Ordering::Relaxed);
+    PENDING.with(|pending| {
+        pending[0].store(p, std::sync::atomic::Ordering::Relaxed);
+        pending[1].store(l, std::sync::atomic::Ordering::Relaxed);
+        pending[2].store(s, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 /// How many translated modules this process has, for a Worker catching up.

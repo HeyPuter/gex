@@ -560,7 +560,21 @@ async function handle(msg) {
     //
     // 134 is what a shell reports for a process killed by `SIGABRT`, which is
     // the nearest true thing to say about a fault.
-    ex.gex_process_gone?.(134);
+    //
+    // But only for a *process* Worker, never a thread's. `gex_process_gone`
+    // sets the process-wide `EXITED` flag and calls `procs.exit`, and a thread
+    // reaching here has merely finished -- the process lives on in its other
+    // Workers. Calling it anyway let the first thread to exit mark the whole
+    // process gone: every sibling then read `gex_exited()` true and stopped
+    // resuming, so a thread whose Worker had started a moment later was
+    // stranded `runnable` forever and the main thread hung joining it. Which
+    // thread lost the race varied run to run. A thread's own exit already did
+    // the one thing a joiner needs -- cleared its `child_tid` and woke the
+    // futex -- back in the guest's `exit` syscall; a thread that *faults*
+    // throws out of `gex.run` and is handled by the Worker's error path, never
+    // reaching here. Process teardown belongs to the main Worker, whose
+    // `gex.run` returns when the guest calls `exit_group`.
+    if (msg.kind !== 'thread') ex.gex_process_gone?.(134);
     // `close` before the reporting, not after: it drops the tick channel,
     // which is a live handle that would otherwise keep a Node Worker up.
     gex.close?.();

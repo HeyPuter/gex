@@ -629,6 +629,18 @@ export class ProcessHost {
             closureCount: (this.#extra?.closure ?? []).length,
             kind: 'thread',
             tid: m.thread.tid,
+            // The registers the thread enters on, which the parent worked out
+            // in `#drainThread` and every other field here is forwarded but
+            // these two were not. `adoptThread` re-derives the entry pc from
+            // `gex_adopt_thread(tid)`, so a dropped `pc` was invisible -- but
+            // `ctx` has no such fallback: it arrived as `undefined`, became
+            // `Number(undefined)` = NaN, and `enter(ctx, pc)` coerced NaN to
+            // 0, so the thread read its registers from guest address 0 and
+            // branched through a zeroed x30 to `pc=0x0`. Every guest thread
+            // died at its first instruction, which read as the process simply
+            // never making progress.
+            ctx: m.thread.ctx,
+            pc: m.thread.pc,
             memory: m.thread.memory,
             kernelStack: this.#nextKernelStack(key),
             shim: shimMod,
