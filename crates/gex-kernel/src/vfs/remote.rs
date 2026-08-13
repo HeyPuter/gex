@@ -70,8 +70,11 @@ pub struct Remote {
     pub mksocket: extern "C" fn(path: u32, path_len: u32) -> i32,
 }
 
-/// How many bytes a serialised [`Metadata`] takes.
-pub const META_BYTES: usize = 32;
+/// How many bytes a serialised [`Metadata`] takes. Both the kernel module (which
+/// encodes) and the shim (which decodes) compile from this file, so the two
+/// agree by construction -- but they are separate wasm artefacts, so a change
+/// here means rebuilding *both* or they will read past/short of each other.
+pub const META_BYTES: usize = 36;
 
 /// `Metadata` as bytes, in the one layout both modules read.
 pub fn encode_meta(m: &Metadata) -> [u8; META_BYTES] {
@@ -81,6 +84,7 @@ pub fn encode_meta(m: &Metadata) -> [u8; META_BYTES] {
     out[8..16].copy_from_slice(&m.size.to_le_bytes());
     out[16..24].copy_from_slice(&m.ino.to_le_bytes());
     out[24..32].copy_from_slice(&m.mtime.to_le_bytes());
+    out[32..36].copy_from_slice(&m.nlink.to_le_bytes());
     out
 }
 
@@ -99,7 +103,7 @@ pub fn decode_meta(b: &[u8]) -> Metadata {
         size: u64at(8),
         ino: u64at(16),
         mtime: u64at(24) as i64,
-        nlink: 1,
+        nlink: u32at(32).max(1),
     }
 }
 
