@@ -1715,6 +1715,12 @@ struct Jit {
     /// joining Worker instantiates these into its own tables to catch up. Order
     /// matters: each module's page assignments seed the next's.
     registry: Vec<Vec<u8>>,
+    /// Whether this process has ever run a second thread-Worker. The registry
+    /// exists only so a joining Worker can catch up; a single-threaded process
+    /// never gains one, so retaining its modules is pure loss against a fixed
+    /// ~2 GiB heap. Set once at the first `SpawnThread` and never cleared while
+    /// the program lives, because the join can come long after the modules.
+    ever_threaded: bool,
     /// Slots that code of a given identity was translated into, system-wide.
     /// Keyed by page address and byte identity (file, offset, mapping length),
     /// so two processes mapping the same library at the same address share the
@@ -2951,6 +2957,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
                 translated: Default::default(),
                 registry: Vec::new(),
+                ever_threaded: false,
                 shared: Default::default(),
                 installed_mods: Default::default(),
                 reuse_have: 0,
@@ -4806,6 +4813,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     waiting: Waiting::Elsewhere,
                     blocked_on: None,
                 });
+                // From here the process has a second Worker, so translated
+                // modules must be kept for it to catch up. Until now they were
+                // not (see `gex_jit_installed`).
+                h.jit.ever_threaded = true;
                 stage_thread(tid, ctx_addr, start);
                 // The stack goes back so the host can see the record and
                 // start the Worker, exactly as a `fork` does. The parent
@@ -5681,6 +5692,7 @@ pub extern "C" fn gex_adopt_child(
             page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
             translated: Default::default(),
             registry: Vec::new(),
+            ever_threaded: false,
             shared: Default::default(),
             installed_mods: Default::default(),
             reuse_have: 0,
@@ -9205,23 +9217,34 @@ pub extern "C" fn gex_jit_installed() {
             dir_note(page, base, "install-done");
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
         }
-        // Kept, only under the shared build: a dispatch table belongs to a
-        // module instance, so a Worker joining this process must instantiate
-        // every translated module into its own tables to catch up. Against a
-        // plain memory there are no other Workers and keeping the bytes is pure
-        // loss -- a large one, since the heap is a fixed ~2 GiB. Under sharing
-        // it is a ceiling on how much a threaded process may translate.
+        // Kept only for a process that has run a second thread-Worker: the
+        // registry exists solely so a joining Worker can instantiate every
+        // translated module into its own tables to catch up. A single-threaded
+        // process -- which every `apt` process is -- never gains one, so
+        // keeping the bytes is pure loss against a fixed ~2 GiB heap.
+        //
+        // This is the regression the OOM was: before threads-as-Workers the
+        // page loaded the plain build, where this push was `#[cfg]`'d out and
+        // nothing was ever kept; the shared build kept it for *every* process,
+        // and `apt-get update` under `?closure=0` filled the heap with ~1,640
+        // one-MiB modules in a single process and aborted. A joining thread now
+        // replays what was kept from the moment it spawned and translates the
+        // rest on the ordinary miss path, which is exactly what a fresh process
+        // does -- so a plain, single-threaded run keeps nothing, as it did
+        // before sharing existed.
         //
         // Shrunk before keeping: `encode_with_custom` starts each module at a
         // 1 MiB capacity, and a batch averages ~26 KB, so a retained module
         // held a megabyte for twenty-six kilobytes.
-        let mut wasm = done.wasm;
-        wasm.shrink_to_fit();
-        // Counted for the arena report (which cannot borrow the host, running
-        // in the allocator's refill path). Nothing trims `registry`.
-        #[cfg(feature = "shared-memory")]
-        REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        h.jit.registry.push(wasm);
+        if h.jit.ever_threaded {
+            let mut wasm = done.wasm;
+            wasm.shrink_to_fit();
+            // Counted for the arena report (which cannot borrow the host,
+            // running in the allocator's refill path). Nothing trims `registry`.
+            #[cfg(feature = "shared-memory")]
+            REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            h.jit.registry.push(wasm);
+        }
         publish_pending(h);
     });
 }
