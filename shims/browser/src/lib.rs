@@ -8167,6 +8167,14 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
         );
         for (i, t) in h.threads.iter().enumerate() {
             s.push_str(&format!(" t{i}={}@{:#x}", waiting_name(&t.waiting), t.pc));
+            // The LIVE pc from the context, not `t.pc` (which only updates on a
+            // block): a `runnable` thread stuck at t.pc=entry is really spinning
+            // somewhere, and the last safepoint wrote its real pc here.
+            if matches!(t.waiting, Waiting::Runnable) {
+                let gm = GuestMem::new(guest_bytes());
+                let live = gm.read_u64(t.kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                s.push_str(&format!("[live={live:#x}]"));
+            }
             // A name says a thread is in `read`; it does not say what it is
             // reading, which is the whole question when two processes are
             // waiting for each other.
