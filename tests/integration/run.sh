@@ -507,6 +507,7 @@ echo "building guest programs..."
 "$CC" -static -O2 -o "$WORK/priority" "$HERE/programs/priority.c"
 "$CC" -static -O2 -o "$WORK/renameat2" "$HERE/programs/renameat2.c"
 "$CC" -static -O2 -o "$WORK/sendfile" "$HERE/programs/sendfile.c"
+"$CC" -static -O2 -o "$WORK/openat2" "$HERE/programs/openat2.c"
 "$CC" -static -no-pie -O3 -o "$WORK/vector" "$HERE/programs/vector.c"
 # -O2: these are intrinsics, and -O3 lets gcc constant-fold half of them away.
 "$CC" -static -no-pie -O2 -o "$WORK/neon3" "$HERE/programs/neon3.c"
@@ -626,6 +627,7 @@ compare "sigpending" "$WORK/sigpending"
 compare "priority" "$WORK/priority"
 compare "renameat2" "$WORK/renameat2"
 compare "sendfile" "$WORK/sendfile"
+compare "openat2" "$WORK/openat2"
 for mode in fatal-default fatal-abort; do
     compare --ignore-stderr "signal-$mode" "$WORK/signals" "$mode"
 done

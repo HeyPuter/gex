@@ -47,6 +47,7 @@ pub mod nr {
     pub const FCHMOD: u64 = 52;
     pub const FCHMODAT: u64 = 53;
     pub const OPENAT: u64 = 56;
+    pub const OPENAT2: u64 = 437;
     pub const CLOSE: u64 = 57;
     pub const PIPE2: u64 = 59;
     pub const GETDENTS64: u64 = 61;
@@ -624,6 +625,7 @@ fn set_id(slot: &mut u32, want: u64) -> SysResult {
 fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
     let at = match n {
         nr::OPENAT
+        | nr::OPENAT2
         | nr::NEWFSTATAT
         | nr::FACCESSAT
         | nr::FACCESSAT2
@@ -1878,6 +1880,7 @@ impl Kernel {
                 self.sys_copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32)
             }
             nr::OPENAT => self.sys_openat(m, a[0] as i32, a[1], a[2], a[3] as u32),
+            nr::OPENAT2 => self.sys_openat2(m, a[0] as i32, a[1], a[2], a[3]),
             nr::CLOSE => self.sys_close(a[0] as i32),
             nr::LSEEK => self
                 .fds
@@ -2733,6 +2736,39 @@ impl Kernel {
         let writable = acc == oflags::O_WRONLY || acc == oflags::O_RDWR;
         let file = OpenFile::new(handle, p, flags, readable, writable);
         self.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
+    }
+
+    /// `openat2(dirfd, path, how, size)`: `openat` with an extensible
+    /// `open_how` struct { u64 flags; u64 mode; u64 resolve } instead of a bare
+    /// flags word.
+    ///
+    /// `resolve` is the reason a program reaches for this syscall specifically:
+    /// RESOLVE_BENEATH / RESOLVE_IN_ROOT / RESOLVE_NO_SYMLINKS pin path lookup
+    /// inside a subtree, which is how a sandbox keeps a lookup from escaping.
+    /// This VFS cannot enforce that per-open, and the one thing worse than not
+    /// offering containment is offering it falsely -- so any non-zero `resolve`
+    /// gets EINVAL rather than an open that silently ignored the constraint.
+    /// `resolve == 0` is ordinary resolution and routes to the `openat` path.
+    fn sys_openat2(
+        &mut self,
+        m: &GuestMem<'_>,
+        dirfd: i32,
+        path: u64,
+        how: u64,
+        size: u64,
+    ) -> SysResult {
+        // The struct is versioned by length; Linux rejects one shorter than the
+        // first defined version (three u64s = 24 bytes).
+        if size < 24 {
+            return Err(Errno::EINVAL);
+        }
+        let flags = m.read_u64(how)?;
+        let mode = m.read_u64(how + 8)? as u32;
+        let resolve = m.read_u64(how + 16)?;
+        if resolve != 0 {
+            return Err(Errno::EINVAL);
+        }
+        self.sys_openat(m, dirfd, path, flags, mode)
     }
 
     fn sys_dup(&mut self, fd: i32) -> SysResult {
@@ -5462,6 +5498,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::FCHMOD => "fchmod",
         nr::FCHMODAT => "fchmodat",
         nr::OPENAT => "openat",
+        nr::OPENAT2 => "openat2",
         nr::CLOSE => "close",
         nr::PIPE2 => "pipe2",
         nr::EVENTFD2 => "eventfd2",
