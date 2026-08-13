@@ -1,77 +1,31 @@
-// The browser runtime: instantiate the shim and a guest module against one
-// memory, and run.
-//
-// The shim is `gex-kernel` compiled to wasm. It imports the same memory the
-// guest module does, so a syscall reads the guest's buffers where they lie --
-// JS is not in the path of a `write`, only of the console it ends up on.
-//
-// Works unchanged in a browser; `run-node.mjs` beside it is the Node entry.
+// The browser runtime: instantiate the shim (gex-kernel compiled to wasm) and
+// a guest module against one memory, and run. The shim imports the guest's
+// memory, so a syscall reads guest buffers in place. `run-node.mjs` is the
+// Node entry.
 
-// How far a process's memory may grow, and what it is allocated with. The
-// second is the number that matters: there is one memory per process, and it
-// is paid for the moment the process exists. See
+// How far a process's memory may grow. One memory per process. See
 // `gex_abi::GUEST_MEM_INITIAL_BYTES`.
 const GUEST_BYTES = 0xffff0000;
 
 /**
  * Decode UTF-8 out of guest memory.
  *
- * `TextDecoder.decode` refuses a view backed by a `SharedArrayBuffer` --
- * "The provided ArrayBufferView value must not be shared" -- because the
- * bytes could change under it mid-decode. Every string the runtime reads out
- * of a guest is such a view, so with a shared memory the first one thrown is
- * the first message anything tries to print, and the process dies inside its
- * own logging.
- *
- * A copy is the whole fix. `slice` gives a Uint8Array over an ordinary
- * buffer; it is only paid when the memory really is shared, which keeps the
- * plain build exactly as it was.
+ * `TextDecoder.decode` refuses a `SharedArrayBuffer`-backed view, so a shared
+ * memory needs the `slice` copy; it is only paid when the memory is shared.
  */
 const DECODER = new TextDecoder();
 export function utf8(view) {
   return DECODER.decode(view.buffer instanceof SharedArrayBuffer ? view.slice() : view);
 }
 const GUEST_INITIAL_BYTES = 0x05000000;
-// The shim's world starts where the guest's ends (`STACK_TOP`); its stack sits
-// at the bottom of that, below its data.
+// The shim's stack sits at the bottom of its region, below its data.
 const SHIM_STACK_TOP = 0x04800000;
-// Everything below the guest's image: the reserved low region, the per-thread
-// register contexts, and the dispatch directory. It is not in the memory map,
-// so a forked child that copied only the mapped regions would arrive with no
-// context to enter and no directory to dispatch through.
-//
-// `DISPATCH_DIR + DISPATCH_MAX_PAGES * 4`, from `gex_abi`.
-// Where the directory itself starts: one `u32` per 4 KiB guest page, holding
-// the packed table index and slot a branch into that page dispatches to.
-// How many traps a forked child takes before it gives up on being an
-// `execve` and takes its parent's modules in bulk. Zero or one is the old
-// eager behaviour, deferred by a trap.
-// Read where it is used, not here.
-//
-// As a module-level constant this was evaluated when the module was first
-// imported, which is before the page has had a chance to set the global --
-// so `?adopt=0` selected nothing and every run that was supposed to be
-// comparing eager against deferred was comparing deferred against itself.
-// Three bisect conclusions were drawn from that before the bug was noticed.
 /**
- * Whether a fork hands the child its parent's compiled modules.
+ * Whether a fork hands the child its parent's compiled modules (default 1).
+ * `?forkmods=0` sends none and the child recompiles what it branches into.
  *
- * One -- it does, which is the behaviour every measurement to date was
- * taken against. `?forkmods=0` sends none, and the child compiles what it
- * branches into from the shim registry it inherited in the image.
- *
- * The reason for the switch: `#compiled` is unbounded and grows to 3,227
- * modules in one long-lived shell, and every fork structured-clones the
- * whole array to the host and again to the child. `apt update` dies of a
- * V8 JavaScript OOM at ~58 processes with a 166 MB heap. Sending none
- * trades compile time for memory, and #106/#108 measured large startup
- * wins from sharing, so the trade has to be measured rather than assumed.
- * See task 145.
- *
- * A function, not a module constant: a constant is evaluated at import,
- * before the page sets the global, which is how `?adopt=0` silently
- * selected nothing and three bisect conclusions were drawn from runs that
- * were comparing a setting against itself.
+ * A function, not a module constant: a constant evaluates at import, before
+ * the page sets the global.
  */
 function forkModules() {
   const v = globalThis.GEX_FORK_MODULES;
@@ -2336,7 +2290,24 @@ export class Gex {
       // at all while inheriting a directory that names its grandparent's
       // slots. The chain has to carry what was inherited as well as what was
       // built, or deferring once breaks every descendant.
-      modules: forkModules() ? [...this.#inherited, ...this.#compiled] : [],
+      //
+      // And `#lazyInherited` too, which is the third place a module can be:
+      // once `#maybeAdopt` runs, a child moves its inherited modules OUT of
+      // `#inherited` and into `#lazyInherited` (registered, instantiated on
+      // demand). Neither list above then holds them, so a grandchild forked
+      // after adoption inherited the parent's *directory* but none of the
+      // *modules* that fill it -- and every branch into a named-but-unfilled
+      // page missed, re-translated, and missed again forever: a nested
+      // `$(...)` (a fork of a fork) wedged its whole process tree. Only the
+      // not-yet-instantiated ones; an instantiated lazy module is already in
+      // `#compiled`, so including both would hand the child a duplicate.
+      modules: forkModules()
+        ? [
+            ...this.#inherited,
+            ...this.#lazyInherited.filter((l) => !l.inst),
+            ...this.#compiled,
+          ]
+        : [],
       opts: this.#opts,
       // The descriptors the child inherits, described rather than cloned: an
       // open file is an `Arc` in the parent's heap and the child's Worker has
