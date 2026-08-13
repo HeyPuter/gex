@@ -263,6 +263,24 @@ async function handle(msg) {
   // wrong -- it landed inside `WorkerEnv.write`, so it took effect only once
   // the guest had already written something, long after the child adopted.
   if (msg.adoptAfter !== undefined) globalThis.GEX_ADOPT_AFTER = msg.adoptAfter;
+  // Mark this Worker's console errors, because the browser will not.
+  //
+  // Chrome logs every console level as INFO on stderr, so a Worker that
+  // reports a fault is indistinguishable from one reporting progress by the
+  // time anything outside reads it. A Worker cannot reach the page's
+  // reporter either -- separate global, separate context -- so the marker in
+  // the text is the only thing that crosses. Guarded so it is applied once
+  // however many messages a Worker receives.
+  if (!globalThis.__gexMarkedConsole) {
+    globalThis.__gexMarkedConsole = true;
+    const realError = console.error.bind(console);
+    console.error = (...a) => realError('[gex-console-error]', ...a);
+  }
+  // Same reasoning, same place: set before anything reads it. `forkModules()`
+  // is evaluated in the Worker that *builds* the fork record, so the page's
+  // global never reached it and the first run of `?forkmods=0` measured the
+  // default against itself. See task 145.
+  if (msg.forkMods !== undefined) globalThis.GEX_FORK_MODULES = msg.forkMods;
 
   // Everything the guest writes goes back to whoever started this. Posted
   // rather than accumulated: a run that takes minutes should say what it is

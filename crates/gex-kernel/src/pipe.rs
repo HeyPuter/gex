@@ -342,8 +342,15 @@ mod tests {
 /// and into the other's. Both ends can be Workers that share nothing else.
 #[derive(Clone, Copy)]
 pub struct Remote {
-    /// Make a pipe with both ends open. Returns its id.
-    pub new: extern "C" fn() -> i32,
+    /// Make a pipe with both ends open, held by `pid`. Returns its id.
+    ///
+    /// The pid is not decoration. The global kernel tracks who holds each
+    /// end so that a process leaving by a trap -- which does not unwind, so
+    /// no `Drop` runs -- can have its ends released by `k_pipe_forget`.
+    /// Without it the two ends a process gets from its own `pipe2` were the
+    /// one case that backstop could not see, and a reader on the far side
+    /// waited for an end-of-file that nobody would send.
+    pub new: extern "C" fn(pid: i32) -> i32,
     /// Another descriptor onto one end, as `dup` and `fork` both make.
     pub open_end: extern "C" fn(id: i32, write: i32),
     /// How many descriptors hold each end, as `(readers << 16) | writers`.

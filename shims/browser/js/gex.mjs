@@ -53,6 +53,31 @@ const SHIM_STACK_TOP = 0x04800000;
 // so `?adopt=0` selected nothing and every run that was supposed to be
 // comparing eager against deferred was comparing deferred against itself.
 // Three bisect conclusions were drawn from that before the bug was noticed.
+/**
+ * Whether a fork hands the child its parent's compiled modules.
+ *
+ * One -- it does, which is the behaviour every measurement to date was
+ * taken against. `?forkmods=0` sends none, and the child compiles what it
+ * branches into from the shim registry it inherited in the image.
+ *
+ * The reason for the switch: `#compiled` is unbounded and grows to 3,227
+ * modules in one long-lived shell, and every fork structured-clones the
+ * whole array to the host and again to the child. `apt update` dies of a
+ * V8 JavaScript OOM at ~58 processes with a 166 MB heap. Sending none
+ * trades compile time for memory, and #106/#108 measured large startup
+ * wins from sharing, so the trade has to be measured rather than assumed.
+ * See task 145.
+ *
+ * A function, not a module constant: a constant is evaluated at import,
+ * before the page sets the global, which is how `?adopt=0` silently
+ * selected nothing and three bisect conclusions were drawn from runs that
+ * were comparing a setting against itself.
+ */
+function forkModules() {
+  const v = globalThis.GEX_FORK_MODULES;
+  return v === undefined ? 1 : Number(v);
+}
+
 function adoptAfterTraps() {
   // One -- deferred. A forked child takes its parent's modules without
   // installing them, and picks up what it actually branches into.
@@ -441,6 +466,9 @@ export class Gex {
   #claimed = [];
   // The parent's modules, held rather than installed. See `#maybeAdopt`.
   #inherited = [];
+  /// The exec generation last seen, so `#maybeAdopt` can tell when this
+  /// process has become a different program. See task 145.
+  #execGen = 0;
   #traps = 0;
   // What `load` was told, so a forked child can be told the same. A child is
   // the same program with the same terminal and the same user; rebuilding its
@@ -1901,7 +1929,14 @@ export class Gex {
     // erased, because the guest module's own entries came from a passive data
     // segment that the copied memory has already marked as applied, so they
     // are never written again and a child that loses them cannot run at all.
-    if (adoptAfterTraps() > 0 && (child.modules?.length ?? 0) > 0 && e.gex_reset_directory) {
+    // Not conditional on there being modules. A child that is handed none
+    // needs this *more*, not less: the inherited directory names slots in a
+    // table it has not filled, and the first branch into one is
+    // "invalid address in funcref table of size 0" -- a trap, not a miss, so
+    // nothing recovers. With `?forkmods=0` pid 2 died exactly that way, 462
+    // entries naming a table of size 0. Rebuilding keeps the guest module's
+    // own passive-segment entries either way. See task 145.
+    if (adoptAfterTraps() > 0 && e.gex_reset_directory) {
       step(`directory rebuilt: ${e.gex_reset_directory() >>> 0} entries kept`);
     }
     // Before the kernel is built, not after.
@@ -1975,6 +2010,63 @@ export class Gex {
       e.gex_free?.(p, n * 20);
     }
     step('pages adopted');
+    // What this child's isolate is actually holding, asked of the browser.
+    //
+    // Six candidates for the OOM in #145 have been eliminated by removing
+    // them and re-running, which can only ever rule out something already
+    // guessed -- and after six misses the cause is probably not on that
+    // list. This asks instead. `measureUserAgentSpecificMemory` needs
+    // cross-origin isolation, which the page already has for
+    // `SharedArrayBuffer`, and reports a real breakdown by type rather than
+    // a total.
+    //
+    // Fired from the child, right after adopt: the isolate that dies is
+    // about four seconds old, so whatever fills 166 MB either arrives here
+    // or is built immediately after. Awaited in the background because the
+    // measurement waits for a GC and must not hold the guest up.
+    // Says why when it does not fire. A diagnostic that is silent about its
+    // own preconditions is indistinguishable from one whose subject never
+    // happened -- which is exactly how the first attempt at this read.
+    {
+      console.error(
+        `[heap] debug=${!!globalThis.GEX_DEBUG_EXIT}`
+          + ` api=${typeof performance.measureUserAgentSpecificMemory}`
+          + ` isolated=${globalThis.crossOriginIsolated}`
+          // The standard API is absent in this Worker even with isolation
+          // on, so fall back to Chrome's own counter. Non-standard and
+          // coarse -- one number for the isolate, no breakdown -- but a
+          // number from the engine beats another guess.
+          + ` used=${performance.memory?.usedJSHeapSize ?? 'n/a'}`
+          + ` limit=${performance.memory?.jsHeapSizeLimit ?? 'n/a'}`
+          + ` image=${(child.image ?? []).reduce((n, r) => n + (r.bytes?.byteLength ?? 0), 0)}`
+          + ` modules=${(child.modules ?? []).length}`,
+      );
+    }
+    if (performance.measureUserAgentSpecificMemory) {
+      const imageBytes = (child.image ?? []).reduce(
+        (n, r) => n + (r.bytes?.byteLength ?? 0), 0);
+      performance
+        .measureUserAgentSpecificMemory()
+        .then((m) => {
+          const by = {};
+          for (const b of m.breakdown ?? []) {
+            if (!b.bytes) continue;
+            const k = (b.types ?? []).join('+') || 'other';
+            by[k] = (by[k] ?? 0) + b.bytes;
+          }
+          const parts = Object.entries(by)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 6)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(' ');
+          console.error(
+            `[heap] pid ${this.#env.pid ?? '?'}: total ${m.bytes}`
+              + ` image ${imageBytes} modules ${(child.modules ?? []).length}`
+              + ` | ${parts}`,
+          );
+        })
+        .catch((e) => console.error(`[heap] measure failed: ${e.message}`));
+    }
     // After the kernel exists and before the guest runs: the first thing a
     // forked child does is read or write a descriptor it expects to have.
     if (child.fds?.length && e.gex_adopt_fds) {
@@ -2217,7 +2309,7 @@ export class Gex {
       // at all while inheriting a directory that names its grandparent's
       // slots. The chain has to carry what was inherited as well as what was
       // built, or deferring once breaks every descendant.
-      modules: [...this.#inherited, ...this.#compiled],
+      modules: forkModules() ? [...this.#inherited, ...this.#compiled] : [],
       opts: this.#opts,
       // The descriptors the child inherits, described rather than cloned: an
       // open file is an `Arc` in the parent's heap and the child's Worker has
@@ -2240,6 +2332,23 @@ export class Gex {
       // for a hop that cannot be more than a few.
       sentAt: performance.timeOrigin + performance.now(),
     };
+    // What a fork actually costs to hand over, per fork and in bytes.
+    // `apt update` dies of a V8 JavaScript OOM at ~58 processes with a
+    // 166 MB heap, and this record is the largest thing crossing per fork:
+    // built here, structured-cloned to the host, cloned again to the child.
+    // The numbers were computed and never reported, so the three copies
+    // have never been weighed. One line per fork; there are tens, not
+    // thousands. See task 145.
+    if (globalThis.GEX_DEBUG_EXIT) console.error(
+      `[fork] pid ${child.pid} image ${child.forkCost.bytes} bytes in ` +
+        `${child.forkCost.regions} regions, built in ${child.forkCost.buildMs}ms, ` +
+        // Every child inherits its parent's modules and adds its own, so this
+        // list grows down the fork tree. The isolate that OOMs has been alive
+        // about four seconds -- a freshly spawned child -- which points here
+        // rather than at the forking parent. See task 145.
+        `${child.modules.length} modules (${this.#inherited.length} inherited ` +
+        `+ ${this.#compiled.length} own)`,
+    );
     e.gex_fork_taken();
     if (globalThis.GEX_DEBUG_EXIT) {
       // The record as it leaves, not as the child reports it. A child that
@@ -3098,6 +3207,25 @@ export class Gex {
    */
   async #maybeAdopt() {
     if (!this.#inherited.length) return;
+    // An exec makes the parent's modules worthless, so let go of them.
+    //
+    // They describe the program this process *was*, and after `execve` the
+    // directory they would fill points at code belonging to a program that
+    // is gone -- `gex_add_lazy_module` says as much about the translator's
+    // own units. Until now nothing in the glue could see an exec, so a
+    // child held its parent's list for life: up to 3,227
+    // `WebAssembly.Module` objects in an `apt` run, in a Worker that
+    // execs within a few hundred instructions of forking and can never use
+    // one of them. That is every shell command. See task 145.
+    //
+    // A generation, compared: two execs between two checks still differ, and
+    // there is nothing to clear or reset.
+    const gen = this.#shim.exports.gex_exec_gen?.() ?? 0;
+    if (gen !== this.#execGen) {
+      this.#execGen = gen;
+      this.#inherited = [];
+      return;
+    }
     if (++this.#traps < adoptAfterTraps()) return;
     const mine = this.#inherited;
     this.#inherited = [];
@@ -3635,9 +3763,31 @@ export class Gex {
               ? `at=${then.at} len=${then.len} pub=${then.published ? 1 : 0}`
                 + `${then.inst === inst ? '' : ' DIFFERENT-INSTANCE'}`
               : 'never asked for this span';
+            // And when it says it wrote and the slot is still a stub, where
+            // the write actually went.
+            //
+            // `said=1` is the fill claiming it put blocks somewhere. If the
+            // slot the directory names is unchanged, the write landed
+            // elsewhere -- and the obvious elsewhere is another table, since
+            // a module's element segments carry the table they were built
+            // for while the *page* is assigned a table per process, and the
+            // two do not have to agree. Every table is checked at the same
+            // index, which costs nothing on the path that already failed.
+            // See task 148.
+            let elsewhere = '';
+            if (said && tabs[tn].get(slot) === stub) {
+              for (let t = 0; t < tabs.length; t++) {
+                if (t === tn) continue;
+                if (slot < tabs[t].length && tabs[t].get(slot) !== stub) {
+                  elsewhere += ` WROTE-TABLE-${t}`;
+                }
+              }
+              if (!elsewhere) elsewhere = ' WROTE-NOWHERE';
+            }
             what = tabs[tn].get(slot) !== stub
               ? `stub->written(was[${was}] now[${now}] said=${said ? 1 : 0})`
-              : `stub->stub(was[${was}] now[${now}] said=${said ? 1 : 0})`;
+              : `stub->stub(was[${was}] now[${now}] said=${said ? 1 : 0}`
+                + `${elsewhere} tn=${tn} slot=${slot})`;
           } else {
             what = `stub, owner=${owner} no fill`;
           }

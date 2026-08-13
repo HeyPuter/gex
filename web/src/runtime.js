@@ -542,6 +542,18 @@ export async function runProgram(
       // rasteriser, which nothing here wants because the renderer is on the
       // other side of the vtest socket.
       recompileObjects,
+      // Whether a fork hands the child its parent's compiled modules.
+      //
+      // In `extra`, which the Host spreads into every Worker message, and
+      // *not* on `globalThis`: the list is built in the forking Worker, and
+      // a global set here is set in the page. That is the same mismatch that
+      // left `?adopt=N` selecting nothing for three bisects, and it silently
+      // invalidated the first measurement of this switch too -- the run
+      // still shipped 2,977 modules per fork. See task 145.
+      forkMods:
+        globalThis.GEX_FORK_MODULES === undefined
+          ? undefined
+          : Number(globalThis.GEX_FORK_MODULES),
       // In `extra` rather than `opts`: the shell that starts a demo is not
       // the process this is for. What pays for the dynamic linker is the
       // forty commands it runs, and each of those is a Worker of its own

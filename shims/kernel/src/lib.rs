@@ -1491,12 +1491,43 @@ fn pipe_at(id: i32) -> Option<std::sync::Arc<gex_kernel::pipe::Pipe>> {
         .cloned()
 }
 
-/// Make a pipe with both ends open. Returns its id.
+/// Make a pipe with both ends open, both held by `pid`. Returns its id.
+///
+/// The holder record matters as much as the pipe. `k_pipe_forget` is the
+/// backstop for a process that leaves by a trap -- which does not unwind, so
+/// no `Drop` runs and no `close_end` is called -- and it can only release
+/// what `pipe_holders` knows about. This used to register nothing, so the two
+/// ends a process got from its own `pipe2` were precisely the case the
+/// backstop could not see: they stayed held for the life of the tab, the
+/// writer count never reached zero, and a reader on the far side waited for
+/// an end-of-file nobody would ever send. Ends taken by `fork` and `dup` were
+/// covered, because those go through `k_pipe_open_end`.
+///
+/// `Pipe::new` already starts each end at one reference, so this records the
+/// holder without touching the counts.
 #[no_mangle]
-pub extern "C" fn k_pipe_new() -> i32 {
-    let mut t = pipes().lock().unwrap_or_else(|e| e.into_inner());
-    t.push(std::sync::Arc::new(gex_kernel::pipe::Pipe::new()));
-    (t.len() - 1) as i32
+pub extern "C" fn k_pipe_new(pid: i32) -> i32 {
+    let id = {
+        let mut t = pipes().lock().unwrap_or_else(|e| e.into_inner());
+        t.push(std::sync::Arc::new(gex_kernel::pipe::Pipe::new()));
+        (t.len() - 1) as i32
+    };
+    // The holder registration that belongs here is disabled while it is
+    // under suspicion.
+    //
+    // Registering both ends makes `k_pipe_forget` release them at exit,
+    // which is behaviour that did not exist before and lands at exactly the
+    // moment `ls | cat` traps: "memory access out of bounds ... after
+    // syscall 94", and 94 is `exit_group`. That is a coincidence worth
+    // ruling out before anything is built on top of it, and this is the
+    // one-line way to rule it out. The pid stays in the signature so the
+    // ABI does not churn between the two runs being compared.
+    //
+    // If the trap survives this, the hole #143 describes is real and still
+    // wants closing -- but by then it is known not to be what breaks a
+    // pipeline. See tasks 143 and 146.
+    let _ = pid;
+    id
 }
 
 /// Another descriptor onto one end, as `dup` and `fork` both make.

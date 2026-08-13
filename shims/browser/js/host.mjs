@@ -30,6 +30,31 @@
  * knowing which it is running under.
  */
 /**
+ * A guest process or thread died, announced once, in one place.
+ *
+ * Both call sites already write a line to the guest's stderr, and that is
+ * right for a person watching a terminal. It is not enough for anything
+ * *automated* watching the run: these failures are caught -- the spawn's
+ * promise is rejected and handled -- so no `error` event fires, and a test
+ * that has already seen the text it was waiting for has stopped reading by
+ * the time the line appears.
+ *
+ * A hook rather than a pattern. Scraping the prose was tried and is the
+ * wrong mechanism: it fails *open*, so rewording a message disables the
+ * check silently, and the pattern ends up duplicated in the places that
+ * read it and drifts between them. Nothing is imposed on a host that does
+ * not set the hook. See task 146.
+ */
+function crashed(what) {
+  try {
+    globalThis.GEX_ON_CRASH?.(what);
+  } catch {
+    // A reporter that throws must not take the run down with it: the point
+    // of this is to make a failure visible, not to add one.
+  }
+}
+
+/**
  * The buffers in a fork record, so `postMessage` can hand them over instead
  * of copying them.
  *
@@ -256,6 +281,20 @@ export class ProcessHost {
       w.addEventListener?.('error', fail);
       w.on?.('error', fail);
       this.#pending.set(pid, { ...msg, pid });
+      // How much is pinned here, and by how many records. `#pending` holds
+      // the whole fork record, image bytes included, until the child reports
+      // ready and `#pending.delete(pid)` runs. A child that never starts
+      // leaves ~19 MB pinned, and nine of those is the 166 MB heap that
+      // `apt update` dies on. See task 145.
+      if (this.#extra?.debugExit) {
+        let held = 0;
+        for (const r of this.#pending.values()) {
+          for (const g of r.image ?? []) held += g.bytes?.byteLength ?? 0;
+        }
+        console.error(
+          `[pending] ${this.#pending.size} records holding ${held} bytes`,
+        );
+      }
       // One line per process, to `debug` so a page hides it and a terminal
       // shows it. A process that never starts leaves no other trace at all:
       // the fork is logged by the *parent*, the exit by the child, and a
@@ -527,6 +566,13 @@ export class ProcessHost {
         // the difference from a switch is exactly that nobody waits for it.
         this.#spawn(m.child.pid, { kind: 'adopt', child: m.child }).catch((e) => {
           this.#onOutput(2, `gex: process ${m.child.pid} failed: ${e.message}\n`, pid);
+          // And as an event, for anything watching the run rather than
+          // reading it. This is caught, so no `error` event fires and a
+          // harness sees only the line above -- which it may well miss,
+          // because a test that has already matched what it wanted has
+          // stopped reading. A whole session was spent calling those runs
+          // "stalls". See task 146.
+          crashed(`pid ${m.child.pid}: ${e.message}`);
         });
         break;
       }
@@ -553,6 +599,7 @@ export class ProcessHost {
         // because the evidence is destroyed with the Worker that had it.
         const threadFailed = (e) => {
           this.#onOutput(2, `gex: thread ${key} failed: ${e?.message ?? String(e)}\n`, pid);
+          crashed(`thread ${key}: ${e?.message ?? String(e)}`);
         };
         w2.addEventListener?.('error', threadFailed);
         w2.on?.('error', threadFailed);
@@ -721,6 +768,14 @@ export class ProcessHost {
         // *which process* fell over -- and because a child's promise often
         // has nobody awaiting it, so rejecting alone can be silent.
         console.error(`[gex] pid ${pid} threw: ${m.message}\n${m.stack ?? ''}`);
+        // And as an event. The console line above is captured by anything
+        // watching the browser's stderr, but capture is not the same as
+        // noticing: every console level arrives as INFO, so nothing can tell
+        // this apart from progress chatter by severity, and a run that has
+        // already seen the text it wanted will print `ok` over the top of it.
+        // This is the process saying it died, in a form a harness can fail
+        // on. See task 146.
+        crashed(`pid ${pid} threw: ${m.message}`);
         reject(
           Object.assign(new Error(`pid ${pid}: ${m.message}`), { guestStack: m.stack }),
         );

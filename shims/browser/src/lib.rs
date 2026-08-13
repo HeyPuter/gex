@@ -353,7 +353,7 @@ extern "C" {
     // Pipes. A shell pipeline is two processes and a pipe, and apt is a
     // process and four method workers on pairs of them; with a Worker per
     // process the other end is always in another memory.
-    fn k_pipe_new() -> i32;
+    fn k_pipe_new(pid: i32) -> i32;
     fn k_pipe_open_end(id: i32, write: i32, pid: i32);
     fn k_pipe_ends(id: i32) -> i32;
     fn k_pipe_write_stats(id: i32) -> i32;
@@ -603,8 +603,10 @@ extern "C" fn rf_mksocket(path: u32, path_len: u32) -> i32 {
     unsafe { k_fs_mksocket(path, path_len) }
 }
 
-extern "C" fn rp_new() -> i32 {
-    unsafe { k_pipe_new() }
+extern "C" fn rp_new(pid: i32) -> i32 {
+    let id = unsafe { k_pipe_new(pid) };
+    pipe_note("new", id, 0);
+    id
 }
 /// This process's pid, for the calls that have to name it.
 ///
@@ -620,8 +622,34 @@ fn my_pid() -> i32 {
     MY_PID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Every change to a pipe's end counts, with who made it and what the
+/// counts became.
+///
+/// A pipe whose last writer has exited must report end-of-file. gpgv's read
+/// on pipe 9 never does: 2.3 seconds after `[proc] exit 8` the pipe still
+/// says `1 readers 1 writers`, and the reader had been woken and re-checked,
+/// so a decrement is missing rather than a wake. An aggregate cannot say
+/// which one -- only the sequence can. See task 140.
+fn pipe_note(what: &str, id: i32, write: i32) {
+    if !tracing() {
+        return;
+    }
+    let e = unsafe { k_pipe_ends(id) };
+    let (r, w) = if e < 0 {
+        (-1, -1)
+    } else {
+        ((e >> 16) & 0xffff, e & 0xffff)
+    };
+    trace_line(&format!(
+        "[pipe:{id}] {what} {} by pid {} -> {r}r {w}w\n",
+        if write != 0 { "write" } else { "read" },
+        my_pid(),
+    ));
+}
+
 extern "C" fn rp_open_end(id: i32, write: i32) {
     unsafe { k_pipe_open_end(id, write, my_pid()) }
+    pipe_note("open", id, write);
 }
 extern "C" fn rp_ends(id: i32) -> i32 {
     unsafe { k_pipe_ends(id) }
@@ -637,6 +665,7 @@ extern "C" fn rp_last_message(id: i32, at: u32, cap: u32) -> i32 {
 }
 extern "C" fn rp_close_end(id: i32, write: i32) {
     unsafe { k_pipe_close_end(id, write, my_pid()) }
+    pipe_note("close", id, write);
 }
 extern "C" fn rp_read(id: i32, at: u32, len: u32) -> i32 {
     unsafe { k_pipe_read(id, at, len) }
@@ -1241,6 +1270,82 @@ static ALLOC: Counting = Counting(HEAP, std::sync::atomic::AtomicUsize::new(0));
 /// counting arms compile away and what is left is a delegating newtype.
 struct Counting(Heap, std::sync::atomic::AtomicUsize);
 
+/// Live bytes by size class, so a full heap can say *what* is filling it.
+///
+/// The total alone could not: 1,676 MiB live says the heap is genuinely
+/// occupied rather than fragmented, and stops there. A few enormous buffers
+/// and a million small ones want completely different fixes, and the classes
+/// tell them apart at the cost of two atomics per allocation. See task 140.
+///
+/// Classes: <64 KiB, <1 MiB, <4 MiB, <16 MiB, >=16 MiB.
+static LIVE_BYTES: [std::sync::atomic::AtomicUsize; 5] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 5];
+static LIVE_COUNT: [std::sync::atomic::AtomicUsize; 5] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 5];
+
+fn size_class(n: usize) -> usize {
+    match n {
+        ..=65_535 => 0,
+        ..=1_048_575 => 1,
+        ..=4_194_303 => 2,
+        ..=16_777_215 => 3,
+        _ => 4,
+    }
+}
+
+/// The distinct sizes seen in the 1-4 MiB class, with a count each.
+///
+/// That class holds 1,640 MiB of the heap in about 1,637 live blocks, so the
+/// leak is something a megabyte in size allocated over and over. An average
+/// cannot be grepped for; an exact byte count can. First eight distinct sizes
+/// win a slot -- enough to name the offender, and no allocation in the hot
+/// path does more than walk eight words. See task 140.
+static BIG_SIZES: [std::sync::atomic::AtomicUsize; 8] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+static BIG_SIZE_N: [std::sync::atomic::AtomicUsize; 8] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+
+#[cfg(feature = "heap-counters")]
+fn note_big(n: usize) {
+    for i in 0..8 {
+        let s = BIG_SIZES[i].load(std::sync::atomic::Ordering::Relaxed);
+        if s == n {
+            BIG_SIZE_N[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        if s == 0
+            && BIG_SIZES[i]
+                .compare_exchange(
+                    0,
+                    n,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            BIG_SIZE_N[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+#[cfg(feature = "heap-counters")]
+fn live_add(n: usize) {
+    let c = size_class(n);
+    LIVE_BYTES[c].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    LIVE_COUNT[c].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if c == 2 {
+        note_big(n);
+    }
+}
+
+#[cfg(feature = "heap-counters")]
+fn live_sub(n: usize) {
+    let c = size_class(n);
+    LIVE_BYTES[c].fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+    LIVE_COUNT[c].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 // SAFETY: both inner allocators are `Sync` on their intended target, and the
 // counter is atomic.
 unsafe impl Sync for Counting {}
@@ -1277,13 +1382,17 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         #[cfg(feature = "heap-counters")]
         if !p.is_null() {
             self.1.fetch_add(l.size(), std::sync::atomic::Ordering::Relaxed);
+            live_add(l.size());
         }
         p
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
         #[cfg(feature = "heap-counters")]
-        self.1.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
+        {
+            self.1.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
+            live_sub(l.size());
+        }
         unsafe { self.0.dealloc(p, l) }
     }
 
@@ -1299,6 +1408,10 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
             } else {
                 self.1.fetch_sub(l.size() - new, std::sync::atomic::Ordering::Relaxed);
             }
+            // The block may have changed class, so move the whole thing
+            // rather than adjusting the delta in place.
+            live_sub(l.size());
+            live_add(new);
         }
         q
     }
@@ -1367,6 +1480,16 @@ pub extern "C" fn gex_set_per_miss(n: u32) {
 /// the per-Worker stacks. `[3]` is the largest single claim.
 static ARENA_SPENT: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// nfds, readfds and writefds of the select in flight; nfds 0 means none.
+/// Where `clock_gettime` was told to write, so the trace can read it back.
+static CLOCK_ARG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static SELECT_ARGS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// The syscall number this thread is inside, or `u64::MAX` between calls.
 /// Distinct from `IN_SYSCALL`, which is a bool about re-entry.
@@ -1489,7 +1612,7 @@ fn arena_take(len: u64) -> Option<u64> {
         // is worse. A fixed buffer on the stack and `core::fmt` into it
         // touches no allocator at all.
         use core::fmt::Write as _;
-        struct Buf([u8; 768], usize);
+        struct Buf([u8; 1400], usize);
         impl core::fmt::Write for Buf {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
                 let room = self.0.len() - self.1;
@@ -1499,28 +1622,46 @@ fn arena_take(len: u64) -> Option<u64> {
                 Ok(())
             }
         }
-        // 768, because the report has grown. `write!` into a full buffer
+        // 1024, because the report has grown again -- the size-class
+        // histogram is the newest field and would be the first thing lost. `write!` into a full buffer
         // stops silently, and the last thing added is the first thing lost --
         // the queue high-water mark vanished off the end of a 448-byte one
         // and read as absent rather than as truncated.
-        let mut b = Buf([0; 768], 0);
+        let mut b = Buf([0; 1400], 0);
         let _ = write!(
             b,
-            "[gex] the arena cannot grow: wanted {len} at {at:#x}, ceiling \
+            "[gex:{}] the arena cannot grow: wanted {len} at {at:#x}, ceiling \
              {:#x}. Spent: {} MiB on guest mappings, {} MiB on this module's \
              heap, {} MiB on Worker stacks; largest single claim {}. Live in \
-             the heap right now: {} MiB, of which {} MiB is kept module \
+             the heap right now: {} KiB (-1 means the counters are off), of \
+             which {} MiB is kept module \
              bytes and {} MiB is files the kernel holds. {} refills, \
              biggest allocation {} (-1 KiB means the counters are off; build \
              with GEX_HEAP_COUNTERS=1). {} MiB queued for the host in {} \
              modules at most. An abort here is not a panic and prints \
-             nothing of its own. Last refill in syscall {}, most in syscall {}; biggest was refill {} in syscall {}.\n",
+             nothing of its own. Last refill in syscall {}, most in syscall {}; biggest was refill {} in syscall {}. \
+             Live by size class -- <64K: {} KiB in {}, <1M: {} KiB in {}, \
+             <4M: {} KiB in {}, <16M: {} KiB in {}, >=16M: {} KiB in {}. \
+             1-4M sizes: {}x{} {}x{} {}x{} {}x{} {}x{} {}x{} {}x{} {}x{}.\n",
+            // Whose arena. Every Worker logs to the same console, so without
+            // this the report had to be pinned to a process by reading the
+            // lines around it -- which interleave, and so is a guess. A plain
+            // atomic, safe to read here: this runs inside the allocator's
+            // refill path and must not borrow the host.
+            my_pid(),
             gex_abi::MMAP_TOP,
             ARENA_SPENT[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[1].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[2].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[3].load(std::sync::atomic::Ordering::Relaxed),
-            gex_heap_used_kib() / 1024,
+            // KiB, and not divided. Without `heap-counters` this is -1, and
+            // `-1 / 1024` truncates to 0 -- so the report read "0 MiB live"
+            // while the heap held 1,699 MiB, and that looked like a leak
+            // rather than like an unanswered question. Printed raw, the
+            // sentinel survives, and the legend below already says what -1
+            // means. Nothing here may allocate: this runs inside the
+            // allocator's own refill path, so no `format!`.
+            gex_heap_used_kib(),
             REGISTRY_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
             // A static in the kernel, read directly: this runs inside the
             // allocator's refill path and must not borrow the host.
@@ -1547,6 +1688,32 @@ fn arena_take(len: u64) -> Option<u64> {
             },
             HEAP_BIGGEST_AT.load(std::sync::atomic::Ordering::Relaxed),
             HEAP_BIGGEST_CALL.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            LIVE_BYTES[0].load(std::sync::atomic::Ordering::Relaxed) >> 10,
+            LIVE_COUNT[0].load(std::sync::atomic::Ordering::Relaxed),
+            LIVE_BYTES[1].load(std::sync::atomic::Ordering::Relaxed) >> 10,
+            LIVE_COUNT[1].load(std::sync::atomic::Ordering::Relaxed),
+            LIVE_BYTES[2].load(std::sync::atomic::Ordering::Relaxed) >> 10,
+            LIVE_COUNT[2].load(std::sync::atomic::Ordering::Relaxed),
+            LIVE_BYTES[3].load(std::sync::atomic::Ordering::Relaxed) >> 10,
+            LIVE_COUNT[3].load(std::sync::atomic::Ordering::Relaxed),
+            LIVE_BYTES[4].load(std::sync::atomic::Ordering::Relaxed) >> 10,
+            LIVE_COUNT[4].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZE_N[0].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZES[0].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZE_N[1].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZES[1].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZE_N[2].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZES[2].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZE_N[3].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZES[3].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZE_N[4].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZES[4].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZE_N[5].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZES[5].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZE_N[6].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZES[6].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZE_N[7].load(std::sync::atomic::Ordering::Relaxed),
+            BIG_SIZES[7].load(std::sync::atomic::Ordering::Relaxed),
         );
         // SAFETY: `warn` reads the bytes and keeps none of them.
         unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
@@ -5173,6 +5340,29 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
         let n = gm.read_u64(base + ctx::x(8) as u64).unwrap_or(u64::MAX);
         SYSCALL_NR.store(n, std::sync::atomic::Ordering::Relaxed);
+        // And a select's arguments, so the answer can be read back from the
+        // guest's own sets afterwards. Counting the bits apt receives is the
+        // only account that does not depend on which call last touched a
+        // global. See task 140.
+        if n == gex_kernel::syscalls::nr::CLOCK_GETTIME {
+            // Where the answer will land, so the trace can print the time the
+            // guest was actually given. apt's stall is a loop of pselect6 and
+            // two clock_gettime calls, which is a deadline being recomputed;
+            // if the clock does not move, the deadline never arrives. See
+            // #134 and task 140.
+            let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
+            CLOCK_ARG.store(g(1), std::sync::atomic::Ordering::Relaxed);
+        } else {
+            CLOCK_ARG.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        if n == gex_kernel::syscalls::nr::PSELECT6 {
+            let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
+            SELECT_ARGS[0].store(g(0), std::sync::atomic::Ordering::Relaxed);
+            SELECT_ARGS[1].store(g(1), std::sync::atomic::Ordering::Relaxed);
+            SELECT_ARGS[2].store(g(2), std::sync::atomic::Ordering::Relaxed);
+        } else {
+            SELECT_ARGS[0].store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
@@ -5196,6 +5386,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             nr::OPENAT | nr::UNLINKAT | nr::RENAMEAT | nr::NEWFSTATAT => Some(path(g(1))),
             _ => None,
         };
+        // And for the calls whose first argument is a descriptor, what that
+        // descriptor *is*. apt waits on `pipe:[3]` and `pipe:[7]` while its
+        // method writes 609 bytes to a stdout that is a pipe too; whether
+        // those are the same pipe is the whole question, and an fd number
+        // cannot answer it because each process numbers its own. See task 140.
+        let obj = match n {
+            nr::READ | nr::WRITE | nr::READV | nr::WRITEV | nr::CLOSE | nr::DUP3
+            | nr::LSEEK => with_host(|h| {
+                h.kernel
+                    .fds
+                    .get(g(0) as i32)
+                    .ok()
+                    .map(|f| format!(" fd0={}", f.path))
+            }),
+            _ => None,
+        }
+        .unwrap_or_default();
         // The pid, not only the thread. Every process in a run writes its
         // trace to the same stderr, so without it a fork is unreadable: two
         // clones, two execves and a wait4 all appear as one sequence and
@@ -5203,7 +5410,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // what made #88 take three passes to localise.
         let whose_pid = with_host(|h| h.kernel.pid);
         trace_line(&format!(
-            "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} ...\n",
+            "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{obj} ...\n",
             gex_kernel::syscalls::syscall_name(n),
             g(0),
             g(1),
@@ -5521,6 +5728,21 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     },
                     gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
                     gex_kernel::BlockOp::ReadStream { handle, .. } => {
+                        // What the thing being waited on says about itself,
+                        // at the moment of parking. A reader on a pipe whose
+                        // writers are already gone should have had
+                        // end-of-file instead, and that is a different bug
+                        // from a reader whose writer is simply busy -- the
+                        // ends tell them apart and nothing else does. gpgv
+                        // parks here on a pipe whose only writer has exited.
+                        // See task 140.
+                        if tracing() {
+                            trace_line(&format!(
+                                "[gex:{}] park read {}\n",
+                                h.kernel.pid,
+                                handle.debug_state()
+                            ));
+                        }
                         Waiting::Read(Arc::clone(handle))
                     }
                     gex_kernel::BlockOp::WriteStream { handle, .. } => {
@@ -5722,7 +5944,83 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let gm = GuestMem::new(guest_bytes());
         let (i, ctx_addr) = with_host(|h| (cur(), h.threads[cur()].kstate.ctx_addr));
         let x0 = gm.read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0);
-        trace_line(&format!("[gex]   t{i} = {}\n", x0 as i64));
+        // For a `select`, split the count. The total hides the answer: apt
+        // spins on `pselect6(7, ..) = 7` and never reads, so whether those
+        // seven are readable or writable decides where the fault is. See
+        // task 140.
+        let split = {
+            let nfds = SELECT_ARGS[0].load(std::sync::atomic::Ordering::Relaxed);
+            if nfds == 0 || nfds > 1024 {
+                String::new()
+            } else {
+                let words = (nfds as usize).div_ceil(64);
+                // The fd numbers, not a count. apt is handed two readable
+                // descriptors and reads neither, so which two is the whole
+                // question -- `PipeEnd::poll_readable` is `self.write || ..`,
+                // which reports a *write* end readable for ever. See task 140.
+                let list = |set: u64| {
+                    let mut v: Vec<u32> = Vec::new();
+                    if set == 0 {
+                        return v;
+                    }
+                    for w in 0..words {
+                        let word = gm.read_u64(set + (w as u64) * 8).unwrap_or(0);
+                        for b in 0..64u32 {
+                            if word & (1u64 << b) != 0 {
+                                let fd = (w as u32) * 64 + b;
+                                if fd < nfds as u32 {
+                                    v.push(fd);
+                                }
+                            }
+                        }
+                    }
+                    v
+                };
+                let rv = list(SELECT_ARGS[1].load(std::sync::atomic::Ordering::Relaxed));
+                let wv = list(SELECT_ARGS[2].load(std::sync::atomic::Ordering::Relaxed));
+                let join = |v: &[u32]| {
+                    v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+                };
+                // What each ready-for-read descriptor actually is. Being told
+                // readable and not reading is either a lying handle or a guest
+                // that never gets there; the open file says which. `available`
+                // of 0 next to `poll_readable` true is the `self.write || ..`
+                // short-circuit in `PipeEnd`. See task 140.
+                let what = with_host(|h| {
+                    let mut s = String::new();
+                    for fd in &rv {
+                        match h.kernel.fds.get(*fd as i32) {
+                            Ok(f) => s.push_str(&format!(
+                                " {fd}:{}{} av={:?} pr={} {}",
+                                if f.readable { "r" } else { "-" },
+                                if f.writable { "w" } else { "-" },
+                                f.handle.available(),
+                                f.handle.poll_readable(),
+                                f.path,
+                            )),
+                            Err(_) => s.push_str(&format!(" {fd}:bad")),
+                        }
+                    }
+                    s
+                });
+                format!(
+                    " nfds={nfds} r=[{}] w=[{}]{what}",
+                    join(&rv),
+                    join(&wv)
+                )
+            }
+        };
+        let clk = {
+            let at = CLOCK_ARG.load(std::sync::atomic::Ordering::Relaxed);
+            if at == 0 {
+                String::new()
+            } else {
+                let secs = gm.read_u64(at).unwrap_or(0);
+                let nanos = gm.read_u64(at + 8).unwrap_or(0);
+                format!(" clock={secs}.{nanos:09}")
+            }
+        };
+        trace_line(&format!("[gex]   t{i} = {}{split}{clk}\n", x0 as i64));
     }
     if stop != 0 {
         trap();
@@ -6470,6 +6768,35 @@ pub extern "C" fn gex_adopt_vma(start: i64, end: i64, prot: i32) {
 /// is enough to keep them apart without widening everything that passes a
 /// status along.
 fn exit_process(h: &mut Host, code: i32) -> i32 {
+    // Every thread of this process is over, said in the one place the
+    // scheduler looks.
+    //
+    // The loop ends a Worker on exactly one test:
+    //
+    //     h.threads.iter().all(|t| matches!(t.waiting, Waiting::Exited))
+    //
+    // and this function used to set every other part of the teardown --
+    // `EXITED`, the descriptor table, `k_pipe_forget`, the status, the
+    // resume slot -- without touching `h.threads` at all. So a process whose
+    // threads were still `Runnable` failed that test, got picked again, and
+    // was re-entered with its kernel state already released.
+    //
+    // The symptom is a guest that keeps making syscalls after it is gone.
+    // Counted over one session: 26 `exit_group` after exiting, and writev,
+    // mmap, rt_sigprocmask, gettid, getpid behind it. The repeats of
+    // `exit_group` itself are the shape of it -- the thread is put back on
+    // the instruction that ended it and runs it again, until something
+    // touches freed state and traps. `ls | cat` dies that way about twice in
+    // ten runs, reported as "memory access out of bounds" at a pc in ld.so
+    // that has nothing to do with the cause. `lib.rs:5554` has been warning
+    // about exactly this and running the syscall anyway.
+    //
+    // With this, that warning should be unreachable, which makes it a test
+    // rather than a note. See task 147.
+    for t in h.threads.iter_mut() {
+        t.waiting = Waiting::Exited;
+        t.blocked_on = None;
+    }
     // See `gex_exited`: this is what tells the host apart a program that
     // finished from one that abandoned the wasm stack with no status set.
     EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -6537,6 +6864,20 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
 /// Returns the entry point, or zero if the program could not be loaded, in
 /// which case the caller has already been given an errno.
 fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
+    // Said out loud, so the host can drop what this exec makes worthless.
+    //
+    // A forked child arrives holding its parent's compiled modules -- up to
+    // 3,227 of them in an `apt` run -- and keeps them in `#inherited` for
+    // its whole life. The moment it execs, every one of them describes a
+    // program that is gone. `gex_add_lazy_module` already says as much about
+    // the runtime translator's units: "keeping those across an exec would
+    // point the directory at code belonging to a program that is gone."
+    //
+    // Nothing in the glue could see an exec until now, so nothing dropped
+    // them, and a shell that forks and execs -- which is every shell -- left
+    // a Worker holding thousands of `WebAssembly.Module` objects it could
+    // never use. See task 145.
+    EXEC_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Has this program been linked already, in this run, in this
     // environment? Then there is nothing to load: the answer is an address
     // space, and it goes back byte for byte.
@@ -6971,6 +7312,19 @@ const SNAP_STUB_CODE: [u32; 3] = [0xd28f0028, 0xf2aceca8, 0xd4000001];
 /// address space and pulls a megabyte and a half into another wasm memory.
 /// When a run that has both goes wrong, one run with 2 says which half.
 static SNAPSHOT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// How many times this process has `execve`d, so the host can tell.
+///
+/// A counter rather than a flag: the host reads it after every trap and
+/// compares, so it cannot miss two execs between reads and it needs no
+/// clearing. See `do_exec` and task 145.
+static EXEC_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// How many `execve`s this process has done.
+#[no_mangle]
+pub extern "C" fn gex_exec_gen() -> u32 {
+    EXEC_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The program being linked in this process, as `(key, real entry)`.
 ///
@@ -10635,15 +10989,28 @@ pub extern "C" fn gex_jit_installed() {
         // The shared build still keeps them all, which is a ceiling on how
         // much a threaded process may translate and the next thing to bound
         // -- by dropping a module once every live Worker has installed it.
-        #[cfg(feature = "shared-memory")]
+        // Shrunk before it is kept, because the registry keeps it for the
+        // life of the process and `WasmModule::encode_with_custom` starts
+        // every module at `Vec::with_capacity(1 << 20)`. A translated batch
+        // averages about 26 KB, so each retained module held a megabyte to
+        // store twenty-six kilobytes -- and `REGISTRY_BYTES` sums `len()`,
+        // not capacity, so the report said 42 MiB while the heap held 1,640.
+        // 1,640 live blocks of exactly 1,048,576 bytes were 96% of the heap
+        // when `apt-key` hit the arena ceiling and died. See task 140.
+        //
+        // The realloc-and-copy is paid once per module and only on the path
+        // that retains one; a transient encode still gets the big buffer.
+        let mut wasm = done.wasm;
+        wasm.shrink_to_fit();
         // Counted for the arena report, which cannot borrow the host: it
         // runs inside the allocator's refill path. `registry` keeps every
         // module's bytes for the life of the process so a joining Worker can
         // instantiate them, and nothing trims it -- the first thing to rule
         // in or out for the 1,861 MiB an `apt-get update` holds live. See
         // #140.
-        REGISTRY_BYTES.fetch_add(done.wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        h.jit.registry.push(done.wasm);
+        #[cfg(feature = "shared-memory")]
+        REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        h.jit.registry.push(wasm);
         publish_pending(h);
     });
 }

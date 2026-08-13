@@ -395,6 +395,15 @@ const REPORTER = `
     const m = /[?&]recompile=([0-9]+)/.exec(location.search);
     if (m) globalThis.GEX_RECOMPILE_OBJECTS = Number(m[1]);
   }
+  // ?forkmods=0 stops a fork handing the child its parent's compiled
+  // modules. The child then compiles what it branches into from the shim
+  // registry it inherited in the image. See task 145: the list is unbounded,
+  // reaches 3,227 in one shell, and is structured-cloned whole on every
+  // fork, which is what puts the page into a V8 OOM at ~58 processes.
+  {
+    const m = /[?&]forkmods=([0-9]+)/.exec(location.search);
+    if (m) globalThis.GEX_FORK_MODULES = Number(m[1]);
+  }
   const post = (kind, body) =>
     fetch('/report?kind=' + kind, { method: 'POST', body }).catch(() => {});
   // The page's own reader gives the whole scrollback; the DOM query is the
@@ -467,6 +476,41 @@ const REPORTER = `
   // the demo was running, while the demo did nothing at all.
   let ticks = 0;
   setInterval(() => post('status', 'tick|running ' + ++ticks * 5 + 's|' + term()), 5000);
+  // Put the console level back into the message, because the browser throws
+  // it away.
+  //
+  // Chrome logs every console level as INFO:CONSOLE on stderr -- 8,462 lines
+  // of it in one run here, and not a single ERROR:CONSOLE even on runs where
+  // a process trapped and console.error said so. So nothing downstream can
+  // tell an error from progress chatter by severity, and the only reports
+  // that were ever noticed were the ones a pattern happened to match.
+  //
+  // Marking the text survives the flattening, and covers EVERY console.error
+  // rather than the call sites somebody remembered to hook -- which is the
+  // difference between a net and a list.
+  var realError = console.error.bind(console);
+  console.error = function () {
+    var a = [].slice.call(arguments);
+    try {
+      post('threw', 'console.error: ' + a.map(String).join(' '));
+    } catch (e) {
+      // Reporting must never be what breaks the run.
+    }
+    realError.apply(null, ['[gex-console-error]'].concat(a));
+  };
+  // A guest process dying, reported as an event rather than scraped.
+  //
+  // The runtime catches these -- the spawn promise is rejected and handled,
+  // the reason written to the guest stderr -- so no error event fires and
+  // nothing here would otherwise hear about it. Matching the prose was tried
+  // and is the wrong mechanism: it fails OPEN, so rewording a message
+  // disables the check silently, and the pattern ends up duplicated in the
+  // places that read it and drifts. This is the runtime saying "a process
+  // died", once, in a form that cannot be reworded away.
+  //
+  // No backticks anywhere in here: this whole reporter is a template
+  // literal, and one backtick ends it.
+  globalThis.GEX_ON_CRASH = (m) => post('threw', String(m));
   // The message, or -- when there is none because this is a *resource*
   // failing rather than code throwing -- what failed to load. Reporting the
   // event itself stringifies to "[object Event]", which names nothing.
@@ -757,6 +801,15 @@ for (const id of list) {
       // nothing else to say. That is the failure this file exists to catch.
       '--enable-logging=stderr',
       '--v=0',
+      // `performance.memory` exists only behind this, and without it the
+      // JavaScript heap cannot be measured from inside a Worker at all:
+      // `measureUserAgentSpecificMemory` is absent here even with
+      // cross-origin isolation on, and `performance.memory` reads
+      // `undefined`. Three attempts at a heap census returned nothing for
+      // that reason alone, which is indistinguishable from a census that
+      // ran and found nothing. `apt update` dies of a V8 OOM (#145) and
+      // the only account of where the bytes are is this counter.
+      '--enable-precise-memory-info',
       url,
     ],
     { stdio: ['ignore', 'ignore', 'pipe'] },
@@ -764,7 +817,9 @@ for (const id of list) {
   let err = '';
   child.stderr.on('data', (d) => (err += d));
 
-  const result = await Promise.race([
+  // `let`, because a crash found in the browser's console below demotes a
+  // "reached" to a failure. See the check after the console is collected.
+  let result = await Promise.race([
     done,
     new Promise((r) => setTimeout(() => r({ how: 'timeout' }), WALL)),
   ]);
@@ -789,6 +844,31 @@ for (const id of list) {
   const noisy = /Fontconfig|GPU|gpu|Registration|Vulkan|dawn/;
   if (process.env.GEX_STDERR === 'all') {
     for (const l of err.split('\n')) if (l && !noisy.test(l)) console.log(`     ${l}`);
+  }
+  // Every console error the run produced, listed, and fatal if there were
+  // any.
+  //
+  // The marker is put on by the page's reporter and by each Worker, because
+  // Chrome logs all console levels as INFO and the level is otherwise gone
+  // by the time it reaches this stream. Listed in full rather than counted:
+  // these carry the guest pc, the syscall, the dispatch page and the table
+  // sizes, and that detail is the whole diagnosis.
+  //
+  // Fatal even when the wanted text appeared. A run in which a process
+  // trapped has not passed, and the reason this check exists is that one
+  // did, printed exactly this, and the harness said `ok` over the top of it.
+  const consoleErrors = err
+    .split('\n')
+    .filter((l) => l.includes('[gex-console-error]'));
+  if (consoleErrors.length) {
+    console.log(`     ${consoleErrors.length} console error(s):`);
+    for (const l of consoleErrors) console.log(`     ! ${l.trim()}`);
+    if (result.how === 'reached') {
+      result = {
+        how: 'bad',
+        body: `${consoleErrors.length} console error(s), first: ${consoleErrors[0].trim().slice(0, 300)}`,
+      };
+    }
   }
   if (result.how === 'reached') {
     // The terminal on a passing run too, when it was asked for. Everything

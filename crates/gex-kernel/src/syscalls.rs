@@ -715,6 +715,13 @@ pub fn poll_ready(fds: &[PollFd]) -> bool {
 
 /// Write the answer back and count what is ready. Shared by the immediate
 /// reply and the one a parked wait gives when it wakes.
+/// Read-ready and write-ready counts from the last `select`. See the note
+/// where they are set.
+pub static SELECT_READY: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
 pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) -> SysResult {
     const POLLIN: u16 = 0x001;
     const POLLOUT: u16 = 0x004;
@@ -783,15 +790,26 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
                 }
             }
             let mut ready = 0u64;
+            let mut per = [0u64; 2];
             for (i, set) in [*readfds, *writefds].into_iter().enumerate() {
                 if set == 0 {
                     continue;
                 }
                 for w in 0..words.min(16) {
                     m.write_u64(set + (w as u64) * 8, out[i][w])?;
+                    per[i] += out[i][w].count_ones() as u64;
                     ready += out[i][w].count_ones() as u64;
                 }
             }
+            // Split the count, because the total hides the answer.
+            //
+            // apt spins on `pselect6(7, ..) = 7` and never reads: seven
+            // descriptors are ready and it believes none of them is readable.
+            // Whether those seven bits are readability or writability decides
+            // whether the bug is in what a pipe reports or in what apt is
+            // waiting for. See task 140.
+            SELECT_READY[0].store(per[0], core::sync::atomic::Ordering::Relaxed);
+            SELECT_READY[1].store(per[1], core::sync::atomic::Ordering::Relaxed);
             // Nothing here ever reports an exceptional condition, but a
             // caller that passed the set expects it cleared.
             if *exceptfds != 0 {
@@ -2610,7 +2628,7 @@ impl Kernel {
         fds: u64,
         flags: u64,
     ) -> SysResult {
-        let id = (r.new)();
+        let id = (r.new)(self.pid);
         if id < 0 {
             return Err(Errno::ENFILE);
         }
