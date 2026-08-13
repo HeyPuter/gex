@@ -38,6 +38,8 @@ pub mod nr {
     pub const LINKAT: u64 = 37;
     pub const RENAMEAT: u64 = 38;
     pub const RENAMEAT2: u64 = 276;
+    pub const SENDFILE: u64 = 71;
+    pub const COPY_FILE_RANGE: u64 = 285;
     pub const FTRUNCATE: u64 = 46;
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
@@ -1871,6 +1873,10 @@ impl Kernel {
             nr::READV => self.sys_readv(m, a[0] as i32, a[1], a[2]),
             nr::PREAD64 => self.sys_pread(m, a[0] as i32, a[1], a[2], a[3]),
             nr::PWRITE64 => self.sys_pwrite(m, a[0] as i32, a[1], a[2], a[3]),
+            nr::SENDFILE => self.sys_sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
+            nr::COPY_FILE_RANGE => {
+                self.sys_copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32)
+            }
             nr::OPENAT => self.sys_openat(m, a[0] as i32, a[1], a[2], a[3] as u32),
             nr::CLOSE => self.sys_close(a[0] as i32),
             nr::LSEEK => self
@@ -2468,6 +2474,117 @@ impl Kernel {
     fn sys_pwrite(&mut self, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
         let data = m.read(buf, len as usize)?.to_vec();
         self.fds.get(fd)?.pwrite(off, &data)
+    }
+
+    /// Copy up to `count` bytes from one descriptor to another through a kernel
+    /// buffer -- the shared core of `sendfile` and `copy_file_range`. When
+    /// `in_off`/`out_off` is `Some` it is an absolute offset used without
+    /// touching that descriptor's own position (the offset-pointer forms);
+    /// `None` uses and advances the descriptor's position. Returns the bytes
+    /// transferred. A single call moves at most one buffer, as Linux does --
+    /// callers loop for more. If the output takes fewer bytes than were read
+    /// from a positional-less input, the input is rewound so the tail is not
+    /// silently dropped.
+    fn transfer_fds(
+        &mut self,
+        in_fd: i32,
+        in_off: Option<u64>,
+        out_fd: i32,
+        out_off: Option<u64>,
+        count: u64,
+    ) -> SysResult {
+        let cap = count.min(1 << 24) as usize;
+        if cap == 0 {
+            return Ok(0);
+        }
+        let in_file = self.fds.get(in_fd)?;
+        let out_file = self.fds.get(out_fd)?;
+        let mut buf = vec![0u8; cap];
+        let n = match in_off {
+            Some(o) => in_file.pread(o, &mut buf)?,
+            None => in_file.read(&mut buf)?,
+        } as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        while written < n {
+            let w = match out_off {
+                Some(o) => out_file.pwrite(o + written as u64, &buf[written..n])?,
+                None => out_file.write(&buf[written..n])?,
+            } as usize;
+            if w == 0 {
+                break;
+            }
+            written += w;
+        }
+        // A positional-less input already advanced by the full `n`; hand back
+        // the tail the output could not take (best effort: a stream cannot seek).
+        if in_off.is_none() && written < n {
+            let _ = in_file.seek(-((n - written) as i64), 1 /* SEEK_CUR */);
+        }
+        Ok(written as u64)
+    }
+
+    /// `sendfile(out_fd, in_fd, offset_ptr, count)`: copy in the kernel. With a
+    /// non-null `offset_ptr` the read starts there and the pointer is advanced
+    /// by the count sent, leaving the input's own position untouched -- so a
+    /// server can serve the same file to many clients without seeking.
+    fn sys_sendfile(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        out_fd: i32,
+        in_fd: i32,
+        off_ptr: u64,
+        count: u64,
+    ) -> SysResult {
+        let in_off = if off_ptr != 0 {
+            Some(m.read_u64(off_ptr)?)
+        } else {
+            None
+        };
+        let sent = self.transfer_fds(in_fd, in_off, out_fd, None, count)?;
+        if let Some(o) = in_off {
+            m.write_u64(off_ptr, o + sent)?;
+        }
+        Ok(sent)
+    }
+
+    /// `copy_file_range(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`.
+    /// Both offset pointers are optional; each non-null one is used for the
+    /// transfer and then advanced by the bytes copied. `flags` is reserved and
+    /// must be zero.
+    fn sys_copy_file_range(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        fd_in: i32,
+        off_in: u64,
+        fd_out: i32,
+        off_out: u64,
+        len: u64,
+        flags: u32,
+    ) -> SysResult {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let in_off = if off_in != 0 {
+            Some(m.read_u64(off_in)?)
+        } else {
+            None
+        };
+        let out_off = if off_out != 0 {
+            Some(m.read_u64(off_out)?)
+        } else {
+            None
+        };
+        let copied = self.transfer_fds(fd_in, in_off, fd_out, out_off, len)?;
+        if let Some(o) = in_off {
+            m.write_u64(off_in, o + copied)?;
+        }
+        if let Some(o) = out_off {
+            m.write_u64(off_out, o + copied)?;
+        }
+        Ok(copied)
     }
 
     fn read_iovecs(m: &GuestMem<'_>, iov: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
@@ -5359,6 +5476,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::WRITEV => "writev",
         nr::PREAD64 => "pread64",
         nr::PWRITE64 => "pwrite64",
+        nr::SENDFILE => "sendfile",
+        nr::COPY_FILE_RANGE => "copy_file_range",
         nr::PPOLL => "ppoll",
         nr::PSELECT6 => "pselect6",
         nr::UTIMENSAT => "utimensat",
