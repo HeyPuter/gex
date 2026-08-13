@@ -20,7 +20,10 @@ int main(void) {
 
     unsigned cpu = 99, node = 99;
     long g = syscall(SYS_getcpu, &cpu, &node, 0);
-    printf("getcpu ok=%d node=%u\n", g == 0, node);
+    /* Only success is checked: the CPU and NUMA node are whatever host core the
+     * process lands on under QEMU (nondeterministic), so neither is a portable
+     * oracle -- gex reports a single scheduling domain (cpu 0, node 0). */
+    printf("getcpu ok=%d\n", g == 0);
 
     printf("priority ok\n");
     return 0;
