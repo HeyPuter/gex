@@ -23,7 +23,7 @@
 //!     side can reach.
 //!
 //!   * Structures cross as bytes, in the two layouts written out here. A
-//!     `Metadata` is 32 bytes and a directory listing is a run of entries;
+//!     `Metadata` is [`META_BYTES`] bytes and a directory listing is a run of entries;
 //!     both sides encode them with the same functions, which is why those
 //!     functions are in this file rather than in either module.
 
