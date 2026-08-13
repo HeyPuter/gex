@@ -87,6 +87,9 @@ pub mod nr {
     pub const SETITIMER: u64 = 103;
     pub const SCHED_GETAFFINITY: u64 = 123;
     pub const SCHED_YIELD: u64 = 124;
+    pub const SETPRIORITY: u64 = 140;
+    pub const GETPRIORITY: u64 = 141;
+    pub const GETCPU: u64 = 168;
     pub const KILL: u64 = 129;
     pub const TKILL: u64 = 130;
     pub const TGKILL: u64 = 131;
@@ -2073,6 +2076,14 @@ impl Kernel {
                 std::thread::yield_now();
                 Ok(0)
             }
+            // Scheduling niceness: we run every guest thread at the default
+            // priority, so report nice 0 and accept any set as a no-op. The
+            // raw getpriority ABI returns `20 - nice` (kept non-negative so a
+            // real nice value is never mistaken for an -errno), i.e. 20 here.
+            nr::GETPRIORITY => Ok(20),
+            nr::SETPRIORITY => Ok(0),
+            // getcpu(cpu, node, tcache): a single scheduling domain, CPU 0.
+            nr::GETCPU => self.sys_getcpu(m, a[0], a[1]),
             nr::TIMES => self.sys_times(m, a[0]),
             nr::GETRUSAGE => self.sys_getrusage(m, a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
@@ -2225,6 +2236,19 @@ impl Kernel {
     fn sys_rt_sigpending(&self, m: &mut GuestMem<'_>, set: u64) -> SysResult {
         if set != 0 {
             m.write_u64(set, self.signals.pending_raw())?;
+        }
+        Ok(0)
+    }
+
+    /// `getcpu`: which CPU/NUMA node the caller runs on. We present a single
+    /// scheduling domain, so both are 0. The third arg (tcache) is ignored on
+    /// modern kernels; null pointers are skipped.
+    fn sys_getcpu(&self, m: &mut GuestMem<'_>, cpu: u64, node: u64) -> SysResult {
+        if cpu != 0 {
+            m.write_u32(cpu, 0)?;
+        }
+        if node != 0 {
+            m.write_u32(node, 0)?;
         }
         Ok(0)
     }
@@ -5319,6 +5343,9 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::GETITIMER => "getitimer",
         nr::SCHED_GETAFFINITY => "sched_getaffinity",
         nr::SCHED_YIELD => "sched_yield",
+        nr::SETPRIORITY => "setpriority",
+        nr::GETPRIORITY => "getpriority",
+        nr::GETCPU => "getcpu",
         nr::KILL => "kill",
         nr::TKILL => "tkill",
         nr::TGKILL => "tgkill",
