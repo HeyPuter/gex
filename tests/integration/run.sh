@@ -509,6 +509,7 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/neon-varshift" "$HERE/programs/neon-varshift.c"
 "$CC" -static -no-pie -O2 -o "$WORK/neon-move" "$HERE/programs/neon-move.c"
 "$CC" -static -O2 -o "$WORK/itimer" "$HERE/programs/itimer.c"
+"$CC" -static -O2 -o "$WORK/eventloop" "$HERE/programs/eventloop.c"
 "$CC" -static -O2 -o "$WORK/unixsock" "$HERE/programs/unixsock.c"
 "$CC" -static -O2 -o "$WORK/hostfacilities" "$HERE/programs/hostfacilities.c"
 "$CC" -static -O2 -o "$WORK/wlclient" "$HERE/programs/wlclient.c"
@@ -631,6 +632,7 @@ compare "neon-varshift" "$WORK/neon-varshift"
 compare "neon-move" "$WORK/neon-move"
 # Interval timers: see programs/itimer.c.
 compare "itimer" "$WORK/itimer"
+compare "eventloop" "$WORK/eventloop"
 # Unix sockets and descriptor passing: see programs/unixsock.c.
 compare "unixsock" "$WORK/unixsock"
 # Shebang scripts, flock and epoll. Not compared against QEMU: the flock and
