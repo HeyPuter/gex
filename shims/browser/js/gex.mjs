@@ -1957,6 +1957,16 @@ export class Gex {
       const uid = o0.uid ?? child.uid;
       if (uid !== undefined) e.gex_set_identity(uid, o0.gid ?? child.gid ?? uid);
     }
+    // The parent's working directory, so a child inherits it as it does on
+    // Linux. `gex_adopt_child` reads the CWD global as it builds its kernel,
+    // so this has to be set first -- same ordering as the identity above.
+    if (child.cwd && e.gex_set_cwd) {
+      const c = new TextEncoder().encode(child.cwd);
+      const cp = e.gex_alloc(c.length) >>> 0;
+      this.#bytes().set(c, cp);
+      e.gex_set_cwd(cp, c.length);
+      e.gex_free?.(cp, c.length);
+    }
     const entry = e.gex_adopt_child(
       child.pid,
       child.ctx,
@@ -2338,6 +2348,19 @@ export class Gex {
             (e.gex_fork_fds_ptr() >>> 0) + (e.gex_fork_fds_len() >>> 0),
           )
         : null,
+      // The parent's working directory, so the child resolves relative paths
+      // where the parent stood rather than at `/`. Decoded to a string here
+      // because the child sets it through `gex_set_cwd`, which takes bytes it
+      // stages itself.
+      cwd:
+        e.gex_fork_cwd_len && e.gex_fork_cwd_len() > 0
+          ? new TextDecoder().decode(
+              this.#bytes().slice(
+                e.gex_fork_cwd_ptr() >>> 0,
+                (e.gex_fork_cwd_ptr() >>> 0) + (e.gex_fork_cwd_len() >>> 0),
+              ),
+            )
+          : null,
     };
     child.forkCost = {
       buildMs: Math.round(this.#imageMs),

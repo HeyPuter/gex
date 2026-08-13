@@ -1,43 +1,17 @@
-//! The browser host: the same kernel, in wasm.
+//! The browser host: the same `gex-kernel`, compiled to wasm and run beside
+//! the guest module.
 //!
-//! PLAN §9's claim is that a host is thin enough for both of them to share one
-//! `gex-kernel`. The native host is a Rust program embedding wasmtime; this
-//! one *is* wasm, and the guest module runs beside it.
+//! The shim imports the guest module's memory -- the same 4 GiB -- and puts its
+//! own heap and stack in the hole above the guest's `STACK_TOP` (see
+//! `build.sh`), so a syscall reads the guest's buffers in place with no copy.
 //!
-//! # Sharing the address space
+//! Each process is its own Worker with its own memory; threads within a process
+//! share it; state shared between processes lives in a separate kernel wasm
+//! module (`shims/kernel`) instantiated against one shared memory.
 //!
-//! Two wasm modules cannot share a memory unless both import it, so this shim
-//! imports the guest's -- the same 4 GiB the guest module gets -- and puts its
-//! own heap and stack inside it. That is not a workaround, it is what makes a
-//! syscall cheap: the kernel reads the guest's buffers where they lie, with no
-//! copy across a host boundary and no JS in the path.
-//!
-//! It works because the guest's layout leaves a hole. Everything the guest
-//! uses ends at `STACK_TOP`, two gigabytes in; the memory is just under four.
-//! The linker is told to put this module's data and stack above that (see
-//! `build.sh`), so the two never meet.
-//!
-//! # Status
-//!
-//! Runs static programs, including real ones: Lua 5.4 passes all sixteen of
-//! its own conformance files here byte-for-byte against QEMU. The suite
-//! checks twelve programs on every invocation -- the whole conformance suite,
-//! the VFS, signals, NEON and C++ exceptions.
-//!
-//! Guest threads run too, cooperatively on the one wasm stack rather than on
-//! Workers: pthreads, mutexes, condition variables and thread-local storage
-//! all work, and six threads sharing one SQLite connection give byte-identical
-//! output. See [`schedule`].
-//!
-//! Not yet: real parallelism (a Worker each, with the memory declared shared),
-//! `fork`, and runtime translation, so a module must be built with
-//! `--exhaustive`.
-//!
-//! # What JS still does
-//!
-//! Creates the memory, instantiates both modules against it, wires this
-//! module's exports to the guest module's `gex.*` imports, and supplies the
-//! two things wasm cannot do for itself: a console and a clock.
+//! JS creates the memory, instantiates both modules against it, wires this
+//! module's exports to the guest's `gex.*` imports, and supplies a console and
+//! a clock.
 
 // Only meaningful as wasm: everything below assumes it shares a linear memory
 // with the guest module beside it. On any other target the crate is empty, so
@@ -72,29 +46,19 @@ extern "C" {
     /// Write `len` bytes at `ptr` -- an address in the shared memory -- to the
     /// host's console for `fd`.
     fn write(fd: i32, ptr: u32, len: u32);
-    /// The shim's own narration, to the host's debug console.
-    ///
-    /// Not fd 2. Everything this file traces used to go to the guest's
-    /// standard error, which is the terminal a person is reading -- so a
-    /// closure diagnostic, a syscall trace and the program's own output
-    /// arrived interleaved on the same stream, and turning the noise off
-    /// meant finding and gating each site. The guest's stderr belongs to the
-    /// guest; this is a channel of our own.
+    /// The shim's own narration, to the host's debug console -- not fd 2, so a
+    /// trace never interleaves with the guest's own stderr.
     fn debug(ptr: u32, len: u32);
-    /// The same channel at error level, for the few things a person must see
-    /// whatever else is switched off: a misplaced pin, a corrupt signal
-    /// frame, a process that crashed.
+    /// The same channel at error level, for what a person must see whatever
+    /// else is switched off.
     fn warn(ptr: u32, len: u32);
     /// Nanoseconds since an arbitrary epoch.
     fn now() -> i64;
 
-    // The network. A page cannot open a socket, so every one of these is a
-    // question for JS, which has a Wisp connection to a proxy. All are
-    // non-blocking: the waiting is the kernel's job, because the kernel is
-    // what can park a guest thread, and JS blocking here would take the
-    // page's only wasm stack with it.
-    //
-    // A stream is named by a small integer JS hands out. Zero is never a
+    // The network. A page cannot open a socket, so each of these asks JS, which
+    // has a Wisp connection to a proxy. All non-blocking: only the kernel can
+    // park a guest thread, and JS blocking here would take the Worker's wasm
+    // stack with it. A stream is a small integer JS hands out; zero is never a
     // stream, so it can mean failure.
     fn net_open() -> i32;
     fn net_connect(id: i32, host: u32, host_len: u32, port: i32);
@@ -120,10 +84,8 @@ static mut HAVE_NET: bool = false;
 #[no_mangle]
 pub extern "C" fn gex_set_network(on: i32) {
     unsafe { HAVE_NET = on != 0 };
-    // Only when there is a kernel to tell. A Worker that has instantiated the
-    // shim but not yet been given a process -- everything between `attach`
-    // and `gex_adopt_child` -- has none, and every kernel built after this
-    // reads the flag on its way up anyway.
+    // Only when there is a kernel to tell: a Worker between `attach` and
+    // `gex_adopt_child` has none, and a kernel built later reads the flag anyway.
     if gex_has_host() != 0 {
         with_host(|h| {
             h.kernel.net =
@@ -216,16 +178,12 @@ impl net::NetStack for WispNet {
 
 // The global kernel: the process table, in a module of its own.
 //
-// Every process is a Worker with its own memory, so no two of them can share
-// a `ProcTable` the way two threads do -- an `Arc` is an address, and an
-// address means a memory. The table lives instead in a second wasm module
-// (`shims/kernel`) that every Worker instantiates against one shared memory,
-// so its `Vec<Proc>` is literally the same bytes for all of them.
-//
-// Reached by *calling*, which is what these imports are. JS wires them to
-// that module's exports; a host with no global kernel wires `k_present` to
-// zero and the rest to stubs, and the run keeps the table it always had, in
-// its own memory, behaving exactly as it did before this existed.
+// Every process is a Worker with its own memory, so they cannot share a
+// `ProcTable` the way threads do (an `Arc` is an address, and an address means
+// a memory). It lives in a second wasm module (`shims/kernel`) every Worker
+// instantiates against one shared memory, reached by calling these imports.
+// With no global kernel, `k_present` is zero and the rest are stubs: one
+// process with its own table, as before.
 #[link(wasm_import_module = "gex_k")]
 extern "C" {
     /// Is there a global kernel behind these calls at all?
@@ -281,12 +239,9 @@ extern "C" {
     fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
     fn k_fs_mksocket(path: u32, path_len: u32) -> i32;
     fn k_fs_add(path: u32, path_len: u32, at: u32, len: u32) -> i32;
-    /// The system-wide map from a page of a mapped object to the dispatch
-    /// slots its code was translated into. Zero means nobody has.
-    ///
-    /// In the kernel rather than here because a shim's statics are one
-    /// Worker's, and this has to be every Worker's: the whole point is that
-    /// the second process to run `ls` finds what the first one did.
+    /// The system-wide map from a page of a mapped object to the dispatch slots
+    /// its code was translated into; zero means nobody has. In the kernel so
+    /// the second process to run `ls` finds what the first one translated.
     fn k_slot_get(page: u64, key: u64) -> u32;
     fn k_slot_put(page: u64, key: u64, base: u32);
     fn k_slot_len() -> u32;
@@ -321,10 +276,8 @@ extern "C" {
     /// allocation clear of what static recompilation already assigned.
     fn k_slot_alloc(count: u64) -> u64;
     fn k_slot_floor(floor: u64);
-    /// Translated modules, once for the whole system. Knowing which slots a
-    /// page's code is in does not let a Worker reach it -- a dispatch table
-    /// belongs to a module instance -- so the module itself has to be
-    /// shareable too, and between two wasm modules that means bytes.
+    /// Translated modules, once for the whole system: a dispatch table belongs
+    /// to a module instance, so the module bytes themselves must be shareable.
     fn k_mod_store(ptr: u32, len: u32, slots: u64, dirs_ptr: u32, dirs_len: u32) -> u32;
     fn k_mod_claim(page: u64, key: u64, id: u32);
     fn k_mod_for(page: u64, key: u64, n: u32) -> u32;
@@ -392,13 +345,10 @@ extern "C" {
 
 /// A page table whose runtime allocations come from the system-wide counter.
 ///
-/// Every process gets one. The slots a statically recompiled image was built
-/// with stay exactly as built -- it is the same code in every process, so the
-/// same numbers are right -- and the mark is raised above them so nothing
-/// translated at runtime can land there. Everything after that is drawn in
-/// chunks from the kernel, which is what lets one process install a module
-/// another one translated: the range it occupies was issued once, to its
-/// translator, and no other process holds it.
+/// Statically recompiled slots stay as built (same code, same numbers in every
+/// process); the mark is raised above them so nothing translated at runtime
+/// lands there; everything after is drawn in kernel-issued chunks, so one
+/// process can install a module another translated without slot collisions.
 fn shared_page_table(
     entries: &[(u64, u32)],
     next_slot: u64,
@@ -416,27 +366,10 @@ fn shared_page_table(
         // SAFETY: as above.
         unsafe { k_slot_alloc(n) }
     }))));
-    // And now that allocation comes from the kernel, forget how long
-    // `from_entries` thought the tables had to be.
-    //
-    // It recorded two things, and with a refill in place neither is this
-    // process's to pay for. The allocation mark is where *the build* stopped
-    // numbering, and this table does not allocate there any more -- every
-    // chunk comes from `k_slot_alloc`. The build's entry for each image page
-    // is where that page sits only if somebody publishes it there, and a
-    // claiming process publishes none of them: it numbers its own.
-    //
-    // Left in, the mark alone made `gex_table_need(0)` report the whole
-    // closure's 3,800,064 slots from the moment a Worker started, so the
-    // first install grew table 0 to hold them -- two `Table.grow`s, 790ms of
-    // an 815ms install, for a process that goes on to use fifty thousand.
-    //
-    // The entries are kept -- a page published at the build's base needs its
-    // table to reach it -- so this is safe whatever the image looks like. The
-    // first attempt gated on `n_blocks > BIG_BLOCKS`, reasoning that a small
-    // image writes absolute slots at instantiation; but the metadata here is
-    // the *seed* module's, which is small, so the gate was never true and the
-    // number never moved. The entries carry that requirement anyway.
+    // With a refill in place, forget the allocation mark: left in, it made
+    // `gex_table_need(0)` report the whole closure's slots at once, growing
+    // table 0 massively on first install. Entries are kept -- a page published
+    // at the build's base needs its table to reach it.
     if claim_pages() {
         table.forget_mark_high();
     }
@@ -460,10 +393,8 @@ pub(crate) fn virgl_release_session(id: i32) {
     }
 }
 
-// A wasm import is `unsafe`, and `Remote` holds safe fn pointers, so each one
-// needs a wrapper. Written out rather than generated: a macro here would save
-// thirty lines and cost the ability to read the surface at a glance, which is
-// the one thing this list is for.
+// A wasm import is `unsafe` and `Remote` holds safe fn pointers, so each needs
+// a wrapper.
 extern "C" fn r_spawn(ppid: i32) -> i32 {
     unsafe { k_spawn(ppid) }
 }
@@ -608,28 +539,19 @@ extern "C" fn rp_new(pid: i32) -> i32 {
     pipe_note("new", id, 0);
     id
 }
-/// This process's pid, for the calls that have to name it.
+/// This process's pid, for the calls that name it.
 ///
-/// A plain static, because the shim's memory belongs to one guest process --
-/// one Worker per process is the whole design. The first attempt put this in
-/// the *global* kernel, which every Worker shares, so an end opened under one
-/// pid was closed under whichever pid happened to have made a syscall most
-/// recently. The removal missed, `k_pipe_forget` closed the end a second
-/// time, a reader saw end-of-file early and `bash` died of SIGABRT.
+/// A plain static: the shim's memory is one process's (one Worker per process).
+/// Putting it in the shared kernel meant a pipe end opened under one pid was
+/// closed under another, double-closing ends.
 static MY_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn my_pid() -> i32 {
     MY_PID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Every change to a pipe's end counts, with who made it and what the
-/// counts became.
-///
-/// A pipe whose last writer has exited must report end-of-file. gpgv's read
-/// on pipe 9 never does: 2.3 seconds after `[proc] exit 8` the pipe still
-/// says `1 readers 1 writers`, and the reader had been woken and re-checked,
-/// so a decrement is missing rather than a wake. An aggregate cannot say
-/// which one -- only the sequence can. See task 140.
+/// Traces every change to a pipe's ends, with who made it -- an aggregate
+/// cannot show which decrement went missing, only the sequence can.
 fn pipe_note(what: &str, id: i32, write: i32) {
     if !tracing() {
         return;
@@ -869,9 +791,9 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
 /// The root every process shares, if the host gave us a global kernel.
 ///
 /// Mounted at `/` in place of this process's own `TmpFs`. Without it a forked
-/// child arrives with an empty root and its `execve` cannot find the program
-/// it was forked to run -- under the switcher the child got its parent's
-/// whole address space and the question never came up.
+/// child arrives with an empty root and its `execve` cannot find the program.
+/// (The removed switcher gave the child its parent's whole address space, so
+/// the question never came up.)
 fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
     if unsafe { k_present() } == 0 {
         return None;
@@ -900,12 +822,8 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
     )))
 }
 
-/// Put the page's bundle into the shared root, once for the whole system.
-///
-/// The first process to load fills it; every later one finds it filled and
-/// does nothing, which matters because the bundle is the same two hundred
-/// megabytes of rootfs each time and unpacking it per process would be both
-/// slow and pointless.
+/// Put the page's bundle into the shared root, once for the whole system: the
+/// first process to load fills it, later ones find it filled and do nothing.
 fn install_bundle_remote() {
     // The files went in as they arrived -- see `gex_add_file` -- so all that
     // is left is to say the bundle is complete. `FILES` is empty on this path
@@ -930,15 +848,12 @@ fn browser_clock() -> (u64, u32) {
 
 /// The guest's standard input, as a queue the page appends to.
 ///
-/// A page that hands over a fixed buffer up front can run a filter. A page
-/// with a terminal in it cannot: the bytes do not exist until someone types
-/// them, and a shell asks for them long before that. So this is a queue --
-/// `gex_push_stdin` adds to it, a read takes from it, and a read that finds
-/// it empty parks the calling thread until it is not (see `Waiting::Read`).
+/// A terminal's bytes do not exist until someone types them, so this is a
+/// queue: `gex_push_stdin` adds, a read takes, a read that finds it empty parks
+/// the thread (see `Waiting::Read`).
 ///
-/// `eof` is the difference between "nothing yet" and "nothing ever". Without
-/// it a shell reading its script from stdin waits forever at the end instead
-/// of exiting.
+/// `eof` distinguishes "nothing yet" from "nothing ever": without it a shell
+/// reading its script from stdin waits forever at the end.
 #[derive(Debug, Default)]
 struct StdinQueue {
     bytes: RefCell<VecDeque<u8>>,
@@ -971,12 +886,9 @@ impl FileHandle for StdinQueue {
                 return Ok(n as u64);
             }
         }
-        // Then the shared queue, which is where a keystroke goes now. It is
-        // in the kernel rather than here so that whoever has it can write it
-        // and wake a *parked* reader: a Worker asleep inside wasm is not
-        // running the event loop a `postMessage` would arrive on, which is
-        // the whole reason waits used to be sorted into "the page ends this"
-        // and "another Worker ends this".
+        // Then the shared queue, where a keystroke goes now: in the kernel so
+        // whoever has it can write and wake a parked reader, since a Worker
+        // asleep inside wasm cannot receive a `postMessage`.
         // SAFETY: scalars, and the kernel refuses a range outside this
         // process's memory rather than writing it.
         if unsafe { k_present() } != 0 {
@@ -1030,11 +942,9 @@ impl FileHandle for StdinQueue {
 /// Mount `/dev`, and bind the virtio-gpu socket if the page brought a
 /// renderer. Returns the device, which the `Host` holds.
 ///
-/// A function because every kernel this shim builds needs it, and there is
-/// more than one: the process `gex_load` places, and every child
-/// `gex_adopt_child` adopts. A child given only the root filesystem has no
-/// `/dev/null` to redirect into and no GPU to draw on, and the gears demo is
-/// a shell script that wants both in its first two lines.
+/// A function because every kernel this shim builds needs it -- both the
+/// process `gex_load` places and every child `gex_adopt_child` adopts, since a
+/// child with only the root filesystem has no `/dev/null` and no GPU.
 fn mount_devices(kernel: &mut Kernel) -> Option<crate::virgl::VirglDevice> {
     let mut devfs = gex_kernel::vfs::DevFs::new();
     devfs.add("tty", Arc::new(Tty));
@@ -1042,10 +952,9 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::virgl::VirglDevice> {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
     }
     kernel.vfs.mount("/dev", Arc::new(devfs));
-    // Only when the page brought one: a guest that connects to a socket
-    // nobody serves is worse off than one that finds no socket, because
-    // Mesa's winsys does not fall back -- it writes its handshake into the
-    // dead descriptor and blocks reading a reply that cannot come.
+    // Only when the page brought one: Mesa's winsys does not fall back if the
+    // socket is unserved -- it writes its handshake and blocks on a reply that
+    // cannot come, worse than finding no socket at all.
     crate::virgl::have_virgl().then(|| {
         let device = crate::virgl::VirglDevice::new();
         kernel.socket_names.bind_host(
@@ -1059,10 +968,9 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::virgl::VirglDevice> {
 /// Mount `/proc`. Returns the source it reads from, which the `Host` holds
 /// and the scheduler keeps up to date.
 ///
-/// It matters more than it looks: a program that cannot open
-/// `/proc/self/maps` gets a null `FILE*` back, and the next `fgets` calls
-/// through it. That surfaces as a jump to address zero -- a dispatch miss at
-/// pc=0 -- with nothing to say the filesystem was the cause.
+/// Matters more than it looks: a program that cannot open `/proc/self/maps`
+/// gets a null `FILE*`, and the next `fgets` calls through it -- surfacing as a
+/// dispatch miss at pc=0 with nothing to blame the filesystem.
 fn mount_procfs(kernel: &mut Kernel) -> Arc<gex_kernel::KernelProcSource> {
     let proc_state: Arc<gex_kernel::KernelProcSource> = Arc::new(gex_kernel::KernelProcSource(
         std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
@@ -1076,12 +984,10 @@ fn mount_procfs(kernel: &mut Kernel) -> Arc<gex_kernel::KernelProcSource> {
 
 /// Give a kernel the three standard descriptors, pointed at the page.
 ///
-/// `Kernel::new` installs `gex-kernel`'s own, which write through `std::io`
-/// and on `wasm32-unknown-unknown` go nowhere at all. Every kernel this shim
-/// builds has to have them replaced, and there is more than one such kernel:
-/// the process `gex_load` places, and every child `gex_adopt_child` adopts.
-/// A forked child whose output vanished is exactly what happened when only
-/// the first of those did it -- the guest ran correctly and said nothing.
+/// `Kernel::new`'s own descriptors write through `std::io`, which on
+/// `wasm32-unknown-unknown` goes nowhere, so every kernel this shim builds must
+/// replace them -- both `gex_load`'s process and every `gex_adopt_child` child,
+/// or a forked child's output vanishes.
 fn install_console(kernel: &mut Kernel) {
     let _ = kernel.fds.install(
         0,
@@ -1113,13 +1019,8 @@ fn install_console(kernel: &mut Kernel) {
 
 /// `/dev/tty`: the process's controlling terminal, readable and writable.
 ///
-/// A shell with job control opens this before it will run anything. dash's
-/// `setjobctl` opens `_PATH_TTY`, and when the open fails it falls back to
-/// whichever of the first three descriptors is a terminal and dups that out
-/// of the way -- and *that* is the descriptor a forked child could not
-/// rebuild. Providing the device is the honest fix as well as the cheaper
-/// one: `/dev/tty` is what `less`, `ssh` and `sudo` reach for too, and none
-/// of them accepts a substitute.
+/// A shell with job control opens this before running anything, as do `less`,
+/// `ssh` and `sudo`; none accepts a substitute.
 #[derive(Debug)]
 struct Tty;
 
@@ -1174,20 +1075,15 @@ impl FileHandle for Console {
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
-        // `c_oflag` first, when this console is a terminal. `ONLCR` is why a
-        // Unix program can write `\n` and have the cursor come back to the
-        // left margin; without it every line starts one column further right
-        // than the last, which is the staircase a serial terminal gives you.
-        // A program that turns `OPOST` off -- `less`, `vi`, anything that
-        // places its own cursor -- gets its bytes through untouched, which is
-        // exactly why this cannot be hard-coded in the page.
+        // `c_oflag` first, when this console is a terminal: `ONLCR` maps `\n` to
+        // CR-LF, and `OPOST` off (`less`, `vi`) passes bytes through untouched,
+        // so it cannot be hard-coded in the page.
         if unsafe { STDIN_TTY } {
             if let Some(cooked) = console_tty().output(buf) {
                 unsafe { write(self.fd, cooked.as_ptr() as u32, cooked.len() as u32) };
-                // The count returned is what the guest asked to write, not
-                // what the translation made of it: a `write` that says it
-                // wrote more bytes than it was given sends libc into a loop
-                // over a buffer that has already gone.
+                // Return what the guest asked to write, not the translated
+                // length: a count above the input sends libc looping over a
+                // buffer that has already gone.
                 return Ok(buf.len() as u64);
             }
         }
@@ -1213,35 +1109,26 @@ impl FileHandle for Console {
         true
     }
 
-    /// Not a terminal. A page's console looks like one, but saying so makes
-    /// musl line-buffer stdout, and then a program's bytes interleave
-    /// differently from the same program's under a pipe -- which is what
-    /// every comparison in the suite runs the reference against.
+    /// Not a terminal: saying so makes musl line-buffer stdout, so bytes would
+    /// interleave differently from the same program under a pipe -- what the
+    /// suite compares against.
     fn is_tty(&self) -> bool {
         false
     }
 }
 
-// The shim's own heap.
+// The shim's own heap: a fixed region above this module's data, because the
+// memory is the guest's and cannot grow (its top is fixed so the guest's stack
+// lands where the ABI says).
 //
-// Rust's default allocator grows the memory when it runs out, and this memory
-// cannot grow: it is the guest's, fixed at its maximum so the guest's stack
-// lands where the ABI says. So the heap is a fixed region instead --
-// everything between the end of this module's data and the end of the address
-// space, which is the rest of the two gigabytes the guest never touches.
+// Talc rather than a first-fit list: the translator allocates constantly, and
+// binned free lists keep allocation from degrading as the heap fragments
+// (lifting tcc's largest source: 15.2s first-fit vs 0.3s).
 //
-// It has to be a *good* allocator, which only became obvious once runtime
-// translation started running inside the shim. A first-fit linked list walks
-// its free list on every allocation and the translator allocates constantly:
-// lifting tcc's largest source took 15.2 seconds that way, against 0.3 with a
-// bump allocator that never freed. Talc bins its free lists, so allocation
-// does not degrade as the heap fragments, and it still frees.
-// Two of them, because the two builds differ in exactly one way that matters
-// here. Against a plain memory the module is single-threaded and a cell is
-// enough. Against a *shared* memory each of a process's threads can be its own
-// Worker and be inside this module at the same time, so the heap needs a real
-// lock -- and `TalcSyncCell` says so itself, refusing to compile once the
-// target has atomics rather than being quietly unsound.
+// Two builds: a plain memory is single-threaded and a cell suffices; a shared
+// memory can have several of a process's Worker-threads inside this module at
+// once, so it needs a real lock -- `TalcSyncCell` refuses to compile with
+// atomics rather than being quietly unsound.
 #[cfg(not(feature = "shared-memory"))]
 type Heap = talc::cell::TalcSyncCell<ShimRegion, talc::wasm::WasmBinning>;
 #[cfg(not(feature = "shared-memory"))]
@@ -1258,27 +1145,14 @@ static ALLOC: Counting = Counting(HEAP, std::sync::atomic::AtomicUsize::new(0));
 
 /// The heap, plus how much of it is out on loan.
 ///
-/// Talc keeps this figure itself, behind its `counters` feature -- but only
-/// on the plain `TalcCell`, and the shim's allocator is a `TalcSyncCell`,
-/// which wraps one and does not pass the accessor through. Counting here is
-/// less code than working around that, and it counts the same thing.
-///
-/// The total is worth having because the heap is *fixed*: `__heap_base` to
-/// the top of memory, about 2039 MiB, with no growing, because the memory
-/// belongs to the guest and moving its top would move where the guest's stack
-/// lands. Running out has no symptom of its own -- the page sees a fault at
-/// whatever the guest touched next -- so the only way to know is to ask.
-///
-/// Without `heap-counters` this is the allocator and nothing else: the
-/// counting arms compile away and what is left is a delegating newtype.
+/// The total is worth having because the heap is fixed: running out has no
+/// symptom of its own (the page just faults at whatever the guest touched
+/// next), so the only way to know is to ask. Without `heap-counters` the
+/// counting arms compile away, leaving a delegating newtype.
 struct Counting(Heap, std::sync::atomic::AtomicUsize);
 
-/// Live bytes by size class, so a full heap can say *what* is filling it.
-///
-/// The total alone could not: 1,676 MiB live says the heap is genuinely
-/// occupied rather than fragmented, and stops there. A few enormous buffers
-/// and a million small ones want completely different fixes, and the classes
-/// tell them apart at the cost of two atomics per allocation. See task 140.
+/// Live bytes by size class, so a full heap can say *what* is filling it: a few
+/// enormous buffers and a million small ones want different fixes.
 ///
 /// Classes: <64 KiB, <1 MiB, <4 MiB, <16 MiB, >=16 MiB.
 static LIVE_BYTES: [std::sync::atomic::AtomicUsize; 5] =
@@ -1296,13 +1170,9 @@ fn size_class(n: usize) -> usize {
     }
 }
 
-/// The distinct sizes seen in the 1-4 MiB class, with a count each.
-///
-/// That class holds 1,640 MiB of the heap in about 1,637 live blocks, so the
-/// leak is something a megabyte in size allocated over and over. An average
-/// cannot be grepped for; an exact byte count can. First eight distinct sizes
-/// win a slot -- enough to name the offender, and no allocation in the hot
-/// path does more than walk eight words. See task 140.
+/// The distinct sizes seen in the 1-4 MiB class, with a count each, to name a
+/// megabyte-sized block allocated over and over. First eight distinct sizes win
+/// a slot, so the hot path walks at most eight words.
 static BIG_SIZES: [std::sync::atomic::AtomicUsize; 8] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
 static BIG_SIZE_N: [std::sync::atomic::AtomicUsize; 8] =
@@ -1356,20 +1226,12 @@ unsafe impl Sync for Counting {}
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
         let p = unsafe { self.0.alloc(l) };
-        // Rust turns a null into `handle_alloc_error`, which aborts, which in
-        // wasm is a bare `unreachable` with nothing said. That is the least
-        // debuggable failure this shim has: the heap is a *fixed* region --
-        // the memory belongs to the guest and cannot grow -- so running out
-        // is a real and reachable state, and it used to surface as a guest
-        // that mysteriously stopped. Say it before the abort.
+        // A null becomes `handle_alloc_error` -> abort -> a bare wasm
+        // `unreachable` with nothing said. The heap is fixed, so running out is
+        // reachable; say so before the abort.
         if p.is_null() {
-            // With where the arena had got to and how big the memory is.
-            //
-            // "Out of heap" stopped being the whole story when the heap
-            // started taking spans from the growing arena: the request can
-            // fail because the arena has reached its ceiling, or because the
-            // memory would not grow, and those want different fixes. The
-            // numbers say which.
+            // The request can fail because the arena hit its ceiling or because
+            // the memory would not grow; the numbers say which.
             trace_line(&format!(
                 "gex: out of shim heap asking for {} bytes (align {}); {} of {} MiB in use; \
                  arena at {:#x} of {:#x}, memory {} MiB\n",
@@ -1399,9 +1261,8 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         unsafe { self.0.dealloc(p, l) }
     }
 
-    // Realloc is forwarded rather than left to the default, which would
-    // allocate-copy-free: talc grows in place where it can, and the lifter
-    // pushes onto a great many vectors.
+    // Forwarded, not left to the default's allocate-copy-free: talc grows in
+    // place where it can, and the lifter pushes onto many vectors.
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
         let q = unsafe { self.0.realloc(p, l, new) };
         #[cfg(feature = "heap-counters")]
@@ -1434,33 +1295,22 @@ struct ShimRegion;
 
 /// Make the memory cover everything below `end`.
 ///
-/// A process's memory starts at what its fixed low layout needs -- contexts,
-/// image, break, stack -- and grows from there. Both things that grow, the
-/// guest's mmap arena and this module's heap, come through here, so the
-/// memory is never larger than what a run has actually asked for.
-///
-/// Returns false when the engine will not give any more, which is a real
-/// answer: `mmap` reports ENOMEM and the allocator fails, rather than the
-/// process being killed by a trap on an address that was never backed.
+/// Both growing consumers -- the guest's mmap arena and this module's heap --
+/// come through here, so the memory never exceeds what a run asked for.
+/// Returns false when the engine will give no more, so `mmap` reports ENOMEM
+/// rather than the process trapping on an address that was never backed.
 fn grow_memory_to(end: u64) -> bool {
     const PAGE: u64 = 65536;
     let have = warch::memory_size(0) as u64 * PAGE;
     if end <= have {
         return true;
     }
-    // A megabyte at a time past what was asked for. `memory.grow` is not
-    // cheap -- the engine may copy -- and a guest that maps a page at a time
-    // would otherwise pay for each one.
+    // A megabyte at a time past what was asked for: `memory.grow` may copy, so
+    // a guest mapping a page at a time should not pay per page.
     let want = (end - have).div_ceil(PAGE).max(16);
     warch::memory_grow(0, want as usize) != usize::MAX
 }
 
-/// The arena both the guest and this module take from, in address order.
-///
-/// One cursor rather than two regions: two would each need a fixed ceiling,
-/// and a fixed ceiling is memory a process pays for whether it uses it or
-/// not. Anything the guest unmaps goes back to the kernel's own free list;
-/// this only ever moves up.
 /// How many of an object's stored units one dispatch miss may take, merged
 /// into a single module. See the use site in the miss path.
 static PER_MISS_N: std::sync::atomic::AtomicUsize =
@@ -1474,13 +1324,9 @@ pub extern "C" fn gex_set_per_miss(n: u32) {
     }
 }
 
-/// What the arena has been spent on, by whoever asked.
-///
-/// Three consumers share one cursor and only one of them goes through the
-/// memory map, which is how a fix aimed at the map turned out to be inert on
-/// the path that actually fails. These say which is which before anything is
-/// changed again: `[0]` the guest's mappings, `[1]` this module's heap, `[2]`
-/// the per-Worker stacks. `[3]` is the largest single claim.
+/// What the arena has been spent on, by whoever asked: `[0]` guest mappings,
+/// `[1]` this module's heap, `[2]` per-Worker stacks, `[3]` largest single
+/// claim. Three consumers share one cursor; only `[0]` goes through the map.
 static ARENA_SPENT: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
@@ -1558,35 +1404,14 @@ static ARENA_NEXT: std::sync::atomic::AtomicU64 =
 /// Take `len` bytes of arena for this module's heap.
 fn arena_take(len: u64) -> Option<u64> {
     let at = ARENA_NEXT.load(std::sync::atomic::Ordering::Relaxed);
-    // Above the placement window, never inside it. The window is where
-    // shared objects go so that every process has them at the same address,
-    // and this cursor is the one thing that could put something else there:
-    // the heap and the arena both take from it, and neither is visible to
-    // the memory map's own idea of what is free.
-    //
-    // And above whatever the memory already reaches, which is the part that
-    // took three days to find. This cursor is a static of *this module
-    // instance*, so it is zero in every freshly instantiated shim -- but a
-    // forked child instantiates a fresh shim over a memory that already holds
-    // its parent's entire address space, every byte of it handed out from
-    // `ARENA_BOTTOM` upwards. Starting at `ARENA_BOTTOM` there hands the
-    // child's first claim a span the parent is still using, and nothing
-    // notices: `MemoryMap::mmap` inserts an arena-extended range without
-    // asking whether it is free, because the arena is meant to be the one
-    // allocator that cannot collide.
-    //
-    // What claims it first is usually this module's own heap, so the damage
-    // lands wherever the parent's mappings happen to be -- and the guest
-    // meets it later as heap corruption somewhere else entirely. `apt update`
-    // died in `malloc_consolidate(): invalid chunk size` in a forked child,
-    // moved when an unrelated string changed length, and did not happen under
-    // a closure at all: a child running code somebody else translated barely
-    // allocates, so it never claimed a span. See #96.
-    //
-    // The memory is grown to cover the whole inherited image before this
-    // module is instantiated, so its size is exactly the floor wanted. For a
-    // process that was not forked it is below `ARENA_BOTTOM` and this is the
-    // behaviour it always had.
+    // First claim starts above both the placement window (where shared objects
+    // sit at a common address) and whatever the memory already reaches. The
+    // cursor is a per-instance static, zero in a fresh shim -- but a forked
+    // child's fresh shim runs over a memory already holding its parent's image,
+    // so starting at `ARENA_BOTTOM` would hand out spans the parent still uses
+    // (nothing checks: the arena is meant to be the one allocator that cannot
+    // collide). The memory is grown to cover the inherited image first, so its
+    // size is the floor; an unforked process is below `ARENA_BOTTOM` as before.
     let at = if at == 0 {
         gex_abi::ARENA_BOTTOM.max(warch::memory_size(0) as u64 * 65536)
     } else {
@@ -1594,26 +1419,12 @@ fn arena_take(len: u64) -> Option<u64> {
     };
     let end = at.checked_add(len)?;
     if end > gex_abi::MMAP_TOP || !grow_memory_to(end) {
-        // Out loud, because the caller cannot say it.
-        //
-        // Both callers turn `None` into an allocation failure, and Rust's
-        // allocation failure is not a panic: `handle_alloc_error` aborts
-        // without going near the panic hook, so the run ends as a bare
-        // `unreachable` with nothing printed. `apt-get update` reported only
-        //
-        //     trapped inside the shim (unreachable, after syscall 63)
-        //
-        // which names the guest's pc and says nothing about the arena being
-        // the thing that ran out. This is the only place that knows.
-        // Without allocating, which is the whole difficulty.
-        //
-        // This *is* the allocator's refill path: `ShimRegion::acquire` calls
-        // it, and `format!` asks the allocator for a string. Written the
-        // obvious way, a failure formatted a message, which allocated, which
-        // refilled, which failed, which formatted -- and `apt-get update`
-        // went from aborting with no reason to hanging with no reason, which
-        // is worse. A fixed buffer on the stack and `core::fmt` into it
-        // touches no allocator at all.
+        // Out loud, because the caller turns `None` into `handle_alloc_error`,
+        // which aborts past the panic hook as a bare `unreachable` with nothing
+        // printed. This is the only place that knows the arena ran out -- and
+        // it must say so without allocating: it *is* the allocator's refill
+        // path (`ShimRegion::acquire`), so a `format!` would refill, fail, and
+        // recurse. A fixed stack buffer and `core::fmt` touch no allocator.
         use core::fmt::Write as _;
         struct Buf([u8; 1400], usize);
         impl core::fmt::Write for Buf {
@@ -1625,11 +1436,8 @@ fn arena_take(len: u64) -> Option<u64> {
                 Ok(())
             }
         }
-        // 1024, because the report has grown again -- the size-class
-        // histogram is the newest field and would be the first thing lost. `write!` into a full buffer
-        // stops silently, and the last thing added is the first thing lost --
-        // the queue high-water mark vanished off the end of a 448-byte one
-        // and read as absent rather than as truncated.
+        // Sized generously: `write!` into a full buffer stops silently, so the
+        // last field added is the first lost and reads as absent, not truncated.
         let mut b = Buf([0; 1400], 0);
         let _ = write!(
             b,
@@ -1646,28 +1454,20 @@ fn arena_take(len: u64) -> Option<u64> {
              Live by size class -- <64K: {} KiB in {}, <1M: {} KiB in {}, \
              <4M: {} KiB in {}, <16M: {} KiB in {}, >=16M: {} KiB in {}. \
              1-4M sizes: {}x{} {}x{} {}x{} {}x{} {}x{} {}x{} {}x{} {}x{}.\n",
-            // Whose arena. Every Worker logs to the same console, so without
-            // this the report had to be pinned to a process by reading the
-            // lines around it -- which interleave, and so is a guess. A plain
-            // atomic, safe to read here: this runs inside the allocator's
-            // refill path and must not borrow the host.
+            // Whose arena: every Worker logs to the same console. A plain
+            // atomic, safe here where borrowing the host is not.
             my_pid(),
             gex_abi::MMAP_TOP,
             ARENA_SPENT[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[1].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[2].load(std::sync::atomic::Ordering::Relaxed) >> 20,
             ARENA_SPENT[3].load(std::sync::atomic::Ordering::Relaxed),
-            // KiB, and not divided. Without `heap-counters` this is -1, and
-            // `-1 / 1024` truncates to 0 -- so the report read "0 MiB live"
-            // while the heap held 1,699 MiB, and that looked like a leak
-            // rather than like an unanswered question. Printed raw, the
-            // sentinel survives, and the legend below already says what -1
-            // means. Nothing here may allocate: this runs inside the
-            // allocator's own refill path, so no `format!`.
+            // KiB, undivided: without `heap-counters` this is the sentinel -1,
+            // and `-1 / 1024` truncates to 0 and reads as a leak. Printed raw,
+            // the sentinel survives.
             gex_heap_used_kib(),
             REGISTRY_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
-            // A static in the kernel, read directly: this runs inside the
-            // allocator's refill path and must not borrow the host.
+            // A kernel static, read directly: must not borrow the host here.
             gex_kernel::vfs::tmpfs::TMPFS_BYTES
                 .load(std::sync::atomic::Ordering::Relaxed)
                 >> 20,
@@ -1728,10 +1528,9 @@ fn arena_take(len: u64) -> Option<u64> {
 
 /// Make the memory reach `end`, and keep the arena above it.
 ///
-/// For a mapping the guest placed itself -- `MAP_FIXED`, or an address hint
-/// the map honoured. The range is the guest's, so nothing else may be handed
-/// out below it: this module's heap takes from the same cursor and would
-/// otherwise put its bookkeeping inside a mapping the guest is using.
+/// For a mapping the guest placed itself (`MAP_FIXED` or an honoured hint): the
+/// range is the guest's, and the heap takes from the same cursor, so the cursor
+/// must not stay below it.
 fn arena_back(end: u64) -> bool {
     if !grow_memory_to(end) {
         return false;
@@ -1754,8 +1553,7 @@ fn arena_grow(len: u64) -> u64 {
 /// Where this module's heap currently ends, so a new span can extend it.
 ///
 /// `talc` keeps each claimed span separate; only `extend` joins new memory to
-/// one it already owns, and that needs the old end. Zero means nothing has
-/// been claimed yet.
+/// one it owns, and that needs the old end. Zero means nothing claimed yet.
 static HEAP_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 unsafe impl talc::source::Source for ShimRegion {
@@ -1763,30 +1561,19 @@ unsafe impl talc::source::Source for ShimRegion {
         talc: &mut talc::base::Talc<Self, B>,
         _layout: std::alloc::Layout,
     ) -> Result<(), ()> {
-        // A span at a time, from the arena the guest's mappings come from
-        // too, and each one grows the memory behind it.
-        //
-        // It used to claim everything between this module's data and the top
-        // of a fixed four-gigabyte memory, once. That is why the memory had
-        // to *be* four gigabytes: the ceiling was the allocator's, and a
-        // process paid for it before it had allocated a byte.
+        // A span at a time, from the same arena as the guest's mappings, each
+        // growing the memory behind it. (It once claimed everything up to a
+        // fixed 4 GiB ceiling at once, which is why the memory had to be 4 GiB.)
         const CHUNK: u64 = 16 * 1024 * 1024;
         let len = (_layout.size() as u64 + _layout.align() as u64).max(CHUNK);
         let len = len.next_multiple_of(65536);
         arena_note(1, len);
-        // How many refills, and the biggest single allocation that forced
-        // one. 1,880 MiB in 16 MiB chunks is about 117 refills whatever the
-        // shape, so the count alone says little -- but the largest *layout*
-        // separates one buffer growing by doubling from many live objects.
-        // See #140.
+        // Count of refills, plus the biggest single layout that forced one --
+        // which separates one doubling buffer from many live objects.
         HEAP_REFILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         {
-            // Exact syscall numbers, not folded.
-            //
-            // The first version kept `nr % 15`, and slot 3 is `read` (63),
-            // `readlinkat` (78) and `socket` (198) at once -- which read as
-            // "the read path" and sent a fix to the wrong function. Eight
-            // pairs, first come first served.
+            // Exact syscall numbers, not folded: `nr % 15` collided `read`,
+            // `readlinkat` and `socket`. Eight pairs, first come first served.
             let n = SYSCALL_NR.load(std::sync::atomic::Ordering::Relaxed);
             HEAP_LAST_CALL.store(n, std::sync::atomic::Ordering::Relaxed);
             for i in 0..8 {
@@ -1811,15 +1598,8 @@ unsafe impl talc::source::Source for ShimRegion {
             }
         }
         {
-            // And who asked for the biggest one.
-            //
-            // The count of refills per syscall says only which syscall is
-            // most common -- `SYSCALL_NR` is set on entry and never cleared,
-            // so it is the most *recent* call, not the one in flight. This
-            // does not have that problem: a new maximum is a single event,
-            // and whatever was last entered is the best name available for
-            // it. 23.25 MiB is bigger than either read buffer could be, so
-            // the caller is something else. See task 140.
+            // Who asked for the biggest one: a new maximum is a single event,
+            // so the last-entered syscall is the best name available for it.
             let sz = _layout.size() as u64;
             let prev =
                 HEAP_BIGGEST.fetch_max(sz, std::sync::atomic::Ordering::Relaxed);
@@ -1836,22 +1616,10 @@ unsafe impl talc::source::Source for ShimRegion {
         }
         let base = arena_take(len).ok_or(())? as *mut u8;
         // Extend the last span when this one abuts it, rather than claiming a
-        // second one beside it.
-        //
-        // `claim` gives talc a span it keeps separate from every other, so a
-        // request larger than any single span cannot be served from two of
-        // them however adjacent they are -- and `arena_take` hands out one
-        // cursor that only goes up, so they usually *are* adjacent. A buffer
-        // that grows by doubling therefore walked the arena upwards, taking a
-        // fresh chunk each time and stranding everything behind it.
-        //
-        // Measured on `apt-get update`: 1,882 MiB of a 2 GiB arena spent by
-        // this heap, in about 117 chunks, with the largest single request
-        // 33.9 MiB. The guest's own mappings were 8 MiB of it.
-        //
-        // Not assumed adjacent: the guest's mappings and the per-Worker
-        // stacks draw from the same cursor, so a claim can land above one of
-        // theirs. The pointers are compared rather than trusted.
+        // separate one: talc cannot serve a request larger than any single span
+        // from two adjacent ones, so a doubling buffer would otherwise strand
+        // every chunk behind it. Adjacency is checked, not assumed -- the
+        // guest's mappings and Worker stacks draw from the same cursor.
         let end = HEAP_END.load(std::sync::atomic::Ordering::Relaxed);
         let new_end = unsafe {
             if end != 0 && end == base as usize {
@@ -1893,46 +1661,25 @@ enum Waiting {
     Read(Arc<dyn gex_kernel::vfs::FileHandle>),
     /// Waiting for room in a stream: a pipe nobody has drained yet.
     Write(Arc<dyn gex_kernel::vfs::FileHandle>),
-    /// Waiting in `accept` for a client to arrive.
-    ///
-    /// This used to park as `Runnable`, on the reasoning that the scheduler
-    /// would come back round and ask again. It does -- and `finish_parked`
-    /// answers EAGAIN when nothing has arrived, which is the right answer for
-    /// a *non-blocking* accept and is handed straight to the guest. A server
-    /// therefore got EAGAIN from a blocking `accept` and gave up. Nothing
-    /// noticed because the only host-served socket was the virtio-gpu
-    /// renderer, where the guest connects and never accepts.
+    /// Waiting in a blocking `accept` for a client. Must not park as
+    /// `Runnable`: `finish_parked` would answer EAGAIN (right only for a
+    /// non-blocking accept) and the server would give up.
     Accept(Arc<dyn gex_kernel::vfs::FileHandle>),
-    /// Waiting in `wait4` for a child to finish.
-    ///
-    /// This used to be impossible: the parent was frozen until the child
-    /// exited, so a `wait4` that ran at all was asking about a child whose
-    /// status was already recorded. Now that processes take turns, a parent
-    /// can reach `wait4` while its child is still running, and has to park
-    /// like anything else.
+    /// Waiting in `wait4` for a child. Possible only since processes take
+    /// turns: a parent can now reach `wait4` while its child still runs.
     Child,
-    /// Waiting on the network -- a connection coming up, or a `poll` with
-    /// nothing ready. Whether it is ready is a question for the operation
-    /// itself, which the scheduler holds in `blocked_on`, so this only
-    /// carries the deadline.
+    /// Waiting on the network. Readiness is the operation's question, held in
+    /// `blocked_on`, so this only carries the deadline.
     Net(Option<u64>),
     /// Finished; the slot stays so a `join` can still find the tid.
     Exited,
-    /// Running in another Worker of this process.
-    ///
-    /// The thread is real and the table entry is real -- `join`, the futexes
-    /// and `live_threads` all still want it -- but this Worker must never
-    /// pick it up, because another one is already on it. That is the whole
-    /// difference between a thread that is a Worker and a thread that is a
-    /// turn on somebody else's stack.
+    /// Running in another Worker of this process: the entry is real (`join`,
+    /// futexes, `live_threads` want it) but this Worker must never pick it up.
     Elsewhere,
 }
-/// One guest thread.
-///
-/// Every register it has is in its context in guest memory, so switching to it
-/// is a call to the guest module's entry with a different context pointer.
-/// There is no stack to save: the shim leaves the guest's wasm stack behind
-/// entirely, which is the same thing the native host does for a signal.
+/// One guest thread. Its registers live in its context in guest memory, so
+/// switching to it is a call to the guest entry with a different context
+/// pointer; there is no wasm stack to save.
 struct Thread {
     kstate: ThreadState,
     /// Where to resume, which for a thread that blocked is the instruction
@@ -1943,13 +1690,9 @@ struct Thread {
     blocked_on: Option<gex_kernel::BlockOp>,
 }
 
-/// Runtime translation state.
-///
-/// The shim can lift and encode a module -- `gex-xlate` is ordinary Rust and
-/// compiles to wasm like everything else -- but it cannot *compile* one:
-/// nothing in wasm can hand bytes to the engine. So a miss produces the
-/// module here, leaves it for JS to instantiate, and comes back.
-/// One emitted module, waiting for JavaScript to instantiate it.
+/// One emitted module, waiting for JavaScript to instantiate it: the shim can
+/// lift and encode a module but not compile one (nothing in wasm can hand bytes
+/// to the engine), so a miss produces it here and leaves it for JS.
 struct PendingModule {
     wasm: Vec<u8>,
     /// The pages it is the first to claim, published only once its blocks are
@@ -1962,44 +1705,27 @@ struct PendingModule {
 struct Jit {
     /// Which guest pages own which slots in the dispatch table.
     page_table: gex_xlate::PageTable,
-    /// Whether the module said where it had got to. Without that this would
-    /// start handing out slots from zero and quietly overwrite the image
-    /// module's own blocks in the table, which is a very confusing way to
-    /// find out the module is too old.
+    /// Whether the module said where it had got to. Without it, slots would be
+    /// handed out from zero and overwrite the image module's own table blocks.
     described: bool,
     /// Addresses whose slot now holds real code.
     translated: std::collections::HashSet<u64>,
-    /// Every translated module's bytes, in the order they were installed.
-    ///
-    /// A dispatch table belongs to a module instance, and instances are not
-    /// shared between Workers -- so a thread joining this process has an
-    /// empty table while the page directory, which *is* shared, already
-    /// points at slots. Keeping the modules is what lets a joining Worker
-    /// instantiate them into its own tables and catch up. Order matters: each
-    /// module's page assignments are the next one's starting point.
+    /// Every translated module's bytes, in install order. A dispatch table
+    /// belongs to a module instance and is not shared between Workers, so a
+    /// joining Worker instantiates these into its own tables to catch up. Order
+    /// matters: each module's page assignments seed the next's.
     registry: Vec<Vec<u8>>,
-    /// Slots that code of a given identity was translated into, for the whole
-    /// tab rather than for one process.
-    ///
-    /// Keyed by the guest address of the page and by what the bytes there
-    /// are: the file, the offset within it, and the length of the mapping.
-    /// Two processes that map the same library at the same address hash to
-    /// the same key and share the slots, so the second one dispatches into
-    /// translations the first already paid for.
-    ///
-    /// Not part of a process's saved state. That is the point -- it outlives
-    /// every `fork` and `execve`, which is where the waste was.
+    /// Slots that code of a given identity was translated into, system-wide.
+    /// Keyed by page address and byte identity (file, offset, mapping length),
+    /// so two processes mapping the same library at the same address share the
+    /// slots. Not part of saved state -- it outlives `fork` and `execve`.
     shared: std::collections::HashMap<(u64, u64), u32>,
-    /// Shared modules this Worker has already put into its own tables.
-    ///
-    /// A dispatch table belongs to a module instance, so this describes the
-    /// Worker and not the program: it survives `execve` for the same reason
-    /// the tables do.
+    /// Shared modules this Worker has put into its own tables. Describes the
+    /// Worker, not the program, and survives `execve` as the tables do.
     installed_mods: std::collections::HashSet<u32>,
-    /// How the shared-slot lookup went, for the question of why a forked and
-    /// exec'd child re-lifts its parent's libraries. Three outcomes: the page
-    /// already had a base in *this* process's table, the identity map knew
-    /// it, or it did not. See `gex_reuse_stats`.
+    /// How the shared-slot lookup went. Three outcomes: the page had a base in
+    /// this process's table, the identity map knew it, or it did not. See
+    /// `gex_reuse_stats`.
     reuse_have: u64,
     reuse_hit: u64,
     reuse_miss: u64,
@@ -2011,61 +1737,36 @@ struct Jit {
     /// of its pages matches.
     store_ok: u64,
     store_full: u64,
-    /// Guest addresses that are `memcpy` and friends, to be served by a wasm
-    /// bulk-memory instruction rather than translated.
-    ///
-    /// Filled from an object's symbol table and relocations the first time a
-    /// dispatch miss lands anywhere in that object -- not when it is mapped,
-    /// because a mapping is not evidence anything in it will run, and not
-    /// from the recompiler, because the runtime translator needs the same
-    /// answers and the page may never have asked for bulk recompilation.
+    /// Guest addresses that are `memcpy` and friends, served by a wasm
+    /// bulk-memory instruction rather than translated. Filled from an object's
+    /// symbols and relocations the first time a miss lands in it -- not at map
+    /// time (a mapping is not evidence anything runs).
     intrinsics: std::collections::HashMap<u64, gex_xlate::Intrinsic>,
     /// How many times each object has been through [`note_intrinsics`], so a
     /// library is parsed once when the answer is settled and a bounded number
     /// of times while it is not.
     intrinsics_scanned: std::collections::HashMap<String, u32>,
-    /// Objects the guest has mapped that have not been recompiled yet, and
-    /// how many dispatch misses have landed in each.
-    ///
-    /// Translating an object the moment it is mapped is the wrong policy
-    /// even though it is the right mechanism. Measured on the gears demo:
-    /// 1,487,251 blocks against 352,080 for the demand path, to reach the
-    /// same two places later, because whole-object translation pays for
-    /// every function in Mesa and libc whether or not the run calls one.
-    /// The X-server test goes the other way -- 30 seconds to 12 -- because
-    /// there the same libraries stay in use.
-    ///
-    /// So an object waits until it proves itself. A library the run touches
-    /// twice stays on the demand path; libc is entered thousands of times
-    /// before anything else happens and is recompiled almost at once.
+    /// Objects the guest has mapped but not yet recompiled, and how many misses
+    /// have landed in each. An object waits until it proves itself: translating
+    /// at map time pays for every function whether or not the run calls one
+    /// (gears demo, 1.49M blocks vs 352K on demand), while libc is entered
+    /// enough to earn recompilation almost at once.
     candidates: Vec<(gex_kernel::CodeMap, u32)>,
-    /// Modules JS has yet to instantiate, oldest first.
-    ///
-    /// A queue rather than one, because statically recompiling a whole
-    /// object produces as many modules as it needs: a wasm module holds at
-    /// most a million functions and gex emits one per block, so libc is
-    /// several and libz3 is many. They must be installed in the order they
-    /// were emitted, since each one's page assignments are the next one's
-    /// starting point.
+    /// Modules JS has yet to instantiate, oldest first. A queue because
+    /// recompiling one object emits many modules (a wasm module holds at most a
+    /// million functions, one per block), installed in emission order since
+    /// each one's page assignments seed the next's.
     pending: std::collections::VecDeque<PendingModule>,
     blocks: u64,
-    /// Blocks lifted, by the object they were lifted from.
-    ///
-    /// The total alone cannot say whether a closure is missing something. A
-    /// `/bin/true` against a closure with libc whole still lifts 4,308
-    /// blocks, and its own text is 714 of them -- so 3,600 come from
-    /// somewhere the closure was supposed to cover, and nothing said where.
-    /// Blocks lifted on a page a closure library already claims.
+    /// Blocks lifted on a page a closure library already claims -- says whether
+    /// a closure is missing something the total alone cannot.
     lift_in_closure: u64,
-    /// Blocks lifted per object, with the address range they came from.
-    ///
-    /// The range is what says whether a closure is missing an object or
-    /// missing part of one: `libc.so.6=10239` reads the same whether the
-    /// closure covers none of libc or all of it but the last page.
+    /// Blocks lifted per object, with the address range: the range says whether
+    /// a closure is missing an object or only part of one.
     by_object: std::collections::BTreeMap<String, (u64, u64, u64)>,
     compiles: u64,
-    /// Nanoseconds spent lifting and encoding, which is the shim's own share
-    /// of a miss -- the engine's compile of what comes out is JS's.
+    /// Nanoseconds lifting and encoding -- the shim's share of a miss; the
+    /// engine's compile of the output is JS's.
     nanos: u64,
 }
 
@@ -2074,32 +1775,15 @@ struct Jit {
 const HOST_MAGIC: u64 = 0x6765_785f_484f_5354;
 
 struct Host {
-    /// A canary, because the failures this shim has are memory corruption and
-    /// they are always found somewhere other than where they happened.
-    ///
-    /// The arena overlap in 02fd80b was a forked child's own heap handed
-    /// addresses its parent was using: it wrote through the guest's heap and
-    /// surfaced, minutes later, as `malloc_consolidate(): invalid chunk size`
-    /// in a program that had done nothing wrong. The one the demo site still
-    /// dies of is `table index is out of bounds` inside `execve`, with a
-    /// dispatch directory that verifies clean in all 524,288 entries -- so
-    /// the index is not the guest's, it is one of this module's own funcref
-    /// calls, and the only way to get one of those wrong is for the `Host`
-    /// holding it to have been written over. `kernel.net` is an
-    /// `Arc<dyn NetStack>`, `kernel.place` an `Arc<dyn ...>`, `kernel.clock` a
-    /// function pointer; all three live in here.
-    ///
-    /// Two words, one at each end, so a write that lands anywhere across the
-    /// structure is caught by one of them. Checked at syscall entry, which is
-    /// a load and a compare against a constant and costs nothing measurable,
-    /// and which turns "something is wrong, elsewhere, later" into "the call
-    /// before this one did it".
+    /// A canary: this shim's failures are memory corruption found far from
+    /// where they happened. Two words, one at each end, so a write landing
+    /// anywhere across the structure trips one. Checked at syscall entry (a
+    /// load and a compare), turning "wrong, elsewhere, later" into "the call
+    /// before this did it".
     magic_head: u64,
     kernel: Kernel,
-    /// The virtio-gpu renderer, when the page brought one. Held here rather
-    /// than in the kernel because the scheduler is what pumps it, and the
-    /// scheduler is the one place every thread passes through on its way to
-    /// waiting for a reply.
+    /// The virtio-gpu renderer, when the page brought one. Held here, not in
+    /// the kernel, because the scheduler pumps it.
     virgl: Option<crate::virgl::VirglDevice>,
     /// The root filesystem, kept so files can be added before the guest runs.
     root: Arc<gex_kernel::vfs::TmpFs>,
@@ -2108,27 +1792,15 @@ struct Host {
     proc_state: Arc<gex_kernel::KernelProcSource>,
     /// Every guest thread, the running one included.
     threads: Vec<Thread>,
-    /// Index into `threads` of the one on the wasm stack right now.
-
     exit: Option<i32>,
-    /// Set alongside `resume` when the scheduler switched threads.
-    /// Why the scheduler gave the stack back to JS, when it was not an exit.
-    /// 1: every thread is waiting for input the page must supply. 2: every
-    /// thread is waiting on the network, and the page's event loop is what
-    /// makes the bytes arrive. Either way the page is expected to call
-    /// `gex_wake`; the difference is what it should do first.
     jit: Jit,
     /// The other end of the canary. See `magic_head`.
     magic_tail: u64,
 }
 
-/// Check the canary, and say so loudly once if it has gone.
-///
-/// Reported rather than trapped: the run is already wrong by the time this
-/// notices, and a trap here would replace the crash that is being diagnosed
-/// with a different one at a different place. Once, because a corrupted
-/// `Host` will fail this on every syscall afterwards and a flood is not a
-/// diagnosis.
+/// Check the canary, and say so loudly once if it has gone. Reported not
+/// trapped (a trap would replace the crash being diagnosed); once, because a
+/// corrupted `Host` fails every later syscall and a flood is not a diagnosis.
 fn check_host_magic(where_: &str) {
     if gex_has_host() == 0 {
         return;
@@ -2157,35 +1829,22 @@ thread_local! {
 
 /// The kernel, shared by every Worker running a thread of this process.
 ///
-/// A thread-local is wrong here, and was the thing standing between this
-/// runtime and real threads. With `+atomics` each Worker gets its own TLS
-/// block, so each would have had its own file table, its own memory map and
-/// its own process table -- which is a fork, not a thread.
-///
-/// A plain `static` is right instead, and for a reason particular to this
-/// design: the shim's data and heap live in the *guest's* linear memory, and
-/// against a shared memory that memory is a `SharedArrayBuffer`. So a static
-/// here is already visible to every Worker that instantiated against it. The
-/// only thing missing was mutual exclusion, which is what the lock is.
-///
-/// A spinlock rather than a blocking one because there is no OS underneath to
-/// park on, and because a syscall holds this for a few microseconds at most.
+/// A plain `static`, not a thread-local: with `+atomics` each Worker has its
+/// own TLS block, so a thread-local would give each its own file table and
+/// memory map -- a fork, not a thread. The shim's data lives in the guest's
+/// memory, a `SharedArrayBuffer` under a shared build, so a static is already
+/// visible to every Worker; only mutual exclusion was missing, hence the lock.
+/// A spinlock because there is no OS to park on and a syscall holds it briefly.
 #[cfg(feature = "shared-memory")]
 static mut HOST: Option<Host> = None;
 
 /// How much of the address space the guest may use.
 ///
-/// Not all of it: a Rust slice may not be longer than `isize::MAX`, which on
-/// wasm32 is just under 2 GiB, and `GuestMem` is built on a slice. Claiming
-/// the whole 4 GiB produces an invalid slice, and the consequences are not a
-/// clean failure -- the compiler deleted stores through it, and reads above
-/// 2 GiB returned `EFAULT` from one call site and succeeded from another.
-///
-/// So the guest gets everything below this line and the shim takes what is
-/// above, which it reaches through ordinary Rust pointers rather than through
-/// the slice. The guest's own layout fits comfortably: its stack is the
-/// highest thing in it, and the shim places it at this address rather than at
-/// `STACK_TOP`.
+/// Not all of it: `GuestMem` is a slice, and a slice may not exceed
+/// `isize::MAX` (just under 2 GiB on wasm32). A 4 GiB slice miscompiles rather
+/// than failing cleanly. The guest gets everything below this line; the shim
+/// takes what is above through ordinary pointers. The guest's stack, its
+/// highest thing, is placed here rather than at `STACK_TOP`.
 const GUEST_LIMIT: u64 = 0x7fff_0000;
 
 /// The guest's memory, as a slice.
@@ -2195,53 +1854,27 @@ const GUEST_LIMIT: u64 = 0x7fff_0000;
 #[allow(clippy::mut_from_ref)]
 #[inline(never)]
 fn guest_bytes() -> &'static mut [u8] {
-    // The base goes through `black_box` so the optimiser cannot see that it is
-    // the constant zero. Without that, LLVM concludes the pointer cannot alias
-    // anything and deletes every store through it: the first version of this
-    // booted the guest with a zero stack pointer, because the writes setting
-    // it up had all been optimised away. Reads survived, which made it look
-    // like the two modules had different memories.
+    // The *pointer* (not just its address) goes through `black_box`: otherwise
+    // LLVM sees a constant-zero pointer aliasing nothing and deletes stores
+    // through it, or folds bounds checks to always-out-of-range -- miscompiles
+    // that returned EFAULT from the kernel path but succeeded from a small fn.
     //
-    // SAFETY: in wasm, address zero is an ordinary location in linear memory
-    // and the guest's address space starts there. The linker places this
-    // module's own data and stack above `STACK_TOP`, and the guest never maps
-    // there, so the two do not overlap; the memory is imported and never
-    // grows, so base and length are fixed for the life of the instance.
-    // The *pointer* goes through `black_box`, not just the address it is made
-    // from. Hiding only the address was not enough: LLVM still tracked the
-    // pointer's provenance and miscompiled accesses through it, so the same
-    // read succeeded from a small function and returned EFAULT from inside the
-    // kernel's call path. Hiding the pointer leaves the optimiser nothing to
-    // reason about.
+    // SAFETY: address zero is an ordinary linear-memory location where the
+    // guest's address space starts; this module's data sits above `STACK_TOP`
+    // where the guest never maps; the memory is imported and never grows.
     let p: *mut u8 = std::hint::black_box(std::ptr::with_exposed_provenance_mut::<u8>(0));
-    // The length is hidden as well. With it a constant, LLVM pairs it against
-    // what it believes the pointer's allocation to be -- nothing -- and folds
-    // slice bounds checks to "always out of range": the same read succeeded
-    // from a small function and returned EFAULT from inside the kernel.
-    // The slice spans the whole address space a guest pointer may name. What
-    // actually *exists* is smaller and moves -- the memory is created at
-    // `GUEST_INITIAL_BYTES` and grown as the guest maps -- so the real bound
-    // is `memory.size`, and `GuestMem` reads it live on every access rather
-    // than trusting this length. See `GuestMem::limit`.
+    // Length hidden for the same reason. It spans the whole nameable address
+    // space; what exists is smaller and moves, so `GuestMem` reads
+    // `memory.size` live on every access. See `GuestMem::limit`.
     let len = std::hint::black_box(GUEST_LIMIT as usize);
     unsafe { std::slice::from_raw_parts_mut(p, len) }
 }
 
-/// Make a panic say what it was.
-///
-/// On wasm32 a Rust panic is a bare `unreachable`, and what reaches the page
-/// is `RuntimeError: unreachable` with no file, no line and no message. That
-/// is the whole of the diagnosis for any bug in the shim, which is not
-/// enough to act on -- it took a bisect to find out even which subsystem had
-/// failed. The hook writes the message and location to stderr through the
-/// import the guest's own output uses, so a panic reads like a panic.
-///
-/// Installed on the first `with_host`, which every entry point goes through.
-/// Write to the guest's stderr, which in a page is the only channel the shim
-/// has to say anything at all.
+/// Write to the guest's stderr -- in a page, the only channel the shim has to
+/// say anything.
 ///
 /// # Safety
-/// The one thread a page has; `write` only reads the bytes.
+/// `write` only reads the bytes.
 pub(crate) unsafe fn write_stderr(text: &str) {
     write(2, text.as_ptr() as u32, text.len() as u32);
 }
@@ -2482,11 +2115,8 @@ fn sys_recent() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let n = SYS_AT.load(Relaxed);
     let mut out = String::new();
-    // From the oldest entry still held, which is not `n % RING` until the
-    // ring has wrapped: a process that made three calls has them at 0, 1, 2
-    // and starting at 3 reads nothing but empty slots. The syscall ring hid
-    // that because its count is always far past its size; the memory ring
-    // beside it printed nothing at all and that is how it was found.
+    // From the oldest entry still held: before the ring wraps that is 0, not
+    // `n % RING`, or an unwrapped ring reads nothing but empty slots.
     for j in n.saturating_sub(SYS_RING)..n {
         let i = j % SYS_RING;
         let nr = SYS_NR[i].load(Relaxed);
@@ -2504,11 +2134,8 @@ fn sys_recent() -> String {
     out
 }
 
-/// The last few `with_host` call sites, oldest first, for the message below.
-///
-/// A location alone says who is holding the kernel and not how it got there,
-/// and the interesting part of a re-entrancy is the path. Six is enough to
-/// see the shape and small enough to cost nothing.
+/// The last few `with_host` call sites, oldest first: a re-entrancy's
+/// interesting part is the path, not just who holds the kernel.
 static RING: [std::sync::atomic::AtomicUsize; 6] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
 static RING_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2563,9 +2190,8 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
         };
         HOST_HOLDER.store(here as *const _ as usize, std::sync::atomic::Ordering::Relaxed);
         note(here);
-        // Named, because "not initialised" on its own says only that some
-        // export ran before `gex_init` and not which -- and the glue calls
-        // thirty of them.
+        // Named: bare "not initialised" says an export ran before `gex_init`
+        // but not which, and the glue calls thirty.
         let r = f(b.as_mut().unwrap_or_else(|| {
             panic!("gex: not initialised, called from {}:{}", here.file(), here.line())
         }));
@@ -2574,15 +2200,10 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     })
 }
 
-/// The host, but only if nobody is inside it.
-///
-/// For the questions a crash reporter asks. Everything else must use
-/// `with_host` and be told loudly when it re-enters, because re-entry is a
-/// real bug; a reporter is the one caller for which re-entry is *expected* --
-/// it runs after a trap, and a trap leaves whatever it interrupted holding
-/// the borrow forever. `None` means "cannot say", which is a worse answer
-/// than the address and a far better one than a panic that replaces the
-/// crash with a complaint about the reporter.
+/// The host, but only if nobody is inside it -- for a crash reporter, the one
+/// caller for which re-entry is expected: it runs after a trap, which leaves
+/// the borrow held forever. `None` ("cannot say") beats a panic that replaces
+/// the crash with a complaint about the reporter.
 #[cfg(not(feature = "shared-memory"))]
 fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
     HOST.with(|h| match h.try_borrow_mut() {
@@ -2601,38 +2222,24 @@ fn with_host_free<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
     unsafe { (*core::ptr::addr_of_mut!(HOST)).as_mut().map(f) }
 }
 
-/// The same, holding the lock for the duration.
-///
-/// Re-entrancy is a real hazard and not a theoretical one: a host call that
-/// asks the guest to write something can come back through here, and with a
-/// spinlock that is a deadlock rather than a panic. Every such path already
-/// had to avoid it -- `gex_hot_blocks` is the one that caught it before, by
-/// re-entering from inside a guest `write` -- so the rule is unchanged and
-/// only the punishment is worse.
+/// The same, under the kernel lock. Re-entrancy is a real hazard -- a host call
+/// that asks the guest to write can come back through here, a deadlock under a
+/// spinlock -- but every such path already had to avoid it.
 #[cfg(feature = "shared-memory")]
 #[track_caller]
 fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
     install_panic_hook();
-    // A borrow in place, with neither a lock nor a move.
+    // A plain static borrowed in place, neither locked-across-`f` nor moved.
+    // The shim traps out of `with_host` as ordinary control flow (that is how
+    // the stack goes back to JS) and a trap does not unwind, so a guard held
+    // across `f` would never drop; moving the `Host` out and back copies it
+    // twice per syscall, indistinguishable from a hang. The static is shared
+    // between Workers for free (the shim's data is in the guest's
+    // `SharedArrayBuffer` memory).
     //
-    // Both were tried and both were wrong. *Holding* a lock across `f` is the
-    // obvious shape: this shim traps out of `with_host` as ordinary control
-    // flow -- that is how a guest hands the wasm stack back to JavaScript --
-    // and a trap does not unwind, so the guard would never drop and the
-    // kernel would be locked out for the rest of the run. *Moving* the `Host`
-    // out and back avoids that and is worse: it copies the whole structure
-    // twice on every syscall and every dispatch miss, which is not a hang but
-    // is indistinguishable from one -- `park` produced no output at all,
-    // where the same build with a thread-local ran it to completion.
-    //
-    // So: a plain static, borrowed where it lies. It is shared between this
-    // process's Workers for free, because the shim's data lives in the
-    // guest's linear memory and that memory is a `SharedArrayBuffer`.
-    //
-    // SAFETY: one Worker is inside the kernel at a time, and `KLock` is what
-    // makes that true rather than hoped for. It is taken here and given back
-    // before this returns; every path out of `f` that is not a return is a
-    // trap, and a trap ends the process.
+    // SAFETY: `KLock` makes one Worker inside the kernel at a time true rather
+    // than hoped for; taken here, given back before return; any non-return path
+    // out of `f` is a trap that ends the process.
     let _guard = KLock::take();
     unsafe {
         f((*core::ptr::addr_of_mut!(HOST))
@@ -2642,35 +2249,15 @@ fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> R {
 }
 
 /// Room for the Workers running threads of this process: a stack and a
-/// thread-local block each.
+/// thread-local block each, both per Worker.
 ///
-/// Both have to be per Worker and neither was. The stack pointer is a wasm
-/// *global*, which belongs to an instance, so every Worker had one -- all
-/// initialised to the same address, so two Workers ran on one stack. The
-/// thread-locals are worse: a Rust module built with `+atomics` has real TLS
-/// and `__wasm_init_tls` is what gives an instance a block of its own, and
-/// nothing was calling it. Every Worker was reading and writing the same
-/// `CURRENT` and the same lock depth, which is the exact opposite of what a
-/// thread-local is for.
+/// The stack pointer is a wasm global (per instance), so without this every
+/// Worker started at the same address and two ran on one stack; TLS needs
+/// `__wasm_init_tls` per instance, which nothing was calling.
 ///
-/// Taken from the arena, one slot at a time, and never from `.bss`.
-///
-/// It was a static array of sixty-four slots, on the reasoning that `.bss` is
-/// address space and costs nothing until it is written. That is true of a
-/// memory that may grow and false of one that may not: `wasm-ld` will not
-/// link a `--shared-memory` module whose data does not fit inside
-/// `--initial-memory`, so sixty-eight megabytes of untouched slots became
-///
-///   rust-lld: error: initial memory too small, 146908720 bytes needed
-///
-/// and the shared build simply stopped being produced. Which is worse than
-/// it sounds: the build is silent about it, so the threads work went on
-/// against a shim that no longer existed.
-///
-/// A slot comes from the same growing arena as everything else now, claimed
-/// by the Worker that is about to stand on it. Sixty-four slots' worth of
-/// address space is never reserved, and a process running one thread pays
-/// for one stack.
+/// Taken from the growing arena, never from `.bss`: `wasm-ld` refuses to link
+/// a `--shared-memory` module whose data does not fit `--initial-memory`, so a
+/// static 64-slot array made the shared build silently fail to build.
 #[cfg(feature = "shared-memory")]
 mod slots {
     /// A megabyte of stack each. The shim's deepest call is a translation,
@@ -2690,13 +2277,10 @@ extern "C" {
 
 /// Claim a slot for this Worker and return the top of its stack.
 ///
-/// Called once, by each Worker, before anything else. The caller writes the
-/// answer into `__stack_pointer`, because a wasm global cannot be assigned
-/// from inside the module that owns it.
-///
-/// Slots are never given back. A process may start more threads over its life
-/// than this has room for; what it may not do is run more than this many at
-/// once, and the host recycles Workers rather than accumulating them.
+/// Called once per Worker before anything else. The caller writes the answer
+/// into `__stack_pointer` (a wasm global cannot be assigned from inside its own
+/// module). Slots are never given back: a process may not run more than
+/// `COUNT` threads at once, and the host recycles Workers.
 #[cfg(feature = "shared-memory")]
 #[no_mangle]
 pub extern "C" fn gex_worker_init() -> u32 {
@@ -2725,20 +2309,14 @@ pub extern "C" fn gex_worker_init() -> u32 {
     }
 }
 
-/// Which Worker this is, among the ones running threads of this process.
-///
-/// Per Worker and not per process: with `+atomics` each Worker gets its own
-/// TLS block, which is exactly wrong for the kernel -- that is why `HOST` is
-/// a plain static -- and exactly right for this. Zero is "not yet told",
-/// which the first Worker never is, so the lock's owner word is the id plus
-/// one and zero means free.
+/// Which Worker this is. Per-Worker via TLS, exactly right here (unlike the
+/// kernel, hence `HOST` is a plain static). Zero is "not yet told", so the
+/// lock's owner word is id-plus-one and zero means free.
 #[cfg(feature = "shared-memory")]
 thread_local! {
     static WORKER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    /// How many times this Worker has taken the kernel lock without giving it
-    /// back. A syscall that comes back through `with_host` -- the panic
-    /// handler writing to fd 2 is the one that does -- would deadlock against
-    /// itself otherwise, where the plain build merely panics.
+    /// This Worker's kernel-lock recursion depth: a re-entrant `with_host`
+    /// (the panic handler writing to fd 2) would otherwise self-deadlock.
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -2758,11 +2336,9 @@ static KLOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0
 
 /// The kernel lock, held for one call into `with_host`.
 ///
-/// A wasm `memory.atomic.wait32` rather than a spin, because a Worker that
-/// spins on a memory another Worker is about to write burns a core doing it
-/// and this runs on a laptop with the tab in the foreground. Waiting is legal
-/// here for the reason the whole design rests on: every guest thread runs in
-/// a Worker, and only the page's main thread is forbidden to block.
+/// A `memory.atomic.wait32` rather than a spin, to not burn a core on a
+/// foreground tab. Blocking is legal here because every guest thread runs in a
+/// Worker; only the page's main thread may not block.
 #[cfg(feature = "shared-memory")]
 struct KLock;
 
@@ -2827,20 +2403,12 @@ impl Drop for KLock {
 static HOST_SOCKETS: SingleThreaded<Vec<Arc<gex_kernel::unix::UnixSocket>>> =
     SingleThreaded(const { RefCell::new(Vec::new()) });
 
-/// Connect the host to a unix socket the *guest* has bound.
+/// Connect the host to a unix socket the *guest* has bound: the mirror of
+/// `bind_host`, needed so a guest that *serves* a socket (an X server in one
+/// Worker, its client in another) can be reached from outside.
 ///
-/// The mirror of `bind_host`, and the half that was missing. A guest that
-/// connects to a socket the host serves already works -- that is how the
-/// virtio-gpu renderer is reached. A guest that *serves* one had no way to be
-/// reached from outside, which is the problem with putting each process in
-/// its own Worker: an X server in one Worker and its client in another need a
-/// socket between them, and only one of those two directions existed.
-///
-/// `SocketNames::connect` already does the work; it only needed a host-owned
-/// socket to do it with.
-///
-/// Returns a handle for [`gex_host_send`] and [`gex_host_recv`], or -1 when
-/// nothing is bound at that path.
+/// Returns a handle for [`gex_host_send`]/[`gex_host_recv`], or -1 when nothing
+/// is bound at that path.
 #[no_mangle]
 pub extern "C" fn gex_host_connect(path: u32, path_len: u32) -> i32 {
     let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
@@ -2886,15 +2454,9 @@ pub extern "C" fn gex_host_recv(handle: i32, ptr: u32, max: u32) -> i32 {
     s.recv(out, 0, false).map(|n| n as i32).unwrap_or(0)
 }
 
-/// A socket the host serves, whose accepted connections JS collects.
-///
-/// The other half of [`gex_host_connect`], and the one that makes two guest
-/// processes in two Workers able to talk. Each Worker has its own kernel and
-/// its own filesystem -- that is the point of the design -- so a client in
-/// one cannot see a socket a server bound in the other. What crosses is the
-/// stream: the client's Worker serves the path, the host accepts, and the
-/// host also connects into the server's Worker with `gex_host_connect`. Two
-/// handles, and JS moves bytes between them.
+/// A socket the host serves, whose accepted connections JS collects: the other
+/// half of [`gex_host_connect`], letting two guest processes in two Workers
+/// talk. JS holds a handle at each end and moves bytes between them.
 #[derive(Default, Debug)]
 struct JsListener {
     accepted: std::sync::Mutex<Vec<Arc<gex_kernel::unix::UnixSocket>>>,
@@ -2927,14 +2489,10 @@ pub extern "C" fn gex_host_bind(path: u32, path_len: u32) -> i32 {
             name,
             Arc::clone(&listener) as Arc<dyn gex_kernel::unix::HostListener>,
         );
-        // And in the filesystem, for the same reason the virtio-gpu socket
-        // is: `connect` goes through the name table and never needs a node,
-        // but anything that checks the path exists first is told there is
-        // nothing there. Mesa connects without looking; Xlib does not, and
-        // neither does a shell script guarding on `test -S`.
-        //
-        // Through the mount, because with a global kernel `h.root` is this
-        // process's own `TmpFs` and nothing is mounted on it.
+        // Also in the filesystem: `connect` goes through the name table, but
+        // anything that checks the path exists first (Xlib, `test -S`; not
+        // Mesa) needs a node. Through the mount, since with a global kernel
+        // `h.root` is this process's own `TmpFs` with nothing mounted on it.
         let _ = h.kernel.vfs.mksocket(name);
     });
     let mut table = HOST_LISTENERS.0.borrow_mut();
@@ -2963,42 +2521,24 @@ pub extern "C" fn gex_host_accept(listener: i32) -> i32 {
     (table.len() - 1) as i32
 }
 
-/// How many regions of guest memory this process actually owns.
-///
-/// A process's world is two gigabytes of address space and a few hundred
-/// megabytes of it at most, so anything that has to *move* a process -- a
-/// `fork` that hands the child to another Worker, a host that wants to
-/// checkpoint one -- needs to know which parts are real. Copying the address
-/// space instead is not an option at this size.
-///
-/// Paired with [`gex_vma_at`]: count first, then ask for each.
+/// How many regions of guest memory this process actually owns. Anything that
+/// moves a process (a `fork` handing the child to another Worker) needs to know
+/// which parts are real. Paired with [`gex_vma_at`]: count first, then ask.
 #[no_mangle]
 pub extern "C" fn gex_vma_count() -> i32 {
     with_host(|h| h.kernel.mem.vmas().len() as i32)
 }
 
-/// The whole memory map as bytes, for a child to rebuild from.
-///
-/// `gex_vma_at` gives three numbers per region, and three numbers is not a
-/// mapping. What a forked child needs to know is also what each region *is*:
-/// its name, and the file and offset its code came from. Without those the
-/// child's map is a single anonymous span -- it was literally called
-/// `[forked]` -- and nothing in it can be identified, so the child cannot
-/// find a page in the shared store and re-translates its parent's code from
-/// cold. In Chromium that was every miss of every process: `hit=0`,
-/// `served=0`, eight thousand blocks lifted again per command.
-///
-/// One blob rather than a call per field, because parent and child are
-/// different instances in different Workers and everything between them is
-/// bytes anyway.
+/// The whole memory map as bytes, for a child to rebuild from. Each region's
+/// name and code identity (file and offset) go too, or the child cannot find a
+/// page in the shared store and re-translates its parent's code from cold.
 ///
 ///   u32 count, then per region:
 ///   u64 start, u64 end, u32 prot,
 ///   u32 name_len, name, u32 code_len, code, u64 code_off
 ///
 /// A zero `code_len` means no code identity. `origin` is deliberately absent:
-/// it says a region can be rebuilt by re-reading a file, which is a claim
-/// about *this* process's mappings and not something to inherit.
+/// it is a claim about *this* process's mappings, not something to inherit.
 fn vma_blob(h: &Host) -> Vec<u8> {
     let vmas = h.kernel.mem.vmas();
     let mut out = Vec::with_capacity(64 * vmas.len());
@@ -3087,10 +2627,8 @@ pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
 /// Describe region `i`, writing `start`, `end` and `prot` as three `u64` at
 /// `out` in this module's own region.
 ///
-/// Returns 0, or -1 if there is no such region. The three words rather than a
-/// return value because a wasm function returns one thing and this is the
-/// cheapest way to hand back three without a struct layout both sides have to
-/// agree on.
+/// Returns 0, or -1 if there is no such region. Three words at `out` rather
+/// than a return value, since a wasm function hands back only one.
 #[no_mangle]
 pub extern "C" fn gex_vma_at(i: i32, out: u32) -> i32 {
     with_host(|h| {
@@ -3108,20 +2646,10 @@ pub extern "C" fn gex_vma_at(i: i32, out: u32) -> i32 {
 
 /// How much of the shim's heap is in use, in KiB. -1 without the counters.
 ///
-/// The heap is a *fixed* region -- `__heap_base` to the top of the memory,
-/// about 2039 MiB -- because the memory belongs to the guest and cannot grow
-/// without moving where the guest's stack lands. So exhausting it is a real
-/// failure mode, and one with no symptom of its own: what a page sees is a
-/// fault at whatever the guest touched next, at whatever address the guest
-/// was last recorded at, which is nowhere near the allocation that failed.
-///
-/// Recompiling Mesa's software rasteriser is the case that motivated this.
-/// It lifts 471,205 blocks, and natively that costs a peak working set of
-/// 2109 MiB against those 2039 -- close enough on both sides of the line that
-/// guessing is no good and a number is needed.
-///
-/// Needs `--features heap-counters`, which charges every allocation and free
-/// and is therefore not what the page ships.
+/// Worth measuring because the heap is fixed, so exhausting it is a real
+/// failure with no symptom of its own (the page faults at whatever the guest
+/// touched next). Needs `--features heap-counters`, which charges every
+/// allocation and is not what the page ships.
 #[no_mangle]
 pub extern "C" fn gex_heap_used_kib() -> i32 {
     #[cfg(feature = "heap-counters")]
@@ -3136,15 +2664,10 @@ pub extern "C" fn gex_heap_used_kib() -> i32 {
 
 /// How large the shim's heap is in total, in KiB. Always available.
 ///
-/// `__heap_base` is a link-time address, so this is not a constant anyone can
-/// write down -- it moves whenever the shim's own data does. Reported rather
-/// than assumed, so a ceiling quoted in a bug report is the real one.
-///
-/// `total - used` is an upper bound on what is left, not the answer: talc can
-/// only hand out a contiguous span, so a fragmented heap refuses allocations
-/// while this still says there is room. A lift that fails with a gigabyte
-/// nominally free has a fragmentation problem rather than a size one, and the
-/// two want different fixes.
+/// `total - used` is an upper bound on what is left, not the answer: talc hands
+/// out contiguous spans, so a fragmented heap refuses allocations while this
+/// still reports room. A lift failing with a gigabyte nominally free is a
+/// fragmentation problem, not a size one.
 #[no_mangle]
 pub extern "C" fn gex_heap_total_kib() -> i32 {
     let base = (&raw const __heap_base) as usize;
@@ -6084,6 +5607,12 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     // The host reads these, builds the Worker, and that Worker calls
     // `gex_adopt_child` to become the process.
     stage_fork_fds(h, pid);
+    // The working directory is per-process state the child must inherit, like
+    // the descriptors: without it a child that its parent `chdir`'d resolves
+    // every relative path against `/`, so `sh -c 'cd d; make'` builds in the
+    // wrong place. The child's fresh kernel starts at `/`, so hand it the
+    // parent's cwd to apply in `gex_adopt_child`.
+    *FORK_CWD.0.borrow_mut() = h.kernel.vfs.cwd.clone();
     FORK[1].store(pc + 4, std::sync::atomic::Ordering::Relaxed);
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
@@ -6116,6 +5645,8 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
 /// Space-separated because a guest path may contain anything but a newline,
 /// so the path goes last and everything before it is a number.
 static FORK_FDS: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+/// The parent's working directory at `fork`, staged for the child to inherit.
+static FORK_CWD: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
 
 /// Describe the calling process's descriptors for the child.
 ///
@@ -6211,6 +5742,17 @@ pub extern "C" fn gex_fork_fds_ptr() -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_fork_fds_len() -> u32 {
     FORK_FDS.0.borrow().len() as u32
+}
+
+/// The parent's working directory, staged at `fork` for the child to adopt.
+#[no_mangle]
+pub extern "C" fn gex_fork_cwd_ptr() -> u32 {
+    FORK_CWD.0.borrow().as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_fork_cwd_len() -> u32 {
+    FORK_CWD.0.borrow().len() as u32
 }
 
 /// Rebuild the descriptors the parent had, in the child.
@@ -6650,6 +6192,10 @@ pub extern "C" fn gex_adopt_child(
     // eighty times and needs root for none of it.
     kernel.uid = unsafe { IDENTITY.0 };
     kernel.gid = unsafe { IDENTITY.1 };
+    // The working directory the parent had at `fork`, staged in the CWD global
+    // by the host from the fork record -- but applied further down, once the
+    // root is mounted: set_cwd checks the target is a directory, and until the
+    // mount below there is nothing there to find.
     kernel.mem.grows_on_demand(arena_grow, arena_back);
     // The same table the parent has, because it is not in either of their
     // memories. This is what makes the parent's `wait4` able to find a child
@@ -6690,6 +6236,16 @@ pub extern "C" fn gex_adopt_child(
     // gears demo is a script that does both in its first two lines.
     let virgl = mount_devices(&mut kernel);
     let proc_state = mount_procfs(&mut kernel);
+    // The parent's working directory, now that the root is mounted and set_cwd
+    // can confirm the target is a directory. Staged in the CWD global by the
+    // host from the fork record; without it the child resolves relative paths
+    // against `/` rather than where its parent had `chdir`'d.
+    {
+        let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
+        if !cwd.is_empty() {
+            let _ = kernel.vfs.set_cwd(&cwd);
+        }
+    }
     kernel.clock = browser_clock;
     kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
     set_host(Host {
