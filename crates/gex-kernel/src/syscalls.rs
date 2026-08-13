@@ -37,6 +37,7 @@ pub mod nr {
     pub const SYMLINKAT: u64 = 36;
     pub const LINKAT: u64 = 37;
     pub const RENAMEAT: u64 = 38;
+    pub const RENAMEAT2: u64 = 276;
     pub const FTRUNCATE: u64 = 46;
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
@@ -632,7 +633,7 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
         | nr::FCHMODAT
         | nr::STATX => a[1],
         nr::CHDIR | nr::STATFS | nr::MOUNT | nr::UMOUNT2 => a[0],
-        nr::RENAMEAT | nr::LINKAT => a[1],
+        nr::RENAMEAT | nr::RENAMEAT2 | nr::LINKAT => a[1],
         // `symlinkat` names the link it creates third, not second.
         nr::SYMLINKAT => a[2],
         _ => return String::new(),
@@ -1902,6 +1903,9 @@ impl Kernel {
             nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
             nr::UNLINKAT => self.sys_unlinkat(m, a[0] as i32, a[1], a[2]),
             nr::RENAMEAT => self.sys_renameat(m, a[0] as i32, a[1], a[2] as i32, a[3]),
+            nr::RENAMEAT2 => {
+                self.sys_renameat2(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32)
+            }
             nr::LINKAT => self.sys_linkat(m, a),
             nr::SYMLINKAT => self.sys_symlinkat(m, a[0], a[1] as i32, a[2]),
             nr::PPOLL => self.sys_ppoll(m, a[0], a[1]),
@@ -3520,6 +3524,42 @@ impl Kernel {
     ) -> SysResult {
         let from = self.at_path(m, old_fd, old)?;
         let to = self.at_path(m, new_fd, new)?;
+        self.vfs.rename(&from, &to).map(|_| 0)
+    }
+
+    /// `renameat2`: `renameat` plus a flags word. The flags matter -- programs
+    /// reach for this syscall specifically to get the atomic guarantee, so
+    /// silently ignoring them would corrupt the very race they were avoiding.
+    ///
+    /// - `flags == 0` is plain `renameat`.
+    /// - `RENAME_NOREPLACE` (1): fail with `EEXIST` if the destination already
+    ///   exists, rather than clobbering it -- the atomic create-or-fail idiom.
+    ///   The KLock serialises syscalls, so the exists-check and rename are not
+    ///   interleaved by another guest thread.
+    /// - `RENAME_EXCHANGE` (2) and `RENAME_WHITEOUT` (4) are not something this
+    ///   VFS can do atomically, so they get `EINVAL` -- the same answer Linux
+    ///   gives on a filesystem that does not support them.
+    fn sys_renameat2(
+        &mut self,
+        m: &GuestMem<'_>,
+        old_fd: i32,
+        old: u64,
+        new_fd: i32,
+        new: u64,
+        flags: u32,
+    ) -> SysResult {
+        const RENAME_NOREPLACE: u32 = 1;
+        const RENAME_EXCHANGE: u32 = 2;
+        let from = self.at_path(m, old_fd, old)?;
+        let to = self.at_path(m, new_fd, new)?;
+        if flags & !RENAME_NOREPLACE != 0 {
+            // EXCHANGE, WHITEOUT, or any unknown bit: unsupported here.
+            let _ = RENAME_EXCHANGE;
+            return Err(Errno::EINVAL);
+        }
+        if flags & RENAME_NOREPLACE != 0 && self.vfs.metadata_nofollow(&to).is_ok() {
+            return Err(Errno::EEXIST);
+        }
         self.vfs.rename(&from, &to).map(|_| 0)
     }
 
@@ -5297,6 +5337,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::LINKAT => "linkat",
         nr::SYMLINKAT => "symlinkat",
         nr::RENAMEAT => "renameat",
+        nr::RENAMEAT2 => "renameat2",
         nr::FTRUNCATE => "ftruncate",
         nr::FACCESSAT | nr::FACCESSAT2 => "faccessat",
         nr::CHDIR => "chdir",
