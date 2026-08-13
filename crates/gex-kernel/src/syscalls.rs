@@ -1925,7 +1925,7 @@ impl Kernel {
             // call is still better than refusing it -- apt sets the time on
             // a file it has just downloaded, and treats the failure as a
             // failure of the download.
-            nr::UTIMENSAT => self.fds.get(a[0] as i32).map(|_| 0).or(Ok(0)),
+            nr::UTIMENSAT => self.sys_utimensat(m, a[0] as i32, a[1], a[3] as u32),
             // There is one process's view of the world and nothing consults
             // a umask, but a program that sets one wants the old value back.
             nr::UMASK => {
@@ -3714,6 +3714,31 @@ impl Kernel {
             return Err(Errno::EEXIST);
         }
         self.vfs.rename(&from, &to).map(|_| 0)
+    }
+
+    /// `utimensat(dirfd, path, times, flags)`: set a file's timestamps.
+    ///
+    /// gex does not persist file times, but it must still answer honestly for
+    /// *existence*. A NULL path is the `futimens` form and validates the
+    /// descriptor; a real path must resolve or the call is `ENOENT`. This was a
+    /// blanket `Ok(0)`, and that quiet success broke `touch`: busybox touch
+    /// calls `utimensat` first and only creates a new file when it *fails*, so
+    /// pretending the timestamp update worked made `touch <newfile>` a no-op
+    /// that created nothing yet exited 0. Checking existence restores it.
+    fn sys_utimensat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u32) -> SysResult {
+        const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+        if path == 0 {
+            // futimens: the "path" is really the open descriptor in `dirfd`.
+            self.fds.get(dirfd)?;
+            return Ok(0);
+        }
+        let p = self.at_path(m, dirfd, path)?;
+        if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            self.vfs.metadata_nofollow(&p)?;
+        } else {
+            self.vfs.metadata(&p)?;
+        }
+        Ok(0)
     }
 
     /// `symlinkat(target, newdirfd, linkpath)`.
