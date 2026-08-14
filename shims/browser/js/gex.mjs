@@ -420,7 +420,7 @@ export class Gex {
   /// The dispatch pages to narrate, by number. Empty in a normal run; the gate
   /// is the set itself, since `opts.strace` never reaches a Worker. `?trace=1`
   /// prints for these only. See #136.
-  static watchPages = new Set([4099, 4121]);
+  static watchPages = new Set();
   /// Fill a whole image page on first ask. See `fillSlotNow`.
   static wholePage = false;
   /// How many times the fill has said why it gave up. See `fillSlotNow`.
@@ -428,7 +428,14 @@ export class Gex {
   /// And how many times it has said what the fill itself answered.
   static #whyDid = 0;
   /// Report the exact slot a missing pc dispatches through. See `fillSlotNow`.
-  static watchSlot = true;
+  static watchSlot = false;
+  /// Narrate a fill request no module answered. Off by default: a closure that
+  /// deliberately leaves a library out (`GEX_SKIP`, the crypto libs) hands
+  /// every one of that library's pages to the run-time translator, and each is
+  /// a fill nobody holds followed by a clean lift -- expected, not a fault, and
+  /// a flood of `console.error` that fails a harness counting them. On to debug
+  /// a genuinely unfillable page. See `#fillSlotTail`.
+  static debugFill = false;
   /// What each ask saw, keyed `page:from`. See `fillSlotNow` and `liftSlots`.
   static askState = new Map();
   /// A dispatch page whose directory writes should be narrated, or -1: every
@@ -1427,7 +1434,11 @@ export class Gex {
     // isolation (already on for `SharedArrayBuffer`) and reports a breakdown by
     // type. Fired from the child right after adopt, awaited in the background
     // since the measurement waits for a GC.
-    {
+    // One line per forked child, so a hundred-process `apt-get update` prints a
+    // hundred: narration for the #145 OOM, behind the same `debugexit` flag as
+    // the rest of the fork story, so an ordinary run does not fail a harness
+    // counting `console.error`.
+    if (globalThis.GEX_DEBUG_EXIT) {
       console.error(
         `[heap] debug=${!!globalThis.GEX_DEBUG_EXIT}`
           + ` api=${typeof performance.measureUserAgentSpecificMemory}`
@@ -2036,18 +2047,23 @@ export class Gex {
             if (woke === 1) break;
           }
           if (woke !== 1) {
-            // Every thread is waiting and nothing woke them: said out loud and
-            // never as a success. A guest that really exited reports its own
-            // code; anything else is this runtime giving up, which is 125 --
-            // outside the range a program would use, so it is not mistaken for
-            // a clean exit.
+            // Every thread is waiting and nothing woke them. Two cases, told
+            // apart by whether the guest actually exited: a process whose last
+            // thread `exit`ed leaves its Worker here with nothing to wake, which
+            // is the ordinary end of every forked child -- it reports the guest's
+            // own code and stays quiet. A give-up (nothing exited, nothing woke)
+            // is the runtime stuck; that is 125 -- outside a program's range so
+            // it is not mistaken for a clean exit -- and it is said out loud.
             const stalled = e.gex_exited ? !e.gex_exited() : false;
-            const why =
-              `[gex] the run stopped and nothing could wake it ` +
-              `(wake=${woke}, exited=${!stalled})`;
-            this.#env.write(2, new TextEncoder().encode(`${why}\n`));
-            console.error(why);
-            return stalled ? 125 : e.gex_exit_code();
+            if (stalled) {
+              const why =
+                `[gex] the run stopped and nothing could wake it ` +
+                `(wake=${woke}, exited=${!stalled})`;
+              this.#env.write(2, new TextEncoder().encode(`${why}\n`));
+              console.error(why);
+              return 125;
+            }
+            return e.gex_exit_code();
           }
           pc = e.gex_resume_pc();
           const wakeCtx = e.gex_resume_ctx() >>> 0;
@@ -2604,6 +2620,26 @@ export class Gex {
     return out.length ? out.join(' ') : undefined;
   }
 
+  // Whether a fill actually wrote the slot that *missed*, not merely something
+  // in its span. `gexfillat` reports success when it wrote any of the page's
+  // covered blocks, but on a page the closure covers only partly the missing
+  // slot is a gap it leaves on the miss stub. Reporting that filled sends the
+  // guest back to re-dispatch the same stub instead of demand-translating the
+  // block, and the churn on a partial page corrupted execution -- the
+  // closure-only fault `apt-get update` hit verifying an EdDSA signature and in
+  // its forked methods. `gex_fill_pc` is the address that missed; with none
+  // (a bulk fill) there is no single slot to insist on, so trust the report.
+  #wroteWanted(page, at) {
+    const mpc = Number(this.#shim.exports.gex_fill_pc?.() ?? 0n);
+    if (!mpc || at <= 0) return true;
+    const tn = this.#shim.exports.gex_page_table
+      ? this.#shim.exports.gex_page_table(BigInt(page >>> 0)) : -1;
+    const tabs = this.#dispatchTables();
+    if (tn < 0 || tn >= tabs.length) return true;
+    const want = at + ((mpc & 0xfff) >>> 2);
+    return want < tabs[tn].length && tabs[tn].get(want) !== tabs[0].get(0);
+  }
+
   // Fill a page without waiting, or null if impossible. The common case: the
   // page belongs to a library this process already built, and filling is a call
   // into wasm rather than the `await` of `fillSlot` (a whole event-loop turn).
@@ -2674,15 +2710,6 @@ export class Gex {
         });
       }
       let did = at > 0 && lazy.instObj.exports[FILL_AT](page, at, askFrom);
-      // Experiment, ?wholepage=1: fill an image page entirely on the first ask
-      // instead of the span around the miss, to tell a span that never reached
-      // a block from a real discovery gap in `gexc`. See #136.
-      if (Gex.wholePage && at > 0 && page * 4096 < 0x3000000 && !lazy.wholeDone?.has(page)) {
-        (lazy.wholeDone ??= new Set()).add(page);
-        for (let f = 0; f < SLOTS_PER_PAGE; f += 32) {
-          if (lazy.instObj.exports[FILL_AT](page, at, f)) did = true;
-        }
-      }
       this.#faInitMs += performance.now() - b1;
       // Read back the one slot the guest will dispatch through: a span read-back
       // says the fill wrote something, this says it wrote the slot that missed.
@@ -2725,7 +2752,9 @@ export class Gex {
         console.error(`[closure] fill page ${page} owner ${owner}: at=${at} did=${did} `
           + `t=${tn} from=${from} wrote=${wrote}/128 tlen=${len}`);
       }
-      if (did) {
+      // `did` says the module wrote *somewhere* in the span, not that it wrote
+      // the slot that actually missed -- see `#wroteWanted`.
+      if (did && this.#wroteWanted(page, at)) {
         this.#filled++;
         filled = true;
       }
@@ -2740,7 +2769,8 @@ export class Gex {
     // Same sentinel as above: zero is "no translation", not slot zero.
     if (where <= 0) return null;
     for (const inst of this.#unfilled) {
-      if (inst.exports[FILL_AT](page, where, this.#fillFrom())) {
+      if (inst.exports[FILL_AT](page, where, this.#fillFrom())
+          && this.#wroteWanted(page, where)) {
         this.#filled++;
         return true;
       }
@@ -2821,23 +2851,27 @@ export class Gex {
     const mine = owner >= 0 ? this.#lazyClosure[owner]?.instObj : null;
     if (mine && typeof mine.exports[FILL_AT] !== 'function') return true;
     const at = this.#pageBase(slot);
-    if (mine && at > 0 && mine.exports[FILL_AT](slot, at, this.#fillFrom())) {
+    // Only "filled" when the slot that missed is off the stub, not merely when
+    // the module wrote its span. See `#wroteWanted`.
+    if (mine && at > 0 && mine.exports[FILL_AT](slot, at, this.#fillFrom())
+        && this.#wroteWanted(slot, at)) {
       this.#filled++;
       return true;
     }
     if (slot * 4096 >= 0x0300_0000) {
       for (const inst of this.#unfilled) {
-        if (at > 0 && inst.exports[FILL_AT](slot, at, this.#fillFrom())) {
+        if (at > 0 && inst.exports[FILL_AT](slot, at, this.#fillFrom())
+            && this.#wroteWanted(slot, at)) {
           this.#filled++;
           return true;
         }
       }
     }
-    // A request nobody can answer is the interesting case, and there should be
-    // almost none -- the shim only asks about a page it has a base for. Common
-    // ones mean the deferred set is wrong. Capped, since a flood would be the
-    // failure, not the diagnosis.
-    if (this.#unanswered++ < 24) {
+    // A request nobody can answer, then a clean run-time lift of the block: for
+    // a skipped library (its pages have a run-time base but no deferred module)
+    // this is every page and expected, so it narrates only under `debugFill`.
+    // Capped even then, since a flood would be the failure, not the diagnosis.
+    if (Gex.debugFill && this.#unanswered++ < 24) {
       console.error(
         `[fill] nothing holds entry ${slot >>> 0}: ` +
           `${this.#unfilled.length} deferred modules, ${this.#filled} filled`,

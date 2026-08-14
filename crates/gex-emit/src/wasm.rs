@@ -744,11 +744,15 @@ impl Module {
         }
         let idx = self.declare_func(ty);
         let mut b = Vec::new();
-        // Two i32 locals: the first slot this call writes and the last, both
-        // clamped to what the segment actually covers. Locals 3 and 4, after
-        // the three parameters.
+        // Three i32 locals: the first slot this call writes and the last, both
+        // clamped to what the segment actually covers (locals 3 and 4, after the
+        // three parameters), and a "page was mine" flag (local 5). The flag,
+        // rather than an early `return 1` on the first matching segment, because a
+        // page is now covered by one segment per contiguous run of blocks -- gaps
+        // hold demand-translated blocks a stub must not erase -- and every run on
+        // the page has to be filled, not just the first found.
         b.push(0x01);
-        write_u32(&mut b, 2);
+        write_u32(&mut b, 3);
         b.push(0x7f); // i32
         for (seg, table, within, len, guest_page) in &passive {
             // if (page == guest_page): exact page equality, not a range test
@@ -833,13 +837,18 @@ impl Module {
             write_u32(&mut b, *seg);
             write_u32(&mut b, *table);
             b.push(op::END); // if (e > s)
+            // The page was this module's, whether or not this run intersected the
+            // span. Remembered, not returned: a later run on the same page still
+            // has to fill.
             b.push(op::I32_CONST);
             write_i32(&mut b, 1);
-            b.push(op::RETURN);
+            b.push(0x21); // local.set
+            write_u32(&mut b, 5);
             b.push(op::END); // if (page == guest_page)
         }
-        b.push(op::I32_CONST);
-        write_i32(&mut b, 0);
+        // 1 if any run on the page was filled, 0 if the page is somebody else's.
+        b.push(op::LOCAL_GET);
+        write_u32(&mut b, 5);
         b.push(op::END); // the function
         let mut sized = Vec::with_capacity(b.len() + 5);
         write_u32(&mut sized, b.len() as u32);

@@ -2066,6 +2066,36 @@ fn ftx_recent() -> String {
     out
 }
 
+/// The last bytes the process wrote to fd 2, captured at the write itself.
+///
+/// A guest that aborts writes glibc's own fatal message -- `free(): invalid
+/// pointer`, a failed assertion, `malloc(): corrupted top size` -- to stderr
+/// and then raises SIGABRT; but an apt method or any forked helper has that fd
+/// wired to a pipe its parent drains, so the one line that says *why* it died
+/// never reaches a console. Recorded here at the write, when the buffer is
+/// unarguably live, and read back when the process dies -- reading it out of
+/// the syscall ring at the death instead failed, the pointer no longer
+/// resolving. Per-Worker like the other rings, so it is this process's own.
+const STDERR_CAP: usize = 256;
+static mut STDERR_BUF: [u8; STDERR_CAP] = [0; STDERR_CAP];
+static mut STDERR_LEN: usize = 0;
+
+fn stderr_note(bytes: &[u8]) {
+    unsafe {
+        let n = bytes.len().min(STDERR_CAP);
+        STDERR_BUF[..n].copy_from_slice(&bytes[..n]);
+        STDERR_LEN = n;
+    }
+}
+
+fn last_stderr() -> String {
+    unsafe {
+        String::from_utf8_lossy(&STDERR_BUF[..STDERR_LEN])
+            .trim_end()
+            .replace('\n', " ")
+    }
+}
+
 /// `brk`, `munmap`, `mremap`, `mmap`.
 fn is_mem_call(nr: u64) -> bool {
     matches!(nr, 214 | 215 | 216 | 222)
@@ -4714,13 +4744,19 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     .collect()
             };
             let want: u64 = parts.iter().map(|p| p.1).sum();
-            if ret != want {
-                let mut said = Vec::new();
-                for (p, n) in parts {
-                    if let Ok(b) = gm.read(p, n.min(200) as usize) {
-                        said.extend_from_slice(b);
-                    }
+            // The bytes themselves, gathered once. Kept for a later abort (the
+            // fatal message is a full write, not the short one below), and
+            // reused for the short-write warning.
+            let mut said = Vec::new();
+            for (p, n) in &parts {
+                if let Ok(b) = gm.read(*p, (*n).min(200) as usize) {
+                    said.extend_from_slice(b);
                 }
+            }
+            if !said.is_empty() {
+                stderr_note(&said);
+            }
+            if ret != want {
                 warn_line(&format!(
                     "[gex] pid {} could not reach stderr ({} of {want} bytes in {} parts): {}",
                     h.kernel.pid,
@@ -4760,10 +4796,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // itself.
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
                 warn_line(&format!(
-                    "[gex] pid {} killed by signal {} at pc={at:#x}\n  threads:{}\n  \
+                    "[gex] pid {} killed by signal {} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
                      last calls:{}\n  address space:{}\n  futexes:{}",
                     h.kernel.pid,
                     signal,
+                    last_stderr(),
                     // Every thread, not only the one that died. Two threads
                     // sharing a register context would clobber each other and
                     // everything downstream of that looks like corruption

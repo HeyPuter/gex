@@ -832,6 +832,12 @@ impl ModuleBuilder {
                 // to this object, and an untranslated one should ask the host
                 // to translate -- which the stub does. Only the interior is
                 // filled; trailing slots past the last block are left alone.
+                // Passive (written by `gexfill`/`gexfillat`, not instantiation)
+                // for a closure module (`demand_fill`), whose pages are filled a
+                // span at a time as the guest branches in; active for a small
+                // runtime unit, whose slots are written when it is instantiated.
+                let passive = self.demand_fill;
+                let _ = BIG_BLOCKS;
                 for (page, mut blocks) in by_page {
                     let Some(entry) = self.page_table.lookup(page) else {
                         continue;
@@ -841,30 +847,59 @@ impl ModuleBuilder {
                     let table = gex_abi::dispatch_entry_table(entry) as u32;
                     blocks.sort_by_key(|(a, _)| *a);
                     let slot = |addr: u64| gex_abi::dispatch_index(addr, entry);
-                    let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
-                        continue;
-                    };
-                    let start = slot(first.0);
-                    let end = slot(last.0);
-                    let mut funcs = vec![self.miss_stub; (end - start + 1) as usize];
-                    for (addr, f) in &blocks {
-                        funcs[(slot(*addr) - start) as usize] = *f;
+                    let page_base = (entry & gex_abi::DISPATCH_SLOT_MASK) as u32;
+                    if passive {
+                        // One `[first,last]` segment for a closure page, this
+                        // module's miss stub in the gaps. Per-contiguous-run
+                        // gap-free segments would be correct on a shared page too,
+                        // but a densely fragmented C++ library (`libapt-pkg`)
+                        // fragments into tens of thousands of runs, and `gexfill`'s
+                        // `br_table` over the segments then exceeds the wasm max
+                        // branch count. See `add_fill`.
+                        let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
+                            continue;
+                        };
+                        let start = slot(first.0);
+                        let end = slot(last.0);
+                        let mut funcs = vec![self.miss_stub; (end - start + 1) as usize];
+                        for (addr, f) in &blocks {
+                            funcs[(slot(*addr) - start) as usize] = *f;
+                        }
+                        self.m.element(ElementSegment {
+                            table,
+                            offset: start as u32,
+                            page_base,
+                            funcs,
+                            passive,
+                            guest_page: page as u32,
+                        });
+                    } else {
+                        // A small runtime unit shares its page with a closure whose
+                        // blocks sit in this unit's gaps, so one segment per
+                        // contiguous run and nothing written between them -- a
+                        // `[first,last]` unit would stub over the closure's blocks.
+                        let mut i = 0;
+                        while i < blocks.len() {
+                            let run_start = slot(blocks[i].0) as u32;
+                            let mut funcs = vec![blocks[i].1];
+                            let mut j = i + 1;
+                            while j < blocks.len()
+                                && slot(blocks[j].0) as u32 == run_start + funcs.len() as u32
+                            {
+                                funcs.push(blocks[j].1);
+                                j += 1;
+                            }
+                            self.m.element(ElementSegment {
+                                table,
+                                offset: run_start,
+                                page_base,
+                                funcs,
+                                passive,
+                                guest_page: page as u32,
+                            });
+                            i = j;
+                        }
                     }
-                    self.m.element(ElementSegment {
-                        table,
-                        offset: start as u32,
-                        page_base: (entry & gex_abi::DISPATCH_SLOT_MASK) as u32,
-                        funcs,
-                        // Passive (written by `gexfill`, not instantiation)
-                        // only on a big module: an active segment makes every
-                        // process write every block of the whole object, most
-                        // of it code the process never reaches. On a small
-                        // runtime unit, making segments passive is pure cost.
-                        passive: self.demand_fill || n_blocks > BIG_BLOCKS,
-                        // What `gexfillat` matches a request against. The
-                        // whole entry, table index included: see the field.
-                        guest_page: page as u32,
-                    });
                 }
             }
         }

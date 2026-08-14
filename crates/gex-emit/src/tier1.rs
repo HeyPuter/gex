@@ -2086,10 +2086,19 @@ impl<'a> Emitter<'a> {
 
     /// Transfer control to a statically known guest address.
     fn jump_to_constant(&mut self, target: u64) {
-        if let Some(&func) = self.cx.blocks.get(&target) {
-            self.f.local_get(self.ctx_local);
-            self.f.return_call_local(func);
-            return;
+        // TEST(GEX_NO_DIRECT_JUMP): force every branch through the dispatch
+        // table, so a same-module target is looked up (and its PC stored) the
+        // way a cross-module one is. Native only -- `env` always fails on wasm,
+        // so the shim keeps direct calls; set it for the closure build to tell a
+        // direct-jump fault from a dispatch one.
+        static NO_DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_direct = *NO_DIRECT.get_or_init(|| std::env::var_os("GEX_NO_DIRECT_JUMP").is_some());
+        if !no_direct {
+            if let Some(&func) = self.cx.blocks.get(&target) {
+                self.f.local_get(self.ctx_local);
+                self.f.return_call_local(func);
+                return;
+            }
         }
         // Not in this module: record the PC and go through the table. The
         // page's directory entry decides whether that reaches real code or

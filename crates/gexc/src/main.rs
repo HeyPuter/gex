@@ -605,13 +605,68 @@ fn build_closure(
     };
     let ordered: Vec<&gex_ld::closure::Object> =
         order.iter().map(|&i| &closure.objects[i]).collect();
+    // Objects to leave OUT of the closure entirely, by name prefix (env
+    // `GEX_SKIP`, comma-separated). They carry no module and are translated at
+    // run time by the miss path -- the only correct path for a library whose
+    // internal functions are reached through pointers installed at run time
+    // (libgcrypt's Ed25519 field ops: static, so not in a stripped `.dynsym`,
+    // and set in a heap `mpi_ec_ctx`, so no static pointer scan finds them). A
+    // closure that covers such a library only partially leaves those blocks to
+    // a demand-fill *into a closure-covered page*, which corrupts dispatch and
+    // is what killed `gpgv` verifying an EdDSA `InRelease` signature. Skipped
+    // whole, the library runs on the plain translator the way `?closure=0`
+    // does, which is correct. The pin is still emitted so it loads where its
+    // pinned neighbours expect.
+    let skip: Vec<String> = std::env::var("GEX_SKIP")
+        .ok()
+        .map(|s| s.split(',').filter(|w| !w.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+    // Every object's `memcpy`/`memmove`/`memset`/`mempcpy`, by biased address,
+    // so `translate_image` emits the shim's intrinsic for them instead of
+    // lifting glibc's hand-written SIMD -- the same substitution the runtime
+    // translator does. Without it the closure and the runtime disagree: a run
+    // on a closure lifts and executes glibc's own `memcpy`, and a wrong lane in
+    // that translation is a wild copy (the heap corruption `gpgv` hit verifying
+    // an EdDSA signature only ever appeared with a closure). Global, because a
+    // call resolves to another object's definition; keyed by biased address,
+    // which is where the block for that function is discovered.
+    let mut intrinsics: std::collections::HashMap<u64, gex_xlate::Intrinsic> =
+        std::collections::HashMap::new();
+    for o in &closure.objects {
+        let (tlo, thi) = o.image.text_range;
+        for s in &o.image.symbols {
+            if s.ifunc {
+                continue;
+            }
+            // Defined, and in this object's own text: an undefined/imported
+            // `memcpy` has no address here (it resolves to libc's definition),
+            // and the executables all share `PIE_BASE`, so an out-of-text entry
+            // would collide across them.
+            let addr = s.value.wrapping_add(o.image.bias);
+            if addr < tlo || addr >= thi {
+                continue;
+            }
+            if let Some(kind) = gex_xlate::intrinsic::recognise(&s.name) {
+                intrinsics.insert(addr, kind);
+            }
+        }
+    }
     for (n, o) in ordered.into_iter().enumerate() {
+        let skipped = skip.iter().any(|w| o.name.starts_with(w.as_str()));
         // Whole, for the objects named. Matched on the start of the name so
         // `libc.so.6` catches `libc.so.6` and `libc` catches it too.
         let whole = exhaustive || exhaustive_for.iter().any(|w| o.name.starts_with(w.as_str()));
         let opts = Options {
             first_slot,
             exhaustive: whole,
+            // `complete_pages` (fill any page a block touches) was measured to
+            // balloon a densely-connected library to its exhaustive size
+            // (libgcrypt: 302 MB, the whole closure 1.2 GB) because completing
+            // one page cascades through the lot -- so it is left off. The
+            // partial-page hazard it targeted is real but must be fixed in the
+            // demand-fill/dispatch path, not by covering everything up front.
+            complete_pages: false,
+            intrinsics: intrinsics.clone(),
             shared_memory,
             // On for every object regardless of size: slots are numbered in one
             // sequence, so a small object's pages can sit far into table 0 and
@@ -626,7 +681,16 @@ fn build_closure(
             },
             ..Options::default()
         };
-        let (module, stats) = gex_xlate::translate_image(&o.image, &opts);
+        // Apply the object's own RELATIVE relocations before translating, so
+        // `scan_pointers` follows a relocated dispatch pointer into the code it
+        // names -- libgcrypt's EdDSA verify is reached only through such a
+        // pointer, and unlinked here it read as an unbiased addend and was
+        // never lifted. A clone because the closure's objects are shared and
+        // only the translation needs the relocated data. See
+        // `gex_ld::elf::apply_own_relative`.
+        let mut img = o.image.clone();
+        gex_ld::elf::apply_own_relative(&mut img);
+        let (module, stats) = gex_xlate::translate_image(&img, &opts);
         // Named like a library when it is one, so a manifest that collects
         // `c.NN.*.wasm` picks it up and the loader has nothing special to do.
         let file = if n == 0 && !shared_image {
@@ -634,10 +698,22 @@ fn build_closure(
         } else {
             format!("{stem}.{n:02}.{}.wasm", o.name)
         };
-        std::fs::write(&file, &module.wasm).with_context(|| format!("writing {file}"))?;
-        if !no_validate {
-            gex_native::validate_module(&module.wasm)
-                .with_context(|| format!("{file} is not valid wasm"))?;
+        // A skipped object is translated only to advance `first_slot`, so every
+        // OTHER object keeps the exact slots it has without the skip -- moving
+        // that layout exposed a latent slot bug (apt-get's startup died). Its
+        // module is NOT written: with no module the library runs on the plain
+        // translator, the correct path for a library whose internals are
+        // reached through pointers installed at run time (libgcrypt's Ed25519
+        // field ops), which build-time discovery cannot see and a partial
+        // closure page then demand-fills wrong. The pin still goes out, so it
+        // loads where its pinned neighbours expect and its own slots -- left
+        // empty in the closure -- are numbered off the plain translator.
+        if !skipped {
+            std::fs::write(&file, &module.wasm).with_context(|| format!("writing {file}"))?;
+            if !no_validate {
+                gex_native::validate_module(&module.wasm)
+                    .with_context(|| format!("{file} is not valid wasm"))?;
+            }
         }
         // Neither the interpreter nor a root image is pinned: gex's loader
         // places both (ld.so at INTERP_BASE, roots at PIE_BASE), so there is no
@@ -651,15 +727,18 @@ fn build_closure(
             images.push_str(&format!("{} {}\n", file.rsplit('/').next().unwrap_or(&file), o.path));
         }
         first_slot = module.metadata().next_slot;
-        blocks += stats.blocks;
-        insts += stats.instructions;
-        bytes_total += stats.wasm_bytes;
+        if !skipped {
+            blocks += stats.blocks;
+            insts += stats.instructions;
+            bytes_total += stats.wasm_bytes;
+        }
         eprintln!(
-            "  {:<40} {:>7} blocks {:>7} KiB  at {:#x}",
+            "  {:<40} {:>7} blocks {:>7} KiB  at {:#x}{}",
             o.name,
             stats.blocks,
             stats.wasm_bytes / 1024,
             o.image.bias,
+            if skipped { "  (slots reserved; runtime-translated)" } else { "" },
         );
     }
     let pin_file = format!("{stem}.pins");

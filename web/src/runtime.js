@@ -430,6 +430,10 @@ export async function runProgram(
       // meets #73) and covers every library these demos run except Mesa's
       // software rasteriser, which nothing here wants.
       recompileObjects,
+      // `?nointrinsics=1` translates glibc's own memcpy/memcmp/memset instead
+      // of substituting the shim's, to tell a substitution fault from a codegen
+      // one. In `extra` so every process gets it.
+      noIntrinsics: flag('nointrinsics') ? 1 : undefined,
       // Whether a fork hands the child its parent's compiled modules. In `extra`
       // (spread into every Worker message), not on `globalThis`: the list is
       // built in the forking Worker, so a global set here is set in the page.

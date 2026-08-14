@@ -62,6 +62,21 @@ pub struct Options {
     /// to keep the up-front module small and let runtime translation pull in
     /// the rest rather than compiling functions the run may never enter.
     pub lazy: bool,
+    /// Once a page holds any translated block, translate every decodable
+    /// instruction in it, so no page comes out *partly* covered.
+    ///
+    /// A partly-covered page is the closure's one real hazard: a run reaching
+    /// an untranslated block in a page the closure has already based
+    /// demand-fills that block into the closure's own page, and the mix of
+    /// build-time and run-time blocks under one base corrupts dispatch --
+    /// libgcrypt's Ed25519 field arithmetic, reached only through a function
+    /// pointer installed at run time that no build-time scan can follow, died
+    /// exactly this way. Completing a touched page leaves only *wholly*
+    /// untouched pages to the demand path, which is the case that already
+    /// works (a C++ library reached entirely through vtables lifts cleanly).
+    /// Bounded, unlike `exhaustive`: only pages a real block already reached,
+    /// and transitively what those pages' blocks reach.
+    pub complete_pages: bool,
     /// Declare the imported memory shared. Off only for a single-threaded
     /// build whose host cannot import a shared memory.
     pub shared_memory: bool,
@@ -91,6 +106,7 @@ impl Default for Options {
             // still available for a build that must not translate later.
             exhaustive: false,
             lazy: false,
+            complete_pages: false,
             shared_memory: true,
             demand_fill: false,
             linkage: Linkage::Own,
@@ -358,6 +374,70 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
             }
         }
         stats.discovered_from_data = worklist.len() - before;
+
+        // Code-embedded pointers. A function whose address is *taken* rather than
+        // called -- `adrp`+`add` materialising its address into a register to be
+        // stored in a struct and later called indirectly -- is reached by no
+        // branch and lies in no data word, so neither successor-following nor the
+        // data scan above finds it. libgcrypt installs its EdDSA field-arithmetic
+        // ops exactly this way: `ec_p_init` writes `ctx->addm = ec_addm_25519`
+        // and the verify calls through `ctx->addm`. A closure that misses them
+        // leaves those blocks to a demand-fill into a page it already partly
+        // covers -- the dispatch corruption that made `gpgv` abort on an EdDSA
+        // `InRelease` signature ("lock ABI version mismatch"). So scan the code
+        // itself for an `adr`/`adrp+add` that resolves to executable text.
+        //
+        // Over-seeding is safe: an address that is really data is dropped by
+        // `is_executable`, and one that lands mid-function only adds a block the
+        // guest never dispatches to unless it truly is an entry. The register
+        // tracking need not be precise for the same reason -- a stale `adrp` page
+        // paired with a later `add` at worst seeds one more real code address.
+        let before_code = worklist.len();
+        for seg in &image.segments {
+            if !seg.executable {
+                continue;
+            }
+            let mut page: [Option<u64>; 32] = [None; 32];
+            let end = seg.vaddr + seg.bytes.len() as u64;
+            let mut a = seg.vaddr;
+            while a + 4 <= end {
+                if !view.is_executable(a) {
+                    page = [None; 32];
+                    a += 4;
+                    continue;
+                }
+                let off = (a - seg.vaddr) as usize;
+                let raw = u32::from_le_bytes(seg.bytes[off..off + 4].try_into().unwrap());
+                match gex_isa::decode(raw, a) {
+                    gex_isa::Inst::Adrp { rd: gex_isa::RegSel::Gp(r), target } => {
+                        page[r as usize] = Some(target);
+                    }
+                    gex_isa::Inst::Adr { target, .. } => {
+                        if target % 4 == 0 && view.is_executable(target) {
+                            worklist.insert(target);
+                        }
+                    }
+                    gex_isa::Inst::AddSubImm {
+                        op: gex_isa::AddOp::Add,
+                        rd: gex_isa::RegSel::Gp(rd),
+                        rn: gex_isa::RegSel::Gp(rn),
+                        imm,
+                        ..
+                    } => {
+                        if let Some(p) = page[rn as usize] {
+                            let target = p.wrapping_add(imm);
+                            if target % 4 == 0 && view.is_executable(target) {
+                                worklist.insert(target);
+                            }
+                        }
+                        page[rd as usize] = None;
+                    }
+                    _ => {}
+                }
+                a += 4;
+            }
+        }
+        stats.discovered_from_data += worklist.len() - before_code;
     }
 
     if opts.exhaustive {
@@ -406,7 +486,31 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 
     while !frontier.is_empty() {
         let lifted = gex_emit::par::map(&frontier, &|&addr| {
-            let mut block = lift_block(|pc| view.fetch(pc), addr, opts.limits);
+            // A recognised library function is emitted as the shim's intrinsic
+            // (a `memory.copy`/`memory.fill`) instead of lifting its own code --
+            // the same substitution `discover` (the runtime path) does. Without
+            // it the closure lifts glibc's hand-written SIMD `memcpy`/`memset`,
+            // and a run that reaches one then depends on that translation being
+            // right; a wrong lane there is a wild copy, exactly the heap
+            // corruption `apt`/`gpgv` hit only with a closure. See `intrinsic`.
+            if let Some(&k) = opts.intrinsics.get(&addr) {
+                return intrinsic::block(addr, k);
+            }
+            // Stop at the *section* boundary, not the segment's: a `PF_X`
+            // segment also maps the string tables, relocations and `.rodata`
+            // that sit beside the code, and `CodeView::fetch` alone would keep
+            // decoding those as instructions when a block runs off the end of a
+            // real code section -- a garbage block that, dispatched to, executes
+            // wild. `discover` (the runtime path) already gates its fetch on
+            // `is_executable` for this reason; without the same gate here the
+            // closure and the runtime disagree, and the closure lifts blocks the
+            // runtime never would. This is the closure-only corruption `gpgv`
+            // hit verifying an EdDSA signature.
+            let mut block = lift_block(
+                |pc| if view.is_executable(pc) { view.fetch(pc) } else { None },
+                addr,
+                opts.limits,
+            );
             pass::optimize(&mut block);
             block
         });
@@ -433,6 +537,31 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
                 if !seen.contains(&succ) && view.is_executable(succ) {
                     seen.insert(succ);
                     next.push(succ);
+                }
+            }
+            // Complete every page this block covers: seed each decodable
+            // instruction in it that discovery has not already reached, so the
+            // page comes out wholly covered rather than partly. See
+            // `Options::complete_pages`. The new seeds re-enter the frontier and
+            // pull their own successors in, so a page reached through a run-time
+            // pointer is filled in from a block a static path did reach nearby.
+            if opts.complete_pages {
+                let first = block.start & !0xfff;
+                let last = block.end.saturating_sub(1) & !0xfff;
+                let mut a = first;
+                while a <= last + 0xfff {
+                    if !seen.contains(&a) && view.is_executable(a) {
+                        if let Some(raw) = view.fetch(a) {
+                            if !matches!(
+                                gex_isa::decode(raw, a),
+                                gex_isa::Inst::Unknown { .. } | gex_isa::Inst::Undefined { .. }
+                            ) {
+                                seen.insert(a);
+                                next.push(a);
+                            }
+                        }
+                    }
+                    a += 4;
                 }
             }
             collected.push(block);

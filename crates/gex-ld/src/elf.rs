@@ -686,6 +686,34 @@ fn apply_relative_relocations(image: &mut Image, dyn_vaddr: u64, dyn_size: u64) 
     }
 }
 
+/// Apply this image's own `R_AARCH64_RELATIVE` relocations in place, at its
+/// bias, from the parsed reloc list.
+///
+/// The closure build (`gexc build --closure`) translates each object WITHOUT
+/// linking it, but `Options::scan_pointers` finds indirect-branch targets by
+/// reading data words that point into text -- a vtable, a `DT_INIT_ARRAY`, the
+/// pubkey/ECC op table libgcrypt's Ed25519 verify reaches through. Those words
+/// are `RELATIVE` relocations, so unrelocated they hold their unbiased addend;
+/// the scan reads that, `is_executable` rejects it, and the code it names is
+/// never lifted -- so `gpgv` branches into an unlifted block whose demand-fill
+/// over a closure-covered page corrupts dispatch (`apt-get update` verifying an
+/// EdDSA `InRelease` signature died exactly here). Applying RELATIVE first -- a
+/// self-reference needs only this object's own bias, not the whole closure's
+/// symbol table -- makes the scan see the real address. Idempotent, like
+/// [`apply_relative_relocations`]: it writes an absolute value.
+pub fn apply_own_relative(image: &mut Image) {
+    let bias = image.bias;
+    let writes: Vec<(u64, u64)> = image
+        .relocs
+        .iter()
+        .filter(|r| r.kind == R_AARCH64_RELATIVE)
+        .map(|r| (r.at, bias.wrapping_add(r.addend as u64)))
+        .collect();
+    for (at, value) in writes {
+        write_u64(image, at, value);
+    }
+}
+
 /// Read a doubleword from the placed image.
 fn read_u64(image: &Image, vaddr: u64) -> Option<u64> {
     for seg in &image.segments {

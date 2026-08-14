@@ -207,7 +207,24 @@ async function handle(msg) {
   if (!globalThis.__gexMarkedConsole) {
     globalThis.__gexMarkedConsole = true;
     const realError = console.error.bind(console);
-    console.error = (...a) => realError('[gex-console-error]', ...a);
+    // One marker per *line*, not per call: Chrome's `--enable-logging=stderr`
+    // writes a console message up to its first newline and drops the rest, so a
+    // multi-line diagnostic (a `killed by signal` report with its thread,
+    // syscall and futex rings) reached the harness as only its first line and
+    // the part naming the fault was silently lost. Splitting here means every
+    // line is its own INFO:CONSOLE record, marked and captured. An Error is
+    // rendered through its stack so that survives too; a lone single-line call
+    // is passed through untouched, objects and all.
+    console.error = (...a) => {
+      const text = a
+        .map((x) => (typeof x === 'string' ? x : x?.stack || String(x)))
+        .join(' ');
+      if (text.includes('\n')) {
+        for (const line of text.split('\n')) realError('[gex-console-error]', line);
+      } else {
+        realError('[gex-console-error]', ...a);
+      }
+    };
   }
   // Set before anything reads it, for the same reason as `adoptAfter`:
   // `forkModules()` runs in the Worker that builds the fork record, so the
