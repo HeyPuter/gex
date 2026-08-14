@@ -621,6 +621,32 @@ fn build_closure(
         .ok()
         .map(|s| s.split(',').filter(|w| !w.is_empty()).map(str::to_string).collect())
         .unwrap_or_default();
+    // Objects NOT to fill the gaps of (`complete_pages`), by name prefix (env
+    // `GEX_NO_COMPLETE`). Completion is on by default for every object: a
+    // partly-covered page demand-fills its gaps at run time into slots the
+    // closure already holds, and that partial-page dispatch corrupts -- apt's
+    // gpgv method smashed its stack there, its forked gpgv aborted on a
+    // `lock ABI version mismatch`, every process in an `apt-get update` a
+    // different symptom of the same thing. The block discovery misses is a C++
+    // exception landing pad (reached by neither a branch nor a pointer) or a
+    // cold path, and the only cure is to carry it.
+    //
+    // The exception is a big, SPARSELY-reached math library: completing it is
+    // effectively its exhaustive size (libgcrypt: 300 MB), and it does not need
+    // it -- libgcrypt is already correct through the code-pointer scan, and the
+    // GnuTLS math stack (nettle/gmp/hogweed/gnutls) an http `apt-get update`
+    // never enters. Everything else -- libstdc++, libgcc_s, libgpg-error, the
+    // apt libraries, libseccomp, the image roots -- is carried whole-on-its-
+    // touched-pages so no live process demand-fills into a partial page.
+    let no_complete: Vec<String> = std::env::var("GEX_NO_COMPLETE")
+        .ok()
+        .map(|s| s.split(',').filter(|w| !w.is_empty()).map(str::to_string).collect())
+        .unwrap_or_else(|| {
+            ["libgcrypt", "libnettle", "libgmp", "libhogweed", "libgnutls"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
     // Every object's `memcpy`/`memmove`/`memset`/`mempcpy`, by biased address,
     // so `translate_image` emits the shim's intrinsic for them instead of
     // lifting glibc's hand-written SIMD -- the same substitution the runtime
@@ -656,16 +682,27 @@ fn build_closure(
         // Whole, for the objects named. Matched on the start of the name so
         // `libc.so.6` catches `libc.so.6` and `libc` catches it too.
         let whole = exhaustive || exhaustive_for.iter().any(|w| o.name.starts_with(w.as_str()));
+        // Fill the gaps on this object's touched pages (C++ landing pads and
+        // cold paths), unless it is already whole (nothing left to fill) or on
+        // the no-complete list (a sparse math library not worth its exhaustive
+        // size). Root images included -- an apt method wraps its `main` in a
+        // try/catch, so the landing pad the unwinder jumps to lives in the
+        // program's own image.
+        let complete =
+            !whole && !no_complete.iter().any(|w| o.name.starts_with(w.as_str()));
         let opts = Options {
             first_slot,
             exhaustive: whole,
-            // `complete_pages` (fill any page a block touches) was measured to
-            // balloon a densely-connected library to its exhaustive size
-            // (libgcrypt: 302 MB, the whole closure 1.2 GB) because completing
-            // one page cascades through the lot -- so it is left off. The
-            // partial-page hazard it targeted is real but must be fixed in the
-            // demand-fill/dispatch path, not by covering everything up front.
-            complete_pages: false,
+            // `complete_pages` fills the gaps on any page a block already
+            // touches, so a partly-covered page becomes whole and nothing on it
+            // demand-fills at run time into slots the closure already holds --
+            // the partial-page corruption that smashed apt's gpgv method's
+            // stack (a C++ exception landing pad, reached by neither branch nor
+            // pointer, is the block discovery misses). Per object (`complete_for`
+            // above), since completing a big C library is its exhaustive size for
+            // gaps no path ever takes. The old cascade is gone: completion blocks
+            // are lifted but their successors are not followed onto fresh pages.
+            complete_pages: complete,
             intrinsics: intrinsics.clone(),
             shared_memory,
             // On for every object regardless of size: slots are numbered in one

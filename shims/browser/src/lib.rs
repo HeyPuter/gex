@@ -2081,6 +2081,11 @@ static mut STDERR_BUF: [u8; STDERR_CAP] = [0; STDERR_CAP];
 static mut STDERR_LEN: usize = 0;
 
 fn stderr_note(bytes: &[u8]) {
+    // Keep the last non-blank write: a fatal diagnostic is often followed by a
+    // shorter write (a newline, a prompt redraw) that would otherwise erase it.
+    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return;
+    }
     unsafe {
         let n = bytes.len().min(STDERR_CAP);
         STDERR_BUF[..n].copy_from_slice(&bytes[..n]);
@@ -4728,7 +4733,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // fatal diagnostic to fd 2 then aborts, so a stderr write that does not
         // go through whole turns a named failure into "killed by signal 6".
         // Only on a short write, so a working program is silent.
-        if a0 == 2 && (nr == 64 || nr == 66) {
+        if (a0 == 1 || a0 == 2) && (nr == 64 || nr == 66) {
             // (base, length) pairs: one for `write`, `a2` of them for
             // `writev`, so the two cases differ only in where the list is.
             let parts: Vec<(u64, u64)> = if nr == 64 {

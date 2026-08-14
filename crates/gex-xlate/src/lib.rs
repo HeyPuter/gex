@@ -539,35 +539,70 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
                     next.push(succ);
                 }
             }
-            // Complete every page this block covers: seed each decodable
-            // instruction in it that discovery has not already reached, so the
-            // page comes out wholly covered rather than partly. See
-            // `Options::complete_pages`. The new seeds re-enter the frontier and
-            // pull their own successors in, so a page reached through a run-time
-            // pointer is filled in from a block a static path did reach nearby.
-            if opts.complete_pages {
-                let first = block.start & !0xfff;
-                let last = block.end.saturating_sub(1) & !0xfff;
-                let mut a = first;
-                while a <= last + 0xfff {
-                    if !seen.contains(&a) && view.is_executable(a) {
-                        if let Some(raw) = view.fetch(a) {
-                            if !matches!(
-                                gex_isa::decode(raw, a),
-                                gex_isa::Inst::Unknown { .. } | gex_isa::Inst::Undefined { .. }
-                            ) {
-                                seen.insert(a);
-                                next.push(a);
-                            }
-                        }
-                    }
-                    a += 4;
-                }
-            }
             collected.push(block);
         }
         next.sort_unstable();
         frontier = next;
+    }
+
+    // Complete every page reachable discovery touched: lift each decodable
+    // instruction on it that no branch or pointer reached, as a standalone block
+    // whose successors are NOT followed. See `Options::complete_pages`.
+    //
+    // A page a closure covers only PARTLY is the hazard: its uncovered blocks
+    // are reached through neither a branch nor a data pointer -- a C++ exception
+    // landing pad the unwinder jumps to from `.eh_frame` is the case that hit
+    // `apt` -- so no static discovery finds them, and they are demand-filled at
+    // run time into a page whose other slots the closure already holds, a
+    // partial page whose dispatch a wrong fill corrupts (the stack smash in
+    // apt's gpgv method). Filling the gaps here makes every touched page WHOLE,
+    // so nothing on it demand-fills. A page discovery never touched stays out of
+    // the closure and demand-fills into empty slots, which is safe.
+    //
+    // Not followed and not in the frontier: following a completion block's
+    // successors onto a fresh page would touch it, complete it, and cascade
+    // through the whole object (libgcrypt reached 302 MB that way). Bounded to
+    // touched pages, the growth is the gaps in code already carried, not the
+    // rest of the library.
+    if opts.complete_pages {
+        let touched: std::collections::BTreeSet<u64> =
+            collected.iter().map(|b| b.start & !0xfff).collect();
+        let mut fill: Vec<u64> = Vec::new();
+        for &pg in &touched {
+            let mut a = pg;
+            while a < pg + 0x1000 {
+                if !seen.contains(&a) && view.is_executable(a) {
+                    if let Some(raw) = view.fetch(a) {
+                        if !matches!(
+                            gex_isa::decode(raw, a),
+                            gex_isa::Inst::Unknown { .. } | gex_isa::Inst::Undefined { .. }
+                        ) {
+                            seen.insert(a);
+                            fill.push(a);
+                        }
+                    }
+                }
+                a += 4;
+            }
+        }
+        fill.sort_unstable();
+        let lifted = gex_emit::par::map(&fill, &|&addr| {
+            if let Some(&k) = opts.intrinsics.get(&addr) {
+                return intrinsic::block(addr, k);
+            }
+            let mut block = lift_block(
+                |pc| if view.is_executable(pc) { view.fetch(pc) } else { None },
+                addr,
+                opts.limits,
+            );
+            pass::optimize(&mut block);
+            block
+        });
+        for block in lifted {
+            stats.blocks += 1;
+            stats.instructions += ((block.end - block.start) / 4) as usize;
+            collected.push(block);
+        }
     }
 
     phases.mark("lifting");
