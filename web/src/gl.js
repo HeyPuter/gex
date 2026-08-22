@@ -60,7 +60,11 @@ class Args {
     return bytes.subarray(start, start + len);
   }
   string(bytes) {
-    return new TextDecoder().decode(this.blob(bytes));
+    // `.slice()` copies to a non-shared buffer first: the guest's memory is a
+    // `SharedArrayBuffer` when threads are on (and always so through the gl
+    // bridge), and `TextDecoder.decode` refuses a view onto shared memory.
+    // `blob` itself stays a view -- WebGL's upload calls accept shared ones.
+    return new TextDecoder().decode(this.blob(bytes).slice());
   }
 }
 

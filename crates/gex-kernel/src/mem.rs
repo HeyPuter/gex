@@ -220,7 +220,24 @@ impl MemoryMap {
                 return Ok(start - tail);
             }
         }
-        self.arena.push((start, start + want));
+        // Not adjacent to the free tail that `want` was shortened for (the
+        // shared bump cursor moved on -- the shim's own heap draws from it too),
+        // so that tail is unreachable from `start` and this span must cover
+        // `need` on its own. `want` may be short by up to `tail`; top it up.
+        // `take` is a monotonic bump cursor, so each claim is contiguous with
+        // the last. Without this, a `mmap` (a pthread stack, commonly) gets an
+        // address whose top `tail` bytes were never backed, and the first write
+        // to it faults with EFAULT -- which is how `pthread_create` died.
+        let mut end = start + want;
+        while end < start + need {
+            let more = start + need - end;
+            let s = take(more);
+            if s == 0 {
+                return Err(Errno::ENOMEM);
+            }
+            end = s + more;
+        }
+        self.arena.push((start, end));
         Ok(start)
     }
 

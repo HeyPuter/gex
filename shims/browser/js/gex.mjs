@@ -1304,7 +1304,13 @@ export class Gex {
     // dead, and a hang is indistinguishable from a slow start otherwise.
     const began = performance.now();
     let last = began;
-    const step = globalThis.GEX_DEBUG_EXIT
+    // `GEX_ADOPT_TRACE` narrates adopt phases WITHOUT the heavy GEX_DEBUG_EXIT
+    // apparatus (per-guest-write console.error flood + image sum-checks), so a
+    // near-native-speed run can reach a deep fork (e.g. Xvfb's xkbcomp helper)
+    // and show where its adopt hangs. The sum-checks below stay GEX_DEBUG_EXIT-
+    // only, and their sums are only computed then (fork side), so this path
+    // computes none.
+    const step = globalThis.GEX_DEBUG_EXIT || globalThis.GEX_ADOPT_TRACE
       ? (s) => {
           const now = performance.now();
           console.error(

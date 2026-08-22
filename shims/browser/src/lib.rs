@@ -5870,9 +5870,27 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // A fresh map for a fresh image, and it grows the same way.
     h.kernel.mem.grows_on_demand(arena_grow, arena_back);
     {
+        // The live memory size, not `guest_bytes().len()` (which is the whole
+        // 4 GiB nameable range): the fill must stay inside what actually exists.
+        let live = warch::memory_size(0) as usize * 65536;
         let data = guest_bytes();
         for (start, end) in old {
-            let (a, b) = (start as usize, (end as usize).min(data.len()));
+            // Only the fixed low layout is reused at the same address by the next
+            // program -- its image at `PIE_BASE`, `ld.so` at `INTERP_BASE`, the
+            // stack, and the placement window -- so only that must be cleared.
+            // The mmap arena is never re-handed-out at an old address: a fresh
+            // process's `arena_take` starts above the memory's high-water mark,
+            // so nothing new lands on the old arena and its stale bytes are
+            // unreachable. Skipping it is also what makes exec from a large
+            // parent viable: Xvfb's `xkbcomp` helper inherits ~130 MiB of arena
+            // (a 107 MiB libLLVM span among it), and zeroing those never-reused
+            // pages stalled the exec indefinitely -- a bulk fill over this shared
+            // memory commits every page and crawls, where the live low layout
+            // clears in a blink. This was the long-standing glxgears/virgl "hang".
+            if start >= gex_abi::ARENA_BOTTOM {
+                continue;
+            }
+            let (a, b) = (start as usize, (end as usize).min(live).min(data.len()));
             if a < b {
                 data[a..b].fill(0);
             }
@@ -6020,8 +6038,20 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
             h.kernel.pid,
         ));
     }
+    // Only re-point the directory at closure slots this Worker actually holds.
+    // `installed_mods` is the shared modules in *this* Worker's tables, and it
+    // is what "the closure's modules are still in the dispatch tables after
+    // execve" (above) really means. A forked child gets fresh, empty tables --
+    // fork does not carry the parent's installed shared modules -- so once it
+    // execs, every CLOSURE_DIRS entry names a table slot it never installed;
+    // writing them anyway sends the next indirect branch through an absent slot
+    // and traps ("table index is out of bounds", 0 modules installed -- broke
+    // debian-deb/lzma/twice/io, all dpkg-deb/xz exec'd from a forked shell).
+    // With nothing installed the whole closure directory is bogus for this
+    // process, so leave those pages at the miss stub to translate on demand.
+    let have_mods = !h.jit.installed_mods.is_empty();
     let closure = CLOSURE_DIRS.0.borrow();
-    if !closure.is_empty() {
+    if !closure.is_empty() && have_mods {
         let mut kept = 0usize;
         for (page, base) in closure.iter() {
             // Not the image's pages: a closure library is pinned to its own
@@ -8269,15 +8299,28 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     // turn. What was served is queued either way, and the
                     // trap at the end of translation installs all of it.
                 }
-                if let Some(base) = shared_slot(h, page, key) {
-                    h.jit.page_table.assign(page, base);
-                    // And the guest's directory, which `execve` cleared: only
-                    // freshly allocated pages get an entry from the unit, and
-                    // this page already has a base, so without writing it here
-                    // the branch misses again next instruction.
-                    let mut gm = GuestMem::new(guest_bytes());
-                    dir_note(page, base, "miss-shared-slot");
-                    let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+                // Only point the directory at a shared base this process can
+                // actually reach. `shared_slot` answers from the system-wide map
+                // (and `h.jit.shared`, which outlives fork), so a forked child
+                // gets bases some *other* process installed but that this one
+                // never put in its own tables. With no shared modules installed
+                // here, every such base names an absent slot; writing it sends
+                // the next indirect branch past the end of the table and traps
+                // ("table index is out of bounds", 0 modules installed -- the
+                // dpkg-deb/xz half of the debian-deb/lzma crash). The serve path
+                // above is what installs a shared module; until it has, leave
+                // the page at the miss stub so it translates locally instead.
+                if !h.jit.installed_mods.is_empty() {
+                    if let Some(base) = shared_slot(h, page, key) {
+                        h.jit.page_table.assign(page, base);
+                        // And the guest's directory, which `execve` cleared: only
+                        // freshly allocated pages get an entry from the unit, and
+                        // this page already has a base, so without writing it here
+                        // the branch misses again next instruction.
+                        let mut gm = GuestMem::new(guest_bytes());
+                        dir_note(page, base, "miss-shared-slot");
+                        let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+                    }
                 }
             }
         }
@@ -8369,12 +8412,33 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         for (addr, _) in &unit.exported_blocks {
             h.jit.translated.insert(*addr);
         }
+        // The base this unit gave the faulting page, captured before `wasm`
+        // is moved. `dir_entries` holds only *freshly allocated* pages, so a
+        // page that already had a page-table base is excluded and
+        // `publish_pending` never writes its guest-directory entry -- which is
+        // the fork-of-a-fork dispatch loop: the grandchild inherits the base
+        // in its page table (a fork carries `#lazyInherited`) but its guest
+        // directory entry stays 0 (the middle process never installed the
+        // module), so the block at `pc` misses, re-translates, and misses
+        // again forever. Reconcile it below, after the unit is installed.
+        let fault_base = unit.covered.iter().find(|(p, _)| *p == page).map(|(_, b)| *b);
         h.jit.pending.push_back(PendingModule {
             dirs: unit.dir_entries.clone(),
             slots: unit.table_slots,
             wasm: unit.wasm,
         });
         publish_pending(h);
+        // Point the guest directory at the slot this unit's block actually
+        // lives in, for the faulting page only (minimal, to keep the shared
+        // dispatch path load-bearing for apt/closures). Only when it differs.
+        if let Some(base) = fault_base {
+            let mut gm = GuestMem::new(guest_bytes());
+            let at = gex_abi::DISPATCH_DIR + page * 4;
+            if gm.read_u32(at).unwrap_or(0) != base {
+                dir_note(page, base, "miss-reconcile-covered");
+                let _ = gm.write_u32(at, base);
+            }
+        }
         h.jit.blocks += stats.blocks as u64;
         let whose = object_name_at(h, pc);
         note_blocks(&mut h.jit.by_object, whose, pc, stats.blocks as u64);
@@ -9065,14 +9129,21 @@ pub extern "C" fn gex_current_pc() -> i64 {
 /// Returns the length, or zero when nothing is mapped there.
 #[no_mangle]
 pub extern "C" fn gex_object_at(addr: i64, out: u32, max: u32) -> u32 {
-    let name = with_host(|h| {
+    // `with_host_free`, not `with_host`: this is a crash reporter -- the whole
+    // reason it is asked is to name the pc of a trap, and the trap it most needs
+    // to describe is one that happened *inside* a `with_host` (the kernel still
+    // borrowed). The panicking `with_host` re-entered that borrow and turned a
+    // clean "out of bounds at pc=0x..." into a confusing double-panic ("the
+    // kernel was re-entered"). Degrade to "no name" when the host is held.
+    let name = with_host_free(|h| {
         h.kernel
             .mem
             .vmas()
             .iter()
             .find(|v| (addr as u64) >= v.start && (addr as u64) < v.end)
             .map(|v| format!("{} +{:#x}", v.name, addr as u64 - v.start))
-    });
+    })
+    .flatten();
     let Some(name) = name else { return 0 };
     let n = name.len().min(max as usize);
     let dst = shim_slice_mut(out, n as u32);

@@ -153,7 +153,15 @@ const DEMOS = {
       + 'n=$(cat <&3 | wc -c); echo bytes=$n secs=$((SECONDS-s)); echo net=done',
     want: /bytes=[0-9]{6,}/,
   },
-  gears: { want: /exit 0 in \d+ ms/, settle: 'finished' },
+  // `covered N%` is gles-gears' own glReadPixels count of non-background
+  // pixels: a run that exits 0 having drawn a black frame (a GL path that ran
+  // but presented nothing) must not pass, so the want is the coverage, not the
+  // exit. `fail` catches the drew-nothing case explicitly.
+  gears: {
+    want: /covered ([1-9]\d*)%/,
+    fail: /covered 0%/,
+    settle: 'finished',
+  },
   // Two things must be true: glxgears' frame rate (Mesa completed frames) and
   // that the frames reached the canvas -- vtest has no present, so a run can
   // draw perfectly onto a canvas that stays black.
@@ -342,12 +350,19 @@ const REPORTER = `
   // rather than the call sites somebody remembered to hook -- which is the
   // difference between a net and a list.
   var realError = console.error.bind(console);
+  // allowerrors=1 in the query logs console.error without ending the run --
+  // needed to read a debug narration (GEX_DEBUG_EXIT prints per-step
+  // console.error, which otherwise trips the fail-on-error net at the first
+  // line). Default behaviour unchanged.
+  var failOnError = location.search.indexOf('allowerrors') < 0;
   console.error = function () {
     var a = [].slice.call(arguments);
-    try {
-      post('threw', 'console.error: ' + a.map(String).join(' '));
-    } catch (e) {
-      // Reporting must never be what breaks the run.
+    if (failOnError) {
+      try {
+        post('threw', 'console.error: ' + a.map(String).join(' '));
+      } catch (e) {
+        // Reporting must never be what breaks the run.
+      }
     }
     realError.apply(null, ['[gex-console-error]'].concat(a));
   };

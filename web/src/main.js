@@ -276,6 +276,9 @@ for (const [event, describe] of [
     globalThis.GEX_DEBUG_EXIT = 1;
     globalThis.GEX_TRAP_STACK = 1;
   }
+  // `?adopttrace=1`: narrate adopt phases only (no debugExit write-flood), fast
+  // enough to reach a deep fork and show where its adopt hangs.
+  if (params.get('adopttrace')) globalThis.GEX_ADOPT_TRACE = 1;
   const asked = params.get('demo') || location.hash.slice(1);
   const want = DEMOS.find((d) => d.id === asked) || DEMOS[0];
   await select(want);

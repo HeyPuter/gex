@@ -63,6 +63,7 @@ pub mod nr {
     pub const NEWFSTATAT: u64 = 79;
     pub const FSTAT: u64 = 80;
     pub const FSYNC: u64 = 82;
+    pub const FDATASYNC: u64 = 83;
     pub const EXIT: u64 = 93;
     pub const EXIT_GROUP: u64 = 94;
     pub const SET_TID_ADDRESS: u64 = 96;
@@ -164,6 +165,7 @@ pub mod nr {
     pub const MUNMAP: u64 = 215;
     pub const CLONE: u64 = 220;
     pub const EXECVE: u64 = 221;
+    pub const CLONE3: u64 = 435;
     pub const MMAP: u64 = 222;
     pub const MREMAP: u64 = 216;
     pub const MPROTECT: u64 = 226;
@@ -1396,6 +1398,61 @@ impl Kernel {
                 }
             };
         }
+        // `clone3` (435): glibc >= 2.34 uses it for `pthread_create` (and
+        // `posix_spawn`), so without it every threaded program dies at the first
+        // thread with EFAULT. It passes a `struct clone_args *` + size rather
+        // than registers; read the fields and route through the same paths as
+        // `clone`. clone3's `stack` is the allocation base and `stack_size` its
+        // length, but `clone`/our thread setup want the *top* (the SP, which
+        // grows down), so hand on `stack + stack_size`.
+        if n == nr::CLONE3 {
+            let c = a[0];
+            // struct clone_args: flags@0, child_tid@16, parent_tid@24,
+            // stack@40, stack_size@48, tls@56 (aligned u64s).
+            let fields = (|| {
+                Some((
+                    m.read_u64(c).ok()?,
+                    m.read_u64(c + 16).ok()?,
+                    m.read_u64(c + 24).ok()?,
+                    m.read_u64(c + 40).ok()?,
+                    m.read_u64(c + 48).ok()?,
+                    m.read_u64(c + 56).ok()?,
+                ))
+            })();
+            let (flags, child_tid, parent_tid, stack, stack_size, tls) = match fields {
+                Some(t) => t,
+                None => {
+                    let _ =
+                        m.write_u64(self.ctx_addr + ctx::x(0) as u64, Errno::EFAULT.as_return());
+                    return SyscallOutcome::Continue;
+                }
+            };
+            let sp = stack.wrapping_add(stack_size);
+            if flags & clone_flags::THREAD == 0 {
+                let pid = self.procs.spawn(self.pid);
+                let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, pid as u64);
+                return SyscallOutcome::SpawnProcess {
+                    pid,
+                    child_stack: sp,
+                    tls: (flags & clone_flags::SETTLS != 0).then_some(tls),
+                };
+            }
+            let ca = [flags, sp, parent_tid, tls, child_tid, 0];
+            return match self.sys_clone(m, ca) {
+                Ok(req) => {
+                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, req.tid as u64);
+                    SyscallOutcome::SpawnThread {
+                        ctx_addr: req.ctx_addr,
+                        tid: req.tid,
+                        clear_child_tid: req.clear_child_tid,
+                    }
+                }
+                Err(e) => {
+                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, e.as_return());
+                    SyscallOutcome::Continue
+                }
+            };
+        }
         // A clone without CLONE_THREAD is a new process, which only the host
         // can build: it needs a second address space.
         if n == nr::CLONE && a[0] & clone_flags::THREAD == 0 {
@@ -1843,7 +1900,12 @@ impl Kernel {
                 .fds
                 .get(a[0] as i32)
                 .and_then(|f| f.handle.truncate(a[1]).map(|_| 0)),
-            nr::FSYNC => self.fds.get(a[0] as i32).map(|_| 0),
+            // `fdatasync` like `fsync`: everything is already durable (the VFS
+            // is in memory), so validating the fd and returning success is the
+            // honest answer. Missing it made sqlite's journal sync return
+            // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
+            // and refuses to write any file-backed database.
+            nr::FSYNC | nr::FDATASYNC => self.fds.get(a[0] as i32).map(|_| 0),
             nr::FACCESSAT | nr::FACCESSAT2 => self.sys_faccessat(m, a[0] as i32, a[1]),
             nr::READLINKAT => self.sys_readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.sys_getcwd(m, a[0], a[1]),
@@ -5292,6 +5354,7 @@ pub fn skips_proc_snapshot(n: u64) -> bool {
             | nr::SET_TID_ADDRESS
             | nr::TKILL
             | nr::CLONE
+            | nr::CLONE3
             | nr::EXIT
             | nr::EXIT_GROUP
     )
@@ -5347,6 +5410,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::NEWFSTATAT => "newfstatat",
         nr::FSTAT => "fstat",
         nr::FSYNC => "fsync",
+        nr::FDATASYNC => "fdatasync",
         nr::EXIT => "exit",
         nr::EXIT_GROUP => "exit_group",
         nr::SET_TID_ADDRESS => "set_tid_address",
@@ -5435,6 +5499,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::MUNMAP => "munmap",
         nr::MREMAP => "mremap",
         nr::CLONE => "clone",
+        nr::CLONE3 => "clone3",
         nr::EXECVE => "execve",
         nr::MMAP => "mmap",
         nr::MPROTECT => "mprotect",

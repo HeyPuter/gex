@@ -379,6 +379,23 @@ export async function runProgram(
     serve = serveVirgl(virgl, channel);
   }
 
+  // The other GPU path: a `GlDevice` (web/src/gl.js) the guest drives through
+  // libGLESv2/libEGL marshallers over a command ring. Same reason it needs a
+  // SharedArrayBuffer bridge as virgl -- `gl_submit` is synchronous inside an
+  // ioctl and the canvas is here, not in the Worker. Without this the `gl`
+  // option was accepted and dropped, so `/dev/gex-gl` was never mounted (it is
+  // gated on `have_gl()`) and gles-gears died at `eglInitialize`/`ring_open`.
+  let glChannel = null;
+  let glServe = null;
+  if (gl) {
+    if (!globalThis.crossOriginIsolated) {
+      throw new Error('the GL demo needs a cross-origin isolated page (SharedArrayBuffer bridge).');
+    }
+    const { makeGlChannel, serveGl } = await import('@gex/gl-bridge.mjs');
+    glChannel = makeGlChannel();
+    glServe = serveGl(gl, glChannel);
+  }
+
   const host = new ProcessHost({
     makeWorker: makeGuestWorker,
     shim: shimBytes,
@@ -414,6 +431,9 @@ export async function runProgram(
       // shape the shim has now.
       shared: true,
       virgl: channel ?? undefined,
+      // The GL ring's shared buffers, so a Worker that opens /dev/gex-gl can
+      // reach the page's GlDevice. In `extra` like virgl, for the same reason.
+      glChannel: glChannel ?? undefined,
       wispUrl: network?.url ?? undefined,
       // Only when there is no shared terminal to hold the size. With one this
       // must not be sent: it is captured at `runProgram` time and every Worker
@@ -425,6 +445,10 @@ export async function runProgram(
       debugExit:
         !!globalThis.GEX_DEBUG_EXIT ||
         (typeof process !== 'undefined' && !!process.env?.GEX_DEBUG_EXIT),
+      // Lightweight adopt-phase narration (no write-flood); see adoptProcess.
+      adoptTrace:
+        !!globalThis.GEX_ADOPT_TRACE ||
+        (typeof process !== 'undefined' && !!process.env?.GEX_ADOPT_TRACE),
       // KiB of mapped text per object to statically recompile once hot. Eight
       // megabytes is the largest that works today (above it the graphics rootfs
       // meets #73) and covers every library these demos run except Mesa's
@@ -459,6 +483,7 @@ export async function runProgram(
     },
     onMessage: (m) => {
       if (m.kind === 'virgl') serve?.();
+      else if (m.kind === 'gl') glServe?.();
       else if (m.kind === 'net') onNetEvent?.(m.event);
     },
   });

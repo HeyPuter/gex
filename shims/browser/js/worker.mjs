@@ -286,6 +286,9 @@ async function handle(msg) {
     // into a plain Error: the wasm frames say *where* a syscall trap happened.
     globalThis.GEX_TRAP_STACK = 1;
   }
+  // Lightweight adopt-phase narration, without the debugExit write-flood: fast
+  // enough for a deep fork to reach where it hangs. See `adoptProcess`.
+  if (msg.adoptTrace) globalThis.GEX_ADOPT_TRACE = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   const gex = new Gex(new WorkerEnv(), {
@@ -304,6 +307,13 @@ async function handle(msg) {
   if (msg.virgl) {
     const { VirglProxy } = await import('./virgl-bridge.mjs');
     gex.useVirgl(new VirglProxy(msg.virgl, () => port.post({ kind: 'virgl' })), !!msg.virglTrace);
+  }
+  // The GL device (gles-gears): the page's GlDevice, reached over a ring in a
+  // SharedArrayBuffer. `useGl` sets the flag `gex_set_gl` reads at load, so it
+  // must run before `load` -- which mounts /dev/gex-gl only when the flag is on.
+  if (msg.glChannel) {
+    const { GlProxy } = await import('./gl-bridge.mjs');
+    gex.useGl(new GlProxy(msg.glChannel, () => port.post({ kind: 'gl' })));
   }
   // The Node fast lane's network: real TCP sockets rather than Wisp, so the
   // paths above them -- apt's helper, the fetch, the parse -- run here in two
