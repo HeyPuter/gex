@@ -276,6 +276,18 @@ for (const [event, describe] of [
     globalThis.GEX_DEBUG_EXIT = 1;
     globalThis.GEX_TRAP_STACK = 1;
   }
+  // `?trapstack=1`: the engine's stack for a trap -- which names the shim
+  // function the fault was in -- without `?debug`'s mirroring of every guest
+  // write to the console. That mirroring is not free: it changed the timing
+  // enough to turn an `unreachable` in a forked apt method into a different
+  // fault, so the one switch could not be used to diagnose the other.
+  if (params.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
+  // `?forkskip=N`: a forked child does not copy any inherited region larger
+  // than N MiB, leaving those pages zero. A diagnostic, and a destructive one:
+  // if the guest reads one it gets zeros. It answers the question a real
+  // copy-on-write would answer for free -- how much of what a fork copies the
+  // child ever actually looks at. See `adoptProcess`.
+  if (params.has('forkskip')) globalThis.GEX_FORK_SKIP_MIB = Number(params.get('forkskip'));
   // `?adopttrace=1`: narrate adopt phases only (no debugExit write-flood), fast
   // enough to reach a deep fork and show where its adopt hangs.
   if (params.get('adopttrace')) globalThis.GEX_ADOPT_TRACE = 1;

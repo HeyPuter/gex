@@ -133,6 +133,11 @@ function parseArgs(argv) {
     fail: null,
     shot: null,
     restartChrome: false,
+    // Don't enable `Runtime` on worker targets. The inspector retains the
+    // arguments of every console message it is shown, and gex runs a hundred
+    // Workers that each log; measuring memory with that on measures the
+    // observer too. This is how to tell how much of a peak is ours.
+    quietWorkers: false,
   };
   const rest = [];
   for (let i = 2; i < argv.length; i++) {
@@ -142,6 +147,7 @@ function parseArgs(argv) {
     else if (a === '--keep') o.keep = true;
     else if (a === '--allow-errors') o.allowErrors = true;
     else if (a === '--restart-chrome') o.restartChrome = true;
+    else if (a === '--quiet-workers') o.quietWorkers = true;
     else if (a === '--wall') o.wallMs = Number(next()) * 1000;
     else if (a === '--idle') o.idleMs = Number(next()) * 1000;
     else if (a === '--query') o.query.push(next());
@@ -387,10 +393,12 @@ async function runDemo(o) {
       const name = shortWorker(info.url);
       workers.set(sid, name);
       log(`  worker + ${name}`);
-      try {
-        await browser.send('Runtime.enable', {}, sid);
-      } catch {
-        /* the worker may already be gone */
+      if (!o.quietWorkers) {
+        try {
+          await browser.send('Runtime.enable', {}, sid);
+        } catch {
+          /* the worker may already be gone */
+        }
       }
     }
     if (p.waitingForDebugger) {
@@ -467,7 +475,12 @@ async function runDemo(o) {
 
     let snap;
     try {
-      snap = await evalPage(browser, page);
+      // With a deadline, like the reporting below: `Runtime.evaluate` waits for
+      // an answer from the page, and a page that has stopped answering never
+      // sends one. Without this the watch loop parks inside the await and the
+      // wall and idle guards below -- the whole point of the loop -- never run
+      // again, so a wedged run reads as one still going.
+      snap = await capped(evalPage(browser, page), 15_000, 'evaluate');
     } catch (e) {
       // A failed eval right after a navigation is normal; a persistent one on a
       // dead session is not, and the wall/crash guards above will end it.
@@ -595,7 +608,11 @@ async function runDemo(o) {
   const secs = ((Date.now() - began) / 1000).toFixed(1);
   let shotPath = o.shot ?? join(STATE, `shot-${o.demo}.png`);
   try {
-    const { data } = await browser.send('Page.captureScreenshot', { format: 'png' }, page);
+    const { data } = await capped(
+      browser.send('Page.captureScreenshot', { format: 'png' }, page),
+      10_000,
+      'screenshot',
+    );
     writeFileSync(shotPath, Buffer.from(data, 'base64'));
   } catch {
     shotPath = null;
@@ -626,12 +643,35 @@ async function runDemo(o) {
   }
 
   if (!o.keep) {
-    await browser.send('Target.closeTarget', { targetId }).catch(() => {});
+    await capped(browser.send('Target.closeTarget', { targetId }), 10_000, 'close').catch(() => {});
   } else {
     log(`--keep: tab left open (targetId ${targetId}) on the persistent browser`);
   }
   browser.close();
   return ok ? 0 : 1;
+}
+
+// A CDP request with a deadline. Every command here awaits a reply from the
+// page, and a *crashed* renderer never answers one: the socket stays open, so
+// nothing rejects and nothing times out.
+//
+// That is not a detail. The reporting above runs after the verdict is decided,
+// so a run that ended in "page crashed -- likely OOM" printed that line and
+// then hung forever inside `Page.captureScreenshot`, with the verdict never
+// printed, the exit code never returned, and -- the part that spread -- the tab
+// never closed. Those tabs stay on the persistent browser and keep their
+// memory, so the next run starts with less of it and crashes sooner. Two
+// abandoned drivers were enough to turn a demo that finishes into one that OOMs
+// halfway, and the evidence for the earlier, healthier runs was thrown away
+// with them.
+function capped(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`cdp ${what} did not answer in ${ms}ms`)), ms);
+    }),
+  ]);
 }
 
 // ---------------------------------------------------------------------------

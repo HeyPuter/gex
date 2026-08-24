@@ -567,6 +567,26 @@ pub extern "C" fn k_slot_floor(floor: u64) {
     slot_mark().fetch_max(floor, core::sync::atomic::Ordering::SeqCst);
 }
 
+/// Runtime slots nobody has claimed yet: from the mark to the top of the last
+/// dispatch table.
+///
+/// There is no reclaiming a dead process's slots -- the shared slot map is what
+/// lets the second process to run `ls` install what the first translated, so a
+/// number handed out means the same thing for the page's whole life. That makes
+/// this a budget, and one worth asking about before spending a large piece of
+/// it: past the top, `PageTable::base` divides into a table index of
+/// `DISPATCH_TABLES` and the emitted module imports a table that does not
+/// exist. The engine then refuses it with "out of bounds table index 8", in
+/// whichever forked child happened to be translating, and the run stops on a
+/// message about wasm validation that says nothing about slots.
+#[no_mangle]
+pub extern "C" fn k_slot_left() -> u64 {
+    let per_table =
+        (gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE;
+    let top = gex_abi::DISPATCH_TABLES as u64 * per_table;
+    top.saturating_sub(slot_mark().load(core::sync::atomic::Ordering::SeqCst))
+}
+
 /// How many pages the map answers for. A diagnostic.
 #[no_mangle]
 pub extern "C" fn k_slot_count() -> u32 {

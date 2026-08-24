@@ -36,9 +36,17 @@ ARCH=arm64
 # other curses program either refuse to start or fall back to `dumb` and
 # scroll. The rootfs had no terminfo file of any kind, and `TERM` was being
 # set to a value nothing in it could read.
+#
+# `usr-is-merged` is here to be *preferred*, not because anything wants it:
+# `init-system-helpers` depends on `usrmerge | usr-is-merged`, and the resolver
+# takes an alternative already in the closure over the first one. Without it the
+# first one wins -- `usrmerge`, which converts a system to merged /usr and pulls
+# perl in behind it -- and the recorded system then has an unmet `perl:any`,
+# which is enough for apt to refuse every `install`. This tree is unpacked
+# merged, so `usr-is-merged` is the true answer as well as the small one.
 ROOTS="${GEX_DEBIAN_ROOTS:-apt dash bash coreutils dpkg findutils grep sed tar gzip diffutils \
        debianutils base-files base-passwd hostname ca-certificates \
-       ncurses-base ncurses-bin less procps \
+       ncurses-base ncurses-bin less procps usr-is-merged \
        libc-bin perl-base debian-archive-keyring}"
 
 mkdir -p "$WORK/debs" "$WORK/root"
@@ -77,11 +85,22 @@ for name, p in pkgs.items():
         if v and v not in provides:
             provides[v] = name
 
-def deps(p):
-    """Every hard dependency, taking the first alternative of each set.
+def base(name):
+    """A dependency name without its architecture qualifier.
 
-    Alternatives are "a | b", and the first is the maintainer's preference.
-    Recommends are skipped: they are what turns a 40 MB closure into 400 MB.
+    A dependency may be written `perl:any` -- satisfied by that package from
+    any architecture. The qualifier is not part of the package's name, so
+    looking one up with it attached finds nothing, and `perl:any` was reported
+    as a package the index does not have. It has `perl`.
+    """
+    return name.split(':', 1)[0]
+
+
+def clauses(p):
+    """The alternative sets of every hard dependency, in order.
+
+    A clause is "a | b": alternatives, best first. Recommends are skipped --
+    they are what turns a 40 MB closure into 400 MB.
     """
     out = []
     for field in ('Pre-Depends', 'Depends'):
@@ -89,16 +108,43 @@ def deps(p):
             clause = clause.strip()
             if not clause:
                 continue
-            first = clause.split('|')[0].strip()
-            name = first.split()[0] if first else ''
-            if name:
-                out.append(name)
+            alts = [a.strip().split()[0] for a in clause.split('|') if a.strip()]
+            if alts:
+                out.append(alts)
+    return out
+
+
+def deps(p, chosen):
+    """One name per clause: an alternative already chosen, else the first.
+
+    Preferring what is already in the closure is what apt does, and it is not
+    a nicety here. `init-system-helpers` depends on `usrmerge | usr-is-merged`,
+    and taking the first alternative pulled in `usrmerge` -- the program that
+    *converts* a system to merged /usr -- and behind it
+    `libfile-find-rule-perl` and a dependency on `perl:any` that this closure
+    does not carry. The tree unpacked here is merged from the start, so the
+    right alternative is `usr-is-merged` (which is a root below, and which
+    debootstrap picks for bookworm too).
+
+    The cost of getting it wrong was not a bigger image, it was a broken one:
+    `/var/lib/dpkg/status` recorded `usrmerge` as installed with an unmet
+    dependency, so `apt-get install anything` refused to do any work at all
+    with "Unmet dependencies. Try 'apt --fix-broken install'".
+    """
+    out = []
+    for alts in clauses(p):
+        pick = next((a for a in alts if base(a) in chosen), alts[0])
+        out.append(pick)
     return out
 
 seen, queue, missing = set(), os.environ['GEX_ROOTS'].split(), []
 order = []
+# Every root counts as chosen before anything transitive is resolved, so a
+# clause naming one prefers it. The queue is FIFO and the roots go in first,
+# which is what makes that true for the packages pulled in behind them.
+chosen = {base(n) for n in queue}
 while queue:
-    name = queue.pop(0)
+    name = base(queue.pop(0))
     if name in seen:
         continue
     seen.add(name)
@@ -107,12 +153,40 @@ while queue:
         missing.append(name)
         continue
     order.append(p)
-    queue.extend(deps(p))
+    chosen.add(p['Package'])
+    queue.extend(deps(p, chosen))
 
 print(f'  {len(order)} packages', file=sys.stderr)
 if missing:
     print(f'  not in the index, skipped: {" ".join(sorted(set(missing)))}',
           file=sys.stderr)
+
+# Is what this is about to record as installed a system apt will work on?
+#
+# The status file below copies each package's own `Depends`, so a dependency the
+# closure does not carry is written down as unmet -- and apt answers every
+# `install` with "Unmet dependencies. Try 'apt --fix-broken install'" and does
+# nothing at all. That was true of this image for as long as it has existed and
+# the only symptom was in a browser, two hundred megabytes of rootfs later. It
+# is one pass over the closure here.
+have = {p['Package'] for p in order}
+for p in order:
+    for item in p.get('Provides', '').split(','):
+        v = item.strip().split()[0] if item.strip() else ''
+        if v:
+            have.add(v)
+unmet = []
+for p in order:
+    for alts in clauses(p):
+        if not any(base(a) in have for a in alts):
+            unmet.append(f"{p['Package']} needs {' | '.join(alts)}")
+if unmet:
+    print('  the closure is not self-consistent -- apt will refuse to install '
+          'anything into it:', file=sys.stderr)
+    for line in unmet:
+        print(f'    {line}', file=sys.stderr)
+    sys.exit(1)
+
 total = sum(int(p.get('Size', 0)) for p in order)
 print(f'  {total / (1 << 20):.0f} MiB of .debs', file=sys.stderr)
 with open(f'{work}/closure.json', 'w') as f:
@@ -231,8 +305,15 @@ APT::Sandbox::User "root";
 //      APT::Cache-Start. Current value: 28311552.
 //   E: Problem with MergeList .../binary-arm64_Packages
 //
-// Started here it parses the whole index and `apt-get update` exits 0.
-APT::Cache-Start "134217728";
+// So it has to be raised -- but only to what the index needs, not to a round
+// number well past it. There is no copy-on-write here: one guest process is one
+// linear memory, so `fork` copies the parent's mappings into the child, and
+// every byte copied is a byte of the tab's memory. apt forks about 120 times in
+// an `apt-get install` and keeps a dozen children alive at once, none of which
+// touches this cache -- they exec a method or dpkg immediately. At 128 MiB that
+// one mapping was most of the ~5 GB the renderer held, and the run died of it.
+// 64 MiB parses the whole bookworm arm64 index with room to spare.
+APT::Cache-Start "67108864";
 Acquire::AllowInsecureRepositories "true";
 Acquire::Check-Valid-Until "false";
 APT::Get::AllowUnauthenticated "true";

@@ -286,6 +286,14 @@ async function handle(msg) {
     // into a plain Error: the wasm frames say *where* a syscall trap happened.
     globalThis.GEX_TRAP_STACK = 1;
   }
+  // And on its own, because every trap that matters happens in a Worker and the
+  // switch for it was only ever set in the page. `?trapstack=1` set a global
+  // here that nothing in this Worker could see, so the one diagnostic that
+  // names the shim function a fault was in has never reached a forked child --
+  // and `?debug=1`, which does carry it, mirrors every guest write and changed
+  // the fault it was being used to look at.
+  if (msg.trapStack) globalThis.GEX_TRAP_STACK = 1;
+  if (msg.forkSkip !== undefined) globalThis.GEX_FORK_SKIP_MIB = msg.forkSkip;
   // Lightweight adopt-phase narration, without the debugExit write-flood: fast
   // enough for a deep fork to reach where it hangs. See `adoptProcess`.
   if (msg.adoptTrace) globalThis.GEX_ADOPT_TRACE = 1;
@@ -516,6 +524,20 @@ async function handle(msg) {
       // What this process's memory grew to -- the question is whether a forked
       // child pays the same again.
       memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)),
+      // Dispatch slots the page has left, in thousands. A budget nothing
+      // refills: when it runs out, the next module names a table that does not
+      // exist and the engine refuses it. Per process, because the question is
+      // always how many more processes a run can afford.
+      slotsLeftK: Number(gex.shim.exports.gex_slots_left_k?.() ?? -1),
+      // Where this process's address space went: guest mappings, the runtime's
+      // own heap, Worker stacks. In MiB.
+      // What this process's fork copied into it, and what `?forkskip` left out.
+      forkCopied: gex.forkCopiedBytes,
+      forkSkipped: gex.forkSkippedBytes,
+      forkZeros: gex.forkZeroBytes,
+      arena: gex.shim.exports.gex_arena_spent_mib
+        ? [0, 1, 2].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
+        : null,
     });
   } catch (e) {
     // Where the guest was, not only what the engine said: a crash inside the

@@ -502,6 +502,28 @@ export class ProcessHost {
             `[gex] pid ${pid}: lived ${lived}ms (guest ${m.guestMillis ?? -1}ms)` +
               // What the runtime still held on exit. -1 without GEX_HEAP_COUNTERS=1.
               (m.heapKib >= 0 ? `, runtime holds ${Math.round(m.heapKib / 1024)} MiB` : '') +
+              // Dispatch slots the page has left. A budget nothing refills, so
+              // this only falls, and how fast it falls is what says how many
+              // more processes the run can translate code in.
+              (m.slotsLeftK >= 0 ? `, ${m.slotsLeftK}k dispatch slots left` : '') +
+              // What this process's memory grew to. One memory per process, so
+              // this times the number live at once is what the tab costs.
+              (m.memoryMib !== undefined ? `, memory ${m.memoryMib} MiB` : '') +
+              // And what that memory went on, which is the only way to tell a
+              // guest that really maps a lot from a runtime spending it.
+              (m.arena ? ` (maps ${m.arena[0]}, heap ${m.arena[1]}, stacks ${m.arena[2]})` : '') +
+              // The one memory every process shares: the filesystem and the
+              // store of translated modules live in it, and it only grows.
+              (this.#kernel?.memory
+                ? `, kernel ${Math.round(this.#kernel.memory.buffer.byteLength / 1048576)} MiB`
+                : '') +
+              // What the fork wrote into this process. There is no
+              // copy-on-write, so this is paid in full, per fork.
+              (m.forkCopied
+                ? `, fork copied ${Math.round(m.forkCopied / 1048576)} MiB`
+                  + (m.forkZeros ? ` (${Math.round(m.forkZeros / 1048576)} MiB of it zero, left alone)` : '')
+                  + (m.forkSkipped ? ` and skipped ${Math.round(m.forkSkipped / 1048576)}` : '')
+                : '') +
               `, ${m.millis}ms translating ${m.blocks} blocks` +
               // Of those, ones on a page the closure already had: if most of
               // `blocks`, the fill is failing to reach the guest, not a

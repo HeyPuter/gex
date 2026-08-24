@@ -283,6 +283,9 @@ extern "C" {
     /// allocation clear of what static recompilation already assigned.
     fn k_slot_alloc(count: u64) -> u64;
     fn k_slot_floor(floor: u64);
+    /// How many slots the mark has left before it runs off the last dispatch
+    /// table. Nothing gives slots back, so this only falls; see `k_slot_left`.
+    fn k_slot_left() -> u64;
     /// Translated modules, once for the whole system: a dispatch table belongs
     /// to a module instance, so the module bytes themselves must be shareable.
     fn k_mod_store(ptr: u32, len: u32, slots: u64, dirs_ptr: u32, dirs_len: u32) -> u32;
@@ -375,6 +378,15 @@ extern "C" {
     fn k_virgl_release(id: i32);
 }
 
+/// The first slot number no dispatch table can hold: `DISPATCH_TABLES` tables
+/// of whole pages each. The emitter's divisor, so the two agree on where the
+/// space ends.
+fn slot_space_top() -> u64 {
+    let per_table =
+        (gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE;
+    gex_abi::DISPATCH_TABLES as u64 * per_table
+}
+
 /// A page table whose runtime allocations come from the system-wide counter.
 ///
 /// Statically recompiled slots stay as built (same code, same numbers in every
@@ -396,7 +408,29 @@ fn shared_page_table(
     unsafe { k_slot_floor(next_slot) };
     table.set_refill(std::sync::Arc::new(gex_xlate::Refill(Box::new(|n| {
         // SAFETY: as above.
-        unsafe { k_slot_alloc(n) }
+        let base = unsafe { k_slot_alloc(n) };
+        // The one place every runtime slot comes from, so the one place that
+        // can say the space is gone. Past the top of the last dispatch table
+        // `PageTable::base` divides into a table index of `DISPATCH_TABLES`,
+        // and the module built from that entry imports a table no instance
+        // has: the engine answers "out of bounds table index 8" and the reader
+        // is left with a wasm validation error for what is really a budget.
+        // Said here, before the module that cannot compile is built.
+        if base + n > slot_space_top() {
+            static SAID: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn_line(&format!(
+                    "[gex] the runtime dispatch slot space is spent: slot {base} is past \
+                     the top of table {} and nothing can be translated after this. \
+                     Slots are never given back, so a page's whole life shares \
+                     {} of them; this run has used them all.\n",
+                    gex_abi::DISPATCH_TABLES - 1,
+                    slot_space_top(),
+                ));
+            }
+        }
+        base
     }))));
     // With a refill in place, forget the allocation mark: left in, it made
     // `gex_table_need(0)` report the whole closure's slots at once, growing
@@ -1609,7 +1643,34 @@ fn arena_take(len: u64) -> Option<u64> {
     // collide). The memory is grown to cover the inherited image first, so its
     // size is the floor; an unforked process is below `ARENA_BOTTOM` as before.
     let at = if cur == 0 {
-        gex_abi::ARENA_BOTTOM.max(warch::memory_size(0) as u64 * 65536)
+        // A forked child starts above the mappings it inherited -- the top of
+        // its *image*, which `gex_adopt_vma_blob` has just seen every region
+        // of, not the top of its *memory*.
+        //
+        // The two are not the same and the difference is most of the address
+        // space. A child's memory is grown to cover the parent's image, and the
+        // parent's memory reaches wherever the parent's own arena had climbed
+        // to -- guest mappings and the parent's runtime heap alike, and the
+        // heap is the larger part by far. None of that heap is inherited: the
+        // image is `[0, LOW_END)` plus the VMAs and nothing else, so the child's
+        // fresh allocator will never read a byte of it. Starting above it threw
+        // the space away anyway.
+        //
+        // What that cost: apt's forked `http` method arrived with a floor of
+        // 1682 MiB against an `MMAP_TOP` of 2048, spent 315 MiB on its own
+        // heap, and then could not claim the 79.5 MiB for its inherited image.
+        // An arena that cannot grow is `handle_alloc_error`, which aborts past
+        // the panic hook as a bare `unreachable` -- so `apt-get install`
+        // reported "Method http has died unexpectedly!  Sub-process http
+        // received signal 9" and nothing about memory at all.
+        let inherited = ADOPTED_TOP.load(std::sync::atomic::Ordering::Acquire);
+        if inherited != 0 {
+            gex_abi::ARENA_BOTTOM.max(inherited)
+        } else {
+            // Not forked: the memory is its own and nothing else is in it. Kept
+            // as the floor rather than assumed, since the loader grows it.
+            gex_abi::ARENA_BOTTOM.max(warch::memory_size(0) as u64 * 65536)
+        }
     } else {
         cur
     };
@@ -1781,6 +1842,52 @@ unsafe impl talc::source::Source for ShimRegion {
         const CHUNK: u64 = 16 * 1024 * 1024;
         let len = (_layout.size() as u64 + _layout.align() as u64).max(CHUNK);
         let len = len.next_multiple_of(65536);
+        // A single allocation bigger than a chunk, said out loud. talc cannot
+        // serve a request from two spans, so one of these claims a span of its
+        // own from an arena that never takes a span back -- which makes a
+        // hundred-megabyte allocation a hundred megabytes of address space gone
+        // for the process's life, and a repeated one fatal. There is no other
+        // way to find out which allocation it was: the biggest-layout counter
+        // names the syscall that was running, and the ones that matter here
+        // happen while a forked child is being built, before it makes any.
+        //
+        // Rendered into a stack buffer, never `format!`: this is the
+        // allocator's own refill path, so allocating here refills, fails and
+        // recurses -- the same care `arena_take` takes, and the run simply
+        // stopped with nothing printed when this was written the easy way.
+        // The first few, and only well above a chunk: this is a real event worth
+        // a line, not a stream. A run that made one of these per miss printed
+        // two hundred of them and drowned everything else in the console.
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if _layout.size() as u64 > 2 * CHUNK
+            && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4
+        {
+            use core::fmt::Write as _;
+            struct Buf([u8; 160], usize);
+            impl core::fmt::Write for Buf {
+                fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                    let room = self.0.len() - self.1;
+                    let n = s.len().min(room);
+                    self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+                    self.1 += n;
+                    Ok(())
+                }
+            }
+            let mut b = Buf([0; 160], 0);
+            let _ = write!(
+                b,
+                "[gex:{}] a single {} MiB allocation takes a span of its own from \
+                 the arena, which never gives one back (in {}, syscall {}, \
+                 {} refills so far)\n",
+                my_pid(),
+                _layout.size() >> 20,
+                phase_name(PHASE.load(std::sync::atomic::Ordering::Relaxed)),
+                LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
+                HEAP_REFILLS.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            // SAFETY: `warn` reads the bytes and keeps none of them.
+            unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+        }
         arena_note(1, len);
         // Count of refills, plus the biggest single layout that forced one --
         // which separates one doubling buffer from many live objects.
@@ -2873,6 +2980,7 @@ pub extern "C" fn gex_vma_blob_read(out: u32, cap: u32) -> u32 {
 /// Rebuild the child's map from what [`vma_blob`] wrote.
 #[no_mangle]
 pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
+    phase(2);
     let raw = shim_slice(ptr, len);
     let mut p = 0usize;
     let mut u32at = |p: &mut usize| -> u32 {
@@ -2907,11 +3015,20 @@ pub extern "C" fn gex_adopt_vma_blob(ptr: u32, len: u32) -> i32 {
                 p += 8;
                 Some((id, off))
             };
+            ADOPTED_TOP.fetch_max(end, std::sync::atomic::Ordering::Release);
             h.kernel.mem.adopt(start, end, prot, &name, code);
         }
         0
     })
 }
+
+/// The highest address this process inherited a mapping at, or zero if it
+/// inherited none (it was not forked).
+///
+/// This is the floor a forked child's arena must start above, and knowing it
+/// exactly is the difference between a child that can allocate and one that
+/// cannot. See `arena_take`.
+static ADOPTED_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Describe region `i`, writing `start`, `end` and `prot` as three `u64` at
 /// `out` in this module's own region.
@@ -2967,6 +3084,7 @@ pub extern "C" fn gex_heap_total_kib() -> i32 {
 /// JS can write to. Used to hand the ELF across.
 #[no_mangle]
 pub extern "C" fn gex_alloc(len: u32) -> u32 {
+    phase(8);
     // `u32` rather than `usize`: this is the JS boundary, and a length is a
     // Number there. Nothing JS allocates is near 4 GiB.
     let len = len as usize;
@@ -3622,6 +3740,7 @@ static METADATA: SingleThreaded<Vec<u8>> = SingleThreaded(const { RefCell::new(V
 
 #[no_mangle]
 pub extern "C" fn gex_set_metadata(ptr: u32, len: u32) {
+    phase(7);
     *METADATA.0.borrow_mut() = shim_slice(ptr, len).to_vec();
 }
 
@@ -4169,6 +4288,7 @@ pub extern "C" fn gex_lazy_owner(page: u64) -> i32 {
 /// covers.
 #[no_mangle]
 pub extern "C" fn gex_reset_directory() -> u32 {
+    phase(6);
     let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
     let data = guest_bytes();
     let from = gex_abi::DISPATCH_DIR as usize;
@@ -5715,6 +5835,7 @@ pub extern "C" fn gex_fork_cwd_len() -> u32 {
 /// redirecting a child's output needs.
 #[no_mangle]
 pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
+    phase(5);
     let Ok(text) = std::str::from_utf8(shim_slice(ptr, len)) else {
         return -1;
     };
@@ -6084,6 +6205,7 @@ pub extern "C" fn gex_thread_taken() {}
 /// Worker runs. Returns the pc to enter at, or zero if there is no such thread.
 #[no_mangle]
 pub extern "C" fn gex_adopt_thread(tid: i32) -> i64 {
+    phase(9);
     with_host(|h| {
         let Some(i) = h.threads.iter().position(|t| t.kstate.tid == tid) else {
             return 0;
@@ -6113,6 +6235,7 @@ pub extern "C" fn gex_adopt_child(
     tls: i64,
     brk: i64,
 ) -> i64 {
+    phase(1);
     let ctx_addr = ctx_addr as u64;
     {
         let mut gm = GuestMem::new(guest_bytes());
@@ -7134,6 +7257,27 @@ impl gex_kernel::syscalls::ObjectPlace for SharedPlaces {
     }
 }
 
+/// Most bytes of shared module one dispatch miss will read into this process.
+///
+/// A miss serves whatever somebody else already translated of the object it
+/// landed in, which is strictly cheaper than translating it again -- but the
+/// bytes are read into the shim's heap, and the arena those spans come from
+/// never takes one back. Unbounded, one miss read every module of the object:
+/// hundreds of megabytes, per process, to install sixteen of them.
+///
+/// Sized to cover an ordinary library whole in one miss (glibc recompiles to
+/// 13.6 MiB) while refusing the pathological case, and nothing is lost by
+/// refusing -- what a miss leaves behind, the next one takes.
+///
+/// This is the process's memory high-water, near enough: the batch is read in
+/// and then merged, so both exist at once, and neither span is ever given back.
+/// At 64 MiB an `apt-get install` served 47 MiB batches and every process in
+/// the tab carried ~90 MiB of heap it was not using; at 16 the same run carries
+/// a quarter of that. Compiling is per *module* far more than per byte, so what
+/// this costs is one more miss, not one more compile per byte.
+const SERVE_MAX_BYTES: u64 = 16 << 20;
+
+
 /// Keep a translated module where every Worker can reach it. Zero if there is
 /// no kernel, or it has no room left.
 fn share_module(wasm: &[u8], slots: u64, dirs: &[(u64, u32)]) -> u32 {
@@ -7208,8 +7352,17 @@ fn obj_finished(h: &Host, page: u64) -> bool {
 
 /// Every module any process stored for this object that this Worker lacks:
 /// `(id, slots, dirs, wasm)` each.
-fn shared_modules_of_object(h: &Host, obj: u64) -> Vec<(u32, u64, Vec<(u64, u32)>, Vec<u8>)> {
+fn shared_modules_of_object(
+    h: &Host,
+    obj: u64,
+    max_mods: usize,
+    max_bytes: u64,
+) -> Vec<(u32, u64, Vec<(u64, u32)>, Vec<u8>)> {
+    phase(13);
     let mut out = Vec::new();
+    let mut took = 0u64;
+    let mut left_behind = 0usize;
+    let mut left_bytes = 0u64;
     // SAFETY: scalars in, and the readers below size their buffers from the
     // kernel's own answer before asking it to fill them.
     unsafe {
@@ -7228,6 +7381,29 @@ fn shared_modules_of_object(h: &Host, obj: u64) -> Vec<(u32, u64, Vec<(u64, u32)
             if len == 0 {
                 continue;
             }
+            // Bounded here, where the bytes are read, not by the caller after
+            // the fact.
+            //
+            // The caller took `per_miss` of these and dropped the rest, so this
+            // read every module of the object -- every time any process missed
+            // in it -- to keep sixteen. In an `apt-get install` that was 31 GB
+            // of module bytes read into per-process heaps across the run, at
+            // 19, 39, 79, 158 and 317 MiB a time, and the arena those spans come
+            // from never takes one back: a forked child arrived holding 629 MiB
+            // of heap before it had run a single guest instruction, the tab
+            // peaked at 11 GB, and apt's `http` method died of an allocation
+            // failure that reads as "Sub-process http received signal 9".
+            //
+            // Always at least one, whatever its size, or a module bigger than
+            // the whole budget could never be taken and the miss would repeat
+            // for ever. Everything skipped is taken by a later miss -- the ones
+            // taken are marked installed, so each miss sees the next batch.
+            if !out.is_empty() && (out.len() >= max_mods || took + len as u64 > max_bytes) {
+                left_behind += 1;
+                left_bytes += len as u64;
+                continue;
+            }
+            took += len as u64;
             let mut wasm = vec![0u8; len];
             if k_mod_read(id, wasm.as_mut_ptr() as u32, len as u32) as usize != len {
                 continue;
@@ -7249,6 +7425,17 @@ fn shared_modules_of_object(h: &Host, obj: u64) -> Vec<(u32, u64, Vec<(u64, u32)
                 .collect();
             out.push((id, k_mod_slots(id), dirs, wasm));
         }
+    }
+    // No silent cap: a run that stops taking modules gets slower for a reason
+    // that is invisible otherwise.
+    if left_behind > 0 && tracing() {
+        trace_line(&format!(
+            "[gex] took {} module(s) of {} KiB for the object, left {left_behind} of \
+             {} KiB for the next miss\n",
+            out.len(),
+            took / 1024,
+            left_bytes / 1024,
+        ));
     }
     out
 }
@@ -8225,6 +8412,38 @@ fn trap() -> ! {
     warch::unreachable()
 }
 
+/// Which of the shim's own entry points is running, for a report that cannot
+/// call anything to find out.
+///
+/// A forked child does its whole setup before it makes a single syscall, so
+/// `LAST_SYSCALL` reads `-1` for all of it and says nothing about where a fault
+/// or a huge allocation came from. This is the one thing that does. A plain
+/// atomic set on entry, never cleared: the last one entered is the answer.
+static PHASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Name a phase by its code, for the reports that print one.
+fn phase_name(n: u32) -> &'static str {
+    match n {
+        1 => "adopt_child",
+        2 => "adopt_vma_blob",
+        3 => "adopt_page",
+        4 => "shared_seed",
+        5 => "adopt_fds",
+        6 => "reset_directory",
+        7 => "set_metadata",
+        8 => "alloc",
+        9 => "adopt_thread",
+        11 => "translate_runtime",
+        12 => "translate_object",
+        13 => "shared_modules_of_object",
+        _ => "-",
+    }
+}
+
+fn phase(n: u32) {
+    PHASE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The syscall number the guest is inside, or the last one it was inside.
 ///
 /// A plain static, deliberately: it is read after a crash, when the kernel
@@ -8894,10 +9113,6 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // on `wasm32-unknown-unknown`, which is why
                 // `GEX_DISPATCH_BALLAST` has never done anything in a page.
                 let per_miss = PER_MISS_N.load(std::sync::atomic::Ordering::Relaxed);
-                let mut ready = shared_modules_of_object(
-                    h,
-                    object_identity(h, page * gex_abi::DISPATCH_PAGE).unwrap_or(0),
-                );
                 // All of it, when the object has been translated whole.
                 //
                 // The cap exists because a stored unit holds only what was
@@ -8906,9 +9121,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // nothing. Once the object is complete the cap drops: everything
                 // is covered, so taking the lot ends the object's misses.
                 let whole = obj_finished(h, page);
-                if !whole {
-                    ready.truncate(per_miss);
-                }
+                // A byte budget either way. "Take the lot" was a count with no
+                // size behind it, and the lot is however many megabytes of wasm
+                // somebody stored: a finished object served 317 MiB in one miss.
+                // What this leaves is taken by the next miss.
+                let ready = shared_modules_of_object(
+                    h,
+                    object_identity(h, page * gex_abi::DISPATCH_PAGE).unwrap_or(0),
+                    if whole { usize::MAX } else { per_miss },
+                    SERVE_MAX_BYTES,
+                );
                 if !ready.is_empty() {
                     if tracing() {
                         trace_line(&format!(
@@ -9001,7 +9223,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }
         let started = now_ns();
         let known = std::mem::take(&mut h.jit.translated);
-        let (unit, stats) = gex_xlate::translate_runtime(
+        phase(11);
+    let (unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
@@ -9034,6 +9257,26 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // re-lifting. Published by what the unit *covers*, not what it allocated
         // (handed the allocation list, nine of ten units published nothing); the
         // slot count travels with it, since the installer's high-water differs.
+        // Every unit, however many the store already holds for these pages.
+        //
+        // Capping it looks obviously right and is not: every process publishes
+        // about 1.5 MiB of near-duplicates into the one memory every process
+        // shares, which only grows, so a 60-process run added 92 MiB to it. But
+        // a unit is route-dependent -- it holds what was reachable from the
+        // block that faulted in the process that built it -- so those
+        // "duplicates" are alternative routes, and they are what later
+        // processes are served instead of lifting their own. Measured on a
+        // 60-process loop:
+        //
+        //     claims kept per page   kernel growth   blocks lifted   wall
+        //     unbounded                    92 MiB           6,162   20.7s
+        //     16                           42 MiB          12,084   47.9s
+        //     3                             7 MiB          13,940   52.3s
+        //
+        // A bound trades a bounded amount of shared memory for unbounded
+        // re-translation in every process that comes later. The growth is real
+        // and worth fixing, but the fix is route-independent units -- one
+        // publication that covers a page for everybody -- not a smaller cache.
         let mod_id = share_module(&unit.wasm, unit.table_slots, &unit.covered);
         if mod_id == 0 {
             h.jit.store_full += 1;
@@ -9193,6 +9436,43 @@ fn recompile_objects() {
 /// path already covers just costs V8 a larger module.
 const RECOMPILE_AFTER_MISSES: u32 = 24;
 
+/// Slots the demand path is left holding whatever else happens: enough for a
+/// few hundred pages of translated code in every process still to come, so
+/// running out of budget for *bulk* recompilation never means running out for
+/// the blocks a guest actually branches to.
+const SLOT_RESERVE: u64 = 8 * 1024 * gex_abi::SLOTS_PER_PAGE;
+
+/// Can the slot space pay for recompiling the whole of `map`, and still keep
+/// the reserve? A page of guest text costs `SLOTS_PER_PAGE` slots whether one
+/// block of it is reached or all of them, so the object's mapped size is the
+/// price.
+fn slots_affordable(map: &gex_kernel::CodeMap) -> bool {
+    // Without a global kernel there is one process and one counter, and the
+    // whole space is its own.
+    if unsafe { k_present() } == 0 {
+        return true;
+    }
+    let pages = map.end.saturating_sub(map.start) / gex_abi::DISPATCH_PAGE + 1;
+    let want = pages * gex_abi::SLOTS_PER_PAGE;
+    // SAFETY: takes nothing, returns a scalar, borrows nothing here.
+    let left = unsafe { k_slot_left() };
+    if want + SLOT_RESERVE <= left {
+        return true;
+    }
+    // Once, and named: a run that quietly stops recompiling gets slower for a
+    // reason nobody can see otherwise.
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn_line(&format!(
+            "[gex] not recompiling {} in bulk: it wants {want} dispatch slots and \
+             {left} are left of the runtime space. Demand translation carries on; \
+             this run has used its budget for whole objects.\n",
+            map.path,
+        ));
+    }
+    false
+}
+
 /// A dispatch miss landed at `pc`. If it is in an object that has now been
 /// missed often enough, translate the rest of that object.
 ///
@@ -9215,12 +9495,30 @@ fn maybe_recompile_at(pc: u64) -> bool {
         Some(h.jit.candidates.remove(at).0)
     });
     let Some(map) = due else { return false };
+    // Only if the slot space can afford it. Bulk recompilation claims slots for
+    // every page of the object, in every process that gets hot in it, and
+    // nothing ever gives a slot back -- so on a run of many processes this
+    // spends a budget the demand path would have made last.
+    //
+    // That is not a slow-down when it runs out, it is the end of the run: past
+    // the last dispatch table a page's entry names table `DISPATCH_TABLES` and
+    // the module built from it imports a table that does not exist, so the
+    // engine refuses it ("out of bounds table index 8") in whichever forked
+    // child was translating. `apt-get update` died that way at its 77th
+    // process; with this it stays on the demand path instead and finishes.
+    if !slots_affordable(&map) {
+        return false;
+    }
     let began = now_ns();
     let blocks = recompile_object(&map);
     if blocks == 0 {
         return false;
     }
-    if unsafe { HEARTBEAT } != 0 {
+    // Under `trace` as well as `heartbeat`: which objects a run recompiles in
+    // bulk, and how much of the shared slot space each one costs, is the first
+    // thing to ask when a many-process run runs out of slots -- and it was
+    // visible only under a flag nobody reaches for.
+    if tracing() || unsafe { HEARTBEAT } != 0 {
         let ms = (now_ns() - began) / 1_000_000;
         let (slots, mods, bytes) = with_host(|h| {
             (
@@ -9331,6 +9629,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     // Timed, like the block path: otherwise `blocks` and `nanos` disagree and
     // the object path's time goes unaccounted.
     let object_started = now_ns();
+    phase(12);
     let (modules, stats) = gex_xlate::translate_object(
         guest_bytes(),
         map.start,
@@ -9942,6 +10241,7 @@ pub extern "C" fn gex_page_dump(out: u32, cap: u32) -> i32 {
 /// addresses.
 #[no_mangle]
 pub extern "C" fn gex_adopt_page(page: i64, entry: u32) {
+    phase(3);
     with_host(|h| h.jit.page_table.assign(page as u64, entry));
 }
 
@@ -9990,6 +10290,7 @@ pub extern "C" fn gex_shared_dump(out: u32, cap: u32) -> i32 {
 /// names whichever base it was given.
 #[no_mangle]
 pub extern "C" fn gex_shared_seed(ptr: u32, count: u32) -> u32 {
+    phase(4);
     let src = shim_slice(ptr, count.saturating_mul(20));
     with_host(|h| {
         let mut n = 0u32;
@@ -10018,10 +10319,42 @@ pub extern "C" fn gex_slots_per_table() -> u32 {
     gex_xlate::PageTable::SLOTS_PER_TABLE as u32
 }
 
+/// What this process's address space went on, in MiB: 0 guest mappings, 1 the
+/// runtime's own heap, 2 Worker stacks.
+///
+/// One memory per process, and it can only grow, so what a process spends here
+/// is what the tab pays for it -- times the number of processes alive at once.
+/// Reported per process because that product is the whole memory story and
+/// neither half of it was visible.
+#[no_mangle]
+pub extern "C" fn gex_arena_spent_mib(which: u32) -> u32 {
+    (ARENA_SPENT
+        .get(which as usize)
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0)
+        >> 20) as u32
+}
+
 /// How many dispatch tables the emitter was built for.
 #[no_mangle]
 pub extern "C" fn gex_dispatch_tables() -> u32 {
     gex_abi::DISPATCH_TABLES as u32
+}
+
+/// Runtime dispatch slots the whole page has left, in thousands (a `u32` will
+/// not hold the count). Reported per process because it is a budget the run
+/// spends and never refills, and a process that spends a large piece of it is
+/// invisible otherwise -- the symptom, tens of processes later, is a module
+/// that names a dispatch table nobody has.
+#[no_mangle]
+pub extern "C" fn gex_slots_left_k() -> u32 {
+    // SAFETY: takes nothing, returns a scalar, borrows nothing here.
+    unsafe {
+        if k_present() == 0 {
+            return u32::MAX;
+        }
+        (k_slot_left() / 1000) as u32
+    }
 }
 
 /// Publish the pending module's pages, now that its blocks are in the table.
@@ -10170,6 +10503,23 @@ pub extern "C" fn gex_abandon(code: i32) {
             return;
         }
         trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
+        // The descriptors, on the same terms as `exit_process`: a status alone
+        // ends a `wait4` and nothing else. A parent reading a dead child's pipe
+        // -- which is every `$(...)`, and every apt method -- is not waiting on
+        // the status, it is waiting for the end of file that only the last close
+        // of the write end produces. Without this the pipe keeps a writer that
+        // no longer exists and the parent's `read` never returns: the run wedges
+        // one process further along than the one that died, which is the shape
+        // that made a lifter fault in a forked child look like a hang in `apt`.
+        h.kernel.fds = gex_kernel::file::FdTable::new();
+        h.kernel.remote_sockets.clear();
+        // SAFETY: takes a scalar and borrows nothing here.
+        unsafe {
+            if k_present() != 0 {
+                k_pipe_forget(pid);
+                k_pty_forget(pid);
+            }
+        }
         h.kernel.procs.exit(pid, code);
     });
 }

@@ -54,6 +54,61 @@ const FILL_ALL = 'gexfillall';
 // never reached. Provisional.
 const FILL_ON_DEMAND_BYTES = 4 << 20;
 
+/// Write `src` at `at`, leaving the pages of it that are entirely zero alone.
+///
+/// A page a guest process never made resident costs nothing, and a page written
+/// with zeros over zeros is resident for no reason. A fresh
+/// `WebAssembly.Memory` is zero-filled and so is every page `grow` adds, so any
+/// all-zero page of a parent's image is *already* what the child should have --
+/// writing it is the only thing that makes it cost memory.
+///
+/// This is not a guess about what the child needs, unlike `?forkskip`: the
+/// bytes end up identical either way. It pays a read of the source (already
+/// resident here -- it was just transferred in) to avoid a write to the
+/// destination. Guests are sparse in the ordinary case: `.bss`, a fresh
+/// anonymous mapping, the untouched tail of a heap or a stack.
+///
+/// Returns `[written, skipped]`.
+function writeSparse(dst, src, at) {
+  const PAGE = 4096;
+  // Word-at-a-time when the source is aligned, which it is: the regions are
+  // `slice`d, so each owns its buffer from offset zero.
+  const words = src.byteOffset % 4 === 0 && src.byteLength % 4 === 0
+    ? new Uint32Array(src.buffer, src.byteOffset, src.byteLength >> 2)
+    : null;
+  const blank = (from, to) => {
+    if (words) {
+      for (let i = from >> 2; i < to >> 2; i++) if (words[i] !== 0) return false;
+      return true;
+    }
+    for (let i = from; i < to; i++) if (src[i] !== 0) return false;
+    return true;
+  };
+  let written = 0;
+  let skipped = 0;
+  let i = 0;
+  while (i < src.length) {
+    const end = Math.min(i + PAGE, src.length);
+    if (blank(i, end)) {
+      skipped += end - i;
+      i = end;
+      continue;
+    }
+    // Coalesce the run of non-blank pages into one `set`, so a dense region is
+    // still one copy and not one per page.
+    let run = end;
+    while (run < src.length) {
+      const next = Math.min(run + PAGE, src.length);
+      if (blank(run, next)) break;
+      run = next;
+    }
+    dst.set(src.subarray(i, run), at + i);
+    written += run - i;
+    i = run;
+  }
+  return [written, skipped];
+}
+
 const DISPATCH_DIR = 0x00100000;
 const LOW_END = DISPATCH_DIR + 0x80000 * 4;
 const PAGES = GUEST_BYTES / 65536;
@@ -310,6 +365,15 @@ export class Gex {
   #strictSlots = 0;
   /// Next free slot in each table, for pages this process claims.
   #claimed = [];
+  /// Bytes of the parent's image this child wrote into its own memory, and
+  /// bytes it was told to leave alone by `?forkskip`. Reported on exit: with no
+  /// copy-on-write, the first number is what a fork costs the tab.
+  #forkCopied = 0;
+  #forkSkipped = 0;
+  #forkZeros = 0;
+  get forkCopiedBytes() { return this.#forkCopied; }
+  get forkSkippedBytes() { return this.#forkSkipped; }
+  get forkZeroBytes() { return this.#forkZeros; }
   // The parent's modules, held rather than installed. See `#maybeAdopt`.
   #inherited = [];
   /// The exec generation last seen, so `#maybeAdopt` can tell when this process
@@ -1336,7 +1400,36 @@ export class Gex {
     // copy throws `RangeError: offset is out of bounds` above the initial size.
     this.#growTo(child.image.reduce((n, r) => Math.max(n, r.at + r.bytes.byteLength), 0));
     const u8 = this.#bytes();
-    for (const r of child.image) u8.set(new Uint8Array(r.bytes), r.at);
+    // `?forkskip=N`: leave any region larger than N MiB uncopied.
+    //
+    // There is no copy-on-write here -- one guest process is one linear memory,
+    // so a fork writes the parent's mappings into the child and every byte of
+    // that is a byte the tab pays for. Whether that copy is *needed* is a
+    // question about the child's future, and this is how to ask it: skip the
+    // big regions, leave them zero, and see whether the run still passes. A
+    // child that execs immediately (nearly all of them) never looks at them.
+    //
+    // Destructive on purpose -- if the guest reads a skipped page it reads
+    // zeros -- so it is a measurement, not a mode.
+    const skipOver = typeof globalThis.GEX_FORK_SKIP_MIB === 'number'
+      ? globalThis.GEX_FORK_SKIP_MIB * (1 << 20)
+      : Infinity;
+    let copied = 0;
+    let skipped = 0;
+    let zeros = 0;
+    for (const r of child.image) {
+      const n = r.bytes.byteLength;
+      if (n > skipOver) {
+        skipped += n;
+        continue;
+      }
+      const [wrote, blank] = writeSparse(u8, new Uint8Array(r.bytes), r.at);
+      copied += wrote;
+      zeros += blank;
+    }
+    this.#forkCopied = copied;
+    this.#forkSkipped = skipped;
+    this.#forkZeros = zeros;
     // Checked here, before anything else writes to this memory: the check
     // further down runs after the child has rewritten the low region itself,
     // so it cannot tell a damaged copy from a deliberate rewrite. This one can.

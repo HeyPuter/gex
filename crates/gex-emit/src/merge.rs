@@ -73,6 +73,32 @@ fn section(out: &mut Vec<u8>, id: u8, payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
+/// How many bytes `write_u32` will spend on `v`.
+fn leb_len(mut v: u32) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// A section whose payload is a count followed by a body, written without
+/// building the payload first.
+///
+/// The obvious spelling -- concatenate the count and the body into a `Vec`,
+/// then `section()` that -- copies the body a second time, and for the code
+/// section the body is the whole merged module. In the browser those copies are
+/// not transient: the runtime's heap takes spans from an arena that never gives
+/// one back, so each was megabytes of a guest process's address space gone for
+/// good. Both lengths are known here, so neither copy is needed.
+fn section_counted(out: &mut Vec<u8>, id: u8, count: u32, body: &[u8]) {
+    out.push(id);
+    write_u32(out, (leb_len(count) + body.len()) as u32);
+    write_u32(out, count);
+    out.extend_from_slice(body);
+}
+
 /// The offsets a unit recorded for its own local-function immediates, as
 /// positions in its code section's payload *after* the body count.
 fn relocs_of(secs: &[(u8, &[u8])]) -> Vec<u32> {
@@ -163,13 +189,43 @@ pub fn merge(units: &[&[u8]]) -> Option<Vec<u8>> {
         }
     }
 
+    // Sized from the inputs, never grown from empty.
+    //
+    // These are concatenations: each ends up about as long as the same section
+    // across every unit, and that is known here. Growing from zero instead
+    // reached the final size through a chain of doublings -- and in the browser
+    // the runtime's heap takes its spans from an arena that never gives one
+    // back, and cannot serve a request from two spans, so every doubling
+    // stranded the one before it. A 64 MiB merge cost about 300 MiB of address
+    // space that way, and since there is one memory per guest process and it
+    // only grows, that was ~200 MiB on every process in the tab: a `$(echo)`
+    // child held 199 MiB of heap spans with 0 MiB live in them, an `apt-get
+    // install` peaked at 11 GB, and apt's forked `http` method died of an
+    // allocation failure.
+    //
+    // A `+ len/2 + 64` for the renumbered sections: an index that moves up can
+    // need another LEB byte, so their output can exceed their input slightly.
+    // Overshooting the capacity is one realloc, not a chain.
+    let cap_of = |id: u8| -> usize {
+        parsed
+            .iter()
+            .filter_map(|secs| secs.iter().find(|(i, _)| *i == id))
+            .map(|(_, payload)| payload.len())
+            .sum()
+    };
     // Functions and code, concatenated; and the offset each unit's local
     // indices move by, which is every earlier unit's local function count.
-    let mut funcs = Vec::new();
+    let mut funcs = Vec::with_capacity(cap_of(SEC_FUNCTION) + 64);
     let mut n_funcs = 0u32;
-    let mut code = Vec::new();
     let mut n_bodies = 0u32;
     let mut offset_of = Vec::with_capacity(parsed.len());
+    // The merged code payload's length, before a byte of it is written.
+    //
+    // The bodies go straight into `out` below rather than into a `code` vector
+    // that is then copied in, and writing a section head needs its length
+    // first. It is exactly each unit's code payload minus the body count it
+    // starts with.
+    let mut code_len = 0usize;
     for secs in &parsed {
         offset_of.push(n_funcs);
         if let Some((_, payload)) = secs.iter().find(|(id, _)| *id == SEC_FUNCTION) {
@@ -182,27 +238,7 @@ pub fn merge(units: &[&[u8]]) -> Option<Vec<u8>> {
             let mut p = 0;
             let n = read_u32(payload, &mut p);
             n_bodies += n;
-            // Where this unit's bodies land in the merged payload, so its
-            // recorded offsets can be found again.
-            let base = code.len();
-            code.extend_from_slice(&payload[p..]);
-            // And every immediate in them that names a local function, moved
-            // by this unit's offset. The bodies themselves are copied
-            // unread -- only these five bytes at a time are touched.
-            let shift = *offset_of.last().unwrap();
-            if shift != 0 {
-                for r in relocs_of(secs) {
-                    let at = base + (r as usize - p);
-                    if at + 5 > code.len() {
-                        return None;
-                    }
-                    let mut v = 0u32;
-                    let mut q = at;
-                    let cur = read_u32(&code, &mut q);
-                    v += cur;
-                    crate::wasm::patch_u32_fixed(&mut code, at, v + shift);
-                }
-            }
+            code_len += payload.len() - p;
         }
     }
     if n_funcs != n_bodies {
@@ -214,7 +250,7 @@ pub fn merge(units: &[&[u8]]) -> Option<Vec<u8>> {
     // is its guest address, and none of `enter` or the miss stub, which every
     // unit declares under the same name.
     let mut names: Vec<String> = Vec::new();
-    let mut exports = Vec::new();
+    let mut exports = Vec::with_capacity(cap_of(SEC_EXPORT) * 3 / 2 + 64);
     let mut n_exports = 0u32;
     for (i, secs) in parsed.iter().enumerate() {
         let Some((_, payload)) = secs.iter().find(|(id, _)| *id == SEC_EXPORT) else {
@@ -251,7 +287,7 @@ pub fn merge(units: &[&[u8]]) -> Option<Vec<u8>> {
     // Element segments, renumbered the same way. A segment's offset is an
     // absolute slot base and is already unique across processes, so segments
     // never collide and none has to be dropped.
-    let mut elems = Vec::new();
+    let mut elems = Vec::with_capacity(cap_of(SEC_ELEMENT) * 3 / 2 + 64);
     let mut n_elems = 0u32;
     for (i, secs) in parsed.iter().enumerate() {
         let Some((_, payload)) = secs.iter().find(|(id, _)| *id == SEC_ELEMENT) else {
@@ -300,30 +336,52 @@ pub fn merge(units: &[&[u8]]) -> Option<Vec<u8>> {
     out.extend_from_slice(&1u32.to_le_bytes());
     for (id, payload) in &parsed[0] {
         match *id {
-            SEC_FUNCTION => {
-                let mut s = Vec::with_capacity(funcs.len() + 5);
-                write_u32(&mut s, n_funcs);
-                s.extend_from_slice(&funcs);
-                section(&mut out, SEC_FUNCTION, &s);
-            }
+            SEC_FUNCTION => section_counted(&mut out, SEC_FUNCTION, n_funcs, &funcs),
             SEC_CODE => {
-                let mut s = Vec::with_capacity(code.len() + 5);
-                write_u32(&mut s, n_bodies);
-                s.extend_from_slice(&code);
-                section(&mut out, SEC_CODE, &s);
+                // Written where it belongs, once.
+                //
+                // A merged code section is the whole of every unit's code, and
+                // it used to be built in a `code` vector and then copied into a
+                // payload vector and then into `out` -- three copies of tens of
+                // megabytes, each claiming a span of the runtime's arena that
+                // nothing ever gives back. `code_len` is known above, so the
+                // section head can be written first and the bodies appended
+                // straight into `out`.
+                out.push(SEC_CODE);
+                write_u32(&mut out, (leb_len(n_bodies) + code_len) as u32);
+                write_u32(&mut out, n_bodies);
+                for (i, secs) in parsed.iter().enumerate() {
+                    let Some((_, payload)) =
+                        secs.iter().find(|(id, _)| *id == SEC_CODE)
+                    else {
+                        continue;
+                    };
+                    let mut p = 0;
+                    let _ = read_u32(payload, &mut p);
+                    // Where this unit's bodies land, so its recorded offsets
+                    // can be found again.
+                    let base = out.len();
+                    out.extend_from_slice(&payload[p..]);
+                    // And every immediate in them that names a local function,
+                    // moved by this unit's offset. The bodies themselves are
+                    // copied unread -- only these five bytes at a time are
+                    // touched.
+                    let shift = offset_of[i];
+                    if shift != 0 {
+                        for r in relocs_of(secs) {
+                            let at = base + (r as usize - p);
+                            if at + 5 > out.len() {
+                                return None;
+                            }
+                            let mut q = at;
+                            let cur = read_u32(&out, &mut q);
+                            crate::wasm::patch_u32_fixed(&mut out, at, cur + shift);
+                        }
+                    }
+                }
             }
-            SEC_EXPORT => {
-                let mut s = Vec::with_capacity(exports.len() + 5);
-                write_u32(&mut s, n_exports);
-                s.extend_from_slice(&exports);
-                section(&mut out, SEC_EXPORT, &s);
-            }
-            SEC_ELEMENT => {
-                let mut s = Vec::with_capacity(elems.len() + 5);
-                write_u32(&mut s, n_elems);
-                s.extend_from_slice(&elems);
-                section(&mut out, SEC_ELEMENT, &s);
-            }
+            SEC_EXPORT => section_counted(&mut out, SEC_EXPORT, n_exports, &exports),
+            SEC_ELEMENT => section_counted(&mut out, SEC_ELEMENT, n_elems, &elems),
             // Types, imports, tables, memory, globals, data, custom: one
             // unit's are every unit's.
             other => section(&mut out, other, payload),

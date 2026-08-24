@@ -333,11 +333,27 @@ export async function runProgram(
     heartbeat = globalThis.GEX_HEARTBEAT ?? 0,
     // KiB of mapped text per object to statically recompile once hot; 0 leaves
     // the guest to arrive one dispatch miss at a time. A parameter because the
-    // page (on) and `run-node.mjs` (off) disagree, so a host-specific fault
-    // cannot be attributed until it can be switched.
+    // page and `run-node.mjs` used to disagree, so a host-specific fault could
+    // not be attributed until it could be switched.
+    //
+    // Off now, which is what the shim has always documented as the default and
+    // what `run-node.mjs` has always passed. The page said 8192, and on a run of
+    // more than a handful of processes that was worse on every axis measured --
+    // a 25-process `$(echo)` loop, per process:
+    //
+    //           dispatch slots   runtime heap   memory   lifetime
+    //     on          107k          48 MiB      219 MiB    345ms
+    //     off            0          16 MiB      187 MiB    298ms
+    //
+    // Zero slots, because with the image named (see `program` below) a process
+    // reuses what its predecessors translated instead of claiming its own --
+    // and claiming its own is what ran the shared slot space out and stopped
+    // `apt-get update` dead at its 77th process. Bulk recompilation only ever
+    // helped a run that is long *and* library-bound, and it is one query
+    // parameter away for such a run: `?recompile=8192`.
     recompileObjects = typeof globalThis.GEX_RECOMPILE_OBJECTS === 'number'
       ? globalThis.GEX_RECOMPILE_OBJECTS
-      : 8192,
+      : 0,
     // A closure built ahead of time by `gexc build --closure`: the image
     // module, every library beside it, and the layout they were placed at.
     closure = null,
@@ -478,6 +494,15 @@ export async function runProgram(
       debugExit:
         !!globalThis.GEX_DEBUG_EXIT ||
         (typeof process !== 'undefined' && !!process.env?.GEX_DEBUG_EXIT),
+      // The engine's wasm-frame stack for a trap, in every process. In `extra`
+      // because a trap that matters happens in a Worker, and a global set in
+      // the page is not visible there.
+      trapStack: globalThis.GEX_TRAP_STACK ? 1 : undefined,
+      // `?forkskip=N`, in `extra` because the process that acts on it is a
+      // forked child, not the page's own.
+      forkSkip: typeof globalThis.GEX_FORK_SKIP_MIB === 'number'
+        ? globalThis.GEX_FORK_SKIP_MIB
+        : undefined,
       // Lightweight adopt-phase narration (no write-flood); see adoptProcess.
       adoptTrace:
         !!globalThis.GEX_ADOPT_TRACE ||
@@ -559,7 +584,21 @@ export async function runProgram(
       // its own translated code does not expect.
       opts: {
         cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, env, pins: closure?.pins,
-        program: closure?.program,
+        // Which program pid 1 is, so its own text gets a code identity and a
+        // second process can reuse what the first translated of it.
+        //
+        // This came only from a closure manifest, so a run without a closure --
+        // every demo here -- left the main image unnamed, and an unnamed page
+        // can never be looked up in the shared slot map. Every process
+        // therefore re-lifted the whole image: 14,807 blocks each, ~160ms each,
+        // and a fresh module stored for every one of them. The store grew
+        // without bound, so each new process was served an ever-larger batch of
+        // its predecessors' near-duplicates -- which is where the tab's memory
+        // went, and why a `$(…)` loop ran out of dispatch slots at all.
+        //
+        // `args[0]` is that program's path, which is exactly what `do_exec`
+        // already uses to name an image it loads itself.
+        program: closure?.program ?? args?.[0],
         // `?permiss=N`: how many stored units one dispatch miss may take.
         perMiss: typeof globalThis.GEX_PER_MISS === 'number' ? globalThis.GEX_PER_MISS : undefined,
       },

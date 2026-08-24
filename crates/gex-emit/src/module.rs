@@ -122,8 +122,23 @@ impl std::fmt::Debug for Refill {
 }
 
 /// Slots taken from the global counter at a time: one kernel round trip per
-/// 256 pages of translated code.
-const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 256;
+/// eight pages of translated code.
+///
+/// It was 256 pages, and the round trip is not what the number should be
+/// chosen for. The counter is system-wide and nothing gives a slot back, so
+/// what a process does not use of its chunk is spent for the page's whole life
+/// -- and a process here claims about 112 pages, so 256 threw away three
+/// quarters of every chunk. A `$(…)` loop reached its 77th process and then
+/// could not translate at all: past the last dispatch table an entry names
+/// table `DISPATCH_TABLES` and the module built from it imports a table no
+/// instance has, so the engine refuses it.
+///
+/// Eight pages leaves at most seven wasted per process, which took the same
+/// loop from 76 processes to about 350 -- and made it faster, because a
+/// process's dispatch tables are grown to reach its slots and a tighter range
+/// is a smaller table. The round trip is an atomic in the global kernel; 32
+/// times as many of them did not show up in the timings at all.
+const REFILL_SLOTS: u64 = SLOTS_PER_PAGE * 8;
 
 /// Above this many blocks, a module's element segments are passive and it
 /// carries the fill helpers; below it, they are active and it carries none.
