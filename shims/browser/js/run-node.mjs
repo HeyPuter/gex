@@ -240,12 +240,25 @@ const host = new ProcessHost({
     // invisible until dereferenced, so this names the block that arrives with
     // the bad value, not the one that dies on it. See #73.
     checkSp: !!process.env.GEX_CHECK_SP,
+    // GEX_COHERENT_LOADS emits guest scalar loads/stores as atomic-when-aligned
+    // so shared reads stay coherent under true parallelism (V8 can't hoist a
+    // plain wasm load across a guest fence). Tests whether the GTK startup race
+    // is plain-load coherence at the PLAN 5.8 boundary. Default off.
+    coherentLoads: !!process.env.GEX_COHERENT_LOADS,
+    // GEX_PREGROW: grow guest memory to a large floor up front so runtime
+    // memory.grow stops during startup -- probes the stale-bound-after-grow race.
+    pregrow: !!process.env.GEX_PREGROW,
     // GEX_HOT dumps the guest's hottest back edges on exit -- the browser's
     // answer to `--sample`, since a host profile is all `wasm-function[N]`.
     hot: !!process.env.GEX_HOT,
     // GEX_NO_INTRINSICS translates glibc's own memcpy/memcmp/memset instead of
     // serving them, the only way to price the substitution.
     noIntrinsics: !!process.env.GEX_NO_INTRINSICS,
+    // GEX_INTRINSIC_MASK bisects which family corrupts memory: bit0=memcpy,
+    // bit1=memset, bit2=memcmp. e.g. 1 = memcpy only, 2 = memset only.
+    intrinsicMask: process.env.GEX_INTRINSIC_MASK
+      ? parseInt(process.env.GEX_INTRINSIC_MASK, 10) >>> 0
+      : undefined,
     // GEX_FMA_COUNT: how many fused multiply-adds crossed out of the guest
     // module. wasm has no FMA, so each is a call into the shim's.
     fmaCount: !!process.env.GEX_FMA_COUNT,

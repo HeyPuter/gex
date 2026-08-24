@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 gex-abi.workspace = true
 gex-kernel.workspace = true
+gex-wayland.workspace = true
 gex-xlate.workspace = true
 gex-ld.workspace = true
 talc = { version = "5.0.4", default-features = false }

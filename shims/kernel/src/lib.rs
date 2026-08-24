@@ -94,6 +94,49 @@ pub extern "C" fn k_park(seq: i32, ns: i64) -> i32 {
     unsafe { core::arch::wasm32::memory_atomic_wait32(wake_addr(), seq, ns) }
 }
 
+/// Per-address futex wake generations, shared across every Worker.
+///
+/// The global [`WAKE`] counter says "somebody did something" and makes every
+/// parked Worker re-check; this says *which futex* was woken, precisely. A
+/// Worker parking on a futex records the address's generation here, and wakes
+/// only when it changes -- a real wake ALWAYS bumps it, whatever the futex word
+/// does afterward, so this has none of the ambiguity of guessing from the word
+/// (which a heavily-contended condvar counter can leave back at the waited-for
+/// value before the sleeper is scheduled, stranding a whole thread pool). It is
+/// a per-Worker `FutexTable` writ shared: those generations cannot cross a
+/// Worker boundary, and these must.
+///
+/// Direct-mapped, not a map: a collision (two addresses to one slot) only wakes
+/// a waiter that then re-checks its own word and re-parks -- an extra turn, not
+/// a wrong answer. 16384 slots is 64 KiB of `.bss`.
+const FUTEX_SLOTS: usize = 16384;
+static FUTEX_GENS: [std::sync::atomic::AtomicU32; FUTEX_SLOTS] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; FUTEX_SLOTS];
+
+fn futex_slot(addr: u64) -> usize {
+    // Futex words are 4-byte aligned; mix the high bits down so neighbouring
+    // locks (a mutex and the condvar beside it) do not share a slot.
+    let a = addr >> 2;
+    (((a ^ (a >> 15)).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 40) as usize & (FUTEX_SLOTS - 1)
+}
+
+/// A futex at `addr` was woken: bump its generation and wake every parked
+/// Worker to re-check. Called by the browser host for every wake its per-Worker
+/// `FutexTable` recorded -- a `FUTEX_WAKE`, a thread exit clearing its tid, any
+/// of them.
+#[no_mangle]
+pub extern "C" fn k_futex_wake(addr: u64) {
+    FUTEX_GENS[futex_slot(addr)].fetch_add(1, std::sync::atomic::Ordering::Release);
+    k_wake();
+}
+
+/// The generation of the futex at `addr`, sampled when a Worker parks on it and
+/// compared on every re-check.
+#[no_mangle]
+pub extern "C" fn k_futex_gen(addr: u64) -> u32 {
+    FUTEX_GENS[futex_slot(addr)].load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// What this module last panicked with. It has no console (it imports nothing
 /// but two memories), so without this a panic unwound to a bare `unreachable`
 /// with no message. The host reads it straight out of shared memory; see
@@ -1329,6 +1372,285 @@ pub extern "C" fn k_pipe_writable(id: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_pipe_buffered(id: i32) -> i32 {
     pipe_at(id).map_or(0, |p| p.buffered() as i32)
+}
+
+// ---------------------------------------------------------------------------
+// Unix98 pseudoterminals. The same shape as pipes -- a numbered pair in the
+// global kernel, bytes copied across memories -- with the terminal added: the
+// master->slave direction runs the shared `Pty`'s line discipline, and `^C`,
+// hangup and window-size changes become real signals delivered here, next to
+// the process table, the way `k_tty_input` does for the console.
+
+/// Every pseudoterminal in the system, by id. The id is also its pts number, so
+/// `/dev/pts/N` is the pair at index N.
+fn ptys() -> &'static Mutex<Vec<std::sync::Arc<gex_kernel::pty::Pty>>> {
+    note_panics();
+    static PTYS: OnceLock<Mutex<Vec<std::sync::Arc<gex_kernel::pty::Pty>>>> = OnceLock::new();
+    PTYS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Which pty ends each process still holds, so a Worker that leaves by a trap
+/// (no unwind, no `Drop`) does not strand the other end. `(id, master)`.
+fn pty_holders() -> &'static Mutex<BTreeMap<i32, Vec<(i32, bool)>>> {
+    note_panics();
+    static HELD: OnceLock<Mutex<BTreeMap<i32, Vec<(i32, bool)>>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn pty_at(id: i32) -> Option<std::sync::Arc<gex_kernel::pty::Pty>> {
+    if id < 0 {
+        return None;
+    }
+    ptys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id as usize)
+        .cloned()
+}
+
+fn pty_hold(pid: i32, id: i32, master: bool) {
+    pty_holders()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(pid)
+        .or_default()
+        .push((id, master));
+}
+
+fn pty_unhold(pid: i32, id: i32, master: bool) {
+    let mut h = pty_holders().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = h.get_mut(&pid) {
+        if let Some(i) = v.iter().position(|e| *e == (id, master)) {
+            v.swap_remove(i);
+        }
+    }
+}
+
+/// A signal to the pty's foreground group, if it has claimed one. `^C`, hangup
+/// and `SIGWINCH` all reach the slave's process this way.
+fn pty_signal(p: &gex_kernel::pty::Pty, sig: u32) {
+    let fg = p.tty.fg();
+    if fg > 0 {
+        let _ = procs().kill_group(gex_kernel::INIT_PID, fg, sig);
+    }
+}
+
+/// Open `/dev/ptmx`: a fresh locked pair with the master held by `pid`. Returns
+/// `(id << 16) | ptn`; the id and the pts number are the same.
+#[no_mangle]
+pub extern "C" fn k_pty_open_master(pid: i32) -> i32 {
+    let id = {
+        let mut t = ptys().lock().unwrap_or_else(|e| e.into_inner());
+        let id = t.len() as u32;
+        t.push(std::sync::Arc::new(gex_kernel::pty::Pty::new(id)));
+        id as i32
+    };
+    pty_hold(pid, id, true);
+    (id << 16) | id
+}
+
+/// Open `/dev/pts/N`: take a slave, held by `pid`. Returns the id, `-1` for no
+/// such pts, or `-5` (EIO) while it is still locked.
+#[no_mangle]
+pub extern "C" fn k_pty_open_slave(ptn: i32, pid: i32) -> i32 {
+    let Some(p) = pty_at(ptn) else { return -1 };
+    if p.locked() {
+        return -5; // EIO -- unlockpt was not called
+    }
+    p.open_slave();
+    pty_hold(pid, ptn, false);
+    ptn
+}
+
+/// Another descriptor onto an end, as `dup` and `fork` make.
+#[no_mangle]
+pub extern "C" fn k_pty_open_end(id: i32, master: i32, pid: i32) {
+    if let Some(p) = pty_at(id) {
+        if master != 0 {
+            p.open_master();
+        } else {
+            p.open_slave();
+        }
+        pty_hold(pid, id, master != 0);
+    }
+}
+
+/// Drop a descriptor. The last master hangs the slave up (`SIGHUP`); the last
+/// slave is the master's end-of-file.
+#[no_mangle]
+pub extern "C" fn k_pty_close_end(id: i32, master: i32, pid: i32) {
+    if let Some(p) = pty_at(id) {
+        if master != 0 {
+            if p.close_master() {
+                pty_signal(&p, gex_kernel::signal::sig::SIGHUP);
+            }
+        } else {
+            p.close_slave();
+        }
+        pty_unhold(pid, id, master != 0);
+        k_wake();
+    }
+}
+
+/// Close every pty end `pid` still holds. Called when a process ends.
+#[no_mangle]
+pub extern "C" fn k_pty_forget(pid: i32) -> u32 {
+    let held = {
+        let mut h = pty_holders().lock().unwrap_or_else(|e| e.into_inner());
+        h.remove(&pid).unwrap_or_default()
+    };
+    let n = held.len() as u32;
+    for (id, master) in held {
+        if let Some(p) = pty_at(id) {
+            if master {
+                if p.close_master() {
+                    pty_signal(&p, gex_kernel::signal::sig::SIGHUP);
+                }
+            } else {
+                p.close_slave();
+            }
+        }
+    }
+    if n > 0 {
+        k_wake();
+    }
+    n
+}
+
+/// Write `len` bytes of the caller's memory to an end. On the master this is
+/// terminal input: the line discipline runs and `^C`-style signals reach the
+/// foreground group. On the slave it is program output. Returns bytes or -errno.
+#[no_mangle]
+pub extern "C" fn k_pty_write(id: i32, master: i32, at: u32, len: u32) -> i32 {
+    let Some(p) = pty_at(id) else { return -9 }; // EBADF
+    let mut buf = vec![0u8; len as usize];
+    unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    if master != 0 {
+        let signals = p.master_write(&buf);
+        for sig in signals {
+            pty_signal(&p, sig);
+        }
+    } else {
+        p.slave_write(&buf);
+    }
+    // Wake a reader parked in another Worker, which runs no event loop.
+    k_wake();
+    len as i32
+}
+
+/// Read up to `len` bytes from an end into the caller's memory.
+#[no_mangle]
+pub extern "C" fn k_pty_read(id: i32, master: i32, at: u32, len: u32) -> i32 {
+    let Some(p) = pty_at(id) else { return -9 };
+    let mut buf = vec![0u8; len as usize];
+    let r = if master != 0 {
+        p.master_read(&mut buf)
+    } else {
+        p.slave_read(&mut buf)
+    };
+    match r {
+        Ok(n) => {
+            unsafe { gex_kmem::push_checked(at, buf.as_ptr(), n as u32) };
+            n as i32
+        }
+        Err(e) => -(e.0 as i32),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_readable(id: i32, master: i32) -> i32 {
+    let Some(p) = pty_at(id) else { return 1 }; // gone: readable, so EOF is seen
+    (if master != 0 { p.master_readable() } else { p.slave_readable() }) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_available(id: i32, master: i32) -> i32 {
+    let Some(p) = pty_at(id) else { return 0 };
+    (if master != 0 { p.master_available() } else { p.slave_available() }) as i32
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_ptn(id: i32) -> i32 {
+    pty_at(id).map_or(-1, |p| p.ptn() as i32)
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_get_lock(id: i32) -> i32 {
+    pty_at(id).map_or(1, |p| p.locked() as i32)
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_set_lock(id: i32, locked: i32) {
+    if let Some(p) = pty_at(id) {
+        p.set_locked(locked != 0);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_get_termios(id: i32, at: u32, len: u32) -> i32 {
+    let Some(p) = pty_at(id) else { return -1 };
+    let t = p.tty.termios();
+    let n = (len as usize).min(t.len());
+    unsafe { gex_kmem::push_checked(at, t.as_ptr(), n as u32) };
+    n as i32
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_set_termios(id: i32, at: u32, len: u32, flush: i32) -> i32 {
+    let Some(p) = pty_at(id) else { return -1 };
+    let mut buf = vec![0u8; len as usize];
+    unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    if flush != 0 {
+        p.flush(gex_kernel::tty::TCIFLUSH);
+    }
+    p.tty.set_termios(&buf);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_winsize(id: i32) -> u64 {
+    pty_at(id).map_or(0, |p| gex_kernel::tty::pack_ws(p.tty.winsize()))
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_set_winsize(id: i32, packed: u64) -> i32 {
+    let Some(p) = pty_at(id) else { return 0 };
+    let changed = p.tty.set_winsize(gex_kernel::tty::unpack_ws(packed));
+    if changed {
+        pty_signal(&p, gex_kernel::signal::sig::SIGWINCH);
+    }
+    changed as i32
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_fg(id: i32) -> i32 {
+    pty_at(id).map_or(0, |p| p.tty.fg())
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_set_fg(id: i32, pgrp: i32) {
+    if let Some(p) = pty_at(id) {
+        p.tty.set_fg(pgrp);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_sid(id: i32) -> i32 {
+    pty_at(id).map_or(0, |p| p.tty.sid())
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_set_sid(id: i32, sid: i32) {
+    if let Some(p) = pty_at(id) {
+        p.tty.set_sid(sid);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_pty_flush(id: i32, which: i32) {
+    if let Some(p) = pty_at(id) {
+        p.flush(which);
+    }
 }
 
 /// Copy `len` bytes of the calling process's memory in, and report their sum. A

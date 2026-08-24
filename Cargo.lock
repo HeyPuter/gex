@@ -409,6 +409,7 @@ dependencies = [
  "gex-abi",
  "gex-kernel",
  "gex-ld",
+ "gex-wayland",
  "gex-xlate",
  "spinning_top",
  "talc",

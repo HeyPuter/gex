@@ -315,6 +315,13 @@ async function handle(msg) {
     const { GlProxy } = await import('./gl-bridge.mjs');
     gex.useGl(new GlProxy(msg.glChannel, () => port.post({ kind: 'gl' })));
   }
+  // The Wayland compositor's present path: frames the shim commits go over this
+  // ring to the page's canvas. `useWl` sets the flag `gex_set_wl` reads at load,
+  // so it must run before `load` -- which binds `wayland-0` only when it is on.
+  if (msg.wlChannel) {
+    const { WlProxy } = await import('./wl-bridge.mjs');
+    gex.useWl(new WlProxy(msg.wlChannel, () => port.post({ kind: 'wl' })));
+  }
   // The Node fast lane's network: real TCP sockets rather than Wisp, so the
   // paths above them -- apt's helper, the fetch, the parse -- run here in two
   // minutes instead of twenty.
@@ -415,10 +422,15 @@ async function handle(msg) {
     const ex = gex.shim.exports;
     if (msg.hot) ex.gex_set_hot?.(1);
     if (msg.noIntrinsics) ex.gex_set_intrinsics?.(0);
+    if (msg.intrinsicMask !== undefined) ex.gex_set_intrinsic_mask?.(msg.intrinsicMask);
     if (msg.trace) ex.gex_set_trace?.(1);
     if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
     if (msg.checkSp) ex.gex_set_check_sp?.(1);
+    if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
+    if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
+    if (msg.pregrow) ex.gex_set_pregrow?.(1);
+    if (msg.wlTrace) ex.gex_set_wl_trace?.(1);
     // A forked or exec'd child never calls `load`, so set the switch here.
     const link = msg.link ?? msg.opts?.link;
     if (link) ex.gex_set_snapshot?.(Number(link));

@@ -558,6 +558,18 @@ const virglGears = {
         const { VirglRenderer } = await import('./virgl.js');
         renderer = await VirglRenderer.create(canvas, '/gex/gexvirgl.mjs');
         if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
+        // Live render state for a test harness: it can tell a client rendered
+        // (lit>0) the moment it happens rather than waiting for the exit report.
+        globalThis.__gexGlState = () => {
+          try {
+            return renderer.glState();
+          } catch {
+            return '';
+          }
+        };
+        // `?virgltrace=1` narrates every vtest command by name, the only way to
+        // see what a stuck GL client is looping on.
+        if (new URLSearchParams(location.search).get('virgltrace')) renderer.traceCommands(1);
         ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
         ctx.term.writeln('');
 
@@ -585,11 +597,27 @@ const virglGears = {
         // The loader passes no environment, so the bounds go into a script.
         // `?gears_size=100x100` shrinks the screen, to tell whether a frame
         // costs by the pixel or by the call.
-        files['/run.sh'] = new TextEncoder().encode(
-          `GEARS_SECONDS=${seconds}\nexport GEARS_SECONDS\n` +
-            `GEARS_SIZE=${/^\d+x\d+$/.test(new URLSearchParams(location.search).get('gears_size') ?? '') ? new URLSearchParams(location.search).get('gears_size') : '300x300'}\nexport GEARS_SIZE\n` +
-            `. /gears.sh\n`,
-        );
+        // `?wlclient=` on the Xvfb (virgl) demo runs that client under Xvfb
+        // instead of glxgears -- a control against the Xwayland demo, to tell an
+        // Xwayland/wl-specific crash from an environment-independent one.
+        const virglClient = new URLSearchParams(location.search).get('wlclient');
+        if (virglClient) {
+          files['/run.sh'] = new TextEncoder().encode(
+            'Xvfb :99 -screen 0 1024x768x24 >/dev/null 2>&1 &\n' +
+              'i=0; while [ ! -e /tmp/.X11-unix/X99 ]; do i=$((i+1)); [ $i -gt 30 ] && break; sleep 1; done\n' +
+              'export DISPLAY=:99 GSETTINGS_SCHEMA_DIR=/usr/share/glib-2.0/schemas XDG_DATA_DIRS=/usr/share ' +
+              'HOME=/root XDG_CACHE_HOME=/tmp GDK_BACKEND=x11 LIBC_FATAL_STDERR_=1\n' +
+              'echo "gex: Xvfb up, starting the client"\n' +
+              `timeout ${seconds} ${virglClient} 2>&1\n` +
+              'echo "gex: client exited $?"\n',
+          );
+        } else {
+          files['/run.sh'] = new TextEncoder().encode(
+            `GEARS_SECONDS=${seconds}\nexport GEARS_SECONDS\n` +
+              `GEARS_SIZE=${/^\d+x\d+$/.test(new URLSearchParams(location.search).get('gears_size') ?? '') ? new URLSearchParams(location.search).get('gears_size') : '300x300'}\nexport GEARS_SIZE\n` +
+              `. /gears.sh\n`,
+          );
+        }
 
         ctx.idle();
         rule(ctx, `graphics rootfs — ${Object.keys(files).length} files`);
@@ -642,4 +670,229 @@ const virglGears = {
   },
 };
 
-export const DEMOS = [upload, busybox, debian, gears, virglGears];
+// XWayland/Wayland, skipping Xvfb: gex-wayland (a compositor in the shim)
+// binds `/tmp/wayland-0`, a client connects, and its committed shm frames are
+// blitted onto a 2D canvas here. First client is `es2gears_wayland` (a native
+// wayland GLES client), which also answers the open question of whether Mesa's
+// EGL can render to a shm-only compositor.
+const waylandGears = {
+  id: 'wayland',
+  title: 'glxgears on Xwayland (no Xvfb)',
+  blurb:
+    'The same real Mesa/virgl stack as the glxgears demo, but the X server is Xwayland instead of ' +
+    'Xvfb: Xwayland runs as a client of a gex-native Wayland compositor in the shim, and glxgears ' +
+    'draws through virgl to virglrenderer on this page.',
+  network: false,
+
+  async enter(ctx) {
+    const wrap = document.createElement('div');
+    wrap.className = 'canvas-wrap';
+    const canvas = document.createElement('canvas');
+    canvas.width = 300;
+    canvas.height = 300;
+    wrap.append(canvas);
+    // A second canvas for the Wayland compositor to blit committed shm frames
+    // onto: a native wl client (es2gears) renders via virgl offscreen, reads
+    // back into a wl_shm buffer, and commits it -- the compositor draws that
+    // here (the WebGL `canvas` above is virglrenderer's own scratch surface).
+    const wlCanvas = document.createElement('canvas');
+    wlCanvas.id = 'gex-wl';
+    wlCanvas.width = 300;
+    wlCanvas.height = 300;
+    wrap.append(wlCanvas);
+    document.getElementById('terminal')?.before(wrap);
+    ctx.onLeave(() => wrap.remove());
+
+    ctx.term.writeln('Xwayland replaces Xvfb. It connects to a Wayland compositor that lives in');
+    ctx.term.writeln('the shim, and glxgears renders through virgl -- real Mesa, no software');
+    ctx.term.writeln('rasteriser -- to virglrenderer on this page.');
+    ctx.term.writeln('');
+
+    const start = async (seconds) => {
+      ctx.actions([]);
+      running(true);
+      const t0 = performance.now();
+      let renderer = null;
+      try {
+        ctx.busy('loading the renderer');
+        const { VirglRenderer } = await import('./virgl.js');
+        renderer = await VirglRenderer.create(canvas, '/gex/gexvirgl.mjs');
+        if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
+        // Live render state for a test harness: it can tell a client rendered
+        // (lit>0) the moment it happens rather than waiting for the exit report.
+        globalThis.__gexGlState = () => {
+          try {
+            return renderer.glState();
+          } catch {
+            return '';
+          }
+        };
+        // `?virgltrace=1` narrates every vtest command by name, the only way to
+        // see what a stuck GL client is looping on.
+        if (new URLSearchParams(location.search).get('virgltrace')) renderer.traceCommands(1);
+        ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
+        ctx.term.writeln('');
+
+        const tree = await ctx.rootfs('/rootfs/graphics.tar');
+        const files = { ...tree.files };
+        for (const [path, target] of Object.entries(tree.links)) {
+          const abs = target.startsWith('/')
+            ? target
+            : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+          if (files[abs]) {
+            files[path] = files[abs];
+            if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
+          }
+        }
+        for (const [path, target] of Object.entries(tree.hard ?? {})) {
+          if (files[target]) {
+            files[path] = files[target];
+            if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
+          }
+        }
+        // `?wlclient=` overrides the X client (default glxgears); `?wlenv=a=b;c=d`
+        // adds env, so a probe needs no rebuild. GALLIUM_DRIVER=virpipe is the
+        // whole point: glxgears' GL goes through Mesa's virgl driver to the vtest
+        // socket, not a software rasteriser.
+        const qp = new URLSearchParams(location.search);
+        const extraEnv = (qp.get('wlenv') || '')
+          .split(';')
+          .filter(Boolean)
+          .map((e) => `export ${e}\n`)
+          .join('');
+        const baseEnv =
+          'export XDG_RUNTIME_DIR=/tmp\n' +
+          'export WAYLAND_DISPLAY=wayland-0\n' +
+          'export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu\n' +
+          // A home and a writable cache so fontconfig (xclock, xterm, any Xft
+          // client) can find fonts and write its scan cache rather than failing.
+          'export HOME=/root\n' +
+          'export XDG_CACHE_HOME=/tmp\n' +
+          // A shell and a terminal type, for xterm (which forks $SHELL on a pty).
+          'export SHELL=/bin/sh\n' +
+          'export TERM=xterm\n' +
+          // GTK: force the X11 backend (run under Xwayland like the other X
+          // clients), point it at the compiled GSettings schemas and the icon/
+          // mime data, and give it a writable pixbuf loader cache.
+          'export GDK_BACKEND=x11\n' +
+          'export GSETTINGS_SCHEMA_DIR=/usr/share/glib-2.0/schemas\n' +
+          'export XDG_DATA_DIRS=/usr/share\n' +
+          'export GDK_PIXBUF_MODULE_FILE=/tmp/gdk-loaders.cache\n' +
+          // Tcl/Tk's script libraries (wish loads init.tcl/tk.tcl from here).
+          'export TCL_LIBRARY=/usr/share/tcltk/tcl8.6\n' +
+          'export TK_LIBRARY=/usr/share/tcltk/tk8.6\n' +
+          'export GALLIUM_DRIVER=virpipe\n' +
+          // Mesa's async shader-disk-cache runs a WORKER THREAD -- a second
+          // Worker on the process's memory. Two robustness fixes made real
+          // progress here (the precise cross-Worker futex wake k_futex_wake so
+          // its condvar signal is not lost, and the compare-and-swap in the
+          // arena allocator so two Workers claiming memory at once cannot be
+          // handed the same bytes), but a residual hazard still crashes the
+          // second Mesa thread, so the cache is disabled by default and the
+          // demos run single-threaded. `?wlenv=MESA_SHADER_CACHE_DISABLE=false`
+          // turns it back on to exercise/diagnose the multithreaded path.
+          'export MESA_SHADER_CACHE_DISABLE=true\n' +
+          extraEnv;
+        let script;
+        if (qp.get('wlmode') === 'native') {
+          // A wayland-native GL client straight against gex-wayland -- no X at
+          // all. GL still goes through virgl (virpipe) to virglrenderer; EGL's
+          // wl_shm/drisw path needs no gbm/DRM and no libLLVM.
+          const client = qp.get('wlclient') || '/usr/bin/es2gears_wayland.aarch64-linux-gnu';
+          // EGL_PLATFORM=wayland is what makes Mesa's EGL take the wl_shm/drisw
+          // path (→ virgl via virpipe) instead of probing for a GPU/gbm device
+          // it cannot find. Without it eglInitialize fails; with it, it comes up
+          // and enumerates real configs.
+          script =
+            baseEnv +
+            'export EGL_PLATFORM=wayland\n' +
+            `echo "gex: running ${client}"\n` +
+            `timeout ${seconds} ${client} 2>&1\n` +
+            'echo "gex: client exited $?"\n';
+        } else {
+          // Xwayland as the X server, glxgears (or ?wlclient=) as an X client.
+          const client = qp.get('wlclient') || 'glxgears.aarch64-linux-gnu -info';
+          script =
+            baseEnv +
+            'echo "gex: starting Xwayland"\n' +
+            // `-ac` disables access control. Xwayland turns authorization on by
+            // default and there is no `.Xauthority` in this rootfs, so a client
+            // is refused with "Authorization required, but no authorization
+            // protocol specified" and glxgears cannot open display :0. Xvfb was
+            // reached without it because that path never enabled auth.
+            'Xwayland :0 -verbose 3 -noreset -ac &\n' +
+            // Do NOT poll for /tmp/.X11-unix/X0: Xwayland binds it in its own
+            // process, and with a Worker (and a tmpfs) per process the node it
+            // makes is not in this shell's filesystem -- the parent would wait
+            // forever for a path only the child can see. The socket *name*,
+            // though, is registered in the global kernel (the abstract
+            // @/tmp/.X11-unix/X0 that libxcb tries first), so a client connects
+            // across the process boundary regardless. Xwayland listens the
+            // instant it binds, long before it finishes bringing extensions up,
+            // so a fixed spell to let it bind is enough and the client's
+            // connection is queued until the server is ready.
+            'sleep 6\n' +
+            'export DISPLAY=:0\n' +
+            // No `gdk-pixbuf-query-loaders` here: it hangs this pipeline (a
+            // forked child that never returns, so the shell's `wait` blocks and
+            // the client never starts), and it could not help anyway -- it writes
+            // its cache into THIS shell's per-process tmpfs, which a forked client
+            // does not share, so a GTK client would never see it. A GTK-in-wayland
+            // demo that needs the loader cache must build it a way that crosses
+            // the process boundary (a shared tmpfs, or bake the cache into the
+            // rootfs at build time).
+            'echo "gex: X up, starting the client"\n' +
+            `timeout ${seconds} ${client} 2>&1\n` +
+            'echo "gex: client exited $?"\n';
+        }
+        files['/run.sh'] = new TextEncoder().encode(script);
+
+        ctx.idle();
+        rule(ctx, `graphics rootfs — ${Object.keys(files).length} files`);
+        ctx.status('running');
+        const { status } = await ctx.runProgram(ctx.term, {
+          elf: files['/bin/sh'],
+          files,
+          dirs: tree.dirs,
+          modes: tree.modes,
+          args: ['/bin/sh', '/run.sh'],
+          cwd: '/',
+          tty: true,
+          uid: 0,
+          // Real GL over virgl, as the glxgears demo does. The compositor gets
+          // a 2D canvas so a native wl client's committed shm frames show; for
+          // the Xwayland path the pixels come via virgl and this stays blank.
+          virgl: renderer,
+          wl: wlCanvas,
+          heartbeat: Number(new URLSearchParams(location.search).get('heartbeat')) || 0,
+        });
+        const ms = (performance.now() - t0).toFixed(0);
+        ctx.term.writeln('');
+        rule(ctx, `exit ${status} in ${ms} ms`);
+        const gl = renderer.glState();
+        const nums = ['presented', 'lit', 'brightest']
+          .map((k) => `${k}=${/=(\d+)/.exec(gl.slice(gl.indexOf(k)))?.[1] ?? '?'}`)
+          .join(' ');
+        ctx.term.writeln(ctx.ansi.dim(`  ${nums}`));
+        ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
+      } catch (e) {
+        failed(ctx, e);
+      } finally {
+        running(false);
+        ctx.idle();
+        ctx.actions([
+          { label: 'Draw for 90s', primary: true, onClick: () => start(90) },
+          { label: 'Draw for 5 minutes', onClick: () => start(300) },
+        ]);
+      }
+    };
+
+    ctx.actions([
+      { label: 'Draw for 90s', primary: true, onClick: () => start(90) },
+      { label: 'Draw for 5 minutes', onClick: () => start(300) },
+    ]);
+    ctx.hint('Xwayland + glxgears, GL through virgl');
+  },
+};
+
+export const DEMOS = [upload, busybox, debian, gears, virglGears, waylandGears];

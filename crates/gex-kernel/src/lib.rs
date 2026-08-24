@@ -20,6 +20,7 @@ pub mod mem;
 pub mod net;
 pub mod pipe;
 pub mod proc;
+pub mod pty;
 pub mod signal;
 pub mod stdio;
 pub mod syscalls;

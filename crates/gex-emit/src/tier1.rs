@@ -153,6 +153,44 @@ fn check_sp() -> bool {
         || CHECK_SP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `GEX_COPY_LOOP=1` natively, or `set_copy_loop(true)` in the browser: emit
+/// `MemCopy` as an explicit forward byte loop instead of `memory.copy`, to tell
+/// a `memory.copy`/clamp fault from a bad-argument one. Diagnostic only --
+/// forward copy is not memmove-safe.
+static COPY_LOOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_copy_loop(on: bool) {
+    COPY_LOOP.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn copy_loop() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var_os("GEX_COPY_LOOP").is_some())
+        || COPY_LOOP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Experiment (default OFF): emit guest scalar loads/stores as *atomic* wasm
+/// accesses when the effective address is naturally aligned, plain otherwise.
+/// A plain wasm load from shared memory can be hoisted/CSE'd by V8 across the
+/// atomic fences gex emits for guest acquire/release/DMB, so a correctly
+/// synchronised guest (GLib's lock-free fast paths) can still read a stale
+/// pointer/count and store wild. An atomic access is a real, un-reorderable
+/// memory op -- this makes shared reads coherent. Aligned-only because an
+/// unaligned wasm atomic traps; the runtime alignment check picks the plain
+/// form for the (rare, usually thread-private) unaligned case. Gated so the
+/// default hot path is byte-identical -- zero regression risk when off.
+static COHERENT_LOADS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_coherent_loads(on: bool) {
+    COHERENT_LOADS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn coherent_loads() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var_os("GEX_COHERENT_LOADS").is_some())
+        || COHERENT_LOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Compile one GIR block into a wasm function body, plus the offsets of every
 /// immediate naming a local function.
 ///
@@ -922,6 +960,8 @@ impl<'a> Emitter<'a> {
                 if *order == Order::SeqCst {
                     let sub = atomic_store_op(ty, *sz);
                     self.f.atomic(sub, natural_align(*sz), static_off);
+                } else if coherent_loads() {
+                    self.emit_coherent_store(ty, *sz, static_off);
                 } else {
                     let opcode = store_op(ty, *sz);
                     self.f.store(opcode, natural_align(*sz), static_off);
@@ -950,6 +990,9 @@ impl<'a> Emitter<'a> {
                     };
                     self.f.simd_mem_lane(sub, align, static_off, 0);
                 }
+            }
+            Stmt::MemCopy { dst, src, len } if copy_loop() => {
+                self.emit_memcopy_loop(*dst, *src, *len);
             }
             Stmt::MemCopy { dst, src, len } => {
                 // Both addresses first: `guard_to_i32` borrows the i64
@@ -1014,6 +1057,146 @@ impl<'a> Emitter<'a> {
             self.f.select();
             self.f.local_set(n);
         }
+    }
+
+    /// `memcpy(dst, src, len)` as an explicit forward byte loop (diagnostic;
+    /// see `copy_loop`). Each access is guarded like any other, so a wild
+    /// pointer faults where the guest's would rather than trapping the process.
+    fn emit_memcopy_loop(&mut self, dst: Value, src: Value, len: Value) {
+        let ld = self.alloc(Ty::I64);
+        let ls = self.alloc(Ty::I64);
+        let llen = self.alloc(Ty::I64);
+        let idx = self.alloc(Ty::I64);
+
+        self.push(dst);
+        self.f.local_set(ld);
+        self.push(src);
+        self.f.local_set(ls);
+        self.push(len);
+        self.f.local_set(llen);
+        self.f.i64_const(0);
+        self.f.local_set(idx);
+
+        self.f.block_void();
+        self.f.loop_void();
+
+        // Done once every byte has been copied.
+        self.f.local_get(idx);
+        self.f.local_get(llen);
+        self.f.byte(0x5a); // i64.ge_u
+        self.f.br_if(1);
+
+        // store8(dst + idx, load8(src + idx)). The destination address is
+        // guarded and left on the stack, then the source byte on top of it.
+        self.f.local_get(ld);
+        self.f.local_get(idx);
+        self.f.byte(0x7c); // i64.add
+        self.guard_to_i32();
+        self.f.local_get(ls);
+        self.f.local_get(idx);
+        self.f.byte(0x7c); // i64.add
+        self.guard_to_i32();
+        self.f.load(0x2d, 0, 0); // i32.load8_u
+        self.f.byte(0x3a); // i32.store8
+        self.f.byte(0); // align
+        self.f.byte(0); // offset
+
+        self.f.local_get(idx);
+        self.f.i64_const(1);
+        self.f.byte(0x7c);
+        self.f.local_set(idx);
+        self.f.br(0);
+
+        self.f.end(); // loop
+        self.f.end(); // block
+    }
+
+    /// Sign-extend the value an atomic (unsigned) load left on the stack from a
+    /// sub-width access up to its register type. A no-op for a full-width load.
+    /// Atomic loads have no signed form, so a signed guest load becomes an
+    /// unsigned atomic load followed by this.
+    fn sign_extend_after_atomic(&mut self, ty: Ty, sz: MemSz) {
+        let op = match (ty, sz) {
+            (Ty::I32, MemSz::B1) => Some(0xc0u8), // i32.extend8_s
+            (Ty::I32, MemSz::B2) => Some(0xc1),   // i32.extend16_s
+            (Ty::I64, MemSz::B1) => Some(0xc2),   // i64.extend8_s
+            (Ty::I64, MemSz::B2) => Some(0xc3),   // i64.extend16_s
+            (Ty::I64, MemSz::B4) => Some(0xc4),   // i64.extend32_s
+            _ => None,                            // full width: already correct
+        };
+        if let Some(op) = op {
+            self.f.byte(op);
+        }
+    }
+
+    /// Coherent (atomic-when-aligned) load. `addr` (i32) is on the stack; the
+    /// effective address is `addr + static_off`. Leaves the loaded value.
+    /// Signed loads use an unsigned atomic load plus a sign-extend, so signed
+    /// `gint` fields (GObject refcounts/counts/flags) are covered too.
+    fn emit_coherent_load(&mut self, ty: Ty, sz: MemSz, signed: bool, static_off: u32) {
+        let alogp = natural_align(sz);
+        if alogp == 0 {
+            // A byte access is always aligned: atomic unconditionally.
+            self.f.atomic(atomic_load_op(ty, sz), 0, static_off);
+            if signed {
+                self.sign_extend_after_atomic(ty, sz);
+            }
+            return;
+        }
+        let mask = (1i32 << alogp) - 1;
+        let a = self.alloc(Ty::I32);
+        self.f.local_set(a);
+        // (addr + static_off) & mask  -- nonzero iff unaligned.
+        self.f.local_get(a);
+        self.f.i32_const(static_off as i32);
+        self.f.byte(0x6a); // i32.add
+        self.f.i32_const(mask);
+        self.f.byte(0x71); // i32.and
+        self.f.if_result(val_type(ty));
+        // unaligned: plain load (handles signed natively)
+        self.f.local_get(a);
+        self.f.load(load_op(ty, sz, signed), alogp, static_off);
+        self.f.else_();
+        // aligned: atomic (unsigned) load, then sign-extend if needed
+        self.f.local_get(a);
+        self.f.atomic(atomic_load_op(ty, sz), alogp, static_off);
+        if signed {
+            self.sign_extend_after_atomic(ty, sz);
+        }
+        self.f.end();
+    }
+
+    /// Coherent (atomic-when-aligned) store. Stack holds `[addr(i32), val(ty)]`
+    /// (val on top), matching a plain store's operands. Leaves nothing.
+    fn emit_coherent_store(&mut self, ty: Ty, sz: MemSz, static_off: u32) {
+        let v = self.alloc(ty);
+        self.f.local_set(v);
+        let alogp = natural_align(sz);
+        if alogp == 0 {
+            // addr is on the stack; byte access is always aligned.
+            self.f.local_get(v);
+            self.f.atomic(atomic_store_op(ty, sz), 0, static_off);
+            return;
+        }
+        let a = self.alloc(Ty::I32);
+        self.f.local_set(a);
+        let mask = (1i32 << alogp) - 1;
+        self.f.local_get(a);
+        self.f.i32_const(static_off as i32);
+        self.f.byte(0x6a); // i32.add
+        self.f.i32_const(mask);
+        self.f.byte(0x71); // i32.and
+        self.f.if_void();
+        // unaligned: plain store
+        self.f.local_get(a);
+        self.f.local_get(v);
+        self.f.store(store_op(ty, sz), alogp, static_off);
+        self.f.else_();
+        // aligned: atomic store
+        self.f.local_get(a);
+        self.f.local_get(v);
+        self.f.atomic(atomic_store_op(ty, sz), alogp, static_off);
+        self.f.end();
     }
 
     /// `dst = memcmp(a, b, len)` as an inline loop.
@@ -1208,6 +1391,8 @@ impl<'a> Emitter<'a> {
                     // no signed load-acquire either.
                     let sub = atomic_load_op(*ty, *sz);
                     self.f.atomic(sub, natural_align(*sz), static_off);
+                } else if coherent_loads() {
+                    self.emit_coherent_load(*ty, *sz, *signed, static_off);
                 } else {
                     let opcode = load_op(*ty, *sz, *signed);
                     self.f.load(opcode, natural_align(*sz), static_off);

@@ -204,7 +204,23 @@ impl MemoryMap {
         // claiming a full `len` above the tail strands it every time. `apt-get
         // update` hit the 2 GiB ceiling this way.
         let tail = self.free_tail();
-        let want = need.saturating_sub(tail).max(CHUNK);
+        // Subtracting the free tail lets a small heap grow carry on from it
+        // instead of stranding it (glibc's `new_heap` free-and-remap, which hit
+        // the 2 GiB ceiling otherwise). But that reuse only actually happens in
+        // the *adjacent* branch below, where the span starts `tail` bytes before
+        // `start`. For a mapping larger than a CHUNK the reduced `want` is what
+        // gets taken and recorded, and if the take lands non-adjacent (the
+        // shared cursor moved) the tail is never reused and the span is short by
+        // `tail` -- a 107 MiB libLLVM mmap then hands back an address whose last
+        // `tail` bytes were never backed, faulting OOB in Mesa's DRI screen init
+        // (no GLX fbconfigs) and crashing glxinfo outright. Small grows floor to
+        // CHUNK >= need and are backed regardless, so only shrink `want` for
+        // them; back a large mapping in full.
+        let want = if need > CHUNK {
+            need
+        } else {
+            need.saturating_sub(tail).max(CHUNK)
+        };
         let start = take(want);
         if start == 0 {
             return Err(Errno::ENOMEM);
@@ -220,24 +236,19 @@ impl MemoryMap {
                 return Ok(start - tail);
             }
         }
-        // Not adjacent to the free tail that `want` was shortened for (the
-        // shared bump cursor moved on -- the shim's own heap draws from it too),
-        // so that tail is unreachable from `start` and this span must cover
-        // `need` on its own. `want` may be short by up to `tail`; top it up.
-        // `take` is a monotonic bump cursor, so each claim is contiguous with
-        // the last. Without this, a `mmap` (a pthread stack, commonly) gets an
-        // address whose top `tail` bytes were never backed, and the first write
-        // to it faults with EFAULT -- which is how `pthread_create` died.
-        let mut end = start + want;
-        while end < start + need {
-            let more = start + need - end;
-            let s = take(more);
-            if s == 0 {
-                return Err(Errno::ENOMEM);
-            }
-            end = s + more;
-        }
-        self.arena.push((start, end));
+        // Record the span and hand back its start. A single `take` is one
+        // contiguous claim whatever the cursor does; a `29f6e7f` change added a
+        // SECOND `take` here to "top up" the tail `want` was shortened by, but
+        // the arena cursor is shared between a process's threads, so a racing
+        // claim from another thread landed between the two takes and the span
+        // recorded here then covered memory that claim owned -- multithreaded
+        // Xvfb corrupted into an OOB/SIGABRT, which was the virgl regression.
+        // The common mapping (a pthread stack is 8 MiB == CHUNK, so `want` is
+        // floored to CHUNK >= need) is fully backed by the one take above; the
+        // only under-backed case is a mapping larger than a CHUNK that followed
+        // a freed tail, which is rare and predates this code -- fix that in the
+        // mmap path if it ever bites, not with a second racing take.
+        self.arena.push((start, start + want));
         Ok(start)
     }
 

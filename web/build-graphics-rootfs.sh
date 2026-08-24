@@ -82,8 +82,41 @@ libbsd.so.0 libmd.so.0 libedit.so.2 libffi.so.8 libunwind.so.8
 libfreetype.so.6 libfontenc.so.1 libpng16.so.16 libpixman-1.so.0
 libbrotlicommon.so.1 libbrotlidec.so.1 libxml2.so.2
 libicuuc.so.72 libicudata.so.72
+libEGL.so.1 libEGL_mesa.so.0 libGLESv2.so.2 libgbm.so.1
+libwayland-client.so.0 libwayland-egl.so.1 libwayland-server.so.0
+libxkbcommon.so.0 libwayland-cursor.so.0
+libxcvt.so.0 libepoxy.so.0 libtirpc.so.3
+libgssapi_krb5.so.2 libkrb5.so.3 libk5crypto.so.3 libkrb5support.so.0
+libcom_err.so.2 libkeyutils.so.1 libresolv.so.2
+libXi.so.6 libXmu.so.6 libXt.so.6 libXrender.so.1 libxcb-damage.so.0
+libSM.so.6 libICE.so.6 libuuid.so.1
+libXft.so.2 libfontconfig.so.1 libXaw.so.7 libXpm.so.4 libXinerama.so.1
+libutempter.so.0 libtcl8.6.so libtk8.6.so libXss.so.1 libjpeg.so.62
+libatk-1.0.so.0 libatk-bridge-2.0.so.0 libatspi.so.0 libavahi-client.so.3
+libavahi-common.so.3 libblkid.so.1 libcairo-gobject.so.2 libcairo.so.2
+libcolordprivate.so.2 libcolord.so.2 libcups.so.2 libdatrie.so.1 libdbus-1.so.3
+libdeflate.so.0 libfribidi.so.0 libgdk-3.so.0 libgdk_pixbuf-2.0.so.0
+libgio-2.0.so.0 libglib-2.0.so.0 libgmodule-2.0.so.0 libgmp.so.10
+libgnutls.so.30 libgobject-2.0.so.0 libgraphite2.so.3 libgthread-2.0.so.0
+libgtk-3.so.0 libharfbuzz.so.0 libhogweed.so.6 libidn2.so.0 libjbig.so.0
+liblcms2.so.2 libLerc.so.4 libmount.so.1 libnettle.so.8
+libp11-kit.so.0 libpango-1.0.so.0 libpangocairo-1.0.so.0 libpangoft2-1.0.so.0
+libtasn1.so.6 libthai.so.0 libtiff.so.6 libudev.so.1 libunistring.so.2
+libwebp.so.7 libXaw7.so.7 libxcb-render.so.0 libxcb-shape.so.0
+libXcomposite.so.1 libXcursor.so.1 libXdamage.so.1 libXrandr.so.2
 "
-PROGS="Xvfb xkbcomp glxgears.aarch64-linux-gnu glxinfo.aarch64-linux-gnu"
+# The GTK3 stack (libgtk-3 + ~50 transitive libs, plus schemas/icons/pixbuf
+# data) was fully assembled and stages in /tmp/gexapps, but gtk3-demo deadlocks
+# in GLib's threaded init on the worker-per-thread cross-worker futex race (the
+# same class as Mesa's shader-cache thread, with no single-thread escape hatch),
+# so its 56 MB is left out of the default image. To revive it once that race is
+# fixed, re-add those SONAMEs here + gtk3-demo/gdk-pixbuf-query-loaders to PROGS
+# + the GTK data copy below. See the apps-through-xwayland-pipeline memory.
+PROGS="Xvfb xkbcomp glxgears.aarch64-linux-gnu glxinfo.aarch64-linux-gnu
+es2gears_wayland.aarch64-linux-gnu eglinfo.aarch64-linux-gnu Xwayland
+es2gears_x11.aarch64-linux-gnu es2tri.aarch64-linux-gnu es2_info.aarch64-linux-gnu
+glxdemo.aarch64-linux-gnu glxheads.aarch64-linux-gnu xeyes xclock xterm xcalc
+wish8.6 twm glmark2 gtk3-demo gdk-pixbuf-query-loaders"
 
 mkdir -p "$R/lib/aarch64-linux-gnu" "$R/usr/lib/aarch64-linux-gnu/dri" \
          "$R/usr/bin" "$R/bin" "$R/etc" "$R/tmp/.X11-unix" "$R/var/lib/xkb" \
@@ -120,7 +153,60 @@ cp -L "$SRC/bin/sleep" "$R/bin/sleep"
 # flush the five-second report that is the only thing it prints.
 cp -L "$SRC/usr/bin/timeout" "$R/usr/bin/timeout"
 
+# Tcl/Tk's script library (wish will not start without init.tcl and tk.tcl) and
+# a self-contained demo script. Tk is single-threaded, so unlike GTK it does not
+# hit the worker-per-thread futex race.
+if [ -d "$SRC/usr/share/tcltk" ]; then
+    mkdir -p "$R/usr/share/tcltk"
+    cp -r "$SRC/usr/share/tcltk/tcl8.6" "$SRC/usr/share/tcltk/tk8.6" "$R/usr/share/tcltk/"
+    [ -f "$SRC/tk-demo.tcl" ] && cp "$SRC/tk-demo.tcl" "$R/tk-demo.tcl"
+    ln -sf wish8.6 "$R/usr/bin/wish"
+fi
+
+# A window-manager session: twm managing several clients at once. twm's config
+# (auto-placement, since there is no user to drag windows) and the launcher.
+[ -f "$SRC/root/.twmrc" ] && { mkdir -p "$R/root"; cp "$SRC/root/.twmrc" "$R/root/.twmrc"; }
+[ -f "$SRC/session.sh" ] && cp "$SRC/session.sh" "$R/session.sh"
+
+# glmark2's benchmark data: the 3D models, the GLSL shaders, and the textures
+# its scenes load. A real GL workload -- shaders, VBOs, framebuffers -- to
+# push virglrenderer well past spinning gears.
+[ -d "$SRC/usr/share/glmark2" ] && { mkdir -p "$R/usr/share"; cp -r "$SRC/usr/share/glmark2" "$R/usr/share/glmark2"; }
+
+# GLVND's EGL vendor config: Debian's libEGL.so.1 is the vendor-neutral
+# dispatch, and without this JSON it never loads libEGL_mesa.so.0 -- eglQuery
+# returns no client extensions and eglInitialize fails before any driver. This
+# one file is the difference between "no EGL" and Mesa.
+[ -d "$SRC/usr/share/glvnd" ] && cp -r "$SRC/usr/share/glvnd" "$R/usr/share/glvnd"
 cp -r "$SRC/usr/share/X11/xkb" "$R/usr/share/X11/xkb"
+# Fonts and fontconfig, for the toolkit clients (xclock, xterm) that render text
+# through Xft. DejaVu is enough for a terminal and a clock; fontconfig scans the
+# directory at startup (no prebuilt cache) and writes its own to the cache dir.
+if [ -d "$SRC/usr/share/fonts" ]; then
+    mkdir -p "$R/usr/share/fonts" "$R/etc" "$R/var/cache/fontconfig"
+    cp -r "$SRC/usr/share/fonts" "$R/usr/share/fonts"
+    [ -d "$SRC/etc/fonts" ] && cp -r "$SRC/etc/fonts" "$R/etc/fonts"
+fi
+# Athena-widget apps (xcalc) read their button layout from an app-defaults
+# resource file; without it xcalc comes up an empty window.
+if [ -d "$SRC/etc/X11/app-defaults" ]; then
+    mkdir -p "$R/etc/X11/app-defaults"
+    cp -r "$SRC/etc/X11/app-defaults/." "$R/etc/X11/app-defaults/"
+fi
+# GTK runtime data (modules, GSettings schemas, icons, pixbuf loaders). Only
+# copied when the GTK stack is in PROGS -- which it is not by default, because
+# gtk3-demo deadlocks on the threading race (see above). Kept for revival.
+if [ -n "${GEX_GTK:-}" ] && [ -d "$SRC/usr/lib/aarch64-linux-gnu/gtk-3.0" ]; then
+    mkdir -p "$R/usr/lib/aarch64-linux-gnu" "$R/usr/share/glib-2.0" "$R/usr/share"
+    cp -r "$SRC/usr/lib/aarch64-linux-gnu/gtk-3.0" "$R/usr/lib/aarch64-linux-gnu/gtk-3.0"
+    cp -r "$SRC/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0" "$R/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0"
+    cp -r "$SRC/usr/share/glib-2.0/schemas" "$R/usr/share/glib-2.0/schemas"
+    [ -d "$SRC/usr/share/icons" ] && cp -r "$SRC/usr/share/icons" "$R/usr/share/icons"
+    # The pixbuf loader cache names absolute loader paths and must match the
+    # guest's layout, so the guest builds it at startup with
+    # gdk-pixbuf-query-loaders (see the wayland demo's GTK env). Nothing to do
+    # here but ship the loaders and the tool.
+fi
 [ -e "$SRC/usr/share/drirc.d" ] && cp -r "$SRC/usr/share/drirc.d" "$R/usr/share/drirc.d"
 [ -e "$SRC/usr/lib/xorg/protocol.txt" ] && cp "$SRC/usr/lib/xorg/protocol.txt" "$R/usr/lib/xorg/"
 
@@ -179,6 +265,14 @@ export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu
 # Nothing in this demo wants a software rasteriser. The renderer is on the
 # other side of the socket.
 export GALLIUM_DRIVER=virpipe
+# Mesa's on-disk shader cache runs on its own thread. Under the worker-per-thread
+# model that thread is a second Web Worker, and its handshake with the main one
+# rides a cross-worker futex wake that the browser scheduler can drop -- the
+# process then deadlocks in futex after the fbconfig probe, before it ever opens
+# the rendering connection (glxgears/es2gears both hung here). No cache, no
+# thread, no lost wake.
+export MESA_SHADER_CACHE_DISABLE=true
+export MESA_GLSL_CACHE_DISABLE=1
 # Every step says so. In a page this is the only channel there is, and a run
 # that is merely slow looks exactly like one that is stuck without it -- the
 # first browser attempt at this printed nothing for half an hour and the

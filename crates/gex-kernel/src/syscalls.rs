@@ -259,6 +259,13 @@ pub enum BlockOp {
         uaddr: u64,
         val: u32,
         deadline: Option<std::time::Duration>,
+        /// A queue place snapshotted BEFORE the word was checked, for a host
+        /// (the browser) that parks cooperatively instead of blocking under
+        /// the queue lock. Taking it before the check is what stops a
+        /// `FUTEX_WAKE` that lands between the check and the park from being
+        /// lost -- the native host holds the lock across both instead and
+        /// ignores this. See [`futex::FutexTable::park`].
+        parked: Option<crate::futex::Parked>,
     },
     Sleep(std::time::Duration),
     /// `rt_sigsuspend`: wait until a signal the caller can see arrives.
@@ -419,6 +426,10 @@ pub struct Kernel {
     /// binds a name in its own Worker and its client, another Worker, looks
     /// in a name table that has never heard of it. See [`crate::unix::Remote`].
     pub unix_remote: Option<crate::unix::Remote>,
+    /// Where a pseudoterminal pair lives when its master and slave may be in
+    /// different address spaces (xterm and its shell). `None` keeps a local
+    /// `Pty`, right whenever every process really is one process.
+    pub ptys: Option<crate::pty::Remote>,
     /// This process's parent, cached from the table so `getppid` is not a
     /// lock. It never changes for a live process except when the parent dies,
     /// and `getppid` re-reads the table in that case.
@@ -991,6 +1002,7 @@ impl Kernel {
             procs: Arc::new(ProcTable::new()),
             pipes: None,
             unix_remote: None,
+            ptys: None,
             ppid: 0,
             clock: system_clock,
             itimers: [None; 3],
@@ -1204,6 +1216,7 @@ impl Kernel {
             procs: Arc::clone(&self.procs),
             pipes: self.pipes,
             unix_remote: self.unix_remote,
+            ptys: self.ptys,
             ppid: self.pid,
             clock: self.clock,
             // A fork does not inherit its parent's timers.
@@ -1744,6 +1757,18 @@ impl Kernel {
                 if !self.mem.vmas().iter().any(|v| a[0] >= v.start && a[0] + 4 <= v.end) {
                     return None;
                 }
+                // Take the queue place BEFORE reading the word. A cooperative
+                // host (the browser) parks by snapshotting the generation and
+                // polling it; if it snapshotted AFTER the check, a `FUTEX_WAKE`
+                // from another thread's Worker landing between the check and the
+                // snapshot would bump the generation first and the park would
+                // baseline against the already-bumped value -- the wake lost,
+                // the thread asleep forever (Mesa's util_queue deadlocked here).
+                // Snapshotting first means such a wake either changed the word
+                // (caught just below as EAGAIN) or bumped a generation the park
+                // will see. The native host holds the queue lock across its
+                // check-and-sleep instead and ignores this.
+                let parked = self.futexes.park(a[0]);
                 // The word must still hold what the caller expects, or the
                 // wake that changed it has already been and gone and the wait
                 // would be permanent. A mismatch declines the wait (EAGAIN via
@@ -1778,6 +1803,7 @@ impl Kernel {
                     uaddr: a[0],
                     val: a[2] as u32,
                     deadline,
+                    parked: Some(parked),
                 })
             }
             nr::WAIT4 => {
@@ -2637,6 +2663,36 @@ impl Kernel {
         Ok(total)
     }
 
+    /// Open a pseudoterminal end if `p` names one, else `None` so the ordinary
+    /// open runs. The pair lives in the global kernel (`self.ptys`); with none
+    /// there is no pty support and `/dev/ptmx` falls through to `ENOENT`.
+    fn open_pty(&mut self, p: &str, flags: u64) -> Option<SysResult> {
+        let r = self.ptys?;
+        let (id, master) = if p == "/dev/ptmx" {
+            let packed = (r.open_master)();
+            if packed < 0 {
+                return Some(Err(Errno::ENOSPC));
+            }
+            (packed >> 16, true)
+        } else if let Some(n) = p.strip_prefix("/dev/pts/") {
+            let ptn: i32 = n.parse().ok()?;
+            let id = (r.open_slave)(ptn);
+            if id == -1 {
+                return None; // no such pts -- let the VFS answer ENOENT
+            }
+            if id < 0 {
+                return Some(Err(Errno(-id))); // locked, or otherwise refused
+            }
+            (id, false)
+        } else {
+            return None;
+        };
+        let handle = Arc::new(crate::pty::RemotePty { id, master, remote: r });
+        let path = format!("pty:[{id}:{}]", if master { 'm' } else { 's' });
+        let file = OpenFile::new(handle, path, flags, true, true);
+        Some(self.fds.insert(file, flags & oflags::O_CLOEXEC != 0))
+    }
+
     fn sys_openat(
         &mut self,
         m: &GuestMem<'_>,
@@ -2646,6 +2702,13 @@ impl Kernel {
         mode: u32,
     ) -> SysResult {
         let p = self.at_path(m, dirfd, path)?;
+        // Unix98 pseudoterminals. `/dev/ptmx` makes a fresh pair and hands back
+        // the master; `/dev/pts/N` takes the matching slave. Both live in the
+        // global kernel, so the master (xterm) and the slave (its shell) can be
+        // different Workers. Intercepted before the VFS, which has no such nodes.
+        if let Some(res) = self.open_pty(&p, flags) {
+            return res;
+        }
         // `O_TMPFILE` names a directory and asks for an unnamed file inside
         // it: made, opened, and unlinked at once, so the handle is the only
         // way to it. `O_PATH` opens the name, not the file, so it does not
@@ -3091,6 +3154,13 @@ impl Kernel {
 
     fn sys_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> SysResult {
         use crate::tty::{self, lflag};
+        // The kernel takes an `unsigned int` command: a request with the top
+        // `_IOC` direction bit set (a read ioctl like TIOCGPTN or TCGETS2)
+        // reaches glibc/musl as a negative `int` and is sign-extended when
+        // widened into the syscall register, arriving here as `0xffffffff_8...`.
+        // Masking to 32 bits is what the real kernel does and what makes those
+        // read-direction ioctls match their numbers at all.
+        let req = req & 0xffff_ffff;
         // The terminal's own requests. `_IOC` encodes direction and size into
         // the number, which is why the four `termios2` calls and the pty ones
         // look nothing like the rest: they are not arbitrary, they are

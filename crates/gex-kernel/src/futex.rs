@@ -11,7 +11,7 @@
 //! holding it across the wait, so no waker can slip through the gap.
 
 use crate::errno::Errno;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -41,8 +41,10 @@ struct Queue {
 /// A place on a futex queue, held by a host that polls instead of blocking.
 ///
 /// Holding it keeps the queue alive, so [`FutexTable::gc`] cannot drop the
-/// generation counter this is watching.
-#[derive(Debug)]
+/// generation counter this is watching. `Clone` shares the same queue and
+/// snapshot -- both observe the same generation, which is what lets the
+/// snapshot be taken in the kernel and carried to the host in a `BlockOp`.
+#[derive(Debug, Clone)]
 pub struct Parked {
     queue: Arc<Queue>,
     at: u64,
@@ -66,6 +68,14 @@ impl Parked {
 #[derive(Default, Debug)]
 pub struct FutexTable {
     queues: Mutex<HashMap<u64, Arc<Queue>>>,
+    /// Addresses woken since the host last drained them, for a host that relays
+    /// wakes across threads that do not share this table -- the browser, where
+    /// each Worker has its own `FutexTable` and a cross-Worker wake must reach
+    /// the waiter through a shared per-address counter. Recorded on every wake,
+    /// even one with no local waiter (the waiter is in the *other* table).
+    /// Bounded: the browser drains it after each syscall; a native run, which
+    /// blocks in [`Self::wait`] and never drains, must not grow it without end.
+    woken: Mutex<VecDeque<u64>>,
 }
 
 impl FutexTable {
@@ -125,6 +135,19 @@ impl FutexTable {
     /// Approximate in the same way Linux's is: it reports how many could be
     /// woken, and a woken thread re-checks its own condition regardless.
     pub fn wake(&self, addr: u64, count: u32) -> u64 {
+        // Record for the cross-thread relay BEFORE the local-queue lookup: a
+        // waiter in another Worker leaves this table with no queue for `addr`,
+        // so returning early here would drop the record and the wake would be
+        // invisible to it. Bounded to the most recent wakes -- a drop only costs
+        // an extra re-check, never a lost wake, since the waiter also re-reads
+        // the word.
+        if count > 0 {
+            let mut w = self.woken.lock().unwrap();
+            if w.len() >= 512 {
+                w.pop_front();
+            }
+            w.push_back(addr);
+        }
         let Some(queue) = self.queues.lock().unwrap().get(&addr).cloned() else {
             return 0;
         };
@@ -141,6 +164,14 @@ impl FutexTable {
                 n as u64
             }
         }
+    }
+
+    /// Addresses woken since this was last called, for the browser host to
+    /// relay across Workers via its shared per-address wake counter. A native
+    /// host blocks in [`Self::wait`] and never calls this; the buffer is bounded
+    /// so that is safe.
+    pub fn take_woken(&self) -> Vec<u64> {
+        Vec::from(std::mem::take(&mut *self.woken.lock().unwrap()))
     }
 
     /// Take a place on `addr`'s queue without blocking, for the browser host

@@ -36,6 +36,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 pub mod gl;
 pub mod virgl;
+pub mod wl;
 
 use std::sync::Arc;
 
@@ -193,6 +194,12 @@ extern "C" {
     fn k_wake_seq() -> i32;
     fn k_wake();
     fn k_park(seq: i32, ns: i64) -> i32;
+    /// Precise cross-Worker futex wake: `k_futex_wake` bumps the shared
+    /// generation of `addr` (and wakes parked Workers), `k_futex_gen` reads it.
+    /// A waiter samples the generation when it parks and wakes when it moves --
+    /// exact, where re-reading the guest word only guesses.
+    fn k_futex_wake(addr: u64);
+    fn k_futex_gen(addr: u64) -> u32;
     fn k_spawn(ppid: i32) -> i32;
     fn k_exit(pid: i32, status: i32);
     fn k_reap(pid: i32);
@@ -319,6 +326,31 @@ extern "C" {
     fn k_pipe_readable(id: i32) -> i32;
     fn k_pipe_writable(id: i32) -> i32;
     fn k_pipe_buffered(id: i32) -> i32;
+
+    // Unix98 pseudoterminals. xterm holds the master, its shell the slave, and
+    // with a Worker per process those are two memories -- so the pair, and the
+    // terminal's line discipline, live in the global kernel like a pipe does.
+    fn k_pty_open_master(pid: i32) -> i32;
+    fn k_pty_open_slave(ptn: i32, pid: i32) -> i32;
+    fn k_pty_open_end(id: i32, master: i32, pid: i32);
+    fn k_pty_close_end(id: i32, master: i32, pid: i32);
+    fn k_pty_forget(pid: i32) -> u32;
+    fn k_pty_read(id: i32, master: i32, at: u32, len: u32) -> i32;
+    fn k_pty_write(id: i32, master: i32, at: u32, len: u32) -> i32;
+    fn k_pty_readable(id: i32, master: i32) -> i32;
+    fn k_pty_available(id: i32, master: i32) -> i32;
+    fn k_pty_ptn(id: i32) -> i32;
+    fn k_pty_get_lock(id: i32) -> i32;
+    fn k_pty_set_lock(id: i32, locked: i32);
+    fn k_pty_get_termios(id: i32, at: u32, len: u32) -> i32;
+    fn k_pty_set_termios(id: i32, at: u32, len: u32, flush: i32) -> i32;
+    fn k_pty_winsize(id: i32) -> u64;
+    fn k_pty_set_winsize(id: i32, packed: u64) -> i32;
+    fn k_pty_fg(id: i32) -> i32;
+    fn k_pty_set_fg(id: i32, pgrp: i32);
+    fn k_pty_sid(id: i32) -> i32;
+    fn k_pty_set_sid(id: i32, sid: i32);
+    fn k_pty_flush(id: i32, which: i32);
 
     // Unix sockets. An X server binds a name and its client connects to it,
     // and with a Worker per process those are two memories -- so the name has
@@ -729,6 +761,99 @@ fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
     })
 }
 
+// Pty wrappers: the ones that name a holder inject this Worker's pid, the way
+// the pipe wrappers do, so the global kernel can release a process's ends when
+// it leaves by a trap.
+extern "C" fn rpty_open_master() -> i32 {
+    unsafe { k_pty_open_master(my_pid()) }
+}
+extern "C" fn rpty_open_slave(ptn: i32) -> i32 {
+    unsafe { k_pty_open_slave(ptn, my_pid()) }
+}
+extern "C" fn rpty_open_end(id: i32, master: i32) {
+    unsafe { k_pty_open_end(id, master, my_pid()) }
+}
+extern "C" fn rpty_close_end(id: i32, master: i32) {
+    unsafe { k_pty_close_end(id, master, my_pid()) }
+}
+extern "C" fn rpty_read(id: i32, master: i32, at: u32, len: u32) -> i32 {
+    unsafe { k_pty_read(id, master, at, len) }
+}
+extern "C" fn rpty_write(id: i32, master: i32, at: u32, len: u32) -> i32 {
+    unsafe { k_pty_write(id, master, at, len) }
+}
+extern "C" fn rpty_readable(id: i32, master: i32) -> i32 {
+    unsafe { k_pty_readable(id, master) }
+}
+extern "C" fn rpty_available(id: i32, master: i32) -> i32 {
+    unsafe { k_pty_available(id, master) }
+}
+extern "C" fn rpty_ptn(id: i32) -> i32 {
+    unsafe { k_pty_ptn(id) }
+}
+extern "C" fn rpty_get_lock(id: i32) -> i32 {
+    unsafe { k_pty_get_lock(id) }
+}
+extern "C" fn rpty_set_lock(id: i32, locked: i32) {
+    unsafe { k_pty_set_lock(id, locked) }
+}
+extern "C" fn rpty_get_termios(id: i32, at: u32, len: u32) -> i32 {
+    unsafe { k_pty_get_termios(id, at, len) }
+}
+extern "C" fn rpty_set_termios(id: i32, at: u32, len: u32, flush: i32) -> i32 {
+    unsafe { k_pty_set_termios(id, at, len, flush) }
+}
+extern "C" fn rpty_winsize(id: i32) -> u64 {
+    unsafe { k_pty_winsize(id) }
+}
+extern "C" fn rpty_set_winsize(id: i32, packed: u64) -> i32 {
+    unsafe { k_pty_set_winsize(id, packed) }
+}
+extern "C" fn rpty_fg(id: i32) -> i32 {
+    unsafe { k_pty_fg(id) }
+}
+extern "C" fn rpty_set_fg(id: i32, pgrp: i32) {
+    unsafe { k_pty_set_fg(id, pgrp) }
+}
+extern "C" fn rpty_sid(id: i32) -> i32 {
+    unsafe { k_pty_sid(id) }
+}
+extern "C" fn rpty_set_sid(id: i32, sid: i32) {
+    unsafe { k_pty_set_sid(id, sid) }
+}
+extern "C" fn rpty_flush(id: i32, which: i32) {
+    unsafe { k_pty_flush(id, which) }
+}
+
+/// Where a pseudoterminal pair lives, when there is a global kernel to hold it.
+fn global_ptys() -> Option<gex_kernel::pty::Remote> {
+    if unsafe { k_present() } == 0 {
+        return None;
+    }
+    Some(gex_kernel::pty::Remote {
+        open_master: rpty_open_master,
+        open_slave: rpty_open_slave,
+        open_end: rpty_open_end,
+        close_end: rpty_close_end,
+        read: rpty_read,
+        write: rpty_write,
+        readable: rpty_readable,
+        available: rpty_available,
+        ptn: rpty_ptn,
+        get_lock: rpty_get_lock,
+        set_lock: rpty_set_lock,
+        get_termios: rpty_get_termios,
+        set_termios: rpty_set_termios,
+        winsize: rpty_winsize,
+        set_winsize: rpty_set_winsize,
+        fg: rpty_fg,
+        set_fg: rpty_set_fg,
+        sid: rpty_sid,
+        set_sid: rpty_set_sid,
+        flush: rpty_flush,
+    })
+}
+
 extern "C" fn rs_bind(path: u32, path_len: u32) -> i32 {
     unsafe { k_sock_bind(path, path_len) }
 }
@@ -945,7 +1070,12 @@ impl FileHandle for StdinQueue {
 /// A function because every kernel this shim builds needs it -- both the
 /// process `gex_load` places and every child `gex_adopt_child` adopts, since a
 /// child with only the root filesystem has no `/dev/null` and no GPU.
-fn mount_devices(kernel: &mut Kernel) -> Option<crate::virgl::VirglDevice> {
+fn mount_devices(
+    kernel: &mut Kernel,
+) -> (
+    Option<crate::virgl::VirglDevice>,
+    Option<crate::wl::WaylandDevice>,
+) {
     let mut devfs = gex_kernel::vfs::DevFs::new();
     devfs.add("tty", Arc::new(Tty));
     if crate::gl::have_gl() {
@@ -955,14 +1085,28 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::virgl::VirglDevice> {
     // Only when the page brought one: Mesa's winsys does not fall back if the
     // socket is unserved -- it writes its handshake and blocks on a reply that
     // cannot come, worse than finding no socket at all.
-    crate::virgl::have_virgl().then(|| {
+    let virgl = crate::virgl::have_virgl().then(|| {
         let device = crate::virgl::VirglDevice::new();
         kernel.socket_names.bind_host(
             crate::virgl::DEFAULT_SOCKET,
             Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
         );
         device
-    })
+    });
+    // The Wayland compositor, on the same terms: bound only when the page
+    // brought a canvas for it, so a guest without one finds no `wayland-0` and
+    // libwayland fails to connect cleanly rather than blocking on a dead name.
+    let wayland = crate::wl::have_wl().then(|| {
+        let device = crate::wl::WaylandDevice::new();
+        kernel.socket_names.bind_host(
+            crate::wl::DEFAULT_SOCKET,
+            Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
+        );
+        // A node too, for a client that stats the path before connecting.
+        let _ = kernel.vfs.mksocket(crate::wl::DEFAULT_SOCKET);
+        device
+    });
+    (virgl, wayland)
 }
 
 /// Mount `/proc`. Returns the source it reads from, which the `Host` holds
@@ -1302,13 +1446,65 @@ struct ShimRegion;
 fn grow_memory_to(end: u64) -> bool {
     const PAGE: u64 = 65536;
     let have = warch::memory_size(0) as u64 * PAGE;
-    if end <= have {
+    // DIAGNOSTIC (GEX_PREGROW): grow to a large floor on the first grow so that
+    // runtime `memory.grow`s stop happening during the racy startup window --
+    // probes whether the SMP crash is a stale shared-memory bound after another
+    // Worker grew the SharedArrayBuffer (the "OOB after syscall 222/mmap"
+    // signature). Off by default; on, the memory reaches the floor once.
+    let target = if pregrow() { end.max(768 * 1024 * 1024) } else { end };
+    if target <= have {
         return true;
     }
     // A megabyte at a time past what was asked for: `memory.grow` may copy, so
     // a guest mapping a page at a time should not pay per page.
-    let want = (end - have).div_ceil(PAGE).max(16);
+    let want = (target - have).div_ceil(PAGE).max(16);
     warch::memory_grow(0, want as usize) != usize::MAX
+}
+
+static PREGROW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[no_mangle]
+pub extern "C" fn gex_set_pregrow(on: i32) {
+    PREGROW.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+fn pregrow() -> bool {
+    PREGROW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn on gex-wayland protocol tracing (buffers, commits, "produced no frame")
+/// -- the shim has no env, so `GEX_WL_TRACE` can't reach the compositor here.
+#[no_mangle]
+pub extern "C" fn gex_set_wl_trace(on: i32) {
+    // gex-wayland's traces use `eprintln!`, a no-op in the wasm shim; route them
+    // to the console instead so `?wltrace=1` actually shows the protocol.
+    fn sink(s: &str) {
+        warn_line(&format!("{s}\n"));
+    }
+    gex_wayland::set_trace_sink(sink);
+    gex_wayland::set_trace(on != 0);
+}
+
+/// Dump every thread's register context on a crash -- called from the JS trap
+/// handler so the common OOB/"trapped inside" crash (not just guest SIGABRT)
+/// names all threads. TWO threads with the SAME `ctx=` is issue #126: two
+/// Workers on one register context, which clobbers stacks and looks like
+/// corruption anywhere. Reads with `with_host_free` (no borrow) so it answers
+/// even when a crash left the kernel borrowed.
+#[no_mangle]
+pub extern "C" fn gex_dump_threads() {
+    with_host_free(|h| {
+        let mut s = String::from("[gex] threads at crash:");
+        for (i, t) in h.threads.iter().enumerate() {
+            s.push_str(&format!(
+                " t{i}(tid={} ctx={:#x} pc={:#x} {})",
+                t.kstate.tid,
+                t.kstate.ctx_addr,
+                t.pc,
+                waiting_name(&t.waiting),
+            ));
+        }
+        s.push('\n');
+        warn_line(&s);
+    });
 }
 
 /// How many of an object's stored units one dispatch miss may take, merged
@@ -1403,7 +1599,7 @@ static ARENA_NEXT: std::sync::atomic::AtomicU64 =
 
 /// Take `len` bytes of arena for this module's heap.
 fn arena_take(len: u64) -> Option<u64> {
-    let at = ARENA_NEXT.load(std::sync::atomic::Ordering::Relaxed);
+    let cur = ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire);
     // First claim starts above both the placement window (where shared objects
     // sit at a common address) and whatever the memory already reaches. The
     // cursor is a per-instance static, zero in a fresh shim -- but a forked
@@ -1412,10 +1608,10 @@ fn arena_take(len: u64) -> Option<u64> {
     // (nothing checks: the arena is meant to be the one allocator that cannot
     // collide). The memory is grown to cover the inherited image first, so its
     // size is the floor; an unforked process is below `ARENA_BOTTOM` as before.
-    let at = if at == 0 {
+    let at = if cur == 0 {
         gex_abi::ARENA_BOTTOM.max(warch::memory_size(0) as u64 * 65536)
     } else {
-        at
+        cur
     };
     let end = at.checked_add(len)?;
     if end > gex_abi::MMAP_TOP || !grow_memory_to(end) {
@@ -1522,8 +1718,26 @@ fn arena_take(len: u64) -> Option<u64> {
         unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
         return None;
     }
-    ARENA_NEXT.store(end, std::sync::atomic::Ordering::Relaxed);
-    Some(at)
+    // A compare-and-swap, not a bare store: two Workers that loaded the same
+    // cursor would otherwise both be handed `at` and, since a program's threads
+    // share this one arena, write over each other -- the out-of-bounds crash a
+    // second Mesa thread (the shader-cache worker) hit. Only the Worker still
+    // seeing `cur` wins the span; a loser recomputes from the advanced cursor
+    // and claims its own bytes. Any grow already done is harmless -- this memory
+    // only ever grows, so a span reserved and then lost is just skipped.
+    if ARENA_NEXT
+        .compare_exchange(
+            cur,
+            end,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        Some(at)
+    } else {
+        arena_take(len)
+    }
 }
 
 /// Make the memory reach `end`, and keep the arena above it.
@@ -1653,6 +1867,19 @@ enum Waiting {
     Futex {
         parked: gex_kernel::futex::Parked,
         deadline: Option<u64>,
+        /// The word value the wait expected, kept as a backup wake signal: a
+        /// waker changes the word before waking, so a word that no longer holds
+        /// `val` means a wake happened. It is only a backup because it is a
+        /// guess -- a contended condvar counter can be back at `val` by the time
+        /// this thread is scheduled to look -- superseded by `wake_gen`.
+        val: u32,
+        /// The shared per-address wake generation (`k_futex_gen`) at park time.
+        /// Each Worker has its own `FutexTable`, so a cross-Worker `FUTEX_WAKE`
+        /// cannot bump this waiter's local `Parked` generation; the shared
+        /// counter can, and a change in it is an EXACT cross-Worker wake --
+        /// bumped on every wake whatever the word does. Zero when there is no
+        /// global kernel (a lone process needs no cross-Worker relay).
+        wake_gen: u32,
     },
     /// Sleeping until this many nanoseconds on the host clock.
     Sleep(u64),
@@ -1791,6 +2018,9 @@ struct Host {
     /// The virtio-gpu renderer, when the page brought one. Held here, not in
     /// the kernel, because the scheduler pumps it.
     virgl: Option<crate::virgl::VirglDevice>,
+    /// The Wayland compositor, when the page brought a canvas. Held here like
+    /// `virgl` because the scheduler pumps it once per turn.
+    wayland: Option<crate::wl::WaylandDevice>,
     /// The root filesystem, kept so files can be added before the guest runs.
     root: Arc<gex_kernel::vfs::TmpFs>,
     /// The snapshot `/proc` reads from, refreshed before each syscall that
@@ -2470,11 +2700,19 @@ pub extern "C" fn gex_host_connect(path: u32, path_len: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_host_send(handle: i32, ptr: u32, len: u32) -> i32 {
     let bytes = shim_slice(ptr, len);
-    let sock = HOST_SOCKETS
-        .0
-        .borrow()
-        .get(handle.max(0) as usize)
-        .cloned();
+    // Clone the Arc under KLOCK: `HOST_SOCKETS` is a `SingleThreaded<Vec>` that
+    // `gex_host_connect` pushes to (a realloc) under KLOCK, and the browser's
+    // Xwayland<->compositor IPC calls send/recv from several Workers at once.
+    // An unlocked `borrow()` racing that push aliases freed backing storage --
+    // the browser-only residual after the closure-JIT races were fixed. The I/O
+    // itself stays outside the lock.
+    let sock = with_host(|_| {
+        HOST_SOCKETS
+            .0
+            .borrow()
+            .get(handle.max(0) as usize)
+            .cloned()
+    });
     match sock {
         Some(s) => s.send(bytes).map(|n| n as i32).unwrap_or(-1),
         None => -1,
@@ -2485,11 +2723,14 @@ pub extern "C" fn gex_host_send(handle: i32, ptr: u32, len: u32) -> i32 {
 /// which is not the same as end of stream -- the caller comes back.
 #[no_mangle]
 pub extern "C" fn gex_host_recv(handle: i32, ptr: u32, max: u32) -> i32 {
-    let sock = HOST_SOCKETS
-        .0
-        .borrow()
-        .get(handle.max(0) as usize)
-        .cloned();
+    // Clone under KLOCK -- see `gex_host_send`.
+    let sock = with_host(|_| {
+        HOST_SOCKETS
+            .0
+            .borrow()
+            .get(handle.max(0) as usize)
+            .cloned()
+    });
     let Some(s) = sock else { return -1 };
     let out = shim_slice_mut(ptr, max);
     s.recv(out, 0, false).map(|n| n as i32).unwrap_or(0)
@@ -2535,31 +2776,38 @@ pub extern "C" fn gex_host_bind(path: u32, path_len: u32) -> i32 {
         // Mesa) needs a node. Through the mount, since with a global kernel
         // `h.root` is this process's own `TmpFs` with nothing mounted on it.
         let _ = h.kernel.vfs.mksocket(name);
-    });
-    let mut table = HOST_LISTENERS.0.borrow_mut();
-    table.push(listener);
-    (table.len() - 1) as i32
+        // Under the same KLOCK: `HOST_LISTENERS`/`HOST_SOCKETS` are pushed to
+        // from other Workers (`gex_host_accept`) while the browser's socket
+        // bridge runs on several threads. An unlocked push races the Vec.
+        let mut table = HOST_LISTENERS.0.borrow_mut();
+        table.push(listener);
+        (table.len() - 1) as i32
+    })
 }
 
 /// Take one waiting connection, as a handle for [`gex_host_send`] and
 /// [`gex_host_recv`]. -1 when nothing is waiting.
 #[no_mangle]
 pub extern "C" fn gex_host_accept(listener: i32) -> i32 {
-    let l = HOST_LISTENERS
-        .0
-        .borrow()
-        .get(listener.max(0) as usize)
-        .cloned();
-    let Some(l) = l else { return -1 };
-    let sock = l
-        .accepted
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .pop();
-    let Some(sock) = sock else { return -1 };
-    let mut table = HOST_SOCKETS.0.borrow_mut();
-    table.push(sock);
-    (table.len() - 1) as i32
+    // Whole body under KLOCK: reads `HOST_LISTENERS` and pushes `HOST_SOCKETS`,
+    // both shared Vecs other Workers touch on the browser's socket bridge.
+    with_host(|_| {
+        let l = HOST_LISTENERS
+            .0
+            .borrow()
+            .get(listener.max(0) as usize)
+            .cloned();
+        let Some(l) = l else { return -1 };
+        let sock = l
+            .accepted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop();
+        let Some(sock) = sock else { return -1 };
+        let mut table = HOST_SOCKETS.0.borrow_mut();
+        table.push(sock);
+        (table.len() - 1) as i32
+    })
 }
 
 /// How many regions of guest memory this process actually owns. Anything that
@@ -2786,7 +3034,10 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
     let program = match gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, &read_file) {
         Ok(p) => p,
-        Err(_) => return 0,
+        Err(e) => {
+            warn_line(&format!("gex_load: load_program failed: {e:?}"));
+            return 0;
+        }
     };
 
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
@@ -2813,6 +3064,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     }
     kernel.pipes = global_pipes();
     kernel.unix_remote = global_sockets();
+    kernel.ptys = global_ptys();
     kernel.tty = global_tty();
     match &shared_root {
         Some(r) => kernel.vfs.mount("/", r.clone()),
@@ -2821,7 +3073,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // The graphics device, when the page said it has a canvas to draw on.
     // Absent otherwise, so a guest sees a machine with no GL rather than one
     // whose drawing vanishes.
-    let virgl = mount_devices(&mut kernel);
+    let (virgl, wayland) = mount_devices(&mut kernel);
     // Also a node in the filesystem, for a guest that looks (`test -e`, the
     // gears script) before it connects. Through the mount, not into `root`:
     // with a global kernel `root` is an unmounted `TmpFs` nothing can see.
@@ -2978,6 +3230,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         magic_head: HOST_MAGIC,
             kernel,
             virgl,
+            wayland,
             root,
             proc_state,
             threads: vec![Thread {
@@ -3176,24 +3429,28 @@ static LAZY_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
 /// The closure library covering this page, or -1.
 #[no_mangle]
 pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
-    if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
-        let claims = IMAGE_PAGES.0.borrow();
-        let Some(idxs) = claims.get(&page) else {
-            return -1;
-        };
-        return with_host(|h| {
-            idxs.iter()
+    // Whole body under KLOCK: `IMAGE_PAGES`/`CLOSURE_OWNER` are written at runtime
+    // by `gex_add_closure_module` as libraries stream in, and this runs on every
+    // Worker's miss path -- see the note there.
+    with_host(|h| {
+        if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+            let claims = IMAGE_PAGES.0.borrow();
+            let Some(idxs) = claims.get(&page) else {
+                return -1;
+            };
+            return idxs
+                .iter()
                 .find(|i| image_is_ours(h, **i))
                 .map(|i| *i as i32)
-                .unwrap_or(-1)
-        });
-    }
-    CLOSURE_OWNER
-        .0
-        .borrow()
-        .get(&page)
-        .map(|v| *v as i32)
-        .unwrap_or(-1)
+                .unwrap_or(-1);
+        }
+        CLOSURE_OWNER
+            .0
+            .borrow()
+            .get(&page)
+            .map(|v| *v as i32)
+            .unwrap_or(-1)
+    })
 }
 
 /// The `k`th closure object covering `page` that belongs to this process.
@@ -3204,11 +3461,12 @@ pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_closure_owner_at(page: u64, k: u32) -> i32 {
     if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
-        let claims = IMAGE_PAGES.0.borrow();
-        let Some(idxs) = claims.get(&page) else {
-            return -1;
-        };
+        // Under KLOCK: `IMAGE_PAGES` is written at runtime by streaming closures.
         return with_host(|h| {
+            let claims = IMAGE_PAGES.0.borrow();
+            let Some(idxs) = claims.get(&page) else {
+                return -1;
+            };
             idxs.iter()
                 .filter(|i| image_is_ours(h, **i))
                 .nth(k as usize)
@@ -3401,11 +3659,13 @@ fn current_image_program(h: &Host) -> Option<String> {
 /// page. This prints the candidates and what each answers. See #136.
 #[no_mangle]
 pub extern "C" fn gex_explain_page(page: u64) {
-    let claims = IMAGE_PAGES.0.borrow();
-    let idxs = claims.get(&page).cloned().unwrap_or_default();
-    let tables = IMAGE_TABLE.0.borrow();
-    let progs = LIB_PROGRAM.0.borrow();
     with_host(|h| {
+        // Under KLOCK: these three maps are written at runtime by
+        // `gex_add_closure_module` on other Workers' fill paths.
+        let claims = IMAGE_PAGES.0.borrow();
+        let idxs = claims.get(&page).cloned().unwrap_or_default();
+        let tables = IMAGE_TABLE.0.borrow();
+        let progs = LIB_PROGRAM.0.borrow();
         let have = current_image_program(h);
         let mut s = format!(
             "[gex] page {page}: running {:?}, {} candidate(s):",
@@ -3477,7 +3737,14 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len
     // arming on instantiate would deadlock (nothing armed -> no miss asks ->
     // nothing instantiates). `fillSlot` instantiates it on the way.
     FILL_POSSIBLE.store(true, std::sync::atomic::Ordering::Relaxed);
-    {
+    // Under KLOCK: closure libraries stream in AFTER the process is up and the
+    // guest (with its threads) is running (see `installClosureModule`), so these
+    // `SingleThreaded<RefCell>` maps are written here while other Workers read
+    // them on the dispatch-miss path (`gex_closure_owner`, `gex_page_table`,
+    // `gex_lib_lazy`). Unlocked, that read-vs-write races the BTreeMaps'
+    // structure -- the true-parallelism stack smash. Those readers lock the same
+    // way. `with_host` is re-entrant, so nesting is fine.
+    with_host(|_| {
         let idx = CLOSURE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
         let program = std::str::from_utf8(shim_slice(prog, prog_len))
             .unwrap_or("")
@@ -3551,7 +3818,7 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len
             }
             LIB_LAZY.0.borrow_mut().insert(idx as u32);
         }
-    }
+    });
     // Registered, not published. See `gex_publish_closure_module`.
     0
 }
@@ -3648,7 +3915,8 @@ static IMAGE_HIGH: SingleThreaded<[u32; gex_abi::DISPATCH_TABLES]> =
 /// Where this process may start handing out slots in table `i`.
 #[no_mangle]
 pub extern "C" fn gex_claim_floor(i: u32) -> u32 {
-    IMAGE_HIGH.0.borrow().get(i as usize).copied().unwrap_or(0)
+    // Under KLOCK: `IMAGE_HIGH` is written at runtime by streaming closures.
+    with_host(|_| IMAGE_HIGH.0.borrow().get(i as usize).copied().unwrap_or(0))
 }
 
 /// Whether pages are numbered by this process or by the build.
@@ -3682,7 +3950,8 @@ static LIB_LAZY: SingleThreaded<std::collections::BTreeSet<u32>> =
 /// long its table must be before instantiating it.
 #[no_mangle]
 pub extern "C" fn gex_lib_lazy(idx: u32) -> i32 {
-    LIB_LAZY.0.borrow().contains(&idx) as i32
+    // Under KLOCK: `LIB_LAZY` is written at runtime by streaming closures.
+    with_host(|_| LIB_LAZY.0.borrow().contains(&idx) as i32)
 }
 
 /// Which dispatch table `gexc` built each closure page for.
@@ -3696,26 +3965,31 @@ pub extern "C" fn gex_page_table(page: u64) -> i32 {
     if !claim_pages() {
         return -1;
     }
-    // An image page belongs to whichever root of the closure this process is
-    // actually running, so it is looked up by module and not by page alone.
-    if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
-        let owner = gex_closure_owner(page);
-        if owner < 0 {
-            return -1;
+    // Whole body under KLOCK: `CLOSURE_TABLE`/`IMAGE_TABLE` are written at runtime
+    // by streaming closures (`gex_add_closure_module`) while this runs on every
+    // Worker's fill path. `gex_closure_owner` also takes KLOCK -- re-entrant.
+    with_host(|_| {
+        // An image page belongs to whichever root of the closure this process is
+        // actually running, so it is looked up by module and not by page alone.
+        if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+            let owner = gex_closure_owner(page);
+            if owner < 0 {
+                return -1;
+            }
+            return IMAGE_TABLE
+                .0
+                .borrow()
+                .get(&(owner as usize, page))
+                .map(|t| *t as i32)
+                .unwrap_or(-1);
         }
-        return IMAGE_TABLE
+        CLOSURE_TABLE
             .0
             .borrow()
-            .get(&(owner as usize, page))
+            .get(&page)
             .map(|t| *t as i32)
-            .unwrap_or(-1);
-    }
-    CLOSURE_TABLE
-        .0
-        .borrow()
-        .get(&page)
-        .map(|t| *t as i32)
-        .unwrap_or(-1)
+            .unwrap_or(-1)
+    })
 }
 
 /// Which dispatch table `gexc` built each image page for, per image. Separate
@@ -3724,25 +3998,66 @@ pub extern "C" fn gex_page_table(page: u64) -> i32 {
 static IMAGE_TABLE: SingleThreaded<std::collections::BTreeMap<(usize, u64), u32>> =
     SingleThreaded(std::cell::RefCell::new(std::collections::BTreeMap::new()));
 
-/// Give a page a base in this process's numbering and write its entry.
-///
-/// The caller has already grown the table, so `base` is a slot span nothing
-/// else holds. Returns the entry written.
+/// Per-table base allocator, shared by all of a process's Worker threads (a
+/// shim static lives in the shared linear memory; a `fork` copies it, so it is
+/// per process). Numbering MUST be process-wide, not per-Worker: the dispatch
+/// directory it fills is process-wide, and a per-Worker counter (the old
+/// JS-side `#claimed`) let two threads claiming the same fresh page pick
+/// *divergent* bases -- the loser of the directory write then dispatched that
+/// page through a slot its own table had filled with a different page's block,
+/// running wrong code against the live guest stack. That is the intermittent
+/// multithreaded-GTK stack smash, which only reproduced under true parallelism
+/// and vanished under any slowdown (the claim then serialised).
+static CLAIM_NEXT: [std::sync::atomic::AtomicU32; gex_abi::DISPATCH_TABLES] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; gex_abi::DISPATCH_TABLES];
+
+/// Number a page in this process's directory and return its base slot, doing it
+/// atomically so a concurrent claim of the *same* page cannot hand two threads
+/// two different bases. If another thread numbered it first its base is adopted
+/// and the range this thread reserved is left unused (harmless: nothing maps to
+/// it). The caller grows its own (per-instance) table to cover the base.
 #[no_mangle]
-pub extern "C" fn gex_claim_page(page: u64, base: u32) -> u32 {
+pub extern "C" fn gex_claim_page(page: u64) -> u32 {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
     let table = match gex_page_table(page) {
-        t if t >= 0 => t as u32,
+        t if t >= 0 => t as usize,
         _ => return 0,
     };
-    let entry = gex_abi::dispatch_entry(table as usize, base);
-    dir_note(page, entry, "claim-page");
-    with_host(|h| {
-        h.jit.page_table.assign(page, entry);
-        let mut gm = GuestMem::new(guest_bytes());
-        let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, entry);
-    });
-    CLOSURE_DIRS.0.borrow_mut().push((page, entry));
-    entry
+    // The directory word as an atomic in the shared linear memory. The guest
+    // address space starts at linear address 0 (see `guest_bytes`), so the
+    // guest address is the native address; `with_exposed_provenance` keeps LLVM
+    // from folding it to a null-derived pointer.
+    let addr = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+    let dir = unsafe {
+        &*(std::ptr::with_exposed_provenance::<u32>(addr)
+            as *const std::sync::atomic::AtomicU32)
+    };
+    let existing = dir.load(Acquire);
+    if existing != 0 {
+        return existing & gex_abi::DISPATCH_SLOT_MASK;
+    }
+    // Keep the counter at or above this table's floor: image slots and the
+    // reserved miss span sit below it, and base 0 is the "no translation"
+    // sentinel the branchless lookup relies on.
+    let floor = gex_claim_floor(table as u32).max(gex_abi::MISS_SLOTS as u32);
+    CLAIM_NEXT[table].fetch_max(floor, AcqRel);
+    let base = CLAIM_NEXT[table].fetch_add(gex_abi::SLOTS_PER_PAGE as u32, AcqRel);
+    let entry = gex_abi::dispatch_entry(table, base);
+    match dir.compare_exchange(0, entry, AcqRel, Acquire) {
+        Ok(_) => {
+            dir_note(page, entry, "claim-page");
+            // Under KLOCK: `page_table` and `CLOSURE_DIRS` are process state two
+            // Workers must not push to at once (the second race the audit found).
+            with_host(|h| {
+                h.jit.page_table.assign(page, entry);
+                CLOSURE_DIRS.0.borrow_mut().push((page, entry));
+            });
+            base
+        }
+        // Another thread numbered it first between our load and CAS: adopt its
+        // base, drop our reserved range.
+        Err(won) => won & gex_abi::DISPATCH_SLOT_MASK,
+    }
 }
 
 /// The dispatch page whose directory writes should be narrated, or -1.
@@ -3829,12 +4144,18 @@ pub extern "C" fn gex_add_lazy_module(ptr: u32, len: u32) -> u32 {
 /// The inherited module covering this page, or -1.
 #[no_mangle]
 pub extern "C" fn gex_lazy_owner(page: u64) -> i32 {
-    LAZY_OWNER
-        .0
-        .borrow()
-        .get(&page)
-        .map(|v| *v as i32)
-        .unwrap_or(-1)
+    // Under KLOCK: `gex_register_module` writes `LAZY_OWNER` (a BTreeMap) at
+    // runtime as lazy modules install, and this read is on the dispatch-miss
+    // path of every Worker -- an unlocked `borrow()` racing that `borrow_mut()`
+    // reads the tree mid-rebalance and follows a stale node pointer.
+    with_host(|_| {
+        LAZY_OWNER
+            .0
+            .borrow()
+            .get(&page)
+            .map(|v| *v as i32)
+            .unwrap_or(-1)
+    })
 }
 
 /// Throw away a forked child's inherited dispatch directory and put back only
@@ -3913,17 +4234,22 @@ static FILL_PENDING: std::sync::atomic::AtomicI64 =
 pub extern "C" fn gex_fill_possible(on: i32) {
     FILL_POSSIBLE.store(on != 0, std::sync::atomic::Ordering::Relaxed);
     if on != 0 {
-        let failed = std::mem::take(&mut *FILL_FAILED.0.borrow_mut());
-        let mut asked = FILL_ASKED.0.borrow_mut();
-        let spans = gex_abi::SLOTS_PER_PAGE as u64
-            / FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed) as u64;
-        for page in failed {
-            // Every span of it: the module that has just arrived may cover
-            // parts of the page this one could not.
-            for i in 0..spans {
-                asked.remove(&(page * spans + i));
+        // Under KLOCK: these two `SingleThreaded<RefCell<BTreeSet>>` are mutated
+        // by `gex_dispatch_miss` on other Workers at the same time; a lock-free
+        // `borrow_mut` here races the tree structure. See the note at the miss.
+        with_host(|_| {
+            let failed = std::mem::take(&mut *FILL_FAILED.0.borrow_mut());
+            let mut asked = FILL_ASKED.0.borrow_mut();
+            let spans = gex_abi::SLOTS_PER_PAGE as u64
+                / FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed) as u64;
+            for page in failed {
+                // Every span of it: the module that has just arrived may cover
+                // parts of the page this one could not.
+                for i in 0..spans {
+                    asked.remove(&(page * spans + i));
+                }
             }
-        }
+        });
     }
 }
 
@@ -3974,7 +4300,8 @@ pub extern "C" fn gex_fill_wanted() -> i64 {
 pub extern "C" fn gex_fill_done(ok: i32) {
     let page = FILL_PENDING.swap(-1, std::sync::atomic::Ordering::Relaxed);
     if ok == 0 && page >= 0 {
-        FILL_FAILED.0.borrow_mut().insert(page as u64);
+        // Under KLOCK: shared with the miss path's `FILL_ASKED`/`FILL_FAILED`.
+        with_host(|_| FILL_FAILED.0.borrow_mut().insert(page as u64));
     }
     FILL_WANTED.store(-1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -4046,9 +4373,39 @@ pub extern "C" fn gex_paused_for_host() -> i32 {
     with_host(|h| (paused() & 4 != 0) as i32)
 }
 
-#[no_mangle]
-/// The wake counter as it read when this Worker last looked at its threads.
-static WAKE_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+thread_local! {
+    /// Persistence guard for the all-blocked deadlock verdict: `(wake seq at the
+    /// last all-blocked observation, how many in a row with that seq unchanged)`.
+    /// A real deadlock bumps the wake counter never again -- every thread is
+    /// parked and nothing runs a syscall -- so the seq stays put and the count
+    /// climbs. A transient all-blocked instant during startup (eight threads
+    /// hitting one `pthread_once`, a wake in flight but not yet marked) keeps
+    /// bumping the seq, which resets the count. Only a run of `DEADLOCK_CONFIRM`
+    /// observations at one frozen seq is a real hang, so a storm is never
+    /// mistaken for one and the process is not killed out from under it.
+    static DEADLOCK_WATCH: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// How many consecutive all-blocked schedules at an unchanged wake seq before the
+/// deadlock is called real. Each is a park cycle apart, so this is a fraction of
+/// a second of genuinely no wake anywhere -- long past any startup storm, short
+/// enough that a real deadlock is still reported promptly.
+const DEADLOCK_CONFIRM: u32 = 32;
+
+thread_local! {
+    /// The wake counter as it read when THIS Worker last looked at its threads.
+    ///
+    /// Per-Worker, and that is load-bearing. A plain `static` lives in the
+    /// shared memory, so every Worker of a process reads and writes the same
+    /// word: one Worker's `schedule` could store a seq that already folds in a
+    /// wake meant for a *different* Worker's thread, and that other Worker then
+    /// parks on it (`gex_park` reads the same word) and sleeps through its own
+    /// wake. That was the residual worker-per-thread hang -- the last runnable
+    /// thread left `runnable` while its Worker sat parked on a seq a sibling had
+    /// advanced. A thread-local gives each Worker its own baseline: it parks on
+    /// the seq *it* last saw, so a bump by anyone since is a wake it returns for.
+    static WAKE_SEEN: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
 
 /// Whether a pending signal makes a parked thread runnable. See `thread_ready`.
 /// A constant so bisecting can flip it in one build; measured off, the wedge is
@@ -4289,7 +4646,7 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
     // zero-nanosecond wait returns at once, spinning the Worker. A
     // Worker-ended wait is still immediate via its notify.
     ns = ns.max(1_000_000);
-    unsafe { k_park(WAKE_SEEN.load(std::sync::atomic::Ordering::Relaxed), ns as i64) }
+    unsafe { k_park(WAKE_SEEN.with(|w| w.get()), ns as i64) }
 }
 
 #[no_mangle]
@@ -4720,6 +5077,43 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
         let ret = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         sys_ret(slot, ret);
+        // A process raising SIGABRT (`abort()`, a fortify/stack-check trap, a
+        // caught fatal signal) prints nothing of its own if the message path is
+        // gone, so name who did it: the stack from the raiser holds `abort`'s
+        // saved return address (its caller), and x30 the nearest frame -- enough
+        // to say which library and function a silent abort came from.
+        {
+            use gex_kernel::syscalls::nr as knr;
+            let is_kill = matches!(nr, knr::KILL | knr::TKILL | knr::TGKILL);
+            let sig = if nr == knr::TGKILL { a2 } else { a1 };
+            if is_kill && sig == 6 {
+                let sp = gm.read_u64(kstate.ctx_addr + ctx::SP as u64).unwrap_or(0);
+                let x30 = gm.read_u64(kstate.ctx_addr + ctx::x(30) as u64).unwrap_or(0);
+                let mut bt = String::new();
+                for i in 0..80u64 {
+                    let w = gm.read_u64(sp + i * 8).unwrap_or(0);
+                    let o = object_name_at(h, w);
+                    if o.contains(".so") || o.starts_with('/') {
+                        bt.push_str(&format!("\n    [sp+{:#x}] {w:#x} {o}", i * 8));
+                    }
+                }
+                warn_line(&format!(
+                    "gex: SIGABRT raised by pid {} x30={x30:#x} {}, stack refs:{bt}\n",
+                    h.kernel.pid,
+                    object_name_at(h, x30),
+                ));
+            }
+        }
+        // Relay every futex this syscall woke to the shared per-address counter,
+        // so a waiter parked in another Worker sees the wake exactly rather than
+        // by re-reading a word that may have changed back. Covers a FUTEX_WAKE, a
+        // thread exit clearing its tid, a robust-list wake -- all go through the
+        // kernel's `FutexTable::wake`, which recorded them.
+        if unsafe { k_present() } != 0 {
+            for addr in h.kernel.futexes.take_woken() {
+                unsafe { k_futex_wake(addr) };
+            }
+        }
         if is_mem_call(nr) {
             mem_note(nr, a0, a1, ret);
         }
@@ -4857,8 +5251,14 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 });
                 // From here the process has a second Worker, so translated
                 // modules must be kept for it to catch up. Until now they were
-                // not (see `gex_jit_installed`).
-                h.jit.ever_threaded = true;
+                // not (see `gex_jit_installed`) -- so on this first edge, take
+                // back into the registry everything already installed, or a
+                // joining thread traps in the low startup pages the main Worker
+                // lifted before this clone (see `backfill_registry`).
+                if !h.jit.ever_threaded {
+                    backfill_registry(h);
+                    h.jit.ever_threaded = true;
+                }
                 stage_thread(tid, ctx_addr, start);
                 // The stack goes back so the host can see the record and
                 // start the Worker, exactly as a `fork` does. The parent
@@ -4877,9 +5277,28 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         table,
                         uaddr,
                         deadline,
-                        ..
+                        parked,
+                        val,
                     } => Waiting::Futex {
-                        parked: table.park(*uaddr),
+                        val: *val,
+                        // The shared generation of this address, sampled now --
+                        // BEFORE parking but AFTER the kernel checked the word,
+                        // which is fine: a wake landing between the check and here
+                        // bumps the counter, so the first re-check sees the change.
+                        // (A wake between the word-check and the *kernel's*
+                        // snapshot is caught by `parked`, taken before the check.)
+                        wake_gen: if unsafe { k_present() } != 0 {
+                            unsafe { k_futex_gen(*uaddr) }
+                        } else {
+                            0
+                        },
+                        // The place the kernel snapshotted BEFORE it checked the
+                        // word -- using it (not a fresh `park` here, after the
+                        // check) is what stops a wake between the check and the
+                        // park from being lost. Falls back to a fresh park only
+                        // if the kernel gave none, which it always does for a
+                        // real FUTEX_WAIT.
+                        parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
                         deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
                     },
                     gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
@@ -5208,6 +5627,10 @@ fn stage_fork_fds(h: &Host, child: i32) {
         if let Some(id) = pipe_id(&file.path) {
             let write = file.writable;
             unsafe { k_pipe_open_end(id, write as i32, child) };
+        } else if let Some((id, master)) = pty_ref(&file.path) {
+            // The child inherits this pty end; open it on the child's behalf so
+            // the parent's copy closing is not the last reference.
+            unsafe { k_pty_open_end(id, master as i32, child) };
         } else if let Some(id) = file.handle.remote_id() {
             let dup = unsafe { k_fs_dup(id) };
             if dup < 0 {
@@ -5254,6 +5677,13 @@ fn console_handle(path: &str) -> Option<(Arc<dyn FileHandle>, bool, bool)> {
 /// The pipe id in a path like `pipe:[7]`, if that is what it is.
 fn pipe_id(path: &str) -> Option<i32> {
     path.strip_prefix("pipe:[")?.strip_suffix(']')?.parse().ok()
+}
+
+/// The `(id, master)` in a pty path like `pty:[3:m]` / `pty:[3:s]`.
+fn pty_ref(path: &str) -> Option<(i32, bool)> {
+    let inner = path.strip_prefix("pty:[")?.strip_suffix(']')?;
+    let (id, side) = inner.split_once(':')?;
+    Some((id.parse().ok()?, side == "m"))
 }
 
 /// Where the child's descriptor table is staged, and how long it is.
@@ -5322,6 +5752,16 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                     flags,
                     !write,
                     write,
+                )
+            } else if let Some((id, master)) = pty_ref(path) {
+                // Same as a pipe end: the parent already opened it for the child.
+                let Some(r) = global_ptys() else { continue };
+                gex_kernel::file::OpenFile::new(
+                    Arc::new(gex_kernel::pty::RemotePty { id, master, remote: r }),
+                    path.to_string(),
+                    flags,
+                    true,
+                    true,
                 )
             } else if let Some(id) = path.strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
                 // An id the parent already asked the global kernel to
@@ -5553,6 +5993,25 @@ static THREAD: [std::sync::atomic::AtomicU64; 3] =
 // the trade -- see `gex_thread_stage` and the host's side of it.
 
 fn stage_thread(tid: i32, ctx_addr: u64, pc: u64) {
+    // One slot, shared by every Worker. A second clone must not overwrite a
+    // triple the claiming Worker has not finished reading: `gex_thread_pending`
+    // takes the tid and *then* the two context words, so an overwrite in that
+    // window hands a thread the wrong `ctx`/`pc` -- a Worker running a stranger's
+    // registers, which is exactly the wild-branch crash GTK's startup (several
+    // threads spawned at once) hit. So wait for the slot to be claimed (tid back
+    // to 0) before staging the next; the claim is quick (the clone syscall
+    // returns straight to the JS that reads it), so this spins rarely and
+    // briefly. Bounded only to turn a never-claimed slot into a loud message
+    // rather than a silent hang under `KLock`.
+    let mut spins: u64 = 0;
+    while THREAD[0].load(std::sync::atomic::Ordering::Acquire) != 0 {
+        core::hint::spin_loop();
+        spins += 1;
+        if spins == 1 << 30 {
+            warn_line("gex: stage_thread: prior thread slot never claimed\n");
+            break;
+        }
+    }
     THREAD[1].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     THREAD[2].store(pc, std::sync::atomic::Ordering::Relaxed);
     // Last, because it is what the host tests.
@@ -5574,16 +6033,34 @@ thread_local! {
 /// prevent. The swap is what makes exactly one of them win.
 #[no_mangle]
 pub extern "C" fn gex_thread_pending() -> i32 {
-    let tid = THREAD[0].swap(0, std::sync::atomic::Ordering::AcqRel) as i32;
-    if tid != 0 {
-        CLAIMED_THREAD.with(|c| {
-            c.set((
-                THREAD[1].load(std::sync::atomic::Ordering::Relaxed),
-                THREAD[2].load(std::sync::atomic::Ordering::Relaxed),
-            ))
-        });
+    loop {
+        let tid = THREAD[0].load(std::sync::atomic::Ordering::Acquire);
+        if tid == 0 {
+            return 0;
+        }
+        // Read the context words BEFORE claiming, then claim with a
+        // compare-and-swap that also proves the tid did not change while they
+        // were read. `stage_thread` will not overwrite a slot whose tid is still
+        // set, so a successful swap means these two words are this tid's; a
+        // failed one means another Worker claimed it (or a stale re-read) --
+        // retry. This is the claim that keeps a Worker off a stranger's
+        // registers; the swap alone (tid first, words after) let a racing stage
+        // slip its own words in between.
+        let ctx = THREAD[1].load(std::sync::atomic::Ordering::Relaxed);
+        let pc = THREAD[2].load(std::sync::atomic::Ordering::Relaxed);
+        if THREAD[0]
+            .compare_exchange(
+                tid,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            CLAIMED_THREAD.with(|c| c.set((ctx, pc)));
+            return tid as i32;
+        }
     }
-    tid
 }
 
 #[no_mangle]
@@ -5678,10 +6155,20 @@ pub extern "C" fn gex_adopt_child(
     }
     kernel.pipes = global_pipes();
     kernel.unix_remote = global_sockets();
+    kernel.ptys = global_ptys();
     kernel.tty = global_tty();
     install_console(&mut kernel);
     kernel.pid = pid;
     kernel.tid = pid;
+    // The main thread's tid is the pid, but `next_tid` (which numbers cloned
+    // threads) was inherited from the parent and is typically 2. A forked child
+    // at pid N that then spawns >= N-1 threads would hand a clone tid == N, a
+    // DUPLICATE of the main thread's tid. Thread lookups go by tid
+    // (`position(|t| t.kstate.tid == tid)`), so a duplicate makes an operation
+    // for one thread land on the other's register context -- two threads driven
+    // through one ctx, wild stores, the SMP stack smash GTK's multi-threaded
+    // startup hit (issue #126). Number clones strictly above the main tid.
+    kernel.next_tid = kernel.next_tid.max(pid + 1);
     PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
     // Before anything opens a descriptor: the child rebuilds its fd table
     // before its first syscall, and if `MY_PID` were still unset every
@@ -5695,7 +6182,7 @@ pub extern "C" fn gex_adopt_child(
     }
     // And the per-process mounts that are not files: without them a child has
     // no `/dev/null` to redirect into and no `/proc/self/maps` for libc.
-    let virgl = mount_devices(&mut kernel);
+    let (virgl, wayland) = mount_devices(&mut kernel);
     let proc_state = mount_procfs(&mut kernel);
     // The parent's working directory, now that the root is mounted so `set_cwd`
     // can confirm the target exists; else the child resolves relative paths
@@ -5712,6 +6199,7 @@ pub extern "C" fn gex_adopt_child(
         magic_head: HOST_MAGIC,
         kernel,
         virgl,
+        wayland,
         root: Arc::new(gex_kernel::vfs::TmpFs::new()),
         proc_state,
         // The child is one thread: `fork` does not carry the parent's others
@@ -5804,6 +6292,10 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
     unsafe {
         if k_present() != 0 {
             k_pipe_forget(pid);
+            // A pty end held open (a shell exiting without closing its slave)
+            // otherwise strands the master: the reader never sees EOF. And a
+            // master gone this way must hang the slave up.
+            k_pty_forget(pid);
         }
     }
     h.kernel.procs.exit(pid, code);
@@ -6761,6 +7253,51 @@ fn shared_modules_of_object(h: &Host, obj: u64) -> Vec<(u32, u64, Vec<(u64, u32)
     out
 }
 
+/// Fill the registry with every module this process has already installed, so
+/// a thread that joins next can `#catchUp` on the code the main Worker built
+/// *before* the first `clone`.
+///
+/// The registry is what a joining Worker replays into its own tables (its
+/// tables are per-instance; only the dispatch *directory* is shared). Until a
+/// process threads, nothing is kept -- a single-threaded `apt` would otherwise
+/// hold ~1,640 modules against a fixed heap (#140) -- so `gex_jit_installed`
+/// gates the keep on `ever_threaded`. That gate means every module lifted
+/// before the first thread spawned is missing from the registry: the main
+/// Worker installed it in *its* tables and wrote the shared directory to point
+/// there, but a joining Worker replays an empty registry, leaves its tables
+/// bare, and the first branch into a pre-spawn page (musl/pthread startup sits
+/// in the low image pages every thread runs) reads the populated directory and
+/// traps on an empty slot -- "table index out of bounds, 0 modules installed".
+///
+/// Called once, at the `false -> true` edge of `ever_threaded`: the bytes are
+/// still in the shared store (`share_module` put them there for any sibling to
+/// install), so we read each installed id back and keep it. Duplicates are
+/// impossible because the registry is empty until this runs -- the keep was
+/// gated off -- and every later module is a fresh id pushed by
+/// `gex_jit_installed`.
+fn backfill_registry(h: &mut Host) {
+    if unsafe { k_present() } == 0 {
+        return;
+    }
+    let ids: Vec<u32> = h.jit.installed_mods.iter().copied().collect();
+    for id in ids {
+        // SAFETY: `k_mod_len` sizes the buffer the `k_mod_read` below fills;
+        // the kernel refuses rather than overruns when the two disagree.
+        let len = unsafe { k_mod_len(id) } as usize;
+        if len == 0 {
+            continue;
+        }
+        let mut wasm = vec![0u8; len];
+        if unsafe { k_mod_read(id, wasm.as_mut_ptr() as u32, len as u32) } as usize != len {
+            continue;
+        }
+        wasm.shrink_to_fit();
+        #[cfg(feature = "shared-memory")]
+        REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        h.jit.registry.push(wasm);
+    }
+}
+
 /// The shared module holding this page's code, if there is one and this
 /// Worker has not installed it: `(id, slots, dirs, wasm)`.
 fn shared_module_at(
@@ -6909,8 +7446,37 @@ fn thread_ready(t: &Thread, now: u64, signalled: bool) -> bool {
     }
     match &t.waiting {
         Waiting::Runnable => true,
-        Waiting::Futex { parked, deadline } => {
-            parked.woken() || deadline.is_some_and(|d| now >= d)
+        Waiting::Futex { parked, deadline, val, wake_gen } => {
+            // Four ways this wait ends. `woken()` is a same-Worker wake; the
+            // deadline is a timed wait. The third is the CROSS-Worker wake, made
+            // exact: the shared per-address generation is bumped by every
+            // `FUTEX_WAKE` (relayed after the waking syscall), so a change since
+            // `wake_gen` is a wake that happened, whatever the word now reads --
+            // which is what a thread pool sharing one condvar needs, its counter
+            // often back at `val` before a woken worker is scheduled.
+            //
+            // The word re-read is ONLY a lone-process fallback (no global kernel,
+            // so no shared generation to consult), and gating it on that is
+            // load-bearing for a threaded process: a plain read of the guest word
+            // carries no synchronisation, so a Worker that is scheduling (not
+            // parked on the wake atomic) could see the word changed and resume
+            // the thread without the acquire the wake atomic would have given it
+            // -- and then read other stores the waker made *before* the change
+            // as stale. That is exactly a lost `pthread_join` return: the exiting
+            // thread writes `result` then clears its tid, and a joiner resumed by
+            // the bare tid re-read saw the tid zero but `result` still zero. With
+            // a global kernel every real futex wake goes through `FutexTable::wake`
+            // -> `woken()` (set under `KLock`) and the relayed generation, both
+            // properly ordered, so the re-read adds nothing but the hazard.
+            parked.woken()
+                || deadline.is_some_and(|d| now >= d)
+                || (unsafe { k_present() } != 0
+                    && unsafe { k_futex_gen(parked.addr()) } != *wake_gen)
+                || (unsafe { k_present() } == 0
+                    && GuestMem::new(guest_bytes())
+                        .read_u32(parked.addr())
+                        .map(|w| w != *val)
+                        .unwrap_or(false))
         }
         Waiting::Sleep(d) => now >= *d,
         Waiting::Read(handle) => handle.poll_readable(),
@@ -6978,8 +7544,9 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
     let over = with_host_free(|h| h.exit.is_some()).unwrap_or(false);
     let text = with_host_free(|h| {
         let mut s = format!(
-            "pid {} paused={why:#x} resume={resume:#x} exited={over}:",
-            h.kernel.pid
+            "pid {} worker-runs-t{} paused={why:#x} resume={resume:#x} exited={over}:",
+            h.kernel.pid,
+            cur(),
         );
         for (i, t) in h.threads.iter().enumerate() {
             s.push_str(&format!(" t{i}={}@{:#x}", waiting_name(&t.waiting), t.pc));
@@ -6988,7 +7555,25 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
             if matches!(t.waiting, Waiting::Runnable) {
                 let gm = GuestMem::new(guest_bytes());
                 let live = gm.read_u64(t.kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
-                s.push_str(&format!("[live={live:#x}]"));
+                // Also the file offset within the object, so `addr2line` can name
+                // the exact function a runnable-but-frozen thread is stuck in.
+                let foff = h
+                    .kernel
+                    .mem
+                    .vmas()
+                    .iter()
+                    .find(|v| live >= v.start && live < v.end)
+                    .and_then(|v| v.code.as_ref().map(|(_, off)| off + (live - v.start)));
+                s.push_str(&format!(
+                    "[live={live:#x} {}+{:#x}]",
+                    object_name_at(h, live),
+                    foff.unwrap_or(0)
+                ));
+            }
+            // Name a futex park's object too, so a deadlock says which lib's
+            // lock each side is on.
+            if let Waiting::Futex { parked, .. } = &t.waiting {
+                s.push_str(&format!("[{}]", object_name_at(h, parked.addr())));
             }
             // Not just "read" but what it is reading -- the question when two
             // processes wait for each other.
@@ -7005,6 +7590,10 @@ pub extern "C" fn gex_wait_census(out: u32, max: u32) -> u32 {
                 s.push_str(&format!("(want {want})"));
             }
         }
+        // This Worker's recent futex traffic (op 0=wait 1=wake), so t0's wakes
+        // can be checked against the address t1 parked on.
+        s.push_str(" ftx:");
+        s.push_str(&ftx_recent());
         s
     })
     .unwrap_or_else(|| "pid ?: the kernel is held".to_string());
@@ -7127,7 +7716,7 @@ fn schedule() -> i32 {
     // be slept through. `gex_park` sleeps only while the counter is still
     // this, and a bump between here and there makes the sleep return at once.
     if unsafe { k_present() } != 0 {
-        WAKE_SEEN.store(unsafe { k_wake_seq() }, std::sync::atomic::Ordering::Relaxed);
+        WAKE_SEEN.with(|w| w.set(unsafe { k_wake_seq() }));
     }
     // Unconditional and at the top: every other counter sits on a path that
     // can be missed, and this is the last place everything passes through. If
@@ -7148,6 +7737,17 @@ fn schedule() -> i32 {
         // blocks on the reply, so the renderer must run in between -- here, the
         // one place every thread passes through on its way to waiting.
         with_host(|h| h.virgl.clone()).map(|v| v.pump());
+        // The compositor, on the same terms and in the same place: a wayland
+        // client writes a request then blocks on the reply, so it must run
+        // here. Needs the kernel (to find a buffer's shared mapping) and guest
+        // memory (the pixels), so it pumps inside `with_host`; the device is a
+        // cheap Arc clone that aliases none of the host's mutable state.
+        with_host(|h| {
+            if let Some(w) = h.wayland.clone() {
+                let gm = GuestMem::new(guest_bytes());
+                w.pump(&h.kernel, &gm);
+            }
+        });
         let pick = with_host(|h| {
             // Every thread gone ends this process, all this Worker has; the
             // status is in the shared table for whoever waits.
@@ -7271,10 +7871,43 @@ fn schedule() -> i32 {
                 return 2;
             }
             if with_host(|h| {
+                let now = now_ns();
+                let sig = any_signal(h);
+                // Every thread parked on a futex AND not one of them already
+                // woken. The readiness test is load-bearing: a `FUTEX_WAKE` from
+                // a sibling marks its waiter `woken` (or bumps the shared
+                // generation) but leaves `waiting` as `Futex` until the thread is
+                // picked, so a check on the variant alone counts an already-woken
+                // thread as blocked. During thread startup that is exactly the
+                // window -- one thread runs a `pthread_once` init and wakes the
+                // others, which sit `Futex`-typed-but-woken for an instant -- and
+                // declaring deadlock there killed the process's Workers ("nothing
+                // could wake it") while a wake was in hand. `thread_ready` sees
+                // the wake, so a ready thread means this is not a deadlock: fall
+                // through, let its Worker pick it, and only the genuinely
+                // all-blocked case (no thread ready) reaches the report below.
                 h.threads
                     .iter()
                     .all(|t| matches!(t.waiting, Waiting::Futex { deadline: None, .. }))
-            }) {
+                    && !h.threads.iter().any(|t| thread_ready(t, now, sig))
+            }) && {
+                // Confirm it persists before acting. A single all-blocked instant
+                // is not a deadlock -- during startup one is routine -- so require
+                // a run of them at a wake seq that never moves (a real deadlock
+                // runs no more syscalls, so nothing bumps the counter). A moved
+                // seq resets the count: something woke, so progress is possible.
+                let seq = if unsafe { k_present() } != 0 {
+                    unsafe { k_wake_seq() }
+                } else {
+                    0
+                };
+                DEADLOCK_WATCH.with(|w| {
+                    let (last, n) = w.get();
+                    let n = if n > 0 && last == seq { n + 1 } else { 1 };
+                    w.set((seq, n));
+                    n >= DEADLOCK_CONFIRM
+                })
+            } {
                 // Every remaining thread parked on a futex nothing will wake.
                 // On Linux this hangs; saying which futex and where the guest
                 // stands turns it from a symptom into something to look up.
@@ -7746,7 +8379,42 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         with_host(|h| set_exit(h, 128 + 11));
         trap();
     }
-    trace_line(&format!("gex: breakpoint at pc={pc:#x}\n"));
+    // A bare `brk` is almost always glibc's `abort()` (the trap it ends on when
+    // `raise(SIGABRT)` returns) or a compiler `__builtin_trap`. Name where it
+    // was reached from and walk the stack a little, so a crash with no printed
+    // message (a corrupted call, a fortify failure) still says which library
+    // and which caller -- otherwise "breakpoint at pc" names only glibc's abort.
+    let line = with_host(|h| {
+        let gm = GuestMem::new(guest_bytes());
+        let c = h.threads[cur()].kstate.ctx_addr;
+        let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+        let x30 = gm.read_u64(c + ctx::x(30) as u64).unwrap_or(0);
+        let object = |a: u64| {
+            h.kernel
+                .mem
+                .vmas()
+                .iter()
+                .find(|v| a >= v.start && a < v.end)
+                .map_or(String::new(), |v| format!("{} +{:#x}", v.name, a - v.start))
+        };
+        // Stack words that look like a return address into some library's text:
+        // the caller of `abort` is saved on its frame, so this recovers it even
+        // though `x30` has been clobbered by the calls `abort` itself made.
+        let mut bt = String::new();
+        for i in 0..48u64 {
+            let w = gm.read_u64(sp + i * 8).unwrap_or(0);
+            let o = object(w);
+            if o.starts_with("/") || o.contains(".so") {
+                bt.push_str(&format!("\n  [sp+{:#x}] {w:#x} {o}", i * 8));
+            }
+        }
+        format!(
+            "gex: breakpoint (abort/trap) at pc={pc:#x} {}, x30={x30:#x} {}, sp={sp:#x}{bt}\n",
+            object(pc as u64),
+            object(x30),
+        )
+    });
+    trace_line(&line);
     with_host(|h| set_exit(h, 128 + 5));
     trap();
 }
@@ -8011,7 +8679,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let from = ((pc & 0xfff) >> 2) as u32 & !(width - 1);
         let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
         let key = page * spans as u64 + (from / width) as u64;
-        let fresh = FILL_ASKED.0.borrow_mut().insert(key);
+        // Under KLOCK: `FILL_ASKED` is a `SingleThreaded<RefCell<BTreeSet>>`, and
+        // with a Worker per thread this is entered concurrently. Two threads
+        // missing at once (the main thread and a dbus/gsettings worker, both
+        // faulting in glib/gobject closure pages) would `borrow_mut` and rebalance
+        // the tree simultaneously -- a data race that stores through a freed/moved
+        // node into unrelated linear memory, smashing a live stack. See
+        // `gex_fill_possible`/`gex_fill_done`, which now lock the same way.
+        let fresh = with_host(|_| FILL_ASKED.0.borrow_mut().insert(key));
         if fresh {
             FILL_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
             FILL_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
@@ -8057,7 +8732,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             let from = ((pc & 0xfff) >> 2) as u32 & !(width - 1);
             let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
             let key = page * spans as u64 + (from / width) as u64;
-            if FILL_ASKED.0.borrow().contains(&key) { 2 } else { 3 }
+            if with_host(|_| FILL_ASKED.0.borrow().contains(&key)) { 2 } else { 3 }
         };
         LIFT_WHY[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Keep the addresses of `why == 2` (a span the fill already answered):
@@ -8747,6 +9422,11 @@ const MAX_OBJECT_BLOCKS: usize = 4_000_000;
 /// Whether library substitution is on. See `gex_set_intrinsics`.
 static mut INTRINSICS_ON: bool = true;
 
+/// Per-family enable bits, for bisecting which substitution misbehaves.
+/// bit0 = memcpy/memmove/mempcpy, bit1 = memset, bit2 = memcmp. All on by
+/// default. See `gex_set_intrinsic_mask`.
+static mut INTRINSICS_MASK: u32 = 0xffff_ffff;
+
 /// Turn library substitution off, to price it.
 ///
 /// The same shape as `GEX_UNSAFE_NO_GUARD`: the only way to know what
@@ -8757,6 +9437,14 @@ static mut INTRINSICS_ON: bool = true;
 #[no_mangle]
 pub extern "C" fn gex_set_intrinsics(on: u32) {
     unsafe { INTRINSICS_ON = on != 0 }
+}
+
+/// Enable only some intrinsic families, to bisect which one corrupts memory.
+/// bit0 = memcpy family, bit1 = memset, bit2 = memcmp. `0xffffffff` = all
+/// (the default). Set before anything translates, alongside `gex_set_intrinsics`.
+#[no_mangle]
+pub extern "C" fn gex_set_intrinsic_mask(mask: u32) {
+    unsafe { INTRINSICS_MASK = mask }
 }
 
 /// Whether region `i` could be rebuilt by re-reading its file rather than
@@ -8806,7 +9494,18 @@ fn note_intrinsics(addr: u64) {
         let n = if pending { 1 } else { 8 };
         *h.jit.intrinsics_scanned.entry(path.clone()).or_insert(0) += n;
         let before = h.jit.intrinsics.len();
+        let mask = unsafe { INTRINSICS_MASK };
         for (a, k) in found {
+            let bit = match k {
+                gex_xlate::Intrinsic::MemCpy => 1,
+                gex_xlate::Intrinsic::MemSet => 2,
+                gex_xlate::Intrinsic::MemCmp => 4,
+                gex_xlate::Intrinsic::MemPCpy => 8,
+                gex_xlate::Intrinsic::MemMove => 16,
+            };
+            if mask & bit == 0 {
+                continue;
+            }
             h.jit.intrinsics.insert(a, k);
         }
         h.jit.intrinsics.len() - before
@@ -8862,10 +9561,13 @@ static LAST_OPEN: SingleThreaded<String> = SingleThreaded(const { RefCell::new(S
 /// How many bytes of it there are, written into the shim's own buffer.
 #[no_mangle]
 pub extern "C" fn gex_last_open(out: u32, max: u32) -> u32 {
-    let s = LAST_OPEN.0.borrow();
-    let n = s.len().min(max as usize);
-    shim_slice_mut(out, n as u32).copy_from_slice(&s.as_bytes()[..n]);
-    n as u32
+    // Under KLOCK: shares `LAST_OPEN` with the openat writer above.
+    with_host(|_| {
+        let s = LAST_OPEN.0.borrow();
+        let n = s.len().min(max as usize);
+        shim_slice_mut(out, n as u32).copy_from_slice(&s.as_bytes()[..n]);
+        n as u32
+    })
 }
 
 fn note_process_syscall(base: u64, pc: i64) {
@@ -8886,7 +9588,14 @@ fn note_process_syscall(base: u64, pc: i64) {
     // away.
     if n == nr::OPENAT {
         if let Ok(b) = gm.read_cstr(g(1), 256) {
-            *LAST_OPEN.0.borrow_mut() = String::from_utf8_lossy(&b).into_owned();
+            // Under KLOCK: `note_process_syscall` runs before `gex_syscall`'s
+            // own `with_host`, so this fires unlocked on EVERY openat of EVERY
+            // Worker. `LAST_OPEN` is one process-global `RefCell<String>`; two
+            // threads openat-ing at once both `borrow_mut` and realloc it -- a
+            // wild store (the residual browser stack smash, since the browser's
+            // true parallelism hits concurrent syscalls far more than node).
+            let path = String::from_utf8_lossy(&b).into_owned();
+            with_host(|_| *LAST_OPEN.0.borrow_mut() = path);
         }
     }
     if n != nr::CLONE && n != nr::EXECVE {
@@ -9323,6 +10032,15 @@ pub extern "C" fn gex_dispatch_tables() -> u32 {
 pub extern "C" fn gex_jit_installed() {
     with_host(|h| {
         let Some(done) = h.jit.pending.pop_front() else {
+            // Empty, but this Worker's published view may still name a module a
+            // sibling already took: the queue is shared between a process's
+            // Workers, so another can empty it between this one's peek and pop.
+            // Without re-publishing here, `gex_jit_pending_len` keeps returning
+            // the stale length and the JS install loop
+            // (`while (gex_jit_pending_len()) …`) spins forever on a module that
+            // is gone -- the thread never resumes and the process wedges. Clear
+            // the view (front is `None`, so this stores zero) and stop.
+            publish_pending(h);
             return;
         };
         let mut gm = GuestMem::new(guest_bytes());
@@ -9479,7 +10197,9 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
     let pid = my_pid();
     let n = unsafe {
         if k_present() != 0 {
-            k_pipe_forget(pid)
+            let n = k_pipe_forget(pid);
+            k_pty_forget(pid);
+            n
         } else {
             0
         }
@@ -9644,6 +10364,19 @@ pub extern "C" fn gex_set_trace_misses(on: i32) {
 #[no_mangle]
 pub extern "C" fn gex_set_check_sp(on: i32) {
     gex_xlate::set_check_sp(on != 0);
+}
+
+/// Diagnostic: emit `memcpy` as a forward byte loop instead of `memory.copy`.
+#[no_mangle]
+pub extern "C" fn gex_set_copy_loop(on: i32) {
+    gex_xlate::set_copy_loop(on != 0);
+}
+
+/// Experiment: emit guest scalar loads/stores as atomic-when-aligned so shared
+/// reads are coherent (V8 cannot hoist them across guest fences). Default off.
+#[no_mangle]
+pub extern "C" fn gex_set_coherent_loads(on: i32) {
+    gex_xlate::set_coherent_loads(on != 0);
 }
 
 /// Ask for a heartbeat every `every` safepoints.

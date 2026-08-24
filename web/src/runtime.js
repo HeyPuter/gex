@@ -323,6 +323,9 @@ export async function runProgram(
     network = null,
     onNetEvent = null,
     gl = null,
+    // A 2D canvas for the Wayland compositor to blit committed frames onto.
+    // Set for the xwayland/es2gears demo; drives the `wl-bridge` present path.
+    wl = null,
     virgl = null,
     uid,
     // Every N safepoints, print the guest pc -- the only instrument for
@@ -396,6 +399,29 @@ export async function runProgram(
     glServe = serveGl(gl, glChannel);
   }
 
+  // The Wayland compositor's output. Its state machine runs in the Worker (the
+  // Rust shim); `wl` is the page's 2D canvas it commits frames onto, over a
+  // one-way SharedArrayBuffer ring. Same isolation requirement as the others.
+  let wlChannel = null;
+  let wlServe = null;
+  if (wl) {
+    if (!globalThis.crossOriginIsolated) {
+      throw new Error('the Wayland demo needs a cross-origin isolated page (SharedArrayBuffer bridge).');
+    }
+    const { makeWlChannel, serveWl, attachWlInput } = await import('@gex/wl-bridge.mjs');
+    wlChannel = makeWlChannel();
+    // `wl` may be a 2D canvas (present shm frames onto it) or just `true`
+    // (run the compositor so a client like Xwayland can connect, but let
+    // something else -- virglrenderer on its own WebGL canvas -- own the
+    // pixels). In the latter case there is no page-side present.
+    wlServe = typeof wl?.getContext === 'function' ? serveWl(wl, wlChannel) : null;
+    // Mouse and keyboard, the reverse ring: listeners on the canvas append to
+    // it, the compositor pump drains it. Only a real canvas can take focus and
+    // report pointer coordinates, so the `wl === true` (no page canvas) case
+    // gets none.
+    if (typeof wl?.getContext === 'function') attachWlInput(wl, wlChannel);
+  }
+
   const host = new ProcessHost({
     makeWorker: makeGuestWorker,
     shim: shimBytes,
@@ -431,9 +457,16 @@ export async function runProgram(
       // shape the shim has now.
       shared: true,
       virgl: channel ?? undefined,
+      // Trace every vtest feed (`[virgl] fed N bytes`) when asked -- the only
+      // way to tell a client that is rendering from one stuck before its first
+      // draw. Off unless GEX_VIRGL_TRACE is set.
+      virglTrace: !!globalThis.GEX_VIRGL_TRACE,
       // The GL ring's shared buffers, so a Worker that opens /dev/gex-gl can
       // reach the page's GlDevice. In `extra` like virgl, for the same reason.
       glChannel: glChannel ?? undefined,
+      // The Wayland ring's shared buffers, so a Worker that binds the
+      // compositor can carry its frames to the page's canvas. Like glChannel.
+      wlChannel: wlChannel ?? undefined,
       wispUrl: network?.url ?? undefined,
       // Only when there is no shared terminal to hold the size. With one this
       // must not be sent: it is captured at `runProgram` time and every Worker
@@ -458,6 +491,16 @@ export async function runProgram(
       // of substituting the shim's, to tell a substitution fault from a codegen
       // one. In `extra` so every process gets it.
       noIntrinsics: flag('nointrinsics') ? 1 : undefined,
+      // `?intrinsicmask=N` enables only some substitution families, to bisect
+      // which one corrupts memory: bit0=memcpy, bit1=memset, bit2=memcmp.
+      // In `extra` so every process gets it.
+      intrinsicMask: flag('intrinsicmask') == null ? undefined : parseInt(flag('intrinsicmask'), 10) >>> 0,
+      // `?copyloop=1` emits memcpy as a forward byte loop, to tell a
+      // `memory.copy` fault from a bad-argument one. In `extra` for every process.
+      copyLoop: flag('copyloop') ? 1 : undefined,
+      // `?wltrace=1` turns on gex-wayland protocol tracing (buffers, commits,
+      // "produced no frame") to debug why a client's window is not shown.
+      wlTrace: flag('wltrace') ? 1 : undefined,
       // Whether a fork hands the child its parent's compiled modules. In `extra`
       // (spread into every Worker message), not on `globalThis`: the list is
       // built in the forking Worker, so a global set here is set in the page.
@@ -484,6 +527,7 @@ export async function runProgram(
     onMessage: (m) => {
       if (m.kind === 'virgl') serve?.();
       else if (m.kind === 'gl') glServe?.();
+      else if (m.kind === 'wl') wlServe?.();
       else if (m.kind === 'net') onNetEvent?.(m.event);
     },
   });

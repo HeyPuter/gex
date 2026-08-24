@@ -18,7 +18,21 @@
 pub mod wire;
 
 use std::collections::HashMap;
-use wire::{header, Reader, Writer};
+use wire::{header, Fixed, Reader, Writer};
+
+/// A US-layout XKB keymap in the `include` form `xkb_keymap_new_from_string`
+/// resolves against the client's own `/usr/share/X11/xkb` (which the graphics
+/// rootfs carries). Sent once as the `wl_keyboard.keymap` payload; the host
+/// attaches it as a readable descriptor the client mmaps and compiles. A flat,
+/// fully-resolved keymap would not depend on the client's config at all, but it
+/// is ~30 KB of text where this is six lines and every client here has the data.
+const KEYMAP: &str = "xkb_keymap {\n\
+\txkb_keycodes  { include \"evdev+aliases(qwerty)\" };\n\
+\txkb_types     { include \"complete\" };\n\
+\txkb_compat    { include \"complete\" };\n\
+\txkb_symbols   { include \"pc+us\" };\n\
+\txkb_geometry  { include \"pc(pc105)\" };\n\
+};\n";
 
 /// Where a buffer's pixels are.
 ///
@@ -49,12 +63,48 @@ pub struct Frame {
 /// binds at the highest shared version and uses requests only that version has,
 /// so offering one whose requests are unimplemented is worse than a lower one:
 /// these are deliberately conservative.
+/// Runtime switch for wl tracing (the wasm shim has no env, so `GEX_WL_TRACE`
+/// never fires there; the host sets this via `gex_set_wl_trace`).
+pub static WL_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn wl protocol tracing on/off at runtime.
+pub fn set_trace(on: bool) {
+    WL_TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where trace lines go. In the wasm shim `eprintln!`/stderr is a no-op (no
+/// wasi), so the host installs a sink that writes to `console.error`. Stored as
+/// a `fn(&str)` pointer in a usize (0 = none, fall back to `eprintln!`).
+pub static TRACE_SINK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Install the sink the shim points at its console writer.
+pub fn set_trace_sink(f: fn(&str)) {
+    TRACE_SINK.store(f as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn trace_out(s: &str) {
+    let p = TRACE_SINK.load(std::sync::atomic::Ordering::Relaxed);
+    if p != 0 {
+        // SAFETY: only ever set by `set_trace_sink` to a valid `fn(&str)`.
+        let f: fn(&str) = unsafe { std::mem::transmute::<usize, fn(&str)>(p) };
+        f(s);
+    } else {
+        eprintln!("{s}");
+    }
+}
+
 const GLOBALS: &[(&str, u32)] = &[
     ("wl_compositor", 4),
     ("wl_shm", 1),
     ("wl_seat", 5),
     ("wl_output", 3),
     ("xdg_wm_base", 3),
+    // GTK expects these during display init; without them it defers/abandons
+    // seat setup (never binds wl_seat) and loops on GDK_IS_SEAT. Minimal: their
+    // requests are accepted and ignored (no real clipboard/DnD or subsurfaces).
+    ("wl_data_device_manager", 3),
+    ("wl_subcompositor", 1),
 ];
 
 /// What an object id currently is.
@@ -77,6 +127,11 @@ enum Object {
     XdgSurface { surface: u32 },
     XdgToplevel { xdg_surface: u32 },
     Positioner,
+    DataDeviceManager,
+    Subcompositor,
+    /// An object whose requests we accept and ignore (data devices/sources,
+    /// subsurfaces) -- present so GTK's init completes, does nothing observable.
+    Stub,
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +184,20 @@ pub struct Client {
     default_size: (i32, i32),
     /// Set when the protocol has been violated and the connection is over.
     pub failed: Option<String>,
+    /// The `wl_pointer` and `wl_keyboard` object ids once the client asks for
+    /// them, so injected input has somewhere to go.
+    pointer: Option<u32>,
+    keyboard: Option<u32>,
+    /// The surface input is delivered to: the last one to commit a buffer, i.e.
+    /// the visible window.
+    focus_surface: Option<u32>,
+    /// Which surface `enter` was last sent for, per device (`None` == not
+    /// currently over/focused), so motion and keys only follow an enter.
+    pointer_on: Option<u32>,
+    keyboard_on: Option<u32>,
+    /// A keyboard was created and owes a `keymap` event whose fd the host must
+    /// attach: this is the payload, taken once by [`Client::take_keymap`].
+    pending_keymap: Option<Vec<u8>>,
 }
 
 /// Wayland's error codes on `wl_display`.
@@ -158,6 +227,12 @@ impl Client {
             next_serial: 1,
             default_size: (640, 480),
             failed: None,
+            pointer: None,
+            keyboard: None,
+            focus_surface: None,
+            pointer_on: None,
+            keyboard_on: None,
+            pending_keymap: None,
         }
     }
 
@@ -217,18 +292,19 @@ impl Client {
     /// requirements were found.
     fn tracing() -> bool {
         std::env::var_os("GEX_WL_TRACE").is_some()
+            || WL_TRACE.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn dispatch(&mut self, object: u32, opcode: u16, body: &[u8], buffers: &dyn Buffers) {
         if Self::tracing() {
-            eprintln!(
+            trace_out(&format!(
                 "[wl] -> object {object} opcode {opcode} ({} bytes) {}",
                 body.len(),
                 match self.objects.get(&object) {
                     Some(o) => format!("{o:?}"),
                     None => "UNKNOWN".into(),
                 }
-            );
+            ));
         }
         let Some(target) = self.objects.get(&object).cloned() else {
             self.error(
@@ -254,6 +330,34 @@ impl Client {
                     self.xdg_toplevel(object, xdg_surface, opcode, &mut r)
                 }
                 Object::Seat => self.seat(opcode, &mut r),
+                Object::DataDeviceManager => {
+                    // create_data_source(id) = 0, get_data_device(id, seat) = 1;
+                    // both make a new object whose requests we then ignore.
+                    match opcode {
+                        0 | 1 => {
+                            if let Some(id) = r.new_id() {
+                                self.objects.insert(id, Object::Stub);
+                            }
+                            true
+                        }
+                        _ => true,
+                    }
+                }
+                Object::Subcompositor => {
+                    // destroy = 0; get_subsurface(id, surface, parent) = 1.
+                    match opcode {
+                        1 => {
+                            if let Some(id) = r.new_id() {
+                                self.objects.insert(id, Object::Stub);
+                            }
+                            true
+                        }
+                        _ => true,
+                    }
+                }
+                // Data devices/sources and subsurfaces: none of their requests
+                // creates a child object, so just accept and ignore everything.
+                Object::Stub => true,
                 Object::Buffer(_) | Object::Region | Object::Positioner => {
                     // Every one of these has `destroy` at opcode 0 and
                     // requests that change nothing observable here.
@@ -263,7 +367,41 @@ impl Client {
                     }
                     true
                 }
-                Object::Output | Object::Keyboard | Object::Pointer | Object::Callback => {
+                Object::Pointer => {
+                    // wl_pointer requests are set_cursor(0) and release(1) -- NOT
+                    // destroy-at-0 like most objects. A client points its cursor
+                    // the instant the pointer enters, and treating set_cursor as
+                    // a destroy takes the pointer object out from under the next
+                    // event ("no object N", then a fatal). We draw no client
+                    // cursor (the page's own shows), so set_cursor is accepted
+                    // and ignored; release destroys.
+                    match opcode {
+                        0 => true,
+                        1 => {
+                            self.objects.remove(&object);
+                            if self.pointer == Some(object) {
+                                self.pointer = None;
+                                self.pointer_on = None;
+                            }
+                            self.delete_id(object);
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                Object::Keyboard => {
+                    // wl_keyboard's only request is release(0).
+                    if opcode == 0 {
+                        self.objects.remove(&object);
+                        if self.keyboard == Some(object) {
+                            self.keyboard = None;
+                            self.keyboard_on = None;
+                        }
+                        self.delete_id(object);
+                    }
+                    true
+                }
+                Object::Output | Object::Callback => {
                     // `release`/`destroy` and nothing else.
                     if opcode == 0 {
                         self.objects.remove(&object);
@@ -276,7 +414,7 @@ impl Client {
         self.fds = fds;
         if !ok && self.failed.is_none() {
             if Self::tracing() {
-                eprintln!("[wl] REFUSED object {object} opcode {opcode}");
+                trace_out(&format!("[wl] REFUSED object {object} opcode {opcode}"));
             }
             self.error(
                 object,
@@ -305,6 +443,12 @@ impl Client {
                 let Some(id) = r.new_id() else { return false };
                 self.objects.insert(id, Object::Registry);
                 for (name, (interface, version)) in GLOBALS.iter().enumerate() {
+                    if Self::tracing() {
+                        trace_out(&format!(
+                            "[wl] advertise global {} = {interface} v{version}",
+                            name as u32 + 1
+                        ));
+                    }
                     let w = Writer::new(id, 0)
                         .uint(name as u32 + 1)
                         .string(interface)
@@ -329,7 +473,7 @@ impl Client {
             return false;
         };
         if Self::tracing() {
-            eprintln!("[wl] bind {interface} v{_version} as {id}");
+            trace_out(&format!("[wl] bind {interface} v{_version} as {id}"));
         }
         let Some((expected, _)) = GLOBALS.get(name as usize - 1) else {
             return false;
@@ -351,8 +495,10 @@ impl Client {
             }
             "wl_seat" => {
                 self.objects.insert(id, Object::Seat);
-                // Pointer and keyboard capabilities, which a toolkit checks
-                // before building input handling.
+                // Pointer (bit 0) and keyboard (bit 1). The keyboard's `keymap`
+                // event needs a real fd for its middle `h` argument, which the
+                // host attaches from the socket's ancillary channel (see
+                // `take_keymap`); with that in place both capabilities are real.
                 let w = Writer::new(id, 0).uint(0b11);
                 self.send(w);
                 let w = Writer::new(id, 1).string("gex-seat0");
@@ -381,6 +527,12 @@ impl Client {
             }
             "xdg_wm_base" => {
                 self.objects.insert(id, Object::WmBase);
+            }
+            "wl_data_device_manager" => {
+                self.objects.insert(id, Object::DataDeviceManager);
+            }
+            "wl_subcompositor" => {
+                self.objects.insert(id, Object::Subcompositor);
             }
             _ => return false,
         }
@@ -545,12 +697,26 @@ impl Client {
             return;
         };
         let buffer_id = state.pending_buffer.or(state.committed_buffer);
+        // The initial, bufferless commit of a surface that has an xdg role: the
+        // xdg_shell contract is that the compositor answers THIS commit with an
+        // `xdg_surface.configure`, and libwayland (es2gears) will not attach its
+        // first buffer until one arrives after its own initial commit. Sending
+        // it eagerly at `get_toplevel` is too early -- the client is still
+        // waiting for the post-commit one and parks forever. Idempotent: a
+        // client acks the latest serial, so an extra configure is harmless.
+        if buffer_id.is_none() && !state.configured {
+            if let Some(xdg) = state.xdg {
+                let serial = self.serial();
+                let w = Writer::new(xdg, 0).uint(serial);
+                self.send(w);
+            }
+        }
         let mut produced = None;
         if let Some(buffer_id) = buffer_id {
             if let Some(Object::Buffer(spec)) = self.objects.get(&buffer_id).cloned() {
                 let mapped = buffers.map(spec.fd, spec.pool_size);
                 if Self::tracing() {
-                    eprintln!(
+                    trace_out(&format!(
                         "[wl] buffer {buffer_id}: fd {} pool {} -> {:?} bytes, {}x{} stride {}",
                         spec.fd,
                         spec.pool_size,
@@ -558,7 +724,7 @@ impl Client {
                         spec.width,
                         spec.height,
                         spec.stride
-                    );
+                    ));
                 }
                 if let Some(pool) = mapped {
                     produced = Self::cut(&pool, &spec).map(|pixels| Frame {
@@ -578,9 +744,13 @@ impl Client {
             self.send(w);
         }
         match produced {
-            Some(frame) => self.frames.push(frame),
+            Some(frame) => {
+                // The visible window, and so where injected input is delivered.
+                self.focus_surface = Some(surface);
+                self.frames.push(frame);
+            }
             None if buffer_id.is_some() && Self::tracing() => {
-                eprintln!("[wl] commit on surface {surface} produced no frame");
+                trace_out(&format!("[wl] commit on surface {surface} produced no frame"));
             }
             None => {}
         }
@@ -751,14 +921,27 @@ impl Client {
             0 => {
                 let Some(id) = r.new_id() else { return false };
                 self.objects.insert(id, Object::Pointer);
+                self.pointer = Some(id);
                 true
             }
             // get_keyboard(id)
             1 => {
                 let Some(id) = r.new_id() else { return false };
                 self.objects.insert(id, Object::Keyboard);
-                // Format 0 ("no keymap"), which every client handles.
-                let w = Writer::new(id, 0).uint(0).uint(0).uint(0);
+                self.keyboard = Some(id);
+                // keymap(format = XKB_V1 (1), fd, size). The `h` fd argument
+                // occupies no word in the body -- it rides the socket's ancillary
+                // control message -- so the body is just format and size, and the
+                // payload the host must attach is recorded for `take_keymap`. The
+                // size counts the NUL the client's `mmap`+compile expects.
+                let mut km = KEYMAP.as_bytes().to_vec();
+                km.push(0);
+                let w = Writer::new(id, 0).uint(1).uint(km.len() as u32);
+                self.send(w);
+                self.pending_keymap = Some(km);
+                // repeat_info(rate keys/s, delay ms) for v4+, so the client does
+                // not have to assume a repeat rate.
+                let w = Writer::new(id, 5).int(25).int(600);
                 self.send(w);
                 true
             }
@@ -772,6 +955,180 @@ impl Client {
             3 => true,
             _ => false,
         }
+    }
+
+    // -- injected input -----------------------------------------------------
+    //
+    // The host turns a page's mouse and keyboard events into these calls; they
+    // append `wl_pointer`/`wl_keyboard` events to the outbox, delivered on the
+    // next pump. Every one is a no-op until the client has asked for the device
+    // (so events before `get_pointer`/`get_keyboard` are dropped, not queued)
+    // and a surface is visible to enter.
+
+    /// The keymap payload the host must hand the client as an SCM_RIGHTS fd,
+    /// taken once. `Some` exactly after a `get_keyboard`.
+    pub fn take_keymap(&mut self) -> Option<Vec<u8>> {
+        self.pending_keymap.take()
+    }
+
+    /// Whether the client has bound a pointer or keyboard: no point delivering
+    /// input to one that has not.
+    pub fn wants_input(&self) -> bool {
+        self.pointer.is_some() || self.keyboard.is_some()
+    }
+
+    /// `wl_pointer.enter` the focus surface if the pointer is not already on it,
+    /// leaving the previous one first. Returns whether the pointer is now on a
+    /// surface.
+    fn ensure_pointer_enter(&mut self) -> bool {
+        let (Some(ptr), Some(surface)) = (self.pointer, self.focus_surface) else {
+            return false;
+        };
+        if self.pointer_on == Some(surface) {
+            return true;
+        }
+        if let Some(old) = self.pointer_on.take() {
+            let serial = self.serial();
+            self.send(Writer::new(ptr, 1).uint(serial).object(old)); // leave
+        }
+        let serial = self.serial();
+        // enter(serial, surface, surface_x, surface_y)
+        self.send(
+            Writer::new(ptr, 0)
+                .uint(serial)
+                .object(surface)
+                .fixed(Fixed::from_int(0))
+                .fixed(Fixed::from_int(0)),
+        );
+        self.pointer_on = Some(surface);
+        true
+    }
+
+    /// `wl_pointer.frame` (v5): closes an event group. Harmless one-per-event.
+    fn pointer_frame(&mut self) {
+        if let Some(ptr) = self.pointer {
+            self.send(Writer::new(ptr, 5));
+        }
+    }
+
+    /// Pointer moved to surface-local `(x, y)` in pixels.
+    pub fn pointer_motion(&mut self, x: i32, y: i32, time: u32) {
+        let Some(ptr) = self.pointer else { return };
+        if !self.ensure_pointer_enter() {
+            return;
+        }
+        // motion(time, surface_x, surface_y)
+        self.send(
+            Writer::new(ptr, 2)
+                .uint(time)
+                .fixed(Fixed::from_int(x))
+                .fixed(Fixed::from_int(y)),
+        );
+        self.pointer_frame();
+    }
+
+    /// A pointer button (Linux `BTN_*` code) went down or up.
+    pub fn pointer_button(&mut self, button: u32, pressed: bool, time: u32) {
+        let Some(ptr) = self.pointer else { return };
+        if !self.ensure_pointer_enter() {
+            return;
+        }
+        let serial = self.serial();
+        // button(serial, time, button, state): 1 pressed, 0 released.
+        self.send(
+            Writer::new(ptr, 3)
+                .uint(serial)
+                .uint(time)
+                .uint(button)
+                .uint(pressed as u32),
+        );
+        self.pointer_frame();
+    }
+
+    /// Scroll. `axis` 0 is vertical, 1 horizontal; `value` is a pixel-ish delta.
+    pub fn pointer_axis(&mut self, axis: u32, value: i32, time: u32) {
+        let Some(ptr) = self.pointer else { return };
+        if self.pointer_on.is_none() {
+            return;
+        }
+        // axis(time, axis, value)
+        self.send(
+            Writer::new(ptr, 4)
+                .uint(time)
+                .uint(axis)
+                .fixed(Fixed::from_int(value)),
+        );
+        self.pointer_frame();
+    }
+
+    /// `wl_keyboard.enter` the focus surface if not already focused, priming the
+    /// client's xkb state with an empty modifiers event. Returns whether focused.
+    fn ensure_keyboard_enter(&mut self) -> bool {
+        let (Some(kbd), Some(surface)) = (self.keyboard, self.focus_surface) else {
+            return false;
+        };
+        if self.keyboard_on == Some(surface) {
+            return true;
+        }
+        if let Some(old) = self.keyboard_on.take() {
+            let serial = self.serial();
+            self.send(Writer::new(kbd, 2).uint(serial).object(old)); // leave
+        }
+        let serial = self.serial();
+        // enter(serial, surface, keys): no keys held.
+        self.send(
+            Writer::new(kbd, 1)
+                .uint(serial)
+                .object(surface)
+                .array(&[]),
+        );
+        self.keyboard_on = Some(surface);
+        // modifiers(serial, depressed, latched, locked, group): all clear, so
+        // the client starts from a known state rather than guessing.
+        let serial = self.serial();
+        self.send(
+            Writer::new(kbd, 4)
+                .uint(serial)
+                .uint(0)
+                .uint(0)
+                .uint(0)
+                .uint(0),
+        );
+        true
+    }
+
+    /// A key (Linux evdev code, i.e. X keycode minus 8) went down or up.
+    pub fn keyboard_key(&mut self, key: u32, pressed: bool, time: u32) {
+        let Some(kbd) = self.keyboard else { return };
+        if !self.ensure_keyboard_enter() {
+            return;
+        }
+        let serial = self.serial();
+        // key(serial, time, key, state): 1 pressed, 0 released.
+        self.send(
+            Writer::new(kbd, 3)
+                .uint(serial)
+                .uint(time)
+                .uint(key)
+                .uint(pressed as u32),
+        );
+    }
+
+    /// The modifier state (xkb masks), sent after a modifier key changes it.
+    pub fn keyboard_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
+        let Some(kbd) = self.keyboard else { return };
+        if !self.ensure_keyboard_enter() {
+            return;
+        }
+        let serial = self.serial();
+        self.send(
+            Writer::new(kbd, 4)
+                .uint(serial)
+                .uint(depressed)
+                .uint(latched)
+                .uint(locked)
+                .uint(group),
+        );
     }
 }
 
@@ -936,6 +1293,123 @@ mod tests {
         assert_eq!(f.pixels.len(), 16);
         // Blue is first in memory, so the first pixel is rgb(3,2,1).
         assert_eq!(to_rgb(f)[..3], [3, 2, 1]);
+    }
+
+    /// After `draw`, bind `wl_seat` (global name 3) as object 12 and return the
+    /// client with the focus surface (6) already set by its committed frame.
+    fn with_seat() -> Client {
+        let (mut c, _) = draw(vec![0u8; 16], 2, 2, 8);
+        c.receive(
+            &Writer::new(2, 0).uint(3).string("wl_seat").uint(5).new_id(12).finish(),
+            &[],
+            &no_pool(),
+        );
+        c
+    }
+
+    #[test]
+    fn a_pointer_enters_the_window_then_moves_and_frames() {
+        let mut c = with_seat();
+        // get_pointer -> 13
+        c.receive(&Writer::new(12, 0).new_id(13).finish(), &[], &no_pool());
+        let _ = c.take_outgoing();
+        c.pointer_motion(10, 20, 100);
+        let msgs = messages(&c.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, _)| *o == 13 && *op == 0), "enter");
+        let motion = msgs.iter().find(|(o, op, _)| *o == 13 && *op == 2).expect("motion");
+        let mut fds = Vec::new();
+        let mut r = Reader::new(&motion.2, &mut fds);
+        assert_eq!(r.uint(), Some(100), "time");
+        assert_eq!(r.fixed().map(|f| f.to_int()), Some(10), "x");
+        assert_eq!(r.fixed().map(|f| f.to_int()), Some(20), "y");
+        assert!(msgs.iter().any(|(o, op, _)| *o == 13 && *op == 5), "frame");
+    }
+
+    #[test]
+    fn a_button_enters_first_and_carries_state() {
+        let mut c = with_seat();
+        c.receive(&Writer::new(12, 0).new_id(13).finish(), &[], &no_pool());
+        let _ = c.take_outgoing();
+        c.pointer_button(0x110, true, 200); // BTN_LEFT
+        let msgs = messages(&c.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, _)| *o == 13 && *op == 0), "enter before button");
+        let btn = msgs.iter().find(|(o, op, _)| *o == 13 && *op == 3).expect("button");
+        let mut fds = Vec::new();
+        let mut r = Reader::new(&btn.2, &mut fds);
+        let _serial = r.uint();
+        assert_eq!(r.uint(), Some(200), "time");
+        assert_eq!(r.uint(), Some(0x110), "button");
+        assert_eq!(r.uint(), Some(1), "pressed");
+    }
+
+    #[test]
+    fn a_keyboard_gets_a_keymap_payload_then_enter_and_keys() {
+        let mut c = with_seat();
+        // get_keyboard -> 13
+        c.receive(&Writer::new(12, 1).new_id(13).finish(), &[], &no_pool());
+        let msgs = messages(&c.take_outgoing());
+        let keymap = msgs.iter().find(|(o, op, _)| *o == 13 && *op == 0).expect("keymap event");
+        let mut fds = Vec::new();
+        let mut r = Reader::new(&keymap.2, &mut fds);
+        assert_eq!(r.uint(), Some(1), "XKB_V1 format");
+        let size = r.uint().expect("size");
+        // The host must have a payload of exactly `size` bytes to hand over.
+        let km = c.take_keymap().expect("keymap payload");
+        assert_eq!(km.len() as u32, size, "size matches the payload");
+        assert!(km.starts_with(b"xkb_keymap"), "a real keymap");
+        assert_eq!(km.last(), Some(&0), "NUL-terminated");
+        // A key delivers enter + modifiers + the key itself.
+        c.keyboard_key(30, true, 300); // KEY_A
+        let msgs = messages(&c.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, _)| *o == 13 && *op == 1), "keyboard enter");
+        assert!(msgs.iter().any(|(o, op, _)| *o == 13 && *op == 4), "modifiers primed");
+        let key = msgs.iter().find(|(o, op, _)| *o == 13 && *op == 3).expect("key");
+        let mut fds = Vec::new();
+        let mut r = Reader::new(&key.2, &mut fds);
+        let _serial = r.uint();
+        assert_eq!(r.uint(), Some(300), "time");
+        assert_eq!(r.uint(), Some(30), "key");
+        assert_eq!(r.uint(), Some(1), "pressed");
+    }
+
+    #[test]
+    fn set_cursor_is_accepted_and_leaves_the_pointer_usable() {
+        let mut c = with_seat();
+        c.receive(&Writer::new(12, 0).new_id(13).finish(), &[], &no_pool()); // get_pointer
+        // The client sets its cursor the moment it is entered: set_cursor is
+        // wl_pointer opcode 0 -- NOT a destroy. (serial, surface, hotspot x, y)
+        c.receive(
+            &Writer::new(13, 0).uint(1).object(0).int(0).int(0).finish(),
+            &[],
+            &no_pool(),
+        );
+        assert!(c.failed.is_none(), "set_cursor accepted: {:?}", c.failed);
+        let _ = c.take_outgoing();
+        c.pointer_motion(5, 6, 10);
+        let msgs = messages(&c.take_outgoing());
+        assert!(
+            msgs.iter().any(|(o, op, _)| *o == 13 && *op == 2),
+            "the pointer still delivers motion after set_cursor"
+        );
+    }
+
+    #[test]
+    fn a_pointer_release_destroys_it_and_stops_events() {
+        let mut c = with_seat();
+        c.receive(&Writer::new(12, 0).new_id(13).finish(), &[], &no_pool());
+        c.receive(&Writer::new(13, 1).finish(), &[], &no_pool()); // release is opcode 1
+        let _ = c.take_outgoing();
+        c.pointer_motion(5, 6, 10);
+        assert!(c.take_outgoing().is_empty(), "no events after the pointer is released");
+    }
+
+    #[test]
+    fn input_before_any_device_is_bound_is_dropped() {
+        let mut c = with_seat();
+        let _ = c.take_outgoing();
+        c.pointer_motion(1, 2, 3);
+        c.keyboard_key(30, true, 4);
+        assert!(c.take_outgoing().is_empty(), "no pointer/keyboard bound, no events");
     }
 
     #[test]

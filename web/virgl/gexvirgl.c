@@ -262,6 +262,56 @@ static void gex_present(uint32_t handle) {
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_fbo);
 }
 
+/* Present whatever the guest just rendered into, with no resource handle to go
+ * on. gex_present() needs the handle from a TRANSFER_GET body, but a GLES/EGL
+ * client that presents through a Wayland/EGL swap never issues one: it renders
+ * with SUBMIT_CMD and hands the buffer to the compositor, expecting the pixels
+ * to already be on screen. So after a submit we blit the currently-bound draw
+ * framebuffer -- the guest's render target -- straight to the canvas. The
+ * source rectangle is the viewport, which the client set to its window size.
+ * Upside down for the same reason as gex_present: GL is bottom-left, the canvas
+ * top-left. */
+static void gex_present_current(void) {
+    GLint fb = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    GLenum st = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    if (fb == 0) return; /* default framebuffer holds nothing of the guest's */
+    if (vp[2] < 64 || vp[3] < 64) return; /* a scratch pass, not a window */
+
+    int w, h;
+    emscripten_get_canvas_element_size("#gex-gl", &w, &h);
+    if (st != GL_FRAMEBUFFER_COMPLETE)
+        return;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+
+    static int seen;
+    if (seen < 8 || seen % 64 == 0) {
+        unsigned char px[20 * 20 * 4];
+        GLint sx = vp[0] + vp[2] / 2 - 10, sy = vp[1] + vp[3] / 2 - 10;
+        if (sx < 0) sx = 0;
+        if (sy < 0) sy = 0;
+        glReadPixels(sx, sy, 20, 20, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        for (size_t i = 0; i < sizeof px; i += 4) {
+            int v = px[i] > px[i + 1] ? px[i] : px[i + 1];
+            if (px[i + 2] > v) v = px[i + 2];
+            if (v > gex_brightest) gex_brightest = v;
+        }
+        if (gex_brightest > 8) gex_lit++;
+    }
+    seen++;
+    glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
+                      0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    gex_presented++;
+    /* Put the guest's framebuffer back as both bindings; virglrenderer expects
+     * to find its own target still current. */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)fb);
+}
+
 /* The resource handle is the first word of a TRANSFER_GET body, so it can be
  * read without consuming it and without duplicating the header struct. */
 /* The resource handle is the first word of a TRANSFER_GET body.
@@ -458,6 +508,7 @@ int gex_virgl_pump(int sid) {
      * pointing at itself. */
     if (s->ctx) vtest_set_current_context(s->ctx);
     int ran = 0;
+    int submitted = 0;
     for (;;) {
         size_t began = s->in_pos;
         uint32_t header[VTEST_HDR_SIZE];
@@ -498,6 +549,7 @@ int gex_virgl_pump(int sid) {
                         nm ? nm : "?", header[0]);
             }
             ret = gex_commands[header[1]](header[0]);
+            if (header[1] == VCMD_SUBMIT_CMD) submitted = 1;
         } else {
             /* A command this build does not know. The stream is framed by
              * length, but skipping blind would hand the next header's bytes
@@ -515,6 +567,23 @@ int gex_virgl_pump(int sid) {
             return -1;
         }
         ran++;
+    }
+    /* Process this context's fences, the way `vtest_server_dispatch_clients`
+     * does when the context poll fd signals. A client (es2gears' Mesa, and any
+     * GLES/EGL client) submits a batch, then WAITS for the submit's fence to
+     * signal before it reads back or presents -- not with BUSY_WAIT but by
+     * reading the fence notification this poll writes to its stream. Without it
+     * the client blocks reading a reply that never comes and the frame never
+     * lands. Submission here is synchronous (see the BUSY_WAIT nop note), so the
+     * fence is already retired and this only delivers the notification. */
+    if (s->ctx) {
+        vtest_poll_context(s->ctx);
+    }
+    /* If the guest submitted a batch but never asks to read it back (the EGL/
+     * Wayland swap path, unlike the X server's TRANSFER_GET), put what it just
+     * drew on the canvas ourselves. */
+    if (submitted) {
+        gex_present_current();
     }
     return ran;
 }

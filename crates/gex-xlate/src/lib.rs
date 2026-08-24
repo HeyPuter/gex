@@ -26,6 +26,8 @@ pub use gex_emit::module::Metadata;
 /// Turn the per-block stack-pointer check on, for a host with no environment
 /// to read `GEX_CHECK_SP` from. See `gex_emit::tier1::set_check_sp`.
 pub use gex_emit::tier1::set_check_sp;
+pub use gex_emit::tier1::set_copy_loop;
+pub use gex_emit::tier1::set_coherent_loads;
 pub use gex_emit::PageTable;
 pub use gex_emit::TranslatedModule;
 use gex_emit::ModuleBuilder;

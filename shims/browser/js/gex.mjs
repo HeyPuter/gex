@@ -241,7 +241,7 @@ const TABLE_NAMES = [
 ];
 
 export class Gex {
-  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #virgl = null; #virglTrace = false;
+  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #virgl = null; #virglTrace = false; #wl = null;
   // The channel `#turn` posts to itself on, made once and kept.
   #tick = null;
   // Translated modules this Worker has put into its own dispatch tables. Per
@@ -632,6 +632,15 @@ export class Gex {
           this.#virgl
             ? this.#virgl.submit(session >>> 0, this.#memory, ptr >>> 0, len >>> 0)
             : -1,
+        // The compositor's output: a wayland client committed a frame, and its
+        // pixels are at `ptr` (tightly-packed RGBA) in this memory. One-way --
+        // the page copies them to its canvas; nothing is returned.
+        wl_present: (ptr, w, h, stride, format) =>
+          this.#wl?.present(this.#memory, ptr >>> 0, w, h, stride >>> 0, format >>> 0),
+        // The reverse: drain the page's mouse/keyboard ring into `ptr` as packed
+        // i32 quintuples, so the compositor pump can deliver them to the client.
+        wl_poll_input: (ptr, max) =>
+          this.#wl?.pollInput(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
         virgl_take: (session, ptr, max) =>
           this.#virgl
             ? this.#virgl.take(session >>> 0, this.#memory, ptr >>> 0, max >>> 0)
@@ -685,6 +694,7 @@ export class Gex {
     }
     // Whatever `useGl` was told before the shim existed.
     this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+    this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
     // Only when there really is one: Mesa's vtest winsys does not fall back
     // from a socket nobody serves -- it blocks on a reply that cannot come.
     this.#shim.exports.gex_set_virgl?.(this.#virgl ? (this.#virglTrace ? 2 : 1) : 0);
@@ -1001,6 +1011,7 @@ export class Gex {
     // built, which is when the device nodes are made and the vtest socket bound.
     if (devices) {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+      this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
       this.#shim.exports.gex_set_virgl?.(this.#virgl ? (this.#virglTrace ? 2 : 1) : 0);
       this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
     // Narrate one page's directory writes, in every process. See #136.
@@ -1773,6 +1784,16 @@ export class Gex {
   }
 
   /**
+   * Give the guest a Wayland compositor. `wl` is a `WlProxy` (wl-bridge.mjs)
+   * that carries committed frames to the page's canvas. Like `useGl`, best set
+   * before `load` -- the socket is bound while the filesystem is built.
+   */
+  useWl(wl) {
+    this.#wl = wl;
+    this.#shim?.exports?.gex_set_wl?.(wl ? 1 : 0);
+  }
+
+  /**
    * Give the guest a virtio-gpu renderer instead: the GPU path that needs no
    * change to the guest (unmodified Debian Mesa, not gex's libGLESv2).
    * `renderer` is a `VirglRenderer` from web/src/virgl.js. Must be set before
@@ -1853,6 +1874,9 @@ export class Gex {
               ? ''
               : `, ${within ? 'inside' : 'after'} syscall ${n}`);
           if (globalThis.GEX_TRAP_STACK) console.error(err.stack ?? err);
+          // Dump every thread's register context: two with the same ctx is #126
+          // (two Workers on one context). Prints via the shim; safe if borrowed.
+          ask(e.gex_dump_threads, () => '');
           // The target of the last indirect branch, stored by the dispatch
           // itself. `enter` is long gone by now (dispatch ends in
           // `return_call_indirect`, which replaces frames), and the argument it
@@ -2469,44 +2493,19 @@ export class Gex {
    */
   #pageBase(page) {
     const e = this.#shim.exports;
-    if (!e.gex_page_base) return -1;
-    const have = e.gex_page_base(page >>> 0) >>> 0;
-    if (have !== 0) {
-      // Somebody already numbered this page, possibly the parent (a `fork`
-      // copies the directory). The base is right -- same code at the same
-      // addresses -- but the table is per instance and starts empty, so reach
-      // it or a branch traps past its end.
-      const ti = e.gex_page_table ? e.gex_page_table(BigInt(page >>> 0)) : -1;
-      if (ti >= 0) {
-        this.#reach(ti, have + SLOTS_PER_PAGE);
-        // And do not hand the same slots out again to a later claim.
-        if (this.#claimed[ti] === undefined || this.#claimed[ti] < have + SLOTS_PER_PAGE) {
-          this.#claimed[ti] = have + SLOTS_PER_PAGE;
-        }
-      }
-      return have;
-    }
-    if (!e.gex_claim_page) return -1;
-    // Unclaimed: give it a base at the end of its table, so the table grows by
-    // one page's worth per page entered rather than to the closure's whole
-    // length. Zero cannot come back (a table is never shorter than the reserved
-    // miss span), keeping zero as "no translation" for the branchless lookup.
-    const t = e.gex_page_table ? e.gex_page_table(BigInt(page >>> 0)) : -1;
+    if (!e.gex_claim_page || !e.gex_page_table) return -1;
+    const t = e.gex_page_table(BigInt(page >>> 0));
     if (t < 0) return 0;
-    const tables = this.#dispatchTables();
-    if (t >= tables.length) return 0;
-    // Above anything an image can write: images keep the build's numbering and
-    // write it at instantiation, which can happen after this claim.
-    const floor = e.gex_claim_floor ? e.gex_claim_floor(t) >>> 0 : 0;
-    // The watermark is the only source of a base: reading `tables[t].length`
-    // after a geometric grow eventually handed out a base past a capped table.
-    if (this.#claimed[t] === undefined) {
-      this.#claimed[t] = Math.max(tables[t].length, floor);
-    }
-    const base = this.#claimed[t];
-    this.#claimed[t] = base + SLOTS_PER_PAGE;
-    this.#reach(t, this.#claimed[t]);
-    e.gex_claim_page(BigInt(page >>> 0), base >>> 0);
+    // The shim numbers the page from a PROCESS-WIDE atomic allocator and writes
+    // the directory with a compare-and-swap, so every thread of this process
+    // agrees on the base (a per-Worker counter here used to let two threads
+    // number one page differently and dispatch it through the wrong slot -- the
+    // multithreaded-GTK stack smash). It returns the base, whether this thread
+    // won the claim or adopted another's. The table is per instance, so reach
+    // this Worker's to cover the base or a branch traps past its end.
+    const base = e.gex_claim_page(BigInt(page >>> 0)) >>> 0;
+    if (base === 0) return 0;
+    this.#reach(t, base + SLOTS_PER_PAGE);
     return base >>> 0;
   }
 

@@ -279,17 +279,26 @@ for (const [event, describe] of [
   // `?adopttrace=1`: narrate adopt phases only (no debugExit write-flood), fast
   // enough to reach a deep fork and show where its adopt hangs.
   if (params.get('adopttrace')) globalThis.GEX_ADOPT_TRACE = 1;
+  // `?virgltrace=1`: log every vtest feed, to tell a rendering client from one
+  // stuck before its first draw.
+  if (params.get('virgltrace')) globalThis.GEX_VIRGL_TRACE = 1;
   const asked = params.get('demo') || location.hash.slice(1);
   const want = DEMOS.find((d) => d.id === asked) || DEMOS[0];
   await select(want);
   // `?run=1` presses the demo's own first button, so a test can drive the page
-  // without reaching inside it.
-  if (params.get('run')) {
+  // without reaching inside it. `?run=N` for N>1 presses the N-th action button
+  // instead -- e.g. `run=2` on the gears demos is "Draw for 5 minutes", the
+  // budget a cold Mesa start needs when translation makes the first frame far
+  // more than the usual forty seconds away.
+  const runN = params.get('run');
+  if (runN) {
+    const idx = Math.max(1, parseInt(runN, 10) || 1) - 1;
     // Waited for, not assumed: a demo registers its actions during setup, which
     // may await a fetch first, so clicking the instant `select` resolves finds
     // nothing.
     for (let i = 0; i < 100; i++) {
-      const b = document.querySelector('#actions .act.primary');
+      const buttons = document.querySelectorAll('#actions .act');
+      const b = buttons[idx] || document.querySelector('#actions .act.primary');
       if (b) {
         b.click();
         break;

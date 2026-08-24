@@ -970,6 +970,9 @@ fn perform_block(
             uaddr,
             val,
             deadline,
+            // The native host closes the check/sleep race with the queue lock
+            // (below), so it does not use the kernel's pre-snapshotted place.
+            parked: _,
         } => {
             // The re-read has to happen under the queue's own lock, which is
             // what closes the race between checking the word and sleeping.

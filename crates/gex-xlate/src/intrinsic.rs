@@ -19,10 +19,15 @@ use gex_ir::*;
 pub enum Intrinsic {
     /// `void *memcpy(void *dst, const void *src, size_t n)`.
     ///
-    /// `memmove` shares this: `memory.copy` is defined as if the bytes went
-    /// through a temporary, which is exactly `memmove`'s guarantee and a
-    /// superset of `memcpy`'s.
+    /// `memory.copy` is defined as if the bytes went through a temporary, a
+    /// superset of `memcpy`'s (non-overlapping) contract.
     MemCpy,
+    /// `void *memmove(void *dst, const void *src, size_t n)`.
+    ///
+    /// Emitted identically to `MemCpy` (`memory.copy` is already memmove-safe),
+    /// kept a distinct variant only so the two can be enabled/disabled apart
+    /// when bisecting a corruption to one or the other.
+    MemMove,
     /// `void *mempcpy(void *dst, const void *src, size_t n)`, which differs
     /// from `memcpy` only in returning the *end* of the copy.
     MemPCpy,
@@ -56,7 +61,8 @@ pub fn recognise(name: &str) -> Option<Intrinsic> {
         None => name,
     };
     match stem {
-        "memcpy" | "memmove" => Some(Intrinsic::MemCpy),
+        "memcpy" => Some(Intrinsic::MemCpy),
+        "memmove" => Some(Intrinsic::MemMove),
         "mempcpy" => Some(Intrinsic::MemPCpy),
         "memset" => Some(Intrinsic::MemSet),
         // `memcmp` is deliberately absent though `Intrinsic::MemCmp` exists
@@ -79,7 +85,7 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
     let src = b.read(GuestReg::X(1));
     let len = b.read(GuestReg::X(2));
     match which {
-        Intrinsic::MemCpy => b.stmt(Stmt::MemCopy { dst, src, len }),
+        Intrinsic::MemCpy | Intrinsic::MemMove => b.stmt(Stmt::MemCopy { dst, src, len }),
         Intrinsic::MemPCpy => {
             b.stmt(Stmt::MemCopy { dst, src, len });
             // The one difference: it returns where the copy ended.
@@ -119,10 +125,10 @@ mod tests {
     #[test]
     fn recognises_glibc_private_names() {
         assert_eq!(recognise("memcpy"), Some(Intrinsic::MemCpy));
-        assert_eq!(recognise("memmove"), Some(Intrinsic::MemCpy));
+        assert_eq!(recognise("memmove"), Some(Intrinsic::MemMove));
         assert_eq!(recognise("__memcpy_generic"), Some(Intrinsic::MemCpy));
         assert_eq!(recognise("__memcpy_simd"), Some(Intrinsic::MemCpy));
-        assert_eq!(recognise("__memmove_thunderx2"), Some(Intrinsic::MemCpy));
+        assert_eq!(recognise("__memmove_thunderx2"), Some(Intrinsic::MemMove));
         assert_eq!(recognise("__memset_a64fx"), Some(Intrinsic::MemSet));
         assert_eq!(recognise("mempcpy"), Some(Intrinsic::MemPCpy));
     }
