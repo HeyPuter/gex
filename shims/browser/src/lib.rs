@@ -1536,7 +1536,11 @@ pub extern "C" fn gex_dump_threads() {
                 waiting_name(&t.waiting),
             ));
         }
-        s.push('\n');
+        // Per-Worker JS phase (0 init, 3 compiling, 4 installing, 6 in-enter,
+        // 7 post-enter, 8 parked) -- says which Workers are stuck in a JS await
+        // vs the scheduler, without the console logging that perturbs the
+        // timing. klock too. Same process memory, so these are this pid's.
+        s.push_str(&format!(" klock={}\n", klock_holder()));
         warn_line(&s);
     });
 }
@@ -2708,9 +2712,24 @@ pub extern "C" fn gex_set_worker(id: u32) {
     WORKER.with(|w| w.set(id));
 }
 
+
 /// Who holds the kernel: a Worker id plus one, or zero for nobody.
 #[cfg(feature = "shared-memory")]
 static KLOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Who holds the kernel lock right now: 0 = nobody, else the holder's Worker id
+/// plus one. For deadlock diagnosis -- a Worker spinning in `KLock::take` while
+/// this stays non-zero and unchanged is blocked on whoever holds it.
+fn klock_holder() -> u32 {
+    #[cfg(feature = "shared-memory")]
+    { KLOCK.load(std::sync::atomic::Ordering::Relaxed) }
+    #[cfg(not(feature = "shared-memory"))]
+    { 0 }
+}
+#[no_mangle]
+pub extern "C" fn gex_klock_holder() -> u32 {
+    klock_holder()
+}
 
 /// The kernel lock, held for one call into `with_host`.
 ///
@@ -2729,6 +2748,7 @@ impl KLock {
             DEPTH.with(|d| d.set(d.get() + 1));
             return KLock;
         }
+        let mut spins: u32 = 0;
         loop {
             match KLOCK.compare_exchange_weak(
                 0,
@@ -2740,6 +2760,18 @@ impl KLock {
                 Err(held) => {
                     if held == 0 {
                         continue;
+                    }
+                    // A Worker that spins here for seconds is blocked on whoever
+                    // holds the lock -- a deadlock if that holder is itself
+                    // waiting. Say so, once per second, naming the holder.
+                    spins += 1;
+                    if spins % 1000 == 0 {
+                        warn_line(&format!(
+                            "[gex] worker {} has spun {}s for KLOCK, held by {}\n",
+                            me - 1,
+                            spins / 1000,
+                            held.wrapping_sub(1),
+                        ));
                     }
                     // SAFETY: the address of a `static AtomicU32`, which is
                     // four-byte aligned and in the memory every Worker shares.
@@ -3597,12 +3629,22 @@ pub extern "C" fn gex_closure_owner_at(page: u64, k: u32) -> i32 {
     if k != 0 {
         return -1;
     }
-    CLOSURE_OWNER
-        .0
-        .borrow()
-        .get(&page)
-        .map(|v| *v as i32)
-        .unwrap_or(-1)
+    // Under KLOCK, like `gex_closure_owner`'s matching branch: `CLOSURE_OWNER`
+    // is a `SingleThreaded<RefCell>` in shared memory that `gex_add_closure_module`
+    // `borrow_mut`s as libraries stream in. This runs on every Worker's miss
+    // path; unlocked, its `borrow` here races that writer on the RefCell's
+    // non-atomic borrow flag (the flag lives in shared memory, so a concurrent
+    // reader and writer corrupt it) -> a spurious "already mutably borrowed"
+    // panic surfacing at whichever access reads the corrupted flag next. The
+    // KLOCK branch above was wrapped; this fall-through was missed.
+    with_host(|_| {
+        CLOSURE_OWNER
+            .0
+            .borrow()
+            .get(&page)
+            .map(|v| *v as i32)
+            .unwrap_or(-1)
+    })
 }
 
 /// Where the closure build says each object goes, staged until there is a
@@ -4130,6 +4172,46 @@ static IMAGE_TABLE: SingleThreaded<std::collections::BTreeMap<(usize, u64), u32>
 static CLAIM_NEXT: [std::sync::atomic::AtomicU32; gex_abi::DISPATCH_TABLES] =
     [const { std::sync::atomic::AtomicU32::new(0) }; gex_abi::DISPATCH_TABLES];
 
+/// The highest slot END any directory entry names, per table, across every
+/// Worker of this process. Every base written into the shared dispatch directory
+/// (by any base-assignment path -- claim, JIT miss, lazy/pin/restore) is folded
+/// in here via `dir_note`, so a Worker can grow its own funcref table to cover a
+/// page a *sibling* numbered. Without it the directory names a slot this Worker's
+/// table has not grown to and `return_call_indirect` traps "table index out of
+/// bounds" -- the concurrent-JIT / stale-dispatch race. CLAIM_NEXT alone is not
+/// enough: the JIT miss path numbers pages from the system-wide `shared_slot` map,
+/// not `gex_claim_page`, so its slots never bump CLAIM_NEXT.
+static DIR_HIGH: [std::sync::atomic::AtomicU32; gex_abi::DISPATCH_TABLES] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; gex_abi::DISPATCH_TABLES];
+
+/// Fold a base written to the directory into `DIR_HIGH`. The table is the entry's
+/// table field; the slot is its offset within that table, so the size the table
+/// must reach is that offset plus a page of slots.
+fn note_dir_high(base: u32) {
+    let t = gex_abi::dispatch_entry_table(base);
+    let end = (base & gex_abi::DISPATCH_SLOT_MASK) + gex_abi::SLOTS_PER_PAGE as u32;
+    if let Some(c) = DIR_HIGH.get(t) {
+        c.fetch_max(end, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The size table `i` must reach to dispatch any page the directory names --
+/// max of the claim allocator's high-water and every directory entry's. The run
+/// loop in gex.mjs grows this Worker's funcref table to this and retries a
+/// "table index out of bounds" dispatch. See `DIR_HIGH`.
+#[no_mangle]
+pub extern "C" fn gex_claimed_slots(i: u32) -> u32 {
+    let claimed = CLAIM_NEXT
+        .get(i as usize)
+        .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+        .unwrap_or(0);
+    let named = DIR_HIGH
+        .get(i as usize)
+        .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+        .unwrap_or(0);
+    claimed.max(named)
+}
+
 /// Number a page in this process's directory and return its base slot, doing it
 /// atomically so a concurrent claim of the *same* page cannot hand two threads
 /// two different bases. If another thread numbered it first its base is adopted
@@ -4190,6 +4272,10 @@ pub extern "C" fn gex_watch_dir(page: i64) {
 /// Say who is about to change a watched page's directory entry, to catch a page
 /// dispatched through a base other than the one its slots were written at.
 fn dir_note(page: u64, entry: u32, who: &str) {
+    // Every directory write passes through here, so it is where the process-wide
+    // per-table high-water is kept: fold this base in before the watch gate so a
+    // sibling Worker can grow its table to cover this page. See `DIR_HIGH`.
+    note_dir_high(entry);
     let want = DIR_WATCH.load(std::sync::atomic::Ordering::Relaxed);
     if want < 0 || want as u64 != page {
         return;
@@ -4788,6 +4874,23 @@ pub extern "C" fn gex_wake() -> i32 {
                         waiting_name(&t.waiting),
                         t.pc
                     ));
+                    // For a futex park, say enough to tell a LOST wake from a
+                    // legitimate wait: the address, the shared generation at park
+                    // time vs now (equal => no wake was relayed to it), and the
+                    // guest word vs the value it slept on (differ => the guest
+                    // thinks it was woken, so a relay that never bumped the gen is
+                    // a lost wake). See `thread_ready`'s Futex arm.
+                    if let Waiting::Futex { parked, val, wake_gen, .. } = &t.waiting {
+                        let a = parked.addr();
+                        let gen_now = if unsafe { k_present() } != 0 {
+                            unsafe { k_futex_gen(a) }
+                        } else { 0 };
+                        let word = GuestMem::new(guest_bytes()).read_u32(a).unwrap_or(0);
+                        out.push_str(&format!(
+                            "[ftx a={a:#x} gen={wake_gen}/{gen_now} word={word:#x}/slept={val:#x} woken={}]",
+                            parked.woken()
+                        ));
+                    }
                 }
             }
             out
@@ -5075,13 +5178,19 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // stderr, so without it a fork's clones, execves and wait4 read as one
         // sequence.
         let whose_pid = with_host(|h| h.kernel.pid);
+        // The caller (x30) symbolized: which library function invoked this
+        // syscall. Pins a busy-wait to the code doing it -- gtk3-demo's
+        // native-wayland stall spins the main thread on time()/gettimeofday and
+        // only the caller says which lock/condition it is polling.
+        let caller = with_host(|h| object_off_at(h, g(30)));
         trace_line(&format!(
-            "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{obj} ...\n",
+            "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{obj} <-{}  ...\n",
             gex_kernel::syscalls::syscall_name(n),
             g(0),
             g(1),
             g(2),
             named.map_or(String::new(), |p| format!(" \"{p}\"")),
+            if caller.is_empty() { format!("{:#x}", g(30)) } else { caller },
         ));
         // For a gather write, what the kernel sees at each iovec: a mismatch
         // with the guest means they disagree about the memory they share.
@@ -5210,9 +5319,28 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 let sp = gm.read_u64(kstate.ctx_addr + ctx::SP as u64).unwrap_or(0);
                 let x30 = gm.read_u64(kstate.ctx_addr + ctx::x(30) as u64).unwrap_or(0);
                 let mut bt = String::new();
+                // The frame-pointer chain: at each aarch64 frame `[x29]` is the
+                // caller's x29 and `[x29+8]` its return address -- a clean call
+                // stack, unlike raw stack words which are half stale data.
+                let mut fp = gm.read_u64(kstate.ctx_addr + ctx::x(29) as u64).unwrap_or(0);
+                for _ in 0..40 {
+                    if fp == 0 || fp & 7 != 0 {
+                        break;
+                    }
+                    let ret = gm.read_u64(fp + 8).unwrap_or(0);
+                    let o = object_off_at(h, ret);
+                    if !o.is_empty() {
+                        bt.push_str(&format!("\n    #fp {ret:#x} {o}"));
+                    }
+                    let next = gm.read_u64(fp).unwrap_or(0);
+                    if next <= fp {
+                        break;
+                    }
+                    fp = next;
+                }
                 for i in 0..80u64 {
                     let w = gm.read_u64(sp + i * 8).unwrap_or(0);
-                    let o = object_name_at(h, w);
+                    let o = object_off_at(h, w);
                     if o.contains(".so") || o.starts_with('/') {
                         bt.push_str(&format!("\n    [sp+{:#x}] {w:#x} {o}", i * 8));
                     }
@@ -7830,7 +7958,34 @@ fn report_idle(why: u8) {
         // Worker's census.
         for (pid, p, k) in std::iter::once((h.kernel.pid as usize, &h.threads, &h.kernel)) {
             for (i, t) in p.iter().enumerate() {
-                out.push_str(&format!(" {pid}.{i}={}", waiting_name(&t.waiting)));
+                out.push_str(&format!(" {pid}.{i}={}@{:#x}", waiting_name(&t.waiting), t.pc));
+                // The live ctx pc (updated by the JIT at block boundaries), not
+                // just the last saved kstate pc: a thread "runnable"/"another
+                // worker" whose Worker is stalled in JS shows its real position
+                // here, where t.pc is still the entry. Names the block a stranded
+                // nested-clone thread died on (native-wayland gtk stall).
+                let cpc = GuestMem::new(guest_bytes())
+                    .read_u64(t.kstate.ctx_addr + ctx::PC as u64)
+                    .unwrap_or(0);
+                if cpc != t.pc {
+                    let where_ = k.mem.vmas().iter()
+                        .find(|v| cpc >= v.start && cpc < v.end)
+                        .map(|v| format!(" in {} +{:#x}", v.name, cpc - v.start))
+                        .unwrap_or_default();
+                    out.push_str(&format!("(cpc={cpc:#x}{where_})"));
+                }
+                // For a futex park, the lost-wake fingerprint: address, park-time
+                // shared gen vs now (equal => no wake relayed here), guest word vs
+                // slept value (differ => guest was woken but the gen never moved).
+                if let Waiting::Futex { parked, val, wake_gen, .. } = &t.waiting {
+                    let a = parked.addr();
+                    let gen_now = if unsafe { k_present() } != 0 { unsafe { k_futex_gen(a) } } else { 0 };
+                    let word = GuestMem::new(guest_bytes()).read_u32(a).unwrap_or(0);
+                    out.push_str(&format!(
+                        "[ftx a={a:#x} gen={wake_gen}/{gen_now} word={word:#x}/slept={val:#x} woken={}]",
+                        parked.woken()
+                    ));
+                }
                 // For a poll, which descriptors and how each answers now:
                 // whether the awaited thing is already true is the difference
                 // between a wait and a deadlock.
@@ -7889,8 +8044,9 @@ fn report_idle(why: u8) {
             asked.push_str(" (only the page can end it)");
         }
     }
+    let klock = klock_holder();
     trace_line(&format!(
-        "[gex] {n} turns with nothing runnable, wanting {asked}, threads:{census}\n"
+        "[gex] {n} turns with nothing runnable, wanting {asked}, klock={klock}, threads:{census}\n"
     ));
 }
 
@@ -9972,6 +10128,22 @@ fn note_blocks(
 /// The short name of whatever object holds this address, for a counter. Takes
 /// the host it already has, since the caller is inside `with_host` and a second
 /// `RefCell` borrow would panic.
+/// Like `object_name_at` but with the `+offset` into the object, so a return
+/// address on a crash stack can be run through objdump to name the function.
+fn object_off_at(h: &Host, a: u64) -> String {
+    h.kernel
+        .mem
+        .vmas()
+        .iter()
+        .find(|v| a >= v.start && a < v.end)
+        .map(|v| {
+            let n = v.code.as_ref().map(|(p, _)| p.as_str()).unwrap_or(&v.name);
+            let n = n.rsplit('/').next().unwrap_or(n);
+            format!("{n} +{:#x}", a - v.start)
+        })
+        .unwrap_or_default()
+}
+
 fn object_name_at(h: &Host, a: u64) -> String {
     h.kernel
         .mem

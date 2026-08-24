@@ -327,6 +327,10 @@ export class Gex {
   }
   #iGrows = 0;
   #iAdded = 0;
+  // How many "table index out of bounds" dispatch traps were repaired by
+  // catching this Worker's tables up to the shared claimed high-water. Capped
+  // in the run loop so a genuine over-run still fails.
+  #tableRetries = 0;
   #iCopied = 0;
   #compileMs = 0;
   #instantiateMs = 0;
@@ -1051,7 +1055,10 @@ export class Gex {
    * data and later ones leave it alone. A plain memory would wipe the kernel.
    */
   async attach(shimWasm, guestWasm, { devices = true } = {}) {
+    const _at = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[attach] ${s}`); };
+    _at('start');
     await this.#startKernel();
+    _at('kernel started');
     // A compiled `Module` if the host has one, bytes otherwise: passing a
     // module saves recompiling the shim per Worker. See `load`.
     const tShimC = performance.now();
@@ -1065,6 +1072,7 @@ export class Gex {
       gex_k: this.#kernelImports(shimMod),
     });
     this.#shimInstantiateMs = performance.now() - tShimI;
+    _at('shim instantiated');
     this.#u8 = null;
     // The stack pointer is a per-instance global, so every Worker has its own
     // and must be told where it goes.
@@ -1100,9 +1108,12 @@ export class Gex {
       { gex: this.#imports },
     );
     this.#guestInstantiateMs = performance.now() - tGuest;
+    _at('guest instantiated');
     this.#offerToFill(this.#guest);
+    _at('offerToFill done, catchUp');
     // Everything the process translated before this thread existed.
     await this.#catchUp();
+    _at('attach catchUp done');
   }
 
   /**
@@ -1187,14 +1198,18 @@ export class Gex {
    * a `kernel` in the constructor options: one process needs no such table.
    */
   async #startKernel() {
-    if (!this.#kernelSpec || this.#kernel) return;
+    const _k = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[kernel] ${s}`); };
+    if (!this.#kernelSpec || this.#kernel) { _k(`skip (spec=${!!this.#kernelSpec} kernel=${!!this.#kernel})`); return; }
     const { module, memory, stackTop } = this.#kernelSpec;
+    _k(`compile (isModule=${module instanceof WebAssembly.Module} stackTop=0x${(stackTop>>>0).toString(16)})`);
     const mod = module instanceof WebAssembly.Module
       ? module
       : await WebAssembly.compile(module);
+    _k('instantiate');
     const inst = await WebAssembly.instantiate(mod, {
       env: { memory, process: this.#memory },
     });
+    _k('instantiated');
     // The stack, before anything is called. Each Worker's `__stack_pointer` is
     // a per-instance global that wasm-ld inits to the same address in shared
     // memory, so two Workers in the kernel would overwrite each other's locals.
@@ -1669,6 +1684,7 @@ export class Gex {
     const tid = e.gex_thread_pending();
     if (!tid) return;
     const thread = { tid, ctx: e.gex_thread_ctx(), pc: e.gex_thread_pc(), memory: this.#memory };
+    if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] #drainThread posting tid ${tid} (t=${Date.now()})`);
     e.gex_thread_taken();
     // A thread needs a memory two Workers can both hold. Posting a non-shared
     // memory does not fail -- the structured clone copies it, and the thread
@@ -1702,8 +1718,11 @@ export class Gex {
    */
   async adoptThread(shimWasm, guestWasm, thread) {
     await this.attach(shimWasm, guestWasm, { devices: false });
+    const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
+    _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
+    _t(`adopted, catchUp (${(this.#shim.exports.gex_module_count?.()>>>0)} modules)`);
     // Install every already-translated module into this Worker's own tables
     // before it runs an instruction. The funcref tables are per-thread (a wasm
     // table is not shareable) while the directory naming their slots is shared
@@ -1942,6 +1961,31 @@ export class Gex {
         // recovery below calls into the shim, whose kernel a crash may leave
         // borrowed -- a second call would bury the first error.
         if (this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff()) {
+          // RECOVERABLE first: a "table index is out of bounds" during dispatch
+          // is usually just this Worker's funcref table lagging the shared
+          // directory. Another Worker numbered a page (bumping the process-wide
+          // CLAIM_NEXT and growing ITS table) while ours had not caught up, so
+          // the directory names a slot past the end of our table and
+          // `return_call_indirect` trapped. Grow to the claimed high-water and
+          // retry the same dispatch: the slot then holds the block (if we filled
+          // it) or the miss stub (a normal miss that fills it). Only retry when
+          // the grow made progress and only so many times, so a genuine over-run
+          // still fails loudly. This is the concurrent-JIT table-growth race that
+          // stranded threads under heavy multithread translation (gtk3-demo, and
+          // the jit-storm repro). See gex_claimed_slots.
+          const eR = this.#shim.exports;
+          if (/table index is out of bounds/.test(err.message) && eR.gex_last_target) {
+            let tgt = 0n;
+            try { tgt = eR.gex_last_target(); } catch { tgt = 0n; }
+            const grew = this.#growTablesToClaimed();
+            if (grew && (globalThis.GEX_TABLE_DEBUG || (typeof process !== 'undefined' && process.env?.GEX_TABLE_DEBUG)))
+              console.error(`[tblrec] caught up tables for a sibling-numbered page (retry ${this.#tableRetries})`);
+            if (tgt && this.#tableRetries < 100000 && grew) {
+              this.#tableRetries++;
+              pc = tgt < 0n ? tgt + (1n << 64n) : tgt;
+              continue;
+            }
+          }
           // Each question in its own try: after a crash the kernel may be
           // borrowed and a second call would trap on top of the first.
           const ask = (f, how) => {
@@ -2179,6 +2223,10 @@ export class Gex {
             // it is not mistaken for a clean exit -- and it is said out loud.
             const stalled = e.gex_exited ? !e.gex_exited() : false;
             if (stalled) {
+              // Dump every thread's wait-state + pc so a give-up says WHICH
+              // thread is stuck on WHAT (futex vs socket read vs exited), not
+              // just that nothing moved. Prints via the shim; safe if borrowed.
+              try { e.gex_dump_threads?.(); } catch {}
               const why =
                 `[gex] the run stopped and nothing could wake it ` +
                 `(wake=${woke}, exited=${!stalled})`;
@@ -2365,6 +2413,33 @@ export class Gex {
       }
     }
     return tables;
+  }
+
+  /**
+   * Grow this Worker's funcref tables to the process-wide claimed high-water,
+   * so a page a sibling Worker numbered (and grew ITS table for) can be
+   * dispatched here without `return_call_indirect` running off the end. Returns
+   * true if anything grew -- the run loop only retries a "table index out of
+   * bounds" when this made progress, so a genuine over-run still fails loudly.
+   * Cheap when nothing changed: a size read and a compare per table.
+   */
+  #growTablesToClaimed() {
+    const e = this.#shim.exports;
+    if (!e.gex_claimed_slots) return false;
+    const tables = this.#dispatchTables();
+    const stub = tables[0].get(0);
+    let grew = false;
+    for (let i = 0; i < tables.length; i++) {
+      const need = e.gex_claimed_slots(i) >>> 0;
+      if (need <= tables[i].length) continue;
+      try {
+        tables[i].grow(need - tables[i].length, stub);
+        grew = true;
+      } catch {
+        /* a table that will not grow is reported by the caller's retry cap */
+      }
+    }
+    return grew;
   }
 
   /**

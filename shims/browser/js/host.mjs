@@ -418,6 +418,7 @@ export class ProcessHost {
         // Worker. Nothing waits for it.
         this.#threads++;
         const key = `${pid}:${m.thread.tid}`;
+        if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'thread' for ${key}, making Worker (t=${Date.now()})`);
         const w2 = this.#makeWorker();
         this.#workers.set(key, w2);
         // Keyed by the thread, so its end stops the right Worker and frees the
@@ -437,6 +438,7 @@ export class ProcessHost {
         // A thread's start message is keyed by tid and handed over here, once.
         const start = (mm) => {
           if (mm?.kind !== 'ready') return;
+          if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] host got 'ready' from ${key}, sending start (t=${Date.now()})`);
           this.#pending.delete(key);
           // Without the closure, as the fork path: `closure` entries are mostly
           // promises (a library is fetched on first branch into it), and a

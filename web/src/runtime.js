@@ -507,6 +507,11 @@ export async function runProgram(
       adoptTrace:
         !!globalThis.GEX_ADOPT_TRACE ||
         (typeof process !== 'undefined' && !!process.env?.GEX_ADOPT_TRACE),
+      // Thread-Worker attach/adopt narration: pinpoints a stranded thread whose
+      // wasm instantiate never completes (threads-worker-per-thread residual).
+      attachTrace:
+        !!globalThis.GEX_ATTACH_TRACE ||
+        (typeof process !== 'undefined' && !!process.env?.GEX_ATTACH_TRACE),
       // KiB of mapped text per object to statically recompile once hot. Eight
       // megabytes is the largest that works today (above it the graphics rootfs
       // meets #73) and covers every library these demos run except Mesa's
@@ -516,6 +521,11 @@ export async function runProgram(
       // of substituting the shim's, to tell a substitution fault from a codegen
       // one. In `extra` so every process gets it.
       noIntrinsics: flag('nointrinsics') ? 1 : undefined,
+      // `?pregrow=1`: grow guest memory to a large floor up front. Tests whether
+      // a concurrent memory.grow is what stalls a spawned thread's wasm
+      // instantiate (native-wayland-gtk-thread-stall). In `extra` so every
+      // Worker sets it before running.
+      pregrow: flag('pregrow') ? 1 : undefined,
       // `?intrinsicmask=N` enables only some substitution families, to bisect
       // which one corrupts memory: bit0=memcpy, bit1=memset, bit2=memcmp.
       // In `extra` so every process gets it.

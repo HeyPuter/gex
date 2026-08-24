@@ -202,10 +202,32 @@ if [ -n "${GEX_GTK:-}" ] && [ -d "$SRC/usr/lib/aarch64-linux-gnu/gtk-3.0" ]; the
     cp -r "$SRC/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0" "$R/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0"
     cp -r "$SRC/usr/share/glib-2.0/schemas" "$R/usr/share/glib-2.0/schemas"
     [ -d "$SRC/usr/share/icons" ] && cp -r "$SRC/usr/share/icons" "$R/usr/share/icons"
-    # The pixbuf loader cache names absolute loader paths and must match the
-    # guest's layout, so the guest builds it at startup with
-    # gdk-pixbuf-query-loaders (see the wayland demo's GTK env). Nothing to do
-    # here but ship the loaders and the tool.
+    # The shared-mime-info database. gdk-pixbuf-thumbnailer (and any GIO
+    # content-type path) identifies a file's type through g_content_type_guess,
+    # which reads /usr/share/mime/mime.cache (+globs/magic). Without it every
+    # load fails with "Couldn't recognize the image file format" -- NOT a gex
+    # bug: it only ever "worked" under qemu-user because qemu has no chroot and
+    # leaked the *host's* /usr/share/mime. Ship the guest its own copy.
+    if [ -d "$SRC/usr/share/mime" ]; then
+        cp -r "$SRC/usr/share/mime" "$R/usr/share/mime"
+    elif [ -d /usr/share/mime ]; then
+        cp -r /usr/share/mime "$R/usr/share/mime"
+    fi
+    # Bake the pixbuf loader cache. It names absolute loader paths that must
+    # match the guest's layout, and the guest cannot build it at startup (the
+    # forked query-loaders writes into a per-process tmpfs the GTK client never
+    # sees; see web/src/demos.js). Generate it here with the guest's OWN
+    # query-loaders run under qemu-user, then rewrite the qemu host prefix ($R)
+    # to guest-absolute paths. A hand-edited or path-mismatched cache makes
+    # gdk-pixbuf free() a bad pointer at parse time (reproduces under qemu too).
+    QEMU="${GEX_QEMU:-$HOME/toolchains/qemu-aarch64}"
+    LOADERDIR="$R/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders"
+    if [ -x "$QEMU" ] && [ -d "$LOADERDIR" ]; then
+        QEMU_LD_PREFIX="$R" LD_LIBRARY_PATH="$R/usr/lib/aarch64-linux-gnu" \
+            "$QEMU" "$R/usr/bin/gdk-pixbuf-query-loaders" "$LOADERDIR"/*.so \
+            2>/dev/null | sed "s#$R##g" \
+            > "$R/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+    fi
 fi
 [ -e "$SRC/usr/share/drirc.d" ] && cp -r "$SRC/usr/share/drirc.d" "$R/usr/share/drirc.d"
 [ -e "$SRC/usr/lib/xorg/protocol.txt" ] && cp "$SRC/usr/lib/xorg/protocol.txt" "$R/usr/lib/xorg/"

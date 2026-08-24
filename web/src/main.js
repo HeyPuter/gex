@@ -291,6 +291,9 @@ for (const [event, describe] of [
   // `?adopttrace=1`: narrate adopt phases only (no debugExit write-flood), fast
   // enough to reach a deep fork and show where its adopt hangs.
   if (params.get('adopttrace')) globalThis.GEX_ADOPT_TRACE = 1;
+  // `?attachtrace=1`: narrate a thread Worker's attach/adopt, to catch a
+  // stranded thread whose wasm instantiate never returns.
+  if (params.get('attachtrace')) globalThis.GEX_ATTACH_TRACE = 1;
   // `?virgltrace=1`: log every vtest feed, to tell a rendering client from one
   // stuck before its first draw.
   if (params.get('virgltrace')) globalThis.GEX_VIRGL_TRACE = 1;

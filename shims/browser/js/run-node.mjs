@@ -16,6 +16,10 @@ import { basename, dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
 
+// The host runs on the main thread; give it the attach-trace flag too so
+// thread spawn/adopt timing is visible from the host side, not just the Worker.
+if (process.env.GEX_ATTACH_TRACE) globalThis.GEX_ATTACH_TRACE = 1;
+
 // Options come first and are named, so a guest argument that happens to
 // contain an `=` -- `lua -e 'local x=1'`, say -- reaches the guest intact.
 const files = {};
@@ -218,6 +222,12 @@ const host = new ProcessHost({
     // apt fetches in a forked helper, so the one process needing a network was
     // the only one without one when this was not carried.
     network: !!process.env.GEX_NETWORK,
+    // GEX_WL_STUB: run the shim's gex-wayland compositor with a headless present
+    // (no canvas), so a native-wayland guest connects and inits under node --
+    // for reproducing the browser-only native-wayland thread deadlock with node
+    // tooling. Every process gets it (gtk3-demo is a forked child of the shell).
+    wlStub: !!process.env.GEX_WL_STUB,
+    attachTrace: !!process.env.GEX_ATTACH_TRACE,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
     // GEX_HEARTBEAT: say where the guest is every N safepoints and every 200
     // dispatch misses, so a slow run can be told from a stuck one.

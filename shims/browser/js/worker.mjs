@@ -297,6 +297,10 @@ async function handle(msg) {
   // Lightweight adopt-phase narration, without the debugExit write-flood: fast
   // enough for a deep fork to reach where it hangs. See `adoptProcess`.
   if (msg.adoptTrace) globalThis.GEX_ADOPT_TRACE = 1;
+  // `?attachtrace=1`: narrate a thread Worker's attach/adopt so a stranded
+  // thread (one whose wasm instantiate never completes) is visible. Off by
+  // default -- it is one line per phase per thread. See threads-worker note.
+  if (msg.attachTrace) globalThis.GEX_ATTACH_TRACE = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   const gex = new Gex(new WorkerEnv(), {
@@ -329,6 +333,17 @@ async function handle(msg) {
   if (msg.wlChannel) {
     const { WlProxy } = await import('./wl-bridge.mjs');
     gex.useWl(new WlProxy(msg.wlChannel, () => port.post({ kind: 'wl' })));
+  } else if (msg.wlStub) {
+    // A headless compositor for node: the shim's gex-wayland runs and binds
+    // `wayland-0`, so a guest connects and inits exactly as in the browser, but
+    // frames are discarded (no canvas) and there is no input. Lets the
+    // native-wayland deadlock be reproduced under node's tooling. present/
+    // pollInput are what `wl_present` and the input pull call.
+    let count = 0;
+    gex.useWl({
+      present() { count++; if (count === 1 || count % 60 === 0) console.error(`[wlstub] present #${count}`); },
+      pollInput() { return 0; },
+    });
   }
   // The Node fast lane's network: real TCP sockets rather than Wisp, so the
   // paths above them -- apt's helper, the fetch, the parse -- run here in two
@@ -358,7 +373,10 @@ async function handle(msg) {
     // registers of its own.
     let ctx;
     if (msg.kind === 'thread') {
+      const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${msg.tid}] ${s}`); };
+      _t(`adopt start pc=0x${(msg.pc??0n).toString(16)} ctx=0x${(msg.ctx??0n).toString(16)}`);
       ({ entry, ctx } = await gex.adoptThread(msg.shim, msg.guest, msg));
+      _t(`adopt done entry=0x${(entry??0n).toString(16)}, entering run`);
     } else if (msg.kind === 'adopt') {
     console.debug(`[worker] pid ${msg.child?.pid}: adopt arrived`);
       // With the closure, as a fresh process gets it: a child inherits its
