@@ -259,7 +259,14 @@ async function ensureChrome(restart) {
     '--use-angle=swiftshader-webgl',
     '--enable-gpu-rasterization',
     '--ozone-platform=headless',
-    '--ozone-override-screen-size=800,600',
+    // The headless screen, and so the viewport a screenshot captures.
+    // 800x600 fits the terminal and clips a toolkit window in half, which
+    // is enough to tell a run passed and not enough to show anyone what it
+    // drew -- `GEX_SCREEN=1280,1000` is for the second question.
+    `--ozone-override-screen-size=${process.env.GEX_SCREEN || '800,600'}`,
+    // Both, because they are different things: the screen is what the page
+    // may grow to and the window is what a screenshot captures.
+    `--window-size=${process.env.GEX_SCREEN || '800,600'}`,
     // We do our own hang detection and want the real stack, not Chrome's
     // "page unresponsive" interposing.
     '--disable-hang-monitor',

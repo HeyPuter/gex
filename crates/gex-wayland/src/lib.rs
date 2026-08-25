@@ -191,6 +191,11 @@ pub struct Client {
     /// The surface input is delivered to: the last one to commit a buffer, i.e.
     /// the visible window.
     focus_surface: Option<u32>,
+    /// The last position the host injected, in surface pixels. An `enter`
+    /// carries it, so a click that arrives without a motion in front of it --
+    /// or right after the focus moved -- lands where the pointer is rather
+    /// than at the origin.
+    pointer_at: (i32, i32),
     /// Which surface `enter` was last sent for, per device (`None` == not
     /// currently over/focused), so motion and keys only follow an enter.
     pointer_on: Option<u32>,
@@ -230,6 +235,7 @@ impl Client {
             pointer: None,
             keyboard: None,
             focus_surface: None,
+            pointer_at: (0, 0),
             pointer_on: None,
             keyboard_on: None,
             pending_keymap: None,
@@ -717,8 +723,32 @@ impl Client {
             }
         }
         let mut produced = None;
+        // A surface with no shell role is not a window, and must never reach the
+        // canvas or take the input focus.
+        //
+        // `wl_pointer.set_cursor` hands the compositor a small surface holding
+        // the cursor image, and a toolkit points its cursor the instant the
+        // pointer enters. Without this test the first mouse move over a Qt or
+        // KDE window replaced the window on the canvas with a giant arrow --
+        // and worse, `focus_surface` follows whatever last committed a frame,
+        // so the pointer focus moved to the cursor surface and every click
+        // after it was delivered to an object the toolkit does not draw with.
+        // That is the other half of "the pointer moves but clicking does
+        // nothing". Subsurfaces (GTK's tooltips) are the same story.
+        //
+        // No compositor shows an unroled surface either. The buffer is still
+        // released below whatever happens here: a client whose cursor buffer
+        // never comes back stops drawing.
+        let is_window = state.xdg.is_some();
         if let Some(buffer_id) = buffer_id {
-            if let Some(Object::Buffer(spec)) = self.objects.get(&buffer_id).cloned() {
+            if !is_window && Self::tracing() {
+                trace_out(&format!(
+                    "[wl] commit on surface {surface} with no role -- not a window"
+                ));
+            }
+            if let (true, Some(Object::Buffer(spec))) =
+                (is_window, self.objects.get(&buffer_id).cloned())
+            {
                 let mapped = buffers.map(spec.fd, spec.pool_size);
                 if Self::tracing() {
                     trace_out(&format!(
@@ -752,6 +782,15 @@ impl Client {
             Some(frame) => {
                 // The visible window, and so where injected input is delivered.
                 self.focus_surface = Some(surface);
+                // Keyboard focus follows the window the moment it appears,
+                // rather than waiting for a key to arrive and entering then.
+                // A toolkit acts on `enter` in its own event loop -- Qt makes
+                // the toplevel the active window a turn later -- so a key
+                // delivered in the same batch as the enter reaches a window
+                // that is not focused yet and is dropped on the floor. Typing
+                // into KCalc lost its first digit every run because of it.
+                // Idempotent, and a no-op until the client binds a keyboard.
+                self.ensure_keyboard_enter();
                 self.frames.push(frame);
             }
             None if buffer_id.is_some() && Self::tracing() => {
@@ -997,13 +1036,14 @@ impl Client {
             self.send(Writer::new(ptr, 1).uint(serial).object(old)); // leave
         }
         let serial = self.serial();
+        let (x, y) = self.pointer_at;
         // enter(serial, surface, surface_x, surface_y)
         self.send(
             Writer::new(ptr, 0)
                 .uint(serial)
                 .object(surface)
-                .fixed(Fixed::from_int(0))
-                .fixed(Fixed::from_int(0)),
+                .fixed(Fixed::from_int(x))
+                .fixed(Fixed::from_int(y)),
         );
         self.pointer_on = Some(surface);
         true
@@ -1019,6 +1059,8 @@ impl Client {
     /// Pointer moved to surface-local `(x, y)` in pixels.
     pub fn pointer_motion(&mut self, x: i32, y: i32, time: u32) {
         let Some(ptr) = self.pointer else { return };
+        // Before the enter, so the enter it may trigger carries this position.
+        self.pointer_at = (x, y);
         if !self.ensure_pointer_enter() {
             return;
         }

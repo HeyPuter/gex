@@ -159,7 +159,22 @@ impl WaylandDevice {
         // Page input for this turn, applied below to every client that has bound
         // a device. One event set reaches each such client once; the demo has a
         // single input client (Xwayland or the native gears), so this is exact.
-        let input = poll_input();
+        //
+        // Drained ONLY when a client is there to take it, and that is the whole
+        // difference between a working pointer and the bug this replaced. There
+        // is one input ring on the page and a `WaylandDevice` in EVERY guest
+        // process -- `mount_devices` gives one to pid 1 and to every child it
+        // adopts -- so every process's pump was draining the same ring. The
+        // events a process with no client drained were dropped on the floor,
+        // and which process won each event was a scheduler race: the shell, or
+        // Xwayland, or the client. Motion survived it (there are hundreds of
+        // events and losing most of them still tracks the cursor), and a click
+        // did not -- press and release are one event each, so a click landed
+        // only when both won the race, and a lone surviving press left a button
+        // stuck down. The queue is the right place for an event no one can take
+        // yet: it stays in the ring, and the pump that has the client gets it.
+        let wanted = sessions.iter().any(|s| s.client.wants_input());
+        let input = if wanted { poll_input() } else { Vec::new() };
         sessions.retain_mut(|s| {
             let mut gone = false;
             let mut buf = vec![0u8; 64 * 1024];

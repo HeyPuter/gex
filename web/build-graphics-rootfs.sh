@@ -105,13 +105,11 @@ libtasn1.so.6 libthai.so.0 libtiff.so.6 libudev.so.1 libunistring.so.2
 libwebp.so.7 libXaw7.so.7 libxcb-render.so.0 libxcb-shape.so.0
 libXcomposite.so.1 libXcursor.so.1 libXdamage.so.1 libXrandr.so.2
 "
-# The GTK3 stack (libgtk-3 + ~50 transitive libs, plus schemas/icons/pixbuf
-# data) was fully assembled and stages in /tmp/gexapps, but gtk3-demo deadlocks
-# in GLib's threaded init on the worker-per-thread cross-worker futex race (the
-# same class as Mesa's shader-cache thread, with no single-thread escape hatch),
-# so its 56 MB is left out of the default image. To revive it once that race is
-# fixed, re-add those SONAMEs here + gtk3-demo/gdk-pixbuf-query-loaders to PROGS
-# + the GTK data copy below. See the apps-through-xwayland-pipeline memory.
+# The GTK3 stack is in the image, and so are Qt 5, Qt 6 and KF5 -- but their
+# libraries are not listed here. Hand-listing SONAMEs stopped scaling at the
+# first toolkit; the closure pass further down takes them from the programs
+# themselves. What is named here is what a *trace* found and DT_NEEDED cannot:
+# the X server, the drivers it dlopens, and the programs an execve reaches.
 PROGS="Xvfb xkbcomp glxgears.aarch64-linux-gnu glxinfo.aarch64-linux-gnu
 es2gears_wayland.aarch64-linux-gnu eglinfo.aarch64-linux-gnu Xwayland
 es2gears_x11.aarch64-linux-gnu es2tri.aarch64-linux-gnu es2_info.aarch64-linux-gnu
@@ -153,6 +151,133 @@ cp -L "$SRC/bin/sleep" "$R/bin/sleep"
 # flush the five-second report that is the only thing it prints.
 cp -L "$SRC/usr/bin/timeout" "$R/usr/bin/timeout"
 
+# -- the toolkit applications, and everything they link --------------------
+#
+# The lists above are one traced closure, written down by hand. The Qt, KF5
+# and GTK applications the Wayland demo offers reach two hundred libraries
+# more between them, and the ones that decide whether an app starts at all
+# are in no binary's DT_NEEDED: a toolkit picks its window system from a
+# plugin it dlopens, so `QT_QPA_PLATFORM=wayland` is served by
+# `plugins/platforms/libqwayland-generic.so`, and that plugin is what pulls
+# libQt5WaylandClient in behind it.
+#
+# So this pass is mechanical rather than curated. Name the programs and the
+# plugin directories; take the transitive DT_NEEDED closure of all of it.
+# Names resolve the way ld.so resolves them -- the object's own directory
+# first, then the multiarch library directories -- and a name that resolves
+# to a symlink is copied as the file it points at, because the SONAME is the
+# only name anything ever opens.
+APPS="${GEX_APPS:-/usr/bin/gtk3-demo /usr/bin/gtk3-widget-factory
+      /usr/bin/kcalc /usr/bin/qt6ct /usr/bin/compton-conf /usr/games/explosive-c4
+      /usr/lib/aarch64-linux-gnu/qt5/plugins /usr/lib/aarch64-linux-gnu/qt6/plugins
+      /usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0 /usr/lib/aarch64-linux-gnu/gtk-3.0}"
+
+# shellcheck disable=SC2086
+python3 - "$SRC" $APPS > "$WORK/closure" <<'PYEOF'
+import os, struct, sys
+
+root, roots = sys.argv[1], sys.argv[2:]
+# Where ld.so looks, after the object's own directory. This Debian keeps its
+# libraries in the multiarch directory, and /lib is not a link to /usr/lib
+# here, so both are searched -- in the order the loader searches them.
+LIBDIRS = ['/usr/lib/aarch64-linux-gnu', '/lib/aarch64-linux-gnu',
+           '/usr/lib', '/lib']
+
+
+def needed(path):
+    """The DT_NEEDED names of an ELF, read out of its dynamic section.
+
+    Read here rather than shelled out to readelf: this walks a few hundred
+    objects, and a process each would be most of the run time.
+    """
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+    except OSError:
+        return []
+    # 64-bit little-endian only, which is every object in an arm64 rootfs.
+    # Anything else in a plugin directory -- a script, a .json -- has no
+    # dynamic section to read and contributes nothing.
+    if data[:4] != b'\x7fELF' or data[4] != 2:
+        return []
+    shoff, = struct.unpack_from('<Q', data, 0x28)
+    shentsize, shnum = struct.unpack_from('<HH', data, 0x3a)
+    sections, dyn = [], None
+    for i in range(shnum):
+        off = shoff + i * shentsize
+        sh_type, = struct.unpack_from('<I', data, off + 4)
+        sh_offset, sh_size = struct.unpack_from('<QQ', data, off + 0x18)
+        sh_link, = struct.unpack_from('<I', data, off + 0x28)
+        sections.append(sh_offset)
+        if sh_type == 6:  # SHT_DYNAMIC
+            dyn = (sh_offset, sh_size, sh_link)
+    if dyn is None:
+        return []
+    off, size, link = dyn
+    strtab = sections[link]
+    out = []
+    for o in range(off, off + size, 16):
+        tag, val = struct.unpack_from('<Qq', data, o)
+        if tag == 0:  # DT_NULL
+            break
+        if tag == 1:  # DT_NEEDED
+            name = data[strtab + val:]
+            out.append(name[:name.index(b'\0')].decode())
+    return out
+
+
+def resolve(soname, first):
+    for d in [first] + LIBDIRS:
+        p = os.path.join(root, d.lstrip('/'), soname)
+        if os.path.exists(p):
+            return '/' + os.path.relpath(p, root)
+    return None
+
+
+seen, missing, work = set(), set(), []
+for r in roots:
+    p = os.path.join(root, r.lstrip('/'))
+    if os.path.isdir(p):
+        for dirpath, _, names in os.walk(p):
+            work += ['/' + os.path.relpath(os.path.join(dirpath, n), root)
+                     for n in names]
+    elif os.path.exists(p):
+        work.append('/' + r.lstrip('/'))
+    else:
+        missing.add(r)
+
+while work:
+    rel = work.pop()
+    if rel in seen:
+        continue
+    seen.add(rel)
+    for so in needed(os.path.join(root, rel.lstrip('/'))):
+        r = resolve(so, os.path.dirname(rel))
+        if r is None:
+            missing.add(so)
+        elif r not in seen:
+            work.append(r)
+
+for rel in sorted(seen):
+    print(rel)
+size = sum(os.path.getsize(os.path.realpath(os.path.join(root, r.lstrip('/'))))
+           for r in seen)
+print(f'  the applications reach {len(seen)} objects, '
+      f'{size / (1 << 20):.0f} MiB', file=sys.stderr)
+if missing:
+    print(f'  missing: {" ".join(sorted(missing))}', file=sys.stderr)
+PYEOF
+
+while read -r rel; do
+    mkdir -p "$R$(dirname "$rel")"
+    cp -L "$SRC$rel" "$R$rel"
+done < "$WORK/closure"
+
+# `explosive-c4` lives in /usr/games, which is not on the PATH of the shell
+# the page starts. A link, rather than a PATH the page has to know about.
+[ -e "$R/usr/games/explosive-c4" ] &&
+    ln -sf ../games/explosive-c4 "$R/usr/bin/explosive-c4"
+
 # Tcl/Tk's script library (wish will not start without init.tcl and tk.tcl) and
 # a self-contained demo script. Tk is single-threaded, so unlike GTK it does not
 # hit the worker-per-thread futex race.
@@ -193,42 +318,59 @@ if [ -d "$SRC/etc/X11/app-defaults" ]; then
     mkdir -p "$R/etc/X11/app-defaults"
     cp -r "$SRC/etc/X11/app-defaults/." "$R/etc/X11/app-defaults/"
 fi
-# GTK runtime data (modules, GSettings schemas, icons, pixbuf loaders). Only
-# copied when the GTK stack is in PROGS -- which it is not by default, because
-# gtk3-demo deadlocks on the threading race (see above). Kept for revival.
-if [ -n "${GEX_GTK:-}" ] && [ -d "$SRC/usr/lib/aarch64-linux-gnu/gtk-3.0" ]; then
-    mkdir -p "$R/usr/lib/aarch64-linux-gnu" "$R/usr/share/glib-2.0" "$R/usr/share"
-    cp -r "$SRC/usr/lib/aarch64-linux-gnu/gtk-3.0" "$R/usr/lib/aarch64-linux-gnu/gtk-3.0"
-    cp -r "$SRC/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0" "$R/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0"
-    cp -r "$SRC/usr/share/glib-2.0/schemas" "$R/usr/share/glib-2.0/schemas"
-    [ -d "$SRC/usr/share/icons" ] && cp -r "$SRC/usr/share/icons" "$R/usr/share/icons"
-    # The shared-mime-info database. gdk-pixbuf-thumbnailer (and any GIO
-    # content-type path) identifies a file's type through g_content_type_guess,
-    # which reads /usr/share/mime/mime.cache (+globs/magic). Without it every
-    # load fails with "Couldn't recognize the image file format" -- NOT a gex
-    # bug: it only ever "worked" under qemu-user because qemu has no chroot and
-    # leaked the *host's* /usr/share/mime. Ship the guest its own copy.
-    if [ -d "$SRC/usr/share/mime" ]; then
-        cp -r "$SRC/usr/share/mime" "$R/usr/share/mime"
-    elif [ -d /usr/share/mime ]; then
-        cp -r /usr/share/mime "$R/usr/share/mime"
-    fi
-    # Bake the pixbuf loader cache. It names absolute loader paths that must
-    # match the guest's layout, and the guest cannot build it at startup (the
-    # forked query-loaders writes into a per-process tmpfs the GTK client never
-    # sees; see web/src/demos.js). Generate it here with the guest's OWN
-    # query-loaders run under qemu-user, then rewrite the qemu host prefix ($R)
-    # to guest-absolute paths. A hand-edited or path-mismatched cache makes
-    # gdk-pixbuf free() a bad pointer at parse time (reproduces under qemu too).
-    QEMU="${GEX_QEMU:-$HOME/toolchains/qemu-aarch64}"
-    LOADERDIR="$R/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders"
-    if [ -x "$QEMU" ] && [ -d "$LOADERDIR" ]; then
-        QEMU_LD_PREFIX="$R" LD_LIBRARY_PATH="$R/usr/lib/aarch64-linux-gnu" \
-            "$QEMU" "$R/usr/bin/gdk-pixbuf-query-loaders" "$LOADERDIR"/*.so \
-            2>/dev/null | sed "s#$R##g" \
-            > "$R/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+# The runtime data the toolkits read, none of which is reachable through
+# DT_NEEDED and each of which fails as something else: GTK aborts on a
+# GSettings schema it cannot find, a KF5 program comes up with no defaults
+# without its .kcfg, and gdk-pixbuf answers "couldn't recognize the image
+# file format" for a missing mime database.
+for d in usr/share/glib-2.0/schemas usr/share/mime usr/share/icons \
+         usr/share/kf5 usr/share/config.kcfg usr/share/kglobalaccel \
+         usr/share/kconf_update usr/share/kservices5 usr/share/qt6ct \
+         usr/share/compton-conf usr/share/gtk-3.0 usr/share/libthai \
+         etc/gtk-3.0; do
+    [ -e "$SRC/$d" ] || continue
+    mkdir -p "$R/$(dirname "$d")"
+    cp -r "$SRC/$d" "$R/$d"
+done
+
+# And the three caches a real system generates in a maintainer script, which
+# nothing here runs. The first two are host tools over guest data files --
+# both formats are byte-order-tagged rather than native, so the host's own
+# copy produces what the guest will read.
+if [ -d "$R/usr/share/glib-2.0/schemas" ]; then
+    glib-compile-schemas "$R/usr/share/glib-2.0/schemas" ||
+        echo "  no compiled schemas -- a GTK client will abort on the first one"
+fi
+if [ -d "$R/usr/share/mime" ]; then
+    update-mime-database "$R/usr/share/mime" ||
+        echo "  no mime cache -- gdk-pixbuf will recognise no image format"
+fi
+
+# The pixbuf loader cache is the one that cannot be faked. It names absolute
+# loader paths that must match the guest's layout, and a hand-edited or
+# path-mismatched cache makes gdk-pixbuf free() a bad pointer at parse time.
+# The guest cannot build it at startup either -- the forked query-loaders
+# writes into a per-process tmpfs the GTK client never sees.
+#
+# So it is generated by running the guest's OWN query-loaders, under gex, on
+# this rootfs. That is the whole point of the project applied to its own
+# build: the paths come out guest-absolute because to that program they ARE
+# its paths, and the qemu-user this used to need (with a host prefix to strip
+# back off afterwards) is gone.
+GEXC="${GEXC:-$HERE/../target/release/gexc}"
+QL=/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders
+if [ -x "$GEXC" ] && [ -e "$R$QL" ]; then
+    if "$GEXC" run --sysroot "$R" --uid 0 "$R$QL" \
+        > "$WORK/loaders.cache" 2>/dev/null &&
+        [ -s "$WORK/loaders.cache" ]; then
+        cp "$WORK/loaders.cache" \
+            "$R/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+        echo "  pixbuf loaders: $(grep -c '^"/usr' "$WORK/loaders.cache") of them"
+    else
+        echo "  no pixbuf loader cache -- gdk-pixbuf will load no images"
     fi
 fi
+
 [ -e "$SRC/usr/share/drirc.d" ] && cp -r "$SRC/usr/share/drirc.d" "$R/usr/share/drirc.d"
 [ -e "$SRC/usr/lib/xorg/protocol.txt" ] && cp "$SRC/usr/lib/xorg/protocol.txt" "$R/usr/lib/xorg/"
 
