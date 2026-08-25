@@ -787,7 +787,7 @@ const waylandGears = {
     // selection is what `start` launches.
     const qp0 = new URLSearchParams(location.search);
     let app = demo.client
-      ? { id: demo.id, label: demo.title, client: demo.client, mode: demo.mode || 'x', env: '' }
+      ? { id: demo.id, label: demo.title, client: qp0.get('wlclient') || demo.client, mode: demo.mode || 'x', env: '' }
       : pickInitialApp(qp0);
     if (!demo.client) {
       // Kept in the demo's own DOM (cleaned up on leave) rather than the shared
@@ -930,9 +930,10 @@ const waylandGears = {
           runOptions.noTimeout || qp.has('wlnotimeout')
             ? client
             : `timeout ${seconds} ${client}`;
-        // A `?wlclient=` or a per-action `runOptions.client` (the SuperTuxKart
-        // "Play" preset) overrides the selected app's command.
-        const client = qp.get('wlclient') || runOptions.client || app.client;
+        // `app.client` already resolves `?wlclient=` (via `pickInitialApp`, or
+        // `demo.client` below); a per-action `runOptions.client` (the
+        // SuperTuxKart "Play" preset) is the only extra override.
+        const client = runOptions.client || app.client;
         const run =
           `echo "gex: running ${client}"\n` +
           `${runClient(client)} 2>&1\n` +
