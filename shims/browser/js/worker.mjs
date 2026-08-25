@@ -515,10 +515,11 @@ async function handle(msg) {
     if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
     if (msg.checkSp) ex.gex_set_check_sp?.(1);
-    // `?claimpages=0`: disable per-process page numbering, so closure modules
-    // publish dir entries at the build's slot numbers instead of demand-claiming
-    // them. Diagnostic for the many-object-closure wrong-dispatch crash.
-    if (msg.claimPages === 0) ex.gex_set_claim_pages?.(0);
+    // Per-process page numbering on (1, the default) or off (0). Off publishes
+    // closure dir entries at the build's slot numbers, which the profile-guided
+    // wayland closures need (the demand path's streaming interaction corrupts
+    // their dispatch); on keeps tables small across a many-fork run like apt.
+    if (msg.claimPages !== undefined) ex.gex_set_claim_pages?.(msg.claimPages);
     if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
     if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
     if (msg.spGuard) ex.gex_set_sp_guard?.(1);

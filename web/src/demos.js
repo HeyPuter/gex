@@ -731,14 +731,13 @@ const WL_APPS = [
     // A profile-guided AOT closure exists at /closure/dolphin (built by
     // web/build-closure.sh from a reached-PC coverage run to first frame) and
     // renders Dolphin at node while roughly halving the browser's peak RSS
-    // (7.1 -> 3.8 GiB). It is NOT auto-loaded because it currently trips a
-    // PRE-EXISTING browser-only AOT-closure crash that hits EVERY graphics-rootfs
-    // wayland closure (gtk3-demo's too): pid 1 traps at libc.so.6+0x84710 right
-    // after prlimit64, in chromium's V8 only -- the same closure runs clean at
-    // node, and pure-JIT wayland renders in the browser. Re-enable by adding
-    // `closure: '/closure/dolphin'` here (or test with `?appclosure=/closure/
-    // dolphin`) once that AOT-closure trap is fixed. Until then Dolphin runs
-    // pure-JIT, which renders at node but is too heavy for a browser tab today.
+    // (7.1 -> 3.8 GiB). The AOT-closure dispatch crash that used to hit every
+    // graphics-rootfs wayland closure (libc+0x84710) is FIXED now that this demo
+    // loads closures with `closureBuildNumbered` (see runProgram). It is still
+    // NOT auto-loaded only because Dolphin's Qt5/KF5/Mesa footprint OOMs a
+    // browser tab (~6 GiB) before first frame -- a memory problem, not a
+    // correctness one. Re-enable with `closure: '/closure/dolphin'` (or test via
+    // `?appclosure=/closure/dolphin`) once that footprint is brought down.
     closureImage: '/bin/sh',
   },
 ];
@@ -1066,6 +1065,12 @@ const waylandGears = {
           tty: true,
           uid: 0,
           closure: appClosure,
+          // Number the closure's slots at the build's numbers. This demo runs a
+          // single client, so the per-process demand allocator's small-table win
+          // does not matter, and its streaming interaction corrupts dispatch for
+          // a profile-guided closure whose pages are demand-filled while pid 1 is
+          // already running (the libc+0x84710 trap). See runProgram.
+          closureBuildNumbered: !!appClosure,
           // Real GL over virgl, as the glxgears demo does. The compositor gets
           // a 2D canvas so a native wl client's committed shm frames show; for
           // the Xwayland path the pixels come via virgl and this stays blank.

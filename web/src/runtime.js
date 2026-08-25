@@ -361,6 +361,16 @@ export async function runProgram(
     // A closure built ahead of time by `gexc build --closure`: the image
     // module, every library beside it, and the layout they were placed at.
     closure = null,
+    // Number this closure's dispatch slots at the build's numbers, not the
+    // per-process demand allocator. The per-process path keeps tables small
+    // across the dozens of forks an `apt-get update` makes, but its streaming
+    // interaction corrupts dispatch for a profile-guided closure whose pages are
+    // demand-filled while pid 1 is already running (the graphics-rootfs wayland
+    // closures trap at libc+0x84710). A single-client demo makes at most a
+    // couple of processes, so the build-numbered table growth is negligible and
+    // the numbering is the complete, correct one. Off by default so the
+    // many-process closure demos (debian) keep the small-table optimisation.
+    closureBuildNumbered = false,
     // Keep the address space the guest's dynamic linker produced, so the next
     // process of the same program starts at its own entry with every
     // relocation already applied.
@@ -542,7 +552,10 @@ export async function runProgram(
       // `?claimpages=0`: publish closure dir entries at the build's slot numbers
       // instead of per-process demand numbering — a diagnostic for the
       // many-object-closure wrong-dispatch crash. In `extra` for every Worker.
-      claimPages: flag('claimpages') === '0' ? 0 : undefined,
+      claimPages:
+        flag('claimpages') != null
+          ? (flag('claimpages') === '0' ? 0 : 1)
+          : (closureBuildNumbered ? 0 : undefined),
       // `?intrinsicmask=N` enables only some substitution families, to bisect
       // which one corrupts memory: bit0=memcpy, bit1=memset, bit2=memcmp.
       // In `extra` so every process gets it.
