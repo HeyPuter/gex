@@ -1753,6 +1753,7 @@ fn decode_simd_three_different(raw: u32, q: bool, u: u32) -> Option<Inst> {
         vd: VReg(bits(raw, 4, 0) as u8),
         vn: VReg(bits(raw, 9, 5) as u8),
         vm: VReg(bits(raw, 20, 16) as u8),
+        index: None,
     })
 }
 
@@ -2101,8 +2102,13 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         (0b10100, 0) => VShiftImmOp::SShll,
         (0b10100, _) => VShiftImmOp::UShll,
         (0b10000, 0) => VShiftImmOp::Shrn,
+        (0b10001, 0) => VShiftImmOp::Rshrn,
         (0b00010, 0) => VShiftImmOp::SSra,
         (0b00010, _) => VShiftImmOp::USra,
+        (0b00100, 0) => VShiftImmOp::Srshr,
+        (0b00100, _) => VShiftImmOp::Urshr,
+        (0b00110, 0) => VShiftImmOp::Srsra,
+        (0b00110, _) => VShiftImmOp::Ursra,
         (0b01000, 1) => VShiftImmOp::Sri,
         (0b01010, 1) => VShiftImmOp::Sli,
         // The fixed-point conversions. They are not shifts, but the scale
@@ -2156,6 +2162,45 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
 /// fields and assembled differently for each element width.
 fn decode_simd_by_element(raw: u32, q: bool, u: u32) -> Option<Inst> {
     let opcode = bits(raw, 15, 12);
+    // The widening multiply-long forms (`smull`/`umlal`/`umlsl` by element):
+    // the same three-different ops, one operand a broadcast lane, the result
+    // twice as wide. Their opcodes do not collide with the same-width group's.
+    let widen = match opcode {
+        0b1010 => Some(VWidenOp::MulL),
+        0b0010 => Some(VWidenOp::MlaL),
+        0b0110 => Some(VWidenOp::MlsL),
+        _ => None,
+    };
+    if let Some(wop) = widen {
+        let size = bits(raw, 23, 22);
+        let m = bit(raw, 20);
+        let h = bit(raw, 11);
+        let l = bit(raw, 21);
+        // The index into `vm` is built from H:L:M, and `vm` from the remaining
+        // register bits -- exactly as the same-width by-element forms below, and
+        // for the same reason: a 16-bit source can index one of eight lanes in
+        // any of the low sixteen registers, a 32-bit source one of four in all.
+        let (lane_bytes, index, vm) = match size {
+            0b01 => (2, h << 2 | l << 1 | m, bits(raw, 19, 16)),
+            0b10 => (4, h << 1 | l, m << 4 | bits(raw, 19, 16)),
+            _ => return None,
+        };
+        return Some(Inst::VWiden {
+            op: wop,
+            arr: VArr {
+                lane_bytes,
+                q,
+                float: false,
+                scalar: false,
+            },
+            upper: q,
+            signed: u == 0,
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+            vm: VReg(vm as u8),
+            index: Some(index),
+        });
+    }
     let float = matches!(opcode, 0b0001 | 0b0101 | 0b1001);
     let op = match (u, opcode) {
         (0, 0b0001) => VOp3::FMla,
@@ -2634,6 +2679,61 @@ mod tests {
 
     fn d(raw: u32) -> Inst {
         decode(raw, 0x1000)
+    }
+
+    #[test]
+    fn rounding_shift_right() {
+        // ursra v8.8h, v8.8h, #8 -- pixman's alpha blend hit this and it was
+        // decoded as Unknown, crashing the guest with an illegal instruction.
+        match d(0x6f183508) {
+            Inst::VShiftImm { op, arr, vd, vn, shift, .. } => {
+                assert_eq!(op, VShiftImmOp::Ursra);
+                assert_eq!(arr.lane_bytes, 2);
+                assert!(arr.q);
+                assert_eq!(shift, 8);
+                assert_eq!(vd.0, 8);
+                assert_eq!(vn.0, 8);
+            }
+            other => panic!("expected VShiftImm ursra, got {other:?}"),
+        }
+        // urshr (opcode 00100, U=1) and the signed forms decode too.
+        assert!(matches!(d(0x6f182508), Inst::VShiftImm { op: VShiftImmOp::Urshr, .. }));
+        assert!(matches!(d(0x4f183508), Inst::VShiftImm { op: VShiftImmOp::Srsra, .. }));
+        assert!(matches!(d(0x4f182508), Inst::VShiftImm { op: VShiftImmOp::Srshr, .. }));
+        // rshrn v28.8b, v8.8h, #8 and rshrn2 (Q=1) -- pixman compositing.
+        assert!(matches!(d(0x0f088d1c), Inst::VShiftImm { op: VShiftImmOp::Rshrn, .. }));
+        assert!(matches!(d(0x4f088d1c), Inst::VShiftImm { op: VShiftImmOp::Rshrn, .. }));
+    }
+
+    #[test]
+    fn widening_multiply_by_element() {
+        // umlsl v0.4s, v1.4h, v15.h[0] -- pixman's multiply-accumulate-long.
+        match d(0x2f4f6020) {
+            Inst::VWiden { op, upper, signed, vd, vn, vm, index, arr } => {
+                assert_eq!(op, VWidenOp::MlsL);
+                assert!(!upper);
+                assert!(!signed); // U=1 => unsigned
+                assert_eq!((vd.0, vn.0, vm.0), (0, 1, 15));
+                assert_eq!(index, Some(0));
+                assert_eq!(arr.lane_bytes, 2);
+            }
+            other => panic!("expected VWiden umlsl, got {other:?}"),
+        }
+        // umlal2 v0.4s, v1.8h, v15.h[0]
+        assert!(matches!(
+            d(0x6f4f2020),
+            Inst::VWiden { op: VWidenOp::MlaL, upper: true, signed: false, index: Some(0), .. }
+        ));
+        // umull v0.4s, v1.4h, v15.h[0]
+        assert!(matches!(
+            d(0x2f4fa020),
+            Inst::VWiden { op: VWidenOp::MulL, signed: false, index: Some(0), .. }
+        ));
+        // smull v0.4s, v2.4h, v2.h[6] (signed, index 6) -- 0x0f62a840
+        assert!(matches!(
+            d(0x0f62a840),
+            Inst::VWiden { op: VWidenOp::MulL, signed: true, index: Some(6), .. }
+        ));
     }
 
     #[test]

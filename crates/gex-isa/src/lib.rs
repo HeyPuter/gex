@@ -959,6 +959,10 @@ pub enum Inst {
         vd: VReg,
         vn: VReg,
         vm: VReg,
+        /// The by-element forms (`umlal v0.4s, v1.4h, v2.h[3]`) broadcast one
+        /// lane of `vm` across the multiply; `Some(lane)` selects it, `None` is
+        /// the ordinary vector form.
+        index: Option<u32>,
     },
     /// `fcvtl`/`fcvtn`: change floating-point precision across a vector.
     VFpCvtPrecision {
@@ -1372,9 +1376,20 @@ pub enum VShiftImmOp {
     UShll,
     /// Narrow each lane to half width after shifting right.
     Shrn,
+    /// Narrow after a *rounding* shift right: `1 << (shift-1)` is added before
+    /// the shift. `rshrn2` writes the destination's upper half.
+    Rshrn,
     /// Shift right and accumulate into the destination.
     SSra,
     USra,
+    /// Rounding shift right: add half the divisor (`1 << (shift-1)`) before the
+    /// shift, so the result is rounded to nearest rather than truncated. Pixman
+    /// leans on the unsigned form for alpha blending.
+    Srshr,
+    Urshr,
+    /// Rounding shift right, then accumulate into the destination.
+    Srsra,
+    Ursra,
     /// Shift and insert: the bits shifted in come from the destination rather
     /// than being zero, so the shift is a splice of the two registers.
     Sli,

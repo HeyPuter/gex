@@ -1602,6 +1602,7 @@ impl<'a> Lifter<'a> {
                 vd,
                 vn,
                 vm,
+                index,
             } => {
                 // Everything here is "widen the narrow operands, then do an
                 // ordinary lane-wise operation at the wider size". The `w`
@@ -1626,7 +1627,23 @@ impl<'a> Lifter<'a> {
                     })
                 };
                 let raw_n = self.b.read(GuestReg::V128(vn.0));
-                let raw_m = self.b.read(GuestReg::V128(vm.0));
+                let mut raw_m = self.b.read(GuestReg::V128(vm.0));
+                // The by-element forms multiply every lane of `vn` by one lane
+                // of `vm`: broadcast that lane across the register first, then
+                // the widen and multiply below are the ordinary vector shape.
+                if let Some(idx) = index {
+                    let lb = arr.lane_bytes as usize;
+                    let base = idx as usize * lb;
+                    let mut sel = [0u8; 16];
+                    for (i, s) in sel.iter_mut().enumerate() {
+                        *s = (base + (i % lb)) as u8;
+                    }
+                    raw_m = self.b.def(Expr::VShuffle {
+                        lanes: Box::new(sel),
+                        a: raw_m,
+                        b: raw_m,
+                    });
+                }
                 let a = match op {
                     VWidenOp::AddW | VWidenOp::SubW => raw_n,
                     _ => widen(self, raw_n),
@@ -3298,6 +3315,68 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 return Flow::Next;
             }
+            // Rounding shift right, and its accumulating form. AArch64 adds
+            // `1 << (shift-1)` before the shift and keeps the extra carry bit;
+            // done that way in wasm the add would overflow a lane. The identical
+            // result without overflow is the truncated shift plus the bit the
+            // shift rounded off: `(a >> shift) + ((a >> (shift-1)) & 1)`. The
+            // truncated part is all-zero once the shift reaches the lane width.
+            VShiftImmOp::Srshr
+            | VShiftImmOp::Urshr
+            | VShiftImmOp::Srsra
+            | VShiftImmOp::Ursra => {
+                let signed = matches!(op, VShiftImmOp::Srshr | VShiftImmOp::Srsra);
+                let accumulate = matches!(op, VShiftImmOp::Srsra | VShiftImmOp::Ursra);
+                let trunc = if !signed && shift >= bits {
+                    self.b.def(Expr::VConst(Box::new([0u8; 16])))
+                } else {
+                    let n = self.b.const_i32(if shift >= bits { bits - 1 } else { shift });
+                    self.b.def(Expr::VShift {
+                        op: if signed { VShiftOp::ShrS } else { VShiftOp::ShrU },
+                        lane,
+                        a,
+                        amount: n,
+                    })
+                };
+                // The bit rounded off: bit `shift-1` of each lane, kept as bit 0.
+                let rb = self.b.const_i32(shift - 1);
+                let dropped = self.b.def(Expr::VShift {
+                    op: VShiftOp::ShrU,
+                    lane,
+                    a,
+                    amount: rb,
+                });
+                let mut low1 = [0u8; 16];
+                let width = arr.lane_bytes as usize;
+                for l in 0..16 / width {
+                    low1[l * width] = 1;
+                }
+                let mask = self.b.def(Expr::VConst(Box::new(low1)));
+                let round = self.b.def(Expr::VBin {
+                    op: VBinOp::And,
+                    a: dropped,
+                    b: mask,
+                });
+                let rounded = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Add,
+                    lane,
+                    a: trunc,
+                    b: round,
+                });
+                let r = if accumulate {
+                    let old = self.b.read(GuestReg::V128(vd.0));
+                    self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::Add,
+                        lane,
+                        a: old,
+                        b: rounded,
+                    })
+                } else {
+                    rounded
+                };
+                self.commit_vector(vd, arr, r);
+                return Flow::Next;
+            }
             VShiftImmOp::SShr => VShiftOp::ShrS,
             VShiftImmOp::UShr => VShiftOp::ShrU,
             // The width-changing forms convert first and then shift at the
@@ -3334,7 +3413,7 @@ impl<'a> Lifter<'a> {
                 self.b.write(GuestReg::V128(vd.0), r);
                 return Flow::Next;
             }
-            VShiftImmOp::Shrn => {
+            VShiftImmOp::Shrn | VShiftImmOp::Rshrn => {
                 // The source lanes are twice as wide as `arr` describes.
                 let wide = VArr {
                     lane_bytes: arr.lane_bytes * 2,
@@ -3342,15 +3421,47 @@ impl<'a> Lifter<'a> {
                     float: false,
                     scalar: false,
                 };
+                let wlane = Self::lane_of(wide);
                 let shifted = if shift == 0 {
                     a
                 } else {
-                    self.b.def(Expr::VShift {
+                    let base = self.b.def(Expr::VShift {
                         op: VShiftOp::ShrU,
-                        lane: Self::lane_of(wide),
+                        lane: wlane,
                         a,
                         amount,
-                    })
+                    });
+                    if op == VShiftImmOp::Rshrn {
+                        // Rounding: add the bit the shift dropped (bit `shift-1`
+                        // of each wide lane), overflow-free -- see the rounding
+                        // shift-right case above.
+                        let rb = self.b.const_i32(shift - 1);
+                        let dropped = self.b.def(Expr::VShift {
+                            op: VShiftOp::ShrU,
+                            lane: wlane,
+                            a,
+                            amount: rb,
+                        });
+                        let mut low1 = [0u8; 16];
+                        let width = (arr.lane_bytes * 2) as usize;
+                        for l in 0..16 / width {
+                            low1[l * width] = 1;
+                        }
+                        let mask1 = self.b.def(Expr::VConst(Box::new(low1)));
+                        let round = self.b.def(Expr::VBin {
+                            op: VBinOp::And,
+                            a: dropped,
+                            b: mask1,
+                        });
+                        self.b.def(Expr::VLaneBin {
+                            op: VLaneBinOp::Add,
+                            lane: wlane,
+                            a: base,
+                            b: round,
+                        })
+                    } else {
+                        base
+                    }
                 };
                 // `shrn` truncates rather than saturating, so mask each wide
                 // lane down before packing the halves together.

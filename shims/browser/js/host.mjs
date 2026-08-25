@@ -54,6 +54,15 @@ export class ProcessHost {
   #pending = new Map();
   #first = null;
   #forked = 0;
+  // Per-process compiled-module cache: `procPid -> Map<registry index,
+  // WebAssembly.Module>`. A process's threads share one guest memory and so one
+  // registry, so a module a sibling compiled is reusable by the rest. Relayed
+  // here between the Workers of a process, and handed to a thread when it starts
+  // so it need not recompile what its siblings already did. Keyed by the process
+  // (the first segment of a `pid:tid` worker key); forks copy the registry into
+  // a separate memory, so they do NOT share this -- the fork path carries the
+  // parent's compiled modules itself. See `Gex#sharedModules`.
+  #moduleCache = new Map();
   /// When each process was asked for. See `#spawn`.
   #asked = new Map();
   #threads = 0;
@@ -326,6 +335,12 @@ export class ProcessHost {
   /** A Worker has ended: stop it, and put its kernel stack back. */
   #release(key, w) {
     this.#workers.delete(key);
+    // The last Worker of a process gone: drop its shared-module cache so a long
+    // page does not accumulate every process's compiled modules forever.
+    const proc = String(key).split(':')[0];
+    if (![...this.#workers.keys()].some((k) => String(k).split(':')[0] === proc)) {
+      this.#moduleCache.delete(proc);
+    }
     const slice = this.#stackOf.get(key);
     if (slice !== undefined) {
       this.#stackOf.delete(key);
@@ -391,6 +406,24 @@ export class ProcessHost {
       case 'output':
         this.#onOutput(m.fd, m.text, pid, m);
         break;
+      case 'compiledModule': {
+        // A Worker compiled registry module `m.i`. Remember it for this process
+        // and relay it to the process's other live Workers so none recompiles
+        // the same bytes. `WebAssembly.Module` crosses `postMessage` by
+        // reference, so this is cheap. See `#moduleCache`.
+        const proc = String(pid).split(':')[0];
+        let cache = this.#moduleCache.get(proc);
+        if (!cache) this.#moduleCache.set(proc, (cache = new Map()));
+        if (!cache.has(m.i)) {
+          cache.set(m.i, m.mod);
+          for (const [key, other] of this.#workers) {
+            if (other !== w && String(key).split(':')[0] === proc) {
+              other.postMessage({ kind: 'sharedModule', i: m.i, mod: m.mod });
+            }
+          }
+        }
+        break;
+      }
       case 'fork': {
         const c = m.child?.forkCost;
         if (c) {
@@ -462,6 +495,11 @@ export class ProcessHost {
             shim: shimMod,
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
+            // Every module the process's Workers have compiled so far, so this
+            // thread reuses them instead of recompiling from bytes in its own
+            // `#catchUp`. `WebAssembly.Module`s cross by reference, so this is
+            // references, not a byte copy. See `#moduleCache`.
+            sharedModules: [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])],
           }),
           );
         };

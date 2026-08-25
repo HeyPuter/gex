@@ -341,6 +341,15 @@ export class Gex {
   #shimInstantiateMs = 0;
   #guestInstantiateMs = 0;
   #installs = 0;
+  /// Compiled `WebAssembly.Module`s for the process's registry, by index,
+  /// shared across the sibling Workers of one process. A thread `#catchUp`s the
+  /// same modules its siblings already compiled; recompiling each from bytes
+  /// per Worker cost seconds (16.9s of a 45s gtk3-demo run, thousands of
+  /// modules re-`compile`d). Populated from `sharedModule` messages the host
+  /// relays; a `WebAssembly.Module` crosses `postMessage` by reference, so this
+  /// carries no byte copies. Only the compile is shared -- each Worker still
+  /// instantiates against its own tables.
+  #sharedModules = new Map();
   // Instances whose slots have not been written, newest first: a miss asks
   // each in turn whether it holds the slot. See `fillSlot`.
   #unfilled = [];
@@ -1851,13 +1860,47 @@ export class Gex {
     // Every slot the *process* has claimed, not the pending module's -- this
     // Worker is catching up on all of them at once.
     const need = (e.gex_jit_slots_total?.() ?? 0) >>> 0;
+    const t0 = globalThis.GEX_ATTACH_TRACE ? performance.now() : 0;
+    const comp0 = this.#compileMs;
+    let n = 0, reused = 0;
     for (; this.#installed < have; this.#installed++) {
-      const ptr = e.gex_module_ptr(this.#installed) >>> 0;
-      const len = e.gex_module_len(this.#installed) >>> 0;
+      const i = this.#installed;
+      const ptr = e.gex_module_ptr(i) >>> 0;
+      const len = e.gex_module_len(i) >>> 0;
       if (!len) continue;
       // Copied out before compiling: the registry is in the guest's memory,
       // and another thread allocating can move it.
-      await this.#installModule(this.#bytes().slice(ptr, ptr + len), need, 64, null, 'jit2049');
+      const bytes = this.#bytes().slice(ptr, ptr + len);
+      // A sibling Worker may already have compiled this module: reuse its
+      // `WebAssembly.Module` (same registry bytes -> same module) rather than
+      // paying `WebAssembly.compile` again. The bytes are still needed for the
+      // metadata and table-need computation the install does regardless.
+      const cached = this.#sharedModules.get(i);
+      await this.#installModule(bytes, need, 64, null, 'jit2049', cached);
+      if (cached) { reused++; continue; }
+      // Newly compiled here: hand it to the host to relay to siblings, and keep
+      // it so this Worker does not compile it twice either.
+      const mod = this.#compiled[this.#compiled.length - 1]?.mod;
+      if (mod) {
+        this.#sharedModules.set(i, mod);
+        this.#env.shareModule?.(i, mod);
+      }
+      n++;
+    }
+    if (globalThis.GEX_ATTACH_TRACE && (n || reused)) {
+      console.error(`[catchup] installed ${n + reused} modules in ${Math.round(performance.now() - t0)}ms`
+        + ` (${Math.round(this.#compileMs - comp0)}ms compile, ${reused} reused from siblings)`);
+    }
+  }
+
+  /**
+   * A `WebAssembly.Module` a sibling Worker compiled, relayed by the host. Kept
+   * by registry index so this Worker's `#catchUp` reuses it instead of
+   * recompiling the same bytes. See `#sharedModules`.
+   */
+  addSharedModule(i, mod) {
+    if (mod instanceof WebAssembly.Module && !this.#sharedModules.has(i)) {
+      this.#sharedModules.set(i, mod);
     }
   }
 
@@ -2479,7 +2522,20 @@ export class Gex {
     e.gex_jit_installed();
     // This Worker translated it, so the entry `gex_jit_installed` just added is
     // the newest here and must not be replayed on top of itself.
-    this.#installed = e.gex_module_count ? e.gex_module_count() >>> 0 : this.#installed;
+    const count = e.gex_module_count ? e.gex_module_count() >>> 0 : this.#installed;
+    this.#installed = count;
+    // Hand the module this Worker just translated to the sibling cache -- the
+    // main thread translates almost everything, and a thread that spawns later
+    // then reuses it (from its start message) instead of recompiling the whole
+    // registry. Its index is the newest entry.
+    if (count) {
+      const i = count - 1;
+      const mod = this.#compiled[this.#compiled.length - 1]?.mod;
+      if (mod && !this.#sharedModules.has(i)) {
+        this.#sharedModules.set(i, mod);
+        this.#env.shareModule?.(i, mod);
+      }
+    }
   }
 
   /**
@@ -2488,11 +2544,11 @@ export class Gex {
    * or another did and this one catches up): a thread that installed them
    * differently would dispatch to different code.
    */
-  async #installModule(bytes, need, segments = 64, meta = null, who = '?') {
+  async #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null) {
     const t0 = performance.now();
     this.#installs++;
     try {
-      return await this.#installModuleInner(bytes, need, segments, meta, who);
+      return await this.#installModuleInner(bytes, need, segments, meta, who, precompiled);
     } finally {
       this.#installMs += performance.now() - t0;
     }
@@ -2504,7 +2560,7 @@ export class Gex {
    * turned out not to be what a run costs: each process installs thousands of
    * shared modules, and compiling and instantiating those was uncounted.
    */
-  async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?') {
+  async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?', precompiled = null) {
     const t0 = performance.now();
     const e = this.#shim.exports;
     const tg = performance.now();
@@ -2512,7 +2568,12 @@ export class Gex {
     this.#growMs += performance.now() - tg;
     this.#tnAt('pre-inst');
     const tc = performance.now();
-    const mod = bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
+    // A `precompiled` Module (a sibling Worker's, relayed by the host) skips the
+    // compile entirely; otherwise compile the bytes (or use them if already a
+    // Module). Same registry bytes either way, so the Module is interchangeable.
+    const mod = precompiled instanceof WebAssembly.Module
+      ? precompiled
+      : bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
     this.#compileMs += performance.now() - tc;
     // With its metadata: a fork hands the child `#compiled`, and without the
     // metadata the child cannot tell which module covers which page and must

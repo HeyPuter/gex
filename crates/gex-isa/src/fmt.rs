@@ -1252,9 +1252,14 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 VShiftImmOp::UShll => "ushll",
                 VShiftImmOp::SSra => "ssra",
                 VShiftImmOp::USra => "usra",
+                VShiftImmOp::Srshr => "srshr",
+                VShiftImmOp::Urshr => "urshr",
+                VShiftImmOp::Srsra => "srsra",
+                VShiftImmOp::Ursra => "ursra",
                 VShiftImmOp::Sli => "sli",
                 VShiftImmOp::Sri => "sri",
                 VShiftImmOp::Shrn => "shrn",
+                VShiftImmOp::Rshrn => "rshrn",
                 VShiftImmOp::Scvtf => "scvtf",
                 VShiftImmOp::Ucvtf => "ucvtf",
                 VShiftImmOp::Fcvtzs => "fcvtzs",
@@ -1332,6 +1337,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             vd,
             vn,
             vm,
+            index,
         } => {
             let m = match op {
                 VWidenOp::AddL => "addl",
@@ -1356,16 +1362,20 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             } else {
                 arr
             };
+            // The by-element form names one lane of `vm` (`v2.h[3]`) rather than
+            // the whole vector.
+            let m_operand = match index {
+                Some(i) => format!("v{}.{}[{}]", vm.0, arr.letter(), i),
+                None => format!("v{}.{}", vm.0, arr.suffix()),
+            };
             format!(
-                "{}{m}{} v{}.{}, v{}.{}, v{}.{}",
+                "{}{m}{} v{}.{}, v{}.{}, {m_operand}",
                 if signed { 's' } else { 'u' },
                 if upper { "2" } else { "" },
                 vd.0,
                 wide.suffix(),
                 vn.0,
                 n_arr.suffix(),
-                vm.0,
-                arr.suffix()
             )
         }
 

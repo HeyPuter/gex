@@ -70,6 +70,10 @@ import { Gex, Env, utf8 } from './gex.mjs';
 
 const port = await channel();
 
+// This Worker's runtime, once its start message builds it. Module-scope so a
+// `sharedModule` message (relayed sibling-Worker compiles) can reach it.
+let workerGex = null;
+
 // Standard input, as it arrives. A guest read that finds nothing asks the
 // host and waits here; `readStdin` below is what the run loop awaits.
 let stdinWaiter = null;
@@ -194,6 +198,14 @@ async function handle(msg) {
     stdinWaiter = null;
     return;
   }
+  // A sibling Worker's compiled module, relayed by the host so this Worker's
+  // `#catchUp` reuses it. Arrives independently of the run/adopt/thread start,
+  // and only matters once this Worker has a `Gex`; before that it is dropped and
+  // the module is simply recompiled. See `Gex#sharedModules`.
+  if (msg?.kind === 'sharedModule') {
+    workerGex?.addSharedModule(msg.i, msg.mod);
+    return;
+  }
   if (msg?.kind !== 'run' && msg?.kind !== 'adopt' && msg?.kind !== 'thread') return;
 
   // How many traps a forked child takes before installing its parent's
@@ -278,6 +290,13 @@ async function handle(msg) {
     async spawnThread(thread) {
       port.post({ kind: 'thread', thread });
     }
+    // A module this Worker just compiled, up to the host to relay to the sibling
+    // Workers of the same process so they reuse it rather than recompiling the
+    // same registry bytes. A `WebAssembly.Module` crosses `postMessage` by
+    // reference -- no byte copy. See `Gex#sharedModules`.
+    shareModule(i, mod) {
+      port.post({ kind: 'compiledModule', i, mod });
+    }
   }
 
   if (msg.debugExit) {
@@ -310,6 +329,11 @@ async function handle(msg) {
     memory: msg.memory ?? null,
     shared: !!msg.shared,
   });
+  // Module-scope, so a `sharedModule` message (which arrives outside this
+  // handler's run/adopt/thread path) can reach this Worker's runtime.
+  workerGex = gex;
+  // Any sibling modules the host already had when this Worker started.
+  for (const [i, mod] of msg.sharedModules ?? []) gex.addSharedModule(i, mod);
 
   // The guest's GPU. The renderer is on the page, so calls cross a
   // `SharedArrayBuffer` and block on `Atomics.wait` -- they must be synchronous
@@ -339,9 +363,29 @@ async function handle(msg) {
     // frames are discarded (no canvas) and there is no input. Lets the
     // native-wayland deadlock be reproduced under node's tooling. present/
     // pollInput are what `wl_present` and the input pull call.
+    // GEX_WL_DUMP=<path>: save the first committed frame as a PPM so a render
+    // can be eyeballed. Loaded here (the handler is async) and closed over.
+    const dumpPath = globalThis.process?.env?.GEX_WL_DUMP;
+    const fs = dumpPath ? await import('node:fs') : null;
     let count = 0;
     gex.useWl({
-      present() { count++; if (count === 1 || count % 60 === 0) console.error(`[wlstub] present #${count}`); },
+      present(memory, ptr, w, h, stride, format) {
+        count++;
+        if (count === 1 || count % 60 === 0) console.error(`[wlstub] present #${count} ${w}x${h} stride=${stride} fmt=${format}`);
+        if (fs && count === 1 && memory?.buffer) {
+          try {
+            const px = new Uint8Array(memory.buffer, ptr >>> 0, stride * h);
+            const body = Buffer.alloc(w * h * 3);
+            for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+              const i = y * stride + x * 4, o = (y * w + x) * 3;
+              body[o] = px[i + 2]; body[o + 1] = px[i + 1]; body[o + 2] = px[i]; // BGRA->RGB
+            }
+            fs.writeFileSync(dumpPath, `P6\n${w} ${h}\n255\n`);
+            fs.appendFileSync(dumpPath, body);
+            console.error(`[wlstub] wrote frame to ${dumpPath}`);
+          } catch (e) { console.error(`[wlstub] dump failed: ${e.message}`); }
+        }
+      },
       pollInput() { return 0; },
     });
   }

@@ -200,6 +200,10 @@ extern "C" {
     /// exact, where re-reading the guest word only guesses.
     fn k_futex_wake(addr: u64);
     fn k_futex_gen(addr: u64) -> u32;
+    /// Sleep on one futex's generation slot rather than the global counter, so
+    /// the blanket wake every syscall fires does not wake an idle condvar
+    /// waiter. Returns 0 woken, 1 already moved, 2 timed out. See `k_park_futex`.
+    fn k_park_futex(addr: u64, gen: u32, ns: i64) -> i32;
     fn k_spawn(ppid: i32) -> i32;
     fn k_exit(pid: i32, status: i32);
     fn k_reap(pid: i32);
@@ -4799,10 +4803,21 @@ fn park_until_ready() {
         // counter still reads this.
         let seq = unsafe { k_wake_seq() };
         let now = now_ns();
-        if with_host(|h| {
+        // Readiness and -- under the same lock -- this Worker's own futex, if a
+        // futex is all its thread waits on. `.get`, not `[]`: a scheduler that
+        // left `cur` past the end must fall back to the global wait, not panic.
+        let (ready, futex) = with_host(|h| {
             let sig = any_signal(h);
-            h.threads.iter().any(|t| thread_ready(t, now, sig))
-        }) {
+            let ready = h.threads.iter().any(|t| thread_ready(t, now, sig));
+            let futex = match h.threads.get(cur()).map(|t| &t.waiting) {
+                Some(Waiting::Futex { parked, wake_gen, .. }) => {
+                    Some((parked.addr(), *wake_gen))
+                }
+                _ => None,
+            };
+            (ready, futex)
+        });
+        if ready {
             return;
         }
         if now >= give_up {
@@ -4814,7 +4829,17 @@ fn park_until_ready() {
         }
         // A deadline already past subtracts to nothing, and a zero-nanosecond
         // wait returns the instant it is made. Never spin here.
-        unsafe { k_park(seq, ns.max(1_000_000) as i64) };
+        let ns = ns.max(1_000_000) as i64;
+        // A futex waiter sleeps on just its own generation slot, not the global
+        // counter every syscall bumps -- so an idle condvar waiter is not woken
+        // by a busy sibling's every syscall (the thundering herd that made a
+        // multi-threaded GTK program crawl). A real `FUTEX_WAKE` still bumps the
+        // slot and wakes it at once; the bound still returns it for a signal or
+        // the page. Any other wait keeps the global counter.
+        match futex {
+            Some((addr, gen)) => unsafe { k_park_futex(addr, gen, ns) },
+            None => unsafe { k_park(seq, ns) },
+        };
     }
 }
 
@@ -4832,10 +4857,13 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
     }
     let mut ns = max_ms as u64 * 1_000_000;
     // The nearest deadline any thread holds: a `sleep` or timed `poll` is ended
-    // by the clock, not another Worker, so sleeping past it wakes late.
+    // by the clock, not another Worker, so sleeping past it wakes late. And --
+    // read under the same lock -- whether THIS Worker's own thread is simply
+    // waiting on a futex, with the address and the generation it parked at.
     let now = now_ns();
-    let soonest = with_host(|h| {
-        h.threads
+    let (soonest, futex) = with_host(|h| {
+        let soonest = h
+            .threads
             .iter()
             .filter_map(|t| match &t.waiting {
                 Waiting::Sleep(at) => Some(*at),
@@ -4843,7 +4871,12 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
                 Waiting::Net(deadline) => *deadline,
                 _ => None,
             })
-            .min()
+            .min();
+        let futex = match h.threads.get(cur()).map(|t| &t.waiting) {
+            Some(Waiting::Futex { parked, wake_gen, .. }) => Some((parked.addr(), *wake_gen)),
+            _ => None,
+        };
+        (soonest, futex)
     });
     if let Some(at) = soonest {
         ns = ns.min(at.saturating_sub(now));
@@ -4852,7 +4885,19 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
     // zero-nanosecond wait returns at once, spinning the Worker. A
     // Worker-ended wait is still immediate via its notify.
     ns = ns.max(1_000_000);
-    unsafe { k_park(WAKE_SEEN.with(|w| w.get()), ns as i64) }
+    // A futex waiter sleeps on just its own generation slot, not the global
+    // counter every syscall bumps -- so an idle condvar waiter (a GLib
+    // thread-pool worker) is not woken by a busy sibling's every syscall. That
+    // blanket wake, with a dozen idle threads each taking the host lock to
+    // re-check, is the thundering herd that made a multi-threaded GTK program
+    // crawl. A real `FUTEX_WAKE` still bumps the slot and wakes it at once; the
+    // bounded `ns` still returns it for a signal, a deadline or page work, which
+    // do not touch the slot. A non-futex wait keeps the global counter, which
+    // any syscall can end.
+    match futex {
+        Some((addr, gen)) => unsafe { k_park_futex(addr, gen, ns as i64) },
+        None => unsafe { k_park(WAKE_SEEN.with(|w| w.get()), ns as i64) },
+    }
 }
 
 #[no_mangle]

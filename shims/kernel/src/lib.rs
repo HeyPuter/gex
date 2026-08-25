@@ -137,6 +137,28 @@ pub extern "C" fn k_futex_gen(addr: u64) -> u32 {
     FUTEX_GENS[futex_slot(addr)].load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Sleep until the futex at `addr` is woken (its generation leaves `gen`), or
+/// `ns` pass. Returns 0 woken, 1 the generation already moved, 2 timed out.
+///
+/// Unlike [`k_park`], which sleeps on the one global [`WAKE`] counter that every
+/// syscall in every process bumps, this sleeps on just this futex's generation
+/// slot -- so an idle condvar waiter (a GLib thread-pool worker, say) is not
+/// woken by the blanket notify a busy sibling fires on every syscall. That
+/// thundering herd made a multi-threaded GTK program crawl: N idle threads each
+/// took the host lock to re-check on every one of another thread's syscalls. A
+/// `FUTEX_WAKE` to this address (via `k_futex_wake`) still bumps the slot and
+/// wakes it precisely; the caller passes a bounded `ns` so signals, deadlines
+/// and page work -- which do not touch this slot -- are still answered in time.
+#[no_mangle]
+pub extern "C" fn k_park_futex(addr: u64, gen: u32, ns: i64) -> i32 {
+    let slot = futex_slot(addr);
+    let at = &FUTEX_GENS[slot] as *const std::sync::atomic::AtomicU32 as *mut i32;
+    // SAFETY: the address of a static in this module's own shared memory, which
+    // is what the wait instruction requires. `gen` is compared as the same bit
+    // pattern the generation was stored with (a wrapping u32 counter).
+    unsafe { core::arch::wasm32::memory_atomic_wait32(at, gen as i32, ns) }
+}
+
 /// What this module last panicked with. It has no console (it imports nothing
 /// but two memories), so without this a panic unwound to a bare `unreachable`
 /// with no message. The host reads it straight out of shared memory; see

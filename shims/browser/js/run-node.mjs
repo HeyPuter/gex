@@ -201,7 +201,13 @@ function readClosure() {
 }
 
 const host = new ProcessHost({
-  makeWorker: () => new Worker(new URL('./worker.mjs', import.meta.url)),
+  makeWorker: () => new Worker(new URL('./worker.mjs', import.meta.url),
+    // GEX_CPU_PROF=<dir>: write a V8 CPU profile per Worker, to see where the
+    // guest's time actually goes (which translated library functions, JS
+    // overhead, GC). Off by default -- it slows the run and writes a file each.
+    process.env.GEX_CPU_PROF
+      ? { execArgv: ['--cpu-prof', '--cpu-prof-dir', process.env.GEX_CPU_PROF, '--cpu-prof-interval', '2000'] }
+      : undefined),
   shim: shimWasm,
   guest: guestWasm,
   kernel,
@@ -227,6 +233,9 @@ const host = new ProcessHost({
     // for reproducing the browser-only native-wayland thread deadlock with node
     // tooling. Every process gets it (gtk3-demo is a forked child of the shell).
     wlStub: !!process.env.GEX_WL_STUB,
+    // GEX_WL_TRACE: narrate the wayland protocol (the wasm shim has no env, so
+    // the host flips the switch via gex_set_wl_trace in the worker).
+    wlTrace: process.env.GEX_WL_TRACE ? 1 : undefined,
     attachTrace: !!process.env.GEX_ATTACH_TRACE,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
     // GEX_HEARTBEAT: say where the guest is every N safepoints and every 200
