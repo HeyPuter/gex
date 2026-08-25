@@ -49,6 +49,7 @@ set -eu
 OUT="${1:-${TMPDIR:-/tmp}/gex-virgl-wasm}"
 SRC="$OUT/virglrenderer"
 EMSDK="${EMSDK:-$HOME/emsdk}"
+DEBUG_FLAGS="${GEX_VIRGL_DEBUG_FLAGS:-}"
 # 1.0.0 is the last release before the build grew a hard Vulkan dependency.
 VIRGL_TAG="${VIRGL_TAG:-virglrenderer-1.0.0}"
 
@@ -403,6 +404,29 @@ if 'gex_writes++' not in s:
         "      res->gex_array_writes = 0;", 1)
     assert 'gex_elem_writes = res->gex_writes + 1' in s, 'the elem mirror did not match'
     assert 'gex_array_writes = res->gex_writes + 1' in s, 'the array mirror did not match'
+    open(p, 'w').write(s)
+
+# WebGL 2 is GLES 3.0, but virglrenderer normally maps GLES 3.0 to a desktop
+# GLSL feature level of 130.  Guest Mesa consequently exposes OpenGL 2.1 and
+# no core profile, even though the renderer already translates Gallium shaders
+# to GLSL ES 3.00.  Desktop applications such as SuperTuxKart then fail before
+# their first draw while requesting the OpenGL 3.3 core context they require.
+# Advertise that translated feature level on this WebGL-only build.  Keep the
+# override here rather than upstream: a native GLES host may have a different
+# policy, while this renderer is pinned to WebGL 2 above.
+p = f'{src}/src/vrend_renderer.c'
+s = open(p).read()
+if 'GEX_WEBGL_GL33' not in s:
+    needle = '''   vrend_fill_caps_glsl_version(gl_ver, gles_ver, caps);
+   VREND_DEBUG(dbg_features, NULL, "GLSL support level: %d", caps->v1.glsl_level);'''
+    replacement = '''   vrend_fill_caps_glsl_version(gl_ver, gles_ver, caps);
+#ifdef __EMSCRIPTEN__ /* GEX_WEBGL_GL33 */
+   if (gles_ver >= 30 && caps->v1.glsl_level < 330)
+      caps->v1.glsl_level = 330;
+#endif
+   VREND_DEBUG(dbg_features, NULL, "GLSL support level: %d", caps->v1.glsl_level);'''
+    assert needle in s, 'the capset GLSL level did not match'
+    s = s.replace(needle, replacement, 1)
     open(p, 'w').write(s)
 PATCH
 
@@ -772,9 +796,10 @@ DESKTOP
     $VTEST_FLAGS \
     -Wno-pedantic -Wno-c23-extensions \
     -sFULL_ES3=1 -sMAX_WEBGL_VERSION=2 -sMIN_WEBGL_VERSION=2 \
-    -sALLOW_MEMORY_GROWTH=1 -sEXPORT_ES6=1 -sMODULARIZE=1 \
+    -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=1048576 -sEXPORT_ES6=1 -sMODULARIZE=1 \
     -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,UTF8ToString \
     -sENVIRONMENT=web,worker \
+    $DEBUG_FLAGS \
     -sEXPORTED_FUNCTIONS=_gex_virgl_init,_gex_virgl_describe,_gex_virgl_gl_state,_gex_virgl_commands,_gex_virgl_feed,_gex_virgl_pump,_gex_virgl_pending,_gex_virgl_replies,_gex_virgl_drain,_gex_virgl_close,_gex_virgl_trace_commands,_malloc,_free
 
 echo

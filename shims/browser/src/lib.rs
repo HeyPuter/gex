@@ -5228,7 +5228,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // native-wayland stall spins the main thread on time()/gettimeofday and
         // only the caller says which lock/condition it is polling.
         let caller = with_host(|h| object_off_at(h, g(30)));
-        trace_line(&format!(
+        warn_line(&format!(
             "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{obj} <-{}  ...\n",
             gex_kernel::syscalls::syscall_name(n),
             g(0),
@@ -10687,7 +10687,7 @@ pub extern "C" fn gex_dump_state() {
             ("x16", r(16)),
             ("x17", r(17)),
         ] {
-            trace_line(&format!("gex:   {name}={a:#x} in {}\n", where_is(a)));
+            warn_line(&format!("gex:   {name}={a:#x} in {}\n", where_is(a)));
         }
     });
 }
@@ -10758,6 +10758,18 @@ fn set_exit(h: &mut Host, code: i32) {
 #[no_mangle]
 pub extern "C" fn gex_process_gone(status: i32) -> u32 {
     if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
+        // `EXITED` is process-wide shared memory.  A sibling thread can set it
+        // while the original process Worker is parked, then that Worker sees
+        // the flag and leaves `gex.run` without having run `exit_process` in
+        // *its* Host.  Republish from the process Worker unless this Host
+        // already recorded the exit; the remote process table accepts this
+        // idempotently and, crucially, wakes the parent's wait4.
+        let pid = my_pid();
+        with_host(|h| {
+            if h.exit.is_none() {
+                h.kernel.procs.exit(pid, status);
+            }
+        });
         return 0;
     }
     EXITED.store(true, std::sync::atomic::Ordering::Relaxed);

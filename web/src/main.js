@@ -276,6 +276,7 @@ for (const [event, describe] of [
     globalThis.GEX_DEBUG_EXIT = 1;
     globalThis.GEX_TRAP_STACK = 1;
   }
+  if (params.get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;
   // `?trapstack=1`: the engine's stack for a trap -- which names the shim
   // function the fault was in -- without `?debug`'s mirroring of every guest
   // write to the console. That mirroring is not free: it changed the timing

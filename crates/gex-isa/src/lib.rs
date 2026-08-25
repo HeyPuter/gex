@@ -798,15 +798,18 @@ pub enum Inst {
         bytes: u32,
         addr: AddrMode,
     },
-    /// `ld1`/`st1` on a single lane, and `ld1r`, which broadcasts instead.
+    /// `ld1`..`ld4`/`st1`..`st4` on a single lane, and the corresponding
+    /// replicate loads.
     VLoadStoreLane {
         load: bool,
-        /// `ld1r`: fill every lane rather than writing one.
+        /// `ldNr`: fill every lane rather than writing one.
         replicate: bool,
+        /// Number of consecutive vector registers in the structure.
+        regs: u8,
         lane_bytes: u32,
         /// Which lane; meaningless when `replicate`.
         index: u32,
-        /// Only affects `ld1r`, which must zero the upper half when clear.
+        /// Only affects replicate loads, which must zero the upper half when clear.
         q: bool,
         vt: VReg,
         addr: AddrMode,
@@ -1197,6 +1200,8 @@ pub enum VOp3 {
     UqAdd,
     SqSub,
     UqSub,
+    /// Unsigned halving add, rounded down.
+    UhAdd,
     UrHAdd,
     CmEq,
     CmGt,

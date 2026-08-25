@@ -326,6 +326,10 @@ export async function runProgram(
     // A 2D canvas for the Wayland compositor to blit committed frames onto.
     // Set for the xwayland/es2gears demo; drives the `wl-bridge` present path.
     wl = null,
+    // Input may belong on a different canvas from wl_shm presentation. In the
+    // Xwayland/virgl path the visible pixels are on the WebGL canvas while the
+    // Wayland canvas only carries the compositor's software framebuffer.
+    wlInput = null,
     virgl = null,
     uid,
     // Every N safepoints, print the guest pc -- the only instrument for
@@ -435,7 +439,8 @@ export async function runProgram(
     // it, the compositor pump drains it. Only a real canvas can take focus and
     // report pointer coordinates, so the `wl === true` (no page canvas) case
     // gets none.
-    if (typeof wl?.getContext === 'function') attachWlInput(wl, wlChannel);
+    const inputCanvas = wlInput || wl;
+    if (typeof inputCanvas?.getContext === 'function') attachWlInput(inputCanvas, wlChannel);
   }
 
   const host = new ProcessHost({
@@ -494,6 +499,9 @@ export async function runProgram(
       debugExit:
         !!globalThis.GEX_DEBUG_EXIT ||
         (typeof process !== 'undefined' && !!process.env?.GEX_DEBUG_EXIT),
+      // Label process/thread Worker exits without `debugExit`'s expensive
+      // mirroring of every guest write.
+      exitTrace: !!globalThis.GEX_EXIT_TRACE,
       // The engine's wasm-frame stack for a trap, in every process. In `extra`
       // because a trap that matters happens in a Worker, and a global set in
       // the page is not visible there.

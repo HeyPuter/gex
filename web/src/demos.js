@@ -9,6 +9,22 @@ function rule(ctx, label) {
   ctx.term.writeln(ctx.ansi.dim(`── ${label} ${'─'.repeat(w)}`));
 }
 
+// Resolve a rootfs symlink target without letting `..` escape the archive
+// root. Debian commonly uses links such as ../../share/foo; merely collapsing
+// duplicate slashes leaves those targets impossible to find in `tree.files`.
+function rootfsLinkTarget(path, target) {
+  const raw = target.startsWith('/')
+    ? target
+    : `${path.slice(0, path.lastIndexOf('/'))}/${target}`;
+  const parts = [];
+  for (const part of raw.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  return `/${parts.join('/')}`;
+}
+
 
 // A demo that failed. The console gets the error object itself so devtools can
 // expand a real stack; the terminal gets the message and the top of the stack.
@@ -145,9 +161,7 @@ async function boot(ctx) {
     // with them: without it `/bin/sh` (a symlink to dash) has no execute bit
     // and dpkg reports "not found in PATH or not executable".
     for (const [path, target] of Object.entries(tree.links)) {
-      const abs = target.startsWith('/')
-        ? target
-        : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+      const abs = rootfsLinkTarget(path, target);
       if (files[abs]) {
         files[path] = files[abs];
         if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
@@ -268,9 +282,7 @@ async function bootDebian(ctx) {
     const tree = await ctx.rootfs('/rootfs/debian.tar');
     const files = { ...tree.files };
     for (const [path, target] of Object.entries(tree.links)) {
-      const abs = target.startsWith('/')
-        ? target
-        : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+      const abs = rootfsLinkTarget(path, target);
       // A symlink becomes a copy; the mode must travel with the bytes or
       // `/bin/sh` (a symlink to dash) loses its execute bit.
       if (files[abs]) {
@@ -576,9 +588,7 @@ const virglGears = {
         const tree = await ctx.rootfs('/rootfs/graphics.tar');
         const files = { ...tree.files };
         for (const [path, target] of Object.entries(tree.links)) {
-          const abs = target.startsWith('/')
-            ? target
-            : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+          const abs = rootfsLinkTarget(path, target);
           // A symlink becomes a copy; the mode must travel with the bytes or
       // `/bin/sh` (a symlink to dash) loses its execute bit.
       if (files[abs]) {
@@ -685,6 +695,7 @@ const waylandGears = {
   network: false,
 
   async enter(ctx) {
+    const demo = this;
     const wrap = document.createElement('div');
     wrap.className = 'canvas-wrap';
     const canvas = document.createElement('canvas');
@@ -703,12 +714,15 @@ const waylandGears = {
     document.getElementById('terminal')?.before(wrap);
     ctx.onLeave(() => wrap.remove());
 
-    ctx.term.writeln('Xwayland replaces Xvfb. It connects to a Wayland compositor that lives in');
-    ctx.term.writeln('the shim, and glxgears renders through virgl -- real Mesa, no software');
-    ctx.term.writeln('rasteriser -- to virglrenderer on this page.');
+    const intro = demo.intro || [
+      'Xwayland replaces Xvfb. It connects to a Wayland compositor that lives in',
+      'the shim, and glxgears renders through virgl -- real Mesa, no software',
+      'rasteriser -- to virglrenderer on this page.',
+    ];
+    for (const line of intro) ctx.term.writeln(line);
     ctx.term.writeln('');
 
-    const start = async (seconds) => {
+    const start = async (seconds, runOptions = {}) => {
       ctx.actions([]);
       running(true);
       const t0 = performance.now();
@@ -733,12 +747,16 @@ const waylandGears = {
         ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
         ctx.term.writeln('');
 
-        const tree = await ctx.rootfs('/rootfs/graphics.tar');
+        const qp = new URLSearchParams(location.search);
+        // Keep the stock graphics image as the default, but let heavier X11
+        // applications bring their own traced/minimised rootfs through the
+        // same Xwayland + Wayland + virgl pipeline. The URL is still fetched
+        // from this site's rootfs directory; only the asset name changes.
+        const rootfsUrl = qp.get('wlrootfs') || demo.rootfs || '/rootfs/graphics.tar';
+        const tree = await ctx.rootfs(rootfsUrl);
         const files = { ...tree.files };
         for (const [path, target] of Object.entries(tree.links)) {
-          const abs = target.startsWith('/')
-            ? target
-            : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+          const abs = rootfsLinkTarget(path, target);
           if (files[abs]) {
             files[path] = files[abs];
             if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
@@ -754,8 +772,9 @@ const waylandGears = {
         // adds env, so a probe needs no rebuild. GALLIUM_DRIVER=virpipe is the
         // whole point: glxgears' GL goes through Mesa's virgl driver to the vtest
         // socket, not a software rasteriser.
-        const qp = new URLSearchParams(location.search);
-        const extraEnv = (qp.get('wlenv') || '')
+        const extraEnv = [demo.env, qp.get('wlenv')]
+          .filter(Boolean)
+          .join(';')
           .split(';')
           .filter(Boolean)
           .map((e) => `export ${e}\n`)
@@ -793,12 +812,22 @@ const waylandGears = {
           // turns it back on to exercise/diagnose the multithreaded path.
           'export MESA_SHADER_CACHE_DISABLE=true\n' +
           extraEnv;
+        // Keeping `timeout` as the normal demo guard is useful, but profiling
+        // clients often exit on their own.  Running those directly avoids an
+        // extra process whose wait state can hide the client's real exit from
+        // the browser harness.
+        const runClient = (client) =>
+          runOptions.noTimeout || qp.has('wlnotimeout')
+            ? client
+            : `timeout ${seconds} ${client}`;
         let script;
         if (qp.get('wlmode') === 'native') {
           // A wayland-native GL client straight against gex-wayland -- no X at
           // all. GL still goes through virgl (virpipe) to virglrenderer; EGL's
           // wl_shm/drisw path needs no gbm/DRM and no libLLVM.
-          const client = qp.get('wlclient') || '/usr/bin/es2gears_wayland.aarch64-linux-gnu';
+          const client =
+            qp.get('wlclient') || runOptions.client || demo.client ||
+            '/usr/bin/es2gears_wayland.aarch64-linux-gnu';
           // EGL_PLATFORM=wayland is what makes Mesa's EGL take the wl_shm/drisw
           // path (→ virgl via virpipe) instead of probing for a GPU/gbm device
           // it cannot find. Without it eglInitialize fails; with it, it comes up
@@ -807,11 +836,13 @@ const waylandGears = {
             baseEnv +
             'export EGL_PLATFORM=wayland\n' +
             `echo "gex: running ${client}"\n` +
-            `timeout ${seconds} ${client} 2>&1\n` +
+            `${runClient(client)} 2>&1\n` +
             'echo "gex: client exited $?"\n';
         } else {
           // Xwayland as the X server, glxgears (or ?wlclient=) as an X client.
-          const client = qp.get('wlclient') || 'glxgears.aarch64-linux-gnu -info';
+          const client =
+            qp.get('wlclient') || runOptions.client || demo.client ||
+            'glxgears.aarch64-linux-gnu -info';
           script =
             baseEnv +
             'echo "gex: starting Xwayland"\n' +
@@ -842,7 +873,7 @@ const waylandGears = {
             // the process boundary (a shared tmpfs, or bake the cache into the
             // rootfs at build time).
             'echo "gex: X up, starting the client"\n' +
-            `timeout ${seconds} ${client} 2>&1\n` +
+            `${runClient(client)} 2>&1\n` +
             'echo "gex: client exited $?"\n';
         }
         files['/run.sh'] = new TextEncoder().encode(script);
@@ -864,6 +895,9 @@ const waylandGears = {
           // the Xwayland path the pixels come via virgl and this stays blank.
           virgl: renderer,
           wl: wlCanvas,
+          // Xwayland's image is the virgl/WebGL canvas, so focus and input
+          // belong there. A native Wayland client draws into wlCanvas itself.
+          wlInput: qp.get('wlmode') === 'native' ? wlCanvas : canvas,
           heartbeat: Number(new URLSearchParams(location.search).get('heartbeat')) || 0,
         });
         const ms = (performance.now() - t0).toFixed(0);
@@ -880,19 +914,71 @@ const waylandGears = {
       } finally {
         running(false);
         ctx.idle();
-        ctx.actions([
+        ctx.actions(demo.actions?.(start) || [
           { label: 'Draw for 90s', primary: true, onClick: () => start(90) },
           { label: 'Draw for 5 minutes', onClick: () => start(300) },
         ]);
       }
     };
 
-    ctx.actions([
+    ctx.actions(demo.actions?.(start) || [
       { label: 'Draw for 90s', primary: true, onClick: () => start(90) },
       { label: 'Draw for 5 minutes', onClick: () => start(300) },
     ]);
-    ctx.hint('Xwayland + glxgears, GL through virgl');
+    ctx.hint(demo.hint || 'Xwayland + glxgears, GL through virgl');
   },
 };
 
-export const DEMOS = [upload, busybox, debian, gears, virglGears, waylandGears];
+const stkVideoOptions =
+  '--screensize=300x300 --windowed --disable-hd-textures --disable-dynamic-lights ' +
+  '--disable-glow --disable-bloom --disable-light-shaft --disable-dof --disable-particles ' +
+  '--disable-animated-characters --disable-motion-blur --disable-mlaa --disable-ssao ' +
+  '--disable-ibl --shadows=0 --anisotropic=0';
+const stkRace =
+  `/usr/games/supertuxkart --race-now --track=snowtuxpeak --kart=tux ` +
+  `--numkarts=1 --laps=1 ${stkVideoOptions}`;
+
+// The real application workload for the complete browser graphics pipeline.
+// It shares the Wayland implementation above, but carries its own rootfs and
+// launch presets so selecting the card needs no query-string incantation.
+const supertuxkart = {
+  id: 'supertuxkart',
+  title: 'SuperTuxKart on Xwayland',
+  blurb:
+    'Run the AArch64 SuperTuxKart package through gex-wayland, Xwayland, Mesa virgl, and ' +
+    'virglrenderer into WebGL in this browser.',
+  network: false,
+  rootfs: '/rootfs/stk.tar',
+  env:
+    'IRR_DEVICE_TYPE=x11;SUPERTUXKART_DATADIR=/usr/share/games/supertuxkart;' +
+    'ALSOFT_DRIVERS=null;MESA_GLSL_CACHE_DISABLE=1;MESA_GL_VERSION_OVERRIDE=3.3;' +
+    'MESA_GLSL_VERSION_OVERRIDE=330;JSIMD_FORCENONE=1',
+  client: `${stkRace} --profile-time=5`,
+  intro: [
+    'SuperTuxKart is running as an AArch64 X11 application inside this page:',
+    'Xwayland -> gex-wayland, Mesa virgl -> virglrenderer -> browser WebGL.',
+  ],
+  hint: 'SuperTuxKart, Xwayland, and Mesa virgl in a real browser',
+  actions: (start) => [
+    {
+      label: 'Run FPS profile',
+      primary: true,
+      onClick: () => start(90, { noTimeout: true }),
+    },
+    {
+      label: 'Play for 5 minutes',
+      onClick: () => start(300, { client: stkRace }),
+    },
+  ],
+  enter: waylandGears.enter,
+};
+
+export const DEMOS = [
+  upload,
+  busybox,
+  debian,
+  gears,
+  virglGears,
+  waylandGears,
+  supertuxkart,
+];

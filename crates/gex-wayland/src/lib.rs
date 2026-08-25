@@ -506,7 +506,12 @@ impl Client {
             }
             "wl_output" => {
                 self.objects.insert(id, Object::Output);
-                let (w_px, h_px) = (1920, 1080);
+                // Keep the advertised output in sync with the size used for
+                // xdg_toplevel configure events.  Xwayland sizes its root
+                // framebuffer from wl_output, so a fixed 1920x1080 mode made
+                // every commit copy 8 MiB even when the compositor and page
+                // were only presenting a 640x480 surface.
+                let (w_px, h_px) = self.default_size;
                 let ev = Writer::new(id, 0)
                     .int(0)
                     .int(0)

@@ -882,28 +882,28 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
     }
 }
 
-/// `ld1`/`st1` on one lane, and `ld1r`. The lane index is scattered across Q,
-/// S and `size`, differently per element width.
+/// `ld1`..`ld4`/`st1`..`st4` on one lane, and their replicate-load forms. The
+/// lane index is scattered across Q, S and `size`, differently per width.
 fn decode_simd_ldst_single(raw: u32) -> Inst {
     let q = bit(raw, 30) == 1;
     let post_index = bit(raw, 23) == 1;
     let load = bit(raw, 22) == 1;
-    // R selects the paired `ld2`/`ld2r` forms, which are not handled here.
-    if bit(raw, 21) != 0 {
-        return Inst::Unknown { raw };
-    }
+    let r = bit(raw, 21);
     let rm = bits(raw, 20, 16);
     let opcode = bits(raw, 15, 13);
     let s = bit(raw, 12);
     let size = bits(raw, 11, 10);
     let qb = q as u32;
 
-    let (lane_bytes, index, replicate) = match opcode {
+    // The low opcode bit adds two registers and R adds one: 1/2/3/4.
+    let regs = (1 + (opcode & 1) * 2 + r) as u8;
+    let base_opcode = opcode & !1;
+    let (lane_bytes, index, replicate) = match base_opcode {
         0b000 => (1, qb << 3 | s << 2 | size, false),
         0b010 if size & 1 == 0 => (2, qb << 2 | s << 1 | (size >> 1), false),
         0b100 if size == 0b00 => (4, qb << 1 | s, false),
         0b100 if size == 0b01 && s == 0 => (8, qb, false),
-        // `ld1r`, which has no index: `size` is simply the element width.
+        // `ldNr`, which has no index: `size` is simply the element width.
         0b110 if load => (1 << size, 0, true),
         _ => return Inst::Unknown { raw },
     };
@@ -912,12 +912,12 @@ fn decode_simd_ldst_single(raw: u32) -> Inst {
     }
     let rn = RegSel::sp(bits(raw, 9, 5));
     let addr = if post_index {
-        // Rm == 31 is the immediate form (advance by the element size); any
+        // Rm == 31 is the immediate form (advance by the structure size); any
         // other register holds the amount.
         if rm == 0b11111 {
             AddrMode::PostIndex {
                 rn,
-                off: lane_bytes as i64,
+                off: (lane_bytes * regs as u32) as i64,
             }
         } else {
             AddrMode::PostIndexReg {
@@ -931,6 +931,7 @@ fn decode_simd_ldst_single(raw: u32) -> Inst {
     Inst::VLoadStoreLane {
         load,
         replicate,
+        regs,
         lane_bytes,
         index,
         q,
@@ -1479,7 +1480,6 @@ fn decode_simd_fp(raw: u32) -> Inst {
             if bit(raw, 10) == 1 {
                 return decode_simd_three_same(raw, q, u);
             }
-
         }
     }
 
@@ -1849,6 +1849,7 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
         return Inst::Undefined { raw };
     };
     let op = match (opcode, u) {
+        (0b00000, 1) => VOp3::UhAdd,
         (0b00001, 0) => VOp3::SqAdd,
         (0b00001, _) => VOp3::UqAdd,
         (0b00010, 1) => VOp3::UrHAdd,
@@ -2937,5 +2938,44 @@ mod tests {
             raw = raw.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             let _ = decode(raw, 0x4000);
         }
+    }
+
+    #[test]
+    fn simd_structure_lane_st4() {
+        assert_eq!(
+            d(0x0d20_a022),
+            Inst::VLoadStoreLane {
+                load: false,
+                replicate: false,
+                regs: 4,
+                lane_bytes: 4,
+                index: 0,
+                q: false,
+                vt: VReg(2),
+                addr: AddrMode::Offset {
+                    rn: RegSel::Gp(1),
+                    off: 0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn simd_unsigned_halving_add() {
+        assert!(matches!(
+            d(0x2e34_0400),
+            Inst::VThreeSame {
+                op: VOp3::UhAdd,
+                arr: VArr {
+                    lane_bytes: 1,
+                    q: false,
+                    float: false,
+                    scalar: false,
+                },
+                vd: VReg(0),
+                vn: VReg(0),
+                vm: VReg(20),
+            }
+        ));
     }
 }

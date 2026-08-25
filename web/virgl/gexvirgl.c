@@ -178,6 +178,7 @@ static struct vtest_input gex_input = {.read = gex_input_read};
  */
 static GLuint gex_blit_fbo;
 static int gex_presented;
+static unsigned gex_submit_present_seq;
 
 /* Why a readback did not become a picture. A blank canvas has several
  * causes that look identical from outside -- the guest never read back, it
@@ -583,7 +584,14 @@ int gex_virgl_pump(int sid) {
      * Wayland swap path, unlike the X server's TRANSFER_GET), put what it just
      * drew on the canvas ourselves. */
     if (submitted) {
-        gex_present_current();
+        /* A GL client commonly submits more often than the display can show.
+         * Mirroring every submit forces an extra framebuffer blit (and a GPU
+         * flush) into the guest's render loop.  Decouple rendering from page
+         * presentation by showing every second completed submit: the canvas
+         * remains a live, playable 30+ Hz view while the guest can run at its
+         * own rate. */
+        if ((gex_submit_present_seq++ & 1u) == 0)
+            gex_present_current();
     }
     return ran;
 }

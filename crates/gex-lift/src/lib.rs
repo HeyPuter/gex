@@ -19,9 +19,8 @@ use gex_ir::*;
 use gex_isa::{
     AddOp, AddrMode, BarrierKind, BfOp, Cond, Dp1Op, Dp2Op, Dp3Op, Extend, FpOp1, FpOp2, FpRound,
     FpSz, Inst, LogOp, MemSz, MoveOp, Ordering as IsaOrder, RegSel, RmwOp as IsaRmw, ShiftType,
-    SysMaintOp, SysReg, Sz, VAcrossOp, VArr, VLogOp, VOp2, VOp3, VPermOp, VSelKind, VShiftImmOp,
-    VNarrowOp,
-    VWidenOp,
+    SysMaintOp, SysReg, Sz, VAcrossOp, VArr, VLogOp, VNarrowOp, VOp2, VOp3, VPermOp, VSelKind,
+    VShiftImmOp, VWidenOp,
 };
 
 mod block;
@@ -1987,6 +1986,7 @@ impl<'a> Lifter<'a> {
             Inst::VLoadStoreLane {
                 load,
                 replicate,
+                regs,
                 lane_bytes,
                 index,
                 q,
@@ -2001,45 +2001,49 @@ impl<'a> Lifter<'a> {
                 };
                 let ty = if lane_bytes == 8 { Ty::I64 } else { Ty::I32 };
                 let a = self.address(addr);
-                if load {
-                    let val = self.b.def(Expr::Load {
-                        addr: a.base,
-                        offset: a.offset,
-                        sz: msz,
-                        signed: false,
-                        ty,
-                        order: Order::Relaxed,
-                    });
-                    let v = if replicate {
-                        let full = self.b.def(Expr::VSplat { a: val, lane_bytes });
-                        // The 64-bit arrangement leaves the upper half zero.
-                        self.narrow_to_64(full, q)
+                for i in 0..regs {
+                    let reg = GuestReg::V128((vt.0 + i) % 32);
+                    let offset = a.offset + i as i64 * lane_bytes as i64;
+                    if load {
+                        let val = self.b.def(Expr::Load {
+                            addr: a.base,
+                            offset,
+                            sz: msz,
+                            signed: false,
+                            ty,
+                            order: Order::Relaxed,
+                        });
+                        let v = if replicate {
+                            let full = self.b.def(Expr::VSplat { a: val, lane_bytes });
+                            // The 64-bit arrangement leaves the upper half zero.
+                            self.narrow_to_64(full, q)
+                        } else {
+                            let old = self.b.read(reg);
+                            self.b.def(Expr::VReplace {
+                                a: old,
+                                lane: index,
+                                lane_bytes,
+                                val,
+                            })
+                        };
+                        self.b.write(reg, v);
                     } else {
-                        let old = self.b.read(GuestReg::V128(vt.0));
-                        self.b.def(Expr::VReplace {
+                        let old = self.b.read(reg);
+                        let val = self.b.def(Expr::VExtract {
                             a: old,
                             lane: index,
                             lane_bytes,
+                            signed: false,
+                            ty,
+                        });
+                        self.b.stmt(Stmt::Store {
+                            addr: a.base,
+                            offset,
                             val,
-                        })
-                    };
-                    self.b.write(GuestReg::V128(vt.0), v);
-                } else {
-                    let old = self.b.read(GuestReg::V128(vt.0));
-                    let val = self.b.def(Expr::VExtract {
-                        a: old,
-                        lane: index,
-                        lane_bytes,
-                        signed: false,
-                        ty,
-                    });
-                    self.b.stmt(Stmt::Store {
-                        addr: a.base,
-                        offset: a.offset,
-                        val,
-                        sz: msz,
-                        order: Order::Relaxed,
-                    });
+                            sz: msz,
+                            order: Order::Relaxed,
+                        });
+                    }
                 }
                 self.finish_address(&a);
                 Flow::Next
@@ -2639,6 +2643,37 @@ impl<'a> Lifter<'a> {
             return Flow::Next;
         }
 
+        // wasm has the rounded-up unsigned average but not UHADD's rounded-down
+        // one. This carry-safe identity works at every lane width:
+        // floor((a+b)/2) = (a & b) + ((a ^ b) >> 1).
+        if op == VOp3::UhAdd {
+            let both = self.b.def(Expr::VBin {
+                op: VBinOp::And,
+                a,
+                b,
+            });
+            let differing = self.b.def(Expr::VBin {
+                op: VBinOp::Xor,
+                a,
+                b,
+            });
+            let amount = self.b.const_i32(1);
+            let half = self.b.def(Expr::VShift {
+                op: VShiftOp::ShrU,
+                lane,
+                a: differing,
+                amount,
+            });
+            let r = self.b.def(Expr::VLaneBin {
+                op: VLaneBinOp::Add,
+                lane,
+                a: both,
+                b: half,
+            });
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+
         // `cmhi`/`cmhs` on 64-bit lanes. wasm's i64x2 compares are signed
         // only, so bias into signed order: `a >u b` == `(a^min) >s (b^min)`.
         if matches!(op, VOp3::CmHi | VOp3::CmHs) && lane == VLane::I64 {
@@ -2762,12 +2797,7 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
             // Pairwise: deinterleave the concatenation, then combine.
-            VOp3::AddP
-            | VOp3::FAddP
-            | VOp3::SMaxP
-            | VOp3::UMaxP
-            | VOp3::SMinP
-            | VOp3::UMinP => {
+            VOp3::AddP | VOp3::FAddP | VOp3::SMaxP | VOp3::UMaxP | VOp3::SMinP | VOp3::UMinP => {
                 let (evens, odds) = pairwise_patterns(arr);
                 let e = self.b.def(Expr::VShuffle {
                     a,
@@ -2803,7 +2833,11 @@ impl<'a> Lifter<'a> {
             VOp3::UShl | VOp3::SShl => {
                 let signed = op == VOp3::SShl;
                 let bits = arr.lane_bytes * 8;
-                let ty = if arr.lane_bytes == 8 { Ty::I64 } else { Ty::I32 };
+                let ty = if arr.lane_bytes == 8 {
+                    Ty::I64
+                } else {
+                    Ty::I32
+                };
                 let lanes = if arr.scalar {
                     1
                 } else {
@@ -2838,12 +2872,9 @@ impl<'a> Lifter<'a> {
                     };
                     let neg = self.b.bin(BinOp::Sub, ty, zero, n);
                     let left = self.b.bin(BinOp::Shl, ty, val, n);
-                    let right = self.b.bin(
-                        if signed { BinOp::ShrS } else { BinOp::ShrU },
-                        ty,
-                        val,
-                        neg,
-                    );
+                    let right =
+                        self.b
+                            .bin(if signed { BinOp::ShrS } else { BinOp::ShrU }, ty, val, neg);
                     // Out of range: everything is gone. Left and unsigned
                     // right give zero; a signed right gives the sign bit,
                     // which is what shifting by width-1 leaves behind.
@@ -3216,10 +3247,7 @@ impl<'a> Lifter<'a> {
         // shifts, so they leave before any of the shift reasoning below.
         if matches!(
             op,
-            VShiftImmOp::Scvtf
-                | VShiftImmOp::Ucvtf
-                | VShiftImmOp::Fcvtzs
-                | VShiftImmOp::Fcvtzu
+            VShiftImmOp::Scvtf | VShiftImmOp::Ucvtf | VShiftImmOp::Fcvtzs | VShiftImmOp::Fcvtzu
         ) {
             return self.fixed_convert(op, arr, vd, vn, shift);
         }
@@ -3270,7 +3298,11 @@ impl<'a> Lifter<'a> {
                 let width = arr.lane_bytes as usize;
                 for lane_i in 0..16 / width {
                     for bit in 0..bits {
-                        let alive = if left { bit < shift } else { bit >= bits - shift };
+                        let alive = if left {
+                            bit < shift
+                        } else {
+                            bit >= bits - shift
+                        };
                         if alive {
                             let byte = lane_i * width + (bit / 8) as usize;
                             keep[byte] |= 1 << (bit % 8);
@@ -3298,9 +3330,15 @@ impl<'a> Lifter<'a> {
                 let shifted = if !signed && shift >= bits {
                     self.b.def(Expr::VConst(Box::new([0u8; 16])))
                 } else {
-                    let n = self.b.const_i32(if shift >= bits { bits - 1 } else { shift });
+                    let n = self
+                        .b
+                        .const_i32(if shift >= bits { bits - 1 } else { shift });
                     self.b.def(Expr::VShift {
-                        op: if signed { VShiftOp::ShrS } else { VShiftOp::ShrU },
+                        op: if signed {
+                            VShiftOp::ShrS
+                        } else {
+                            VShiftOp::ShrU
+                        },
                         lane,
                         a,
                         amount: n,
@@ -3503,10 +3541,9 @@ impl<'a> Lifter<'a> {
                 return Flow::Next;
             }
             // Handled above, before any of the shift reasoning.
-            VShiftImmOp::Scvtf
-            | VShiftImmOp::Ucvtf
-            | VShiftImmOp::Fcvtzs
-            | VShiftImmOp::Fcvtzu => unreachable!("fixed-point converts leave earlier"),
+            VShiftImmOp::Scvtf | VShiftImmOp::Ucvtf | VShiftImmOp::Fcvtzs | VShiftImmOp::Fcvtzu => {
+                unreachable!("fixed-point converts leave earlier")
+            }
         };
         let r = self.b.def(Expr::VShift {
             op: sop,
@@ -3669,10 +3706,7 @@ impl<'a> Lifter<'a> {
         let to_fp = matches!(op, VShiftImmOp::Scvtf | VShiftImmOp::Ucvtf);
         // The same lanes, read as floats: the arrangement the encoding gives
         // describes the integer side.
-        let fa = VArr {
-            float: true,
-            ..arr
-        };
+        let fa = VArr { float: true, ..arr };
         let lane = Self::lane_of(fa);
         let a = self.b.read(GuestReg::V128(vn.0));
 
@@ -4396,7 +4430,6 @@ pub fn sysreg_code(r: SysReg) -> i32 {
         SysReg::Nzcv => -10,
     }
 }
-
 
 /// `2^n` for the fixed-point scales, built from the exponent field rather
 /// than computed.

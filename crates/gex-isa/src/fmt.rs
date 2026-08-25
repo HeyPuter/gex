@@ -972,19 +972,28 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
         Inst::VLoadStoreLane {
             load,
             replicate,
+            regs,
             lane_bytes,
             index,
             q,
             vt,
             ref addr,
         } => {
-            let m = if load { "ld1" } else { "st1" };
+            let m = format!("{}{}", if load { "ld" } else { "st" }, regs);
             let l = lane_letter(lane_bytes);
+            let list = (0..regs)
+                .map(|i| format!("v{}.{}", (vt.0 + i) % 32, l))
+                .collect::<Vec<_>>()
+                .join(", ");
             if replicate {
                 let lanes = (if q { 16 } else { 8 }) / lane_bytes;
-                format!("ld1r {{v{}.{lanes}{l}}}, {}", vt.0, addr_str(addr))
+                let list = (0..regs)
+                    .map(|i| format!("v{}.{lanes}{l}", (vt.0 + i) % 32))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("ld{regs}r {{{list}}}, {}", addr_str(addr))
             } else {
-                format!("{m} {{v{}.{l}}}[{index}], {}", vt.0, addr_str(addr))
+                format!("{m} {{{list}}}[{index}], {}", addr_str(addr))
             }
         }
         Inst::VLoadStore2 {
@@ -1665,6 +1674,7 @@ fn vop3_name(op: VOp3) -> &'static str {
         VOp3::UqAdd => "uqadd",
         VOp3::SqSub => "sqsub",
         VOp3::UqSub => "uqsub",
+        VOp3::UhAdd => "uhadd",
         VOp3::UrHAdd => "urhadd",
         VOp3::CmEq => "cmeq",
         VOp3::CmGt => "cmgt",
