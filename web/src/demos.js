@@ -9,6 +9,22 @@ function rule(ctx, label) {
   ctx.term.writeln(ctx.ansi.dim(`── ${label} ${'─'.repeat(w)}`));
 }
 
+// Resolve a rootfs symlink target without letting `..` escape the archive
+// root. Debian commonly uses links such as ../../share/foo; merely collapsing
+// duplicate slashes leaves those targets impossible to find in `tree.files`.
+function rootfsLinkTarget(path, target) {
+  const raw = target.startsWith('/')
+    ? target
+    : `${path.slice(0, path.lastIndexOf('/'))}/${target}`;
+  const parts = [];
+  for (const part of raw.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  return `/${parts.join('/')}`;
+}
+
 
 // A demo that failed. The console gets the error object itself so devtools can
 // expand a real stack; the terminal gets the message and the top of the stack.
@@ -145,9 +161,7 @@ async function boot(ctx) {
     // with them: without it `/bin/sh` (a symlink to dash) has no execute bit
     // and dpkg reports "not found in PATH or not executable".
     for (const [path, target] of Object.entries(tree.links)) {
-      const abs = target.startsWith('/')
-        ? target
-        : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+      const abs = rootfsLinkTarget(path, target);
       if (files[abs]) {
         files[path] = files[abs];
         if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
@@ -268,9 +282,7 @@ async function bootDebian(ctx) {
     const tree = await ctx.rootfs('/rootfs/debian.tar');
     const files = { ...tree.files };
     for (const [path, target] of Object.entries(tree.links)) {
-      const abs = target.startsWith('/')
-        ? target
-        : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+      const abs = rootfsLinkTarget(path, target);
       // A symlink becomes a copy; the mode must travel with the bytes or
       // `/bin/sh` (a symlink to dash) loses its execute bit.
       if (files[abs]) {
@@ -576,9 +588,7 @@ const virglGears = {
         const tree = await ctx.rootfs('/rootfs/graphics.tar');
         const files = { ...tree.files };
         for (const [path, target] of Object.entries(tree.links)) {
-          const abs = target.startsWith('/')
-            ? target
-            : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+          const abs = rootfsLinkTarget(path, target);
           // A symlink becomes a copy; the mode must travel with the bytes or
       // `/bin/sh` (a symlink to dash) loses its execute bit.
       if (files[abs]) {
@@ -737,6 +747,7 @@ const waylandGears = {
   network: false,
 
   async enter(ctx) {
+    const demo = this;
     const wrap = document.createElement('div');
     wrap.className = 'canvas-wrap';
     // The Wayland compositor's output -- the one window the user sees. `serveWl`
@@ -771,48 +782,57 @@ const waylandGears = {
       wlCanvas.classList.toggle('wl-offscreen', glWindow);
     };
 
-    // The app picker: a labelled dropdown above the canvases. Its selection is
-    // what `start` launches. Kept in the demo's own DOM (cleaned up on leave)
-    // rather than the shared #actions bar, which `ctx.actions` replaces wholesale.
-    const qp = new URLSearchParams(location.search);
-    let app = pickInitialApp(qp);
-    const bar = document.createElement('div');
-    bar.className = 'wl-picker';
-    const label = document.createElement('label');
-    label.textContent = 'App: ';
-    const select = document.createElement('select');
-    for (const a of WL_APPS) {
-      const opt = document.createElement('option');
-      opt.value = a.id;
-      opt.textContent = a.label;
-      select.append(opt);
+    // A demo that names its own client (SuperTuxKart) runs just that; otherwise
+    // an app-picker dropdown chooses among the Qt/GTK/KDE and GL clients. The
+    // selection is what `start` launches.
+    const qp0 = new URLSearchParams(location.search);
+    let app = demo.client
+      ? { id: demo.id, label: demo.title, client: demo.client, mode: demo.mode || 'x', env: '' }
+      : pickInitialApp(qp0);
+    if (!demo.client) {
+      // Kept in the demo's own DOM (cleaned up on leave) rather than the shared
+      // #actions bar, which `ctx.actions` replaces wholesale.
+      const bar = document.createElement('div');
+      bar.className = 'wl-picker';
+      const label = document.createElement('label');
+      label.textContent = 'App: ';
+      const select = document.createElement('select');
+      for (const a of WL_APPS) {
+        const opt = document.createElement('option');
+        opt.value = a.id;
+        opt.textContent = a.label;
+        select.append(opt);
+      }
+      // A `?wlclient=` that is a raw command, not a listed id, gets its own
+      // option so the dropdown still shows what is selected.
+      if (!WL_APPS.some((a) => a.id === app.id)) {
+        const opt = document.createElement('option');
+        opt.value = app.id;
+        opt.textContent = app.label;
+        select.append(opt);
+      }
+      select.value = app.id;
+      label.append(select);
+      bar.append(label);
+      wrap.before(bar);
+      ctx.onLeave(() => bar.remove());
+      select.onchange = () => {
+        app = WL_APPS.find((a) => a.id === select.value) || app;
+        ctx.hint(app.label);
+        showWindow(app);
+      };
     }
-    // A `?wlclient=` that is a raw command, not a listed id, gets its own option
-    // so the dropdown still shows what is selected.
-    if (!WL_APPS.some((a) => a.id === app.id)) {
-      const opt = document.createElement('option');
-      opt.value = app.id;
-      opt.textContent = app.label;
-      select.append(opt);
-    }
-    select.value = app.id;
-    label.append(select);
-    bar.append(label);
-    wrap.before(bar);
-    ctx.onLeave(() => bar.remove());
     showWindow(app);
-    select.onchange = () => {
-      app = WL_APPS.find((a) => a.id === select.value) || app;
-      ctx.hint(app.label);
-      showWindow(app);
-    };
 
-    ctx.term.writeln('Xwayland replaces Xvfb. It connects to a Wayland compositor that lives in');
-    ctx.term.writeln('the shim, and glxgears renders through virgl -- real Mesa, no software');
-    ctx.term.writeln('rasteriser -- to virglrenderer on this page.');
+    const intro = demo.intro || [
+      'Xwayland replaces Xvfb. It connects to a Wayland compositor that lives in',
+      'the shim, and glxgears renders through virgl -- real Mesa, no software',
+      'rasteriser -- to virglrenderer on this page.',
+    ];
+    for (const line of intro) ctx.term.writeln(line);
     ctx.term.writeln('');
 
-    const start = async (seconds) => {
+    const start = async (seconds, runOptions = {}) => {
       ctx.actions([]);
       running(true);
       const t0 = performance.now();
@@ -837,12 +857,16 @@ const waylandGears = {
         ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
         ctx.term.writeln('');
 
-        const tree = await ctx.rootfs('/rootfs/graphics.tar');
+        const qp = new URLSearchParams(location.search);
+        // Keep the stock graphics image as the default, but let heavier X11
+        // applications bring their own traced/minimised rootfs through the
+        // same Xwayland + Wayland + virgl pipeline. The URL is still fetched
+        // from this site's rootfs directory; only the asset name changes.
+        const rootfsUrl = qp.get('wlrootfs') || demo.rootfs || '/rootfs/graphics.tar';
+        const tree = await ctx.rootfs(rootfsUrl);
         const files = { ...tree.files };
         for (const [path, target] of Object.entries(tree.links)) {
-          const abs = target.startsWith('/')
-            ? target
-            : `${path.slice(0, path.lastIndexOf('/'))}/${target}`.replace(/\/{2,}/g, '/');
+          const abs = rootfsLinkTarget(path, target);
           if (files[abs]) {
             files[path] = files[abs];
             if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
@@ -858,8 +882,9 @@ const waylandGears = {
         // adds env, so a probe needs no rebuild. GALLIUM_DRIVER=virpipe is the
         // whole point: glxgears' GL goes through Mesa's virgl driver to the vtest
         // socket, not a software rasteriser.
-        const qp = new URLSearchParams(location.search);
-        const extraEnv = (qp.get('wlenv') || '')
+        const extraEnv = [demo.env, qp.get('wlenv')]
+          .filter(Boolean)
+          .join(';')
           .split(';')
           .filter(Boolean)
           .map((e) => `export ${e}\n`)
@@ -897,9 +922,20 @@ const waylandGears = {
           // turns it back on to exercise/diagnose the multithreaded path.
           'export MESA_SHADER_CACHE_DISABLE=true\n' +
           extraEnv;
+        // Keeping `timeout` as the normal demo guard is useful, but profiling
+        // clients often exit on their own. Running those directly avoids an
+        // extra process whose wait state can hide the client's real exit from
+        // the browser harness.
+        const runClient = (client) =>
+          runOptions.noTimeout || qp.has('wlnotimeout')
+            ? client
+            : `timeout ${seconds} ${client}`;
+        // A `?wlclient=` or a per-action `runOptions.client` (the SuperTuxKart
+        // "Play" preset) overrides the selected app's command.
+        const client = qp.get('wlclient') || runOptions.client || app.client;
         const run =
-          `echo "gex: running ${app.client}"\n` +
-          `timeout ${seconds} ${app.client} 2>&1\n` +
+          `echo "gex: running ${client}"\n` +
+          `${runClient(client)} 2>&1\n` +
           'echo "gex: client exited $?"\n';
         let script;
         if (app.mode === 'shm') {
@@ -918,7 +954,8 @@ const waylandGears = {
           // and enumerates real configs.
           script = baseEnv + 'export EGL_PLATFORM=wayland\n' + (app.env || '') + run;
         } else {
-          // Xwayland as the X server, glxgears (or a raw ?wlclient=) as an X client.
+          // Xwayland as the X server, glxgears (or a raw ?wlclient=/demo.client)
+          // as an X client.
           script =
             baseEnv +
             (app.env || '') +
@@ -971,6 +1008,9 @@ const waylandGears = {
           // the Xwayland path the pixels come via virgl and this stays blank.
           virgl: renderer,
           wl: wlCanvas,
+          // Focus and input go to the one visible canvas: the virgl/WebGL one
+          // for an Xwayland client ('x'), the compositor's output otherwise.
+          wlInput: app.mode === 'x' ? canvas : wlCanvas,
           heartbeat: Number(new URLSearchParams(location.search).get('heartbeat')) || 0,
         });
         const ms = (performance.now() - t0).toFixed(0);
@@ -987,19 +1027,71 @@ const waylandGears = {
       } finally {
         running(false);
         ctx.idle();
-        ctx.actions([
+        ctx.actions(demo.actions?.(start) || [
           { label: 'Run for 90s', primary: true, onClick: () => start(90) },
           { label: 'Run for 5 minutes', onClick: () => start(300) },
         ]);
       }
     };
 
-    ctx.actions([
+    ctx.actions(demo.actions?.(start) || [
       { label: 'Run for 90s', primary: true, onClick: () => start(90) },
       { label: 'Run for 5 minutes', onClick: () => start(300) },
     ]);
-    ctx.hint(app.label);
+    ctx.hint(demo.hint || app.label);
   },
 };
 
-export const DEMOS = [upload, busybox, debian, gears, virglGears, waylandGears];
+const stkVideoOptions =
+  '--screensize=300x300 --windowed --disable-hd-textures --disable-dynamic-lights ' +
+  '--disable-glow --disable-bloom --disable-light-shaft --disable-dof --disable-particles ' +
+  '--disable-animated-characters --disable-motion-blur --disable-mlaa --disable-ssao ' +
+  '--disable-ibl --shadows=0 --anisotropic=0';
+const stkRace =
+  `/usr/games/supertuxkart --race-now --track=snowtuxpeak --kart=tux ` +
+  `--numkarts=1 --laps=1 ${stkVideoOptions}`;
+
+// The real application workload for the complete browser graphics pipeline.
+// It shares the Wayland implementation above, but carries its own rootfs and
+// launch presets so selecting the card needs no query-string incantation.
+const supertuxkart = {
+  id: 'supertuxkart',
+  title: 'SuperTuxKart on Xwayland',
+  blurb:
+    'Run the AArch64 SuperTuxKart package through gex-wayland, Xwayland, Mesa virgl, and ' +
+    'virglrenderer into WebGL in this browser.',
+  network: false,
+  rootfs: '/rootfs/stk.tar',
+  env:
+    'IRR_DEVICE_TYPE=x11;SUPERTUXKART_DATADIR=/usr/share/games/supertuxkart;' +
+    'ALSOFT_DRIVERS=null;MESA_GLSL_CACHE_DISABLE=1;MESA_GL_VERSION_OVERRIDE=3.3;' +
+    'MESA_GLSL_VERSION_OVERRIDE=330;JSIMD_FORCENONE=1',
+  client: `${stkRace} --profile-time=5`,
+  intro: [
+    'SuperTuxKart is running as an AArch64 X11 application inside this page:',
+    'Xwayland -> gex-wayland, Mesa virgl -> virglrenderer -> browser WebGL.',
+  ],
+  hint: 'SuperTuxKart, Xwayland, and Mesa virgl in a real browser',
+  actions: (start) => [
+    {
+      label: 'Run FPS profile',
+      primary: true,
+      onClick: () => start(90, { noTimeout: true }),
+    },
+    {
+      label: 'Play for 5 minutes',
+      onClick: () => start(300, { client: stkRace }),
+    },
+  ],
+  enter: waylandGears.enter,
+};
+
+export const DEMOS = [
+  upload,
+  busybox,
+  debian,
+  gears,
+  virglGears,
+  waylandGears,
+  supertuxkart,
+];

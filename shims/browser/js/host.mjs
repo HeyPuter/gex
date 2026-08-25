@@ -526,6 +526,15 @@ export class ProcessHost {
         break;
       }
       case 'exit':
+        if (this.#extra?.exitTrace) {
+          this.#onOutput(
+            2,
+            `[gex] worker ${pid} ended with status ${m.status}` +
+              `${m.exitPc ? ` at pc 0x${m.exitPc.toString(16)}` : ''}` +
+              ` (guest ${m.guestMillis ?? -1}ms)\n`,
+            typeof pid === 'number' ? pid : 0,
+          );
+        }
         // The page passes no `onExit`, so these per-process numbers were
         // computed and thrown away. Printed here, guarded so the Node harness
         // (which prints its own) does not double up.

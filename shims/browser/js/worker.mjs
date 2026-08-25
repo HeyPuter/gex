@@ -535,6 +535,11 @@ async function handle(msg) {
     const runStarted = performance.now();
     const status = await gex.run(entry, ctx);
     const guestMillis = Math.round(performance.now() - runStarted);
+    if (msg.exitTrace && status !== 0) {
+      ex.gex_set_trace?.(1);
+      ex.gex_dump_state?.();
+      ex.gex_set_trace?.(0);
+    }
     // Where each pinned object landed. A pin that does not take runs code built
     // for one address at another; only knowable after `ld.so` maps the libraries.
     if (msg.opts?.pins) ex.gex_pin_report?.();
@@ -557,6 +562,7 @@ async function handle(msg) {
       kind: 'exit',
       status,
       guestMillis,
+      exitPc: msg.exitTrace ? Number(ex.gex_current_pc?.() ?? 0n) : undefined,
       // Whatever the runner asked to be read out of the guest before its
       // address space goes away with this thread.
       hot: msg.hot ? hotBlocks(gex) : undefined,

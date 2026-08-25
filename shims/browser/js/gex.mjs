@@ -2309,6 +2309,11 @@ export class Gex {
           if (nextCtx !== 0) ctx = nextCtx;
           continue;
         }
+        // `exit_group` marks every guest thread exited and deliberately leaves
+        // no resume PC. Do not inspect the wait state that thread had before
+        // the exit: a network/futex flag can still be set, and waiting on it
+        // here strands an already-dead process so its parent can never reap it.
+        if (e.gex_exited?.()) return e.gex_exit_code();
         // The guest gave the stack back unfinished: every thread waits on
         // something only the page can produce. Waiting happens out here because
         // a guest holding the one wasm stack is a guest nothing can reach. The
@@ -2316,6 +2321,10 @@ export class Gex {
         if (e.gex_paused_for_net() || e.gex_paused_for_input()) {
           let woke = 0;
           while (e.gex_paused_for_net() || e.gex_paused_for_input()) {
+            // Another Worker can execute exit_group while this one is parked.
+            // The global-kernel wake it generates is not a resume request for
+            // this dead thread, so observe the process flag before consuming it.
+            if (e.gex_exited?.()) return e.gex_exit_code();
             // Input first, and the two are not exclusive: a guest can wait on
             // the keyboard and a socket at once.
             if (e.gex_paused_for_input()) {
@@ -2366,9 +2375,11 @@ export class Gex {
                 await this.#turn();
               }
             }
+            if (e.gex_exited?.()) return e.gex_exit_code();
             woke = e.gex_wake();
             if (woke === 1) break;
           }
+          if (e.gex_exited?.()) return e.gex_exit_code();
           if (woke !== 1) {
             // Every thread is waiting and nothing woke them. Two cases, told
             // apart by whether the guest actually exited: a process whose last
