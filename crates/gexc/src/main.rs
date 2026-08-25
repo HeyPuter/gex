@@ -668,7 +668,14 @@ fn build_closure(
             // `memcpy` has no address here (it resolves to libc's definition),
             // and the executables all share `PIE_BASE`, so an out-of-text entry
             // would collide across them.
-            let addr = s.value.wrapping_add(o.image.bias);
+            //
+            // `Symbol::value` is already biased -- `elf::read_symbols` adds the
+            // bias as it reads the table -- so it is the address, and adding
+            // the bias again put every entry at twice the base, outside the
+            // text range that follows, matching nothing. This whole table was
+            // empty for every object with a non-zero bias, which is all of
+            // them.
+            let addr = s.value;
             if addr < tlo || addr >= thi {
                 continue;
             }

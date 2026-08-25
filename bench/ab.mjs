@@ -30,7 +30,8 @@
 // change at all -- while the paired median read 1.00. Anything smaller than
 // the null-test figure below is not a result.
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -51,11 +52,18 @@ function parse(argv) {
       const [g, h] = [spec.slice(0, eq), spec.slice(eq + 1)];
       if (a === '--file') o.files[g] = h;
       else {
+        // `stat`, and tolerate what it cannot answer. A real distribution rootfs
+        // has dangling symlinks in it -- Debian ships /etc/rmt pointing at a
+        // package that is not installed -- and `stat` on one throws, which
+        // took down the whole harness before any benchmark ran. A link is
+        // bundled as whatever it resolves to, or skipped if that is nothing.
         const walk = (gp, hp) => {
           for (const n of readdirSync(hp)) {
             const hc = `${hp}/${n}`, gc = `${gp}/${n}`;
-            if (statSync(hc).isDirectory()) walk(gc, hc);
-            else o.files[gc] = hc;
+            let st;
+            try { st = statSync(hc); } catch { continue; }
+            if (st.isDirectory()) walk(gc, hc);
+            else if (st.isFile()) o.files[gc] = hc;
           }
         };
         walk(g.replace(/\/$/, ''), h.replace(/\/$/, ''));
@@ -77,12 +85,20 @@ if (!wasmB || !prog) {
 // and stops, and process wall time would include node's own startup.
 const CHILD = `${HERE}one.mjs`;
 
+// Through a file, not the environment. `--dir` over a whole distribution
+// rootfs is tens of thousands of entries and megabytes of JSON, and an
+// environment that big fails `exec` with E2BIG -- which arrives as a child
+// that produced no measurement rather than as an error that says so.
+const MAP = `${tmpdir()}/gex-ab-files-${process.pid}.json`;
+writeFileSync(MAP, JSON.stringify(opt.files));
+process.on('exit', () => { try { unlinkSync(MAP); } catch {} });
+
 function once(wasm) {
   const r = spawnSync(process.execPath, [CHILD, wasm, prog, ...args], {
     input: opt.stdin ? readFileSync(opt.stdin) : undefined,
     env: {
       ...process.env,
-      GEX_BENCH_FILES: JSON.stringify(opt.files),
+      GEX_BENCH_FILES_JSON: MAP,
       GEX_BENCH_CWD: opt.cwd ?? '',
     },
     maxBuffer: 1 << 28,

@@ -68,6 +68,15 @@ function forkTransfer(child) {
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { Gex, Env, utf8 } from './gex.mjs';
 
+// Narration to stderr under Node, for the reason `run-node.mjs` gives: the
+// shim writes it with `console.debug`, which a browser console filters and
+// Node aliases to `console.log`, i.e. to the guest's own stdout. Done here as
+// well as there because a Worker has its own globals, and the guest runs in
+// one -- so this is the copy that was actually corrupting output.
+if (typeof process !== 'undefined' && process.stderr) {
+  console.debug = (...args) => process.stderr.write(`${args.join(' ')}\n`);
+}
+
 const port = await channel();
 
 // This Worker's runtime, once its start message builds it. Module-scope so a

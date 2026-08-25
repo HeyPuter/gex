@@ -24,6 +24,10 @@ CC="$TOOLCHAIN/aarch64-linux-musl-gcc"
 CXX="$TOOLCHAIN/aarch64-linux-musl-g++"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="${GEX_WORK:-target/integration}"
+# How long a guest gets under Node before the harness calls it hung. Every
+# one-off case below already had one; the three comparison helpers did not, so
+# a guest that never exits stopped the suite there instead of failing it.
+NODE_TIMEOUT="${GEX_NODE_TIMEOUT:-300}"
 
 for tool in "$CC" "$QEMU" "$GEXC"; do
     if [ ! -x "$tool" ]; then
@@ -322,7 +326,7 @@ cross_engine() {
     set +e
     "$GEXC" build --exhaustive "$prog" -o "$wasm" >/dev/null 2>&1
     "$QEMU" "$prog" "$@" >"$WORK/$label.qemu" 2>&1
-    "$NODE" "$HERE/../cross-engine/run-node.mjs" "$wasm" "$prog" "$@" \
+    timeout "$NODE_TIMEOUT" "$NODE" "$HERE/../cross-engine/run-node.mjs" "$wasm" "$prog" "$@" \
         >"$WORK/$label.v8" 2>&1
     set -e
     if ! cmp -s "$WORK/$label.qemu" "$WORK/$label.v8"; then
@@ -364,7 +368,7 @@ browser() {
             aot) "$GEXC" build --exhaustive --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1 ;;
             jit) "$GEXC" build --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1 ;;
         esac
-        "$NODE" shims/browser/js/run-node.mjs "$wasm" "$prog" "$@" >"$WORK/$label.$mode.br" 2>&1
+        timeout "$NODE_TIMEOUT" "$NODE" shims/browser/js/run-node.mjs "$wasm" "$prog" "$@" >"$WORK/$label.$mode.br" 2>&1
         set -e
         name="browser-$label"
         [ "$mode" = jit ] && name="browser-jit-$label"
@@ -400,7 +404,7 @@ browser_dynamic() {
     "$GEXC" build --no-shared-memory "$prog" -o "$wasm" >/dev/null 2>&1
     "$QEMU" -L "$SYSROOT" "$prog" "$@" >"$WORK/$label.qemu3" 2>&1
     # shellcheck disable=SC2086
-    "$NODE" shims/browser/js/run-node.mjs $bundle "$wasm" "$prog" "$@" >"$WORK/$label.dyn.br" 2>&1
+    timeout "$NODE_TIMEOUT" "$NODE" shims/browser/js/run-node.mjs $bundle "$wasm" "$prog" "$@" >"$WORK/$label.dyn.br" 2>&1
     set -e
     if ! cmp -s "$WORK/$label.qemu3" "$WORK/$label.dyn.br"; then
         echo "FAIL browser-dynamic-$label: the browser runtime and QEMU disagree"

@@ -16,6 +16,15 @@ import { basename, dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
 
+// The shim's narration goes to `console.debug`, which is exactly right in a
+// browser -- a level the console filters -- and exactly wrong here, because
+// Node makes it an alias for `console.log` and so writes it to the guest's own
+// stdout. A program that clones had `[gex:1] t0 pc=... clone/thread ...` in
+// the middle of its output; for `zstd -c` that is in the middle of a
+// compressed stream. Narration belongs on stderr under Node, where the guest's
+// bytes are not.
+console.debug = (...args) => process.stderr.write(`${args.join(' ')}\n`);
+
 // The host runs on the main thread; give it the attach-trace flag too so
 // thread spawn/adopt timing is visible from the host side, not just the Worker.
 if (process.env.GEX_ATTACH_TRACE) globalThis.GEX_ATTACH_TRACE = 1;
@@ -385,6 +394,12 @@ try {
   process.stderr.write(`gex: ${e?.message ?? e}\n`);
   status = 1;
 }
+// For the path above that threw. `host.start` stops the workers itself when
+// pid 1 exits normally, and `stop` is idempotent, so this is a no-op on the
+// ordinary path -- but a run that throws never reaches that, and a live Worker
+// keeps node from exiting. `process.exitCode` was set and the process then sat
+// there until something killed it, on a failure it had already diagnosed.
+host.stop();
 // `process.exitCode`, not `process.exit`: the guest's output goes through
 // `process.stdout`/`process.stderr` (async when a pipe), and `process.exit`
 // does not wait for them to drain. Setting the code lets node finish the writes.

@@ -19,7 +19,12 @@ class Quiet extends Env {
 }
 
 const files = {};
-for (const [g, h] of Object.entries(JSON.parse(process.env.GEX_BENCH_FILES || '{}'))) {
+// The map arrives as a path, because a whole-rootfs `--dir` is too big for
+// the environment; the inline form is still honoured for a hand-run child.
+const fileMap = process.env.GEX_BENCH_FILES_JSON
+  ? JSON.parse(readFileSync(process.env.GEX_BENCH_FILES_JSON, 'utf8'))
+  : JSON.parse(process.env.GEX_BENCH_FILES || '{}');
+for (const [g, h] of Object.entries(fileMap)) {
   files[g] = readFileSync(h);
 }
 let stdin = null;

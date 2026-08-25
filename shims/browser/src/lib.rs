@@ -3580,31 +3580,38 @@ static LAZY_OWNER: SingleThreaded<std::collections::BTreeMap<u64, u32>> =
     SingleThreaded(const { RefCell::new(std::collections::BTreeMap::new()) });
 static LAZY_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The body of [`gex_closure_owner`], for a caller that already holds KLOCK.
+///
+/// The comments here and in `gex_page_table` used to say `with_host` was
+/// re-entrant and the nesting was fine. It is not: without `shared-memory` it
+/// is `RefCell::try_borrow_mut`, and the second take panics. Nothing noticed
+/// because the fill path this nesting is on had never run.
+fn closure_owner_locked(h: &mut Host, page: u64) -> i32 {
+    if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+        let claims = IMAGE_PAGES.0.borrow();
+        let Some(idxs) = claims.get(&page) else {
+            return -1;
+        };
+        return idxs
+            .iter()
+            .find(|i| image_is_ours(h, **i))
+            .map(|i| *i as i32)
+            .unwrap_or(-1);
+    }
+    CLOSURE_OWNER
+        .0
+        .borrow()
+        .get(&page)
+        .map(|v| *v as i32)
+        .unwrap_or(-1)
+}
+
 /// The closure library covering this page, or -1.
 #[no_mangle]
 pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
-    // Whole body under KLOCK: `IMAGE_PAGES`/`CLOSURE_OWNER` are written at runtime
-    // by `gex_add_closure_module` as libraries stream in, and this runs on every
-    // Worker's miss path -- see the note there.
-    with_host(|h| {
-        if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
-            let claims = IMAGE_PAGES.0.borrow();
-            let Some(idxs) = claims.get(&page) else {
-                return -1;
-            };
-            return idxs
-                .iter()
-                .find(|i| image_is_ours(h, **i))
-                .map(|i| *i as i32)
-                .unwrap_or(-1);
-        }
-        CLOSURE_OWNER
-            .0
-            .borrow()
-            .get(&page)
-            .map(|v| *v as i32)
-            .unwrap_or(-1)
-    })
+    // Takes KLOCK, so only for a caller that does not hold it; the ones that
+    // do call `closure_owner_locked`.
+    with_host(|h| closure_owner_locked(h, page))
 }
 
 /// The `k`th closure object covering `page` that belongs to this process.
@@ -4132,12 +4139,13 @@ pub extern "C" fn gex_page_table(page: u64) -> i32 {
     }
     // Whole body under KLOCK: `CLOSURE_TABLE`/`IMAGE_TABLE` are written at runtime
     // by streaming closures (`gex_add_closure_module`) while this runs on every
-    // Worker's fill path. `gex_closure_owner` also takes KLOCK -- re-entrant.
-    with_host(|_| {
+    // Worker's fill path. The owner lookup is the *locked* body: taking KLOCK
+    // again here is what panicked the first time this path ever ran.
+    with_host(|h| {
         // An image page belongs to whichever root of the closure this process is
         // actually running, so it is looked up by module and not by page alone.
         if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
-            let owner = gex_closure_owner(page);
+            let owner = closure_owner_locked(h, page);
             if owner < 0 {
                 return -1;
             }

@@ -9,8 +9,21 @@
 //! Safety against substituting the wrong function: a symbol here is `STT_FUNC`
 //! (`elf::load` keeps no other kind), naming a definition in this object's
 //! text. aarch64 glibc resolves `memcpy` through an IFUNC, whose
-//! `STT_GNU_IFUNC` resolver symbol never reaches this table; what reaches it
-//! is the real `__memcpy_generic` and siblings the resolver returns.
+//! `STT_GNU_IFUNC` resolver symbol is skipped -- its address is the resolver,
+//! not an implementation.
+//!
+//! Which means **this finds almost nothing in a distribution's glibc**. The
+//! note that used to be here, saying the real `__memcpy_generic` and siblings
+//! reach the table instead, was wrong: those are local symbols, and a shipped
+//! `libc.so.6` has no `.symtab`. Only `.dynsym` survives, and there `memcpy`,
+//! `memmove` and `memset` are all `STT_GNU_IFUNC`. Of the 2,775 symbols in
+//! Debian trixie's aarch64 `libc.so.6`, the ones this recognises are
+//! `mempcpy` and its `__mempcpy` alias -- one function.
+//!
+//! Where it does work is an object whose `memcpy` is an ordinary `STT_FUNC`:
+//! anything statically linked, and musl's. Reaching glibc's would mean reading
+//! the GOT slot `named_relocs` names *after* `ld.so` has run the resolver,
+//! which is a runtime hook this does not have.
 
 use gex_ir::*;
 
