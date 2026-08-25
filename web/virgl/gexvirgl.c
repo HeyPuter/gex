@@ -179,6 +179,14 @@ static struct vtest_input gex_input = {.read = gex_input_read};
 static GLuint gex_blit_fbo;
 static int gex_presented;
 
+/* A serial for every image copied to the canvas. JavaScript samples this once
+ * per animation frame, which coalesces duplicate submit/readback mirrors but
+ * still counts either path when it is the only one carrying a new image. */
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_presented(void) {
+    return gex_presented;
+}
+
 /* Why a readback did not become a picture. A blank canvas has several
  * causes that look identical from outside -- the guest never read back, it
  * read back a resource that is not a texture, it read back something the
@@ -427,7 +435,7 @@ static const char *const gex_cmd_names[] = {
 /* -- what JavaScript calls ----------------------------------------------- */
 
 EMSCRIPTEN_KEEPALIVE
-int gex_virgl_init(int width, int height) {
+int gex_virgl_init(int width, int height, int preserve_drawing_buffer) {
     EmscriptenWebGLContextAttributes attr;
     emscripten_webgl_init_context_attributes(&attr);
     attr.majorVersion = 2;
@@ -436,10 +444,13 @@ int gex_virgl_init(int width, int height) {
     attr.depth = true;
     attr.stencil = true;
     attr.antialias = false;
-    /* Readback is from the guest resource/FBO before it is blitted here. The
-     * browser's default framebuffer is presentation-only and can be discarded
-     * after compositing; preserving it forces an unnecessary full-frame copy. */
-    attr.preserveDrawingBuffer = false;
+    /* Readback is from the guest resource/FBO before it is blitted here. A
+     * main-thread canvas is redrawn in the browser's rendering task and can
+     * discard its default framebuffer after compositing. OffscreenCanvas is
+     * serviced by a sequence of Worker tasks, however: Chromium may expose
+     * the post-composite clear between those tasks as a black frame. Preserve
+     * that backend until the next completed guest image replaces it. */
+    attr.preserveDrawingBuffer = preserve_drawing_buffer != 0;
     attr.explicitSwapControl = false;
 
     emscripten_set_canvas_element_size("#gex-gl", width, height);

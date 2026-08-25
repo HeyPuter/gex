@@ -119,13 +119,26 @@ main {
 }
 
 .canvas-wrap {
-  display: flex;
-  justify-content: center;
-  margin-bottom: 12px;
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 auto 12px;
   overflow: auto;
 }
 
+.fps {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 2px 5px;
+  color: white;
+  background: black;
+  font-family: monospace;
+  font-variant-numeric: tabular-nums;
+}
+
 .canvas-wrap canvas {
+  display: block;
   width: 640px;
   max-width: 100%;
   height: auto;

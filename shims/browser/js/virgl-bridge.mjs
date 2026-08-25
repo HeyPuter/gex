@@ -91,6 +91,9 @@ export class VirglProxy {
     ctl[SESSION] = session;
     ctl[LEN] = len;
     Atomics.store(ctl, STATE, REQUEST);
+    // An OffscreenCanvas renderer waits on this word directly. The page-side
+    // fallback still uses `wake`; notifying with no waiter is harmless.
+    Atomics.notify(ctl, STATE);
     this.#wake();
     // A timeout, so a dead page or renderer ends the guest rather than wedging
     // its Worker for the life of the tab. Thirty seconds is far longer than any
@@ -101,6 +104,7 @@ export class VirglProxy {
       }
     }
     Atomics.store(ctl, STATE, IDLE);
+    Atomics.notify(ctl, STATE);
     return ctl[RESULT];
   }
 

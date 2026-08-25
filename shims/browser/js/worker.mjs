@@ -343,7 +343,14 @@ async function handle(msg) {
   // fall back when it is missing.
   if (msg.virgl) {
     const { VirglProxy } = await import('./virgl-bridge.mjs');
-    gex.useVirgl(new VirglProxy(msg.virgl, () => port.post({ kind: 'virgl' })), !!msg.virglTrace);
+    gex.useVirgl(
+      new VirglProxy(msg.virgl, () => {
+        // An OffscreenCanvas renderer waits on the shared control word itself;
+        // only the main-thread fallback needs a posted wake-up.
+        if (!msg.virgl.direct) port.post({ kind: 'virgl' });
+      }),
+      !!msg.virglTrace,
+    );
   }
   // The GL device (gles-gears): the page's GlDevice, reached over a ring in a
   // SharedArrayBuffer. `useGl` sets the flag `gex_set_gl` reads at load, so it

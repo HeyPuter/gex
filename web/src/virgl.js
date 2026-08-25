@@ -29,8 +29,16 @@ async function loadGlue(url) {
 
 export class VirglRenderer {
   #module = null;
+  #worker = null;
+  #stats = null;
   #canvas = null;
   #failed = null;
+  #description = '';
+  #state = '';
+  #commandState = '';
+  #channelId = 0;
+  #requestId = 0;
+  #pending = new Map();
 
   /**
    * @param {HTMLCanvasElement} canvas the drawing surface
@@ -45,6 +53,14 @@ export class VirglRenderer {
     // virglrenderer looks the canvas up by selector, so it has to carry the
     // id the module asks for.
     canvas.id = 'gex-gl';
+    if (
+      typeof Worker === 'function' &&
+      typeof canvas.transferControlToOffscreen === 'function' &&
+      typeof SharedArrayBuffer === 'function'
+    ) {
+      await r.#createWorker(canvas, url);
+      return r;
+    }
     try {
       const Module = await loadGlue(url);
       r.#module = await Module({
@@ -57,7 +73,9 @@ export class VirglRenderer {
         printErr: (s) => (onLog ? onLog(s) : console.warn('[virgl]', s)),
         print: (s) => (onLog ? onLog(s) : console.log('[virgl]', s)),
       });
-      const rc = r.#module._gex_virgl_init(canvas.width, canvas.height);
+      const offscreen =
+        typeof OffscreenCanvas === 'function' && canvas instanceof OffscreenCanvas;
+      const rc = r.#module._gex_virgl_init(canvas.width, canvas.height, offscreen ? 1 : 0);
       if (rc !== 0) {
         r.#failed = `the renderer would not start (${rc})`;
       }
@@ -67,8 +85,48 @@ export class VirglRenderer {
     return r;
   }
 
+  async #createWorker(canvas, url) {
+    const worker = new Worker(new URL('./virgl-worker.js', import.meta.url), { type: 'module' });
+    this.#worker = worker;
+    this.#stats = new Int32Array(new SharedArrayBuffer(16));
+    const ready = new Promise((resolve, reject) => {
+      const fail = (e) => reject(new Error(e?.message || 'the renderer worker failed to start'));
+      worker.addEventListener('error', fail, { once: true });
+      worker.addEventListener('message', (event) => {
+        const m = event.data || {};
+        if (m.kind === 'ready') {
+          worker.removeEventListener('error', fail);
+          this.#failed = m.error || null;
+          this.#description = m.description || '';
+          this.#state = m.state || '';
+          this.#commandState = m.commands || '';
+          resolve();
+        } else if (m.kind === 'diagnostic') {
+          this.#state = m.state || this.#state;
+          this.#commandState = m.commands || this.#commandState;
+          const done = this.#pending.get(m.id);
+          if (done) {
+            this.#pending.delete(m.id);
+            done();
+          }
+        } else if (m.kind === 'error') {
+          this.#failed = m.error || 'the renderer worker failed';
+        }
+      });
+    });
+    const offscreen = canvas.transferControlToOffscreen();
+    worker.postMessage({ kind: 'init', canvas: offscreen, url, stats: this.#stats.buffer }, [offscreen]);
+    try {
+      await ready;
+    } catch (e) {
+      this.#failed = e?.message || String(e);
+      worker.terminate();
+      this.#worker = null;
+    }
+  }
+
   get ok() {
-    return this.#module !== null && this.#failed === null;
+    return (this.#module !== null || this.#worker !== null) && this.#failed === null;
   }
 
   get error() {
@@ -77,7 +135,10 @@ export class VirglRenderer {
 
   /** What the guest will be told it has. */
   describe() {
-    return this.ok ? this.#module.UTF8ToString(this.#module._gex_virgl_describe()) : this.#failed;
+    if (!this.ok) return this.#failed;
+    return this.#worker
+      ? this.#description
+      : this.#module.UTF8ToString(this.#module._gex_virgl_describe());
   }
 
   /**
@@ -86,7 +147,14 @@ export class VirglRenderer {
    * perfectly with nothing visible.
    */
   glState() {
-    return this.ok ? this.#module.UTF8ToString(this.#module._gex_virgl_gl_state()) : this.#failed;
+    if (!this.ok) return this.#failed;
+    return this.#worker ? this.#state : this.#module.UTF8ToString(this.#module._gex_virgl_gl_state());
+  }
+
+  /** Number of completed images copied to the browser canvas. */
+  presentedCount() {
+    if (!this.ok) return 0;
+    return this.#worker ? Atomics.load(this.#stats, 0) : this.#module._gex_virgl_presented();
   }
 
   /**
@@ -95,7 +163,42 @@ export class VirglRenderer {
    * black, since it says whether the guest drew at all.
    */
   commands() {
-    return this.ok ? this.#module.UTF8ToString(this.#module._gex_virgl_commands()) : this.#failed;
+    if (!this.ok) return this.#failed;
+    return this.#worker
+      ? this.#commandState
+      : this.#module.UTF8ToString(this.#module._gex_virgl_commands());
+  }
+
+  /** Ask the worker for an exact diagnostic snapshot before reporting a run. */
+  refresh() {
+    if (!this.#worker || !this.ok) return Promise.resolve();
+    const id = ++this.#requestId;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.#pending.delete(id);
+        resolve();
+      }, 2000);
+      this.#pending.set(id, () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      this.#worker.postMessage({ kind: 'diagnostic', id });
+    });
+  }
+
+  /**
+   * Give the renderer worker one guest bridge and return its cheap page-side
+   * wake function. Shared buffers do the data/reply transfer; the page only
+   * forwards a notification and never executes GL commands.
+   */
+  attachChannel(channel) {
+    if (!this.#worker) return null;
+    const id = ++this.#channelId;
+    channel.direct = typeof Atomics.waitAsync === 'function';
+    this.#worker.postMessage({ kind: 'channel', id, channel });
+    return channel.direct
+      ? () => {}
+      : () => this.#worker?.postMessage({ kind: 'serve', id });
   }
 
   /**
@@ -143,12 +246,23 @@ export class VirglRenderer {
    * everything, and the last line printed names the command it went into.
    */
   traceCommands(on) {
-    if (this.ok) this.#module._gex_virgl_trace_commands(on ? 1 : 0);
+    if (!this.ok) return;
+    if (this.#worker) this.#worker.postMessage({ kind: 'trace', on: !!on });
+    else this.#module._gex_virgl_trace_commands(on ? 1 : 0);
   }
 
   /** A client has gone: drop its context and its buffers. */
   close(session) {
-    if (this.ok) this.#module._gex_virgl_close(session);
+    if (!this.ok) return;
+    if (this.#worker) this.#worker.postMessage({ kind: 'close', session });
+    else this.#module._gex_virgl_close(session);
+  }
+
+  dispose() {
+    this.#worker?.terminate();
+    this.#worker = null;
+    for (const done of this.#pending.values()) done();
+    this.#pending.clear();
   }
 }
 

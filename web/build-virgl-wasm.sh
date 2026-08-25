@@ -168,6 +168,27 @@ if 'GEX_NO_UNSYNCHRONIZED' not in s:
     assert 'GEX_NO_UNSYNCHRONIZED' in s, 'the unsynchronized map did not match'
     open(p, 'w').write(s)
 
+# Native GL error queries are cheap enough that virglrenderer validates every
+# command after dispatch. In WebGL each getError() crosses into the browser's
+# GPU service and synchronizes with it; a race profile showed those checks
+# consuming roughly half of the renderer's main-thread samples. Keep the
+# checks around setup and transfers, but do not put a synchronous round trip
+# after every command in a trusted, locally generated VirGL stream. The
+# exported gex_virgl_gl_state() remains an explicit end-to-end error check.
+p = f'{src}/src/vrend_decode.c'
+s = open(p).read()
+if 'GEX_SKIP_PER_COMMAND_GL_ERROR' not in s:
+    s = s.replace('''      ret = decode_table[cmd](gdctx->grctx, buf, len);
+      if (!vrend_check_no_error(gdctx->grctx) && !ret)
+         ret = EINVAL;''',
+                  '''      ret = decode_table[cmd](gdctx->grctx, buf, len);
+#ifndef __EMSCRIPTEN__ /* GEX_SKIP_PER_COMMAND_GL_ERROR */
+      if (!vrend_check_no_error(gdctx->grctx) && !ret)
+         ret = EINVAL;
+#endif''', 1)
+    assert 'GEX_SKIP_PER_COMMAND_GL_ERROR' in s, 'per-command error check did not match'
+    open(p, 'w').write(s)
+
 # An index buffer of its own, because WebGL will not let one buffer be both.
 #
 # WebGL fixes a buffer's kind at its first bind: a buffer bound to
@@ -800,7 +821,7 @@ DESKTOP
     -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,UTF8ToString \
     -sENVIRONMENT=web,worker \
     $DEBUG_FLAGS \
-    -sEXPORTED_FUNCTIONS=_gex_virgl_init,_gex_virgl_describe,_gex_virgl_gl_state,_gex_virgl_commands,_gex_virgl_feed,_gex_virgl_pump,_gex_virgl_pending,_gex_virgl_replies,_gex_virgl_drain,_gex_virgl_close,_gex_virgl_trace_commands,_malloc,_free
+    -sEXPORTED_FUNCTIONS=_gex_virgl_init,_gex_virgl_describe,_gex_virgl_gl_state,_gex_virgl_commands,_gex_virgl_presented,_gex_virgl_feed,_gex_virgl_pump,_gex_virgl_pending,_gex_virgl_replies,_gex_virgl_drain,_gex_virgl_close,_gex_virgl_trace_commands,_malloc,_free
 
 echo
 for a in src/libvirglrenderer.a src/libvirgl.a src/gallium/libgallium.a src/mesa/libmesa.a; do

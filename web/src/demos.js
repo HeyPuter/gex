@@ -652,6 +652,7 @@ const virglGears = {
         rule(ctx, `exit ${status} in ${ms} ms`);
         // vtest has no present -- the X server reads its pixels back and never
         // looks at a screen -- so a run can draw perfectly with a blank canvas.
+        await renderer.refresh();
         const gl = renderer.glState();
         // `presented` counts blits; `lit` counts blits whose source had a pixel
         // in it. Those differing is a black canvas with the frame reported to
@@ -670,6 +671,7 @@ const virglGears = {
       } catch (e) {
         failed(ctx, e);
       } finally {
+        renderer?.dispose();
         running(false);
         ctx.idle();
         ctx.actions(gearsButtons(start));
@@ -798,8 +800,18 @@ const waylandGears = {
     canvas.width = demo.canvasWidth || 300;
     canvas.height = demo.canvasHeight || 300;
     wrap.append(canvas);
+    const fps = document.createElement('output');
+    fps.className = 'fps';
+    fps.textContent = 'FPS: —';
+    wrap.append(fps);
     document.getElementById('terminal')?.before(wrap);
-    ctx.onLeave(() => wrap.remove());
+    let fpsTimer = 0;
+    let fpsRaf = 0;
+    ctx.onLeave(() => {
+      clearInterval(fpsTimer);
+      cancelAnimationFrame(fpsRaf);
+      wrap.remove();
+    });
 
     // Show exactly one window: the WebGL surface for an Xwayland GL client
     // ('x'), the compositor's output for everything else ('gl'/'shm').
@@ -807,6 +819,7 @@ const waylandGears = {
       const glWindow = a.mode === 'x';
       canvas.classList.toggle('wl-offscreen', !glWindow);
       wlCanvas.classList.toggle('wl-offscreen', glWindow);
+      fps.hidden = a.mode === 'shm';
     };
 
     // A demo that names its own client (SuperTuxKart) runs just that; otherwise
@@ -869,6 +882,27 @@ const waylandGears = {
         const { VirglRenderer } = await import('./virgl.js');
         renderer = await VirglRenderer.create(canvas, '/gex/gexvirgl.mjs');
         if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
+        clearInterval(fpsTimer);
+        cancelAnimationFrame(fpsRaf);
+        fps.textContent = 'FPS: 0.0';
+        let fpsFrames = 0;
+        let fpsSerial = renderer.presentedCount();
+        let fpsAt = performance.now();
+        const countDisplayedFrame = () => {
+          const serial = renderer.presentedCount();
+          if (serial !== fpsSerial) {
+            fpsFrames++;
+            fpsSerial = serial;
+          }
+          fpsRaf = requestAnimationFrame(countDisplayedFrame);
+        };
+        fpsRaf = requestAnimationFrame(countDisplayedFrame);
+        fpsTimer = setInterval(() => {
+          const now = performance.now();
+          fps.textContent = `FPS: ${(fpsFrames * 1000 / (now - fpsAt)).toFixed(1)}`;
+          fpsFrames = 0;
+          fpsAt = now;
+        }, 1000);
         // Live render state for a test harness: it can tell a client rendered
         // (lit>0) the moment it happens rather than waiting for the exit report.
         globalThis.__gexGlState = () => {
@@ -1092,6 +1126,7 @@ const waylandGears = {
         const ms = (performance.now() - t0).toFixed(0);
         ctx.term.writeln('');
         rule(ctx, `exit ${status} in ${ms} ms`);
+        await renderer.refresh();
         const gl = renderer.glState();
         const nums = ['presented', 'lit', 'brightest']
           .map((k) => `${k}=${/=(\d+)/.exec(gl.slice(gl.indexOf(k)))?.[1] ?? '?'}`)
@@ -1105,6 +1140,11 @@ const waylandGears = {
       } catch (e) {
         failed(ctx, e);
       } finally {
+        clearInterval(fpsTimer);
+        cancelAnimationFrame(fpsRaf);
+        fpsTimer = 0;
+        fpsRaf = 0;
+        renderer?.dispose();
         running(false);
         ctx.idle();
         ctx.actions(demo.actions?.(start) || [
@@ -1129,8 +1169,12 @@ const stkRace =
   `/usr/games/supertuxkart --race-now --track=snowtuxpeak --kart=tux ` +
   `--numkarts=1 --laps=1 ${stkVideoOptions}`;
 const stkPlay = `/usr/games/supertuxkart ${stkVideoOptions}`;
-const stkLaunch = new URLSearchParams(location.search).has('stkprofile')
-  ? `${stkRace} --profile-time=5`
+const stkProfileValue = Number(new URLSearchParams(location.search).get('stkprofile'));
+// Preserve the original `?stkprofile=1` harness shorthand (a five-second
+// profile), while accepting an explicit duration for longer stable samples.
+const stkProfileSeconds = stkProfileValue === 1 ? 5 : Math.floor(stkProfileValue);
+const stkLaunch = stkProfileSeconds > 0
+  ? `${stkRace} --profile-time=${Math.min(300, stkProfileSeconds)}`
   : stkPlay;
 
 // The real application workload for the complete browser graphics pipeline.

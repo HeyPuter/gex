@@ -393,8 +393,9 @@ export async function runProgram(
   // once at startup and then only on `SIGWINCH`.
   sharedTty?.resize(term.rows, term.cols);
 
-  // The GPU, if this demo has one. The renderer stays here, with the canvas;
-  // the guest reaches it across a `SharedArrayBuffer` and blocks on
+  // The GPU, if this demo has one. The renderer normally owns an
+  // OffscreenCanvas in its own Worker; the guest reaches it across a
+  // `SharedArrayBuffer` and blocks on
   // `Atomics.wait`, because `virgl_submit` is called from inside a syscall
   // and there is nothing to await with. See `virgl-bridge.js`.
   let channel = null;
@@ -409,7 +410,10 @@ export async function runProgram(
     }
     const { makeChannel, serveVirgl } = await import('@gex/virgl-bridge.mjs');
     channel = makeChannel();
-    serve = serveVirgl(virgl, channel);
+    // OffscreenCanvas path: the renderer worker serves the ring itself. The
+    // returned function only forwards the wake-up. Older browsers retain the
+    // original main-thread renderer and serve it directly.
+    serve = virgl.attachChannel?.(channel) || serveVirgl(virgl, channel);
   }
 
   // The other GPU path: a `GlDevice` (web/src/gl.js) the guest drives through
