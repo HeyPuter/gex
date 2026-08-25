@@ -359,6 +359,11 @@ pub mod imports {
     /// `tier1::emit_sp_check`.
     pub const BRK_BAD_SP: i32 = -1;
 
+    /// Not a `brk`: a diagnostic breakpoint planted at a chosen guest pc (see
+    /// `tier1::emit_trap_pc`). The host dumps the live registers and RETURNS, so
+    /// the block runs on -- unlike `BRK_BAD_SP`, which exits.
+    pub const BRK_TRAP_PC: i32 = -2;
+
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
     pub const SYSREG_READ: &str = "sysreg_read";

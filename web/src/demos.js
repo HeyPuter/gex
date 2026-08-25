@@ -670,38 +670,142 @@ const virglGears = {
   },
 };
 
+// The graphical clients the Wayland demo can launch, chosen from its dropdown.
+// Each runs against the one gex-wayland compositor (in the shim); `mode` is how:
+//   'x'   — an X client under Xwayland (OpenGL through virgl)
+//   'gl'  — a native Wayland OpenGL client (EGL's wl_shm/drisw path, GL via virgl)
+//   'shm' — a native Wayland *toolkit* client that draws in software into a
+//           wl_shm buffer (GTK's wayland backend, Qt's libqwayland-generic): no
+//           OpenGL at all, so it exercises the compositor and the toolkit rather
+//           than Mesa. These are the real Qt/GTK/KDE apps.
+const WL_TOOLKIT_ENV = {
+  qt6:
+    'export QT_QPA_PLATFORM=wayland\n' +
+    'export QT_PLUGIN_PATH=/usr/lib/aarch64-linux-gnu/qt6/plugins\n' +
+    'export FONTCONFIG_PATH=/etc/fonts\n' +
+    'export DBUS_SESSION_BUS_ADDRESS=disabled:\n' +
+    'export QT_LOGGING_RULES="*=false"\n',
+  qt5:
+    'export QT_QPA_PLATFORM=wayland\n' +
+    'export QT_PLUGIN_PATH=/usr/lib/aarch64-linux-gnu/qt5/plugins\n' +
+    'export FONTCONFIG_PATH=/etc/fonts\n' +
+    'export DBUS_SESSION_BUS_ADDRESS=disabled:\n' +
+    'export QT_LOGGING_RULES="*=false"\n',
+  // The base env forces GDK_BACKEND=x11 for the Xwayland clients; put it back to
+  // wayland and point the pixbuf loaders at the cache baked into the rootfs.
+  gtk:
+    'export GDK_BACKEND=wayland\n' +
+    'export GDK_PIXBUF_MODULE_FILE=/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache\n',
+};
+
+const WL_APPS = [
+  { id: 'glxgears', label: 'glxgears — OpenGL via virgl (Xwayland)', mode: 'x', client: 'glxgears.aarch64-linux-gnu -info' },
+  { id: 'es2gears', label: 'es2gears — OpenGL ES, native Wayland', mode: 'gl', client: '/usr/bin/es2gears_wayland.aarch64-linux-gnu' },
+  { id: 'gtk3-demo', label: 'GTK 3 — Demo', mode: 'shm', client: 'gtk3-demo', env: WL_TOOLKIT_ENV.gtk },
+  { id: 'gtk3-widget-factory', label: 'GTK 3 — Widget Factory', mode: 'shm', client: 'gtk3-widget-factory', env: WL_TOOLKIT_ENV.gtk },
+  { id: 'qt6ct', label: 'Qt 6 — Configuration Tool', mode: 'shm', client: 'qt6ct', env: WL_TOOLKIT_ENV.qt6 },
+  { id: 'explosive-c4', label: 'Qt 6 — Explosive C4 (game)', mode: 'shm', client: 'explosive-c4', env: WL_TOOLKIT_ENV.qt6 },
+  { id: 'compton-conf', label: 'Qt 5 — compton-conf', mode: 'shm', client: 'compton-conf', env: WL_TOOLKIT_ENV.qt5 },
+  { id: 'kcalc', label: 'KDE / KF5 — KCalc', mode: 'shm', client: 'kcalc', env: WL_TOOLKIT_ENV.qt5 },
+];
+
+// Which app to start with: an explicit `?wlclient=<id>` (the drive.mjs harness
+// uses it) wins, then the dropdown. A `?wlclient=` that is a raw command rather
+// than a known id still runs, as whatever `?wlmode` says (default Xwayland).
+function pickInitialApp(qp) {
+  const wanted = qp.get('wlclient');
+  if (wanted) {
+    const known = WL_APPS.find((a) => a.id === wanted);
+    if (known) return known;
+    return { id: wanted, label: wanted, client: wanted, mode: qp.get('wlmode') === 'native' ? 'gl' : 'x' };
+  }
+  return WL_APPS[0];
+}
+
 // XWayland/Wayland, skipping Xvfb: gex-wayland (a compositor in the shim)
 // binds `/tmp/wayland-0`, a client connects, and its committed shm frames are
-// blitted onto a 2D canvas here. First client is `es2gears_wayland` (a native
-// wayland GLES client), which also answers the open question of whether Mesa's
-// EGL can render to a shm-only compositor.
+// blitted onto a 2D canvas here. The dropdown picks the client: real Qt/GTK/KDE
+// toolkit apps (native wl_shm), a native Wayland GL client, or glxgears under
+// Xwayland.
 const waylandGears = {
   id: 'wayland',
-  title: 'glxgears on Xwayland (no Xvfb)',
+  title: 'Qt / GTK / KDE apps on gex-wayland',
   blurb:
-    'The same real Mesa/virgl stack as the glxgears demo, but the X server is Xwayland instead of ' +
-    'Xvfb: Xwayland runs as a client of a gex-native Wayland compositor in the shim, and glxgears ' +
-    'draws through virgl to virglrenderer on this page.',
+    'A gex-native Wayland compositor lives in the shim; a client connects and its committed shm ' +
+    'frames are blitted onto a canvas here. Pick a client from the dropdown: real Qt, GTK and KDE ' +
+    'apps draw in software into wl_shm, or glxgears/es2gears render OpenGL through virgl.',
   network: false,
 
   async enter(ctx) {
     const wrap = document.createElement('div');
     wrap.className = 'canvas-wrap';
+    // The Wayland compositor's output -- the one window the user sees. `serveWl`
+    // resizes it to each committed frame (so it takes the app's real size), and
+    // `attachWlInput` routes mouse+keyboard to it; `tabIndex` makes it able to
+    // take keyboard focus (a bare <canvas> cannot). Every client shows here:
+    // toolkit apps commit software frames, and the GL clients' pixels are read
+    // back into wl_shm and composited here too.
+    const wlCanvas = document.createElement('canvas');
+    wlCanvas.id = 'gex-wl';
+    wlCanvas.width = 640;
+    wlCanvas.height = 480;
+    wlCanvas.tabIndex = 0;
+    wrap.append(wlCanvas);
+    // virglrenderer's own GL surface, a WebGL context the GL clients execute on.
+    // Which canvas the user actually sees depends on the client (see
+    // `showWindow`): glxgears under Xwayland presents *here*, while toolkit apps
+    // and the native-GL client present on `wlCanvas`. The other is moved
+    // off-screen (kept full-size and rendering) so only one window ever shows.
     const canvas = document.createElement('canvas');
     canvas.width = 300;
     canvas.height = 300;
     wrap.append(canvas);
-    // A second canvas for the Wayland compositor to blit committed shm frames
-    // onto: a native wl client (es2gears) renders via virgl offscreen, reads
-    // back into a wl_shm buffer, and commits it -- the compositor draws that
-    // here (the WebGL `canvas` above is virglrenderer's own scratch surface).
-    const wlCanvas = document.createElement('canvas');
-    wlCanvas.id = 'gex-wl';
-    wlCanvas.width = 300;
-    wlCanvas.height = 300;
-    wrap.append(wlCanvas);
     document.getElementById('terminal')?.before(wrap);
     ctx.onLeave(() => wrap.remove());
+
+    // Show exactly one window: the WebGL surface for an Xwayland GL client
+    // ('x'), the compositor's output for everything else ('gl'/'shm').
+    const showWindow = (a) => {
+      const glWindow = a.mode === 'x';
+      canvas.classList.toggle('wl-offscreen', !glWindow);
+      wlCanvas.classList.toggle('wl-offscreen', glWindow);
+    };
+
+    // The app picker: a labelled dropdown above the canvases. Its selection is
+    // what `start` launches. Kept in the demo's own DOM (cleaned up on leave)
+    // rather than the shared #actions bar, which `ctx.actions` replaces wholesale.
+    const qp = new URLSearchParams(location.search);
+    let app = pickInitialApp(qp);
+    const bar = document.createElement('div');
+    bar.className = 'wl-picker';
+    const label = document.createElement('label');
+    label.textContent = 'App: ';
+    const select = document.createElement('select');
+    for (const a of WL_APPS) {
+      const opt = document.createElement('option');
+      opt.value = a.id;
+      opt.textContent = a.label;
+      select.append(opt);
+    }
+    // A `?wlclient=` that is a raw command, not a listed id, gets its own option
+    // so the dropdown still shows what is selected.
+    if (!WL_APPS.some((a) => a.id === app.id)) {
+      const opt = document.createElement('option');
+      opt.value = app.id;
+      opt.textContent = app.label;
+      select.append(opt);
+    }
+    select.value = app.id;
+    label.append(select);
+    bar.append(label);
+    wrap.before(bar);
+    ctx.onLeave(() => bar.remove());
+    showWindow(app);
+    select.onchange = () => {
+      app = WL_APPS.find((a) => a.id === select.value) || app;
+      ctx.hint(app.label);
+      showWindow(app);
+    };
 
     ctx.term.writeln('Xwayland replaces Xvfb. It connects to a Wayland compositor that lives in');
     ctx.term.writeln('the shim, and glxgears renders through virgl -- real Mesa, no software');
@@ -793,27 +897,31 @@ const waylandGears = {
           // turns it back on to exercise/diagnose the multithreaded path.
           'export MESA_SHADER_CACHE_DISABLE=true\n' +
           extraEnv;
+        const run =
+          `echo "gex: running ${app.client}"\n` +
+          `timeout ${seconds} ${app.client} 2>&1\n` +
+          'echo "gex: client exited $?"\n';
         let script;
-        if (qp.get('wlmode') === 'native') {
+        if (app.mode === 'shm') {
+          // A native Wayland toolkit client (GTK's wayland backend, Qt's
+          // libqwayland-generic) drawing in software into wl_shm -- no X, no GL.
+          // The app's own env (QT_QPA_PLATFORM=wayland, GDK_BACKEND=wayland, the
+          // plugin paths) goes on top of the base env.
+          script = baseEnv + (app.env || '') + run;
+        } else if (app.mode === 'gl') {
           // A wayland-native GL client straight against gex-wayland -- no X at
           // all. GL still goes through virgl (virpipe) to virglrenderer; EGL's
           // wl_shm/drisw path needs no gbm/DRM and no libLLVM.
-          const client = qp.get('wlclient') || '/usr/bin/es2gears_wayland.aarch64-linux-gnu';
           // EGL_PLATFORM=wayland is what makes Mesa's EGL take the wl_shm/drisw
           // path (→ virgl via virpipe) instead of probing for a GPU/gbm device
           // it cannot find. Without it eglInitialize fails; with it, it comes up
           // and enumerates real configs.
-          script =
-            baseEnv +
-            'export EGL_PLATFORM=wayland\n' +
-            `echo "gex: running ${client}"\n` +
-            `timeout ${seconds} ${client} 2>&1\n` +
-            'echo "gex: client exited $?"\n';
+          script = baseEnv + 'export EGL_PLATFORM=wayland\n' + (app.env || '') + run;
         } else {
-          // Xwayland as the X server, glxgears (or ?wlclient=) as an X client.
-          const client = qp.get('wlclient') || 'glxgears.aarch64-linux-gnu -info';
+          // Xwayland as the X server, glxgears (or a raw ?wlclient=) as an X client.
           script =
             baseEnv +
+            (app.env || '') +
             'echo "gex: starting Xwayland"\n' +
             // `-ac` disables access control. Xwayland turns authorization on by
             // default and there is no `.Xauthority` in this rootfs, so a client
@@ -842,8 +950,7 @@ const waylandGears = {
             // the process boundary (a shared tmpfs, or bake the cache into the
             // rootfs at build time).
             'echo "gex: X up, starting the client"\n' +
-            `timeout ${seconds} ${client} 2>&1\n` +
-            'echo "gex: client exited $?"\n';
+            run;
         }
         files['/run.sh'] = new TextEncoder().encode(script);
 
@@ -881,17 +988,17 @@ const waylandGears = {
         running(false);
         ctx.idle();
         ctx.actions([
-          { label: 'Draw for 90s', primary: true, onClick: () => start(90) },
-          { label: 'Draw for 5 minutes', onClick: () => start(300) },
+          { label: 'Run for 90s', primary: true, onClick: () => start(90) },
+          { label: 'Run for 5 minutes', onClick: () => start(300) },
         ]);
       }
     };
 
     ctx.actions([
-      { label: 'Draw for 90s', primary: true, onClick: () => start(90) },
-      { label: 'Draw for 5 minutes', onClick: () => start(300) },
+      { label: 'Run for 90s', primary: true, onClick: () => start(90) },
+      { label: 'Run for 5 minutes', onClick: () => start(300) },
     ]);
-    ctx.hint('Xwayland + glxgears, GL through virgl');
+    ctx.hint(app.label);
   },
 };
 

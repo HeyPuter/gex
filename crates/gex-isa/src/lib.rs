@@ -799,14 +799,22 @@ pub enum Inst {
         addr: AddrMode,
     },
     /// `ld1`/`st1` on a single lane, and `ld1r`, which broadcasts instead.
+    /// Also the interleaved single-lane forms `ld2`/`st2`/`ld3`/`st3`/`ld4`/
+    /// `st4` and the replicating `ld2r`/`ld3r`/`ld4r`: `regs` consecutive
+    /// registers, each contributing (or receiving) one lane at consecutive
+    /// `lane_bytes` offsets from the address.
     VLoadStoreLane {
         load: bool,
-        /// `ld1r`: fill every lane rather than writing one.
+        /// `ld1r`/`ld2r`/…: fill every lane rather than writing one.
         replicate: bool,
+        /// How many consecutive registers the transfer touches: 1 for `ld1`/
+        /// `st1`/`ld1r`, up to 4 for `ld4`/`st4`/`ld4r`.
+        regs: u8,
         lane_bytes: u32,
         /// Which lane; meaningless when `replicate`.
         index: u32,
-        /// Only affects `ld1r`, which must zero the upper half when clear.
+        /// Only affects the replicating forms, which must zero the upper half
+        /// when clear.
         q: bool,
         vt: VReg,
         addr: AddrMode,
@@ -1197,7 +1205,12 @@ pub enum VOp3 {
     UqAdd,
     SqSub,
     UqSub,
+    SHAdd,
+    UHAdd,
+    SrHAdd,
     UrHAdd,
+    SHSub,
+    UHSub,
     CmEq,
     CmGt,
     CmGe,

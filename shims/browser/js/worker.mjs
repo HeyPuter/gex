@@ -320,6 +320,7 @@ async function handle(msg) {
   // thread (one whose wasm instantiate never completes) is visible. Off by
   // default -- it is one line per phase per thread. See threads-worker note.
   if (msg.attachTrace) globalThis.GEX_ATTACH_TRACE = 1;
+  if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   const gex = new Gex(new WorkerEnv(), {
@@ -366,11 +367,28 @@ async function handle(msg) {
     // GEX_WL_DUMP=<path>: save the first committed frame as a PPM so a render
     // can be eyeballed. Loaded here (the handler is async) and closed over.
     const dumpPath = globalThis.process?.env?.GEX_WL_DUMP;
-    const fs = dumpPath ? await import('node:fs') : null;
+    // GEX_COVERAGE_OUT=<path>: dump every block PC translated in this process (the
+    // reached set) as hex lines, to seed a reachability-trimmed closure build.
+    // Re-dumped as the run reaches more code; the set only grows, so the last
+    // write is the fullest. present is the natural moment -- the app has drawn.
+    const covPath = globalThis.process?.env?.GEX_COVERAGE_OUT;
+    const fs = (dumpPath || covPath) ? await import('node:fs') : null;
+    const dumpCoverage = () => {
+      if (!fs || !covPath) return;
+      try {
+        const cov = gex.coverage();
+        if (!cov) return;
+        let out = '';
+        for (let i = 0; i < cov.length; i++) out += '0x' + cov[i].toString(16) + '\n';
+        fs.writeFileSync(covPath, out);
+        console.error(`[cov] wrote ${cov.length} block PCs to ${covPath}`);
+      } catch (e) { console.error(`[cov] dump failed: ${e.message}`); }
+    };
     let count = 0;
     gex.useWl({
       present(memory, ptr, w, h, stride, format) {
         count++;
+        if (count === 1 || count % 30 === 0) dumpCoverage();
         if (count === 1 || count % 60 === 0) console.error(`[wlstub] present #${count} ${w}x${h} stride=${stride} fmt=${format}`);
         if (fs && count === 1 && memory?.buffer) {
           try {
@@ -499,6 +517,8 @@ async function handle(msg) {
     if (msg.checkSp) ex.gex_set_check_sp?.(1);
     if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
     if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
+    if (msg.spGuard) ex.gex_set_sp_guard?.(1);
+    if (msg.trapPc) ex.gex_set_trap_pc?.(BigInt(msg.trapPc));
     if (msg.pregrow) ex.gex_set_pregrow?.(1);
     if (msg.wlTrace) ex.gex_set_wl_trace?.(1);
     // A forked or exec'd child never calls `load`, so set the switch here.

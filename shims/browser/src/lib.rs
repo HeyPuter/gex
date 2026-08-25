@@ -2052,6 +2052,10 @@ struct Jit {
     described: bool,
     /// Addresses whose slot now holds real code.
     translated: std::collections::HashSet<u64>,
+    /// A sorted snapshot of `translated`, materialised by `gex_coverage_snapshot`
+    /// so JS can read the executed block PCs out of linear memory and write them
+    /// as a profile seed for a reachability-trimmed closure build.
+    coverage_snap: Vec<u64>,
     /// Every translated module's bytes, in install order. A dispatch table
     /// belongs to a module instance and is not shared between Workers, so a
     /// joining Worker instantiates these into its own tables to catch up. Order
@@ -3398,6 +3402,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 described: meta.next_slot != 0,
                 page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
                 translated: Default::default(),
+            coverage_snap: Vec::new(),
                 registry: Vec::new(),
                 ever_threaded: false,
                 shared: Default::default(),
@@ -6517,6 +6522,7 @@ pub extern "C" fn gex_adopt_child(
             described: meta.next_slot != 0,
             page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
             translated: Default::default(),
+            coverage_snap: Vec::new(),
             registry: Vec::new(),
             ever_threaded: false,
             shared: Default::default(),
@@ -8769,6 +8775,47 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
 }
 #[no_mangle]
 pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
+    // A diagnostic breakpoint planted at a chosen guest pc: dump the live
+    // registers (x30 names the caller) and RETURN so the block runs on. Pointed
+    // at __stack_chk_fail, it deterministically names the smashed function --
+    // the one thing the downstream abort cannot recover. First few hits only.
+    if raw == gex_abi::imports::BRK_TRAP_PC {
+        static mut HITS: u64 = 0;
+        let n = unsafe {
+            HITS = HITS.wrapping_add(1);
+            HITS
+        };
+        if n <= 24 {
+            let line = with_host(|h| {
+                let gm = GuestMem::new(guest_bytes());
+                let c = h.threads[cur()].kstate.ctx_addr;
+                let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
+                let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+                let x30 = r(30);
+                let object = |a: u64| {
+                    h.kernel
+                        .mem
+                        .vmas()
+                        .iter()
+                        .find(|v| a >= v.start && a < v.end)
+                        .map_or(String::new(), |v| format!("{} +{:#x}", v.name, a - v.start))
+                };
+                format!(
+                    "gex: TRAP_PC #{n} tid={} at pc={:#x}: x30={x30:#x} ({}) sp={sp:#x} \
+                     x0={:#x} x1={:#x} x19={:#x} x20={:#x}\n",
+                    h.threads[cur()].kstate.tid,
+                    pc as u64,
+                    object(x30),
+                    r(0),
+                    r(1),
+                    r(19),
+                    r(20),
+                )
+            });
+            warn_line(&line);
+        }
+        return;
+    }
     // The stack-pointer check borrows this import rather than adding one, so an
     // older shim still links. Names the object, since the block that *writes* a
     // bad `sp` is elsewhere from the one that dies on it.
@@ -8856,11 +8903,47 @@ pub extern "C" fn gex_sysreg_write(_ctx: i32, _pc: i64, _reg: i32, _val: i64) {}
 /// Cache maintenance. Only `dc zva` does anything, and it must: the lifter
 /// reports a 64-byte block through `DCZID_EL0` and musl's `memset` zeroes whole
 /// blocks with it, so a no-op leaves large `memset`s silently un-zeroed.
+/// How many times self-modifying guest code has forced a page re-lift. See
+/// `gex_cache_op`'s `IC_INVALIDATE` handling.
+static SMC_INVALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[no_mangle]
 pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
+    if op == gex_abi::cache_op::IC_INVALIDATE {
+        // Self-modifying / JIT-generated guest code (PCRE2's regex JIT does this)
+        // wrote new machine code to a page it had already run, and is flushing
+        // the icache before executing it. gex's translation of that page is now
+        // STALE -- running it executes the OLD code, which for PCRE2 smashed
+        // `pcre2_jit_match_16`'s stack canary. Invalidate: drop the page->slot
+        // mapping so the next miss RE-LIFTS the new bytes into a FRESH slot
+        // (reusing the old slot would leave the directory naming one block and
+        // the table holding another -- an illegal instruction, see the miss
+        // path), clear the directory word so the next branch misses, and drop
+        // the page's block records. The old slots leak, which is harmless: they
+        // are never reused and, once the directory is cleared, unreachable.
+        let page = gex_abi::dispatch_page(addr as u64);
+        with_host(|h| {
+            if h.jit.page_table.forget(page).is_none() {
+                return;
+            }
+            let mut gm = GuestMem::new(guest_bytes());
+            let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, 0);
+            let lo = page * gex_abi::DISPATCH_PAGE;
+            let hi = lo + gex_abi::DISPATCH_PAGE;
+            h.jit.translated.retain(|&a| a < lo || a >= hi);
+            let n = SMC_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 8 || tracing() {
+                warn_line(&format!(
+                    "gex: self-modifying-code: re-lifting page {page:#x} \
+                     (addr={:#x}, {n} so far)\n",
+                    addr as u64,
+                ));
+            }
+        });
+        return;
+    }
     if op != gex_abi::cache_op::DC_ZVA {
-        // Clean, invalidate and barrier are all no-ops: the memory is
-        // coherent and nothing here translates at runtime yet.
+        // Clean and barrier are no-ops: the memory is coherent.
         return;
     }
     let block = gex_abi::DCZID_BLOCK_BYTES as usize;
@@ -8884,6 +8967,34 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
             ctx as u32 as u64 + ctx::SAFEPOINT_COUNTER as u64,
             SAFEPOINT_INTERVAL,
         );
+    }
+    // Catch a worker running on a stray SP that reaches into the MAIN thread's
+    // stack -- a store there smashes a canary the quiet main thread detects much
+    // later, which is the complex-Qt (designer) stack smash. Cheap (one guest
+    // read at safepoint cadence), loud, off unless asked. A non-main thread whose
+    // SP is inside [STACK_TOP-STACK_SIZE, STACK_TOP) is the smoking gun.
+    if SP_GUARD.load(std::sync::atomic::Ordering::Relaxed) {
+        let ctxa = ctx as u32 as u64;
+        if ctxa != gex_abi::ctx_addr(0) {
+            let gm = GuestMem::new(guest_bytes());
+            let sp = gm.read_u64(ctxa + ctx::SP as u64).unwrap_or(0);
+            let main_lo = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
+            if sp >= main_lo && sp < gex_abi::STACK_TOP {
+                static mut HITS: u64 = 0;
+                let n = unsafe {
+                    HITS = HITS.wrapping_add(1);
+                    HITS
+                };
+                if n <= 16 {
+                    warn_line(&format!(
+                        "gex: SP-GUARD hit #{n}: worker ctx={ctxa:#x} SP={sp:#x} is in MAIN \
+                         stack [{main_lo:#x},{:#x}) at pc={:#x}\n",
+                        gex_abi::STACK_TOP,
+                        pc as u64,
+                    ));
+                }
+            }
+        }
     }
     // A heartbeat when tracing: nothing else runs while the guest executes
     // translated code, so back-edges are the only place to say where it is and
@@ -10380,6 +10491,28 @@ pub extern "C" fn gex_object_at(addr: i64, out: u32, max: u32) -> u32 {
 ///
 /// So the host grows its tables once for a batch, not once per module:
 /// `Table.grow` reallocates, so many small grows are quadratic in table size.
+/// Materialise a sorted snapshot of every block PC translated in this process so
+/// far and return the count. The snapshot lives in the shared `Jit`, so `_ptr`
+/// can hand JS its address in linear memory. Called from a sandbox run (e.g. at
+/// first Wayland present) to dump the executed set as a profile seed for a
+/// reachability-trimmed closure build.
+#[no_mangle]
+pub extern "C" fn gex_coverage_snapshot() -> u32 {
+    with_host(|h| {
+        let mut v: Vec<u64> = h.jit.translated.iter().copied().collect();
+        v.sort_unstable();
+        h.jit.coverage_snap = v;
+        h.jit.coverage_snap.len() as u32
+    })
+}
+
+/// Byte address in linear memory of the snapshot `gex_coverage_snapshot` built,
+/// as `count` little-endian u64s. Valid until the next snapshot call.
+#[no_mangle]
+pub extern "C" fn gex_coverage_ptr() -> u32 {
+    with_host(|h| h.jit.coverage_snap.as_ptr() as u32)
+}
+
 #[no_mangle]
 pub extern "C" fn gex_jit_pending_slots() -> u32 {
     with_host(|h| h.jit.pending.iter().map(|p| p.slots).max().unwrap_or(0) as u32)
@@ -10649,13 +10782,20 @@ pub extern "C" fn gex_dump_state() {
         let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
         let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
         trace_line(&format!(
-            "gex: pid {} thread {} sp={sp:#x} x0={:#x} x1={:#x} x2={:#x} x30={:#x}\n",
+            "gex: pid {} thread {} sp={sp:#x} x0={:#x} x1={:#x} x2={:#x} x30={:#x} \
+             x19={:#x} x20={:#x} x21={:#x} x22={:#x} x23={:#x} x24={:#x}\n",
             h.kernel.pid,
             cur(),
             r(0),
             r(1),
             r(2),
             r(30),
+            r(19),
+            r(20),
+            r(21),
+            r(22),
+            r(23),
+            r(24),
         ));
         // Which mapping each of those addresses is in, if any. An address
         // with no vma is the whole diagnosis: the guest followed a pointer
@@ -10944,6 +11084,26 @@ pub extern "C" fn gex_set_copy_loop(on: i32) {
 #[no_mangle]
 pub extern "C" fn gex_set_coherent_loads(on: i32) {
     gex_xlate::set_coherent_loads(on != 0);
+}
+
+/// Diagnostic: at each safepoint, check the running thread's SP against the
+/// stacks it must NOT be in. A worker running with a stray SP that points into
+/// the MAIN thread's stack writes into it and smashes a canary a quiet main
+/// thread only detects much later -- the exact shape of the complex-Qt
+/// (designer) stack smash. Off by default; loud when it fires. See
+/// `gex_safepoint`.
+static SP_GUARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_sp_guard(on: i32) {
+    SP_GUARD.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Plant a diagnostic breakpoint at guest pc `pc` (0 = off). See
+/// `gex_xlate::set_trap_pc` and `tier1::emit_trap_pc`.
+#[no_mangle]
+pub extern "C" fn gex_set_trap_pc(pc: i64) {
+    gex_xlate::set_trap_pc(pc as u64);
 }
 
 /// Ask for a heartbeat every `every` safepoints.

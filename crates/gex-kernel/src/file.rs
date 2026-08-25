@@ -27,6 +27,13 @@ pub struct OpenFile {
     dir_cache: Mutex<Option<Vec<DirEntry>>>,
     pub readable: bool,
     pub writable: bool,
+    /// A path to unlink when the last descriptor to this file closes. Set for
+    /// `O_TMPFILE`: Linux makes such a file nameless at once, but gex keeps it
+    /// named (`.gex-tmpfile-*`) so the `linkat("/proc/self/fd/N", target,
+    /// AT_SYMLINK_FOLLOW)` idiom -- how QSaveFile, and thus every Qt/KDE app,
+    /// materialises an atomic write -- can find it. Cleaned up here so it does
+    /// not linger visibly in the directory.
+    pub unlink_on_close: Option<String>,
 }
 
 impl OpenFile {
@@ -41,6 +48,29 @@ impl OpenFile {
             handle,
             offset: AtomicU64::new(0),
             flags: AtomicU64::new(flags),
+            path,
+            dir_pos: AtomicUsize::new(0),
+            dir_cache: Mutex::new(None),
+            readable,
+            writable,
+            unlink_on_close: None,
+        })
+    }
+
+    /// An `O_TMPFILE` descriptor: named at `path` while open, unlinked when the
+    /// last reference closes. See `unlink_on_close`.
+    pub fn tmpfile(
+        handle: Arc<dyn FileHandle>,
+        path: String,
+        flags: u64,
+        readable: bool,
+        writable: bool,
+    ) -> Arc<OpenFile> {
+        Arc::new(OpenFile {
+            handle,
+            offset: AtomicU64::new(0),
+            flags: AtomicU64::new(flags),
+            unlink_on_close: Some(path.clone()),
             path,
             dir_pos: AtomicUsize::new(0),
             dir_cache: Mutex::new(None),

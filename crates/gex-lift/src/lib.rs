@@ -1987,6 +1987,7 @@ impl<'a> Lifter<'a> {
             Inst::VLoadStoreLane {
                 load,
                 replicate,
+                regs,
                 lane_bytes,
                 index,
                 q,
@@ -2001,45 +2002,53 @@ impl<'a> Lifter<'a> {
                 };
                 let ty = if lane_bytes == 8 { Ty::I64 } else { Ty::I32 };
                 let a = self.address(addr);
-                if load {
-                    let val = self.b.def(Expr::Load {
-                        addr: a.base,
-                        offset: a.offset,
-                        sz: msz,
-                        signed: false,
-                        ty,
-                        order: Order::Relaxed,
-                    });
-                    let v = if replicate {
-                        let full = self.b.def(Expr::VSplat { a: val, lane_bytes });
-                        // The 64-bit arrangement leaves the upper half zero.
-                        self.narrow_to_64(full, q)
+                // The interleaved forms touch `regs` consecutive registers, each
+                // one lane at consecutive `lane_bytes` offsets: `st4 {v2..v5}[0]`
+                // writes v2[0], v3[0], v4[0], v5[0] to four consecutive words.
+                // v31 wraps to v0.
+                for i in 0..regs as u32 {
+                    let reg = (vt.0 as u32 + i) % 32;
+                    let off = a.offset + (i as i64) * lane_bytes as i64;
+                    if load {
+                        let val = self.b.def(Expr::Load {
+                            addr: a.base,
+                            offset: off,
+                            sz: msz,
+                            signed: false,
+                            ty,
+                            order: Order::Relaxed,
+                        });
+                        let v = if replicate {
+                            let full = self.b.def(Expr::VSplat { a: val, lane_bytes });
+                            // The 64-bit arrangement leaves the upper half zero.
+                            self.narrow_to_64(full, q)
+                        } else {
+                            let old = self.b.read(GuestReg::V128(reg as u8));
+                            self.b.def(Expr::VReplace {
+                                a: old,
+                                lane: index,
+                                lane_bytes,
+                                val,
+                            })
+                        };
+                        self.b.write(GuestReg::V128(reg as u8), v);
                     } else {
-                        let old = self.b.read(GuestReg::V128(vt.0));
-                        self.b.def(Expr::VReplace {
+                        let old = self.b.read(GuestReg::V128(reg as u8));
+                        let val = self.b.def(Expr::VExtract {
                             a: old,
                             lane: index,
                             lane_bytes,
+                            signed: false,
+                            ty,
+                        });
+                        self.b.stmt(Stmt::Store {
+                            addr: a.base,
+                            offset: off,
                             val,
-                        })
-                    };
-                    self.b.write(GuestReg::V128(vt.0), v);
-                } else {
-                    let old = self.b.read(GuestReg::V128(vt.0));
-                    let val = self.b.def(Expr::VExtract {
-                        a: old,
-                        lane: index,
-                        lane_bytes,
-                        signed: false,
-                        ty,
-                    });
-                    self.b.stmt(Stmt::Store {
-                        addr: a.base,
-                        offset: a.offset,
-                        val,
-                        sz: msz,
-                        order: Order::Relaxed,
-                    });
+                            sz: msz,
+                            order: Order::Relaxed,
+                        });
+                    }
                 }
                 self.finish_address(&a);
                 Flow::Next
@@ -2635,6 +2644,67 @@ impl<'a> Lifter<'a> {
                 a,
                 b,
             });
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+
+        // The halving add/sub have no single wasm op (only the rounding
+        // *unsigned* add, `avgr_u` = `UrHAdd` above). The SWAR identities hold
+        // per lane, verified exhaustively over all 8-bit inputs both signs:
+        //   shadd/uhadd  = (a & b) + ((a ^ b) >> 1)
+        //   srhadd       = (a | b) - ((a ^ b) >> 1)
+        //   shsub/uhsub  = ((a ^ b) >> 1) - (~a & b)   [~a & b = (a & b) ^ b]
+        // with an arithmetic shift for the signed forms, logical for unsigned.
+        if matches!(
+            op,
+            VOp3::SHAdd | VOp3::UHAdd | VOp3::SrHAdd | VOp3::SHSub | VOp3::UHSub
+        ) {
+            let signed = matches!(op, VOp3::SHAdd | VOp3::SrHAdd | VOp3::SHSub);
+            let rounding = matches!(op, VOp3::SrHAdd);
+            let sub = matches!(op, VOp3::SHSub | VOp3::UHSub);
+            let xor = self.b.def(Expr::VBin {
+                op: VBinOp::Xor,
+                a,
+                b,
+            });
+            let one = self.b.const_i32(1);
+            let half = self.b.def(Expr::VShift {
+                op: if signed { VShiftOp::ShrS } else { VShiftOp::ShrU },
+                lane,
+                a: xor,
+                amount: one,
+            });
+            let r = if sub {
+                // `~a & b`, then `((a ^ b) >> 1) - (~a & b)`.
+                let ab = self.b.def(Expr::VBin {
+                    op: VBinOp::And,
+                    a,
+                    b,
+                });
+                let nab = self.b.def(Expr::VBin {
+                    op: VBinOp::Xor,
+                    a: ab,
+                    b,
+                });
+                self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Sub,
+                    lane,
+                    a: half,
+                    b: nab,
+                })
+            } else {
+                let base = self.b.def(Expr::VBin {
+                    op: if rounding { VBinOp::Or } else { VBinOp::And },
+                    a,
+                    b,
+                });
+                self.b.def(Expr::VLaneBin {
+                    op: if rounding { VLaneBinOp::Sub } else { VLaneBinOp::Add },
+                    lane,
+                    a: base,
+                    b: half,
+                })
+            };
             self.commit_vector(vd, arr, r);
             return Flow::Next;
         }

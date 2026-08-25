@@ -126,8 +126,15 @@ fi
 # so reserves its maximum up front, once per process: 64 of them at the full
 # `GUEST_MEM_BYTES` maximum allocate without complaint. The reservation is
 # address space, not pages.
+# GEX_PROFILE=<file>: a reached-PC profile from a sandbox run
+# (`GEX_COVERAGE_OUT`). Seeds each object with only the blocks the run touched,
+# so the closure covers reached code alone -- ~15x smaller and correct without
+# any partial page to demand-fill (the profile carries the indirect targets a
+# static scan misses). `$mode`'s exhaustive-for is ignored under a profile.
+profile=""
+[ -n "$GEX_PROFILE" ] && profile="--profile $GEX_PROFILE"
 target/release/gexc build --closure --sysroot "$sysroot" \
-    $mode --shared-image $withs "$sysroot$program" -o "$work/c.wasm"
+    $mode $profile --shared-image $withs "$sysroot$program" -o "$work/c.wasm"
 
 mkdir -p "$out"
 # The metadata too. Clearing the modules and the manifest but leaving the
@@ -136,8 +143,12 @@ mkdir -p "$out"
 # build with a different object order survives under a name the new manifest
 # also uses, and the page registers one object's pages against another's
 # slots. Every stray file here has cost a day at least once.
-rm -f "$out"/*.wasm "$out"/*.meta "$out"/closure.json
+rm -f "$out"/*.wasm "$out"/*.meta "$out"/closure.json "$out"/c.pins
 cp "$work"/*.wasm "$out/"
+# The layout too, in the `base span path` form run-node's GEX_PINS wants -- so a
+# node test of this closure needs only GEX_CLOSURE=<out>/c and GEX_PINS=<out>/
+# c.pins, not a hand rebuild of the pins out of closure.json.
+cp "$work"/c.pins "$out/" 2>/dev/null || true
 
 # The manifest, as `loadClosure` wants it: the image module's name, the
 # libraries in placement order, and where each object was pinned.

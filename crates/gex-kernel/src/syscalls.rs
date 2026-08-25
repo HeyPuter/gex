@@ -1998,7 +1998,7 @@ impl Kernel {
                 }
                 self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0)
             }
-            nr::MADVISE => Ok(0),
+            nr::MADVISE => self.sys_madvise(m, a[0], a[1], a[2] as u32),
 
             // -- process and time --------------------------------------------
             nr::UNAME => self.sys_uname(m, a[0]),
@@ -2194,7 +2194,7 @@ impl Kernel {
         Ok(r)
     }
 
-    fn sys_futex(&mut self, _m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
+    fn sys_futex(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         let (uaddr, raw_op, val) = (a[0], a[1] as u32, a[2] as u32);
         // The private and clock bits change nothing here: the timeout is
         // treated as relative either way.
@@ -2219,6 +2219,51 @@ impl Kernel {
             // Requeue is an optimisation for condition variables; waking
             // everyone is correct, if less efficient.
             futex::op::REQUEUE | futex::op::CMP_REQUEUE => Ok(self.futexes.wake(uaddr, u32::MAX)),
+            // `FUTEX_WAKE_OP`: atomically apply an op to a second word, wake
+            // `val` waiters on `uaddr`, then -- if the old second word compares
+            // true -- wake `a[3]` waiters on `uaddr2` (`a[4]`). glibc's condvar
+            // signalling uses it; returning ENOSYS here lost a wake and left
+            // Qt's pthread-cond waiters asleep forever. The operation and
+            // comparison are packed into `a[5]` (see the kernel's `FUTEX_OP`).
+            futex::op::WAKE_OP => {
+                let nr_wake2 = a[3] as u32;
+                let uaddr2 = a[4];
+                let encoded = a[5] as u32;
+                let mut oper = (encoded >> 28) & 0xf;
+                let cmp = (encoded >> 24) & 0xf;
+                // `oparg`/`cmparg` are 12-bit signed fields.
+                let mut oparg = ((((encoded >> 12) & 0xfff) as i32) << 20) >> 20;
+                let cmparg = (((encoded & 0xfff) as i32) << 20) >> 20;
+                // `FUTEX_OP_OPARG_SHIFT`: the arg is a shift count, not a value.
+                if oper & 8 != 0 {
+                    oper &= 7;
+                    oparg = 1i32.wrapping_shl((oparg & 31) as u32);
+                }
+                let oldval = m.read_u32(uaddr2)? as i32;
+                let newval = match oper {
+                    0 => oparg,                        // SET
+                    1 => oldval.wrapping_add(oparg),   // ADD
+                    2 => oldval | oparg,               // OR
+                    3 => oldval & !oparg,              // ANDN
+                    4 => oldval ^ oparg,               // XOR
+                    _ => return Err(Errno::ENOSYS),
+                };
+                m.write_u32(uaddr2, newval as u32)?;
+                let mut woken = self.futexes.wake(uaddr, val);
+                let fire = match cmp {
+                    0 => oldval == cmparg, // EQ
+                    1 => oldval != cmparg, // NE
+                    2 => oldval < cmparg,  // LT
+                    3 => oldval <= cmparg, // LE
+                    4 => oldval > cmparg,  // GT
+                    5 => oldval >= cmparg, // GE
+                    _ => return Err(Errno::ENOSYS),
+                };
+                if fire {
+                    woken += self.futexes.wake(uaddr2, nr_wake2);
+                }
+                Ok(woken)
+            }
             _ => Err(Errno::ENOSYS),
         }
     }
@@ -2714,6 +2759,7 @@ impl Kernel {
         // way to it. `O_PATH` opens the name, not the file, so it does not
         // follow a dangling symlink to `ENOENT` -- which is how tar sets the
         // mode on a symlink whose target does not exist yet.
+        let mut tmpfile_path: Option<String> = None;
         let handle = if flags & oflags::O_PATH != 0 {
             let md = if flags & oflags::O_NOFOLLOW != 0 {
                 self.vfs.metadata_nofollow(&p)?
@@ -2730,7 +2776,13 @@ impl Kernel {
                 oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
                 if mode == 0 { 0o600 } else { mode },
             )?;
-            let _ = self.vfs.unlink(&tmp);
+            // Kept named (not unlinked here) so `/proc/self/fd/N` resolves to the
+            // file and the `linkat(..., AT_SYMLINK_FOLLOW)` idiom can hardlink it
+            // into place; the name is removed when the descriptor closes (see
+            // `OpenFile::unlink_on_close`). Recording `tmp` as the fd's path --
+            // not the directory `p` -- is what makes `/proc/self/fd/N` point at
+            // the file rather than at a directory (linking which is EPERM).
+            tmpfile_path = Some(tmp);
             h
         } else {
             // Arm a pin if this is an object of the closure. Before the open
@@ -2756,7 +2808,10 @@ impl Kernel {
         let acc = flags & oflags::ACCMODE;
         let readable = acc == oflags::O_RDONLY || acc == oflags::O_RDWR;
         let writable = acc == oflags::O_WRONLY || acc == oflags::O_RDWR;
-        let file = OpenFile::new(handle, p, flags, readable, writable);
+        let file = match tmpfile_path {
+            Some(tp) => OpenFile::tmpfile(handle, tp, flags, readable, writable),
+            None => OpenFile::new(handle, p, flags, readable, writable),
+        };
         self.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
     }
 
@@ -2808,7 +2863,35 @@ impl Kernel {
 
     /// `linkat`: a second name for a file that already exists.
     fn sys_linkat(&mut self, m: &GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        const AT_SYMLINK_FOLLOW: u64 = 0x400;
         let from = self.at_path(m, a[0] as i32, a[1])?;
+        // With AT_SYMLINK_FOLLOW the link is to what `from` points at, not the
+        // symlink itself. This is how the O_TMPFILE atomic-create idiom names an
+        // unnamed file: write to an `O_TMPFILE` fd, then
+        // `linkat("/proc/self/fd/N", target, AT_SYMLINK_FOLLOW)`. gex's
+        // `/proc/self/fd/N` is a symlink to the temp's real path, so following it
+        // here turns a would-be cross-mount link (/proc vs the target's fs, an
+        // EXDEV) into the same-fs link it really is. QSaveFile (Qt, hence every
+        // KDE app) relies on it -- without it dolphin cannot save its bookmarks.
+        let from = if a[4] & AT_SYMLINK_FOLLOW != 0 {
+            let mut cur = from;
+            for _ in 0..40 {
+                match self.vfs.read_link(&cur) {
+                    Ok(target) => {
+                        cur = if target.starts_with('/') {
+                            crate::vfs::normalize(&target, "/")
+                        } else {
+                            let parent = crate::vfs::parent_of(&cur);
+                            crate::vfs::normalize(&target, &parent)
+                        };
+                    }
+                    Err(_) => break,
+                }
+            }
+            cur
+        } else {
+            from
+        };
         let to = self.at_path(m, a[2] as i32, a[3])?;
         self.vfs.link(&from, &to).map(|_| 0)
     }
@@ -4048,6 +4131,12 @@ impl Kernel {
             let keep = old_len.min(new_len) as usize;
             let bytes = m.read(addr, keep)?.to_vec();
             m.write(dst, &bytes)?;
+            // The grown tail at the new location is fresh anonymous memory,
+            // which Linux exposes as zero -- but `dst` may be a reused hole
+            // holding stale bytes, and only `keep` of them were overwritten.
+            if new_len > old_len {
+                m.zero(dst + keep as u64, (new_len - keep as u64) as usize)?;
+            }
         } else if new_len > old_len {
             // Growing in place must expose zeroes, not whatever the guest
             // left behind the last time this range was mapped.
@@ -4073,6 +4162,34 @@ impl Kernel {
             .iter()
             .find(|(k, _)| k.rsplit('/').next() == Some(want))
             .map(|(_, &v)| v)
+    }
+
+    /// `madvise`. Only `MADV_DONTNEED` does anything: on Linux it makes an
+    /// anonymous range read as zero on next access, and glibc's malloc frees
+    /// arena memory this way and then REUSES it trusting the zero. A no-op left
+    /// the reused pages holding stale bytes, so glibc read garbage -- a
+    /// deterministic corruption Qt hits (heavy glibc malloc/threads) and musl
+    /// does not (it frees via `munmap`, which is re-zeroed on remap). Only
+    /// anonymous VMAs are zeroed; a file mapping's `MADV_DONTNEED` reloads from
+    /// the file, which the demand path already does, so it is left alone.
+    fn sys_madvise(&mut self, m: &mut GuestMem<'_>, addr: u64, len: u64, advice: u32) -> SysResult {
+        const MADV_DONTNEED: u32 = 4;
+        if advice == MADV_DONTNEED {
+            let end = addr.saturating_add(len);
+            let anon: Vec<(u64, u64)> = self
+                .mem
+                .vmas()
+                .iter()
+                .filter(|v| v.origin.is_none() && v.start < end && addr < v.end)
+                .map(|v| (v.start.max(addr), v.end.min(end)))
+                .collect();
+            for (lo, hi) in anon {
+                if hi > lo {
+                    m.zero(lo, (hi - lo) as usize)?;
+                }
+            }
+        }
+        Ok(0)
     }
 
     fn sys_mmap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
@@ -4437,6 +4554,11 @@ impl Kernel {
         // above that is another descriptor.
         if Arc::strong_count(&file) == 1 {
             self.file_locks.release(key);
+            // Last descriptor to an O_TMPFILE: drop its name. If a `linkat` gave
+            // it another (the atomic-write idiom), that name keeps the inode.
+            if let Some(tp) = &file.unlink_on_close {
+                let _ = self.vfs.unlink(tp);
+            }
         }
         Ok(0)
     }

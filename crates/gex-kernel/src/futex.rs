@@ -21,6 +21,11 @@ pub mod op {
     pub const WAKE: u32 = 1;
     pub const REQUEUE: u32 = 3;
     pub const CMP_REQUEUE: u32 = 4;
+    /// `FUTEX_WAKE_OP`: atomically apply an operation to a second futex word,
+    /// wake waiters on the first, and conditionally wake waiters on the second.
+    /// glibc's condvar signalling path uses it; without it a `pthread_cond`
+    /// wake is lost and the waiter deadlocks (Qt's threads hit exactly this).
+    pub const WAKE_OP: u32 = 5;
     pub const WAIT_BITSET: u32 = 9;
     pub const WAKE_BITSET: u32 = 10;
     /// `FUTEX_PRIVATE_FLAG`; these queues are per-process and all waiters share

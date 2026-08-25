@@ -43,7 +43,7 @@ fn main() {
     let mut v: Vec<_> = unknown.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
     eprintln!("{total} words scanned, {} distinct undecoded", v.len());
-    for (raw, n) in v.iter().take(60) {
+    for (raw, n) in v.iter() {
         println!("{raw:#010x} {n}");
     }
 }

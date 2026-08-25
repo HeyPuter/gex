@@ -257,6 +257,25 @@ export function elementTableNeeds(wasm) {
 }
 
 export function metadataSection(wasm) {
+  // A compiled `WebAssembly.Module` -- which `attach` accepts, so the guest
+  // image and the closure's libraries cross `postMessage` by reference rather
+  // than re-cloning and re-compiling hundreds of megabytes per forked process
+  // -- has no bytes to scan. Its custom sections are read through the
+  // reflection API instead. Without this, a forked process in the browser threw
+  // "First argument to DataView constructor must be an ArrayBuffer".
+  if (wasm instanceof WebAssembly.Module) {
+    const secs = WebAssembly.Module.customSections(wasm, 'gex.meta');
+    return secs.length ? new Uint8Array(secs[0]) : null;
+  }
+  // A bare ArrayBuffer (or SharedArrayBuffer) has no `.buffer`, so the DataView
+  // below would throw "First argument to DataView constructor must be an
+  // ArrayBuffer"; wrap it. Anything else is not module bytes and has no
+  // metadata to give -- a guard rather than a crash, matching
+  // `elementTableNeeds`.
+  if (wasm instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && wasm instanceof SharedArrayBuffer)) {
+    wasm = new Uint8Array(wasm);
+  }
+  if (!(wasm instanceof Uint8Array)) return null;
   const dv = new DataView(wasm.buffer, wasm.byteOffset, wasm.byteLength);
   let i = 8;
   const leb = () => {
@@ -350,6 +369,11 @@ export class Gex {
   /// carries no byte copies. Only the compile is shared -- each Worker still
   /// instantiates against its own tables.
   #sharedModules = new Map();
+  /// A spawned thread that registers the process's modules lazily (directory +
+  /// tables now, instance on the branch that wants it) instead of installing
+  /// them all up front. Set in `adoptThread` from `GEX_LAZY_THREAD`. See
+  /// `#catchUpLazy` and gtk-startup-is-per-thread-install.
+  #lazyCatchUp = false;
   // Instances whose slots have not been written, newest first: a miss asks
   // each in turn whether it holds the slot. See `fillSlot`.
   #unfilled = [];
@@ -534,6 +558,21 @@ export class Gex {
   }
 
   get memory() { return this.#memory; }
+
+  /**
+   * Every guest block PC translated in this process so far, as a BigUint64Array
+   * (a fresh copy, safe to keep). The profile a sandbox run dumps to seed a
+   * reachability-trimmed closure build. Null if the shim lacks the export.
+   */
+  coverage() {
+    const e = this.#shim?.exports;
+    if (!e?.gex_coverage_snapshot) return null;
+    const n = e.gex_coverage_snapshot() >>> 0;
+    const ptr = e.gex_coverage_ptr() >>> 0;
+    // Copied out: the snapshot lives in linear memory that a later host call
+    // may reallocate, and the caller writes it to disk asynchronously.
+    return new BigUint64Array(this.#memory.buffer.slice(ptr, ptr + n * 8));
+  }
 
   /**
    * Let go of everything that would keep a host's event loop alive. `#tick` is
@@ -1732,6 +1771,11 @@ export class Gex {
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
     _t(`adopted, catchUp (${(this.#shim.exports.gex_module_count?.()>>>0)} modules)`);
+    // A spawned thread runs almost none of the process's modules, so registering
+    // them lazily (instance on the branch that wants it) skips compiling and
+    // instantiating the rest -- the dominant startup cost for a threaded app.
+    // Opt-in while it proves out; the eager path below is the safe default.
+    this.#lazyCatchUp = !!globalThis.GEX_LAZY_THREAD;
     // Install every already-translated module into this Worker's own tables
     // before it runs an instruction. The funcref tables are per-thread (a wasm
     // table is not shareable) while the directory naming their slots is shared
@@ -1860,6 +1904,16 @@ export class Gex {
     // Every slot the *process* has claimed, not the pending module's -- this
     // Worker is catching up on all of them at once.
     const need = (e.gex_jit_slots_total?.() ?? 0) >>> 0;
+    // A spawned thread branches into almost none of the process's modules (a
+    // GLib pool worker runs `start_thread` and then sits in a condvar), yet
+    // eager catch-up compiles+instantiates every one -- ~48% of an idle helper
+    // thread's whole startup, on code it never runs (see gtk-startup profile).
+    // The lazy path registers each module's directory the same way a fork's
+    // inherited modules are (`gex_add_lazy_module`) but defers the instance to
+    // the branch that wants it (`fillSlot`). Off unless the thread opted in.
+    if (this.#lazyCatchUp && e.gex_add_lazy_module) {
+      return this.#catchUpLazy(have, need);
+    }
     const t0 = globalThis.GEX_ATTACH_TRACE ? performance.now() : 0;
     const comp0 = this.#compileMs;
     let n = 0, reused = 0;
@@ -1901,6 +1955,58 @@ export class Gex {
   addSharedModule(i, mod) {
     if (mod instanceof WebAssembly.Module && !this.#sharedModules.has(i)) {
       this.#sharedModules.set(i, mod);
+    }
+  }
+
+  /**
+   * Catch up on the process's modules the lazy way: register each one's
+   * directory and grow the tables, but leave the instance for the branch that
+   * wants it -- exactly how a fork's inherited modules and closure libraries
+   * are handled (`#adoptModule`, `#lazyClosure`), and through the same
+   * `gex_add_lazy_module`/`gex_lazy_owner`/`fillSlot` path. A spawned thread
+   * runs a handful of the process's ~thousands of modules, so this skips
+   * compiling and instantiating the rest. The registry bytes carry the same
+   * directory the main thread already published, so re-registering is
+   * idempotent; it only fills in *this* Worker's own `LAZY_OWNER` map so its
+   * miss path can find the module.
+   */
+  async #catchUpLazy(have, need) {
+    const e = this.#shim.exports;
+    // Grow the funcref tables once to the whole claimed range, so any branch
+    // resolves to a slot (its instance is written when the branch faults).
+    if (need) this.#growTables(need, 'lazy-catchup');
+    let lazy = 0, eager = 0;
+    for (; this.#installed < have; this.#installed++) {
+      const i = this.#installed;
+      const ptr = e.gex_module_ptr(i) >>> 0;
+      const len = e.gex_module_len(i) >>> 0;
+      if (!len) continue;
+      const bytes = this.#bytes().slice(ptr, ptr + len);
+      const meta = metadataSection(bytes);
+      // No metadata means nothing to key a later fill on -- install it eagerly,
+      // as the fork path does (`#adoptModule`), reusing a sibling's compile.
+      if (!meta || !meta.length) {
+        await this.#installModule(bytes, need, 64, null, 'lazy-nometa', this.#sharedModules.get(i));
+        eager++;
+        continue;
+      }
+      const gp = e.gex_alloc(meta.length) >>> 0;
+      this.#bytes().set(meta, gp);
+      const got = e.gex_add_lazy_module(gp, meta.length) >>> 0;
+      e.gex_free?.(gp, meta.length);
+      if (!got) {
+        await this.#installModule(bytes, need, 64, meta, 'lazy-noneed', this.#sharedModules.get(i));
+        eager++;
+        continue;
+      }
+      // Keep a sibling's compiled Module when we have it, so the on-demand
+      // instantiate skips the compile too; otherwise the raw bytes. The push
+      // order matches `gex_add_lazy_module`'s ordinal (both count from 0 here).
+      this.#lazyInherited.push({ mod: this.#sharedModules.get(i) ?? bytes, need, inst: null, meta });
+      lazy++;
+    }
+    if (globalThis.GEX_ATTACH_TRACE && (lazy || eager)) {
+      console.error(`[catchup] lazy-registered ${lazy} modules (${eager} eager, deferred instantiation)`);
     }
   }
 
@@ -2054,6 +2160,13 @@ export class Gex {
               ? ''
               : `, ${within ? 'inside' : 'after'} syscall ${n}`);
           if (globalThis.GEX_TRAP_STACK) console.error(err.stack ?? err);
+          // Physical size of the linear memory at the trap: a "memory access out
+          // of bounds" fires only past this, so it is the ceiling the faulting
+          // address crossed -- a stack whose mmap did not grow the memory, or a
+          // wild pointer beyond it.
+          try {
+            console.error(`[trap] linear memory grown to ${(this.#memory.buffer.byteLength / (1024 * 1024)) | 0} MiB (0x${this.#memory.buffer.byteLength.toString(16)})`);
+          } catch {}
           // Dump every thread's register context: two with the same ctx is #126
           // (two Workers on one context). Prints via the shim; safe if borrowed.
           ask(e.gex_dump_threads, () => '');
@@ -2518,6 +2631,16 @@ export class Gex {
     const e = this.#shim.exports;
     const ptr = e.gex_jit_pending_ptr() >>> 0;
     const len = e.gex_jit_pending_len() >>> 0;
+    // A zero-length published view means the shared pending queue was drained
+    // (by a sibling Worker) between the caller's `gex_jit_pending_len()` guard
+    // and this read -- the queue is process-wide, the view is per-Worker.
+    // Compiling a zero-length slice traps ("BufferSource argument is empty" --
+    // Qt's heavy multi-thread JIT hit exactly this); there is nothing to install,
+    // so resync the view and stop rather than crash.
+    if (len === 0) {
+      if (globalThis.GEX_JIT_TRACE) console.error('[jit] empty pending view (sibling drained the queue), skipping compile');
+      return;
+    }
     await this.#installModule(this.#bytes().slice(ptr, ptr + len), e.gex_jit_slots() >>> 0, 64, null, 'jit2878');
     e.gex_jit_installed();
     // This Worker translated it, so the entry `gex_jit_installed` just added is
@@ -2568,6 +2691,18 @@ export class Gex {
     this.#growMs += performance.now() - tg;
     this.#tnAt('pre-inst');
     const tc = performance.now();
+    // Nothing to install: a zero-length buffer is not a module, and
+    // `WebAssembly.compile` on one traps ("BufferSource argument is empty").
+    // It reaches here when a Worker's view of the shared pending queue, or a
+    // registry slot, is drained/unwritten under concurrency -- an empty module
+    // has no blocks, so skipping it is exactly correct. Logged (with `who`) so
+    // the racing producer can be found.
+    if (!(precompiled instanceof WebAssembly.Module)
+        && !(bytes instanceof WebAssembly.Module)
+        && (bytes?.byteLength ?? 0) === 0) {
+      if (globalThis.GEX_JIT_TRACE) console.error(`[jit] empty module bytes, skipping install (who=${who})`);
+      return null;
+    }
     // A `precompiled` Module (a sibling Worker's, relayed by the host) skips the
     // compile entirely; otherwise compile the bytes (or use them if already a
     // Module). Same registry bytes either way, so the Module is interchangeable.

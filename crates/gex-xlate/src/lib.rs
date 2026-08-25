@@ -28,6 +28,7 @@ pub use gex_emit::module::Metadata;
 pub use gex_emit::tier1::set_check_sp;
 pub use gex_emit::tier1::set_copy_loop;
 pub use gex_emit::tier1::set_coherent_loads;
+pub use gex_emit::tier1::set_trap_pc;
 pub use gex_emit::PageTable;
 pub use gex_emit::TranslatedModule;
 use gex_emit::ModuleBuilder;
@@ -79,6 +80,17 @@ pub struct Options {
     /// Bounded, unlike `exhaustive`: only pages a real block already reached,
     /// and transitively what those pages' blocks reach.
     pub complete_pages: bool,
+    /// Translate only the seed blocks (`extra_entries` and the image entry),
+    /// without following their branch successors onto fresh pages. For a
+    /// profile-guided build: the seeds ARE the reached set, so recursive descent
+    /// off them only adds never-taken branches -- one run measured 29 reached
+    /// blocks of libzstd exploding to 14,588 followed ones. Paired with
+    /// `complete_pages`, every reached block's page is still made whole (each
+    /// reached block is a seed, so its page is touched and completed), so the
+    /// result is exactly the reached pages: no partial page, no static
+    /// over-coverage. A block a divergent run reaches is either on a completed
+    /// page (present) or a wholly untouched one (a clean demand-fill).
+    pub seeds_only: bool,
     /// Declare the imported memory shared. Off only for a single-threaded
     /// build whose host cannot import a shared memory.
     pub shared_memory: bool,
@@ -109,6 +121,7 @@ impl Default for Options {
             exhaustive: false,
             lazy: false,
             complete_pages: false,
+            seeds_only: false,
             shared_memory: true,
             demand_fill: false,
             linkage: Linkage::Own,
@@ -317,22 +330,13 @@ impl Phases {
     }
 }
 
-pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
+/// Discover and lift every block of `image` the options ask for, returning them
+/// address-sorted and dead-flag-eliminated, plus the stats. The module emission
+/// is left to the caller: [`translate_image`] builds one module, and
+/// [`translate_image_split`] builds several when the object is too big for one.
+fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
     let mut phases = Phases::start();
     let view = CodeView::new(image);
-    let (text_lo, text_hi) = image.text_range;
-    let mut builder = if opts.first_slot == 0 {
-        ModuleBuilder::with_linkage(text_lo, text_hi - text_lo, opts.linkage, opts.shared_memory)
-    } else {
-        ModuleBuilder::with_pages(
-            text_lo,
-            text_hi - text_lo,
-            opts.linkage,
-            gex_emit::module::PageTable::from_entries(&[], opts.first_slot),
-            opts.shared_memory,
-        )
-    };
-    builder.set_demand_fill(opts.demand_fill);
     let mut stats = Stats::default();
 
     // Collect entry points. A BTreeSet keeps translation order deterministic,
@@ -534,11 +538,16 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 
             // Both the successors and the return site of any call in this
             // block are entry points; a callee's `ret` branches straight to
-            // the latter.
-            for succ in block.successors().chain(block.call_return) {
-                if !seen.contains(&succ) && view.is_executable(succ) {
-                    seen.insert(succ);
-                    next.push(succ);
+            // the latter. Skipped for a `seeds_only` (profile-guided) build:
+            // the seeds are already the reached set, and following their
+            // branches only re-adds the never-taken code the profile exists to
+            // leave out -- `complete_pages` still makes each touched page whole.
+            if !opts.seeds_only {
+                for succ in block.successors().chain(block.call_return) {
+                    if !seen.contains(&succ) && view.is_executable(succ) {
+                        seen.insert(succ);
+                        next.push(succ);
+                    }
                 }
             }
             collected.push(block);
@@ -618,16 +627,75 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     // finished rather than per block.
     stats.dead_flag_stmts = eliminate_dead_flags(&mut collected);
     phases.mark("flag liveness");
+    (collected, stats)
+}
+
+/// Build a module for `opts.first_slot`-based placement, either the one-shot
+/// [`ModuleBuilder`] the whole-image emitters share.
+fn image_builder(image: &Image, opts: &Options) -> ModuleBuilder {
+    let (text_lo, text_hi) = image.text_range;
+    let mut builder = if opts.first_slot == 0 {
+        ModuleBuilder::with_linkage(text_lo, text_hi - text_lo, opts.linkage, opts.shared_memory)
+    } else {
+        ModuleBuilder::with_pages(
+            text_lo,
+            text_hi - text_lo,
+            opts.linkage,
+            gex_emit::module::PageTable::from_entries(&[], opts.first_slot),
+            opts.shared_memory,
+        )
+    };
+    builder.set_demand_fill(opts.demand_fill);
+    builder
+}
+
+pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
+    let (collected, mut stats) = image_blocks(image, opts);
+    let mut builder = image_builder(image, opts);
     for block in collected {
         builder.reserve(block.start);
         builder.add_block(block);
     }
-    phases.mark("reserving");
-
     let module = builder.finish();
-    phases.mark("codegen and encoding");
     stats.wasm_bytes = module.wasm.len();
     (module, stats)
+}
+
+/// Like [`translate_image`], but emits SEVERAL modules when the object has more
+/// than `max_funcs` blocks -- more than one wasm module may hold (libQt6Gui,
+/// Mesa, libz3). Split by dispatch page, never within one, threading the page
+/// table so later parts see earlier parts' slot assignments. An `Own` image
+/// module is never split: it declares the memory and tables, and an executable
+/// is always small enough for one module anyway.
+pub fn translate_image_split(
+    image: &Image,
+    opts: &Options,
+    max_funcs: usize,
+) -> (Vec<TranslatedModule>, Stats) {
+    let (collected, mut stats) = image_blocks(image, opts);
+    if opts.linkage != Linkage::Shared || collected.len() <= max_funcs {
+        let mut builder = image_builder(image, opts);
+        for block in collected {
+            builder.reserve(block.start);
+            builder.add_block(block);
+        }
+        let module = builder.finish();
+        stats.wasm_bytes = module.wasm.len();
+        return (vec![module], stats);
+    }
+    // Split through the proven runtime splitter, threaded from this object's
+    // starting slot and emitting the closure's passive segments (`demand_fill`).
+    let page_table = gex_emit::module::PageTable::from_entries(&[], opts.first_slot);
+    let modules = emit_modules(
+        collected,
+        image.text_range.0,
+        page_table,
+        opts.shared_memory,
+        opts.demand_fill,
+        max_funcs,
+    );
+    stats.wasm_bytes = modules.iter().map(|m| m.wasm.len()).sum();
+    (modules, stats)
 }
 
 /// A module that translates nothing: the entry stub, the miss stub, and an
@@ -712,7 +780,7 @@ pub fn translate_object(
         intrinsics,
     );
     stage("discovered", blocks.len());
-    let modules = emit_modules(blocks, lo, page_table, shared_memory, MAX_FUNCS_PER_MODULE);
+    let modules = emit_modules(blocks, lo, page_table, shared_memory, false, MAX_FUNCS_PER_MODULE);
     stage("emitted", modules.len());
     stats.wasm_bytes = modules.iter().map(|m| m.wasm.len()).sum();
     (modules, stats)
@@ -759,6 +827,7 @@ fn emit_modules(
     text_base: u64,
     page_table: PageTable,
     shared_memory: bool,
+    demand_fill: bool,
     max_funcs: usize,
 ) -> Vec<TranslatedModule> {
     if blocks.len() <= max_funcs {
@@ -769,6 +838,7 @@ fn emit_modules(
             page_table,
             shared_memory,
         );
+        builder.set_demand_fill(demand_fill);
         for block in blocks {
             builder.add_block(block);
         }
@@ -803,6 +873,7 @@ fn emit_modules(
             pages.clone(),
             shared_memory,
         );
+        builder.set_demand_fill(demand_fill);
         for block in chunk.drain(..) {
             builder.add_block(block);
         }
@@ -865,7 +936,7 @@ fn translate_seeded(
     let (blocks, mut stats) = discover(
         memory, entry, seeds, executable, known, limits, max_blocks, intrinsics,
     );
-    let mut modules = emit_modules(blocks, entry, page_table, shared_memory, usize::MAX);
+    let mut modules = emit_modules(blocks, entry, page_table, shared_memory, false, usize::MAX);
     let module = modules.pop().expect("an unbounded budget emits one module");
     stats.wasm_bytes = module.wasm.len();
     (module, stats)
@@ -1034,6 +1105,9 @@ mod tests {
             tls: None,
             symbols: Vec::new(),
             named_relocs: Vec::new(),
+            relocs: Vec::new(),
+            init_array: Vec::new(),
+            dynsyms: Vec::new(),
             irelative: Vec::new(),
             pie: false,
             interp: None,
@@ -1070,7 +1144,7 @@ mod tests {
         assert_eq!(total, seeds.len(), "every `ret` is its own block");
 
         // A budget that forces a split without dictating where it falls.
-        let modules = emit_modules(blocks, base, PageTable::default(), false, total / 4);
+        let modules = emit_modules(blocks, base, PageTable::default(), false, false, total / 4);
         assert!(modules.len() > 1, "the budget should have forced a split");
 
         let mut seen_addrs = HashSet::new();

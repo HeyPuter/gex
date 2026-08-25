@@ -274,3 +274,42 @@ footer {
   border-radius: 4px;
   background: #000;
 }
+
+/* The Wayland demo's app picker: a labelled dropdown above the canvases. */
+.wl-picker {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 0;
+  background: #0d0f14;
+}
+
+.wl-picker label {
+  font-size: 13px;
+  color: var(--muted, #9aa0ac);
+}
+
+.wl-picker select {
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg, #e6e8ec);
+  background: #14171d;
+  border: 1px solid #2a2e38;
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.wl-picker select:hover { border-color: var(--accent-dim, #3a6ea5); }
+
+/* virglrenderer's WebGL scratch surface: kept rendering (full size) but off the
+   visible page, so the Wayland demo shows one window (the compositor output),
+   not two. Not display:none — that can suspend the WebGL context/readback. */
+canvas.wl-offscreen {
+  position: absolute;
+  left: -99999px;
+  top: 0;
+  border: 0;
+  pointer-events: none;
+}

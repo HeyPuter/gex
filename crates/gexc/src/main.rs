@@ -388,6 +388,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut shared_image = false;
     let mut also: Vec<String> = Vec::new();
     let mut sysroot: Option<String> = None;
+    let mut profile: Vec<u64> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -445,6 +446,27 @@ fn cmd_build(args: &[String]) -> Result<()> {
                 i += 1;
                 sysroot = Some(args.get(i).context("--sysroot needs a directory")?.clone());
             }
+            // A profile from a sandbox run (`GEX_COVERAGE_OUT`): one hex block PC
+            // per line, the exact set a real run reached. Seeds each object's
+            // translation with the PCs in its range instead of scanning the whole
+            // symbol table, so the closure covers only reached code (and the
+            // untaken branches off it, plus each touched page completed) --
+            // ~15x smaller than static reachability and, because it carries the
+            // indirect targets a static scan misses, correct without any partial
+            // page to demand-fill.
+            "--profile" => {
+                i += 1;
+                let p = args.get(i).context("--profile needs a path")?;
+                let text = std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?;
+                profile = text
+                    .lines()
+                    .filter_map(|l| {
+                        let l = l.trim();
+                        let l = l.strip_prefix("0x").unwrap_or(l);
+                        u64::from_str_radix(l, 16).ok()
+                    })
+                    .collect();
+            }
             other => path = Some(other.to_string()),
         }
         i += 1;
@@ -455,7 +477,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     if closure {
         return build_closure(
             &path, &also, sysroot.as_deref(), &out, exhaustive, &exhaustive_for, shared_memory,
-            no_validate, shared_image,
+            no_validate, shared_image, &profile,
         );
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
@@ -562,8 +584,16 @@ fn build_closure(
     shared_memory: bool,
     no_validate: bool,
     shared_image: bool,
+    profile: &[u64],
 ) -> Result<()> {
     let (closure, interp) = closure_of_all(path, also, sysroot)?;
+    // Sorted once so each object can binary-search its slice of reached PCs.
+    let mut profile_sorted = profile.to_vec();
+    profile_sorted.sort_unstable();
+    profile_sorted.dedup();
+    if !profile_sorted.is_empty() {
+        eprintln!("gexc: profile-guided build from {} reached block PCs", profile_sorted.len());
+    }
     for (name, asker) in &closure.missing {
         eprintln!("gexc: {name} not found, needed by {asker} -- the build will be incomplete");
     }
@@ -679,20 +709,53 @@ fn build_closure(
     }
     for (n, o) in ordered.into_iter().enumerate() {
         let skipped = skip.iter().any(|w| o.name.starts_with(w.as_str()));
+        // This object's slice of the reached-PC profile, when one was given. The
+        // profile holds absolute biased PCs and every object loads at the same
+        // pinned base the run used, so a range test on the object's text picks
+        // out its reached blocks.
+        let seeds: Vec<u64> = if profile_sorted.is_empty() {
+            Vec::new()
+        } else {
+            let (tlo, thi) = o.image.text_range;
+            let lo = profile_sorted.partition_point(|&p| p < tlo);
+            let hi = profile_sorted.partition_point(|&p| p < thi);
+            profile_sorted[lo..hi].to_vec()
+        };
+        let guided = !profile_sorted.is_empty();
+        if guided {
+            eprintln!("gexc:   {} <- {} reached PCs", o.name, seeds.len());
+        }
         // Whole, for the objects named. Matched on the start of the name so
-        // `libc.so.6` catches `libc.so.6` and `libc` catches it too.
-        let whole = exhaustive || exhaustive_for.iter().any(|w| o.name.starts_with(w.as_str()));
+        // `libc.so.6` catches `libc.so.6` and `libc` catches it too. A profile
+        // overrides it: the reached set already carries what a run of this
+        // program touches, and keeping a library whole under a profile just
+        // re-inflates the closure the profile exists to shrink.
+        let whole = !guided
+            && (exhaustive || exhaustive_for.iter().any(|w| o.name.starts_with(w.as_str())));
         // Fill the gaps on this object's touched pages (C++ landing pads and
         // cold paths), unless it is already whole (nothing left to fill) or on
         // the no-complete list (a sparse math library not worth its exhaustive
         // size). Root images included -- an apt method wraps its `main` in a
         // try/catch, so the landing pad the unwinder jumps to lives in the
-        // program's own image.
-        let complete =
-            !whole && !no_complete.iter().any(|w| o.name.starts_with(w.as_str()));
+        // program's own image. Under a profile, always complete: a run reaches
+        // few pages, completing them is cheap, and it is what guarantees no
+        // reached page comes out partial (the closure's one corruption hazard).
+        let complete = guided
+            || (!whole && !no_complete.iter().any(|w| o.name.starts_with(w.as_str())));
         let opts = Options {
             first_slot,
             exhaustive: whole,
+            // Under a profile, seed discovery from only the reached PCs and skip
+            // the symbol-table and pointer scans -- that is the whole trim. The
+            // executable's real entry is still added inside `translate_image`.
+            lazy: guided,
+            scan_pointers: !guided,
+            // The seeds are the reached set; do not follow their branches onto
+            // fresh pages (that re-inflates to static reachability). complete_pages
+            // still makes every touched page whole, so the closure is the reached
+            // pages exactly.
+            seeds_only: guided,
+            extra_entries: seeds,
             // `complete_pages` fills the gaps on any page a block already
             // touches, so a partly-covered page becomes whole and nothing on it
             // demand-fills at run time into slots the closure already holds --
@@ -727,13 +790,29 @@ fn build_closure(
         // `gex_ld::elf::apply_own_relative`.
         let mut img = o.image.clone();
         gex_ld::elf::apply_own_relative(&mut img);
-        let (module, stats) = gex_xlate::translate_image(&img, &opts);
+        // An object with more blocks than fit in one wasm module (libQt6Gui,
+        // Mesa) comes back as several parts; the runtime splitter's logic, now
+        // reachable at build time. All the closure's objects are `Shared` under
+        // `--shared-image`, which is what makes the split valid (an `Own` image
+        // module cannot be split, and executables are small enough not to need
+        // it anyway).
+        let (modules, stats) =
+            gex_xlate::translate_image_split(&img, &opts, gex_xlate::MAX_FUNCS_PER_MODULE);
         // Named like a library when it is one, so a manifest that collects
         // `c.NN.*.wasm` picks it up and the loader has nothing special to do.
-        let file = if n == 0 && !shared_image {
-            format!("{stem}.wasm")
+        // Multiple parts are `.p0`, `.p1`, … under the same object index; the
+        // glob takes them all, and they sort in build (page) order.
+        let base = if n == 0 && !shared_image {
+            stem.to_string()
         } else {
-            format!("{stem}.{n:02}.{}.wasm", o.name)
+            format!("{stem}.{n:02}.{}", o.name)
+        };
+        let part_file = |i: usize| -> String {
+            if modules.len() == 1 {
+                format!("{base}.wasm")
+            } else {
+                format!("{base}.p{i}.wasm")
+            }
         };
         // A skipped object is translated only to advance `first_slot`, so every
         // OTHER object keeps the exact slots it has without the skip -- moving
@@ -746,10 +825,13 @@ fn build_closure(
         // loads where its pinned neighbours expect and its own slots -- left
         // empty in the closure -- are numbered off the plain translator.
         if !skipped {
-            std::fs::write(&file, &module.wasm).with_context(|| format!("writing {file}"))?;
-            if !no_validate {
-                gex_native::validate_module(&module.wasm)
-                    .with_context(|| format!("{file} is not valid wasm"))?;
+            for (i, module) in modules.iter().enumerate() {
+                let file = part_file(i);
+                std::fs::write(&file, &module.wasm).with_context(|| format!("writing {file}"))?;
+                if !no_validate {
+                    gex_native::validate_module(&module.wasm)
+                        .with_context(|| format!("{file} is not valid wasm"))?;
+                }
             }
         }
         // Neither the interpreter nor a root image is pinned: gex's loader
@@ -759,11 +841,17 @@ fn build_closure(
             pins.push_str(&format!("{:#x} {:#x} {}\n", o.image.bias, o.span, o.path));
         }
         // And which file holds which program's image, so the loader can tell
-        // a process the pages at `PIE_BASE` are or are not its own.
+        // a process the pages at `PIE_BASE` are or are not its own. A root image
+        // is `Own`/small, so it is always one part.
         if o.depth == 0 {
-            images.push_str(&format!("{} {}\n", file.rsplit('/').next().unwrap_or(&file), o.path));
+            let f = part_file(0);
+            images.push_str(&format!("{} {}\n", f.rsplit('/').next().unwrap_or(&f), o.path));
         }
-        first_slot = module.metadata().next_slot;
+        // The LAST part carries the cumulative page table (the parts are
+        // threaded), so its `next_slot` is where the next object begins.
+        first_slot = modules
+            .last()
+            .map_or(first_slot, |m| m.metadata().next_slot);
         if !skipped {
             blocks += stats.blocks;
             insts += stats.instructions;
@@ -775,7 +863,13 @@ fn build_closure(
             stats.blocks,
             stats.wasm_bytes / 1024,
             o.image.bias,
-            if skipped { "  (slots reserved; runtime-translated)" } else { "" },
+            if skipped {
+                "  (slots reserved; runtime-translated)".to_string()
+            } else if modules.len() > 1 {
+                format!("  ({} parts)", modules.len())
+            } else {
+                String::new()
+            },
         );
     }
     let pin_file = format!("{stem}.pins");

@@ -191,6 +191,39 @@ fn coherent_loads() -> bool {
         || COHERENT_LOADS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A single guest pc (block start) to plant a breakpoint call at, or 0.
+///
+/// Diagnostic: when the block heading `pc` is entered, translated code calls the
+/// `breakpoint` import with `BRK_TRAP_PC`, which dumps the live registers (x30
+/// names the caller) and RETURNS so execution carries on. Pointed at
+/// `__stack_chk_fail`, it names the function whose canary was smashed -- the one
+/// thing a downstream abort cannot recover. `GEX_TRAP_PC=0x50fbde0` natively or
+/// `gex_set_trap_pc` in the browser.
+static TRAP_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_trap_pc(pc: u64) {
+    TRAP_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn trap_pc() -> u64 {
+    static ENV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let e = *ENV.get_or_init(|| {
+        std::env::var("GEX_TRAP_PC")
+            .ok()
+            .and_then(|v| {
+                let v = v.trim();
+                let v = v.strip_prefix("0x").unwrap_or(v);
+                u64::from_str_radix(v, 16).ok()
+            })
+            .unwrap_or(0)
+    });
+    if e != 0 {
+        e
+    } else {
+        TRAP_PC.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Compile one GIR block into a wasm function body, plus the offsets of every
 /// immediate naming a local function.
 ///
@@ -203,6 +236,9 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     if check_sp() {
         e.emit_sp_check(block.start);
     }
+    if trap_pc() == block.start {
+        e.emit_trap_pc(block.start);
+    }
     run_one(&mut e, block);
     e.f.finish_with_relocs()
 }
@@ -211,6 +247,9 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx);
     if check_sp() {
         e.emit_sp_check(block.start);
+    }
+    if trap_pc() == block.start {
+        e.emit_trap_pc(block.start);
     }
     run_one(&mut e, block);
     e.f.finish()
@@ -717,6 +756,17 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(gex_abi::imports::BRK_BAD_SP);
         self.f.call(self.cx.breakpoint);
         self.f.end();
+    }
+
+    /// Unconditional breakpoint at a block's entry: call the host with
+    /// `BRK_TRAP_PC`, which dumps the live registers and returns so the block
+    /// runs on. The registers are still in the context here (nothing in this
+    /// block has cached them yet), so x30 names the caller. See `trap_pc`.
+    fn emit_trap_pc(&mut self, pc: u64) {
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(pc as i64);
+        self.f.i32_const(gex_abi::imports::BRK_TRAP_PC);
+        self.f.call(self.cx.breakpoint);
     }
 
     /// The local holding `r`, loading it from the context on first use.

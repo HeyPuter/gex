@@ -882,29 +882,34 @@ fn decode_simd_ldst_multi(raw: u32) -> Inst {
     }
 }
 
-/// `ld1`/`st1` on one lane, and `ld1r`. The lane index is scattered across Q,
-/// S and `size`, differently per element width.
+/// `ld1`/`st1`/`ld1r` and the interleaved single-lane forms `ld2`/`ld3`/`ld4`,
+/// `st2`/`st3`/`st4`, `ld2r`/`ld3r`/`ld4r`. The register count is `R:opcode<0>`
+/// plus one; `opcode<2:1>` gives the element width and the lane index is
+/// scattered across Q, S and `size`, differently per width.
 fn decode_simd_ldst_single(raw: u32) -> Inst {
     let q = bit(raw, 30) == 1;
     let post_index = bit(raw, 23) == 1;
     let load = bit(raw, 22) == 1;
-    // R selects the paired `ld2`/`ld2r` forms, which are not handled here.
-    if bit(raw, 21) != 0 {
-        return Inst::Unknown { raw };
-    }
+    let r = bit(raw, 21);
     let rm = bits(raw, 20, 16);
     let opcode = bits(raw, 15, 13);
     let s = bit(raw, 12);
     let size = bits(raw, 11, 10);
     let qb = q as u32;
+    // One to four consecutive registers: `st1`/`ld1` and `ld1r` are one,
+    // `st4`/`ld4`/`ld4r` are four. `opcode<0>` counts the low bit, `R` the high.
+    let regs = ((r << 1 | (opcode & 1)) + 1) as u8;
 
-    let (lane_bytes, index, replicate) = match opcode {
-        0b000 => (1, qb << 3 | s << 2 | size, false),
-        0b010 if size & 1 == 0 => (2, qb << 2 | s << 1 | (size >> 1), false),
-        0b100 if size == 0b00 => (4, qb << 1 | s, false),
-        0b100 if size == 0b01 && s == 0 => (8, qb, false),
-        // `ld1r`, which has no index: `size` is simply the element width.
-        0b110 if load => (1 << size, 0, true),
+    // `opcode<2:1>` selects the element width; the replicating forms are the
+    // `11` group and load only.
+    let (lane_bytes, index, replicate) = match opcode >> 1 {
+        0b00 => (1, qb << 3 | s << 2 | size, false),
+        0b01 if size & 1 == 0 => (2, qb << 2 | s << 1 | (size >> 1), false),
+        0b10 if size == 0b00 => (4, qb << 1 | s, false),
+        0b10 if size == 0b01 && s == 0 => (8, qb, false),
+        // `ld1r`/`ld2r`/`ld3r`/`ld4r`, which have no index: `size` is simply
+        // the element width.
+        0b11 if load && s == 0 => (1 << size, 0, true),
         _ => return Inst::Unknown { raw },
     };
     if !post_index && rm != 0 {
@@ -912,12 +917,12 @@ fn decode_simd_ldst_single(raw: u32) -> Inst {
     }
     let rn = RegSel::sp(bits(raw, 9, 5));
     let addr = if post_index {
-        // Rm == 31 is the immediate form (advance by the element size); any
-        // other register holds the amount.
+        // Rm == 31 is the immediate form (advance by the total transfer size:
+        // one lane per register); any other register holds the amount.
         if rm == 0b11111 {
             AddrMode::PostIndex {
                 rn,
-                off: lane_bytes as i64,
+                off: lane_bytes as i64 * regs as i64,
             }
         } else {
             AddrMode::PostIndexReg {
@@ -931,6 +936,7 @@ fn decode_simd_ldst_single(raw: u32) -> Inst {
     Inst::VLoadStoreLane {
         load,
         replicate,
+        regs,
         lane_bytes,
         index,
         q,
@@ -1849,9 +1855,14 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
         return Inst::Undefined { raw };
     };
     let op = match (opcode, u) {
+        (0b00000, 0) => VOp3::SHAdd,
+        (0b00000, _) => VOp3::UHAdd,
         (0b00001, 0) => VOp3::SqAdd,
         (0b00001, _) => VOp3::UqAdd,
+        (0b00010, 0) => VOp3::SrHAdd,
         (0b00010, 1) => VOp3::UrHAdd,
+        (0b00100, 0) => VOp3::SHSub,
+        (0b00100, _) => VOp3::UHSub,
         (0b00101, 0) => VOp3::SqSub,
         (0b00101, _) => VOp3::UqSub,
         (0b00110, 0) => VOp3::CmGt,
@@ -2925,6 +2936,71 @@ mod tests {
                 assert_eq!(rd, RegSel::Gp(1));
                 assert_eq!(target, 0xa90);
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn simd_ldst_single_interleaved() {
+        // st4 {v2.s, v3.s, v4.s, v5.s}[0], [x1]  (the widget-factory gap)
+        assert_eq!(
+            d(0x0d20a022),
+            Inst::VLoadStoreLane {
+                load: false,
+                replicate: false,
+                regs: 4,
+                lane_bytes: 4,
+                index: 0,
+                q: false,
+                vt: VReg(2),
+                addr: AddrMode::Offset { rn: RegSel::sp(1), off: 0 },
+            }
+        );
+        // ld1 {v0.s}[0], [x0] stays a single register.
+        match d(0x0d408000) {
+            Inst::VLoadStoreLane { load, regs, lane_bytes, .. } => {
+                assert!(load);
+                assert_eq!(regs, 1);
+                assert_eq!(lane_bytes, 4);
+            }
+            other => panic!("{other:?}"),
+        }
+        // ld4r {v0.4s, v1.4s, v2.4s, v3.4s}, [x0] replicates four registers.
+        match d(0x0d60e800) {
+            Inst::VLoadStoreLane { load, replicate, regs, .. } => {
+                assert!(load);
+                assert!(replicate);
+                assert_eq!(regs, 4);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn simd_halving_add() {
+        // uhadd v0.8b, v0.8b, v20.8b  (the widget-factory gap)
+        match d(0x2e340400) {
+            Inst::VThreeSame { op, .. } => assert_eq!(op, VOp3::UHAdd),
+            other => panic!("{other:?}"),
+        }
+        // shadd v0.8b, v0.8b, v20.8b
+        match d(0x0e340400) {
+            Inst::VThreeSame { op, .. } => assert_eq!(op, VOp3::SHAdd),
+            other => panic!("{other:?}"),
+        }
+        // srhadd v0.8b, v0.8b, v20.8b (opcode 0b00010, U=0)
+        match d(0x0e341400) {
+            Inst::VThreeSame { op, .. } => assert_eq!(op, VOp3::SrHAdd),
+            other => panic!("{other:?}"),
+        }
+        // shsub v0.8b, v0.8b, v18.8b  (0b00100, U=0)
+        match d(0x0e322400) {
+            Inst::VThreeSame { op, .. } => assert_eq!(op, VOp3::SHSub),
+            other => panic!("{other:?}"),
+        }
+        // uhsub v8.8h, v17.8h, v21.8h (0b00100, U=1)
+        match d(0x6e752628) {
+            Inst::VThreeSame { op, .. } => assert_eq!(op, VOp3::UHSub),
             other => panic!("{other:?}"),
         }
     }

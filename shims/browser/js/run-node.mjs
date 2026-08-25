@@ -237,6 +237,9 @@ const host = new ProcessHost({
     // the host flips the switch via gex_set_wl_trace in the worker).
     wlTrace: process.env.GEX_WL_TRACE ? 1 : undefined,
     attachTrace: !!process.env.GEX_ATTACH_TRACE,
+    // GEX_LAZY_THREAD: spawned threads register the process's modules lazily
+    // (instance on first branch) instead of installing them all up front.
+    lazyThread: !!process.env.GEX_LAZY_THREAD,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
     // GEX_HEARTBEAT: say where the guest is every N safepoints and every 200
     // dispatch misses, so a slow run can be told from a stuck one.
@@ -264,6 +267,14 @@ const host = new ProcessHost({
     // plain wasm load across a guest fence). Tests whether the GTK startup race
     // is plain-load coherence at the PLAN 5.8 boundary. Default off.
     coherentLoads: !!process.env.GEX_COHERENT_LOADS,
+    // GEX_SP_GUARD: at each safepoint, catch a worker thread whose SP has strayed
+    // into the MAIN thread's stack (it would smash a canary the main thread only
+    // detects later -- the complex-Qt/designer stack smash). Loud when it fires.
+    spGuard: !!process.env.GEX_SP_GUARD,
+    // GEX_TRAP_PC=0xADDR: plant a diagnostic breakpoint at that guest pc that
+    // dumps the live registers (x30 = caller) and continues. Aimed at
+    // __stack_chk_fail to name the smashed function.
+    trapPc: process.env.GEX_TRAP_PC || 0,
     // GEX_PREGROW: grow guest memory to a large floor up front so runtime
     // memory.grow stops during startup -- probes the stale-bound-after-grow race.
     pregrow: !!process.env.GEX_PREGROW,
