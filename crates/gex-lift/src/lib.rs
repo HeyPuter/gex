@@ -3353,6 +3353,52 @@ impl<'a> Lifter<'a> {
                 }
                 Flow::Next
             }
+            VOp2::SqXtn | VOp2::UqXtn | VOp2::SqXtun => {
+                let wide = VArr {
+                    lane_bytes: arr.lane_bytes * 2,
+                    q: true,
+                    float: false,
+                    scalar: false,
+                };
+                // WebAssembly has signed->signed and unsigned->unsigned
+                // saturating narrows. SQXTUN's signed->unsigned spelling is
+                // the latter after signed-clamping negative lanes to zero.
+                let source = if op == VOp2::SqXtun {
+                    let zero = self.b.def(Expr::VConst(Box::new([0; 16])));
+                    self.b.def(Expr::VLaneBin {
+                        op: VLaneBinOp::MaxS,
+                        lane: Self::lane_of(wide),
+                        a,
+                        b: zero,
+                    })
+                } else {
+                    a
+                };
+                let packed = self.b.def(Expr::VCvt {
+                    op: VCvtOp::NarrowSat { signed: op == VOp2::SqXtn },
+                    from: Self::lane_of(wide),
+                    a: source,
+                    b: Some(source),
+                });
+                if arr.q {
+                    let old = self.b.read(GuestReg::V128(vd.0));
+                    let mut merge = [0u8; 16];
+                    for i in 0..8 {
+                        merge[i] = i as u8;
+                        merge[i + 8] = (16 + i) as u8;
+                    }
+                    let r = self.b.def(Expr::VShuffle {
+                        a: old,
+                        b: packed,
+                        lanes: Box::new(merge),
+                    });
+                    self.b.write(GuestReg::V128(vd.0), r);
+                } else {
+                    let v = self.narrow_to_64(packed, false);
+                    self.b.write(GuestReg::V128(vd.0), v);
+                }
+                Flow::Next
+            }
             _ => Flow::End(Term::Illegal { raw: self.raw, pc }),
         }
     }

@@ -141,11 +141,11 @@ const busybox = {
   network: false,
 
   async enter(ctx) {
-    ctx.actions([{ label: 'Boot', primary: true, id: 'boot', onClick: () => boot(ctx) }]);
+    ctx.actions([{ label: 'Run', primary: true, id: 'boot', onClick: () => boot(ctx) }]);
     ctx.hint('a real shell: try `ls -l /bin`, `stty -a`, `echo hi | wc -c`, ^C');
     ctx.term.writeln('A BusyBox rootfs, about 1 MB, unpacked into an in-memory filesystem.');
     ctx.term.writeln('');
-    ctx.term.writeln(ctx.ansi.dim('Press Boot. The first command is slow -- the whole binary has'));
+    ctx.term.writeln(ctx.ansi.dim('Press Run. The first command is slow -- the whole binary has'));
     ctx.term.writeln(ctx.ansi.dim('to be translated -- and everything after it is not.'));
     ctx.term.writeln('');
   },
@@ -240,7 +240,7 @@ const debian = {
 
   async enter(ctx) {
     ctx.actions([
-      { label: 'Boot', primary: true, id: 'dboot', onClick: () => bootDebian(ctx) },
+      { label: 'Run', primary: true, id: 'dboot', onClick: () => bootDebian(ctx) },
       { label: 'Wisp endpoint…', onClick: () => setWisp(ctx) },
     ]);
     ctx.hint(`network: ${wispUrl() || 'not set'}`);
@@ -479,17 +479,11 @@ const gears = {
       } finally {
         running(false);
         ctx.idle();
-        ctx.actions([
-          { label: 'Draw 30 frames', primary: true, onClick: () => start(30) },
-          { label: 'Draw 200', onClick: () => start(200) },
-        ]);
+        ctx.actions([{ label: 'Run', primary: true, onClick: () => start(200) }]);
       }
     };
 
-    ctx.actions([
-      { label: 'Draw 30 frames', primary: true, onClick: () => start(30) },
-      { label: 'Draw 200', onClick: () => start(200) },
-    ]);
+    ctx.actions([{ label: 'Run', primary: true, onClick: () => start(200) }]);
     ctx.hint('every GL call crosses to this page and runs on WebGL');
 
     // `?frames=N` starts it straight away, so a link can carry the demo.
@@ -515,6 +509,7 @@ const virglGears = {
     const wrap = document.createElement('div');
     wrap.className = 'canvas-wrap';
     const canvas = document.createElement('canvas');
+    canvas.id = 'gex-virgl';
     canvas.width = 300;
     canvas.height = 300;
     wrap.append(canvas);
@@ -556,8 +551,7 @@ const virglGears = {
     // The budget has to clear the cold start: the first frame is ~40s in, so a
     // 30s run ends with a blank canvas and code 124 that reads as a failure.
     const gearsButtons = (go) => [
-      { label: 'Draw for 90s', primary: true, onClick: () => go(90) },
-      { label: 'Draw for 5 minutes', onClick: () => go(300) },
+      { label: 'Run', primary: true, onClick: () => go(300) },
     ];
 
     const start = async (seconds) => {
@@ -575,6 +569,13 @@ const virglGears = {
         globalThis.__gexGlState = () => {
           try {
             return renderer.glState();
+          } catch {
+            return '';
+          }
+        };
+        globalThis.__gexGlCommands = () => {
+          try {
+            return renderer.commands();
           } catch {
             return '';
           }
@@ -768,8 +769,8 @@ const waylandGears = {
     // and the native-GL client present on `wlCanvas`. The other is moved
     // off-screen (kept full-size and rendering) so only one window ever shows.
     const canvas = document.createElement('canvas');
-    canvas.width = 300;
-    canvas.height = 300;
+    canvas.width = demo.canvasWidth || 300;
+    canvas.height = demo.canvasHeight || 300;
     wrap.append(canvas);
     document.getElementById('terminal')?.before(wrap);
     ctx.onLeave(() => wrap.remove());
@@ -847,6 +848,13 @@ const waylandGears = {
         globalThis.__gexGlState = () => {
           try {
             return renderer.glState();
+          } catch {
+            return '';
+          }
+        };
+        globalThis.__gexGlCommands = () => {
+          try {
+            return renderer.commands();
           } catch {
             return '';
           }
@@ -1022,6 +1030,10 @@ const waylandGears = {
           .map((k) => `${k}=${/=(\d+)/.exec(gl.slice(gl.indexOf(k)))?.[1] ?? '?'}`)
           .join(' ');
         ctx.term.writeln(ctx.ansi.dim(`  ${nums}`));
+        ctx.term.writeln(ctx.ansi.dim(`  ${gl}`));
+        for (const part of renderer.commands().split('|')) {
+          ctx.term.writeln(ctx.ansi.dim(`  ${part.trim()}`));
+        }
         ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
       } catch (e) {
         failed(ctx, e);
@@ -1029,28 +1041,30 @@ const waylandGears = {
         running(false);
         ctx.idle();
         ctx.actions(demo.actions?.(start) || [
-          { label: 'Run for 90s', primary: true, onClick: () => start(90) },
-          { label: 'Run for 5 minutes', onClick: () => start(300) },
+          { label: 'Run', primary: true, onClick: () => start(300) },
         ]);
       }
     };
 
     ctx.actions(demo.actions?.(start) || [
-      { label: 'Run for 90s', primary: true, onClick: () => start(90) },
-      { label: 'Run for 5 minutes', onClick: () => start(300) },
+      { label: 'Run', primary: true, onClick: () => start(300) },
     ]);
     ctx.hint(demo.hint || app.label);
   },
 };
 
 const stkVideoOptions =
-  '--screensize=300x300 --windowed --disable-hd-textures --disable-dynamic-lights ' +
+  '--screensize=640x480 --windowed --disable-hd-textures --disable-dynamic-lights ' +
   '--disable-glow --disable-bloom --disable-light-shaft --disable-dof --disable-particles ' +
   '--disable-animated-characters --disable-motion-blur --disable-mlaa --disable-ssao ' +
   '--disable-ibl --shadows=0 --anisotropic=0';
 const stkRace =
   `/usr/games/supertuxkart --race-now --track=snowtuxpeak --kart=tux ` +
   `--numkarts=1 --laps=1 ${stkVideoOptions}`;
+const stkPlay = `/usr/games/supertuxkart ${stkVideoOptions}`;
+const stkLaunch = new URLSearchParams(location.search).has('stkprofile')
+  ? `${stkRace} --profile-time=5`
+  : stkPlay;
 
 // The real application workload for the complete browser graphics pipeline.
 // It shares the Wayland implementation above, but carries its own rootfs and
@@ -1062,27 +1076,28 @@ const supertuxkart = {
     'Run the AArch64 SuperTuxKart package through gex-wayland, Xwayland, Mesa virgl, and ' +
     'virglrenderer into WebGL in this browser.',
   network: false,
-  rootfs: '/rootfs/stk.tar',
+  // Match STK's framebuffer, Xwayland's advertised output, and the displayed
+  // canvas one-for-one instead of rendering tiny and stretching in CSS.
+  canvasWidth: 640,
+  canvasHeight: 480,
+  // Version the generated image so a persistent browser does not reuse an
+  // earlier over-trimmed tar that lacked the track and kart materials.
+  rootfs: '/rootfs/stk.tar?v=snowpeak18',
   env:
     'IRR_DEVICE_TYPE=x11;SUPERTUXKART_DATADIR=/usr/share/games/supertuxkart;' +
     'ALSOFT_DRIVERS=null;MESA_GLSL_CACHE_DISABLE=1;MESA_GL_VERSION_OVERRIDE=3.3;' +
-    'MESA_GLSL_VERSION_OVERRIDE=330;JSIMD_FORCENONE=1',
-  client: `${stkRace} --profile-time=5`,
+    'MESA_GLSL_VERSION_OVERRIDE=330;JSIMD_FORCENONE=1;' +
+    'LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgex-stk-sdl.so',
+  // Auto-run is playable by default. The harness adds ?stkprofile=1 for its
+  // finite benchmark run without exposing profiling controls in the demo UI.
+  client: stkLaunch,
   intro: [
     'SuperTuxKart is running as an AArch64 X11 application inside this page:',
     'Xwayland -> gex-wayland, Mesa virgl -> virglrenderer -> browser WebGL.',
   ],
   hint: 'SuperTuxKart, Xwayland, and Mesa virgl in a real browser',
   actions: (start) => [
-    {
-      label: 'Run FPS profile',
-      primary: true,
-      onClick: () => start(90, { noTimeout: true }),
-    },
-    {
-      label: 'Play for 5 minutes',
-      onClick: () => start(300, { client: stkRace }),
-    },
+    { label: 'Run', primary: true, onClick: () => start(300, { client: stkLaunch }) },
   ],
   enter: waylandGears.enter,
 };

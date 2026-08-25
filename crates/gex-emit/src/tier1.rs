@@ -1829,11 +1829,6 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Take the f64 on the stack into a fresh local and leave it there.
-    fn tee_f64(&mut self, l: u32) {
-        self.f.local_tee(l);
-    }
-
     /// Single precision: the product of two f32 is exact in f64, so only the
     /// sum can round, and round-to-odd stops the narrowing from breaking a
     /// tie the wrong way. No guard is needed.
@@ -1844,7 +1839,7 @@ impl<'a> Emitter<'a> {
             self.f.add_local(ValType::F64),
         );
         // Each operand arrives as f32 bits in the low half of an i64.
-        let mut widen = |me: &mut Self, v: Value| {
+        let widen = |me: &mut Self, v: Value| {
             me.push(v);
             me.f.byte(0xa7); // i32.wrap_i64
             me.f.byte(0xbe); // f32.reinterpret_i32
@@ -1853,19 +1848,22 @@ impl<'a> Emitter<'a> {
         widen(self, args[0]);
         widen(self, args[1]);
         self.f.byte(0xa2); // f64.mul -- exact
-        self.tee_f64(pl);
+        self.f.local_set(pl);
+        self.f.local_get(pl);
         widen(self, args[2]);
         self.f.byte(0xa0); // f64.add
-        self.tee_f64(sl);
+        self.f.local_set(sl);
 
         // t = (p - (s - bb)) + (c - bb), where bb = s - p.
-        self.f.local_get(pl);
         self.f.local_get(sl);
         self.f.local_get(pl);
         self.f.byte(0xa1); // bb = s - p
         let bb = self.f.add_local(ValType::F64);
-        self.f.local_tee(bb);
-        // stack: p, s, bb -> p - (s - bb)
+        self.f.local_set(bb);
+
+        self.f.local_get(pl);
+        self.f.local_get(sl);
+        self.f.local_get(bb);
         self.f.byte(0xa1); // s - bb
         self.f.byte(0xa1); // p - (s - bb)
         widen(self, args[2]);

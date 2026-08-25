@@ -8,26 +8,13 @@
   </head>
   <body>
     <div id="app">
-      <aside class="rail">
-        <div class="brand">
-          <span class="mark">▚</span>
-          <div>
-            <h1>gex</h1>
-            <p>AArch64 Linux, recompiled to WebAssembly</p>
-          </div>
-        </div>
-
-        <nav id="demos"></nav>
-
-        <div class="rail-foot">
-          <div class="stat"><span>engine</span><b id="stat-engine">—</b></div>
-          <div class="stat"><span>translated</span><b id="stat-blocks">—</b></div>
-          <div class="stat"><span>network</span><b id="stat-net">off</b></div>
-        </div>
-      </aside>
+      <header class="site-header">
+        <h1>gex</h1>
+        <p>AArch64 Linux programs, recompiled to WebAssembly and run in your browser.</p>
+      </header>
 
       <main>
-        <header>
+        <header class="demo-header">
           <div>
             <h2 id="demo-title">—</h2>
             <p id="demo-blurb"></p>
@@ -39,18 +26,24 @@
           <div id="terminal"></div>
           <div id="overlay" class="overlay hidden">
             <div class="overlay-card">
-              <div class="spinner"></div>
               <p id="overlay-text">working</p>
             </div>
           </div>
         </section>
 
-        <footer>
+        <footer class="status-line">
           <span id="status">ready</span>
-          <span class="spacer"></span>
           <span class="hint" id="hint"></span>
+          <span>engine: <b id="stat-engine">—</b></span>
+          <span>translated: <b id="stat-blocks">—</b></span>
+          <span>network: <b id="stat-net">off</b></span>
         </footer>
       </main>
+
+      <nav aria-label="Demos">
+        <h2>Demos</h2>
+        <ol id="demos"></ol>
+      </nav>
     </div>
     <script type="module" src="/src/main.js"></script>
   </body>

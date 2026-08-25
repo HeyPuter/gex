@@ -178,7 +178,6 @@ static struct vtest_input gex_input = {.read = gex_input_read};
  */
 static GLuint gex_blit_fbo;
 static int gex_presented;
-static unsigned gex_submit_present_seq;
 
 /* Why a readback did not become a picture. A blank canvas has several
  * causes that look identical from outside -- the guest never read back, it
@@ -187,6 +186,8 @@ static unsigned gex_submit_present_seq;
  * costs four words and turns a day of guessing into a glance. */
 static int gex_present_no_info, gex_present_no_tex, gex_present_small,
     gex_present_incomplete, gex_present_no_handle;
+static int gex_submit_present_calls, gex_submit_present_fb0,
+    gex_submit_present_small;
 /* Presents whose source texture had a pixel in it, and the brightest byte
  * ever seen. `presented` counts blits, which is not the same thing: a
  * renderer that draws nothing still blits, and the canvas stays black while
@@ -217,6 +218,11 @@ static void gex_present(uint32_t handle) {
 
     int w, h;
     emscripten_get_canvas_element_size("#gex-gl", &w, &h);
+    /* Xwayland also reads pixmaps and intermediate targets. Only a surface
+     * matching the output can be the completed application window. */
+    if (info.width != (uint32_t)w || info.height != (uint32_t)h) {
+        return;
+    }
     if (!gex_blit_fbo) glGenFramebuffers(1, &gex_blit_fbo);
 
     GLint draw_fbo = 0, read_fbo = 0;
@@ -229,15 +235,11 @@ static void gex_present(uint32_t handle) {
     if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDisable(GL_SCISSOR_TEST);
-        /* A look at what is about to be blitted, from the middle of it. Four
-         * hundred pixels is enough to tell a picture from a black rectangle
-         * and small enough to cost nothing at thirty frames a second. */
-        /* Not every frame. `glReadPixels` waits for the GPU, and a stall per
-         * present is a real cost for a number whose whole job is to say
-         * whether anything is ever drawn. The first few answer that, and one
-         * in sixty-four keeps answering it. */
+        /* Probe once to distinguish a lit frame from a black presentation.
+         * Even a tiny glReadPixels synchronizes the whole WebGL pipeline; a
+         * recurring diagnostic probe showed up as a GPU stall in gameplay. */
         static int seen;
-        if (seen < 8 || seen % 64 == 0) {
+        if (seen == 0) {
         unsigned char px[20 * 20 * 4];
         GLint sx = (GLint)info.width / 2 - 10, sy = (GLint)info.height / 2 - 10;
         if (sx < 0) sx = 0;
@@ -252,7 +254,7 @@ static void gex_present(uint32_t handle) {
         }
         seen++;
         glBlitFramebuffer(0, 0, (GLint)info.width, (GLint)info.height,
-                          0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                          0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
         gex_presented++;
     } else {
         gex_present_incomplete++;
@@ -273,24 +275,31 @@ static void gex_present(uint32_t handle) {
  * Upside down for the same reason as gex_present: GL is bottom-left, the canvas
  * top-left. */
 static void gex_present_current(void) {
+    gex_submit_present_calls++;
     GLint fb = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
     GLint vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, vp);
-    GLenum st = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
-    if (fb == 0) return; /* default framebuffer holds nothing of the guest's */
-    if (vp[2] < 64 || vp[3] < 64) return; /* a scratch pass, not a window */
+    if (fb == 0) { /* default framebuffer holds nothing of the guest's */
+        gex_submit_present_fb0++;
+        return;
+    }
+    if (vp[2] < 64 || vp[3] < 64) { /* a scratch pass, not a window */
+        gex_submit_present_small++;
+        return;
+    }
 
     int w, h;
     emscripten_get_canvas_element_size("#gex-gl", &w, &h);
-    if (st != GL_FRAMEBUFFER_COMPLETE)
-        return;
+    /* virglrenderer created and validated this draw target before submitting
+     * it. Rechecking framebuffer completeness here is a synchronous WebGL
+     * query in a per-frame hot path and has never rejected a target. */
     glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
 
     static int seen;
-    if (seen < 8 || seen % 64 == 0) {
+    if (seen == 0) {
         unsigned char px[20 * 20 * 4];
         GLint sx = vp[0] + vp[2] / 2 - 10, sy = vp[1] + vp[3] / 2 - 10;
         if (sx < 0) sx = 0;
@@ -305,7 +314,7 @@ static void gex_present_current(void) {
     }
     seen++;
     glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
-                      0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                      0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     gex_presented++;
     /* Put the guest's framebuffer back as both bindings; virglrenderer expects
      * to find its own target still current. */
@@ -427,10 +436,10 @@ int gex_virgl_init(int width, int height) {
     attr.depth = true;
     attr.stencil = true;
     attr.antialias = false;
-    /* The guest reads its pixels back through TRANSFER_GET rather than
-     * looking at the canvas, so the default framebuffer must survive being
-     * read after the frame is submitted. */
-    attr.preserveDrawingBuffer = true;
+    /* Readback is from the guest resource/FBO before it is blitted here. The
+     * browser's default framebuffer is presentation-only and can be discarded
+     * after compositing; preserving it forces an unnecessary full-frame copy. */
+    attr.preserveDrawingBuffer = false;
     attr.explicitSwapControl = false;
 
     emscripten_set_canvas_element_size("#gex-gl", width, height);
@@ -580,18 +589,8 @@ int gex_virgl_pump(int sid) {
     if (s->ctx) {
         vtest_poll_context(s->ctx);
     }
-    /* If the guest submitted a batch but never asks to read it back (the EGL/
-     * Wayland swap path, unlike the X server's TRANSFER_GET), put what it just
-     * drew on the canvas ourselves. */
     if (submitted) {
-        /* A GL client commonly submits more often than the display can show.
-         * Mirroring every submit forces an extra framebuffer blit (and a GPU
-         * flush) into the guest's render loop.  Decouple rendering from page
-         * presentation by showing every second completed submit: the canvas
-         * remains a live, playable 30+ Hz view while the guest can run at its
-         * own rate. */
-        if ((gex_submit_present_seq++ & 1u) == 0)
-            gex_present_current();
+        gex_present_current();
     }
     return ran;
 }
@@ -656,10 +655,11 @@ const char *gex_virgl_commands(void) {
     }
     snprintf(out + at, sizeof out - at,
              "%sdropped: no_handle=%d no_info=%d no_tex=%d small=%d incomplete=%d "
-             "last=%ux%u",
+             "last=%ux%u | submit_present: calls=%d fb0=%d small=%d",
              at ? " | " : "", gex_present_no_handle, gex_present_no_info,
              gex_present_no_tex, gex_present_small, gex_present_incomplete,
-             gex_present_last_w, gex_present_last_h);
+             gex_present_last_w, gex_present_last_h, gex_submit_present_calls,
+             gex_submit_present_fb0, gex_submit_present_small);
     return out;
 }
 

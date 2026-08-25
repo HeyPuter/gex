@@ -579,7 +579,7 @@ export async function runProgram(
   // are echoed and line-buffered is the guest's choice, read from its termios.
   const keys = term.onData((d) => tenv.onKey(d));
   // xterm hears the keyboard only through a hidden textarea that must hold
-  // focus; the Boot button disables itself and drops focus to the body, so
+  // focus; the Run button disables itself and drops focus to the body, so
   // without this a program would ignore every key until the terminal was
   // clicked.
   term.focus?.();

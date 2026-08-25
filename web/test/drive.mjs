@@ -78,16 +78,22 @@ const DEMOS = {
 };
 
 // Dispatched in the page by `--input`: synthetic mouse and keyboard on the
-// compositor canvas (`#gex-wl`), the same DOM events a real user would make, so
+// visible Wayland/virgl canvas, the same DOM events a real user would make, so
 // `attachWlInput`'s listeners fire and fill the input ring. Coordinates are
 // element-relative; the keys are `KeyboardEvent.code`s the evdev table maps.
 const INJECT_JS = `(() => {
-  const cv = document.getElementById('gex-wl');
-  if (!cv) return 'no #gex-wl canvas';
+  const cv = document.querySelector('.canvas-wrap canvas:not(.wl-offscreen)');
+  if (!cv) return 'no visible app canvas';
   cv.focus?.();
   const r = cv.getBoundingClientRect();
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
   const move = (x, y) => cv.dispatchEvent(new MouseEvent('mousemove', { clientX: x, clientY: y, bubbles: true }));
+  // Keys first: requiring two delivered events below then proves a modifier
+  // update and an actual key reached the client, not merely a pointer move.
+  for (const code of ['ArrowUp', 'ArrowLeft', 'KeyA', 'ArrowRight', 'ArrowDown']) {
+    cv.dispatchEvent(new KeyboardEvent('keydown', { code, bubbles: true }));
+    cv.dispatchEvent(new KeyboardEvent('keyup', { code, bubbles: true }));
+  }
   // A grid sweep over the WHOLE element, so the surface-mapped pointer visits
   // every region -- a window in a corner (xeyes) is reached as surely as one in
   // the middle (gears).
@@ -96,10 +102,6 @@ const INJECT_JS = `(() => {
       move(r.left + (r.width * gx) / 6, r.top + (r.height * gy) / 6);
   cv.dispatchEvent(new MouseEvent('mousedown', { button: 0, clientX: cx, clientY: cy, bubbles: true }));
   cv.dispatchEvent(new MouseEvent('mouseup', { button: 0, clientX: cx, clientY: cy, bubbles: true }));
-  for (const code of ['ArrowUp', 'ArrowLeft', 'KeyA', 'ArrowRight', 'ArrowDown']) {
-    cv.dispatchEvent(new KeyboardEvent('keydown', { code, bubbles: true }));
-    cv.dispatchEvent(new KeyboardEvent('keyup', { code, bubbles: true }));
-  }
   return 'dispatched';
 })()`;
 
@@ -532,14 +534,16 @@ async function runDemo(o) {
             { expression: INJECT_JS, returnByValue: true },
             page,
           );
-          if (injectCount === 1) log(`  input: ${r?.result?.value ?? '?'} on #gex-wl`);
+          if (injectCount === 1) log(`  input: ${r?.result?.value ?? '?'} on visible canvas`);
         } catch {
           /* a transient eval failure just means we try again next tick */
         }
       }
       // The shim's delivery trace comes through the guest terminal (`term`),
       // not the console, so match there.
-      inputConfirmed ||= /\[wl\] delivered \d+ input/.test(term);
+      inputConfirmed ||=
+        [...term.matchAll(/\[wl\] delivered (\d+) input/g)]
+          .reduce((n, m) => n + Number(m[1]), 0) >= 2;
       // The input goal is met while the client is still up: it is drawing
       // (frames) and the compositor's trace confirms an event reached it. Don't
       // wait for `want` (which needs the exit-time `lit=` line) -- that would
@@ -626,6 +630,26 @@ async function runDemo(o) {
   }
 
   const finalTerm = printed.replace(/\n+$/, '');
+  try {
+    const r = await capped(
+      browser.send(
+        'Runtime.evaluate',
+        {
+          expression:
+            'JSON.stringify({state:globalThis.__gexGlState?.()??"",commands:globalThis.__gexGlCommands?.()??""})',
+          returnByValue: true,
+        },
+        page,
+      ),
+      10_000,
+      'renderer diagnostics',
+    );
+    const diagnostics = JSON.parse(r?.result?.value || '{}');
+    if (diagnostics.state) console.log(`\n---- renderer state ----\n  ${diagnostics.state}`);
+    if (diagnostics.commands) console.log(`  ${diagnostics.commands}`);
+  } catch {
+    /* A dead renderer cannot report diagnostics. */
+  }
   console.log('\n---- guest terminal (tail) ----');
   console.log(
     finalTerm.split('\n').slice(-40).map((l) => `  | ${l}`).join('\n') || '  (empty)',

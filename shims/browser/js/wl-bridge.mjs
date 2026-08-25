@@ -243,6 +243,11 @@ export function attachWlInput(canvas, channel, now = () => performance.now()) {
   canvas.addEventListener('contextmenu', onCtx);
   canvas.addEventListener('keydown', onDownKey);
   canvas.addEventListener('keyup', onUpKey);
+  // The graphics demos launch from a button or an auto-run URL while the
+  // terminal's hidden textarea still owns focus. Give the newly attached app
+  // keyboard focus immediately; a later terminal click can still take it
+  // back, and clicking the canvas restores it through onDown above.
+  canvas.focus({ preventScroll: true });
   return () => {
     canvas.removeEventListener('mousemove', onMove);
     canvas.removeEventListener('mousedown', onDown);

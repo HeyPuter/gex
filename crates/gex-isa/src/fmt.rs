@@ -1134,7 +1134,7 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 return format!("{m} {}, {}, #0.0", areg(vd, arr), areg(vn, arr));
             }
             // The narrowing forms name the wider source arrangement.
-            if matches!(op, VOp2::Xtn | VOp2::SqXtn | VOp2::UqXtn) {
+            if matches!(op, VOp2::Xtn | VOp2::SqXtn | VOp2::UqXtn | VOp2::SqXtun) {
                 let wide = VArr {
                     lane_bytes: arr.lane_bytes * 2,
                     q: true,
@@ -1773,6 +1773,7 @@ fn vop2_name(op: VOp2) -> &'static str {
         VOp2::Xtn => "xtn",
         VOp2::SqXtn => "sqxtn",
         VOp2::UqXtn => "uqxtn",
+        VOp2::SqXtun => "sqxtun",
     }
 }
 

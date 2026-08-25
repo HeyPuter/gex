@@ -143,7 +143,7 @@ const ctx = {
       b.className = `act${a.primary ? ' primary' : ''}`;
       b.textContent = a.label;
       // Hand the keyboard back to the terminal: a button that disables itself
-      // (the Boot buttons do) drops focus to the body, where keystrokes go
+      // (a Run button does) drops focus to the body, where keystrokes go
       // nowhere.
       b.onclick = (ev) => {
         const r = a.onClick(ev);
@@ -196,15 +196,19 @@ async function select(demo) {
 }
 
 const nav = $('demos');
-DEMOS.forEach((d, i) => {
-  const b = document.createElement('button');
-  b.className = 'demo';
-  b.dataset.id = d.id;
-  b.innerHTML = `<span class="n">${String(i + 1).padStart(2, '0')}</span><span class="t"></span><span class="d"></span>`;
-  b.querySelector('.t').textContent = d.title;
-  b.querySelector('.d').textContent = d.blurb;
-  b.onclick = () => select(d);
-  nav.append(b);
+DEMOS.forEach((d) => {
+  const item = document.createElement('li');
+  const link = document.createElement('a');
+  link.className = 'demo';
+  link.dataset.id = d.id;
+  link.href = `#${d.id}`;
+  link.textContent = d.title;
+  link.onclick = (event) => {
+    event.preventDefault();
+    select(d);
+  };
+  item.append(link);
+  nav.append(item);
 });
 
 // -- start ----------------------------------------------------------------
@@ -301,11 +305,9 @@ for (const [event, describe] of [
   const asked = params.get('demo') || location.hash.slice(1);
   const want = DEMOS.find((d) => d.id === asked) || DEMOS[0];
   await select(want);
-  // `?run=1` presses the demo's own first button, so a test can drive the page
-  // without reaching inside it. `?run=N` for N>1 presses the N-th action button
-  // instead -- e.g. `run=2` on the gears demos is "Draw for 5 minutes", the
-  // budget a cold Mesa start needs when translation makes the first frame far
-  // more than the usual forty seconds away.
+  // `?run=1` presses the demo's Run button so a test can drive the page without
+  // reaching inside it. The numeric form still supports demos with multiple
+  // non-run actions, but runtime budgets belong to the harness, not the UI.
   const runN = params.get('run');
   if (runN) {
     const idx = Math.max(1, parseInt(runN, 10) || 1) - 1;

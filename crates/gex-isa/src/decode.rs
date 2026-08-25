@@ -2005,6 +2005,7 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
         (0b01011, 0) => VOp2::Abs,
         (0b01011, _) => VOp2::Neg,
         (0b10010, 0) => VOp2::Xtn,
+        (0b10010, _) => VOp2::SqXtun,
         (0b10100, 0) => VOp2::SqXtn,
         (0b10100, _) => VOp2::UqXtn,
         _ => return Inst::Unknown { raw },
@@ -3017,5 +3018,36 @@ mod tests {
             raw = raw.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             let _ = decode(raw, 0x4000);
         }
+    }
+
+    #[test]
+    fn simd_saturating_narrow_family() {
+        assert!(matches!(
+            d(0x0e61_4800),
+            Inst::VTwoMisc {
+                op: VOp2::SqXtn,
+                arr: VArr { lane_bytes: 2, q: false, .. },
+                vd: VReg(0),
+                vn: VReg(0),
+            }
+        ));
+        assert!(matches!(
+            d(0x4e61_48a0),
+            Inst::VTwoMisc {
+                op: VOp2::SqXtn,
+                arr: VArr { lane_bytes: 2, q: true, .. },
+                vd: VReg(0),
+                vn: VReg(5),
+            }
+        ));
+        assert!(matches!(
+            d(0x2e21_2800),
+            Inst::VTwoMisc {
+                op: VOp2::SqXtun,
+                arr: VArr { lane_bytes: 1, q: false, .. },
+                vd: VReg(0),
+                vn: VReg(0),
+            }
+        ));
     }
 }

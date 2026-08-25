@@ -1329,6 +1329,8 @@ pub enum VOp2 {
     /// Narrow to half width, saturating.
     SqXtn,
     UqXtn,
+    /// Narrow signed lanes to unsigned lanes, saturating negative values to 0.
+    SqXtun,
 }
 
 /// The three-different group's operations, named for what they do to the

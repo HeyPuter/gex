@@ -140,5 +140,13 @@ int main(void) {
         facc = facc * 31 + fbits(fmsub_f(a, fv, c));
     }
     printf("float, ordinary: %08x\n", facc);
+
+    /* Bullet advances its fixed-step clock with exactly this cancellation.
+     * Keep it separate from the checksums: the result must be positive zero,
+     * and a stale temporary on the emitter's operand stack once turned it
+     * into 0xffffffff (a NaN), hiding every 3D object in SuperTuxKart. */
+    fv = 0.008333333333333333f;
+    printf("float, exact cancellation: %08x\n",
+           fbits(fmsub_f(1.0f, fv, fv)));
     return 0;
 }
