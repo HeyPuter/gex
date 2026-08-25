@@ -534,6 +534,15 @@ export async function runProgram(
       // instantiate (native-wayland-gtk-thread-stall). In `extra` so every
       // Worker sets it before running.
       pregrow: flag('pregrow') ? 1 : undefined,
+      // `?checksp=1` checks `sp` at the top of every block, so a corrupt (e.g.
+      // sign-extended) stack pointer names the block that ARRIVES with the bad
+      // value rather than the later one that dereferences it and traps. In
+      // `extra` so every Worker enables it.
+      checkSp: flag('checksp') ? 1 : undefined,
+      // `?claimpages=0`: publish closure dir entries at the build's slot numbers
+      // instead of per-process demand numbering — a diagnostic for the
+      // many-object-closure wrong-dispatch crash. In `extra` for every Worker.
+      claimPages: flag('claimpages') === '0' ? 0 : undefined,
       // `?intrinsicmask=N` enables only some substitution families, to bisect
       // which one corrupts memory: bit0=memcpy, bit1=memset, bit2=memcmp.
       // In `extra` so every process gets it.
