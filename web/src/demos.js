@@ -728,17 +728,21 @@ const WL_APPS = [
     // linkat atomic-write into $XDG_CONFIG_HOME, so it must point at a writable
     // dir rather than defaulting under a read-only path.
     env: WL_TOOLKIT_ENV.qt5 + 'export XDG_CONFIG_HOME=/root/.config\n',
-    // A profile-guided AOT closure exists at /closure/dolphin (built by
-    // web/build-closure.sh from a reached-PC coverage run to first frame) and
-    // renders Dolphin at node while roughly halving the browser's peak RSS
-    // (7.1 -> 3.8 GiB). The AOT-closure dispatch crash that used to hit every
-    // graphics-rootfs wayland closure (libc+0x84710) is FIXED now that this demo
-    // loads closures with `closureBuildNumbered` (see runProgram). It is still
-    // NOT auto-loaded only because Dolphin's Qt5/KF5/Mesa footprint OOMs a
-    // browser tab (~6 GiB) before first frame -- a memory problem, not a
-    // correctness one. Re-enable with `closure: '/closure/dolphin'` (or test via
-    // `?appclosure=/closure/dolphin`) once that footprint is brought down.
+    // A profile-guided AOT closure (built by web/build-closure.sh from a
+    // reached-PC coverage run to first frame). The dispatch crash that used to
+    // hit every graphics-rootfs wayland closure (libc+0x84710) is fixed by
+    // `closureBuildNumbered` (see runProgram), so Dolphin now renders in a real
+    // browser.
+    closure: '/closure/dolphin',
     closureImage: '/bin/sh',
+    // Drop Mesa's software rasteriser from Dolphin's filesystem. Dolphin is a
+    // QtWidgets app -- it renders through Qt's own raster engine into wl_shm and
+    // needs no GL -- but on startup something (a KDE/EGL probe) dlopens
+    // swrast_dri.so, whose mappings pushed the guest's 32-bit (4 GiB) wasm memory
+    // over the top and crashed the tab. Absent, the probe fails gracefully and
+    // Dolphin renders under the ceiling. Scoped to this app: glxgears' Xwayland
+    // GLX genuinely needs swrast, and it does not drop it.
+    dropFiles: ['/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so'],
   },
 ];
 
@@ -1021,6 +1025,10 @@ const waylandGears = {
             run;
         }
         files['/run.sh'] = new TextEncoder().encode(script);
+        // Files this app must not see (e.g. Dolphin drops Mesa's swrast so its
+        // guest memory stays under the 4 GiB wasm ceiling). Other apps that
+        // share this rootfs keep them.
+        for (const path of app.dropFiles || []) delete files[path];
 
         // A per-app AOT closure, when one has been built (Dolphin). Loaded like
         // the debian demo's: `loadClosure` answers null when there is no
