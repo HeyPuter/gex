@@ -718,6 +718,29 @@ const WL_APPS = [
   { id: 'explosive-c4', label: 'Qt 6 — Explosive C4 (game)', mode: 'shm', client: 'explosive-c4', env: WL_TOOLKIT_ENV.qt6 },
   { id: 'compton-conf', label: 'Qt 5 — compton-conf', mode: 'shm', client: 'compton-conf', env: WL_TOOLKIT_ENV.qt5 },
   { id: 'kcalc', label: 'KDE / KF5 — KCalc', mode: 'shm', client: 'kcalc', env: WL_TOOLKIT_ENV.qt5 },
+  {
+    id: 'dolphin',
+    label: 'KDE / KF5 — Dolphin (file manager)',
+    mode: 'shm',
+    client: 'dolphin --new-window /root',
+    // Qt5 base env plus a writable config home: Dolphin's first run saves
+    // bookmarks (user-places.xbel) and view state via QSaveFile's O_TMPFILE +
+    // linkat atomic-write into $XDG_CONFIG_HOME, so it must point at a writable
+    // dir rather than defaulting under a read-only path.
+    env: WL_TOOLKIT_ENV.qt5 + 'export XDG_CONFIG_HOME=/root/.config\n',
+    // A profile-guided AOT closure exists at /closure/dolphin (built by
+    // web/build-closure.sh from a reached-PC coverage run to first frame) and
+    // renders Dolphin at node while roughly halving the browser's peak RSS
+    // (7.1 -> 3.8 GiB). It is NOT auto-loaded because it currently trips a
+    // PRE-EXISTING browser-only AOT-closure crash that hits EVERY graphics-rootfs
+    // wayland closure (gtk3-demo's too): pid 1 traps at libc.so.6+0x84710 right
+    // after prlimit64, in chromium's V8 only -- the same closure runs clean at
+    // node, and pure-JIT wayland renders in the browser. Re-enable by adding
+    // `closure: '/closure/dolphin'` here (or test with `?appclosure=/closure/
+    // dolphin`) once that AOT-closure trap is fixed. Until then Dolphin runs
+    // pure-JIT, which renders at node but is too heavy for a browser tab today.
+    closureImage: '/bin/sh',
+  },
 ];
 
 // Which app to start with: an explicit `?wlclient=<id>` (the drive.mjs harness
@@ -1000,8 +1023,38 @@ const waylandGears = {
         }
         files['/run.sh'] = new TextEncoder().encode(script);
 
+        // A per-app AOT closure, when one has been built (Dolphin). Loaded like
+        // the debian demo's: `loadClosure` answers null when there is no
+        // manifest, so trying costs nothing, and `?closure=0` forces the
+        // runtime translator. pid 1 is `/bin/sh`, so the manifest is checked
+        // against that image. Without it Dolphin's Qt5/KF5/Mesa is lifted from
+        // scratch -- ~100s to first frame and a >7 GiB peak that OOMs the tab.
+        // `?appclosure=/closure/<name>` overrides which closure to load (for
+        // bisecting the closure path against a known-good one); `?closure=0`
+        // forces the runtime translator.
+        const qpc = new URLSearchParams(location.search);
+        const closurePath = qpc.get('appclosure') || app.closure;
+        let appClosure = null;
+        if (closurePath && qpc.get('closure') !== '0') {
+          ctx.busy('loading the closure');
+          const { loadClosure } = await import('./closure.js');
+          try {
+            appClosure = await loadClosure(closurePath, {
+              image: app.closureImage || '/bin/sh',
+              log: (s) => console.debug(`[gex] ${s}`),
+            });
+          } catch (e) {
+            console.debug(`[gex] no ${app.id} closure: ${e.message}`);
+          }
+        }
+
         ctx.idle();
         rule(ctx, `graphics rootfs — ${Object.keys(files).length} files`);
+        if (appClosure) {
+          ctx.term.writeln(
+            ctx.ansi.dim(`closure: ${appClosure.libs.length} libraries, translated ahead of time`),
+          );
+        }
         ctx.status('running');
         const { status } = await ctx.runProgram(ctx.term, {
           elf: files['/bin/sh'],
@@ -1012,6 +1065,7 @@ const waylandGears = {
           cwd: '/',
           tty: true,
           uid: 0,
+          closure: appClosure,
           // Real GL over virgl, as the glxgears demo does. The compositor gets
           // a 2D canvas so a native wl client's committed shm frames show; for
           // the Xwayland path the pixels come via virgl and this stays blank.
