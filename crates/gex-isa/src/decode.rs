@@ -1829,6 +1829,8 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
             (0, 0b11100, false) => VOp3::FCmEq,
             (0, 0b11110, false) => VOp3::FMax,
             (0, 0b11110, true) => VOp3::FMin,
+            (0, 0b11111, false) => VOp3::FRecps,
+            (0, 0b11111, true) => VOp3::FRSqrts,
             (1, 0b11010, false) => VOp3::FAddP,
             (1, 0b11010, true) => VOp3::FAbd,
             (1, 0b11011, false) => VOp3::FMul,
@@ -1961,6 +1963,8 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
             (0b11100, _, false) => VOp2::FcvtAu,
             (0b11101, 0, false) => VOp2::Scvtf,
             (0b11101, _, false) => VOp2::Ucvtf,
+            (0b11101, 0, true) => VOp2::FRecpe,
+            (0b11101, _, true) => VOp2::FRSqrtE,
             (0b11111, _, true) => VOp2::FSqrt,
             _ => return Inst::Unknown { raw },
         };

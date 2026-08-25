@@ -2648,6 +2648,56 @@ impl<'a> Lifter<'a> {
             return Flow::Next;
         }
 
+        // The Newton refinement steps: `frecps(a,b) = 2 - a*b` and
+        // `frsqrts(a,b) = (3 - a*b)/2`, per lane. gex's `frecpe`/`frsqrte`
+        // already return exact values so these steps just reproduce them, but
+        // implementing them faithfully keeps any independent use correct.
+        if matches!(op, VOp3::FRecps | VOp3::FRSqrts) {
+            let splat = |val: f64| -> Box<[u8; 16]> {
+                let mut c = [0u8; 16];
+                if arr.lane_bytes == 8 {
+                    let bytes = val.to_le_bytes();
+                    for i in [0usize, 8] {
+                        c[i..i + 8].copy_from_slice(&bytes);
+                    }
+                } else {
+                    let bytes = (val as f32).to_le_bytes();
+                    for i in [0usize, 4, 8, 12] {
+                        c[i..i + 4].copy_from_slice(&bytes);
+                    }
+                }
+                Box::new(c)
+            };
+            let prod = self.b.def(Expr::VLaneBin {
+                op: VLaneBinOp::Mul,
+                lane,
+                a,
+                b,
+            });
+            let top = self
+                .b
+                .def(Expr::VConst(splat(if matches!(op, VOp3::FRSqrts) { 3.0 } else { 2.0 })));
+            let diff = self.b.def(Expr::VLaneBin {
+                op: VLaneBinOp::Sub,
+                lane,
+                a: top,
+                b: prod,
+            });
+            let r = if matches!(op, VOp3::FRSqrts) {
+                let half = self.b.def(Expr::VConst(splat(0.5)));
+                self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Mul,
+                    lane,
+                    a: diff,
+                    b: half,
+                })
+            } else {
+                diff
+            };
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+
         // The halving add/sub have no single wasm op (only the rounding
         // *unsigned* add, `avgr_u` = `UrHAdd` above). The SWAR identities hold
         // per lane, verified exhaustively over all 8-bit inputs both signs:
@@ -2987,6 +3037,40 @@ impl<'a> Lifter<'a> {
         }
 
         match op {
+            // `frecpe`/`frsqrte` are estimates; gex computes the exact value.
+            // `frecpe x = 1/x`, `frsqrte x = 1/sqrt(x)`. Code that refines with
+            // `frecps`/`frsqrts` converges the same, and code that uses the
+            // estimate directly gets better precision than the hardware.
+            VOp2::FRecpe | VOp2::FRSqrtE => {
+                let mut one = [0u8; 16];
+                if arr.lane_bytes == 8 {
+                    // 1.0f64 = 0x3ff0000000000000, little-endian, per 8-byte lane.
+                    for i in [0usize, 8] {
+                        one[i + 6] = 0xf0;
+                        one[i + 7] = 0x3f;
+                    }
+                } else {
+                    // 1.0f32 = 0x3f800000, little-endian, per 4-byte lane.
+                    for i in [0usize, 4, 8, 12] {
+                        one[i + 2] = 0x80;
+                        one[i + 3] = 0x3f;
+                    }
+                }
+                let ones = self.b.def(Expr::VConst(Box::new(one)));
+                let denom = if matches!(op, VOp2::FRSqrtE) {
+                    self.b.def(Expr::VLaneUn { op: VLaneUnOp::Sqrt, lane, a })
+                } else {
+                    a
+                };
+                let r = self.b.def(Expr::VLaneBin {
+                    op: VLaneBinOp::Div,
+                    lane,
+                    a: ones,
+                    b: denom,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
             VOp2::Not => {
                 let ones = self.b.def(Expr::VConst(Box::new([0xff; 16])));
                 let r = self.b.def(Expr::VBin {

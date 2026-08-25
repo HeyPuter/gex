@@ -1237,6 +1237,10 @@ pub enum VOp3 {
     /// `|a - b|` per lane.
     FAbd,
     FDiv,
+    /// `frecps`: a Newton step for the reciprocal estimate, `2 - a*b`.
+    FRecps,
+    /// `frsqrts`: a Newton step for the reciprocal-sqrt estimate, `(3 - a*b)/2`.
+    FRSqrts,
     FMax,
     FMin,
     FMaxNm,
@@ -1276,6 +1280,13 @@ pub enum VOp2 {
     FNeg,
     FAbs,
     FSqrt,
+    /// Reciprocal estimate, `~1/x`. gex lifts it as the exact `1/x`: code that
+    /// refines it with `frecps` converges the same, and code that uses it raw
+    /// gets better precision than the hardware estimate.
+    FRecpe,
+    /// Reciprocal square-root estimate, `~1/sqrt(x)`; lifted as exact
+    /// `1/sqrt(x)` for the same reason. libpixman/Qt geometry math reach it.
+    FRSqrtE,
     FrintN,
     FrintP,
     FrintM,
