@@ -84,20 +84,32 @@ int main(int argc, char **argv) {
      * written to the master, so the line discipline echoes it and the child
      * reads it as input. This is how a shell reading commands from a terminal
      * is tested without a terminal emulator in the way. */
-    if (argc > 2) {
-        usleep(400000);
-        char line[256];
-        int n = snprintf(line, sizeof line, "%s\n", argv[2]);
-        ssize_t w = write(m, line, n);
-        printf("typed %zd bytes: %s", w, line);
-        fflush(stdout);
-    }
-
+    /* One write per argument, spaced out, rather than one write for the whole
+     * line -- and the difference is not cosmetic. A terminal emulator writes a
+     * keystroke per event, so a readiness bug that delivers the first write and
+     * never reports another looks exactly like a working terminal when the line
+     * arrives at once. `\n` as an argument is a newline, so a command and its
+     * Enter are two separate writes, which is how a person types them.
+     *
+     * dash does not notice such a bug (it blocks in `read`); bash does, because
+     * readline waits in `select` between characters. */
+    int typed = 0;
     int reads = 0;
     /* Long enough to see a second and third write, which is the point: a
      * terminal that prints one line and stops looks fine for the first
      * quarter-second. */
     for (int round = 0; round < 200; round++) {
+        if (2 + typed < argc && round % 4 == 2) {
+            const char *s = argv[2 + typed++];
+            char line[256];
+            int n;
+            if (!strcmp(s, "\\n")) { line[0] = '\n'; n = 1; }
+            else n = snprintf(line, sizeof line, "%s", s);
+            ssize_t w = write(m, line, n);
+            printf("typed %zd of %d bytes: %s\n", w, n,
+                   n == 1 && line[0] == '\n' ? "(newline)" : s);
+            fflush(stdout);
+        }
         struct pollfd p = { .fd = m, .events = POLLIN };
         int r = poll(&p, 1, 250);
         if (r > 0 && (p.revents & POLLIN)) {

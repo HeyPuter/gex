@@ -316,6 +316,13 @@ impl crate::vfs::FileHandle for RemotePty {
         true
     }
 
+    /// Both ends of this pair live in the global kernel, and the other one is
+    /// held by a program in another Worker -- a terminal emulator. Its write is
+    /// what ends a wait here, and it wakes on its way out of the syscall.
+    fn peer_wakes(&self) -> bool {
+        true
+    }
+
     fn poll_readable(&self) -> bool {
         (self.remote.readable)(self.id, self.m()) != 0
     }

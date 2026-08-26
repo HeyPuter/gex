@@ -4774,7 +4774,12 @@ fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
         match h.metadata().map(|m| m.file_type) {
             Ok(FileType::Fifo) => true,
             Ok(FileType::Socket) => kernel.net.is_none(),
-            _ => false,
+            // And whatever else says its waits are ended by another process:
+            // a pseudoterminal, whose two ends live in the global kernel with a
+            // terminal emulator in another Worker holding one of them. It was
+            // called the page's before, which is true of the page's OWN
+            // terminal (`STDIN`, just above) and of nothing else.
+            _ => h.peer_wakes() && (unsafe { k_present() }) != 0,
         }
     };
     // A socket the *page* is the other end of.
@@ -8340,8 +8345,25 @@ fn schedule() -> i32 {
                 // Only a terminal is a keystroke; a pipe or socket is written by
                 // another process (apt's http method, a pipeline) and wants the
                 // event loop, not a key.
+                // Bit 1 means "the page has to supply a keystroke", and the JS
+                // side answers it by *awaiting* one -- with no timeout when
+                // nothing else is set. So it must be reserved for the page's own
+                // terminal. A pty is not that: it is two ends in the global
+                // kernel, and the end that will write is a program in another
+                // Worker. Classed as a keyboard, a `select` on one waited for a
+                // keystroke into the page that was never coming, which is what
+                // made an interactive bash in xterm go deaf after one character
+                // -- readline waits in `select` where a plain shell waits in
+                // `read`, and a read happened to also set bit 2 and be retried.
                 let by_kind = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
                     use gex_kernel::vfs::FileType;
+                    let stdin_p = Arc::as_ptr(&*STDIN) as *const ();
+                    if Arc::as_ptr(handle) as *const () == stdin_p {
+                        return 1;
+                    }
+                    if handle.peer_wakes() {
+                        return 2;
+                    }
                     match handle.metadata().map(|m| m.file_type) {
                         Ok(FileType::Socket) | Ok(FileType::Fifo) => 2,
                         _ => 1,
