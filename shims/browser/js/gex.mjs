@@ -824,7 +824,16 @@ export class Gex {
     // wasm-ld puts the shim's stack at address zero (the guest's image); move
     // it into the shim's own region, above everything the guest maps.
     this.#shim.exports.__stack_pointer.value = this.#workerStack();
-    this.#opts = { strace: opts.strace, tty: opts.tty, uid: opts.uid, gid: opts.gid };
+    this.#opts = {
+      strace: opts.strace,
+      // Which single process to narrate, if any. Inherited like `strace` --
+      // the interesting process is usually a child, and a whole session's
+      // syscalls is more output than a page survives.
+      stracePid: opts.stracePid,
+      tty: opts.tty,
+      uid: opts.uid,
+      gid: opts.gid,
+    };
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
     // How many of an object's stored units one miss may take.
     if (opts.perMiss) this.#shim.exports.gex_set_per_miss?.(opts.perMiss);
@@ -1565,7 +1574,9 @@ export class Gex {
     // The kernel exists now, so everything that configures one can be said.
     const o = child.opts ?? {};
     this.#opts = o;
-    if (o.strace) e.gex_set_trace(1);
+    // `?strace=1` narrates every process; `?stracepid=N` only that one, which
+    // is what a run that must stay alive can afford.
+    if (o.strace || (o.stracePid && o.stracePid === child.pid)) e.gex_set_trace(1);
     if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
     if (o.tty) e.gex_set_tty(1);
     // Identity was already said above, before the kernel was built.

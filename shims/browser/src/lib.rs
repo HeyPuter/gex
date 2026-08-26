@@ -346,6 +346,8 @@ extern "C" {
     fn k_pty_read(id: i32, master: i32, at: u32, len: u32) -> i32;
     fn k_pty_write(id: i32, master: i32, at: u32, len: u32) -> i32;
     fn k_pty_readable(id: i32, master: i32) -> i32;
+    fn k_pty_counts(id: i32) -> u32;
+    fn k_last_kill() -> u64;
     fn k_pty_available(id: i32, master: i32) -> i32;
     fn k_pty_ptn(id: i32) -> i32;
     fn k_pty_get_lock(id: i32) -> i32;
@@ -803,20 +805,55 @@ fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
 // Pty wrappers: the ones that name a holder inject this Worker's pid, the way
 // the pipe wrappers do, so the global kernel can release a process's ends when
 // it leaves by a trap.
+/// The first few pty end open/close events, with who did them.
+///
+/// An end is opened and closed a handful of times in a session -- a terminal
+/// takes the master, its child takes the slave, a fork hands both on -- and the
+/// whole session rests on the count being right: the last master closing is a
+/// SIGHUP to everything in that terminal's session, which from the outside
+/// looks exactly like a shell that died for no reason. Cheap to say, and the
+/// only way to see an unbalanced open.
+fn pty_note(what: &str, id: i32, master: i32, pid: i32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SAID: AtomicU32 = AtomicU32::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= 60 {
+        return;
+    }
+    let counts = unsafe { k_pty_counts(id) };
+    warn_line(&format!(
+        "[pty] pid {pid} {what}s the {} of pty {id}: {} master(s), {} slave(s) now\n",
+        if master != 0 { "master" } else { "slave" },
+        counts >> 16,
+        counts & 0xffff
+    ));
+}
+
 extern "C" fn rpty_open_master() -> i32 {
-    unsafe { k_pty_open_master(my_pid()) }
+    let r = unsafe { k_pty_open_master(my_pid()) };
+    pty_note("open", r >> 16, 1, my_pid());
+    r
 }
 extern "C" fn rpty_open_slave(ptn: i32) -> i32 {
-    unsafe { k_pty_open_slave(ptn, my_pid()) }
+    let r = unsafe { k_pty_open_slave(ptn, my_pid()) };
+    pty_note("open", ptn, 0, my_pid());
+    r
 }
 extern "C" fn rpty_open_end(id: i32, master: i32) {
-    unsafe { k_pty_open_end(id, master, my_pid()) }
+    unsafe { k_pty_open_end(id, master, my_pid()) };
+    pty_note("inherit", id, master, my_pid());
 }
 extern "C" fn rpty_close_end(id: i32, master: i32) {
-    unsafe { k_pty_close_end(id, master, my_pid()) }
+    unsafe { k_pty_close_end(id, master, my_pid()) };
+    pty_note("close", id, master, my_pid());
 }
 extern "C" fn rpty_read(id: i32, master: i32, at: u32, len: u32) -> i32 {
-    unsafe { k_pty_read(id, master, at, len) }
+    let r = unsafe { k_pty_read(id, master, at, len) };
+    // End of file on the master is how a terminal emulator learns its shell is
+    // gone -- and if it is wrong, the emulator kills the session. Worth saying.
+    if r == 0 && master != 0 {
+        pty_note("reads end of file on", id, master, my_pid());
+    }
+    r
 }
 extern "C" fn rpty_write(id: i32, master: i32, at: u32, len: u32) -> i32 {
     unsafe { k_pty_write(id, master, at, len) }
@@ -5508,8 +5545,20 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // through `tgkill`, and the arguments say whether it aimed at
                 // itself.
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                // Who sent it, if the global kernel knows: "killed by signal 1"
+                // is true of a hangup, a terminal's line discipline and any
+                // guest's `kill`, and they are not the same bug.
+                let from = if unsafe { k_present() } != 0 {
+                    let v = unsafe { k_last_kill() };
+                    let caller = (v >> 40) as i32;
+                    let target = ((v >> 8) & 0xffff_ffff) as i32;
+                    let signo = (v & 0xff) as u32;
+                    format!(" (last signal sent: {signo} from pid {caller} to {target})")
+                } else {
+                    String::new()
+                };
                 warn_line(&format!(
-                    "[gex] pid {} killed by signal {} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
+                    "[gex] pid {} killed by signal {}{from} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
                      last calls:{}\n  address space:{}\n  futexes:{}",
                     h.kernel.pid,
                     signal,
@@ -5945,6 +5994,7 @@ fn stage_fork_fds(h: &Host, child: i32) {
             // The child inherits this pty end; open it on the child's behalf so
             // the parent's copy closing is not the last reference.
             unsafe { k_pty_open_end(id, master as i32, child) };
+            pty_note("hands on", id, master as i32, child);
         } else if let Some(id) = file.handle.remote_id() {
             let dup = unsafe { k_fs_dup(id) };
             if dup < 0 {
@@ -6512,6 +6562,26 @@ pub extern "C" fn gex_adopt_child(
     }
     kernel.clock = browser_clock;
     kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
+    // The state this Worker started from is a *copy* of the parent's, and the
+    // descriptors in it are the parent's: pipe and pty ends it still holds,
+    // sockets it is still using. Every one of those handles closes its end in
+    // the global kernel when it drops (that is how a process leaving by a trap
+    // still releases them), so letting the copy drop here closes descriptors
+    // that belong to another process -- and it is charged to whichever pid this
+    // Worker answers as. That is what killed a terminal's session: the shell's
+    // slave end went with the copy, the master read end of file, and the whole
+    // foreground group took a SIGHUP one command in. The child's own ends are
+    // opened for it by `stage_fork_fds`, so the copy is leaked rather than
+    // dropped -- into memory that is this process's own image anyway.
+    if gex_has_host() != 0 {
+        with_host(|h| {
+            std::mem::forget(std::mem::replace(
+                &mut h.kernel.fds,
+                gex_kernel::file::FdTable::new(),
+            ));
+            std::mem::forget(std::mem::take(&mut h.kernel.remote_sockets));
+        });
+    }
     set_host(Host {
         magic_head: HOST_MAGIC,
         kernel,
@@ -6613,7 +6683,10 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
             // A pty end held open (a shell exiting without closing its slave)
             // otherwise strands the master: the reader never sees EOF. And a
             // master gone this way must hang the slave up.
-            k_pty_forget(pid);
+            let left = k_pty_forget(pid);
+            if left > 0 {
+                pty_note("exit-sweeps", 0, 0, pid);
+            }
         }
     }
     h.kernel.procs.exit(pid, code);

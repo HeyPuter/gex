@@ -321,6 +321,13 @@ impl crate::vfs::FileHandle for RemotePty {
         Some((self.remote.available)(self.id, self.m()).max(0) as u64)
     }
 
+    fn claim_session(&self, sid: i32) {
+        // What `TIOCSCTTY` means for a pty that lives in the global kernel: the
+        // session is recorded there, where the hangup rule can ask whether it is
+        // still alive. See `slave_session_alive` in shims/kernel.
+        (self.remote.set_sid)(self.id, sid);
+    }
+
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
         Some(self.do_ioctl(m, request, arg))
     }

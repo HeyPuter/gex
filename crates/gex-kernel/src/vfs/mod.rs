@@ -172,6 +172,15 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// kernel's own handling runs. Guest memory is passed because an ioctl arg
     /// is usually a pointer to a struct the device reads or writes -- and a
     /// host device reaches the caller's buffers through it uncopied.
+    /// A session has claimed this file as its controlling terminal.
+    ///
+    /// `TIOCSCTTY` on a *local* tty is handled at the syscall layer, which has
+    /// the process table and can record the session there. A pty in the global
+    /// kernel cannot be reached that way -- its state is in another module --
+    /// so the syscall layer hands the session down here instead. Nothing else
+    /// needs it, hence the default.
+    fn claim_session(&self, _sid: i32) {}
+
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {
         let _ = (m, request, arg);
         None

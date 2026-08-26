@@ -687,6 +687,8 @@ export async function runProgram(
         cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, env, pins: closure?.pins,
         // `?strace=1`, and every child inherits it: see `#opts` in gex.mjs.
         strace: globalThis.GEX_STRACE ? 1 : undefined,
+        // `?stracepid=N`: narrate that one process, which is affordable.
+        stracePid: globalThis.GEX_STRACE_PID || undefined,
         // Which program pid 1 is, so its own text gets a code identity and a
         // second process can reuse what the first translated of it.
         //

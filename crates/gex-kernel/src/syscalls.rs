@@ -3322,6 +3322,15 @@ impl Kernel {
         // A device the host provides answers its own ioctls, and knows things
         // the kernel does not. Asked first, because the request numbers below
         // are the terminal's and a graphics device's are its own.
+        // Claiming a controlling terminal has to be recorded where the terminal
+        // lives. For a local tty that is the branch further down (it has the
+        // process table); for a pty in the global kernel it is the handle, which
+        // is the only thing that can reach the other module. See
+        // `FileHandle::claim_session`.
+        if req == TIOCSCTTY {
+            let sid = self.procs.sid(self.pid, 0).unwrap_or(self.pid);
+            file.handle.claim_session(sid);
+        }
         if let Some(r) = file.handle.ioctl(m, req, arg) {
             return r;
         }
