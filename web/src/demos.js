@@ -1281,7 +1281,7 @@ const SESSION_APPS = [
   { id: 'xcalc', label: 'xcalc — X11 through rootless Xwayland', kind: 'x', cmd: 'xcalc' },
   {
     id: 'glxgears',
-    // Needs GLX, which only the guest X server has: see `hostX` below.
+    // Wants GLX, which the page's X server has not: see `hostX` below.
     gl: true,
     label: 'glxgears — OpenGL, Mesa → virgl, under Xwayland',
     kind: 'x',
@@ -1290,7 +1290,7 @@ const SESSION_APPS = [
   },
   {
     id: 'glmark2',
-    // Needs GLX, which only the guest X server has: see `hostX` below.
+    // Wants GLX, which the page's X server has not: see `hostX` below.
     gl: true,
     label: 'glmark2 — a real GL benchmark, under Xwayland',
     kind: 'x',
@@ -1526,22 +1526,18 @@ const compositor = {
             if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
           }
         }
-        // Which X server: the one in the page (`web/src/hostx.js`) or a guest
-        // Xwayland. Same protocol, same window manager, same compositor; the
-        // page's own drawing is native wasm rather than translated AArch64, and
-        // it is what makes xeyes, xclock and xcalc work at all.
+        // A guest Xwayland serves every X client, because rendering goes
+        // through Mesa and virgl and that is the path with GLX in it.
         //
-        // It has no GLX, though -- that needs glamor on a GPU nothing here can
-        // offer -- so a session with an OpenGL X client in it uses the guest's
-        // server, which reaches the GPU through Mesa and virgl. `?hostx=0` or
-        // `?hostx=1` decides it by hand.
-        const wantsGl = chosen.some((a) => a.kind === 'x' && a.gl);
-        const hostX = qp.has('hostx') ? qp.get('hostx') === '1' : !wantsGl;
-        if (chosen.some((a) => a.kind === 'x')) {
+        // There is another X server -- the one in the page (`web/src/hostx.js`),
+        // native wasm rather than translated AArch64, and the only one xeyes,
+        // xclock and xcalc have ever worked under. It has no GLX, so while virgl
+        // is how anything reaches the GPU it stays behind `?hostx=1` rather than
+        // being chosen for a session that might want OpenGL.
+        const hostX = qp.get('hostx') === '1';
+        if (hostX && chosen.some((a) => a.kind === 'x' && a.gl)) {
           ctx.term.writeln(
-            ctx.ansi.dim(
-              `the X server: ${hostX ? 'in the page (wasm)' : 'a guest Xwayland (it has GLX)'}`,
-            ),
+            ctx.ansi.dim('the X server is in the page, which has no GLX: an OpenGL client will not start'),
           );
         }
         const script = sessionScript(chosen, {
