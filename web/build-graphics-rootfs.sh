@@ -9,10 +9,17 @@
 # the only thing that is not Debian's is what sits on the far side of the
 # vtest socket.
 #
-# The source tree is the one `tests/opengl-in-guest.sh` uses, which is 342 MB.
-# A page cannot ask for that, so this takes the closure a traced run actually
-# opens, which is 204 MB, and then removes the two libraries that make up most
-# of it.
+# The source tree is the one `web/build-session-tree.sh` builds and
+# `tests/opengl-in-guest.sh` uses: a Debian with the session's programs
+# unpacked into it. What comes across is that tree less its documentation, its
+# translations and what only a compiler reads -- so the image is a Debian
+# userspace, with `ls`, `bash`, `dpkg` and `apt` in it, and a session can add
+# to itself from inside the guest.
+#
+# It did not use to be. This took the closure a traced run opened, which is
+# smaller and is still what `GEX_SESSION_BASE=0` builds, but a curated list
+# only ever holds what someone thought to name: a terminal in that image had
+# no `ls`.
 #
 # # LLVM, and the switch that removes it
 #
@@ -97,6 +104,11 @@ def source_of(rel):
 # The index is shared by every pass: the curated list, the NEEDED closure and
 # each manifest all name some of the same files, and two 106 MB copies of
 # libLLVM is what happens when each pass dedupes only against itself.
+#
+# Keyed by the file rather than by the path, and a file is a device and an
+# inode: a symlink and its target resolve to one name, but so do two *hard*
+# links, which is what Debian's DRI directory is -- forty-three names for one
+# 24 MB megadriver. Keyed by path that directory is a gigabyte.
 by_real = {}
 if os.path.exists(index):
     for line in open(index):
@@ -117,9 +129,15 @@ for line in open(listing):
     d = os.path.join(dst, rel)
     os.makedirs(os.path.dirname(d), exist_ok=True)
     real = os.path.realpath(s)
-    first = by_real.get(real)
+    try:
+        st = os.stat(s)
+    except OSError:
+        missing += 1
+        continue
+    key = f'{st.st_dev}:{st.st_ino}'
+    first = by_real.get(key)
     if first is None:
-        by_real[real] = rel
+        by_real[key] = rel
         if os.path.isdir(s):
             continue
         shutil.copyfile(real, d)
@@ -129,9 +147,20 @@ for line in open(listing):
     else:
         # A second name for a file already installed: a link to it, relative so
         # the image can be unpacked anywhere.
-        target = os.path.relpath(os.path.join(dst, first), os.path.dirname(d))
+        if first == rel:
+            # The same path named by two passes. Not a second name for the
+            # file -- it IS the file -- and linking it to itself is what put
+            # 258 `gconv/IBM855.so -> IBM855.so` in the image.
+            continue
         if os.path.lexists(d):
             continue
+        if not os.path.exists(os.path.join(dst, first)):
+            # The name it would point at was dropped on purpose (see DROP
+            # below). A dangling link is worse than an absent file: `dlopen`
+            # of one reports a missing library, which is what was wanted, but
+            # every tool that walks the tree trips over it first.
+            continue
+        target = os.path.relpath(os.path.join(dst, first), os.path.dirname(d))
         os.symlink(target, d)
         links += 1
 with open(index, 'w') as f:
@@ -199,6 +228,88 @@ mkdir -p "$R/lib/aarch64-linux-gnu" "$R/usr/lib/aarch64-linux-gnu/dri" \
          "$R/usr/bin" "$R/bin" "$R/etc" "$R/tmp/.X11-unix" "$R/var/lib/xkb" \
          "$R/usr/share/X11" "$R/usr/lib/xorg" "$R/proc" "$R/dev" "$R/root"
 
+# -- the Debian userspace -------------------------------------------------
+#
+# The image is a Debian root filesystem that has the session's programs in it,
+# rather than a list of programs with the libraries they name. A terminal is
+# what notices the difference: `ls` was not in the image and neither was `apt`,
+# because nothing in the lists below asks for them, and a curated list only
+# ever holds what someone thought to name.
+#
+# So the whole source tree comes across, less four kinds of thing: what is
+# documentation (57 MB) or a translation of it (130 MB), what the passes below
+# handle specially (the megadriver and libLLVM), and what only a compiler would
+# read. `GEX_SESSION_BASE=0` builds the old curated image, `GEX_KEEP_LOCALE=1`
+# keeps the translations.
+if [ "${GEX_SESSION_BASE:-1}" != "0" ]; then
+    python3 - "$SRC" "$WORK" <<'PYEOF'
+import os, sys
+
+src, work = sys.argv[1], sys.argv[2]
+
+# Pruned by directory, and the walk does not descend into these at all.
+skip = {
+    'usr/share/doc', 'usr/share/man', 'usr/share/info', 'usr/include',
+    # Forty-three hard links to one megadriver, and the pass below copies the
+    # one of them this image uses.
+    'usr/lib/aarch64-linux-gnu/dri',
+    # The kernel's, not the image's.
+    'proc', 'sys', 'dev', 'run', 'tmp',
+    # A cache of the .debs the tree was unpacked from.
+    'var/cache/apt/archives',
+}
+if not os.environ.get('GEX_KEEP_LOCALE'):
+    skip.add('usr/share/locale')
+# libLLVM is either stubbed or copied whole further down; either way not here.
+skip_prefix = ('usr/lib/aarch64-linux-gnu/libLLVM-',
+               'usr/lib/aarch64-linux-gnu/libz3.so')
+
+files, dirs, links = [], [], []
+for dirpath, dirnames, filenames in os.walk(src):
+    rel = os.path.relpath(dirpath, src)
+    rel = '' if rel == '.' else rel
+    # A symlink to a directory is a name, not a tree: `os.walk` will not
+    # descend into it and `install_paths` cannot make one, so it is recorded
+    # here and remade as a link. /usr/share/perl/5.36 is one of these.
+    keep = []
+    for d in dirnames:
+        p = os.path.join(rel, d) if rel else d
+        if p in skip:
+            continue
+        if os.path.islink(os.path.join(dirpath, d)):
+            links.append((p, os.readlink(os.path.join(dirpath, d))))
+        else:
+            keep.append(d)
+            dirs.append(p)
+    dirnames[:] = keep
+    for name in filenames:
+        p = os.path.join(rel, name) if rel else name
+        if not p.startswith(skip_prefix):
+            files.append('/' + p)
+
+with open(f'{work}/base', 'w') as f:
+    f.write('\n'.join(sorted(files)) + '\n')
+# Every directory, so the empty ones survive too: apt wants
+# /var/lib/apt/lists to exist and will not create it.
+with open(f'{work}/base.dirs', 'w') as f:
+    f.write('\n'.join(sorted(dirs)) + '\n')
+with open(f'{work}/base.links', 'w') as f:
+    for p, target in sorted(links):
+        f.write(f'{p}\t{target}\n')
+print(f'  {len(files)} files, {len(dirs)} directories, {len(links)} linked')
+PYEOF
+    while IFS= read -r d; do
+        [ -n "$d" ] && mkdir -p "$R/$d"
+    done < "$WORK/base.dirs"
+    echo "  the Debian userspace:"
+    install_paths "$WORK/base"
+    while IFS="$(printf '\t')" read -r path target; do
+        [ -n "$path" ] || continue
+        rm -rf "$R/$path"
+        ln -s "$target" "$R/$path"
+    done < "$WORK/base.links"
+fi
+
 # -L, so a name that is a symlink becomes the file. ld.so opens libraries by
 # the SONAME, which is the link name, so the target's own name is never
 # needed and copying both would double 22 MB of megadriver.
@@ -219,30 +330,6 @@ done
 echo "  the traced closure:"
 install_paths "$WORK/curated"
 
-# What the image does NOT need, however it got in.
-#
-# A NEEDED closure follows everything a program *might* load, and Dolphin's
-# reaches the video and audio codecs behind its thumbnailers plus glibc's whole
-# charset module set. None of it is on the path of anything this session shows,
-# and it is a hundred megabytes of a page's memory before a window appears.
-# Dolphin without them thumbnails less; the alternative is Dolphin not
-# starting, because the tab ran out of memory unpacking the image.
-DROP="${GEX_KEEP_EXTRAS:+}"
-if [ -z "${GEX_KEEP_EXTRAS:-}" ]; then
-    DROP="libavcodec.so.* libavformat.so.* libavutil.so.* libswscale.so.*
-          libswresample.so.* libcodec2.so.* libavfilter.so.* libpostproc.so.*
-          libx264.so.* libx265.so.* libvpx.so.* libaom.so.* libdav1d.so.*
-          librav1e.so.* libsvtav1enc.so.* libzvbi.so.* libsrt-gnutls.so.*
-          libopenh264.so.* libmfx.so.* libva.so.* libva-drm.so.* libva-x11.so.*
-          libvidstab.so.* libshine.so.* libtwolame.so.* libmp3lame.so.*
-          libopenmpt.so.* libchromaprint.so.* libbs2b.so.* librubberband.so.*"
-fi
-for pattern in $DROP; do
-    rm -f "$R"/usr/lib/aarch64-linux-gnu/$pattern
-done
-# glibc's charset modules: 20 MB of tables for encodings nothing here reads.
-# UTF-8 needs no module at all.
-[ -z "${GEX_KEEP_EXTRAS:-}" ] && rm -rf "$R/usr/lib/aarch64-linux-gnu/gconv"
 cp -L "$SRC/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so" \
       "$R/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so"
 cp -L "$SRC/lib/ld-linux-aarch64.so.1" "$R/lib/ld-linux-aarch64.so.1"
@@ -256,15 +343,17 @@ for p in $PROGS; do
 done
 echo "  the programs:"
 install_paths "$WORK/progs"
-cp -L "$SRC/bin/dash" "$R/bin/sh"
-# The one coreutils program in the image. dash has no `sleep` builtin, and
-# without one the wait for the X socket spins through six hundred iterations
-# in a millisecond and gives up before Xvfb has opened its listener.
-cp -L "$SRC/bin/sleep" "$R/bin/sleep"
-# And `timeout`, so a run can be bounded. glxgears has no frame count and no
-# way to stop: it draws until it is killed, and a killed process does not
-# flush the five-second report that is the only thing it prints.
-cp -L "$SRC/usr/bin/timeout" "$R/usr/bin/timeout"
+# A shell, and the two programs the session script cannot do without: `sleep`,
+# because dash has no builtin one and the wait for the X socket would spin
+# through six hundred iterations in a millisecond and give up before the server
+# opened its listener, and `timeout`, because glxgears draws until it is killed
+# and a killed process never flushes the five-second report it prints.
+#
+# Only if they are not there already: the Debian pass above brings all of
+# coreutils, and `GEX_SESSION_BASE=0` is the build where it did not run.
+[ -e "$R/bin/sh" ] || cp -L "$SRC/bin/dash" "$R/bin/sh"
+[ -e "$R/bin/sleep" ] || cp -L "$SRC/bin/sleep" "$R/bin/sleep"
+[ -e "$R/usr/bin/timeout" ] || cp -L "$SRC/usr/bin/timeout" "$R/usr/bin/timeout"
 
 # -- the toolkit applications, and everything they link --------------------
 #
@@ -459,9 +548,10 @@ fi
 mkdir -p "$R/usr/bin"
 cat > "$R/usr/bin/shell.sh" <<'SHELL'
 #!/bin/sh
-# The shell xterm runs. Reads from the terminal, prints what its commands
-# print; no prompt, because dash only prints one when it is sure it is
-# interactive and it is not sure here.
+# The shell xterm runs: bash if the image has one, because it reads
+# /root/.profile for a prompt and a PATH and gives the terminal line editing
+# and history. dash otherwise, which is what a curated image has.
+[ -x /bin/bash ] && exec /bin/bash -l
 exec /bin/sh
 SHELL
 chmod 755 "$R/usr/bin/shell.sh"
@@ -550,6 +640,34 @@ fi
 [ -e "$SRC/usr/lib/xorg/protocol.txt" ] && cp "$SRC/usr/lib/xorg/protocol.txt" "$R/usr/lib/xorg/"
 
 
+# What the image does NOT need, however it got in -- and this runs after
+# every pass that puts something in, because it used to run in the middle:
+# the manifests below named files it had just deleted, and `install_paths`
+# wrote a link to each of them instead.
+#
+# A NEEDED closure follows everything a program *might* load, and Dolphin's
+# reaches the video and audio codecs behind its thumbnailers plus glibc's whole
+# charset module set. None of it is on the path of anything this session shows,
+# and it is a hundred megabytes of a page's memory before a window appears.
+# Dolphin without them thumbnails less; the alternative is Dolphin not
+# starting, because the tab ran out of memory unpacking the image.
+DROP="${GEX_KEEP_EXTRAS:+}"
+if [ -z "${GEX_KEEP_EXTRAS:-}" ]; then
+    DROP="libavcodec.so.* libavformat.so.* libavutil.so.* libswscale.so.*
+          libswresample.so.* libcodec2.so.* libavfilter.so.* libpostproc.so.*
+          libx264.so.* libx265.so.* libvpx.so.* libaom.so.* libdav1d.so.*
+          librav1e.so.* libsvtav1enc.so.* libzvbi.so.* libsrt-gnutls.so.*
+          libopenh264.so.* libmfx.so.* libva.so.* libva-drm.so.* libva-x11.so.*
+          libvidstab.so.* libshine.so.* libtwolame.so.* libmp3lame.so.*
+          libopenmpt.so.* libchromaprint.so.* libbs2b.so.* librubberband.so.*"
+fi
+for pattern in $DROP; do
+    rm -f "$R"/usr/lib/aarch64-linux-gnu/$pattern
+done
+# glibc's charset modules: 20 MB of tables for encodings nothing here reads.
+# UTF-8 needs no module at all.
+[ -z "${GEX_KEEP_EXTRAS:-}" ] && rm -rf "$R/usr/lib/aarch64-linux-gnu/gconv"
+
 if [ -n "${GEX_LLVM_STUB:-}" ]; then
     # Generated from the megadriver's own import list, so it stays right when
     # the driver comes from a different Debian.
@@ -579,6 +697,29 @@ else
     done
     echo "  libLLVM: the real one, $(du -h "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" | cut -f1)"
 fi
+
+# One copy of a big library, however many names reach it. The linker name
+# (`libLLVM-15.so`) is in Dolphin's manifest and the SONAME (`libLLVM-15.so.1`)
+# is what the branch above writes, and nothing at run time opens the first --
+# so two 106 MB files is what the difference used to cost the image.
+for l in libLLVM-15.so libz3.so; do
+    f="$R/usr/lib/aarch64-linux-gnu/$l"
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    real=""
+    for c in "$R/usr/lib/aarch64-linux-gnu/$l".[0-9]*; do
+        [ -f "$c" ] && real="$(basename "$c")"
+    done
+    [ -n "$real" ] || continue
+    rm -f "$f"
+    ln -s "$real" "$f"
+    echo "  $l: a link to $real"
+done
+
+# The alternatives a maintainer script would have made. Nothing runs those
+# here (see build-debian.sh), so the names they install are missing -- and
+# `awk` is one a shell script reaches for without thinking.
+[ -e "$R/usr/bin/awk" ] || [ ! -e "$R/usr/bin/gawk" ] || ln -s gawk "$R/usr/bin/awk"
+[ -e "$R/usr/bin/pager" ] || [ ! -e "$R/usr/bin/less" ] || ln -s less "$R/usr/bin/pager"
 
 cat > "$R/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/sh

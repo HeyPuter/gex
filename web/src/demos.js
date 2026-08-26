@@ -1425,7 +1425,9 @@ const compositor = {
     + 'output, all in one WebGL context. Every window is drawn from the guest\'s own memory: '
     + 'nothing copies a frame. The X11 clients share one X server and are cheap; a Qt or KDE '
     + 'toolkit translates 100 MB of its own code, so pick one of those at a time.',
-  network: false,
+  // The image has apt in it, so a session can install into itself -- which
+  // needs a Wisp relay, set with `?wisp=` (see the Debian demo).
+  network: true,
   outputWidth: 1280,
   outputHeight: 760,
   // The session image: every program the picker offers, and Mesa's software
