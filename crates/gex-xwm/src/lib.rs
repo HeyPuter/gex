@@ -161,6 +161,8 @@ impl Atoms {
 #[derive(Clone, Copy)]
 enum Awaiting {
     Atom(usize),
+    /// The `WM_PROTOCOLS` list of a window: which ICCCM messages it accepts.
+    Protocols(u32),
     /// The Composite extension's major opcode.
     Composite,
     /// An `_NET_WM_NAME` read for this window.
@@ -173,6 +175,13 @@ enum Awaiting {
 /// One X window the manager knows about.
 #[derive(Default, Clone)]
 struct XWindow {
+    /// Whether `WM_PROTOCOLS` lists `WM_TAKE_FOCUS`. Sending that message to a
+    /// client that did not ask for it is not merely useless: xterm answers one
+    /// by tearing down its session -- it kills its process group, which from
+    /// the outside looks like a terminal whose shell died one command in. The
+    /// ICCCM is explicit that a manager sends it only to clients that
+    /// advertise it, and this is why.
+    takes_focus: bool,
     x: i32,
     y: i32,
     w: i32,
@@ -200,7 +209,15 @@ pub struct Xwm {
     next_id: u32,
     atoms: Atoms,
     atoms_done: usize,
-    awaiting: std::collections::VecDeque<Awaiting>,
+    /// Replies still owed, each with the sequence number of the request that
+    /// will answer it. Matched by that number and not by arrival order: a
+    /// request whose reply nobody wanted (Composite's QueryVersion, sent for
+    /// the version handshake) would otherwise be handed to the next waiter and
+    /// every reply after it would belong to the wrong request.
+    awaiting: std::collections::VecDeque<(u16, Awaiting)>,
+    /// The sequence number of the last request sent. X numbers them from one,
+    /// per connection, and a reply carries the low 16 bits of its request's.
+    seq: u16,
     windows: HashMap<u32, XWindow>,
     /// `WL_SURFACE_ID` can arrive before the surface exists on the Wayland
     /// connection; the pairing is retried until it does.
@@ -240,6 +257,7 @@ impl Xwm {
             atoms: Atoms::default(),
             atoms_done: 0,
             awaiting: std::collections::VecDeque::new(),
+            seq: 0,
             windows: HashMap::new(),
             pending_pairs: Vec::new(),
             redirected: std::collections::HashSet::new(),
@@ -300,6 +318,7 @@ impl Xwm {
         msg.extend_from_slice(&(units as u16).to_le_bytes());
         msg.extend_from_slice(body);
         msg.resize(4 + padded, 0);
+        self.seq = self.seq.wrapping_add(1);
         self.write(msg);
     }
 
@@ -309,7 +328,8 @@ impl Xwm {
         body.extend_from_slice(&0u16.to_le_bytes());
         body.extend_from_slice(name.as_bytes());
         self.request(op::QUERY_EXTENSION, 0, &body);
-        self.awaiting.push_back(Awaiting::Composite);
+        let seq = self.seq;
+        self.awaiting.push_back((seq, Awaiting::Composite));
     }
 
     /// Redirect a window's drawing to an offscreen pixmap.
@@ -337,7 +357,8 @@ impl Xwm {
         body.extend_from_slice(&0u16.to_le_bytes());
         body.extend_from_slice(name.as_bytes());
         self.request(op::INTERN_ATOM, 0, &body);
-        self.awaiting.push_back(Awaiting::Atom(i));
+        let seq = self.seq;
+        self.awaiting.push_back((seq, Awaiting::Atom(i)));
     }
 
     fn change_window_attributes(&mut self, window: u32, mask: u32, values: &[u32]) {
@@ -392,7 +413,8 @@ impl Xwm {
         body.extend_from_slice(&0u32.to_le_bytes()); // long_offset
         body.extend_from_slice(&256u32.to_le_bytes()); // long_length
         self.request(op::GET_PROPERTY, 0, &body);
-        self.awaiting.push_back(what);
+        let seq = self.seq;
+        self.awaiting.push_back((seq, what));
     }
 
     fn set_input_focus(&mut self, window: u32) {
@@ -575,8 +597,10 @@ impl Xwm {
                         "[xwm] X error {code} on request {major}\n"
                     ));
                 }
-                // A reply we were waiting for will never come.
-                self.awaiting.pop_front();
+                // The reply to *this* request will never come. Named by its
+                // sequence number, which the error carries.
+                let seq = u16::from_le_bytes([msg[2], msg[3]]);
+                self.awaiting.retain(|(s, _)| *s != seq);
             }
             1 => self.reply(&msg, client),
             _ => self.event(&msg, client),
@@ -585,10 +609,43 @@ impl Xwm {
     }
 
     fn reply(&mut self, msg: &[u8], client: &mut Client) {
-        let Some(what) = self.awaiting.pop_front() else {
+        // Matched by sequence number: replies arrive in request order, but not
+        // every request that produces one is waited for. Anything older than
+        // this reply is never coming.
+        let seq = u16::from_le_bytes([msg[2], msg[3]]);
+        while self
+            .awaiting
+            .front()
+            .is_some_and(|(s, _)| s.wrapping_sub(seq) > 0x8000)
+        {
+            self.awaiting.pop_front();
+        }
+        let Some(what) = self
+            .awaiting
+            .front()
+            .is_some_and(|(s, _)| *s == seq)
+            .then(|| self.awaiting.pop_front().map(|(_, w)| w))
+            .flatten()
+        else {
             return;
         };
         match what {
+            Awaiting::Protocols(window) => {
+                // A list of atoms, 32 bits each: `value_len` counts items.
+                let items = u32::from_le_bytes([msg[16], msg[17], msg[18], msg[19]]) as usize;
+                let take = self.atoms.wm_take_focus;
+                let mut takes_focus = false;
+                for i in 0..items.min((msg.len().saturating_sub(32)) / 4) {
+                    let at = 32 + i * 4;
+                    let atom = u32::from_le_bytes([msg[at], msg[at + 1], msg[at + 2], msg[at + 3]]);
+                    if atom != 0 && atom == take {
+                        takes_focus = true;
+                    }
+                }
+                if let Some(w) = self.windows.get_mut(&window) {
+                    w.takes_focus = takes_focus;
+                }
+            }
             Awaiting::Atom(i) => {
                 let atom = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]);
                 self.atoms.set(i, atom);
@@ -723,6 +780,13 @@ impl Xwm {
                 self.redirect(window);
                 self.set_wm_state_normal(window);
                 self.map_window(window);
+                // Which ICCCM messages this client accepts. Asked at map time
+                // because that is when the client has set the property and
+                // before the compositor gives it the focus.
+                let protocols = self.atoms.wm_protocols;
+                if protocols != 0 {
+                    self.get_property(window, protocols, Awaiting::Protocols(window));
+                }
             }
             ev::MAP_NOTIFY => {
                 let window = word(8);
@@ -877,6 +941,15 @@ impl Xwm {
         let Some(window) = self.window_of(surface) else {
             return false;
         };
+        // Said out loud: asking a client to close is the one thing here that
+        // ends a session, and an X client obeys by hanging up its whole process
+        // group. If one arrives that nobody asked for, this is the line that
+        // says so.
+        unsafe {
+            write_stderr(&format!(
+                "[xwm] asking window {window:#x} (surface {surface}) to close\n"
+            ))
+        };
         self.send_delete(window);
         true
     }
@@ -892,7 +965,10 @@ impl Xwm {
             return false;
         };
         self.set_input_focus(window);
-        self.send_take_focus(window);
+        // Only if the client asked for it: see `send_take_focus`.
+        if self.windows.get(&window).is_some_and(|w| w.takes_focus) {
+            self.send_take_focus(window);
+        }
         true
     }
 

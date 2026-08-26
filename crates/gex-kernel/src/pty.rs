@@ -242,6 +242,9 @@ pub struct Remote {
     /// process table). Returns 1 when it changed.
     pub set_winsize: extern "C" fn(id: i32, packed: u64) -> i32,
     pub fg: extern "C" fn(id: i32) -> i32,
+    /// Which pty a session has claimed as its controlling terminal, or -1.
+    /// This is what `/dev/tty` resolves to inside a terminal emulator.
+    pub for_sid: extern "C" fn(sid: i32) -> i32,
     pub set_fg: extern "C" fn(id: i32, pgrp: i32),
     pub sid: extern "C" fn(id: i32) -> i32,
     pub set_sid: extern "C" fn(id: i32, sid: i32),
@@ -322,10 +325,21 @@ impl crate::vfs::FileHandle for RemotePty {
     }
 
     fn claim_session(&self, sid: i32) {
-        // What `TIOCSCTTY` means for a pty that lives in the global kernel: the
-        // session is recorded there, where the hangup rule can ask whether it is
-        // still alive. See `slave_session_alive` in shims/kernel.
+        // What `TIOCSCTTY` means for a pty that lives in the global kernel.
+        //
+        // The session is recorded there, where the hangup rule can ask whether
+        // it is still alive (see `hangup_is_real` in shims/kernel) -- and so is
+        // the foreground process group, because claiming a controlling terminal
+        // is what makes the claimer's group the foreground one. Only a session
+        // leader may claim, and a session leader's group is its own pid, which
+        // is the session id: so the group is the session.
+        //
+        // Without that second half every read from the terminal is a background
+        // read: the kernel answers a shell's `read` with SIGTTIN, and a terminal
+        // shows a shell that echoes what is typed (the line discipline does
+        // that) and never runs any of it.
         (self.remote.set_sid)(self.id, sid);
+        (self.remote.set_fg)(self.id, sid);
     }
 
     fn ioctl(&self, m: &mut crate::GuestMem<'_>, request: u64, arg: u64) -> Option<SysResult> {

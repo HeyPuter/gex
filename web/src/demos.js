@@ -1269,7 +1269,15 @@ const SESSION_APPS = [
   },
   { id: 'xeyes', label: 'xeyes — X11 through rootless Xwayland', kind: 'x', cmd: 'xeyes' },
   { id: 'xclock', label: 'xclock — X11 through rootless Xwayland', kind: 'x', cmd: 'xclock' },
-  { id: 'xterm', label: 'xterm — X11 through rootless Xwayland (draws no text yet)', kind: 'x', cmd: 'xterm' },
+  {
+    id: 'xterm',
+    label: 'xterm — a terminal, X11 through rootless Xwayland',
+    kind: 'x',
+    // With a script rather than bare: xterm with no `-e` looks for a shell in
+    // the password file, and this image has no entry to find.
+    cmd: 'xterm -e /bin/sh /usr/bin/shell.sh',
+    on: true,
+  },
   { id: 'xcalc', label: 'xcalc — X11 through rootless Xwayland', kind: 'x', cmd: 'xcalc' },
   {
     id: 'glxgears',

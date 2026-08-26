@@ -495,7 +495,9 @@ export async function runProgram(
       // count up from 1, and this is 'xwl1' as ASCII.
       token: 0x78776c31,
       display: ':0',
-      verbose: globalThis.GEX_HOSTX_VERBOSE || undefined,
+      // `?xverbose=N`: the X server's own log, which is the only thing that
+      // says what it told a client.
+      verbose: globalThis.GEX_HOSTX_VERBOSE || Number(new URLSearchParams(location.search).get('xverbose')) || undefined,
       trace: globalThis.GEX_HOSTX_TRACE || undefined,
       wlTrace: flag('wltrace') ? 1 : undefined,
     });

@@ -80,6 +80,19 @@ int main(int argc, char **argv) {
     if (pre >= 0) close(pre);   /* exactly what xterm does */
     printf("forked child %d, parent closed its slave\n", pid);
 
+    /* Anything on the command line after the program is typed at the terminal:
+     * written to the master, so the line discipline echoes it and the child
+     * reads it as input. This is how a shell reading commands from a terminal
+     * is tested without a terminal emulator in the way. */
+    if (argc > 2) {
+        usleep(400000);
+        char line[256];
+        int n = snprintf(line, sizeof line, "%s\n", argv[2]);
+        ssize_t w = write(m, line, n);
+        printf("typed %zd bytes: %s", w, line);
+        fflush(stdout);
+    }
+
     int reads = 0;
     /* Long enough to see a second and third write, which is the point: a
      * terminal that prints one line and stops looks fine for the first

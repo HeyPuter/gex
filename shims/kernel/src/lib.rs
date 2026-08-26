@@ -1074,6 +1074,10 @@ pub extern "C" fn k_spawn(ppid: i32) -> i32 {
 /// [`k_wait`] turns the two into the one word a parent reads.
 #[no_mangle]
 pub extern "C" fn k_exit(pid: i32, status: i32) {
+    // The exit owes this process's parent a SIGCHLD, which `exit` sets. Record
+    // it like any other signal so a delivery can be traced back to the process
+    // that ended -- "why did the terminal think its shell died" needs the pid.
+    note_kill(pid, procs().ppid(pid), gex_kernel::signal::sig::SIGCHLD);
     procs().exit(pid, status);
 }
 
@@ -1152,11 +1156,22 @@ static SIGNAL_SEQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::
 /// are spread out -- the shared terminal's line discipline, a pty hangup, and
 /// any guest's own `kill`. The shim reads this for its death report.
 static LAST_KILL: Mutex<(i32, i32, u32)> = Mutex::new((0, 0, 0));
+/// How many signals have been sent, so notes from different Workers can be put
+/// in order -- which is the whole question when one process's signal makes
+/// another one misbehave.
+static KILL_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn note_kill(caller: i32, target: i32, signo: u32) {
     if signo != 0 {
         *LAST_KILL.lock().unwrap_or_else(|e| e.into_inner()) = (caller, target, signo);
+        KILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// How many signals have been sent so far. See `note_kill`.
+#[no_mangle]
+pub extern "C" fn k_last_kill_seq() -> u32 {
+    KILL_SEQ.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Caller in the high bits, target in the middle, signal in the low byte. A
@@ -1791,6 +1806,28 @@ pub extern "C" fn k_pty_set_winsize(id: i32, packed: u64) -> i32 {
         pty_signal(&p, gex_kernel::signal::sig::SIGWINCH);
     }
     changed as i32
+}
+
+/// Which pty this session claimed as its controlling terminal, or -1.
+///
+/// `/dev/tty` means "the caller's controlling terminal", and for anything
+/// running inside a terminal emulator that is a pty in here -- not the page's
+/// own terminal, which is what the name used to resolve to. A shell opens
+/// /dev/tty for job control and compares its foreground group with its own; the
+/// page's terminal never matches, so the shell spun raising SIGTTIN at itself
+/// and ran nothing.
+#[no_mangle]
+pub extern "C" fn k_pty_for_sid(sid: i32) -> i32 {
+    if sid <= 0 {
+        return -1;
+    }
+    let t = ptys().lock().unwrap_or_else(|e| e.into_inner());
+    for (i, p) in t.iter().enumerate() {
+        if p.tty.sid() == sid {
+            return i as i32;
+        }
+    }
+    -1
 }
 
 #[no_mangle]

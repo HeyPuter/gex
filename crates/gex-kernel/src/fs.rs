@@ -14,6 +14,9 @@ pub mod oflags {
     pub const O_TRUNC: u64 = 0o1000;
     pub const O_APPEND: u64 = 0o2000;
     pub const O_NONBLOCK: u64 = 0o4000;
+    /// Opening a terminal does *not* make it this session's controlling one.
+    /// Without this flag a session leader's open claims it -- see `open_pty`.
+    pub const O_NOCTTY: u64 = 0o400;
     pub const O_DIRECTORY: u64 = 0o200000;
     pub const O_CLOEXEC: u64 = 0o2000000;
     /// An unnamed file created inside the named *directory*. The bit overlaps

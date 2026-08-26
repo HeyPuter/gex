@@ -347,7 +347,9 @@ extern "C" {
     fn k_pty_write(id: i32, master: i32, at: u32, len: u32) -> i32;
     fn k_pty_readable(id: i32, master: i32) -> i32;
     fn k_pty_counts(id: i32) -> u32;
+    fn k_pty_for_sid(sid: i32) -> i32;
     fn k_last_kill() -> u64;
+    fn k_last_kill_seq() -> u32;
     fn k_pty_available(id: i32, master: i32) -> i32;
     fn k_pty_ptn(id: i32) -> i32;
     fn k_pty_get_lock(id: i32) -> i32;
@@ -486,10 +488,25 @@ extern "C" fn r_wait_ready(ppid: i32, want: i32) -> i32 {
 extern "C" fn r_has_children(ppid: i32) -> i32 {
     unsafe { k_has_children(ppid) }
 }
+/// The first few signals a guest sends, capped. One process signalling another
+/// is where a session comes apart -- a terminal hanging up a live shell, a
+/// shell killing its jobs -- and the receiver's death report can only say what
+/// arrived, not who decided it.
+fn signal_note(what: &str, caller: i32, target: i32, signo: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SAID: AtomicU32 = AtomicU32::new(0);
+    if signo == 0 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
+        return;
+    }
+    warn_line(&format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n"));
+}
+
 extern "C" fn r_kill(caller: i32, target: i32, signo: u32) -> i32 {
+    signal_note("pid", caller, target, signo);
     unsafe { k_kill(caller, target, signo) }
 }
 extern "C" fn r_kill_group(caller: i32, pgid: i32, signo: u32) -> i32 {
+    signal_note("group", caller, pgid, signo);
     unsafe { k_kill_group(caller, pgid, signo) }
 }
 extern "C" fn r_take_signals(pid: i32) -> u64 {
@@ -885,10 +902,17 @@ extern "C" fn rpty_winsize(id: i32) -> u64 {
 extern "C" fn rpty_set_winsize(id: i32, packed: u64) -> i32 {
     unsafe { k_pty_set_winsize(id, packed) }
 }
+extern "C" fn rpty_for_sid(sid: i32) -> i32 {
+    unsafe { k_pty_for_sid(sid) }
+}
 extern "C" fn rpty_fg(id: i32) -> i32 {
     unsafe { k_pty_fg(id) }
 }
 extern "C" fn rpty_set_fg(id: i32, pgrp: i32) {
+    // Who the terminal's foreground group is, capped. A shell that is not it
+    // spins raising SIGTTIN at itself (dash's `setjobctl` does exactly that),
+    // which looks like a terminal that echoes and never runs anything.
+    pty_note(&format!("makes group {pgrp} the foreground of"), id, 0, my_pid());
     unsafe { k_pty_set_fg(id, pgrp) }
 }
 extern "C" fn rpty_sid(id: i32) -> i32 {
@@ -923,6 +947,7 @@ fn global_ptys() -> Option<gex_kernel::pty::Remote> {
         winsize: rpty_winsize,
         set_winsize: rpty_set_winsize,
         fg: rpty_fg,
+        for_sid: rpty_for_sid,
         set_fg: rpty_set_fg,
         sid: rpty_sid,
         set_sid: rpty_set_sid,
@@ -5520,6 +5545,33 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         match outcome {
             SyscallOutcome::Continue => 0,
             SyscallOutcome::Resume(target) => {
+                // A syscall boundary that resumes somewhere else is a signal
+                // handler frame: the process took a signal here. Capped, and
+                // with where the signal came from (`k_last_kill`), because a
+                // signal that should never have been sent looks like a program
+                // misbehaving -- a terminal tearing down a live session.
+                {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static SAID: AtomicU32 = AtomicU32::new(0);
+                    if SAID.fetch_add(1, Ordering::Relaxed) < 32 {
+                        let last = if unsafe { k_present() } != 0 {
+                            let v = unsafe { k_last_kill() };
+                            format!(
+                                " (signal #{}: {} from pid {} to {})",
+                                unsafe { k_last_kill_seq() },
+                                v & 0xff,
+                                (v >> 40) as i32,
+                                ((v >> 8) & 0xffff_ffff) as i32
+                            )
+                        } else {
+                            String::new()
+                        };
+                        warn_line(&format!(
+                            "[sig] pid {} runs a handler at {target:#x}{last}\n",
+                            h.kernel.pid
+                        ));
+                    }
+                }
                 set_resume(target);
                 1
             }
@@ -5553,7 +5605,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     let caller = (v >> 40) as i32;
                     let target = ((v >> 8) & 0xffff_ffff) as i32;
                     let signo = (v & 0xff) as u32;
-                    format!(" (last signal sent: {signo} from pid {caller} to {target})")
+                    format!(
+                        " (signal #{}: {signo} from pid {caller} to {target})",
+                        unsafe { k_last_kill_seq() }
+                    )
                 } else {
                     String::new()
                 };
@@ -9190,6 +9245,31 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
             h.threads[cur()].pc = pc as u64;
             h.kernel.enter_thread(&h.threads[cur()].kstate);
             let d = h.kernel.deliver_pending(&mut gm);
+            // Which signals a process actually takes, capped. A signal that
+            // should never have been sent looks like a program misbehaving:
+            // xterm tearing down a live session, a shell exiting for no reason.
+            // Where it came from is in `k_last_kill`.
+            if !matches!(d, gex_kernel::signal::Delivery::None) {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SAID: AtomicU32 = AtomicU32::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 32 {
+                    let last = if unsafe { k_present() } != 0 {
+                        let v = unsafe { k_last_kill() };
+                        format!(
+                            " (last sent: {} from pid {} to {})",
+                            v & 0xff,
+                            (v >> 40) as i32,
+                            ((v >> 8) & 0xffff_ffff) as i32
+                        )
+                    } else {
+                        String::new()
+                    };
+                    warn_line(&format!(
+                        "[sig] pid {} takes a signal{last}\n",
+                        h.kernel.pid
+                    ));
+                }
+            }
             h.kernel.leave_thread(&mut h.threads[cur()].kstate);
             match d {
                 gex_kernel::signal::Delivery::None => 0,

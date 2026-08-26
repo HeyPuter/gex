@@ -2728,6 +2728,27 @@ impl Kernel {
     /// there is no pty support and `/dev/ptmx` falls through to `ENOENT`.
     fn open_pty(&mut self, p: &str, flags: u64) -> Option<SysResult> {
         let r = self.ptys?;
+        // `/dev/tty` is the caller's *controlling terminal*. Inside a terminal
+        // emulator that is a pty in the global kernel, not the page's own
+        // terminal -- a shell opens this for job control and compares its
+        // foreground group with its own, and the page's terminal never matches:
+        // dash then spins raising SIGTTIN at itself, which shows as a window
+        // that echoes what is typed and runs none of it. Only when this
+        // session has claimed one; otherwise the name falls through to the
+        // console handle, which is right for the page's own shell.
+        if p == "/dev/tty" {
+            let sid = self.procs.sid(self.pid, 0).unwrap_or(0);
+            let id = (r.for_sid)(sid);
+            if id >= 0 {
+                let handle = Arc::new(crate::pty::RemotePty { id, master: false, remote: r });
+                // A descriptor of its own on that end, so the counting stays
+                // right, but no claim: this session already owns it.
+                (r.open_end)(id, 0);
+                let file = OpenFile::new(handle, format!("pty:[{id}:s]"), flags, true, true);
+                return Some(self.fds.insert(file, flags & oflags::O_CLOEXEC != 0));
+            }
+            return None;
+        }
         let (id, master) = if p == "/dev/ptmx" {
             let packed = (r.open_master)();
             if packed < 0 {
@@ -2748,6 +2769,24 @@ impl Kernel {
             return None;
         };
         let handle = Arc::new(crate::pty::RemotePty { id, master, remote: r });
+        // Opening a terminal is how a session claims it.
+        //
+        // A session leader with no controlling terminal that opens one without
+        // O_NOCTTY acquires it, and its process group becomes the terminal's
+        // foreground group -- Linux does this in the open, not in `TIOCSCTTY`,
+        // and a terminal emulator's child relies on it: xterm's child calls
+        // `setsid` and opens the slave, and never issues the ioctl. Without
+        // this the shell it execs is in a *background* group, so the kernel
+        // answers every read from the terminal with SIGTTIN: a window that
+        // echoes what is typed (the line discipline does that) and runs none
+        // of it.
+        if !master && flags & oflags::O_NOCTTY == 0 {
+            let leader = self.procs.sid(self.pid, 0) == Ok(self.pid);
+            if leader {
+                use crate::vfs::FileHandle;
+                handle.claim_session(self.pid);
+            }
+        }
         let path = format!("pty:[{id}:{}]", if master { 'm' } else { 's' });
         let file = OpenFile::new(handle, path, flags, true, true);
         Some(self.fds.insert(file, flags & oflags::O_CLOEXEC != 0))

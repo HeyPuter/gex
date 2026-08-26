@@ -449,6 +449,23 @@ TWMRC
 fi
 [ -f "$SRC/session.sh" ] && cp "$SRC/session.sh" "$R/session.sh"
 
+# The terminal's shell.
+#
+# `xterm` with no `-e` goes looking for a shell in the password file, and this
+# image has no entry to find -- so the session starts it as `xterm -e /bin/sh
+# /usr/bin/shell.sh` and this is that script. A file in the image for the same
+# reason as .twmrc above: a shell cannot write one where another process will
+# see it.
+mkdir -p "$R/usr/bin"
+cat > "$R/usr/bin/shell.sh" <<'SHELL'
+#!/bin/sh
+# The shell xterm runs. Reads from the terminal, prints what its commands
+# print; no prompt, because dash only prints one when it is sure it is
+# interactive and it is not sure here.
+exec /bin/sh
+SHELL
+chmod 755 "$R/usr/bin/shell.sh"
+
 # glmark2's benchmark data: the 3D models, the GLSL shaders, and the textures
 # its scenes load. A real GL workload -- shaders, VBOs, framebuffers -- to
 # push virglrenderer well past spinning gears.
