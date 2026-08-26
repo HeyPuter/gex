@@ -63,6 +63,85 @@ mkdir -p "$WORK"
 R="$WORK/root"
 mkdir -p "$R"
 
+# Copy a list of paths into the image, once per file.
+#
+# `cp -L` on a list that names both `libfoo.so.1` and `libfoo.so.1.2.3` -- and a
+# NEEDED closure does, because both exist and one is a link -- writes the file
+# twice. That put two 106 MB copies of libLLVM in the image and two 30 MB copies
+# of libicudata, which is most of a quarter of a gigabyte for nothing. So: the
+# first name of a file is the file, and every later name of it becomes a
+# relative symlink, which is what the source tree has and what ld.so follows.
+install_paths() {
+    python3 - "$SRC" "$R" "$1" "$WORK/installed" <<'PYEOF'
+import os, shutil, sys
+
+src, dst, listing, index = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+
+def source_of(rel):
+    """Where the source tree keeps this file.
+
+    A name under /usr/lib may live in /lib in the source: they are the same
+    directory on a merged system and the image uses the one the guest's
+    search path names.
+    """
+    direct = os.path.join(src, rel)
+    if os.path.exists(direct):
+        return direct
+    if rel.startswith('usr/lib/'):
+        alt = os.path.join(src, rel[4:])
+        if os.path.exists(alt):
+            return alt
+    return None
+
+# The index is shared by every pass: the curated list, the NEEDED closure and
+# each manifest all name some of the same files, and two 106 MB copies of
+# libLLVM is what happens when each pass dedupes only against itself.
+by_real = {}
+if os.path.exists(index):
+    for line in open(index):
+        real, rel = line.rstrip('\n').split('\t', 1)
+        by_real[real] = rel
+files = 0
+links = 0
+missing = 0
+bytes_copied = 0
+for line in open(listing):
+    rel = line.strip().lstrip('/')
+    if not rel or rel.startswith('#'):
+        continue
+    s = source_of(rel)
+    if s is None:
+        missing += 1
+        continue
+    d = os.path.join(dst, rel)
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    real = os.path.realpath(s)
+    first = by_real.get(real)
+    if first is None:
+        by_real[real] = rel
+        if os.path.isdir(s):
+            continue
+        shutil.copyfile(real, d)
+        shutil.copymode(real, d)
+        files += 1
+        bytes_copied += os.path.getsize(real)
+    else:
+        # A second name for a file already installed: a link to it, relative so
+        # the image can be unpacked anywhere.
+        target = os.path.relpath(os.path.join(dst, first), os.path.dirname(d))
+        if os.path.lexists(d):
+            continue
+        os.symlink(target, d)
+        links += 1
+with open(index, 'w') as f:
+    for real, rel in by_real.items():
+        f.write(f'{real}\t{rel}\n')
+print(f'  {files} files ({bytes_copied / (1 << 20):.0f} MiB), {links} aliased, '
+      f'{missing} the source tree does not have', file=sys.stderr)
+PYEOF
+}
+
 # What to copy. The library list is the closure of a traced run, less LLVM and
 # z3; the programs are named because an execve does not look like an open.
 LIBS="
@@ -123,14 +202,47 @@ mkdir -p "$R/lib/aarch64-linux-gnu" "$R/usr/lib/aarch64-linux-gnu/dri" \
 # -L, so a name that is a symlink becomes the file. ld.so opens libraries by
 # the SONAME, which is the link name, so the target's own name is never
 # needed and copying both would double 22 MB of megadriver.
+: > "$WORK/curated"
 for l in $LIBS; do
-    for d in "$SRC/usr/lib/aarch64-linux-gnu" "$SRC/lib/aarch64-linux-gnu"; do
-        [ -e "$d/$l" ] || continue
-        cp -L "$d/$l" "$R/usr/lib/aarch64-linux-gnu/$l"
+    found=""
+    for d in /usr/lib/aarch64-linux-gnu /lib/aarch64-linux-gnu; do
+        [ -e "$SRC$d/$l" ] || continue
+        # Always under the multiarch name the SONAME uses, whichever directory
+        # the source keeps it in: /lib and /usr/lib are one place on this
+        # Debian, and the guest's search path points at one of them.
+        echo "/usr/lib/aarch64-linux-gnu/$l" >> "$WORK/curated"
+        found=1
         break
     done
-    [ -e "$R/usr/lib/aarch64-linux-gnu/$l" ] || echo "  missing: $l"
+    [ -n "$found" ] || echo "  missing: $l"
 done
+echo "  the traced closure:"
+install_paths "$WORK/curated"
+
+# What the image does NOT need, however it got in.
+#
+# A NEEDED closure follows everything a program *might* load, and Dolphin's
+# reaches the video and audio codecs behind its thumbnailers plus glibc's whole
+# charset module set. None of it is on the path of anything this session shows,
+# and it is a hundred megabytes of a page's memory before a window appears.
+# Dolphin without them thumbnails less; the alternative is Dolphin not
+# starting, because the tab ran out of memory unpacking the image.
+DROP="${GEX_KEEP_EXTRAS:+}"
+if [ -z "${GEX_KEEP_EXTRAS:-}" ]; then
+    DROP="libavcodec.so.* libavformat.so.* libavutil.so.* libswscale.so.*
+          libswresample.so.* libcodec2.so.* libavfilter.so.* libpostproc.so.*
+          libx264.so.* libx265.so.* libvpx.so.* libaom.so.* libdav1d.so.*
+          librav1e.so.* libsvtav1enc.so.* libzvbi.so.* libsrt-gnutls.so.*
+          libopenh264.so.* libmfx.so.* libva.so.* libva-drm.so.* libva-x11.so.*
+          libvidstab.so.* libshine.so.* libtwolame.so.* libmp3lame.so.*
+          libopenmpt.so.* libchromaprint.so.* libbs2b.so.* librubberband.so.*"
+fi
+for pattern in $DROP; do
+    rm -f "$R"/usr/lib/aarch64-linux-gnu/$pattern
+done
+# glibc's charset modules: 20 MB of tables for encodings nothing here reads.
+# UTF-8 needs no module at all.
+[ -z "${GEX_KEEP_EXTRAS:-}" ] && rm -rf "$R/usr/lib/aarch64-linux-gnu/gconv"
 cp -L "$SRC/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so" \
       "$R/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so"
 cp -L "$SRC/lib/ld-linux-aarch64.so.1" "$R/lib/ld-linux-aarch64.so.1"
@@ -138,9 +250,12 @@ cp -L "$SRC/lib/ld-linux-aarch64.so.1" "$R/lib/ld-linux-aarch64.so.1"
 # /lib and /usr/lib are the same directory on a Debian this recent, and the
 # guest's ld.so looks in both. Copying twice would double 22 MB, so the
 # search path is what points at one place.
+: > "$WORK/progs"
 for p in $PROGS; do
-    [ -e "$SRC/usr/bin/$p" ] && cp -L "$SRC/usr/bin/$p" "$R/usr/bin/$p"
+    [ -e "$SRC/usr/bin/$p" ] && echo "/usr/bin/$p" >> "$WORK/progs"
 done
+echo "  the programs:"
+install_paths "$WORK/progs"
 cp -L "$SRC/bin/dash" "$R/bin/sh"
 # The one coreutils program in the image. dash has no `sleep` builtin, and
 # without one the wait for the X socket spins through six hundred iterations
@@ -169,6 +284,7 @@ cp -L "$SRC/usr/bin/timeout" "$R/usr/bin/timeout"
 # only name anything ever opens.
 APPS="${GEX_APPS:-/usr/bin/gtk3-demo /usr/bin/gtk3-widget-factory
       /usr/bin/kcalc /usr/bin/qt6ct /usr/bin/compton-conf /usr/games/explosive-c4
+      /usr/bin/dolphin /usr/lib/aarch64-linux-gnu/libexec/kf5
       /usr/lib/aarch64-linux-gnu/qt5/plugins /usr/lib/aarch64-linux-gnu/qt6/plugins
       /usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0 /usr/lib/aarch64-linux-gnu/gtk-3.0}"
 
@@ -268,15 +384,31 @@ if missing:
     print(f'  missing: {" ".join(sorted(missing))}', file=sys.stderr)
 PYEOF
 
-while read -r rel; do
-    mkdir -p "$R$(dirname "$rel")"
-    cp -L "$SRC$rel" "$R$rel"
-done < "$WORK/closure"
+install_paths "$WORK/closure"
 
 # `explosive-c4` lives in /usr/games, which is not on the PATH of the shell
 # the page starts. A link, rather than a PATH the page has to know about.
 [ -e "$R/usr/games/explosive-c4" ] &&
     ln -sf ../games/explosive-c4 "$R/usr/bin/explosive-c4"
+
+# -- the app deltas recorded in web/rootfs-manifests -----------------------
+#
+# The closure pass above starts at a program and follows DT_NEEDED. A heavy KDE
+# application reaches much more than that: Dolphin runs KIO workers out of
+# libexec, loads kcms and parts as kservice plugins, and reads .desktop and
+# .kcfg data that names them -- none of it in anyone's DT_NEEDED. That file
+# list was derived once (see `web/rootfs-manifests/README.md`) and is written
+# down rather than re-derived here, so this pass is a copy of what the
+# manifest says.
+#
+# A path the source tree does not have is counted, not fatal: a manifest may
+# name a program this image was not built with, and the count is the signal
+# for whether that matters.
+for m in "$HERE"/rootfs-manifests/*-delta.txt; do
+    [ -f "$m" ] || continue
+    echo "  $(basename "$m"):"
+    install_paths "$m"
+done
 
 # Tcl/Tk's script library (wish will not start without init.tcl and tk.tcl) and
 # a self-contained demo script. Tk is single-threaded, so unlike GTK it does not
@@ -288,9 +420,33 @@ if [ -d "$SRC/usr/share/tcltk" ]; then
     ln -sf wish8.6 "$R/usr/bin/wish"
 fi
 
-# A window-manager session: twm managing several clients at once. twm's config
-# (auto-placement, since there is no user to drag windows) and the launcher.
-[ -f "$SRC/root/.twmrc" ] && { mkdir -p "$R/root"; cp "$SRC/root/.twmrc" "$R/root/.twmrc"; }
+# twm's configuration, for anyone who runs the X session by hand.
+#
+# The compositor demo does NOT use a window manager in the guest: gex-wayland
+# manages the X windows itself (`shims/browser/src/xwm.rs`), which is what
+# rootless Xwayland expects and what sway, mutter and kwin all do. twm is
+# still in the image, and if it is started it needs this: `RandomPlacement`,
+# because its default is to have a user place each window with the mouse, and
+# no decorations, because whatever draws the frames should draw all of them.
+#
+# It has to be a file in the image rather than something a session script
+# writes: every process has its own tmpfs, so a `cat > /root/.twmrc` in a
+# shell is invisible to the twm it then starts.
+mkdir -p "$R/root"
+if [ -f "$SRC/root/.twmrc" ]; then
+    cp "$SRC/root/.twmrc" "$R/root/.twmrc"
+else
+    cat > "$R/root/.twmrc" <<'TWMRC'
+NoGrabServer
+NoTitle
+NoHighlight
+NoMenus
+BorderWidth 0
+RandomPlacement
+NoRaiseOnMove
+OpaqueMove
+TWMRC
+fi
 [ -f "$SRC/session.sh" ] && cp "$SRC/session.sh" "$R/session.sh"
 
 # glmark2's benchmark data: the 3D models, the GLSL shaders, and the textures
@@ -327,7 +483,9 @@ for d in usr/share/glib-2.0/schemas usr/share/mime usr/share/icons \
          usr/share/kf5 usr/share/config.kcfg usr/share/kglobalaccel \
          usr/share/kconf_update usr/share/kservices5 usr/share/qt6ct \
          usr/share/compton-conf usr/share/gtk-3.0 usr/share/libthai \
-         etc/gtk-3.0; do
+         usr/share/dolphin usr/share/kxmlgui5 usr/share/knotifications5 \
+         usr/share/kio usr/share/solid usr/share/kservicetypes5 \
+         etc/gtk-3.0 etc/xdg; do
     [ -e "$SRC/$d" ] || continue
     mkdir -p "$R/$(dirname "$d")"
     cp -r "$SRC/$d" "$R/$d"
@@ -485,3 +643,36 @@ chmod +x "$R/gears.sh"
 mkdir -p "$(dirname "$OUT")"
 tar -C "$R" -cf "$OUT" .
 echo "  $OUT: $(du -h "$OUT" | cut -f1)"
+
+# -- the session image -----------------------------------------------------
+#
+# The compositor demo runs several of these programs at once, so what it costs
+# a browser tab to unpack is a real constraint: an image is fetched and then
+# written into the guest's filesystem, so every megabyte is paid for twice.
+#
+# libLLVM is 107 MB of that, and the temptation is to stub it for this image --
+# nothing in the session should enter llvmpipe, since Xwayland's glamor finds
+# no GPU and falls back to its own software blitting while the GL clients render
+# through Mesa's virgl driver. It does not work, and it fails quietly: with a
+# stub of `brk #0` in its place Xwayland initialises every extension, GLX
+# included, says it is ready, and then never answers a client. Its X clients and
+# the compositor's own window manager both sit in `connect` forever. Something
+# on the way through swrast's DRI entry points calls in, exactly as it does for
+# Xvfb.
+#
+# So this image is the graphics image, and what it adds is SuperTuxKart, because
+# a session that offers it needs one filesystem. `tar` archives are streams, so
+# appending is a copy rather than an unpack, and a path in both resolves the way
+# an extractor resolves it: the later entry wins.
+STK="$(dirname "$OUT")/stk.tar"
+SESSION="$(dirname "$OUT")/session.tar"
+if [ "${GEX_SESSION_TAR:-1}" != "0" ]; then
+    cp "$OUT" "$SESSION"
+    echo "  $SESSION: $(du -h "$SESSION" | cut -f1)"
+    if [ -f "$STK" ]; then
+        WITH_STK="$(dirname "$OUT")/session-stk.tar"
+        cp "$SESSION" "$WITH_STK"
+        tar --concatenate --file="$WITH_STK" "$STK"
+        echo "  $WITH_STK: $(du -h "$WITH_STK" | cut -f1) (with supertuxkart)"
+    fi
+fi

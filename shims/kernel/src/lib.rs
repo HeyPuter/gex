@@ -2084,7 +2084,17 @@ pub extern "C" fn k_sock_connect(path: u32, path_len: u32) -> i32 {
     let p = path_of_raw(path, path_len);
     let s = std::sync::Arc::new(UnixSocket::new(true));
     match names().connect(&s, &p) {
-        Ok(_) => keep(s),
+        Ok(_) => {
+            // A connection is waiting on someone's listener, and that someone
+            // may be parked. The guest syscall path wakes after every call;
+            // these entry points are reached from the *host* -- the
+            // compositor's X window manager, the page's own sockets -- and woke
+            // nothing at all. A parked Worker re-checks on its own every 20 ms
+            // whatever happens, so this is latency rather than correctness:
+            // without it a host-side connect waits for that timer.
+            k_wake();
+            keep(s)
+        }
         Err(e) => -e.0,
     }
 }
@@ -2094,7 +2104,12 @@ pub extern "C" fn k_sock_connect(path: u32, path_len: u32) -> i32 {
 pub extern "C" fn k_sock_accept(listener: i32) -> i32 {
     let Some(l) = sock_at(listener) else { return -9 };
     match l.accept() {
-        Ok(s) => keep(s),
+        Ok(s) => {
+            // The other end is connected now, which a parked client may be
+            // waiting to hear.
+            k_wake();
+            keep(s)
+        }
         Err(e) => -e.0,
     }
 }
@@ -2129,7 +2144,12 @@ pub extern "C" fn k_sock_write(id: i32, at: u32, len: u32) -> i32 {
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
     match s.send(&buf) {
-        Ok(n) => n as i32,
+        Ok(n) => {
+            // Bytes for whoever is reading, who may be parked. Same reason as
+            // `k_sock_connect`: the host has no syscall path to wake for it.
+            k_wake();
+            n as i32
+        }
         Err(e) => -e.0,
     }
 }

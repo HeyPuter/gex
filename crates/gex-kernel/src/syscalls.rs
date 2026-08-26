@@ -480,6 +480,15 @@ pub struct Kernel {
     /// a server and its clients are different processes and the whole point
     /// of a named socket is that they find each other by name.
     pub socket_names: Arc<unix::SocketNames>,
+    /// Names *this process's host* listens on, which is not the same table.
+    ///
+    /// The compositor and the GPU device are in the shim, one per process
+    /// (`mount_devices` gives every adopted child its own), and they can only
+    /// read the memory of the process they are in -- a `wl_shm` pool is guest
+    /// memory. So `wayland-0` must resolve to the compositor of the process
+    /// that is connecting, and not to whichever one bound the name last. It is
+    /// deliberately NOT shared across a fork: a child gets its own.
+    pub host_names: Arc<unix::SocketNames>,
     /// Advisory whole-file locks, shared for the same reason.
     pub file_locks: Arc<unix::FileLocks>,
     /// Where each object of a statically recompiled closure must be placed.
@@ -1027,6 +1036,7 @@ impl Kernel {
             epolls: Default::default(),
             memfds: Default::default(),
             socket_names: Arc::new(unix::SocketNames::new()),
+            host_names: Arc::new(unix::SocketNames::new()),
             file_locks: Arc::new(unix::FileLocks::new()),
             tty: Arc::new(crate::tty::TtyRef::new()),
         }
@@ -1247,6 +1257,11 @@ impl Kernel {
             // Named sockets are system-wide: a forked child must still be
             // able to reach a server its parent could.
             socket_names: Arc::clone(&self.socket_names),
+            // Host-served names are not: the child's own shim will bind its own
+            // compositor and GPU device over these, and connecting to the
+            // parent's would hand a client's surfaces to a process that cannot
+            // read them.
+            host_names: Arc::new(unix::SocketNames::new()),
             file_locks: Arc::clone(&self.file_locks),
             // The terminal is the system's, not this process's: a child
             // shares it rather than inheriting a copy.
@@ -4873,6 +4888,13 @@ impl Kernel {
                 self.install_remote_unix(fd, remote, flags, cloexec)?;
                 return Ok(0);
             }
+        }
+        // This process's own host first -- its compositor, its GPU device --
+        // then the system-wide table, which is where a guest server (an X
+        // server's socket) lives.
+        let mine = Arc::clone(&self.host_names);
+        if let Ok(r) = mine.connect(&sock, &path) {
+            return Ok(r);
         }
         let names = Arc::clone(&self.socket_names);
         names.connect(&sock, &path)

@@ -14,11 +14,13 @@ members = [
     "crates/gex-ld",
     "crates/gex-kernel",
     "crates/gex-wayland",
+    "crates/gex-xwm",
     "crates/gex-gpu",
     "crates/gex-gl",
     "crates/gex-virgl",
     "crates/gexc",
     "shims/browser",
+    "shims/hostwl",
     "shims/native",
     "tests/diff-fuzz",
 ]
@@ -35,6 +37,7 @@ gex-abi = { path = "crates/gex-abi" }
 gex-cache = { path = "crates/gex-cache" }
 gex-mem = { path = "crates/gex-mem" }
 gex-wayland = { path = "crates/gex-wayland" }
+gex-xwm = { path = "crates/gex-xwm" }
 gex-virgl = { path = "crates/gex-virgl" }
 gex-gpu = { path = "crates/gex-gpu" }
 gex-gl = { path = "crates/gex-gl" }

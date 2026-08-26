@@ -41,6 +41,19 @@ const KEYMAP: &str = "xkb_keymap {\n\
 pub trait Buffers {
     /// The bytes of the memory behind a descriptor, if it has any.
     fn map(&self, fd: u32, size: usize) -> Option<Vec<u8>>;
+
+    /// Where the memory behind a descriptor *is*, as an address in the address
+    /// space the host can read, and its length.
+    ///
+    /// This is the difference between a compositor that copies and one that
+    /// does not. A `wl_shm` pool is guest memory, and in the browser the host
+    /// can read guest memory directly -- so a host that implements this gets a
+    /// buffer's address and uploads the damaged rows to a texture, and nothing
+    /// ever copies a frame on the way out. `map` stays for the host that has no
+    /// such view (the native one, which composites from its own copy).
+    fn locate(&self, _fd: u32) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 /// A committed surface: what to draw, and where its pixels are.
@@ -57,6 +70,115 @@ pub struct Frame {
     pub pixels: Vec<u8>,
     /// The window title, when the surface has an `xdg_toplevel` with one.
     pub title: String,
+}
+
+/// What a surface is, as far as presentation is concerned. A surface with no
+/// role is not displayable; the rest are drawn differently and hit-tested
+/// differently, so the role is part of what the host is told.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Role {
+    /// Created, but given no role yet: not a window, and never drawn.
+    #[default]
+    None,
+    /// An `xdg_toplevel`: a window. The compositor places and decorates it.
+    Toplevel,
+    /// An `xdg_popup`: a menu or a combo box, placed relative to its parent by
+    /// the positioner the client sent.
+    Popup,
+    /// A `wl_subsurface`: part of its parent's window, at a fixed offset.
+    Subsurface,
+    /// The surface a client handed to `wl_pointer.set_cursor`. Drawn at the
+    /// pointer, offset by its hotspot -- never a window, never hit-tested.
+    Cursor,
+}
+
+impl Role {
+    /// The wire value the host sees, and what `Role::from_code` reads back.
+    pub fn code(self) -> u32 {
+        match self {
+            Role::None => 0,
+            Role::Toplevel => 1,
+            Role::Popup => 2,
+            Role::Subsurface => 3,
+            Role::Cursor => 4,
+        }
+    }
+}
+
+/// A rectangle of a surface that changed since the host last looked, in surface
+/// pixels. `w == 0` means "all of it" -- what a client that never sent a damage
+/// rectangle is asking for, and what a newly attached buffer of a new size is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Damage {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl Damage {
+    fn all() -> Damage {
+        Damage { x: 0, y: 0, w: 0, h: 0 }
+    }
+
+    /// Whether this means "the whole surface", which is what a client that
+    /// declared no damage at all is asking for.
+    pub fn is_all(&self) -> bool {
+        self.w <= 0 || self.h <= 0
+    }
+
+    /// The smallest rectangle covering both. Damage is a union of rectangles in
+    /// the protocol; one bounding box is what an upload wants, and the cost of
+    /// being loose is uploading a few rows nothing changed in.
+    fn merge(&mut self, o: Damage) {
+        if o.is_all() || self.is_all() {
+            *self = Damage::all();
+            return;
+        }
+        let x = self.x.min(o.x);
+        let y = self.y.min(o.y);
+        let r = (self.x + self.w).max(o.x + o.w);
+        let b = (self.y + self.h).max(o.y + o.h);
+        *self = Damage { x, y, w: r - x, h: b - y };
+    }
+}
+
+/// One surface, as the host needs it to draw a frame: what it is, where its
+/// pixels are, and what changed.
+///
+/// Deliberately flat and `Copy`: the host mirrors an array of these into shared
+/// memory every pump, and a compositor that allocates per surface per frame is
+/// a compositor that stutters.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceInfo {
+    /// The `wl_surface` object id, which is the host's handle for it.
+    pub surface: u32,
+    pub role: Role,
+    /// The parent surface for a popup or a subsurface, else 0.
+    pub parent: u32,
+    /// Offset from the parent (popup, subsurface), or the cursor's hotspot.
+    pub rel_x: i32,
+    pub rel_y: i32,
+    pub width: i32,
+    pub height: i32,
+    /// Where the pixels are: an address in the guest's address space, and the
+    /// row stride. Zero when the surface has no buffer the host can read.
+    pub addr: u32,
+    pub stride: i32,
+    /// A `wl_shm` format code: 0 is ARGB8888, 1 is XRGB8888.
+    pub format: u32,
+    /// Bumped on every commit that brings new pixels, so the host can tell a
+    /// surface that redrew from one that is merely still there.
+    pub serial: u32,
+    pub damage: Damage,
+    /// The `xdg_toplevel` title, for the decoration the host draws.
+    pub title: String,
+    /// The client asked to be moved by the pointer (`xdg_toplevel.move`), which
+    /// is how a client-decorated window is dragged by its own titlebar.
+    pub move_requested: bool,
+    /// An X window, paired to this surface by the compositor's own X window
+    /// manager rather than given a role by its client.
+    pub x11: bool,
 }
 
 /// Interfaces the registry advertises, with the version offered. A toolkit
@@ -105,6 +227,12 @@ const GLOBALS: &[(&str, u32)] = &[
     // requests are accepted and ignored (no real clipboard/DnD or subsurfaces).
     ("wl_data_device_manager", 3),
     ("wl_subcompositor", 1),
+    // Server-side decorations, which is what makes this a compositor rather
+    // than a surface mirror: a Qt or KDE client that sees this protocol stops
+    // drawing its own titlebar and lets the compositor do it. GTK 3 has never
+    // implemented it and decorates itself regardless -- the same thing it does
+    // under KWin, so it is the right answer there too, not a gap here.
+    ("zxdg_decoration_manager_v1", 1),
 ];
 
 /// What an object id currently is.
@@ -127,11 +255,68 @@ enum Object {
     XdgSurface { surface: u32 },
     XdgToplevel { xdg_surface: u32 },
     Positioner,
+    XdgPopup { xdg_surface: u32 },
     DataDeviceManager,
     Subcompositor,
+    Subsurface { surface: u32 },
+    DecorationManager,
+    Decoration { surface: u32 },
     /// An object whose requests we accept and ignore (data devices/sources,
     /// subsurfaces) -- present so GTK's init completes, does nothing observable.
     Stub,
+}
+
+/// An `xdg_positioner`: where a popup wants to be, expressed the way the
+/// protocol expresses it -- a rectangle on the parent, an edge of that
+/// rectangle to hang from, and a direction to grow in.
+#[derive(Clone, Copy, Debug, Default)]
+struct Positioner {
+    width: i32,
+    height: i32,
+    anchor_rect: (i32, i32, i32, i32),
+    anchor: u32,
+    gravity: u32,
+    offset: (i32, i32),
+}
+
+impl Positioner {
+    /// The popup's top-left corner relative to the parent's window geometry.
+    ///
+    /// The anchor picks a point on the anchor rectangle; the gravity says which
+    /// way the popup grows from it. Both are the same nine-value enum, so both
+    /// are read the same way: 0 none (the centre), 1 top, 2 bottom, 3 left,
+    /// 4 right, and 5..8 the corners.
+    fn place(&self) -> (i32, i32) {
+        let (ax, ay, aw, ah) = self.anchor_rect;
+        let (mut x, mut y) = (ax + aw / 2, ay + ah / 2);
+        match self.anchor {
+            1 => y = ay,
+            2 => y = ay + ah,
+            3 => x = ax,
+            4 => x = ax + aw,
+            5 => { x = ax; y = ay }
+            6 => { x = ax + aw; y = ay }
+            7 => { x = ax; y = ay + ah }
+            8 => { x = ax + aw; y = ay + ah }
+            _ => {}
+        }
+        let (w, h) = (self.width.max(0), self.height.max(0));
+        // Gravity is where the popup goes relative to the anchor point, so it
+        // decides which corner of the popup lands there.
+        match self.gravity {
+            1 => y -= h,
+            2 => {}
+            3 => x -= w,
+            4 => {}
+            5 => { x -= w; y -= h }
+            6 => { y -= h }
+            7 => { x -= w }
+            8 => {}
+            // "none": centred on the anchor point.
+            _ => { x -= w / 2; y -= h / 2 }
+        }
+        (x + self.offset.0, y + self.offset.1)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -158,11 +343,54 @@ struct SurfaceState {
     /// that does not get these back stops drawing.
     pending_callbacks: Vec<u32>,
     title: String,
+    app_id: String,
     /// The `xdg_surface` that gave this surface a role, if any.
     xdg: Option<u32>,
     /// Set once the client has acknowledged a configure, which is when a
     /// toplevel is allowed to show anything.
     configured: bool,
+    /// What this surface is for. Set when it takes a role, and the reason an
+    /// unroled surface (a cursor image, a scratch buffer) never reaches the
+    /// output.
+    role: Role,
+    /// The parent of a popup or a subsurface, and the offset from it. For a
+    /// cursor these carry the hotspot instead.
+    parent: u32,
+    rel_x: i32,
+    rel_y: i32,
+    /// Where the last committed buffer's pixels are and what shape they are:
+    /// the descriptor the host draws from, rather than a copy of them.
+    addr: u32,
+    stride: i32,
+    width: i32,
+    height: i32,
+    format: u32,
+    /// Bumped on every commit with new pixels.
+    serial: u32,
+    /// Damage the client has declared and the host has not drawn yet, kept
+    /// pending until commit like everything else in Wayland.
+    ///
+    /// `None` is not the same as an empty rectangle: it means the client
+    /// declared nothing, and `Damage::all()` -- an empty rectangle -- means
+    /// "everything". Conflating the two made every commit a full upload,
+    /// because the accumulator started at the value that means all of it.
+    pending_damage: Option<Damage>,
+    damage: Option<Damage>,
+    /// The window geometry a client set with `xdg_surface.set_window_geometry`:
+    /// the part of the surface that is the window, excluding the invisible
+    /// margins GTK leaves for its shadows. What the compositor decorates and
+    /// hit-tests, when it is set.
+    geom: Option<(i32, i32, i32, i32)>,
+    /// `xdg_toplevel.move`: the client wants the pointer to drag its window.
+    move_requested: bool,
+    /// This surface is an X11 window, paired with it by the X window manager.
+    /// It has no xdg role and never will: rootless Xwayland hands the
+    /// compositor bare surfaces and names them over the X connection.
+    x11: bool,
+    /// A NULL buffer was attached: this commit unmaps the surface.
+    pending_null: bool,
+    /// Subsurfaces of this surface, in bottom-to-top order.
+    children: Vec<u32>,
 }
 
 /// One connected client.
@@ -182,15 +410,30 @@ pub struct Client {
     next_serial: u32,
     /// The size a toplevel is told it is.
     default_size: (i32, i32),
+    /// Positioner state, by object id: what a popup asked to be placed against.
+    positioners: HashMap<u32, Positioner>,
+    /// Surfaces whose scene state changed since the host last published it, so
+    /// a pump that changed nothing costs nothing.
+    dirty: bool,
     /// Set when the protocol has been violated and the connection is over.
     pub failed: Option<String>,
     /// The `wl_pointer` and `wl_keyboard` object ids once the client asks for
     /// them, so injected input has somewhere to go.
     pointer: Option<u32>,
     keyboard: Option<u32>,
-    /// The surface input is delivered to: the last one to commit a buffer, i.e.
-    /// the visible window.
+    /// The surface input is delivered to when the host has not said which:
+    /// the last one to commit a buffer. What a one-window host wants, and the
+    /// fallback for the native host, which composites from copies and has no
+    /// hit test of its own.
     focus_surface: Option<u32>,
+    /// The surface the host's hit test says the pointer is over, and the one it
+    /// gave the keyboard to. A real compositor decides both, so these win over
+    /// `focus_surface` when set.
+    pointer_target: Option<u32>,
+    keyboard_target: Option<u32>,
+    /// The surface the client last handed to `set_cursor`, so a new one
+    /// replaces it rather than leaving two cursors in the scene.
+    cursor_surface: Option<u32>,
     /// The last position the host injected, in surface pixels. An `enter`
     /// carries it, so a click that arrives without a motion in front of it --
     /// or right after the focus moved -- lands where the pointer is rather
@@ -231,10 +474,15 @@ impl Client {
             frames: Vec::new(),
             next_serial: 1,
             default_size: (640, 480),
+            positioners: HashMap::new(),
+            dirty: false,
             failed: None,
             pointer: None,
             keyboard: None,
             focus_surface: None,
+            pointer_target: None,
+            keyboard_target: None,
+            cursor_surface: None,
             pointer_at: (0, 0),
             pointer_on: None,
             keyboard_on: None,
@@ -335,6 +583,12 @@ impl Client {
                 Object::XdgToplevel { xdg_surface } => {
                     self.xdg_toplevel(object, xdg_surface, opcode, &mut r)
                 }
+                Object::XdgPopup { xdg_surface } => {
+                    self.xdg_popup(object, xdg_surface, opcode, &mut r)
+                }
+                Object::Subsurface { surface } => self.subsurface(object, surface, opcode, &mut r),
+                Object::DecorationManager => self.decoration_manager(opcode, &mut r),
+                Object::Decoration { surface } => self.decoration(object, surface, opcode, &mut r),
                 Object::Seat => self.seat(opcode, &mut r),
                 Object::DataDeviceManager => {
                     // create_data_source(id) = 0, get_data_device(id, seat) = 1;
@@ -349,22 +603,12 @@ impl Client {
                         _ => true,
                     }
                 }
-                Object::Subcompositor => {
-                    // destroy = 0; get_subsurface(id, surface, parent) = 1.
-                    match opcode {
-                        1 => {
-                            if let Some(id) = r.new_id() {
-                                self.objects.insert(id, Object::Stub);
-                            }
-                            true
-                        }
-                        _ => true,
-                    }
-                }
+                Object::Subcompositor => self.subcompositor(opcode, &mut r),
                 // Data devices/sources and subsurfaces: none of their requests
                 // creates a child object, so just accept and ignore everything.
                 Object::Stub => true,
-                Object::Buffer(_) | Object::Region | Object::Positioner => {
+                Object::Positioner => self.positioner(object, opcode, &mut r),
+                Object::Buffer(_) | Object::Region => {
                     // Every one of these has `destroy` at opcode 0 and
                     // requests that change nothing observable here.
                     if opcode == 0 {
@@ -382,7 +626,31 @@ impl Client {
                     // cursor (the page's own shows), so set_cursor is accepted
                     // and ignored; release destroys.
                     match opcode {
-                        0 => true,
+                        // set_cursor(serial, surface, hotspot_x, hotspot_y).
+                        // The compositor draws it: a real pointer image, from
+                        // the client, at the hotspot the client chose.
+                        0 => {
+                            let (_serial, cursor, hx, hy) =
+                                (r.uint(), r.object(), r.int(), r.int());
+                            let cursor = cursor.unwrap_or(0);
+                            if let Some(prev) = self.cursor_surface.take() {
+                                if prev != cursor {
+                                    if let Some(s) = self.surfaces.get_mut(&prev) {
+                                        s.role = Role::None;
+                                    }
+                                }
+                            }
+                            if cursor != 0 {
+                                if let Some(s) = self.surfaces.get_mut(&cursor) {
+                                    s.role = Role::Cursor;
+                                    s.rel_x = hx.unwrap_or(0);
+                                    s.rel_y = hy.unwrap_or(0);
+                                }
+                                self.cursor_surface = Some(cursor);
+                            }
+                            self.dirty = true;
+                            true
+                        }
                         1 => {
                             self.objects.remove(&object);
                             if self.pointer == Some(object) {
@@ -545,6 +813,9 @@ impl Client {
             "wl_subcompositor" => {
                 self.objects.insert(id, Object::Subcompositor);
             }
+            "zxdg_decoration_manager_v1" => {
+                self.objects.insert(id, Object::DecorationManager);
+            }
             _ => return false,
         }
         true
@@ -661,12 +932,47 @@ impl Client {
         match opcode {
             // destroy
             0 => {
+                // Every place that remembers this surface forgets it, and the
+                // input focus most of all: a `leave` naming a destroyed object
+                // is a fatal protocol error, and it killed Xwayland the moment
+                // a second window appeared -- "unknown object (15), message
+                // leave(uo)", and with the X server went the whole session.
+                // No leave is sent here: the object is already gone, and the
+                // client knows it destroyed it.
+                if self.pointer_on == Some(object) {
+                    self.pointer_on = None;
+                }
+                if self.keyboard_on == Some(object) {
+                    self.keyboard_on = None;
+                }
+                if self.pointer_target == Some(object) {
+                    self.pointer_target = None;
+                }
+                if self.keyboard_target == Some(object) {
+                    self.keyboard_target = None;
+                }
+                if self.focus_surface == Some(object) {
+                    self.focus_surface = None;
+                }
+                if self.cursor_surface == Some(object) {
+                    self.cursor_surface = None;
+                }
+                // Out of its parent's child list too, or a destroyed tooltip
+                // stays in the scene as a dangling id.
+                let parent = self.surfaces.get(&object).map(|s| s.parent).unwrap_or(0);
+                if let Some(p) = self.surfaces.get_mut(&parent) {
+                    p.children.retain(|c| *c != object);
+                }
                 self.objects.remove(&object);
                 self.surfaces.remove(&object);
                 self.delete_id(object);
+                self.dirty = true;
                 true
             }
-            // attach(buffer, x, y)
+            // attach(buffer, x, y). A NULL buffer is not "no change": it
+            // unmaps the surface, and it is how a client hides a window
+            // without destroying it. Kept apart from "attached nothing this
+            // commit", or a hidden window stays on screen forever.
             1 => {
                 let Some(buffer) = r.object() else {
                     return false;
@@ -674,12 +980,31 @@ impl Client {
                 let (_x, _y) = (r.int(), r.int());
                 if let Some(s) = self.surfaces.get_mut(&object) {
                     s.pending_buffer = if buffer == 0 { None } else { Some(buffer) };
+                    s.pending_null = buffer == 0;
                 }
                 true
             }
-            // damage(x, y, width, height): irrelevant to a compositor that
-            // always redraws.
-            2 => true,
+            // damage(x, y, width, height), in surface coordinates. What makes
+            // an upload cheap: a text cursor blinking in a terminal is a
+            // 8x16 rectangle, and uploading the whole window for it is the
+            // difference between a compositor that idles and one that does not.
+            2 => {
+                let (Some(x), Some(y), Some(w), Some(h)) = (r.int(), r.int(), r.int(), r.int())
+                else {
+                    return false;
+                };
+                if let Some(s) = self.surfaces.get_mut(&object) {
+                    let rect = Damage { x, y, w, h };
+                    s.pending_damage = Some(match s.pending_damage {
+                        Some(mut held) => {
+                            held.merge(rect);
+                            held
+                        }
+                        None => rect,
+                    });
+                }
+                true
+            }
             // frame(callback)
             3 => {
                 let Some(id) = r.new_id() else { return false };
@@ -696,8 +1021,28 @@ impl Client {
                 self.commit(object, buffers);
                 true
             }
-            // set_buffer_transform, set_buffer_scale, damage_buffer, offset
-            7 | 8 | 9 | 10 => true,
+            // set_buffer_transform, set_buffer_scale, offset
+            7 | 8 | 10 => true,
+            // damage_buffer(x, y, width, height), in buffer coordinates. The
+            // same thing as `damage` at scale 1 and no transform, which is
+            // every surface here -- and it is the one toolkits actually use.
+            9 => {
+                let (Some(x), Some(y), Some(w), Some(h)) = (r.int(), r.int(), r.int(), r.int())
+                else {
+                    return false;
+                };
+                if let Some(s) = self.surfaces.get_mut(&object) {
+                    let rect = Damage { x, y, w, h };
+                    s.pending_damage = Some(match s.pending_damage {
+                        Some(mut held) => {
+                            held.merge(rect);
+                            held
+                        }
+                        None => rect,
+                    });
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -707,6 +1052,19 @@ impl Client {
         let Some(state) = self.surfaces.get(&surface).cloned() else {
             return;
         };
+        if state.pending_null {
+            // Unmapped: no pixels, so nothing to draw and nothing to hit-test.
+            // The role is kept -- the surface is still a toplevel, it is just
+            // not on screen -- so a later attach maps it again.
+            if let Some(s) = self.surfaces.get_mut(&surface) {
+                s.pending_null = false;
+                s.committed_buffer = None;
+                s.pending_buffer = None;
+                s.addr = 0;
+            }
+            self.dirty = true;
+            return;
+        }
         let buffer_id = state.pending_buffer.or(state.committed_buffer);
         // The initial, bufferless commit of a surface that has an xdg role: the
         // xdg_shell contract is that the compositor answers THIS commit with an
@@ -722,55 +1080,101 @@ impl Client {
                 self.send(w);
             }
         }
+        // A surface with no role is not displayable, and no compositor shows
+        // one: a cursor image, a scratch buffer, a surface whose popup was just
+        // dismissed. Its buffer is still released below -- a client whose
+        // buffer never comes back stops drawing.
         let mut produced = None;
-        // A surface with no shell role is not a window, and must never reach the
-        // canvas or take the input focus.
+        // The descriptor is recorded whatever the surface's role is -- even
+        // none. Rootless Xwayland attaches and commits before its window
+        // manager has paired the surface with an X window, and a client's
+        // cursor surface is committed before `set_cursor` names it: a
+        // descriptor dropped because the role had not arrived yet is a window
+        // that never appears. `scene()` is where the role decides what is
+        // drawn.
         //
-        // `wl_pointer.set_cursor` hands the compositor a small surface holding
-        // the cursor image, and a toolkit points its cursor the instant the
-        // pointer enters. Without this test the first mouse move over a Qt or
-        // KDE window replaced the window on the canvas with a giant arrow --
-        // and worse, `focus_surface` follows whatever last committed a frame,
-        // so the pointer focus moved to the cursor surface and every click
-        // after it was delivered to an object the toolkit does not draw with.
-        // That is the other half of "the pointer moves but clicking does
-        // nothing". Subsurfaces (GTK's tooltips) are the same story.
-        //
-        // No compositor shows an unroled surface either. The buffer is still
-        // released below whatever happens here: a client whose cursor buffer
-        // never comes back stops drawing.
-        let is_window = state.xdg.is_some();
+        // The *copy* path below is different: it exists for a host with no
+        // view into guest memory, and copying a frame for a surface that is
+        // not a window is pure waste.
+        let showable = state.role != Role::None;
         if let Some(buffer_id) = buffer_id {
-            if !is_window && Self::tracing() {
-                trace_out(&format!(
-                    "[wl] commit on surface {surface} with no role -- not a window"
-                ));
-            }
-            if let (true, Some(Object::Buffer(spec))) =
-                (is_window, self.objects.get(&buffer_id).cloned())
-            {
-                let mapped = buffers.map(spec.fd, spec.pool_size);
+            if let Some(Object::Buffer(spec)) = self.objects.get(&buffer_id).cloned() {
+                // Where the pixels are, not what they are. `locate` hands back
+                // the address of the client's pool in an address space the host
+                // can read, so the frame is never copied: the host uploads the
+                // damaged rows straight out of the guest's memory. A host with
+                // no such view (the native one) says None, and gets a `Frame`
+                // with the pixels in it as before.
+                let placed = buffers.locate(spec.fd).and_then(|(base, len)| {
+                    let off = u32::try_from(spec.offset).ok()?;
+                    let need = u32::try_from(spec.stride)
+                        .ok()?
+                        .checked_mul(u32::try_from(spec.height).ok()?)?;
+                    // A client that claims more than its pool holds is refused
+                    // rather than read: this is a length the guest chose.
+                    if spec.stride < spec.width.checked_mul(4)? || off.checked_add(need)? > len {
+                        return None;
+                    }
+                    base.checked_add(off)
+                });
                 if Self::tracing() {
                     trace_out(&format!(
-                        "[wl] buffer {buffer_id}: fd {} pool {} -> {:?} bytes, {}x{} stride {}",
-                        spec.fd,
-                        spec.pool_size,
-                        mapped.as_ref().map(|p| p.len()),
-                        spec.width,
-                        spec.height,
-                        spec.stride
+                        "[wl] buffer {buffer_id}: fd {} pool {} -> addr {:?}, {}x{} stride {}",
+                        spec.fd, spec.pool_size, placed, spec.width, spec.height, spec.stride
                     ));
                 }
-                if let Some(pool) = mapped {
-                    produced = Self::cut(&pool, &spec).map(|pixels| Frame {
-                        surface,
-                        width: spec.width,
-                        height: spec.height,
-                        stride: spec.stride,
-                        format: spec.format,
-                        pixels,
-                        title: state.title.clone(),
-                    });
+                match placed {
+                    Some(addr) => {
+                        // The whole surface is damaged when its size changed --
+                        // the host's texture is remade -- or when it had no
+                        // pixels at all before. NOT when the address changed:
+                        // damage is relative to the *surface*, and a
+                        // double-buffered client alternates between two
+                        // buffers every frame, so treating a new address as
+                        // full damage uploads a whole window per frame and
+                        // makes damage tracking do nothing.
+                        let resized =
+                            state.width != spec.width || state.height != spec.height;
+                        // A client that attached a buffer and declared no
+                        // damage gets a full upload: it is the only safe
+                        // reading, and shm clients do it.
+                        let mut damage = state.pending_damage.unwrap_or_else(Damage::all);
+                        if resized || state.addr == 0 {
+                            damage = Damage::all();
+                        }
+                        if let Some(s) = self.surfaces.get_mut(&surface) {
+                            s.addr = addr;
+                            s.stride = spec.stride;
+                            s.width = spec.width;
+                            s.height = spec.height;
+                            s.format = spec.format;
+                            s.serial = s.serial.wrapping_add(1);
+                            s.damage = Some(match s.damage {
+                                Some(mut held) => {
+                                    held.merge(damage);
+                                    held
+                                }
+                                None => damage,
+                            });
+                            s.pending_damage = None;
+                        }
+                        self.dirty = true;
+                    }
+                    None if showable => {
+                        let mapped = buffers.map(spec.fd, spec.pool_size);
+                        if let Some(pool) = mapped {
+                            produced = Self::cut(&pool, &spec).map(|pixels| Frame {
+                                surface,
+                                width: spec.width,
+                                height: spec.height,
+                                stride: spec.stride,
+                                format: spec.format,
+                                pixels,
+                                title: state.title.clone(),
+                            });
+                        }
+                    }
+                    None => {}
                 }
             }
             // A client may not draw into a buffer again until it is released,
@@ -778,25 +1182,12 @@ impl Client {
             let w = Writer::new(buffer_id, 0);
             self.send(w);
         }
-        match produced {
-            Some(frame) => {
-                // The visible window, and so where injected input is delivered.
-                self.focus_surface = Some(surface);
-                // Keyboard focus follows the window the moment it appears,
-                // rather than waiting for a key to arrive and entering then.
-                // A toolkit acts on `enter` in its own event loop -- Qt makes
-                // the toplevel the active window a turn later -- so a key
-                // delivered in the same batch as the enter reaches a window
-                // that is not focused yet and is dropped on the floor. Typing
-                // into KCalc lost its first digit every run because of it.
-                // Idempotent, and a no-op until the client binds a keyboard.
-                self.ensure_keyboard_enter();
-                self.frames.push(frame);
-            }
-            None if buffer_id.is_some() && Self::tracing() => {
-                trace_out(&format!("[wl] commit on surface {surface} produced no frame"));
-            }
-            None => {}
+        if let Some(frame) = produced {
+            // The host that composites from copies has one window, and it is
+            // whichever last drew.
+            self.focus_surface = Some(surface);
+            self.ensure_keyboard_enter();
+            self.frames.push(frame);
         }
         // Frame callbacks belong to the commit that carried them. The argument
         // is meant to be a monotonic millisecond timestamp, used only for
@@ -874,8 +1265,12 @@ impl Client {
         r: &mut Reader<'_>,
     ) -> bool {
         match opcode {
-            // destroy
+            // destroy: the surface loses its role, and a surface with no role
+            // is not on screen. Without this a client that recreates its
+            // window -- which Qt does on a resize -- left the old one drawn,
+            // and a session accumulated empty stacked frames.
             0 => {
+                self.unmap(surface);
                 self.objects.remove(&object);
                 self.delete_id(object);
                 true
@@ -889,26 +1284,68 @@ impl Client {
                         xdg_surface: object,
                     },
                 );
-                // A toplevel may not draw until configured, so the size goes out
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.role = Role::Toplevel;
+                }
+                self.dirty = true;
+                // A toplevel may not draw until configured, so a size goes out
                 // at once. A real size (not 0x0, "you choose") is what a tiling
-                // compositor sends.
+                // compositor sends, and a window that has just appeared is the
+                // active one.
                 let (w, h) = self.default_size;
-                let ev = Writer::new(id, 0).int(w).int(h).array(&[]);
-                self.send(ev);
-                let serial = self.serial();
-                let ev = Writer::new(object, 0).uint(serial);
-                self.send(ev);
-                let _ = surface;
+                self.send_toplevel_configure(id, object, w, h, true);
                 true
             }
             // get_popup(id, parent, positioner)
             2 => {
-                let Some(id) = r.new_id() else { return false };
-                self.objects.insert(id, Object::Positioner);
+                let (Some(id), parent, Some(pos)) = (r.new_id(), r.object(), r.object()) else {
+                    return false;
+                };
+                self.objects.insert(id, Object::XdgPopup { xdg_surface: object });
+                let placed = self.positioners.get(&pos).copied().unwrap_or_default();
+                let (x, y) = placed.place();
+                // The parent is an xdg_surface, and what the compositor places
+                // against is its wl_surface.
+                let parent_surface = match parent.and_then(|p| self.objects.get(&p)) {
+                    Some(Object::XdgSurface { surface }) => *surface,
+                    _ => 0,
+                };
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.role = Role::Popup;
+                    s.parent = parent_surface;
+                    s.rel_x = x;
+                    s.rel_y = y;
+                }
+                self.dirty = true;
+                // configure(x, y, width, height), then the xdg_surface configure
+                // that makes the pair complete. A popup that gets no configure
+                // never attaches a buffer -- which is why menus never appeared.
+                let ev = Writer::new(id, 0)
+                    .int(x)
+                    .int(y)
+                    .int(placed.width)
+                    .int(placed.height);
+                self.send(ev);
+                let serial = self.serial();
+                let ev = Writer::new(object, 0).uint(serial);
+                self.send(ev);
                 true
             }
-            // set_window_geometry(x, y, width, height)
-            3 => true,
+            // set_window_geometry(x, y, width, height): the part of the surface
+            // that is the window. GTK leaves invisible margins for its shadows
+            // and says so here, and a compositor that decorates or hit-tests
+            // the whole surface instead draws a frame around the shadow.
+            3 => {
+                let (Some(x), Some(y), Some(w), Some(h)) = (r.int(), r.int(), r.int(), r.int())
+                else {
+                    return false;
+                };
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.geom = Some((x, y, w, h));
+                }
+                self.dirty = true;
+                true
+            }
             // ack_configure(serial)
             4 => {
                 if let Some(s) = self.surfaces.get_mut(&surface) {
@@ -928,8 +1365,12 @@ impl Client {
         r: &mut Reader<'_>,
     ) -> bool {
         match opcode {
-            // destroy
+            // destroy: the window is gone, whatever the client does with the
+            // wl_surface next.
             0 => {
+                if let Some(surface) = self.surface_of_xdg(xdg_surface) {
+                    self.unmap(surface);
+                }
                 self.objects.remove(&object);
                 self.delete_id(object);
                 true
@@ -939,20 +1380,408 @@ impl Client {
             // set_title(title)
             2 => {
                 let Some(title) = r.string() else { return false };
-                let surface = match self.objects.get(&xdg_surface) {
-                    Some(Object::XdgSurface { surface }) => *surface,
-                    _ => return false,
-                };
-                if let Some(s) = self.surfaces.get_mut(&surface) {
+                let surface = self.surface_of_xdg(xdg_surface);
+                if let Some(s) = surface.and_then(|k| self.surfaces.get_mut(&k)) {
                     s.title = title;
+                }
+                self.dirty = true;
+                true
+            }
+            // set_app_id(app_id)
+            3 => {
+                let Some(app_id) = r.string() else { return false };
+                let surface = self.surface_of_xdg(xdg_surface);
+                if let Some(s) = surface.and_then(|k| self.surfaces.get_mut(&k)) {
+                    s.app_id = app_id;
                 }
                 true
             }
-            // set_app_id, show_window_menu, move, resize, set_max_size,
-            // set_min_size, set_maximized, unset_maximized, set_fullscreen,
-            // unset_fullscreen, set_minimized -- all layout, none of which
-            // changes what the host is handed.
-            3..=13 => true,
+            // show_window_menu(seat, serial, x, y)
+            4 => true,
+            // move(seat, serial): drag me. A client that draws its own frames
+            // (every GTK app) reports a titlebar drag this way, and it is the
+            // only way the compositor can know a CSD window is being moved.
+            5 => {
+                let surface = self.surface_of_xdg(xdg_surface);
+                if let Some(s) = surface.and_then(|k| self.surfaces.get_mut(&k)) {
+                    s.move_requested = true;
+                }
+                self.dirty = true;
+                true
+            }
+            // resize(seat, serial, edges): the same for an interactive resize.
+            // The compositor drives resizes from its own frame, so this is
+            // accepted and the drag is not started.
+            6 => true,
+            // set_max_size, set_min_size, set_maximized, unset_maximized,
+            // set_fullscreen, unset_fullscreen, set_minimized -- layout the
+            // compositor decides, so acknowledged and not acted on.
+            7..=13 => true,
+            _ => false,
+        }
+    }
+
+
+    /// Take a surface off the screen: no role, no pixels, no place in the
+    /// scene. What a destroyed role and an unmapped window have in common.
+    fn unmap(&mut self, surface: u32) {
+        // The pointer and the keyboard leave a surface that stops being
+        // mapped -- said now, while the object still exists to be named. A
+        // client that unmaps commonly destroys next, and after that naming it
+        // is a protocol error.
+        if self.pointer_on == Some(surface) {
+            if let Some(ptr) = self.pointer {
+                let serial = self.serial();
+                self.send(Writer::new(ptr, 1).uint(serial).object(surface));
+                self.pointer_frame();
+            }
+            self.pointer_on = None;
+        }
+        if self.keyboard_on == Some(surface) {
+            if let Some(kbd) = self.keyboard {
+                let serial = self.serial();
+                self.send(Writer::new(kbd, 2).uint(serial).object(surface));
+            }
+            self.keyboard_on = None;
+        }
+        if let Some(s) = self.surfaces.get_mut(&surface) {
+            s.role = Role::None;
+            s.addr = 0;
+            s.committed_buffer = None;
+            s.pending_buffer = None;
+            s.xdg = None;
+            s.configured = false;
+        }
+        if self.pointer_target == Some(surface) {
+            self.pointer_target = None;
+        }
+        if self.keyboard_target == Some(surface) {
+            self.keyboard_target = None;
+        }
+        if self.focus_surface == Some(surface) {
+            self.focus_surface = None;
+        }
+        self.dirty = true;
+    }
+
+    /// The `wl_surface` an `xdg_surface` gave a role to.
+    fn surface_of_xdg(&self, xdg_surface: u32) -> Option<u32> {
+        match self.objects.get(&xdg_surface) {
+            Some(Object::XdgSurface { surface }) => Some(*surface),
+            _ => None,
+        }
+    }
+
+    /// The `xdg_toplevel` (and its `xdg_surface`) of a surface, if it has one.
+    fn toplevel_of_surface(&self, surface: u32) -> Option<(u32, u32)> {
+        let xdg = self.surfaces.get(&surface)?.xdg?;
+        let toplevel = self.objects.iter().find_map(|(id, o)| match o {
+            Object::XdgToplevel { xdg_surface } if *xdg_surface == xdg => Some(*id),
+            _ => None,
+        })?;
+        Some((toplevel, xdg))
+    }
+
+    /// `xdg_toplevel.configure` and the `xdg_surface.configure` that completes
+    /// it: the size the compositor has decided, and whether this window has the
+    /// keyboard. A toplevel may not draw until it has had one.
+    fn send_toplevel_configure(
+        &mut self,
+        toplevel: u32,
+        xdg_surface: u32,
+        w: i32,
+        h: i32,
+        activated: bool,
+    ) {
+        // The states array is a list of little-endian u32s: 1 maximized,
+        // 2 fullscreen, 3 resizing, 4 activated. A window with none of them
+        // draws itself as inactive, which is why an app that never gets
+        // `activated` looks greyed out and takes no keyboard focus of its own.
+        let mut states = Vec::new();
+        if activated {
+            states.extend_from_slice(&4u32.to_le_bytes());
+        }
+        let ev = Writer::new(toplevel, 0).int(w).int(h).array(&states);
+        self.send(ev);
+        let serial = self.serial();
+        let ev = Writer::new(xdg_surface, 0).uint(serial);
+        self.send(ev);
+    }
+
+    // -- xdg_positioner -----------------------------------------------------
+
+    /// Where a popup wants to go. Every request here is a field of the
+    /// placement, applied when `get_popup` reads it -- so a positioner is
+    /// state, not behaviour.
+    fn positioner(&mut self, object: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        let p = self.positioners.entry(object).or_default();
+        match opcode {
+            // destroy
+            0 => {
+                self.positioners.remove(&object);
+                self.objects.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            // set_size(width, height)
+            1 => match (r.int(), r.int()) {
+                (Some(w), Some(h)) => {
+                    p.width = w;
+                    p.height = h;
+                    true
+                }
+                _ => false,
+            },
+            // set_anchor_rect(x, y, width, height)
+            2 => match (r.int(), r.int(), r.int(), r.int()) {
+                (Some(x), Some(y), Some(w), Some(h)) => {
+                    p.anchor_rect = (x, y, w, h);
+                    true
+                }
+                _ => false,
+            },
+            // set_anchor(anchor)
+            3 => match r.uint() {
+                Some(a) => {
+                    p.anchor = a;
+                    true
+                }
+                None => false,
+            },
+            // set_gravity(gravity)
+            4 => match r.uint() {
+                Some(g) => {
+                    p.gravity = g;
+                    true
+                }
+                None => false,
+            },
+            // set_constraint_adjustment(adjustment): which way a popup may be
+            // flipped or slid to stay on screen. The compositor clamps popups
+            // to the output itself, so this needs no state of its own.
+            5 => true,
+            // set_offset(x, y)
+            6 => match (r.int(), r.int()) {
+                (Some(x), Some(y)) => {
+                    p.offset = (x, y);
+                    true
+                }
+                _ => false,
+            },
+            // set_reactive, set_parent_size, set_parent_configure (v3)
+            7..=9 => true,
+            _ => false,
+        }
+    }
+
+    // -- xdg_popup ----------------------------------------------------------
+
+    /// A menu, a combo box drop-down, a tooltip: a surface placed against its
+    /// parent rather than by the compositor.
+    fn xdg_popup(
+        &mut self,
+        object: u32,
+        xdg_surface: u32,
+        opcode: u16,
+        r: &mut Reader<'_>,
+    ) -> bool {
+        let surface = match self.objects.get(&xdg_surface) {
+            Some(Object::XdgSurface { surface }) => *surface,
+            _ => return false,
+        };
+        match opcode {
+            // destroy: the popup is gone, and so is the surface's role. Its
+            // parent stays mapped -- a menu closing must not take the window
+            // with it.
+            0 => {
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.role = Role::None;
+                    s.committed_buffer = None;
+                    s.addr = 0;
+                }
+                self.dirty = true;
+                self.objects.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            // grab(seat, serial): the client asks for an implicit grab, so that
+            // a click outside the popup dismisses it. Accepted -- the
+            // compositor dismisses popups on an outside click anyway, which is
+            // the behaviour the grab is for.
+            1 => true,
+            // reposition(positioner, token)
+            2 => {
+                let (Some(pos), Some(token)) = (r.object(), r.uint()) else {
+                    return false;
+                };
+                let placed = self.positioners.get(&pos).copied().unwrap_or_default();
+                let (x, y) = placed.place();
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.rel_x = x;
+                    s.rel_y = y;
+                }
+                self.dirty = true;
+                // repositioned(token), then the configure pair a client waits
+                // for before it redraws.
+                let w = Writer::new(object, 2).uint(token);
+                self.send(w);
+                let ev = Writer::new(object, 0)
+                    .int(x)
+                    .int(y)
+                    .int(placed.width)
+                    .int(placed.height);
+                self.send(ev);
+                let serial = self.serial();
+                let w = Writer::new(xdg_surface, 0).uint(serial);
+                self.send(w);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // -- wl_subcompositor / wl_subsurface -----------------------------------
+
+    fn subcompositor(&mut self, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            // destroy
+            0 => true,
+            // get_subsurface(id, surface, parent)
+            1 => {
+                let (Some(id), Some(surface), Some(parent)) =
+                    (r.new_id(), r.object(), r.object())
+                else {
+                    return false;
+                };
+                self.objects.insert(id, Object::Subsurface { surface });
+                if let Some(sub) = self.surfaces.get_mut(&surface) {
+                    sub.role = Role::Subsurface;
+                    sub.parent = parent;
+                }
+                if let Some(p) = self.surfaces.get_mut(&parent) {
+                    if !p.children.contains(&surface) {
+                        p.children.push(surface);
+                    }
+                }
+                self.dirty = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Part of another surface's window: a tooltip, a GTK popover, the
+    /// video plane of a player. Position is relative to the parent, and
+    /// stacking is relative to its siblings.
+    fn subsurface(
+        &mut self,
+        object: u32,
+        surface: u32,
+        opcode: u16,
+        r: &mut Reader<'_>,
+    ) -> bool {
+        match opcode {
+            // destroy
+            0 => {
+                let parent = self.surfaces.get(&surface).map(|s| s.parent).unwrap_or(0);
+                if let Some(p) = self.surfaces.get_mut(&parent) {
+                    p.children.retain(|c| *c != surface);
+                }
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.role = Role::None;
+                    s.parent = 0;
+                }
+                self.dirty = true;
+                self.objects.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            // set_position(x, y)
+            1 => {
+                let (Some(x), Some(y)) = (r.int(), r.int()) else {
+                    return false;
+                };
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.rel_x = x;
+                    s.rel_y = y;
+                }
+                self.dirty = true;
+                true
+            }
+            // place_above(sibling) / place_below(sibling)
+            2 | 3 => {
+                let Some(sibling) = r.object() else { return false };
+                let parent = self.surfaces.get(&surface).map(|s| s.parent).unwrap_or(0);
+                if let Some(p) = self.surfaces.get_mut(&parent) {
+                    p.children.retain(|c| *c != surface);
+                    let at = p.children.iter().position(|c| *c == sibling);
+                    match (at, opcode) {
+                        (Some(i), 2) => p.children.insert(i + 1, surface),
+                        (Some(i), _) => p.children.insert(i, surface),
+                        (None, _) => p.children.push(surface),
+                    }
+                }
+                self.dirty = true;
+                true
+            }
+            // set_sync / set_desync: whether the child's commits wait for the
+            // parent's. Every commit here is applied when it arrives, which is
+            // what desync means and is indistinguishable for a client that
+            // commits both in the same frame -- which is all of them.
+            4 | 5 => true,
+            _ => false,
+        }
+    }
+
+    // -- xdg_decoration -----------------------------------------------------
+
+    fn decoration_manager(&mut self, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            // destroy
+            0 => true,
+            // get_toplevel_decoration(id, toplevel)
+            1 => {
+                let (Some(id), Some(toplevel)) = (r.new_id(), r.object()) else {
+                    return false;
+                };
+                let surface = match self.objects.get(&toplevel) {
+                    Some(Object::XdgToplevel { xdg_surface }) => {
+                        match self.objects.get(xdg_surface) {
+                            Some(Object::XdgSurface { surface }) => *surface,
+                            _ => return false,
+                        }
+                    }
+                    _ => return false,
+                };
+                self.objects.insert(id, Object::Decoration { surface });
+                // configure(mode): server_side (2). Said immediately, because a
+                // client that asked for the decoration is waiting for the
+                // answer before it lays anything out.
+                let w = Writer::new(id, 0).uint(2);
+                self.send(w);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn decoration(&mut self, object: u32, _surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            // destroy
+            0 => {
+                self.objects.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            // set_mode(mode) / unset_mode: the answer is server_side either
+            // way. A client may ask for client_side and this compositor says no
+            // -- which is allowed, and is the point of drawing the frames here.
+            1 | 2 => {
+                let _ = r.uint();
+                let w = Writer::new(object, 0).uint(2);
+                self.send(w);
+                true
+            }
             _ => false,
         }
     }
@@ -1009,6 +1838,198 @@ impl Client {
     // (so events before `get_pointer`/`get_keyboard` are dropped, not queued)
     // and a surface is visible to enter.
 
+
+    // -- what the host draws ------------------------------------------------
+
+    /// Every surface the host should draw, with where its pixels are.
+    ///
+    /// Only surfaces that have a role and a buffer: a toplevel that has not
+    /// drawn yet, a dismissed popup and a scratch surface are all absent, which
+    /// is what "not mapped" means in this protocol.
+    pub fn scene(&self) -> Vec<SurfaceInfo> {
+        let mut out = Vec::new();
+        for (id, s) in &self.surfaces {
+            if s.role == Role::None || s.addr == 0 || s.width <= 0 || s.height <= 0 {
+                continue;
+            }
+            out.push(SurfaceInfo {
+                surface: *id,
+                role: s.role,
+                parent: s.parent,
+                rel_x: s.rel_x,
+                rel_y: s.rel_y,
+                width: s.width,
+                height: s.height,
+                addr: s.addr,
+                stride: s.stride,
+                format: s.format,
+                serial: s.serial,
+                // With nothing outstanding the value does not matter: the
+                // host only reads damage when the serial has moved on.
+                damage: s.damage.unwrap_or_else(Damage::all),
+                title: s.title.clone(),
+                move_requested: s.move_requested,
+                x11: s.x11,
+            });
+        }
+        // A stable order, so a host that keys textures by index rather than by
+        // surface id is not quietly wrong. HashMap iteration is not an order.
+        out.sort_by_key(|s| s.surface);
+        out
+    }
+
+    /// Whether the scene changed since this was last asked. A pump that
+    /// changed nothing should cost the host nothing.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// The damage a host has now drawn. Cleared per surface, because a host
+    /// that draws a frame and leaves the damage behind uploads it forever.
+    pub fn clear_damage(&mut self, surface: u32) {
+        if let Some(s) = self.surfaces.get_mut(&surface) {
+            s.damage = None;
+        }
+    }
+
+    /// The windows whose clients asked to be dragged (`xdg_toplevel.move`),
+    /// taken once. A client-decorated window reports a titlebar drag this way.
+    pub fn take_move_requests(&mut self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (id, s) in self.surfaces.iter_mut() {
+            if s.move_requested {
+                s.move_requested = false;
+                out.push(*id);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Tell a window what size to be, and whether it has the keyboard. This is
+    /// how a compositor resizes: it configures, and the client redraws to fit.
+    pub fn configure(&mut self, surface: u32, w: i32, h: i32, activated: bool) {
+        let Some((toplevel, xdg)) = self.toplevel_of_surface(surface) else {
+            return;
+        };
+        self.send_toplevel_configure(toplevel, xdg, w, h, activated);
+    }
+
+    /// Ask a window to close, the way a titlebar's close button does. The
+    /// client decides what that means -- a text editor may put up a dialog --
+    /// which is why this is a request and not a kill.
+    pub fn close(&mut self, surface: u32) {
+        if let Some((toplevel, _)) = self.toplevel_of_surface(surface) {
+            let w = Writer::new(toplevel, 1);
+            self.send(w);
+        }
+    }
+
+    /// Dismiss a popup: `xdg_popup.popup_done`, which is what a compositor
+    /// sends when a click lands outside an open menu.
+    pub fn dismiss_popup(&mut self, surface: u32) {
+        let Some(xdg) = self.surfaces.get(&surface).and_then(|s| s.xdg) else {
+            return;
+        };
+        let popup = self.objects.iter().find_map(|(id, o)| match o {
+            Object::XdgPopup { xdg_surface } if *xdg_surface == xdg => Some(*id),
+            _ => None,
+        });
+        if let Some(popup) = popup {
+            let w = Writer::new(popup, 1);
+            self.send(w);
+        }
+    }
+
+    // -- X11 windows --------------------------------------------------------
+    //
+    // Rootless Xwayland does not use xdg_shell. It creates a plain
+    // `wl_surface` per X window and tells the compositor's X window manager
+    // which is which (`WL_SURFACE_ID`), so a surface becomes a window on the
+    // manager's word rather than on a role it requested. These are how that
+    // word arrives.
+
+    /// Whether this client has a surface with this id at all -- the pairing
+    /// message can arrive before the surface does.
+    pub fn has_surface(&self, surface: u32) -> bool {
+        self.surfaces.contains_key(&surface)
+    }
+
+    /// This surface is an X window: a toplevel the compositor decorates, or --
+    /// if the X window is override-redirect, which is what a menu is -- a
+    /// popup positioned in output coordinates by the client itself.
+    pub fn adopt_x11(&mut self, surface: u32, title: &str, override_redirect: bool, x: i32, y: i32) {
+        let Some(s) = self.surfaces.get_mut(&surface) else {
+            return;
+        };
+        s.role = if override_redirect { Role::Popup } else { Role::Toplevel };
+        s.x11 = true;
+        s.parent = 0;
+        s.rel_x = x;
+        s.rel_y = y;
+        if !title.is_empty() {
+            s.title = title.to_string();
+        } else if s.title.is_empty() {
+            s.title = "X11".to_string();
+        }
+        self.dirty = true;
+    }
+
+    /// The X window is gone or unmapped.
+    pub fn forget_x11(&mut self, surface: u32) {
+        if self.surfaces.get(&surface).map(|s| s.x11) == Some(true) {
+            self.unmap(surface);
+            if let Some(s) = self.surfaces.get_mut(&surface) {
+                s.x11 = false;
+            }
+        }
+    }
+
+    /// Whether a surface is an X window, which decides where a close or a move
+    /// has to be sent: to the X server, not to an xdg_toplevel that does not
+    /// exist.
+    pub fn is_x11(&self, surface: u32) -> bool {
+        self.surfaces.get(&surface).map(|s| s.x11).unwrap_or(false)
+    }
+
+    /// Move the pointer to a position on a particular surface, entering it (and
+    /// leaving whatever it was on) if the surface changed.
+    ///
+    /// This is the compositor's hit test speaking: the host knows where every
+    /// window is, so it -- not this state machine -- decides which surface the
+    /// pointer is over.
+    pub fn pointer_to(&mut self, surface: u32, x: i32, y: i32, time: u32) {
+        self.pointer_target = Some(surface);
+        self.pointer_motion(x, y, time);
+    }
+
+    /// The pointer left every surface of this client (it is over another
+    /// client's window, or over the compositor's own decorations).
+    pub fn pointer_clear(&mut self) {
+        self.pointer_target = None;
+        let (Some(ptr), Some(old)) = (self.pointer, self.pointer_on.take()) else {
+            return;
+        };
+        let serial = self.serial();
+        self.send(Writer::new(ptr, 1).uint(serial).object(old)); // leave
+        self.pointer_frame();
+    }
+
+    /// Give the keyboard to a surface, or to none.
+    pub fn keyboard_focus(&mut self, surface: u32) {
+        if surface == 0 {
+            self.keyboard_target = None;
+            let (Some(kbd), Some(old)) = (self.keyboard, self.keyboard_on.take()) else {
+                return;
+            };
+            let serial = self.serial();
+            self.send(Writer::new(kbd, 2).uint(serial).object(old)); // leave
+            return;
+        }
+        self.keyboard_target = Some(surface);
+        self.ensure_keyboard_enter();
+    }
+
     /// The keymap payload the host must hand the client as an SCM_RIGHTS fd,
     /// taken once. `Some` exactly after a `get_keyboard`.
     pub fn take_keymap(&mut self) -> Option<Vec<u8>> {
@@ -1025,9 +2046,16 @@ impl Client {
     /// leaving the previous one first. Returns whether the pointer is now on a
     /// surface.
     fn ensure_pointer_enter(&mut self) -> bool {
-        let (Some(ptr), Some(surface)) = (self.pointer, self.focus_surface) else {
+        let target = self.pointer_target.or(self.focus_surface);
+        let (Some(ptr), Some(surface)) = (self.pointer, target) else {
             return false;
         };
+        // A surface the client has destroyed cannot be entered, and the host's
+        // hit test can be a frame behind the client.
+        if !self.surfaces.contains_key(&surface) {
+            self.pointer_target = None;
+            return false;
+        }
         if self.pointer_on == Some(surface) {
             return true;
         }
@@ -1111,9 +2139,16 @@ impl Client {
     /// `wl_keyboard.enter` the focus surface if not already focused, priming the
     /// client's xkb state with an empty modifiers event. Returns whether focused.
     fn ensure_keyboard_enter(&mut self) -> bool {
-        let (Some(kbd), Some(surface)) = (self.keyboard, self.focus_surface) else {
+        let target = self.keyboard_target.or(self.focus_surface);
+        let (Some(kbd), Some(surface)) = (self.keyboard, target) else {
             return false;
         };
+        // A surface the client has destroyed cannot be given the keyboard, and the host's
+        // hit test can be a frame behind the client.
+        if !self.surfaces.contains_key(&surface) {
+            self.keyboard_target = None;
+            return false;
+        }
         if self.keyboard_on == Some(surface) {
             return true;
         }
@@ -1146,8 +2181,18 @@ impl Client {
 
     /// A key (Linux evdev code, i.e. X keycode minus 8) went down or up.
     pub fn keyboard_key(&mut self, key: u32, pressed: bool, time: u32) {
-        let Some(kbd) = self.keyboard else { return };
+        let Some(kbd) = self.keyboard else {
+            trace_out("[wl] a key arrived before the client asked for a keyboard");
+            return;
+        };
         if !self.ensure_keyboard_enter() {
+            // Nowhere to send it: the host has not said which surface has the
+            // keyboard, and nothing has drawn. Said out loud because a key that
+            // vanishes here looks exactly like a client ignoring it.
+            trace_out(&format!(
+                "[wl] key {key} dropped: no focused surface (target {:?})",
+                self.keyboard_target
+            ));
             return;
         }
         let serial = self.serial();
@@ -1514,6 +2559,397 @@ mod tests {
             format: 1,
         };
         assert!(Client::cut(&vec![0u8; 64], &spec).is_none());
+    }
+
+    /// A pool whose memory the host can *place* rather than copy, which is what
+    /// the browser does: the descriptor path, and the one the compositor uses.
+    struct Placed(u32, u32);
+    impl Buffers for Placed {
+        fn map(&self, _fd: u32, size: usize) -> Option<Vec<u8>> {
+            Some(vec![0u8; size])
+        }
+        fn locate(&self, _fd: u32) -> Option<(u32, u32)> {
+            Some((self.0, self.1))
+        }
+    }
+
+    /// A client with a toplevel that has drawn, on a pool the host located
+    /// rather than copied. Returns the client and the surface id.
+    fn placed_window(w: i32, h: i32, stride: i32) -> (Client, u32) {
+        let pool = Placed(0x10_0000, (stride * h) as u32 + 64);
+        let mut c = Client::new();
+        let mut go = |c: &mut Client, bytes: Vec<u8>, fds: &[u32]| {
+            c.receive(&bytes, fds, &pool);
+        };
+        go(&mut c, Writer::new(1, 1).new_id(2).finish(), &[]);
+        for (name, iface, ver, id) in [
+            (1u32, "wl_compositor", 4u32, 3u32),
+            (2, "wl_shm", 1, 4),
+            (5, "xdg_wm_base", 3, 5),
+        ] {
+            go(
+                &mut c,
+                Writer::new(2, 0).uint(name).string(iface).uint(ver).new_id(id).finish(),
+                &[],
+            );
+        }
+        go(&mut c, Writer::new(3, 0).new_id(6).finish(), &[]);
+        go(&mut c, Writer::new(5, 2).new_id(7).object(6).finish(), &[]);
+        go(&mut c, Writer::new(7, 1).new_id(8).finish(), &[]);
+        go(&mut c, Writer::new(8, 2).string("a window").finish(), &[]);
+        go(&mut c, Writer::new(7, 4).uint(2).finish(), &[]);
+        go(&mut c, Writer::new(4, 0).new_id(9).int(stride * h).finish(), &[77]);
+        go(
+            &mut c,
+            Writer::new(9, 0).new_id(10).int(0).int(w).int(h).int(stride).uint(1).finish(),
+            &[],
+        );
+        go(&mut c, Writer::new(6, 1).object(10).int(0).int(0).finish(), &[]);
+        go(&mut c, Writer::new(6, 6).finish(), &[]);
+        (c, 6)
+    }
+
+    #[test]
+    fn a_located_buffer_becomes_a_descriptor_and_not_a_copy() {
+        let (c, surface) = placed_window(64, 32, 256);
+        // No `Frame`: nothing was copied out of the pool.
+        assert!(c.frames.is_empty(), "a frame was copied out of the pool");
+        let scene = c.scene();
+        assert_eq!(scene.len(), 1);
+        let s = &scene[0];
+        assert_eq!(s.surface, surface);
+        assert_eq!((s.width, s.height, s.stride), (64, 32, 256));
+        assert_eq!(s.addr, 0x10_0000, "the descriptor points at the pool");
+        assert_eq!(s.role, Role::Toplevel);
+        assert_eq!(s.title, "a window");
+    }
+
+    #[test]
+    fn a_buffer_past_the_end_of_its_pool_is_not_placed() {
+        // The pool is one byte short of what the buffer claims, so there is
+        // nothing safe to hand the compositor: a guest chose this length.
+        let pool = Placed(0x1000, 63);
+        let mut c = Client::new();
+        let mut go = |c: &mut Client, bytes: Vec<u8>, fds: &[u32]| c.receive(&bytes, fds, &pool);
+        go(&mut c, Writer::new(1, 1).new_id(2).finish(), &[]);
+        for (name, iface, ver, id) in [
+            (1u32, "wl_compositor", 4u32, 3u32),
+            (2, "wl_shm", 1, 4),
+            (5, "xdg_wm_base", 3, 5),
+        ] {
+            go(
+                &mut c,
+                Writer::new(2, 0).uint(name).string(iface).uint(ver).new_id(id).finish(),
+                &[],
+            );
+        }
+        go(&mut c, Writer::new(3, 0).new_id(6).finish(), &[]);
+        go(&mut c, Writer::new(5, 2).new_id(7).object(6).finish(), &[]);
+        go(&mut c, Writer::new(7, 1).new_id(8).finish(), &[]);
+        go(&mut c, Writer::new(4, 0).new_id(9).int(64).finish(), &[77]);
+        go(
+            &mut c,
+            Writer::new(9, 0).new_id(10).int(0).int(4).int(4).int(16).uint(1).finish(),
+            &[],
+        );
+        go(&mut c, Writer::new(6, 1).object(10).int(0).int(0).finish(), &[]);
+        go(&mut c, Writer::new(6, 6).finish(), &[]);
+        assert!(c.scene().is_empty(), "a buffer larger than its pool was placed");
+    }
+
+    #[test]
+    fn damage_accumulates_until_the_host_has_drawn_it() {
+        // The same pool the window was placed in: a different address would be
+        // a different buffer, which is a thing that happens and is not what
+        // this test is about.
+        let pool = Placed(0x10_0000, 8192);
+        let (mut c, surface) = placed_window(32, 32, 128);
+        // The first frame of a window is all of it, and until the host has
+        // drawn that there is nothing smaller to say.
+        assert!(c.scene()[0].damage.is_all());
+        c.clear_damage(surface);
+        // Two damage rectangles and a commit: the union is what to upload.
+        c.receive(&Writer::new(surface, 2).int(2).int(3).int(4).int(5).finish(), &[], &pool);
+        c.receive(&Writer::new(surface, 9).int(10).int(10).int(2).int(2).finish(), &[], &pool);
+        c.receive(&Writer::new(surface, 6).finish(), &[], &pool);
+        let d = c.scene()[0].damage;
+        assert_eq!((d.x, d.y, d.w, d.h), (2, 3, 10, 9), "the damage union");
+        c.clear_damage(surface);
+        assert_eq!(c.scene()[0].damage.w, 0, "drawn damage is not uploaded twice");
+    }
+
+    #[test]
+    fn a_null_buffer_takes_the_window_off_the_screen() {
+        let pool = Placed(0x3000, 4096);
+        let (mut c, surface) = placed_window(16, 16, 64);
+        assert_eq!(c.scene().len(), 1);
+        // attach(NULL) then commit: hidden, but still a toplevel.
+        c.receive(&Writer::new(surface, 1).object(0).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(surface, 6).finish(), &[], &pool);
+        assert!(c.scene().is_empty(), "an unmapped window stayed on screen");
+    }
+
+    #[test]
+    fn a_destroyed_toplevel_leaves_no_window_behind() {
+        let pool = Placed(0x4000, 4096);
+        let (mut c, _) = placed_window(16, 16, 64);
+        // xdg_toplevel.destroy. Qt does this on a resize, and a window that
+        // survived it was drawn forever as an empty frame.
+        c.receive(&Writer::new(8, 0).finish(), &[], &pool);
+        assert!(c.scene().is_empty(), "a destroyed window stayed in the scene");
+    }
+
+    #[test]
+    fn a_popup_is_placed_by_its_positioner_and_configured() {
+        let pool = Placed(0x5000, 8192);
+        let (mut c, _) = placed_window(200, 100, 800);
+        c.take_outgoing();
+        // create_positioner(20); size 40x20; anchor rect at (5,10) 30x8;
+        // anchor = bottom (2); gravity = bottom-right (8).
+        c.receive(&Writer::new(5, 1).new_id(20).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 1).int(40).int(20).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 2).int(5).int(10).int(30).int(8).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 3).uint(2).finish(), &[], &pool);
+        c.receive(&Writer::new(20, 4).uint(8).finish(), &[], &pool);
+        // A second surface with an xdg_surface, made a popup of the first.
+        c.receive(&Writer::new(3, 0).new_id(21).finish(), &[], &pool);
+        c.receive(&Writer::new(5, 2).new_id(22).object(21).finish(), &[], &pool);
+        c.receive(&Writer::new(22, 2).new_id(23).object(7).object(20).finish(), &[], &pool);
+        let out = messages(&c.take_outgoing());
+        // xdg_popup.configure(x, y, w, h) then xdg_surface.configure(serial).
+        let configure = out.iter().find(|(id, op, _)| *id == 23 && *op == 0);
+        let (_, _, body) = configure.expect("the popup was never configured");
+        let x = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        let y = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        // Anchor "bottom" is the middle of the bottom edge: (5 + 30/2, 10 + 8);
+        // gravity "bottom_right" grows away from it, so the corner is there.
+        assert_eq!((x, y), (20, 18), "the popup went somewhere else");
+        assert!(
+            out.iter().any(|(id, op, _)| *id == 22 && *op == 0),
+            "the popup's xdg_surface was not configured, so it will never draw",
+        );
+        // And it draws: attach a buffer to the popup and it is in the scene.
+        c.receive(&Writer::new(9, 0).new_id(24).int(0).int(40).int(20).int(160).uint(1).finish(), &[], &pool);
+        c.receive(&Writer::new(21, 1).object(24).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(21, 6).finish(), &[], &pool);
+        let popup = c.scene().into_iter().find(|s| s.surface == 21).expect("no popup surface");
+        assert_eq!(popup.role, Role::Popup);
+        assert_eq!(popup.parent, 6, "a popup is placed against its parent");
+        assert_eq!((popup.rel_x, popup.rel_y), (20, 18));
+    }
+
+    #[test]
+    fn a_subsurface_follows_its_parent() {
+        let pool = Placed(0x6000, 8192);
+        let (mut c, _) = placed_window(200, 100, 800);
+        // bind wl_subcompositor (name 7), get_subsurface(child of the window)
+        c.receive(
+            &Writer::new(2, 0).uint(7).string("wl_subcompositor").uint(1).new_id(30).finish(),
+            &[],
+            &pool,
+        );
+        c.receive(&Writer::new(3, 0).new_id(31).finish(), &[], &pool);
+        c.receive(&Writer::new(30, 1).new_id(32).object(31).object(6).finish(), &[], &pool);
+        c.receive(&Writer::new(32, 1).int(12).int(7).finish(), &[], &pool);
+        c.receive(&Writer::new(9, 0).new_id(33).int(0).int(20).int(10).int(80).uint(1).finish(), &[], &pool);
+        c.receive(&Writer::new(31, 1).object(33).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(31, 6).finish(), &[], &pool);
+        let sub = c.scene().into_iter().find(|s| s.surface == 31).expect("no subsurface");
+        assert_eq!(sub.role, Role::Subsurface);
+        assert_eq!(sub.parent, 6);
+        assert_eq!((sub.rel_x, sub.rel_y), (12, 7));
+    }
+
+    #[test]
+    fn a_toplevel_decoration_is_answered_server_side() {
+        let pool = Placed(0x7000, 4096);
+        let (mut c, _) = placed_window(64, 64, 256);
+        c.take_outgoing();
+        // bind zxdg_decoration_manager_v1 (name 8), get_toplevel_decoration.
+        c.receive(
+            &Writer::new(2, 0)
+                .uint(8)
+                .string("zxdg_decoration_manager_v1")
+                .uint(1)
+                .new_id(40)
+                .finish(),
+            &[],
+            &pool,
+        );
+        c.receive(&Writer::new(40, 1).new_id(41).object(8).finish(), &[], &pool);
+        let out = messages(&c.take_outgoing());
+        let (_, _, body) = out
+            .iter()
+            .find(|(id, op, _)| *id == 41 && *op == 0)
+            .expect("the decoration was never configured");
+        let mode = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        assert_eq!(mode, 2, "the compositor draws the frames, so: server_side");
+    }
+
+    #[test]
+    fn a_cursor_surface_is_a_cursor_and_not_a_window() {
+        let pool = Placed(0x8000, 4096);
+        let (mut c, _) = placed_window(64, 64, 256);
+        // A seat, a pointer, and a surface handed to set_cursor with a hotspot.
+        c.receive(
+            &Writer::new(2, 0).uint(3).string("wl_seat").uint(5).new_id(50).finish(),
+            &[],
+            &pool,
+        );
+        c.receive(&Writer::new(50, 0).new_id(51).finish(), &[], &pool);
+        c.receive(&Writer::new(3, 0).new_id(52).finish(), &[], &pool);
+        c.receive(&Writer::new(9, 0).new_id(53).int(0).int(24).int(24).int(96).uint(0).finish(), &[], &pool);
+        c.receive(&Writer::new(51, 0).uint(1).object(52).int(4).int(3).finish(), &[], &pool);
+        c.receive(&Writer::new(52, 1).object(53).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(52, 6).finish(), &[], &pool);
+        let cursor = c.scene().into_iter().find(|s| s.surface == 52).expect("no cursor surface");
+        assert_eq!(cursor.role, Role::Cursor);
+        assert_eq!((cursor.rel_x, cursor.rel_y), (4, 3), "the hotspot");
+        // And the window is still the window: a cursor never becomes one.
+        assert_eq!(
+            c.scene().iter().filter(|s| s.role == Role::Toplevel).count(),
+            1,
+            "the cursor was counted as a window",
+        );
+    }
+
+    #[test]
+    fn an_x11_window_is_a_window_on_the_managers_word() {
+        let pool = Placed(0x9000, 8192);
+        let mut c = Client::new();
+        let mut go = |c: &mut Client, bytes: Vec<u8>| c.receive(&bytes, &[], &pool);
+        go(&mut c, Writer::new(1, 1).new_id(2).finish());
+        for (name, iface, ver, id) in
+            [(1u32, "wl_compositor", 4u32, 3u32), (2, "wl_shm", 1, 4)]
+        {
+            go(
+                &mut c,
+                Writer::new(2, 0).uint(name).string(iface).uint(ver).new_id(id).finish(),
+            );
+        }
+        // A bare surface with a buffer: what rootless Xwayland creates. No
+        // role, so it is not on screen -- until the window manager says what
+        // it is.
+        go(&mut c, Writer::new(3, 0).new_id(6).finish());
+        c.receive(&Writer::new(4, 0).new_id(9).int(4096).finish(), &[77], &pool);
+        go(&mut c, Writer::new(9, 0).new_id(10).int(0).int(50).int(20).int(200).uint(1).finish());
+        go(&mut c, Writer::new(6, 1).object(10).int(0).int(0).finish());
+        go(&mut c, Writer::new(6, 6).finish());
+        assert!(c.scene().is_empty(), "a surface with no role was on screen");
+        assert!(c.has_surface(6));
+        c.adopt_x11(6, "xterm", false, 30, 40);
+        let s = c.scene();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].role, Role::Toplevel, "an X window is a window");
+        assert_eq!(s[0].title, "xterm");
+        assert!(s[0].x11);
+        assert!(c.is_x11(6));
+        // An override-redirect X window is a menu: no frame, placed by the
+        // client in output coordinates.
+        c.adopt_x11(6, "menu", true, 30, 40);
+        assert_eq!(c.scene()[0].role, Role::Popup);
+        assert_eq!((c.scene()[0].rel_x, c.scene()[0].rel_y), (30, 40));
+        c.forget_x11(6);
+        assert!(c.scene().is_empty(), "an unmapped X window stayed on screen");
+    }
+
+    #[test]
+    fn a_destroyed_surface_is_never_named_in_an_event() {
+        let pool = Placed(0xb000, 8192);
+        let (mut c, first) = placed_window(64, 64, 256);
+        c.receive(
+            &Writer::new(2, 0).uint(3).string("wl_seat").uint(5).new_id(80).finish(),
+            &[],
+            &pool,
+        );
+        c.receive(&Writer::new(80, 0).new_id(81).finish(), &[], &pool);
+        // The pointer is on the first window.
+        c.pointer_to(first, 5, 5, 10);
+        assert!(messages(&c.take_outgoing()).iter().any(|(id, op, _)| *id == 81 && *op == 0));
+        // A second window, and the first destroyed while the pointer is on it.
+        c.receive(&Writer::new(3, 0).new_id(90).finish(), &[], &pool);
+        c.receive(&Writer::new(5, 2).new_id(91).object(90).finish(), &[], &pool);
+        c.receive(&Writer::new(91, 1).new_id(92).finish(), &[], &pool);
+        c.receive(&Writer::new(9, 0).new_id(93).int(0).int(16).int(16).int(64).uint(1).finish(), &[], &pool);
+        c.receive(&Writer::new(90, 1).object(93).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(90, 6).finish(), &[], &pool);
+        c.receive(&Writer::new(first, 0).finish(), &[], &pool); // wl_surface.destroy
+        c.take_outgoing();
+        // Moving to the new window must not send a `leave` for the dead one.
+        // Xwayland answers that with "unknown object, message leave(uo)" and
+        // exits, which took the whole session with it.
+        c.pointer_to(90, 3, 3, 20);
+        for (id, op, body) in messages(&c.take_outgoing()) {
+            if id == 81 && op == 1 {
+                let named = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                assert_ne!(named, first, "a leave named a destroyed surface");
+            }
+        }
+        // And the pointer did enter the surviving window.
+        assert_eq!(c.pointer_on, Some(90));
+    }
+
+    #[test]
+    fn a_positioner_anchors_and_grows_the_way_the_protocol_says() {
+        // Anchor top-left of a 100x50 rectangle at (10, 20), popup 30x10,
+        // gravity top-left: the popup's bottom-right corner lands on the
+        // anchor point.
+        let p = Positioner {
+            width: 30,
+            height: 10,
+            anchor_rect: (10, 20, 100, 50),
+            anchor: 5,
+            gravity: 5,
+            offset: (0, 0),
+        };
+        assert_eq!(p.place(), (10 - 30, 20 - 10));
+        // No anchor and no gravity: centred on the middle of the rectangle.
+        let p = Positioner {
+            anchor: 0,
+            gravity: 0,
+            ..p
+        };
+        assert_eq!(p.place(), (10 + 50 - 15, 20 + 25 - 5));
+        // And the offset is added last.
+        let p = Positioner {
+            offset: (3, -4),
+            ..p
+        };
+        assert_eq!(p.place(), (10 + 50 - 15 + 3, 20 + 25 - 5 - 4));
+    }
+
+    #[test]
+    fn input_goes_to_the_surface_the_host_names() {
+        let pool = Placed(0xa000, 8192);
+        let (mut c, _) = placed_window(64, 64, 256);
+        c.receive(
+            &Writer::new(2, 0).uint(3).string("wl_seat").uint(5).new_id(60).finish(),
+            &[],
+            &pool,
+        );
+        c.receive(&Writer::new(60, 0).new_id(61).finish(), &[], &pool);
+        c.take_outgoing();
+        // A second window, and the pointer put on it by name: the enter must
+        // be for that surface, not for whichever drew last.
+        c.receive(&Writer::new(3, 0).new_id(70).finish(), &[], &pool);
+        c.receive(&Writer::new(5, 2).new_id(71).object(70).finish(), &[], &pool);
+        c.receive(&Writer::new(71, 1).new_id(72).finish(), &[], &pool);
+        c.receive(&Writer::new(9, 0).new_id(73).int(0).int(10).int(10).int(40).uint(1).finish(), &[], &pool);
+        c.receive(&Writer::new(70, 1).object(73).int(0).int(0).finish(), &[], &pool);
+        c.receive(&Writer::new(70, 6).finish(), &[], &pool);
+        c.take_outgoing();
+        c.pointer_to(70, 3, 4, 100);
+        let out = messages(&c.take_outgoing());
+        let (_, _, enter) = out
+            .iter()
+            .find(|(id, op, _)| *id == 61 && *op == 0)
+            .expect("no pointer enter");
+        let surface = u32::from_le_bytes([enter[4], enter[5], enter[6], enter[7]]);
+        assert_eq!(surface, 70, "the enter named the wrong surface");
+        // The enter carries the position, so a click with no motion in front
+        // of it lands where the pointer is.
+        let x = i32::from_le_bytes([enter[8], enter[9], enter[10], enter[11]]);
+        assert_eq!(x, 3 * 256, "the enter's x, in 24.8 fixed point");
     }
 
     #[test]

@@ -89,7 +89,12 @@ export function untar(buf, root = '') {
     } else if (type === '0' || type === '\0' || type === '7') {
       const p = path(name);
       if (p) {
-        files[p] = b.slice(body, body + size);
+        // A view, not a copy. A 650 MB image copied file by file is 650 MB
+        // of page memory on top of the 650 MB just fetched, and the tab ran
+        // out before the first window appeared. The bytes are read once more
+        // when they are written into the guest's filesystem, and nothing
+        // mutates them in between.
+        files[p] = b.subarray(body, body + size);
         const mode = octal(b, off + 100, 8) & 0o7777;
         if (mode & 0o111) modes[p] = mode;
       }

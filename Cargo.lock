@@ -411,6 +411,7 @@ dependencies = [
  "gex-ld",
  "gex-wayland",
  "gex-xlate",
+ "gex-xwm",
  "spinning_top",
  "talc",
 ]
@@ -449,6 +450,15 @@ dependencies = [
  "gex-wayland",
  "pollster",
  "wgpu",
+]
+
+[[package]]
+name = "gex-hostwl"
+version = "0.0.1"
+dependencies = [
+ "gex-kernel",
+ "gex-wayland",
+ "gex-xwm",
 ]
 
 [[package]]
@@ -540,6 +550,14 @@ dependencies = [
  "gex-isa",
  "gex-ld",
  "gex-lift",
+]
+
+[[package]]
+name = "gex-xwm"
+version = "0.0.1"
+dependencies = [
+ "gex-kernel",
+ "gex-wayland",
 ]
 
 [[package]]

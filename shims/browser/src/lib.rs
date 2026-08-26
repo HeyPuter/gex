@@ -37,6 +37,7 @@ use std::collections::VecDeque;
 pub mod gl;
 pub mod virgl;
 pub mod wl;
+mod xwm;
 
 use std::sync::Arc;
 
@@ -1125,7 +1126,11 @@ fn mount_devices(
     // cannot come, worse than finding no socket at all.
     let virgl = crate::virgl::have_virgl().then(|| {
         let device = crate::virgl::VirglDevice::new();
-        kernel.socket_names.bind_host(
+        // In this process's own host table, not the system-wide one: the device
+        // can only reach the memory of the process it is in, so the name must
+        // resolve to the device of whoever is connecting. Sharing it across a
+        // fork handed one process's clients to another's device.
+        kernel.host_names.bind_host(
             crate::virgl::DEFAULT_SOCKET,
             Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
         );
@@ -1136,7 +1141,7 @@ fn mount_devices(
     // libwayland fails to connect cleanly rather than blocking on a dead name.
     let wayland = crate::wl::have_wl().then(|| {
         let device = crate::wl::WaylandDevice::new();
-        kernel.socket_names.bind_host(
+        kernel.host_names.bind_host(
             crate::wl::DEFAULT_SOCKET,
             Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
         );
@@ -3591,25 +3596,35 @@ pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
     // Whole body under KLOCK: `IMAGE_PAGES`/`CLOSURE_OWNER` are written at runtime
     // by `gex_add_closure_module` as libraries stream in, and this runs on every
     // Worker's miss path -- see the note there.
-    with_host(|h| {
-        if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
-            let claims = IMAGE_PAGES.0.borrow();
-            let Some(idxs) = claims.get(&page) else {
-                return -1;
-            };
-            return idxs
-                .iter()
-                .find(|i| image_is_ours(h, **i))
-                .map(|i| *i as i32)
-                .unwrap_or(-1);
-        }
-        CLOSURE_OWNER
-            .0
-            .borrow()
-            .get(&page)
-            .map(|v| *v as i32)
-            .unwrap_or(-1)
-    })
+    with_host(|h| closure_owner_held(h, page))
+}
+
+/// Which closure object owns an image page, for a caller that ALREADY holds
+/// KLOCK.
+///
+/// The lock is not re-entrant -- `with_host` panics on a second borrow, and the
+/// panic message is the only sign of it -- so a locked caller must not call
+/// `gex_closure_owner`. `gex_fill_table_for` did exactly that, and a forked
+/// child filling its first image page died with "the kernel was re-entered"
+/// before it could exec: a terminal whose shell never ran a command.
+fn closure_owner_held(h: &mut Host, page: u64) -> i32 {
+    if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+        let claims = IMAGE_PAGES.0.borrow();
+        let Some(idxs) = claims.get(&page) else {
+            return -1;
+        };
+        return idxs
+            .iter()
+            .find(|i| image_is_ours(h, **i))
+            .map(|i| *i as i32)
+            .unwrap_or(-1);
+    }
+    CLOSURE_OWNER
+        .0
+        .borrow()
+        .get(&page)
+        .map(|v| *v as i32)
+        .unwrap_or(-1)
 }
 
 /// The `k`th closure object covering `page` that belongs to this process.
@@ -4137,12 +4152,13 @@ pub extern "C" fn gex_page_table(page: u64) -> i32 {
     }
     // Whole body under KLOCK: `CLOSURE_TABLE`/`IMAGE_TABLE` are written at runtime
     // by streaming closures (`gex_add_closure_module`) while this runs on every
-    // Worker's fill path. `gex_closure_owner` also takes KLOCK -- re-entrant.
-    with_host(|_| {
+    // Worker's fill path. The owner lookup inside is the *held* form: KLOCK is
+    // not re-entrant, and calling `gex_closure_owner` here panicked the process.
+    with_host(|h| {
         // An image page belongs to whichever root of the closure this process is
         // actually running, so it is looked up by module and not by page alone.
         if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
-            let owner = gex_closure_owner(page);
+            let owner = closure_owner_held(h, page);
             if owner < 0 {
                 return -1;
             }

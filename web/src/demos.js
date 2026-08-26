@@ -779,26 +779,26 @@ const waylandGears = {
     const demo = this;
     const wrap = document.createElement('div');
     wrap.className = 'canvas-wrap';
-    // The Wayland compositor's output -- the one window the user sees. `serveWl`
-    // resizes it to each committed frame (so it takes the app's real size), and
-    // `attachWlInput` routes mouse+keyboard to it; `tabIndex` makes it able to
-    // take keyboard focus (a bare <canvas> cannot). Every client shows here:
-    // toolkit apps commit software frames, and the GL clients' pixels are read
-    // back into wl_shm and composited here too.
+    // The compositor's output: the whole desktop, and the only thing the user
+    // sees. Every surface is drawn here -- windows with the frames the
+    // compositor draws, their menus, and the cursor -- by a WebGL2 context in
+    // the compositor worker. `tabIndex` makes it able to take keyboard focus,
+    // which a bare <canvas> cannot.
     const wlCanvas = document.createElement('canvas');
     wlCanvas.id = 'gex-wl';
-    wlCanvas.width = 640;
-    wlCanvas.height = 480;
+    wlCanvas.width = demo.outputWidth || 1024;
+    wlCanvas.height = demo.outputHeight || 640;
     wlCanvas.tabIndex = 0;
+    wlCanvas.classList.add('wl-output');
     wrap.append(wlCanvas);
-    // virglrenderer's own GL surface, a WebGL context the GL clients execute on.
-    // Which canvas the user actually sees depends on the client (see
-    // `showWindow`): glxgears under Xwayland presents *here*, while toolkit apps
-    // and the native-GL client present on `wlCanvas`. The other is moved
-    // off-screen (kept full-size and rendering) so only one window ever shows.
+    // virglrenderer's own GL surface: the context an OpenGL client's commands
+    // are replayed into. Not a window -- with a compositor the client's pixels
+    // reach the screen the way every other client's do, through its
+    // wl_surface -- so it is kept off-screen, rendering, and never shown.
     const canvas = document.createElement('canvas');
     canvas.width = demo.canvasWidth || 300;
     canvas.height = demo.canvasHeight || 300;
+    canvas.classList.add('wl-offscreen');
     wrap.append(canvas);
     const fps = document.createElement('output');
     fps.className = 'fps';
@@ -813,12 +813,10 @@ const waylandGears = {
       wrap.remove();
     });
 
-    // Show exactly one window: the WebGL surface for an Xwayland GL client
-    // ('x'), the compositor's output for everything else ('gl'/'shm').
+    // There is one output now, so nothing is swapped: the FPS readout is the
+    // only thing that depends on the client, since only a GL one has a frame
+    // rate to report.
     const showWindow = (a) => {
-      const glWindow = a.mode === 'x';
-      canvas.classList.toggle('wl-offscreen', !glWindow);
-      wlCanvas.classList.toggle('wl-offscreen', glWindow);
       fps.hidden = a.mode === 'shm';
     };
 
@@ -1113,14 +1111,13 @@ const waylandGears = {
           // a profile-guided closure whose pages are demand-filled while pid 1 is
           // already running (the libc+0x84710 trap). See runProgram.
           closureBuildNumbered: !!appClosure,
-          // Real GL over virgl, as the glxgears demo does. The compositor gets
-          // a 2D canvas so a native wl client's committed shm frames show; for
-          // the Xwayland path the pixels come via virgl and this stays blank.
+          // Real GL over virgl: the guest's own Mesa, replayed by
+          // virglrenderer. Its output reaches the screen through the client's
+          // wl_surface like everything else, so there is one output and one
+          // place input goes.
           virgl: renderer,
           wl: wlCanvas,
-          // Focus and input go to the one visible canvas: the virgl/WebGL one
-          // for an Xwayland client ('x'), the compositor's output otherwise.
-          wlInput: app.mode === 'x' ? canvas : wlCanvas,
+          wlInput: wlCanvas,
           heartbeat: Number(new URLSearchParams(location.search).get('heartbeat')) || 0,
         });
         const ms = (performance.now() - t0).toFixed(0);
@@ -1169,6 +1166,19 @@ const stkRace =
   `/usr/games/supertuxkart --race-now --track=snowtuxpeak --kart=tux ` +
   `--numkarts=1 --laps=1 ${stkVideoOptions}`;
 const stkPlay = `/usr/games/supertuxkart ${stkVideoOptions}`;
+// The same environment the SuperTuxKart card sets, as shell exports, for a
+// session that runs it beside other programs.
+const stkEnv =
+  'export IRR_DEVICE_TYPE=x11\n'
+  + 'export SUPERTUXKART_DATADIR=/usr/share/games/supertuxkart\n'
+  + 'export ALSOFT_DRIVERS=null\n'
+  + 'export MESA_GL_VERSION_OVERRIDE=3.3\n'
+  + 'export MESA_GLSL_VERSION_OVERRIDE=330\n'
+  + 'export JSIMD_FORCENONE=1\n'
+  // STK asks SDL for an explicit ES 3 context, which Mesa's virgl GLX
+  // frontend refuses; this preload rewrites the request to ES 2, which comes
+  // back as 3.0 anyway. See web/virgl/stk-sdl-es3-compat.c.
+  + 'export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgex-stk-sdl.so\n';
 const stkProfileValue = Number(new URLSearchParams(location.search).get('stkprofile'));
 // Preserve the original `?stkprofile=1` harness shorthand (a five-second
 // profile), while accepting an explicit duration for longer stable samples.
@@ -1213,6 +1223,348 @@ const supertuxkart = {
   enter: waylandGears.enter,
 };
 
+
+// -- the compositor demo ----------------------------------------------------
+//
+// Not one app on a canvas: a session. Several programs, each its own guest
+// process, all connected to the compositor in the shim, all drawn into one
+// output with frames the compositor draws itself -- and, for the X11 ones, a
+// rootless Xwayland that gives every X window its own wl_surface so the
+// compositor decorates and stacks them like any other window.
+const SESSION_APPS = [
+  {
+    id: 'kcalc',
+    label: 'KCalc — Qt 5 / KF5, native Wayland',
+    kind: 'wl',
+    cmd: 'kcalc',
+    env: WL_TOOLKIT_ENV.qt5,
+  },
+  {
+    id: 'qt6ct',
+    label: 'Qt 6 Configuration — native Wayland',
+    kind: 'wl',
+    cmd: 'qt6ct',
+    env: WL_TOOLKIT_ENV.qt6,
+  },
+  {
+    id: 'explosive-c4',
+    label: 'Explosive C4 — Qt 6 game, native Wayland',
+    kind: 'wl',
+    cmd: 'explosive-c4',
+    env: WL_TOOLKIT_ENV.qt6,
+  },
+  {
+    id: 'gtk3-demo',
+    label: 'GTK 3 Demo — native Wayland (draws its own frames)',
+    kind: 'wl',
+    cmd: 'gtk3-demo',
+    env: WL_TOOLKIT_ENV.gtk,
+  },
+  {
+    id: 'dolphin',
+    label: 'Dolphin — KDE file manager, native Wayland',
+    kind: 'wl',
+    cmd: 'dolphin --new-window /root',
+    env: WL_TOOLKIT_ENV.qt5 + 'export XDG_CONFIG_HOME=/root/.config\n',
+  },
+  { id: 'xeyes', label: 'xeyes — X11 through rootless Xwayland', kind: 'x', cmd: 'xeyes' },
+  { id: 'xclock', label: 'xclock — X11 through rootless Xwayland', kind: 'x', cmd: 'xclock' },
+  { id: 'xterm', label: 'xterm — X11 through rootless Xwayland (draws no text yet)', kind: 'x', cmd: 'xterm' },
+  { id: 'xcalc', label: 'xcalc — X11 through rootless Xwayland', kind: 'x', cmd: 'xcalc' },
+  {
+    id: 'glxgears',
+    label: 'glxgears — OpenGL, Mesa → virgl, under Xwayland',
+    kind: 'x',
+    cmd: 'glxgears.aarch64-linux-gnu',
+    on: true,
+  },
+  {
+    id: 'glmark2',
+    label: 'glmark2 — a real GL benchmark, under Xwayland',
+    kind: 'x',
+    cmd: 'glmark2 --size 480x320',
+  },
+  {
+    id: 'es2gears',
+    label: 'es2gears — OpenGL ES straight onto Wayland',
+    kind: 'wl',
+    cmd: '/usr/bin/es2gears_wayland.aarch64-linux-gnu',
+    env: 'export EGL_PLATFORM=wayland\n',
+  },
+  {
+    id: 'supertuxkart',
+    label: 'SuperTuxKart — a real game, X11 + Mesa (needs the big image)',
+    kind: 'x',
+    cmd: stkRace,
+    env: stkEnv,
+    // Its 200 MB of game data is in its own image, so choosing it swaps the
+    // session's filesystem for the one that has both.
+    rootfs: '/rootfs/session-stk.tar',
+  },
+];
+
+/**
+ * The session script: the environment every client needs, then each chosen app
+ * in the background.
+ *
+ * The X clients share one Xwayland, started `-rootless` so that each X window
+ * becomes its own `xdg_toplevel` rather than one big desktop -- which is what
+ * makes an X11 program and a Wayland program windows of the same session.
+ * Launches are spaced out because each new process translates its own copy of
+ * whatever it links, and six toolkits arriving at once is a memory spike with
+ * nothing to show for it.
+ */
+function sessionScript(chosen, { stagger = 4, verbose = 0, extra = '', hostX = false } = {}) {
+  const wl = chosen.filter((a) => a.kind === 'wl');
+  const x = chosen.filter((a) => a.kind === 'x');
+  // An X server is wanted if anything needs one, including `?xtra=`.
+  const wantX = x.length > 0 || !!extra;
+  let s = '';
+  s += 'export XDG_RUNTIME_DIR=/tmp\n';
+  s += 'export WAYLAND_DISPLAY=wayland-0\n';
+  s += 'export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu\n';
+  s += 'export HOME=/root\n';
+  s += 'export XDG_CACHE_HOME=/tmp\n';
+  s += 'export XDG_DATA_DIRS=/usr/share\n';
+  s += 'export GSETTINGS_SCHEMA_DIR=/usr/share/glib-2.0/schemas\n';
+  s += 'export SHELL=/bin/sh\n';
+  s += 'export TERM=xterm\n';
+  s += 'export FONTCONFIG_PATH=/etc/fonts\n';
+  s += 'export DBUS_SESSION_BUS_ADDRESS=disabled:\n';
+  s += 'export QT_LOGGING_RULES="*=false"\n';
+  s += 'export TCL_LIBRARY=/usr/share/tcltk/tcl8.6\n';
+  s += 'export TK_LIBRARY=/usr/share/tcltk/tk8.6\n';
+  // Mesa's virgl driver, and no shader cache: the cache runs a second thread
+  // whose handshake with the first is a cross-Worker futex the browser
+  // scheduler can drop.
+  s += 'export GALLIUM_DRIVER=virpipe\n';
+  s += 'export MESA_SHADER_CACHE_DISABLE=true\n';
+  s += 'export MESA_GLSL_CACHE_DISABLE=1\n';
+  s += 'echo "gex: session starting"\n';
+  for (const a of wl) {
+    // Each app's own environment in a subshell, so one app's QT_QPA_PLATFORM
+    // is not every app's.
+    s += `(\n${a.env || ''}echo "gex: launching ${a.id}"\n${a.cmd} 2>&1\n) &\n`;
+    s += `sleep ${stagger}\n`;
+  }
+  if (wantX) {
+    // Rootless: one X server, and every X window is a wl_surface of its own.
+    //
+    // No window manager is started here, and that is the point: rootless
+    // Xwayland hands a window to Wayland only once it is *managed*, and the
+    // thing that manages it is the compositor. gex-wayland contains the X
+    // window manager (`shims/browser/src/xwm.rs`), exactly as sway, mutter and
+    // kwin do -- it takes SubstructureRedirect on the root, answers
+    // MapRequest, and pairs each X window with the surface Xwayland names in
+    // its WL_SURFACE_ID message.
+    if (hostX) {
+      // The X server is not a guest program in this session: it is a wasm
+      // module in the page (see web/src/hostx.js), started before this shell
+      // and already listening on the display. Its socket is a name in the
+      // global kernel, which is the same place a guest Xwayland would have
+      // bound it -- so from a client's side nothing about this changed.
+      s += 'echo "gex: the X server is in the page"\n';
+      s += 'export DISPLAY=:0\n';
+    } else {
+    s += 'echo "gex: starting rootless Xwayland"\n';
+    // `-shm`: hand buffers over as shared memory and never try glamor.
+    //
+    // Without it Xwayland attempts an EGL/GL screen, finds no GPU, prints
+    // "Failed to initialize glamor, falling back to sw" -- and then draws
+    // rectangles but no glyphs, so every X client came up as an empty window
+    // with a cursor in it. Its software path is what this compositor wants
+    // anyway: the pixels arrive as wl_shm, which is what the output uploads.
+    s += `Xwayland :0 -rootless -shm -noreset -ac${verbose ? ` -verbose ${verbose}` : ''} &\n`;
+    // Not a poll for /tmp/.X11-unix/X0: Xwayland binds it in its own process,
+    // and with a tmpfs per process that node is not in this shell's
+    // filesystem. The name is registered in the global kernel, so a client
+    // connects across the process boundary; this only has to let it bind.
+    s += 'sleep 8\n';
+    s += 'export DISPLAY=:0\n';
+    }
+
+    for (const a of x) {
+      s += `echo "gex: launching ${a.id}"\n`;
+      s += `(\n${a.env || ''}${a.cmd} 2>&1\n) &\n`;
+      s += `sleep ${stagger}\n`;
+    }
+    // `?xtra=<command>` runs one more X client, whatever it is: a way to try
+    // something the picker does not list without rebuilding anything.
+    if (extra) {
+      s += `echo "gex: launching ${extra}"\n`;
+      s += `${extra} 2>&1 &\n`;
+      s += `sleep ${stagger}\n`;
+    }
+  }
+  s += 'echo "gex: session up"\n';
+  s += 'wait\n';
+  return s;
+}
+
+const compositor = {
+  id: 'compositor',
+  title: 'A desktop session on gex-wayland',
+  blurb:
+    'gex-wayland as a compositor: several AArch64 programs at once, each its own guest process, '
+    + 'in windows this page draws the frames for. Qt and KDE apps take server-side decorations, '
+    + 'GTK draws its own, X11 programs arrive through a rootless Xwayland whose window manager is '
+    + 'this compositor, and OpenGL goes through the guest\'s Mesa to virglrenderer -- all in one '
+    + 'output, all in one WebGL context. Every window is drawn from the guest\'s own memory: '
+    + 'nothing copies a frame. The X11 clients share one X server and are cheap; a Qt or KDE '
+    + 'toolkit translates 100 MB of its own code, so pick one of those at a time.',
+  network: false,
+  outputWidth: 1280,
+  outputHeight: 760,
+  // The session image: every program the picker offers, and Mesa's software
+  // rasteriser stubbed out -- nothing here enters it, and a browser tab pays
+  // for every megabyte of an image twice (once fetched, once written into the
+  // guest's filesystem).
+  rootfs: '/rootfs/session.tar',
+
+  async enter(ctx) {
+    const wrap = document.createElement('div');
+    wrap.className = 'canvas-wrap';
+    const wlCanvas = document.createElement('canvas');
+    wlCanvas.id = 'gex-wl';
+    wlCanvas.width = this.outputWidth;
+    wlCanvas.height = this.outputHeight;
+    wlCanvas.tabIndex = 0;
+    wlCanvas.classList.add('wl-output');
+    wrap.append(wlCanvas);
+    // The renderer's own GL context: where an OpenGL client's commands are
+    // replayed. Never shown -- its pixels reach the screen through the
+    // client's wl_surface like everything else's.
+    const glCanvas = document.createElement('canvas');
+    glCanvas.width = 640;
+    glCanvas.height = 480;
+    glCanvas.classList.add('wl-offscreen');
+    wrap.append(glCanvas);
+
+    // Which apps to start. A query string wins (`?apps=kcalc,xterm`), so a
+    // harness needs no clicking.
+    const qp = new URLSearchParams(location.search);
+    const wanted = qp.get('apps')?.split(',').filter(Boolean);
+    const picker = document.createElement('div');
+    picker.className = 'wl-picker session-picker';
+    const boxes = new Map();
+    for (const a of SESSION_APPS) {
+      const label = document.createElement('label');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = wanted ? wanted.includes(a.id) : !!a.on;
+      label.append(box, document.createTextNode(` ${a.label}`));
+      picker.append(label);
+      boxes.set(a.id, box);
+    }
+    document.getElementById('terminal')?.before(wrap);
+    wrap.before(picker);
+    ctx.onLeave(() => {
+      picker.remove();
+      wrap.remove();
+    });
+
+    for (const line of [
+      'A session, not one window: every program below is its own AArch64',
+      'process, and what draws them is gex-wayland in the shim -- which is',
+      'also the X window manager the rootless Xwayland needs.',
+      '',
+      'Drag a titlebar, click between windows, type into the one with the',
+      'focus. Each toolkit app costs a tab about 3 GB while it translates,',
+      'so a session of several is X11 clients plus one of them.',
+    ]) {
+      ctx.term.writeln(line);
+    }
+    ctx.term.writeln('');
+
+    const start = async (seconds) => {
+      ctx.actions([]);
+      running(true);
+      const chosen = SESSION_APPS.filter((a) => boxes.get(a.id)?.checked);
+      if (!chosen.length && !qp.get('xtra')) {
+        ctx.term.writeln('nothing selected');
+        running(false);
+        return;
+      }
+      const t0 = performance.now();
+      let renderer = null;
+      try {
+        ctx.busy('loading the renderer');
+        const { VirglRenderer } = await import('./virgl.js');
+        renderer = await VirglRenderer.create(glCanvas, '/gex/gexvirgl.mjs');
+        if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
+        ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
+        ctx.busy('unpacking the rootfs');
+        // The smallest image that has everything chosen: the graphics one
+        // unless something needs the session image, which is that plus
+        // SuperTuxKart's 200 MB of game data.
+        const image = chosen.find((a) => a.rootfs)?.rootfs || this.rootfs;
+        const tree = await ctx.rootfs(qp.get('wlrootfs') || image);
+        const files = { ...tree.files };
+        for (const [path, target] of Object.entries(tree.links)) {
+          const abs = rootfsLinkTarget(path, target);
+          if (files[abs]) {
+            files[path] = files[abs];
+            if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
+          }
+        }
+        for (const [path, target] of Object.entries(tree.hard ?? {})) {
+          if (files[target]) {
+            files[path] = files[target];
+            if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
+          }
+        }
+        // `?hostx=1`: run the X server in the page rather than as a guest
+        // process. Same protocol, same window manager, same compositor -- the
+        // difference is that the server's own drawing is native wasm.
+        const hostX = qp.get('hostx') === '1';
+        const script = sessionScript(chosen, {
+          hostX,
+          stagger: Number(qp.get('stagger')) || 4,
+          // `?xverbose=N` turns the X server's own log on, which is the only
+          // thing that says where a session that never appears stopped.
+          verbose: Number(qp.get('xverbose')) || 0,
+          extra: qp.get('xtra') || '',
+        });
+        files['/session.sh'] = new TextEncoder().encode(script);
+        ctx.idle();
+        rule(ctx, `graphics rootfs — ${Object.keys(files).length} files, ${chosen.length} apps`);
+        ctx.status('running');
+        const { status } = await ctx.runProgram(ctx.term, {
+          elf: files['/bin/sh'],
+          files,
+          dirs: tree.dirs,
+          modes: tree.modes,
+          args: ['/bin/sh', '/session.sh'],
+          cwd: '/',
+          tty: true,
+          uid: 0,
+          virgl: renderer,
+          wl: wlCanvas,
+          wlInput: wlCanvas,
+          hostX,
+          heartbeat: Number(qp.get('heartbeat')) || 0,
+        });
+        const ms = (performance.now() - t0).toFixed(0);
+        ctx.term.writeln('');
+        rule(ctx, `exit ${status} in ${ms} ms`);
+        ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
+      } catch (e) {
+        failed(ctx, e);
+      } finally {
+        running(false);
+        ctx.idle();
+        ctx.actions(actions(start));
+      }
+    };
+
+    const actions = (go) => [
+      { label: 'Start the session', primary: true, onClick: () => go(0) },
+    ];
+    ctx.actions(actions(start));
+    ctx.hint('drag a titlebar, click a window, type into it');
+  },
+};
+
 export const DEMOS = [
   upload,
   busybox,
@@ -1220,5 +1572,6 @@ export const DEMOS = [
   gears,
   virglGears,
   waylandGears,
+  compositor,
   supertuxkart,
 ];

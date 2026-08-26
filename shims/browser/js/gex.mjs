@@ -748,13 +748,15 @@ export class Gex {
           this.#virgl
             ? this.#virgl.submit(session >>> 0, this.#memory, ptr >>> 0, len >>> 0)
             : -1,
-        // The compositor's output: a wayland client committed a frame, and its
-        // pixels are at `ptr` (tightly-packed RGBA) in this memory. One-way --
-        // the page copies them to its canvas; nothing is returned.
-        wl_present: (ptr, w, h, stride, format) =>
-          this.#wl?.present(this.#memory, ptr >>> 0, w, h, stride >>> 0, format >>> 0),
-        // The reverse: drain the page's mouse/keyboard ring into `ptr` as packed
-        // i32 quintuples, so the compositor pump can deliver them to the client.
+        // This pump's scene: `count` surface records at `ptr` in this memory,
+        // saying where each surface's pixels are rather than carrying them. The
+        // compositor reads those addresses out of this same memory, so a frame
+        // is never copied on its way to the screen.
+        wl_publish: (ptr, count) =>
+          this.#wl?.publish(this.#memory, ptr >>> 0, count >>> 0),
+        // The reverse: drain this process's input and control ring into `ptr`,
+        // so the compositor pump can deliver each event to the client and
+        // surface the compositor's own hit test picked.
         wl_poll_input: (ptr, max) =>
           this.#wl?.pollInput(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
         virgl_take: (session, ptr, max) =>
@@ -2045,13 +2047,28 @@ export class Gex {
   }
 
   /**
-   * Give the guest a Wayland compositor. `wl` is a `WlProxy` (wl-bridge.mjs)
-   * that carries committed frames to the page's canvas. Like `useGl`, best set
-   * before `load` -- the socket is bound while the filesystem is built.
+   * Give the guest a Wayland compositor. `wl` is a `WlProxy` (wl-bridge.mjs),
+   * this process's window into the shared scene arena the compositor worker
+   * draws from. Like `useGl`, best set before `load` -- the socket is bound
+   * while the filesystem is built.
    */
   useWl(wl) {
     this.#wl = wl;
     this.#shim?.exports?.gex_set_wl?.(wl ? 1 : 0);
+  }
+
+  /** Say how large the compositor's output is, before the guest runs. */
+  wlOutput(w, h) {
+    this.#shim?.exports?.gex_set_wl_output?.(w | 0, h | 0);
+  }
+
+  /**
+   * This process's name in the compositor's scene arena: its pid, which every
+   * Worker of the process agrees on and no other process shares. Zero before
+   * the process has one, so callers ask again rather than caching it.
+   */
+  wlToken() {
+    return this.#shim?.exports?.gex_wl_token?.() ?? 0;
   }
 
   /**

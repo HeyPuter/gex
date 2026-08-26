@@ -323,13 +323,20 @@ export async function runProgram(
     network = null,
     onNetEvent = null,
     gl = null,
-    // A 2D canvas for the Wayland compositor to blit committed frames onto.
-    // Set for the xwayland/es2gears demo; drives the `wl-bridge` present path.
+    // The compositor's output canvas. Its control is transferred to a worker
+    // that owns a WebGL2 context and draws the whole scene there: every
+    // window, its decorations, its menus, and the cursor.
     wl = null,
-    // Input may belong on a different canvas from wl_shm presentation. In the
-    // Xwayland/virgl path the visible pixels are on the WebGL canvas while the
-    // Wayland canvas only carries the compositor's software framebuffer.
+    // Kept for callers that used to route input to a different canvas from the
+    // one wl_shm frames landed on. There is one output now, so this is only a
+    // fallback for where to attach the listeners.
     wlInput = null,
+    // Run the X server in the page instead of in a guest process: a Worker
+    // holding `Xwayland.wasm` and the compositor beside it (see
+    // `web/src/hostx.js`). Guest X clients reach it through the global
+    // kernel's unix socket, so from their side nothing changes -- but the
+    // server's own drawing runs at wasm speed rather than translated AArch64.
+    hostX = false,
     virgl = null,
     uid,
     // Every N safepoints, print the guest pc -- the only instrument for
@@ -433,28 +440,73 @@ export async function runProgram(
     glServe = serveGl(gl, glChannel);
   }
 
-  // The Wayland compositor's output. Its state machine runs in the Worker (the
-  // Rust shim); `wl` is the page's 2D canvas it commits frames onto, over a
-  // one-way SharedArrayBuffer ring. Same isolation requirement as the others.
+  // The Wayland compositor. The protocol state machine runs in each guest
+  // process (the Rust shim, next to the client's memory, which is the only
+  // place that can read a wl_shm pool); the scene, the output and the input
+  // live in one worker that owns a WebGL2 context. What crosses between them is
+  // a shared arena of surface descriptors -- never a frame.
   let wlChannel = null;
-  let wlServe = null;
+  let compositor = null;
   if (wl) {
     if (!globalThis.crossOriginIsolated) {
       throw new Error('the Wayland demo needs a cross-origin isolated page (SharedArrayBuffer bridge).');
     }
-    const { makeWlChannel, serveWl, attachWlInput } = await import('@gex/wl-bridge.mjs');
+    const { makeWlChannel, setOutputSize } = await import('@gex/wl-bridge.mjs');
     wlChannel = makeWlChannel();
-    // `wl` may be a 2D canvas (present shm frames onto it) or just `true`
-    // (run the compositor so a client like Xwayland can connect, but let
-    // something else -- virglrenderer on its own WebGL canvas -- own the
-    // pixels). In the latter case there is no page-side present.
-    wlServe = typeof wl?.getContext === 'function' ? serveWl(wl, wlChannel) : null;
-    // Mouse and keyboard, the reverse ring: listeners on the canvas append to
-    // it, the compositor pump drains it. Only a real canvas can take focus and
-    // report pointer coordinates, so the `wl === true` (no page canvas) case
-    // gets none.
-    const inputCanvas = wlInput || wl;
-    if (typeof inputCanvas?.getContext === 'function') attachWlInput(inputCanvas, wlChannel);
+    const canvas = typeof wl?.getContext === 'function' ? wl : null;
+    if (canvas) {
+      setOutputSize(wlChannel, canvas.width, canvas.height);
+      const { Compositor } = await import('./compositor.js');
+      compositor = await Compositor.create(canvas, wlChannel, wlInput || canvas);
+      globalThis.__gexCompositor = compositor;
+    }
+  }
+
+  // The X server, in the page. Started before the guest so the display is
+  // already listening when the first X client connects: the socket lives in the
+  // global kernel, so "listening" is a name in its table rather than a file.
+  let xServer = null;
+  if (hostX && wlChannel) {
+    if (!kernel) throw new Error('the host X server needs the global kernel');
+    xServer = new Worker(new URL('./xwayland-worker.js', import.meta.url), { type: 'module' });
+    // Waited for below: a guest that starts before the display is listening
+    // gets "Can't open display" and dies, and the display here is a name in the
+    // global kernel that only exists once the server has bound it.
+    let listening = null;
+    const up = new Promise((resolve) => (listening = resolve));
+    xServer.onmessage = (e) => {
+      const m = e.data;
+      if (m.kind === 'log') term.writeln(m.text);
+      else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory);
+      else if (m.kind === 'ready') listening(true);
+      else if (m.kind === 'failed') {
+        term.writeln(`gex: the X server failed: ${m.why}`);
+        listening(false);
+      }
+    };
+    xServer.postMessage({
+      kind: 'start',
+      xwaylandUrl: new URL('/gex/xwayland/Xwayland.mjs', location.href).href,
+      hostwlUrl: new URL('/gex/xwayland/gexhostwl.wasm', location.href).href,
+      keymapUrl: new URL('/gex/xwayland/gex.xkm', location.href).href,
+      kernel: { module: kernel.module, memory: kernel.memory },
+      wlChannel,
+      // A name in the scene arena that no guest pid can collide with: pids
+      // count up from 1, and this is 'xwl1' as ASCII.
+      token: 0x78776c31,
+      display: ':0',
+      verbose: globalThis.GEX_HOSTX_VERBOSE || undefined,
+      trace: globalThis.GEX_HOSTX_TRACE || undefined,
+      wlTrace: flag('wltrace') ? 1 : undefined,
+    });
+    // Two modules and a kernel to instantiate; a slow machine takes a few
+    // seconds. A run that goes ahead without the display is worse than one that
+    // says so.
+    const ok = await Promise.race([
+      up,
+      new Promise((r) => setTimeout(() => r('timeout'), 60000)),
+    ]);
+    if (ok === 'timeout') term.writeln('gex: the X server did not come up in 60s');
   }
 
   const host = new ProcessHost({
@@ -596,7 +648,12 @@ export async function runProgram(
     onMessage: (m) => {
       if (m.kind === 'virgl') serve?.();
       else if (m.kind === 'gl') glServe?.();
-      else if (m.kind === 'wl') wlServe?.();
+      // A process that has a compositor block hands the compositor its memory:
+      // that is where the pixels of every one of its surfaces are.
+      else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory);
+      else if (m.kind === 'wl') {
+        /* a publish happened; the compositor draws on its own clock */
+      }
       else if (m.kind === 'net') onNetEvent?.(m.event);
     },
   });
@@ -628,6 +685,8 @@ export async function runProgram(
       // its own translated code does not expect.
       opts: {
         cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, env, pins: closure?.pins,
+        // `?strace=1`, and every child inherits it: see `#opts` in gex.mjs.
+        strace: globalThis.GEX_STRACE ? 1 : undefined,
         // Which program pid 1 is, so its own text gets a code identity and a
         // second process can reuse what the first translated of it.
         //
@@ -652,6 +711,13 @@ export async function runProgram(
     keys.dispose();
     resize.dispose();
     host.stop();
+    // The compositor outlives no run: its worker holds a GL context and every
+    // process's memory, and a page that starts a second demo must not keep
+    // either.
+    compositor?.stop();
+    // The X server owns its Worker's thread for good -- `main` never returns --
+    // so ending the run means ending the Worker.
+    xServer?.terminate();
   }
 }
 

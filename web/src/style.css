@@ -151,6 +151,32 @@ main {
   margin-bottom: 10px;
 }
 
+/* The compositor's output. Sized by the demo (its width attribute is the
+   number of pixels the session has), shown at its own size up to the page's
+   width, and with no cursor of the browser's: the compositor draws the
+   client's. */
+/* The session picker: a column of checkboxes above the output, one per app. */
+.session-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 2px 16px;
+  margin: 0 auto 8px;
+  max-width: 100%;
+  font-size: 13px;
+}
+
+.session-picker label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+canvas.wl-output {
+  width: auto;
+  max-width: 100%;
+  cursor: none;
+}
+
 canvas.wl-offscreen {
   position: absolute;
   top: 0;

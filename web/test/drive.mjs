@@ -66,6 +66,11 @@ const DEMOS = {
       Number(/lit=(\d+)/.exec(t.replace(/\s+/g, ''))?.[1]) > 0,
     fail: (t) => /lit=0(?!\d)/.test(t.replace(/\s+/g, '')),
   },
+  // A session: several clients, each its own process, in one output. The bar
+  // is the compositor's own: windows mapped and pixels on the output, which
+  // `--wllit` reads back from its framebuffer. The terminal line only says the
+  // shell got that far.
+  compositor: { want: /gex: session up/ },
   // glxgears under Xwayland, GL through virgl (same success bar as `virgl`):
   // a frame rate AND a lit texture presented. `lit=0` is drew-nothing.
   wayland: {
@@ -105,17 +110,32 @@ const INJECT_JS = `(() => {
   return 'dispatched';
 })()`;
 
-// Counts non-black pixels on the compositor canvas (#gex-wl) -- the read-back
-// that tells `--wllit` a client drew something the whole pipeline delivered.
-const WLLIT_JS = `(() => {
-  const cv = document.getElementById('gex-wl');
-  if (!cv) return 0;
-  const ctx = cv.getContext('2d');
-  if (!ctx) return 0;
-  const d = ctx.getImageData(0, 0, cv.width, cv.height).data;
-  let lit = 0;
-  for (let i = 0; i < d.length; i += 4) if (Math.max(d[i], d[i + 1], d[i + 2]) > 24) lit++;
-  return lit;
+// What the compositor says it has drawn: mapped windows, frames, and a readback
+// of its own output (`lit`). The output is a WebGL canvas owned by a worker, so
+// the page cannot sample it directly -- `describe()` asks the worker, which
+// reads its own framebuffer. A run that maps a window and shows black is the
+// failure this measures, and it has happened at every layer of this pipeline.
+const WLLIT_JS = `(async () => {
+  const c = globalThis.__gexCompositor;
+  if (!c) return 0;
+  const s = await c.describe();
+  return s ? s.lit : 0;
+})()`;
+
+// How many windows the compositor has mapped, for a session where one window
+// drawing is not the goal: `--wlwindows 3` waits for three.
+const WLWINDOWS_JS = `(async () => {
+  const c = globalThis.__gexCompositor;
+  if (!c) return 0;
+  const s = await c.describe();
+  return s ? s.windows : 0;
+})()`;
+
+const WLSTATE_JS = `(async () => {
+  const c = globalThis.__gexCompositor;
+  if (!c) return null;
+  const s = await c.describe();
+  return s ? JSON.stringify(s) : null;
 })()`;
 
 // ---------------------------------------------------------------------------
@@ -160,6 +180,7 @@ function parseArgs(argv) {
     else if (a === '--input') o.input = true;
     else if (a === '--applit') o.applit = true;
     else if (a === '--wllit') o.wllit = true;
+    else if (a === '--wlwindows') o.wlwindows = Number(next());
     else if (a.startsWith('--')) fatal(`unknown flag ${a}`);
     else rest.push(a);
   }
@@ -571,6 +592,33 @@ async function runDemo(o) {
       }
     }
 
+    // --wlwindows N: a session's goal. N windows mapped in the compositor, and
+    // pixels on the output -- one client drawing says nothing about whether the
+    // others arrived, which is the whole question for a session.
+    if (o.wlwindows && !verdict) {
+      try {
+        const r = await browser.send(
+          'Runtime.evaluate',
+          { expression: WLWINDOWS_JS, returnByValue: true, awaitPromise: true },
+          page,
+        );
+        const windows = Number(r?.result?.value ?? 0);
+        if (windows >= o.wlwindows) {
+          const lit = await browser.send(
+            'Runtime.evaluate',
+            { expression: WLLIT_JS, returnByValue: true, awaitPromise: true },
+            page,
+          );
+          const px = Number(lit?.result?.value ?? 0);
+          if (px > 4000) {
+            verdict = { how: 'pass', body: `${windows} windows, output lit (${px} samples)` };
+          }
+        }
+      } catch {
+        /* transient */
+      }
+    }
+
     // --wllit: the universal Xwayland-pipeline success signal. Xwayland
     // composites every client -- GL or not -- to a wl_shm buffer the compositor
     // blits onto #gex-wl, so non-black pixels there mean the app drew and the
@@ -579,11 +627,14 @@ async function runDemo(o) {
       try {
         const r = await browser.send(
           'Runtime.evaluate',
-          { expression: WLLIT_JS, returnByValue: true },
+          { expression: WLLIT_JS, returnByValue: true, awaitPromise: true },
           page,
         );
         const lit = Number(r?.result?.value ?? 0);
-        if (lit > 200) verdict = { how: 'pass', body: `compositor canvas lit (${lit}px)` };
+        // A window's worth of pixels, not a cursor's: the compositor draws a
+        // pointer whatever else happens, and 200 samples of it passed a run
+        // whose clients had all died.
+        if (lit > 4000) verdict = { how: 'pass', body: `compositor output lit (${lit} samples)` };
       } catch {
         /* transient */
       }

@@ -17,40 +17,86 @@ use gex_kernel::syscalls::Kernel;
 use gex_kernel::unix::{HostListener, MemFd, UnixSocket};
 use gex_kernel::vfs::FileHandle;
 use gex_kernel::GuestMem;
-use gex_wayland::{Buffers, Client, Frame};
+use gex_wayland::{Buffers, Client, SurfaceInfo};
 use std::sync::{Arc, Mutex};
 
 #[link(wasm_import_module = "gex_env")]
 extern "C" {
-    /// Put a frame on the canvas. `ptr` is an address in this shared memory of
-    /// `stride*height` bytes of `wl_shm` pixels (format 0 = ARGB8888, 1 =
-    /// XRGB8888); the page reads them and draws. Called synchronously from the
-    /// scheduler pump, so the page's `putImageData` happens off a message it
-    /// posts to itself -- the pixels are in shared memory either way.
-    fn wl_present(ptr: u32, width: i32, height: i32, stride: i32, format: u32);
-    /// Pull up to `max` page input events into `ptr`, packed as i32 quintuples
-    /// `[kind, a, b, c, d]`; returns how many were written. The reverse of
-    /// `wl_present`: the page fills a ring from its mouse/keyboard listeners and
-    /// this drains it into wasm memory. `kind` selects the event: 0 motion(x, y,
-    /// time), 1 button(code, pressed, time), 2 axis(axis, value, time), 3
-    /// key(code, pressed, time), 4 modifiers(depressed, latched, locked, group).
-    /// Coordinates are surface-local pixels; button/key codes are Linux
-    /// `BTN_*`/evdev numbers, which is what Wayland carries.
+    /// Hand the host this pump's scene: `count` fixed-size records at `ptr`,
+    /// one per mapped surface, laid out as [`REC`] words each.
+    ///
+    /// The records are descriptors, not pixels. A `wl_shm` buffer lives in the
+    /// guest's memory and the host can read that memory directly, so what
+    /// crosses here is where each surface's pixels are -- an address, a stride,
+    /// a size, and the rectangle that changed -- and the compositor uploads the
+    /// damaged rows straight out of the guest. Nothing copies a frame.
+    fn wl_publish(ptr: u32, count: u32);
+    /// Pull up to `max` input and control events into `ptr`, packed as i32
+    /// records of [`EV`] words: `[kind, a, b, c, d, client, surface, pad]`.
+    /// Returns how many were written.
+    ///
+    /// The reverse of `wl_publish`: the compositor knows where every window is,
+    /// so it does the hit test and names the surface each event is for. `kind`
+    /// selects the event -- 0 motion(x, y, time), 1 button(code, pressed,
+    /// time), 2 axis(axis, value, time), 3 key(code, pressed, time),
+    /// 4 modifiers(depressed, latched, locked, group), 5 the pointer left this
+    /// client, 6 keyboard focus, 7 configure(width, height, activated),
+    /// 8 close, 9 dismiss popup. Coordinates are surface-local pixels;
+    /// button/key codes are Linux `BTN_*`/evdev numbers.
     fn wl_poll_input(ptr: u32, max: u32) -> u32;
 }
 
-/// A page input event, decoded from the poll buffer and applied to the client.
+/// Words in one published surface record. Fixed so both sides can index it
+/// without a schema: see `wl-bridge.mjs`, which reads the same numbers.
+const REC: usize = 28;
+/// Words in one input event record.
+const EV: usize = 8;
+/// The most surfaces published in one pump. A desktop session with a dozen
+/// windows, their menus and their tooltips fits several times over.
+const MAX_SURFACES: usize = 64;
+/// Bytes of UTF-8 title carried in a record, which is what a titlebar shows.
+const TITLE_BYTES: usize = 32;
+
+/// A page input or control event, decoded from the poll buffer.
 enum InputEvent {
-    Motion { x: i32, y: i32, time: u32 },
-    Button { button: u32, pressed: bool, time: u32 },
-    Axis { axis: u32, value: i32, time: u32 },
-    Key { key: u32, pressed: bool, time: u32 },
-    Mods { depressed: u32, latched: u32, locked: u32, group: u32 },
+    Motion { client: u32, surface: u32, x: i32, y: i32, time: u32 },
+    Button { client: u32, button: u32, pressed: bool, time: u32 },
+    Axis { client: u32, axis: u32, value: i32, time: u32 },
+    Key { client: u32, key: u32, pressed: bool, time: u32 },
+    Mods { client: u32, depressed: u32, latched: u32, locked: u32, group: u32 },
+    PointerClear { client: u32 },
+    KeyboardFocus { client: u32, surface: u32 },
+    Configure { client: u32, surface: u32, w: i32, h: i32, activated: bool },
+    Close { client: u32, surface: u32 },
+    DismissPopup { client: u32, surface: u32 },
+    /// The compositor moved a window. For an X window this has to reach the X
+    /// server, so that a menu the client positions in X coordinates lands
+    /// where the window now is.
+    Moved { client: u32, surface: u32, x: i32, y: i32 },
 }
 
-/// The most events pulled from the page in one pump. A page cannot generate
-/// more than a handful per turn; this is roomy and keeps the buffer on the
-/// stack.
+impl InputEvent {
+    /// Which client this is addressed to. A process can host more than one
+    /// (Xwayland and a native client both connect), and an event for one must
+    /// not reach the other.
+    fn client(&self) -> u32 {
+        match *self {
+            InputEvent::Motion { client, .. }
+            | InputEvent::Button { client, .. }
+            | InputEvent::Axis { client, .. }
+            | InputEvent::Key { client, .. }
+            | InputEvent::Mods { client, .. }
+            | InputEvent::PointerClear { client }
+            | InputEvent::KeyboardFocus { client, .. }
+            | InputEvent::Configure { client, .. }
+            | InputEvent::Close { client, .. }
+            | InputEvent::DismissPopup { client, .. }
+            | InputEvent::Moved { client, .. } => client,
+        }
+    }
+}
+
+/// The most events pulled from the page in one pump.
 const MAX_POLL: usize = 64;
 
 /// Pull and decode this turn's page input.
@@ -58,23 +104,52 @@ fn poll_input() -> Vec<InputEvent> {
     if !have_wl() {
         return Vec::new();
     }
-    let mut raw = [0i32; MAX_POLL * 5];
+    let mut raw = [0i32; MAX_POLL * EV];
     let n = (unsafe { wl_poll_input(raw.as_mut_ptr() as u32, MAX_POLL as u32) } as usize)
         .min(MAX_POLL);
     (0..n)
         .filter_map(|i| {
-            let q = &raw[i * 5..i * 5 + 5];
+            let q = &raw[i * EV..i * EV + EV];
+            let (client, surface) = (q[5] as u32, q[6] as u32);
             Some(match q[0] {
-                0 => InputEvent::Motion { x: q[1], y: q[2], time: q[3] as u32 },
-                1 => InputEvent::Button { button: q[1] as u32, pressed: q[2] != 0, time: q[3] as u32 },
-                2 => InputEvent::Axis { axis: q[1] as u32, value: q[2], time: q[3] as u32 },
-                3 => InputEvent::Key { key: q[1] as u32, pressed: q[2] != 0, time: q[3] as u32 },
+                0 => InputEvent::Motion { client, surface, x: q[1], y: q[2], time: q[3] as u32 },
+                1 => InputEvent::Button {
+                    client,
+                    button: q[1] as u32,
+                    pressed: q[2] != 0,
+                    time: q[3] as u32,
+                },
+                2 => InputEvent::Axis {
+                    client,
+                    axis: q[1] as u32,
+                    value: q[2],
+                    time: q[3] as u32,
+                },
+                3 => InputEvent::Key {
+                    client,
+                    key: q[1] as u32,
+                    pressed: q[2] != 0,
+                    time: q[3] as u32,
+                },
                 4 => InputEvent::Mods {
+                    client,
                     depressed: q[1] as u32,
                     latched: q[2] as u32,
                     locked: q[3] as u32,
                     group: q[4] as u32,
                 },
+                5 => InputEvent::PointerClear { client },
+                6 => InputEvent::KeyboardFocus { client, surface },
+                7 => InputEvent::Configure {
+                    client,
+                    surface,
+                    w: q[1],
+                    h: q[2],
+                    activated: q[4] != 0,
+                },
+                8 => InputEvent::Close { client, surface },
+                9 => InputEvent::DismissPopup { client, surface },
+                10 => InputEvent::Moved { client, surface, x: q[1], y: q[2] },
                 _ => return None,
             })
         })
@@ -99,6 +174,41 @@ pub fn have_wl() -> bool {
     unsafe { HAVE_WL }
 }
 
+/// The output size, as the page's compositor canvas. A toplevel is configured
+/// to this and `wl_output` reports it, so a client sizes its window to the
+/// space there actually is.
+static mut OUTPUT: (i32, i32) = DEFAULT_SIZE;
+
+/// Say how large the compositor's output is.
+///
+/// # Safety
+/// Called from JS before the guest runs, on the one thread a page has.
+#[no_mangle]
+pub extern "C" fn gex_set_wl_output(w: i32, h: i32) {
+    unsafe { OUTPUT = (w.max(1), h.max(1)) }
+}
+
+fn output_size() -> (i32, i32) {
+    unsafe { OUTPUT }
+}
+
+/// This process's name in the compositor's scene arena: its pid.
+///
+/// It has to be the *process's* and not the Worker's. A process's threads are
+/// each a Worker with their own shim instance and their own JS side, and every
+/// one of them can run the scheduler pump and publish this process's surfaces.
+/// A token per Worker therefore showed one window once per thread -- four
+/// stacked copies of KCalc, the newest of them empty -- and a random number
+/// per process cannot be agreed on by Workers that share no statics. The pid
+/// is the one name every Worker of a process already knows.
+///
+/// Zero until the process has a pid (`gex_load` or `gex_adopt_child` sets it),
+/// which is why the JS side asks again rather than caching a zero.
+#[no_mangle]
+pub extern "C" fn gex_wl_token() -> u32 {
+    crate::my_pid().max(0) as u32
+}
+
 /// The default screen size, until a client asks for its own.
 pub const DEFAULT_SIZE: (i32, i32) = (640, 480);
 
@@ -112,6 +222,17 @@ pub const DEFAULT_SOCKET: &str = "/tmp/wayland-0";
 struct Session {
     socket: Arc<UnixSocket>,
     client: Client,
+    /// Pumps since this session started, for rate-limiting the attempt to
+    /// reach an X server that may not be listening yet.
+    xwm_tries: u32,
+    /// The X window manager, once this client has turned out to be an X server.
+    /// The compositor *is* the window manager -- there is no second one in the
+    /// guest -- so it lives here, beside the Wayland half of the same client.
+    xwm: Option<crate::xwm::Xwm>,
+    /// This client's number within this process, which is how the compositor
+    /// addresses it: surface ids are per-client, so two clients in one process
+    /// can both own a surface 3.
+    idx: u32,
     fds: Vec<Arc<OpenFile>>,
     /// Event bytes the socket had no room for yet, and how many have gone.
     out: Vec<u8>,
@@ -122,9 +243,12 @@ struct Session {
 struct Inner {
     sessions: Mutex<Vec<Session>>,
     size: Mutex<(i32, i32)>,
-    /// Pixels of the last frame presented, kept alive across the `wl_present`
-    /// call so the address handed to the page stays valid until it has read.
-    held: Mutex<Vec<u8>>,
+    /// Clients numbered so far, so an index is never reused by a later
+    /// connection -- the compositor keys its window state on it.
+    next_idx: Mutex<u32>,
+    /// How many clients were live at the last publish, so a client going away
+    /// is a scene change even when no one drew.
+    published: Mutex<usize>,
 }
 
 /// The compositor as the guest sees it: a name that accepts connections.
@@ -141,40 +265,51 @@ impl std::fmt::Debug for WaylandDevice {
 
 impl WaylandDevice {
     pub fn new() -> WaylandDevice {
+        // The compositor's own diagnostics -- a key with nowhere to go, a
+        // buffer that could not be placed -- go to this process's stderr
+        // whether or not protocol tracing is on. The verbose per-message trace
+        // stays behind `?wltrace=1`; these are the lines that answer "why is
+        // nothing happening", and they should not need a flag.
+        fn sink(s: &str) {
+            unsafe { crate::write_stderr(&format!("{s}\n")) };
+        }
+        gex_wayland::set_trace_sink(sink);
+        // The window manager's notes go the same way: it is a crate now, and
+        // its notes belong beside the compositor's in the page's terminal.
+        gex_xwm::set_trace_sink(sink);
         let dev = WaylandDevice {
             inner: Arc::new(Inner::default()),
         };
-        *dev.inner.size.lock().unwrap() = DEFAULT_SIZE;
+        *dev.inner.size.lock().unwrap() = output_size();
         dev
     }
 
-    /// Move bytes both ways for every client and present what committed. Run
-    /// once per scheduler turn. `kernel`/`mem` are how a buffer's pixels are
-    /// found: a client maps its `wl_shm` pool `MAP_SHARED`, which aliases a
-    /// range of guest memory, so the compositor reads the framebuffer with no
-    /// copy of its own.
+    /// Move bytes both ways for every client, hand the compositor this turn's
+    /// scene, and take its input. Run once per scheduler turn.
+    ///
+    /// `kernel`/`mem` are how a buffer is found: a client maps its `wl_shm`
+    /// pool `MAP_SHARED`, which aliases a range of guest memory, so what the
+    /// compositor is told is the address of that range -- nothing is copied
+    /// here, and nothing is composited here either.
     pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) {
         let mut sessions = self.inner.sessions.lock().unwrap();
-        let mut produced: Vec<Frame> = Vec::new();
-        // Page input for this turn, applied below to every client that has bound
-        // a device. One event set reaches each such client once; the demo has a
-        // single input client (Xwayland or the native gears), so this is exact.
+        // Compositor input and control for this turn, addressed by client: a
+        // process can host Xwayland and a native client at once, and an event
+        // for one must not reach the other.
         //
         // Drained ONLY when a client is there to take it, and that is the whole
         // difference between a working pointer and the bug this replaced. There
-        // is one input ring on the page and a `WaylandDevice` in EVERY guest
-        // process -- `mount_devices` gives one to pid 1 and to every child it
-        // adopts -- so every process's pump was draining the same ring. The
-        // events a process with no client drained were dropped on the floor,
-        // and which process won each event was a scheduler race: the shell, or
-        // Xwayland, or the client. Motion survived it (there are hundreds of
-        // events and losing most of them still tracks the cursor), and a click
-        // did not -- press and release are one event each, so a click landed
-        // only when both won the race, and a lone surviving press left a button
-        // stuck down. The queue is the right place for an event no one can take
-        // yet: it stays in the ring, and the pump that has the client gets it.
+        // is one input ring per process on the page and a `WaylandDevice` in
+        // EVERY guest process -- `mount_devices` gives one to pid 1 and to every
+        // child it adopts -- so a pump with no client would drain events meant
+        // for the process that has one and drop them on the floor. Motion
+        // survived that (hundreds of events, and losing most still tracks the
+        // cursor); a click did not, because press and release are one event
+        // each. The queue is the right place for an event no one can take yet.
         let wanted = sessions.iter().any(|s| s.client.wants_input());
         let input = if wanted { poll_input() } else { Vec::new() };
+        let mut scene: Vec<i32> = Vec::new();
+        let mut changed = false;
         sessions.retain_mut(|s| {
             let mut gone = false;
             let mut buf = vec![0u8; 64 * 1024];
@@ -200,38 +335,119 @@ impl WaylandDevice {
                     break;
                 }
             }
-            // Deliver the page's input now that any `get_pointer`/`get_keyboard`
-            // from this turn's bytes has been processed.
-            if s.client.wants_input() && !input.is_empty() {
+            // Deliver this turn's events now that any `get_pointer`/
+            // `get_keyboard` from this turn's bytes has been processed.
+            if s.client.wants_input() {
                 // A self-limiting note that input reached a client end to end
-                // (page ring -> poll -> compositor -> this client), for the first
-                // few events only so a busy session does not narrate every move.
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static SEEN: AtomicU32 = AtomicU32::new(0);
-                if SEEN.fetch_add(input.len() as u32, Ordering::Relaxed) < 24 {
-                    unsafe {
-                        crate::write_stderr(&format!(
-                            "[wl] delivered {} input event(s) to a client\n",
-                            input.len()
-                        ));
+                // (compositor hit test -> ring -> poll -> this client), for the
+                // first few events only so a busy session does not narrate
+                // every move.
+                let mine = input.iter().filter(|e| e.client() == s.idx).count();
+                if mine > 0 {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static SEEN: AtomicU32 = AtomicU32::new(0);
+                    if SEEN.fetch_add(mine as u32, Ordering::Relaxed) < 24 {
+                        unsafe {
+                            crate::write_stderr(&format!(
+                                "[wl] delivered {mine} event(s) to client {}\n",
+                                s.idx
+                            ));
+                        }
                     }
                 }
-                for ev in &input {
+                for ev in input.iter().filter(|e| e.client() == s.idx) {
                     match *ev {
-                        InputEvent::Motion { x, y, time } => s.client.pointer_motion(x, y, time),
-                        InputEvent::Button { button, pressed, time } => {
+                        InputEvent::Motion { surface, x, y, time, .. } => {
+                            s.client.pointer_to(surface, x, y, time)
+                        }
+                        InputEvent::Button { button, pressed, time, .. } => {
                             s.client.pointer_button(button, pressed, time)
                         }
-                        InputEvent::Axis { axis, value, time } => {
+                        InputEvent::Axis { axis, value, time, .. } => {
                             s.client.pointer_axis(axis, value, time)
                         }
-                        InputEvent::Key { key, pressed, time } => {
+                        InputEvent::Key { key, pressed, time, .. } => {
                             s.client.keyboard_key(key, pressed, time)
                         }
-                        InputEvent::Mods { depressed, latched, locked, group } => {
+                        InputEvent::Mods { depressed, latched, locked, group, .. } => {
                             s.client.keyboard_modifiers(depressed, latched, locked, group)
                         }
+                        InputEvent::PointerClear { .. } => s.client.pointer_clear(),
+                        InputEvent::KeyboardFocus { surface, .. } => {
+                            s.client.keyboard_focus(surface);
+                            if surface != 0 && s.client.is_x11(surface) {
+                                if let Some(xwm) = s.xwm.as_mut() {
+                                    xwm.focus(surface);
+                                }
+                            }
+                        }
+                        InputEvent::Configure { surface, w, h, activated, .. } => {
+                            s.client.configure(surface, w, h, activated)
+                        }
+                        InputEvent::Close { surface, .. } => {
+                            // An X window has no xdg_toplevel to close: the
+                            // manager asks the client with WM_DELETE_WINDOW.
+                            let x11 = s.client.is_x11(surface);
+                            match (x11, s.xwm.as_mut()) {
+                                (true, Some(xwm)) => {
+                                    xwm.close(surface);
+                                }
+                                _ => s.client.close(surface),
+                            }
+                        }
+                        InputEvent::DismissPopup { surface, .. } => {
+                            s.client.dismiss_popup(surface)
+                        }
+                        InputEvent::Moved { surface, x, y, .. } => {
+                            if let Some(xwm) = s.xwm.as_mut() {
+                                xwm.moved(surface, x, y);
+                            }
+                        }
                     }
+                }
+            }
+            // The X window manager, if this client is an X server. Connected
+            // lazily: the socket only exists once Xwayland has bound it, which
+            // is after its Wayland connection is up.
+            // Not every pump: the X socket does not exist until Xwayland has
+            // bound it, and asking the global kernel for a name that is not
+            // there yet, thousands of times a second, is a lock and a scan
+            // each time for nothing.
+            s.xwm_tries = s.xwm_tries.wrapping_add(1);
+            if s.xwm_tries == 1 {
+                // Which program this client is, and so whether this process is
+                // the X server whose windows the compositor must manage.
+                unsafe {
+                    crate::write_stderr(&format!(
+                        "[wl] client {} is {} (x server: {})\n",
+                        s.idx,
+                        kernel.exe_path,
+                        is_x_server(kernel)
+                    ));
+                }
+            }
+            if s.xwm.is_none() && s.xwm_tries % 64 == 1 && is_x_server(kernel) {
+                s.xwm = crate::xwm::connect(kernel);
+                if s.xwm.is_none() {
+                    // Once, and only from the process that is the X server: a
+                    // manager that cannot reach the server is the difference
+                    // between windows and an empty output, and it should not be
+                    // silent about it.
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static SAID: AtomicBool = AtomicBool::new(false);
+                    if !SAID.swap(true, Ordering::Relaxed) {
+                        unsafe {
+                            crate::write_stderr(
+                                "[xwm] the X server's socket is not connectable yet\n",
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(xwm) = s.xwm.as_mut() {
+                xwm.pump(&mut s.client);
+                if xwm.failed() {
+                    s.xwm = None;
                 }
             }
             s.out.extend_from_slice(&s.client.take_outgoing());
@@ -263,80 +479,158 @@ impl WaylandDevice {
                 s.out.clear();
                 s.sent = 0;
             }
-            let frames = s.client.take_frames();
-            // A self-limiting note of what actually committed -- surface and
-            // size -- so a client that draws nothing to the compositor can be
-            // told from one whose frames simply do not reach the canvas.
-            if !frames.is_empty() {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static F: AtomicU32 = AtomicU32::new(0);
-                if F.fetch_add(frames.len() as u32, Ordering::Relaxed) < 16 {
-                    for fr in &frames {
-                        unsafe {
-                            crate::write_stderr(&format!(
-                                "[wl] commit: surface {} {}x{}\n",
-                                fr.surface, fr.width, fr.height
-                            ));
-                        }
-                    }
+            // This client's contribution to the scene. Published every pump it
+            // changed anything, which a client that is not drawing does not.
+            // Frames are the copy-out path, for a host that cannot read guest
+            // memory. This one can, so a frame here means a buffer that could
+            // not be placed (one that claimed more than its pool holds) --
+            // taken and dropped rather than left to accumulate.
+            let refused = s.client.take_frames();
+            if !refused.is_empty() && Self::trace_refusals() {
+                unsafe {
+                    crate::write_stderr(&format!(
+                        "[wl] {} buffer(s) could not be placed and were dropped\n",
+                        refused.len()
+                    ));
                 }
             }
-            produced.extend(frames);
+            changed |= s.client.take_dirty();
+            for info in s.client.scene() {
+                if scene.len() / REC >= MAX_SURFACES {
+                    break;
+                }
+                push_record(&mut scene, s.idx, &info);
+                s.client.clear_damage(info.surface);
+            }
+            // A client that is gone, or one this compositor threw out. The
+            // second is worth saying out loud: a dropped session takes its X
+            // window manager with it, and then every X client waits forever
+            // for a MapRequest nobody will answer.
+            if let Some(why) = s.client.failed.clone() {
+                unsafe {
+                    crate::write_stderr(&format!(
+                        "[wl] client {} was dropped: {why}\n",
+                        s.idx
+                    ));
+                }
+            }
+            if gone {
+                unsafe {
+                    crate::write_stderr(&format!("[wl] client {} disconnected\n", s.idx));
+                }
+            }
             !gone && s.client.failed.is_none()
         });
+        // A client that went away changes the scene by its absence.
+        let live = sessions.len();
+        let mut last = self.inner.published.lock().unwrap();
+        changed |= *last != live;
+        *last = live;
         drop(sessions);
-        // Present the newest commit. A frame already carries its pixels (copied
-        // out of the client's pool during `receive`), so there is nothing left
-        // to resolve here -- just swizzle to the RGBA the canvas wants and hand
-        // the page the address. `held` keeps the bytes alive across the call.
-        if let Some(frame) = produced.last() {
-            let rgba = to_rgba(frame);
-            let (w, h) = (frame.width, frame.height);
-            let mut held = self.inner.held.lock().unwrap();
-            *held = rgba;
-            unsafe { wl_present(held.as_ptr() as u32, w, h, w * 4, frame.format) };
+        if changed {
+            let count = (scene.len() / REC) as u32;
+            unsafe { wl_publish(scene.as_ptr() as u32, count) };
         }
     }
 
     pub fn client_count(&self) -> usize {
         self.inner.sessions.lock().unwrap().len()
     }
+
+    /// The output size the compositor is drawing at, which is what a toplevel
+    /// is configured to and what `wl_output` reports.
+    pub fn set_output(&self, w: i32, h: i32) {
+        *self.inner.size.lock().unwrap() = (w.max(1), h.max(1));
+    }
 }
 
-/// A frame's pixels as tightly-packed RGBA for a canvas `ImageData`. The
-/// `wl_shm` formats are ARGB8888/XRGB8888, little-endian, so a pixel's bytes
-/// are B,G,R,A; the canvas wants R,G,B,A. Alpha is forced opaque -- XRGB has
-/// none, and a partially-transparent toplevel over a blank page is not wanted.
-fn to_rgba(frame: &Frame) -> Vec<u8> {
-    let (w, h) = (frame.width.max(0) as usize, frame.height.max(0) as usize);
-    let stride = frame.stride.max(0) as usize;
-    let mut out = vec![0u8; w * h * 4];
-    for y in 0..h {
-        let row = y * stride;
-        for x in 0..w {
-            let at = row + x * 4;
-            let o = (y * w + x) * 4;
-            if at + 3 < frame.pixels.len() {
-                out[o] = frame.pixels[at + 2];
-                out[o + 1] = frame.pixels[at + 1];
-                out[o + 2] = frame.pixels[at];
-                out[o + 3] = 255;
-            } else {
-                out[o + 3] = 255;
-            }
-        }
+impl WaylandDevice {
+    /// Say once that a buffer was refused, and not again: a client that does it
+    /// does it every frame.
+    fn trace_refusals() -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        !SAID.swap(true, Ordering::Relaxed)
     }
-    out
+}
+
+/// Whether this process is the X server, which is how the compositor knows to
+/// be its window manager as well.
+///
+/// sway knows because it spawns Xwayland itself; here the guest's session
+/// starts it, so the program's own name is what says so. The manager has to run
+/// in *this* process: the pairing between an X window and a `wl_surface` names
+/// a surface on this process's Wayland connection.
+fn is_x_server(kernel: &Kernel) -> bool {
+    if !kernel.exe_path.contains("Xwayland") {
+        return false;
+    }
+    // And only a *rootless* one. Rootless Xwayland hands each X window over as
+    // its own surface and needs a window manager to do it; a rootful one
+    // presents the whole X screen as one surface and manages its own windows
+    // inside it -- and a manager that redirects them with Composite there sends
+    // every window offscreen, leaving a black root. Which is exactly what
+    // happened to the single-app card until this test was here.
+    kernel.argv.iter().any(|a| a == "-rootless")
+}
+
+/// One surface's record, in the layout `wl-bridge.mjs` reads.
+fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
+    let base = out.len();
+    out.resize(base + REC, 0);
+    let r = &mut out[base..base + REC];
+    r[0] = client as i32;
+    r[1] = info.surface as i32;
+    r[2] = info.role.code() as i32;
+    r[3] = info.parent as i32;
+    r[4] = info.rel_x;
+    r[5] = info.rel_y;
+    r[6] = info.width;
+    r[7] = info.height;
+    r[8] = info.addr as i32;
+    r[9] = info.stride;
+    r[10] = info.format as i32;
+    r[11] = info.serial as i32;
+    r[12] = info.damage.x;
+    r[13] = info.damage.y;
+    r[14] = info.damage.w;
+    r[15] = info.damage.h;
+    r[16] = i32::from(info.move_requested);
+    // The title as UTF-8 in the record's tail, truncated on a character
+    // boundary so a multi-byte title cannot be cut into invalid bytes.
+    let mut n = info.title.len().min(TITLE_BYTES);
+    while n > 0 && !info.title.is_char_boundary(n) {
+        n -= 1;
+    }
+    let bytes = &info.title.as_bytes()[..n];
+    for (i, chunk) in bytes.chunks(4).enumerate() {
+        let mut word = [0u8; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        r[18 + i] = i32::from_le_bytes(word);
+    }
 }
 
 impl HostListener for WaylandDevice {
     fn accept(&self, peer: Arc<UnixSocket>) {
         let mut client = Client::new();
-        let (w, h) = *self.inner.size.lock().unwrap();
+        let (w, h) = output_size();
         client.set_default_size(w, h);
+        let idx = {
+            let mut n = self.inner.next_idx.lock().unwrap();
+            *n += 1;
+            *n
+        };
+        unsafe {
+            crate::write_stderr(&format!(
+                "[wl] client {idx} connected to this process's compositor\n"
+            ));
+        }
         self.inner.sessions.lock().unwrap().push(Session {
             socket: peer,
             client,
+            xwm_tries: 0,
+            xwm: None,
+            idx,
             fds: Vec::new(),
             out: Vec::new(),
             sent: 0,
@@ -352,6 +646,20 @@ struct PoolView<'a, 'm> {
 }
 
 impl Buffers for PoolView<'_, '_> {
+    fn locate(&self, fd: u32) -> Option<(u32, u32)> {
+        let file = self.fds.get(fd as usize)?;
+        // The client mapped its pool MAP_SHARED, so the mapping *is* the
+        // pool: its address in guest memory is where the pixels are, live,
+        // and the compositor reads them from there. This is why a frame is
+        // never copied on the way to the screen.
+        let map = self
+            .kernel
+            .shared_maps
+            .iter()
+            .find(|m| Arc::ptr_eq(&m.file, file))?;
+        Some((u32::try_from(map.start).ok()?, u32::try_from(map.len).ok()?))
+    }
+
     fn map(&self, fd: u32, size: usize) -> Option<Vec<u8>> {
         let file = self.fds.get(fd as usize)?;
         // Mapped shared, so the live pixels are in the guest's memory; the
