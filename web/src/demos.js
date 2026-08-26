@@ -1530,10 +1530,10 @@ const compositor = {
         // through Mesa and virgl and that is the path with GLX in it.
         //
         // There is another X server -- the one in the page (`web/src/hostx.js`),
-        // native wasm rather than translated AArch64, and the only one xeyes,
-        // xclock and xcalc have ever worked under. It has no GLX, so while virgl
-        // is how anything reaches the GPU it stays behind `?hostx=1` rather than
-        // being chosen for a session that might want OpenGL.
+        // native wasm rather than translated AArch64, so its own drawing costs
+        // what the host's does. It has no GLX, so while virgl is how anything
+        // reaches the GPU it stays behind `?hostx=1` rather than being chosen
+        // for a session that might want OpenGL.
         const hostX = qp.get('hostx') === '1';
         if (hostX && chosen.some((a) => a.kind === 'x' && a.gl)) {
           ctx.term.writeln(
