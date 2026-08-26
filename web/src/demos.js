@@ -1281,6 +1281,8 @@ const SESSION_APPS = [
   { id: 'xcalc', label: 'xcalc — X11 through rootless Xwayland', kind: 'x', cmd: 'xcalc' },
   {
     id: 'glxgears',
+    // Needs GLX, which only the guest X server has: see `hostX` below.
+    gl: true,
     label: 'glxgears — OpenGL, Mesa → virgl, under Xwayland',
     kind: 'x',
     cmd: 'glxgears.aarch64-linux-gnu',
@@ -1288,6 +1290,8 @@ const SESSION_APPS = [
   },
   {
     id: 'glmark2',
+    // Needs GLX, which only the guest X server has: see `hostX` below.
+    gl: true,
     label: 'glmark2 — a real GL benchmark, under Xwayland',
     kind: 'x',
     cmd: 'glmark2 --size 480x320',
@@ -1301,6 +1305,7 @@ const SESSION_APPS = [
   },
   {
     id: 'supertuxkart',
+    gl: true,
     label: 'SuperTuxKart — a real game, X11 + Mesa (needs the big image)',
     kind: 'x',
     cmd: stkRace,
@@ -1521,10 +1526,24 @@ const compositor = {
             if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
           }
         }
-        // `?hostx=1`: run the X server in the page rather than as a guest
-        // process. Same protocol, same window manager, same compositor -- the
-        // difference is that the server's own drawing is native wasm.
-        const hostX = qp.get('hostx') === '1';
+        // Which X server: the one in the page (`web/src/hostx.js`) or a guest
+        // Xwayland. Same protocol, same window manager, same compositor; the
+        // page's own drawing is native wasm rather than translated AArch64, and
+        // it is what makes xeyes, xclock and xcalc work at all.
+        //
+        // It has no GLX, though -- that needs glamor on a GPU nothing here can
+        // offer -- so a session with an OpenGL X client in it uses the guest's
+        // server, which reaches the GPU through Mesa and virgl. `?hostx=0` or
+        // `?hostx=1` decides it by hand.
+        const wantsGl = chosen.some((a) => a.kind === 'x' && a.gl);
+        const hostX = qp.has('hostx') ? qp.get('hostx') === '1' : !wantsGl;
+        if (chosen.some((a) => a.kind === 'x')) {
+          ctx.term.writeln(
+            ctx.ansi.dim(
+              `the X server: ${hostX ? 'in the page (wasm)' : 'a guest Xwayland (it has GLX)'}`,
+            ),
+          );
+        }
         const script = sessionScript(chosen, {
           hostX,
           stagger: Number(qp.get('stagger')) || 4,

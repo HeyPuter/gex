@@ -53,9 +53,13 @@ landed. What runs today:
   virgl to virglrenderer -- sits beside them in the same output;
 * **an X server that is not a guest program** -- `web/build-xwayland-wasm.sh`
   cross-builds Xwayland itself to WebAssembly (pixman, libwayland, libXfont2 and
-  the rest with it) and `?hostx=1` runs it in a Worker of the page instead of in
-  a guest process, so the server's own drawing is native wasm rather than
-  translated AArch64. Its two connections are bridged rather than emulated: X
+  the rest with it) and the session runs it in a Worker of the page instead of
+  in a guest process, so the server's own drawing is native wasm rather than
+  translated AArch64. It is what makes xeyes, xclock and xcalc work at all, and
+  a terminal in it -- xterm, with a shell, a prompt and job control -- behaves.
+  It has no GLX (that wants glamor on a GPU a tab does not have), so a session
+  with an OpenGL X client in it starts a guest Xwayland instead, which reaches
+  the GPU through Mesa and virgl; `?hostx=0`/`?hostx=1` decides by hand. Its two connections are bridged rather than emulated: X
   clients are guest processes reaching it through the global kernel's unix
   socket, and the compositor is `gex-wayland` in the same Worker with no socket
   at all (`shims/hostwl`). A `wl_shm` pool is an allocation in the server's own
