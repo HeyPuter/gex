@@ -25,7 +25,7 @@
 // a stuck one. Exit code is 0 on pass, non-zero on fail/hang/crash.
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, openSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, openSync, existsSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -230,6 +230,35 @@ async function ensureServer() {
 // profile so a second launch refuses (singleton) and a fixed port so we find
 // it again. WebGL via swiftshader (the demos need a real GL context headless).
 // ---------------------------------------------------------------------------
+
+// Total resident memory of every chrome process, in MiB, read from /proc.
+// GEX_CHROME_MAX_RSS (default 5000) is the point at which the persistent
+// browser is retired instead of reused.
+function chromeIsTooBig() {
+  const limit = Number(process.env.GEX_CHROME_MAX_RSS || 5000);
+  if (!(limit > 0)) return false;
+  let total = 0;
+  try {
+    for (const entry of readdirSync('/proc')) {
+      if (!/^\d+$/.test(entry)) continue;
+      let comm;
+      try {
+        comm = readFileSync(`/proc/${entry}/comm`, 'utf8');
+      } catch { continue; }
+      if (!/chrom/i.test(comm)) continue;
+      try {
+        // statm field 2 is resident pages.
+        const resident = Number(readFileSync(`/proc/${entry}/statm`, 'utf8').split(' ')[1]);
+        total += (resident * 4096) / (1024 * 1024);
+      } catch { /* gone */ }
+    }
+  } catch {
+    return false;
+  }
+  if (total > limit) log(`chrome: ${total.toFixed(0)} MiB resident, over ${limit}`);
+  return total > limit;
+}
+
 async function ensureChrome(restart) {
   if (restart) {
     const url = await browserWsUrl(CHROME_PORT);
@@ -251,6 +280,25 @@ async function ensureChrome(restart) {
   }
 
   let url = await browserWsUrl(CHROME_PORT);
+  if (url && chromeIsTooBig()) {
+    // A browser kept across dozens of runs accumulates: today it reached
+    // 11 GiB over 32 processes and pages started dying of OOM in the middle
+    // of unrelated tests. A crash that is really "the machine is full" reads
+    // exactly like a rendering bug -- SuperTuxKart came back black, and the
+    // driver was blameless -- so retire it before that happens rather than
+    // after.
+    log('chrome: restarting, the persistent browser has grown too large');
+    try {
+      const c = await Cdp.connect(url);
+      await c.send('Browser.close');
+    } catch { /* fall through to the pidfile */ }
+    try {
+      const pid = Number(await readFile(join(CHROME_STATE, 'chrome.pid'), 'utf8'));
+      if (pid) process.kill(pid, 'SIGKILL');
+    } catch { /* none recorded */ }
+    await sleep(800);
+    url = null;
+  }
   if (url) {
     log(`chrome: reusing :${CHROME_PORT}`);
     return url;
