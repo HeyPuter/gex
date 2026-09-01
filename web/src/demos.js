@@ -395,8 +395,12 @@ async function bootDebian(ctx) {
  * correctly today. `wgpu` is st/mesa on the gex_wgpu driver, which is where
  * this is going. `?glbackend=` picks.
  */
-function mesaBackend(query, api) {
-  const driver = query.get('glbackend') || 'virgl';
+function mesaBackend(query, api, dflt = 'virgl') {
+  // The default is the caller's, not one rule for everyone: `?gl=mesa` has
+  // meant "st/mesa on gex_wgpu" since it existed, and every gl44 probe and CTS
+  // gate is written that way -- silently pointing those at another driver
+  // would produce numbers that look like the ones being asked for and are not.
+  const driver = query.get('glbackend') || dflt;
   return {
     backend: driver,
     url: driver === 'virgl' ? '/gex/gex-virgl-replay.js' : '/gex/gex-wgpu-replay.js',
@@ -439,14 +443,14 @@ const gears = {
     let gl;
     if (mesaWebGpu) {
       gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(
-        canvas, mesaBackend(query, 'es'));
+        canvas, mesaBackend(query, 'es', 'wgpu'));
     } else if (directWebGpu) {
       // This used to be an unconditional MobileGL construction, so a demo
       // marked directGl ran the broken backend with nothing said about it.
       console.warn('[gex] MobileGL was requested and ignored: it is disabled ' +
                    'with no override. Running Mesa instead.');
       gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(
-        canvas, mesaBackend(query, 'es'));
+        canvas, mesaBackend(query, 'es', 'wgpu'));
     } else {
       gl = new GlDevice(canvas);
     }
