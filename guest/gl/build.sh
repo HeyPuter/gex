@@ -39,6 +39,19 @@ out = ["/* Opcodes for the gex graphics device.",
        ""]
 for m in re.finditer(r'pub const ([A-Z_0-9]+): u32 = (\d+);', body):
     out.append(f"#define GEXGL_{m.group(1)} {m.group(2)}")
+# The small enumerations beside the opcodes -- who a surface belongs to, which
+# API a context is -- for the same reason: written twice is written
+# differently.
+for name in ('surface', 'client_api'):
+    marker = f'pub mod {name} {{'
+    if marker not in src:
+        continue
+    block = src[src.index(marker):]
+    block = block[:block.index('\n}')]
+    out.append("")
+    for m in re.finditer(r'pub const ([A-Z_0-9]+): u32 = (\d+);', block):
+        out.append(f"#define GEXGL_{name.upper()}_{m.group(1)} {m.group(2)}")
+
 magic = re.search(r'pub const MAGIC: u32 = (0x[0-9a-fA-F_]+);', src).group(1)
 protocol_version = re.search(r'pub const PROTOCOL_VERSION: u32 = (\d+);', src).group(1)
 out += ["", f"#define GEXGL_MAGIC {magic.replace('_','')}u",
@@ -46,6 +59,10 @@ out += ["", f"#define GEXGL_MAGIC {magic.replace('_','')}u",
 dev = open(f'{root}/shims/native/src/gl.rs').read()
 sub = re.search(r'pub const GEX_GL_SUBMIT: u64 = (0x[0-9a-fA-F_]+);', dev).group(1)
 out += [f"#define GEXGL_SUBMIT {sub.replace('_','')}u"]
+browser = open(f'{root}/shims/browser/src/gl.rs').read()
+surface_ioctl = re.search(r'pub const GEX_GL_SURFACE: u64 = (0x[0-9a-fA-F_]+);', browser)
+if surface_ioctl:
+    out += [f"#define GEXGL_SURFACE {surface_ioctl.group(1).replace('_','')}u"]
 out += ["", "#endif", ""]
 open(f'{here}/gexgl.h', 'w').write("\n".join(out))
 

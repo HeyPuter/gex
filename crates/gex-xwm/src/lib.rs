@@ -901,6 +901,9 @@ impl Xwm {
             ));
         }
         client.adopt_x11(surface, &w.title, w.override_redirect, w.x, w.y);
+        // And which window it is: a GL client names its drawable, and the
+        // compositor has no other way to know which surface that became.
+        client.set_xid(surface, window);
         if let Some(e) = self.windows.get_mut(&window) {
             e.announced = true;
         }

@@ -818,15 +818,24 @@ DESKTOP
     -Wno-pedantic -Wno-c23-extensions \
     -sFULL_ES3=1 -sMAX_WEBGL_VERSION=2 -sMIN_WEBGL_VERSION=2 \
     -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=1048576 -sEXPORT_ES6=1 -sMODULARIZE=1 \
-    -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,UTF8ToString \
+    -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,UTF8ToString,GL \
     -sENVIRONMENT=web,worker \
     $DEBUG_FLAGS \
-    -sEXPORTED_FUNCTIONS=_gex_virgl_init,_gex_virgl_describe,_gex_virgl_gl_state,_gex_virgl_commands,_gex_virgl_presented,_gex_virgl_feed,_gex_virgl_pump,_gex_virgl_pending,_gex_virgl_replies,_gex_virgl_drain,_gex_virgl_close,_gex_virgl_trace_commands,_malloc,_free
+    -sEXPORTED_FUNCTIONS=_gex_virgl_init,_gex_virgl_describe,_gex_virgl_gl_state,_gex_virgl_commands,_gex_virgl_presented,_gex_virgl_feed,_gex_virgl_pump,_gex_virgl_pending,_gex_virgl_replies,_gex_virgl_drain,_gex_virgl_close,_gex_virgl_trace_commands,_gex_virgl_present_texture,_gex_virgl_present_width,_gex_virgl_present_height,_gex_virgl_present_serial,_gex_virgl_present_to_canvas,_malloc,_free
 
 echo
 for a in src/libvirglrenderer.a src/libvirgl.a src/gallium/libgallium.a src/mesa/libmesa.a; do
     printf '  %-34s %8d bytes\n' "$a" "$(stat -c%s "$OUT/build/$a")"
 done
 printf '  %-34s %8d bytes\n' "gexvirgl.wasm" "$(stat -c%s "$OUT/gexvirgl.wasm")"
+# And where the page loads it from. Left out before, so a rebuilt renderer sat
+# in $OUT while the site kept serving the last one that `build-assets.sh`
+# happened to copy -- which looks exactly like a change that did not work.
+PUB="$(CDPATH='' cd -- "$(dirname "$0")" && pwd)/public/gex"
+if [ -d "$PUB" ]; then
+    cp "$OUT/gexvirgl.mjs" "$OUT/gexvirgl.wasm" "$PUB/"
+    echo "  published into $PUB"
+fi
+
 echo
 echo "built into $OUT"

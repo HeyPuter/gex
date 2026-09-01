@@ -1209,6 +1209,9 @@ fn mount_devices(
         );
         // A node too, for a client that stats the path before connecting.
         let _ = kernel.vfs.mksocket(crate::wl::DEFAULT_SOCKET);
+        // And where the GL device can find it: a client rendering on the host
+        // names the surface it draws into through /dev/gex-gl.
+        crate::wl::set_compositor(&device);
         device
     });
     (virgl, wayland)

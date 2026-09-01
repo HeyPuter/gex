@@ -313,6 +313,43 @@ static void gex_present(uint32_t handle) {
  * source rectangle is the viewport, which the client set to its window size.
  * Upside down for the same reason as gex_present: GL is bottom-left, the canvas
  * top-left. */
+/* The frame a compositor in this same context can draw for itself.
+ *
+ * `gex_present_current` blits the guest's render target onto the canvas,
+ * which is the whole picture when the guest is the only thing on screen. In a
+ * session it is not: the frame belongs inside a window, among others, and the
+ * compositor draws it. Both live in one worker on one WebGL context, so what
+ * it needs is the texture -- no readback, no upload, no second copy of the
+ * frame anywhere.
+ *
+ * The texture is the colour attachment of the framebuffer virglrenderer just
+ * rendered into, which is a plain GL query rather than anything of
+ * virglrenderer's. */
+static GLuint gex_present_tex;
+static int gex_present_tex_w, gex_present_tex_h;
+/* Where a finished frame is copied to, so a compositor never samples a frame
+ * that is still being drawn. */
+static GLuint gex_present_copy, gex_present_copy_fbo;
+static int gex_present_copy_w, gex_present_copy_h;
+static unsigned gex_present_serial;
+/* Whether the canvas still wants the blit. A compositor turns it off: it is
+ * going to draw this frame somewhere else on the same canvas, and a blit
+ * would overwrite everything else on it. */
+static int gex_present_to_canvas = 1;
+
+EMSCRIPTEN_KEEPALIVE
+unsigned gex_virgl_present_texture(void) { return gex_present_tex; }
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_present_width(void) { return gex_present_tex_w; }
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_present_height(void) { return gex_present_tex_h; }
+/* Bumped once per presented frame, so a compositor can tell a new frame from
+ * the same texture presented again. */
+EMSCRIPTEN_KEEPALIVE
+unsigned gex_virgl_present_serial(void) { return gex_present_serial; }
+EMSCRIPTEN_KEEPALIVE
+void gex_virgl_present_to_canvas(int on) { gex_present_to_canvas = on != 0; }
+
 static void gex_present_current(void) {
     gex_submit_present_calls++;
     GLint fb = 0;
@@ -328,6 +365,80 @@ static void gex_present_current(void) {
         return;
     }
 
+    /* What the frame *is*, before deciding where it goes. */
+    GLint attached = 0, kind = 0;
+    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
+    if (kind == GL_TEXTURE) {
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                              GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                              &attached);
+        gex_present_tex = (GLuint)attached;
+        gex_present_tex_w = vp[2];
+        gex_present_tex_h = vp[3];
+        gex_present_serial++;
+    }
+    if (!gex_present_to_canvas) {
+        /* A copy of the finished frame, for a compositor to draw.
+         *
+         * Not the guest's own target: that is the buffer it keeps drawing
+         * into, and a compositor sampling it at its own rhythm sees whatever
+         * has been rendered so far -- three red bands of a gear that is half
+         * drawn. This is one GPU blit at the moment the frame is finished,
+         * and no readback: the pixels never leave the GPU. */
+        if (gex_present_copy_w != vp[2] || gex_present_copy_h != vp[3]) {
+            if (!gex_present_copy) glGenTextures(1, &gex_present_copy);
+            glBindTexture(GL_TEXTURE_2D, gex_present_copy);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, vp[2], vp[3], 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, NULL);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            if (!gex_present_copy_fbo) glGenFramebuffers(1, &gex_present_copy_fbo);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gex_present_copy_fbo);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, gex_present_copy, 0);
+            gex_present_copy_w = vp[2];
+            gex_present_copy_h = vp[3];
+        }
+        GLint read_was = 0, draw_was = 0;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_was);
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_was);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gex_present_copy_fbo);
+        glDisable(GL_SCISSOR_TEST);
+        glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
+                          0, 0, gex_present_copy_w, gex_present_copy_h,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_was);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_was);
+        gex_present_tex = gex_present_copy;
+        gex_present_tex_w = gex_present_copy_w;
+        gex_present_tex_h = gex_present_copy_h;
+
+        static int probed;
+        if (probed++ % 32 == 0) {
+            unsigned char px[20 * 20 * 4];
+            GLint sx = vp[0] + vp[2] / 2 - 10, sy = vp[1] + vp[3] / 2 - 10;
+            if (sx < 0) sx = 0;
+            if (sy < 0) sy = 0;
+            GLint was = 0;
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &was);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
+            glReadPixels(sx, sy, 20, 20, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)was);
+            for (size_t i = 0; i < sizeof px; i += 4) {
+                int v = px[i] > px[i + 1] ? px[i] : px[i + 1];
+                if (px[i + 2] > v) v = px[i + 2];
+                if (v > gex_brightest) gex_brightest = v;
+            }
+            if (gex_brightest > 8) gex_lit++;
+        }
+        gex_presented++;
+        return;
+    }
+
     int w, h;
     emscripten_get_canvas_element_size("#gex-gl", &w, &h);
     /* virglrenderer created and validated this draw target before submitting
@@ -338,7 +449,11 @@ static void gex_present_current(void) {
     glDisable(GL_SCISSOR_TEST);
 
     static int seen;
-    if (seen == 0) {
+    // Every thirty-second frame, not only the first. A compositor drawing
+    // this texture and getting black has two possible causes -- the frame is
+    // black, or the wrong thing is being sampled -- and only the renderer's
+    // own reading of its own framebuffer tells them apart.
+    if (seen % 32 == 0) {
         unsigned char px[20 * 20 * 4];
         GLint sx = vp[0] + vp[2] / 2 - 10, sy = vp[1] + vp[3] / 2 - 10;
         if (sx < 0) sx = 0;

@@ -204,6 +204,50 @@ fn output_size() -> (i32, i32) {
 ///
 /// Zero until the process has a pid (`gex_load` or `gex_adopt_child` sets it),
 /// which is why the JS side asks again rather than caching a zero.
+/// This process's compositor, for a device that has to reach it.
+///
+/// The GL device's `GEX_GL_SURFACE` is the one: a client that renders on the
+/// host has to tell the compositor which of its surfaces that is, and the two
+/// devices know nothing of each other. Process-wide rather than per-thread
+/// because the ioctl arrives on whichever thread the client called it from.
+static COMPOSITOR: std::sync::Mutex<Option<WaylandDevice>> = std::sync::Mutex::new(None);
+
+/// Remember it at mount, so the GL device can find it later.
+pub fn set_compositor(device: &WaylandDevice) {
+    *COMPOSITOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(device.clone());
+}
+
+/// Say that a surface of this process's client is drawn by the host.
+///
+/// Surface ids are per-client, and a process with a GL client has one;
+/// marking every session is what makes that true without the caller having to
+/// know its own client number.
+pub fn attach_external(surface: u32, w: i32, h: i32) {
+    let device = COMPOSITOR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(device) = device else { return };
+    {
+        let mut sessions = device
+            .inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            crate::write_stderr(&format!(
+                "[wl] external: surface {surface} {w}x{h} to {} session(s)\n",
+                sessions.len()
+            ));
+        }
+        for session in sessions.iter_mut() {
+            session.client.attach_external(surface, w, h);
+        }
+    }
+    // And publish it now rather than waiting for a pump. A client that has
+    // just said this is about to stop talking to its compositor: its frames
+    // go to the host from here on, and nothing it does will drive another
+    // pump. Waiting for one means the window never appears at all.
+    device.publish_scene();
+}
+
 #[no_mangle]
 pub extern "C" fn gex_wl_token() -> u32 {
     crate::my_pid().max(0) as u32
@@ -533,6 +577,32 @@ impl WaylandDevice {
         }
     }
 
+    /// Write every client's surfaces into the scene arena.
+    ///
+    /// The tail of `pump`, callable on its own for a change that arrives from
+    /// somewhere other than the Wayland socket -- a GL client naming the
+    /// surface the host draws for it.
+    pub fn publish_scene(&self) {
+        let mut scene: Vec<i32> = Vec::new();
+        {
+            let mut sessions = self
+                .inner
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for s in sessions.iter_mut() {
+                for info in s.client.scene() {
+                    if scene.len() / REC >= MAX_SURFACES {
+                        break;
+                    }
+                    push_record(&mut scene, s.idx, &info);
+                }
+            }
+        }
+        let count = (scene.len() / REC) as u32;
+        unsafe { wl_publish(scene.as_ptr() as u32, count) };
+    }
+
     pub fn client_count(&self) -> usize {
         self.inner.sessions.lock().unwrap().len()
     }
@@ -595,7 +665,10 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[13] = info.damage.y;
     r[14] = info.damage.w;
     r[15] = info.damage.h;
-    r[16] = i32::from(info.move_requested);
+    r[16] = i32::from(info.move_requested) | (i32::from(info.external) << 1);
+    // Which X window this is, for a host that knows a drawable and not a
+    // surface -- an OpenGL client naming what it draws into.
+    r[17] = info.xid as i32;
     // The title as UTF-8 in the record's tail, truncated on a character
     // boundary so a multi-byte title cannot be cut into invalid bytes.
     let mut n = info.title.len().min(TITLE_BYTES);

@@ -318,6 +318,37 @@ export class VirglRenderer {
     return ran < 0 ? -1 : bytes.length;
   }
 
+  /** The frame this renderer last drew, as a texture in its own context.
+   *
+   * For a compositor sharing that context: the guest's picture without a
+   * readback, an upload, or a copy of any kind. `serial` moves once per
+   * presented frame, so a caller can tell a new frame from the same one. */
+  frame() {
+    if (!this.ok || this.#worker) return null;
+    const name = this.#module._gex_virgl_present_texture?.() ?? 0;
+    if (!name) return null;
+    // A texture is an integer inside the module and a `WebGLTexture` out
+    // here: emscripten keeps the table, and WebGL will not take the number.
+    const tex = this.#module.GL?.textures?.[name] ?? null;
+    if (!tex) return null;
+    return {
+      tex,
+      w: this.#module._gex_virgl_present_width(),
+      h: this.#module._gex_virgl_present_height(),
+      serial: this.#module._gex_virgl_present_serial(),
+    };
+  }
+
+  /** Whether a finished frame is also blitted onto the canvas.
+   *
+   * On for a guest that owns the screen. Off for one inside a window: the
+   * compositor puts that frame where the window is, and a blit would cover
+   * everything else with it. */
+  presentToCanvas(on) {
+    if (!this.ok || this.#worker) return;
+    this.#module._gex_virgl_present_to_canvas?.(on ? 1 : 0);
+  }
+
   /** How many reply bytes are waiting for an in-context client. */
   pending(session) {
     if (!this.ok || this.#worker) return -1;

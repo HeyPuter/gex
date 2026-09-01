@@ -662,6 +662,8 @@ const virglGears = {
       let renderer = null;
       try {
         ctx.busy('loading the renderer');
+        // No compositor in this demo: its GL owns the canvas, so the device
+        // stays here whatever a session would do.
         if (usesDirectGl(demo)) {
           renderer = await createDirectGlDevice(canvas, runOptions.gl ?? demo.gl ?? null);
         } else {
@@ -671,27 +673,31 @@ const virglGears = {
             : (demo.renderer || '/gex/gexvirgl.mjs');
           renderer = await VirglRenderer.create(canvas, rendererUrl);
         }
-        if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
+        if (renderer && !renderer.ok) {
+          throw new Error(`the renderer would not start: ${renderer.error}`);
+        }
         // Live render state for a test harness: it can tell a client rendered
         // (lit>0) the moment it happens rather than waiting for the exit report.
         globalThis.__gexGlState = () => {
           try {
-            return renderer.glState();
+            return renderer?.glState() ?? '';
           } catch {
             return '';
           }
         };
         globalThis.__gexGlCommands = () => {
           try {
-            return renderer.commands();
+            return renderer?.commands() ?? null;
           } catch {
             return '';
           }
         };
         // `?virgltrace=1` narrates every vtest command by name, the only way to
         // see what a stuck GL client is looping on.
-        if (new URLSearchParams(location.search).get('virgltrace')) renderer.traceCommands(1);
-        ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
+        if (new URLSearchParams(location.search).get('virgltrace')) renderer?.traceCommands(1);
+        if (renderer) {
+          ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
+        }
         ctx.term.writeln('');
 
         const tree = await ctx.rootfs('/rootfs/graphics.tar');
@@ -760,8 +766,8 @@ const virglGears = {
         rule(ctx, `exit ${status} in ${ms} ms`);
         // vtest has no present -- the X server reads its pixels back and never
         // looks at a screen -- so a run can draw perfectly with a blank canvas.
-        await renderer.refresh();
-        const gl = renderer.glState();
+        await renderer?.refresh();
+        const gl = renderer?.glState() ?? '';
         // `presented` counts blits; `lit` counts blits whose source had a pixel
         // in it. Those differing is a black canvas with the frame reported to
         // have arrived.
@@ -775,7 +781,7 @@ const virglGears = {
         // MesaGlDevice.commands() returns null, and calling .split() on that
         // threw out of the report, so every `?gl=mesa` run of this demo ended
         // in "Cannot read properties of null" instead of its own summary.
-        for (const part of (renderer.commands() ?? '').split('|')) {
+        for (const part of (renderer?.commands() ?? '').split('|')) {
           if (part.trim()) ctx.term.writeln(ctx.ansi.dim(`  ${part.trim()}`));
         }
         ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
@@ -1012,9 +1018,18 @@ const waylandGears = {
       running(true);
       const t0 = performance.now();
       let renderer = null;
+      // Where the guest's GL runs. In the compositor's worker its frames are
+      // textures in the context that draws the scene, so a GL window costs no
+      // readback and no upload -- which is the whole reason Mesa is on the
+      // host. `?glhost=page` keeps the old arrangement, where the device is
+      // here and its last frame is blitted over the output.
+      const glInCompositor = usesDirectGl(demo) &&
+        new URLSearchParams(location.search).get('glhost') !== 'page';
       try {
         ctx.busy('loading the renderer');
-        if (usesDirectGl(demo)) {
+        if (glInCompositor) {
+          // The runtime starts it once the compositor's worker exists.
+        } else if (usesDirectGl(demo)) {
           renderer = await createDirectGlDevice(canvas, runOptions.gl ?? demo.gl ?? null);
         } else {
           const { VirglRenderer } = await import('./virgl.js');
@@ -1023,17 +1038,19 @@ const waylandGears = {
             : (demo.renderer || '/gex/gexvirgl.mjs');
           renderer = await VirglRenderer.create(canvas, rendererUrl);
         }
-        if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
+        if (renderer && !renderer.ok) {
+          throw new Error(`the renderer would not start: ${renderer.error}`);
+        }
         clearInterval(fpsTimer);
         cancelAnimationFrame(fpsRaf);
         fps.textContent = 'FPS: 0.0';
         let fpsFrames = 0;
-        let fpsSerial = renderer.presentedCount();
+        let fpsSerial = renderer?.presentedCount() ?? 0;
         let fpsAt = performance.now();
         globalThis.__gexDisplayFps = [];
         const countDisplayedFrame = () => {
-          renderer.display?.();
-          const serial = renderer.presentedCount();
+          renderer?.display?.();
+          const serial = renderer?.presentedCount() ?? 0;
           if (serial !== fpsSerial) {
             fpsFrames++;
             fpsSerial = serial;
@@ -1068,7 +1085,7 @@ const waylandGears = {
         // `?virgltrace=1` narrates every vtest command by name, the only way to
         // see what a stuck GL client is looping on.
         if (new URLSearchParams(location.search).get('virgltrace')) renderer.traceCommands(1);
-        ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
+        if (renderer) ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
         ctx.term.writeln('');
 
         const qp = new URLSearchParams(location.search);
@@ -1324,7 +1341,7 @@ const waylandGears = {
           // client's wl_surface like everything else, so there is one output
           // and one place input goes.
           virgl: usesDirectGl(demo) ? null : renderer,
-          gl: usesDirectGl(demo) ? renderer : null,
+          gl: glInCompositor ? 'compositor' : (usesDirectGl(demo) ? renderer : null),
           wl: wlCanvas,
           wlInput: wlCanvas,
           heartbeat: Number(new URLSearchParams(location.search).get('heartbeat')) || 0,

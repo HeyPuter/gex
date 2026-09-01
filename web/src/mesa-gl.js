@@ -386,6 +386,27 @@ export class MesaGlDevice {
       : done(result);
   }
 
+  /** The renderer this device encodes for, when the backend is virgl. */
+  get renderer() {
+    return this.#renderer;
+  }
+
+  /** What the guest says its frames belong to: see `op::SURFACE_ATTACH`.
+   *
+   * `kind` 0 is a Wayland surface named with the process that published it,
+   * 1 an X drawable. A zero `id` means the guest never said, which is the
+   * case for anything drawing to the output rather than into a window. */
+  attachment() {
+    const m = this.#module;
+    if (!m?._gex_gl_attached_id) return null;
+    return {
+      kind: m._gex_gl_attached_kind(),
+      id: m._gex_gl_attached_id(),
+      token: m._gex_gl_attached_token(),
+      generation: m._gex_gl_attached_generation(),
+    };
+  }
+
   /** Present whatever the guest last drew. */
   display() {
     // Not while a submit is suspended. Readback makes submit a JSPI call that

@@ -115,6 +115,7 @@ void mesa_get_internal_format_iv(GLenum target, GLenum internal_format,
 
 enum Op : uint32_t {
     CONTEXT_CREATE = 1, SURFACE_RESIZE = 2, FINISH = 3, PRESENT = 4,
+    SURFACE_ATTACH = 5,
     CLEAR_COLOR = 16, CLEAR = 17, VIEWPORT = 18, ENABLE = 19, DISABLE = 20,
     BLEND_FUNC = 21, DEPTH_FUNC = 22, CULL_FACE = 23, FRONT_FACE = 24,
     SCISSOR = 25, PIXEL_STOREI = 26, CLEAR_DEPTH = 27, DEPTH_MASK = 28,
@@ -384,6 +385,12 @@ int backend_minor = 0;
 /* Surface size, remembered until the context that draws to it exists. */
 int backend_width = 1;
 int backend_height = 1;
+/* What the guest says its frames belong to, and a count of how many times it
+ * has said something different. Read by the page after a submit. */
+unsigned attached_kind = 0;
+unsigned attached_id = 0;
+unsigned attached_token = 0;
+unsigned attached_generation = 0;
 
 #if defined(GEX_MESA_WGPU)
 /* Report which Gallium entry points st/mesa is going to need and this driver
@@ -1365,6 +1372,17 @@ bool one(uint32_t op, Reader& a) {
         resize_drawable(width, height);
         break;
     }
+    /* Which window on the page's screen the frames after this one belong
+     * to: see `op::SURFACE_ATTACH`. Kept, not acted on -- the page reads it
+     * and the compositor does the rest, because what a surface id means is
+     * the compositor's business and not this decoder's. */
+    case SURFACE_ATTACH: {
+        attached_kind = a.u32();
+        attached_id = a.u32();
+        attached_token = a.u32();
+        attached_generation++;
+        break;
+    }
     case FINISH: glFinish(); put_u32(0); break;
     /* The reply is the number of frames the *page* has put on screen, which
      * is not the number the guest has swapped: the backend renders into a
@@ -2176,6 +2194,10 @@ EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_display() {
     display_backend();
     return displayed;
 }
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_kind() { return attached_kind; }
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_id() { return attached_id; }
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_token() { return attached_token; }
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_generation() { return attached_generation; }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_presented() { return displayed; }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_produced() { return produced; }
 

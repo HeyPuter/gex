@@ -476,7 +476,9 @@ fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     r[13] = info.damage.y;
     r[14] = info.damage.w;
     r[15] = info.damage.h;
-    r[16] = i32::from(info.move_requested);
+    r[16] = i32::from(info.move_requested) | (i32::from(info.external) << 1);
+    // The X window this surface is, for a GL client that names a drawable.
+    r[17] = info.xid as i32;
     let mut n = info.title.len().min(TITLE_BYTES);
     while n > 0 && !info.title.is_char_boundary(n) {
         n -= 1;

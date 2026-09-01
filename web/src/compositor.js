@@ -49,6 +49,24 @@ export class Compositor {
     return c;
   }
 
+  /** Run the guest's OpenGL in the compositor's own worker.
+   *
+   * Not on the page: the frames have to be textures in the context that draws
+   * the scene, or a GL window costs a readback and an upload every frame. The
+   * ring is the same shared one the page-side device would have served. */
+  hostGl(channel, opts = {}) {
+    return new Promise((resolve, reject) => {
+      const onMessage = ({ data: m }) => {
+        if (m.kind !== 'gl-ready' && m.kind !== 'gl-failed') return;
+        this.#worker.removeEventListener('message', onMessage);
+        if (m.kind === 'gl-ready') resolve(m.describe);
+        else reject(new Error(m.error));
+      };
+      this.#worker.addEventListener('message', onMessage);
+      this.#worker.postMessage({ kind: 'gl', channel, ...opts });
+    });
+  }
+
   async #start(canvas, channel, inputTarget) {
     this.#canvas = canvas;
     this.#stats = new SharedArrayBuffer(16);

@@ -179,6 +179,10 @@ pub struct SurfaceInfo {
     /// An X window, paired to this surface by the compositor's own X window
     /// manager rather than given a role by its client.
     pub x11: bool,
+    /// The X window id, when the window manager has named one.
+    pub xid: u32,
+    /// The pixels are not at `addr`: the host knows where they are.
+    pub external: bool,
 }
 
 /// Interfaces the registry advertises, with the version offered. A toolkit
@@ -387,16 +391,37 @@ struct SurfaceState {
     /// It has no xdg role and never will: rootless Xwayland hands the
     /// compositor bare surfaces and names them over the X connection.
     x11: bool,
+    /// The X window this surface is, when it is one. Published so a host that
+    /// knows a drawable -- an OpenGL client naming what it draws into -- can
+    /// find the surface without knowing anything about X.
+    xid: u32,
+    /// The size of a surface whose pixels are somewhere else.
+    ///
+    /// A client rendering through the host's OpenGL attaches no buffer: there
+    /// is nothing to attach, because its frames never come back to the guest.
+    /// Such a surface would never be published at all -- no buffer, no size,
+    /// nothing to draw -- so it says how big it is and the compositor finds
+    /// the pixels by other means.
+    external: Option<(i32, i32)>,
     /// A NULL buffer was attached: this commit unmaps the surface.
     pending_null: bool,
     /// Subsurfaces of this surface, in bottom-to-top order.
     children: Vec<u32>,
 }
 
+/// Whether a surface's pixels are the host's. A free function because the
+/// caller is holding `self.surfaces` mutably where it asks.
+fn state_is_external(surfaces: &HashMap<u32, SurfaceState>, id: u32) -> bool {
+    surfaces.get(&id).is_some_and(|s| s.external.is_some())
+}
+
 /// One connected client.
 pub struct Client {
     objects: HashMap<u32, Object>,
     surfaces: HashMap<u32, SurfaceState>,
+    /// Surfaces named as drawn-on-the-host before they existed. See
+    /// [`Client::attach_external`].
+    external_pending: HashMap<u32, (i32, i32)>,
     /// Bytes received and not yet forming a whole message.
     inbox: Vec<u8>,
     /// Descriptors received and not yet claimed by an `fd` argument.
@@ -468,6 +493,7 @@ impl Client {
         Client {
             objects,
             surfaces: HashMap::new(),
+            external_pending: HashMap::new(),
             inbox: Vec::new(),
             fds: Vec::new(),
             outbox: Vec::new(),
@@ -829,7 +855,14 @@ impl Client {
             0 => {
                 let Some(id) = r.new_id() else { return false };
                 self.objects.insert(id, Object::Surface);
-                self.surfaces.insert(id, SurfaceState::default());
+                let mut state = SurfaceState::default();
+                // A client that already said this surface is drawn on the host
+                // said so before the request that creates it arrived.
+                state.external = self.external_pending.get(&id).copied();
+                self.surfaces.insert(id, state);
+                if state_is_external(&self.surfaces, id) {
+                    self.dirty = true;
+                }
                 true
             }
             // create_region(id)
@@ -1849,17 +1882,22 @@ impl Client {
     pub fn scene(&self) -> Vec<SurfaceInfo> {
         let mut out = Vec::new();
         for (id, s) in &self.surfaces {
-            if s.role == Role::None || s.addr == 0 || s.width <= 0 || s.height <= 0 {
+            let external = s.external.filter(|(w, h)| *w > 0 && *h > 0);
+            if s.role == Role::None {
                 continue;
             }
+            if external.is_none() && (s.addr == 0 || s.width <= 0 || s.height <= 0) {
+                continue;
+            }
+            let (width, height) = external.unwrap_or((s.width, s.height));
             out.push(SurfaceInfo {
                 surface: *id,
                 role: s.role,
                 parent: s.parent,
                 rel_x: s.rel_x,
                 rel_y: s.rel_y,
-                width: s.width,
-                height: s.height,
+                width,
+                height,
                 addr: s.addr,
                 stride: s.stride,
                 format: s.format,
@@ -1870,6 +1908,8 @@ impl Client {
                 title: s.title.clone(),
                 move_requested: s.move_requested,
                 x11: s.x11,
+                xid: s.xid,
+                external: external.is_some(),
             });
         }
         // A stable order, so a host that keys textures by index rather than by
@@ -1958,6 +1998,34 @@ impl Client {
     /// This surface is an X window: a toplevel the compositor decorates, or --
     /// if the X window is override-redirect, which is what a menu is -- a
     /// popup positioned in output coordinates by the client itself.
+    /// A client's frames for this surface are drawn by the host, not put in a
+    /// buffer. `w`/`h` are what size it draws at; zero forgets the
+    /// arrangement.
+    pub fn attach_external(&mut self, surface: u32, w: i32, h: i32) {
+        // Remembered, not just applied: this arrives by a route of its own --
+        // the client tells the compositor directly, through the GL device --
+        // and it can beat the `create_surface` request still sitting in the
+        // client's own output buffer. So the surface may not exist yet, and
+        // the mark waits for it.
+        if w > 0 && h > 0 {
+            self.external_pending.insert(surface, (w, h));
+        } else {
+            self.external_pending.remove(&surface);
+        }
+        if let Some(s) = self.surfaces.get_mut(&surface) {
+            s.external = if w > 0 && h > 0 { Some((w, h)) } else { None };
+            self.dirty = true;
+        }
+    }
+
+    /// Which X window a surface is, for a host that knows only the drawable.
+    pub fn set_xid(&mut self, surface: u32, xid: u32) {
+        if let Some(s) = self.surfaces.get_mut(&surface) {
+            s.xid = xid;
+            self.dirty = true;
+        }
+    }
+
     pub fn adopt_x11(&mut self, surface: u32, title: &str, override_redirect: bool, x: i32, y: i32) {
         let Some(s) = self.surfaces.get_mut(&surface) else {
             return;

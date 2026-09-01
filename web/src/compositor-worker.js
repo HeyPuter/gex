@@ -127,6 +127,17 @@ class Painter {
       tex: gl.getUniformLocation(prog, 'uTex'),
     };
     this.vao = gl.createVertexArray();
+    // A sampler, so what this draws does not depend on parameters set by
+    // whoever made the texture. The guest's own frames are textures Mesa
+    // created and left with the GL default filter -- mipmapped, with no
+    // mipmaps -- which samples as black and nothing says why. A sampler
+    // object overrides that for this unit without touching the texture, which
+    // matters because the texture is not ours.
+    this.sampler = gl.createSampler();
+    gl.samplerParameteri(this.sampler, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.samplerParameteri(this.sampler, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.samplerParameteri(this.sampler, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.samplerParameteri(this.sampler, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.useProgram(prog);
     gl.uniform1i(this.u.tex, 0);
     gl.enable(gl.BLEND);
@@ -135,10 +146,77 @@ class Painter {
 
   begin(w, h) {
     const gl = this.gl;
+    // This context is shared: the guest's OpenGL runs in it too (see
+    // `startGl`). Two things follow, and both were learned the hard way.
+    //
+    // What it leaves behind -- a framebuffer, a scissor, a depth test -- is
+    // enough to make this draw nothing, or draw into something that is not
+    // the canvas. So the state this needs is set, not assumed.
+    //
+    // And what *this* leaves behind is just as bad the other way: the driver
+    // on the other side caches what it believes is bound and does not re-bind
+    // what it thinks is already right. Leaving framebuffer 0 bound sent the
+    // guest's next frame to the canvas instead of its own texture -- one
+    // frame drawn and then nothing, for ever. So `end` puts it all back.
+    this.saved = {
+      fb: gl.getParameter(gl.FRAMEBUFFER_BINDING),
+      program: gl.getParameter(gl.CURRENT_PROGRAM),
+      vao: gl.getParameter(gl.VERTEX_ARRAY_BINDING),
+      unit: gl.getParameter(gl.ACTIVE_TEXTURE),
+      viewport: gl.getParameter(gl.VIEWPORT),
+      blend: gl.isEnabled(gl.BLEND),
+      scissor: gl.isEnabled(gl.SCISSOR_TEST),
+      depth: gl.isEnabled(gl.DEPTH_TEST),
+      stencil: gl.isEnabled(gl.STENCIL_TEST),
+      cull: gl.isEnabled(gl.CULL_FACE),
+      depthMask: gl.getParameter(gl.DEPTH_WRITEMASK),
+      colorMask: gl.getParameter(gl.COLOR_WRITEMASK),
+      blendSrc: gl.getParameter(gl.BLEND_SRC_ALPHA),
+      blendDst: gl.getParameter(gl.BLEND_DST_ALPHA),
+    };
+    gl.activeTexture(gl.TEXTURE0);
+    this.saved.tex0 = gl.getParameter(gl.TEXTURE_BINDING_2D);
+    this.saved.sampler = gl.getParameter(gl.SAMPLER_BINDING);
+    gl.bindSampler(0, this.sampler);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.STENCIL_TEST);
+    gl.disable(gl.CULL_FACE);
+    gl.colorMask(true, true, true, true);
+    gl.depthMask(false);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindVertexArray(this.vao);
     gl.useProgram(this.prog);
+    gl.uniform1i(this.u.tex, 0);
     gl.viewport(0, 0, w, h);
     gl.uniform2f(this.u.output, w, h);
+  }
+
+  /** Put the context back the way the guest's driver believes it is. */
+  end() {
+    const gl = this.gl;
+    const s = this.saved;
+    if (!s) return;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, s.fb);
+    gl.useProgram(s.program);
+    gl.bindVertexArray(s.vao);
+    gl.bindTexture(gl.TEXTURE_2D, s.tex0);
+    gl.bindSampler(0, s.sampler);
+    gl.activeTexture(s.unit);
+    gl.viewport(s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3]);
+    const set = (cap, on) => (on ? gl.enable(cap) : gl.disable(cap));
+    set(gl.BLEND, s.blend);
+    set(gl.SCISSOR_TEST, s.scissor);
+    set(gl.DEPTH_TEST, s.depth);
+    set(gl.STENCIL_TEST, s.stencil);
+    set(gl.CULL_FACE, s.cull);
+    gl.depthMask(s.depthMask);
+    gl.colorMask(s.colorMask[0], s.colorMask[1], s.colorMask[2], s.colorMask[3]);
+    gl.blendFunc(s.blendSrc, s.blendDst);
+    this.saved = null;
   }
 
   solid(x, y, w, h, color) {
@@ -261,6 +339,8 @@ class Compositor {
   /** Window state the compositor owns: position, stacking, focus. */
   #windows = new Map();
   #order = [];
+  #glSaid = '';
+  #glSaidAt = 0;
   #focus = null;
   #pointer = { x: 0, y: 0, over: null, buttons: 0 };
   #drag = null;
@@ -523,6 +603,9 @@ class Compositor {
    * over the parts that did not change, and the sub-rectangle costs one call.
    */
   #upload(k, s) {
+    // Nothing to read: this surface's pixels are the host's, and `addr` names
+    // no buffer. See `F_EXTERNAL`.
+    if (s.external || !s.addr) return true;
     const gl = this.#gl;
     const mem = this.#memoryOf(s.token);
     if (!mem) return false;
@@ -633,13 +716,64 @@ class Compositor {
   }
 
   #drawSurface(k, win) {
+    const f = this.#frameOf(win);
+    // A window whose pixels are the host's GL, not the guest's memory. The
+    // texture is already in this context, and upside down relative to
+    // everything else here: GL's origin is bottom-left.
+    const gl = this.#glSurface(win);
+    if (gl) {
+      // `uv` is an origin and a size, not two corners: flipping means starting
+      // at the top and walking down. Read as corners it samples one row of the
+      // frame across the whole window, which looks like vertical stripes in
+      // the right colours -- the gears, one scanline of them.
+      this.#painter.textured(f.x, f.y, win.width, win.height, gl.tex,
+                             { opaque: 1, uv: [0, 1, 1, -1] });
+      return;
+    }
     const t = this.#textures.get(k);
     if (!t) return;
-    const f = this.#frameOf(win);
     this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, {
       swizzle: 1,
       opaque: win.info?.format === 1 ? 1 : 0,
     });
+  }
+
+  /** The GL frame that belongs in this window, if one does.
+   *
+   * A Wayland client names its own surface and the process that published it.
+   * An X client names a drawable instead, and the window manager is what knows
+   * which surface that window became -- see `xid` on the record. */
+  #glSurface(win) {
+    const a = glAttachment();
+    // Said once per change, because a GL window that stays black has three
+    // possible reasons -- no attachment, no match, no frame -- and they are
+    // indistinguishable from the outside.
+    const f0 = glFrame();
+    // Every two seconds rather than on change: what matters is whether frames
+    // keep arriving, and a state that never changes says nothing about that.
+    const now = performance.now();
+    const stamp = now - this.#glSaidAt > 2000
+      ? `${a ? `${a.kind}:${a.id}@${a.token}#${a.generation}` : 'none'} f${f0?.serial ?? 0}`
+      : this.#glSaid;
+    if (stamp !== this.#glSaid) this.#glSaidAt = now;
+    if (stamp !== this.#glSaid) {
+      this.#glSaid = stamp;
+      const f = glFrame();
+      this.#note(`gl attachment ${stamp}, frame ${f ? `${f.w}x${f.h} #${f.serial}` : 'none'}`
+        + `, window ${win.token}:${win.surface} xid ${win.info?.xid ?? 0}`
+        + `, device ${glDevice?.glState?.() ?? '?'}`
+        + `, renderer ${glRenderer?.glState?.() ?? '?'}`);
+    }
+    if (!a || !a.id) return null;
+    // A Wayland client names its own surface and the process that published
+    // it; an X client names a drawable, and the window manager is what put
+    // that window's id on the record.
+    const hit = a.kind === 0
+      ? win.token === a.token && win.surface === a.id
+      : win.info?.xid === a.id;
+    if (!hit) return null;
+    const frame = glFrame();
+    return frame && frame.tex ? frame : null;
   }
 
   /** Children of a surface, in the order they should be drawn (above it). */
@@ -705,6 +839,9 @@ class Compositor {
       const c = this.#cursorFallback;
       this.#painter.textured(this.#pointer.x, this.#pointer.y, c.w, c.h, c.tex);
     }
+    // The guest's driver shares this context and caches what it thinks is
+    // bound: leave it as it was found.
+    this.#painter.end();
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
     this.#frames++;
     if (this.#stats) {
@@ -962,11 +1099,17 @@ class Compositor {
 // -- the worker's protocol --------------------------------------------------
 
 let comp = null;
+let canvas = null;
 let running = false;
 
 function loop() {
   if (!comp || !running) return;
   try {
+    // A guest paces itself against frames *displayed*, not produced: its
+    // `eglSwapBuffers` waits for this count to move. On the page that was the
+    // demo's own animation loop; here there is no other loop to do it, and a
+    // client that swapped once would wait for ever.
+    glDevice?.display?.();
     comp.frame();
   } catch (e) {
     postMessage({ kind: 'error', error: e?.stack || String(e) });
@@ -976,13 +1119,78 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
+// -- the guest's OpenGL, in this worker -------------------------------------
+//
+// Mesa and virglrenderer run here rather than on the page, and that is the
+// whole point: they render into *this* worker's WebGL context, so a GL
+// window's frame is a texture this compositor binds. Nothing is read back and
+// nothing is uploaded -- the path that used to end in the guest copying its
+// own frame into an shm buffer for us to upload again.
+//
+// One canvas is what makes it one context: `getContext('webgl2')` on a canvas
+// that already has one hands back the same object, whoever asked first.
+let glDevice = null;
+let glRenderer = null;
+let glChannel = null;
+let glServing = false;
+
+/** What the guest last said its frames belong to, or null. */
+function glAttachment() {
+  return glDevice?.ok ? glDevice.attachment() : null;
+}
+
+/** The frame itself: a texture in this context, or null if there is none. */
+function glFrame() {
+  return glRenderer?.ok ? glRenderer.frame() : null;
+}
+
+async function startGl(m, canvas) {
+  // Emscripten looks a canvas up by selector, and a worker has no document.
+  if (!globalThis.document) globalThis.document = { querySelector: () => canvas };
+  const { MesaGlDevice } = await import('./mesa-gl.js');
+  glDevice = await MesaGlDevice.create(canvas, {
+    backend: 'virgl',
+    url: m.url || '/gex/gex-virgl-replay.js',
+    api: m.api || 'core',
+  });
+  if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
+  glRenderer = glDevice.renderer;
+  // The compositor draws these frames where their window is; a blit would put
+  // the last one over the whole output. `?glcanvas=1` keeps the blit, which
+  // is how to tell "the renderer drew nothing" from "the compositor drew it
+  // wrong" -- they look the same from outside.
+  glRenderer.presentToCanvas(!!m.canvasBlit);
+  glChannel = m.channel;
+  postMessage({ kind: 'gl-ready', describe: glDevice.describe() });
+  serveGlRing();
+}
+
+/** Run the guest's submissions as they arrive.
+ *
+ * `serveGl` drives itself where `Atomics.waitAsync` exists, which is a worker
+ * -- a second loop over the same channel here is not more service, it is a
+ * spin that starves the frame loop. Ask for it and leave it alone. */
+async function serveGlRing() {
+  if (glServing) return;
+  glServing = true;
+  const { serveGl } = await import('@gex/gl-bridge.mjs');
+  serveGl(glDevice, glChannel);
+}
+
 self.onmessage = ({ data: m }) => {
   try {
     if (m.kind === 'init') {
+      canvas = m.canvas;
       comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null);
       running = true;
       requestAnimationFrame(loop);
       postMessage({ kind: 'ready' });
+    } else if (m.kind === 'gl') {
+      // The guest's GL, hosted here for the reason above. Reported rather
+      // than thrown: a session whose GL will not start should still show its
+      // other windows.
+      startGl(m, canvas).catch((e) =>
+        postMessage({ kind: 'gl-failed', error: e?.message || String(e) }));
     } else if (m.kind === 'memory') {
       comp?.addMemory(m.token, m.memory);
     } else if (m.kind === 'drop-memory') {

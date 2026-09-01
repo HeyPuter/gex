@@ -69,6 +69,16 @@ pub mod error {
 
 /// Opcodes, numbered in blocks so adding to one group does not renumber
 /// another and break a guest built against an older header.
+/// What a [`op::SURFACE_ATTACH`] names.
+pub mod surface {
+    /// A `wl_surface`, by its object id on the guest's own compositor
+    /// connection.
+    pub const WAYLAND: u32 = 0;
+    /// An X drawable, by XID. The window manager resolves it to the surface
+    /// the X server publishes for that window.
+    pub const X: u32 = 1;
+}
+
 pub mod op {
     // -- the device itself ------------------------------------------------
     /// `{ client_api, major, minor }` -- make a context of the API the
@@ -91,6 +101,25 @@ pub mod op {
     pub const FINISH: u32 = 3;
     /// `{}` -- submit the completed default framebuffer to the display.
     pub const PRESENT: u32 = 4;
+    /// `{ kind, id, token }` -- what the frames after this one belong to.
+    ///
+    /// The host draws for a guest that has a window somewhere else: a
+    /// `wl_surface` the compositor is already showing, or an X drawable
+    /// belonging to a window an X server owns. Naming it is what lets the
+    /// frame be *composited* rather than blitted over the whole output --
+    /// without it there is nowhere to put the pixels, since with Mesa on the
+    /// host nothing comes back to the guest to draw with.
+    ///
+    /// `kind` is [`surface::WAYLAND`] or [`surface::X`]; `id` is the
+    /// `wl_surface` object id or the XID; `token` is the guest's pid, which is
+    /// how the compositor names the process that published the surface (see
+    /// `gex_wl_token`). A zero `id` detaches, which is what a guest drawing to
+    /// nothing but the output does (the gears demo), and is the default.
+    ///
+    /// An X drawable needs no token: the surface belongs to the X server's
+    /// process, not the client's, and the window manager is what resolves one
+    /// to the other.
+    pub const SURFACE_ATTACH: u32 = 5;
 
     // -- state ------------------------------------------------------------
     pub const CLEAR_COLOR: u32 = 16; // { r, g, b, a } as floats

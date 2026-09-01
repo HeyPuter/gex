@@ -46,6 +46,8 @@ export const R_DAMAGE_Y = 13;
 export const R_DAMAGE_W = 14;
 export const R_DAMAGE_H = 15;
 export const R_FLAGS = 16;
+/** The X window this surface is, or zero. See `F_EXTERNAL`. */
+export const R_XID = 17;
 export const R_TITLE = 18;
 export const R_TITLE_WORDS = 8;
 
@@ -57,6 +59,11 @@ export const ROLE_CURSOR = 4;
 
 /** `R_FLAGS` bits. */
 export const F_MOVE_REQUESTED = 1;
+/** The pixels are not at `addr`: the host has them. A client that renders
+ *  through the host's OpenGL attaches no buffer -- its frames never come back
+ *  to the guest -- so the record says how big the surface is and the
+ *  compositor finds the picture elsewhere. */
+export const F_EXTERNAL = 2;
 
 /** Event kinds the compositor writes into a process's ring. */
 export const EV_MOTION = 0;
@@ -179,6 +186,8 @@ export function readScene(channel, { onlyChanged = false } = {}) {
           h: a[r + R_DAMAGE_H],
         },
         flags: a[r + R_FLAGS],
+        xid: a[r + R_XID] >>> 0,
+        external: (a[r + R_FLAGS] & F_EXTERNAL) !== 0,
         title: end ? decoder.decode(bytes.subarray(0, end)) : '',
       });
     }

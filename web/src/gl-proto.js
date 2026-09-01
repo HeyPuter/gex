@@ -8,6 +8,7 @@ export const op = {
     SURFACE_RESIZE: 2,
     FINISH: 3,
     PRESENT: 4,
+    SURFACE_ATTACH: 5,
     CLEAR_COLOR: 16,
     CLEAR: 17,
     VIEWPORT: 18,

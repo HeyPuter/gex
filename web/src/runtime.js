@@ -442,10 +442,16 @@ export async function runProgram(
     }
     const { makeGlChannel, serveGl } = await import('@gex/gl-bridge.mjs');
     glChannel = makeGlChannel();
-    // An OffscreenCanvas renderer consumes the shared ring in its own Worker;
-    // the returned function is then only the cheap wake-up fallback. A
-    // main-thread renderer retains the original page-side service path.
-    glServe = gl.attachChannel?.(glChannel) || serveGl(gl, glChannel);
+    // `gl: 'compositor'` means the device is not here at all: the compositor's
+    // worker hosts it, so its frames are textures in the context that draws
+    // the scene. Nothing on this side serves the ring in that case -- see
+    // `hostGl` below, once the compositor exists.
+    if (gl !== 'compositor') {
+      // An OffscreenCanvas renderer consumes the shared ring in its own Worker;
+      // the returned function is then only the cheap wake-up fallback. A
+      // main-thread renderer retains the original page-side service path.
+      glServe = gl.attachChannel?.(glChannel) || serveGl(gl, glChannel);
+    }
   }
 
   // The Wayland compositor. The protocol state machine runs in each guest
@@ -467,6 +473,12 @@ export async function runProgram(
       const { Compositor } = await import('./compositor.js');
       compositor = await Compositor.create(canvas, wlChannel, wlInput || canvas);
       globalThis.__gexCompositor = compositor;
+      if (gl === 'compositor' && glChannel) {
+        await compositor.hostGl(glChannel, {
+          api: 'core',
+          canvasBlit: new URLSearchParams(location.search).get('glcanvas') === '1',
+        });
+      }
     }
   }
 
