@@ -8,10 +8,13 @@
 // guest memory, not a copy). The command encoding is generated from the Rust
 // definition in gl-proto.js, so guest, native host and this cannot drift apart.
 
-import { op, MAGIC, HEADER_BYTES, error } from './gl-proto.js';
+import { op, MAGIC, PROTOCOL_VERSION, HEADER_BYTES, error } from './gl-proto.js';
+import { defaultPixelStore, pixelLayout, setPixelStore } from './gl-pixels.js';
+import { captureIfRequested } from './gl-capture.js';
 
 // Header word offsets, in 32-bit units.
 const H_MAGIC = 0;
+const H_PROTOCOL_VERSION = 7;
 const H_CAPACITY = 1;
 const H_TAIL = 2;
 const H_REPLY_CAP = 3;
@@ -49,6 +52,11 @@ class Args {
     const v = this.view.getFloat32(this.at, true);
     this.at += 4;
     return v;
+  }
+  u64() {
+    const low = this.u32(), high = this.u32();
+    const value = low + high * 0x100000000;
+    return Number.isSafeInteger(value) ? value : 0;
   }
   /// A length word then that many bytes, as a view into guest memory rather
   /// than a copy: uploading a texture should not allocate.
@@ -123,7 +131,10 @@ export class GlDevice {
     this.shaders = new Map();
     this.programs = new Map();
     this.framebuffers = new Map();
+    this.packStore = defaultPixelStore();
+    this.unpackStore = defaultPixelStore();
     this.ok = !!this.gl;
+    this.capture = captureIfRequested(PROTOCOL_VERSION, canvas.width, canvas.height);
   }
 
   describe() {
@@ -141,10 +152,18 @@ export class GlDevice {
     const bytes = new Uint8Array(memory.buffer);
     const words = new Uint32Array(memory.buffer, ring, HEADER_BYTES / 4);
     if (words[H_MAGIC] !== MAGIC) return -1;
+    if (words[H_PROTOCOL_VERSION] !== PROTOCOL_VERSION) return -1;
 
     const capacity = words[H_CAPACITY];
     const tail = words[H_TAIL];
     if (tail > capacity) return -1;
+
+    // Before execution: a batch that takes the context down with it is still
+    // the batch a replay needs.
+    this.capture?.record(
+      bytes.subarray(ring + HEADER_BYTES, ring + HEADER_BYTES + tail),
+      words[H_REPLY_CAP],
+    );
 
     const view = new DataView(memory.buffer);
     const base = ring + HEADER_BYTES;
@@ -194,6 +213,13 @@ export class GlDevice {
     const gl = this.gl;
     switch (opcode) {
       case op.CONTEXT_CREATE:
+        // The client API and version the guest asked for. This device is
+        // WebGL 2 whatever the request, so they are read and not acted on --
+        // but they must be consumed, because a command whose payload is left
+        // unread is rejected as malformed.
+        a.u32();
+        a.u32();
+        a.u32();
         reply.string(gl.getParameter(GL_VENDOR) ?? '');
         reply.string(gl.getParameter(GL_RENDERER) ?? '');
         reply.string(gl.getParameter(GL_VERSION) ?? '');
@@ -212,6 +238,18 @@ export class GlDevice {
         gl.finish();
         reply.u32(0);
         break;
+      case op.PRESENT:
+        // WebGL presents its default framebuffer implicitly. Keep the opcode
+        // so explicit backends can use the same guest driver and wire stream.
+        gl.flush();
+        // The count of frames shown, which the guest paces against. Here that
+        // is simply the count of presents processed -- the browser composites
+        // this canvas on its own schedule and nothing defers it to a later
+        // display() the way the WebGPU backend does -- so the guest is never
+        // ahead and never throttles itself on this path.
+        this.presents = (this.presents ?? 0) + 1;
+        reply.u32(this.presents);
+        break;
 
       case op.CLEAR_COLOR: gl.clearColor(a.f32(), a.f32(), a.f32(), a.f32()); break;
       case op.CLEAR_DEPTH: gl.clearDepth(a.f32()); break;
@@ -224,7 +262,12 @@ export class GlDevice {
       case op.DEPTH_FUNC: gl.depthFunc(a.u32()); break;
       case op.CULL_FACE: gl.cullFace(a.u32()); break;
       case op.FRONT_FACE: gl.frontFace(a.u32()); break;
-      case op.PIXEL_STOREI: gl.pixelStorei(a.u32(), a.i32()); break;
+      case op.PIXEL_STOREI: {
+        const pname = a.u32(), param = a.i32();
+        gl.pixelStorei(pname, param);
+        setPixelStore(this.packStore, this.unpackStore, pname, param);
+        break;
+      }
 
       case op.GEN_BUFFERS: {
         const n = a.u32();
@@ -246,14 +289,17 @@ export class GlDevice {
         break;
       }
       case op.BUFFER_DATA: {
-        const target = a.u32(), usage = a.u32(), data = a.blob(bytes);
-        // A zero-length payload with a non-zero size means "allocate without
-        // initialising", which the guest encodes as an empty blob.
-        gl.bufferData(target, data.length ? data : 0, usage);
+        const target = a.u32(), usage = a.u32(), size = a.u64(), hasData = a.u32() !== 0;
+        const data = a.blob(bytes);
+        if (!Number.isSafeInteger(size) || size < 0 ||
+            (hasData ? data.length !== size : data.length !== 0)) { a.ok = false; break; }
+        gl.bufferData(target, hasData ? data : size, usage);
         break;
       }
       case op.BUFFER_SUB_DATA: {
-        const target = a.u32(), offset = a.u32(), data = a.blob(bytes);
+        const target = a.u32(), offset = a.u64(), size = a.u64(), data = a.blob(bytes);
+        if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) ||
+            offset < 0 || size < 0 || data.length !== size) { a.ok = false; break; }
         gl.bufferSubData(target, offset, data);
         break;
       }
@@ -409,16 +455,19 @@ export class GlDevice {
       case op.TEX_IMAGE_2D: {
         const target = a.u32(), level = a.i32(), internal = a.i32();
         const w = a.i32(), h = a.i32(), border = a.i32();
-        const format = a.u32(), type = a.u32(), data = a.blob(bytes);
+        const format = a.u32(), type = a.u32(), pbo = a.u32() !== 0;
+        const pointer = a.u64(), data = a.blob(bytes);
         gl.texImage2D(target, level, internal, w, h, border, format, type,
-                      data.length ? data : null);
+                      pbo ? pointer : (pointer ? data : null));
         break;
       }
       case op.TEX_SUB_IMAGE_2D: {
         const target = a.u32(), level = a.i32();
         const x = a.i32(), y = a.i32(), w = a.i32(), h = a.i32();
-        const format = a.u32(), type = a.u32(), data = a.blob(bytes);
-        gl.texSubImage2D(target, level, x, y, w, h, format, type, data);
+        const format = a.u32(), type = a.u32(), pbo = a.u32() !== 0;
+        const pointer = a.u64(), data = a.blob(bytes);
+        gl.texSubImage2D(target, level, x, y, w, h, format, type,
+                         pbo ? pointer : data);
         break;
       }
 
@@ -427,10 +476,17 @@ export class GlDevice {
 
       case op.READ_PIXELS: {
         const x = a.i32(), y = a.i32(), w = a.i32(), h = a.i32();
-        const format = a.u32(), type = a.u32();
-        const px = new Uint8Array(Math.max(0, w) * Math.max(0, h) * 4);
+        const format = a.u32(), type = a.u32(), pbo = a.u32() !== 0;
+        const pointer = a.u64();
+        if (pbo) {
+          gl.readPixels(x, y, w, h, format, type, pointer);
+          break;
+        }
+        const layout = pixelLayout(format, type, w, h, null, this.packStore);
+        const px = new Uint8Array(layout?.end ?? 0);
         gl.readPixels(x, y, w, h, format, type, px);
-        reply.blob(px);
+        reply.u32(layout?.offset ?? 0);
+        reply.blob(px.subarray(layout?.offset ?? 0));
         break;
       }
       case op.GET_STRING: {

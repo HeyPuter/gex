@@ -1,4 +1,4 @@
-/* virglrenderer, in a browser tab, on WebGL 2.
+/* virglrenderer in a browser tab, hosted by WebGL 2 or MobileGL/WebGPU.
  *
  * The guest runs Debian's own Mesa with its Gallium `virgl` driver. That
  * driver encodes a VirGL command stream and speaks the vtest protocol over a
@@ -36,9 +36,20 @@
 
 #include <emscripten.h>
 #include <emscripten/html5.h>
+#ifndef GEX_VIRGL_WEBGPU
 #include <emscripten/html5_webgl.h>
-
 #include <GLES3/gl3.h>
+#else
+#define GL_GLEXT_PROTOTYPES 1
+#include <EGL/egl.h>
+#include <GL/gl.h>
+#include <GL/glext.h>
+namespace MobileGL { void Initialize(); }
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include "virglrenderer.h"
 #include "vtest.h"
@@ -50,7 +61,13 @@
  * node in a tab, so gex supplies the winsys through the callbacks structure
  * -- the same arrangement the native build uses, for the same reason. Here a
  * "GL context" is a WebGL 2 context on a canvas. */
+#ifndef GEX_VIRGL_WEBGPU
 static EMSCRIPTEN_WEBGL_CONTEXT_HANDLE gex_ctx;
+#else
+static EGLDisplay gex_display = EGL_NO_DISPLAY;
+static EGLSurface gex_surface = EGL_NO_SURFACE;
+static EGLContext gex_ctx = EGL_NO_CONTEXT;
+#endif
 
 virgl_renderer_gl_context gex_create_gl_context(
     void *cookie, int scanout, struct virgl_renderer_gl_ctx_param *param) {
@@ -74,10 +91,15 @@ void gex_destroy_gl_context(void *cookie, virgl_renderer_gl_context ctx) {
 int gex_make_current(void *cookie, int scanout, virgl_renderer_gl_context ctx) {
     (void)cookie;
     (void)scanout;
+#ifndef GEX_VIRGL_WEBGPU
     return emscripten_webgl_make_context_current(
                (EMSCRIPTEN_WEBGL_CONTEXT_HANDLE)(intptr_t)ctx) == EMSCRIPTEN_RESULT_SUCCESS
                ? 0
                : -1;
+#else
+    return eglMakeCurrent(gex_display, gex_surface, gex_surface,
+                          (EGLContext)(intptr_t)ctx) == EGL_TRUE ? 0 : -1;
+#endif
 }
 
 /* The callbacks are vtest's, not ours: `vtest_init_renderer` registers its
@@ -139,7 +161,7 @@ void gex_virgl_sink(const void *data, size_t len) {
     if (!cur) return;
     if (cur->out_len + len > cur->out_cap) {
         cur->out_cap = (cur->out_len + len) * 2 + 4096;
-        cur->out_buf = realloc(cur->out_buf, cur->out_cap);
+        cur->out_buf = (uint8_t *)realloc(cur->out_buf, cur->out_cap);
     }
     memcpy(cur->out_buf + cur->out_len, data, len);
     cur->out_len += len;
@@ -205,6 +227,12 @@ static int gex_brightest;
 static uint32_t gex_present_last_w, gex_present_last_h;
 
 static void gex_present(uint32_t handle) {
+    /* A GL/EGL guest is presented directly from its bound render target after
+     * SUBMIT_CMD. Xwayland may subsequently TRANSFER_GET an unrelated backing
+     * pixmap; mirroring that readback would overwrite the real frame with the
+     * (often black) software-compositor surface. Keep transfer presentation as
+     * the fallback for guests that never exercise the submit-side path. */
+    if (gex_submit_present_calls != 0) return;
     struct virgl_renderer_resource_info info;
     if (virgl_renderer_resource_get_info((int)handle, &info) != 0) {
         gex_present_no_info++;
@@ -263,6 +291,9 @@ static void gex_present(uint32_t handle) {
         seen++;
         glBlitFramebuffer(0, 0, (GLint)info.width, (GLint)info.height,
                           0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+#ifdef GEX_VIRGL_WEBGPU
+        eglSwapBuffers(gex_display, gex_surface);
+#endif
         gex_presented++;
     } else {
         gex_present_incomplete++;
@@ -323,6 +354,9 @@ static void gex_present_current(void) {
     seen++;
     glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
                       0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+#ifdef GEX_VIRGL_WEBGPU
+    eglSwapBuffers(gex_display, gex_surface);
+#endif
     gex_presented++;
     /* Put the guest's framebuffer back as both bindings; virglrenderer expects
      * to find its own target still current. */
@@ -436,6 +470,7 @@ static const char *const gex_cmd_names[] = {
 
 EMSCRIPTEN_KEEPALIVE
 int gex_virgl_init(int width, int height, int preserve_drawing_buffer) {
+#ifndef GEX_VIRGL_WEBGPU
     EmscriptenWebGLContextAttributes attr;
     emscripten_webgl_init_context_attributes(&attr);
     attr.majorVersion = 2;
@@ -461,6 +496,38 @@ int gex_virgl_init(int width, int height, int preserve_drawing_buffer) {
     if (emscripten_webgl_make_context_current(gex_ctx) != EMSCRIPTEN_RESULT_SUCCESS) {
         return -2;
     }
+#else
+    (void)preserve_drawing_buffer;
+    emscripten_set_canvas_element_size("#gex-gl", width, height);
+    MobileGL::Initialize();
+    static const EGLint config_attribs[] = {
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8, EGL_NONE
+    };
+    gex_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (gex_display == EGL_NO_DISPLAY ||
+        eglInitialize(gex_display, NULL, NULL) != EGL_TRUE ||
+        eglBindAPI(EGL_OPENGL_API) != EGL_TRUE) {
+        return -1;
+    }
+    EGLConfig config = NULL;
+    EGLint config_count = 0;
+    if (eglChooseConfig(gex_display, config_attribs, &config, 1,
+                        &config_count) != EGL_TRUE || config_count < 1) {
+        return -2;
+    }
+    static const EGLint context_attribs[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3, EGL_NONE
+    };
+    gex_ctx = eglCreateContext(gex_display, config, EGL_NO_CONTEXT,
+                               context_attribs);
+    gex_surface = eglCreateWindowSurface(gex_display, config,
+                                         (EGLNativeWindowType)1, NULL);
+    if (gex_ctx == EGL_NO_CONTEXT || gex_surface == EGL_NO_SURFACE ||
+        eglMakeCurrent(gex_display, gex_surface, gex_surface, gex_ctx) != EGL_TRUE) {
+        return -2;
+    }
+#endif
     /* Flags zero: the winsys is ours, so virglrenderer must not go looking
      * for EGL or a DRM node of its own. vtest adds the two it insists on. */
     if (vtest_init_renderer(false, 0, NULL) != 0) {
@@ -507,7 +574,7 @@ int gex_virgl_feed(int sid, const uint8_t *data, int len) {
     }
     if (s->in_len + (size_t)len > s->in_cap) {
         s->in_cap = (s->in_len + (size_t)len) * 2 + 65536;
-        s->in_buf = realloc(s->in_buf, s->in_cap);
+        s->in_buf = (uint8_t *)realloc(s->in_buf, s->in_cap);
     }
     memcpy(s->in_buf + s->in_len, data, (size_t)len);
     s->in_len += (size_t)len;
@@ -709,3 +776,7 @@ void gex_virgl_close(int sid) {
     free(s->out_buf);
     memset(s, 0, sizeof *s);
 }
+
+#ifdef __cplusplus
+}
+#endif

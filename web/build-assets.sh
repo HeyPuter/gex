@@ -79,6 +79,24 @@ if [ -f "$VIRGL_BUILD/gexvirgl.wasm" ]; then
 else
     echo "no virgl renderer -- run web/build-virgl-wasm.sh to build one"
 fi
+if [ -f "$VIRGL_BUILD/gexvirgl-webgpu.wasm" ]; then
+    echo "copying the WebGPU virgl renderer..."
+    cp "$VIRGL_BUILD/gexvirgl-webgpu.wasm" "$VIRGL_BUILD/gexvirgl-webgpu.mjs" "$PUB/gex/"
+    echo "  $(du -h "$PUB/gex/gexvirgl-webgpu.wasm" | cut -f1) of WebGPU renderer"
+else
+    echo "no WebGPU virgl renderer -- run web/build-virgl-webgpu-wasm.sh to build one"
+fi
+
+# Direct API-split MobileGL/WebGPU module. Unlike gexvirgl-webgpu this contains
+# no Mesa or virglrenderer; the ordinary guest libGLES/EGL wire driver feeds it.
+MOBILEGL_BUILD="${GEX_MOBILEGL_WASM:-${TMPDIR:-/tmp}/gex-mobilegl-wasm}"
+if [ -f "$MOBILEGL_BUILD/gexmobilegl-webgpu.wasm" ]; then
+    echo "copying the direct MobileGL renderer..."
+    cp "$MOBILEGL_BUILD/gexmobilegl-webgpu.wasm" \
+       "$MOBILEGL_BUILD/gexmobilegl-webgpu.mjs" "$PUB/gex/"
+else
+    echo "no direct MobileGL renderer -- run web/build-mobilegl-wasm.sh"
+fi
 
 # -- busybox rootfs --------------------------------------------------------
 
@@ -171,7 +189,71 @@ if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
     cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/glinc/" 2>/dev/null || true
     "$CC" -O2 -o "$PUB/fs/gles-gears" "$ROOT/tests/integration/programs/gles-gears.c" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-uniform-probe" \
+        "$ROOT/tests/integration/programs/gl44-uniform-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-state-probe" \
+        "$ROOT/tests/integration/programs/gl44-state-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-clear-probe" \
+        "$ROOT/tests/integration/programs/gl44-clear-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-msaa-blit-probe" \
+        "$ROOT/tests/integration/programs/gl44-msaa-blit-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-msaa-depth-blit-probe" \
+        "$ROOT/tests/integration/programs/gl44-msaa-depth-blit-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-indirect-probe" \
+        "$ROOT/tests/integration/programs/gl44-indirect-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-reflection-probe" \
+        "$ROOT/tests/integration/programs/gl44-reflection-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-indexed-probe" \
+        "$ROOT/tests/integration/programs/gl44-indexed-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-compute-probe" \
+        "$ROOT/tests/integration/programs/gl44-compute-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-texture-sampler-probe" \
+        "$ROOT/tests/integration/programs/gl44-texture-sampler-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
+    "$CC" -O2 -o "$PUB/fs/gl44-integer-texture-probe" \
+        "$ROOT/tests/integration/programs/gl44-integer-texture-probe.c" \
+        -I "$ROOT/third_party/mobilegl-webgpu/include" \
+        -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
     cp "$WORK/gldriver/libGLESv2.so.2" "$WORK/gldriver/libEGL.so.1" "$PUB/fs/"
+    # The packaged desktop applications are Debian/glibc, while gles-gears is
+    # intentionally a tiny musl binary. Build the same marshaller against each
+    # ABI instead of making either process load the other C runtime.
+    if command -v strat >/dev/null 2>&1 && strat debian test -x /usr/bin/aarch64-linux-gnu-gcc; then
+        mkdir -p "$PUB/fs/glibc"
+        strat debian env GEX_CC=/usr/bin/aarch64-linux-gnu-gcc \
+            "$ROOT/guest/gl/build.sh" "$WORK/gldriver-glibc" >/dev/null
+        cp "$WORK/gldriver-glibc/libGLESv2.so.2" \
+           "$WORK/gldriver-glibc/libEGL.so.1" \
+           "$WORK/gldriver-glibc/libgex-gl-sdl.so" "$PUB/fs/glibc/"
+    elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+        mkdir -p "$PUB/fs/glibc"
+        GEX_CC="$(command -v aarch64-linux-gnu-gcc)" \
+            "$ROOT/guest/gl/build.sh" "$WORK/gldriver-glibc" >/dev/null
+        cp "$WORK/gldriver-glibc/libGLESv2.so.2" \
+           "$WORK/gldriver-glibc/libEGL.so.1" \
+           "$WORK/gldriver-glibc/libgex-gl-sdl.so" "$PUB/fs/glibc/"
+    else
+        echo "skipping glibc GL driver: no aarch64-linux-gnu-gcc"
+    fi
     cp "$MUSL" "$PUB/fs/ld-musl-aarch64.so.1"
 else
     echo "skipping the gears: no cross compiler or no GLES2 headers"

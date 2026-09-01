@@ -40,7 +40,7 @@ export function serveVirgl(renderer, channel) {
   // The renderer expects a `WebAssembly.Memory` (what the shim hands it on the
   // direct path); here the bytes are in a plain buffer, so hand it a lookalike.
   const asMemory = { buffer: channel.data };
-  return function serve() {
+  return async function serve() {
     if (Atomics.load(ctl, STATE) !== REQUEST) return;
     const op = ctl[OP];
     const session = ctl[SESSION];
@@ -49,7 +49,7 @@ export function serveVirgl(renderer, channel) {
     let replyLen = 0;
     try {
       if (op === 0) {
-        result = renderer ? renderer.submit(session, asMemory, 0, len) : -1;
+        result = renderer ? await renderer.submit(session, asMemory, 0, len) : -1;
       } else if (op === 1) {
         const n = renderer ? renderer.take(session, asMemory, 0, Math.min(len, data.length)) : 0;
         result = n;

@@ -34,7 +34,7 @@ async function serveDirect(id, channel) {
   while (channels.has(id)) {
     const state = Atomics.load(ctl, 0);
     if (state === 1) {
-      serve();
+      await serve();
       afterServe();
       continue;
     }
@@ -50,6 +50,7 @@ self.onmessage = async ({ data: m }) => {
   try {
     if (m.kind === 'init') {
       stats = new Int32Array(m.stats);
+      globalThis.__gexDumpWgsl = m.dumpWgsl || 0;
       // Emscripten resolves the C selector "#gex-gl" through document even
       // for an OffscreenCanvas. Supply the one selector this worker owns.
       globalThis.document = { querySelector: () => m.canvas };
@@ -66,7 +67,7 @@ self.onmessage = async ({ data: m }) => {
       channels.set(m.id, serveVirgl(renderer, m.channel));
       if (m.channel.direct) serveDirect(m.id, m.channel);
     } else if (m.kind === 'serve') {
-      channels.get(m.id)?.();
+      await channels.get(m.id)?.();
       afterServe();
     } else if (m.kind === 'diagnostic') {
       snapshot(m.id);

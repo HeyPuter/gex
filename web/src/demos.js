@@ -400,6 +400,11 @@ const gears = {
   network: false,
 
   async enter(ctx) {
+    const query = new URLSearchParams(location.search);
+    const directWebGpu = query.get('webgpu') === '1' || query.get('gl') === 'mobilegl';
+    // The Mesa path: same guest, same wire protocol, but st/mesa and the
+    // gex_wgpu Gallium driver below the decoder instead of MobileGL.
+    const mesaWebGpu = query.get('webgpu') === 'mesa' || query.get('gl') === 'mesa';
     const { GlDevice } = await import('./gl.js');
 
     // The canvas lives above the terminal while this demo is chosen, made here
@@ -413,10 +418,29 @@ const gears = {
     document.getElementById('terminal')?.before(wrap);
     ctx.onLeave(() => wrap.remove());
 
-    const gl = new GlDevice(canvas);
+    let gl;
+    if (mesaWebGpu) {
+      gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(canvas, {
+        api: query.get('glapi') || 'es',
+        major: Number(query.get('glmajor') || 0),
+        minor: Number(query.get('glminor') || 0),
+      });
+    } else if (directWebGpu) {
+      // This used to be an unconditional MobileGL construction, so a demo
+      // marked directGl ran the broken backend with nothing said about it.
+      console.warn('[gex] MobileGL was requested and ignored: it is disabled ' +
+                   'with no override. Running Mesa instead.');
+      gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(canvas, {
+        api: query.get('glapi') || 'es',
+        major: Number(query.get('glmajor') || 0),
+        minor: Number(query.get('glminor') || 0),
+      });
+    } else {
+      gl = new GlDevice(canvas);
+    }
     if (!gl.ok) {
-      ctx.term.writeln(ctx.ansi.red('This browser has no WebGL 2, so there is no GPU to use.'));
-      ctx.status('no WebGL 2', 'bad');
+      ctx.term.writeln(ctx.ansi.red(gl.error || 'This browser has no usable GPU API.'));
+      ctx.status('no GPU', 'bad');
       return;
     }
 
@@ -438,38 +462,96 @@ const gears = {
     );
     ctx.term.writeln('');
 
+    // Nothing reaches the canvas until someone asks for it.
+    //
+    // The backend renders into an offscreen texture and copies it to the
+    // canvas surface only when `display()` is called; the guest's swap only
+    // marks a frame produced. The wayland demo below drives that from its own
+    // animation loop, and this demo -- whose entire point is to show a
+    // picture -- had none, so its canvas was black for as long as it ran on
+    // Mesa. The terminal said "frames 200" and the gate matched on that text,
+    // so nothing noticed.
+    let displayRaf = 0;
+    const pump = () => {
+      gl.display?.();
+      displayRaf = requestAnimationFrame(pump);
+    };
+    const stopPump = () => {
+      if (displayRaf) cancelAnimationFrame(displayRaf);
+      displayRaf = 0;
+    };
+    ctx.onLeave(stopPump);
+
     const start = async (frames) => {
       ctx.actions([]);
       ctx.status('fetching');
       running(true);
+      if (!displayRaf) displayRaf = requestAnimationFrame(pump);
       const t0 = performance.now();
       try {
+        const qp = new URLSearchParams(location.search);
+        const guestProgram = qp.get('glclient') || '/fs/gles-gears';
+        // Repeated `?glarg=` values let the test harness launch an arbitrary
+        // unmodified EGL/OpenGL binary (notably Khronos glcts) through this
+        // same loader. The gears demo keeps its ordinary frame-count argument.
+        const guestArgs = qp.has('glarg') ? qp.getAll('glarg') : [String(frames)];
+        // `?glenv=KEY=VALUE`, repeatable, for the guest's own diagnostics --
+        // GEXGL_EXTENSION_TRACE most of all, which lists the host extensions
+        // the guest declines to repeat. Without this the flag existed and
+        // could not be set: nothing between tests/gl44-probe.sh and the
+        // guest process carried an environment. Passing any of these replaces
+        // the shim's default environment, which a GL probe does not need.
+        const guestEnv = qp.getAll('glenv');
         const [elf, loader, glesv2, egl] = await Promise.all(
           [
-            '/fs/gles-gears',
+            guestProgram,
             '/fs/ld-musl-aarch64.so.1',
             '/fs/libGLESv2.so.2',
             '/fs/libEGL.so.1',
           ].map(async (u) => {
-            const r = await fetch(u);
+            // These are development/build artifacts under stable filesystem
+            // names. A persistent CDP browser must not keep yesterday's guest
+            // driver after the server has rebuilt it.
+            const r = await fetch(u, { cache: 'no-store' });
             if (!r.ok) throw new Error(`${u}: ${r.status}`);
             return new Uint8Array(await r.arrayBuffer());
           }),
         );
-        rule(ctx, `gles-gears — ${ctx.bytes(elf.length)}`);
+        const extraFiles = {};
+        await Promise.all(
+          qp.getAll('glfile').map(async (u) => {
+            const r = await fetch(u, { cache: 'no-store' });
+            if (!r.ok) throw new Error(`${u}: ${r.status}`);
+            extraFiles[u] = new Uint8Array(await r.arrayBuffer());
+          }),
+        );
+        rule(ctx, `${guestProgram.split('/').pop()} — ${ctx.bytes(elf.length)}`);
         ctx.status('running');
         const { status } = await ctx.runProgram(ctx.term, {
           elf,
           files: {
+            ...extraFiles,
             '/lib/ld-musl-aarch64.so.1': loader,
+            // CTS and ordinary desktop loaders ask for the unversioned link
+            // names with dlopen. They are the same driver bytes here; the VFS
+            // has no symlink object in this small directly bundled filesystem.
+            '/usr/lib/libGLESv2.so': glesv2,
             '/usr/lib/libGLESv2.so.2': glesv2,
+            '/usr/lib/libEGL.so': egl,
             '/usr/lib/libEGL.so.1': egl,
           },
-          args: ['/gles-gears', String(frames)],
+          args: [guestProgram, ...guestArgs],
+          env: guestEnv,
           cwd: '/',
           tty: true,
           gl,
         });
+        // Once more now the guest has exited: its last swapped frame is
+        // produced but not yet copied, and the loop above stops with it. A
+        // short run would otherwise leave the canvas on an earlier frame, or
+        // on nothing at all.
+        gl.display?.();
+        stopPump();
         const ms = (performance.now() - t0).toFixed(0);
         ctx.term.writeln('');
         rule(ctx, `exit ${status} in ${ms} ms`);
@@ -506,6 +588,9 @@ const virglGears = {
   network: false,
 
   async enter(ctx) {
+    // `this` is the demo object; the shared start() below reads directGl/renderer
+    // off it, exactly as waylandGears does.
+    const demo = this;
     const wrap = document.createElement('div');
     wrap.className = 'canvas-wrap';
     const canvas = document.createElement('canvas');
@@ -554,15 +639,22 @@ const virglGears = {
       { label: 'Run', primary: true, onClick: () => go(300) },
     ];
 
-    const start = async (seconds) => {
+    const start = async (seconds, runOptions = {}) => {
       ctx.actions([]);
       running(true);
       const t0 = performance.now();
       let renderer = null;
       try {
         ctx.busy('loading the renderer');
-        const { VirglRenderer } = await import('./virgl.js');
-        renderer = await VirglRenderer.create(canvas, '/gex/gexvirgl.mjs');
+        if (usesDirectGl(demo)) {
+          renderer = await createDirectGlDevice(canvas, runOptions.gl ?? demo.gl ?? null);
+        } else {
+          const { VirglRenderer } = await import('./virgl.js');
+          const rendererUrl = new URLSearchParams(location.search).get('webgpu')
+            ? '/gex/gexvirgl-webgpu.mjs'
+            : (demo.renderer || '/gex/gexvirgl.mjs');
+          renderer = await VirglRenderer.create(canvas, rendererUrl);
+        }
         if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
         // Live render state for a test harness: it can tell a client rendered
         // (lit>0) the moment it happens rather than waiting for the exit report.
@@ -663,9 +755,12 @@ const virglGears = {
         ctx.term.writeln(ctx.ansi.dim(`  ${nums}`));
         ctx.term.writeln(ctx.ansi.dim(`  ${gl}`));
         // The command counts say whether an empty frame had nothing drawn into
-        // it or was drawn somewhere else.
-        for (const part of renderer.commands().split('|')) {
-          ctx.term.writeln(ctx.ansi.dim(`  ${part.trim()}`));
+        // it or was drawn somewhere else. Only virglrenderer keeps them --
+        // MesaGlDevice.commands() returns null, and calling .split() on that
+        // threw out of the report, so every `?gl=mesa` run of this demo ended
+        // in "Cannot read properties of null" instead of its own summary.
+        for (const part of (renderer.commands() ?? '').split('|')) {
+          if (part.trim()) ctx.term.writeln(ctx.ansi.dim(`  ${part.trim()}`));
         }
         ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
       } catch (e) {
@@ -714,6 +809,24 @@ const WL_TOOLKIT_ENV = {
 const WL_APPS = [
   { id: 'glxgears', label: 'glxgears — OpenGL via virgl (Xwayland)', mode: 'x', client: 'glxgears.aarch64-linux-gnu -info' },
   { id: 'es2gears', label: 'es2gears — OpenGL ES, native Wayland', mode: 'gl', client: '/usr/bin/es2gears_wayland.aarch64-linux-gnu' },
+  // The same program built for X11, which is the one that runs on gex-gl:
+  // `?gl=mesa` replaces EGL with this project's marshaller, and that has no
+  // Wayland platform -- no wl_egl_window, no wl_buffer -- so the native
+  // Wayland build renders one frame and then waits forever for a frame
+  // callback that cannot arrive. Under Xwayland the same binary presents on
+  // the GL canvas, which is the path SuperTuxKart uses.
+  { id: 'es2gears-x11', label: 'es2gears — OpenGL ES on X11 (Xwayland)', mode: 'x', client: '/usr/bin/es2gears_x11.aarch64-linux-gnu' },
+  // The smallest real GL program here, and the one that covers client-side
+  // vertex arrays: it points glVertexAttribPointer straight at a stack array
+  // with no buffer bound, which is how most tutorial code and every
+  // mesa-demos program feeds geometry.
+  { id: 'es2tri', label: 'es2tri — a triangle, client-side arrays', mode: 'x', client: '/usr/bin/es2tri.aarch64-linux-gnu' },
+  // The heaviest thing here, and the only one that arrives through GLX rather
+  // than EGL: thirty shader-based scenes, which is why it finds driver bugs
+  // the small demos cannot. Its contexts are legacy ones, so it runs in a
+  // compatibility profile -- see gexgl-glx.inc.
+  { id: 'glmark2', label: 'glmark2 — GL benchmark suite (GLX)', mode: 'x', client: 'glmark2 -b :duration=2' },
+  { id: 'glxinfo', label: 'glxinfo — GLX/GL capability dump', mode: 'x', client: 'glxinfo.aarch64-linux-gnu -B' },
   { id: 'gtk3-demo', label: 'GTK 3 — Demo', mode: 'shm', client: 'gtk3-demo', env: WL_TOOLKIT_ENV.gtk },
   { id: 'gtk3-widget-factory', label: 'GTK 3 — Widget Factory', mode: 'shm', client: 'gtk3-widget-factory', env: WL_TOOLKIT_ENV.gtk },
   { id: 'qt6ct', label: 'Qt 6 — Configuration Tool', mode: 'shm', client: 'qt6ct', env: WL_TOOLKIT_ENV.qt6 },
@@ -768,6 +881,14 @@ function pickInitialApp(qp) {
 // Xwayland.
 const waylandGears = {
   id: 'wayland',
+  // Every client in WL_APPS is a Debian aarch64 binary, so when `?gl=mesa`
+  // routes one through gex-gl the glibc build of the marshaller is the one to
+  // inject. Without this the musl pair went in and the client died at load
+  // with "libc.so: cannot open shared object file" -- musl's soname, reported
+  // against a glibc program, which reads like a missing library rather than
+  // like the wrong ABI. SuperTuxKart borrows this demo's `enter` but declares
+  // its own `directGlAbi`, so it was never affected and the gap stayed hidden.
+  directGlAbi: 'glibc',
   title: 'Qt / GTK / KDE apps on gex-wayland',
   blurb:
     'A gex-native Wayland compositor lives in the shim; a client connects and its committed shm ' +
@@ -879,8 +1000,15 @@ const waylandGears = {
       let renderer = null;
       try {
         ctx.busy('loading the renderer');
-        const { VirglRenderer } = await import('./virgl.js');
-        renderer = await VirglRenderer.create(canvas, '/gex/gexvirgl.mjs');
+        if (usesDirectGl(demo)) {
+          renderer = await createDirectGlDevice(canvas, runOptions.gl ?? demo.gl ?? null);
+        } else {
+          const { VirglRenderer } = await import('./virgl.js');
+          const rendererUrl = new URLSearchParams(location.search).get('webgpu')
+            ? '/gex/gexvirgl-webgpu.mjs'
+            : (demo.renderer || '/gex/gexvirgl.mjs');
+          renderer = await VirglRenderer.create(canvas, rendererUrl);
+        }
         if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
         clearInterval(fpsTimer);
         cancelAnimationFrame(fpsRaf);
@@ -888,7 +1016,9 @@ const waylandGears = {
         let fpsFrames = 0;
         let fpsSerial = renderer.presentedCount();
         let fpsAt = performance.now();
+        globalThis.__gexDisplayFps = [];
         const countDisplayedFrame = () => {
+          renderer.display?.();
           const serial = renderer.presentedCount();
           if (serial !== fpsSerial) {
             fpsFrames++;
@@ -899,7 +1029,9 @@ const waylandGears = {
         fpsRaf = requestAnimationFrame(countDisplayedFrame);
         fpsTimer = setInterval(() => {
           const now = performance.now();
-          fps.textContent = `FPS: ${(fpsFrames * 1000 / (now - fpsAt)).toFixed(1)}`;
+          const measured = fpsFrames * 1000 / (now - fpsAt);
+          fps.textContent = `FPS: ${measured.toFixed(1)}`;
+          globalThis.__gexDisplayFps.push(measured);
           fpsFrames = 0;
           fpsAt = now;
         }, 1000);
@@ -946,6 +1078,41 @@ const waylandGears = {
             if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
           }
         }
+        if (usesDirectGl(demo)) {
+          const directFiles = ['libGLESv2.so.2', 'libEGL.so.1', 'libgex-gl-sdl.so'];
+          const directPrefix = demo.directGlAbi ? `/fs/${demo.directGlAbi}` : '/fs';
+          await Promise.all(directFiles.map(async (name) => {
+            // `no-store` for the same reason the gles-gears path uses it: these
+            // are build artifacts under stable names, and the persistent CDP
+            // browser will otherwise keep yesterday's guest driver after the
+            // server has rebuilt it. A stale one here is not a subtle bug --
+            // it cost this demo its GL context entirely, on both backends.
+            const response = await fetch(`${directPrefix}/${name}?direct=1`,
+                                         { cache: 'no-store' });
+            if (!response.ok) throw new Error(`direct GL guest driver ${name}: ${response.status}`);
+            files[`/usr/lib/gex-gl/${name}`] = new Uint8Array(await response.arrayBuffer());
+            tree.modes[`/usr/lib/gex-gl/${name}`] = 0o755;
+          }));
+          // libGL.so.1 -- the GLX half, and the same object again -- goes in a
+          // directory of its own, deliberately off the shared library path.
+          //
+          // GLX is how a traditional X program asks for a context, so without
+          // this file that whole class cannot start. But Xwayland links libGL
+          // too, for glamor, and it wants the GL 1.x entry points this library
+          // has never had: put it where Xwayland looks and Xwayland dies at
+          // load with `undefined symbol: glConvolutionParameterfv`, taking the
+          // X server and every client with it. Only the client's own command
+          // gets this directory on its path -- see `run` below.
+          {
+            const response = await fetch(`${directPrefix}/libGL.so.1`,
+                                         { cache: 'no-store' });
+            if (response.ok) {
+              files['/usr/lib/gex-glx/libGL.so.1'] =
+                new Uint8Array(await response.arrayBuffer());
+              tree.modes['/usr/lib/gex-glx/libGL.so.1'] = 0o755;
+            }
+          }
+        }
         // `?wlclient=` overrides the X client (default glxgears); `?wlenv=a=b;c=d`
         // adds env, so a probe needs no rebuild. GALLIUM_DRIVER=virpipe is the
         // whole point: glxgears' GL goes through Mesa's virgl driver to the vtest
@@ -960,7 +1127,7 @@ const waylandGears = {
         const baseEnv =
           'export XDG_RUNTIME_DIR=/tmp\n' +
           'export WAYLAND_DISPLAY=wayland-0\n' +
-          'export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu\n' +
+          `export LD_LIBRARY_PATH=${usesDirectGl(demo) ? '/usr/lib/gex-gl:' : ''}/usr/lib/aarch64-linux-gnu\n` +
           // A home and a writable cache so fontconfig (xclock, xterm, any Xft
           // client) can find fonts and write its scan cache rather than failing.
           'export HOME=/root\n' +
@@ -978,7 +1145,7 @@ const waylandGears = {
           // Tcl/Tk's script libraries (wish loads init.tcl/tk.tcl from here).
           'export TCL_LIBRARY=/usr/share/tcltk/tcl8.6\n' +
           'export TK_LIBRARY=/usr/share/tcltk/tk8.6\n' +
-          'export GALLIUM_DRIVER=virpipe\n' +
+          (usesDirectGl(demo) ? '' : 'export GALLIUM_DRIVER=virpipe\n') +
           // Mesa's async shader-disk-cache runs a WORKER THREAD -- a second
           // Worker on the process's memory. Two robustness fixes made real
           // progress here (the precise cross-Worker futex wake k_futex_wake so
@@ -1000,12 +1167,36 @@ const waylandGears = {
             : `timeout ${seconds} ${client}`;
         // `app.client` already resolves `?wlclient=` (via `pickInitialApp`, or
         // `demo.client` below); a per-action `runOptions.client` (the
-        // SuperTuxKart "Play" preset) is the only extra override.
-        const client = runOptions.client || app.client;
+        // SuperTuxKart presets) is the only extra override.
+        //
+        // An explicit `?wlclient=` / `?cmd=` beats the action's preset. It used
+        // to lose, which silently discarded what the harness had asked to run:
+        // `tests/stk-webgpu-fps.sh` passes a full `--race-now ...` command line
+        // and was benchmarking STK's main menu instead, because the Run button
+        // handed `stkLaunch` over the top of it.
+        //
+        // `?wlclient=` is two things at once: the id of a listed app, or a raw
+        // command. Taking it literally here threw away the resolution
+        // `pickInitialApp` had just done, so `?wlclient=es2gears` ran a
+        // program called `es2gears` -- "No such file or directory" -- instead
+        // of /usr/bin/es2gears_wayland.aarch64-linux-gnu. The app's `mode`
+        // came from the resolved entry while its command did not, which is
+        // the shape of the bug: half-resolved.
+        const wanted = qp.get('wlclient');
+        const explicitClient =
+          (wanted && (WL_APPS.find((a) => a.id === wanted)?.client ?? wanted)) ||
+          qp.get('cmd');
+        const client = explicitClient || runOptions.client || app.client;
+        // The GLX library reaches the client and nothing else; see where it
+        // is staged above.
+        const glxPath = usesDirectGl(demo)
+          ? 'LD_LIBRARY_PATH=/usr/lib/gex-glx:$LD_LIBRARY_PATH ' : '';
         const run =
           `echo "gex: running ${client}"\n` +
-          `${runClient(client)} 2>&1\n` +
-          'echo "gex: client exited $?"\n';
+          `${glxPath}${runClient(client)} 2>&1\n` +
+          'gex_client_status=$?\n' +
+          (runOptions.after ? `${runOptions.after}\n` : '') +
+          'echo "gex: client exited $gex_client_status"\n';
         let script;
         if (app.mode === 'shm') {
           // A native Wayland toolkit client (GTK's wayland backend, Qt's
@@ -1116,7 +1307,8 @@ const waylandGears = {
           // Real GL over virgl, as the glxgears demo does. The compositor gets
           // a 2D canvas so a native wl client's committed shm frames show; for
           // the Xwayland path the pixels come via virgl and this stays blank.
-          virgl: renderer,
+          virgl: usesDirectGl(demo) ? null : renderer,
+          gl: usesDirectGl(demo) ? renderer : null,
           wl: wlCanvas,
           // Focus and input go to the one visible canvas: the virgl/WebGL one
           // for an Xwayland client ('x'), the compositor's output otherwise.
@@ -1133,8 +1325,10 @@ const waylandGears = {
           .join(' ');
         ctx.term.writeln(ctx.ansi.dim(`  ${nums}`));
         ctx.term.writeln(ctx.ansi.dim(`  ${gl}`));
-        for (const part of renderer.commands().split('|')) {
-          ctx.term.writeln(ctx.ansi.dim(`  ${part.trim()}`));
+        // Null on the Mesa backend, which keeps no command counts; see the
+        // sibling loop in the virgl demo above.
+        for (const part of (renderer.commands() ?? '').split('|')) {
+          if (part.trim()) ctx.term.writeln(ctx.ansi.dim(`  ${part.trim()}`));
         }
         ctx.status(status === 0 ? 'finished' : `exit ${status}`, status === 0 ? 'good' : 'bad');
       } catch (e) {
@@ -1161,7 +1355,7 @@ const waylandGears = {
 };
 
 const stkVideoOptions =
-  '--screensize=640x480 --windowed --disable-hd-textures --disable-dynamic-lights ' +
+  '--screensize=640x480 --windowed --disable-hd-textures ' +
   '--disable-glow --disable-bloom --disable-light-shaft --disable-dof --disable-particles ' +
   '--disable-animated-characters --disable-motion-blur --disable-mlaa --disable-ssao ' +
   '--disable-ibl --shadows=0 --anisotropic=0';
@@ -1172,6 +1366,83 @@ const stkPlay = `/usr/games/supertuxkart ${stkVideoOptions}`;
 const stkProfileValue = Number(new URLSearchParams(location.search).get('stkprofile'));
 // Preserve the original `?stkprofile=1` harness shorthand (a five-second
 // profile), while accepting an explicit duration for longer stable samples.
+// Which backend a directGl demo renders through.
+//
+// !!! MobileGL DOES NOT RENDER SuperTuxKart. It is fully broken for this
+// !!! demo -- not partially, not "renders the loading screen". Do not reach
+// !!! for it as a reference, a control, or a differential baseline when
+// !!! debugging the Mesa path: a comparison against it proves nothing, and
+// !!! any conclusion of the form "MobileGL renders X so the bug is
+// !!! Mesa-specific" is unsound. This has been mistakenly relied on before.
+// !!!
+// !!! The ONLY working reference path for STK is virgl (the `virgl` /
+// !!! `wayland` demos, GALLIUM_DRIVER=virpipe -> virglrenderer). If you need
+// !!! to know what a correct frame looks like, or whether the application
+// !!! itself reaches a given state, use virgl -- not MobileGL.
+//
+// `?gl=mesa` selects st/mesa plus the gex_wgpu Gallium driver below the same
+// wire protocol. Mesa is the path under active development and the one that
+// matters.
+/* Whether this demo sends its GL straight to a host backend rather than
+ * through virglrenderer.
+ *
+ * `?gl=` forces it on for a demo that does not declare it, which is how a
+ * second application can be put on the Mesa backend at all -- SuperTuxKart is
+ * the only demo that declares `directGl`.
+ *
+ * It has to be one decision rather than a per-call-site test: the flag also
+ * chooses the guest's LD_LIBRARY_PATH and whether GALLIUM_DRIVER=virpipe is
+ * exported, and a guest still pointed at virgl while the page had loaded the
+ * Mesa renderer simply never spoke to it.
+ *
+ * Forcing it only makes sense for a client that reaches GL through **EGL**.
+ * gex-gl ships `libEGL.so.1` and `libGLESv2.so.2` and no `libGL.so.1`, so
+ * there is no GLX provider on this path: an ordinary GLX client (glxgears)
+ * cannot use it, and Xwayland -- which finds gex-gl first on
+ * LD_LIBRARY_PATH and then cannot resolve what libepoxy wants -- aborts with
+ * SIGABRT inside libepoxy rather than falling back. SuperTuxKart is
+ * unaffected because Irrlicht asks EGL for desktop GL directly, which is why
+ * it negotiates GL 3.1 here without any GLX at all. Giving GLX clients this
+ * backend needs a libGL that gex-gl does not currently build. */
+function usesDirectGl(demo) {
+  const forced = new URLSearchParams(location.search).get('gl');
+  // `?gl=virgl` forces the *other* way, so a demo that declares `directGl` can
+  // still be run through virglrenderer. That is the only renderer known to
+  // draw SuperTuxKart correctly, which makes it the reference frame to compare
+  // a gex_wgpu frame against -- and without this there was no way to get one
+  // for the same application, track and camera.
+  if (forced === 'virgl') return false;
+  return !!(demo.directGl || forced);
+}
+
+async function createDirectGlDevice(canvas, backend = null) {
+  const query = new URLSearchParams(location.search);
+  // `backend` is a per-action choice (the SuperTuxKart buttons); the query
+  // string stays the override so an existing harness invocation keeps working
+  // and so a backend can be forced onto a demo that does not offer a button.
+  // `?gl=mobilegl` is no longer an escape hatch on its own -- it also needs
+  // the unlock token, for the reason below.
+  // Always Mesa. MobileGL used to be the fallthrough here, which is how
+  // `?webgpu=1` -- every gl44 probe gate's default -- silently ran the broken
+  // backend and produced results that looked like Mesa's. It is now
+  // unreachable rather than merely non-default, so a stale URL or bookmark
+  // that still asks for it says so and gets Mesa instead of quietly
+  // rendering something whose results mean nothing.
+  const { MobileGlDevice } = await import('./mobilegl.js');
+  if (MobileGlDevice.requested(query) || backend === 'mobilegl') {
+    console.warn('[gex] MobileGL was requested and ignored: it is disabled ' +
+                 'with no override. Running Mesa instead.');
+  }
+  const { MesaGlDevice } = await import('./mesa-gl.js');
+  // Desktop core by default here: a real GL application asks for a core
+  // profile, unlike the ES demos that share this path.
+  return MesaGlDevice.create(canvas, {
+    api: query.get('glapi') || 'core',
+    major: Number(query.get('glmajor') || 0),
+    minor: Number(query.get('glminor') || 0),
+  });
+}
+
 const stkProfileSeconds = stkProfileValue === 1 ? 5 : Math.floor(stkProfileValue);
 const stkLaunch = stkProfileSeconds > 0
   ? `${stkRace} --profile-time=${Math.min(300, stkProfileSeconds)}`
@@ -1184,32 +1455,54 @@ const supertuxkart = {
   id: 'supertuxkart',
   title: 'SuperTuxKart on Xwayland',
   blurb:
-    'Run the AArch64 SuperTuxKart package through gex-wayland, Xwayland, Mesa virgl, and ' +
-    'virglrenderer into WebGL in this browser.',
+    'Run the stock AArch64 SuperTuxKart package through gex-wayland and Xwayland, with ' +
+    'its OpenGL calls sent directly to WebGPU in this browser -- through MobileGL, or ' +
+    'through st/mesa and the gex_wgpu Gallium driver.',
   network: false,
   // Match STK's framebuffer, Xwayland's advertised output, and the displayed
   // canvas one-for-one instead of rendering tiny and stretching in CSS.
   canvasWidth: 640,
   canvasHeight: 480,
+  directGl: true,
+  // Xwayland and Debian's stock STK use glibc. The small GLES demo is musl;
+  // keeping both driver builds avoids injecting a second C runtime into either.
+  directGlAbi: 'glibc',
   // Version the generated image so a persistent browser does not reuse an
   // earlier over-trimmed tar that lacked the track and kart materials.
-  rootfs: '/rootfs/stk.tar?v=snowpeak18',
+  rootfs: '/rootfs/stk.tar?v=snowpeak20',
   env:
     'IRR_DEVICE_TYPE=x11;SUPERTUXKART_DATADIR=/usr/share/games/supertuxkart;' +
-    'ALSOFT_DRIVERS=null;MESA_GLSL_CACHE_DISABLE=1;MESA_GL_VERSION_OVERRIDE=3.3;' +
-    'MESA_GLSL_VERSION_OVERRIDE=330;JSIMD_FORCENONE=1;' +
-    'LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgex-stk-sdl.so',
+    'ALSOFT_DRIVERS=null;JSIMD_FORCENONE=1;' +
+    'LD_PRELOAD=/usr/lib/gex-gl/libgex-gl-sdl.so',
   // Auto-run is playable by default. The harness adds ?stkprofile=1 for its
   // finite benchmark run without exposing profiling controls in the demo UI.
   client: stkLaunch,
   intro: [
     'SuperTuxKart is running as an AArch64 X11 application inside this page:',
-    'Xwayland -> gex-wayland, Mesa virgl -> virglrenderer -> browser WebGL.',
+    'Xwayland -> gex-wayland; OpenGL -> gex-gl -> the chosen backend -> browser WebGPU.',
   ],
-  hint: 'SuperTuxKart, Xwayland, and Mesa virgl in a real browser',
-  actions: (start) => [
-    { label: 'Run', primary: true, onClick: () => start(300, { client: stkLaunch }) },
-  ],
+  hint: 'SuperTuxKart and Xwayland rendering straight to WebGPU',
+  // Mesa is primary because it is the path that is meant to work. The MobileGL
+  // button is kept only so the backend switch stays exercised -- it is KNOWN
+  // BROKEN for this demo and renders nothing. Do not treat it as a fallback,
+  // and do not "verify" a Mesa bug by checking whether MobileGL shows it.
+  // For a known-good reference frame, run the virgl/wayland demos instead.
+  actions: (start) => {
+    const run = (gl) => start(300, {
+      gl,
+      client: stkLaunch,
+      noTimeout: true,
+      // Hidden profile runs preserve the application's own logfile after an
+      // abnormal exit; normal user-facing runs do not add harness output.
+      after: stkProfileSeconds > 0
+        ? 'echo "gex: STK logfile tail"; tail -n 120 /root/.config/supertuxkart/config-0.10/stdout.log 2>/dev/null || true'
+        : '',
+    });
+    return [
+      { label: 'Run on Mesa', primary: true, onClick: () => run('mesa') },
+      { label: 'Run on MobileGL (broken)', onClick: () => run('mobilegl') },
+    ];
+  },
   enter: waylandGears.enter,
 };
 

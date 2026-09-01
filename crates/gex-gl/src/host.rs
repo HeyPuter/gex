@@ -229,6 +229,100 @@ struct Names {
     programs: HashMap<u32, GLuint>,
 }
 
+#[derive(Copy, Clone)]
+struct PixelStore {
+    alignment: usize,
+    row_length: usize,
+    image_height: usize,
+    skip_pixels: usize,
+    skip_rows: usize,
+    skip_images: usize,
+}
+
+impl Default for PixelStore {
+    fn default() -> Self {
+        Self { alignment: 4, row_length: 0, image_height: 0,
+               skip_pixels: 0, skip_rows: 0, skip_images: 0 }
+    }
+}
+
+fn format_components(format: u32) -> Option<usize> {
+    match format {
+        0x1900..=0x1906 | 0x1909 | 0x8d94..=0x8d96 | 0x84f9 => Some(1),
+        0x190a | 0x8227 | 0x8228 => Some(2),
+        0x1907 | 0x80e0 | 0x8d98 | 0x8d9a => Some(3),
+        0x1908 | 0x80e1 | 0x8d99 | 0x8d9b => Some(4),
+        _ => None,
+    }
+}
+
+fn pixel_group_bytes(format: u32, ty: u32) -> Option<usize> {
+    match ty {
+        0x8032 | 0x8362 => Some(1),
+        0x8033 | 0x8034 | 0x8363..=0x8366 => Some(2),
+        0x8035 | 0x8036 | 0x8367 | 0x8368 | 0x84fa | 0x8c3b | 0x8c3e => Some(4),
+        0x8dad => Some(8),
+        0x1a00 => None, // GL_BITMAP requires bit-level offsets.
+        _ => {
+            let scalar = match ty {
+                0x1400 | 0x1401 => 1,
+                0x1402 | 0x1403 | 0x140b => 2,
+                0x1404..=0x1406 | 0x140c => 4,
+                0x140a => 8,
+                _ => return None,
+            };
+            format_components(format)?.checked_mul(scalar)
+        }
+    }
+}
+
+fn pixel_layout(format: u32, ty: u32, width: i32, height: i32,
+                depth: Option<i32>, store: PixelStore) -> Option<(usize, usize)> {
+    if width < 0 || height < 0 || depth.is_some_and(|d| d < 0) { return None; }
+    if width == 0 || height == 0 || depth == Some(0) { return Some((0, 0)); }
+    let group = pixel_group_bytes(format, ty)?;
+    let row_pixels = if store.row_length != 0 { store.row_length } else { width as usize };
+    let row_bytes = row_pixels.checked_mul(group)?;
+    let row_stride = row_bytes.checked_add(store.alignment - 1)?
+        & !(store.alignment - 1);
+    let image_rows = if depth.is_some() && store.image_height != 0 {
+        store.image_height
+    } else { height as usize };
+    let image_stride = row_stride.checked_mul(image_rows)?;
+    let offset = (if depth.is_some() { store.skip_images } else { 0 })
+        .checked_mul(image_stride)?
+        .checked_add(store.skip_rows.checked_mul(row_stride)?)?
+        .checked_add(store.skip_pixels.checked_mul(group)?)?;
+    let end = offset
+        .checked_add((depth.unwrap_or(1) as usize - 1).checked_mul(image_stride)?)?
+        .checked_add((height as usize - 1).checked_mul(row_stride)?)?
+        .checked_add((width as usize).checked_mul(group)?)?;
+    Some((offset, end))
+}
+
+fn set_pixel_store(pack: &mut PixelStore, unpack: &mut PixelStore,
+                   pname: u32, param: i32) {
+    if param < 0 { return; }
+    let alignment = pname == 0x0d05 || pname == 0x0cf5;
+    if alignment && !matches!(param, 1 | 2 | 4 | 8) { return; }
+    let (state, field): (&mut PixelStore, fn(&mut PixelStore) -> &mut usize) = match pname {
+        0x0d05 => (pack, |s| &mut s.alignment),
+        0x0d02 => (pack, |s| &mut s.row_length),
+        0x806c => (pack, |s| &mut s.image_height),
+        0x0d04 => (pack, |s| &mut s.skip_pixels),
+        0x0d03 => (pack, |s| &mut s.skip_rows),
+        0x806b => (pack, |s| &mut s.skip_images),
+        0x0cf5 => (unpack, |s| &mut s.alignment),
+        0x0cf2 => (unpack, |s| &mut s.row_length),
+        0x806e => (unpack, |s| &mut s.image_height),
+        0x0cf4 => (unpack, |s| &mut s.skip_pixels),
+        0x0cf3 => (unpack, |s| &mut s.skip_rows),
+        0x806d => (unpack, |s| &mut s.skip_images),
+        _ => return,
+    };
+    *field(state) = param as usize;
+}
+
 /// # Threads
 ///
 /// The fields are EGL handles (bare pointers). What belongs to a thread is the
@@ -245,6 +339,8 @@ pub struct Gl {
     config: EGLConfig,
     context: EGLContext,
     names: Names,
+    pack_store: PixelStore,
+    unpack_store: PixelStore,
     width: i32,
     height: i32,
     /// Which thread the context is current on, so it is only moved when needed.
@@ -371,6 +467,8 @@ impl Gl {
                 config,
                 context,
                 names: Names::default(),
+                pack_store: PixelStore::default(),
+                unpack_store: PixelStore::default(),
                 current_on: Some(std::thread::current().id()),
                 width,
                 height,
@@ -467,6 +565,16 @@ impl Gl {
         unsafe {
             match opcode {
                 op::CONTEXT_CREATE => {
+                    // This host brings up one GLES context at startup, so the
+                    // requested API is read and not acted on. It must still be
+                    // consumed: the decoders reject a command whose payload it
+                    // did not use, which is what keeps a version mismatch from
+                    // looking like a valid stream.
+                    let (Some(_api), Some(_major), Some(_minor)) =
+                        (a.u32(), a.u32(), a.u32())
+                    else {
+                        return true;
+                    };
                     reply.blob(self.vendor.as_bytes());
                     reply.blob(self.renderer.as_bytes());
                     reply.blob(self.version.as_bytes());
@@ -549,6 +657,7 @@ impl Gl {
                 op::PIXEL_STOREI => {
                     if let (Some(p), Some(v)) = (a.u32(), a.i32()) {
                         glPixelStorei(p, v);
+                        set_pixel_store(&mut self.pack_store, &mut self.unpack_store, p, v);
                     }
                 }
 
@@ -572,30 +681,41 @@ impl Gl {
                     }
                 }
                 op::BUFFER_DATA => {
-                    let (Some(target), Some(usage), Some(data)) = (a.u32(), a.u32(), a.blob())
+                    let (Some(target), Some(usage), Some(size), Some(has_data), Some(data)) =
+                        (a.u32(), a.u32(), a.u64(), a.u32(), a.blob())
                     else {
                         return true;
                     };
+                    if size > isize::MAX as u64
+                        || (has_data != 0 && data.len() as u64 != size)
+                        || (has_data == 0 && !data.is_empty())
+                    {
+                        return true;
+                    }
                     glBufferData(
                         target,
-                        data.len() as isize,
-                        if data.is_empty() {
-                            std::ptr::null()
-                        } else {
+                        size as isize,
+                        if has_data != 0 {
                             data.as_ptr() as *const c_void
+                        } else {
+                            std::ptr::null()
                         },
                         usage,
                     );
                 }
                 op::BUFFER_SUB_DATA => {
-                    let (Some(target), Some(offset), Some(data)) = (a.u32(), a.u32(), a.blob())
+                    let (Some(target), Some(offset), Some(size), Some(data)) =
+                        (a.u32(), a.u64(), a.u64(), a.blob())
                     else {
                         return true;
                     };
+                    if offset > isize::MAX as u64 || size > isize::MAX as u64 || data.len() as u64 != size {
+                        return true;
+                    }
                     glBufferSubData(
                         target,
                         offset as isize,
-                        data.len() as isize,
+                        size as isize,
                         data.as_ptr() as *const c_void,
                     );
                 }
@@ -822,6 +942,8 @@ impl Gl {
                         Some(border),
                         Some(format),
                         Some(ty),
+                        Some(pbo),
+                        Some(pointer),
                         Some(data),
                     ) = (
                         a.u32(),
@@ -832,6 +954,8 @@ impl Gl {
                         a.i32(),
                         a.u32(),
                         a.u32(),
+                        a.u32(),
+                        a.u64(),
                         a.blob(),
                     )
                     else {
@@ -846,7 +970,9 @@ impl Gl {
                         border,
                         format,
                         ty,
-                        if data.is_empty() {
+                        if pbo != 0 {
+                            pointer as usize as *const c_void
+                        } else if pointer == 0 {
                             std::ptr::null()
                         } else {
                             data.as_ptr() as *const c_void
@@ -863,6 +989,8 @@ impl Gl {
                         Some(h),
                         Some(format),
                         Some(ty),
+                        Some(pbo),
+                        Some(pointer),
                         Some(data),
                     ) = (
                         a.u32(),
@@ -873,6 +1001,8 @@ impl Gl {
                         a.i32(),
                         a.u32(),
                         a.u32(),
+                        a.u32(),
+                        a.u64(),
                         a.blob(),
                     )
                     else {
@@ -887,7 +1017,8 @@ impl Gl {
                         h,
                         format,
                         ty,
-                        data.as_ptr() as *const c_void,
+                        if pbo != 0 { pointer as usize as *const c_void }
+                        else { data.as_ptr() as *const c_void },
                     );
                 }
 
@@ -908,17 +1039,29 @@ impl Gl {
                 }
 
                 op::READ_PIXELS => {
-                    let (Some(x), Some(y), Some(w), Some(h), Some(format), Some(ty)) =
-                        (a.i32(), a.i32(), a.i32(), a.i32(), a.u32(), a.u32())
+                    let (Some(x), Some(y), Some(w), Some(h), Some(format), Some(ty),
+                         Some(pbo), Some(pointer)) =
+                        (a.i32(), a.i32(), a.i32(), a.i32(), a.u32(), a.u32(),
+                         a.u32(), a.u64())
                     else {
                         return true;
                     };
-                    // Four bytes a pixel: RGBA/UNSIGNED_BYTE is the only combo
-                    // GLES2 guarantees, and this is large enough for it.
-                    let n = (w.max(0) as usize) * (h.max(0) as usize) * 4;
-                    let mut px = vec![0u8; n];
-                    glReadPixels(x, y, w, h, format, ty, px.as_mut_ptr() as *mut c_void);
-                    reply.blob(&px);
+                    if pbo != 0 {
+                        glReadPixels(x, y, w, h, format, ty,
+                                     pointer as usize as *mut c_void);
+                    } else if let Some((offset, end)) =
+                        pixel_layout(format, ty, w, h, None, self.pack_store)
+                    {
+                        let mut px = vec![0u8; end];
+                        glReadPixels(x, y, w, h, format, ty,
+                                     px.as_mut_ptr() as *mut c_void);
+                        reply.u32(offset as u32);
+                        reply.blob(&px[offset..]);
+                    } else {
+                        glReadPixels(x, y, w, h, format, ty, std::ptr::null_mut());
+                        reply.u32(0);
+                        reply.blob(&[]);
+                    }
                 }
                 op::GET_STRING => {
                     let Some(name) = a.u32() else { return true };
@@ -957,7 +1100,7 @@ pub fn read_header(bytes: &[u8]) -> Option<Header> {
         reply_len: w(4),
         status: w(5),
         failed_at: w(6),
-        reserved: w(7),
+        protocol_version: w(7),
     })
 }
 
@@ -968,7 +1111,7 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{op, Batch};
+    use crate::proto::{client_api, op, Batch};
 
     // The handful of GL constants a test needs, spelled out rather than
     // pulled in: a guest sends these numbers, so a test should send numbers.
@@ -1026,7 +1169,7 @@ mod tests {
         let fs = b"precision mediump float;\nvoid main(){gl_FragColor=vec4(0.0,1.0,0.0,1.0);}\n";
 
         let mut b = Batch::new();
-        b.cmd(op::CONTEXT_CREATE, &[]);
+        b.cmd(op::CONTEXT_CREATE, &[client_api::ES, 0, 0]);
         b.cmd(op::VIEWPORT, &[0, 0, 64, 64]);
         b.cmd(
             op::CLEAR_COLOR,
@@ -1059,14 +1202,16 @@ mod tests {
         b.cmd(op::BIND_BUFFER, &[GL_ARRAY_BUFFER, 7]);
         b.raw(
             op::BUFFER_DATA,
-            &[GL_ARRAY_BUFFER, GL_STATIC_DRAW, bytes.len() as u32],
+            &[GL_ARRAY_BUFFER, GL_STATIC_DRAW, bytes.len() as u32, 0, 1,
+              bytes.len() as u32],
             &bytes,
         );
         b.cmd(op::ENABLE_VERTEX_ATTRIB_ARRAY, &[0]);
         b.cmd(op::VERTEX_ATTRIB_POINTER, &[0, 2, GL_FLOAT, 0, 0, 0]);
         b.cmd(op::DRAW_ARRAYS, &[GL_TRIANGLES, 0, 3]);
         b.cmd(op::FINISH, &[]);
-        b.cmd(op::READ_PIXELS, &[0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE]);
+        b.cmd(op::READ_PIXELS,
+              &[0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, 0, 1, 0]);
         b.cmd(op::GET_ERROR, &[]);
 
         let (reply, status, ran) = gl.run(b.bytes());
@@ -1088,6 +1233,8 @@ mod tests {
         let attrib = read_u32(r, &mut at) as i32;
         assert_eq!(attrib, 0, "pos was bound to location 0");
         let _finish = read_u32(r, &mut at);
+        let pixel_offset = read_u32(r, &mut at);
+        assert_eq!(pixel_offset, 0);
         let pixels = read_blob(r, &mut at);
         let err = read_u32(r, &mut at);
         assert_eq!(err, 0, "GL reported no error");

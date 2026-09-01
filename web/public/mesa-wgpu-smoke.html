@@ -1,0 +1,37 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mesa WebGPU Gallium smoke</title>
+<pre id="result">running</pre>
+<script type="module">
+  const result = document.getElementById('result');
+  try {
+    if (!navigator.gpu) throw new Error('navigator.gpu unavailable');
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) throw new Error('WebGPU adapter unavailable');
+    const requiredFeatures = adapter.features.has('texture-compression-bc')
+      ? ['texture-compression-bc'] : [];
+    const device = await adapter.requestDevice({ requiredFeatures });
+    device.addEventListener('uncapturederror', (event) => {
+      const message = event.error?.message || String(event.error);
+      console.error(`WebGPU validation: ${message}`);
+      globalThis.__gexWgpuResult = { ok: false, error: message };
+    });
+    const { default: createModule } = await import('/gex/gex-wgpu-smoke.js');
+    const module = await createModule({
+      preinitializedWebGPUDevice: device,
+      locateFile: (file) => `/gex/${file}`,
+      print: (line) => console.log(line),
+      printErr: (line) => console.error(line),
+    });
+    const run = WebAssembly.promising(module.gexWgpuRaw);
+    const rc = await run();
+    const outcome = { ok: rc === 0, rc };
+    globalThis.__gexWgpuResult = outcome;
+    result.textContent = JSON.stringify(outcome);
+  } catch (error) {
+    const outcome = { ok: false, error: error?.stack || error?.message || String(error) };
+    globalThis.__gexWgpuResult = outcome;
+    result.textContent = JSON.stringify(outcome);
+    console.error(outcome.error);
+  }
+</script>

@@ -4,6 +4,7 @@
 //! GPU, and [`host`] for what runs the commands.
 
 pub mod proto;
+pub mod trace;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod host;

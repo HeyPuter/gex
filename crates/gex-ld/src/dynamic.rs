@@ -85,6 +85,20 @@ pub fn load_program(
     // The interpreter is position-independent and goes wherever we say, well
     // clear of the executable so neither can overlap the other's mappings.
     let interp = load(&interp_bytes, interp_base)?;
+    for a in &exe.segments {
+        for b in &interp.segments {
+            let a_end = a.vaddr + a.mem_size;
+            let b_end = b.vaddr + b.mem_size;
+            if a.vaddr < b_end && b.vaddr < a_end {
+                return Err(LoadError::ImageOverlap {
+                    first_start: a.vaddr,
+                    first_end: a_end,
+                    second_start: b.vaddr,
+                    second_end: b_end,
+                });
+            }
+        }
+    }
     Ok(Program {
         exe,
         interp: Some(interp),

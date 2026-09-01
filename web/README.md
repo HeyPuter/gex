@@ -1,36 +1,74 @@
-# web — the demo page
+# Browser demo
 
-A Vite app that runs AArch64 Linux programs in the browser. Three demos:
+The SuperTuxKart demo uses the direct compatibility graphics path:
 
-1. **Run your own binary.** Drop in a statically linked aarch64 ELF. There is
-   no ahead-of-time step in a browser, so the page ships a *seed* module
-   (`gexc seed`, 1.4 KB) that translates nothing and lets the runtime
-   translator produce the whole program on demand.
-2. **A BusyBox userspace.** A root filesystem and a shell on top of it, with
-   real `fork`, `exec` and pipes.
-3. **Debian, with `apt`.** `apt-get update` fetches and parses the real
-   bookworm index. Networking goes over Wisp, because a page cannot open a
-   TCP socket.
+```text
+stock application -> guest libGL/libEGL marshaller -> MobileGL -> WebGPU
+```
 
-## Running it
+It does not run virglrenderer or guest Mesa. Those remain available for the
+separate legacy virgl demos; the direct path intercepts the standard library
+ABI, so STK and other desktop applications require no source modification.
 
-    ./build-assets.sh      # the two wasm modules and the rootfs tars
-    npm install
-    npm run dev
+MobileGL is pinned as `third_party/mobilegl-webgpu` and patched at build time.
+The WebGPU fork is unfinished and, candidly, much of this backend is not written
+well: important GL invariants are missing from cache keys, unsupported calls
+silently poison whole WebGPU command buffers, and several formats, framebuffer
+operations, and texture types remain unimplemented despite advertising desktop
+OpenGL 3.3. Treat it as an experimental compatibility layer, not a conformant GL
+implementation.
+Keeping the changes in `web/mobilegl-*.patch` makes those local fixes explicit
+and leaves the upstream checkout reproducible.
 
-`build-assets.sh --debian` also builds the Debian image, which needs
-`debootstrap` and root.
+Build the direct WebGPU renderer, then publish the assets:
 
-## How fork works here
+```sh
+git submodule update --init --recursive third_party/mobilegl-webgpu
+web/build-mobilegl-wasm.sh
+(cd web && npm run assets)
+```
 
-There is one address space: a guest address is a byte offset into the page's
-single `WebAssembly.Memory`, and a page gets one memory. So `fork` is done by
-checkpoint — the parent's memory, kernel and dispatch state are copied aside,
-the child runs in place, and when the child exits the parent is restored with
-the child's pid already in `x0`.
+The first WebGPU build compiles the fork's pinned Tint and glslang trees and is
+substantially slower than subsequent incremental builds. SuperTuxKart selects
+`gexmobilegl-webgpu.mjs`; the virgl demos continue to use their own renderer.
 
-That buys a whole userspace in a page. What it costs is concurrency: the
-parent does not run while the child does. For `fork` then `wait`, which is
-every shell, that is invisible. For a parent that forks and keeps working it
-is not, and it shows up as the parent simply not running until the child is
-finished.
+## OpenGL 4.4 validation
+
+The complete 543-command core-4.4 loader surface and the currently transported
+and WebGPU-backed subsets have a structural gate:
+
+```sh
+tests/gl44-layer.sh
+```
+
+That is deliberately not a conformance claim. Official semantic evidence comes
+from the pinned Khronos GL CTS (`opengl-cts-4.6.8.1`):
+
+```sh
+export GEX_CTS_TOOLCHAIN=/path/to/aarch64-linux-musl-cross
+tests/gl44-cts.sh
+tests/gl44-cts-browser.sh
+```
+
+The second command runs a real `KHR-GL44` case through the persistent browser
+and direct MobileGL/WebGPU path. `GEX_CTS_CASE=KHR-GL44.…` selects another case;
+the growing pass list, rather than symbol coverage or an advertised version
+string, is the compliance measure.
+
+## SuperTuxKart real-present benchmark
+
+With the persistent browser CDP server on port 9335 and the demo server on
+port 8091, run:
+
+```sh
+tests/stk-webgpu-fps.sh
+```
+
+The gate profiles a race and separately measures browser animation ticks and
+distinct WebGPU canvas frames over the final ten seconds. It requires at least
+59.8 real presents per second, 99.5% fresh-frame coverage, and no more than one
+missed animation tick. The game can produce frames faster than the browser can
+display them, so its own `Average FPS` is diagnostic rather than the pass/fail
+metric. A four-snapshot MobileGL presentation queue decouples guest production
+from browser animation timing; this costs about 4.7 MiB at 640x480 and can add
+roughly 40 ms of queueing latency when the guest runs near 95 FPS.

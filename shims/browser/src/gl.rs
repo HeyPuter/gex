@@ -41,7 +41,7 @@ pub fn have_gl() -> bool {
 pub const GEX_GL_SUBMIT: u64 = 0xc008_6701;
 pub const GEX_GL_LIMITS: u64 = 0x8008_6702;
 
-const MAX_BATCH: u32 = 16 * 1024 * 1024;
+const MAX_BATCH: u32 = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct GlDevice;
