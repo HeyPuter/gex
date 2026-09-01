@@ -1,0 +1,58 @@
+diff --git a/framework/platform/surfaceless/tcuSurfacelessPlatform.cpp b/framework/platform/surfaceless/tcuSurfacelessPlatform.cpp
+index 2224f41..f1c662f 100644
+--- a/framework/platform/surfaceless/tcuSurfacelessPlatform.cpp
++++ b/framework/platform/surfaceless/tcuSurfacelessPlatform.cpp
+@@ -295,16 +295,23 @@ EglRenderContext::EglRenderContext(const glu::RenderConfig &config, const tcu::C
+     EGLU_CHECK_CALL(m_egl, initialize(m_eglDisplay, &eglMajorVersion, &eglMinorVersion));
+ 
+     frame_buffer_attribs.push_back(EGL_RENDERABLE_TYPE);
+-    switch (contextType.getMajorVersion())
++    if (!glu::isContextTypeES(contextType))
+     {
+-    case 3:
+-        frame_buffer_attribs.push_back(EGL_OPENGL_ES3_BIT);
+-        break;
+-    case 2:
+-        frame_buffer_attribs.push_back(EGL_OPENGL_ES2_BIT);
+-        break;
+-    default:
+-        frame_buffer_attribs.push_back(EGL_OPENGL_ES_BIT);
++        frame_buffer_attribs.push_back(EGL_OPENGL_BIT);
++    }
++    else
++    {
++        switch (contextType.getMajorVersion())
++        {
++        case 3:
++            frame_buffer_attribs.push_back(EGL_OPENGL_ES3_BIT);
++            break;
++        case 2:
++            frame_buffer_attribs.push_back(EGL_OPENGL_ES2_BIT);
++            break;
++        default:
++            frame_buffer_attribs.push_back(EGL_OPENGL_ES_BIT);
++        }
+     }
+ 
+     frame_buffer_attribs.push_back(EGL_SURFACE_TYPE);
+diff --git a/targets/gex/gex.cmake b/targets/gex/gex.cmake
+new file mode 100644
+index 0000000..c84fda5
+--- /dev/null
++++ b/targets/gex/gex.cmake
+@@ -0,0 +1,15 @@
++message("*** Using gex EGL/OpenGL target")
++
++# The guest implementation is loaded at runtime under its ordinary sonames;
++# no host-architecture GL/EGL library may leak into this cross build.
++set(DEQP_TARGET_NAME "gex")
++set(DEQP_USE_SURFACELESS ON)
++if(NOT GEX_GUEST_GL_LIBRARY)
++    message(FATAL_ERROR "GEX_GUEST_GL_LIBRARY must name the aarch64 guest GL marshaller")
++endif()
++# The generic surfaceless platform resolves most EGL/GL calls dynamically, but
++# config enumeration and pbuffer creation are direct references. Link those to
++# the exact same one-object EGL/GLES marshaller that the browser guest loads.
++set(DEQP_PLATFORM_LIBRARIES "${GEX_GUEST_GL_LIBRARY}" dl pthread)
++add_definitions(-DDEQP_OPENGL_LIBRARY_PATH="libGLESv2.so.2")
++include_directories("${CMAKE_SOURCE_DIR}/../mobilegl-webgpu/include")

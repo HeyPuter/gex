@@ -7,9 +7,11 @@
 
 use gex_gl::host::{read_header, Gl};
 use gex_gl::proto::{error, Header, MAGIC};
+use gex_gl::trace;
 use gex_kernel::errno::{Errno, SysResult};
 use gex_kernel::vfs::{FileHandle, FileType, Metadata};
 use gex_kernel::GuestMem;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 /// `_IOWR('g', 1, ...)`: hand over the batch whose header is at `arg`. A private
@@ -19,7 +21,7 @@ pub const GEX_GL_SUBMIT: u64 = 0xc008_6701;
 pub const GEX_GL_LIMITS: u64 = 0x8008_6702;
 
 /// The largest batch the device will read in one go.
-const MAX_BATCH: u32 = 16 * 1024 * 1024;
+const MAX_BATCH: u32 = 32 * 1024 * 1024;
 
 /// The device, and the host GL context behind it. The context is used on
 /// whichever thread submits (a GL thread's channel round trip measured 23 of a
@@ -28,6 +30,22 @@ const MAX_BATCH: u32 = 16 * 1024 * 1024;
 pub struct GlDevice {
     gl: Mutex<Option<Result<Gl, String>>>,
     size: (i32, i32),
+    /// Where `GEX_GL_CAPTURE` said to record the command stream, and the file
+    /// once one batch has arrived. Recording is a debugging aid: a guest whose
+    /// trace cannot be written still runs.
+    capture: Mutex<Capture>,
+}
+
+/// The recording half of the device.
+#[derive(Default)]
+enum Capture {
+    /// `GEX_GL_CAPTURE` was unset, or the file stopped being writable.
+    #[default]
+    Off,
+    /// Asked for, not opened yet: the header carries the surface size, so it
+    /// is written when the first batch proves a guest is really drawing.
+    Requested(std::path::PathBuf),
+    On(std::fs::File),
 }
 
 impl std::fmt::Debug for GlDevice {
@@ -38,10 +56,44 @@ impl std::fmt::Debug for GlDevice {
 
 impl GlDevice {
     pub fn new(width: i32, height: i32) -> Arc<GlDevice> {
+        let capture = match std::env::var_os("GEX_GL_CAPTURE") {
+            Some(path) if !path.is_empty() => Capture::Requested(path.into()),
+            _ => Capture::Off,
+        };
         Arc::new(GlDevice {
             gl: Mutex::new(None),
             size: (width, height),
+            capture: Mutex::new(capture),
         })
+    }
+
+    /// Append one batch to the recording, if there is one.
+    ///
+    /// Recorded before execution rather than after, so a batch that makes the
+    /// host GL abort is in the file that gets replayed.
+    fn record(&self, batch: &[u8], reply_capacity: u32) {
+        let mut capture = self.capture.lock().unwrap();
+        if let Capture::Requested(path) = &*capture {
+            *capture = match std::fs::File::create(path).and_then(|mut file| {
+                file.write_all(&trace::header(self.size.0 as u32, self.size.1 as u32))?;
+                Ok(file)
+            }) {
+                Ok(file) => Capture::On(file),
+                Err(e) => {
+                    eprintln!("gex: cannot record GL to {}: {e}", path.display());
+                    Capture::Off
+                }
+            };
+        }
+        if let Capture::On(file) = &mut *capture {
+            if let Err(e) = file
+                .write_all(&trace::record(batch, reply_capacity))
+                .and_then(|()| file.flush())
+            {
+                eprintln!("gex: GL recording stopped: {e}");
+                *capture = Capture::Off;
+            }
+        }
     }
 
     /// What the host's GL turned out to be, once a guest has asked for it.
@@ -69,6 +121,8 @@ impl GlDevice {
         let batch = m
             .read(ring + Header::SIZE as u64, header.tail as usize)?
             .to_vec();
+
+        self.record(&batch, header.reply_capacity);
 
         let mut slot = self.gl.lock().unwrap();
         if slot.is_none() {

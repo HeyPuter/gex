@@ -407,18 +407,18 @@ export class ProcessHost {
         this.#onOutput(m.fd, m.text, pid, m);
         break;
       case 'compiledModule': {
-        // A Worker compiled registry module `m.i`. Remember it for this process
+        // A Worker compiled a module with content key `m.key`. Remember it for this process
         // and relay it to the process's other live Workers so none recompiles
         // the same bytes. `WebAssembly.Module` crosses `postMessage` by
         // reference, so this is cheap. See `#moduleCache`.
         const proc = String(pid).split(':')[0];
         let cache = this.#moduleCache.get(proc);
         if (!cache) this.#moduleCache.set(proc, (cache = new Map()));
-        if (!cache.has(m.i)) {
-          cache.set(m.i, m.mod);
+        if (typeof m.key === 'string' && !cache.has(m.key)) {
+          cache.set(m.key, m.mod);
           for (const [key, other] of this.#workers) {
             if (other !== w && String(key).split(':')[0] === proc) {
-              other.postMessage({ kind: 'sharedModule', i: m.i, mod: m.mod });
+              other.postMessage({ kind: 'sharedModule', key: m.key, mod: m.mod });
             }
           }
         }

@@ -1,0 +1,242 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mesa WebGPU replay</title>
+<pre id="result">running</pre>
+<script type="module">
+  // Replay a recorded guest GL command stream through Mesa's frontend and the
+  // gex_wgpu Gallium driver, on the browser's own WebGPU.
+  //
+  // This is the production shape end to end: the bytes are exactly what the
+  // guest's libGLESv2.so.2 emitted, and everything below the decoder is
+  // st/mesa -> NIR -> gex_wgpu -> WebGPU. Replaying rather than running a
+  // guest keeps it comparable -- `tests/gl-replay.mjs` feeds the same file to
+  // softpipe, so a disagreement is the driver's and nothing else's.
+
+  const result = document.getElementById('result');
+  const query = new URLSearchParams(location.search);
+  const tracePath = query.get('trace') || '/gex/replay.gexgltr';
+  const api = query.get('api') === 'core' ? 1 : 0;
+  // Which GL version to ask st/mesa for. The driver's caps decide what it can
+  // actually give; asking for more than they support fails context creation,
+  // so this is how the working floor gets found rather than guessed.
+  const major = Number(query.get('major') || 0);
+  const minor = Number(query.get('minor') || 0);
+
+  // Format is defined by crates/gex-gl/src/trace.rs.
+  function parseTrace(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (String.fromCharCode(...bytes.subarray(0, 7)) !== 'GEXGLTR')
+      throw new Error('not a gex GL trace');
+    const info = {
+      protocolVersion: view.getUint32(12, true),
+      width: view.getUint32(16, true),
+      height: view.getUint32(20, true),
+    };
+    const batches = [];
+    for (let at = 24; at < bytes.length;) {
+      const length = view.getUint32(at, true);
+      const start = at + 8;
+      batches.push(bytes.subarray(start, start + length));
+      at = start + length + ((4 - (length & 3)) & 3);
+    }
+    return { info, batches };
+  }
+
+  function command(op, words = []) {
+    const out = new Uint8Array(8 + words.length * 4);
+    const view = new DataView(out.buffer);
+    view.setUint32(0, op, true);
+    view.setUint32(4, out.length, true);
+    words.forEach((w, i) => view.setUint32(8 + i * 4, w >>> 0, true));
+    return out;
+  }
+
+  try {
+    if (!navigator.gpu) throw new Error('navigator.gpu unavailable');
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) throw new Error('WebGPU adapter unavailable');
+    // Keep this list identical to web/src/mesa-gl.js. It had drifted: without
+    // dual-source-blending the driver reported max_dual_source_render_targets
+    // as 0, so ARB_blend_func_extended looked missing on this path and
+    // tests/mesa-wgpu-version.sh under-reported the GL ceiling the real
+    // application path reaches.
+    const optional = ['texture-compression-bc', 'depth32float-stencil8',
+                'rg11b10ufloat-renderable', 'depth-clip-control',
+                      'float32-filterable', 'float32-blendable',
+                'clip-distances', 'dual-source-blending',
+                'timestamp-query'];
+    // Each of these gates a GL extension st/mesa derives from format
+    // support: BC compression, ARB_depth_buffer_float, EXT_packed_float,
+    // and ARB_depth_clamp.
+    // clip-distances is not a format feature -- it is what lets a translated
+    // shader declare `enable clip_distances`, which is how gl_ClipDistance
+    // reaches WGSL at all.
+    // Absent ones are simply not requested; the driver asks the device what
+    // it actually got rather than assuming.
+    const requiredFeatures = optional.filter((f) => adapter.features.has(f));
+    console.log('FEATURES ' + JSON.stringify([...adapter.features].sort()));
+    // A device gets WebGPU's *default* limits unless it asks for more, and
+    // those defaults are well below what this adapter can do -- storage
+    // buffers in the vertex stage default to none at all. The driver reads
+    // the limits back from the device and sizes its caps from them, so
+    // anything not asked for here is capability the backend never sees.
+    //
+    // st/mesa needs 13 constant buffers per stage for
+    // ARB_uniform_buffer_object, which is GL 3.1; WebGPU guarantees only 12,
+    // so the driver backs the rest with storage buffers. Ask for everything
+    // up to what the driver is built for, clamped to the adapter --
+    // requesting above the adapter's maximum makes requestDevice reject.
+    const want = {
+      maxUniformBuffersPerShaderStage: 16,
+      maxStorageBuffersPerShaderStage: 16,
+      maxStorageBuffersInVertexStage: 16,
+      maxStorageBuffersInFragmentStage: 16,
+      // Eight RGBA8 draw buffers is exactly WebGPU's default 32 bytes per
+      // sample, so any wider attachment set fails on it -- GL 3.2 wants
+      // eight draw buffers of whatever format the application chose.
+      maxColorAttachmentBytesPerSample: 64,
+    };
+    const requiredLimits = {};
+    for (const [limit, wanted] of Object.entries(want)) {
+      const available = adapter.limits[limit];
+      if (typeof available === 'number' && available > 0)
+        requiredLimits[limit] = Math.min(available, wanted);
+    }
+    const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
+    let validation = null;
+    device.addEventListener('uncapturederror', (event) => {
+      validation = event.error?.message || String(event.error);
+      console.error(`WebGPU validation: ${validation}`);
+    });
+
+    // Limits that decide what the driver can implement at all. These are the
+    // *device's*, not the adapter's: the driver reads them back from the
+    // device, and a device only gets what it asked for above, which is why
+    // the adapter's numbers are the wrong ones to report here.
+    const limitNames = ['maxStorageBuffersInVertexStage',
+                        'maxStorageBuffersPerShaderStage',
+                        'maxUniformBuffersPerShaderStage',
+                        'maxVertexBuffers', 'maxColorAttachments'];
+    console.log('LIMITS ' + JSON.stringify(Object.fromEntries(
+      limitNames.map((n) => [n, device.limits[n]]))));
+
+    const traceBytes = new Uint8Array(await (await fetch(tracePath)).arrayBuffer());
+    const trace = parseTrace(traceBytes);
+
+    const { default: createModule } = await import('/gex/gex-wgpu-replay.js');
+    const module = await createModule({
+      preinitializedWebGPUDevice: device,
+      locateFile: (file) => `/gex/${file}`,
+      print: (line) => console.log(line),
+      printErr: (line) => console.error(line),
+    });
+
+    // Readback suspends the wasm stack, so every submit goes through JSPI.
+    const submitRaw = WebAssembly.promising(module.gexGlSubmitRaw);
+    async function submit(bytes) {
+      const ptr = module._malloc(bytes.length || 1);
+      if (bytes.length) module.HEAPU8.set(bytes, ptr);
+      const status = await submitRaw(ptr, bytes.length);
+      module._free(ptr);
+      return status;
+    }
+    function reply() {
+      const length = module._gex_gl_reply_len();
+      const from = module._gex_gl_reply_data();
+      return module.HEAPU8.slice(from, from + length);
+    }
+
+    if (module._gex_gl_set_api) module._gex_gl_set_api(api, major, minor);
+    const { width, height } = trace.info;
+    const init = module._gex_gl_init(width, height);
+    if (init !== 0) throw new Error(`backend init returned ${init}`);
+
+    let failed = null;
+    let replayed = 0;
+    for (const [index, batch] of trace.batches.entries()) {
+      const status = await submit(batch);
+      replayed++;
+      if (status !== 0) {
+        failed = { index, reason: `decoder status ${status}` };
+        break;
+      }
+      // GET_ERROR, so a GL error is attributed to the batch that caused it.
+      if (await submit(command(131)) === 0) {
+        const bytes = reply();
+        const error = bytes.length >= 4
+          ? new DataView(bytes.buffer, bytes.byteOffset).getUint32(0, true) : 0;
+        if (error !== 0) {
+          failed = { index, reason: `GL error 0x${error.toString(16)}` };
+          break;
+        }
+      }
+    }
+
+    // The same FNV-1a digest tests/gl-replay.mjs prints, so the two backends
+    // are compared by value rather than by eye.
+    let digest = null;
+    let pixels = 0;
+    let mean = null;
+    let coverage = null;
+    if (!failed) {
+      const GL_RGBA = 0x1908, GL_UNSIGNED_BYTE = 0x1401;
+      const status = await submit(command(128,
+        [0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, 0, 0, 0]));
+      if (status !== 0) {
+        failed = { index: -1, reason: `readback rejected with status ${status}` };
+      } else {
+        const out = reply();
+        const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+        pixels = view.getUint32(4, true);
+        let hash = 0x811c9dc5;
+        const sum = [0, 0, 0, 0];
+        let covered = 0;
+        for (let i = 0; i < pixels; i++) {
+          hash ^= out[8 + i];
+          hash = Math.imul(hash, 0x01000193) >>> 0;
+          sum[i & 3] += out[8 + i];
+        }
+        for (let i = 0; i + 3 < pixels; i += 4) {
+          if (out[8 + i] || out[9 + i] || out[10 + i]) covered++;
+        }
+        const pixelCount = pixels >> 2;
+        // Same tolerant metrics tests/gl-replay.mjs prints, so a CPU
+        // rasterizer and a GPU can be compared without demanding bit equality.
+        mean = sum.map((v) => (pixelCount ? v / pixelCount : 0).toFixed(1)).join(',');
+        coverage = pixelCount ? ((100 * covered) / pixelCount).toFixed(1) : '0.0';
+        digest = hash.toString(16).padStart(8, '0');
+        // And the surface itself, base64, for tools/surface-diff.py. The
+        // metrics above are summaries and a summary cannot tell a flipped
+        // image from a correct one -- their means are identical. Holding two
+        // backends to the same picture means comparing the pictures.
+        let binary = '';
+        for (let i = 0; i < pixels; i += 0x8000) {
+          binary += String.fromCharCode.apply(
+            null, out.subarray(8 + i, 8 + Math.min(i + 0x8000, pixels)));
+        }
+        globalThis.__gexWgpuSurface = btoa(binary);
+      }
+    }
+
+    const outcome = {
+      ok: !failed && !validation,
+      batches: replayed,
+      total: trace.batches.length,
+      size: `${width}x${height}`,
+      digest,
+      pixels,
+      mean,
+      coverage,
+      failed,
+      validation,
+    };
+    globalThis.__gexWgpuResult = outcome;
+    result.textContent = JSON.stringify(outcome, null, 2);
+    console.log(`REPLAY ${JSON.stringify(outcome)}`);
+  } catch (error) {
+    const outcome = { ok: false, error: error?.stack || error?.message || String(error) };
+    globalThis.__gexWgpuResult = outcome;
+    result.textContent = JSON.stringify(outcome);
+    console.error(outcome.error);
+  }
+</script>

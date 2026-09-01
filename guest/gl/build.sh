@@ -16,6 +16,11 @@ CC="${GEX_CC:-$HOME/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-g
 
 [ -x "$CC" ] || { echo "skip: no $CC"; exit 0; }
 
+# Generate every registry-backed entry point before compiling the transport.
+# This deliberately fails closed if a pointer-shaped command has no explicit
+# wire policy in tools/gen_gl44_transport.py.
+python3 "$ROOT/tools/gen_gl44_transport.py"
+
 # The opcodes come from the Rust side, so the two cannot drift.
 python3 - "$ROOT" "$HERE" <<'PYEOF'
 import re, sys
@@ -35,7 +40,9 @@ out = ["/* Opcodes for the gex graphics device.",
 for m in re.finditer(r'pub const ([A-Z_0-9]+): u32 = (\d+);', body):
     out.append(f"#define GEXGL_{m.group(1)} {m.group(2)}")
 magic = re.search(r'pub const MAGIC: u32 = (0x[0-9a-fA-F_]+);', src).group(1)
-out += ["", f"#define GEXGL_MAGIC {magic.replace('_','')}u"]
+protocol_version = re.search(r'pub const PROTOCOL_VERSION: u32 = (\d+);', src).group(1)
+out += ["", f"#define GEXGL_MAGIC {magic.replace('_','')}u",
+        f"#define GEXGL_PROTOCOL_VERSION {protocol_version}u"]
 dev = open(f'{root}/shims/native/src/gl.rs').read()
 sub = re.search(r'pub const GEX_GL_SUBMIT: u64 = (0x[0-9a-fA-F_]+);', dev).group(1)
 out += [f"#define GEXGL_SUBMIT {sub.replace('_','')}u"]
@@ -53,6 +60,7 @@ for m in re.finditer(r'pub const ([A-Z_0-9]+): u32 = (\d+);', body):
     js.append(f"    {m.group(1)}: {m.group(2)},")
 js += ["};", "",
        f"export const MAGIC = {magic.replace('_','')};",
+       f"export const PROTOCOL_VERSION = {protocol_version};",
        "export const HEADER_BYTES = 32;", ""]
 errs = src[src.index('pub mod error {'):]
 errs = errs[:errs.index('\n}')]
@@ -67,11 +75,38 @@ if os.path.isdir(webdir):
 PYEOF
 
 mkdir -p "$OUT"
-$CC -shared -fPIC -O2 -Wall -o "$OUT/libGLESv2.so.2" \
-    -Wl,-soname,libGLESv2.so.2 "$HERE/gexgl.c"
+# The extension allowlist is derived from this object's own exported symbols
+# -- an extension is only claimable when every command the registry says it
+# requires is actually here -- so it can only be generated after a link, and
+# a change to it needs one more. In steady state the second link never runs.
+INCLUDE="$HERE/gl-extensions-generated.inc"
+ALIASES="$HERE/gl-aliases-generated.inc"
+[ -f "$INCLUDE" ] || printf '%s\n' \
+    'static const char *const gexgl_claimable_extensions[] = {0};' > "$INCLUDE"
+[ -f "$ALIASES" ] || : > "$ALIASES"
+link_guest_gl() {
+    $CC -shared -fPIC -O2 -Wall -o "$OUT/libGLESv2.so.2" \
+        -Wl,-soname,libGLESv2.so.2 "$HERE/gexgl.c" -ldl
+}
+link_guest_gl
+if [ -n "$(python3 "$ROOT/tools/gen_gl_extensions.py" \
+        --library "$OUT/libGLESv2.so.2" --output "$INCLUDE" \
+        --aliases "$ALIASES")" ]; then
+    link_guest_gl
+fi
 # EGL is the same object under its own name, so a loader that opens either
 # finds every symbol it needs.
 cp "$OUT/libGLESv2.so.2" "$OUT/libEGL.so.1"
+# And libGL.so.1, the same object again: GLX is how a traditional X program
+# asks for a context, and without this file that whole class of application
+# cannot start. It is a separate soname rather than a symlink because a loader
+# that opens both must see two libraries, not one.
+cp "$OUT/libGLESv2.so.2" "$OUT/libGL.so.1"
+ln -sf libGL.so.1 "$OUT/libGL.so"
 ln -sf libGLESv2.so.2 "$OUT/libGLESv2.so"
 ln -sf libEGL.so.1 "$OUT/libEGL.so"
+$CC -shared -fPIC -O2 -Wall -o "$OUT/libgex-gl-sdl.so" \
+    -Wl,-soname,libgex-gl-sdl.so \
+    -Wl,-rpath,/usr/lib/gex-gl "$HERE/gexgl-sdl.c" \
+    -L"$OUT" -Wl,-rpath-link,"$OUT" -Wl,--no-as-needed -l:libGLESv2.so.2 -ldl
 echo "$OUT: $(ls "$OUT" | tr '\n' ' ')"

@@ -203,7 +203,7 @@ async function handle(msg) {
   // and only matters once this Worker has a `Gex`; before that it is dropped and
   // the module is simply recompiled. See `Gex#sharedModules`.
   if (msg?.kind === 'sharedModule') {
-    workerGex?.addSharedModule(msg.i, msg.mod);
+    workerGex?.addSharedModule(msg.key, msg.mod);
     return;
   }
   if (msg?.kind !== 'run' && msg?.kind !== 'adopt' && msg?.kind !== 'thread') return;
@@ -294,8 +294,8 @@ async function handle(msg) {
     // Workers of the same process so they reuse it rather than recompiling the
     // same registry bytes. A `WebAssembly.Module` crosses `postMessage` by
     // reference -- no byte copy. See `Gex#sharedModules`.
-    shareModule(i, mod) {
-      port.post({ kind: 'compiledModule', i, mod });
+    shareModule(key, mod) {
+      port.post({ kind: 'compiledModule', key, mod });
     }
   }
 
@@ -334,7 +334,7 @@ async function handle(msg) {
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
   // Any sibling modules the host already had when this Worker started.
-  for (const [i, mod] of msg.sharedModules ?? []) gex.addSharedModule(i, mod);
+  for (const [key, mod] of msg.sharedModules ?? []) gex.addSharedModule(key, mod);
 
   // The guest's GPU. The renderer is on the page, so calls cross a
   // `SharedArrayBuffer` and block on `Atomics.wait` -- they must be synchronous
@@ -357,7 +357,11 @@ async function handle(msg) {
   // must run before `load` -- which mounts /dev/gex-gl only when the flag is on.
   if (msg.glChannel) {
     const { GlProxy } = await import('./gl-bridge.mjs');
-    gex.useGl(new GlProxy(msg.glChannel, () => port.post({ kind: 'gl' })));
+    gex.useGl(new GlProxy(msg.glChannel, () => {
+      // An OffscreenCanvas renderer waits on the control word directly. Keep
+      // thousands of synchronous query wake-ups off the page event loop.
+      if (!msg.glChannel.direct) port.post({ kind: 'gl' });
+    }));
   }
   // The Wayland compositor: this process's window into the scene arena the
   // compositor worker draws from. `useWl` sets the flag `gex_set_wl` reads at
@@ -600,6 +604,10 @@ async function handle(msg) {
     // Around `gex.run` alone: everything before it is loading and module
     // compilation, so a codegen A/B measured through the total is a third
     // module size and V8's compiler.
+    // A thread exits through syscall 93 without marking the whole process
+    // exited, so only a process Worker should label an unreachable return as
+    // an abandoned process stack.
+    globalThis.GEX_REPORT_ABANDONED = msg.kind !== 'thread';
     const runStarted = performance.now();
     const status = await gex.run(entry, ctx);
     const guestMillis = Math.round(performance.now() - runStarted);

@@ -21,8 +21,8 @@ const REPLY = 2;
 
 // Must match guest/gl/gexgl.c and web/src/gl.js.
 const HEADER_BYTES = 32;
-const CMD_CAPACITY = 4 * 1024 * 1024;
-const REPLY_CAPACITY = 4 * 1024 * 1024;
+const CMD_CAPACITY = 32 * 1024 * 1024;
+const REPLY_CAPACITY = 32 * 1024 * 1024;
 export const GL_RING_BYTES = HEADER_BYTES + CMD_CAPACITY + REPLY_CAPACITY;
 const H_CAPACITY = 1; // words: magic(0) capacity(1) tail(2) reply_cap(3) reply_len(4)
 const H_TAIL = 2;
@@ -46,21 +46,67 @@ export function serveGl(glDevice, channel) {
   // `GlDevice.submit` wants a `{buffer}` and a ring offset; the ring sits at 0
   // of the shared data buffer, so the buffer *is* the "memory" and 0 the ring.
   const asMemory = { buffer: channel.data };
-  return function serve() {
+  let active = true;
+  // One submit at a time. Two things drive `serve`: the waitAsync loop below
+  // and the function returned to the runtime, which calls it on every
+  // wake-up. A JSPI device suspends inside submit, so the request is still
+  // marked REQUEST while its promise is pending -- and the other driver, not
+  // seeing it, called submit again on the same thread. That re-enters the
+  // wasm module and trips musl's own check: "pthread mutex deadlock
+  // detected". The throw unwinds to the guest as a failed ioctl, which
+  // discards the whole queued batch in silence, and the GL objects created in
+  // it are simply gone. It surfaces far away, as an incomplete framebuffer.
+  let inFlight = null;
+  const serve = function serve() {
+    if (inFlight) return inFlight;
     if (Atomics.load(ctl, STATE) !== REQUEST) return;
-    let result = -1;
+    const finish = (result) => {
+      ctl[RESULT] = result;
+      Atomics.store(ctl, STATE, REPLY);
+      Atomics.notify(ctl, STATE);
+    };
+    let result;
     try {
       result = glDevice.submit(asMemory, 0);
     } catch (e) {
       // A device that throws must still reply, or the Worker blocks forever
       // inside its ioctl.
       console.error('[gl] the device threw', e);
-      result = -1;
+      finish(-1);
+      return;
     }
-    ctl[RESULT] = result;
-    Atomics.store(ctl, STATE, REPLY);
+    if (result instanceof Promise) {
+      inFlight = result.then(finish, (e) => {
+        console.error('[gl] the async device threw', e);
+        finish(-1);
+      }).finally(() => { inFlight = null; });
+      return inFlight;
+    } else {
+      finish(result);
+    }
+  };
+  serve.stop = () => {
+    active = false;
     Atomics.notify(ctl, STATE);
   };
+  // `waitAsync` is legal on the page thread and avoids a posted-message turn
+  // for every synchronous GL query. The renderer still owns the ordinary DOM
+  // canvas here, so WebGPU presentation remains visible and flicker-free.
+  if (typeof Atomics.waitAsync === 'function') {
+    channel.direct = true;
+    (async () => {
+      while (active) {
+        const state = Atomics.load(ctl, STATE);
+        if (state === REQUEST) {
+          await serve();
+          continue;
+        }
+        const waiting = Atomics.waitAsync(ctl, STATE, state, 1000);
+        if (waiting.async) await waiting.value;
+      }
+    })();
+  }
+  return serve;
 }
 
 /** The Worker's half: `submit`, what `Gex.useGl` calls from `gl_submit`. */
@@ -89,6 +135,7 @@ export class GlProxy {
 
     const ctl = this.#ctl;
     Atomics.store(ctl, STATE, REQUEST);
+    Atomics.notify(ctl, STATE);
     this.#wake();
     // A timeout, so a dead page ends the guest rather than wedging its Worker.
     while (Atomics.load(ctl, STATE) === REQUEST) {
@@ -97,6 +144,7 @@ export class GlProxy {
       }
     }
     Atomics.store(ctl, STATE, IDLE);
+    Atomics.notify(ctl, STATE);
 
     // Back: the updated header (tail=0, reply_len, status) then the reply bytes
     // the device wrote into the reply area at HEADER_BYTES + capacity.

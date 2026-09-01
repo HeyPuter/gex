@@ -407,6 +407,11 @@ export async function runProgram(
   // and there is nothing to await with. See `virgl-bridge.js`.
   let channel = null;
   let serve = null;
+  // Which GPU rings this run wired up. A demo that passes `gl` but whose
+  // worker never mounts /dev/gex-gl is otherwise indistinguishable from one
+  // that never asked, and the guest's only symptom is an empty GL_VERSION
+  // much later.
+  console.warn(`[gex] runtime rings: virgl=${!!virgl} gl=${!!gl} wl=${!!wl}`);
   if (virgl) {
     if (!globalThis.crossOriginIsolated) {
       throw new Error(
@@ -437,7 +442,10 @@ export async function runProgram(
     }
     const { makeGlChannel, serveGl } = await import('@gex/gl-bridge.mjs');
     glChannel = makeGlChannel();
-    glServe = serveGl(gl, glChannel);
+    // An OffscreenCanvas renderer consumes the shared ring in its own Worker;
+    // the returned function is then only the cheap wake-up fallback. A
+    // main-thread renderer retains the original page-side service path.
+    glServe = gl.attachChannel?.(glChannel) || serveGl(gl, glChannel);
   }
 
   // The Wayland compositor. The protocol state machine runs in each guest
@@ -540,6 +548,7 @@ export async function runProgram(
       // of the 32-slot span around the miss. An experiment for #136: it says
       // whether the closure has the blocks an exec'd process lifts anyway.
       wholePage: flag('wholepage') ? 1 : undefined,
+      trapPc: flag('trappc') ? Number.parseInt(flag('trappc'), 16) : undefined,
       // Every process gets a memory two Workers can hold, so a `clone` asking
       // for a thread can be given one. `worker.mjs` passes this to the `Gex`
       // constructor as `shared`. A guest's threads are Workers -- the only
@@ -722,6 +731,7 @@ export async function runProgram(
     // The X server owns its Worker's thread for good -- `main` never returns --
     // so ending the run means ending the Worker.
     xServer?.terminate();
+    glServe?.stop?.();
   }
 }
 

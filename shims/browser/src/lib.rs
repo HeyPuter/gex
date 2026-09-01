@@ -2453,16 +2453,22 @@ static FTX_ADDR: [std::sync::atomic::AtomicU64; FTX_RING] =
     [const { std::sync::atomic::AtomicU64::new(0) }; FTX_RING];
 static FTX_RET: [std::sync::atomic::AtomicI64; FTX_RING] =
     [const { std::sync::atomic::AtomicI64::new(0) }; FTX_RING];
+static FTX_PC: [std::sync::atomic::AtomicU64; FTX_RING] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; FTX_RING];
+static FTX_TID: [std::sync::atomic::AtomicI32; FTX_RING] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; FTX_RING];
 static FTX_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// `op` is the raw futex operation, or `!0` for the resumption of a wait
 /// that had parked -- the answer the syscall itself never recorded.
-fn ftx_note(op: u64, addr: u64, ret: i64) {
+fn ftx_note(op: u64, addr: u64, ret: i64, pc: u64, tid: i32) {
     use std::sync::atomic::Ordering::Relaxed;
     let i = FTX_AT.fetch_add(1, Relaxed) % FTX_RING;
     FTX_OP[i].store(op, Relaxed);
     FTX_ADDR[i].store(addr, Relaxed);
     FTX_RET[i].store(ret, Relaxed);
+    FTX_PC[i].store(pc, Relaxed);
+    FTX_TID[i].store(tid, Relaxed);
 }
 
 fn ftx_recent() -> String {
@@ -2470,13 +2476,20 @@ fn ftx_recent() -> String {
     let n = FTX_AT.load(Relaxed);
     let mut out = String::new();
     for j in n.saturating_sub(FTX_RING)..n {
+        // Chromium truncates a long console argument. Keep each physical line
+        // short enough that the worker's line-splitting console wrapper can
+        // preserve the complete ring in a crash report.
+        if j > n.saturating_sub(FTX_RING) && (j - n.saturating_sub(FTX_RING)) % 6 == 0 {
+            out.push_str("\n           ");
+        }
         let i = j % FTX_RING;
         let op = FTX_OP[i].load(Relaxed);
         let (addr, ret) = (FTX_ADDR[i].load(Relaxed), FTX_RET[i].load(Relaxed));
+        let (pc, tid) = (FTX_PC[i].load(Relaxed), FTX_TID[i].load(Relaxed));
         if op == !0 {
-            out.push_str(&format!(" resume({addr:#x})={ret}"));
+            out.push_str(&format!(" t{tid}@{pc:#x} resume({addr:#x})={ret}"));
         } else {
-            out.push_str(&format!(" {addr:#x} op={op:#x} = {ret}"));
+            out.push_str(&format!(" t{tid}@{pc:#x} {addr:#x} op={op:#x}={ret}"));
         }
     }
     out
@@ -5378,6 +5391,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     let stop = with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
+        if ctx as u32 as u64 != kstate.ctx_addr {
+            warn_line(&format!(
+                "[gex] syscall context mismatch at {:#x}: translated ctx={:#x}, worker thread {} ctx={:#x}",
+                pc as u64,
+                ctx as u32,
+                kstate.tid,
+                kstate.ctx_addr,
+            ));
+        }
         h.kernel.enter_thread(&kstate);
         // Rebuilding the proc snapshot costs more than most syscalls, and only
         // a handful can observe it, so the rest skip it.
@@ -5435,6 +5457,39 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let a0 = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         let a1 = gm.read_u64(kstate.ctx_addr + ctx::x(1) as u64).unwrap_or(0);
         let a2 = gm.read_u64(kstate.ctx_addr + ctx::x(2) as u64).unwrap_or(0);
+        if nr == gex_kernel::syscalls::nr::FUTEX {
+            let op = (a1 as u32)
+                & !(gex_kernel::futex::op::PRIVATE_FLAG
+                    | gex_kernel::futex::op::CLOCK_REALTIME);
+            if !matches!(op, 0 | 1 | 3 | 4 | 5 | 9 | 10) {
+                let fp = gm.read_u64(kstate.ctx_addr + ctx::x(29) as u64).unwrap_or(0);
+                let caller = gm.read_u64(fp + 8).unwrap_or(0);
+                let call_insn = gm.read_u32(caller.saturating_sub(4)).unwrap_or(0);
+                let imm26 = ((call_insn & 0x03ff_ffff) as i32) << 6 >> 6;
+                let target = caller
+                    .saturating_sub(4)
+                    .wrapping_add((imm26 as i64 * 4) as u64);
+                let last_target = gm
+                    .read_u64(kstate.ctx_addr + ctx::LAST_TARGET as u64)
+                    .unwrap_or(0);
+                let saved_pc = gm
+                    .read_u64(kstate.ctx_addr + ctx::PC as u64)
+                    .unwrap_or(0);
+                let dir = |addr: u64| {
+                    gm.read_u32(gex_abi::DISPATCH_DIR + gex_abi::dispatch_page(addr) * 4)
+                        .unwrap_or(0)
+                };
+                warn_line(&format!(
+                    "[gex] invalid futex registers at pc={:#x}, translated ctx={:#x}, worker ctx={:#x}: x0={a0:#x} x1={a1:#x} x2={a2:#x}; saved-pc={saved_pc:#x} last-target={last_target:#x}; caller={caller:#x} call={call_insn:#x}->{target:#x}, mem[target]={:#x}, dirs target={:#x} libc={:#x}",
+                    pc as u64,
+                    ctx as u32,
+                    kstate.ctx_addr,
+                    gm.read_u32(target).unwrap_or(0),
+                    dir(target),
+                    dir(pc as u64),
+                ));
+            }
+        }
         let slot = sys_note(nr, a0, a1);
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
         let ret = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
@@ -5502,7 +5557,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // unexpected futex error code with no clue which call or code, and the
         // ring cannot say (a blocked call has not written `x0` when recorded).
         if nr == 98 {
-            ftx_note(a1, a0, ret as i64);
+            ftx_note(a1, a0, ret as i64, pc as u64, kstate.tid);
         }
         // What the guest was trying to say when it could not: glibc writes a
         // fatal diagnostic to fd 2 then aborts, so a stderr write that does not
@@ -8311,7 +8366,15 @@ fn schedule() -> i32 {
             let i = cur();
             if thread_ready(&h.threads[i], now, sig) {
                 let timed_out = match &h.threads[i].waiting {
-                    Waiting::Futex { parked, .. } => !parked.woken(),
+                    // A cross-Worker FUTEX_WAKE advances the shared generation
+                    // without touching this Worker's local `Parked` queue. It
+                    // is still a wake, not a timeout. The old `!parked.woken()`
+                    // test therefore handed ETIMEDOUT to every such untimed
+                    // glibc lock wait, which glibc correctly treats as a fatal
+                    // futex result. Only an expired deadline is a timeout.
+                    Waiting::Futex { deadline, .. } => {
+                        deadline.is_some_and(|at| now >= at)
+                    }
                     _ => false,
                 };
                 // Woken by the signal and not by the wait: ask the same
@@ -8520,16 +8583,21 @@ fn schedule() -> i32 {
             set_current(h, i);
             let t = &mut h.threads[i];
             let was_futex = matches!(t.waiting, Waiting::Futex { .. });
+            let ctx_addr = t.kstate.ctx_addr;
             t.waiting = Waiting::Runnable;
             let op = t.blocked_on.take();
-            // A futex thread arriving with nothing to finish is resumed with no
-            // return value, so the guest reads the stale `x0` (`uaddr`) and
-            // glibc calls `futex_fatal_error` on the unrecognised errno.
+            // A futex thread arriving with nothing to finish must still receive
+            // a legal result. Linux permits spurious futex wakes, and zero is
+            // exactly that result; leaving x0 untouched hands glibc the uaddr
+            // as an errno and makes it call futex_fatal_error.
             if was_futex && op.is_none() {
                 warn_line(&format!(
-                    "[gex] pid {} resumed thread {i} from a futex with no result to write",
+                    "[gex] pid {} recovered a spurious futex wake for thread {i}",
                     h.kernel.pid,
                 ));
+                let mut gm = GuestMem::new(guest_bytes());
+                let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
+                ftx_note(!0, 0, 0, t.pc, t.kstate.tid);
             }
             let (mut pc, kstate) = (t.pc, t.kstate.clone());
             if let Some(op) = op {
@@ -8550,6 +8618,8 @@ fn schedule() -> i32 {
                             Ok(v) => *v as i64,
                             Err(e) => -(e.0 as i64),
                         },
+                        t.pc,
+                        t.kstate.tid,
                     );
                 }
                 let outcome = h.kernel.finish_blocking(&mut gm, r);
@@ -8951,8 +9021,8 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             HITS = HITS.wrapping_add(1);
             HITS
         };
-        if n <= 24 {
-            let line = with_host(|h| {
+        {
+            let (line, unusual) = with_host(|h| {
                 let gm = GuestMem::new(guest_bytes());
                 let c = h.threads[cur()].kstate.ctx_addr;
                 let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
@@ -8966,7 +9036,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
                         .find(|v| a >= v.start && a < v.end)
                         .map_or(String::new(), |v| format!("{} +{:#x}", v.name, a - v.start))
                 };
-                format!(
+                (format!(
                     "gex: TRAP_PC #{n} tid={} at pc={:#x}: x30={x30:#x} ({}) sp={sp:#x} \
                      x0={:#x} x1={:#x} x19={:#x} x20={:#x}\n",
                     h.threads[cur()].kstate.tid,
@@ -8976,9 +9046,15 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
                     r(1),
                     r(19),
                     r(20),
-                )
+                ), r(1) > 0xff)
             });
-            warn_line(&line);
+            // The first hits establish the normal call shape. Keep reporting
+            // a wildly non-ABI-looking x1 afterward: that is precisely how a
+            // wrong function target hides behind thousands of valid lock
+            // entries before the one malformed call.
+            if n <= 24 || unusual {
+                warn_line(&line);
+            }
         }
         return;
     }
@@ -10652,6 +10728,22 @@ pub extern "C" fn gex_current_pc() -> i64 {
     .unwrap_or(0)
 }
 
+/// Link register at the same crash-safe context snapshot as `gex_current_pc`.
+/// An indirect-branch trap leaves PC equal to the bad target; LR identifies
+/// the call site that supplied it and is therefore the actionable address.
+#[no_mangle]
+pub extern "C" fn gex_current_lr() -> i64 {
+    let read = |at: u64| {
+        let gm = GuestMem::new(guest_bytes());
+        gm.read_u64(at + 30 * 8).unwrap_or(0) as i64
+    };
+    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    if at != 0 {
+        return read(at);
+    }
+    with_host_free(|h| h.threads.get(cur()).map_or(0, |t| read(t.kstate.ctx_addr))).unwrap_or(0)
+}
+
 /// Which mapped object an address belongs to, written into `out` as bytes.
 /// Returns the length, or zero when nothing is mapped there.
 #[no_mangle]
@@ -11017,6 +11109,7 @@ pub extern "C" fn gex_dump_state() {
             ("x1", r(1)),
             ("x16", r(16)),
             ("x17", r(17)),
+            ("x30", r(30)),
         ] {
             warn_line(&format!("gex:   {name}={a:#x} in {}\n", where_is(a)));
         }

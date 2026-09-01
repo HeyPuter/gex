@@ -3,8 +3,9 @@
 // The guest runs Debian's own Mesa with its Gallium `virgl` driver, which
 // speaks the vtest protocol over a UNIX socket. `shims/browser/src/virgl.rs`
 // serves that socket and hands the bytes here; here hands them to
-// virglrenderer (compiled to wasm by `web/build-virgl-wasm.sh`, pointed at a
-// WebGL 2 context). It is a second module -- a copy in, a copy out, the canvas
+// virglrenderer compiled to wasm. The default build targets WebGL 2; the
+// compatibility build routes its desktop GL calls through MobileGL to WebGPU.
+// It is a second module -- a copy in, a copy out, the canvas
 // -- so virglrenderer allocates in its own heap and never in the guest's
 // address space, which the shim shares to read syscall buffers directly.
 
@@ -27,8 +28,33 @@ async function loadGlue(url) {
   }
 }
 
+async function webGpuDeviceFor(url) {
+  if (!url.includes('webgpu')) return null;
+  if (!navigator.gpu) throw new Error('this browser does not expose WebGPU');
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) throw new Error('WebGPU did not provide an adapter');
+  const optional = [
+    'rg11b10ufloat-renderable',
+    'float32-filterable',
+    'texture-compression-bc',
+  ]
+    .filter((feature) => adapter.features.has(feature));
+  const requiredLimits = {};
+  // WebGPU's portable default is only 32 bytes/sample across all color
+  // attachments. Desktop GL exposes eight render targets, and MobileGL must
+  // sometimes materialize all of them for a shader even when the application
+  // routes some outputs to GL_NONE. Ask for the adapter's advertised budget
+  // instead of silently accepting the smaller default device limit.
+  if (adapter.limits.maxColorAttachmentBytesPerSample > 32) {
+    requiredLimits.maxColorAttachmentBytesPerSample =
+      adapter.limits.maxColorAttachmentBytesPerSample;
+  }
+  return adapter.requestDevice({ requiredFeatures: optional, requiredLimits });
+}
+
 export class VirglRenderer {
   #module = null;
+  #pump = null;
   #worker = null;
   #stats = null;
   #canvas = null;
@@ -62,6 +88,7 @@ export class VirglRenderer {
       return r;
     }
     try {
+      const webGpuDevice = await webGpuDeviceFor(url);
       const Module = await loadGlue(url);
       r.#module = await Module({
         // Where the renderer's own wasm is, said rather than inferred. The
@@ -72,7 +99,13 @@ export class VirglRenderer {
         // return value beyond "no", so this is the only diagnostic there is.
         printErr: (s) => (onLog ? onLog(s) : console.warn('[virgl]', s)),
         print: (s) => (onLog ? onLog(s) : console.log('[virgl]', s)),
+        dumpWgsl: globalThis.__gexDumpWgsl ||
+          Number(new URLSearchParams(location.search).get('dumpwgsl')) || 0,
+        ...(webGpuDevice ? { preinitializedWebGPUDevice: webGpuDevice } : {}),
       });
+      r.#pump = webGpuDevice
+        ? WebAssembly.promising(r.#module._gex_virgl_pump)
+        : r.#module._gex_virgl_pump;
       const offscreen =
         typeof OffscreenCanvas === 'function' && canvas instanceof OffscreenCanvas;
       const rc = r.#module._gex_virgl_init(canvas.width, canvas.height, offscreen ? 1 : 0);
@@ -115,7 +148,13 @@ export class VirglRenderer {
       });
     });
     const offscreen = canvas.transferControlToOffscreen();
-    worker.postMessage({ kind: 'init', canvas: offscreen, url, stats: this.#stats.buffer }, [offscreen]);
+    worker.postMessage({
+      kind: 'init',
+      canvas: offscreen,
+      url,
+      stats: this.#stats.buffer,
+      dumpWgsl: Number(new URLSearchParams(location.search).get('dumpwgsl')) || 0,
+    }, [offscreen]);
     try {
       await ready;
     } catch (e) {
@@ -213,14 +252,17 @@ export class VirglRenderer {
     this.#module.HEAPU8.set(new Uint8Array(shimMemory.buffer, ptr, len), buf);
     this.#module._gex_virgl_feed(session, buf, len);
     this.#module._free(buf);
-    const ran = this.#module._gex_virgl_pump(session);
-    // A refusal ends the connection: a stream protocol cannot resynchronise
-    // after a command of unknown length.
-    if (ran < 0) {
-      this.#failed = 'the renderer refused the stream';
-      return -1;
-    }
-    return this.#module._gex_virgl_pending(session);
+    const finish = (ran) => {
+      // A refusal ends the connection: a stream protocol cannot resynchronise
+      // after a command of unknown length.
+      if (ran < 0) {
+        this.#failed = 'the renderer refused the stream';
+        return -1;
+      }
+      return this.#module._gex_virgl_pending(session);
+    };
+    const ran = this.#pump(session);
+    return ran instanceof Promise ? ran.then(finish) : finish(ran);
   }
 
   /** Copy up to `max` reply bytes to `ptr` in the shim's memory. */
