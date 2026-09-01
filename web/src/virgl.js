@@ -65,6 +65,9 @@ export class VirglRenderer {
   #channelId = 0;
   #requestId = 0;
   #pending = new Map();
+  #directSessions = 0;
+  /** How far an in-context client has read into each session's reply. */
+  #directRead = new Map();
 
   /**
    * @param {HTMLCanvasElement} canvas the drawing surface
@@ -73,13 +76,14 @@ export class VirglRenderer {
    *   the console default is dropped under load in a headless browser, so a
    *   harness with its own channel should pass one.
    */
-  static async create(canvas, url = '/gex/gexvirgl.mjs', onLog = null) {
+  static async create(canvas, url = '/gex/gexvirgl.mjs', onLog = null, opts = {}) {
     const r = new VirglRenderer();
     r.#canvas = canvas;
     // virglrenderer looks the canvas up by selector, so it has to carry the
     // id the module asks for.
     canvas.id = 'gex-gl';
     if (
+      !opts.inProcess &&
       typeof Worker === 'function' &&
       typeof canvas.transferControlToOffscreen === 'function' &&
       typeof SharedArrayBuffer === 'function'
@@ -279,6 +283,68 @@ export class VirglRenderer {
     // All or nothing: the shim always asks for everything waiting, and a
     // partial drain would leave the rest to be re-sent on top of itself.
     this.#module._gex_virgl_drain(session);
+    return n;
+  }
+
+  /* -- a client in this same context -------------------------------------
+   *
+   * `submit`/`take` above are for the guest: they read and write the shim's
+   * memory, because the client is a Worker away. Host Mesa's vtest winsys is
+   * not -- it is a module beside this one -- so it is handed views instead,
+   * and the session it opens is one this renderer never sees a socket for.
+   */
+
+  /** A session id for a client in this context. */
+  openSession() {
+    if (!this.ok || this.#worker) return -1;
+    return ++this.#directSessions;
+  }
+
+  /** Feed one write's worth of command stream. Returns what was taken. */
+  feed(session, bytes) {
+    if (!this.ok || this.#worker) return -1;
+    const buf = this.#module._malloc(bytes.length);
+    this.#module.HEAPU8.set(bytes, buf);
+    this.#module._gex_virgl_feed(session, buf, bytes.length);
+    this.#module._free(buf);
+    const ran = this.#pump(session);
+    // Only the WebGL renderer runs in process, and its pump is synchronous.
+    // A promise here would mean a reply the winsys cannot wait for, so it is
+    // an error rather than something to paper over.
+    if (ran instanceof Promise) {
+      this.#failed = 'an in-process renderer must not pump asynchronously';
+      return -1;
+    }
+    return ran < 0 ? -1 : bytes.length;
+  }
+
+  /** How many reply bytes are waiting for an in-context client. */
+  pending(session) {
+    if (!this.ok || this.#worker) return -1;
+    return this.#module._gex_virgl_pending(session);
+  }
+
+  /** Copy the next of the reply into `out`, and say how much that was.
+   *
+   * Not all of it: this client reads a header and then a body, eight bytes at
+   * a time, where the guest's shim asks for everything waiting at once. So the
+   * cursor is kept here and the renderer's buffer is only drained when it has
+   * been read to the end -- a drain after a partial read discards the rest of
+   * the answer, which the protocol has no way to ask for again. */
+  drainInto(session, out) {
+    if (!this.ok || this.#worker) return -1;
+    const have = this.#module._gex_virgl_pending(session);
+    const at = this.#directRead.get(session) || 0;
+    const n = Math.min(have - at, out.length);
+    if (n <= 0) return 0;
+    const from = this.#module._gex_virgl_replies(session) + at;
+    out.set(this.#module.HEAPU8.subarray(from, from + n), 0);
+    if (at + n >= have) {
+      this.#module._gex_virgl_drain(session);
+      this.#directRead.set(session, 0);
+    } else {
+      this.#directRead.set(session, at + n);
+    }
     return n;
   }
 

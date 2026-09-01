@@ -388,6 +388,24 @@ async function bootDebian(ctx) {
   }
 }
 
+/** Which Gallium driver a Mesa device should run on, and where its module is.
+ *
+ * `virgl` is Mesa's own encoder decoded by virglrenderer on WebGL -- the path
+ * the guest used to run for itself, and the one that draws these applications
+ * correctly today. `wgpu` is st/mesa on the gex_wgpu driver, which is where
+ * this is going. `?glbackend=` picks.
+ */
+function mesaBackend(query, api) {
+  const driver = query.get('glbackend') || 'virgl';
+  return {
+    backend: driver,
+    url: driver === 'virgl' ? '/gex/gex-virgl-replay.js' : '/gex/gex-wgpu-replay.js',
+    api: query.get('glapi') || api,
+    major: Number(query.get('glmajor') || 0),
+    minor: Number(query.get('glminor') || 0),
+  };
+}
+
 // -- 4: the gears ---------------------------------------------------------
 
 const gears = {
@@ -420,21 +438,15 @@ const gears = {
 
     let gl;
     if (mesaWebGpu) {
-      gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(canvas, {
-        api: query.get('glapi') || 'es',
-        major: Number(query.get('glmajor') || 0),
-        minor: Number(query.get('glminor') || 0),
-      });
+      gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(
+        canvas, mesaBackend(query, 'es'));
     } else if (directWebGpu) {
       // This used to be an unconditional MobileGL construction, so a demo
       // marked directGl ran the broken backend with nothing said about it.
       console.warn('[gex] MobileGL was requested and ignored: it is disabled ' +
                    'with no override. Running Mesa instead.');
-      gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(canvas, {
-        api: query.get('glapi') || 'es',
-        major: Number(query.get('glmajor') || 0),
-        minor: Number(query.get('glminor') || 0),
-      });
+      gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(
+        canvas, mesaBackend(query, 'es'));
     } else {
       gl = new GlDevice(canvas);
     }
@@ -1445,13 +1457,14 @@ async function createDirectGlDevice(canvas, backend = null) {
                  'with no override. Running Mesa instead.');
   }
   const { MesaGlDevice } = await import('./mesa-gl.js');
+  // Which Gallium driver Mesa runs on. `virgl` is the default because it is
+  // the path that already draws these applications correctly and quickly:
+  // Mesa's own virgl encoder, decoded by virglrenderer on WebGL, which is
+  // what the guest used to do for itself. `?glbackend=wgpu` selects the
+  // WebGPU driver instead -- where this is going, and still being brought up.
   // Desktop core by default here: a real GL application asks for a core
   // profile, unlike the ES demos that share this path.
-  return MesaGlDevice.create(canvas, {
-    api: query.get('glapi') || 'core',
-    major: Number(query.get('glmajor') || 0),
-    minor: Number(query.get('glminor') || 0),
-  });
+  return MesaGlDevice.create(canvas, mesaBackend(query, 'core'));
 }
 
 const stkProfileSeconds = stkProfileValue === 1 ? 5 : Math.floor(stkProfileValue);

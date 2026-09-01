@@ -35,6 +35,19 @@ extern "C" const char *gex_wgpu_declined_last_why;
 
 #include "gex_wgpu/gex_wgpu_public.h"
 extern "C" WGPUDevice emscripten_webgpu_get_device(void);
+#elif defined(GEX_MESA_VIRGL)
+/* The same Mesa frontend again, on the driver that has always drawn these
+ * pixels: Gallium's virgl encoder, with virglrenderer decoding it on the
+ * page's WebGL. The guest used to run this half itself; the only thing that
+ * moved is where the encoder runs. */
+#include "sw/null/null_sw_winsys.h"
+/* Neither of these carries an `extern "C"` of its own, and this decoder is
+ * C++: without the guard the linker looks for mangled names Mesa never
+ * defined. */
+extern "C" {
+#include "virgl/virgl_public.h"
+#include "virgl_vtest_public.h"
+}
 #else
 #include "softpipe/sp_public.h"
 #include "sw/null/null_sw_winsys.h"
@@ -655,12 +668,47 @@ void report_version_gap() {
             missing, have / 10, have % 10, next / 10, next % 10);
 }
 
+/* The depth/stencil format the driver under us will actually take.
+ *
+ * This used to name one -- Z24_UNORM_S8_UINT -- which softpipe and gex_wgpu
+ * both accept and virglrenderer does not: its format table only carries the
+ * other byte order, so every drawable failed to allocate and every command
+ * buffer after it was refused. Which of the two a driver has is a driver's
+ * business, so ask rather than assume; the order here is preference, and the
+ * fallback is what the code said before.
+ */
+static enum pipe_format depth_stencil_for(struct pipe_screen *screen)
+{
+    static const enum pipe_format wanted[] = {
+        PIPE_FORMAT_Z24_UNORM_S8_UINT,
+        PIPE_FORMAT_S8_UINT_Z24_UNORM,
+        PIPE_FORMAT_Z32_FLOAT_S8X24_UINT,
+    };
+    if (screen) {
+        for (unsigned i = 0; i < sizeof wanted / sizeof *wanted; i++) {
+            if (screen->is_format_supported(screen, wanted[i], PIPE_TEXTURE_2D, 1, 1,
+                                            PIPE_BIND_DEPTH_STENCIL))
+                return wanted[i];
+        }
+    }
+    return PIPE_FORMAT_Z24_UNORM_S8_UINT;
+}
+
 int initialize_backend(int width, int height) {
 #if defined(GEX_MESA_WGPU)
     /* The page owns the device; the screen only retains its queue. */
     WGPUDevice device = emscripten_webgpu_get_device();
     if (!device) return -1;
     mesa_frontend_screen.screen = gex_wgpu_screen_create(device);
+#elif defined(GEX_MESA_VIRGL)
+    /* The sw_winsys is what a Gallium screen presents *through*, and this one
+     * displays nothing: virglrenderer already blits the resource it just drew
+     * into onto its own canvas, exactly as it does for a guest. */
+    mesa_winsys = null_sw_create();
+    if (!mesa_winsys) return -1;
+    struct virgl_winsys *vws = virgl_vtest_winsys_wrap(mesa_winsys);
+    if (!vws) return -3;
+    mesa_frontend_screen.screen = virgl_create_screen(vws, NULL);
 #else
     mesa_winsys = null_sw_create();
     if (!mesa_winsys) return -1;
@@ -681,7 +729,7 @@ int initialize_backend(int width, int height) {
                          ST_ATTACHMENT_BACK_LEFT_MASK |
                          ST_ATTACHMENT_DEPTH_STENCIL_MASK;
     visual.color_format = PIPE_FORMAT_R8G8B8A8_UNORM;
-    visual.depth_stencil_format = PIPE_FORMAT_Z24_UNORM_S8_UINT;
+    visual.depth_stencil_format = depth_stencil_for(mesa_frontend_screen.screen);
     visual.accum_format = PIPE_FORMAT_NONE;
     visual.samples = 0;
 
@@ -714,7 +762,7 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
                          ST_ATTACHMENT_BACK_LEFT_MASK |
                          ST_ATTACHMENT_DEPTH_STENCIL_MASK;
     visual.color_format = PIPE_FORMAT_R8G8B8A8_UNORM;
-    visual.depth_stencil_format = PIPE_FORMAT_Z24_UNORM_S8_UINT;
+    visual.depth_stencil_format = depth_stencil_for(mesa_frontend_screen.screen);
     visual.accum_format = PIPE_FORMAT_NONE;
     visual.samples = 0;
 
