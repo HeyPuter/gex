@@ -51,7 +51,7 @@ if [ "${GEX_ARCH:-}" = "x86" ]; then
     CC="${GEX_CC:-$(command -v gcc)}"
     GEXC="${GEXC:-$HERE/../target/x86/release/gexc}"
 else
-    MA=${MA}
+    MA=aarch64-linux-gnu
     LDSO=ld-linux-aarch64.so.1
     OUT="${1:-$HERE/public/rootfs/graphics.tar}"
     SRC="${2:-/tmp/gex-x/root}"
@@ -506,6 +506,12 @@ install_paths "$WORK/closure"
 for m in "$HERE"/rootfs-manifests/*-delta.txt; do
     [ -f "$m" ] || continue
     echo "  $(basename "$m"):"
+    # The manifests were traced on the arm64 image and name its multiarch
+    # directory; the x86-64 image wants the same files under its own.
+    if [ "$MA" != "aarch64-linux-gnu" ]; then
+        sed "s|/aarch64-linux-gnu/|/${MA}/|g" "$m" > "$WORK/$(basename "$m")"
+        m="$WORK/$(basename "$m")"
+    fi
     install_paths "$m"
 done
 
