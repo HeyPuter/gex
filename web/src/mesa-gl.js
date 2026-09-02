@@ -88,6 +88,10 @@ export class MesaGlDevice {
   /** The virglrenderer this Mesa encodes for, when that is the backend. */
   #renderer = null;
   #failed = null;
+  /** Batches this device refused, and the last of them: a client's own
+   *  problem, kept where a page can see it. */
+  #rejects = 0;
+  #lastReject = '';
   #description = '';
   #submits = 0;
   #bytes = 0;
@@ -343,10 +347,24 @@ export class MesaGlDevice {
       if (elapsed > this.#maxSubmitMs) this.#maxSubmitMs = elapsed;
       this.#module._free(ptr);
       if (rc !== 0) {
-        // Decoder failure is terminal: a command may have executed a valid
-        // prefix before its malformed tail was found, so neither the reply nor
-        // this GL context is safe to reuse.
-        this.#failed = `Mesa/WebGPU decoder rejected a batch (${rc})`;
+        // Terminal for that *client*: a command may have executed a valid
+        // prefix before its malformed tail was found, so neither the reply
+        // nor that client's GL context is safe to reuse -- and the guest
+        // latches on the failed ioctl by itself.
+        //
+        // Not terminal for the device, which is the difference several
+        // clients make. Marking the device failed here stopped every other
+        // client's OpenGL as well: one program with one bad batch took the
+        // compositor's whole GL path with it, and the client that lost its
+        // window was usually not the one at fault.
+        this.#rejects++;
+        const m = this.#module;
+        const why = ['', 'short read', 'trailing data', 'unknown opcode',
+                     'no context'][m._gex_gl_reject_why?.() ?? 0] || 'refused';
+        this.#lastReject = `client ${client} batch rejected (${rc}): opcode `
+          + `${m._gex_gl_reject_op?.() ?? '?'} ${why}, payload `
+          + `${m._gex_gl_reject_payload?.() ?? '?'}`;
+        console.error(`[mesa-gl] ${this.#lastReject}`);
         words[H_STATUS] = error.BAD_OPCODE;
         words[H_REPLY_LEN] = 0;
         words[H_TAIL] = 0;
@@ -536,7 +554,8 @@ export class MesaGlDevice {
   // backend did.
   glState() {
     if (!this.ok) return this.#failed ?? '';
-    return `presented=${this.presentedCount()} produced=${this.producedCount()} ` +
+    return (this.#rejects ? `rejects=${this.#rejects} (${this.#lastReject}) ` : '') +
+      `presented=${this.presentedCount()} produced=${this.producedCount()} ` +
       `mesa=1 submits=${this.#submits} bytes=${this.#bytes} ` +
       `submit_ms=${this.#submitMs.toFixed(1)} ` +
       `avg_ms=${(this.#submitMs / Math.max(1, this.#submits)).toFixed(3)} ` +

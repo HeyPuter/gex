@@ -524,6 +524,18 @@ unsigned attached_kind = 0;
 unsigned attached_id = 0;
 unsigned attached_token = 0;
 unsigned attached_generation = 0;
+/* The last batch this device refused, for whoever asks: which opcode, why
+ * (1 short read, 2 trailing data, 3 unknown), how big its payload was, and
+ * whose it was. */
+uint32_t last_reject_op = 0;
+uint32_t last_reject_why = 0;
+uint32_t last_reject_payload = 0;
+uint32_t last_reject_client = 0;
+/* Set when a command has already said *why* it refused, so the dispatcher's
+ * generic report does not overwrite it with "unhandled opcode" -- which is
+ * how a context that could not be created described itself for one confusing
+ * afternoon. */
+bool last_reject_detailed = false;
 
 /* Everything above that belongs to one *client* rather than to the device.
  *
@@ -1130,22 +1142,27 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
      * ones that turn up later: a window created after the context is a
      * surface of its own now. */
     backend_visual = visual;
-    /* Whatever surface the guest has already named, or the default one. The
-     * two commands can arrive in either order -- a GLX program attaches its
-     * window inside glXMakeCurrent, just before the context is made -- so
-     * this must not overwrite a table that already has entries in it. */
-    sur = nullptr;
-    if (!use_surface(current_surface)) return -9;
-    /* Built by `surface_for` before the visual was known, in the order the
-     * guest happened to name things: give it this one. */
-    sur->drawable.visual = visual;
-    sur->drawable.width = backend_width > 0 ? (unsigned)backend_width : 1;
-    sur->drawable.height = backend_height > 0 ? (unsigned)backend_height : 1;
-    ++sur->drawable.base.stamp;
+    /* And the ones that turned up *before* it. The two commands arrive in
+     * either order -- a GLX program attaches its window inside
+     * glXMakeCurrent, just before the context is made -- so a surface can
+     * already exist with no visual at all, and a context made current
+     * against a drawable with no colour format simply fails. That is what
+     * -9 was: a window attached first, and glxgears with no context. */
+    for (auto& entry : surfaces) {
+        gex_drawable& drawable = entry.second.drawable;
+        if (drawable.visual.color_format != PIPE_FORMAT_NONE) continue;
+        drawable.visual = visual;
+        drawable.width = backend_width > 0 ? (unsigned)backend_width : 1;
+        drawable.height = backend_height > 0 ? (unsigned)backend_height : 1;
+        ++drawable.base.stamp;
+    }
 
-    if (!st_api_make_current(mesa_context, &sur->drawable.base,
-                             &sur->drawable.base))
+    gex_surface* into = surface_for(current_surface);
+    sur = into;
+    if (!st_api_make_current(mesa_context, &into->drawable.base,
+                             &into->drawable.base))
         return -9;
+    note_surface_to_backend(into->uid);
 #if defined(GEX_MESA_WGPU)
     report_version_gap();
 #endif
@@ -1661,9 +1678,25 @@ bool one(uint32_t op, Reader& a) {
 #if defined(GEX_MESA_WASM)
         /* Both Mesa backends -- softpipe and gex_wgpu -- make their context
          * here, now that the guest has said what it is for. */
-        if (create_backend_context(requested_api, requested_major,
-                                   requested_minor, requested_profile) != 0)
-            return false;
+        {
+            const int made = create_backend_context(requested_api, requested_major,
+                                                    requested_minor, requested_profile);
+            if (made != 0) {
+                /* Recorded as itself rather than left to be reported as an
+                 * unhandled opcode, which is what a false return from here
+                 * looks like from outside: "opcode 1, unknown opcode" for a
+                 * context that could not be created is a diagnosis that
+                 * sends the reader to the wrong place entirely. */
+                last_reject_op = op;
+                last_reject_why = 4;
+                last_reject_payload = (uint32_t)(-made);
+                last_reject_client = current_client;
+                last_reject_detailed = true;
+                fprintf(stderr, "gexgl: client %u has no context: %d\n",
+                        current_client, made);
+                return false;
+            }
+        }
 #else
         (void)requested_api;
         (void)requested_major;
@@ -2556,16 +2589,27 @@ EMSCRIPTEN_KEEPALIVE int gex_gl_submit(const uint8_t* data, uint32_t len,
                -2 says a batch was rejected and the caller then latches, so the
                application stops dead with no indication of what it asked for
                -- and the opcode is the whole diagnosis. */
+            /* Kept, not only printed: a page reads this back and says it
+             * where the failure is visible, which stderr in a worker is
+             * not. One rejected batch is a client that stops dead, and the
+             * opcode is the whole diagnosis. */
+            if (!last_reject_detailed) {
+                last_reject_op = op;
+                last_reject_why = !args.ok ? 1 : args.p != args.end ? 2 : 3;
+                last_reject_payload = size - 8;
+                last_reject_client = current_client;
+            }
+            last_reject_detailed = false;
             static bool said;
             if (!said) {
                 said = true;
                 std::fprintf(stderr,
                              "gexgl: batch rejected at opcode %u (%s) "
-                             "payload=%u\n", op,
+                             "payload=%u client=%u\n", op,
                              !args.ok ? "short read"
                              : args.p != args.end ? "trailing data"
                              : "unhandled opcode",
-                             size - 8);
+                             size - 8, current_client);
             }
             return -2;
         }
@@ -2704,6 +2748,12 @@ EMSCRIPTEN_KEEPALIVE void gex_gl_forget_client(uint32_t client) {
     clients.erase(client);
 }
 #endif
+
+/* Why the last batch was refused: see `last_reject_op`. */
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_reject_op() { return last_reject_op; }
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_reject_why() { return last_reject_why; }
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_reject_payload() { return last_reject_payload; }
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_reject_client() { return last_reject_client; }
 
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_kind() { return attached_kind; }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_id() { return attached_id; }
