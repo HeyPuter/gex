@@ -126,6 +126,10 @@ libtasn1.so.6 libthai.so.0 libtiff.so.6 libudev.so.1 libunistring.so.2
 libwebp.so.7 libXaw7.so.7 libxcb-render.so.0 libxcb-shape.so.0
 libXcomposite.so.1 libXcursor.so.1 libXdamage.so.1 libXrandr.so.2
 "
+# The x86-64 swrast_dri.so links libdrm_intel as well (the aarch64 build has
+# no Intel DRM); without it the X servers have no software GL renderer and
+# glxgears gets "couldn't get an RGB, Double-buffered visual".
+[ "${GEX_ARCH:-}" = x86 ] && LIBS="$LIBS libdrm_intel.so.1"
 # The GTK3 stack is in the image, and so are Qt 5, Qt 6 and KF5 -- but their
 # libraries are not listed here. Hand-listing SONAMEs stopped scaling at the
 # first toolkit; the closure pass further down takes them from the programs

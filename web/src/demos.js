@@ -712,8 +712,10 @@ const WL_TOOLKIT_ENV = {
 };
 
 const WL_APPS = [
-  { id: 'glxgears', label: 'glxgears — OpenGL via virgl (Xwayland)', mode: 'x', client: `glxgears.${multiarch()} -info` },
-  { id: 'es2gears', label: 'es2gears — OpenGL ES, native Wayland', mode: 'gl', client: `/usr/bin/es2gears_wayland.${multiarch()}` },
+  // Functions, not strings: `multiarch()` depends on `?arch=`, which is parsed
+  // after this module is evaluated, so the name is chosen when the app runs.
+  { id: 'glxgears', label: 'glxgears — OpenGL via virgl (Xwayland)', mode: 'x', client: () => `glxgears.${multiarch()} -info` },
+  { id: 'es2gears', label: 'es2gears — OpenGL ES, native Wayland', mode: 'gl', client: () => `/usr/bin/es2gears_wayland.${multiarch()}` },
   { id: 'gtk3-demo', label: 'GTK 3 — Demo', mode: 'shm', client: 'gtk3-demo', env: WL_TOOLKIT_ENV.gtk },
   { id: 'gtk3-widget-factory', label: 'GTK 3 — Widget Factory', mode: 'shm', client: 'gtk3-widget-factory', env: WL_TOOLKIT_ENV.gtk },
   { id: 'qt6ct', label: 'Qt 6 — Configuration Tool', mode: 'shm', client: 'qt6ct', env: WL_TOOLKIT_ENV.qt6 },
@@ -969,7 +971,7 @@ const waylandGears = {
         // `app.client` already resolves `?wlclient=` (via `pickInitialApp`, or
         // `demo.client` below); a per-action `runOptions.client` (the
         // SuperTuxKart "Play" preset) is the only extra override.
-        const client = runOptions.client || app.client;
+        const client = runOptions.client || (typeof app.client === 'function' ? app.client() : app.client);
         const run =
           `echo "gex: running ${client}"\n` +
           `${runClient(client)} 2>&1\n` +
