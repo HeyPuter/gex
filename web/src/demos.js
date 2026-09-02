@@ -1595,23 +1595,23 @@ const SESSION_APPS = [
     cmd: 'dolphin --new-window /root',
     env: WL_TOOLKIT_ENV.qt5 + 'export XDG_CONFIG_HOME=/root/.config\n',
   },
-  { id: 'xeyes', label: 'xeyes — X11 through rootless Xwayland', kind: 'x', cmd: 'xeyes' },
-  { id: 'xclock', label: 'xclock — X11 through rootless Xwayland', kind: 'x', cmd: 'xclock' },
+  { id: 'xeyes', label: 'xeyes — X11, on the X server in this page', kind: 'x', cmd: 'xeyes' },
+  { id: 'xclock', label: 'xclock — X11, on the X server in this page', kind: 'x', cmd: 'xclock' },
   {
     id: 'xterm',
-    label: 'xterm — a terminal, X11 through rootless Xwayland',
+    label: 'xterm — a terminal, on the X server in this page',
     kind: 'x',
     // With a script rather than bare: xterm with no `-e` looks for a shell in
     // the password file, and this image has no entry to find.
     cmd: 'xterm -e /bin/sh /usr/bin/shell.sh',
     on: true,
   },
-  { id: 'xcalc', label: 'xcalc — X11 through rootless Xwayland', kind: 'x', cmd: 'xcalc' },
+  { id: 'xcalc', label: 'xcalc — X11, on the X server in this page', kind: 'x', cmd: 'xcalc' },
   {
     id: 'glxgears',
     // OpenGL, so it needs the marshaller on its path: see `directGl`.
     gl: true,
-    label: 'glxgears — OpenGL, Mesa → virgl, under Xwayland',
+    label: 'glxgears — OpenGL, marshalled to Mesa on the host',
     kind: 'x',
     cmd: 'glxgears.aarch64-linux-gnu',
     on: true,
@@ -1620,7 +1620,7 @@ const SESSION_APPS = [
     id: 'glmark2',
     // OpenGL, so it needs the marshaller on its path: see `directGl`.
     gl: true,
-    label: 'glmark2 — a real GL benchmark, under Xwayland',
+    label: 'glmark2 — a real GL benchmark, on the host\'s Mesa',
     kind: 'x',
     cmd: 'glmark2 --size 480x320',
   },
@@ -1752,7 +1752,9 @@ function domDecorations(root, ctx) {
   let cascade = 0;
   // The desktop is created by the runtime when the run starts; poll for it
   // rather than plumb a callback through, since a page would normally be
-  // holding the object it made itself.
+  // holding the object it made itself. The caller is handed a way to stop
+  // waiting, because choosing the other compositor while this one is still
+  // looking would leave two of these running.
   const wait = setInterval(() => {
     const desk = globalThis.__gexDesktop;
     if (!desk || desk.onwindow) return;
@@ -1822,6 +1824,7 @@ function domDecorations(root, ctx) {
       ctx?.hint?.(`${desk.windows().length} window(s)`);
     };
   }, 100);
+  return () => clearInterval(wait);
 }
 
 const compositor = {
@@ -1836,7 +1839,7 @@ const compositor = {
     + 'copied twice. Nothing in the guest is a graphics driver. Every window is drawn from the '
     + 'guest\'s own memory: nothing copies a frame. The X11 clients share one X server and are '
     + 'cheap; a Qt or KDE toolkit translates 100 MB of its own code, so pick one of those at a '
-    + 'time. `?desktop=dom` puts each window in an element instead, with the frames in HTML.',
+    + 'time. The choice below puts each window in an element instead, with the frames in HTML.',
   // The image has apt in it, so a session can install into itself -- which
   // needs a Wisp relay, set with `?wisp=` (see the Debian demo).
   network: true,
@@ -1851,23 +1854,40 @@ const compositor = {
   async enter(ctx) {
     const wrap = document.createElement('div');
     wrap.className = 'canvas-wrap';
-    // `?desktop=dom` runs the other compositor: windows are elements and the
-    // decorations below are ordinary HTML, styled in the page's own CSS. The
-    // default draws the whole scene itself in one WebGL context.
-    const asDom = new URLSearchParams(location.search).get('desktop') === 'dom';
-    const wlCanvas = document.createElement(asDom ? 'div' : 'canvas');
-    wlCanvas.id = 'gex-wl';
-    if (!asDom) {
-      wlCanvas.width = this.outputWidth;
-      wlCanvas.height = this.outputHeight;
-    } else {
-      wlCanvas.style.width = `${this.outputWidth}px`;
-      wlCanvas.style.height = `${this.outputHeight}px`;
-    }
-    wlCanvas.tabIndex = 0;
-    wlCanvas.classList.add(asDom ? 'dom-output' : 'wl-output');
-    wrap.append(wlCanvas);
-    if (asDom) domDecorations(wlCanvas, ctx);
+    // Which compositor draws this session. Both are the same compositor
+    // underneath -- the same surfaces, the same input, the same protocol in
+    // every guest -- and differ in where the pixels land: one WebGL scene that
+    // draws its own decorations, or an element per window with the frames in
+    // this page's HTML. Chosen in the picker below, or with `?desktop=`.
+    //
+    // The output element itself differs (a canvas or a div), so it is built
+    // per choice rather than switched: `output()` replaces it in place, which
+    // is only allowed between runs.
+    let mode = new URLSearchParams(location.search).get('desktop') === 'dom' ? 'dom' : 'scene';
+    let wlCanvas = null;
+    const buildOutput = () => {
+      const asDom = mode === 'dom';
+      const el = document.createElement(asDom ? 'div' : 'canvas');
+      el.id = 'gex-wl';
+      if (asDom) {
+        el.style.width = `${this.outputWidth}px`;
+        el.style.height = `${this.outputHeight}px`;
+      } else {
+        el.width = this.outputWidth;
+        el.height = this.outputHeight;
+      }
+      el.tabIndex = 0;
+      el.classList.add(asDom ? 'dom-output' : 'wl-output');
+      if (wlCanvas) wlCanvas.replaceWith(el);
+      else wrap.append(el);
+      wlCanvas = el;
+      stopDecorations?.();
+      stopDecorations = asDom ? domDecorations(el, ctx) : null;
+      return el;
+    };
+    let stopDecorations = null;
+    buildOutput();
+    ctx.onLeave(() => stopDecorations?.());
     // The renderer's own GL context: where an OpenGL client's commands are
     // replayed. Never shown -- its pixels reach the screen through the
     // client's wl_surface like everything else's.
@@ -1893,6 +1913,35 @@ const compositor = {
       picker.append(label);
       boxes.set(a.id, box);
     }
+    // And which compositor draws them. A radio rather than a checkbox because
+    // it is one output either way, and it takes effect on the next run: the
+    // desktop is built when the session starts.
+    const desktopPick = document.createElement('div');
+    desktopPick.className = 'session-desktop';
+    desktopPick.append(Object.assign(document.createElement('span'),
+                                     { textContent: 'windows drawn by:' }));
+    for (const [value, text] of [
+      ['scene', 'one WebGL scene (decorations drawn by the compositor)'],
+      ['dom', 'an element each (decorations in this page\'s HTML)'],
+    ]) {
+      const label = document.createElement('label');
+      const radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = 'gex-desktop';
+      radio.value = value;
+      radio.checked = mode === value;
+      radio.onchange = () => {
+        if (!radio.checked || mode === value) return;
+        mode = value;
+        buildOutput();
+        ctx.hint(value === 'dom'
+          ? 'windows will be elements, with the frames in HTML'
+          : 'windows will be drawn in one WebGL scene');
+      };
+      label.append(radio, document.createTextNode(` ${text}`));
+      desktopPick.append(label);
+    }
+    picker.append(desktopPick);
     document.getElementById('terminal')?.before(wrap);
     wrap.before(picker);
     ctx.onLeave(() => {
