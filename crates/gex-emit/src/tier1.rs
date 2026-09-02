@@ -42,6 +42,10 @@ mod simd {
     pub const I8X16_SWIZZLE: u32 = 0x0e;
     pub const V128_BITSELECT: u32 = 0x52;
     pub const I8X16_POPCNT: u32 = 0x62;
+    pub const I8X16_BITMASK: u32 = 0x64;
+    pub const I16X8_BITMASK: u32 = 0x84;
+    pub const I32X4_BITMASK: u32 = 0xa4;
+    pub const I64X2_BITMASK: u32 = 0xc4;
     pub const I16X8_EXTADD_PAIRWISE_I8X16_S: u32 = 0x7c;
     pub const I16X8_EXTADD_PAIRWISE_I8X16_U: u32 = 0x7d;
     pub const I32X4_EXTADD_PAIRWISE_I16X8_S: u32 = 0x7e;
@@ -205,6 +209,15 @@ pub fn set_trap_pc(pc: u64) {
     TRAP_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `GEX_TRACE_BLOCKS`: plant a trace point at every block entry, so the host
+/// can print the path a guest takes. A diagnostic for a run that ends
+/// somewhere it should not, with no other record of how it got there. Costs
+/// a host call per block, so never on by default.
+fn trace_blocks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_TRACE_BLOCKS").is_some())
+}
+
 fn trap_pc() -> u64 {
     static ENV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let e = *ENV.get_or_init(|| {
@@ -239,6 +252,9 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     if trap_pc() == block.start {
         e.emit_trap_pc(block.start);
     }
+    if trace_blocks() {
+        e.emit_trace_point(block.start);
+    }
     run_one(&mut e, block);
     e.f.finish_with_relocs()
 }
@@ -250,6 +266,9 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     }
     if trap_pc() == block.start {
         e.emit_trap_pc(block.start);
+    }
+    if trace_blocks() {
+        e.emit_trace_point(block.start);
     }
     run_one(&mut e, block);
     e.f.finish()
@@ -506,8 +525,27 @@ impl<'a> Emitter<'a> {
             }
             self.f.store(0x36, 2, ctx::NZCV as u32);
         }
+        let pa = [GuestReg::P, GuestReg::A];
+        let pa_packed = pa.iter().all(|r| self.regs.contains_key(r))
+            && pa.iter().any(|r| self.region_writes.contains(r));
+        if pa_packed {
+            let lp = self.regs[&GuestReg::P].local;
+            let la = self.regs[&GuestReg::A].local;
+            note_traffic(GuestReg::P);
+            note_traffic(GuestReg::A);
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(lp);
+            self.f.local_get(la);
+            self.f.i32_const(8);
+            self.f.byte(0x74); // i32.shl
+            self.f.byte(0x72); // i32.or
+            self.f.store(0x3b, 1, ctx::PF as u32); // i32.store16
+        }
         for (r, local) in all {
-            if Self::is_flag(r) && packed {
+            if packed && matches!(r, GuestReg::N | GuestReg::Z | GuestReg::C | GuestReg::V) {
+                continue;
+            }
+            if pa_packed && matches!(r, GuestReg::P | GuestReg::A) {
                 continue;
             }
             note_traffic(r);
@@ -716,7 +754,7 @@ impl<'a> Emitter<'a> {
     /// So they load and store as bytes, not words -- `reg_offset` gives the
     /// byte, and `flush_inner` writes all four at once when it can.
     fn is_flag(r: GuestReg) -> bool {
-        matches!(r, GuestReg::N | GuestReg::Z | GuestReg::C | GuestReg::V)
+        r.is_flag()
     }
 
     fn reg_offset(r: GuestReg) -> u32 {
@@ -729,11 +767,21 @@ impl<'a> Emitter<'a> {
             GuestReg::Z => ctx::ZF,
             GuestReg::C => ctx::CF,
             GuestReg::V => ctx::VF,
+            GuestReg::P => ctx::PF,
+            GuestReg::A => ctx::AF,
+            GuestReg::D => ctx::DF,
             GuestReg::Tpidr => ctx::TPIDR,
             GuestReg::TpidrRo => ctx::TPIDRRO,
             GuestReg::MonAddr => ctx::MON_ADDR,
             GuestReg::MonValue => ctx::MON_VALUE,
             GuestReg::MonSize => ctx::MON_SIZE,
+            GuestReg::Mxcsr => ctx::MXCSR,
+            GuestReg::X87Top => ctx::X87_TOP,
+            GuestReg::X87Cw => ctx::X87_CW,
+            GuestReg::X87Sw => ctx::X87_SW,
+            GuestReg::X87Tags => ctx::X87_TAGS,
+            // Not a slot: read as the context's own address. Never stored.
+            GuestReg::CtxAddr => 0,
         }) as u32
     }
 
@@ -769,6 +817,16 @@ impl<'a> Emitter<'a> {
         self.f.call(self.cx.breakpoint);
     }
 
+    /// The `GEX_TRACE_BLOCKS` trace point. Registers are flushed first so the
+    /// host sees them; nothing is invalidated, since the host only reads.
+    fn emit_trace_point(&mut self, pc: u64) {
+        self.flush();
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(pc as i64);
+        self.f.i32_const(gex_abi::imports::BRK_TRACE);
+        self.f.call(self.cx.breakpoint);
+    }
+
     /// The local holding `r`, loading it from the context on first use.
     fn reg_local(&mut self, r: GuestReg) -> u32 {
         if let Some(c) = self.regs.get(&r) {
@@ -778,7 +836,10 @@ impl<'a> Emitter<'a> {
         let local = self.f.add_local(val_type(ty));
         let before = self.f.code.len();
         self.f.local_get(self.ctx_local);
-        if Self::is_flag(r) {
+        if r == GuestReg::CtxAddr {
+            // The context's guest address is the `ctx` parameter itself.
+            self.f.byte(code::I64_EXTEND_I32_U);
+        } else if Self::is_flag(r) {
             // i32.load8_u: the flag is one byte of the packed slot, and it is
             // 0 or 1, so there is nothing to sign-extend or mask.
             self.f.load(0x2d, 0, Self::reg_offset(r));
@@ -875,9 +936,37 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        // x86-64's parity and auxiliary-carry flags, adjacent bytes, as one
+        // 16-bit store when both are cached and either is dirty.
+        let pa = [GuestReg::P, GuestReg::A];
+        let pa_packed = pa.iter().all(|r| self.regs.contains_key(r))
+            && pa.iter().any(|r| self.regs.get(r).is_some_and(|c| c.dirty));
+        if pa_packed {
+            let lp = self.regs[&GuestReg::P].local;
+            let la = self.regs[&GuestReg::A].local;
+            note_traffic(GuestReg::P);
+            note_traffic(GuestReg::A);
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(lp);
+            self.f.local_get(la);
+            self.f.i32_const(8);
+            self.f.byte(0x74); // i32.shl
+            self.f.byte(0x72); // i32.or
+            self.f.store(0x3b, 1, ctx::PF as u32); // i32.store16
+            if !keep_dirty {
+                for r in pa {
+                    if let Some(c) = self.regs.get_mut(&r) {
+                        c.dirty = false;
+                    }
+                }
+            }
+        }
 
         for (r, local) in dirty {
-            if packed && Self::is_flag(r) {
+            if packed && matches!(r, GuestReg::N | GuestReg::Z | GuestReg::C | GuestReg::V) {
+                continue;
+            }
+            if pa_packed && matches!(r, GuestReg::P | GuestReg::A) {
                 continue;
             }
             note_traffic(r);
@@ -1078,7 +1167,289 @@ impl<'a> Emitter<'a> {
             }
             Stmt::MemCmp { dst, a, b, len } => self.emit_memcmp(*dst, *a, *b, *len),
             Stmt::Fence => self.f.atomic_fence(),
+            Stmt::StrOp { .. } => self.emit_strop(s),
         }
+    }
+
+    /// Clamp the length in the i64 scratch so a bulk op from any of `bases`
+    /// cannot run off the end of guest memory. See [`Self::clamp_len`].
+    fn clamp_scratch_len(&mut self, bases: &[u32]) {
+        let n = self.scratch_i64;
+        let room = self.scratch_page;
+        for &b in bases {
+            self.f.i64_const(GUEST_LIMIT as i64);
+            self.f.local_get(b);
+            self.f.byte(code::I64_EXTEND_I32_U);
+            self.f.byte(code::I64_SUB);
+            self.f.local_set(room);
+            self.f.local_get(n);
+            self.f.local_get(room);
+            self.f.local_get(n);
+            self.f.local_get(room);
+            self.f.byte(code::I64_LT_U);
+            self.f.select();
+            self.f.local_set(n);
+        }
+    }
+
+    /// An x86 `rep` string instruction: see [`Stmt::StrOp`].
+    ///
+    /// `rep movs` with the direction flag clear and a forward-safe overlap
+    /// becomes one `memory.copy`; `rep stos` with a repeating byte pattern
+    /// becomes one `memory.fill`. Everything else is an element loop whose
+    /// accesses are guarded like any other guest access.
+    fn emit_strop(&mut self, s: &Stmt) {
+        let Stmt::StrOp {
+            kind,
+            sz,
+            until,
+            count,
+            dst,
+            src,
+            val,
+            df,
+            out_count,
+            out_dst,
+            out_src,
+            out_a,
+            out_b,
+        } = s
+        else {
+            unreachable!()
+        };
+        use gex_ir::{StrKind, StrUntil};
+        let (kind, sz, until) = (*kind, *sz, *until);
+        let bytes = sz.bytes() as i64;
+
+        let lc = self.alloc(Ty::I64);
+        let ld = self.alloc(Ty::I64);
+        let ls = self.alloc(Ty::I64);
+        let lv = self.alloc(Ty::I64);
+        let lstep = self.alloc(Ty::I64);
+        let la = self.alloc(Ty::I64);
+        let lb = self.alloc(Ty::I64);
+
+        self.push(*count);
+        self.f.local_set(lc);
+        self.push(*dst);
+        self.f.local_set(ld);
+        self.push(*src);
+        self.f.local_set(ls);
+        self.push(*val);
+        self.f.local_set(lv);
+        // step = df ? -bytes : +bytes
+        self.f.i64_const(-bytes);
+        self.f.i64_const(bytes);
+        self.push(*df);
+        self.f.byte(0x45); // i32.eqz
+        self.f.select();
+        self.f.local_set(lstep);
+        self.f.i64_const(0);
+        self.f.local_set(la);
+        self.f.i64_const(0);
+        self.f.local_set(lb);
+
+        let (d32, s32) = (self.scratch_i32, self.scratch_entry);
+
+        self.f.block_void(); // $end
+        if matches!(kind, StrKind::Movs | StrKind::Stos) {
+            self.f.block_void(); // $slow
+            // df set: slow path.
+            self.push(*df);
+            self.f.br_if(0);
+            // count == 0: nothing to do, but the loop handles it too.
+            self.f.local_get(lc);
+            self.f.byte(0x50); // i64.eqz
+            self.f.br_if(0);
+            match kind {
+                StrKind::Movs => {
+                    // Forward-safe unless dst is inside (src, src+len).
+                    // rep movs copies element by element ascending, which
+                    // equals memmove exactly when dst <= src or dst >= src+len.
+                    self.f.local_get(ld);
+                    self.f.local_get(ls);
+                    self.f.byte(0x58); // i64.le_u
+                    self.f.local_get(ld);
+                    self.f.local_get(ls);
+                    self.f.local_get(lc);
+                    self.f.i64_const(bytes);
+                    self.f.byte(0x7e); // i64.mul
+                    self.f.byte(0x7c); // i64.add
+                    self.f.byte(0x5a); // i64.ge_u
+                    self.f.byte(0x72); // i32.or
+                    self.f.byte(0x45); // i32.eqz
+                    self.f.br_if(0);
+                    // memory.copy(dst, src, count*bytes)
+                    self.f.local_get(ld);
+                    self.guard_to_i32();
+                    self.f.local_set(d32);
+                    self.f.local_get(ls);
+                    self.guard_to_i32();
+                    self.f.local_set(s32);
+                    self.f.local_get(lc);
+                    self.f.i64_const(bytes);
+                    self.f.byte(0x7e);
+                    self.f.local_set(self.scratch_i64);
+                    self.clamp_scratch_len(&[d32, s32]);
+                    self.f.local_get(d32);
+                    self.f.local_get(s32);
+                    self.f.local_get(self.scratch_i64);
+                    self.f.byte(code::I32_WRAP_I64);
+                    self.f.byte(crate::wasm::op::MISC_PREFIX);
+                    self.f.u32(code::MEMORY_COPY);
+                    self.f.byte(0);
+                    self.f.byte(0);
+                }
+                _ => {
+                    // Every byte of the element equal, or a single byte.
+                    if bytes > 1 {
+                        self.f.local_get(lv);
+                        self.f.local_get(lv);
+                        self.f.i64_const(0xff);
+                        self.f.byte(0x83); // i64.and
+                        let rep: i64 = match bytes {
+                            2 => 0x0101,
+                            4 => 0x0101_0101,
+                            _ => 0x0101_0101_0101_0101,
+                        };
+                        self.f.i64_const(rep);
+                        self.f.byte(0x7e); // i64.mul
+                        if bytes < 8 {
+                            // Compare only the element's own bytes.
+                            self.f.local_set(self.scratch_i64);
+                            self.f.i64_const((1i64 << (bytes * 8)) - 1);
+                            self.f.byte(0x83);
+                            self.f.local_get(self.scratch_i64);
+                            self.f.byte(0x52); // i64.ne
+                        } else {
+                            self.f.byte(0x52); // i64.ne
+                        }
+                        self.f.br_if(0);
+                    }
+                    self.f.local_get(ld);
+                    self.guard_to_i32();
+                    self.f.local_set(d32);
+                    self.f.local_get(lc);
+                    self.f.i64_const(bytes);
+                    self.f.byte(0x7e);
+                    self.f.local_set(self.scratch_i64);
+                    self.clamp_scratch_len(&[d32]);
+                    self.f.local_get(d32);
+                    self.f.local_get(lv);
+                    self.f.byte(code::I32_WRAP_I64);
+                    self.f.local_get(self.scratch_i64);
+                    self.f.byte(code::I32_WRAP_I64);
+                    self.f.byte(crate::wasm::op::MISC_PREFIX);
+                    self.f.u32(code::MEMORY_FILL);
+                    self.f.byte(0);
+                }
+            }
+            // dst += count*bytes; src likewise; count = 0.
+            for l in [ld, ls] {
+                self.f.local_get(l);
+                self.f.local_get(lc);
+                self.f.i64_const(bytes);
+                self.f.byte(0x7e);
+                self.f.byte(0x7c);
+                self.f.local_set(l);
+            }
+            self.f.i64_const(0);
+            self.f.local_set(lc);
+            self.f.br(1); // $end
+            self.f.end(); // $slow
+        }
+
+        // The element loop.
+        let (load_op, store_op) = match bytes {
+            1 => (0x31u8, 0x3cu8), // i64.load8_u / i64.store8
+            2 => (0x33, 0x3d),
+            4 => (0x35, 0x3e),
+            _ => (0x29, 0x37),
+        };
+        self.f.block_void();
+        self.f.loop_void();
+        self.f.local_get(lc);
+        self.f.byte(0x50); // i64.eqz
+        self.f.br_if(1);
+        match kind {
+            StrKind::Movs => {
+                self.f.local_get(ld);
+                self.guard_to_i32();
+                self.f.local_set(d32);
+                self.f.local_get(ls);
+                self.guard_to_i32();
+                self.f.load(load_op, 0, 0);
+                self.f.local_set(la);
+                self.f.local_get(d32);
+                self.f.local_get(la);
+                self.f.store(store_op, 0, 0);
+            }
+            StrKind::Stos => {
+                self.f.local_get(ld);
+                self.guard_to_i32();
+                self.f.local_get(lv);
+                self.f.store(store_op, 0, 0);
+            }
+            StrKind::Scas => {
+                self.f.local_get(lv);
+                if bytes < 8 {
+                    self.f.i64_const((1i64 << (bytes * 8)) - 1);
+                    self.f.byte(0x83);
+                }
+                self.f.local_set(la);
+                self.f.local_get(ld);
+                self.guard_to_i32();
+                self.f.load(load_op, 0, 0);
+                self.f.local_set(lb);
+            }
+            StrKind::Cmps => {
+                self.f.local_get(ls);
+                self.guard_to_i32();
+                self.f.load(load_op, 0, 0);
+                self.f.local_set(la);
+                self.f.local_get(ld);
+                self.guard_to_i32();
+                self.f.load(load_op, 0, 0);
+                self.f.local_set(lb);
+            }
+        }
+        for l in [ld, ls] {
+            self.f.local_get(l);
+            self.f.local_get(lstep);
+            self.f.byte(0x7c);
+            self.f.local_set(l);
+        }
+        self.f.local_get(lc);
+        self.f.i64_const(1);
+        self.f.byte(0x7d); // i64.sub
+        self.f.local_set(lc);
+        match until {
+            StrUntil::Count => {}
+            StrUntil::NotEqual => {
+                self.f.local_get(la);
+                self.f.local_get(lb);
+                self.f.byte(0x52); // i64.ne
+                self.f.br_if(1);
+            }
+            StrUntil::Equal => {
+                self.f.local_get(la);
+                self.f.local_get(lb);
+                self.f.byte(0x51); // i64.eq
+                self.f.br_if(1);
+            }
+        }
+        self.f.br(0);
+        self.f.end(); // loop
+        self.f.end(); // block
+        self.f.end(); // $end
+
+        for (v, l) in [(out_count, lc), (out_dst, ld), (out_src, ls), (out_a, la), (out_b, lb)] {
+            let i = v.0 as usize;
+            self.value_ty[i] = Ty::I64;
+            self.value_local[i] = Some(l);
+        }
+        self.free_i64.push(lv);
+        self.free_i64.push(lstep);
     }
 
     /// Leave in the i64 scratch a length that cannot run off the end of guest
@@ -1547,6 +1918,15 @@ impl<'a> Emitter<'a> {
                 self.push(*a);
                 self.push(*idx);
                 self.f.simd(simd::I8X16_SWIZZLE);
+            }
+            Expr::VBitmask { a, lane } => {
+                self.push(*a);
+                self.f.simd(match lane.bytes() {
+                    1 => simd::I8X16_BITMASK,
+                    2 => simd::I16X8_BITMASK,
+                    4 => simd::I32X4_BITMASK,
+                    _ => simd::I64X2_BITMASK,
+                });
             }
             Expr::VBitSelect { mask, a, b } => {
                 // wasm's bitselect takes (a, b, mask) and yields
@@ -2179,7 +2559,7 @@ impl<'a> Emitter<'a> {
                 // be preempted or take a signal. Safe here because the PC is
                 // already the target (stored above) and the registers are
                 // flushed, so the slow path may deliver a signal and unwind.
-                self.emit_safepoint_no_flush(block.end - 4);
+                self.emit_safepoint_no_flush(block.end - gex_abi::INST_ALIGN);
                 self.emit_dispatch_tail_call();
             }
             Term::Syscall { next } => {
@@ -2190,7 +2570,7 @@ impl<'a> Emitter<'a> {
                 // the syscall's own address, which is what a trace wants.
                 self.store_pc(next);
                 self.f.local_get(self.ctx_local);
-                self.f.i64_const((block.end - 4) as i64);
+                self.f.i64_const((block.end - gex_abi::SYSCALL_INST_BYTES) as i64);
                 self.f.call(self.cx.syscall);
                 self.invalidate();
                 self.jump_to_constant(next);
@@ -2394,13 +2774,15 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// index += (pc & 0xfff) >> 2
+    /// index += (pc & 0xfff) >> INST_ALIGN_SHIFT
     fn add_page_offset(&mut self) {
         self.f.local_get(self.scratch_i64);
         self.f.i64_const((DISPATCH_PAGE - 1) as i64);
         self.f.byte(0x83); // i64.and
-        self.f.i64_const(2);
-        self.f.byte(0x88); // i64.shr_u
+        if gex_abi::INST_ALIGN_SHIFT != 0 {
+            self.f.i64_const(gex_abi::INST_ALIGN_SHIFT as i64);
+            self.f.byte(0x88); // i64.shr_u
+        }
         self.f.byte(0xa7); // i32.wrap_i64
         self.f.byte(0x6a); // i32.add
     }

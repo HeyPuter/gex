@@ -10,3 +10,7 @@ crate-type = ["cdylib"]
 gex-abi.workspace = true
 gex-kmem.workspace = true
 gex-kernel.workspace = true
+
+[features]
+# Serve an x86-64 guest. See `gex_abi::X86`.
+x86 = ["gex-abi/x86", "gex-kernel/x86"]

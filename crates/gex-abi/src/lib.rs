@@ -6,6 +6,34 @@
 #![no_std]
 
 // ---------------------------------------------------------------------------
+// Guest architecture
+// ---------------------------------------------------------------------------
+
+/// True when this build targets an x86-64 guest, false for AArch64. Chosen by
+/// the `x86` cargo feature: the two guests differ in constants the emitter,
+/// kernel and shims bake into code (instruction alignment, syscall registers),
+/// so one binary serves one guest.
+pub const X86: bool = cfg!(feature = "x86");
+
+/// The guest architecture's name as Linux spells it (`uname -m`, `AT_PLATFORM`).
+pub const ARCH_NAME: &str = if X86 { "x86_64" } else { "aarch64" };
+
+/// The ELF `e_machine` of a guest object.
+pub const ELF_MACHINE: u16 = if X86 { 62 } else { 183 };
+
+/// Log2 of the guest's instruction alignment: A64 instructions are 4-byte
+/// aligned words, x86-64 instructions start on any byte.
+pub const INST_ALIGN_SHIFT: u32 = if X86 { 0 } else { 2 };
+
+/// The guest's instruction alignment in bytes.
+pub const INST_ALIGN: u64 = 1 << INST_ALIGN_SHIFT;
+
+/// Length in bytes of the guest's system-call instruction (`svc #0` is a
+/// 4-byte word; `syscall` is `0f 05`). Where a syscall resumes is the
+/// instruction after it, and a host that restarts or skips one needs this.
+pub const SYSCALL_INST_BYTES: u64 = if X86 { 2 } else { 4 };
+
+// ---------------------------------------------------------------------------
 // Guest address space (PLAN §7.1)
 // ---------------------------------------------------------------------------
 
@@ -127,8 +155,10 @@ pub const ARENA_BOTTOM: u64 = PLACE_TOP;
 pub mod ctx {
     /// `x0`–`x30`, 8 bytes each.
     pub const X: usize = 0;
-    /// Stack pointer.
-    pub const SP: usize = 31 * 8;
+    /// Stack pointer. On x86-64 the stack pointer is an ordinary GPR (`rsp`,
+    /// `x(4)`), so this names that slot and the kernel's every use of `SP`
+    /// reads the right register.
+    pub const SP: usize = if super::X86 { x(4) } else { 31 * 8 };
     /// Program counter. Only meaningful at block boundaries and safepoints.
     pub const PC: usize = 32 * 8;
 
@@ -142,6 +172,14 @@ pub mod ctx {
     pub const ZF: usize = NZCV + 1;
     pub const CF: usize = NZCV + 2;
     pub const VF: usize = NZCV + 3;
+
+    /// x86-64 only: the parity, auxiliary-carry and direction flags, bytes in
+    /// the doubleword after NZCV so all six arithmetic flags (N=SF, Z, C,
+    /// V=OF, P, A) store as one 64-bit word. `DF` is not an arithmetic flag
+    /// (only `cld`/`std` write it) but keeps a byte here for one packed frame.
+    pub const PF: usize = NZCV + 4;
+    pub const AF: usize = NZCV + 5;
+    pub const DF: usize = NZCV + 6;
 
     /// Pack four 0/1 flags into the slot (and [`unpack_nzcv`] to reverse), so
     /// the packing lives in one place.
@@ -161,10 +199,14 @@ pub mod ctx {
         )
     }
 
-    /// `TPIDR_EL0` — the guest thread pointer.
+    /// `TPIDR_EL0` — the guest thread pointer. On x86-64 this slot is the
+    /// `FS` segment base, which is how that ABI reaches thread-local storage.
     pub const TPIDR: usize = 35 * 8;
-    /// `TPIDRRO_EL0`.
+    /// `TPIDRRO_EL0`; the `GS` base on x86-64.
     pub const TPIDRRO: usize = 36 * 8;
+    /// The x86-64 names for the same two slots.
+    pub const FS_BASE: usize = TPIDR;
+    pub const GS_BASE: usize = TPIDRRO;
 
     /// Local exclusive monitor: address, value and access size. `SIZE == 0`
     /// means the monitor is clear.
@@ -172,9 +214,10 @@ pub mod ctx {
     pub const MON_VALUE: usize = 38 * 8;
     pub const MON_SIZE: usize = 39 * 8;
 
-    /// FP control and status registers.
+    /// FP control and status registers. On x86-64 `FPCR` holds `MXCSR`.
     pub const FPCR: usize = 40 * 8;
     pub const FPSR: usize = FPCR + 4;
+    pub const MXCSR: usize = FPCR;
 
     /// Per-thread interrupt flag, polled at safepoints for signal delivery.
     pub const INTERRUPT: usize = 41 * 8;
@@ -197,11 +240,59 @@ pub mod ctx {
     /// `return_call` and never come here.
     pub const LAST_TARGET: usize = 44 * 8;
 
-    /// `v0`–`v31`, the SIMD/FP register file, 16 bytes each.
+    /// The raw system-call number the guest last issued, saved by the kernel
+    /// at entry. On x86-64 the number's register (`rax`) is also the result
+    /// register, so a host that wants to know which call just ran after the
+    /// fact cannot read it back from there.
+    pub const LAST_SYSCALL: usize = 45 * 8;
+
+    /// `v0`–`v31`, the SIMD/FP register file, 16 bytes each. On x86-64 the
+    /// first sixteen are `xmm0`–`xmm15`.
     pub const V: usize = 48 * 8;
 
+    /// x86-64 only: the x87 register stack, eight 64-bit slots holding each
+    /// `ST(i)` (physical register `R(i)`, not stack-relative) as a double.
+    /// gex computes the x87 in double precision, not the architectural 80-bit
+    /// extended format; guests observe that as reduced `long double` precision.
+    pub const X87: usize = V + 32 * 16;
+    /// x87 `TOP` (0..7), the physical register `ST(0)` names.
+    pub const X87_TOP: usize = X87 + 8 * 8;
+    /// x87 control word, as `fldcw`/`fnstcw` see it.
+    pub const X87_CW: usize = X87_TOP + 4;
+    /// x87 status word, less `TOP` and the condition codes the lifter derives.
+    pub const X87_SW: usize = X87_CW + 2;
+    /// One bit per physical register: 1 means valid (tag word derived).
+    pub const X87_TAGS: usize = X87_SW + 2;
+
+    /// A 64-byte per-thread scratch area the kernel may use for structures it
+    /// must materialise in guest memory on the guest's behalf (an x86-64
+    /// `poll` becomes `ppoll` with a timespec that has to live somewhere).
+    pub const SCRATCH: usize = X87 + 12 * 8;
+
     /// Total size of the context structure, rounded up.
-    pub const SIZE: usize = V + 32 * 16;
+    pub const SIZE: usize = SCRATCH + 64;
+
+    /// Where the guest puts a system-call number: `x8`, or `rax` (`x(0)` in
+    /// gex's numbering of x86-64 registers, which is the hardware's).
+    pub const SYSCALL_NR: usize = if super::X86 { x(0) } else { x(8) };
+    /// Where the six system-call arguments arrive: `x0`–`x5`, or
+    /// `rdi, rsi, rdx, r10, r8, r9`.
+    pub const SYSCALL_ARGS: [usize; 6] = if super::X86 {
+        [x(7), x(6), x(2), x(10), x(8), x(9)]
+    } else {
+        [x(0), x(1), x(2), x(3), x(4), x(5)]
+    };
+    /// Where a system call's result goes: `x0` on both (`rax` is `x(0)`).
+    pub const SYSCALL_RET: usize = x(0);
+
+    /// The first argument register of the guest's C calling convention
+    /// (`x0`, or `rdi`), and the next two. What a library-function intrinsic
+    /// reads its arguments from.
+    pub const CALL_ARGS: [usize; 3] = if super::X86 {
+        [x(7), x(6), x(2)]
+    } else {
+        [x(0), x(1), x(2)]
+    };
 
     /// Byte offset of general-purpose register `n` (0..=30).
     #[inline]
@@ -223,8 +314,9 @@ pub mod ctx {
 /// Bytes of guest text one dispatch-directory entry covers.
 pub const DISPATCH_PAGE: u64 = 4096;
 
-/// Dispatch-table slots per covered page: one per instruction slot.
-pub const SLOTS_PER_PAGE: u64 = DISPATCH_PAGE / 4;
+/// Dispatch-table slots per covered page: one per possible instruction start,
+/// so 1,024 for A64's 4-byte words and 4,096 for byte-aligned x86-64.
+pub const SLOTS_PER_PAGE: u64 = DISPATCH_PAGE >> INST_ALIGN_SHIFT;
 
 /// Table slots reserved at index 0, all holding the miss stub. An untranslated
 /// page has directory entry zero, so its index lands in this span and calls
@@ -364,6 +456,11 @@ pub mod imports {
     /// the block runs on -- unlike `BRK_BAD_SP`, which exits.
     pub const BRK_TRAP_PC: i32 = -2;
 
+    /// Not a `brk`: a block-entry trace point (`GEX_TRACE_BLOCKS`), planted at
+    /// the start of every block so a run can be followed block by block. The
+    /// host prints the pc and a few registers and RETURNS.
+    pub const BRK_TRACE: i32 = -3;
+
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
     pub const SYSREG_READ: &str = "sysreg_read";
@@ -463,7 +560,7 @@ pub const CNTFRQ: u64 = 1_000_000_000;
 /// the table index, so a caller holding only the base (table 0) can pass it.
 #[inline]
 pub const fn dispatch_index(pc: u64, page_entry: u32) -> u64 {
-    dispatch_entry_base(page_entry) as u64 + ((pc % DISPATCH_PAGE) >> 2)
+    dispatch_entry_base(page_entry) as u64 + ((pc % DISPATCH_PAGE) >> INST_ALIGN_SHIFT)
 }
 
 #[cfg(test)]
@@ -475,12 +572,13 @@ mod tests {
     const _: () = {
         assert!(ctx::x(0) == 0);
         assert!(ctx::x(30) == 240);
-        assert!(ctx::SP > ctx::x(30));
-        assert!(ctx::PC > ctx::SP);
+        assert!(ctx::PC > ctx::x(30));
         assert!(ctx::NF > ctx::PC);
         assert!(ctx::TPIDR > ctx::VF);
-        assert!(ctx::V >= ctx::TID + 8);
-        assert!(ctx::SIZE == ctx::v(31) + 16);
+        assert!(ctx::V >= ctx::LAST_SYSCALL + 8);
+        assert!(ctx::X87 == ctx::v(31) + 16);
+        assert!(ctx::SIZE >= ctx::X87_TAGS + 2);
+        assert!(ctx::SIZE % 8 == 0);
         // The vector slots must be 16-byte aligned for `v128` accesses.
         assert!(ctx::V % 16 == 0);
     };

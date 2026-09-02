@@ -249,7 +249,7 @@ struct SpawnContext {
     wayland: Option<wayland::Wayland>,
     virgl: Option<virgl::VirglDevice>,
     jit_shared: Option<Arc<Mutex<JitShared>>>,
-    limits: gex_lift::BlockLimits,
+    limits: gex_xlate::BlockLimits,
 }
 
 /// Runtime translation state belonging to one store (PLAN §6.2, M3).
@@ -274,7 +274,7 @@ struct Jit {
     instances: Vec<wasmtime::Instance>,
     /// Registry entries already instantiated into this store.
     replayed: usize,
-    limits: gex_lift::BlockLimits,
+    limits: gex_xlate::BlockLimits,
 }
 
 /// One runtime-translated module, kept so another thread's store can
@@ -2187,13 +2187,18 @@ fn place_image(
     // leaves it.
     let data = memory.bytes();
     let ctx_addr = gex_abi::ctx_addr(0) as usize;
+    // Registers first, then the stack pointer: on x86-64 `SP` is one of them.
+    for i in 0..31u8 {
+        write_u64(data, ctx_addr + ctx::x(i), 0);
+    }
     write_u64(data, ctx_addr + ctx::SP, layout.sp);
     write_u64(data, ctx_addr + ctx::PC, image.entry);
     data[ctx_addr + ctx::SAFEPOINT_COUNTER..ctx_addr + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
-    for i in 0..31u8 {
-        write_u64(data, ctx_addr + ctx::x(i), 0);
-    }
+    // x87 control word: the power-on default glibc expects (round to
+    // nearest, 64-bit precision, all exceptions masked).
+    data[ctx_addr + ctx::X87_CW..ctx_addr + ctx::X87_CW + 4].copy_from_slice(&0x37fu32.to_le_bytes());
+    data[ctx_addr + ctx::MXCSR..ctx_addr + ctx::MXCSR + 4].copy_from_slice(&0x1f80u32.to_le_bytes());
     Ok(())
 }
 
@@ -2526,7 +2531,30 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::BREAKPOINT,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, imm: i32| -> Result<()> {
+        |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, imm: i32| -> Result<()> {
+            // The diagnostic trace points dump the registers and carry on.
+            if imm == gex_abi::imports::BRK_TRAP_PC || imm == gex_abi::imports::BRK_TRACE {
+                if let Some(memory) = caller.data().memory.clone() {
+                    let data = memory.bytes();
+                    let c = ctx as u32 as usize;
+                    let r = |i: u8| read_u64(data, c + ctx::x(i));
+                    if gex_abi::X86 {
+                        eprintln!(
+                            "[trace] pc={pc:#x} rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x} fl={:#x}",
+                            r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7), r(8), r(9), r(10), r(11), r(12), r(13), r(14), r(15),
+                            read_u64(data, c + ctx::NZCV)
+                        );
+                    } else {
+                        let regs: Vec<String> = (0..31u8).map(|i| format!("x{i}={:#x}", r(i))).collect();
+                        eprintln!(
+                            "[trace] pc={pc:#x} sp={:#x} {}",
+                            read_u64(data, c + ctx::SP),
+                            regs.join(" ")
+                        );
+                    }
+                }
+                return Ok(());
+            }
             caller.data_mut().exit = Some(Exit::Signal {
                 signal: signal::SIGTRAP,
                 pc: pc as u64,
@@ -2560,7 +2588,21 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::SYSREG_WRITE,
-        |_caller: Caller<'_, HostState>, _ctx: i32, _pc: i64, _reg: i32, _v: i64| {},
+        |mut caller: Caller<'_, HostState>, ctx: i32, _pc: i64, reg: i32, v: i64| -> Result<()> {
+            // The x86-64 lifter routes `cpuid` here: the leaf and subleaf come
+            // in `v`, the four results go back into the context.
+            if reg == gex_kernel::x86::SYSREG_CPUID {
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
+                let mut gm = GuestMem::new(data);
+                gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, v as u64);
+            }
+            Ok(())
+        },
     )?;
 
     linker.func_wrap(
@@ -2727,14 +2769,14 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.page_table.clone()
     };
-    if pc % 4 != 0 || pc >= gex_abi::DISPATCH_MAX_PAGES * gex_abi::DISPATCH_PAGE {
+    if pc % gex_abi::INST_ALIGN != 0 || pc >= gex_abi::DISPATCH_MAX_PAGES * gex_abi::DISPATCH_PAGE {
         return Ok(false);
     }
     // Only translate what the guest says is executable, so a wild branch into
     // data reports SIGSEGV rather than running whatever bytes are there.
     if !caller
         .data_mut()
-        .with_kernel(|k| k.mem.check_access(pc, 4, prot::EXEC))
+        .with_kernel(|k| k.mem.check_access(pc, gex_abi::INST_ALIGN, prot::EXEC))
     {
         return Ok(false);
     }
@@ -2761,7 +2803,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         gex_xlate::translate_runtime(
             data,
             pc,
-            &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
+            &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&a),
             page_table,
             limits,
@@ -3110,7 +3152,7 @@ fn object_seeds(
                 continue;
             }
             let v = u64::from_le_bytes(chunk.try_into().unwrap());
-            if v >= lo && v < hi && v % 4 == 0 {
+            if v >= lo && v < hi && v % gex_abi::INST_ALIGN == 0 {
                 seeds.push(v.wrapping_add(bias));
             }
         }
@@ -3187,7 +3229,7 @@ fn recompile_object(
             map.start,
             map.end,
             seeds,
-            &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
+            &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&a),
             page_table,
             limits,

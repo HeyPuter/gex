@@ -1,0 +1,2431 @@
+//! `gex-lift-x86` — x86-64 instruction semantics, expressed in GIR.
+//!
+//! The contract is the A64 lifter's: total (every decoded instruction lifts
+//! or ends the block with a precise SIGILL), exact where wasm and the
+//! architecture disagree, and flags written as separate one-bit registers so
+//! dead-flag elimination can drop the ones nobody reads.
+//!
+//! Register model: the sixteen GPRs are `GuestReg::X(0..16)` in hardware
+//! order, `rsp` included (`X(4)`); `GuestReg::Sp` is unused. The six
+//! arithmetic flags are `N` (SF), `Z`, `C`, `V` (OF), `P` and `A`, with `D`
+//! for the direction flag. `Tpidr` holds the FS base and `TpidrRo` the GS
+//! base. `xmm0`–`xmm15` are `V128(0..16)`. The x87 stack lives in the
+//! context as eight doubles reached through `GuestReg::CtxAddr`.
+
+#![forbid(unsafe_code)]
+
+use gex_ir::*;
+use gex_isa_x86::{Cond, Inst, Mem, Op, Operand, Reg, Rep, Seg, Width};
+
+mod block;
+mod sse;
+mod x87;
+pub use block::{lift_block, BlockLimits};
+
+/// Pseudo system-register codes passed to the `sysreg_read`/`sysreg_write`
+/// host imports. Negative, like the A64 lifter's, so they never collide with
+/// an encoded A64 register.
+pub mod sysreg {
+    /// `rdtsc`: the host's monotonic counter (the A64 `CNTVCT_EL0` code).
+    pub const TSC: i32 = -3;
+    /// `cpuid`: written with `eax | ecx << 32`; the host fills
+    /// `eax`, `ebx`, `ecx`, `edx` in the context.
+    pub const CPUID: i32 = -100;
+}
+
+/// What the condition flags hold, when a branch can ask about the operands
+/// directly instead of reading the flag registers. See the A64 lifter for the
+/// rationale; the x86 twist is that 8- and 16-bit operands travel
+/// zero-extended in an `I32`, so a signed comparison first sign-extends.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum FlagSource {
+    #[default]
+    Unknown,
+    /// Flags of `a - b` at `bits` wide (`cmp`, `sub`).
+    Sub { a: Value, b: Value, ty: Ty, bits: u32 },
+    /// Flags of a logical result `v` (`test`, `and`, `or`, `xor`): C and O
+    /// are zero.
+    Logic { v: Value, ty: Ty, bits: u32 },
+}
+
+/// What the lifter decided about control flow after one instruction.
+pub enum Flow {
+    Next,
+    End(Term),
+}
+
+pub struct Lifter<'a> {
+    b: &'a mut Builder,
+    flags: FlagSource,
+    raw: u32,
+    /// The instruction being lifted and where it is.
+    pc: u64,
+    next: u64,
+    /// The current instruction's memory operand, for the x87 forms whose
+    /// decoded `X87Src` names memory without carrying the operand.
+    cur_mem: Operand,
+}
+
+const RAX: u8 = 0;
+const RCX: u8 = 1;
+const RDX: u8 = 2;
+const RSP: u8 = 4;
+const RBP: u8 = 5;
+const RSI: u8 = 6;
+const RDI: u8 = 7;
+const R11: u8 = 11;
+
+fn ty_of(w: Width) -> Ty {
+    if w == Width::Q {
+        Ty::I64
+    } else {
+        Ty::I32
+    }
+}
+
+fn mem_sz(w: Width) -> MemSz {
+    match w {
+        Width::B => MemSz::B1,
+        Width::W => MemSz::B2,
+        Width::D => MemSz::B4,
+        Width::Q => MemSz::B8,
+    }
+}
+
+impl<'a> Lifter<'a> {
+    pub fn new(b: &'a mut Builder, flags: FlagSource, raw: u32) -> Lifter<'a> {
+        Lifter {
+            b,
+            flags,
+            raw,
+            pc: 0,
+            next: 0,
+            cur_mem: Operand::Imm(0),
+        }
+    }
+
+    pub fn flags(&self) -> FlagSource {
+        self.flags
+    }
+
+    // -- constants -------------------------------------------------------------
+
+    fn k(&mut self, ty: Ty, v: u64) -> Value {
+        self.b.const_ty(ty, v)
+    }
+    fn k32(&mut self, v: u32) -> Value {
+        self.b.const_i32(v)
+    }
+    fn k64(&mut self, v: u64) -> Value {
+        self.b.const_i64(v)
+    }
+
+    // -- registers ---------------------------------------------------------------
+
+    /// Read GPR `n` in full.
+    fn rd64(&mut self, n: u8) -> Value {
+        self.b.read(GuestReg::X(n))
+    }
+    fn wr64(&mut self, n: u8, v: Value) {
+        self.b.write(GuestReg::X(n), v);
+    }
+
+    /// Read a register at its width: `I64` for 64-bit, otherwise an `I32`
+    /// holding the zero-extended low bits.
+    fn rd_reg(&mut self, r: Reg) -> Value {
+        match r {
+            Reg::Gp(n, Width::Q) => self.rd64(n),
+            Reg::Gp(n, Width::D) => {
+                let v = self.rd64(n);
+                self.b.wrap(v)
+            }
+            Reg::Gp(n, w) => {
+                let v = self.rd64(n);
+                let v = self.b.wrap(v);
+                let m = self.k32(w.mask() as u32);
+                self.b.bin(BinOp::And, Ty::I32, v, m)
+            }
+            Reg::High(n) => {
+                let v = self.rd64(n);
+                let v = self.b.wrap(v);
+                let eight = self.k32(8);
+                let v = self.b.bin(BinOp::ShrU, Ty::I32, v, eight);
+                let m = self.k32(0xff);
+                self.b.bin(BinOp::And, Ty::I32, v, m)
+            }
+            Reg::Seg(_) => self.k32(0),
+            // Vector and x87 registers are read by their own paths.
+            Reg::Xmm(_) | Reg::Mm(_) | Reg::St(_) => self.k64(0),
+        }
+    }
+
+    /// Write a register at its width. 32-bit writes zero-extend into the
+    /// full register; 16- and 8-bit writes merge into it.
+    fn wr_reg(&mut self, r: Reg, val: Value) {
+        match r {
+            Reg::Gp(n, Width::Q) => self.wr64(n, val),
+            Reg::Gp(n, Width::D) => {
+                let v = self.b.extend(val, false);
+                self.wr64(n, v);
+            }
+            Reg::Gp(n, w) => {
+                let old = self.rd64(n);
+                let keep = self.k64(!w.mask());
+                let old = self.b.bin(BinOp::And, Ty::I64, old, keep);
+                let m = self.k32(w.mask() as u32);
+                let val = self.b.bin(BinOp::And, Ty::I32, val, m);
+                let val = self.b.extend(val, false);
+                let v = self.b.bin(BinOp::Or, Ty::I64, old, val);
+                self.wr64(n, v);
+            }
+            Reg::High(n) => {
+                let old = self.rd64(n);
+                let keep = self.k64(!0xff00u64);
+                let old = self.b.bin(BinOp::And, Ty::I64, old, keep);
+                let m = self.k32(0xff);
+                let val = self.b.bin(BinOp::And, Ty::I32, val, m);
+                let eight = self.k32(8);
+                let val = self.b.bin(BinOp::Shl, Ty::I32, val, eight);
+                let val = self.b.extend(val, false);
+                let v = self.b.bin(BinOp::Or, Ty::I64, old, val);
+                self.wr64(n, v);
+            }
+            Reg::Seg(_) | Reg::Xmm(_) | Reg::Mm(_) | Reg::St(_) => {}
+        }
+    }
+
+    // -- memory --------------------------------------------------------------------
+
+    /// The effective address of a memory operand, as an `I64`, and a static
+    /// offset to carry on the access.
+    fn addr(&mut self, m: &Mem) -> (Value, i64) {
+        let mut parts: Vec<Value> = Vec::new();
+        if let Some(b) = m.base {
+            parts.push(self.rd64(b));
+        }
+        if let Some(i) = m.index {
+            let mut v = self.rd64(i);
+            if m.scale > 1 {
+                let sh = self.k64(m.scale.trailing_zeros() as u64);
+                v = self.b.bin(BinOp::Shl, Ty::I64, v, sh);
+            }
+            parts.push(v);
+        }
+        if let Some(seg) = m.seg {
+            let base = match seg {
+                Seg::Fs => self.b.read(GuestReg::Tpidr),
+                _ => self.b.read(GuestReg::TpidrRo),
+            };
+            parts.push(base);
+        }
+        let mut sum: Option<Value> = None;
+        for p in parts {
+            sum = Some(match sum {
+                None => p,
+                Some(s) => self.b.bin(BinOp::Add, Ty::I64, s, p),
+            });
+        }
+        match sum {
+            None => (self.k64(m.disp as u64), 0),
+            Some(s) if m.addr32 => {
+                // 32-bit address arithmetic wraps before the access.
+                let d = self.k64(m.disp as u64);
+                let s = self.b.bin(BinOp::Add, Ty::I64, s, d);
+                let s = self.b.wrap(s);
+                (self.b.extend(s, false), 0)
+            }
+            Some(s) => (s, m.disp),
+        }
+    }
+
+    fn load(&mut self, m: &Mem, w: Width) -> Value {
+        let (addr, offset) = self.addr(m);
+        self.b.def(Expr::Load {
+            addr,
+            offset,
+            sz: mem_sz(w),
+            signed: false,
+            ty: ty_of(w),
+            order: Order::Relaxed,
+        })
+    }
+
+    fn store(&mut self, m: &Mem, w: Width, val: Value) {
+        let (addr, offset) = self.addr(m);
+        self.b.stmt(Stmt::Store {
+            addr,
+            offset,
+            val,
+            sz: mem_sz(w),
+            order: Order::Relaxed,
+        });
+    }
+
+    /// Read an operand at width `w`.
+    fn rd(&mut self, o: Operand, w: Width) -> Value {
+        match o {
+            Operand::Reg(r) => self.rd_reg(r),
+            Operand::Mem(m) => self.load(&m, w),
+            Operand::Imm(v) => self.k(ty_of(w), (v as u64) & w.mask()),
+        }
+    }
+
+    fn wr(&mut self, o: Operand, w: Width, val: Value) {
+        match o {
+            Operand::Reg(r) => self.wr_reg(r, val),
+            Operand::Mem(m) => self.store(&m, w, val),
+            Operand::Imm(_) => {}
+        }
+    }
+
+    // -- stack ------------------------------------------------------------------------
+
+    fn push(&mut self, w: Width, val: Value) {
+        let sp = self.rd64(RSP);
+        let n = self.k64((w.bytes() as u64).wrapping_neg());
+        let sp = self.b.bin(BinOp::Add, Ty::I64, sp, n);
+        self.b.stmt(Stmt::Store {
+            addr: sp,
+            offset: 0,
+            val,
+            sz: mem_sz(w),
+            order: Order::Relaxed,
+        });
+        self.wr64(RSP, sp);
+    }
+
+    fn pop(&mut self, w: Width) -> Value {
+        let sp = self.rd64(RSP);
+        let v = self.b.def(Expr::Load {
+            addr: sp,
+            offset: 0,
+            sz: mem_sz(w),
+            signed: false,
+            ty: ty_of(w),
+            order: Order::Relaxed,
+        });
+        let n = self.k64(w.bytes() as u64);
+        let sp = self.b.bin(BinOp::Add, Ty::I64, sp, n);
+        self.wr64(RSP, sp);
+        v
+    }
+
+    // -- flags -------------------------------------------------------------------
+
+    /// Mask an `I32` value to `w` when narrower than 32 bits.
+    fn narrow(&mut self, v: Value, w: Width) -> Value {
+        match w {
+            Width::B | Width::W => {
+                let m = self.k32(w.mask() as u32);
+                self.b.bin(BinOp::And, Ty::I32, v, m)
+            }
+            _ => v,
+        }
+    }
+
+    /// Sign-extend the low `w` bits of a value to its type.
+    fn sext(&mut self, v: Value, w: Width) -> Value {
+        match w {
+            Width::B | Width::W => self.b.def(Expr::ExtendBits {
+                a: v,
+                ty: Ty::I32,
+                bits: w.bits(),
+                signed: true,
+            }),
+            _ => v,
+        }
+    }
+
+    /// Bit `bits-1` of `v` (already masked), as an `I32` 0/1.
+    fn sign_bit(&mut self, v: Value, w: Width) -> Value {
+        let ty = ty_of(w);
+        let sh = self.k(ty, (w.bits() - 1) as u64);
+        let s = self.b.bin(BinOp::ShrU, ty, v, sh);
+        let s = if ty == Ty::I64 { self.b.wrap(s) } else { s };
+        let one = self.k32(1);
+        self.b.bin(BinOp::And, Ty::I32, s, one)
+    }
+
+    fn is_zero(&mut self, v: Value, w: Width) -> Value {
+        let ty = ty_of(w);
+        let z = self.k(ty, 0);
+        self.b.cmp(CmpOp::Eq, ty, v, z)
+    }
+
+    /// PF: 1 when the low byte has an even number of set bits.
+    fn parity(&mut self, v: Value, w: Width) -> Value {
+        let v = if ty_of(w) == Ty::I64 { self.b.wrap(v) } else { v };
+        let m = self.k32(0xff);
+        let v = self.b.bin(BinOp::And, Ty::I32, v, m);
+        let p = self.b.un(UnOp::Popcnt, Ty::I32, v);
+        let one = self.k32(1);
+        let p = self.b.bin(BinOp::And, Ty::I32, p, one);
+        self.b.bin(BinOp::Xor, Ty::I32, p, one)
+    }
+
+    /// AF: carry out of bit 3, `((a ^ b ^ r) >> 4) & 1`.
+    fn aux(&mut self, a: Value, b: Value, r: Value, w: Width) -> Value {
+        let ty = ty_of(w);
+        let x = self.b.bin(BinOp::Xor, ty, a, b);
+        let x = self.b.bin(BinOp::Xor, ty, x, r);
+        let x = if ty == Ty::I64 { self.b.wrap(x) } else { x };
+        let four = self.k32(4);
+        let x = self.b.bin(BinOp::ShrU, Ty::I32, x, four);
+        let one = self.k32(1);
+        self.b.bin(BinOp::And, Ty::I32, x, one)
+    }
+
+    fn write_flag(&mut self, r: GuestReg, v: Value) {
+        self.b.write(r, v);
+    }
+
+    /// The flags of a logical operation: C and O clear, A cleared too (it is
+    /// undefined, and zero is a value), S/Z/P from the masked result.
+    fn flags_logic(&mut self, r: Value, w: Width) {
+        let s = self.sign_bit(r, w);
+        let z = self.is_zero(r, w);
+        let p = self.parity(r, w);
+        let zero = self.k32(0);
+        self.write_flag(GuestReg::N, s);
+        self.write_flag(GuestReg::Z, z);
+        self.write_flag(GuestReg::C, zero);
+        self.write_flag(GuestReg::V, zero);
+        self.write_flag(GuestReg::P, p);
+        self.write_flag(GuestReg::A, zero);
+        self.flags = FlagSource::Logic {
+            v: r,
+            ty: ty_of(w),
+            bits: w.bits(),
+        };
+    }
+
+    /// The flags of `r = a + b (+ cin)`, `a`/`b`/`r` masked to `w`.
+    /// `cin` is an `I32` 0/1 carry-in, or `None`.
+    fn flags_add(&mut self, a: Value, b: Value, r: Value, w: Width, cin: Option<Value>, keep_c: bool) {
+        let ty = ty_of(w);
+        let s = self.sign_bit(r, w);
+        let z = self.is_zero(r, w);
+        let p = self.parity(r, w);
+        let af = self.aux(a, b, r, w);
+        // OF: operands same sign, result different.
+        let ar = self.b.bin(BinOp::Xor, ty, a, r);
+        let br = self.b.bin(BinOp::Xor, ty, b, r);
+        let o = self.b.bin(BinOp::And, ty, ar, br);
+        let o = self.sign_bit(o, w);
+        if !keep_c {
+            let c = match (w, cin) {
+                (Width::Q, None) => self.b.cmp(CmpOp::LtU, ty, r, a),
+                (Width::Q, Some(cin)) => {
+                    // carry = cin ? r <= a : r < a
+                    let lt = self.b.cmp(CmpOp::LtU, ty, r, a);
+                    let le = self.b.cmp(CmpOp::LeU, ty, r, a);
+                    self.b.select(cin, le, lt, Ty::I32)
+                }
+                (Width::D, None) => self.b.cmp(CmpOp::LtU, ty, r, a),
+                (Width::D, Some(cin)) => {
+                    let lt = self.b.cmp(CmpOp::LtU, ty, r, a);
+                    let le = self.b.cmp(CmpOp::LeU, ty, r, a);
+                    self.b.select(cin, le, lt, Ty::I32)
+                }
+                (_, cin) => {
+                    // Narrow: the unmasked sum's bit `bits` is the carry.
+                    let sum = self.b.bin(BinOp::Add, Ty::I32, a, b);
+                    let sum = match cin {
+                        Some(c) => self.b.bin(BinOp::Add, Ty::I32, sum, c),
+                        None => sum,
+                    };
+                    let sh = self.k32(w.bits());
+                    let c = self.b.bin(BinOp::ShrU, Ty::I32, sum, sh);
+                    let one = self.k32(1);
+                    self.b.bin(BinOp::And, Ty::I32, c, one)
+                }
+            };
+            self.write_flag(GuestReg::C, c);
+        }
+        self.write_flag(GuestReg::N, s);
+        self.write_flag(GuestReg::Z, z);
+        self.write_flag(GuestReg::V, o);
+        self.write_flag(GuestReg::P, p);
+        self.write_flag(GuestReg::A, af);
+        self.flags = FlagSource::Unknown;
+    }
+
+    /// The flags of `r = a - b (- bin)`.
+    fn flags_sub(&mut self, a: Value, b: Value, r: Value, w: Width, bin: Option<Value>, keep_c: bool) {
+        let ty = ty_of(w);
+        let s = self.sign_bit(r, w);
+        let z = self.is_zero(r, w);
+        let p = self.parity(r, w);
+        let af = self.aux(a, b, r, w);
+        // OF: operands differ in sign, result's sign differs from a's.
+        let ab = self.b.bin(BinOp::Xor, ty, a, b);
+        let ar = self.b.bin(BinOp::Xor, ty, a, r);
+        let o = self.b.bin(BinOp::And, ty, ab, ar);
+        let o = self.sign_bit(o, w);
+        if !keep_c {
+            let c = match bin {
+                None => self.b.cmp(CmpOp::LtU, ty, a, b),
+                Some(bin) => {
+                    let lt = self.b.cmp(CmpOp::LtU, ty, a, b);
+                    let le = self.b.cmp(CmpOp::LeU, ty, a, b);
+                    self.b.select(bin, le, lt, Ty::I32)
+                }
+            };
+            self.write_flag(GuestReg::C, c);
+        }
+        self.write_flag(GuestReg::N, s);
+        self.write_flag(GuestReg::Z, z);
+        self.write_flag(GuestReg::V, o);
+        self.write_flag(GuestReg::P, p);
+        self.write_flag(GuestReg::A, af);
+        self.flags = match bin {
+            None if !keep_c => FlagSource::Sub {
+                a,
+                b,
+                ty,
+                bits: w.bits(),
+            },
+            _ => FlagSource::Unknown,
+        };
+    }
+
+    fn read_flag(&mut self, r: GuestReg) -> Value {
+        self.b.read(r)
+    }
+
+    /// The `I32` truth value of a condition code.
+    fn cond(&mut self, c: Cond) -> Value {
+        let base = c.0 >> 1;
+        let inv = c.0 & 1 == 1;
+        let direct = match self.flags {
+            FlagSource::Sub { a, b, ty, bits } => {
+                let w = Width::from_bytes(bits / 8);
+                match base {
+                    1 => Some(self.b.cmp(CmpOp::LtU, ty, a, b)),
+                    2 => Some(self.b.cmp(CmpOp::Eq, ty, a, b)),
+                    3 => Some(self.b.cmp(CmpOp::LeU, ty, a, b)),
+                    6 => {
+                        let sa = self.sext(a, w);
+                        let sb = self.sext(b, w);
+                        Some(self.b.cmp(CmpOp::LtS, ty, sa, sb))
+                    }
+                    7 => {
+                        let sa = self.sext(a, w);
+                        let sb = self.sext(b, w);
+                        Some(self.b.cmp(CmpOp::LeS, ty, sa, sb))
+                    }
+                    _ => None,
+                }
+            }
+            FlagSource::Logic { v, ty, bits } => {
+                let w = Width::from_bytes(bits / 8);
+                match base {
+                    0 | 1 => Some(self.k32(0)),
+                    2 | 3 => {
+                        let z = self.k(ty, 0);
+                        Some(self.b.cmp(CmpOp::Eq, ty, v, z))
+                    }
+                    4 | 6 => {
+                        let sv = self.sext(v, w);
+                        let z = self.k(ty, 0);
+                        Some(self.b.cmp(CmpOp::LtS, ty, sv, z))
+                    }
+                    7 => {
+                        let sv = self.sext(v, w);
+                        let z = self.k(ty, 0);
+                        Some(self.b.cmp(CmpOp::LeS, ty, sv, z))
+                    }
+                    _ => None,
+                }
+            }
+            FlagSource::Unknown => None,
+        };
+        let v = match direct {
+            Some(v) => v,
+            None => match base {
+                0 => self.read_flag(GuestReg::V),
+                1 => self.read_flag(GuestReg::C),
+                2 => self.read_flag(GuestReg::Z),
+                3 => {
+                    let c = self.read_flag(GuestReg::C);
+                    let z = self.read_flag(GuestReg::Z);
+                    self.b.bin(BinOp::Or, Ty::I32, c, z)
+                }
+                4 => self.read_flag(GuestReg::N),
+                5 => self.read_flag(GuestReg::P),
+                6 => {
+                    let s = self.read_flag(GuestReg::N);
+                    let o = self.read_flag(GuestReg::V);
+                    self.b.bin(BinOp::Xor, Ty::I32, s, o)
+                }
+                _ => {
+                    let s = self.read_flag(GuestReg::N);
+                    let o = self.read_flag(GuestReg::V);
+                    let so = self.b.bin(BinOp::Xor, Ty::I32, s, o);
+                    let z = self.read_flag(GuestReg::Z);
+                    self.b.bin(BinOp::Or, Ty::I32, so, z)
+                }
+            },
+        };
+        if inv {
+            let one = self.k32(1);
+            self.b.bin(BinOp::Xor, Ty::I32, v, one)
+        } else {
+            v
+        }
+    }
+
+    // -- the entry point ----------------------------------------------------------------
+
+    pub fn lift(&mut self, i: &Inst, pc: u64) -> Flow {
+        self.pc = pc;
+        self.next = pc + i.len as u64;
+        let next = self.next;
+        let w = i.width;
+        let ty = ty_of(w);
+        match i.op {
+            Op::Unknown | Op::Undefined | Op::Hlt | Op::Int | Op::Xlat => {
+                Flow::End(Term::Illegal { raw: self.raw, pc })
+            }
+            Op::Nop | Op::Endbr | Op::Pause | Op::Prefetch | Op::Fwait | Op::Clflush => Flow::Next,
+            Op::Fence => {
+                self.b.stmt(Stmt::Fence);
+                Flow::Next
+            }
+
+            // -- moves --------------------------------------------------------------
+            Op::Mov | Op::Movabs => {
+                let v = self.rd(i.op1(), w);
+                self.wr(i.op0(), w, v);
+                Flow::Next
+            }
+            Op::Movzx(sw) => {
+                let v = self.rd(i.op1(), sw);
+                let v = self.widen(v, sw, w, false);
+                self.wr(i.op0(), w, v);
+                Flow::Next
+            }
+            Op::Movsx(sw) => {
+                let v = self.rd(i.op1(), sw);
+                let v = self.widen(v, sw, w, true);
+                self.wr(i.op0(), w, v);
+                Flow::Next
+            }
+            Op::Movsxd => {
+                let v = self.rd(i.op1(), Width::D);
+                let v = self.widen(v, Width::D, w, true);
+                self.wr(i.op0(), w, v);
+                Flow::Next
+            }
+            Op::Lea => {
+                let Operand::Mem(m) = i.op1() else {
+                    return Flow::End(Term::Illegal { raw: self.raw, pc });
+                };
+                // lea has no segment base and no access: pure arithmetic.
+                let mut m = m;
+                m.seg = None;
+                let (a, off) = self.addr(&m);
+                let a = if off != 0 {
+                    let d = self.k64(off as u64);
+                    self.b.bin(BinOp::Add, Ty::I64, a, d)
+                } else {
+                    a
+                };
+                let v = match w {
+                    Width::Q => a,
+                    _ => {
+                        let v = self.b.wrap(a);
+                        self.narrow(v, w)
+                    }
+                };
+                self.wr(i.op0(), w, v);
+                Flow::Next
+            }
+            Op::Push => {
+                let v = match i.op0() {
+                    Operand::Imm(imm) => self.k(ty, (imm as u64) & w.mask()),
+                    Operand::Reg(Reg::Seg(_)) => self.k(ty, 0),
+                    o => self.rd(o, w),
+                };
+                self.push(w, v);
+                Flow::Next
+            }
+            Op::Pop => {
+                let v = self.pop(w);
+                if !matches!(i.op0(), Operand::Reg(Reg::Seg(_))) {
+                    self.wr(i.op0(), w, v);
+                }
+                Flow::Next
+            }
+            Op::Xchg => {
+                let (d, s) = (i.op0(), i.op1());
+                if i.lock || matches!(d, Operand::Mem(_)) {
+                    if let Operand::Mem(m) = d {
+                        let sv = self.rd(s, w);
+                        let (addr, offset) = self.addr(&m);
+                        let addr = self.offset_addr(addr, offset);
+                        let old = self.b.def(Expr::Rmw {
+                            op: RmwOp::Xchg,
+                            addr,
+                            val: sv,
+                            sz: mem_sz(w),
+                            ty,
+                        });
+                        self.wr(s, w, old);
+                        return Flow::Next;
+                    }
+                }
+                let dv = self.rd(d, w);
+                let sv = self.rd(s, w);
+                self.wr(d, w, sv);
+                self.wr(s, w, dv);
+                Flow::Next
+            }
+            Op::Cmovcc(c) => {
+                let cond = self.cond(c);
+                let dv = self.rd(i.op0(), w);
+                let sv = self.rd(i.op1(), w);
+                let v = self.b.select(cond, sv, dv, ty);
+                self.wr(i.op0(), w, v);
+                Flow::Next
+            }
+            Op::Setcc(c) => {
+                let cond = self.cond(c);
+                self.wr(i.op0(), Width::B, cond);
+                Flow::Next
+            }
+            Op::Cbw => {
+                // Sign-extend the low half of rax into the width.
+                let half = Width::from_bytes(w.bytes() / 2);
+                let v = self.rd_reg(Reg::Gp(RAX, half));
+                let v = self.widen(v, half, w, true);
+                self.wr_reg(Reg::Gp(RAX, w), v);
+                Flow::Next
+            }
+            Op::Cwd => {
+                let v = self.rd_reg(Reg::Gp(RAX, w));
+                let s = self.sext(v, w);
+                let sh = self.k(ty, (w.bits() - 1) as u64);
+                let v = self.b.bin(BinOp::ShrS, ty, s, sh);
+                let v = self.narrow(v, w);
+                self.wr_reg(Reg::Gp(RDX, w), v);
+                Flow::Next
+            }
+            Op::Bswap => {
+                let v = self.rd(i.op0(), w);
+                let v = self.byte_reverse(v, w);
+                self.wr(i.op0(), w, v);
+                Flow::Next
+            }
+            Op::Movbe => {
+                let v = self.rd(i.op1(), w);
+                let v = self.byte_reverse(v, w);
+                self.wr(i.op0(), w, v);
+                Flow::Next
+            }
+
+            // -- arithmetic --------------------------------------------------------------
+            Op::Add | Op::Or | Op::Adc | Op::Sbb | Op::And | Op::Sub | Op::Xor | Op::Cmp | Op::Test => {
+                self.alu(i.op, i.op0(), i.op1(), w, i.lock);
+                Flow::Next
+            }
+            Op::Inc | Op::Dec => {
+                let d = i.op0();
+                let one = self.k(ty, 1);
+                let a = if i.lock {
+                    if let Operand::Mem(m) = d {
+                        let (addr, offset) = self.addr(&m);
+                        let addr = self.offset_addr(addr, offset);
+                        self.b.def(Expr::Rmw {
+                            op: if i.op == Op::Inc { RmwOp::Add } else { RmwOp::Sub },
+                            addr,
+                            val: one,
+                            sz: mem_sz(w),
+                            ty,
+                        })
+                    } else {
+                        self.rd(d, w)
+                    }
+                } else {
+                    self.rd(d, w)
+                };
+                let a = self.narrow(a, w);
+                let r = if i.op == Op::Inc {
+                    self.b.bin(BinOp::Add, ty, a, one)
+                } else {
+                    self.b.bin(BinOp::Sub, ty, a, one)
+                };
+                let r = self.narrow(r, w);
+                if !i.lock {
+                    self.wr(d, w, r);
+                }
+                if i.op == Op::Inc {
+                    self.flags_add(a, one, r, w, None, true);
+                } else {
+                    self.flags_sub(a, one, r, w, None, true);
+                }
+                Flow::Next
+            }
+            Op::Neg => {
+                let a = self.rd(i.op0(), w);
+                let zero = self.k(ty, 0);
+                let r = self.b.bin(BinOp::Sub, ty, zero, a);
+                let r = self.narrow(r, w);
+                self.wr(i.op0(), w, r);
+                self.flags_sub(zero, a, r, w, None, false);
+                // CF is "a != 0", which the sub formula (0 < a) already gives.
+                self.flags = FlagSource::Unknown;
+                Flow::Next
+            }
+            Op::Not => {
+                let a = self.rd(i.op0(), w);
+                let r = self.b.un(UnOp::Not, ty, a);
+                let r = self.narrow(r, w);
+                self.wr(i.op0(), w, r);
+                Flow::Next
+            }
+            Op::Mul => {
+                self.mul1(i.op0(), w, false);
+                Flow::Next
+            }
+            Op::Imul1 => {
+                self.mul1(i.op0(), w, true);
+                Flow::Next
+            }
+            Op::Imul => {
+                let (dst, a, b) = if i.n_ops() == 3 {
+                    (i.op0(), i.op1(), i.op2())
+                } else {
+                    (i.op0(), i.op0(), i.op1())
+                };
+                let av = self.rd(a, w);
+                let bv = self.rd(b, w);
+                let av = self.sext(av, w);
+                let bv = self.sext(bv, w);
+                let r = self.b.bin(BinOp::Mul, ty, av, bv);
+                let rn = self.narrow(r, w);
+                self.wr(dst, w, rn);
+                // CF = OF = the full product does not fit the width.
+                let of = match w {
+                    Width::Q => {
+                        // Compare high half of the 128-bit product against the
+                        // sign of the low half. High half via the identity
+                        // hi = mulhs(a, b).
+                        let hi = self.mulh_s64(av, bv);
+                        let sh = self.k64(63);
+                        let sign = self.b.bin(BinOp::ShrS, Ty::I64, r, sh);
+                        self.b.cmp(CmpOp::Ne, Ty::I64, hi, sign)
+                    }
+                    Width::D => {
+                        let a64 = self.b.extend(av, true);
+                        let b64 = self.b.extend(bv, true);
+                        let full = self.b.bin(BinOp::Mul, Ty::I64, a64, b64);
+                        let r64 = self.b.extend(r, true);
+                        self.b.cmp(CmpOp::Ne, Ty::I64, full, r64)
+                    }
+                    _ => {
+                        let s = self.sext(rn, w);
+                        self.b.cmp(CmpOp::Ne, Ty::I32, s, r)
+                    }
+                };
+                self.write_flag(GuestReg::C, of);
+                self.write_flag(GuestReg::V, of);
+                // S/Z/P/A are undefined; give them the result's values.
+                let s = self.sign_bit(rn, w);
+                let z = self.is_zero(rn, w);
+                let p = self.parity(rn, w);
+                let zero = self.k32(0);
+                self.write_flag(GuestReg::N, s);
+                self.write_flag(GuestReg::Z, z);
+                self.write_flag(GuestReg::P, p);
+                self.write_flag(GuestReg::A, zero);
+                self.flags = FlagSource::Unknown;
+                Flow::Next
+            }
+            Op::Div | Op::Idiv => self.div(i.op0(), w, i.op == Op::Idiv),
+            Op::Shl | Op::Shr | Op::Sar | Op::Rol | Op::Ror => {
+                self.shift(i.op, i.op0(), i.op1(), w);
+                Flow::Next
+            }
+            Op::Rcl | Op::Rcr => self.rotate_carry(i.op, i.op0(), i.op1(), w),
+            Op::Shld | Op::Shrd => {
+                self.double_shift(i.op, i.op0(), i.op1(), i.op2(), w);
+                Flow::Next
+            }
+            Op::Bt | Op::Bts | Op::Btr | Op::Btc => {
+                self.bit_test(i.op, i.op0(), i.op1(), w, i.lock);
+                Flow::Next
+            }
+            Op::Bsf | Op::Bsr | Op::Tzcnt | Op::Lzcnt => {
+                let src = self.rd(i.op1(), w);
+                let src = self.narrow(src, w);
+                let zero = self.k(ty, 0);
+                let is_zero = self.b.cmp(CmpOp::Eq, ty, src, zero);
+                let r = match i.op {
+                    Op::Bsf | Op::Tzcnt => {
+                        // ctz of a zero narrow value is the type width; cap
+                        // to the operand width for tzcnt.
+                        let c = self.b.un(UnOp::Ctz, ty, src);
+                        if w.bits() < 32 {
+                            let cap = self.k32(w.bits());
+                            self.b.select(is_zero, cap, c, Ty::I32)
+                        } else {
+                            c
+                        }
+                    }
+                    Op::Bsr => {
+                        // bits-1-clz at the operand width.
+                        let c = self.b.un(UnOp::Clz, ty, src);
+                        let k = self.k(ty, (ty.bits() - 1) as u64);
+                        let r = self.b.bin(BinOp::Sub, ty, k, c);
+                        r
+                    }
+                    _ => {
+                        // lzcnt at the operand width: clz minus the type's
+                        // extra bits (zero-extended narrow values).
+                        let c = self.b.un(UnOp::Clz, ty, src);
+                        if w.bits() < ty.bits() {
+                            let k = self.k(ty, (ty.bits() - w.bits()) as u64);
+                            self.b.bin(BinOp::Sub, ty, c, k)
+                        } else {
+                            c
+                        }
+                    }
+                };
+                match i.op {
+                    Op::Bsf | Op::Bsr => {
+                        // Destination undefined when the source is zero; keep
+                        // it, as hardware does.
+                        let old = self.rd(i.op0(), w);
+                        let v = self.b.select(is_zero, old, r, ty);
+                        let v = self.narrow(v, w);
+                        self.wr(i.op0(), w, v);
+                        self.write_flag(GuestReg::Z, is_zero);
+                    }
+                    _ => {
+                        let r = self.narrow(r, w);
+                        self.wr(i.op0(), w, r);
+                        self.write_flag(GuestReg::C, is_zero);
+                        let z = self.is_zero(r, w);
+                        self.write_flag(GuestReg::Z, z);
+                    }
+                }
+                self.flags = FlagSource::Unknown;
+                Flow::Next
+            }
+            Op::Popcnt => {
+                let src = self.rd(i.op1(), w);
+                let src = self.narrow(src, w);
+                let r = self.b.un(UnOp::Popcnt, ty, src);
+                self.wr(i.op0(), w, r);
+                let z = self.is_zero(src, w);
+                let zero = self.k32(0);
+                self.write_flag(GuestReg::Z, z);
+                for f in [GuestReg::N, GuestReg::C, GuestReg::V, GuestReg::P, GuestReg::A] {
+                    self.write_flag(f, zero);
+                }
+                self.flags = FlagSource::Unknown;
+                Flow::Next
+            }
+            Op::Xadd => {
+                let (d, s) = (i.op0(), i.op1());
+                let sv = self.rd(s, w);
+                let old = match d {
+                    Operand::Mem(m) => {
+                        let (addr, offset) = self.addr(&m);
+                        let addr = self.offset_addr(addr, offset);
+                        self.b.def(Expr::Rmw {
+                            op: RmwOp::Add,
+                            addr,
+                            val: sv,
+                            sz: mem_sz(w),
+                            ty,
+                        })
+                    }
+                    _ => {
+                        let dv = self.rd(d, w);
+                        let r = self.b.bin(BinOp::Add, ty, dv, sv);
+                        let r = self.narrow(r, w);
+                        self.wr(d, w, r);
+                        dv
+                    }
+                };
+                let old = self.narrow(old, w);
+                let r = self.b.bin(BinOp::Add, ty, old, sv);
+                let r = self.narrow(r, w);
+                self.wr(s, w, old);
+                self.flags_add(old, sv, r, w, None, false);
+                Flow::Next
+            }
+            Op::Cmpxchg => {
+                let (d, s) = (i.op0(), i.op1());
+                let acc = self.rd_reg(Reg::Gp(RAX, w));
+                let sv = self.rd(s, w);
+                let old = match d {
+                    Operand::Mem(m) => {
+                        let (addr, offset) = self.addr(&m);
+                        let addr = self.offset_addr(addr, offset);
+                        self.b.def(Expr::CmpXchg {
+                            addr,
+                            expected: acc,
+                            replacement: sv,
+                            sz: mem_sz(w),
+                            ty,
+                        })
+                    }
+                    _ => {
+                        let dv = self.rd(d, w);
+                        let eq = self.b.cmp(CmpOp::Eq, ty, dv, acc);
+                        let nv = self.b.select(eq, sv, dv, ty);
+                        self.wr(d, w, nv);
+                        dv
+                    }
+                };
+                let old = self.narrow(old, w);
+                // Unequal: the accumulator receives what was there.
+                let eq = self.b.cmp(CmpOp::Eq, ty, old, acc);
+                let nacc = self.b.select(eq, acc, old, ty);
+                self.wr_reg(Reg::Gp(RAX, w), nacc);
+                let r = self.b.bin(BinOp::Sub, ty, acc, old);
+                let r = self.narrow(r, w);
+                self.flags_sub(acc, old, r, w, None, false);
+                Flow::Next
+            }
+            Op::CmpxchgNb => {
+                // cmpxchg8b/16b: rdx:rax against [m]; replace with rcx:rbx.
+                // Not atomic across the two halves.
+                let Operand::Mem(m) = i.op0() else {
+                    return Flow::End(Term::Illegal { raw: self.raw, pc });
+                };
+                let (addr, offset) = self.addr(&m);
+                let half = w; // D for 8b (two 32-bit halves), Q for 16b
+                let sz = mem_sz(half);
+                let lo = self.b.def(Expr::Load {
+                    addr,
+                    offset,
+                    sz,
+                    signed: false,
+                    ty,
+                    order: Order::SeqCst,
+                });
+                let hi = self.b.def(Expr::Load {
+                    addr,
+                    offset: offset + half.bytes() as i64,
+                    sz,
+                    signed: false,
+                    ty,
+                    order: Order::SeqCst,
+                });
+                let rax = self.rd_reg(Reg::Gp(RAX, half));
+                let rdx = self.rd_reg(Reg::Gp(RDX, half));
+                let eq_lo = self.b.cmp(CmpOp::Eq, ty, lo, rax);
+                let eq_hi = self.b.cmp(CmpOp::Eq, ty, hi, rdx);
+                let eq = self.b.bin(BinOp::And, Ty::I32, eq_lo, eq_hi);
+                let rbx = self.rd_reg(Reg::Gp(3, half));
+                let rcx = self.rd_reg(Reg::Gp(RCX, half));
+                let nlo = self.b.select(eq, rbx, lo, ty);
+                let nhi = self.b.select(eq, rcx, hi, ty);
+                self.b.stmt(Stmt::Store {
+                    addr,
+                    offset,
+                    val: nlo,
+                    sz,
+                    order: Order::SeqCst,
+                });
+                self.b.stmt(Stmt::Store {
+                    addr,
+                    offset: offset + half.bytes() as i64,
+                    val: nhi,
+                    sz,
+                    order: Order::SeqCst,
+                });
+                let nrax = self.b.select(eq, rax, lo, ty);
+                let nrdx = self.b.select(eq, rdx, hi, ty);
+                self.wr_reg(Reg::Gp(RAX, half), nrax);
+                self.wr_reg(Reg::Gp(RDX, half), nrdx);
+                self.write_flag(GuestReg::Z, eq);
+                self.flags = FlagSource::Unknown;
+                Flow::Next
+            }
+
+            // -- control flow ------------------------------------------------------------
+            Op::Jmp => match i.op0() {
+                Operand::Imm(t) => Flow::End(Term::Goto { target: t as u64 }),
+                o => {
+                    let target = self.rd(o, Width::Q);
+                    Flow::End(Term::Indirect {
+                        target,
+                        is_ret: false,
+                    })
+                }
+            },
+            Op::Jcc(c) => {
+                let Operand::Imm(t) = i.op0() else {
+                    return Flow::End(Term::Illegal { raw: self.raw, pc });
+                };
+                let cond = self.cond(c);
+                Flow::End(Term::Branch {
+                    cond,
+                    taken: t as u64,
+                    not_taken: next,
+                })
+            }
+            Op::Jrcxz | Op::Loop | Op::Loope | Op::Loopne => {
+                let Operand::Imm(t) = i.op0() else {
+                    return Flow::End(Term::Illegal { raw: self.raw, pc });
+                };
+                let cw = w; // Q, or D with 0x67
+                let mut rcx = self.rd_reg(Reg::Gp(RCX, cw));
+                if i.op != Op::Jrcxz {
+                    let one = self.k(ty_of(cw), 1);
+                    rcx = self.b.bin(BinOp::Sub, ty_of(cw), rcx, one);
+                    self.wr_reg(Reg::Gp(RCX, cw), rcx);
+                }
+                let zero = self.k(ty_of(cw), 0);
+                let cond = match i.op {
+                    Op::Jrcxz => self.b.cmp(CmpOp::Eq, ty_of(cw), rcx, zero),
+                    Op::Loop => self.b.cmp(CmpOp::Ne, ty_of(cw), rcx, zero),
+                    Op::Loope => {
+                        let nz = self.b.cmp(CmpOp::Ne, ty_of(cw), rcx, zero);
+                        let z = self.cond(Cond(4));
+                        self.b.bin(BinOp::And, Ty::I32, nz, z)
+                    }
+                    _ => {
+                        let nz = self.b.cmp(CmpOp::Ne, ty_of(cw), rcx, zero);
+                        let z = self.cond(Cond(5));
+                        self.b.bin(BinOp::And, Ty::I32, nz, z)
+                    }
+                };
+                Flow::End(Term::Branch {
+                    cond,
+                    taken: t as u64,
+                    not_taken: next,
+                })
+            }
+            Op::Call => {
+                let target = match i.op0() {
+                    Operand::Imm(t) => None.or(Some(t as u64)).map(|t| (t, None)),
+                    o => {
+                        let v = self.rd(o, Width::Q);
+                        Some((0, Some(v)))
+                    }
+                };
+                let ret = self.k64(next);
+                self.push(Width::Q, ret);
+                self.b.set_call_return(next);
+                match target {
+                    Some((t, None)) => Flow::End(Term::Goto { target: t }),
+                    Some((_, Some(v))) => Flow::End(Term::Indirect {
+                        target: v,
+                        is_ret: false,
+                    }),
+                    None => unreachable!(),
+                }
+            }
+            Op::Ret => {
+                let target = self.pop(Width::Q);
+                if let Some(Operand::Imm(n)) = i.ops[0] {
+                    let sp = self.rd64(RSP);
+                    let k = self.k64(n as u64);
+                    let sp = self.b.bin(BinOp::Add, Ty::I64, sp, k);
+                    self.wr64(RSP, sp);
+                }
+                Flow::End(Term::Indirect {
+                    target,
+                    is_ret: true,
+                })
+            }
+            Op::Leave => {
+                let rbp = self.rd64(RBP);
+                self.wr64(RSP, rbp);
+                let v = self.pop(w);
+                self.wr_reg(Reg::Gp(RBP, w), v);
+                Flow::Next
+            }
+            Op::Enter => {
+                // enter imm16, 0: push rbp; mov rbp, rsp; sub rsp, imm.
+                let Some(Operand::Imm(size)) = i.ops[0] else {
+                    return Flow::End(Term::Illegal { raw: self.raw, pc });
+                };
+                let rbp = self.rd64(RBP);
+                self.push(Width::Q, rbp);
+                let sp = self.rd64(RSP);
+                self.wr64(RBP, sp);
+                let k = self.k64((size as u64).wrapping_neg());
+                let sp = self.b.bin(BinOp::Add, Ty::I64, sp, k);
+                self.wr64(RSP, sp);
+                Flow::Next
+            }
+            Op::Syscall => {
+                // The kernel returns with rcx = the return address and r11 =
+                // rflags; both are clobbers a guest may not rely on beyond
+                // "clobbered", so a plausible value in each is enough.
+                let n = self.k64(next);
+                self.wr64(RCX, n);
+                let fl = self.k64(0x246);
+                self.wr64(R11, fl);
+                Flow::End(Term::Syscall { next })
+            }
+            Op::Int3 => {
+                let pcv = self.k64(pc);
+                let immv = self.k32(3);
+                self.b.stmt(Stmt::HostCall {
+                    func: HostFunc::Breakpoint,
+                    args: vec![pcv, immv],
+                });
+                Flow::End(Term::Goto { target: next })
+            }
+            Op::Cpuid => {
+                let eax = self.rd_reg(Reg::Gp(RAX, Width::D));
+                let ecx = self.rd_reg(Reg::Gp(RCX, Width::D));
+                let eax = self.b.extend(eax, false);
+                let ecx = self.b.extend(ecx, false);
+                let sh = self.k64(32);
+                let ecx = self.b.bin(BinOp::Shl, Ty::I64, ecx, sh);
+                let v = self.b.bin(BinOp::Or, Ty::I64, eax, ecx);
+                let pcv = self.k64(pc);
+                let id = self.k32(sysreg::CPUID as u32);
+                self.b.stmt(Stmt::HostCall {
+                    func: HostFunc::SysRegWrite,
+                    args: vec![pcv, id, v],
+                });
+                Flow::Next
+            }
+            Op::Rdtsc | Op::Rdtscp => {
+                let pcv = self.k64(pc);
+                let id = self.k32(sysreg::TSC as u32);
+                let v = self.b.def(Expr::HostCall {
+                    func: HostFunc::SysRegRead,
+                    args: vec![pcv, id],
+                    ty: Ty::I64,
+                });
+                let lo = self.b.wrap(v);
+                let sh = self.k64(32);
+                let hi = self.b.bin(BinOp::ShrU, Ty::I64, v, sh);
+                let hi = self.b.wrap(hi);
+                self.wr_reg(Reg::Gp(RAX, Width::D), lo);
+                self.wr_reg(Reg::Gp(RDX, Width::D), hi);
+                if i.op == Op::Rdtscp {
+                    let z = self.k32(0);
+                    self.wr_reg(Reg::Gp(RCX, Width::D), z);
+                }
+                Flow::Next
+            }
+            Op::Xgetbv => {
+                // XCR0 = x87 | SSE: what the advertised CPUID promises.
+                let lo = self.k32(3);
+                let hi = self.k32(0);
+                self.wr_reg(Reg::Gp(RAX, Width::D), lo);
+                self.wr_reg(Reg::Gp(RDX, Width::D), hi);
+                Flow::Next
+            }
+            Op::Rdrand | Op::Rdseed => {
+                // Not advertised; a guest that probes anyway gets CF=0 (no
+                // random value available).
+                let zero = self.k32(0);
+                self.write_flag(GuestReg::C, zero);
+                self.flags = FlagSource::Unknown;
+                Flow::Next
+            }
+
+            // -- flags -------------------------------------------------------------------
+            Op::Clc | Op::Stc | Op::Cmc => {
+                let v = match i.op {
+                    Op::Clc => self.k32(0),
+                    Op::Stc => self.k32(1),
+                    _ => {
+                        let c = self.read_flag(GuestReg::C);
+                        let one = self.k32(1);
+                        self.b.bin(BinOp::Xor, Ty::I32, c, one)
+                    }
+                };
+                self.write_flag(GuestReg::C, v);
+                self.flags = FlagSource::Unknown;
+                Flow::Next
+            }
+            Op::Cld | Op::Std => {
+                let v = self.k32(if i.op == Op::Std { 1 } else { 0 });
+                self.write_flag(GuestReg::D, v);
+                Flow::Next
+            }
+            Op::Lahf => {
+                let v = self.flags_byte();
+                self.wr_reg(Reg::High(0), v);
+                Flow::Next
+            }
+            Op::Sahf => {
+                let v = self.rd_reg(Reg::High(0));
+                self.unpack_flags_low(v);
+                Flow::Next
+            }
+            Op::Pushf => {
+                let v = self.rflags();
+                let v = if w == Width::Q { self.b.extend(v, false) } else { v };
+                self.push(w, v);
+                Flow::Next
+            }
+            Op::Popf => {
+                let v = self.pop(w);
+                let v = if w == Width::Q { self.b.wrap(v) } else { v };
+                self.unpack_flags_low(v);
+                let ten = self.k32(10);
+                let d = self.b.bin(BinOp::ShrU, Ty::I32, v, ten);
+                let one = self.k32(1);
+                let d = self.b.bin(BinOp::And, Ty::I32, d, one);
+                self.write_flag(GuestReg::D, d);
+                let eleven = self.k32(11);
+                let o = self.b.bin(BinOp::ShrU, Ty::I32, v, eleven);
+                let o = self.b.bin(BinOp::And, Ty::I32, o, one);
+                self.write_flag(GuestReg::V, o);
+                Flow::Next
+            }
+
+            // -- strings ------------------------------------------------------------------
+            Op::Movs | Op::Stos | Op::Lods | Op::Scas | Op::Cmps => self.string_op(i),
+
+            // -- SSE / x87 ------------------------------------------------------------------
+            Op::Fld(_)
+            | Op::Fild(_)
+            | Op::Fst { .. }
+            | Op::Fist { .. }
+            | Op::FldSt(_)
+            | Op::FstSt { .. }
+            | Op::Fxch(_)
+            | Op::Fadd(_)
+            | Op::Fsub(_)
+            | Op::Fsubr(_)
+            | Op::Fmul(_)
+            | Op::Fdiv(_)
+            | Op::Fdivr(_)
+            | Op::Fcom { .. }
+            | Op::Fucom { .. }
+            | Op::Fcomi { .. }
+            | Op::Ficom { .. }
+            | Op::Fchs
+            | Op::Fabs
+            | Op::Ftst
+            | Op::Fxam
+            | Op::Fld1
+            | Op::Fldl2t
+            | Op::Fldl2e
+            | Op::Fldpi
+            | Op::Fldlg2
+            | Op::Fldln2
+            | Op::Fldz
+            | Op::F2xm1
+            | Op::Fyl2x
+            | Op::Fptan
+            | Op::Fpatan
+            | Op::Fxtract
+            | Op::Fprem1
+            | Op::Fdecstp
+            | Op::Fincstp
+            | Op::Fprem
+            | Op::Fyl2xp1
+            | Op::Fsqrt
+            | Op::Fsincos
+            | Op::Frndint
+            | Op::Fscale
+            | Op::Fsin
+            | Op::Fcos
+            | Op::Fnop
+            | Op::Fninit
+            | Op::Fnclex
+            | Op::Fldcw
+            | Op::Fnstcw
+            | Op::Fnstsw
+            | Op::FnstswAx
+            | Op::Fldenv
+            | Op::Fnstenv
+            | Op::Frstor
+            | Op::Fnsave
+            | Op::Ffree(_)
+            | Op::Ffreep(_)
+            | Op::Fcmovcc { .. } => self.x87(i),
+
+            Op::Ldmxcsr => {
+                let v = self.rd(i.op0(), Width::D);
+                self.b.write(GuestReg::Mxcsr, v);
+                Flow::Next
+            }
+            Op::Stmxcsr => {
+                let v = self.b.read(GuestReg::Mxcsr);
+                self.wr(i.op0(), Width::D, v);
+                Flow::Next
+            }
+            Op::Fxsave | Op::Fxrstor | Op::Xsave | Op::Xrstor => self.fxsave(i),
+
+            Op::Crc32
+            | Op::Andn
+            | Op::Bzhi
+            | Op::Blsr
+            | Op::Blsmsk
+            | Op::Blsi
+            | Op::Sarx
+            | Op::Shlx
+            | Op::Shrx
+            | Op::Bextr => Flow::End(Term::Illegal { raw: self.raw, pc }),
+
+            _ => self.sse(i),
+        }
+    }
+
+    // -- helpers for the arms above ----------------------------------------------------
+
+    fn widen(&mut self, v: Value, from: Width, to: Width, signed: bool) -> Value {
+        let v = if signed { self.sext(v, from) } else { self.narrow(v, from) };
+        match (ty_of(from), ty_of(to)) {
+            (Ty::I32, Ty::I64) => self.b.extend(v, signed),
+            (Ty::I32, Ty::I32) => self.narrow(v, to),
+            _ => v,
+        }
+    }
+
+    fn offset_addr(&mut self, addr: Value, offset: i64) -> Value {
+        if offset == 0 {
+            addr
+        } else {
+            let d = self.k64(offset as u64);
+            self.b.bin(BinOp::Add, Ty::I64, addr, d)
+        }
+    }
+
+    /// `hi64(a * b)` for signed 64-bit operands, from 32-bit pieces.
+    fn mulh_s64(&mut self, a: Value, b: Value) -> Value {
+        // Unsigned high product, then correct for signs:
+        // mulhs(a,b) = mulhu(a,b) - (a<0 ? b : 0) - (b<0 ? a : 0).
+        let hu = self.mulh_u64(a, b);
+        let sh = self.k64(63);
+        let sa = self.b.bin(BinOp::ShrS, Ty::I64, a, sh); // 0 or -1
+        let sb = self.b.bin(BinOp::ShrS, Ty::I64, b, sh);
+        let ta = self.b.bin(BinOp::And, Ty::I64, sa, b);
+        let tb = self.b.bin(BinOp::And, Ty::I64, sb, a);
+        let r = self.b.bin(BinOp::Sub, Ty::I64, hu, ta);
+        self.b.bin(BinOp::Sub, Ty::I64, r, tb)
+    }
+
+    /// `hi64(a * b)` for unsigned 64-bit operands.
+    fn mulh_u64(&mut self, a: Value, b: Value) -> Value {
+        let m32 = self.k64(0xffff_ffff);
+        let sh = self.k64(32);
+        let a0 = self.b.bin(BinOp::And, Ty::I64, a, m32);
+        let a1 = self.b.bin(BinOp::ShrU, Ty::I64, a, sh);
+        let b0 = self.b.bin(BinOp::And, Ty::I64, b, m32);
+        let b1 = self.b.bin(BinOp::ShrU, Ty::I64, b, sh);
+        let p00 = self.b.bin(BinOp::Mul, Ty::I64, a0, b0);
+        let p01 = self.b.bin(BinOp::Mul, Ty::I64, a0, b1);
+        let p10 = self.b.bin(BinOp::Mul, Ty::I64, a1, b0);
+        let p11 = self.b.bin(BinOp::Mul, Ty::I64, a1, b1);
+        // mid = (p00 >> 32) + (p01 & m32) + (p10 & m32)
+        let p00h = self.b.bin(BinOp::ShrU, Ty::I64, p00, sh);
+        let p01l = self.b.bin(BinOp::And, Ty::I64, p01, m32);
+        let p10l = self.b.bin(BinOp::And, Ty::I64, p10, m32);
+        let mid = self.b.bin(BinOp::Add, Ty::I64, p00h, p01l);
+        let mid = self.b.bin(BinOp::Add, Ty::I64, mid, p10l);
+        let midh = self.b.bin(BinOp::ShrU, Ty::I64, mid, sh);
+        let p01h = self.b.bin(BinOp::ShrU, Ty::I64, p01, sh);
+        let p10h = self.b.bin(BinOp::ShrU, Ty::I64, p10, sh);
+        let hi = self.b.bin(BinOp::Add, Ty::I64, p11, p01h);
+        let hi = self.b.bin(BinOp::Add, Ty::I64, hi, p10h);
+        self.b.bin(BinOp::Add, Ty::I64, hi, midh)
+    }
+
+    fn byte_reverse(&mut self, v: Value, w: Width) -> Value {
+        let ty = ty_of(w);
+        let n = w.bytes();
+        let mut acc: Option<Value> = None;
+        for i in 0..n {
+            let from = i * 8;
+            let to = (n - 1 - i) * 8;
+            let m = self.k(ty, 0xffu64 << from);
+            let piece = self.b.bin(BinOp::And, ty, v, m);
+            let piece = if to > from {
+                let s = self.k(ty, (to - from) as u64);
+                self.b.bin(BinOp::Shl, ty, piece, s)
+            } else if from > to {
+                let s = self.k(ty, (from - to) as u64);
+                self.b.bin(BinOp::ShrU, ty, piece, s)
+            } else {
+                piece
+            };
+            acc = Some(match acc {
+                None => piece,
+                Some(a) => self.b.bin(BinOp::Or, ty, a, piece),
+            });
+        }
+        acc.unwrap()
+    }
+
+    /// Two-operand ALU ops and the compares.
+    fn alu(&mut self, op: Op, d: Operand, s: Operand, w: Width, lock: bool) {
+        let ty = ty_of(w);
+        let sv = self.rd(s, w);
+        let sv = self.narrow(sv, w);
+        // The atomic forms read the old value through the RMW itself.
+        let rmw = match (lock, d, op) {
+            (true, Operand::Mem(m), Op::Add | Op::Sub | Op::And | Op::Or | Op::Xor | Op::Adc | Op::Sbb) => {
+                Some((m, op))
+            }
+            _ => None,
+        };
+        let a = match rmw {
+            Some((m, rop)) => {
+                let (addr, offset) = self.addr(&m);
+                let addr = self.offset_addr(addr, offset);
+                let (rmw_op, val) = match rop {
+                    Op::Add => (RmwOp::Add, sv),
+                    Op::Sub => (RmwOp::Sub, sv),
+                    Op::And => (RmwOp::And, sv),
+                    Op::Or => (RmwOp::Or, sv),
+                    Op::Xor => (RmwOp::Xor, sv),
+                    Op::Adc => {
+                        let c = self.read_flag(GuestReg::C);
+                        let c = if ty == Ty::I64 { self.b.extend(c, false) } else { c };
+                        (RmwOp::Add, self.b.bin(BinOp::Add, ty, sv, c))
+                    }
+                    _ => {
+                        let c = self.read_flag(GuestReg::C);
+                        let c = if ty == Ty::I64 { self.b.extend(c, false) } else { c };
+                        (RmwOp::Sub, self.b.bin(BinOp::Add, ty, sv, c))
+                    }
+                };
+                let old = self.b.def(Expr::Rmw {
+                    op: rmw_op,
+                    addr,
+                    val,
+                    sz: mem_sz(w),
+                    ty,
+                });
+                self.narrow(old, w)
+            }
+            None => {
+                let a = self.rd(d, w);
+                self.narrow(a, w)
+            }
+        };
+        match op {
+            Op::Add | Op::Adc => {
+                let cin = if op == Op::Adc {
+                    let c = self.read_flag(GuestReg::C);
+                    Some(c)
+                } else {
+                    None
+                };
+                let mut r = self.b.bin(BinOp::Add, ty, a, sv);
+                if let Some(c) = cin {
+                    let c = if ty == Ty::I64 { self.b.extend(c, false) } else { c };
+                    r = self.b.bin(BinOp::Add, ty, r, c);
+                }
+                let r = self.narrow(r, w);
+                if rmw.is_none() {
+                    self.wr(d, w, r);
+                }
+                self.flags_add(a, sv, r, w, cin, false);
+            }
+            Op::Sub | Op::Sbb | Op::Cmp => {
+                let bin = if op == Op::Sbb {
+                    let c = self.read_flag(GuestReg::C);
+                    Some(c)
+                } else {
+                    None
+                };
+                let mut r = self.b.bin(BinOp::Sub, ty, a, sv);
+                if let Some(c) = bin {
+                    let c = if ty == Ty::I64 { self.b.extend(c, false) } else { c };
+                    r = self.b.bin(BinOp::Sub, ty, r, c);
+                }
+                let r = self.narrow(r, w);
+                if op != Op::Cmp && rmw.is_none() {
+                    self.wr(d, w, r);
+                }
+                self.flags_sub(a, sv, r, w, bin, false);
+            }
+            Op::And | Op::Or | Op::Xor | Op::Test => {
+                let bop = match op {
+                    Op::And | Op::Test => BinOp::And,
+                    Op::Or => BinOp::Or,
+                    _ => BinOp::Xor,
+                };
+                let r = self.b.bin(bop, ty, a, sv);
+                if op != Op::Test && rmw.is_none() {
+                    self.wr(d, w, r);
+                }
+                self.flags_logic(r, w);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// One-operand multiply into rdx:rax (or ax for bytes).
+    fn mul1(&mut self, s: Operand, w: Width, signed: bool) {
+        let ty = ty_of(w);
+        let sv = self.rd(s, w);
+        let sv = self.narrow(sv, w);
+        let av = self.rd_reg(Reg::Gp(RAX, w));
+        match w {
+            Width::B | Width::W => {
+                let (a, b) = if signed {
+                    (self.sext(av, w), self.sext(sv, w))
+                } else {
+                    (av, sv)
+                };
+                let full = self.b.bin(BinOp::Mul, Ty::I32, a, b);
+                let bits = w.bits();
+                let lo = self.narrow(full, w);
+                let sh = self.k32(bits);
+                let hi = self.b.bin(BinOp::ShrU, Ty::I32, full, sh);
+                let hi = self.narrow(hi, w);
+                if w == Width::B {
+                    // ax = full product.
+                    let m = self.k32(0xffff);
+                    let ax = self.b.bin(BinOp::And, Ty::I32, full, m);
+                    self.wr_reg(Reg::Gp(RAX, Width::W), ax);
+                } else {
+                    self.wr_reg(Reg::Gp(RAX, w), lo);
+                    self.wr_reg(Reg::Gp(RDX, w), hi);
+                }
+                let of = if signed {
+                    let s = self.sext(lo, w);
+                    self.b.cmp(CmpOp::Ne, Ty::I32, s, full)
+                } else {
+                    let z = self.k32(0);
+                    self.b.cmp(CmpOp::Ne, Ty::I32, hi, z)
+                };
+                self.write_flag(GuestReg::C, of);
+                self.write_flag(GuestReg::V, of);
+            }
+            Width::D => {
+                let (a, b) = (self.b.extend(av, signed), self.b.extend(sv, signed));
+                let full = self.b.bin(BinOp::Mul, Ty::I64, a, b);
+                let lo = self.b.wrap(full);
+                let sh = self.k64(32);
+                let hi = self.b.bin(BinOp::ShrU, Ty::I64, full, sh);
+                let hi = self.b.wrap(hi);
+                self.wr_reg(Reg::Gp(RAX, Width::D), lo);
+                self.wr_reg(Reg::Gp(RDX, Width::D), hi);
+                let of = if signed {
+                    let s = self.b.extend(lo, true);
+                    self.b.cmp(CmpOp::Ne, Ty::I64, s, full)
+                } else {
+                    let z = self.k32(0);
+                    self.b.cmp(CmpOp::Ne, Ty::I32, hi, z)
+                };
+                self.write_flag(GuestReg::C, of);
+                self.write_flag(GuestReg::V, of);
+            }
+            Width::Q => {
+                let lo = self.b.bin(BinOp::Mul, Ty::I64, av, sv);
+                let hi = if signed {
+                    self.mulh_s64(av, sv)
+                } else {
+                    self.mulh_u64(av, sv)
+                };
+                self.wr64(RAX, lo);
+                self.wr64(RDX, hi);
+                let of = if signed {
+                    let sh = self.k64(63);
+                    let sign = self.b.bin(BinOp::ShrS, Ty::I64, lo, sh);
+                    self.b.cmp(CmpOp::Ne, Ty::I64, hi, sign)
+                } else {
+                    let z = self.k64(0);
+                    self.b.cmp(CmpOp::Ne, Ty::I64, hi, z)
+                };
+                self.write_flag(GuestReg::C, of);
+                self.write_flag(GuestReg::V, of);
+            }
+        }
+        let _ = ty;
+        self.flags = FlagSource::Unknown;
+    }
+
+    /// `div`/`idiv`: rdx:rax by the operand. Division by zero and quotient
+    /// overflow raise #DE, which Linux delivers as SIGFPE; here that is an
+    /// `Illegal` terminator guarded at run time, so the block is split: the
+    /// division happens only when safe.
+    fn div(&mut self, s: Operand, w: Width, signed: bool) -> Flow {
+        let ty = ty_of(w);
+        let sv = self.rd(s, w);
+        let sv = self.narrow(sv, w);
+        // wasm traps on /0 and INT_MIN/-1 where x86 raises #DE. Rather than a
+        // block split, guard the divisor: divide by 1 in the bad case and
+        // leave the (undefined-on-hardware) result; a program that divides
+        // by zero gets garbage instead of SIGFPE. Recorded as a known gap.
+        match w {
+            Width::B => {
+                let ax = self.rd_reg(Reg::Gp(RAX, Width::W));
+                let (n, d) = if signed {
+                    (self.sext(ax, Width::W), self.sext(sv, Width::B))
+                } else {
+                    (ax, sv)
+                };
+                let d = self.safe_divisor(d, Ty::I32, signed);
+                let q = self.b.bin(if signed { BinOp::DivS } else { BinOp::DivU }, Ty::I32, n, d);
+                let r = self.b.bin(if signed { BinOp::RemS } else { BinOp::RemU }, Ty::I32, n, d);
+                let q = self.narrow(q, Width::B);
+                let r = self.narrow(r, Width::B);
+                let eight = self.k32(8);
+                let r = self.b.bin(BinOp::Shl, Ty::I32, r, eight);
+                let ax = self.b.bin(BinOp::Or, Ty::I32, q, r);
+                self.wr_reg(Reg::Gp(RAX, Width::W), ax);
+            }
+            Width::W | Width::D => {
+                let lo = self.rd_reg(Reg::Gp(RAX, w));
+                let hi = self.rd_reg(Reg::Gp(RDX, w));
+                let lo = self.b.extend(lo, false);
+                let hi = self.b.extend(hi, false);
+                let sh = self.k64(w.bits() as u64);
+                let hi = self.b.bin(BinOp::Shl, Ty::I64, hi, sh);
+                let n = self.b.bin(BinOp::Or, Ty::I64, lo, hi);
+                let n = if w == Width::W && signed {
+                    self.b.def(Expr::ExtendBits {
+                        a: n,
+                        ty: Ty::I64,
+                        bits: 32,
+                        signed: true,
+                    })
+                } else {
+                    n
+                };
+                let d = if signed {
+                    let s = self.sext(sv, w);
+                    self.b.extend(s, true)
+                } else {
+                    self.b.extend(sv, false)
+                };
+                let d = self.safe_divisor(d, Ty::I64, signed);
+                let q = self.b.bin(if signed { BinOp::DivS } else { BinOp::DivU }, Ty::I64, n, d);
+                let r = self.b.bin(if signed { BinOp::RemS } else { BinOp::RemU }, Ty::I64, n, d);
+                let q = self.b.wrap(q);
+                let r = self.b.wrap(r);
+                let q = self.narrow(q, w);
+                let r = self.narrow(r, w);
+                self.wr_reg(Reg::Gp(RAX, w), q);
+                self.wr_reg(Reg::Gp(RDX, w), r);
+            }
+            Width::Q => {
+                // 128-by-64 division. The common case has rdx equal to the
+                // sign-extension of rax (or zero), which is a 64-by-64
+                // division. Anything else overflows or needs long division;
+                // long division is done by a bit loop the IR cannot express,
+                // so it is approximated by the 64-bit result. Recorded gap.
+                let lo = self.rd64(RAX);
+                let d = self.safe_divisor(sv, Ty::I64, signed);
+                let q = self.b.bin(if signed { BinOp::DivS } else { BinOp::DivU }, Ty::I64, lo, d);
+                let r = self.b.bin(if signed { BinOp::RemS } else { BinOp::RemU }, Ty::I64, lo, d);
+                self.wr64(RAX, q);
+                self.wr64(RDX, r);
+            }
+        }
+        let _ = ty;
+        Flow::Next
+    }
+
+    /// Replace a divisor of zero (and, for signed division, the -1 that
+    /// would overflow INT_MIN) with 1, so wasm cannot trap.
+    fn safe_divisor(&mut self, d: Value, ty: Ty, signed: bool) -> Value {
+        let zero = self.k(ty, 0);
+        let one = self.k(ty, 1);
+        let bad = self.b.cmp(CmpOp::Eq, ty, d, zero);
+        let bad = if signed {
+            let m1 = self.k(ty, u64::MAX);
+            let is_m1 = self.b.cmp(CmpOp::Eq, ty, d, m1);
+            self.b.bin(BinOp::Or, Ty::I32, bad, is_m1)
+        } else {
+            bad
+        };
+        self.b.select(bad, one, d, ty)
+    }
+
+    /// Shifts and rotates by an immediate or `cl`.
+    fn shift(&mut self, op: Op, d: Operand, amt: Operand, w: Width) {
+        let ty = ty_of(w);
+        let bits = w.bits();
+        let a = self.rd(d, w);
+        let a = self.narrow(a, w);
+        let (count, count_static) = match amt {
+            Operand::Imm(n) => {
+                let n = (n as u32) & if w == Width::Q { 63 } else { 31 };
+                (self.k(ty, n as u64), Some(n))
+            }
+            _ => {
+                let c = self.rd_reg(Reg::Gp(RCX, Width::B));
+                let m = self.k32(if w == Width::Q { 63 } else { 31 });
+                let c = self.b.bin(BinOp::And, Ty::I32, c, m);
+                let c = if ty == Ty::I64 { self.b.extend(c, false) } else { c };
+                (c, None)
+            }
+        };
+        if count_static == Some(0) {
+            return;
+        }
+        let one = self.k(ty, 1);
+        let cm1 = self.b.bin(BinOp::Sub, ty, count, one);
+        let (r, cf, of) = match op {
+            Op::Shl => {
+                let r = self.b.bin(BinOp::Shl, ty, a, count);
+                let r = self.narrow(r, w);
+                // CF: the last bit shifted out = bit (bits - count) of a.
+                let t = self.b.bin(BinOp::Shl, ty, a, cm1);
+                let cf = self.sign_bit(t, w);
+                let msb = self.sign_bit(r, w);
+                let of = self.b.bin(BinOp::Xor, Ty::I32, msb, cf);
+                (r, cf, of)
+            }
+            Op::Shr => {
+                let r = self.b.bin(BinOp::ShrU, ty, a, count);
+                let t = self.b.bin(BinOp::ShrU, ty, a, cm1);
+                let t = if ty == Ty::I64 { self.b.wrap(t) } else { t };
+                let one32 = self.k32(1);
+                let cf = self.b.bin(BinOp::And, Ty::I32, t, one32);
+                let of = self.sign_bit(a, w);
+                (r, cf, of)
+            }
+            Op::Sar => {
+                let s = self.sext(a, w);
+                let r = self.b.bin(BinOp::ShrS, ty, s, count);
+                let r = self.narrow(r, w);
+                let t = self.b.bin(BinOp::ShrS, ty, s, cm1);
+                let t = if ty == Ty::I64 { self.b.wrap(t) } else { t };
+                let one32 = self.k32(1);
+                let cf = self.b.bin(BinOp::And, Ty::I32, t, one32);
+                let of = self.k32(0);
+                (r, cf, of)
+            }
+            Op::Rol | Op::Ror => {
+                // Rotation amount is the count modulo the width.
+                let modmask = self.k(ty, (bits - 1) as u64);
+                let n = self.b.bin(BinOp::And, ty, count, modmask);
+                let bitsv = self.k(ty, bits as u64);
+                let nn = self.b.bin(BinOp::Sub, ty, bitsv, n);
+                let (l, rr) = if op == Op::Rol { (n, nn) } else { (nn, n) };
+                // Shift amounts of `bits` produce 0 through the mask below
+                // for narrow widths; for full widths wasm masks the amount,
+                // so rotate by 0 needs care: (a << 0) | (a >> bits) where
+                // `>> bits` becomes `>> 0`. Use Rotr for full widths.
+                let r = if bits == ty.bits() {
+                    self.b.bin(BinOp::Rotr, ty, a, rr)
+                } else {
+                    let hi = self.b.bin(BinOp::Shl, ty, a, l);
+                    let lo = self.b.bin(BinOp::ShrU, ty, a, rr);
+                    let r = self.b.bin(BinOp::Or, ty, hi, lo);
+                    self.narrow(r, w)
+                };
+                let one32 = self.k32(1);
+                let (cf, of) = if op == Op::Rol {
+                    let r32 = if ty == Ty::I64 { self.b.wrap(r) } else { r };
+                    let cf = self.b.bin(BinOp::And, Ty::I32, r32, one32);
+                    let msb = self.sign_bit(r, w);
+                    (cf, self.b.bin(BinOp::Xor, Ty::I32, msb, cf))
+                } else {
+                    let cf = self.sign_bit(r, w);
+                    let sh = self.k(ty, (bits - 2) as u64);
+                    let m1 = self.b.bin(BinOp::ShrU, ty, r, sh);
+                    let m1 = if ty == Ty::I64 { self.b.wrap(m1) } else { m1 };
+                    let m1 = self.b.bin(BinOp::And, Ty::I32, m1, one32);
+                    (cf, self.b.bin(BinOp::Xor, Ty::I32, cf, m1))
+                };
+                (r, cf, of)
+            }
+            _ => unreachable!(),
+        };
+        let rotate = matches!(op, Op::Rol | Op::Ror);
+        if count_static.is_some() {
+            self.wr(d, w, r);
+            self.write_flag(GuestReg::C, cf);
+            self.write_flag(GuestReg::V, of);
+            if !rotate {
+                let s = self.sign_bit(r, w);
+                let z = self.is_zero(r, w);
+                let p = self.parity(r, w);
+                let zero = self.k32(0);
+                self.write_flag(GuestReg::N, s);
+                self.write_flag(GuestReg::Z, z);
+                self.write_flag(GuestReg::P, p);
+                self.write_flag(GuestReg::A, zero);
+            }
+        } else {
+            // A zero count leaves everything unchanged.
+            let zero = self.k(ty, 0);
+            let is_zero = self.b.cmp(CmpOp::Eq, ty, count, zero);
+            let v = self.b.select(is_zero, a, r, ty);
+            self.wr(d, w, v);
+            for (reg, nv) in [(GuestReg::C, cf), (GuestReg::V, of)] {
+                let old = self.read_flag(reg);
+                let f = self.b.select(is_zero, old, nv, Ty::I32);
+                self.write_flag(reg, f);
+            }
+            if !rotate {
+                let s = self.sign_bit(r, w);
+                let z = self.is_zero(r, w);
+                let p = self.parity(r, w);
+                let zero32 = self.k32(0);
+                for (reg, nv) in [(GuestReg::N, s), (GuestReg::Z, z), (GuestReg::P, p), (GuestReg::A, zero32)] {
+                    let old = self.read_flag(reg);
+                    let f = self.b.select(is_zero, old, nv, Ty::I32);
+                    self.write_flag(reg, f);
+                }
+            }
+        }
+        self.flags = FlagSource::Unknown;
+    }
+
+    /// `rcl`/`rcr` by an immediate; the `cl` forms are rare enough to refuse.
+    fn rotate_carry(&mut self, op: Op, d: Operand, amt: Operand, w: Width) -> Flow {
+        let Operand::Imm(n) = amt else {
+            return Flow::End(Term::Illegal {
+                raw: self.raw,
+                pc: self.pc,
+            });
+        };
+        let bits = w.bits();
+        let n = ((n as u32) & if w == Width::Q { 63 } else { 31 }) % (bits + 1);
+        if n == 0 {
+            return Flow::Next;
+        }
+        let ty = ty_of(w);
+        let a = self.rd(d, w);
+        let a = self.narrow(a, w);
+        let c = self.read_flag(GuestReg::C);
+        let c = if ty == Ty::I64 { self.b.extend(c, false) } else { c };
+        // Work in a (bits+1)-bit register: value | carry << bits.
+        let (r, cf) = if op == Op::Rcl {
+            // r = (a << n) | (c << (n-1)) | (a >> (bits + 1 - n))
+            let sh = self.k(ty, n as u64);
+            let hi = self.b.bin(BinOp::Shl, ty, a, sh);
+            let sh2 = self.k(ty, (n - 1) as u64);
+            let cm = self.b.bin(BinOp::Shl, ty, c, sh2);
+            let r = self.b.bin(BinOp::Or, ty, hi, cm);
+            let r = if n < bits {
+                let sh3 = self.k(ty, (bits + 1 - n) as u64);
+                let lo = self.b.bin(BinOp::ShrU, ty, a, sh3);
+                self.b.bin(BinOp::Or, ty, r, lo)
+            } else {
+                r
+            };
+            let r = self.narrow(r, w);
+            // new CF = bit (bits - n) of a
+            let sh4 = self.k(ty, (bits - n) as u64);
+            let cf = self.b.bin(BinOp::ShrU, ty, a, sh4);
+            let cf = if ty == Ty::I64 { self.b.wrap(cf) } else { cf };
+            let one = self.k32(1);
+            (r, self.b.bin(BinOp::And, Ty::I32, cf, one))
+        } else {
+            // r = (a >> n) | (c << (bits - n)) | (a << (bits + 1 - n))
+            let sh = self.k(ty, n as u64);
+            let lo = self.b.bin(BinOp::ShrU, ty, a, sh);
+            let sh2 = self.k(ty, (bits - n) as u64);
+            let cm = self.b.bin(BinOp::Shl, ty, c, sh2);
+            let r = self.b.bin(BinOp::Or, ty, lo, cm);
+            let r = if n > 1 {
+                let sh3 = self.k(ty, (bits + 1 - n) as u64);
+                let hi = self.b.bin(BinOp::Shl, ty, a, sh3);
+                self.b.bin(BinOp::Or, ty, r, hi)
+            } else {
+                r
+            };
+            let r = self.narrow(r, w);
+            let sh4 = self.k(ty, (n - 1) as u64);
+            let cf = self.b.bin(BinOp::ShrU, ty, a, sh4);
+            let cf = if ty == Ty::I64 { self.b.wrap(cf) } else { cf };
+            let one = self.k32(1);
+            (r, self.b.bin(BinOp::And, Ty::I32, cf, one))
+        };
+        self.wr(d, w, r);
+        self.write_flag(GuestReg::C, cf);
+        let msb = self.sign_bit(r, w);
+        let of = self.b.bin(BinOp::Xor, Ty::I32, msb, cf);
+        self.write_flag(GuestReg::V, of);
+        self.flags = FlagSource::Unknown;
+        Flow::Next
+    }
+
+    fn double_shift(&mut self, op: Op, d: Operand, s: Operand, amt: Operand, w: Width) {
+        let ty = ty_of(w);
+        let bits = w.bits();
+        let a = self.rd(d, w);
+        let a = self.narrow(a, w);
+        let b = self.rd(s, w);
+        let b = self.narrow(b, w);
+        let (count, count_static) = match amt {
+            Operand::Imm(n) => {
+                let n = (n as u32) & if w == Width::Q { 63 } else { 31 };
+                (self.k(ty, n as u64), Some(n))
+            }
+            _ => {
+                let c = self.rd_reg(Reg::Gp(RCX, Width::B));
+                let m = self.k32(if w == Width::Q { 63 } else { 31 });
+                let c = self.b.bin(BinOp::And, Ty::I32, c, m);
+                let c = if ty == Ty::I64 { self.b.extend(c, false) } else { c };
+                (c, None)
+            }
+        };
+        if count_static == Some(0) {
+            return;
+        }
+        let bitsv = self.k(ty, bits as u64);
+        let nn = self.b.bin(BinOp::Sub, ty, bitsv, count);
+        let one = self.k(ty, 1);
+        let cm1 = self.b.bin(BinOp::Sub, ty, count, one);
+        let (r, cf) = if op == Op::Shld {
+            let hi = self.b.bin(BinOp::Shl, ty, a, count);
+            let lo = self.b.bin(BinOp::ShrU, ty, b, nn);
+            let r = self.b.bin(BinOp::Or, ty, hi, lo);
+            let r = self.narrow(r, w);
+            let t = self.b.bin(BinOp::Shl, ty, a, cm1);
+            (r, self.sign_bit(t, w))
+        } else {
+            let lo = self.b.bin(BinOp::ShrU, ty, a, count);
+            let hi = self.b.bin(BinOp::Shl, ty, b, nn);
+            let r = self.b.bin(BinOp::Or, ty, lo, hi);
+            let r = self.narrow(r, w);
+            let t = self.b.bin(BinOp::ShrU, ty, a, cm1);
+            let t = if ty == Ty::I64 { self.b.wrap(t) } else { t };
+            let one32 = self.k32(1);
+            (r, self.b.bin(BinOp::And, Ty::I32, t, one32))
+        };
+        let sa = self.sign_bit(a, w);
+        let sr = self.sign_bit(r, w);
+        let of = self.b.bin(BinOp::Xor, Ty::I32, sa, sr);
+        let s_ = self.sign_bit(r, w);
+        let z = self.is_zero(r, w);
+        let p = self.parity(r, w);
+        let zero32 = self.k32(0);
+        if count_static.is_some() {
+            self.wr(d, w, r);
+            for (reg, v) in [
+                (GuestReg::C, cf),
+                (GuestReg::V, of),
+                (GuestReg::N, s_),
+                (GuestReg::Z, z),
+                (GuestReg::P, p),
+                (GuestReg::A, zero32),
+            ] {
+                self.write_flag(reg, v);
+            }
+        } else {
+            let zero = self.k(ty, 0);
+            let is_zero = self.b.cmp(CmpOp::Eq, ty, count, zero);
+            let v = self.b.select(is_zero, a, r, ty);
+            self.wr(d, w, v);
+            for (reg, nv) in [
+                (GuestReg::C, cf),
+                (GuestReg::V, of),
+                (GuestReg::N, s_),
+                (GuestReg::Z, z),
+                (GuestReg::P, p),
+                (GuestReg::A, zero32),
+            ] {
+                let old = self.read_flag(reg);
+                let f = self.b.select(is_zero, old, nv, Ty::I32);
+                self.write_flag(reg, f);
+            }
+        }
+        self.flags = FlagSource::Unknown;
+    }
+
+    fn bit_test(&mut self, op: Op, d: Operand, s: Operand, w: Width, lock: bool) {
+        let ty = ty_of(w);
+        let bits = w.bits();
+        // The bit index. For a register destination it is modulo the width;
+        // for memory it addresses bits beyond the operand, so the address
+        // is adjusted by the index's quotient.
+        let idx = match s {
+            Operand::Imm(n) => self.k(ty, (n as u64) & (bits as u64 - 1)),
+            o => {
+                let v = self.rd(o, w);
+                let v = self.sext(v, w);
+                v
+            }
+        };
+        let (a, mem_addr) = match d {
+            Operand::Mem(m) => {
+                let (addr, offset) = self.addr(&m);
+                let addr = self.offset_addr(addr, offset);
+                // byte address += (idx >> 3) sign-extended, then bit = idx & 7
+                // within the operand-sized word at the aligned address.
+                let idx64 = if ty == Ty::I64 { idx } else { self.b.extend(idx, true) };
+                let sh = self.k64(bits.trailing_zeros() as u64);
+                let word = self.b.bin(BinOp::ShrS, Ty::I64, idx64, sh);
+                let scale = self.k64(w.bytes().trailing_zeros() as u64);
+                let byte_off = self.b.bin(BinOp::Shl, Ty::I64, word, scale);
+                let addr = self.b.bin(BinOp::Add, Ty::I64, addr, byte_off);
+                let a = self.b.def(Expr::Load {
+                    addr,
+                    offset: 0,
+                    sz: mem_sz(w),
+                    signed: false,
+                    ty,
+                    order: Order::Relaxed,
+                });
+                (a, Some(addr))
+            }
+            o => {
+                let a = self.rd(o, w);
+                (self.narrow(a, w), None)
+            }
+        };
+        let modmask = self.k(ty, (bits - 1) as u64);
+        let bit = self.b.bin(BinOp::And, ty, idx, modmask);
+        let one = self.k(ty, 1);
+        let mask = self.b.bin(BinOp::Shl, ty, one, bit);
+        let (r, old) = match op {
+            Op::Bt => (None, a),
+            Op::Bts => (Some((BinOp::Or, RmwOp::Or)), a),
+            Op::Btr => (Some((BinOp::And, RmwOp::And)), a),
+            _ => (Some((BinOp::Xor, RmwOp::Xor)), a),
+        };
+        let old = match (r, mem_addr, lock) {
+            (Some((_, rop)), Some(addr), true) => {
+                let val = if op == Op::Btr {
+                    self.b.un(UnOp::Not, ty, mask)
+                } else {
+                    mask
+                };
+                self.b.def(Expr::Rmw {
+                    op: rop,
+                    addr,
+                    val,
+                    sz: mem_sz(w),
+                    ty,
+                })
+            }
+            (Some((bop, _)), _, _) => {
+                let val = if op == Op::Btr {
+                    self.b.un(UnOp::Not, ty, mask)
+                } else {
+                    mask
+                };
+                let nv = self.b.bin(bop, ty, old, val);
+                let nv = self.narrow(nv, w);
+                match mem_addr {
+                    Some(addr) => self.b.stmt(Stmt::Store {
+                        addr,
+                        offset: 0,
+                        val: nv,
+                        sz: mem_sz(w),
+                        order: Order::Relaxed,
+                    }),
+                    None => self.wr(d, w, nv),
+                }
+                old
+            }
+            (None, _, _) => old,
+        };
+        let t = self.b.bin(BinOp::ShrU, ty, old, bit);
+        let t = if ty == Ty::I64 { self.b.wrap(t) } else { t };
+        let one32 = self.k32(1);
+        let cf = self.b.bin(BinOp::And, Ty::I32, t, one32);
+        self.write_flag(GuestReg::C, cf);
+        self.flags = FlagSource::Unknown;
+    }
+
+    /// The low byte of RFLAGS: CF, 1, PF, 0, AF, 0, ZF, SF.
+    fn flags_byte(&mut self) -> Value {
+        let c = self.read_flag(GuestReg::C);
+        let p = self.read_flag(GuestReg::P);
+        let a = self.read_flag(GuestReg::A);
+        let z = self.read_flag(GuestReg::Z);
+        let s = self.read_flag(GuestReg::N);
+        let two = self.k32(2);
+        let mut v = self.b.bin(BinOp::Or, Ty::I32, c, two);
+        for (f, sh) in [(p, 2), (a, 4), (z, 6), (s, 7)] {
+            let k = self.k32(sh);
+            let t = self.b.bin(BinOp::Shl, Ty::I32, f, k);
+            v = self.b.bin(BinOp::Or, Ty::I32, v, t);
+        }
+        v
+    }
+
+    /// Full RFLAGS as an `I32`: the low byte plus IF (bit 9, always set for
+    /// user code), DF and OF.
+    fn rflags(&mut self) -> Value {
+        let lo = self.flags_byte();
+        let d = self.read_flag(GuestReg::D);
+        let o = self.read_flag(GuestReg::V);
+        let ten = self.k32(10);
+        let d = self.b.bin(BinOp::Shl, Ty::I32, d, ten);
+        let eleven = self.k32(11);
+        let o = self.b.bin(BinOp::Shl, Ty::I32, o, eleven);
+        let v = self.b.bin(BinOp::Or, Ty::I32, lo, d);
+        let v = self.b.bin(BinOp::Or, Ty::I32, v, o);
+        let ifl = self.k32(0x200);
+        self.b.bin(BinOp::Or, Ty::I32, v, ifl)
+    }
+
+    /// Set CF, PF, AF, ZF, SF from the low byte of `v`.
+    fn unpack_flags_low(&mut self, v: Value) {
+        let one = self.k32(1);
+        for (reg, sh) in [
+            (GuestReg::C, 0u32),
+            (GuestReg::P, 2),
+            (GuestReg::A, 4),
+            (GuestReg::Z, 6),
+            (GuestReg::N, 7),
+        ] {
+            let k = self.k32(sh);
+            let t = self.b.bin(BinOp::ShrU, Ty::I32, v, k);
+            let t = self.b.bin(BinOp::And, Ty::I32, t, one);
+            self.write_flag(reg, t);
+        }
+        self.flags = FlagSource::Unknown;
+    }
+
+    // -- string instructions ---------------------------------------------------------------
+
+    fn string_op(&mut self, i: &Inst) -> Flow {
+        let w = i.width;
+        let ty = ty_of(w);
+        let bytes = w.bytes() as u64;
+        let df = self.read_flag(GuestReg::D);
+        // step = df ? -bytes : bytes
+        let neg = self.k64(bytes.wrapping_neg());
+        let pos = self.k64(bytes);
+        let zero32 = self.k32(0);
+        let df_clear = self.b.cmp(CmpOp::Eq, Ty::I32, df, zero32);
+        let step = self.b.select(df_clear, pos, neg, Ty::I64);
+
+        if i.rep != Rep::None && i.op != Op::Lods {
+            let kind = match i.op {
+                Op::Movs => StrKind::Movs,
+                Op::Stos => StrKind::Stos,
+                Op::Scas => StrKind::Scas,
+                _ => StrKind::Cmps,
+            };
+            let until = match (i.op, i.rep) {
+                (Op::Scas | Op::Cmps, Rep::Rep) => StrUntil::NotEqual,
+                (Op::Scas | Op::Cmps, Rep::RepNe) => StrUntil::Equal,
+                _ => StrUntil::Count,
+            };
+            let count = self.rd64(RCX);
+            let dst = self.rd64(RDI);
+            let src = self.rd64(RSI);
+            let val = self.rd64(RAX);
+            let out_count = self.b.fresh();
+            let out_dst = self.b.fresh();
+            let out_src = self.b.fresh();
+            let out_a = self.b.fresh();
+            let out_b = self.b.fresh();
+            self.b.stmt(Stmt::StrOp {
+                kind,
+                sz: mem_sz(w),
+                until,
+                count,
+                dst,
+                src,
+                val,
+                df,
+                out_count,
+                out_dst,
+                out_src,
+                out_a,
+                out_b,
+            });
+            self.wr64(RCX, out_count);
+            self.wr64(RDI, out_dst);
+            if matches!(kind, StrKind::Movs | StrKind::Cmps) {
+                self.wr64(RSI, out_src);
+            }
+            if matches!(kind, StrKind::Scas | StrKind::Cmps) {
+                // Flags of the last compare, unless nothing ran.
+                let (a, b) = if ty == Ty::I64 {
+                    (out_a, out_b)
+                } else {
+                    (self.b.wrap(out_a), self.b.wrap(out_b))
+                };
+                let r = self.b.bin(BinOp::Sub, ty, a, b);
+                let r = self.narrow(r, w);
+                let olds: Vec<(GuestReg, Value)> = [GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V, GuestReg::P, GuestReg::A]
+                    .into_iter()
+                    .map(|f| (f, self.read_flag(f)))
+                    .collect();
+                self.flags_sub(a, b, r, w, None, false);
+                let zero = self.k64(0);
+                let none = self.b.cmp(CmpOp::Eq, Ty::I64, count, zero);
+                for (f, old) in olds {
+                    let nv = self.read_flag(f);
+                    let v = self.b.select(none, old, nv, Ty::I32);
+                    self.write_flag(f, v);
+                }
+                self.flags = FlagSource::Unknown;
+            }
+            return Flow::Next;
+        }
+
+        // A single element.
+        let rdi = self.rd64(RDI);
+        let rsi = self.rd64(RSI);
+        let load = |l: &mut Self, addr: Value| -> Value {
+            l.b.def(Expr::Load {
+                addr,
+                offset: 0,
+                sz: mem_sz(w),
+                signed: false,
+                ty,
+                order: Order::Relaxed,
+            })
+        };
+        match i.op {
+            Op::Movs => {
+                let v = load(self, rsi);
+                self.b.stmt(Stmt::Store {
+                    addr: rdi,
+                    offset: 0,
+                    val: v,
+                    sz: mem_sz(w),
+                    order: Order::Relaxed,
+                });
+                let ndi = self.b.bin(BinOp::Add, Ty::I64, rdi, step);
+                let nsi = self.b.bin(BinOp::Add, Ty::I64, rsi, step);
+                self.wr64(RDI, ndi);
+                self.wr64(RSI, nsi);
+            }
+            Op::Stos => {
+                let v = self.rd_reg(Reg::Gp(RAX, w));
+                self.b.stmt(Stmt::Store {
+                    addr: rdi,
+                    offset: 0,
+                    val: v,
+                    sz: mem_sz(w),
+                    order: Order::Relaxed,
+                });
+                let ndi = self.b.bin(BinOp::Add, Ty::I64, rdi, step);
+                self.wr64(RDI, ndi);
+            }
+            Op::Lods => {
+                let v = load(self, rsi);
+                self.wr_reg(Reg::Gp(RAX, w), v);
+                let nsi = self.b.bin(BinOp::Add, Ty::I64, rsi, step);
+                self.wr64(RSI, nsi);
+            }
+            Op::Scas => {
+                let a = self.rd_reg(Reg::Gp(RAX, w));
+                let b = load(self, rdi);
+                let r = self.b.bin(BinOp::Sub, ty, a, b);
+                let r = self.narrow(r, w);
+                self.flags_sub(a, b, r, w, None, false);
+                let ndi = self.b.bin(BinOp::Add, Ty::I64, rdi, step);
+                self.wr64(RDI, ndi);
+            }
+            _ => {
+                let a = load(self, rsi);
+                let b = load(self, rdi);
+                let r = self.b.bin(BinOp::Sub, ty, a, b);
+                let r = self.narrow(r, w);
+                self.flags_sub(a, b, r, w, None, false);
+                let ndi = self.b.bin(BinOp::Add, Ty::I64, rdi, step);
+                let nsi = self.b.bin(BinOp::Add, Ty::I64, rsi, step);
+                self.wr64(RDI, ndi);
+                self.wr64(RSI, nsi);
+            }
+        }
+        Flow::Next
+    }
+
+    /// `fxsave`/`fxrstor` and the `xsave` family: save/restore the SSE state
+    /// (MXCSR and the sixteen xmm registers) in the architectural layout. The
+    /// x87 part of the area is written as empty; guests use these to spill
+    /// vector state across signal handlers and `setjmp`, not to move x87
+    /// values.
+    fn fxsave(&mut self, i: &Inst) -> Flow {
+        let Operand::Mem(m) = i.op0() else {
+            return Flow::End(Term::Illegal {
+                raw: self.raw,
+                pc: self.pc,
+            });
+        };
+        let (addr, offset) = self.addr(&m);
+        let addr = self.offset_addr(addr, offset);
+        let save = matches!(i.op, Op::Fxsave | Op::Xsave);
+        if save {
+            // FCW=0x37f, FSW=0, FTW=0 (abridged: all empty), MXCSR at 24,
+            // MXCSR_MASK at 28.
+            let fcw = self.b.read(GuestReg::X87Cw);
+            self.b.stmt(Stmt::Store {
+                addr,
+                offset: 0,
+                val: fcw,
+                sz: MemSz::B2,
+                order: Order::Relaxed,
+            });
+            let zero = self.k32(0);
+            self.b.stmt(Stmt::Store {
+                addr,
+                offset: 2,
+                val: zero,
+                sz: MemSz::B2,
+                order: Order::Relaxed,
+            });
+            self.b.stmt(Stmt::Store {
+                addr,
+                offset: 4,
+                val: zero,
+                sz: MemSz::B4,
+                order: Order::Relaxed,
+            });
+            let mxcsr = self.b.read(GuestReg::Mxcsr);
+            self.b.stmt(Stmt::Store {
+                addr,
+                offset: 24,
+                val: mxcsr,
+                sz: MemSz::B4,
+                order: Order::Relaxed,
+            });
+            let mask = self.k32(0xffff);
+            self.b.stmt(Stmt::Store {
+                addr,
+                offset: 28,
+                val: mask,
+                sz: MemSz::B4,
+                order: Order::Relaxed,
+            });
+            for n in 0..16u8 {
+                let v = self.b.read(GuestReg::V128(n));
+                self.b.stmt(Stmt::VStore {
+                    addr,
+                    offset: 160 + 16 * n as i64,
+                    val: v,
+                    bytes: 16,
+                });
+            }
+            if matches!(i.op, Op::Xsave) {
+                // XSTATE_BV at 512: x87 | SSE present.
+                let bv = self.k64(3);
+                self.b.stmt(Stmt::Store {
+                    addr,
+                    offset: 512,
+                    val: bv,
+                    sz: MemSz::B8,
+                    order: Order::Relaxed,
+                });
+            }
+        } else {
+            let fcw = self.b.def(Expr::Load {
+                addr,
+                offset: 0,
+                sz: MemSz::B2,
+                signed: false,
+                ty: Ty::I32,
+                order: Order::Relaxed,
+            });
+            self.b.write(GuestReg::X87Cw, fcw);
+            let mxcsr = self.b.def(Expr::Load {
+                addr,
+                offset: 24,
+                sz: MemSz::B4,
+                signed: false,
+                ty: Ty::I32,
+                order: Order::Relaxed,
+            });
+            self.b.write(GuestReg::Mxcsr, mxcsr);
+            for n in 0..16u8 {
+                let v = self.b.def(Expr::VLoad {
+                    addr,
+                    offset: 160 + 16 * n as i64,
+                    bytes: 16,
+                });
+                self.b.write(GuestReg::V128(n), v);
+            }
+        }
+        Flow::Next
+    }
+}

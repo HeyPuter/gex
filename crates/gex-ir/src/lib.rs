@@ -76,20 +76,64 @@ pub enum GuestReg {
     MonValue,
     /// Exclusive monitor: access size in bytes, 0 when clear.
     MonSize,
+
+    // -- x86-64 only ---------------------------------------------------------
+    /// Parity flag.
+    P,
+    /// Auxiliary-carry flag.
+    A,
+    /// Direction flag.
+    D,
+    /// `MXCSR`.
+    Mxcsr,
+    /// x87 `TOP` (0..=7).
+    X87Top,
+    /// x87 control word.
+    X87Cw,
+    /// x87 status word, less `TOP` and the condition codes.
+    X87Sw,
+    /// x87 register tags: one valid bit per physical register.
+    X87Tags,
+    /// The guest address of this thread's own context structure. Read-only;
+    /// how the x87 register stack (a computed slot of the context) is reached
+    /// through ordinary loads and stores.
+    CtxAddr,
 }
 
 impl GuestReg {
     pub fn ty(self) -> Ty {
         match self {
-            GuestReg::N | GuestReg::Z | GuestReg::C | GuestReg::V => Ty::I32,
+            GuestReg::N
+            | GuestReg::Z
+            | GuestReg::C
+            | GuestReg::V
+            | GuestReg::P
+            | GuestReg::A
+            | GuestReg::D
+            | GuestReg::Mxcsr
+            | GuestReg::X87Top
+            | GuestReg::X87Cw
+            | GuestReg::X87Sw
+            | GuestReg::X87Tags => Ty::I32,
             GuestReg::V128(_) => Ty::V128,
             _ => Ty::I64,
         }
     }
 
-    /// True for the four condition flags.
+    /// True for the condition flags: AArch64's four, plus x86-64's parity,
+    /// auxiliary-carry and direction flags. Each lives in one byte of the
+    /// context and takes part in flag liveness.
     pub fn is_flag(self) -> bool {
-        matches!(self, GuestReg::N | GuestReg::Z | GuestReg::C | GuestReg::V)
+        matches!(
+            self,
+            GuestReg::N
+                | GuestReg::Z
+                | GuestReg::C
+                | GuestReg::V
+                | GuestReg::P
+                | GuestReg::A
+                | GuestReg::D
+        )
     }
 }
 
@@ -358,6 +402,12 @@ pub enum Expr {
         lane_bytes: u32,
         val: Value,
     },
+    /// The sign bit of every lane, packed into an `I32` with lane 0 at bit 0
+    /// (`pmovmskb`, `movmskps`; wasm's `bitmask`).
+    VBitmask {
+        a: Value,
+        lane: VLane,
+    },
 
     /// Scalar floating-point arithmetic on bit patterns.
     FpBin {
@@ -616,6 +666,7 @@ impl Expr {
             | Expr::VBitSelect { .. }
             | Expr::VCvt { .. }
             | Expr::VReplace { .. } => Ty::V128,
+            Expr::VBitmask { .. } => Ty::I32,
             // FP results are bit patterns, so width follows precision.
             Expr::FpBin { double, .. } | Expr::FpUn { double, .. } => {
                 if double {
@@ -668,7 +719,10 @@ impl Expr {
             Expr::HostCall { args, .. } => args.iter().copied().for_each(f),
             Expr::VLoad { addr, .. } => f(*addr),
             Expr::VConst(_) => {}
-            Expr::VSplat { a, .. } | Expr::VExtract { a, .. } | Expr::VUn { a, .. } => f(*a),
+            Expr::VSplat { a, .. }
+            | Expr::VExtract { a, .. }
+            | Expr::VUn { a, .. }
+            | Expr::VBitmask { a, .. } => f(*a),
             Expr::VLaneUn { a, .. } => f(*a),
             Expr::VLaneBin { a, b, .. } | Expr::VShuffle { a, b, .. } => {
                 f(*a);
@@ -791,6 +845,57 @@ pub enum Stmt {
     },
     /// A memory fence.
     Fence,
+    /// An x86 `rep`-prefixed string instruction, as one statement: a loop of
+    /// `count` elements of `sz` bytes, each step moving `dst`/`src` by `+sz`
+    /// when `df` (an `I32`) is 0 and `-sz` when it is 1. Lowers to a wasm
+    /// loop (with `memory.copy`/`memory.fill` fast paths), which is why it is
+    /// a statement and not an expression.
+    ///
+    /// Defines `out_count`, `out_dst`, `out_src` (all `I64`) with the final
+    /// register values, and for `Scas`/`Cmps` also `out_a`/`out_b` (`I64`,
+    /// zero-extended) with the last two elements compared, from which the
+    /// lifter derives the flags. When no iteration runs, `out_a` and
+    /// `out_b` are both zero.
+    StrOp {
+        kind: StrKind,
+        sz: MemSz,
+        until: StrUntil,
+        count: Value,
+        dst: Value,
+        src: Value,
+        /// The accumulator: what `stos` stores and `scas` compares against.
+        val: Value,
+        df: Value,
+        out_count: Value,
+        out_dst: Value,
+        out_src: Value,
+        out_a: Value,
+        out_b: Value,
+    },
+}
+
+/// Which string instruction a [`Stmt::StrOp`] repeats.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum StrKind {
+    /// `[dst] = [src]`.
+    Movs,
+    /// `[dst] = val`.
+    Stos,
+    /// compare `val` with `[dst]`.
+    Scas,
+    /// compare `[src]` with `[dst]`.
+    Cmps,
+}
+
+/// When a [`Stmt::StrOp`] stops, besides the count reaching zero.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum StrUntil {
+    /// Only the count (`rep movs`/`rep stos`).
+    Count,
+    /// Also when the elements compared differ (`repe`).
+    NotEqual,
+    /// Also when the elements compared match (`repne`).
+    Equal,
 }
 
 impl Stmt {
@@ -819,6 +924,20 @@ impl Stmt {
                 f(*len);
             }
             // `dst` is defined here, not used, so it is not visited.
+            Stmt::StrOp {
+                count,
+                dst,
+                src,
+                val,
+                df,
+                ..
+            } => {
+                f(*count);
+                f(*dst);
+                f(*src);
+                f(*val);
+                f(*df);
+            }
             Stmt::MemCmp { a, b, len, .. } => {
                 f(*a);
                 f(*b);
@@ -839,6 +958,7 @@ impl Stmt {
             | Stmt::MemCopy { .. }
             | Stmt::MemFill { .. }
             | Stmt::MemCmp { .. }
+            | Stmt::StrOp { .. }
             | Stmt::Fence => true,
         }
     }

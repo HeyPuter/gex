@@ -16,7 +16,7 @@ gex-gpu.workspace = true
 gex-gl.workspace = true
 gex-ld.workspace = true
 gex-xlate = { workspace = true, features = ["parallel"] }
-gex-lift.workspace = true
+
 anyhow = "1"
 # `parallel-compilation` is not a default here because `default-features` is
 # off, and leaving it off made every compile serial. gex hands wasmtime a
@@ -24,3 +24,7 @@ anyhow = "1"
 # bash, half a million for Mesa -- which is close to the ideal shape for
 # compiling in parallel, and it was using one core out of twenty-four.
 wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "threads", "parallel-compilation"] }
+
+[features]
+# Host an x86-64 guest. See `gex_abi::X86`.
+x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-kernel/x86"]

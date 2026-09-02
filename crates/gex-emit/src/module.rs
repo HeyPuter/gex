@@ -563,7 +563,11 @@ impl ModuleBuilder {
         page_table: PageTable,
         shared_memory: bool,
     ) -> ModuleBuilder {
-        assert_eq!(text_base % 4, 0, "text base must be instruction-aligned");
+        assert_eq!(
+            text_base % gex_abi::INST_ALIGN,
+            0,
+            "text base must be instruction-aligned"
+        );
         let _ = text_size;
 
         let mut m = Module::new();
@@ -1031,8 +1035,10 @@ impl ModuleBuilder {
         f.local_get(1);
         f.i64_const((DISPATCH_PAGE - 1) as i64);
         f.byte(0x83); // i64.and
-        f.i64_const(2);
-        f.byte(0x88); // i64.shr_u
+        if gex_abi::INST_ALIGN_SHIFT != 0 {
+            f.i64_const(gex_abi::INST_ALIGN_SHIFT as i64);
+            f.byte(0x88); // i64.shr_u
+        }
         f.byte(0xa7); // i32.wrap_i64
         f.byte(0x6a); // i32.add
         f.local_set(index);

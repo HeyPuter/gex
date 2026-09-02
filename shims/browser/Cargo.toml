@@ -30,3 +30,5 @@ shared-memory = ["dep:spinning_top"]
 # mode with no symptom of its own: what the page sees is a fault at whatever
 # the guest touched next.
 heap-counters = ["talc/counters"]
+# Host an x86-64 guest. See `gex_abi::X86`.
+x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-kernel/x86"]

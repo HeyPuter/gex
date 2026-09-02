@@ -18,6 +18,15 @@ fn reg(r: GuestReg) -> String {
         GuestReg::MonAddr => "mon.addr".into(),
         GuestReg::MonValue => "mon.val".into(),
         GuestReg::MonSize => "mon.size".into(),
+        GuestReg::P => "p".into(),
+        GuestReg::A => "a".into(),
+        GuestReg::D => "d".into(),
+        GuestReg::Mxcsr => "mxcsr".into(),
+        GuestReg::X87Top => "x87.top".into(),
+        GuestReg::X87Cw => "x87.cw".into(),
+        GuestReg::X87Sw => "x87.sw".into(),
+        GuestReg::X87Tags => "x87.tags".into(),
+        GuestReg::CtxAddr => "ctx".into(),
     }
 }
 
@@ -135,6 +144,7 @@ fn expr(e: &Expr) -> String {
         } => format!("{lane:?}.{op:?} {a:?}, {amount:?}").to_lowercase(),
         Expr::VShuffle { a, b, lanes } => format!("shuffle {a:?}, {b:?}, {lanes:?}"),
         Expr::VSwizzle { a, idx } => format!("swizzle {a:?}, {idx:?}"),
+        Expr::VBitmask { a, lane } => format!("bitmask.{lane:?} {a:?}"),
         Expr::VBitSelect { mask, a, b } => format!("bitselect {mask:?} ? {a:?} : {b:?}"),
         Expr::VCvt { op, from, a, b } => match b {
             Some(b) => format!("cvt.{op:?}.{from:?} {a:?}, {b:?}").to_lowercase(),
@@ -228,6 +238,26 @@ pub fn block(b: &Block) -> String {
             }
             Stmt::MemCmp { dst, a, b, len } => {
                 let _ = writeln!(s, "  {dst:?} = memcmp [{a:?}], [{b:?}], {len:?}");
+            }
+            Stmt::StrOp {
+                kind,
+                sz,
+                until,
+                count,
+                dst,
+                src,
+                val,
+                df,
+                out_count,
+                out_dst,
+                out_src,
+                out_a,
+                out_b,
+            } => {
+                let _ = writeln!(
+                    s,
+                    "  {out_count:?}, {out_dst:?}, {out_src:?}, {out_a:?}, {out_b:?} = rep.{kind:?}.{sz:?}.{until:?} count={count:?} dst={dst:?} src={src:?} val={val:?} df={df:?}"
+                );
             }
             Stmt::Fence => {
                 let _ = writeln!(s, "  fence");

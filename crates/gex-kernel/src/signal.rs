@@ -317,6 +317,54 @@ pub mod frame {
     pub const FRAME_SIZE: usize = UCONTEXT + UCONTEXT_SIZE;
 }
 
+/// Byte offsets inside the x86-64 `struct rt_sigframe`.
+///
+/// The return address the handler `ret`s through comes first, then the
+/// `ucontext` (whose `uc_mcontext` is a `struct sigcontext` of 23 words in
+/// the architecture's fixed order), then the `siginfo`. The FP state is a
+/// separate 512-byte `fxsave` area above the frame that `uc_mcontext.fpstate`
+/// points to. Fixed ABI: libc's unwinders and `swapcontext` read it.
+pub mod xframe {
+    pub const PRETCODE: usize = 0;
+    pub const UCONTEXT: usize = 8;
+    pub const UC_FLAGS: usize = 0;
+    pub const UC_LINK: usize = 8;
+    pub const UC_STACK: usize = 16;
+    pub const UC_MCONTEXT: usize = 40;
+    /// `sigcontext` words: r8..r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp,
+    /// rip, eflags, then cs/gs/fs/ss packed, err, trapno, oldmask, cr2,
+    /// fpstate pointer, and reserved space.
+    pub const MC_R8: usize = 0;
+    pub const MC_RDI: usize = 64;
+    pub const MC_RSI: usize = 72;
+    pub const MC_RBP: usize = 80;
+    pub const MC_RBX: usize = 88;
+    pub const MC_RDX: usize = 96;
+    pub const MC_RAX: usize = 104;
+    pub const MC_RCX: usize = 112;
+    pub const MC_RSP: usize = 120;
+    pub const MC_RIP: usize = 128;
+    pub const MC_EFLAGS: usize = 136;
+    pub const MC_CS: usize = 144;
+    pub const MC_ERR: usize = 152;
+    pub const MC_TRAPNO: usize = 160;
+    pub const MC_OLDMASK: usize = 168;
+    pub const MC_CR2: usize = 176;
+    pub const MC_FPSTATE: usize = 184;
+    pub const SIGCONTEXT_SIZE: usize = 256;
+    pub const UC_SIGMASK: usize = UC_MCONTEXT + SIGCONTEXT_SIZE;
+    pub const UCONTEXT_SIZE: usize = UC_SIGMASK + 8;
+    pub const SIGINFO: usize = UCONTEXT + UCONTEXT_SIZE;
+    pub const SIGINFO_SIZE: usize = 128;
+    pub const FRAME_SIZE: usize = SIGINFO + SIGINFO_SIZE;
+    /// The `fxsave` image.
+    pub const FPSTATE_SIZE: usize = 512;
+    /// The System V red zone below `rsp` a signal frame must not touch.
+    pub const RED_ZONE: u64 = 128;
+    /// `struct sigcontext` register order as gex GPR numbers.
+    pub const GPR_ORDER: [u8; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4];
+}
+
 /// Build a handler frame for `signal` and point the context at the handler.
 ///
 /// Returns the address to resume at. The caller has already established that
@@ -328,6 +376,9 @@ pub fn setup_frame(
     signal: u32,
     fault_address: u64,
 ) -> Result<u64, Errno> {
+    if gex_abi::X86 {
+        return setup_frame_x86(signals, m, ctx_addr, signal, fault_address);
+    }
     let action = signals.action(signal);
     let sp = m.read_u64(ctx_addr + ctx::SP as u64)?;
 
@@ -415,8 +466,181 @@ pub fn setup_frame(
     Ok(action.handler)
 }
 
+/// The x86-64 frame builder. See [`xframe`] for the layout.
+fn setup_frame_x86(
+    signals: &mut Signals,
+    m: &mut GuestMem<'_>,
+    ctx_addr: u64,
+    signal: u32,
+    fault_address: u64,
+) -> Result<u64, Errno> {
+    let action = signals.action(signal);
+    let sp = m.read_u64(ctx_addr + ctx::SP as u64)?;
+
+    let on_alt = action.flags & sa::ONSTACK != 0 && signals.alt_stack.size > 0;
+    let base = if on_alt {
+        let alt = &signals.alt_stack;
+        let top = alt.sp + alt.size;
+        if sp > alt.sp && sp <= top {
+            sp
+        } else {
+            top
+        }
+    } else {
+        // Leave the red zone below the interrupted code's stack pointer.
+        sp - xframe::RED_ZONE
+    };
+
+    // The FP state above the frame, 64-byte aligned; the frame below it so
+    // that `rsp + 8` is 16-byte aligned on handler entry, as after a `call`.
+    let fpstate = (base - xframe::FPSTATE_SIZE as u64) & !63;
+    let frame_addr = ((fpstate - xframe::FRAME_SIZE as u64) & !0xf) - 8;
+    m.zero(frame_addr, xframe::FRAME_SIZE)?;
+    m.zero(fpstate, xframe::FPSTATE_SIZE)?;
+
+    // The handler's return address: the libc restorer (glibc always sets one
+    // on x86-64), else the untranslated trampoline the host recognises.
+    let ret = if action.flags & sa::RESTORER != 0 && action.restorer != 0 {
+        action.restorer
+    } else {
+        SIGRETURN_TRAMPOLINE
+    };
+    m.write_u64(frame_addr + xframe::PRETCODE as u64, ret)?;
+
+    let info = frame_addr + xframe::SIGINFO as u64;
+    m.write_u32(info, signal)?;
+    m.write_u32(info + 8, fault_code(signal))?;
+    if matches!(
+        signal,
+        sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE
+    ) {
+        m.write_u64(info + 16, fault_address)?;
+    }
+
+    let uc = frame_addr + xframe::UCONTEXT as u64;
+    m.write_u64(uc + xframe::UC_FLAGS as u64, 0)?;
+    m.write_u64(uc + xframe::UC_LINK as u64, 0)?;
+    m.write_u64(uc + xframe::UC_STACK as u64, signals.alt_stack.sp)?;
+    m.write_u32(uc + xframe::UC_STACK as u64 + 8, signals.alt_stack.flags)?;
+    m.write_u64(uc + xframe::UC_STACK as u64 + 16, signals.alt_stack.size)?;
+    m.write_u64(
+        uc + xframe::UC_SIGMASK as u64,
+        signals.suspend_restore.take().unwrap_or(signals.blocked),
+    )?;
+
+    let mc = uc + xframe::UC_MCONTEXT as u64;
+    for (i, reg) in xframe::GPR_ORDER.iter().enumerate() {
+        let v = m.read_u64(ctx_addr + ctx::x(*reg) as u64)?;
+        m.write_u64(mc + i as u64 * 8, v)?;
+    }
+    let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
+    m.write_u64(mc + xframe::MC_RIP as u64, pc)?;
+    m.write_u64(mc + xframe::MC_EFLAGS as u64, read_rflags(m, ctx_addr)?)?;
+    // cs = __USER_CS (0x33), the other selectors zero.
+    m.write_u64(mc + xframe::MC_CS as u64, 0x33)?;
+    m.write_u64(mc + xframe::MC_TRAPNO as u64, if signal == sig::SIGSEGV { 14 } else { 0 })?;
+    m.write_u64(mc + xframe::MC_OLDMASK as u64, signals.blocked)?;
+    m.write_u64(mc + xframe::MC_CR2 as u64, fault_address)?;
+    m.write_u64(mc + xframe::MC_FPSTATE as u64, fpstate)?;
+
+    // The fxsave image: control words, MXCSR, and the sixteen xmm registers.
+    m.write_u32(fpstate, m.read_u32(ctx_addr + ctx::X87_CW as u64)? & 0xffff)?;
+    m.write_u32(fpstate + 24, m.read_u32(ctx_addr + ctx::MXCSR as u64)?)?;
+    m.write_u32(fpstate + 28, 0xffff)?;
+    for n in 0..16u8 {
+        for half in 0..2u64 {
+            let v = m.read_u64(ctx_addr + ctx::v(n) as u64 + half * 8)?;
+            m.write_u64(fpstate + 160 + n as u64 * 16 + half * 8, v)?;
+        }
+    }
+
+    signals.blocked |= action.mask;
+    if action.flags & sa::NODEFER == 0 {
+        signals.blocked |= bit(signal);
+    }
+    signals.pending &= !bit(signal);
+    signals.in_handler = true;
+    if action.flags & sa::RESETHAND != 0 {
+        let _ = signals.set_action(signal, SigAction::default());
+    }
+
+    // rsp = frame, rdi = signo, rsi = &info, rdx = &uc, rax = 0.
+    m.write_u64(ctx_addr + ctx::SP as u64, frame_addr)?;
+    m.write_u64(ctx_addr + ctx::x(7) as u64, signal as u64)?;
+    m.write_u64(ctx_addr + ctx::x(6) as u64, info)?;
+    m.write_u64(ctx_addr + ctx::x(2) as u64, uc)?;
+    m.write_u64(ctx_addr + ctx::x(0) as u64, 0)?;
+    m.write_u64(ctx_addr + ctx::PC as u64, action.handler)?;
+    Ok(action.handler)
+}
+
+/// The x86-64 `rt_sigreturn`. The handler's `ret` popped the return address,
+/// so the frame starts one word below the stack pointer.
+fn sigreturn_x86(signals: &mut Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
+    let frame_addr = m.read_u64(ctx_addr + ctx::SP as u64)? - 8;
+    let uc = frame_addr + xframe::UCONTEXT as u64;
+    let mc = uc + xframe::UC_MCONTEXT as u64;
+    for (i, reg) in xframe::GPR_ORDER.iter().enumerate() {
+        let v = m.read_u64(mc + i as u64 * 8)?;
+        m.write_u64(ctx_addr + ctx::x(*reg) as u64, v)?;
+    }
+    let pc = m.read_u64(mc + xframe::MC_RIP as u64)?;
+    m.write_u64(ctx_addr + ctx::PC as u64, pc)?;
+    write_rflags(m, ctx_addr, m.read_u64(mc + xframe::MC_EFLAGS as u64)?)?;
+    let fpstate = m.read_u64(mc + xframe::MC_FPSTATE as u64)?;
+    if fpstate != 0 {
+        if let Ok(mxcsr) = m.read_u32(fpstate + 24) {
+            m.write_u32(ctx_addr + ctx::MXCSR as u64, mxcsr)?;
+            for n in 0..16u8 {
+                for half in 0..2u64 {
+                    let v = m.read_u64(fpstate + 160 + n as u64 * 16 + half * 8)?;
+                    m.write_u64(ctx_addr + ctx::v(n) as u64 + half * 8, v)?;
+                }
+            }
+        }
+    }
+    signals.blocked = m.read_u64(uc + xframe::UC_SIGMASK as u64)?;
+    signals.in_handler = false;
+    Ok(pc)
+}
+
+/// RFLAGS from the context's flag bytes: CF, PF, AF, ZF, SF, DF, OF in their
+/// architectural bits, plus the always-set bit 1 and IF.
+fn read_rflags(m: &GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
+    let f = |off: usize| -> Result<u64, Errno> {
+        Ok(m.read(ctx_addr + off as u64, 1)?[0] as u64 & 1)
+    };
+    Ok((f(ctx::CF)?)
+        | (1 << 1)
+        | (f(ctx::PF)? << 2)
+        | (f(ctx::AF)? << 4)
+        | (f(ctx::ZF)? << 6)
+        | (f(ctx::NF)? << 7)
+        | (1 << 9)
+        | (f(ctx::DF)? << 10)
+        | (f(ctx::VF)? << 11))
+}
+
+fn write_rflags(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), Errno> {
+    for (off, bit) in [
+        (ctx::CF, 0),
+        (ctx::PF, 2),
+        (ctx::AF, 4),
+        (ctx::ZF, 6),
+        (ctx::NF, 7),
+        (ctx::DF, 10),
+        (ctx::VF, 11),
+    ] {
+        m.write(ctx_addr + off as u64, &[((v >> bit) & 1) as u8])?;
+    }
+    Ok(())
+}
+
 /// Restore the context a handler frame captured. Returns the resume address.
 pub fn sigreturn(signals: &mut Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
+    if gex_abi::X86 {
+        return sigreturn_x86(signals, m, ctx_addr);
+    }
     // The frame is at the stack pointer the handler was entered with, which
     // it is required to have preserved.
     let frame_addr = m.read_u64(ctx_addr + ctx::SP as u64)?;
@@ -516,7 +740,7 @@ fn write_pstate(m: &mut GuestMem<'_>, ctx_addr: u64, pstate: u64) -> Result<(), 
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "x86")))]
 mod tests {
     use super::*;
 

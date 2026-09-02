@@ -176,6 +176,13 @@ pub mod nr {
     pub const GETRANDOM: u64 = 278;
     pub const RSEQ: u64 = 293;
     pub const FACCESSAT2: u64 = 439;
+
+    // Legacy calls only x86-64 has, given canonical numbers above anything
+    // the asm-generic ABI assigns. See `crate::x86::translate`.
+    pub const DUP2: u64 = 0x1000;
+    pub const TIME: u64 = 0x1001;
+    pub const ALARM: u64 = 0x1002;
+    pub const ARCH_PRCTL: u64 = 0x1003;
 }
 
 /// `*at` calls use this to mean "relative to the current directory".
@@ -1328,13 +1335,16 @@ impl Kernel {
     }
 
     fn arg(&self, m: &GuestMem<'_>, i: u8) -> u64 {
-        m.read_u64(self.ctx_addr + ctx::x(i) as u64).unwrap_or(0)
+        m.read_u64(self.ctx_addr + ctx::SYSCALL_ARGS[i as usize] as u64)
+            .unwrap_or(0)
     }
 
-    /// Handle one `svc #0`.
+    /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
-        let n = m.read_u64(self.ctx_addr + ctx::x(8) as u64).unwrap_or(!0);
-        let a: [u64; 6] = [
+        let raw = m
+            .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
+            .unwrap_or(!0);
+        let mut a: [u64; 6] = [
             self.arg(m, 0),
             self.arg(m, 1),
             self.arg(m, 2),
@@ -1342,6 +1352,22 @@ impl Kernel {
             self.arg(m, 4),
             self.arg(m, 5),
         ];
+        // The number's register doubles as the result register on x86-64, so
+        // keep the raw number where a host can read it after the fact.
+        let _ = m.write_u64(self.ctx_addr + ctx::LAST_SYSCALL as u64, raw);
+        // An x86-64 guest's numbering is translated to the canonical one, and
+        // its legacy calls rewritten into the `*at`/extended forms.
+        let n = if gex_abi::X86 {
+            crate::x86::translate(
+                raw,
+                &mut a,
+                m,
+                self.ctx_addr + ctx::SCRATCH as u64,
+                self.signals.blocked,
+            )
+        } else {
+            raw
+        };
 
         // Returning from a handler restores a whole context, so it cannot go
         // through the normal "write x0 and continue" path.
@@ -1890,6 +1916,12 @@ impl Kernel {
     fn dispatch(&mut self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Result<SysResult, i32> {
         let r: SysResult = match n {
             nr::EXIT | nr::EXIT_GROUP => return Err((a[0] & 0xff) as i32),
+
+            // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
+            nr::DUP2 => self.sys_dup2(a[0] as i32, a[1] as i32),
+            nr::TIME => self.sys_time(m, a[0]),
+            nr::ALARM => self.sys_alarm(m, a[0]),
+            nr::ARCH_PRCTL => self.sys_arch_prctl(m, a[0], a[1]),
 
             // -- I/O ---------------------------------------------------------
             nr::WRITE => self.sys_write(m, a[0] as i32, a[1], a[2]),
@@ -4627,6 +4659,8 @@ impl Kernel {
         // `EPOLL_CTL_DEL` is allowed a null event pointer.
         let (events, data) = if event == 0 {
             (0, 0)
+        } else if gex_abi::X86 {
+            (m.read_u32(event)?, m.read_u64(event + 4)?)
         } else {
             (m.read_u32(event)?, m.read_u64(event + 8)?)
         };
@@ -4725,10 +4759,17 @@ impl Kernel {
     ) -> SysResult {
         let n = ready.len().min(max as usize);
         for (i, (events, data)) in ready.iter().take(n).enumerate() {
-            let at = out + i as u64 * 16;
-            m.write_u32(at, *events)?;
-            m.write_u32(at + 4, 0)?;
-            m.write_u64(at + 8, *data)?;
+            if gex_abi::X86 {
+                // Packed: 12 bytes, the token at offset four.
+                let at = out + i as u64 * 12;
+                m.write_u32(at, *events)?;
+                m.write_u64(at + 4, *data)?;
+            } else {
+                let at = out + i as u64 * 16;
+                m.write_u32(at, *events)?;
+                m.write_u32(at + 4, 0)?;
+                m.write_u64(at + 8, *data)?;
+            }
         }
         Ok(n as u64)
     }
@@ -5234,13 +5275,69 @@ impl Kernel {
 
     // -- process and time ----------------------------------------------------
 
+    /// `dup2`: `dup3` without flags, except that `dup2(fd, fd)` is a no-op
+    /// that still validates the descriptor, where `dup3` would refuse.
+    fn sys_dup2(&mut self, old: i32, new: i32) -> SysResult {
+        if old == new {
+            self.fds.get(old)?;
+            return Ok(new as u64);
+        }
+        self.sys_dup3(old, new, 0)
+    }
+
+    fn sys_time(&mut self, m: &mut GuestMem<'_>, tloc: u64) -> SysResult {
+        let (secs, _) = (self.clock)();
+        if tloc != 0 {
+            m.write_u64(tloc, secs)?;
+        }
+        Ok(secs)
+    }
+
+    /// `alarm(s)`: `setitimer(ITIMER_REAL, {0, s})`, returning the seconds the
+    /// previous timer had left. Both itimervals live in the thread's scratch
+    /// area, since the call has none of its own.
+    fn sys_alarm(&mut self, m: &mut GuestMem<'_>, secs: u64) -> SysResult {
+        let scratch = self.ctx_addr + ctx::SCRATCH as u64;
+        for off in 0..4 {
+            m.write_u64(scratch + off * 8, 0)?;
+        }
+        m.write_u64(scratch + 16, secs)?;
+        self.sys_itimer(m, 0, scratch, scratch + 32, true)?;
+        let left = m.read_u64(scratch + 32 + 16)?;
+        let left_us = m.read_u64(scratch + 32 + 24)?;
+        Ok(left + u64::from(left_us > 0))
+    }
+
+    /// x86-64 `arch_prctl`: the FS and GS segment bases, which is how that
+    /// ABI sets its thread pointer.
+    fn sys_arch_prctl(&mut self, m: &mut GuestMem<'_>, code: u64, addr: u64) -> SysResult {
+        const ARCH_SET_GS: u64 = 0x1001;
+        const ARCH_SET_FS: u64 = 0x1002;
+        const ARCH_GET_FS: u64 = 0x1003;
+        const ARCH_GET_GS: u64 = 0x1004;
+        match code {
+            ARCH_SET_FS => m.write_u64(self.ctx_addr + ctx::FS_BASE as u64, addr)?,
+            ARCH_SET_GS => m.write_u64(self.ctx_addr + ctx::GS_BASE as u64, addr)?,
+            ARCH_GET_FS => {
+                let v = m.read_u64(self.ctx_addr + ctx::FS_BASE as u64)?;
+                m.write_u64(addr, v)?;
+            }
+            ARCH_GET_GS => {
+                let v = m.read_u64(self.ctx_addr + ctx::GS_BASE as u64)?;
+                m.write_u64(addr, v)?;
+            }
+            _ => return Err(Errno::EINVAL),
+        }
+        Ok(0)
+    }
+
     fn sys_uname(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
         let fields = [
             "Linux",
             "gex",
             "6.1.0-gex",
             "#1 SMP gex",
-            "aarch64",
+            gex_abi::ARCH_NAME,
             "(none)",
         ];
         let mut out = vec![0u8; 65 * 6];
@@ -5555,6 +5652,10 @@ pub fn skips_proc_snapshot(n: u64) -> bool {
 /// Name a syscall for trace output.
 pub fn syscall_name(n: u64) -> &'static str {
     match n {
+        nr::DUP2 => "dup2",
+        nr::TIME => "time",
+        nr::ALARM => "alarm",
+        nr::ARCH_PRCTL => "arch_prctl",
         nr::GETCWD => "getcwd",
         nr::DUP => "dup",
         nr::DUP3 => "dup3",

@@ -5,8 +5,10 @@ members = [
     "crates/gex-cache",
     "crates/gex-mem",
     "crates/gex-isa",
+    "crates/gex-isa-x86",
     "crates/gex-ir",
     "crates/gex-lift",
+    "crates/gex-lift-x86",
     "crates/gex-emit",
     "crates/gex-kmem",
     "shims/kernel",
@@ -39,8 +41,10 @@ gex-virgl = { path = "crates/gex-virgl" }
 gex-gpu = { path = "crates/gex-gpu" }
 gex-gl = { path = "crates/gex-gl" }
 gex-isa = { path = "crates/gex-isa" }
+gex-isa-x86 = { path = "crates/gex-isa-x86" }
 gex-ir = { path = "crates/gex-ir" }
 gex-lift = { path = "crates/gex-lift" }
+gex-lift-x86 = { path = "crates/gex-lift-x86" }
 gex-emit = { path = "crates/gex-emit" }
 gex-kmem = { path = "crates/gex-kmem" }
 gex-xlate = { path = "crates/gex-xlate" }

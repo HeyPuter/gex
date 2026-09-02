@@ -81,9 +81,12 @@ pub fn recognise(name: &str) -> Option<Intrinsic> {
 /// clobber are left alone, which the procedure call standard permits.
 pub fn block(addr: u64, which: Intrinsic) -> Block {
     let mut b = Builder::new(addr);
-    let dst = b.read(GuestReg::X(0));
-    let src = b.read(GuestReg::X(1));
-    let len = b.read(GuestReg::X(2));
+    // The C calling convention's first three argument registers: x0-x2, or
+    // rdi/rsi/rdx. `ctx::CALL_ARGS` gives their context offsets.
+    let arg = |i: usize| GuestReg::X((gex_abi::ctx::CALL_ARGS[i] / 8) as u8);
+    let dst = b.read(arg(0));
+    let src = b.read(arg(1));
+    let len = b.read(arg(2));
     match which {
         Intrinsic::MemCpy | Intrinsic::MemMove => b.stmt(Stmt::MemCopy { dst, src, len }),
         Intrinsic::MemPCpy => {
@@ -111,9 +114,26 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
             b.write(GuestReg::X(0), wide);
         }
     }
-    let lr = b.read(GuestReg::X(30));
+    // Return: through the link register, or by popping the return address.
+    let target = if gex_abi::X86 {
+        let sp = b.read(GuestReg::X(4));
+        let ret = b.def(gex_ir::Expr::Load {
+            addr: sp,
+            offset: 0,
+            sz: gex_ir::MemSz::B8,
+            signed: false,
+            ty: Ty::I64,
+            order: gex_ir::Order::Relaxed,
+        });
+        let eight = b.const_i64(8);
+        let nsp = b.bin(BinOp::Add, Ty::I64, sp, eight);
+        b.write(GuestReg::X(4), nsp);
+        ret
+    } else {
+        b.read(GuestReg::X(30))
+    };
     b.finish(Term::Indirect {
-        target: lr,
+        target,
         is_ret: true,
     })
 }

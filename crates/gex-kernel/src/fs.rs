@@ -52,9 +52,28 @@ pub struct Stat {
 }
 
 impl Stat {
-    /// Serialise into the aarch64 kernel `struct stat` (128 bytes).
-    pub fn encode(&self) -> [u8; 128] {
-        let mut b = [0u8; 128];
+    /// Serialise into the guest kernel's `struct stat`: 128 bytes on aarch64,
+    /// 144 on x86-64, where `st_nlink` widens to 64 bits and precedes
+    /// `st_mode` and `st_blksize` is 64 bits.
+    pub fn encode(&self) -> Vec<u8> {
+        if gex_abi::X86 {
+            let mut b = vec![0u8; 144];
+            b[0..8].copy_from_slice(&self.dev.to_le_bytes());
+            b[8..16].copy_from_slice(&self.ino.to_le_bytes());
+            b[16..24].copy_from_slice(&(self.nlink as u64).to_le_bytes());
+            b[24..28].copy_from_slice(&self.mode.to_le_bytes());
+            b[28..32].copy_from_slice(&self.uid.to_le_bytes());
+            b[32..36].copy_from_slice(&self.gid.to_le_bytes());
+            b[40..48].copy_from_slice(&self.rdev.to_le_bytes());
+            b[48..56].copy_from_slice(&self.size.to_le_bytes());
+            b[56..64].copy_from_slice(&(self.blksize as i64).to_le_bytes());
+            b[64..72].copy_from_slice(&self.blocks.to_le_bytes());
+            for off in [72usize, 88, 104] {
+                b[off..off + 8].copy_from_slice(&self.mtime.to_le_bytes());
+            }
+            return b;
+        }
+        let mut b = vec![0u8; 128];
         b[0..8].copy_from_slice(&self.dev.to_le_bytes());
         b[8..16].copy_from_slice(&self.ino.to_le_bytes());
         b[16..20].copy_from_slice(&self.mode.to_le_bytes());
