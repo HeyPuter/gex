@@ -1030,7 +1030,13 @@ impl<'a> Emitter<'a> {
         // nothing: the guard is pure arithmetic on an unchanging value, which
         // V8's own CSE already collapses, so the emitted bytes it removes cost
         // nothing while the local it adds is real.
-        let static_off = if (0..=u32::MAX as i64).contains(&offset) {
+        // A static offset rides on the guarded base, so it must stay small:
+        // the guard only promises the base is below `GUEST_LIMIT`, and the
+        // engine's guard region past the memory is what turns base+offset
+        // into a trap rather than a wild read. 64 KiB is inside every
+        // engine's guard region; x86-64's displacements can reach 2 GiB and
+        // go through the add below instead.
+        let static_off = if (0..=0xffff).contains(&offset) {
             self.push(addr);
             offset as u32
         } else {

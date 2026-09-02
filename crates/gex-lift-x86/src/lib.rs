@@ -1703,21 +1703,159 @@ impl<'a> Lifter<'a> {
                 self.wr_reg(Reg::Gp(RDX, w), r);
             }
             Width::Q => {
-                // 128-by-64 division. The common case has rdx equal to the
-                // sign-extension of rax (or zero), which is a 64-by-64
-                // division. Anything else overflows or needs long division;
-                // long division is done by a bit loop the IR cannot express,
-                // so it is approximated by the 64-bit result. Recorded gap.
+                // 128-by-64 division of rdx:rax. glibc's printf and strtod
+                // (`__mpn_divrem`) depend on the full-width form.
                 let lo = self.rd64(RAX);
+                let hi = self.rd64(RDX);
                 let d = self.safe_divisor(sv, Ty::I64, signed);
-                let q = self.b.bin(if signed { BinOp::DivS } else { BinOp::DivU }, Ty::I64, lo, d);
-                let r = self.b.bin(if signed { BinOp::RemS } else { BinOp::RemU }, Ty::I64, lo, d);
+                let (q, r) = if signed {
+                    // Divide magnitudes, then fix the signs: the quotient
+                    // takes the operands' sign product, the remainder the
+                    // dividend's.
+                    let sh = self.k64(63);
+                    let nsign = self.b.bin(BinOp::ShrS, Ty::I64, hi, sh); // 0 or -1
+                    let dsign = self.b.bin(BinOp::ShrS, Ty::I64, d, sh);
+                    let (ahi, alo) = self.neg128_if(hi, lo, nsign);
+                    let ad = self.b.bin(BinOp::Xor, Ty::I64, d, dsign);
+                    let ad = self.b.bin(BinOp::Sub, Ty::I64, ad, dsign);
+                    let (q, r) = self.divlu(ahi, alo, ad);
+                    let qsign = self.b.bin(BinOp::Xor, Ty::I64, nsign, dsign);
+                    let q = self.b.bin(BinOp::Xor, Ty::I64, q, qsign);
+                    let q = self.b.bin(BinOp::Sub, Ty::I64, q, qsign);
+                    let r = self.b.bin(BinOp::Xor, Ty::I64, r, nsign);
+                    let r = self.b.bin(BinOp::Sub, Ty::I64, r, nsign);
+                    (q, r)
+                } else {
+                    self.divlu(hi, lo, d)
+                };
                 self.wr64(RAX, q);
                 self.wr64(RDX, r);
             }
         }
         let _ = ty;
         Flow::Next
+    }
+
+    /// Two's-complement negate the 128-bit `hi:lo` when `neg` is -1 (leave it
+    /// when 0).
+    fn neg128_if(&mut self, hi: Value, lo: Value, neg: Value) -> (Value, Value) {
+        let lo_x = self.b.bin(BinOp::Xor, Ty::I64, lo, neg);
+        let hi_x = self.b.bin(BinOp::Xor, Ty::I64, hi, neg);
+        // (hi_x:lo_x) - neg  ==  (hi_x:lo_x) + 1 when neg == -1
+        let one = self.k64(1);
+        let inc = self.b.bin(BinOp::And, Ty::I64, neg, one); // 0 or 1
+        let nlo = self.b.bin(BinOp::Add, Ty::I64, lo_x, inc);
+        let carry = self.b.cmp(CmpOp::LtU, Ty::I64, nlo, lo_x);
+        let carry = self.b.extend(carry, false);
+        let nhi = self.b.bin(BinOp::Add, Ty::I64, hi_x, carry);
+        (nhi, nlo)
+    }
+
+    /// Unsigned 128-by-64 division `(u1:u0) / v` with `v != 0`, returning
+    /// `(quotient, remainder)`. Hacker's Delight's `divlu` (two 32-bit digit
+    /// steps on a normalised divisor, each with its at-most-two corrections
+    /// unrolled), so it is straight-line code the IR can express. When
+    /// `u1 >= v` the hardware raises #DE; here the low 64 bits of the
+    /// quotient come out and the run continues.
+    fn divlu(&mut self, u1: Value, u0: Value, v: Value) -> (Value, Value) {
+        let ty = Ty::I64;
+        let k32 = self.k64(32);
+        let k64 = self.k64(64);
+        let m32 = self.k64(0xffff_ffff);
+        let b = self.k64(1u64 << 32);
+        let zero = self.k64(0);
+        let one = self.k64(1);
+
+        let s = self.b.un(UnOp::Clz, ty, v);
+        let vn = self.b.bin(BinOp::Shl, ty, v, s);
+        let vn1 = self.b.bin(BinOp::ShrU, ty, vn, k32);
+        let vn0 = self.b.bin(BinOp::And, ty, vn, m32);
+
+        // un32 = (u1 << s) | (s ? u0 >> (64 - s) : 0)
+        let u1s = self.b.bin(BinOp::Shl, ty, u1, s);
+        let rs = self.b.bin(BinOp::Sub, ty, k64, s);
+        let u0r = self.b.bin(BinOp::ShrU, ty, u0, rs);
+        let s_zero = self.b.cmp(CmpOp::Eq, ty, s, zero);
+        let u0r = self.b.select(s_zero, zero, u0r, ty);
+        let un32 = self.b.bin(BinOp::Or, ty, u1s, u0r);
+        let un10 = self.b.bin(BinOp::Shl, ty, u0, s);
+        let un1 = self.b.bin(BinOp::ShrU, ty, un10, k32);
+        let un0 = self.b.bin(BinOp::And, ty, un10, m32);
+
+        // First digit.
+        let (q1, un21) = {
+            let q = self.b.bin(BinOp::DivU, ty, un32, vn1);
+            let qv = self.b.bin(BinOp::Mul, ty, q, vn1);
+            let rhat = self.b.bin(BinOp::Sub, ty, un32, qv);
+            let (q, _rhat) = self.divlu_correct(q, rhat, vn1, vn0, un1, b, one);
+            // un21 = un32*b + un1 - q*vn
+            let t = self.b.bin(BinOp::Shl, ty, un32, k32);
+            let t = self.b.bin(BinOp::Add, ty, t, un1);
+            let qvn = self.b.bin(BinOp::Mul, ty, q, vn);
+            let un21 = self.b.bin(BinOp::Sub, ty, t, qvn);
+            (q, un21)
+        };
+        // Second digit.
+        let q0 = {
+            let q = self.b.bin(BinOp::DivU, ty, un21, vn1);
+            let qv = self.b.bin(BinOp::Mul, ty, q, vn1);
+            let rhat = self.b.bin(BinOp::Sub, ty, un21, qv);
+            let (q, _rhat) = self.divlu_correct(q, rhat, vn1, vn0, un0, b, one);
+            q
+        };
+        let q1b = self.b.bin(BinOp::Shl, ty, q1, k32);
+        let q = self.b.bin(BinOp::Or, ty, q1b, q0);
+        // r = (un21*b + un0 - q0*vn) >> s
+        let t = self.b.bin(BinOp::Shl, ty, un21, k32);
+        let t = self.b.bin(BinOp::Add, ty, t, un0);
+        let q0vn = self.b.bin(BinOp::Mul, ty, q0, vn);
+        let r = self.b.bin(BinOp::Sub, ty, t, q0vn);
+        let r = self.b.bin(BinOp::ShrU, ty, r, s);
+        (q, r)
+    }
+
+    /// The `divlu` digit correction: while `q >= b || q*vn0 > b*rhat + un`,
+    /// decrement `q` and add `vn1` to `rhat`, stopping once `rhat >= b`.
+    /// At most two rounds are ever needed, so both are unrolled.
+    #[allow(clippy::too_many_arguments)]
+    fn divlu_correct(
+        &mut self,
+        q: Value,
+        rhat: Value,
+        vn1: Value,
+        vn0: Value,
+        un: Value,
+        b: Value,
+        one: Value,
+    ) -> (Value, Value) {
+        let ty = Ty::I64;
+        let k32 = self.k64(32);
+        let mut q = q;
+        let mut rhat = rhat;
+        let mut go = None;
+        for _ in 0..2 {
+            let qb = self.b.cmp(CmpOp::GeU, ty, q, b);
+            let lhs = self.b.bin(BinOp::Mul, ty, q, vn0);
+            let rb = self.b.bin(BinOp::Shl, ty, rhat, k32);
+            let rhs = self.b.bin(BinOp::Add, ty, rb, un);
+            let gt = self.b.cmp(CmpOp::GtU, ty, lhs, rhs);
+            let mut c = self.b.bin(BinOp::Or, Ty::I32, qb, gt);
+            if let Some(g) = go {
+                // A second round only if the first fired and rhat stayed < b.
+                let small = self.b.cmp(CmpOp::LtU, ty, rhat, b);
+                c = self.b.bin(BinOp::And, Ty::I32, c, small);
+                c = self.b.bin(BinOp::And, Ty::I32, c, g);
+            }
+            let c64 = self.b.extend(c, false);
+            let qm = self.b.bin(BinOp::Sub, ty, q, c64);
+            let add = self.b.bin(BinOp::Mul, ty, c64, vn1);
+            let rp = self.b.bin(BinOp::Add, ty, rhat, add);
+            q = qm;
+            rhat = rp;
+            go = Some(c);
+        }
+        let _ = one;
+        (q, rhat)
     }
 
     /// Replace a divisor of zero (and, for signed division, the -1 that
