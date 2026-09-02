@@ -116,6 +116,16 @@ for p in xproto randrproto renderproto xextproto inputproto kbproto fontsproto \
         # Build tools and data, not headers: keep them as they are.
         cp "$d/$p.pc" "$PREFIX/lib/pkgconfig/$p.pc" ;;
     *)
+        # A proto package the distribution lacks or ships too old (xwaylandproto,
+        # or presentproto >= 1.4, on a Debian 12 host) may be installed under a
+        # prefix of its own and found through PKG_CONFIG_PATH. Its headers are
+        # not under /usr/include, so bring them over too -- on top of the
+        # host's copy, since the one pkg-config answered with is the one asked
+        # for.
+        inc=$(env -u PKG_CONFIG_LIBDIR pkg-config --variable=includedir "$p")
+        if [ -n "$inc" ] && [ "$inc" != /usr/include ] && [ -d "$inc/X11" ]; then
+            cp -r "$inc/X11" "$PREFIX/include/"
+        fi
         sed -e "s|^prefix=.*|prefix=$PREFIX|" \
             -e "s|^includedir=.*|includedir=$PREFIX/include|" \
             "$d/$p.pc" > "$PREFIX/lib/pkgconfig/$p.pc" ;;
