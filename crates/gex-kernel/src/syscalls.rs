@@ -4068,6 +4068,19 @@ impl Kernel {
     /// the guest is blocked in the host (no back-edges until the call
     /// returns). `ITIMER_VIRTUAL`/`ITIMER_PROF` should count CPU time but are
     /// driven from the same wall clock as the rest.
+    /// Whether an interval timer has expired and has yet to raise its signal.
+    /// The host asks this on its way past: a process that never traps into
+    /// the kernel (a shell's `timeout` spinning on `wait4`/`sigsuspend`) would
+    /// otherwise never have its `alarm` delivered, because delivery is only
+    /// attempted once a signal is already pending.
+    pub fn timer_due(&mut self) -> bool {
+        if self.itimers.iter().all(|t| t.is_none()) {
+            return false;
+        }
+        let now = self.now_nanos();
+        self.itimers.iter().flatten().any(|t| now >= t.next)
+    }
+
     pub fn check_timers(&mut self) {
         if self.itimers.iter().all(|t| t.is_none()) {
             return;
