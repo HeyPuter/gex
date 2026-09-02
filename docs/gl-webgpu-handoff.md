@@ -7785,3 +7785,69 @@ The remaining 39 programs need real marshalling:
 | `glRenderMode`, `glSelectBuffer`, `glInitNames`, `glLoadName`, `glPushName` | 4 | selection mode, which returns a buffer to the guest |
 | `glCallLists`, `glListBase` | 5 | an array of list names |
 | `glXCreatePbuffer` | 4 | GLX, not GL |
+
+
+## Flat shading was silently smooth (2026-09-02)
+
+The first defect the llvmpipe pixel comparison found on its own, and it is the
+kind it was built for: nothing refused, nothing crashed, nothing logged a
+word. `dlist-tri-flat-tri` drew a gradient where llvmpipe draws flat red.
+
+Two separate faults, one behind the other.
+
+**`caps->flatshade` was left true, and the driver ignored the bit.**
+`create_rasterizer_state` accepted `flatshade` into its `supported` copy and
+did nothing with it, so `glShadeModel(GL_FLAT)` had no effect at all. The cap
+was left on because "st never asks for it in a core profile" -- true, and
+beside the point: the profile here is a compatibility one and glShadeModel is
+real in it. A comment three thousand lines away already asserted the cap was
+false, which is how the inconsistency survived. Turning it off has st lower
+flat shading with `nir_lower_flatshade`, which sets `INTERP_MODE_FLAT` on the
+varyings -- and this driver already emits WGSL's `@interpolate(flat)`.
+
+**Then the provoking vertex was wrong.** A flat primitive takes its value from
+one vertex, and GL's default convention is the *last*; WGSL's flat
+interpolation always takes the first (`first` and `either` are its only
+qualifiers, and there is no `last`). So the triangle came out red where
+llvmpipe draws blue -- flat, but the wrong corner.
+
+The indices are rewritten instead, so the vertex GL calls provoking comes
+first. `u_index_translator` and `u_index_generator` take the API's provoking
+vertex and the hardware's as separate arguments and exist for exactly this;
+using them rather than rotating triples by hand is what makes strips and fans
+right, where the provoking vertex sits at a different offset per primitive and
+the winding alternates. zink solves the same problem with a geometry shader
+(`lower_pv_mode`), which is far more machinery than an index rewrite this
+driver already does three other kinds of.
+
+**The rewrite runs only for a draw with a flat varying to get wrong**, which
+is nearly none of them: `gex_wgpu_shader_has_flat_varying` checks the fragment
+shader's recorded interpolation, so a shader with none pays nothing. The
+recursion has to be stopped explicitly, since the rewritten draw is still
+flat-shaded and the same test would send it back.
+
+**What it costs, and the cache that got most of it back.** The rewrite is
+per-draw, and glxgears -- which does use `glShadeModel(GL_FLAT)`, for its gear
+faces -- lost 28% of its frame rate to it: 424 FPS down to 305. Most of that
+is the index-buffer *map*, which breaks the pending batch whenever a recorded
+draw already read that buffer.
+
+Caching the rewritten lists brings it back to about 408 FPS, a residual 4%.
+Two things about the cache had to be measured rather than assumed:
+
+- **Eight slots recovered nothing at all.** The working set is one entry per
+  *draw*, not per index buffer: a display list replays as many draws over one
+  buffer, each with its own start and count, and glxgears alone issues about
+  eighteen a frame. Sixty-four slots hit; eight thrashed completely.
+- **A hash in front of the eleven-field comparison changed nothing**
+  measurable, so the residual is not the lookup. It is the extra `draw_vbo`
+  and the per-draw upload of the rewritten indices as user indices; keeping a
+  `pipe_resource` per cache slot instead would remove that, and has not been
+  done.
+
+`tests/gl44-probe.sh flatshade` gates it with three cases -- flat, smooth, and
+flat compiled into a display list, which is how the demo does it. The flat
+cases check that all three samples are *identical* and that the colour is the
+last vertex's; the smooth case checks that they differ and that each channel
+grows towards its own corner, because absolute thresholds there would be
+asserting where an 8x8 window falls inside a triangle that reaches past it.
