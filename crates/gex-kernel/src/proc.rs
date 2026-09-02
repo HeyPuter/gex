@@ -9,7 +9,7 @@
 //! Not modelled: controlling terminals, orphaned-process-group handling, and
 //! session keyrings. A guest that asks gets plausible answers, not Linux's.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 /// The signal a parent is owed when a child ends.
 const SIGCHLD: u32 = crate::signal::sig::SIGCHLD;
@@ -96,6 +96,12 @@ pub struct ProcTable {
     /// poll they already do. So it takes effect soon, and never mid-syscall.
     halting: AtomicBool,
     halt_code: AtomicI32,
+    /// How many guest processes are still executing (host threads running a
+    /// process, not zombies). The machine is alive while this is non-zero;
+    /// an init-mode host waits for it to reach zero after pid 1 exits, so a
+    /// daemon that outlives its launcher can finish. Machine-global: the
+    /// table is shared across the whole process tree.
+    live: AtomicUsize,
     /// Where the table really is, when it is not here. See [`Remote`].
     remote: Option<Remote>,
 }
@@ -123,6 +129,7 @@ impl ProcTable {
         ProcTable {
             halting: AtomicBool::new(false),
             halt_code: AtomicI32::new(0),
+            live: AtomicUsize::new(0),
             remote: None,
             inner: Mutex::new(Table {
                 next_pid: INIT_PID + 1,
@@ -467,6 +474,18 @@ impl ProcTable {
     }
 
     /// The exit code the machine is halting with, if it is.
+    /// A process's host thread has begun (or ended) executing.
+    pub fn enter_running(&self) {
+        self.live.fetch_add(1, Ordering::AcqRel);
+    }
+    pub fn leave_running(&self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+    }
+    /// How many guest processes are still executing.
+    pub fn live_running(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
     pub fn halt_code(&self) -> Option<i32> {
         if let Some(r) = self.remote {
             // -1 for "nobody has asked", because a halt code is a status and

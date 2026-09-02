@@ -871,7 +871,14 @@ fn run_program_with(
         }
     }
 
-    let stopped = run_thread_loop(&mut store, &instance, ctx_addr, program.entry())?;
+    let live_procs = {
+        let k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&k.procs)
+    };
+    live_procs.enter_running();
+    let stopped = run_thread_loop(&mut store, &instance, ctx_addr, program.entry());
+    live_procs.leave_running();
+    let stopped = stopped?;
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);
         let kernel = take_kernel(&spawn);
@@ -889,9 +896,20 @@ fn run_program_with(
         unreachable!()
     };
 
-    // The process is over. Every other thread must stop before the stores and
-    // memory go away: set the stopping flag and wake anyone parked on a futex,
-    // then give them a bounded moment to notice.
+    // The process is over. Two ways to end the machine:
+    //
+    //   * The default, for a command: stop every other thread now, so the
+    //     stores and memory can go away. A CLI tool that leaves a stray
+    //     thread behind should not make the shell wait on it.
+    //   * `GEX_WAIT_ALL` (init mode): let background processes run until they
+    //     exit on their own, the way a real machine keeps living while a
+    //     daemon does. Wine's launcher exits first and its wineserver (and
+    //     any service it started) exits when its last client is gone; forcing
+    //     them down at pid-1 exit is what kept a daemon from ever running.
+    //     Bounded, so a genuinely persistent daemon cannot hang the run.
+    if std::env::var_os("GEX_WAIT_ALL").is_some() {
+        wait_for_all_processes(&spawn, opts.verbose);
+    }
     stop_other_threads(&spawn, opts.verbose);
 
     if let Some(s) = &sampler {
@@ -957,6 +975,32 @@ fn run_program_with(
         }
     }
     Ok((exit, stats))
+}
+
+/// Keep the machine alive after pid 1 exits until every background process
+/// has exited on its own -- init semantics, for a launcher (Wine) whose
+/// daemons outlive it. Bounded by `GEX_WAIT_ALL_SECS` (default 120), because
+/// a `--persistent` daemon never exits and must not hang the run.
+fn wait_for_all_processes(spawn: &SpawnContext, verbose: bool) {
+    let procs = {
+        let k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&k.procs)
+    };
+    let secs: u64 = std::env::var("GEX_WAIT_ALL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while procs.live_running() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if verbose {
+        let left = procs.live_running();
+        eprintln!(
+            "[gex] all processes exited{}",
+            if left > 0 { format!(" (timeout, {left} still running)") } else { String::new() }
+        );
+    }
 }
 
 /// Bring every other guest thread to a halt after the process has exited.
@@ -1421,6 +1465,9 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         .name(format!("gex-pid-{pid}"))
         .spawn(move || {
             let cleanup = Arc::clone(&child_cx);
+            // This process is now executing; the machine stays alive while it
+            // is, so a daemon that outlives its launcher is not torn down.
+            procs.enter_running();
             // Two numbers, deliberately: the process table keeps the one a
             // shell would print, and `wait4` gets the kernel's encoding.
             let (code, wstatus) = match run_guest_process(child_cx, thread, entry) {
@@ -1443,6 +1490,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
             if std::env::var_os("GEX_TRACE_EXIT").is_some() {
                 eprintln!("[gex:{pid}] process finished: code {code}, wait status {wstatus:#x}");
             }
+            procs.leave_running();
             // Through the table, so this process's own children -- if any are
             // still running -- become init's rather than being lost.
             procs.exit(pid, code);
