@@ -6285,3 +6285,145 @@ change, a clear, a copy or blit, a resource map, a query result, or a present.
 That list is the whole risk -- getting it wrong reorders work rather than
 merely slowing it -- so it is a project, not a patch. Caching the pipeline
 alone buys 17% and is not worth doing on its own.
+
+## Three of the GL 4.0 extensions, and a smaller rung than it looked (2026-09-02)
+
+GL 4.0 was recorded here as seven missing extensions, which made it read as
+seven pieces of work. Two of them are not work at all in that sense, and
+finding that out changed what the rung costs.
+
+**`ARB_gpu_shader5` is not gated on a driver cap.** `st_extensions.c:1257` is
+the whole gate:
+
+```c
+if (GLSLVersion >= 400 && !options->disable_arb_gpu_shader5)
+   extensions->ARB_gpu_shader5 = GL_TRUE;
+```
+
+**`ARB_gpu_shader_fp64` cannot be enabled before that either**, which explains
+an earlier failed attempt. Mesa builds the software fp64 library only under
+
+```c
+if (_mesa_is_desktop_gl(st->ctx) && st->ctx->Const.GLSLVersion >= 400)
+   st->ctx->SoftFP64 = glsl_float64_funcs_to_nir(st->ctx, options);
+```
+
+(`st_glsl_to_nir.cpp:496`), and `nir_lower_doubles` asserts the library exists
+(`nir_lower_double_ops.c:690`). Setting `caps.doubles` at GLSL 3.30 therefore
+does not produce fp64, it produces that assert. `glsl_feature_level` is the
+driver's own cap so this is not a true circle, but fp64 arrives *with* the
+rung and never before it. Raising `glsl_feature_level` early would advertise
+every GLSL 4.00 feature, `interpolateAtOffset` included, whether or not it
+works -- so it is the last thing to do, not the first.
+
+That leaves three pieces of real driver work for GL 4.0:
+`ARB_tessellation_shader`, `ARB_texture_buffer_object` (+`_rgb32`), and the
+transform feedback pair. The pair, and `ARB_texture_query_lod`, are done.
+
+### `ARB_texture_query_lod`: computed, because Tint refuses to be asked
+
+WGSL has no `textureQueryLod`, and SPIR-V's `OpImageQueryLod` is one of the
+few opcodes Tint rejects outright:
+
+```
+error: WGSL does not support querying the level of detail of an image:
+%28 = OpImageQueryLod %6 %27 %20
+```
+
+`nir_get_texture_lod` is no help -- it builds the same query rather than
+computing one. So `gex_wgpu_lower_query_lod_instr` computes it the way the
+specification defines it: scale the coordinate by the texture size, take
+`ddx`/`ddy`, and the larger of the two lengths is the scale factor whose
+`log2` is the level. `.x` is that clamped into the mip chain and `.y` is the
+raw value, which is the only reason the query returns two components.
+
+The instructive part was *where* the pass goes. It started in
+`gex_wgpu_lower_texture_variant`, which only runs for shaders that need a
+sampler variant -- so a shader whose only unusual feature was the query went
+straight to SPIR-V and Tint refused it, with the pass never running. Nothing
+in the lowering depends on the bound view, so it belongs in the base compile
+next to the other shader-wide lowerings.
+
+`gl44-query-lod-probe` checks it against arithmetic rather than a flag. A
+full-screen quad over an NxN viewport moves a 0..1 coordinate by `1/N` per
+pixel, which across an S-texel texture is `S/N` texels per pixel, so the
+answer is `log2(S/N)` and the viewport chooses it. The cases are picked to
+separate a correct lowering from the plausible wrong ones: one that forgets
+the texture size fails all of them, one that returns the clamped value for
+both components passes the minification cases and fails the magnified one
+where the two genuinely differ, and one that clamps at the wrong end fails it
+too. Results are read from an `RGBA32F` attachment, because at 8 bits a level
+is a few codes wide -- an early 8-bit version of this test read 2.008 for an
+answer of exactly 2, which is the encoding and not the driver.
+
+### `ARB_transform_feedback2`: one number, three features
+
+Pause/resume, the explicit append offset, and `glDrawTransformFeedback` are
+the same state seen from three directions: how far into each bound buffer the
+last capture got. Gallium passes it through the `offsets` argument of
+`set_stream_output_targets` -- a byte count starts a capture there, `~0` means
+carry on -- and `_mesa_PauseTransformFeedback` simply unbinds every target
+while resume rebinds with `~0`. So the running total lives on
+`gex_wgpu_so_target`, not on the context, or pausing would lose it.
+
+`glDrawTransformFeedback` is where this driver gets something for free. On
+real hardware the recorded count lives on the GPU, because only the GPU knows
+how much fitted, and drawing from it needs a counter buffer or a stall. Here
+the capture is a compute dispatch whose size the driver computes on the CPU
+before recording it -- `writable_prims`, already clamped to what the buffer
+had room for -- so the count is just `written / stride` and there is nothing
+to read back.
+
+### `ARB_transform_feedback3`, and the bug it uncovered
+
+`gl_NextBuffer` splits one interleaved capture across several buffers. The
+linker expresses that entirely in the xfb info the capture pass already
+walked, so the extension itself needed no new machinery -- but turning it on
+failed immediately, with buffer 0 correct and buffer 1 untouched.
+
+The cause is that two `float` varyings do not get a varying slot each. The
+linker packs them into components of one, so `a` and `b` both arrive as
+location 32 and are told apart only by `location_frac`:
+
+```
+gex-xfb: so_mask=0x1 outputs=2 written=0x3
+gex-xfb:   out[0] loc=32 buffer=0 offset=0 mask=0x1 stride=4
+gex-xfb:   out[1] loc=32 buffer=1 offset=0 mask=0x2 stride=4
+```
+
+`gex_wgpu_capture_store` matched an output to a store by location alone and
+stopped at the first hit, so both stores found `out[0]` and buffer 1 was never
+even claimed -- note `so_mask=0x1`. It now matches on the component mask as
+well, keeps going through every output the variable overlaps, and maps a
+component to its byte offset by its rank among the set bits below it rather
+than by its index within the variable. Those are the same number only when
+the variable starts at component zero and the output covers all of it.
+
+The plain interleaved case -- the same two varyings captured into one buffer
+-- was *not* affected, which is worth recording because it is the natural
+assumption and it is wrong. Reverting the fix and re-running confirmed it:
+`xfb3_next_buffer` fails, `xfb3_packed_interleaved` still passes. Those two
+varyings keep separate slots when nothing splits them, so the first-match
+shortcut happened to be right. The interleaved case is in the probe as a
+control against a fix to the packed path that breaks the ordinary one.
+
+`GEX_WGPU_XFB_DEBUG=1` prints the block above, which is what found this.
+
+### How the three were checked
+
+Each extension got a probe that checks arithmetic rather than a flag, on the
+principle established with sample shading: an extension that is advertised but
+does not work is worse than one that is absent. All three probes were run
+first against native Mesa (llvmpipe), whose answers are the reference, then
+against `gex_wgpu` on Dawn, then through `tests/gl44-probe.sh` in the browser,
+which builds the same source for the guest and requires the same `SUMMARY`
+line. Every case matched llvmpipe exactly, including the two that separate a
+correct implementation from a plausible one -- the magnified LOD case, where
+the clamped and raw values differ, and `gl_NextBuffer`, where one buffer stays
+empty if the output matching is wrong.
+
+Two full `KHR-GL33` sweeps were run against the recorded baseline, one with
+`texture_query_lod` alone and one with the transform feedback pair added:
+**zero regressions both times**, 32 shared families and 1612 passing cases
+unchanged. `caps->texture_query_lod` was deliberately left off until the
+lowering was verified, for the same reason.

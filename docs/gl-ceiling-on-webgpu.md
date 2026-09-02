@@ -249,16 +249,40 @@ framebuffers, 2D arrays. `MaxColorAttachments` 8 >= 4, `MaxSamples` 4 >= 4.
 
 ### GL 4.0 -- the heaviest rung
 
+The seven items this rung was missing are not seven independent pieces of
+work, and reading them as a flat list is what made the rung look larger than
+it is. Mesa grants two of them from the GLSL version alone, so they cannot be
+worked on separately and cannot be worked on first:
+
+* **`ARB_gpu_shader5` is not gated on any driver cap.** `st_extensions.c:1257`
+  is `if (GLSLVersion >= 400 && !options->disable_arb_gpu_shader5)
+  extensions->ARB_gpu_shader5 = GL_TRUE;` -- nothing else. It appears the
+  moment the driver raises `glsl_feature_level` to 400.
+* **`ARB_gpu_shader_fp64` cannot be enabled before that either.** Mesa builds
+  the software fp64 library only under `_mesa_is_desktop_gl(ctx) &&
+  ctx->Const.GLSLVersion >= 400` (`st_glsl_to_nir.cpp:496`), and
+  `nir_lower_doubles` asserts the library is present
+  (`nir_lower_double_ops.c:690`). Setting `caps.doubles` at GLSL 3.30 does not
+  produce fp64; it produces that assert, which is exactly what an earlier
+  attempt hit. `glsl_feature_level` is the driver's own cap, so this is not a
+  true circle -- but it does mean fp64 lands *with* the rung, never before it.
+
+So the rung is three pieces of real driver work, and then one flag that brings
+the other two with it. Raising `glsl_feature_level` early would be a lie worth
+avoiding: it advertises every GLSL 4.00 feature, `interpolateAtOffset`
+included, whether or not it works.
+
 | requirement | verdict |
 |---|---|
-| `ARB_tessellation_shader` | **lowerable; the single largest unbuilt item.** WebGPU has no tessellator *and no hardware one to drive*, so unlike GS this is not "run the user's shader as compute" -- you must also write the fixed-function tessellator itself in WGSL. `MAX_TESS_GEN_LEVEL` 64, `MAX_PATCH_VERTICES` 32. The driver's own note calls it out: *"Tessellation still has no emulation and so is still absent."* |
-| `ARB_gpu_shader_fp64` | **lowerable, and already written** -- WGSL has no `f64` (confirmed: "unresolved type 'f64'"), but Mesa ships `src/compiler/glsl/float64.glsl` plus `nir_lower_doubles(shader, softfp64, ...)`, used in production by Intel's compiler. Set `caps.doubles` and run the pass. |
-| `ARB_texture_query_lod` | **lowerable** -- confirmed no `textureQueryLod` in WGSL. The LOD formula is fully specified; compute it from `dpdx`/`dpdy` in shader. |
-| `ARB_gpu_shader5` | mixed. `fma` direct; `textureGatherOffsets` (4 offsets) = 4 gathers; `gl_SampleID`/`gl_SampleMask` direct; dynamically-uniform sampler indexing = a switch over N bindings. **`interpolateAtOffset`/`interpolateAtSample` have no WGSL equivalent** -- needs manual interpolation (see below). |
+| `ARB_tessellation_shader` | **not built; the single largest unbuilt item.** WebGPU has no tessellator *and no hardware one to drive*, so unlike GS this is not "run the user's shader as compute" -- you must also write the fixed-function tessellator itself in WGSL. `MAX_TESS_GEN_LEVEL` 64, `MAX_PATCH_VERTICES` 32. |
+| `ARB_texture_buffer_object` (+`_rgb32`) | **not built.** A `samplerBuffer` becomes a read-only storage buffer plus format decode in the shader. There is no existing Mesa pass to borrow -- `nir_lower_tex` has no buffer-texture case and no driver in tree lowers `GLSL_SAMPLER_DIM_BUF` this way -- so the decode for every buffer format has to be written. `_rgb32` is a format addition on top and cannot land first. |
+| `ARB_gpu_shader5` | **arrives with `glsl_feature_level = 400`; the work is making it true, not enabling it.** `fma` direct; `textureGatherOffsets` (4 offsets) = 4 gathers; `gl_SampleID`/`gl_SampleMask` direct; dynamically-uniform sampler indexing = a switch over N bindings. **`interpolateAtOffset`/`interpolateAtSample` have no WGSL equivalent** -- needs manual interpolation (see below). |
+| `ARB_gpu_shader_fp64` | **arrives with the same flag.** WGSL has no `f64` (confirmed: "unresolved type 'f64'"), but Mesa ships `src/compiler/glsl/float64.glsl` and `nir_lower_doubles(shader, softfp64, ...)`, used in production by Intel's compiler. Once GLSL 4.00 is claimed, `caps.doubles` plus `nir_lower_fp64_full_software` is the whole change. |
+| `ARB_texture_query_lod` | **done.** WGSL has no `textureQueryLod` and Tint refuses SPIR-V's `OpImageQueryLod` outright, so `gex_wgpu_lower_query_lod_instr` computes it from the coordinate's derivatives scaled by the texture size. Checked numerically against hand-computed levels in `gl44-query-lod-probe`, minification and magnification both. |
+| `ARB_transform_feedback2` | **done.** Pause, resume, append offsets and `glDrawTransformFeedback`, all riding on a byte total kept per stream-output target. The count is exact without a GPU counter or a readback, because this driver sizes each capture on the CPU before dispatching it. |
+| `ARB_transform_feedback3` | **done.** `gl_NextBuffer` splits a capture across buffers. Landing it exposed a real bug: the linker packs two float varyings into one slot, and the capture lowering matched an xfb output to a store by location alone, so one buffer was written twice and the other not at all. |
 | `ARB_sample_shading` | direct -- `@builtin(sample_index)` forces per-sample invocation; `glMinSampleShading` fractions may be rounded up, which GL permits |
-| `ARB_transform_feedback2/3` | lowerable, on the XFB emulation; `MAX_VERTEX_STREAMS >= 4` |
 | `ARB_draw_buffers_blend`, `ARB_draw_indirect`, `ARB_texture_cube_map_array` | direct |
-| `ARB_texture_buffer_object_rgb32` | lowerable -- storage buffer; `MAX_TEXTURE_BUFFER_SIZE >= 65536` easily met |
 
 ### GL 4.1 -- every limit met exactly, and only on hardware
 
