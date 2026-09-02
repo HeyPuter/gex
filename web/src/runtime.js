@@ -467,6 +467,15 @@ export async function runProgram(
     }
     const { makeWlChannel, setOutputSize } = await import('@gex/wl-bridge.mjs');
     wlChannel = makeWlChannel();
+    // An element that is not a canvas asks for the other compositor: windows
+    // as DOM elements, decorations in the page's own HTML. Same arena, same
+    // input ring, same protocol -- only the drawing is different.
+    const element = wl && typeof wl.getContext !== 'function' && wl.nodeType === 1 ? wl : null;
+    if (element) {
+      const { DomDesktop } = await import('./dom-compositor.js');
+      compositor = DomDesktop.create(element, wlChannel);
+      globalThis.__gexDesktop = compositor;
+    }
     const canvas = typeof wl?.getContext === 'function' ? wl : null;
     if (canvas) {
       setOutputSize(wlChannel, canvas.width, canvas.height);

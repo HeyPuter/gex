@@ -201,3 +201,38 @@ canvas.wl-offscreen {
     height: 26rem;
   }
 }
+
+/* The DOM desktop: windows are elements, and this is all a page's own CSS.
+   Nothing here is known to the compositor -- it hands over a canvas per
+   window and the frame around it is entirely this. */
+.dom-output {
+  background: #11151d;
+  border: 1px solid #2a3040;
+  position: relative;
+  overflow: hidden;
+}
+.dom-window {
+  box-shadow: 0 6px 24px #0008;
+  border: 1px solid #2a3040;
+  background: #11151d;
+}
+.dom-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px 2px 8px;
+  font: 12px/1.6 system-ui, sans-serif;
+  color: #dfe6f2;
+  background: #2d6cdf;
+  cursor: move;
+  user-select: none;
+}
+.dom-close {
+  border: 0;
+  background: #c0392b;
+  color: #fff;
+  font: 11px/1 system-ui, sans-serif;
+  padding: 3px 6px;
+  cursor: pointer;
+}

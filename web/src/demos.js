@@ -1737,6 +1737,93 @@ function sessionScript(chosen, {
   return s;
 }
 
+/* Window decorations, in HTML, for the DOM desktop.
+ *
+ * This is the part a page owns: the compositor hands over a canvas per window
+ * and nothing else, and everything here -- the frame, the title, dragging,
+ * closing, stacking -- is ordinary DOM. It is deliberately plain, because the
+ * point is that it is replaceable: a page can style it, animate it, or lay the
+ * windows out in a grid instead, without the compositor knowing.
+ */
+function domDecorations(root, ctx) {
+  root.style.position = 'relative';
+  root.style.overflow = 'hidden';
+  let top = 10;
+  let cascade = 0;
+  // The desktop is created by the runtime when the run starts; poll for it
+  // rather than plumb a callback through, since a page would normally be
+  // holding the object it made itself.
+  const wait = setInterval(() => {
+    const desk = globalThis.__gexDesktop;
+    if (!desk || desk.onwindow) return;
+    clearInterval(wait);
+    desk.onwindow = (win) => {
+      const frame = document.createElement('div');
+      frame.className = 'dom-window';
+      const bar = document.createElement('div');
+      bar.className = 'dom-titlebar';
+      const name = document.createElement('span');
+      name.textContent = win.title || 'X11';
+      const close = document.createElement('button');
+      close.textContent = '\u2715';
+      close.className = 'dom-close';
+      bar.append(name, close);
+      if (win.decorations === 'server') frame.append(bar);
+      frame.append(win.canvas);
+      // A cascade, so two windows that appear together are both reachable.
+      const x = 12 + (cascade * 28) % Math.max(1, root.clientWidth - win.width - 24);
+      const y = 12 + (cascade * 28) % Math.max(1, root.clientHeight - win.height - 60);
+      cascade++;
+      const put = (nx, ny) => {
+        frame.style.left = `${nx}px`;
+        frame.style.top = `${ny}px`;
+        // The compositor is told where the window is because an X client's
+        // menus are placed in these coordinates. A Wayland one never asks.
+        win.place(nx + (win.decorations === 'server' ? 0 : 0),
+                  ny + (win.decorations === 'server' ? bar.offsetHeight : 0));
+      };
+      frame.style.position = 'absolute';
+      frame.style.zIndex = String(++top);
+      root.append(frame);
+      put(x, y);
+
+      win.onretitle = (t) => { name.textContent = t; };
+      win.onresized = () => put(parseInt(frame.style.left, 10), parseInt(frame.style.top, 10));
+      win.onclosed = () => frame.remove();
+      close.onclick = () => win.close();
+      frame.addEventListener('pointerdown', () => {
+        frame.style.zIndex = String(++top);
+        win.focus();
+      }, true);
+
+      // Dragging by the titlebar, which is a page's business and not a
+      // compositor's: nothing below knows this happened except through
+      // `place`.
+      let from = null;
+      bar.addEventListener('pointerdown', (e) => {
+        from = { x: e.clientX, y: e.clientY,
+                 left: parseInt(frame.style.left, 10), top: parseInt(frame.style.top, 10) };
+        bar.setPointerCapture(e.pointerId);
+      });
+      bar.addEventListener('pointermove', (e) => {
+        if (!from) return;
+        put(from.left + (e.clientX - from.x), from.top + (e.clientY - from.y));
+      });
+      bar.addEventListener('pointerup', (e) => {
+        from = null;
+        bar.releasePointerCapture(e.pointerId);
+      });
+
+      // A popup or an X menu is placed by its client, in output coordinates.
+      win.onplace = (px, py) => {
+        frame.style.left = `${px}px`;
+        frame.style.top = `${py}px`;
+      };
+      ctx?.hint?.(`${desk.windows().length} window(s)`);
+    };
+  }, 100);
+}
+
 const compositor = {
   id: 'compositor',
   title: 'A desktop session on gex-wayland',
@@ -1762,13 +1849,23 @@ const compositor = {
   async enter(ctx) {
     const wrap = document.createElement('div');
     wrap.className = 'canvas-wrap';
-    const wlCanvas = document.createElement('canvas');
+    // `?desktop=dom` runs the other compositor: windows are elements and the
+    // decorations below are ordinary HTML, styled in the page's own CSS. The
+    // default draws the whole scene itself in one WebGL context.
+    const asDom = new URLSearchParams(location.search).get('desktop') === 'dom';
+    const wlCanvas = document.createElement(asDom ? 'div' : 'canvas');
     wlCanvas.id = 'gex-wl';
-    wlCanvas.width = this.outputWidth;
-    wlCanvas.height = this.outputHeight;
+    if (!asDom) {
+      wlCanvas.width = this.outputWidth;
+      wlCanvas.height = this.outputHeight;
+    } else {
+      wlCanvas.style.width = `${this.outputWidth}px`;
+      wlCanvas.style.height = `${this.outputHeight}px`;
+    }
     wlCanvas.tabIndex = 0;
-    wlCanvas.classList.add('wl-output');
+    wlCanvas.classList.add(asDom ? 'dom-output' : 'wl-output');
     wrap.append(wlCanvas);
+    if (asDom) domDecorations(wlCanvas, ctx);
     // The renderer's own GL context: where an OpenGL client's commands are
     // replayed. Never shown -- its pixels reach the screen through the
     // client's wl_surface like everything else's.
