@@ -362,6 +362,14 @@ pub const DISPATCH_DIR_BYTES: u64 = DISPATCH_MAX_PAGES * 4;
 /// First guest address above the dispatch directory.
 pub const DISPATCH_DIR_END: u64 = DISPATCH_DIR + DISPATCH_DIR_BYTES;
 
+/// The first address the guest may map. Everything below it -- the contexts,
+/// the exclusive-monitor scratch, and the dispatch directory -- is the
+/// runtime's, and a guest mapping over it corrupts dispatch. A `MAP_FIXED`
+/// that reaches below this is clipped to start here; a `MAP_FIXED_NOREPLACE`
+/// that reaches below it fails, which is how Wine's address-space reservation
+/// reserves only the gaps and leaves the runtime's region alone.
+pub const RESERVE_FLOOR: u64 = DISPATCH_DIR_END;
+
 /// Ceiling on one dispatch table (10M slots ≈ 38 MiB of guest text). The
 /// table grows from the image's size, so the ceiling costs nothing until used.
 ///

@@ -2512,11 +2512,23 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     static COUNT: AtomicU64 = AtomicU64::new(0);
                     if LAST.swap(pc, Ordering::Relaxed) == pc {
                         let n = COUNT.fetch_add(1, Ordering::Relaxed);
-                        if n < 4 {
+                        if n < 6 {
                             let ca = ctx as u32 as u64;
                             let lt = gm.read_u64(ca + gex_abi::ctx::LAST_TARGET as u64).unwrap_or(0);
                             let ls = gm.read_u64(ca + gex_abi::ctx::LAST_SOURCE as u64).unwrap_or(0);
-                            eprintln!("[loop] pc={pc:#x} LAST_TARGET={lt:#x} LAST_SOURCE={ls:#x}");
+                            let page = pc / gex_abi::DISPATCH_PAGE;
+                            let dir = gm.read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(0);
+                            let want = gex_abi::dispatch_index(pc, dir);
+                            let in_translated = caller
+                                .data()
+                                .jit
+                                .as_ref()
+                                .map(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).translated.contains(&pc))
+                                .unwrap_or(false);
+                            eprintln!(
+                                "[loop] pc={pc:#x} page={page:#x} dir=t{} s{} idx={want} translated={in_translated} LT={lt:#x} LS={ls:#x}",
+                                dir >> 24, dir & 0xffffff
+                            );
                         }
                     } else {
                         COUNT.store(0, Ordering::Relaxed);

@@ -27,6 +27,12 @@ pub mod flags {
     pub const SHARED: u64 = 0x01;
     pub const PRIVATE: u64 = 0x02;
     pub const FIXED: u64 = 0x10;
+    /// `MAP_FIXED_NOREPLACE`: map at the address only where it is free; fail
+    /// with `EEXIST` if any part is already mapped, leaving every existing
+    /// mapping alone. Wine reserves address space with it -- one huge request
+    /// that must reserve only the gaps and never disturb the loaded images,
+    /// the stack, or the runtime's own reserved region.
+    pub const FIXED_NOREPLACE: u64 = 0x100000;
     pub const ANONYMOUS: u64 = 0x20;
     pub const NORESERVE: u64 = 0x4000;
     pub const STACK: u64 = 0x20000;
@@ -386,7 +392,7 @@ impl MemoryMap {
         }
         let len = page_align_up(len);
 
-        if flags & flags::FIXED != 0 {
+        if flags & (flags::FIXED | flags::FIXED_NOREPLACE) != 0 {
             if !addr.is_multiple_of(PAGE_SIZE) {
                 return Err(Errno::EINVAL);
             }
@@ -394,10 +400,26 @@ impl MemoryMap {
             if end > GUEST_LIMIT {
                 return Err(Errno::ENOMEM);
             }
-            // MAP_FIXED replaces whatever was there.
-            self.ensure_backed(end)?;
-            self.unmap(addr, len)?;
-            self.insert_from(addr, end, prot, name, origin);
+            // `MAP_FIXED_NOREPLACE` must not disturb anything already there:
+            // fail if the range overlaps a mapping or the runtime's own
+            // reserved region (which is not a VMA but is guest memory the
+            // runtime owns -- its dispatch directory and contexts live at
+            // 0..`RESERVE_FLOOR`). Wine reserves address space this way and
+            // relies on the failure to reserve only the free gaps.
+            let noreplace = flags & flags::FIXED_NOREPLACE != 0 && flags & flags::FIXED == 0;
+            let hits_reserved = addr < gex_abi::RESERVE_FLOOR;
+            if noreplace && (!self.is_free(addr, end) || hits_reserved) {
+                return Err(Errno::EEXIST);
+            }
+            // Plain `MAP_FIXED` replaces whatever was there -- except the
+            // reserved region, which it must never overwrite. Clip it out and
+            // keep the requested address for the guest's bookkeeping.
+            let map_lo = addr.max(gex_abi::RESERVE_FLOOR);
+            if map_lo < end {
+                self.ensure_backed(end)?;
+                self.unmap(map_lo, end - map_lo)?;
+                self.insert_from(map_lo, end, prot, name, origin);
+            }
             return Ok(addr);
         }
 
