@@ -6649,3 +6649,64 @@ keep the shadow", and the condition below it only excludes index buffers. The
 comment in `gex_wgpu_buffer_subdata` is the accurate one: nothing reads a
 constant buffer's shadow, and its pages are where the memory was. The
 staged-map comment is stale, not the code.)
+
+### The scene was the staged write-map path
+
+`GEX_WGPU_NO_STAGED_MAP=1` -- added to answer a different question -- renders
+STK's scene completely and correctly, matching llvmpipe at GL 3.3. So the
+fault is in the staged write map, and the bisection above is explained: every
+mesh in the scene comes from one buffer written that way, while the skybox and
+the HUD do not.
+
+STK maps it like this, and this is the only staged map in the whole run:
+
+```
+staged map usage=0xa2 WRITE DISCARD_WHOLE UNSYNC bind=0x10 range=0+180640
+```
+
+A whole 180 KB vertex buffer, rewritten per object. `PIPE_MAP_DISCARD_WHOLE_-
+RESOURCE` is how an application asks for **buffer renaming**: give me this
+buffer again and do not make me wait for whatever is still reading the old
+one. A driver honours it by handing over a fresh allocation while the previous
+one lives on for the work that still references it. This driver does not
+rename, and serving the map from a staged block instead is where the two part
+company.
+
+So the staged path is now taken only for `PIPE_MAP_DISCARD_RANGE`, which is
+the pattern it was written for -- u_upload_mgr hands out a fresh region of a
+large buffer and fills it, and a fresh block to fill is exactly right for
+that. STK renders correctly, and Minecraft's crowd scene is unaffected: 60-67
+fps at 1429-1538 draws a frame, 192 draws a submit.
+
+**The mechanism is still not understood, and the fix is scoped rather than
+diagnosed.** What was ruled out, with measurements:
+
+* **Lost bytes.** Instrumented against the buffer's previous contents, the
+  caller leaves nothing behind that it needed: 0 bytes of 180640 are zero in
+  the staged block where the old buffer held something. The block is 80-99.9%
+  non-zero and the last byte written is at the very end of the range.
+* **Write-versus-recorded-draw ordering.** A flush at unmap whenever the
+  pending batch reads the buffer never fires once in an STK run -- at each
+  unmap the batch holds no draw reading it. Worth knowing anyway: that flush
+  ignores `PIPE_MAP_UNSYNCHRONIZED`, and on Minecraft it fires constantly and
+  costs half the frame rate (33 fps, 3.5 draws a submit, against 66-70 and
+  187). It was reverted.
+* **An unconditional submit at map time**, which is the side effect
+  `NO_STAGED_MAP` has through `gex_wgpu_shadow_for_read`. Does not help.
+* **The shadow's mere existence.** Forcing a shadow *and* keeping the staged
+  path leaves the scene broken, so it is not something else reading the
+  shadow.
+
+Two real bugs were found while eliminating those, and both are kept:
+
+* `gex_wgpu_batch_conflicts` consulted a per-resource `in_batch` flag that
+  `gex_wgpu_batch_touch` stops setting once its array is full, and the
+  overflow flag it set was never read -- so in a frame busy enough to
+  overflow, a write to a resource the batch really does read reported no
+  conflict. Overflow now means "assume everything conflicts", and the array
+  is sized to a full batch (4096) so overflow is the backstop it was meant to
+  be: at 256 it overflowed constantly, and the conservative path then halved
+  the frame rate.
+* The staged path uploads the whole mapped range out of a zeroed block, so it
+  needs the caller to have undertaken to write all of it. A plain
+  `PIPE_MAP_WRITE` promises nothing of the kind.
