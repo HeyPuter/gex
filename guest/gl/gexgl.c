@@ -2692,6 +2692,204 @@ void glMaterialfv(unsigned face, unsigned pname, const float *params) {
                   material_parameter_floats(pname));
 }
 
+/* The rest of the fixed-function set.
+ *
+ * A missing entry point here is not a missing feature: libGL exports a fixed
+ * list of symbols, so a program calling one that is absent fails to resolve
+ * it and never starts. 181 of the 341 installed GL programs needed at least
+ * one symbol this library did not export, and none of that is visible in a
+ * native sweep, where they link the system's own libGL.
+ *
+ * The vector forms are folded into the widest one -- glColor3f sends alpha 1,
+ * glTexCoord2f sends r 0 and q 1 -- so one opcode serves a family. That is
+ * what GL itself specifies those calls to mean.
+ */
+static void put_f4(uint32_t opcode, float a, float b, float c, float d) {
+    uint32_t *p = begin(opcode, 4, 0);
+    if (!p) return;
+    put_float(&p[0], a); put_float(&p[1], b);
+    put_float(&p[2], c); put_float(&p[3], d);
+}
+
+void glOrtho(double l, double r, double b, double t, double n, double f) {
+    uint32_t *p = begin(GEXGL_ORTHO, 12, 0); if (!p) return;
+    put_double(&p[0], l); put_double(&p[2], r); put_double(&p[4], b);
+    put_double(&p[6], t); put_double(&p[8], n); put_double(&p[10], f);
+}
+
+void glColor3f(float r, float g, float b) { put_f4(GEXGL_COLOR4F, r, g, b, 1.0f); }
+void glColor4f(float r, float g, float b, float a) { put_f4(GEXGL_COLOR4F, r, g, b, a); }
+void glColor3fv(const float *v) { if (v) put_f4(GEXGL_COLOR4F, v[0], v[1], v[2], 1.0f); }
+void glColor4fv(const float *v) { if (v) put_f4(GEXGL_COLOR4F, v[0], v[1], v[2], v[3]); }
+void glColor3d(double r, double g, double b) { put_f4(GEXGL_COLOR4F, (float)r, (float)g, (float)b, 1.0f); }
+void glColor4d(double r, double g, double b, double a) { put_f4(GEXGL_COLOR4F, (float)r, (float)g, (float)b, (float)a); }
+/* The integer colour forms scale to [0, 1] as GL specifies: unsigned bytes by
+   255, signed bytes by 127. */
+void glColor3ub(unsigned char r, unsigned char g, unsigned char b) {
+    put_f4(GEXGL_COLOR4F, r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
+}
+void glColor4ub(unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+    put_f4(GEXGL_COLOR4F, r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+}
+void glColor3ubv(const unsigned char *v) { if (v) glColor3ub(v[0], v[1], v[2]); }
+void glColor4ubv(const unsigned char *v) { if (v) glColor4ub(v[0], v[1], v[2], v[3]); }
+
+void glTexCoord2f(float s_, float t_) { put_f4(GEXGL_TEXCOORD4F, s_, t_, 0.0f, 1.0f); }
+void glTexCoord3f(float s_, float t_, float r) { put_f4(GEXGL_TEXCOORD4F, s_, t_, r, 1.0f); }
+void glTexCoord4f(float s_, float t_, float r, float q) { put_f4(GEXGL_TEXCOORD4F, s_, t_, r, q); }
+void glTexCoord2fv(const float *v) { if (v) put_f4(GEXGL_TEXCOORD4F, v[0], v[1], 0.0f, 1.0f); }
+void glTexCoord3fv(const float *v) { if (v) put_f4(GEXGL_TEXCOORD4F, v[0], v[1], v[2], 1.0f); }
+void glTexCoord4fv(const float *v) { if (v) put_f4(GEXGL_TEXCOORD4F, v[0], v[1], v[2], v[3]); }
+void glTexCoord2d(double s_, double t_) { put_f4(GEXGL_TEXCOORD4F, (float)s_, (float)t_, 0.0f, 1.0f); }
+void glTexCoord2i(int s_, int t_) { put_f4(GEXGL_TEXCOORD4F, (float)s_, (float)t_, 0.0f, 1.0f); }
+
+void glVertex2f(float x, float y) { glVertex3f(x, y, 0.0f); }
+void glVertex2i(int x, int y) { glVertex3f((float)x, (float)y, 0.0f); }
+void glVertex2d(double x, double y) { glVertex3f((float)x, (float)y, 0.0f); }
+void glVertex2fv(const float *v) { if (v) glVertex3f(v[0], v[1], 0.0f); }
+void glVertex3fv(const float *v) { if (v) glVertex3f(v[0], v[1], v[2]); }
+void glVertex3d(double x, double y, double z) { glVertex3f((float)x, (float)y, (float)z); }
+void glVertex3dv(const double *v) { if (v) glVertex3f((float)v[0], (float)v[1], (float)v[2]); }
+void glVertex3i(int x, int y, int z) { glVertex3f((float)x, (float)y, (float)z); }
+void glNormal3fv(const float *v) { if (v) glNormal3f(v[0], v[1], v[2]); }
+void glNormal3d(double x, double y, double z) { glNormal3f((float)x, (float)y, (float)z); }
+
+void glScalef(float x, float y, float z) {
+    uint32_t *p = begin(GEXGL_SCALEF, 3, 0); if (!p) return;
+    put_float(&p[0], x); put_float(&p[1], y); put_float(&p[2], z);
+}
+void glScaled(double x, double y, double z) { glScalef((float)x, (float)y, (float)z); }
+void glRotated(double a, double x, double y, double z) {
+    glRotatef((float)a, (float)x, (float)y, (float)z);
+}
+
+static void put_enum_f(uint32_t opcode, unsigned target, unsigned pname, float v) {
+    uint32_t *p = begin(opcode, 3, 0); if (!p) return;
+    p[0] = target; p[1] = pname; put_float(&p[2], v);
+}
+void glTexEnvf(unsigned target, unsigned pname, float v) {
+    put_enum_f(GEXGL_TEXENVF, target, pname, v);
+}
+void glTexEnvi(unsigned target, unsigned pname, int v) {
+    uint32_t *p = begin(GEXGL_TEXENVI, 3, 0); if (!p) return;
+    p[0] = target; p[1] = pname; p[2] = (uint32_t)v;
+}
+void glTexEnvfv(unsigned target, unsigned pname, const float *v) {
+    /* Only the scalar parameters are forwarded as scalars; GL_TEXTURE_ENV_COLOR
+       is the one vector form and takes four. */
+    if (!v) return;
+    if (pname == 0x2201u) { /* GL_TEXTURE_ENV_COLOR */
+        uint32_t *p = begin(GEXGL_TEXENVF, 6, 0); if (!p) return;
+        p[0] = target; p[1] = pname;
+        for (unsigned i = 0; i < 4; ++i) put_float(&p[2 + i], v[i]);
+        return;
+    }
+    put_enum_f(GEXGL_TEXENVF, target, pname, v[0]);
+}
+
+void glFogf(unsigned pname, float v) {
+    uint32_t *p = begin(GEXGL_FOGF, 2, 0); if (!p) return;
+    p[0] = pname; put_float(&p[1], v);
+}
+void glFogi(unsigned pname, int v) {
+    uint32_t *p = begin(GEXGL_FOGI, 2, 0); if (!p) return;
+    p[0] = pname; p[1] = (uint32_t)v;
+}
+void glFogfv(unsigned pname, const float *v) {
+    if (!v) return;
+    /* GL_FOG_COLOR is the only vector parameter; the rest are scalars. */
+    const unsigned count = pname == 0x0B66u ? 4u : 1u; /* GL_FOG_COLOR */
+    uint32_t *p = begin(GEXGL_FOGFV, 2 + count, 0); if (!p) return;
+    p[0] = pname; p[1] = count;
+    for (unsigned i = 0; i < count; ++i) put_float(&p[2 + i], v[i]);
+}
+
+void glClipPlane(unsigned plane, const double *equation) {
+    if (!equation) return;
+    uint32_t *p = begin(GEXGL_CLIP_PLANE, 9, 0); if (!p) return;
+    p[0] = plane;
+    for (unsigned i = 0; i < 4; ++i) put_double(&p[1 + i * 2], equation[i]);
+}
+
+void glAlphaFunc(unsigned func, float ref) {
+    uint32_t *p = begin(GEXGL_ALPHA_FUNC, 2, 0); if (!p) return;
+    p[0] = func; put_float(&p[1], ref);
+}
+
+void glRectf(float x1, float y1, float x2, float y2) {
+    put_f4(GEXGL_RECTF, x1, y1, x2, y2);
+}
+void glRecti(int x1, int y1, int x2, int y2) {
+    put_f4(GEXGL_RECTF, (float)x1, (float)y1, (float)x2, (float)y2);
+}
+void glRectd(double x1, double y1, double x2, double y2) {
+    put_f4(GEXGL_RECTF, (float)x1, (float)y1, (float)x2, (float)y2);
+}
+
+void glRasterPos2f(float x, float y) { put_f4(GEXGL_RASTER_POS4F, x, y, 0.0f, 1.0f); }
+void glRasterPos2i(int x, int y) { put_f4(GEXGL_RASTER_POS4F, (float)x, (float)y, 0.0f, 1.0f); }
+void glRasterPos2d(double x, double y) { put_f4(GEXGL_RASTER_POS4F, (float)x, (float)y, 0.0f, 1.0f); }
+void glRasterPos3f(float x, float y, float z) { put_f4(GEXGL_RASTER_POS4F, x, y, z, 1.0f); }
+void glRasterPos3fv(const float *v) { if (v) put_f4(GEXGL_RASTER_POS4F, v[0], v[1], v[2], 1.0f); }
+
+void glLineStipple(int factor, unsigned short pattern) {
+    uint32_t *p = begin(GEXGL_LINE_STIPPLE, 2, 0); if (!p) return;
+    p[0] = (uint32_t)factor; p[1] = pattern;
+}
+
+void glPushAttrib(unsigned mask) { CMD1(GEXGL_PUSH_ATTRIB, mask); }
+void glPopAttrib(void) { CMD0(GEXGL_POP_ATTRIB); }
+
+void glPixelZoom(float x, float y) {
+    uint32_t *p = begin(GEXGL_PIXEL_ZOOM, 2, 0); if (!p) return;
+    put_float(&p[0], x); put_float(&p[1], y);
+}
+
+void glLightModelfv(unsigned pname, const float *v) {
+    if (!v) return;
+    /* GL_LIGHT_MODEL_AMBIENT takes four; the rest are scalars. */
+    const unsigned count = pname == 0x0B53u ? 4u : 1u; /* LIGHT_MODEL_AMBIENT */
+    uint32_t *p = begin(GEXGL_LIGHT_MODELFV, 2 + count, 0); if (!p) return;
+    p[0] = pname; p[1] = count;
+    for (unsigned i = 0; i < count; ++i) put_float(&p[2 + i], v[i]);
+}
+void glLightModelf(unsigned pname, float v) { glLightModelfv(pname, &v); }
+void glLightModeli(unsigned pname, int v) { const float f = (float)v; glLightModelfv(pname, &f); }
+
+void glMaterialf(unsigned face, unsigned pname, float v) {
+    put_enum_f(GEXGL_MATERIALF, face, pname, v);
+}
+void glLightf(unsigned light, unsigned pname, float v) {
+    put_enum_f(GEXGL_LIGHTF, light, pname, v);
+}
+void glLighti(unsigned light, unsigned pname, int v) { glLightf(light, pname, (float)v); }
+void glMateriali(unsigned face, unsigned pname, int v) { glMaterialf(face, pname, (float)v); }
+
+static void put_matrix(uint32_t opcode, const float *m) {
+    if (!m) return;
+    uint32_t *p = begin(opcode, 16, 0); if (!p) return;
+    for (unsigned i = 0; i < 16; ++i) put_float(&p[i], m[i]);
+}
+void glMultMatrixf(const float *m) { put_matrix(GEXGL_MULT_MATRIXF, m); }
+void glLoadMatrixf(const float *m) { put_matrix(GEXGL_LOAD_MATRIXF, m); }
+void glMultMatrixd(const double *m) {
+    if (!m) return;
+    float f[16];
+    for (unsigned i = 0; i < 16; ++i) f[i] = (float)m[i];
+    put_matrix(GEXGL_MULT_MATRIXF, f);
+}
+void glLoadMatrixd(const double *m) {
+    if (!m) return;
+    float f[16];
+    for (unsigned i = 0; i < 16; ++i) f[i] = (float)m[i];
+    put_matrix(GEXGL_LOAD_MATRIXF, f);
+}
+
+void glColorMaterial(unsigned face, unsigned mode) {
+    uint32_t *p = begin(GEXGL_COLOR_MATERIAL, 2, 0); if (!p) return;
+    p[0] = face; p[1] = mode;
+}
+
 /* glPolygonStipple: the 32x32 pattern, as 32 words.
  *
  * Hand-written rather than generated because the generator covers GL 4.4 core

@@ -165,6 +165,12 @@ enum Op : uint32_t {
     SHADE_MODEL = 177, LIGHTFV = 178, MATERIALFV = 179, GEN_LISTS = 180,
     NEW_LIST = 181, END_LIST = 182, CALL_LIST = 183, DELETE_LISTS = 184,
     POLYGON_STIPPLE = 185,
+    ORTHO = 186, COLOR4F = 187, TEXCOORD4F = 188, SCALEF = 189,
+    TEXENVF = 190, TEXENVI = 191, FOGF = 192, FOGI = 193, FOGFV = 194,
+    CLIP_PLANE = 195, ALPHA_FUNC = 196, RECTF = 197, RASTER_POS4F = 198,
+    LINE_STIPPLE = 199, PUSH_ATTRIB = 200, POP_ATTRIB = 201,
+    PIXEL_ZOOM = 202, LIGHT_MODELFV = 203, MATERIALF = 204, LIGHTF = 205,
+    MULT_MATRIXF = 206, LOAD_MATRIXF = 207, COLOR_MATERIAL = 208,
 };
 
 struct Reader {
@@ -2051,6 +2057,160 @@ bool one(uint32_t op, Reader& a) {
         }
         if (!a.ok) return false;
         glPolygonStipple(mask);
+        break;
+    }
+    /* The rest of the fixed-function set. Each is state the compatibility
+     * context can take directly, so each case is one GL call. The guest folds
+     * the narrower forms into the widest -- glColor3f arrives as a vec4 with
+     * alpha 1, glTexCoord2f as a vec4 with r 0 and q 1 -- which is what GL
+     * specifies those calls to mean. */
+    case ORTHO: {
+        const GLdouble l = a.f64(), r = a.f64(), b = a.f64();
+        const GLdouble t = a.f64(), n = a.f64(), f = a.f64();
+        if (!a.ok) return false;
+        glOrtho(l, r, b, t, n, f);
+        break;
+    }
+    case COLOR4F: {
+        const GLfloat r = a.f32(), g = a.f32(), b = a.f32(), al = a.f32();
+        if (!a.ok) return false;
+        glColor4f(r, g, b, al);
+        break;
+    }
+    case TEXCOORD4F: {
+        const GLfloat s0 = a.f32(), t0 = a.f32(), r0 = a.f32(), q = a.f32();
+        if (!a.ok) return false;
+        glTexCoord4f(s0, t0, r0, q);
+        break;
+    }
+    case SCALEF: {
+        const GLfloat x = a.f32(), y = a.f32(), z = a.f32();
+        if (!a.ok) return false;
+        glScalef(x, y, z);
+        break;
+    }
+    case TEXENVF: {
+        const GLenum target = a.u32();
+        const GLenum pname = a.u32();
+        if (pname == GL_TEXTURE_ENV_COLOR) {
+            GLfloat colour[4];
+            for (float &channel : colour) channel = a.f32();
+            if (!a.ok) return false;
+            glTexEnvfv(target, pname, colour);
+        } else {
+            const GLfloat value = a.f32();
+            if (!a.ok) return false;
+            glTexEnvf(target, pname, value);
+        }
+        break;
+    }
+    case TEXENVI: {
+        const GLenum target = a.u32();
+        const GLenum pname = a.u32();
+        const GLint value = a.i32();
+        if (!a.ok) return false;
+        glTexEnvi(target, pname, value);
+        break;
+    }
+    case FOGF: {
+        const GLenum pname = a.u32();
+        const GLfloat value = a.f32();
+        if (!a.ok) return false;
+        glFogf(pname, value);
+        break;
+    }
+    case FOGI: {
+        const GLenum pname = a.u32();
+        const GLint value = a.i32();
+        if (!a.ok) return false;
+        glFogi(pname, value);
+        break;
+    }
+    case FOGFV:
+    case LIGHT_MODELFV: {
+        const GLenum pname = a.u32();
+        const uint32_t count = a.u32();
+        /* Four is the widest of these parameters; more is a malformed
+         * command rather than something to read past the buffer for. */
+        if (count > 4 || !a.ok) return false;
+        GLfloat values[4] = {};
+        for (uint32_t i = 0; i < count; ++i) values[i] = a.f32();
+        if (!a.ok) return false;
+        if (op == FOGFV) glFogfv(pname, values);
+        else glLightModelfv(pname, values);
+        break;
+    }
+    case CLIP_PLANE: {
+        const GLenum plane = a.u32();
+        GLdouble equation[4];
+        for (double &term : equation) term = a.f64();
+        if (!a.ok) return false;
+        glClipPlane(plane, equation);
+        break;
+    }
+    case ALPHA_FUNC: {
+        const GLenum func = a.u32();
+        const GLfloat ref = a.f32();
+        if (!a.ok) return false;
+        glAlphaFunc(func, ref);
+        break;
+    }
+    case RECTF: {
+        const GLfloat x1 = a.f32(), y1 = a.f32(), x2 = a.f32(), y2 = a.f32();
+        if (!a.ok) return false;
+        glRectf(x1, y1, x2, y2);
+        break;
+    }
+    case RASTER_POS4F: {
+        const GLfloat x = a.f32(), y = a.f32(), z = a.f32(), w = a.f32();
+        if (!a.ok) return false;
+        glRasterPos4f(x, y, z, w);
+        break;
+    }
+    case LINE_STIPPLE: {
+        const GLint factor = a.i32();
+        const uint32_t pattern = a.u32();
+        if (!a.ok) return false;
+        glLineStipple(factor, (GLushort)pattern);
+        break;
+    }
+    case PUSH_ATTRIB: {
+        const GLbitfield mask = a.u32();
+        if (!a.ok) return false;
+        glPushAttrib(mask);
+        break;
+    }
+    case POP_ATTRIB: glPopAttrib(); break;
+    case PIXEL_ZOOM: {
+        const GLfloat x = a.f32(), y = a.f32();
+        if (!a.ok) return false;
+        glPixelZoom(x, y);
+        break;
+    }
+    case MATERIALF:
+    case LIGHTF: {
+        const GLenum target = a.u32();
+        const GLenum pname = a.u32();
+        const GLfloat value = a.f32();
+        if (!a.ok) return false;
+        if (op == MATERIALF) glMaterialf(target, pname, value);
+        else glLightf(target, pname, value);
+        break;
+    }
+    case MULT_MATRIXF:
+    case LOAD_MATRIXF: {
+        GLfloat matrix[16];
+        for (float &term : matrix) term = a.f32();
+        if (!a.ok) return false;
+        if (op == MULT_MATRIXF) glMultMatrixf(matrix);
+        else glLoadMatrixf(matrix);
+        break;
+    }
+    case COLOR_MATERIAL: {
+        const GLenum face = a.u32();
+        const GLenum mode = a.u32();
+        if (!a.ok) return false;
+        glColorMaterial(face, mode);
         break;
     }
     case GEN_LISTS: put_u32(glGenLists(a.i32())); break;

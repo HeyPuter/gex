@@ -322,6 +322,40 @@ pub mod op {
     /// leftmost pixel. Compatibility-profile only, so it is not one of the
     /// generated GL 4.4 core commands.
     pub const POLYGON_STIPPLE: u32 = 185;
+    /* The rest of the fixed-function set, added because a *missing* entry
+     * point is not a missing feature: libGL exports a fixed list of symbols,
+     * so a program calling one that is absent fails to resolve it and never
+     * starts. Of the 341 installed GL programs, 181 needed at least one
+     * symbol the guest did not export -- `glOrtho` alone was in 127 of them
+     * and `glColor3f` in 126 -- and none of that shows up in a native sweep,
+     * where they link the system's own libGL.
+     *
+     * Every one of these is state the host's compatibility context can
+     * execute directly, so the host case is a single GL call. */
+    pub const ORTHO: u32 = 186;
+    pub const COLOR4F: u32 = 187;
+    pub const TEXCOORD4F: u32 = 188;
+    pub const SCALEF: u32 = 189;
+    pub const TEXENVF: u32 = 190;
+    pub const TEXENVI: u32 = 191;
+    pub const FOGF: u32 = 192;
+    pub const FOGI: u32 = 193;
+    pub const FOGFV: u32 = 194;
+    pub const CLIP_PLANE: u32 = 195;
+    pub const ALPHA_FUNC: u32 = 196;
+    pub const RECTF: u32 = 197;
+    pub const RASTER_POS4F: u32 = 198;
+    pub const LINE_STIPPLE: u32 = 199;
+    pub const PUSH_ATTRIB: u32 = 200;
+    pub const POP_ATTRIB: u32 = 201;
+    pub const PIXEL_ZOOM: u32 = 202;
+    pub const LIGHT_MODELFV: u32 = 203;
+    pub const MATERIALF: u32 = 204;
+    pub const LIGHTF: u32 = 205;
+    pub const MULT_MATRIXF: u32 = 206;
+    pub const LOAD_MATRIXF: u32 = 207;
+    pub const COLOR_MATERIAL: u32 = 208;
+    pub const POLYGON_MODE_FF: u32 = 209;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,
