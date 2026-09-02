@@ -6427,3 +6427,57 @@ Two full `KHR-GL33` sweeps were run against the recorded baseline, one with
 **zero regressions both times**, 32 shared families and 1612 passing cases
 unchanged. `caps->texture_query_lod` was deliberately left off until the
 lowering was verified, for the same reason.
+
+## The bind group cache never hit (2026-09-02)
+
+`GEX_WGPU_TIMING=1` on Minecraft with a crowd reported:
+
+```
+cache hit rate -- bind groups 0.0% (46987974), pipelines 99.4% (90743)
+```
+
+Not a low hit rate: zero, across forty-seven million lookups. Every draw built
+a bind group Dawn had already been given.
+
+The cause is that `cache_epoch` is global and every slot is validated against
+it -- a hit needs `slot->epoch == screen->cache_epoch` -- while the *eviction*
+path incremented it. So evicting any one of the 512 slots invalidated all the
+others, and a workload that evicted at all could never hit again. The pipeline
+cache's eviction path bumped it too, which was pure collateral damage: that
+cache does not consult the epoch at all, so the bump could only harm the bind
+group cache it shared the counter with.
+
+The epoch is still needed, but only where it was actually earned. A key names
+its buffers, views and samplers by address, and Dawn hands a freed address
+straight back, so a stale key could match the wrong object. What makes that
+impossible between neighbours is that each slot holds a reference to its own
+group, which holds one to everything its key names -- so nothing a live slot
+names can be freed underneath it, whatever happens to the slot next door. The
+one thing that outruns the reference is a driver-level sampler or view being
+destroyed, and those two paths still bump the epoch. Eviction never needed to.
+
+`KHR-GL33` confirms the guard is intact: zero regressions across 32 families
+and 1612 cases, with `texture_repeat_mode` -- the family that fell from 162 to
+158 when this class of bug last appeared -- back at a full 162/162.
+
+### What it was worth, measured rather than assumed
+
+Matched runs of the same scene at the same 1429 draws/frame, the fix being the
+only difference:
+
+| | eviction bump present | removed |
+|---|---|---|
+| frames/s | 54.4 -- 56.2 | 57.6 -- 62.4 |
+| draws/s | 77.7k -- 80.2k | 83.9k -- 92.8k |
+| bind group hits | 0.0% | 99.6% |
+
+About 8%. Worth having, and much less than it looked like it should be --
+Dawn builds bind groups cheaply enough that forty-seven million redundant
+creations cost single digits.
+
+The measurement matters as much as the fix. An earlier reading of "19,319
+draws/s at 645 draws/frame" was taken from the same script while the scene was
+still loading, and comparing the fixed build against *that* suggested a 4.5x
+improvement. It was not a baseline, only a different scene. Any claim about
+this driver's frame rate needs the draws/frame printed next to it, or it is
+comparing two different pictures.
