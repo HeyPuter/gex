@@ -3290,6 +3290,48 @@ unsigned glGenLists(int range) {
     return reply_u32();
 }
 
+/* Selection mode.
+ *
+ * The one remaining piece of ordinary GL the guest could not call at all, and
+ * `glpuzzle` picks its pieces with it. The records are written on the host
+ * side and read on the guest's, so glSelectBuffer keeps the client pointer
+ * here and tells the host only how large its own buffer must be;
+ * glRenderMode then brings back both the return value and the buffer, the way
+ * glReadPixels brings back pixels.
+ *
+ * Copying the whole buffer rather than just the hits a record count implies:
+ * a hit record is a variable number of words -- four plus one per name on the
+ * stack -- so the count alone does not say how much to copy, and the buffer
+ * is small.
+ */
+static unsigned *select_buffer;
+static int select_buffer_size;
+
+void glSelectBuffer(int size, unsigned *buffer) {
+    select_buffer = buffer;
+    select_buffer_size = size > 0 ? size : 0;
+    CMD1(GEXGL_SELECT_BUFFER, (uint32_t)select_buffer_size);
+}
+
+int glRenderMode(unsigned mode) {
+    CMD1(GEXGL_RENDER_MODE, mode);
+    flush();
+    const uint32_t hits = reply_u32();
+    uint32_t n = 0;
+    const uint8_t *records = reply_blob(&n);
+    if (records && select_buffer && select_buffer_size > 0) {
+        size_t words = n / sizeof(unsigned);
+        if (words > (size_t)select_buffer_size) words = (size_t)select_buffer_size;
+        memcpy(select_buffer, records, words * sizeof(unsigned));
+    }
+    return (int)hits;
+}
+
+void glInitNames(void) { CMD0(GEXGL_INIT_NAMES); }
+void glLoadName(unsigned name) { CMD1(GEXGL_LOAD_NAME, name); }
+void glPushName(unsigned name) { CMD1(GEXGL_PUSH_NAME, name); }
+void glPopName(void) { CMD0(GEXGL_POP_NAME); }
+
 /* GLX, exported from libGL.so.1. After the EGL above, which it is built on.
  */
 #include "gexgl-glx.inc"

@@ -391,6 +391,15 @@ pub mod op {
     pub const TEX_GENFV: u32 = 232;
     /// glWindowPos, the raster position in window coordinates.
     pub const WINDOW_POS3F: u32 = 233;
+    /// Selection mode. The host keeps the buffer glSelectBuffer names and
+    /// hands its contents back with glRenderMode's return value, because the
+    /// records are written on the host side and read on the guest's.
+    pub const SELECT_BUFFER: u32 = 234;
+    pub const RENDER_MODE: u32 = 235;
+    pub const INIT_NAMES: u32 = 236;
+    pub const LOAD_NAME: u32 = 237;
+    pub const PUSH_NAME: u32 = 238;
+    pub const POP_NAME: u32 = 239;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

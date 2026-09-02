@@ -225,6 +225,12 @@ export const op = {
     TEX_GENI: 231,
     TEX_GENFV: 232,
     WINDOW_POS3F: 233,
+    SELECT_BUFFER: 234,
+    RENDER_MODE: 235,
+    INIT_NAMES: 236,
+    LOAD_NAME: 237,
+    PUSH_NAME: 238,
+    POP_NAME: 239,
 };
 
 export const MAGIC = 0x47584547;

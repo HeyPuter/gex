@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 451 of them whose target this
+ * claimed -- so here are the 470 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -57,6 +57,7 @@ extern __typeof(glClampColor) glClampColorARB __attribute__((alias("glClampColor
 extern __typeof(glClearDepthf) glClearDepthfOES __attribute__((alias("glClearDepthf")));
 extern __typeof(glClearTexImage) glClearTexImageEXT __attribute__((alias("glClearTexImage")));
 extern __typeof(glClearTexSubImage) glClearTexSubImageEXT __attribute__((alias("glClearTexSubImage")));
+extern __typeof(glClientActiveTexture) glClientActiveTextureARB __attribute__((alias("glClientActiveTexture")));
 extern __typeof(glClientWaitSync) glClientWaitSyncAPPLE __attribute__((alias("glClientWaitSync")));
 extern __typeof(glColorMaski) glColorMaskIndexedEXT __attribute__((alias("glColorMaski")));
 extern __typeof(glColorMaski) glColorMaskiEXT __attribute__((alias("glColorMaski")));
@@ -459,3 +460,21 @@ extern __typeof(glViewportIndexedf) glViewportIndexedfOES __attribute__((alias("
 extern __typeof(glViewportIndexedfv) glViewportIndexedfvNV __attribute__((alias("glViewportIndexedfv")));
 extern __typeof(glViewportIndexedfv) glViewportIndexedfvOES __attribute__((alias("glViewportIndexedfv")));
 extern __typeof(glWaitSync) glWaitSyncAPPLE __attribute__((alias("glWaitSync")));
+extern __typeof(glWindowPos2d) glWindowPos2dARB __attribute__((alias("glWindowPos2d")));
+extern __typeof(glWindowPos2d) glWindowPos2dMESA __attribute__((alias("glWindowPos2d")));
+extern __typeof(glWindowPos2f) glWindowPos2fARB __attribute__((alias("glWindowPos2f")));
+extern __typeof(glWindowPos2f) glWindowPos2fMESA __attribute__((alias("glWindowPos2f")));
+extern __typeof(glWindowPos2fv) glWindowPos2fvARB __attribute__((alias("glWindowPos2fv")));
+extern __typeof(glWindowPos2fv) glWindowPos2fvMESA __attribute__((alias("glWindowPos2fv")));
+extern __typeof(glWindowPos2i) glWindowPos2iARB __attribute__((alias("glWindowPos2i")));
+extern __typeof(glWindowPos2i) glWindowPos2iMESA __attribute__((alias("glWindowPos2i")));
+extern __typeof(glWindowPos2iv) glWindowPos2ivARB __attribute__((alias("glWindowPos2iv")));
+extern __typeof(glWindowPos2iv) glWindowPos2ivMESA __attribute__((alias("glWindowPos2iv")));
+extern __typeof(glWindowPos2s) glWindowPos2sARB __attribute__((alias("glWindowPos2s")));
+extern __typeof(glWindowPos2s) glWindowPos2sMESA __attribute__((alias("glWindowPos2s")));
+extern __typeof(glWindowPos3f) glWindowPos3fARB __attribute__((alias("glWindowPos3f")));
+extern __typeof(glWindowPos3f) glWindowPos3fMESA __attribute__((alias("glWindowPos3f")));
+extern __typeof(glWindowPos3fv) glWindowPos3fvARB __attribute__((alias("glWindowPos3fv")));
+extern __typeof(glWindowPos3fv) glWindowPos3fvMESA __attribute__((alias("glWindowPos3fv")));
+extern __typeof(glWindowPos3i) glWindowPos3iARB __attribute__((alias("glWindowPos3i")));
+extern __typeof(glWindowPos3i) glWindowPos3iMESA __attribute__((alias("glWindowPos3i")));

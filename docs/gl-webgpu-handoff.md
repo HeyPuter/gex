@@ -8130,3 +8130,54 @@ them an ordinary GL application:
   name stack) and **`looking-glass-client`** (`glGetTexEnviv`). Selection mode
   needs a reply that carries the hit records back into a client buffer, the
   way glReadPixels does; it is the only remaining item that is ordinary GL.
+
+## Selection mode, the last ordinary GL the guest could not call (2026-09-02)
+
+`glpuzzle` picks its pieces with GL selection mode, and the guest exported
+none of it -- `glSelectBuffer`, `glRenderMode`, `glInitNames`, `glLoadName`,
+`glPushName`, `glPopName`. It was the last item in the blocked list that was
+ordinary GL rather than a window-system drawable or an X server.
+
+Selection mode is the only part of this API surface whose result is neither
+pixels nor a scalar: GL writes *hit records* into a buffer the application
+owns. On this stack that buffer is on the wrong side of the wire -- the
+records are produced where GL runs, on the host, and read where the
+application runs, in the guest. So the split is:
+
+- `glSelectBuffer(size, buffer)` keeps the client pointer in the guest and
+  sends only the size. The host allocates its own `std::vector<GLuint>` of
+  that size and gives *that* to the real `glSelectBuffer`, so GL writes into
+  host memory and nothing on the wire carries a guest address.
+- `glRenderMode(mode)` flushes and reads back two things: the return value
+  (the hit count) and a blob holding the whole buffer. The guest copies
+  `min(client size, blob words)` words into the application's buffer.
+
+Everything else is a plain scalar command.
+
+**Why the whole buffer rather than the hits the count implies.** A hit record
+is four words plus one per name on the stack, so the count alone does not say
+how many words to copy -- you would have to walk the records to find out, on
+the guest, having already decided how much to send. The buffers are small
+(`glpuzzle` asks for 512 words) and this is a picking path that runs on a
+click, not per frame, so copying all of it is both simpler and safe.
+
+`tests/gl44-probe.sh selection` is the gate. It pushes *two distinct names*
+and checks which one each record carries, because the interesting failure is
+not "no hits" but "the right number of hits with the wrong names" -- a stale
+buffer, a wrong word offset or a reply read in the wrong order all produce
+plausible counts. A fourth case draws outside the pick region and requires
+zero hits, which is what distinguishes records that came from this frame's
+geometry from whatever the buffer happened to hold. 4/4 natively on llvmpipe
+and 4/4 through the browser, with identical `INFO` lines.
+
+`glpuzzle` itself compares at **RMSE 0.0002** against llvmpipe, which is as
+identical as this harness measures.
+
+### The symbol gate is effectively closed
+
+**328 of 341 programs now resolve fully**, up from 160 when this started. The
+thirteen that remain are the three X servers (159 legacy symbols each, linked
+rather than necessarily called), the eight GLX surface types (pbuffers,
+pixmaps, `glXUseXFont` -- a *different kind of drawable*, which this stack
+does not have), and `looking-glass-client`'s `glGetTexEnviv`. No ordinary GL
+application is blocked on a missing entry point any more.

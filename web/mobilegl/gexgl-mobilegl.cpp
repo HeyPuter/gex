@@ -180,6 +180,8 @@ enum Op : uint32_t {
     INDEXF = 225, EDGE_FLAG = 226, MATERIALIV = 227, LIGHTIV = 228,
     LIST_BASE = 229, CALL_LISTS = 230,
     TEX_GENI = 231, TEX_GENFV = 232, WINDOW_POS3F = 233,
+    SELECT_BUFFER = 234, RENDER_MODE = 235, INIT_NAMES = 236,
+    LOAD_NAME = 237, PUSH_NAME = 238, POP_NAME = 239,
 };
 
 struct Reader {
@@ -1103,6 +1105,10 @@ void put_u64(uint64_t v) {
     put_u32(static_cast<uint32_t>(v));
     put_u32(static_cast<uint32_t>(v >> 32));
 }
+/* The selection buffer glSelectBuffer names. It lives here rather than in the
+ * guest because GL writes the records here; glRenderMode hands them back. */
+static std::vector<GLuint> selection_buffer;
+
 void put_blob(const void* p, uint32_t n) {
     const size_t padded = (static_cast<size_t>(n) + 3u) & ~size_t{3};
     put_u32(n); const size_t at = reply.size(); reply.resize(at + padded, 0);
@@ -2408,6 +2414,35 @@ bool one(uint32_t op, Reader& a) {
         const GLfloat x = a.f32(), y = a.f32(), z = a.f32();
         if (!a.ok) return false;
         glWindowPos3f(x, y, z);
+        break;
+    }
+    /* Selection mode. The buffer lives here because the records are written
+     * here; glRenderMode hands both its return value and the buffer back, and
+     * the guest copies as much of it as its own buffer holds. */
+    case SELECT_BUFFER: {
+        const GLsizei size = a.i32();
+        if (!a.ok || size < 0 || size > (1 << 20)) return false;
+        selection_buffer.assign((size_t)size, 0u);
+        glSelectBuffer(size, size ? selection_buffer.data() : nullptr);
+        break;
+    }
+    case RENDER_MODE: {
+        const GLenum mode = a.u32();
+        if (!a.ok) return false;
+        const GLint hits = glRenderMode(mode);
+        put_u32((uint32_t)(hits < 0 ? 0 : hits));
+        put_blob(selection_buffer.empty() ? nullptr : selection_buffer.data(),
+                 (uint32_t)(selection_buffer.size() * sizeof(GLuint)));
+        break;
+    }
+    case INIT_NAMES: glInitNames(); break;
+    case POP_NAME: glPopName(); break;
+    case LOAD_NAME:
+    case PUSH_NAME: {
+        const GLuint name = a.u32();
+        if (!a.ok) return false;
+        if (op == LOAD_NAME) glLoadName(name);
+        else glPushName(name);
         break;
     }
     case GEN_LISTS: put_u32(glGenLists(a.i32())); break;
