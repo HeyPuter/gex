@@ -5197,8 +5197,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
         let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
-        let g = |i: usize| gm.read_u64(base + ctx::x(i as u8) as u64).unwrap_or(0);
-        let n = g(8);
+        // The number and arguments where this architecture's ABI puts them;
+        // the number canonicalised so the names below match on x86-64 too.
+        let g = |i: usize| gm.read_u64(base + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0);
+        let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(0);
+        let n = if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n };
         let who = cur();
         // The path, for calls whose meaning is which file: `execve(0x2805ef70)`
         // says a program ran but not which. `openat`'s path is arg 1, the rest
@@ -10839,6 +10842,22 @@ pub extern "C" fn gex_dump_state() {
         // held, not on the page the pc is in -- which is why a report built
         // from `dispatch_page(pc)` kept describing an entry that was
         // perfectly in range while the branch was somewhere else entirely.
+        if gex_abi::X86 {
+            // Every GPR: with variable-length instructions and no link
+            // register, which value went wild is not guessable from a few.
+            const NAMES: [&str; 16] = [
+                "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11",
+                "r12", "r13", "r14", "r15",
+            ];
+            for (i, name) in NAMES.iter().enumerate() {
+                let a = r(i as u8);
+                warn_line(&format!("gex:   {name}={a:#x} in {}\n", where_is(a)));
+            }
+            let fs = gm.read_u64(c + ctx::FS_BASE as u64).unwrap_or(0);
+            let last = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
+            warn_line(&format!("gex:   fs_base={fs:#x} in {}  last_target={last:#x} in {}\n", where_is(fs), where_is(last)));
+            return;
+        }
         for (name, a) in [
             ("sp", sp),
             ("x0", r(0)),
