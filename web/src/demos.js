@@ -553,7 +553,7 @@ const virglGears = {
     // The budget has to clear the cold start: the first frame is ~40s in, so a
     // 30s run ends with a blank canvas and code 124 that reads as a failure.
     const gearsButtons = (go) => [
-      { label: 'Run', primary: true, onClick: () => go(300) },
+      { label: 'Run', primary: true, onClick: () => go(runSeconds(300)) },
     ];
 
     const start = async (seconds) => {
@@ -691,6 +691,13 @@ const virglGears = {
 //           wl_shm buffer (GTK's wayland backend, Qt's libqwayland-generic): no
 //           OpenGL at all, so it exercises the compositor and the toolkit rather
 //           than Mesa. These are the real Qt/GTK/KDE apps.
+// How long a timed GL run lasts: `?seconds=N` for a harness or a link, else the
+// default the caller names (300, clearing the ~40s cold start with a margin).
+function runSeconds(fallback) {
+  const n = Number(new URLSearchParams(location.search).get('seconds'));
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 3600) : fallback;
+}
+
 const WL_TOOLKIT_ENV = {
   qt6:
     'export QT_QPA_PLATFORM=wayland\n' +
@@ -1113,13 +1120,13 @@ const waylandGears = {
         running(false);
         ctx.idle();
         ctx.actions(demo.actions?.(start) || [
-          { label: 'Run', primary: true, onClick: () => start(300) },
+          { label: 'Run', primary: true, onClick: () => start(runSeconds(300)) },
         ]);
       }
     };
 
     ctx.actions(demo.actions?.(start) || [
-      { label: 'Run', primary: true, onClick: () => start(300) },
+      { label: 'Run', primary: true, onClick: () => start(runSeconds(300)) },
     ]);
     ctx.hint(demo.hint || app.label);
   },
