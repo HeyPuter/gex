@@ -1489,6 +1489,141 @@ void glTexSubImage2D(unsigned target, int level, int x, int y, int w, int h,
     put_blob(p + 11, pbo ? NULL : pixels, len);
 }
 
+/* Defined further down, with the fixed-function set they belong to. */
+static void put_float(uint32_t *slot, float value);
+static size_t light_parameter_floats(unsigned pname);
+static size_t material_parameter_floats(unsigned pname);
+
+/* The pixel-rectangle family.
+ *
+ * glDrawPixels carries an image and is sized by the same pixel-store
+ * calculation the texture uploads above use -- keeping that identical at both
+ * ends is a memory-safety requirement, not an optimisation, which is why it
+ * lives in gexgl-pixel.h and is shared.
+ *
+ * glBitmap is the exception: its GL_BITMAP packing is one bit per pixel, which
+ * gexgl_compute_pixel_layout deliberately refuses, so its rows are measured
+ * here. A row is ceil(width / 8) bytes rounded up to the unpack alignment,
+ * and there are `height` of them. */
+void glDrawPixels(int w, int h, unsigned format, unsigned type,
+                  const void *pixels) {
+    const int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
+    const size_t len = pixels && !pbo
+        ? pixel_transfer_bytes(format, type, w, h, -1, &unpack_store, NULL) : 0;
+    if (len > UINT32_MAX - 4u) return;
+    uint32_t *p = begin(GEXGL_DRAW_PIXELS, 5, 4 + len);
+    if (!p) return;
+    p[0] = (uint32_t)w; p[1] = (uint32_t)h;
+    p[2] = format; p[3] = type; p[4] = (uint32_t)pbo;
+    put_blob(p + 5, pbo ? NULL : pixels, len);
+}
+
+void glCopyPixels(int x, int y, int w, int h, unsigned type) {
+    uint32_t *p = begin(GEXGL_COPY_PIXELS, 5, 0);
+    if (!p) return;
+    p[0] = (uint32_t)x; p[1] = (uint32_t)y;
+    p[2] = (uint32_t)w; p[3] = (uint32_t)h; p[4] = type;
+}
+
+void glBitmap(int w, int h, float xorig, float yorig, float xmove, float ymove,
+              const unsigned char *bitmap) {
+    const int pbo = bound_buffer(0x88ECu) != 0;
+    size_t len = 0;
+    if (bitmap && !pbo && w > 0 && h > 0) {
+        const size_t alignment = unpack_store.alignment ? unpack_store.alignment : 1;
+        const size_t row_pixels = unpack_store.row_length ? unpack_store.row_length
+                                                          : (size_t)w;
+        size_t row = (row_pixels + 7u) / 8u;
+        row = ((row + alignment - 1u) / alignment) * alignment;
+        if (row && (size_t)h > SIZE_MAX / row) return;
+        len = row * (size_t)h;
+    }
+    if (len > UINT32_MAX - 4u) return;
+    uint32_t *p = begin(GEXGL_BITMAP, 7, 4 + len);
+    if (!p) return;
+    p[0] = (uint32_t)w; p[1] = (uint32_t)h;
+    put_float(&p[2], xorig); put_float(&p[3], yorig);
+    put_float(&p[4], xmove); put_float(&p[5], ymove);
+    p[6] = (uint32_t)pbo;
+    put_blob(p + 7, pbo ? NULL : bitmap, len);
+}
+
+void glPixelTransferf(unsigned pname, float value) {
+    uint32_t *p = begin(GEXGL_PIXEL_TRANSFERF, 2, 0);
+    if (!p) return;
+    p[0] = pname; put_float(&p[1], value);
+}
+void glPixelTransferi(unsigned pname, int value) {
+    uint32_t *p = begin(GEXGL_PIXEL_TRANSFERI, 2, 0);
+    if (!p) return;
+    p[0] = pname; p[1] = (uint32_t)value;
+}
+
+/* Colour-index mode state. The index itself is a float on the wire, which is
+   what every entry point below reduces to. */
+void glClearIndex(float index) {
+    uint32_t *p = begin(GEXGL_CLEAR_INDEX, 1, 0);
+    if (!p) return;
+    put_float(&p[0], index);
+}
+void glIndexf(float index) {
+    uint32_t *p = begin(GEXGL_INDEXF, 1, 0);
+    if (!p) return;
+    put_float(&p[0], index);
+}
+void glIndexi(int index) { glIndexf((float)index); }
+void glIndexub(unsigned char index) { glIndexf((float)index); }
+void glIndexd(double index) { glIndexf((float)index); }
+void glIndexs(short index) { glIndexf((float)index); }
+
+void glEdgeFlag(unsigned char flag) { CMD1(GEXGL_EDGE_FLAG, flag ? 1u : 0u); }
+void glEdgeFlagv(const unsigned char *flag) { if (flag) glEdgeFlag(*flag); }
+
+/* The integer forms of the light and material parameters. GL scales them the
+   same way as the float forms; sending them as integers keeps that decision
+   on the host, where the real entry point makes it. */
+static void put_enum_iv(uint32_t opcode, unsigned target, unsigned pname,
+                        const int *values, size_t count) {
+    if (!values || !count) return;
+    uint32_t *p = begin(opcode, 3 + count, 0);
+    if (!p) return;
+    p[0] = target; p[1] = pname; p[2] = (uint32_t)count;
+    for (size_t i = 0; i < count; ++i) p[3 + i] = (uint32_t)values[i];
+}
+void glMaterialiv(unsigned face, unsigned pname, const int *values) {
+    put_enum_iv(GEXGL_MATERIALIV, face, pname, values,
+                material_parameter_floats(pname));
+}
+void glLightiv(unsigned light, unsigned pname, const int *values) {
+    put_enum_iv(GEXGL_LIGHTIV, light, pname, values,
+                light_parameter_floats(pname));
+}
+
+/* Display list names. glCallLists' array is `n` values of `type`, which is
+   the one place a display list index is not a plain uint32. */
+void glListBase(unsigned base) { CMD1(GEXGL_LIST_BASE, base); }
+void glCallLists(int n, unsigned type, const void *lists) {
+    if (n <= 0 || !lists) return;
+    size_t element;
+    switch (type) {
+    case 0x1400: case 0x1401: element = 1; break;  /* GL_[UNSIGNED_]BYTE */
+    case 0x1402: case 0x1403: element = 2; break;  /* GL_[UNSIGNED_]SHORT */
+    case 0x1404: case 0x1405: element = 4; break;  /* GL_[UNSIGNED_]INT */
+    case 0x1406: element = 4; break;               /* GL_FLOAT */
+    case 0x1407: element = 3; break;               /* GL_2_BYTES */
+    case 0x1408: element = 3; break;               /* GL_3_BYTES */
+    case 0x1409: element = 4; break;               /* GL_4_BYTES */
+    default: return;
+    }
+    if ((size_t)n > SIZE_MAX / element) return;
+    const size_t len = (size_t)n * element;
+    if (len > UINT32_MAX - 4u) return;
+    uint32_t *p = begin(GEXGL_CALL_LISTS, 2, 4 + len);
+    if (!p) return;
+    p[0] = (uint32_t)n; p[1] = type;
+    put_blob(p + 2, lists, len);
+}
+
 #define GEN_OBJECTS(fn, opcode) \
     void fn(int n, unsigned *out) { \
         if (n < 0) { CMD1(opcode, (uint32_t)n); return; } \

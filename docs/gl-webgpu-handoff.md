@@ -8067,8 +8067,32 @@ can colour the quad; and disabling an array again, since a stale enabled array
 over a freed pointer is how this goes wrong in an application rather than in a
 probe. 5/5 natively and 5/5 through the guest, matching llvmpipe in both.
 
-What is left blocked is the pixel-rectangle family -- `glDrawPixels` (10
-programs), `glCopyPixels` and `glBitmap` (5 each), `glPixelTransferf` (6) --
-plus selection mode and `glCallLists`/`glListBase`. Those need a wire shape
-for a pixel rectangle with the whole pixel-store state attached, which is more
-than another opcode.
+### The pixel rectangles, which needed no new wire shape after all
+
+`glDrawPixels` carries an image, and the guest already knows how to size one:
+`gexgl-pixel.h`'s `gexgl_compute_pixel_layout` is shared with the texture
+uploads precisely so both ends of the wire agree, "a memory-safety
+requirement, not merely an optimization" as its own comment puts it. So
+glDrawPixels, glCopyPixels, glPixelTransferf/i, glClearIndex, glIndex*,
+glEdgeFlag, glMaterialiv, glLightiv, glListBase and glCallLists are all one
+opcode each.
+
+**glBitmap is the exception the shared calculation refuses.** GL_BITMAP is one
+bit per pixel and `gexgl_compute_pixel_layout` rejects it by design, so its
+rows are measured separately: `ceil(width / 8)` bytes rounded up to the unpack
+alignment, `height` of them. Measuring it in two places is exactly the hazard
+that header exists to avoid, so the probe checks a two-row bitmap whose rows
+differ (`0xF0` then `0x0F`) -- a wrong row stride shows as the wrong half lit
+rather than as nothing at all.
+
+**324 of 341 programs resolve fully now.** `tests/gl44-probe.sh drawpixels`
+gates the batch with four cases -- a 2x2 image drawn at a raster position away
+from the origin, so the row order and the within-row order are both
+observable; glCopyPixels moving it, which reads the target as well as writing
+it; glListBase with glCallLists, called by offset so the base has to be
+applied; and the bitmap. 4/4 natively and 4/4 through the guest.
+
+What is left is selection mode (`glRenderMode`, `glSelectBuffer` and the name
+stack, 4 programs, and glSelectBuffer needs a reply the way glReadPixels
+does), GLX pbuffers and pixmaps (4), texture-coordinate generation
+(`glTexGeni`, 4) and a handful of singletons.

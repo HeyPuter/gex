@@ -369,6 +369,22 @@ pub mod op {
     pub const ENABLE_CLIENT_STATE: u32 = 216;
     pub const DISABLE_CLIENT_STATE: u32 = 217;
     pub const CLIENT_ACTIVE_TEXTURE: u32 = 218;
+    /* The pixel-rectangle family and the rest of the display-list and
+     * fixed-function surface the installed programs ask for. glDrawPixels and
+     * glBitmap carry an image, sized by the same pixel-store calculation the
+     * texture uploads use; the rest are scalars. */
+    pub const DRAW_PIXELS: u32 = 219;
+    pub const COPY_PIXELS: u32 = 220;
+    pub const BITMAP: u32 = 221;
+    pub const PIXEL_TRANSFERF: u32 = 222;
+    pub const PIXEL_TRANSFERI: u32 = 223;
+    pub const CLEAR_INDEX: u32 = 224;
+    pub const INDEXF: u32 = 225;
+    pub const EDGE_FLAG: u32 = 226;
+    pub const MATERIALIV: u32 = 227;
+    pub const LIGHTIV: u32 = 228;
+    pub const LIST_BASE: u32 = 229;
+    pub const CALL_LISTS: u32 = 230;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

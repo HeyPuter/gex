@@ -175,6 +175,10 @@ enum Op : uint32_t {
     TEXCOORD_POINTER = 213, EDGE_FLAG_POINTER = 214, INDEX_POINTER = 215,
     ENABLE_CLIENT_STATE = 216, DISABLE_CLIENT_STATE = 217,
     CLIENT_ACTIVE_TEXTURE = 218,
+    DRAW_PIXELS = 219, COPY_PIXELS = 220, BITMAP = 221,
+    PIXEL_TRANSFERF = 222, PIXEL_TRANSFERI = 223, CLEAR_INDEX = 224,
+    INDEXF = 225, EDGE_FLAG = 226, MATERIALIV = 227, LIGHTIV = 228,
+    LIST_BASE = 229, CALL_LISTS = 230,
 };
 
 struct Reader {
@@ -2282,6 +2286,101 @@ bool one(uint32_t op, Reader& a) {
         const GLenum unit = a.u32();
         if (!a.ok) return false;
         glClientActiveTexture(unit);
+        break;
+    }
+    /* The pixel-rectangle family. The image arrives as a blob unless a pixel
+     * unpack buffer is bound, in which case the guest sent none and the
+     * pointer is an offset into that buffer -- the same split the texture
+     * uploads use. */
+    case DRAW_PIXELS: {
+        const GLsizei w = a.i32(), h = a.i32();
+        const GLenum format = a.u32();
+        const GLenum type = a.u32();
+        const uint32_t pbo = a.u32();
+        uint32_t n = 0;
+        const uint8_t *pixels = a.blob(n);
+        if (!a.ok) return false;
+        glDrawPixels(w, h, format, type, pbo ? nullptr : (const void *)pixels);
+        break;
+    }
+    case COPY_PIXELS: {
+        const GLint x = a.i32(), y = a.i32();
+        const GLsizei w = a.i32(), h = a.i32();
+        const GLenum type = a.u32();
+        if (!a.ok) return false;
+        glCopyPixels(x, y, w, h, type);
+        break;
+    }
+    case BITMAP: {
+        const GLsizei w = a.i32(), h = a.i32();
+        const GLfloat xorig = a.f32(), yorig = a.f32();
+        const GLfloat xmove = a.f32(), ymove = a.f32();
+        const uint32_t pbo = a.u32();
+        uint32_t n = 0;
+        const uint8_t *bits = a.blob(n);
+        if (!a.ok) return false;
+        glBitmap(w, h, xorig, yorig, xmove, ymove,
+                 pbo ? nullptr : (const GLubyte *)bits);
+        break;
+    }
+    case PIXEL_TRANSFERF: {
+        const GLenum pname = a.u32();
+        const GLfloat value = a.f32();
+        if (!a.ok) return false;
+        glPixelTransferf(pname, value);
+        break;
+    }
+    case PIXEL_TRANSFERI: {
+        const GLenum pname = a.u32();
+        const GLint value = a.i32();
+        if (!a.ok) return false;
+        glPixelTransferi(pname, value);
+        break;
+    }
+    case CLEAR_INDEX: {
+        const GLfloat index = a.f32();
+        if (!a.ok) return false;
+        glClearIndex(index);
+        break;
+    }
+    case INDEXF: {
+        const GLfloat index = a.f32();
+        if (!a.ok) return false;
+        glIndexf(index);
+        break;
+    }
+    case EDGE_FLAG: {
+        const uint32_t flag = a.u32();
+        if (!a.ok) return false;
+        glEdgeFlag(flag ? GL_TRUE : GL_FALSE);
+        break;
+    }
+    case MATERIALIV:
+    case LIGHTIV: {
+        const GLenum target = a.u32();
+        const GLenum pname = a.u32();
+        const uint32_t count = a.u32();
+        if (count > 4 || !a.ok) return false;
+        GLint values[4] = {};
+        for (uint32_t i = 0; i < count; ++i) values[i] = a.i32();
+        if (!a.ok) return false;
+        if (op == MATERIALIV) glMaterialiv(target, pname, values);
+        else glLightiv(target, pname, values);
+        break;
+    }
+    case LIST_BASE: {
+        const GLuint base = a.u32();
+        if (!a.ok) return false;
+        glListBase(base);
+        break;
+    }
+    case CALL_LISTS: {
+        const GLsizei n = a.i32();
+        const GLenum type = a.u32();
+        uint32_t bytes = 0;
+        const uint8_t *lists = a.blob(bytes);
+        if (!a.ok || n < 0 || !lists) return false;
+        glCallLists(n, type, (const void *)lists);
         break;
     }
     case GEN_LISTS: put_u32(glGenLists(a.i32())); break;
