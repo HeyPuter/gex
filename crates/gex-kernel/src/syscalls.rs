@@ -457,6 +457,12 @@ pub struct Kernel {
     /// splits: the host waits for a connection to arrive, and the work
     /// happens back here.
     pub retry_accept: Option<(i32, u64, u64, u64)>,
+    /// A `recvmsg` on a blocking socket with nothing to read: the fd and the
+    /// `msghdr`, re-run once the socket becomes readable. Like `retry_accept`,
+    /// the real work waits for the kernel lock (the msghdr may carry
+    /// descriptors, which only the kernel's table can place). Wine's protocol
+    /// with wineserver is a blocking `recvmsg` for every reply.
+    pub retry_recvmsg: Option<(i32, u64)>,
     /// The blocked mask an `rt_sigsuspend` has to put back when it returns.
     pub restore_sigmask: Option<u64>,
     /// A 32-bit (i386) process: its code runs in compatibility mode, it
@@ -1051,6 +1057,7 @@ impl Kernel {
             clock: system_clock,
             itimers: [None; 3],
             retry_accept: None,
+            retry_recvmsg: None,
             restore_sigmask: None,
             started: 0,
             pins: std::collections::HashMap::new(),
@@ -1272,6 +1279,7 @@ impl Kernel {
             // A fork does not inherit its parent's timers.
             itimers: [None; 3],
             retry_accept: None,
+            retry_recvmsg: None,
             restore_sigmask: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
@@ -1869,6 +1877,19 @@ impl Kernel {
                     len: a[2].min(1 << 24) as usize,
                 })
             }
+            nr::RECVMSG => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                // A non-blocking socket, or one with data, does not wait.
+                if !file.would_block() {
+                    return None;
+                }
+                // Wait until it is readable, then do the real recvmsg under
+                // the lock (see `retry_recvmsg`), the way `accept` does.
+                self.retry_recvmsg = Some((a[0] as i32, a[1]));
+                Some(BlockOp::AcceptWait {
+                    socket: Arc::clone(&file.handle),
+                })
+            }
             nr::FUTEX => {
                 let operation =
                     (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
@@ -1980,6 +2001,10 @@ impl Kernel {
             Some((fd, addr, len, flags)) if r.is_ok() => {
                 self.sys_unix_accept(m, fd, addr, len, flags)
             }
+            _ => r,
+        };
+        let r = match self.retry_recvmsg.take() {
+            Some((fd, msg)) if r.is_ok() => self.sys_recvmsg(m, fd, msg),
             _ => r,
         };
         // `rt_sigsuspend` waited with a mask of the caller's choosing. The
