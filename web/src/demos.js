@@ -1609,7 +1609,7 @@ const SESSION_APPS = [
   { id: 'xcalc', label: 'xcalc — X11 through rootless Xwayland', kind: 'x', cmd: 'xcalc' },
   {
     id: 'glxgears',
-    // Wants GLX, which the page's X server has not: see `hostX` below.
+    // OpenGL, so it needs the marshaller on its path: see `directGl`.
     gl: true,
     label: 'glxgears — OpenGL, Mesa → virgl, under Xwayland',
     kind: 'x',
@@ -1618,7 +1618,7 @@ const SESSION_APPS = [
   },
   {
     id: 'glmark2',
-    // Wants GLX, which the page's X server has not: see `hostX` below.
+    // OpenGL, so it needs the marshaller on its path: see `directGl`.
     gl: true,
     label: 'glmark2 — a real GL benchmark, under Xwayland',
     kind: 'x',
@@ -1657,7 +1657,7 @@ const SESSION_APPS = [
  * nothing to show for it.
  */
 function sessionScript(chosen, {
-  stagger = 4, verbose = 0, extra = '', hostX = false, directGl = false,
+  stagger = 4, verbose = 0, extra = '', directGl = true,
 } = {}) {
   const wl = chosen.filter((a) => a.kind === 'wl');
   const x = chosen.filter((a) => a.kind === 'x');
@@ -1704,39 +1704,13 @@ function sessionScript(chosen, {
     // kwin do -- it takes SubstructureRedirect on the root, answers
     // MapRequest, and pairs each X window with the surface Xwayland names in
     // its WL_SURFACE_ID message.
-    if (hostX) {
-      // The X server is not a guest program in this session: it is a wasm
-      // module in the page (see web/src/hostx.js), started before this shell
-      // and already listening on the display. Its socket is a name in the
-      // global kernel, which is the same place a guest Xwayland would have
-      // bound it -- so from a client's side nothing about this changed.
-      s += 'echo "gex: the X server is in the page"\n';
-      s += 'export DISPLAY=:0\n';
-    } else {
-    s += 'echo "gex: starting rootless Xwayland"\n';
-    // `-shm`: hand buffers over as shared memory and never try glamor.
-    //
-    // Without it Xwayland attempts an EGL/GL screen, finds no GPU, prints
-    // "Failed to initialize glamor, falling back to sw" -- and then draws
-    // rectangles but no glyphs, so every X client came up as an empty window
-    // with a cursor in it. Its software path is what this compositor wants
-    // anyway: the pixels arrive as wl_shm, which is what the output uploads.
-    // With the guest rendering on the host there is no virgl socket, and an X
-    // server with no GL driver to find loads Debian's megadriver instead --
-    // 24 MB of Gallium plus 106 MB of LLVM, translated, before it answers its
-    // first client. Nothing here wants the server's own GL: a client's OpenGL
-    // never goes through X at all on this path. So it is pointed at no
-    // drivers, GLX initialisation fails harmlessly, and the server comes up.
-    if (directGl) s += 'export LIBGL_DRIVERS_PATH=/nonexistent\n';
-    s += `Xwayland :0 -rootless -shm -noreset -ac${verbose ? ` -verbose ${verbose}` : ''} &\n`;
-    if (directGl) s += 'unset LIBGL_DRIVERS_PATH\n';
-    // Not a poll for /tmp/.X11-unix/X0: Xwayland binds it in its own process,
-    // and with a tmpfs per process that node is not in this shell's
-    // filesystem. The name is registered in the global kernel, so a client
-    // connects across the process boundary; this only has to let it bind.
-    s += 'sleep 8\n';
+    // The X server is a wasm module in the page (see web/src/hostx.js),
+    // started before this shell and already listening. Its socket is a name in
+    // the global kernel, which is where a guest Xwayland would have bound one,
+    // so from a client's side nothing about this is different -- and there is
+    // no guest Xwayland to start any more: the image does not carry one.
+    s += 'echo "gex: the X server is in the page"\n';
     s += 'export DISPLAY=:0\n';
-    }
 
     for (const a of x) {
       s += `echo "gex: launching ${a.id}"\n`;
@@ -1851,11 +1825,11 @@ const compositor = {
       }
       const t0 = performance.now();
       let renderer = null;
-      // Where OpenGL runs. `?gl=direct` marshals from the guest to Mesa in the
-      // compositor's worker -- no guest Mesa, and a frame is a texture the
-      // compositor draws rather than pixels copied twice. Anything else keeps
-      // the guest's own Mesa on a renderer here.
-      const directGl = qp.get('gl') === 'direct';
+      // OpenGL runs on the host: the guest marshals, Mesa and virglrenderer
+      // are in the compositor's worker, and a frame is a texture that worker
+      // draws. There is no other path left -- the image has no Mesa in it --
+      // so this is a switch only for bringing one back by hand.
+      const directGl = qp.get('gl') !== 'virgl';
       try {
         ctx.busy('loading the renderer');
         if (!directGl) {
@@ -1884,22 +1858,16 @@ const compositor = {
             if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
           }
         }
-        // A guest Xwayland serves every X client, because rendering goes
-        // through Mesa and virgl and that is the path with GLX in it.
+        // The X server is the one in the page (`web/src/hostx.js`): native wasm
+        // rather than a translated guest program, and the only one there is --
+        // the image no longer carries an Xwayland to run.
         //
-        // There is another X server -- the one in the page (`web/src/hostx.js`),
-        // native wasm rather than translated AArch64, so its own drawing costs
-        // what the host's does. It has no GLX, so while virgl is how anything
-        // reaches the GPU it stays behind `?hostx=1` rather than being chosen
-        // for a session that might want OpenGL.
-        const hostX = qp.get('hostx') === '1';
-        if (hostX && chosen.some((a) => a.kind === 'x' && a.gl)) {
-          ctx.term.writeln(
-            ctx.ansi.dim('the X server is in the page, which has no GLX: an OpenGL client will not start'),
-          );
-        }
+        // Its lack of GLX used to be the reason a session with an OpenGL
+        // client started a guest server instead. It is not any more: a GL
+        // client's OpenGL does not go through X at all now. It marshals to
+        // Mesa in the compositor's worker and the frame arrives as a texture.
+        const hostX = qp.get('hostx') !== '0';
         const script = sessionScript(chosen, {
-          hostX,
           directGl,
           stagger: Number(qp.get('stagger')) || 4,
           // `?xverbose=N` turns the X server's own log on, which is the only

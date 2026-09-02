@@ -21,35 +21,19 @@
 # only ever holds what someone thought to name: a terminal in that image had
 # no `ls`.
 #
-# # LLVM, and the switch that removes it
+# # No Mesa in the guest
 #
-# Debian ships one megadriver: `swrast_dri.so` is every Gallium driver at
-# once, and it declares `libLLVM-15.so.1` in DT_NEEDED because *llvmpipe*
-# wants it -- 106 MB, plus the 21 MB of libz3 that LLVM in turn wants. That
-# is 127 MB of a 208 MB image, and in a browser it is worse than download
-# size: a dispatch slot is claimed per 4 KiB of guest text, a browser will
-# not grow the table past ten million of them, and llvmpipe is a great deal
-# of text.
+# The guest used to run Debian's own Mesa: its megadriver (`swrast_dri.so`,
+# every Gallium driver in one 24 MB object), the 106 MB of LLVM llvmpipe
+# wants, and the 22 MB of libz3 behind that. All of it is gone, because the
+# guest no longer has a graphics driver at all -- its `libGL`/`libEGL` are
+# marshallers, and the Mesa that runs is a wasm one in the page's compositor
+# worker (see `web/build-mesa-virgl-wasm.sh`).
 #
-# `GEX_LLVM_STUB=1` replaces it with a stand-in: the 280 symbols the
-# megadriver imports from LLVM, each one a `brk #0`. Nothing on the virgl
-# path should call them, and anything that does dies at the instruction with
-# the guest PC in the trap, which is a far better failure than a quietly
-# different picture.
+# `Xwayland` is gone for the same reason: the X server is in the page too.
+# What stays is the X *clients* and their libraries, which is what a session
+# actually runs.
 #
-# It does not work, and the question is now settled rather than open. Xvfb
-# brings up GLX through the swrast DRI entry points and *calls* into llvmpipe,
-# not merely maps it: with the renderer listening and `GALLIUM_DRIVER=virpipe`
-# exported before the X server, the run still stopped at
-# `gex: breakpoint at pc=0x6d435040` five seconds in, before the X socket
-# appeared. The switch remains for anyone who wants to try a client-only
-# workload, where nothing brings up a software rasteriser -- but it will not
-# get an X server up, so it is off.
-#
-# Which also means the 106 MB is not avoidable this way. `swrast_dri.so`
-# names libLLVM in DT_NEEDED, so ld.so maps it at dlopen whichever Gallium
-# driver is chosen, and Xvfb writes out 221 MiB every time it is swapped.
-# That is what makes the arena split (task #71) the thing to do instead.
 set -eu
 
 OUT="${1:-$(cd "$(dirname "$0")" && pwd)/public/rootfs/graphics.tar}"
@@ -250,8 +234,7 @@ src, work = sys.argv[1], sys.argv[2]
 # Pruned by directory, and the walk does not descend into these at all.
 skip = {
     'usr/share/doc', 'usr/share/man', 'usr/share/info', 'usr/include',
-    # Forty-three hard links to one megadriver, and the pass below copies the
-    # one of them this image uses.
+    # Debian's Mesa drivers: nothing in the guest loads one any more.
     'usr/lib/aarch64-linux-gnu/dri',
     # The kernel's, not the image's.
     'proc', 'sys', 'dev', 'run', 'tmp',
@@ -260,9 +243,11 @@ skip = {
 }
 if not os.environ.get('GEX_KEEP_LOCALE'):
     skip.add('usr/share/locale')
-# libLLVM is either stubbed or copied whole further down; either way not here.
+# What only Mesa's software rasteriser wanted, and the X server that is now
+# in the page.
 skip_prefix = ('usr/lib/aarch64-linux-gnu/libLLVM-',
-               'usr/lib/aarch64-linux-gnu/libz3.so')
+               'usr/lib/aarch64-linux-gnu/libz3.so',
+               'usr/bin/Xwayland')
 
 files, dirs, links = [], [], []
 for dirpath, dirnames, filenames in os.walk(src):
@@ -330,8 +315,6 @@ done
 echo "  the traced closure:"
 install_paths "$WORK/curated"
 
-cp -L "$SRC/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so" \
-      "$R/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so"
 cp -L "$SRC/lib/ld-linux-aarch64.so.1" "$R/lib/ld-linux-aarch64.so.1"
 
 # /lib and /usr/lib are the same directory on a Debian this recent, and the
@@ -659,61 +642,26 @@ if [ -z "${GEX_KEEP_EXTRAS:-}" ]; then
           librav1e.so.* libsvtav1enc.so.* libzvbi.so.* libsrt-gnutls.so.*
           libopenh264.so.* libmfx.so.* libva.so.* libva-drm.so.* libva-x11.so.*
           libvidstab.so.* libshine.so.* libtwolame.so.* libmp3lame.so.*
-          libopenmpt.so.* libchromaprint.so.* libbs2b.so.* librubberband.so.*"
+          libopenmpt.so.* libchromaprint.so.* libbs2b.so.* librubberband.so.*
+          libLLVM-*.so* libz3.so*"
 fi
 for pattern in $DROP; do
     rm -f "$R"/usr/lib/aarch64-linux-gnu/$pattern
 done
+# Mesa's drivers and the X server, whichever pass put them here: the guest has
+# no graphics driver and does not run an X server, and a manifest written when
+# it did still names them.
+if [ -z "${GEX_KEEP_EXTRAS:-}" ]; then
+    rm -rf "$R/usr/lib/aarch64-linux-gnu/dri" "$R/usr/bin/Xwayland"
+fi
 # glibc's charset modules: 20 MB of tables for encodings nothing here reads.
 # UTF-8 needs no module at all.
 [ -z "${GEX_KEEP_EXTRAS:-}" ] && rm -rf "$R/usr/lib/aarch64-linux-gnu/gconv"
 
-if [ -n "${GEX_LLVM_STUB:-}" ]; then
-    # Generated from the megadriver's own import list, so it stays right when
-    # the driver comes from a different Debian.
-    readelf -W --dyn-syms "$R/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so" |
-        awk '$7 == "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/undef"
-    readelf -W --dyn-syms "$SRC/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" |
-        awk '$7 != "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/llvm"
-    comm -12 "$WORK/undef" "$WORK/llvm" > "$WORK/need"
-    {
-        echo '.text'
-        while read -r sym; do
-            printf '.globl %s\n.type %s,@function\n%s:\n  brk #0\n' "$sym" "$sym" "$sym"
-        done < "$WORK/need"
-    } > "$WORK/llvmstub.s"
-    # The version, and it is not decoration: the megadriver imports every one
-    # of these as `LLVMFoo@LLVM_15`, and against an unversioned definition
-    # glibc's ld.so does not warn -- it fails an assertion in dl-lookup.c and
-    # kills the process before `main`.
-    printf 'LLVM_15 { global: *; };\n' > "$WORK/llvmstub.map"
-    "$CC" -shared -nostdlib -o "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" \
-        "$WORK/llvmstub.s" -Wl,-soname,libLLVM-15.so.1 \
-        -Wl,--version-script="$WORK/llvmstub.map"
-    echo "  libLLVM: a stub of $(wc -l < "$WORK/need") symbols, $(du -h "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" | cut -f1)"
-else
-    for l in libLLVM-15.so.1 libz3.so.4; do
-        cp -L "$SRC/usr/lib/aarch64-linux-gnu/$l" "$R/usr/lib/aarch64-linux-gnu/$l"
-    done
-    echo "  libLLVM: the real one, $(du -h "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" | cut -f1)"
-fi
-
-# One copy of a big library, however many names reach it. The linker name
-# (`libLLVM-15.so`) is in Dolphin's manifest and the SONAME (`libLLVM-15.so.1`)
-# is what the branch above writes, and nothing at run time opens the first --
-# so two 106 MB files is what the difference used to cost the image.
-for l in libLLVM-15.so libz3.so; do
-    f="$R/usr/lib/aarch64-linux-gnu/$l"
-    [ -f "$f" ] && [ ! -L "$f" ] || continue
-    real=""
-    for c in "$R/usr/lib/aarch64-linux-gnu/$l".[0-9]*; do
-        [ -f "$c" ] && real="$(basename "$c")"
-    done
-    [ -n "$real" ] || continue
-    rm -f "$f"
-    ln -s "$real" "$f"
-    echo "  $l: a link to $real"
-done
+# Nothing here brings LLVM or the megadriver in any more: the guest has no
+# Mesa to want them (see the note at the top). What used to be here was a
+# choice between copying 106 MB of libLLVM into the image and generating a
+# stub of its 280 symbols, and both are gone with the driver that named them.
 
 # The alternatives a maintainer script would have made. Nothing runs those
 # here (see build-debian.sh), so the names they install are missing -- and

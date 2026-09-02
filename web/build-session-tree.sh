@@ -29,7 +29,10 @@ BASE="apt dash bash coreutils dpkg findutils grep sed tar gzip diffutils
 # And the session: an X server and a Wayland one, the toolkits, the programs the
 # picker offers, and Mesa's own GL utilities. `dbus` and `dbus-user-session` are
 # not decoration -- KF5 asks for a session bus before it draws anything.
-APPS="xvfb xwayland x11-apps xterm twm tk8.6
+# No `xwayland`: the X server is the one in the page now (see
+# `web/build-xwayland-wasm.sh`), cross-built to wasm rather than run as a
+# guest program. `xvfb` stays because the older virgl demos still start one.
+APPS="xvfb x11-apps xterm twm tk8.6
       mesa-utils glmark2-x11 gtk-3-examples
       kcalc dolphin qt6ct compton-conf explosive-c4
       qt6-wayland qtwayland5 dbus dbus-user-session
