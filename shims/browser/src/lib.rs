@@ -5092,14 +5092,16 @@ fn count_syscall() {
     let nr = with_host(|h| {
         let gm = GuestMem::new(guest_bytes());
         let at = h.threads[cur()].kstate.ctx_addr;
-        gm.read_u64(at + ctx::SYSCALL_NR as u64).unwrap_or(!0)
+        let n = gm.read_u64(at + ctx::SYSCALL_NR as u64).unwrap_or(!0);
+        // Canonical, so the census and the ring name x86-64 calls too.
+        if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n }
     });
     let (a0, a1) = with_host(|h| {
         let gm = GuestMem::new(guest_bytes());
         let at = h.threads[cur()].kstate.ctx_addr;
         (
-            gm.read_u64(at + ctx::x(0) as u64).unwrap_or(0),
-            gm.read_u64(at + ctx::x(1) as u64).unwrap_or(0),
+            gm.read_u64(at + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0),
+            gm.read_u64(at + ctx::SYSCALL_ARGS[1] as u64).unwrap_or(0),
         )
     });
     let total = unsafe {

@@ -114,6 +114,13 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
             b.write(GuestReg::X(0), wide);
         }
     }
+    // `memcpy`, `memmove` and `memset` return their first argument. On
+    // aarch64 that is x0 already; on x86-64 it arrived in rdi and must be
+    // placed in rax, or every `strcpy`-shaped caller that uses the return
+    // value (`g_strdup`, `stpcpy`, ...) reads whatever rax held.
+    if gex_abi::X86 && matches!(which, Intrinsic::MemCpy | Intrinsic::MemMove | Intrinsic::MemSet) {
+        b.write(GuestReg::X(0), dst);
+    }
     // Return: through the link register, or by popping the return address.
     let target = if gex_abi::X86 {
         let sp = b.read(GuestReg::X(4));
@@ -182,8 +189,11 @@ mod tests {
             1
         );
         // Nothing is written but the values it reads: a `memcpy` that
-        // returned its first argument in x0 already has it there.
-        assert!(!b.stmts.iter().any(|s| matches!(s, Stmt::WriteReg { .. })));
+        // returned its first argument in x0 already has it there. (On x86-64
+        // the return register differs from the argument's, so it is written.)
+        if !gex_abi::X86 {
+            assert!(!b.stmts.iter().any(|s| matches!(s, Stmt::WriteReg { .. })));
+        }
     }
 
     #[test]
