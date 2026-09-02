@@ -10,7 +10,7 @@
 //! the *kernel* performs on the guest's behalf does check them.
 
 use crate::errno::{Errno, SysResult};
-use gex_abi::{GUEST_LIMIT, MMAP_BOTTOM, MMAP_TOP};
+use gex_abi::{GUEST_LIMIT, MMAP_AUTO_TOP, MMAP_BOTTOM, MMAP_TOP};
 
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -125,7 +125,7 @@ impl MemoryMap {
             generation: 0,
             brk_start: page_align_up(brk_start),
             brk_cur: page_align_up(brk_start),
-            mmap_next: MMAP_TOP,
+            mmap_next: MMAP_AUTO_TOP,
             arena: Vec::new(),
             take: None,
             back: None,
@@ -408,7 +408,17 @@ impl MemoryMap {
             // relies on the failure to reserve only the free gaps.
             let noreplace = flags & flags::FIXED_NOREPLACE != 0 && flags & flags::FIXED == 0;
             let hits_reserved = addr < gex_abi::RESERVE_FLOOR;
-            if noreplace && (!self.is_free(addr, end) || hits_reserved) {
+            // A pure address-space reservation (PROT_NONE) is the guest's own
+            // and may be committed over: Wine reserves a range and then maps
+            // real pages into it, sometimes with NOREPLACE. Only a mapping
+            // with real permissions -- a loaded image, another commit -- or
+            // the runtime's region makes NOREPLACE fail, which is what lets
+            // Wine's recursive reserve split down to the true gaps.
+            let over_real = self
+                .vmas
+                .iter()
+                .any(|v| v.start < end && v.end > addr && v.prot != 0);
+            if noreplace && (over_real || hits_reserved) {
                 return Err(Errno::EEXIST);
             }
             // Plain `MAP_FIXED` replaces whatever was there -- except the

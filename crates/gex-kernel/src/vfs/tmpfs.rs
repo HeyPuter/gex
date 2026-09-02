@@ -242,6 +242,7 @@ impl FileHandle for TmpHandle {
             Some(Node::Dir) => Ok(Metadata {
                 ino,
                 nlink: TmpFs::dir_nlink(&inner, &self.path),
+                mode: inner.modes.get(&self.path).copied().unwrap_or(0o755),
                 ..Metadata::dir()
             }),
             Some(Node::Symlink(t)) => Ok(Metadata {
@@ -423,7 +424,7 @@ impl FileSystem for TmpFs {
         }
     }
 
-    fn mkdir(&self, path: &str, _mode: u32) -> Result<(), Errno> {
+    fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let mut inner = self.inner.lock().unwrap();
         if inner.nodes.contains_key(path) {
             return Err(Errno::EEXIST);
@@ -432,6 +433,13 @@ impl FileSystem for TmpFs {
         inner.next_ino += 1;
         inner.inos.insert(path.to_string(), ino);
         inner.nodes.insert(path.to_string(), Node::Dir);
+        // The permission bits travel with the name, like a file's: wineserver
+        // makes its temp dir 0700 and refuses to run if it comes back
+        // group/other-accessible.
+        let mode = mode & 0o7777;
+        if mode != 0o755 {
+            inner.modes.insert(path.to_string(), mode);
+        }
         Ok(())
     }
 

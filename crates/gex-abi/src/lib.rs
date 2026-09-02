@@ -124,6 +124,16 @@ pub const STACK_SIZE: u64 = 8 * 1024 * 1024;
 /// translated. The assertion below keeps the two numbers together.
 pub const MMAP_TOP: u64 = DISPATCH_MAX_PAGES * DISPATCH_PAGE;
 
+/// The highest address the kernel places an *automatic* (unhinted) mapping,
+/// leaving the top of the space free for the guest's own fixed high mappings.
+/// Windows pins structures near the top of its 2 GiB user range -- the shared
+/// user-data page at 0x7ffe0000 and the 64 KiB above it -- and Wine maps them
+/// with `MAP_FIXED_NOREPLACE`, which needs the address free. A library packed
+/// against `MMAP_TOP` would land on it (the whole space is only 2 GiB here),
+/// so the automatic allocator stops a little short. `MAP_FIXED` still reaches
+/// `MMAP_TOP`.
+pub const MMAP_AUTO_TOP: u64 = MMAP_TOP - 0x0010_0000;
+
 /// Lowest address the mmap allocator will hand out, and the bottom of the
 /// region that grows.
 pub const MMAP_BOTTOM: u64 = 0x0700_0000;
