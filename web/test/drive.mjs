@@ -137,6 +137,7 @@ function parseArgs(argv) {
     fail: null,
     shot: null,
     restartChrome: false,
+    ensureChromeOnly: false,
     // Don't enable `Runtime` on worker targets. The inspector retains the
     // arguments of every console message it is shown, and gex runs a hundred
     // Workers that each log; measuring memory with that on measures the
@@ -153,6 +154,11 @@ function parseArgs(argv) {
     else if (a === '--keep') o.keep = true;
     else if (a === '--allow-errors') o.allowErrors = true;
     else if (a === '--restart-chrome') o.restartChrome = true;
+    // Start the persistent browser and stop, for the tests that attach to it
+    // rather than driving a page themselves. Without this they fail with
+    // "persistent CDP browser unavailable", which says nothing about what is
+    // wrong and sends you looking at the driver.
+    else if (a === '--ensure-chrome') o.ensureChromeOnly = true;
     else if (a === '--quiet-workers') o.quietWorkers = true;
     else if (a === '--wall') o.wallMs = Number(next()) * 1000;
     else if (a === '--idle') o.idleMs = Number(next()) * 1000;
@@ -472,7 +478,12 @@ async function runDemo(o) {
   log(`run: ${url}`);
   log(`goal: ${o.want ? `--want ${o.want}` : describe(spec.want)}${settle ? `  (settle: ${settle})` : ''}`);
 
-  const browser = await Cdp.connect(await ensureChrome(o.restartChrome));
+  const chromeUrl = await ensureChrome(o.restartChrome);
+  if (o.ensureChromeOnly) {
+    log(`chrome: ready on :${CHROME_PORT}`);
+    process.exit(0);
+  }
+  const browser = await Cdp.connect(chromeUrl);
 
   // A fresh tab per run: a wedged worker from a previous run must not poison
   // the next, and closing the tab (not the browser) keeps startup instant.

@@ -50,6 +50,9 @@ node "$ROOT/tests/gl-replay.mjs" "$TRACE" "$REPLAY" --api "$API" \
 grep -e "^REPLAY" -e "^PASS" "$WORK/softpipe.log" | sed 's/^/     /'
 
 echo "---- Mesa + gex_wgpu on WebGPU ----"
+# The browser this attaches to has to exist; starting it is drive.mjs's job.
+GEX_CHROME_PORT=${GEX_CHROME_PORT:-9335} \
+  node "$ROOT/web/test/drive.mjs" --ensure-chrome >/dev/null 2>&1 || true
 GEX_CHROME_PORT=${GEX_CHROME_PORT:-9335} \
 GEX_SERVE_PORT=${GEX_SERVE_PORT:-8091} \
 GEX_WGPU_PAGE=${GEX_WGPU_PAGE:-mesa-wgpu-replay.html} \
