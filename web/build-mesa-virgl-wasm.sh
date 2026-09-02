@@ -66,7 +66,12 @@ fi
 # same decoder, a different Gallium driver under it, which is exactly what the
 # session's "OpenGL through:" choice switches between.
 TARGETS=src/gallium/targets/gex-wasm/gex-virgl-replay.js
-if meson configure "$BUILD" 2>/dev/null | grep -q '^  gex-emdawn-dir *[^ ]'; then
+# `meson configure`'s table has a value column that is hard to grep -- an
+# empty value still leaves non-blank text on the line -- so ask introspect.
+if meson introspect "$BUILD" --buildoptions 2>/dev/null | python3 -c '
+import json, sys
+o = [x for x in json.load(sys.stdin) if x["name"] == "gex-emdawn-dir"]
+sys.exit(0 if o and o[0]["value"] else 1)'; then
     TARGETS="$TARGETS src/gallium/targets/gex-wasm/gex-wgpu-replay.js"
 fi
 
