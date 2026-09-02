@@ -1894,6 +1894,9 @@ impl<'a> Lifter<'a> {
             }
         };
         if count_static == Some(0) {
+            // Nothing moves and no flag changes, but the destination is still
+            // written: a 32-bit destination zero-extends into its register.
+            self.wr(d, w, a);
             return;
         }
         let one = self.k(ty, 1);
@@ -2017,12 +2020,13 @@ impl<'a> Lifter<'a> {
         };
         let bits = w.bits();
         let n = ((n as u32) & if w == Width::Q { 63 } else { 31 }) % (bits + 1);
-        if n == 0 {
-            return Flow::Next;
-        }
         let ty = ty_of(w);
         let a = self.rd(d, w);
         let a = self.narrow(a, w);
+        if n == 0 {
+            self.wr(d, w, a);
+            return Flow::Next;
+        }
         let c = self.read_flag(GuestReg::C);
         let c = if ty == Ty::I64 { self.b.extend(c, false) } else { c };
         // Work in a (bits+1)-bit register: value | carry << bits.
@@ -2033,7 +2037,9 @@ impl<'a> Lifter<'a> {
             let sh2 = self.k(ty, (n - 1) as u64);
             let cm = self.b.bin(BinOp::Shl, ty, c, sh2);
             let r = self.b.bin(BinOp::Or, ty, hi, cm);
-            let r = if n < bits {
+            // The wrapped-around low part, unless its shift is the whole
+            // type width (which wasm would mask to zero).
+            let r = if bits + 1 - n < ty.bits() {
                 let sh3 = self.k(ty, (bits + 1 - n) as u64);
                 let lo = self.b.bin(BinOp::ShrU, ty, a, sh3);
                 self.b.bin(BinOp::Or, ty, r, lo)
@@ -2054,7 +2060,7 @@ impl<'a> Lifter<'a> {
             let sh2 = self.k(ty, (bits - n) as u64);
             let cm = self.b.bin(BinOp::Shl, ty, c, sh2);
             let r = self.b.bin(BinOp::Or, ty, lo, cm);
-            let r = if n > 1 {
+            let r = if bits + 1 - n < ty.bits() {
                 let sh3 = self.k(ty, (bits + 1 - n) as u64);
                 let hi = self.b.bin(BinOp::Shl, ty, a, sh3);
                 self.b.bin(BinOp::Or, ty, r, hi)
@@ -2098,6 +2104,7 @@ impl<'a> Lifter<'a> {
             }
         };
         if count_static == Some(0) {
+            self.wr(d, w, a);
             return;
         }
         let bitsv = self.k(ty, bits as u64);

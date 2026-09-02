@@ -1,0 +1,12 @@
+[package]
+name = "gex-difffuzz-x86"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Instruction-level differential fuzzing of gex's x86-64 lifter against the host CPU"
+
+[[bin]]
+name = "gex-difffuzz-x86"
+path = "src/main.rs"
+
+[dependencies]

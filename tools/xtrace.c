@@ -58,14 +58,40 @@ int main(int argc, char **argv) {
         fprintf(stderr, "child did not stop\n");
         return 1;
     }
-    // Maps are read at the first stop (after exec): the interpreter and the
-    // executable are mapped, libraries are not yet.
-    dump_maps(pid);
     setvbuf(stdout, NULL, _IOFBF, 1 << 20);
     struct user_regs_struct r;
     long steps = 0;
+    // Known executable ranges; a pc outside them means something new was
+    // mapped (a library), so the maps are printed again.
+    unsigned long known_lo[256], known_hi[256];
+    int nknown = 0;
     for (;;) {
         if (ptrace(PTRACE_GETREGS, pid, 0, &r) < 0) break;
+        {
+            int found = 0;
+            for (int i = 0; i < nknown; i++)
+                if (r.rip >= known_lo[i] && r.rip < known_hi[i]) { found = 1; break; }
+            if (!found) {
+                dump_maps(pid);
+                char path[64];
+                snprintf(path, sizeof path, "/proc/%d/maps", pid);
+                FILE *f = fopen(path, "r");
+                if (f) {
+                    char line[512];
+                    nknown = 0;
+                    while (fgets(line, sizeof line, f) && nknown < 256) {
+                        unsigned long lo, hi;
+                        char perms[8];
+                        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) == 3 && perms[2] == 'x') {
+                            known_lo[nknown] = lo;
+                            known_hi[nknown] = hi;
+                            nknown++;
+                        }
+                    }
+                    fclose(f);
+                }
+            }
+        }
         printf("pc=%#llx rax=%#llx rcx=%#llx rdx=%#llx rbx=%#llx rsp=%#llx rbp=%#llx rsi=%#llx rdi=%#llx "
                "r8=%#llx r9=%#llx r10=%#llx r11=%#llx r12=%#llx r13=%#llx r14=%#llx r15=%#llx fl=%#llx\n",
                r.rip, r.rax, r.rcx, r.rdx, r.rbx, r.rsp, r.rbp, r.rsi, r.rdi, r.r8, r.r9, r.r10, r.r11,

@@ -23,6 +23,7 @@ members = [
     "shims/browser",
     "shims/native",
     "tests/diff-fuzz",
+    "tests/diff-fuzz-x86",
 ]
 
 [workspace.package]

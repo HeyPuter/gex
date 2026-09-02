@@ -1243,9 +1243,10 @@ impl<'a> Emitter<'a> {
         self.f.local_set(ls);
         self.push(*val);
         self.f.local_set(lv);
-        // step = df ? -bytes : +bytes
-        self.f.i64_const(-bytes);
+        // step = df ? -bytes : +bytes  (`select` yields its first operand
+        // when the condition is non-zero)
         self.f.i64_const(bytes);
+        self.f.i64_const(-bytes);
         self.push(*df);
         self.f.byte(0x45); // i32.eqz
         self.f.select();

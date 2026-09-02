@@ -16,9 +16,31 @@ const ECHO = 0x8;
 // A memory import's `shared` flag is part of its type, so the shim, seed,
 // kernel, closure and host-made memory must all be the shared build or nothing
 // links.
-const SHIM_URL = '/gex/gex_browser.shared.wasm';
-const SEED_URL = '/gex/seed.shared.wasm';
-const KERNEL_URL = '/gex/gex_kernel.wasm';
+//
+// One set per guest architecture: the lifter is compiled into the shim, the
+// seed's `enter` stub and the kernel's syscall ABI are per-arch too. The
+// x86-64 set carries an `.x86` infix; `?arch=x86` (see main.js) selects it.
+export function guestArch() {
+  return globalThis.GEX_ARCH === 'x86' ? 'x86' : 'aarch64';
+}
+function archInfix() {
+  return guestArch() === 'x86' ? '.x86' : '';
+}
+/** `/rootfs/x86/name` or `/rootfs/name`: where this architecture's assets live. */
+export function archAsset(path) {
+  return guestArch() === 'x86' ? path.replace(/^\/(rootfs|closure|fs)\//, '/$1/x86/') : path;
+}
+/** Debian's multiarch directory name for the guest. */
+export function multiarch() {
+  return guestArch() === 'x86' ? 'x86_64-linux-gnu' : 'aarch64-linux-gnu';
+}
+/** ELF `e_machine` of a guest binary. */
+export function elfMachine() {
+  return guestArch() === 'x86' ? 0x3e : 0xb7;
+}
+const SHIM_URL = () => `/gex/gex_browser${archInfix()}.shared.wasm`;
+const SEED_URL = () => `/gex/seed${archInfix()}.shared.wasm`;
+const KERNEL_URL = () => `/gex/gex_kernel${archInfix()}.wasm`;
 
 let shimBytes = null;
 let seedBytes = null;
@@ -69,8 +91,8 @@ async function fetchBytes(url, onProgress) {
 
 /** The two wasm modules every demo needs, fetched once for the page's life. */
 export async function loadRuntime(onProgress) {
-  if (!shimBytes) shimBytes = await fetchBytes(SHIM_URL, onProgress);
-  if (!seedBytes) seedBytes = await fetchBytes(SEED_URL);
+  if (!shimBytes) shimBytes = await fetchBytes(SHIM_URL(), onProgress);
+  if (!seedBytes) seedBytes = await fetchBytes(SEED_URL());
   return { shimBytes, seedBytes };
 }
 
@@ -260,7 +282,7 @@ async function loadKernel() {
     return null;
   }
   try {
-    const bytes = await fetchBytes(KERNEL_URL);
+    const bytes = await fetchBytes(KERNEL_URL());
     kernelSpec = {
       // The maximum must match `--max-memory` in `shims/kernel/build.sh`
       // exactly: a shared memory carries its maximum in its type, so a host

@@ -431,6 +431,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-difffuzz-x86"
+version = "0.0.1"
+
+[[package]]
 name = "gex-emit"
 version = "0.0.1"
 dependencies = [

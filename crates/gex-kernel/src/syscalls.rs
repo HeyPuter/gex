@@ -183,6 +183,9 @@ pub mod nr {
     pub const TIME: u64 = 0x1001;
     pub const ALARM: u64 = 0x1002;
     pub const ARCH_PRCTL: u64 = 0x1003;
+    /// Advisory calls a guest may issue and never checks: `fadvise64`,
+    /// `readahead`, `mlock`... Answered with success and nothing done.
+    pub const NOOP_OK: u64 = 0x1004;
 }
 
 /// `*at` calls use this to mean "relative to the current directory".
@@ -1922,6 +1925,7 @@ impl Kernel {
             nr::TIME => self.sys_time(m, a[0]),
             nr::ALARM => self.sys_alarm(m, a[0]),
             nr::ARCH_PRCTL => self.sys_arch_prctl(m, a[0], a[1]),
+            nr::NOOP_OK => Ok(0),
 
             // -- I/O ---------------------------------------------------------
             nr::WRITE => self.sys_write(m, a[0] as i32, a[1], a[2]),
@@ -5656,6 +5660,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::TIME => "time",
         nr::ALARM => "alarm",
         nr::ARCH_PRCTL => "arch_prctl",
+        nr::NOOP_OK => "advisory-noop",
         nr::GETCWD => "getcwd",
         nr::DUP => "dup",
         nr::DUP3 => "dup3",

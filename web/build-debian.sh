@@ -16,11 +16,17 @@
 # installed, and apt will not try to fetch it again.
 set -eu
 
-OUT="${1:-$(cd "$(dirname "$0")" && pwd)/public/rootfs/debian.tar}"
-WORK="${2:-${TMPDIR:-/tmp}/gex-debian}"
+# The Debian architecture: arm64 for the AArch64 guest, amd64 for the x86-64
+# one. The amd64 tree lands under `rootfs/x86/` so the two coexist.
+ARCH="${GEX_DEBIAN_ARCH:-arm64}"
+case "$ARCH" in
+    amd64) SUB=x86/ ;;
+    *) SUB= ;;
+esac
+OUT="${1:-$(cd "$(dirname "$0")" && pwd)/public/rootfs/${SUB}debian.tar}"
+WORK="${2:-${TMPDIR:-/tmp}/gex-debian-$ARCH}"
 MIRROR="${GEX_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
 SUITE="${GEX_DEBIAN_SUITE:-bookworm}"
-ARCH=arm64
 
 # The roots of the closure. `apt` is the point of the exercise; the rest is
 # what a shell prompt needs to be worth having.

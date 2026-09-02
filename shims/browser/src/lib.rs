@@ -3371,13 +3371,17 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     );
 
     let c = gex_abi::ctx_addr(0) as usize;
+    // Registers first, then the stack pointer: on x86-64 `SP` is one of them.
+    for i in 0..31u8 {
+        write_u64(data, c + ctx::x(i), 0);
+    }
     write_u64(data, c + ctx::SP, layout.sp);
     write_u64(data, c + ctx::PC, program.entry());
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
-    for i in 0..31u8 {
-        write_u64(data, c + ctx::x(i), 0);
-    }
+    // The x87 control word and MXCSR at their power-on defaults.
+    data[c + ctx::X87_CW..c + ctx::X87_CW + 4].copy_from_slice(&0x37fu32.to_le_bytes());
+    data[c + ctx::MXCSR..c + ctx::MXCSR + 4].copy_from_slice(&0x1f80u32.to_le_bytes());
     if hook != 0 {
         snap_arm(&mut kernel, snap_key_1, &program.exe, program.interp_base());
     }
@@ -5088,7 +5092,7 @@ fn count_syscall() {
     let nr = with_host(|h| {
         let gm = GuestMem::new(guest_bytes());
         let at = h.threads[cur()].kstate.ctx_addr;
-        gm.read_u64(at + ctx::x(8) as u64).unwrap_or(!0)
+        gm.read_u64(at + ctx::SYSCALL_NR as u64).unwrap_or(!0)
     });
     let (a0, a1) = with_host(|h| {
         let gm = GuestMem::new(guest_bytes());
@@ -5167,7 +5171,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     {
         let gm = GuestMem::new(guest_bytes());
         let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
-        let n = gm.read_u64(base + ctx::x(8) as u64).unwrap_or(u64::MAX);
+        let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
+        let n = if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n };
         SYSCALL_NR.store(n, std::sync::atomic::Ordering::Relaxed);
         // And a select's arguments, to read the answer back from the guest's
         // own sets afterwards.
@@ -5262,7 +5267,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // what survives to narrow a crash to a single handler.
     LAST_SYSCALL.store(
         GuestMem::new(guest_bytes())
-            .read_u64(ctx as u32 as u64 + ctx::x(8) as u64)
+            .read_u64(ctx as u32 as u64 + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0) as u32,
         std::sync::atomic::Ordering::Relaxed,
     );
@@ -5299,9 +5304,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // Rebuilding the proc snapshot costs more than most syscalls, and only
         // a handful can observe it, so the rest skip it.
         let nr = gm
-            .read_u64(kstate.ctx_addr + ctx::x(8) as u64)
+            .read_u64(kstate.ctx_addr + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0);
-        if !gex_kernel::skips_proc_snapshot(nr) {
+        // The raw number: `SNAP_SYSCALL` is compared raw; the proc-snapshot
+        // question wants the canonical one.
+        let canonical = if gex_abi::X86 { gex_kernel::x86::canonical_number(nr) } else { nr };
+        if !gex_kernel::skips_proc_snapshot(canonical) {
             let st = Arc::clone(&h.proc_state);
             h.kernel.refresh_proc(&st.0);
         }
@@ -5867,7 +5875,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     // The parent carries straight on, keeping its memory, threads and tables:
     // the child is a separate Worker and will not use them.
-    h.threads[cur()].pc = pc + 4;
+    h.threads[cur()].pc = pc + gex_abi::SYSCALL_INST_BYTES;
     h.threads[cur()].waiting = Waiting::Runnable;
     h.threads[cur()].blocked_on = None;
 
@@ -5882,7 +5890,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     // fresh kernel starts at `/`, so hand it the parent's cwd to apply in
     // `gex_adopt_child`, or `sh -c 'cd d; make'` builds in the wrong place.
     *FORK_CWD.0.borrow_mut() = h.kernel.vfs.cwd.clone();
-    FORK[1].store(pc + 4, std::sync::atomic::Ordering::Relaxed);
+    FORK[1].store(pc + gex_abi::SYSCALL_INST_BYTES, std::sync::atomic::Ordering::Relaxed);
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
     FORK[4].store(tls.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
@@ -6998,13 +7006,19 @@ const SNAP_STUB: u64 = gex_abi::STACK_TOP;
 /// Linux has assigned on aarch64, so no guest can reach it by accident.
 const SNAP_SYSCALL: u64 = 0x6765_7801;
 
-/// `movz x8, #0x7801` / `movk x8, #0x6765, lsl #16` / `svc #0`.
+/// `movz x8, #0x7801` / `movk x8, #0x6765, lsl #16` / `svc #0`, or on
+/// x86-64 `mov eax, 0x67657801` / `syscall`.
 ///
-/// Three instructions and no registers touched but `x8`, which is
-/// caller-saved and which `_start` does not read -- so `x0`, holding the
-/// address of `_dl_fini` that glibc's `__libc_start_main` will register with
-/// `atexit`, arrives at the entry exactly as the linker left it.
-const SNAP_STUB_CODE: [u32; 3] = [0xd28f0028, 0xf2aceca8, 0xd4000001];
+/// No registers touched but the syscall-number one, which is caller-saved
+/// and which `_start` does not read -- so `x0`/`rdx`, holding the address of
+/// `_dl_fini` that glibc's `__libc_start_main` will register with `atexit`,
+/// arrives at the entry exactly as the linker left it. (On x86-64 `_start`
+/// takes `_dl_fini` in `rdx`; `rax` is free.)
+const SNAP_STUB_CODE: &[u8] = if gex_abi::X86 {
+    &[0xb8, 0x01, 0x78, 0x65, 0x67, 0x0f, 0x05]
+} else {
+    &[0x28, 0x00, 0x8f, 0xd2, 0xa8, 0xec, 0xac, 0xf2, 0x01, 0x00, 0x00, 0xd4]
+};
 
 /// Whether to keep the linked image of a program and start the next process
 /// of it from the result.
@@ -7127,9 +7141,7 @@ fn snap_arm(kernel: &mut Kernel, key: u64, exe: &gex_ld::Image, interp_base: u64
     let entry = exe.entry;
     let data = guest_bytes();
     let at = SNAP_STUB as usize;
-    for (i, w) in SNAP_STUB_CODE.iter().enumerate() {
-        data[at + i * 4..at + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
-    }
+    data[at..at + SNAP_STUB_CODE.len()].copy_from_slice(SNAP_STUB_CODE);
     kernel.mem.insert_loaded(
         SNAP_STUB,
         SNAP_STUB + 4096,
@@ -8898,7 +8910,14 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
     }
 }
 #[no_mangle]
-pub extern "C" fn gex_sysreg_write(_ctx: i32, _pc: i64, _reg: i32, _val: i64) {}
+pub extern "C" fn gex_sysreg_write(ctx: i32, _pc: i64, reg: i32, val: i64) {
+    // The x86-64 lifter's `cpuid`: the leaf and subleaf arrive in `val`, the
+    // four results go back into the context.
+    if reg == gex_kernel::x86::SYSREG_CPUID {
+        let mut gm = GuestMem::new(guest_bytes());
+        gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, val as u64);
+    }
+}
 
 /// Cache maintenance. Only `dc zva` does anything, and it must: the lifter
 /// reports a 64-byte block through `DCZID_EL0` and musl's `memset` zeroes whole
@@ -9013,7 +9032,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
         // single heartbeat sample prints whichever pc was current, which for a
         // loop is the same few addresses and says nothing about the work.
         unsafe {
-            let slot = (pc as u64 as usize >> 2) % HOT_SLOTS;
+            let slot = (pc as u64 as usize >> gex_abi::INST_ALIGN_SHIFT) % HOT_SLOTS;
             if HOT_PC[slot] == pc as u64 {
                 HOT_N[slot] += 1;
             } else if HOT_N[slot] == 0 {
@@ -9207,7 +9226,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // while a second ask for one span would loop for ever.
         let page = gex_abi::dispatch_page(pc);
         let width = FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
-        let from = ((pc & 0xfff) >> 2) as u32 & !(width - 1);
+        let from = ((pc & 0xfff) >> gex_abi::INST_ALIGN_SHIFT) as u32 & !(width - 1);
         let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
         let key = page * spans as u64 + (from / width) as u64;
         // Under KLOCK: `FILL_ASKED` is a `SingleThreaded<RefCell<BTreeSet>>`, and
@@ -9260,7 +9279,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         } else {
             let width = FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
             let page = gex_abi::dispatch_page(pc);
-            let from = ((pc & 0xfff) >> 2) as u32 & !(width - 1);
+            let from = ((pc & 0xfff) >> gex_abi::INST_ALIGN_SHIFT) as u32 & !(width - 1);
             let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
             let key = page * spans as u64 + (from / width) as u64;
             if with_host(|_| FILL_ASKED.0.borrow().contains(&key)) { 2 } else { 3 }
@@ -9306,7 +9325,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             .filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
             .map(|v| (v.start, v.end))
             .collect();
-        if !exec.iter().any(|(a, b)| pc >= *a && pc + 4 <= *b) {
+        if !exec.iter().any(|(a, b)| pc >= *a && pc + gex_abi::INST_ALIGN <= *b) {
             return false;
         }
         // Before anything is translated: if this page's code has been
@@ -9554,7 +9573,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         );
         h.jit.translated = known;
         if pc == 0x10f6d24 {
-            let ok = exec.iter().any(|(s, e)| pc >= *s && pc + 4 <= *e);
+            let ok = exec.iter().any(|(s, e)| pc >= *s && pc + gex_abi::INST_ALIGN <= *e);
             let has_block = unit.covered.iter().any(|(p, _)| *p == 0x10f6);
             warn_line(&format!(
                 "[trace] translate pc=0x10f6d24 blocks={} exec={} covers_page_10f6={} exec_regions={}\n",
@@ -10419,7 +10438,7 @@ fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {
                 continue;
             }
             let v = u64::from_le_bytes(chunk.try_into().unwrap());
-            if v >= lo && v < hi && v % 4 == 0 {
+            if v >= lo && v < hi && v % gex_abi::INST_ALIGN == 0 {
                 seeds.push(v.wrapping_add(bias));
             }
         }

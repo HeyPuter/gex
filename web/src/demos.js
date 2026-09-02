@@ -1,6 +1,8 @@
 // The demos. Each has an `enter(ctx)` that owns the terminal until the next is
 // chosen; `ctx` carries the page's chrome so a demo never touches the DOM.
 
+import { archAsset, multiarch, elfMachine, guestArch } from './runtime.js';
+
 const running = (on) => window.dispatchEvent(new CustomEvent('gex:running', { detail: on }));
 
 /** Print a rule with a label, so a long session stays readable. */
@@ -83,9 +85,9 @@ const upload = {
         ctx.term.writeln(ctx.ansi.red(`${file.name} is not an ELF`));
         return;
       }
-      if (buf[18] !== 0xb7) {
+      if (buf[18] !== elfMachine()) {
         ctx.term.writeln(
-          ctx.ansi.red(`${file.name} is not aarch64 (e_machine=${buf[18] | (buf[19] << 8)})`),
+          ctx.ansi.red(`${file.name} is not ${guestArch()} (e_machine=${buf[18] | (buf[19] << 8)})`),
         );
         return;
       }
@@ -155,7 +157,7 @@ async function boot(ctx) {
   document.getElementById('boot').disabled = true;
   ctx.busy('fetching root filesystem');
   try {
-    const tree = await ctx.rootfs('/rootfs/busybox.tar');
+    const tree = await ctx.rootfs(archAsset('/rootfs/busybox.tar'));
     const files = { ...tree.files };
     // A symlink becomes a copy of the target's bytes, and the mode must travel
     // with them: without it `/bin/sh` (a symlink to dash) has no execute bit
@@ -189,7 +191,7 @@ async function boot(ctx) {
     const wantClosure = new URLSearchParams(location.search).get('closure') !== '0';
     let closure = null;
     try {
-      closure = !wantClosure ? null : await loadClosure('/closure/busybox', {
+      closure = !wantClosure ? null : await loadClosure(archAsset('/closure/busybox'), {
         image: '/bin/busybox',
         log: (m) => console.debug(`[gex] ${m}`),
       });
@@ -279,7 +281,7 @@ async function bootDebian(ctx) {
   document.getElementById('dboot').disabled = true;
   const cmd = new URLSearchParams(location.search).get('cmd');
   try {
-    const tree = await ctx.rootfs('/rootfs/debian.tar');
+    const tree = await ctx.rootfs(archAsset('/rootfs/debian.tar'));
     const files = { ...tree.files };
     for (const [path, target] of Object.entries(tree.links)) {
       const abs = rootfsLinkTarget(path, target);
@@ -324,7 +326,7 @@ async function bootDebian(ctx) {
     ctx.busy('loading the closure');
     const { loadClosure } = await import('./closure.js');
     const wantClosure = new URLSearchParams(location.search).get('closure') !== '0';
-    const closure = !wantClosure ? null : await loadClosure('/closure/debian', {
+    const closure = !wantClosure ? null : await loadClosure(archAsset('/closure/debian'), {
       image: '/bin/bash',
       // The console, not the terminal, which belongs to the guest.
       log: (s) => console.debug(`[gex] ${s}`),
@@ -447,10 +449,10 @@ const gears = {
         const [elf, loader, glesv2, egl] = await Promise.all(
           [
             '/fs/gles-gears',
-            '/fs/ld-musl-aarch64.so.1',
+            guestArch() === 'x86' ? '/fs/ld-musl-x86_64.so.1' : '/fs/ld-musl-aarch64.so.1',
             '/fs/libGLESv2.so.2',
             '/fs/libEGL.so.1',
-          ].map(async (u) => {
+          ].map(archAsset).map(async (u) => {
             const r = await fetch(u);
             if (!r.ok) throw new Error(`${u}: ${r.status}`);
             return new Uint8Array(await r.arrayBuffer());
@@ -461,7 +463,7 @@ const gears = {
         const { status } = await ctx.runProgram(ctx.term, {
           elf,
           files: {
-            '/lib/ld-musl-aarch64.so.1': loader,
+            [guestArch() === 'x86' ? '/lib/ld-musl-x86_64.so.1' : '/lib/ld-musl-aarch64.so.1']: loader,
             '/usr/lib/libGLESv2.so.2': glesv2,
             '/usr/lib/libEGL.so.1': egl,
           },
@@ -586,7 +588,7 @@ const virglGears = {
         ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
         ctx.term.writeln('');
 
-        const tree = await ctx.rootfs('/rootfs/graphics.tar');
+        const tree = await ctx.rootfs(archAsset('/rootfs/graphics.tar'));
         const files = { ...tree.files };
         for (const [path, target] of Object.entries(tree.links)) {
           const abs = rootfsLinkTarget(path, target);
@@ -692,13 +694,13 @@ const virglGears = {
 const WL_TOOLKIT_ENV = {
   qt6:
     'export QT_QPA_PLATFORM=wayland\n' +
-    'export QT_PLUGIN_PATH=/usr/lib/aarch64-linux-gnu/qt6/plugins\n' +
+    `export QT_PLUGIN_PATH=/usr/lib/${multiarch()}/qt6/plugins\n` +
     'export FONTCONFIG_PATH=/etc/fonts\n' +
     'export DBUS_SESSION_BUS_ADDRESS=disabled:\n' +
     'export QT_LOGGING_RULES="*=false"\n',
   qt5:
     'export QT_QPA_PLATFORM=wayland\n' +
-    'export QT_PLUGIN_PATH=/usr/lib/aarch64-linux-gnu/qt5/plugins\n' +
+    `export QT_PLUGIN_PATH=/usr/lib/${multiarch()}/qt5/plugins\n` +
     'export FONTCONFIG_PATH=/etc/fonts\n' +
     'export DBUS_SESSION_BUS_ADDRESS=disabled:\n' +
     'export QT_LOGGING_RULES="*=false"\n',
@@ -706,12 +708,12 @@ const WL_TOOLKIT_ENV = {
   // wayland and point the pixbuf loaders at the cache baked into the rootfs.
   gtk:
     'export GDK_BACKEND=wayland\n' +
-    'export GDK_PIXBUF_MODULE_FILE=/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache\n',
+    `export GDK_PIXBUF_MODULE_FILE=/usr/lib/${multiarch()}/gdk-pixbuf-2.0/2.10.0/loaders.cache\n`,
 };
 
 const WL_APPS = [
-  { id: 'glxgears', label: 'glxgears — OpenGL via virgl (Xwayland)', mode: 'x', client: 'glxgears.aarch64-linux-gnu -info' },
-  { id: 'es2gears', label: 'es2gears — OpenGL ES, native Wayland', mode: 'gl', client: '/usr/bin/es2gears_wayland.aarch64-linux-gnu' },
+  { id: 'glxgears', label: 'glxgears — OpenGL via virgl (Xwayland)', mode: 'x', client: `glxgears.${multiarch()} -info` },
+  { id: 'es2gears', label: 'es2gears — OpenGL ES, native Wayland', mode: 'gl', client: `/usr/bin/es2gears_wayland.${multiarch()}` },
   { id: 'gtk3-demo', label: 'GTK 3 — Demo', mode: 'shm', client: 'gtk3-demo', env: WL_TOOLKIT_ENV.gtk },
   { id: 'gtk3-widget-factory', label: 'GTK 3 — Widget Factory', mode: 'shm', client: 'gtk3-widget-factory', env: WL_TOOLKIT_ENV.gtk },
   { id: 'qt6ct', label: 'Qt 6 — Configuration Tool', mode: 'shm', client: 'qt6ct', env: WL_TOOLKIT_ENV.qt6 },
@@ -733,7 +735,7 @@ const WL_APPS = [
     // hit every graphics-rootfs wayland closure (libc+0x84710) is fixed by
     // `closureBuildNumbered` (see runProgram), so Dolphin now renders in a real
     // browser.
-    closure: '/closure/dolphin',
+    closure: archAsset('/closure/dolphin'),
     closureImage: '/bin/sh',
     // Drop Mesa's software rasteriser from Dolphin's filesystem. Dolphin is a
     // QtWidgets app -- it renders through Qt's own raster engine into wl_shm and
@@ -742,7 +744,7 @@ const WL_APPS = [
     // over the top and crashed the tab. Absent, the probe fails gracefully and
     // Dolphin renders under the ceiling. Scoped to this app: glxgears' Xwayland
     // GLX genuinely needs swrast, and it does not drop it.
-    dropFiles: ['/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so'],
+    dropFiles: [`/usr/lib/${multiarch()}/dri/swrast_dri.so`],
   },
 ];
 
@@ -896,7 +898,7 @@ const waylandGears = {
         // applications bring their own traced/minimised rootfs through the
         // same Xwayland + Wayland + virgl pipeline. The URL is still fetched
         // from this site's rootfs directory; only the asset name changes.
-        const rootfsUrl = qp.get('wlrootfs') || demo.rootfs || '/rootfs/graphics.tar';
+        const rootfsUrl = archAsset(qp.get('wlrootfs') || demo.rootfs || '/rootfs/graphics.tar');
         const tree = await ctx.rootfs(rootfsUrl);
         const files = { ...tree.files };
         for (const [path, target] of Object.entries(tree.links)) {
@@ -926,7 +928,7 @@ const waylandGears = {
         const baseEnv =
           'export XDG_RUNTIME_DIR=/tmp\n' +
           'export WAYLAND_DISPLAY=wayland-0\n' +
-          'export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu\n' +
+          `export LD_LIBRARY_PATH=/usr/lib/${multiarch()}\n` +
           // A home and a writable cache so fontconfig (xclock, xterm, any Xft
           // client) can find fonts and write its scan cache rather than failing.
           'export HOME=/root\n' +
@@ -1149,12 +1151,12 @@ const supertuxkart = {
   canvasHeight: 480,
   // Version the generated image so a persistent browser does not reuse an
   // earlier over-trimmed tar that lacked the track and kart materials.
-  rootfs: '/rootfs/stk.tar?v=snowpeak18',
+  rootfs: archAsset('/rootfs/stk.tar?v=snowpeak18'),
   env:
     'IRR_DEVICE_TYPE=x11;SUPERTUXKART_DATADIR=/usr/share/games/supertuxkart;' +
     'ALSOFT_DRIVERS=null;MESA_GLSL_CACHE_DISABLE=1;MESA_GL_VERSION_OVERRIDE=3.3;' +
     'MESA_GLSL_VERSION_OVERRIDE=330;JSIMD_FORCENONE=1;' +
-    'LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgex-stk-sdl.so',
+    `LD_PRELOAD=/usr/lib/${multiarch()}/libgex-stk-sdl.so`,
   // Auto-run is playable by default. The harness adds ?stkprofile=1 for its
   // finite benchmark run without exposing profiling controls in the demo UI.
   client: stkLaunch,
