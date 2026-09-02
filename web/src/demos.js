@@ -737,7 +737,8 @@ const WL_APPS = [
     // hit every graphics-rootfs wayland closure (libc+0x84710) is fixed by
     // `closureBuildNumbered` (see runProgram), so Dolphin now renders in a real
     // browser.
-    closure: archAsset('/closure/dolphin'),
+    // A function: `archAsset` depends on `?arch=`, parsed after this module loads.
+    closure: () => archAsset('/closure/dolphin'),
     closureImage: '/bin/sh',
     // Drop Mesa's software rasteriser from Dolphin's filesystem. Dolphin is a
     // QtWidgets app -- it renders through Qt's own raster engine into wl_shm and
@@ -1044,7 +1045,7 @@ const waylandGears = {
         // bisecting the closure path against a known-good one); `?closure=0`
         // forces the runtime translator.
         const qpc = new URLSearchParams(location.search);
-        const closurePath = qpc.get('appclosure') || app.closure;
+        const closurePath = qpc.get('appclosure') || (typeof app.closure === 'function' ? app.closure() : app.closure);
         let appClosure = null;
         if (closurePath && qpc.get('closure') !== '0') {
           ctx.busy('loading the closure');
