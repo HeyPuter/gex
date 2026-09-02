@@ -1127,7 +1127,7 @@ const waylandGears = {
         }
         if (usesDirectGl(demo)) {
           const directFiles = ['libGLESv2.so.2', 'libEGL.so.1', 'libgex-gl-sdl.so'];
-          const directPrefix = demo.directGlAbi ? `/fs/${demo.directGlAbi}` : '/fs';
+          const directPrefix = archAsset(demo.directGlAbi ? `/fs/${demo.directGlAbi}` : '/fs');
           await Promise.all(directFiles.map(async (name) => {
             // `no-store` for the same reason the gles-gears path uses it: these
             // are build artifacts under stable names, and the persistent CDP
@@ -2084,7 +2084,7 @@ const compositor = {
         // unless something needs the session image, which is that plus
         // SuperTuxKart's 200 MB of game data.
         const image = chosen.find((a) => a.rootfs)?.rootfs || this.rootfs;
-        const tree = await ctx.rootfs(qp.get('wlrootfs') || image);
+        const tree = await ctx.rootfs(archAsset(qp.get('wlrootfs') || image));
         const files = { ...tree.files };
         for (const [path, target] of Object.entries(tree.links)) {
           const abs = rootfsLinkTarget(path, target);
@@ -2127,7 +2127,7 @@ const compositor = {
             ['/fs/glibc/libgex-gl-sdl.so', '/usr/lib/gex-gl/libgex-gl-sdl.so'],
             ['/fs/glibc/libGL.so.1', '/usr/lib/gex-glx/libGL.so.1'],
           ]) {
-            const response = await fetch(from, { cache: 'no-store' });
+            const response = await fetch(archAsset(from), { cache: 'no-store' });
             if (!response.ok) continue;
             files[to] = new Uint8Array(await response.arrayBuffer());
             tree.modes[to] = 0o755;
