@@ -27,6 +27,7 @@ pub fn lift_block(
     fetch: impl Fn(u64, &mut [u8; 16]) -> usize,
     start: u64,
     limits: BlockLimits,
+    mode: gex_isa_x86::Mode,
 ) -> Block {
     let mut builder = Builder::new(start);
     let mut pc = start;
@@ -40,10 +41,10 @@ pub fn lift_block(
             term = Some(Term::Illegal { raw: 0, pc });
             break;
         }
-        let inst = decode(&buf[..n], pc);
+        let inst = gex_isa_x86::decode_in(mode, &buf[..n], pc);
         let raw = u32::from_le_bytes(buf[..4].try_into().unwrap());
         let mark = builder.mark();
-        let mut lifter = Lifter::new(&mut builder, flags, raw);
+        let mut lifter = Lifter::new(&mut builder, flags, raw, mode);
         let flow = lifter.lift(&inst, pc);
         flags = lifter.flags();
         if builder.has_inexpressible(mark) {

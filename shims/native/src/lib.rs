@@ -2238,6 +2238,7 @@ fn place_image(
         write_u64(data, ctx_addr + ctx::x(i), 0);
     }
     write_u64(data, ctx_addr + ctx::SP, layout.sp);
+    gex_kernel::x86::init_segments(&mut GuestMem::new(data), ctx_addr as u64, program.compat());
     write_u64(data, ctx_addr + ctx::PC, image.entry);
     data[ctx_addr + ctx::SAFEPOINT_COUNTER..ctx_addr + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
@@ -2484,8 +2485,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::DISPATCH_MISS,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<i32> {
+        |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64| -> Result<i32> {
             let pc = pc as u64;
+            // The code this thread is about to run is decoded in the mode
+            // its code segment says (a WoW64 thread crosses between 32- and
+            // 64-bit code).
+            if let Some(memory) = caller.data().memory.clone() {
+                let gm = GuestMem::new(memory.bytes());
+                let cs = gex_kernel::x86::selector(&gm, ctx as u32 as u64, gex_kernel::x86::SEG_CS);
+                gex_xlate::set_thread_mode(if cs == 0 {
+                    None
+                } else {
+                    Some(cs == gex_kernel::x86::USER32_CS)
+                });
+            }
             // Returning from a signal handler with no `sa_restorer` lands
             // here: the trampoline address deliberately has no translation.
             if pc == gex_kernel::signal::SIGRETURN_TRAMPOLINE {
@@ -2660,7 +2673,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::SYSREG_READ,
-        |_caller: Caller<'_, HostState>, _ctx: i32, _pc: i64, reg: i32| -> i64 {
+        |mut caller: Caller<'_, HostState>, ctx: i32, _pc: i64, reg: i32| -> i64 {
+            // A segment register read: the selector it holds.
+            let sb = gex_kernel::x86::SYSREG_SEG_BASE;
+            if reg <= sb && reg > sb - 6 {
+                let Some(memory) = caller.data().memory.clone() else { return 0 };
+                let gm = GuestMem::new(memory.bytes());
+                return gex_kernel::x86::selector(&gm, ctx as u32 as u64, (sb - reg) as u8) as i64;
+            }
             match reg {
                 // CNTVCT_EL0. Served from the host clock at the frequency the
                 // guest was told (CNTFRQ), which keeps its arithmetic exact.
@@ -2681,6 +2701,40 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::SYSREG_WRITE,
         |mut caller: Caller<'_, HostState>, ctx: i32, _pc: i64, reg: i32, v: i64| -> Result<()> {
+            // A segment register load. For cs the value also names the code
+            // the transfer lands in, whose mode the selector decides.
+            let sb = gex_kernel::x86::SYSREG_SEG_BASE;
+            if reg <= sb && reg > sb - 6 {
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let mut gm = GuestMem::new(memory.bytes());
+                let seg = (sb - reg) as u8;
+                let ldt = caller.data_mut().with_kernel(|k| k.ldt.clone());
+                if seg == gex_kernel::x86::SEG_CS {
+                    let sel = (v as u64 >> 48) as u16;
+                    let target = v as u64 & 0xffff_ffff_ffff;
+                    gex_kernel::x86::load_segment(&mut gm, ctx as u32 as u64, &ldt, seg, sel);
+                    // A page translated in the other mode (the image was
+                    // lifted ahead of time as 64-bit code, say) is stale for
+                    // the code this switch lands in: retire it so the miss
+                    // that follows lifts it in the right mode.
+                    let compat = sel == gex_kernel::x86::USER32_CS;
+                    if gex_xlate::page_mode_conflicts(target, compat) {
+                        drop(gm);
+                        let page = target / gex_abi::DISPATCH_PAGE;
+                        retire_translations(
+                            &mut caller,
+                            &[(page * gex_abi::DISPATCH_PAGE, (page + 1) * gex_abi::DISPATCH_PAGE)],
+                        )?;
+                    }
+                } else {
+                    gex_kernel::x86::load_segment(&mut gm, ctx as u32 as u64, &ldt, seg, v as u16);
+                }
+                return Ok(());
+            }
             // The x86-64 lifter routes `cpuid` here: the leaf and subleaf come
             // in `v`, the four results go back into the context.
             if reg == gex_kernel::x86::SYSREG_CPUID {

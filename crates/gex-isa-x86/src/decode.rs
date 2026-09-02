@@ -708,6 +708,20 @@ impl<'a> Decoder<'a> {
                 let n = self.u8()? as i64;
                 return Ok(self.i1(Op::Int, Width::D, Operand::Imm(n)));
             }
+            // Far transfers. The direct forms exist only in 32-bit code; the
+            // width is that of the offset popped or pushed.
+            0x9a | 0xea if self.mode == Mode::Compat => {
+                let off = self.i32()? & 0xffff_ffff;
+                let sel = self.u16()? as i64;
+                let o = if op == 0xea { Op::JmpFar } else { Op::CallFar };
+                return Ok(self.i2(o, Width::D, Operand::Imm(off), Operand::Imm(sel)));
+            }
+            0xca => {
+                let imm = self.u16()? as i64;
+                return Ok(self.i1(Op::Retf, self.wv(), Operand::Imm(imm)));
+            }
+            0xcb => return Ok(self.i1(Op::Retf, self.wv(), Operand::Imm(0))),
+            0xcf => return Ok(self.i0(Op::Iret, self.wv())),
             0xd8..=0xdf => return self.x87(op),
             0xe0..=0xe3 => {
                 let rel = self.i8()?;
@@ -784,7 +798,13 @@ impl<'a> Decoder<'a> {
                         let w = self.w64();
                         self.i1(Op::Push, w, self.e(&m, w))
                     }
-                    // far call/jmp
+                    // far call/jmp through a memory far pointer: m16:32, or
+                    // m16:64 with REX.W. A register form is invalid.
+                    3 | 5 if !m.is_reg => {
+                        let w = self.wv();
+                        let o = if (m.raw >> 3) & 7 == 5 { Op::JmpFar } else { Op::CallFar };
+                        self.i1(o, w, self.e(&m, w))
+                    }
                     _ => self.unk(),
                 });
             }

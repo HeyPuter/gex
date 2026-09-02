@@ -283,7 +283,16 @@ pub mod ctx {
     pub const SCRATCH: usize = X87 + 12 * 8;
 
     /// Total size of the context structure, rounded up.
-    pub const SIZE: usize = SCRATCH + 64;
+    /// The six segment selectors (es, cs, ss, ds, fs, gs), a `u32` each in
+    /// `Seg` order. A 64-bit process holds 0x33/0x2b; a WoW64 thread reloads
+    /// them on every 32/64 switch, and `cs` is what says which mode a block
+    /// of code runs in.
+    pub const SEG: usize = SCRATCH + 64;
+    /// The thread's three TLS descriptors (GDT entries 12..=14, selectors
+    /// 0x63/0x6b/0x73): the 32-bit base each holds, as set by
+    /// `set_thread_area`; a selector load of one of them installs the base.
+    pub const TLS: usize = SEG + 24;
+    pub const SIZE: usize = TLS + 24;
 
     /// Where the guest puts a system-call number: `x8`, or `rax` (`x(0)` in
     /// gex's numbering of x86-64 registers, which is the hardware's).

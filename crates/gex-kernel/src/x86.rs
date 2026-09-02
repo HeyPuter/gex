@@ -24,6 +24,103 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 const SIGCHLD: u64 = 17;
 
+/// The pseudo system register the lifter writes to load a segment register
+/// (`gex_lift_x86::sysreg::SEG_BASE - Seg`; the two must agree).
+pub const SYSREG_SEG_BASE: i32 = -200;
+
+/// Linux's fixed user selectors and TLS GDT entries.
+pub const USER32_CS: u16 = 0x23;
+pub const USER_DS: u16 = 0x2b;
+pub const USER_CS: u16 = 0x33;
+pub const TLS_ENTRY_MIN: u16 = 12;
+pub const TLS_ENTRIES: u16 = 3;
+
+/// The segment registers by number: es, cs, ss, ds, fs, gs.
+pub const SEG_CS: u8 = 1;
+pub const SEG_FS: u8 = 4;
+pub const SEG_GS: u8 = 5;
+
+use gex_abi::ctx;
+
+/// The selector `seg` holds.
+pub fn selector(m: &GuestMem<'_>, ctx_addr: u64, seg: u8) -> u16 {
+    m.read_u32(ctx_addr + ctx::SEG as u64 + seg as u64 * 4).unwrap_or(0) as u16
+}
+
+/// A thread's initial selectors: the 64-bit or 32-bit code segment, the
+/// flat data segment for ss/ds/es, nothing in fs/gs.
+pub fn init_segments(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool) {
+    let cs = if compat { USER32_CS } else { USER_CS };
+    for (seg, sel) in [(0u8, USER_DS), (1, cs), (2, USER_DS), (3, USER_DS), (4, 0), (5, 0)] {
+        let _ = m.write_u32(ctx_addr + ctx::SEG as u64 + seg as u64 * 4, sel as u32);
+    }
+}
+
+/// The base the descriptor `sel` names: a TLS entry's recorded base, zero for
+/// the flat selectors, the null selector, and anything unknown (an LDT
+/// selector, which nothing here sets up).
+pub fn segment_base(m: &GuestMem<'_>, ctx_addr: u64, ldt: &[u64], sel: u16) -> u64 {
+    let idx = sel >> 3;
+    if sel & 4 != 0 {
+        return ldt.get(idx as usize).copied().unwrap_or(0);
+    }
+    if (TLS_ENTRY_MIN..TLS_ENTRY_MIN + TLS_ENTRIES).contains(&idx) {
+        return m
+            .read_u64(ctx_addr + ctx::TLS as u64 + (idx - TLS_ENTRY_MIN) as u64 * 8)
+            .unwrap_or(0);
+    }
+    0
+}
+
+/// `mov seg, sel`: record the selector and, for fs and gs, install the base
+/// it names. cs, ss, ds and es are flat and only recorded.
+pub fn load_segment(m: &mut GuestMem<'_>, ctx_addr: u64, ldt: &[u64], seg: u8, sel: u16) {
+    let _ = m.write_u32(ctx_addr + ctx::SEG as u64 + seg as u64 * 4, sel as u32);
+    let slot = match seg {
+        SEG_FS => ctx::FS_BASE,
+        SEG_GS => ctx::GS_BASE,
+        _ => return,
+    };
+    let base = segment_base(m, ctx_addr, ldt, sel);
+    let _ = m.write_u64(ctx_addr + slot as u64, base);
+}
+
+/// A descriptor changed under a segment register: whichever of fs and gs
+/// holds `sel` reloads its base.
+pub fn refresh_segments(m: &mut GuestMem<'_>, ctx_addr: u64, ldt: &[u64], sel: u16) {
+    for (seg, slot) in [(SEG_FS, ctx::FS_BASE), (SEG_GS, ctx::GS_BASE)] {
+        if selector(m, ctx_addr, seg) == sel {
+            let base = segment_base(m, ctx_addr, ldt, sel);
+            let _ = m.write_u64(ctx_addr + slot as u64, base);
+        }
+    }
+}
+
+/// `set_thread_area`'s effect: TLS entry `entry` gets `base`, and a segment
+/// register currently holding that entry's selector sees the new base at
+/// once (glibc sets the entry and then loads %gs; a thread's descriptor may
+/// also be rewritten while %gs already points at it).
+pub fn set_tls(m: &mut GuestMem<'_>, ctx_addr: u64, entry: u16, base: u64) {
+    let _ = m.write_u64(ctx_addr + ctx::TLS as u64 + (entry - TLS_ENTRY_MIN) as u64 * 8, base);
+    for (seg, slot) in [(SEG_FS, ctx::FS_BASE), (SEG_GS, ctx::GS_BASE)] {
+        let sel = selector(m, ctx_addr, seg);
+        if sel & 4 == 0 && sel >> 3 == entry {
+            let _ = m.write_u64(ctx_addr + slot as u64, base);
+        }
+    }
+}
+
+/// A free TLS entry for `set_thread_area(-1)`: the first whose base is
+/// still zero, else the last.
+pub fn free_tls_entry(m: &GuestMem<'_>, ctx_addr: u64) -> u16 {
+    for i in 0..TLS_ENTRIES {
+        if m.read_u64(ctx_addr + ctx::TLS as u64 + i as u64 * 8).unwrap_or(0) == 0 {
+            return TLS_ENTRY_MIN + i;
+        }
+    }
+    TLS_ENTRY_MIN + TLS_ENTRIES - 1
+}
+
 /// x86-64 raw syscall numbers (`asm/unistd_64.h`).
 #[allow(dead_code)]
 pub mod raw {
@@ -146,6 +243,7 @@ pub mod raw {
     pub const SETPRIORITY: u64 = 141;
     pub const PRCTL: u64 = 157;
     pub const ARCH_PRCTL: u64 = 158;
+    pub const MODIFY_LDT: u64 = 154;
     pub const SETRLIMIT: u64 = 160;
     pub const SYNC: u64 = 162;
     pub const MOUNT: u64 = 165;
@@ -441,6 +539,7 @@ pub fn translate(
         x::SETPRIORITY => nr::SETPRIORITY,
         x::PRCTL => nr::PRCTL,
         x::ARCH_PRCTL => nr::ARCH_PRCTL,
+        x::MODIFY_LDT => nr::MODIFY_LDT,
         x::SYNC => nr::SYNC,
         x::MOUNT => nr::MOUNT,
         x::UMOUNT2 => nr::UMOUNT2,

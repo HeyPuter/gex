@@ -186,6 +186,8 @@ pub mod nr {
     /// Advisory calls a guest may issue and never checks: `fadvise64`,
     /// `readahead`, `mlock`... Answered with success and nothing done.
     pub const NOOP_OK: u64 = 0x1004;
+    /// `modify_ldt`: x86 only, no asm-generic number. See `sys_modify_ldt`.
+    pub const MODIFY_LDT: u64 = 0x1005;
 }
 
 /// `*at` calls use this to mean "relative to the current directory".
@@ -462,6 +464,10 @@ pub struct Kernel {
     /// ones (see `crate::i386`). Set at exec from the image's class,
     /// inherited across fork.
     pub compat: bool,
+    /// The process's LDT: the 32-bit base each entry holds, by index (zero
+    /// for an entry never written). `modify_ldt` writes it; a segment load of
+    /// a selector with TI=1 reads it. Shared by the threads, copied by fork.
+    pub ldt: Vec<u64>,
     /// The i386 process entered through the non-rt `sigreturn` (119), whose
     /// frame is laid out differently from `rt_sigreturn`'s. Set at entry,
     /// consumed by `sigreturn`.
@@ -1052,6 +1058,7 @@ impl Kernel {
             armed_place: None,
             armed_pin: None,
             compat: false,
+            ldt: Vec::new(),
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
@@ -1275,6 +1282,7 @@ impl Kernel {
             armed_place: None,
             armed_pin: None,
             compat: self.compat,
+            ldt: self.ldt.clone(),
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
@@ -1346,10 +1354,25 @@ impl Kernel {
         m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
         m.write_u64(child + ctx::TID as u64, tid as u64)?;
         if flags & clone_flags::SETTLS != 0 {
-            // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
-            // one's base into %fs.
-            let slot = if self.compat { ctx::TPIDRRO } else { ctx::TPIDR };
-            m.write_u64(child + slot as u64, tls)?;
+            if self.compat {
+                // A 32-bit thread: the descriptor (entry in the high word,
+                // base in the low, see `i386::translate`) goes into the
+                // child's TLS slot, and whichever of its fs/gs holds that
+                // selector sees the base.
+                let entry = (tls >> 32) as u16;
+                let base = tls & 0xffff_ffff;
+                if (crate::x86::TLS_ENTRY_MIN..crate::x86::TLS_ENTRY_MIN + crate::x86::TLS_ENTRIES)
+                    .contains(&entry)
+                {
+                    crate::x86::set_tls(m, child, entry, base);
+                }
+                // glibc's clone loads %gs with the descriptor's selector in
+                // the child before anything else runs; the child inherits
+                // the parent's register file here, so say it up front.
+                m.write_u64(child + ctx::TPIDRRO as u64, base)?;
+            } else {
+                m.write_u64(child + ctx::TPIDR as u64, tls)?;
+            }
         }
         if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
             m.write_u32(parent_tid, tid as u32)?;
@@ -2028,6 +2051,7 @@ impl Kernel {
             nr::TIMERFD_SETTIME => self.sys_timerfd_settime(m, a[0] as i32, a[1], a[2], a[3]),
             nr::TIMERFD_GETTIME => self.sys_timerfd_gettime(m, a[0] as i32, a[1]),
             nr::GETDENTS64 => self.sys_getdents(m, a[0] as i32, a[1], a[2]),
+            nr::MODIFY_LDT => self.sys_modify_ldt(m, a[0], a[1], a[2]),
             nr::FSTAT => self.sys_fstat(m, a[0] as i32, a[1]),
             nr::NEWFSTATAT => self.sys_fstatat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::STATX => self.sys_statx(m, a[0] as i32, a[1], a[2], a[4]),
@@ -5634,6 +5658,55 @@ impl Kernel {
         Ok(0)
     }
 
+    /// `modify_ldt(func, ptr, bytecount)`. Wine gives its 32-bit TEB a
+    /// selector this way from 64-bit code (the 64-bit ABI has no
+    /// set_thread_area): func 1 or 0x11 writes a `struct user_desc`, 0 reads
+    /// the table back. Only the base is kept -- gex has no segment limits
+    /// or rights to enforce -- and a segment register already holding the
+    /// entry's selector sees the new base at once.
+    fn sys_modify_ldt(&mut self, m: &mut GuestMem<'_>, func: u64, ptr: u64, count: u64) -> SysResult {
+        match func {
+            0 => {
+                let n = (count as usize).min(self.ldt.len() * 8);
+                let mut out = vec![0u8; n];
+                for (i, base) in self.ldt.iter().enumerate() {
+                    if i * 8 + 8 > n {
+                        break;
+                    }
+                    let b = *base as u32;
+                    out[i * 8 + 2..i * 8 + 4].copy_from_slice(&(b as u16).to_le_bytes());
+                    out[i * 8 + 4] = (b >> 16) as u8;
+                    out[i * 8 + 7] = (b >> 24) as u8;
+                    out[i * 8 + 5] = 0xf2; // present, DPL 3, data, read/write
+                }
+                m.write(ptr, &out)?;
+                Ok(n as u64)
+            }
+            1 | 0x11 => {
+                if count < 16 {
+                    return Err(Errno::EINVAL);
+                }
+                let entry = m.read_u32(ptr)? as usize;
+                let base = m.read_u32(ptr + 4)? as u64;
+                let flags = m.read_u32(ptr + 12)?;
+                if entry >= 8192 {
+                    return Err(Errno::EINVAL);
+                }
+                // An "empty" descriptor (read_exec_only and seg_not_present
+                // set, base zero) clears the entry.
+                let empty = flags & 0x28 == 0x28 && base == 0;
+                if self.ldt.len() <= entry {
+                    self.ldt.resize(entry + 1, 0);
+                }
+                self.ldt[entry] = if empty { 0 } else { base };
+                let sel = ((entry as u16) << 3) | 7;
+                crate::x86::refresh_segments(m, self.ctx_addr, &self.ldt, sel);
+                Ok(0)
+            }
+            _ => Err(Errno::ENOSYS),
+        }
+    }
+
     fn sys_sysinfo(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
         if buf == 0 {
             return Err(Errno::EFAULT);
@@ -5900,6 +5973,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::TIMERFD_SETTIME => "timerfd_settime",
         nr::TIMERFD_GETTIME => "timerfd_gettime",
         nr::GETDENTS64 => "getdents64",
+        nr::MODIFY_LDT => "modify_ldt",
         nr::LSEEK => "lseek",
         nr::READ => "read",
         nr::WRITE => "write",

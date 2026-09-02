@@ -145,17 +145,80 @@ mod imp {
 mod imp {
     use super::*;
     pub use gex_lift_x86::BlockLimits;
+    use gex_isa_x86::Mode;
+
+    /// Address ranges whose code runs in a mode other than the process's:
+    /// a WoW64 process is 64-bit with 32-bit DLLs mapped low, and the code
+    /// segment a far transfer lands in says which is which. Recorded by the
+    /// host when `cs` is loaded (`sysreg::SEG_CS`); consulted per block.
+    static MODE_RANGES: std::sync::RwLock<Vec<(u64, u64, Mode)>> = std::sync::RwLock::new(Vec::new());
+
+    /// Record that `[lo, hi)` holds `compat` (32-bit) or long-mode code.
+    pub fn set_mode_range(lo: u64, hi: u64, compat: bool) {
+        let mode = if compat { Mode::Compat } else { Mode::Long };
+        let mut v = MODE_RANGES.write().unwrap();
+        v.retain(|(a, b, _)| *b <= lo || *a >= hi);
+        v.push((lo, hi, mode));
+    }
+
+    thread_local! {
+        /// The mode of the thread whose dispatch miss is being served: the
+        /// code segment it holds decides how the bytes it is about to run
+        /// are decoded. A WoW64 process has 32-bit and 64-bit code at
+        /// addresses nothing distinguishes (everything is below 4 GiB
+        /// here), so the executing thread's `cs` is the only witness.
+        static THREAD_MODE: std::cell::Cell<Option<Mode>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Say which mode the thread now being served runs in (`None`: the
+    /// process default, or a recorded range).
+    pub fn set_thread_mode(compat: Option<bool>) {
+        THREAD_MODE.with(|m| {
+            m.set(compat.map(|c| if c { Mode::Compat } else { Mode::Long }))
+        });
+    }
+
+    /// The mode code at `pc` is decoded in: the serving thread's, else a
+    /// recorded range, else the process's own.
+    pub fn mode_at(pc: u64) -> Mode {
+        if let Some(m) = THREAD_MODE.with(|m| m.get()) {
+            return m;
+        }
+        let v = MODE_RANGES.read().unwrap();
+        for (lo, hi, m) in v.iter() {
+            if pc >= *lo && pc < *hi {
+                return *m;
+            }
+        }
+        gex_isa_x86::mode()
+    }
+
+    /// The mode each page's blocks were last lifted in, so a code-segment
+    /// switch into a page can tell whether its translations still apply.
+    static PAGE_MODES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Mode>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    /// Whether `[target]`'s page holds blocks lifted in the *other* mode from
+    /// the one a transfer with `compat` lands in: those translations are
+    /// stale and must be retired before the page is entered.
+    pub fn page_mode_conflicts(target: u64, compat: bool) -> bool {
+        let want = if compat { Mode::Compat } else { Mode::Long };
+        let page = target >> 12;
+        PAGE_MODES.lock().unwrap().get(&page).is_some_and(|m| *m != want)
+    }
 
     pub fn lift_block(
         fetch: impl Fn(u64, &mut FetchBuf) -> usize,
         start: u64,
         limits: BlockLimits,
     ) -> Block {
-        gex_lift_x86::lift_block(fetch, start, limits)
+        let mode = mode_at(start);
+        PAGE_MODES.lock().unwrap().insert(start >> 12, mode);
+        gex_lift_x86::lift_block(fetch, start, limits, mode)
     }
 
     pub fn decodable(bytes: &[u8], pc: u64) -> bool {
-        !bytes.is_empty() && gex_isa_x86::decode(bytes, pc).is_known()
+        !bytes.is_empty() && gex_isa_x86::decode_in(mode_at(pc), bytes, pc).is_known()
     }
 
     /// A linear sweep of the code: every `lea reg, [rip+disp]` and every
@@ -179,7 +242,7 @@ mod imp {
             }
             let off = (a - vaddr) as usize;
             let avail = (bytes.len() - off).min(16);
-            let inst = gex_isa_x86::decode(&bytes[off..off + avail], a);
+            let inst = gex_isa_x86::decode_in(mode_at(a), &bytes[off..off + avail], a);
             match (inst.op, inst.ops[1]) {
                 (Op::Lea, Some(Operand::Mem(m))) if m.rip => {
                     let t = m.disp as u64;
@@ -232,7 +295,7 @@ mod imp {
                     a += 1;
                     continue;
                 }
-                let inst = gex_isa_x86::decode(&buf[..n], a);
+                let inst = gex_isa_x86::decode_in(mode_at(a), &buf[..n], a);
                 if inst.is_known() {
                     emit(a);
                 }
@@ -242,7 +305,7 @@ mod imp {
     }
 
     pub fn disasm(bytes: &[u8], pc: u64) -> (String, usize) {
-        let inst = gex_isa_x86::decode(bytes, pc);
+        let inst = gex_isa_x86::decode_in(mode_at(pc), bytes, pc);
         let n = inst.len as usize;
         let hex: String = bytes[..n.min(bytes.len())]
             .iter()

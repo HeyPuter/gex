@@ -3524,6 +3524,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         write_u64(data, c + ctx::x(i), 0);
     }
     write_u64(data, c + ctx::SP, layout.sp);
+    gex_kernel::x86::init_segments(&mut GuestMem::new(data), c as u64, program.compat());
     write_u64(data, c + ctx::PC, program.entry());
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
@@ -7211,6 +7212,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // same address by construction -- see `BLOB_RESERVE` -- and the argv on
     // it is this process's.
     write_u64(data, c + ctx::SP, layout.sp);
+    gex_kernel::x86::init_segments(
+        &mut GuestMem::new(data),
+        c as u64,
+        program.as_ref().map(|p| p.compat()).unwrap_or(false),
+    );
     let entry = match (&program, &restored) {
         (Some(p), _) => p.entry(),
         (None, Some(l)) => l.entry,
@@ -9308,7 +9314,13 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     trap();
 }
 #[no_mangle]
-pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
+pub extern "C" fn gex_sysreg_read(ctx: i32, _pc: i64, reg: i32) -> i64 {
+    // A segment register read: the selector it holds.
+    let sb = gex_kernel::x86::SYSREG_SEG_BASE;
+    if reg <= sb && reg > sb - 6 {
+        let gm = GuestMem::new(guest_bytes());
+        return gex_kernel::x86::selector(&gm, ctx as u32 as u64, (sb - reg) as u8) as i64;
+    }
     match reg {
         // CNTVCT_EL0, at the frequency the lifter tells the guest CNTFRQ is,
         // so the guest's own arithmetic on it comes out exact.
@@ -9321,6 +9333,29 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
 }
 #[no_mangle]
 pub extern "C" fn gex_sysreg_write(ctx: i32, _pc: i64, reg: i32, val: i64) {
+    // A segment register load. For cs the value also names the code the
+    // transfer lands in, whose mode the selector decides (0x23: 32-bit).
+    let sb = gex_kernel::x86::SYSREG_SEG_BASE;
+    if reg <= sb && reg > sb - 6 {
+        let mut gm = GuestMem::new(guest_bytes());
+        let seg = (sb - reg) as u8;
+        let ldt = with_host(|h| h.kernel.ldt.clone());
+        if seg == gex_kernel::x86::SEG_CS {
+            let sel = (val as u64 >> 48) as u16;
+            let target = val as u64 & 0xffff_ffff_ffff;
+            gex_kernel::x86::load_segment(&mut gm, ctx as u32 as u64, &ldt, seg, sel);
+            // A page translated in the other mode is stale for the code this
+            // switch lands in: retire it, as self-modifying code is.
+            let compat = sel == gex_kernel::x86::USER32_CS;
+            if gex_xlate::page_mode_conflicts(target, compat) {
+                drop(gm);
+                gex_cache_op(ctx, _pc, gex_abi::cache_op::IC_INVALIDATE, target as i64);
+            }
+        } else {
+            gex_kernel::x86::load_segment(&mut gm, ctx as u32 as u64, &ldt, seg, val as u16);
+        }
+        return;
+    }
     // The x86-64 lifter's `cpuid`: the leaf and subleaf arrive in `val`, the
     // four results go back into the context.
     if reg == gex_kernel::x86::SYSREG_CPUID {
@@ -9651,9 +9686,16 @@ pub extern "C" fn gex_my_pid() -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
+pub extern "C" fn gex_dispatch_miss(ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
     LAST_MISS_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
+    // The code this thread is about to run is decoded in the mode its code
+    // segment says (a WoW64 thread crosses between 32- and 64-bit code).
+    {
+        let gm = GuestMem::new(guest_bytes());
+        let cs = gex_kernel::x86::selector(&gm, ctx as u32 as u64, gex_kernel::x86::SEG_CS);
+        gex_xlate::set_thread_mode(if cs == 0 { None } else { Some(cs == gex_kernel::x86::USER32_CS) });
+    }
     watch_mem("miss");
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator

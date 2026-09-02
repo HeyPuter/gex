@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 use gex_ir::*;
+use gex_isa_x86::Mode;
 use gex_isa_x86::{Cond, Inst, Mem, Op, Operand, Reg, Rep, Seg, Width};
 
 mod block;
@@ -28,6 +29,14 @@ pub use block::{lift_block, BlockLimits};
 pub mod sysreg {
     /// `rdtsc`: the host's monotonic counter (the A64 `CNTVCT_EL0` code).
     pub const TSC: i32 = -3;
+    /// The segment registers, `-200 - Seg`: a write carries the selector
+    /// (and for `cs`, `selector << 48 | target`: the host records the mode
+    /// of the code the transfer lands in); a read answers the selector.
+    pub const SEG_BASE: i32 = -200;
+    pub fn seg(s: gex_isa_x86::Seg) -> i32 {
+        SEG_BASE - s as i32
+    }
+    pub const SEG_CS: i32 = SEG_BASE - 1;
     /// `cpuid`: written with `eax | ecx << 32`; the host fills
     /// `eax`, `ebx`, `ecx`, `edx` in the context.
     pub const CPUID: i32 = -100;
@@ -58,6 +67,9 @@ pub struct Lifter<'a> {
     b: &'a mut Builder,
     flags: FlagSource,
     raw: u32,
+    /// The mode the block is decoded in: the width of addresses, of pushed
+    /// return addresses, and whether `int 0x80` is a system call.
+    mode: Mode,
     /// The instruction being lifted and where it is.
     pc: u64,
     next: u64,
@@ -93,11 +105,12 @@ fn mem_sz(w: Width) -> MemSz {
 }
 
 impl<'a> Lifter<'a> {
-    pub fn new(b: &'a mut Builder, flags: FlagSource, raw: u32) -> Lifter<'a> {
+    pub fn new(b: &'a mut Builder, flags: FlagSource, raw: u32, mode: Mode) -> Lifter<'a> {
         Lifter {
             b,
             flags,
             raw,
+            mode,
             pc: 0,
             next: 0,
             cur_mem: Operand::Imm(0),
@@ -107,11 +120,26 @@ impl<'a> Lifter<'a> {
     /// The address width of the code being lifted: the size of a pushed
     /// return address, of what `ret` pops, of an indirect branch target.
     fn wa(&self) -> Width {
-        if gex_isa_x86::mode() == gex_isa_x86::Mode::Compat {
+        if self.mode == Mode::Compat {
             Width::D
         } else {
             Width::Q
         }
+    }
+
+    /// Load `cs` with `sel` for a transfer landing at `target`: the host
+    /// records the selector and, for the code the transfer lands in, the mode
+    /// that selector means (0x23 is 32-bit, 0x33 64-bit).
+    fn switch_cs(&mut self, sel: Value, target: Value) {
+        let sh = self.k64(48);
+        let hi = self.b.bin(BinOp::Shl, Ty::I64, sel, sh);
+        let v = self.b.bin(BinOp::Or, Ty::I64, hi, target);
+        let pcv = self.k64(self.pc);
+        let id = self.k32(sysreg::SEG_CS as u32);
+        self.b.stmt(Stmt::HostCall {
+            func: HostFunc::SysRegWrite,
+            args: vec![pcv, id, v],
+        });
     }
 
     /// An indirect branch target: read at the address width, as an `I64`.
@@ -174,7 +202,16 @@ impl<'a> Lifter<'a> {
                 let m = self.k32(0xff);
                 self.b.bin(BinOp::And, Ty::I32, v, m)
             }
-            Reg::Seg(_) => self.k32(0),
+            Reg::Seg(s) => {
+                let pcv = self.k64(self.pc);
+                let id = self.k32(sysreg::seg(s) as u32);
+                let v = self.b.def(Expr::HostCall {
+                    func: HostFunc::SysRegRead,
+                    args: vec![pcv, id],
+                    ty: Ty::I64,
+                });
+                self.b.wrap(v)
+            }
             // Vector and x87 registers are read by their own paths.
             Reg::Xmm(_) | Reg::Mm(_) | Reg::St(_) => self.k64(0),
         }
@@ -211,7 +248,22 @@ impl<'a> Lifter<'a> {
                 let v = self.b.bin(BinOp::Or, Ty::I64, old, val);
                 self.wr64(n, v);
             }
-            Reg::Seg(_) | Reg::Xmm(_) | Reg::Mm(_) | Reg::St(_) => {}
+            Reg::Seg(sg) => {
+                // A selector load: the host resolves it against the
+                // descriptor tables and installs the base (fs, gs).
+                // Callers hand a 16- or 32-bit value in an `I32`.
+                let mask = self.k32(0xffff);
+                let v = val;
+                let v = self.b.bin(BinOp::And, Ty::I32, v, mask);
+                let v = self.b.extend(v, false);
+                let pcv = self.k64(self.pc);
+                let id = self.k32(sysreg::seg(sg) as u32);
+                self.b.stmt(Stmt::HostCall {
+                    func: HostFunc::SysRegWrite,
+                    args: vec![pcv, id, v],
+                });
+            }
+            Reg::Xmm(_) | Reg::Mm(_) | Reg::St(_) => {}
         }
     }
 
@@ -674,7 +726,6 @@ impl<'a> Lifter<'a> {
             Op::Push => {
                 let v = match i.op0() {
                     Operand::Imm(imm) => self.k(ty, (imm as u64) & w.mask()),
-                    Operand::Reg(Reg::Seg(_)) => self.k(ty, 0),
                     o => self.rd(o, w),
                 };
                 self.push(w, v);
@@ -682,9 +733,7 @@ impl<'a> Lifter<'a> {
             }
             Op::Pop => {
                 let v = self.pop(w);
-                if !matches!(i.op0(), Operand::Reg(Reg::Seg(_))) {
-                    self.wr(i.op0(), w, v);
-                }
+                self.wr(i.op0(), w, v);
                 Flow::Next
             }
             Op::Xchg => {
@@ -1152,6 +1201,99 @@ impl<'a> Lifter<'a> {
                     }),
                     None => unreachable!(),
                 }
+            }
+            Op::JmpFar | Op::CallFar => {
+                // Offset and selector: immediates, or a far pointer in memory
+                // (offset at the operand width, selector in the two bytes
+                // after it).
+                let (off, sel) = match i.op0() {
+                    Operand::Imm(o) => {
+                        let Some(Operand::Imm(s)) = i.ops[1] else {
+                            return Flow::End(Term::Illegal { raw: self.raw, pc });
+                        };
+                        (self.k64(o as u64), self.k64(s as u64 & 0xffff))
+                    }
+                    Operand::Mem(m) => {
+                        // m16:32, or m16:64 with REX.W: the offset at the
+                        // operand width, the selector in the two bytes after.
+                        let off = self.rd(Operand::Mem(m), w);
+                        let off = if w == Width::Q { off } else { self.b.extend(off, false) };
+                        let mut ms = m;
+                        ms.disp = ms.disp.wrapping_add(w.bytes() as i64);
+                        let s = self.load(&ms, Width::W);
+                        (off, self.b.extend(s, false))
+                    }
+                    _ => return Flow::End(Term::Illegal { raw: self.raw, pc }),
+                };
+                if i.op == Op::CallFar {
+                    let wa = self.wa();
+                    let cs = self.rd_reg(Reg::Seg(Seg::Cs));
+                    let cs = if wa == Width::Q { self.b.extend(cs, false) } else { cs };
+                    self.push(wa, cs);
+                    let ret = if wa == Width::Q { self.k64(next) } else { self.k32(next as u32) };
+                    self.push(wa, ret);
+                }
+                self.switch_cs(sel, off);
+                Flow::End(Term::Indirect {
+                    target: off,
+                    is_ret: false,
+                })
+            }
+            Op::Retf => {
+                let wa = self.wa();
+                let target = self.pop(wa);
+                let target = if wa == Width::Q { target } else { self.b.extend(target, false) };
+                let cs = self.pop(wa);
+                let cs = if wa == Width::Q { cs } else { self.b.extend(cs, false) };
+                if let Some(Operand::Imm(n)) = i.ops[0] {
+                    if n != 0 {
+                        let sp = self.rd64(RSP);
+                        let k = self.k64(n as u64);
+                        let sp = self.b.bin(BinOp::Add, Ty::I64, sp, k);
+                        self.wr64(RSP, sp);
+                    }
+                }
+                self.switch_cs(cs, target);
+                Flow::End(Term::Indirect {
+                    target,
+                    is_ret: true,
+                })
+            }
+            Op::Iret => {
+                // The user-mode frame: rip, cs, rflags, rsp, ss -- five
+                // words at the operand width (`iretq` is the one Wine's
+                // WoW64 switch uses; the 32-bit one is three words unless the
+                // privilege level changes, which it never does here).
+                let pop = |me: &mut Self| -> Value {
+                    let v = me.pop(w);
+                    if w == Width::Q { v } else { me.b.extend(v, false) }
+                };
+                let rip = pop(self);
+                let cs = pop(self);
+                let fl = pop(self);
+                let fl32 = self.b.wrap(fl);
+                self.unpack_flags_low(fl32);
+                let ten = self.k32(10);
+                let one = self.k32(1);
+                let d = self.b.bin(BinOp::ShrU, Ty::I32, fl32, ten);
+                let d = self.b.bin(BinOp::And, Ty::I32, d, one);
+                self.write_flag(GuestReg::D, d);
+                let eleven = self.k32(11);
+                let o = self.b.bin(BinOp::ShrU, Ty::I32, fl32, eleven);
+                let o = self.b.bin(BinOp::And, Ty::I32, o, one);
+                self.write_flag(GuestReg::V, o);
+                if w == Width::Q {
+                    let rsp = pop(self);
+                    let ss = pop(self);
+                    self.wr64(RSP, rsp);
+                    let ss32 = self.b.wrap(ss);
+                    self.wr_reg(Reg::Seg(Seg::Ss), ss32);
+                }
+                self.switch_cs(cs, rip);
+                Flow::End(Term::Indirect {
+                    target: rip,
+                    is_ret: true,
+                })
             }
             Op::Ret => {
                 let wa = self.wa();

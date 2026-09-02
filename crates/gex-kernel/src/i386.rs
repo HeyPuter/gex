@@ -110,6 +110,7 @@ pub mod raw {
     pub const FSYNC: u64 = 118;
     pub const CLONE: u64 = 120;
     pub const UNAME: u64 = 122;
+    pub const MODIFY_LDT: u64 = 123;
     pub const MPROTECT: u64 = 125;
     pub const GETPGID: u64 = 132;
     pub const FCHDIR: u64 = 133;
@@ -788,6 +789,7 @@ pub fn translate(
         x::ARCH_PRCTL => nr::ARCH_PRCTL,
         x::PERSONALITY => nr::NOOP_OK,
         x::UNAME => nr::UNAME,
+        x::MODIFY_LDT => nr::MODIFY_LDT,
         x::SYSINFO => nr::SYSINFO,
         x::GETRANDOM => nr::GETRANDOM,
         x::RT_SIGACTION => nr::RT_SIGACTION,
@@ -851,25 +853,39 @@ pub fn translate(
             // clone(flags, stack, parent_tid, tls, child_tid): the canonical
             // order already. `tls` is a `struct user_desc *`, not a base.
             if a[0] & CLONE_SETTLS != 0 && a[3] != 0 {
-                a[3] = m.read_u32(a[3] + 4).unwrap_or(0) as u64;
+                // The entry travels in the high word, the base in the low:
+                // `sys_clone` installs the descriptor in the child.
+                let entry = m.read_u32(a[3]).unwrap_or(0) as u64;
+                let base = m.read_u32(a[3] + 4).unwrap_or(0) as u64;
+                a[3] = base | (entry << 32);
             }
             nr::CLONE
         }
         x::CLONE3 => nr::CLONE3,
         x::SET_THREAD_AREA => {
             // struct user_desc { int entry_number; u32 base_addr; u32 limit;
-            // u32 bitfields }. Linux allots GDT entries 6..=8 to TLS; -1
-            // asks for a free one. There is one segment base register for
-            // %gs, which is the register i386 programs load the entry into,
-            // so the base is installed there directly (see `sys_clone` for
-            // the same shortcut on a new thread).
+            // u32 bitfields }. The TLS GDT entries are 12..=14 (selectors
+            // 0x63, 0x6b, 0x73); -1 asks for a free one. The base takes
+            // effect when a segment register loads the entry's selector
+            // (`mov %gs` right after, in glibc), or at once if one already
+            // holds it.
             let p = a[0];
             let entry = m.read_u32(p).unwrap_or(0) as i32;
             let base = m.read_u32(p + 4).unwrap_or(0) as u64;
-            if entry == -1 {
-                let _ = m.write_u32(p, 6);
+            let entry = if entry == -1 {
+                let e = crate::x86::free_tls_entry(m, ctx_addr);
+                let _ = m.write_u32(p, e as u32);
+                e
+            } else {
+                entry as u16
+            };
+            if !(crate::x86::TLS_ENTRY_MIN..crate::x86::TLS_ENTRY_MIN + crate::x86::TLS_ENTRIES)
+                .contains(&entry)
+            {
+                *a = [0; 6];
+                return (UNKNOWN, post);
             }
-            let _ = m.write_u64(ctx_addr + gex_abi::ctx::GS_BASE as u64, base);
+            crate::x86::set_tls(m, ctx_addr, entry, base);
             *a = [0; 6];
             nr::NOOP_OK
         }

@@ -21,7 +21,7 @@
 pub mod decode;
 pub mod fmt;
 
-pub use decode::decode;
+pub use decode::{decode, decode_in};
 
 /// Longest legal x86 instruction.
 pub const MAX_INST_BYTES: usize = 15;
@@ -357,6 +357,15 @@ pub enum Op {
     Leave,
     Enter,
     Syscall,
+    /// Far transfers, which may change the code segment and with it the
+    /// mode (see `Mode`): `jmp ptr16:32` / `jmp m16:32|64`, `call` likewise,
+    /// `retf [imm16]`, `iret`. Operands: for the direct forms
+    /// `[Imm(offset), Imm(selector)]`; for the indirect ones `[Mem]` holding
+    /// the offset with the selector after it; `Retf` carries its immediate.
+    JmpFar,
+    CallFar,
+    Retf,
+    Iret,
     Int3,
     Int,
     Hlt,

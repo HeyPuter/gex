@@ -672,8 +672,6 @@ mod iframe {
 
     pub const USER32_CS: u32 = 0x23;
     pub const USER_DS: u32 = 0x2b;
-    /// The TLS entry glibc's i386 port loads into %gs: GDT entry 6, RPL 3.
-    pub const GS_TLS: u32 = 0x33;
 }
 
 fn setup_frame_i386(
@@ -747,8 +745,8 @@ fn setup_frame_i386(
         frame_addr + iframe::SF_SC
     };
 
-    m.write_u32(sc + iframe::SC_GS, iframe::GS_TLS)?;
-    m.write_u32(sc + iframe::SC_FS, 0)?;
+    m.write_u32(sc + iframe::SC_GS, crate::x86::selector(m, ctx_addr, crate::x86::SEG_GS) as u32)?;
+    m.write_u32(sc + iframe::SC_FS, crate::x86::selector(m, ctx_addr, crate::x86::SEG_FS) as u32)?;
     m.write_u32(sc + iframe::SC_ES, iframe::USER_DS)?;
     m.write_u32(sc + iframe::SC_DS, iframe::USER_DS)?;
     for (i, reg) in iframe::GPR_ORDER.iter().enumerate() {

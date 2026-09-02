@@ -1089,6 +1089,37 @@ fn fetch_code_bytes(
 /// host refreshes this before each translation.
 static VOLATILE_RANGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
+/// The mode of the thread whose dispatch miss is being served, from its
+/// code segment (`Some(true)`: 32-bit). Cleared with `None`. No-op on the
+/// AArch64 guest.
+pub fn set_thread_mode(compat: Option<bool>) {
+    #[cfg(feature = "x86")]
+    arch::set_thread_mode(compat);
+    #[cfg(not(feature = "x86"))]
+    let _ = compat;
+}
+
+/// Whether `target`'s page was last translated in the other mode from the
+/// one a code-segment switch lands in (see `arch::page_mode_conflicts`).
+pub fn page_mode_conflicts(target: u64, compat: bool) -> bool {
+    #[cfg(feature = "x86")]
+    return arch::page_mode_conflicts(target, compat);
+    #[cfg(not(feature = "x86"))]
+    {
+        let _ = (target, compat);
+        false
+    }
+}
+
+/// A range of code in the other mode from the process's own (a WoW64
+/// process's 32-bit DLLs). No-op on the AArch64 guest.
+pub fn set_mode_range(lo: u64, hi: u64, compat: bool) {
+    #[cfg(feature = "x86")]
+    arch::set_mode_range(lo, hi, compat);
+    #[cfg(not(feature = "x86"))]
+    let _ = (lo, hi, compat);
+}
+
 /// Whether the code this translator sees is 32-bit (i386 compatibility
 /// mode). One setting per process: a 32-bit program is 32-bit throughout.
 /// On the AArch64 guest there is no such mode and this is a no-op.
