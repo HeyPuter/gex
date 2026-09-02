@@ -14,6 +14,13 @@ ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 OUT=${TMPDIR:-/tmp}/gex-drawrate
 DRAWS=${1:-2000}
 mkdir -p "$OUT"
+# A busy machine invalidates the answer. Measurements here have swung by 30%
+# between a load average of 3 and one of 24 -- enough to make a change look
+# like a regression, and to make a regression look like a win.
+load=$(cut -d' ' -f1 /proc/loadavg)
+if [ "${load%%.*}" -gt 4 ]; then
+    echo "load average is $load; wait for the machine to go quiet before trusting this" >&2
+fi
 for src in gl-drawrate gl-drawrate-state; do
     cc -O2 -o "$OUT/$src" "$ROOT/tests/$src.c" -lGL -lX11
 done
