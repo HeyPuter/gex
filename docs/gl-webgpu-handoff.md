@@ -7545,3 +7545,96 @@ does name 3.2 or later, or that names a profile mask, is unchanged.
 
 This is also why `tests/gl44-probe.sh shadow` carries both shader spellings:
 until this, the same probe saw Compatibility natively and Core in the browser.
+
+
+## Two crashes from the sweep, and a bug my own shadow pass introduced (2026-09-02)
+
+**`samplers_array`: an array of combined samplers.** `uniform sampler2D
+tex[8]` is ordinary GLSL and `gex_wgpu_split_combined_samplers` refused it
+outright -- `if (var->type != type ...) return false` -- which failed the link
+and then tripped the demo's own `assert(loc >= 0)` on the uniform location it
+could not find. A plain one-dimensional array is now split into one
+texture/sampler pair per unit, `binding = 2 * unit` and `2 * unit + 1` as
+before, with `driver_location` the unit so the driver's slot model is
+unchanged. Sixteen pairs for that demo.
+
+Two things the change had to get right. A *dynamically* indexed array cannot
+be split at all -- WGSL has no array of textures to index and the unit is only
+known at run time -- so the pass now scans for
+`nir_tex_src_texture_offset`/`sampler_offset` **before** rewriting anything and
+refuses if it finds one: a half-split shader is worse than a refused one. And
+the variable is retired once per variable rather than once per unit; removing
+the same `exec_node` twice corrupts the list.
+
+**`shadow_sampler`: `sampler2DRectShadow`, and the pass that broke it.** With
+the projective-reference fix in place this demo still failed, now with
+
+```
+error: line:73: Result Type has 1 components, but 2 expected
+```
+
+on `%40 = OpImageQuerySizeLod %int %39 %int_0`. The cause was
+`gex_wgpu_lower_old_style_shadow` itself. **A size query derived from a shadow
+lookup keeps its `is_shadow` flag** -- `nir_lower_tex`'s rect lowering builds
+one through `nir_get_texture_size`, which copies both shadow flags -- so a
+`txs` on a 2D shadow texture matched the pass's condition, had its two
+components collapsed to one, and was splatted back out. The shader then divided
+its coordinate by `vec2(width, width)`. `nir_tex_instr_is_query(tex)` is now
+part of the guard.
+
+Worth keeping: `GEX_WGPU_TEX_LOG=1` prints every texture instruction's op,
+dimension, array-ness, both shadow flags, its component count and the count
+`nir_tex_instr_result_size` says it should have, at three points -- on entry,
+after the base `nir_lower_tex`, and before ntv. That is what found this in one
+run after a long stretch of reasoning about which pass could possibly have
+built a one-component query. The answer was that none of them did; a later
+pass shrank it.
+
+`nir_tex_instr_result_size` disagreeing with `def.num_components` is a
+malformed instruction that neither `nir_validate` nor the SPIR-V emitter
+objects to -- it becomes a wrong result type and Tint's complaint arrives with
+no NIR in sight. The log line prints both numbers side by side for that
+reason.
+
+
+## Cascaded and cube shadow maps (2026-09-02)
+
+Widening the depth-format targets past plain 2D turned up three more defects,
+all in the same place: **the depth attachment was never treated as a slice.**
+
+`is_format_supported` answered "no depth format exists" for anything but
+`PIPE_TEXTURE_2D`, and st/mesa has no fallback for that -- it asserts inside
+`_mesa_choose_texture_format`, which is how `shadow_sampler` died once its
+shaders started linking (a `GL_TEXTURE_RECTANGLE` depth texture). A rectangle
+texture *is* a 2D texture with unnormalised coordinates, and WGSL has
+`texture_depth_2d_array` and `texture_depth_cube`, so RECT, 2D_ARRAY, CUBE and
+CUBE_ARRAY are all expressible; multisampling stays 2D-only, which is also all
+WebGPU offers.
+
+Claiming them was not enough, and `tests/gl44-probe.sh depth-array` is what
+said so -- eight cases, a two-layer depth array and a depth cube, each layer
+or face rendered with a depth on the opposite side of the same reference so a
+lookup that reads the wrong one fails rather than passing by luck. Three
+things had to be fixed before it passed:
+
+- **`set_framebuffer_state` refused any depth buffer past level 0, layer 0**
+  and failed the context otherwise, so attaching the second cascade of a
+  shadow map latched everything. It now accepts one level and one layer,
+  whichever they are, and records them the way the colour targets already did.
+- **The render pass's depth view was built with a NULL descriptor**, which
+  views the whole texture. WebGPU refuses an attachment with more than one
+  layer -- `The layer count (2) ... used as attachment is greater than 1` --
+  so every depth array failed, and a depth mip level other than the first was
+  silently rendered into level zero.
+- **The depth clear built its own NULL-descriptor view**, with the same
+  result: one invalid command buffer, and with it every later submit. It takes
+  the level and layer from the surface it was handed.
+
+The pass key gained the depth level and layer too, or a pass rendering one
+cascade would be reused for the next.
+
+Why this matters more than a probe passing: a cascaded shadow map is a depth
+2D array and an omnidirectional shadow map is a depth cube. Both were
+unreachable -- the first attach latched the context -- and nothing in the
+sweep said so, because the programs that use them are engines rather than
+demos.
