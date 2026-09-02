@@ -904,6 +904,21 @@ impl Xwm {
         // And which window it is: a GL client names its drawable, and the
         // compositor has no other way to know which surface that became.
         client.set_xid(surface, window);
+        // Publish it even before the X server has anything to commit.
+        //
+        // Xwayland commits a window's surface when the window is damaged, and
+        // a client whose drawing goes to the host's GL rather than through X
+        // never damages anything: SDL's window has no background, so not even
+        // the initial fill happens. Xwayland created the surface, set its
+        // input region and allocated a 640x480 pool for SuperTuxKart -- and
+        // never committed, so the compositor never learned the window
+        // existed and had nowhere to put the frames the host was drawing.
+        //
+        // A window this manager has adopted is a window that exists, which is
+        // reason enough to publish it. It is not a claim about where the
+        // pixels are: a buffer is still uploaded whenever one arrives, so an
+        // ordinary X client is unaffected beyond appearing a frame earlier.
+        client.attach_external(surface, w.w.max(1), w.h.max(1));
         if let Some(e) = self.windows.get_mut(&window) {
             e.announced = true;
         }
