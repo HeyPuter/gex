@@ -76,7 +76,7 @@ if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
 // console.debug -> stdout) on the same stream as the syscall log and the crash
 // report (stderr): two streams interleave arbitrarily and the stdout tail is
 // lost when the process is killed, which hides the very blocks before a crash.
-if (typeof process !== 'undefined' && process.env?.GEX_TRACE_BLOCKS) {
+if (typeof process !== 'undefined' && (process.env?.GEX_TRACE_BLOCKS || process.env?.GEX_SYNC_CONSOLE)) {
   // Synchronous, too: a Worker's console goes through the main thread
   // asynchronously, and the megabytes a crashing process traces just before
   // it is killed never arrive -- the one stretch the trace is for.
