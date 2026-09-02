@@ -6592,4 +6592,60 @@ for twice:
 Also worth knowing: the driver dumps the first 24 distinct vertex shaders it
 sees, unconditionally, with each one's input mask and `missing` mask. For STK
 every shape reports `missing 0x0`, so no draw is collapsing for want of an
-attribute.
+attribute. STK uses eleven vertex shaders in all.
+
+### Narrowing it with a draw bisection
+
+`GEX_WGPU_DRAW_LIMIT=n` keeps the first n draws of every frame and
+`GEX_WGPU_DRAW_ONLY=n` keeps only draw n, counted at the outermost `draw_vbo`
+and reset at each present. With a frame of a few dozen draws that turns "which
+draw puts nothing on screen" into a bisection, which is the only way to ask it
+here: the draws are submitted, their attributes are all supplied, no state is
+refused and no validation error is raised, and they still produce no pixels.
+
+What it says about STK:
+
+* `GEX_WGPU_DRAW_LIMIT=4` and `=12` are **blank** -- not "missing an object",
+  entirely empty. The first twelve draws of the frame contribute nothing.
+* Those are the large meshes: from the trace, draws 0-11 carry 12, 6258, 2772,
+  3558, 72, 96, 120, 210, 4683, 45, 18 and 1200 vertices.
+* `GEX_WGPU_DRAW_ONLY=1` and `=17` are blank on a cleared framebuffer, with
+  nothing else drawn that could hide them. So the geometry genuinely
+  rasterises nothing; it is not being painted over, which also rules out the
+  no-depth-test skybox pass covering the scene.
+* `=41` is the full broken image with the HUD cut off, so the HUD is issued
+  after draw 41 and the scene occupies the draws before it.
+
+The conclusion is that **everything visible in STK's frame is the skybox and
+the HUD**, and every mesh in the scene is being transformed out of the frame
+or otherwise producing no coverage. That is the same signature the comment
+beside the constant-buffer dump already describes: *"if it arrives wrong every
+scene vertex leaves the frustum while the skybox -- one attribute, no depth
+test, its own matrix path -- still lands."* The object shader reads vertex-stage
+UBO slots 0 and 3.
+
+Two more hypotheses eliminated while chasing that:
+
+* **A stale UBO under batching.** `glBufferSubData` to a uniform buffer while
+  draws sit recorded-but-unsubmitted would let every batched draw read the
+  last matrix written. It does not happen: `gex_wgpu_buffer_subdata` flushes
+  the batch through `gex_wgpu_batch_conflicts_usage`, and both stages' UBOs
+  are registered with `gex_wgpu_batch_touch`.
+* **A rejected UBO binding.** `set_constant_buffer` refuses an offset that is
+  not 256-byte aligned, but the driver advertises
+  `constant_buffer_offset_alignment = 256`, so st/mesa never hands it one --
+  and the refusal is loud, while STK's run logs none.
+
+The obvious next step is to see the matrix. That is harder than it looks:
+STK's UBO has no CPU shadow, because it is only ever written through
+`gex_wgpu_buffer_subdata`, whose aligned fast path sends bytes straight to the
+queue and deliberately keeps no copy. Excluding `PIPE_BIND_CONSTANT_BUFFER`
+from the staged-map path does not help -- the buffer is never mapped at all.
+Reading it back on the GPU inside the dump, or teaching `buffer_subdata` to
+keep a shadow behind a debug flag, is what it will take.
+
+(The comment on the staged-map condition claims "Index and constant buffers
+keep the shadow", and the condition below it only excludes index buffers. The
+comment in `gex_wgpu_buffer_subdata` is the accurate one: nothing reads a
+constant buffer's shadow, and its pages are where the memory was. The
+staged-map comment is stale, not the code.)
