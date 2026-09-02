@@ -1626,6 +1626,7 @@ const SESSION_APPS = [
   },
   {
     id: 'es2gears',
+    gl: true,
     label: 'es2gears — OpenGL ES straight onto Wayland',
     kind: 'wl',
     cmd: '/usr/bin/es2gears_wayland.aarch64-linux-gnu',
@@ -1655,7 +1656,9 @@ const SESSION_APPS = [
  * whatever it links, and six toolkits arriving at once is a memory spike with
  * nothing to show for it.
  */
-function sessionScript(chosen, { stagger = 4, verbose = 0, extra = '', hostX = false } = {}) {
+function sessionScript(chosen, {
+  stagger = 4, verbose = 0, extra = '', hostX = false, directGl = false,
+} = {}) {
   const wl = chosen.filter((a) => a.kind === 'wl');
   const x = chosen.filter((a) => a.kind === 'x');
   // An X server is wanted if anything needs one, including `?xtra=`.
@@ -1685,7 +1688,10 @@ function sessionScript(chosen, { stagger = 4, verbose = 0, extra = '', hostX = f
   for (const a of wl) {
     // Each app's own environment in a subshell, so one app's QT_QPA_PLATFORM
     // is not every app's.
-    s += `(\n${a.env || ''}echo "gex: launching ${a.id}"\n${a.cmd} 2>&1\n) &\n`;
+    const path = directGl && a.gl
+      ? 'LD_LIBRARY_PATH=/usr/lib/gex-gl:$LD_LIBRARY_PATH '
+      : '';
+    s += `(\n${a.env || ''}echo "gex: launching ${a.id}"\n${path}${a.cmd} 2>&1\n) &\n`;
     s += `sleep ${stagger}\n`;
   }
   if (wantX) {
@@ -1715,7 +1721,15 @@ function sessionScript(chosen, { stagger = 4, verbose = 0, extra = '', hostX = f
     // rectangles but no glyphs, so every X client came up as an empty window
     // with a cursor in it. Its software path is what this compositor wants
     // anyway: the pixels arrive as wl_shm, which is what the output uploads.
+    // With the guest rendering on the host there is no virgl socket, and an X
+    // server with no GL driver to find loads Debian's megadriver instead --
+    // 24 MB of Gallium plus 106 MB of LLVM, translated, before it answers its
+    // first client. Nothing here wants the server's own GL: a client's OpenGL
+    // never goes through X at all on this path. So it is pointed at no
+    // drivers, GLX initialisation fails harmlessly, and the server comes up.
+    if (directGl) s += 'export LIBGL_DRIVERS_PATH=/nonexistent\n';
     s += `Xwayland :0 -rootless -shm -noreset -ac${verbose ? ` -verbose ${verbose}` : ''} &\n`;
+    if (directGl) s += 'unset LIBGL_DRIVERS_PATH\n';
     // Not a poll for /tmp/.X11-unix/X0: Xwayland binds it in its own process,
     // and with a tmpfs per process that node is not in this shell's
     // filesystem. The name is registered in the global kernel, so a client
@@ -1726,7 +1740,14 @@ function sessionScript(chosen, { stagger = 4, verbose = 0, extra = '', hostX = f
 
     for (const a of x) {
       s += `echo "gex: launching ${a.id}"\n`;
-      s += `(\n${a.env || ''}${a.cmd} 2>&1\n) &\n`;
+      // An OpenGL client gets the marshaller on its path and nothing else
+      // does: Xwayland links libGL for glamor, and finding this one there
+      // kills the X server at load (`undefined symbol:
+      // glConvolutionParameterfv`) and every client with it.
+      const path = directGl && a.gl
+        ? 'LD_LIBRARY_PATH=/usr/lib/gex-glx:/usr/lib/gex-gl:$LD_LIBRARY_PATH '
+        : '';
+      s += `(\n${a.env || ''}${path}${a.cmd} 2>&1\n) &\n`;
       s += `sleep ${stagger}\n`;
     }
     // `?xtra=<command>` runs one more X client, whatever it is: a way to try
@@ -1830,12 +1851,19 @@ const compositor = {
       }
       const t0 = performance.now();
       let renderer = null;
+      // Where OpenGL runs. `?gl=direct` marshals from the guest to Mesa in the
+      // compositor's worker -- no guest Mesa, and a frame is a texture the
+      // compositor draws rather than pixels copied twice. Anything else keeps
+      // the guest's own Mesa on a renderer here.
+      const directGl = qp.get('gl') === 'direct';
       try {
         ctx.busy('loading the renderer');
-        const { VirglRenderer } = await import('./virgl.js');
-        renderer = await VirglRenderer.create(glCanvas, '/gex/gexvirgl.mjs');
-        if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
-        ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
+        if (!directGl) {
+          const { VirglRenderer } = await import('./virgl.js');
+          renderer = await VirglRenderer.create(glCanvas, '/gex/gexvirgl.mjs');
+          if (!renderer.ok) throw new Error(`the renderer would not start: ${renderer.error}`);
+          ctx.term.writeln(ctx.ansi.dim(`  ${renderer.describe().split('|').join('\r\n  ')}`));
+        }
         ctx.busy('unpacking the rootfs');
         // The smallest image that has everything chosen: the graphics one
         // unless something needs the session image, which is that plus
@@ -1872,12 +1900,30 @@ const compositor = {
         }
         const script = sessionScript(chosen, {
           hostX,
+          directGl,
           stagger: Number(qp.get('stagger')) || 4,
           // `?xverbose=N` turns the X server's own log on, which is the only
           // thing that says where a session that never appears stopped.
           verbose: Number(qp.get('xverbose')) || 0,
           extra: qp.get('xtra') || '',
         });
+        // The guest's GL driver, when the session renders on the host: three
+        // sonames of one marshaller, in a directory of their own. `gex-glx`
+        // is separate because Xwayland links libGL for glamor and dies at
+        // load if it finds this one -- only the client's own command gets it.
+        if (directGl) {
+          for (const [from, to] of [
+            ['/fs/glibc/libGLESv2.so.2', '/usr/lib/gex-gl/libGLESv2.so.2'],
+            ['/fs/glibc/libEGL.so.1', '/usr/lib/gex-gl/libEGL.so.1'],
+            ['/fs/glibc/libgex-gl-sdl.so', '/usr/lib/gex-gl/libgex-gl-sdl.so'],
+            ['/fs/glibc/libGL.so.1', '/usr/lib/gex-glx/libGL.so.1'],
+          ]) {
+            const response = await fetch(from, { cache: 'no-store' });
+            if (!response.ok) continue;
+            files[to] = new Uint8Array(await response.arrayBuffer());
+            tree.modes[to] = 0o755;
+          }
+        }
         files['/session.sh'] = new TextEncoder().encode(script);
         ctx.idle();
         rule(ctx, `graphics rootfs — ${Object.keys(files).length} files, ${chosen.length} apps`);
@@ -1891,7 +1937,10 @@ const compositor = {
           cwd: '/',
           tty: true,
           uid: 0,
-          virgl: renderer,
+          // One or the other: the guest's own Mesa through virglrenderer, or
+          // the guest marshalling to Mesa in the compositor's worker.
+          virgl: directGl ? null : renderer,
+          gl: directGl ? 'compositor' : null,
           wl: wlCanvas,
           wlInput: wlCanvas,
           hostX,

@@ -341,6 +341,8 @@ class Compositor {
   #order = [];
   #glSaid = '';
   #glSaidAt = 0;
+  #glDraws = 0;
+  #probeFbo = null;
   #focus = null;
   #pointer = { x: 0, y: 0, over: null, buttons: 0 };
   #drag = null;
@@ -722,6 +724,7 @@ class Compositor {
     // everything else here: GL's origin is bottom-left.
     const gl = this.#glSurface(win);
     if (gl) {
+      this.#glDraws++;
       // `uv` is an origin and a size, not two corners: flipping means starting
       // at the top and walking down. Read as corners it samples one row of the
       // frame across the whole window, which looks like vertical stripes in
@@ -736,6 +739,30 @@ class Compositor {
       swizzle: 1,
       opaque: win.info?.format === 1 ? 1 : 0,
     });
+  }
+
+  /** What this context reads out of the guest's texture: the compositor's own
+   *  view of it, which is the only thing that says whether a black window is
+   *  a black frame or a texture this side cannot see. */
+  #glSample(f) {
+    if (!f?.tex) return 'none';
+    const gl = this.#gl;
+    try {
+      if (!this.#probeFbo) this.#probeFbo = gl.createFramebuffer();
+      const was = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.#probeFbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, f.tex, 0);
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      let px = new Uint8Array(4);
+      if (status === gl.FRAMEBUFFER_COMPLETE) {
+        gl.readPixels(Math.floor(f.w / 2), Math.floor(f.h / 2), 1, 1,
+                      gl.RGBA, gl.UNSIGNED_BYTE, px);
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, was);
+      return `${status.toString(16)} ${px[0]},${px[1]},${px[2]},${px[3]}`;
+    } catch (e) {
+      return `failed: ${e?.message || e}`;
+    }
   }
 
   /** The GL frame that belongs in this window, if one does.
@@ -761,6 +788,9 @@ class Compositor {
       const f = glFrame();
       this.#note(`gl attachment ${stamp}, frame ${f ? `${f.w}x${f.h} #${f.serial}` : 'none'}`
         + `, window ${win.token}:${win.surface} xid ${win.info?.xid ?? 0}`
+        + `, drawn ${this.#glDraws}`
+        + `, shared ${glRenderer?.sharesContextWith?.(this.#gl) ?? '?'}`
+        + `, sample ${this.#glSample(f)}`
         + `, device ${glDevice?.glState?.() ?? '?'}`
         + `, renderer ${glRenderer?.glState?.() ?? '?'}`);
     }

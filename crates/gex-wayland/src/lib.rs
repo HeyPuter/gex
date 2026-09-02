@@ -2020,9 +2020,12 @@ impl Client {
 
     /// Which X window a surface is, for a host that knows only the drawable.
     pub fn set_xid(&mut self, surface: u32, xid: u32) {
-        if let Some(s) = self.surfaces.get_mut(&surface) {
-            s.xid = xid;
-            self.dirty = true;
+        match self.surfaces.get_mut(&surface) {
+            Some(s) => {
+                s.xid = xid;
+                self.dirty = true;
+            }
+            None => trace_out(&format!("[wl] xid {xid:#x}: no surface {surface}")),
         }
     }
 

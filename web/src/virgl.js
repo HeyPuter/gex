@@ -339,6 +339,17 @@ export class VirglRenderer {
     };
   }
 
+  /** Whether this renderer draws in the very context a compositor is using.
+   *
+   * A texture cannot cross a WebGL context, so a compositor that samples one
+   * of these must be in the same one -- and "same canvas" is what makes that
+   * true, since `getContext` on a canvas that has a context returns it. Worth
+   * being able to check rather than assume: the failure is a black window and
+   * nothing else. */
+  sharesContextWith(gl) {
+    return !!gl && this.#module?.GL?.currentContext?.GLctx === gl;
+  }
+
   /** Whether a finished frame is also blitted onto the canvas.
    *
    * On for a guest that owns the screen. Off for one inside a window: the

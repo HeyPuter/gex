@@ -330,6 +330,12 @@ static int gex_present_tex_w, gex_present_tex_h;
 /* Where a finished frame is copied to, so a compositor never samples a frame
  * that is still being drawn. */
 static GLuint gex_present_copy, gex_present_copy_fbo;
+/* What went wrong the last time a frame was copied, if anything. */
+static GLenum gex_present_error;
+/* What the guest's drawable actually is: a texture, a renderbuffer, or
+ * nothing this can hand over. */
+static GLint gex_present_attach_kind;
+static GLuint gex_present_attach_name;
 static int gex_present_copy_w, gex_present_copy_h;
 static unsigned gex_present_serial;
 /* Whether the canvas still wants the blit. A compositor turns it off: it is
@@ -369,11 +375,13 @@ static void gex_present_current(void) {
     GLint attached = 0, kind = 0;
     glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                           GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
+    gex_present_attach_kind = kind;
     if (kind == GL_TEXTURE) {
         glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                               GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
                                               &attached);
         gex_present_tex = (GLuint)attached;
+        gex_present_attach_name = (GLuint)attached;
         gex_present_tex_w = vp[2];
         gex_present_tex_h = vp[3];
         gex_present_serial++;
@@ -386,36 +394,62 @@ static void gex_present_current(void) {
          * has been rendered so far -- three red bands of a gear that is half
          * drawn. This is one GPU blit at the moment the frame is finished,
          * and no readback: the pixels never leave the GPU. */
-        if (gex_present_copy_w != vp[2] || gex_present_copy_h != vp[3]) {
-            if (!gex_present_copy) glGenTextures(1, &gex_present_copy);
-            glBindTexture(GL_TEXTURE_2D, gex_present_copy);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, vp[2], vp[3], 0, GL_RGBA,
-                         GL_UNSIGNED_BYTE, NULL);
+        /* A copy of the finished frame, made with `glCopyTexImage2D`.
+         *
+         * Not a framebuffer blit and not `CopyTexSubImage`: both want the
+         * destination's format to match what is being read, and the guest's
+         * drawable is whatever Mesa chose -- with a plain RGBA8 destination
+         * the driver answered INVALID_OPERATION and left the copy black. An
+         * unsized `GL_RGBA` lets it pick a format it can convert into, which
+         * is the whole point of the call.
+         *
+         * The texture is remade every frame rather than sub-copied for the
+         * same reason: the format is the driver's to choose and it may not be
+         * the one it chose last time. */
+        bool use_copy = false;
+        if (!gex_present_copy) glGenTextures(1, &gex_present_copy);
+        GLint read_was = 0, tex_was = 0;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_was);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex_was);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindTexture(GL_TEXTURE_2D, gex_present_copy);
+        glDisable(GL_SCISSOR_TEST);
+        while (glGetError() != GL_NO_ERROR) { }
+        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vp[0], vp[1], vp[2], vp[3], 0);
+        GLenum copy_error = glGetError();
+        if (copy_error == GL_NO_ERROR) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            gex_present_copy_w = vp[2];
+            gex_present_copy_h = vp[3];
             if (!gex_present_copy_fbo) glGenFramebuffers(1, &gex_present_copy_fbo);
+            GLint draw_was = 0;
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_was);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gex_present_copy_fbo);
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                    GL_TEXTURE_2D, gex_present_copy, 0);
-            gex_present_copy_w = vp[2];
-            gex_present_copy_h = vp[3];
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_was);
         }
-        GLint read_was = 0, draw_was = 0;
-        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_was);
-        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_was);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gex_present_copy_fbo);
-        glDisable(GL_SCISSOR_TEST);
-        glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
-                          0, 0, gex_present_copy_w, gex_present_copy_h,
-                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        if (copy_error != GL_NO_ERROR) gex_present_error = copy_error;
+        glBindTexture(GL_TEXTURE_2D, (GLuint)tex_was);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_was);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_was);
-        gex_present_tex = gex_present_copy;
-        gex_present_tex_w = gex_present_copy_w;
-        gex_present_tex_h = gex_present_copy_h;
+        /* Whether the snapshot is what a compositor should draw.
+         *
+         * When the copy works this is the frame as it was when it was
+         * finished, which is what a compositor wants. When it does not --
+         * some drawables cannot be read into a plain RGBA8 texture, and the
+         * driver says so with INVALID_OPERATION -- handing over the guest's
+         * own target is better than handing over a black rectangle: it can
+         * tear, and it is the picture. */
+        use_copy = copy_error == GL_NO_ERROR;
+        if (use_copy) {
+            gex_present_tex = gex_present_copy;
+            gex_present_tex_w = gex_present_copy_w;
+            gex_present_tex_h = gex_present_copy_h;
+        }
 
         static int probed;
         if (probed++ % 32 == 0) {
@@ -423,17 +457,31 @@ static void gex_present_current(void) {
             GLint sx = vp[0] + vp[2] / 2 - 10, sy = vp[1] + vp[3] / 2 - 10;
             if (sx < 0) sx = 0;
             if (sy < 0) sy = 0;
+            /* From the copy, not the source: what the compositor will
+             * sample is the only thing worth measuring here. */
             GLint was = 0;
             glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &was);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                              use_copy ? gex_present_copy_fbo : (GLuint)fb);
+            sx = (use_copy ? 0 : vp[0]) + gex_present_copy_w / 2 - 10;
+            sy = (use_copy ? 0 : vp[1]) + gex_present_copy_h / 2 - 10;
+            if (sx < 0) sx = 0;
+            if (sy < 0) sy = 0;
             glReadPixels(sx, sy, 20, 20, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            GLenum blit_error = glGetError();
             glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)was);
+            /* This frame's brightness, not the brightest ever seen: a running
+             * maximum says a frame was bright once, which is exactly the
+             * question this is being asked to answer. */
+            int now = 0;
             for (size_t i = 0; i < sizeof px; i += 4) {
                 int v = px[i] > px[i + 1] ? px[i] : px[i + 1];
                 if (px[i + 2] > v) v = px[i + 2];
-                if (v > gex_brightest) gex_brightest = v;
+                if (v > now) now = v;
             }
-            if (gex_brightest > 8) gex_lit++;
+            gex_brightest = now;
+            if (now > 8) gex_lit++;
+            if (blit_error != GL_NO_ERROR) gex_present_error = blit_error;
         }
         gex_presented++;
         return;
@@ -814,9 +862,12 @@ const char *gex_virgl_gl_state(void) {
     }
     snprintf(out, sizeof out,
              "draw_fbo=%d read_fbo=%d viewport=%d,%d,%dx%d fbo_status=0x%x gl_error=0x%x "
-             "presented=%d lit=%d brightest=%d",
+             "presented=%d lit=%d brightest=%d copy_error=0x%x copy=%dx%d "
+             "attach=0x%x name=%u tex=%u",
              draw_fbo, read_fbo, vp[0], vp[1], vp[2], vp[3], status, err, gex_presented,
-             gex_lit, gex_brightest);
+             gex_lit, gex_brightest, gex_present_error,
+             gex_present_copy_w, gex_present_copy_h,
+             gex_present_attach_kind, gex_present_attach_name, gex_present_tex);
     return out;
 }
 
