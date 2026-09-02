@@ -7099,3 +7099,25 @@ answerable without a quiet machine: **on 655.9 and 651.6 fps, off 647.9 and
 645.2**, interleaved under the same load. The branch is not a cost. Checking
 `/proc/loadavg` and who owns the load is worth doing before believing any
 frame rate here -- and the load may not be this session's to kill.
+
+### Where the sweep stands after five fixes
+
+| | start of the day | now |
+|---|---|---|
+| RAN | 192 | **235** |
+| CRASH | 32 | **15** |
+| REFUSED | 60 | **38** |
+| WGPU-ERROR | 14 | **10** |
+
+**43 of the 336 programs moved out of a failing verdict, and none moved into
+one.** The RAN and CRASH columns are somewhat load-sensitive -- a program under
+contention gets less far inside its eight seconds -- but REFUSED is a statement
+about what the driver turned away and is deterministic, and that is 60 to 38.
+
+Of the 15 remaining crashes, 13 are not this driver's (Wayland compositors,
+KMS, GLX and EGL context creation), leaving `dlist-degenerate`, which crashes
+before any GL work, and one shader that cannot split a combined sampler. The
+38 remaining refusals are line and polygon stipple, line smoothing, logic ops,
+front and back polygon modes differing, and 8-bit indices -- of which only
+8-bit indices is straightforwardly implementable (convert to 16-bit), the rest
+having no WebGPU equivalent at all.
