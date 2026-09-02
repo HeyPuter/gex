@@ -171,6 +171,10 @@ enum Op : uint32_t {
     LINE_STIPPLE = 199, PUSH_ATTRIB = 200, POP_ATTRIB = 201,
     PIXEL_ZOOM = 202, LIGHT_MODELFV = 203, MATERIALF = 204, LIGHTF = 205,
     MULT_MATRIXF = 206, LOAD_MATRIXF = 207, COLOR_MATERIAL = 208,
+    VERTEX_POINTER = 210, NORMAL_POINTER = 211, COLOR_POINTER = 212,
+    TEXCOORD_POINTER = 213, EDGE_FLAG_POINTER = 214, INDEX_POINTER = 215,
+    ENABLE_CLIENT_STATE = 216, DISABLE_CLIENT_STATE = 217,
+    CLIENT_ACTIVE_TEXTURE = 218,
 };
 
 struct Reader {
@@ -2211,6 +2215,73 @@ bool one(uint32_t op, Reader& a) {
         const GLenum mode = a.u32();
         if (!a.ok) return false;
         glColorMaterial(face, mode);
+        break;
+    }
+    /* The fixed-function vertex arrays. The guest has already uploaded any
+     * client-side array into a scratch buffer and bound it, so the pointer
+     * here is an offset into whatever GL_ARRAY_BUFFER is current -- which is
+     * exactly what these calls mean with a buffer bound. */
+    case VERTEX_POINTER:
+    case COLOR_POINTER: {
+        const GLint size = a.i32();
+        const GLenum type = a.u32();
+        const GLsizei stride = a.i32();
+        const uintptr_t offset = a.u32();
+        if (!a.ok) return false;
+        if (op == VERTEX_POINTER)
+            glVertexPointer(size, type, stride, (const void *)offset);
+        else
+            glColorPointer(size, type, stride, (const void *)offset);
+        break;
+    }
+    case NORMAL_POINTER:
+    case INDEX_POINTER: {
+        (void)a.i32();   /* the component count, implicit in these two */
+        const GLenum type = a.u32();
+        const GLsizei stride = a.i32();
+        const uintptr_t offset = a.u32();
+        if (!a.ok) return false;
+        if (op == NORMAL_POINTER)
+            glNormalPointer(type, stride, (const void *)offset);
+        else
+            glIndexPointer(type, stride, (const void *)offset);
+        break;
+    }
+    case EDGE_FLAG_POINTER: {
+        (void)a.i32();
+        (void)a.u32();
+        const GLsizei stride = a.i32();
+        const uintptr_t offset = a.u32();
+        if (!a.ok) return false;
+        glEdgeFlagPointer(stride, (const void *)offset);
+        break;
+    }
+    case TEXCOORD_POINTER: {
+        const uint32_t unit = a.u32();
+        const GLint size = a.i32();
+        const GLenum type = a.u32();
+        const GLsizei stride = a.i32();
+        const uintptr_t offset = a.u32();
+        if (unit > 7 || !a.ok) return false;
+        /* The array belongs to the client-active unit, and the guest sends
+         * which one rather than relying on the host's current selector
+         * surviving whatever else is in the batch. */
+        glClientActiveTexture(GL_TEXTURE0 + unit);
+        glTexCoordPointer(size, type, stride, (const void *)offset);
+        break;
+    }
+    case ENABLE_CLIENT_STATE:
+    case DISABLE_CLIENT_STATE: {
+        const GLenum array = a.u32();
+        if (!a.ok) return false;
+        if (op == ENABLE_CLIENT_STATE) glEnableClientState(array);
+        else glDisableClientState(array);
+        break;
+    }
+    case CLIENT_ACTIVE_TEXTURE: {
+        const GLenum unit = a.u32();
+        if (!a.ok) return false;
+        glClientActiveTexture(unit);
         break;
     }
     case GEN_LISTS: put_u32(glGenLists(a.i32())); break;

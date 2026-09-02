@@ -1058,6 +1058,42 @@ struct vertex_attrib_state {
 static struct vertex_attrib_state vertex_attribs[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
 static int vertex_attrib_client_count;
 
+/* The fixed-function vertex arrays.
+ *
+ * glVertexPointer and its siblings are how every pre-VBO GL program submits
+ * geometry, and this library exported none of them -- which is not a missing
+ * feature but a missing symbol: the program fails to resolve it and never
+ * starts. They work the same way as the client-side glVertexAttribPointer
+ * arrays below, and reuse the same upload: the guest copies each enabled
+ * array into a scratch buffer of its own and re-points the host at offset
+ * zero of it, so the draw command, its `first` and any index values keep
+ * their meaning.
+ *
+ * One state block per array. Texture coordinates have one per unit, selected
+ * by glClientActiveTexture, because a multitexturing program sets two. */
+#define GEXGL_MAX_CLIENT_TEXTURE_UNITS 8
+enum gexgl_ff_array {
+    GEXGL_FF_VERTEX,
+    GEXGL_FF_NORMAL,
+    GEXGL_FF_COLOR,
+    GEXGL_FF_EDGE_FLAG,
+    GEXGL_FF_INDEX,
+    GEXGL_FF_TEXCOORD0,
+    GEXGL_FF_COUNT = GEXGL_FF_TEXCOORD0 + GEXGL_MAX_CLIENT_TEXTURE_UNITS,
+};
+struct gexgl_ff_array_state {
+    int size;              /* components; three for normals, one for the rest */
+    unsigned type;
+    int stride;
+    const void *pointer;
+    unsigned scratch;      /* upload buffer, 0 until first needed */
+    unsigned char client;  /* set with no array buffer bound */
+    unsigned char enabled;
+};
+static struct gexgl_ff_array_state gexgl_ff_arrays[GEXGL_FF_COUNT];
+static int gexgl_ff_client_count;
+static unsigned gexgl_client_texture_unit;
+
 /* Bytes one attribute occupies, ignoring stride. */
 static size_t attrib_element_bytes(int size, unsigned type) {
     size_t component;
@@ -1083,6 +1119,111 @@ void glEnableVertexAttribArray(unsigned i) {
 void glDisableVertexAttribArray(unsigned i) {
     if (i < GEXGL_MAX_VERTEX_ATTRIB_POINTERS) vertex_attribs[i].enabled = 0;
     CMD1(GEXGL_DISABLE_VERTEX_ATTRIB_ARRAY, i);
+}
+
+/* Which state block an enum names, or -1. */
+static int gexgl_ff_array_of(unsigned array) {
+    switch (array) {
+    case 0x8074u: return GEXGL_FF_VERTEX;         /* GL_VERTEX_ARRAY */
+    case 0x8075u: return GEXGL_FF_NORMAL;         /* GL_NORMAL_ARRAY */
+    case 0x8076u: return GEXGL_FF_COLOR;          /* GL_COLOR_ARRAY */
+    case 0x8077u: return GEXGL_FF_INDEX;          /* GL_INDEX_ARRAY */
+    case 0x8078u:                                 /* GL_TEXTURE_COORD_ARRAY */
+        return GEXGL_FF_TEXCOORD0 +
+               (int)(gexgl_client_texture_unit < GEXGL_MAX_CLIENT_TEXTURE_UNITS
+                        ? gexgl_client_texture_unit : 0u);
+    case 0x8079u: return GEXGL_FF_EDGE_FLAG;      /* GL_EDGE_FLAG_ARRAY */
+    default: return -1;
+    }
+}
+
+static void gexgl_record_ff_array(int which, int size, unsigned type,
+                                  int stride, const void *pointer) {
+    if (which < 0 || which >= GEXGL_FF_COUNT) return;
+    struct gexgl_ff_array_state *a = &gexgl_ff_arrays[which];
+    const unsigned char was_client = a->client;
+    a->size = size;
+    a->type = type;
+    a->stride = stride;
+    a->pointer = pointer;
+    /* Which buffer is bound *now* decides, for good -- as for the generic
+       arrays: binding one afterwards does not retroactively capture it. */
+    a->client = bound_buffer(0x8892u) == 0 && pointer != NULL;
+    if (a->client != was_client)
+        gexgl_ff_client_count += a->client ? 1 : -1;
+}
+
+void glClientActiveTexture(unsigned unit) {
+    /* GL_TEXTURE0 is 0x84C0. */
+    gexgl_client_texture_unit = unit >= 0x84C0u ? unit - 0x84C0u : unit;
+    CMD1(GEXGL_CLIENT_ACTIVE_TEXTURE, unit);
+}
+
+void glEnableClientState(unsigned array) {
+    const int which = gexgl_ff_array_of(array);
+    if (which >= 0) gexgl_ff_arrays[which].enabled = 1;
+    CMD1(GEXGL_ENABLE_CLIENT_STATE, array);
+}
+void glDisableClientState(unsigned array) {
+    const int which = gexgl_ff_array_of(array);
+    if (which >= 0) gexgl_ff_arrays[which].enabled = 0;
+    CMD1(GEXGL_DISABLE_CLIENT_STATE, array);
+}
+
+/* The array shape, with an offset of zero: whatever buffer is bound on the
+   host when this arrives is the one it captures. */
+static void gexgl_send_ff_pointer(int which) {
+    struct gexgl_ff_array_state *a = &gexgl_ff_arrays[which];
+    if (which >= GEXGL_FF_TEXCOORD0) {
+        uint32_t *p = begin(GEXGL_TEXCOORD_POINTER, 5, 0);
+        if (p) { p[0] = (uint32_t)(which - GEXGL_FF_TEXCOORD0);
+                 p[1] = (uint32_t)a->size; p[2] = a->type;
+                 p[3] = (uint32_t)a->stride; p[4] = 0; }
+        return;
+    }
+    static const uint32_t opcode[] = {
+        GEXGL_VERTEX_POINTER, GEXGL_NORMAL_POINTER, GEXGL_COLOR_POINTER,
+        GEXGL_EDGE_FLAG_POINTER, GEXGL_INDEX_POINTER,
+    };
+    uint32_t *p = begin(opcode[which], 4, 0);
+    if (p) { p[0] = (uint32_t)a->size; p[1] = a->type;
+             p[2] = (uint32_t)a->stride; p[3] = 0; }
+}
+
+void glVertexPointer(int size, unsigned type, int stride, const void *pointer) {
+    gexgl_record_ff_array(GEXGL_FF_VERTEX, size, type, stride, pointer);
+    if (!gexgl_ff_arrays[GEXGL_FF_VERTEX].client)
+        gexgl_send_ff_pointer(GEXGL_FF_VERTEX);
+}
+void glNormalPointer(unsigned type, int stride, const void *pointer) {
+    gexgl_record_ff_array(GEXGL_FF_NORMAL, 3, type, stride, pointer);
+    if (!gexgl_ff_arrays[GEXGL_FF_NORMAL].client)
+        gexgl_send_ff_pointer(GEXGL_FF_NORMAL);
+}
+void glColorPointer(int size, unsigned type, int stride, const void *pointer) {
+    gexgl_record_ff_array(GEXGL_FF_COLOR, size, type, stride, pointer);
+    if (!gexgl_ff_arrays[GEXGL_FF_COLOR].client)
+        gexgl_send_ff_pointer(GEXGL_FF_COLOR);
+}
+void glTexCoordPointer(int size, unsigned type, int stride,
+                       const void *pointer) {
+    const int which = GEXGL_FF_TEXCOORD0 +
+        (int)(gexgl_client_texture_unit < GEXGL_MAX_CLIENT_TEXTURE_UNITS
+                 ? gexgl_client_texture_unit : 0u);
+    gexgl_record_ff_array(which, size, type, stride, pointer);
+    if (!gexgl_ff_arrays[which].client)
+        gexgl_send_ff_pointer(which);
+}
+void glEdgeFlagPointer(int stride, const void *pointer) {
+    /* GL_BOOL is not a vertex type; edge flags are unsigned bytes. */
+    gexgl_record_ff_array(GEXGL_FF_EDGE_FLAG, 1, 0x1401u, stride, pointer);
+    if (!gexgl_ff_arrays[GEXGL_FF_EDGE_FLAG].client)
+        gexgl_send_ff_pointer(GEXGL_FF_EDGE_FLAG);
+}
+void glIndexPointer(unsigned type, int stride, const void *pointer) {
+    gexgl_record_ff_array(GEXGL_FF_INDEX, 1, type, stride, pointer);
+    if (!gexgl_ff_arrays[GEXGL_FF_INDEX].client)
+        gexgl_send_ff_pointer(GEXGL_FF_INDEX);
 }
 
 static void gexgl_record_attrib(unsigned index, int size, unsigned type,
@@ -1115,8 +1256,32 @@ static void gexgl_record_attrib(unsigned index, int size, unsigned type,
  * then has the same layout as the original, so the draw command itself, its
  * `first`, and any index values need no adjustment. */
 static void gexgl_upload_client_arrays(size_t vertices, int instances) {
-    if (vertex_attrib_client_count <= 0) return;
+    if (vertex_attrib_client_count <= 0 && gexgl_ff_client_count <= 0) return;
     const unsigned previous = bound_buffer(0x8892u); /* GL_ARRAY_BUFFER */
+    /* The fixed-function arrays first, by the same rules: a copy from element
+       zero, so the draw needs no adjustment. They have no divisor. */
+    for (int which = 0; which < GEXGL_FF_COUNT; ++which) {
+        struct gexgl_ff_array_state *a = &gexgl_ff_arrays[which];
+        if (!a->enabled || !a->client || !a->pointer || !vertices) continue;
+        const size_t element = attrib_element_bytes(a->size, a->type);
+        if (!element) continue;
+        const size_t stride = a->stride > 0 ? (size_t)a->stride : element;
+        if (vertices - 1 > (SIZE_MAX - element) / stride) continue;
+        const size_t bytes = (vertices - 1) * stride + element;
+        if (!a->scratch) {
+            unsigned name = 0;
+            glGenBuffers(1, &name);
+            if (!name) continue;
+            a->scratch = name;
+        }
+        glBindBuffer(0x8892u, a->scratch);
+        glBufferData(0x8892u, (long)bytes, a->pointer, 0x88E8u);
+        gexgl_send_ff_pointer(which);
+    }
+    if (vertex_attrib_client_count <= 0) {
+        glBindBuffer(0x8892u, previous);
+        return;
+    }
     for (unsigned i = 0; i < GEXGL_MAX_VERTEX_ATTRIB_POINTERS; ++i) {
         struct vertex_attrib_state *a = &vertex_attribs[i];
         if (!a->enabled || !a->client || !a->pointer) continue;

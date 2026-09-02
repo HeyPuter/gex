@@ -8032,3 +8032,43 @@ run contaminates the capture. Two early comparisons in this session were
 wrong for that reason -- `samplers_array` read 0.377 against a stale window and
 0.007 once the display was its own. Run it with nothing else on the display,
 or on a display of its own.
+
+
+## The fixed-function vertex arrays (2026-09-02)
+
+`glVertexPointer` and its siblings are how every pre-VBO GL program submits
+geometry, and the guest exported none of them -- so ten of the installed
+programs could not resolve `glVertexPointer` and nine could not resolve
+`glColorPointer`, and none of them started.
+
+They need no new machinery. `glVertexAttribPointer` with a client pointer
+already works this way: the guest copies each enabled array into a scratch
+buffer of its own, binds it, and re-points the host at offset zero, so the
+draw command, its `first` and any index values keep their meaning. The
+fixed-function arrays reuse the same upload with their own state blocks --
+vertex, normal, colour, edge flag, colour index, and one texture-coordinate
+array per unit, selected by `glClientActiveTexture`.
+
+What travels is the array *shape* and an offset of zero into whatever
+`GL_ARRAY_BUFFER` is current on the host, which is exactly what these calls
+mean with a buffer bound. The texture-coordinate command carries its unit
+rather than relying on the host's client-active selector surviving the rest of
+the batch.
+
+`308 of 341` programs resolve fully now.
+
+`tests/gl44-probe.sh client-arrays` gates it from pixels, five cases: two
+tightly-packed arrays; one interleaved array, where the stride is not the
+element size and a copy that ignores it reads positions out of the colour
+slots; `glDrawElements` with client indices *over* client arrays, which is two
+different pointers into guest memory in one draw; `glTexCoordPointer` against
+a 2x2 texture with the colour array off, so the texture is the only thing that
+can colour the quad; and disabling an array again, since a stale enabled array
+over a freed pointer is how this goes wrong in an application rather than in a
+probe. 5/5 natively and 5/5 through the guest, matching llvmpipe in both.
+
+What is left blocked is the pixel-rectangle family -- `glDrawPixels` (10
+programs), `glCopyPixels` and `glBitmap` (5 each), `glPixelTransferf` (6) --
+plus selection mode and `glCallLists`/`glListBase`. Those need a wire shape
+for a pixel rectangle with the whole pixel-store state attached, which is more
+than another opcode.

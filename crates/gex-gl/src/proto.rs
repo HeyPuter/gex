@@ -356,6 +356,19 @@ pub mod op {
     pub const LOAD_MATRIXF: u32 = 207;
     pub const COLOR_MATERIAL: u32 = 208;
     pub const POLYGON_MODE_FF: u32 = 209;
+    /* The fixed-function vertex arrays. Client-side pointers are uploaded on
+     * the guest side into one scratch buffer per array -- the same thing
+     * glVertexAttribPointer already does -- so what travels here is the array
+     * *shape* and an offset of zero into whichever buffer is bound. */
+    pub const VERTEX_POINTER: u32 = 210;
+    pub const NORMAL_POINTER: u32 = 211;
+    pub const COLOR_POINTER: u32 = 212;
+    pub const TEXCOORD_POINTER: u32 = 213;
+    pub const EDGE_FLAG_POINTER: u32 = 214;
+    pub const INDEX_POINTER: u32 = 215;
+    pub const ENABLE_CLIENT_STATE: u32 = 216;
+    pub const DISABLE_CLIENT_STATE: u32 = 217;
+    pub const CLIENT_ACTIVE_TEXTURE: u32 = 218;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,
