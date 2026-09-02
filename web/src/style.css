@@ -211,6 +211,18 @@ canvas.wl-offscreen {
   position: relative;
   overflow: hidden;
 }
+/* A window is a canvas, and the page's canvas rule above -- 640px wide,
+   bordered, pixelated -- is written for a demo's single output. Windows are
+   shown at their own size instead, with no frame of their own: the titlebar
+   and the border belong to `.dom-window`. */
+.dom-output canvas {
+  width: auto;
+  max-width: none;
+  height: auto;
+  border: 0;
+  background: transparent;
+  image-rendering: auto;
+}
 .dom-window {
   box-shadow: 0 6px 24px #0008;
   border: 1px solid #2a3040;
@@ -238,7 +250,9 @@ canvas.wl-offscreen {
 }
 
 /* Which compositor draws the session's windows. */
-.session-desktop {
+/* A labelled row of radios in the session picker: which compositor draws the
+   windows, which Mesa draws the OpenGL. One row each, across the app grid. */
+.session-choice {
   grid-column: 1 / -1;
   display: flex;
   flex-wrap: wrap;
@@ -248,6 +262,6 @@ canvas.wl-offscreen {
   padding-top: 6px;
   border-top: 1px solid #2a3040;
 }
-.session-desktop > span {
+.session-choice > span {
   opacity: 0.7;
 }

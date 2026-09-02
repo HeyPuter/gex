@@ -342,6 +342,14 @@ static unsigned gex_present_serial;
  * going to draw this frame somewhere else on the same canvas, and a blit
  * would overwrite everything else on it. */
 static int gex_present_to_canvas = 1;
+/* Whether that blit turns the frame over.
+ *
+ * Which way up a presented frame is depends on who drew it. A guest's own
+ * Mesa hands over a window's front buffer, whose rows run top-down; the
+ * host's Mesa renders through this renderer's own GL and its rows run
+ * bottom-up, the way GL always does. Flipping the second one puts the gears
+ * on their heads, so the page says which it has. */
+static int gex_present_flip = 1;
 
 EMSCRIPTEN_KEEPALIVE
 unsigned gex_virgl_present_texture(void) { return gex_present_tex; }
@@ -355,6 +363,8 @@ EMSCRIPTEN_KEEPALIVE
 unsigned gex_virgl_present_serial(void) { return gex_present_serial; }
 EMSCRIPTEN_KEEPALIVE
 void gex_virgl_present_to_canvas(int on) { gex_present_to_canvas = on != 0; }
+EMSCRIPTEN_KEEPALIVE
+void gex_virgl_present_flip(int on) { gex_present_flip = on != 0; }
 
 static void gex_present_current(void) {
     gex_submit_present_calls++;
@@ -515,8 +525,18 @@ static void gex_present_current(void) {
         if (gex_brightest > 8) gex_lit++;
     }
     seen++;
-    glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
-                      0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    /* The frame is wherever the viewport says it is: virglrenderer sizes the
+     * drawable at init and a smaller window is drawn into the top of it, so
+     * the source rectangle is read rather than assumed. The destination is
+     * the canvas as it is now, which is how a window sized after init still
+     * gets its frame one pixel to one pixel. */
+    if (gex_present_flip) {
+        glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
+                          0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    } else {
+        glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
+                          0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
 #ifdef GEX_VIRGL_WEBGPU
     eglSwapBuffers(gex_display, gex_surface);
 #endif

@@ -112,7 +112,12 @@ export class VirglRenderer {
         : r.#module._gex_virgl_pump;
       const offscreen =
         typeof OffscreenCanvas === 'function' && canvas instanceof OffscreenCanvas;
-      const rc = r.#module._gex_virgl_init(canvas.width, canvas.height, offscreen ? 1 : 0);
+      // `preserve` overrides the guess: a canvas the browser composites can
+      // lose its default framebuffer after each composite, so a client that
+      // draws slower than the page does would flicker black between presents.
+      // See the note on `preserveDrawingBuffer` in gexvirgl.c.
+      const preserve = opts.preserve ?? offscreen;
+      const rc = r.#module._gex_virgl_init(canvas.width, canvas.height, preserve ? 1 : 0);
       if (rc !== 0) {
         r.#failed = `the renderer would not start (${rc})`;
       }
@@ -355,9 +360,13 @@ export class VirglRenderer {
    * On for a guest that owns the screen. Off for one inside a window: the
    * compositor puts that frame where the window is, and a blit would cover
    * everything else with it. */
-  presentToCanvas(on) {
+  presentToCanvas(on, flip = true) {
     if (!this.ok || this.#worker) return;
     this.#module._gex_virgl_present_to_canvas?.(on ? 1 : 0);
+    // Which way up. A frame the host's Mesa rendered through this renderer's
+    // own GL is already the right way round for a blit; one a guest's Mesa
+    // handed over as a window's front buffer is not. See `gex_present_flip`.
+    this.#module._gex_virgl_present_flip?.(flip ? 1 : 0);
   }
 
   /** How many reply bytes are waiting for an in-context client. */
