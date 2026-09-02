@@ -397,6 +397,40 @@ fn slot_space_top() -> u64 {
 /// process); the mark is raised above them so nothing translated at runtime
 /// lands there; everything after is drawn in kernel-issued chunks, so one
 /// process can install a module another translated without slot collisions.
+/// The code identity of every non-writable mapping with one, as `(start, end,
+/// hasher after the object id, file offset)`: what `page_identity` computes,
+/// prepared so the page table's identity hooks -- which run inside a
+/// translation, with the host borrowed -- can finish the key for a page without
+/// the host. Refreshed before each translation (`refresh_ident_snapshot`).
+static IDENT_SNAPSHOT: SingleThreaded<Vec<(u64, u64, std::collections::hash_map::DefaultHasher, u64)>> =
+    SingleThreaded(RefCell::new(Vec::new()));
+
+fn refresh_ident_snapshot(h: &Host) {
+    use std::hash::Hash;
+    let mut snap = Vec::new();
+    for v in h.kernel.mem.vmas().iter() {
+        if v.prot & gex_kernel::mem::prot::WRITE != 0 {
+            continue;
+        }
+        let Some((id, off)) = v.code.as_ref() else { continue };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut hasher);
+        snap.push((v.start, v.end, hasher, *off));
+    }
+    *IDENT_SNAPSHOT.0.borrow_mut() = snap;
+}
+
+/// `page_identity` for a page number, from the snapshot.
+fn snapshot_page_key(page: u64) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let addr = page * gex_abi::DISPATCH_PAGE;
+    let snap = IDENT_SNAPSHOT.0.borrow();
+    let (start, _, hasher, off) = snap.iter().find(|(s, e, _, _)| addr >= *s && addr < *e)?;
+    let mut hs = hasher.clone();
+    (off + (addr - start)).hash(&mut hs);
+    Some(hs.finish())
+}
+
 fn shared_page_table(
     entries: &[(u64, u32)],
     next_slot: u64,
@@ -409,6 +443,22 @@ fn shared_page_table(
     if unsafe { k_present() } == 0 {
         return table;
     }
+    // Pages numbered by identity, so every process gives a library page the
+    // same base and the units they store are interchangeable. See `Identity`.
+    table.set_identity(std::sync::Arc::new(gex_xlate::Identity {
+        adopt: Box::new(|page| {
+            let key = snapshot_page_key(page)?;
+            // SAFETY: a lookup in the kernel's own memory, borrowing nothing here.
+            let base = unsafe { k_slot_get(page, key) };
+            (base != 0).then_some(base)
+        }),
+        publish: Box::new(|page, entry| {
+            if let Some(key) = snapshot_page_key(page) {
+                // SAFETY: as above.
+                unsafe { k_slot_put(page, key, entry) };
+            }
+        }),
+    }));
     unsafe { k_slot_floor(next_slot) };
     table.set_refill(std::sync::Arc::new(gex_xlate::Refill(Box::new(|n| {
         // SAFETY: as above.
@@ -9685,6 +9735,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }
         let started = now_ns();
         let known = std::mem::take(&mut h.jit.translated);
+        // What the page table's identity hooks answer from, as of now.
+        refresh_ident_snapshot(h);
         phase(11);
     let (unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),

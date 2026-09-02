@@ -22,6 +22,7 @@
 pub use gex_emit::merge;
 pub use gex_emit::module::Linkage;
 pub use gex_emit::module::Refill;
+pub use gex_emit::module::Identity;
 pub use gex_emit::module::Metadata;
 /// Turn the per-block stack-pointer check on, for a host with no environment
 /// to read `GEX_CHECK_SP` from. See `gex_emit::tier1::set_check_sp`.

@@ -104,6 +104,26 @@ pub struct PageTable {
     /// closures own tables 0..3 and the run translates into 4..7.
     highs: std::sync::Arc<Vec<std::sync::atomic::AtomicU64>>,
     refill: Option<std::sync::Arc<Refill>>,
+    /// Number pages by identity: see [`Identity`].
+    identity: Option<std::sync::Arc<Identity>>,
+}
+
+/// One base per page *identity*, system-wide.
+///
+/// Two processes translating the same library page must give it the same base,
+/// or a unit one built and the other adopts writes its blocks into slots that
+/// mean another page there. `adopt(page)` asks the system-wide map for the base
+/// an earlier process gave this page (by its code identity); `publish(page,
+/// entry)` records the base this table just allocated, first writer winning.
+pub struct Identity {
+    pub adopt: Box<dyn Fn(u64) -> Option<u32> + Send + Sync>,
+    pub publish: Box<dyn Fn(u64, u32) + Send + Sync>,
+}
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Identity")
+    }
 }
 
 /// A source of slot numbers no other page table will hand out.
@@ -179,6 +199,16 @@ impl PageTable {
         if let Some(&b) = self.pages.get(&page) {
             return b;
         }
+        // The base another process already gave this page's code, if any: the
+        // one thing that keeps two processes' numberings compatible.
+        if let Some(id) = self.identity.clone() {
+            if let Some(entry) = (id.adopt)(page) {
+                if entry != 0 {
+                    self.assign(page, entry);
+                    return entry;
+                }
+            }
+        }
         let v = self.take_slots();
         let entry = gex_abi::dispatch_entry(
             (v / Self::SLOTS_PER_TABLE) as usize,
@@ -190,7 +220,15 @@ impl PageTable {
             std::sync::atomic::Ordering::SeqCst,
         );
         self.note_virtual(v);
+        if let Some(id) = &self.identity {
+            (id.publish)(page, entry);
+        }
         entry
+    }
+
+    /// Number pages by identity from now on. See [`Identity`].
+    pub fn set_identity(&mut self, identity: std::sync::Arc<Identity>) {
+        self.identity = Some(identity);
     }
 
     /// Record that virtual slot `v` and the page above it are wanted, so the
@@ -374,6 +412,7 @@ impl PageTable {
                     .collect(),
             ),
             refill: None,
+            identity: None,
         };
         // The mark says where allocation carries on, so the table holding it
         // has to be long enough for the page it will hand out next.
