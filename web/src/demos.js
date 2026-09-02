@@ -1617,6 +1617,19 @@ const SESSION_APPS = [
     on: true,
   },
   {
+    /* An SDL-shaped GLX initialization, without SDL: a throwaway window and
+     * context to read the GL strings, both destroyed, then the real ones with
+     * an explicit version and profile -- and a redundant make-current in
+     * every frame. That sequence is what toolkits do and what small demos
+     * never do, and it is what made SDL applications need a preloaded
+     * interposer here for years. See guest/glx-init/glx-init.c. */
+    id: 'glx-init',
+    label: 'glx-init — a toolkit-shaped GLX startup (prints each step)',
+    kind: 'x',
+    cmd: '/usr/bin/glx-init 120',
+    gl: true,
+  },
+  {
     // The smallest GL client there is, and the one that finds driver bugs the
     // big ones hide: it points glVertexAttribPointer at a stack array with no
     // buffer bound, the way tutorial code and every mesa-demos program does.
@@ -2104,6 +2117,9 @@ const compositor = {
             ['/fs/glibc/libGLESv2.so.2', '/usr/lib/gex-gl/libGLESv2.so.2'],
             ['/fs/glibc/libEGL.so.1', '/usr/lib/gex-gl/libEGL.so.1'],
             ['/fs/glibc/libGL.so.1', '/usr/lib/gex-glx/libGL.so.1'],
+            // A guest program rather than a driver, staged the same way: see
+            // the `glx-init` entry in the picker.
+            ['/fs/glibc/glx-init', '/usr/bin/glx-init'],
           ]) {
             const response = await fetch(from, { cache: 'no-store' });
             if (!response.ok) continue;
