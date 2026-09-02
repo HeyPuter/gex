@@ -5240,7 +5240,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // syscall. Pins a busy-wait to the code doing it -- gtk3-demo's
         // native-wayland stall spins the main thread on time()/gettimeofday and
         // only the caller says which lock/condition it is polling.
-        let caller = with_host(|h| object_off_at(h, g(30)));
+        // On x86-64 the return address is the word at rsp, not a register
+        // (`g` indexes the six argument slots; 30 would be out of bounds).
+        let ret = if gex_abi::X86 {
+            gm.read_u64(gm.read_u64(base + ctx::SP as u64).unwrap_or(0))
+                .unwrap_or(0)
+        } else {
+            gm.read_u64(base + ctx::x(30) as u64).unwrap_or(0)
+        };
+        let caller = with_host(|h| object_off_at(h, ret));
         warn_line(&format!(
             "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{obj} <-{}  ...\n",
             gex_kernel::syscalls::syscall_name(n),
@@ -5248,7 +5256,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             g(1),
             g(2),
             named.map_or(String::new(), |p| format!(" \"{p}\"")),
-            if caller.is_empty() { format!("{:#x}", g(30)) } else { caller },
+            if caller.is_empty() { format!("{ret:#x}") } else { caller },
         ));
         // For a gather write, what the kernel sees at each iovec: a mismatch
         // with the guest means they disagree about the memory they share.

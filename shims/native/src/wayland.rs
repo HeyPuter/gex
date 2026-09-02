@@ -159,6 +159,18 @@ impl Wayland {
                     break;
                 }
             }
+            // A `get_keyboard` produced a `wl_keyboard.keymap` whose fd rides
+            // the socket's ancillary data: back the payload with a memfd and
+            // stage it, so the send below carries it with the message. Without
+            // it every keyboard-using client fails its first roundtrip with
+            // "file descriptor expected" (EINVAL) -- GTK and Qt both do.
+            if let Some(km) = s.client.take_keymap() {
+                let memfd = Arc::new(gex_kernel::unix::MemFd::new("gex-keymap"));
+                let _ = gex_kernel::vfs::FileHandle::write_at(&*memfd, 0, &km);
+                let handle: Arc<dyn gex_kernel::vfs::FileHandle> = memfd;
+                let file = OpenFile::new(handle, "/memfd:gex-keymap".to_string(), 0, true, false);
+                s.socket.stage_send(vec![file]);
+            }
             s.out.extend_from_slice(&s.client.take_outgoing());
             while s.sent < s.out.len() {
                 match s.socket.send(&s.out[s.sent..]) {
