@@ -1245,39 +1245,30 @@ const waylandGears = {
           // and enumerates real configs.
           script = baseEnv + 'export EGL_PLATFORM=wayland\n' + (app.env || '') + run;
         } else {
-          // Xwayland as the X server, glxgears (or a raw ?wlclient=/demo.client)
-          // as an X client.
+          // An X client. The X server is the one in this page (a Worker
+          // holding `Xwayland.wasm`; see web/src/hostx.js), so this script
+          // starts nothing: it exports the display and runs the client.
+          //
+          // There used to be a guest Xwayland here -- `Xwayland :0 -ac &` and
+          // six seconds to let it bind. It is gone everywhere: it translated a
+          // whole X server and Mesa into a tab, and with the guest's Mesa
+          // retired it could not even load, because it links libGL for glamor
+          // and the only libGL in the image is a marshaller that does not
+          // pretend to have every legacy entry point (`undefined symbol:
+          // glConvolutionParameterfv`). What kept working was the page's
+          // server answering :0 underneath the corpse.
           script =
             baseEnv +
             (app.env || '') +
-            'echo "gex: starting Xwayland"\n' +
-            // `-ac` disables access control. Xwayland turns authorization on by
-            // default and there is no `.Xauthority` in this rootfs, so a client
-            // is refused with "Authorization required, but no authorization
-            // protocol specified" and glxgears cannot open display :0. Xvfb was
-            // reached without it because that path never enabled auth.
-            'Xwayland :0 -verbose 3 -noreset -ac &\n' +
-            // Do NOT poll for /tmp/.X11-unix/X0: Xwayland binds it in its own
-            // process, and with a Worker (and a tmpfs) per process the node it
-            // makes is not in this shell's filesystem -- the parent would wait
-            // forever for a path only the child can see. The socket *name*,
-            // though, is registered in the global kernel (the abstract
-            // @/tmp/.X11-unix/X0 that libxcb tries first), so a client connects
-            // across the process boundary regardless. Xwayland listens the
-            // instant it binds, long before it finishes bringing extensions up,
-            // so a fixed spell to let it bind is enough and the client's
-            // connection is queued until the server is ready.
-            'sleep 6\n' +
+            'echo "gex: the X server is in the page"\n' +
             'export DISPLAY=:0\n' +
             // No `gdk-pixbuf-query-loaders` here: it hangs this pipeline (a
-            // forked child that never returns, so the shell's `wait` blocks and
-            // the client never starts), and it could not help anyway -- it writes
-            // its cache into THIS shell's per-process tmpfs, which a forked client
-            // does not share, so a GTK client would never see it. A GTK-in-wayland
-            // demo that needs the loader cache must build it a way that crosses
-            // the process boundary (a shared tmpfs, or bake the cache into the
-            // rootfs at build time).
-            'echo "gex: X up, starting the client"\n' +
+            // forked child that never returns, so the shell's `wait` blocks
+            // and the client never starts), and it could not help anyway --
+            // it writes its cache into THIS shell's per-process tmpfs, which
+            // a forked client does not share. A GTK demo that needs the
+            // loader cache must build it a way that crosses the process
+            // boundary, or bake it into the rootfs.
             run;
         }
         files['/run.sh'] = new TextEncoder().encode(script);
@@ -1344,6 +1335,11 @@ const waylandGears = {
           gl: glInCompositor ? 'compositor' : (usesDirectGl(demo) ? renderer : null),
           wl: wlCanvas,
           wlInput: wlCanvas,
+          // The X server for the `x` apps above: in the page, started before
+          // the guest so the display is already listening. `?hostx=0` is left
+          // as a way to run without one at all, which is what a Wayland-only
+          // app wants and all a `shm`/`gl` app ever needed.
+          hostX: new URLSearchParams(location.search).get('hostx') !== '0',
           heartbeat: Number(new URLSearchParams(location.search).get('heartbeat')) || 0,
         });
         const ms = (performance.now() - t0).toFixed(0);
