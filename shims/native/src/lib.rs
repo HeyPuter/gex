@@ -584,6 +584,20 @@ fn run_program_with(
         .and_then(|a| std::fs::canonicalize(a).ok())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| opts.args.first().cloned().unwrap_or_default());
+    // A program inside the sysroot is named by its guest path: Wine finds
+    // its DLL directory relative to /proc/self/exe, and the host path leads
+    // nowhere in the guest's namespace.
+    let exe_path = match opts
+        .sysroot
+        .as_deref()
+        .and_then(|r| std::fs::canonicalize(r).ok())
+        .and_then(|r| exe_path.strip_prefix(r.to_string_lossy().as_ref()).map(str::to_string))
+    {
+        Some(rest) if !rest.is_empty() => {
+            if rest.starts_with('/') { rest } else { format!("/{rest}") }
+        }
+        _ => exe_path,
+    };
     let fresh = inherited.is_none();
     // Taken before the kernel is moved out, because the setup below uses them
     // to decide whether to build a device or keep the one already bound.
@@ -2981,11 +2995,11 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             &Default::default(),
         )
     };
-    if translated_module.exported_blocks.is_empty() {
-        return Ok(false);
     if std::env::var_os("GEX_TRACE_MISSES").is_some() {
         eprintln!("[miss] pc={pc:#x} blocks={}", stats.blocks);
     }
+    if translated_module.exported_blocks.is_empty() {
+        return Ok(false);
     }
 
     let engine = {
