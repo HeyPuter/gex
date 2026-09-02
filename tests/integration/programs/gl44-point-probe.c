@@ -447,6 +447,99 @@ int main(void) {
                error == GL_NO_ERROR && red_varies && blue_varies);
     }
 
+    /* 8. An *indexed* point draw, which the expansion cannot take directly:
+     * it needs the per-point data on the instance index and WebGPU's index
+     * buffer addresses only the vertex one. The driver de-indexes the draw
+     * into a gathered vertex buffer instead
+     * (gex_wgpu_gather_indexed_vertices), and KHR-GL33's
+     * primitive_restart.restart_mode is exactly this shape -- indexed points
+     * from a shader writing gl_PointSize = 4.0.
+     *
+     * The indices are deliberately out of order and skip a vertex, because a
+     * gather that ignored them and copied straight through would put the
+     * right number of points in the wrong places with the wrong colours. */
+    {
+        static const float vertices[4][5] = {
+            {-0.6f, -0.6f,  1.0f, 0.0f, 0.0f},   /* 0: red, lower left */
+            { 0.0f,  0.0f,  1.0f, 1.0f, 1.0f},   /* 1: white, centre -- unused */
+            { 0.6f,  0.6f,  0.0f, 1.0f, 0.0f},   /* 2: green, upper right */
+            {-0.6f,  0.6f,  0.0f, 0.0f, 1.0f},   /* 3: blue, upper left */
+        };
+        static const unsigned short indices[2] = {2, 3};
+        clear_black();
+        glPointSize(6.0f);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glEnableClientState(GL_COLOR_ARRAY);
+        glVertexPointer(2, GL_FLOAT, 5 * sizeof(float), vertices);
+        glColorPointer(3, GL_FLOAT, 5 * sizeof(float), &vertices[0][2]);
+        glDrawElements(GL_POINTS, 2, GL_UNSIGNED_SHORT, indices);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glDisableClientState(GL_VERTEX_ARRAY);
+        read_target();
+        const GLenum error = glGetError();
+        /* Upper right is green (vertex 2), upper left blue (vertex 3), and
+         * the centre stays black -- vertex 1 is not indexed, and a gather
+         * that copied the first two vertices instead would light it. */
+        const unsigned right_x = (unsigned)((0.6f + 1.0f) * 0.5f * SIZE);
+        const unsigned left_x = (unsigned)((-0.6f + 1.0f) * 0.5f * SIZE);
+        const unsigned top_y = (unsigned)((0.6f + 1.0f) * 0.5f * SIZE);
+        const int ok = error == GL_NO_ERROR &&
+                       channel(right_x, top_y, 1) > 200 &&
+                       channel(right_x, top_y, 2) < 60 &&
+                       channel(left_x, top_y, 2) > 200 &&
+                       channel(left_x, top_y, 1) < 60 &&
+                       !lit(SIZE / 2, SIZE / 2);
+        int x0, y0, x1, y1;
+        lit_bounds(&x0, &y0, &x1, &y1);
+        fprintf(stderr, "INFO indexed box=%d,%d..%d,%d right=%u,%u,%u "
+                "left=%u,%u,%u centre=%d err=0x%04x\n", x0, y0, x1, y1,
+                channel(right_x, top_y, 0), channel(right_x, top_y, 1),
+                channel(right_x, top_y, 2), channel(left_x, top_y, 0),
+                channel(left_x, top_y, 1), channel(left_x, top_y, 2),
+                lit(SIZE / 2, SIZE / 2), (unsigned)error);
+        result("indexed_points", ok);
+    }
+
+    /* 9. The same indexed draw at size 1, which does *not* go through the
+     * expansion. It is here to tell a defect in the expansion apart from one
+     * in the indexed client-array path underneath it: if both cases fail the
+     * gather is innocent. */
+    {
+        static const float vertices[4][5] = {
+            {-0.6f, -0.6f,  1.0f, 0.0f, 0.0f},
+            { 0.0f,  0.0f,  1.0f, 1.0f, 1.0f},
+            { 0.6f,  0.6f,  0.0f, 1.0f, 0.0f},
+            {-0.6f,  0.6f,  0.0f, 0.0f, 1.0f},
+        };
+        static const unsigned short indices[2] = {2, 3};
+        clear_black();
+        glPointSize(1.0f);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glEnableClientState(GL_COLOR_ARRAY);
+        glVertexPointer(2, GL_FLOAT, 5 * sizeof(float), vertices);
+        glColorPointer(3, GL_FLOAT, 5 * sizeof(float), &vertices[0][2]);
+        glDrawElements(GL_POINTS, 2, GL_UNSIGNED_SHORT, indices);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glDisableClientState(GL_VERTEX_ARRAY);
+        read_target();
+        const GLenum error = glGetError();
+        int x0, y0, x1, y1;
+        lit_bounds(&x0, &y0, &x1, &y1);
+        /* Two lit pixels, in the upper half, and none in the middle. Their
+         * exact pixel is a fill-rule question at these coordinates, so the
+         * box is what is checked rather than a sample. */
+        int lit_count = 0;
+        for (unsigned y = 0; y < SIZE; ++y)
+            for (unsigned x = 0; x < SIZE; ++x)
+                lit_count += lit(x, y);
+        fprintf(stderr, "INFO indexed_thin box=%d,%d..%d,%d lit=%d "
+                "err=0x%04x\n", x0, y0, x1, y1, lit_count, (unsigned)error);
+        result("indexed_points_size_one",
+               error == GL_NO_ERROR && lit_count == 2 &&
+               y0 > (int)SIZE / 2 && x0 < (int)SIZE / 2 &&
+               x1 > (int)SIZE / 2);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

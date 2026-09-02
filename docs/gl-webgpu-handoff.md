@@ -8365,23 +8365,19 @@ pixel centre 16.5 in both cases -- so this is a tie-break at exact integers
 and nothing more. The expanded path does not have it: an 8-pixel point at the
 same place gives `box=12,12..19,19` on both.
 
-It is worth knowing about because it is a candidate for the residual
-`KHR-GL33.primitive_restart.restart_mode` failure, whose remaining
-disagreement is "POINTS, LINES and LINE_STRIP spot positions" while every
-triangle topology passes -- and CTS spot checks are exactly the kind of code
-that lands on integral coordinates. Five explanations for that failure have
-already been ruled out (see the gl33-cts-landscape notes); this is a sixth and
-has not been tested against it.
+The *expanded* path no longer has this: the corner offsets carry a
+1/512-pixel translation that breaks the tie the way `floor` does -- see the
+indexed-points section below, where it turned out to matter for a shader
+writing `gl_PointSize = 1.0`. What remains is the un-expanded path, where the
+point is WebGPU's own and there is nothing between it and the rasteriser.
 
-The fix, if it turns out to matter, is a sub-pixel nudge rather than more
-geometry: shifting the point draw's window origin up by a fraction of a pixel
-breaks the tie the way `floor` does, and leaves non-integral coordinates
-alone. It cannot go through `setViewport`, because WebGPU requires the
-viewport rectangle to lie inside the attachment and the common case fills it
-exactly -- so it would reuse the clipped-viewport fold, which already puts an
-affine window transform into the vertex shader. That costs one cached vertex
-variant per shader that draws one-pixel points. Not attempted, because the
-thing it might fix has not been shown to depend on it.
+Fixing that would mean expanding one-pixel points too, and paying six vertices
+per point for a tie-break; or shifting the draw's window origin, which cannot
+go through `setViewport` (WebGPU requires the viewport rectangle to lie inside
+the attachment and the common case fills it exactly) and would have to reuse
+the clipped-viewport fold, costing a cached vertex variant per shader. Neither
+has been shown to be worth it: the `restart_mode` failure it was suspected of
+causing turned out to be the indexed refusal instead.
 
 ### Lines are the same trick, and are the next thing worth doing
 
@@ -8418,11 +8414,32 @@ shader had already computed.
 Two routes that avoid the duplication, both bigger than the point work:
 
 - **Reuse the geometry-shader path.** The driver already runs a vertex shader
-  as a *compute* pass that writes its varyings to a buffer
-  (`gex_wgpu_gs_draw` and the `varying_nir` variants, built for geometry
-  shader support). A line pass could read two transformed vertices out of that
-  buffer per instance and build the quad from them, with no shader
-  duplication at all. This is the principled route.
+  as a *compute* pass that writes every varying, position included, to a
+  buffer at a fixed stride -- `gex_wgpu_gs_draw`, the `varying_nir` variants
+  and `gex_wgpu_varying_layout`, all built for geometry shader support. A line
+  draw would then be:
+
+    1. one compute dispatch running the bound vertex shader over the draw's
+       vertices, exactly as `gs_draw` pass one does;
+    2. a render pass of six vertices by N line instances with a *generated*
+       pass-through vertex shader -- `gex_wgpu_gs_passthrough` is the model --
+       that reads endpoints A and B out of that buffer by `instance_index`,
+       computes the screen-space perpendicular from their two clip positions,
+       offsets the corner by half the width, and forwards the varyings of
+       whichever endpoint its corner belongs to.
+
+  No shader duplication, and the rasteriser interpolates the varyings for
+  free because each corner simply carries one endpoint's values. Index
+  arithmetic in the shader covers `LINE_STRIP` and `LINE_LOOP` as well as
+  `LINES`, and -- unlike the point expansion -- even *indexed* line draws, by
+  reading the index buffer as a storage binding the way the capture path
+  already does. A stipple counter is the distance along the line in pixels,
+  which the same shader can emit as a varying.
+
+  The cost is a compute dispatch per line draw, which is why it must stay
+  gated on width > 1, stipple or smooth: an ordinary one-pixel wireframe --
+  and glPolygonMode's rewrite produces plenty of those -- has to keep the
+  fast path.
 - **A brush approximation.** GL 4.6 §14.5.1 defines a non-antialiased
   width-*w* line as *w* copies of the line offset along its *minor* axis, so
   drawing the line *w* times with a sub-pixel window offset would be close --
@@ -8432,3 +8449,99 @@ Two routes that avoid the duplication, both bigger than the point work:
 
 `caps->max_line_width` is 1.0 for the same reason `max_point_size` was, and
 should only be raised together with whichever of these lands.
+
+## Indexed wide points, and a guest bug underneath them (2026-09-02)
+
+The wide-point expansion refused indexed draws, because it needs the per-point
+data on the instance index and WebGPU's index buffer addresses only the vertex
+one. That was not a corner case. `KHR-GL33.primitive_restart.restart_mode`
+draws indexed points from a vertex shader that writes `gl_PointSize = 4.0`,
+and the driver's own log named it -- `points drawn one pixel wide (indexed)`
+-- after five other explanations for that family's failure had been ruled out
+and a sixth (the exact-integer tie-break, below) had been guessed at.
+
+### De-indexing, by dword
+
+An indexed draw is now **de-indexed**: the vertices it references are gathered
+into a fresh buffer in draw order, and the draw proceeds as if it had never
+been indexed. Nothing downstream changes -- the strides are the same, so every
+attribute's `src_offset` still lands where it did, and the corner buffer, the
+step modes and both shader variants are untouched.
+
+The copy is format-agnostic on purpose. A vertex is a run of bytes whose
+meaning belongs to the vertex elements, so the compute shader runs **one
+invocation per dword** -- `vertex = i / stride`, `dword = i % stride` -- which
+needs no per-layout variant and no loop. One dispatch per vertex buffer,
+because eight sources and eight destinations would be sixteen storage bindings
+and the device offers ten. The indices themselves are resolved on the CPU and
+uploaded as a table, which is what the transform feedback capture path already
+does for the same reason.
+
+Three bugs, each caught by a different gate:
+
+- **`firstInstance` was passed twice.** A gathered buffer starts at draw order
+  zero, so the draw's own start has already been applied -- passing it again
+  asked for instances 7..12 of a six-vertex buffer, which is a validation
+  error, and a validation error takes the whole command buffer with it. Half
+  of every restart-split point draw vanished. `tests/gl44-probe.sh primrestart`
+  went 22/22 → 20/22 and named it.
+
+- **A sub-pixel nudge was needed.** GL rasterises a point as the fragments
+  whose centres lie in `[x - s/2, x + s/2]`, and for `s = 1` states the answer
+  outright: `floor(x_w)`. A quad with its edges exactly on pixel centres is a
+  tie, and WebGPU's fill rule breaks it the other way -- a point at 16.0 landed
+  on pixel 15 where llvmpipe puts it on 16. That is invisible for a point four
+  pixels across and decisive for one pixel, and one pixel *does* reach the
+  expansion: whenever the shader writes `gl_PointSize` the size is unknown
+  until the shader runs, so the draw is expanded whatever it turns out to be.
+  The corner offsets now carry a 1/512-pixel translation, with its y sign
+  baked on the CPU because the y-flipped module negates what it is given and
+  a corner buffer belongs to one draw.
+
+- **The bounds scan dereferenced NULL.** It was guarded on `info->index_size`,
+  which a de-indexed draw still has, rather than on the index resource, which
+  it no longer has.
+
+### The guest never uploaded fixed-function client arrays for glDrawElements
+
+The browser gate then failed where the native one passed, and the probe's own
+control case is what separated the two: the *same* indexed draw at size 1,
+which never goes near the expansion, drew nothing either. So the expansion was
+innocent.
+
+`glDrawElements` in the guest uploads client vertex arrays as far as the
+indices reach -- and tested only `vertex_attrib_client_count`, the *generic*
+attribute arrays. `glVertexPointer`/`glColorPointer` are counted separately,
+so a fixed-function client array got no upload at all and the host drew from
+whatever a previous `glDrawArrays` had left in the scratch buffers. For an
+index reaching past that draw's vertex count, the fetch is out of bounds, and
+an out-of-bounds vertex fetch reads zero -- so the draw covered no pixels and
+said nothing about why.
+
+This is old-GL bread and butter (`glVertexPointer` + `glDrawElements`), and it
+was silently wrong in the browser for every program that does it. Fixed by
+counting both kinds of client array.
+
+`glDrawRangeElements` and the `BaseVertex` family are still generated as
+*element-buffer offsets*, on the reasoning that "in an OpenGL 4.4 core context
+these are never guest client-memory pointers" -- true, but the guest hands out
+compatibility contexts now, where they can be. That gap is untested and
+unmeasured; it wants the same treatment `glDrawElements` has.
+
+### What is still wrong with restart_mode
+
+The POINTS case no longer draws one-pixel points, and the family still fails
+-- now with the same seven modes as before, which are POINTS and all six line
+topologies while every triangle topology passes. Since a one-pixel line is not
+something this driver can place differently, and lines get a ±1 tolerance in
+that test, the remaining failure is more likely to be about lines than about
+points. It has not been separated further.
+
+### One known limit of the de-indexing
+
+`gl_VertexID` in an expanded indexed point draw reports the vertex's *position
+in the index list* rather than the index value, because the expansion reads
+`instance_index` and the gather renumbered the vertices. Getting it right
+means binding the index table as a per-instance integer attribute, which costs
+a vertex attribute and a buffer slot; no installed program has been seen to
+need it.

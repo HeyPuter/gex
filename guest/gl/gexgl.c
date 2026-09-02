@@ -1823,8 +1823,18 @@ void glDrawElements(unsigned mode, int count, unsigned type, const void *offset)
     const size_t element = index_element_bytes(type);
     /* Client vertex arrays are uploaded as far as these indices reach. With
        the indices in a buffer there is nothing to scan, so the whole array is
-       out of reach and the draw is left to the host as before. */
-    if (vertex_attrib_client_count > 0 && client)
+       out of reach and the draw is left to the host as before.
+       The fixed-function arrays count too. Testing only the generic ones left
+       glVertexPointer/glColorPointer draws with no upload at all, so the host
+       drew from whatever a previous glDrawArrays had left in the scratch
+       buffers -- which for an index that reached past that draw's vertex
+       count is out of bounds, and an out-of-bounds vertex fetch reads zero.
+       tests/gl44-probe.sh point caught it as two points that drew nothing:
+       the same draw at size 1, which does not go near the wide-point
+       expansion, drew nothing either, which is what said the expansion was
+       innocent. */
+    if ((vertex_attrib_client_count > 0 || gexgl_ff_client_count > 0) &&
+        client)
         gexgl_upload_client_arrays(
             gexgl_client_index_extent(offset, count, type), 1);
     size_t blob_len = 0;
