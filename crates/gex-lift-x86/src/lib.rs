@@ -104,6 +104,27 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// The address width of the code being lifted: the size of a pushed
+    /// return address, of what `ret` pops, of an indirect branch target.
+    fn wa(&self) -> Width {
+        if gex_isa_x86::mode() == gex_isa_x86::Mode::Compat {
+            Width::D
+        } else {
+            Width::Q
+        }
+    }
+
+    /// An indirect branch target: read at the address width, as an `I64`.
+    fn rd_target(&mut self, o: Operand) -> Value {
+        let w = self.wa();
+        let v = self.rd(o, w);
+        if w == Width::Q {
+            v
+        } else {
+            self.b.extend(v, false)
+        }
+    }
+
     pub fn flags(&self) -> FlagSource {
         self.flags
     }
@@ -226,6 +247,9 @@ impl<'a> Lifter<'a> {
             });
         }
         match sum {
+            // A bare absolute address: in 32-bit code the sign-extended
+            // disp32 names a 32-bit address.
+            None if m.addr32 => (self.k64(m.disp as u64 & 0xffff_ffff), 0),
             None => (self.k64(m.disp as u64), 0),
             Some(s) if m.addr32 => {
                 // 32-bit address arithmetic wraps before the access.
@@ -584,6 +608,12 @@ impl<'a> Lifter<'a> {
         let w = i.width;
         let ty = ty_of(w);
         match i.op {
+            // `int 0x80` is the i386 system-call gate; the kernel reads the
+            // number and arguments from the 32-bit registers when the process
+            // is a 32-bit one. Any other software interrupt is a fault.
+            Op::Int if i.ops[0] == Some(Operand::Imm(0x80)) && self.wa() == Width::D => {
+                Flow::End(Term::Syscall { next })
+            }
             Op::Unknown | Op::Undefined | Op::Hlt | Op::Int | Op::Xlat => {
                 Flow::End(Term::Illegal { raw: self.raw, pc })
             }
@@ -1052,7 +1082,7 @@ impl<'a> Lifter<'a> {
             Op::Jmp => match i.op0() {
                 Operand::Imm(t) => Flow::End(Term::Goto { target: t as u64 }),
                 o => {
-                    let target = self.rd(o, Width::Q);
+                    let target = self.rd_target(o);
                     Flow::End(Term::Indirect {
                         target,
                         is_ret: false,
@@ -1106,12 +1136,13 @@ impl<'a> Lifter<'a> {
                 let target = match i.op0() {
                     Operand::Imm(t) => None.or(Some(t as u64)).map(|t| (t, None)),
                     o => {
-                        let v = self.rd(o, Width::Q);
+                        let v = self.rd_target(o);
                         Some((0, Some(v)))
                     }
                 };
-                let ret = self.k64(next);
-                self.push(Width::Q, ret);
+                let wa = self.wa();
+                let ret = if wa == Width::Q { self.k64(next) } else { self.k32(next as u32) };
+                self.push(wa, ret);
                 self.b.set_call_return(next);
                 match target {
                     Some((t, None)) => Flow::End(Term::Goto { target: t }),
@@ -1123,7 +1154,9 @@ impl<'a> Lifter<'a> {
                 }
             }
             Op::Ret => {
-                let target = self.pop(Width::Q);
+                let wa = self.wa();
+                let target = self.pop(wa);
+                let target = if wa == Width::Q { target } else { self.b.extend(target, false) };
                 if let Some(Operand::Imm(n)) = i.ops[0] {
                     let sp = self.rd64(RSP);
                     let k = self.k64(n as u64);
@@ -1147,8 +1180,10 @@ impl<'a> Lifter<'a> {
                 let Some(Operand::Imm(size)) = i.ops[0] else {
                     return Flow::End(Term::Illegal { raw: self.raw, pc });
                 };
+                let wa = self.wa();
                 let rbp = self.rd64(RBP);
-                self.push(Width::Q, rbp);
+                let rbp = if wa == Width::Q { rbp } else { self.b.wrap(rbp) };
+                self.push(wa, rbp);
                 let sp = self.rd64(RSP);
                 self.wr64(RBP, sp);
                 let k = self.k64((size as u64).wrapping_neg());

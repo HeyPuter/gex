@@ -3343,6 +3343,10 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
 
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
+    // A 32-bit (i386) program: i386 ABI in the kernel, compatibility-mode
+    // decoding in the translator.
+    kernel.compat = program.compat();
+    gex_xlate::set_compat(program.compat());
     PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
     // And the same for the first process, which opens its console before it
     // makes a syscall. See the note beside the other one.
@@ -6989,6 +6993,10 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
+    if let Some(p) = program.as_ref() {
+        h.kernel.compat = p.compat();
+        gex_xlate::set_compat(p.compat());
+    }
     h.kernel.live_threads = 1;
     h.kernel.next_ctx_slot = 1;
     // Signal handlers do not survive an exec; the mask does.

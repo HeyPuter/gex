@@ -77,6 +77,11 @@ pub mod signal {
 pub struct RunOptions {
     pub args: Vec<String>,
     pub env: Vec<String>,
+    /// The guest path the program was exec'd by, when this run is an exec
+    /// (`None` for the first program, whose path is a host one). It is what
+    /// `/proc/self/exe` answers, resolved through the guest's own symlinks:
+    /// glibc's `_dl_get_origin` asserts that it is absolute.
+    pub program_path: Option<String>,
     /// Print every syscall to stderr.
     pub trace: bool,
     /// Print translation statistics to stderr.
@@ -133,6 +138,7 @@ pub struct RunOptions {
 impl Default for RunOptions {
     fn default() -> Self {
         RunOptions {
+            program_path: None,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -347,6 +353,8 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
         image.text_range.0.to_le_bytes().into(),
         image.text_range.1.to_le_bytes().into(),
         format!("{xlate:?}").into_bytes(),
+        // The same bytes mean different instructions in 32-bit mode.
+        vec![image.class32 as u8],
         // Symbols steer discovery, so two images with the same code but
         // different symbol tables translate differently.
         (image.symbols.len() as u64).to_le_bytes().into(),
@@ -399,6 +407,27 @@ struct Inherited {
     virgl: Option<virgl::VirglDevice>,
 }
 
+/// `path` with the guest's symlinks followed, as `/proc/self/exe` reports it.
+/// Bounded, and stopping at the first component the VFS cannot read as a
+/// link (a regular file, or nothing at all).
+fn guest_canonical(kernel: &Kernel, path: &str) -> String {
+    let mut cur = path.to_string();
+    for _ in 0..32 {
+        match kernel.vfs.read_link(&cur) {
+            Ok(target) if target.starts_with('/') => cur = target,
+            Ok(target) => {
+                let dir = match cur.rfind('/') {
+                    Some(0) | None => "/".to_string(),
+                    Some(i) => cur[..i].to_string(),
+                };
+                cur = if dir == "/" { format!("/{target}") } else { format!("{dir}/{target}") };
+            }
+            Err(_) => break,
+        }
+    }
+    cur
+}
+
 fn run_program_with(
     program: &Program,
     opts: &RunOptions,
@@ -406,6 +435,12 @@ fn run_program_with(
     inherited: Option<Inherited>,
 ) -> Result<(Exit, Stats)> {
     let image = &program.exe;
+    // Before anything is translated: a 32-bit (i386) program's code is
+    // decoded in compatibility mode, and the kernel below speaks its ABI.
+    // One setting per host process -- the native runner keeps one translator
+    // for every guest process, so a mixed tree is not supported here (the
+    // browser has a shim per process).
+    gex_xlate::set_compat(program.compat());
 
     // A profile records where a previous run went, feeding `extra_entries` so
     // discovery reaches entry points static analysis cannot. It changes the
@@ -566,7 +601,10 @@ fn run_program_with(
             // other part of the kernel is what exec is defined to keep.
             k.mem = gex_kernel::mem::MemoryMap::new(image.brk);
             k.ctx_addr = ctx_addr;
-            k.exe_path = exe_path.clone();
+            k.exe_path = match &opts.program_path {
+                Some(p) => guest_canonical(&k, p),
+                None => exe_path.clone(),
+            };
             k.argv = opts.args.clone();
             k.envp = opts.env.clone();
             k.live_threads = 1;
@@ -603,6 +641,12 @@ fn run_program_with(
         envp: opts.env.clone(),
         ..kernel
     };
+    // A 32-bit (i386) program: the kernel speaks its ABI and the translator
+    // decodes its code in compatibility mode, for this process and the ones
+    // it forks. One setting per host process: the native runner keeps one
+    // translator for every guest process, so a mixed tree is not supported
+    // here (the browser has a shim per process).
+    kernel.compat = program.compat();
     // Mounts survive an exec, so they are only established for a new process.
     if fresh {
         mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;
@@ -1460,6 +1504,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             let opts = RunOptions {
                 args: req.argv.clone(),
                 env: req.envp.clone(),
+                program_path: Some(req.path.clone()),
                 ..cx.opts.clone()
             };
             exec_program(
@@ -1514,6 +1559,7 @@ fn exec_program(
     let opts = RunOptions {
         args: req.argv,
         env: req.envp,
+        program_path: Some(req.path.clone()),
         ..opts.clone()
     };
     run_program_with(

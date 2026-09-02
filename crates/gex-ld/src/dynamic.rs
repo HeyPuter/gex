@@ -29,6 +29,12 @@ impl Program {
         }
     }
 
+    /// Whether this is a 32-bit (i386) program: its code runs in
+    /// compatibility mode and it speaks the i386 system-call ABI.
+    pub fn compat(&self) -> bool {
+        self.exe.class32
+    }
+
     /// Load bias of the interpreter, for `AT_BASE`.
     pub fn interp_base(&self) -> u64 {
         self.interp.as_ref().map(|i| i.bias).unwrap_or(0)
