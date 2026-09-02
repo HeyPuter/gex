@@ -1624,6 +1624,70 @@ void glCallLists(int n, unsigned type, const void *lists) {
     put_blob(p + 2, lists, len);
 }
 
+/* Texture-coordinate generation.
+ *
+ * How a fixed-function program does sphere mapping and reflections, and
+ * `texcyl` needed nothing else to start. The plane parameters are the only
+ * vector form -- GL_OBJECT_PLANE and GL_EYE_PLANE take four floats; the mode
+ * is a single enum. */
+static size_t tex_gen_floats(unsigned pname) {
+    switch (pname) {
+    case 0x2501: case 0x2502: return 4; /* GL_OBJECT_PLANE, GL_EYE_PLANE */
+    default: return 1;                  /* GL_TEXTURE_GEN_MODE */
+    }
+}
+void glTexGeni(unsigned coord, unsigned pname, int param) {
+    uint32_t *p = begin(GEXGL_TEX_GENI, 3, 0);
+    if (!p) return;
+    p[0] = coord; p[1] = pname; p[2] = (uint32_t)param;
+}
+void glTexGenfv(unsigned coord, unsigned pname, const float *params) {
+    if (!params) return;
+    const size_t count = tex_gen_floats(pname);
+    uint32_t *p = begin(GEXGL_TEX_GENFV, 3 + count, 0);
+    if (!p) return;
+    p[0] = coord; p[1] = pname; p[2] = (uint32_t)count;
+    for (size_t i = 0; i < count; ++i) put_float(&p[3 + i], params[i]);
+}
+void glTexGenf(unsigned coord, unsigned pname, float param) {
+    glTexGenfv(coord, pname, &param);
+}
+void glTexGend(unsigned coord, unsigned pname, double param) {
+    const float f = (float)param;
+    glTexGenfv(coord, pname, &f);
+}
+void glTexGeniv(unsigned coord, unsigned pname, const int *params) {
+    if (!params) return;
+    glTexGeni(coord, pname, params[0]);
+}
+void glTexGendv(unsigned coord, unsigned pname, const double *params) {
+    if (!params) return;
+    float f[4];
+    const size_t count = tex_gen_floats(pname);
+    for (size_t i = 0; i < count; ++i) f[i] = (float)params[i];
+    glTexGenfv(coord, pname, f);
+}
+
+/* glWindowPos: the raster position, in window coordinates, bypassing the
+   transform. `wincopy` and `glxsnoop` place their pixel rectangles with it. */
+void glWindowPos3f(float x, float y, float z) {
+    uint32_t *p = begin(GEXGL_WINDOW_POS3F, 3, 0);
+    if (!p) return;
+    put_float(&p[0], x); put_float(&p[1], y); put_float(&p[2], z);
+}
+void glWindowPos2f(float x, float y) { glWindowPos3f(x, y, 0.0f); }
+void glWindowPos2i(int x, int y) { glWindowPos3f((float)x, (float)y, 0.0f); }
+void glWindowPos2d(double x, double y) { glWindowPos3f((float)x, (float)y, 0.0f); }
+void glWindowPos2s(short x, short y) { glWindowPos3f(x, y, 0.0f); }
+void glWindowPos3i(int x, int y, int z) { glWindowPos3f((float)x, (float)y, (float)z); }
+void glWindowPos2fv(const float *v) { if (v) glWindowPos3f(v[0], v[1], 0.0f); }
+void glWindowPos2iv(const int *v) { if (v) glWindowPos2i(v[0], v[1]); }
+void glWindowPos3fv(const float *v) { if (v) glWindowPos3f(v[0], v[1], v[2]); }
+/* The ARB spellings -- glWindowPos2iARB and the rest -- are what the
+   applications actually link against, and gl-aliases-generated.inc emits them
+   from the registry for every core name that exists here. Defining them by
+   hand collides with that. */
+
 #define GEN_OBJECTS(fn, opcode) \
     void fn(int n, unsigned *out) { \
         if (n < 0) { CMD1(opcode, (uint32_t)n); return; } \

@@ -8092,7 +8092,41 @@ observable; glCopyPixels moving it, which reads the target as well as writing
 it; glListBase with glCallLists, called by offset so the base has to be
 applied; and the bitmap. 4/4 natively and 4/4 through the guest.
 
-What is left is selection mode (`glRenderMode`, `glSelectBuffer` and the name
-stack, 4 programs, and glSelectBuffer needs a reply the way glReadPixels
-does), GLX pbuffers and pixmaps (4), texture-coordinate generation
-(`glTexGeni`, 4) and a handful of singletons.
+### Texture-coordinate generation and glWindowPos
+
+Two more one-symbol blocks, both cheap. `glTexGen*` is how a fixed-function
+program does sphere mapping and reflections -- `texcyl` needed nothing else to
+start -- and only the object and eye plane equations are vector-valued, so it
+is two opcodes. `glWindowPos*` places a raster position in window coordinates,
+bypassing the transform, which is how `wincopy` and `glxsnoop` position their
+pixel rectangles.
+
+**Do not hand-write the ARB spellings.** `glWindowPos2iARB` is what the
+applications actually link against, and `gl-aliases-generated.inc` emits every
+such alias from the registry for each core name that exists -- so defining
+them by hand collides with the generated file rather than filling a gap.
+Adding the core name is enough.
+
+`tests/gl44-probe.sh fixed-function2` gained a texgen case:
+`GL_OBJECT_LINEAR` with planes that make `s = x/4` and `t = y/4`, so the
+ortho box maps exactly onto a 2x2 texture and each texel lands on one quadrant
+-- which a wrong plane or a dropped enable cannot imitate. 9/9 natively and
+through the guest.
+
+### What is left, and why
+
+**327 of 341 resolve fully.** The remaining fourteen are three groups, none of
+them an ordinary GL application:
+
+- **Three X servers** (Xephyr, Xvfb, Xwayland), each needing 159 symbols --
+  the whole legacy GL API including accumulation buffers, colour tables,
+  convolution, histograms and evaluators. They link it; they do not
+  necessarily call it.
+- **Eight GLX surface types** -- `glXCreatePbuffer`, `glXCreatePixmap`,
+  `glXCreateGLXPixmap`, `glXUseXFont`. That is the window-system layer rather
+  than GL, and a pbuffer or a pixmap is a *different kind of drawable*, which
+  this stack does not have.
+- **`glpuzzle`** (selection mode: `glRenderMode`, `glSelectBuffer` and the
+  name stack) and **`looking-glass-client`** (`glGetTexEnviv`). Selection mode
+  needs a reply that carries the hit records back into a client buffer, the
+  way glReadPixels does; it is the only remaining item that is ordinary GL.

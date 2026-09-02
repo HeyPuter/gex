@@ -385,6 +385,12 @@ pub mod op {
     pub const LIGHTIV: u32 = 228;
     pub const LIST_BASE: u32 = 229;
     pub const CALL_LISTS: u32 = 230;
+    /// Texture-coordinate generation, which is how a fixed-function program
+    /// does sphere mapping and reflections.
+    pub const TEX_GENI: u32 = 231;
+    pub const TEX_GENFV: u32 = 232;
+    /// glWindowPos, the raster position in window coordinates.
+    pub const WINDOW_POS3F: u32 = 233;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

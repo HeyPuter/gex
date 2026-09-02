@@ -254,6 +254,51 @@ int main(void) {
         result("fog", ok);
     }
 
+    /* 9. glTexGen: texture coordinates generated from the object position
+     * rather than supplied. GL_OBJECT_LINEAR with the planes below makes
+     * s = x/4 and t = y/4, so the 0..4 ortho box maps exactly onto the
+     * texture -- and each texel lands on one quadrant of the 4x4 target,
+     * which a wrong plane or a dropped enable cannot imitate. */
+    {
+        static const unsigned char texels[16] = {
+            255, 0, 0, 255,      0, 255, 0, 255,
+            0, 0, 255, 255,      255, 255, 0, 255,
+        };
+        static const GLfloat s_plane[4] = {0.25f, 0.0f, 0.0f, 0.0f};
+        static const GLfloat t_plane[4] = {0.0f, 0.25f, 0.0f, 0.0f};
+        GLuint texture = 0;
+        glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2, 2, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, texels);
+        glEnable(GL_TEXTURE_2D);
+        glTexGeni(GL_S, GL_TEXTURE_GEN_MODE, GL_OBJECT_LINEAR);
+        glTexGeni(GL_T, GL_TEXTURE_GEN_MODE, GL_OBJECT_LINEAR);
+        glTexGenfv(GL_S, GL_OBJECT_PLANE, s_plane);
+        glTexGenfv(GL_T, GL_OBJECT_PLANE, t_plane);
+        glEnable(GL_TEXTURE_GEN_S);
+        glEnable(GL_TEXTURE_GEN_T);
+        clear_black();
+        glColor3f(1.0f, 1.0f, 1.0f);
+        glRectf(0.0f, 0.0f, 4.0f, 4.0f);
+        read_target();
+        glDisable(GL_TEXTURE_GEN_S);
+        glDisable(GL_TEXTURE_GEN_T);
+        glDisable(GL_TEXTURE_2D);
+        const int ok = glGetError() == GL_NO_ERROR &&
+                       red(0, 0) > 200 && green(0, 0) < 60 &&
+                       green(3, 0) > 200 && red(3, 0) < 60 &&
+                       red(3, 3) > 200 && green(3, 3) > 200;
+        fprintf(stderr, "INFO texgen bl=%u,%u br=%u,%u tl=%u,%u tr=%u,%u\n",
+                red(0, 0), green(0, 0), red(3, 0), green(3, 0),
+                red(0, 3), green(0, 3), red(3, 3), green(3, 3));
+        result("texgen_object_linear", ok);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

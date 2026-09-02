@@ -222,6 +222,9 @@ export const op = {
     LIGHTIV: 228,
     LIST_BASE: 229,
     CALL_LISTS: 230,
+    TEX_GENI: 231,
+    TEX_GENFV: 232,
+    WINDOW_POS3F: 233,
 };
 
 export const MAGIC = 0x47584547;

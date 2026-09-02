@@ -179,6 +179,7 @@ enum Op : uint32_t {
     PIXEL_TRANSFERF = 222, PIXEL_TRANSFERI = 223, CLEAR_INDEX = 224,
     INDEXF = 225, EDGE_FLAG = 226, MATERIALIV = 227, LIGHTIV = 228,
     LIST_BASE = 229, CALL_LISTS = 230,
+    TEX_GENI = 231, TEX_GENFV = 232, WINDOW_POS3F = 233,
 };
 
 struct Reader {
@@ -2381,6 +2382,32 @@ bool one(uint32_t op, Reader& a) {
         const uint8_t *lists = a.blob(bytes);
         if (!a.ok || n < 0 || !lists) return false;
         glCallLists(n, type, (const void *)lists);
+        break;
+    }
+    case TEX_GENI: {
+        const GLenum coord = a.u32();
+        const GLenum pname = a.u32();
+        const GLint param = a.i32();
+        if (!a.ok) return false;
+        glTexGeni(coord, pname, param);
+        break;
+    }
+    case TEX_GENFV: {
+        const GLenum coord = a.u32();
+        const GLenum pname = a.u32();
+        const uint32_t count = a.u32();
+        /* Four is the widest -- the object and eye plane equations. */
+        if (count > 4 || !a.ok) return false;
+        GLfloat params[4] = {};
+        for (uint32_t i = 0; i < count; ++i) params[i] = a.f32();
+        if (!a.ok) return false;
+        glTexGenfv(coord, pname, params);
+        break;
+    }
+    case WINDOW_POS3F: {
+        const GLfloat x = a.f32(), y = a.f32(), z = a.f32();
+        if (!a.ok) return false;
+        glWindowPos3f(x, y, z);
         break;
     }
     case GEN_LISTS: put_u32(glGenLists(a.i32())); break;
