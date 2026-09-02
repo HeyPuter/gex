@@ -620,9 +620,14 @@ class Compositor {
    * over the parts that did not change, and the sub-rectangle costs one call.
    */
   #upload(k, s) {
-    // Nothing to read: this surface's pixels are the host's, and `addr` names
-    // no buffer. See `F_EXTERNAL`.
-    if (s.external || !s.addr) return true;
+    // Nothing to read: `addr` names no buffer, which is the case for a window
+    // whose pixels are the host's GL and for one the window manager published
+    // before the X server had anything to commit. `external` on its own is
+    // not a reason to skip a buffer that *is* there -- it says the pixels may
+    // be somewhere else, not that this surface never has any -- and an X
+    // window can have both: a background the server painted, with the GL
+    // frame drawn over it.
+    if (!s.addr) return true;
     const gl = this.#gl;
     const mem = this.#memoryOf(s.token);
     if (!mem) return false;

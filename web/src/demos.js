@@ -1126,7 +1126,7 @@ const waylandGears = {
           }
         }
         if (usesDirectGl(demo)) {
-          const directFiles = ['libGLESv2.so.2', 'libEGL.so.1', 'libgex-gl-sdl.so'];
+          const directFiles = ['libGLESv2.so.2', 'libEGL.so.1', 'libGL.so.1'];
           const directPrefix = archAsset(demo.directGlAbi ? `/fs/${demo.directGlAbi}` : '/fs');
           await Promise.all(directFiles.map(async (name) => {
             // `no-store` for the same reason the gles-gears path uses it: these
@@ -1261,39 +1261,30 @@ const waylandGears = {
           // and enumerates real configs.
           script = baseEnv + 'export EGL_PLATFORM=wayland\n' + (app.env || '') + run;
         } else {
-          // Xwayland as the X server, glxgears (or a raw ?wlclient=/demo.client)
-          // as an X client.
+          // An X client. The X server is the one in this page (a Worker
+          // holding `Xwayland.wasm`; see web/src/hostx.js), so this script
+          // starts nothing: it exports the display and runs the client.
+          //
+          // There used to be a guest Xwayland here -- `Xwayland :0 -ac &` and
+          // six seconds to let it bind. It is gone everywhere: it translated a
+          // whole X server and Mesa into a tab, and with the guest's Mesa
+          // retired it could not even load, because it links libGL for glamor
+          // and the only libGL in the image is a marshaller that does not
+          // pretend to have every legacy entry point (`undefined symbol:
+          // glConvolutionParameterfv`). What kept working was the page's
+          // server answering :0 underneath the corpse.
           script =
             baseEnv +
             (app.env || '') +
-            'echo "gex: starting Xwayland"\n' +
-            // `-ac` disables access control. Xwayland turns authorization on by
-            // default and there is no `.Xauthority` in this rootfs, so a client
-            // is refused with "Authorization required, but no authorization
-            // protocol specified" and glxgears cannot open display :0. Xvfb was
-            // reached without it because that path never enabled auth.
-            'Xwayland :0 -verbose 3 -noreset -ac &\n' +
-            // Do NOT poll for /tmp/.X11-unix/X0: Xwayland binds it in its own
-            // process, and with a Worker (and a tmpfs) per process the node it
-            // makes is not in this shell's filesystem -- the parent would wait
-            // forever for a path only the child can see. The socket *name*,
-            // though, is registered in the global kernel (the abstract
-            // @/tmp/.X11-unix/X0 that libxcb tries first), so a client connects
-            // across the process boundary regardless. Xwayland listens the
-            // instant it binds, long before it finishes bringing extensions up,
-            // so a fixed spell to let it bind is enough and the client's
-            // connection is queued until the server is ready.
-            'sleep 6\n' +
+            'echo "gex: the X server is in the page"\n' +
             'export DISPLAY=:0\n' +
             // No `gdk-pixbuf-query-loaders` here: it hangs this pipeline (a
-            // forked child that never returns, so the shell's `wait` blocks and
-            // the client never starts), and it could not help anyway -- it writes
-            // its cache into THIS shell's per-process tmpfs, which a forked client
-            // does not share, so a GTK client would never see it. A GTK-in-wayland
-            // demo that needs the loader cache must build it a way that crosses
-            // the process boundary (a shared tmpfs, or bake the cache into the
-            // rootfs at build time).
-            'echo "gex: X up, starting the client"\n' +
+            // forked child that never returns, so the shell's `wait` blocks
+            // and the client never starts), and it could not help anyway --
+            // it writes its cache into THIS shell's per-process tmpfs, which
+            // a forked client does not share. A GTK demo that needs the
+            // loader cache must build it a way that crosses the process
+            // boundary, or bake it into the rootfs.
             run;
         }
         files['/run.sh'] = new TextEncoder().encode(script);
@@ -1360,6 +1351,11 @@ const waylandGears = {
           gl: glInCompositor ? 'compositor' : (usesDirectGl(demo) ? renderer : null),
           wl: wlCanvas,
           wlInput: wlCanvas,
+          // The X server for the `x` apps above: in the page, started before
+          // the guest so the display is already listening. `?hostx=0` is left
+          // as a way to run without one at all, which is what a Wayland-only
+          // app wants and all a `shm`/`gl` app ever needed.
+          hostX: new URLSearchParams(location.search).get('hostx') !== '0',
           heartbeat: Number(new URLSearchParams(location.search).get('heartbeat')) || 0,
         });
         const ms = (performance.now() - t0).toFixed(0);
@@ -1418,11 +1414,7 @@ const stkEnv =
   + 'export ALSOFT_DRIVERS=null\n'
   + 'export MESA_GL_VERSION_OVERRIDE=3.3\n'
   + 'export MESA_GLSL_VERSION_OVERRIDE=330\n'
-  + 'export JSIMD_FORCENONE=1\n'
-  // STK asks SDL for an explicit ES 3 context, which Mesa's virgl GLX
-  // frontend refuses; this preload rewrites the request to ES 2, which comes
-  // back as 3.0 anyway. See web/virgl/stk-sdl-es3-compat.c.
-  + `export LD_PRELOAD=/usr/lib/${multiarch()}/libgex-stk-sdl.so\n`;
+  + 'export JSIMD_FORCENONE=1\n';
 const stkProfileValue = Number(new URLSearchParams(location.search).get('stkprofile'));
 // Preserve the original `?stkprofile=1` harness shorthand (a five-second
 // profile), while accepting an explicit duration for longer stable samples.
@@ -1533,8 +1525,7 @@ const supertuxkart = {
   rootfs: archAsset('/rootfs/stk.tar?v=snowpeak20'),
   env:
     'IRR_DEVICE_TYPE=x11;SUPERTUXKART_DATADIR=/usr/share/games/supertuxkart;' +
-    'ALSOFT_DRIVERS=null;JSIMD_FORCENONE=1;' +
-    'LD_PRELOAD=/usr/lib/gex-gl/libgex-gl-sdl.so',
+    'ALSOFT_DRIVERS=null;JSIMD_FORCENONE=1',
   // Auto-run is playable by default. The harness adds ?stkprofile=1 for its
   // finite benchmark run without exposing profiling controls in the demo UI.
   client: stkLaunch,
@@ -1636,6 +1627,30 @@ const SESSION_APPS = [
     kind: 'x',
     cmd: () => `glxgears.${multiarch()}`,
     on: true,
+  },
+  {
+    /* An SDL-shaped GLX initialization, without SDL: a throwaway window and
+     * context to read the GL strings, both destroyed, then the real ones with
+     * an explicit version and profile -- and a redundant make-current in
+     * every frame. That sequence is what toolkits do and what small demos
+     * never do, and it is what made SDL applications need a preloaded
+     * interposer here for years. See guest/glx-init/glx-init.c. */
+    id: 'glx-init',
+    label: 'glx-init — a toolkit-shaped GLX startup (prints each step)',
+    kind: 'x',
+    cmd: '/usr/bin/glx-init 120',
+    gl: true,
+  },
+  {
+    /* The same question on the other path: a desktop-GL context through EGL,
+     * which is how every Wayland client and SDL's EGL backend reach the
+     * device. No window, because what is being asked about is the context and
+     * what it says about itself -- see guest/glx-init/egl-init.c. */
+    id: 'egl-init',
+    label: 'egl-init — desktop GL through EGL (prints what the context says)',
+    kind: 'wl',
+    cmd: '/usr/bin/egl-init 120',
+    gl: true,
   },
   {
     // The smallest GL client there is, and the one that finds driver bugs the
@@ -2124,8 +2139,11 @@ const compositor = {
           for (const [from, to] of [
             ['/fs/glibc/libGLESv2.so.2', '/usr/lib/gex-gl/libGLESv2.so.2'],
             ['/fs/glibc/libEGL.so.1', '/usr/lib/gex-gl/libEGL.so.1'],
-            ['/fs/glibc/libgex-gl-sdl.so', '/usr/lib/gex-gl/libgex-gl-sdl.so'],
             ['/fs/glibc/libGL.so.1', '/usr/lib/gex-glx/libGL.so.1'],
+            // A guest program rather than a driver, staged the same way: see
+            // the `glx-init` entry in the picker.
+            ['/fs/glibc/glx-init', '/usr/bin/glx-init'],
+            ['/fs/glibc/egl-init', '/usr/bin/egl-init'],
           ]) {
             const response = await fetch(archAsset(from), { cache: 'no-store' });
             if (!response.ok) continue;

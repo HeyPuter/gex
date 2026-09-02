@@ -358,9 +358,10 @@ export class VirglRenderer {
    * every submit is too often (half-drawn frames, and with two clients the
    * wrong window) and only the flush that carries a swap is too rare (a
    * client that draws once and stops is never seen at all). */
-  snapshotSurface(uid) {
+  snapshotSurface(uid, resource) {
     if (!this.ok || this.#worker || !uid) return false;
-    return (this.#module._gex_virgl_snapshot_surface?.(uid >>> 0) ?? 0) !== 0;
+    return (this.#module._gex_virgl_snapshot_surface?.(uid >>> 0,
+                                                      resource >>> 0) ?? 0) !== 0;
   }
 
   /** Stop watching the command stream for frames; they will be asked for. */

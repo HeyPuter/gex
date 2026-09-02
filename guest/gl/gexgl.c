@@ -1613,6 +1613,8 @@ static unsigned egl_api = 0x30A0; /* EGL_OPENGL_ES_API */
 /* Whether CONTEXT_CREATE has been sent. A process gets one host context, and
    an application may create several EGLContexts against it. */
 static int host_context_made;
+/* How many contexts the application believes it has. */
+static int egl_contexts_live;
 
 /* Defined below, next to the list it builds. */
 static const char *gexgl_extension_string(void);
@@ -2035,6 +2037,9 @@ struct gexgl_egl_surface {
     unsigned handle;     /* zero for a free slot */
     int kind;            /* GEXGL_SURFACE_X, GEXGL_SURFACE_WAYLAND, or -1 */
     unsigned id;         /* XID, or wl_surface object id */
+    void *native;        /* what the application passed: an XID, or a
+                            wl_egl_window. What lets a second request for the
+                            same window find the surface that already exists. */
     int width, height;
     /* Wayland only, and per surface for the same reason as everything else:
        the proxy to commit at every swap and the window structure a resize is
@@ -2054,7 +2059,51 @@ static struct gexgl_egl_surface *egl_surface;   /* the current drawable */
 static int egl_surface_width = 256;
 static int egl_surface_height = 256;
 
+static int gexgl_x11_window_size(void *win, int *width, int *height);
+
+/* The surface for a window this process already has one for.
+ *
+ * GLX has no surface object: the drawable *is* the window, and an
+ * application makes it current as often as it likes -- some engines do it
+ * every frame. Making a new one each time burned a slot per call and left
+ * the host holding drawables for windows nothing was drawing into. */
+static struct gexgl_egl_surface *egl_surface_for_native(void *native) {
+    if (!native) return NULL;
+    for (unsigned i = 0; i < GEXGL_MAX_SURFACES; i++)
+        if (egl_surfaces[i].handle && egl_surfaces[i].native == native)
+            return &egl_surfaces[i];
+    return NULL;
+}
+
+/* Let go of the surfaces whose windows have gone.
+ *
+ * An X window can be destroyed without this library hearing about it -- SDL
+ * creates a window and a context purely to read the GL strings, then throws
+ * both away before making the real ones -- and a real GL driver notices when
+ * the drawable stops existing. Asking the server for the geometry is that
+ * test, and it is only worth doing when a new surface is wanted. */
+static void egl_surface_reap(void) {
+    for (unsigned i = 0; i < GEXGL_MAX_SURFACES; i++) {
+        struct gexgl_egl_surface *s = &egl_surfaces[i];
+        if (!s->handle || s->kind != GEXGL_SURFACE_X) continue;
+        int w = 0, h = 0;
+        if (gexgl_x11_window_size(s->native, &w, &h)) continue;
+        CMD1(GEXGL_SURFACE_DETACH, s->handle);
+        if (egl_surface == s) egl_surface = NULL;
+        *s = (struct gexgl_egl_surface){ .kind = -1 };
+    }
+}
+
 static struct gexgl_egl_surface *egl_surface_new(void) {
+    for (unsigned i = 0; i < GEXGL_MAX_SURFACES; i++) {
+        if (egl_surfaces[i].handle) continue;
+        struct gexgl_egl_surface *s = &egl_surfaces[i];
+        *s = (struct gexgl_egl_surface){ .handle = egl_next_surface_handle++,
+                                         .kind = -1 };
+        return s;
+    }
+    /* Nothing free -- but some of these windows may be gone. */
+    egl_surface_reap();
     for (unsigned i = 0; i < GEXGL_MAX_SURFACES; i++) {
         if (egl_surfaces[i].handle) continue;
         struct gexgl_egl_surface *s = &egl_surfaces[i];
@@ -2204,9 +2253,14 @@ static int gexgl_x11_default_visual(void) {
    does this one now. */
 static void context_create(void) {
     if (host_context_made || !ring) {
+        /* Still a context as far as the application is concerned: what is
+           latched is the *host's*, and the count is what tells
+           eglDestroyContext whether the last one has gone. */
+        if (host_context_made) egl_contexts_live++;
         return;
     }
     host_context_made = 1;
+    egl_contexts_live++;
     uint32_t *p = begin(GEXGL_CONTEXT_CREATE, 4, 0);
     if (!p) return;
     p[0] = egl_api == 0x30A2u ? 1u /* desktop */ : 0u /* ES */;
@@ -2503,12 +2557,23 @@ static void gexgl_wl_commit(struct gexgl_egl_surface *s) {
 void *eglCreateWindowSurface(void *dpy, void *config, void *win,
                              const int *attrs) {
     (void)dpy; (void)config; (void)attrs;
+    /* One surface per window. EGL says a second request for the same window
+       is an error; answering with the one that exists is what a GLX caller
+       needs, since making a drawable current twice is ordinary there -- and
+       it is friendlier than an error to an EGL caller that asked twice. */
+    struct gexgl_egl_surface *existing = egl_surface_for_native(win);
+    if (existing) {
+        egl_surface_use(existing);
+        return (void *)(uintptr_t)existing->handle;
+    }
+    egl_surface_reap();
     struct gexgl_egl_surface *s = egl_surface_new();
     if (!s) return (void *)(uintptr_t)(egl_surface ? egl_surface->handle : 1);
     int w = 0, h = 0;
     if (gexgl_x11_window_size(win, &w, &h)) {
         s->kind = GEXGL_SURFACE_X;
         s->id = (unsigned)(uintptr_t)win;
+        s->native = win;
         s->width = w;
         s->height = h;
         /* Which window this surface's frames belong to, so a compositor can
@@ -2526,6 +2591,7 @@ void *eglCreateWindowSurface(void *dpy, void *config, void *win,
            application's window has is the size to draw at. */
         CMD2(GEXGL_SURFACE_RESIZE, w, h);
     } else if (gexgl_wl_surface_id_into(win, s)) {
+        s->native = win;
         const struct gexgl_wl_egl_window *ww = win;
         if (ww->width > 0 && ww->height > 0) {
             s->width = ww->width;
@@ -2622,7 +2688,29 @@ void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
     return (void *)3;
 }
 
-unsigned eglDestroyContext(void *dpy, void *ctx) { (void)dpy; (void)ctx; return EGL_TRUE; }
+/* Really destroy it, so the next context is created rather than latched.
+ *
+ * The host makes its GL context when this library first says what the
+ * application asked for, and that used to be the only time it ever made one:
+ * a program that created a context, threw it away and made another with
+ * different attributes -- which is how SDL reads the GL strings before
+ * choosing a profile -- silently kept the first one's profile and version.
+ *
+ * Only the last one: an application that keeps two contexts and destroys one
+ * is not asking for the other's to go. */
+unsigned eglDestroyContext(void *dpy, void *ctx) {
+    (void)dpy; (void)ctx;
+    if (!host_context_made || egl_contexts_live > 1) {
+        if (egl_contexts_live) egl_contexts_live--;
+        return EGL_TRUE;
+    }
+    egl_contexts_live = 0;
+    host_context_made = 0;
+    egl_current_context = NULL;
+    CMD0(GEXGL_CONTEXT_DESTROY);
+    flush();
+    return EGL_TRUE;
+}
 
 unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
     if (!egl_ready) return EGL_FALSE;

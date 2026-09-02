@@ -17,7 +17,7 @@
 pub const MAGIC: u32 = 0x4758_4547;
 /// Version of the command ABI. A guest and host must agree before any opcode
 /// is decoded; generated opcode policy changes require incrementing this.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The fixed header at the start of the shared buffer. `repr(C)` for the C
 /// guest half; every field 32 bits, 32 bytes total.
@@ -132,6 +132,19 @@ pub mod op {
     /// drawable of its own, so a pbuffer or a window that never attached to
     /// anything still has somewhere to draw.
     pub const SURFACE_CURRENT: u32 = 6;
+    /// `{}` -- the context is gone; make the next one afresh.
+    ///
+    /// The host builds its GL context when a guest first says what the
+    /// application asked for. That was once and for all, which is wrong for
+    /// the commonest odd initialization there is: a toolkit makes a throwaway
+    /// context to read `GL_VERSION` and the extension strings, destroys it,
+    /// and only then creates the context it wants -- SDL does exactly this,
+    /// and the profile it asked for the second time was quietly ignored.
+    ///
+    /// Sent when the last context a guest holds is destroyed, so the next
+    /// creation is a creation rather than a latch. The client's objects go
+    /// with it, which is what destroying a context means.
+    pub const CONTEXT_DESTROY: u32 = 8;
     /// `{ surface }` -- this handle is gone; release what it owns.
     ///
     /// `eglDestroySurface`, and the only orderly way the host learns that a

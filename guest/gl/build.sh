@@ -122,8 +122,4 @@ cp "$OUT/libGLESv2.so.2" "$OUT/libGL.so.1"
 ln -sf libGL.so.1 "$OUT/libGL.so"
 ln -sf libGLESv2.so.2 "$OUT/libGLESv2.so"
 ln -sf libEGL.so.1 "$OUT/libEGL.so"
-$CC -shared -fPIC -O2 -Wall -o "$OUT/libgex-gl-sdl.so" \
-    -Wl,-soname,libgex-gl-sdl.so \
-    -Wl,-rpath,/usr/lib/gex-gl "$HERE/gexgl-sdl.c" \
-    -L"$OUT" -Wl,-rpath-link,"$OUT" -Wl,--no-as-needed -l:libGLESv2.so.2 -ldl
 echo "$OUT: $(ls "$OUT" | tr '\n' ' ')"

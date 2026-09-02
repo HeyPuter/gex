@@ -689,8 +689,13 @@ done
 # no graphics driver and does not run an X server, and a manifest written when
 # it did still names them.
 if [ -z "${GEX_KEEP_EXTRAS:-}" ]; then
-    rm -rf "$R/usr/lib/${MA}/dri" "$R/usr/bin/Xwayland"
+    rm -rf "$R/usr/lib/${MA}/dri"
 fi
+# The X server goes whatever `GEX_KEEP_EXTRAS` says. It is not an extra that
+# might be wanted: there is no guest X server any more, and this one cannot
+# load at all -- it links libGL for glamor, and the only libGL in the image is
+# a marshaller for the host's Mesa.
+rm -rf "$R/usr/bin/Xwayland" "$R/usr/lib/xorg"
 # glibc's charset modules: 20 MB of tables for encodings nothing here reads.
 # UTF-8 needs no module at all.
 [ -z "${GEX_KEEP_EXTRAS:-}" ] && rm -rf "$R/usr/lib/${MA}/gconv"
@@ -820,6 +825,17 @@ if [ "${GEX_SESSION_TAR:-1}" != "0" ]; then
     cp "$OUT" "$SESSION"
     echo "  $SESSION: $(du -h "$SESSION" | cut -f1)"
     if [ -f "$STK" ]; then
+        # Not the X server, whatever the SuperTuxKart tar happens to carry.
+        # That tar predates the page's X server and is not built here, so it
+        # can still hold a guest Xwayland -- and since the later entry of a
+        # duplicated path wins, concatenating it would put one back into an
+        # image this script had just taken it out of. There is no guest X
+        # server any more: it cannot even load, because it links libGL for
+        # glamor and the only libGL here is a marshaller.
+        if tar -tf "$STK" 2>/dev/null | grep -q '^\./usr/bin/Xwayland$'; then
+            echo "  dropping the guest Xwayland from $STK"
+            tar --delete -f "$STK" ./usr/bin/Xwayland ./usr/lib/xorg 2>/dev/null || true
+        fi
         WITH_STK="$(dirname "$OUT")/session-stk.tar"
         cp "$SESSION" "$WITH_STK"
         tar --concatenate --file="$WITH_STK" "$STK"

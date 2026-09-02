@@ -528,9 +528,11 @@ export class DomDesktop {
       win.relY = s.relY;
       win.onplace?.(s.relX, s.relY, win.parent);
     }
-    // A GL window's pixels arrive on its canvas by themselves: the host's GL
-    // presents into it. There is nothing here to copy.
-    if (win.external) return;
+    // Nothing to copy when there is no buffer: a window whose pixels are the
+    // host's GL has none, and neither has one the window manager published
+    // before the X server had anything to commit. A buffer that *is* there is
+    // painted even for an external surface -- the GL frame is drawn over it
+    // afterwards (see `#drawGl`).
     if (!s.addr) return;
     if (s.serial === win.serial) return;
     const prev = win.serial;

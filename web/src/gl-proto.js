@@ -10,6 +10,7 @@ export const op = {
     PRESENT: 4,
     SURFACE_ATTACH: 5,
     SURFACE_CURRENT: 6,
+    CONTEXT_DESTROY: 8,
     SURFACE_DETACH: 7,
     CLEAR_COLOR: 16,
     CLEAR: 17,
@@ -182,7 +183,7 @@ export const op = {
 };
 
 export const MAGIC = 0x47584547;
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 export const HEADER_BYTES = 32;
 
 export const error = {

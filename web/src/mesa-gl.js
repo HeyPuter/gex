@@ -169,7 +169,7 @@ export class MesaGlDevice {
         surface: (uid) => renderer.presentSurface(uid),
         // And that this surface's frame is finished: the renderer takes its
         // copy then and only then, from the framebuffer that is still bound.
-        snapshot: (uid) => renderer.snapshotSurface(uid),
+        snapshot: (uid, resource) => renderer.snapshotSurface(uid, resource),
       };
       // No JSPI here: virglrenderer runs the commands before `feed` returns,
       // so a submit is an ordinary call.

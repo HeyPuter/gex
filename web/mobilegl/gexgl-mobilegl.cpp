@@ -36,6 +36,7 @@ extern "C" const char *gex_wgpu_declined_last_why;
 #include "gex_wgpu/gex_wgpu_public.h"
 extern "C" WGPUDevice emscripten_webgpu_get_device(void);
 #elif defined(GEX_MESA_VIRGL)
+#include "frontend/winsys_handle.h"
 /* The same Mesa frontend again, on the driver that has always drawn these
  * pixels: Gallium's virgl encoder, with virglrenderer decoding it on the
  * page's WebGL. The guest used to run this half itself; the only thing that
@@ -117,6 +118,7 @@ void mesa_get_internal_format_iv(GLenum target, GLenum internal_format,
 enum Op : uint32_t {
     CONTEXT_CREATE = 1, SURFACE_RESIZE = 2, FINISH = 3, PRESENT = 4,
     SURFACE_ATTACH = 5, SURFACE_CURRENT = 6, SURFACE_DETACH = 7,
+    CONTEXT_DESTROY = 8,
     CLEAR_COLOR = 16, CLEAR = 17, VIEWPORT = 18, ENABLE = 19, DISABLE = 20,
     BLEND_FUNC = 21, DEPTH_FUNC = 22, CULL_FACE = 23, FRONT_FACE = 24,
     SCISSOR = 25, PIXEL_STOREI = 26, CLEAR_DEPTH = 27, DEPTH_MASK = 28,
@@ -1396,21 +1398,41 @@ EM_JS(void, gex_note_present_surface, (unsigned handle), {
   Module.gexVirgl?.surface?.(handle);
 });
 
-/* And, after the flush, that this surface's frame is finished and should be
- * kept -- which the renderer can then take from its own bound framebuffer
- * with nothing to infer. */
-EM_JS(void, gex_note_frame_done, (unsigned handle), {
-  Module.gexVirgl?.snapshot?.(handle);
+/* And, after the flush, that this surface's frame is finished -- naming the
+ * renderer's own resource it was drawn into.
+ *
+ * By name and not "whatever is bound": the renderer's current GL context
+ * follows whichever vtest connection submitted last, so with two clients
+ * drawing, a snapshot of the bound framebuffer is the wrong client's picture
+ * as often as not. glxgears' frames stopped dead at 280 the moment glmark2
+ * started submitting. */
+EM_JS(void, gex_note_frame_done, (unsigned surface, unsigned resource), {
+  Module.gexVirgl?.snapshot?.(surface, resource);
 });
 
 void note_surface_to_backend(unsigned uid) { gex_note_present_surface(uid); }
 
 void present_backend() {
-    /* Finish first: everything this client drew goes through the renderer,
-     * and its drawable is still what is bound when it returns -- which is
-     * what makes the copy that follows exactly this frame of this window. */
+    /* Finish first, so everything this client drew has been through the
+     * renderer; then name the resource it was drawn into, which is what the
+     * renderer keeps a copy of. */
     glFinish();
-    if (sur) gex_note_frame_done(sur->uid);
+    if (sur) {
+        /* The renderer's own name for the buffer this frame was drawn into.
+         * `resource_get_handle` is Gallium's way to ask, and the vtest winsys
+         * answers with the handle the renderer created the resource under --
+         * which is what `virgl_renderer_resource_get_info` takes. */
+        struct pipe_resource* back =
+            sur->drawable.attachments[ST_ATTACHMENT_BACK_LEFT];
+        unsigned resource = 0;
+        struct pipe_screen* screen = mesa_frontend_screen.screen;
+        if (back && screen && screen->resource_get_handle) {
+            struct winsys_handle whandle = {};
+            if (screen->resource_get_handle(screen, nullptr, back, &whandle, 0))
+                resource = whandle.handle;
+        }
+        gex_note_frame_done(sur->uid, resource);
+    }
     ++produced;
     if (sur) ++sur->produced;
 }
@@ -1726,6 +1748,20 @@ bool one(uint32_t op, Reader& a) {
 #else
         const char* version = "3.3 (Core Profile) Mesa 26.0.0 (MobileGL WebGPU)";
 #endif
+        /* Said once. An application chooses its renderer by parsing this,
+         * and a string that arrives empty is invisible from the guest's
+         * side -- it looks like a driver with no name and no version. */
+        {
+            static bool said_strings;
+            if (!said_strings) {
+                said_strings = true;
+                fprintf(stderr, "gexgl: context strings vendor=%s renderer=%s"
+                                " version=%s\n",
+                        vendor ? vendor : "(null)",
+                        renderer ? renderer : "(null)",
+                        version ? version : "(null)");
+            }
+        }
         put_blob(vendor, vendor ? std::strlen(vendor) : 0);
         put_blob(renderer, renderer ? std::strlen(renderer) : 0);
         put_blob(version, version ? std::strlen(version) : 0);
@@ -1769,6 +1805,24 @@ bool one(uint32_t op, Reader& a) {
         use_surface(handle);
 #else
         (void)handle;
+#endif
+        break;
+    }
+    case CONTEXT_DESTROY: {
+#if defined(GEX_MESA_WASM)
+        /* Everything this client's context held goes with it: its objects
+         * are named in maps that mean nothing to the next context, and the
+         * next `CONTEXT_CREATE` is then a creation rather than a no-op --
+         * which is what lets a toolkit read the GL strings through a
+         * throwaway context and still get the profile it asks for after. */
+        if (mesa_context) {
+            st_destroy_context(mesa_context);
+            mesa_context = nullptr;
+        }
+        reset_guest_namespace();
+        for (auto& entry : surfaces)
+            for (struct pipe_resource*& attachment : entry.second.drawable.attachments)
+                pipe_resource_reference(&attachment, nullptr);
 #endif
         break;
     }
