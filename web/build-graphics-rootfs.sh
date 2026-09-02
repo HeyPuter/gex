@@ -667,6 +667,10 @@ fi
 # and it is a hundred megabytes of a page's memory before a window appears.
 # Dolphin without them thumbnails less; the alternative is Dolphin not
 # starting, because the tab ran out of memory unpacking the image.
+# libmp3lame stays, small as its use is: Debian's libsndfile links it, and
+# libsndfile is on the load path of anything that reaches libpulse (Dolphin's
+# KF5 stack does), so dropping it made Dolphin fail before main with
+# "libmp3lame.so.0: cannot open shared object file".
 DROP="${GEX_KEEP_EXTRAS:+}"
 if [ -z "${GEX_KEEP_EXTRAS:-}" ]; then
     DROP="libavcodec.so.* libavformat.so.* libavutil.so.* libswscale.so.*
@@ -674,7 +678,7 @@ if [ -z "${GEX_KEEP_EXTRAS:-}" ]; then
           libx264.so.* libx265.so.* libvpx.so.* libaom.so.* libdav1d.so.*
           librav1e.so.* libsvtav1enc.so.* libzvbi.so.* libsrt-gnutls.so.*
           libopenh264.so.* libmfx.so.* libva.so.* libva-drm.so.* libva-x11.so.*
-          libvidstab.so.* libshine.so.* libtwolame.so.* libmp3lame.so.*
+          libvidstab.so.* libshine.so.* libtwolame.so.*
           libopenmpt.so.* libchromaprint.so.* libbs2b.so.* librubberband.so.*
           libLLVM-*.so* libz3.so*"
 fi
