@@ -1250,6 +1250,23 @@ void resize_drawable(int width, int height) {
     }
 }
 
+/* The device's queue, fetched once and kept.
+ *
+ * This used to be fetched and released around every present. `webgpu.h` says
+ * the getter hands out a reference the caller owns, so releasing it is
+ * correct by the letter -- and with this implementation the device stopped
+ * existing a frame or two later, reported as
+ * `lost: destroyed: Device was destroyed`, which is a device that has quietly
+ * stopped doing anything: no failed calls, no validation errors, frame
+ * counters still climbing, and a black window. Holding the queue for the
+ * device's whole life also saves a fetch per frame, which is what a driver
+ * would do anyway. */
+WGPUQueue present_queue(WGPUDevice device) {
+    static WGPUQueue queue = nullptr;
+    if (!queue) queue = wgpuDeviceGetQueue(device);
+    return queue;
+}
+
 void configure_present_surface() {
     if (mesa_surface || !mesa_frontend_screen.screen) return;
     GEX_PRESENT_MARK(configure_begin);
@@ -1275,7 +1292,16 @@ void configure_present_surface() {
     WGPUSurfaceConfiguration cfg{};
     cfg.device = device;
     cfg.format = WGPUTextureFormat_RGBA8Unorm;
-    cfg.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
+    /* Read as well as written. The frame is presented into this canvas and
+     * then *taken* from it: the compositor with a scene uploads the canvas
+     * into a WebGL texture, and the one that puts each window in an element
+     * copies it into the window's own canvas. Both are ordinary image-source
+     * reads of a canvas, and a WebGPU canvas configured without CopySrc
+     * cannot be one -- which did not fail the read so much as take the device
+     * with it: `lost: destroyed` in the same breath as the first present, and
+     * a black window from then on, with draws still counting up. */
+    cfg.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst |
+                WGPUTextureUsage_CopySrc | WGPUTextureUsage_TextureBinding;
     cfg.width = sur->drawable.width;
     cfg.height = sur->drawable.height;
     cfg.alphaMode = WGPUCompositeAlphaMode_Opaque;
@@ -1371,11 +1397,8 @@ bool display_backend() {
         WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, nullptr);
         if (commands) {
             GEX_PRESENT_MARK(submit);
-            WGPUQueue queue = wgpuDeviceGetQueue(device);
-            wgpuQueueSubmit(queue, 1, &commands);
+            wgpuQueueSubmit(present_queue(device), 1, &commands);
             wgpuCommandBufferRelease(commands);
-            GEX_PRESENT_MARK(queue_release);
-            wgpuQueueRelease(queue);
         }
         wgpuCommandEncoderRelease(encoder);
     }

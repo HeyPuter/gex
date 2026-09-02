@@ -264,12 +264,18 @@ let kernelSpec = null;
  * than failing at `eglInitialize`. That is the same shape as a machine whose
  * GPU has fallen over, and better than pretending the session is broken.
  */
-async function startHostGl(compositor, glChannel, opts) {
+async function startHostGl(compositor, glChannel, opts, term) {
   try {
     return await compositor.hostGl(glChannel, opts);
   } catch (e) {
     const why = e?.message || String(e);
+    // Said where a person is looking. A GL device that will not start leaves
+    // every GL window black and nothing else amiss, so a line in the console
+    // is a line nobody reads: the demo's own terminal is where the rest of
+    // the session's trouble is reported.
     console.error(`[gex] the guest's OpenGL did not start (${opts.backend || 'virgl'}): ${why}`);
+    term?.writeln?.(`gex: the guest's OpenGL did not start (${opts.backend || 'virgl'}): ${why}`);
+    term?.writeln?.('gex: GL windows will be blank; everything else still runs');
     globalThis.__gexGlError = why;
     return null;
   }
@@ -505,10 +511,16 @@ export async function runProgram(
       const { DomDesktop } = await import('./dom-compositor.js');
       compositor = DomDesktop.create(element, wlChannel);
       globalThis.__gexDesktop = compositor;
+      // A GL device that dies mid-session leaves black windows and no other
+      // sign; say it where the session's other trouble is reported.
+      compositor.onglfailed = (why) => {
+        term.writeln(`gex: the guest's OpenGL is gone: ${why}`);
+        term.writeln('gex: GL windows will be blank; everything else still runs');
+      };
       // The GL goes onto the window's own canvas here rather than into a
       // scene: see `DomDesktop.hostGl`.
       if (gl === 'compositor' && glChannel) {
-        await startHostGl(compositor, glChannel, { api: 'core', backend: glBackend });
+        await startHostGl(compositor, glChannel, { api: 'core', backend: glBackend }, term);
       }
     }
     const canvas = typeof wl?.getContext === 'function' ? wl : null;
@@ -522,7 +534,7 @@ export async function runProgram(
           api: 'core',
           backend: glBackend,
           canvasBlit: new URLSearchParams(location.search).get('glcanvas') === '1',
-        });
+        }, term);
       }
     }
   }

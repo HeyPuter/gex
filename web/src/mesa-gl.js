@@ -258,6 +258,31 @@ export class MesaGlDevice {
       }
       const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
       out.#device = device;
+      // And out of reach of the collector for as long as the page lives.
+      //
+      // The fields above were supposed to be enough, and are not: the device
+      // still resolved its `lost` promise with "destroyed" a few frames in,
+      // with nothing calling `destroy()` -- a wrapper on the method proved
+      // that -- and a destroyed device fails nothing, it simply stops, which
+      // is a black window and climbing frame counters. The queue is held too,
+      // since the device's collection took it with them.
+      //
+      // Not tidy. A GL device is created once or twice in a page's life, and
+      // an object that outlives its owner is a cheaper mistake than a device
+      // collected in the middle of a frame.
+      (globalThis.__gexWebGPU ||= []).push({ adapter, device, queue: device.queue });
+      // Who destroyed it, if anyone does. `wgpuDeviceDestroy` from the wasm
+      // side is this method in emdawnwebgpu, so a wrapper here names the
+      // caller -- and a device that is destroyed stops doing anything without
+      // failing a single call, which is invisible from every other angle.
+      {
+        const destroy = device.destroy.bind(device);
+        device.destroy = () => {
+          console.error('[mesa-gl] the WebGPU device is being destroyed',
+                        new Error('destroy').stack);
+          destroy();
+        };
+      }
       // A lost device explains everything downstream at once -- every map
       // aborts, every submit is dropped -- and says nothing about itself
       // through the normal error channel, so it has to be watched for

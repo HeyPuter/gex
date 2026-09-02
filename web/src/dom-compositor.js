@@ -283,6 +283,7 @@ export class DomDesktop {
   #glList = [];
   #glLooks = 0;
   #glCopies = 0;
+  #glGone = false;
   /** Called when a window goes away, after its `onclosed`. */
   onwindowgone = null;
 
@@ -314,11 +315,20 @@ export class DomDesktop {
    */
   async hostGl(channel, opts = {}) {
     const canvas = document.createElement('canvas');
-    // Never shown, and in the document all the same: both backends look this
-    // canvas up with `document.querySelector`, and a canvas that is not in
-    // the document is simply not found -- which is a renderer that will not
-    // start rather than a canvas that stays blank.
-    canvas.style.display = 'none';
+    // In the document, because both backends look this canvas up with
+    // `document.querySelector` and one that is not in it is simply not found
+    // -- a renderer that will not start, rather than a canvas that stays
+    // blank. And off to the side rather than `display: none`, because a
+    // WebGPU context on a canvas that is not rendered does not survive:
+    // Chromium destroyed the device in the same breath as the first present,
+    // with nothing calling `destroy()` and every reference held, and from
+    // then on every GL window was black while the client went on drawing.
+    // The same backend on an OffscreenCanvas in a worker -- what the other
+    // compositor uses -- never lost a device once.
+    canvas.style.position = 'absolute';
+    canvas.style.top = '0';
+    canvas.style.left = '-99999px';
+    canvas.style.pointerEvents = 'none';
     // As large as the desktop, for two reasons: virglrenderer fixes the
     // drawable's size when it starts, so a window bigger than this would have
     // its frame clipped; and every window's frame is staged here, so it has
@@ -638,7 +648,29 @@ export class DomDesktop {
     const device = this.#gl;
     const renderer = device?.renderer;
     this.#glLooks++;
-    if (!device?.ok || !renderer) return;
+    if (!device?.ok) {
+      // Once, and loudly. A device that dies after it started -- a WebGPU
+      // device whose `lost` promise resolves is the way this happens -- fails
+      // nothing and says nothing: the client goes on submitting, the frame
+      // counters go on climbing, and every GL window is simply black from
+      // then on.
+      if (device && !this.#glGone) {
+        this.#glGone = true;
+        const why = device.error || 'no reason given';
+        console.error(`[dom-desktop] the GL device is gone: ${why}`);
+        this.onglfailed?.(why);
+      }
+      return;
+    }
+    // Which of the two backends is drawing. virglrenderer hands over a frame
+    // per surface as a texture, and this desktop asks for one window at a
+    // time; gex_wgpu presents into the canvas it was configured with, so the
+    // frame is simply *there* and the copy takes it as it is.
+    //
+    // Without this the WebGPU backend drew nothing at all: there is no
+    // renderer object on that path, and this returned before looking at a
+    // single window.
+    const staged = !renderer;
     // Read every frame rather than when a counter says it changed. The
     // counter was an optimisation worth a handful of wasm calls per frame,
     // and it was wrong once -- a list captured while only one client had
@@ -650,7 +682,7 @@ export class DomDesktop {
     for (const old of before) {
       if (!old.frame) continue;
       if (this.#glList.some((s) => s.frame === old.frame)) continue;
-      renderer.forgetSurface?.(old.frame);
+      renderer?.forgetSurface?.(old.frame);
     }
     if (!this.#glList.length) return;
     for (const [key, win] of this.#windows) {
@@ -661,6 +693,21 @@ export class DomDesktop {
       // Its pixels are the host's from now on: nothing paints this window
       // out of the guest's memory any more. See `#update`.
       win.external = true;
+      if (staged) {
+        // The frame is already on this desktop's canvas: that is where the
+        // backend presents. One canvas, so one frame -- with several GL
+        // windows on this backend they would all show whichever presented
+        // last, which is why the other one keeps a frame per surface.
+        const serial = device.presentedCount?.() ?? 0;
+        if (this.#glShown.get(key) === serial) continue;
+        const w = this.#glCanvas.width;
+        const h = this.#glCanvas.height;
+        if (w < 2 || h < 2) continue;   // still at its placeholder size
+        this.#glShown.set(key, serial);
+        this.#glCopies++;
+        win.showGl(this.#glCanvas, w, h);
+        continue;
+      }
       const frame = found.frame ? renderer.frameFor?.(found.frame) : null;
       if (!frame) continue;
       if (this.#glShown.get(key) === frame.serial) continue;
