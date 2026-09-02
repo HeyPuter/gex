@@ -2674,6 +2674,16 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // runs the previous compilation. Retired by dispatch page rather
             // than cache line — coarser, but a generator sweeps a whole
             // function so later lines find the page already retired.
+            // A block entered for a neighbour sharing its dispatch slot
+            // (x86-64): forget the neighbour so the miss that follows lifts it
+            // again, with this block as a mate, into a trampoline.
+            if op == gex_abi::cache_op::SLOT_CONFLICT {
+                if let Some(shared) = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
+                    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    sh.translated.remove(&(addr as u64));
+                }
+                return Ok(());
+            }
             if op == gex_abi::cache_op::IC_INVALIDATE {
                 let addr = addr as u64;
                 let page = addr / gex_abi::DISPATCH_PAGE;
@@ -2873,6 +2883,9 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     };
     if translated_module.exported_blocks.is_empty() {
         return Ok(false);
+    if std::env::var_os("GEX_TRACE_MISSES").is_some() {
+        eprintln!("[miss] pc={pc:#x} blocks={}", stats.blocks);
+    }
     }
 
     let engine = {

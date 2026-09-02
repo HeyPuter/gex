@@ -28,6 +28,15 @@ pub const INST_ALIGN_SHIFT: u32 = if X86 { 0 } else { 2 };
 /// The guest's instruction alignment in bytes.
 pub const INST_ALIGN: u64 = 1 << INST_ALIGN_SHIFT;
 
+/// `log2` of the dispatch slot granularity: a slot covers this many bytes of
+/// guest code. AArch64 instructions are 4-byte aligned, so a slot per
+/// instruction. x86-64 instructions start at any byte, but a slot per byte made
+/// the dispatch tables (one copy per thread Worker) four times the size and
+/// broke the browser's memory budget; a slot per 4 bytes instead, with an
+/// in-module trampoline wherever two blocks start in one slot (see
+/// `ctx::LAST_TARGET`, which every dispatch records so the trampoline can tell).
+pub const DISPATCH_SHIFT: u32 = 2;
+
 /// Length in bytes of the guest's system-call instruction (`svc #0` is a
 /// 4-byte word; `syscall` is `0f 05`). Where a syscall resumes is the
 /// instruction after it, and a host that restarts or skips one needs this.
@@ -320,7 +329,7 @@ pub const DISPATCH_PAGE: u64 = 4096;
 
 /// Dispatch-table slots per covered page: one per possible instruction start,
 /// so 1,024 for A64's 4-byte words and 4,096 for byte-aligned x86-64.
-pub const SLOTS_PER_PAGE: u64 = DISPATCH_PAGE >> INST_ALIGN_SHIFT;
+pub const SLOTS_PER_PAGE: u64 = DISPATCH_PAGE >> DISPATCH_SHIFT;
 
 /// Table slots reserved at index 0, all holding the miss stub. An untranslated
 /// page has directory entry zero, so its index lands in this span and calls
@@ -535,6 +544,11 @@ pub mod exports {
 
 /// Cache-maintenance operation codes passed to [`imports::CACHE_OP`].
 pub mod cache_op {
+    /// Not a cache operation: a block was entered for a neighbouring address
+    /// that shares its dispatch slot (x86-64, see `DISPATCH_SHIFT`). The host
+    /// forgets that address so the miss that follows re-translates it and the
+    /// slot gets a trampoline covering both.
+    pub const SLOT_CONFLICT: i32 = 9;
     /// `dc zva` — zero a cache line's worth of memory.
     pub const DC_ZVA: i32 = 0;
     /// `dc cvau`/`civac`/… — clean; a no-op on a coherent host.
@@ -564,7 +578,7 @@ pub const CNTFRQ: u64 = 1_000_000_000;
 /// the table index, so a caller holding only the base (table 0) can pass it.
 #[inline]
 pub const fn dispatch_index(pc: u64, page_entry: u32) -> u64 {
-    dispatch_entry_base(page_entry) as u64 + ((pc % DISPATCH_PAGE) >> INST_ALIGN_SHIFT)
+    dispatch_entry_base(page_entry) as u64 + ((pc % DISPATCH_PAGE) >> DISPATCH_SHIFT)
 }
 
 #[cfg(test)]

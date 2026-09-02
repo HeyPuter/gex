@@ -266,6 +266,9 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     if trace_blocks() {
         e.emit_trace_point(block.start);
     }
+    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        e.emit_target_check(block.start);
+    }
     if let Some(g) = &block.guard {
         e.emit_guard(block.start, g);
     }
@@ -283,6 +286,9 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     }
     if trace_blocks() {
         e.emit_trace_point(block.start);
+    }
+    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        e.emit_target_check(block.start);
     }
     if let Some(g) = &block.guard {
         e.emit_guard(block.start, g);
@@ -2790,6 +2796,13 @@ impl<'a> Emitter<'a> {
         let no_direct = *NO_DIRECT.get_or_init(|| std::env::var_os("GEX_NO_DIRECT_JUMP").is_some());
         if !no_direct {
             if let Some(&func) = self.cx.blocks.get(&target) {
+                // The callee checks `LAST_TARGET` against its own address
+                // (x86-64), so a direct jump has to record it as a dispatch would.
+                if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+                    self.f.local_get(self.ctx_local);
+                    self.f.i64_const(target as i64);
+                    self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
+                }
                 self.f.local_get(self.ctx_local);
                 self.f.return_call_local(func);
                 return;
@@ -2802,6 +2815,13 @@ impl<'a> Emitter<'a> {
         self.store_pc(target);
         self.f.i64_const(target as i64);
         self.f.local_set(self.scratch_i64);
+        // The exact target, for a slot shared by several blocks (x86-64): the
+        // trampoline there reads `LAST_TARGET` to pick one.
+        if gex_abi::X86 {
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(self.scratch_i64);
+            self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
+        }
         self.emit_dispatch_tail_call();
     }
 
@@ -2856,13 +2876,13 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// index += (pc & 0xfff) >> INST_ALIGN_SHIFT
+    /// index += (pc & 0xfff) >> DISPATCH_SHIFT
     fn add_page_offset(&mut self) {
         self.f.local_get(self.scratch_i64);
         self.f.i64_const((DISPATCH_PAGE - 1) as i64);
         self.f.byte(0x83); // i64.and
-        if gex_abi::INST_ALIGN_SHIFT != 0 {
-            self.f.i64_const(gex_abi::INST_ALIGN_SHIFT as i64);
+        if gex_abi::DISPATCH_SHIFT != 0 {
+            self.f.i64_const(gex_abi::DISPATCH_SHIFT as i64);
             self.f.byte(0x88); // i64.shr_u
         }
         self.f.byte(0xa7); // i32.wrap_i64
@@ -2880,6 +2900,38 @@ impl<'a> Emitter<'a> {
     /// untranslated page, an out-of-range address and a real table-0 block all
     /// take the same path with no test between them. Index and table go into
     /// locals first: a value pushed outside a `block` cannot be consumed inside.
+    /// A slot covers several guest addresses (x86-64: four bytes), so a block
+    /// can be entered for a neighbour's address. Every dispatch records the
+    /// exact target in `ctx::LAST_TARGET`; a block that is not it asks the
+    /// host to translate the real target (the slot then gets a trampoline
+    /// covering both) and dispatches again.
+    fn emit_target_check(&mut self, start: u64) {
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x29, 3, ctx::LAST_TARGET as u32);
+        self.f.i64_const(start as i64);
+        self.f.byte(0x52); // i64.ne
+        self.f.if_void();
+        // First make the host forget the neighbour: a translated address is
+        // otherwise answered without translating, and the plain block here
+        // would be entered for it again, for ever.
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(start as i64);
+        self.f.i32_const(gex_abi::cache_op::SLOT_CONFLICT);
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x29, 3, ctx::LAST_TARGET as u32);
+        self.f.call(self.cx.cache_op);
+        self.f.local_get(self.ctx_local);
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x29, 3, ctx::LAST_TARGET as u32);
+        self.f.call(self.cx.dispatch_miss);
+        self.f.byte(0x1a); // drop the slot it answered with
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x29, 3, ctx::LAST_TARGET as u32);
+        self.f.local_set(self.scratch_i64);
+        self.emit_dispatch_tail_call();
+        self.f.end();
+    }
+
     /// The self-modifying-code guard (`Block::guard`): compare the block's
     /// code bytes with what was lifted; on a difference tell the host to
     /// re-lift the page (`cache_op` IC_INVALIDATE, the same path `ic ivau`
@@ -2916,6 +2968,11 @@ impl<'a> Emitter<'a> {
         self.f.call(self.cx.cache_op);
         self.f.i64_const(start as i64);
         self.f.local_set(self.scratch_i64);
+        if gex_abi::X86 {
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(self.scratch_i64);
+            self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
+        }
         self.emit_dispatch_tail_call();
         self.f.end();
     }

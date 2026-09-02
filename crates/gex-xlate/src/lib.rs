@@ -914,9 +914,34 @@ fn translate_seeded(
     shared_memory: bool,
     intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (TranslatedModule, Stats) {
-    let (blocks, mut stats) = discover(
+    let (mut blocks, mut stats) = discover(
         memory, entry, seeds, executable, known, limits, max_blocks, intrinsics,
     );
+    // A dispatch slot spans more bytes than an instruction (x86-64): every
+    // block already translated that shares a slot with one of these has to be
+    // in the same module, or this module's slot write would hide it. Lift
+    // those again here; the slot then gets a trampoline covering all of them.
+    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        let span = 1u64 << gex_abi::DISPATCH_SHIFT;
+        let mut have: HashSet<u64> = blocks.iter().map(|b| b.start).collect();
+        let mut i = 0;
+        while i < blocks.len() {
+            let a = blocks[i].start;
+            let lo = a & !(span - 1);
+            for b in lo..lo + span {
+                if b != a && !have.contains(&b) && known(b) && fetchable(memory, executable, b) {
+                    have.insert(b);
+                    let (blk, _) = match intrinsics.get(&b) {
+                        Some(&k) => (intrinsic::block(b, k), None),
+                        None => lift_one(b, memory, executable, limits),
+                    };
+                    stats.blocks += 1;
+                    blocks.push(blk);
+                }
+            }
+            i += 1;
+        }
+    }
     let mut modules = emit_modules(blocks, entry, page_table, shared_memory, false, usize::MAX);
     let module = modules.pop().expect("an unbounded budget emits one module");
     stats.wasm_bytes = module.wasm.len();

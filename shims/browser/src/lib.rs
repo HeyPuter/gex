@@ -8888,7 +8888,7 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
 /// rather than assumes, so one `gex.mjs` serves both shims.
 #[no_mangle]
 pub extern "C" fn gex_inst_align_shift() -> i32 {
-    gex_abi::INST_ALIGN_SHIFT as i32
+    gex_abi::DISPATCH_SHIFT as i32
 }
 
 #[no_mangle]
@@ -9063,6 +9063,15 @@ static SMC_INVALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 #[no_mangle]
 pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
+    if op == gex_abi::cache_op::SLOT_CONFLICT {
+        // A block entered for a neighbour sharing its slot: forget the
+        // neighbour so the miss that follows lifts it (with this block as a
+        // mate) into a trampoline. See `gex_abi::DISPATCH_SHIFT`.
+        with_host(|h| {
+            h.jit.translated.remove(&(addr as u64));
+        });
+        return;
+    }
     if op == gex_abi::cache_op::IC_INVALIDATE {
         // Self-modifying / JIT-generated guest code (PCRE2's regex JIT does this)
         // wrote new machine code to a page it had already run, and is flushing
@@ -9167,7 +9176,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
         // single heartbeat sample prints whichever pc was current, which for a
         // loop is the same few addresses and says nothing about the work.
         unsafe {
-            let slot = (pc as u64 as usize >> gex_abi::INST_ALIGN_SHIFT) % HOT_SLOTS;
+            let slot = (pc as u64 as usize >> gex_abi::DISPATCH_SHIFT) % HOT_SLOTS;
             if HOT_PC[slot] == pc as u64 {
                 HOT_N[slot] += 1;
             } else if HOT_N[slot] == 0 {
@@ -9439,7 +9448,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // while a second ask for one span would loop for ever.
         let page = gex_abi::dispatch_page(pc);
         let width = FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
-        let from = ((pc & 0xfff) >> gex_abi::INST_ALIGN_SHIFT) as u32 & !(width - 1);
+        let from = ((pc & 0xfff) >> gex_abi::DISPATCH_SHIFT) as u32 & !(width - 1);
         let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
         let key = page * spans as u64 + (from / width) as u64;
         // Under KLOCK: `FILL_ASKED` is a `SingleThreaded<RefCell<BTreeSet>>`, and
@@ -9492,7 +9501,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         } else {
             let width = FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
             let page = gex_abi::dispatch_page(pc);
-            let from = ((pc & 0xfff) >> gex_abi::INST_ALIGN_SHIFT) as u32 & !(width - 1);
+            let from = ((pc & 0xfff) >> gex_abi::DISPATCH_SHIFT) as u32 & !(width - 1);
             let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
             let key = page * spans as u64 + (from / width) as u64;
             if with_host(|_| FILL_ASKED.0.borrow().contains(&key)) { 2 } else { 3 }
