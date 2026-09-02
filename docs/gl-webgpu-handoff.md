@@ -7121,3 +7121,85 @@ before any GL work, and one shader that cannot split a combined sampler. The
 front and back polygon modes differing, and 8-bit indices -- of which only
 8-bit indices is straightforwardly implementable (convert to 16-bit), the rest
 having no WebGPU equivalent at all.
+
+## Four more from the sweep: byte indices, MSAA copies, point sprites (2026-09-02)
+
+### 8-bit indices
+
+`glDrawElements` with `GL_UNSIGNED_BYTE` is ordinary GL and WebGPU has no
+index width for it, so the draw was refused and the context latched. They are
+now widened to 16 bits before anything else looks at them, so the unfilled
+rewrite, the restart split and the draw all see a width WebGPU takes. A
+multi-draw is left alone and converted when the loop re-issues each of its
+draws.
+
+`gl44-byte-indices-probe` checks that the *right bytes* are widened, which a
+test drawing triangle 0,1,2 would not: the buffer holds eight vertices, the
+first five collapsed onto a point where they cover nothing, and the triangle
+that covers anything is 5,6,7. It also asks for the same triangle through
+`glDrawElementsBaseVertex` with indices 0,1,2 and a base vertex of 5, which
+exercises the other half -- the base vertex has to be folded into the indices,
+because a biased byte index need not fit sixteen bits and the driver refuses to
+be handed one separately.
+
+### A copy cannot change the sample count
+
+```
+Source [...] sample count (1) and destination [...] sample count (4) does not
+match.
+```
+
+`gex_wgpu_blit` takes a copy fast path when the formats and sizes agree, and
+sample count was not among the things it checked. Multisample to single was
+already handled by resolving; this is the other direction, a single-sampled
+image replicated into a multisampled target, which only a draw can do. It now
+goes to `u_blitter` with the rest of the non-copy cases. Emitting the copy
+anyway produced an invalid command buffer, and that is not one lost blit --
+every later submit fails with it. `glpuzzle`, `pointblast` and `spriteblast`
+all did this.
+
+### gl_PointCoord, GL_COORD_REPLACE, and inputs nobody writes
+
+Three related failures behind `The fragment input at location 4 doesn't have a
+corresponding vertex output`, which is fatal in WebGPU and merely undefined in
+GL.
+
+`gl_PointCoord` first: ntv emits `SpvBuiltInPointCoord`, which WGSL has no
+equivalent of. WebGPU rasterises a point as a single pixel -- something this
+driver already accepts, since `gex_wgpu_strip_point_size` drops `gl_PointSize`
+for the same reason -- and over one fragment the sprite coordinate is that
+fragment's centre. So `nir_load_point_coord` lowers to `(0.5, 0.5)`, which is
+not an approximation of a wider point but the exact answer for the point
+WebGPU draws. `caps->fs_point_is_sysval` then asks st/mesa for the system value
+rather than a varying with no producer, exactly as
+`fs_face_is_integer_sysval` does for FrontFacing.
+
+`GL_COORD_REPLACE` is the harder half. The rasteriser feeds a texcoord from
+the point sprite, so the vertex shader does not write it -- and whether it
+should be substituted depends on the *draw*, not on shader state: the same
+rasterizer state stays bound across triangle draws that read the same texcoord
+from the vertex shader for real, and substituting there would replace their
+texture coordinates with a constant. So the fragment variant is keyed on the
+sprite mask *and* on whether this draw is points.
+
+`nir_lower_texcoord_replace` is not usable for it. That pass expects the
+io-lowered form, and the NIR at this stage still addresses its inputs through
+derefs: it reported progress while leaving both the loads and the variable in
+place. The variable is what matters -- the emitter declares an input for every
+`shader_in` variable there is, so the pipeline stayed invalid even once the
+loads were gone. Chasing that took three rounds of "lowered=1, inputs
+unchanged" before printing the variant's inputs rather than trusting the
+return value.
+
+What replaced it is one pass over the form actually present, doing both
+substitutions: a coord-replaced texcoord gets `(0.5, 0.5, 0, 1)`, and an input
+with no producer at all gets zero -- GL leaves such a varying undefined, so
+zero is a conformant answer. Then DCE, then `nir_remove_dead_variables`, which
+is the step that actually removes the input. Removing fragment inputs is safe
+in this direction: WebGPU requires every fragment input to have a vertex
+output, not the reverse, so an unread vertex output is harmless while an
+unwritten fragment input is fatal.
+
+That last part is general rather than sprite-specific, and it is the reason
+`point-sprite` and `spriteblast` needed it: they read a texcoord before
+enabling `GL_COORD_REPLACE`, so nothing produces it and nothing is meant to.
