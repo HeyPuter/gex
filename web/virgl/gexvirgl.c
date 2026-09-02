@@ -40,6 +40,7 @@
 
 #include <GLES3/gl3.h>
 
+#include <emscripten/console.h>
 #include "virglrenderer.h"
 #include "vtest.h"
 #include "vtest_protocol.h"
@@ -427,7 +428,18 @@ static const char *const gex_cmd_names[] = {
 /* -- what JavaScript calls ----------------------------------------------- */
 
 EMSCRIPTEN_KEEPALIVE
+/* virglrenderer's default logger writes through stdio, and in this module a
+ * FILE's write hook is null: the first error it tried to report (es2gears's
+ * shader compile failure) died as "null function" inside fputs, saying
+ * nothing. Route its messages to the browser console instead. */
+static void gex_virgl_log(enum virgl_log_level_flags level, const char *message, void *user) {
+    (void)level;
+    (void)user;
+    emscripten_console_error(message);
+}
+
 int gex_virgl_init(int width, int height) {
+    virgl_set_log_callback(gex_virgl_log, NULL, NULL);
     EmscriptenWebGLContextAttributes attr;
     emscripten_webgl_init_context_attributes(&attr);
     attr.majorVersion = 2;
