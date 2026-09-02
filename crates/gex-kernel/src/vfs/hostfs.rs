@@ -236,11 +236,20 @@ impl FileSystem for HostFs {
         std::fs::remove_file(self.host_path(path)?).map_err(|e| Errno::from_io(&e))
     }
 
-    fn mkdir(&self, path: &str, _mode: u32) -> Result<(), Errno> {
+    fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        std::fs::create_dir(self.host_path(path)?).map_err(|e| Errno::from_io(&e))
+        let host = self.host_path(path)?;
+        std::fs::create_dir(&host).map_err(|e| Errno::from_io(&e))?;
+        // Honour the requested permission bits: `create_dir` applies the host
+        // umask, but the guest asked for an exact mode -- wineserver makes its
+        // socket dir 0700 and refuses to run if it comes back accessible by
+        // others. Set them explicitly, after creation, so the umask does not
+        // clear them.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode & 0o7777));
+        Ok(())
     }
 
     fn rmdir(&self, path: &str) -> Result<(), Errno> {
