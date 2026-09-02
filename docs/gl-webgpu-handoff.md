@@ -7711,3 +7711,77 @@ on the CPU, or in a compute pass that writes two index lists. That is a real
 piece of work for eight compatibility-profile test programs and no
 application, so it stays refused, now for a stated reason rather than "nothing
 here could express that".
+
+
+## 181 of 341 programs could not start in the browser (2026-09-02)
+
+The app sweep runs natively, where every program links the system's own
+libGL. In the browser they link `guest/gl/out/libGL.so.1`, which **exports a
+fixed list of symbols** -- so a program calling one it does not export does
+not lose that call: it fails to resolve the symbol and never starts. None of
+that is visible in a native sweep, and nothing else was looking.
+
+The measurement takes seconds and needs no GPU:
+
+```
+nm -D --defined-only guest/gl/out/libGL.so.1 | awk '{print $3}' \
+  | grep -E '^(gl|egl|glX)' | sort -u > /tmp/have.txt
+objdump -T <program> | awk '/UND/ {print $NF}' | grep -E '^(gl|egl|glX)[A-Z]'
+```
+
+**181 of the 341 installed GL programs needed at least one absent symbol.**
+`glOrtho` was missing from 127 of them and `glColor3f` from 126. The
+fixed-function set had been built for glxgears and its own comment said so --
+"the whole set exists to run programs written before shaders: glxgears needs
+exactly these twenty and nothing else".
+
+Adding the rest of the immediate-mode and fixed-function state -- the
+glColor / glTexCoord / glVertex / glNormal / glRasterPos families in every
+width, glOrtho, glScalef, glTexEnv, glFog, glClipPlane, glAlphaFunc, glRect,
+glLineStipple, glPushAttrib and glPopAttrib, glPixelZoom, glLightModel,
+glLightf, glMaterialf, glMultMatrixf, glLoadMatrixf, glColorMaterial -- takes
+it to **302 of 341**.
+
+Narrower forms fold into the widest: glColor3f sends alpha 1, glTexCoord2f
+sends r 0 and q 1. That is what GL specifies them to mean, so one opcode
+serves a family and the host case is a single GL call, because the host's
+context is a compatibility one.
+
+### How to add one
+
+Three files, and only one of them by hand:
+
+- the opcode in `crates/gex-gl/src/proto.rs`. `guest/gl/gexgl.h` and
+  `web/src/gl-proto.js` are **generated** from it by `guest/gl/build.sh` --
+  editing the header directly is silently undone by the next build, which is
+  worth knowing before spending a compile on it.
+- the guest function in `guest/gl/gexgl.c`.
+- the host case in `web/mobilegl/gexgl-mobilegl.cpp`, which despite its name
+  is the guest-facing shim the *Mesa* wasm target links too (see its
+  `meson.build`). The WebGL host implements none of the compatibility
+  opcodes, so it needs nothing.
+
+`tools/gen_gl44_transport.py` cannot help: it covers GL 4.4 *core* and its
+`validate()` refuses any command not in that manifest.
+
+### Gate from pixels, not from state queries
+
+`tests/gl44-probe.sh fixed-function2` has eight cases -- glOrtho with glRectf,
+glColor3f through immediate mode, glScalef, glLoadMatrixf, glAlphaFunc,
+glPushAttrib/glPopAttrib, glClipPlane and linear fog -- and every one is
+checked by reading pixels back. A transport that drops a command leaves
+`glGet` answering whatever the host defaults to, which looks like success.
+8/8 natively and 8/8 through the guest in the browser, matching llvmpipe in
+both.
+
+### What is left, and why it is not more opcodes
+
+The remaining 39 programs need real marshalling:
+
+| symbols | programs | why it is harder |
+|---|---|---|
+| `glVertexPointer`, `glColorPointer`, `glTexCoordPointer`, `glEnableClientState`, `glDisableClientState` | 10 | pointers into guest memory, followed at draw time |
+| `glDrawPixels`, `glCopyPixels`, `glBitmap`, `glPixelTransferf` | 20 | pixel rectangles, with the whole pixel-store state |
+| `glRenderMode`, `glSelectBuffer`, `glInitNames`, `glLoadName`, `glPushName` | 4 | selection mode, which returns a buffer to the guest |
+| `glCallLists`, `glListBase` | 5 | an array of list names |
+| `glXCreatePbuffer` | 4 | GLX, not GL |
