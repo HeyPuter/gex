@@ -402,7 +402,7 @@ fn slot_space_top() -> u64 {
 /// prepared so the page table's identity hooks -- which run inside a
 /// translation, with the host borrowed -- can finish the key for a page without
 /// the host. Refreshed before each translation (`refresh_ident_snapshot`).
-static IDENT_SNAPSHOT: SingleThreaded<Vec<(u64, u64, std::collections::hash_map::DefaultHasher, u64)>> =
+static IDENT_SNAPSHOT: SingleThreaded<Vec<(u64, u64, std::collections::hash_map::DefaultHasher, u64, String)>> =
     SingleThreaded(RefCell::new(Vec::new()));
 
 fn refresh_ident_snapshot(h: &Host) {
@@ -415,20 +415,21 @@ fn refresh_ident_snapshot(h: &Host) {
         let Some((id, off)) = v.code.as_ref() else { continue };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         id.hash(&mut hasher);
-        snap.push((v.start, v.end, hasher, *off));
+        snap.push((v.start, v.end, hasher, *off, id.clone()));
     }
     *IDENT_SNAPSHOT.0.borrow_mut() = snap;
 }
 
-/// `page_identity` for a page number, from the snapshot.
-fn snapshot_page_key(page: u64) -> Option<u64> {
+/// `page_identity` for a page number, from the snapshot, with the object id
+/// for narration.
+fn snapshot_page_key(page: u64) -> Option<(u64, String)> {
     use std::hash::{Hash, Hasher};
     let addr = page * gex_abi::DISPATCH_PAGE;
     let snap = IDENT_SNAPSHOT.0.borrow();
-    let (start, _, hasher, off) = snap.iter().find(|(s, e, _, _)| addr >= *s && addr < *e)?;
+    let (start, _, hasher, off, id) = snap.iter().find(|(s, e, _, _, _)| addr >= *s && addr < *e)?;
     let mut hs = hasher.clone();
     (off + (addr - start)).hash(&mut hs);
-    Some(hs.finish())
+    Some((hs.finish(), id.clone()))
 }
 
 fn shared_page_table(
@@ -447,13 +448,23 @@ fn shared_page_table(
     // same base and the units they store are interchangeable. See `Identity`.
     table.set_identity(std::sync::Arc::new(gex_xlate::Identity {
         adopt: Box::new(|page| {
-            let key = snapshot_page_key(page)?;
+            let (key, id) = snapshot_page_key(page)?;
             // SAFETY: a lookup in the kernel's own memory, borrowing nothing here.
             let base = unsafe { k_slot_get(page, key) };
+            if tracing() && base != 0 {
+                trace_line(&format!(
+                    "[gex] page {page:#x} adopts base {base:#x} by identity {id:?} key {key:#x}\n"
+                ));
+            }
             (base != 0).then_some(base)
         }),
         publish: Box::new(|page, entry| {
-            if let Some(key) = snapshot_page_key(page) {
+            if let Some((key, id)) = snapshot_page_key(page) {
+                if tracing() {
+                    trace_line(&format!(
+                        "[gex] page {page:#x} publishes base {entry:#x} as identity {id:?} key {key:#x}\n"
+                    ));
+                }
                 // SAFETY: as above.
                 unsafe { k_slot_put(page, key, entry) };
             }
@@ -5325,6 +5336,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
     }
     count_syscall();
+    watch_mem("syscall");
     // Recorded before the kernel is taken, and readable without taking it: a
     // crash inside a syscall leaves the kernel borrowed, so this one number is
     // what survives to narrow a crash to a single handler.
@@ -6884,11 +6896,24 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     FILL_ASKED.0.borrow_mut().clear();
     FILL_FAILED.0.borrow_mut().clear();
     SERVED_PAGE.0.borrow_mut().clear();
+    // And the modules inherited from the parent: they cover the PARENT's pages.
+    // The new program's image sits at the same PIE base, so a page number the
+    // parent's image had is now another program's code; a fill answered from
+    // the inherited module would run the old program's block there (x86 qt6ct
+    // exec'd from dash ran dash's `_init` in qt6ct's address space).
+    LAZY_OWNER.0.borrow_mut().clear();
     // Slots already handed out are never reused, so allocation carries on from
     // the high-water mark. No entries, so `usize::MAX` ("nothing with active
     // segments to place") is true whatever the new program turns out to be.
     h.jit.page_table = shared_page_table(&[], h.jit.page_table.slots(), usize::MAX);
     h.jit.translated.clear();
+    // And whatever was queued for the host to install: a fork copies the
+    // parent's queue, and a module of the OLD program installed after this
+    // point publishes its pages -- the old program's bases for the new
+    // program's addresses (`install-done` wrote dash's base for qt6ct's
+    // `_init` page; the block there was dash's).
+    h.jit.pending.clear();
+    publish_pending(h);
     // Except the closure's: those modules are still in the dispatch tables
     // (`execve` rebuilds the image, not the wasm instance), so the new program
     // gets every library the build covered for nothing. See `CLOSURE_DIRS`.
@@ -9263,6 +9288,34 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 /// The pc of the most recent dispatch miss, for the host's install check.
 static LAST_MISS_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A guest address to watch (`GEX_WATCH_MEM`): its 8 bytes are re-read at every
+/// syscall and dispatch miss, and a change is reported with what ran between.
+/// For "who wrote this word": a GOT slot that turns into code bytes, say.
+static WATCH_MEM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WATCH_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_set_watch_mem(addr: i64) {
+    WATCH_MEM.store(addr as u64, std::sync::atomic::Ordering::Relaxed);
+    WATCH_LAST.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn watch_mem(where_: &str) {
+    let addr = WATCH_MEM.load(std::sync::atomic::Ordering::Relaxed);
+    if addr == 0 {
+        return;
+    }
+    let now = GuestMem::new(guest_bytes()).read_u64(addr).unwrap_or(u64::MAX - 1);
+    let last = WATCH_LAST.swap(now, std::sync::atomic::Ordering::Relaxed);
+    if now != last {
+        warn_line(&format!(
+            "[watch] pid {} [{addr:#x}] = {now:#x} (was {last:#x}) at {where_}, last syscall {}\n",
+            my_pid(),
+            LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
+        ));
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn gex_miss_pc() -> i64 {
     LAST_MISS_PC.load(std::sync::atomic::Ordering::Relaxed) as i64
@@ -9278,6 +9331,7 @@ pub extern "C" fn gex_my_pid() -> i32 {
 pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
     LAST_MISS_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
+    watch_mem("miss");
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
         // did not come back from, and a line printed after never appears.
@@ -9659,14 +9713,38 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         // Every page they cover, before the install: install
                         // asks the shim which slot each block belongs in, and
                         // the answer comes from here.
-                        // Only pages this process has not numbered: see
-                        // `gex_jit_installed` for why a second base is fatal.
+                        //
+                        // Only pages whose code HERE is what the stored unit
+                        // was built from: a libc unit's blocks run into the
+                        // program that called it, so its covered pages include
+                        // the image pages of the process that built it -- another
+                        // program at the same PIE base (dash's `_init` page
+                        // served into qt6ct). The identity map says which base a
+                        // (page, identity) has; a page whose identity here does
+                        // not name this base is another program's, and the
+                        // entry is dropped (its blocks land in slots nothing
+                        // dispatches to).
+                        let mut keep: Vec<(u64, u32)> = Vec::new();
                         for (p, b) in d {
+                            let same = page_identity(h, *p * gex_abi::DISPATCH_PAGE)
+                                // SAFETY: a lookup in the kernel's memory, borrowing nothing here.
+                                .map_or(false, |k| unsafe { k_slot_get(*p, k) } == *b);
+                            if !same {
+                                if tracing() {
+                                    trace_line(&format!(
+                                        "[gex] serve: page {p:#x} base {b:#x} is another program's here, entry dropped\n"
+                                    ));
+                                }
+                                continue;
+                            }
+                            // Only pages this process has not numbered: see
+                            // `gex_jit_installed` for why a second base is fatal.
                             if h.jit.page_table.lookup(*p).is_none() {
                                 h.jit.page_table.assign(*p, *b);
                             }
+                            keep.push((*p, *b));
                         }
-                        dirs.extend_from_slice(d);
+                        dirs.extend_from_slice(&keep);
                         h.jit.reuse_served += 1;
                     }
                     // Does any of this answer the block that faulted? A unit

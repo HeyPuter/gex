@@ -264,6 +264,7 @@ const host = new ProcessHost({
     traceMisses: !!process.env.GEX_TRACE_MISSES,
     // GEX_TRACE_BLOCKS: the per-block register trace, as natively.
     traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
+    watchMem: process.env.GEX_WATCH_MEM || undefined,
     // GEX_CHECK_SP checks `sp` at the top of every block: a corrupt `sp` is
     // invisible until dereferenced, so this names the block that arrives with
     // the bad value, not the one that dies on it. See #73.
@@ -389,6 +390,7 @@ try {
       traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
       traceMisses: !!process.env.GEX_TRACE_MISSES,
       checkSp: !!process.env.GEX_CHECK_SP,
+      watchMem: process.env.GEX_WATCH_MEM || undefined,
       noIntrinsics: !!process.env.GEX_NO_INTRINSICS,
       intrinsicMask: process.env.GEX_INTRINSIC_MASK ? Number(process.env.GEX_INTRINSIC_MASK) : undefined,
       // The suite compares this run against QEMU on the same machine, and QEMU
