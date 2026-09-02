@@ -9505,14 +9505,22 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // `k_signal_seq` is one relaxed load every `kill` bumps; the table walk
     // behind its lock is asked only when that counter moved.
     let sent = if unsafe { k_present() } != 0 { unsafe { k_signal_seq() } } else { 0 };
+    // Or an interval timer that has expired: `alarm`/`setitimer` become a
+    // signal only when the kernel checks them, which `deliver_pending` does --
+    // so a due timer has to count as "something to deliver" here, or a
+    // process that never blocks (a shell's `timeout`) never gets its SIGALRM.
     let anything = SIGNAL_SEEN.swap(sent, std::sync::atomic::Ordering::Relaxed) != sent
-        || with_host(|h| h.kernel.signals.has_pending());
+        || with_host(|h| h.kernel.signals.has_pending() || h.kernel.timer_due());
     // A thread table with this thread in it: a safepoint can fire in a child
     // still being built, where an empty table would panic.
     let have_thread = with_host(|h| cur() < h.threads.len());
     if have_thread
         && anything
-        && with_host(|h| h.kernel.procs.has_signals(h.kernel.pid) || h.kernel.signals.has_pending())
+        && with_host(|h| {
+            h.kernel.procs.has_signals(h.kernel.pid)
+                || h.kernel.signals.has_pending()
+                || h.kernel.timer_due()
+        })
     {
         let delivered = with_host(|h| {
             let a = h.threads[cur()].kstate.ctx_addr;
