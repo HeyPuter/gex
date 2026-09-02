@@ -7227,3 +7227,150 @@ texture view missing a usage flag (`dissolve`, `tri-z-eq`), a shader reading
 more of a uniform buffer than its layout declares (`blinking-teapot`), a
 filtering sampler bound where the layout says non-filtering (`vert-tex`), and
 an overlapping copy (`readpix`) -- four distinct bugs, all still ours.
+
+## The last two validation errors, and a correction about the refusals (2026-09-02)
+
+### A texture copied onto itself
+
+```
+Copy source and destination are overlapping layer ranges ([0, 1) and [0, 1))
+of [Texture (unlabeled 750x250 px, TextureFormat::BGRA8Unorm)] mip level 0
+ - While encoding [CommandEncoder].CopyTextureToTexture(...)
+```
+
+WebGPU refuses a `CopyTextureToTexture` whose source and destination
+subresources are the same, whether or not the regions actually overlap, and it
+refuses it by invalidating the whole command buffer -- so the next `Submit`
+fails too, and so does every one after it. GL has no such rule, and st/mesa's
+`ReadPixels` staging blit asks for one; `readpix` reached it on a 750x250
+window.
+
+The copy now goes through a scratch texture of the requested size, both halves
+recorded in the same encoder so they stay ordered. The y-flipping path needed
+its row range rebased as well: a flipped box runs *upward* from `box->y`, so
+its lowest row is `box->y - |height|`, and the loop reads `box->y - 1 - i`,
+which means the rebased origin is the row count rather than zero.
+
+Worth knowing for the next such bug: the error text names both textures by
+size, so a copy that has already been routed through a scratch says so -- the
+source appears with the scratch's dimensions. That is how it became clear the
+first attempt had not taken effect at all, which was an install rather than a
+code problem. `web/build-mesa-native.sh` builds; it does not install, and the
+sweep and every run script read `/tmp/gex-mesa-native/inst`. A rebuild without
+`meson install` measures the previous driver, silently and with every
+appearance of having worked.
+
+### A uniform block bigger than the buffer bound to it
+
+```
+The shader uses more bytes of the buffer (192) than the layout's
+minBindingSize (80).
+```
+
+`blinking-teapot`'s fragment shader declares
+
+```glsl
+layout(std140) uniform colors0 {
+    float DiffuseCool; float DiffuseWarm;
+    vec3 SurfaceColor; vec3 WarmColor; vec3 CoolColor;
+    vec4 some[8];
+};
+```
+
+which std140 lays out at 192 bytes. It never reads `some`, and it uploads 80.
+GL allows that -- `glBindBufferRange` may bind less than the block, and reads
+past the end are undefined rather than an error.
+
+The first fix was to relax `minBindingSize` to zero for that binding, which
+moved the failure rather than removing it:
+
+```
+[Buffer] bound with size 80 at group 2, binding 1 is too small. The pipeline
+requires a buffer binding which is at least 192 bytes.
+```
+
+WebGPU checks the binding against the size the *module* declares in two
+places, at pipeline creation and again at draw time against the pipeline, so
+the binding genuinely has to be big enough -- which means the buffer does. The
+buffer now grows once to hold the whole block, carrying its old contents
+across with a `CopyBufferToBuffer` submitted ahead of anything already
+recorded, and the binding names the full size. The bytes past the end read as
+zero, which is one of the values GL's "undefined" allows.
+
+The resource keeps the size st/mesa gave it: uploads, maps and the shadow all
+still measure it by `allocation_size`, and only the WGPU buffer behind it
+changes, tracked separately as `gpu_size`. Growing `allocation_size` instead
+would have been a buffer overrun -- the shadow is allocated at that size and
+the upload path reads that many bytes out of it.
+
+Each shader records what its blocks need at compile time, after
+`ntv_shader_prepare`, which is what puts the variables into the word-array
+shape the emitter measures. **A UBO variable arrives as `GLSL_TYPE_INTERFACE`,
+for which `glsl_type_is_struct()` answers no.** Reading the size through it
+returned zero, the relaxation never fired, and the error was unchanged through
+a build and run cycle that looked like the fix simply not working. Use
+`glsl_type_is_struct_or_ifc`.
+
+### Correction: fourteen of the 37 refusals were implementable
+
+The previous section said the 37 refusals were "line and polygon stipple, line
+smoothing, logic ops, and front and back polygon modes differing: WebGPU has no
+equivalent for any of them". That was wrong, and reading the refusal messages
+by byte offset is what showed it. `create_rasterizer_state` reports the first
+byte where the requested state and the state it can honour differ, and the
+`struct pipe_rasterizer_state` bitfield order turns that into a field name:
+
+| byte | bit | field | programs |
+|---|---|---|---|
+| 0 | 0x02 | `light_twoside` | 4 |
+| 0 | 0x80 | `fill_front` low bit (front != back) | 6 |
+| 1 | 0x02 | `fill_back` (front != back) | 1 |
+| 2 | 0x01 | `poly_stipple_enable` | 4 |
+| 3 | 0x04 | `line_stipple_enable` | 6 |
+| 3 | 0x02 | `line_smooth` | 2 |
+| 6 | 0x40 | `clip_plane_enable` bit 0 | 7 |
+
+Three of those groups are now closed, fourteen programs between them.
+
+**User clip planes (7 programs).** `caps->clip_planes = 0` has st/mesa run
+`nir_lower_clip_vs`, so the vertex shader writes `gl_ClipDistance` for each
+enabled plane and WebGPU's `clip_distances` does the clipping -- the same path
+`clip_distance`'s own CTS cases already took. st sets `clip_plane_enable`
+either way, because the field also means "which of a shader's own clip
+distances are live", so refusing it refused the whole rasterizer state and
+those seven programs lost culling and the scissor over a plane the shader was
+already honouring. `tri-userclip` now matches llvmpipe exactly.
+
+**Two-sided lighting (4 programs).** `caps->two_sided_color = false` has st
+lower it into the fragment shader with `nir_lower_two_sided_color` and stop
+setting `light_twoside` at all. The cap was left on because the lowering used
+to reach an ALU opcode zink's SPIR-V emitter did not implement; that gap -- the
+vector comparison reductions -- was closed with `nir_lower_alu_width`, and
+nothing had gone back to check. `morph3d` matches llvmpipe.
+
+**3D textures (3 programs, and this one was a plain bug).** Every 3D texture
+there is was refused:
+
+```
+sampler view refused (shape or format) format=r8g8b8a8_unorm target=3
+levels=0..0 layers=0..0
+```
+
+The gate demanded `last_layer == depth0 - 1`. A 3D texture's depth is not a
+layer range: st/mesa's `last_layer()` returns `array_size - 1`, and a 3D
+texture's `array_size` is 1, so the view arrives as 0..0. The view creation
+code was already correct -- it skips `baseArrayLayer`/`arrayLayerCount` for
+`PIPE_TEXTURE_3D` -- so only the gate had to change. `tri-tex-3d`,
+`quad-tex-3d` and `stex3d` all match llvmpipe.
+
+What is left of the refusals is line stipple (6), front and back polygon modes
+differing (7), polygon stipple (4), line smoothing (2), logic ops (2) and three
+singletons. Of those, **polygon stipple has a lowering waiting in Mesa** --
+`nir_lower_pstipple_fs` in `gallium/auxiliary/nir/nir_draw_helpers.c`, which
+d3d12 uses: it samples a 32x32 stipple texture at `gl_FragCoord/32` and
+discards where the alpha is zero, and `util_pstipple_create_stipple_texture`
+builds the texture from the pattern. That needs a fragment variant key bit and
+one more texture binding, both of which this driver already has machinery for.
+Line stipple and line smoothing have only `nir_lower_aaline_fs`, which needs a
+companion vertex stage that the `draw` module supplies and this driver does
+not.
