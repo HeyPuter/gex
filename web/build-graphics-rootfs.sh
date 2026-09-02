@@ -212,7 +212,8 @@ root, ma, roots = sys.argv[1], sys.argv[2], sys.argv[3:]
 # Where ld.so looks, after the object's own directory. This Debian keeps its
 # libraries in the multiarch directory, and /lib is not a link to /usr/lib
 # here, so both are searched -- in the order the loader searches them.
-LIBDIRS = [f'/usr/lib/{ma}', f'/lib/{ma}', '/usr/lib', '/lib']
+# `pulseaudio/` is libpulse's RUNPATH directory (libpulsecommon lives there).
+LIBDIRS = [f'/usr/lib/{ma}', f'/lib/{ma}', '/usr/lib', '/lib', f'/usr/lib/{ma}/pulseaudio']
 
 
 def needed(path):
