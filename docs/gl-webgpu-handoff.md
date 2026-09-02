@@ -7038,3 +7038,64 @@ work) and one shader that still cannot split a combined sampler. The 54
 refusals are dominated by polygon mode LINE/POINT (10 programs, which would
 need triangles rewritten to line topology) plus line and polygon stipple and
 line smoothing, none of which WebGPU has.
+
+## glPolygonMode: the polygon rewritten as its edges (2026-09-02)
+
+The largest remaining group in the sweep was `fill_front`/`fill_back` -- ten
+programs asking for `glPolygonMode(GL_LINE)` or `(GL_POINT)`. WebGPU has no
+polygon mode, and refusing the state bound **no rasterizer state at all**, so
+those programs lost culling and the scissor as well as the wireframe: they drew
+filled *and* wrong.
+
+Mesa already has the rewrite. `u_unfilled_translator` and
+`u_unfilled_generator` turn a polygon into the lines or points it would be
+drawn as, and using them rather than open-coding it is what makes quads and
+polygons come out right: taking each triangle's three edges after converting a
+quad into two triangles would draw a diagonal across it that GL does not draw.
+So the conversion runs **before** the topology rewrite, on the primitive the
+application asked for, and comes back through `draw_vbo` as LINES or POINTS --
+which are not polygons, so it does not recurse.
+
+`gl44-polygon-mode-probe` checks the result by coverage rather than by
+acceptance, because a driver that took the state and drew the triangle filled
+anyway would look like it worked. Filled and unfilled agree with llvmpipe
+exactly: **1770 of 4096 pixels lit filled, 183 unfilled**, same numbers on both.
+
+Two limitations, both honest and still refused:
+
+* **Front and back differing** (`fill=0/1`, which `pgon-mode` asks for). GL
+  allows a different mode per face and nothing here could express it.
+* **Line smoothing** (`smooth=0/1`, `tri-unfilled-smooth`). WebGPU has no
+  antialiased lines.
+
+And one fidelity gap that is accepted rather than refused: GL culls before
+applying polygon mode, so a culled back face contributes no edges, while lines
+carry no winding -- a wireframe drawn with culling enabled shows back-facing
+polygons' edges too. That pairing is uncommon and the alternative is culling on
+the CPU.
+
+### A stale field made meaningful
+
+The rewrite turns a non-indexed draw into an indexed one, and `index_bias`
+means nothing on a non-indexed draw -- st/mesa leaves it set from an earlier
+one. Copying the draw wholesale therefore handed a stale base vertex to a draw
+where it counts, which the driver refuses outright ("draw refused (index
+bias)") and which cost the whole context. A genuine base vertex on an indexed
+source still has to apply, and the translator copies the source indices without
+it, so it is folded into the generated indices instead -- widened to 32 bits
+first, since a biased index need not fit the width the generator chose -- and
+the field cleared.
+
+### An external measurement trap
+
+glxgears read 481 fps after this change against 835 before it, which looks like
+a 40% regression and is not one. Another agent session was running headless
+Chromium in a different checkout, holding the load average at 13-15 on twelve
+cores. Under that load glxgears alone varied between 481 and 596 fps run to
+run.
+
+`GEX_WGPU_NO_UNFILLED=1` skips the new branch, which makes the question
+answerable without a quiet machine: **on 655.9 and 651.6 fps, off 647.9 and
+645.2**, interleaved under the same load. The branch is not a cost. Checking
+`/proc/loadavg` and who owns the load is worth doing before believing any
+frame rate here -- and the load may not be this session's to kill.
