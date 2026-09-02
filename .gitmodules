@@ -1,0 +1,14 @@
+[submodule "third_party/mobilegl-webgpu"]
+	path = third_party/mobilegl-webgpu
+	url = https://github.com/r58Playz/MobileGL.git
+	branch = feat/wasm-webgpu-backend
+[submodule "third_party/opengl-registry"]
+	path = third_party/opengl-registry
+	url = https://github.com/KhronosGroup/OpenGL-Registry.git
+[submodule "third_party/vk-gl-cts"]
+	path = third_party/vk-gl-cts
+	url = https://github.com/KhronosGroup/VK-GL-CTS.git
+[submodule "third_party/mesa"]
+	path = third_party/mesa
+	url = https://github.com/MercuryWorkshop/mesa-wink.git
+	branch = gex-virgl

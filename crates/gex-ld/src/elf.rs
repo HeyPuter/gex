@@ -77,6 +77,13 @@ pub enum LoadError {
         vaddr: u64,
         size: u64,
     },
+    /// Two independently placed ELF images claim the same guest addresses.
+    ImageOverlap {
+        first_start: u64,
+        first_end: u64,
+        second_start: u64,
+        second_end: u64,
+    },
     Malformed(&'static str),
 }
 
@@ -94,6 +101,16 @@ impl fmt::Display for LoadError {
             LoadError::SegmentOutOfRange { vaddr, size } => write!(
                 f,
                 "segment at 0x{vaddr:x} (0x{size:x} bytes) does not fit in the guest address space"
+            ),
+            LoadError::ImageOverlap {
+                first_start,
+                first_end,
+                second_start,
+                second_end,
+            } => write!(
+                f,
+                "ELF mappings overlap: 0x{first_start:x}..0x{first_end:x} and \
+                 0x{second_start:x}..0x{second_end:x}"
             ),
             LoadError::Malformed(m) => write!(f, "malformed ELF: {m}"),
         }

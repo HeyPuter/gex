@@ -25,12 +25,12 @@ cd "$(dirname "$0")/../.."
 # differ because there is one memory per process and `initial` is paid for the
 # moment the process exists -- see `gex_abi::GUEST_MEM_INITIAL_BYTES`.
 GUEST_BYTES=$((0xFFFF0000))
-GUEST_INITIAL=$((0x05000000))
-# The guest's stack tops out at STACK_TOP (0x0400_0000). Above it: 8 MiB of
+GUEST_INITIAL=$((0x07000000))
+# The guest's stack tops out at STACK_TOP (0x0580_0000). Above it: 8 MiB of
 # shim stack, then the shim's data. The shim's *heap* is not here at all any
 # more -- it claims spans from the same growing arena the guest's mappings
 # come from, so neither pays for a ceiling it is not using.
-SHIM_STACK_TOP=$((0x04800000))
+SHIM_STACK_TOP=$((0x06000000))
 SHIM_BASE=$SHIM_STACK_TOP
 LINK="-C link-arg=--import-memory \
   -C link-arg=--initial-memory=$GUEST_INITIAL \

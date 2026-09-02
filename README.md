@@ -37,9 +37,45 @@ landed. What runs today:
   faults, and delivery inside tight loops;
 * **a real filesystem** — mount table over tmpfs, host passthrough, synthetic
   `/proc` and `/dev`, with the T0-T2 syscall tiers over it;
+* **a compositor** — `gex-wayland` is a Wayland compositor rather than a
+  surface mirror: many surfaces at once, each program its own guest process, in
+  windows it draws the frames for (`xdg-decoration`, so Qt and KDE stop drawing
+  their own), with popups placed by their positioners, subsurfaces, client
+  cursors, per-surface input hit-testing, drag-to-move and click-to-raise. The
+  output is one WebGL context, and a software client's pixels are uploaded
+  straight out of the guest's memory -- damage-tracked, no copy of a frame
+  anywhere. It is also the **X window manager**: rootless Xwayland hands a
+  window to Wayland only once something has taken `SubstructureRedirect`,
+  redirected it with Composite and paired it with a surface through
+  `WL_SURFACE_ID`, so the compositor does all three
+  (`crates/gex-xwm`), the way sway and mutter do. X11 and Wayland programs are
+  windows of the same session, and an OpenGL one -- the guest's own Mesa through
+  virgl to virglrenderer -- sits beside them in the same output;
+* **an X server that is not a guest program** -- `web/build-xwayland-wasm.sh`
+  cross-builds Xwayland itself to WebAssembly (pixman, libwayland, libXfont2 and
+  the rest with it) and `?hostx=1` runs it in a Worker of the page instead of in
+  a guest process, so the server's own drawing is native wasm rather than
+  translated AArch64 -- xeyes, xclock, xcalc and a terminal with a shell in it
+  all behave. What it has not got is GLX, which wants glamor on a GPU a tab does
+  not have; while rendering goes through Mesa and virgl the guest's own Xwayland
+  is what a session starts, and this one waits behind the flag. Its two connections are bridged rather than emulated: X
+  clients are guest processes reaching it through the global kernel's unix
+  socket, and the compositor is `gex-wayland` in the same Worker with no socket
+  at all (`shims/hostwl`). A `wl_shm` pool is an allocation in the server's own
+  memory, which the page reads directly -- so an X window still reaches the
+  screen without a frame being copied;
 * a native host on wasmtime, and the same modules execute unmodified on V8.
 
 What does not:
+
+* **A session of several toolkit applications.** The compositor and the window
+  manager scale; a browser tab does not. Every guest process translates its own
+  copy of what it links, so a Qt or KDE app costs a tab about 3 GB while it
+  starts, and two of them at once run it out of memory before either draws. X11
+  clients share one X server and are cheap -- a terminal, gears and a clock
+  together are fine -- so that is what the session demo starts with. The fix is
+  the thing this project is for: an ahead-of-time closure per app, which
+  roughly halves it, rather than anything about the compositor.
 
 * **Threads.** The futex is built and tested; `clone` is not. The host needs
   restructuring first — a shared memory instead of a module-owned one, one

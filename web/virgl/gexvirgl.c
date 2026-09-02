@@ -1,4 +1,4 @@
-/* virglrenderer, in a browser tab, on WebGL 2.
+/* virglrenderer in a browser tab, hosted by WebGL 2 or MobileGL/WebGPU.
  *
  * The guest runs Debian's own Mesa with its Gallium `virgl` driver. That
  * driver encodes a VirGL command stream and speaks the vtest protocol over a
@@ -36,9 +36,20 @@
 
 #include <emscripten.h>
 #include <emscripten/html5.h>
+#ifndef GEX_VIRGL_WEBGPU
 #include <emscripten/html5_webgl.h>
-
 #include <GLES3/gl3.h>
+#else
+#define GL_GLEXT_PROTOTYPES 1
+#include <EGL/egl.h>
+#include <GL/gl.h>
+#include <GL/glext.h>
+namespace MobileGL { void Initialize(); }
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <emscripten/console.h>
 #include "virglrenderer.h"
@@ -51,7 +62,13 @@
  * node in a tab, so gex supplies the winsys through the callbacks structure
  * -- the same arrangement the native build uses, for the same reason. Here a
  * "GL context" is a WebGL 2 context on a canvas. */
+#ifndef GEX_VIRGL_WEBGPU
 static EMSCRIPTEN_WEBGL_CONTEXT_HANDLE gex_ctx;
+#else
+static EGLDisplay gex_display = EGL_NO_DISPLAY;
+static EGLSurface gex_surface = EGL_NO_SURFACE;
+static EGLContext gex_ctx = EGL_NO_CONTEXT;
+#endif
 
 virgl_renderer_gl_context gex_create_gl_context(
     void *cookie, int scanout, struct virgl_renderer_gl_ctx_param *param) {
@@ -75,10 +92,15 @@ void gex_destroy_gl_context(void *cookie, virgl_renderer_gl_context ctx) {
 int gex_make_current(void *cookie, int scanout, virgl_renderer_gl_context ctx) {
     (void)cookie;
     (void)scanout;
+#ifndef GEX_VIRGL_WEBGPU
     return emscripten_webgl_make_context_current(
                (EMSCRIPTEN_WEBGL_CONTEXT_HANDLE)(intptr_t)ctx) == EMSCRIPTEN_RESULT_SUCCESS
                ? 0
                : -1;
+#else
+    return eglMakeCurrent(gex_display, gex_surface, gex_surface,
+                          (EGLContext)(intptr_t)ctx) == EGL_TRUE ? 0 : -1;
+#endif
 }
 
 /* The callbacks are vtest's, not ours: `vtest_init_renderer` registers its
@@ -140,7 +162,7 @@ void gex_virgl_sink(const void *data, size_t len) {
     if (!cur) return;
     if (cur->out_len + len > cur->out_cap) {
         cur->out_cap = (cur->out_len + len) * 2 + 4096;
-        cur->out_buf = realloc(cur->out_buf, cur->out_cap);
+        cur->out_buf = (uint8_t *)realloc(cur->out_buf, cur->out_cap);
     }
     memcpy(cur->out_buf + cur->out_len, data, len);
     cur->out_len += len;
@@ -180,6 +202,14 @@ static struct vtest_input gex_input = {.read = gex_input_read};
 static GLuint gex_blit_fbo;
 static int gex_presented;
 
+/* A serial for every image copied to the canvas. JavaScript samples this once
+ * per animation frame, which coalesces duplicate submit/readback mirrors but
+ * still counts either path when it is the only one carrying a new image. */
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_presented(void) {
+    return gex_presented;
+}
+
 /* Why a readback did not become a picture. A blank canvas has several
  * causes that look identical from outside -- the guest never read back, it
  * read back a resource that is not a texture, it read back something the
@@ -198,6 +228,12 @@ static int gex_brightest;
 static uint32_t gex_present_last_w, gex_present_last_h;
 
 static void gex_present(uint32_t handle) {
+    /* A GL/EGL guest is presented directly from its bound render target after
+     * SUBMIT_CMD. Xwayland may subsequently TRANSFER_GET an unrelated backing
+     * pixmap; mirroring that readback would overwrite the real frame with the
+     * (often black) software-compositor surface. Keep transfer presentation as
+     * the fallback for guests that never exercise the submit-side path. */
+    if (gex_submit_present_calls != 0) return;
     struct virgl_renderer_resource_info info;
     if (virgl_renderer_resource_get_info((int)handle, &info) != 0) {
         gex_present_no_info++;
@@ -256,6 +292,9 @@ static void gex_present(uint32_t handle) {
         seen++;
         glBlitFramebuffer(0, 0, (GLint)info.width, (GLint)info.height,
                           0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+#ifdef GEX_VIRGL_WEBGPU
+        eglSwapBuffers(gex_display, gex_surface);
+#endif
         gex_presented++;
     } else {
         gex_present_incomplete++;
@@ -275,6 +314,292 @@ static void gex_present(uint32_t handle) {
  * source rectangle is the viewport, which the client set to its window size.
  * Upside down for the same reason as gex_present: GL is bottom-left, the canvas
  * top-left. */
+/* The frame a compositor in this same context can draw for itself.
+ *
+ * `gex_present_current` blits the guest's render target onto the canvas,
+ * which is the whole picture when the guest is the only thing on screen. In a
+ * session it is not: the frame belongs inside a window, among others, and the
+ * compositor draws it. Both live in one worker on one WebGL context, so what
+ * it needs is the texture -- no readback, no upload, no second copy of the
+ * frame anywhere.
+ *
+ * The texture is the colour attachment of the framebuffer virglrenderer just
+ * rendered into, which is a plain GL query rather than anything of
+ * virglrenderer's. */
+static GLuint gex_present_tex;
+static int gex_present_tex_w, gex_present_tex_h;
+/* Where a finished frame is copied to, so a compositor never samples a frame
+ * that is still being drawn -- one per surface, because the host draws for
+ * more than one window at a time.
+ *
+ * There used to be a single copy for the whole renderer, which is one frame
+ * for however many windows were drawing: two GL clients overwrote each
+ * other's picture between page frames, and whichever presented last was the
+ * one both windows showed. The decoder next door says which surface it is
+ * about to present (`gex_virgl_present_surface`), and its id is a device-wide
+ * one so two clients cannot collide on it. */
+#define GEX_PRESENT_SLOTS 8
+struct gex_present_slot {
+    unsigned uid;        /* zero for a free slot */
+    GLuint copy;         /* the snapshot a compositor draws */
+    int w, h;
+    unsigned serial;     /* bumped per frame of *this* surface */
+    GLuint live;         /* the guest's own target, when a copy is impossible */
+};
+static struct gex_present_slot gex_slots[GEX_PRESENT_SLOTS];
+/* Which surface the frame being presented belongs to. Zero is the surface a
+ * client that never named one still has. */
+static unsigned gex_present_uid;
+/* Whether frames are taken when *asked for* rather than when noticed.
+ *
+ * This renderer notices a finished frame by watching the command stream,
+ * which is the only thing it can do for a guest that runs its own Mesa. When
+ * the *host's* Mesa is driving, the decoder knows exactly when a frame is
+ * finished and which window it belongs to -- and watching is then strictly
+ * worse. Every rule tried on top of watching was wrong for some client:
+ * taking a frame on any submit files half-drawn pictures (and, with two
+ * clients, files them under the wrong window), while waiting for the flush
+ * that carries a swap loses the frame of a client that draws once and stops
+ * -- es2tri, whose window stayed black beside a client that kept drawing.
+ *
+ * So the decoder asks: see `gex_virgl_snapshot_surface`. */
+static int gex_present_direct;
+static int gex_live_surfaces(void);
+static GLuint gex_present_copy_fbo;
+
+/* The slot for a surface, taking a free one if this is the first frame.
+ *
+ * When every slot is taken the oldest-serial one is reused: a ninth window
+ * drawing GL is not a thing that happens, and losing the least active
+ * window's frame is better than losing the new one entirely. */
+static struct gex_present_slot *gex_slot_for(unsigned uid) {
+    struct gex_present_slot *oldest = &gex_slots[0];
+    for (int i = 0; i < GEX_PRESENT_SLOTS; i++) {
+        if (gex_slots[i].uid == uid) return &gex_slots[i];
+        if (!gex_slots[i].uid) {
+            gex_slots[i].uid = uid;
+            gex_slots[i].serial = 0;
+            return &gex_slots[i];
+        }
+        if (gex_slots[i].serial < oldest->serial) oldest = &gex_slots[i];
+    }
+    oldest->uid = uid;
+    oldest->serial = 0;
+    return oldest;
+}
+/* What went wrong the last time a frame was copied, if anything. */
+static GLenum gex_present_error;
+/* What the guest's drawable actually is: a texture, a renderbuffer, or
+ * nothing this can hand over. */
+static GLint gex_present_attach_kind;
+static GLuint gex_present_attach_name;
+static unsigned gex_present_serial;
+/* Whether the canvas still wants the blit. A compositor turns it off: it is
+ * going to draw this frame somewhere else on the same canvas, and a blit
+ * would overwrite everything else on it. */
+static int gex_present_to_canvas = 1;
+/* Whether that blit turns the frame over.
+ *
+ * Which way up a presented frame is depends on who drew it. A guest's own
+ * Mesa hands over a window's front buffer, whose rows run top-down; the
+ * host's Mesa renders through this renderer's own GL and its rows run
+ * bottom-up, the way GL always does. Flipping the second one puts the gears
+ * on their heads, so the page says which it has. */
+static int gex_present_flip = 1;
+
+EMSCRIPTEN_KEEPALIVE
+unsigned gex_virgl_present_texture(void) { return gex_present_tex; }
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_present_width(void) { return gex_present_tex_w; }
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_present_height(void) { return gex_present_tex_h; }
+/* Bumped once per presented frame, so a compositor can tell a new frame from
+ * the same texture presented again. */
+EMSCRIPTEN_KEEPALIVE
+unsigned gex_virgl_present_serial(void) { return gex_present_serial; }
+EMSCRIPTEN_KEEPALIVE
+void gex_virgl_present_to_canvas(int on) { gex_present_to_canvas = on != 0; }
+EMSCRIPTEN_KEEPALIVE
+void gex_virgl_present_flip(int on) { gex_present_flip = on != 0; }
+
+/* Which surface the commands that follow belong to: said by the decoder next
+ * door whenever the drawable it renders into changes. */
+EMSCRIPTEN_KEEPALIVE
+void gex_virgl_present_surface(unsigned uid) { gex_present_uid = uid; }
+
+/* Frames are asked for from now on, not noticed: see `gex_present_direct`. */
+EMSCRIPTEN_KEEPALIVE
+void gex_virgl_present_direct(int on) { gex_present_direct = on != 0; }
+
+/* Keep this surface's frame, now.
+ *
+ * Called by the decoder the moment a frame is finished -- after its
+ * `glFinish`, so everything the client drew has been through this renderer
+ * and its own framebuffer is still the bound one. That makes the copy exactly
+ * the finished frame of exactly that window, with nothing to infer.
+ *
+ * Returns zero when there was nothing to take, which for a client that has
+ * not drawn yet is ordinary. */
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_snapshot_surface(unsigned uid) {
+    GLint fb = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    if (fb == 0 || vp[2] <= 0 || vp[3] <= 0) return 0;
+    struct gex_present_slot *slot = gex_slot_for(uid);
+    if (!slot->copy) glGenTextures(1, &slot->copy);
+    GLint read_was = 0, tex_was = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_was);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex_was);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindTexture(GL_TEXTURE_2D, slot->copy);
+    glDisable(GL_SCISSOR_TEST);
+    while (glGetError() != GL_NO_ERROR) { }
+    /* An unsized `GL_RGBA` on purpose: the guest's drawable is whatever Mesa
+     * chose, and a sized destination makes the driver answer
+     * INVALID_OPERATION and leave the copy black. Remade every frame for the
+     * same reason -- the format is the driver's to choose and need not be the
+     * one it chose last time. */
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vp[0], vp[1], vp[2], vp[3], 0);
+    const GLenum copy_error = glGetError();
+    if (copy_error == GL_NO_ERROR) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        slot->w = vp[2];
+        slot->h = vp[3];
+        slot->serial++;
+        slot->live = 0;
+    } else {
+        /* Some drawables cannot be read into a plain RGBA8 texture. The
+         * guest's own target is then what a compositor gets: it can tear,
+         * and it is the picture. */
+        gex_present_error = copy_error;
+        GLint attached = 0, kind = 0;
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
+                                              GL_COLOR_ATTACHMENT0,
+                                              GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+                                              &kind);
+        if (kind == GL_TEXTURE) {
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
+                                                  GL_COLOR_ATTACHMENT0,
+                                                  GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                                  &attached);
+            slot->live = (GLuint)attached;
+            slot->w = vp[2];
+            slot->h = vp[3];
+            slot->serial++;
+        }
+    }
+    glBindTexture(GL_TEXTURE_2D, (GLuint)tex_was);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_was);
+    gex_presented++;
+    return copy_error == GL_NO_ERROR || slot->live ? 1 : 0;
+}
+
+/* One surface's own latest frame. Zero when that surface has never presented
+ * -- a window whose client has not drawn yet, or one that has gone. */
+EMSCRIPTEN_KEEPALIVE
+unsigned gex_virgl_frame_texture(unsigned uid) {
+    for (int i = 0; i < GEX_PRESENT_SLOTS; i++)
+        if (gex_slots[i].uid == uid)
+            return gex_slots[i].copy ? gex_slots[i].copy : gex_slots[i].live;
+    return 0;
+}
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_frame_width(unsigned uid) {
+    for (int i = 0; i < GEX_PRESENT_SLOTS; i++)
+        if (gex_slots[i].uid == uid) return gex_slots[i].w;
+    return 0;
+}
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_frame_height(unsigned uid) {
+    for (int i = 0; i < GEX_PRESENT_SLOTS; i++)
+        if (gex_slots[i].uid == uid) return gex_slots[i].h;
+    return 0;
+}
+EMSCRIPTEN_KEEPALIVE
+unsigned gex_virgl_frame_serial(unsigned uid) {
+    for (int i = 0; i < GEX_PRESENT_SLOTS; i++)
+        if (gex_slots[i].uid == uid) return gex_slots[i].serial;
+    return 0;
+}
+
+/* That window is gone: its snapshot goes back to the driver.
+ *
+ * A texture per closed window is a leak the size of the window, and a
+ * compositor that kept drawing the last frame of a window that had closed was
+ * the other half of the same bug. */
+EMSCRIPTEN_KEEPALIVE
+void gex_virgl_forget_surface(unsigned uid) {
+    for (int i = 0; i < GEX_PRESENT_SLOTS; i++) {
+        if (gex_slots[i].uid != uid) continue;
+        if (gex_slots[i].copy) glDeleteTextures(1, &gex_slots[i].copy);
+        gex_slots[i] = (struct gex_present_slot){0};
+    }
+}
+
+/* How many surfaces have a frame here. Diagnostic. */
+static int gex_live_surfaces(void) {
+    int n = 0;
+    for (int i = 0; i < GEX_PRESENT_SLOTS; i++) if (gex_slots[i].uid) n++;
+    return n;
+}
+
+/* Put one surface's frame on the canvas, at the canvas's size.
+ *
+ * For the compositor that has no scene: it hands each window an ordinary
+ * canvas and copies this one into it, so several windows can be drawn from
+ * one renderer. Returns zero when that surface has no frame yet. */
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_show_surface(unsigned uid) {
+    GLuint tex = 0;
+    int w = 0, h = 0;
+    for (int i = 0; i < GEX_PRESENT_SLOTS; i++) {
+        if (gex_slots[i].uid != uid) continue;
+        tex = gex_slots[i].copy ? gex_slots[i].copy : gex_slots[i].live;
+        w = gex_slots[i].w;
+        h = gex_slots[i].h;
+    }
+    if (!tex || w <= 0 || h <= 0) return 0;
+    int cw = 0, ch = 0;
+    emscripten_get_canvas_element_size("#gex-gl", &cw, &ch);
+    if (cw <= 0 || ch <= 0) return 0;
+    GLint draw_was = 0, read_was = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_was);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_was);
+    if (!gex_present_copy_fbo) glGenFramebuffers(1, &gex_present_copy_fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, gex_present_copy_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, tex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    while (glGetError() != GL_NO_ERROR) { }
+    /* Into the top-left corner of the canvas, at its own size.
+     *
+     * The top because that is where a `drawImage` of the first w by h pixels
+     * reads from, and this canvas is a staging area a page copies out of --
+     * it is as large as the desktop and a window is smaller. Not flipped:
+     * this is a copy of a frame the host's Mesa rendered through this
+     * renderer's own GL, and it is the right way up already, which is the
+     * same reason `gex_present_flip` exists. */
+    const int dw = cw < w ? cw : w;
+    const int dh = ch < h ? ch : h;
+    glBlitFramebuffer(0, 0, dw, dh, 0, ch - dh, dw, ch,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    const GLenum blit_error = glGetError();
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_was);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_was);
+    if (blit_error != GL_NO_ERROR) {
+        gex_present_error = blit_error;
+        return 0;
+    }
+    return 1;
+}
+
 static void gex_present_current(void) {
     gex_submit_present_calls++;
     GLint fb = 0;
@@ -290,6 +615,134 @@ static void gex_present_current(void) {
         return;
     }
 
+    /* What the frame *is*, before deciding where it goes. */
+    GLint attached = 0, kind = 0;
+    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
+    gex_present_attach_kind = kind;
+    if (kind == GL_TEXTURE) {
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                              GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                              &attached);
+        gex_present_tex = (GLuint)attached;
+        gex_present_attach_name = (GLuint)attached;
+        gex_present_tex_w = vp[2];
+        gex_present_tex_h = vp[3];
+        gex_present_serial++;
+    }
+    /* The decoder says when a frame is finished and whose it is, so watching
+     * the stream for one would only guess worse. See `gex_present_direct`. */
+    if (gex_present_direct) return;
+    if (!gex_present_to_canvas) {
+        /* A copy of the finished frame, for a compositor to draw.
+         *
+         * Not the guest's own target: that is the buffer it keeps drawing
+         * into, and a compositor sampling it at its own rhythm sees whatever
+         * has been rendered so far -- three red bands of a gear that is half
+         * drawn. This is one GPU blit at the moment the frame is finished,
+         * and no readback: the pixels never leave the GPU. */
+        /* A copy of the finished frame, made with `glCopyTexImage2D`.
+         *
+         * Not a framebuffer blit and not `CopyTexSubImage`: both want the
+         * destination's format to match what is being read, and the guest's
+         * drawable is whatever Mesa chose -- with a plain RGBA8 destination
+         * the driver answered INVALID_OPERATION and left the copy black. An
+         * unsized `GL_RGBA` lets it pick a format it can convert into, which
+         * is the whole point of the call.
+         *
+         * The texture is remade every frame rather than sub-copied for the
+         * same reason: the format is the driver's to choose and it may not be
+         * the one it chose last time. */
+        bool use_copy = false;
+        struct gex_present_slot *slot = gex_slot_for(gex_present_uid);
+        if (!slot->copy) glGenTextures(1, &slot->copy);
+        GLint read_was = 0, tex_was = 0;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_was);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex_was);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindTexture(GL_TEXTURE_2D, slot->copy);
+        glDisable(GL_SCISSOR_TEST);
+        while (glGetError() != GL_NO_ERROR) { }
+        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vp[0], vp[1], vp[2], vp[3], 0);
+        GLenum copy_error = glGetError();
+        if (copy_error == GL_NO_ERROR) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            slot->w = vp[2];
+            slot->h = vp[3];
+            slot->serial++;
+            if (!gex_present_copy_fbo) glGenFramebuffers(1, &gex_present_copy_fbo);
+            GLint draw_was = 0;
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_was);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gex_present_copy_fbo);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, slot->copy, 0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw_was);
+        }
+        if (copy_error != GL_NO_ERROR) gex_present_error = copy_error;
+        glBindTexture(GL_TEXTURE_2D, (GLuint)tex_was);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_was);
+        /* Whether the snapshot is what a compositor should draw.
+         *
+         * When the copy works this is the frame as it was when it was
+         * finished, which is what a compositor wants. When it does not --
+         * some drawables cannot be read into a plain RGBA8 texture, and the
+         * driver says so with INVALID_OPERATION -- handing over the guest's
+         * own target is better than handing over a black rectangle: it can
+         * tear, and it is the picture. */
+        use_copy = copy_error == GL_NO_ERROR;
+        slot->live = gex_present_tex;
+        if (use_copy) {
+            gex_present_tex = slot->copy;
+            gex_present_tex_w = slot->w;
+            gex_present_tex_h = slot->h;
+        } else {
+            /* No snapshot for this surface: the guest's own target is what a
+             * compositor gets, tearing and all -- it is at least the picture. */
+            slot->w = vp[2];
+            slot->h = vp[3];
+            slot->serial++;
+        }
+
+        static int probed;
+        if (probed++ % 32 == 0) {
+            unsigned char px[20 * 20 * 4];
+            GLint sx = vp[0] + vp[2] / 2 - 10, sy = vp[1] + vp[3] / 2 - 10;
+            if (sx < 0) sx = 0;
+            if (sy < 0) sy = 0;
+            /* From the copy, not the source: what the compositor will
+             * sample is the only thing worth measuring here. */
+            GLint was = 0;
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &was);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                              use_copy ? gex_present_copy_fbo : (GLuint)fb);
+            sx = (use_copy ? 0 : vp[0]) + slot->w / 2 - 10;
+            sy = (use_copy ? 0 : vp[1]) + slot->h / 2 - 10;
+            if (sx < 0) sx = 0;
+            if (sy < 0) sy = 0;
+            glReadPixels(sx, sy, 20, 20, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            GLenum blit_error = glGetError();
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)was);
+            /* This frame's brightness, not the brightest ever seen: a running
+             * maximum says a frame was bright once, which is exactly the
+             * question this is being asked to answer. */
+            int now = 0;
+            for (size_t i = 0; i < sizeof px; i += 4) {
+                int v = px[i] > px[i + 1] ? px[i] : px[i + 1];
+                if (px[i + 2] > v) v = px[i + 2];
+                if (v > now) now = v;
+            }
+            gex_brightest = now;
+            if (now > 8) gex_lit++;
+            if (blit_error != GL_NO_ERROR) gex_present_error = blit_error;
+        }
+        gex_presented++;
+        return;
+    }
+
     int w, h;
     emscripten_get_canvas_element_size("#gex-gl", &w, &h);
     /* virglrenderer created and validated this draw target before submitting
@@ -300,7 +753,11 @@ static void gex_present_current(void) {
     glDisable(GL_SCISSOR_TEST);
 
     static int seen;
-    if (seen == 0) {
+    // Every thirty-second frame, not only the first. A compositor drawing
+    // this texture and getting black has two possible causes -- the frame is
+    // black, or the wrong thing is being sampled -- and only the renderer's
+    // own reading of its own framebuffer tells them apart.
+    if (seen % 32 == 0) {
         unsigned char px[20 * 20 * 4];
         GLint sx = vp[0] + vp[2] / 2 - 10, sy = vp[1] + vp[3] / 2 - 10;
         if (sx < 0) sx = 0;
@@ -314,8 +771,21 @@ static void gex_present_current(void) {
         if (gex_brightest > 8) gex_lit++;
     }
     seen++;
-    glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
-                      0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    /* The frame is wherever the viewport says it is: virglrenderer sizes the
+     * drawable at init and a smaller window is drawn into the top of it, so
+     * the source rectangle is read rather than assumed. The destination is
+     * the canvas as it is now, which is how a window sized after init still
+     * gets its frame one pixel to one pixel. */
+    if (gex_present_flip) {
+        glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
+                          0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    } else {
+        glBlitFramebuffer(vp[0], vp[1], vp[0] + vp[2], vp[1] + vp[3],
+                          0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+#ifdef GEX_VIRGL_WEBGPU
+    eglSwapBuffers(gex_display, gex_surface);
+#endif
     gex_presented++;
     /* Put the guest's framebuffer back as both bindings; virglrenderer expects
      * to find its own target still current. */
@@ -438,8 +908,9 @@ static void gex_virgl_log(enum virgl_log_level_flags level, const char *message,
     emscripten_console_error(message);
 }
 
-int gex_virgl_init(int width, int height) {
+int gex_virgl_init(int width, int height, int preserve_drawing_buffer) {
     virgl_set_log_callback(gex_virgl_log, NULL, NULL);
+#ifndef GEX_VIRGL_WEBGPU
     EmscriptenWebGLContextAttributes attr;
     emscripten_webgl_init_context_attributes(&attr);
     attr.majorVersion = 2;
@@ -448,10 +919,13 @@ int gex_virgl_init(int width, int height) {
     attr.depth = true;
     attr.stencil = true;
     attr.antialias = false;
-    /* Readback is from the guest resource/FBO before it is blitted here. The
-     * browser's default framebuffer is presentation-only and can be discarded
-     * after compositing; preserving it forces an unnecessary full-frame copy. */
-    attr.preserveDrawingBuffer = false;
+    /* Readback is from the guest resource/FBO before it is blitted here. A
+     * main-thread canvas is redrawn in the browser's rendering task and can
+     * discard its default framebuffer after compositing. OffscreenCanvas is
+     * serviced by a sequence of Worker tasks, however: Chromium may expose
+     * the post-composite clear between those tasks as a black frame. Preserve
+     * that backend until the next completed guest image replaces it. */
+    attr.preserveDrawingBuffer = preserve_drawing_buffer != 0;
     attr.explicitSwapControl = false;
 
     emscripten_set_canvas_element_size("#gex-gl", width, height);
@@ -462,6 +936,38 @@ int gex_virgl_init(int width, int height) {
     if (emscripten_webgl_make_context_current(gex_ctx) != EMSCRIPTEN_RESULT_SUCCESS) {
         return -2;
     }
+#else
+    (void)preserve_drawing_buffer;
+    emscripten_set_canvas_element_size("#gex-gl", width, height);
+    MobileGL::Initialize();
+    static const EGLint config_attribs[] = {
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8, EGL_NONE
+    };
+    gex_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (gex_display == EGL_NO_DISPLAY ||
+        eglInitialize(gex_display, NULL, NULL) != EGL_TRUE ||
+        eglBindAPI(EGL_OPENGL_API) != EGL_TRUE) {
+        return -1;
+    }
+    EGLConfig config = NULL;
+    EGLint config_count = 0;
+    if (eglChooseConfig(gex_display, config_attribs, &config, 1,
+                        &config_count) != EGL_TRUE || config_count < 1) {
+        return -2;
+    }
+    static const EGLint context_attribs[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3, EGL_NONE
+    };
+    gex_ctx = eglCreateContext(gex_display, config, EGL_NO_CONTEXT,
+                               context_attribs);
+    gex_surface = eglCreateWindowSurface(gex_display, config,
+                                         (EGLNativeWindowType)1, NULL);
+    if (gex_ctx == EGL_NO_CONTEXT || gex_surface == EGL_NO_SURFACE ||
+        eglMakeCurrent(gex_display, gex_surface, gex_surface, gex_ctx) != EGL_TRUE) {
+        return -2;
+    }
+#endif
     /* Flags zero: the winsys is ours, so virglrenderer must not go looking
      * for EGL or a DRM node of its own. vtest adds the two it insists on. */
     if (vtest_init_renderer(false, 0, NULL) != 0) {
@@ -508,7 +1014,7 @@ int gex_virgl_feed(int sid, const uint8_t *data, int len) {
     }
     if (s->in_len + (size_t)len > s->in_cap) {
         s->in_cap = (s->in_len + (size_t)len) * 2 + 65536;
-        s->in_buf = realloc(s->in_buf, s->in_cap);
+        s->in_buf = (uint8_t *)realloc(s->in_buf, s->in_cap);
     }
     memcpy(s->in_buf + s->in_len, data, (size_t)len);
     s->in_len += (size_t)len;
@@ -633,9 +1139,11 @@ const char *gex_virgl_gl_state(void) {
     }
     snprintf(out, sizeof out,
              "draw_fbo=%d read_fbo=%d viewport=%d,%d,%dx%d fbo_status=0x%x gl_error=0x%x "
-             "presented=%d lit=%d brightest=%d",
+             "presented=%d lit=%d brightest=%d copy_error=0x%x surfaces=%d "
+             "attach=0x%x name=%u tex=%u",
              draw_fbo, read_fbo, vp[0], vp[1], vp[2], vp[3], status, err, gex_presented,
-             gex_lit, gex_brightest);
+             gex_lit, gex_brightest, gex_present_error, gex_live_surfaces(),
+             gex_present_attach_kind, gex_present_attach_name, gex_present_tex);
     return out;
 }
 
@@ -710,3 +1218,7 @@ void gex_virgl_close(int sid) {
     free(s->out_buf);
     memset(s, 0, sizeof *s);
 }
+
+#ifdef __cplusplus
+}
+#endif

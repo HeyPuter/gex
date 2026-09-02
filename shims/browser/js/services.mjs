@@ -21,7 +21,11 @@ self.onmessage = async (e) => {
         : await WebAssembly.compile(msg.kernel.module);
     // The kernel imports `env.process`, so it must be supplied even though
     // nothing here is a guest.
-    const process = new WebAssembly.Memory({ initial: 0x05000000 / 65536 });
+    const process = new WebAssembly.Memory({
+      initial: 0x07000000 / 65536,
+      maximum: 0xffff0000 / 65536,
+      shared: true,
+    });
     const inst = await WebAssembly.instantiate(mod, {
       env: { memory: msg.kernel.memory, process },
     });

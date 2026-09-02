@@ -3,8 +3,9 @@
 // The guest runs Debian's own Mesa with its Gallium `virgl` driver, which
 // speaks the vtest protocol over a UNIX socket. `shims/browser/src/virgl.rs`
 // serves that socket and hands the bytes here; here hands them to
-// virglrenderer (compiled to wasm by `web/build-virgl-wasm.sh`, pointed at a
-// WebGL 2 context). It is a second module -- a copy in, a copy out, the canvas
+// virglrenderer compiled to wasm. The default build targets WebGL 2; the
+// compatibility build routes its desktop GL calls through MobileGL to WebGPU.
+// It is a second module -- a copy in, a copy out, the canvas
 // -- so virglrenderer allocates in its own heap and never in the guest's
 // address space, which the shim shares to read syscall buffers directly.
 
@@ -27,10 +28,46 @@ async function loadGlue(url) {
   }
 }
 
+async function webGpuDeviceFor(url) {
+  if (!url.includes('webgpu')) return null;
+  if (!navigator.gpu) throw new Error('this browser does not expose WebGPU');
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) throw new Error('WebGPU did not provide an adapter');
+  const optional = [
+    'rg11b10ufloat-renderable',
+    'float32-filterable',
+    'texture-compression-bc',
+  ]
+    .filter((feature) => adapter.features.has(feature));
+  const requiredLimits = {};
+  // WebGPU's portable default is only 32 bytes/sample across all color
+  // attachments. Desktop GL exposes eight render targets, and MobileGL must
+  // sometimes materialize all of them for a shader even when the application
+  // routes some outputs to GL_NONE. Ask for the adapter's advertised budget
+  // instead of silently accepting the smaller default device limit.
+  if (adapter.limits.maxColorAttachmentBytesPerSample > 32) {
+    requiredLimits.maxColorAttachmentBytesPerSample =
+      adapter.limits.maxColorAttachmentBytesPerSample;
+  }
+  return adapter.requestDevice({ requiredFeatures: optional, requiredLimits });
+}
+
 export class VirglRenderer {
   #module = null;
+  #pump = null;
+  #worker = null;
+  #stats = null;
   #canvas = null;
   #failed = null;
+  #description = '';
+  #state = '';
+  #commandState = '';
+  #channelId = 0;
+  #requestId = 0;
+  #pending = new Map();
+  #directSessions = 0;
+  /** How far an in-context client has read into each session's reply. */
+  #directRead = new Map();
 
   /**
    * @param {HTMLCanvasElement} canvas the drawing surface
@@ -39,13 +76,23 @@ export class VirglRenderer {
    *   the console default is dropped under load in a headless browser, so a
    *   harness with its own channel should pass one.
    */
-  static async create(canvas, url = '/gex/gexvirgl.mjs', onLog = null) {
+  static async create(canvas, url = '/gex/gexvirgl.mjs', onLog = null, opts = {}) {
     const r = new VirglRenderer();
     r.#canvas = canvas;
     // virglrenderer looks the canvas up by selector, so it has to carry the
     // id the module asks for.
     canvas.id = 'gex-gl';
+    if (
+      !opts.inProcess &&
+      typeof Worker === 'function' &&
+      typeof canvas.transferControlToOffscreen === 'function' &&
+      typeof SharedArrayBuffer === 'function'
+    ) {
+      await r.#createWorker(canvas, url);
+      return r;
+    }
     try {
+      const webGpuDevice = await webGpuDeviceFor(url);
       const Module = await loadGlue(url);
       r.#module = await Module({
         // Where the renderer's own wasm is, said rather than inferred. The
@@ -56,8 +103,21 @@ export class VirglRenderer {
         // return value beyond "no", so this is the only diagnostic there is.
         printErr: (s) => (onLog ? onLog(s) : console.warn('[virgl]', s)),
         print: (s) => (onLog ? onLog(s) : console.log('[virgl]', s)),
+        dumpWgsl: globalThis.__gexDumpWgsl ||
+          Number(new URLSearchParams(location.search).get('dumpwgsl')) || 0,
+        ...(webGpuDevice ? { preinitializedWebGPUDevice: webGpuDevice } : {}),
       });
-      const rc = r.#module._gex_virgl_init(canvas.width, canvas.height);
+      r.#pump = webGpuDevice
+        ? WebAssembly.promising(r.#module._gex_virgl_pump)
+        : r.#module._gex_virgl_pump;
+      const offscreen =
+        typeof OffscreenCanvas === 'function' && canvas instanceof OffscreenCanvas;
+      // `preserve` overrides the guess: a canvas the browser composites can
+      // lose its default framebuffer after each composite, so a client that
+      // draws slower than the page does would flicker black between presents.
+      // See the note on `preserveDrawingBuffer` in gexvirgl.c.
+      const preserve = opts.preserve ?? offscreen;
+      const rc = r.#module._gex_virgl_init(canvas.width, canvas.height, preserve ? 1 : 0);
       if (rc !== 0) {
         r.#failed = `the renderer would not start (${rc})`;
       }
@@ -67,8 +127,54 @@ export class VirglRenderer {
     return r;
   }
 
+  async #createWorker(canvas, url) {
+    const worker = new Worker(new URL('./virgl-worker.js', import.meta.url), { type: 'module' });
+    this.#worker = worker;
+    this.#stats = new Int32Array(new SharedArrayBuffer(16));
+    const ready = new Promise((resolve, reject) => {
+      const fail = (e) => reject(new Error(e?.message || 'the renderer worker failed to start'));
+      worker.addEventListener('error', fail, { once: true });
+      worker.addEventListener('message', (event) => {
+        const m = event.data || {};
+        if (m.kind === 'ready') {
+          worker.removeEventListener('error', fail);
+          this.#failed = m.error || null;
+          this.#description = m.description || '';
+          this.#state = m.state || '';
+          this.#commandState = m.commands || '';
+          resolve();
+        } else if (m.kind === 'diagnostic') {
+          this.#state = m.state || this.#state;
+          this.#commandState = m.commands || this.#commandState;
+          const done = this.#pending.get(m.id);
+          if (done) {
+            this.#pending.delete(m.id);
+            done();
+          }
+        } else if (m.kind === 'error') {
+          this.#failed = m.error || 'the renderer worker failed';
+        }
+      });
+    });
+    const offscreen = canvas.transferControlToOffscreen();
+    worker.postMessage({
+      kind: 'init',
+      canvas: offscreen,
+      url,
+      stats: this.#stats.buffer,
+      dumpWgsl: Number(new URLSearchParams(location.search).get('dumpwgsl')) || 0,
+    }, [offscreen]);
+    try {
+      await ready;
+    } catch (e) {
+      this.#failed = e?.message || String(e);
+      worker.terminate();
+      this.#worker = null;
+    }
+  }
+
   get ok() {
-    return this.#module !== null && this.#failed === null;
+    return (this.#module !== null || this.#worker !== null) && this.#failed === null;
   }
 
   get error() {
@@ -77,7 +183,10 @@ export class VirglRenderer {
 
   /** What the guest will be told it has. */
   describe() {
-    return this.ok ? this.#module.UTF8ToString(this.#module._gex_virgl_describe()) : this.#failed;
+    if (!this.ok) return this.#failed;
+    return this.#worker
+      ? this.#description
+      : this.#module.UTF8ToString(this.#module._gex_virgl_describe());
   }
 
   /**
@@ -86,7 +195,14 @@ export class VirglRenderer {
    * perfectly with nothing visible.
    */
   glState() {
-    return this.ok ? this.#module.UTF8ToString(this.#module._gex_virgl_gl_state()) : this.#failed;
+    if (!this.ok) return this.#failed;
+    return this.#worker ? this.#state : this.#module.UTF8ToString(this.#module._gex_virgl_gl_state());
+  }
+
+  /** Number of completed images copied to the browser canvas. */
+  presentedCount() {
+    if (!this.ok) return 0;
+    return this.#worker ? Atomics.load(this.#stats, 0) : this.#module._gex_virgl_presented();
   }
 
   /**
@@ -95,7 +211,42 @@ export class VirglRenderer {
    * black, since it says whether the guest drew at all.
    */
   commands() {
-    return this.ok ? this.#module.UTF8ToString(this.#module._gex_virgl_commands()) : this.#failed;
+    if (!this.ok) return this.#failed;
+    return this.#worker
+      ? this.#commandState
+      : this.#module.UTF8ToString(this.#module._gex_virgl_commands());
+  }
+
+  /** Ask the worker for an exact diagnostic snapshot before reporting a run. */
+  refresh() {
+    if (!this.#worker || !this.ok) return Promise.resolve();
+    const id = ++this.#requestId;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.#pending.delete(id);
+        resolve();
+      }, 2000);
+      this.#pending.set(id, () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      this.#worker.postMessage({ kind: 'diagnostic', id });
+    });
+  }
+
+  /**
+   * Give the renderer worker one guest bridge and return its cheap page-side
+   * wake function. Shared buffers do the data/reply transfer; the page only
+   * forwards a notification and never executes GL commands.
+   */
+  attachChannel(channel) {
+    if (!this.#worker) return null;
+    const id = ++this.#channelId;
+    channel.direct = typeof Atomics.waitAsync === 'function';
+    this.#worker.postMessage({ kind: 'channel', id, channel });
+    return channel.direct
+      ? () => {}
+      : () => this.#worker?.postMessage({ kind: 'serve', id });
   }
 
   /**
@@ -110,14 +261,17 @@ export class VirglRenderer {
     this.#module.HEAPU8.set(new Uint8Array(shimMemory.buffer, ptr, len), buf);
     this.#module._gex_virgl_feed(session, buf, len);
     this.#module._free(buf);
-    const ran = this.#module._gex_virgl_pump(session);
-    // A refusal ends the connection: a stream protocol cannot resynchronise
-    // after a command of unknown length.
-    if (ran < 0) {
-      this.#failed = 'the renderer refused the stream';
-      return -1;
-    }
-    return this.#module._gex_virgl_pending(session);
+    const finish = (ran) => {
+      // A refusal ends the connection: a stream protocol cannot resynchronise
+      // after a command of unknown length.
+      if (ran < 0) {
+        this.#failed = 'the renderer refused the stream';
+        return -1;
+      }
+      return this.#module._gex_virgl_pending(session);
+    };
+    const ran = this.#pump(session);
+    return ran instanceof Promise ? ran.then(finish) : finish(ran);
   }
 
   /** Copy up to `max` reply bytes to `ptr` in the shim's memory. */
@@ -137,18 +291,198 @@ export class VirglRenderer {
     return n;
   }
 
+  /* -- a client in this same context -------------------------------------
+   *
+   * `submit`/`take` above are for the guest: they read and write the shim's
+   * memory, because the client is a Worker away. Host Mesa's vtest winsys is
+   * not -- it is a module beside this one -- so it is handed views instead,
+   * and the session it opens is one this renderer never sees a socket for.
+   */
+
+  /** A session id for a client in this context. */
+  openSession() {
+    if (!this.ok || this.#worker) return -1;
+    return ++this.#directSessions;
+  }
+
+  /** Feed one write's worth of command stream. Returns what was taken. */
+  feed(session, bytes) {
+    if (!this.ok || this.#worker) return -1;
+    const buf = this.#module._malloc(bytes.length);
+    this.#module.HEAPU8.set(bytes, buf);
+    this.#module._gex_virgl_feed(session, buf, bytes.length);
+    this.#module._free(buf);
+    const ran = this.#pump(session);
+    // Only the WebGL renderer runs in process, and its pump is synchronous.
+    // A promise here would mean a reply the winsys cannot wait for, so it is
+    // an error rather than something to paper over.
+    if (ran instanceof Promise) {
+      this.#failed = 'an in-process renderer must not pump asynchronously';
+      return -1;
+    }
+    return ran < 0 ? -1 : bytes.length;
+  }
+
+  /** The frame this renderer last drew, as a texture in its own context.
+   *
+   * For a compositor sharing that context: the guest's picture without a
+   * readback, an upload, or a copy of any kind. `serial` moves once per
+   * presented frame, so a caller can tell a new frame from the same one. */
+  frame() {
+    if (!this.ok || this.#worker) return null;
+    const name = this.#module._gex_virgl_present_texture?.() ?? 0;
+    if (!name) return null;
+    // A texture is an integer inside the module and a `WebGLTexture` out
+    // here: emscripten keeps the table, and WebGL will not take the number.
+    const tex = this.#module.GL?.textures?.[name] ?? null;
+    if (!tex) return null;
+    return {
+      tex,
+      w: this.#module._gex_virgl_present_width(),
+      h: this.#module._gex_virgl_present_height(),
+      serial: this.#module._gex_virgl_present_serial(),
+    };
+  }
+
+  /** Which surface the frames that follow belong to. */
+  presentSurface(uid) {
+    if (!this.ok || this.#worker) return;
+    this.#module._gex_virgl_present_surface?.(uid >>> 0);
+  }
+
+  /** Take this surface's frame now, from what is currently bound.
+   *
+   * For a caller whose Mesa is on this side of the transport: it knows when
+   * a frame is finished and which window it is, so the renderer need not
+   * watch the command stream and guess. Watching cannot be made right --
+   * every submit is too often (half-drawn frames, and with two clients the
+   * wrong window) and only the flush that carries a swap is too rare (a
+   * client that draws once and stops is never seen at all). */
+  snapshotSurface(uid) {
+    if (!this.ok || this.#worker || !uid) return false;
+    return (this.#module._gex_virgl_snapshot_surface?.(uid >>> 0) ?? 0) !== 0;
+  }
+
+  /** Stop watching the command stream for frames; they will be asked for. */
+  presentDirect(on) {
+    if (!this.ok || this.#worker) return;
+    this.#module._gex_virgl_present_direct?.(on ? 1 : 0);
+  }
+
+  /** One surface's own latest frame, as a texture in this renderer's context.
+   *
+   * `uid` is the surface id the GL device hands out (`surfaces()` there), and
+   * what makes several windows possible: the renderer keeps a frame each, so
+   * a compositor asks per window instead of getting whichever window
+   * presented last. Null when that surface has not drawn yet. */
+  frameFor(uid) {
+    if (!this.ok || this.#worker || !uid) return null;
+    const name = this.#module._gex_virgl_frame_texture?.(uid) ?? 0;
+    if (!name) return null;
+    const tex = this.#module.GL?.textures?.[name] ?? null;
+    if (!tex) return null;
+    return {
+      tex,
+      w: this.#module._gex_virgl_frame_width(uid),
+      h: this.#module._gex_virgl_frame_height(uid),
+      serial: this.#module._gex_virgl_frame_serial(uid),
+    };
+  }
+
+  /** Draw one surface's frame onto this renderer's canvas.
+   *
+   * For a compositor with no scene of its own: it copies this canvas into the
+   * window's, one window at a time, which is how several windows are drawn
+   * from one renderer without a texture ever crossing a context. */
+  showSurface(uid) {
+    if (!this.ok || this.#worker || !uid) return false;
+    return (this.#module._gex_virgl_show_surface?.(uid) ?? 0) !== 0;
+  }
+
+  /** That window is gone: let its frame go. */
+  forgetSurface(uid) {
+    if (!this.ok || this.#worker || !uid) return;
+    this.#module._gex_virgl_forget_surface?.(uid);
+  }
+
+  /** Whether this renderer draws in the very context a compositor is using.
+   *
+   * A texture cannot cross a WebGL context, so a compositor that samples one
+   * of these must be in the same one -- and "same canvas" is what makes that
+   * true, since `getContext` on a canvas that has a context returns it. Worth
+   * being able to check rather than assume: the failure is a black window and
+   * nothing else. */
+  sharesContextWith(gl) {
+    return !!gl && this.#module?.GL?.currentContext?.GLctx === gl;
+  }
+
+  /** Whether a finished frame is also blitted onto the canvas.
+   *
+   * On for a guest that owns the screen. Off for one inside a window: the
+   * compositor puts that frame where the window is, and a blit would cover
+   * everything else with it. */
+  presentToCanvas(on, flip = true) {
+    if (!this.ok || this.#worker) return;
+    this.#module._gex_virgl_present_to_canvas?.(on ? 1 : 0);
+    // Which way up. A frame the host's Mesa rendered through this renderer's
+    // own GL is already the right way round for a blit; one a guest's Mesa
+    // handed over as a window's front buffer is not. See `gex_present_flip`.
+    this.#module._gex_virgl_present_flip?.(flip ? 1 : 0);
+  }
+
+  /** How many reply bytes are waiting for an in-context client. */
+  pending(session) {
+    if (!this.ok || this.#worker) return -1;
+    return this.#module._gex_virgl_pending(session);
+  }
+
+  /** Copy the next of the reply into `out`, and say how much that was.
+   *
+   * Not all of it: this client reads a header and then a body, eight bytes at
+   * a time, where the guest's shim asks for everything waiting at once. So the
+   * cursor is kept here and the renderer's buffer is only drained when it has
+   * been read to the end -- a drain after a partial read discards the rest of
+   * the answer, which the protocol has no way to ask for again. */
+  drainInto(session, out) {
+    if (!this.ok || this.#worker) return -1;
+    const have = this.#module._gex_virgl_pending(session);
+    const at = this.#directRead.get(session) || 0;
+    const n = Math.min(have - at, out.length);
+    if (n <= 0) return 0;
+    const from = this.#module._gex_virgl_replies(session) + at;
+    out.set(this.#module.HEAPU8.subarray(from, from + n), 0);
+    if (at + n >= have) {
+      this.#module._gex_virgl_drain(session);
+      this.#directRead.set(session, 0);
+    } else {
+      this.#directRead.set(session, at + n);
+    }
+    return n;
+  }
+
   /**
    * Narrate every command as it starts, for when the renderer does not come
    * back: it runs on the page's thread, so a command that loops freezes
    * everything, and the last line printed names the command it went into.
    */
   traceCommands(on) {
-    if (this.ok) this.#module._gex_virgl_trace_commands(on ? 1 : 0);
+    if (!this.ok) return;
+    if (this.#worker) this.#worker.postMessage({ kind: 'trace', on: !!on });
+    else this.#module._gex_virgl_trace_commands(on ? 1 : 0);
   }
 
   /** A client has gone: drop its context and its buffers. */
   close(session) {
-    if (this.ok) this.#module._gex_virgl_close(session);
+    if (!this.ok) return;
+    if (this.#worker) this.#worker.postMessage({ kind: 'close', session });
+    else this.#module._gex_virgl_close(session);
+  }
+
+  dispose() {
+    this.#worker?.terminate();
+    this.#worker = null;
+    for (const done of this.#pending.values()) done();
+    this.#pending.clear();
   }
 }
 

@@ -6,3 +6,17 @@ web/dist/
 web/public/gex/
 web/public/rootfs/
 web/public/closure/
+/web/public/fs/glcts
+__pycache__/
+
+# Scratch and build caches
+web/.work/
+# The MobileGL backend is gated off; its 7 MB build output is dead weight.
+web/public/gexmobilegl-webgpu.wasm
+web/public/gexmobilegl-webgpu.mjs
+# Run output and crash debris
+logs/
+*.core
+core.[0-9]*
+hs_err_pid*.log
+TestResults.qpa

@@ -22,7 +22,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 // different numbers because there is one memory per process and the first is
 // paid for immediately.
 const GUEST_MAX_PAGES = 0xffff0000 / 65536;
-const GUEST_MIN_PAGES = 0x05000000 / 65536;
+const GUEST_MIN_PAGES = 0x07000000 / 65536;
 
 const [
   inPath,

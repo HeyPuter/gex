@@ -25,7 +25,7 @@
 // a stuck one. Exit code is 0 on pass, non-zero on fail/hang/crash.
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, openSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdirSync, openSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,6 +44,8 @@ mkdirSync(STATE, { recursive: true });
 const CHROME = process.env.CHROME || '/usr/bin/chromium';
 const CHROME_PORT = Number(process.env.GEX_CHROME_PORT || 9333);
 const SERVE_PORT = Number(process.env.GEX_SERVE_PORT || 8090);
+const CHROME_STATE = join(STATE, `chrome-${CHROME_PORT}`);
+mkdirSync(CHROME_STATE, { recursive: true });
 
 // ---------------------------------------------------------------------------
 // What each demo is, and what counts as having worked. `want`/`fail` may be a
@@ -66,6 +68,11 @@ const DEMOS = {
       Number(/lit=(\d+)/.exec(t.replace(/\s+/g, ''))?.[1]) > 0,
     fail: (t) => /lit=0(?!\d)/.test(t.replace(/\s+/g, '')),
   },
+  // A session: several clients, each its own process, in one output. The bar
+  // is the compositor's own: windows mapped and pixels on the output, which
+  // `--wllit` reads back from its framebuffer. The terminal line only says the
+  // shell got that far.
+  compositor: { want: /gex: session up/ },
   // glxgears under Xwayland, GL through virgl (same success bar as `virgl`):
   // a frame rate AND a lit texture presented. `lit=0` is drew-nothing.
   wayland: {
@@ -105,17 +112,32 @@ const INJECT_JS = `(() => {
   return 'dispatched';
 })()`;
 
-// Counts non-black pixels on the compositor canvas (#gex-wl) -- the read-back
-// that tells `--wllit` a client drew something the whole pipeline delivered.
-const WLLIT_JS = `(() => {
-  const cv = document.getElementById('gex-wl');
-  if (!cv) return 0;
-  const ctx = cv.getContext('2d');
-  if (!ctx) return 0;
-  const d = ctx.getImageData(0, 0, cv.width, cv.height).data;
-  let lit = 0;
-  for (let i = 0; i < d.length; i += 4) if (Math.max(d[i], d[i + 1], d[i + 2]) > 24) lit++;
-  return lit;
+// What the compositor says it has drawn: mapped windows, frames, and a readback
+// of its own output (`lit`). The output is a WebGL canvas owned by a worker, so
+// the page cannot sample it directly -- `describe()` asks the worker, which
+// reads its own framebuffer. A run that maps a window and shows black is the
+// failure this measures, and it has happened at every layer of this pipeline.
+const WLLIT_JS = `(async () => {
+  const c = globalThis.__gexCompositor;
+  if (!c) return 0;
+  const s = await c.describe();
+  return s ? s.lit : 0;
+})()`;
+
+// How many windows the compositor has mapped, for a session where one window
+// drawing is not the goal: `--wlwindows 3` waits for three.
+const WLWINDOWS_JS = `(async () => {
+  const c = globalThis.__gexCompositor;
+  if (!c) return 0;
+  const s = await c.describe();
+  return s ? s.windows : 0;
+})()`;
+
+const WLSTATE_JS = `(async () => {
+  const c = globalThis.__gexCompositor;
+  if (!c) return null;
+  const s = await c.describe();
+  return s ? JSON.stringify(s) : null;
 })()`;
 
 // ---------------------------------------------------------------------------
@@ -140,6 +162,8 @@ function parseArgs(argv) {
     // Workers that each log; measuring memory with that on measures the
     // observer too. This is how to tell how much of a peak is ours.
     quietWorkers: false,
+    displayFps: 0,
+    displaySamples: 5,
   };
   const rest = [];
   for (let i = 2; i < argv.length; i++) {
@@ -157,9 +181,13 @@ function parseArgs(argv) {
     else if (a === '--want') o.want = next();
     else if (a === '--fail') o.fail = next();
     else if (a === '--shot') o.shot = next();
+    else if (a === '--gl-capture') o.glCapture = next();
     else if (a === '--input') o.input = true;
     else if (a === '--applit') o.applit = true;
     else if (a === '--wllit') o.wllit = true;
+    else if (a === '--wlwindows') o.wlwindows = Number(next());
+    else if (a === '--display-fps') o.displayFps = Number(next());
+    else if (a === '--display-samples') o.displaySamples = Number(next());
     else if (a.startsWith('--')) fatal(`unknown flag ${a}`);
     else rest.push(a);
   }
@@ -235,7 +263,7 @@ async function ensureChrome(restart) {
       }
     }
     try {
-      const pid = Number(await readFile(join(STATE, 'chrome.pid'), 'utf8'));
+      const pid = Number(await readFile(join(CHROME_STATE, 'chrome.pid'), 'utf8'));
       if (pid) process.kill(pid, 'SIGKILL');
     } catch {
       /* none recorded */
@@ -250,22 +278,50 @@ async function ensureChrome(restart) {
   }
   if (!existsSync(CHROME)) fatal(`no browser at ${CHROME} (set CHROME=...)`);
 
-  const out = openSync(join(STATE, 'chrome.log'), 'a');
+  const out = openSync(join(CHROME_STATE, 'chrome.log'), 'a');
+  const headed = process.env.GEX_HEADED === '1';
   const args = [
-    '--headless',
+    ...(!headed ? ['--headless'] : []),
     '--no-sandbox',
     '--disable-gpu-sandbox',
     // A real, if software, WebGL2 context in headless -- the graphics demos
     // negotiate a GL context before drawing a byte.
-    '--enable-unsafe-swiftshader',
-    '--use-angle=swiftshader-webgl',
+    ...(!headed ? ['--enable-unsafe-swiftshader'] : []),
+    // The compatibility renderer targets WebGPU. Chromium's Linux/headless
+    // build exposes navigator.gpu without offering an adapter unless this
+    // explicit gate is enabled.
+    '--enable-unsafe-webgpu',
+    // Vulkan, not SwiftShader, for ANGLE -- and the feature flag as well, since
+    // the backend alone is ignored without it.
+    //
+    // `--use-angle=swiftshader-webgl` left GL on SwiftShader while WebGPU ran
+    // on Dawn, and no SharedImageBackingFactory can back a texture both of
+    // them read. Configuring a canvas for WebGPU therefore failed in the GPU
+    // process -- "Could not find SharedImageBackingFactory with params: usage:
+    // Gles2Read|...|WebgpuSwapChainTexture|..." -- and Chromium destroyed the
+    // device two milliseconds later. Nothing surfaced that as an error: draws
+    // kept being "issued" into a dead device and the canvas stayed blank,
+    // which is what made SuperTuxKart look like a renderer bug for days.
+    // Demos that never present (gears) never hit it.
+    //
+    // GEX_WEBGPU_SOFTWARE=1 moves *both* to SwiftShader instead. Correctness
+    // gates do not need the discrete GPU, and keeping them off it means a
+    // routine gate run cannot exhaust the 4 GB card the desktop is also using.
+    // Both move together for the reason above: the pairing is what has to
+    // match, not which backend it is.
+    ...(!headed
+      ? (process.env.GEX_WEBGPU_SOFTWARE === '1'
+          ? ['--use-angle=swiftshader-webgl',
+             '--use-webgpu-adapter=swiftshader']
+          : ['--use-angle=vulkan', '--enable-features=Vulkan'])
+      : []),
     '--enable-gpu-rasterization',
-    '--ozone-platform=headless',
+    ...(!headed ? ['--ozone-platform=headless'] : []),
     // The headless screen, and so the viewport a screenshot captures.
     // 800x600 fits the terminal and clips a toolkit window in half, which
     // is enough to tell a run passed and not enough to show anyone what it
     // drew -- `GEX_SCREEN=1280,1000` is for the second question.
-    `--ozone-override-screen-size=${process.env.GEX_SCREEN || '800,600'}`,
+    ...(!headed ? [`--ozone-override-screen-size=${process.env.GEX_SCREEN || '800,600'}`] : []),
     // Both, because they are different things: the screen is what the page
     // may grow to and the window is what a screenshot captures.
     `--window-size=${process.env.GEX_SCREEN || '800,600'}`,
@@ -280,12 +336,12 @@ async function ensureChrome(restart) {
     '--no-default-browser-check',
     '--remote-allow-origins=*',
     `--remote-debugging-port=${CHROME_PORT}`,
-    `--user-data-dir=${join(STATE, 'chrome-profile')}`,
+    `--user-data-dir=${join(CHROME_STATE, 'profile')}`,
     'about:blank',
   ];
   const child = spawn(CHROME, args, { detached: true, stdio: ['ignore', out, out] });
   child.unref();
-  writeFileSync(join(STATE, 'chrome.pid'), String(child.pid));
+  writeFileSync(join(CHROME_STATE, 'chrome.pid'), String(child.pid));
   for (let i = 0; i < 80; i++) {
     url = await browserWsUrl(CHROME_PORT);
     if (url) {
@@ -294,7 +350,7 @@ async function ensureChrome(restart) {
     }
     await sleep(250);
   }
-  fatal('chrome did not expose a debugging port (see /tmp/gex-harness/chrome.log)');
+  fatal(`chrome did not expose :${CHROME_PORT} (see ${join(CHROME_STATE, 'chrome.log')})`);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -304,7 +360,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // does show here, so a climb toward the ceiling is visible before the kill.
 // Matched by our unique `--user-data-dir`, so an unrelated chromium on the box
 // (a stray headless run) does not inflate the number and mislead the guard.
-const PROFILE = join(STATE, 'chrome-profile');
+const PROFILE = join(CHROME_STATE, 'profile');
 function chromeRssMiB() {
   try {
     // `ps` with the full command line, summing the RSS of every process whose
@@ -335,9 +391,35 @@ async function runDemo(o) {
   if (o.cmd ?? spec.cmd) qs.set('cmd', o.cmd ?? spec.cmd);
   if (o.allowErrors) qs.set('allowerrors', '1');
   for (const q of [spec.query, ...o.query].filter(Boolean)) {
-    for (const [k, v] of new URLSearchParams(q)) qs.set(k, v);
+    for (const [k, v] of new URLSearchParams(q)) {
+      // An argv is ordered and may contain repeated options. Preserve repeated
+      // glarg values while retaining last-writer-wins behavior for ordinary
+      // scalar demo settings. glfile is the same shape -- the page reads it
+      // with getAll to stage several files -- and collapsing it to the last
+      // one silently dropped the guest binary itself.
+      if (k === 'glarg' || k === 'glfile') qs.append(k, v);
+      else qs.set(k, v);
+    }
+  }
+  // MobileGL does not render SuperTuxKart and is not a valid reference for the
+  // Mesa/gex_wgpu path, so the harness refuses to drive it. There is
+  // deliberately no override: an escape hatch would only ever be reached by
+  // mistake, or by a future agent talking itself into "just as a control".
+  // This is the first of two refusals (MobileGlDevice.create throws as well);
+  // it exists because failing here costs a second, while failing in the page
+  // costs a browser launch and a log read carefully enough to notice which
+  // backend even ran.
+  // Must match MobileGlDevice.requested() in web/src/mobilegl.js. `webgpu=1` is
+  // the selector that actually reached MobileGL and the one every gl44 gate
+  // used to pass by default -- checking only `gl=mobilegl` missed it.
+  if (qs.get('gl') === 'mobilegl' || qs.get('webgpu') === '1') {
+    fatal('refusing to run MobileGL: it does not render SuperTuxKart and is '
+        + 'not a valid reference for the Mesa/gex_wgpu path, not even as a '
+        + 'comparison. There is no override flag -- use --query gl=mesa, or '
+        + 'virgl when you need to know what a correct frame looks like.');
   }
   const url = `http://127.0.0.1:${SERVE_PORT}/?${qs}`;
+  const dumpWgsl = qs.has('dumpwgsl');
   log(`run: ${url}`);
   log(`goal: ${o.want ? `--want ${o.want}` : describe(spec.want)}${settle ? `  (settle: ${settle})` : ''}`);
 
@@ -366,7 +448,12 @@ async function runDemo(o) {
     if (p.type === 'error' || p.type === 'assert') {
       record(errors, `[${label(sid)}] console.${p.type}: ${text}`);
     } else if (p.type === 'warning') {
-      log(`  warn [${label(sid)}] ${trunc(text, 200)}`);
+      // 400, not 200: a driver diagnostic carries the numbers at its end, and
+      // the browser's own error strings are long enough that 200 cut them off
+      // mid-sentence -- "A valid external \u2026" is not a diagnosis.
+      log(`  warn [${label(sid)}] ${trunc(text, 400)}`);
+    } else if (/\[webgpu\] WGSL/.test(text) || (dumpWgsl && /\[mobilegl\]/.test(text))) {
+      log(`  · [${label(sid)}] ${text}`);
     } else if (/\bquiet:|MISS-LOOP|\[virgl\] running/.test(text)) {
       // The wait census (console.debug "[gex] quiet: ...") and a few other
       // diagnostics say what a wedged run is parked on -- surfaced on demand.
@@ -442,7 +529,20 @@ async function runDemo(o) {
     {
       source:
         'window.__gex={statuses:[]};' +
-        "addEventListener('gex:status',e=>window.__gex.statuses.push(e.detail));",
+        "addEventListener('gex:status',e=>window.__gex.statuses.push(e.detail));" +
+        // Harness-only frame pacing trace. Sample the renderer serial on each
+        // browser animation tick so we can distinguish missed rAF deadlines from
+        // ticks where the application simply had no newer frame.
+        'window.__gexPresentTiming={raf:[],fresh:[]};' +
+        'requestAnimationFrame(function tick(t){' +
+          'const q=window.__gexPresentTiming;q.raf.push(t);' +
+          'if(q.raf.length>6000)q.raf.splice(0,q.raf.length-6000);' +
+          'const s=globalThis.__gexGlState?.()||"";' +
+          'const m=/presented=(\\d+)/.exec(s);const p=m?Number(m[1]):-1;' +
+          'if(p>=0&&p!==q.last){if(q.last>=0)q.fresh.push([t,p-q.last]);q.last=p;' +
+            'if(q.fresh.length>6000)q.fresh.splice(0,q.fresh.length-6000);}' +
+          'requestAnimationFrame(tick);' +
+        '});',
     },
     page,
   );
@@ -474,6 +574,15 @@ async function runDemo(o) {
       verdict = { how: 'timeout', body: `wall of ${o.wallMs / 1000}s` };
       break;
     }
+    const vram = vramUsedMiB();
+    if (vram !== null && vram > VRAM_BUDGET_MIB) {
+      verdict = {
+        how: 'vram',
+        body: `GPU VRAM ${vram} MiB over budget ${VRAM_BUDGET_MIB} MiB ` +
+              `(GEX_VRAM_BUDGET_MIB to change)`,
+      };
+      break;
+    }
     if (now - lastActivity > o.idleMs) {
       verdict = {
         how: 'hang',
@@ -495,7 +604,7 @@ async function runDemo(o) {
       // dead session is not, and the wall/crash guards above will end it.
       continue;
     }
-    const { term, statuses } = snap;
+    const { term, statuses, fpsSamples } = snap;
 
     if (term !== printed) {
       streamTerminalDelta(printed, term);
@@ -571,6 +680,33 @@ async function runDemo(o) {
       }
     }
 
+    // --wlwindows N: a session's goal. N windows mapped in the compositor, and
+    // pixels on the output -- one client drawing says nothing about whether the
+    // others arrived, which is the whole question for a session.
+    if (o.wlwindows && !verdict) {
+      try {
+        const r = await browser.send(
+          'Runtime.evaluate',
+          { expression: WLWINDOWS_JS, returnByValue: true, awaitPromise: true },
+          page,
+        );
+        const windows = Number(r?.result?.value ?? 0);
+        if (windows >= o.wlwindows) {
+          const lit = await browser.send(
+            'Runtime.evaluate',
+            { expression: WLLIT_JS, returnByValue: true, awaitPromise: true },
+            page,
+          );
+          const px = Number(lit?.result?.value ?? 0);
+          if (px > 4000) {
+            verdict = { how: 'pass', body: `${windows} windows, output lit (${px} samples)` };
+          }
+        }
+      } catch {
+        /* transient */
+      }
+    }
+
     // --wllit: the universal Xwayland-pipeline success signal. Xwayland
     // composites every client -- GL or not -- to a wl_shm buffer the compositor
     // blits onto #gex-wl, so non-black pixels there mean the app drew and the
@@ -579,11 +715,14 @@ async function runDemo(o) {
       try {
         const r = await browser.send(
           'Runtime.evaluate',
-          { expression: WLLIT_JS, returnByValue: true },
+          { expression: WLLIT_JS, returnByValue: true, awaitPromise: true },
           page,
         );
         const lit = Number(r?.result?.value ?? 0);
-        if (lit > 200) verdict = { how: 'pass', body: `compositor canvas lit (${lit}px)` };
+        // A window's worth of pixels, not a cursor's: the compositor draws a
+        // pointer whatever else happens, and 200 samples of it passed a run
+        // whose clients had all died.
+        if (lit > 4000) verdict = { how: 'pass', body: `compositor output lit (${lit} samples)` };
       } catch {
         /* transient */
       }
@@ -593,10 +732,19 @@ async function runDemo(o) {
     // Goal reached?
     if (verdict) {
       // already decided (e.g. --input / --applit / --wllit above)
-    } else if (matches(want, term)) {
-      verdict = { how: 'pass', body: 'want matched' };
+    } else if (o.displayFps > 0 && fpsSamples.length >= o.displaySamples) {
+      const recent = fpsSamples.slice(-o.displaySamples);
+      const average = recent.reduce((sum, fps) => sum + fps, 0) / recent.length;
+      if (average >= o.displayFps) {
+        verdict = {
+          how: 'pass',
+          body: `displayed ${average.toFixed(1)} FPS over ${recent.length} one-second samples`,
+        };
+      }
     } else if (matches(fail, term)) {
       verdict = { how: 'fail', body: 'fail pattern matched' };
+    } else if (matches(want, term)) {
+      verdict = { how: 'pass', body: 'want matched' };
     } else if (last?.kind === 'bad') {
       verdict = { how: 'fail', body: `status: ${last.text}` };
     } else if (settle && last?.text === settle) {
@@ -619,14 +767,107 @@ async function runDemo(o) {
   const secs = ((Date.now() - began) / 1000).toFixed(1);
   let shotPath = o.shot ?? join(STATE, `shot-${o.demo}.png`);
   try {
+    // Frame the canvas, not the top of the page. A demo's canvas sits below a
+    // heading and a paragraph, so a plain full-page capture at this viewport
+    // shows a strip of its top edge at best -- which reads as "still blank"
+    // whatever the renderer actually drew. Scroll it into view and clip to it.
+    // Falls back to the whole page when the demo has no canvas.
+    let clip;
+    try {
+      const r = await capped(
+        browser.send(
+          'Runtime.evaluate',
+          {
+            expression: `(() => {
+              // The visible one. A demo can have a second, offscreen canvas --
+              // the Wayland path does -- and querySelector('canvas') would
+              // hand back whichever came first in the document.
+              const all = [...document.querySelectorAll('canvas')]
+                .filter((e) => !e.classList.contains('wl-offscreen'));
+              // #gex-gl first: a GL client presents there, and the Wayland
+              // demo keeps a second canvas beside it for the compositor's own
+              // shm frames. Both are in .canvas-wrap and the shm one comes
+              // first in the document, so picking by position photographed
+              // the wrong one for anything rendering through GL.
+              const c = document.querySelector('#gex-gl:not(.wl-offscreen)')
+                ?? document.querySelector('.canvas-wrap canvas:not(.wl-offscreen)')
+                ?? all[0] ?? document.querySelector('canvas');
+              if (!c) return '';
+              c.scrollIntoView({ block: 'center' });
+              const b = c.getBoundingClientRect();
+              // Page coordinates, not viewport ones. captureBeyondViewport
+              // clips against the page, and scrollIntoView above is what makes
+              // the two disagree -- so a plain getBoundingClientRect() framed
+              // a region scrollY above the canvas. Every screenshot of a demo
+              // whose canvas sits below the fold showed the heading and a
+              // strip of the canvas's top edge, which reads as "it drew
+              // nothing" no matter what it drew.
+              return JSON.stringify({
+                x: b.x + window.scrollX,
+                y: b.y + window.scrollY,
+                width: b.width,
+                height: b.height,
+              });
+            })()`,
+            returnByValue: true,
+          },
+          page,
+        ),
+        10_000,
+        'canvas rect',
+      );
+      const rect = r?.result?.value ? JSON.parse(r.result.value) : null;
+      if (rect && rect.width >= 1 && rect.height >= 1)
+        clip = { ...rect, scale: 1 };
+    } catch {
+      /* no canvas, or the page is gone -- capture whatever is there */
+    }
     const { data } = await capped(
-      browser.send('Page.captureScreenshot', { format: 'png' }, page),
+      browser.send(
+        'Page.captureScreenshot',
+        clip ? { format: 'png', clip, captureBeyondViewport: true }
+             : { format: 'png' },
+        page,
+      ),
       10_000,
       'screenshot',
     );
     writeFileSync(shotPath, Buffer.from(data, 'base64'));
   } catch {
     shotPath = null;
+  }
+
+  // Pull any recorded GL command stream out before the page goes away. The
+  // page never offers a download: a driver that can evaluate can read it, and
+  // that keeps recording free of any UI.
+  if (o.glCapture) {
+    try {
+      const r = await capped(
+        browser.send(
+          'Runtime.evaluate',
+          {
+            expression:
+              'globalThis.__gexGlCapture ? JSON.stringify({data:globalThis.__gexGlCapture.toBase64(),batches:globalThis.__gexGlCapture.batches,truncated:globalThis.__gexGlCapture.truncated}) : ""',
+            returnByValue: true,
+          },
+          page,
+        ),
+        60_000,
+        'GL capture',
+      );
+      const recorded = r?.result?.value ? JSON.parse(r.result.value) : null;
+      if (!recorded) {
+        console.error('drive: nothing recorded -- did the page get ?glcapture=1?');
+      } else {
+        writeFileSync(o.glCapture, Buffer.from(recorded.data, 'base64'));
+        console.log(
+          `  GL capture: ${recorded.batches} batches -> ${o.glCapture}` +
+            (recorded.truncated ? ' (truncated at the size ceiling)' : ''),
+        );
+      }
+    } catch (e) {
+      console.error(`drive: could not collect the GL capture: ${e?.message || e}`);
+    }
   }
 
   const finalTerm = printed.replace(/\n+$/, '');
@@ -636,7 +877,7 @@ async function runDemo(o) {
         'Runtime.evaluate',
         {
           expression:
-            'JSON.stringify({state:globalThis.__gexGlState?.()??"",commands:globalThis.__gexGlCommands?.()??""})',
+            'JSON.stringify({state:globalThis.__gexGlState?.()??"",commands:globalThis.__gexGlCommands?.()??"",fps:document.querySelector("output.fps")?.textContent??"",fpsSamples:globalThis.__gexDisplayFps??[],presentTiming:globalThis.__gexPresentTiming??null})',
           returnByValue: true,
         },
         page,
@@ -647,6 +888,36 @@ async function runDemo(o) {
     const diagnostics = JSON.parse(r?.result?.value || '{}');
     if (diagnostics.state) console.log(`\n---- renderer state ----\n  ${diagnostics.state}`);
     if (diagnostics.commands) console.log(`  ${diagnostics.commands}`);
+    if (diagnostics.fps) console.log(`  ${diagnostics.fps}`);
+    if (diagnostics.fpsSamples?.length) {
+      console.log(`  FPS samples: ${diagnostics.fpsSamples.map((n) => n.toFixed(1)).join(' ')}`);
+    }
+    if (diagnostics.presentTiming?.raf?.length > 2) {
+      const allRaf = diagnostics.presentTiming.raf;
+      const allFresh = diagnostics.presentTiming.fresh;
+      const timingEnd = allFresh.at(-1)?.[0] ?? allRaf.at(-1);
+      const timingStart = timingEnd - 10_000;
+      const recentRaf = allRaf.filter((t) => t >= timingStart && t <= timingEnd);
+      const rafIntervals = recentRaf.slice(1).map((t, i) => t - recentRaf[i]);
+      const recentFresh = allFresh.filter(([t]) => t >= timingStart && t <= timingEnd);
+      const freshIntervals = recentFresh.slice(1).map(([t], i) => t - recentFresh[i][0]);
+      const percentile = (values, q) => {
+        if (!values.length) return 0;
+        const sorted = [...values].sort((a, b) => a - b);
+        return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+      };
+      const rafMisses = rafIntervals.filter((ms) => ms > 20).length;
+      const freshTicks = recentFresh.length;
+      const serialAdvance = recentFresh.reduce((sum, [, delta]) => sum + delta, 0);
+      console.log(
+        `  Present timing (${(recentRaf.at(-1) - recentRaf[0]).toFixed(0)}ms): ` +
+        `rAF p50=${percentile(rafIntervals, 0.50).toFixed(2)}ms ` +
+        `p95=${percentile(rafIntervals, 0.95).toFixed(2)}ms ` +
+        `max=${Math.max(...rafIntervals).toFixed(2)}ms misses=${rafMisses}; ` +
+        `fresh=${freshTicks}/${recentRaf.length} serial-advance=${serialAdvance} ` +
+        `fresh-p95=${percentile(freshIntervals, 0.95).toFixed(2)}ms`,
+      );
+    }
   } catch {
     /* A dead renderer cannot report diagnostics. */
   }
@@ -741,7 +1012,7 @@ async function evalPage(browser, page) {
     'Runtime.evaluate',
     {
       expression:
-        'JSON.stringify({term:(window.gexTerminalText?.()||""),statuses:(window.__gex?.statuses||[])})',
+        'JSON.stringify({term:(window.gexTerminalText?.()||""),statuses:(window.__gex?.statuses||[]),fpsSamples:(globalThis.__gexDisplayFps||[])})',
       returnByValue: true,
     },
     page,
@@ -763,10 +1034,45 @@ function streamTerminalDelta(prev, next) {
   }
 }
 
+// How much VRAM the discrete GPU is using, in MiB, or null if there is no
+// amdgpu card exposing it.
+//
+// This is the guard that replaces watching the kernel log. A gex_wgpu run
+// mirrors every GL buffer into a WGPUBuffer -- a SuperTuxKart race holds about
+// 1.9 GB of them -- and on this 4 GB card that has twice exhausted VRAM,
+// after which amdgpu floods
+//   [drm] *ERROR* Not enough memory for command submission!
+// and wedges a CPU in the DRM path until the machine is reset by hand. By then
+// nothing can report anything, so the check has to happen before that point
+// and has to stop the run itself. sysfs is world-readable and exact.
+const VRAM_SYSFS = (() => {
+  // Overridable so the guard itself can be tested without a loaded GPU.
+  if (process.env.GEX_VRAM_SYSFS) return process.env.GEX_VRAM_SYSFS;
+  for (const card of ['card0', 'card1', 'card2', 'card3']) {
+    const p = `/sys/class/drm/${card}/device/mem_info_vram_used`;
+    if (existsSync(p)) return p;
+  }
+  return null;
+})();
+
+function vramUsedMiB() {
+  if (!VRAM_SYSFS) return null;
+  try {
+    return Math.round(Number(readFileSync(VRAM_SYSFS, 'utf8').trim()) / 1048576);
+  } catch {
+    return null;
+  }
+}
+
+// Abort the run at this much VRAM rather than letting amdgpu reach its own
+// limit: the failure is not graceful, and the margin is what keeps a bad run
+// from taking the machine with it.
+const VRAM_BUDGET_MIB = Number(process.env.GEX_VRAM_BUDGET_MIB || 2600);
+
 // ---------------------------------------------------------------------------
 async function main() {
   const o = parseArgs(process.argv);
-  if (!DEMOS[o.demo] && !o.want) {
+  if (!DEMOS[o.demo] && !o.want && o.displayFps <= 0) {
     fatal(`unknown demo '${o.demo}' and no --want given (known: ${Object.keys(DEMOS).join(', ')})`);
   }
   if (o.build) {
@@ -779,6 +1085,18 @@ async function main() {
     const code = await new Promise((res) => r.on('exit', res));
     if (code !== 0) fatal(`build failed (exit ${code})`);
     log(`build: ok in ${((Date.now() - t) / 1000).toFixed(0)}s`);
+  }
+  // Pre-flight: refuse to start on a card that is already loaded. Starting a
+  // gex_wgpu run with little VRAM left is how the machine gets wedged, and a
+  // refusal here costs nothing next to an outage that needs a physical reset.
+  const vramAtStart = vramUsedMiB();
+  if (vramAtStart !== null) {
+    log(`gpu: ${vramAtStart} MiB VRAM in use, budget ${VRAM_BUDGET_MIB} MiB`);
+    if (vramAtStart > VRAM_BUDGET_MIB * 0.75) {
+      fatal(`GPU already at ${vramAtStart} MiB of a ${VRAM_BUDGET_MIB} MiB ` +
+            `budget -- close what is holding it, or raise ` +
+            `GEX_VRAM_BUDGET_MIB deliberately`);
+    }
   }
   await ensureServer();
   const code = await runDemo(o);

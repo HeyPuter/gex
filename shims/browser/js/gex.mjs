@@ -17,9 +17,28 @@ const DECODER = new TextDecoder();
 export function utf8(view) {
   return DECODER.decode(view.buffer instanceof SharedArrayBuffer ? view.slice() : view);
 }
-const GUEST_INITIAL_BYTES = 0x05000000;
+
+// Registry indices describe a shared queue, not module identity: two Workers
+// can drain and publish that queue in different turns. A compiled Module may
+// only be reused for byte-identical input, or its element segments install
+// unrelated functions into otherwise-correct dispatch slots. Two independent
+// 32-bit accumulators plus the exact length make a cheap content key; this is
+// validation against an index race, not a persistent content-addressed cache.
+function moduleContentKey(bytes) {
+  if (!(bytes instanceof Uint8Array)) return null;
+  let a = 0x811c9dc5;
+  let b = 0x9e3779b9;
+  for (let i = 0; i < bytes.length; i++) {
+    const x = bytes[i];
+    a = Math.imul(a ^ x, 0x01000193);
+    b = Math.imul(b ^ (x + i), 0x85ebca6b);
+    b ^= b >>> 13;
+  }
+  return `${bytes.length}:${a >>> 0}:${b >>> 0}`;
+}
+const GUEST_INITIAL_BYTES = 0x07000000;
 // The shim's stack sits at the bottom of its region, below its data.
-const SHIM_STACK_TOP = 0x04800000;
+const SHIM_STACK_TOP = 0x06000000;
 /**
  * Whether a fork hands the child its parent's compiled modules (default 1).
  * `?forkmods=0` sends none and the child recompiles what it branches into.
@@ -796,7 +815,13 @@ export class Gex {
         net_close: (id) => this.#net?.close(id),
         // Graphics: the guest's GL library batched commands in its own memory;
         // this hands over the address and the page runs them on WebGL.
-        gl_submit: (ring) => (this.#gl ? this.#gl.submit(this.#memory, ring >>> 0) : -1),
+        // The token as well as the ring: the host keeps a GL context per
+        // process, because the object names in the stream are this process's
+        // own and another process hands out the same ones.
+        gl_submit: (ring) =>
+          (this.#gl
+            ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken())
+            : -1),
         // The other GPU path: unmodified Mesa speaking VirGL over a socket,
         // decoded by virglrenderer (a separate wasm module with its own heap,
         // so bytes not an address -- see web/src/virgl.js). `session` says
@@ -805,13 +830,15 @@ export class Gex {
           this.#virgl
             ? this.#virgl.submit(session >>> 0, this.#memory, ptr >>> 0, len >>> 0)
             : -1,
-        // The compositor's output: a wayland client committed a frame, and its
-        // pixels are at `ptr` (tightly-packed RGBA) in this memory. One-way --
-        // the page copies them to its canvas; nothing is returned.
-        wl_present: (ptr, w, h, stride, format) =>
-          this.#wl?.present(this.#memory, ptr >>> 0, w, h, stride >>> 0, format >>> 0),
-        // The reverse: drain the page's mouse/keyboard ring into `ptr` as packed
-        // i32 quintuples, so the compositor pump can deliver them to the client.
+        // This pump's scene: `count` surface records at `ptr` in this memory,
+        // saying where each surface's pixels are rather than carrying them. The
+        // compositor reads those addresses out of this same memory, so a frame
+        // is never copied on its way to the screen.
+        wl_publish: (ptr, count) =>
+          this.#wl?.publish(this.#memory, ptr >>> 0, count >>> 0),
+        // The reverse: drain this process's input and control ring into `ptr`,
+        // so the compositor pump can deliver each event to the client and
+        // surface the compositor's own hit test picked.
         wl_poll_input: (ptr, max) =>
           this.#wl?.pollInput(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
         virgl_take: (session, ptr, max) =>
@@ -883,7 +910,12 @@ export class Gex {
     // a debugging switch set for the run holds for the processes it spawns --
     // the block trace of a child that crashes is otherwise silent.
     this.#opts = {
-      strace: opts.strace, tty: opts.tty, uid: opts.uid, gid: opts.gid,
+      strace: opts.strace,
+      // Which single process to narrate, if any. Inherited like `strace` --
+      // the interesting process is usually a child, and a whole session's
+      // syscalls is more output than a page survives.
+      stracePid: opts.stracePid,
+      tty: opts.tty, uid: opts.uid, gid: opts.gid,
       traceBlocks: opts.traceBlocks, traceMisses: opts.traceMisses, checkSp: opts.checkSp,
       watchMem: opts.watchMem,
       noIntrinsics: opts.noIntrinsics, intrinsicMask: opts.intrinsicMask,
@@ -1630,7 +1662,9 @@ export class Gex {
     const o = child.opts ?? {};
     this.#opts = o;
     syncSlotShift(e);
-    if (o.strace) e.gex_set_trace(1);
+    // `?strace=1` narrates every process; `?stracepid=N` only that one, which
+    // is what a run that must stay alive can afford.
+    if (o.strace || (o.stracePid && o.stracePid === child.pid)) e.gex_set_trace(1);
     if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
     if (o.watchMem) e.gex_set_watch_mem?.(BigInt(o.watchMem));
     if (o.traceMisses) e.gex_set_trace_misses?.(1);
@@ -2002,15 +2036,16 @@ export class Gex {
       // `WebAssembly.Module` (same registry bytes -> same module) rather than
       // paying `WebAssembly.compile` again. The bytes are still needed for the
       // metadata and table-need computation the install does regardless.
-      const cached = this.#sharedModules.get(i);
+      const key = moduleContentKey(bytes);
+      const cached = key ? this.#sharedModules.get(key) : undefined;
       await this.#installModule(bytes, need, 64, null, 'jit2049', cached);
       if (cached) { reused++; continue; }
       // Newly compiled here: hand it to the host to relay to siblings, and keep
       // it so this Worker does not compile it twice either.
       const mod = this.#compiled[this.#compiled.length - 1]?.mod;
-      if (mod) {
-        this.#sharedModules.set(i, mod);
-        this.#env.shareModule?.(i, mod);
+      if (mod && key) {
+        this.#sharedModules.set(key, mod);
+        this.#env.shareModule?.(key, mod);
       }
       n++;
     }
@@ -2025,9 +2060,9 @@ export class Gex {
    * by registry index so this Worker's `#catchUp` reuses it instead of
    * recompiling the same bytes. See `#sharedModules`.
    */
-  addSharedModule(i, mod) {
-    if (mod instanceof WebAssembly.Module && !this.#sharedModules.has(i)) {
-      this.#sharedModules.set(i, mod);
+  addSharedModule(key, mod) {
+    if (typeof key === 'string' && mod instanceof WebAssembly.Module && !this.#sharedModules.has(key)) {
+      this.#sharedModules.set(key, mod);
     }
   }
 
@@ -2059,7 +2094,7 @@ export class Gex {
       // No metadata means nothing to key a later fill on -- install it eagerly,
       // as the fork path does (`#adoptModule`), reusing a sibling's compile.
       if (!meta || !meta.length) {
-        await this.#installModule(bytes, need, 64, null, 'lazy-nometa', this.#sharedModules.get(i));
+        await this.#installModule(bytes, need, 64, null, 'lazy-nometa', this.#sharedModules.get(moduleContentKey(bytes)));
         eager++;
         continue;
       }
@@ -2068,14 +2103,14 @@ export class Gex {
       const got = e.gex_add_lazy_module(gp, meta.length) >>> 0;
       e.gex_free?.(gp, meta.length);
       if (!got) {
-        await this.#installModule(bytes, need, 64, meta, 'lazy-noneed', this.#sharedModules.get(i));
+        await this.#installModule(bytes, need, 64, meta, 'lazy-noneed', this.#sharedModules.get(moduleContentKey(bytes)));
         eager++;
         continue;
       }
       // Keep a sibling's compiled Module when we have it, so the on-demand
       // instantiate skips the compile too; otherwise the raw bytes. The push
       // order matches `gex_add_lazy_module`'s ordinal (both count from 0 here).
-      this.#lazyInherited.push({ mod: this.#sharedModules.get(i) ?? bytes, need, inst: null, meta });
+      this.#lazyInherited.push({ mod: this.#sharedModules.get(moduleContentKey(bytes)) ?? bytes, need, inst: null, meta });
       lazy++;
     }
     if (globalThis.GEX_ATTACH_TRACE && (lazy || eager)) {
@@ -2118,13 +2153,28 @@ export class Gex {
   }
 
   /**
-   * Give the guest a Wayland compositor. `wl` is a `WlProxy` (wl-bridge.mjs)
-   * that carries committed frames to the page's canvas. Like `useGl`, best set
-   * before `load` -- the socket is bound while the filesystem is built.
+   * Give the guest a Wayland compositor. `wl` is a `WlProxy` (wl-bridge.mjs),
+   * this process's window into the shared scene arena the compositor worker
+   * draws from. Like `useGl`, best set before `load` -- the socket is bound
+   * while the filesystem is built.
    */
   useWl(wl) {
     this.#wl = wl;
     this.#shim?.exports?.gex_set_wl?.(wl ? 1 : 0);
+  }
+
+  /** Say how large the compositor's output is, before the guest runs. */
+  wlOutput(w, h) {
+    this.#shim?.exports?.gex_set_wl_output?.(w | 0, h | 0);
+  }
+
+  /**
+   * This process's name in the compositor's scene arena: its pid, which every
+   * Worker of the process agrees on and no other process shares. Zero before
+   * the process has one, so callers ask again rather than caching it.
+   */
+  wlToken() {
+    return this.#shim?.exports?.gex_wl_token?.() ?? 0;
   }
 
   /**
@@ -2220,6 +2270,8 @@ export class Gex {
           const e = this.#shim.exports;
           const at = ask(e.gex_current_pc, (pc) =>
             `, guest pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}`);
+          const lr = ask(e.gex_current_lr, (lr) =>
+            `, lr=0x${(lr < 0n ? lr + (1n << 64n) : lr).toString(16)}`);
           const code = ask(e.gex_exit_code, (c) => (c ? `, exit code ${c}` : ''));
           const heap = ask(e.gex_heap_used_kib, (k) =>
             k >= 0 ? `, ${(k / 1024) | 0} MiB of shim heap in use` : '');
@@ -2313,7 +2365,7 @@ export class Gex {
             );
           });
           throw new Error(
-            `the gex runtime trapped inside the shim (${err.message}${at}${nr}` +
+            `the gex runtime trapped inside the shim (${err.message}${at}${lr}${nr}` +
               `${code}${heap}${where}). That is a crash in the runtime, not a guest exit; ` +
               'anything printed above is all the guest managed to do first.',
           );
@@ -2520,10 +2572,35 @@ export class Gex {
             `, ctx=0x${ctx.toString(16)}${heap}${dispatch})`;
         }
         if (String(err).includes("unreachable")) {
+          // A handoff can race a sibling wake: the first scheduling pass sees
+          // no owned thread ready, then a sibling makes this Worker's thread
+          // runnable before JS observes the pause mask. Do one final scheduler
+          // pass before declaring the process abandoned. Without this, a
+          // perfectly valid runnable thread is discarded with pc=0.
+          if (!e.gex_exited?.() && e.gex_wake && e.gex_resume_pc) {
+            const scheduled = e.gex_wake();
+            const resume = e.gex_resume_pc();
+            if (scheduled === 1 && resume !== 0n) {
+              pc = resume < 0n ? resume + (1n << 64n) : resume;
+              const resumeCtx = e.gex_resume_ctx?.() >>> 0;
+              if (resumeCtx) ctx = resumeCtx;
+              continue;
+            }
+            if (globalThis.GEX_REPORT_ABANDONED) {
+              console.error(
+                `[gex] final handoff recovery found scheduler=${scheduled}, resume=0x${
+                  (resume < 0n ? resume + (1n << 64n) : resume).toString(16)
+                }`,
+              );
+            }
+          }
           // The ordinary end: the shim set an exit status and abandoned the
           // stack. `enter` never returns then, so this is the path a finished
           // program takes.
-          if (globalThis.GEX_DEBUG_EXIT) {
+          // An abandoned translated stack is always a crash and must explain
+          // itself. Keep successful exits quiet unless full debug was asked
+          // for, but never hide the only useful PC/wasm-stack diagnostics.
+          if ((!e.gex_exited?.() && globalThis.GEX_REPORT_ABANDONED) || globalThis.GEX_DEBUG_EXIT) {
             // With where it was, because a crash with no status set looks
             // identical to a clean finish otherwise.
             const say = (fn, f) => {
@@ -2582,6 +2659,8 @@ export class Gex {
             // And the wasm stack, when nobody set a status: a finished program's
             // says nothing, but a faulted shim's names the function that did it.
             if (!e.gex_exited?.()) {
+              try { e.gex_dump_threads?.(); } catch {}
+              try { e.gex_dump_state?.(); } catch {}
               console.error(`[gex] the stack under it:\n${err.stack ?? String(err)}`);
             }
           }
@@ -2731,7 +2810,9 @@ export class Gex {
     // trace. Checked only when nothing is left to install: the queue is FIFO
     // and a served module ahead of the unit legitimately lacks the block.
     const check = globalThis.GEX_CHECK_INSTALL || (typeof process !== 'undefined' && process.env?.GEX_CHECK_INSTALL);
-    await this.#installModule(this.#bytes().slice(ptr, ptr + len), e.gex_jit_slots() >>> 0, 64, null, 'jit2878');
+    const bytes = this.#bytes().slice(ptr, ptr + len);
+    const key = moduleContentKey(bytes);
+    await this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'jit2878');
     e.gex_jit_installed();
     if (check && e.gex_miss_pc && e.gex_dispatch_slot && (e.gex_jit_pending_len() >>> 0) === 0) {
       try {
@@ -2761,11 +2842,10 @@ export class Gex {
     // then reuses it (from its start message) instead of recompiling the whole
     // registry. Its index is the newest entry.
     if (count) {
-      const i = count - 1;
       const mod = this.#compiled[this.#compiled.length - 1]?.mod;
-      if (mod && !this.#sharedModules.has(i)) {
-        this.#sharedModules.set(i, mod);
-        this.#env.shareModule?.(i, mod);
+      if (mod && key && !this.#sharedModules.has(key)) {
+        this.#sharedModules.set(key, mod);
+        this.#env.shareModule?.(key, mod);
       }
     }
   }
@@ -3261,7 +3341,7 @@ export class Gex {
     // Owned but unfillable: the caller's fallback scan cannot help, because
     // the objects that claim this page are the only ones that hold its code.
     if (owned) return null;
-    if (page * 4096 < 0x0300_0000) return null;
+    if (page * 4096 < 0x04a0_0000) return null;
     const where = this.#pageBase(page);
     // Same sentinel as above: zero is "no translation", not slot zero.
     if (where <= 0) return null;
@@ -3355,7 +3435,7 @@ export class Gex {
       this.#filled++;
       return true;
     }
-    if (slot * 4096 >= 0x0300_0000) {
+    if (slot * 4096 >= 0x04a0_0000) {
       for (const inst of this.#unfilled) {
         if (at > 0 && inst.exports[FILL_AT](slot, at, this.#fillFrom())
             && this.#wroteWanted(slot, at)) {

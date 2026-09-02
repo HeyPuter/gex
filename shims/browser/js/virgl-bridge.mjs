@@ -40,7 +40,7 @@ export function serveVirgl(renderer, channel) {
   // The renderer expects a `WebAssembly.Memory` (what the shim hands it on the
   // direct path); here the bytes are in a plain buffer, so hand it a lookalike.
   const asMemory = { buffer: channel.data };
-  return function serve() {
+  return async function serve() {
     if (Atomics.load(ctl, STATE) !== REQUEST) return;
     const op = ctl[OP];
     const session = ctl[SESSION];
@@ -49,7 +49,7 @@ export function serveVirgl(renderer, channel) {
     let replyLen = 0;
     try {
       if (op === 0) {
-        result = renderer ? renderer.submit(session, asMemory, 0, len) : -1;
+        result = renderer ? await renderer.submit(session, asMemory, 0, len) : -1;
       } else if (op === 1) {
         const n = renderer ? renderer.take(session, asMemory, 0, Math.min(len, data.length)) : 0;
         result = n;
@@ -91,6 +91,9 @@ export class VirglProxy {
     ctl[SESSION] = session;
     ctl[LEN] = len;
     Atomics.store(ctl, STATE, REQUEST);
+    // An OffscreenCanvas renderer waits on this word directly. The page-side
+    // fallback still uses `wake`; notifying with no waiter is harmless.
+    Atomics.notify(ctl, STATE);
     this.#wake();
     // A timeout, so a dead page or renderer ends the guest rather than wedging
     // its Worker for the life of the tab. Thirty seconds is far longer than any
@@ -101,6 +104,7 @@ export class VirglProxy {
       }
     }
     Atomics.store(ctl, STATE, IDLE);
+    Atomics.notify(ctl, STATE);
     return ctl[RESULT];
   }
 

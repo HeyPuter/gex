@@ -294,6 +294,14 @@ for (const [event, describe] of [
     globalThis.GEX_TRAP_STACK = 1;
   }
   if (params.get('exittrace')) globalThis.GEX_EXIT_TRACE = 1;
+  // `?strace=1`: narrate every syscall of every process, the shim's own
+  // `--strace`. A flood -- tens of thousands of lines a second -- but the only
+  // instrument that says what a process did *last* before it stopped, and the
+  // option is inherited by children, which is where the interesting ones are.
+  if (params.get('strace')) globalThis.GEX_STRACE = 1;
+  // `?stracepid=N`: the same narration for one process only -- a page survives
+  // a shell's syscalls, not a session's.
+  if (params.has('stracepid')) globalThis.GEX_STRACE_PID = Number(params.get('stracepid'));
   // `?trapstack=1`: the engine's stack for a trap -- which names the shim
   // function the fault was in -- without `?debug`'s mirroring of every guest
   // write to the console. That mirroring is not free: it changed the timing

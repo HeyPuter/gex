@@ -144,6 +144,9 @@ def deps(p, chosen):
     return out
 
 seen, queue, missing = set(), os.environ['GEX_ROOTS'].split(), []
+# Names asked for, and packages actually resolved: not the same set, which is
+# what the duplicate stanzas came from.
+resolved = set()
 order = []
 # Every root counts as chosen before anything transitive is resolved, so a
 # clause naming one prefers it. The queue is FIFO and the roots go in first,
@@ -158,6 +161,15 @@ while queue:
     if not p:
         missing.append(name)
         continue
+    # A virtual name and the package behind it are one package: `awk` resolves
+    # to `gawk`, and so does `gawk`. Keyed on the name asked for, both were
+    # appended -- and two stanzas for one package in /var/lib/dpkg/status is a
+    # dpkg that will not run at all ("multiple non-coinstallable package
+    # instances present"), which takes apt down with it. Nothing noticed until
+    # an image had dpkg in it to run.
+    if p['Package'] in resolved:
+        continue
+    resolved.add(p['Package'])
     order.append(p)
     chosen.add(p['Package'])
     queue.extend(deps(p, chosen))
@@ -231,7 +243,17 @@ mkdir -p "$R/var/lib/dpkg/info" "$R/var/lib/dpkg/updates" "$R/var/lib/dpkg/trigg
          "$R/var/lib/apt/lists/partial" "$R/var/lib/apt/periodic" \
          "$R/var/log/apt" "$R/var/log" "$R/tmp" "$R/proc" "$R/dev" "$R/run" \
          "$R/var/tmp" "$R/usr/share/keyrings"
-for d in "$WORK"/debs/*.deb; do
+# The closure's own archives, not every .deb the cache holds. The cache is
+# never cleaned -- it is what makes a second run cheap -- so unpacking all of
+# it put whatever an earlier build had fetched into the tree, and the tree then
+# held packages that /var/lib/dpkg/status (written from the closure below) says
+# nothing about. Dropping a package from the roots now drops it from the tree.
+python3 -c "
+import json
+for p in json.load(open('$WORK/closure.json')): print(p['Filename'].rsplit('/', 1)[-1])
+" | while read -r base; do
+    d="$WORK/debs/$base"
+    [ -f "$d" ] || { echo "  missing from the cache: $base"; continue; }
     (cd "$WORK" && ar x "$d" && tar -C "$R" -xf data.tar.* && rm -f data.tar.* control.tar.* debian-binary)
 done
 

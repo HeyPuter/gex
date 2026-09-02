@@ -1,0 +1,10 @@
+[package]
+name = "gex-xwm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The X window manager a rootless Xwayland needs, as protocol"
+
+[dependencies]
+gex-kernel.workspace = true
+gex-wayland.workspace = true

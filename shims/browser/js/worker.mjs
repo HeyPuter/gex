@@ -223,7 +223,7 @@ async function handle(msg) {
   // and only matters once this Worker has a `Gex`; before that it is dropped and
   // the module is simply recompiled. See `Gex#sharedModules`.
   if (msg?.kind === 'sharedModule') {
-    workerGex?.addSharedModule(msg.i, msg.mod);
+    workerGex?.addSharedModule(msg.key, msg.mod);
     return;
   }
   if (msg?.kind !== 'run' && msg?.kind !== 'adopt' && msg?.kind !== 'thread') return;
@@ -314,8 +314,8 @@ async function handle(msg) {
     // Workers of the same process so they reuse it rather than recompiling the
     // same registry bytes. A `WebAssembly.Module` crosses `postMessage` by
     // reference -- no byte copy. See `Gex#sharedModules`.
-    shareModule(i, mod) {
-      port.post({ kind: 'compiledModule', i, mod });
+    shareModule(key, mod) {
+      port.post({ kind: 'compiledModule', key, mod });
     }
   }
 
@@ -354,7 +354,7 @@ async function handle(msg) {
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
   // Any sibling modules the host already had when this Worker started.
-  for (const [i, mod] of msg.sharedModules ?? []) gex.addSharedModule(i, mod);
+  for (const [key, mod] of msg.sharedModules ?? []) gex.addSharedModule(key, mod);
 
   // The guest's GPU. The renderer is on the page, so calls cross a
   // `SharedArrayBuffer` and block on `Atomics.wait` -- they must be synchronous
@@ -363,36 +363,68 @@ async function handle(msg) {
   // fall back when it is missing.
   if (msg.virgl) {
     const { VirglProxy } = await import('./virgl-bridge.mjs');
-    gex.useVirgl(new VirglProxy(msg.virgl, () => port.post({ kind: 'virgl' })), !!msg.virglTrace);
+    gex.useVirgl(
+      new VirglProxy(msg.virgl, () => {
+        // An OffscreenCanvas renderer waits on the shared control word itself;
+        // only the main-thread fallback needs a posted wake-up.
+        if (!msg.virgl.direct) port.post({ kind: 'virgl' });
+      }),
+      !!msg.virglTrace,
+    );
   }
   // The GL device (gles-gears): the page's GlDevice, reached over a ring in a
   // SharedArrayBuffer. `useGl` sets the flag `gex_set_gl` reads at load, so it
   // must run before `load` -- which mounts /dev/gex-gl only when the flag is on.
   if (msg.glChannel) {
     const { GlProxy } = await import('./gl-bridge.mjs');
-    gex.useGl(new GlProxy(msg.glChannel, () => port.post({ kind: 'gl' })));
+    gex.useGl(new GlProxy(msg.glChannel, () => {
+      // An OffscreenCanvas renderer waits on the control word directly. Keep
+      // thousands of synchronous query wake-ups off the page event loop.
+      if (!msg.glChannel.direct) port.post({ kind: 'gl' });
+    }));
   }
-  // The Wayland compositor's present path: frames the shim commits go over this
-  // ring to the page's canvas. `useWl` sets the flag `gex_set_wl` reads at load,
-  // so it must run before `load` -- which binds `wayland-0` only when it is on.
+  // The Wayland compositor: this process's window into the scene arena the
+  // compositor worker draws from. `useWl` sets the flag `gex_set_wl` reads at
+  // load, so it must run before `load` -- which binds `wayland-0` only when it
+  // is on.
   if (msg.wlChannel) {
-    const { WlProxy } = await import('./wl-bridge.mjs');
-    gex.useWl(new WlProxy(msg.wlChannel, () => port.post({ kind: 'wl' })));
+    const { WlProxy, outputSize } = await import('./wl-bridge.mjs');
+    // The token is this process's pid, which is not known yet -- the process
+    // has none until it is loaded or adopted -- so it is asked for lazily, on
+    // the first publish.
+    const proxy = new WlProxy(msg.wlChannel, () => port.post({ kind: 'wl' }), () => gex.wlToken());
+    gex.useWl(proxy);
+    // The output size a toplevel is configured to, before the guest runs.
+    const out = outputSize(msg.wlChannel);
+    gex.wlOutput(out.w, out.h);
+    // The compositor reads this process's pixels out of this memory, so it
+    // needs the memory itself. Sent once, with the token that names this
+    // process's block in the arena.
+    // The compositor reads this process's pixels out of this memory, so it
+    // needs the memory itself. Sent when the token is known, which is after
+    // load: `onLoaded` is the first moment this process has a pid.
+    // The memory object, not its buffer: a shared memory that grows gives out a
+    // new buffer, and the compositor has to be able to see the new length.
+    gex.onWlToken = (token) => {
+      port.post({ kind: 'wl-memory', token, memory: gex.memory });
+    };
+    proxy.onToken = gex.onWlToken;
   } else if (msg.wlStub) {
     // A headless compositor for node: the shim's gex-wayland runs and binds
     // `wayland-0`, so a guest connects and inits exactly as in the browser, but
-    // frames are discarded (no canvas) and there is no input. Lets the
-    // native-wayland deadlock be reproduced under node's tooling. present/
-    // pollInput are what `wl_present` and the input pull call.
-    // GEX_WL_DUMP=<path>: save the first committed frame as a PPM so a render
-    // can be eyeballed. Loaded here (the handler is async) and closed over.
+    // there is no canvas and no input. What the browser's compositor worker
+    // does in WebGL, this does in software -- painter's algorithm over the
+    // published scene -- which is enough to prove a client rendered.
+    //
+    // GEX_WL_DUMP=<path>: composite the scene to a PPM so a render can be
+    // eyeballed. GEX_COVERAGE_OUT=<path>: dump every block PC translated in
+    // this process (the reached set) as hex lines, to seed a
+    // reachability-trimmed closure build. Re-dumped as the run reaches more
+    // code; the set only grows, so the last write is the fullest.
     const dumpPath = globalThis.process?.env?.GEX_WL_DUMP;
-    // GEX_COVERAGE_OUT=<path>: dump every block PC translated in this process (the
-    // reached set) as hex lines, to seed a reachability-trimmed closure build.
-    // Re-dumped as the run reaches more code; the set only grows, so the last
-    // write is the fullest. present is the natural moment -- the app has drawn.
     const covPath = globalThis.process?.env?.GEX_COVERAGE_OUT;
     const fs = (dumpPath || covPath) ? await import('node:fs') : null;
+    const bridge = await import('./wl-bridge.mjs');
     const dumpCoverage = () => {
       if (!fs || !covPath) return;
       try {
@@ -406,27 +438,62 @@ async function handle(msg) {
     };
     let count = 0;
     gex.useWl({
-      present(memory, ptr, w, h, stride, format) {
+      publish(memory, ptr, n) {
         count++;
         if (count === 1 || count % 30 === 0) dumpCoverage();
-        if (count === 1 || count % 60 === 0) console.error(`[wlstub] present #${count} ${w}x${h} stride=${stride} fmt=${format}`);
-        if (fs && count === 1 && memory?.buffer) {
-          try {
-            const px = new Uint8Array(memory.buffer, ptr >>> 0, stride * h);
-            const body = Buffer.alloc(w * h * 3);
-            for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-              const i = y * stride + x * 4, o = (y * w + x) * 3;
-              body[o] = px[i + 2]; body[o + 1] = px[i + 1]; body[o + 2] = px[i]; // BGRA->RGB
-            }
-            fs.writeFileSync(dumpPath, `P6\n${w} ${h}\n255\n`);
-            fs.appendFileSync(dumpPath, body);
-            console.error(`[wlstub] wrote frame to ${dumpPath}`);
-          } catch (e) { console.error(`[wlstub] dump failed: ${e.message}`); }
+        const recs = [];
+        const words = new Int32Array(memory.buffer, ptr >>> 0, n * bridge.REC);
+        for (let i = 0; i < n; i++) {
+          const r = i * bridge.REC;
+          recs.push({
+            surface: words[r + bridge.R_SURFACE],
+            role: words[r + bridge.R_ROLE],
+            x: words[r + bridge.R_REL_X],
+            y: words[r + bridge.R_REL_Y],
+            w: words[r + bridge.R_WIDTH],
+            h: words[r + bridge.R_HEIGHT],
+            addr: words[r + bridge.R_ADDR] >>> 0,
+            stride: words[r + bridge.R_STRIDE],
+          });
         }
+        const windows = recs.filter((s) => s.role === bridge.ROLE_TOPLEVEL && s.w > 0);
+        if (count === 1 || count % 60 === 0) {
+          console.error(
+            `[wlstub] publish #${count}: ${recs.length} surfaces, ${windows.length} windows`
+            + windows.map((w) => ` ${w.w}x${w.h}`).join(''),
+          );
+        }
+        if (!fs || !dumpPath || !windows.length) return;
+        // The output is the largest window's size, and every surface is drawn
+        // into it at its own offset: one file that shows the whole session.
+        const W = Math.max(...windows.map((s) => s.x + s.w));
+        const H = Math.max(...windows.map((s) => s.y + s.h));
+        const body = Buffer.alloc(W * H * 3);
+        const px = new Uint8Array(memory.buffer);
+        for (const s of recs) {
+          if (s.role === bridge.ROLE_CURSOR || s.w <= 0 || s.h <= 0) continue;
+          for (let y = 0; y < s.h; y++) {
+            const oy = s.y + y;
+            if (oy < 0 || oy >= H) continue;
+            for (let x = 0; x < s.w; x++) {
+              const ox = s.x + x;
+              if (ox < 0 || ox >= W) continue;
+              const i = s.addr + y * s.stride + x * 4;
+              const o = (oy * W + ox) * 3;
+              body[o] = px[i + 2];
+              body[o + 1] = px[i + 1];
+              body[o + 2] = px[i];
+            }
+          }
+        }
+        fs.writeFileSync(dumpPath, `P6\n${W} ${H}\n255\n`);
+        fs.appendFileSync(dumpPath, body);
+        if (count === 1) console.error(`[wlstub] wrote ${W}x${H} scene to ${dumpPath}`);
       },
       pollInput() { return 0; },
     });
   }
+
   // The Node fast lane's network: real TCP sockets rather than Wisp, so the
   // paths above them -- apt's helper, the fetch, the parse -- run here in two
   // minutes instead of twenty.
@@ -559,6 +626,10 @@ async function handle(msg) {
     // Around `gex.run` alone: everything before it is loading and module
     // compilation, so a codegen A/B measured through the total is a third
     // module size and V8's compiler.
+    // A thread exits through syscall 93 without marking the whole process
+    // exited, so only a process Worker should label an unreachable return as
+    // an abandoned process stack.
+    globalThis.GEX_REPORT_ABANDONED = msg.kind !== 'thread';
     const runStarted = performance.now();
     const status = await gex.run(entry, ctx);
     const guestMillis = Math.round(performance.now() - runStarted);

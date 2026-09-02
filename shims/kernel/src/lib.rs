@@ -359,6 +359,7 @@ pub extern "C" fn k_tty_input(at: u32, len: u32) -> i32 {
             .extend(r.echo);
     }
     for sig in r.signals {
+        note_kill(0, -fg_group(), sig);
         let _ = procs().kill_group(gex_kernel::INIT_PID, fg_group(), sig);
     }
     // Wake a reader parked inside wasm, which runs no event loop.
@@ -446,6 +447,7 @@ pub extern "C" fn k_tty_signal(signo: u32) -> i32 {
     if signo == 0 || signo > gex_kernel::signal::sig::MAX {
         return -22;
     }
+    note_kill(0, -fg_group(), signo);
     let n = match procs().kill_group(gex_kernel::INIT_PID, fg_group(), signo) {
         Ok(n) => n as i32,
         Err(e) => -(e.0 as i32),
@@ -1072,6 +1074,10 @@ pub extern "C" fn k_spawn(ppid: i32) -> i32 {
 /// [`k_wait`] turns the two into the one word a parent reads.
 #[no_mangle]
 pub extern "C" fn k_exit(pid: i32, status: i32) {
+    // The exit owes this process's parent a SIGCHLD, which `exit` sets. Record
+    // it like any other signal so a delivery can be traced back to the process
+    // that ended -- "why did the terminal think its shell died" needs the pid.
+    note_kill(pid, procs().ppid(pid), gex_kernel::signal::sig::SIGCHLD);
     procs().exit(pid, status);
 }
 
@@ -1129,6 +1135,7 @@ pub extern "C" fn k_has_children(ppid: i32) -> i32 {
 pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
     if signo != 0 {
         note_signal();
+        note_kill(caller, target, signo);
     }
     match procs().kill(caller, target, signo) {
         Ok(n) => n as i32,
@@ -1142,6 +1149,39 @@ pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
 /// "has anybody sent anything since I last looked", and only a change pays for
 /// the real check.
 static SIGNAL_SEQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The last signal this kernel handed to anyone: caller, target, number.
+///
+/// "Killed by signal 1" says nothing about who decided that, and the senders
+/// are spread out -- the shared terminal's line discipline, a pty hangup, and
+/// any guest's own `kill`. The shim reads this for its death report.
+static LAST_KILL: Mutex<(i32, i32, u32)> = Mutex::new((0, 0, 0));
+/// How many signals have been sent, so notes from different Workers can be put
+/// in order -- which is the whole question when one process's signal makes
+/// another one misbehave.
+static KILL_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn note_kill(caller: i32, target: i32, signo: u32) {
+    if signo != 0 {
+        *LAST_KILL.lock().unwrap_or_else(|e| e.into_inner()) = (caller, target, signo);
+        KILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// How many signals have been sent so far. See `note_kill`.
+#[no_mangle]
+pub extern "C" fn k_last_kill_seq() -> u32 {
+    KILL_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Caller in the high bits, target in the middle, signal in the low byte. A
+/// negative target is a process group, as `kill` spells it.
+#[no_mangle]
+pub extern "C" fn k_last_kill() -> u64 {
+    let (caller, target, signo) = *LAST_KILL.lock().unwrap_or_else(|e| e.into_inner());
+    ((caller as i64 as u64) << 40) | (((target as i64 as u64) & 0xffff_ffff) << 8)
+        | (signo as u64 & 0xff)
+}
 
 fn note_signal() {
     SIGNAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -1158,6 +1198,7 @@ pub extern "C" fn k_signal_seq() -> i32 {
 /// running as pid 1 is in has no negative spelling.
 #[no_mangle]
 pub extern "C" fn k_kill_group(caller: i32, pgid: i32, signo: u32) -> i32 {
+    note_kill(caller, -pgid, signo);
     if signo != 0 {
         note_signal();
     }
@@ -1431,11 +1472,27 @@ fn ptys() -> &'static Mutex<Vec<std::sync::Arc<gex_kernel::pty::Pty>>> {
     PTYS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Which pty ends each process still holds, so a Worker that leaves by a trap
-/// (no unwind, no `Drop`) does not strand the other end. `(id, master)`.
-fn pty_holders() -> &'static Mutex<BTreeMap<i32, Vec<(i32, bool)>>> {
+/// How many descriptors each process has on each pty end, keyed
+/// `pid -> (id, master) -> count`.
+///
+/// The *end's* own count is a count of PROCESSES, not of descriptors, and this
+/// is what makes that possible: a process's first descriptor on an end opens it
+/// and its last one closes it. That is the semantic that matters -- the slave
+/// is at end of file when no process has it open, and the last master going is
+/// a hangup for the whole session -- and it is the only one gex can keep exact.
+/// A descriptor count cannot be: `fork` hands a child every descriptor (so the
+/// parent counts three for one file it dup'd to stdin, stdout and stderr) while
+/// the child's kernel holds one object for them and closes once. Counting
+/// descriptors, those two disagree, and the disagreement showed up as a
+/// terminal whose shell died the moment its first command finished: the slave
+/// count reached zero while three descriptors still pointed at it, the master
+/// read end of file, and the session took a SIGHUP.
+///
+/// It also survives a Worker that leaves by a trap (no unwind, no `Drop`):
+/// `k_pty_forget` releases whatever that pid still held.
+fn pty_holders() -> &'static Mutex<BTreeMap<i32, BTreeMap<(i32, bool), u32>>> {
     note_panics();
-    static HELD: OnceLock<Mutex<BTreeMap<i32, Vec<(i32, bool)>>>> = OnceLock::new();
+    static HELD: OnceLock<Mutex<BTreeMap<i32, BTreeMap<(i32, bool), u32>>>> = OnceLock::new();
     HELD.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -1450,22 +1507,31 @@ fn pty_at(id: i32) -> Option<std::sync::Arc<gex_kernel::pty::Pty>> {
         .cloned()
 }
 
-fn pty_hold(pid: i32, id: i32, master: bool) {
-    pty_holders()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(pid)
-        .or_default()
-        .push((id, master));
+/// Note a descriptor on an end. True when this process did not have one before,
+/// which is when the end itself gains a holder.
+fn pty_hold(pid: i32, id: i32, master: bool) -> bool {
+    let mut h = pty_holders().lock().unwrap_or_else(|e| e.into_inner());
+    let n = h.entry(pid).or_default().entry((id, master)).or_insert(0);
+    *n += 1;
+    *n == 1
 }
 
-fn pty_unhold(pid: i32, id: i32, master: bool) {
+/// Drop a descriptor on an end. True when this process has none left, which is
+/// when the end itself loses a holder.
+fn pty_unhold(pid: i32, id: i32, master: bool) -> bool {
     let mut h = pty_holders().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(v) = h.get_mut(&pid) {
-        if let Some(i) = v.iter().position(|e| *e == (id, master)) {
-            v.swap_remove(i);
-        }
+    let Some(mine) = h.get_mut(&pid) else {
+        return false;
+    };
+    let Some(n) = mine.get_mut(&(id, master)) else {
+        return false;
+    };
+    *n = n.saturating_sub(1);
+    if *n == 0 {
+        mine.remove(&(id, master));
+        return true;
     }
+    false
 }
 
 /// A signal to the pty's foreground group, if it has claimed one. `^C`, hangup
@@ -1473,7 +1539,8 @@ fn pty_unhold(pid: i32, id: i32, master: bool) {
 fn pty_signal(p: &gex_kernel::pty::Pty, sig: u32) {
     let fg = p.tty.fg();
     if fg > 0 {
-        let _ = procs().kill_group(gex_kernel::INIT_PID, fg, sig);
+        note_kill(0, -fg, sig);
+    let _ = procs().kill_group(gex_kernel::INIT_PID, fg, sig);
     }
 }
 
@@ -1499,8 +1566,9 @@ pub extern "C" fn k_pty_open_slave(ptn: i32, pid: i32) -> i32 {
     if p.locked() {
         return -5; // EIO -- unlockpt was not called
     }
-    p.open_slave();
-    pty_hold(pid, ptn, false);
+    if pty_hold(pid, ptn, false) {
+        p.open_slave();
+    }
     ptn
 }
 
@@ -1508,12 +1576,15 @@ pub extern "C" fn k_pty_open_slave(ptn: i32, pid: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_pty_open_end(id: i32, master: i32, pid: i32) {
     if let Some(p) = pty_at(id) {
-        if master != 0 {
-            p.open_master();
-        } else {
-            p.open_slave();
+        // Only the process's *first* descriptor on this end opens it: see
+        // `pty_holders`.
+        if pty_hold(pid, id, master != 0) {
+            if master != 0 {
+                p.open_master();
+            } else {
+                p.open_slave();
+            }
         }
-        pty_hold(pid, id, master != 0);
     }
 }
 
@@ -1522,14 +1593,20 @@ pub extern "C" fn k_pty_open_end(id: i32, master: i32, pid: i32) {
 #[no_mangle]
 pub extern "C" fn k_pty_close_end(id: i32, master: i32, pid: i32) {
     if let Some(p) = pty_at(id) {
-        if master != 0 {
-            if p.close_master() {
-                pty_signal(&p, gex_kernel::signal::sig::SIGHUP);
+        // And only its *last* descriptor closes it.
+        if pty_unhold(pid, id, master != 0) {
+            if master != 0 {
+                if p.close_master() {
+                    pty_signal(&p, gex_kernel::signal::sig::SIGHUP);
+                }
+            } else {
+                p.close_slave();
+                last_slave_closer()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, pid);
             }
-        } else {
-            p.close_slave();
         }
-        pty_unhold(pid, id, master != 0);
         k_wake();
     }
 }
@@ -1542,7 +1619,9 @@ pub extern "C" fn k_pty_forget(pid: i32) -> u32 {
         h.remove(&pid).unwrap_or_default()
     };
     let n = held.len() as u32;
-    for (id, master) in held {
+    // One close per end, whatever the process had open on it: the end counts
+    // holders. See `pty_holders`.
+    for ((id, master), _) in held {
         if let Some(p) = pty_at(id) {
             if master {
                 if p.close_master() {
@@ -1557,6 +1636,47 @@ pub extern "C" fn k_pty_forget(pid: i32) -> u32 {
         k_wake();
     }
     n
+}
+
+/// Whether the session that owns this pty's slave is still running.
+///
+/// A pty master reports end of file when the last slave descriptor goes -- that
+/// is how a terminal emulator learns its shell is gone. But a *transient*
+/// close is not a hangup, and a terminal emulator's own child makes one: it
+/// opens the slave, closes it, calls `setsid`, and opens it again so that the
+/// reopen is what claims the controlling terminal. On Linux that window is a
+/// few instructions wide and nothing observes it; here every syscall crosses
+/// into JavaScript, so the window is milliseconds and the emulator's poll saw
+/// it every time -- read end of file, kill the process group, and a terminal
+/// that ran exactly one command before its shell died of SIGHUP.
+///
+/// So the question is not "is a descriptor open" but "is whoever owned the slave
+/// still there": the session that claimed the terminal, if one has, and
+/// otherwise the process that let the last descriptor go -- because the window
+/// above opens *before* `TIOCSCTTY`, when no session owns it yet. Either one
+/// alive means the slave is merely between descriptors.
+fn hangup_is_real(p: &gex_kernel::pty::Pty, id: i32) -> bool {
+    let sid = p.tty.sid();
+    if sid > 0 {
+        return !procs().exists(sid);
+    }
+    let who = last_slave_closer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .copied();
+    match who {
+        Some(pid) if pid > 0 => !procs().exists(pid),
+        // Nobody has closed one yet, or the closer is unknown: the old rule.
+        _ => true,
+    }
+}
+
+/// Who last let go of a pty's slave. See `hangup_is_real`.
+fn last_slave_closer() -> &'static Mutex<BTreeMap<i32, i32>> {
+    note_panics();
+    static WHO: OnceLock<Mutex<BTreeMap<i32, i32>>> = OnceLock::new();
+    WHO.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 /// Write `len` bytes of the caller's memory to an end. On the master this is
@@ -1586,7 +1706,13 @@ pub extern "C" fn k_pty_read(id: i32, master: i32, at: u32, len: u32) -> i32 {
     let Some(p) = pty_at(id) else { return -9 };
     let mut buf = vec![0u8; len as usize];
     let r = if master != 0 {
-        p.master_read(&mut buf)
+        match p.master_read(&mut buf) {
+            // End of file, but the session that owns the slave is still there:
+            // this is the reopen window, not a hangup. See
+            // `hangup_is_real`.
+            Ok(0) if !hangup_is_real(&p, id) => Err(gex_kernel::errno::Errno(11)),
+            other => other,
+        }
     } else {
         p.slave_read(&mut buf)
     };
@@ -1599,10 +1725,28 @@ pub extern "C" fn k_pty_read(id: i32, master: i32, at: u32, len: u32) -> i32 {
     }
 }
 
+/// How many descriptors hold each end: masters in the high half, slaves in the
+/// low. Only a diagnostic -- but the whole session rests on these being right
+/// (the last master closing hangs the slave up with SIGHUP), and an unbalanced
+/// inherit is otherwise invisible until a shell dies for no reason.
+#[no_mangle]
+pub extern "C" fn k_pty_counts(id: i32) -> u32 {
+    let Some(p) = pty_at(id) else { return 0 };
+    (p.master_count() << 16) | (p.slave_count() & 0xffff)
+}
+
 #[no_mangle]
 pub extern "C" fn k_pty_readable(id: i32, master: i32) -> i32 {
     let Some(p) = pty_at(id) else { return 1 }; // gone: readable, so EOF is seen
-    (if master != 0 { p.master_readable() } else { p.slave_readable() }) as i32
+    if master != 0 {
+        // Readable for the same reasons a read would answer with something:
+        // bytes, or a hangup that is real. See `hangup_is_real`.
+        if p.master_available() > 0 {
+            return 1;
+        }
+        return (p.master_readable() && hangup_is_real(&p, id)) as i32;
+    }
+    p.slave_readable() as i32
 }
 
 #[no_mangle]
@@ -1662,6 +1806,28 @@ pub extern "C" fn k_pty_set_winsize(id: i32, packed: u64) -> i32 {
         pty_signal(&p, gex_kernel::signal::sig::SIGWINCH);
     }
     changed as i32
+}
+
+/// Which pty this session claimed as its controlling terminal, or -1.
+///
+/// `/dev/tty` means "the caller's controlling terminal", and for anything
+/// running inside a terminal emulator that is a pty in here -- not the page's
+/// own terminal, which is what the name used to resolve to. A shell opens
+/// /dev/tty for job control and compares its foreground group with its own; the
+/// page's terminal never matches, so the shell spun raising SIGTTIN at itself
+/// and ran nothing.
+#[no_mangle]
+pub extern "C" fn k_pty_for_sid(sid: i32) -> i32 {
+    if sid <= 0 {
+        return -1;
+    }
+    let t = ptys().lock().unwrap_or_else(|e| e.into_inner());
+    for (i, p) in t.iter().enumerate() {
+        if p.tty.sid() == sid {
+            return i as i32;
+        }
+    }
+    -1
 }
 
 #[no_mangle]
@@ -2084,7 +2250,17 @@ pub extern "C" fn k_sock_connect(path: u32, path_len: u32) -> i32 {
     let p = path_of_raw(path, path_len);
     let s = std::sync::Arc::new(UnixSocket::new(true));
     match names().connect(&s, &p) {
-        Ok(_) => keep(s),
+        Ok(_) => {
+            // A connection is waiting on someone's listener, and that someone
+            // may be parked. The guest syscall path wakes after every call;
+            // these entry points are reached from the *host* -- the
+            // compositor's X window manager, the page's own sockets -- and woke
+            // nothing at all. A parked Worker re-checks on its own every 20 ms
+            // whatever happens, so this is latency rather than correctness:
+            // without it a host-side connect waits for that timer.
+            k_wake();
+            keep(s)
+        }
         Err(e) => -e.0,
     }
 }
@@ -2094,7 +2270,12 @@ pub extern "C" fn k_sock_connect(path: u32, path_len: u32) -> i32 {
 pub extern "C" fn k_sock_accept(listener: i32) -> i32 {
     let Some(l) = sock_at(listener) else { return -9 };
     match l.accept() {
-        Ok(s) => keep(s),
+        Ok(s) => {
+            // The other end is connected now, which a parked client may be
+            // waiting to hear.
+            k_wake();
+            keep(s)
+        }
         Err(e) => -e.0,
     }
 }
@@ -2129,7 +2310,12 @@ pub extern "C" fn k_sock_write(id: i32, at: u32, len: u32) -> i32 {
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
     }
     match s.send(&buf) {
-        Ok(n) => n as i32,
+        Ok(n) => {
+            // Bytes for whoever is reading, who may be parked. Same reason as
+            // `k_sock_connect`: the host has no syscall path to wake for it.
+            k_wake();
+            n as i32
+        }
         Err(e) => -e.0,
     }
 }

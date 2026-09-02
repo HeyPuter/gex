@@ -37,6 +37,7 @@ use std::collections::VecDeque;
 pub mod gl;
 pub mod virgl;
 pub mod wl;
+mod xwm;
 
 use std::sync::Arc;
 
@@ -345,6 +346,10 @@ extern "C" {
     fn k_pty_read(id: i32, master: i32, at: u32, len: u32) -> i32;
     fn k_pty_write(id: i32, master: i32, at: u32, len: u32) -> i32;
     fn k_pty_readable(id: i32, master: i32) -> i32;
+    fn k_pty_counts(id: i32) -> u32;
+    fn k_pty_for_sid(sid: i32) -> i32;
+    fn k_last_kill() -> u64;
+    fn k_last_kill_seq() -> u32;
     fn k_pty_available(id: i32, master: i32) -> i32;
     fn k_pty_ptn(id: i32) -> i32;
     fn k_pty_get_lock(id: i32) -> i32;
@@ -544,10 +549,25 @@ extern "C" fn r_wait_ready(ppid: i32, want: i32) -> i32 {
 extern "C" fn r_has_children(ppid: i32) -> i32 {
     unsafe { k_has_children(ppid) }
 }
+/// The first few signals a guest sends, capped. One process signalling another
+/// is where a session comes apart -- a terminal hanging up a live shell, a
+/// shell killing its jobs -- and the receiver's death report can only say what
+/// arrived, not who decided it.
+fn signal_note(what: &str, caller: i32, target: i32, signo: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SAID: AtomicU32 = AtomicU32::new(0);
+    if signo == 0 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
+        return;
+    }
+    warn_line(&format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n"));
+}
+
 extern "C" fn r_kill(caller: i32, target: i32, signo: u32) -> i32 {
+    signal_note("pid", caller, target, signo);
     unsafe { k_kill(caller, target, signo) }
 }
 extern "C" fn r_kill_group(caller: i32, pgid: i32, signo: u32) -> i32 {
+    signal_note("group", caller, pgid, signo);
     unsafe { k_kill_group(caller, pgid, signo) }
 }
 extern "C" fn r_take_signals(pid: i32) -> u64 {
@@ -863,20 +883,55 @@ fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
 // Pty wrappers: the ones that name a holder inject this Worker's pid, the way
 // the pipe wrappers do, so the global kernel can release a process's ends when
 // it leaves by a trap.
+/// The first few pty end open/close events, with who did them.
+///
+/// An end is opened and closed a handful of times in a session -- a terminal
+/// takes the master, its child takes the slave, a fork hands both on -- and the
+/// whole session rests on the count being right: the last master closing is a
+/// SIGHUP to everything in that terminal's session, which from the outside
+/// looks exactly like a shell that died for no reason. Cheap to say, and the
+/// only way to see an unbalanced open.
+fn pty_note(what: &str, id: i32, master: i32, pid: i32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SAID: AtomicU32 = AtomicU32::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= 60 {
+        return;
+    }
+    let counts = unsafe { k_pty_counts(id) };
+    warn_line(&format!(
+        "[pty] pid {pid} {what}s the {} of pty {id}: {} master(s), {} slave(s) now\n",
+        if master != 0 { "master" } else { "slave" },
+        counts >> 16,
+        counts & 0xffff
+    ));
+}
+
 extern "C" fn rpty_open_master() -> i32 {
-    unsafe { k_pty_open_master(my_pid()) }
+    let r = unsafe { k_pty_open_master(my_pid()) };
+    pty_note("open", r >> 16, 1, my_pid());
+    r
 }
 extern "C" fn rpty_open_slave(ptn: i32) -> i32 {
-    unsafe { k_pty_open_slave(ptn, my_pid()) }
+    let r = unsafe { k_pty_open_slave(ptn, my_pid()) };
+    pty_note("open", ptn, 0, my_pid());
+    r
 }
 extern "C" fn rpty_open_end(id: i32, master: i32) {
-    unsafe { k_pty_open_end(id, master, my_pid()) }
+    unsafe { k_pty_open_end(id, master, my_pid()) };
+    pty_note("inherit", id, master, my_pid());
 }
 extern "C" fn rpty_close_end(id: i32, master: i32) {
-    unsafe { k_pty_close_end(id, master, my_pid()) }
+    unsafe { k_pty_close_end(id, master, my_pid()) };
+    pty_note("close", id, master, my_pid());
 }
 extern "C" fn rpty_read(id: i32, master: i32, at: u32, len: u32) -> i32 {
-    unsafe { k_pty_read(id, master, at, len) }
+    let r = unsafe { k_pty_read(id, master, at, len) };
+    // End of file on the master is how a terminal emulator learns its shell is
+    // gone -- and if it is wrong, the emulator kills the session. Worth saying.
+    if r == 0 && master != 0 {
+        pty_note("reads end of file on", id, master, my_pid());
+    }
+    r
 }
 extern "C" fn rpty_write(id: i32, master: i32, at: u32, len: u32) -> i32 {
     unsafe { k_pty_write(id, master, at, len) }
@@ -908,10 +963,17 @@ extern "C" fn rpty_winsize(id: i32) -> u64 {
 extern "C" fn rpty_set_winsize(id: i32, packed: u64) -> i32 {
     unsafe { k_pty_set_winsize(id, packed) }
 }
+extern "C" fn rpty_for_sid(sid: i32) -> i32 {
+    unsafe { k_pty_for_sid(sid) }
+}
 extern "C" fn rpty_fg(id: i32) -> i32 {
     unsafe { k_pty_fg(id) }
 }
 extern "C" fn rpty_set_fg(id: i32, pgrp: i32) {
+    // Who the terminal's foreground group is, capped. A shell that is not it
+    // spins raising SIGTTIN at itself (dash's `setjobctl` does exactly that),
+    // which looks like a terminal that echoes and never runs anything.
+    pty_note(&format!("makes group {pgrp} the foreground of"), id, 0, my_pid());
     unsafe { k_pty_set_fg(id, pgrp) }
 }
 extern "C" fn rpty_sid(id: i32) -> i32 {
@@ -946,6 +1008,7 @@ fn global_ptys() -> Option<gex_kernel::pty::Remote> {
         winsize: rpty_winsize,
         set_winsize: rpty_set_winsize,
         fg: rpty_fg,
+        for_sid: rpty_for_sid,
         set_fg: rpty_set_fg,
         sid: rpty_sid,
         set_sid: rpty_set_sid,
@@ -1186,7 +1249,11 @@ fn mount_devices(
     // cannot come, worse than finding no socket at all.
     let virgl = crate::virgl::have_virgl().then(|| {
         let device = crate::virgl::VirglDevice::new();
-        kernel.socket_names.bind_host(
+        // In this process's own host table, not the system-wide one: the device
+        // can only reach the memory of the process it is in, so the name must
+        // resolve to the device of whoever is connecting. Sharing it across a
+        // fork handed one process's clients to another's device.
+        kernel.host_names.bind_host(
             crate::virgl::DEFAULT_SOCKET,
             Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
         );
@@ -1197,12 +1264,15 @@ fn mount_devices(
     // libwayland fails to connect cleanly rather than blocking on a dead name.
     let wayland = crate::wl::have_wl().then(|| {
         let device = crate::wl::WaylandDevice::new();
-        kernel.socket_names.bind_host(
+        kernel.host_names.bind_host(
             crate::wl::DEFAULT_SOCKET,
             Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
         );
         // A node too, for a client that stats the path before connecting.
         let _ = kernel.vfs.mksocket(crate::wl::DEFAULT_SOCKET);
+        // And where the GL device can find it: a client rendering on the host
+        // names the surface it draws into through /dev/gex-gl.
+        crate::wl::set_compositor(&device);
         device
     });
     (virgl, wayland)
@@ -2447,16 +2517,22 @@ static FTX_ADDR: [std::sync::atomic::AtomicU64; FTX_RING] =
     [const { std::sync::atomic::AtomicU64::new(0) }; FTX_RING];
 static FTX_RET: [std::sync::atomic::AtomicI64; FTX_RING] =
     [const { std::sync::atomic::AtomicI64::new(0) }; FTX_RING];
+static FTX_PC: [std::sync::atomic::AtomicU64; FTX_RING] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; FTX_RING];
+static FTX_TID: [std::sync::atomic::AtomicI32; FTX_RING] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; FTX_RING];
 static FTX_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// `op` is the raw futex operation, or `!0` for the resumption of a wait
 /// that had parked -- the answer the syscall itself never recorded.
-fn ftx_note(op: u64, addr: u64, ret: i64) {
+fn ftx_note(op: u64, addr: u64, ret: i64, pc: u64, tid: i32) {
     use std::sync::atomic::Ordering::Relaxed;
     let i = FTX_AT.fetch_add(1, Relaxed) % FTX_RING;
     FTX_OP[i].store(op, Relaxed);
     FTX_ADDR[i].store(addr, Relaxed);
     FTX_RET[i].store(ret, Relaxed);
+    FTX_PC[i].store(pc, Relaxed);
+    FTX_TID[i].store(tid, Relaxed);
 }
 
 fn ftx_recent() -> String {
@@ -2464,13 +2540,20 @@ fn ftx_recent() -> String {
     let n = FTX_AT.load(Relaxed);
     let mut out = String::new();
     for j in n.saturating_sub(FTX_RING)..n {
+        // Chromium truncates a long console argument. Keep each physical line
+        // short enough that the worker's line-splitting console wrapper can
+        // preserve the complete ring in a crash report.
+        if j > n.saturating_sub(FTX_RING) && (j - n.saturating_sub(FTX_RING)) % 6 == 0 {
+            out.push_str("\n           ");
+        }
         let i = j % FTX_RING;
         let op = FTX_OP[i].load(Relaxed);
         let (addr, ret) = (FTX_ADDR[i].load(Relaxed), FTX_RET[i].load(Relaxed));
+        let (pc, tid) = (FTX_PC[i].load(Relaxed), FTX_TID[i].load(Relaxed));
         if op == !0 {
-            out.push_str(&format!(" resume({addr:#x})={ret}"));
+            out.push_str(&format!(" t{tid}@{pc:#x} resume({addr:#x})={ret}"));
         } else {
-            out.push_str(&format!(" {addr:#x} op={op:#x} = {ret}"));
+            out.push_str(&format!(" t{tid}@{pc:#x} {addr:#x} op={op:#x}={ret}"));
         }
     }
     out
@@ -3656,25 +3739,35 @@ pub extern "C" fn gex_closure_owner(page: u64) -> i32 {
     // Whole body under KLOCK: `IMAGE_PAGES`/`CLOSURE_OWNER` are written at runtime
     // by `gex_add_closure_module` as libraries stream in, and this runs on every
     // Worker's miss path -- see the note there.
-    with_host(|h| {
-        if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
-            let claims = IMAGE_PAGES.0.borrow();
-            let Some(idxs) = claims.get(&page) else {
-                return -1;
-            };
-            return idxs
-                .iter()
-                .find(|i| image_is_ours(h, **i))
-                .map(|i| *i as i32)
-                .unwrap_or(-1);
-        }
-        CLOSURE_OWNER
-            .0
-            .borrow()
-            .get(&page)
-            .map(|v| *v as i32)
-            .unwrap_or(-1)
-    })
+    with_host(|h| closure_owner_held(h, page))
+}
+
+/// Which closure object owns an image page, for a caller that ALREADY holds
+/// KLOCK.
+///
+/// The lock is not re-entrant -- `with_host` panics on a second borrow, and the
+/// panic message is the only sign of it -- so a locked caller must not call
+/// `gex_closure_owner`. `gex_fill_table_for` did exactly that, and a forked
+/// child filling its first image page died with "the kernel was re-entered"
+/// before it could exec: a terminal whose shell never ran a command.
+fn closure_owner_held(h: &mut Host, page: u64) -> i32 {
+    if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
+        let claims = IMAGE_PAGES.0.borrow();
+        let Some(idxs) = claims.get(&page) else {
+            return -1;
+        };
+        return idxs
+            .iter()
+            .find(|i| image_is_ours(h, **i))
+            .map(|i| *i as i32)
+            .unwrap_or(-1);
+    }
+    CLOSURE_OWNER
+        .0
+        .borrow()
+        .get(&page)
+        .map(|v| *v as i32)
+        .unwrap_or(-1)
 }
 
 /// The `k`th closure object covering `page` that belongs to this process.
@@ -4202,12 +4295,13 @@ pub extern "C" fn gex_page_table(page: u64) -> i32 {
     }
     // Whole body under KLOCK: `CLOSURE_TABLE`/`IMAGE_TABLE` are written at runtime
     // by streaming closures (`gex_add_closure_module`) while this runs on every
-    // Worker's fill path. `gex_closure_owner` also takes KLOCK -- re-entrant.
-    with_host(|_| {
+    // Worker's fill path. The owner lookup inside is the *held* form: KLOCK is
+    // not re-entrant, and calling `gex_closure_owner` here panicked the process.
+    with_host(|h| {
         // An image page belongs to whichever root of the closure this process is
         // actually running, so it is looked up by module and not by page alone.
         if page * gex_abi::DISPATCH_PAGE < gex_abi::INTERP_BASE {
-            let owner = gex_closure_owner(page);
+            let owner = closure_owner_held(h, page);
             if owner < 0 {
                 return -1;
             }
@@ -4761,7 +4855,12 @@ fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
         match h.metadata().map(|m| m.file_type) {
             Ok(FileType::Fifo) => true,
             Ok(FileType::Socket) => kernel.net.is_none(),
-            _ => false,
+            // And whatever else says its waits are ended by another process:
+            // a pseudoterminal, whose two ends live in the global kernel with a
+            // terminal emulator in another Worker holding one of them. It was
+            // called the page's before, which is true of the page's OWN
+            // terminal (`STDIN`, just above) and of nothing else.
+            _ => h.peer_wakes() && (unsafe { k_present() }) != 0,
         }
     };
     // A socket the *page* is the other end of.
@@ -5381,6 +5480,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     let stop = with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
+        if ctx as u32 as u64 != kstate.ctx_addr {
+            warn_line(&format!(
+                "[gex] syscall context mismatch at {:#x}: translated ctx={:#x}, worker thread {} ctx={:#x}",
+                pc as u64,
+                ctx as u32,
+                kstate.tid,
+                kstate.ctx_addr,
+            ));
+        }
         h.kernel.enter_thread(&kstate);
         // Rebuilding the proc snapshot costs more than most syscalls, and only
         // a handful can observe it, so the rest skip it.
@@ -5441,6 +5549,39 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let a0 = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         let a1 = gm.read_u64(kstate.ctx_addr + ctx::x(1) as u64).unwrap_or(0);
         let a2 = gm.read_u64(kstate.ctx_addr + ctx::x(2) as u64).unwrap_or(0);
+        if nr == gex_kernel::syscalls::nr::FUTEX {
+            let op = (a1 as u32)
+                & !(gex_kernel::futex::op::PRIVATE_FLAG
+                    | gex_kernel::futex::op::CLOCK_REALTIME);
+            if !matches!(op, 0 | 1 | 3 | 4 | 5 | 9 | 10) {
+                let fp = gm.read_u64(kstate.ctx_addr + ctx::x(29) as u64).unwrap_or(0);
+                let caller = gm.read_u64(fp + 8).unwrap_or(0);
+                let call_insn = gm.read_u32(caller.saturating_sub(4)).unwrap_or(0);
+                let imm26 = ((call_insn & 0x03ff_ffff) as i32) << 6 >> 6;
+                let target = caller
+                    .saturating_sub(4)
+                    .wrapping_add((imm26 as i64 * 4) as u64);
+                let last_target = gm
+                    .read_u64(kstate.ctx_addr + ctx::LAST_TARGET as u64)
+                    .unwrap_or(0);
+                let saved_pc = gm
+                    .read_u64(kstate.ctx_addr + ctx::PC as u64)
+                    .unwrap_or(0);
+                let dir = |addr: u64| {
+                    gm.read_u32(gex_abi::DISPATCH_DIR + gex_abi::dispatch_page(addr) * 4)
+                        .unwrap_or(0)
+                };
+                warn_line(&format!(
+                    "[gex] invalid futex registers at pc={:#x}, translated ctx={:#x}, worker ctx={:#x}: x0={a0:#x} x1={a1:#x} x2={a2:#x}; saved-pc={saved_pc:#x} last-target={last_target:#x}; caller={caller:#x} call={call_insn:#x}->{target:#x}, mem[target]={:#x}, dirs target={:#x} libc={:#x}",
+                    pc as u64,
+                    ctx as u32,
+                    kstate.ctx_addr,
+                    gm.read_u32(target).unwrap_or(0),
+                    dir(target),
+                    dir(pc as u64),
+                ));
+            }
+        }
         let slot = sys_note(nr, a0, a1);
         let outcome = h.kernel.syscall(&mut gm, pc as u64);
         let ret = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
@@ -5508,7 +5649,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // unexpected futex error code with no clue which call or code, and the
         // ring cannot say (a blocked call has not written `x0` when recorded).
         if nr == 98 {
-            ftx_note(a1, a0, ret as i64);
+            ftx_note(a1, a0, ret as i64, pc as u64, kstate.tid);
         }
         // What the guest was trying to say when it could not: glibc writes a
         // fatal diagnostic to fd 2 then aborts, so a stderr write that does not
@@ -5556,6 +5697,33 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         match outcome {
             SyscallOutcome::Continue => 0,
             SyscallOutcome::Resume(target) => {
+                // A syscall boundary that resumes somewhere else is a signal
+                // handler frame: the process took a signal here. Capped, and
+                // with where the signal came from (`k_last_kill`), because a
+                // signal that should never have been sent looks like a program
+                // misbehaving -- a terminal tearing down a live session.
+                {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static SAID: AtomicU32 = AtomicU32::new(0);
+                    if SAID.fetch_add(1, Ordering::Relaxed) < 32 {
+                        let last = if unsafe { k_present() } != 0 {
+                            let v = unsafe { k_last_kill() };
+                            format!(
+                                " (signal #{}: {} from pid {} to {})",
+                                unsafe { k_last_kill_seq() },
+                                v & 0xff,
+                                (v >> 40) as i32,
+                                ((v >> 8) & 0xffff_ffff) as i32
+                            )
+                        } else {
+                            String::new()
+                        };
+                        warn_line(&format!(
+                            "[sig] pid {} runs a handler at {target:#x}{last}\n",
+                            h.kernel.pid
+                        ));
+                    }
+                }
                 set_resume(target);
                 1
             }
@@ -5581,8 +5749,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // through `tgkill`, and the arguments say whether it aimed at
                 // itself.
                 let at = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                // Who sent it, if the global kernel knows: "killed by signal 1"
+                // is true of a hangup, a terminal's line discipline and any
+                // guest's `kill`, and they are not the same bug.
+                let from = if unsafe { k_present() } != 0 {
+                    let v = unsafe { k_last_kill() };
+                    let caller = (v >> 40) as i32;
+                    let target = ((v >> 8) & 0xffff_ffff) as i32;
+                    let signo = (v & 0xff) as u32;
+                    format!(
+                        " (signal #{}: {signo} from pid {caller} to {target})",
+                        unsafe { k_last_kill_seq() }
+                    )
+                } else {
+                    String::new()
+                };
                 warn_line(&format!(
-                    "[gex] pid {} killed by signal {} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
+                    "[gex] pid {} killed by signal {}{from} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
                      last calls:{}\n  address space:{}\n  futexes:{}",
                     h.kernel.pid,
                     signal,
@@ -6018,6 +6201,7 @@ fn stage_fork_fds(h: &Host, child: i32) {
             // The child inherits this pty end; open it on the child's behalf so
             // the parent's copy closing is not the last reference.
             unsafe { k_pty_open_end(id, master as i32, child) };
+            pty_note("hands on", id, master as i32, child);
         } else if let Some(id) = file.handle.remote_id() {
             let dup = unsafe { k_fs_dup(id) };
             if dup < 0 {
@@ -6585,6 +6769,26 @@ pub extern "C" fn gex_adopt_child(
     }
     kernel.clock = browser_clock;
     kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
+    // The state this Worker started from is a *copy* of the parent's, and the
+    // descriptors in it are the parent's: pipe and pty ends it still holds,
+    // sockets it is still using. Every one of those handles closes its end in
+    // the global kernel when it drops (that is how a process leaving by a trap
+    // still releases them), so letting the copy drop here closes descriptors
+    // that belong to another process -- and it is charged to whichever pid this
+    // Worker answers as. That is what killed a terminal's session: the shell's
+    // slave end went with the copy, the master read end of file, and the whole
+    // foreground group took a SIGHUP one command in. The child's own ends are
+    // opened for it by `stage_fork_fds`, so the copy is leaked rather than
+    // dropped -- into memory that is this process's own image anyway.
+    if gex_has_host() != 0 {
+        with_host(|h| {
+            std::mem::forget(std::mem::replace(
+                &mut h.kernel.fds,
+                gex_kernel::file::FdTable::new(),
+            ));
+            std::mem::forget(std::mem::take(&mut h.kernel.remote_sockets));
+        });
+    }
     set_host(Host {
         magic_head: HOST_MAGIC,
         kernel,
@@ -6686,7 +6890,10 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
             // A pty end held open (a shell exiting without closing its slave)
             // otherwise strands the master: the reader never sees EOF. And a
             // master gone this way must hang the slave up.
-            k_pty_forget(pid);
+            let left = k_pty_forget(pid);
+            if left > 0 {
+                pty_note("exit-sweeps", 0, 0, pid);
+            }
         }
     }
     h.kernel.procs.exit(pid, code);
@@ -8268,7 +8475,15 @@ fn schedule() -> i32 {
             let i = cur();
             if thread_ready(&h.threads[i], now, sig) {
                 let timed_out = match &h.threads[i].waiting {
-                    Waiting::Futex { parked, .. } => !parked.woken(),
+                    // A cross-Worker FUTEX_WAKE advances the shared generation
+                    // without touching this Worker's local `Parked` queue. It
+                    // is still a wake, not a timeout. The old `!parked.woken()`
+                    // test therefore handed ETIMEDOUT to every such untimed
+                    // glibc lock wait, which glibc correctly treats as a fatal
+                    // futex result. Only an expired deadline is a timeout.
+                    Waiting::Futex { deadline, .. } => {
+                        deadline.is_some_and(|at| now >= at)
+                    }
                     _ => false,
                 };
                 // Woken by the signal and not by the wait: ask the same
@@ -8302,8 +8517,25 @@ fn schedule() -> i32 {
                 // Only a terminal is a keystroke; a pipe or socket is written by
                 // another process (apt's http method, a pipeline) and wants the
                 // event loop, not a key.
+                // Bit 1 means "the page has to supply a keystroke", and the JS
+                // side answers it by *awaiting* one -- with no timeout when
+                // nothing else is set. So it must be reserved for the page's own
+                // terminal. A pty is not that: it is two ends in the global
+                // kernel, and the end that will write is a program in another
+                // Worker. Classed as a keyboard, a `select` on one waited for a
+                // keystroke into the page that was never coming, which is what
+                // made an interactive bash in xterm go deaf after one character
+                // -- readline waits in `select` where a plain shell waits in
+                // `read`, and a read happened to also set bit 2 and be retried.
                 let by_kind = |handle: &Arc<dyn gex_kernel::vfs::FileHandle>| {
                     use gex_kernel::vfs::FileType;
+                    let stdin_p = Arc::as_ptr(&*STDIN) as *const ();
+                    if Arc::as_ptr(handle) as *const () == stdin_p {
+                        return 1;
+                    }
+                    if handle.peer_wakes() {
+                        return 2;
+                    }
                     match handle.metadata().map(|m| m.file_type) {
                         Ok(FileType::Socket) | Ok(FileType::Fifo) => 2,
                         _ => 1,
@@ -8460,16 +8692,21 @@ fn schedule() -> i32 {
             set_current(h, i);
             let t = &mut h.threads[i];
             let was_futex = matches!(t.waiting, Waiting::Futex { .. });
+            let ctx_addr = t.kstate.ctx_addr;
             t.waiting = Waiting::Runnable;
             let op = t.blocked_on.take();
-            // A futex thread arriving with nothing to finish is resumed with no
-            // return value, so the guest reads the stale `x0` (`uaddr`) and
-            // glibc calls `futex_fatal_error` on the unrecognised errno.
+            // A futex thread arriving with nothing to finish must still receive
+            // a legal result. Linux permits spurious futex wakes, and zero is
+            // exactly that result; leaving x0 untouched hands glibc the uaddr
+            // as an errno and makes it call futex_fatal_error.
             if was_futex && op.is_none() {
                 warn_line(&format!(
-                    "[gex] pid {} resumed thread {i} from a futex with no result to write",
+                    "[gex] pid {} recovered a spurious futex wake for thread {i}",
                     h.kernel.pid,
                 ));
+                let mut gm = GuestMem::new(guest_bytes());
+                let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
+                ftx_note(!0, 0, 0, t.pc, t.kstate.tid);
             }
             let (mut pc, kstate) = (t.pc, t.kstate.clone());
             if let Some(op) = op {
@@ -8490,6 +8727,8 @@ fn schedule() -> i32 {
                             Ok(v) => *v as i64,
                             Err(e) => -(e.0 as i64),
                         },
+                        t.pc,
+                        t.kstate.tid,
                     );
                 }
                 let outcome = h.kernel.finish_blocking(&mut gm, r);
@@ -8932,8 +9171,8 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             HITS = HITS.wrapping_add(1);
             HITS
         };
-        if n <= 24 {
-            let line = with_host(|h| {
+        {
+            let (line, unusual) = with_host(|h| {
                 let gm = GuestMem::new(guest_bytes());
                 let c = h.threads[cur()].kstate.ctx_addr;
                 let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
@@ -8947,7 +9186,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
                         .find(|v| a >= v.start && a < v.end)
                         .map_or(String::new(), |v| format!("{} +{:#x}", v.name, a - v.start))
                 };
-                format!(
+                (format!(
                     "gex: TRAP_PC #{n} tid={} at pc={:#x}: x30={x30:#x} ({}) sp={sp:#x} \
                      x0={:#x} x1={:#x} x19={:#x} x20={:#x}\n",
                     h.threads[cur()].kstate.tid,
@@ -8957,9 +9196,15 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
                     r(1),
                     r(19),
                     r(20),
-                )
+                ), r(1) > 0xff)
             });
-            warn_line(&line);
+            // The first hits establish the normal call shape. Keep reporting
+            // a wildly non-ABI-looking x1 afterward: that is precisely how a
+            // wrong function target hides behind thousands of valid lock
+            // entries before the one malformed call.
+            if n <= 24 || unusual {
+                warn_line(&line);
+            }
         }
         return;
     }
@@ -9272,6 +9517,31 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
             h.threads[cur()].pc = pc as u64;
             h.kernel.enter_thread(&h.threads[cur()].kstate);
             let d = h.kernel.deliver_pending(&mut gm);
+            // Which signals a process actually takes, capped. A signal that
+            // should never have been sent looks like a program misbehaving:
+            // xterm tearing down a live session, a shell exiting for no reason.
+            // Where it came from is in `k_last_kill`.
+            if !matches!(d, gex_kernel::signal::Delivery::None) {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SAID: AtomicU32 = AtomicU32::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 32 {
+                    let last = if unsafe { k_present() } != 0 {
+                        let v = unsafe { k_last_kill() };
+                        format!(
+                            " (last sent: {} from pid {} to {})",
+                            v & 0xff,
+                            (v >> 40) as i32,
+                            ((v >> 8) & 0xffff_ffff) as i32
+                        )
+                    } else {
+                        String::new()
+                    };
+                    warn_line(&format!(
+                        "[sig] pid {} takes a signal{last}\n",
+                        h.kernel.pid
+                    ));
+                }
+            }
             h.kernel.leave_thread(&mut h.threads[cur()].kstate);
             match d {
                 gex_kernel::signal::Delivery::None => 0,
@@ -10793,6 +11063,22 @@ pub extern "C" fn gex_current_pc() -> i64 {
     .unwrap_or(0)
 }
 
+/// Link register at the same crash-safe context snapshot as `gex_current_pc`.
+/// An indirect-branch trap leaves PC equal to the bad target; LR identifies
+/// the call site that supplied it and is therefore the actionable address.
+#[no_mangle]
+pub extern "C" fn gex_current_lr() -> i64 {
+    let read = |at: u64| {
+        let gm = GuestMem::new(guest_bytes());
+        gm.read_u64(at + 30 * 8).unwrap_or(0) as i64
+    };
+    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    if at != 0 {
+        return read(at);
+    }
+    with_host_free(|h| h.threads.get(cur()).map_or(0, |t| read(t.kstate.ctx_addr))).unwrap_or(0)
+}
+
 /// Which mapped object an address belongs to, written into `out` as bytes.
 /// Returns the length, or zero when nothing is mapped there.
 #[no_mangle]
@@ -11190,6 +11476,7 @@ pub extern "C" fn gex_dump_state() {
             ("x1", r(1)),
             ("x16", r(16)),
             ("x17", r(17)),
+            ("x30", r(30)),
         ] {
             warn_line(&format!("gex:   {name}={a:#x} in {}\n", where_is(a)));
         }

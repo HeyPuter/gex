@@ -40,8 +40,19 @@ pub fn have_gl() -> bool {
 /// guest library talks to both.
 pub const GEX_GL_SUBMIT: u64 = 0xc008_6701;
 pub const GEX_GL_LIMITS: u64 = 0x8008_6702;
+/// `{ kind, id, width, height }` -- this process's window whose pixels the
+/// host draws.
+///
+/// A client rendering through the host's GL attaches no buffer to its
+/// `wl_surface`: there is nothing to attach, because its frames never come
+/// back here. Without a buffer the compositor would never see the surface at
+/// all, so the client says which surface it is and how big, and the
+/// compositor finds the picture on the host. `kind` matches
+/// `gex_gl::proto::surface`; an X drawable is not this device's business (the
+/// window manager names those).
+pub const GEX_GL_SURFACE: u64 = 0x4010_6703;
 
-const MAX_BATCH: u32 = 16 * 1024 * 1024;
+const MAX_BATCH: u32 = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct GlDevice;
@@ -89,6 +100,26 @@ impl FileHandle for GlDevice {
                 Some(if r < 0 { Err(Errno::EIO) } else { Ok(0) })
             }
             GEX_GL_LIMITS => Some(m.write_u32(arg, MAX_BATCH).map(|()| 0)),
+            GEX_GL_SURFACE => {
+                let Ok(kind) = m.read_u32(arg) else {
+                    return Some(Err(Errno::EFAULT));
+                };
+                let Ok(id) = m.read_u32(arg + 4) else {
+                    return Some(Err(Errno::EFAULT));
+                };
+                let Ok(w) = m.read_u32(arg + 8) else {
+                    return Some(Err(Errno::EFAULT));
+                };
+                let Ok(h) = m.read_u32(arg + 12) else {
+                    return Some(Err(Errno::EFAULT));
+                };
+                // Only a Wayland surface: an X window belongs to the X
+                // server's process, not this one.
+                if kind == 0 {
+                    crate::wl::attach_external(id, w as i32, h as i32);
+                }
+                Some(Ok(0))
+            }
             _ => None,
         }
     }

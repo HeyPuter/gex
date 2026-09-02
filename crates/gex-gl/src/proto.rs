@@ -15,6 +15,9 @@
 
 /// Marks the head of a ring. The bytes "GEXG", little-endian.
 pub const MAGIC: u32 = 0x4758_4547;
+/// Version of the command ABI. A guest and host must agree before any opcode
+/// is decoded; generated opcode policy changes require incrementing this.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The fixed header at the start of the shared buffer. `repr(C)` for the C
 /// guest half; every field 32 bits, 32 bytes total.
@@ -35,11 +38,19 @@ pub struct Header {
     pub status: u32,
     /// Which command failed, counting from zero.
     pub failed_at: u32,
-    pub reserved: u32,
+    pub protocol_version: u32,
 }
 
 /// Size of [`Header`] in bytes.
 pub const HEADER: u32 = 32;
+
+/// Which client API a context is for, as `eglBindAPI` selects it.
+pub mod client_api {
+    /// OpenGL ES, EGL's default when an application never calls `eglBindAPI`.
+    pub const ES: u32 = 0;
+    /// Desktop OpenGL, which `eglBindAPI(EGL_OPENGL_API)` selects.
+    pub const DESKTOP: u32 = 1;
+}
 
 pub mod error {
     pub const NONE: u32 = 0;
@@ -52,19 +63,82 @@ pub mod error {
     pub const BAD_ARGUMENT: u32 = 3;
     /// There is no GL context to run this against.
     pub const NO_CONTEXT: u32 = 4;
+    /// The command layouts/opcode assignments are from a different ABI.
+    pub const VERSION_MISMATCH: u32 = 5;
 }
 
 /// Opcodes, numbered in blocks so adding to one group does not renumber
 /// another and break a guest built against an older header.
+/// What a [`op::SURFACE_ATTACH`] names.
+pub mod surface {
+    /// A `wl_surface`, by its object id on the guest's own compositor
+    /// connection.
+    pub const WAYLAND: u32 = 0;
+    /// An X drawable, by XID. The window manager resolves it to the surface
+    /// the X server publishes for that window.
+    pub const X: u32 = 1;
+}
+
 pub mod op {
     // -- the device itself ------------------------------------------------
-    /// `{}` -- make a context and make it current. Replies: vendor, renderer,
+    /// `{ client_api, major, minor }` -- make a context of the API the
+    /// application asked for and make it current. Replies: vendor, renderer,
     /// version.
+    ///
+    /// The API has to be on the wire because only the guest knows it: it comes
+    /// from `eglBindAPI`, and a host that guesses will hand a desktop program
+    /// an ES context, or the reverse. The guest therefore defers this command
+    /// until `eglCreateContext`, which is where a real EGL implementation
+    /// makes the context and the same information is available.
+    ///
+    /// `client_api` is [`client_api::ES`] or [`client_api::DESKTOP`]. A zero
+    /// major asks the host for the highest version it can honour, which is
+    /// what an application that never states one should get.
     pub const CONTEXT_CREATE: u32 = 1;
     /// `{ width, height }` -- the offscreen surface everything draws to.
     pub const SURFACE_RESIZE: u32 = 2;
     /// `{}` -- finish everything and reply when it is done.
     pub const FINISH: u32 = 3;
+    /// `{}` -- submit the completed default framebuffer to the display.
+    pub const PRESENT: u32 = 4;
+    /// `{ kind, id, token, surface }` -- which window a surface's frames go to.
+    ///
+    /// The host draws for a guest that has a window somewhere else: a
+    /// `wl_surface` the compositor is already showing, or an X drawable
+    /// belonging to a window an X server owns. Naming it is what lets the
+    /// frame be *composited* rather than blitted over the whole output --
+    /// without it there is nowhere to put the pixels, since with Mesa on the
+    /// host nothing comes back to the guest to draw with.
+    ///
+    /// `kind` is [`surface::WAYLAND`] or [`surface::X`]; `id` is the
+    /// `wl_surface` object id or the XID; `token` is the guest's pid, which is
+    /// how the compositor names the process that published the surface (see
+    /// `gex_wl_token`). A zero `id` detaches, which is what a guest drawing to
+    /// nothing but the output does (the gears demo), and is the default.
+    ///
+    /// An X drawable needs no token: the surface belongs to the X server's
+    /// process, not the client's, and the window manager is what resolves one
+    /// to the other.
+    ///
+    /// `surface` is the guest's own handle for the EGL surface -- whatever its
+    /// `eglCreateWindowSurface` returned -- and is what makes several windows
+    /// possible at once: the host keeps a drawable per handle, and a frame
+    /// belongs to the window the *handle* was attached to rather than to
+    /// whatever was attached last. Attaching also makes that handle current.
+    pub const SURFACE_ATTACH: u32 = 5;
+    /// `{ surface }` -- draw into this handle's drawable from now on.
+    ///
+    /// What `eglMakeCurrent` selects. A handle the host has not seen gets a
+    /// drawable of its own, so a pbuffer or a window that never attached to
+    /// anything still has somewhere to draw.
+    pub const SURFACE_CURRENT: u32 = 6;
+    /// `{ surface }` -- this handle is gone; release what it owns.
+    ///
+    /// `eglDestroySurface`, and the only orderly way the host learns that a
+    /// window's frames have stopped. A client that simply exits never sends
+    /// it -- the page notices the process is gone and says so instead (see
+    /// `gex_gl_forget_client`).
+    pub const SURFACE_DETACH: u32 = 7;
 
     // -- state ------------------------------------------------------------
     pub const CLEAR_COLOR: u32 = 16; // { r, g, b, a } as floats
@@ -79,13 +153,28 @@ pub mod op {
     pub const SCISSOR: u32 = 25; // { x, y, w, h }
     pub const PIXEL_STOREI: u32 = 26; // { pname, param }
     pub const CLEAR_DEPTH: u32 = 27; // { depth as float }
+    pub const DEPTH_MASK: u32 = 28; // { enabled }
+    pub const HINT: u32 = 29;
+    pub const COLOR_MASK: u32 = 30;
+    pub const BLEND_EQUATION: u32 = 31;
 
     // -- buffers ----------------------------------------------------------
     pub const GEN_BUFFERS: u32 = 32; // { count, names... }
     pub const DELETE_BUFFERS: u32 = 33; // { count, names... }
     pub const BIND_BUFFER: u32 = 34; // { target, name }
-    pub const BUFFER_DATA: u32 = 35; // { target, usage, len, bytes... }
-    pub const BUFFER_SUB_DATA: u32 = 36; // { target, offset, len, bytes... }
+    pub const BUFFER_DATA: u32 = 35; // { target, usage, size:u64, has_data, blob }
+    pub const BUFFER_SUB_DATA: u32 = 36; // { target, offset:u64, size:u64, blob }
+    pub const BLEND_FUNC_SEPARATE: u32 = 37;
+    pub const POLYGON_OFFSET: u32 = 38;
+    pub const LINE_WIDTH: u32 = 39;
+    pub const CLEAR_STENCIL: u32 = 40;
+    pub const DEPTH_RANGE: u32 = 41;
+    pub const BIND_BUFFER_BASE: u32 = 42;
+    pub const GEN_SAMPLERS: u32 = 43;
+    pub const DELETE_SAMPLERS: u32 = 44;
+    pub const BIND_SAMPLER: u32 = 45;
+    pub const SAMPLER_PARAMETER_I: u32 = 46;
+    pub const SAMPLER_PARAMETER_F: u32 = 47;
 
     // -- shaders and programs ---------------------------------------------
     pub const CREATE_SHADER: u32 = 48; // { name, type }
@@ -116,6 +205,16 @@ pub mod op {
     pub const UNIFORM_3F: u32 = 67;
     pub const UNIFORM_4F: u32 = 68;
     pub const UNIFORM_MATRIX4FV: u32 = 69; // { location, count, transpose, floats... }
+    pub const GET_ACTIVE_UNIFORM: u32 = 70; // { program, index } -> size, type, name
+    pub const GET_ACTIVE_ATTRIB: u32 = 71; // { program, index } -> size, type, name
+    pub const UNIFORM_1IV: u32 = 72;
+    pub const UNIFORM_1FV: u32 = 73;
+    pub const UNIFORM_2FV: u32 = 74;
+    pub const UNIFORM_3FV: u32 = 75;
+    pub const UNIFORM_4FV: u32 = 76;
+    pub const UNIFORM_2IV: u32 = 77;
+    pub const UNIFORM_3IV: u32 = 78;
+    pub const UNIFORM_4IV: u32 = 79;
 
     // -- vertex attributes -------------------------------------------------
     pub const ENABLE_VERTEX_ATTRIB_ARRAY: u32 = 80; // { index }
@@ -124,6 +223,18 @@ pub mod op {
     /// bound buffer. Client-side arrays are uploaded in the guest first, since a
     /// guest pointer means nothing to the host's GL.
     pub const VERTEX_ATTRIB_POINTER: u32 = 82;
+    pub const GEN_VERTEX_ARRAYS: u32 = 83;
+    pub const DELETE_VERTEX_ARRAYS: u32 = 84;
+    pub const BIND_VERTEX_ARRAY: u32 = 85;
+    pub const UNIFORM_MATRIX2FV: u32 = 86;
+    pub const UNIFORM_MATRIX3FV: u32 = 87;
+    pub const DETACH_SHADER: u32 = 88;
+    pub const GET_ATTACHED_SHADERS: u32 = 89;
+    pub const GET_UNIFORM_BLOCK_INDEX: u32 = 90;
+    pub const UNIFORM_BLOCK_BINDING: u32 = 91;
+    pub const UNIFORM_2I: u32 = 92;
+    pub const UNIFORM_3I: u32 = 93;
+    pub const UNIFORM_4I: u32 = 94;
 
     // -- textures ----------------------------------------------------------
     pub const GEN_TEXTURES: u32 = 96; // { count, names... }
@@ -131,16 +242,48 @@ pub mod op {
     pub const BIND_TEXTURE: u32 = 98; // { target, name }
     pub const ACTIVE_TEXTURE: u32 = 99; // { unit }
     pub const TEX_PARAMETER_I: u32 = 100; // { target, pname, param }
-    /// `{ target, level, internal, w, h, border, format, type, len, bytes }`
+    /// `{ target, level, internal, w, h, border, format, type, pbo, pointer64,
+    ///    len, bytes }`. `pointer64` is only dereferenced as an offset when a
+    /// pixel-unpack buffer is bound; otherwise the self-contained blob is used.
     pub const TEX_IMAGE_2D: u32 = 101;
     pub const TEX_SUB_IMAGE_2D: u32 = 102;
+    pub const GEN_FRAMEBUFFERS: u32 = 103;
+    pub const DELETE_FRAMEBUFFERS: u32 = 104;
+    pub const BIND_FRAMEBUFFER: u32 = 105;
+    pub const CHECK_FRAMEBUFFER_STATUS: u32 = 106;
+    pub const FRAMEBUFFER_TEXTURE_2D: u32 = 107;
+    pub const GEN_RENDERBUFFERS: u32 = 108;
+    pub const DELETE_RENDERBUFFERS: u32 = 109;
+    pub const BIND_RENDERBUFFER: u32 = 110;
+    pub const RENDERBUFFER_STORAGE: u32 = 111;
 
     // -- drawing -----------------------------------------------------------
     pub const DRAW_ARRAYS: u32 = 112; // { mode, first, count }
-    pub const DRAW_ELEMENTS: u32 = 113; // { mode, count, type, offset }
+    // { mode, count, type, offset, client } and, when `client` is set, a blob
+    // of `count` index elements. glDrawElements may name a client array
+    // rather than an offset into GL_ELEMENT_ARRAY_BUFFER, and the pointer is
+    // meaningless on the host: sending it as an offset had the host read its
+    // own address space, which is how KHR-GL32.transform_feedback's indexed
+    // draws became four copies of vertex zero.
+    pub const DRAW_ELEMENTS: u32 = 113;
+    pub const FRAMEBUFFER_RENDERBUFFER: u32 = 114;
+    pub const GENERATE_MIPMAP: u32 = 115;
+    pub const TEX_STORAGE_2D: u32 = 116;
+    pub const TEX_STORAGE_3D: u32 = 117;
+    pub const TEX_IMAGE_3D: u32 = 118;
+    pub const FRAMEBUFFER_TEXTURE_LAYER: u32 = 119;
+    pub const DRAW_BUFFERS: u32 = 120;
+    pub const VERTEX_ATTRIB_I_POINTER: u32 = 121;
+    pub const VERTEX_ATTRIB_DIVISOR: u32 = 122;
+    pub const DRAW_ARRAYS_INSTANCED: u32 = 123;
+    pub const DRAW_ELEMENTS_INSTANCED: u32 = 124;
+    pub const BLIT_FRAMEBUFFER: u32 = 125;
+    pub const VERTEX_ATTRIB_4F: u32 = 126;
+    pub const VERTEX_ATTRIB_I4I: u32 = 127;
 
     // -- reading back --------------------------------------------------------
-    /// `{ x, y, w, h, format, type }` -- replies with the pixels. The only
+    /// `{ x, y, w, h, format, type, pbo, pointer64 }` -- for client memory,
+    /// replies with the first written byte offset and the pixels. The only
     /// command that moves a lot of data back, and slow if called every frame.
     pub const READ_PIXELS: u32 = 128;
     /// `{ name }` -- one of GL's strings, replied as bytes.
@@ -149,6 +292,80 @@ pub mod op {
     pub const GET_INTEGERV: u32 = 130;
     /// `{}` -- replies with the error code, one round trip per call.
     pub const GET_ERROR: u32 = 131;
+    pub const GET_STRING_I: u32 = 132;
+    pub const BLEND_COLOR: u32 = 133;
+    pub const CLEAR_BUFFER_FV: u32 = 134;
+    pub const CLEAR_BUFFER_IV: u32 = 135;
+    pub const CLEAR_BUFFER_UIV: u32 = 136;
+    pub const CLEAR_BUFFER_FI: u32 = 137;
+    pub const STENCIL_FUNC: u32 = 138;
+    pub const STENCIL_FUNC_SEPARATE: u32 = 139;
+    pub const STENCIL_MASK: u32 = 140;
+    pub const STENCIL_MASK_SEPARATE: u32 = 141;
+    pub const STENCIL_OP: u32 = 142;
+    pub const STENCIL_OP_SEPARATE: u32 = 143;
+    pub const BLEND_EQUATION_SEPARATE: u32 = 144;
+    pub const GET_UNIFORM_FV: u32 = 145;
+    pub const GET_UNIFORM_IV: u32 = 146;
+    pub const TEX_PARAMETER_F: u32 = 147;
+    pub const TEX_PARAMETER_FV: u32 = 148;
+    pub const TEX_PARAMETER_IV: u32 = 149;
+    pub const GEN_QUERIES: u32 = 150;
+    pub const DELETE_QUERIES: u32 = 151;
+    pub const IS_QUERY: u32 = 152;
+    pub const GEN_TRANSFORM_FEEDBACKS: u32 = 153;
+    pub const DELETE_TRANSFORM_FEEDBACKS: u32 = 154;
+    pub const BIND_TRANSFORM_FEEDBACK: u32 = 155;
+    pub const IS_TRANSFORM_FEEDBACK: u32 = 156;
+    pub const PAUSE_TRANSFORM_FEEDBACK: u32 = 157;
+    pub const RESUME_TRANSFORM_FEEDBACK: u32 = 158;
+    /// `{ program, index }` -> size, type, name -- the transform feedback
+    /// varying's description. Shaped exactly like `GET_ACTIVE_UNIFORM`.
+    pub const GET_TRANSFORM_FEEDBACK_VARYING: u32 = 159;
+    /// `{ shader }` -> the source string the guest last handed over.
+    pub const GET_SHADER_SOURCE: u32 = 160;
+    /// `{ program, index }` -> name, for one active uniform.
+    pub const GET_ACTIVE_UNIFORM_NAME: u32 = 161;
+    /// `{ program, index }` -> name, for one active uniform block.
+    pub const GET_ACTIVE_UNIFORM_BLOCK_NAME: u32 = 162;
+    /// `{ program, index, pname }` -> the integers that query yields.
+    pub const GET_ACTIVE_UNIFORM_BLOCKIV: u32 = 163;
+    /// `{ program, pname, indices }` -> one integer per index.
+    pub const GET_ACTIVE_UNIFORMSIV: u32 = 164;
+    /// `{ program, count, names }` -> one index per name. The names arrive as
+    /// one blob of NUL-terminated strings, which is how the guest already
+    /// holds them.
+    pub const GET_UNIFORM_INDICES: u32 = 165;
+
+    /* Fixed function, which a compatibility profile has and the generated
+     * GL 4.4 core set does not. These are hand-written rather than generated
+     * because tools/gen_gl44_manifest.py builds its list from glcorearb.h --
+     * the core-profile header, which by definition omits every one of them.
+     *
+     * The whole set exists to run programs written before shaders: glxgears
+     * needs exactly these twenty and nothing else. Immediate mode is as
+     * chatty as it looks, but glxgears compiles its gears into display lists,
+     * so glBegin and glVertex3f run once at startup and each frame is a
+     * handful of matrix calls and three glCallList. */
+    pub const MATRIX_MODE: u32 = 166;
+    pub const LOAD_IDENTITY: u32 = 167;
+    pub const PUSH_MATRIX: u32 = 168;
+    pub const POP_MATRIX: u32 = 169;
+    pub const TRANSLATEF: u32 = 170;
+    pub const ROTATEF: u32 = 171;
+    pub const FRUSTUM: u32 = 172;
+    pub const BEGIN: u32 = 173;
+    pub const END: u32 = 174;
+    pub const VERTEX3F: u32 = 175;
+    pub const NORMAL3F: u32 = 176;
+    pub const SHADE_MODEL: u32 = 177;
+    pub const LIGHTFV: u32 = 178;
+    pub const MATERIALFV: u32 = 179;
+    pub const GEN_LISTS: u32 = 180;
+    pub const NEW_LIST: u32 = 181;
+    pub const END_LIST: u32 = 182;
+    pub const CALL_LIST: u32 = 183;
+    pub const DELETE_LISTS: u32 = 184;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,
@@ -165,6 +382,12 @@ impl Batch {
 
     pub fn cmd(&mut self, opcode: u32, args: &[u32]) -> &mut Batch {
         self.raw(opcode, args, &[])
+    }
+
+    /// Split a 64-bit ABI value into the two little-endian wire words used by
+    /// GLintptr, GLsizeiptr, GLint64, GLuint64, and GLdouble payloads.
+    pub fn words64(value: u64) -> [u32; 2] {
+        [value as u32, (value >> 32) as u32]
     }
 
     /// A command with trailing bytes (shader source, buffer contents). Padded
@@ -215,6 +438,20 @@ impl<'a> Args<'a> {
 
     pub fn f32(&mut self) -> Option<f32> {
         self.u32().map(f32::from_bits)
+    }
+
+    pub fn u64(&mut self) -> Option<u64> {
+        let low = self.u32()? as u64;
+        let high = self.u32()? as u64;
+        Some(low | (high << 32))
+    }
+
+    pub fn i64(&mut self) -> Option<i64> {
+        self.u64().map(|value| value as i64)
+    }
+
+    pub fn f64(&mut self) -> Option<f64> {
+        self.u64().map(f64::from_bits)
     }
 
     /// A length word then that many bytes, which is how every payload is
@@ -335,5 +572,20 @@ mod tests {
     #[test]
     fn the_header_is_thirty_two_bytes() {
         assert_eq!(std::mem::size_of::<Header>(), HEADER as usize);
+    }
+
+    #[test]
+    fn sixty_four_bit_wire_values_are_little_endian_and_exact() {
+        let bits = 0xfedc_ba98_7654_3210;
+        assert_eq!(Batch::words64(bits), [0x7654_3210, 0xfedc_ba98]);
+        let words = Batch::words64(bits);
+        let bytes: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let mut args = Args::new(&bytes);
+        assert_eq!(args.u64(), Some(bits));
+
+        let number = -1234.5_f64;
+        let words = Batch::words64(number.to_bits());
+        let bytes: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(Args::new(&bytes).f64(), Some(number));
     }
 }

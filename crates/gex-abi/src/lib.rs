@@ -99,7 +99,7 @@ pub const EXEC_BASE: u64 = 0x0040_0000;
 /// Where a dynamic program's interpreter is placed: above the executable and
 /// its break, below the stack. It defines the break's ceiling ([`BRK_TOP`]),
 /// since a break growing past it would run over `ld.so`.
-pub const INTERP_BASE: u64 = 0x0300_0000;
+pub const INTERP_BASE: u64 = 0x04a0_0000;
 
 /// Highest address the break may reach. The break grows up from the end of
 /// the image at [`PIE_BASE`]; a program that wants more gets a failing `brk`
@@ -111,7 +111,7 @@ pub const BRK_TOP: u64 = INTERP_BASE;
 /// Kept just above the image and its break, not at the top of the address
 /// space: linear memory must be allocated up to its highest used address, so
 /// a stack at the top would make every process cost the whole 4 GiB.
-pub const STACK_TOP: u64 = 0x0400_0000;
+pub const STACK_TOP: u64 = 0x0580_0000;
 
 /// Default guest stack size (8 MiB, matching a typical `RLIMIT_STACK`).
 pub const STACK_SIZE: u64 = 8 * 1024 * 1024;
@@ -126,7 +126,7 @@ pub const MMAP_TOP: u64 = DISPATCH_MAX_PAGES * DISPATCH_PAGE;
 
 /// Lowest address the mmap allocator will hand out, and the bottom of the
 /// region that grows.
-pub const MMAP_BOTTOM: u64 = 0x0500_0000;
+pub const MMAP_BOTTOM: u64 = 0x0700_0000;
 
 /// The bottom of the region shared objects are placed in.
 ///
@@ -624,6 +624,7 @@ mod tests {
         // The stack sits at the top of the fixed low region, and the arena
         // starts above it and grows upward.
         assert!(PIE_BASE < INTERP_BASE);
+        assert!(INTERP_BASE + 0x0010_0000 <= STACK_TOP - STACK_SIZE);
         assert!(INTERP_BASE < STACK_TOP);
         assert!(STACK_TOP <= MMAP_BOTTOM);
         assert!(MMAP_TOP <= GUEST_LIMIT);

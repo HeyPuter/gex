@@ -9,56 +9,42 @@
 # the only thing that is not Debian's is what sits on the far side of the
 # vtest socket.
 #
-# The source tree is the one `tests/opengl-in-guest.sh` uses, which is 342 MB.
-# A page cannot ask for that, so this takes the closure a traced run actually
-# opens, which is 204 MB, and then removes the two libraries that make up most
-# of it.
+# The source tree is the one `web/build-session-tree.sh` builds and
+# `tests/opengl-in-guest.sh` uses: a Debian with the session's programs
+# unpacked into it. What comes across is that tree less its documentation, its
+# translations and what only a compiler reads -- so the image is a Debian
+# userspace, with `ls`, `bash`, `dpkg` and `apt` in it, and a session can add
+# to itself from inside the guest.
 #
-# # LLVM, and the switch that removes it
+# It did not use to be. This took the closure a traced run opened, which is
+# smaller and is still what `GEX_SESSION_BASE=0` builds, but a curated list
+# only ever holds what someone thought to name: a terminal in that image had
+# no `ls`.
 #
-# Debian ships one megadriver: `swrast_dri.so` is every Gallium driver at
-# once, and it declares `libLLVM-15.so.1` in DT_NEEDED because *llvmpipe*
-# wants it -- 106 MB, plus the 21 MB of libz3 that LLVM in turn wants. That
-# is 127 MB of a 208 MB image, and in a browser it is worse than download
-# size: a dispatch slot is claimed per 4 KiB of guest text, a browser will
-# not grow the table past ten million of them, and llvmpipe is a great deal
-# of text.
+# # No Mesa in the guest
 #
-# `GEX_LLVM_STUB=1` replaces it with a stand-in: the 280 symbols the
-# megadriver imports from LLVM, each one a `brk #0`. Nothing on the virgl
-# path should call them, and anything that does dies at the instruction with
-# the guest PC in the trap, which is a far better failure than a quietly
-# different picture.
+# The guest used to run Debian's own Mesa: its megadriver (`swrast_dri.so`,
+# every Gallium driver in one 24 MB object), the 106 MB of LLVM llvmpipe
+# wants, and the 22 MB of libz3 behind that. All of it is gone, because the
+# guest no longer has a graphics driver at all -- its `libGL`/`libEGL` are
+# marshallers, and the Mesa that runs is a wasm one in the page's compositor
+# worker (see `web/build-mesa-virgl-wasm.sh`).
 #
-# It does not work, and the question is now settled rather than open. Xvfb
-# brings up GLX through the swrast DRI entry points and *calls* into llvmpipe,
-# not merely maps it: with the renderer listening and `GALLIUM_DRIVER=virpipe`
-# exported before the X server, the run still stopped at
-# `gex: breakpoint at pc=0x6d435040` five seconds in, before the X socket
-# appeared. The switch remains for anyone who wants to try a client-only
-# workload, where nothing brings up a software rasteriser -- but it will not
-# get an X server up, so it is off.
+# `Xwayland` is gone for the same reason: the X server is in the page too.
+# What stays is the X *clients* and their libraries, which is what a session
+# actually runs.
 #
-# Which also means the 106 MB is not avoidable this way. `swrast_dri.so`
-# names libLLVM in DT_NEEDED, so ld.so maps it at dlopen whichever Gallium
-# driver is chosen, and Xvfb writes out 221 MiB every time it is swapped.
-# That is what makes the arena split (task #71) the thing to do instead.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # The guest architecture. `GEX_ARCH=x86` curates the x86-64 tree (the one
 # `GEX_DEBIAN_ARCH=amd64 build-debian.sh` with the graphics roots produces)
 # into `rootfs/x86/graphics.tar`, with Debian's x86-64 multiarch names, the
-# x86-64 dynamic linker, the host compiler for the LLVM stub and the x86-64
-# gexc for the pixbuf cache. Generated scripts inside the image are
-# rewritten to the same names at the end.
+# x86-64 dynamic linker and the x86-64 gexc for the pixbuf cache. Generated
+# scripts inside the image are rewritten to the same names at the end.
 if [ "${GEX_ARCH:-}" = "x86" ]; then
     MA=x86_64-linux-gnu
     LDSO=ld-linux-x86-64.so.2
-    # Not a trap: Mesa's swrast asks `LLVMIsMultithreaded()` while loading even
-    # when softpipe is the driver, so the stubs return zero instead of killing
-    # the X server with SIGILL.
-    TRAP_INSN='xor %eax,%eax; ret'
     OUT="${1:-$HERE/public/rootfs/x86/graphics.tar}"
     SRC="${2:-/tmp/gex-gfx-amd64/root}"
     WORK="${GEX_ASSET_WORK:-${TMPDIR:-/tmp}/gex-assets}/graphics-x86"
@@ -66,8 +52,7 @@ if [ "${GEX_ARCH:-}" = "x86" ]; then
     GEXC="${GEXC:-$HERE/../target/x86/release/gexc}"
 else
     MA=${MA}
-    LDSO=${LDSO}
-    TRAP_INSN='brk #0'
+    LDSO=ld-linux-aarch64.so.1
     OUT="${1:-$HERE/public/rootfs/graphics.tar}"
     SRC="${2:-/tmp/gex-x/root}"
     WORK="${GEX_ASSET_WORK:-${TMPDIR:-/tmp}/gex-assets}/graphics"
@@ -76,7 +61,7 @@ else
     fi
 mkdir -p "$(dirname "$OUT")"
 
-if [ ! -x "$SRC/usr/bin/glxgears.$MA" ] || [ ! -x "$SRC/usr/bin/Xvfb" ]; then
+if [ ! -x "$SRC/usr/bin/glxgears.${MA}" ] || [ ! -x "$SRC/usr/bin/Xvfb" ]; then
     echo "skip: no graphics rootfs at $SRC (wants Mesa, Xvfb and mesa-utils)"
     exit 0
 fi
@@ -86,6 +71,107 @@ rm -rf "$WORK"
 mkdir -p "$WORK"
 R="$WORK/root"
 mkdir -p "$R"
+
+# Copy a list of paths into the image, once per file.
+#
+# `cp -L` on a list that names both `libfoo.so.1` and `libfoo.so.1.2.3` -- and a
+# NEEDED closure does, because both exist and one is a link -- writes the file
+# twice. That put two 106 MB copies of libLLVM in the image and two 30 MB copies
+# of libicudata, which is most of a quarter of a gigabyte for nothing. So: the
+# first name of a file is the file, and every later name of it becomes a
+# relative symlink, which is what the source tree has and what ld.so follows.
+install_paths() {
+    python3 - "$SRC" "$R" "$1" "$WORK/installed" <<'PYEOF'
+import os, shutil, sys
+
+src, dst, listing, index = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+
+def source_of(rel):
+    """Where the source tree keeps this file.
+
+    A name under /usr/lib may live in /lib in the source: they are the same
+    directory on a merged system and the image uses the one the guest's
+    search path names.
+    """
+    direct = os.path.join(src, rel)
+    if os.path.exists(direct):
+        return direct
+    if rel.startswith('usr/lib/'):
+        alt = os.path.join(src, rel[4:])
+        if os.path.exists(alt):
+            return alt
+    return None
+
+# The index is shared by every pass: the curated list, the NEEDED closure and
+# each manifest all name some of the same files, and two 106 MB copies of
+# libLLVM is what happens when each pass dedupes only against itself.
+#
+# Keyed by the file rather than by the path, and a file is a device and an
+# inode: a symlink and its target resolve to one name, but so do two *hard*
+# links, which is what Debian's DRI directory is -- forty-three names for one
+# 24 MB megadriver. Keyed by path that directory is a gigabyte.
+by_real = {}
+if os.path.exists(index):
+    for line in open(index):
+        real, rel = line.rstrip('\n').split('\t', 1)
+        by_real[real] = rel
+files = 0
+links = 0
+missing = 0
+bytes_copied = 0
+for line in open(listing):
+    rel = line.strip().lstrip('/')
+    if not rel or rel.startswith('#'):
+        continue
+    s = source_of(rel)
+    if s is None:
+        missing += 1
+        continue
+    d = os.path.join(dst, rel)
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    real = os.path.realpath(s)
+    try:
+        st = os.stat(s)
+    except OSError:
+        missing += 1
+        continue
+    key = f'{st.st_dev}:{st.st_ino}'
+    first = by_real.get(key)
+    if first is None:
+        by_real[key] = rel
+        if os.path.isdir(s):
+            continue
+        shutil.copyfile(real, d)
+        shutil.copymode(real, d)
+        files += 1
+        bytes_copied += os.path.getsize(real)
+    else:
+        # A second name for a file already installed: a link to it, relative so
+        # the image can be unpacked anywhere.
+        if first == rel:
+            # The same path named by two passes. Not a second name for the
+            # file -- it IS the file -- and linking it to itself is what put
+            # 258 `gconv/IBM855.so -> IBM855.so` in the image.
+            continue
+        if os.path.lexists(d):
+            continue
+        if not os.path.exists(os.path.join(dst, first)):
+            # The name it would point at was dropped on purpose (see DROP
+            # below). A dangling link is worse than an absent file: `dlopen`
+            # of one reports a missing library, which is what was wanted, but
+            # every tool that walks the tree trips over it first.
+            continue
+        target = os.path.relpath(os.path.join(dst, first), os.path.dirname(d))
+        os.symlink(target, d)
+        links += 1
+with open(index, 'w') as f:
+    for real, rel in by_real.items():
+        f.write(f'{real}\t{rel}\n')
+print(f'  {files} files ({bytes_copied / (1 << 20):.0f} MiB), {links} aliased, '
+      f'{missing} the source tree does not have', file=sys.stderr)
+PYEOF
+}
 
 # What to copy. The library list is the closure of a traced run, less LLVM and
 # z3; the programs are named because an execve does not look like an open.
@@ -129,10 +215,6 @@ libtasn1.so.6 libthai.so.0 libtiff.so.6 libudev.so.1 libunistring.so.2
 libwebp.so.7 libXaw7.so.7 libxcb-render.so.0 libxcb-shape.so.0
 libXcomposite.so.1 libXcursor.so.1 libXdamage.so.1 libXrandr.so.2
 "
-# The x86-64 swrast_dri.so links libdrm_intel as well (the aarch64 build has
-# no Intel DRM); without it the X servers have no software GL renderer and
-# glxgears gets "couldn't get an RGB, Double-buffered visual".
-[ "${GEX_ARCH:-}" = x86 ] && LIBS="$LIBS libdrm_intel.so.1 libpciaccess.so.0"
 # The GTK3 stack is in the image, and so are Qt 5, Qt 6 and KF5 -- but their
 # libraries are not listed here. Hand-listing SONAMEs stopped scaling at the
 # first toolkit; the closure pass further down takes them from the programs
@@ -148,19 +230,110 @@ mkdir -p "$R/lib/${MA}" "$R/usr/lib/${MA}/dri" \
          "$R/usr/bin" "$R/bin" "$R/etc" "$R/tmp/.X11-unix" "$R/var/lib/xkb" \
          "$R/usr/share/X11" "$R/usr/lib/xorg" "$R/proc" "$R/dev" "$R/root"
 
+# -- the Debian userspace -------------------------------------------------
+#
+# The image is a Debian root filesystem that has the session's programs in it,
+# rather than a list of programs with the libraries they name. A terminal is
+# what notices the difference: `ls` was not in the image and neither was `apt`,
+# because nothing in the lists below asks for them, and a curated list only
+# ever holds what someone thought to name.
+#
+# So the whole source tree comes across, less four kinds of thing: what is
+# documentation (57 MB) or a translation of it (130 MB), what the passes below
+# handle specially (the megadriver and libLLVM), and what only a compiler would
+# read. `GEX_SESSION_BASE=0` builds the old curated image, `GEX_KEEP_LOCALE=1`
+# keeps the translations.
+if [ "${GEX_SESSION_BASE:-1}" != "0" ]; then
+    MA="$MA" python3 - "$SRC" "$WORK" <<'PYEOF'
+import os, sys
+
+src, work = sys.argv[1], sys.argv[2]
+ma = os.environ['MA']
+
+# Pruned by directory, and the walk does not descend into these at all.
+skip = {
+    'usr/share/doc', 'usr/share/man', 'usr/share/info', 'usr/include',
+    # Debian's Mesa drivers: nothing in the guest loads one any more.
+    f'usr/lib/{ma}/dri',
+    # The kernel's, not the image's.
+    'proc', 'sys', 'dev', 'run', 'tmp',
+    # A cache of the .debs the tree was unpacked from.
+    'var/cache/apt/archives',
+}
+if not os.environ.get('GEX_KEEP_LOCALE'):
+    skip.add('usr/share/locale')
+# What only Mesa's software rasteriser wanted, and the X server that is now
+# in the page.
+skip_prefix = (f'usr/lib/{ma}/libLLVM-',
+               f'usr/lib/{ma}/libz3.so',
+               'usr/bin/Xwayland')
+
+files, dirs, links = [], [], []
+for dirpath, dirnames, filenames in os.walk(src):
+    rel = os.path.relpath(dirpath, src)
+    rel = '' if rel == '.' else rel
+    # A symlink to a directory is a name, not a tree: `os.walk` will not
+    # descend into it and `install_paths` cannot make one, so it is recorded
+    # here and remade as a link. /usr/share/perl/5.36 is one of these.
+    keep = []
+    for d in dirnames:
+        p = os.path.join(rel, d) if rel else d
+        if p in skip:
+            continue
+        if os.path.islink(os.path.join(dirpath, d)):
+            links.append((p, os.readlink(os.path.join(dirpath, d))))
+        else:
+            keep.append(d)
+            dirs.append(p)
+    dirnames[:] = keep
+    for name in filenames:
+        p = os.path.join(rel, name) if rel else name
+        if not p.startswith(skip_prefix):
+            files.append('/' + p)
+
+with open(f'{work}/base', 'w') as f:
+    f.write('\n'.join(sorted(files)) + '\n')
+# Every directory, so the empty ones survive too: apt wants
+# /var/lib/apt/lists to exist and will not create it.
+with open(f'{work}/base.dirs', 'w') as f:
+    f.write('\n'.join(sorted(dirs)) + '\n')
+with open(f'{work}/base.links', 'w') as f:
+    for p, target in sorted(links):
+        f.write(f'{p}\t{target}\n')
+print(f'  {len(files)} files, {len(dirs)} directories, {len(links)} linked')
+PYEOF
+    while IFS= read -r d; do
+        [ -n "$d" ] && mkdir -p "$R/$d"
+    done < "$WORK/base.dirs"
+    echo "  the Debian userspace:"
+    install_paths "$WORK/base"
+    while IFS="$(printf '\t')" read -r path target; do
+        [ -n "$path" ] || continue
+        rm -rf "$R/$path"
+        ln -s "$target" "$R/$path"
+    done < "$WORK/base.links"
+fi
+
 # -L, so a name that is a symlink becomes the file. ld.so opens libraries by
 # the SONAME, which is the link name, so the target's own name is never
 # needed and copying both would double 22 MB of megadriver.
+: > "$WORK/curated"
 for l in $LIBS; do
-    for d in "$SRC/usr/lib/${MA}" "$SRC/lib/${MA}"; do
-        [ -e "$d/$l" ] || continue
-        cp -L "$d/$l" "$R/usr/lib/${MA}/$l"
+    found=""
+    for d in /usr/lib/${MA} /lib/${MA}; do
+        [ -e "$SRC$d/$l" ] || continue
+        # Always under the multiarch name the SONAME uses, whichever directory
+        # the source keeps it in: /lib and /usr/lib are one place on this
+        # Debian, and the guest's search path points at one of them.
+        echo "/usr/lib/${MA}/$l" >> "$WORK/curated"
+        found=1
         break
     done
-    [ -e "$R/usr/lib/${MA}/$l" ] || echo "  missing: $l"
+    [ -n "$found" ] || echo "  missing: $l"
 done
-cp -L "$SRC/usr/lib/${MA}/dri/swrast_dri.so" \
-      "$R/usr/lib/${MA}/dri/swrast_dri.so"
+echo "  the traced closure:"
+install_paths "$WORK/curated"
+
 # The dynamic linker at the path `PT_INTERP` names: `/lib/ld-linux-aarch64.so.1`
 # on arm64, `/lib64/ld-linux-x86-64.so.2` on amd64.
 if [ "$MA" = "x86_64-linux-gnu" ]; then
@@ -173,18 +346,23 @@ fi
 # /lib and /usr/lib are the same directory on a Debian this recent, and the
 # guest's ld.so looks in both. Copying twice would double 22 MB, so the
 # search path is what points at one place.
+: > "$WORK/progs"
 for p in $PROGS; do
-    [ -e "$SRC/usr/bin/$p" ] && cp -L "$SRC/usr/bin/$p" "$R/usr/bin/$p"
+    [ -e "$SRC/usr/bin/$p" ] && echo "/usr/bin/$p" >> "$WORK/progs"
 done
-cp -L "$SRC/bin/dash" "$R/bin/sh"
-# The one coreutils program in the image. dash has no `sleep` builtin, and
-# without one the wait for the X socket spins through six hundred iterations
-# in a millisecond and gives up before Xvfb has opened its listener.
-cp -L "$SRC/bin/sleep" "$R/bin/sleep"
-# And `timeout`, so a run can be bounded. glxgears has no frame count and no
-# way to stop: it draws until it is killed, and a killed process does not
-# flush the five-second report that is the only thing it prints.
-cp -L "$SRC/usr/bin/timeout" "$R/usr/bin/timeout"
+echo "  the programs:"
+install_paths "$WORK/progs"
+# A shell, and the two programs the session script cannot do without: `sleep`,
+# because dash has no builtin one and the wait for the X socket would spin
+# through six hundred iterations in a millisecond and give up before the server
+# opened its listener, and `timeout`, because glxgears draws until it is killed
+# and a killed process never flushes the five-second report it prints.
+#
+# Only if they are not there already: the Debian pass above brings all of
+# coreutils, and `GEX_SESSION_BASE=0` is the build where it did not run.
+[ -e "$R/bin/sh" ] || cp -L "$SRC/bin/dash" "$R/bin/sh"
+[ -e "$R/bin/sleep" ] || cp -L "$SRC/bin/sleep" "$R/bin/sleep"
+[ -e "$R/usr/bin/timeout" ] || cp -L "$SRC/usr/bin/timeout" "$R/usr/bin/timeout"
 
 # -- the toolkit applications, and everything they link --------------------
 #
@@ -204,14 +382,16 @@ cp -L "$SRC/usr/bin/timeout" "$R/usr/bin/timeout"
 # only name anything ever opens.
 APPS="${GEX_APPS:-/usr/bin/gtk3-demo /usr/bin/gtk3-widget-factory
       /usr/bin/kcalc /usr/bin/qt6ct /usr/bin/compton-conf /usr/games/explosive-c4
+      /usr/bin/dolphin /usr/lib/${MA}/libexec/kf5
       /usr/lib/${MA}/qt5/plugins /usr/lib/${MA}/qt6/plugins
       /usr/lib/${MA}/gdk-pixbuf-2.0 /usr/lib/${MA}/gtk-3.0}"
 
 # shellcheck disable=SC2086
-python3 - "$SRC" "$MA" $APPS > "$WORK/closure" <<'PYEOF'
+MA="$MA" python3 - "$SRC" $APPS > "$WORK/closure" <<'PYEOF'
 import os, struct, sys
 
-root, ma, roots = sys.argv[1], sys.argv[2], sys.argv[3:]
+root, roots = sys.argv[1], sys.argv[2:]
+ma = os.environ['MA']
 # Where ld.so looks, after the object's own directory. This Debian keeps its
 # libraries in the multiarch directory, and /lib is not a link to /usr/lib
 # here, so both are searched -- in the order the loader searches them.
@@ -303,15 +483,31 @@ if missing:
     print(f'  missing: {" ".join(sorted(missing))}', file=sys.stderr)
 PYEOF
 
-while read -r rel; do
-    mkdir -p "$R$(dirname "$rel")"
-    cp -L "$SRC$rel" "$R$rel"
-done < "$WORK/closure"
+install_paths "$WORK/closure"
 
 # `explosive-c4` lives in /usr/games, which is not on the PATH of the shell
 # the page starts. A link, rather than a PATH the page has to know about.
 [ -e "$R/usr/games/explosive-c4" ] &&
     ln -sf ../games/explosive-c4 "$R/usr/bin/explosive-c4"
+
+# -- the app deltas recorded in web/rootfs-manifests -----------------------
+#
+# The closure pass above starts at a program and follows DT_NEEDED. A heavy KDE
+# application reaches much more than that: Dolphin runs KIO workers out of
+# libexec, loads kcms and parts as kservice plugins, and reads .desktop and
+# .kcfg data that names them -- none of it in anyone's DT_NEEDED. That file
+# list was derived once (see `web/rootfs-manifests/README.md`) and is written
+# down rather than re-derived here, so this pass is a copy of what the
+# manifest says.
+#
+# A path the source tree does not have is counted, not fatal: a manifest may
+# name a program this image was not built with, and the count is the signal
+# for whether that matters.
+for m in "$HERE"/rootfs-manifests/*-delta.txt; do
+    [ -f "$m" ] || continue
+    echo "  $(basename "$m"):"
+    install_paths "$m"
+done
 
 # Tcl/Tk's script library (wish will not start without init.tcl and tk.tcl) and
 # a self-contained demo script. Tk is single-threaded, so unlike GTK it does not
@@ -323,10 +519,52 @@ if [ -d "$SRC/usr/share/tcltk" ]; then
     ln -sf wish8.6 "$R/usr/bin/wish"
 fi
 
-# A window-manager session: twm managing several clients at once. twm's config
-# (auto-placement, since there is no user to drag windows) and the launcher.
-[ -f "$SRC/root/.twmrc" ] && { mkdir -p "$R/root"; cp "$SRC/root/.twmrc" "$R/root/.twmrc"; }
+# twm's configuration, for anyone who runs the X session by hand.
+#
+# The compositor demo does NOT use a window manager in the guest: gex-wayland
+# manages the X windows itself (`shims/browser/src/xwm.rs`), which is what
+# rootless Xwayland expects and what sway, mutter and kwin all do. twm is
+# still in the image, and if it is started it needs this: `RandomPlacement`,
+# because its default is to have a user place each window with the mouse, and
+# no decorations, because whatever draws the frames should draw all of them.
+#
+# It has to be a file in the image rather than something a session script
+# writes: every process has its own tmpfs, so a `cat > /root/.twmrc` in a
+# shell is invisible to the twm it then starts.
+mkdir -p "$R/root"
+if [ -f "$SRC/root/.twmrc" ]; then
+    cp "$SRC/root/.twmrc" "$R/root/.twmrc"
+else
+    cat > "$R/root/.twmrc" <<'TWMRC'
+NoGrabServer
+NoTitle
+NoHighlight
+NoMenus
+BorderWidth 0
+RandomPlacement
+NoRaiseOnMove
+OpaqueMove
+TWMRC
+fi
 [ -f "$SRC/session.sh" ] && cp "$SRC/session.sh" "$R/session.sh"
+
+# The terminal's shell.
+#
+# `xterm` with no `-e` goes looking for a shell in the password file, and this
+# image has no entry to find -- so the session starts it as `xterm -e /bin/sh
+# /usr/bin/shell.sh` and this is that script. A file in the image for the same
+# reason as .twmrc above: a shell cannot write one where another process will
+# see it.
+mkdir -p "$R/usr/bin"
+cat > "$R/usr/bin/shell.sh" <<'SHELL'
+#!/bin/sh
+# The shell xterm runs: bash if the image has one, because it reads
+# /root/.profile for a prompt and a PATH and gives the terminal line editing
+# and history. dash otherwise, which is what a curated image has.
+[ -x /bin/bash ] && exec /bin/bash -l
+exec /bin/sh
+SHELL
+chmod 755 "$R/usr/bin/shell.sh"
 
 # glmark2's benchmark data: the 3D models, the GLSL shaders, and the textures
 # its scenes load. A real GL workload -- shaders, VBOs, framebuffers -- to
@@ -362,7 +600,9 @@ for d in usr/share/glib-2.0/schemas usr/share/mime usr/share/icons \
          usr/share/kf5 usr/share/config.kcfg usr/share/kglobalaccel \
          usr/share/kconf_update usr/share/kservices5 usr/share/qt6ct \
          usr/share/compton-conf usr/share/gtk-3.0 usr/share/libthai \
-         etc/gtk-3.0; do
+         usr/share/dolphin usr/share/kxmlgui5 usr/share/knotifications5 \
+         usr/share/kio usr/share/solid usr/share/kservicetypes5 \
+         etc/gtk-3.0 etc/xdg; do
     [ -e "$SRC/$d" ] || continue
     mkdir -p "$R/$(dirname "$d")"
     cp -r "$SRC/$d" "$R/$d"
@@ -392,6 +632,7 @@ fi
 # build: the paths come out guest-absolute because to that program they ARE
 # its paths, and the qemu-user this used to need (with a host prefix to strip
 # back off afterwards) is gone.
+GEXC="${GEXC:-$HERE/../target/release/gexc}"
 QL=/usr/lib/${MA}/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders
 if [ -x "$GEXC" ] && [ -e "$R$QL" ]; then
     if "$GEXC" run --sysroot "$R" --uid 0 "$R$QL" \
@@ -409,38 +650,51 @@ fi
 [ -e "$SRC/usr/lib/xorg/protocol.txt" ] && cp "$SRC/usr/lib/xorg/protocol.txt" "$R/usr/lib/xorg/"
 
 
-if [ -n "${GEX_LLVM_STUB:-}" ]; then
-    # Generated from the megadriver's own import list, so it stays right when
-    # the driver comes from a different Debian.
-    readelf -W --dyn-syms "$R/usr/lib/${MA}/dri/swrast_dri.so" |
-        awk '$7 == "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/undef"
-    readelf -W --dyn-syms "$SRC/usr/lib/${MA}/libLLVM-15.so.1" |
-        awk '$7 != "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/llvm"
-    comm -12 "$WORK/undef" "$WORK/llvm" > "$WORK/need"
-    {
-        # A missing GNU-stack note makes glibc give every thread an executable
-        # stack in any process that loads the stub.
-        echo '.section .note.GNU-stack,"",@progbits'
-        echo '.text'
-        while read -r sym; do
-            printf '.globl %s\n.type %s,@function\n%s:\n  %s\n' "$sym" "$sym" "$sym" "$TRAP_INSN"
-        done < "$WORK/need"
-    } > "$WORK/llvmstub.s"
-    # The version, and it is not decoration: the megadriver imports every one
-    # of these as `LLVMFoo@LLVM_15`, and against an unversioned definition
-    # glibc's ld.so does not warn -- it fails an assertion in dl-lookup.c and
-    # kills the process before `main`.
-    printf 'LLVM_15 { global: *; };\n' > "$WORK/llvmstub.map"
-    "$CC" -shared -nostdlib -o "$R/usr/lib/${MA}/libLLVM-15.so.1" \
-        "$WORK/llvmstub.s" -Wl,-soname,libLLVM-15.so.1 \
-        -Wl,--version-script="$WORK/llvmstub.map"
-    echo "  libLLVM: a stub of $(wc -l < "$WORK/need") symbols, $(du -h "$R/usr/lib/${MA}/libLLVM-15.so.1" | cut -f1)"
-else
-    for l in libLLVM-15.so.1 libz3.so.4; do
-        cp -L "$SRC/usr/lib/${MA}/$l" "$R/usr/lib/${MA}/$l"
-    done
-    echo "  libLLVM: the real one, $(du -h "$R/usr/lib/${MA}/libLLVM-15.so.1" | cut -f1)"
+# What the image does NOT need, however it got in -- and this runs after
+# every pass that puts something in, because it used to run in the middle:
+# the manifests below named files it had just deleted, and `install_paths`
+# wrote a link to each of them instead.
+#
+# A NEEDED closure follows everything a program *might* load, and Dolphin's
+# reaches the video and audio codecs behind its thumbnailers plus glibc's whole
+# charset module set. None of it is on the path of anything this session shows,
+# and it is a hundred megabytes of a page's memory before a window appears.
+# Dolphin without them thumbnails less; the alternative is Dolphin not
+# starting, because the tab ran out of memory unpacking the image.
+DROP="${GEX_KEEP_EXTRAS:+}"
+if [ -z "${GEX_KEEP_EXTRAS:-}" ]; then
+    DROP="libavcodec.so.* libavformat.so.* libavutil.so.* libswscale.so.*
+          libswresample.so.* libcodec2.so.* libavfilter.so.* libpostproc.so.*
+          libx264.so.* libx265.so.* libvpx.so.* libaom.so.* libdav1d.so.*
+          librav1e.so.* libsvtav1enc.so.* libzvbi.so.* libsrt-gnutls.so.*
+          libopenh264.so.* libmfx.so.* libva.so.* libva-drm.so.* libva-x11.so.*
+          libvidstab.so.* libshine.so.* libtwolame.so.* libmp3lame.so.*
+          libopenmpt.so.* libchromaprint.so.* libbs2b.so.* librubberband.so.*
+          libLLVM-*.so* libz3.so*"
 fi
+for pattern in $DROP; do
+    rm -f "$R"/usr/lib/${MA}/$pattern
+done
+# Mesa's drivers and the X server, whichever pass put them here: the guest has
+# no graphics driver and does not run an X server, and a manifest written when
+# it did still names them.
+if [ -z "${GEX_KEEP_EXTRAS:-}" ]; then
+    rm -rf "$R/usr/lib/${MA}/dri" "$R/usr/bin/Xwayland"
+fi
+# glibc's charset modules: 20 MB of tables for encodings nothing here reads.
+# UTF-8 needs no module at all.
+[ -z "${GEX_KEEP_EXTRAS:-}" ] && rm -rf "$R/usr/lib/${MA}/gconv"
+
+# Nothing here brings LLVM or the megadriver in any more: the guest has no
+# Mesa to want them (see the note at the top). What used to be here was a
+# choice between copying 106 MB of libLLVM into the image and generating a
+# stub of its 280 symbols, and both are gone with the driver that named them.
+
+# The alternatives a maintainer script would have made. Nothing runs those
+# here (see build-debian.sh), so the names they install are missing -- and
+# `awk` is one a shell script reaches for without thinking.
+[ -e "$R/usr/bin/awk" ] || [ ! -e "$R/usr/bin/gawk" ] || ln -s gawk "$R/usr/bin/awk"
+[ -e "$R/usr/bin/pager" ] || [ ! -e "$R/usr/bin/less" ] || ln -s less "$R/usr/bin/pager"
 
 cat > "$R/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/sh
@@ -522,10 +776,43 @@ chmod +x "$R/gears.sh"
 mkdir -p "$(dirname "$OUT")"
 # The scripts baked into the image name the multiarch directory and the
 # mesa-utils program suffix; for the x86-64 image, say the x86-64 names.
-if [ "$MA" != "aarch64-linux-gnu" ]; then
+if [ "$MA" != "${MA}" ]; then
     for f in "$R/gears.sh" "$R/session.sh" "$R/tk-demo.tcl" "$R/root/.twmrc"; do
-        [ -f "$f" ] && sed -i "s/aarch64-linux-gnu/$MA/g" "$f"
+        [ -f "$f" ] && sed -i "s/${MA}/$MA/g" "$f"
     done
 fi
 tar -C "$R" -cf "$OUT" .
 echo "  $OUT: $(du -h "$OUT" | cut -f1)"
+
+# -- the session image -----------------------------------------------------
+#
+# The compositor demo runs several of these programs at once, so what it costs
+# a browser tab to unpack is a real constraint: an image is fetched and then
+# written into the guest's filesystem, so every megabyte is paid for twice.
+#
+# libLLVM is 107 MB of that, and the temptation is to stub it for this image --
+# nothing in the session should enter llvmpipe, since Xwayland's glamor finds
+# no GPU and falls back to its own software blitting while the GL clients render
+# through Mesa's virgl driver. It does not work, and it fails quietly: with a
+# stub of `brk #0` in its place Xwayland initialises every extension, GLX
+# included, says it is ready, and then never answers a client. Its X clients and
+# the compositor's own window manager both sit in `connect` forever. Something
+# on the way through swrast's DRI entry points calls in, exactly as it does for
+# Xvfb.
+#
+# So this image is the graphics image, and what it adds is SuperTuxKart, because
+# a session that offers it needs one filesystem. `tar` archives are streams, so
+# appending is a copy rather than an unpack, and a path in both resolves the way
+# an extractor resolves it: the later entry wins.
+STK="$(dirname "$OUT")/stk.tar"
+SESSION="$(dirname "$OUT")/session.tar"
+if [ "${GEX_SESSION_TAR:-1}" != "0" ]; then
+    cp "$OUT" "$SESSION"
+    echo "  $SESSION: $(du -h "$SESSION" | cut -f1)"
+    if [ -f "$STK" ]; then
+        WITH_STK="$(dirname "$OUT")/session-stk.tar"
+        cp "$SESSION" "$WITH_STK"
+        tar --concatenate --file="$WITH_STK" "$STK"
+        echo "  $WITH_STK: $(du -h "$WITH_STK" | cut -f1) (with supertuxkart)"
+    fi
+fi
