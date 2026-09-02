@@ -318,6 +318,10 @@ pub mod op {
     pub const END_LIST: u32 = 182;
     pub const CALL_LIST: u32 = 183;
     pub const DELETE_LISTS: u32 = 184;
+    /// glPolygonStipple's 32x32 pattern, one word per row with bit 31 the
+    /// leftmost pixel. Compatibility-profile only, so it is not one of the
+    /// generated GL 4.4 core commands.
+    pub const POLYGON_STIPPLE: u32 = 185;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

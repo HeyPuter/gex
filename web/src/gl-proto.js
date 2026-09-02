@@ -176,6 +176,7 @@ export const op = {
     END_LIST: 182,
     CALL_LIST: 183,
     DELETE_LISTS: 184,
+    POLYGON_STIPPLE: 185,
 };
 
 export const MAGIC = 0x47584547;

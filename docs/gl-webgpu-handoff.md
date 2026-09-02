@@ -7638,3 +7638,76 @@ Why this matters more than a probe passing: a cascaded shadow map is a depth
 unreachable -- the first attach latched the context -- and nothing in the
 sweep said so, because the programs that use them are engines rather than
 demos.
+
+
+## glPolygonStipple, and why front-and-back polygon modes cannot be done (2026-09-02)
+
+### The stipple
+
+Four programs (`tri-stipple`, `tri-tex-stipple`, `gamma`, `multictx`) had every
+rasterizer state refused over `poly_stipple_enable`, and `set_polygon_stipple`
+failed the context outright on any pattern that was not all ones -- which is
+every enabled stipple there is.
+
+Mesa's own `nir_lower_pstipple_fs` samples a 32x32 alpha texture, which would
+need a texture binding this driver decides at shader-create time rather than
+per variant. The pattern is only 32 words, so it goes in as immediates and the
+variant is keyed on it; applications set it once, so that costs one variant.
+The row word is selected by a five-level `bcsel` tree rather than a 32-deep
+chain.
+
+**The row index is `y & 31`, and that had to be measured rather than reasoned
+about.** GL anchors the pattern at the window origin, which is the bottom,
+while WebGPU's fragment position counts from the top -- so the obvious formula
+is `(height - 1 - y) & 31`. It is wrong: this driver already flips the geometry
+in the vertex shader (`flip=1` in the draw log, from a positive viewport scale
+y), so WebGPU's row zero *is* GL's row zero and a raw position load is already
+a GL window coordinate. `tests/gl44-probe.sh polygon-stipple` checks a column
+pattern and a row pattern on a 32-tall target and the row pattern again on a
+48-tall one, because the two formulas differ only by an inversion at 32 and by
+an inversion *plus* a shift at 48. One height cannot tell them apart.
+
+One trap in writing the pass: `nir_draw_helpers`' own `load_frag_coord` sets
+`INTERP_MODE_NOPERSPECTIVE` on the position input, and copying that is fatal
+here -- the input becomes `@builtin(position)` in WGSL and Tint answers
+"'@interpolate' can only be used with '@location'".
+
+**The guest had no `glPolygonStipple` at all**, which the browser gate found
+and the native run could not: `tools/gen_gl44_transport.py` generates the
+registry-backed entry points and covers GL 4.4 *core*, refusing any command
+not in it, and the pattern's registry length is `COMPSIZE()` besides. So it
+joins the hand-written compatibility entry points, as one opcode carrying 32
+words -- one per row, bit 31 the leftmost pixel, which is both what
+glPolygonStipple defines and the form `pipe_poly_stipple` uses.
+
+That absence was not a missing feature but a missing symbol: `libGL` exports a
+fixed set, so an application calling `glPolygonStipple` failed to resolve it
+and did not start. Worth remembering when a compatibility-profile feature
+looks unimplemented -- check `nm` on the guest library before the driver.
+
+Three files, and only one of them by hand: the opcode goes in
+`crates/gex-gl/src/proto.rs`, from which `guest/gl/gexgl.h` and
+`web/src/gl-proto.js` are both generated (editing the header directly is
+undone by the next `guest/gl/build.sh`). The host case goes in
+`web/mobilegl/gexgl-mobilegl.cpp`, which despite its name is the guest-facing
+shim the *Mesa* wasm target links too. The WebGL host implements none of the
+compatibility opcodes, so nothing was needed there.
+
+### Front and back polygon modes differing: not implementable
+
+Eight programs ask for it (`dlist-edgeflag*`, `tri-edgeflag*`, `vp-unfilled`,
+`pgon-mode`) and the obvious plan is two draws: one with the back face culled
+and the front's fill mode, one with the front culled and the back's.
+
+**That cannot work here.** WebGPU has no polygon mode, so a non-FILL mode is
+implemented by rewriting the triangles into lines or points
+(`gex_wgpu_draw_unfilled`) -- and **culling does not apply to lines or
+points**, in WebGPU or in GL. Once the primitive is rewritten there is no
+facing left to cull by, so the second pass cannot be restricted to one side.
+
+Doing it properly needs the facing of each triangle *before* rasterisation,
+which means the transformed positions, which means running the vertex shader --
+on the CPU, or in a compute pass that writes two index lists. That is a real
+piece of work for eight compatibility-profile test programs and no
+application, so it stays refused, now for a stated reason rather than "nothing
+here could express that".

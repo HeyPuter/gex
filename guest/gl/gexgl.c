@@ -2692,6 +2692,33 @@ void glMaterialfv(unsigned face, unsigned pname, const float *params) {
                   material_parameter_floats(pname));
 }
 
+/* glPolygonStipple: the 32x32 pattern, as 32 words.
+ *
+ * Hand-written rather than generated because the generator covers GL 4.4 core
+ * and this is compatibility-only. The pattern's registry length is
+ * COMPSIZE(), which no generated policy resolves, but it is a fixed 128 bytes
+ * -- 32 rows of 4 -- so there is nothing to compute.
+ *
+ * Missing entirely, this was not a silently absent feature: libGL exports a
+ * fixed set of symbols, so an application that calls glPolygonStipple failed
+ * to resolve it and did not start at all. */
+void glPolygonStipple(const unsigned char *mask) {
+    if (!mask) return;
+    uint32_t *p = begin(GEXGL_POLYGON_STIPPLE, 32, 0);
+    if (!p) return;
+    for (size_t row = 0; row < 32; ++row) {
+        /* Big-endian within each row, as glPolygonStipple defines it: the
+           first byte holds the leftmost eight pixels, most significant bit
+           first. Packed here so the host sees one word per row with bit 31 as
+           the leftmost pixel, which is the form Gallium's pipe_poly_stipple
+           uses. */
+        p[row] = ((uint32_t)mask[row * 4 + 0] << 24) |
+                 ((uint32_t)mask[row * 4 + 1] << 16) |
+                 ((uint32_t)mask[row * 4 + 2] << 8) |
+                 (uint32_t)mask[row * 4 + 3];
+    }
+}
+
 /* The host's own list names are handed straight back. Display lists are the
    only object here the guest does not allocate names for, and glGenLists is
    their only source, so guest and host cannot disagree about them. */

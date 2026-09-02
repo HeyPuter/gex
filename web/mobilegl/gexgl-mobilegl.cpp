@@ -164,6 +164,7 @@ enum Op : uint32_t {
     BEGIN = 173, END = 174, VERTEX3F = 175, NORMAL3F = 176,
     SHADE_MODEL = 177, LIGHTFV = 178, MATERIALFV = 179, GEN_LISTS = 180,
     NEW_LIST = 181, END_LIST = 182, CALL_LIST = 183, DELETE_LISTS = 184,
+    POLYGON_STIPPLE = 185,
 };
 
 struct Reader {
@@ -2034,6 +2035,22 @@ bool one(uint32_t op, Reader& a) {
         if (!a.ok) return false;
         if (op == LIGHTFV) glLightfv(target, pname, values);
         else glMaterialfv(target, pname, values);
+        break;
+    }
+    case POLYGON_STIPPLE: {
+        /* One word per row, bit 31 the leftmost pixel -- the packing the
+         * guest does. glPolygonStipple wants 32 rows of 4 bytes, most
+         * significant bit first, so this unpacks the same way round. */
+        GLubyte mask[128];
+        for (unsigned row = 0; row < 32; ++row) {
+            const uint32_t word = a.u32();
+            mask[row * 4 + 0] = (GLubyte)(word >> 24);
+            mask[row * 4 + 1] = (GLubyte)(word >> 16);
+            mask[row * 4 + 2] = (GLubyte)(word >> 8);
+            mask[row * 4 + 3] = (GLubyte)word;
+        }
+        if (!a.ok) return false;
+        glPolygonStipple(mask);
         break;
     }
     case GEN_LISTS: put_u32(glGenLists(a.i32())); break;
