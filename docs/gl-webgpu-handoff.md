@@ -7369,8 +7369,137 @@ singletons. Of those, **polygon stipple has a lowering waiting in Mesa** --
 `nir_lower_pstipple_fs` in `gallium/auxiliary/nir/nir_draw_helpers.c`, which
 d3d12 uses: it samples a 32x32 stipple texture at `gl_FragCoord/32` and
 discards where the alpha is zero, and `util_pstipple_create_stipple_texture`
-builds the texture from the pattern. That needs a fragment variant key bit and
-one more texture binding, both of which this driver already has machinery for.
+builds the texture from the pattern. Two things to know before starting it:
+
+- The fragment stage's texture bindings are decided at **create** time, from
+  `fs->texture_count` and `fs->texture_slots`, and the bind group for group 0
+  is built from those. A pass that adds a sampler in a *variant* therefore
+  needs the binding path to follow the variant, not the shader -- which is the
+  bulk of the work. The alternative is to bake the 32 pattern words into the
+  shader as immediates (a five-level `bcsel` tree selects the row) and key the
+  variant on the pattern, which needs no binding at all; applications set the
+  pattern once, so it costs one variant.
+- **The pattern's row index is not `gl_FragCoord.y & 31` here.** GL defines
+  the stipple against the window origin, which is the bottom, and this driver
+  advertises `fs_coord_origin_upper_left` -- st/mesa runs
+  `nir_lower_wpos_ytransform` for it, so `gl_FragCoord.y` arrives measured
+  from the top. The row is `(height - 1 - y) & 31`, and because `height & 31`
+  is part of that, the framebuffer height belongs in the variant key. Sampling
+  it the way `u_pstipple` does (`pattern[y & 31] & (0x80000000u >> (x & 31))`,
+  which is what llvmpipe and d3d12 get) would come out flipped, and flipped by
+  a phase that depends on the window height -- which is exactly the kind of
+  wrong that looks right in a 32-pixel-tall test.
+
 Line stipple and line smoothing have only `nir_lower_aaline_fs`, which needs a
 companion vertex stage that the `draw` module supplies and this driver does
 not.
+
+
+## Shadow mapping: five bugs behind one missing shadow (2026-09-02)
+
+`shadowtex` was the app sweep's one remaining shader rejection. Behind it were
+five separate defects, and the last two were only visible because the first
+three had been fixed -- each one hid the next.
+
+### 1. Old-style shadow sampling returns a vec4
+
+`shadow2D` and `shadow2DProj` are GLSL 1.20 functions returning a vec4, where
+`texture(sampler2DShadow, ...)` returns a scalar. NIR carries the difference as
+`is_new_style_shadow`. SPIR-V has only the scalar form, so a vec4 result type
+on `OpImageSampleProjDrefImplicitLod` is invalid:
+
+```
+error: line:73: Expected Result Type to be int or float scalar type
+```
+
+That rejected the whole fragment shader. `gex_wgpu_lower_old_style_shadow`
+samples as new-style and expands the scalar to (r, r, r, 1) -- the same answer
+zink gives (`lower_zs_swizzle_tex`).
+
+Reading the rejected module is what found it: the driver prints the SPIR-V as
+hex, so `spirv-dis` on the reassembled words names the instruction and the
+line the error mentions. That is much faster than bisecting a shader.
+
+### 2. The projective depth reference was never divided
+
+SPIR-V's `OpImageSample*Proj*Dref*` projects the *coordinate* -- the divisor is
+its last component -- and leaves `D_ref` alone, while GL's `shadow2DProj`
+compares against `coord.p / coord.q`. zink's emitter passes the reference
+straight through, so every projective shadow comparison used an undivided
+reference. For a shadow map that reads as "behind everything", i.e. fully
+shadowed, and it looks like a depth-range or bias problem rather than a
+missing divide.
+
+`nir_lower_tex`'s `project_src` divides the coordinate *and* the comparator, so
+`.lower_txp = ~0u` removes the question. Non-shadow projection is lowered with
+it: WGSL has no projective sampling either, so Tint was undoing it again, and
+one `frcp` plus a multiply is the whole cost.
+
+### 3. A depth texture read as an ordinary one, with a filter
+
+WebGPU's pair for a shader that declared `texture_2d<f32>` against a
+depth-format view is `unfilterable-float` with a non-filtering sampler, so a
+filtering sampler could not be honoured -- and the driver declined the draw,
+which is a black frame with one line in the log. Reading a depth attachment as
+an ordinary texture is not rare (a depth prepass feeding SSAO, soft particles,
+depth of field), so the filter is now dropped to nearest and the draw
+proceeds. A nearest-filtered depth read is a small error; a missing one is the
+whole surface.
+
+The same relaxation had to accept **no sampler state at all**. st/mesa binds a
+sampler view for a texture it reads through a display path without binding
+sampler state for that unit, and requiring a bound sampler kept the draw
+declined. The decline message now prints the shader's sample type, the view
+format, the compare mode and the three filters, which is what turned "sample
+type differs from the shader's slot=0" into "there is no sampler here at all".
+
+### 4. A swizzled view with no sampler state got no swizzle
+
+`needs_sampler_variant |= swizzled` sat inside `if (uses_sampler && view &&
+sampler)`, so a slot whose sampler state was unbound never got the swizzle
+variant -- and a swizzle belongs to the *view*. WebGPU reads a depth aspect as
+(d, 0, 0, 1) while GL's `GL_DEPTH_TEXTURE_MODE` default of `GL_LUMINANCE` wants
+(d, d, d, 1), which is exactly a view swizzle, so `shadowtex`'s depth-texture
+display came out red instead of grey.
+
+**This one also fixed SuperTuxKart's HUD.** Its position indicator drew a red
+"1" where llvmpipe draws a white one; matching llvmpipe took the HUD crop from
+RMSE 0.13 to 0.016. Nothing had connected the two, and nothing would have --
+the digit looked like a deliberate colour.
+
+### 5. The default comparison sampler compared with `Always`
+
+A comparison sampler needs some function, and `Always` looks like the harmless
+choice -- until a shadow comparison lands on it, which answers "in front of
+everything" for every fragment and lights the whole scene. With st binding no
+sampler state for `shadowtex`'s shadow map (see 3), every comparison went
+through that stand-in, so the scene rendered correctly and cast no shadow at
+all. GL's default `GL_TEXTURE_COMPARE_FUNC` is `GL_LEQUAL`, which is also what
+a shadow map wants.
+
+### The probe, and one thing it must not assert
+
+`tests/gl44-probe.sh shadow` covers all of it: a 2x2 depth texture with four
+distinct depths sampled at four points; both spellings of the lookup; a depth
+map *rendered* into an FBO as well as uploaded, because that is a different
+path through the driver and every real shadow map takes it; and the same
+texture read as an ordinary one.
+
+Two traps in writing it:
+
+- **Green and blue are a profile difference, not a driver one.**
+  `GL_DEPTH_TEXTURE_MODE` exists only in a compatibility profile, where its
+  default makes a depth lookup (d, d, d, 1); a core profile has no such state
+  and reads (d, 0, 0, 1). Native Mesa answers an empty EGL context attribute
+  list with 4.6 Compatibility and **the guest's EGL with 3.3 Core**, so the
+  probe sees both. It asserts red and alpha only -- alpha still being the
+  channel that separates an (r, r, r, 1) expansion from an (r, r, r, r) one.
+- **A core profile has no default vertex array object**, so `glDrawArrays`
+  without one is `GL_INVALID_OPERATION`. Every case came back as the clear
+  colour with `err=0x0502` in the guest and passed natively until the probe
+  bound a VAO.
+
+The guest's EGL handing out a core profile where the same driver natively
+hands out compatibility is worth knowing about on its own: it is why the probe
+carries both shader spellings, and any compatibility-only construct an
+application uses will meet it.
