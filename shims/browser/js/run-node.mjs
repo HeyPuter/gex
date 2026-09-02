@@ -15,6 +15,10 @@ import { lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSyn
 import { basename, dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
+// `GEX_ARCH=x86` runs the x86-64 guest: the `.x86`-infixed shim and kernel
+// (see shims/browser/build.sh), and `globalThis.GEX_ARCH` for the glue.
+const ARCH_INFIX = process.env.GEX_ARCH === 'x86' ? '.x86' : '';
+if (process.env.GEX_ARCH === 'x86') globalThis.GEX_ARCH = 'x86';
 
 // The host runs on the main thread; give it the attach-trace flag too so
 // thread spawn/adopt timing is visible from the host side, not just the Worker.
@@ -126,8 +130,8 @@ function readStdin() {
 const SHARED = !!process.env.GEX_SHARED;
 const shimWasm = readFileSync(
   new URL(
-    SHARED ? '../../../web/public/gex/gex_browser.shared.wasm'
-           : '../../../web/public/gex/gex_browser.wasm',
+    SHARED ? `../../../web/public/gex/gex_browser${ARCH_INFIX}.shared.wasm`
+           : `../../../web/public/gex/gex_browser${ARCH_INFIX}.wasm`,
     import.meta.url,
   ),
 );
@@ -139,8 +143,8 @@ const shimWasm = readFileSync(
 let kernel = null;
 try {
   const path = new URL(
-    SHARED ? '../../../web/public/gex/gex_kernel.wasm'
-           : '../../../web/public/gex/gex_kernel.plain.wasm',
+    SHARED ? `../../../web/public/gex/gex_kernel${ARCH_INFIX}.wasm`
+           : `../../../web/public/gex/gex_kernel${ARCH_INFIX}.plain.wasm`,
     import.meta.url,
   );
   kernel = {

@@ -60,11 +60,23 @@ for w in "$@"; do
     fi
 done
 
-out="web/public/closure/$name"
+# `GEX_ARCH=x86`: the x86-64 translator, and the closure lands under
+# `closure/x86/` beside the AArch64 ones (the page picks by `?arch=`).
+if [ "${GEX_ARCH:-}" = "x86" ]; then
+    out="web/public/closure/x86/$name"
+    gexc=target/x86/release/gexc
+else
+    out="web/public/closure/$name"
+    gexc=target/release/gexc
+fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-cargo build --release -p gexc 2>&1 | grep -E "^error" && exit 1
+if [ "${GEX_ARCH:-}" = "x86" ]; then
+    cargo build --release -p gexc --features x86 --target-dir target/x86 2>&1 | grep -E "^error" && exit 1
+else
+    cargo build --release -p gexc 2>&1 | grep -E "^error" && exit 1
+fi
 echo "building the closure for $program..."
 # libc, the dynamic linker and the program itself whole; the rest
 # reachable-only.
@@ -133,7 +145,7 @@ fi
 # static scan misses). `$mode`'s exhaustive-for is ignored under a profile.
 profile=""
 [ -n "$GEX_PROFILE" ] && profile="--profile $GEX_PROFILE"
-target/release/gexc build --closure --sysroot "$sysroot" \
+$gexc build --closure --sysroot "$sysroot" \
     $mode $profile --shared-image $withs "$sysroot$program" -o "$work/c.wasm"
 
 mkdir -p "$out"

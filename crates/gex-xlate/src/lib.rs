@@ -448,21 +448,25 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
                 continue;
             }
             let end = seg.vaddr + seg.bytes.len() as u64;
-            let mut a = seg.vaddr;
-            while a < end {
-                // Skip addresses that are not really instructions: an
-                // executable segment is full of padding and literal pools, and
-                // for a shared library also holds string tables, relocations
-                // and `.rodata`. `is_executable` uses the section flags to say
-                // which bytes are code. Skipping the rest keeps exhaustive mode
-                // affordable (three quarters of the slots on a static musl
-                // binary) and avoids folding a `.rodata` block over a real
-                // entry point's slot -- the bug in #46 that broke `apt` on libc.
-                if view.decodable_at(a) {
-                    worklist.insert(a);
-                }
-                a += INST_ALIGN;
-            }
+            // Skip addresses that are not really instructions: an executable
+            // segment is full of padding and literal pools, and for a shared
+            // library also holds string tables, relocations and `.rodata`.
+            // `is_executable` (behind `fetch_code`) uses the section flags to
+            // say which bytes are code. Skipping the rest keeps exhaustive
+            // mode affordable (three quarters of the slots on a static musl
+            // binary) and avoids folding a `.rodata` block over a real entry
+            // point's slot -- the bug in #46 that broke `apt` on libc. The
+            // entries found so far anchor the sweep (see `arch::sweep`).
+            let anchors: Vec<u64> = worklist.range(seg.vaddr..end).copied().collect();
+            let mut found: Vec<u64> = Vec::new();
+            arch::sweep(
+                &|pc, buf| view.fetch_code(pc, buf),
+                seg.vaddr,
+                end,
+                &anchors,
+                &mut |a| found.push(a),
+            );
+            worklist.extend(found);
         }
         stats.discovered_exhaustively = worklist.len().saturating_sub(before);
     }
@@ -561,14 +565,28 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
         let touched: std::collections::BTreeSet<u64> =
             collected.iter().map(|b| b.start & !0xfff).collect();
         let mut fill: Vec<u64> = Vec::new();
+        // The blocks already on a page anchor its sweep, so on x86-64 the
+        // gaps are filled from real instruction boundaries rather than from
+        // every byte.
+        let mut anchors: Vec<u64> = collected.iter().map(|b| b.start).collect();
+        anchors.sort_unstable();
         for &pg in &touched {
-            let mut a = pg;
-            while a < pg + 0x1000 {
-                if !seen.contains(&a) && view.decodable_at(a) {
+            let lo = anchors.partition_point(|&a| a < pg);
+            let hi = anchors.partition_point(|&a| a < pg + 0x1000);
+            let page_anchors = &anchors[lo..hi];
+            let mut found: Vec<u64> = Vec::new();
+            arch::sweep(
+                &|pc, buf| view.fetch_code(pc, buf),
+                pg,
+                pg + 0x1000,
+                page_anchors,
+                &mut |a| found.push(a),
+            );
+            for a in found {
+                if !seen.contains(&a) {
                     seen.insert(a);
                     fill.push(a);
                 }
-                a += INST_ALIGN;
             }
         }
         fill.sort_unstable();
@@ -719,17 +737,13 @@ pub fn translate_object(
     // here: an executable segment is full of padding and literal pools.
     let mut scanned: Vec<u64> = Vec::new();
     let seeds = if seeds.is_empty() {
-        let mut a = lo;
-        while a < hi {
-            if fetchable(memory, executable, a) {
-                let mut buf = [0u8; 16];
-                let n = fetch_code_bytes(memory, executable, a, &mut buf);
-                if n > 0 && arch::decodable(&buf[..n], a) {
-                    scanned.push(a);
-                }
-            }
-            a += INST_ALIGN;
-        }
+        arch::sweep(
+            &|pc, buf| fetch_code_bytes(memory, executable, pc, buf),
+            lo,
+            hi,
+            &[],
+            &mut |a| scanned.push(a),
+        );
         &scanned[..]
     } else {
         seeds

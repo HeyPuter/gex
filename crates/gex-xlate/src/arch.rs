@@ -106,6 +106,27 @@ mod imp {
         }
     }
 
+    /// Every candidate instruction start in `[lo, hi)`: for A64, every aligned
+    /// word that decodes. `anchors` (known instruction starts) are not needed
+    /// on a fixed-width ISA.
+    pub fn sweep(
+        fetch: &dyn Fn(u64, &mut FetchBuf) -> usize,
+        lo: u64,
+        hi: u64,
+        _anchors: &[u64],
+        emit: &mut dyn FnMut(u64),
+    ) {
+        let mut a = lo & !3;
+        while a < hi {
+            let mut buf = [0u8; 16];
+            let n = fetch(a, &mut buf);
+            if n > 0 && decodable(&buf[..n], a) {
+                emit(a);
+            }
+            a += 4;
+        }
+    }
+
     /// Disassemble one instruction: its text and length.
     pub fn disasm(bytes: &[u8], pc: u64) -> (String, usize) {
         if bytes.len() < 4 {
@@ -175,6 +196,48 @@ mod imp {
                 _ => {}
             }
             a += inst.len.max(1) as u64;
+        }
+    }
+
+    /// Every candidate instruction start in `[lo, hi)`, by linear sweep: from
+    /// each anchor (a known instruction start -- a symbol, a block discovery
+    /// reached, a data pointer) decode forward, following instruction
+    /// lengths, until the next anchor. Seeding *every byte* instead, as the
+    /// A64 sweep does with every word, is wrong twice over on x86-64: most
+    /// byte offsets fall inside an instruction and decode as garbage (libc came
+    /// out at 1.2 million blocks, ten times its instruction count), and the
+    /// garbage exercises lifter paths no real program has.
+    pub fn sweep(
+        fetch: &dyn Fn(u64, &mut FetchBuf) -> usize,
+        lo: u64,
+        hi: u64,
+        anchors: &[u64],
+        emit: &mut dyn FnMut(u64),
+    ) {
+        let mut starts: Vec<u64> = anchors.iter().copied().filter(|&a| a >= lo && a < hi).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        if starts.first().map_or(true, |&f| f > lo) {
+            starts.insert(0, lo);
+        }
+        for (i, &s) in starts.iter().enumerate() {
+            let next = starts.get(i + 1).copied().unwrap_or(hi);
+            let mut a = s;
+            while a < next {
+                let mut buf = [0u8; 16];
+                let n = fetch(a, &mut buf);
+                if n == 0 {
+                    // Not executable here: step to the next byte and try to
+                    // resynchronise.
+                    a += 1;
+                    continue;
+                }
+                let inst = gex_isa_x86::decode(&buf[..n], a);
+                if inst.is_known() {
+                    emit(a);
+                }
+                a += inst.len.max(1) as u64;
+            }
         }
     }
 

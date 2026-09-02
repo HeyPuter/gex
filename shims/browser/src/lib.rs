@@ -5569,7 +5569,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // The stack goes back so the host can see the record and
                 // start the Worker, exactly as a `fork` does. The parent
                 // resumes where it was: `clone` returns the tid to it.
-                set_resume(pc as u64 + 4);
+                set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
                 set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
                 1
             }
@@ -5657,7 +5657,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     gex_kernel::BlockOp::SigSuspend { .. } => Waiting::Runnable,
                 };
                 let t = &mut h.threads[cur()];
-                t.pc = pc as u64 + 4;
+                t.pc = pc as u64 + gex_abi::SYSCALL_INST_BYTES;
                 t.waiting = waiting;
                 t.blocked_on = Some(op);
                 3
@@ -5672,7 +5672,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // is a copy of this memory that must be taken now, when the
                 // stack comes back. Letting the parent run on first copied it
                 // several syscalls later, with a context already saved over.
-                set_resume(pc as u64 + 4);
+                set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
                 set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
                 1
             }
@@ -5744,7 +5744,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // is a real re-entry that must go out through JS.
         let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
         if picked == 1
-            && resume() == Some(pc as u64 + 4)
+            && resume() == Some(pc as u64 + gex_abi::SYSCALL_INST_BYTES)
             && resume_ctx().unwrap_or(here) == here
         {
             set_resume_none();
