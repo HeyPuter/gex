@@ -231,6 +231,31 @@ async function ensureServer() {
 // it again. WebGL via swiftshader (the demos need a real GL context headless).
 // ---------------------------------------------------------------------------
 
+
+// Every chrome process running against our profile. The recorded pid is not
+// enough: it goes stale, and a restart that leaves the old browser running
+// while starting a new one doubles the memory it was meant to reclaim --
+// 10.6 GiB became 20.3 GiB exactly once before this existed.
+function killChromeProcesses() {
+  const profile = join(CHROME_STATE, 'profile');
+  let killed = 0;
+  try {
+    for (const entry of readdirSync('/proc')) {
+      if (!/^\d+$/.test(entry)) continue;
+      let cmdline;
+      try {
+        cmdline = readFileSync(`/proc/${entry}/cmdline`, 'utf8');
+      } catch { continue; }
+      if (!cmdline.includes(profile)) continue;
+      try {
+        process.kill(Number(entry), 'SIGKILL');
+        killed += 1;
+      } catch { /* already gone */ }
+    }
+  } catch { /* no /proc; nothing to do */ }
+  if (killed) log(`chrome: killed ${killed} process(es)`);
+}
+
 // Total resident memory of every chrome process, in MiB, read from /proc.
 // GEX_CHROME_MAX_RSS (default 5000) is the point at which the persistent
 // browser is retired instead of reused.
@@ -291,11 +316,8 @@ async function ensureChrome(restart) {
     try {
       const c = await Cdp.connect(url);
       await c.send('Browser.close');
-    } catch { /* fall through to the pidfile */ }
-    try {
-      const pid = Number(await readFile(join(CHROME_STATE, 'chrome.pid'), 'utf8'));
-      if (pid) process.kill(pid, 'SIGKILL');
-    } catch { /* none recorded */ }
+    } catch { /* fall through to killing it */ }
+    killChromeProcesses();
     await sleep(800);
     url = null;
   }
