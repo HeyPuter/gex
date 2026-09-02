@@ -262,6 +262,8 @@ const host = new ProcessHost({
     // narrowed to a few seconds of guest time.
     trace: !!process.env.GEX_TRACE,
     traceMisses: !!process.env.GEX_TRACE_MISSES,
+    // GEX_TRACE_BLOCKS: the per-block register trace, as natively.
+    traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
     // GEX_CHECK_SP checks `sp` at the top of every block: a corrupt `sp` is
     // invisible until dereferenced, so this names the block that arrives with
     // the bad value, not the one that dies on it. See #73.

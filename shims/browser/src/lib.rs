@@ -8798,8 +8798,49 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     with_host(|h| set_exit(h, 128 + 4));
     trap();
 }
+/// The per-block register trace (`GEX_TRACE_BLOCKS` natively): every block
+/// translated after this call starts by reporting its pc and registers to the
+/// debug console. Enormous; pipe it to `tail`. The one tool that shows what ran
+/// between two syscalls when the guest lands somewhere wild.
+/// `log2` of the instruction alignment: 2 on AArch64 (1024 dispatch slots per
+/// page), 0 on x86-64 (a slot per byte, 4096). The glue's slot arithmetic asks
+/// rather than assumes, so one `gex.mjs` serves both shims.
+#[no_mangle]
+pub extern "C" fn gex_inst_align_shift() -> i32 {
+    gex_abi::INST_ALIGN_SHIFT as i32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_set_trace_blocks(on: i32) {
+    gex_xlate::set_trace_blocks(on != 0);
+}
+
 #[no_mangle]
 pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
+    if raw == gex_abi::imports::BRK_TRACE {
+        let line = with_host(|h| {
+            let gm = GuestMem::new(guest_bytes());
+            let c = h.threads[cur()].kstate.ctx_addr;
+            let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
+            if gex_abi::X86 {
+                format!(
+                    "[trace] t{} pc={:#x} rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}\n",
+                    cur(), pc as u64,
+                    r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7),
+                    r(8), r(9), r(10), r(11), r(12), r(13), r(14), r(15)
+                )
+            } else {
+                let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+                format!(
+                    "[trace] t{} pc={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x8={:#x} x19={:#x} x20={:#x} x29={:#x} x30={:#x} sp={sp:#x}\n",
+                    cur(), pc as u64,
+                    r(0), r(1), r(2), r(3), r(8), r(19), r(20), r(29), r(30)
+                )
+            }
+        });
+        trace_line(&line);
+        return;
+    }
     // A diagnostic breakpoint planted at a chosen guest pc: dump the live
     // registers (x30 names the caller) and RETURN so the block runs on. Pointed
     // at __stack_chk_fail, it deterministically names the smashed function --
@@ -9224,6 +9265,38 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             }
         });
         let _ = resumed;
+        trap();
+    }
+    // A branch to memory nothing executable is mapped at: a bad return
+    // address or function pointer. Said before any slot arithmetic, because a
+    // wild `pc` makes a wild directory index, and a shim trap on that reads as
+    // a runtime bug where the guest's own crash is the story.
+    let wild = with_host(|h| {
+        !h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && pc >= v.start && pc < v.end)
+    });
+    if wild {
+        with_host(|h| {
+            let gm = GuestMem::new(guest_bytes());
+            let c = h.threads[cur()].kstate.ctx_addr;
+            let last = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
+            let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+            let stack: Vec<String> = (0..8)
+                .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
+                .collect();
+            warn_line(&format!(
+                "[gex] pid {} thread {} branched to {pc:#x}, which is not executable guest memory (SIGSEGV); last indirect target {last:#x} ({}), sp={sp:#x} stack=[{}], last syscall {}\n",
+                h.kernel.pid,
+                cur(),
+                object_off_at(h, last),
+                stack.join(", "),
+                LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
+            ));
+            set_exit(h, 128 + 11);
+        });
         trap();
     }
     // Which of this object's functions the backend serves itself, before either

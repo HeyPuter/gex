@@ -1243,3 +1243,4 @@ mod tests {
         assert!(!m.wasm.is_empty());
     }
 }
+pub use gex_emit::set_trace_blocks;

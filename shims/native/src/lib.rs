@@ -2474,10 +2474,34 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(StopExecution.into())
                 }
                 Ok(false) => {
+                    // A wild branch is nearly always a bad return address or
+                    // function pointer: say where the last indirect branch
+                    // was aimed and what the stack holds, so the caller can
+                    // be found without a full trace.
+                    let detail = {
+                        let memory = caller.data().memory.clone();
+                        let state = caller.data();
+                        let base = state.thread.ctx_addr;
+                        match memory {
+                            Some(memory) => {
+                                let gm = GuestMem::new(memory.bytes());
+                                let last = gm.read_u64(base + ctx::LAST_TARGET as u64).unwrap_or(0);
+                                let sp = gm.read_u64(base + ctx::SP as u64).unwrap_or(0);
+                                let stack: Vec<String> = (0..8)
+                                    .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
+                                    .collect();
+                                format!(
+                                    "branch to 0x{pc:x}, which is not executable guest memory (last indirect target {last:#x}; sp={sp:#x} stack=[{}])",
+                                    stack.join(", ")
+                                )
+                            }
+                            None => format!("branch to 0x{pc:x}, which is not executable guest memory"),
+                        }
+                    };
                     caller.data_mut().exit = Some(Exit::Signal {
                         signal: signal::SIGSEGV,
                         pc,
-                        detail: format!("branch to 0x{pc:x}, which is not executable guest memory"),
+                        detail,
                         internal: false,
                     });
                     Err(StopExecution.into())

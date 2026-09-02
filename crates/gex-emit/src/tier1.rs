@@ -213,9 +213,20 @@ pub fn set_trap_pc(pc: u64) {
 /// can print the path a guest takes. A diagnostic for a run that ends
 /// somewhere it should not, with no other record of how it got there. Costs
 /// a host call per block, so never on by default.
+/// Set by a host without an environment (the browser shim, via
+/// `gex_set_trace_blocks`); the native host sets `GEX_TRACE_BLOCKS`.
+static TRACE_BLOCKS_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the per-block register trace on for everything translated from now
+/// on. Blocks already emitted are unaffected.
+pub fn set_trace_blocks(on: bool) {
+    TRACE_BLOCKS_SET.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn trace_blocks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GEX_TRACE_BLOCKS").is_some())
+    TRACE_BLOCKS_SET.load(std::sync::atomic::Ordering::Relaxed)
+        || *ON.get_or_init(|| std::env::var_os("GEX_TRACE_BLOCKS").is_some())
 }
 
 fn trap_pc() -> u64 {

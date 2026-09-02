@@ -45,8 +45,19 @@ function adoptAfterTraps() {
 const FILL = 'gexfill';
 // The one a miss can ask for: fill whichever segment holds this slot.
 const FILL_AT = 'gexfillat';
-// Dispatch slots one 4 KiB guest page covers. `gex_abi::SLOTS_PER_PAGE`.
-const SLOTS_PER_PAGE = 1024;
+// Dispatch slots one 4 KiB guest page covers (`gex_abi::SLOTS_PER_PAGE`) and
+// the `log2` of the instruction alignment that decides it: 1024 and 2 on
+// AArch64, 4096 and 0 on x86-64. Asked of the shim once it exists (see
+// `syncSlotShift`); the AArch64 values until then.
+let SLOT_SHIFT = 2;
+let SLOTS_PER_PAGE = 4096 >> SLOT_SHIFT;
+function syncSlotShift(exports) {
+  const s = exports?.gex_inst_align_shift?.();
+  if (typeof s === 'number' && s >= 0 && s <= 2) {
+    SLOT_SHIFT = s;
+    SLOTS_PER_PAGE = 4096 >> s;
+  }
+}
 const FILL_ALL = 'gexfillall';
 
 // Above this, a module's slots are written when a branch asks rather than at
@@ -823,6 +834,7 @@ export class Gex {
     // it into the shim's own region, above everything the guest maps.
     this.#shim.exports.__stack_pointer.value = this.#workerStack();
     this.#opts = { strace: opts.strace, tty: opts.tty, uid: opts.uid, gid: opts.gid };
+    syncSlotShift(this.#shim.exports);
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
     // How many of an object's stored units one miss may take.
     if (opts.perMiss) this.#shim.exports.gex_set_per_miss?.(opts.perMiss);
@@ -1563,6 +1575,7 @@ export class Gex {
     // The kernel exists now, so everything that configures one can be said.
     const o = child.opts ?? {};
     this.#opts = o;
+    syncSlotShift(e);
     if (o.strace) e.gex_set_trace(1);
     if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
     if (o.tty) e.gex_set_tty(1);
@@ -2189,7 +2202,7 @@ export class Gex {
             // The page's base plus the block's offset within the page: the
             // base alone showed a slot inside the table while the branch was
             // past its end.
-            const at = slot + ((Number(guest) & 0xfff) >> 2);
+            const at = slot + ((Number(guest) & 0xfff) >> SLOT_SHIFT);
             const len = tables[idx]?.length ?? 0;
             // Asked, not computed: `get` settles whether the table really is
             // short (RangeError) or the trap belongs to some other operation.
@@ -2216,7 +2229,7 @@ export class Gex {
               const b = v & 0xffffff;
               const cap = tables[t]?.length ?? 0;
               // The whole page, because any block in it may be branched to.
-              if (t < tables.length && b + 1024 <= cap) continue;
+              if (t < tables.length && b + SLOTS_PER_PAGE <= cap) continue;
               bad++;
               if (t >= 2) highTable++;
               if (sample.length < 6) {
@@ -2950,7 +2963,7 @@ export class Gex {
       }
       else if (tn < 0 || tn >= tabs.length) what = 'no table';
       else {
-        const slot = base + ((pc & 0xfff) >>> 2);
+        const slot = base + ((pc & 0xfff) >>> SLOT_SHIFT);
         what = slot >= tabs[tn].length
           ? `past end ${tabs[tn].length}`
           : tabs[tn].get(slot) !== stub ? 'written' : 'stub';
@@ -2964,7 +2977,7 @@ export class Gex {
           const inst = owner >= 0 ? this.#lazyClosure[owner]?.instObj : null;
           const fill = inst?.exports?.[FILL_AT];
           if (typeof fill === 'function') {
-            const mine = ((pc & 0xfff) >>> 2) & ~31;
+            const mine = ((pc & 0xfff) >>> SLOT_SHIFT) & ~31;
             const said = fill(page, base, mine);
             const then = Gex.askState.get(`${page}:${mine}`);
             const now = `at=${base} len=${tabs[tn].length}`;
@@ -3016,7 +3029,7 @@ export class Gex {
       ? this.#shim.exports.gex_page_table(BigInt(page >>> 0)) : -1;
     const tabs = this.#dispatchTables();
     if (tn < 0 || tn >= tabs.length) return true;
-    const want = at + ((mpc & 0xfff) >>> 2);
+    const want = at + ((mpc & 0xfff) >>> SLOT_SHIFT);
     return want < tabs[tn].length && tabs[tn].get(want) !== tabs[0].get(0);
   }
 
@@ -3098,7 +3111,7 @@ export class Gex {
         const mpc = Number(this.#shim.exports.gex_fill_pc?.() ?? 0n);
         if (mpc && Gex.#whySlot < 12) {
           Gex.#whySlot++;
-          const want = at + ((mpc & 0xfff) >>> 2);
+          const want = at + ((mpc & 0xfff) >>> SLOT_SHIFT);
           const tn2 = this.#shim.exports.gex_page_table
             ? this.#shim.exports.gex_page_table(BigInt(page >>> 0)) : -1;
           const tabs2 = this.#dispatchTables();
@@ -3109,7 +3122,7 @@ export class Gex {
               : `past end (${tabs2[tn2].length})`;
           }
           console.error(`[closure] pc ${mpc.toString(16)} page ${page} slot ${want}`
-            + ` (base ${at} + ${(mpc & 0xfff) >>> 2}) t=${tn2}: ${set}`);
+            + ` (base ${at} + ${(mpc & 0xfff) >>> SLOT_SHIFT}) t=${tn2}: ${set}`);
         }
       }
       if (Gex.watchPages.has(page) && Gex.#whyDid < 24) {

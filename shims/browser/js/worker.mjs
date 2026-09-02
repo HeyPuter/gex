@@ -514,6 +514,7 @@ async function handle(msg) {
     if (msg.trace) ex.gex_set_trace?.(1);
     if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
+    if (msg.traceBlocks) ex.gex_set_trace_blocks?.(1);
     if (msg.checkSp) ex.gex_set_check_sp?.(1);
     // Per-process page numbering on (1, the default) or off (0). Off publishes
     // closure dir entries at the build's slot numbers, which the profile-guided

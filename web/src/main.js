@@ -248,6 +248,12 @@ for (const [event, describe] of [
   }
   ui.engine.textContent = navigator.userAgent.includes('Firefox') ? 'spidermonkey' : 'v8';
   const archName = globalThis.GEX_ARCH === 'x86' ? 'x86-64' : 'AArch64';
+  if (globalThis.GEX_ARCH === 'x86') {
+    // The static page copy names the default guest; retitle it for x86-64.
+    document.title = document.title.replace('AArch64', archName);
+    for (const p of document.querySelectorAll('header.site-header p'))
+      p.textContent = p.textContent.replace('AArch64', archName);
+  }
   term.writeln(ansi.bold('gex') + ansi.dim(` — ${archName} Linux programs, recompiled to WebAssembly`));
   term.writeln('');
   busy('fetching the runtime');
