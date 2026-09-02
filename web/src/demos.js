@@ -1626,6 +1626,17 @@ const SESSION_APPS = [
     gl: true,
   },
   {
+    /* The same question on the other path: a desktop-GL context through EGL,
+     * which is how every Wayland client and SDL's EGL backend reach the
+     * device. No window, because what is being asked about is the context and
+     * what it says about itself -- see guest/glx-init/egl-init.c. */
+    id: 'egl-init',
+    label: 'egl-init — desktop GL through EGL (prints what the context says)',
+    kind: 'wl',
+    cmd: '/usr/bin/egl-init 120',
+    gl: true,
+  },
+  {
     // The smallest GL client there is, and the one that finds driver bugs the
     // big ones hide: it points glVertexAttribPointer at a stack array with no
     // buffer bound, the way tutorial code and every mesa-demos program does.
@@ -2116,6 +2127,7 @@ const compositor = {
             // A guest program rather than a driver, staged the same way: see
             // the `glx-init` entry in the picker.
             ['/fs/glibc/glx-init', '/usr/bin/glx-init'],
+            ['/fs/glibc/egl-init', '/usr/bin/egl-init'],
           ]) {
             const response = await fetch(from, { cache: 'no-store' });
             if (!response.ok) continue;

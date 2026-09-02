@@ -1748,6 +1748,20 @@ bool one(uint32_t op, Reader& a) {
 #else
         const char* version = "3.3 (Core Profile) Mesa 26.0.0 (MobileGL WebGPU)";
 #endif
+        /* Said once. An application chooses its renderer by parsing this,
+         * and a string that arrives empty is invisible from the guest's
+         * side -- it looks like a driver with no name and no version. */
+        {
+            static bool said_strings;
+            if (!said_strings) {
+                said_strings = true;
+                fprintf(stderr, "gexgl: context strings vendor=%s renderer=%s"
+                                " version=%s\n",
+                        vendor ? vendor : "(null)",
+                        renderer ? renderer : "(null)",
+                        version ? version : "(null)");
+            }
+        }
         put_blob(vendor, vendor ? std::strlen(vendor) : 0);
         put_blob(renderer, renderer ? std::strlen(renderer) : 0);
         put_blob(version, version ? std::strlen(version) : 0);

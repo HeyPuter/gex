@@ -14,4 +14,5 @@ CC=${GEX_CC:-aarch64-linux-gnu-gcc}
 command -v "$CC" >/dev/null 2>&1 || { echo "need $CC" >&2; exit 1; }
 mkdir -p "$OUT"
 "$CC" -O2 -Wall -Wextra -o "$OUT/glx-init" "$HERE/glx-init.c" -ldl
-echo "$OUT/glx-init"
+"$CC" -O2 -Wall -Wextra -o "$OUT/egl-init" "$HERE/egl-init.c" -ldl
+echo "$OUT/glx-init $OUT/egl-init"

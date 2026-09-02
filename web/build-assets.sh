@@ -248,7 +248,7 @@ if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
         # is built by the same compiler and staged the same way.
         GEX_CC=/usr/bin/aarch64-linux-gnu-gcc "$ROOT/guest/glx-init/build.sh" \
             "$WORK/glx-init" >/dev/null 2>&1 &&
-            cp "$WORK/glx-init/glx-init" "$PUB/fs/glibc/" || true
+            cp "$WORK/glx-init/glx-init" "$WORK/glx-init/egl-init" "$PUB/fs/glibc/" || true
     elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
         mkdir -p "$PUB/fs/glibc"
         GEX_CC="$(command -v aarch64-linux-gnu-gcc)" \
