@@ -6710,3 +6710,61 @@ Two real bugs were found while eliminating those, and both are kept:
 * The staged path uploads the whole mapped range out of a zeroed block, so it
   needs the caller to have undertaken to write all of it. A plain
   `PIPE_MAP_WRITE` promises nothing of the kind.
+
+### Chasing the mechanism further, and where it now stands
+
+`GEX_WGPU_STAGE_WHOLE=1` puts the old behaviour back, so both the working and
+the failing configuration are reachable from one build and can be compared
+directly. An objective check beats looking at screenshots: count reddish
+pixels in the lower middle third, where the kart is. Roughly **1580 means the
+scene rendered and 555 means it did not** -- the broken frame still scores
+because the timer and speedometer are red.
+
+`GEX_WGPU_UPLOAD_LOG=<skip>` checksums every buffer upload, skipping the first
+`<skip>` of them. The skip matters: the first attempt logged only the first
+sixty uploads, which are all loading, concluded the two paths were identical,
+and had never looked at a single per-frame rewrite. Sampling from 3000 shows
+what actually differs -- the staged buffers in the failing configuration are
+**44-byte per-instance blocks**, which is STK's `stride=44 divisor=1`
+attributes: `i_origin`, `i_rotation`, `i_scale`. The shader builds position
+from those, so a wrong `i_scale` collapses an object to a point, which is
+exactly the symptom.
+
+They are not wrong. Dumped as floats, both configurations upload the same sane
+values -- origin around (-198, 0.05, 31.7), a unit quaternion, scale 0.008.
+And reading the buffers back off the GPU at draw time gives **byte-identical
+checksums across all eight slots in both configurations**, with the same
+instance values.
+
+So: the same bytes are in the same buffers when the draw runs, the bindings are
+the same, and the pixels differ. Eleven mechanisms are now eliminated with
+measurements -- the four from before, plus:
+
+* **Source lifetime.** Keeping the staged block alive instead of freeing it
+  after `wgpuQueueWriteBuffer` changes nothing, so the copy really has been
+  taken by the time that returns.
+* **Writing past the block.** The shadow path hands out a pointer into the
+  resource's whole allocation, so a caller overrunning its mapped range would
+  corrupt the heap only in the staged case. Over-allocating the block by 4 KB
+  changes nothing.
+* **Buffer renaming.** There is none: `DISCARD_WHOLE_RESOURCE` appears nowhere
+  else in the driver, so `gex->buffer` is stable across the map.
+* **Redundant-bind elision.** `SetVertexBuffer` is skipped when the handle and
+  offset match what the pass already bound, which is the same
+  recycled-address shape as the bind group cache bug. Forcing every bind
+  changes nothing.
+* **Synchronisation.** A full round trip to the GPU after the write -- which is
+  what the shadow path gets for free on its first map, through
+  `gex_wgpu_shadow_for_read` -- changes nothing. Nor does submitting the
+  pending batch at map time.
+
+That last one is the important negative, because it also indicts the
+measurements: **every CPU-side probe that observes the GPU's state also
+synchronises it**, and the one that read the buffers back is therefore not
+observing the failing state. The readback says the bytes are right; it cannot
+say they were right before it forced a sync.
+
+So the next step is not more instrumentation inside the driver. It is a
+non-perturbing capture of what Dawn is actually told -- its own API trace or a
+capture layer -- run once in each configuration and diffed. Everything
+reachable from inside the driver has been tried.
