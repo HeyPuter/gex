@@ -6835,3 +6835,119 @@ staged with **no** shadow fails, staged with a **stale** shadow fails, staged
 with a **current** shadow works. That isolates "something reads the shadow and
 needs it up to date" in three runs, and from there the reader is one grep
 away.
+
+## Sweeping the 336 installed GL programs (2026-09-02)
+
+With SuperTuxKart and Minecraft working, "and other GL apps" needed something
+broader than the two applications to hand. There are **336 GL programs
+installed** on this machine -- the mesa-demos and piglit-style suites, plus
+aseprite, cemu, dolphin-emu, moonlight and mpv. Individually they are trivial.
+Together they are the widest statement available about whether ordinary GL
+works here, and they cost seconds each.
+
+`tests/../scratchpad/gl-app-sweep.sh` runs each one for eight seconds and
+classifies it by what the *driver* did, not by whether the program was happy:
+CRASH, REFUSED (a state or shader this driver turned away), WGPU-ERROR (a
+WebGPU validation failure), LATCHED, or RAN. Format probing --
+"render target refused" for the dozens of formats st/mesa asks about at
+startup -- is routine and deliberately not counted.
+
+The first sweep:
+
+```
+RAN 192   REFUSED 60   CRASH 32   EXIT 22   WGPU-ERROR 14   OK 16
+```
+
+### Every crash was a consequence, not a cause
+
+All 27 crash logs contained "already failed", and 14 ended in
+`texture_map declined (context already failed)`. The shape is always the same:
+something is refused, the context latches, `texture_map` returns NULL, and the
+application dereferences it. So the crashes were not 27 bugs -- they were the
+visible end of a smaller number of refusals.
+
+Grouping the *first* refusal in each crashing log made that concrete: **17 of
+27 began with a rejected SPIR-V**, and of the 30,661 Tint rejections across
+all the logs, one message accounted for 30,656 of them.
+
+### Vertex input locations collided
+
+```
+[VUID-StandaloneSpirv-OpEntryPoint-08721] Entry-point has conflicting input
+location assignment at location 0, component 0
+  OpEntryPoint Vertex %main "main" %VERT_ATTRIB_POS %VERT_ATTRIB_COLOR0
+                                   %VERT_ATTRIB_GENERIC0 ...
+```
+
+`ntv_shader_prepare` rewrites every vertex input's `driver_location` -- which
+becomes the module's `@location` -- as
+
+```c
+location >= VERT_ATTRIB_GENERIC0 ? location - VERT_ATTRIB_GENERIC0 : location
+```
+
+and those two ranges overlap. `VERT_ATTRIB_POS` is 0 and
+`VERT_ATTRIB_GENERIC0` is 16, so a shader using a fixed-function attribute
+together with a generic one declares two inputs at `@location(0)` and the
+SPIR-V is invalid before Tint sees it. st/mesa builds exactly that shape for
+its own fixed-function work, so `glDrawPixels`, `glCopyPixels` and the FBO
+clear paths all produced a rejected vertex shader.
+
+st/mesa's own numbering does not collide: it is dense from zero, and it is
+what Gallium's vertex elements are indexed by -- so it is also the numbering
+the pipeline's `shaderLocation` uses. Keeping it across
+`ntv_shader_prepare` makes both sides agree by construction instead of by a
+formula the driver had to mirror (and whose collision it inherited).
+
+**21 programs fixed by that one change, no regressions**: arbocclude,
+arbocclude2, bump, clear-fbo, clear-fbo-scissor, clear-fbo-tex, copypix,
+drawpix, engine, fbo_firecube, fire, fogcoord, ipers, lodbias, pixeltest, ray,
+readpixels, teapot, terrain, texenv, tri-fbo.
+
+With glPolygonOffset below, **26 in total**, and the sweep moves to:
+
+```
+RAN 217   REFUSED 54   CRASH 17   EXIT 22   WGPU-ERROR 10   OK 16
+```
+
+`moonlight` looks like a regression in the tally and is not: its log already
+contained thirteen "Failed to create ... context" lines before the change. It
+fails to create a Qt RHI context either way, and only changed verdict because
+on a quiet machine it now reaches its own abort inside the eight-second
+window.
+
+### The rasterizer refusals, decoded
+
+28 of the 60 refusals were `rasterizer state refused`, which reports the
+differing byte and value rather than a field name. Decoding those against the
+bitfield layout of `pipe_rasterizer_state` gives the real list:
+
+| refused | programs | representable in WebGPU? |
+|---|---|---|
+| `fill_front`/`fill_back` (polygon mode LINE/POINT) | 10 | no polygon mode; would need triangles rewritten to lines |
+| `offset_tri` (glPolygonOffset) | 6 | **yes -- depthBias, done** |
+| `light_twoside` | 3 | fixed-function two-sided lighting |
+| `line_smooth`, `line_stipple`, `poly_stipple` | 4 | no |
+
+### glPolygonOffset
+
+WebGPU takes it directly, so this was a refusal of something fully
+representable -- and a refused rasterizer state binds as NULL, costing culling
+and the scissor along with it. GL adds `factor * m + units * r`, WebGPU's
+`depthBias` counts in units of r and `depthBiasSlopeScale` multiplies the
+slope, and Gallium halves units unless `offset_units_unscaled` says otherwise,
+so it is doubled back -- the same correction zink applies.
+
+One WebGPU constraint to respect: **depthBias must be zero for a line or point
+topology**, and a pipeline that sets it anyway is rejected outright. That
+matches GL, where polygon offset applies to polygon rasterization; but an
+application that leaves `GL_POLYGON_OFFSET_FILL` enabled while drawing lines is
+ordinary, and `offset` does exactly that. The bias is applied only for
+triangle topologies.
+
+`gl44-polygon-offset-probe` checks it by arithmetic rather than by acceptance:
+two coplanar quads under `GL_LESS`, where the second can only win if it was
+pulled towards the viewer and can only lose if it was pushed away. The third
+case is the control -- offset disabled, equal depth, second quad rejected --
+without which a driver that ignored the offset entirely would still pass the
+first case.
