@@ -6481,3 +6481,115 @@ still loading, and comparing the fixed build against *that* suggested a 4.5x
 improvement. It was not a baseline, only a different scene. Any claim about
 this driver's frame rate needs the draws/frame printed next to it, or it is
 comparing two different pictures.
+
+## SuperTuxKart's empty scene, and three smaller faults (2026-09-02)
+
+STK's race scene rendered as a HUD floating over nothing: the timer, the kart
+icons and the speedometer ring drew, and the world did not. Behind it were
+254,456 instances of
+
+```
+[Invalid RenderPipeline (unlabeled)] is invalid.
+```
+
+and six of
+
+```
+The component count (4) of the vertex output at location 0 is different from
+the component count (3) of the fragment input at location 0.
+```
+
+### Varying widths have to match, and in GLSL they need not
+
+GLSL is content for a fragment shader to read `vec3 v` from a vertex shader
+that writes `vec4 v`; the fourth component is simply never read. WGSL requires
+the two sides of an interstage variable to be the same type, and Dawn rejects
+the entire pipeline when they differ. That is a validation error rather than a
+failed call, so the draw is dropped in silence -- six shader pairs were enough
+to erase the world.
+
+The driver already had the machinery for this shape of problem, built for
+interpolation qualifiers: the fragment stage is authoritative, and a vertex
+variant is compiled to agree with it. `varying_components` now rides alongside
+`varying_interp` in exactly the same way, and `gex_wgpu_fit_varyings` reshapes
+the clone's outputs -- narrowing drops components nothing can read, widening
+pads with zero, which is a value GL leaves undefined anyway.
+
+One trap in doing it. A `store_deref` carries its own `num_components`, and
+`nir_src_rewrite` does not update it, so trimming the value left a store
+claiming four components while holding three. `nir_validate` catches that and
+aborts; a release build would not have.
+
+### gl_PointSize took the driver down with it
+
+Found while writing an unrelated probe. `gex_wgpu_strip_point_size` drops the
+store -- WGSL has no point size and Tint accepts only a constant 1.0 -- and
+then unlinks the variable, but the deref that addressed it survived:
+
+```
+%3 = deref_var &gl_PointSize (shader_out highp float)
+     error: entry (nir_validate.c:323)
+```
+
+A variable removed from under a live deref is a dangling reference, and that
+aborts the process rather than mis-compiling. DCE before removing the variable
+takes the deref with the store. Any shader that set `gl_PointSize` used to
+crash the driver.
+
+### flatshade_first was refused backwards
+
+The rasterizer allowlist turned away `flatshade_first`, and a refused
+rasterizer state binds as NULL -- no culling, no scissor, `front_ccw = 0`.
+That is the wrong way round: WGSL's flat interpolation takes the *first*
+vertex, so GL's FIRST_VERTEX_CONVENTION is the case that can be honoured
+exactly, while GL's default of the last vertex is the one that cannot and was
+being accepted quietly. Now accepted.
+
+### What STK still gets wrong, and how to look at it
+
+The scene renders -- terrain, sky, mountains, the banner -- but the kart, the
+minimap, a rock face and the track borders do not, and the speedometer digit
+comes out a flat red block.
+
+**Do not compare against llvmpipe as it comes.** llvmpipe reports GL 4.6, and
+STK reads the version and picks a different renderer: compute shaders, SSBOs,
+image load/store, and TBO skinning. Against that, half the difference on
+screen is STK running a different code path, not this driver rendering wrongly.
+Hold it to the same rung:
+
+```
+MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 \
+LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe supertuxkart ...
+```
+
+llvmpipe at GL 3.3 renders the scene correctly and completely, so GL 3.3 is
+sufficient and the remaining fault is this driver's.
+
+The useful fact for whoever picks this up: **both drivers are handed the same
+work.** `GALLIUM_TRACE` on llvmpipe at 3.3 gives 216,911 `draw_vbo` calls over
+5,305 `flush_frontbuffer`, or 40.9 draws a frame; this driver's own
+`GEX_WGPU_TIMING=1` reports 41 draws a frame on the same scene. Nothing is
+being culled or dropped before the driver -- 41 draws arrive and render less
+than they should, which is a much smaller search than it first looked. The
+frame is 32 indexed draws of 6 to 6258 vertices and 9 non-indexed draws of
+three or four, into a single framebuffer that is set three times in the whole
+run.
+
+Four hypotheses, each plausible and each wrong, recorded so they are not paid
+for twice:
+
+* **Backface culling.** Forcing `WGPUCullMode_None` changes nothing.
+* **Texture buffer objects.** STK logs "ARB Texture Buffer Object Present" and
+  skins through one on llvmpipe, and `samplerBuffer` shaders *are* rejected
+  here ("invalid or duplicate texture binding") -- but STK takes its
+  `SKINNING_TBO_DISABLED` path against this driver and no shader is rejected
+  in the whole run. Real gap, wrong culprit.
+* **RGBA32F `texelFetch`**, which the fallback skinning path reads its bone
+  matrices from. Works, via both `glTexImage2D` and `glTexSubImage2D`.
+* **Instancing.** The trace's instance counts are 1 to 4; STK at this rung
+  barely instances at all.
+
+Also worth knowing: the driver dumps the first 24 distinct vertex shaders it
+sees, unconditionally, with each one's input mask and `missing` mask. For STK
+every shape reports `missing 0x0`, so no draw is collapsing for want of an
+attribute.
