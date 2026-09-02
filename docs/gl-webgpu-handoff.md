@@ -7203,3 +7203,27 @@ unwritten fragment input is fatal.
 That last part is general rather than sprite-specific, and it is the reason
 `point-sprite` and `spriteblast` needed it: they read a texcoord before
 enabling `GL_COORD_REPLACE`, so nothing produces it and nothing is meant to.
+
+### The sweep, after nine fixes
+
+| | start of the day | now |
+|---|---|---|
+| RAN | 192 | **241** |
+| CRASH | 32 | **15** |
+| REFUSED | 60 | **37** |
+| WGPU-ERROR | 14 | **5** |
+
+**49 of the 336 programs moved out of a failing verdict, and none moved into
+one.**
+
+What is left is mostly not implementable. The 15 crashes are 13 that are not
+this driver's -- Wayland compositors, KMS, GLX and EGL context creation -- plus
+`dlist-degenerate`, which crashes before any GL work, and one shader that
+cannot split a combined sampler. The 37 refusals are line and polygon stipple,
+line smoothing, logic ops, and front and back polygon modes differing: WebGPU
+has no equivalent for any of them, and each is refused with a named reason
+rather than silently mis-drawn. The 5 remaining WebGPU errors are a depth
+texture view missing a usage flag (`dissolve`, `tri-z-eq`), a shader reading
+more of a uniform buffer than its layout declares (`blinking-teapot`), a
+filtering sampler bound where the layout says non-filtering (`vert-tex`), and
+an overlapping copy (`readpix`) -- four distinct bugs, all still ours.
