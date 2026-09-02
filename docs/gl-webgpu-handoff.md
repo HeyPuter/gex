@@ -8181,3 +8181,254 @@ rather than necessarily called), the eight GLX surface types (pbuffers,
 pixmaps, `glXUseXFont` -- a *different kind of drawable*, which this stack
 does not have), and `looking-glass-client`'s `glGetTexEnviv`. No ordinary GL
 application is blocked on a missing entry point any more.
+
+## Wide points: glPointSize, sprites and smoothing (2026-09-02)
+
+A WebGPU point is one pixel, and WGSL has no `point_size` builtin -- Tint
+refuses `SpvBuiltInPointSize` outright, so the driver dropped the
+`gl_PointSize` store and reported `max_point_size = 1.0`. glPointSize did
+nothing at all.
+
+That was the largest remaining hole in the pixel comparison. `spriteblast`
+(RMSE 0.257) and `points` (0.214) were the two most divergent programs in the
+whole 253-program sweep, and for the obvious reason: a particle system drawn
+as single pixels shares no structure with the same particle system drawn as
+sprites.
+
+### The shape of the expansion
+
+A point becomes a quad. The interesting part is where the quad's corners come
+from, because WebGPU's vertex fetch offers exactly two indices --
+`vertex_index` and `instance_index` -- and a triangle is three *consecutive
+vertices of one instance*. So the corners must vary along the vertex index,
+which means the per-point data has to vary along the instance one:
+
+- every vertex buffer is rebound with `stepMode: instance`;
+- the draw becomes `draw(6, count, 0, first)` -- six vertices, one instance
+  per point, `firstInstance` carrying the draw's start;
+- a seventh vertex buffer holds six `vec4` corner records, uploaded per draw
+  through the stream uploader.
+
+`firstInstance` doing double duty is what keeps `gl_VertexID` working: WGSL's
+`instance_index` counts from `firstInstance`, so it *is* `gl_VertexID`, and
+the pass rewrites `load_vertex_id` to `load_instance_id` (and `gl_InstanceID`
+to zero).
+
+**Indexed point draws cannot take this road**, and that is structural rather
+than unfinished: the index buffer would have to index the instance dimension
+and WebGPU indexes only the vertex one. Those still draw as single pixels.
+Same for an instanced point draw and for one with per-instance attributes.
+`GEX_WGPU_POINT_LOG=1` prints the decision and the reason for every point
+draw; a refusal also says so once on stderr.
+
+### The offset, and why it is scaled on the CPU
+
+The corner record carries `(dx, dy, s, t)` with the offset **already scaled**,
+so the shader is two `ffma`s: `position.xy += corner.xy * position.w`. The
+scale is `2 * size / viewport`, because clip space spans 2 across the
+viewport.
+
+It is the *viewport*, not the framebuffer, even when the clipped-viewport fold
+is active -- the fold multiplies x by `viewport/framebuffer`, so an offset
+expressed against the viewport comes out right either way. That is why the
+pass runs *before* `gex_wgpu_lower_viewport_transform`, and why the probe has
+a half-viewport case: a driver that divided by the framebuffer passes the
+whole-viewport case and fails that one.
+
+With `gl_PointSize` written per vertex the record carries `2/viewport` alone
+and the shader multiplies by the shader's own value.
+
+### Two ordering traps
+
+**The point size is not known at the position store.** st/mesa emits its
+output stores in slot order, and `VARYING_SLOT_PSIZ` (2) comes *after*
+`VARYING_SLOT_POS` (0) -- so reading a stashed `gl_PointSize` at the position
+store gets the 1.0 the temporary was initialised with. `point-param`'s
+attenuated points and `spriteblast`'s sprites came out expanded and one pixel
+across. The fix is to leave the position store alone, stash its value, and
+store `gl_Position` a *second* time after every store the shader makes. The
+last store wins, and the viewport fold that runs later rewrites both.
+
+**gl_PointCoord cannot live at VARYING_SLOT_PNTC.** `ntv_shader_prepare`
+recomputes every varying's `driver_location`, and so its WGSL `@location`, as
+
+    location >= VARYING_SLOT_VAR0 ? location - VARYING_SLOT_VAR0 : location
+
+PNTC is 25 under that rule, past WebGPU's sixteen inter-stage locations:
+
+    Vertex output variable "<retval>.gex_point_coord_1" has a location (25)
+    that is too large. It should be less than (16).
+
+So the sprite coordinate rides a `VARYING_SLOT_VAR0 + n` slot, with `n` the
+lowest *effective* @location neither stage uses -- effective, because
+`gl_TexCoord[0]` is slot 4 and lands on `@location(4)`, so counting VAR slots
+alone would collide with it.
+
+### Three bugs behind one gradient
+
+Getting the geometry right took one pass. Getting `gl_PointCoord` right took
+three more fixes, and all three had the same signature -- a solid square of
+one colour, which looks like a correctly expanded point until you check the
+colours:
+
+1. **`reads_point_coord` read the wrong thing.** `info.system_values_read`
+   does not carry gl_PointCoord, so the bit stayed clear on a shader that
+   plainly reads it and every expanded point got the single-pixel centre. It
+   is scanned for now.
+
+2. **The fragment variant was built but not reached.** `gex_wgpu_fragment_module`
+   has an early return for a shader with no texture, no retype, no coord
+   replace, no unproduced input and no stipple -- and `pointcoord` is exactly
+   that shape, so it got the base module whose gl_PointCoord is the constant
+   0.5. Worth remembering as a category: *the variant is built* and *the
+   variant is reached* are separate claims.
+
+3. **The unproduced-input pass zeroed the driver's own varying.** It runs
+   after the substitution, cannot tell one `shader_in` from another, and the
+   base vertex shader's `varying_interp_mask` naturally does not mention a
+   varying the *variant* writes -- so the sprite coordinate came out (0, 0)
+   everywhere. Only shaders that *had* an unproduced input were affected,
+   which is why a shader reading gl_PointCoord and nothing else was already
+   right by then. The coord's slot is now added to `produced`.
+
+GL_COORD_REPLACE needed one more thing: it has to be applied whether or not
+the vertex stage writes the texcoord it replaces. It used to ride on the
+unproduced-input substitution, which only fires where nothing produces the
+varying -- and st/mesa's fixed-function vertex shader writes `gl_TexCoord[0]`
+as a matter of course. With a one-pixel point that was invisible, because the
+sprite coordinate was the constant (0.5, 0.5) either way.
+
+### GL_POINT_SMOOTH
+
+A round point rather than a square one, done as a discard where the sprite
+coordinate is more than 0.5 from the centre. GL's own antialiasing turns
+coverage into alpha; this gets the *shape*, which is the whole of the
+difference against llvmpipe for the opaque dots `points` and
+`point-wide-smooth` draw, and gives up the one-pixel soft edge. Alpha
+modulation would mean rewriting the fragment stage's colour outputs and would
+only show where the program also blends.
+
+### What it measures
+
+`tests/gl44-probe.sh point` is the gate: extent on a full and a half
+viewport, the sprite coordinate's gradient *and its orientation*, a
+shader-written `gl_PointSize` with two different sizes in one draw, per-point
+attributes from a vertex array (which is what says the vertex/instance
+inversion is wired up), a size-1 point that must stay one pixel, and
+GL_COORD_REPLACE through a 2x2 texture. 8/8 natively and in the browser, with
+every `INFO` line byte-identical to llvmpipe's -- including the four quadrant
+colours.
+
+Against llvmpipe, on the programs that draw points:
+
+| program           | before | after   |
+|-------------------|--------|---------|
+| point-sprite      | 0.105  | **0**   |
+| points            | 0.214  | 0.00007 |
+| point-wide-smooth | 0.041  | 0.009   |
+| pointcoord        | 0.065  | 0.016   |
+| point-param       | 0.104  | 0.017   |
+| point-wide        | 0.048  | 0.024   |
+| spriteblast       | 0.257  | 0.039   |
+
+`spriteblast` animates, so its remainder is phase. `tri-point-line-clipped`
+is unchanged at 0.069 and is about line clipping, not points.
+
+`caps->max_point_size` is now 255, matching llvmpipe -- with it left at 1.0
+st/mesa clamped every size before the driver ever saw it.
+
+Two diagnostics, both env-gated and both worth reaching for first next time:
+`GEX_WGPU_POINT_LOG=1` prints each point draw's count, size, size source,
+viewport, whether the fragment stage reads the sprite coordinate, the
+GL_COORD_REPLACE mask and the decision; it also prints each *unproduced*
+fragment input's slot, which is how bug 3 above was finally named.
+`GEX_WGPU_POINT_NIR=1` prints the vertex and fragment variants of the first
+few expanded point draws. The fragment variant's NIR is what settled bug 3:
+the texcoord read had been folded to `load_const (0, 0)`, and only the slot
+in the log said which variable that came from.
+
+### One thing the point probe measured and did not fix
+
+A *one-pixel* point does not go through the expansion, and at exactly integral
+window coordinates it lands one pixel low and left of where GL puts it. The
+probe's own log says so:
+
+    llvmpipe   INFO single box=16,16..16,16
+    gex_wgpu   INFO single box=15,15..15,15
+
+GL specifies the covered fragment as `floor(x_w), floor(y_w)`, and
+`floor(16.0)` is 16. WebGPU rasterises a point as a 1x1 square centred on the
+vertex, whose edges then fall exactly on the pixel centres at 15.5 and 16.5,
+and the fill rule takes the lower one. Away from integers the two agree --
+`floor(16.3)` and `floor(16.7)` are both 16, and the 1x1 square contains only
+pixel centre 16.5 in both cases -- so this is a tie-break at exact integers
+and nothing more. The expanded path does not have it: an 8-pixel point at the
+same place gives `box=12,12..19,19` on both.
+
+It is worth knowing about because it is a candidate for the residual
+`KHR-GL33.primitive_restart.restart_mode` failure, whose remaining
+disagreement is "POINTS, LINES and LINE_STRIP spot positions" while every
+triangle topology passes -- and CTS spot checks are exactly the kind of code
+that lands on integral coordinates. Five explanations for that failure have
+already been ruled out (see the gl33-cts-landscape notes); this is a sixth and
+has not been tested against it.
+
+The fix, if it turns out to matter, is a sub-pixel nudge rather than more
+geometry: shifting the point draw's window origin up by a fraction of a pixel
+breaks the tie the way `floor` does, and leaves non-integral coordinates
+alone. It cannot go through `setViewport`, because WebGPU requires the
+viewport rectangle to lie inside the attachment and the common case fills it
+exactly -- so it would reuse the clipped-viewport fold, which already puts an
+affine window transform into the vertex shader. That costs one cached vertex
+variant per shader that draws one-pixel points. Not attempted, because the
+thing it might fix has not been shown to depend on it.
+
+### Lines are the same trick, and are the next thing worth doing
+
+With the point expansion in place, the remaining refusals in the app sweep
+fall into five clusters, and the largest is lines:
+
+| cluster                    | programs | note |
+|----------------------------|----------|------|
+| line stipple               | 6 | `line_stipple_enable` refused |
+| front != back polygon mode | 7 | not implementable, documented above |
+| line smooth                | 2 | `line_smooth` refused |
+| logic op                   | 2 | WGSL has none |
+
+WebGPU draws every line one pixel wide, has no stipple and no line
+antialiasing -- the same three holes points had, and all three want the same
+thing: a quad over the line, whose orientation depends on the line's
+*direction* and therefore on **both** endpoints.
+
+Getting both endpoints' attributes into one invocation is easy, and is the
+part that generalises from the point work: for `LINES`, instance *i* wants
+vertices *2i* and *2i+1*, and for `LINE_STRIP` it wants *i* and *i+1*. Both
+are expressible by binding the same vertex buffer to **two** instance-step
+slots, with `arrayStride` 2x or 1x the vertex stride and the second slot's
+offset one vertex further in.
+
+**The hard part is that attributes are not positions.** A quad needs both
+endpoints' *clip-space* positions, and the vertex shader computes one
+position from one set of attributes -- so it would have to run its whole
+transform twice with the two attribute sets, which means duplicating every
+input and cloning the position computation. That is a different order of NIR
+surgery from the point pass, which only had to add an offset to a position the
+shader had already computed.
+
+Two routes that avoid the duplication, both bigger than the point work:
+
+- **Reuse the geometry-shader path.** The driver already runs a vertex shader
+  as a *compute* pass that writes its varyings to a buffer
+  (`gex_wgpu_gs_draw` and the `varying_nir` variants, built for geometry
+  shader support). A line pass could read two transformed vertices out of that
+  buffer per instance and build the quad from them, with no shader
+  duplication at all. This is the principled route.
+- **A brush approximation.** GL 4.6 §14.5.1 defines a non-antialiased
+  width-*w* line as *w* copies of the line offset along its *minor* axis, so
+  drawing the line *w* times with a sub-pixel window offset would be close --
+  and a square brush (offsets in both axes) would over-draw the ends of
+  diagonal lines. Cheap, approximate, and it would need to be documented as
+  approximate. It does nothing for stipple.
+
+`caps->max_line_width` is 1.0 for the same reason `max_point_size` was, and
+should only be raised together with whichever of these lands.
