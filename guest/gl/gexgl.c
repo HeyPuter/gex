@@ -2339,17 +2339,36 @@ void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
     (void)dpy; (void)config; (void)share;
     egl_context_major = egl_api == 0x30A2u ? 4 : 3;
     egl_context_minor = egl_api == 0x30A2u ? 4 : 0;
+    int asked_version = 0, asked_profile = 0;
     if (attrs) {
         for (const int *a = attrs; *a != 0x3038; a += 2) {
-            if (a[0] == 0x3098) egl_context_major = a[1];
+            if (a[0] == 0x3098) { egl_context_major = a[1]; asked_version = 1; }
             else if (a[0] == 0x30FB) egl_context_minor = a[1];
             /* EGL_CONTEXT_OPENGL_PROFILE_MASK, which EGL 1.5 defines and this
-               used to ignore: bit 0 is core, bit 1 compatibility. Core stays
-               the default, as EGL specifies, so this only ever widens what an
-               application can ask for. */
-            else if (a[0] == 0x30FD) egl_context_profile = (a[1] & 0x2) ? 1 : 0;
+               used to ignore: bit 0 is core, bit 1 compatibility. */
+            else if (a[0] == 0x30FD) {
+                egl_context_profile = (a[1] & 0x2) ? 1 : 0;
+                asked_profile = 1;
+            }
         }
     }
+    /* An application that names no version gets a compatibility profile.
+     *
+       EGL's profile mask only means anything for a requested version of 3.2 or
+       later; below that the profile is not selectable and desktop GL gives the
+       compatibility one. EGL_CONTEXT_MAJOR_VERSION itself defaults to 1, so an
+       empty attribute list is a request for GL 1.0 -- which is why native Mesa
+       answers one with 4.6 Compatibility.
+
+       This defaulted to core instead, and the difference is not academic: a
+       core profile has no default vertex array object and no legacy GLSL, so
+       GL2-era code that names no version had `shadow2D` rejected and every
+       draw dropped before the driver saw it. An application that does name
+       3.2 or later, or that names a profile mask, is left exactly as it was. */
+    if (egl_api == 0x30A2u && !asked_profile &&
+        (!asked_version || egl_context_major < 3 ||
+         (egl_context_major == 3 && egl_context_minor < 2)))
+        egl_context_profile = 1;
     context_create();
     return (void *)3;
 }

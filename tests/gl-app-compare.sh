@@ -54,9 +54,20 @@ shoot() {
           timeout -s KILL $((DELAY + 10)) "$app" >"$out.log" 2>&1 & )
     fi
     sleep "$DELAY"
+    # The largest window, not the first. With no window manager the root's
+    # children are in stacking order, and a program that makes a small helper
+    # window first would be photographed through it -- as would any window a
+    # previous program left behind. Area is the one property that identifies
+    # the window being rendered into.
     local window
-    window=$(xwininfo -root -children 2>/dev/null \
-             | sed -n 's/^ *\(0x[0-9a-f]*\) .*[0-9]\+x[0-9]\++.*/\1/p' | head -1)
+    window=$(xwininfo -root -children 2>/dev/null | awk '
+        match($0, /^ *(0x[0-9a-f]+) /, id) {
+            if (match($0, /([0-9]+)x([0-9]+)\+/, wh)) {
+                area = wh[1] * wh[2]
+                if (area > best) { best = area; pick = id[1] }
+            }
+        }
+        END { if (pick != "") print pick }')
     [ -n "$window" ] || return 1
     import -window "$window" "$out" 2>/dev/null || return 1
     [ -s "$out" ]

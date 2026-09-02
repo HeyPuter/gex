@@ -7503,3 +7503,45 @@ The guest's EGL handing out a core profile where the same driver natively
 hands out compatibility is worth knowing about on its own: it is why the probe
 carries both shader spellings, and any compatibility-only construct an
 application uses will meet it.
+
+
+## Three smaller things the shadow work turned up (2026-09-02)
+
+Each of these is the same shape as one of the five above: a stand-in or a gate
+that was stricter than GL, refusing something GL defines.
+
+**A vertex-stage sampled slot with no sampler state declined the draw.**
+`gex_wgpu_interp_variant_get` returned NULL for `!view || (uses_sampler &&
+!sampler)`, while the fragment stage has always served an unbound sampler
+state with a default sampler -- and st/mesa really does bind a view without
+sampler state for a unit it reads through a display path, which is what the
+depth-as-float relaxation had to learn. A missing *view* still declines, since
+there is nothing to sample. The vertex texture bind group also serves the
+default non-filtering sampler now instead of binding NULL, and
+`bind_groups[3]` joined the `bind_failed` check: it was left out, so a
+vertex-texture bind group that failed to build was bound as NULL and the draw
+went ahead reading nothing.
+
+**A viewport with no area failed the context.** `glViewport(x, y, 0, h)` is
+legal GL and draws nothing; `wincopy` asks for it, arriving as
+`scale=0,-0 translate=0,300` -- which the all-zero "no viewport yet" case does
+not catch, because the translate is not zero. `create_viewport_state` refused
+it and `gex_fail`ed the context, costing every later call in it. Zero is now
+accepted on either axis and the draw path declines the draw, which is the
+whole of what the viewport means. The draw path already had a degenerate-
+viewport check, but only inside the branch for a viewport reaching *outside*
+the framebuffer, so a zero-area one that fits inside went to `setViewport`
+instead; it is now checked first.
+
+**An application that names no GL version gets a compatibility profile.**
+EGL's profile mask only means anything for a requested version of 3.2 or
+later, and `EGL_CONTEXT_MAJOR_VERSION` itself defaults to 1 -- so an empty
+attribute list is a request for GL 1.0, which is why native Mesa answers one
+with 4.6 Compatibility. The guest's EGL defaulted to core instead, and the
+difference is not academic: a core profile has no default vertex array object
+and no legacy GLSL, so GL2-era code that names no version has `shadow2D`
+rejected and every draw dropped before the driver sees it. An application that
+does name 3.2 or later, or that names a profile mask, is unchanged.
+
+This is also why `tests/gl44-probe.sh shadow` carries both shader spellings:
+until this, the same probe saw Compatibility natively and Core in the browser.
