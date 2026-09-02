@@ -2506,6 +2506,22 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // 64-bit code).
             if let Some(memory) = caller.data().memory.clone() {
                 let gm = GuestMem::new(memory.bytes());
+                if std::env::var_os("GEX_MISS_LOOP").is_some() {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static LAST: AtomicU64 = AtomicU64::new(0);
+                    static COUNT: AtomicU64 = AtomicU64::new(0);
+                    if LAST.swap(pc, Ordering::Relaxed) == pc {
+                        let n = COUNT.fetch_add(1, Ordering::Relaxed);
+                        if n < 4 {
+                            let ca = ctx as u32 as u64;
+                            let lt = gm.read_u64(ca + gex_abi::ctx::LAST_TARGET as u64).unwrap_or(0);
+                            let ls = gm.read_u64(ca + gex_abi::ctx::LAST_SOURCE as u64).unwrap_or(0);
+                            eprintln!("[loop] pc={pc:#x} LAST_TARGET={lt:#x} LAST_SOURCE={ls:#x}");
+                        }
+                    } else {
+                        COUNT.store(0, Ordering::Relaxed);
+                    }
+                }
                 let cs = gex_kernel::x86::selector(&gm, ctx as u32 as u64, gex_kernel::x86::SEG_CS);
                 gex_xlate::set_thread_mode(if cs == 0 {
                     None
