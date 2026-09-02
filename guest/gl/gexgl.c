@@ -188,10 +188,29 @@ static void flush(void) {
         static int said;
         if (!said) {
             said = 1;
+            /* Named, with what to do about it. The commonest cause by far is
+               a host module older than this library: the page's wasm is a
+               build artifact and this library is shipped with the image, so
+               they drift apart every time the protocol grows -- and what a
+               person sees is a black window, with no reason to suspect a
+               build. */
+            const char *why =
+                ring->status == 5u
+                    ? "the host's GL module speaks a different protocol"
+                      " version -- rebuild the page's wasm modules"
+                : ring->status == 2u
+                    ? "the host does not know one of these commands -- its GL"
+                      " module is older than this library"
+                : ring->status == 1u ? "the batch was truncated"
+                : ring->status == 3u ? "an argument the host would not take"
+                : ring->status == 4u ? "there is no GL context"
+                : "no reason given";
             fprintf(stderr,
-                    "gexgl: submit failed, discarding %u queued bytes "
-                    "(status %u) -- GL commands are being lost\n",
-                    ring->tail, ring->status);
+                    "gexgl: submit failed, discarding %u queued bytes -- GL"
+                    " commands are being lost\n"
+                    "gexgl: status %u: %s (this library speaks protocol %u)\n",
+                    ring->tail, ring->status, why,
+                    (unsigned)GEXGL_PROTOCOL_VERSION);
         }
         ring->tail = 0;
         ring->reply_len = 0;
