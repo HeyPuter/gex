@@ -6652,6 +6652,11 @@ staged-map comment is stale, not the code.)
 
 ### The scene was the staged write-map path
 
+> **Superseded.** The scoping described here was the right first move but it
+> was not the cause. See "The mechanism, found" at the end of this section --
+> it is a one-line invariant violation, and with it fixed the optimisation
+> below is restored in full.
+
 `GEX_WGPU_NO_STAGED_MAP=1` -- added to answer a different question -- renders
 STK's scene completely and correctly, matching llvmpipe at GL 3.3. So the
 fault is in the staged write map, and the bisection above is explained: every
@@ -6764,7 +6769,69 @@ synchronises it**, and the one that read the buffers back is therefore not
 observing the failing state. The readback says the bytes are right; it cannot
 say they were right before it forced a sync.
 
-So the next step is not more instrumentation inside the driver. It is a
-non-perturbing capture of what Dawn is actually told -- its own API trace or a
-capture layer -- run once in each configuration and diffed. Everything
-reachable from inside the driver has been tried.
+That conclusion was wrong, and usefully so: it confused "every probe that
+reads GPU state synchronises" with "nothing inside the driver can see this".
+What had never been written was a log of the *commands* -- which is pure
+`fprintf` and perturbs nothing at all. That is what found it.
+
+### The mechanism, found
+
+`gex_wgpu_shadow_for_read` only reads a buffer back off the GPU when it
+believes the buffer holds something:
+
+```c
+const bool needs_contents = gex->bytes_written != 0 || gex->gpu_written;
+```
+
+Two paths in this driver write a buffer while bypassing its shadow.
+`gex_wgpu_buffer_subdata`'s direct path keeps the invariant that makes the
+line above true -- it counts the bytes it wrote. **The staged map upload did
+not.** So a buffer written only through staged maps looked empty, and the next
+thing to need a shadow was handed a freshly *zeroed* one instead of the
+buffer's real contents.
+
+`transfer_flush_region` then uploads **from** the shadow -- 291,926 times in a
+SuperTuxKart run, because that buffer is how STK streams its scene meshes. It
+wrote those zeros back over the mesh. Every vertex collapsed onto the origin,
+so the scene did not rasterise, while the skybox and the HUD -- on other
+buffers -- still did.
+
+The fix is one line in each of the two staged upload sites:
+
+```c
+gex->bytes_written += (uint64_t)transfer->box.width;
+```
+
+With it, `PIPE_MAP_DISCARD_WHOLE_RESOURCE` is staged again and the memory
+optimisation is back in full. STK renders correctly and Minecraft's crowd
+scene runs at 64.6-69.2 fps, better than with the scoping workaround.
+
+### Why it took so long, which is the transferable part
+
+Nothing about the upload was ever wrong. That is why checksumming every
+upload, reading the buffers back off the GPU at draw time, and diffing the
+entire command stream all showed two identical runs -- the corruption happened
+*later*, from a different code path, sourcing from a copy that had quietly
+been declared empty.
+
+Three of the instruments were actively misleading, and each in a way worth
+recognising again:
+
+* **A window that misses the event.** The first upload log covered the first
+  sixty uploads, which are all loading, and concluded the two paths were
+  identical without having looked at a single per-frame write.
+* **Normalisation that erases the signal.** Diffing two runs meant mapping
+  pointers to symbolic ids -- and `sed 's/0x[0-9a-f]*/P/g'` collapses *every*
+  pointer to one token, so "a different buffer is bound" and "the same buffer
+  is bound" look identical. Comparing by stable identity (a buffer's
+  `width0`, a texture's size and format, a dynamic offset's value) is what
+  makes a cross-run diff mean anything.
+* **A probe that changes what it measures.** Reading a buffer back requires a
+  submit and a wait, so it reports the state *after* forcing a
+  synchronisation, not the state the failing draw saw.
+
+The bisection that actually cracked it asked a question none of those could:
+staged with **no** shadow fails, staged with a **stale** shadow fails, staged
+with a **current** shadow works. That isolates "something reads the shadow and
+needs it up to date" in three runs, and from there the reader is one grep
+away.
