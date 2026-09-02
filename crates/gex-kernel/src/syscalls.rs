@@ -786,10 +786,20 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
                     .find(|(fd, _)| *fd == p.fd)
                     .map(|(_, d)| *d)
                     .unwrap_or(0);
-                let at = out + n * 16;
-                m.write_u32(at, r as u32)?;
-                m.write_u32(at + 4, 0)?;
-                m.write_u64(at + 8, token)?;
+                // The same layout `write_epoll_events` uses: packed 12 bytes
+                // on x86-64 (the token at offset four), 16 on aarch64. Xvfb
+                // read its `data.ptr` from the wrong offset after every wait
+                // that had to block, and dereferenced the mask.
+                if gex_abi::X86 {
+                    let at = out + n * 12;
+                    m.write_u32(at, r as u32)?;
+                    m.write_u64(at + 4, token)?;
+                } else {
+                    let at = out + n * 16;
+                    m.write_u32(at, r as u32)?;
+                    m.write_u32(at + 4, 0)?;
+                    m.write_u64(at + 8, token)?;
+                }
                 n += 1;
             }
             Ok(n)

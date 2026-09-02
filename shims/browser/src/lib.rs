@@ -5312,9 +5312,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             gm.read_u64(base + ctx::x(30) as u64).unwrap_or(0)
         };
         let caller = with_host(|h| object_off_at(h, ret));
+        // An unknown call shows its raw number: "unknown" alone cannot be looked up.
+        let raw_nr = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
+        let name = match gex_kernel::syscalls::syscall_name(n) {
+            "unknown" => format!("unknown#{raw_nr}"),
+            s => s.to_string(),
+        };
         warn_line(&format!(
             "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{obj} <-{}  ...\n",
-            gex_kernel::syscalls::syscall_name(n),
+            name,
             g(0),
             g(1),
             g(2),
