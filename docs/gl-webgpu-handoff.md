@@ -6951,3 +6951,54 @@ pulled towards the viewer and can only lose if it was pushed away. The third
 case is the control -- offset disabled, equal depth, second quad rejected --
 without which a driver that ignored the offset entirely would still pass the
 first case.
+
+### The crashes that were left, and gl_FrontFacing
+
+After the location fix, 17 crashes remained. Triaging them the same way --
+what did the driver refuse first -- said **15 had no driver refusal at all**,
+and reading their own output explains why: `weston-simple-*` and
+`weston-subsurfaces` want a Wayland display, `hyprland` and
+`looking-glass-client` are not GL demos, `eglkms` wants KMS, `glxpixmap`,
+`MaterialXView` and `moonlight` fail GLX/EGL context creation, and `glsync`
+prints "GLX_SGI_video_sync not supported, exiting" and leaves. None of those
+is this driver's.
+
+Two were. `twoside` died inside the borrowed SPIR-V emitter:
+
+```
+nir_to_spirv.c:1821: get_alu_src: Assertion `!"bool should have bit-size 1"' failed
+```
+
+**A wide boolean reaching get_alu_src.** NIR's own booleans are 1-bit, but a
+TGSI-derived shader carries 32-bit ones and narrows them with `b2b1` -- and
+`emit_alu`'s case for that op already knows how to read a wide source,
+comparing it against zero. It never got the chance, because `get_alu_src`
+runs first and aborted. It now hands the raw value back and lets the op
+convert, which is the same trade the `b2b1` case was written for: a shader
+Tint refuses fails one program, an abort takes the whole application down.
+
+**gl_FrontFacing was declared uint.** Past that abort, the same shader could
+still not link:
+
+```
+[VUID-FrontFacing-FrontFacing-04231] According to the Vulkan spec BuiltIn
+FrontFacing variable needs to be a bool scalar.
+  %gl_FrontFacing = OpVariable %_ptr_Input_uint Input
+```
+
+`tgsi_to_nir` represents `TGSI_SEMANTIC_FACE` either as `nir_load_front_face`
+or as an ordinary fragment input variable, and the choice is
+`screen->caps.fs_face_is_integer_sysval`. Left false, the emitter decorated
+that input variable `BuiltIn FrontFacing` while giving it the variable's own
+uint type, which SPIR-V does not allow. zink sets the cap true, and this
+driver borrows zink's emitter, so it should have too. With it set the shader
+reaches `emit_load_front_face`, which builds the builtin as a bool.
+
+st/mesa builds two-sided lighting through ureg, so this was the whole of
+`twoside`. It also removes the `light_twoside` rasterizer refusals: with
+FrontFacing available as a system value, st/mesa resolves two-sided lighting
+in the shader and stops asking the rasterizer for it.
+
+The cap also sets `GLSLFrontFacingIsSysVal`, so it changes the GLSL path as
+well as the TGSI one -- which is why it is worth more than the one program it
+was found by, and why it wants the CTS sweep rather than a spot check.
