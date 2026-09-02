@@ -1005,6 +1005,11 @@ pub struct Block {
     /// `blr`). Not a control-flow successor, but an entry point the callee's
     /// `ret` branches to; without it code discovery misses every return site.
     pub call_return: Option<u64>,
+    /// The code bytes this block was lifted from, when its page is writable as
+    /// well as executable (a JIT's). The emitter compares them at every entry
+    /// and re-lifts the page when they have changed: x86-64 has no cache-flush
+    /// instruction to announce self-modifying code, so the block checks itself.
+    pub guard: Option<Vec<u8>>,
 }
 
 impl Block {
@@ -1016,6 +1021,7 @@ impl Block {
             term: Term::Goto { target: start },
             n_values: 0,
             call_return: None,
+            guard: None,
         }
     }
 

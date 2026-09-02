@@ -817,10 +817,112 @@ impl<'a> Lifter<'a> {
             | Op::Fsincos
             | Op::Fsin
             | Op::Fcos
-            | Op::Fldenv
-            | Op::Fnstenv
             | Op::Frstor
             | Op::Fnsave => return self.illegal_x87(),
+            // The x87 environment, 28 bytes in the 32-bit protected-mode
+            // layout glibc's fenv.h expects: control word, status word, tag
+            // word, then the instruction/operand pointers (stored as zero, as
+            // a real CPU stores nothing meaningful after `fninit`). `fnstenv`
+            // also masks every exception in the live control word, which
+            // `feholdexcept` relies on. Tags here are one valid bit per
+            // register; the tag word is two bits per register, 11 = empty.
+            Op::Fnstenv | Op::Fldenv => {
+                let Operand::Mem(m) = i.op0() else { return self.illegal_x87() };
+                let (addr, off) = self.addr(&m);
+                let addr = self.offset_addr(addr, off);
+                let st32 = |this: &mut Self, offset: i64, val: Value| {
+                    this.b.stmt(Stmt::Store { addr, offset, val, sz: MemSz::B4, order: Order::Relaxed });
+                };
+                if i.op == Op::Fnstenv {
+                    let cw = self.b.read(GuestReg::X87Cw);
+                    let hi = self.k32(0xffff_0000);
+                    let cwv = self.b.bin(BinOp::Or, Ty::I32, cw, hi);
+                    st32(self, 0, cwv);
+                    let sw = self.b.read(GuestReg::X87Sw);
+                    let m = self.k32(!0x3800u32);
+                    let sw = self.b.bin(BinOp::And, Ty::I32, sw, m);
+                    let top = self.top();
+                    let eleven = self.k32(11);
+                    let t = self.b.bin(BinOp::Shl, Ty::I32, top, eleven);
+                    let sw = self.b.bin(BinOp::Or, Ty::I32, sw, t);
+                    let swv = self.b.bin(BinOp::Or, Ty::I32, sw, hi);
+                    st32(self, 4, swv);
+                    // Spread the 8 valid bits to 16 (each bit doubled), then
+                    // invert: valid -> 00, empty -> 11.
+                    let tags = self.b.read(GuestReg::X87Tags);
+                    let m8 = self.k32(0xff);
+                    let x = self.b.bin(BinOp::And, Ty::I32, tags, m8);
+                    let four = self.k32(4);
+                    let s4 = self.b.bin(BinOp::Shl, Ty::I32, x, four);
+                    let x = self.b.bin(BinOp::Or, Ty::I32, x, s4);
+                    let m0f = self.k32(0x0f0f);
+                    let x = self.b.bin(BinOp::And, Ty::I32, x, m0f);
+                    let two = self.k32(2);
+                    let s2 = self.b.bin(BinOp::Shl, Ty::I32, x, two);
+                    let x = self.b.bin(BinOp::Or, Ty::I32, x, s2);
+                    let m33 = self.k32(0x3333);
+                    let x = self.b.bin(BinOp::And, Ty::I32, x, m33);
+                    let one = self.k32(1);
+                    let s1 = self.b.bin(BinOp::Shl, Ty::I32, x, one);
+                    let x = self.b.bin(BinOp::Or, Ty::I32, x, s1);
+                    let m55 = self.k32(0x5555);
+                    let x = self.b.bin(BinOp::And, Ty::I32, x, m55);
+                    let s1 = self.b.bin(BinOp::Shl, Ty::I32, x, one);
+                    let x = self.b.bin(BinOp::Or, Ty::I32, x, s1);
+                    let all = self.k32(0xffff);
+                    let tw = self.b.bin(BinOp::Xor, Ty::I32, x, all);
+                    let twv = self.b.bin(BinOp::Or, Ty::I32, tw, hi);
+                    st32(self, 8, twv);
+                    let zero = self.k32(0);
+                    st32(self, 12, zero);
+                    st32(self, 16, zero);
+                    st32(self, 20, zero);
+                    st32(self, 24, zero);
+                    // Then mask all exceptions.
+                    let m3f = self.k32(0x3f);
+                    let cw2 = self.b.bin(BinOp::Or, Ty::I32, cw, m3f);
+                    self.b.write(GuestReg::X87Cw, cw2);
+                } else {
+                    let ld16 = |this: &mut Self, offset: i64| {
+                        this.b.def(Expr::Load { addr, offset, sz: MemSz::B2, signed: false, ty: Ty::I32, order: Order::Relaxed })
+                    };
+                    let cw = ld16(self, 0);
+                    self.b.write(GuestReg::X87Cw, cw);
+                    let sw = ld16(self, 4);
+                    let eleven = self.k32(11);
+                    let t = self.b.bin(BinOp::ShrU, Ty::I32, sw, eleven);
+                    let seven = self.k32(7);
+                    let top = self.b.bin(BinOp::And, Ty::I32, t, seven);
+                    self.set_top(top);
+                    let m = self.k32(!0x3800u32);
+                    let sw = self.b.bin(BinOp::And, Ty::I32, sw, m);
+                    self.b.write(GuestReg::X87Sw, sw);
+                    // Tag word -> valid bits: a register is valid when its two
+                    // tag bits are not both set. Compress the even bits to 8.
+                    let tw = ld16(self, 8);
+                    let one = self.k32(1);
+                    let hi1 = self.b.bin(BinOp::ShrU, Ty::I32, tw, one);
+                    let both = self.b.bin(BinOp::And, Ty::I32, tw, hi1);
+                    let nb = self.b.un(UnOp::Not, Ty::I32, both);
+                    let m55 = self.k32(0x5555);
+                    let v = self.b.bin(BinOp::And, Ty::I32, nb, m55);
+                    let s1 = self.b.bin(BinOp::ShrU, Ty::I32, v, one);
+                    let v = self.b.bin(BinOp::Or, Ty::I32, v, s1);
+                    let m33 = self.k32(0x3333);
+                    let v = self.b.bin(BinOp::And, Ty::I32, v, m33);
+                    let two = self.k32(2);
+                    let s2 = self.b.bin(BinOp::ShrU, Ty::I32, v, two);
+                    let v = self.b.bin(BinOp::Or, Ty::I32, v, s2);
+                    let m0f = self.k32(0x0f0f);
+                    let v = self.b.bin(BinOp::And, Ty::I32, v, m0f);
+                    let four = self.k32(4);
+                    let s4 = self.b.bin(BinOp::ShrU, Ty::I32, v, four);
+                    let v = self.b.bin(BinOp::Or, Ty::I32, v, s4);
+                    let m8 = self.k32(0xff);
+                    let v = self.b.bin(BinOp::And, Ty::I32, v, m8);
+                    self.b.write(GuestReg::X87Tags, v);
+                }
+            }
             _ => return self.illegal_x87(),
         }
         Flow::Next

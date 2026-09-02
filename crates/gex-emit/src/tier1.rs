@@ -256,7 +256,7 @@ fn trap_pc() -> u64 {
 /// immediates without decoding the stream; they are written at a fixed width so
 /// a patch cannot change a body's length.
 pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32>) {
-    let mut e = Emitter::new(cx);
+    let mut e = Emitter::new(cx, block.start);
     if check_sp() {
         e.emit_sp_check(block.start);
     }
@@ -265,13 +265,16 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     }
     if trace_blocks() {
         e.emit_trace_point(block.start);
+    }
+    if let Some(g) = &block.guard {
+        e.emit_guard(block.start, g);
     }
     run_one(&mut e, block);
     e.f.finish_with_relocs()
 }
 
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
-    let mut e = Emitter::new(cx);
+    let mut e = Emitter::new(cx, block.start);
     if check_sp() {
         e.emit_sp_check(block.start);
     }
@@ -280,6 +283,9 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     }
     if trace_blocks() {
         e.emit_trace_point(block.start);
+    }
+    if let Some(g) = &block.guard {
+        e.emit_guard(block.start, g);
     }
     run_one(&mut e, block);
     e.f.finish()
@@ -316,6 +322,8 @@ struct Emitter<'a> {
     cx: &'a Context<'a>,
     /// The `ctx` parameter.
     ctx_local: u32,
+    /// The guest address this block starts at, for `ctx::LAST_SOURCE`.
+    block_start: u64,
     /// Scratch for address computation.
     scratch_i64: u32,
     /// Scratch for the safepoint counter.
@@ -369,7 +377,7 @@ struct RegionState {
 }
 
 impl<'a> Emitter<'a> {
-    fn new(cx: &'a Context<'a>) -> Emitter<'a> {
+    fn new(cx: &'a Context<'a>, block_start: u64) -> Emitter<'a> {
         let mut f = FuncBody::new(1);
         let scratch_i64 = f.add_local(ValType::I64);
         let scratch_i32 = f.add_local(ValType::I32);
@@ -380,6 +388,7 @@ impl<'a> Emitter<'a> {
             f,
             cx,
             ctx_local: 0,
+            block_start,
             scratch_i64,
             scratch_i32,
             scratch_page,
@@ -2871,6 +2880,46 @@ impl<'a> Emitter<'a> {
     /// untranslated page, an out-of-range address and a real table-0 block all
     /// take the same path with no test between them. Index and table go into
     /// locals first: a value pushed outside a `block` cannot be consumed inside.
+    /// The self-modifying-code guard (`Block::guard`): compare the block's
+    /// code bytes with what was lifted; on a difference tell the host to
+    /// re-lift the page (`cache_op` IC_INVALIDATE, the same path `ic ivau`
+    /// takes on AArch64) and dispatch to this address again, which now misses.
+    fn emit_guard(&mut self, start: u64, bytes: &[u8]) {
+        self.f.i64_const(0);
+        self.f.local_set(self.scratch_i64);
+        for (i, chunk) in bytes.chunks(8).enumerate() {
+            let at = start + (i * 8) as u64;
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            let want = u64::from_le_bytes(buf);
+            let mask: u64 = if chunk.len() == 8 { !0 } else { (1u64 << (8 * chunk.len())) - 1 };
+            self.f.i32_const(at as u32 as i32);
+            self.f.load(0x29, 0, 0); // i64.load, unaligned
+            if mask != !0 {
+                self.f.i64_const(mask as i64);
+                self.f.byte(0x83); // i64.and
+            }
+            self.f.i64_const(want as i64);
+            self.f.byte(0x85); // i64.xor
+            self.f.local_get(self.scratch_i64);
+            self.f.byte(0x84); // i64.or
+            self.f.local_set(self.scratch_i64);
+        }
+        self.f.local_get(self.scratch_i64);
+        self.f.byte(0x50); // i64.eqz
+        self.f.byte(0x45); // i32.eqz: changed?
+        self.f.if_void();
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(start as i64);
+        self.f.i32_const(gex_abi::cache_op::IC_INVALIDATE);
+        self.f.i64_const(start as i64);
+        self.f.call(self.cx.cache_op);
+        self.f.i64_const(start as i64);
+        self.f.local_set(self.scratch_i64);
+        self.emit_dispatch_tail_call();
+        self.f.end();
+    }
+
     fn emit_dispatch_tail_call(&mut self) {
         let before = self.f.code.len();
         self.emit_ballast();
@@ -2933,6 +2982,10 @@ impl<'a> Emitter<'a> {
         self.f.local_get(self.ctx_local);
         self.f.local_get(self.scratch_i64);
         self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
+        // And where it was made: the block start, a constant per block.
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(self.block_start as i64);
+        self.f.store(0x37, 3, ctx::LAST_SOURCE as u32);
 
         self.emit_dispatch_entry();
         self.f.local_tee(entry);

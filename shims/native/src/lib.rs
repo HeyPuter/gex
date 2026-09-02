@@ -2486,12 +2486,18 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                             Some(memory) => {
                                 let gm = GuestMem::new(memory.bytes());
                                 let last = gm.read_u64(base + ctx::LAST_TARGET as u64).unwrap_or(0);
+                                let src = gm.read_u64(base + ctx::LAST_SOURCE as u64).unwrap_or(0);
+                                let code: Vec<String> = gm
+                                    .read(src, 24)
+                                    .map(|b| b.iter().map(|x| format!("{x:02x}")).collect())
+                                    .unwrap_or_default();
                                 let sp = gm.read_u64(base + ctx::SP as u64).unwrap_or(0);
                                 let stack: Vec<String> = (0..8)
                                     .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
                                     .collect();
                                 format!(
-                                    "branch to 0x{pc:x}, which is not executable guest memory (last indirect target {last:#x}; sp={sp:#x} stack=[{}])",
+                                    "branch to 0x{pc:x}, which is not executable guest memory (last indirect target {last:#x} from block {src:#x} [{}]; sp={sp:#x} stack=[{}])",
+                                    code.join(" "),
                                     stack.join(", ")
                                 )
                             }
@@ -2838,6 +2844,17 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             .map(|v| (v.start, v.end))
             .collect()
     });
+    // Writable-and-executable ranges (a JIT's), whose blocks guard their own
+    // bytes. See `Block::guard`.
+    let volatile: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
+        k.mem
+            .vmas()
+            .iter()
+            .filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0)
+            .map(|v| (v.start, v.end))
+            .collect()
+    });
+    gex_xlate::set_volatile_ranges(volatile);
     let (translated_module, stats) = {
         let data = memory.bytes();
         gex_xlate::translate_runtime(

@@ -1059,6 +1059,27 @@ fn fetch_code_bytes(
 /// reads memory at run time like any other: what a slot holds at translation
 /// time is not what it holds later (lazy binding, a store this translation
 /// ran ahead of), and the dispatch table, not the guess, decides the target.
+/// Address ranges that are writable AND executable right now: a JIT's code
+/// area. Blocks lifted from them carry a byte guard (see `Block::guard`). The
+/// host refreshes this before each translation.
+static VOLATILE_RANGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn set_volatile_ranges(ranges: Vec<(u64, u64)>) {
+    *VOLATILE_RANGES.lock().unwrap_or_else(|e| e.into_inner()) = ranges;
+}
+
+fn is_volatile(addr: u64) -> bool {
+    VOLATILE_RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(s, e)| addr >= *s && addr < *e)
+}
+
+/// The most bytes a guard compares: a block longer than this is guarded on
+/// its head only, which still catches a JIT reusing the region.
+const GUARD_MAX: usize = 256;
+
 fn lift_one(
     addr: u64,
     memory: &[u8],
@@ -1068,6 +1089,13 @@ fn lift_one(
     let fetch = |pc: u64, buf: &mut arch::FetchBuf| fetch_code_bytes(memory, executable, pc, buf);
     let mut block = lift_block(fetch, addr, limits);
     pass::optimize(&mut block);
+    if is_volatile(addr) {
+        let lo = addr as usize;
+        let hi = (block.end as usize).max(lo + 1).min(lo + GUARD_MAX).min(memory.len());
+        if hi > lo {
+            block.guard = Some(memory[lo..hi].to_vec());
+        }
+    }
     let folded = match block.term {
         Term::Indirect { target, .. } => {
             let mut probe = block.clone();

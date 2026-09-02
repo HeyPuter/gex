@@ -9408,15 +9408,17 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             let gm = GuestMem::new(guest_bytes());
             let c = h.threads[cur()].kstate.ctx_addr;
             let last = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
+            let src = gm.read_u64(c + ctx::LAST_SOURCE as u64).unwrap_or(0);
             let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
             let stack: Vec<String> = (0..8)
                 .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
                 .collect();
             warn_line(&format!(
-                "[gex] pid {} thread {} branched to {pc:#x}, which is not executable guest memory (SIGSEGV); last indirect target {last:#x} ({}), sp={sp:#x} stack=[{}], last syscall {}\n",
+                "[gex] pid {} thread {} branched to {pc:#x}, which is not executable guest memory (SIGSEGV); last indirect target {last:#x} ({}) from block {src:#x} ({}), sp={sp:#x} stack=[{}], last syscall {}\n",
                 h.kernel.pid,
                 cur(),
                 object_off_at(h, last),
+                object_off_at(h, src),
                 stack.join(", "),
                 LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
             ));
@@ -9821,6 +9823,20 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let known = std::mem::take(&mut h.jit.translated);
         // What the page table's identity hooks answer from, as of now.
         refresh_ident_snapshot(h);
+        // And which pages are a JIT's (writable and executable), so their
+        // blocks carry a self-modifying-code guard. See `Block::guard`.
+        gex_xlate::set_volatile_ranges(
+            h.kernel
+                .mem
+                .vmas()
+                .iter()
+                .filter(|v| {
+                    v.prot & gex_kernel::mem::prot::EXEC != 0
+                        && v.prot & gex_kernel::mem::prot::WRITE != 0
+                })
+                .map(|v| (v.start, v.end))
+                .collect(),
+        );
         phase(11);
     let (unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),

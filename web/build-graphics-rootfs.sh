@@ -55,7 +55,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 if [ "${GEX_ARCH:-}" = "x86" ]; then
     MA=x86_64-linux-gnu
     LDSO=ld-linux-x86-64.so.2
-    TRAP_INSN='ud2'
+    # Not a trap: Mesa's swrast asks `LLVMIsMultithreaded()` while loading even
+    # when softpipe is the driver, so the stubs return zero instead of killing
+    # the X server with SIGILL.
+    TRAP_INSN='xor %eax,%eax; ret'
     OUT="${1:-$HERE/public/rootfs/x86/graphics.tar}"
     SRC="${2:-/tmp/gex-gfx-amd64/root}"
     WORK="${GEX_ASSET_WORK:-${TMPDIR:-/tmp}/gex-assets}/graphics-x86"
@@ -415,6 +418,9 @@ if [ -n "${GEX_LLVM_STUB:-}" ]; then
         awk '$7 != "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/llvm"
     comm -12 "$WORK/undef" "$WORK/llvm" > "$WORK/need"
     {
+        # A missing GNU-stack note makes glibc give every thread an executable
+        # stack in any process that loads the stub.
+        echo '.section .note.GNU-stack,"",@progbits'
         echo '.text'
         while read -r sym; do
             printf '.globl %s\n.type %s,@function\n%s:\n  %s\n' "$sym" "$sym" "$sym" "$TRAP_INSN"

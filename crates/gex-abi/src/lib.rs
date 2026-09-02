@@ -239,6 +239,10 @@ pub mod ctx {
     /// was headed. One store per indirect branch; direct branches use
     /// `return_call` and never come here.
     pub const LAST_TARGET: usize = 44 * 8;
+    /// The start of the block that made the last indirect branch, stored
+    /// beside `LAST_TARGET`: a wild target is only half the story, the code
+    /// that computed it is the other half.
+    pub const LAST_SOURCE: usize = 46 * 8;
 
     /// The raw system-call number the guest last issued, saved by the kernel
     /// at entry. On x86-64 the number's register (`rax`) is also the result
