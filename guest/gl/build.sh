@@ -14,6 +14,14 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 OUT="${1:-$HERE/out}"
 CC="${GEX_CC:-$HOME/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc}"
 
+# A name as well as a path. `GEX_CC=aarch64-linux-gnu-gcc` used to be reported
+# as a missing compiler and *skipped* -- exit zero, no output, no libraries --
+# so a caller that trusted the exit status went on to copy files that were
+# never built.
+if [ ! -x "$CC" ]; then
+    resolved=$(command -v "$CC" 2>/dev/null || true)
+    [ -z "$resolved" ] || CC=$resolved
+fi
 [ -x "$CC" ] || { echo "skip: no $CC"; exit 0; }
 
 # Generate every registry-backed entry point before compiling the transport.

@@ -57,10 +57,36 @@ VIRGL_TAG="${VIRGL_TAG:-virglrenderer-1.0.0}"
 # shell's PATH, so the script reported meson missing on a machine that had it.
 PATH="$HOME/.local/bin:$PATH"
 command -v meson >/dev/null 2>&1 || { echo "need meson (pip install meson ninja)"; exit 1; }
-[ -f "$EMSDK/emsdk_env.sh" ] || { echo "no emscripten at $EMSDK"; exit 1; }
-# shellcheck disable=SC1091
-. "$EMSDK/emsdk_env.sh" >/dev/null 2>&1
-EMCC="$EMSDK/upstream/emscripten"
+# Where Emscripten is, asked rather than assumed.
+#
+# This used to insist on `$EMSDK/emsdk_env.sh` under one person's home
+# directory and refuse to run without it -- on a machine whose Emscripten was
+# installed in /usr/lib and already on the PATH, which is the ordinary case
+# for a distribution package. What the build actually needs is `emcc`, so the
+# path it is on is the answer, and the emsdk environment is only sourced when
+# there is one to source.
+if [ -z "${EMSDK:-}" ] || [ ! -f "${EMSDK}/emsdk_env.sh" ]; then
+    emcc_on_path=$(command -v emcc 2>/dev/null || true)
+    case "$emcc_on_path" in
+        */upstream/emscripten/emcc) EMSDK=${emcc_on_path%/upstream/emscripten/emcc} ;;
+    esac
+fi
+for candidate in "${EMSDK:-}" /usr/lib/emsdk "$HOME/emsdk"; do
+    [ -n "$candidate" ] || continue
+    [ -f "$candidate/emsdk_env.sh" ] || continue
+    EMSDK=$candidate
+    break
+done
+if [ -n "${EMSDK:-}" ] && [ -f "$EMSDK/emsdk_env.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$EMSDK/emsdk_env.sh" >/dev/null 2>&1
+    EMCC="$EMSDK/upstream/emscripten"
+elif command -v emcc >/dev/null 2>&1; then
+    EMCC=$(dirname "$(command -v emcc)")
+else
+    echo "need Emscripten: no emcc on the PATH and no emsdk_env.sh" >&2
+    exit 1
+fi
 SYSROOT="$EMCC/cache/sysroot/include"
 
 mkdir -p "$OUT"
