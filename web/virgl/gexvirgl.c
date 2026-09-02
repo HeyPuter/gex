@@ -349,16 +349,20 @@ static struct gex_present_slot gex_slots[GEX_PRESENT_SLOTS];
 /* Which surface the frame being presented belongs to. Zero is the surface a
  * client that never named one still has. */
 static unsigned gex_present_uid;
-/* Whether a *finished* frame is expected.
+/* Whether frames are taken when *asked for* rather than when noticed.
  *
- * A frame is looked for whenever commands have been submitted, which happens
- * several times inside one frame -- and a mid-frame submit of client A, with
- * client B's window still bound, filed A's half-drawn picture under B. The
- * decoder arms this when it is about to flush a swap, and it stays armed
- * until a snapshot is actually taken: the last commands of the frame may
- * already have gone, in which case the flush that follows carries nothing and
- * the frame would otherwise be missed altogether. */
-static int gex_present_armed;
+ * This renderer notices a finished frame by watching the command stream,
+ * which is the only thing it can do for a guest that runs its own Mesa. When
+ * the *host's* Mesa is driving, the decoder knows exactly when a frame is
+ * finished and which window it belongs to -- and watching is then strictly
+ * worse. Every rule tried on top of watching was wrong for some client:
+ * taking a frame on any submit files half-drawn pictures (and, with two
+ * clients, files them under the wrong window), while waiting for the flush
+ * that carries a swap loses the frame of a client that draws once and stops
+ * -- es2tri, whose window stayed black beside a client that kept drawing.
+ *
+ * So the decoder asks: see `gex_virgl_snapshot_surface`. */
+static int gex_present_direct;
 static int gex_live_surfaces(void);
 static GLuint gex_present_copy_fbo;
 
@@ -420,21 +424,79 @@ void gex_virgl_present_flip(int on) { gex_present_flip = on != 0; }
 /* Which surface the commands that follow belong to: said by the decoder next
  * door whenever the drawable it renders into changes. */
 EMSCRIPTEN_KEEPALIVE
-void gex_virgl_present_surface(unsigned uid) {
-    /* A different surface is being drawn, so any frame that was expected and
-     * never arrived is not coming: dropping the expectation is what stops one
-     * client's swap being satisfied by the *next* client's frame, which is
-     * the same confusion this tag exists to prevent. */
-    if (uid != gex_present_uid) gex_present_armed = 0;
-    gex_present_uid = uid;
-}
+void gex_virgl_present_surface(unsigned uid) { gex_present_uid = uid; }
 
-/* And that the next finished frame is this surface's: said just before the
- * flush that carries a swap. */
+/* Frames are asked for from now on, not noticed: see `gex_present_direct`. */
 EMSCRIPTEN_KEEPALIVE
-void gex_virgl_expect_present(unsigned uid) {
-    gex_present_uid = uid;
-    gex_present_armed = 1;
+void gex_virgl_present_direct(int on) { gex_present_direct = on != 0; }
+
+/* Keep this surface's frame, now.
+ *
+ * Called by the decoder the moment a frame is finished -- after its
+ * `glFinish`, so everything the client drew has been through this renderer
+ * and its own framebuffer is still the bound one. That makes the copy exactly
+ * the finished frame of exactly that window, with nothing to infer.
+ *
+ * Returns zero when there was nothing to take, which for a client that has
+ * not drawn yet is ordinary. */
+EMSCRIPTEN_KEEPALIVE
+int gex_virgl_snapshot_surface(unsigned uid) {
+    GLint fb = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    if (fb == 0 || vp[2] <= 0 || vp[3] <= 0) return 0;
+    struct gex_present_slot *slot = gex_slot_for(uid);
+    if (!slot->copy) glGenTextures(1, &slot->copy);
+    GLint read_was = 0, tex_was = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_was);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex_was);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindTexture(GL_TEXTURE_2D, slot->copy);
+    glDisable(GL_SCISSOR_TEST);
+    while (glGetError() != GL_NO_ERROR) { }
+    /* An unsized `GL_RGBA` on purpose: the guest's drawable is whatever Mesa
+     * chose, and a sized destination makes the driver answer
+     * INVALID_OPERATION and leave the copy black. Remade every frame for the
+     * same reason -- the format is the driver's to choose and need not be the
+     * one it chose last time. */
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vp[0], vp[1], vp[2], vp[3], 0);
+    const GLenum copy_error = glGetError();
+    if (copy_error == GL_NO_ERROR) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        slot->w = vp[2];
+        slot->h = vp[3];
+        slot->serial++;
+        slot->live = 0;
+    } else {
+        /* Some drawables cannot be read into a plain RGBA8 texture. The
+         * guest's own target is then what a compositor gets: it can tear,
+         * and it is the picture. */
+        gex_present_error = copy_error;
+        GLint attached = 0, kind = 0;
+        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
+                                              GL_COLOR_ATTACHMENT0,
+                                              GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+                                              &kind);
+        if (kind == GL_TEXTURE) {
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
+                                                  GL_COLOR_ATTACHMENT0,
+                                                  GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                                  &attached);
+            slot->live = (GLuint)attached;
+            slot->w = vp[2];
+            slot->h = vp[3];
+            slot->serial++;
+        }
+    }
+    glBindTexture(GL_TEXTURE_2D, (GLuint)tex_was);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_was);
+    gex_presented++;
+    return copy_error == GL_NO_ERROR || slot->live ? 1 : 0;
 }
 
 /* One surface's own latest frame. Zero when that surface has never presented
@@ -567,13 +629,9 @@ static void gex_present_current(void) {
         gex_present_tex_h = vp[3];
         gex_present_serial++;
     }
-    /* Not a swap: some mid-frame flush of whatever is bound. Keeping it would
-     * file a half-drawn picture as this surface's frame -- and, when two
-     * clients are drawing, as the wrong surface's. */
-    if (!gex_present_armed) {
-        gex_submit_present_small++;
-        return;
-    }
+    /* The decoder says when a frame is finished and whose it is, so watching
+     * the stream for one would only guess worse. See `gex_present_direct`. */
+    if (gex_present_direct) return;
     if (!gex_present_to_canvas) {
         /* A copy of the finished frame, for a compositor to draw.
          *
@@ -635,7 +693,6 @@ static void gex_present_current(void) {
          * own target is better than handing over a black rectangle: it can
          * tear, and it is the picture. */
         use_copy = copy_error == GL_NO_ERROR;
-        gex_present_armed = 0;
         slot->live = gex_present_tex;
         if (use_copy) {
             gex_present_tex = slot->copy;
@@ -685,9 +742,6 @@ static void gex_present_current(void) {
         return;
     }
 
-    /* This frame is the one that was expected; the next mid-frame flush is
-     * not. See `gex_present_armed`. */
-    gex_present_armed = 0;
     int w, h;
     emscripten_get_canvas_element_size("#gex-gl", &w, &h);
     /* virglrenderer created and validated this draw target before submitting

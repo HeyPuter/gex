@@ -123,6 +123,9 @@ export class MesaGlDevice {
       // from inside a wasm frame, with nothing to await on.
       const renderer = await VirglRenderer.create(canvas, '/gex/gexvirgl.mjs', null,
                                                   { inProcess: true, preserve });
+      // Frames are asked for rather than noticed: this Mesa is on this side
+      // of the transport and knows when a frame is finished and whose it is.
+      renderer.presentDirect?.(true);
       if (!renderer.ok) throw new Error(renderer.describe?.() || 'the renderer would not start');
       out.#renderer = renderer;
 
@@ -164,9 +167,9 @@ export class MesaGlDevice {
         // decoder, one module over, because only it knows -- and needed by
         // the renderer, which keeps a frame per window.
         surface: (uid) => renderer.presentSurface(uid),
-        // And that a finished frame of it is on its way: the renderer keeps
-        // a copy only then, so a mid-frame flush is not mistaken for one.
-        swap: (uid) => renderer.expectPresent(uid),
+        // And that this surface's frame is finished: the renderer takes its
+        // copy then and only then, from the framebuffer that is still bound.
+        snapshot: (uid) => renderer.snapshotSurface(uid),
       };
       // No JSPI here: virglrenderer runs the commands before `feed` returns,
       // so a submit is an ordinary call.

@@ -350,10 +350,23 @@ export class VirglRenderer {
     this.#module._gex_virgl_present_surface?.(uid >>> 0);
   }
 
-  /** The next finished frame belongs to this surface. */
-  expectPresent(uid) {
+  /** Take this surface's frame now, from what is currently bound.
+   *
+   * For a caller whose Mesa is on this side of the transport: it knows when
+   * a frame is finished and which window it is, so the renderer need not
+   * watch the command stream and guess. Watching cannot be made right --
+   * every submit is too often (half-drawn frames, and with two clients the
+   * wrong window) and only the flush that carries a swap is too rare (a
+   * client that draws once and stops is never seen at all). */
+  snapshotSurface(uid) {
+    if (!this.ok || this.#worker || !uid) return false;
+    return (this.#module._gex_virgl_snapshot_surface?.(uid >>> 0) ?? 0) !== 0;
+  }
+
+  /** Stop watching the command stream for frames; they will be asked for. */
+  presentDirect(on) {
     if (!this.ok || this.#worker) return;
-    this.#module._gex_virgl_expect_present?.(uid >>> 0);
+    this.#module._gex_virgl_present_direct?.(on ? 1 : 0);
   }
 
   /** One surface's own latest frame, as a texture in this renderer's context.

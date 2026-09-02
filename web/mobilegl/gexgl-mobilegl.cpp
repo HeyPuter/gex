@@ -1396,17 +1396,21 @@ EM_JS(void, gex_note_present_surface, (unsigned handle), {
   Module.gexVirgl?.surface?.(handle);
 });
 
-/* And that the flush about to happen carries a finished frame of it, which is
- * what the renderer waits for before keeping a copy. */
-EM_JS(void, gex_note_present_coming, (unsigned handle), {
-  Module.gexVirgl?.swap?.(handle);
+/* And, after the flush, that this surface's frame is finished and should be
+ * kept -- which the renderer can then take from its own bound framebuffer
+ * with nothing to infer. */
+EM_JS(void, gex_note_frame_done, (unsigned handle), {
+  Module.gexVirgl?.snapshot?.(handle);
 });
 
 void note_surface_to_backend(unsigned uid) { gex_note_present_surface(uid); }
 
 void present_backend() {
-    if (sur) gex_note_present_coming(sur->uid);
+    /* Finish first: everything this client drew goes through the renderer,
+     * and its drawable is still what is bound when it returns -- which is
+     * what makes the copy that follows exactly this frame of this window. */
     glFinish();
+    if (sur) gex_note_frame_done(sur->uid);
     ++produced;
     if (sur) ++sur->produced;
 }
