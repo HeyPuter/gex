@@ -3591,7 +3591,13 @@ fn catch_up_and_resume(store: &mut Store<HostState>, ctx_addr: u64) -> Result<Op
 }
 
 fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
-    let pc = store.data().memory.as_ref().map(|_| 0u64).unwrap_or(0);
+    let ctx_addr = store.data().thread.ctx_addr;
+    let pc = store
+        .data()
+        .memory
+        .as_ref()
+        .map(|mem| read_u64(mem.bytes(), (ctx_addr + gex_abi::ctx::PC as u64) as usize))
+        .unwrap_or(0);
     if let Some(trap) = e.downcast_ref::<wasmtime::Trap>() {
         let detail = match trap {
             // The guard in tier-1 codegen steers a too-large effective
