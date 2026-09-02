@@ -378,6 +378,18 @@ const host = new ProcessHost({
 });
 
 let status;
+// GEX_MEMSTATS=<seconds>: report process memory every so often -- the whole
+// process (every Worker) in `rss`, this isolate's wasm memories in
+// `arrayBuffers` -- to see what a run's footprint is made of.
+if (process.env.GEX_MEMSTATS) {
+  const every = Number(process.env.GEX_MEMSTATS) * 1000 || 10000;
+  const t0 = Date.now();
+  setInterval(() => {
+    const m = process.memoryUsage();
+    const mib = (n) => (n / 1048576).toFixed(0);
+    process.stderr.write(`[memstats] t=${((Date.now() - t0) / 1000).toFixed(0)}s rss=${mib(m.rss)}MiB heap=${mib(m.heapUsed)}MiB external=${mib(m.external)}MiB arrayBuffers=${mib(m.arrayBuffers)}MiB\n`);
+  }, every).unref();
+}
 try {
   status = await host.start({
     elf,

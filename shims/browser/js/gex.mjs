@@ -45,6 +45,24 @@ function adoptAfterTraps() {
 const FILL = 'gexfill';
 // The one a miss can ask for: fill whichever segment holds this slot.
 const FILL_AT = 'gexfillat';
+// The shim's debug channel. A heartbeat line gets this isolate's own memory
+// figures appended at node (GEX_MEMSTATS): a Worker's wasm memories and heap,
+// which the main thread's `process.memoryUsage()` cannot see.
+function debugLine(text) {
+  if (typeof process !== 'undefined' && process.env?.GEX_MEMSTATS && text.startsWith('[beat]')) {
+    try {
+      const m = process.memoryUsage();
+      const mib = (n) => (n / 1048576) | 0;
+      text += ` | isolate heap=${mib(m.heapUsed)}MiB arrayBuffers=${mib(m.arrayBuffers)}MiB external=${mib(m.external)}MiB`;
+      if (process.env.GEX_MEMSTATS === 'spaces') {
+        const v8 = process.getBuiltinModule?.('v8') ?? null;
+        if (v8) text += ' | ' + v8.getHeapSpaceStatistics().filter((sp) => sp.space_used_size > 8 << 20).map((sp) => `${sp.space_name}=${mib(sp.space_used_size)}`).join(' ');
+      }
+    } catch {}
+  }
+  console.debug(text);
+}
+
 // Dispatch slots one 4 KiB guest page covers (`gex_abi::SLOTS_PER_PAGE`) and
 // the `log2` of the instruction alignment that decides it: 1024 and 2 on
 // AArch64, 4096 and 0 on x86-64. Asked of the shim once it exists (see
@@ -745,7 +763,7 @@ export class Gex {
           this.#env.write(fd, this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0))),
         // The shim's own narration, to the console -- never to the guest's
         // output, which shares fd 2 with a terminal a person is reading.
-        debug: (ptr, len) => console.debug(
+        debug: (ptr, len) => debugLine(
           utf8(
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
           ).replace(/\n$/, ''),
