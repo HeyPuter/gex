@@ -698,6 +698,28 @@ impl<'a> Emitter<'a> {
         if std::env::var_os("GEX_NO_LOOP_FUSION").is_some() {
             return false;
         }
+        // And a finer one: `GEX_FUSE_SKIP=0xaaa,0xbbb` leaves the named
+        // blocks unfused, to bisect a fusion bug down to one loop;
+        // `GEX_FUSE_LIST=1` names every loop that is fused.
+        if back_edge {
+            static SKIP: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+            let skip = SKIP.get_or_init(|| {
+                std::env::var("GEX_FUSE_SKIP")
+                    .ok()
+                    .map(|v| {
+                        v.split(',')
+                            .filter_map(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+            if skip.contains(&block.start) {
+                return false;
+            }
+            if std::env::var_os("GEX_FUSE_LIST").is_some() {
+                eprintln!("[fuse] self-loop at {:#x}", block.start);
+            }
+        }
         back_edge && !block.stmts.iter().any(clobbers_guest_state)
     }
 
@@ -2566,7 +2588,18 @@ impl<'a> Emitter<'a> {
                 // be preempted or take a signal. Safe here because the PC is
                 // already the target (stored above) and the registers are
                 // flushed, so the slow path may deliver a signal and unwind.
-                self.emit_safepoint_no_flush(block.end - gex_abi::INST_ALIGN);
+                // The pc handed to the poll is what the host writes back as
+                // the context PC, and what a dispatch miss right after this
+                // resumes from. On A64 the branch's own address serves: the
+                // instruction is re-executed and re-reads its register. On
+                // x86-64 `end - 1` is inside the branch instruction, so the
+                // poll gets the target itself -- the value the PC already
+                // holds, and the only address that is safe to resume at.
+                if gex_abi::X86 {
+                    self.emit_safepoint_no_flush_dynamic();
+                } else {
+                    self.emit_safepoint_no_flush(block.end - gex_abi::INST_ALIGN);
+                }
                 self.emit_dispatch_tail_call();
             }
             Term::Syscall { next } => {
@@ -2604,6 +2637,28 @@ impl<'a> Emitter<'a> {
     fn emit_safepoint_no_flush(&mut self, pc: u64) {
         let before = self.f.code.len();
         self.emit_safepoint_no_flush_inner(pc);
+        SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
+    }
+
+    /// The poll with the pc taken from `scratch_i64` (the branch target an
+    /// indirect terminator has just stored) rather than a constant.
+    fn emit_safepoint_no_flush_dynamic(&mut self) {
+        let before = self.f.code.len();
+        self.f.local_get(self.ctx_local);
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
+        self.f.i32_const(1);
+        self.f.byte(0x6b); // i32.sub
+        self.f.local_tee(self.scratch_i32);
+        self.f.store(0x36, 2, ctx::SAFEPOINT_COUNTER as u32);
+        self.f.local_get(self.scratch_i32);
+        self.f.i32_const(0);
+        self.f.byte(0x4c); // i32.le_s
+        self.f.if_void();
+        self.f.local_get(self.ctx_local);
+        self.f.local_get(self.scratch_i64);
+        self.f.call(self.cx.safepoint);
+        self.f.end();
         SAFEPOINT_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
     }
 

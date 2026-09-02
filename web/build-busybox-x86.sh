@@ -29,7 +29,7 @@ cp "$BB" "$R/bin/busybox"
 # host, and the answer is the same under gex).
 for a in $("$BB" --list 2>/dev/null); do
     case "$a" in
-        */*) continue ;;
+        */*|busybox) continue ;;
     esac
     ln -sf busybox "$R/bin/$a"
 done

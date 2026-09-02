@@ -2516,10 +2516,26 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     state.resume_at = Some(target);
                 }
                 _ => {
+                    // Where the last indirect branch was aimed, and how the
+                    // dispatch directory names its page and this one: an
+                    // illegal instruction at an address no branch should
+                    // reach is usually a dispatch that landed in the wrong
+                    // slot, and these are the numbers that say so.
+                    let last = gm
+                        .read_u64(state.thread.ctx_addr + ctx::LAST_TARGET as u64)
+                        .unwrap_or(0);
+                    let dir = |a: u64| {
+                        gm.read_u32(gex_abi::DISPATCH_DIR + gex_abi::dispatch_page(a) * 4)
+                            .unwrap_or(0)
+                    };
                     state.exit = Some(Exit::Signal {
                         signal: signal::SIGILL,
                         pc,
-                        detail: format!("instruction 0x{raw:08x} at 0x{pc:x} is not implemented"),
+                        detail: format!(
+                            "instruction 0x{raw:08x} at 0x{pc:x} is not implemented (last indirect target 0x{last:x}; directory entry for its page {:#x}, for this page {:#x})",
+                            dir(last),
+                            dir(pc)
+                        ),
                         internal: true,
                     });
                 }

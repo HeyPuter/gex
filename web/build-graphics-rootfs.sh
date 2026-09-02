@@ -45,14 +45,35 @@
 # That is what makes the arena split (task #71) the thing to do instead.
 set -eu
 
-OUT="${1:-$(cd "$(dirname "$0")" && pwd)/public/rootfs/graphics.tar}"
-SRC="${2:-/tmp/gex-x/root}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WORK="${GEX_ASSET_WORK:-${TMPDIR:-/tmp}/gex-assets}/graphics"
-TOOLCHAIN="${GEX_TOOLCHAIN:-$HOME/toolchains/aarch64-linux-musl-cross}"
-CC="$TOOLCHAIN/bin/aarch64-linux-musl-gcc"
+# The guest architecture. `GEX_ARCH=x86` curates the x86-64 tree (the one
+# `GEX_DEBIAN_ARCH=amd64 build-debian.sh` with the graphics roots produces)
+# into `rootfs/x86/graphics.tar`, with Debian's x86-64 multiarch names, the
+# x86-64 dynamic linker, the host compiler for the LLVM stub and the x86-64
+# gexc for the pixbuf cache. Generated scripts inside the image are
+# rewritten to the same names at the end.
+if [ "${GEX_ARCH:-}" = "x86" ]; then
+    MA=x86_64-linux-gnu
+    LDSO=ld-linux-x86-64.so.2
+    TRAP_INSN='ud2'
+    OUT="${1:-$HERE/public/rootfs/x86/graphics.tar}"
+    SRC="${2:-/tmp/gex-gfx-amd64/root}"
+    WORK="${GEX_ASSET_WORK:-${TMPDIR:-/tmp}/gex-assets}/graphics-x86"
+    CC="${GEX_CC:-$(command -v gcc)}"
+    GEXC="${GEXC:-$HERE/../target/x86/release/gexc}"
+else
+    MA=${MA}
+    LDSO=${LDSO}
+    TRAP_INSN='brk #0'
+    OUT="${1:-$HERE/public/rootfs/graphics.tar}"
+    SRC="${2:-/tmp/gex-x/root}"
+    WORK="${GEX_ASSET_WORK:-${TMPDIR:-/tmp}/gex-assets}/graphics"
+    TOOLCHAIN="${GEX_TOOLCHAIN:-$HOME/toolchains/aarch64-linux-musl-cross}"
+    CC="$TOOLCHAIN/bin/aarch64-linux-musl-gcc"
+    fi
+mkdir -p "$(dirname "$OUT")"
 
-if [ ! -x "$SRC/usr/bin/glxgears.aarch64-linux-gnu" ] || [ ! -x "$SRC/usr/bin/Xvfb" ]; then
+if [ ! -x "$SRC/usr/bin/glxgears.$MA" ] || [ ! -x "$SRC/usr/bin/Xvfb" ]; then
     echo "skip: no graphics rootfs at $SRC (wants Mesa, Xvfb and mesa-utils)"
     exit 0
 fi
@@ -110,13 +131,13 @@ libXcomposite.so.1 libXcursor.so.1 libXdamage.so.1 libXrandr.so.2
 # first toolkit; the closure pass further down takes them from the programs
 # themselves. What is named here is what a *trace* found and DT_NEEDED cannot:
 # the X server, the drivers it dlopens, and the programs an execve reaches.
-PROGS="Xvfb xkbcomp glxgears.aarch64-linux-gnu glxinfo.aarch64-linux-gnu
-es2gears_wayland.aarch64-linux-gnu eglinfo.aarch64-linux-gnu Xwayland
-es2gears_x11.aarch64-linux-gnu es2tri.aarch64-linux-gnu es2_info.aarch64-linux-gnu
-glxdemo.aarch64-linux-gnu glxheads.aarch64-linux-gnu xeyes xclock xterm xcalc
+PROGS="Xvfb xkbcomp glxgears.${MA} glxinfo.${MA}
+es2gears_wayland.${MA} eglinfo.${MA} Xwayland
+es2gears_x11.${MA} es2tri.${MA} es2_info.${MA}
+glxdemo.${MA} glxheads.${MA} xeyes xclock xterm xcalc
 wish8.6 twm glmark2 gtk3-demo gdk-pixbuf-query-loaders"
 
-mkdir -p "$R/lib/aarch64-linux-gnu" "$R/usr/lib/aarch64-linux-gnu/dri" \
+mkdir -p "$R/lib/${MA}" "$R/usr/lib/${MA}/dri" \
          "$R/usr/bin" "$R/bin" "$R/etc" "$R/tmp/.X11-unix" "$R/var/lib/xkb" \
          "$R/usr/share/X11" "$R/usr/lib/xorg" "$R/proc" "$R/dev" "$R/root"
 
@@ -124,16 +145,23 @@ mkdir -p "$R/lib/aarch64-linux-gnu" "$R/usr/lib/aarch64-linux-gnu/dri" \
 # the SONAME, which is the link name, so the target's own name is never
 # needed and copying both would double 22 MB of megadriver.
 for l in $LIBS; do
-    for d in "$SRC/usr/lib/aarch64-linux-gnu" "$SRC/lib/aarch64-linux-gnu"; do
+    for d in "$SRC/usr/lib/${MA}" "$SRC/lib/${MA}"; do
         [ -e "$d/$l" ] || continue
-        cp -L "$d/$l" "$R/usr/lib/aarch64-linux-gnu/$l"
+        cp -L "$d/$l" "$R/usr/lib/${MA}/$l"
         break
     done
-    [ -e "$R/usr/lib/aarch64-linux-gnu/$l" ] || echo "  missing: $l"
+    [ -e "$R/usr/lib/${MA}/$l" ] || echo "  missing: $l"
 done
-cp -L "$SRC/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so" \
-      "$R/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so"
-cp -L "$SRC/lib/ld-linux-aarch64.so.1" "$R/lib/ld-linux-aarch64.so.1"
+cp -L "$SRC/usr/lib/${MA}/dri/swrast_dri.so" \
+      "$R/usr/lib/${MA}/dri/swrast_dri.so"
+# The dynamic linker at the path `PT_INTERP` names: `/lib/ld-linux-aarch64.so.1`
+# on arm64, `/lib64/ld-linux-x86-64.so.2` on amd64.
+if [ "$MA" = "x86_64-linux-gnu" ]; then
+    mkdir -p "$R/lib64"
+    cp -L "$SRC/lib64/${LDSO}" "$R/lib64/${LDSO}"
+else
+    cp -L "$SRC/lib/${LDSO}" "$R/lib/${LDSO}"
+fi
 
 # /lib and /usr/lib are the same directory on a Debian this recent, and the
 # guest's ld.so looks in both. Copying twice would double 22 MB, so the
@@ -169,19 +197,18 @@ cp -L "$SRC/usr/bin/timeout" "$R/usr/bin/timeout"
 # only name anything ever opens.
 APPS="${GEX_APPS:-/usr/bin/gtk3-demo /usr/bin/gtk3-widget-factory
       /usr/bin/kcalc /usr/bin/qt6ct /usr/bin/compton-conf /usr/games/explosive-c4
-      /usr/lib/aarch64-linux-gnu/qt5/plugins /usr/lib/aarch64-linux-gnu/qt6/plugins
-      /usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0 /usr/lib/aarch64-linux-gnu/gtk-3.0}"
+      /usr/lib/${MA}/qt5/plugins /usr/lib/${MA}/qt6/plugins
+      /usr/lib/${MA}/gdk-pixbuf-2.0 /usr/lib/${MA}/gtk-3.0}"
 
 # shellcheck disable=SC2086
-python3 - "$SRC" $APPS > "$WORK/closure" <<'PYEOF'
+python3 - "$SRC" "$MA" $APPS > "$WORK/closure" <<'PYEOF'
 import os, struct, sys
 
-root, roots = sys.argv[1], sys.argv[2:]
+root, ma, roots = sys.argv[1], sys.argv[2], sys.argv[3:]
 # Where ld.so looks, after the object's own directory. This Debian keeps its
 # libraries in the multiarch directory, and /lib is not a link to /usr/lib
 # here, so both are searched -- in the order the loader searches them.
-LIBDIRS = ['/usr/lib/aarch64-linux-gnu', '/lib/aarch64-linux-gnu',
-           '/usr/lib', '/lib']
+LIBDIRS = [f'/usr/lib/{ma}', f'/lib/{ma}', '/usr/lib', '/lib']
 
 
 def needed(path):
@@ -357,14 +384,13 @@ fi
 # build: the paths come out guest-absolute because to that program they ARE
 # its paths, and the qemu-user this used to need (with a host prefix to strip
 # back off afterwards) is gone.
-GEXC="${GEXC:-$HERE/../target/release/gexc}"
-QL=/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders
+QL=/usr/lib/${MA}/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders
 if [ -x "$GEXC" ] && [ -e "$R$QL" ]; then
     if "$GEXC" run --sysroot "$R" --uid 0 "$R$QL" \
         > "$WORK/loaders.cache" 2>/dev/null &&
         [ -s "$WORK/loaders.cache" ]; then
         cp "$WORK/loaders.cache" \
-            "$R/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+            "$R/usr/lib/${MA}/gdk-pixbuf-2.0/2.10.0/loaders.cache"
         echo "  pixbuf loaders: $(grep -c '^"/usr' "$WORK/loaders.cache") of them"
     else
         echo "  no pixbuf loader cache -- gdk-pixbuf will load no images"
@@ -378,15 +404,15 @@ fi
 if [ -n "${GEX_LLVM_STUB:-}" ]; then
     # Generated from the megadriver's own import list, so it stays right when
     # the driver comes from a different Debian.
-    readelf -W --dyn-syms "$R/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so" |
+    readelf -W --dyn-syms "$R/usr/lib/${MA}/dri/swrast_dri.so" |
         awk '$7 == "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/undef"
-    readelf -W --dyn-syms "$SRC/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" |
+    readelf -W --dyn-syms "$SRC/usr/lib/${MA}/libLLVM-15.so.1" |
         awk '$7 != "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u > "$WORK/llvm"
     comm -12 "$WORK/undef" "$WORK/llvm" > "$WORK/need"
     {
         echo '.text'
         while read -r sym; do
-            printf '.globl %s\n.type %s,@function\n%s:\n  brk #0\n' "$sym" "$sym" "$sym"
+            printf '.globl %s\n.type %s,@function\n%s:\n  %s\n' "$sym" "$sym" "$sym" "$TRAP_INSN"
         done < "$WORK/need"
     } > "$WORK/llvmstub.s"
     # The version, and it is not decoration: the megadriver imports every one
@@ -394,15 +420,15 @@ if [ -n "${GEX_LLVM_STUB:-}" ]; then
     # glibc's ld.so does not warn -- it fails an assertion in dl-lookup.c and
     # kills the process before `main`.
     printf 'LLVM_15 { global: *; };\n' > "$WORK/llvmstub.map"
-    "$CC" -shared -nostdlib -o "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" \
+    "$CC" -shared -nostdlib -o "$R/usr/lib/${MA}/libLLVM-15.so.1" \
         "$WORK/llvmstub.s" -Wl,-soname,libLLVM-15.so.1 \
         -Wl,--version-script="$WORK/llvmstub.map"
-    echo "  libLLVM: a stub of $(wc -l < "$WORK/need") symbols, $(du -h "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" | cut -f1)"
+    echo "  libLLVM: a stub of $(wc -l < "$WORK/need") symbols, $(du -h "$R/usr/lib/${MA}/libLLVM-15.so.1" | cut -f1)"
 else
     for l in libLLVM-15.so.1 libz3.so.4; do
-        cp -L "$SRC/usr/lib/aarch64-linux-gnu/$l" "$R/usr/lib/aarch64-linux-gnu/$l"
+        cp -L "$SRC/usr/lib/${MA}/$l" "$R/usr/lib/${MA}/$l"
     done
-    echo "  libLLVM: the real one, $(du -h "$R/usr/lib/aarch64-linux-gnu/libLLVM-15.so.1" | cut -f1)"
+    echo "  libLLVM: the real one, $(du -h "$R/usr/lib/${MA}/libLLVM-15.so.1" | cut -f1)"
 fi
 
 cat > "$R/etc/passwd" <<'EOF'
@@ -483,5 +509,12 @@ EOF
 chmod +x "$R/gears.sh"
 
 mkdir -p "$(dirname "$OUT")"
+# The scripts baked into the image name the multiarch directory and the
+# mesa-utils program suffix; for the x86-64 image, say the x86-64 names.
+if [ "$MA" != "aarch64-linux-gnu" ]; then
+    for f in "$R/gears.sh" "$R/session.sh" "$R/tk-demo.tcl" "$R/root/.twmrc"; do
+        [ -f "$f" ] && sed -i "s/aarch64-linux-gnu/$MA/g" "$f"
+    done
+fi
 tar -C "$R" -cf "$OUT" .
 echo "  $OUT: $(du -h "$OUT" | cut -f1)"
