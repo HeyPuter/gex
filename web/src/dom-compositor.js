@@ -645,9 +645,6 @@ export class DomDesktop {
     // than sixteen calls.
     const before = this.#glList;
     this.#glList = device.surfaces();
-    if (this.#glLooks % 300 === 1) {
-      console.log('[dom-desktop] gl list', JSON.stringify(this.#glList));
-    }
     for (const old of before) {
       if (!old.frame) continue;
       if (this.#glList.some((s) => s.frame === old.frame)) continue;
