@@ -68,6 +68,14 @@ function forkTransfer(child) {
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { Gex, Env, utf8 } from './gex.mjs';
 
+// Under a block trace at node, keep the trace (the shim's `debug` channel,
+// console.debug -> stdout) on the same stream as the syscall log and the crash
+// report (stderr): two streams interleave arbitrarily and the stdout tail is
+// lost when the process is killed, which hides the very blocks before a crash.
+if (typeof process !== 'undefined' && process.env?.GEX_TRACE_BLOCKS) {
+  console.debug = (...a) => console.error(...a);
+}
+
 const port = await channel();
 
 // This Worker's runtime, once its start message builds it. Module-scope so a

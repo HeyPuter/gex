@@ -267,6 +267,34 @@ export function elementTableNeeds(wasm) {
   return needs;
 }
 
+/** Active element segments of `wasm` that write table `t` slot `sl`: `[table, off, n]`, plus a total count. */
+export function elementSegmentsCovering(wasm, t, sl) {
+  if (!(wasm instanceof Uint8Array) || wasm.length < 8) return 'no bytes';
+  const dv = new DataView(wasm.buffer, wasm.byteOffset, wasm.byteLength);
+  let i = 8;
+  const leb = () => { let n = 0, shift = 0, b; do { b = dv.getUint8(i++); n |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80); return n >>> 0; };
+  const out = []; let total = 0;
+  try {
+    while (i < wasm.length) {
+      const id = dv.getUint8(i++); const size = leb(); const end = i + size;
+      if (id !== 9) { i = end; continue; }
+      const count = leb(); total = count;
+      for (let seg = 0; seg < count; seg++) {
+        const flags = leb(); let table = 0;
+        if (flags === 2 || flags === 6) table = leb();
+        let off = -1;
+        if ((flags & 3) === 0 || flags === 2 || flags === 6) { if (dv.getUint8(i) === 0x41) { i++; off = leb(); } while (dv.getUint8(i) !== 0x0b) i++; i++; }
+        if (flags === 1 || flags === 2 || flags === 3) leb(); else if (flags >= 5) leb();
+        const n = leb();
+        for (let k = 0; k < n; k++) { if (flags & 4) { while (dv.getUint8(i) !== 0x0b) i++; i++; } else leb(); }
+        if (table === t && off >= 0 && sl >= off && sl < off + n) out.push([flags, table, off, n]);
+      }
+      i = end;
+    }
+  } catch (err) { return `parse error ${err}`; }
+  return { total, covering: out };
+}
+
 export function metadataSection(wasm) {
   // A compiled `WebAssembly.Module` -- which `attach` accepts, so the guest
   // image and the closure's libraries cross `postMessage` by reference rather
@@ -833,7 +861,14 @@ export class Gex {
     // wasm-ld puts the shim's stack at address zero (the guest's image); move
     // it into the shim's own region, above everything the guest maps.
     this.#shim.exports.__stack_pointer.value = this.#workerStack();
-    this.#opts = { strace: opts.strace, tty: opts.tty, uid: opts.uid, gid: opts.gid };
+    // Carried into every fork child's Worker (see the fork record's `opts`), so
+    // a debugging switch set for the run holds for the processes it spawns --
+    // the block trace of a child that crashes is otherwise silent.
+    this.#opts = {
+      strace: opts.strace, tty: opts.tty, uid: opts.uid, gid: opts.gid,
+      traceBlocks: opts.traceBlocks, traceMisses: opts.traceMisses, checkSp: opts.checkSp,
+      noIntrinsics: opts.noIntrinsics, intrinsicMask: opts.intrinsicMask,
+    };
     syncSlotShift(this.#shim.exports);
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
     // How many of an object's stored units one miss may take.
@@ -1577,6 +1612,11 @@ export class Gex {
     this.#opts = o;
     syncSlotShift(e);
     if (o.strace) e.gex_set_trace(1);
+    if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
+    if (o.traceMisses) e.gex_set_trace_misses?.(1);
+    if (o.checkSp) e.gex_set_check_sp?.(1);
+    if (o.noIntrinsics) e.gex_set_intrinsics?.(0);
+    if (o.intrinsicMask !== undefined) e.gex_set_intrinsic_mask?.(o.intrinsicMask);
     if (o.perMiss) e.gex_set_per_miss?.(o.perMiss);
     if (o.tty) e.gex_set_tty(1);
     // Identity was already said above, before the kernel was built.
@@ -2665,8 +2705,33 @@ export class Gex {
       if (globalThis.GEX_JIT_TRACE) console.error('[jit] empty pending view (sibling drained the queue), skipping compile');
       return;
     }
+    // GEX_CHECK_INSTALL: once the pending queue is drained, is the slot the
+    // missed pc dispatches through written? A unit whose blocks land elsewhere
+    // makes the resume run whatever was there before -- a wild branch with no
+    // trace. Checked only when nothing is left to install: the queue is FIFO
+    // and a served module ahead of the unit legitimately lacks the block.
+    const check = globalThis.GEX_CHECK_INSTALL || (typeof process !== 'undefined' && process.env?.GEX_CHECK_INSTALL);
     await this.#installModule(this.#bytes().slice(ptr, ptr + len), e.gex_jit_slots() >>> 0, 64, null, 'jit2878');
     e.gex_jit_installed();
+    if (check && e.gex_miss_pc && e.gex_dispatch_slot && (e.gex_jit_pending_len() >>> 0) === 0) {
+      try {
+        const raw = e.gex_miss_pc();
+        const mpc = raw < 0n ? raw + (1n << 64n) : raw;
+        const packed = e.gex_dispatch_slot(mpc);
+        const tabs = this.#dispatchTables();
+        const stub = tabs[0].get(0);
+        let what;
+        if (packed < 0) what = 'no page-table entry';
+        else {
+          const t = packed >>> 24, sl = packed & 0xffffff;
+          const f = sl < (tabs[t]?.length ?? 0) ? tabs[t].get(sl) : 'past-end';
+          what = f === stub ? `STUB at table ${t} slot ${sl} (len ${tabs[t]?.length})` : f === 'past-end' ? `PAST END table ${t} slot ${sl} len ${tabs[t]?.length}` : null;
+        }
+        const dv = new DataView(this.#memory.buffer);
+        const dir = dv.getUint32(DISPATCH_DIR + Number(mpc >> 12n) * 4, true) >>> 0;
+        if (what) console.error(`[install-check] pid ${e.gex_my_pid?.() ?? '?'} miss pc 0x${mpc.toString(16)}: ${what}; dir entry t${dir >>> 24} s${dir & 0xffffff}, pt ${packed >= 0 ? `t${packed >>> 24} s${(packed & 0xffffff) - Number(mpc & 0xfffn)}` : '-'}`);
+      } catch (err) { console.error(`[install-check] failed: ${err}`); }
+    }
     // This Worker translated it, so the entry `gex_jit_installed` just added is
     // the newest here and must not be replayed on top of itself.
     const count = e.gex_module_count ? e.gex_module_count() >>> 0 : this.#installed;
@@ -2760,6 +2825,25 @@ export class Gex {
       // yield -- an `await` here goes to the back of the Worker's task queue.
       inst = new WebAssembly.Instance(mod, { gex: imports });
       this.#instantiateMs += performance.now() - ti;
+      // GEX_CHECK_INSTALL: for the unit this Worker just translated, was the
+      // missed pc's slot written by instantiation, and which segment holds it?
+      if (who === 'jit2878' && (globalThis.GEX_CHECK_INSTALL || (typeof process !== 'undefined' && process.env?.GEX_CHECK_INSTALL)) && e.gex_miss_pc && e.gex_dispatch_slot) {
+        try {
+          const raw = e.gex_miss_pc();
+          const mpc = raw < 0n ? raw + (1n << 64n) : raw;
+          const packed = e.gex_dispatch_slot(mpc);
+          if (packed >= 0) {
+            const t = packed >>> 24, sl = packed & 0xffffff;
+            const f = tables[t].get(sl);
+            const stub = tables[0].get(0);
+            {
+              const segs = elementSegmentsCovering(bytes, t, sl);
+              const st = f === null ? 'NULL' : f === stub ? 'STUB' : 'written';
+              console.error(`[inst-check] pid ${e.gex_my_pid?.() ?? '?'} miss pc 0x${mpc.toString(16)} slot t${t}/${sl} ${st} after instantiating a ${bytes?.byteLength ?? '?'}-byte module (${e.gex_jit_pending_len?.() >>> 0} pending); covering: ${JSON.stringify(segs)}; needs=${JSON.stringify(needs)}`);
+            }
+          }
+        } catch (err) { console.error(`[inst-check] failed: ${err}`); }
+      }
     } catch (first) {
       // Grow to everything the module could need and retry once. `need` read
       // loosely (only the table the total lands in) is right for a module whose

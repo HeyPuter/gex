@@ -384,6 +384,13 @@ try {
     args,
     opts: {
       strace,
+      // The debugging switches, in the run's own options as well as the boot
+      // message: `opts` is what a fork record carries to a child's Worker.
+      traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
+      traceMisses: !!process.env.GEX_TRACE_MISSES,
+      checkSp: !!process.env.GEX_CHECK_SP,
+      noIntrinsics: !!process.env.GEX_NO_INTRINSICS,
+      intrinsicMask: process.env.GEX_INTRINSIC_MASK ? Number(process.env.GEX_INTRINSIC_MASK) : undefined,
       // The suite compares this run against QEMU on the same machine, and QEMU
       // reports the real user.
       uid: process.getuid?.(),

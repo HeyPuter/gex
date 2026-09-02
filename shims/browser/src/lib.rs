@@ -9210,9 +9210,24 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 /// translated ahead of time, and the rest arrives here as needed. The shim
 /// lifts and encodes but cannot compile, so it leaves the module behind and
 /// traps out for JS to instantiate before resuming at the address that missed.
+/// The pc of the most recent dispatch miss, for the host's install check.
+static LAST_MISS_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_miss_pc() -> i64 {
+    LAST_MISS_PC.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+/// This process's pid, from the static every syscall refreshes.
+#[no_mangle]
+pub extern "C" fn gex_my_pid() -> i32 {
+    my_pid()
+}
+
 #[no_mangle]
 pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
+    LAST_MISS_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
         // did not come back from, and a line printed after never appears.
@@ -9548,6 +9563,32 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     if whole { usize::MAX } else { per_miss },
                     SERVE_MAX_BYTES,
                 );
+                // Only modules whose every page base agrees with this process's
+                // numbering (or names a page not numbered here yet). A module is
+                // written at the bases the process that BUILT it gave its pages;
+                // where this process gave the same page a different base, its
+                // blocks would land in slots that mean another page here --
+                // over a block this process already wrote, or under a directory
+                // entry that dispatches into it as something else. That is the
+                // x86 pipeline wild branch (`ls | cat`): 4096 slots a page makes
+                // two processes' numberings diverge in a few misses.
+                let before = ready.len();
+                let ready: Vec<_> = ready
+                    .into_iter()
+                    .filter(|(_, _, d, _)| {
+                        d.iter().all(|(p, b)| match h.jit.page_table.lookup(*p) {
+                            Some(have) => have == *b,
+                            None => true,
+                        })
+                    })
+                    .collect();
+                if tracing() && ready.len() != before {
+                    trace_line(&format!(
+                        "[gex] serve: {} of {} stored module(s) number a page differently here, not taken\n",
+                        before - ready.len(),
+                        before
+                    ));
+                }
                 if !ready.is_empty() {
                     if tracing() {
                         trace_line(&format!(
@@ -9568,8 +9609,12 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         // Every page they cover, before the install: install
                         // asks the shim which slot each block belongs in, and
                         // the answer comes from here.
+                        // Only pages this process has not numbered: see
+                        // `gex_jit_installed` for why a second base is fatal.
                         for (p, b) in d {
-                            h.jit.page_table.assign(*p, *b);
+                            if h.jit.page_table.lookup(*p).is_none() {
+                                h.jit.page_table.assign(*p, *b);
+                            }
                         }
                         dirs.extend_from_slice(d);
                         h.jit.reuse_served += 1;
@@ -9624,7 +9669,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // dpkg-deb/xz half of the debian-deb/lzma crash). The serve path
                 // above is what installs a shared module; until it has, leave
                 // the page at the miss stub so it translates locally instead.
-                if !h.jit.installed_mods.is_empty() {
+                if !h.jit.installed_mods.is_empty() && h.jit.page_table.lookup(page).is_none() {
                     if let Some(base) = shared_slot(h, page, key) {
                         h.jit.page_table.assign(page, base);
                         // And the guest's directory, which `execve` cleared: only
@@ -9780,6 +9825,19 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         h.jit.compiles += 1;
         h.jit.nanos += now_ns().saturating_sub(started);
         if tracing() {
+            // Whether the block that faulted is in what was built, and at which
+            // slot the builder placed it: a unit without it means the resume
+            // misses again; a unit with it at a slot the directory does not
+            // name means the resume runs something else.
+            let has = unit.exported_blocks.iter().any(|(a, _)| *a == pc);
+            let entry = h.jit.page_table.lookup(page).unwrap_or(0);
+            trace_line(&format!(
+                "[gex]   unit has block at pc={pc:#x}: {has}; page entry t{} base {} -> slot {}; blocks {:?}\n",
+                gex_abi::dispatch_entry_table(entry),
+                gex_abi::dispatch_entry_base(entry),
+                gex_abi::dispatch_index(pc, entry),
+                unit.exported_blocks.iter().take(12).map(|(a, _)| format!("{a:#x}")).collect::<Vec<_>>(),
+            ));
             trace_line(&format!(
                 "[gex]   translated {} blocks in {} ms, {} vmas, {} slots, {} pages\n",
                 stats.blocks,
@@ -10833,6 +10891,22 @@ pub extern "C" fn gex_jit_installed() {
         };
         let mut gm = GuestMem::new(guest_bytes());
         for (page, base) in done.dirs {
+            // A page has ONE base per process. A served module built elsewhere
+            // names its own bases; where this process already numbered the page
+            // (and wrote blocks at that base), pointing the directory at the
+            // served base strands those blocks and dispatches through slots
+            // that may hold anything -- the two-bases-per-page wild branch the
+            // x86 pipeline runs hit (`ls | cat`: 4096 slots a page made it
+            // common). The served blocks on such a page are simply unreachable;
+            // a miss there lifts locally, at the base the process has.
+            match h.jit.page_table.lookup(page) {
+                Some(have) if have != base => {
+                    dir_note(page, have, "install-done-kept-local");
+                    continue;
+                }
+                None => h.jit.page_table.assign(page, base),
+                _ => {}
+            }
             dir_note(page, base, "install-done");
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
         }
