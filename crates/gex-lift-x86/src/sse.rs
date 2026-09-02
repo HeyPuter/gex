@@ -862,6 +862,22 @@ impl<'a> Lifter<'a> {
                     a: s,
                     b: None,
                 });
+                // wasm saturates; x86 answers the "integer indefinite"
+                // (INT_MIN) for a NaN or an out-of-range lane, in both
+                // directions. Positive overflow is the one case the two
+                // disagree on (saturation gives INT_MAX), plus NaN (0).
+                let r = if vl == VLane::F32 {
+                    let limit = self.vconst(0x4f00_0000u32.to_le_bytes().repeat(4).try_into().unwrap());
+                    let over = self.vbin(VLaneBinOp::GeS, VLane::F32, s, limit);
+                    let nan = self.vbin(VLaneBinOp::Ne, VLane::F32, s, s);
+                    let bad = self.vbit(VBinOp::Or, over, nan);
+                    let indefinite = self.vconst(0x8000_0000u32.to_le_bytes().repeat(4).try_into().unwrap());
+                    let keep = self.vbit(VBinOp::AndNot, r, bad);
+                    let fix = self.vbit(VBinOp::And, indefinite, bad);
+                    self.vbit(VBinOp::Or, keep, fix)
+                } else {
+                    r
+                };
                 self.wr_x(i.op0(), r);
             }
             Op::CvtMmx => return self.illegal(),
