@@ -1604,6 +1604,11 @@ const SESSION_APPS = [
     // With a script rather than bare: xterm with no `-e` looks for a shell in
     // the password file, and this image has no entry to find.
     cmd: 'xterm -e /bin/sh /usr/bin/shell.sh',
+    // xterm wants no GL of its own, but what a person types into it might:
+    // the marshaller goes on this subshell's library path, and everything
+    // launched from the terminal inherits it. Without that, a glxgears typed
+    // at the prompt finds no libGL at all -- the image carries no Mesa.
+    glEnv: true,
     on: true,
   },
   { id: 'xcalc', label: 'xcalc — X11, on the X server in this page', kind: 'x', cmd: 'xcalc' },
@@ -1615,6 +1620,25 @@ const SESSION_APPS = [
     kind: 'x',
     cmd: 'glxgears.aarch64-linux-gnu',
     on: true,
+  },
+  {
+    // The smallest GL client there is, and the one that finds driver bugs the
+    // big ones hide: it points glVertexAttribPointer at a stack array with no
+    // buffer bound, the way tutorial code and every mesa-demos program does.
+    //
+    // It currently draws upside down, and it is the only one that does: its
+    // binary's vertex data is red at (-1,-1), green at (1,-1) and blue at
+    // (0,1) -- blue at the top -- and what appears has blue at the bottom.
+    // glxgears through GLX, es2gears on Wayland and es2gears on X11 are all
+    // the right way up, in both compositors, so this is something about this
+    // client's own path through the marshaller rather than the orientation of
+    // a presented frame. Left in the picker because it is the smallest case
+    // that shows it.
+    id: 'es2tri',
+    label: 'es2tri — a triangle, client-side arrays (renders flipped)',
+    kind: 'x',
+    cmd: '/usr/bin/es2tri.aarch64-linux-gnu',
+    gl: true,
   },
   {
     id: 'glmark2',
@@ -1644,6 +1668,32 @@ const SESSION_APPS = [
     rootfs: '/rootfs/session-stk.tar',
   },
 ];
+
+/** One labelled row of radios, for a choice the session makes on its next run.
+ *
+ * The two of these -- which compositor, which Mesa -- are the same shape, and
+ * both are things a person should be able to try without editing a URL. */
+function radioGroup({ legend, name, current, options, onpick }) {
+  const group = document.createElement('div');
+  group.className = 'session-choice';
+  group.append(Object.assign(document.createElement('span'), { textContent: legend }));
+  for (const [value, text] of options) {
+    const label = document.createElement('label');
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = name;
+    radio.value = value;
+    radio.checked = current === value;
+    radio.onchange = () => {
+      if (!radio.checked || current === value) return;
+      current = value;
+      onpick(value);
+    };
+    label.append(radio, document.createTextNode(` ${text}`));
+    group.append(label);
+  }
+  return group;
+}
 
 /**
  * The session script: the environment every client needs, then each chosen app
@@ -1688,7 +1738,7 @@ function sessionScript(chosen, {
   for (const a of wl) {
     // Each app's own environment in a subshell, so one app's QT_QPA_PLATFORM
     // is not every app's.
-    const path = directGl && a.gl
+    const path = directGl && (a.gl || a.glEnv)
       ? 'LD_LIBRARY_PATH=/usr/lib/gex-gl:$LD_LIBRARY_PATH '
       : '';
     s += `(\n${a.env || ''}echo "gex: launching ${a.id}"\n${path}${a.cmd} 2>&1\n) &\n`;
@@ -1714,11 +1764,13 @@ function sessionScript(chosen, {
 
     for (const a of x) {
       s += `echo "gex: launching ${a.id}"\n`;
-      // An OpenGL client gets the marshaller on its path and nothing else
-      // does: Xwayland links libGL for glamor, and finding this one there
-      // kills the X server at load (`undefined symbol:
-      // glConvolutionParameterfv`) and every client with it.
-      const path = directGl && a.gl
+      // An OpenGL client gets the marshaller on its path, and so does a
+      // terminal, whose children may want it (see `glEnv`). Not everything,
+      // still: this list is what asks for GL, and a program that never does
+      // should not have its libGL answered by a marshaller. The old reason --
+      // a guest Xwayland linking libGL for glamor and dying at load on it --
+      // is gone with the guest Xwayland.
+      const path = directGl && (a.gl || a.glEnv)
         ? 'LD_LIBRARY_PATH=/usr/lib/gex-glx:/usr/lib/gex-gl:$LD_LIBRARY_PATH '
         : '';
       s += `(\n${a.env || ''}${path}${a.cmd} 2>&1\n) &\n`;
@@ -1728,7 +1780,10 @@ function sessionScript(chosen, {
     // something the picker does not list without rebuilding anything.
     if (extra) {
       s += `echo "gex: launching ${extra}"\n`;
-      s += `${extra} 2>&1 &\n`;
+      // With the GL path, since what this is for is trying a client the
+      // picker does not list -- and half of those are GL clients.
+      const path = directGl ? 'LD_LIBRARY_PATH=/usr/lib/gex-glx:/usr/lib/gex-gl:$LD_LIBRARY_PATH ' : '';
+      s += `${path}${extra} 2>&1 &\n`;
       s += `sleep ${stagger}\n`;
     }
   }
@@ -1839,7 +1894,9 @@ const compositor = {
     + 'copied twice. Nothing in the guest is a graphics driver. Every window is drawn from the '
     + 'guest\'s own memory: nothing copies a frame. The X11 clients share one X server and are '
     + 'cheap; a Qt or KDE toolkit translates 100 MB of its own code, so pick one of those at a '
-    + 'time. The choice below puts each window in an element instead, with the frames in HTML.',
+    + 'time. Two choices below: which compositor draws the windows -- one WebGL scene, or an element '
+    + 'each with the frames in this page\'s HTML -- and which driver Mesa uses, '
+    + 'virglrenderer on WebGL or gex_wgpu on WebGPU.',
   // The image has apt in it, so a session can install into itself -- which
   // needs a Wisp relay, set with `?wisp=` (see the Debian demo).
   network: true,
@@ -1864,6 +1921,10 @@ const compositor = {
     // per choice rather than switched: `output()` replaces it in place, which
     // is only allowed between runs.
     let mode = new URLSearchParams(location.search).get('desktop') === 'dom' ? 'dom' : 'scene';
+    // And which driver Mesa uses for it. virgl is the path with years on it;
+    // gex_wgpu is newer and buggier, and having both a click apart is how one
+    // gets compared against the other. `?glbackend=wgpu` picks it up front.
+    let glMode = new URLSearchParams(location.search).get('glbackend') === 'wgpu' ? 'wgpu' : 'virgl';
     let wlCanvas = null;
     const buildOutput = () => {
       const asDom = mode === 'dom';
@@ -1913,35 +1974,41 @@ const compositor = {
       picker.append(label);
       boxes.set(a.id, box);
     }
-    // And which compositor draws them. A radio rather than a checkbox because
-    // it is one output either way, and it takes effect on the next run: the
-    // desktop is built when the session starts.
-    const desktopPick = document.createElement('div');
-    desktopPick.className = 'session-desktop';
-    desktopPick.append(Object.assign(document.createElement('span'),
-                                     { textContent: 'windows drawn by:' }));
-    for (const [value, text] of [
-      ['scene', 'one WebGL scene (decorations drawn by the compositor)'],
-      ['dom', 'an element each (decorations in this page\'s HTML)'],
-    ]) {
-      const label = document.createElement('label');
-      const radio = document.createElement('input');
-      radio.type = 'radio';
-      radio.name = 'gex-desktop';
-      radio.value = value;
-      radio.checked = mode === value;
-      radio.onchange = () => {
-        if (!radio.checked || mode === value) return;
+    // And which compositor draws them, and which Mesa draws the OpenGL.
+    // Radios rather than checkboxes because each is one choice, and both take
+    // effect on the next run: the desktop and the GL device are built when the
+    // session starts.
+    picker.append(radioGroup({
+      legend: 'windows drawn by:',
+      name: 'gex-desktop',
+      current: mode,
+      options: [
+        ['scene', 'one WebGL scene (decorations drawn by the compositor)'],
+        ['dom', 'an element each (decorations in this page\'s HTML)'],
+      ],
+      onpick: (value) => {
         mode = value;
         buildOutput();
         ctx.hint(value === 'dom'
           ? 'windows will be elements, with the frames in HTML'
           : 'windows will be drawn in one WebGL scene');
-      };
-      label.append(radio, document.createTextNode(` ${text}`));
-      desktopPick.append(label);
-    }
-    picker.append(desktopPick);
+      },
+    }));
+    picker.append(radioGroup({
+      legend: 'OpenGL through:',
+      name: 'gex-gl-backend',
+      current: glMode,
+      options: [
+        ['virgl', 'virglrenderer, on this page\'s WebGL'],
+        ['wgpu', 'gex_wgpu, straight onto WebGPU'],
+      ],
+      onpick: (value) => {
+        glMode = value;
+        ctx.hint(value === 'wgpu'
+          ? 'Mesa will use the gex_wgpu driver; a frame reaches the scene as an upload'
+          : 'Mesa will encode for virglrenderer, whose frames the compositor draws directly');
+      },
+    }));
     document.getElementById('terminal')?.before(wrap);
     wrap.before(picker);
     ctx.onLeave(() => {
@@ -1965,6 +2032,12 @@ const compositor = {
     const start = async (seconds) => {
       ctx.actions([]);
       running(true);
+      // A fresh output for every run. The scene compositor takes the canvas
+      // over -- `transferControlToOffscreen` -- and a canvas allows that once,
+      // so re-running the session on the one from last time throws before
+      // anything starts. Rebuilding is also what clears the previous run's
+      // windows out of the DOM desktop.
+      buildOutput();
       const chosen = SESSION_APPS.filter((a) => boxes.get(a.id)?.checked);
       if (!chosen.length && !qp.get('xtra')) {
         ctx.term.writeln('nothing selected');
@@ -2057,6 +2130,7 @@ const compositor = {
           // the guest marshalling to Mesa in the compositor's worker.
           virgl: directGl ? null : renderer,
           gl: directGl ? 'compositor' : null,
+          glBackend: glMode,
           wl: wlCanvas,
           wlInput: wlCanvas,
           hostX,

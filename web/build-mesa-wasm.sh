@@ -94,6 +94,18 @@ else
         -j"${JOBS:-$(nproc)}"
 fi
 
+# Where the page loads them from. Left out before, so a rebuilt module sat in
+# the build directory while the site served whatever had last been copied by
+# hand -- which looks exactly like a change that did not work.
+PUB="$ROOT/web/public/gex"
+if [ -d "$PUB" ]; then
+    for f in gex-wgpu-replay.js gex-wgpu-replay.wasm; do
+        [ -f "$BUILD/src/gallium/targets/gex-wasm/$f" ] || continue
+        cp "$BUILD/src/gallium/targets/gex-wasm/$f" "$PUB/$f"
+        echo "  published $PUB/$f"
+    done
+fi
+
 printf '%s\n' \
     "$BUILD/src/gallium/targets/gex-wasm/gex-mesa-smoke.js" \
     "$BUILD/src/gallium/targets/gex-wasm/gex-mesa-replay.js" \

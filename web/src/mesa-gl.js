@@ -111,14 +111,14 @@ export class MesaGlDevice {
    * The renderer owns the canvas and blits what it last drew onto it, so this
    * backend never presents anything itself.
    */
-  static async #onVirgl(canvas, { url, api, major, minor }) {
+  static async #onVirgl(canvas, { url, api, major, minor, preserve }) {
     const out = new MesaGlDevice();
     try {
       const { VirglRenderer } = await import('./virgl.js');
       // In this context on purpose: the winsys calls across synchronously,
       // from inside a wasm frame, with nothing to await on.
       const renderer = await VirglRenderer.create(canvas, '/gex/gexvirgl.mjs', null,
-                                                  { inProcess: true });
+                                                  { inProcess: true, preserve });
       if (!renderer.ok) throw new Error(renderer.describe?.() || 'the renderer would not start');
       out.#renderer = renderer;
 
@@ -180,13 +180,19 @@ export class MesaGlDevice {
    */
   static async create(canvas, options = {}) {
     const {
-      url = '/gex/gex-wgpu-replay.js',
       api = 'es',
       major = 0,
       minor = 0,
-      backend = url.includes('virgl') ? 'virgl' : 'wgpu',
+      // The backend is the choice; the module follows from it. Naming the
+      // module still works and still decides the backend when it is all a
+      // caller passes, but asking for a backend and getting the other one's
+      // module -- which is what a url-shaped default did -- cannot happen.
+      backend = (options.url || '').includes('virgl') ? 'virgl' : 'wgpu',
+      url = backend === 'virgl' ? '/gex/gex-virgl-replay.js' : '/gex/gex-wgpu-replay.js',
     } = options;
-    if (backend === 'virgl') return MesaGlDevice.#onVirgl(canvas, { url, api, major, minor });
+    if (backend === 'virgl') {
+      return MesaGlDevice.#onVirgl(canvas, { url, api, major, minor, preserve: options.preserve });
+    }
     const out = new MesaGlDevice();
     canvas.id = 'gex-gl';
     try {

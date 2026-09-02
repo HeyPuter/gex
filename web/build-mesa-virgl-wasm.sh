@@ -61,12 +61,21 @@ if [ ! -f "$BUILD/build.ninja" ]; then
         -Dbuild-tests=false
 fi
 
-ninja -C "$BUILD" \
-    src/gallium/targets/gex-wasm/gex-virgl-replay.js \
-    -j"${JOBS:-$(nproc)}"
+# The WebGPU driver too, when this tree has been configured for it (an
+# emdawnwebgpu package and a Tint build -- see build-mesa-wasm.sh). Same Mesa,
+# same decoder, a different Gallium driver under it, which is exactly what the
+# session's "OpenGL through:" choice switches between.
+TARGETS=src/gallium/targets/gex-wasm/gex-virgl-replay.js
+if meson configure "$BUILD" 2>/dev/null | grep -q '^  gex-emdawn-dir *[^ ]'; then
+    TARGETS="$TARGETS src/gallium/targets/gex-wasm/gex-wgpu-replay.js"
+fi
+
+# shellcheck disable=SC2086
+ninja -C "$BUILD" $TARGETS -j"${JOBS:-$(nproc)}"
 
 mkdir -p "$PUB"
-for f in gex-virgl-replay.js gex-virgl-replay.wasm; do
+for f in gex-virgl-replay.js gex-virgl-replay.wasm gex-wgpu-replay.js gex-wgpu-replay.wasm; do
+    [ -f "$BUILD/src/gallium/targets/gex-wasm/$f" ] || continue
     cp "$BUILD/src/gallium/targets/gex-wasm/$f" "$PUB/$f"
     echo "  $PUB/$f: $(du -h "$PUB/$f" | cut -f1)"
 done

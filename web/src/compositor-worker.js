@@ -146,6 +146,10 @@ class Painter {
 
   begin(w, h) {
     const gl = this.gl;
+    if (gl.isContextLost?.()) {
+      this.saved = null;
+      return false;
+    }
     // This context is shared: the guest's OpenGL runs in it too (see
     // `startGl`). Two things follow, and both were learned the hard way.
     //
@@ -200,6 +204,17 @@ class Painter {
     const gl = this.gl;
     const s = this.saved;
     if (!s) return;
+    this.saved = null;
+    // A context that has been lost answers every query with null. Restoring
+    // state from that throws, once per frame, and buries whatever actually
+    // went wrong -- so say what happened and stop.
+    if (!s.viewport || !s.colorMask) {
+      if (!this.lost) {
+        this.lost = true;
+        console.error('[compositor] the WebGL context was lost; the scene is not being drawn');
+      }
+      return;
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, s.fb);
     gl.useProgram(s.program);
     gl.bindVertexArray(s.vao);
@@ -216,7 +231,6 @@ class Painter {
     gl.depthMask(s.depthMask);
     gl.colorMask(s.colorMask[0], s.colorMask[1], s.colorMask[2], s.colorMask[3]);
     gl.blendFunc(s.blendSrc, s.blendDst);
-    this.saved = null;
   }
 
   solid(x, y, w, h, color) {
@@ -343,6 +357,7 @@ class Compositor {
   #glSaidAt = 0;
   #glDraws = 0;
   #probeFbo = null;
+  #glExtTex = null;
   #focus = null;
   #pointer = { x: 0, y: 0, over: null, buttons: 0 };
   #drag = null;
@@ -725,6 +740,13 @@ class Compositor {
     const gl = this.#glSurface(win);
     if (gl) {
       this.#glDraws++;
+      if (gl.source) {
+        // A canvas, not a texture: upload it and draw it like any other
+        // top-row-first image. See `glFrame`.
+        const tex = this.#uploadGlCanvas(gl);
+        if (tex) this.#painter.textured(f.x, f.y, win.width, win.height, tex, { opaque: 1 });
+        return;
+      }
       // `uv` is an origin and a size, not two corners: flipping means starting
       // at the top and walking down. Read as corners it samples one row of the
       // frame across the whole window, which looks like vertical stripes in
@@ -739,6 +761,31 @@ class Compositor {
       swizzle: 1,
       opaque: win.info?.format === 1 ? 1 : 0,
     });
+  }
+
+  /** The WebGPU backend's frame, copied into a texture this context can draw.
+   *
+   * Every composited frame, because a canvas carries no serial of its own that
+   * says whether what is on it has changed. */
+  #uploadGlCanvas(frame) {
+    const gl = this.#gl;
+    try {
+      if (!this.#glExtTex) {
+        this.#glExtTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, this.#glExtTex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      } else {
+        gl.bindTexture(gl.TEXTURE_2D, this.#glExtTex);
+      }
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame.source);
+      return this.#glExtTex;
+    } catch (e) {
+      this.#note(`gl canvas upload failed: ${e?.message || e}`);
+      return null;
+    }
   }
 
   /** What this context reads out of the guest's texture: the compositor's own
@@ -803,7 +850,7 @@ class Compositor {
       : win.info?.xid === a.id;
     if (!hit) return null;
     const frame = glFrame();
-    return frame && frame.tex ? frame : null;
+    return frame && (frame.tex || frame.source) ? frame : null;
   }
 
   /** Children of a surface, in the order they should be drawn (above it). */
@@ -829,7 +876,9 @@ class Compositor {
       if (t && t.serial === s.serial) continue;
       this.#upload(k, s);
     }
-    this.#painter.begin(this.#outW, this.#outH);
+    // Nothing to draw into: see `Painter.begin`. The arena is still acked
+    // below on the next frame that works, so a restored context catches up.
+    if (this.#painter.begin(this.#outW, this.#outH) === false) return;
     gl.clearColor(...COL.desktop);
     gl.clear(gl.COLOR_BUFFER_BIT);
     // Windows bottom to top, each with its popups and subsurfaces above it.
@@ -1163,33 +1212,54 @@ let glDevice = null;
 let glRenderer = null;
 let glChannel = null;
 let glServing = false;
+// Where Mesa presents. The same canvas as this compositor's when virgl is
+// decoding -- its frames are then textures in this very context -- and a
+// canvas of its own when gex_wgpu is, because a canvas has one context and
+// WebGPU is not WebGL.
+let glTarget = null;
+let glPresentCanvas = null;
 
 /** What the guest last said its frames belong to, or null. */
 function glAttachment() {
   return glDevice?.ok ? glDevice.attachment() : null;
 }
 
-/** The frame itself: a texture in this context, or null if there is none. */
+/** The frame itself, or null if there is none.
+ *
+ * Two shapes, because the two backends hand it over differently: `tex` is a
+ * texture this context can bind (virgl decoded it here), `source` is a canvas
+ * to upload from (WebGPU drew it, and nothing else can touch that texture). */
 function glFrame() {
-  return glRenderer?.ok ? glRenderer.frame() : null;
+  if (glRenderer?.ok) return glRenderer.frame();
+  if (!glPresentCanvas) return null;
+  const w = glPresentCanvas.width, h = glPresentCanvas.height;
+  if (w < 2 || h < 2) return null;   // still at its placeholder size
+  return { source: glPresentCanvas, w, h, serial: glDevice?.presentedCount?.() ?? 0 };
 }
 
 async function startGl(m, canvas) {
+  const backend = m.backend === 'wgpu' ? 'wgpu' : 'virgl';
+  // A WebGPU context cannot be created on a canvas that already has WebGL's,
+  // so gex_wgpu presents into one of its own and the frame reaches the scene
+  // as an upload. One copy per frame, GPU-side -- the price of the API that
+  // cannot share a texture with the one this compositor draws in.
+  glTarget = backend === 'wgpu' ? new OffscreenCanvas(16, 16) : canvas;
   // Emscripten looks a canvas up by selector, and a worker has no document.
-  if (!globalThis.document) globalThis.document = { querySelector: () => canvas };
+  if (!globalThis.document) globalThis.document = { querySelector: () => glTarget };
   const { MesaGlDevice } = await import('./mesa-gl.js');
-  glDevice = await MesaGlDevice.create(canvas, {
-    backend: 'virgl',
-    url: m.url || '/gex/gex-virgl-replay.js',
+  glDevice = await MesaGlDevice.create(glTarget, {
+    backend,
+    url: m.url,
     api: m.api || 'core',
   });
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
   glRenderer = glDevice.renderer;
+  glPresentCanvas = glRenderer ? null : glTarget;
   // The compositor draws these frames where their window is; a blit would put
   // the last one over the whole output. `?glcanvas=1` keeps the blit, which
   // is how to tell "the renderer drew nothing" from "the compositor drew it
   // wrong" -- they look the same from outside.
-  glRenderer.presentToCanvas(!!m.canvasBlit);
+  glRenderer?.presentToCanvas(!!m.canvasBlit);
   glChannel = m.channel;
   postMessage({ kind: 'gl-ready', describe: glDevice.describe() });
   serveGlRing();

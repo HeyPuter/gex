@@ -323,6 +323,11 @@ export async function runProgram(
     network = null,
     onNetEvent = null,
     gl = null,
+    // Which Mesa the host runs when `gl` is 'compositor': 'virgl' (Gallium's
+    // virgl encoder, virglrenderer decoding on WebGL) or 'wgpu' (the gex_wgpu
+    // driver, straight onto WebGPU). Only the driver under Mesa differs -- the
+    // guest sees the same GL either way.
+    glBackend = 'virgl',
     // The compositor's output canvas. Its control is transferred to a worker
     // that owns a WebGL2 context and draws the whole scene there: every
     // window, its decorations, its menus, and the cursor.
@@ -475,6 +480,12 @@ export async function runProgram(
       const { DomDesktop } = await import('./dom-compositor.js');
       compositor = DomDesktop.create(element, wlChannel);
       globalThis.__gexDesktop = compositor;
+      // Deferred by that desktop until a window needs it: there is no scene
+      // to present into here, so the GL goes onto the window's own canvas and
+      // the window has to exist first. See `DomDesktop.hostGl`.
+      if (gl === 'compositor' && glChannel) {
+        await compositor.hostGl(glChannel, { api: 'core', backend: glBackend });
+      }
     }
     const canvas = typeof wl?.getContext === 'function' ? wl : null;
     if (canvas) {
@@ -485,6 +496,7 @@ export async function runProgram(
       if (gl === 'compositor' && glChannel) {
         await compositor.hostGl(glChannel, {
           api: 'core',
+          backend: glBackend,
           canvasBlit: new URLSearchParams(location.search).get('glcanvas') === '1',
         });
       }

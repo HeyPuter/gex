@@ -136,6 +136,8 @@ class DomWindow {
     this.relX = s.relX;
     this.relY = s.relY;
     this.serial = -1;
+    /** How many times this window has been painted from guest memory. */
+    this.paints = 0;
     this.onretitle = null;
     this.onresized = null;
     this.onplace = null;
@@ -197,6 +199,7 @@ class DomWindow {
 
   /** Draw one damaged rectangle out of the guest's memory, or all of it. */
   paint(mem, s, full = false) {
+    this.paints++;
     const { x, y, w, h } = clampDamage(s, this.canvas.width, this.canvas.height, full);
     if (w <= 0 || h <= 0) return;
     // The descriptor and the memory can disagree -- a client's bad buffer, or
@@ -264,6 +267,7 @@ export class DomDesktop {
   #running = false;
   #cursor = null;
   #records = [];
+  #silent = new Set();
   #cursorShown = -1;
 
   /** Called with each new window. The page keeps it and places its canvas. */
@@ -361,9 +365,25 @@ export class DomDesktop {
     return this.#gl;
   }
 
-  /** A guest process's memory, so its surfaces can be read. */
+  /** A guest process's memory, so its surfaces can be read.
+   *
+   * The `WebAssembly.Memory` is kept, not a view of it: growing it replaces
+   * the buffer, and a view taken at startup then covers only the first few
+   * megabytes of a process that has grown to hundreds. Every surface past
+   * that point reads as zero -- a window that is simply blank, with nothing
+   * to say for itself. */
   addMemory(token, memory) {
-    this.#memories.set(token, new Uint8Array(memory.buffer));
+    this.#memories.set(token, { memory, view: new Uint8Array(memory.buffer) });
+  }
+
+  /** The current view of a process's memory, re-derived if it has grown. */
+  #memoryOf(token) {
+    const held = this.#memories.get(token);
+    if (!held) return null;
+    if (held.view.buffer !== held.memory.buffer) {
+      held.view = new Uint8Array(held.memory.buffer);
+    }
+    return held.view;
   }
 
   dropMemory(token) {
@@ -472,13 +492,20 @@ export class DomDesktop {
     if (s.serial === win.serial) return;
     const prev = win.serial;
     win.serial = s.serial;
-    const mem = this.#memories.get(s.token);
+    const mem = this.#memoryOf(s.token);
     // Damage is a hint about what changed, not a promise that the rest is
     // already right. Paint the whole surface when there is nothing to go on:
     // the first frame, a commit that named no damage at all -- Xwayland does
     // that, which is why xeyes stayed blank -- or a commit this desktop never
     // saw, whose damage it therefore does not have.
-    if (mem) win.paint(mem, s, prev < 0 || s.serial !== prev + 1);
+    if (mem) {
+      win.paint(mem, s, prev < 0 || s.serial !== prev + 1);
+    } else if (!this.#silent.has(s.token)) {
+      // Said once per process: a window whose memory this desktop was never
+      // given is blank for a reason no pixel can show.
+      this.#silent.add(s.token);
+      console.warn(`[dom-desktop] no memory for token ${s.token}: ${win.title} cannot be painted`);
+    }
     if (win === this.#cursor) this.#showCursor(win);
   }
 
