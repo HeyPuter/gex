@@ -7002,3 +7002,39 @@ in the shader and stops asking the rasterizer for it.
 The cap also sets `GLSLFrontFacingIsSysVal`, so it changes the GLSL path as
 well as the TGSI one -- which is why it is worth more than the one program it
 was found by, and why it wants the CTS sweep rather than a spot check.
+
+### Where the sweep stands, and one trap in the harness itself
+
+Across the 336 programs, over the four fixes above:
+
+| | start | after locations + polygon offset | after gl_FrontFacing |
+|---|---|---|---|
+| RAN | 192 | 217 | 219 |
+| CRASH | 32 | 17 | **15** |
+| REFUSED | 60 | 54 | 54 |
+| WGPU-ERROR | 14 | 10 | 10 |
+
+**27 programs** moved out of a failing verdict. Note what the last column does
+and does not claim: the FrontFacing pass genuinely fixed `twoside`, and
+`moonlight` changed verdict without being fixed at all -- it still cannot
+create a Qt RHI context, it merely no longer reaches its own abort inside eight
+seconds. A program that fails for its own reasons will drift between verdicts
+run to run; only a change of *reason* is a fix.
+
+The harness itself produced a false result worth recording. Moving it from a
+scratch directory into `tests/` broke its path to the driver environment, every
+program exited 127, and because "exited non-zero" is not one of the driver
+verdicts, the comparison reported **81 programs fixed** -- a total failure
+reading as the best result of the day. It is now self-contained (it exports the
+driver environment itself and refuses to start without a driver and a display),
+and exit 127 has its own `HARNESS` verdict so it can never again be mistaken
+for progress. Three programs legitimately land there: `dotewm` wants a
+libGLEW this system does not have, and `qs`/`quickshell` have unresolved Qt
+Wayland symbols.
+
+Of the 15 remaining crashes, 13 are not this driver's -- Wayland compositors,
+KMS, GLX context creation -- leaving `dlist-degenerate` (crashes before any GL
+work) and one shader that still cannot split a combined sampler. The 54
+refusals are dominated by polygon mode LINE/POINT (10 programs, which would
+need triangles rewritten to line topology) plus line and polygon stipple and
+line smoothing, none of which WebGPU has.

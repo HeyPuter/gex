@@ -27,21 +27,33 @@
 # not the pass rate -- many need input, or a feature no one has claimed -- but
 # which ones the *driver* refuses or crashes in.
 set -u
-S=$(dirname "$0")
 OUT=${1:-/tmp/glsweep}
 LIST=${2:-/tmp/glapps.txt}
 mkdir -p "$OUT"
 : > "$OUT/results.tsv"
 printf 'app\tverdict\texit\tnote\n' >> "$OUT/results.tsv"
-export DISPLAY=:77
-bash "$S/ensure-display.sh" >/dev/null 2>&1
+
+# Self-contained, deliberately. An earlier version shelled out to a run.sh
+# beside itself, which was true where it was written and false once it lived
+# here -- every program then exited 127 and, because "exit non-zero" is not one
+# of the driver verdicts below, the whole run read as though the failures had
+# been fixed. A harness that cannot run the thing it is measuring has to say
+# so, which is what the HARNESS verdict is for.
+INST=${GEX_INST:-/tmp/gex-mesa-native/inst}
+export DISPLAY=${GEX_DISPLAY:-:77}
+export LD_LIBRARY_PATH=$INST/lib:$HOME/.cache/gex-dawn-native/pkg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export LIBGL_DRIVERS_PATH=$INST/lib/dri
+export LIBGL_ALWAYS_SOFTWARE=1
+export GALLIUM_DRIVER=${GALLIUM_DRIVER:-gex_wgpu}
+[ -d "$INST/lib/dri" ] || { echo "no driver at $INST/lib/dri" >&2; exit 2; }
+xdpyinfo >/dev/null 2>&1 || { echo "no X display at $DISPLAY" >&2; exit 2; }
 while read -r app; do
   name=$(basename "$app")
   case "$name" in
     aseprite|cemu|dolphin-emu|dolphin-emu-nogui|mpv) continue ;;
   esac
   log="$OUT/$name.log"
-  timeout -s KILL 8 "$S/run.sh" "$app" >"$log" 2>&1
+  timeout -s KILL 8 "$app" >"$log" 2>&1
   rc=$?
   # The driver's own complaints, which are the point of the sweep. Format
   # probing ("render target refused") is routine and not a complaint.
@@ -51,7 +63,9 @@ while read -r app; do
   wgpuerr=$(grep -c "WebGPU error" "$log" 2>/dev/null || echo 0)
   latched=$(grep -c "gex_wgpu context failed\|context latched" "$log" 2>/dev/null || echo 0)
   note=""
-  if [ "$rc" -gt 128 ] && [ "$rc" -ne 137 ]; then
+  if [ "$rc" -eq 127 ]; then
+    verdict=HARNESS; note="could not execute"
+  elif [ "$rc" -gt 128 ] && [ "$rc" -ne 137 ]; then
     verdict=CRASH; note="signal $((rc-128))"
   elif [ "$wgpuerr" -gt 0 ]; then
     verdict=WGPU-ERROR
