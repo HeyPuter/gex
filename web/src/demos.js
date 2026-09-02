@@ -1830,11 +1830,13 @@ const compositor = {
   blurb:
     'gex-wayland as a compositor: several AArch64 programs at once, each its own guest process, '
     + 'in windows this page draws the frames for. Qt and KDE apps take server-side decorations, '
-    + 'GTK draws its own, X11 programs arrive through a rootless Xwayland whose window manager is '
-    + 'this compositor, and OpenGL goes through the guest\'s Mesa to virglrenderer -- all in one '
-    + 'output, all in one WebGL context. Every window is drawn from the guest\'s own memory: '
-    + 'nothing copies a frame. The X11 clients share one X server and are cheap; a Qt or KDE '
-    + 'toolkit translates 100 MB of its own code, so pick one of those at a time.',
+    + 'GTK draws its own, X11 programs arrive through an X server that is part of this page '
+    + 'rather than a guest program, and OpenGL is marshalled out of the guest to Mesa in the '
+    + 'compositor\'s own worker -- so a GL window is a texture it draws rather than a frame '
+    + 'copied twice. Nothing in the guest is a graphics driver. Every window is drawn from the '
+    + 'guest\'s own memory: nothing copies a frame. The X11 clients share one X server and are '
+    + 'cheap; a Qt or KDE toolkit translates 100 MB of its own code, so pick one of those at a '
+    + 'time. `?desktop=dom` puts each window in an element instead, with the frames in HTML.',
   // The image has apt in it, so a session can install into itself -- which
   // needs a Wisp relay, set with `?wisp=` (see the Debian demo).
   network: true,
