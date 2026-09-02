@@ -7851,3 +7851,184 @@ cases check that all three samples are *identical* and that the colour is the
 last vertex's; the smooth case checks that they differ and that each channel
 grows towards its own corner, because absolute thresholds there would be
 asserting where an 8x8 window falls inside a triangle that reaches past it.
+
+
+## Geometry shaders that read a uniform, and four bugs behind them (2026-09-02)
+
+`gsraytrace` and `geom-outlining-150` both rendered a black window, and both
+for the same first reason: `set_constant_buffer` **failed the context** for
+any stage other than vertex or fragment. The geometry stage takes real data --
+`gs_draw` already binds `ctx->constant_buffers[MESA_SHADER_GEOMETRY]` through
+`gex_wgpu_bind_constants`, and everything below is indexed by stage -- so the
+only thing missing was permission to store them.
+
+Accepting them let the geometry pass run for the first time, and it ran into
+three more faults in a row. Each was invisible while the context was failing
+at the first call.
+
+**Two writable storage bindings over one buffer.** WebGPU forbids it, and one
+vertex buffer feeding several attributes arrives as several Gallium slots
+pointing at the same resource -- `gsraytrace` binds one 4 MiB buffer to four:
+
+```
+Writable storage buffer binding aliasing found between [BindGroup] set at bind
+group index 0, binding index 0, and ... binding index 1, with overlapping
+ranges (offset: 0, size: 4194304)
+```
+
+The vertex-buffer blocks the compute passes read are now declared
+`NonWritable`, which Tint maps to `var<storage, read>`, and read-only storage
+bindings may alias. **zink's `emit_bo` never looked at `var->data.access`**, so
+the decoration had to be added there before the declaration could say so; the
+layout entries had to change to `ReadOnlyStorage` in the same commit, since
+WebGPU rejects a layout that disagrees with the shader.
+
+**The index-bounds scan read from a NULL shadow.** The draw path scans the
+index buffer's CPU shadow to find the highest vertex an element will read, and
+dereferenced `->shadow` without checking it. A buffer written only on the GPU
+has none: the geometry stage's compute pass writes `ctx->gs_indices` and
+nothing ever maps it, so this was `NULL + offset`. The scan feeds a diagnostic
+overrun warning and nothing else, so not knowing the bound costs only the
+warning.
+
+**A GL buffer is retargetable and a WebGPU buffer is not.** `glBufferData`
+names one target and the application may bind the same object anywhere
+afterwards, while a WGPU buffer's usage is fixed at creation. `gsraytrace`
+writes a buffer with transform feedback and then draws from it, so st/mesa
+created it with `PIPE_BIND_STREAM_OUTPUT` alone and the vertex bind was
+refused -- "not bound as a vertex buffer ... bind=0x400". Every buffer
+resource now carries the union of the usages a GL buffer might need (vertex,
+index, uniform, storage, both copy directions), and the vertex- and
+index-buffer paths no longer consult the Gallium bind flags, which record what
+a buffer was created *for* rather than what it can do. MapRead and MapWrite
+stay absent -- this driver keeps its own CPU shadow and never maps a WGPU
+buffer -- which is also what keeps the combination legal.
+
+`gsraytrace` now draws its scene: the same spheres in the same places and
+colours as llvmpipe. What is still missing is the reflections on the ground,
+and that is the known geometry-shader transform-feedback gap -- the driver
+says so ("transform feedback with a geometry shader is not captured") and
+fixing it needs the prefix-sum pipeline described earlier. Worth recording
+that this demo is a user of it: the gap had no application behind it before.
+
+
+## The GL_QUADS diagonal, which is not a defect (2026-09-02)
+
+`quad` and `quad-degenerate` show up in the pixel comparison at RMSE 0.24, and
+the shape of the difference is unmistakable: the four corner colours agree with
+llvmpipe and the interior gradient runs the other way -- green across the
+middle where llvmpipe is red. Sampling the centre says which diagonal each one
+split on. llvmpipe's centre is the average of the top-left and bottom-right
+colours; gex_wgpu's is the average of the top-right and bottom-left.
+
+**This driver never gets asked.** `GL_QUADS` is decomposed above it, by Mesa's
+own `vbo_save`, against `ctx->Const.DriverSupportedPrimMask` -- and that call
+passes `PV_LAST`, which selects `do_quad`'s `inpv == LAST` branch: triangles
+(v0, v1, v3) and (v1, v2, v3), the v1-v3 diagonal. llvmpipe advertises
+`GL_QUADS`, so nothing converts them and its `draw` module splits (v0, v1, v2)
+and (v0, v2, v3) instead. Confirmed by `GEX_WGPU_PRIM_LOG=1`, which never
+prints for this program: the driver's own `u_primconvert` is not on the path.
+
+The GL specification leaves the decomposition of a quadrilateral
+implementation-dependent, so both are legal and neither is a bug to fix. The
+only way to match llvmpipe would be to advertise `GL_QUADS` and convert them
+in the driver with `PV_FIRST`, which would then take a flat-shaded quad's
+colour from the wrong vertex. Not worth it, and worth writing down so the next
+reading of the comparison list does not chase it.
+
+**One real fix came out of looking.** Nothing was calling
+`util_primconvert_save_flatshade_first`, so the driver's own primconvert had
+`api_pv` at its zero default of `PV_FIRST` while GL's convention is the last
+vertex. That decides the vertex order of every primitive it *does* convert, so
+a flat-shaded line loop or polygon took its colour from the wrong end. Every
+driver using primconvert calls this from `bind_rasterizer_state`.
+
+
+## The index rewrites were corrupting the heap (2026-09-02)
+
+The comparison sweep's second finding, and it was a regression from the first:
+`fire` and `fbo_firecube` stopped making a window at all, with
+
+```
+malloc(): invalid next size (unsorted)
+```
+
+nothing to do with indices on the face of it. `GEX_WGPU_NO_PROVOKING=1` --
+added to measure the provoking-vertex rewrite's cost -- put both programs back,
+which named the culprit in one run. Valgrind then named the line:
+
+```
+Invalid write of size 2
+   at generate_tris_uint16_last2first_tris (u_indices_gen.c:515)
+   by gex_wgpu_draw_provoking_last (gex_wgpu_screen.c:14495)
+```
+
+**u_indices' generated functions write one whole primitive per iteration and
+stop on `j < out_nr`.** With `out_nr` not a multiple of the primitive's stride,
+the last iteration writes past the end: `fire` draws TRIANGLES with 3524
+vertices, so the generator wrote 3526 uint16 into a 3524-entry buffer. The
+count has to be trimmed to whole primitives first -- `u_trim_pipe_prim`, which
+`u_primconvert` calls one line before its own translator call for exactly this
+reason.
+
+**The same latent bug was already in `gex_wgpu_draw_unfilled`**, which had been
+passing `draw->count` raw since it was written. It had not been caught because
+glPolygonMode is rare and its programs happened to draw whole primitives. Both
+call sites trim now.
+
+Worth keeping from this: the env switch added to measure a change's cost is
+also the fastest bisect for a regression it caused, and it costs nothing to
+leave in. And a "malloc(): invalid next size" from a GL program is worth
+one valgrind run before any reasoning -- 100 seconds of it named the exact
+generated function, which no amount of reading the driver would have.
+
+
+## What the pixel comparison says overall (2026-09-02)
+
+277 programs that the app sweep classified as RAN or OK, photographed on
+llvmpipe and on gex_wgpu at a fixed delay after their window appeared:
+
+| RMSE against llvmpipe | programs |
+|---|---|
+| <= 0.02 | 128 |
+| <= 0.05 | 57 |
+| <= 0.12 | 39 |
+| > 0.12 | 29 |
+| no window (offscreen, or no reference) | 24 |
+
+**185 of 253 are at 0.05 or below**, which for an animated program photographed
+twice is as close as this harness can measure. The tail is what to read, and
+almost all of it is phase rather than pixels: `gears`, `glxgears`, `bounce`,
+`glxheads`, `glthreads`, `clear-repeat`, `cubemap` and `arbfplight` all differ
+only in where a rotation or a light had got to -- `arbfplight` has the same
+shading with its highlight a few degrees round.
+
+What the tail actually contained, in the order it was found:
+
+- **flat shading** -- fixed, and the reason the harness exists.
+- **`gsraytrace`, `geom-outlining-150`** -- geometry-shader constant buffers,
+  and the four bugs behind them. Fixed.
+- **`fire`, `fbo_firecube`** -- the heap corruption above, which the harness
+  found because they stopped making a window at all.
+- **`quad`, `quad-degenerate`** -- the GL_QUADS diagonal, which is
+  unspecified. Not a defect; documented so it is not chased again.
+- **`points`, `spriteblast`** -- `glPointSize` has no effect, because WGSL has
+  no `point_size` builtin and WebGPU rasterises every point as one pixel.
+  Implementable by expanding each point into a quad in a vertex-shader
+  variant, which would also give `gl_PointCoord` its real value instead of the
+  centre constant it returns now. Not attempted.
+- **`textures`** -- three of four objects, and the missing one is a
+  sphere-mapped quad. Uninvestigated; the demo animates, so a still comparison
+  cannot separate the missing object from a different phase without stopping
+  it.
+- **`sharedtex_mt`**, **`glthreads`** -- multithreaded; a still comparison says
+  little.
+- **`gltestperf`** -- llvmpipe's frame is nearly empty and gex_wgpu's is a full
+  moiré pattern, so gex_wgpu is more likely the one drawing what was asked.
+
+The harness itself has one caveat worth repeating: `import -window` on X11
+without a compositor reads the *screen*, so an overlapping window from another
+run contaminates the capture. Two early comparisons in this session were
+wrong for that reason -- `samplers_array` read 0.377 against a stale window and
+0.007 once the display was its own. Run it with nothing else on the display,
+or on a display of its own.
