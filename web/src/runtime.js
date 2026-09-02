@@ -250,6 +250,31 @@ class TerminalEnv extends Env {
  * that does not fork.
  */
 let kernelSpec = null;
+/** Start the guest's OpenGL in whichever compositor is drawing.
+ *
+ * A failure here is not a failed session. The GL device is one part of a
+ * desktop -- a device that will not start means GL clients have nowhere to
+ * draw, and every other window, the X server and the shell are unaffected.
+ * Throwing took the whole run down with it, which is a black page instead of
+ * a session with one thing missing from it, and the reason was in a console
+ * message rather than anywhere a person would look.
+ *
+ * The guest is told nothing: its `/dev/gex-gl` still exists and its ring is
+ * still there, so a GL client blocks on a device that never answers rather
+ * than failing at `eglInitialize`. That is the same shape as a machine whose
+ * GPU has fallen over, and better than pretending the session is broken.
+ */
+async function startHostGl(compositor, glChannel, opts) {
+  try {
+    return await compositor.hostGl(glChannel, opts);
+  } catch (e) {
+    const why = e?.message || String(e);
+    console.error(`[gex] the guest's OpenGL did not start (${opts.backend || 'virgl'}): ${why}`);
+    globalThis.__gexGlError = why;
+    return null;
+  }
+}
+
 async function loadKernel() {
   if (kernelSpec !== null) return kernelSpec || null;
   // Test for `SharedArrayBuffer` directly, not `crossOriginIsolated`: it is
@@ -480,11 +505,10 @@ export async function runProgram(
       const { DomDesktop } = await import('./dom-compositor.js');
       compositor = DomDesktop.create(element, wlChannel);
       globalThis.__gexDesktop = compositor;
-      // Deferred by that desktop until a window needs it: there is no scene
-      // to present into here, so the GL goes onto the window's own canvas and
-      // the window has to exist first. See `DomDesktop.hostGl`.
+      // The GL goes onto the window's own canvas here rather than into a
+      // scene: see `DomDesktop.hostGl`.
       if (gl === 'compositor' && glChannel) {
-        await compositor.hostGl(glChannel, { api: 'core', backend: glBackend });
+        await startHostGl(compositor, glChannel, { api: 'core', backend: glBackend });
       }
     }
     const canvas = typeof wl?.getContext === 'function' ? wl : null;
@@ -494,7 +518,7 @@ export async function runProgram(
       compositor = await Compositor.create(canvas, wlChannel, wlInput || canvas);
       globalThis.__gexCompositor = compositor;
       if (gl === 'compositor' && glChannel) {
-        await compositor.hostGl(glChannel, {
+        await startHostGl(compositor, glChannel, {
           api: 'core',
           backend: glBackend,
           canvasBlit: new URLSearchParams(location.search).get('glcanvas') === '1',

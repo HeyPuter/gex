@@ -156,10 +156,18 @@ export class MesaGlDevice {
           return n;
         },
         close: (session) => renderer.close(session),
+        // Which window the frame about to be flushed belongs to. Said by the
+        // decoder, one module over, because only it knows -- and needed by
+        // the renderer, which keeps a frame per window.
+        surface: (uid) => renderer.presentSurface(uid),
+        // And that a finished frame of it is on its way: the renderer keeps
+        // a copy only then, so a mid-frame flush is not mistaken for one.
+        swap: (uid) => renderer.expectPresent(uid),
       };
       // No JSPI here: virglrenderer runs the commands before `feed` returns,
       // so a submit is an ordinary call.
-      out.#submit = (ptr, len) => out.#module._gex_gl_submit(ptr, len);
+      out.#submit = (ptr, len, client) =>
+        out.#module._gex_gl_submit(ptr, len, client >>> 0);
       if (out.#module._gex_gl_set_api)
         out.#module._gex_gl_set_api(api === 'core' ? 1 : 0, major, minor);
       const rc = out.#module._gex_gl_init(canvas.width, canvas.height);
@@ -302,8 +310,12 @@ export class MesaGlDevice {
     return `${this.#submits} submits, ${(this.#bytes / 1024) | 0} KiB`;
   }
 
-  /** Run one batch. `memory` holds the ring; `ring` is its offset. */
-  submit(memory, ring) {
+  /** Run one batch. `memory` holds the ring; `ring` is its offset.
+   *
+   * `client` names the guest process the batch came from: it gets a GL
+   * context of its own on the host, because the object names in the stream
+   * are its own and another process hands out the same ones. */
+  submit(memory, ring, client = 0) {
     if (!this.#module) return -1;
     const words = new Uint32Array(memory.buffer, ring, HEADER_BYTES / 4);
     if (words[H_MAGIC] !== MAGIC) return -1;
@@ -383,7 +395,7 @@ export class MesaGlDevice {
     };
     let result;
     try {
-      result = this.#submit(ptr, tail);
+      result = this.#submit(ptr, tail, client >>> 0);
     } catch (e) {
       return report(e);
     }
@@ -411,6 +423,60 @@ export class MesaGlDevice {
       token: m._gex_gl_attached_token(),
       generation: m._gex_gl_attached_generation(),
     };
+  }
+
+  /** Every window the host is drawing, one entry each.
+   *
+   * `frame` is what the renderer keys that window's picture by -- pass it to
+   * `renderer.frameFor` -- and `kind`/`id`/`token` are the window itself, as
+   * `attachment()` describes them. The list is what makes more than one GL
+   * window possible: a compositor asks per window rather than being told
+   * about whichever one presented last. */
+  surfaces() {
+    const m = this.#module;
+    if (!m?._gex_gl_surface_count) {
+      // A module without the enumeration: report its single attachment in the
+      // same shape, so callers need no second path.
+      const one = this.attachment();
+      return one && one.id ? [{ ...one, frame: 0, client: one.token }] : [];
+    }
+    const out = [];
+    const count = m._gex_gl_surface_count();
+    for (let i = 0; i < count; i++) {
+      out.push({
+        kind: m._gex_gl_surface_kind(i),
+        id: m._gex_gl_surface_id(i),
+        token: m._gex_gl_surface_token(i),
+        client: m._gex_gl_surface_client(i),
+        frame: m._gex_gl_surface_frame(i),
+        width: m._gex_gl_surface_width(i),
+        height: m._gex_gl_surface_height(i),
+      });
+    }
+    return out;
+  }
+
+  /** Bumped whenever a window is attached or goes away. */
+  surfaceGeneration() {
+    return this.#module?._gex_gl_surface_generation?.() ?? 0;
+  }
+
+  /** That process is gone: release its context, its windows and their frames.
+   *
+   * A client that exits says nothing -- it is not there to say it -- so the
+   * page says it instead. Its frames go too, which is what stops a
+   * compositor drawing the last picture of a window that has closed. */
+  forgetClient(client) {
+    const m = this.#module;
+    if (!m?._gex_gl_forget_client || !client) return;
+    // The frames first: after the client is gone its surfaces are no longer
+    // enumerable, so this is the last chance to know which they were.
+    if (this.#renderer) {
+      for (const s of this.surfaces()) {
+        if (s.client === client && s.frame) this.#renderer.forgetSurface(s.frame);
+      }
+    }
+    m._gex_gl_forget_client(client >>> 0);
   }
 
   /** Present whatever the guest last drew. */

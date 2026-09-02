@@ -758,7 +758,13 @@ export class Gex {
         net_close: (id) => this.#net?.close(id),
         // Graphics: the guest's GL library batched commands in its own memory;
         // this hands over the address and the page runs them on WebGL.
-        gl_submit: (ring) => (this.#gl ? this.#gl.submit(this.#memory, ring >>> 0) : -1),
+        // The token as well as the ring: the host keeps a GL context per
+        // process, because the object names in the stream are this process's
+        // own and another process hands out the same ones.
+        gl_submit: (ring) =>
+          (this.#gl
+            ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken())
+            : -1),
         // The other GPU path: unmodified Mesa speaking VirGL over a socket,
         // decoded by virglrenderer (a separate wasm module with its own heap,
         // so bytes not an address -- see web/src/virgl.js). `session` says

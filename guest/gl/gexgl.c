@@ -2018,8 +2018,74 @@ static void *egl_current_display;
 static void *egl_current_context;
 static void *egl_current_draw;
 static void *egl_current_read;
+/* The window surfaces this process has, and which one is current.
+ *
+ * `eglCreateWindowSurface` used to return the same made-up handle to every
+ * caller, which is fine for a client with one window and wrong for anything
+ * else: the host kept one drawable, so a second window's frames went into the
+ * first window's, and whichever surface attached last owned them both. A
+ * handle per surface is what lets the host keep a drawable per window and the
+ * compositor put each frame where it belongs.
+ *
+ * Eight, because a client with more windows than that drawing GL into all of
+ * them is not a thing that happens; the ninth gets the handle of the first
+ * free slot when one closes. */
+#define GEXGL_MAX_SURFACES 8
+struct gexgl_egl_surface {
+    unsigned handle;     /* zero for a free slot */
+    int kind;            /* GEXGL_SURFACE_X, GEXGL_SURFACE_WAYLAND, or -1 */
+    unsigned id;         /* XID, or wl_surface object id */
+    int width, height;
+    /* Wayland only, and per surface for the same reason as everything else:
+       the proxy to commit at every swap and the window structure a resize is
+       written into. */
+    void *wl_proxy;
+    const struct gexgl_wl_egl_window *wl_window;
+    /* The frame callback this surface has outstanding, if any. */
+    void *wl_callback;
+};
+static struct gexgl_egl_surface egl_surfaces[GEXGL_MAX_SURFACES];
+static unsigned egl_next_surface_handle = 1;
+static struct gexgl_egl_surface *egl_surface;   /* the current drawable */
+
+/* The current surface's size, which is what eglQuerySurface answers and what
+ * the pbuffer path sets. Kept beside the table rather than inside it because
+ * a query can arrive before anything has been created. */
 static int egl_surface_width = 256;
 static int egl_surface_height = 256;
+
+static struct gexgl_egl_surface *egl_surface_new(void) {
+    for (unsigned i = 0; i < GEXGL_MAX_SURFACES; i++) {
+        if (egl_surfaces[i].handle) continue;
+        struct gexgl_egl_surface *s = &egl_surfaces[i];
+        *s = (struct gexgl_egl_surface){ .handle = egl_next_surface_handle++,
+                                         .kind = -1 };
+        return s;
+    }
+    fprintf(stderr, "gex-gl: more than %d EGL surfaces at once;"
+                    " the newest shares the current one\n", GEXGL_MAX_SURFACES);
+    return NULL;
+}
+
+static struct gexgl_egl_surface *egl_surface_of(void *handle) {
+    const unsigned h = (unsigned)(uintptr_t)handle;
+    for (unsigned i = 0; i < GEXGL_MAX_SURFACES; i++)
+        if (egl_surfaces[i].handle && egl_surfaces[i].handle == h)
+            return &egl_surfaces[i];
+    return NULL;
+}
+
+/* Make this surface the one the host draws into, and remember its size for
+ * the queries that ask. Sent even when it has not changed on the host's side
+ * only when it has: a SURFACE_CURRENT per frame would be harmless but is
+ * noise in a trace. */
+static void egl_surface_use(struct gexgl_egl_surface *s) {
+    if (!s || s == egl_surface) return;
+    egl_surface = s;
+    egl_surface_width = s->width > 0 ? s->width : egl_surface_width;
+    egl_surface_height = s->height > 0 ? s->height : egl_surface_height;
+    CMD1(GEXGL_SURFACE_CURRENT, s->handle);
+}
 static int egl_context_major = 3;
 static int egl_context_minor;
 /* Which desktop GL profile to ask the host for: 1 is compatibility, 0 leaves
@@ -2321,15 +2387,15 @@ struct gexgl_wl_egl_window {
  * libwayland-client mapped: what arrives here is an XID for an X client and a
  * pointer for a Wayland one, and dereferencing the first would be reading a
  * small integer as an address. */
-/* The `wl_surface` this process draws to, when it is a Wayland client. Kept
- * so `eglSwapBuffers` can commit it: see `gexgl_wl_commit`. */
-static void *gexgl_wl_proxy;
-/* The window structure itself, and the surface's object id: both wanted every
- * swap, to notice a resize. */
-static const struct gexgl_wl_egl_window *gexgl_wl_window;
-static unsigned gexgl_wl_surface;
-
-static unsigned gexgl_wl_surface_id(void *win) {
+/* Which `wl_surface` a window is, and the two things a swap needs from it --
+ * the proxy to commit and the structure a resize is written into -- are kept
+ * per surface in `egl_surfaces`, not once per process: a client with two
+ * windows commits two surfaces, and committing the wrong one is a frame
+ * callback that never comes for the window that is waiting.
+ *
+ * Fills `into` when there is one, and returns the object id either way. */
+static unsigned gexgl_wl_surface_id_into(void *win,
+                                         struct gexgl_egl_surface *into) {
     if (!win || (uintptr_t)win < 4096 || ((uintptr_t)win & (sizeof(void *) - 1)))
         return 0;
     void *wayland = dlopen("libwayland-client.so.0", RTLD_LAZY | RTLD_NOLOAD);
@@ -2350,11 +2416,16 @@ static unsigned gexgl_wl_surface_id(void *win) {
         return 0;
     }
     if (!w->surface) return 0;
-    gexgl_wl_proxy = w->surface;
-    gexgl_wl_window = w;
-    gexgl_wl_surface = proxy_id(w->surface);
-    return gexgl_wl_surface;
+    const unsigned id = proxy_id(w->surface);
+    if (into) {
+        into->kind = GEXGL_SURFACE_WAYLAND;
+        into->id = id;
+        into->wl_proxy = w->surface;
+        into->wl_window = w;
+    }
+    return id;
 }
+
 
 /* Commit the surface, which is what a real EGL does inside eglSwapBuffers.
  *
@@ -2373,21 +2444,28 @@ static unsigned gexgl_wl_surface_id(void *win) {
  * nobody: a real EGL notices at the next swap, and so does this. Without it
  * the frame is one size and the window another, and the compositor stretches
  * whatever it was given. */
-static void gexgl_wl_follow_size(void) {
-    if (!gexgl_wl_proxy || !gexgl_wl_window) return;
-    const struct gexgl_wl_egl_window *w = gexgl_wl_window;
+static void gexgl_wl_follow_size(struct gexgl_egl_surface *s) {
+    if (!s || !s->wl_proxy || !s->wl_window) return;
+    const struct gexgl_wl_egl_window *w = s->wl_window;
     if (w->width <= 0 || w->height <= 0) return;
-    if (w->width == egl_surface_width && w->height == egl_surface_height) return;
-    egl_surface_width = w->width;
-    egl_surface_height = w->height;
+    if (w->width == s->width && w->height == s->height) return;
+    s->width = w->width;
+    s->height = w->height;
+    if (s == egl_surface) {
+        egl_surface_width = w->width;
+        egl_surface_height = w->height;
+    }
+    /* The current drawable is the one SURFACE_RESIZE means, so say which
+       first. Cheap when it is already current: see `egl_surface_use`. */
+    egl_surface_use(s);
     CMD2(GEXGL_SURFACE_RESIZE, w->width, w->height);
-    unsigned args[4] = { GEXGL_SURFACE_WAYLAND, gexgl_wl_surface,
+    unsigned args[4] = { GEXGL_SURFACE_WAYLAND, s->id,
                          (unsigned)w->width, (unsigned)w->height };
     ioctl(gl_fd, GEXGL_SURFACE, args);
 }
 
-static void gexgl_wl_commit(void) {
-    if (!gexgl_wl_proxy) return;
+static void gexgl_wl_commit(struct gexgl_egl_surface *s) {
+    if (!s || !s->wl_proxy) return;
     void *wayland = dlopen("libwayland-client.so.0", RTLD_LAZY | RTLD_NOLOAD);
     if (!wayland) return;
     void (*marshal)(void *, unsigned) = dlsym(wayland, "wl_proxy_marshal");
@@ -2408,70 +2486,89 @@ static void gexgl_wl_commit(void) {
         dlsym(wayland, "wl_proxy_marshal_constructor");
     const void *callback_interface = dlsym(wayland, "wl_callback_interface");
     void (*proxy_destroy)(void *) = dlsym(wayland, "wl_proxy_destroy");
-    static void *last_callback;
+    /* Per surface: one callback outstanding per window, destroyed when its
+       replacement is asked for. Shared, a second window's commit destroyed
+       the first window's pending callback and that window stopped drawing. */
     if (marshal_ctor && callback_interface) {
-        if (last_callback && proxy_destroy) proxy_destroy(last_callback);
-        last_callback = marshal_ctor(gexgl_wl_proxy, 3, callback_interface, NULL);
+        if (s->wl_callback && proxy_destroy) proxy_destroy(s->wl_callback);
+        s->wl_callback = marshal_ctor(s->wl_proxy, 3, callback_interface, NULL);
     }
 
-    marshal(gexgl_wl_proxy, 6);
+    marshal(s->wl_proxy, 6);
     void *(*get_display)(void *) = dlsym(wayland, "wl_proxy_get_display");
     int (*flush)(void *) = dlsym(wayland, "wl_display_flush");
-    if (get_display && flush) flush(get_display(gexgl_wl_proxy));
+    if (get_display && flush) flush(get_display(s->wl_proxy));
 }
 
 void *eglCreateWindowSurface(void *dpy, void *config, void *win,
                              const int *attrs) {
     (void)dpy; (void)config; (void)attrs;
+    struct gexgl_egl_surface *s = egl_surface_new();
+    if (!s) return (void *)(uintptr_t)(egl_surface ? egl_surface->handle : 1);
     int w = 0, h = 0;
     if (gexgl_x11_window_size(win, &w, &h)) {
+        s->kind = GEXGL_SURFACE_X;
+        s->id = (unsigned)(uintptr_t)win;
+        s->width = w;
+        s->height = h;
+        /* Which window this surface's frames belong to, so a compositor can
+           put them inside it rather than over everything: the host draws for
+           a guest whose window lives somewhere else, and without this there
+           is nowhere to put the pixels. The handle goes with it, which is
+           what allows a second window at the same time -- the host keeps a
+           drawable per handle. Attaching also makes it current. */
+        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X, s->id,
+             (unsigned)getpid(), s->handle);
+        egl_surface = s;
         egl_surface_width = w;
         egl_surface_height = h;
-        /* The host surface is what reaches the canvas, so the application's
-           window size is the one to present at. A later resize of the window
-           is not tracked -- nothing here has asked for one. */
+        /* The host's drawable is what reaches the screen, so the size the
+           application's window has is the size to draw at. */
         CMD2(GEXGL_SURFACE_RESIZE, w, h);
-        /* And which window it is, so a compositor can put the frame inside it
-           rather than over everything. The host draws for a guest whose window
-           lives somewhere else; without this there is nowhere to put it. */
-        CMD3(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X,
-             (unsigned)(uintptr_t)win, (unsigned)getpid());
-    } else {
-        unsigned surface = gexgl_wl_surface_id(win);
-        if (!surface)
-            fprintf(stderr, "gex-gl: eglCreateWindowSurface: %p is neither an X"
-                            " window nor a wl_egl_window\n", win);
-        if (surface) {
-            const struct gexgl_wl_egl_window *ww = win;
-            if (ww->width > 0 && ww->height > 0) {
-                egl_surface_width = ww->width;
-                egl_surface_height = ww->height;
-                CMD2(GEXGL_SURFACE_RESIZE, ww->width, ww->height);
-            }
-            CMD3(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_WAYLAND, surface,
-                 (unsigned)getpid());
-            /* And tell this process's own compositor, which is a different
-               thing from telling the host: nothing will ever be attached to
-               this surface -- the frames are drawn on the host and never come
-               back -- so without this it stays unmapped and is never shown at
-               all. */
-            unsigned args[4] = { GEXGL_SURFACE_WAYLAND, surface,
-                                 (unsigned)egl_surface_width,
-                                 (unsigned)egl_surface_height };
-            const int marked = ioctl(gl_fd, GEXGL_SURFACE, args);
-            fprintf(stderr, "gex-gl: wl_surface %u is drawn on the host,"
-                            " %dx%d (%s)\n",
-                    surface, egl_surface_width, egl_surface_height,
-                    marked == 0 ? "ok" : strerror(errno));
+    } else if (gexgl_wl_surface_id_into(win, s)) {
+        const struct gexgl_wl_egl_window *ww = win;
+        if (ww->width > 0 && ww->height > 0) {
+            s->width = ww->width;
+            s->height = ww->height;
         }
+        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_WAYLAND, s->id,
+             (unsigned)getpid(), s->handle);
+        egl_surface = s;
+        if (s->width > 0 && s->height > 0) {
+            egl_surface_width = s->width;
+            egl_surface_height = s->height;
+            CMD2(GEXGL_SURFACE_RESIZE, s->width, s->height);
+        }
+        /* And tell this process's own compositor, which is a different thing
+           from telling the host: nothing will ever be attached to this
+           surface -- the frames are drawn on the host and never come back --
+           so without this it stays unmapped and is never shown at all. */
+        unsigned args[4] = { GEXGL_SURFACE_WAYLAND, s->id,
+                             (unsigned)egl_surface_width,
+                             (unsigned)egl_surface_height };
+        const int marked = ioctl(gl_fd, GEXGL_SURFACE, args);
+        fprintf(stderr, "gex-gl: wl_surface %u is drawn on the host,"
+                        " %dx%d (%s)\n",
+                s->id, egl_surface_width, egl_surface_height,
+                marked == 0 ? "ok" : strerror(errno));
+    } else {
+        fprintf(stderr, "gex-gl: eglCreateWindowSurface: %p is neither an X"
+                        " window nor a wl_egl_window\n", win);
+        /* Still a surface, and still a drawable of its own: a client that
+           goes on to draw into it gets its frames rendered, they simply have
+           no window to be composited into. */
+        egl_surface_use(s);
     }
-    return (void *)2;
+    return (void *)(uintptr_t)s->handle;
 }
 
 void *eglCreatePbufferSurface(void *dpy, void *config, const int *attrs) {
     (void)dpy; (void)config;
-    /* The host's surface is sized at startup; a pbuffer request resizes it,
-       which is the closest thing to what the caller asked for. */
+    /* A drawable of its own, with no window attached to it: offscreen is
+       exactly what a pbuffer is, and a client that has one as well as a
+       window must not have them share. */
+    struct gexgl_egl_surface *s = egl_surface_new();
+    if (!s) return (void *)(uintptr_t)(egl_surface ? egl_surface->handle : 1);
     int w = 0, h = 0;
     if (attrs) {
         for (const int *a = attrs; *a != 0x3038; a += 2) {
@@ -2479,16 +2576,30 @@ void *eglCreatePbufferSurface(void *dpy, void *config, const int *attrs) {
             else if (a[0] == 0x3056) h = a[1]; /* EGL_HEIGHT */
         }
     }
+    s->width = w;
+    s->height = h;
+    egl_surface_use(s);
     if (w > 0 && h > 0) {
         egl_surface_width = w;
         egl_surface_height = h;
         CMD2(GEXGL_SURFACE_RESIZE, w, h);
     }
-    return (void *)2;
+    return (void *)(uintptr_t)s->handle;
 }
 
 unsigned eglDestroySurface(void *dpy, void *surface) {
-    (void)dpy; (void)surface;
+    (void)dpy;
+    struct gexgl_egl_surface *s = egl_surface_of(surface);
+    if (!s) return EGL_TRUE;
+    /* The host holds a drawable, a colour buffer and a depth buffer for this
+       surface, and -- for a window -- a frame the compositor may still be
+       drawing. Saying it is gone is what frees them; a client that exits
+       without saying so is cleaned up by the page instead, which notices the
+       process has gone. */
+    CMD1(GEXGL_SURFACE_DETACH, s->handle);
+    flush();
+    if (egl_surface == s) egl_surface = NULL;
+    *s = (struct gexgl_egl_surface){ .kind = -1 };
     return EGL_TRUE;
 }
 
@@ -2523,6 +2634,11 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
     egl_current_context = ctx;
     egl_current_draw = ctx ? draw : NULL;
     egl_current_read = ctx ? read : NULL;
+    /* Which drawable the host should render into from here on. This is the
+       call that means it, and the reason a client with two windows can draw
+       both: without it the host drew everything into whichever surface was
+       created last. */
+    if (ctx && draw) egl_surface_use(egl_surface_of(draw));
     return EGL_TRUE;
 }
 
@@ -2532,15 +2648,20 @@ static int egl_swap_interval = 1;
 static uint32_t egl_swaps_issued;
 
 unsigned eglSwapBuffers(void *dpy, void *surface) {
-    (void)dpy; (void)surface;
+    (void)dpy;
+    /* The surface named here, not the one that happens to be current: a
+       client that draws two windows in one frame swaps each in turn. */
+    struct gexgl_egl_surface *s = egl_surface_of(surface);
+    if (s) egl_surface_use(s);
+    else s = egl_surface;
     /* Preserve the swap boundary in the wire stream. WebGL displays its
        default framebuffer automatically, while explicit APIs such as WebGPU
        must acquire and submit a surface image here. */
     // What a real EGL does here as well as presenting: notice a resize, and
     // commit -- the commit is what carries the frame callback this client is
     // waiting for.
-    gexgl_wl_follow_size();
-    gexgl_wl_commit();
+    gexgl_wl_follow_size(s);
+    gexgl_wl_commit(s);
     CMD0(GEXGL_PRESENT);
     flush();
     /* How many frames the page has actually shown. Zero from a decoder that

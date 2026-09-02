@@ -344,6 +344,54 @@ export class VirglRenderer {
     };
   }
 
+  /** Which surface the frames that follow belong to. */
+  presentSurface(uid) {
+    if (!this.ok || this.#worker) return;
+    this.#module._gex_virgl_present_surface?.(uid >>> 0);
+  }
+
+  /** The next finished frame belongs to this surface. */
+  expectPresent(uid) {
+    if (!this.ok || this.#worker) return;
+    this.#module._gex_virgl_expect_present?.(uid >>> 0);
+  }
+
+  /** One surface's own latest frame, as a texture in this renderer's context.
+   *
+   * `uid` is the surface id the GL device hands out (`surfaces()` there), and
+   * what makes several windows possible: the renderer keeps a frame each, so
+   * a compositor asks per window instead of getting whichever window
+   * presented last. Null when that surface has not drawn yet. */
+  frameFor(uid) {
+    if (!this.ok || this.#worker || !uid) return null;
+    const name = this.#module._gex_virgl_frame_texture?.(uid) ?? 0;
+    if (!name) return null;
+    const tex = this.#module.GL?.textures?.[name] ?? null;
+    if (!tex) return null;
+    return {
+      tex,
+      w: this.#module._gex_virgl_frame_width(uid),
+      h: this.#module._gex_virgl_frame_height(uid),
+      serial: this.#module._gex_virgl_frame_serial(uid),
+    };
+  }
+
+  /** Draw one surface's frame onto this renderer's canvas.
+   *
+   * For a compositor with no scene of its own: it copies this canvas into the
+   * window's, one window at a time, which is how several windows are drawn
+   * from one renderer without a texture ever crossing a context. */
+  showSurface(uid) {
+    if (!this.ok || this.#worker || !uid) return false;
+    return (this.#module._gex_virgl_show_surface?.(uid) ?? 0) !== 0;
+  }
+
+  /** That window is gone: let its frame go. */
+  forgetSurface(uid) {
+    if (!this.ok || this.#worker || !uid) return;
+    this.#module._gex_virgl_forget_surface?.(uid);
+  }
+
   /** Whether this renderer draws in the very context a compositor is using.
    *
    * A texture cannot cross a WebGL context, so a compositor that samples one

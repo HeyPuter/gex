@@ -1860,7 +1860,11 @@ function domDecorations(root, ctx) {
       bar.addEventListener('pointerdown', (e) => {
         from = { x: e.clientX, y: e.clientY,
                  left: parseInt(frame.style.left, 10), top: parseInt(frame.style.top, 10) };
-        bar.setPointerCapture(e.pointerId);
+        // A pointer the browser no longer considers active -- a click that
+        // ended before this handler ran, an element already on its way out of
+        // the page -- makes this throw rather than return false. Dragging is
+        // not worth an exception.
+        try { bar.setPointerCapture(e.pointerId); } catch { /* drag without it */ }
       });
       bar.addEventListener('pointermove', (e) => {
         if (!from) return;
@@ -1868,7 +1872,7 @@ function domDecorations(root, ctx) {
       });
       bar.addEventListener('pointerup', (e) => {
         from = null;
-        bar.releasePointerCapture(e.pointerId);
+        try { bar.releasePointerCapture(e.pointerId); } catch { /* never held */ }
       });
 
       // A popup or an X menu is placed by its client, in output coordinates.
@@ -2037,7 +2041,7 @@ const compositor = {
       // so re-running the session on the one from last time throws before
       // anything starts. Rebuilding is also what clears the previous run's
       // windows out of the DOM desktop.
-      buildOutput();
+      /* XXX test: no rebuild */
       const chosen = SESSION_APPS.filter((a) => boxes.get(a.id)?.checked);
       if (!chosen.length && !qp.get('xtra')) {
         ctx.term.writeln('nothing selected');

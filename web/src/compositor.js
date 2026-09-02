@@ -68,13 +68,27 @@ export class Compositor {
   }
 
   async #start(canvas, channel, inputTarget) {
+    const sameTarget = inputTarget === canvas;
+    // A canvas can be handed to a worker once and never again, and a page
+    // that runs a session twice hands over the same element the second time:
+    // `transferControlToOffscreen` then throws an InvalidStateError before
+    // anything has started, which reads as the compositor being broken rather
+    // than as this element having been used up. It has: put a fresh one in
+    // its place and hand that over.
+    let offscreen;
+    try {
+      offscreen = canvas.transferControlToOffscreen();
+    } catch (e) {
+      canvas = freshCanvas(canvas);
+      if (sameTarget) inputTarget = canvas;
+      offscreen = canvas.transferControlToOffscreen();
+    }
     this.#canvas = canvas;
     this.#stats = new SharedArrayBuffer(16);
     const worker = new Worker(new URL('./compositor-worker.js', import.meta.url), {
       type: 'module',
     });
     this.#worker = worker;
-    const offscreen = canvas.transferControlToOffscreen();
     const ready = new Promise((resolve, reject) => {
       const onMessage = ({ data: m }) => {
         if (m.kind === 'ready') {
@@ -220,4 +234,24 @@ export class Compositor {
     }
     if (globalThis.__gexCompositor === this) delete globalThis.__gexCompositor;
   }
+}
+
+/** A canvas exactly like this one, in its place in the page.
+ *
+ * Everything a compositor's output needs carried over: the pixel size it is
+ * drawn at, the id and classes a page's CSS and a harness both look it up by,
+ * whatever inline style it was given, and its place in the tab order -- so
+ * the replacement is the same element as far as the rest of the page is
+ * concerned. The old one is left with nothing referring to it.
+ */
+function freshCanvas(old) {
+  const fresh = document.createElement('canvas');
+  fresh.width = old.width;
+  fresh.height = old.height;
+  fresh.id = old.id;
+  fresh.className = old.className;
+  if (old.hasAttribute('style')) fresh.setAttribute('style', old.getAttribute('style'));
+  if (old.hasAttribute('tabindex')) fresh.setAttribute('tabindex', old.getAttribute('tabindex'));
+  if (old.parentNode) old.replaceWith(fresh);
+  return fresh;
 }

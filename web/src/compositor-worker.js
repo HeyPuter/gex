@@ -826,8 +826,11 @@ class Compositor {
     // Every two seconds rather than on change: what matters is whether frames
     // keep arriving, and a state that never changes says nothing about that.
     const now = performance.now();
+    const list = glSurfaceList();
     const stamp = now - this.#glSaidAt > 2000
-      ? `${a ? `${a.kind}:${a.id}@${a.token}#${a.generation}` : 'none'} f${f0?.serial ?? 0}`
+      ? `${list.length} surface(s) `
+        + list.map((s) => `${s.kind}:${s.id}@${s.token}/${s.frame}`).join(' ')
+        + ` f${f0?.serial ?? 0}`
       : this.#glSaid;
     if (stamp !== this.#glSaid) this.#glSaidAt = now;
     if (stamp !== this.#glSaid) {
@@ -841,15 +844,8 @@ class Compositor {
         + `, device ${glDevice?.glState?.() ?? '?'}`
         + `, renderer ${glRenderer?.glState?.() ?? '?'}`);
     }
-    if (!a || !a.id) return null;
-    // A Wayland client names its own surface and the process that published
-    // it; an X client names a drawable, and the window manager is what put
-    // that window's id on the record.
-    const hit = a.kind === 0
-      ? win.token === a.token && win.surface === a.id
-      : win.info?.xid === a.id;
-    if (!hit) return null;
-    const frame = glFrame();
+    // Per window, out of the device's list of them: see `glFrameFor`.
+    const frame = glFrameFor(win);
     return frame && (frame.tex || frame.source) ? frame : null;
   }
 
@@ -1188,6 +1184,7 @@ function loop() {
     // `eglSwapBuffers` waits for this count to move. On the page that was the
     // demo's own animation loop; here there is no other loop to do it, and a
     // client that swapped once would wait for ever.
+    glTick++;
     glDevice?.display?.();
     comp.frame();
   } catch (e) {
@@ -1222,6 +1219,59 @@ let glPresentCanvas = null;
 /** What the guest last said its frames belong to, or null. */
 function glAttachment() {
   return glDevice?.ok ? glDevice.attachment() : null;
+}
+
+/* Every window the host's GL is drawing, and what it last drew for each.
+ *
+ * Re-read when the device says the list has changed, which is what makes more
+ * than one GL window work: each window is matched against its own entry and
+ * drawn from its own frame, rather than every GL window being handed whichever
+ * frame presented last. */
+let glSurfaces = [];
+let glSurfaceFrame = -1;
+// Bumped once per composited frame, so the list above is read once per frame
+// however many windows ask for it.
+let glTick = 0;
+
+function glSurfaceList() {
+  if (!glDevice?.ok) return [];
+  // Once per frame, and read fresh rather than when a counter says it
+  // changed: a list captured while only one client had attached and never
+  // refreshed is a second GL window that is never drawn, which is a much
+  // worse trade than the handful of wasm calls this costs.
+  if (glSurfaceFrame === glTick) return glSurfaces;
+  glSurfaceFrame = glTick;
+  const before = glSurfaces;
+  glSurfaces = glDevice.surfaces();
+  // A window that has gone leaves a frame behind; the renderer holds a
+  // texture the size of that window until someone says it may go.
+  for (const old of before) {
+    if (!old.frame) continue;
+    if (glSurfaces.some((s) => s.frame === old.frame)) continue;
+    glRenderer?.forgetSurface?.(old.frame);
+  }
+  return glSurfaces;
+}
+
+/* The GL frame for one window, or null.
+ *
+ * A Wayland client names its own surface and the process that published it;
+ * an X client names a drawable, and the window manager is what knows which
+ * surface that window became (`xid` on the record). */
+function glFrameFor(win) {
+  for (const s of glSurfaceList()) {
+    if (!s.id) continue;
+    const hit = s.kind === 0
+      ? win.token === s.token && win.surface === s.id
+      : win.info?.xid === s.id;
+    if (!hit) continue;
+    const frame = s.frame ? glRenderer?.frameFor?.(s.frame) : null;
+    // A device without per-surface frames (the WebGPU backend has one canvas
+    // and one frame) still has the one; it is this window's if the match
+    // above says so.
+    return frame || glFrame();
+  }
+  return null;
 }
 
 /** The frame itself, or null if there is none.
@@ -1295,6 +1345,11 @@ self.onmessage = ({ data: m }) => {
       comp?.addMemory(m.token, m.memory);
     } else if (m.kind === 'drop-memory') {
       comp?.dropMemory(m.token);
+      // That process is gone: its GL context, its windows and their frames go
+      // with it. Nothing else will ever say so -- a client that exits is not
+      // there to send a detach.
+      glDevice?.forgetClient?.(m.token);
+      glSurfaceFrame = -1;
     } else if (m.kind === 'resize') {
       comp?.resize(m.width, m.height);
     } else if (m.kind === 'pointer-move') {

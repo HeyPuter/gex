@@ -15,6 +15,15 @@
 
 const STATE = 0; // 0 idle, 1 request, 2 reply
 const RESULT = 1;
+// Which guest process the request belongs to. The host keeps a GL context per
+// client: object names are the guest's to allocate, so two processes hand out
+// the same ones and a single context would give the second client the first
+// one's textures.
+const CLIENT = 2;
+// The ring is one buffer and every process copies into it, so it has to be
+// claimed. Holds the claiming client's own number, which is what makes a
+// stuck claim diagnosable rather than just stuck.
+const LOCK = 3;
 const IDLE = 0;
 const REQUEST = 1;
 const REPLY = 2;
@@ -67,7 +76,7 @@ export function serveGl(glDevice, channel) {
     };
     let result;
     try {
-      result = glDevice.submit(asMemory, 0);
+      result = glDevice.submit(asMemory, 0, Atomics.load(ctl, CLIENT) >>> 0);
     } catch (e) {
       // A device that throws must still reply, or the Worker blocks forever
       // inside its ioctl.
@@ -123,17 +132,57 @@ export class GlProxy {
     this.#wake = wake;
   }
 
-  /** Run the ring at `ring` in the guest `memory`, blocking for the reply. */
-  submit(memory, ring) {
+  /** Run the ring at `ring` in the guest `memory`, blocking for the reply.
+   *
+   * `client` names this process to the host, which keeps a GL context per
+   * client. Zero for a caller that has no identity to give.
+   */
+  submit(memory, ring, client = 0) {
     const gbytes = new Uint8Array(memory.buffer);
     const ghead = new Uint32Array(memory.buffer, ring, HEADER_BYTES / 4);
     const capacity = ghead[H_CAPACITY];
     const tail = ghead[H_TAIL];
     if (HEADER_BYTES + tail > this.#data.length) return -1;
+
+    const ctl = this.#ctl;
+    // One ring, and as many processes as have OpenGL open. Without a claim,
+    // two of them copy their commands over each other and the host decodes
+    // the mixture -- which is not a corrupt frame, it is a rejected batch and
+    // a client that stops dead.
+    //
+    // Stealing after thirty seconds is deliberate: a holder that has not
+    // finished in that time is a process that died inside its ioctl, and
+    // waiting for it for ever would take every other GL client with it.
+    const mine = client || 1;
+    const until = Date.now() + 30000;
+    for (;;) {
+      const held = Atomics.compareExchange(ctl, LOCK, 0, mine);
+      if (held === 0) break;
+      // Waiting on the value the claim just saw, not on a fresh read of it: a
+      // re-read races with the release, `wait` returns "not-equal" at once,
+      // and the loop becomes a spin that eats the core its guest runs on --
+      // which with two GL clients starves the very page they are waiting for.
+      Atomics.wait(ctl, LOCK, held, 50);
+      if (Date.now() > until) {
+        console.warn(`[gl] taking the ring from client ${held}`);
+        Atomics.store(ctl, LOCK, mine);
+        break;
+      }
+    }
+    try {
+      return this.#exchange(gbytes, ring, capacity, tail, client);
+    } finally {
+      Atomics.store(ctl, LOCK, 0);
+      Atomics.notify(ctl, LOCK);
+    }
+  }
+
+  #exchange(gbytes, ring, capacity, tail, client) {
     // Forward: the header and the commands recorded so far.
     this.#data.set(gbytes.subarray(ring, ring + HEADER_BYTES + tail), 0);
 
     const ctl = this.#ctl;
+    Atomics.store(ctl, CLIENT, client >>> 0);
     Atomics.store(ctl, STATE, REQUEST);
     Atomics.notify(ctl, STATE);
     this.#wake();

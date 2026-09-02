@@ -64,6 +64,7 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -115,7 +116,7 @@ void mesa_get_internal_format_iv(GLenum target, GLenum internal_format,
 
 enum Op : uint32_t {
     CONTEXT_CREATE = 1, SURFACE_RESIZE = 2, FINISH = 3, PRESENT = 4,
-    SURFACE_ATTACH = 5,
+    SURFACE_ATTACH = 5, SURFACE_CURRENT = 6, SURFACE_DETACH = 7,
     CLEAR_COLOR = 16, CLEAR = 17, VIEWPORT = 18, ENABLE = 19, DISABLE = 20,
     BLEND_FUNC = 21, DEPTH_FUNC = 22, CULL_FACE = 23, FRONT_FACE = 24,
     SCISSOR = 25, PIXEL_STOREI = 26, CLEAR_DEPTH = 27, DEPTH_MASK = 28,
@@ -226,6 +227,24 @@ std::unordered_map<uint32_t, GLuint> vertex_arrays, framebuffers, renderbuffers;
 std::unordered_map<uint32_t, GLuint> samplers;
 std::unordered_map<uint32_t, GLuint> queries, transform_feedbacks;
 std::unordered_map<uint32_t, GLuint> program_pipelines;
+/* Surface size, remembered until the context that draws to it exists. Above
+ * the backend blocks because a new drawable is built with it. */
+int backend_width = 1;
+int backend_height = 1;
+
+/* What the *page* configured, before any client existed.
+ *
+ * `gex_gl_init` and `gex_gl_set_api` are asked once, by the embedder, and
+ * what they set is per client from then on -- so a client that turns up
+ * later has to inherit them rather than start from this file's defaults.
+ * Without that the second GL application got a 1x1 drawable and an ES 3.0
+ * context however the page had configured the device. */
+int device_profile = static_cast<int>(API_OPENGLES2);
+int device_major = 3;
+int device_minor = 0;
+int device_width = 1;
+int device_height = 1;
+
 #if defined(GEX_MESA_WASM)
 #if !defined(GEX_MESA_WGPU)
 struct sw_winsys* mesa_winsys = nullptr;
@@ -251,7 +270,40 @@ struct gex_drawable {
     unsigned height;
 };
 
-gex_drawable mesa_drawable = {};
+/* One surface a client draws into: a window, or a pbuffer, or -- handle zero
+ * -- the default one a client that never created a surface at all still has.
+ *
+ * There used to be a single drawable for the whole device, which is right up
+ * until a client has two windows or two clients each have one: the second
+ * window's frames went into the first's, and whichever surface attached last
+ * owned them both. The guest names its surfaces now (`op::SURFACE_ATTACH`
+ * carries the handle its EGL made up), so there is a drawable per handle and
+ * a frame belongs to the window it was drawn for.
+ *
+ * `produced` and `displayed` are per surface for the same reason: a client
+ * swapping window A must not be released by a frame of window B reaching the
+ * screen. */
+struct gex_surface {
+    gex_drawable drawable{};
+    /* Unique across the device, not just within a client: two clients both
+     * call their first surface handle 1, and the page keeps one frame per
+     * surface. */
+    unsigned uid = 0;
+    unsigned kind = 0;      /* surface::WAYLAND, surface::X, or none */
+    unsigned id = 0;        /* wl_surface object id, or XID */
+    unsigned token = 0;     /* the client's pid, as the compositor knows it */
+    uint32_t produced = 0;
+    uint32_t displayed = 0;
+    unsigned generation = 0;
+};
+
+/* This client's surfaces, and which is current. `sur` is always the entry
+ * `current_surface` names once a context exists; ordered, so the enumeration
+ * the page reads is stable. */
+std::map<uint32_t, gex_surface> surfaces;
+uint32_t current_surface = 0;
+gex_surface* sur = nullptr;
+unsigned next_surface_uid = 1;
 
 gex_drawable* drawable_of(struct pipe_frontend_drawable* drawable) {
     return reinterpret_cast<gex_drawable*>(drawable);
@@ -333,6 +385,90 @@ bool drawable_validate(struct st_context* st,
     if (resolve) *resolve = nullptr;
     return true;
 }
+
+/* The visual every one of this client's drawables is built with.
+ *
+ * Chosen once, in create_backend_context, and wanted again every time a new
+ * surface turns up -- which now happens long after the context exists. */
+struct st_visual backend_visual = {};
+
+/* The drawable for a handle, made if this is the first time it is named.
+ *
+ * Handle zero is the surface a client that never created one still has: the
+ * CTS and the replay harnesses draw into framebuffer 0 without ever calling
+ * eglCreateWindowSurface, and they must keep working. */
+gex_surface* surface_for(uint32_t handle) {
+    auto found = surfaces.find(handle);
+    if (found != surfaces.end()) return &found->second;
+    gex_surface& made = surfaces[handle];
+    made.uid = next_surface_uid++;
+    made.drawable.visual = backend_visual;
+    made.drawable.width = backend_width > 0 ? (unsigned)backend_width : 1;
+    made.drawable.height = backend_height > 0 ? (unsigned)backend_height : 1;
+    made.drawable.base.visual = &made.drawable.visual;
+    made.drawable.base.fscreen = &mesa_frontend_screen;
+    /* st/mesa keys its framebuffer cache on this identifier, so every
+     * drawable needs its own: two surfaces both claiming ID 1 are one
+     * framebuffer as far as st is concerned, which is the confusion this
+     * whole table exists to end. */
+    made.drawable.base.ID = handle + 1;
+    made.drawable.base.stamp = 1;
+    made.drawable.base.flush_front = drawable_flush_front;
+    made.drawable.base.validate = drawable_validate;
+    made.drawable.base.flush_swapbuffers = drawable_flush_swapbuffers;
+    return &made;
+}
+
+/* Told to whatever is decoding for us, when it keeps anything per surface.
+ * Defined per backend below; a no-op for the ones that do not. */
+void note_surface_to_backend(unsigned uid);
+
+/* Draw into this handle from here on: `op::SURFACE_CURRENT`, and what an
+ * attach does as well. */
+bool use_surface(uint32_t handle) {
+    gex_surface* next = surface_for(handle);
+    current_surface = handle;
+    if (sur == next) return true;
+    sur = next;
+    /* Every flush from here belongs to this surface, not only the one that
+     * presents it. virglrenderer keeps a frame per surface and takes it
+     * whenever commands arrive -- including in the middle of a frame -- so a
+     * tag that only moved at present time filed one client's half-drawn
+     * frames under another client's window. */
+    note_surface_to_backend(sur->uid);
+    /* Before the context exists there is nothing to make current with; the
+     * context creation that follows uses whatever is current then. */
+    if (!mesa_context) return true;
+    return st_api_make_current(mesa_context, &sur->drawable.base,
+                               &sur->drawable.base);
+}
+
+/* Told to the page so it can drop the frame it keeps for a surface. Set by
+ * the backend that has one; see `gex_gl_surface_gone`. */
+uint32_t surface_gone_handle = 0;
+unsigned surface_gone_generation = 0;
+
+/* Everything a surface owns goes back: its colour and depth buffers, and the
+ * page's copy of its last frame.
+ *
+ * Without this a closed window's buffers stayed allocated for as long as the
+ * client lived, and -- worse -- the page went on drawing the frame it had
+ * kept for a window that no longer existed. */
+void drop_surface(uint32_t handle) {
+    auto found = surfaces.find(handle);
+    if (found == surfaces.end()) return;
+    for (struct pipe_resource*& attachment : found->second.drawable.attachments)
+        pipe_resource_reference(&attachment, nullptr);
+    const unsigned uid = found->second.uid;
+    surfaces.erase(found);
+    surface_gone_handle = uid;
+    ++surface_gone_generation;
+    if (current_surface != handle) return;
+    /* Whatever is left, or the default surface if nothing is: a context must
+     * always have a framebuffer 0, and the client may well draw again. */
+    sur = nullptr;
+    use_surface(surfaces.empty() ? 0 : surfaces.begin()->first);
+}
 #else
 EGLDisplay display = EGL_NO_DISPLAY;
 EGLSurface surface = EGL_NO_SURFACE;
@@ -382,15 +518,145 @@ int get_frontend_param(struct pipe_frontend_screen* fscreen,
 int backend_profile = static_cast<int>(API_OPENGLES2);
 int backend_major = 3;
 int backend_minor = 0;
-/* Surface size, remembered until the context that draws to it exists. */
-int backend_width = 1;
-int backend_height = 1;
 /* What the guest says its frames belong to, and a count of how many times it
  * has said something different. Read by the page after a submit. */
 unsigned attached_kind = 0;
 unsigned attached_id = 0;
 unsigned attached_token = 0;
 unsigned attached_generation = 0;
+
+/* Everything above that belongs to one *client* rather than to the device.
+ *
+ * GL object names are the guest's to allocate -- that is the whole point of
+ * this protocol -- so two clients hand out the same names, and a single set
+ * of these maps gives the second client the first one's objects. Two GL
+ * applications at once therefore drew each other's geometry with each other's
+ * textures, and closing one broke the other, since the names it deleted were
+ * names the survivor was still using.
+ *
+ * A context each is the fix, and it is what a display server does. The state
+ * is swapped rather than referred to through a pointer so that the thousands
+ * of lines that use these by name -- including a generated file -- stay as
+ * they are; swapping maps is a pointer exchange each, and it happens once per
+ * batch at most.
+ */
+struct client_state {
+    std::unordered_map<uint32_t, GLuint> buffers, textures, shaders, programs,
+        vertex_arrays, framebuffers, renderbuffers, samplers, queries,
+        transform_feedbacks, program_pipelines;
+    std::unordered_map<GLuint, std::string> shader_source_heads;
+    std::unordered_set<uint32_t> delete_pending_programs;
+    uint32_t current_guest_program = 0;
+    GLuint default_vao = 0;
+    std::vector<GLenum> current_draw_buffers{GL_BACK};
+    GLfloat current_clear_color[4] = {0.f, 0.f, 0.f, 0.f};
+    GLfloat current_clear_depth = 1.f;
+    GLint current_clear_stencil = 0;
+    gexgl_pixel_store pack_store = gexgl_default_pixel_store();
+    gexgl_pixel_store unpack_store = gexgl_default_pixel_store();
+    int backend_profile = static_cast<int>(API_OPENGLES2);
+    int backend_major = 3;
+    int backend_minor = 0;
+    int backend_width = 1;
+    int backend_height = 1;
+    unsigned attached_kind = 0, attached_id = 0, attached_token = 0;
+#if defined(GEX_MESA_WASM)
+    struct st_context* mesa_context = nullptr;
+    /* A Gallium screen each: see `ensure_screen`. */
+    struct pipe_frontend_screen mesa_frontend_screen = {};
+#if !defined(GEX_MESA_WGPU)
+    struct sw_winsys* mesa_winsys = nullptr;
+#endif
+    struct st_visual backend_visual = {};
+    std::map<uint32_t, gex_surface> surfaces;
+    uint32_t current_surface = 0;
+#endif
+};
+
+std::map<uint32_t, client_state> clients;
+/* Which client's state is loaded into the globals. Zero is "the only one",
+ * which is what a caller that never says who it is gets -- the smoke and
+ * conformance harnesses call submit directly. */
+uint32_t current_client = 0;
+
+void swap_client_state(client_state& other) {
+    std::swap(buffers, other.buffers);
+    std::swap(textures, other.textures);
+    std::swap(shaders, other.shaders);
+    std::swap(programs, other.programs);
+    std::swap(vertex_arrays, other.vertex_arrays);
+    std::swap(framebuffers, other.framebuffers);
+    std::swap(renderbuffers, other.renderbuffers);
+    std::swap(samplers, other.samplers);
+    std::swap(queries, other.queries);
+    std::swap(transform_feedbacks, other.transform_feedbacks);
+    std::swap(program_pipelines, other.program_pipelines);
+    std::swap(shader_source_heads, other.shader_source_heads);
+    std::swap(delete_pending_programs, other.delete_pending_programs);
+    std::swap(current_guest_program, other.current_guest_program);
+    std::swap(default_vao, other.default_vao);
+    std::swap(current_draw_buffers, other.current_draw_buffers);
+    for (int i = 0; i < 4; ++i)
+        std::swap(current_clear_color[i], other.current_clear_color[i]);
+    std::swap(current_clear_depth, other.current_clear_depth);
+    std::swap(current_clear_stencil, other.current_clear_stencil);
+    std::swap(pack_store, other.pack_store);
+    std::swap(unpack_store, other.unpack_store);
+    std::swap(backend_profile, other.backend_profile);
+    std::swap(backend_major, other.backend_major);
+    std::swap(backend_minor, other.backend_minor);
+    std::swap(backend_width, other.backend_width);
+    std::swap(backend_height, other.backend_height);
+    std::swap(attached_kind, other.attached_kind);
+    std::swap(attached_id, other.attached_id);
+    std::swap(attached_token, other.attached_token);
+#if defined(GEX_MESA_WASM)
+    std::swap(mesa_context, other.mesa_context);
+    std::swap(mesa_frontend_screen, other.mesa_frontend_screen);
+#if !defined(GEX_MESA_WGPU)
+    std::swap(mesa_winsys, other.mesa_winsys);
+#endif
+    std::swap(backend_visual, other.backend_visual);
+    std::swap(surfaces, other.surfaces);
+    std::swap(current_surface, other.current_surface);
+#endif
+}
+
+/* Run what follows as this client. */
+void use_client(uint32_t client) {
+    if (client == current_client) return;
+    const bool fresh = clients.find(client) == clients.end();
+    swap_client_state(clients[current_client]);
+    current_client = client;
+    swap_client_state(clients[client]);
+    if (fresh) {
+        /* What the page configured for the device, which this client has not
+         * had a chance to be told about: it never calls init or set_api --
+         * the embedder does, once. */
+        backend_profile = device_profile;
+        backend_major = device_major;
+        backend_minor = device_minor;
+        backend_width = device_width;
+        backend_height = device_height;
+    }
+#if defined(GEX_MESA_WASM)
+    /* The GL context and the drawable are part of what was just swapped in,
+     * so this is where the host's GL is pointed at them. A client whose
+     * context does not exist yet gets one from its own CONTEXT_CREATE. */
+    sur = nullptr;
+    if (mesa_context) {
+        gex_surface* into = surface_for(current_surface);
+        sur = into;
+        st_api_make_current(mesa_context, &into->drawable.base,
+                            &into->drawable.base);
+        /* And the renderer next door, which keeps a frame per surface: a
+         * client switch changes the drawable without going through
+         * `use_surface`, so without this the frames of the client that just
+         * took over were filed under the window of the one that left. */
+        note_surface_to_backend(into->uid);
+    }
+#endif
+}
 
 #if defined(GEX_MESA_WGPU)
 /* Report which Gallium entry points st/mesa is going to need and this driver
@@ -701,7 +967,19 @@ static enum pipe_format depth_stencil_for(struct pipe_screen *screen)
     return PIPE_FORMAT_Z24_UNORM_S8_UINT;
 }
 
-int initialize_backend(int width, int height) {
+/* This client's Gallium screen, made if it has none yet.
+ *
+ * One screen per client, not one per device. virglrenderer sees a *connection*
+ * per screen and a vtest connection carries a single context, so two clients
+ * on one screen shared a virgl context -- and their GL state with it. What
+ * that looks like from outside is one client's viewport with the other's
+ * drawable bound, two windows the wrong size, and both of them black.
+ *
+ * The other backends have no such constraint, but a screen each is right for
+ * them too: it is where a driver keeps its per-client caches.
+ */
+int ensure_screen() {
+    if (mesa_frontend_screen.screen) return 0;
 #if defined(GEX_MESA_WGPU)
     /* The page owns the device; the screen only retains its queue. */
     WGPUDevice device = emscripten_webgpu_get_device();
@@ -727,24 +1005,21 @@ int initialize_backend(int width, int height) {
 #if defined(GEX_MESA_WGPU)
     audit_driver_hooks(mesa_frontend_screen.screen);
 #endif
+    return 0;
+}
 
-    /* A visual the guest's default framebuffer can actually be: a colour
-     * buffer it draws to and a depth/stencil buffer, both at the size the
-     * transport was given. */
-    struct st_visual visual = {};
-    visual.buffer_mask = ST_ATTACHMENT_FRONT_LEFT_MASK |
-                         ST_ATTACHMENT_BACK_LEFT_MASK |
-                         ST_ATTACHMENT_DEPTH_STENCIL_MASK;
-    visual.color_format = PIPE_FORMAT_R8G8B8A8_UNORM;
-    visual.depth_stencil_format = depth_stencil_for(mesa_frontend_screen.screen);
-    visual.accum_format = PIPE_FORMAT_NONE;
-    visual.samples = 0;
-
-    /* The context itself waits for CONTEXT_CREATE, which is where the guest
-     * finally knows whether the application wants desktop GL or ES. */
+/* What the page asks for once, before any client exists: the size everything
+ * starts at, and a screen for whoever is current -- which also reports at
+ * once whether this backend works at all. The context itself waits for
+ * CONTEXT_CREATE, where the guest finally knows whether the application
+ * wants desktop GL or ES. */
+int initialize_backend(int width, int height) {
     backend_width = width;
     backend_height = height;
-    return 0;
+    /* And for clients that turn up later: see `device_width`. */
+    device_width = width;
+    device_height = height;
+    return ensure_screen();
 }
 
 /* Create the GL context the guest asked for.
@@ -758,7 +1033,9 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
                            unsigned profile) {
     if (mesa_context)
         return 0;
-    if (!mesa_frontend_screen.screen)
+    /* This client's own screen, which is where its virgl context comes from:
+     * the page only ever made one, for whoever was current at the time. */
+    if (ensure_screen() != 0 || !mesa_frontend_screen.screen)
         return -1;
 
     /* A visual the guest's default framebuffer can actually be: a colour
@@ -849,22 +1126,25 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
                 mesa_context->ctx->Version % 10);
     }
 
-    mesa_drawable = {};
-    mesa_drawable.visual = visual;
-    mesa_drawable.width = backend_width > 0 ? (unsigned)backend_width : 1;
-    mesa_drawable.height = backend_height > 0 ? (unsigned)backend_height : 1;
-    mesa_drawable.base.visual = &mesa_drawable.visual;
-    mesa_drawable.base.fscreen = &mesa_frontend_screen;
-    /* Any non-zero identifier; st/mesa uses it to key its framebuffer cache
-     * and there is exactly one drawable here. */
-    mesa_drawable.base.ID = 1;
-    mesa_drawable.base.stamp = 1;
-    mesa_drawable.base.flush_front = drawable_flush_front;
-    mesa_drawable.base.validate = drawable_validate;
-    mesa_drawable.base.flush_swapbuffers = drawable_flush_swapbuffers;
+    /* Every drawable of this client is built with this visual, including the
+     * ones that turn up later: a window created after the context is a
+     * surface of its own now. */
+    backend_visual = visual;
+    /* Whatever surface the guest has already named, or the default one. The
+     * two commands can arrive in either order -- a GLX program attaches its
+     * window inside glXMakeCurrent, just before the context is made -- so
+     * this must not overwrite a table that already has entries in it. */
+    sur = nullptr;
+    if (!use_surface(current_surface)) return -9;
+    /* Built by `surface_for` before the visual was known, in the order the
+     * guest happened to name things: give it this one. */
+    sur->drawable.visual = visual;
+    sur->drawable.width = backend_width > 0 ? (unsigned)backend_width : 1;
+    sur->drawable.height = backend_height > 0 ? (unsigned)backend_height : 1;
+    ++sur->drawable.base.stamp;
 
-    if (!st_api_make_current(mesa_context, &mesa_drawable.base,
-                             &mesa_drawable.base))
+    if (!st_api_make_current(mesa_context, &sur->drawable.base,
+                             &sur->drawable.base))
         return -9;
 #if defined(GEX_MESA_WGPU)
     report_version_gap();
@@ -935,14 +1215,14 @@ void resize_drawable(int width, int height) {
      * and rendered its whole scene outside the framebuffer. */
     backend_width = width;
     backend_height = height;
-    if ((unsigned)width == mesa_drawable.width &&
-        (unsigned)height == mesa_drawable.height)
+    if ((unsigned)width == sur->drawable.width &&
+        (unsigned)height == sur->drawable.height)
         return;
-    mesa_drawable.width = (unsigned)width;
-    mesa_drawable.height = (unsigned)height;
-    for (struct pipe_resource*& attachment : mesa_drawable.attachments)
+    sur->drawable.width = (unsigned)width;
+    sur->drawable.height = (unsigned)height;
+    for (struct pipe_resource*& attachment : sur->drawable.attachments)
         pipe_resource_reference(&attachment, nullptr);
-    ++mesa_drawable.base.stamp;
+    ++sur->drawable.base.stamp;
     /* Counted-draw bookkeeping only, but it names a texture that is gone. */
     gex_wgpu_presented_texture = nullptr;
     if (mesa_surface) {
@@ -970,15 +1250,15 @@ void configure_present_surface() {
         return;
     }
     fprintf(stderr, "gex-wgpu: first present -- canvas resize to %ux%u\n",
-            mesa_drawable.width, mesa_drawable.height);
-    emscripten_set_canvas_element_size("#gex-gl", (int)mesa_drawable.width,
-                                       (int)mesa_drawable.height);
+            sur->drawable.width, sur->drawable.height);
+    emscripten_set_canvas_element_size("#gex-gl", (int)sur->drawable.width,
+                                       (int)sur->drawable.height);
     WGPUSurfaceConfiguration cfg{};
     cfg.device = device;
     cfg.format = WGPUTextureFormat_RGBA8Unorm;
     cfg.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
-    cfg.width = mesa_drawable.width;
-    cfg.height = mesa_drawable.height;
+    cfg.width = sur->drawable.width;
+    cfg.height = sur->drawable.height;
     cfg.alphaMode = WGPUCompositeAlphaMode_Opaque;
     cfg.presentMode = WGPUPresentMode_Fifo;
     GEX_PRESENT_MARK(surface_configure);
@@ -986,16 +1266,21 @@ void configure_present_surface() {
     GEX_PRESENT_MARK(configure_done);
 }
 
+/* Nothing keeps a frame per surface on this backend: it presents into the one
+ * canvas it was configured with. */
+void note_surface_to_backend(unsigned uid) { (void)uid; }
+
 void present_backend() {
     glFinish();
     ++produced;
+    if (sur) ++sur->produced;
 }
 
 bool display_backend() {
-    if (displayed >= produced) return false;
+    if (!sur || sur->displayed >= sur->produced) return false;
     configure_present_surface();
     struct pipe_resource *source =
-        mesa_drawable.attachments[ST_ATTACHMENT_BACK_LEFT];
+        sur->drawable.attachments[ST_ATTACHMENT_BACK_LEFT];
     WGPUTexture from = source ? gex_wgpu_resource_texture(source) : nullptr;
     WGPUDevice device = mesa_frontend_screen.screen
         ? gex_wgpu_screen_device(mesa_frontend_screen.screen) : nullptr;
@@ -1062,7 +1347,7 @@ bool display_backend() {
         src.texture = from;
         WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
         dst.texture = surface_texture.texture;
-        WGPUExtent3D size{mesa_drawable.width, mesa_drawable.height, 1};
+        WGPUExtent3D size{sur->drawable.width, sur->drawable.height, 1};
         wgpuCommandEncoderCopyTextureToTexture(encoder, &src, &dst, &size);
         WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, nullptr);
         if (commands) {
@@ -1079,25 +1364,67 @@ bool display_backend() {
     wgpuTextureRelease(surface_texture.texture);
     GEX_PRESENT_MARK(done);
     ++displayed;
+    if (sur) ++sur->displayed;
     return true;
 }
 #else
+/* Tell the renderer next door which surface the frame it is about to see
+ * belongs to.
+ *
+ * virglrenderer notices a finished frame itself, in the middle of the command
+ * stream, and keeps a copy of it for the page to draw. With more than one
+ * window it has to keep a copy each, and only this side knows which window is
+ * being drawn -- so it is said before the flush that carries the frame. */
+EM_JS(void, gex_note_present_surface, (unsigned handle), {
+  Module.gexVirgl?.surface?.(handle);
+});
+
+/* And that the flush about to happen carries a finished frame of it, which is
+ * what the renderer waits for before keeping a copy. */
+EM_JS(void, gex_note_present_coming, (unsigned handle), {
+  Module.gexVirgl?.swap?.(handle);
+});
+
+void note_surface_to_backend(unsigned uid) { gex_note_present_surface(uid); }
+
 void present_backend() {
+    if (sur) gex_note_present_coming(sur->uid);
     glFinish();
     ++produced;
+    if (sur) ++sur->produced;
 }
 
 bool display_backend() {
-    if (displayed >= produced) return false;
+    if (!sur || sur->displayed >= sur->produced) return false;
+    ++sur->displayed;
     ++displayed;
     return true;
 }
 
-/* Nothing to do without the Mesa frontend: this build draws into a surface
- * the embedder created, and there is no drawable of ours to re-allocate. The
- * declaration is here because the command dispatch is shared between the two
- * configurations. */
-void resize_drawable(int width, int height) { (void)width; (void)height; }
+/* Give the current drawable the size the guest's window has.
+ *
+ * This used to do nothing at all, with a comment about there being no
+ * drawable of ours -- true of the backend that draws into an embedder's
+ * surface, and not of this one, which owns its drawable. So a window's size
+ * never reached it: the drawable stayed whatever the transport was started
+ * with, a 300x300 window drew into a 300x150 framebuffer, and the top half of
+ * the gears was simply missing. The attachments are dropped so
+ * drawable_validate builds them again, and the stamp is bumped because that
+ * is the only thing st/mesa re-reads them for. */
+void resize_drawable(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    backend_width = width;
+    backend_height = height;
+    if (!sur) return;
+    if ((unsigned)width == sur->drawable.width &&
+        (unsigned)height == sur->drawable.height)
+        return;
+    sur->drawable.width = (unsigned)width;
+    sur->drawable.height = (unsigned)height;
+    for (struct pipe_resource*& attachment : sur->drawable.attachments)
+        pipe_resource_reference(&attachment, nullptr);
+    ++sur->drawable.base.stamp;
+}
 #endif
 #else
 int initialize_backend(int width, int height) {
@@ -1377,10 +1704,48 @@ bool one(uint32_t op, Reader& a) {
      * and the compositor does the rest, because what a surface id means is
      * the compositor's business and not this decoder's. */
     case SURFACE_ATTACH: {
-        attached_kind = a.u32();
-        attached_id = a.u32();
-        attached_token = a.u32();
+        const unsigned kind = a.u32();
+        const unsigned id = a.u32();
+        const unsigned token = a.u32();
+        const unsigned handle = a.u32();
+        if (!a.ok) break;
+        attached_kind = kind;
+        attached_id = id;
+        attached_token = token;
         attached_generation++;
+#if defined(GEX_MESA_WASM)
+        /* A window names the drawable its frames go to, and attaching makes
+         * that drawable current: this is `eglCreateWindowSurface` finishing,
+         * and what the client draws next belongs to this window. */
+        use_surface(handle);
+        sur->kind = kind;
+        sur->id = id;
+        sur->token = token;
+        ++sur->generation;
+#endif
+        break;
+    }
+    case SURFACE_CURRENT: {
+        const unsigned handle = a.u32();
+        if (!a.ok) break;
+#if defined(GEX_MESA_WASM)
+        use_surface(handle);
+#else
+        (void)handle;
+#endif
+        break;
+    }
+    case SURFACE_DETACH: {
+        const unsigned handle = a.u32();
+        if (!a.ok) break;
+#if defined(GEX_MESA_WASM)
+        drop_surface(handle);
+        /* The last thing the page was told about is gone; saying so keeps a
+         * compositor from drawing a window's final frame for ever. */
+        if (attached_id && handle == 0) attached_id = 0;
+#else
+        (void)handle;
+#endif
         break;
     }
     case FINISH: glFinish(); put_u32(0); break;
@@ -1390,7 +1755,17 @@ bool one(uint32_t op, Reader& a) {
      * calls display(). The guest paces itself against the difference -- see
      * eglSwapBuffers -- because without that an application free-runs, and
      * the round trips alone starve the loop it is waiting for. */
-    case PRESENT: present_backend(); put_u32(displayed); break;
+    /* The reply is this *surface's* count of frames shown, which is what the
+     * guest paces itself against: a client swapping one window must not be
+     * released by another window's frame reaching the screen. */
+    case PRESENT:
+        present_backend();
+#if defined(GEX_MESA_WASM)
+        put_u32(sur ? sur->displayed : displayed);
+#else
+        put_u32(displayed);
+#endif
+        break;
     case CLEAR_COLOR: {
         for (float& value : current_clear_color) value = a.f32();
         glClearColor(current_clear_color[0], current_clear_color[1],
@@ -2141,6 +2516,10 @@ EMSCRIPTEN_KEEPALIVE void gex_gl_set_api(int api, int major, int minor) {
                                                 : API_OPENGLES2);
     backend_major = major > 0 ? major : (api == 1 ? 3 : 3);
     backend_minor = major > 0 ? minor : (api == 1 ? 3 : 0);
+    /* And for every client that has not appeared yet. */
+    device_profile = backend_profile;
+    device_major = backend_major;
+    device_minor = backend_minor;
 }
 #endif
 
@@ -2155,7 +2534,13 @@ EMSCRIPTEN_KEEPALIVE int gex_gl_init(int width, int height) {
     return 0;
 }
 
-EMSCRIPTEN_KEEPALIVE int gex_gl_submit(const uint8_t* data, uint32_t len) {
+/* `client` names the guest process whose commands these are: its own GL
+ * context, its own object names, its own windows. Callers that predate it --
+ * the smoke and conformance harnesses, which are the only client there is --
+ * pass nothing and get client zero. */
+EMSCRIPTEN_KEEPALIVE int gex_gl_submit(const uint8_t* data, uint32_t len,
+                                       uint32_t client) {
+    use_client(client);
     reply.clear(); uint32_t at = 0;
     while (at < len) {
         if (len - at < 8) return -1;
@@ -2190,10 +2575,136 @@ EMSCRIPTEN_KEEPALIVE int gex_gl_submit(const uint8_t* data, uint32_t len) {
 }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_reply_len() { return reply.size(); }
 EMSCRIPTEN_KEEPALIVE const uint8_t* gex_gl_reply_data() { return reply.data(); }
+/* Show one frame of every window that has one waiting.
+ *
+ * Not just the current one: a page frame shows every window, and a client
+ * whose window is not the one that submitted last must not be left waiting
+ * for a count that only moves when it is. */
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_display() {
+#if defined(GEX_MESA_WASM)
+    const uint32_t was_client = current_client;
+    const uint32_t was_surface = current_surface;
+    std::vector<uint32_t> ids;
+    ids.push_back(was_client);
+    for (const auto& entry : clients)
+        if (entry.first != was_client) ids.push_back(entry.first);
+    for (uint32_t id : ids) {
+        use_client(id);
+        if (!mesa_context) continue;
+        std::vector<uint32_t> pending;
+        for (const auto& entry : surfaces)
+            if (entry.second.displayed < entry.second.produced)
+                pending.push_back(entry.first);
+        for (uint32_t handle : pending) {
+            use_surface(handle);
+            display_backend();
+        }
+    }
+    use_client(was_client);
+    use_surface(was_surface);
+#else
     display_backend();
+#endif
     return displayed;
 }
+
+#if defined(GEX_MESA_WASM)
+/* The windows the host is drawing, as the page reads them.
+ *
+ * One entry per attached surface across every client: the page pairs each
+ * with the window it belongs to (a `wl_surface` id, or an X drawable) and
+ * asks the renderer for that surface's own frame. A snapshot is taken when
+ * the count is asked for, so the indices below are stable for one read. */
+struct surface_ref {
+    uint32_t client, handle, uid, kind, id, token, width, height;
+};
+std::vector<surface_ref> surface_list;
+
+void collect_surfaces() {
+    surface_list.clear();
+    for (const auto& entry : surfaces)
+        if (entry.second.kind || entry.second.id)
+            surface_list.push_back({current_client, entry.first,
+                                    entry.second.uid, entry.second.kind,
+                                    entry.second.id, entry.second.token,
+                                    entry.second.drawable.width,
+                                    entry.second.drawable.height});
+    /* The other clients' surfaces are in their saved state, and readable
+     * there without swapping anything in. */
+    for (const auto& client : clients) {
+        if (client.first == current_client) continue;
+        for (const auto& entry : client.second.surfaces)
+            if (entry.second.kind || entry.second.id)
+                surface_list.push_back({client.first, entry.first,
+                                        entry.second.uid, entry.second.kind,
+                                        entry.second.id, entry.second.token,
+                                        entry.second.drawable.width,
+                                        entry.second.drawable.height});
+    }
+}
+#endif
+#if defined(GEX_MESA_WASM)
+/* How many windows the host is drawing, and what each one is. Call the count
+ * first: it takes the snapshot the rest read. */
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_count() {
+    collect_surfaces();
+    return (uint32_t)surface_list.size();
+}
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_kind(uint32_t i) {
+    return i < surface_list.size() ? surface_list[i].kind : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_id(uint32_t i) {
+    return i < surface_list.size() ? surface_list[i].id : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_token(uint32_t i) {
+    return i < surface_list.size() ? surface_list[i].token : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_client(uint32_t i) {
+    return i < surface_list.size() ? surface_list[i].client : 0;
+}
+/* What the renderer keys this surface's frame by: see `gex_note_present_surface`. */
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_frame(uint32_t i) {
+    return i < surface_list.size() ? surface_list[i].uid : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_width(uint32_t i) {
+    return i < surface_list.size() ? surface_list[i].width : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_height(uint32_t i) {
+    return i < surface_list.size() ? surface_list[i].height : 0;
+}
+/* Bumped whenever a surface is attached or one goes away, so a page can tell
+ * a changed list from the same list read twice. */
+EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_generation() {
+    return attached_generation + surface_gone_generation;
+}
+
+/* This client is gone: its process exited, or the page dropped it.
+ *
+ * A client that exits says nothing -- it is not there to say it -- so the
+ * page, which does notice, says it instead. Everything the client owned goes
+ * back: its windows' colour and depth buffers, and the GL context that holds
+ * its textures, its programs and its buffers. Without this a session that ran
+ * two GL clients in turn leaked a context per client, and the names the dead
+ * one had allocated were still in the maps the next one drew with. */
+EMSCRIPTEN_KEEPALIVE void gex_gl_forget_client(uint32_t client) {
+    const bool known = clients.find(client) != clients.end();
+    if (!known && client != current_client) return;
+    const uint32_t was = current_client;
+    use_client(client);
+    while (!surfaces.empty()) drop_surface(surfaces.begin()->first);
+    surfaces.clear();
+    sur = nullptr;
+    current_surface = 0;
+    if (mesa_context) {
+        st_destroy_context(mesa_context);
+        mesa_context = nullptr;
+    }
+    /* Back to whoever was running, unless that was this one. */
+    use_client(was == client ? 0 : was);
+    clients.erase(client);
+}
+#endif
+
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_kind() { return attached_kind; }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_id() { return attached_id; }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_attached_token() { return attached_token; }
@@ -2207,7 +2718,7 @@ EMSCRIPTEN_KEEPALIVE int gex_mobilegl_init(int width, int height) {
     return gex_gl_init(width, height);
 }
 EMSCRIPTEN_KEEPALIVE int gex_mobilegl_submit(const uint8_t* data, uint32_t len) {
-    return gex_gl_submit(data, len);
+    return gex_gl_submit(data, len, 0);
 }
 EMSCRIPTEN_KEEPALIVE uint32_t gex_mobilegl_reply_len() { return gex_gl_reply_len(); }
 EMSCRIPTEN_KEEPALIVE const uint8_t* gex_mobilegl_reply_data() { return gex_gl_reply_data(); }

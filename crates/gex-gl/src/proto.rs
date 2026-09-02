@@ -17,7 +17,7 @@
 pub const MAGIC: u32 = 0x4758_4547;
 /// Version of the command ABI. A guest and host must agree before any opcode
 /// is decoded; generated opcode policy changes require incrementing this.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The fixed header at the start of the shared buffer. `repr(C)` for the C
 /// guest half; every field 32 bits, 32 bytes total.
@@ -101,7 +101,7 @@ pub mod op {
     pub const FINISH: u32 = 3;
     /// `{}` -- submit the completed default framebuffer to the display.
     pub const PRESENT: u32 = 4;
-    /// `{ kind, id, token }` -- what the frames after this one belong to.
+    /// `{ kind, id, token, surface }` -- which window a surface's frames go to.
     ///
     /// The host draws for a guest that has a window somewhere else: a
     /// `wl_surface` the compositor is already showing, or an X drawable
@@ -119,7 +119,26 @@ pub mod op {
     /// An X drawable needs no token: the surface belongs to the X server's
     /// process, not the client's, and the window manager is what resolves one
     /// to the other.
+    ///
+    /// `surface` is the guest's own handle for the EGL surface -- whatever its
+    /// `eglCreateWindowSurface` returned -- and is what makes several windows
+    /// possible at once: the host keeps a drawable per handle, and a frame
+    /// belongs to the window the *handle* was attached to rather than to
+    /// whatever was attached last. Attaching also makes that handle current.
     pub const SURFACE_ATTACH: u32 = 5;
+    /// `{ surface }` -- draw into this handle's drawable from now on.
+    ///
+    /// What `eglMakeCurrent` selects. A handle the host has not seen gets a
+    /// drawable of its own, so a pbuffer or a window that never attached to
+    /// anything still has somewhere to draw.
+    pub const SURFACE_CURRENT: u32 = 6;
+    /// `{ surface }` -- this handle is gone; release what it owns.
+    ///
+    /// `eglDestroySurface`, and the only orderly way the host learns that a
+    /// window's frames have stopped. A client that simply exits never sends
+    /// it -- the page notices the process is gone and says so instead (see
+    /// `gex_gl_forget_client`).
+    pub const SURFACE_DETACH: u32 = 7;
 
     // -- state ------------------------------------------------------------
     pub const CLEAR_COLOR: u32 = 16; // { r, g, b, a } as floats

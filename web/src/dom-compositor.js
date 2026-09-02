@@ -120,8 +120,6 @@ class DomWindow {
     this.external = !!s.external;
     /** The X window this is, or zero. */
     this.xid = s.xid || 0;
-    // Replaced later for a GL window, which adopts the canvas the host's GL
-    // presents into: see `DomDesktop.#adoptGl`.
     this.canvas = document.createElement('canvas');
     this.canvas.width = Math.max(1, s.width);
     this.canvas.height = Math.max(1, s.height);
@@ -175,16 +173,18 @@ class DomWindow {
     this.#desktop.focus(this);
   }
 
-  /** Take the canvas the host's GL presents into as this window's content.
+  /** Copy this window's OpenGL frame in, from wherever the renderer put it.
    *
-   * From here on nothing paints this window from the guest's memory -- the
-   * pixels are already on the canvas -- so it is marked external, which is
-   * what `#update` reads. */
-  adopt(canvas) {
-    this.canvas = canvas;
-    this.external = true;
-    this.#ctx = null;
-    this.#image = null;
+   * `source` is the renderer's own canvas with this window's frame in its
+   * top-left corner, at `w` by `h`; the copy is a canvas-to-canvas draw,
+   * which the browser does on the GPU. Scaled only when the window and the
+   * frame disagree about the size, which happens for a frame or two after a
+   * resize. */
+  showGl(source, w, h) {
+    if (w <= 0 || h <= 0) return;
+    const ctx = this.#context();
+    ctx.drawImage(source, 0, 0, w, h,
+                  0, 0, this.canvas.width, this.canvas.height);
   }
 
   /** The 2D context, taken on first paint rather than at construction.
@@ -276,7 +276,13 @@ export class DomDesktop {
   #gl = null;
   #glCanvas = null;
   #glServed = false;
-  #glAdopted = null;
+  #glServe = null;
+  /* The window frames already copied, by serial, so a still picture is
+   * copied once rather than every frame. */
+  #glShown = new Map();
+  #glList = [];
+  #glLooks = 0;
+  #glCopies = 0;
   /** Called when a window goes away, after its `onclosed`. */
   onwindowgone = null;
 
@@ -299,30 +305,24 @@ export class DomDesktop {
    * first GL call is an ioctl that waits for an answer, and a device built
    * later than that is a thirty-second stall and a trap.
    *
-   * What it presents into is a canvas of this desktop's own, which the GL
-   * window then *adopts* as its content -- the element moves into the frame
-   * the page draws around it. So the frame still lands nowhere but the canvas
-   * the client's window is made of: no texture crossing a context, no
-   * readback, and WebGPU works exactly as well as WebGL here, because the
-   * canvas belongs to the client rather than to a compositor that has to
-   * sample it.
-   *
-   * One GL client at a time: a canvas has one context and the guest has one
-   * device. A second GL window would want a second of each.
+   * It draws on a canvas of this desktop's own, which is never shown: it is
+   * where the renderer puts whichever window's frame is being asked for, and
+   * each window's canvas is copied out of it (see `#drawGl`). That is one
+   * canvas-to-canvas copy per window per frame -- on the GPU, with no
+   * readback -- and it is what lets several GL windows be drawn at once by
+   * one renderer.
    */
   async hostGl(channel, opts = {}) {
     const canvas = document.createElement('canvas');
-    // Hidden until a window adopts it, and in the document from the start:
-    // both backends look this canvas up with `document.querySelector`, and a
-    // canvas that is not in the document is simply not found -- which is a
-    // renderer that will not start rather than a canvas that stays blank.
+    // Never shown, and in the document all the same: both backends look this
+    // canvas up with `document.querySelector`, and a canvas that is not in
+    // the document is simply not found -- which is a renderer that will not
+    // start rather than a canvas that stays blank.
     canvas.style.display = 'none';
-    // As large as the desktop, because virglrenderer fixes the drawable's
-    // size here and now: a window bigger than this canvas would have its
-    // frame clipped, and a window smaller is drawn into the top of it, which
-    // is what the present path reads the viewport for. The canvas element is
-    // resized to the window when one adopts it -- that changes where the
-    // frame is *shown*, not the size it was drawn at.
+    // As large as the desktop, for two reasons: virglrenderer fixes the
+    // drawable's size when it starts, so a window bigger than this would have
+    // its frame clipped; and every window's frame is staged here, so it has
+    // to hold the biggest of them.
     canvas.width = Math.max(640, this.#mount.clientWidth || 1280);
     canvas.height = Math.max(480, this.#mount.clientHeight || 760);
     canvas.style.touchAction = 'none';
@@ -346,9 +346,12 @@ export class DomDesktop {
     // Presented straight onto that canvas. The scene compositor asks for the
     // frame as a texture instead, because it has a scene to put it in; here
     // the canvas *is* where it goes.
-    device.renderer?.presentToCanvas(true, false);
+    // Snapshots, not a blit: the renderer keeps a frame per window and this
+    // desktop copies each into its own window's canvas (see `#drawGl`). A
+    // blit would put whichever window presented last over the whole canvas.
+    device.renderer?.presentToCanvas(false);
     const { serveGl } = await import('@gex/gl-bridge.mjs');
-    serveGl(device, channel);
+    this.#glServe = serveGl(device, channel);
     this.#glServed = true;
     this.ongl?.(device.describe());
     return device.describe();
@@ -357,6 +360,19 @@ export class DomDesktop {
   /** Told when the guest's OpenGL is up, or would not start. */
   ongl = null;
   onglfailed = null;
+
+  /** What this desktop has done about the host's OpenGL: how often it looked,
+   *  how many frames it copied into a window, and what its list of windows
+   *  says. For diagnosis -- a window that stays black is either not being
+   *  looked at, not matched, or matched and drawn from an empty frame. */
+  glStats() {
+    return {
+      looks: this.#glLooks,
+      copies: this.#glCopies,
+      list: this.#glList.length,
+      served: this.#glServed,
+    };
+  }
 
   /** The GL device, when one is running: what it presents and how much of it,
    *  which is the only way to tell a black frame from a frame that never
@@ -388,6 +404,10 @@ export class DomDesktop {
 
   dropMemory(token) {
     this.#memories.delete(token);
+    // And whatever that process had on the host's GL: its context, its
+    // windows and their frames. Nothing else will say so -- a client that
+    // exits is not there to send a detach.
+    this.#gl?.forgetClient?.(token);
   }
 
   stop() {
@@ -396,9 +416,32 @@ export class DomDesktop {
     this.#raf = 0;
     for (const win of this.#windows.values()) win.onclosed?.();
     this.#windows.clear();
+    // The guest's OpenGL goes with it. Left running, a finished session keeps
+    // a Mesa module, a WebGL or WebGPU context and a thread waiting on a ring
+    // nobody writes to any more -- and the *next* session then asks the
+    // browser for a second set of all of it, which is how a run that works
+    // the first time throws the second.
+    this.#glServe?.stop?.();
+    this.#glServe = null;
+    this.#glServed = false;
+    const gl = this.#gl;
+    this.#gl = null;
+    this.#glShown.clear();
+    this.#glList = [];
+    gl?.dispose?.();
+    // A context is not collected just because nothing refers to it, and a
+    // page holds a fixed number of them. Asking for it to be lost frees it
+    // now rather than whenever the browser gets round to it.
+    const canvas = this.#glCanvas;
+    this.#glCanvas = null;
+    if (canvas) {
+      try {
+        canvas.getContext('webgl2')?.getExtension('WEBGL_lose_context')?.loseContext();
+      } catch { /* a WebGPU canvas has no such context, and needs none */ }
+      canvas.remove();
+    }
   }
 
-  /** Every window currently on the desktop, newest last. */
   /** The surface records this desktop last read, as the compositor saw them.
    *
    * For diagnosis: a window that stays blank is either a record with nothing
@@ -408,6 +451,7 @@ export class DomDesktop {
     return this.#records;
   }
 
+  /** Every window currently on the desktop, newest last. */
   windows() {
     return [...this.#windows.values()];
   }
@@ -421,7 +465,7 @@ export class DomDesktop {
       // `eglSwapBuffers` waits for this count to move.
       if (this.#glServed) {
         this.#gl?.display?.();
-        this.#adoptGl();
+        this.#drawGl();
       }
       this.#reconcile();
     } catch (e) {
@@ -452,7 +496,6 @@ export class DomDesktop {
       if (live.has(k)) continue;
       this.#windows.delete(k);
       if (this.#focus === win) this.#focus = null;
-      if (this.#glAdopted === win) this.#glAdopted = null;
       if (this.#cursor === win) {
         // The client took its cursor away: back to the page's own pointer,
         // which is what the scene compositor's fallback arrow amounts to.
@@ -572,47 +615,61 @@ export class DomDesktop {
 
   /** Every window's canvas listens for itself, which is what makes the
    *  browser's hit-testing ours: `offsetX`/`offsetY` is surface-local. */
-  /** Give the GL window the canvas the host's GL presents into.
+  /* Draw every window whose pixels are the host's OpenGL.
    *
-   * Which window that is comes from the GL device, not from the surface: a
-   * Wayland client names the surface it attached to, an X client names a
-   * drawable and the window manager is what knows which window became which
-   * surface. Either way the answer arrives *after* the window does -- a
-   * client creates its window first and its GL context second -- so this is
-   * checked per frame until it matches, and the canvas is swapped into the
-   * frame the page has already drawn around it.
+   * One renderer, several windows: the renderer keeps a frame per surface and
+   * puts the one asked for on its own canvas, which is then copied into that
+   * window's canvas. One GPU blit and one canvas copy per window per frame,
+   * and no readback -- the pixels never come back to JavaScript.
    *
-   * The swap is what makes this copy-free: the element the client's GL draws
-   * on becomes the element the page shows, rather than one being blitted into
-   * the other. */
-  #adoptGl() {
-    if (this.#glAdopted || !this.#glCanvas) return;
-    const a = this.#gl?.attachment?.();
-    if (!a || !a.id) return;
-    for (const win of this.#windows.values()) {
-      const hit = a.kind === 0
-        ? win.token === a.token && win.surface === a.id
-        : win.xid === a.id;
-      if (!hit) continue;
-      const old = win.canvas;
-      const gl = this.#glCanvas;
-      gl.style.display = 'block';
-      gl.width = Math.max(1, win.width);
-      gl.height = Math.max(1, win.height);
-      // In the page's frame, exactly where the window's own canvas was.
-      if (old.parentElement) old.replaceWith(gl);
-      else this.#mount.append(gl);
-      win.adopt(gl);
-      // Listeners were bound to the canvas that just left.
-      this.#attach(win);
-      this.#glAdopted = win;
-      this.ongladopted?.(win);
-      return;
+   * The canvas the window adopted used to be the renderer's own, which is one
+   * copy fewer and exactly one window: a second GL client had nowhere to be
+   * drawn, and closing the first took the renderer's canvas out of the page
+   * with the frame it was inside.
+   *
+   * Which window is which comes from the device rather than from the surface
+   * record: a Wayland client names its own surface, an X client names a
+   * drawable, and the window manager is what knows which surface that window
+   * became. Either way the answer arrives after the window does.
+   */
+  #drawGl() {
+    const device = this.#gl;
+    const renderer = device?.renderer;
+    this.#glLooks++;
+    if (!device?.ok || !renderer) return;
+    // Read every frame rather than when a counter says it changed. The
+    // counter was an optimisation worth a handful of wasm calls per frame,
+    // and it was wrong once -- a list captured while only one client had
+    // attached, never refreshed, and a second GL window that was therefore
+    // never drawn at all. A window that is missing is much more expensive
+    // than sixteen calls.
+    const before = this.#glList;
+    this.#glList = device.surfaces();
+    for (const old of before) {
+      if (!old.frame) continue;
+      if (this.#glList.some((s) => s.frame === old.frame)) continue;
+      renderer.forgetSurface?.(old.frame);
     }
+    if (!this.#glList.length) return;
+    for (const [key, win] of this.#windows) {
+      const found = this.#glList.find((s) => s.id && (s.kind === 0
+        ? win.token === s.token && win.surface === s.id
+        : win.xid === s.id));
+      if (!found) continue;
+      // Its pixels are the host's from now on: nothing paints this window
+      // out of the guest's memory any more. See `#update`.
+      win.external = true;
+      const frame = found.frame ? renderer.frameFor?.(found.frame) : null;
+      if (!frame) continue;
+      if (this.#glShown.get(key) === frame.serial) continue;
+      if (!renderer.showSurface?.(found.frame)) continue;
+      this.#glShown.set(key, frame.serial);
+      this.#glCopies++;
+      win.showGl(this.#glCanvas, frame.w, frame.h);
+    }
+    for (const key of [...this.#glShown.keys()])
+      if (!this.#windows.has(key)) this.#glShown.delete(key);
   }
-
-  /** Told which window the host's GL draws, once that is known. */
-  ongladopted = null;
 
   #attach(win) {
     const c = win.canvas;
@@ -640,7 +697,9 @@ export class DomDesktop {
     c.addEventListener('pointerdown', (e) => {
       const p = at(e);
       this.focus(win);
-      c.setPointerCapture?.(e.pointerId);
+      // A pointer that is no longer active makes this throw, and a window
+      // that cannot take a drag is better than a listener that dies in it.
+      try { c.setPointerCapture?.(e.pointerId); } catch { /* no capture */ }
       sendEvent(this.#channel, win.block, EV_MOTION, p.x, p.y, p.t, 0,
                 win.client, win.surface);
       sendEvent(this.#channel, win.block, EV_BUTTON, BTN[e.button] ?? 0x110, 1,
@@ -648,7 +707,7 @@ export class DomDesktop {
     });
     c.addEventListener('pointerup', (e) => {
       const p = at(e);
-      c.releasePointerCapture?.(e.pointerId);
+      try { c.releasePointerCapture?.(e.pointerId); } catch { /* never held */ }
       sendEvent(this.#channel, win.block, EV_BUTTON, BTN[e.button] ?? 0x110, 0,
                 p.t, 0, win.client, win.surface);
     });
