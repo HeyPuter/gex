@@ -440,18 +440,35 @@ void gex_virgl_present_direct(int on) { gex_present_direct = on != 0; }
  * Returns zero when there was nothing to take, which for a client that has
  * not drawn yet is ordinary. */
 EMSCRIPTEN_KEEPALIVE
-int gex_virgl_snapshot_surface(unsigned uid) {
-    GLint fb = 0;
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
-    GLint vp[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_VIEWPORT, vp);
-    if (fb == 0 || vp[2] <= 0 || vp[3] <= 0) return 0;
+int gex_virgl_snapshot_surface(unsigned uid, unsigned resource) {
+    /* The resource the decoder named, not whatever framebuffer is bound: this
+     * renderer's current context follows whichever connection submitted last,
+     * so with two clients drawing, the bound one is the wrong client's as
+     * often as not. */
+    struct virgl_renderer_resource_info info;
+    if (!resource ||
+        virgl_renderer_resource_get_info((int)resource, &info) != 0 ||
+        !info.tex_id || info.width == 0 || info.height == 0) {
+        gex_present_no_info++;
+        return 0;
+    }
+    if (!gex_blit_fbo) glGenFramebuffers(1, &gex_blit_fbo);
+    const GLint vp[4] = {0, 0, (GLint)info.width, (GLint)info.height};
+    GLint read_first = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_first);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, gex_blit_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, info.tex_id, 0);
+    if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_first);
+        gex_present_no_tex++;
+        return 0;
+    }
+    /* Left bound: this is the framebuffer the copy below reads from. */
     struct gex_present_slot *slot = gex_slot_for(uid);
     if (!slot->copy) glGenTextures(1, &slot->copy);
-    GLint read_was = 0, tex_was = 0;
-    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_was);
+    GLint tex_was = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex_was);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)fb);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glBindTexture(GL_TEXTURE_2D, slot->copy);
     glDisable(GL_SCISSOR_TEST);
@@ -474,30 +491,23 @@ int gex_virgl_snapshot_surface(unsigned uid) {
         slot->live = 0;
     } else {
         /* Some drawables cannot be read into a plain RGBA8 texture. The
-         * guest's own target is then what a compositor gets: it can tear,
-         * and it is the picture. */
+         * resource's own texture is then what a compositor gets: it is what
+         * the client keeps drawing into, so it can tear, and it is the
+         * picture. */
         gex_present_error = copy_error;
-        GLint attached = 0, kind = 0;
-        glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
-                                              GL_COLOR_ATTACHMENT0,
-                                              GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
-                                              &kind);
-        if (kind == GL_TEXTURE) {
-            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
-                                                  GL_COLOR_ATTACHMENT0,
-                                                  GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
-                                                  &attached);
-            slot->live = (GLuint)attached;
-            slot->w = vp[2];
-            slot->h = vp[3];
-            slot->serial++;
-        }
+        slot->live = info.tex_id;
+        slot->w = vp[2];
+        slot->h = vp[3];
+        slot->serial++;
     }
     glBindTexture(GL_TEXTURE_2D, (GLuint)tex_was);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_was);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_first);
     gex_presented++;
     return copy_error == GL_NO_ERROR || slot->live ? 1 : 0;
 }
+
+/* Kept for the frame's own texture when a copy is impossible: the resource's
+ * texture is the guest's target, which can tear but is at least the picture. */
 
 /* One surface's own latest frame. Zero when that surface has never presented
  * -- a window whose client has not drawn yet, or one that has gone. */

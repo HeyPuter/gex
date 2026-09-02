@@ -243,16 +243,14 @@ if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
             "$ROOT/guest/gl/build.sh" "$WORK/gldriver-glibc" >/dev/null
         cp "$WORK/gldriver-glibc/libGLESv2.so.2" \
            "$WORK/gldriver-glibc/libEGL.so.1" \
-           "$WORK/gldriver-glibc/libGL.so.1" \
-           "$WORK/gldriver-glibc/libgex-gl-sdl.so" "$PUB/fs/glibc/"
+           "$WORK/gldriver-glibc/libGL.so.1" "$PUB/fs/glibc/"
     elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
         mkdir -p "$PUB/fs/glibc"
         GEX_CC="$(command -v aarch64-linux-gnu-gcc)" \
             "$ROOT/guest/gl/build.sh" "$WORK/gldriver-glibc" >/dev/null
         cp "$WORK/gldriver-glibc/libGLESv2.so.2" \
            "$WORK/gldriver-glibc/libEGL.so.1" \
-           "$WORK/gldriver-glibc/libGL.so.1" \
-           "$WORK/gldriver-glibc/libgex-gl-sdl.so" "$PUB/fs/glibc/"
+           "$WORK/gldriver-glibc/libGL.so.1" "$PUB/fs/glibc/"
     else
         echo "skipping glibc GL driver: no aarch64-linux-gnu-gcc"
     fi

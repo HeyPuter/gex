@@ -66,7 +66,7 @@ for tree in "$ROOT/web/public" "$ROOT/web/dist"; do
     mkdir -p "$tree/fs" "$tree/fs/glibc"
     cp "$GUEST_GL/libGLESv2.so.2" "$GUEST_GL/libEGL.so.1" "$tree/fs/"
     [ -z "$GUEST_GL_GLIBC" ] || cp "$GUEST_GL_GLIBC/libGLESv2.so.2" \
-        "$GUEST_GL_GLIBC/libEGL.so.1" "$GUEST_GL_GLIBC/libgex-gl-sdl.so" \
+        "$GUEST_GL_GLIBC/libEGL.so.1" "$GUEST_GL_GLIBC/libGL.so.1" \
         "$tree/fs/glibc/"
 done
 

@@ -1110,7 +1110,7 @@ const waylandGears = {
           }
         }
         if (usesDirectGl(demo)) {
-          const directFiles = ['libGLESv2.so.2', 'libEGL.so.1', 'libgex-gl-sdl.so'];
+          const directFiles = ['libGLESv2.so.2', 'libEGL.so.1', 'libGL.so.1'];
           const directPrefix = demo.directGlAbi ? `/fs/${demo.directGlAbi}` : '/fs';
           await Promise.all(directFiles.map(async (name) => {
             // `no-store` for the same reason the gles-gears path uses it: these
@@ -1402,11 +1402,7 @@ const stkEnv =
   + 'export ALSOFT_DRIVERS=null\n'
   + 'export MESA_GL_VERSION_OVERRIDE=3.3\n'
   + 'export MESA_GLSL_VERSION_OVERRIDE=330\n'
-  + 'export JSIMD_FORCENONE=1\n'
-  // STK asks SDL for an explicit ES 3 context, which Mesa's virgl GLX
-  // frontend refuses; this preload rewrites the request to ES 2, which comes
-  // back as 3.0 anyway. See web/virgl/stk-sdl-es3-compat.c.
-  + 'export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgex-stk-sdl.so\n';
+  + 'export JSIMD_FORCENONE=1\n';
 const stkProfileValue = Number(new URLSearchParams(location.search).get('stkprofile'));
 // Preserve the original `?stkprofile=1` harness shorthand (a five-second
 // profile), while accepting an explicit duration for longer stable samples.
@@ -1517,8 +1513,7 @@ const supertuxkart = {
   rootfs: '/rootfs/stk.tar?v=snowpeak20',
   env:
     'IRR_DEVICE_TYPE=x11;SUPERTUXKART_DATADIR=/usr/share/games/supertuxkart;' +
-    'ALSOFT_DRIVERS=null;JSIMD_FORCENONE=1;' +
-    'LD_PRELOAD=/usr/lib/gex-gl/libgex-gl-sdl.so',
+    'ALSOFT_DRIVERS=null;JSIMD_FORCENONE=1',
   // Auto-run is playable by default. The harness adds ?stkprofile=1 for its
   // finite benchmark run without exposing profiling controls in the demo UI.
   client: stkLaunch,
@@ -2108,7 +2103,6 @@ const compositor = {
           for (const [from, to] of [
             ['/fs/glibc/libGLESv2.so.2', '/usr/lib/gex-gl/libGLESv2.so.2'],
             ['/fs/glibc/libEGL.so.1', '/usr/lib/gex-gl/libEGL.so.1'],
-            ['/fs/glibc/libgex-gl-sdl.so', '/usr/lib/gex-gl/libgex-gl-sdl.so'],
             ['/fs/glibc/libGL.so.1', '/usr/lib/gex-glx/libGL.so.1'],
           ]) {
             const response = await fetch(from, { cache: 'no-store' });

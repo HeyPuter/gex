@@ -94,10 +94,27 @@ int glXQueryExtension(void *dpy, int *error_base, int *event_base) {
 
 const char *glXQueryExtensionsString(void *dpy, int screen) {
     (void)dpy; (void)screen;
-    /* One extension, and it is the one a program checks before asking for a
-       version-and-profile context; without it glmark2 takes the legacy
-       glXCreateContext path, which this also implements. */
-    return "GLX_ARB_create_context GLX_ARB_create_context_profile";
+    /* What this library actually implements, named the way a program looks
+       for it. Toolkits check this string before using an entry point at all:
+       SDL asks for the create-context extensions before it will make
+       anything but a legacy context, and for the swap-control ones before it
+       will honour a swap interval. Claiming only the first two left three
+       implemented entry points unreachable.
+       Nothing here claims sRGB framebuffers or float pixel formats: those
+       would have to be true of the backend's buffer, and are not. */
+    return "GLX_ARB_get_proc_address "
+           "GLX_ARB_create_context "
+           "GLX_ARB_create_context_profile "
+           "GLX_ARB_create_context_robustness "
+           "GLX_EXT_create_context_es2_profile "
+           "GLX_ARB_multisample "
+           "GLX_EXT_visual_info "
+           "GLX_EXT_visual_rating "
+           "GLX_EXT_swap_control "
+           "GLX_MESA_swap_control "
+           "GLX_SGI_swap_control "
+           "GLX_SGIX_fbconfig "
+           "GLX_SGI_make_current_read";
 }
 
 const char *glXGetClientString(void *dpy, int name) { (void)dpy; (void)name; return "gex"; }
@@ -258,21 +275,49 @@ void *glXCreateContextAttribsARB(void *dpy, void *config, void *share,
        version is forwarded the same way EGL's is -- the host still reports
        what it actually got through GL_VERSION -- and an explicit core request
        overrides the compatibility default above. */
+    int wants_es = 0;
     for (const int *a = attribs; a && *a != 0 && !host_context_made; a += 2) {
         switch (a[0]) {
         case 0x2091: egl_context_major = a[1]; break; /* MAJOR_VERSION_ARB */
         case 0x2092: egl_context_minor = a[1]; break; /* MINOR_VERSION_ARB */
         case 0x9126: /* GLX_CONTEXT_PROFILE_MASK_ARB */
-            /* 0x1 core, 0x2 compatibility. */
+            /* 0x1 core, 0x2 compatibility, 0x4 OpenGL ES -- the last from
+               GLX_EXT_create_context_es2_profile, and an application that
+               asks for it is asking for ES however it got here.
+               SuperTuxKart asks GLX for ES 3 exactly this way, and the
+               request used to be rewritten to ES 2 by a preloaded library
+               because the driver underneath refused it. */
+            wants_es = (a[1] & 0x4) != 0;
             egl_context_profile = (a[1] & 0x2) ? 1 : 0;
             break;
-        default: break;
+        default:
+            /* Flags, reset notification, release behaviour: read past them.
+               A GLX driver that refuses a context because it was told
+               something it does not act on is worse than one that ignores
+               it, and the host reports what the context really is. */
+            break;
         }
     }
+    /* After the attributes, not before: `gexgl_glx_ensure_egl` binds desktop
+       GL because that is what reaching for GLX usually means, and only the
+       profile mask can say otherwise. */
+    if (wants_es) eglBindAPI(0x30A0u /* EGL_OPENGL_ES_API */);
     return GEXGL_GLX_CONTEXT;
 }
 
-void glXDestroyContext(void *dpy, void *ctx) { (void)dpy; (void)ctx; }
+/* Destroying the context really destroys it, which is what makes an odd
+ * initialization work.
+ *
+ * A toolkit commonly makes a throwaway context to read GL_VERSION and the
+ * extension strings, destroys it, and only then creates the one it wants --
+ * SDL does exactly this. The host context used to be made once and latched,
+ * so the second request's profile and version were quietly ignored and the
+ * application ran on whatever the throwaway had asked for. Letting the host
+ * drop it means the next creation is a real creation. */
+void glXDestroyContext(void *dpy, void *ctx) {
+    (void)dpy; (void)ctx;
+    eglDestroyContext(NULL, ctx);
+}
 
 int glXMakeCurrent(void *dpy, unsigned long drawable, void *ctx) {
     gexgl_glx_ensure_egl(dpy);
@@ -304,8 +349,13 @@ int glXMakeContextCurrent(void *dpy, unsigned long draw, unsigned long read,
 }
 
 void glXSwapBuffers(void *dpy, unsigned long drawable) {
-    (void)drawable;
-    eglSwapBuffers(dpy, egl_current_draw);
+    /* The drawable named here, not whatever is current: an application with
+       two windows swaps each in turn, and GLX has no notion of "the current
+       one" for this call. The surface for that window is the one this
+       library already made for it. */
+    struct gexgl_egl_surface *s =
+        egl_surface_for_native((void *)(uintptr_t)drawable);
+    eglSwapBuffers(dpy, s ? (void *)(uintptr_t)s->handle : egl_current_draw);
 }
 
 void *glXGetCurrentContext(void) {
