@@ -1333,11 +1333,27 @@ fn run_thread_loop(
             std::thread::Builder::new()
                 .name(format!("gex-tid-{}", child.tid))
                 .spawn(move || {
-                    if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
-                        eprintln!("gexc: thread {} failed: {e:#}", child.tid);
-                        // A thread that fails takes its process with it, as on
-                        // Linux: otherwise the other threads sit in a futex
-                        // forever and every descriptor it holds stays open.
+                    // A thread that fails, or that a fatal signal stops, takes
+                    // its process with it, as on Linux: otherwise the other
+                    // threads sit in a futex forever, every descriptor it
+                    // holds stays open, and (for Wine) the wineserver keeps
+                    // the dead process alive until the run times out.
+                    let fatal = match run_guest_thread(Arc::clone(&cx), child) {
+                        Err(e) => {
+                            eprintln!("gexc: thread {} failed: {e:#}", child.tid);
+                            true
+                        }
+                        Ok(Exit::Signal { signal, pc, detail, .. }) => {
+                            let pid = cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).pid;
+                            eprintln!(
+                                "[gex:{pid}] fatal signal {signal} in thread {} at 0x{pc:x}: {detail}",
+                                child.tid
+                            );
+                            true
+                        }
+                        Ok(_) => false,
+                    };
+                    if fatal {
                         stop_other_threads(&cx, false);
                         cx.kernel
                             .lock()
@@ -1711,7 +1727,7 @@ fn exec_program(
 }
 
 /// A guest thread: its own store, its own instances, the same memory.
-fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
+fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Exit> {
     let mut store = Store::new(
         &cx.engine,
         HostState {
@@ -1770,10 +1786,10 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
         let data = cx.memory.bytes();
         read_u64(data, (thread.ctx_addr + ctx::PC as u64) as usize)
     };
-    if let Stopped::Exec(_) = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)? {
-        bail!("execve from a non-main thread is not supported");
+    match run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)? {
+        Stopped::Exec(_) => bail!("execve from a non-main thread is not supported"),
+        Stopped::Exited(exit) => Ok(exit),
     }
-    Ok(())
 }
 
 /// Instantiate every registry entry into this store, outside a wasm frame.
@@ -2816,18 +2832,65 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                             r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7), r(8), r(9), r(10), r(11), r(12), r(13), r(14), r(15),
                             read_u64(data, c + ctx::NZCV)
                         );
-                        if let Some(a) = std::env::var_os("GEX_TRAP_MEM").and_then(|s| {
-                            let s = s.to_string_lossy().to_string();
-                            u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
-                        }) {
-                            let a = a as usize;
-                            let mut mem = String::new();
-                            for k in (0..64usize).step_by(8) {
-                                if a + k + 8 <= data.len() {
-                                    mem.push_str(&format!(" [{:#x}]={:#x}", a + k, read_u64(data, a + k)));
+                        // GEX_TRAP_MEM=<expr>[:<hexlen>][,<expr>[:<hexlen>]...]: dump
+                        // guest memory (64 bytes by default) at each address.
+                        // An expr is a base -- a hex address, or `gs`/`fs`/`sp`
+                        // for the thread's segment base or stack pointer --
+                        // followed by `+hex`, `-hex`, `|hex` and `*` (load the
+                        // u64 there), left to right. So `gs+1488*+4:2d0` is the
+                        // WoW64 CPU area's context and `sp|fffff+1-2e0` the top
+                        // of the kernel stack it sits under.
+                        if let Some(spec) = std::env::var_os("GEX_TRAP_MEM") {
+                            let gs = read_u64(data, c + ctx::GS_BASE);
+                            let fs = read_u64(data, c + ctx::FS_BASE);
+                            let sp = r(4);
+                            for one in spec.to_string_lossy().split(',') {
+                                let (expr, len) = match one.split_once(':') {
+                                    Some((e, l)) => (e, usize::from_str_radix(l, 16).unwrap_or(64)),
+                                    None => (one, 64),
+                                };
+                                let expr = expr.trim();
+                                let mut rest = expr;
+                                let take_hex = |s: &mut &str| -> u64 {
+                                    let end = s.find(|ch: char| !ch.is_ascii_hexdigit()).unwrap_or(s.len());
+                                    let v = u64::from_str_radix(&s[..end], 16).unwrap_or(0);
+                                    *s = &s[end..];
+                                    v
+                                };
+                                let mut a = if let Some(r) = rest.strip_prefix("gs") {
+                                    rest = r;
+                                    gs
+                                } else if let Some(r) = rest.strip_prefix("fs") {
+                                    rest = r;
+                                    fs
+                                } else if let Some(r) = rest.strip_prefix("sp") {
+                                    rest = r;
+                                    sp
+                                } else {
+                                    rest = rest.trim_start_matches("0x");
+                                    take_hex(&mut rest)
+                                };
+                                while let Some(op) = rest.chars().next() {
+                                    rest = &rest[1..];
+                                    match op {
+                                        '+' => a = a.wrapping_add(take_hex(&mut rest)),
+                                        '-' => a = a.wrapping_sub(take_hex(&mut rest)),
+                                        '|' => a |= take_hex(&mut rest),
+                                        '*' => {
+                                            a = if (a as usize) + 8 <= data.len() { read_u64(data, a as usize) } else { 0 };
+                                        }
+                                        _ => break,
+                                    }
                                 }
+                                let a = a as usize;
+                                let mut mem = format!(" {expr} ->");
+                                for k in (0..len).step_by(8) {
+                                    if a + k + 8 <= data.len() {
+                                        mem.push_str(&format!(" [{:#x}]={:#x}", a + k, read_u64(data, a + k)));
+                                    }
+                                }
+                                eprintln!("[trace-mem]{mem}");
                             }
-                            eprintln!("[trace-mem]{mem}");
                         }
                         if std::env::var_os("GEX_TRAP_STACK").is_some() {
                             let sp = r(4) as usize;
