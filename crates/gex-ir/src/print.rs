@@ -276,7 +276,7 @@ pub fn block(b: &Block) -> String {
             "  {} {target:?}",
             if *is_ret { "ret" } else { "br_indirect" }
         ),
-        Term::Syscall { next } => writeln!(s, "  syscall -> 0x{next:x}"),
+        Term::Syscall { next, .. } => writeln!(s, "  syscall -> 0x{next:x}"),
         Term::Illegal { raw, pc } => writeln!(s, "  illegal 0x{raw:08x} @0x{pc:x}"),
     };
     s

@@ -663,8 +663,13 @@ impl<'a> Lifter<'a> {
             // `int 0x80` is the i386 system-call gate; the kernel reads the
             // number and arguments from the 32-bit registers when the process
             // is a 32-bit one. Any other software interrupt is a fault.
-            Op::Int if i.ops[0] == Some(Operand::Imm(0x80)) && self.wa() == Width::D => {
-                Flow::End(Term::Syscall { next })
+            // `int 0x80` is the i386 system-call gate. A 32-bit process reaches
+            // every syscall this way; a 64-bit one uses it deliberately for a
+            // few i386-ABI calls (Wine allocates its WoW64 `fs` selector with
+            // `modify_ldt` this way), which x86-64 Linux serves with the i386
+            // ABI regardless of mode -- so it is a syscall in either mode.
+            Op::Int if i.ops[0] == Some(Operand::Imm(0x80)) => {
+                Flow::End(Term::Syscall { next, i386: true })
             }
             Op::Unknown | Op::Undefined | Op::Hlt | Op::Int | Op::Xlat => {
                 Flow::End(Term::Illegal { raw: self.raw, pc })
@@ -1341,7 +1346,7 @@ impl<'a> Lifter<'a> {
                 self.wr64(RCX, n);
                 let fl = self.k64(0x246);
                 self.wr64(R11, fl);
-                Flow::End(Term::Syscall { next })
+                Flow::End(Term::Syscall { next, i386: false })
             }
             Op::Int3 => {
                 let pcv = self.k64(pc);

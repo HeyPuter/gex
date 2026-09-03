@@ -1423,7 +1423,16 @@ impl Kernel {
         let raw = m
             .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0);
-        let mut a: [u64; 6] = if self.compat {
+        // The i386 ABI applies when the process itself is 32-bit, or when a
+        // 64-bit one reached the kernel through `int 0x80` (the emitter flags
+        // that in the context): x86-64 Linux serves `int 0x80` with the 32-bit
+        // registers and numbering regardless of the caller's mode.
+        let i386_abi = self.compat
+            || (gex_abi::X86
+                && m.read_u64(self.ctx_addr + ctx::SYSCALL_I386 as u64)
+                    .unwrap_or(0)
+                    != 0);
+        let mut a: [u64; 6] = if i386_abi {
             let mut a = [0u64; 6];
             for (i, slot) in crate::i386::ARG_SLOTS.iter().enumerate() {
                 a[i] = m.read_u64(self.ctx_addr + *slot as u64).unwrap_or(0) & 0xffff_ffff;
@@ -1445,7 +1454,7 @@ impl Kernel {
         // An x86-64 guest's numbering is translated to the canonical one, and
         // its legacy calls rewritten into the `*at`/extended forms.
         let mut post = crate::i386::Post::None;
-        let n = if gex_abi::X86 && self.compat {
+        let n = if gex_abi::X86 && i386_abi {
             let (n, p) = crate::i386::translate(
                 raw & 0xffff_ffff,
                 &mut a,

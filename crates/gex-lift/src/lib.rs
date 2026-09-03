@@ -944,7 +944,7 @@ impl<'a> Lifter<'a> {
                 Flow::End(Term::Indirect { target, is_ret })
             }
 
-            Inst::Svc { .. } => Flow::End(Term::Syscall { next }),
+            Inst::Svc { .. } => Flow::End(Term::Syscall { next, i386: false }),
 
             Inst::Brk { imm } => {
                 let pcv = self.b.const_i64(pc);

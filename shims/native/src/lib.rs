@@ -1494,7 +1494,16 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
             // Two numbers, deliberately: the process table keeps the one a
             // shell would print, and `wait4` gets the kernel's encoding.
             let (code, wstatus) = match run_guest_process(child_cx, thread, entry) {
-                Ok(exit) => (exit.code(), exit.wait_status()),
+                Ok(exit) => {
+                    // A gex limitation that killed a *child* is as much a bug as
+                    // one that kills the main process, and a child is exactly
+                    // where a Wine helper or a WoW64 process dies -- so say so
+                    // rather than let it vanish into a wait status.
+                    if let Exit::Signal { signal, pc, detail, .. } = &exit {
+                        eprintln!("[gex:{pid}] fatal signal {signal} at 0x{pc:x}: {detail}");
+                    }
+                    (exit.code(), exit.wait_status())
+                }
                 Err(e) => {
                     eprintln!("gexc: child {pid} failed: {e:#}");
                     // A process that dies takes its threads and descriptors

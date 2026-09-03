@@ -982,8 +982,11 @@ pub enum Term {
         /// True for `ret`, which the backend may serve from a return cache.
         is_ret: bool,
     },
-    /// Enter the kernel, then continue at `next`.
-    Syscall { next: u64 },
+    /// Enter the kernel, then continue at `next`. `i386` is set when the
+    /// guest reached the kernel through the i386 ABI (`int 0x80`) rather than
+    /// the native gate, so the kernel reads the 32-bit registers even in a
+    /// 64-bit process.
+    Syscall { next: u64, i386: bool },
     /// An instruction we cannot execute. Raises SIGILL and does not return.
     Illegal { raw: u32, pc: u64 },
 }
@@ -1046,7 +1049,7 @@ impl Block {
                 out.push(taken);
                 out.push(not_taken);
             }
-            Term::Syscall { next } => out.push(next),
+            Term::Syscall { next, .. } => out.push(next),
             Term::Indirect { .. } | Term::Illegal { .. } => {}
         }
         out.into_iter()

@@ -269,6 +269,14 @@ pub mod ctx {
     /// fact cannot read it back from there.
     pub const LAST_SYSCALL: usize = 45 * 8;
 
+    /// Set by the emitter just before a system call to say the guest reached it
+    /// through the i386 ABI (`int 0x80`) rather than the native one (`syscall`),
+    /// so the kernel reads the number and arguments from the 32-bit registers
+    /// even in a 64-bit process. Wine's WoW64 setup uses `int 0x80` from
+    /// long-mode code to allocate its 32-bit `fs` selector via `modify_ldt`,
+    /// which x86-64 Linux services with the i386 ABI regardless of mode.
+    pub const SYSCALL_I386: usize = 47 * 8;
+
     /// `v0`–`v31`, the SIMD/FP register file, 16 bytes each. On x86-64 the
     /// first sixteen are `xmm0`–`xmm15`.
     pub const V: usize = 48 * 8;

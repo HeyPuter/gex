@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn syscall_terminates() {
         let b = lift_block(bytes(0x4000, &[0x0f, 0x05]), 0x4000, BlockLimits::default());
-        assert_eq!(b.term, Term::Syscall { next: 0x4002 });
+        assert_eq!(b.term, Term::Syscall { next: 0x4002, i386: false });
     }
 
     #[test]

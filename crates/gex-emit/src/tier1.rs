@@ -2628,13 +2628,18 @@ impl<'a> Emitter<'a> {
                 }
                 self.emit_dispatch_tail_call();
             }
-            Term::Syscall { next } => {
+            Term::Syscall { next, i386 } => {
                 self.flush();
                 // The recorded PC is the instruction *after* the `svc`: it is
                 // where a signal frame must resume, and resuming at the `svc`
                 // itself would re-issue the syscall. The call still receives
                 // the syscall's own address, which is what a trace wants.
                 self.store_pc(next);
+                // Say which ABI reached the kernel -- `int 0x80` (i386) or the
+                // native gate. Written on every syscall so the slot is fresh.
+                self.f.local_get(self.ctx_local);
+                self.f.i64_const(i386 as i64);
+                self.f.store(0x37, 3, gex_abi::ctx::SYSCALL_I386 as u32);
                 self.f.local_get(self.ctx_local);
                 self.f.i64_const((block.end - gex_abi::SYSCALL_INST_BYTES) as i64);
                 self.f.call(self.cx.syscall);
