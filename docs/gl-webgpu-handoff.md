@@ -10209,3 +10209,108 @@ The SSBO count is a warning, not the refusal. st reserves *half* of
 five blocks; the cap now claims twice the device budget, which yields eight.
 Blender wants more than eight, which the device's ten cannot give under that
 split.
+
+## Blender draws its interface
+
+Blender 5.2 now passes its platform check, links and runs its UI shaders, and
+**draws its own interface** -- the header, the toolbars, the sidebars, each
+with the right viewport and scissor. It dies on one shader family, named below.
+
+Five things got it there.
+
+**`ARB_shader_draw_parameters`** (`gl44-draw-parameters-probe`, 5/5), which was
+the capability Blender named. `gl_BaseVertexARB`, `gl_BaseInstanceARB` and
+`gl_DrawIDARB` have no WGSL builtin -- `instance_index` counts from
+`firstInstance`, which this driver folds into the vertex buffer offsets, so the
+base is not even visible there. All three are per-draw scalars, so they travel
+in a driver-owned read-only block in the vertex group, **suballocated from the
+same constant ring the uniforms use**: the binding stays one stable buffer and
+only the dynamic offset changes, which is what keeps the bind group cached. A
+variant keyed on the values would recompile for every draw of a batched
+renderer, which is exactly the renderer that reads them.
+
+Four traps, in the order they appeared:
+
+1. **The block's type is rewritten if it is declared too early.**
+   `gex_wgpu_flatten_ssbo_blocks` runs *inside* `gex_wgpu_lower_gallium_ubos`
+   and reshapes every storage block above `GEX_WGPU_SSBO_FIRST_BINDING`, so a
+   deref built before it failed NIR validation inside ntv --
+   `deref_var &gex_draw_params ... error: instr->type == instr->var->type`.
+   It is declared after that lowering, and after the capture and varying
+   clones, which become *compute* variants that would otherwise carry a
+   storage block nothing fills.
+2. **It must not be collected as an application storage block.** The bind
+   group then had two entries at the same binding: "binding index (60) was
+   specified by a previous entry", plus "vertex storage block 0 has no buffer
+   bound".
+3. **`gl_BaseVertexARB` is not the first vertex.** The specification says it is
+   *zero* for a command with no basevertex parameter, while NIR's
+   `load_first_vertex` -- the internal value `gl_VertexID` is derived from --
+   *is* `first`. They are separate words. The probe carries a case for each,
+   and a fifth that reads `gl_VertexID` and `gl_BaseVertexARB` in one shader,
+   which is what catches sharing one word between them.
+4. **The base vertex is gone by the time the bind path runs.** The
+   provoking-vertex and unfilled rewrites build a fresh index list with the
+   base folded into the indices and `index_bias` reset -- correct for the draw,
+   wrong for the value the shader asked for. A `flat` varying is enough to
+   trigger it. The parameters are captured at the outermost `draw_vbo`, where
+   `ctx->draw_depth == 0` already means "as the application issued it".
+
+**`gl_DrawID` counts across a multi-draw.** The driver's multi-draw loop passed
+`drawid_offset` unchanged to every sub-draw, so a `glMultiDrawArrays` gave
+them all the same id. Gallium says which loops increment with
+`info->increment_draw_id` -- the same loop also serves the primitive-restart
+splitter, whose ranges came from one draw and must share its id.
+
+**A clear colour has to be finite.** GL puts no constraint on `glClearColor`;
+for a normalised target the value is clamped when the clear happens, so a NaN
+is unobservable. WebGPU validates the dictionary and rejects the *whole render
+pass*: "Color clearValue ([Color r:nan, ...]) contains a NaN or Inf". Blender
+clears with NaN during startup. Non-finite components now become 0, and an
+infinity clamps -- which is what a normalised target would have produced.
+
+**The texture creation limits had to follow the device too.** Taking the caps
+from the device (for GL 4.1's 16384) left `resource_create` refusing at a
+hardcoded 8192, and a refused allocation is `GL_OUT_OF_MEMORY` from whatever
+call made it -- Blender's log had only "GL_OUT_OF_MEMORY in glTexStorage2D" to
+go on. Both follow `screen->max_texture_*` now, and a refused texture
+allocation is named once with its format and shape.
+
+**Sampler-less texture queries.** `textureSize`, `textureQueryLevels` and
+`textureSamples` reach NIR as `txs`, `query_levels` and `texture_samples`, none
+of which carries a sampler deref -- and the metadata check refused any tex op
+without one that was not `txf`. The diagnostic named none of it, because the
+refusal happens before the slot masks are filled and the masks it printed were
+perfectly consistent; it names the op now.
+
+### The SSBO count, and an over-claim stated plainly
+
+Blender wants twelve SSBO binding locations. st/mesa reserves **half** of
+`max_shader_buffers` for atomic counter buffers, and Dawn's ceiling for
+`maxStorageBuffersPerShaderStage` is **ten** -- so the honest post-split
+number is five, and even claiming twice the device budget reaches only ten.
+
+The cap now claims 24, which yields twelve. That is an over-claim: a shader
+using more than ten storage bindings in one stage asks for more than the
+device has, and WebGPU rejects the bind group -- which the draw path reports
+as `bind=failed` rather than mis-rendering. Understating the driver by half
+to avoid a combination nothing does was the worse trade, and the alternative
+to the over-claim is that Blender does not start at all.
+
+### What is left
+
+    gex-wgpu: texture metadata invalid (texop=-1) textures=3 samplers=3
+    texture-used=0x07 sampler-used=0x07 shadow=0x00 float=0x07 uint=0x00
+    sint=0x01
+    gex-wgpu: shader rejected: gex_wgpu requires dereferenced, consistently
+    typed texture slots
+    ERROR workbench_resolve_opaque_studio_no_cavity_no_curvature_no_shado
+
+**Slot 0 is sampled as both a float and a signed integer in one shader**
+(`float=0x07`, `sint=0x01`). The metadata check requires one type per slot,
+because the bind group layout names one sample type per binding -- so two
+sampler variables sharing a driver location with different base types is a
+real conflict, not a bookkeeping one. Whether Blender declares two samplers
+that st collapsed onto one unit, or the shader reads one texture through two
+differently-typed samplers, is the next thing to find out: dump the shader
+before theorising about it.
