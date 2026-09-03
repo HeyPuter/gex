@@ -9410,3 +9410,71 @@ a shader using them now fails to link where before it could not have been
 written at all. That is the thing to watch in the next app sweep and CTS run;
 the honest fix is SSBO atomics, which WGSL supports but only on `atomic<u32>`
 storage, a different declaration from the plain array used here.
+
+## The target applications, measured
+
+### Krita 6.0.3 works
+
+The whole application: the welcome screen with decoded image thumbnails, and
+then the canvas -- an 800x600 image at 81.3% zoom, the GL colour wheel, layer
+and brush-preset thumbnails, every docker panel. Seven screen initialisations,
+sixteen shaders compiled, **zero declines and zero refusals**. It is the first
+ambitious user-facing application after SuperTuxKart to run on this driver end
+to end.
+
+**It needs `QT_XCB_GL_INTEGRATION=xcb_egl`, and that is not a Krita quirk --
+it is how any GLVND application has to be tested on the native path.**
+
+Qt does not link libGL; it goes through GLVND, which means the *system*
+`libGLX.so.0`. That loader looks for a DRI driver in `LIBGL_DRIVERS_PATH`,
+finds this build's `swrast_dri.so`, and fails:
+
+    glx: failed to create drisw screen
+
+Five times, and the driver is **never reached** -- no feature request, no
+screen init, nothing in the log. The reason is that `libdril_dri.so` needs
+only libm and libc: it is Mesa's *stub* DRI driver, not a loader for
+`libgallium`, and this build ships no `libGLX.so.0` of its own for a GLVND
+application to find. Forcing Qt onto EGL routes it through the `libEGL.so.1`
+this build does ship, and the driver is reached normally.
+
+Worth knowing because the failure looks exactly like a driver bug from
+outside: an application that opens its window, renders in software, and logs a
+GLX message. Count `native screen on Dawn` in the log before believing the
+driver was involved at all.
+
+### Modern Blender is blocked, and says so itself
+
+Blender 5.2.0 LTS starts, creates a context, probes formats -- and then stops
+without a window and without an error. Its own binary carries the reason:
+
+    A graphics card and driver with support for OpenGL 4.3 or higher is required.
+
+Zero shaders compiled. It checks the version and gives up, so it is blocked on
+the ladder rather than on any individual feature, and the ladder is blocked at
+4.0 by tessellation and fp64.
+
+### GL compute cannot be advertised, and it is not this driver's fault
+
+`st_extensions.c` gates `ARB_compute_shader` behind
+`max_threads_per_block >= 1024`, because GL 4.3 *requires*
+`MAX_COMPUTE_WORK_GROUP_INVOCATIONS` to be at least 1024. Dawn on this machine
+reports:
+
+    gex-wgpu: compute limits invocations/workgroup 256 workgroup 256x256x64
+              grid 65535x65535x65535 storage/compute 10
+
+**256.** That is WebGPU's guaranteed figure and what this adapter offers, and a
+GL workgroup of 1024 cannot be split into four WebGPU workgroups of 256
+without breaking shared memory and barriers. So compute at GL's required
+limits is not expressible here.
+
+This is worth stating as plainly as the tessellation and fp64 walls, because
+the code is already written and it would be easy to assume only a cap was
+missing: `launch_grid`, `create_compute_state`, `bind_compute_state` and
+`set_shader_buffers` are all implemented. What is missing is a device that
+offers 1024, plus `ARB_shader_image_load_store` on the way. Advertising 1024
+and refusing an over-large dispatch out loud is a possible trade -- it would
+serve the majority of real compute shaders, which use 64, 128 or 256 -- but it
+is a declared limit the device cannot meet, so it is a decision rather than an
+implementation.
