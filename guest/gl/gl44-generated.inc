@@ -1074,6 +1074,18 @@ void glGetQueryIndexediv(unsigned target, unsigned index, unsigned pname, int *p
         memcpy(params, source, expected);
 }
 void glGetQueryObjecti64v(unsigned id, unsigned pname, long long *params) {
+    {
+        const unsigned query_buffer = bound_buffer(0x9192u);
+        if (query_buffer) {
+            __typeof__(*params) value = 0;
+            glBindBuffer(0x9192u, 0);
+            glGetQueryObjecti64v(id, pname, &value);
+            glBindBuffer(0x9192u, query_buffer);
+            glBufferSubData(0x9192u, (long)(size_t)params,
+                            (long)sizeof(value), &value);
+            return;
+        }
+    }
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1272, 2, 0);
     if (!packet) return;
@@ -1086,6 +1098,18 @@ void glGetQueryObjecti64v(unsigned id, unsigned pname, long long *params) {
         memcpy(params, source, expected);
 }
 void glGetQueryObjectiv(unsigned id, unsigned pname, int *params) {
+    {
+        const unsigned query_buffer = bound_buffer(0x9192u);
+        if (query_buffer) {
+            __typeof__(*params) value = 0;
+            glBindBuffer(0x9192u, 0);
+            glGetQueryObjectiv(id, pname, &value);
+            glBindBuffer(0x9192u, query_buffer);
+            glBufferSubData(0x9192u, (long)(size_t)params,
+                            (long)sizeof(value), &value);
+            return;
+        }
+    }
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1273, 2, 0);
     if (!packet) return;
@@ -1098,6 +1122,18 @@ void glGetQueryObjectiv(unsigned id, unsigned pname, int *params) {
         memcpy(params, source, expected);
 }
 void glGetQueryObjectui64v(unsigned id, unsigned pname, unsigned long long *params) {
+    {
+        const unsigned query_buffer = bound_buffer(0x9192u);
+        if (query_buffer) {
+            __typeof__(*params) value = 0;
+            glBindBuffer(0x9192u, 0);
+            glGetQueryObjectui64v(id, pname, &value);
+            glBindBuffer(0x9192u, query_buffer);
+            glBufferSubData(0x9192u, (long)(size_t)params,
+                            (long)sizeof(value), &value);
+            return;
+        }
+    }
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1274, 2, 0);
     if (!packet) return;
@@ -1110,6 +1146,18 @@ void glGetQueryObjectui64v(unsigned id, unsigned pname, unsigned long long *para
         memcpy(params, source, expected);
 }
 void glGetQueryObjectuiv(unsigned id, unsigned pname, unsigned *params) {
+    {
+        const unsigned query_buffer = bound_buffer(0x9192u);
+        if (query_buffer) {
+            __typeof__(*params) value = 0;
+            glBindBuffer(0x9192u, 0);
+            glGetQueryObjectuiv(id, pname, &value);
+            glBindBuffer(0x9192u, query_buffer);
+            glBufferSubData(0x9192u, (long)(size_t)params,
+                            (long)sizeof(value), &value);
+            return;
+        }
+    }
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1275, 2, 0);
     if (!packet) return;

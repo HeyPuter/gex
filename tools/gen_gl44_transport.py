@@ -580,6 +580,15 @@ def validate(commands: list[dict]) -> list[dict]:
     return selected
 
 
+# The four query reads that ARB_query_buffer_object redirects into a buffer.
+QUERY_OBJECT_READS = (
+    "glGetQueryObjectiv",
+    "glGetQueryObjectuiv",
+    "glGetQueryObjecti64v",
+    "glGetQueryObjectui64v",
+)
+
+
 def output_component_expression(policy: str, pname: str = "pname") -> str:
     if policy == "one":
         return "1u"
@@ -624,6 +633,37 @@ def guest_function(command: dict, opcode: int) -> str:
             *params = 0;
         return;
     }
+""" + text[brace:]
+    if command["name"] in QUERY_OBJECT_READS:
+        # ARB_query_buffer_object. With a buffer bound to GL_QUERY_BUFFER,
+        # `params` is an *offset* into that buffer rather than a client
+        # pointer -- and the host has the same buffer bound, so it took the
+        # address of its own reply slot as the offset and answered
+        # GL_INVALID_OPERATION. All four cases of gl44-query-buffer-probe
+        # failed in the browser while passing natively, where there is no
+        # reply slot to mistake for an offset.
+        #
+        # Done entirely on this side, with calls that already exist: read the
+        # value with the binding out of the way, then put it where the
+        # application asked. The result still comes from a CPU readback -- the
+        # extension's point is to avoid the stall, and this does not -- but it
+        # is the semantics GL 4.4 requires, and 0x9192 is GL_QUERY_BUFFER.
+        # __typeof__ rather than the GL type name: this library's generated
+        # signatures use plain C types (`unsigned *params`), and glBufferSubData
+        # here takes `long` offsets.
+        brace = text.index("{\n") + 2
+        text = text[:brace] + f"""    {{
+        const unsigned query_buffer = bound_buffer(0x9192u);
+        if (query_buffer) {{
+            __typeof__(*params) value = 0;
+            glBindBuffer(0x9192u, 0);
+            {command["name"]}(id, pname, &value);
+            glBindBuffer(0x9192u, query_buffer);
+            glBufferSubData(0x9192u, (long)(size_t)params,
+                            (long)sizeof(value), &value);
+            return;
+        }}
+    }}
 """ + text[brace:]
     if _needs_coherent_flush(command["name"]):
         # After the opening brace of the definition, before any argument
