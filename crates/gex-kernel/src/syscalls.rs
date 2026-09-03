@@ -1703,14 +1703,23 @@ impl Kernel {
             }
         };
         if self.trace {
+            // A 64-byte write is the size of a wineserver request; its first
+            // word is the request code, which is what a Wine trace wants.
+            let req = if n == nr::WRITE && a[2] == 64 {
+                m.read_u32(a[1]).map(|r| format!(" [req {r}]")).unwrap_or_default()
+            } else {
+                String::new()
+            };
             eprintln!(
-                "[gex:{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} = {}",
+                "[gex:{}] {:.3}s pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{} = {}",
                 self.pid,
+                Self::trace_clock(),
                 syscall_name(n),
                 a[0],
                 a[1],
                 a[2],
                 traced_path(m, n, a),
+                req,
                 ret as i64
             );
         }
@@ -2044,7 +2053,14 @@ impl Kernel {
         }
     }
 
+        /// Seconds since the first traced syscall, for `--strace` timestamps.
+    fn trace_clock() -> f64 {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+    }
+    
     /// Finish a syscall whose blocking half the host has now run.
+
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
         // An `accept` that waited does its real work here, now that the
         // kernel is locked again and there is a descriptor table to put the
