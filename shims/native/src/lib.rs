@@ -2616,7 +2616,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 let cs = gex_kernel::x86::selector(&gm, ctx as u32 as u64, gex_kernel::x86::SEG_CS);
                 if cs == gex_kernel::x86::USER32_CS && std::env::var_os("GEX_WOW_TRACE").is_some() {
-                    eprintln!("[wow] miss pc=0x{pc:x} cs=0x{cs:x} -> compat");
+                    let esp = gm.read_u64(ctx as u32 as u64 + gex_abi::ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff;
+                    eprintln!("[wow] miss pc=0x{pc:x} esp=0x{esp:x} -> compat");
                 }
                 gex_xlate::set_thread_mode(if cs == 0 {
                     None

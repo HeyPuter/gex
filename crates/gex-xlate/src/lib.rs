@@ -983,7 +983,16 @@ fn discover(
         if frontier.len() + stats.blocks > max_blocks {
             frontier.truncate(max_blocks - stats.blocks);
         }
+        // A discovery pass is one mode throughout (a near branch keeps it, a
+        // far one ends the block), so carry the dispatch thread's mode to the
+        // parallel lift workers, which do not inherit the thread-local it lives
+        // in. Without this a WoW64 process's 32-bit blocks lifted on a worker
+        // fall back to long mode and run at the wrong stack width.
+        #[cfg(feature = "x86")]
+        let pass_mode = arch::thread_mode();
         let lifted = gex_emit::par::map(&frontier, &|&a| {
+            #[cfg(feature = "x86")]
+            arch::set_worker_mode(pass_mode);
             match intrinsics.get(&a) {
                 // Not lifted at all, so discovery never walks into the
                 // function's body and the module never carries it.

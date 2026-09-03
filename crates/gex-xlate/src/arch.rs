@@ -178,6 +178,22 @@ mod imp {
         });
     }
 
+    /// The serving thread's mode, so a discovery running on the dispatch
+    /// thread can carry it to the worker threads it lifts on.
+    pub fn thread_mode() -> Option<Mode> {
+        THREAD_MODE.with(|m| m.get())
+    }
+
+    /// Set the raw mode a lift worker runs in. A discovery pass is one mode
+    /// throughout -- a near branch never changes it, and a far one ends the
+    /// block -- so every block a pass lifts takes the dispatch thread's mode,
+    /// which the parallel workers do not otherwise inherit (it is thread
+    /// local). Without this a WoW64 process's 32-bit blocks lifted on a worker
+    /// default to long mode and run at the wrong stack width.
+    pub fn set_worker_mode(mode: Option<Mode>) {
+        THREAD_MODE.with(|m| m.set(mode));
+    }
+
     /// The mode code at `pc` is decoded in: the serving thread's, else a
     /// recorded range, else the process's own.
     pub fn mode_at(pc: u64) -> Mode {
