@@ -11288,3 +11288,70 @@ Note the rung does not move by granting the four: `_mesa_compute_version`
 wants all of them plus GLSL450. So the version stays 4.4 while four of its
 five extensions are now advertised and tested -- applications that detect
 them individually can use them today.
+
+## A sampler view across format classes -- the "ceiling" that was not one
+
+This was written up here as a WebGPU ceiling: `viewFormats` spans only the
+sRGB pair, so a view whose format is a different *class* from its texture's
+cannot exist. That much is true, and the conclusion drawn from it was wrong.
+
+**A copy is format-agnostic.** A texture-to-buffer-to-texture round trip moves
+bytes without caring what either side calls them, because a buffer is just
+bytes -- the only requirement is that the bytes per texel match. So the
+source's texels are copied into a scratch texture declared with the *view's*
+format and the shader samples that.
+
+Scope and cost, deliberately bounded:
+
+- One level of one layer of a 2D texture, which is what the cases asking for
+  it use. A wider view still refuses rather than serving part of itself.
+- Refreshed when the source's `write_serial` moves, not per draw -- resources
+  now carry that serial, bumped at the four places a texture is written. A
+  view of a texture nothing has written since the last copy costs nothing.
+- The copy is still real work when the source *is* written every frame, which
+  is the reason for the level/layer bound.
+
+**Where the refresh runs is the whole subtlety.** It has to submit pending
+work, because the source's writes must reach the queue before they can be
+copied -- and doing that while a pass is being built releases the encoder the
+draw is recording on. Dawn then faults inside `ValidateCanEncodeOn` at
+`BeginRenderPass`. It was written the obvious way first (at the point the bind
+group is built) and segfaulted exactly there. It now runs at the outermost
+draw entry, before anything is recorded.
+
+`gl44-texture-view-probe` is **6/6**, the case it used to fail returning the
+exact expected texel, natively and in the browser. The suite is 77 with two
+divergences, and both are llvmpipe being the outlier: `quad`'s GL_QUADS
+triangulation and `texture-sampler`'s extra 2x sample count. SuperTuxKart is
+unchanged at 72 frames/s.
+
+Blender's **sampler-view** refusal is gone with this -- 0 refusals where there
+was one. What remains for its viewport is the same reinterpretation on a
+*render target* (`r16_uint` over `r16_float`), and that is a bigger change
+than this one: the scratch has to be threaded through three call sites rather
+than one -- the pass attachments, `glClear`'s own per-target path, and
+`end_pass` -- and it needs the copy in *both* directions, since a pass whose
+`loadOp` is Load must see the real texture's bytes before it renders. Those
+copies can ride the pending encoder around the pass, so no submit is needed;
+the risk is that the framebuffer path is what makes SuperTuxKart, Minecraft
+and Krita work.
+
+### Newly surfaced: an sRGB view reads zero in the browser
+
+Gating this probe in the browser for the first time turned up a separate,
+**pre-existing** bug: the `srgb` case (an `GL_SRGB8_ALPHA8` view of an
+`GL_RGBA8` texture, which is the one reinterpretation WebGPU *does* allow)
+reads 0 in the browser and 55 natively.
+
+What is known, so the next pass does not re-derive it:
+
+- Reading the same texel through the **base** texture in the browser gives
+  128, the correct linear value -- so the upload landed and the aliasing that
+  `glTextureView` sets up works. Only the differing-format view is wrong.
+- There is no `sampler view refused` and no WebGPU error anywhere in the run.
+  The view is created and samples zero.
+- The `levels` and `layers` cases use `glTextureView` too and pass, so the
+  entry point and the alias are fine; the format is the only variable.
+- It is **not** a regression from the work above, verified rather than
+  reasoned: rebuilding the wasm host from the pre-change driver and gating
+  again fails `srgb` identically.
