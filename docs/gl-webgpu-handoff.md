@@ -8845,3 +8845,32 @@ Worth remembering that the earlier work here (the two NULL guards in
 `vbo_save_api.c`) turned this program from a crash into a silent blank. That
 was the right call for the crash -- a null dereference inside `glEndList`
 takes the application with it -- but the blank is this bug, not that fix.
+
+### The tail, read with the floor beside it
+
+Sixty-one programs -- the old tail plus everything that draws points or lines
+-- re-measured with `GEX_COMPARE_SELF=1`. What is left in the *real* column,
+and what each one is:
+
+| program | vs llvmpipe | self | what it is |
+|---|---|---|---|
+| dlist-edgeflag, -dangling | 0.46 | 0 | front != back polygon mode, and edge flags |
+| dlist-degenerate | 0.34 | 0 | the vbo save lead above |
+| gltestperf | 0.31 | 0 | *not* a defect -- see below |
+| quad, quad-degenerate | 0.24 | 0 | the GL_QUADS diagonal, unspecified by GL |
+| poly-flat-unfilled-clip | 0.15 | 0 | front != back polygon mode |
+| gsraytrace | 0.12 | 0 | geometry-shader transform feedback, known |
+
+Everything else above 0.1 has an animation floor to match it and says nothing:
+`clear-repeat` 0.50 against 0.49, `cubemap` 0.40 against 0.30, `glxheads` 0.24
+against 0.24, `arbfplight` 0.23 against 0.17, `bounce`, `fire`, `glxgears_*`,
+`arbfslight`.
+
+**`gltestperf` is a timing test, not a rendering one.** It draws a triangle
+whose size comes out of its own `glFinish`-based measurement -- `objdump`
+shows `glutGet`, `glFinish` and no geometry that does not depend on them -- so
+a slower driver draws a smaller triangle and the picture differs legitimately.
+Worth knowing before someone spends an afternoon on it.
+
+So every remaining entry is either fixed, carrying a written-down lead, or a
+GL feature this backend has a stated reason not to have.
