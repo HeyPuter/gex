@@ -10822,7 +10822,7 @@ answers `GL_INVALID_OPERATION`. It needs the guest to notice the binding and
 send an offset instead. `ARB_query_buffer_object` is mostly used by profilers
 rather than by the applications being targeted, which is why it is last.
 
-## Krita: the driver draws it correctly and the window stays black
+## Krita renders (and one X depth was the whole story)
 
 Krita 6.0.3 is one of the named target applications and had not been checked
 at GL 4.4. It renders a black window on this driver. The useful part of this
@@ -10894,12 +10894,53 @@ not reach the X window. The hand-off code was read end to end --
 its shm and non-shm paths -- and nothing in it is conditional on anything this
 driver does differently. glxgears goes through the identical path and works.
 
-**Not blocked in principle**: the next step is X-protocol-level tracing
-(`xtrace`, or an `XPutImage`/`XShmPutImage` interposer) to see whether the
-request is issued and what the server does with it. It stops here because
-every cheaper instrument has been exhausted and the two bugs above were the
-payoff. One difference worth starting from: softpipe renders *into* the
-winsys's own displaytarget, while this driver renders into a WebGPU texture
-and copies into a displaytarget of its own -- so if a drawable's images must
-come from the displaytarget the loader associated with it, that is where the
-asymmetry lies.
+### The answer: an image depth the window could not accept
+
+The interposer (`scratchpad/xspy.c`, on `XPutImage`/`XShmPutImage`/
+`XShmAttach`) took one run to settle it:
+
+```
+glxgears:  XShmPutImage(drawable=0x200003 304x300 depth=24 bpp=32) = 1   -> visible
+Krita:     XShmPutImage(drawable=0x200013 960x998 depth=32 bpp=32) = 1   -> nothing
+```
+
+Krita's window is **depth 24**. Putting a depth-32 image into it is a
+`BadMatch`, and X reports that asynchronously -- so `XShmPutImage` returns
+success, the driver sees nothing wrong, and the frame is gone. Six correct
+frames, one black window, no error anywhere.
+
+The depth comes from the *fbconfig's visual*: `drisw_create_drawable` sets
+`pdp->xDepth` from `config->visualID`'s depth, and the XImage is built with
+it. So the question became why Qt chose a config with a depth-32 visual for a
+depth-24 window, and the answer was in this driver's own refusal list, which
+had been scrolling past all along as routine format probing:
+
+```
+render target refused b8g8r8x8_unorm ... (unmapped format not renderable ...)
+render target refused r8g8b8x8_unorm ... (unmapped format not renderable ...)
+```
+
+**B8G8R8X8 and R8G8B8X8 were unmapped.** Mesa builds its GLX fbconfig list
+from the formats the driver accepts, so there was no 8,8,8,0 config: all 144
+had an alpha channel (measured -- zero configs with `GLX_ALPHA_SIZE` 0), and
+24 of them carried a depth-32 visual. A toolkit asking for an opaque window
+had nothing opaque to choose, and whether it drew depended on which visual it
+happened to land on.
+
+The fix is four lines of format mapping. WebGPU has no ignored-alpha format,
+so they map to the same `BGRA8Unorm`/`RGBA8Unorm`, and GL's promise that an
+X format's alpha reads as one is kept by the view swizzle -- next to the
+`DXT1_RGB` case that is there for exactly the same reason. 96 opaque configs
+appeared, and Krita renders: its welcome screen, and its full editor with the
+GL canvas, colour wheel, layers and brush presets, pixel-comparable to
+softpipe.
+
+This was never Krita-specific. Any toolkit that asks for an opaque config was
+affected, which is most of them.
+
+`gl44-window-present-probe.c` now covers the step that had no probe at all:
+every other probe reads back with `glReadPixels`, which never leaves the
+driver. It creates a window from a config's own visual, clears it, swaps, and
+reads the window back *through X* -- opaque, alpha with a depth-24 visual, and
+alpha with a depth-32 ARGB visual. 3/3 here and on softpipe, and it would have
+caught this: before the fix the opaque case could not find a config.
