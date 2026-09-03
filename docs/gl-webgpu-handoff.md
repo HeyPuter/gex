@@ -9581,3 +9581,67 @@ The app sweep over 336 programs is **unchanged** across the storage-buffer
 work: RAN 284, REFUSED 2, CRASH 12, HARNESS 3, EXIT 19, OK 16, with zero
 movement in either direction. SuperTuxKart still renders correctly. The full
 probe sweep shows only the intended `quad` divergence.
+
+## Software fp64, and GLSL 4.00 as a lever
+
+`ARB_gpu_shader_fp64`, `ARB_vertex_attrib_64bit` and `ARB_gpu_shader5` are all
+advertised now, and fp64 verifiably *works*: `gl44-fp64-probe` is 4/4 against
+llvmpipe, including a case a single-precision fallback cannot pass (1.0 + 2^-30
+is 1.0 in binary32 and distinguishable in binary64).
+
+**The reason this was thought impossible is worth correcting in full**, because
+it was recorded here as settled. The previous note said:
+
+> Mesa can lower fp64 in software [...] But st only *builds* that shader when
+> GLSL is 4.00 or better, and Mesa clamps the GLSL version to the GL version,
+> which stays at 3.3 until the whole GL 4.0 extension set is present -- fp64
+> among it. So fp64 cannot be delivered on its own.
+
+The first half is right and the second is not. **There is no clamp.**
+`st_extensions.c` does exactly this:
+
+    consts->GLSLVersion = screen->caps.glsl_feature_level;
+
+and nothing lowers it afterwards. So the GLSL level is a cap this driver sets
+freely, the circle does not exist, and the two caps simply have to move
+together -- because getting it wrong is not a soft failure: without the
+support shader `nir_lower_double_ops` hits `assert(softfp64 != NULL)` and
+takes the process with it.
+
+**And the GLSL level turns out to be a lever, not just a number.** Three of the
+extensions the ladder still wanted are gated on it alone:
+
+| gate | extension |
+|---|---|
+| `GLSLVersion >= 400` | `ARB_gpu_shader5` |
+| `GLSLVersion >= 410` | `ARB_shader_precision` |
+| `GLSLVersion >= 140` + formats | `ARB_enhanced_layouts` |
+
+Note that `GL_SHADING_LANGUAGE_VERSION` still reports 3.30 in a 3.3 context,
+which is correct: the string follows the context, while the cap is what st
+reads for its own decisions.
+
+### Where the ladder stands
+
+Measured against Mesa's own `_mesa_compute_version`, the gap to 4.4 has gone
+from 26 extensions to 18:
+
+| rung | missing |
+|---|---|
+| **4.0** | `ARB_tessellation_shader`, `ARB_texture_buffer_object_rgb32` |
+| 4.1 | `ARB_shader_precision` (GLSL 410), `ARB_viewport_array` |
+| 4.2 | `ARB_base_instance` |
+| 4.3 | `copy_image`, `fragment_layer_viewport`, `framebuffer_no_attachments`, `robust_buffer_access_behavior`, `stencil_texturing`, `texture_buffer_range`, `texture_view` |
+| 4.4 | `buffer_storage`, `enhanced_layouts`, `query_buffer_object`, `texture_mirror_clamp_to_edge`, `texture_stencil8`, `vertex_type_10f_11f_11f_rev` |
+
+**4.0 is two extensions away, and one of them is the tessellator.** That is now
+the single thing standing between this driver and a version number that
+modern Blender will accept, and geometry shaders already show the shape of an
+answer: lower it to compute.
+
+`ARB_base_instance` is worth noting as the cheapest remaining item with a known
+blocker: WebGPU's draw takes a `firstInstance`, which the driver already
+passes, but SPIR-V's `InstanceIndex` counts from it while GL's `gl_InstanceID`
+counts from zero. Advancing each instance-step vertex buffer by
+`base * arrayStride` instead of passing `firstInstance` keeps `gl_InstanceID`
+correct with no shader change.
