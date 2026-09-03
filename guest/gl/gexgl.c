@@ -453,6 +453,15 @@ struct buffer_object_state {
     size_t map_offset;
     size_t map_length;
     unsigned map_access;
+    /* The flags glBufferStorage was called with, as the application sees
+       them. The host is given one more -- see the note in
+       tools/gen_gl44_transport.py -- so GL_BUFFER_STORAGE_FLAGS has to be
+       answered from here rather than forwarded. */
+    unsigned storage_flags;
+    int has_storage_flags;
+    /* What the host was last told this mapping holds, for the coherent case
+       below. Allocated only for a mapping that needs it. */
+    void *map_sent;
     struct buffer_object_state *next;
 };
 static struct buffer_target_state buffer_targets[16];
@@ -577,7 +586,9 @@ unsigned char glUnmapBuffer(unsigned target) {
     if (object->map_access & 2u)
         glBufferSubData(target, (long)object->map_offset, (long)object->map_length, object->map);
     free(object->map);
+    free(object->map_sent);
     object->map = NULL;
+    object->map_sent = NULL;
     object->map_offset = object->map_length = 0;
     return 1;
 }
@@ -1255,7 +1266,75 @@ static void gexgl_record_attrib(unsigned index, int size, unsigned type,
  * Counting from element zero rather than from `first` is deliberate: the copy
  * then has the same layout as the original, so the draw command itself, its
  * `first`, and any index values need no adjustment. */
+/* Persistent coherent mappings, re-sent before anything on the host could
+   read them.
+ *
+ * A mapping returned by this library is guest memory, and the bytes reach the
+ * host at glUnmapBuffer or glFlushMappedBufferRange. ARB_buffer_storage's
+ * point is that neither happens: GL_MAP_PERSISTENT_BIT keeps the mapping
+ * across draws and GL_MAP_COHERENT_BIT promises the writes are visible with no
+ * call at all. So nothing was ever sent, and a draw read whatever the buffer
+ * held at creation -- zeros. gl44-buffer-storage-probe's mapped-draw and
+ * second-draw cases passed natively and drew nothing in the browser, and
+ * Minecraft 26.2 allocates its uniform and vertex rings exactly this way.
+ *
+ * There is no way to observe a guest write: wasm has no mprotect and no
+ * signals, so the write barrier every real implementation of this uses is not
+ * available. The mapping is therefore compared against what was last sent and
+ * only the changed span goes over. That is one pass over the mapped range per
+ * draw -- the cost is real for a megabyte-sized ring, and GEXGL_NO_COHERENT=1
+ * turns it off for anyone measuring it -- but a ring is written a little at a
+ * time, so what is *transported* stays proportional to what changed.
+ *
+ * Per draw, not per batch: an application writes region N, draws, writes
+ * region N+1, draws again, and both draws can sit in one unflushed batch.
+ * Sending the mapping once at flush time would give the first draw the second
+ * region's bytes, which is what second-draw catches. */
+static void gexgl_flush_coherent_maps(void) {
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("GEXGL_NO_COHERENT") ? 1 : 0;
+    if (disabled) return;
+    for (struct buffer_object_state *object = buffer_objects; object;
+         object = object->next) {
+        /* Writable, persistent, coherent: 0x2 | 0x40 | 0x80. A persistent
+           mapping without COHERENT is the application's job to flush, and
+           glFlushMappedBufferRange already serves it. */
+        if (!object->map || !object->map_length ||
+            (object->map_access & 0xc2u) != 0xc2u)
+            continue;
+        if (!object->map_sent) {
+            object->map_sent = malloc(object->map_length);
+            if (!object->map_sent) continue;
+            /* Nothing has been sent, so everything differs. */
+            memset(object->map_sent, ~*(const unsigned char *)object->map,
+                   object->map_length);
+        }
+        const unsigned char *now = object->map;
+        unsigned char *sent = object->map_sent;
+        size_t first = 0;
+        while (first < object->map_length && now[first] == sent[first]) ++first;
+        if (first == object->map_length) continue;
+        size_t last = object->map_length;
+        while (last > first && now[last - 1] == sent[last - 1]) --last;
+        const size_t length = last - first;
+        memcpy(sent + first, now + first, length);
+        /* glBufferSubData names a target, so the buffer has to be the bound
+           one. Every buffer this loop can reach was mapped through a binding
+           that is still recorded, and the mapping's own target is the one to
+           use. */
+        unsigned target = 0;
+        for (size_t i = 0; i < sizeof(buffer_targets) / sizeof(buffer_targets[0]);
+             ++i)
+            if (buffer_targets[i].target && buffer_targets[i].name == object->name)
+                { target = buffer_targets[i].target; break; }
+        if (!target) continue;
+        glBufferSubData(target, (long)(object->map_offset + first), (long)length,
+                        now + first);
+    }
+}
+
 static void gexgl_upload_client_arrays(size_t vertices, int instances) {
+    gexgl_flush_coherent_maps();
     if (vertex_attrib_client_count <= 0 && gexgl_ff_client_count <= 0) return;
     const unsigned previous = bound_buffer(0x8892u); /* GL_ARRAY_BUFFER */
     /* The fixed-function arrays first, by the same rules: a copy from element

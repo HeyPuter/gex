@@ -210,12 +210,17 @@ void glBufferStorage(unsigned target, long size, const void *data, unsigned flag
     if (size < 0) return;
     size_t blob_len = data ? (size_t)size : 0;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
-    if (object) object->size = (size_t)size;
+    if (object) {
+        object->size = (size_t)size;
+        object->storage_flags = flags;
+        object->has_storage_flags = 1;
+    }
     uint32_t *a = begin(1063, 5, 4 + blob_len);
     if (!a) return;
     uint64_t bytes = (uint64_t)size;
     a[0] = target; a[1] = (uint32_t)bytes; a[2] = (uint32_t)(bytes >> 32);
-    a[3] = flags; a[4] = data != NULL; put_blob(a + 5, data, blob_len);
+    a[3] = flags | 0x0100u; /* GL_DYNAMIC_STORAGE_BIT */
+    a[4] = data != NULL; put_blob(a + 5, data, blob_len);
 }
 void glClampColor(unsigned target, unsigned clamp) {
     uint32_t *packet = begin(1066, 2, 0);
@@ -570,6 +575,7 @@ void glDisablei(unsigned target, unsigned index) {
     packet[at++] = (uint32_t)(index);
 }
 void glDispatchCompute(unsigned num_groups_x, unsigned num_groups_y, unsigned num_groups_z) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1126, 3, 0);
     if (!packet) return;
     size_t at = 0;
@@ -578,6 +584,7 @@ void glDispatchCompute(unsigned num_groups_x, unsigned num_groups_y, unsigned nu
     packet[at++] = (uint32_t)(num_groups_z);
 }
 void glDispatchComputeIndirect(long indirect) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1127, 2, 0);
     if (!packet) return;
     size_t at = 0;
@@ -587,6 +594,7 @@ void glDispatchComputeIndirect(long indirect) {
     packet[at++] = (uint32_t)(bits_indirect >> 32);
 }
 void glDrawArraysIndirect(unsigned mode, const void *indirect) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1129, 3, 0);
     if (!packet) return;
     size_t at = 0;
@@ -596,6 +604,7 @@ void glDrawArraysIndirect(unsigned mode, const void *indirect) {
     packet[at++] = (uint32_t)(bits_indirect >> 32);
 }
 void glDrawArraysInstancedBaseInstance(unsigned mode, int first, int count, int instancecount, unsigned baseinstance) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1131, 5, 0);
     if (!packet) return;
     size_t at = 0;
@@ -612,6 +621,7 @@ void glDrawBuffer(unsigned buf) {
     packet[at++] = (uint32_t)(buf);
 }
 void glDrawElementsIndirect(unsigned mode, unsigned type, const void *indirect) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1136, 4, 0);
     if (!packet) return;
     size_t at = 0;
@@ -622,6 +632,7 @@ void glDrawElementsIndirect(unsigned mode, unsigned type, const void *indirect) 
     packet[at++] = (uint32_t)(bits_indirect >> 32);
 }
 void glDrawTransformFeedback(unsigned mode, unsigned id) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1143, 2, 0);
     if (!packet) return;
     size_t at = 0;
@@ -629,6 +640,7 @@ void glDrawTransformFeedback(unsigned mode, unsigned id) {
     packet[at++] = (uint32_t)(id);
 }
 void glDrawTransformFeedbackInstanced(unsigned mode, unsigned id, int instancecount) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1144, 3, 0);
     if (!packet) return;
     size_t at = 0;
@@ -637,6 +649,7 @@ void glDrawTransformFeedbackInstanced(unsigned mode, unsigned id, int instanceco
     packet[at++] = (uint32_t)(instancecount);
 }
 void glDrawTransformFeedbackStream(unsigned mode, unsigned id, unsigned stream) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1145, 3, 0);
     if (!packet) return;
     size_t at = 0;
@@ -645,6 +658,7 @@ void glDrawTransformFeedbackStream(unsigned mode, unsigned id, unsigned stream) 
     packet[at++] = (uint32_t)(stream);
 }
 void glDrawTransformFeedbackStreamInstanced(unsigned mode, unsigned id, unsigned stream, int instancecount) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1146, 4, 0);
     if (!packet) return;
     size_t at = 0;
@@ -771,6 +785,17 @@ void glGetBufferParameteri64v(unsigned target, unsigned pname, long long *params
         memcpy(params, source, expected);
 }
 void glGetBufferParameteriv(unsigned target, unsigned pname, int *params) {
+    if (pname == 0x8220u) { /* GL_BUFFER_STORAGE_FLAGS */
+        /* Not forwarded: the host was given an extra bit so that a mapping
+           can be written back at all. What the application asked for is
+           recorded on this side. */
+        struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
+        if (params && object && object->has_storage_flags)
+            *params = (int)object->storage_flags;
+        else if (params)
+            *params = 0;
+        return;
+    }
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1191, 2, 0);
     if (!packet) return;
@@ -1556,6 +1581,7 @@ void glMinSampleShading(float value) {
 }
 void glMultiDrawArrays(unsigned mode, const int *first, const int *count,
                               int drawcount) {
+    gexgl_flush_coherent_maps();
     if (drawcount > 0 && (!first || !count)) return;
     if (drawcount > 0 && (size_t)drawcount > UINT32_MAX / 8u) return;
     size_t blob_len = drawcount > 0 ? (size_t)drawcount * 8u : 0;
@@ -1570,6 +1596,7 @@ void glMultiDrawArrays(unsigned mode, const int *first, const int *count,
     }
 }
 void glMultiDrawArraysIndirect(unsigned mode, const void *indirect, int drawcount, int stride) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1299, 5, 0);
     if (!packet) return;
     size_t at = 0;
@@ -1581,6 +1608,7 @@ void glMultiDrawArraysIndirect(unsigned mode, const void *indirect, int drawcoun
     packet[at++] = (uint32_t)(bits_indirect >> 32);
 }
 void glMultiDrawElements(unsigned mode, const int *count, unsigned type, const void *const *indices, int drawcount) {
+    gexgl_flush_coherent_maps();
     if (drawcount < 0 || (drawcount > 0 && !(count && indices))) return;
     if ((size_t)drawcount > UINT32_MAX / 12u) return;
     size_t blob_len = (size_t)drawcount * 12u;
@@ -1595,6 +1623,7 @@ void glMultiDrawElements(unsigned mode, const int *count, unsigned type, const v
     }
 }
 void glMultiDrawElementsBaseVertex(unsigned mode, const int *count, unsigned type, const void *const *indices, int drawcount, const int *basevertex) {
+    gexgl_flush_coherent_maps();
     if (drawcount < 0 || (drawcount > 0 && !(count && indices && basevertex))) return;
     if ((size_t)drawcount > UINT32_MAX / 16u) return;
     size_t blob_len = (size_t)drawcount * 16u;
@@ -1610,6 +1639,7 @@ void glMultiDrawElementsBaseVertex(unsigned mode, const int *count, unsigned typ
     }
 }
 void glMultiDrawElementsIndirect(unsigned mode, unsigned type, const void *indirect, int drawcount, int stride) {
+    gexgl_flush_coherent_maps();
     uint32_t *packet = begin(1302, 6, 0);
     if (!packet) return;
     size_t at = 0;

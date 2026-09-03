@@ -592,7 +592,42 @@ def output_component_expression(policy: str, pname: str = "pname") -> str:
     raise RuntimeError(f"unknown output component policy: {policy}")
 
 
+# Commands that make the host read a buffer, and so must be preceded by the
+# guest re-sending any persistent coherent mapping. The hand-written draws in
+# gexgl.c get this through gexgl_upload_client_arrays; these are the rest.
+def _needs_coherent_flush(name: str) -> bool:
+    if name in ("glDrawBuffer", "glDrawBuffers"):
+        return False          # framebuffer state, not a draw
+    return (name.startswith("glDraw") or name.startswith("glMultiDraw")
+            or name.startswith("glDispatch"))
+
+
 def guest_function(command: dict, opcode: int) -> str:
+    text = _guest_function(command, opcode)
+    if command["name"] == "glGetBufferParameteriv":
+        brace = text.index("{\n") + 2
+        text = text[:brace] + """    if (pname == 0x8220u) { /* GL_BUFFER_STORAGE_FLAGS */
+        /* Not forwarded: the host was given an extra bit so that a mapping
+           can be written back at all. What the application asked for is
+           recorded on this side. */
+        struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
+        if (params && object && object->has_storage_flags)
+            *params = (int)object->storage_flags;
+        else if (params)
+            *params = 0;
+        return;
+    }
+""" + text[brace:]
+    if _needs_coherent_flush(command["name"]):
+        # After the opening brace of the definition, before any argument
+        # validation: the flush is unconditional and must not be skipped by an
+        # early return.
+        brace = text.index("{\n") + 2
+        text = text[:brace] + "    gexgl_flush_coherent_maps();\n" + text[brace:]
+    return text
+
+
+def _guest_function(command: dict, opcode: int) -> str:
     name = command["name"]
     if name in PROGRAM_PIPELINE_GENERATORS:
         return f"""void {name}(int n, unsigned *pipelines) {{
@@ -605,16 +640,37 @@ def guest_function(command: dict, opcode: int) -> str:
 }}
 """
     if name in BUFFER_STORAGE_COMMANDS:
+        # GL_DYNAMIC_STORAGE_BIT is added to what the host is told, and only
+        # there.
+        #
+        # A mapping this library returns is guest memory, so the bytes reach
+        # the host as a glBufferSubData -- see gexgl_flush_coherent_maps. On an
+        # immutable buffer that call is GL_INVALID_OPERATION unless
+        # GL_DYNAMIC_STORAGE_BIT was among the storage flags, and an
+        # application asking for PERSISTENT|COHERENT has no reason to ask for
+        # it: it means to write through the mapping, not through the API. So
+        # every persistent write was refused by the host, silently as far as
+        # the application could see, and the draw read zeros.
+        #
+        # The application's own view is unchanged: the flags it passed are
+        # recorded here and GL_BUFFER_STORAGE_FLAGS is answered from them, and
+        # immutability itself comes from having called glBufferStorage at all,
+        # which glBufferData still refuses.
         return f"""void {name}(unsigned target, long size, const void *data, unsigned flags) {{
     if (size < 0) return;
     size_t blob_len = data ? (size_t)size : 0;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
-    if (object) object->size = (size_t)size;
+    if (object) {{
+        object->size = (size_t)size;
+        object->storage_flags = flags;
+        object->has_storage_flags = 1;
+    }}
     uint32_t *a = begin({opcode}, 5, 4 + blob_len);
     if (!a) return;
     uint64_t bytes = (uint64_t)size;
     a[0] = target; a[1] = (uint32_t)bytes; a[2] = (uint32_t)(bytes >> 32);
-    a[3] = flags; a[4] = data != NULL; put_blob(a + 5, data, blob_len);
+    a[3] = flags | 0x0100u; /* GL_DYNAMIC_STORAGE_BIT */
+    a[4] = data != NULL; put_blob(a + 5, data, blob_len);
 }}
 """
     if name in STRING_INPUT_COMMANDS | STRING_RETURN_COMMANDS.keys():
