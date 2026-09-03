@@ -11043,3 +11043,18 @@ Two cautions for the next re-run, both learned the hard way:
 - It uses `DISPLAY=:77`, so an app screenshot taken while it runs picks up
   *its* windows. One Blender check this pass photographed a sweep program's
   window and had to be redone.
+
+### Blender, checked for a regression from the new configs
+
+Adding opaque configs changes which fbconfig a toolkit picks, so Blender was
+re-checked: it shows no window within 55 s and dies on the documented ceiling,
+`colour target 1 refused (surface reinterprets the format) surface=r16_uint
+texture=r16_float`, followed by a `GL_OUT_OF_MEMORY` cascade from the latched
+context and a core dump.
+
+That is **not** a regression from this pass -- verified by removing the four
+format mappings, rebuilding, and running it again: identical, no window. The
+format-reinterpretation ceiling is where Blender stands either way. Worth
+noting that it now reaches that ceiling and *crashes* rather than sitting at a
+drawn interface, so "Blender's UI draws" from an earlier pass should be read as
+"it drew before it got to the viewport", not as a state that survives startup.
