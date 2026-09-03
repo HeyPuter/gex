@@ -8821,6 +8821,20 @@ What is known, and it is worth having:
   Mesa, different result.
 - **It is not a timeout artefact**: 25 seconds behaves like 6.
 
+One more thing narrows it, found after the above: the error comes from
+`dlist.c:save_End`, not from vbo's `_save_End`. That function ends with
+
+    if (ctx->ExecuteFlag)
+       CALL_End(ctx->Dispatch.Exec, ());
+
+so the list was opened `GL_COMPILE_AND_EXECUTE`, and the *exec* End is what
+finds itself outside a begin/end -- `save_Begin` in the same file never calls
+the exec Begin. Both drivers take that path; what differs is whether the
+vertices were in the vbo save store by the time it ran. A `SAVE_FLUSH_VERTICES`
+between the Begin and the vertices would reinstall the plain display-list
+dispatch and send them to opcodes instead, which would leave exactly the
+`verts=0` seen here.
+
 So the divergence is inside Mesa's vbo save path and is driven by something
 the driver supplies -- a cap, or a callback -- rather than by anything the
 application does. `GEX_DLIST_LOG` is gone from the tree; re-add the two
