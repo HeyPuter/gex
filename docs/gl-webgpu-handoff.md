@@ -11125,3 +11125,79 @@ was noticed, after the run. `tests/gl44-probe.sh` now warns when the driver
 source is newer than the staged module. That makes three investigations
 started by a stale build artefact: the vite bundle, the generated extension
 table, and this.
+
+## Compute shader images, indirect dispatch, and a probe that had never run
+
+`max_shader_images` was fragment-only, so `ARB_shader_image_load_store`
+stopped at the fragment stage and `gl44-compute-probe` died at link --
+"Too many compute shader image uniforms (1 > 0)" -- at its third case. Behind
+that were three driver bugs and three probe bugs, and the probe had never run
+past case three on *any* driver.
+
+**Driver.** `launch_grid` now collects images from the NIR the way the
+graphics stages do, with the same two refusals, and builds a view and a layout
+entry per image per dispatch (`glBindImageTexture` names a level and a layer
+the next dispatch may change). A read-only image gets a *sampled* texture
+entry rather than a storage one, because Tint lowers a read-only storage image
+to a plain `texture_2d<T>`.
+
+Then:
+
+- The images kept **descriptor set 2** while `launch_grid` binds one group at
+  index 0, so Dawn refused the pipeline -- "the entry-point uses bindings in
+  group 2 but [PipelineLayout] doesn't have a BindGroupLayout for this index"
+  -- and an invalid compute pipeline invalidates the command buffer, so the
+  dispatch wrote nothing and the image read back as zeros. The set-to-zero
+  loop covered UBOs and SSBOs and not images.
+- **`glDispatchComputeIndirect` was refused outright.** The counts are now
+  read on the CPU and re-issued as an ordinary dispatch, which is the choice
+  the draw path already makes for `ARB_draw_indirect`; the native
+  `dispatchWorkgroupsIndirect` would need `WGPUBufferUsage_Indirect`, which
+  `resource_create` does not ask for.
+- The **image-unit heuristic preferred `driver_location`** over an explicit
+  `layout(binding = N)`. st gives a fragment image `UINT_MAX` there and a
+  compute image `0`, whatever the GLSL said, so every compute image went to
+  unit 0 and the driver found nothing bound.
+
+**Probe.** It read 8 uints from the wrong buffer -- `glBindBufferBase` sets the
+*generic* binding point as well as the indexed one, so
+`GL_SHADER_STORAGE_BUFFER` still named the 7-word indirect buffer. And four
+textures were mipmap-**incomplete**: one level (or levels 0 and 1 of an 8x2)
+with the default `GL_NEAREST_MIPMAP_LINEAR` filter. `glCopyImageSubData`
+refuses an incomplete source by name; `st_convert_image_from_unit` silently
+*drops* one and hands the driver an empty image view with nothing to say why.
+That second failure mode is worth remembering -- an image that is simply not
+there, with no GL error and no driver message.
+
+`gl44-compute-probe` now passes end to end natively and in the browser.
+
+### Probe suite: 73, with three divergences and all of them explained
+
+- `quad` -- llvmpipe is the outlier on GL_QUADS triangulation (this driver 6/6).
+- `texture-sampler` -- llvmpipe offers a 2x sample count; WebGPU core has 1
+  and 4 only, so one entry (`{4}`) is the correct answer here.
+- `texture-view` 5/6 -- the format-class ceiling.
+
+`compute` and `indexed` were in that list at the start of this pass and are
+not now.
+
+### The version ladder was measuring GLSL against a level the driver passed
+
+`tests/gl-version-ladder.sh` defaulted `GEX_GLSL_LEVEL` to 430, hardcoded,
+long after the driver reached 440 -- so the 4.4 rung was reported as needing
+a GLSL level it already had. It now reads `caps->glsl_feature_level` from the
+driver source and exits rather than assume. The honest state:
+
+- **to 4.4**: seven numeric limits, no extensions.
+- **4.5**: `ARB_conditional_render_inverted`, `ARB_cull_distance`,
+  `ARB_derivative_control`, `ARB_shader_texture_image_samples`,
+  `NV_texture_barrier`, GLSL450.
+- **4.6**: seven more plus GLSL460.
+
+Of the 4.5 set, `NV_texture_barrier` and `ARB_derivative_control` look close
+to free (the driver already hooks `texture_barrier`, and WGSL has
+`dpdxFine`/`dpdxCoarse`), `ARB_shader_texture_image_samples` needs the sample
+count in the shader, and `ARB_cull_distance` and
+`ARB_conditional_render_inverted` need real implementations -- so the rung
+does not move by granting the cheap two, and granting a cap the driver does
+not honour would draw when it should not.
