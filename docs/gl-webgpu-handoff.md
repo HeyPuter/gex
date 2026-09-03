@@ -8745,3 +8745,52 @@ bind their state and draw: `line-smooth`, `line-stipple-wide`,
 SuperTuxKart, which is what all of this is ultimately for, still renders its
 scene: 586 of 599 frames presented at 57 FPS, with the kart, the track, the
 minimap and the HUD all where they belong.
+
+## Telling a defect from a turning gear (2026-09-02)
+
+The llvmpipe pixel comparison has always had one weakness, stated in its own
+header: "Anything animated diverges by construction". That left its tail
+unreadable -- `textures` sat at RMSE 0.33 and was written up as a known defect
+("`textures`' missing sphere-mapped object"), and `clear-repeat` at 0.39 above
+it, and there was no way to tell either from a real one.
+
+`GEX_COMPARE_SELF=1` photographs **gex_wgpu twice** and reports how far the
+driver's own two images are apart. That is the animation floor, and a
+divergence at or below it says nothing:
+
+| program        | vs llvmpipe | vs itself | reading |
+|----------------|-------------|-----------|---------|
+| textures       | 0.314       | 0.319     | animation, not a defect |
+| clear-repeat   | 0.274       | 0.247     | animation, not a defect |
+| quad-degenerate| 0.244       | 0         | the GL_QUADS diagonal, unspecified |
+| tri-viewport   | 0.162       | 0         | **real**: one-pixel rows |
+| tri-cull-both  | 0.336       | 0         | **real**: fixed, now 0 |
+
+It costs a third run per program, so it is off by default -- but the tail is
+where the next defect is, and the tail is exactly where it is needed. Two of
+the five entries above were noise and two were real; without the column all
+five looked the same.
+
+**`textures` is not a defect** and the note calling it one is withdrawn.
+
+### The one-pixel rows, and why they stay
+
+`tri-viewport` draws a grid every 25 pixels of a 250-pixel window. Every
+*horizontal* line lands one row from where llvmpipe puts it; every vertical
+one is exact. GL measures window y from the bottom and WebGPU from the top, so
+a rasterisation tie resolves opposite ways in the two, and geometry exactly on
+a pixel boundary is exactly a tie. A one-pixel point at an integral coordinate
+does the same in both axes.
+
+The viewport is the obvious lever and it does not work. WebGPU requires the
+viewport rectangle to lie inside the attachment, so it cannot be *translated*
+when it already fills the framebuffer -- only shrunk, which gives a shift that
+fades linearly to nothing at the far edge. Measured: 0.162 -> 0.073 at a 64th
+of a pixel and 0.053 at half a pixel, moving some of the grid's lines and not
+others. That is worse than a consistent tie-break, because it makes the answer
+depend on where on the screen the geometry is.
+
+A uniform translation has to happen in the shader: either a vertex variant
+keyed on the framebuffer height, recompiled on every resize for every shader,
+or a uniform read by every vertex shader in the driver. Both are real costs
+for one pixel. Left alone, with the measurement written down.

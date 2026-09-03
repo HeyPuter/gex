@@ -30,13 +30,17 @@ OUT=${1:-/tmp/glcompare}
 LIST=${2:-/tmp/glapps.txt}
 INST=${GEX_INST:-/tmp/gex-mesa-native/inst}
 DELAY=${GEX_COMPARE_DELAY:-5}
+# GEX_COMPARE_SELF=1 photographs gex_wgpu a second time and reports how far
+# the driver's own two images are apart -- the animation floor, below which a
+# difference from llvmpipe says nothing.
+SELF=${GEX_COMPARE_SELF:-}
 export DISPLAY=${GEX_DISPLAY:-:77}
 
 [ -d "$INST/lib/dri" ] || { echo "no driver at $INST/lib/dri" >&2; exit 2; }
 xdpyinfo >/dev/null 2>&1 || { echo "no X display at $DISPLAY" >&2; exit 2; }
 mkdir -p "$OUT"
 : > "$OUT/results.tsv"
-printf 'app\trmse\tnote\n' >> "$OUT/results.tsv"
+printf 'app\trmse\tself\tnote\n' >> "$OUT/results.tsv"
 
 # A program is photographed by its own window. With no window manager the
 # window's name is whatever the program set, which is usually its argv[0] and
@@ -117,13 +121,31 @@ while read -r app; do
                null: 2>&1 | sed -n 's/.*(\([0-9.e-]*\)).*/\1/p')
         [ -n "$rmse" ] || note="sizes differ or compare failed"
     fi
-    printf '%s\t%s\t%s\n' "$name" "${rmse:--}" "$note" >> "$OUT/results.tsv"
-    printf '%-32s %-10s %s\n' "$name" "${rmse:--}" "$note"
+    # The animation floor: the same driver photographed twice. Anything
+    # animated diverges from itself by construction, and until this column
+    # existed there was no way to tell a program whose two images differ
+    # because the driver is wrong from one whose two images differ because a
+    # gear turned. `clear-repeat` sat near the top of the tail at 0.39 and
+    # varies from *itself* by 0.22; `tri-cull-both` sat just below it at 0.34
+    # and varies from itself by nothing, which is what a real defect looks
+    # like. Off by default because it is a third run per program.
+    self=
+    if [ -n "$SELF" ] && [ -z "$note" ]; then
+        if shoot gex_wgpu "$OUT/$name-gex2.png" "$app"; then
+            self=$(compare -metric RMSE "$OUT/$name-gex.png" \
+                   "$OUT/$name-gex2.png" null: 2>&1 \
+                   | sed -n 's/.*(\([0-9.e-]*\)).*/\1/p')
+        fi
+        quiet_kill "$name"; sleep 1
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$name" "${rmse:--}" "${self:--}" "$note" \
+        >> "$OUT/results.tsv"
+    printf '%-32s %-10s %-10s %s\n' "$name" "${rmse:--}" "${self:--}" "$note"
 done < "$LIST"
 
 echo
 echo "---- most divergent ----"
 awk -F'\t' 'NR>1 && $2 != "-"' "$OUT/results.tsv" \
     | sort -t"$(printf '\t')" -k2 -gr | head -25 \
-    | awk -F'\t' '{printf "  %-32s %s\n",$1,$2}'
+    | awk -F'\t' '{printf "  %-32s %-10s %s\n",$1,$2,$3}'
 echo "full results: $OUT/results.tsv"
