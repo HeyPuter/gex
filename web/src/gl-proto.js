@@ -231,6 +231,7 @@ export const op = {
     LOAD_NAME: 237,
     PUSH_NAME: 238,
     POP_NAME: 239,
+    DRAW_ELEMENTS_FULL: 240,
 };
 
 export const MAGIC = 0x47584547;

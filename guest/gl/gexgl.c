@@ -1814,6 +1814,95 @@ static size_t gexgl_client_index_extent(const void *indices, int count,
     return highest + 1;
 }
 
+/* Every indexed draw except plain glDrawElements, which keeps its own opcode.
+ *
+ * The whole family used to be generated from the registry as an
+ * *element-buffer offset*, on the reasoning that "in an OpenGL 4.4 core
+ * context these are never client-memory pointers". True, and the guest hands
+ * out compatibility contexts -- where `indices` is a client pointer whenever
+ * no element array buffer is bound. Sent as an offset, it had the host read
+ * its own address space; and nothing uploaded the client vertex arrays
+ * either, so the draw read zeroes and covered no pixels. `glDrawRangeElements`
+ * is the GL 1.2 form most old code actually calls.
+ *
+ * One command covers all of them because what they share is the part that
+ * matters. Base vertex, instancing and base instance are fields the host
+ * dispatches on; glDrawRangeElements' start/end are dropped, which is legal
+ * -- they are a promise about the indices, not a change to what is drawn.
+ */
+static void gexgl_draw_elements_full(unsigned mode, int count, unsigned type,
+                                     const void *indices, int basevertex,
+                                     int instances, unsigned baseinstance) {
+    const int client = bound_buffer(0x8893u) == 0; /* GL_ELEMENT_ARRAY_BUFFER */
+    const size_t element = index_element_bytes(type);
+    if ((vertex_attrib_client_count > 0 || gexgl_ff_client_count > 0) &&
+        client) {
+        size_t extent = gexgl_client_index_extent(indices, count, type);
+        /* The host reads vertex `index + basevertex`, so the copy has to
+           reach that far. A negative base only ever reads lower. */
+        if (extent && basevertex > 0) extent += (size_t)basevertex;
+        gexgl_upload_client_arrays(extent, instances > 0 ? instances : 1);
+    }
+    size_t blob_len = 0;
+    if (client && indices && count > 0 && element &&
+        (size_t)count <= SIZE_MAX / element)
+        blob_len = (size_t)count * element;
+    if (blob_len > UINT32_MAX - 4u) return;
+    uint32_t *p = begin(GEXGL_DRAW_ELEMENTS_FULL, 8,
+                        blob_len ? 4 + blob_len : 0);
+    if (!p) return;
+    p[0] = mode;
+    p[1] = (uint32_t)count;
+    p[2] = type;
+    p[3] = (uint32_t)basevertex;
+    p[4] = (uint32_t)instances;
+    p[5] = baseinstance;
+    p[6] = (uint32_t)(uintptr_t)indices;
+    p[7] = (uint32_t)(blob_len != 0);
+    if (blob_len)
+        put_blob(p + 8, indices, blob_len);
+}
+
+void glDrawRangeElements(unsigned mode, unsigned start, unsigned end,
+                         int count, unsigned type, const void *indices) {
+    (void)start; (void)end;
+    gexgl_draw_elements_full(mode, count, type, indices, 0, 0, 0);
+}
+
+void glDrawRangeElementsBaseVertex(unsigned mode, unsigned start, unsigned end,
+                                   int count, unsigned type,
+                                   const void *indices, int basevertex) {
+    (void)start; (void)end;
+    gexgl_draw_elements_full(mode, count, type, indices, basevertex, 0, 0);
+}
+
+void glDrawElementsBaseVertex(unsigned mode, int count, unsigned type,
+                              const void *indices, int basevertex) {
+    gexgl_draw_elements_full(mode, count, type, indices, basevertex, 0, 0);
+}
+
+void glDrawElementsInstancedBaseVertex(unsigned mode, int count, unsigned type,
+                                       const void *indices, int instancecount,
+                                       int basevertex) {
+    gexgl_draw_elements_full(mode, count, type, indices, basevertex,
+                             instancecount, 0);
+}
+
+void glDrawElementsInstancedBaseInstance(unsigned mode, int count,
+                                         unsigned type, const void *indices,
+                                         int instancecount,
+                                         unsigned baseinstance) {
+    gexgl_draw_elements_full(mode, count, type, indices, 0, instancecount,
+                             baseinstance);
+}
+
+void glDrawElementsInstancedBaseVertexBaseInstance(
+    unsigned mode, int count, unsigned type, const void *indices,
+    int instancecount, int basevertex, unsigned baseinstance) {
+    gexgl_draw_elements_full(mode, count, type, indices, basevertex,
+                             instancecount, baseinstance);
+}
+
 void glDrawElements(unsigned mode, int count, unsigned type, const void *offset) {
     /* With no element array buffer bound, `offset` is a pointer into the
      * client's own memory and means nothing on the host -- sending it as an
@@ -1863,9 +1952,9 @@ void glDrawArraysInstanced(unsigned mode, int first, int count, int instances) {
 }
 void glDrawElementsInstanced(unsigned mode, int count, unsigned type,
                              const void *offset, int instances) {
-    uint32_t *p=begin(GEXGL_DRAW_ELEMENTS_INSTANCED,5,0); if(!p)return;
-    p[0]=mode;p[1]=(uint32_t)count;p[2]=type;
-    p[3]=(uint32_t)(uintptr_t)offset;p[4]=(uint32_t)instances;
+    /* Through the shared path, which is what gives it the client-array upload
+       and the indices on the wire. Its own opcode sent neither. */
+    gexgl_draw_elements_full(mode, count, type, offset, 0, instances, 0);
 }
 void glBlitFramebuffer(int sx0,int sy0,int sx1,int sy1,
                        int dx0,int dy0,int dx1,int dy1,

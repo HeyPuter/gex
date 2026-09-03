@@ -540,6 +540,49 @@ int main(void) {
                x1 > (int)SIZE / 2);
     }
 
+    /* 10. The same draw again through glDrawRangeElements, which is the form
+     * GL 1.2 added and most old code actually calls. It is here because the
+     * guest transports `indices` for the whole DrawElements family as an
+     * *element-buffer offset* -- correct in a core context, where it always
+     * is one, and wrong in the compatibility context the guest now hands out,
+     * where it can be a client pointer. glDrawElements itself is
+     * hand-written and handles both; the rest of the family is generated and
+     * does not. */
+    {
+        static const float vertices[4][5] = {
+            {-0.6f, -0.6f,  1.0f, 0.0f, 0.0f},
+            { 0.0f,  0.0f,  1.0f, 1.0f, 1.0f},
+            { 0.6f,  0.6f,  0.0f, 1.0f, 0.0f},
+            {-0.6f,  0.6f,  0.0f, 0.0f, 1.0f},
+        };
+        static const unsigned short indices[2] = {2, 3};
+        clear_black();
+        glPointSize(6.0f);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glEnableClientState(GL_COLOR_ARRAY);
+        glVertexPointer(2, GL_FLOAT, 5 * sizeof(float), vertices);
+        glColorPointer(3, GL_FLOAT, 5 * sizeof(float), &vertices[0][2]);
+        glDrawRangeElements(GL_POINTS, 2, 3, 2, GL_UNSIGNED_SHORT, indices);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glDisableClientState(GL_VERTEX_ARRAY);
+        read_target();
+        const GLenum error = glGetError();
+        const unsigned right_x = (unsigned)((0.6f + 1.0f) * 0.5f * SIZE);
+        const unsigned left_x = (unsigned)((-0.6f + 1.0f) * 0.5f * SIZE);
+        const unsigned top_y = (unsigned)((0.6f + 1.0f) * 0.5f * SIZE);
+        const int ok = error == GL_NO_ERROR &&
+                       channel(right_x, top_y, 1) > 200 &&
+                       channel(left_x, top_y, 2) > 200 &&
+                       !lit(SIZE / 2, SIZE / 2);
+        fprintf(stderr, "INFO range right=%u,%u,%u left=%u,%u,%u centre=%d "
+                "err=0x%04x\n",
+                channel(right_x, top_y, 0), channel(right_x, top_y, 1),
+                channel(right_x, top_y, 2), channel(left_x, top_y, 0),
+                channel(left_x, top_y, 1), channel(left_x, top_y, 2),
+                lit(SIZE / 2, SIZE / 2), (unsigned)error);
+        result("draw_range_elements", ok);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

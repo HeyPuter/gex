@@ -182,6 +182,7 @@ enum Op : uint32_t {
     TEX_GENI = 231, TEX_GENFV = 232, WINDOW_POS3F = 233,
     SELECT_BUFFER = 234, RENDER_MODE = 235, INIT_NAMES = 236,
     LOAD_NAME = 237, PUSH_NAME = 238, POP_NAME = 239,
+    DRAW_ELEMENTS_FULL = 240,
 };
 
 struct Reader {
@@ -1908,6 +1909,44 @@ bool one(uint32_t op, Reader& a) {
         uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
         if (!wire) { a.ok = false; break; }
         glDrawElements(mode, n, type, wire);
+        break;
+    }
+    /* Every indexed draw but plain glDrawElements. One case, because base
+       vertex, instancing and base instance are fields rather than different
+       commands -- and because what they share is that `indices` may have come
+       with the command instead of being an offset. */
+    case DRAW_ELEMENTS_FULL: {
+        const GLenum mode = a.u32();
+        const GLsizei n = a.i32();
+        const GLenum type = a.u32();
+        const GLint basevertex = a.i32();
+        const GLsizei instances = a.i32();
+        const GLuint baseinstance = a.u32();
+        const uintptr_t off = a.u32();
+        const bool client = a.u32() != 0;
+        const void *indices = reinterpret_cast<const void *>(off);
+        if (client) {
+            uint32_t bytes = 0;
+            const uint8_t *wire = a.blob(bytes);
+            if (!wire) { a.ok = false; break; }
+            indices = wire;
+        }
+        if (!a.ok) return false;
+        if (instances > 0) {
+            if (baseinstance)
+                glDrawElementsInstancedBaseVertexBaseInstance(
+                    mode, n, type, indices, instances, basevertex,
+                    baseinstance);
+            else if (basevertex)
+                glDrawElementsInstancedBaseVertex(mode, n, type, indices,
+                                                  instances, basevertex);
+            else
+                glDrawElementsInstanced(mode, n, type, indices, instances);
+        } else if (basevertex) {
+            glDrawElementsBaseVertex(mode, n, type, indices, basevertex);
+        } else {
+            glDrawElements(mode, n, type, indices);
+        }
         break;
     }
     case DRAW_BUFFERS: {

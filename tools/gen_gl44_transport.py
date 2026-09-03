@@ -183,14 +183,15 @@ VERTEX_OFFSET_COMMANDS = {"glVertexAttribLPointer"}
 # GL_ELEMENT_ARRAY_BUFFER.  In an OpenGL 4.4 core context these are never guest
 # client-memory pointers.  Keep this separate from indirect-buffer offsets so
 # validation catches a registry signature drifting into the wrong policy.
-ELEMENT_OFFSET_COMMANDS = {
-    "glDrawElementsBaseVertex",
-    "glDrawElementsInstancedBaseInstance",
-    "glDrawElementsInstancedBaseVertex",
-    "glDrawElementsInstancedBaseVertexBaseInstance",
-    "glDrawRangeElements",
-    "glDrawRangeElementsBaseVertex",
-}
+#
+# The DrawElements family used to live here on exactly that reasoning, and the
+# reasoning stopped being true: the guest hands out *compatibility* contexts,
+# where `indices` is a client pointer whenever no element array buffer is
+# bound.  Transported as an offset it had the host read its own address space,
+# and nothing uploaded the client vertex arrays either -- so the draw read
+# zeroes and covered no pixels.  They are hand-written in gexgl.c now, on one
+# shared opcode; see gexgl_draw_elements_full.
+ELEMENT_OFFSET_COMMANDS = set()
 OPAQUE_OFFSET_COMMANDS = OFFSET_COMMANDS | ELEMENT_OFFSET_COMMANDS | VERTEX_OFFSET_COMMANDS
 BUFFER_STORAGE_COMMANDS = {"glBufferStorage"}
 UNIFORM_VALUE_QUERIES = {

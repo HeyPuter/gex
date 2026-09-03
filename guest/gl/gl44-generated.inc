@@ -611,18 +611,6 @@ void glDrawBuffer(unsigned buf) {
     size_t at = 0;
     packet[at++] = (uint32_t)(buf);
 }
-void glDrawElementsBaseVertex(unsigned mode, int count, unsigned type, const void *indices, int basevertex) {
-    uint32_t *packet = begin(1135, 6, 0);
-    if (!packet) return;
-    size_t at = 0;
-    packet[at++] = (uint32_t)(mode);
-    packet[at++] = (uint32_t)(count);
-    packet[at++] = (uint32_t)(type);
-    packet[at++] = (uint32_t)(basevertex);
-    uint64_t bits_indices = (uint64_t)(uintptr_t)indices;
-    packet[at++] = (uint32_t)bits_indices;
-    packet[at++] = (uint32_t)(bits_indices >> 32);
-}
 void glDrawElementsIndirect(unsigned mode, unsigned type, const void *indirect) {
     uint32_t *packet = begin(1136, 4, 0);
     if (!packet) return;
@@ -632,73 +620,6 @@ void glDrawElementsIndirect(unsigned mode, unsigned type, const void *indirect) 
     uint64_t bits_indirect = (uint64_t)(uintptr_t)indirect;
     packet[at++] = (uint32_t)bits_indirect;
     packet[at++] = (uint32_t)(bits_indirect >> 32);
-}
-void glDrawElementsInstancedBaseInstance(unsigned mode, int count, unsigned type, const void *indices, int instancecount, unsigned baseinstance) {
-    uint32_t *packet = begin(1138, 7, 0);
-    if (!packet) return;
-    size_t at = 0;
-    packet[at++] = (uint32_t)(mode);
-    packet[at++] = (uint32_t)(count);
-    packet[at++] = (uint32_t)(type);
-    packet[at++] = (uint32_t)(instancecount);
-    packet[at++] = (uint32_t)(baseinstance);
-    uint64_t bits_indices = (uint64_t)(uintptr_t)indices;
-    packet[at++] = (uint32_t)bits_indices;
-    packet[at++] = (uint32_t)(bits_indices >> 32);
-}
-void glDrawElementsInstancedBaseVertex(unsigned mode, int count, unsigned type, const void *indices, int instancecount, int basevertex) {
-    uint32_t *packet = begin(1139, 7, 0);
-    if (!packet) return;
-    size_t at = 0;
-    packet[at++] = (uint32_t)(mode);
-    packet[at++] = (uint32_t)(count);
-    packet[at++] = (uint32_t)(type);
-    packet[at++] = (uint32_t)(instancecount);
-    packet[at++] = (uint32_t)(basevertex);
-    uint64_t bits_indices = (uint64_t)(uintptr_t)indices;
-    packet[at++] = (uint32_t)bits_indices;
-    packet[at++] = (uint32_t)(bits_indices >> 32);
-}
-void glDrawElementsInstancedBaseVertexBaseInstance(unsigned mode, int count, unsigned type, const void *indices, int instancecount, int basevertex, unsigned baseinstance) {
-    uint32_t *packet = begin(1140, 8, 0);
-    if (!packet) return;
-    size_t at = 0;
-    packet[at++] = (uint32_t)(mode);
-    packet[at++] = (uint32_t)(count);
-    packet[at++] = (uint32_t)(type);
-    packet[at++] = (uint32_t)(instancecount);
-    packet[at++] = (uint32_t)(basevertex);
-    packet[at++] = (uint32_t)(baseinstance);
-    uint64_t bits_indices = (uint64_t)(uintptr_t)indices;
-    packet[at++] = (uint32_t)bits_indices;
-    packet[at++] = (uint32_t)(bits_indices >> 32);
-}
-void glDrawRangeElements(unsigned mode, unsigned start, unsigned end, int count, unsigned type, const void *indices) {
-    uint32_t *packet = begin(1141, 7, 0);
-    if (!packet) return;
-    size_t at = 0;
-    packet[at++] = (uint32_t)(mode);
-    packet[at++] = (uint32_t)(start);
-    packet[at++] = (uint32_t)(end);
-    packet[at++] = (uint32_t)(count);
-    packet[at++] = (uint32_t)(type);
-    uint64_t bits_indices = (uint64_t)(uintptr_t)indices;
-    packet[at++] = (uint32_t)bits_indices;
-    packet[at++] = (uint32_t)(bits_indices >> 32);
-}
-void glDrawRangeElementsBaseVertex(unsigned mode, unsigned start, unsigned end, int count, unsigned type, const void *indices, int basevertex) {
-    uint32_t *packet = begin(1142, 8, 0);
-    if (!packet) return;
-    size_t at = 0;
-    packet[at++] = (uint32_t)(mode);
-    packet[at++] = (uint32_t)(start);
-    packet[at++] = (uint32_t)(end);
-    packet[at++] = (uint32_t)(count);
-    packet[at++] = (uint32_t)(type);
-    packet[at++] = (uint32_t)(basevertex);
-    uint64_t bits_indices = (uint64_t)(uintptr_t)indices;
-    packet[at++] = (uint32_t)bits_indices;
-    packet[at++] = (uint32_t)(bits_indices >> 32);
 }
 void glDrawTransformFeedback(unsigned mode, unsigned id) {
     uint32_t *packet = begin(1143, 2, 0);

@@ -400,6 +400,13 @@ pub mod op {
     pub const LOAD_NAME: u32 = 237;
     pub const PUSH_NAME: u32 = 238;
     pub const POP_NAME: u32 = 239;
+    /// Every indexed draw except plain glDrawElements, which has its own
+    /// opcode above. One command covers the whole family -- base vertex,
+    /// instancing and base instance are all just fields -- because what they
+    /// share is the part that matters: `indices` may be a client pointer, and
+    /// then the indices have to travel with the command and the client vertex
+    /// arrays have to be uploaded as far as they reach.
+    pub const DRAW_ELEMENTS_FULL: u32 = 240;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

@@ -599,72 +599,11 @@ case 1132: {
     GEX_GL_CALL(glDrawBuffer, buf);
     break;
 }
-case 1135: {
-    GLenum mode = a.u32();
-    GLsizei count = a.i32();
-    GLenum type = a.u32();
-    GLint basevertex = a.i32();
-    const void *indices = reinterpret_cast<const void *>(static_cast<uintptr_t>(a.u64()));
-    GEX_GL_CALL(glDrawElementsBaseVertex, mode, count, type, indices, basevertex);
-    break;
-}
 case 1136: {
     GLenum mode = a.u32();
     GLenum type = a.u32();
     const void *indirect = reinterpret_cast<const void *>(static_cast<uintptr_t>(a.u64()));
     GEX_GL_CALL(glDrawElementsIndirect, mode, type, indirect);
-    break;
-}
-case 1138: {
-    GLenum mode = a.u32();
-    GLsizei count = a.i32();
-    GLenum type = a.u32();
-    GLsizei instancecount = a.i32();
-    GLuint baseinstance = a.u32();
-    const void *indices = reinterpret_cast<const void *>(static_cast<uintptr_t>(a.u64()));
-    GEX_GL_CALL(glDrawElementsInstancedBaseInstance, mode, count, type, indices, instancecount, baseinstance);
-    break;
-}
-case 1139: {
-    GLenum mode = a.u32();
-    GLsizei count = a.i32();
-    GLenum type = a.u32();
-    GLsizei instancecount = a.i32();
-    GLint basevertex = a.i32();
-    const void *indices = reinterpret_cast<const void *>(static_cast<uintptr_t>(a.u64()));
-    GEX_GL_CALL(glDrawElementsInstancedBaseVertex, mode, count, type, indices, instancecount, basevertex);
-    break;
-}
-case 1140: {
-    GLenum mode = a.u32();
-    GLsizei count = a.i32();
-    GLenum type = a.u32();
-    GLsizei instancecount = a.i32();
-    GLint basevertex = a.i32();
-    GLuint baseinstance = a.u32();
-    const void *indices = reinterpret_cast<const void *>(static_cast<uintptr_t>(a.u64()));
-    GEX_GL_CALL(glDrawElementsInstancedBaseVertexBaseInstance, mode, count, type, indices, instancecount, basevertex, baseinstance);
-    break;
-}
-case 1141: {
-    GLenum mode = a.u32();
-    GLuint start = a.u32();
-    GLuint end = a.u32();
-    GLsizei count = a.i32();
-    GLenum type = a.u32();
-    const void *indices = reinterpret_cast<const void *>(static_cast<uintptr_t>(a.u64()));
-    GEX_GL_CALL(glDrawRangeElements, mode, start, end, count, type, indices);
-    break;
-}
-case 1142: {
-    GLenum mode = a.u32();
-    GLuint start = a.u32();
-    GLuint end = a.u32();
-    GLsizei count = a.i32();
-    GLenum type = a.u32();
-    GLint basevertex = a.i32();
-    const void *indices = reinterpret_cast<const void *>(static_cast<uintptr_t>(a.u64()));
-    GEX_GL_CALL(glDrawRangeElementsBaseVertex, mode, start, end, count, type, indices, basevertex);
     break;
 }
 case 1143: {
