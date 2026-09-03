@@ -10706,8 +10706,19 @@ problems, not driver ones; `compute` additionally stops earlier here because
 - **The u_blitter fallback.** It silently produced black for the window blit.
   Declining, the way `gex_wgpu_blit` declines everything else it cannot do, is
   probably better than a fallback that can be wrong.
-- **In-game rendering.** The title screen is verified pixel by pixel. Loading a
-  world is the next thing to check.
+- **In-game rendering.** Verified further than the title screen: the world
+  `--quickPlaySingleplayer` loads, its chunks build, and the game runs at 30
+  fps with **556 draws a frame**. The same frame rendered on llvmpipe differs
+  by **RMSE 0.0024** -- text, buttons, hearts, hotbar and an entity all match
+  the software reference.
+
+  One thing to be careful of, having been caught by it: that save spawns the
+  player falling out of the world, so a frame captured a few minutes in is
+  terrain seen from a great height. It looks flat-coloured because it is
+  legitimately mip-minified, not because the atlas is being sampled wrong --
+  the llvmpipe reference at the same save shows the same death screen. Driving
+  the game further needs a real focus grab; `xdotool click` on bare Xvfb with
+  no window manager does not reach Minecraft's button.
 
 ## The browser was three GL versions behind, and two guest gaps under it
 
