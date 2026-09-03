@@ -182,6 +182,45 @@ int main(void) {
     }
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
+    /* glCullFace(GL_FRONT_AND_BACK), which culls every polygon. WebGPU's
+     * cullMode has no name for it -- None, Front and Back are all it offers
+     * -- so a driver mapping the state onto the nearest one draws the
+     * triangle it was told to throw away. `tri-cull-both` renders an empty
+     * window everywhere else and a full-screen triangle here.
+     *
+     * Lines are the other half of the claim: GL culls *polygons*, so a line
+     * drawn under the same state still has to appear. A driver that answered
+     * "cull both" by discarding the whole draw would pass the first check and
+     * fail this one. */
+    {
+        unsigned char *image = malloc((size_t)SIDE * SIDE * 4);
+        if (!image) return 2;
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_FRONT_AND_BACK);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glReadPixels(0, 0, SIDE, SIDE, GL_RGBA, GL_UNSIGNED_BYTE, image);
+        unsigned lit = 0;
+        for (unsigned p = 0; p < (unsigned)SIDE * SIDE; ++p)
+            if (image[p * 4] > 128) ++lit;
+
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_LINES, 0, 2);
+        glReadPixels(0, 0, SIDE, SIDE, GL_RGBA, GL_UNSIGNED_BYTE, image);
+        unsigned line_lit = 0;
+        for (unsigned p = 0; p < (unsigned)SIDE * SIDE; ++p)
+            if (image[p * 4] > 128) ++line_lit;
+
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO cull_both triangle=%u line=%u err=0x%04x\n",
+                lit, line_lit, (unsigned)error);
+        result("cull_front_and_back",
+               error == GL_NO_ERROR && lit == 0 && line_lit > 0);
+        glDisable(GL_CULL_FACE);
+        free(image);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;
