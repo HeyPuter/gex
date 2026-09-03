@@ -1204,9 +1204,26 @@ impl Client {
         // client acks the latest serial, so an extra configure is harmless.
         if buffer_id.is_none() && !state.configured {
             if let Some(xdg) = state.xdg {
-                let serial = self.serial();
-                let w = Writer::new(xdg, 0).uint(serial);
-                self.send(w);
+                // A toplevel's configure must carry its size: winewayland (and
+                // any client that mirrors the xdg_shell state machine) consumes
+                // the pending size on every `xdg_surface.configure` and zeroes
+                // it, so a bare configure here -- with no `xdg_toplevel.configure`
+                // in front of it -- is read as "resize to 0x0", and the window
+                // collapses to nothing. Re-send the toplevel configure so the
+                // size rides along; for a non-toplevel role the bare serial is
+                // right (a popup carries its size in its own configure, a plain
+                // surface has none).
+                match self.toplevel_of_surface(surface) {
+                    Some((toplevel, xdg)) => {
+                        let (w, h) = self.default_size;
+                        self.send_toplevel_configure(toplevel, xdg, w, h, true);
+                    }
+                    None => {
+                        let serial = self.serial();
+                        let w = Writer::new(xdg, 0).uint(serial);
+                        self.send(w);
+                    }
+                }
             }
         }
         // A surface with no role is not displayable, and no compositor shows
@@ -2694,6 +2711,44 @@ mod tests {
         // The configure pair goes out at get_toplevel; the test above then
         // acks it, and the surface records that.
         assert!(c.surfaces.values().any(|s| s.configured));
+    }
+
+    /// The post-commit `xdg_surface.configure` a toplevel gets on its initial
+    /// bufferless commit must be preceded by an `xdg_toplevel.configure`
+    /// carrying the size. winewayland consumes the pending size on every
+    /// xdg_surface.configure and zeroes it, so a bare one is read as
+    /// "resize to 0x0" and the window collapses; winemine hit exactly this.
+    #[test]
+    fn a_toplevels_post_commit_configure_carries_its_size() {
+        let mut c = Client::new();
+        c.set_default_size(400, 300);
+        let mut go = |c: &mut Client, bytes: Vec<u8>| c.receive(&bytes, &[], &no_pool());
+        go(&mut c, Writer::new(1, 1).new_id(2).finish());
+        for (name, iface, ver, id) in [
+            (1u32, "wl_compositor", 4u32, 3u32),
+            (5, "xdg_wm_base", 3, 5),
+        ] {
+            go(&mut c, Writer::new(2, 0).uint(name).string(iface).uint(ver).new_id(id).finish());
+        }
+        go(&mut c, Writer::new(3, 0).new_id(6).finish()); // create_surface -> 6
+        go(&mut c, Writer::new(5, 2).new_id(7).object(6).finish()); // get_xdg_surface -> 7
+        let _ = c.take_outgoing();
+        go(&mut c, Writer::new(7, 1).new_id(8).finish()); // get_toplevel -> 8
+        let _ = c.take_outgoing(); // the configure pair from get_toplevel
+        // The bufferless commit of the handshake: the reply must be a
+        // toplevel configure with 400x300, then the xdg_surface configure.
+        go(&mut c, Writer::new(6, 6).finish()); // wl_surface.commit
+        let msgs = messages(&c.take_outgoing());
+        let toplevel = msgs.iter().find(|(o, op, _)| *o == 8 && *op == 0);
+        let (_, _, body) = toplevel.expect("a toplevel configure after the commit");
+        let mut fds = Vec::new();
+        let mut r = Reader::new(body, &mut fds);
+        assert_eq!(r.int(), Some(400), "configure width");
+        assert_eq!(r.int(), Some(300), "configure height");
+        assert!(
+            msgs.iter().any(|(o, op, _)| *o == 7 && *op == 0),
+            "the xdg_surface configure that completes it"
+        );
     }
 
     #[test]
