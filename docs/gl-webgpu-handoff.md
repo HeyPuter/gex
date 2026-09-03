@@ -9164,3 +9164,74 @@ the place to add it once it is known.
 The probe did catch one small real divergence on the way, kept as a note
 rather than a case: a three-vertex `GL_QUAD_STRIP` lights about 70 pixels on
 this driver and none on either reference.
+
+### Closing the gap: culling on the CPU, and edge flags with it
+
+The gap above is closed. `gl44-polygon-mode-faces-probe.c` is 6/6, and the
+eight programs went from 0.46 to between 0.020 and 0.069.
+
+**The facing filter.** `gex_wgpu_cull_polygons` runs the vertex shader as
+compute into a capture buffer -- the same first pass the wide-line rewrite
+uses, with a one-slot layout because only `VARYING_SLOT_POS` is wanted, so the
+record is 16 bytes and the position sits at offset 0 -- maps it, and decides
+each source polygon's facing from the sign of its signed area after the
+perspective divide. Only the vertex range the draw touches is captured, which
+for an indexed draw is its index bounds.
+
+*Source* polygons are filtered, not the translator's output: the unfilled
+rewrite deliberately runs before the topology conversion so a quad's four
+edges stay four edges, and the mapping from output line back to input polygon
+differs per topology. Strips and fans become `TRIANGLES` and a quad strip
+becomes `QUADS`, which is lossless because polygon mode's edges are per-polygon
+either way. A vertex at or behind the eye makes the facing undecidable, and
+such a polygon is kept rather than guessed at -- erring the way the old
+behaviour did.
+
+The sign convention was measured, not derived: two triangles of known opposite
+winding, and the front/back pair and both cull cases invert together if it is
+wrong, which is what makes the probe able to tell.
+
+**Edge flags came almost free.** Mesa already delivers them: `varray.c` enables
+`_PerVertexEdgeFlagsEnabled` only when the polygon mode of an unculled face is
+not `FILL`, and `st_atom_shader.c` turns that into `passthrough_edgeflags`, so
+a vertex shader writing `VARYING_SLOT_EDGE` is exactly the case where GL says
+the flags decide which edges are drawn. Capturing that slot alongside the
+position costs one more 16-byte record.
+
+GL's rule is one predicate -- the flag on a vertex says whether the edge
+*beginning* at it is a boundary edge, a `LINE` polygon draws only its boundary
+edges, and a `POINT` polygon draws only the vertices that begin one -- so the
+line or point list is built here rather than handed to `u_unfilled_translator`,
+which has no way to be told about it. A `LINES` or `POINTS` result re-enters
+the draw path directly, which also picks up the wide, smooth and stippled line
+rewrites on the way.
+
+### The bug underneath: a union, and a stage change
+
+None of it worked at first. Every capture variant of the shader `glPolygonMode`
+makes st/mesa emit was rejected:
+
+    Tint rejected SPIR-V: Capability PhysicalStorageBufferAddresses is not
+    allowed by Vulkan 1.1 specification
+
+for a shader that touches no global memory at all. The disassembly said
+`OpMemoryModel PhysicalStorageBuffer64`, and ntv chooses that from exactly one
+field:
+
+    if (s->info.cs.ptr_size == 64) {
+       emit_cap(PhysicalStorageBufferAddresses);
+       model = PhysicalStorageBuffer64;
+
+`shader_info`'s stage-specific fields are a **union**. All three of this
+driver's capture builders -- transform feedback, the varying capture, and the
+geometry stage -- turn a vertex shader into a compute one by assigning
+`info.stage`, which leaves the vertex stage's bytes to be read as compute
+state. Whether it bites depends on what those bytes happened to hold, which is
+why it struck one shader and not the captures that had been running all along.
+All three now clear `info.cs` with the stage change.
+
+Worth remembering for its own sake: **the debug print that would have shown
+this never ran**, because a mechanical "replace the first occurrence" edit put
+it in the wrong one of three near-identical builders. The rejected SPIR-V hex
+the driver already dumps is what actually named it -- `spirv-dis` on it took
+one command and no rebuild.

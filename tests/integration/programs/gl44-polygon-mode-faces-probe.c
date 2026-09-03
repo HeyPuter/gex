@@ -24,24 +24,14 @@
  * The first version of this lived in the core-profile polygon-mode probe and
  * both drivers "agreed" at 3/6 because neither had accepted the state at all.
  *
- * KNOWN GAP -- `cull_back_with_split` is expected to fail on gex_wgpu, 5/6
- * against llvmpipe's 6/6, and the failure is real rather than a probe
- * artefact. Each pass of the split culls the other face, but WebGPU applies
- * cullMode only to triangle topology and an unfilled pass has been rewritten
- * into lines or points by then, so the cull is inert and the pass draws both
- * facings' edges. gex_wgpu_draw_unfilled documents the same gap for the
- * uniform-fill-mode case ("Lines carry no winding [...] the alternative is
- * culling on the CPU"), and one fix repairs both: capture the post-VS
- * positions with the compute path the wide-line rewrite already uses, compute
- * each source primitive's window-space signed area, and hand the unfilled
- * translator only the primitives of the wanted facing.
- *
- * The gap is small in practice and worth measuring before spending that: the
- * eight affected programs went from 0.46 to 0.02-0.07 against llvmpipe when
- * the state stopped being refused, and three of them are now at or below the
- * llvmpipe-vs-softpipe floor. What is left is the wrong facing's vertex
- * points and edges, which mostly land on top of geometry that is already
- * there.
+ * The two cull cases are the point of the probe as much as the fill modes
+ * are. WebGPU applies cullMode only to *triangle* topology, and an unfilled
+ * pass has been rewritten into lines or points before it draws, so the cull
+ * the split relies on is inert unless the driver does it itself. It does:
+ * gex_wgpu_cull_polygons captures the post-vertex-shader positions and
+ * filters source polygons by the sign of their signed area. Take that away
+ * and `cull_back_with_split` fails while everything else still passes, which
+ * is what makes this probe worth its runtime.
  */
 #define GL_GLEXT_PROTOTYPES 1
 #include <EGL/egl.h>
