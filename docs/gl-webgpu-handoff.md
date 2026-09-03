@@ -9454,27 +9454,37 @@ Zero shaders compiled. It checks the version and gives up, so it is blocked on
 the ladder rather than on any individual feature, and the ladder is blocked at
 4.0 by tessellation and fp64.
 
-### GL compute cannot be advertised, and it is not this driver's fault
+### GL compute is not blocked after all -- nobody was asking
 
-`st_extensions.c` gates `ARB_compute_shader` behind
-`max_threads_per_block >= 1024`, because GL 4.3 *requires*
-`MAX_COMPUTE_WORK_GROUP_INVOCATIONS` to be at least 1024. Dawn on this machine
-reports:
+This section previously said compute could not be advertised, on the strength
+of the device reporting 256 invocations per workgroup against the 1024
+`st_extensions.c` requires. **That was wrong, and the way it was wrong is worth
+keeping.**
 
-    gex-wgpu: compute limits invocations/workgroup 256 workgroup 256x256x64
-              grid 65535x65535x65535 storage/compute 10
+256 is WebGPU's *default*, not the adapter's maximum. `requestDevice` may ask
+for more, and `gex_wgpu_native.c` already had a `GEX_WANT` macro that requests
+a limit clamped to what the adapter reports -- it simply never listed the
+compute limits. The adapter here offers:
 
-**256.** That is WebGPU's guaranteed figure and what this adapter offers, and a
-GL workgroup of 1024 cannot be split into four WebGPU workgroups of 256
-without breaking shared memory and barriers. So compute at GL's required
-limits is not expressible here.
+    gex-wgpu: adapter compute limits invocations/workgroup 1024
+              workgroup 1024x1024x1024 shared 65536B (asking for 1024)
 
-This is worth stating as plainly as the tessellation and fp64 walls, because
-the code is already written and it would be easy to assume only a cap was
-missing: `launch_grid`, `create_compute_state`, `bind_compute_state` and
-`set_shader_buffers` are all implemented. What is missing is a device that
-offers 1024, plus `ARB_shader_image_load_store` on the way. Advertising 1024
-and refusing an over-large dispatch out loud is a possible trade -- it would
-serve the majority of real compute shaders, which use 64, 128 or 256 -- but it
-is a declared limit the device cannot meet, so it is a decision rather than an
-implementation.
+So the granted figure is 1024 now, and the gate is met. The lesson is narrow
+and general: **a limit read back from the device is what you asked for, not
+what the hardware can do.** Read the adapter before calling something a wall.
+
+`screen->compute_caps` is filled from the granted limits rather than from a
+hopeful constant, so a device that grants less still reports the truth to GL.
+
+What remains before `ARB_compute_shader` appears is
+`ARB_shader_image_load_store`: st_extensions gates compute behind it and
+behind `ARB_shader_atomic_counters`, and the latter came free with SSBOs.
+`launch_grid`, `create_compute_state`, `bind_compute_state` and
+`set_shader_buffers` are all already implemented.
+
+Image load/store is expressible: this Dawn has `WGPUStorageTextureAccess_ReadOnly`
+and `_ReadWrite` and neither is behind a feature name. The restriction to
+respect is *format* -- WebGPU allows read_write storage on a narrow set
+(r32uint, r32sint, r32float) and write-only on a wider one -- so the honest
+shape is to advertise per-format support through `is_format_supported` with
+`PIPE_BIND_SHADER_IMAGE` rather than to claim GL's whole required list.
