@@ -71,6 +71,22 @@ if [ -f "$MESA_BUILD/gex-wgpu-replay.wasm" ]; then
         cp "$MESA_BUILD/gex-wgpu-replay.js" \
            "$MESA_BUILD/gex-wgpu-replay.wasm" "$tree/gex/"
     done
+    # Newer than the driver source, or it is testing a driver that no longer
+    # exists. This has now cost three separate investigations -- a stale vite
+    # bundle had the browser reporting GL 4.0 against a native 4.4, a stale
+    # generated extension table withheld ARB_viewport_array, and a stale host
+    # module failed two compute cases that the current driver passes. The
+    # module's own GL_VERSION carries the git sha, which is how the last one
+    # was spotted; this says so before the run instead of after.
+    DRIVER_SRC="$ROOT/third_party/mesa/src/gallium/drivers/gex_wgpu"
+    for src in "$DRIVER_SRC"/gex_wgpu_screen.c "$DRIVER_SRC"/gex_wgpu_native.c; do
+        [ -f "$src" ] || continue
+        if [ "$src" -nt "$MESA_BUILD/gex-wgpu-replay.wasm" ]; then
+            echo "warning: $(basename "$src") is newer than the staged host" \
+                 "module; run web/build-mesa-wasm.sh or this tests an older" \
+                 "driver than the native expectation" >&2
+        fi
+    done
 else
     echo "warning: no gex-wgpu-replay in $MESA_BUILD; testing whatever host" \
          "module is already staged (run web/build-mesa-wasm.sh)" >&2
