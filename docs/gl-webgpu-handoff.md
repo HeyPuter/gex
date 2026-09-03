@@ -11418,15 +11418,78 @@ Working inwards, all measured in the failing browser run:
 - The probe sets `GL_NEAREST` filters, so texture completeness is not it, and
   the `srgb=` field in the draw dump drives nothing.
 
-That is a contradiction, which usually means an assumption above is subtly
-wrong rather than that all of them are right. The sharpest remaining question
-is whether the *draw* produces black or the *sample* does: have that case's
-fragment shader write a constant instead of the sample and see whether the
-constant appears. After that, dumping the WGSL and the pipeline for that one
-draw in both builds is the next instrument -- note the WGSL should be
-*identical to the passing unorm cases*, since the probe compiles the same
-shader source for all of them and the format lives entirely in the view.
+Two more instruments ran before the answer turned up. The *draw* is fine: a
+constant fragment body in that case reads 128 in the browser, so it is the
+**sample** that returns black. And a *nearest* sampler on an sRGB view is
+also correct in the raw repro (`near-samp-srgb=55 near-samp-lin=128`), which
+removed the last difference between the repro and the driver -- the probe
+sets `GL_NEAREST` and the repro had used a filtering sampler.
 
-Stopped here deliberately rather than blocked: the state above is worth more
-to the next pass than a half-finished sixth instrument, and nothing else in
-the driver depends on it.
+### The answer: StorageBinding usage forbids an sRGB view
+
+Every instrument above measured the *request*, and the request was legal. The
+rejection was inside Dawn, and it had been in the browser console the whole
+time:
+
+```
+The texture usage (CopySrc|CopyDst|TextureBinding|StorageBinding|
+RenderAttachment) includes TextureUsage::StorageBinding, which is
+incompatible with the format (TextureFormat::RGBA8UnormSrgb).
+```
+
+**No sRGB format is storage-compatible**, and this driver hands
+StorageBinding to every storage-capable single-sampled texture -- deliberately
+and with its own comment, because st/mesa never asks for
+`PIPE_BIND_SHADER_IMAGE` up front and `glBindImageTexture` arrives long after
+the allocation. So on an 8-bit texture the sRGB counterpart that
+`resource_create` declares in `viewFormats` could never actually be *used*.
+The declaration is accepted; the view built from it is not.
+
+That explains every contradictory measurement at once. The texture is valid,
+the view descriptor is right, the bind group layout is right, the shader is
+right -- and the `WGPUTextureView` object is invalid, so its bind group is
+invalid, so the draw is dropped and the probe reads back the clear colour. No
+GL error, no `sampler view refused`, nothing in the driver's own logs.
+
+Native Dawn does not enforce the rule, which is why this was browser-only.
+That is the third time the "native Dawn is more permissive" note has cost a
+pass; a native-only pass is not a pass.
+
+The fix routes those views through the scratch copy a cross-class view
+already uses (`storage_forbids_view` in `create_sampler_view`). The bytes are
+identical either way -- an sRGB view differs from a linear one only in how the
+sampler decodes what is there -- and the scratch carries
+`CopyDst|TextureBinding` alone, so it may legally be sRGB. `texture-view` is
+now **6/6 in the browser** as well as natively, the native suite is unchanged
+at 77, and `image`, `compute`, `compute-readonly`, `swizzle`, `copy-image`,
+`integer-texture` and `clear` all still pass in the browser.
+
+### The lesson, which is worth more than the fix
+
+**Grep the browser log for WebGPU validation errors before building any
+instrument.** Five instruments were built across two passes -- a driver view
+log, a bind-group-layout log, JS monkey-patches of `createTexture` and
+`createView`, a raw-WebGPU repro, a constant-shader probe variant -- and the
+root cause was one `grep -i validation` away in a log already on disk. The
+searches that were run looked for the driver's own strings, which is exactly
+the blind spot: the driver cannot report an error it never learns about.
+
+When reading those errors, note that an invalid object **cascades**:
+
+```
+validation: [Invalid TextureView (unlabeled)] is invalid due to a previous error.
+validation: [Invalid BindGroup (unlabeled)] is invalid due to a previous error.
+validation: [Invalid CommandBuffer] is invalid due to a previous error.
+```
+
+Only the *first* message names a cause; the rest are downstream noise. Sort
+unique and look for the one line that mentions a format, a usage or a limit.
+
+One related hole is now known but unmeasured: the same rule applies to a
+**render-target** view of a differing format, which is how `GL_FRAMEBUFFER_SRGB`
+is expressed. Nothing in the probe suite trips it today (a full browser sweep
+of the affected probes shows no remaining `incompatible with the format`
+line), but a real app that renders through an sRGB view of a storage-capable
+texture would hit it, and the driver currently refuses colour-target
+reinterpretation outright rather than copying. That is the next thing to
+measure in a real app run.
