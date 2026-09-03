@@ -9694,3 +9694,76 @@ Seventeen extensions to 4.4, from twenty-six. `ARB_shader_precision` is
 another pure GLSL-level item -- raising the cap to 410 grants it -- which
 would leave 4.1 wanting only `ARB_viewport_array`, and WebGPU has a single
 viewport.
+
+## Texture buffers: GL 4.0 is one extension away
+
+`samplerBuffer` and `texelFetch` work. `gl44-texture-buffer-probe` is 4/4
+against llvmpipe -- rgba32f, rgb32f, r32f and r32i -- and this closes the hole
+the probe was written to document: a shader using core GL 3.1 functionality
+that failed to *link* on a driver claiming 3.3.
+
+It also takes two extensions off the ladder. `ARB_texture_buffer_object_rgb32`
+was one of GL 4.0's two remaining items and `ARB_texture_buffer_range` was one
+of 4.3's, so:
+
+| rung | missing |
+|---|---|
+| **4.0** | **`ARB_tessellation_shader`** -- and nothing else |
+| 4.1 | `shader_precision` (pure GLSL-level), `viewport_array` |
+| 4.2 | complete |
+| 4.3 | 6 |
+| 4.4 | 6 |
+
+Fifteen to 4.4, from twenty-six.
+
+### How it works
+
+WebGPU has no texel buffer of any kind, so a texture buffer is bound as a
+**read-only storage buffer** and `texelFetch(buf, i)` becomes a run of word
+loads at `i * words` -- see `gex_wgpu_lower_buffer_texture`. Only the
+32-bit-per-channel formats are served, which makes a texel a run of words and
+the fetch a load plus a reinterpretation: NIR values are untyped bit patterns,
+so nothing is converted and only the *padding* differs between a float and an
+integer sampler (`(0,0,0,1)` as floats or as integers). The 8- and 16-bit
+formats GL also allows would each need their own unpack;
+`is_format_supported` is asked per format, so refusing them is visible to
+st/mesa rather than silent.
+
+### The one real design problem
+
+**The texel's word count is not known when the shader is compiled.** A
+`samplerBuffer` yields a `vec4` whatever the format holds, and the format
+lives on the sampler view. So the lowering runs in the **per-draw variant
+builders** and the word counts are part of both stages' variant keys --
+`gex_wgpu_interp_variant_get` for the vertex stage and
+`gex_wgpu_fragment_module` for the fragment one. Doing it at shader creation
+is not merely wrong, it is impossible.
+
+That also means **neither stage can have a base module** for such a shader.
+Compiling eagerly does not produce a merely-unspecialised module; it produces
+one Tint refuses outright, because a `samplerBuffer` reaches SPIR-V as an image
+of dimension `Buffer`:
+
+    Tint rejected SPIR-V: error: invalid dimension: 5
+
+which arrives at the application as a link error -- exactly the symptom the
+probe documents. The existing `deferred_integer_sampling` path already had this
+shape for integer sampling and now covers buffer textures too.
+
+### Two traps
+
+**A buffer sampler view has to leave before the texture guards.**
+`create_sampler_view`'s checks read `templ->u.tex`, and for a buffer view that
+union member holds the offset and size instead -- so a level range read out of
+it is nonsense. The buffer case returns early with no `WGPUTextureView` at
+all, and the bind path recognises `target == PIPE_BUFFER`.
+
+**Removing the tex instruction leaves its `deref_var` behind**, and dropping
+the variable then leaves that deref pointing at nothing. NIR validation
+catches it *inside ntv*, after ntv's own copy-prop:
+
+    deref_var &gex_texture0 (uniform textureBuffer) error: entry
+
+One of the four cases passed anyway because DCE happened to run first, which
+made it look like a format problem rather than an ordering one. `nir_opt_dce`
+now runs before the variables are dropped.
