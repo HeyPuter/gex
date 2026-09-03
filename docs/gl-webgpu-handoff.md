@@ -12233,3 +12233,80 @@ the vertices-per-patch to compute. That is not what `PRIMITIVES_GENERATED`
 means on a tessellating draw -- GL asks for what the evaluation stage emitted
 -- so the query is approximate there and the comment says so. Approximate
 beats aborting. `KHR-GL44.tessellation_shader` runs to completion at 6/20.
+
+## Two more from the CTS, and a correction to how it is read (2026-09-03)
+
+### Read the failure count, not the gap
+
+Ranking families by `total - passed` is wrong: it counts **not supported** as
+failure. `shader_image_size` looked like 73 missing and is really 1 passed, 13
+failed, 60 skipped; `constant_expressions` looked like 464 missing and has
+**zero** failures. Collect all three numbers:
+
+```
+p=$(... | grep -aoE "Passed: +[0-9]+" | tail -1 | grep -oE '[0-9]+')
+f=$(... | grep -aoE "Failed: +[0-9]+" | tail -1 | grep -oE '[0-9]+')
+n=$(... | grep -aoE "Not supported: +[0-9]+" | tail -1 | grep -oE '[0-9]+')
+```
+
+By real failures the list is: `shader_multisample_interpolation` 99,
+`shader_storage_buffer_object` 91, `geometry_shader` 64, `texture_gather` 46,
+`shaders` 37 of 2397, `transform_feedback` and `compute_shader` 16 each.
+
+### Count storage blocks, not block variables (a regression of my own)
+
+Earlier the storage-block slot fallback was changed from "the GLSL binding
+qualifier" to "the enumeration order of the variable list", to fix Blender's
+fragment shaders. That is right when a block is one variable -- and a block
+declared **without an instance name** is one variable *per member*.
+`KHR-GL44.shader_bitfield_operation`'s single `buffer Data { ... }` of fourteen
+members arrived as fourteen variables sharing a binding and an interface type,
+the counter gave each its own slot, and the layout asked for thirteen storage
+buffers that do not exist:
+
+```
+The number of storage buffers (12) in the Compute stage exceeds the maximum
+per-stage limit (10)
+```
+
+The pipeline was invalid, the dispatch never ran, and every case whose inputs
+were not already zero read zeros. **Only the `_zero` variants passed, across
+every function in the family** -- which is what named the cause: not one
+bitfield builtin was wrong, the shader had never run. The interface type says
+which block a member belongs to, so distinct interface types are what get
+counted. **324/324, from 51/324**, with Blender unchanged.
+
+The lesson generalises: when a fix keys on "the order of the variable list",
+ask what happens when one declaration produces several variables.
+
+### Centroid and sample must match across the stages
+
+WebGPU rejects a pipeline whose fragment input and vertex output disagree
+about interpolation *sampling*, not only about the mode. GL puts the qualifier
+on the fragment input alone, so every `centroid in` mismatched -- and an
+invalid render pipeline invalidates the command buffer, losing every draw
+batched with it.
+
+The driver already builds a vertex variant matching the fragment stage's
+interpolation modes; centroid and sample are separate bits on the variable, so
+they were never carried. They are now, keyed into the same variant. **That
+alone changed nothing**, because zink's emitter decorates Centroid and Sample
+only on a fragment *input* -- Vulkan tolerates the disagreement, so the output
+branch never needed it. Emitting it there too is what gives the copy something
+to travel on.
+
+The nine mismatch rejections are gone. The family's score does not move,
+because what remains is `gl_SamplePosition` (SPIR-V builtin 19) and
+`interpolateAtSample` (GLSL.std.450 77), neither of which WGSL has in any
+form. The fix is not about the score.
+
+### Where the rest of shader_storage_buffer_object's 91 failures are
+
+Measured, not fixed: 34 are `var with 'storage' address space and 'read_write'
+access mode cannot be used by vertex pipeline stage` (WGSL forbids a writable
+storage buffer in the vertex stage); 20 are `.length()` on an unsized array,
+which WGSL has as `arrayLength` but zink's emitter reaches through its own
+SSBO layout rather than this driver's, so it needs the size supplied by the
+driver instead -- the shape to copy is the draw-parameters block; 6 are a
+storage block indexed at run time; 4 are `OpMemoryBarrier` outside compute,
+where WGSL has no barrier at all.
