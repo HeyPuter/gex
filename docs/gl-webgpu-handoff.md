@@ -8440,6 +8440,15 @@ Two routes that avoid the duplication, both bigger than the point work:
   gated on width > 1, stipple or smooth: an ordinary one-pixel wireframe --
   and glPolygonMode's rewrite produces plenty of those -- has to keep the
   fast path.
+
+  **The quad is axis-aligned, not perpendicular.** GL 4.6 §14.5.1 rasterises a
+  non-antialiased wide line as *w copies of the line offset along its minor
+  axis* -- so a 5-pixel diagonal lights five pixels per row, not the seven a
+  rotated quad would. llvmpipe agrees (`INFO diagonal row=5`), which is worth
+  knowing *before* writing the shader: the offset is `(0, w/2)` for an x-major
+  line and `(w/2, 0)` for a y-major one, chosen by comparing |dx| with |dy| in
+  window space. That is both simpler than a perpendicular and the rule GL
+  actually states.
 - **A brush approximation.** GL 4.6 §14.5.1 defines a non-antialiased
   width-*w* line as *w* copies of the line offset along its *minor* axis, so
   drawing the line *w* times with a sub-pixel window offset would be close --
@@ -8449,6 +8458,77 @@ Two routes that avoid the duplication, both bigger than the point work:
 
 `caps->max_line_width` is 1.0 for the same reason `max_point_size` was, and
 should only be raised together with whichever of these lands.
+
+### What landed
+
+The first route, and smaller than it looked, because the render side needs no
+new plumbing at all. `gex_wgpu_line_draw` runs the application's vertex shader
+as compute into `ctx->line_vs_out` -- that is the geometry path's first pass
+with the geometry stage taken out -- and then swaps `ctx->vs` and
+`ctx->vertex_elements` for a generated quad shader and re-enters
+`gex_wgpu_draw_vbo` with triangles. That is exactly how `gex_wgpu_gs_draw`
+rasterises its own output, so pipelines, bind groups, render passes and every
+shader variant come for free.
+
+The two endpoints reach one invocation through the vertex layout rather than
+through storage reads: the capture buffer is bound **twice**, at offset 0 and
+one record further in, both with `instance_divisor = 1` and a stride of one
+segment. For `LINES` a segment is two records, for `LINE_STRIP` it is one --
+so the same layout expresses both, and neither needs an index table. That is
+also why v1 is *non-indexed LINES and LINE_STRIP only*: `LINE_LOOP` wraps and
+an indexed draw permutes, and both would need the index table the capture pass
+already supports but this does not yet build.
+
+A third buffer holds the six corners, at stride 32, per *vertex* rather than
+per instance: which end and which side each corner is, and the draw's own
+numbers (half the width in clip space, and the aspect ratio, which is what
+lets the shader compare the two axes in pixels).
+
+Declines, all of them logged once and all of them leaving the line one pixel
+wide, which is what it was before: a vertex shader that samples a texture (the
+capture dispatch binds vertex buffers, its output and the constant buffers,
+and a compute module declaring a texture binding the dispatch does not provide
+is a pipeline WebGPU rejects, which poisons the device), per-instance vertex
+attributes, more than seven varyings (two attributes each against WebGPU's
+sixteen), and an empty viewport.
+
+### A uniform bug the line work uncovered
+
+The first wide line of any program drew nothing, and every later one was
+right. The capture buffer said why: `A=0,0,0,0 B=0,0,0,0` on the first
+dispatch and the correct clip positions on every one after -- a
+modelview-projection matrix read as zero.
+
+Uniforms are staged into a ring and written to the GPU in one queue write,
+inside `gex_wgpu_submit_pending`. That function begins
+
+    gex_wgpu_end_pass(ctx);
+    if (!ctx->pending_encoder)
+       return;
+    ...
+    gex_wgpu_flush_constant_ring(ctx);
+
+-- so with nothing else pending it returned *before* flushing. Every compute
+pass in this driver submits its own command buffer through
+`gex_wgpu_dispatch`, which calls `submit_pending` first, so a dispatch with no
+other work in flight read a constant ring the GPU had never been given. The
+flush moved above the early return.
+
+This was not a line bug. It is a latent one in **every** compute pass the
+driver runs -- transform feedback's capture and the geometry stage's two
+passes included -- and it would show as the first such draw after a state
+change reading stale or zero uniforms. Geometry shaders got away with it
+because something else had usually flushed the ring by the time they ran.
+
+**Not yet: GL_LINE_STIPPLE and GL_LINE_SMOOTH**, both still refused by the
+rasterizer gate -- six installed programs for stipple, two for smooth. The
+quad has what they need. Smooth wants a coverage value across the line, which
+is the `side` attribute interpolated, and a fragment variant that multiplies
+alpha by it -- `nir_lower_point_smooth` is the shape. Stipple wants the
+distance along the line in pixels, which the quad shader can emit for `LINES`
+directly; for a `LINE_STRIP` the counter runs on across segments, which is a
+prefix sum over the captured vertices and therefore another small compute
+pass.
 
 ## Indexed wide points, and a guest bug underneath them (2026-09-02)
 
@@ -8545,3 +8625,41 @@ in the index list* rather than the index value, because the expansion reads
 means binding the index table as a per-instance integer attribute, which costs
 a vertex attribute and a buffer slot; no installed program has been seen to
 need it.
+
+### The rest of the DrawElements family
+
+`glDrawElements` was hand-written and handled client pointers; every other
+indexed draw was generated from the registry as an *element-buffer offset*, on
+this reasoning, quoted from the generator:
+
+> An opaque pointer interpreted as a byte offset into the vertex array's bound
+> GL_ELEMENT_ARRAY_BUFFER. In an OpenGL 4.4 core context these are never guest
+> client-memory pointers.
+
+True of a core context, and the guest hands out **compatibility** contexts now
+(see the EGL profile work) -- where `indices` is a client pointer whenever no
+element array buffer is bound. Sent as an offset it had the host read its own
+address space, and nothing uploaded the client vertex arrays either, so the
+draw read zeroes and covered no pixels. `glDrawRangeElements` is the GL 1.2
+form most old code actually calls, and `glDrawElementsInstanced` sent no
+indices at all.
+
+All seven now share one opcode and one host case. Base vertex, instancing and
+base instance are *fields* rather than different commands, and the host
+dispatches on them; `glDrawRangeElements`' start/end are dropped, which is
+legal -- they are a promise about the indices, not a change to what is drawn.
+The upload extent accounts for a positive base vertex, because the host then
+reads vertex `index + basevertex`.
+
+`tests/gl44-probe.sh point` gained a `glDrawRangeElements` case with client
+arrays and client indices.
+
+Two things are still not handled, both for the same reason -- the guest cannot
+see the indices:
+
+- **Client vertex arrays with the indices in a buffer.** The guest would have
+  to read the buffer back to know how far the arrays reach, so it uploads
+  nothing and the host draws from whatever was there. Legal GL, untested.
+- **`glMultiDrawElements`.** It carries an array of pointers, each of which
+  can be a client pointer, so the same fix needs a blob per element rather
+  than one blob. Its packet still treats them all as offsets.
