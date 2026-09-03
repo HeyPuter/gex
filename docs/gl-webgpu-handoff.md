@@ -11785,3 +11785,56 @@ turns `nir_var_mem_global` into `CrossWorkgroupMemory`, which Tint refuses
 (`unsupported control barrier semantics: 512`), so global now folds into ssbo
 -- which is what the memory is here. That is a general translation fix; the
 four above are the platform.
+
+## Anisotropic filtering, which was refused and cost more than itself
+
+`EXT_texture_filter_anisotropic` and, at a maximum of 16,
+`ARB_texture_filter_anisotropic` -- one of GL 4.6's ten. WebGPU has it as a
+sampler field, so the refusal that stood here was never necessary, and it was
+expensive out of all proportion: **any** sampler with anisotropy above one was
+turned away, and a refused sampler binds as NULL, so an application that
+enables anisotropic filtering -- which most games do by default -- lost its
+wrap modes and filters along with it and drew the wrong thing. SuperTuxKart is
+launched in this tree with `--anisotropic=0` for exactly that reason; it now
+runs with `--anisotropic=16` and no sampler refusal at all.
+
+GL treats anisotropy as a quality hint rather than a promise, and WebGPU
+requires all three filters to be linear above one, so a sampler that is not
+fully linear takes one instead of being refused.
+
+`gl44-anisotropy-probe` deliberately does not measure filtering quality, which
+is implementation-defined. It measures what was broken: the extension is
+claimed with a maximum of at least 16 (which is what st gates the ARB form
+on), setting `GL_TEXTURE_MAX_ANISOTROPY` raises no error, and with anisotropy
+on a `GL_REPEAT` wrap still repeats and a `LINEAR` filter still blends two
+texels. Those last two are the cases a NULL sampler fails, because the default
+it falls back to clamps and does not filter the way the application asked.
+4/4 natively and in the browser.
+
+### ARB_polygon_offset_clamp: implemented, measured, and not claimed
+
+The neighbouring 4.6 item looked like a free cap: `offset_clamp` is already
+carried to `depthBiasClamp`, which means the same thing, the value arrives
+intact, and the pipeline key covers the whole depth-stencil state. So the cap
+went in and a probe case went with it -- two coplanar quads under `GL_LESS`
+with a pull of -8 units, which the second wins, and a clamp of -1e-9, a
+sixtieth of a 24-bit depth unit, which should round that pull away and make
+it lose.
+
+**llvmpipe loses it. This driver still wins it.** The clamp reaches the
+descriptor and the depth bias beside it works, so the clamp alone is being
+ignored; Vulkan gates a non-zero `depthBiasClamp` on a device feature, which
+is the likeliest place for it to vanish. The cap was withdrawn rather than
+left claiming an effect that is silently absent -- an application asking for
+a clamp would otherwise get an unclamped offset with no way to tell.
+
+The browser side cannot be asked at all yet: the guest exports no
+`glPolygonOffsetClampEXT`, and adding a command shifts the opcode numbering
+the guest and host share (`opcodes = 1024 + index in the alphabetic 4.4 set`),
+so it is a coordinated change rather than a one-line one.
+
+The probe cases were removed rather than left as a standing failure, with the
+reasoning next to `caps->polygon_offset_clamp` and in the probe's header.
+Restoring them is a two-line change the day the platform honours it. Worth
+noting as a pattern: **the cheap-looking caps are the ones to measure**, since
+the implementation being present says nothing about the platform honouring it.

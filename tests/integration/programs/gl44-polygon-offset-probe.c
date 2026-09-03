@@ -20,6 +20,16 @@
 static int cases;
 static int passed;
 
+static int have_extension(const char *want) {
+    GLint count = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+    for (GLint i = 0; i < count; ++i) {
+        const GLubyte *one = glGetStringi(GL_EXTENSIONS, (GLuint)i);
+        if (one && strcmp((const char *)one, want) == 0) return 1;
+    }
+    return 0;
+}
+
 static void result(const char *name, int ok) {
     ++cases;
     if (ok) ++passed;
@@ -133,7 +143,17 @@ int main(void) {
     glDepthMask(GL_TRUE);
     glUseProgram(program);
 
-    struct { const char *name; float units; int want_green; } tests[] = {
+    /* ARB_polygon_offset_clamp's entry point, which Mesa's non-glvnd libGL
+     * does not export -- see the note in gl44-reflection-probe. */
+    void (*polygon_offset_clamp)(GLfloat, GLfloat, GLfloat) =
+        (void (*)(GLfloat, GLfloat, GLfloat))
+            eglGetProcAddress("glPolygonOffsetClampEXT");
+    const int have_clamp = have_extension("GL_ARB_polygon_offset_clamp") &&
+                           polygon_offset_clamp != NULL;
+    fprintf(stderr, "INFO polygon_offset_clamp=%d\n", have_clamp);
+
+    struct { const char *name; float units; int want_green; float clamp;
+             int needs_clamp; } tests[] = {
         /* Pulled towards the viewer: the second quad is now nearer than the
          * first at the same z, so GL_LESS lets it through. */
         {"offset_negative_wins", -8.0f, 1},
@@ -143,6 +163,14 @@ int main(void) {
          * is the control -- without it, a driver that ignored the offset
          * entirely would still pass the case above. */
         {"offset_disabled_loses", 0.0f, 0},
+        /* ARB_polygon_offset_clamp's two cases -- offset through
+         * glPolygonOffsetClampEXT with no clamp, and the same offset clamped
+         * to a magnitude below one depth unit so the pull rounds away -- were
+         * written and then removed. This driver does not claim the extension:
+         * the clamp reaches WebGPU intact and has no effect on Dawn, while
+         * the bias beside it works. The reasoning is recorded next to
+         * caps->polygon_offset_clamp; restore the cases when the platform
+         * honours it, and they will discriminate immediately. */
     };
 
     for (unsigned i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
@@ -157,9 +185,14 @@ int main(void) {
         glDrawArrays(GL_TRIANGLES, 0, 6);
 
         /* Green, at the same z, with the offset under test. */
+        if (tests[i].needs_clamp && !have_clamp)
+            continue;
         if (tests[i].units != 0.0f) {
             glEnable(GL_POLYGON_OFFSET_FILL);
-            glPolygonOffset(0.0f, tests[i].units);
+            if (tests[i].needs_clamp)
+                polygon_offset_clamp(0.0f, tests[i].units, tests[i].clamp);
+            else
+                glPolygonOffset(0.0f, tests[i].units);
         }
         glUniform4f(colour_location, 0.0f, 1.0f, 0.0f, 1.0f);
         glDrawArrays(GL_TRIANGLES, 0, 6);
