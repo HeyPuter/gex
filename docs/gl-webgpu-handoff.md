@@ -11058,3 +11058,70 @@ format-reinterpretation ceiling is where Blender stands either way. Worth
 noting that it now reaches that ceiling and *crashes* rather than sitting at a
 drawn interface, so "Blender's UI draws" from an earlier pass should be read as
 "it drew before it got to the viewport", not as a state that survives startup.
+
+## Two fatal compute bugs, found by taking a latch off
+
+Blender's viewport is a platform ceiling, but its *crash* was not, so the
+latch on the framebuffer refusal was removed to see what came next. Three
+things did, and two of them are fatal bugs that had nothing to do with
+Blender.
+
+**A read-only compute SSBO gave the pipeline a layout WebGPU rejects.**
+`launch_grid` declared every storage block as read-write `Storage`. A block
+the shader never writes is emitted as `var<storage, read>`, and the layout has
+to agree:
+
+```
+The buffer type in the shader (BufferBindingType::ReadOnlyStorage) is not
+compatible with the type in the layout (BufferBindingType::Storage)
+```
+
+An invalid compute pipeline makes the whole command buffer invalid, so the
+submit fails and everything recorded with it is lost. The graphics path has
+carried this bit per stage as `ssbo_readonly_mask` for a long time; compute
+had no equivalent.
+
+**A storage block the shader declares with nothing bound failed the context**,
+in all three bind paths. GL leaves the *contents* undefined rather than the
+call fatal, and this driver advertises `robust_buffer_access_behavior` under
+which the read is zero -- so zeros are what has already been promised. A
+grown, zero-filled placeholder is bound instead. A *uniform* block with
+nothing bound still fails: its size is part of the layout and there is no
+defensible answer.
+
+**And a refused sampler view was dereferenced**, segfaulting the process
+rather than declining the shader variant. Unreachable while the framebuffer
+refusal latched first -- which is exactly what removing a latch exposes.
+
+Neither compute bug had any coverage: `gl44-compute-probe` stops at the
+deliberate fragment-only shader-image cap, so every SSBO case after it had
+never run here. `gl44-compute-readonly-probe.c` now covers all three,
+including both spellings of read-only (the `readonly` qualifier, and inferred
+because the shader never writes the block -- only one is visible in the
+GLSL). 3/3 native, 3/3 in the browser, and it catches the defect: with the
+binding type reverted it fails 2 of 3, verified by reverting and rebuilding.
+
+### The framebuffer refusal stays a latch, and this was tried the other way
+
+Dropping the unexpressible attachment -- the treatment the bytes-per-sample
+budget already gets -- lets the draw proceed against a framebuffer the
+application believes it has. Blender reinterprets **three** colour targets and
+a sampler view (`r16_uint` over `r16_float`, `r16g16_float` over `r32_float`,
+`r16g16b16a16_float` over `r32g32_float`), so dropping them left nothing to
+draw into and the failure moved from a named refusal to a segfault: first
+inside this driver, then inside Blender itself once that was guarded.
+
+A latch is a bad outcome. A crash with no diagnostic is worse, and Blender
+cannot render that pass either way. The comment in the code records the trade
+so the next pass does not retry it blind. Worth revisiting only for an
+application that reinterprets *one* of several attachments and would keep
+working without it.
+
+### A third stale artefact
+
+The browser run of the new probe failed 2 of 3 -- because the staged wasm host
+module predated the fix. Its `GL_VERSION` carries the git sha, which is how it
+was noticed, after the run. `tests/gl44-probe.sh` now warns when the driver
+source is newer than the staged module. That makes three investigations
+started by a stale build artefact: the vite bundle, the generated extension
+table, and this.
