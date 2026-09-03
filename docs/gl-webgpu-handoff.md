@@ -11355,3 +11355,34 @@ What is known, so the next pass does not re-derive it:
 - It is **not** a regression from the work above, verified rather than
   reasoned: rebuilding the wasm host from the pre-change driver and gating
   again fails `srgb` identically.
+
+Narrowed further, and this is where it stands:
+
+- The driver now reports what it built for any differing-format view, and the
+  two builds print an **identical** line: the same view format over the same
+  texture format, `reinterpreting=0` (the sRGB pair needs no copy), mapping to
+  the same pair of WGPU formats, over a resource that is written in both. So
+  the right view is built and it samples wrong.
+- The `srgb=` field in the draw dump is `util_format_is_srgb(sv->format)` and
+  drives nothing -- there is no sRGB shader variant to suspect.
+- **`format-class` passes in the browser** through the scratch-copy path added
+  this pass, while the *direct* WebGPU sRGB view fails there. So the browser
+  samples a copied texture correctly; what it does not do is sample an
+  `rgba8unorm-srgb` view of an `rgba8unorm` texture.
+- The software-adapter comparison is not available: that adapter grants fewer
+  limits, so the GL version drops and `ARB_texture_view` is not advertised at
+  all (the probe reports its never-sampled sentinel, 65535).
+
+**Blocked on the right instrument, not on effort.** Every host-side signal is
+identical between the two builds, so more driver logging cannot separate them.
+The next step is a WebGPU-level repro in the page -- create an `rgba8unorm`
+texture with `viewFormats: ['rgba8unorm-srgb']`, upload a known texel, sample
+it through an sRGB view, and read it back -- which answers whether this is a
+Chrome/Dawn behaviour difference or something the driver does to the texture
+before the view is made.
+
+A fallback exists if that repro shows a genuine browser limitation: route
+sRGB views through the same scratch copy, which demonstrably works there.
+That is deliberately *not* done now -- it would cost a copy on every
+`GL_FRAMEBUFFER_SRGB` blit view, which is a common path, to paper over a cause
+that is not yet understood.
