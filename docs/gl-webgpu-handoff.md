@@ -10049,3 +10049,39 @@ rather than from the default.
 and atomic counters lower to SSBO atomics, so a shader using either fails to
 link. WGSL has atomics but only on `atomic<u32>` storage, which is a different
 declaration from the plain word array the lowering emits.
+
+### Verified in a browser, and one thing only the browser caught
+
+Every feature this session landed was re-run on the wasm path, not just native
+Dawn:
+
+| probe | native | browser |
+|---|---|---|
+| `tessellation` | 12/12 | **12/12**, every pinned pixel identical |
+| `texture-buffer` | 4/4 | 4/4 |
+| `stencil-texture` | 4/4 | 3/4 → 4/4 after a fix |
+| `robust-access` | 5/5 | 5/5 |
+| `fbo-no-attachments` | 5/5 | 5/5 |
+| `copy-image` | 6/6 | 6/6 |
+
+SuperTuxKart in a real browser: **58.7 FPS, 97.8% fresh frames, one rAF miss.**
+
+The one divergence is worth reading, because it is a defect this driver has
+already had and documented once. `gex_wgpu_clear_depth_stencil` builds its
+attachment with `WGPU_..._INIT`, which leaves `depthClearValue` **NaN**, and
+the new stencil-only path set the value only inside the `has_depth` branch. So
+a stencil8 clear reached `beginRenderPass` carrying a NaN it never intended to
+use.
+
+Native Dawn accepts that. The browser reads the value off the dictionary and
+validates it as a float whatever the load op says:
+
+    Failed to read the 'depthClearValue' property from
+    'GPURenderPassDepthStencilAttachment': The provided float value is
+    non-finite.
+
+...which takes the whole pass. The render pass's own depth attachment already
+carries a comment about exactly this ("Unconditionally, and outside the branch
+below"), and it was reintroduced somewhere new. **A finite value belongs on
+every dictionary field the browser will read, whether or not the op that uses
+it is set** -- and native Dawn cannot be trusted to say so.
