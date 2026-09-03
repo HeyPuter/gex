@@ -11647,14 +11647,30 @@ unconditionally doubles or quadruples the memory of two formats renderers use
 heavily for HDR and depth, for the sake of the few textures actually bound as
 images -- and the driver cannot know which those are at creation, because
 st/mesa never asks for `PIPE_BIND_SHADER_IMAGE` (the same reason
-StorageBinding is given to everything storage-capable). The honest version is
-a **lazy promotion**: when `set_shader_images` binds a texture whose format is
-not storage-capable, recreate it with the wider backing, convert the contents
-once, and bump `cache_epoch` so views holding the old handle are rebuilt.
-That is a contained piece of work with a measured payoff, and it is the next
-thing to do on Blender. It is deliberately not started here rather than
-guessed at, because the memory cost of getting the trigger wrong is paid by
-every application.
+StorageBinding is given to everything storage-capable). A **lazy promotion** -- recreate on
+the first `set_shader_images` that binds the texture, convert its contents
+once, bump `cache_epoch` -- sounds like the answer, and it is where this
+stopped, but the shape of the code says why it is not cheap.
+
+The backing is resolved **globally, per format**: `gex_wgpu_texture_format()`
+consults `gex_wgpu_format_backing()` itself, so every site that names a
+format -- sampler views, colour attachments, clear views, image views, the
+copy helpers -- agrees on the wider one without knowing a resource is
+involved. Making the promotion per-resource means threading a resource
+through all of those, and a site that is missed does not fail loudly: it
+builds a view whose format is not the texture's, which WebGPU returns as a
+non-null *invalid* object, and the draw disappears. That is exactly the
+failure mode that cost two passes earlier in this document.
+
+So the two honest options are: **eager** promotion, which is a four-line
+change to `gex_wgpu_format_backing()` and costs 2x memory on two formats
+renderers use heavily for HDR (a real cost in a browser with a 4 GB budget --
+see the note on exhausting it); or the per-resource refactor, done carefully
+with the invalid-view trap in mind. Neither is guesswork-sized, which is why
+this pass measured and recorded it rather than picking one. If a future pass
+wants the cheap version first, put it behind an environment variable and
+measure a Blender run's peak against the default before making it the
+default.
 
 ### The 341-application sweep, re-run against all of this
 
