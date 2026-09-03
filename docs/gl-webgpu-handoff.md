@@ -7640,7 +7640,7 @@ sweep said so, because the programs that use them are engines rather than
 demos.
 
 
-## glPolygonStipple, and why front-and-back polygon modes cannot be done (2026-09-02)
+## glPolygonStipple, and why front-and-back polygon modes are refused (2026-09-02)
 
 ### The stipple
 
@@ -7693,7 +7693,7 @@ undone by the next `guest/gl/build.sh`). The host case goes in
 shim the *Mesa* wasm target links too. The WebGL host implements none of the
 compatibility opcodes, so nothing was needed there.
 
-### Front and back polygon modes differing: not implementable
+### Front and back polygon modes differing: refused, and what it would take
 
 Eight programs ask for it (`dlist-edgeflag*`, `tri-edgeflag*`, `vp-unfilled`,
 `pgon-mode`) and the obvious plan is two draws: one with the back face culled
@@ -7711,6 +7711,21 @@ on the CPU, or in a compute pass that writes two index lists. That is a real
 piece of work for eight compatibility-profile test programs and no
 application, so it stays refused, now for a stated reason rather than "nothing
 here could express that".
+
+**Update (2026-09-02): the machinery now exists.** The wide-line work runs the
+application's vertex shader as compute into a buffer of transformed positions
+(`gex_wgpu_line_draw`), which is exactly what the facing test needs. A pass
+over that buffer computing each triangle's signed area in window space could
+write two index lists -- with the excluded triangles emitted as three copies of
+one index, which rasterises to nothing, so no atomics and no compaction are
+needed. Two `gex_wgpu_draw_unfilled` calls then follow.
+
+What has *not* changed is the value. Six of those eight programs are about
+**edge flags** as well: `glEdgeFlag` marks polygon edges as boundary or not
+and only boundary edges are drawn in LINE mode, which the unfilled rewrite
+does not honour either. Fixing front-versus-back alone would leave them drawing
+the wrong wireframe rather than no wireframe. Anyone picking this up should
+cost both halves together.
 
 
 ## 181 of 341 programs could not start in the browser (2026-09-02)
@@ -8717,3 +8732,16 @@ see the indices:
 - **`glMultiDrawElements`.** It carries an array of pointers, each of which
   can be a client pointer, so the same fix needs a blob per element rather
   than one blob. Its packet still treats them all as offsets.
+
+### What the line work moved
+
+Seven of the eight programs the rasterizer gate refused for line state now
+bind their state and draw: `line-smooth`, `line-stipple-wide`,
+`linestrip-stipple`, `linestrip-flat-stipple`, `linestrip-stipple-wide`,
+`quad-unfilled-stipple` and `tri-unfilled-userclip-stip`. The eighth,
+`tri-unfilled-smooth`, still refuses -- and for a different reason:
+`fill=1/0`, front and back polygon modes differing, which is the cluster above.
+
+SuperTuxKart, which is what all of this is ultimately for, still renders its
+scene: 586 of 599 frames presented at 57 FPS, with the kart, the track, the
+minimap and the HUD all where they belong.
