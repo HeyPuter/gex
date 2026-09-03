@@ -1270,11 +1270,51 @@ fn run_thread_loop(
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
     let mut pc = entry;
     loop {
-        let result = enter.call(
-            &mut *store,
-            &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)],
-            &mut [],
-        );
+        // wasmtime aborts (`assert!(fault.is_none())`) when it attributes a
+        // guest memory fault in a store whose one shared memory is imported by
+        // several module instances -- its per-instance fault search matches
+        // each. That is exactly a data access just past the linear memory: a
+        // guest SIGSEGV, which every other trap here becomes too. Catch the
+        // unwind and treat it as one, saying where the guest was.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            enter.call(
+                &mut *store,
+                &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)],
+                &mut [],
+            )
+        })) {
+            Ok(r) => r,
+            Err(_) => {
+                let fault_pc = store
+                    .data()
+                    .memory
+                    .clone()
+                    .and_then(|m| {
+                        GuestMem::new(m.bytes())
+                            .read_u64(ctx_addr + gex_abi::ctx::PC as u64)
+                            .ok()
+                    })
+                    .unwrap_or(pc);
+                if std::env::var_os("GEX_WOW_TRACE").is_some() {
+                    if let Some(m) = store.data().memory.clone() {
+                        let gm = GuestMem::new(m.bytes());
+                        let r = |n: u8| gm.read_u64(ctx_addr + gex_abi::ctx::x(n) as u64).unwrap_or(0);
+                        eprintln!(
+                            "[oob] pc=0x{fault_pc:x} rax=0x{:x} rcx=0x{:x} rdx=0x{:x} rbx=0x{:x} rsp=0x{:x} rsi=0x{:x} rdi=0x{:x}",
+                            r(0), r(1), r(2), r(3), r(4), r(6), r(7)
+                        );
+                    }
+                }
+                let exit = Exit::Signal {
+                    signal: signal::SIGSEGV,
+                    pc: fault_pc,
+                    detail: "guest access past the linear memory".into(),
+                    internal: true,
+                };
+                store.data_mut().exit = Some(exit.clone());
+                return Ok(Stopped::Exited(exit));
+            }
+        };
         if let Some(req) = store.data_mut().pending_fork.take() {
             fork_process(store, req)?;
         }
