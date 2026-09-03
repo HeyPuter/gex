@@ -1394,11 +1394,34 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         // fork translates the same block forever.
         let low = (gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4) as usize;
         dst[..low].copy_from_slice(&src[..low]);
-        for (start, end) in &regions {
-            let (a, b) = (*start as usize, (*end as usize).min(src.len()));
+        let mut sorted = regions.clone();
+        sorted.sort_unstable();
+        for &(start, end) in &sorted {
+            let (a, b) = (start as usize, (end as usize).min(src.len()));
             if a < b {
                 dst[a..b].copy_from_slice(&src[a..b]);
             }
+        }
+        // Carry the small gaps *between* mapped regions too. A mapping can hold
+        // committed data yet have lost its VMA: Wine reserves a wide range with
+        // `PROT_NONE`, gex's allocator hands part of it out for a live mapping
+        // (a glibc arena), and Wine later releases the reservation with one
+        // broad `munmap` that also drops the live mapping's VMA -- the bytes
+        // stay, the record is gone. The per-VMA copy would leave the child a
+        // zeroed hole there and its first `malloc` aborts on the torn arena.
+        // Real such holes sit against a live region and are at most a few MiB;
+        // the one multi-GiB gap (the program's low area to Wine's high PE arena)
+        // is genuinely empty, so a cap carries the committed holes without
+        // touching -- and faulting in -- gigabytes of zeroes.
+        const GAP_CAP: usize = 64 << 20;
+        let mut prev_end = low;
+        for &(start, end) in &sorted {
+            let g0 = prev_end;
+            let g1 = (start as usize).min(src.len());
+            if g1 > g0 && g1 - g0 <= GAP_CAP {
+                dst[g0..g1].copy_from_slice(&src[g0..g1]);
+            }
+            prev_end = prev_end.max((end as usize).min(src.len()));
         }
         // `fork` returns zero in the child, and a clone that named a stack
         // starts on it.

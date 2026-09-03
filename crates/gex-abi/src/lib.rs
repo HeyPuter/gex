@@ -364,7 +364,16 @@ pub const MISS_SLOTS: u64 = SLOTS_PER_PAGE;
 pub const DISPATCH_DIR: u64 = RESERVED_END;
 
 /// Pages the directory covers, and so the highest address code may occupy.
-pub const DISPATCH_MAX_PAGES: u64 = 0x8_0000;
+///
+/// Sized so the directory ends exactly at [`EXEC_BASE`] (0x400000): a 3 MiB
+/// directory of `0xC_0000` entries reaches 3 GiB, the ceiling on both code and
+/// data mappings. 64-bit Wine keeps its "high half" — thread/kernel stacks and
+/// high-preferred-base modules — above a 2 GiB boundary (its `limit_4g`,
+/// lowered to 2 GiB in gex's curated Wine build, since wasm32 cannot address
+/// the 4 GiB Wine wants on a real host), so the arena has to reach past 2 GiB
+/// for those to land. 2 GiB was enough for a pure low-half process but leaves
+/// no room for the high half.
+pub const DISPATCH_MAX_PAGES: u64 = 0xC_0000;
 
 /// Size of the directory in bytes.
 pub const DISPATCH_DIR_BYTES: u64 = DISPATCH_MAX_PAGES * 4;

@@ -72,8 +72,26 @@ impl Pipe {
     fn recv(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>), Errno> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.bytes.is_empty() {
-            // Empty buffer means end-of-file or nothing yet: a stream socket
-            // never carries descriptors without bytes.
+            // A descriptor can arrive with no data of its own: wineserver hands
+            // a spawned thread its request pipe as an ancillary-only message,
+            // and a program blocking in `recvmsg` for exactly that fd would
+            // hang, or its poll never fire, if the fd needed bytes to escort
+            // it. Its attach position is where the stream had reached, so once
+            // the reader has consumed everything before it, deliver it now with
+            // a zero-byte read rather than stranding it. (`readable` reports the
+            // same, so a blocking wait wakes for it.)
+            if !peek {
+                let mut out = Vec::new();
+                while out.len() < max_fds {
+                    match s.fds.front() {
+                        Some(&(at, _)) if at <= s.read => out.push(s.fds.pop_front().unwrap().1),
+                        _ => break,
+                    }
+                }
+                if !out.is_empty() {
+                    return Ok((0, out));
+                }
+            }
             return if s.closed { Ok((0, Vec::new())) } else { Err(Errno::EAGAIN) };
         }
         let n = buf.len().min(s.bytes.len());
@@ -102,7 +120,13 @@ impl Pipe {
 
     fn readable(&self) -> bool {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        !s.bytes.is_empty() || s.closed
+        !s.bytes.is_empty()
+            || s.closed
+            || s.fds.front().is_some_and(|&(at, _)| at <= s.read)
+    }
+
+    fn closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
     }
 
     fn available(&self) -> u64 {
@@ -326,6 +350,10 @@ impl Drop for UnixSocket {
 }
 
 impl FileHandle for UnixSocket {
+    fn as_unix_socket(self: Arc<Self>) -> Option<Arc<UnixSocket>> {
+        Some(self)
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         self.recv(buf, 0, false)
     }
@@ -385,6 +413,15 @@ impl FileHandle for UnixSocket {
             // connect polls for POLLOUT to learn it finished -- so report
             // writable rather than stranding it.
             _ => true,
+        }
+    }
+
+    fn poll_hup(&self) -> bool {
+        // The peer closed its end: our receive pipe is at end-of-file. This is
+        // what a wineserver client's death looks like to the server side.
+        match &*self.role.lock().unwrap() {
+            Role::Connected { rx, .. } => rx.closed(),
+            _ => false,
         }
     }
 }

@@ -161,6 +161,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         true
     }
 
+    /// Whether the peer has hung up: `poll`/`epoll` report `POLLHUP` for it
+    /// unconditionally, the way Linux does. A stream socket whose peer closed
+    /// is how wineserver learns a Wine process died; without it the server
+    /// never marks the process object signalled and its waiters hang.
+    fn poll_hup(&self) -> bool {
+        false
+    }
+
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that
     /// the fd number and path cannot show.
@@ -223,6 +231,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// The current `(remaining, interval)` in nanoseconds of a `timerfd`, or
     /// `None` when this handle is not one.
     fn timerfd_get(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// This handle as a `UnixSocket`, when it is one. Recovering it from the
+    /// `Arc` directly — rather than a per-process side table — lets a socket
+    /// that arrived over `SCM_RIGHTS` be recognised in the receiver, which
+    /// never registered it. Default: not a unix socket.
+    fn as_unix_socket(self: Arc<Self>) -> Option<Arc<crate::unix::UnixSocket>> {
         None
     }
 }
@@ -358,49 +374,88 @@ impl Vfs {
         Ok((fs, rel))
     }
 
-    /// Open a path, following symlinks up to a bounded depth.
-    pub fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
-        let mut current = normalize(path, &self.cwd);
-        for _ in 0..40 {
-            let (fs, rel) = self.resolve(&current)?;
-            // O_NOFOLLOW and O_PATH are not modelled; a symlink is always
-            // followed, which is what every caller here wants.
+    /// Resolve a path to a canonical guest path, following every symlink
+    /// component — and the final one when `follow_final` — before the real
+    /// filesystem sees it. This is what keeps a symlink inside the sysroot:
+    /// the host filesystem would follow an absolute link such as Wine's
+    /// `dosdevices/z: -> /` with its own kernel and escape to the host root,
+    /// so gex resolves each component itself and re-bases an absolute target
+    /// on the guest root. `..` is handled lexically, as Linux does after a
+    /// symlink. A missing final component is kept literal (the caller may be
+    /// creating it); a missing intermediate one is `ENOENT`.
+    fn canonicalize(&self, path: &str, follow_final: bool) -> Result<String, Errno> {
+        let start = normalize(path, &self.cwd);
+        let mut pending: Vec<String> = start
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .rev()
+            .map(|s| s.to_string())
+            .collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut links = 0u32;
+        while let Some(c) = pending.pop() {
+            match c.as_str() {
+                "." => continue,
+                ".." => {
+                    out.pop();
+                    continue;
+                }
+                _ => {}
+            }
+            let is_final = pending.is_empty();
+            if is_final && !follow_final {
+                out.push(c);
+                break;
+            }
+            let probe = if out.is_empty() {
+                format!("/{c}")
+            } else {
+                format!("/{}/{}", out.join("/"), c)
+            };
+            let (fs, rel) = self.resolve(&probe)?;
             match fs.read_link(&rel) {
                 Ok(target) => {
-                    current = if target.starts_with('/') {
-                        normalize(&target, "/")
-                    } else {
-                        let parent = parent_of(&current);
-                        normalize(&target, &parent)
-                    };
+                    links += 1;
+                    if links > 40 {
+                        return Err(Errno::ELOOP);
+                    }
+                    if target.starts_with('/') {
+                        out.clear();
+                    }
+                    for tc in target.split('/').filter(|s| !s.is_empty()).rev() {
+                        pending.push(tc.to_string());
+                    }
                 }
-                Err(_) => return fs.open(&rel, flags, mode),
+                // `EINVAL` from `read_link` means the component exists and is
+                // not a symlink; a missing final component is left for the
+                // caller to create or report.
+                Err(Errno::EINVAL) => out.push(c),
+                Err(Errno::ENOENT) if is_final => out.push(c),
+                Err(e) => return Err(e),
             }
         }
-        Err(Errno::ELOOP)
+        Ok(format!("/{}", out.join("/")))
+    }
+
+    /// Open a path, following symlinks up to a bounded depth.
+    pub fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        // O_NOFOLLOW and O_PATH are not modelled; a symlink is always
+        // followed, which is what every caller here wants.
+        let real = self.canonicalize(path, true)?;
+        let (fs, rel) = self.resolve(&real)?;
+        fs.open(&rel, flags, mode)
     }
 
     pub fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
-        let mut current = normalize(path, &self.cwd);
-        for _ in 0..40 {
-            let (fs, rel) = self.resolve(&current)?;
-            match fs.read_link(&rel) {
-                Ok(target) => {
-                    current = if target.starts_with('/') {
-                        normalize(&target, "/")
-                    } else {
-                        normalize(&target, &parent_of(&current))
-                    };
-                }
-                Err(_) => return fs.metadata(&rel),
-            }
-        }
-        Err(Errno::ELOOP)
+        let real = self.canonicalize(path, true)?;
+        let (fs, rel) = self.resolve(&real)?;
+        fs.metadata(&rel)
     }
 
     /// Metadata without following a final symlink, for `lstat`.
     pub fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
-        let (fs, rel) = self.resolve(path)?;
+        let real = self.canonicalize(path, false)?;
+        let (fs, rel) = self.resolve(&real)?;
         if let Ok(target) = fs.read_link(&rel) {
             return Ok(Metadata {
                 file_type: FileType::Symlink,
@@ -415,28 +470,33 @@ impl Vfs {
     }
 
     pub fn read_link(&self, path: &str) -> Result<String, Errno> {
-        let (fs, rel) = self.resolve(path)?;
+        let real = self.canonicalize(path, false)?;
+        let (fs, rel) = self.resolve(&real)?;
         fs.read_link(&rel)
     }
 
     pub fn unlink(&self, path: &str) -> Result<(), Errno> {
-        let (fs, rel) = self.resolve(path)?;
+        let real = self.canonicalize(path, false)?;
+        let (fs, rel) = self.resolve(&real)?;
         fs.unlink(&rel)
     }
 
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
-        let (fs, rel) = self.resolve(path)?;
+        let real = self.canonicalize(path, false)?;
+        let (fs, rel) = self.resolve(&real)?;
         fs.mkdir(&rel, mode)
     }
 
     pub fn rmdir(&self, path: &str) -> Result<(), Errno> {
-        let (fs, rel) = self.resolve(path)?;
+        let real = self.canonicalize(path, false)?;
+        let (fs, rel) = self.resolve(&real)?;
         fs.rmdir(&rel)
     }
 
     pub fn rename(&self, from: &str, to: &str) -> Result<(), Errno> {
-        let (fs, rel_from) = self.resolve(from)?;
-        let (fs_to, rel_to) = self.resolve(to)?;
+        let (from, to) = (self.canonicalize(from, false)?, self.canonicalize(to, false)?);
+        let (fs, rel_from) = self.resolve(&from)?;
+        let (fs_to, rel_to) = self.resolve(&to)?;
         // Crossing a mount boundary needs a copy, which Linux also refuses.
         if !Arc::ptr_eq(fs, fs_to) {
             return Err(Errno::EXDEV);
@@ -445,7 +505,8 @@ impl Vfs {
     }
 
     pub fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
-        let (fs, rel) = self.resolve(path)?;
+        let real = self.canonicalize(path, true)?;
+        let (fs, rel) = self.resolve(&real)?;
         fs.chmod(&rel, mode)
     }
 
@@ -453,8 +514,9 @@ impl Vfs {
     /// a hard link is a second directory entry for the same inode, and an
     /// inode does not span mounts.
     pub fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
-        let (fs, rel_from) = self.resolve(from)?;
-        let (fs_to, rel_to) = self.resolve(to)?;
+        let (from, to) = (self.canonicalize(from, false)?, self.canonicalize(to, false)?);
+        let (fs, rel_from) = self.resolve(&from)?;
+        let (fs_to, rel_to) = self.resolve(&to)?;
         if !Arc::ptr_eq(fs, fs_to) {
             return Err(Errno::EXDEV);
         }
@@ -463,12 +525,14 @@ impl Vfs {
 
     /// Create a filesystem node for a bound UNIX socket.
     pub fn mksocket(&self, path: &str) -> Result<(), Errno> {
-        let (fs, rel) = self.resolve(path)?;
+        let real = self.canonicalize(path, false)?;
+        let (fs, rel) = self.resolve(&real)?;
         fs.mksocket(&rel)
     }
 
     pub fn symlink(&self, target: &str, path: &str) -> Result<(), Errno> {
-        let (fs, rel) = self.resolve(path)?;
+        let real = self.canonicalize(path, false)?;
+        let (fs, rel) = self.resolve(&real)?;
         fs.symlink(target, &rel)
     }
 

@@ -10,7 +10,7 @@
 //! the *kernel* performs on the guest's behalf does check them.
 
 use crate::errno::{Errno, SysResult};
-use gex_abi::{GUEST_LIMIT, MMAP_AUTO_TOP, MMAP_BOTTOM, MMAP_TOP};
+use gex_abi::{MMAP_AUTO_TOP, MMAP_BOTTOM, MMAP_TOP};
 
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -397,7 +397,14 @@ impl MemoryMap {
                 return Err(Errno::EINVAL);
             }
             let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
-            if end > GUEST_LIMIT {
+            // The guest may not map above the dispatch directory's reach
+            // ([`MMAP_TOP`]): the wasm memory is backed higher (to
+            // [`GUEST_LIMIT`], just under 4 GiB), but code mapped past
+            // `MMAP_TOP` has no directory entry and cannot be translated. A
+            // 64-bit Wine probes the address space and lays its modules and
+            // stacks against whatever ceiling it finds, so the ceiling it
+            // finds has to be the reach, or it maps code gex cannot run.
+            if end > MMAP_TOP {
                 return Err(Errno::ENOMEM);
             }
             // `MAP_FIXED_NOREPLACE` must not disturb anything already there:
@@ -436,7 +443,7 @@ impl MemoryMap {
         // An address hint is honoured when the range happens to be free.
         if addr != 0 && addr.is_multiple_of(PAGE_SIZE) {
             let end = addr.saturating_add(len);
-            if end <= GUEST_LIMIT && self.is_free(addr, end) && self.ensure_backed(end).is_ok() {
+            if end <= MMAP_TOP && self.is_free(addr, end) && self.ensure_backed(end).is_ok() {
                 self.insert_from(addr, end, prot, name, origin);
                 return Ok(addr);
             }
@@ -528,7 +535,7 @@ impl MemoryMap {
             return Ok((addr, false));
         }
         let grown = addr + new_len;
-        if grown <= GUEST_LIMIT && self.is_free(addr + old_len, grown) {
+        if grown <= MMAP_TOP && self.is_free(addr + old_len, grown) {
             self.insert(addr + old_len, grown, v.prot, &v.name);
             return Ok((addr, false));
         }

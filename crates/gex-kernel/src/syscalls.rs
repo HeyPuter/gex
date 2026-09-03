@@ -496,8 +496,6 @@ pub struct Kernel {
     /// Sockets by handle address, so a descriptor can be got back to the
     /// concrete socket the network syscalls need.
     pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
-    /// The same trick for unix sockets, which are a different concrete type.
-    pub unix_sockets: std::collections::HashMap<usize, Arc<unix::UnixSocket>>,
     /// The same, for the ones that live in the global kernel. Two tables
     /// rather than a trait object because the calls that need the concrete
     /// type -- `accept`, `has_pending`, descriptor passing -- are exactly the
@@ -769,6 +767,12 @@ pub fn poll_revents(p: &PollFd) -> u16 {
     // stored "not writable" never moved once the reader drained the buffer.
     if p.events & POLLOUT != 0 && p.writable && h.poll_writable() {
         r |= POLLOUT;
+    }
+    // POLLHUP is reported whether or not the caller asked for it, as Linux
+    // does. A hung-up socket is also readable (EOF), so leave POLLIN too.
+    const POLLHUP: u16 = 0x010;
+    if h.poll_hup() {
+        r |= POLLHUP;
     }
     r
 }
@@ -1076,7 +1080,6 @@ impl Kernel {
             net: None,
             resolver: Arc::new(net::Resolver::new()),
             sockets: Default::default(),
-            unix_sockets: Default::default(),
             remote_sockets: Default::default(),
             epolls: Default::default(),
             memfds: Default::default(),
@@ -1301,7 +1304,6 @@ impl Kernel {
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
             sockets: self.sockets.clone(),
-            unix_sockets: self.unix_sockets.clone(),
             remote_sockets: self.remote_sockets.clone(),
             epolls: self.epolls.clone(),
             memfds: self.memfds.clone(),
@@ -1983,9 +1985,38 @@ impl Kernel {
                 }
                 let secs = m.read_u64(req).ok()?;
                 let nanos = m.read_u64(req + 8).ok()?;
+                // An invalid timespec is an expired wait, not a long sleep.
+                // Wine computes a relative timeout as `deadline - now`; when
+                // the deadline has already passed -- routine here, since gex's
+                // JIT makes real time outrun a short Windows timeout -- that
+                // difference is negative (huge unsigned seconds) or carries a
+                // denormal `tv_nsec >= 1e9`. Linux answers EINVAL; the old
+                // `secs.min(60)` instead slept a full minute, so every expired
+                // wait cost 60s and the guest crawled. Treat it as "time's up"
+                // and let the syscall return at once (Ok(0)).
+                if (secs as i64) < 0 || nanos >= 1_000_000_000 {
+                    return None;
+                }
+                // `TIMER_ABSTIME` (clock_nanosleep flag bit 0): the value is a
+                // deadline on the clock, not a duration -- sleep the time that
+                // is left, or return now if it has passed.
+                let total_ns = secs as u128 * 1_000_000_000 + nanos as u128;
+                let dur_ns = if n == nr::CLOCK_NANOSLEEP && a[1] & 1 != 0 {
+                    let (cs, cn) = (self.clock)();
+                    let now_ns = cs as u128 * 1_000_000_000 + cn as u128;
+                    match total_ns.checked_sub(now_ns) {
+                        Some(d) if d > 0 => d,
+                        _ => return None,
+                    }
+                } else {
+                    total_ns
+                };
+                // Cap for signal-interruptibility (see the host sleep loop),
+                // but on the real remaining time, never on a stale absolute one.
+                let dur_ns = dur_ns.min(60_000_000_000);
                 Some(BlockOp::Sleep(std::time::Duration::new(
-                    secs.min(60),
-                    (nanos % 1_000_000_000) as u32,
+                    (dur_ns / 1_000_000_000) as u64,
+                    (dur_ns % 1_000_000_000) as u32,
                 )))
             }
             _ => None,
@@ -4502,6 +4533,26 @@ impl Kernel {
             let n = file.pread(offset, &mut tmp)? as usize;
             m.zero(start, len_aligned as usize)?;
             m.write(start, &tmp[..n])?;
+            // KUSER_SHARED_DATA.SystemCall (offset 0x308) tells Wine's PE
+            // syscall thunks which path to take: bit 0 set means "call the
+            // user-mode dispatcher at 0x7ffe1000" (which every process sets up
+            // for itself), clear means "issue a raw `syscall`". Wine sets the
+            // bit in the shared USD section, but gex maps that section as an
+            // eager per-process copy, so wineserver's write never reaches a
+            // client and the client falls to the raw path -- where its Windows
+            // syscall numbers (e.g. 0xe6 NtWaitForAlertByThreadId) collide with
+            // Linux ones (0xe6 = clock_nanosleep) and the guest wedges. gex has
+            // no seccomp/SIGSYS to redirect a raw syscall, so the dispatcher
+            // path is the only one that works: force the bit on in each mapper's
+            // own copy of the fixed USD page. The page is read-only to the
+            // guest, but writing it here (before it runs) is exactly what the
+            // shared section would have delivered.
+            if gex_abi::X86
+                && start <= 0x7ffe_0308
+                && 0x7ffe_0308 < start + len_aligned
+            {
+                let _ = m.write(0x7ffe_0308, &[1u8]);
+            }
             // A shared mapping is written back at `msync` and `munmap` (where
             // a program that never calls `msync` expects its changes to land).
             // An executable file mapping is a shared library arriving: tell the
@@ -4720,11 +4771,14 @@ impl Kernel {
         Ok(fd)
     }
 
-    /// The unix socket behind a descriptor, if it is one.
+    /// The unix socket behind a descriptor, if it is one. Recovered straight
+    /// from the handle `Arc`, so a socket that arrived over `SCM_RIGHTS` (which
+    /// this process never registered) is recognised just like one it opened.
     fn unix_of(&self, fd: i32) -> Result<Arc<unix::UnixSocket>, Errno> {
         let file = self.fds.get(fd)?;
-        let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.unix_sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+        Arc::clone(&file.handle)
+            .as_unix_socket()
+            .ok_or(Errno::ENOTSOCK)
     }
 
     /// The same for a socket that lives in the global kernel.
@@ -4756,14 +4810,11 @@ impl Kernel {
         Ok(())
     }
 
-    /// Put a unix socket in the descriptor table and remember the concrete
-    /// type, the way `sys_socket` does for an internet one.
+    /// Put a unix socket in the descriptor table.
     fn install_unix(&mut self, sock: Arc<unix::UnixSocket>, flags: u64, cloexec: bool) -> SysResult {
-        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
-        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let handle: Arc<dyn crate::vfs::FileHandle> = sock;
         let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
         let fd = self.fds.insert(file, cloexec)?;
-        self.unix_sockets.insert(key, sock);
         Ok(fd)
     }
 
