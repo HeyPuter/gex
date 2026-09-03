@@ -11684,3 +11684,104 @@ the GL_XOR logic-op demos, which are a genuine WebGPU ceiling.
 That is the broad statement that the pass's larger changes -- the scratch
 render target, the batch-touched resource classes, the un-gated uploads and
 maps -- did not cost anything elsewhere.
+
+## A compute shader may sample a texture (2026-09-03)
+
+Found by pushing Blender's rendered viewport, and much bigger than that
+application: **this driver had no support for sampling a texture from a
+compute shader at all**, and the failure was not a refusal. The pass that
+splits a combined `sampler2D` into the texture and sampler WebGPU wants ran
+only for the graphics stages, so a compute shader reached the SPIR-V emitter
+with its texture derefs lowered away and asserted there --
+
+```
+nir_to_spirv.c:4702: emit_tex: Assertion `var' failed.
+```
+
+-- which aborts the *application*. Binding a view for the compute stage was
+refused separately, and that latched the context. GL 4.3's compute shaders
+sample as freely as a fragment shader does, and a renderer that does its
+post-processing in compute does little else, so this was a large hole.
+
+What it took: the split pass runs for compute too, numbering its texture and
+sampler above the ranges the blocks and images already use (a dispatch has
+one bind group for everything, where the graphics stages have a set of their
+own); the compute state carries texture and sampler tables like a graphics
+shader; `set_sampler_views` and `bind_sampler_states` accept the compute
+stage; and `launch_grid` binds both.
+
+The split pass also had to stop **skipping a tex instruction that already has
+a texture deref**. The comment there assumed st/mesa always lowers them away
+-- true for the graphics stages, false for compute -- and the deref it leaves
+names the combined variable the pass then retires, so it dangles:
+
+```
+deref_var &combined_tx (uniform sampler2D) error: entry
+NIR validation failed after nir_remove_dead_variables
+```
+
+Those are repointed at the texture half, with the unused derefs cleared
+before the variables they name are removed. Blender has five such samplers in
+one compute shader.
+
+`gl44-compute-texture-probe` covers the three shapes that have to work: a
+filtered sample, a `texelFetch` (no sampler, a different WGSL binding shape),
+and a 2D *array* sample, where the view dimension the layout names must match
+the shader's. 3/3 natively and in the browser.
+
+### Storage-format promotion, and the conflict that decides it
+
+`GEX_WGPU_PROMOTE_STORAGE=1` widens `R16_FLOAT` to `R32_FLOAT` and
+`R11G11B10_FLOAT` to `R16G16B16A16_FLOAT` through the same
+`gex_wgpu_format_backing` machinery the 16-bit normalized formats use, so
+that both can be storage textures. The NIR image format is promoted with the
+texture, or the WGSL declaration, the bind group layout and the view would
+disagree -- and `r16float` is not a WGSL storage format at all, so naming the
+narrow one would not compile.
+
+**It is off by default, and the memory is not why.** Measured: a SuperTuxKart
+race peaks at 1571 MiB of video memory with it and 1563 MiB without -- half a
+percent -- because these formats live in shaders rather than in the large
+textures that dominate a scene. And it earns something real: without it,
+selecting Blender's rendered viewport fails a shader link and Blender dumps
+core on the null program.
+
+What keeps it off is a **direct conflict with format reinterpretation**, and
+this settles the question the earlier section left open. Widening is *per
+format*: promoting `R16_FLOAT` stores every one of them as four bytes, so a
+colour target viewing an `R16_FLOAT` texture as `R16_UINT` is no longer
+looking at two bytes per texel and the copy that serves it has nothing to
+preserve. `gl44-target-view` -- Blender's own pair -- goes from **3/3 to 0/3**
+with the switch on. The probe written earlier the same day caught it
+immediately, which is the argument for writing it.
+
+So the cheap option is not viable, not merely expensive: **only per-resource
+promotion can serve both**, recreating a texture with the wider backing when
+it is first bound as an image. The reinterpretation checks now compare the
+*stored* format rather than the Gallium one, so with the switch on that case
+is refused by name -- "surface reinterprets the format at another texel size"
+-- rather than quietly copying the wrong number of bytes.
+
+### What actually stops EEVEE, in the end
+
+With promotion on, Blender's rendered viewport reaches "Compiling EEVEE engine
+shaders" with its whole interface and viewport drawn -- from "dumps core
+before opening a window" to that. Four genuine platform limits stop it there,
+and none of them is a driver defect:
+
+1. **Image atomics.** ntv emits `OpImageTexelPointer`, whose result lives in
+   SPIR-V storage class Image, and Tint reports `unknown SPIR-V storage
+   class: 11`. WGSL has no atomic operation on a texture in any form.
+2. **A read-write image at 16 bits.** WebGPU allows `read_write` storage only
+   on r32uint/r32sint/r32float, and EEVEE's `color_accum_img` is read *and*
+   written.
+3. **`workgroupBarrier` in non-uniform control flow**, which WGSL forbids and
+   GLSL permits. Hoisting it would change what the shader means.
+4. **A dual-source blend output shape** Tint rejects: `@blend_src` on one
+   member of a structure while another member with `@location` has none.
+
+The barrier *semantics* problem next to these was ours and is fixed: zink
+turns `nir_var_mem_global` into `CrossWorkgroupMemory`, which Tint refuses
+(`unsupported control barrier semantics: 512`), so global now folds into ssbo
+-- which is what the memory is here. That is a general translation fix; the
+four above are the platform.
