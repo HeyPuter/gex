@@ -11493,3 +11493,81 @@ line), but a real app that renders through an sRGB view of a storage-capable
 texture would hit it, and the driver currently refuses colour-target
 reinterpretation outright rather than copying. That is the next thing to
 measure in a real app run.
+
+## Blender 5.2 renders (2026-09-03)
+
+The last of the named target applications that had never drawn anything now
+matches the system Mesa on the same window: mean 60 with 482 colours to its
+484. The menu bar, every tab label, the splash screen's two file lists, the
+outliner tree, all eleven properties panels with their values, and a viewport
+with grid, axes, camera and navigation gizmo. No refusals and no WebGPU
+errors in the run.
+
+Six separate defects stood between "dumps core before opening a window" and
+that, and **not one of them reported anything**. They are worth listing in
+order, because the order is the lesson:
+
+1. **A refusal killed the process.** The refusal latch is never cleared, and
+   `buffer_map` was gated on it. Mesa turns a NULL map into
+   `GL_OUT_OF_MEMORY`, applications dereference the result, and the crash
+   lands in application code with nothing of this driver's in the backtrace.
+   A colour-target refusal Blender would have survived with one wrong panel
+   killed it instead. Maps and every upload path now proceed regardless;
+   draws, clears and dispatches stay latched, which is what the latch is for.
+
+2. **Only the first refusal was ever printed.** That one hid the fatal one:
+   the log named the colour target and said nothing about the map. Every
+   *distinct* site is now reported.
+
+3. **A colour target whose surface reinterprets the format** latched the
+   context, which stopped every draw after it -- so the window froze on a
+   half-painted frame. Blender reinterprets three targets (`r16_uint` over
+   `r16_float`, `r16g16_float` over `r32_float`, `r16g16b16a16_float` over
+   `r32g32_float`), and the earlier attempt to drop the attachment instead
+   segfaulted because that left nothing to draw into. It now renders into a
+   scratch texture of the surface's format, copied in at bind and back at
+   every submit -- the same byte-preserving trick the cross-class sampler
+   views use. Only a pair that changes the *texel size* is still refused.
+
+4. **`GL_POLYGON_SMOOTH` refused the whole rasterizer state**, which binds as
+   NULL and so loses culling and the scissor as well. WebGPU has no coverage
+   antialiasing, so it is ignored now; Blender enables it while drawing its
+   interface.
+
+5. **An unbound storage block was bound with size 0**, and WebGPU reads an
+   explicit zero as a zero-byte binding. That invalidated the bind group,
+   then the command buffer, then the whole submit -- every draw batched with
+   it lost. Found by grepping the log for validation errors, per the lesson
+   below.
+
+6. **The storage-block slot fell back to the GLSL `binding =` qualifier**
+   when Mesa left `driver_location` unset, which the fragment halves of
+   Blender's shaders do. Blender numbers those 0, 1 and 7, so its third block
+   was looked for at slot 7 while st had bound it at slot 2, and the shader
+   silently read the zero placeholder. Enumeration order is the block order.
+
+7. **Storage buffers, buffer textures and shader images were missing from the
+   batch-touched list.** An untouched resource reports no conflict, so
+   `buffer_subdata` and the unmap upload were free to replace its bytes while
+   draws that read them were still unsubmitted -- and `wgpuQueueWriteBuffer`
+   is ordered against the following submit, so the *last* write is what every
+   batched draw reads. Blender rewrites a 128-glyph storage buffer whole
+   before each label's draw, so each frame kept only the final label:
+   "Delta Transform" rendered as "orm", "Scene Collection" as "tion". This is
+   the SuperTuxKart vertex-buffer failure the note on
+   `gex_wgpu_batch_conflicts_usage` already describes, reached through three
+   resource classes that note did not cover.
+
+**The two instruments that mattered**, out of everything tried: grepping the
+browser (or Dawn) log for validation errors, which found 5 in one line after
+the earlier sRGB investigation had spent two passes learning to do it; and
+comparing against the *same application* on the system Mesa, which is what
+turned "the text looks odd" into "these exact labels are missing their
+leading glyphs, and the last one in each group is intact" -- the observation
+that names a per-batch overwrite rather than a font problem.
+
+**What is left on Blender**: nothing known. The remaining two-colour
+difference against the reference is most likely the ignored polygon
+smoothing. Its viewport was previously documented here as blocked on a
+WebGPU ceiling for format reinterpretation on a render target; that is now
+implemented, so the note above it is superseded.
