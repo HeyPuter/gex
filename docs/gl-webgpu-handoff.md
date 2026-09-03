@@ -9854,3 +9854,109 @@ every rung complete: it looked for `ver_4_N:` labels, `version.c` has
 `const bool ver_4_N = (...)` expressions, and an empty requirement list reads
 as nothing missing. A measurement tool that cannot find its input has to say
 so, so it now exits rather than printing a clean sheet.
+
+## GL 4.0. Tessellation works.
+
+`gl44-tessellation-probe` is **12/12** against llvmpipe, every pinned value
+matched, and the driver now reports:
+
+    OpenGL core profile version string: 4.0 (Core Profile)
+    OpenGL core profile shading language version string: 4.00
+
+`tests/gl-version-ladder.sh` says `GL 4.0: ** COMPLETE **`.
+
+**What that buys is not the number.** Mesa clamps the usable GLSL version to
+the *granted* GL version, so until this landed nothing could declare above
+`#version 330` however high `caps->glsl_feature_level` was set. GLSL 400 is now
+reachable, which is what modern application shaders actually need.
+
+### Five passes
+
+WebGPU has no tessellation stage, and unlike the geometry stage there is a
+**fixed-function piece in the middle**. So:
+
+1. the application's vertex shader, as compute, writing the control shader's
+   inputs -- the geometry path's first pass, unchanged;
+2. the **control shader as compute: one workgroup per patch, `vertices_out`
+   invocations in it**. That shape is the whole reason for it: `barrier()` is
+   then a workgroup barrier and needs no rewriting, `gl_InvocationID` is the
+   local invocation index, and one patch's invocations can read each other's
+   outputs -- which is what a control shader is *for*;
+3. **the tessellator, on the CPU**, from the levels pass 2 wrote;
+4. the evaluation shader as compute, one invocation per generated vertex;
+5. an ordinary indexed draw of what pass 4 wrote, through the geometry path's
+   passthrough vertex shader.
+
+### Pass 3 is a stall, and it is the right answer anyway
+
+Reading the levels back is a GPU-to-CPU round trip per draw. It is also the
+only honest option available: the topology depends on numbers a *shader*
+computed, and there is no way to know how many vertices a patch will generate
+without them.
+
+What makes it more than acceptable is *which* tessellator:
+`src/gallium/auxiliary/tessellator` is the same implementation llvmpipe uses.
+The generated mesh is therefore **identical** to the reference rather than
+merely similar -- which is why the probe can pin exact pixel values across all
+three spacings and a mixed set of levels and have them match. A WGSL port would
+have had to reproduce §11.2.2 of the specification exactly to reach the same
+place.
+
+It had to be moved out of meson's `draw_with_llvm` block to be reachable. It
+has no LLVM dependency -- `u_math`, `u_memory`, `p_defines` and `<cmath>` --
+and was only in there because the draw module was its only consumer, so
+`p_tess_init` was simply absent from a build without gallivm.
+
+### Three traps, and one of them is a naming lie
+
+**`p_tess_init`'s third argument is spelled `tes_vertex_order_cw` and behaves
+as counter-clockwise.** The draw module passes `!shader->vertex_order_cw` into
+it (`draw_tess.c:365`). Passing GL's `cw` straight in inverts every generated
+triangle -- the driver drew the `cw` patch and culled the `ccw` one, exactly
+backwards, with the flag reaching the tessellator correctly all along.
+
+What made that findable in one run is that the probe has **both** cases with
+the same culling. A single `cw` case can only say "wrong"; "ignored" and
+"inverted" are the same failure until something distinguishes them, and they
+have completely different causes.
+
+**`caps->glsl_tess_levels_as_inputs` is not a preference.** `gl_nir_linker`
+asserts on the combination of `ARB_tessellation_shader`, `compact_arrays`
+(which this driver's NIR options set) and that cap being false -- "the NIR
+linker doesn't support linking these as compat arrays of sysvals" -- and it
+fires during *linking*, so the first tessellated program aborts the process. It
+is also the shape this driver wants: a patch input is a variable with a
+location, which the lowering already addresses; a system value would be an
+intrinsic with no buffer behind it.
+
+**Both tessellation stages needed permission to hold constant buffers.**
+`gex_wgpu_set_constant_buffer` refused every stage but vertex, fragment and
+geometry, and a refusal latches. A control shader computing its levels from a
+uniform is the ordinary case, not a corner, so the first real tessellation
+program produced "first refusal at gex_wgpu_set_constant_buffer" and then
+`GL_OUT_OF_MEMORY` out of every `glReadPixels`, with nothing said about
+tessellation at all.
+
+### What it does not do yet
+
+Named refusals rather than silence, all through `GEX_TESS_DECLINE`
+(`GEX_WGPU_TESS_LOG=1` prints what each draw was handed): an indexed or
+instanced patch draw, a geometry shader after tessellation, and a patch draw
+with no control shader (GL allows the control stage to be absent, with the
+levels coming from `GL_PATCH_DEFAULT_OUTER_LEVEL`). Transform feedback from a
+tessellation stage is not captured, on the same terms as the geometry stage's.
+
+### The ladder now
+
+| rung | missing |
+|---|---|
+| **4.0** | **complete** |
+| 4.1 | `shader_precision`, `viewport_array`, a GLSL 410 cap |
+| 4.2 | a GLSL 420 cap |
+| 4.3 | `copy_image`, `fragment_layer_viewport`, `framebuffer_no_attachments`, `robust_buffer_access_behavior`, `texture_view`, a GLSL 430 cap |
+| 4.4 | `buffer_storage`, `enhanced_layouts`, `query_buffer_object`, `texture_mirror_clamp_to_edge`, `vertex_type_10f_11f_11f_rev`, a GLSL 440 cap |
+
+`ARB_shader_precision` is a pure GLSL-410 lever, so 4.1 is really
+`ARB_viewport_array` plus a cap bump -- and `ARB_fragment_layer_viewport` (4.3)
+comes from the same cap, which makes multiple viewports the next thing worth
+doing.

@@ -309,6 +309,13 @@ int main(void) {
          * nothing. */
         {"quad-cw", set_all,
          "layout(quads, equal_spacing, cw) in;", quad_pos, 4.0f, 0, 0, 0, 0},
+        /* The control for it: the same draw, the same culling, the default
+         * winding. Without this pair a driver that ignores the winding and a
+         * driver that inverts it look identical -- one case can only say
+         * "wrong", not which way. */
+        {"quad-ccw", set_all,
+         "layout(quads, equal_spacing, ccw) in;", quad_pos, 4.0f,
+         140, 220, 1, 1},
     };
 
     for (unsigned t = 0; t < sizeof(tests) / sizeof(tests[0]); ++t) {
@@ -327,7 +334,7 @@ int main(void) {
             glPatchParameteri(GL_PATCH_VERTICES, 4);
             /* Culling on for the winding case and off otherwise: `cw` is only
              * observable through it. */
-            if (strcmp(tests[t].name, "quad-cw") == 0) {
+            if (strncmp(tests[t].name, "quad-c", 6) == 0) {
                 glEnable(GL_CULL_FACE);
                 glCullFace(GL_BACK);
                 glFrontFace(GL_CCW);
