@@ -1381,7 +1381,15 @@ impl Kernel {
                 // the parent's register file here, so say it up front.
                 m.write_u64(child + ctx::TPIDRRO as u64, base)?;
             } else {
+                // Linux's CLONE_SETTLS is ARCH_SET_FS for the child: the base
+                // is `tls` and the fs *selector* becomes null, so a later
+                // set_thread_area on the entry the parent's 32-bit code had
+                // in %fs (Wine's alloc_fs_sel in a new WoW64 thread) does not
+                // reload this thread's 64-bit fs base from that descriptor.
                 m.write_u64(child + ctx::TPIDR as u64, tls)?;
+                if gex_abi::X86 {
+                    m.write_u32(child + ctx::SEG as u64 + crate::x86::SEG_FS as u64 * 4, 0)?;
+                }
             }
         }
         if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
@@ -5641,9 +5649,27 @@ impl Kernel {
         const ARCH_SET_FS: u64 = 0x1002;
         const ARCH_GET_FS: u64 = 0x1003;
         const ARCH_GET_GS: u64 = 0x1004;
+        // Setting a base through arch_prctl also loads the *null selector*
+        // into that segment register, as Linux does (arch/x86/kernel/process_64.c).
+        // That matters for set_thread_area, which reloads fs/gs from a TLS
+        // descriptor only while the register still holds that descriptor's
+        // selector: a WoW64 thread comes back from 32-bit code with %fs =
+        // the 32-bit TLS selector, restores its 64-bit base with ARCH_SET_FS,
+        // and then rewrites that TLS entry for the 32-bit TEB. With the
+        // selector left behind, the rewrite repointed the live 64-bit fs base
+        // at the 32-bit TEB and glibc's TLS (pthread_getspecific) read junk.
+        let seg = |m: &mut GuestMem<'_>, seg: u8| {
+            m.write_u32(self.ctx_addr + ctx::SEG as u64 + seg as u64 * 4, 0)
+        };
         match code {
-            ARCH_SET_FS => m.write_u64(self.ctx_addr + ctx::FS_BASE as u64, addr)?,
-            ARCH_SET_GS => m.write_u64(self.ctx_addr + ctx::GS_BASE as u64, addr)?,
+            ARCH_SET_FS => {
+                m.write_u64(self.ctx_addr + ctx::FS_BASE as u64, addr)?;
+                seg(m, crate::x86::SEG_FS)?;
+            }
+            ARCH_SET_GS => {
+                m.write_u64(self.ctx_addr + ctx::GS_BASE as u64, addr)?;
+                seg(m, crate::x86::SEG_GS)?;
+            }
             ARCH_GET_FS => {
                 let v = m.read_u64(self.ctx_addr + ctx::FS_BASE as u64)?;
                 m.write_u64(addr, v)?;
@@ -6620,6 +6646,34 @@ mod tests {
         set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_DONTWAIT]);
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, k.ctx_addr), -(Errno::EAGAIN.0 as i64));
+    }
+
+    /// `arch_prctl(ARCH_SET_FS)` nulls the fs selector like Linux, so a
+    /// following `set_thread_area` on the TLS entry that selector named does
+    /// not reload the 64-bit base (Wine's WoW64 new-thread start relies on
+    /// this: alloc_fs_sel rewrites the 32-bit TLS entry while glibc's TLS
+    /// must stay on the 64-bit base).
+    #[test]
+    fn arch_prctl_set_fs_nulls_selector() {
+        use crate::x86::{self, SEG_FS, TLS_ENTRY_MIN};
+        const ARCH_SET_FS: u64 = 0x1002;
+        let (mut buf, mut k) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        let ctx_addr = k.ctx_addr;
+        // 32-bit code left %fs on TLS entry 12 (selector 0x63) with some base.
+        x86::set_tls(&mut m, ctx_addr, TLS_ENTRY_MIN, 0x2000);
+        x86::load_segment(&mut m, ctx_addr, &[], SEG_FS, (TLS_ENTRY_MIN << 3) | 3);
+        assert_eq!(m.read_u64(ctx_addr + ctx::FS_BASE as u64).unwrap(), 0x2000);
+
+        set_args(&mut m, ctx_addr, nr::ARCH_PRCTL, &[ARCH_SET_FS, 0x8000]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, ctx_addr), 0);
+        assert_eq!(m.read_u64(ctx_addr + ctx::FS_BASE as u64).unwrap(), 0x8000);
+        assert_eq!(x86::selector(&m, ctx_addr, SEG_FS), 0, "selector must be null");
+
+        // Rewriting the entry must leave the 64-bit base alone now.
+        x86::set_tls(&mut m, ctx_addr, TLS_ENTRY_MIN, 0x3000);
+        assert_eq!(m.read_u64(ctx_addr + ctx::FS_BASE as u64).unwrap(), 0x8000);
     }
 
     #[test]
