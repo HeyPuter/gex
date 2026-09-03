@@ -9645,3 +9645,52 @@ passes, but SPIR-V's `InstanceIndex` counts from it while GL's `gl_InstanceID`
 counts from zero. Advancing each instance-step vertex buffer by
 `base * arrayStride` instead of passing `firstInstance` keeps `gl_InstanceID`
 correct with no shader change.
+
+## ARB_base_instance: GL 4.2 complete
+
+`glDrawArraysInstancedBaseInstance` works, and **GL 4.2 now has nothing
+missing**. `gl44-base-instance-probe` 3/3 against llvmpipe.
+
+The feature is two claims that fail in opposite directions, which is why the
+probe reads them separately:
+
+- per-instance attributes are fetched starting at the base instance
+- `gl_InstanceID` still counts from **zero**
+
+WebGPU's draw takes a `firstInstance`, and this driver was already passing
+GL's base through it -- which gets the attributes right and `gl_InstanceID`
+wrong, because SPIR-V's `InstanceIndex` *counts from* `firstInstance`. That is
+exactly why the cap had been left off, with a comment saying the two "must
+move together".
+
+They do, but not in the shader. **The base is folded into the offsets of the
+instance-stepped vertex buffers** -- `offset += start_instance * arrayStride`
+-- and the draw is issued from instance zero. The fetch then starts where GL
+says and the builtin still counts from zero, with no shader change and no
+per-draw uniform. A gathered slot is left alone, since the de-indexing gather
+has already resolved the draw's addressing.
+
+The buffer-overrun check above the bind loop still computes
+`start_instance + instance_count - 1`, which stays correct: it bounds the
+*absolute* last element against the buffer, and folding the base into the
+offset does not move where that element lives.
+
+The probe's colour comes from a per-instance attribute and its position from
+`gl_InstanceID`, so a driver that passes the base through draws the right
+colours in the wrong places, and one that ignores the base draws the wrong
+colours in the right places.
+
+### The ladder now
+
+| rung | missing |
+|---|---|
+| **4.0** | `tessellation_shader`, `texture_buffer_object_rgb32` |
+| 4.1 | `shader_precision` (GLSL 410 alone), `viewport_array` |
+| **4.2** | **complete** |
+| 4.3 | 7 |
+| 4.4 | 6 |
+
+Seventeen extensions to 4.4, from twenty-six. `ARB_shader_precision` is
+another pure GLSL-level item -- raising the cap to 410 grants it -- which
+would leave 4.1 wanting only `ARB_viewport_array`, and WebGPU has a single
+viewport.
