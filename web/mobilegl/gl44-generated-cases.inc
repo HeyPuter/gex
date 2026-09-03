@@ -140,7 +140,7 @@ case 1045: {
     glBindSamplers(first, count, bytes ? names.data() : nullptr);
     break;
 }
-case 1047: {
+case 1048: {
     GLuint first = a.u32();
     GLsizei count = a.i32();
     uint32_t bytes = 0;
@@ -156,7 +156,7 @@ case 1047: {
     GEX_GL_CALL(glBindTextures, first, count, bytes ? host.data() : nullptr);
     break;
 }
-case 1050: {
+case 1051: {
     GLuint bindingindex = a.u32();
     GLuint buffer = a.u32();
     GLintptr offset = a.i64();
@@ -164,7 +164,7 @@ case 1050: {
     GEX_GL_CALL(glBindVertexBuffer, bindingindex, lookup(buffers, buffer), offset, stride);
     break;
 }
-case 1051: {
+case 1052: {
     GLuint first = a.u32(); GLsizei count = a.i32();
     uint32_t name_bytes = 0, offset_bytes = 0, third_bytes = 0;
     const uint8_t *name_wire = a.blob(name_bytes);
@@ -188,20 +188,20 @@ case 1051: {
                 name_bytes ? strides.data() : nullptr);
     break;
 }
-case 1055: {
+case 1056: {
     GLuint buf = a.u32();
     GLenum modeRGB = a.u32();
     GLenum modeAlpha = a.u32();
     GEX_GL_CALL(glBlendEquationSeparatei, buf, modeRGB, modeAlpha);
     break;
 }
-case 1056: {
+case 1057: {
     GLuint buf = a.u32();
     GLenum mode = a.u32();
     GEX_GL_CALL(glBlendEquationi, buf, mode);
     break;
 }
-case 1059: {
+case 1060: {
     GLuint buf = a.u32();
     GLenum srcRGB = a.u32();
     GLenum dstRGB = a.u32();
@@ -210,14 +210,14 @@ case 1059: {
     GEX_GL_CALL(glBlendFuncSeparatei, buf, srcRGB, dstRGB, srcAlpha, dstAlpha);
     break;
 }
-case 1060: {
+case 1061: {
     GLuint buf = a.u32();
     GLenum src = a.u32();
     GLenum dst = a.u32();
     GEX_GL_CALL(glBlendFunci, buf, src, dst);
     break;
 }
-case 1063: {
+case 1065: {
     GLenum target = a.u32(); uint64_t size = a.u64(); GLbitfield flags = a.u32();
     const bool has_data = a.u32() != 0; uint32_t bytes = 0;
     const uint8_t *wire = a.blob(bytes);
@@ -226,13 +226,13 @@ case 1063: {
     GEX_GL_CALL(glBufferStorage, target, (GLsizeiptr)size, has_data ? wire : nullptr, flags);
     break;
 }
-case 1066: {
+case 1069: {
     GLenum target = a.u32();
     GLenum clamp = a.u32();
     GEX_GL_CALL(glClampColor, target, clamp);
     break;
 }
-case 1068: {
+case 1071: {
     GLenum target = a.u32();
     GLenum internalformat = a.u32();
     GLenum format = a.u32();
@@ -245,7 +245,7 @@ case 1068: {
     GEX_GL_CALL(glClearBufferData, target, internalformat, format, type, bytes ? aligned.data() : nullptr);
     break;
 }
-case 1069: {
+case 1072: {
     GLenum target = a.u32();
     GLenum internalformat = a.u32();
     GLintptr offset = a.i64();
@@ -260,12 +260,12 @@ case 1069: {
     GEX_GL_CALL(glClearBufferSubData, target, internalformat, offset, size, format, type, bytes ? aligned.data() : nullptr);
     break;
 }
-case 1075: {
+case 1078: {
     GLdouble depth = a.f64();
     GEX_GL_CALL(glClearDepth, depth);
     break;
 }
-case 1078: {
+case 1087: {
     GLuint texture = a.u32();
     GLint level = a.i32();
     GLenum format = a.u32();
@@ -278,7 +278,7 @@ case 1078: {
     GEX_GL_CALL(glClearTexImage, lookup(textures, texture), level, format, type, bytes ? aligned.data() : nullptr);
     break;
 }
-case 1079: {
+case 1088: {
     GLuint texture = a.u32();
     GLint level = a.i32();
     GLint xoffset = a.i32();
@@ -297,7 +297,7 @@ case 1079: {
     GEX_GL_CALL(glClearTexSubImage, lookup(textures, texture), level, xoffset, yoffset, zoffset, width, height, depth, format, type, bytes ? aligned.data() : nullptr);
     break;
 }
-case 1082: {
+case 1092: {
     GLuint index = a.u32();
     GLboolean r = a.u32();
     GLboolean g = a.u32();
@@ -306,7 +306,7 @@ case 1082: {
     GEX_GL_CALL(glColorMaski, index, r, g, b, arg_a);
     break;
 }
-case 1084: {
+case 1094: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLenum internalformat = a.u32();
@@ -326,7 +326,7 @@ case 1084: {
     glCompressedTexImage1D(target, level, internalformat, width, border, imageSize, data);
     break;
 }
-case 1085: {
+case 1095: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLenum internalformat = a.u32();
@@ -347,7 +347,7 @@ case 1085: {
     glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
     break;
 }
-case 1086: {
+case 1096: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLenum internalformat = a.u32();
@@ -369,7 +369,7 @@ case 1086: {
     glCompressedTexImage3D(target, level, internalformat, width, height, depth, border, imageSize, data);
     break;
 }
-case 1087: {
+case 1097: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLint xoffset = a.i32();
@@ -389,7 +389,7 @@ case 1087: {
     glCompressedTexSubImage1D(target, level, xoffset, width, format, imageSize, data);
     break;
 }
-case 1088: {
+case 1098: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLint xoffset = a.i32();
@@ -411,7 +411,7 @@ case 1088: {
     glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
     break;
 }
-case 1089: {
+case 1099: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLint xoffset = a.i32();
@@ -435,7 +435,7 @@ case 1089: {
     glCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
     break;
 }
-case 1090: {
+case 1103: {
     GLenum readTarget = a.u32();
     GLenum writeTarget = a.u32();
     GLintptr readOffset = a.i64();
@@ -444,7 +444,7 @@ case 1090: {
     GEX_GL_CALL(glCopyBufferSubData, readTarget, writeTarget, readOffset, writeOffset, size);
     break;
 }
-case 1091: {
+case 1104: {
     GLuint srcName = a.u32();
     GLenum srcTarget = a.u32();
     GLint srcLevel = a.i32();
@@ -463,7 +463,7 @@ case 1091: {
     GEX_GL_CALL(glCopyImageSubData, lookup(textures, srcName), srcTarget, srcLevel, srcX, srcY, srcZ, lookup(textures, dstName), dstTarget, dstLevel, dstX, dstY, dstZ, srcWidth, srcHeight, srcDepth);
     break;
 }
-case 1092: {
+case 1106: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLenum internalformat = a.u32();
@@ -474,7 +474,7 @@ case 1092: {
     GEX_GL_CALL(glCopyTexImage1D, target, level, internalformat, x, y, width, border);
     break;
 }
-case 1093: {
+case 1107: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLenum internalformat = a.u32();
@@ -486,7 +486,7 @@ case 1093: {
     GEX_GL_CALL(glCopyTexImage2D, target, level, internalformat, x, y, width, height, border);
     break;
 }
-case 1094: {
+case 1108: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLint xoffset = a.i32();
@@ -496,7 +496,7 @@ case 1094: {
     GEX_GL_CALL(glCopyTexSubImage1D, target, level, xoffset, x, y, width);
     break;
 }
-case 1095: {
+case 1109: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLint xoffset = a.i32();
@@ -508,7 +508,7 @@ case 1095: {
     GEX_GL_CALL(glCopyTexSubImage2D, target, level, xoffset, yoffset, x, y, width, height);
     break;
 }
-case 1096: {
+case 1110: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLint xoffset = a.i32();
@@ -521,7 +521,7 @@ case 1096: {
     GEX_GL_CALL(glCopyTexSubImage3D, target, level, xoffset, yoffset, zoffset, x, y, width, height);
     break;
 }
-case 1107: {
+case 1133: {
     GLsizei count = a.i32();
     if (count < 0) { GEX_GL_CALL(glDeleteProgramPipelines, count, nullptr); break; }
     std::vector<GLuint> host; host.reserve((size_t)count);
@@ -532,13 +532,13 @@ case 1107: {
     GEX_GL_CALL(glDeleteProgramPipelines, count, host.data());
     break;
 }
-case 1118: {
+case 1144: {
     GLdouble n = a.f64();
     GLdouble f = a.f64();
     GEX_GL_CALL(glDepthRange, n, f);
     break;
 }
-case 1119: {
+case 1145: {
     GLuint first = a.u32();
     GLsizei count = a.i32();
     uint32_t v_bytes = 0;
@@ -554,38 +554,38 @@ case 1119: {
     GEX_GL_CALL(glDepthRangeArrayv, first, count, v);
     break;
 }
-case 1120: {
+case 1146: {
     GLuint index = a.u32();
     GLdouble n = a.f64();
     GLdouble f = a.f64();
     GEX_GL_CALL(glDepthRangeIndexed, index, n, f);
     break;
 }
-case 1125: {
+case 1152: {
     GLenum target = a.u32();
     GLuint index = a.u32();
     GEX_GL_CALL(glDisablei, target, index);
     break;
 }
-case 1126: {
+case 1153: {
     GLuint num_groups_x = a.u32();
     GLuint num_groups_y = a.u32();
     GLuint num_groups_z = a.u32();
     GEX_GL_CALL(glDispatchCompute, num_groups_x, num_groups_y, num_groups_z);
     break;
 }
-case 1127: {
+case 1154: {
     GLintptr indirect = a.i64();
     GEX_GL_CALL(glDispatchComputeIndirect, indirect);
     break;
 }
-case 1129: {
+case 1156: {
     GLenum mode = a.u32();
     const void *indirect = reinterpret_cast<const void *>(static_cast<uintptr_t>(a.u64()));
     GEX_GL_CALL(glDrawArraysIndirect, mode, indirect);
     break;
 }
-case 1131: {
+case 1158: {
     GLenum mode = a.u32();
     GLint first = a.i32();
     GLsizei count = a.i32();
@@ -594,39 +594,39 @@ case 1131: {
     GEX_GL_CALL(glDrawArraysInstancedBaseInstance, mode, first, count, instancecount, baseinstance);
     break;
 }
-case 1132: {
+case 1159: {
     GLenum buf = a.u32();
     GEX_GL_CALL(glDrawBuffer, buf);
     break;
 }
-case 1136: {
+case 1163: {
     GLenum mode = a.u32();
     GLenum type = a.u32();
     const void *indirect = reinterpret_cast<const void *>(static_cast<uintptr_t>(a.u64()));
     GEX_GL_CALL(glDrawElementsIndirect, mode, type, indirect);
     break;
 }
-case 1143: {
+case 1170: {
     GLenum mode = a.u32();
     GLuint id = a.u32();
     GEX_GL_CALL(glDrawTransformFeedback, mode, lookup(transform_feedbacks, id));
     break;
 }
-case 1144: {
+case 1171: {
     GLenum mode = a.u32();
     GLuint id = a.u32();
     GLsizei instancecount = a.i32();
     GEX_GL_CALL(glDrawTransformFeedbackInstanced, mode, lookup(transform_feedbacks, id), instancecount);
     break;
 }
-case 1145: {
+case 1172: {
     GLenum mode = a.u32();
     GLuint id = a.u32();
     GLuint stream = a.u32();
     GEX_GL_CALL(glDrawTransformFeedbackStream, mode, lookup(transform_feedbacks, id), stream);
     break;
 }
-case 1146: {
+case 1173: {
     GLenum mode = a.u32();
     GLuint id = a.u32();
     GLuint stream = a.u32();
@@ -634,39 +634,39 @@ case 1146: {
     GEX_GL_CALL(glDrawTransformFeedbackStreamInstanced, mode, lookup(transform_feedbacks, id), stream, instancecount);
     break;
 }
-case 1149: {
+case 1177: {
     GLenum target = a.u32();
     GLuint index = a.u32();
     GEX_GL_CALL(glEnablei, target, index);
     break;
 }
-case 1150: {
+case 1178: {
     GEX_GL_CALL(glEndConditionalRender, );
     break;
 }
-case 1151: {
+case 1179: {
     GLenum target = a.u32();
     GEX_GL_CALL(glEndQuery, target);
     break;
 }
-case 1152: {
+case 1180: {
     GLenum target = a.u32();
     GLuint index = a.u32();
     GEX_GL_CALL(glEndQueryIndexed, target, index);
     break;
 }
-case 1153: {
+case 1181: {
     GEX_GL_CALL(glEndTransformFeedback, );
     break;
 }
-case 1158: {
+case 1187: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
     GLint param = a.i32();
     GEX_GL_CALL(glFramebufferParameteri, target, pname, param);
     break;
 }
-case 1160: {
+case 1189: {
     GLenum target = a.u32();
     GLenum attachment = a.u32();
     GLuint texture = a.u32();
@@ -674,7 +674,7 @@ case 1160: {
     GEX_GL_CALL(glFramebufferTexture, target, attachment, lookup(textures, texture), level);
     break;
 }
-case 1161: {
+case 1190: {
     GLenum target = a.u32();
     GLenum attachment = a.u32();
     GLenum textarget = a.u32();
@@ -683,7 +683,7 @@ case 1161: {
     GEX_GL_CALL(glFramebufferTexture1D, target, attachment, textarget, lookup(textures, texture), level);
     break;
 }
-case 1163: {
+case 1192: {
     GLenum target = a.u32();
     GLenum attachment = a.u32();
     GLenum textarget = a.u32();
@@ -693,7 +693,7 @@ case 1163: {
     GEX_GL_CALL(glFramebufferTexture3D, target, attachment, textarget, lookup(textures, texture), level, zoffset);
     break;
 }
-case 1168: {
+case 1197: {
     GLsizei count = a.i32();
     if (count < 0) { GEX_GL_CALL(glGenProgramPipelines, count, nullptr); break; }
     std::vector<GLuint> host((size_t)count);
@@ -701,7 +701,7 @@ case 1168: {
     for (GLsizei i = 0; i < count; ++i) program_pipelines[a.u32()] = host[(size_t)i];
     break;
 }
-case 1176: {
+case 1206: {
     GLuint program = a.u32();
     GLuint bufferIndex = a.u32();
     GLenum pname = a.u32();
@@ -711,7 +711,7 @@ case 1176: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1188: {
+case 1218: {
     GLenum target = a.u32();
     GLuint index = a.u32();
     const uint32_t components = gexgl_state_query_components(target);
@@ -720,7 +720,7 @@ case 1188: {
     put_blob(values, components * sizeof(GLboolean));
     break;
 }
-case 1189: {
+case 1219: {
     GLenum pname = a.u32();
     const uint32_t components = gexgl_state_query_components(pname);
     std::vector<GLboolean> values(components);
@@ -728,7 +728,7 @@ case 1189: {
     put_blob(values.data(), components * sizeof(GLboolean));
     break;
 }
-case 1190: {
+case 1220: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = 1u;
@@ -737,7 +737,7 @@ case 1190: {
     put_blob(values, components * sizeof(GLint64));
     break;
 }
-case 1191: {
+case 1221: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = 1u;
@@ -746,14 +746,14 @@ case 1191: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1193: {
+case 1223: {
     GLenum target = a.u32(); GLintptr offset = (GLintptr)a.u64(); GLsizeiptr size = (GLsizeiptr)a.u64();
     if (offset < 0 || size < 0 || (uint64_t)size > (1u << 28)) { a.ok = false; break; }
     std::vector<uint8_t> value((size_t)size); glGetBufferSubData(target, offset, size, value.data());
     put_blob(value.data(), value.size());
     break;
 }
-case 1194: {
+case 1224: {
     GLenum target = a.u32(); GLint level = a.i32(); const bool pbo = a.u32() != 0;
     const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
     if (pbo) { glGetCompressedTexImage(target, level, reinterpret_cast<void *>(pointer)); break; }
@@ -763,7 +763,7 @@ case 1194: {
     put_blob(image.data(), image.size());
     break;
 }
-case 1196: {
+case 1228: {
     GLenum target = a.u32();
     GLuint index = a.u32();
     const uint32_t components = gexgl_state_query_components(target);
@@ -772,7 +772,7 @@ case 1196: {
     put_blob(values, components * sizeof(GLdouble));
     break;
 }
-case 1197: {
+case 1229: {
     GLenum pname = a.u32();
     const uint32_t components = gexgl_state_query_components(pname);
     std::vector<GLdouble> values(components);
@@ -780,7 +780,7 @@ case 1197: {
     put_blob(values.data(), components * sizeof(GLdouble));
     break;
 }
-case 1199: {
+case 1231: {
     GLenum target = a.u32();
     GLuint index = a.u32();
     const uint32_t components = gexgl_state_query_components(target);
@@ -789,7 +789,7 @@ case 1199: {
     put_blob(values, components * sizeof(GLfloat));
     break;
 }
-case 1200: {
+case 1232: {
     GLenum pname = a.u32();
     const uint32_t components = gexgl_state_query_components(pname);
     std::vector<GLfloat> values(components);
@@ -797,21 +797,21 @@ case 1200: {
     put_blob(values.data(), components * sizeof(GLfloat));
     break;
 }
-case 1201: {
+case 1233: {
     GLuint program = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     std::string value(reinterpret_cast<const char *>(wire), bytes);
     put_u32((uint32_t)GEX_GL_CALL(glGetFragDataIndex, lookup(programs, program), value.c_str()));
     break;
 }
-case 1202: {
+case 1234: {
     GLuint program = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     std::string value(reinterpret_cast<const char *>(wire), bytes);
     put_u32((uint32_t)GEX_GL_CALL(glGetFragDataLocation, lookup(programs, program), value.c_str()));
     break;
 }
-case 1203: {
+case 1235: {
     GLenum target = a.u32();
     GLenum attachment = a.u32();
     GLenum pname = a.u32();
@@ -831,7 +831,7 @@ case 1203: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1204: {
+case 1236: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = 1u;
@@ -840,7 +840,7 @@ case 1204: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1205: {
+case 1238: {
     GLenum target = a.u32(); GLuint index = a.u32();
     GLint64 value[4] = {0, 0, 0, 0};
     const unsigned components =
@@ -852,7 +852,7 @@ case 1205: {
     put_blob(value, components * sizeof(value[0]));
     break;
 }
-case 1206: {
+case 1239: {
     GLenum pname = a.u32();
     const uint32_t components = gexgl_state_query_components(pname);
     std::vector<GLint64> values(components);
@@ -860,7 +860,7 @@ case 1206: {
     put_blob(values.data(), components * sizeof(GLint64));
     break;
 }
-case 1207: {
+case 1240: {
     GLenum target = a.u32(); GLuint index = a.u32();
     GLint value[4] = {0, 0, 0, 0};
     const unsigned components =
@@ -874,7 +874,7 @@ case 1207: {
     put_blob(value, components * sizeof(value[0]));
     break;
 }
-case 1209: {
+case 1242: {
     GLenum target = a.u32(), internalformat = a.u32(), pname = a.u32(); GLsizei count = a.i32();
     if (count < 0 || count > 4096) { a.ok = false; break; }
     std::vector<GLint64> values((size_t)count, 0);
@@ -882,7 +882,7 @@ case 1209: {
     put_blob(values.data(), values.size() * sizeof(GLint64));
     break;
 }
-case 1210: {
+case 1243: {
     GLenum target = a.u32(), internalformat = a.u32(), pname = a.u32(); GLsizei count = a.i32();
     if (count < 0 || count > 4096) { a.ok = false; break; }
     std::vector<GLint> values((size_t)count, 0);
@@ -890,17 +890,17 @@ case 1210: {
     put_blob(values.data(), values.size() * sizeof(GLint));
     break;
 }
-case 1211: {
+case 1244: {
     GLenum pname = a.u32(); GLuint index = a.u32(); GLfloat values[2]{};
     glGetMultisamplefv(pname, index, values); put_blob(values, sizeof(values));
     break;
 }
-case 1217: {
+case 1257: {
     GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(), pname = a.u32();
     GLint value = 0; glGetProgramInterfaceiv(program, interface, pname, &value); put_u32((uint32_t)value);
     break;
 }
-case 1219: {
+case 1259: {
     GLuint pipeline = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = 1u;
@@ -909,22 +909,22 @@ case 1219: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1220: {
+case 1260: {
     GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
     put_u32((uint32_t)glGetProgramResourceIndex(program, interface, resourceName.c_str()));
     break;
 }
-case 1221: {
+case 1261: {
     GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
     put_u32((uint32_t)glGetProgramResourceLocation(program, interface, resourceName.c_str()));
     break;
 }
-case 1222: {
+case 1262: {
     GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
     put_u32((uint32_t)glGetProgramResourceLocationIndex(program, interface, resourceName.c_str()));
     break;
 }
-case 1223: {
+case 1263: {
     GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
     GLint maximum = 0; glGetProgramInterfaceiv(program, interface, GL_MAX_NAME_LENGTH, &maximum);
     std::vector<GLchar> value(std::max(maximum, 1)); GLsizei length = 0;
@@ -932,7 +932,7 @@ case 1223: {
     put_blob(value.data(), std::max(length, 0));
     break;
 }
-case 1224: {
+case 1264: {
     GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
     GLsizei propCount = a.i32(), bufSize = a.i32(); uint32_t propBytes = 0;
     const uint8_t *propWire = a.blob(propBytes);
@@ -944,7 +944,7 @@ case 1224: {
     put_blob(values.data(), (uint32_t)length * sizeof(GLint));
     break;
 }
-case 1225: {
+case 1265: {
     GLuint program = a.u32();
     GLenum shadertype = a.u32();
     GLenum pname = a.u32();
@@ -954,7 +954,7 @@ case 1225: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1227: {
+case 1271: {
     GLenum target = a.u32();
     GLuint index = a.u32();
     GLenum pname = a.u32();
@@ -964,7 +964,7 @@ case 1227: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1228: {
+case 1272: {
     GLuint id = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = 1u;
@@ -973,7 +973,7 @@ case 1228: {
     put_blob(values, components * sizeof(GLint64));
     break;
 }
-case 1229: {
+case 1273: {
     GLuint id = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = 1u;
@@ -982,7 +982,7 @@ case 1229: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1230: {
+case 1274: {
     GLuint id = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = 1u;
@@ -991,7 +991,7 @@ case 1230: {
     put_blob(values, components * sizeof(GLuint64));
     break;
 }
-case 1231: {
+case 1275: {
     GLuint id = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = 1u;
@@ -1000,7 +1000,7 @@ case 1231: {
     put_blob(values, components * sizeof(GLuint));
     break;
 }
-case 1232: {
+case 1276: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = 1u;
@@ -1009,7 +1009,7 @@ case 1232: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1233: {
+case 1277: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = 1u;
@@ -1018,7 +1018,7 @@ case 1233: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1234: {
+case 1278: {
     GLuint sampler = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x1004u ? 4u : 1u);
@@ -1027,7 +1027,7 @@ case 1234: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1235: {
+case 1279: {
     GLuint sampler = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x1004u ? 4u : 1u);
@@ -1036,7 +1036,7 @@ case 1235: {
     put_blob(values, components * sizeof(GLuint));
     break;
 }
-case 1236: {
+case 1280: {
     GLuint sampler = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x1004u ? 4u : 1u);
@@ -1045,7 +1045,7 @@ case 1236: {
     put_blob(values, components * sizeof(GLfloat));
     break;
 }
-case 1237: {
+case 1281: {
     GLuint sampler = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x1004u ? 4u : 1u);
@@ -1054,7 +1054,7 @@ case 1237: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1244: {
+case 1288: {
     GLuint program = a.u32();
     GLenum shadertype = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
@@ -1062,7 +1062,7 @@ case 1244: {
     put_u32((uint32_t)GEX_GL_CALL(glGetSubroutineIndex, lookup(programs, program), shadertype, value.c_str()));
     break;
 }
-case 1245: {
+case 1289: {
     GLuint program = a.u32();
     GLenum shadertype = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
@@ -1070,7 +1070,7 @@ case 1245: {
     put_u32((uint32_t)GEX_GL_CALL(glGetSubroutineUniformLocation, lookup(programs, program), shadertype, value.c_str()));
     break;
 }
-case 1247: {
+case 1291: {
     GLenum target = a.u32(); GLint level = a.i32(); GLenum format = a.u32(), type = a.u32();
     const bool pbo = a.u32() != 0; const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
     if (pbo) { glGetTexImage(target, level, format, type, reinterpret_cast<void*>(pointer)); break; }
@@ -1101,7 +1101,7 @@ case 1247: {
              static_cast<uint32_t>(layout.end - layout.offset));
     break;
 }
-case 1248: {
+case 1292: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLenum pname = a.u32();
@@ -1111,7 +1111,7 @@ case 1248: {
     put_blob(values, components * sizeof(GLfloat));
     break;
 }
-case 1249: {
+case 1293: {
     GLenum target = a.u32();
     GLint level = a.i32();
     GLenum pname = a.u32();
@@ -1121,7 +1121,7 @@ case 1249: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1250: {
+case 1294: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x1004u || (pname) == 0x8e46u ? 4u : 1u);
@@ -1130,7 +1130,7 @@ case 1250: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1251: {
+case 1295: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x1004u || (pname) == 0x8e46u ? 4u : 1u);
@@ -1139,7 +1139,7 @@ case 1251: {
     put_blob(values, components * sizeof(GLuint));
     break;
 }
-case 1252: {
+case 1296: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x1004u || (pname) == 0x8e46u ? 4u : 1u);
@@ -1148,7 +1148,7 @@ case 1252: {
     put_blob(values, components * sizeof(GLfloat));
     break;
 }
-case 1253: {
+case 1297: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x1004u || (pname) == 0x8e46u ? 4u : 1u);
@@ -1157,7 +1157,7 @@ case 1253: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1258: {
+case 1313: {
     GLenum shadertype = a.u32();
     GLint location = a.i32();
     const uint32_t components = 1u;
@@ -1166,7 +1166,7 @@ case 1258: {
     put_blob(values, components * sizeof(GLuint));
     break;
 }
-case 1259: {
+case 1314: {
     GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
     uint32_t components = uniform_components(program, location);
     if (components > 16) { a.ok = false; break; }
@@ -1175,7 +1175,7 @@ case 1259: {
     put_blob(values, components * sizeof(values[0]));
     break;
 }
-case 1262: {
+case 1317: {
     GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
     uint32_t components = uniform_components(program, location);
     if (components > 16) { a.ok = false; break; }
@@ -1184,7 +1184,7 @@ case 1262: {
     put_blob(values, components * sizeof(values[0]));
     break;
 }
-case 1263: {
+case 1321: {
     GLuint index = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x8626u ? 4u : 1u);
@@ -1195,7 +1195,7 @@ case 1263: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1264: {
+case 1322: {
     GLuint index = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x8626u ? 4u : 1u);
@@ -1206,7 +1206,7 @@ case 1264: {
     put_blob(values, components * sizeof(GLuint));
     break;
 }
-case 1265: {
+case 1323: {
     GLuint index = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x8626u ? 4u : 1u);
@@ -1215,7 +1215,7 @@ case 1265: {
     put_blob(values, components * sizeof(GLdouble));
     break;
 }
-case 1267: {
+case 1325: {
     GLuint index = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x8626u ? 4u : 1u);
@@ -1224,7 +1224,7 @@ case 1267: {
     put_blob(values, components * sizeof(GLdouble));
     break;
 }
-case 1268: {
+case 1326: {
     GLuint index = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x8626u ? 4u : 1u);
@@ -1233,7 +1233,7 @@ case 1268: {
     put_blob(values, components * sizeof(GLfloat));
     break;
 }
-case 1269: {
+case 1327: {
     GLuint index = a.u32();
     GLenum pname = a.u32();
     const uint32_t components = ((pname) == 0x8626u ? 4u : 1u);
@@ -1244,19 +1244,19 @@ case 1269: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
-case 1271: {
+case 1335: {
     GLuint buffer = a.u32();
     GEX_GL_CALL(glInvalidateBufferData, lookup(buffers, buffer));
     break;
 }
-case 1272: {
+case 1336: {
     GLuint buffer = a.u32();
     GLintptr offset = a.i64();
     GLsizeiptr length = a.i64();
     GEX_GL_CALL(glInvalidateBufferSubData, lookup(buffers, buffer), offset, length);
     break;
 }
-case 1273: {
+case 1337: {
     GLenum target = a.u32();
     GLsizei numAttachments = a.i32();
     uint32_t attachments_bytes = 0;
@@ -1272,13 +1272,13 @@ case 1273: {
     GEX_GL_CALL(glInvalidateFramebuffer, target, numAttachments, attachments);
     break;
 }
-case 1275: {
+case 1341: {
     GLuint texture = a.u32();
     GLint level = a.i32();
     GEX_GL_CALL(glInvalidateTexImage, lookup(textures, texture), level);
     break;
 }
-case 1276: {
+case 1342: {
     GLuint texture = a.u32();
     GLint level = a.i32();
     GLint xoffset = a.i32();
@@ -1290,78 +1290,78 @@ case 1276: {
     GEX_GL_CALL(glInvalidateTexSubImage, lookup(textures, texture), level, xoffset, yoffset, zoffset, width, height, depth);
     break;
 }
-case 1277: {
+case 1343: {
     GLuint buffer = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsBuffer, lookup(buffers, buffer)));
     break;
 }
-case 1278: {
+case 1344: {
     GLenum cap = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsEnabled, cap));
     break;
 }
-case 1279: {
+case 1345: {
     GLenum target = a.u32();
     GLuint index = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsEnabledi, target, index));
     break;
 }
-case 1280: {
+case 1346: {
     GLuint framebuffer = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsFramebuffer, lookup(framebuffers, framebuffer)));
     break;
 }
-case 1281: {
+case 1347: {
     GLuint program = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsProgram, lookup(programs, program)));
     break;
 }
-case 1282: {
+case 1348: {
     GLuint pipeline = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsProgramPipeline, lookup(program_pipelines, pipeline)));
     break;
 }
-case 1284: {
+case 1350: {
     GLuint renderbuffer = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsRenderbuffer, lookup(renderbuffers, renderbuffer)));
     break;
 }
-case 1285: {
+case 1351: {
     GLuint sampler = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsSampler, lookup(samplers, sampler)));
     break;
 }
-case 1286: {
+case 1352: {
     GLuint shader = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsShader, lookup(shaders, shader)));
     break;
 }
-case 1288: {
+case 1354: {
     GLuint texture = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsTexture, lookup(textures, texture)));
     break;
 }
-case 1290: {
+case 1356: {
     GLuint array = a.u32();
     put_u32((uint32_t)GEX_GL_CALL(glIsVertexArray, lookup(vertex_arrays, array)));
     break;
 }
-case 1293: {
+case 1359: {
     GLenum opcode = a.u32();
     GEX_GL_CALL(glLogicOp, opcode);
     break;
 }
-case 1296: {
+case 1364: {
     GLbitfield barriers = a.u32();
     GEX_GL_CALL(glMemoryBarrier, barriers);
     break;
 }
-case 1297: {
+case 1366: {
     GLfloat value = a.f32();
     GEX_GL_CALL(glMinSampleShading, value);
     break;
 }
-case 1298: {
+case 1367: {
     GLenum mode = a.u32(); GLsizei drawcount = a.i32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     if (drawcount < 0) {
@@ -1379,7 +1379,7 @@ case 1298: {
     glMultiDrawArrays(mode, first.data(), counts.data(), drawcount);
     break;
 }
-case 1299: {
+case 1368: {
     GLenum mode = a.u32();
     GLsizei drawcount = a.i32();
     GLsizei stride = a.i32();
@@ -1387,7 +1387,7 @@ case 1299: {
     GEX_GL_CALL(glMultiDrawArraysIndirect, mode, indirect, drawcount, stride);
     break;
 }
-case 1300: {
+case 1369: {
     GLenum mode = a.u32(), type = a.u32(); GLsizei drawcount = a.i32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     if (drawcount < 0 || (uint64_t)drawcount * 12u != bytes) { a.ok = false; break; }
@@ -1401,7 +1401,7 @@ case 1300: {
     glMultiDrawElements(mode, counts.data(), type, indices.data(), drawcount);
     break;
 }
-case 1301: {
+case 1370: {
     GLenum mode = a.u32(), type = a.u32(); GLsizei drawcount = a.i32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     if (drawcount < 0 || (uint64_t)drawcount * 16u != bytes) { a.ok = false; break; }
@@ -1416,7 +1416,7 @@ case 1301: {
     glMultiDrawElementsBaseVertex(mode, counts.data(), type, indices.data(), drawcount, basevertices.data());
     break;
 }
-case 1302: {
+case 1371: {
     GLenum mode = a.u32();
     GLenum type = a.u32();
     GLsizei drawcount = a.i32();
@@ -1425,7 +1425,7 @@ case 1302: {
     GEX_GL_CALL(glMultiDrawElementsIndirect, mode, type, indirect, drawcount, stride);
     break;
 }
-case 1305: {
+case 1386: {
     GLenum pname = a.u32(); uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     const uint32_t expected = pname == GL_PATCH_DEFAULT_INNER_LEVEL ? 2u * sizeof(GLfloat) :
                               pname == GL_PATCH_DEFAULT_OUTER_LEVEL ? 4u * sizeof(GLfloat) : 0u;
@@ -1433,77 +1433,77 @@ case 1305: {
     glPatchParameterfv(pname, reinterpret_cast<const GLfloat *>(wire));
     break;
 }
-case 1306: {
+case 1387: {
     GLenum pname = a.u32();
     GLint value = a.i32();
     GEX_GL_CALL(glPatchParameteri, pname, value);
     break;
 }
-case 1308: {
+case 1389: {
     GLenum pname = a.u32();
     GLfloat param = a.f32();
     GEX_GL_CALL(glPixelStoref, pname, param);
     break;
 }
-case 1310: {
+case 1391: {
     GLenum pname = a.u32();
     GLfloat param = a.f32();
     GEX_GL_CALL(glPointParameterf, pname, param);
     break;
 }
-case 1311: {
+case 1392: {
     GLenum pname = a.u32(); uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     if (bytes != sizeof(GLfloat)) { a.ok = false; break; }
     glPointParameterfv(pname, reinterpret_cast<const GLfloat *>(wire));
     break;
 }
-case 1312: {
+case 1393: {
     GLenum pname = a.u32();
     GLint param = a.i32();
     GEX_GL_CALL(glPointParameteri, pname, param);
     break;
 }
-case 1313: {
+case 1394: {
     GLenum pname = a.u32(); uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     if (bytes != sizeof(GLint)) { a.ok = false; break; }
     glPointParameteriv(pname, reinterpret_cast<const GLint *>(wire));
     break;
 }
-case 1314: {
+case 1395: {
     GLfloat size = a.f32();
     GEX_GL_CALL(glPointSize, size);
     break;
 }
-case 1315: {
+case 1396: {
     GLenum face = a.u32();
     GLenum mode = a.u32();
     GEX_GL_CALL(glPolygonMode, face, mode);
     break;
 }
-case 1317: {
+case 1398: {
     GEX_GL_CALL(glPopDebugGroup, );
     break;
 }
-case 1318: {
+case 1399: {
     GLuint index = a.u32();
     GEX_GL_CALL(glPrimitiveRestartIndex, index);
     break;
 }
-case 1320: {
+case 1401: {
     GLuint program = a.u32();
     GLenum pname = a.u32();
     GLint value = a.i32();
     GEX_GL_CALL(glProgramParameteri, lookup(programs, program), pname, value);
     break;
 }
-case 1321: {
+case 1402: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLdouble v0 = a.f64();
     GEX_GL_CALL(glProgramUniform1d, lookup(programs, program), location, v0);
     break;
 }
-case 1322: {
+case 1403: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1520,14 +1520,14 @@ case 1322: {
     GEX_GL_CALL(glProgramUniform1dv, lookup(programs, program), location, count, value);
     break;
 }
-case 1323: {
+case 1404: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLfloat v0 = a.f32();
     GEX_GL_CALL(glProgramUniform1f, lookup(programs, program), location, v0);
     break;
 }
-case 1324: {
+case 1405: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1544,14 +1544,14 @@ case 1324: {
     GEX_GL_CALL(glProgramUniform1fv, lookup(programs, program), location, count, value);
     break;
 }
-case 1325: {
+case 1406: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLint v0 = a.i32();
     GEX_GL_CALL(glProgramUniform1i, lookup(programs, program), location, v0);
     break;
 }
-case 1326: {
+case 1407: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1568,14 +1568,14 @@ case 1326: {
     GEX_GL_CALL(glProgramUniform1iv, lookup(programs, program), location, count, value);
     break;
 }
-case 1327: {
+case 1408: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLuint v0 = a.u32();
     GEX_GL_CALL(glProgramUniform1ui, lookup(programs, program), location, v0);
     break;
 }
-case 1328: {
+case 1409: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1592,7 +1592,7 @@ case 1328: {
     GEX_GL_CALL(glProgramUniform1uiv, lookup(programs, program), location, count, value);
     break;
 }
-case 1329: {
+case 1410: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLdouble v0 = a.f64();
@@ -1600,7 +1600,7 @@ case 1329: {
     GEX_GL_CALL(glProgramUniform2d, lookup(programs, program), location, v0, v1);
     break;
 }
-case 1330: {
+case 1411: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1617,7 +1617,7 @@ case 1330: {
     GEX_GL_CALL(glProgramUniform2dv, lookup(programs, program), location, count, value);
     break;
 }
-case 1331: {
+case 1412: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLfloat v0 = a.f32();
@@ -1625,7 +1625,7 @@ case 1331: {
     GEX_GL_CALL(glProgramUniform2f, lookup(programs, program), location, v0, v1);
     break;
 }
-case 1332: {
+case 1413: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1642,7 +1642,7 @@ case 1332: {
     GEX_GL_CALL(glProgramUniform2fv, lookup(programs, program), location, count, value);
     break;
 }
-case 1333: {
+case 1414: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLint v0 = a.i32();
@@ -1650,7 +1650,7 @@ case 1333: {
     GEX_GL_CALL(glProgramUniform2i, lookup(programs, program), location, v0, v1);
     break;
 }
-case 1334: {
+case 1415: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1667,7 +1667,7 @@ case 1334: {
     GEX_GL_CALL(glProgramUniform2iv, lookup(programs, program), location, count, value);
     break;
 }
-case 1335: {
+case 1416: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLuint v0 = a.u32();
@@ -1675,7 +1675,7 @@ case 1335: {
     GEX_GL_CALL(glProgramUniform2ui, lookup(programs, program), location, v0, v1);
     break;
 }
-case 1336: {
+case 1417: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1692,7 +1692,7 @@ case 1336: {
     GEX_GL_CALL(glProgramUniform2uiv, lookup(programs, program), location, count, value);
     break;
 }
-case 1337: {
+case 1418: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLdouble v0 = a.f64();
@@ -1701,7 +1701,7 @@ case 1337: {
     GEX_GL_CALL(glProgramUniform3d, lookup(programs, program), location, v0, v1, v2);
     break;
 }
-case 1338: {
+case 1419: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1718,7 +1718,7 @@ case 1338: {
     GEX_GL_CALL(glProgramUniform3dv, lookup(programs, program), location, count, value);
     break;
 }
-case 1339: {
+case 1420: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLfloat v0 = a.f32();
@@ -1727,7 +1727,7 @@ case 1339: {
     GEX_GL_CALL(glProgramUniform3f, lookup(programs, program), location, v0, v1, v2);
     break;
 }
-case 1340: {
+case 1421: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1744,7 +1744,7 @@ case 1340: {
     GEX_GL_CALL(glProgramUniform3fv, lookup(programs, program), location, count, value);
     break;
 }
-case 1341: {
+case 1422: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLint v0 = a.i32();
@@ -1753,7 +1753,7 @@ case 1341: {
     GEX_GL_CALL(glProgramUniform3i, lookup(programs, program), location, v0, v1, v2);
     break;
 }
-case 1342: {
+case 1423: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1770,7 +1770,7 @@ case 1342: {
     GEX_GL_CALL(glProgramUniform3iv, lookup(programs, program), location, count, value);
     break;
 }
-case 1343: {
+case 1424: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLuint v0 = a.u32();
@@ -1779,7 +1779,7 @@ case 1343: {
     GEX_GL_CALL(glProgramUniform3ui, lookup(programs, program), location, v0, v1, v2);
     break;
 }
-case 1344: {
+case 1425: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1796,7 +1796,7 @@ case 1344: {
     GEX_GL_CALL(glProgramUniform3uiv, lookup(programs, program), location, count, value);
     break;
 }
-case 1345: {
+case 1426: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLdouble v0 = a.f64();
@@ -1806,7 +1806,7 @@ case 1345: {
     GEX_GL_CALL(glProgramUniform4d, lookup(programs, program), location, v0, v1, v2, v3);
     break;
 }
-case 1346: {
+case 1427: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1823,7 +1823,7 @@ case 1346: {
     GEX_GL_CALL(glProgramUniform4dv, lookup(programs, program), location, count, value);
     break;
 }
-case 1347: {
+case 1428: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLfloat v0 = a.f32();
@@ -1833,7 +1833,7 @@ case 1347: {
     GEX_GL_CALL(glProgramUniform4f, lookup(programs, program), location, v0, v1, v2, v3);
     break;
 }
-case 1348: {
+case 1429: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1850,7 +1850,7 @@ case 1348: {
     GEX_GL_CALL(glProgramUniform4fv, lookup(programs, program), location, count, value);
     break;
 }
-case 1349: {
+case 1430: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLint v0 = a.i32();
@@ -1860,7 +1860,7 @@ case 1349: {
     GEX_GL_CALL(glProgramUniform4i, lookup(programs, program), location, v0, v1, v2, v3);
     break;
 }
-case 1350: {
+case 1431: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1877,7 +1877,7 @@ case 1350: {
     GEX_GL_CALL(glProgramUniform4iv, lookup(programs, program), location, count, value);
     break;
 }
-case 1351: {
+case 1432: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLuint v0 = a.u32();
@@ -1887,7 +1887,7 @@ case 1351: {
     GEX_GL_CALL(glProgramUniform4ui, lookup(programs, program), location, v0, v1, v2, v3);
     break;
 }
-case 1352: {
+case 1433: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1904,7 +1904,7 @@ case 1352: {
     GEX_GL_CALL(glProgramUniform4uiv, lookup(programs, program), location, count, value);
     break;
 }
-case 1353: {
+case 1434: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1922,7 +1922,7 @@ case 1353: {
     GEX_GL_CALL(glProgramUniformMatrix2dv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1354: {
+case 1435: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1940,7 +1940,7 @@ case 1354: {
     GEX_GL_CALL(glProgramUniformMatrix2fv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1355: {
+case 1436: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1958,7 +1958,7 @@ case 1355: {
     GEX_GL_CALL(glProgramUniformMatrix2x3dv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1356: {
+case 1437: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1976,7 +1976,7 @@ case 1356: {
     GEX_GL_CALL(glProgramUniformMatrix2x3fv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1357: {
+case 1438: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -1994,7 +1994,7 @@ case 1357: {
     GEX_GL_CALL(glProgramUniformMatrix2x4dv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1358: {
+case 1439: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2012,7 +2012,7 @@ case 1358: {
     GEX_GL_CALL(glProgramUniformMatrix2x4fv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1359: {
+case 1440: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2030,7 +2030,7 @@ case 1359: {
     GEX_GL_CALL(glProgramUniformMatrix3dv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1360: {
+case 1441: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2048,7 +2048,7 @@ case 1360: {
     GEX_GL_CALL(glProgramUniformMatrix3fv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1361: {
+case 1442: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2066,7 +2066,7 @@ case 1361: {
     GEX_GL_CALL(glProgramUniformMatrix3x2dv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1362: {
+case 1443: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2084,7 +2084,7 @@ case 1362: {
     GEX_GL_CALL(glProgramUniformMatrix3x2fv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1363: {
+case 1444: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2102,7 +2102,7 @@ case 1363: {
     GEX_GL_CALL(glProgramUniformMatrix3x4dv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1364: {
+case 1445: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2120,7 +2120,7 @@ case 1364: {
     GEX_GL_CALL(glProgramUniformMatrix3x4fv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1365: {
+case 1446: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2138,7 +2138,7 @@ case 1365: {
     GEX_GL_CALL(glProgramUniformMatrix4dv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1366: {
+case 1447: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2156,7 +2156,7 @@ case 1366: {
     GEX_GL_CALL(glProgramUniformMatrix4fv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1367: {
+case 1448: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2174,7 +2174,7 @@ case 1367: {
     GEX_GL_CALL(glProgramUniformMatrix4x2dv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1368: {
+case 1449: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2192,7 +2192,7 @@ case 1368: {
     GEX_GL_CALL(glProgramUniformMatrix4x2fv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1369: {
+case 1450: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2210,7 +2210,7 @@ case 1369: {
     GEX_GL_CALL(glProgramUniformMatrix4x3dv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1370: {
+case 1451: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLsizei count = a.i32();
@@ -2228,27 +2228,27 @@ case 1370: {
     GEX_GL_CALL(glProgramUniformMatrix4x3fv, lookup(programs, program), location, count, transpose, value);
     break;
 }
-case 1371: {
+case 1452: {
     GLenum mode = a.u32();
     GEX_GL_CALL(glProvokingVertex, mode);
     break;
 }
-case 1373: {
+case 1454: {
     GLuint id = a.u32();
     GLenum target = a.u32();
     GEX_GL_CALL(glQueryCounter, lookup(queries, id), target);
     break;
 }
-case 1374: {
+case 1455: {
     GLenum src = a.u32();
     GEX_GL_CALL(glReadBuffer, src);
     break;
 }
-case 1376: {
+case 1458: {
     GEX_GL_CALL(glReleaseShaderCompiler, );
     break;
 }
-case 1378: {
+case 1460: {
     GLenum target = a.u32();
     GLsizei samples = a.i32();
     GLenum internalformat = a.u32();
@@ -2257,19 +2257,19 @@ case 1378: {
     GEX_GL_CALL(glRenderbufferStorageMultisample, target, samples, internalformat, width, height);
     break;
 }
-case 1380: {
+case 1462: {
     GLfloat value = a.f32();
     GLboolean invert = a.u32();
     GEX_GL_CALL(glSampleCoverage, value, invert);
     break;
 }
-case 1381: {
+case 1463: {
     GLuint maskNumber = a.u32();
     GLbitfield mask = a.u32();
     GEX_GL_CALL(glSampleMaski, maskNumber, mask);
     break;
 }
-case 1382: {
+case 1464: {
     GLuint first = a.u32(); GLenum pname = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLint);
@@ -2277,7 +2277,7 @@ case 1382: {
     glSamplerParameterIiv(lookup(samplers, first), pname, reinterpret_cast<const GLint *>(wire));
     break;
 }
-case 1383: {
+case 1465: {
     GLuint first = a.u32(); GLenum pname = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLuint);
@@ -2285,7 +2285,7 @@ case 1383: {
     glSamplerParameterIuiv(lookup(samplers, first), pname, reinterpret_cast<const GLuint *>(wire));
     break;
 }
-case 1389: {
+case 1471: {
     GLuint first = a.u32();
     GLsizei count = a.i32();
     uint32_t v_bytes = 0;
@@ -2301,7 +2301,7 @@ case 1389: {
     GEX_GL_CALL(glScissorArrayv, first, count, v);
     break;
 }
-case 1390: {
+case 1472: {
     GLuint index = a.u32();
     GLint left = a.i32();
     GLint bottom = a.i32();
@@ -2310,7 +2310,7 @@ case 1390: {
     GEX_GL_CALL(glScissorIndexed, index, left, bottom, width, height);
     break;
 }
-case 1391: {
+case 1473: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -2322,21 +2322,21 @@ case 1391: {
     GEX_GL_CALL(glScissorIndexedv, index, v);
     break;
 }
-case 1394: {
+case 1476: {
     GLuint program = a.u32();
     GLuint storageBlockIndex = a.u32();
     GLuint storageBlockBinding = a.u32();
     GEX_GL_CALL(glShaderStorageBlockBinding, lookup(programs, program), storageBlockIndex, storageBlockBinding);
     break;
 }
-case 1401: {
+case 1483: {
     GLenum target = a.u32();
     GLenum internalformat = a.u32();
     GLuint buffer = a.u32();
     GEX_GL_CALL(glTexBuffer, target, internalformat, lookup(buffers, buffer));
     break;
 }
-case 1402: {
+case 1484: {
     GLenum target = a.u32();
     GLenum internalformat = a.u32();
     GLuint buffer = a.u32();
@@ -2345,7 +2345,7 @@ case 1402: {
     GEX_GL_CALL(glTexBufferRange, target, internalformat, lookup(buffers, buffer), offset, size);
     break;
 }
-case 1403: {
+case 1485: {
     GLenum target = a.u32(); GLint level = a.i32(), internalformat = a.i32();
     GLsizei width = a.i32(); GLint border = a.i32(); GLenum format = a.u32(), type = a.u32();
     const bool pbo = a.u32() != 0; const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
@@ -2361,7 +2361,7 @@ case 1403: {
                  bytes ? pixels : nullptr);
     break;
 }
-case 1405: {
+case 1487: {
     GLenum target = a.u32();
     GLsizei samples = a.i32();
     GLenum internalformat = a.u32();
@@ -2371,7 +2371,7 @@ case 1405: {
     GEX_GL_CALL(glTexImage2DMultisample, target, samples, internalformat, width, height, fixedsamplelocations);
     break;
 }
-case 1407: {
+case 1489: {
     GLenum target = a.u32();
     GLsizei samples = a.i32();
     GLenum internalformat = a.u32();
@@ -2382,7 +2382,7 @@ case 1407: {
     GEX_GL_CALL(glTexImage3DMultisample, target, samples, internalformat, width, height, depth, fixedsamplelocations);
     break;
 }
-case 1408: {
+case 1490: {
     GLenum first = a.u32(); GLenum pname = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLint);
@@ -2390,7 +2390,7 @@ case 1408: {
     glTexParameterIiv(first, pname, reinterpret_cast<const GLint *>(wire));
     break;
 }
-case 1409: {
+case 1491: {
     GLenum first = a.u32(); GLenum pname = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLuint);
@@ -2398,7 +2398,7 @@ case 1409: {
     glTexParameterIuiv(first, pname, reinterpret_cast<const GLuint *>(wire));
     break;
 }
-case 1414: {
+case 1496: {
     GLenum target = a.u32();
     GLsizei levels = a.i32();
     GLenum internalformat = a.u32();
@@ -2406,7 +2406,7 @@ case 1414: {
     GEX_GL_CALL(glTexStorage1D, target, levels, internalformat, width);
     break;
 }
-case 1416: {
+case 1498: {
     GLenum target = a.u32();
     GLsizei samples = a.i32();
     GLenum internalformat = a.u32();
@@ -2416,7 +2416,7 @@ case 1416: {
     GEX_GL_CALL(glTexStorage2DMultisample, target, samples, internalformat, width, height, fixedsamplelocations);
     break;
 }
-case 1418: {
+case 1500: {
     GLenum target = a.u32();
     GLsizei samples = a.i32();
     GLenum internalformat = a.u32();
@@ -2427,7 +2427,7 @@ case 1418: {
     GEX_GL_CALL(glTexStorage3DMultisample, target, samples, internalformat, width, height, depth, fixedsamplelocations);
     break;
 }
-case 1419: {
+case 1501: {
     GLenum target = a.u32(); GLint level = a.i32(), xoffset = a.i32();
     GLsizei width = a.i32(); GLenum format = a.u32(), type = a.u32();
     const bool pbo = a.u32() != 0; const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
@@ -2442,7 +2442,7 @@ case 1419: {
     glTexSubImage1D(target, level, xoffset, width, format, type, bytes ? pixels : nullptr);
     break;
 }
-case 1421: {
+case 1503: {
     GLenum target = a.u32(); GLint level = a.i32(), xoffset = a.i32(), yoffset = a.i32(), zoffset = a.i32();
     GLsizei width = a.i32(), height = a.i32(), depth = a.i32(); GLenum format = a.u32(), type = a.u32();
     const bool pbo = a.u32() != 0; const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
@@ -2458,7 +2458,11 @@ case 1421: {
                     format, type, bytes ? pixels : nullptr);
     break;
 }
-case 1422: {
+case 1504: {
+    GEX_GL_CALL(glTextureBarrier, );
+    break;
+}
+case 1521: {
     GLuint texture = a.u32();
     GLenum target = a.u32();
     GLuint origtexture = a.u32();
@@ -2470,7 +2474,7 @@ case 1422: {
     GEX_GL_CALL(glTextureView, lookup(textures, texture), target, lookup(textures, origtexture), internalformat, minlevel, numlevels, minlayer, numlayers);
     break;
 }
-case 1423: {
+case 1524: {
     GLuint program = lookup(programs, a.u32()); GLsizei count = a.i32();
     GLenum bufferMode = a.u32(); uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     if (count < 0 || (count && !wire)) { a.ok = false; break; }
@@ -2488,13 +2492,13 @@ case 1423: {
     glTransformFeedbackVaryings(program, count, varyings.data(), bufferMode);
     break;
 }
-case 1424: {
+case 1525: {
     GLint location = a.i32();
     GLdouble x = a.f64();
     GEX_GL_CALL(glUniform1d, location, x);
     break;
 }
-case 1425: {
+case 1526: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     uint32_t value_bytes = 0;
@@ -2510,13 +2514,13 @@ case 1425: {
     GEX_GL_CALL(glUniform1dv, location, count, value);
     break;
 }
-case 1430: {
+case 1531: {
     GLint location = a.i32();
     GLuint v0 = a.u32();
     GEX_GL_CALL(glUniform1ui, location, v0);
     break;
 }
-case 1431: {
+case 1532: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     uint32_t value_bytes = 0;
@@ -2532,14 +2536,14 @@ case 1431: {
     GEX_GL_CALL(glUniform1uiv, location, count, value);
     break;
 }
-case 1432: {
+case 1533: {
     GLint location = a.i32();
     GLdouble x = a.f64();
     GLdouble y = a.f64();
     GEX_GL_CALL(glUniform2d, location, x, y);
     break;
 }
-case 1433: {
+case 1534: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     uint32_t value_bytes = 0;
@@ -2555,14 +2559,14 @@ case 1433: {
     GEX_GL_CALL(glUniform2dv, location, count, value);
     break;
 }
-case 1438: {
+case 1539: {
     GLint location = a.i32();
     GLuint v0 = a.u32();
     GLuint v1 = a.u32();
     GEX_GL_CALL(glUniform2ui, location, v0, v1);
     break;
 }
-case 1439: {
+case 1540: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     uint32_t value_bytes = 0;
@@ -2578,7 +2582,7 @@ case 1439: {
     GEX_GL_CALL(glUniform2uiv, location, count, value);
     break;
 }
-case 1440: {
+case 1541: {
     GLint location = a.i32();
     GLdouble x = a.f64();
     GLdouble y = a.f64();
@@ -2586,7 +2590,7 @@ case 1440: {
     GEX_GL_CALL(glUniform3d, location, x, y, z);
     break;
 }
-case 1441: {
+case 1542: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     uint32_t value_bytes = 0;
@@ -2602,7 +2606,7 @@ case 1441: {
     GEX_GL_CALL(glUniform3dv, location, count, value);
     break;
 }
-case 1446: {
+case 1547: {
     GLint location = a.i32();
     GLuint v0 = a.u32();
     GLuint v1 = a.u32();
@@ -2610,7 +2614,7 @@ case 1446: {
     GEX_GL_CALL(glUniform3ui, location, v0, v1, v2);
     break;
 }
-case 1447: {
+case 1548: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     uint32_t value_bytes = 0;
@@ -2626,7 +2630,7 @@ case 1447: {
     GEX_GL_CALL(glUniform3uiv, location, count, value);
     break;
 }
-case 1448: {
+case 1549: {
     GLint location = a.i32();
     GLdouble x = a.f64();
     GLdouble y = a.f64();
@@ -2635,7 +2639,7 @@ case 1448: {
     GEX_GL_CALL(glUniform4d, location, x, y, z, w);
     break;
 }
-case 1449: {
+case 1550: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     uint32_t value_bytes = 0;
@@ -2651,7 +2655,7 @@ case 1449: {
     GEX_GL_CALL(glUniform4dv, location, count, value);
     break;
 }
-case 1454: {
+case 1555: {
     GLint location = a.i32();
     GLuint v0 = a.u32();
     GLuint v1 = a.u32();
@@ -2660,7 +2664,7 @@ case 1454: {
     GEX_GL_CALL(glUniform4ui, location, v0, v1, v2, v3);
     break;
 }
-case 1455: {
+case 1556: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     uint32_t value_bytes = 0;
@@ -2676,7 +2680,7 @@ case 1455: {
     GEX_GL_CALL(glUniform4uiv, location, count, value);
     break;
 }
-case 1457: {
+case 1558: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2693,7 +2697,7 @@ case 1457: {
     GEX_GL_CALL(glUniformMatrix2dv, location, count, transpose, value);
     break;
 }
-case 1459: {
+case 1560: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2710,7 +2714,7 @@ case 1459: {
     GEX_GL_CALL(glUniformMatrix2x3dv, location, count, transpose, value);
     break;
 }
-case 1460: {
+case 1561: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2727,7 +2731,7 @@ case 1460: {
     GEX_GL_CALL(glUniformMatrix2x3fv, location, count, transpose, value);
     break;
 }
-case 1461: {
+case 1562: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2744,7 +2748,7 @@ case 1461: {
     GEX_GL_CALL(glUniformMatrix2x4dv, location, count, transpose, value);
     break;
 }
-case 1462: {
+case 1563: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2761,7 +2765,7 @@ case 1462: {
     GEX_GL_CALL(glUniformMatrix2x4fv, location, count, transpose, value);
     break;
 }
-case 1463: {
+case 1564: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2778,7 +2782,7 @@ case 1463: {
     GEX_GL_CALL(glUniformMatrix3dv, location, count, transpose, value);
     break;
 }
-case 1465: {
+case 1566: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2795,7 +2799,7 @@ case 1465: {
     GEX_GL_CALL(glUniformMatrix3x2dv, location, count, transpose, value);
     break;
 }
-case 1466: {
+case 1567: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2812,7 +2816,7 @@ case 1466: {
     GEX_GL_CALL(glUniformMatrix3x2fv, location, count, transpose, value);
     break;
 }
-case 1467: {
+case 1568: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2829,7 +2833,7 @@ case 1467: {
     GEX_GL_CALL(glUniformMatrix3x4dv, location, count, transpose, value);
     break;
 }
-case 1468: {
+case 1569: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2846,7 +2850,7 @@ case 1468: {
     GEX_GL_CALL(glUniformMatrix3x4fv, location, count, transpose, value);
     break;
 }
-case 1469: {
+case 1570: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2863,7 +2867,7 @@ case 1469: {
     GEX_GL_CALL(glUniformMatrix4dv, location, count, transpose, value);
     break;
 }
-case 1471: {
+case 1572: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2880,7 +2884,7 @@ case 1471: {
     GEX_GL_CALL(glUniformMatrix4x2dv, location, count, transpose, value);
     break;
 }
-case 1472: {
+case 1573: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2897,7 +2901,7 @@ case 1472: {
     GEX_GL_CALL(glUniformMatrix4x2fv, location, count, transpose, value);
     break;
 }
-case 1473: {
+case 1574: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2914,7 +2918,7 @@ case 1473: {
     GEX_GL_CALL(glUniformMatrix4x3dv, location, count, transpose, value);
     break;
 }
-case 1474: {
+case 1575: {
     GLint location = a.i32();
     GLsizei count = a.i32();
     GLboolean transpose = a.u32();
@@ -2931,7 +2935,7 @@ case 1474: {
     GEX_GL_CALL(glUniformMatrix4x3fv, location, count, transpose, value);
     break;
 }
-case 1475: {
+case 1576: {
     GLenum shadertype = a.u32();
     GLsizei count = a.i32();
     uint32_t indices_bytes = 0;
@@ -2947,30 +2951,30 @@ case 1475: {
     GEX_GL_CALL(glUniformSubroutinesuiv, shadertype, count, indices);
     break;
 }
-case 1478: {
+case 1580: {
     GLuint pipeline = a.u32();
     GLbitfield stages = a.u32();
     GLuint program = a.u32();
     GEX_GL_CALL(glUseProgramStages, lookup(program_pipelines, pipeline), stages, lookup(programs, program));
     break;
 }
-case 1479: {
+case 1581: {
     GLuint program = a.u32();
     GEX_GL_CALL(glValidateProgram, lookup(programs, program));
     break;
 }
-case 1480: {
+case 1582: {
     GLuint pipeline = a.u32();
     GEX_GL_CALL(glValidateProgramPipeline, lookup(program_pipelines, pipeline));
     break;
 }
-case 1481: {
+case 1591: {
     GLuint index = a.u32();
     GLdouble x = a.f64();
     GEX_GL_CALL(glVertexAttrib1d, index, x);
     break;
 }
-case 1482: {
+case 1592: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -2982,13 +2986,13 @@ case 1482: {
     GEX_GL_CALL(glVertexAttrib1dv, index, v);
     break;
 }
-case 1483: {
+case 1593: {
     GLuint index = a.u32();
     GLfloat x = a.f32();
     GEX_GL_CALL(glVertexAttrib1f, index, x);
     break;
 }
-case 1484: {
+case 1594: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3000,13 +3004,13 @@ case 1484: {
     GEX_GL_CALL(glVertexAttrib1fv, index, v);
     break;
 }
-case 1485: {
+case 1595: {
     GLuint index = a.u32();
     GLshort x = a.i32();
     GEX_GL_CALL(glVertexAttrib1s, index, x);
     break;
 }
-case 1486: {
+case 1596: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3018,14 +3022,14 @@ case 1486: {
     GEX_GL_CALL(glVertexAttrib1sv, index, v);
     break;
 }
-case 1487: {
+case 1597: {
     GLuint index = a.u32();
     GLdouble x = a.f64();
     GLdouble y = a.f64();
     GEX_GL_CALL(glVertexAttrib2d, index, x, y);
     break;
 }
-case 1488: {
+case 1598: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3037,14 +3041,14 @@ case 1488: {
     GEX_GL_CALL(glVertexAttrib2dv, index, v);
     break;
 }
-case 1489: {
+case 1599: {
     GLuint index = a.u32();
     GLfloat x = a.f32();
     GLfloat y = a.f32();
     GEX_GL_CALL(glVertexAttrib2f, index, x, y);
     break;
 }
-case 1490: {
+case 1600: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3056,14 +3060,14 @@ case 1490: {
     GEX_GL_CALL(glVertexAttrib2fv, index, v);
     break;
 }
-case 1491: {
+case 1601: {
     GLuint index = a.u32();
     GLshort x = a.i32();
     GLshort y = a.i32();
     GEX_GL_CALL(glVertexAttrib2s, index, x, y);
     break;
 }
-case 1492: {
+case 1602: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3075,7 +3079,7 @@ case 1492: {
     GEX_GL_CALL(glVertexAttrib2sv, index, v);
     break;
 }
-case 1493: {
+case 1603: {
     GLuint index = a.u32();
     GLdouble x = a.f64();
     GLdouble y = a.f64();
@@ -3083,7 +3087,7 @@ case 1493: {
     GEX_GL_CALL(glVertexAttrib3d, index, x, y, z);
     break;
 }
-case 1494: {
+case 1604: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3095,7 +3099,7 @@ case 1494: {
     GEX_GL_CALL(glVertexAttrib3dv, index, v);
     break;
 }
-case 1495: {
+case 1605: {
     GLuint index = a.u32();
     GLfloat x = a.f32();
     GLfloat y = a.f32();
@@ -3103,7 +3107,7 @@ case 1495: {
     GEX_GL_CALL(glVertexAttrib3f, index, x, y, z);
     break;
 }
-case 1496: {
+case 1606: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3115,7 +3119,7 @@ case 1496: {
     GEX_GL_CALL(glVertexAttrib3fv, index, v);
     break;
 }
-case 1497: {
+case 1607: {
     GLuint index = a.u32();
     GLshort x = a.i32();
     GLshort y = a.i32();
@@ -3123,7 +3127,7 @@ case 1497: {
     GEX_GL_CALL(glVertexAttrib3s, index, x, y, z);
     break;
 }
-case 1498: {
+case 1608: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3135,7 +3139,7 @@ case 1498: {
     GEX_GL_CALL(glVertexAttrib3sv, index, v);
     break;
 }
-case 1499: {
+case 1609: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3147,7 +3151,7 @@ case 1499: {
     GEX_GL_CALL(glVertexAttrib4Nbv, index, v);
     break;
 }
-case 1500: {
+case 1610: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3159,7 +3163,7 @@ case 1500: {
     GEX_GL_CALL(glVertexAttrib4Niv, index, v);
     break;
 }
-case 1501: {
+case 1611: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3171,7 +3175,7 @@ case 1501: {
     GEX_GL_CALL(glVertexAttrib4Nsv, index, v);
     break;
 }
-case 1502: {
+case 1612: {
     GLuint index = a.u32();
     GLubyte x = a.u32();
     GLubyte y = a.u32();
@@ -3180,7 +3184,7 @@ case 1502: {
     GEX_GL_CALL(glVertexAttrib4Nub, index, x, y, z, w);
     break;
 }
-case 1503: {
+case 1613: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3192,7 +3196,7 @@ case 1503: {
     GEX_GL_CALL(glVertexAttrib4Nubv, index, v);
     break;
 }
-case 1504: {
+case 1614: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3204,7 +3208,7 @@ case 1504: {
     GEX_GL_CALL(glVertexAttrib4Nuiv, index, v);
     break;
 }
-case 1505: {
+case 1615: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3216,7 +3220,7 @@ case 1505: {
     GEX_GL_CALL(glVertexAttrib4Nusv, index, v);
     break;
 }
-case 1506: {
+case 1616: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3228,7 +3232,7 @@ case 1506: {
     GEX_GL_CALL(glVertexAttrib4bv, index, v);
     break;
 }
-case 1507: {
+case 1617: {
     GLuint index = a.u32();
     GLdouble x = a.f64();
     GLdouble y = a.f64();
@@ -3237,7 +3241,7 @@ case 1507: {
     GEX_GL_CALL(glVertexAttrib4d, index, x, y, z, w);
     break;
 }
-case 1508: {
+case 1618: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3249,7 +3253,7 @@ case 1508: {
     GEX_GL_CALL(glVertexAttrib4dv, index, v);
     break;
 }
-case 1510: {
+case 1620: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3261,7 +3265,7 @@ case 1510: {
     GEX_GL_CALL(glVertexAttrib4fv, index, v);
     break;
 }
-case 1511: {
+case 1621: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3273,7 +3277,7 @@ case 1511: {
     GEX_GL_CALL(glVertexAttrib4iv, index, v);
     break;
 }
-case 1512: {
+case 1622: {
     GLuint index = a.u32();
     GLshort x = a.i32();
     GLshort y = a.i32();
@@ -3282,7 +3286,7 @@ case 1512: {
     GEX_GL_CALL(glVertexAttrib4s, index, x, y, z, w);
     break;
 }
-case 1513: {
+case 1623: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3294,7 +3298,7 @@ case 1513: {
     GEX_GL_CALL(glVertexAttrib4sv, index, v);
     break;
 }
-case 1514: {
+case 1624: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3306,7 +3310,7 @@ case 1514: {
     GEX_GL_CALL(glVertexAttrib4ubv, index, v);
     break;
 }
-case 1515: {
+case 1625: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3318,7 +3322,7 @@ case 1515: {
     GEX_GL_CALL(glVertexAttrib4uiv, index, v);
     break;
 }
-case 1516: {
+case 1626: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3330,13 +3334,13 @@ case 1516: {
     GEX_GL_CALL(glVertexAttrib4usv, index, v);
     break;
 }
-case 1517: {
+case 1627: {
     GLuint attribindex = a.u32();
     GLuint bindingindex = a.u32();
     GEX_GL_CALL(glVertexAttribBinding, attribindex, bindingindex);
     break;
 }
-case 1519: {
+case 1629: {
     GLuint attribindex = a.u32();
     GLint size = a.i32();
     GLenum type = a.u32();
@@ -3345,13 +3349,13 @@ case 1519: {
     GEX_GL_CALL(glVertexAttribFormat, attribindex, size, type, normalized, relativeoffset);
     break;
 }
-case 1520: {
+case 1630: {
     GLuint index = a.u32();
     GLint x = a.i32();
     GEX_GL_CALL(glVertexAttribI1i, index, x);
     break;
 }
-case 1521: {
+case 1631: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3363,13 +3367,13 @@ case 1521: {
     GEX_GL_CALL(glVertexAttribI1iv, index, v);
     break;
 }
-case 1522: {
+case 1632: {
     GLuint index = a.u32();
     GLuint x = a.u32();
     GEX_GL_CALL(glVertexAttribI1ui, index, x);
     break;
 }
-case 1523: {
+case 1633: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3381,14 +3385,14 @@ case 1523: {
     GEX_GL_CALL(glVertexAttribI1uiv, index, v);
     break;
 }
-case 1524: {
+case 1634: {
     GLuint index = a.u32();
     GLint x = a.i32();
     GLint y = a.i32();
     GEX_GL_CALL(glVertexAttribI2i, index, x, y);
     break;
 }
-case 1525: {
+case 1635: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3400,14 +3404,14 @@ case 1525: {
     GEX_GL_CALL(glVertexAttribI2iv, index, v);
     break;
 }
-case 1526: {
+case 1636: {
     GLuint index = a.u32();
     GLuint x = a.u32();
     GLuint y = a.u32();
     GEX_GL_CALL(glVertexAttribI2ui, index, x, y);
     break;
 }
-case 1527: {
+case 1637: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3419,7 +3423,7 @@ case 1527: {
     GEX_GL_CALL(glVertexAttribI2uiv, index, v);
     break;
 }
-case 1528: {
+case 1638: {
     GLuint index = a.u32();
     GLint x = a.i32();
     GLint y = a.i32();
@@ -3427,7 +3431,7 @@ case 1528: {
     GEX_GL_CALL(glVertexAttribI3i, index, x, y, z);
     break;
 }
-case 1529: {
+case 1639: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3439,7 +3443,7 @@ case 1529: {
     GEX_GL_CALL(glVertexAttribI3iv, index, v);
     break;
 }
-case 1530: {
+case 1640: {
     GLuint index = a.u32();
     GLuint x = a.u32();
     GLuint y = a.u32();
@@ -3447,7 +3451,7 @@ case 1530: {
     GEX_GL_CALL(glVertexAttribI3ui, index, x, y, z);
     break;
 }
-case 1531: {
+case 1641: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3459,7 +3463,7 @@ case 1531: {
     GEX_GL_CALL(glVertexAttribI3uiv, index, v);
     break;
 }
-case 1532: {
+case 1642: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3471,7 +3475,7 @@ case 1532: {
     GEX_GL_CALL(glVertexAttribI4bv, index, v);
     break;
 }
-case 1534: {
+case 1644: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3483,7 +3487,7 @@ case 1534: {
     GEX_GL_CALL(glVertexAttribI4iv, index, v);
     break;
 }
-case 1535: {
+case 1645: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3495,7 +3499,7 @@ case 1535: {
     GEX_GL_CALL(glVertexAttribI4sv, index, v);
     break;
 }
-case 1536: {
+case 1646: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3507,7 +3511,7 @@ case 1536: {
     GEX_GL_CALL(glVertexAttribI4ubv, index, v);
     break;
 }
-case 1537: {
+case 1647: {
     GLuint index = a.u32();
     GLuint x = a.u32();
     GLuint y = a.u32();
@@ -3516,7 +3520,7 @@ case 1537: {
     GEX_GL_CALL(glVertexAttribI4ui, index, x, y, z, w);
     break;
 }
-case 1538: {
+case 1648: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3528,7 +3532,7 @@ case 1538: {
     GEX_GL_CALL(glVertexAttribI4uiv, index, v);
     break;
 }
-case 1539: {
+case 1649: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3540,7 +3544,7 @@ case 1539: {
     GEX_GL_CALL(glVertexAttribI4usv, index, v);
     break;
 }
-case 1540: {
+case 1650: {
     GLuint attribindex = a.u32();
     GLint size = a.i32();
     GLenum type = a.u32();
@@ -3548,13 +3552,13 @@ case 1540: {
     GEX_GL_CALL(glVertexAttribIFormat, attribindex, size, type, relativeoffset);
     break;
 }
-case 1542: {
+case 1652: {
     GLuint index = a.u32();
     GLdouble x = a.f64();
     GEX_GL_CALL(glVertexAttribL1d, index, x);
     break;
 }
-case 1543: {
+case 1653: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3566,14 +3570,14 @@ case 1543: {
     GEX_GL_CALL(glVertexAttribL1dv, index, v);
     break;
 }
-case 1544: {
+case 1654: {
     GLuint index = a.u32();
     GLdouble x = a.f64();
     GLdouble y = a.f64();
     GEX_GL_CALL(glVertexAttribL2d, index, x, y);
     break;
 }
-case 1545: {
+case 1655: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3585,7 +3589,7 @@ case 1545: {
     GEX_GL_CALL(glVertexAttribL2dv, index, v);
     break;
 }
-case 1546: {
+case 1656: {
     GLuint index = a.u32();
     GLdouble x = a.f64();
     GLdouble y = a.f64();
@@ -3593,7 +3597,7 @@ case 1546: {
     GEX_GL_CALL(glVertexAttribL3d, index, x, y, z);
     break;
 }
-case 1547: {
+case 1657: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3605,7 +3609,7 @@ case 1547: {
     GEX_GL_CALL(glVertexAttribL3dv, index, v);
     break;
 }
-case 1548: {
+case 1658: {
     GLuint index = a.u32();
     GLdouble x = a.f64();
     GLdouble y = a.f64();
@@ -3614,7 +3618,7 @@ case 1548: {
     GEX_GL_CALL(glVertexAttribL4d, index, x, y, z, w);
     break;
 }
-case 1549: {
+case 1659: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);
@@ -3626,7 +3630,7 @@ case 1549: {
     GEX_GL_CALL(glVertexAttribL4dv, index, v);
     break;
 }
-case 1550: {
+case 1660: {
     GLuint attribindex = a.u32();
     GLint size = a.i32();
     GLenum type = a.u32();
@@ -3634,7 +3638,7 @@ case 1550: {
     GEX_GL_CALL(glVertexAttribLFormat, attribindex, size, type, relativeoffset);
     break;
 }
-case 1551: {
+case 1661: {
     GLuint index = a.u32();
     GLint size = a.i32();
     GLenum type = a.u32();
@@ -3643,7 +3647,7 @@ case 1551: {
     GEX_GL_CALL(glVertexAttribLPointer, index, size, type, stride, pointer);
     break;
 }
-case 1552: {
+case 1662: {
     GLuint index = a.u32();
     GLenum type = a.u32();
     GLboolean normalized = a.u32();
@@ -3651,7 +3655,7 @@ case 1552: {
     GEX_GL_CALL(glVertexAttribP1ui, index, type, normalized, value);
     break;
 }
-case 1553: {
+case 1663: {
     GLuint index = a.u32();
     GLenum type = a.u32();
     GLboolean normalized = a.u32();
@@ -3665,7 +3669,7 @@ case 1553: {
     GEX_GL_CALL(glVertexAttribP1uiv, index, type, normalized, value);
     break;
 }
-case 1554: {
+case 1664: {
     GLuint index = a.u32();
     GLenum type = a.u32();
     GLboolean normalized = a.u32();
@@ -3673,7 +3677,7 @@ case 1554: {
     GEX_GL_CALL(glVertexAttribP2ui, index, type, normalized, value);
     break;
 }
-case 1555: {
+case 1665: {
     GLuint index = a.u32();
     GLenum type = a.u32();
     GLboolean normalized = a.u32();
@@ -3687,7 +3691,7 @@ case 1555: {
     GEX_GL_CALL(glVertexAttribP2uiv, index, type, normalized, value);
     break;
 }
-case 1556: {
+case 1666: {
     GLuint index = a.u32();
     GLenum type = a.u32();
     GLboolean normalized = a.u32();
@@ -3695,7 +3699,7 @@ case 1556: {
     GEX_GL_CALL(glVertexAttribP3ui, index, type, normalized, value);
     break;
 }
-case 1557: {
+case 1667: {
     GLuint index = a.u32();
     GLenum type = a.u32();
     GLboolean normalized = a.u32();
@@ -3709,7 +3713,7 @@ case 1557: {
     GEX_GL_CALL(glVertexAttribP3uiv, index, type, normalized, value);
     break;
 }
-case 1558: {
+case 1668: {
     GLuint index = a.u32();
     GLenum type = a.u32();
     GLboolean normalized = a.u32();
@@ -3717,7 +3721,7 @@ case 1558: {
     GEX_GL_CALL(glVertexAttribP4ui, index, type, normalized, value);
     break;
 }
-case 1559: {
+case 1669: {
     GLuint index = a.u32();
     GLenum type = a.u32();
     GLboolean normalized = a.u32();
@@ -3731,13 +3735,13 @@ case 1559: {
     GEX_GL_CALL(glVertexAttribP4uiv, index, type, normalized, value);
     break;
 }
-case 1561: {
+case 1671: {
     GLuint bindingindex = a.u32();
     GLuint divisor = a.u32();
     GEX_GL_CALL(glVertexBindingDivisor, bindingindex, divisor);
     break;
 }
-case 1563: {
+case 1673: {
     GLuint first = a.u32();
     GLsizei count = a.i32();
     uint32_t v_bytes = 0;
@@ -3753,7 +3757,7 @@ case 1563: {
     GEX_GL_CALL(glViewportArrayv, first, count, v);
     break;
 }
-case 1564: {
+case 1674: {
     GLuint index = a.u32();
     GLfloat x = a.f32();
     GLfloat y = a.f32();
@@ -3762,7 +3766,7 @@ case 1564: {
     GEX_GL_CALL(glViewportIndexedf, index, x, y, w, h);
     break;
 }
-case 1565: {
+case 1675: {
     GLuint index = a.u32();
     uint32_t v_bytes = 0;
     const uint8_t *v_wire = a.blob(v_bytes);

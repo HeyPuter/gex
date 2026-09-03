@@ -136,14 +136,14 @@ void glBindSamplers(unsigned first, int count, const unsigned *samplers) {
 void glBindTextures(unsigned first, int count, const unsigned *names) {
     if (count < 0 || (size_t)count > UINT32_MAX / sizeof(*names)) return;
     size_t blob_len = names ? (size_t)count * sizeof(*names) : 0;
-    uint32_t *a = begin(1047, 2, 4 + blob_len);
+    uint32_t *a = begin(1048, 2, 4 + blob_len);
     if (!a) return;
     a[0] = (uint32_t)(first);
     a[1] = (uint32_t)(count);
     put_blob(a + 2, names, blob_len);
 }
 void glBindVertexBuffer(unsigned bindingindex, unsigned buffer, long offset, int stride) {
-    uint32_t *packet = begin(1050, 5, 0);
+    uint32_t *packet = begin(1051, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(bindingindex);
@@ -165,7 +165,7 @@ void glBindVertexBuffers(unsigned first, int count, const unsigned *buffers,
     size_t third_bytes = buffers ? (size_t)count * sizeof(*strides) : 0;
     size_t tail = 12 + ((names_bytes + 3) & ~3u) +
                   ((offsets_bytes + 3) & ~3u) + ((third_bytes + 3) & ~3u);
-    uint32_t *a = begin(1051, 2, tail);
+    uint32_t *a = begin(1052, 2, tail);
     if (!a) return;
     a[0] = first; a[1] = (uint32_t)count;
     uint32_t *wire = a + 2;
@@ -174,7 +174,7 @@ void glBindVertexBuffers(unsigned first, int count, const unsigned *buffers,
     put_blob(wire, strides, third_bytes);
 }
 void glBlendEquationSeparatei(unsigned buf, unsigned modeRGB, unsigned modeAlpha) {
-    uint32_t *packet = begin(1055, 3, 0);
+    uint32_t *packet = begin(1056, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(buf);
@@ -182,14 +182,14 @@ void glBlendEquationSeparatei(unsigned buf, unsigned modeRGB, unsigned modeAlpha
     packet[at++] = (uint32_t)(modeAlpha);
 }
 void glBlendEquationi(unsigned buf, unsigned mode) {
-    uint32_t *packet = begin(1056, 2, 0);
+    uint32_t *packet = begin(1057, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(buf);
     packet[at++] = (uint32_t)(mode);
 }
 void glBlendFuncSeparatei(unsigned buf, unsigned srcRGB, unsigned dstRGB, unsigned srcAlpha, unsigned dstAlpha) {
-    uint32_t *packet = begin(1059, 5, 0);
+    uint32_t *packet = begin(1060, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(buf);
@@ -199,7 +199,7 @@ void glBlendFuncSeparatei(unsigned buf, unsigned srcRGB, unsigned dstRGB, unsign
     packet[at++] = (uint32_t)(dstAlpha);
 }
 void glBlendFunci(unsigned buf, unsigned src, unsigned dst) {
-    uint32_t *packet = begin(1060, 3, 0);
+    uint32_t *packet = begin(1061, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(buf);
@@ -215,7 +215,7 @@ void glBufferStorage(unsigned target, long size, const void *data, unsigned flag
         object->storage_flags = flags;
         object->has_storage_flags = 1;
     }
-    uint32_t *a = begin(1063, 5, 4 + blob_len);
+    uint32_t *a = begin(1065, 5, 4 + blob_len);
     if (!a) return;
     uint64_t bytes = (uint64_t)size;
     a[0] = target; a[1] = (uint32_t)bytes; a[2] = (uint32_t)(bytes >> 32);
@@ -223,7 +223,7 @@ void glBufferStorage(unsigned target, long size, const void *data, unsigned flag
     a[4] = data != NULL; put_blob(a + 5, data, blob_len);
 }
 void glClampColor(unsigned target, unsigned clamp) {
-    uint32_t *packet = begin(1066, 2, 0);
+    uint32_t *packet = begin(1069, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -232,7 +232,7 @@ void glClampColor(unsigned target, unsigned clamp) {
 void glClearBufferData(unsigned target, unsigned internalformat, unsigned format, unsigned type, const void *data) {
     size_t value_bytes = gexgl_pixel_group_bytes(format, type);
     size_t blob_len = data ? value_bytes : 0;
-    uint32_t *a = begin(1068, 4, 4 + blob_len);
+    uint32_t *a = begin(1071, 4, 4 + blob_len);
     if (!a) return;
     a[0] = (uint32_t)(target);
     a[1] = (uint32_t)(internalformat);
@@ -243,7 +243,7 @@ void glClearBufferData(unsigned target, unsigned internalformat, unsigned format
 void glClearBufferSubData(unsigned target, unsigned internalformat, long offset, long size, unsigned format, unsigned type, const void *data) {
     size_t value_bytes = gexgl_pixel_group_bytes(format, type);
     size_t blob_len = data ? value_bytes : 0;
-    uint32_t *a = begin(1069, 8, 4 + blob_len);
+    uint32_t *a = begin(1072, 8, 4 + blob_len);
     if (!a) return;
     a[0] = (uint32_t)(target);
     a[1] = (uint32_t)(internalformat);
@@ -260,7 +260,7 @@ void glClearBufferSubData(unsigned target, unsigned internalformat, long offset,
     put_blob(a + 8, data, blob_len);
 }
 void glClearDepth(double depth) {
-    uint32_t *packet = begin(1075, 2, 0);
+    uint32_t *packet = begin(1078, 2, 0);
     if (!packet) return;
     size_t at = 0;
     uint64_t bits_depth;
@@ -271,7 +271,7 @@ void glClearDepth(double depth) {
 void glClearTexImage(unsigned texture, int level, unsigned format, unsigned type, const void *data) {
     size_t value_bytes = gexgl_pixel_group_bytes(format, type);
     size_t blob_len = data ? value_bytes : 0;
-    uint32_t *a = begin(1078, 4, 4 + blob_len);
+    uint32_t *a = begin(1087, 4, 4 + blob_len);
     if (!a) return;
     a[0] = (uint32_t)(texture);
     a[1] = (uint32_t)(level);
@@ -282,7 +282,7 @@ void glClearTexImage(unsigned texture, int level, unsigned format, unsigned type
 void glClearTexSubImage(unsigned texture, int level, int xoffset, int yoffset, int zoffset, int width, int height, int depth, unsigned format, unsigned type, const void *data) {
     size_t value_bytes = gexgl_pixel_group_bytes(format, type);
     size_t blob_len = data ? value_bytes : 0;
-    uint32_t *a = begin(1079, 10, 4 + blob_len);
+    uint32_t *a = begin(1088, 10, 4 + blob_len);
     if (!a) return;
     a[0] = (uint32_t)(texture);
     a[1] = (uint32_t)(level);
@@ -297,7 +297,7 @@ void glClearTexSubImage(unsigned texture, int level, int xoffset, int yoffset, i
     put_blob(a + 10, data, blob_len);
 }
 void glColorMaski(unsigned index, unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
-    uint32_t *packet = begin(1082, 5, 0);
+    uint32_t *packet = begin(1092, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -309,7 +309,7 @@ void glColorMaski(unsigned index, unsigned char r, unsigned char g, unsigned cha
 void glCompressedTexImage1D(unsigned target, int level, unsigned internalformat, int width, int border, int imageSize, const void *data) {
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
-    uint32_t *packet = begin(1084, 10, blob_len);
+    uint32_t *packet = begin(1094, 10, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -327,7 +327,7 @@ void glCompressedTexImage1D(unsigned target, int level, unsigned internalformat,
 void glCompressedTexImage2D(unsigned target, int level, unsigned internalformat, int width, int height, int border, int imageSize, const void *data) {
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
-    uint32_t *packet = begin(1085, 11, blob_len);
+    uint32_t *packet = begin(1095, 11, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -346,7 +346,7 @@ void glCompressedTexImage2D(unsigned target, int level, unsigned internalformat,
 void glCompressedTexImage3D(unsigned target, int level, unsigned internalformat, int width, int height, int depth, int border, int imageSize, const void *data) {
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
-    uint32_t *packet = begin(1086, 12, blob_len);
+    uint32_t *packet = begin(1096, 12, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -366,7 +366,7 @@ void glCompressedTexImage3D(unsigned target, int level, unsigned internalformat,
 void glCompressedTexSubImage1D(unsigned target, int level, int xoffset, int width, unsigned format, int imageSize, const void *data) {
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
-    uint32_t *packet = begin(1087, 10, blob_len);
+    uint32_t *packet = begin(1097, 10, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -384,7 +384,7 @@ void glCompressedTexSubImage1D(unsigned target, int level, int xoffset, int widt
 void glCompressedTexSubImage2D(unsigned target, int level, int xoffset, int yoffset, int width, int height, unsigned format, int imageSize, const void *data) {
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
-    uint32_t *packet = begin(1088, 12, blob_len);
+    uint32_t *packet = begin(1098, 12, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -404,7 +404,7 @@ void glCompressedTexSubImage2D(unsigned target, int level, int xoffset, int yoff
 void glCompressedTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, int zoffset, int width, int height, int depth, unsigned format, int imageSize, const void *data) {
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
-    uint32_t *packet = begin(1089, 14, blob_len);
+    uint32_t *packet = begin(1099, 14, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -424,7 +424,7 @@ void glCompressedTexSubImage3D(unsigned target, int level, int xoffset, int yoff
     put_blob(packet + at, data, blob_len);
 }
 void glCopyBufferSubData(unsigned readTarget, unsigned writeTarget, long readOffset, long writeOffset, long size) {
-    uint32_t *packet = begin(1090, 8, 0);
+    uint32_t *packet = begin(1103, 8, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(readTarget);
@@ -443,7 +443,7 @@ void glCopyBufferSubData(unsigned readTarget, unsigned writeTarget, long readOff
     packet[at++] = (uint32_t)(bits_size >> 32);
 }
 void glCopyImageSubData(unsigned srcName, unsigned srcTarget, int srcLevel, int srcX, int srcY, int srcZ, unsigned dstName, unsigned dstTarget, int dstLevel, int dstX, int dstY, int dstZ, int srcWidth, int srcHeight, int srcDepth) {
-    uint32_t *packet = begin(1091, 15, 0);
+    uint32_t *packet = begin(1104, 15, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(srcName);
@@ -463,7 +463,7 @@ void glCopyImageSubData(unsigned srcName, unsigned srcTarget, int srcLevel, int 
     packet[at++] = (uint32_t)(srcDepth);
 }
 void glCopyTexImage1D(unsigned target, int level, unsigned internalformat, int x, int y, int width, int border) {
-    uint32_t *packet = begin(1092, 7, 0);
+    uint32_t *packet = begin(1106, 7, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -475,7 +475,7 @@ void glCopyTexImage1D(unsigned target, int level, unsigned internalformat, int x
     packet[at++] = (uint32_t)(border);
 }
 void glCopyTexImage2D(unsigned target, int level, unsigned internalformat, int x, int y, int width, int height, int border) {
-    uint32_t *packet = begin(1093, 8, 0);
+    uint32_t *packet = begin(1107, 8, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -488,7 +488,7 @@ void glCopyTexImage2D(unsigned target, int level, unsigned internalformat, int x
     packet[at++] = (uint32_t)(border);
 }
 void glCopyTexSubImage1D(unsigned target, int level, int xoffset, int x, int y, int width) {
-    uint32_t *packet = begin(1094, 6, 0);
+    uint32_t *packet = begin(1108, 6, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -499,7 +499,7 @@ void glCopyTexSubImage1D(unsigned target, int level, int xoffset, int x, int y, 
     packet[at++] = (uint32_t)(width);
 }
 void glCopyTexSubImage2D(unsigned target, int level, int xoffset, int yoffset, int x, int y, int width, int height) {
-    uint32_t *packet = begin(1095, 8, 0);
+    uint32_t *packet = begin(1109, 8, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -512,7 +512,7 @@ void glCopyTexSubImage2D(unsigned target, int level, int xoffset, int yoffset, i
     packet[at++] = (uint32_t)(height);
 }
 void glCopyTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, int zoffset, int x, int y, int width, int height) {
-    uint32_t *packet = begin(1096, 9, 0);
+    uint32_t *packet = begin(1110, 9, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -526,10 +526,10 @@ void glCopyTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, i
     packet[at++] = (uint32_t)(height);
 }
 void glDeleteProgramPipelines(int n, const unsigned *pipelines) {
-    delete_named_objects(1107, n, pipelines);
+    delete_named_objects(1133, n, pipelines);
 }
 void glDepthRange(double n, double f) {
-    uint32_t *packet = begin(1118, 4, 0);
+    uint32_t *packet = begin(1144, 4, 0);
     if (!packet) return;
     size_t at = 0;
     uint64_t bits_n;
@@ -546,7 +546,7 @@ void glDepthRangeArrayv(unsigned first, int count, const double *v) {
     if (v && count > 0 &&
         (size_t)count <= SIZE_MAX / (2u * sizeof(*v)))
         blob_len = (size_t)count * 2u * sizeof(*v);
-    uint32_t *packet = begin(1119, 3, blob_len);
+    uint32_t *packet = begin(1145, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(first);
@@ -554,7 +554,7 @@ void glDepthRangeArrayv(unsigned first, int count, const double *v) {
     put_blob(packet + at, v, blob_len);
 }
 void glDepthRangeIndexed(unsigned index, double n, double f) {
-    uint32_t *packet = begin(1120, 5, 0);
+    uint32_t *packet = begin(1146, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -568,7 +568,7 @@ void glDepthRangeIndexed(unsigned index, double n, double f) {
     packet[at++] = (uint32_t)(bits_f >> 32);
 }
 void glDisablei(unsigned target, unsigned index) {
-    uint32_t *packet = begin(1125, 2, 0);
+    uint32_t *packet = begin(1152, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -576,7 +576,7 @@ void glDisablei(unsigned target, unsigned index) {
 }
 void glDispatchCompute(unsigned num_groups_x, unsigned num_groups_y, unsigned num_groups_z) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1126, 3, 0);
+    uint32_t *packet = begin(1153, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(num_groups_x);
@@ -585,7 +585,7 @@ void glDispatchCompute(unsigned num_groups_x, unsigned num_groups_y, unsigned nu
 }
 void glDispatchComputeIndirect(long indirect) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1127, 2, 0);
+    uint32_t *packet = begin(1154, 2, 0);
     if (!packet) return;
     size_t at = 0;
     uint64_t bits_indirect;
@@ -595,7 +595,7 @@ void glDispatchComputeIndirect(long indirect) {
 }
 void glDrawArraysIndirect(unsigned mode, const void *indirect) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1129, 3, 0);
+    uint32_t *packet = begin(1156, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(mode);
@@ -605,7 +605,7 @@ void glDrawArraysIndirect(unsigned mode, const void *indirect) {
 }
 void glDrawArraysInstancedBaseInstance(unsigned mode, int first, int count, int instancecount, unsigned baseinstance) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1131, 5, 0);
+    uint32_t *packet = begin(1158, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(mode);
@@ -615,14 +615,14 @@ void glDrawArraysInstancedBaseInstance(unsigned mode, int first, int count, int 
     packet[at++] = (uint32_t)(baseinstance);
 }
 void glDrawBuffer(unsigned buf) {
-    uint32_t *packet = begin(1132, 1, 0);
+    uint32_t *packet = begin(1159, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(buf);
 }
 void glDrawElementsIndirect(unsigned mode, unsigned type, const void *indirect) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1136, 4, 0);
+    uint32_t *packet = begin(1163, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(mode);
@@ -633,7 +633,7 @@ void glDrawElementsIndirect(unsigned mode, unsigned type, const void *indirect) 
 }
 void glDrawTransformFeedback(unsigned mode, unsigned id) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1143, 2, 0);
+    uint32_t *packet = begin(1170, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(mode);
@@ -641,7 +641,7 @@ void glDrawTransformFeedback(unsigned mode, unsigned id) {
 }
 void glDrawTransformFeedbackInstanced(unsigned mode, unsigned id, int instancecount) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1144, 3, 0);
+    uint32_t *packet = begin(1171, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(mode);
@@ -650,7 +650,7 @@ void glDrawTransformFeedbackInstanced(unsigned mode, unsigned id, int instanceco
 }
 void glDrawTransformFeedbackStream(unsigned mode, unsigned id, unsigned stream) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1145, 3, 0);
+    uint32_t *packet = begin(1172, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(mode);
@@ -659,7 +659,7 @@ void glDrawTransformFeedbackStream(unsigned mode, unsigned id, unsigned stream) 
 }
 void glDrawTransformFeedbackStreamInstanced(unsigned mode, unsigned id, unsigned stream, int instancecount) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1146, 4, 0);
+    uint32_t *packet = begin(1173, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(mode);
@@ -668,35 +668,35 @@ void glDrawTransformFeedbackStreamInstanced(unsigned mode, unsigned id, unsigned
     packet[at++] = (uint32_t)(instancecount);
 }
 void glEnablei(unsigned target, unsigned index) {
-    uint32_t *packet = begin(1149, 2, 0);
+    uint32_t *packet = begin(1177, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
     packet[at++] = (uint32_t)(index);
 }
 void glEndConditionalRender(void) {
-    uint32_t *packet = begin(1150, 0, 0);
+    uint32_t *packet = begin(1178, 0, 0);
     if (!packet) return;
 }
 void glEndQuery(unsigned target) {
-    uint32_t *packet = begin(1151, 1, 0);
+    uint32_t *packet = begin(1179, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
 }
 void glEndQueryIndexed(unsigned target, unsigned index) {
-    uint32_t *packet = begin(1152, 2, 0);
+    uint32_t *packet = begin(1180, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
     packet[at++] = (uint32_t)(index);
 }
 void glEndTransformFeedback(void) {
-    uint32_t *packet = begin(1153, 0, 0);
+    uint32_t *packet = begin(1181, 0, 0);
     if (!packet) return;
 }
 void glFramebufferParameteri(unsigned target, unsigned pname, int param) {
-    uint32_t *packet = begin(1158, 3, 0);
+    uint32_t *packet = begin(1187, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -704,7 +704,7 @@ void glFramebufferParameteri(unsigned target, unsigned pname, int param) {
     packet[at++] = (uint32_t)(param);
 }
 void glFramebufferTexture(unsigned target, unsigned attachment, unsigned texture, int level) {
-    uint32_t *packet = begin(1160, 4, 0);
+    uint32_t *packet = begin(1189, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -713,7 +713,7 @@ void glFramebufferTexture(unsigned target, unsigned attachment, unsigned texture
     packet[at++] = (uint32_t)(level);
 }
 void glFramebufferTexture1D(unsigned target, unsigned attachment, unsigned textarget, unsigned texture, int level) {
-    uint32_t *packet = begin(1161, 5, 0);
+    uint32_t *packet = begin(1190, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -723,7 +723,7 @@ void glFramebufferTexture1D(unsigned target, unsigned attachment, unsigned texta
     packet[at++] = (uint32_t)(level);
 }
 void glFramebufferTexture3D(unsigned target, unsigned attachment, unsigned textarget, unsigned texture, int level, int zoffset) {
-    uint32_t *packet = begin(1163, 6, 0);
+    uint32_t *packet = begin(1192, 6, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -734,11 +734,11 @@ void glFramebufferTexture3D(unsigned target, unsigned attachment, unsigned texta
     packet[at++] = (uint32_t)(zoffset);
 }
 void glGenProgramPipelines(int n, unsigned *pipelines) {
-    gen_named_objects(1168, n, pipelines);
+    gen_named_objects(1197, n, pipelines);
 }
 void glGetActiveAtomicCounterBufferiv(unsigned program, unsigned bufferIndex, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1176, 3, 0);
+    uint32_t *packet = begin(1206, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -751,7 +751,7 @@ void glGetActiveAtomicCounterBufferiv(unsigned program, unsigned bufferIndex, un
 }
 void glGetBooleani_v(unsigned target, unsigned index, unsigned char *data) {
     const size_t expected = (size_t)gexgl_state_query_components(target) * sizeof(*data);
-    uint32_t *packet = begin(1188, 2, 0);
+    uint32_t *packet = begin(1218, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -763,7 +763,7 @@ void glGetBooleani_v(unsigned target, unsigned index, unsigned char *data) {
 }
 void glGetBooleanv(unsigned pname, unsigned char *data) {
     const size_t expected = (size_t)gexgl_state_query_components(pname) * sizeof(*data);
-    uint32_t *packet = begin(1189, 1, 0);
+    uint32_t *packet = begin(1219, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pname);
@@ -774,7 +774,7 @@ void glGetBooleanv(unsigned pname, unsigned char *data) {
 }
 void glGetBufferParameteri64v(unsigned target, unsigned pname, long long *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1190, 2, 0);
+    uint32_t *packet = begin(1220, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -797,7 +797,7 @@ void glGetBufferParameteriv(unsigned target, unsigned pname, int *params) {
         return;
     }
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1191, 2, 0);
+    uint32_t *packet = begin(1221, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -808,7 +808,7 @@ void glGetBufferParameteriv(unsigned target, unsigned pname, int *params) {
         memcpy(params, source, expected);
 }
 void glGetBufferSubData(unsigned target, long offset, long size, void *data) {
-    uint32_t *a = begin(1193, 5, 0);
+    uint32_t *a = begin(1223, 5, 0);
     if (!a) return;
     uint64_t off = (uint64_t)offset, bytes = (uint64_t)size;
     a[0] = target; a[1] = (uint32_t)off; a[2] = (uint32_t)(off >> 32);
@@ -818,7 +818,7 @@ void glGetBufferSubData(unsigned target, long offset, long size, void *data) {
 }
 void glGetCompressedTexImage(unsigned target, int level, void *img) {
     int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
-    uint32_t *a = begin(1194, 5, 0);
+    uint32_t *a = begin(1224, 5, 0);
     if (!a) return;
     uint64_t pointer = (uint64_t)(uintptr_t)img;
     a[0] = target; a[1] = (uint32_t)level; a[2] = (uint32_t)pbo;
@@ -829,7 +829,7 @@ void glGetCompressedTexImage(unsigned target, int level, void *img) {
 }
 void glGetDoublei_v(unsigned target, unsigned index, double *data) {
     const size_t expected = (size_t)gexgl_state_query_components(target) * sizeof(*data);
-    uint32_t *packet = begin(1196, 2, 0);
+    uint32_t *packet = begin(1228, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -841,7 +841,7 @@ void glGetDoublei_v(unsigned target, unsigned index, double *data) {
 }
 void glGetDoublev(unsigned pname, double *data) {
     const size_t expected = (size_t)gexgl_state_query_components(pname) * sizeof(*data);
-    uint32_t *packet = begin(1197, 1, 0);
+    uint32_t *packet = begin(1229, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pname);
@@ -852,7 +852,7 @@ void glGetDoublev(unsigned pname, double *data) {
 }
 void glGetFloati_v(unsigned target, unsigned index, float *data) {
     const size_t expected = (size_t)gexgl_state_query_components(target) * sizeof(*data);
-    uint32_t *packet = begin(1199, 2, 0);
+    uint32_t *packet = begin(1231, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -864,7 +864,7 @@ void glGetFloati_v(unsigned target, unsigned index, float *data) {
 }
 void glGetFloatv(unsigned pname, float *data) {
     const size_t expected = (size_t)gexgl_state_query_components(pname) * sizeof(*data);
-    uint32_t *packet = begin(1200, 1, 0);
+    uint32_t *packet = begin(1232, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pname);
@@ -876,7 +876,7 @@ void glGetFloatv(unsigned pname, float *data) {
 int glGetFragDataIndex(unsigned program, const char *name) {
     if (!name) return -1;
     size_t blob_len = strlen(name);
-    uint32_t *a = begin(1201, 1, 4 + blob_len);
+    uint32_t *a = begin(1233, 1, 4 + blob_len);
     if (!a) return -1;
     a[0] = (uint32_t)(program);
     put_blob(a + 1, name, blob_len);
@@ -885,7 +885,7 @@ int glGetFragDataIndex(unsigned program, const char *name) {
 int glGetFragDataLocation(unsigned program, const char *name) {
     if (!name) return -1;
     size_t blob_len = strlen(name);
-    uint32_t *a = begin(1202, 1, 4 + blob_len);
+    uint32_t *a = begin(1234, 1, 4 + blob_len);
     if (!a) return -1;
     a[0] = (uint32_t)(program);
     put_blob(a + 1, name, blob_len);
@@ -893,7 +893,7 @@ int glGetFragDataLocation(unsigned program, const char *name) {
 }
 void glGetFramebufferAttachmentParameteriv(unsigned target, unsigned attachment, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1203, 3, 0);
+    uint32_t *packet = begin(1235, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -906,7 +906,7 @@ void glGetFramebufferAttachmentParameteriv(unsigned target, unsigned attachment,
 }
 void glGetFramebufferParameteriv(unsigned target, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1204, 2, 0);
+    uint32_t *packet = begin(1236, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -919,7 +919,7 @@ void glGetFramebufferParameteriv(unsigned target, unsigned pname, int *params) {
 void glGetInteger64i_v(unsigned target, unsigned index, long long *data) {
     const size_t expected =
         (size_t)gexgl_indexed_query_components(target) * sizeof(*data);
-    uint32_t *a = begin(1205, 2, 0);
+    uint32_t *a = begin(1238, 2, 0);
     if (!a) return;
     a[0] = target; a[1] = index; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
@@ -928,7 +928,7 @@ void glGetInteger64i_v(unsigned target, unsigned index, long long *data) {
 }
 void glGetInteger64v(unsigned pname, long long *data) {
     const size_t expected = (size_t)gexgl_state_query_components(pname) * sizeof(*data);
-    uint32_t *packet = begin(1206, 1, 0);
+    uint32_t *packet = begin(1239, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pname);
@@ -940,7 +940,7 @@ void glGetInteger64v(unsigned pname, long long *data) {
 void glGetIntegeri_v(unsigned target, unsigned index, int *data) {
     const size_t expected =
         (size_t)gexgl_indexed_query_components(target) * sizeof(*data);
-    uint32_t *a = begin(1207, 2, 0);
+    uint32_t *a = begin(1240, 2, 0);
     if (!a) return;
     a[0] = target; a[1] = index; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
@@ -950,7 +950,7 @@ void glGetIntegeri_v(unsigned target, unsigned index, int *data) {
 void glGetInternalformati64v(unsigned target, unsigned internalformat, unsigned pname,
                                   int count, long long *params) {
     if (count < 0 || count > 4096) return;
-    uint32_t *a = begin(1209, 4, 0);
+    uint32_t *a = begin(1242, 4, 0);
     if (!a) return;
     a[0] = target; a[1] = internalformat; a[2] = pname; a[3] = (uint32_t)count;
     flush();
@@ -960,7 +960,7 @@ void glGetInternalformati64v(unsigned target, unsigned internalformat, unsigned 
 void glGetInternalformativ(unsigned target, unsigned internalformat, unsigned pname,
                                   int count, int *params) {
     if (count < 0 || count > 4096) return;
-    uint32_t *a = begin(1210, 4, 0);
+    uint32_t *a = begin(1243, 4, 0);
     if (!a) return;
     a[0] = target; a[1] = internalformat; a[2] = pname; a[3] = (uint32_t)count;
     flush();
@@ -968,14 +968,14 @@ void glGetInternalformativ(unsigned target, unsigned internalformat, unsigned pn
     if (params && source && bytes <= (uint32_t)count * sizeof(*params)) memcpy(params, source, bytes);
 }
 void glGetMultisamplefv(unsigned pname, unsigned index, float *val) {
-    uint32_t *a = begin(1211, 2, 0);
+    uint32_t *a = begin(1244, 2, 0);
     if (!a) return;
     a[0] = pname; a[1] = index; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     if (val && source && bytes == 2u * sizeof(*val)) memcpy(val, source, bytes);
 }
 void glGetProgramInterfaceiv(unsigned program, unsigned programInterface, unsigned pname, int *params) {
-    uint32_t *a = begin(1217, 3, 0);
+    uint32_t *a = begin(1257, 3, 0);
     if (!a) return;
     a[0] = program; a[1] = programInterface; a[2] = pname;
     flush();
@@ -983,7 +983,7 @@ void glGetProgramInterfaceiv(unsigned program, unsigned programInterface, unsign
 }
 void glGetProgramPipelineiv(unsigned pipeline, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1219, 2, 0);
+    uint32_t *packet = begin(1259, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pipeline);
@@ -996,7 +996,7 @@ void glGetProgramPipelineiv(unsigned pipeline, unsigned pname, int *params) {
 unsigned glGetProgramResourceIndex(unsigned program, unsigned programInterface, const char *name) {
     if (!name) return 0xffffffffu;
     size_t blob_len = strlen(name);
-    uint32_t *a = begin(1220, 2, 4 + blob_len);
+    uint32_t *a = begin(1260, 2, 4 + blob_len);
     if (!a) return 0xffffffffu;
     a[0] = program; a[1] = programInterface; put_blob(a + 2, name, blob_len);
     flush();
@@ -1005,7 +1005,7 @@ unsigned glGetProgramResourceIndex(unsigned program, unsigned programInterface, 
 int glGetProgramResourceLocation(unsigned program, unsigned programInterface, const char *name) {
     if (!name) return -1;
     size_t blob_len = strlen(name);
-    uint32_t *a = begin(1221, 2, 4 + blob_len);
+    uint32_t *a = begin(1261, 2, 4 + blob_len);
     if (!a) return -1;
     a[0] = program; a[1] = programInterface; put_blob(a + 2, name, blob_len);
     flush();
@@ -1014,7 +1014,7 @@ int glGetProgramResourceLocation(unsigned program, unsigned programInterface, co
 int glGetProgramResourceLocationIndex(unsigned program, unsigned programInterface, const char *name) {
     if (!name) return -1;
     size_t blob_len = strlen(name);
-    uint32_t *a = begin(1222, 2, 4 + blob_len);
+    uint32_t *a = begin(1262, 2, 4 + blob_len);
     if (!a) return -1;
     a[0] = program; a[1] = programInterface; put_blob(a + 2, name, blob_len);
     flush();
@@ -1022,7 +1022,7 @@ int glGetProgramResourceLocationIndex(unsigned program, unsigned programInterfac
 }
 void glGetProgramResourceName(unsigned program, unsigned programInterface, unsigned index, int bufSize,
                               int *length, char *name) {
-    uint32_t *a = begin(1223, 3, 0);
+    uint32_t *a = begin(1263, 3, 0);
     if (!a) return;
     a[0] = program; a[1] = programInterface; a[2] = index;
     flush();
@@ -1035,7 +1035,7 @@ void glGetProgramResourceName(unsigned program, unsigned programInterface, unsig
 void glGetProgramResourceiv(unsigned program, unsigned programInterface, unsigned index, int propCount,
                             const unsigned *props, int bufSize, int *length, int *params) {
     size_t blob_len = props && propCount > 0 ? (size_t)propCount * sizeof(*props) : 0;
-    uint32_t *a = begin(1224, 5, 4 + blob_len);
+    uint32_t *a = begin(1264, 5, 4 + blob_len);
     if (!a) return;
     a[0] = program; a[1] = programInterface; a[2] = index;
     a[3] = (uint32_t)propCount; a[4] = (uint32_t)bufSize; put_blob(a + 5, props, blob_len);
@@ -1049,7 +1049,7 @@ void glGetProgramResourceiv(unsigned program, unsigned programInterface, unsigne
 }
 void glGetProgramStageiv(unsigned program, unsigned shadertype, unsigned pname, int *values) {
     const size_t expected = (size_t)1u * sizeof(*values);
-    uint32_t *packet = begin(1225, 3, 0);
+    uint32_t *packet = begin(1265, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1062,7 +1062,7 @@ void glGetProgramStageiv(unsigned program, unsigned shadertype, unsigned pname, 
 }
 void glGetQueryIndexediv(unsigned target, unsigned index, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1227, 3, 0);
+    uint32_t *packet = begin(1271, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1075,7 +1075,7 @@ void glGetQueryIndexediv(unsigned target, unsigned index, unsigned pname, int *p
 }
 void glGetQueryObjecti64v(unsigned id, unsigned pname, long long *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1228, 2, 0);
+    uint32_t *packet = begin(1272, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(id);
@@ -1087,7 +1087,7 @@ void glGetQueryObjecti64v(unsigned id, unsigned pname, long long *params) {
 }
 void glGetQueryObjectiv(unsigned id, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1229, 2, 0);
+    uint32_t *packet = begin(1273, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(id);
@@ -1099,7 +1099,7 @@ void glGetQueryObjectiv(unsigned id, unsigned pname, int *params) {
 }
 void glGetQueryObjectui64v(unsigned id, unsigned pname, unsigned long long *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1230, 2, 0);
+    uint32_t *packet = begin(1274, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(id);
@@ -1111,7 +1111,7 @@ void glGetQueryObjectui64v(unsigned id, unsigned pname, unsigned long long *para
 }
 void glGetQueryObjectuiv(unsigned id, unsigned pname, unsigned *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1231, 2, 0);
+    uint32_t *packet = begin(1275, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(id);
@@ -1123,7 +1123,7 @@ void glGetQueryObjectuiv(unsigned id, unsigned pname, unsigned *params) {
 }
 void glGetQueryiv(unsigned target, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1232, 2, 0);
+    uint32_t *packet = begin(1276, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1135,7 +1135,7 @@ void glGetQueryiv(unsigned target, unsigned pname, int *params) {
 }
 void glGetRenderbufferParameteriv(unsigned target, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1233, 2, 0);
+    uint32_t *packet = begin(1277, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1147,7 +1147,7 @@ void glGetRenderbufferParameteriv(unsigned target, unsigned pname, int *params) 
 }
 void glGetSamplerParameterIiv(unsigned sampler, unsigned pname, int *params) {
     const size_t expected = (size_t)((pname) == 0x1004u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1234, 2, 0);
+    uint32_t *packet = begin(1278, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(sampler);
@@ -1159,7 +1159,7 @@ void glGetSamplerParameterIiv(unsigned sampler, unsigned pname, int *params) {
 }
 void glGetSamplerParameterIuiv(unsigned sampler, unsigned pname, unsigned *params) {
     const size_t expected = (size_t)((pname) == 0x1004u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1235, 2, 0);
+    uint32_t *packet = begin(1279, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(sampler);
@@ -1171,7 +1171,7 @@ void glGetSamplerParameterIuiv(unsigned sampler, unsigned pname, unsigned *param
 }
 void glGetSamplerParameterfv(unsigned sampler, unsigned pname, float *params) {
     const size_t expected = (size_t)((pname) == 0x1004u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1236, 2, 0);
+    uint32_t *packet = begin(1280, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(sampler);
@@ -1183,7 +1183,7 @@ void glGetSamplerParameterfv(unsigned sampler, unsigned pname, float *params) {
 }
 void glGetSamplerParameteriv(unsigned sampler, unsigned pname, int *params) {
     const size_t expected = (size_t)((pname) == 0x1004u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1237, 2, 0);
+    uint32_t *packet = begin(1281, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(sampler);
@@ -1196,7 +1196,7 @@ void glGetSamplerParameteriv(unsigned sampler, unsigned pname, int *params) {
 unsigned glGetSubroutineIndex(unsigned program, unsigned shadertype, const char *name) {
     if (!name) return 0xffffffffu;
     size_t blob_len = strlen(name);
-    uint32_t *a = begin(1244, 2, 4 + blob_len);
+    uint32_t *a = begin(1288, 2, 4 + blob_len);
     if (!a) return 0xffffffffu;
     a[0] = (uint32_t)(program);
     a[1] = (uint32_t)(shadertype);
@@ -1206,7 +1206,7 @@ unsigned glGetSubroutineIndex(unsigned program, unsigned shadertype, const char 
 int glGetSubroutineUniformLocation(unsigned program, unsigned shadertype, const char *name) {
     if (!name) return -1;
     size_t blob_len = strlen(name);
-    uint32_t *a = begin(1245, 2, 4 + blob_len);
+    uint32_t *a = begin(1289, 2, 4 + blob_len);
     if (!a) return -1;
     a[0] = (uint32_t)(program);
     a[1] = (uint32_t)(shadertype);
@@ -1216,7 +1216,7 @@ int glGetSubroutineUniformLocation(unsigned program, unsigned shadertype, const 
 void glGetTexImage(unsigned target, int level, unsigned format, unsigned type,
                        void *pixels) {
     int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
-    uint32_t *a = begin(1247, 7, 0);
+    uint32_t *a = begin(1291, 7, 0);
     if (!a) return;
     a[0] = target; a[1] = (uint32_t)level; a[2] = format; a[3] = type;
     a[4] = (uint32_t)pbo;
@@ -1250,7 +1250,7 @@ void glGetTexImage(unsigned target, int level, unsigned format, unsigned type,
 }
 void glGetTexLevelParameterfv(unsigned target, int level, unsigned pname, float *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1248, 3, 0);
+    uint32_t *packet = begin(1292, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1263,7 +1263,7 @@ void glGetTexLevelParameterfv(unsigned target, int level, unsigned pname, float 
 }
 void glGetTexLevelParameteriv(unsigned target, int level, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1249, 3, 0);
+    uint32_t *packet = begin(1293, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1276,7 +1276,7 @@ void glGetTexLevelParameteriv(unsigned target, int level, unsigned pname, int *p
 }
 void glGetTexParameterIiv(unsigned target, unsigned pname, int *params) {
     const size_t expected = (size_t)((pname) == 0x1004u || (pname) == 0x8e46u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1250, 2, 0);
+    uint32_t *packet = begin(1294, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1288,7 +1288,7 @@ void glGetTexParameterIiv(unsigned target, unsigned pname, int *params) {
 }
 void glGetTexParameterIuiv(unsigned target, unsigned pname, unsigned *params) {
     const size_t expected = (size_t)((pname) == 0x1004u || (pname) == 0x8e46u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1251, 2, 0);
+    uint32_t *packet = begin(1295, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1300,7 +1300,7 @@ void glGetTexParameterIuiv(unsigned target, unsigned pname, unsigned *params) {
 }
 void glGetTexParameterfv(unsigned target, unsigned pname, float *params) {
     const size_t expected = (size_t)((pname) == 0x1004u || (pname) == 0x8e46u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1252, 2, 0);
+    uint32_t *packet = begin(1296, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1312,7 +1312,7 @@ void glGetTexParameterfv(unsigned target, unsigned pname, float *params) {
 }
 void glGetTexParameteriv(unsigned target, unsigned pname, int *params) {
     const size_t expected = (size_t)((pname) == 0x1004u || (pname) == 0x8e46u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1253, 2, 0);
+    uint32_t *packet = begin(1297, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1324,7 +1324,7 @@ void glGetTexParameteriv(unsigned target, unsigned pname, int *params) {
 }
 void glGetUniformSubroutineuiv(unsigned shadertype, int location, unsigned *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
-    uint32_t *packet = begin(1258, 2, 0);
+    uint32_t *packet = begin(1313, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(shadertype);
@@ -1335,14 +1335,14 @@ void glGetUniformSubroutineuiv(unsigned shadertype, int location, unsigned *para
         memcpy(params, source, expected);
 }
 void glGetUniformdv(unsigned program, int location, double *params) {
-    uint32_t *a = begin(1259, 2, 0);
+    uint32_t *a = begin(1314, 2, 0);
     if (!a) return;
     a[0] = program; a[1] = (uint32_t)location; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     if (params && source && bytes <= 16u * sizeof(*params)) memcpy(params, source, bytes);
 }
 void glGetUniformuiv(unsigned program, int location, unsigned *params) {
-    uint32_t *a = begin(1262, 2, 0);
+    uint32_t *a = begin(1317, 2, 0);
     if (!a) return;
     a[0] = program; a[1] = (uint32_t)location; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
@@ -1350,7 +1350,7 @@ void glGetUniformuiv(unsigned program, int location, unsigned *params) {
 }
 void glGetVertexAttribIiv(unsigned index, unsigned pname, int *params) {
     const size_t expected = (size_t)((pname) == 0x8626u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1263, 2, 0);
+    uint32_t *packet = begin(1321, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -1362,7 +1362,7 @@ void glGetVertexAttribIiv(unsigned index, unsigned pname, int *params) {
 }
 void glGetVertexAttribIuiv(unsigned index, unsigned pname, unsigned *params) {
     const size_t expected = (size_t)((pname) == 0x8626u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1264, 2, 0);
+    uint32_t *packet = begin(1322, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -1374,7 +1374,7 @@ void glGetVertexAttribIuiv(unsigned index, unsigned pname, unsigned *params) {
 }
 void glGetVertexAttribLdv(unsigned index, unsigned pname, double *params) {
     const size_t expected = (size_t)((pname) == 0x8626u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1265, 2, 0);
+    uint32_t *packet = begin(1323, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -1386,7 +1386,7 @@ void glGetVertexAttribLdv(unsigned index, unsigned pname, double *params) {
 }
 void glGetVertexAttribdv(unsigned index, unsigned pname, double *params) {
     const size_t expected = (size_t)((pname) == 0x8626u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1267, 2, 0);
+    uint32_t *packet = begin(1325, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -1398,7 +1398,7 @@ void glGetVertexAttribdv(unsigned index, unsigned pname, double *params) {
 }
 void glGetVertexAttribfv(unsigned index, unsigned pname, float *params) {
     const size_t expected = (size_t)((pname) == 0x8626u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1268, 2, 0);
+    uint32_t *packet = begin(1326, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -1410,7 +1410,7 @@ void glGetVertexAttribfv(unsigned index, unsigned pname, float *params) {
 }
 void glGetVertexAttribiv(unsigned index, unsigned pname, int *params) {
     const size_t expected = (size_t)((pname) == 0x8626u ? 4u : 1u) * sizeof(*params);
-    uint32_t *packet = begin(1269, 2, 0);
+    uint32_t *packet = begin(1327, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -1421,13 +1421,13 @@ void glGetVertexAttribiv(unsigned index, unsigned pname, int *params) {
         memcpy(params, source, expected);
 }
 void glInvalidateBufferData(unsigned buffer) {
-    uint32_t *packet = begin(1271, 1, 0);
+    uint32_t *packet = begin(1335, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(buffer);
 }
 void glInvalidateBufferSubData(unsigned buffer, long offset, long length) {
-    uint32_t *packet = begin(1272, 5, 0);
+    uint32_t *packet = begin(1336, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(buffer);
@@ -1445,7 +1445,7 @@ void glInvalidateFramebuffer(unsigned target, int numAttachments, const unsigned
     if (attachments && numAttachments > 0 &&
         (size_t)numAttachments <= SIZE_MAX / (1u * sizeof(*attachments)))
         blob_len = (size_t)numAttachments * 1u * sizeof(*attachments);
-    uint32_t *packet = begin(1273, 3, blob_len);
+    uint32_t *packet = begin(1337, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1453,14 +1453,14 @@ void glInvalidateFramebuffer(unsigned target, int numAttachments, const unsigned
     put_blob(packet + at, attachments, blob_len);
 }
 void glInvalidateTexImage(unsigned texture, int level) {
-    uint32_t *packet = begin(1275, 2, 0);
+    uint32_t *packet = begin(1341, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(texture);
     packet[at++] = (uint32_t)(level);
 }
 void glInvalidateTexSubImage(unsigned texture, int level, int xoffset, int yoffset, int zoffset, int width, int height, int depth) {
-    uint32_t *packet = begin(1276, 8, 0);
+    uint32_t *packet = begin(1342, 8, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(texture);
@@ -1473,7 +1473,7 @@ void glInvalidateTexSubImage(unsigned texture, int level, int xoffset, int yoffs
     packet[at++] = (uint32_t)(depth);
 }
 unsigned char glIsBuffer(unsigned buffer) {
-    uint32_t *packet = begin(1277, 1, 0);
+    uint32_t *packet = begin(1343, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(buffer);
@@ -1481,7 +1481,7 @@ unsigned char glIsBuffer(unsigned buffer) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsEnabled(unsigned cap) {
-    uint32_t *packet = begin(1278, 1, 0);
+    uint32_t *packet = begin(1344, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(cap);
@@ -1489,7 +1489,7 @@ unsigned char glIsEnabled(unsigned cap) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsEnabledi(unsigned target, unsigned index) {
-    uint32_t *packet = begin(1279, 2, 0);
+    uint32_t *packet = begin(1345, 2, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -1498,7 +1498,7 @@ unsigned char glIsEnabledi(unsigned target, unsigned index) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsFramebuffer(unsigned framebuffer) {
-    uint32_t *packet = begin(1280, 1, 0);
+    uint32_t *packet = begin(1346, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(framebuffer);
@@ -1506,7 +1506,7 @@ unsigned char glIsFramebuffer(unsigned framebuffer) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsProgram(unsigned program) {
-    uint32_t *packet = begin(1281, 1, 0);
+    uint32_t *packet = begin(1347, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1514,7 +1514,7 @@ unsigned char glIsProgram(unsigned program) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsProgramPipeline(unsigned pipeline) {
-    uint32_t *packet = begin(1282, 1, 0);
+    uint32_t *packet = begin(1348, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(pipeline);
@@ -1522,7 +1522,7 @@ unsigned char glIsProgramPipeline(unsigned pipeline) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsRenderbuffer(unsigned renderbuffer) {
-    uint32_t *packet = begin(1284, 1, 0);
+    uint32_t *packet = begin(1350, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(renderbuffer);
@@ -1530,7 +1530,7 @@ unsigned char glIsRenderbuffer(unsigned renderbuffer) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsSampler(unsigned sampler) {
-    uint32_t *packet = begin(1285, 1, 0);
+    uint32_t *packet = begin(1351, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(sampler);
@@ -1538,7 +1538,7 @@ unsigned char glIsSampler(unsigned sampler) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsShader(unsigned shader) {
-    uint32_t *packet = begin(1286, 1, 0);
+    uint32_t *packet = begin(1352, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(shader);
@@ -1546,7 +1546,7 @@ unsigned char glIsShader(unsigned shader) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsTexture(unsigned texture) {
-    uint32_t *packet = begin(1288, 1, 0);
+    uint32_t *packet = begin(1354, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(texture);
@@ -1554,7 +1554,7 @@ unsigned char glIsTexture(unsigned texture) {
     return (unsigned char)reply_u32();
 }
 unsigned char glIsVertexArray(unsigned array) {
-    uint32_t *packet = begin(1290, 1, 0);
+    uint32_t *packet = begin(1356, 1, 0);
     if (!packet) return 0;
     size_t at = 0;
     packet[at++] = (uint32_t)(array);
@@ -1562,19 +1562,19 @@ unsigned char glIsVertexArray(unsigned array) {
     return (unsigned char)reply_u32();
 }
 void glLogicOp(unsigned opcode) {
-    uint32_t *packet = begin(1293, 1, 0);
+    uint32_t *packet = begin(1359, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(opcode);
 }
 void glMemoryBarrier(unsigned barriers) {
-    uint32_t *packet = begin(1296, 1, 0);
+    uint32_t *packet = begin(1364, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(barriers);
 }
 void glMinSampleShading(float value) {
-    uint32_t *packet = begin(1297, 1, 0);
+    uint32_t *packet = begin(1366, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = as_bits(value);
@@ -1585,7 +1585,7 @@ void glMultiDrawArrays(unsigned mode, const int *first, const int *count,
     if (drawcount > 0 && (!first || !count)) return;
     if (drawcount > 0 && (size_t)drawcount > UINT32_MAX / 8u) return;
     size_t blob_len = drawcount > 0 ? (size_t)drawcount * 8u : 0;
-    uint32_t *a = begin(1298, 2, 4 + blob_len);
+    uint32_t *a = begin(1367, 2, 4 + blob_len);
     if (!a) return;
     a[0] = mode; a[1] = (uint32_t)drawcount; a[2] = (uint32_t)blob_len;
     uint8_t *wire = (uint8_t *)(a + 3);
@@ -1597,7 +1597,7 @@ void glMultiDrawArrays(unsigned mode, const int *first, const int *count,
 }
 void glMultiDrawArraysIndirect(unsigned mode, const void *indirect, int drawcount, int stride) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1299, 5, 0);
+    uint32_t *packet = begin(1368, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(mode);
@@ -1612,7 +1612,7 @@ void glMultiDrawElements(unsigned mode, const int *count, unsigned type, const v
     if (drawcount < 0 || (drawcount > 0 && !(count && indices))) return;
     if ((size_t)drawcount > UINT32_MAX / 12u) return;
     size_t blob_len = (size_t)drawcount * 12u;
-    uint32_t *a = begin(1300, 3, 4 + blob_len);
+    uint32_t *a = begin(1369, 3, 4 + blob_len);
     if (!a) return;
     a[0] = mode; a[1] = type; a[2] = (uint32_t)drawcount; a[3] = (uint32_t)blob_len;
     uint8_t *wire = (uint8_t *)(a + 4);
@@ -1627,7 +1627,7 @@ void glMultiDrawElementsBaseVertex(unsigned mode, const int *count, unsigned typ
     if (drawcount < 0 || (drawcount > 0 && !(count && indices && basevertex))) return;
     if ((size_t)drawcount > UINT32_MAX / 16u) return;
     size_t blob_len = (size_t)drawcount * 16u;
-    uint32_t *a = begin(1301, 3, 4 + blob_len);
+    uint32_t *a = begin(1370, 3, 4 + blob_len);
     if (!a) return;
     a[0] = mode; a[1] = type; a[2] = (uint32_t)drawcount; a[3] = (uint32_t)blob_len;
     uint8_t *wire = (uint8_t *)(a + 4);
@@ -1640,7 +1640,7 @@ void glMultiDrawElementsBaseVertex(unsigned mode, const int *count, unsigned typ
 }
 void glMultiDrawElementsIndirect(unsigned mode, unsigned type, const void *indirect, int drawcount, int stride) {
     gexgl_flush_coherent_maps();
-    uint32_t *packet = begin(1302, 6, 0);
+    uint32_t *packet = begin(1371, 6, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(mode);
@@ -1654,12 +1654,12 @@ void glMultiDrawElementsIndirect(unsigned mode, unsigned type, const void *indir
 void glPatchParameterfv(unsigned pname, const float *values) {
     size_t count = pname == 0x8e73u ? 2u : pname == 0x8e74u ? 4u : 0u;
     size_t blob_len = values ? count * sizeof(*values) : 0;
-    uint32_t *a = begin(1305, 2, blob_len);
+    uint32_t *a = begin(1386, 2, blob_len);
     if (!a) return;
     a[0] = pname; put_blob(a + 1, values, blob_len);
 }
 void glPatchParameteri(unsigned pname, int value) {
-    uint32_t *packet = begin(1306, 2, 0);
+    uint32_t *packet = begin(1387, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pname);
@@ -1671,12 +1671,12 @@ void glPixelStoref(unsigned pname, float param) {
         rounded = (int)(param >= 0.0f ? param + 0.5f : param - 0.5f);
         (void)gexgl_set_pixel_store(&pack_store, &unpack_store, pname, rounded);
     }
-    uint32_t *packet = begin(1308, 2, 0);
+    uint32_t *packet = begin(1389, 2, 0);
     if (!packet) return;
     packet[0] = pname; packet[1] = as_bits(param);
 }
 void glPointParameterf(unsigned pname, float param) {
-    uint32_t *packet = begin(1310, 2, 0);
+    uint32_t *packet = begin(1391, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pname);
@@ -1684,12 +1684,12 @@ void glPointParameterf(unsigned pname, float param) {
 }
 void glPointParameterfv(unsigned pname, const float *params) {
     size_t blob_len = params ? sizeof(*params) : 0;
-    uint32_t *a = begin(1311, 1, 4 + blob_len);
+    uint32_t *a = begin(1392, 1, 4 + blob_len);
     if (!a) return;
     a[0] = pname; put_blob(a + 1, params, blob_len);
 }
 void glPointParameteri(unsigned pname, int param) {
-    uint32_t *packet = begin(1312, 2, 0);
+    uint32_t *packet = begin(1393, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pname);
@@ -1697,35 +1697,35 @@ void glPointParameteri(unsigned pname, int param) {
 }
 void glPointParameteriv(unsigned pname, const int *params) {
     size_t blob_len = params ? sizeof(*params) : 0;
-    uint32_t *a = begin(1313, 1, 4 + blob_len);
+    uint32_t *a = begin(1394, 1, 4 + blob_len);
     if (!a) return;
     a[0] = pname; put_blob(a + 1, params, blob_len);
 }
 void glPointSize(float size) {
-    uint32_t *packet = begin(1314, 1, 0);
+    uint32_t *packet = begin(1395, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = as_bits(size);
 }
 void glPolygonMode(unsigned face, unsigned mode) {
-    uint32_t *packet = begin(1315, 2, 0);
+    uint32_t *packet = begin(1396, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(face);
     packet[at++] = (uint32_t)(mode);
 }
 void glPopDebugGroup(void) {
-    uint32_t *packet = begin(1317, 0, 0);
+    uint32_t *packet = begin(1398, 0, 0);
     if (!packet) return;
 }
 void glPrimitiveRestartIndex(unsigned index) {
-    uint32_t *packet = begin(1318, 1, 0);
+    uint32_t *packet = begin(1399, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
 }
 void glProgramParameteri(unsigned program, unsigned pname, int value) {
-    uint32_t *packet = begin(1320, 3, 0);
+    uint32_t *packet = begin(1401, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1733,7 +1733,7 @@ void glProgramParameteri(unsigned program, unsigned pname, int value) {
     packet[at++] = (uint32_t)(value);
 }
 void glProgramUniform1d(unsigned program, int location, double v0) {
-    uint32_t *packet = begin(1321, 4, 0);
+    uint32_t *packet = begin(1402, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1748,7 +1748,7 @@ void glProgramUniform1dv(unsigned program, int location, int count, const double
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (1u * sizeof(*value)))
         blob_len = (size_t)count * 1u * sizeof(*value);
-    uint32_t *packet = begin(1322, 4, blob_len);
+    uint32_t *packet = begin(1403, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1757,7 +1757,7 @@ void glProgramUniform1dv(unsigned program, int location, int count, const double
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform1f(unsigned program, int location, float v0) {
-    uint32_t *packet = begin(1323, 3, 0);
+    uint32_t *packet = begin(1404, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1769,7 +1769,7 @@ void glProgramUniform1fv(unsigned program, int location, int count, const float 
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (1u * sizeof(*value)))
         blob_len = (size_t)count * 1u * sizeof(*value);
-    uint32_t *packet = begin(1324, 4, blob_len);
+    uint32_t *packet = begin(1405, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1778,7 +1778,7 @@ void glProgramUniform1fv(unsigned program, int location, int count, const float 
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform1i(unsigned program, int location, int v0) {
-    uint32_t *packet = begin(1325, 3, 0);
+    uint32_t *packet = begin(1406, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1790,7 +1790,7 @@ void glProgramUniform1iv(unsigned program, int location, int count, const int *v
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (1u * sizeof(*value)))
         blob_len = (size_t)count * 1u * sizeof(*value);
-    uint32_t *packet = begin(1326, 4, blob_len);
+    uint32_t *packet = begin(1407, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1799,7 +1799,7 @@ void glProgramUniform1iv(unsigned program, int location, int count, const int *v
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform1ui(unsigned program, int location, unsigned v0) {
-    uint32_t *packet = begin(1327, 3, 0);
+    uint32_t *packet = begin(1408, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1811,7 +1811,7 @@ void glProgramUniform1uiv(unsigned program, int location, int count, const unsig
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (1u * sizeof(*value)))
         blob_len = (size_t)count * 1u * sizeof(*value);
-    uint32_t *packet = begin(1328, 4, blob_len);
+    uint32_t *packet = begin(1409, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1820,7 +1820,7 @@ void glProgramUniform1uiv(unsigned program, int location, int count, const unsig
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform2d(unsigned program, int location, double v0, double v1) {
-    uint32_t *packet = begin(1329, 6, 0);
+    uint32_t *packet = begin(1410, 6, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1839,7 +1839,7 @@ void glProgramUniform2dv(unsigned program, int location, int count, const double
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (2u * sizeof(*value)))
         blob_len = (size_t)count * 2u * sizeof(*value);
-    uint32_t *packet = begin(1330, 4, blob_len);
+    uint32_t *packet = begin(1411, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1848,7 +1848,7 @@ void glProgramUniform2dv(unsigned program, int location, int count, const double
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform2f(unsigned program, int location, float v0, float v1) {
-    uint32_t *packet = begin(1331, 4, 0);
+    uint32_t *packet = begin(1412, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1861,7 +1861,7 @@ void glProgramUniform2fv(unsigned program, int location, int count, const float 
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (2u * sizeof(*value)))
         blob_len = (size_t)count * 2u * sizeof(*value);
-    uint32_t *packet = begin(1332, 4, blob_len);
+    uint32_t *packet = begin(1413, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1870,7 +1870,7 @@ void glProgramUniform2fv(unsigned program, int location, int count, const float 
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform2i(unsigned program, int location, int v0, int v1) {
-    uint32_t *packet = begin(1333, 4, 0);
+    uint32_t *packet = begin(1414, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1883,7 +1883,7 @@ void glProgramUniform2iv(unsigned program, int location, int count, const int *v
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (2u * sizeof(*value)))
         blob_len = (size_t)count * 2u * sizeof(*value);
-    uint32_t *packet = begin(1334, 4, blob_len);
+    uint32_t *packet = begin(1415, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1892,7 +1892,7 @@ void glProgramUniform2iv(unsigned program, int location, int count, const int *v
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform2ui(unsigned program, int location, unsigned v0, unsigned v1) {
-    uint32_t *packet = begin(1335, 4, 0);
+    uint32_t *packet = begin(1416, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1905,7 +1905,7 @@ void glProgramUniform2uiv(unsigned program, int location, int count, const unsig
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (2u * sizeof(*value)))
         blob_len = (size_t)count * 2u * sizeof(*value);
-    uint32_t *packet = begin(1336, 4, blob_len);
+    uint32_t *packet = begin(1417, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1914,7 +1914,7 @@ void glProgramUniform2uiv(unsigned program, int location, int count, const unsig
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform3d(unsigned program, int location, double v0, double v1, double v2) {
-    uint32_t *packet = begin(1337, 8, 0);
+    uint32_t *packet = begin(1418, 8, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1937,7 +1937,7 @@ void glProgramUniform3dv(unsigned program, int location, int count, const double
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (3u * sizeof(*value)))
         blob_len = (size_t)count * 3u * sizeof(*value);
-    uint32_t *packet = begin(1338, 4, blob_len);
+    uint32_t *packet = begin(1419, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1946,7 +1946,7 @@ void glProgramUniform3dv(unsigned program, int location, int count, const double
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform3f(unsigned program, int location, float v0, float v1, float v2) {
-    uint32_t *packet = begin(1339, 5, 0);
+    uint32_t *packet = begin(1420, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1960,7 +1960,7 @@ void glProgramUniform3fv(unsigned program, int location, int count, const float 
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (3u * sizeof(*value)))
         blob_len = (size_t)count * 3u * sizeof(*value);
-    uint32_t *packet = begin(1340, 4, blob_len);
+    uint32_t *packet = begin(1421, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1969,7 +1969,7 @@ void glProgramUniform3fv(unsigned program, int location, int count, const float 
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform3i(unsigned program, int location, int v0, int v1, int v2) {
-    uint32_t *packet = begin(1341, 5, 0);
+    uint32_t *packet = begin(1422, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1983,7 +1983,7 @@ void glProgramUniform3iv(unsigned program, int location, int count, const int *v
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (3u * sizeof(*value)))
         blob_len = (size_t)count * 3u * sizeof(*value);
-    uint32_t *packet = begin(1342, 4, blob_len);
+    uint32_t *packet = begin(1423, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -1992,7 +1992,7 @@ void glProgramUniform3iv(unsigned program, int location, int count, const int *v
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform3ui(unsigned program, int location, unsigned v0, unsigned v1, unsigned v2) {
-    uint32_t *packet = begin(1343, 5, 0);
+    uint32_t *packet = begin(1424, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2006,7 +2006,7 @@ void glProgramUniform3uiv(unsigned program, int location, int count, const unsig
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (3u * sizeof(*value)))
         blob_len = (size_t)count * 3u * sizeof(*value);
-    uint32_t *packet = begin(1344, 4, blob_len);
+    uint32_t *packet = begin(1425, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2015,7 +2015,7 @@ void glProgramUniform3uiv(unsigned program, int location, int count, const unsig
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform4d(unsigned program, int location, double v0, double v1, double v2, double v3) {
-    uint32_t *packet = begin(1345, 10, 0);
+    uint32_t *packet = begin(1426, 10, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2042,7 +2042,7 @@ void glProgramUniform4dv(unsigned program, int location, int count, const double
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*value)))
         blob_len = (size_t)count * 4u * sizeof(*value);
-    uint32_t *packet = begin(1346, 4, blob_len);
+    uint32_t *packet = begin(1427, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2051,7 +2051,7 @@ void glProgramUniform4dv(unsigned program, int location, int count, const double
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform4f(unsigned program, int location, float v0, float v1, float v2, float v3) {
-    uint32_t *packet = begin(1347, 6, 0);
+    uint32_t *packet = begin(1428, 6, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2066,7 +2066,7 @@ void glProgramUniform4fv(unsigned program, int location, int count, const float 
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*value)))
         blob_len = (size_t)count * 4u * sizeof(*value);
-    uint32_t *packet = begin(1348, 4, blob_len);
+    uint32_t *packet = begin(1429, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2075,7 +2075,7 @@ void glProgramUniform4fv(unsigned program, int location, int count, const float 
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform4i(unsigned program, int location, int v0, int v1, int v2, int v3) {
-    uint32_t *packet = begin(1349, 6, 0);
+    uint32_t *packet = begin(1430, 6, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2090,7 +2090,7 @@ void glProgramUniform4iv(unsigned program, int location, int count, const int *v
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*value)))
         blob_len = (size_t)count * 4u * sizeof(*value);
-    uint32_t *packet = begin(1350, 4, blob_len);
+    uint32_t *packet = begin(1431, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2099,7 +2099,7 @@ void glProgramUniform4iv(unsigned program, int location, int count, const int *v
     put_blob(packet + at, value, blob_len);
 }
 void glProgramUniform4ui(unsigned program, int location, unsigned v0, unsigned v1, unsigned v2, unsigned v3) {
-    uint32_t *packet = begin(1351, 6, 0);
+    uint32_t *packet = begin(1432, 6, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2114,7 +2114,7 @@ void glProgramUniform4uiv(unsigned program, int location, int count, const unsig
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*value)))
         blob_len = (size_t)count * 4u * sizeof(*value);
-    uint32_t *packet = begin(1352, 4, blob_len);
+    uint32_t *packet = begin(1433, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2127,7 +2127,7 @@ void glProgramUniformMatrix2dv(unsigned program, int location, int count, unsign
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*value)))
         blob_len = (size_t)count * 4u * sizeof(*value);
-    uint32_t *packet = begin(1353, 5, blob_len);
+    uint32_t *packet = begin(1434, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2141,7 +2141,7 @@ void glProgramUniformMatrix2fv(unsigned program, int location, int count, unsign
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*value)))
         blob_len = (size_t)count * 4u * sizeof(*value);
-    uint32_t *packet = begin(1354, 5, blob_len);
+    uint32_t *packet = begin(1435, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2155,7 +2155,7 @@ void glProgramUniformMatrix2x3dv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (6u * sizeof(*value)))
         blob_len = (size_t)count * 6u * sizeof(*value);
-    uint32_t *packet = begin(1355, 5, blob_len);
+    uint32_t *packet = begin(1436, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2169,7 +2169,7 @@ void glProgramUniformMatrix2x3fv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (6u * sizeof(*value)))
         blob_len = (size_t)count * 6u * sizeof(*value);
-    uint32_t *packet = begin(1356, 5, blob_len);
+    uint32_t *packet = begin(1437, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2183,7 +2183,7 @@ void glProgramUniformMatrix2x4dv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (8u * sizeof(*value)))
         blob_len = (size_t)count * 8u * sizeof(*value);
-    uint32_t *packet = begin(1357, 5, blob_len);
+    uint32_t *packet = begin(1438, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2197,7 +2197,7 @@ void glProgramUniformMatrix2x4fv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (8u * sizeof(*value)))
         blob_len = (size_t)count * 8u * sizeof(*value);
-    uint32_t *packet = begin(1358, 5, blob_len);
+    uint32_t *packet = begin(1439, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2211,7 +2211,7 @@ void glProgramUniformMatrix3dv(unsigned program, int location, int count, unsign
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (9u * sizeof(*value)))
         blob_len = (size_t)count * 9u * sizeof(*value);
-    uint32_t *packet = begin(1359, 5, blob_len);
+    uint32_t *packet = begin(1440, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2225,7 +2225,7 @@ void glProgramUniformMatrix3fv(unsigned program, int location, int count, unsign
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (9u * sizeof(*value)))
         blob_len = (size_t)count * 9u * sizeof(*value);
-    uint32_t *packet = begin(1360, 5, blob_len);
+    uint32_t *packet = begin(1441, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2239,7 +2239,7 @@ void glProgramUniformMatrix3x2dv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (6u * sizeof(*value)))
         blob_len = (size_t)count * 6u * sizeof(*value);
-    uint32_t *packet = begin(1361, 5, blob_len);
+    uint32_t *packet = begin(1442, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2253,7 +2253,7 @@ void glProgramUniformMatrix3x2fv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (6u * sizeof(*value)))
         blob_len = (size_t)count * 6u * sizeof(*value);
-    uint32_t *packet = begin(1362, 5, blob_len);
+    uint32_t *packet = begin(1443, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2267,7 +2267,7 @@ void glProgramUniformMatrix3x4dv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (12u * sizeof(*value)))
         blob_len = (size_t)count * 12u * sizeof(*value);
-    uint32_t *packet = begin(1363, 5, blob_len);
+    uint32_t *packet = begin(1444, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2281,7 +2281,7 @@ void glProgramUniformMatrix3x4fv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (12u * sizeof(*value)))
         blob_len = (size_t)count * 12u * sizeof(*value);
-    uint32_t *packet = begin(1364, 5, blob_len);
+    uint32_t *packet = begin(1445, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2295,7 +2295,7 @@ void glProgramUniformMatrix4dv(unsigned program, int location, int count, unsign
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (16u * sizeof(*value)))
         blob_len = (size_t)count * 16u * sizeof(*value);
-    uint32_t *packet = begin(1365, 5, blob_len);
+    uint32_t *packet = begin(1446, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2309,7 +2309,7 @@ void glProgramUniformMatrix4fv(unsigned program, int location, int count, unsign
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (16u * sizeof(*value)))
         blob_len = (size_t)count * 16u * sizeof(*value);
-    uint32_t *packet = begin(1366, 5, blob_len);
+    uint32_t *packet = begin(1447, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2323,7 +2323,7 @@ void glProgramUniformMatrix4x2dv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (8u * sizeof(*value)))
         blob_len = (size_t)count * 8u * sizeof(*value);
-    uint32_t *packet = begin(1367, 5, blob_len);
+    uint32_t *packet = begin(1448, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2337,7 +2337,7 @@ void glProgramUniformMatrix4x2fv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (8u * sizeof(*value)))
         blob_len = (size_t)count * 8u * sizeof(*value);
-    uint32_t *packet = begin(1368, 5, blob_len);
+    uint32_t *packet = begin(1449, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2351,7 +2351,7 @@ void glProgramUniformMatrix4x3dv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (12u * sizeof(*value)))
         blob_len = (size_t)count * 12u * sizeof(*value);
-    uint32_t *packet = begin(1369, 5, blob_len);
+    uint32_t *packet = begin(1450, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2365,7 +2365,7 @@ void glProgramUniformMatrix4x3fv(unsigned program, int location, int count, unsi
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (12u * sizeof(*value)))
         blob_len = (size_t)count * 12u * sizeof(*value);
-    uint32_t *packet = begin(1370, 5, blob_len);
+    uint32_t *packet = begin(1451, 5, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2375,30 +2375,30 @@ void glProgramUniformMatrix4x3fv(unsigned program, int location, int count, unsi
     put_blob(packet + at, value, blob_len);
 }
 void glProvokingVertex(unsigned mode) {
-    uint32_t *packet = begin(1371, 1, 0);
+    uint32_t *packet = begin(1452, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(mode);
 }
 void glQueryCounter(unsigned id, unsigned target) {
-    uint32_t *packet = begin(1373, 2, 0);
+    uint32_t *packet = begin(1454, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(id);
     packet[at++] = (uint32_t)(target);
 }
 void glReadBuffer(unsigned src) {
-    uint32_t *packet = begin(1374, 1, 0);
+    uint32_t *packet = begin(1455, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(src);
 }
 void glReleaseShaderCompiler(void) {
-    uint32_t *packet = begin(1376, 0, 0);
+    uint32_t *packet = begin(1458, 0, 0);
     if (!packet) return;
 }
 void glRenderbufferStorageMultisample(unsigned target, int samples, unsigned internalformat, int width, int height) {
-    uint32_t *packet = begin(1378, 5, 0);
+    uint32_t *packet = begin(1460, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -2408,14 +2408,14 @@ void glRenderbufferStorageMultisample(unsigned target, int samples, unsigned int
     packet[at++] = (uint32_t)(height);
 }
 void glSampleCoverage(float value, unsigned char invert) {
-    uint32_t *packet = begin(1380, 2, 0);
+    uint32_t *packet = begin(1462, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = as_bits(value);
     packet[at++] = (uint32_t)(invert);
 }
 void glSampleMaski(unsigned maskNumber, unsigned mask) {
-    uint32_t *packet = begin(1381, 2, 0);
+    uint32_t *packet = begin(1463, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(maskNumber);
@@ -2424,7 +2424,7 @@ void glSampleMaski(unsigned maskNumber, unsigned mask) {
 void glSamplerParameterIiv(unsigned sampler, unsigned pname, const int *param) {
     size_t components = pname == 0x1004u ? 4u : 1u; /* GL_TEXTURE_BORDER_COLOR */
     size_t blob_len = param ? components * sizeof(*param) : 0;
-    uint32_t *a = begin(1382, 2, 4 + blob_len);
+    uint32_t *a = begin(1464, 2, 4 + blob_len);
     if (!a) return;
     a[0] = sampler; a[1] = pname;
     put_blob(a + 2, param, blob_len);
@@ -2432,7 +2432,7 @@ void glSamplerParameterIiv(unsigned sampler, unsigned pname, const int *param) {
 void glSamplerParameterIuiv(unsigned sampler, unsigned pname, const unsigned *param) {
     size_t components = pname == 0x1004u ? 4u : 1u; /* GL_TEXTURE_BORDER_COLOR */
     size_t blob_len = param ? components * sizeof(*param) : 0;
-    uint32_t *a = begin(1383, 2, 4 + blob_len);
+    uint32_t *a = begin(1465, 2, 4 + blob_len);
     if (!a) return;
     a[0] = sampler; a[1] = pname;
     put_blob(a + 2, param, blob_len);
@@ -2442,7 +2442,7 @@ void glScissorArrayv(unsigned first, int count, const int *v) {
     if (v && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*v)))
         blob_len = (size_t)count * 4u * sizeof(*v);
-    uint32_t *packet = begin(1389, 3, blob_len);
+    uint32_t *packet = begin(1471, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(first);
@@ -2450,7 +2450,7 @@ void glScissorArrayv(unsigned first, int count, const int *v) {
     put_blob(packet + at, v, blob_len);
 }
 void glScissorIndexed(unsigned index, int left, int bottom, int width, int height) {
-    uint32_t *packet = begin(1390, 5, 0);
+    uint32_t *packet = begin(1472, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -2461,14 +2461,14 @@ void glScissorIndexed(unsigned index, int left, int bottom, int width, int heigh
 }
 void glScissorIndexedv(unsigned index, const int *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1391, 2, blob_len);
+    uint32_t *packet = begin(1473, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glShaderStorageBlockBinding(unsigned program, unsigned storageBlockIndex, unsigned storageBlockBinding) {
-    uint32_t *packet = begin(1394, 3, 0);
+    uint32_t *packet = begin(1476, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
@@ -2476,7 +2476,7 @@ void glShaderStorageBlockBinding(unsigned program, unsigned storageBlockIndex, u
     packet[at++] = (uint32_t)(storageBlockBinding);
 }
 void glTexBuffer(unsigned target, unsigned internalformat, unsigned buffer) {
-    uint32_t *packet = begin(1401, 3, 0);
+    uint32_t *packet = begin(1483, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -2484,7 +2484,7 @@ void glTexBuffer(unsigned target, unsigned internalformat, unsigned buffer) {
     packet[at++] = (uint32_t)(buffer);
 }
 void glTexBufferRange(unsigned target, unsigned internalformat, unsigned buffer, long offset, long size) {
-    uint32_t *packet = begin(1402, 7, 0);
+    uint32_t *packet = begin(1484, 7, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -2504,7 +2504,7 @@ void glTexImage1D(unsigned target, int level, int internalformat, int width, int
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = pixels && !pbo ? pixel_transfer_bytes(format, type, width, 1, -1,
                                                              &unpack_store, NULL) : 0;
-    uint32_t *a = begin(1403, 10, 4 + blob_len);
+    uint32_t *a = begin(1485, 10, 4 + blob_len);
     if (!a) return;
     a[0] = target; a[1] = (uint32_t)level; a[2] = (uint32_t)internalformat;
     a[3] = (uint32_t)width; a[4] = (uint32_t)border; a[5] = format; a[6] = type;
@@ -2514,7 +2514,7 @@ void glTexImage1D(unsigned target, int level, int internalformat, int width, int
     put_blob(a + 10, pbo ? NULL : pixels, blob_len);
 }
 void glTexImage2DMultisample(unsigned target, int samples, unsigned internalformat, int width, int height, unsigned char fixedsamplelocations) {
-    uint32_t *packet = begin(1405, 6, 0);
+    uint32_t *packet = begin(1487, 6, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -2525,7 +2525,7 @@ void glTexImage2DMultisample(unsigned target, int samples, unsigned internalform
     packet[at++] = (uint32_t)(fixedsamplelocations);
 }
 void glTexImage3DMultisample(unsigned target, int samples, unsigned internalformat, int width, int height, int depth, unsigned char fixedsamplelocations) {
-    uint32_t *packet = begin(1407, 7, 0);
+    uint32_t *packet = begin(1489, 7, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -2539,7 +2539,7 @@ void glTexImage3DMultisample(unsigned target, int samples, unsigned internalform
 void glTexParameterIiv(unsigned target, unsigned pname, const int *params) {
     size_t components = pname == 0x1004u ? 4u : 1u; /* GL_TEXTURE_BORDER_COLOR */
     size_t blob_len = params ? components * sizeof(*params) : 0;
-    uint32_t *a = begin(1408, 2, 4 + blob_len);
+    uint32_t *a = begin(1490, 2, 4 + blob_len);
     if (!a) return;
     a[0] = target; a[1] = pname;
     put_blob(a + 2, params, blob_len);
@@ -2547,13 +2547,13 @@ void glTexParameterIiv(unsigned target, unsigned pname, const int *params) {
 void glTexParameterIuiv(unsigned target, unsigned pname, const unsigned *params) {
     size_t components = pname == 0x1004u ? 4u : 1u; /* GL_TEXTURE_BORDER_COLOR */
     size_t blob_len = params ? components * sizeof(*params) : 0;
-    uint32_t *a = begin(1409, 2, 4 + blob_len);
+    uint32_t *a = begin(1491, 2, 4 + blob_len);
     if (!a) return;
     a[0] = target; a[1] = pname;
     put_blob(a + 2, params, blob_len);
 }
 void glTexStorage1D(unsigned target, int levels, unsigned internalformat, int width) {
-    uint32_t *packet = begin(1414, 4, 0);
+    uint32_t *packet = begin(1496, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -2562,7 +2562,7 @@ void glTexStorage1D(unsigned target, int levels, unsigned internalformat, int wi
     packet[at++] = (uint32_t)(width);
 }
 void glTexStorage2DMultisample(unsigned target, int samples, unsigned internalformat, int width, int height, unsigned char fixedsamplelocations) {
-    uint32_t *packet = begin(1416, 6, 0);
+    uint32_t *packet = begin(1498, 6, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -2573,7 +2573,7 @@ void glTexStorage2DMultisample(unsigned target, int samples, unsigned internalfo
     packet[at++] = (uint32_t)(fixedsamplelocations);
 }
 void glTexStorage3DMultisample(unsigned target, int samples, unsigned internalformat, int width, int height, int depth, unsigned char fixedsamplelocations) {
-    uint32_t *packet = begin(1418, 7, 0);
+    uint32_t *packet = begin(1500, 7, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
@@ -2589,7 +2589,7 @@ void glTexSubImage1D(unsigned target, int level, int xoffset, int width,
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = pixels && !pbo ? pixel_transfer_bytes(format, type, width, 1, -1,
                                                              &unpack_store, NULL) : 0;
-    uint32_t *a = begin(1419, 9, 4 + blob_len);
+    uint32_t *a = begin(1501, 9, 4 + blob_len);
     if (!a) return;
     a[0] = target; a[1] = (uint32_t)level; a[2] = (uint32_t)xoffset;
     a[3] = (uint32_t)width; a[4] = format; a[5] = type; a[6] = (uint32_t)pbo;
@@ -2603,7 +2603,7 @@ void glTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, int z
     int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
     size_t blob_len = pixels && !pbo ? pixel_transfer_bytes(format, type, width, height, depth,
                                                              &unpack_store, NULL) : 0;
-    uint32_t *a = begin(1421, 13, 4 + blob_len);
+    uint32_t *a = begin(1503, 13, 4 + blob_len);
     if (!a) return;
     a[0] = target; a[1] = (uint32_t)level; a[2] = (uint32_t)xoffset;
     a[3] = (uint32_t)yoffset; a[4] = (uint32_t)zoffset;
@@ -2613,8 +2613,12 @@ void glTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, int z
     a[12] = (uint32_t)((uint64_t)(uintptr_t)pixels >> 32);
     put_blob(a + 13, pbo ? NULL : pixels, blob_len);
 }
+void glTextureBarrier(void) {
+    uint32_t *packet = begin(1504, 0, 0);
+    if (!packet) return;
+}
 void glTextureView(unsigned texture, unsigned target, unsigned origtexture, unsigned internalformat, unsigned minlevel, unsigned numlevels, unsigned minlayer, unsigned numlayers) {
-    uint32_t *packet = begin(1422, 8, 0);
+    uint32_t *packet = begin(1521, 8, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(texture);
@@ -2637,7 +2641,7 @@ void glTransformFeedbackVaryings(unsigned program, int count, const char *const 
             blob_len += bytes;
         }
     }
-    uint32_t *a = begin(1423, 4, blob_len);
+    uint32_t *a = begin(1524, 4, blob_len);
     if (!a) return;
     a[0] = program; a[1] = (uint32_t)count; a[2] = bufferMode;
     uint8_t *wire = (uint8_t *)(a + 4);
@@ -2648,7 +2652,7 @@ void glTransformFeedbackVaryings(unsigned program, int count, const char *const 
     }
 }
 void glUniform1d(int location, double x) {
-    uint32_t *packet = begin(1424, 3, 0);
+    uint32_t *packet = begin(1525, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2662,7 +2666,7 @@ void glUniform1dv(int location, int count, const double *value) {
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (1u * sizeof(*value)))
         blob_len = (size_t)count * 1u * sizeof(*value);
-    uint32_t *packet = begin(1425, 3, blob_len);
+    uint32_t *packet = begin(1526, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2670,7 +2674,7 @@ void glUniform1dv(int location, int count, const double *value) {
     put_blob(packet + at, value, blob_len);
 }
 void glUniform1ui(int location, unsigned v0) {
-    uint32_t *packet = begin(1430, 2, 0);
+    uint32_t *packet = begin(1531, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2681,7 +2685,7 @@ void glUniform1uiv(int location, int count, const unsigned *value) {
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (1u * sizeof(*value)))
         blob_len = (size_t)count * 1u * sizeof(*value);
-    uint32_t *packet = begin(1431, 3, blob_len);
+    uint32_t *packet = begin(1532, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2689,7 +2693,7 @@ void glUniform1uiv(int location, int count, const unsigned *value) {
     put_blob(packet + at, value, blob_len);
 }
 void glUniform2d(int location, double x, double y) {
-    uint32_t *packet = begin(1432, 5, 0);
+    uint32_t *packet = begin(1533, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2707,7 +2711,7 @@ void glUniform2dv(int location, int count, const double *value) {
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (2u * sizeof(*value)))
         blob_len = (size_t)count * 2u * sizeof(*value);
-    uint32_t *packet = begin(1433, 3, blob_len);
+    uint32_t *packet = begin(1534, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2715,7 +2719,7 @@ void glUniform2dv(int location, int count, const double *value) {
     put_blob(packet + at, value, blob_len);
 }
 void glUniform2ui(int location, unsigned v0, unsigned v1) {
-    uint32_t *packet = begin(1438, 3, 0);
+    uint32_t *packet = begin(1539, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2727,7 +2731,7 @@ void glUniform2uiv(int location, int count, const unsigned *value) {
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (2u * sizeof(*value)))
         blob_len = (size_t)count * 2u * sizeof(*value);
-    uint32_t *packet = begin(1439, 3, blob_len);
+    uint32_t *packet = begin(1540, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2735,7 +2739,7 @@ void glUniform2uiv(int location, int count, const unsigned *value) {
     put_blob(packet + at, value, blob_len);
 }
 void glUniform3d(int location, double x, double y, double z) {
-    uint32_t *packet = begin(1440, 7, 0);
+    uint32_t *packet = begin(1541, 7, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2757,7 +2761,7 @@ void glUniform3dv(int location, int count, const double *value) {
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (3u * sizeof(*value)))
         blob_len = (size_t)count * 3u * sizeof(*value);
-    uint32_t *packet = begin(1441, 3, blob_len);
+    uint32_t *packet = begin(1542, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2765,7 +2769,7 @@ void glUniform3dv(int location, int count, const double *value) {
     put_blob(packet + at, value, blob_len);
 }
 void glUniform3ui(int location, unsigned v0, unsigned v1, unsigned v2) {
-    uint32_t *packet = begin(1446, 4, 0);
+    uint32_t *packet = begin(1547, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2778,7 +2782,7 @@ void glUniform3uiv(int location, int count, const unsigned *value) {
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (3u * sizeof(*value)))
         blob_len = (size_t)count * 3u * sizeof(*value);
-    uint32_t *packet = begin(1447, 3, blob_len);
+    uint32_t *packet = begin(1548, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2786,7 +2790,7 @@ void glUniform3uiv(int location, int count, const unsigned *value) {
     put_blob(packet + at, value, blob_len);
 }
 void glUniform4d(int location, double x, double y, double z, double w) {
-    uint32_t *packet = begin(1448, 9, 0);
+    uint32_t *packet = begin(1549, 9, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2812,7 +2816,7 @@ void glUniform4dv(int location, int count, const double *value) {
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*value)))
         blob_len = (size_t)count * 4u * sizeof(*value);
-    uint32_t *packet = begin(1449, 3, blob_len);
+    uint32_t *packet = begin(1550, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2820,7 +2824,7 @@ void glUniform4dv(int location, int count, const double *value) {
     put_blob(packet + at, value, blob_len);
 }
 void glUniform4ui(int location, unsigned v0, unsigned v1, unsigned v2, unsigned v3) {
-    uint32_t *packet = begin(1454, 5, 0);
+    uint32_t *packet = begin(1555, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2834,7 +2838,7 @@ void glUniform4uiv(int location, int count, const unsigned *value) {
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*value)))
         blob_len = (size_t)count * 4u * sizeof(*value);
-    uint32_t *packet = begin(1455, 3, blob_len);
+    uint32_t *packet = begin(1556, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2846,7 +2850,7 @@ void glUniformMatrix2dv(int location, int count, unsigned char transpose, const 
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*value)))
         blob_len = (size_t)count * 4u * sizeof(*value);
-    uint32_t *packet = begin(1457, 4, blob_len);
+    uint32_t *packet = begin(1558, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2859,7 +2863,7 @@ void glUniformMatrix2x3dv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (6u * sizeof(*value)))
         blob_len = (size_t)count * 6u * sizeof(*value);
-    uint32_t *packet = begin(1459, 4, blob_len);
+    uint32_t *packet = begin(1560, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2872,7 +2876,7 @@ void glUniformMatrix2x3fv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (6u * sizeof(*value)))
         blob_len = (size_t)count * 6u * sizeof(*value);
-    uint32_t *packet = begin(1460, 4, blob_len);
+    uint32_t *packet = begin(1561, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2885,7 +2889,7 @@ void glUniformMatrix2x4dv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (8u * sizeof(*value)))
         blob_len = (size_t)count * 8u * sizeof(*value);
-    uint32_t *packet = begin(1461, 4, blob_len);
+    uint32_t *packet = begin(1562, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2898,7 +2902,7 @@ void glUniformMatrix2x4fv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (8u * sizeof(*value)))
         blob_len = (size_t)count * 8u * sizeof(*value);
-    uint32_t *packet = begin(1462, 4, blob_len);
+    uint32_t *packet = begin(1563, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2911,7 +2915,7 @@ void glUniformMatrix3dv(int location, int count, unsigned char transpose, const 
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (9u * sizeof(*value)))
         blob_len = (size_t)count * 9u * sizeof(*value);
-    uint32_t *packet = begin(1463, 4, blob_len);
+    uint32_t *packet = begin(1564, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2924,7 +2928,7 @@ void glUniformMatrix3x2dv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (6u * sizeof(*value)))
         blob_len = (size_t)count * 6u * sizeof(*value);
-    uint32_t *packet = begin(1465, 4, blob_len);
+    uint32_t *packet = begin(1566, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2937,7 +2941,7 @@ void glUniformMatrix3x2fv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (6u * sizeof(*value)))
         blob_len = (size_t)count * 6u * sizeof(*value);
-    uint32_t *packet = begin(1466, 4, blob_len);
+    uint32_t *packet = begin(1567, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2950,7 +2954,7 @@ void glUniformMatrix3x4dv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (12u * sizeof(*value)))
         blob_len = (size_t)count * 12u * sizeof(*value);
-    uint32_t *packet = begin(1467, 4, blob_len);
+    uint32_t *packet = begin(1568, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2963,7 +2967,7 @@ void glUniformMatrix3x4fv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (12u * sizeof(*value)))
         blob_len = (size_t)count * 12u * sizeof(*value);
-    uint32_t *packet = begin(1468, 4, blob_len);
+    uint32_t *packet = begin(1569, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2976,7 +2980,7 @@ void glUniformMatrix4dv(int location, int count, unsigned char transpose, const 
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (16u * sizeof(*value)))
         blob_len = (size_t)count * 16u * sizeof(*value);
-    uint32_t *packet = begin(1469, 4, blob_len);
+    uint32_t *packet = begin(1570, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -2989,7 +2993,7 @@ void glUniformMatrix4x2dv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (8u * sizeof(*value)))
         blob_len = (size_t)count * 8u * sizeof(*value);
-    uint32_t *packet = begin(1471, 4, blob_len);
+    uint32_t *packet = begin(1572, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -3002,7 +3006,7 @@ void glUniformMatrix4x2fv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (8u * sizeof(*value)))
         blob_len = (size_t)count * 8u * sizeof(*value);
-    uint32_t *packet = begin(1472, 4, blob_len);
+    uint32_t *packet = begin(1573, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -3015,7 +3019,7 @@ void glUniformMatrix4x3dv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (12u * sizeof(*value)))
         blob_len = (size_t)count * 12u * sizeof(*value);
-    uint32_t *packet = begin(1473, 4, blob_len);
+    uint32_t *packet = begin(1574, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -3028,7 +3032,7 @@ void glUniformMatrix4x3fv(int location, int count, unsigned char transpose, cons
     if (value && count > 0 &&
         (size_t)count <= SIZE_MAX / (12u * sizeof(*value)))
         blob_len = (size_t)count * 12u * sizeof(*value);
-    uint32_t *packet = begin(1474, 4, blob_len);
+    uint32_t *packet = begin(1575, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(location);
@@ -3041,7 +3045,7 @@ void glUniformSubroutinesuiv(unsigned shadertype, int count, const unsigned *ind
     if (indices && count > 0 &&
         (size_t)count <= SIZE_MAX / (1u * sizeof(*indices)))
         blob_len = (size_t)count * 1u * sizeof(*indices);
-    uint32_t *packet = begin(1475, 3, blob_len);
+    uint32_t *packet = begin(1576, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(shadertype);
@@ -3049,7 +3053,7 @@ void glUniformSubroutinesuiv(unsigned shadertype, int count, const unsigned *ind
     put_blob(packet + at, indices, blob_len);
 }
 void glUseProgramStages(unsigned pipeline, unsigned stages, unsigned program) {
-    uint32_t *packet = begin(1478, 3, 0);
+    uint32_t *packet = begin(1580, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pipeline);
@@ -3057,19 +3061,19 @@ void glUseProgramStages(unsigned pipeline, unsigned stages, unsigned program) {
     packet[at++] = (uint32_t)(program);
 }
 void glValidateProgram(unsigned program) {
-    uint32_t *packet = begin(1479, 1, 0);
+    uint32_t *packet = begin(1581, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(program);
 }
 void glValidateProgramPipeline(unsigned pipeline) {
-    uint32_t *packet = begin(1480, 1, 0);
+    uint32_t *packet = begin(1582, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pipeline);
 }
 void glVertexAttrib1d(unsigned index, double x) {
-    uint32_t *packet = begin(1481, 3, 0);
+    uint32_t *packet = begin(1591, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3080,14 +3084,14 @@ void glVertexAttrib1d(unsigned index, double x) {
 }
 void glVertexAttrib1dv(unsigned index, const double *v) {
     size_t blob_len = v ? 1u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1482, 2, blob_len);
+    uint32_t *packet = begin(1592, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib1f(unsigned index, float x) {
-    uint32_t *packet = begin(1483, 2, 0);
+    uint32_t *packet = begin(1593, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3095,14 +3099,14 @@ void glVertexAttrib1f(unsigned index, float x) {
 }
 void glVertexAttrib1fv(unsigned index, const float *v) {
     size_t blob_len = v ? 1u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1484, 2, blob_len);
+    uint32_t *packet = begin(1594, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib1s(unsigned index, short x) {
-    uint32_t *packet = begin(1485, 2, 0);
+    uint32_t *packet = begin(1595, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3110,14 +3114,14 @@ void glVertexAttrib1s(unsigned index, short x) {
 }
 void glVertexAttrib1sv(unsigned index, const short *v) {
     size_t blob_len = v ? 1u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1486, 2, blob_len);
+    uint32_t *packet = begin(1596, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib2d(unsigned index, double x, double y) {
-    uint32_t *packet = begin(1487, 5, 0);
+    uint32_t *packet = begin(1597, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3132,14 +3136,14 @@ void glVertexAttrib2d(unsigned index, double x, double y) {
 }
 void glVertexAttrib2dv(unsigned index, const double *v) {
     size_t blob_len = v ? 2u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1488, 2, blob_len);
+    uint32_t *packet = begin(1598, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib2f(unsigned index, float x, float y) {
-    uint32_t *packet = begin(1489, 3, 0);
+    uint32_t *packet = begin(1599, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3148,14 +3152,14 @@ void glVertexAttrib2f(unsigned index, float x, float y) {
 }
 void glVertexAttrib2fv(unsigned index, const float *v) {
     size_t blob_len = v ? 2u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1490, 2, blob_len);
+    uint32_t *packet = begin(1600, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib2s(unsigned index, short x, short y) {
-    uint32_t *packet = begin(1491, 3, 0);
+    uint32_t *packet = begin(1601, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3164,14 +3168,14 @@ void glVertexAttrib2s(unsigned index, short x, short y) {
 }
 void glVertexAttrib2sv(unsigned index, const short *v) {
     size_t blob_len = v ? 2u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1492, 2, blob_len);
+    uint32_t *packet = begin(1602, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib3d(unsigned index, double x, double y, double z) {
-    uint32_t *packet = begin(1493, 7, 0);
+    uint32_t *packet = begin(1603, 7, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3190,14 +3194,14 @@ void glVertexAttrib3d(unsigned index, double x, double y, double z) {
 }
 void glVertexAttrib3dv(unsigned index, const double *v) {
     size_t blob_len = v ? 3u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1494, 2, blob_len);
+    uint32_t *packet = begin(1604, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib3f(unsigned index, float x, float y, float z) {
-    uint32_t *packet = begin(1495, 4, 0);
+    uint32_t *packet = begin(1605, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3207,14 +3211,14 @@ void glVertexAttrib3f(unsigned index, float x, float y, float z) {
 }
 void glVertexAttrib3fv(unsigned index, const float *v) {
     size_t blob_len = v ? 3u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1496, 2, blob_len);
+    uint32_t *packet = begin(1606, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib3s(unsigned index, short x, short y, short z) {
-    uint32_t *packet = begin(1497, 4, 0);
+    uint32_t *packet = begin(1607, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3224,7 +3228,7 @@ void glVertexAttrib3s(unsigned index, short x, short y, short z) {
 }
 void glVertexAttrib3sv(unsigned index, const short *v) {
     size_t blob_len = v ? 3u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1498, 2, blob_len);
+    uint32_t *packet = begin(1608, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3232,7 +3236,7 @@ void glVertexAttrib3sv(unsigned index, const short *v) {
 }
 void glVertexAttrib4Nbv(unsigned index, const signed char *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1499, 2, blob_len);
+    uint32_t *packet = begin(1609, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3240,7 +3244,7 @@ void glVertexAttrib4Nbv(unsigned index, const signed char *v) {
 }
 void glVertexAttrib4Niv(unsigned index, const int *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1500, 2, blob_len);
+    uint32_t *packet = begin(1610, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3248,14 +3252,14 @@ void glVertexAttrib4Niv(unsigned index, const int *v) {
 }
 void glVertexAttrib4Nsv(unsigned index, const short *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1501, 2, blob_len);
+    uint32_t *packet = begin(1611, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib4Nub(unsigned index, unsigned char x, unsigned char y, unsigned char z, unsigned char w) {
-    uint32_t *packet = begin(1502, 5, 0);
+    uint32_t *packet = begin(1612, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3266,7 +3270,7 @@ void glVertexAttrib4Nub(unsigned index, unsigned char x, unsigned char y, unsign
 }
 void glVertexAttrib4Nubv(unsigned index, const unsigned char *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1503, 2, blob_len);
+    uint32_t *packet = begin(1613, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3274,7 +3278,7 @@ void glVertexAttrib4Nubv(unsigned index, const unsigned char *v) {
 }
 void glVertexAttrib4Nuiv(unsigned index, const unsigned *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1504, 2, blob_len);
+    uint32_t *packet = begin(1614, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3282,7 +3286,7 @@ void glVertexAttrib4Nuiv(unsigned index, const unsigned *v) {
 }
 void glVertexAttrib4Nusv(unsigned index, const unsigned short *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1505, 2, blob_len);
+    uint32_t *packet = begin(1615, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3290,14 +3294,14 @@ void glVertexAttrib4Nusv(unsigned index, const unsigned short *v) {
 }
 void glVertexAttrib4bv(unsigned index, const signed char *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1506, 2, blob_len);
+    uint32_t *packet = begin(1616, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib4d(unsigned index, double x, double y, double z, double w) {
-    uint32_t *packet = begin(1507, 9, 0);
+    uint32_t *packet = begin(1617, 9, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3320,7 +3324,7 @@ void glVertexAttrib4d(unsigned index, double x, double y, double z, double w) {
 }
 void glVertexAttrib4dv(unsigned index, const double *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1508, 2, blob_len);
+    uint32_t *packet = begin(1618, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3328,7 +3332,7 @@ void glVertexAttrib4dv(unsigned index, const double *v) {
 }
 void glVertexAttrib4fv(unsigned index, const float *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1510, 2, blob_len);
+    uint32_t *packet = begin(1620, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3336,14 +3340,14 @@ void glVertexAttrib4fv(unsigned index, const float *v) {
 }
 void glVertexAttrib4iv(unsigned index, const int *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1511, 2, blob_len);
+    uint32_t *packet = begin(1621, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttrib4s(unsigned index, short x, short y, short z, short w) {
-    uint32_t *packet = begin(1512, 5, 0);
+    uint32_t *packet = begin(1622, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3354,7 +3358,7 @@ void glVertexAttrib4s(unsigned index, short x, short y, short z, short w) {
 }
 void glVertexAttrib4sv(unsigned index, const short *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1513, 2, blob_len);
+    uint32_t *packet = begin(1623, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3362,7 +3366,7 @@ void glVertexAttrib4sv(unsigned index, const short *v) {
 }
 void glVertexAttrib4ubv(unsigned index, const unsigned char *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1514, 2, blob_len);
+    uint32_t *packet = begin(1624, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3370,7 +3374,7 @@ void glVertexAttrib4ubv(unsigned index, const unsigned char *v) {
 }
 void glVertexAttrib4uiv(unsigned index, const unsigned *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1515, 2, blob_len);
+    uint32_t *packet = begin(1625, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3378,21 +3382,21 @@ void glVertexAttrib4uiv(unsigned index, const unsigned *v) {
 }
 void glVertexAttrib4usv(unsigned index, const unsigned short *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1516, 2, blob_len);
+    uint32_t *packet = begin(1626, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribBinding(unsigned attribindex, unsigned bindingindex) {
-    uint32_t *packet = begin(1517, 2, 0);
+    uint32_t *packet = begin(1627, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(attribindex);
     packet[at++] = (uint32_t)(bindingindex);
 }
 void glVertexAttribFormat(unsigned attribindex, int size, unsigned type, unsigned char normalized, unsigned relativeoffset) {
-    uint32_t *packet = begin(1519, 5, 0);
+    uint32_t *packet = begin(1629, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(attribindex);
@@ -3402,7 +3406,7 @@ void glVertexAttribFormat(unsigned attribindex, int size, unsigned type, unsigne
     packet[at++] = (uint32_t)(relativeoffset);
 }
 void glVertexAttribI1i(unsigned index, int x) {
-    uint32_t *packet = begin(1520, 2, 0);
+    uint32_t *packet = begin(1630, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3410,14 +3414,14 @@ void glVertexAttribI1i(unsigned index, int x) {
 }
 void glVertexAttribI1iv(unsigned index, const int *v) {
     size_t blob_len = v ? 1u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1521, 2, blob_len);
+    uint32_t *packet = begin(1631, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribI1ui(unsigned index, unsigned x) {
-    uint32_t *packet = begin(1522, 2, 0);
+    uint32_t *packet = begin(1632, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3425,14 +3429,14 @@ void glVertexAttribI1ui(unsigned index, unsigned x) {
 }
 void glVertexAttribI1uiv(unsigned index, const unsigned *v) {
     size_t blob_len = v ? 1u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1523, 2, blob_len);
+    uint32_t *packet = begin(1633, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribI2i(unsigned index, int x, int y) {
-    uint32_t *packet = begin(1524, 3, 0);
+    uint32_t *packet = begin(1634, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3441,14 +3445,14 @@ void glVertexAttribI2i(unsigned index, int x, int y) {
 }
 void glVertexAttribI2iv(unsigned index, const int *v) {
     size_t blob_len = v ? 2u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1525, 2, blob_len);
+    uint32_t *packet = begin(1635, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribI2ui(unsigned index, unsigned x, unsigned y) {
-    uint32_t *packet = begin(1526, 3, 0);
+    uint32_t *packet = begin(1636, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3457,14 +3461,14 @@ void glVertexAttribI2ui(unsigned index, unsigned x, unsigned y) {
 }
 void glVertexAttribI2uiv(unsigned index, const unsigned *v) {
     size_t blob_len = v ? 2u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1527, 2, blob_len);
+    uint32_t *packet = begin(1637, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribI3i(unsigned index, int x, int y, int z) {
-    uint32_t *packet = begin(1528, 4, 0);
+    uint32_t *packet = begin(1638, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3474,14 +3478,14 @@ void glVertexAttribI3i(unsigned index, int x, int y, int z) {
 }
 void glVertexAttribI3iv(unsigned index, const int *v) {
     size_t blob_len = v ? 3u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1529, 2, blob_len);
+    uint32_t *packet = begin(1639, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribI3ui(unsigned index, unsigned x, unsigned y, unsigned z) {
-    uint32_t *packet = begin(1530, 4, 0);
+    uint32_t *packet = begin(1640, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3491,7 +3495,7 @@ void glVertexAttribI3ui(unsigned index, unsigned x, unsigned y, unsigned z) {
 }
 void glVertexAttribI3uiv(unsigned index, const unsigned *v) {
     size_t blob_len = v ? 3u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1531, 2, blob_len);
+    uint32_t *packet = begin(1641, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3499,7 +3503,7 @@ void glVertexAttribI3uiv(unsigned index, const unsigned *v) {
 }
 void glVertexAttribI4bv(unsigned index, const signed char *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1532, 2, blob_len);
+    uint32_t *packet = begin(1642, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3507,7 +3511,7 @@ void glVertexAttribI4bv(unsigned index, const signed char *v) {
 }
 void glVertexAttribI4iv(unsigned index, const int *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1534, 2, blob_len);
+    uint32_t *packet = begin(1644, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3515,7 +3519,7 @@ void glVertexAttribI4iv(unsigned index, const int *v) {
 }
 void glVertexAttribI4sv(unsigned index, const short *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1535, 2, blob_len);
+    uint32_t *packet = begin(1645, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3523,14 +3527,14 @@ void glVertexAttribI4sv(unsigned index, const short *v) {
 }
 void glVertexAttribI4ubv(unsigned index, const unsigned char *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1536, 2, blob_len);
+    uint32_t *packet = begin(1646, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribI4ui(unsigned index, unsigned x, unsigned y, unsigned z, unsigned w) {
-    uint32_t *packet = begin(1537, 5, 0);
+    uint32_t *packet = begin(1647, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3541,7 +3545,7 @@ void glVertexAttribI4ui(unsigned index, unsigned x, unsigned y, unsigned z, unsi
 }
 void glVertexAttribI4uiv(unsigned index, const unsigned *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1538, 2, blob_len);
+    uint32_t *packet = begin(1648, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3549,14 +3553,14 @@ void glVertexAttribI4uiv(unsigned index, const unsigned *v) {
 }
 void glVertexAttribI4usv(unsigned index, const unsigned short *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1539, 2, blob_len);
+    uint32_t *packet = begin(1649, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribIFormat(unsigned attribindex, int size, unsigned type, unsigned relativeoffset) {
-    uint32_t *packet = begin(1540, 4, 0);
+    uint32_t *packet = begin(1650, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(attribindex);
@@ -3565,7 +3569,7 @@ void glVertexAttribIFormat(unsigned attribindex, int size, unsigned type, unsign
     packet[at++] = (uint32_t)(relativeoffset);
 }
 void glVertexAttribL1d(unsigned index, double x) {
-    uint32_t *packet = begin(1542, 3, 0);
+    uint32_t *packet = begin(1652, 3, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3576,14 +3580,14 @@ void glVertexAttribL1d(unsigned index, double x) {
 }
 void glVertexAttribL1dv(unsigned index, const double *v) {
     size_t blob_len = v ? 1u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1543, 2, blob_len);
+    uint32_t *packet = begin(1653, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribL2d(unsigned index, double x, double y) {
-    uint32_t *packet = begin(1544, 5, 0);
+    uint32_t *packet = begin(1654, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3598,14 +3602,14 @@ void glVertexAttribL2d(unsigned index, double x, double y) {
 }
 void glVertexAttribL2dv(unsigned index, const double *v) {
     size_t blob_len = v ? 2u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1545, 2, blob_len);
+    uint32_t *packet = begin(1655, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribL3d(unsigned index, double x, double y, double z) {
-    uint32_t *packet = begin(1546, 7, 0);
+    uint32_t *packet = begin(1656, 7, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3624,14 +3628,14 @@ void glVertexAttribL3d(unsigned index, double x, double y, double z) {
 }
 void glVertexAttribL3dv(unsigned index, const double *v) {
     size_t blob_len = v ? 3u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1547, 2, blob_len);
+    uint32_t *packet = begin(1657, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribL4d(unsigned index, double x, double y, double z, double w) {
-    uint32_t *packet = begin(1548, 9, 0);
+    uint32_t *packet = begin(1658, 9, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3654,14 +3658,14 @@ void glVertexAttribL4d(unsigned index, double x, double y, double z, double w) {
 }
 void glVertexAttribL4dv(unsigned index, const double *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1549, 2, blob_len);
+    uint32_t *packet = begin(1659, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
     put_blob(packet + at, v, blob_len);
 }
 void glVertexAttribLFormat(unsigned attribindex, int size, unsigned type, unsigned relativeoffset) {
-    uint32_t *packet = begin(1550, 4, 0);
+    uint32_t *packet = begin(1660, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(attribindex);
@@ -3670,7 +3674,7 @@ void glVertexAttribLFormat(unsigned attribindex, int size, unsigned type, unsign
     packet[at++] = (uint32_t)(relativeoffset);
 }
 void glVertexAttribLPointer(unsigned index, int size, unsigned type, int stride, const void *pointer) {
-    uint32_t *packet = begin(1551, 6, 0);
+    uint32_t *packet = begin(1661, 6, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3682,7 +3686,7 @@ void glVertexAttribLPointer(unsigned index, int size, unsigned type, int stride,
     packet[at++] = (uint32_t)(bits_pointer >> 32);
 }
 void glVertexAttribP1ui(unsigned index, unsigned type, unsigned char normalized, unsigned value) {
-    uint32_t *packet = begin(1552, 4, 0);
+    uint32_t *packet = begin(1662, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3692,7 +3696,7 @@ void glVertexAttribP1ui(unsigned index, unsigned type, unsigned char normalized,
 }
 void glVertexAttribP1uiv(unsigned index, unsigned type, unsigned char normalized, const unsigned *value) {
     size_t blob_len = value ? 1u * sizeof(*value) : 0;
-    uint32_t *packet = begin(1553, 4, blob_len);
+    uint32_t *packet = begin(1663, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3701,7 +3705,7 @@ void glVertexAttribP1uiv(unsigned index, unsigned type, unsigned char normalized
     put_blob(packet + at, value, blob_len);
 }
 void glVertexAttribP2ui(unsigned index, unsigned type, unsigned char normalized, unsigned value) {
-    uint32_t *packet = begin(1554, 4, 0);
+    uint32_t *packet = begin(1664, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3711,7 +3715,7 @@ void glVertexAttribP2ui(unsigned index, unsigned type, unsigned char normalized,
 }
 void glVertexAttribP2uiv(unsigned index, unsigned type, unsigned char normalized, const unsigned *value) {
     size_t blob_len = value ? 1u * sizeof(*value) : 0;
-    uint32_t *packet = begin(1555, 4, blob_len);
+    uint32_t *packet = begin(1665, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3720,7 +3724,7 @@ void glVertexAttribP2uiv(unsigned index, unsigned type, unsigned char normalized
     put_blob(packet + at, value, blob_len);
 }
 void glVertexAttribP3ui(unsigned index, unsigned type, unsigned char normalized, unsigned value) {
-    uint32_t *packet = begin(1556, 4, 0);
+    uint32_t *packet = begin(1666, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3730,7 +3734,7 @@ void glVertexAttribP3ui(unsigned index, unsigned type, unsigned char normalized,
 }
 void glVertexAttribP3uiv(unsigned index, unsigned type, unsigned char normalized, const unsigned *value) {
     size_t blob_len = value ? 1u * sizeof(*value) : 0;
-    uint32_t *packet = begin(1557, 4, blob_len);
+    uint32_t *packet = begin(1667, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3739,7 +3743,7 @@ void glVertexAttribP3uiv(unsigned index, unsigned type, unsigned char normalized
     put_blob(packet + at, value, blob_len);
 }
 void glVertexAttribP4ui(unsigned index, unsigned type, unsigned char normalized, unsigned value) {
-    uint32_t *packet = begin(1558, 4, 0);
+    uint32_t *packet = begin(1668, 4, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3749,7 +3753,7 @@ void glVertexAttribP4ui(unsigned index, unsigned type, unsigned char normalized,
 }
 void glVertexAttribP4uiv(unsigned index, unsigned type, unsigned char normalized, const unsigned *value) {
     size_t blob_len = value ? 1u * sizeof(*value) : 0;
-    uint32_t *packet = begin(1559, 4, blob_len);
+    uint32_t *packet = begin(1669, 4, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3758,7 +3762,7 @@ void glVertexAttribP4uiv(unsigned index, unsigned type, unsigned char normalized
     put_blob(packet + at, value, blob_len);
 }
 void glVertexBindingDivisor(unsigned bindingindex, unsigned divisor) {
-    uint32_t *packet = begin(1561, 2, 0);
+    uint32_t *packet = begin(1671, 2, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(bindingindex);
@@ -3769,7 +3773,7 @@ void glViewportArrayv(unsigned first, int count, const float *v) {
     if (v && count > 0 &&
         (size_t)count <= SIZE_MAX / (4u * sizeof(*v)))
         blob_len = (size_t)count * 4u * sizeof(*v);
-    uint32_t *packet = begin(1563, 3, blob_len);
+    uint32_t *packet = begin(1673, 3, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(first);
@@ -3777,7 +3781,7 @@ void glViewportArrayv(unsigned first, int count, const float *v) {
     put_blob(packet + at, v, blob_len);
 }
 void glViewportIndexedf(unsigned index, float x, float y, float w, float h) {
-    uint32_t *packet = begin(1564, 5, 0);
+    uint32_t *packet = begin(1674, 5, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);
@@ -3788,7 +3792,7 @@ void glViewportIndexedf(unsigned index, float x, float y, float w, float h) {
 }
 void glViewportIndexedfv(unsigned index, const float *v) {
     size_t blob_len = v ? 4u * sizeof(*v) : 0;
-    uint32_t *packet = begin(1565, 2, blob_len);
+    uint32_t *packet = begin(1675, 2, blob_len);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(index);

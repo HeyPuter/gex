@@ -29,7 +29,17 @@ VERSIONS = (
     [(1, minor) for minor in range(6)]
     + [(2, minor) for minor in range(2)]
     + [(3, minor) for minor in range(4)]
-    + [(4, minor) for minor in range(5)]
+    # Through 4.5, not 4.4: the driver now grants GL 4.5 extensions and the
+    # guest has to be able to export their entry points. glTextureBarrier is
+    # 4.5 core, so with the universe stopping at 4.4 the transport generator
+    # refused it ("commands absent from GL 4.4 core") and the guest could
+    # claim neither ARB_texture_barrier nor NV_texture_barrier however the
+    # host driver was built.
+    #
+    # This widens the *universe* only: the transport generator still emits
+    # exactly the commands its policy sets name, so nothing new is generated
+    # by adding a version here.
+    + [(4, minor) for minor in range(6)]
 )
 
 

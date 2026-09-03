@@ -25,6 +25,13 @@ SCALAR_COMMANDS = {
     "glDispatchCompute", "glDispatchComputeIndirect", "glDrawArraysInstancedBaseInstance", "glDrawBuffer",
     "glEnablei", "glLogicOp",
     "glEndQuery", "glEndTransformFeedback", "glMemoryBarrier", "glMinSampleShading",
+    # glTextureBarrier takes no arguments, like glEndTransformFeedback above.
+    # Without it the guest exported no entry point for ARB_texture_barrier /
+    # NV_texture_barrier, so gen_gl_extensions could not claim either even
+    # though the host driver had just granted both, and
+    # gl44-conditional-render-probe's barrier case was skipped in the browser
+    # while it ran natively.
+    "glTextureBarrier",
     "glPointParameterf", "glPointParameteri", "glPointSize", "glPolygonMode",
     "glPixelStoref",
     "glPatchParameteri",
