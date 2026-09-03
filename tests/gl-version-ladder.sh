@@ -10,6 +10,21 @@
 # or against any driver:                 GEX_LADDER_GLXINFO="glxinfo" ...
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# The driver's own GLSL cap, read from its source rather than assumed. This
+# was hardcoded to 430 long after the driver reached 440, so the 4.4 rung was
+# reported as needing GLSL440 that it already had. GEX_GLSL_LEVEL overrides it
+# for a what-if.
+DRIVER_C=${GEX_DRIVER_C:-$ROOT/third_party/mesa/src/gallium/drivers/gex_wgpu/gex_wgpu_screen.c}
+GLSL_LEVEL=${GEX_GLSL_LEVEL:-}
+if [ -z "$GLSL_LEVEL" ] && [ -r "$DRIVER_C" ]; then
+  GLSL_LEVEL=$(grep -oE 'caps->glsl_feature_level[[:space:]]*=[[:space:]]*[0-9]+' \
+    "$DRIVER_C" | grep -oE '[0-9]+$' | head -1)
+fi
+if [ -z "$GLSL_LEVEL" ]; then
+  echo "cannot read glsl_feature_level from $DRIVER_C; set GEX_GLSL_LEVEL" >&2
+  exit 2
+fi
+
 VERSION_C=$ROOT/third_party/mesa/src/mesa/main/version.c
 INST=${GEX_INST:-/tmp/gex-mesa-native/inst}
 LIST=$(mktemp)
@@ -70,7 +85,7 @@ for rung in 4_0 4_1 4_2 4_3 4_4 4_5 4_6; do
     on && /^   const bool ver_[0-9]_[0-9] = / && !index($0, tag) {exit}
     on {print}' "$VERSION_C" |
     grep -oE 'GLSLVersion >= [0-9]+' | grep -oE '[0-9]+$' | head -1)
-  if [ -n "$glsl" ] && [ "$glsl" -gt "${GEX_GLSL_LEVEL:-430}" ]; then
+  if [ -n "$glsl" ] && [ "$glsl" -gt "$GLSL_LEVEL" ]; then
     missing="$missing GLSL$glsl"
   fi
   n=$(echo $missing | wc -w)
@@ -85,7 +100,7 @@ printf -- '--- the need:X=N entries are numeric limits from the same rung, not\n
 printf -- '    extensions: check them against glxinfo -l. They are listed\n'
 printf -- '    unconditionally because this script cannot query them.\n'
 printf -- '--- driver glsl_feature_level: %s (Mesa then clamps the usable\n' \
-  "${GEX_GLSL_LEVEL:-430}"
+  "$GLSL_LEVEL"
 printf -- '    #version to the granted GL version, so a 400 cap in a 3.3\n'
 printf -- '    context still compiles nothing above 3.30)\n'
 rm -f "$LIST"
