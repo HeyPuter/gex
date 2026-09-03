@@ -77,12 +77,23 @@ static GLuint counting_program(void)
         "}\n";
     /* No colour output at all: there is nowhere to put one, and declaring one
      * is what a driver emulating this with a scratch attachment must not
-     * require. */
+     * require.
+     *
+     * Each fragment marks *its own* slot rather than incrementing a counter.
+     * An atomic add would be the obvious way to count and it tests two things
+     * at once: gex_wgpu refuses storage atomics today, so the probe reported
+     * zero fragments for a framebuffer that was working. Marking a slot needs
+     * no atomic -- one fragment per slot, so there is no race -- and it is a
+     * stronger check, because the CPU then knows *which* pixels were covered
+     * rather than only how many. */
     static const char *fs_src =
         "#version 330 core\n"
         "#extension GL_ARB_shader_storage_buffer_object : require\n"
-        "layout(std430, binding = 0) buffer Count { uint fragments; };\n"
-        "void main() { atomicAdd(fragments, 1u); }\n";
+        "layout(std430, binding = 0) buffer Covered { uint hit[]; };\n"
+        "void main() {\n"
+        "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+        "  hit[p.y * 64 + p.x] = 1u;\n"
+        "}\n";
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vs, 1, &vs_src, NULL);
     glCompileShader(vs);
@@ -117,22 +128,45 @@ static GLuint counting_program(void)
 }
 
 static GLuint counter_bo;
+#define COVERAGE_SLOTS (DEFAULT_W * DEFAULT_H)
 
-static unsigned count_fragments(GLuint prog)
+/* Draw the quad and return how many distinct pixels the fragment shader ran
+ * on. `box` receives the covered rectangle, so a wrong *placement* with the
+ * right area is caught too. */
+static unsigned count_fragments(GLuint prog, int box[4])
 {
-    const uint32_t zero = 0;
+    static uint32_t zeros[COVERAGE_SLOTS];
+    memset(zeros, 0, sizeof(zeros));
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, counter_bo);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(zero), &zero);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(zeros), zeros);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, counter_bo);
     glUseProgram(prog);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-    uint32_t got = 0xffffffffu;
+    unsigned got = 0;
+    int minx = 1 << 20, miny = 1 << 20, maxx = -1, maxy = -1;
     const uint32_t *read = (const uint32_t *)glMapBufferRange(
-        GL_SHADER_STORAGE_BUFFER, 0, sizeof(got), GL_MAP_READ_BIT);
+        GL_SHADER_STORAGE_BUFFER, 0, sizeof(zeros), GL_MAP_READ_BIT);
     if (read) {
-        got = read[0];
+        for (unsigned i = 0; i < COVERAGE_SLOTS; ++i) {
+            if (!read[i])
+                continue;
+            ++got;
+            const int x = (int)(i % DEFAULT_W), y = (int)(i / DEFAULT_W);
+            if (x < minx) minx = x;
+            if (y < miny) miny = y;
+            if (x > maxx) maxx = x;
+            if (y > maxy) maxy = y;
+        }
         glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    } else {
+        return 0xffffffffu;
+    }
+    if (box) {
+        box[0] = maxx < 0 ? -1 : minx;
+        box[1] = maxy < 0 ? -1 : miny;
+        box[2] = maxx;
+        box[3] = maxy;
     }
     return got;
 }
@@ -177,8 +211,9 @@ int main(void) {
     glGenBuffers(1, &counter_bo);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, counter_bo);
     {
-        const uint32_t zero = 0;
-        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(zero), &zero,
+        static uint32_t zeros[COVERAGE_SLOTS];
+        memset(zeros, 0, sizeof(zeros));
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(zeros), zeros,
                      GL_DYNAMIC_COPY);
     }
     glGenFramebuffers(1, &fbo);
@@ -218,46 +253,58 @@ int main(void) {
     /* Case 3: the whole default size. */
     {
         unsigned got = 0;
+        int box[4] = {-1, -1, -1, -1};
         if (prog) {
             glDisable(GL_SCISSOR_TEST);
             glViewport(0, 0, DEFAULT_W, DEFAULT_H);
-            got = count_fragments(prog);
+            got = count_fragments(prog, box);
         }
         const GLenum error = glGetError();
-        fprintf(stderr, "INFO full got=%u want=%u err=0x%04x\n", got,
-                DEFAULT_W * DEFAULT_H, (unsigned)error);
+        fprintf(stderr, "INFO full got=%u want=%u box=%d,%d..%d,%d "
+                "err=0x%04x\n", got, DEFAULT_W * DEFAULT_H, box[0], box[1],
+                box[2], box[3], (unsigned)error);
         result("full", prog && error == GL_NO_ERROR &&
-                       got == DEFAULT_W * DEFAULT_H);
+                       got == DEFAULT_W * DEFAULT_H &&
+                       box[0] == 0 && box[1] == 0 &&
+                       box[2] == DEFAULT_W - 1 && box[3] == DEFAULT_H - 1);
     }
 
     /* Case 4: a smaller viewport on the same framebuffer. */
     {
         unsigned got = 0;
+        int box[4] = {-1, -1, -1, -1};
         if (prog) {
             glDisable(GL_SCISSOR_TEST);
             glViewport(0, 0, 16, 8);
-            got = count_fragments(prog);
+            got = count_fragments(prog, box);
         }
         const GLenum error = glGetError();
-        fprintf(stderr, "INFO viewport got=%u want=%u err=0x%04x\n", got,
-                16u * 8u, (unsigned)error);
-        result("viewport", prog && error == GL_NO_ERROR && got == 16u * 8u);
+        fprintf(stderr, "INFO viewport got=%u want=%u box=%d,%d..%d,%d "
+                "err=0x%04x\n", got, 16u * 8u, box[0], box[1], box[2], box[3],
+                (unsigned)error);
+        result("viewport", prog && error == GL_NO_ERROR && got == 16u * 8u &&
+                           box[0] == 0 && box[1] == 0 && box[2] == 15 &&
+                           box[3] == 7);
     }
 
     /* Case 5: and a scissor inside that. */
     {
         unsigned got = 0;
+        int box[4] = {-1, -1, -1, -1};
         if (prog) {
             glViewport(0, 0, 16, 8);
             glEnable(GL_SCISSOR_TEST);
             glScissor(2, 2, 4, 4);
-            got = count_fragments(prog);
+            got = count_fragments(prog, box);
             glDisable(GL_SCISSOR_TEST);
         }
         const GLenum error = glGetError();
-        fprintf(stderr, "INFO scissor got=%u want=%u err=0x%04x\n", got,
-                4u * 4u, (unsigned)error);
-        result("scissor", prog && error == GL_NO_ERROR && got == 4u * 4u);
+        fprintf(stderr, "INFO scissor got=%u want=%u box=%d,%d..%d,%d "
+                "err=0x%04x\n", got, 4u * 4u, box[0], box[1], box[2], box[3],
+                (unsigned)error);
+        result("scissor", prog && error == GL_NO_ERROR && got == 4u * 4u &&
+                          box[0] == 2 && box[1] == 2 && box[2] == 5 &&
+                          box[3] == 5);
     }
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,

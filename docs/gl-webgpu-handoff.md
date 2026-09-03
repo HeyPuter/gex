@@ -9960,3 +9960,92 @@ tessellation stage is not captured, on the same terms as the geometry stage's.
 `ARB_viewport_array` plus a cap bump -- and `ARB_fragment_layer_viewport` (4.3)
 comes from the same cap, which makes multiple viewports the next thing worth
 doing.
+
+## Three more of GL 4.3's five
+
+`ARB_robust_buffer_access_behavior` (5/5), `ARB_framebuffer_no_attachments`
+(5/5) and `ARB_copy_image` (6/6), all against llvmpipe. **GL 4.3 is now two
+extensions away** -- `ARB_texture_view` and `ARB_fragment_layer_viewport`, and
+the second comes free with `ARB_viewport_array`, which is also 4.1's only real
+item. Two features stand between this driver and the OpenGL 4.3 floor Blender
+refuses to start below.
+
+### Robust buffer access is a claim, not code
+
+The extension promises that an out-of-bounds buffer access from a shader
+cannot crash, cannot read another buffer and cannot write outside its own; the
+value it returns is explicitly undefined. **WebGPU makes exactly that
+guarantee by construction** -- its specification defines every out-of-bounds
+buffer access as returning zero or being discarded, and an implementation that
+let one escape would be a security bug rather than a conformance one.
+
+So this is a cap and a verification, not an implementation. What the probe
+checks is that *this driver* does not defeat the platform's promise -- a
+CPU-side index clamp with signed arithmetic, or a binding sized from the
+shader's declaration rather than from the buffer, would -- which is why every
+case pairs its out-of-bounds access with a **sentinel in the buffer allocated
+right after it**: a storage read and write past the end, the same read through
+a uniform block, a `texelFetch` past the end of a texture buffer (a different
+path here, since those are served as storage reads), and an index list running
+past the end of a vertex buffer followed by an ordinary draw that has to still
+work.
+
+### An attachment-less framebuffer gets a stand-in
+
+A framebuffer with nothing attached is complete in GL once
+`GL_FRAMEBUFFER_DEFAULT_WIDTH`/`_HEIGHT` are set, and rendering into it runs
+the fragment shader over the covered area for its **side effects** -- image
+stores, storage writes, atomic counters. Voxel cone tracing, GPU-driven
+culling and per-pixel linked lists are all built on it.
+
+WebGPU's render pass needs at least one attachment, so one R8_UNORM target is
+manufactured at the default size and thrown away. Standing it in as *colour
+attachment zero* is what makes this small: the views, the pass, the pipeline
+and the viewport bounds all work unchanged. Only one thing had to change --
+**the write mask is forced to zero**, because WebGPU requires a colour target
+the fragment shader does not write to be masked out, and a shader rendering
+into a framebuffer with no attachments writes nothing by definition. Leaving
+the application's `glColorMask` there is a validation error, and a validation
+error poisons the device.
+
+A layered default (`GL_FRAMEBUFFER_DEFAULT_LAYERS > 1`) rasterizes layer zero
+and says so in the log; WebGPU attaches one layer at a time.
+
+### Cross-format copies go through util_resource_copy_region
+
+`glCopyImageSubData` copies between images of the same bytes *per block*
+rather than the same format -- DXT1 and RG32UI are both eight bytes, so the
+specification pairs them, and a 16x16 DXT1 image corresponds to a 4x4 RG32UI
+one. st/mesa hands such a copy straight to `resource_copy_region`
+(`st_cb_copyimage.c`'s `copy_image`, whose first branch covers "either side is
+compressed" as well as equal formats). WebGPU's texture-to-texture copy
+demands identical formats, so there is no command for it.
+
+`util_resource_copy_region` is the command: it maps both sides and copies
+blocks, and it already knows the whole rule -- shrink the destination box by
+the source's block size when the source is compressed, expand it by the
+destination's when the destination is, refuse when the block sizes disagree.
+Writing that against a staging buffer would have been a WebGPU round trip per
+row *and* the same arithmetic a second time. It is a CPU round trip, which for
+`glCopyImageSubData` is the right trade: texture streaming calls it once per
+promoted tile, not once per draw. Equal formats keep the GPU path.
+
+### The probe bug worth keeping
+
+`gl44-fbo-no-attachments-probe` first counted fragments with an `atomicAdd`
+into a storage buffer, and reported **zero fragments for a framebuffer that
+was working**: this driver refuses storage atomics, so the shader failed to
+link. One probe, two features, and the failure named neither.
+
+It now has each fragment mark *its own* slot -- one fragment per slot, so no
+atomic is needed -- and the CPU counts the marks and computes the covered
+rectangle. That is strictly stronger than counting: the viewport case now
+checks that the covered box is `0,0..15,7` and not merely that 128 pixels were
+touched, which is what would catch a stand-in target sized from the viewport
+rather than from the default.
+
+**Storage atomics remain unimplemented and are now known to matter.**
+`ARB_shader_atomic_counters` is advertised (st derives it from SSBO support)
+and atomic counters lower to SSBO atomics, so a shader using either fails to
+link. WGSL has atomics but only on `atomic<u32>` storage, which is a different
+declaration from the plain word array the lowering emits.
