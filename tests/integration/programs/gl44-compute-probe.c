@@ -172,6 +172,15 @@ int main(void) {
 
     GLuint result[8];
     memset(result, 0, sizeof(result));
+    /* glBindBufferBase sets the *generic* binding point as well as the
+       indexed one, so the indirect buffer bound at index 3 above is what
+       GL_SHADER_STORAGE_BUFFER still names. Reading without re-binding read
+       that buffer instead -- 28 bytes asked for 32 --
+       "GL_INVALID_VALUE in glGetBufferSubData(offset 0 + size 32 > buffer
+       size 28)", which failed on every driver and stopped this probe before
+       any of the cases after it. Every other readback below already binds
+       first; this one did not. */
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
     glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(result), result);
     for (GLuint i = 0; i < 8; ++i) {
         CHECK(result[i] == 0x51a70000u + i * 17u, "SSBO result/readback");
@@ -209,6 +218,13 @@ int main(void) {
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, zero_pixels);
+    /* One level with the default GL_NEAREST_MIPMAP_LINEAR filter is a
+       mipmap-*incomplete* texture, and glCopyImageSubData below requires a
+       complete one -- "GL_INVALID_OPERATION in glCopyImageSubData(srcName
+       incomplete)", which left the readback all zeros on every driver and
+       stopped this probe before the seven cases after it. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glBindImageTexture(1, texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glUseProgram(image_program);
     glDispatchCompute(1, 1, 1);
@@ -217,6 +233,8 @@ int main(void) {
     glGenTextures(1, &copied_texture);
     glBindTexture(GL_TEXTURE_2D, copied_texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, zero_pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glCopyImageSubData(texture, GL_TEXTURE_2D, 0, 0, 0, 0,
                        copied_texture, GL_TEXTURE_2D, 0, 0, 0, 0, 4, 1, 1);
     glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
@@ -241,6 +259,9 @@ int main(void) {
     GLuint framebuffer_copy = 0;
     glGenTextures(1, &framebuffer_copy);
     glBindTexture(GL_TEXTURE_2D, framebuffer_copy);
+    /* Complete, or st drops it: see the note at the first image texture. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 6, 1, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, copy_zero);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
@@ -284,6 +305,13 @@ int main(void) {
                  GL_RED_INTEGER, GL_UNSIGNED_INT, uint_zero_level0);
     glTexImage2D(GL_TEXTURE_2D, 1, GL_R32UI, 4, 1, 0,
                  GL_RED_INTEGER, GL_UNSIGNED_INT, uint_zero);
+    /* Levels 0 and 1 of an 8x2 texture are not the whole chain, so with the
+       default GL_NEAREST_MIPMAP_LINEAR filter this is mipmap-incomplete --
+       and st_convert_image_from_unit drops an incomplete texture, handing the
+       driver an empty image view with nothing to say why. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 1);
     glBindImageTexture(4, uint_texture, 1, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
     glUseProgram(uint_image_writer);
     glDispatchCompute(1, 1, 1);
@@ -310,6 +338,8 @@ int main(void) {
     const GLuint array_zero[6] = {0};
     glGenTextures(1, &array_texture);
     glBindTexture(GL_TEXTURE_2D_ARRAY, array_texture);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_R32UI, 2, 1, 3, 0,
                  GL_RED_INTEGER, GL_UNSIGNED_INT, array_zero);
     glBindImageTexture(7, array_texture, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32UI);
@@ -361,6 +391,8 @@ int main(void) {
     const GLuint volume_initial[6] = {0x6600u, 0x6605u, 0x6610u, 0x6615u, 0x6620u, 0x6625u};
     glGenTextures(1, &volume_texture);
     glBindTexture(GL_TEXTURE_3D, volume_texture);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage3D(GL_TEXTURE_3D, 0, GL_R32UI, 2, 1, 3, 0,
                  GL_RED_INTEGER, GL_UNSIGNED_INT, volume_initial);
 
