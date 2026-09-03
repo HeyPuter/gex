@@ -12172,3 +12172,64 @@ shader's images, which is what identified the three shapes involved.
 **The pattern across all five**: a driver limit expressed as "map it to
 something close and carry on" becomes an abort in a component that has no idea
 what GL is. Refusing by name costs a feature; guessing costs the process.
+
+## A crash sweep over all 89 GL 4.4 families (2026-09-03)
+
+Crashes are the worst failure this driver has, and they also abort the family
+they are in, hiding everything after. So rather than chasing scores, the whole
+mustpass was swept for how each family *ended*:
+
+```
+for fam in $(awk -F. '{print $2}' gl44-main.txt | sort -u); do
+  timeout 90 ./glcts --deqp-case="KHR-GL44.$fam.*" --deqp-surface-type=fbo \
+      --deqp-surface-width=64 --deqp-surface-height=64 >/tmp/f.log 2>&1
+  printf '%s\t%s\n' "$fam" "$?"
+done
+```
+
+132 is SIGILL, 134 an abort, 139 a segfault; 124 is only the timeout and means
+the family was still running happily. Result after the fixes above: **89
+families, one crash** -- and it is fixed below. The script is
+`/tmp/cts-crashsweep.sh`; a family that crashes has its log kept as
+`/tmp/cts-crash-<family>.log`.
+
+### ARB_clear_texture: 10/78 to 78/78
+
+`glClearTexImage` is core in GL 4.4 and the driver had no `clear_texture`
+hook, so st fell back to `u_default_clear_texture`, which clears by
+**rendering** into the texture. That needs the format and target to be a
+render target, and a 1D texture cannot be one in WebGPU -- so the fallback
+called `clear_render_target` for a shape this driver refuses, **the refusal
+latched the context**, and the rest of the run collapsed into
+`GL_OUT_OF_MEMORY` from every later map. Only ten of the seventy-eight cases
+were really about clearing.
+
+Filling a texture with one colour needs no rendering here at all: the value
+arrives in the resource's own format, so repeating it across the box and
+handing that to `texture_subdata` is the entire operation -- and that path
+already knows the wider backing formats, the block sizes and the row
+alignment. A few lines, and it works for every target and format the render
+path could not.
+
+Depth, stencil and compressed formats go to `util_clear_texture_sw` rather
+than to the default, because the default would render for those too and this
+driver's depth clear only does a *whole level* -- so `glClearTexSubImage` of a
+region refused and latched all over again.
+
+**78/78**, with no refusals and no `GL_OUT_OF_MEMORY` anywhere in the run.
+
+### A patch topology has no primitive count
+
+The last crash. A draw with a query active counts the primitives its vertex
+stage produced, via `u_prims_for_vertices` -- which has no entry for a patch,
+because a patch's vertex count comes from `glPatchParameteri` and reaches the
+driver through `set_patch_vertices` rather than in the draw info. So
+`u_prim.h`'s table carries an increment of zero and the helper *asserts*,
+aborting the application. Every draw with a patch topology and a query active
+reaches it, which is ordinary for a tessellating program.
+
+Patches now count as patches, which is well defined and which the driver has
+the vertices-per-patch to compute. That is not what `PRIMITIVES_GENERATED`
+means on a tessellating draw -- GL asks for what the evaluation stage emitted
+-- so the query is approximate there and the comment says so. Approximate
+beats aborting. `KHR-GL44.tessellation_shader` runs to completion at 6/20.
