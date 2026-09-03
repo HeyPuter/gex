@@ -1047,12 +1047,18 @@ def _guest_function(command: dict, opcode: int) -> str:
         # ARB_viewport_array. Both sides used to assume one, so the guest read
         # a single word -- gl44-viewport-array-probe's roundtrip case saw a
         # scissor box of "2,0,0,0" -- and the host wrote four GLints into one
-        # on its own stack. The arity comes from the same pname table
-        # glGetIntegerv uses, computed before the request goes out so a
-        # disagreement cannot write past the caller's array.
+        # on its own stack. The arity is *per index*, which is not the arity
+        # of the plain query: glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_COUNT)
+        # returns three values, glGetIntegeri_v of it returns one per index.
+        # Sizing this from gexgl_state_query_components made the guest expect
+        # three words where the host sent one, the reply was discarded as the
+        # wrong length, and the value read back as zero -- below GL's required
+        # minimum, which gl44-indexed-probe checks and the browser gate
+        # caught. Computed before the request goes out so a disagreement
+        # cannot write past the caller's array.
         return f"""void {name}(unsigned target, unsigned index, {output_type} *data) {{
     const size_t expected =
-        (size_t)gexgl_state_query_components(target) * sizeof(*data);
+        (size_t)gexgl_indexed_query_components(target) * sizeof(*data);
     uint32_t *a = begin({opcode}, 2, 0);
     if (!a) return;
     a[0] = target; a[1] = index; flush();

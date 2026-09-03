@@ -2395,6 +2395,23 @@ void glGetIntegerv(unsigned pname, int *out) {
         memcpy(out, values, expected);
 }
 
+/* How many values *one index* of an indexed query yields.
+ *
+ * Not gexgl_state_query_components: that answers the plain query, where
+ * GL_MAX_COMPUTE_WORK_GROUP_COUNT is three values. glGetIntegeri_v of the
+ * same pname is one value per index, and only GL_VIEWPORT and GL_SCISSOR_BOX
+ * -- ARB_viewport_array's whole point -- are vectors per index. The host side
+ * applies the same rule. */
+static size_t gexgl_indexed_query_components(unsigned pname) {
+    switch (pname) {
+    case 0x0BA2u: /* GL_VIEWPORT */
+    case 0x0C10u: /* GL_SCISSOR_BOX */
+        return 4;
+    default:
+        return 1;
+    }
+}
+
 static size_t gexgl_state_query_components(unsigned pname) {
     switch (pname) {
     case 0x0BA2u: /* GL_VIEWPORT */

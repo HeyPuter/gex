@@ -918,7 +918,7 @@ void glGetFramebufferParameteriv(unsigned target, unsigned pname, int *params) {
 }
 void glGetInteger64i_v(unsigned target, unsigned index, long long *data) {
     const size_t expected =
-        (size_t)gexgl_state_query_components(target) * sizeof(*data);
+        (size_t)gexgl_indexed_query_components(target) * sizeof(*data);
     uint32_t *a = begin(1205, 2, 0);
     if (!a) return;
     a[0] = target; a[1] = index; flush();
@@ -939,7 +939,7 @@ void glGetInteger64v(unsigned pname, long long *data) {
 }
 void glGetIntegeri_v(unsigned target, unsigned index, int *data) {
     const size_t expected =
-        (size_t)gexgl_state_query_components(target) * sizeof(*data);
+        (size_t)gexgl_indexed_query_components(target) * sizeof(*data);
     uint32_t *a = begin(1207, 2, 0);
     if (!a) return;
     a[0] = target; a[1] = index; flush();

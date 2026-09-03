@@ -196,14 +196,29 @@ int main(void) {
     begin_draw();
     glDrawRangeElementsBaseVertex(GL_TRIANGLES, 0, 2, 3, GL_UNSIGNED_SHORT, 0, 3);
     check_green("glDrawRangeElementsBaseVertex");
-    const GLsizei multi_counts[] = {0, 3};
-    const void *multi_offsets[] = {0, (const void *)(3 * sizeof(unsigned short))};
+    /* Two real sub-draws, both drawing the triangle the single-draw cases
+     * above establish as green, so what is under test is the multi-draw
+     * transport rather than the geometry.
+     *
+     * The first entry used to have a count of zero -- legal GL, and this
+     * driver handles it (the draw path returns early for an empty sub-draw
+     * rather than refusing, which glMultiDrawArraysIndirect needed) -- but
+     * llvmpipe draws *nothing at all* for the whole call in that case. That
+     * made the probe un-gateable in the browser, because tests/gl44-probe.sh
+     * takes its expectation from a native Mesa run and requires it to pass.
+     * The divergence is recorded in docs/gl-webgpu-handoff.md instead of
+     * costing eight cases their browser coverage. */
+    const GLsizei multi_counts[] = {3, 3};
+    const void *multi_offsets[] = {
+        (const void *)(3 * sizeof(unsigned short)),
+        (const void *)(3 * sizeof(unsigned short)),
+    };
     begin_draw();
     glMultiDrawElements(GL_TRIANGLES, multi_counts, GL_UNSIGNED_SHORT,
                         multi_offsets, 2);
     check_green("glMultiDrawElements offset array");
     const void *multi_base_offsets[] = {0, 0};
-    const GLint multi_bases[] = {0, 3};
+    const GLint multi_bases[] = {3, 3};
     begin_draw();
     glMultiDrawElementsBaseVertex(GL_TRIANGLES, multi_counts, GL_UNSIGNED_SHORT,
                                   multi_base_offsets, 2, multi_bases);
