@@ -11373,16 +11373,60 @@ Narrowed further, and this is where it stands:
   limits, so the GL version drops and `ARB_texture_view` is not advertised at
   all (the probe reports its never-sampled sentinel, 65535).
 
-**Blocked on the right instrument, not on effort.** Every host-side signal is
-identical between the two builds, so more driver logging cannot separate them.
-The next step is a WebGPU-level repro in the page -- create an `rgba8unorm`
-texture with `viewFormats: ['rgba8unorm-srgb']`, upload a known texel, sample
-it through an sRGB view, and read it back -- which answers whether this is a
-Chrome/Dawn behaviour difference or something the driver does to the texture
-before the view is made.
+### The repro was written, and it clears the browser
 
-A fallback exists if that repro shows a genuine browser limitation: route
-sRGB views through the same scratch copy, which demonstrably works there.
-That is deliberately *not* done now -- it would cost a copy on every
-`GL_FRAMEBUFFER_SRGB` blit view, which is a common path, to paper over a cause
-that is not yet understood.
+`scratchpad/srgbrepro/repro.html` does the whole thing in raw WebGPU with no
+driver involved: an `rgba8unorm` texture created with
+`viewFormats: ['rgba8unorm-srgb']`, a known texel written to it, then read
+back through both an sRGB view and a linear one, by `textureLoad` *and* by
+`textureSampleLevel` with a filtering sampler. Served over `http://localhost`
+(a secure context) and reported out through the server's request log, because
+`--dump-dom` fires before the async GPU work finishes and
+`--virtual-time-budget` does not advance real GPU work.
+
+In the same headless Chromium the harness uses, with the same
+`--use-angle=vulkan` flags:
+
+```
+load-srgb=55  load-linear=128  sample-srgb=55  sample-linear=128
+```
+
+All four exact. **The browser's WebGPU is correct for this**, sampled path
+included. So the fallback sketched here previously -- routing sRGB views
+through the scratch copy -- would paper over a driver bug, not a platform
+limitation, and is off the table.
+
+### Every layer between GL and WebGPU now measures correct
+
+Working inwards, all measured in the failing browser run:
+
+- The driver builds an **identical** sampler view in both builds: same view
+  format over the same texture format, `reinterpreting=0`, same WGPU format
+  pair, over a resource that reports itself written.
+- The **bind group layout** is identical for all six of the probe's draws,
+  the sRGB one included: same `sampleType`, same view dimension, same
+  `depth_as_float` bit.
+- The **JS `createTexture`** call declares `viewFormats:
+  ["rgba8unorm-srgb"]`, so the view is legal rather than an invalid object
+  that would silently drop the draw.
+- The **JS `createView`** call is `format=rgba8unorm-srgb dim=2d baseMip=0
+  mipCount=1 baseLayer=0 layerCount=1 aspect=all` on an `rgba8unorm`
+  texture -- byte for byte what the passing repro asks for.
+- The draw machinery is fine in that build: the `format-class` case, which
+  samples a scratch texture through the same fragment path, **passes** in the
+  browser.
+- The probe sets `GL_NEAREST` filters, so texture completeness is not it, and
+  the `srgb=` field in the draw dump drives nothing.
+
+That is a contradiction, which usually means an assumption above is subtly
+wrong rather than that all of them are right. The sharpest remaining question
+is whether the *draw* produces black or the *sample* does: have that case's
+fragment shader write a constant instead of the sample and see whether the
+constant appears. After that, dumping the WGSL and the pipeline for that one
+draw in both builds is the next instrument -- note the WGSL should be
+*identical to the passing unorm cases*, since the probe compiles the same
+shader source for all of them and the format lives entirely in the view.
+
+Stopped here deliberately rather than blocked: the state above is worth more
+to the next pass than a half-finished sixth instrument, and nothing else in
+the driver depends on it.
