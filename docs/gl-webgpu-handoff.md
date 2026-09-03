@@ -11979,3 +11979,103 @@ The probe stays in the suite as a **feature-gap marker**: llvmpipe reports
 alongside `quad` and `texture-sampler`. It is also the guard -- anyone who
 enables the cap will see it move from 0/0 to 2/3, which is the suite saying
 what this section says.
+
+## The native CTS as a bug source (2026-09-03)
+
+There is a **native** CTS build at `/tmp/gex-glcts-native`, and it reaches
+driver bugs far faster than an application does:
+
+```
+cd /tmp/gex-glcts-native/external/openglcts/modules
+env LD_LIBRARY_PATH=/tmp/gex-mesa-native/inst/lib:~/.cache/gex-dawn-native/pkg/lib \
+    LIBGL_DRIVERS_PATH=/tmp/gex-mesa-native/inst/lib/dri LIBGL_ALWAYS_SOFTWARE=1 \
+    GALLIUM_DRIVER=gex_wgpu DISPLAY=:78 \
+  ./glcts --deqp-case='KHR-GL44.compute_shader.*' --deqp-surface-type=fbo \
+          --deqp-surface-width=64 --deqp-surface-height=64
+```
+
+The mustpass list is at
+`gl_cts/data/mustpass/gl/khronos_mustpass/main/gl44-main.txt` (16843 cases);
+`awk -F. '{print $1"."$2"."$3}' | sort | uniq -c` gives the family sizes.
+First measurements: `compute_shader` 2/19, `texture_view` 1/7,
+`buffer_storage` 6/9.
+
+**Collect the refusal reasons first**, not the pass rate:
+`grep -aE "rejected:" | sed 's/.*rejected: /REJECT: /' | sort | uniq -c`.
+For `compute_shader` that turned 17 failures into four distinct causes, which
+is what makes the work tractable.
+
+### An array of uniform blocks is one variable over many slots
+
+`uniform InputBuffer { ... } g_in_buffer[12]` gives Gallium twelve constant
+buffers -- each element is bound separately -- and NIR **one** variable at the
+first of them, whose type is the *element* struct with no array left in it. So
+there is no length to read anywhere, and matching a load's slot against
+`driver_location` found nothing for the other eleven:
+
+```
+compute shader rejected: load_ubo slot=2 block=(none) interface=no fields=-1
+```
+
+The block whose `driver_location` is the greatest one at or below the slot
+owns it -- no length needed, and still right when a shader has several arrays.
+Two things about this were easy to get wrong, and both were, in the order
+written:
+
+1. The search must be bounded by `nir->info.num_ubos`. Unbounded, it answers
+   *every* slot with the nearest block, so a load the driver genuinely cannot
+   account for reads the wrong buffer **silently** instead of being refused.
+   That is a worse outcome than the bug being fixed.
+2. Each element needs a variable of its own, or they all deref the first
+   one's binding and read the first one's data -- silently again. The fixup
+   after this pass assigns the descriptor set and the binding from
+   `driver_location`, including the spill to a storage binding above the
+   device's uniform-buffer count, which this case needs: twelve blocks plus
+   the default one exceeds the twelve WebGPU guarantees.
+
+`resource-ubo` passes now. Arrays of uniform blocks are ordinary in engine
+code, so this was never only a conformance question.
+
+### Barriers, twice more
+
+Tint's SPIR-V reader **does not implement `OpMemoryBarrier`** ("unhandled
+instruction with opcode 225"), which is what zink emits for GLSL's
+`memoryBarrier()` family -- a barrier with no execution scope. WGSL has no
+standalone memory barrier; `storageBarrier()` and `workgroupBarrier()` are
+control barriers. Giving such a barrier the workgroup *execution* scope makes
+zink emit `OpControlBarrier`, which Tint takes, and a control barrier is
+**stronger** than the memory barrier it replaces.
+
+Tint then wants the *memory* scope to be the workgroup as well
+("storageBarrier requires workgroup memory scope"). A workgroup is the widest
+scope WGSL has, so that is what it gets -- weaker than the device scope GLSL
+asked for, and the same ceiling as the cross-workgroup semantics already
+folded away here. Compute only: WGSL has no barrier in the other stages, so
+one there stays a named refusal instead of becoming an illegal module.
+
+One shader then reports `'workgroupBarrier' must only be called from uniform
+control flow`, which is a WGSL restriction GLSL does not have. Promoting a
+memory barrier into a control barrier is what exposes it; there is nothing to
+do about that one.
+
+### Atomic counters: a convention clash, left alone on purpose
+
+`resource-atomic-counter` declares one SSBO and two atomic counters. Mesa's
+`nir_lower_atomics_to_ssbo` creates storage blocks for the counters and puts
+their block index in **`data.binding`**
+(`ssbo->data.binding = ssbo_offset + var->data.binding`), leaving
+`driver_location` at zero -- the opposite of an ordinary GLSL storage block,
+where `driver_location` is the block index and `binding` is the GL binding
+point. This driver's fixup then overwrites `binding` with
+`SSBO_FIRST_BINDING + driver_location`, so the index is gone before the
+lowering looks for it. `GEX_WGPU_SSBO_LOG` now prints the variables, and shows
+it plainly: four of them, all at `driver_location` 0 and `binding` 32, for
+block indices 0, 1 and 2.
+
+**Not fixed, deliberately.** The only marker distinguishing the two
+conventions is that Mesa names the type `counters`, and a heuristic that
+guesses wrong mis-slots *ordinary* storage blocks -- which every modern
+application uses. Two atomic-counter cases are not worth that risk, and the
+refusal is loud. If a future pass wants it, the sound fix is to capture the
+block index **before** the driver's fixup overwrites `binding`, not to guess
+afterwards.
