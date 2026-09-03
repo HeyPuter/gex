@@ -892,11 +892,14 @@ void glGetFramebufferParameteriv(unsigned target, unsigned pname, int *params) {
         memcpy(params, source, expected);
 }
 void glGetInteger64i_v(unsigned target, unsigned index, long long *data) {
+    const size_t expected =
+        (size_t)gexgl_state_query_components(target) * sizeof(*data);
     uint32_t *a = begin(1205, 2, 0);
     if (!a) return;
     a[0] = target; a[1] = index; flush();
-    uint64_t value = reply_u32(); value |= (uint64_t)reply_u32() << 32;
-    if (data) *data = (long long)value;
+    uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
+    if (data && source && expected && bytes == expected)
+        memcpy(data, source, expected);
 }
 void glGetInteger64v(unsigned pname, long long *data) {
     const size_t expected = (size_t)gexgl_state_query_components(pname) * sizeof(*data);
@@ -910,10 +913,14 @@ void glGetInteger64v(unsigned pname, long long *data) {
         memcpy(data, source, expected);
 }
 void glGetIntegeri_v(unsigned target, unsigned index, int *data) {
+    const size_t expected =
+        (size_t)gexgl_state_query_components(target) * sizeof(*data);
     uint32_t *a = begin(1207, 2, 0);
     if (!a) return;
     a[0] = target; a[1] = index; flush();
-    if (data) *data = (int)reply_u32();
+    uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
+    if (data && source && expected && bytes == expected)
+        memcpy(data, source, expected);
 }
 void glGetInternalformati64v(unsigned target, unsigned internalformat, unsigned pname,
                                   int count, long long *params) {

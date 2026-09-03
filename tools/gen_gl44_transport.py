@@ -986,15 +986,23 @@ def guest_function(command: dict, opcode: int) -> str:
 """
     if name in INDEXED_INTEGER_QUERIES:
         output_type = "long long" if name == "glGetInteger64i_v" else "int"
-        reply = ("uint64_t value = reply_u32(); value |= (uint64_t)reply_u32() << 32;\n"
-                 "    if (data) *data = (long long)value;"
-                 if name == "glGetInteger64i_v" else
-                 "if (data) *data = (int)reply_u32();")
+        # An indexed query is not always a scalar: GL_VIEWPORT and
+        # GL_SCISSOR_BOX are four values per index, which is the whole point of
+        # ARB_viewport_array. Both sides used to assume one, so the guest read
+        # a single word -- gl44-viewport-array-probe's roundtrip case saw a
+        # scissor box of "2,0,0,0" -- and the host wrote four GLints into one
+        # on its own stack. The arity comes from the same pname table
+        # glGetIntegerv uses, computed before the request goes out so a
+        # disagreement cannot write past the caller's array.
         return f"""void {name}(unsigned target, unsigned index, {output_type} *data) {{
+    const size_t expected =
+        (size_t)gexgl_state_query_components(target) * sizeof(*data);
     uint32_t *a = begin({opcode}, 2, 0);
     if (!a) return;
     a[0] = target; a[1] = index; flush();
-    {reply}
+    uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
+    if (data && source && expected && bytes == expected)
+        memcpy(data, source, expected);
 }}
 """
     if name == "glGetProgramInterfaceiv":
@@ -1510,20 +1518,27 @@ def host_case(command: dict, opcode: int) -> str:
 }}"""
     if name in INDEXED_INTEGER_QUERIES:
         value_type = "GLint64" if name == "glGetInteger64i_v" else "GLint"
-        put = "put_u64((uint64_t)value);" if name == "glGetInteger64i_v" else "put_u32((uint32_t)value);"
         image_translation = ("\n    if (target == GL_IMAGE_BINDING_NAME) "
-                             "value = external_name(textures, (GLuint)value);"
+                             "value[0] = external_name(textures, (GLuint)value[0]);"
                              if name == "glGetIntegeri_v" else "")
         sampler_translation = ("\n    if (target == GL_SAMPLER_BINDING) "
-                               "value = external_name(samplers, (GLuint)value);"
+                               "value[0] = external_name(samplers, (GLuint)value[0]);"
                                if name == "glGetIntegeri_v" else "")
+        # Four, not one: glGetIntegeri_v(GL_VIEWPORT | GL_SCISSOR_BOX, ...)
+        # writes four values, and this used to hand it the address of a single
+        # GLint -- an out-of-bounds write on the host's own stack for the two
+        # pnames ARB_viewport_array exists for. The object-name translations
+        # below apply to the scalar binding queries and so to element zero.
         return f"""case {opcode}: {{
-    GLenum target = a.u32(); GLuint index = a.u32(); {value_type} value = 0;
-    {name}(target, index, &value);
+    GLenum target = a.u32(); GLuint index = a.u32();
+    {value_type} value[4] = {{0, 0, 0, 0}};
+    const unsigned components =
+        (target == GL_VIEWPORT || target == GL_SCISSOR_BOX) ? 4u : 1u;
+    {name}(target, index, value);
     if (target == GL_UNIFORM_BUFFER_BINDING || target == GL_TRANSFORM_FEEDBACK_BUFFER_BINDING ||
         target == GL_ATOMIC_COUNTER_BUFFER_BINDING || target == GL_SHADER_STORAGE_BUFFER_BINDING)
-        value = external_name(buffers, (GLuint)value);{image_translation}{sampler_translation}
-    {put}
+        value[0] = external_name(buffers, (GLuint)value[0]);{image_translation}{sampler_translation}
+    put_blob(value, components * sizeof(value[0]));
     break;
 }}"""
     if name == "glGetProgramInterfaceiv":

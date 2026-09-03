@@ -65,6 +65,18 @@ def extension_commands(registry: pathlib.Path) -> dict[str, set[str]]:
             # of them are the compatibility glColorP3ui family.
             if require.get("profile") == "compatibility":
                 continue
+            # A <require> whose comment names an interaction with another
+            # extension describes the *pair*, not this extension: the
+            # commands in it belong to the other one and exist only when it
+            # is also present. GL_ARB_viewport_array carries such a block --
+            # "ARB_viewport_array interactions with NV_depth_buffer_float",
+            # holding glDepthRangeArraydvNV and glDepthRangeIndexeddNV -- and
+            # requiring those withheld the whole extension from the guest.
+            # The browser therefore reported viewport_array=0 while the host
+            # driver had it and passed 6/6 natively.
+            comment = require.get("comment") or ""
+            if "interaction" in comment.lower():
+                continue
             for command in require.iterfind("command"):
                 if command.get("name"):
                     required.add(command.get("name"))

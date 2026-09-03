@@ -841,12 +841,15 @@ case 1204: {
     break;
 }
 case 1205: {
-    GLenum target = a.u32(); GLuint index = a.u32(); GLint64 value = 0;
-    glGetInteger64i_v(target, index, &value);
+    GLenum target = a.u32(); GLuint index = a.u32();
+    GLint64 value[4] = {0, 0, 0, 0};
+    const unsigned components =
+        (target == GL_VIEWPORT || target == GL_SCISSOR_BOX) ? 4u : 1u;
+    glGetInteger64i_v(target, index, value);
     if (target == GL_UNIFORM_BUFFER_BINDING || target == GL_TRANSFORM_FEEDBACK_BUFFER_BINDING ||
         target == GL_ATOMIC_COUNTER_BUFFER_BINDING || target == GL_SHADER_STORAGE_BUFFER_BINDING)
-        value = external_name(buffers, (GLuint)value);
-    put_u64((uint64_t)value);
+        value[0] = external_name(buffers, (GLuint)value[0]);
+    put_blob(value, components * sizeof(value[0]));
     break;
 }
 case 1206: {
@@ -858,14 +861,17 @@ case 1206: {
     break;
 }
 case 1207: {
-    GLenum target = a.u32(); GLuint index = a.u32(); GLint value = 0;
-    glGetIntegeri_v(target, index, &value);
+    GLenum target = a.u32(); GLuint index = a.u32();
+    GLint value[4] = {0, 0, 0, 0};
+    const unsigned components =
+        (target == GL_VIEWPORT || target == GL_SCISSOR_BOX) ? 4u : 1u;
+    glGetIntegeri_v(target, index, value);
     if (target == GL_UNIFORM_BUFFER_BINDING || target == GL_TRANSFORM_FEEDBACK_BUFFER_BINDING ||
         target == GL_ATOMIC_COUNTER_BUFFER_BINDING || target == GL_SHADER_STORAGE_BUFFER_BINDING)
-        value = external_name(buffers, (GLuint)value);
-    if (target == GL_IMAGE_BINDING_NAME) value = external_name(textures, (GLuint)value);
-    if (target == GL_SAMPLER_BINDING) value = external_name(samplers, (GLuint)value);
-    put_u32((uint32_t)value);
+        value[0] = external_name(buffers, (GLuint)value[0]);
+    if (target == GL_IMAGE_BINDING_NAME) value[0] = external_name(textures, (GLuint)value[0]);
+    if (target == GL_SAMPLER_BINDING) value[0] = external_name(samplers, (GLuint)value[0]);
+    put_blob(value, components * sizeof(value[0]));
     break;
 }
 case 1209: {
