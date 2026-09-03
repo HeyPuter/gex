@@ -10944,3 +10944,52 @@ driver. It creates a window from a config's own visual, clears it, swaps, and
 reads the window back *through X* -- opaque, alpha with a depth-24 visual, and
 alpha with a depth-32 ARGB visual. 3/3 here and on softpipe, and it would have
 caught this: before the fix the opaque case could not find a config.
+
+## Two probes that were lying, and a regression the browser gate caught
+
+### gl44-indexed-probe stopped at its third case on every native driver
+
+It asserted that a shader name and a buffer name differ. Only the *guest*
+allocates object names from one global pool; a native driver may hand out
+shader 1 and buffer 1, and llvmpipe and this one both do. The condition was
+`!getenv("GEX_NATIVE_REFERENCE")` -- a variable the reference run sets and the
+*native driver* run does not, though both are native -- so a guest-only
+invariant was asserted against a native driver and the probe exited three
+cases in. It now opts in from the guest, which `tests/gl44-probe.sh` always
+sets.
+
+And `check_green` called `exit(3)`. Combined with the above, six of eight
+cases had never run on this driver and three had never run on either. With
+both fixed the driver passes **8 of 8**, including the instanced
+base-vertex/base-instance draws that had never been exercised.
+
+### llvmpipe drops a whole multi-draw when one sub-draw has count zero
+
+The probe's two multi-draw cases had `counts = {0, 3}`. A zero count is legal
+GL and this driver handles it -- the draw path returns early for an empty
+sub-draw rather than refusing, which `glMultiDrawArraysIndirect` needed --
+but **llvmpipe draws nothing at all for the entire call**. The equivalent
+single draw at the same offset passes there, so it is the zero entry that
+does it.
+
+That made the probe un-gateable in the browser: `tests/gl44-probe.sh` takes
+its expectation from a native Mesa run and requires it to pass. Both entries
+now draw, which tests the multi-draw transport rather than the geometry, and
+this is the third place the reference is the outlier -- after `quad`'s
+GL_QUADS triangulation and `texture-sampler`'s extra 2x sample count.
+
+### An indexed query's arity is per index
+
+Making `glGetIntegeri_v` pname-sized last pass took the arity from
+`gexgl_state_query_components`, which answers the *plain* query:
+`glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_COUNT)` is three values, while
+`glGetIntegeri_v` of the same pname is one value per index. The guest expected
+three words where the host sent one, discarded the reply as the wrong length,
+and read back zero -- below the minimum GL requires. Only `GL_VIEWPORT` and
+`GL_SCISSOR_BOX` are vectors per index, which is the rule the host side
+already applied.
+
+**The browser gate is what caught it.** The native runs were unaffected and
+reported 8 of 8. That is the case the gate exists for, and it is worth running
+it on a probe whose transport was touched even when the native numbers look
+clean.
