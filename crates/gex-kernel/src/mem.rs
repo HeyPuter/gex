@@ -415,17 +415,33 @@ impl MemoryMap {
             // relies on the failure to reserve only the free gaps.
             let noreplace = flags & flags::FIXED_NOREPLACE != 0 && flags & flags::FIXED == 0;
             let hits_reserved = addr < gex_abi::RESERVE_FLOOR;
-            // A pure address-space reservation (PROT_NONE) is the guest's own
-            // and may be committed over: Wine reserves a range and then maps
-            // real pages into it, sometimes with NOREPLACE. Only a mapping
-            // with real permissions -- a loaded image, another commit -- or
-            // the runtime's region makes NOREPLACE fail, which is what lets
-            // Wine's recursive reserve split down to the true gaps.
+            // `MAP_FIXED_NOREPLACE` must not disturb anything already there.
+            // Linux fails it over *any* existing mapping, PROT_NONE included,
+            // and that failure is load-bearing for a multithreaded guest: Wine
+            // finds free address space by trying a candidate with NOREPLACE and
+            // stepping to the next only on `EEXIST`, so every thread's stack,
+            // TEB and heap comes from this loop. If two threads' reservations
+            // (PROT_NONE) are allowed to overlap, their stacks alias and the
+            // guest corrupts itself.
+            //
+            // The one intended leniency: a *commit* (real permissions) may land
+            // on top of the guest's own PROT_NONE reservation -- Wine reserves a
+            // range and then maps real pages into it, sometimes with NOREPLACE,
+            // and virtual_init relies on that succeeding. So only a reservation
+            // (PROT_NONE) is refused over another PROT_NONE mapping; a real
+            // mapping is refused only over another real one. Either is refused
+            // over the runtime's region.
             let over_real = self
                 .vmas
                 .iter()
                 .any(|v| v.start < end && v.end > addr && v.prot != 0);
-            if noreplace && (over_real || hits_reserved) {
+            let over_reservation = self
+                .vmas
+                .iter()
+                .any(|v| v.start < end && v.end > addr && v.prot == 0);
+            let committing = prot != 0;
+            let conflict = over_real || (!committing && over_reservation);
+            if noreplace && (conflict || hits_reserved) {
                 return Err(Errno::EEXIST);
             }
             // Plain `MAP_FIXED` replaces whatever was there -- except the
