@@ -926,6 +926,11 @@ pub struct SharedMap {
     pub len: u64,
     pub file: Arc<OpenFile>,
     pub offset: u64,
+    /// Whether the mapping is writable. A single-writer shared region (the
+    /// wineserver owns its shared memory; clients read it) is kept coherent
+    /// at safepoints by flushing the writer's copy and refreshing readers'
+    /// -- see [`Kernel::sync_shared_maps`].
+    pub writable: bool,
 }
 
 /// A child process the kernel is tracking.
@@ -1741,6 +1746,11 @@ impl Kernel {
             );
         }
         let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, ret);
+
+        // Propagate single-writer shared memory (the wineserver's session and
+        // desktop regions) so a client sees the server's writes -- gex's
+        // MAP_SHARED is an eager copy and Wine never msyncs.
+        self.sync_shared_maps(m);
 
         // A syscall boundary is a safepoint: the context is complete, so a
         // pending signal can be delivered precisely here.
@@ -4317,6 +4327,69 @@ impl Kernel {
         Ok(())
     }
 
+    /// Keep single-writer shared memory coherent across processes at a
+    /// safepoint. gex maps `MAP_SHARED` as an eager per-process copy (guest
+    /// memory is a flat per-process linear space, so it cannot alias one
+    /// backing), and the wineserver relies on true `MAP_SHARED`: it writes
+    /// its session/desktop shared memory and never `msync`s, expecting every
+    /// client to see the write at once. Under the copy semantics the write
+    /// stayed in the server's copy and clients read stale zeroes -- so Wine's
+    /// `monitor_serial` never moved, no process registered display monitors,
+    /// and a GUI app (winemine) got an empty screen and a collapsed window.
+    ///
+    /// So here, once per syscall: a writable data mapping's bytes go out to
+    /// the file (the writer propagates), and a read-only one is re-read from
+    /// it (the reader catches up). The two never touch the same direction, so
+    /// a single-writer region -- which is how Wine's shared memory is built --
+    /// stays correct; nothing else (a program that maps a file it also writes
+    /// through the same fd) is affected because that is not a shared *data*
+    /// region here. Executable maps (shared libraries) are skipped: their
+    /// bytes are relocated in place and re-reading the file would smash the
+    /// running code. Large maps (Wayland pixel buffers) are skipped too --
+    /// the compositor reads those out of guest memory directly, not the file,
+    /// and copying megabytes every syscall is pure cost.
+    fn sync_shared_maps(&mut self, m: &mut GuestMem<'_>) {
+        // Cheap common case: nothing shared, or only shared libraries.
+        if self.shared_maps.is_empty() {
+            return;
+        }
+        // A generous bound: the wineserver's session and desktop regions are
+        // tens of KiB; a Wayland buffer is far larger.
+        const SYNC_MAX: u64 = 512 * 1024;
+        for i in 0..self.shared_maps.len() {
+            let (start, len, offset, writable, file) = {
+                let map = &self.shared_maps[i];
+                // The KUSER_SHARED_DATA page (fixed at 0x7ffe0000) is a special
+                // per-process page gex sets up and patches (its SystemCall bit);
+                // it is not a wineserver region and must not be re-read from or
+                // written back to its file, so leave it alone.
+                let is_usd = gex_abi::X86
+                    && map.start <= 0x7ffe_0000
+                    && 0x7ffe_0000 < map.start + map.len;
+                if map.len > SYNC_MAX || is_usd || is_shared_object(&map.file.path) {
+                    continue;
+                }
+                (
+                    map.start,
+                    map.len,
+                    map.offset,
+                    map.writable,
+                    Arc::clone(&map.file),
+                )
+            };
+            if writable {
+                if let Ok(bytes) = m.read(start, len as usize) {
+                    let _ = file.pwrite(offset, bytes);
+                }
+            } else {
+                let mut tmp = vec![0u8; len as usize];
+                if let Ok(n) = file.pread(offset, &mut tmp) {
+                    let _ = m.write(start, &tmp[..n as usize]);
+                }
+            }
+        }
+    }
+
     /// `fchmod` and `fchmodat`. The first names an open file, whose path the
     /// descriptor kept; the second names a path directly.
     fn sys_chmod(&mut self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
@@ -4651,6 +4724,7 @@ impl Kernel {
                     len: len_aligned,
                     file,
                     offset,
+                    writable: prot_bits & crate::mem::prot::WRITE != 0,
                 });
             }
             return Ok(start);
