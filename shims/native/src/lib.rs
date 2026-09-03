@@ -2615,6 +2615,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 }
                 let cs = gex_kernel::x86::selector(&gm, ctx as u32 as u64, gex_kernel::x86::SEG_CS);
+                if cs == gex_kernel::x86::USER32_CS && std::env::var_os("GEX_WOW_TRACE").is_some() {
+                    eprintln!("[wow] miss pc=0x{pc:x} cs=0x{cs:x} -> compat");
+                }
                 gex_xlate::set_thread_mode(if cs == 0 {
                     None
                 } else {
@@ -2838,6 +2841,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 if seg == gex_kernel::x86::SEG_CS {
                     let sel = (v as u64 >> 48) as u16;
                     let target = v as u64 & 0xffff_ffff_ffff;
+                    if std::env::var_os("GEX_WOW_TRACE").is_some() {
+                        let rsp = gm.read_u64(ctx as u32 as u64 + gex_abi::ctx::x(4) as u64).unwrap_or(0);
+                        let top = gm.read_u64(rsp).unwrap_or(0);
+                        eprintln!(
+                            "[wow] cs->0x{sel:x} target=0x{target:x} conflict={} rsp=0x{rsp:x} [rsp]=0x{top:x}",
+                            gex_xlate::page_mode_conflicts(target, sel == gex_kernel::x86::USER32_CS)
+                        );
+                    }
                     gex_kernel::x86::load_segment(&mut gm, ctx as u32 as u64, &ldt, seg, sel);
                     // A page translated in the other mode (the image was
                     // lifted ahead of time as 64-bit code, say) is stale for
