@@ -9065,3 +9065,102 @@ real applications on the same display produced a `textures` row of 0.792 whose
 three images were MaterialXGraphEditor, aseprite and SuperTuxKart. And
 softpipe needs a longer settle than llvmpipe; `GEX_COMPARE_DELAY=25` is enough
 for the slow ones.
+
+## glPolygonMode with the faces set differently
+
+The last rasterizer state this driver refused, and after it the only refusals
+left in the whole app sweep are render-target format probing (routine) and two
+`GL_XOR` logic ops (which WebGPU genuinely has no form of). Eight programs
+asked for it: `dlist-edgeflag`, `dlist-edgeflag-dangling`, `tri-edgeflag`,
+`tri-edgeflag-pv`, `tri-edgeflag-array`, `tri-unfilled-smooth`, `pgon-mode`
+and `vp-unfilled`.
+
+GL lets the front and back faces be filled, outlined or stippled
+independently. WebGPU has no polygon mode at all, so an unfilled polygon is
+already rewritten into the lines or points it would be drawn as
+(`gex_wgpu_draw_unfilled`) -- but that rewrite takes *one* mode, and the state
+was refused outright when the two faces disagreed, on the reasoning that
+"nothing here could honour it".
+
+**It is two draws.** Each pass has a single fill mode and culls the other
+face, so everything downstream sees a state it already handles, and the
+facing test is the rasterizer's own job -- nothing has to compute a winding
+and `front_ccw` keeps deciding what "front" means. The application's cull
+state composes rather than being replaced: a pass whose face the application
+already culls is skipped, and `PIPE_FACE_FRONT_AND_BACK` skips both.
+
+The measured effect, against llvmpipe with the softpipe floor beside it:
+
+| program | before | after | refdiff |
+|---|---|---|---|
+| `dlist-edgeflag` | 0.463 | 0.0735 | 0.0295 |
+| `dlist-edgeflag-dangling` | 0.464 | 0.0465 | 0.0551 |
+| `vp-unfilled` | -- | 0.0201 | 0.0201 |
+| `pgon-mode` | -- | 0.0407 | 0.0368 |
+| `tri-edgeflag`, `tri-edgeflag-array` | -- | 0.0376 | ~0 |
+| `tri-edgeflag-pv` | -- | 0.0571 | 0 |
+| `tri-unfilled-smooth` | -- | 0.0690 | 0.0402 |
+
+Three of the eight are now at or below the floor, which is as close to
+"correct" as that measurement can say.
+
+### The gap that is left, and what closing it takes
+
+`tests/integration/programs/gl44-polygon-mode-faces-probe.c` scores 5/6 and
+the failure is real: **WebGPU applies `cullMode` only to triangle topology**,
+and an unfilled pass has been rewritten into lines or points before it draws,
+so its cull is inert and it emits both facings' edges. `gex_wgpu_draw_unfilled`
+already documents the same gap for the uniform case -- "Lines carry no
+winding [...] the alternative is culling on the CPU" -- and **one fix repairs
+both**: capture the post-VS positions with the compute path the wide-line
+rewrite already uses (`gex_wgpu_varying_variant_get` and the dispatch
+sequence in `gex_wgpu_line_draw`), compute each source primitive's
+window-space signed area, and hand the unfilled translator only the
+primitives of the wanted facing. It has to filter *source* primitives rather
+than the translator's output, because the rewrite deliberately runs before
+the topology conversion so that a quad's four edges stay four edges.
+
+It was worth landing the split before doing that, and the numbers are why: the
+residual is the wrong facing's vertex points and edges, which mostly land on
+top of geometry that is already there. A single front-facing triangle with
+`glPolygonMode(GL_FRONT, GL_LINE)` and `glPolygonMode(GL_BACK, GL_POINT)` --
+which is six of the eight programs -- comes out as its three edges plus three
+points sitting on the edge endpoints, three pixels' worth. Before the split it
+came out filled.
+
+## dlist-degenerate: located, not fixed
+
+The other real defect the second reference left standing, and it is not in the
+driver -- the driver receives a depth clear and **no draws at all**.
+
+`GEX_DLIST_LOG=1` (added to `vbo_save_api.c`, env-gated) says what the list
+holds:
+
+    dlist: prim 0 mode=0x9 count=2 start=0 supported=0
+    dlist:   converted -> mode=0x4 count=0 index_size=2
+    dlist: totals idx=0 total_vert_count=0 merged_prims=1 current_bo=NULL
+
+One `GL_POLYGON` with **two vertices**. `vbo_save_api.c` converts a display
+list's primitives against `ctx->Const.DriverSupportedPrimMask`, which comes
+from the driver: llvmpipe advertises every mode and never converts, this
+driver advertises five and converts POLYGON, so the primitive becomes
+`GL_TRIANGLES` with a count of zero, the list records no vertices and no
+indices, and `save->current_bo` stays NULL. That is what the two `ib.obj`
+guards in that file were added for -- they stopped a null dereference inside
+`glEndList`, which is not the same as the list being harmless afterwards. The
+run also reports `GL_INVALID_OPERATION in glEnd`, a `glEnd` with no matching
+`glBegin`, which the reference run does not.
+
+`tests/integration/programs/gl44-dlist-degenerate-probe.c` does **not**
+reproduce it, and that is worth knowing before trying again: eleven cases,
+covering every mode this driver converts, at too-few-vertex counts, in both
+orders, merged with a real primitive and alone in a list -- 11/11 on llvmpipe,
+radeonsi and gex_wgpu. The reason is visible in the log: a `glBegin(GL_POLYGON)`
+with two vertices written straight out never reaches `compile_vertex_list` at
+all, because `_mesa_End` drops an under-length primitive first. The demo's
+does. Whatever gets it past that check is the thing to find, and the probe is
+the place to add it once it is known.
+
+The probe did catch one small real divergence on the way, kept as a note
+rather than a case: a three-vertex `GL_QUAD_STRIP` lights about 70 pixels on
+this driver and none on either reference.
