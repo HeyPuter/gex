@@ -3442,11 +3442,16 @@ mod tests {
     fn dispatch_indices_follow_the_page_directory() {
         // A page whose directory entry is `base` maps its instructions to
         // consecutive slots from there.
+        let page = gex_abi::DISPATCH_PAGE;
+        let step = 1u64 << gex_abi::DISPATCH_SHIFT;
         assert_eq!(gex_abi::dispatch_index(0x400000, 2048), 2048);
-        assert_eq!(gex_abi::dispatch_index(0x400004, 2048), 2049);
-        assert_eq!(gex_abi::dispatch_index(0x400ffc, 2048), 2048 + 1023);
+        assert_eq!(gex_abi::dispatch_index(0x400000 + step, 2048), 2049);
+        assert_eq!(
+            gex_abi::dispatch_index(0x400000 + page - step, 2048),
+            2048 + gex_abi::SLOTS_PER_PAGE - 1
+        );
         // The next page starts over from its own entry.
-        assert_eq!(gex_abi::dispatch_index(0x401000, 4096), 4096);
+        assert_eq!(gex_abi::dispatch_index(0x400000 + page, 4096), 4096);
         // A page with no translation lands in the reserved miss span.
         assert!(gex_abi::dispatch_index(0x400004, 0) < gex_abi::MISS_SLOTS);
     }

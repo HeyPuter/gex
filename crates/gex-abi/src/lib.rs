@@ -352,7 +352,18 @@ pub mod ctx {
 // ---------------------------------------------------------------------------
 
 /// Bytes of guest text one dispatch-directory entry covers.
-pub const DISPATCH_PAGE: u64 = 4096;
+///
+/// 8 KiB, not the 4 KiB mmap page: at 4 bytes per entry ([`DISPATCH_SHIFT`]),
+/// an 8 KiB reach needs half the directory, which is what lets the directory
+/// cover the whole ~4 GiB backed memory ([`DISPATCH_MAX_PAGES`]) and still end
+/// below [`EXEC_BASE`]. Reaching 4 GiB is what lets a WoW64 process map its
+/// win32u GDI heaps and shared sections against the top of the 32-bit address
+/// space, where Wine puts them, instead of being capped at 3 GiB and left with
+/// wild pointers into a range it could not map. Two 4 KiB pages share one
+/// directory entry; that is safe because code of one mode never sits within
+/// 8 KiB of code of the other (DLLs align to 64 KiB), and per-page protection
+/// and mode are still tracked at 4 KiB granularity elsewhere.
+pub const DISPATCH_PAGE: u64 = 8192;
 
 /// Dispatch-table slots per covered page: one per possible instruction start,
 /// so 1,024 for A64's 4-byte words and 4,096 for byte-aligned x86-64.
@@ -373,15 +384,14 @@ pub const DISPATCH_DIR: u64 = RESERVED_END;
 
 /// Pages the directory covers, and so the highest address code may occupy.
 ///
-/// Sized so the directory ends exactly at [`EXEC_BASE`] (0x400000): a 3 MiB
-/// directory of `0xC_0000` entries reaches 3 GiB, the ceiling on both code and
-/// data mappings. 64-bit Wine keeps its "high half" — thread/kernel stacks and
-/// high-preferred-base modules — above a 2 GiB boundary (its `limit_4g`,
-/// lowered to 2 GiB in gex's curated Wine build, since wasm32 cannot address
-/// the 4 GiB Wine wants on a real host), so the arena has to reach past 2 GiB
-/// for those to land. 2 GiB was enough for a pure low-half process but leaves
-/// no room for the high half.
-pub const DISPATCH_MAX_PAGES: u64 = 0xC_0000;
+/// Sized so the reach is the whole backed memory ([`GUEST_LIMIT`], just under
+/// 4 GiB) while the directory still ends below [`EXEC_BASE`] (0x400000): at
+/// 8 KiB per entry ([`DISPATCH_PAGE`]) and 4 bytes each, `0x7_FFF8` entries are
+/// a ~2 MiB directory reaching `GUEST_LIMIT`. A 4 GiB reach is what a WoW64
+/// process needs — its win32u shared memory sits just under 4 GiB, and modules
+/// and stacks land wherever Wine's layout (its `limit_4g`) puts them, all now
+/// within reach and dispatchable.
+pub const DISPATCH_MAX_PAGES: u64 = 0x7_FFF8;
 
 /// Size of the directory in bytes.
 pub const DISPATCH_DIR_BYTES: u64 = DISPATCH_MAX_PAGES * 4;

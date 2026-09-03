@@ -1299,9 +1299,10 @@ fn run_thread_loop(
                     if let Some(m) = store.data().memory.clone() {
                         let gm = GuestMem::new(m.bytes());
                         let r = |n: u8| gm.read_u64(ctx_addr + gex_abi::ctx::x(n) as u64).unwrap_or(0);
+                        let insn = gm.read(fault_pc, 16).map(|b| b.to_vec()).unwrap_or_default();
                         eprintln!(
-                            "[oob] pc=0x{fault_pc:x} rax=0x{:x} rcx=0x{:x} rdx=0x{:x} rbx=0x{:x} rsp=0x{:x} rsi=0x{:x} rdi=0x{:x}",
-                            r(0), r(1), r(2), r(3), r(4), r(6), r(7)
+                            "[oob] pc=0x{fault_pc:x} insn={insn:02x?} rax=0x{:x} rcx=0x{:x} rdx=0x{:x} rbx=0x{:x} rsp=0x{:x} rbp=0x{:x} rsi=0x{:x} rdi=0x{:x} r8=0x{:x} r9=0x{:x} r12=0x{:x} r13=0x{:x} r14=0x{:x} r15=0x{:x}",
+                            r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7), r(8), r(9), r(12), r(13), r(14), r(15)
                         );
                     }
                 }
