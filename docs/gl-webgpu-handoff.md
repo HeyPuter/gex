@@ -11920,3 +11920,62 @@ The *linker* had resolved `-lGL` against this driver's non-glvnd libGL. It
 looks like a catastrophic regression and is nothing at all -- run the suite
 with `env -u LD_LIBRARY_PATH -u LIBGL_DRIVERS_PATH -u GALLIUM_DRIVER`, or from
 a shell that never exported them. `nprobe2.sh` sets what it needs per run.
+
+## GL 4.5 is one cap away, and the cap is a silent bug (2026-09-03)
+
+`ARB_cull_distance` is the only extension between this driver and GL 4.5 --
+everything else 4.5 requires is granted and probe-verified. Setting
+`caps->cull_distance` grants 4.5 immediately; the version was read back as
+`4.5 (Compatibility Profile)` with the cap on. So the only question was ever
+whether the result is *right*.
+
+**It is not, and it fails silently.** `gl44-cull-distance-probe` was written
+to answer exactly this, and llvmpipe passes all three of its cases:
+
+| case | with the cap on |
+|---|---|
+| `all_negative_culled` -- every vertex negative, nothing drawn | **pass** |
+| `all_positive_kept` -- the control | **pass** |
+| `mixed_kept` -- one vertex negative, triangle drawn *whole* | **fail** |
+
+The failing case is the one that tells the two features apart. A clip distance
+cuts a primitive along the plane where it reaches zero; a cull distance
+discards the primitive entirely, and **only when every vertex is negative**,
+so a mixed-sign primitive is drawn whole -- including the corner where the
+distance is negative. With the cap on, that corner is missing: the primitive
+was *clipped*.
+
+The mechanism, which is worth knowing before anyone tries this again: Mesa's
+GLSL linker runs `nir_merge_clip_cull_distance_vars` **unconditionally**
+(`gl_nir_linker.c`, "Combine clip and cull outputs into one array"), packing
+the cull values into the clip array behind the clip ones. zink's emitter then
+hands that whole array to WebGPU's `clip_distances`. So the cull values clip,
+and "map cull onto clip" is not a shortcut that loses a little quality -- it
+is a silent geometry bug.
+
+**What implementing it would take**, and why it was not done here. Two parts:
+
+1. Split the merged array before ntv, so only the first
+   `clip_distance_array_size` elements reach `clip_distances` and the rest
+   travel as an ordinary varying.
+2. Cull per primitive from that varying. This part is nearly free:
+   `gex_wgpu_cull_polygons` is already exactly this shape -- it captures
+   post-vertex-shader outputs with `gex_wgpu_capture_positions`, resolves the
+   draw's indices to vertex numbers, tests each primitive on the CPU, and
+   returns a rewritten index list that the caller re-issues as a user-index
+   draw. Cull distance needs the same walk widened to points and lines (the
+   current one handles triangles, quads and polygons) and a different test.
+   The capture already takes an arbitrary set of varying slots, one vec4 each.
+
+What makes it more than a morning's work is *where* part 1 lands: the same
+path user clip planes take. `caps->clip_planes = 0` has st run
+`nir_lower_clip_vs`, so **every application clip plane is a gl_ClipDistance
+write** -- and applications running here depend on it. Breaking that to add a
+rarely-used extension, for a version number no target application asks for,
+is the wrong trade; 4.4 is the stated target and it is met.
+
+The probe stays in the suite as a **feature-gap marker**: llvmpipe reports
+3/3 and this driver reports 0/0 (extension absent), so it shows as a DIFF
+alongside `quad` and `texture-sampler`. It is also the guard -- anyone who
+enables the cap will see it move from 0/0 to 2/3, which is the suite saying
+what this section says.
