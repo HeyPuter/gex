@@ -599,13 +599,23 @@ impl Client {
 
     fn dispatch(&mut self, object: u32, opcode: u16, body: &[u8], buffers: &dyn Buffers) {
         if Self::tracing() {
+            let words: Vec<String> = body
+                .chunks(4)
+                .take(6)
+                .map(|c| {
+                    let mut w = [0u8; 4];
+                    w[..c.len()].copy_from_slice(c);
+                    format!("{:x}", u32::from_le_bytes(w))
+                })
+                .collect();
             trace_out(&format!(
-                "[wl] -> object {object} opcode {opcode} ({} bytes) {}",
+                "[wl] -> object {object} opcode {opcode} ({} bytes) {} [{}]",
                 body.len(),
                 match self.objects.get(&object) {
                     Some(o) => format!("{o:?}"),
                     None => "UNKNOWN".into(),
-                }
+                },
+                words.join(" ")
             ));
         }
         let Some(target) = self.objects.get(&object).cloned() else {
@@ -670,12 +680,20 @@ impl Client {
                     match opcode {
                         1 => {
                             if let Some(id) = r.new_id() {
-                                let _output = r.object();
+                                let output = r.object();
                                 self.objects.insert(id, Object::Stub);
                                 let (w, h) = self.default_size;
                                 self.send(Writer::new(id, 0).int(0).int(0)); // logical_position
                                 self.send(Writer::new(id, 1).int(w).int(h)); // logical_size
                                 self.send(Writer::new(id, 2)); // done
+                                // From v3 on, xdg_output.done is deprecated:
+                                // the client commits the logical geometry on
+                                // the *wl_output's* done, so send that too
+                                // (winewayland ignores xdg done at v3 and
+                                // would otherwise never finish the output).
+                                if let Some(output) = output {
+                                    self.send(Writer::new(output, 2));
+                                }
                             }
                             true
                         }
