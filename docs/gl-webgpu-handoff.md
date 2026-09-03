@@ -10708,3 +10708,104 @@ problems, not driver ones; `compute` additionally stops earlier here because
   probably better than a fallback that can be wrong.
 - **In-game rendering.** The title screen is verified pixel by pixel. Loading a
   world is the next thing to check.
+
+## The browser was three GL versions behind, and two guest gaps under it
+
+Everything above was measured natively. Taking the same probes to a real
+browser found one embarrassment and two genuine gaps.
+
+### The bundle
+
+`web/dist` is a built vite bundle, and it is gitignored. It had not been
+rebuilt since the device limits were added to `mesa-gl.js`'s `want`, so the
+browser asked for none of them and ran on WebGPU's guaranteed minimums:
+`maxTextureDimension2D` 8192, `maxTextureArrayLayers` 256,
+`maxComputeInvocationsPerWorkgroup` 256. It therefore reported **GL 4.0 while
+the native path on the same machine reported 4.4**, and `ARB_compute_shader`
+was missing there for the same reason. `npm run build` in `web/` alone moved
+it to 4.4 with `tex2d 16384 layers 2048` and 1024 compute invocations.
+
+Two instruments so this cannot recur: the driver now prints its texture limits
+with the rest (they decide the reported GL *version* and were the only ones not
+printed), and `mesa-gl.js` lists every wanted limit the adapter will not grant
+at `console.warn` -- the harness echoes warnings and drops `console.log`. On
+this machine the list is one entry, `maxUniformBuffersPerShaderStage 12<16`,
+which the driver already backs with storage buffers.
+
+**Rebuild `web/dist` before drawing any conclusion from a browser run.** The
+wasm driver build does not do it.
+
+### ARB_viewport_array was withheld from the guest
+
+6/6 natively, 0/6 in the browser, with `viewport_array=0`: the guest never
+advertised it. It exports all ten of the extension's commands. What it lacked
+were the registry's eleventh and twelfth, `glDepthRangeArraydvNV` and
+`glDepthRangeIndexeddNV`, which sit in a second `<require>` block the registry
+labels *"ARB_viewport_array interactions with NV_depth_buffer_float"*.
+
+An interaction block describes the pair, not the extension: those commands
+belong to the other one and exist only when it is present.
+`tools/gen_gl_extensions.py` now skips a `<require>` whose comment says so.
+One extension unblocked; worth re-checking the other 278 withheld entries for
+the same shape.
+
+Then five of six passed, and the roundtrip read a scissor box of `2,0,0,0`.
+`glGetIntegeri_v` is not always a scalar -- `GL_VIEWPORT` and
+`GL_SCISSOR_BOX` are four values per index, which is what the extension is
+*for*. The guest read one word, and the host passed the address of a single
+`GLint` to a call that writes four: an out-of-bounds write on its own stack,
+for exactly the two pnames the extension exists for. Both sides now size the
+reply from the pname, the guest through the same `gexgl_state_query_components`
+table `glGetIntegerv` uses, computed before the request goes out so a
+disagreement cannot write past the caller's array. 6/6.
+
+### Persistent coherent mappings never reached the host
+
+`gl44-buffer-storage-probe`: 5/5 natively, 3/5 in the browser, and the two
+failures are the whole point of `ARB_buffer_storage` -- vertices written
+through a `PERSISTENT|COHERENT` mapping, then written again and drawn again.
+Both drew nothing. **This was the browser path's blocker for Minecraft**,
+whose uniform and vertex rings are allocated exactly this way.
+
+A mapping the guest returns is guest memory, and the bytes used to reach the
+host only at `glUnmapBuffer` or `glFlushMappedBufferRange`. Persistent means
+the first never happens; coherent means the second is not required. So nothing
+was ever sent.
+
+There is no write barrier to be had -- wasm has no `mprotect` and no signals,
+which is what every real implementation of this uses -- so the mapping is
+compared against what was last sent and only the changed span is transported.
+It has to be **per draw, not per batch**: an application writes region N,
+draws, writes region N+1 and draws again, and both draws can sit in one
+unflushed batch, so sending once at flush time gives the first draw the second
+region's bytes. `GEXGL_NO_COHERENT=1` disables the comparison for anyone
+measuring it; the cost is one pass over the mapped range per draw.
+
+The first attempt was refused by the host with `GL_INVALID_OPERATION`:
+`glBufferSubData` on an immutable buffer requires `GL_DYNAMIC_STORAGE_BIT`, and
+an application asking for `PERSISTENT|COHERENT` has no reason to ask for it --
+it means to write through the mapping, not through the API. The host is now
+given that bit and only the host is; the flags the application passed are
+recorded guest-side and `GL_BUFFER_STORAGE_FLAGS` is answered from them.
+
+### Browser state after all of it
+
+| probe | native | browser |
+| --- | --- | --- |
+| flip-blit | 7/7 | 7/7 |
+| buffer-storage | 5/5 | 5/5 |
+| viewport-array | 6/6 | 6/6 |
+| tessellation | 12/12 | 12/12 |
+| ssbo-atomic | 7/7 | 7/7 |
+| stencil-texture | 4/4 | 4/4 |
+| draw-parameters | 5/5 | 5/5 |
+| integer-texture | ok | ok |
+| clear | ok | ok |
+| query-buffer | 4/4 | **0/4** |
+
+`query-buffer` is the one gap left, and it is the same shape as the mapping
+one: the guest forwards the `GL_QUERY_BUFFER` binding but then passes a client
+pointer where the bound buffer makes that argument an offset, so the host
+answers `GL_INVALID_OPERATION`. It needs the guest to notice the binding and
+send an offset instead. `ARB_query_buffer_object` is mostly used by profilers
+rather than by the applications being targeted, which is why it is last.
