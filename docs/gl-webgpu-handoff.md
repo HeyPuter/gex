@@ -11571,3 +11571,33 @@ difference against the reference is most likely the ignored polygon
 smoothing. Its viewport was previously documented here as blocked on a
 WebGPU ceiling for format reinterpretation on a render target; that is now
 implemented, so the note above it is superseded.
+
+### A probe for the render-target path, and what else attaches a view
+
+`tests/integration/programs/gl44-target-view-probe.c` covers the new path
+directly, using Blender's own format pair: an R16UI view of an R16F texture,
+attached to a framebuffer and written through, then read back **through the
+base texture** with a sampler -- which is the property that matters, since
+that is what a later pass reads. 0x3C00 is half-float 1.0, so a correct round
+trip reads 255 and a scratch that was never copied back reads 0. Three cases:
+a draw, `glClearBufferuiv`, and clear-draw-clear, the last because each has to
+reach the base texture *in order* rather than once at the end. 3/3 natively,
+agreeing with llvmpipe.
+
+The other places a view of a colour target gets built were audited at the same
+time:
+
+- `gex_wgpu_clear_render_target` (which `gex_wgpu_clear` delegates to) renders
+  into the scratch as well, and copies back straight away -- the surface may
+  not belong to the bound framebuffer, in which case no submit would ever do
+  it.
+- `gex_wgpu_blit` needs nothing: its `srgb_compatible` test already requires
+  each format to be in its own resource's linear class, so a cross-class blit
+  falls through to `u_blitter`, which draws through
+  `set_framebuffer_state` and picks up the scratch there.
+- Shader *images* still take the texture's own format through
+  `gex_wgpu_storage_texture_format`, and `glBindImageTexture` accepts any
+  format of the same size class. That combination is not audited and no
+  application here reaches it; it would show up as an `incompatible with the
+  format` validation line rather than silently, now that the log is grepped
+  for those.
