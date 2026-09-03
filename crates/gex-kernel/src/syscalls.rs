@@ -462,7 +462,7 @@ pub struct Kernel {
     /// the real work waits for the kernel lock (the msghdr may carry
     /// descriptors, which only the kernel's table can place). Wine's protocol
     /// with wineserver is a blocking `recvmsg` for every reply.
-    pub retry_recvmsg: Option<(i32, u64)>,
+    pub retry_recvmsg: Option<(i32, u64, u64)>,
     /// The blocked mask an `rt_sigsuspend` has to put back when it returns.
     pub restore_sigmask: Option<u64>,
     /// A 32-bit (i386) process: its code runs in compatibility mode, it
@@ -1890,13 +1890,17 @@ impl Kernel {
             }
             nr::RECVMSG => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                // A non-blocking socket, or one with data, does not wait.
-                if !file.would_block() {
+                // A non-blocking socket, one with data, or a call that asked
+                // for `MSG_DONTWAIT` does not wait. libwayland reads its
+                // blocking socket with `MSG_DONTWAIT` and expects `EAGAIN`
+                // once it has drained it; waiting here instead hangs the
+                // client in its first round-trip.
+                if a[2] & Self::MSG_DONTWAIT != 0 || !file.would_block() {
                     return None;
                 }
                 // Wait until it is readable, then do the real recvmsg under
                 // the lock (see `retry_recvmsg`), the way `accept` does.
-                self.retry_recvmsg = Some((a[0] as i32, a[1]));
+                self.retry_recvmsg = Some((a[0] as i32, a[1], a[2]));
                 Some(BlockOp::AcceptWait {
                     socket: Arc::clone(&file.handle),
                 })
@@ -2044,7 +2048,7 @@ impl Kernel {
             _ => r,
         };
         let r = match self.retry_recvmsg.take() {
-            Some((fd, msg)) if r.is_ok() => self.sys_recvmsg(m, fd, msg),
+            Some((fd, msg, flags)) if r.is_ok() => self.sys_recvmsg(m, fd, msg, flags),
             _ => r,
         };
         // `rt_sigsuspend` waited with a mask of the caller's choosing. The
@@ -2256,9 +2260,9 @@ impl Kernel {
             nr::SENDTO => self.sys_sendto(m, a[0] as i32, a[1], a[2], a[4]),
             nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[4], a[5]),
             nr::SENDMSG => self.sys_sendmsg(m, a[0] as i32, a[1]),
-            nr::RECVMSG => self.sys_recvmsg(m, a[0] as i32, a[1]),
+            nr::RECVMSG => self.sys_recvmsg(m, a[0] as i32, a[1], a[2]),
             nr::SENDMMSG => self.sys_sendmmsg(m, a[0] as i32, a[1], a[2]),
-            nr::RECVMMSG => self.sys_recvmmsg(m, a[0] as i32, a[1], a[2]),
+            nr::RECVMMSG => self.sys_recvmmsg(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETPEERNAME => self.sys_getpeername(m, a[0] as i32, a[1], a[2]),
             // One interface, unnamed. A guest that asks where it is calling
             // from gets 0.0.0.0, which is what an unbound socket reports.
@@ -5520,11 +5524,18 @@ impl Kernel {
         Ok(sent)
     }
 
-    fn sys_recvmmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, vec: u64, n: u64) -> SysResult {
+    fn sys_recvmmsg(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        fd: i32,
+        vec: u64,
+        n: u64,
+        flags: u64,
+    ) -> SysResult {
         let mut got = 0u64;
         for i in 0..n.min(1024) {
             let hdr = vec + i * Self::MMSGHDR;
-            match self.sys_recvmsg(m, fd, hdr) {
+            match self.sys_recvmsg(m, fd, hdr, flags) {
                 Ok(len) => {
                     m.write_u32(hdr + 56, len as u32)?;
                     got += 1;
@@ -5541,7 +5552,14 @@ impl Kernel {
         Ok(got)
     }
 
-    fn sys_recvmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
+    /// `recvmsg` flags. `MSG_DONTWAIT` is decided in `blocking_op`; here it
+    /// only matters that an empty socket answers `EAGAIN`, which the stream
+    /// already does. `MSG_PEEK` leaves the bytes queued.
+    const MSG_PEEK: u64 = 0x2;
+    const MSG_DONTWAIT: u64 = 0x40;
+
+    fn sys_recvmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, msg: u64, flags: u64) -> SysResult {
+        let peek = flags & Self::MSG_PEEK != 0;
         let iov = m.read_u64(msg + 16)?;
         let iovlen = m.read_u64(msg + 24)?;
         let control = m.read_u64(msg + 32)?;
@@ -5564,7 +5582,7 @@ impl Kernel {
             }
             let mut tmp = vec![0u8; len.min(1 << 22)];
             let n = match &unix_sock {
-                Some(sock) => sock.recv(&mut tmp, room, false)?,
+                Some(sock) => sock.recv(&mut tmp, room, peek)?,
                 None => self.fds.get(fd)?.read(&mut tmp)?,
             };
             m.write(base, &tmp[..n as usize])?;
@@ -6554,6 +6572,54 @@ mod tests {
         set_args(&mut m, k.ctx_addr, nr::BRK, &[base + 0x2000]);
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, k.ctx_addr) as u64, base + 0x2000);
+    }
+
+    /// `recvmsg` honours its flags: `MSG_DONTWAIT` on an empty blocking
+    /// socket is `EAGAIN`, not a wait (libwayland drains its socket this way
+    /// and hung in its first round-trip when the flag was dropped), and
+    /// `MSG_PEEK` leaves the bytes for the next read.
+    #[test]
+    fn recvmsg_flags() {
+        const MSG_PEEK: u64 = 0x2;
+        const MSG_DONTWAIT: u64 = 0x40;
+        let (mut buf, mut k) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        set_args(&mut m, k.ctx_addr, nr::SOCKETPAIR, &[1, 1, 0, 0x20000]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 0);
+        let a = m.read_u32(0x20000).unwrap() as u64;
+        let b = m.read_u32(0x20004).unwrap() as u64;
+        // msghdr at 0x21000 with one iovec at 0x21100 -> 64 bytes at 0x22000.
+        m.write_u64(0x21000 + 16, 0x21100).unwrap();
+        m.write_u64(0x21000 + 24, 1).unwrap();
+        m.write_u64(0x21100, 0x22000).unwrap();
+        m.write_u64(0x21108, 64).unwrap();
+
+        set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_DONTWAIT]);
+        assert!(matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue));
+        assert_eq!(ret(&m, k.ctx_addr), -(Errno::EAGAIN.0 as i64));
+
+        set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, 0]);
+        assert!(
+            !matches!(k.syscall(&mut m, 0), SyscallOutcome::Continue),
+            "a plain recvmsg on an empty blocking socket must wait"
+        );
+        k.retry_recvmsg = None;
+
+        m.write(0x23000, b"hello").unwrap();
+        set_args(&mut m, k.ctx_addr, nr::WRITE, &[b, 0x23000, 5]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 5);
+        set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_PEEK]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 5);
+        assert_eq!(m.read(0x22000, 5).unwrap(), b"hello");
+        set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_DONTWAIT]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), 5, "peek must leave the bytes queued");
+        set_args(&mut m, k.ctx_addr, nr::RECVMSG, &[a, 0x21000, MSG_DONTWAIT]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), -(Errno::EAGAIN.0 as i64));
     }
 
     #[test]
