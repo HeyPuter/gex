@@ -11838,3 +11838,85 @@ reasoning next to `caps->polygon_offset_clamp` and in the probe's header.
 Restoring them is a two-line change the day the platform honours it. Worth
 noting as a pattern: **the cheap-looking caps are the ones to measure**, since
 the implementation being present says nothing about the platform honouring it.
+
+## FreeCAD renders (2026-09-03)
+
+The last of the named target applications that had never been tested, because
+it was not installed. It still is not: the distribution package could not be
+fetched (the local database is stale against the mirror, and fixing that on
+Arch means a full upgrade, which is not a thing to do to someone's machine
+unasked). The **AppImage** needs no installation at all, and that is how this
+was tested:
+
+```
+curl -L -o freecad.AppImage https://github.com/FreeCAD/FreeCAD/releases/\
+download/1.1.3/FreeCAD_1.1.3-Linux-x86_64-py311.AppImage
+chmod +x freecad.AppImage && ./freecad.AppImage --appimage-extract
+```
+
+**The AppImage bundles glvnd**, which is the trap `libGLX.so.0` set for GLFW
+earlier in this document: `squashfs-root/usr/lib/libGL.so.1` exports 3470
+entry points and would load the *system* Mesa vendor, so the driver under test
+would never be reached. Since the image is extracted, the fix is to point the
+bundled names at this driver's own libraries:
+
+```
+L=squashfs-root/usr/lib; INST=/tmp/gex-mesa-native/inst
+for n in libGL.so.1 libGL.so.1.7.0 libGLX.so.0 libOpenGL.so.0; do
+  ln -sfn $INST/lib/libGL.so.1 $L/$n; done
+for n in libEGL.so.1 libEGL.so.1.1.0; do
+  ln -sfn $INST/lib/libEGL.so.1 $L/$n; done
+```
+
+Then run `squashfs-root/AppRun` with the usual driver environment.
+
+**It works.** FreeCAD 1.1.3 draws its whole interface -- menus, three
+toolbars, the Model tree, the first-run page with its widgets -- and, driven
+to a document with `scratchpad/fc-macro.py` (a box with a cylinder cut out of
+it), its **3D viewport renders the shaded solid with its edges, the navigation
+cube and the axis cross**. No refusals and no WebGPU errors in the run.
+
+Two things worth knowing for the next pass:
+
+- The Start page is **not** an MDI subwindow: `QMdiArea::subWindowList()`
+  returns exactly one entry (the document), yet the Start tab sits in front of
+  it. Activating the subwindow from a macro does not help. Clicking the
+  document's tab does -- `scratchpad/appshot-click.sh <out> <settle> <x> <y>
+  <cmd...>` exists for that, and the tab is at about (313, 953) in a 1280x1000
+  window.
+- A key sent with `xdotool key` after that click goes to the Tasks panel
+  rather than the view, so the view stays where the macro left it. The
+  screenshot on record is a TOP view, which is enough to show the geometry,
+  the shading and the edges.
+
+### The bug FreeCAD found immediately
+
+Anisotropic filtering had stopped being refused earlier the same day, and
+FreeCAD asks for 4x on a texture it samples *unfiltered*. Every sampler here
+is built with a non-filtering twin for the vertex stage -- all three filters
+forced to Nearest -- and the twin inherited the descriptor's anisotropy, which
+WebGPU forbids:
+
+```
+One of minFilter (FilterMode::Nearest), magFilter (FilterMode::Nearest) or
+mipmapFilter (MipmapFilterMode::Nearest) is not FilterMode::Linear while
+using anisotropic filter (maxAnisotropy is 4.000000)
+```
+
+A one-line fix, and a good argument for testing a new application: none of
+the 80 probes nor the four other target applications asks for anisotropy on
+an unfiltered texture.
+
+### A false alarm worth remembering
+
+Running the probe suite from a shell that had **exported the driver's
+`LD_LIBRARY_PATH`** made all 80 probes report `BUILDFAIL`:
+
+```
+/usr/bin/ld: .../libGL.so: undefined reference to `__glXGLLoadGLXFunction'
+```
+
+The *linker* had resolved `-lGL` against this driver's non-glvnd libGL. It
+looks like a catastrophic regression and is nothing at all -- run the suite
+with `env -u LD_LIBRARY_PATH -u LIBGL_DRIVERS_PATH -u GALLIUM_DRIVER`, or from
+a shell that never exported them. `nprobe2.sh` sets what it needs per run.
