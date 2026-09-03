@@ -8,8 +8,9 @@
  * unknown number are silently drawing one-pixel lines where they asked for
  * more.
  *
- * This probe is the gate for whatever fixes that. It is written to fail until
- * then, and each case isolates one thing:
+ * This probe is the gate for the quad expansion that fixes it, and it was
+ * written *before* the feature and against llvmpipe -- which is how the rule
+ * got settled before the shader did. Each case isolates one thing:
  *
  *  - the *width*, measured across a horizontal and a vertical line, because
  *    an expansion that works in the wrong space gets one axis right and the
@@ -21,12 +22,14 @@
  *    from two endpoints carries one endpoint's values on each end, and an
  *    implementation that carried the *first* endpoint's on all four corners
  *    draws a flat line that looks correct until you check the colours;
- *  - GL_LINE_SMOOTH, which is a *different rule*: an antialiased wide line
- *    is a rectangle of width w centred on the segment, so a smooth diagonal
+ *  - GL_LINE_STIPPLE, twice: once on an independent segment, where GL
+ *    restarts the counter, and once across a LINE_STRIP, where it runs on --
+ *    the second compared against the first pixel for pixel, because a
+ *    counter that restarted at the join could still give the same count;
+ *  - GL_LINE_SMOOTH, which is a *different rule*: an antialiased wide line is
+ *    a rectangle of width w centred on the segment, so a smooth diagonal
  *    reaches wider than an aliased one of the same width, and the fragment's
  *    coverage of that rectangle multiplies into alpha.
- *
- * GL_LINE_STIPPLE is not covered yet; see the note where its case will go.
  */
 #define GL_GLEXT_PROTOTYPES 1
 #include <EGL/egl.h>
@@ -62,22 +65,6 @@ static void clear_black(void) {
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 }
-/* The lit bounding box, printed alongside every count: "nothing in this
- * column" and "nothing anywhere" are different failures and the difference is
- * most of the diagnosis. */
-static void lit_bounds(int *x0, int *y0, int *x1, int *y1) {
-    *x0 = *y0 = SIZE;
-    *x1 = *y1 = -1;
-    for (unsigned y = 0; y < SIZE; ++y)
-        for (unsigned x = 0; x < SIZE; ++x)
-            if (lit(x, y)) {
-                if ((int)x < *x0) *x0 = x;
-                if ((int)y < *y0) *y0 = y;
-                if ((int)x > *x1) *x1 = x;
-                if ((int)y > *y1) *y1 = y;
-            }
-}
-
 /* How many pixels are lit in one column, and in one row. */
 static int lit_in_column(unsigned x) {
     int n = 0;
@@ -151,10 +138,7 @@ int main(void) {
         glEnd();
         read_target();
         const int mid = lit_in_column(SIZE / 2);
-        int x0, y0, x1, y1;
-        lit_bounds(&x0, &y0, &x1, &y1);
-        fprintf(stderr, "INFO horizontal width=%d box=%d,%d..%d,%d "
-                "err=0x%04x\n", mid, x0, y0, x1, y1,
+        fprintf(stderr, "INFO horizontal width=%d err=0x%04x\n", mid,
                 (unsigned)glGetError());
         result("horizontal_width", mid >= 4 && mid <= 6);
     }
@@ -170,10 +154,8 @@ int main(void) {
         glEnd();
         read_target();
         const int mid = lit_in_row(SIZE / 2);
-        int x0, y0, x1, y1;
-        lit_bounds(&x0, &y0, &x1, &y1);
-        fprintf(stderr, "INFO vertical width=%d box=%d,%d..%d,%d err=0x%04x\n",
-                mid, x0, y0, x1, y1, (unsigned)glGetError());
+        fprintf(stderr, "INFO vertical width=%d err=0x%04x\n", mid,
+                (unsigned)glGetError());
         result("vertical_width", mid >= 4 && mid <= 6);
     }
 
@@ -232,13 +214,66 @@ int main(void) {
         result("varyings_interpolate", ok);
     }
 
-    /* GL_LINE_STIPPLE is the one thing left, and it is refused by the
-     * rasterizer gate -- six of the installed programs ask for it. The quad
-     * has what it needs: the distance along the line in pixels, which the
-     * quad shader can emit as a varying. What it additionally needs is a
-     * running distance across a LINE_STRIP's segments, which is a prefix sum
-     * over the captured vertices rather than anything one invocation can
-     * see. */
+    /* 5. GL_LINE_STIPPLE. A 1-pixel line with the pattern 0x00FF and factor 1
+     * is eight pixels on, eight off, so a 24-pixel span has two thirds of its
+     * pixels lit rather than all of them. */
+    {
+        clear_black();
+        glLineWidth(1.0f);
+        glLineStipple(1, 0x00FF);
+        glEnable(GL_LINE_STIPPLE);
+        glBegin(GL_LINES);
+        glVertex2f(-0.75f, 0.0f);
+        glVertex2f(0.75f, 0.0f);
+        glEnd();
+        glDisable(GL_LINE_STIPPLE);
+        read_target();
+        int span = 0, on = 0;
+        for (unsigned x = 0; x < SIZE; ++x) {
+            const int any = lit(x, SIZE / 2) || lit(x, SIZE / 2 - 1);
+            if (x >= 5 && x < SIZE - 5) { ++span; on += any; }
+        }
+        fprintf(stderr, "INFO stipple on=%d of %d err=0x%04x\n", on, span,
+                (unsigned)glGetError());
+        /* Not every pixel, and not none: the pattern has to be visible. */
+        result("line_stipple", on > 2 && on < span - 2);
+    }
+
+    /* 5b. The same pattern across a LINE_STRIP, which is where the counter
+     * has to run *on*: GL restarts it at every independent segment and never
+     * between the segments of a strip. Drawn as two collinear halves and
+     * compared against the single line above, pixel for pixel -- a counter
+     * that restarted at the join would give a different image, and might
+     * still give the same *count*, which is why this compares the picture. */
+    {
+        unsigned char single[SIZE * SIZE * 4];
+        glLineStipple(1, 0x00FF);
+        glEnable(GL_LINE_STIPPLE);
+        clear_black();
+        glBegin(GL_LINES);
+        glVertex2f(-0.75f, 0.0f);
+        glVertex2f(0.75f, 0.0f);
+        glEnd();
+        read_target();
+        memcpy(single, pixels, sizeof(single));
+
+        clear_black();
+        glBegin(GL_LINE_STRIP);
+        glVertex2f(-0.75f, 0.0f);
+        glVertex2f(0.0f, 0.0f);
+        glVertex2f(0.75f, 0.0f);
+        glEnd();
+        glDisable(GL_LINE_STIPPLE);
+        read_target();
+        const GLenum error = glGetError();
+        const int same = memcmp(single, pixels, sizeof(single)) == 0;
+        int lit_count = 0;
+        for (unsigned y = 0; y < SIZE; ++y) lit_count += lit_in_row(y);
+        fprintf(stderr, "INFO stipple_strip lit=%d same=%d err=0x%04x\n",
+                lit_count, same, (unsigned)error);
+        result("line_stipple_strip",
+               error == GL_NO_ERROR && lit_count > 0 && same);
+    }
 
     /* 6. GL_LINE_SMOOTH on a wide line: the corners of the end caps come off,
      * so the count of lit pixels drops from the aliased case. */

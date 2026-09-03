@@ -8553,11 +8553,36 @@ Two caps traps, both of which cost a debugging round:
   there. Nineteen native probes went from identical-to-llvmpipe to failing in
   a single build, which is exactly what that gate is for.
 
-**Not yet: GL_LINE_STIPPLE**, still refused -- six installed programs. The
-quad shader can emit the distance along the line in pixels for `LINES`
-directly; for a `LINE_STRIP` the counter runs on across segments, which is a
-prefix sum over the captured vertices and therefore another small compute
-pass.
+### GL_LINE_STIPPLE, and the prefix pass a strip needs
+
+The counter is the distance from the start of the line in pixels, and GL
+resets it at every `glBegin` and, for `GL_LINES`, before *every* segment --
+but a strip or a loop runs on. So independent segments need nothing at all
+(their start is zero) and a strip needs the summed length of every segment
+before it, which depends on the transformed positions and so cannot be
+computed on the CPU.
+
+One compute invocation walks the strip and writes each segment's start. A
+draw has at most a few thousand segments and this is gated on stippling being
+on, so a serial loop costs microseconds where a parallel scan would be more
+code for nothing. Its output is bound as an **ordinary per-instance vertex
+attribute**, which is why the quad shader still needs no storage bindings; the
+`GL_LINES` case points that same attribute at a zero in the corner buffer with
+`arrayStride` 0, which saves a buffer and a dispatch.
+
+The pattern and the repeat factor are baked into a fragment variant as
+immediates and keyed on -- the same choice `gex_wgpu_lower_poly_stipple` makes
+for its thirty-two words, and for the same reason: they change rarely, and a
+uniform would cost a binding on every fragment shader in the driver.
+
+Smoothing and stippling share one varying: coverage across the line in `.xy`
+and distance along it in `.z`. The trap there was that each lowering created
+that input for itself, so a stipple-only draw found no variable and did
+nothing -- both now go through one find-or-create helper.
+
+`tests/gl44-probe.sh line` is 7/7: the strip case draws two collinear halves
+and compares them against the single line **pixel for pixel**, because a
+counter that restarted at the join could still produce the same *count*.
 
 ## Indexed wide points, and a guest bug underneath them (2026-09-02)
 
