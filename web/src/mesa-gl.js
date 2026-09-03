@@ -174,11 +174,28 @@ export class MesaGlDevice {
         maxTextureArrayLayers: 2048,
       };
       const requiredLimits = {};
+      const short = [];
       for (const [limit, wanted] of Object.entries(want)) {
         const available = adapter.limits[limit];
-        if (typeof available === 'number' && available > 0)
+        if (typeof available === 'number' && available > 0) {
           requiredLimits[limit] = Math.min(available, wanted);
+          if (available < wanted) short.push(`${limit} ${available}<${wanted}`);
+        } else {
+          short.push(`${limit} absent`);
+        }
       }
+      // Every one of these is a GL capability -- or, for the texture limits, a
+      // whole GL *version* -- that the frontend will not enable, and a missing
+      // extension is a poor way to find that out. The native path reports 4.4
+      // and a browser on the same machine reported 4.0, which is this list and
+      // nothing else: maxTextureDimension2D 8192 against the 16384 the 4.1
+      // rung of _mesa_compute_version requires.
+      // console.warn, not log: the test harness echoes warnings and drops
+      // logs, and this is the one line that explains a whole missing GL
+      // version.
+      if (short.length)
+        console.warn(`gex-gl: adapter is short of ${short.length} wanted ` +
+                     `limit(s): ${short.join(', ')}`);
       const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
       out.#device = device;
       // A lost device explains everything downstream at once -- every map
