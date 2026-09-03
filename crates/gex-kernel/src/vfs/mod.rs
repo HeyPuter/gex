@@ -72,6 +72,11 @@ pub struct Metadata {
     /// Hard-link count, reported as `st_nlink`. A file with one name is 1; a
     /// directory is `2 + immediate subdirectories`.
     pub nlink: u32,
+    /// `st_rdev`: the device a character or block device node names, in
+    /// Linux's `makedev` encoding (`/dev/null` is 1:3 = 0x103). Zero for
+    /// anything else. Programs compare these -- Wine silences all of its
+    /// debug output when stderr's rdev equals `/dev/null`'s.
+    pub rdev: u64,
 }
 
 impl Metadata {
@@ -83,6 +88,7 @@ impl Metadata {
             ino: 1,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         }
     }
     pub fn dir() -> Metadata {
@@ -93,6 +99,7 @@ impl Metadata {
             ino: 1,
             mtime: 0,
             nlink: 2,
+            rdev: 0,
         }
     }
 }
@@ -464,6 +471,7 @@ impl Vfs {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             });
         }
         fs.metadata(&rel)
@@ -494,7 +502,10 @@ impl Vfs {
     }
 
     pub fn rename(&self, from: &str, to: &str) -> Result<(), Errno> {
-        let (from, to) = (self.canonicalize(from, false)?, self.canonicalize(to, false)?);
+        let (from, to) = (
+            self.canonicalize(from, false)?,
+            self.canonicalize(to, false)?,
+        );
         let (fs, rel_from) = self.resolve(&from)?;
         let (fs_to, rel_to) = self.resolve(&to)?;
         // Crossing a mount boundary needs a copy, which Linux also refuses.
@@ -514,7 +525,10 @@ impl Vfs {
     /// a hard link is a second directory entry for the same inode, and an
     /// inode does not span mounts.
     pub fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
-        let (from, to) = (self.canonicalize(from, false)?, self.canonicalize(to, false)?);
+        let (from, to) = (
+            self.canonicalize(from, false)?,
+            self.canonicalize(to, false)?,
+        );
         let (fs, rel_from) = self.resolve(&from)?;
         let (fs_to, rel_to) = self.resolve(&to)?;
         if !Arc::ptr_eq(fs, fs_to) {

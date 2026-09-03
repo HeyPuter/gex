@@ -69,7 +69,12 @@ impl Pipe {
     ///
     /// `max_fds` is the room the caller left; the rest stay queued, as Linux
     /// does with a short control buffer.
-    fn recv(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>), Errno> {
+    fn recv(
+        &self,
+        buf: &mut [u8],
+        max_fds: usize,
+        peek: bool,
+    ) -> Result<(u64, Vec<Arc<OpenFile>>), Errno> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.bytes.is_empty() {
             // A descriptor can arrive with no data of its own: wineserver hands
@@ -92,7 +97,11 @@ impl Pipe {
                     return Ok((0, out));
                 }
             }
-            return if s.closed { Ok((0, Vec::new())) } else { Err(Errno::EAGAIN) };
+            return if s.closed {
+                Ok((0, Vec::new()))
+            } else {
+                Err(Errno::EAGAIN)
+            };
         }
         let n = buf.len().min(s.bytes.len());
         for (i, slot) in buf[..n].iter_mut().enumerate() {
@@ -120,9 +129,7 @@ impl Pipe {
 
     fn readable(&self) -> bool {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        !s.bytes.is_empty()
-            || s.closed
-            || s.fds.front().is_some_and(|&(at, _)| at <= s.read)
+        !s.bytes.is_empty() || s.closed || s.fds.front().is_some_and(|&(at, _)| at <= s.read)
     }
 
     fn closed(&self) -> bool {
@@ -130,7 +137,11 @@ impl Pipe {
     }
 
     fn available(&self) -> u64 {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).bytes.len() as u64
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bytes
+            .len() as u64
     }
 
     fn writable(&self) -> bool {
@@ -370,6 +381,7 @@ impl FileHandle for UnixSocket {
             ino: 1,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 
@@ -398,7 +410,10 @@ impl FileHandle for UnixSocket {
             Role::Fresh => "fresh".into(),
             Role::Bound(p) => format!("bound {p}"),
             Role::Listening { path, backlog } => {
-                format!("listening {path}, {} waiting", backlog.lock().unwrap().len())
+                format!(
+                    "listening {path}, {} waiting",
+                    backlog.lock().unwrap().len()
+                )
             }
             Role::Connected { rx, tx, .. } => {
                 format!("connected rx={} tx={}", rx.available(), tx.available())
@@ -610,7 +625,10 @@ mod tests {
     fn connecting_to_nothing_is_refused() {
         let names = SocketNames::new();
         let client = UnixSocket::new(true);
-        assert_eq!(names.connect(&client, "/run/absent"), Err(Errno::ECONNREFUSED));
+        assert_eq!(
+            names.connect(&client, "/run/absent"),
+            Err(Errno::ECONNREFUSED)
+        );
     }
 
     #[test]
@@ -784,6 +802,7 @@ impl FileHandle for MemFd {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 }
@@ -1005,6 +1024,7 @@ impl FileHandle for EpollSet {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 }
@@ -1070,7 +1090,11 @@ impl std::fmt::Debug for RemoteUnix {
             f,
             "RemoteUnix({}, {})",
             self.id,
-            if self.listening { "listening" } else { "connected" }
+            if self.listening {
+                "listening"
+            } else {
+                "connected"
+            }
         )
     }
 }
@@ -1153,6 +1177,7 @@ impl crate::vfs::FileHandle for RemoteUnix {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 

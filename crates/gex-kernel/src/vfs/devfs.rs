@@ -22,6 +22,19 @@ enum Device {
     Tty,
 }
 
+/// The Linux device number (`makedev` encoding) each node reports as
+/// `st_rdev`: /dev/null 1:3, zero 1:5, full 1:7, random 1:8, tty 5:0.
+/// Distinct on purpose -- Wine compares stderr's rdev with /dev/null's.
+fn rdev_of(device: Device) -> u64 {
+    match device {
+        Device::Null => 0x103,
+        Device::Zero => 0x105,
+        Device::Full => 0x107,
+        Device::Random => 0x108,
+        Device::Tty => 0x500,
+    }
+}
+
 #[derive(Debug)]
 struct DevHandle {
     device: Device,
@@ -60,6 +73,7 @@ impl FileHandle for DevHandle {
             ino: 1,
             mtime: 0,
             nlink: 1,
+            rdev: rdev_of(self.device),
         })
     }
 
@@ -128,7 +142,7 @@ impl FileSystem for DevFs {
         if path.is_empty() {
             return Ok(Metadata::dir());
         }
-        if Self::device_of(path).is_some() {
+        if let Some(device) = Self::device_of(path) {
             return Ok(Metadata {
                 file_type: FileType::CharDevice,
                 size: 0,
@@ -136,6 +150,7 @@ impl FileSystem for DevFs {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
+                rdev: rdev_of(device),
             });
         }
         if matches!(path, "stdin" | "stdout" | "stderr" | "fd") {
@@ -146,6 +161,7 @@ impl FileSystem for DevFs {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             });
         }
         Err(Errno::ENOENT)
@@ -239,6 +255,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_numbers_are_distinct() {
+        let fs = DevFs::new();
+        let null = fs.metadata("null").unwrap();
+        let tty = fs.metadata("tty").unwrap();
+        assert_eq!(null.rdev, 0x103, "/dev/null is 1:3");
+        assert_ne!(null.rdev, tty.rdev);
+        assert_eq!(
+            fs.open("null", 0, 0).unwrap().metadata().unwrap().rdev,
+            0x103
+        );
+    }
+
+    #[test]
     fn null_reads_empty_and_swallows_writes() {
         let f = DevFs::new().open("null", 0, 0).unwrap();
         let mut buf = [0xffu8; 8];
@@ -293,6 +322,7 @@ mod tests {
                     ino: 0,
                     mtime: 0,
                     nlink: 1,
+                    rdev: 0,
                 })
             }
             fn ioctl(

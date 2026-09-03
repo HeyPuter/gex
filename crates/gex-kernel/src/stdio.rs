@@ -72,6 +72,8 @@ impl FileHandle for StdStream {
             ino: 1,
             mtime: 0,
             nlink: 1,
+            // A pseudo-terminal's number, whatever the host stream is.
+            rdev: 0x8800,
         })
     }
 

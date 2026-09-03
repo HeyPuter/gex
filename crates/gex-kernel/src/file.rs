@@ -422,7 +422,11 @@ impl FileHandle for PipeEnd {
     }
 
     fn available(&self) -> Option<u64> {
-        Some(if self.write { 0 } else { self.pipe.buffered() as u64 })
+        Some(if self.write {
+            0
+        } else {
+            self.pipe.buffered() as u64
+        })
     }
 
     fn poll_writable(&self) -> bool {
@@ -455,6 +459,7 @@ impl FileHandle for PipeEnd {
             ino: 1,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 

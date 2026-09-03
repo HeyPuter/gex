@@ -96,6 +96,7 @@ impl FileHandle for EventFd {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 
@@ -112,7 +113,11 @@ impl FileHandle for EventFd {
     }
 
     fn available(&self) -> Option<u64> {
-        Some(if *self.count.lock().unwrap() > 0 { 8 } else { 0 })
+        Some(if *self.count.lock().unwrap() > 0 {
+            8
+        } else {
+            0
+        })
     }
 }
 

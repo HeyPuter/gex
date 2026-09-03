@@ -144,7 +144,7 @@ pub fn answer_dns(query: &[u8], resolver: &Resolver) -> Option<Vec<u8>> {
 
     let mut out = Vec::with_capacity(qend + 16);
     out.extend_from_slice(&query[..2]); // the id, echoed
-    // QR=1 (response), RD copied, RA=1 (recursion available), RCODE=0.
+                                        // QR=1 (response), RD copied, RA=1 (recursion available), RCODE=0.
     out.push(0x81);
     out.push(0x80);
     out.extend_from_slice(&1u16.to_be_bytes()); // qdcount
@@ -330,6 +330,7 @@ impl FileHandle for Socket {
             ino: 3,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 
@@ -461,7 +462,11 @@ mod tests {
         let r = Resolver::new();
         let a = answer_dns(&query("deb.debian.org", 28), &r).unwrap();
         assert_eq!(u16::from_be_bytes([a[6], a[7]]), 0, "no answers");
-        assert_eq!(a[3] & 0x0f, 0, "but not an error, or the name is given up on");
+        assert_eq!(
+            a[3] & 0x0f,
+            0,
+            "but not an error, or the name is given up on"
+        );
     }
 
     #[test]

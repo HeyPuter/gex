@@ -259,15 +259,26 @@ pub mod raw {
 pub enum Post {
     None,
     /// `_llseek`: the 64-bit result goes to `result` and the call returns 0.
-    Llseek { result: u64 },
+    Llseek {
+        result: u64,
+    },
     /// A `struct timespec` with 32-bit fields: the canonical call wrote the
     /// 16-byte one at `scratch`; copy it to `user` as two 32-bit words.
-    Timespec32 { user: u64, scratch: u64 },
+    Timespec32 {
+        user: u64,
+        scratch: u64,
+    },
     /// `gettimeofday`'s 32-bit timeval, likewise.
-    Timeval32 { user: u64, scratch: u64 },
+    Timeval32 {
+        user: u64,
+        scratch: u64,
+    },
     /// `getrlimit`'s 32-bit rlimit: the canonical `prlimit64` wrote 16 bytes
     /// at `scratch`; each half saturates to the 32-bit `RLIM_INFINITY`.
-    Rlimit32 { user: u64, scratch: u64 },
+    Rlimit32 {
+        user: u64,
+        scratch: u64,
+    },
 }
 
 impl Post {
@@ -288,7 +299,11 @@ impl Post {
                 if ok && user != 0 {
                     for i in 0..2 {
                         let v = m.read_u64(scratch + i * 8).unwrap_or(0);
-                        let v32 = if v > 0xffff_ffff { 0xffff_ffff } else { v as u32 };
+                        let v32 = if v > 0xffff_ffff {
+                            0xffff_ffff
+                        } else {
+                            v as u32
+                        };
                         let _ = m.write_u32(user + i * 4, v32);
                     }
                 }
@@ -355,7 +370,11 @@ pub fn translate(
         }
         x::READ | x::WRITE => {
             a[0] = sext(a[0]);
-            if n == x::READ { nr::READ } else { nr::WRITE }
+            if n == x::READ {
+                nr::READ
+            } else {
+                nr::WRITE
+            }
         }
         x::OPEN => {
             *a = [AT_FDCWD, a[0], a[1], a[2], 0, 0];
@@ -601,14 +620,24 @@ pub fn translate(
         x::GETTIMEOFDAY => {
             // gettimeofday(&tv32, tz): let the kernel fill the 64-bit one in
             // scratch and narrow it afterwards.
-            post = Post::Timeval32 { user: a[0], scratch };
+            post = Post::Timeval32 {
+                user: a[0],
+                scratch,
+            };
             a[0] = if a[0] != 0 { scratch } else { 0 };
             nr::GETTIMEOFDAY
         }
         x::CLOCK_GETTIME | x::CLOCK_GETRES => {
-            post = Post::Timespec32 { user: a[1], scratch };
+            post = Post::Timespec32 {
+                user: a[1],
+                scratch,
+            };
             a[1] = if a[1] != 0 { scratch } else { 0 };
-            if n == x::CLOCK_GETTIME { nr::CLOCK_GETTIME } else { nr::CLOCK_GETRES }
+            if n == x::CLOCK_GETTIME {
+                nr::CLOCK_GETTIME
+            } else {
+                nr::CLOCK_GETRES
+            }
         }
         x::CLOCK_GETTIME64 => nr::CLOCK_GETTIME,
         x::CLOCK_GETRES_TIME64 => nr::CLOCK_GETRES,
@@ -819,7 +848,10 @@ pub fn translate(
         }
         x::GETRLIMIT | x::UGETRLIMIT => {
             // getrlimit(resource, &rlimit32) -> prlimit64(0, resource, NULL, &rlimit64 in scratch)
-            post = Post::Rlimit32 { user: a[1], scratch };
+            post = Post::Rlimit32 {
+                user: a[1],
+                scratch,
+            };
             *a = [0, a[0], 0, scratch, 0, 0];
             nr::PRLIMIT64
         }
@@ -938,9 +970,12 @@ pub fn translate(
         }
         // msghdr and its iovecs are 32-bit structures the kernel does not
         // read yet.
-        x::SENDMSG | x::RECVMSG | x::SENDMMSG | x::RECVMMSG | x::RECVMMSG_TIME64 | x::SOCKETCALL => {
-            UNKNOWN
-        }
+        x::SENDMSG
+        | x::RECVMSG
+        | x::SENDMMSG
+        | x::RECVMMSG
+        | x::RECVMMSG_TIME64
+        | x::SOCKETCALL => UNKNOWN,
         x::REBOOT => nr::REBOOT,
         x::STATFS | x::FSTATFS | x::STATFS64 | x::FSTATFS64 => UNKNOWN,
         x::TRUNCATE | x::TRUNCATE64 | x::GETDENTS => UNKNOWN,

@@ -549,7 +549,10 @@ fn setup_frame_x86(
     m.write_u64(mc + xframe::MC_EFLAGS as u64, read_rflags(m, ctx_addr)?)?;
     // cs = __USER_CS (0x33), the other selectors zero.
     m.write_u64(mc + xframe::MC_CS as u64, 0x33)?;
-    m.write_u64(mc + xframe::MC_TRAPNO as u64, if signal == sig::SIGSEGV { 14 } else { 0 })?;
+    m.write_u64(
+        mc + xframe::MC_TRAPNO as u64,
+        if signal == sig::SIGSEGV { 14 } else { 0 },
+    )?;
     m.write_u64(mc + xframe::MC_OLDMASK as u64, signals.blocked)?;
     m.write_u64(mc + xframe::MC_CR2 as u64, fault_address)?;
     m.write_u64(mc + xframe::MC_FPSTATE as u64, fpstate)?;
@@ -745,8 +748,14 @@ fn setup_frame_i386(
         frame_addr + iframe::SF_SC
     };
 
-    m.write_u32(sc + iframe::SC_GS, crate::x86::selector(m, ctx_addr, crate::x86::SEG_GS) as u32)?;
-    m.write_u32(sc + iframe::SC_FS, crate::x86::selector(m, ctx_addr, crate::x86::SEG_FS) as u32)?;
+    m.write_u32(
+        sc + iframe::SC_GS,
+        crate::x86::selector(m, ctx_addr, crate::x86::SEG_GS) as u32,
+    )?;
+    m.write_u32(
+        sc + iframe::SC_FS,
+        crate::x86::selector(m, ctx_addr, crate::x86::SEG_FS) as u32,
+    )?;
     m.write_u32(sc + iframe::SC_ES, iframe::USER_DS)?;
     m.write_u32(sc + iframe::SC_DS, iframe::USER_DS)?;
     for (i, reg) in iframe::GPR_ORDER.iter().enumerate() {
@@ -754,7 +763,10 @@ fn setup_frame_i386(
         m.write_u32(sc + iframe::SC_GPRS + i as u64 * 4, v as u32)?;
     }
     let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
-    m.write_u32(sc + iframe::SC_TRAPNO, if signal == sig::SIGSEGV { 14 } else { 0 })?;
+    m.write_u32(
+        sc + iframe::SC_TRAPNO,
+        if signal == sig::SIGSEGV { 14 } else { 0 },
+    )?;
     m.write_u32(sc + iframe::SC_ERR, 0)?;
     m.write_u32(sc + iframe::SC_EIP, pc as u32)?;
     m.write_u32(sc + iframe::SC_CS, iframe::USER32_CS)?;
@@ -767,7 +779,10 @@ fn setup_frame_i386(
 
     // The FP image: x87 control word, MXCSR and the eight xmm registers.
     m.write_u32(fpstate, m.read_u32(ctx_addr + ctx::X87_CW as u64)? & 0xffff)?;
-    m.write_u32(fpstate + iframe::FP_MXCSR, m.read_u32(ctx_addr + ctx::MXCSR as u64)?)?;
+    m.write_u32(
+        fpstate + iframe::FP_MXCSR,
+        m.read_u32(ctx_addr + ctx::MXCSR as u64)?,
+    )?;
     for n in 0..8u8 {
         for half in 0..2u64 {
             let v = m.read_u64(ctx_addr + ctx::v(n) as u64 + half * 8)?;
@@ -825,7 +840,10 @@ fn sigreturn_i386(
     } else {
         let frame_addr = esp - 4;
         let uc = frame_addr + iframe::RT_UC;
-        (uc + iframe::UC_MCONTEXT, m.read_u64(uc + iframe::UC_SIGMASK)?)
+        (
+            uc + iframe::UC_MCONTEXT,
+            m.read_u64(uc + iframe::UC_SIGMASK)?,
+        )
     };
     if std::env::var_os("GEX_SIGTRACE").is_some() {
         let words: Vec<String> = (0..8)
@@ -864,9 +882,8 @@ fn sigreturn_i386(
 /// RFLAGS from the context's flag bytes: CF, PF, AF, ZF, SF, DF, OF in their
 /// architectural bits, plus the always-set bit 1 and IF.
 fn read_rflags(m: &GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
-    let f = |off: usize| -> Result<u64, Errno> {
-        Ok(m.read(ctx_addr + off as u64, 1)?[0] as u64 & 1)
-    };
+    let f =
+        |off: usize| -> Result<u64, Errno> { Ok(m.read(ctx_addr + off as u64, 1)?[0] as u64 & 1) };
     Ok((f(ctx::CF)?)
         | (1 << 1)
         | (f(ctx::PF)? << 2)
@@ -958,11 +975,7 @@ pub fn dispatch(
             // `^Z` there does nothing on real hardware too), and is far better
             // than killing a backgrounded reader. `SIGSTOP` is excluded -- it
             // can't be handled, so ending the process at least does something.
-            DefaultAction::Stop
-                if matches!(signal, sig::SIGTSTP | 21 | 22) =>
-            {
-                Delivery::None
-            }
+            DefaultAction::Stop if matches!(signal, sig::SIGTSTP | 21 | 22) => Delivery::None,
             DefaultAction::Core | DefaultAction::Stop => Delivery::Terminate { signal, core: true },
             _ => Delivery::Terminate {
                 signal,
@@ -1084,7 +1097,10 @@ mod tests {
         )
         .unwrap();
         s.raise(sig::SIGUSR1);
-        assert_eq!(dispatch(&mut s, &mut m, CTX, false).unwrap(), Delivery::None);
+        assert_eq!(
+            dispatch(&mut s, &mut m, CTX, false).unwrap(),
+            Delivery::None
+        );
         assert!(!s.has_pending());
     }
 
@@ -1093,7 +1109,10 @@ mod tests {
         let (mut buf, mut s) = setup();
         let mut m = GuestMem::new(&mut buf);
         s.raise(sig::SIGCHLD);
-        assert_eq!(dispatch(&mut s, &mut m, CTX, false).unwrap(), Delivery::None);
+        assert_eq!(
+            dispatch(&mut s, &mut m, CTX, false).unwrap(),
+            Delivery::None
+        );
     }
 
     #[test]

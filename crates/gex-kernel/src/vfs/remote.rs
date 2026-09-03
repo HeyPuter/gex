@@ -85,6 +85,7 @@ pub fn decode_meta(b: &[u8]) -> Metadata {
         ino: u64at(16),
         mtime: u64at(24) as i64,
         nlink: u32at(32).max(1),
+        rdev: 0,
     }
 }
 

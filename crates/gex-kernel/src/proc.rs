@@ -265,7 +265,7 @@ impl ProcTable {
     /// `getpgid`. A pid of zero means the caller, as it does in Linux.
     pub fn pgid(&self, caller: i32, of: i32) -> Result<i32, Errno> {
         if let Some(r) = self.remote {
-            return errno_or(( r.pgid)(caller, of));
+            return errno_or((r.pgid)(caller, of));
         }
         let want = if of == 0 { caller } else { of };
         self.lock()
@@ -426,8 +426,12 @@ impl ProcTable {
             return Err(Errno::EINVAL);
         }
         let t = self.lock();
-        let hits: Vec<&Arc<AtomicU64>> =
-            t.procs.iter().filter(|p| p.pgid == pgid).map(|p| &p.pending).collect();
+        let hits: Vec<&Arc<AtomicU64>> = t
+            .procs
+            .iter()
+            .filter(|p| p.pgid == pgid)
+            .map(|p| &p.pending)
+            .collect();
         if hits.is_empty() {
             return Err(Errno::ESRCH);
         }
@@ -658,7 +662,11 @@ mod tests {
         assert_eq!(t.kill_group(INIT_PID, INIT_PID, 2), Ok(2));
         assert_eq!(t.take_signals(INIT_PID), 1 << 1);
         assert_eq!(t.take_signals(child), 1 << 1);
-        assert_eq!(t.take_signals(outsider), 0, "a different session is untouched");
+        assert_eq!(
+            t.take_signals(outsider),
+            0,
+            "a different session is untouched"
+        );
     }
 
     #[test]

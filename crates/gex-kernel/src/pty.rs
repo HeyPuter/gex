@@ -305,6 +305,7 @@ impl crate::vfs::FileHandle for RemotePty {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0x8800,
         })
     }
 
@@ -518,8 +519,15 @@ impl RemotePty {
             }
             // No-op successes: nothing to drain or break, no modem lines, line
             // discipline is fixed at N_TTY, exclusive mode is not enforced.
-            ioc::TCSBRK | ioc::TCSBRKP | ioc::TCXONC | ioc::TIOCEXCL | ioc::TIOCNXCL
-            | ioc::TIOCMBIS | ioc::TIOCMBIC | ioc::TIOCMSET | ioc::TIOCSIG => Ok(0),
+            ioc::TCSBRK
+            | ioc::TCSBRKP
+            | ioc::TCXONC
+            | ioc::TIOCEXCL
+            | ioc::TIOCNXCL
+            | ioc::TIOCMBIS
+            | ioc::TIOCMBIC
+            | ioc::TIOCMSET
+            | ioc::TIOCSIG => Ok(0),
             ioc::TIOCMGET => {
                 m.write_u32(arg, 0)?;
                 Ok(0)

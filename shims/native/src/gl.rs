@@ -181,6 +181,8 @@ impl FileHandle for GlDevice {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            // A DRM render node, 226:128.
+            rdev: 0xe280,
         })
     }
 

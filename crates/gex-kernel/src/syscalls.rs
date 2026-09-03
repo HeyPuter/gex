@@ -15,11 +15,11 @@ use crate::fs::{oflags, Stat};
 use crate::futex::{self, FutexTable};
 use crate::mem::{flags as mflags, MemoryMap};
 use crate::net;
-use crate::proc::ProcTable;
 use crate::pipe::Pipe;
-use crate::unix;
+use crate::proc::ProcTable;
 use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
 use crate::stdio::{StdStream, Stream};
+use crate::unix;
 use crate::vfs::{FileType, ProcSource, Vfs};
 use crate::GuestMem;
 use gex_abi::{ctx, ctx_addr, EXCLUSIVE_SCRATCH};
@@ -287,7 +287,9 @@ pub enum BlockOp {
     /// `restore_mask` is what to put back afterwards, which
     /// [`Kernel::finish_blocking`] does before the call returns `EINTR` --
     /// the only thing it ever returns.
-    SigSuspend { restore_mask: u64 },
+    SigSuspend {
+        restore_mask: u64,
+    },
     /// A `read` on a stream with nothing in it yet: a terminal nobody has
     /// typed at, a socket with nothing arrived.
     ///
@@ -303,7 +305,9 @@ pub enum BlockOp {
     },
     /// A `connect` on a descriptor that is not non-blocking. Ready once the
     /// connection is up, refused, or gone.
-    Connect { socket: Arc<net::Socket> },
+    Connect {
+        socket: Arc<net::Socket>,
+    },
     /// An `accept` on a listener with nothing waiting. The host only waits;
     /// the descriptor is made by the kernel afterwards, because only the
     /// kernel has a descriptor table. See `Kernel::retry_accept`.
@@ -704,7 +708,6 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
 /// Both live in [`crate::tty`] now, next to the discipline that obeys them --
 /// there is no second definition here to fall out of step with it.
 pub use crate::tty::{lflag::ECHO, lflag::ICANON, COOKED as COOKED_TERMIOS, KERNEL_TERMIOS};
-
 
 /// One entry of a `poll` set, kept so the host can re-check it without going
 /// back through the kernel.
@@ -1227,7 +1230,11 @@ impl Kernel {
                 if p == 0 {
                     break;
                 }
-                let ptr = if compat { m.read_u32(p)? as u64 } else { m.read_u64(p)? };
+                let ptr = if compat {
+                    m.read_u32(p)? as u64
+                } else {
+                    m.read_u64(p)?
+                };
                 if ptr == 0 {
                     break;
                 }
@@ -1653,7 +1660,10 @@ impl Kernel {
         // last thread the two are the same thing.
         if n == nr::EXIT && self.live_threads > 1 {
             if self.trace {
-                eprintln!("[gex:{}] exit({}) (thread {})", self.pid, a[0] as i32, self.tid);
+                eprintln!(
+                    "[gex:{}] exit({}) (thread {})",
+                    self.pid, a[0] as i32, self.tid
+                );
             }
             self.thread_exit(m);
             return SyscallOutcome::ThreadExit;
@@ -1672,7 +1682,12 @@ impl Kernel {
                         .iter()
                         .map(|p| format!("{}:{:x}", p.fd, p.events))
                         .collect();
-                    eprintln!("[gex:{}] {} blocking on [{}]", self.pid, syscall_name(n), want.join(" "));
+                    eprintln!(
+                        "[gex:{}] {} blocking on [{}]",
+                        self.pid,
+                        syscall_name(n),
+                        want.join(" ")
+                    );
                 } else {
                     eprintln!("[gex:{}] {} blocking", self.pid, syscall_name(n));
                 }
@@ -1706,7 +1721,9 @@ impl Kernel {
             // A 64-byte write is the size of a wineserver request; its first
             // word is the request code, which is what a Wine trace wants.
             let req = if n == nr::WRITE && a[2] == 64 {
-                m.read_u32(a[1]).map(|r| format!(" [req {r}]")).unwrap_or_default()
+                m.read_u32(a[1])
+                    .map(|r| format!(" [req {r}]"))
+                    .unwrap_or_default()
             } else {
                 String::new()
             };
@@ -1797,7 +1814,10 @@ impl Kernel {
                         if secs == 0 && nanos == 0 {
                             return None; // {0,0}: non-blocking
                         }
-                        Some(std::time::Duration::new(secs, (nanos % 1_000_000_000) as u32))
+                        Some(std::time::Duration::new(
+                            secs,
+                            (nanos % 1_000_000_000) as u32,
+                        ))
                     }
                 } else {
                     let millis = a[3] as i32;
@@ -1822,11 +1842,7 @@ impl Kernel {
             }
             nr::PPOLL | nr::PSELECT6 => {
                 let (fds, report, timeout) = if n == nr::PPOLL {
-                    (
-                        self.collect_pollfds(m, a[0], a[1])?,
-                        PollReport::Poll,
-                        a[2],
-                    )
+                    (self.collect_pollfds(m, a[0], a[1])?, PollReport::Poll, a[2])
                 } else {
                     (
                         self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?,
@@ -1934,7 +1950,12 @@ impl Kernel {
                 // `GuestMem::read` -- a guest address is a linear-memory
                 // offset, so reading address zero succeeds and proves nothing
                 // (#113).
-                if !self.mem.vmas().iter().any(|v| a[0] >= v.start && a[0] + 4 <= v.end) {
+                if !self
+                    .mem
+                    .vmas()
+                    .iter()
+                    .any(|v| a[0] >= v.start && a[0] + 4 <= v.end)
+                {
                     return None;
                 }
                 // Take the queue place BEFORE reading the word. A cooperative
@@ -2053,12 +2074,15 @@ impl Kernel {
         }
     }
 
-        /// Seconds since the first traced syscall, for `--strace` timestamps.
+    /// Seconds since the first traced syscall, for `--strace` timestamps.
     fn trace_clock() -> f64 {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_secs_f64()
     }
-    
+
     /// Finish a syscall whose blocking half the host has now run.
 
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
@@ -2318,7 +2342,9 @@ impl Kernel {
             nr::FALLOCATE => self.sys_fallocate(a[0] as i32, a[1], a[2], a[3]),
             nr::EPOLL_CREATE1 => self.sys_epoll_create(a[0]),
             nr::EPOLL_CTL => self.sys_epoll_ctl(m, a[0] as i32, a[1], a[2] as i32, a[3]),
-            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => self.sys_epoll_wait(m, a[0] as i32, a[1], a[2] as u32),
+            nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 => {
+                self.sys_epoll_wait(m, a[0] as i32, a[1], a[2] as u32)
+            }
             nr::CLOSE_RANGE => self.sys_close_range(a[0], a[1], a[2]),
             nr::MEMBARRIER => self.sys_membarrier(a[0]),
             nr::SET_TID_ADDRESS => {
@@ -2469,11 +2495,11 @@ impl Kernel {
                 }
                 let oldval = m.read_u32(uaddr2)? as i32;
                 let newval = match oper {
-                    0 => oparg,                        // SET
-                    1 => oldval.wrapping_add(oparg),   // ADD
-                    2 => oldval | oparg,               // OR
-                    3 => oldval & !oparg,              // ANDN
-                    4 => oldval ^ oparg,               // XOR
+                    0 => oparg,                      // SET
+                    1 => oldval.wrapping_add(oparg), // ADD
+                    2 => oldval | oparg,             // OR
+                    3 => oldval & !oparg,            // ANDN
+                    4 => oldval ^ oparg,             // XOR
                     _ => return Err(Errno::ENOSYS),
                 };
                 m.write_u32(uaddr2, newval as u32)?;
@@ -3005,7 +3031,11 @@ impl Kernel {
             let sid = self.procs.sid(self.pid, 0).unwrap_or(0);
             let id = (r.for_sid)(sid);
             if id >= 0 {
-                let handle = Arc::new(crate::pty::RemotePty { id, master: false, remote: r });
+                let handle = Arc::new(crate::pty::RemotePty {
+                    id,
+                    master: false,
+                    remote: r,
+                });
                 // A descriptor of its own on that end, so the counting stays
                 // right, but no claim: this session already owns it.
                 (r.open_end)(id, 0);
@@ -3033,7 +3063,11 @@ impl Kernel {
         } else {
             return None;
         };
-        let handle = Arc::new(crate::pty::RemotePty { id, master, remote: r });
+        let handle = Arc::new(crate::pty::RemotePty {
+            id,
+            master,
+            remote: r,
+        });
         // Opening a terminal is how a session claims it.
         //
         // A session leader with no controlling terminal that opens one without
@@ -3089,7 +3123,12 @@ impl Kernel {
         } else if flags & oflags::O_TMPFILE == oflags::O_TMPFILE {
             let n = self.next_tmpfile;
             self.next_tmpfile += 1;
-            let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
+            let tmp = format!(
+                "{}/.gex-tmpfile-{}-{}",
+                p.trim_end_matches('/'),
+                self.pid,
+                n
+            );
             let h = self.vfs.open(
                 &tmp,
                 oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
@@ -3272,7 +3311,11 @@ impl Kernel {
         let value = read_ns(m, new + 16)?;
         let handle = self.fds.get(fd)?.handle.clone();
         let (rem, prev_int) = handle
-            .timerfd_set(value, interval, flags & crate::timerfd::TFD_TIMER_ABSTIME != 0)
+            .timerfd_set(
+                value,
+                interval,
+                flags & crate::timerfd::TFD_TIMER_ABSTIME != 0,
+            )
             .ok_or(Errno::EINVAL)?;
         if old != 0 {
             m.write_u64(old, prev_int / 1_000_000_000)?;
@@ -3405,11 +3448,7 @@ impl Kernel {
             blksize: 4096,
             blocks: (md.size as i64 + 511) / 512,
             mtime: md.mtime,
-            rdev: if md.file_type == FileType::CharDevice {
-                0x8800
-            } else {
-                0
-            },
+            rdev: md.rdev,
             ..Default::default()
         }
     }
@@ -3442,12 +3481,10 @@ impl Kernel {
 
         // `struct statx` is 256 bytes and mostly reserved.
         let mut out = [0u8; 256];
-        let put32 = |o: &mut [u8; 256], at: usize, v: u32| {
-            o[at..at + 4].copy_from_slice(&v.to_le_bytes())
-        };
-        let put64 = |o: &mut [u8; 256], at: usize, v: u64| {
-            o[at..at + 8].copy_from_slice(&v.to_le_bytes())
-        };
+        let put32 =
+            |o: &mut [u8; 256], at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 =
+            |o: &mut [u8; 256], at: usize, v: u64| o[at..at + 8].copy_from_slice(&v.to_le_bytes());
         // What is filled in. The caller asks for a mask and the kernel says
         // which parts it actually answered; claiming everything but the
         // birth time is what a Linux filesystem without one reports.
@@ -3654,7 +3691,11 @@ impl Kernel {
                 let on = m.read_u32(arg)? != 0;
                 let f = self.fds.get(fd)?;
                 let flags = f.flags();
-                f.set_flags(if on { flags | oflags::O_NONBLOCK } else { flags & !oflags::O_NONBLOCK });
+                f.set_flags(if on {
+                    flags | oflags::O_NONBLOCK
+                } else {
+                    flags & !oflags::O_NONBLOCK
+                });
                 return Ok(0);
             }
             _ => {}
@@ -3824,7 +3865,11 @@ impl Kernel {
             }
             TIOCGSID => {
                 let sid = tty.sid();
-                let s = if sid > 0 { sid } else { self.procs.sid(self.pid, 0).unwrap_or(1) };
+                let s = if sid > 0 {
+                    sid
+                } else {
+                    self.procs.sid(self.pid, 0).unwrap_or(1)
+                };
                 m.write_u32(arg, s as u32)?;
                 Ok(0)
             }
@@ -3944,7 +3989,10 @@ impl Kernel {
                 const TIOCM_CTS: u32 = 0x020;
                 const TIOCM_CAR: u32 = 0x040;
                 const TIOCM_DSR: u32 = 0x100;
-                m.write_u32(arg, TIOCM_DTR | TIOCM_RTS | TIOCM_CTS | TIOCM_CAR | TIOCM_DSR)?;
+                m.write_u32(
+                    arg,
+                    TIOCM_DTR | TIOCM_RTS | TIOCM_CTS | TIOCM_CAR | TIOCM_DSR,
+                )?;
                 Ok(0)
             }
             TIOCMSET | TIOCMBIS | TIOCMBIC => Ok(0),
@@ -4242,9 +4290,9 @@ impl Kernel {
                         events,
                         handle: file.as_ref().map(|f| Arc::clone(&f.handle)),
                         // The open mode only. Whether a write would *block* is
-                // asked of the handle in `poll_revents`, every time, because
-                // a parked poll outlives the state it was built from.
-                writable: file.as_ref().is_some_and(|f| f.writable),
+                        // asked of the handle in `poll_revents`, every time, because
+                        // a parked poll outlives the state it was built from.
+                        writable: file.as_ref().is_some_and(|f| f.writable),
                     }
                 })
                 .collect(),
@@ -4413,9 +4461,8 @@ impl Kernel {
             return Err(Errno::EFAULT);
         }
         let mut out = [0u8; 120];
-        let put = |o: &mut [u8; 120], at: usize, v: u64| {
-            o[at..at + 8].copy_from_slice(&v.to_le_bytes())
-        };
+        let put =
+            |o: &mut [u8; 120], at: usize, v: u64| o[at..at + 8].copy_from_slice(&v.to_le_bytes());
         put(&mut out, 0, 0x0102_1994); // f_type: TMPFS_MAGIC
         put(&mut out, 8, 4096); // f_bsize
         put(&mut out, 16, 1 << 20); // f_blocks
@@ -4584,10 +4631,7 @@ impl Kernel {
             // own copy of the fixed USD page. The page is read-only to the
             // guest, but writing it here (before it runs) is exactly what the
             // shared section would have delivered.
-            if gex_abi::X86
-                && start <= 0x7ffe_0308
-                && 0x7ffe_0308 < start + len_aligned
-            {
+            if gex_abi::X86 && start <= 0x7ffe_0308 && 0x7ffe_0308 < start + len_aligned {
                 let _ = m.write(0x7ffe_0308, &[1u8]);
             }
             // A shared mapping is written back at `msync` and `munmap` (where
@@ -4643,7 +4687,6 @@ impl Kernel {
         m.zero(start, crate::mem::page_align_up(len) as usize)?;
         Ok(start)
     }
-
 
     // -- sessions, credentials and mounts --------------------------------------
 
@@ -4753,7 +4796,6 @@ impl Kernel {
         }
     }
 
-
     // -- sockets ---------------------------------------------------------------
 
     /// `socket`. Only AF_INET, and only the two kinds that matter: a stream,
@@ -4822,7 +4864,10 @@ impl Kernel {
     fn remote_unix_of(&self, fd: i32) -> Result<Arc<unix::RemoteUnix>, Errno> {
         let file = self.fds.get(fd)?;
         let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.remote_sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+        self.remote_sockets
+            .get(&key)
+            .cloned()
+            .ok_or(Errno::ENOTSOCK)
     }
 
     /// Put a socket that lives in the global kernel at `fd`, replacing
@@ -4848,7 +4893,12 @@ impl Kernel {
     }
 
     /// Put a unix socket in the descriptor table.
-    fn install_unix(&mut self, sock: Arc<unix::UnixSocket>, flags: u64, cloexec: bool) -> SysResult {
+    fn install_unix(
+        &mut self,
+        sock: Arc<unix::UnixSocket>,
+        flags: u64,
+        cloexec: bool,
+    ) -> SysResult {
         let handle: Arc<dyn crate::vfs::FileHandle> = sock;
         let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
         let fd = self.fds.insert(file, cloexec)?;
@@ -5025,13 +5075,7 @@ impl Kernel {
     }
 
     /// `epoll_pwait`, answered from the same readiness the `poll` path uses.
-    fn sys_epoll_wait(
-        &mut self,
-        m: &mut GuestMem<'_>,
-        epfd: i32,
-        out: u64,
-        max: u32,
-    ) -> SysResult {
+    fn sys_epoll_wait(&mut self, m: &mut GuestMem<'_>, epfd: i32, out: u64, max: u32) -> SysResult {
         let set = self.epoll_of(epfd)?;
         let ready = self.epoll_ready(&set);
         let n = self.write_epoll_events(m, out, max, &ready)?;
@@ -5155,7 +5199,13 @@ impl Kernel {
         Ok(fd)
     }
 
-    fn sys_socketpair(&mut self, m: &mut GuestMem<'_>, domain: u64, ty: u64, out: u64) -> SysResult {
+    fn sys_socketpair(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        domain: u64,
+        ty: u64,
+        out: u64,
+    ) -> SysResult {
         const AF_UNIX: u64 = 1;
         const SOCK_NONBLOCK: u64 = 0o4000;
         const SOCK_CLOEXEC: u64 = 0o2000000;
@@ -5705,7 +5755,11 @@ impl Kernel {
             "gex",
             "6.1.0-gex",
             "#1 SMP gex",
-            if self.compat { "i686" } else { gex_abi::ARCH_NAME },
+            if self.compat {
+                "i686"
+            } else {
+                gex_abi::ARCH_NAME
+            },
             "(none)",
         ];
         let mut out = vec![0u8; 65 * 6];
@@ -5809,7 +5863,13 @@ impl Kernel {
     /// the table back. Only the base is kept -- gex has no segment limits
     /// or rights to enforce -- and a segment register already holding the
     /// entry's selector sees the new base at once.
-    fn sys_modify_ldt(&mut self, m: &mut GuestMem<'_>, func: u64, ptr: u64, count: u64) -> SysResult {
+    fn sys_modify_ldt(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        func: u64,
+        ptr: u64,
+        count: u64,
+    ) -> SysResult {
         match func {
             0 => {
                 let n = (count as usize).min(self.ldt.len() * 8);
@@ -6300,7 +6360,9 @@ mod tests {
                 (Stream::Err, "/dev/stderr", false, true),
             ] {
                 let h = Arc::new(StdStream::new(stream, true));
-                let _ = k.fds.insert(OpenFile::new(h, name.to_string(), 0, r, w), false);
+                let _ = k
+                    .fds
+                    .insert(OpenFile::new(h, name.to_string(), 0, r, w), false);
             }
             (mem, k)
         }
@@ -6318,7 +6380,11 @@ mod tests {
             // `struct __kernel_termios` on the stack, and the 24 bytes past
             // it are the caller's, ending at the stack canary.
             assert_eq!(&mem[AT as usize..AT as usize + 4], &0x6502u32.to_le_bytes());
-            assert_eq!(mem[AT as usize + tty::KERNEL_TERMIOS], 0, "wrote past the kernel struct");
+            assert_eq!(
+                mem[AT as usize + tty::KERNEL_TERMIOS],
+                0,
+                "wrote past the kernel struct"
+            );
             // `intr` is `^C`, which is where a shell reads it from.
             assert_eq!(mem[AT as usize + 17], 3);
 
@@ -6342,8 +6408,14 @@ mod tests {
             assert_eq!(ioctl(&mut k, &mut mem, TIOCSWINSZ, AT), Ok(0));
             mem[AT as usize..AT as usize + 8].fill(0);
             assert_eq!(ioctl(&mut k, &mut mem, TIOCGWINSZ, AT), Ok(0));
-            assert_eq!(u16::from_le_bytes([mem[AT as usize], mem[AT as usize + 1]]), 40);
-            assert_eq!(u16::from_le_bytes([mem[AT as usize + 2], mem[AT as usize + 3]]), 100);
+            assert_eq!(
+                u16::from_le_bytes([mem[AT as usize], mem[AT as usize + 1]]),
+                40
+            );
+            assert_eq!(
+                u16::from_le_bytes([mem[AT as usize + 2], mem[AT as usize + 3]]),
+                100
+            );
         }
 
         #[test]
@@ -6685,7 +6757,11 @@ mod tests {
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, ctx_addr), 0);
         assert_eq!(m.read_u64(ctx_addr + ctx::FS_BASE as u64).unwrap(), 0x8000);
-        assert_eq!(x86::selector(&m, ctx_addr, SEG_FS), 0, "selector must be null");
+        assert_eq!(
+            x86::selector(&m, ctx_addr, SEG_FS),
+            0,
+            "selector must be null"
+        );
 
         // Rewriting the entry must leave the 64-bit base alone now.
         x86::set_tls(&mut m, ctx_addr, TLS_ENTRY_MIN, 0x3000);

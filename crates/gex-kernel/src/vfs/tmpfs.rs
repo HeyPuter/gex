@@ -17,9 +17,15 @@ pub static TMPFS_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 
 fn note_capacity(before: usize, after: usize) {
     if after >= before {
-        TMPFS_BYTES.fetch_add((after - before) as u64, core::sync::atomic::Ordering::Relaxed);
+        TMPFS_BYTES.fetch_add(
+            (after - before) as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
     } else {
-        TMPFS_BYTES.fetch_sub((before - after) as u64, core::sync::atomic::Ordering::Relaxed);
+        TMPFS_BYTES.fetch_sub(
+            (before - after) as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -225,6 +231,7 @@ impl FileHandle for TmpHandle {
                 ino: file.ino,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             });
         }
         let inner = self.inner.lock().unwrap();
@@ -238,6 +245,7 @@ impl FileHandle for TmpHandle {
                 mtime: 0,
                 // Every name that maps to this inode is a hard link to it.
                 nlink: inner.inos.values().filter(|&&v| v == ino).count() as u32,
+                rdev: 0,
             }),
             Some(Node::Dir) => Ok(Metadata {
                 ino,
@@ -252,6 +260,7 @@ impl FileHandle for TmpHandle {
                 ino,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             }),
             Some(Node::Socket) => Ok(Metadata {
                 file_type: FileType::Socket,
@@ -260,6 +269,7 @@ impl FileHandle for TmpHandle {
                 ino,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             }),
             None => Err(Errno::ENOENT),
         }

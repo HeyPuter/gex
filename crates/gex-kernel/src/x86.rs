@@ -9,8 +9,8 @@
 //! `poll` → `ppoll` with a timespec in the thread's scratch area) so the rest
 //! of the kernel never sees them.
 
-use crate::GuestMem;
 use crate::syscalls::nr;
+use crate::GuestMem;
 
 /// A raw number with no canonical equivalent. Dispatch answers `ENOSYS`.
 pub const UNKNOWN: u64 = u64::MAX;
@@ -44,14 +44,22 @@ use gex_abi::ctx;
 
 /// The selector `seg` holds.
 pub fn selector(m: &GuestMem<'_>, ctx_addr: u64, seg: u8) -> u16 {
-    m.read_u32(ctx_addr + ctx::SEG as u64 + seg as u64 * 4).unwrap_or(0) as u16
+    m.read_u32(ctx_addr + ctx::SEG as u64 + seg as u64 * 4)
+        .unwrap_or(0) as u16
 }
 
 /// A thread's initial selectors: the 64-bit or 32-bit code segment, the
 /// flat data segment for ss/ds/es, nothing in fs/gs.
 pub fn init_segments(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool) {
     let cs = if compat { USER32_CS } else { USER_CS };
-    for (seg, sel) in [(0u8, USER_DS), (1, cs), (2, USER_DS), (3, USER_DS), (4, 0), (5, 0)] {
+    for (seg, sel) in [
+        (0u8, USER_DS),
+        (1, cs),
+        (2, USER_DS),
+        (3, USER_DS),
+        (4, 0),
+        (5, 0),
+    ] {
         let _ = m.write_u32(ctx_addr + ctx::SEG as u64 + seg as u64 * 4, sel as u32);
     }
 }
@@ -101,7 +109,10 @@ pub fn refresh_segments(m: &mut GuestMem<'_>, ctx_addr: u64, ldt: &[u64], sel: u
 /// once (glibc sets the entry and then loads %gs; a thread's descriptor may
 /// also be rewritten while %gs already points at it).
 pub fn set_tls(m: &mut GuestMem<'_>, ctx_addr: u64, entry: u16, base: u64) {
-    let _ = m.write_u64(ctx_addr + ctx::TLS as u64 + (entry - TLS_ENTRY_MIN) as u64 * 8, base);
+    let _ = m.write_u64(
+        ctx_addr + ctx::TLS as u64 + (entry - TLS_ENTRY_MIN) as u64 * 8,
+        base,
+    );
     for (seg, slot) in [(SEG_FS, ctx::FS_BASE), (SEG_GS, ctx::GS_BASE)] {
         let sel = selector(m, ctx_addr, seg);
         if sel & 4 == 0 && sel >> 3 == entry {
@@ -114,7 +125,10 @@ pub fn set_tls(m: &mut GuestMem<'_>, ctx_addr: u64, entry: u16, base: u64) {
 /// still zero, else the last.
 pub fn free_tls_entry(m: &GuestMem<'_>, ctx_addr: u64) -> u16 {
     for i in 0..TLS_ENTRIES {
-        if m.read_u64(ctx_addr + ctx::TLS as u64 + i as u64 * 8).unwrap_or(0) == 0 {
+        if m.read_u64(ctx_addr + ctx::TLS as u64 + i as u64 * 8)
+            .unwrap_or(0)
+            == 0
+        {
             return TLS_ENTRY_MIN + i;
         }
     }

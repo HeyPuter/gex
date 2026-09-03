@@ -96,8 +96,8 @@ const CC_AT: usize = 17;
 pub const COOKED: [u8; 60] = {
     let mut t = [0u8; 60];
     // ICRNL | IXON | BRKINT | IMAXBEL | IUTF8.
-    let i = (iflag::BRKINT | iflag::ICRNL | iflag::IXON | iflag::IMAXBEL | iflag::IUTF8)
-        .to_le_bytes();
+    let i =
+        (iflag::BRKINT | iflag::ICRNL | iflag::IXON | iflag::IMAXBEL | iflag::IUTF8).to_le_bytes();
     let o = (oflag::OPOST | oflag::ONLCR).to_le_bytes();
     let c = 0xbfu32.to_le_bytes(); // B38400 | CS8 | CREAD
     let l = (lflag::ISIG
@@ -109,10 +109,22 @@ pub const COOKED: [u8; 60] = {
         | lflag::ECHOKE
         | lflag::IEXTEN)
         .to_le_bytes();
-    t[0] = i[0]; t[1] = i[1]; t[2] = i[2]; t[3] = i[3];
-    t[4] = o[0]; t[5] = o[1]; t[6] = o[2]; t[7] = o[3];
-    t[8] = c[0]; t[9] = c[1]; t[10] = c[2]; t[11] = c[3];
-    t[12] = l[0]; t[13] = l[1]; t[14] = l[2]; t[15] = l[3];
+    t[0] = i[0];
+    t[1] = i[1];
+    t[2] = i[2];
+    t[3] = i[3];
+    t[4] = o[0];
+    t[5] = o[1];
+    t[6] = o[2];
+    t[7] = o[3];
+    t[8] = c[0];
+    t[9] = c[1];
+    t[10] = c[2];
+    t[11] = c[3];
+    t[12] = l[0];
+    t[13] = l[1];
+    t[14] = l[2];
+    t[15] = l[3];
     // `c_line` is 0 (N_TTY), then `c_cc` -- the kernel's `INIT_C_CC`. Not
     // harmless to leave zero: a zero erase character means backspace does
     // nothing.
@@ -691,11 +703,17 @@ pub const BIT_STOPPED: i32 = 4;
 
 impl TtyRef {
     pub fn new() -> TtyRef {
-        TtyRef { local: Tty::new(), remote: None }
+        TtyRef {
+            local: Tty::new(),
+            remote: None,
+        }
     }
 
     pub fn shared(remote: Remote) -> TtyRef {
-        TtyRef { local: Tty::new(), remote: Some(remote) }
+        TtyRef {
+            local: Tty::new(),
+            remote: Some(remote),
+        }
     }
 
     /// The local terminal, for a host that drives the discipline itself.
@@ -884,7 +902,12 @@ pub fn pack_ws(ws: (u16, u16, u16, u16)) -> u64 {
 }
 
 pub fn unpack_ws(v: u64) -> (u16, u16, u16, u16) {
-    ((v >> 48) as u16, (v >> 32) as u16, (v >> 16) as u16, v as u16)
+    (
+        (v >> 48) as u16,
+        (v >> 32) as u16,
+        (v >> 16) as u16,
+        v as u16,
+    )
 }
 
 #[cfg(test)]
@@ -950,7 +973,8 @@ mod tests {
         let t = Tty::new();
         let mut tm = COOKED;
         // Clear ICANON and ECHO, which is what a shell's line editor does.
-        let l = u32::from_le_bytes([tm[12], tm[13], tm[14], tm[15]]) & !(lflag::ICANON | lflag::ECHO);
+        let l =
+            u32::from_le_bytes([tm[12], tm[13], tm[14], tm[15]]) & !(lflag::ICANON | lflag::ECHO);
         tm[12..16].copy_from_slice(&l.to_le_bytes());
         t.set_termios(&tm);
         let a = typed(&t, "hi");

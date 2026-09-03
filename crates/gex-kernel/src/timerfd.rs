@@ -39,7 +39,9 @@ pub struct TimerFd {
 
 impl std::fmt::Debug for TimerFd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TimerFd").field("state", &*self.state.lock().unwrap()).finish()
+        f.debug_struct("TimerFd")
+            .field("state", &*self.state.lock().unwrap())
+            .finish()
     }
 }
 
@@ -53,7 +55,8 @@ impl TimerFd {
 
     fn now_ns(&self) -> u64 {
         let (secs, nanos) = (self.clock)();
-        secs.saturating_mul(1_000_000_000).saturating_add(nanos as u64)
+        secs.saturating_mul(1_000_000_000)
+            .saturating_add(nanos as u64)
     }
 
     /// How many times the timer has fired at `now` but not yet been read.
@@ -79,7 +82,11 @@ impl TimerFd {
         if value == 0 {
             *s = State::default();
         } else {
-            s.next = if abstime { value } else { now.saturating_add(value) };
+            s.next = if abstime {
+                value
+            } else {
+                now.saturating_add(value)
+            };
             s.interval = interval;
         }
         prev
@@ -140,6 +147,7 @@ impl FileHandle for TimerFd {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 

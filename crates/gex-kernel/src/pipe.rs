@@ -43,7 +43,6 @@ struct State {
 pub struct Pipe {
     state: Mutex<State>,
     ready: Condvar,
-
 }
 
 impl Default for Pipe {
@@ -69,8 +68,6 @@ impl Pipe {
             ready: Condvar::new(),
         }
     }
-
-
 
     /// Note that another descriptor now refers to one end.
     pub fn open_end(&self, write: bool) {
@@ -388,6 +385,7 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 
@@ -431,7 +429,11 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
             ((e >> 16) & 0xffff, e & 0xffff)
         };
         let ws = (self.remote.write_stats)(self.id);
-        let (short, refused) = if ws < 0 { (-1i32, -1i32) } else { ((ws >> 16) & 0xffff, ws & 0xffff) };
+        let (short, refused) = if ws < 0 {
+            (-1i32, -1i32)
+        } else {
+            ((ws >> 16) & 0xffff, ws & 0xffff)
+        };
         let broken = (short >> 8) & 0xff;
         let short = short & 0xff;
         let wrote = if short > 0 || refused > 0 || broken > 0 {
