@@ -10993,3 +10993,53 @@ already applied.
 reported 8 of 8. That is the case the gate exists for, and it is worth running
 it on a probe whose transport was touched even when the native numbers look
 clean.
+
+## The app sweep, re-run: 60 refusals down to 2
+
+`scratchpad/gl-app-sweep.sh` runs every installed GL program for eight
+seconds and records the driver's own complaints. It had not been re-run since
+a long list of fixes landed, and its notes were describing a driver that no
+longer existed -- its biggest cluster, 45 programs on one rasterizer-state
+field, had been fixed in between.
+
+Re-run over the same 336 programs:
+
+| verdict | before | after |
+| --- | --- | --- |
+| RAN | 192 | **281** |
+| REFUSED | 60 | **6** → 2 |
+| CRASH | 32 | **11** |
+| WGPU-ERROR | 14 | **0** |
+| EXIT | 22 | 22 |
+| OK | 16 | 16 |
+
+Grouping the notes by cause is what makes this a work list rather than a
+score. The whole remaining refusal set was two causes:
+
+- **Four programs on GL 1.x `GL_CLAMP`** (`convolutions`, `projtex`,
+  `shadowtex`, `texenv`). It clamps to the *border* for NEAREST and blends
+  toward the border colour for LINEAR; WebGPU has no such mode and neither
+  does any modern GPU -- it was removed in the core profile and every current
+  driver serves it as clamp-to-edge, which is what these programs already see
+  everywhere else. Refusing it was the worse trade, because a refused sampler
+  is silently served by the default one and the filters, LOD range and
+  **comparison mode** went with it. Now accepted: all four run with no
+  refusal, and `shadowtex` draws its shadow.
+- **Two programs on logic ops** (`line-xor`, `tri-logicop-xor`). WebGPU has
+  no logic ops at all, and these demos exist to draw with `GL_XOR`.
+  Accepting and ignoring would draw solid instead of XOR -- wrong either way,
+  so this one stays a named refusal. It is a platform ceiling.
+
+The 11 crashes are worth a note: seven are `signal 127` (the program is not
+executable here at all) or `signal 6` from Hyprland, and the two real ones
+are `texture_from_pixmap` (`signal 11`) and `glxpixmap` -- GLX pixmap
+rendering, which this driver has never claimed.
+
+Two cautions for the next re-run, both learned the hard way:
+
+- Check each log for `gex-wgpu: native screen on Dawn` before believing a
+  verdict. 308 of 336 have it; the 28 without are Wayland compositors, KMS
+  programs and X servers that cannot run here at all.
+- It uses `DISPLAY=:77`, so an app screenshot taken while it runs picks up
+  *its* windows. One Blender check this pass photographed a sweep program's
+  window and had to be redone.
