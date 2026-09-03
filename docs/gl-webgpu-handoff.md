@@ -8794,3 +8794,40 @@ A uniform translation has to happen in the shader: either a vertex variant
 keyed on the framebuffer height, recompiled on every resize for every shader,
 or a uniform read by every vertex shader in the driver. Both are real costs
 for one pixel. Left alone, with the measurement written down.
+
+### `dlist-degenerate`: a lead, localised but not solved
+
+The animation floor put this one squarely in the real column: RMSE 0.335
+against llvmpipe with the driver's own two frames identical. llvmpipe draws a
+white square; gex_wgpu draws nothing at all and Mesa reports
+`GL_INVALID_OPERATION in glEnd`.
+
+What is known, and it is worth having:
+
+- **It is not the Mesa version.** The same build of this tree, with
+  `GALLIUM_DRIVER=softpipe`, draws the square. Only the driver differs.
+- **The display list comes out empty.** Instrumenting `compile_vertex_list`:
+  softpipe reaches it with `verts=3`, gex_wgpu with `verts=0`, and neither has
+  `out_of_memory` set. `total_vert_count` is `prims[last].start +
+  prims[last].count - prims[0].start`, so a zero means the last primitive's
+  `count` was never filled in.
+- **`vbo_save_NotifyBegin` runs identically** under both -- `mode=0x9`
+  (GL_POLYGON), `start=0`.
+- **`_save_End` runs under neither**, which is the odd part: softpipe still
+  ends up with `count=3`, so something else closes the primitive there.
+- **The application cannot be branching.** `objdump -T` shows it calls no
+  GL query at all -- glBegin, glVertex2f, glEnd, glNewList, glEndList,
+  glCallList and matrix calls, and nothing else. Identical calls, identical
+  Mesa, different result.
+- **It is not a timeout artefact**: 25 seconds behaves like 6.
+
+So the divergence is inside Mesa's vbo save path and is driven by something
+the driver supplies -- a cap, or a callback -- rather than by anything the
+application does. `GEX_DLIST_LOG` is gone from the tree; re-add the two
+`fprintf`s at `compile_vertex_list` and `vbo_save_NotifyBegin` to pick this up
+where it was left.
+
+Worth remembering that the earlier work here (the two NULL guards in
+`vbo_save_api.c`) turned this program from a crash into a silent blank. That
+was the right call for the crash -- a null dereference inside `glEndList`
+takes the application with it -- but the blank is this bug, not that fix.
