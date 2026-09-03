@@ -10085,3 +10085,127 @@ carries a comment about exactly this ("Unconditionally, and outside the branch
 below"), and it was reintroduced somewhere new. **A finite value belongs on
 every dictionary field the browser will read, whether or not the op that uses
 it is set** -- and native Dawn cannot be trusted to say so.
+
+## GL 4.3, and what Blender says next
+
+    OpenGL core profile version string: 4.3 (Core Profile)
+    OpenGL core profile shading language version string: 4.30
+
+Blender 5.2 now gets past its version gate, compiles every shader it has, and
+reports its own two remaining requirements. That is the useful outcome: the
+question moved from "what version" to "which capability".
+
+Landed to get here:
+
+- **`ARB_viewport_array`** (6/6) and with it **`ARB_fragment_layer_viewport`**.
+- **`ARB_texture_view`** (5/6).
+- **Shader storage atomics** (7/7), which were a hole in a claim already made.
+- **GLSL 4.30** as the cap, and **the texture limits taken from the device**.
+- A **Tint crash** on non-finite constants, fixed in ntv.
+
+### One viewport is not an approximation; routing is the only gap
+
+GL rasterizes a primitive with no shader-written `gl_ViewportIndex` through
+viewport **zero**, so a driver with WebGPU's single viewport is *correct* for
+every program that does not route -- which is nearly all of them. The other
+fifteen slots still have to be **stored**, because st sets every slot at
+context setup and refusing them is not a missing feature but a dead context.
+
+Routing is implemented too: `gex_wgpu_gs_route_viewports` reads the geometry
+pass's index list and the viewport slot each triangle asked for back off the
+GPU, **sorts the triangles by viewport**, and draws them in runs with each
+viewport installed in turn. Same trade as the tessellator's level readback,
+conditioned on the shader actually writing the index.
+
+The trap: `gl_ViewportIndex` and `gl_Layer` are shader *outputs* but not
+varyings, and handing them to the passthrough vertex shader fails outright --
+ntv recomputes a varying's `@location` from its slot, so `VARYING_SLOT_VIEWPORT`
+becomes `@location(23)`, past WebGPU's sixteen inter-stage locations. They keep
+their place in the vertex buffer (the routing reads one of them from there) and
+are excluded from the passthrough. That is the same trap `gl_PointCoord` hit at
+`VARYING_SLOT_PNTC`.
+
+### Texture views: everything but cross-type formats
+
+A `GPUTextureView` carries its own `dimension`, base layer and layer count, so
+level ranges, layer ranges and *target* reinterpretation map straight across --
+one array layer as a 2D texture, a cube map's faces as an array, an array's
+layers as a cube. What WebGPU has no form of is a view format outside the
+texture's own sRGB pair, so an `RGBA8UI` view of an `RGBA8` texture is refused
+by name (5/6 on the probe, and the sixth case is exactly that).
+
+The guards had to move from the *texture's* target to the **view's**: a
+one-layer view of an array is a 2D view whose single layer is whichever one it
+names, and demanding layer zero of it refused the case the extension exists for.
+
+### Storage atomics were a hole in a claim already made
+
+`ARB_shader_atomic_counters` has been advertised since storage buffers landed
+-- st derives it from them -- and any shader using an atomic failed to link.
+`gl44-ssbo-atomic-probe` is 7/7 including GL's own atomic counters and a mixed
+plain-store-plus-atomic-add on one buffer.
+
+The lowering is small because ntv was already ready: `nir_intrinsic_ssbo_atomic`
+becomes the **deref form** of itself on the flattened word array, and Tint's
+SPIR-V reader turns a variable an `OpAtomic` addresses into `atomic<u32>`,
+which is the only shape WGSL has. Nothing in the driver has to know which
+operation it is -- the `ATOMIC_OP` index travels across unchanged.
+
+### The texture limits decide the GL version
+
+`_mesa_compute_version`'s 4.1 rung requires `MaxTextureSize >= 16384`,
+`MaxRenderbufferSize >= 16384`, `MaxCubeTextureLevels >= 15` and
+`MaxArrayTextureLayers >= 2048`. None is an extension. WebGPU *guarantees*
+8192 and 256 layers, and the driver was reporting the guarantee -- so it was
+capped at GL 4.0 however many extensions it implemented, and no amount of
+feature work would have moved it.
+
+The device is now asked for 16384 and 2048 at creation and the caps follow
+what it granted, so **the reported GL version is device-dependent**: this
+machine reports 4.3, a device stuck at the WebGPU floor reports 4.0. That is
+what every hardware Mesa driver does, and the alternative is claiming a size
+the device will reject at allocation.
+
+`tests/gl-version-ladder.sh` reports these limits per rung now. It had said
+"GL 4.3 complete" while glxinfo said 4.0, because it only read the
+`extensions->` terms of a conjunction -- an incomplete reading of a rung is
+worse than no reading, so it prints the numeric requirements too.
+
+### The Tint fix worth remembering: no non-finite constants
+
+Blender writes `gl_Position = vec4(uintBitsToFloat(0x7FC00000u))` to discard a
+primitive -- a NaN position fails every clip comparison. **WGSL has no
+non-finite literal**, and Tint rejects any *constant expression* evaluating to
+one. At first it did worse than reject:
+
+    tint/lang/core/constant/scalar.h:59 internal compiler error:
+    TINT_ASSERT(std::isfinite(v.value))
+
+...which killed the whole process during Blender's shader compilation.
+
+Emitting the value as an integer constant plus `OpBitcast` is **not enough**:
+Tint folds the bitcast and rejects the result. A NaN produced at *run time* is
+perfectly legal, so `emit_unfoldable_zero` in ntv creates a function-local
+`u32` variable, stores zero into it, loads it back, and ORs it into the bit
+pattern -- a `var` in WGSL is not a constant expression. Every component of a
+vector has to go through it, because one constant component would let the whole
+composite fold again.
+
+### What Blender wants next
+
+    Warning: Unsupported platform as it supports max 8 SSBO binding locations
+    Error: The OpenGL implementation doesn't support ARB_shader_draw_parameters
+    Blender - Platform Unsupported
+
+`ARB_shader_draw_parameters` is the hard one: `gl_BaseVertexARB`,
+`gl_BaseInstanceARB` and `gl_DrawIDARB`. WGSL has no builtin for any of them --
+`instance_index` counts from `firstInstance`, which this driver folds into the
+vertex buffer offsets, so the base is not derivable in the shader. All three
+are per-draw scalars the driver already knows, so the answer is a driver-owned
+uniform the vertex module reads, not a shader variant keyed on the values.
+
+The SSBO count is a warning, not the refusal. st reserves *half* of
+`max_shader_buffers` for atomic counter buffers, so the device's ten became
+five blocks; the cap now claims twice the device budget, which yields eight.
+Blender wants more than eight, which the device's ten cannot give under that
+split.

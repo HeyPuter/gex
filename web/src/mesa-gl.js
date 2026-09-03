@@ -153,6 +153,25 @@ export class MesaGlDevice {
         // sample, so any wider attachment set fails on it -- GL 3.2 wants
         // eight draw buffers of whatever format the application chose.
         maxColorAttachmentBytesPerSample: 64,
+        // Compute, which the native path has asked for since GL compute
+        // landed and this one did not: st/mesa gates ARB_compute_shader behind
+        // a granted maxComputeInvocationsPerWorkgroup of 1024 and WebGPU's
+        // default is 256, so the browser was the only place the extension
+        // could silently be missing.
+        maxComputeInvocationsPerWorkgroup: 1024,
+        maxComputeWorkgroupSizeX: 1024,
+        maxComputeWorkgroupSizeY: 1024,
+        maxComputeWorkgroupSizeZ: 64,
+        maxComputeWorkgroupStorageSize: 32768,
+        // Textures, because the reported *GL version* depends on them and
+        // nothing else does: the 4.1 rung of _mesa_compute_version requires a
+        // 16384 texture and 2048 array layers, where WebGPU guarantees 8192
+        // and 256. A browser whose adapter offers more reports GL 4.3; one
+        // that does not reports 4.0.
+        maxTextureDimension1D: 16384,
+        maxTextureDimension2D: 16384,
+        maxTextureDimension3D: 2048,
+        maxTextureArrayLayers: 2048,
       };
       const requiredLimits = {};
       for (const [limit, wanted] of Object.entries(want)) {

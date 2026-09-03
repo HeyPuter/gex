@@ -45,6 +45,21 @@ for rung in 4_0 4_1 4_2 4_3 4_4 4_5 4_6; do
   for e in $want; do
     grep -qx "GL_$e" "$LIST" || missing="$missing $e"
   done
+  # And a set of numeric limits (`consts->MaxTextureSize >= 16384` and its
+  # kind), which are not extensions and not the GLSL level. Missing those is
+  # exactly how this script once reported GL 4.3 complete against a driver
+  # that glxinfo said was 4.0: a rung is a conjunction, and an incomplete
+  # reading of it is worse than no reading.
+  limits=$(awk -v tag="const bool ver_$rung = " '
+    index($0, tag) {on=1}
+    on && /^   const bool ver_[0-9]_[0-9] = / && !index($0, tag) {exit}
+    on {print}' "$VERSION_C" |
+    grep -oE 'consts->[A-Za-z0-9_]+(\[[A-Z_]+\])?\.?[A-Za-z0-9]* >= [0-9]+' |
+    grep -v GLSLVersion | sed 's/consts->//; s/ >= /=/')
+  for l in $limits; do
+    missing="$missing need:$l"
+  done
+
   # Each rung also demands a GLSL level (`consts->GLSLVersion >= N`), read
   # from the driver's `glsl_feature_level` cap *before* Mesa clamps the level
   # down to the granted GL version -- so it is a real requirement that no
@@ -55,7 +70,7 @@ for rung in 4_0 4_1 4_2 4_3 4_4 4_5 4_6; do
     on && /^   const bool ver_[0-9]_[0-9] = / && !index($0, tag) {exit}
     on {print}' "$VERSION_C" |
     grep -oE 'GLSLVersion >= [0-9]+' | grep -oE '[0-9]+$' | head -1)
-  if [ -n "$glsl" ] && [ "$glsl" -gt "${GEX_GLSL_LEVEL:-400}" ]; then
+  if [ -n "$glsl" ] && [ "$glsl" -gt "${GEX_GLSL_LEVEL:-430}" ]; then
     missing="$missing GLSL$glsl"
   fi
   n=$(echo $missing | wc -w)
@@ -66,8 +81,11 @@ for rung in 4_0 4_1 4_2 4_3 4_4 4_5 4_6; do
 done
 # The driver's own GLSL cap, which the rungs above are measured against.
 # GEX_GLSL_LEVEL overrides it for a what-if.
+printf -- '--- the need:X=N entries are numeric limits from the same rung, not\n'
+printf -- '    extensions: check them against glxinfo -l. They are listed\n'
+printf -- '    unconditionally because this script cannot query them.\n'
 printf -- '--- driver glsl_feature_level: %s (Mesa then clamps the usable\n' \
-  "${GEX_GLSL_LEVEL:-400}"
+  "${GEX_GLSL_LEVEL:-430}"
 printf -- '    #version to the granted GL version, so a 400 cap in a 3.3\n'
 printf -- '    context still compiles nothing above 3.30)\n'
 rm -f "$LIST"
