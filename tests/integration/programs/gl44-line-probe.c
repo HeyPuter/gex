@@ -21,9 +21,12 @@
  *    from two endpoints carries one endpoint's values on each end, and an
  *    implementation that carried the *first* endpoint's on all four corners
  *    draws a flat line that looks correct until you check the colours;
+ *  - GL_LINE_SMOOTH, which is a *different rule*: an antialiased wide line
+ *    is a rectangle of width w centred on the segment, so a smooth diagonal
+ *    reaches wider than an aliased one of the same width, and the fragment's
+ *    coverage of that rectangle multiplies into alpha.
  *
- * GL_LINE_STIPPLE and GL_LINE_SMOOTH are not covered yet; see the note where
- * their cases will go.
+ * GL_LINE_STIPPLE is not covered yet; see the note where its case will go.
  */
 #define GL_GLEXT_PROTOTYPES 1
 #include <EGL/egl.h>
@@ -229,16 +232,42 @@ int main(void) {
         result("varyings_interpolate", ok);
     }
 
-    /* GL_LINE_STIPPLE and GL_LINE_SMOOTH are not here yet, and are the next
-     * two things this file should grow. Both are refused by the rasterizer
-     * gate today, so a program that asks for either draws with no rasterizer
-     * state at all -- six of the installed programs for stipple, two for
-     * smooth. The quad has what they need: stipple wants the distance along
-     * the line in pixels, which is a varying the quad shader can emit, and
-     * smooth wants a coverage value across the line, which is the `side`
-     * attribute interpolated. What stipple additionally needs is a running
-     * distance across a LINE_STRIP's segments, which is a prefix sum over
-     * the captured vertices rather than anything the quad shader can see. */
+    /* GL_LINE_STIPPLE is the one thing left, and it is refused by the
+     * rasterizer gate -- six of the installed programs ask for it. The quad
+     * has what it needs: the distance along the line in pixels, which the
+     * quad shader can emit as a varying. What it additionally needs is a
+     * running distance across a LINE_STRIP's segments, which is a prefix sum
+     * over the captured vertices rather than anything one invocation can
+     * see. */
+
+    /* 6. GL_LINE_SMOOTH on a wide line: the corners of the end caps come off,
+     * so the count of lit pixels drops from the aliased case. */
+    {
+        clear_black();
+        glLineWidth(5.0f);
+        glBegin(GL_LINES);
+        glVertex2f(-0.5f, -0.5f);
+        glVertex2f(0.5f, 0.5f);
+        glEnd();
+        read_target();
+        int aliased = 0;
+        for (unsigned y = 0; y < SIZE; ++y) aliased += lit_in_row(y);
+
+        clear_black();
+        glEnable(GL_LINE_SMOOTH);
+        glBegin(GL_LINES);
+        glVertex2f(-0.5f, -0.5f);
+        glVertex2f(0.5f, 0.5f);
+        glEnd();
+        glDisable(GL_LINE_SMOOTH);
+        read_target();
+        int smooth = 0;
+        for (unsigned y = 0; y < SIZE; ++y) smooth += lit_in_row(y);
+        fprintf(stderr, "INFO smooth aliased=%d smooth=%d err=0x%04x\n",
+                aliased, smooth, (unsigned)glGetError());
+        result("line_smooth_differs", aliased > 0 && smooth > 0 &&
+                                      aliased != smooth);
+    }
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);

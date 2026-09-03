@@ -8520,12 +8520,41 @@ passes included -- and it would show as the first such draw after a state
 change reading stale or zero uniforms. Geometry shaders got away with it
 because something else had usually flushed the ring by the time they ran.
 
-**Not yet: GL_LINE_STIPPLE and GL_LINE_SMOOTH**, both still refused by the
-rasterizer gate -- six installed programs for stipple, two for smooth. The
-quad has what they need. Smooth wants a coverage value across the line, which
-is the `side` attribute interpolated, and a fragment variant that multiplies
-alpha by it -- `nir_lower_point_smooth` is the shape. Stipple wants the
-distance along the line in pixels, which the quad shader can emit for `LINES`
+### GL_LINE_SMOOTH, which is a different rule
+
+An *antialiased* wide line is not the same shape as an aliased one. GL
+rasterises the aliased one as w copies along the minor axis, and the
+antialiased one as **a rectangle of width w centred on the segment** -- so a
+smooth five-pixel diagonal reaches wider in x than an aliased one, which
+llvmpipe's footprints show plainly (`6,6..25,25` against `8,6..23,25`). The
+quad shader therefore takes a perpendicular offset when smoothing and an
+axis-aligned one when not; since it is generated per varying layout *and* per
+smooth location, that is a compile-time branch rather than a runtime one.
+
+Coverage rides on one extra varying: `side` scaled by the widened half-width,
+which interpolates to the fragment's distance from the line's centre in
+pixels, with the original half-width in the second component (both endpoints
+carry the same value, so it interpolates to a constant the fragment stage can
+use -- baking it in would key a variant on the line width, and applications
+change that). The fragment variant multiplies it into alpha, which is what GL
+specifies and what only shows where the program blends; the *shape* changes
+regardless, because the quad is a pixel wider.
+
+Two caps traps, both of which cost a debugging round:
+
+- **`max_line_width_aa` and `max_point_size_aa` are separate caps.** Raising
+  only `max_line_width` left st/mesa clamping a smooth line back to one pixel,
+  so GL_LINE_SMOOTH produced a two-pixel line where the aliased path produced
+  five -- the expansion working perfectly on a width of 1.
+- **`ctx->line_smooth_location` had to be initialised to `~0u`.** Zero is a
+  valid varying location, and the zero CALLOC leaves had every fragment
+  variant believe a coverage varying was in play: an input declared at
+  location 0, that slot marked produced, and alpha multiplied by whatever was
+  there. Nineteen native probes went from identical-to-llvmpipe to failing in
+  a single build, which is exactly what that gate is for.
+
+**Not yet: GL_LINE_STIPPLE**, still refused -- six installed programs. The
+quad shader can emit the distance along the line in pixels for `LINES`
 directly; for a `LINE_STRIP` the counter runs on across segments, which is a
 prefix sum over the captured vertices and therefore another small compute
 pass.
