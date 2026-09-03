@@ -9235,3 +9235,73 @@ this never ran**, because a mechanical "replace the first occurrence" edit put
 it in the wrong one of three near-identical builders. The rejected SPIR-V hex
 the driver already dumps is what actually named it -- `spirv-dis` on it took
 one command and no rebuild.
+
+## Wide and smooth lines from an indexed draw
+
+The wide-line rewrite took **non-indexed draws only**, and its guard said so in
+one clause -- `!info->index_size` -- with no decline message, so it was silent.
+The consequence was larger than it looks: `glLineWidth`, `GL_LINE_SMOOTH` and
+`GL_LINE_STIPPLE` did nothing at all for *any* indexed line draw, which
+includes every outline `glPolygonMode`'s unfilled rewrite emits, and which is
+how most real programs draw lines.
+
+The reason for the restriction was structural. The rewrite binds the capture
+buffer twice as instance-step vertex buffers, at offset 0 and one record
+further in, so a segment's two endpoints have to be a fixed distance apart in
+it -- true of a non-indexed draw by construction. The capture already had the
+answer for indexed ones: `gex_wgpu_capture_layout.index_table`, a slot table of
+one already-resolved vertex number per captured slot, which the
+transform-feedback capture has used all along. With it the capture buffer comes
+out in *draw* order and the premise holds again.
+
+The two cases added to `gl44-line-probe.c` compare an indexed draw against the
+same line drawn directly -- identical geometry has to give an identical pixel
+count whichever way it is submitted -- with indices deliberately out of order
+and starting away from zero, so a capture that ignored them and walked the
+vertices in order draws a different line and is caught. 9/9, with the indexed
+wide line byte-identical to llvmpipe.
+
+### The collision underneath
+
+None of it worked at first: every captured position came back `(0,0,0,0)`.
+
+    #define GEX_WGPU_CAPTURE_INDEX_BINDING (GEX_WGPU_CAPTURE_PARAMS_BINDING + 1)
+    #define GEX_WGPU_VARYING_OUT_BINDING   (GEX_WGPU_CAPTURE_PARAMS_BINDING + 1)
+
+**The same number.** Nothing noticed while no shader declared both: the
+transform-feedback capture has an index table and no varying output, the
+varying capture had a varying output and no index table. Teaching the line
+rewrite to take indexed draws made one shader declare both, and the capture
+then read its vertex numbers out of the buffer it was writing varyings into.
+`VARYING_OUT` moves to `+ 2`.
+
+Worth recording how it was found, because three plausible theories were wrong
+first -- a read-only/writable binding mismatch, a buffer created with the wrong
+usage, and `num_ssbos` not covering the binding. What settled it was dumping
+the capture variant's NIR and reading the declarations:
+
+    decl_var ssbo ... gex_capture_index#1 gex_capture_index (0, 0, 29)
+    decl_var ssbo ... gex_varying_out#2   gex_varying_out   (0, 0, 29)
+
+The binding numbers are printed right there. **Dump the shader before
+theorising about the shader.** The first dump attempt looked at the wrong
+capture -- the facing filter's, which legitimately has no index block and runs
+first -- so read the *second* variant when a draw takes two captures.
+
+### A note on measuring `tri-unfilled-smooth`
+
+Its outline is now antialiased, as GL asks, where before `GL_LINE_SMOOTH` was
+ignored. Against llvmpipe it scores *worse* for it -- 0.0690 to 0.0781 --
+because our smooth coverage differs from llvmpipe's by about 3% (144 lit
+pixels against 148 on the probe's diagonal), and a wrong-but-present outline
+costs more RMSE than an aliased one. The driver is more correct and the number
+is larger; the probe is the signal here, not the ranking.
+
+The comparison harness also reported 0.239 for the same build that direct
+capture reproduces at 0.0781 eight runs out of eight. Its image is a **partial
+frame** -- both outlines drawn, the fill not yet -- and its `self` column said
+so at 0.2255 in an earlier run, which was read as animation noise and was not.
+`self > 0` means *unmeasurable*, whatever the cause: an animated program, or a
+program slow enough that a fixed delay lands mid-frame. The facing filter's
+readback is a full GPU stall per unfilled draw, which makes the second case
+more likely for polygon-mode programs than it used to be.

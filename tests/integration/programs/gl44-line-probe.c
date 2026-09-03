@@ -304,6 +304,65 @@ int main(void) {
                                       aliased != smooth);
     }
 
+    /* The same wide and smooth lines from an *indexed* draw.
+     *
+     * The rewrite that makes a wide line a quad runs the vertex shader as
+     * compute and binds the capture buffer twice as instance-step vertex
+     * buffers, which needs a segment's two endpoints a fixed distance apart
+     * in it -- true of a non-indexed draw by construction and of an indexed
+     * one only once the capture goes through a slot table. It took
+     * non-indexed draws only for that reason, so glLineWidth, GL_LINE_SMOOTH
+     * and GL_LINE_STIPPLE silently did nothing for every indexed line draw,
+     * which includes everything glPolygonMode's unfilled rewrite emits.
+     *
+     * The indices are deliberately out of order and start away from zero, so
+     * a capture that quietly ignored them and walked the vertices in order
+     * would draw a different line and be caught. The comparison is against
+     * the same line drawn non-indexed: identical geometry has to give an
+     * identical pixel count whichever way it is submitted. */
+    {
+        static const float verts[12] = {
+            0.0f, 0.0f,      /* 0: unused, so index 0 is not the answer */
+            0.5f, 0.5f,      /* 1: the far end */
+            0.0f, 0.0f,      /* 2: unused */
+            -0.5f, -0.5f,    /* 3: the near end */
+            0.0f, 0.0f, 0.0f, 0.0f,
+        };
+        static const unsigned short indices[2] = {3, 1};
+
+        for (int smooth = 0; smooth < 2; ++smooth) {
+            clear_black();
+            glLineWidth(5.0f);
+            if (smooth) glEnable(GL_LINE_SMOOTH);
+            glBegin(GL_LINES);
+            glVertex2f(-0.5f, -0.5f);
+            glVertex2f(0.5f, 0.5f);
+            glEnd();
+            read_target();
+            int direct = 0;
+            for (unsigned y = 0; y < SIZE; ++y) direct += lit_in_row(y);
+
+            clear_black();
+            glEnableClientState(GL_VERTEX_ARRAY);
+            glVertexPointer(2, GL_FLOAT, 0, verts);
+            glDrawElements(GL_LINES, 2, GL_UNSIGNED_SHORT, indices);
+            glDisableClientState(GL_VERTEX_ARRAY);
+            read_target();
+            int indexed = 0;
+            for (unsigned y = 0; y < SIZE; ++y) indexed += lit_in_row(y);
+            if (smooth) glDisable(GL_LINE_SMOOTH);
+
+            const GLenum error = glGetError();
+            fprintf(stderr, "INFO indexed_%s direct=%d indexed=%d err=0x%04x\n",
+                    smooth ? "smooth" : "wide", direct, indexed,
+                    (unsigned)error);
+            result(smooth ? "indexed_smooth_matches_direct"
+                          : "indexed_wide_matches_direct",
+                   error == GL_NO_ERROR && direct > 0 && indexed == direct);
+        }
+        glLineWidth(1.0f);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;
