@@ -12079,3 +12079,96 @@ application uses. Two atomic-counter cases are not worth that risk, and the
 refusal is loud. If a future pass wants it, the sound fix is to capture the
 block index **before** the driver's fixup overwrites `binding`, not to guess
 afterwards.
+
+## Three crashes the CTS found, and what they were (2026-09-03)
+
+Continuing the CTS work above. Every one of these killed the *application*
+rather than reporting anything, which is the failure mode this driver tries
+hardest to avoid.
+
+### A geometry shader may take points and emit triangles
+
+`KHR-GL44.texture_view.view_sampling` needs it, and so does every billboard,
+particle and impostor ever drawn. The path refused a shader whose input and
+output primitives were not the same class -- and the refusal was hiding a
+defect: `verts_per_input_prim` was derived from the **output** primitive,
+while its two other readers treat it as the input count (one derives the
+draw's topology from it, the other divides a vertex count by it). A
+points-in shader would have read three vertices per point. Separating the two
+is the fix, and `gl44-gs-point-expand-probe` is the proof -- two points, two
+quads, a pixel checked inside each *and* in the gap between them, with the
+tint carried through the geometry stage differently per point.
+
+### A tex instruction with no deref aborts the emitter
+
+Lifting that refusal immediately exposed the next layer: `emit_tex: Assertion
+'var' failed`, this time from a *tessellation control* shader compiled as
+compute. The combined-sampler split is what rebuilds those derefs, and it does
+not run on every path. `gex_wgpu_compile_nir` now checks and refuses by name,
+naming the stage, so the next path to need the split is a message rather than
+a core dump.
+
+### A vertex shader that samples cannot be run as compute
+
+Three `texture_view` cases were producing this:
+
+```
+The entry-point uses bindings in group 3 but [PipelineLayout] doesn't have a
+BindGroupLayout for this index
+```
+
+A vertex stage's texture and sampler live in descriptor set 3; a compute
+dispatch has one bind group, number zero. **An invalid compute pipeline makes
+the command buffer invalid**, so the submit fails and everything recorded with
+it is lost -- not just that pass. Two of the four callers of the
+varying-variant builder already checked for this and the geometry and
+tessellation paths did not; the transform-feedback capture has a builder of
+its own that did not either. Both builders check now, so every caller is
+covered.
+
+### Software fp64 crashed because int64 was never claimed
+
+This one is worth the whole section. The driver asks Mesa for
+`nir_lower_fp64_full_software` -- WGSL has no doubles, and Mesa can build them
+out of 64-bit integers -- but it never set `caps->int64`, and
+`src/compiler/glsl/float64.glsl` opens with
+`#extension GL_ARB_gpu_shader_int64 : require`. So Mesa's built-in source
+failed to compile, and `glsl_float64_funcs_to_nir` cloned the null shader
+*before* checking `CompileStatus`:
+
+```
+#0  nir_shader_clone (mem_ctx=0x0, s=0x0)
+#1  glsl_float64_funcs_to_nir
+#2  st_link_glsl_to_nir
+```
+
+A segmentation fault with nothing naming fp64 anywhere in it. Two fixes: the
+null dereference in Mesa (one reordering, so the failure becomes the
+diagnostic it was always meant to be), and `caps->int64 = true`, which is
+honest -- `lower_int64_options` already asks for every 64-bit integer
+operation to be expanded into 32-bit pairs, and that is the very machinery the
+fp64 lowering runs on.
+
+`KHR-GL44.vertex_attrib_binding` goes from a segfault with no results at all
+to 12/30, and **`KHR-GL44.gpu_shader_fp64.builtin` runs 478/650** -- software
+doubles work, where before any shader using one killed the process.
+
+### Tint aborts on an image shape WGSL has no type for
+
+GLSL has `imageCube`, `imageBuffer`, `image2DRect`, `image1DArray` and
+`image2DMS`. WGSL has exactly four storage textures: `texture_storage_1d`,
+`_2d`, `_2d_array`, `_3d`. This driver mapped every other shape to 2D **in its
+own tables** while the shader went on declaring the real one, so the layout
+and the module disagreed -- and Tint does not report that. It raises an
+internal compiler error building the `storage_texture` type, which aborts the
+process with SIGILL from inside its own destructor, with nothing in the
+backtrace naming the image.
+
+`gex_wgpu_image_view_dimension` now answers which shapes exist and both
+collection paths refuse the rest by name. `KHR-GL44.shader_image_load_store`
+runs to completion at 6/51 instead of aborting. `GEX_WGPU_IMAGE_TRACE` lists a
+shader's images, which is what identified the three shapes involved.
+
+**The pattern across all five**: a driver limit expressed as "map it to
+something close and carry on" becomes an abort in a component that has no idea
+what GL is. Refusing by name costs a feature; guessing costs the process.
