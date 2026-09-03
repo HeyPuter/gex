@@ -237,6 +237,15 @@ const GLOBALS: &[(&str, u32)] = &[
     // implemented it and decorates itself regardless -- the same thing it does
     // under KWin, so it is the right answer there too, not a gap here.
     ("zxdg_decoration_manager_v1", 1),
+    // Wine's winewayland.drv binds wp_viewporter for every surface (it scales
+    // its window through a viewport) and zxdg_output_manager_v1 to learn the
+    // output's logical size -- without either it aborts display init before it
+    // ever binds a global or creates a surface, so winemine and every Wine GUI
+    // connects, does one roundtrip, and stops. The viewport is accepted and
+    // ignored (1x, buffer-sized); the xdg-output reports the same size as
+    // wl_output so Wine sees a monitor.
+    ("wp_viewporter", 1),
+    ("zxdg_output_manager_v1", 3),
 ];
 
 /// What an object id currently is.
@@ -265,6 +274,9 @@ enum Object {
     Subsurface { surface: u32 },
     DecorationManager,
     Decoration { surface: u32 },
+    Viewporter,
+    Viewport,
+    XdgOutputManager,
     /// An object whose requests we accept and ignore (data devices/sources,
     /// subsurfaces) -- present so GTK's init completes, does nothing observable.
     Stub,
@@ -551,7 +563,17 @@ impl Client {
     }
 
     fn send(&mut self, w: Writer) {
-        self.outbox.extend_from_slice(&w.finish());
+        let bytes = w.finish();
+        if Self::tracing() && bytes.len() >= 8 {
+            let obj = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+            let hdr = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            trace_out(&format!(
+                "[wl] <- object {obj} opcode {} ({} bytes)",
+                hdr & 0xffff,
+                hdr >> 16
+            ));
+        }
+        self.outbox.extend_from_slice(&bytes);
     }
 
     fn error(&mut self, object: u32, code: u32, message: &str) {
@@ -615,6 +637,56 @@ impl Client {
                 Object::Subsurface { surface } => self.subsurface(object, surface, opcode, &mut r),
                 Object::DecorationManager => self.decoration_manager(opcode, &mut r),
                 Object::Decoration { surface } => self.decoration(object, surface, opcode, &mut r),
+                Object::Viewporter => {
+                    // destroy(0); get_viewport(1, id, surface) -> a viewport
+                    // whose set_source/set_destination we accept and ignore.
+                    match opcode {
+                        1 => {
+                            if let Some(id) = r.new_id() {
+                                let _surface = r.object();
+                                self.objects.insert(id, Object::Viewport);
+                            }
+                            true
+                        }
+                        0 => {
+                            self.objects.remove(&object);
+                            self.delete_id(object);
+                            true
+                        }
+                        _ => true,
+                    }
+                }
+                Object::Viewport => {
+                    // destroy(0); set_source(1); set_destination(2).
+                    if opcode == 0 {
+                        self.objects.remove(&object);
+                        self.delete_id(object);
+                    }
+                    true
+                }
+                Object::XdgOutputManager => {
+                    // destroy(0); get_xdg_output(1, id, output) -> report the
+                    // output's logical geometry so Wine sees a monitor.
+                    match opcode {
+                        1 => {
+                            if let Some(id) = r.new_id() {
+                                let _output = r.object();
+                                self.objects.insert(id, Object::Stub);
+                                let (w, h) = self.default_size;
+                                self.send(Writer::new(id, 0).int(0).int(0)); // logical_position
+                                self.send(Writer::new(id, 1).int(w).int(h)); // logical_size
+                                self.send(Writer::new(id, 2)); // done
+                            }
+                            true
+                        }
+                        0 => {
+                            self.objects.remove(&object);
+                            self.delete_id(object);
+                            true
+                        }
+                        _ => true,
+                    }
+                }
                 Object::Seat => self.seat(opcode, &mut r),
                 Object::DataDeviceManager => {
                     // create_data_source(id) = 0, get_data_device(id, seat) = 1;
@@ -841,6 +913,12 @@ impl Client {
             }
             "zxdg_decoration_manager_v1" => {
                 self.objects.insert(id, Object::DecorationManager);
+            }
+            "wp_viewporter" => {
+                self.objects.insert(id, Object::Viewporter);
+            }
+            "zxdg_output_manager_v1" => {
+                self.objects.insert(id, Object::XdgOutputManager);
             }
             _ => return false,
         }
