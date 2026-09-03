@@ -9488,3 +9488,96 @@ respect is *format* -- WebGPU allows read_write storage on a narrow set
 (r32uint, r32sint, r32float) and write-only on a wider one -- so the honest
 shape is to advertise per-format support through `is_format_supported` with
 `PIPE_BIND_SHADER_IMAGE` rather than to claim GL's whole required list.
+
+## Image load/store, and GL compute working
+
+`GL_ARB_shader_image_load_store`, `GL_ARB_shader_image_size` and
+**`GL_ARB_compute_shader`** are all advertised and working now, on top of the
+storage buffers. Gates: `gl44-image-probe` 4/4 and
+`gl44-compute-ssbo-probe` 5/5, both identical to llvmpipe.
+
+### Compute shaders do not need GLSL 4.30
+
+The obvious reading of *"Compute shaders require GLSL 4.30 or GLSL ES 3.10"* is
+that the GLSL level has to be raised, which would mean accepting every GLSL
+4.30 feature. It does not. Mesa's rule is:
+
+    has_compute_shader() = ARB_compute_shader_enable || is_version(430, 310)
+
+So a compute shader asking for the extension by name compiles at GLSL 3.30.
+The pre-existing `gl44-compute-probe` uses `#version 430` and therefore cannot
+run here at all; `gl44-compute-ssbo-probe` asks for the extension instead,
+which is what makes compute usable at the level this driver reports.
+
+### Four things gated compute, none of them the dispatch
+
+The dispatch itself -- `launch_grid`, `create_compute_state`,
+`bind_compute_state`, `set_shader_buffers` -- was already written. What was
+missing:
+
+1. **`caps->compute`.** st_extensions reads it *before* it looks at
+   `compute_caps` at all, so the entire compute block was skipped however well
+   its own three gates were met.
+
+2. **`compute_caps` set after `gex_wgpu_init_caps`.** `u_init_pipe_screen_caps`
+   inside it resets every cap, so filling them earlier left
+   `max_threads_per_block` at zero with `ARB_compute_shader` off and all three
+   gates otherwise satisfied.
+
+3. **`MESA_SHADER_COMPUTE` in the shader-caps stage list**, which held
+   VERTEX, FRAGMENT and GEOMETRY only. A stage left out of that list does not
+   get "no features" -- it gets **zero**, and a zero `indirect_const_addr`
+   makes `st_glsl_to_nir` ask
+   `nir_lower_indirect_derefs_to_if_else_trees` to lower indirect access to
+   *storage blocks*. That pass asserts `start < end` on the runtime-sized
+   array a storage block is, so a compute shader indexing an SSBO crashed in
+   the compiler before reaching this driver.
+
+4. **The SSBO lowering, wired into `create_compute_state`.** That path does
+   not go through `gex_wgpu_lower_gallium_ubos`, so compute shaders reached the
+   SPIR-V emitter with raw `store_ssbo` and asserted. It also needs
+   `nir_opt_copy_prop` and `nir_opt_constant_folding` run first: a compute
+   shader arrives without the optimisation the graphics path gets, and the
+   block index was a `mov` of a constant -- `%21 = mov %19.x` -- which
+   `nir_src_is_const` does not see through, so the lowering refused an
+   ordinary shader.
+
+### Two things image load/store needed
+
+**The storage usage cannot be conditioned on `PIPE_BIND_SHADER_IMAGE`,
+because st/mesa never asks for it.** `st_cb_texture.c` creates every texture
+with `SAMPLER_VIEW | RENDER_TARGET`, and `glBindImageTexture` arrives long
+afterwards with no reallocation. So any single-sampled texture whose format
+WebGPU can take as a storage texture is given `StorageBinding` -- which is
+what a Vulkan driver does with `VK_IMAGE_USAGE_STORAGE_BIT` for the same
+reason. Without it the failure names the bind group, not the allocation:
+
+    [TextureView of Texture (8x8 px, R32Uint)] usage
+    (CopySrc|CopyDst|TextureBinding|RenderAttachment) doesn't include
+    TextureUsage::StorageBinding
+
+**A read-only image is a sampled texture binding, not a storage one.** Tint
+lowers a SPIR-V storage image that is only read to a plain `texture_2d<T>` --
+WGSL reads it with `textureLoad`, which needs no sampler -- and WebGPU then
+rejects a `storageTexture` layout against it by name:
+
+    Binding type in the shader (texture) doesn't match the type in the layout
+    (storageTexture).
+
+So the layout follows what the shader was compiled *into* rather than what GL
+called it. And an image used only for `imageSize()` is marked both
+`NonWritable` and `NonReadable` by `nir_opt_access`, which Tint refuses
+outright -- it is made read-only instead.
+
+The format restriction is real and is respected rather than papered over:
+WebGPU takes a narrow list as storage textures at all, and allows read_write
+on only the 32-bit single-channel three. A shader that reads *and* writes any
+other format is refused by name, and `is_format_supported` answers per format
+so st/mesa disables the rest.
+
+### Regression check
+
+The app sweep over 336 programs is **unchanged** across the storage-buffer
+work: RAN 284, REFUSED 2, CRASH 12, HARNESS 3, EXIT 19, OK 16, with zero
+movement in either direction. SuperTuxKart still renders correctly. The full
+probe sweep shows only the intended `quad` divergence.
