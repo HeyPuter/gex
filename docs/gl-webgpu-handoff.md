@@ -8874,3 +8874,131 @@ Worth knowing before someone spends an afternoon on it.
 
 So every remaining entry is either fixed, carrying a written-down lead, or a
 GL feature this backend has a stated reason not to have.
+
+## A reference can be wrong: the second-reference column
+
+The llvmpipe pixel comparison (`tests/gl-app-compare.sh`) had one reference,
+and a ranked list is only as good as the thing it ranks against. Two classes
+of false defect sit in it. The animation floor (`GEX_COMPARE_SELF=1`) retires
+the first: a program photographed twice by the same driver, which is how a
+spinning gear is told from a wrong pixel. `GEX_COMPARE_REF2=1` retires the
+second, which is a reference that is simply wrong, by photographing **softpipe**
+as well and reporting how far the two references are from each other.
+
+Read the columns as: `rmse` means nothing unless it is well above **both**
+`self` and `refdiff`.
+
+The program that forced this was `quad` -- four vertices, one `glBegin`, the
+most trivial thing in the whole sweep -- sitting at 0.24378 with an animation
+floor of zero, which is exactly what a real deterministic defect looks like.
+It is not one. `quad` and `quad-degenerate` scored identically because they
+are the same defect, and the defect is llvmpipe's:
+
+| program | gex vs llvmpipe | gex vs softpipe | llvmpipe vs softpipe |
+|---|---|---|---|
+| `quad`, `quad-degenerate` | 0.244 | 0.060 | **0.251** |
+| `cubemap` | 0.380 | -- | **0.551** |
+| `tri-viewport` | 0.162 | 0.228 | **0.164** |
+| `simplex-noise` | 0.149 | 0.207 | **0.172** |
+| `tri-fbo-tex-mip` | 0.276 | 0.276 | **0** |
+| `dlist-degenerate` | 0.335 | 0.335 | **0** |
+| `dlist-edgeflag` | 0.463 | 0.464 | **0.029** |
+
+Five of the nine deterministic entries at the top of the tail were the
+reference. The four that survived are the ones where the references agree to
+within 0.03 and the driver does not.
+
+### Why llvmpipe disagrees about a quad
+
+WebGPU has no quad topology, so a `GL_QUADS` draw becomes two triangles. Both
+diagonals cover the same pixels and give the same four corner colours, and
+only the interior differs -- so the wrong choice draws a quad that is the
+right shape, in the right place, with the right corners, and a transposed
+gradient. The centre pixel names the diagonal, because it lies on whichever
+one was chosen and takes the average of that diagonal's two endpoints.
+
+The GL spec leaves the subdivision implementation-dependent, so neither answer
+is a conformance failure. What matters is that llvmpipe is alone:
+
+    gl44-quad-probe   gex_wgpu 6/6   softpipe 6/6   radeonsi 6/6   llvmpipe 3/6
+
+A driver that does not advertise `MESA_PRIM_QUADS` -- which is every hardware
+driver, and this one -- has its quads converted by `u_primconvert`, whose
+`do_quad()` splits on **v1-v3** under GL's default last-vertex convention.
+llvmpipe advertises quads, keeps them to the `draw` module, and splits an
+immediate-mode quad on **v0-v2**. Its own display-list path splits on v1-v3,
+so it disagrees with itself between immediate mode and a display list.
+
+`tests/integration/programs/gl44-quad-probe.c` is the gate. It measures
+`GL_QUADS` in immediate mode, in a display list and through client arrays,
+plus `GL_QUAD_STRIP` and `GL_POLYGON`, and two quads in one `glBegin` so a
+converter that got the per-quad base wrong is caught. The `GL_QUAD_STRIP`
+expectation is measured rather than reasoned: all four drivers split a strip
+quad on v0-v3, which is not what the QUADS reasoning predicts.
+
+## Rendering into a mip level that is not the base
+
+`tri-fbo-tex-mip` was the top deterministic divergence that survived the
+second reference -- both references byte-identical, this driver different --
+and it was **two** separate bugs, both of which had been invisible because the
+ordinary case hides them.
+
+`tests/integration/programs/gl44-fbo-mip-probe.c` is the gate. It reads every
+level back with `glGetTexImage` rather than sampling, so a failure names the
+level that is wrong instead of the pixel.
+
+### 1. glClear cleared level zero
+
+`gex_wgpu_clear` reconstructed each attachment as a `pipe_surface` with
+`level = 0`, `first_layer = 0` at the resource's full `width0 x height0`, on a
+comment saying `set_framebuffer_state` had required exactly that. It had
+stopped being true: the framebuffer path keeps `color_levels[]` and
+`color_layers[]` and renders into any level and layer, and its struct comment
+says why -- "rendering a mip chain is how SuperTuxKart builds its lightmaps".
+
+So a `glClear` on a framebuffer whose attachment is mip level 4 of a 512x512
+texture cleared **level 0 at 512x512** -- wiping the base level and leaving the
+level being drawn into untouched. It did not fail, because clearing level zero
+at its own full size is a perfectly valid clear of the wrong thing.
+
+The colour helper already handled this; only the caller lied to it. The depth
+helper did not, and fixing the caller exposed that: `gex_wgpu_clear_depth_stencil`
+guarded on `dst->level != 0 || dst->first_layer != 0` while its own body built
+its view from `dst->level` and `dst->first_layer`, with a comment explaining
+that one layer of a depth array is exactly what a cascaded shadow map
+attaches. Nothing had ever reached the mismatch. Passing the real layer turned
+a silent clear of the wrong cascade into a latched context, and `depth-array`
+went from 8/8 to 4/8 with `GL_OUT_OF_MEMORY` -- which is what `gex_fail`
+becomes in st/mesa. The guard now matches the body.
+
+### 2. The feedback-loop detector ate mipmap generation
+
+The larger one. `gex_wgpu_feedback_snapshot` exists because a draw cannot
+sample a texture it also renders to -- WebGPU rejects the whole command buffer
+-- so the driver snapshots the attachment and samples the copy instead. The
+trigger compared **resource identity only**:
+
+    if (ctx->colors[c] && ctx->sampler_views[slot]->texture == ctx->colors[c])
+
+`util_gen_mipmap` generates a chain as a run of blits from level n to level
+n+1 of one texture. Every one of them is the same resource on both sides, so
+every one was diverted to the snapshot -- and the snapshot is a copy of
+**level 0**, at level 0's dimensions. A chain generated from a non-zero
+`GL_TEXTURE_BASE_LEVEL` therefore came out holding level 0 everywhere.
+
+Neither WebGPU nor GL calls this a feedback loop: both scope the rule to a
+*subresource*, so sampling one mip level while rendering into another is
+legal and needs no snapshot at all. The trigger now requires the attached
+level and layer to fall inside the sampled view's ranges, and the snapshot
+takes `sv->u.tex.first_level` at that level's size rather than level 0.
+
+**Why it survived so long, which is the transferable part.** The ordinary case
+generates from level 0, where the wrong source and the right one are the same
+texels -- so `generate_mipmap` passes whether or not the bug is there. The
+first version of this probe filled the base level with a flat colour and
+passed on a broken driver. Three colours are needed to see it: the readback
+after a failed generate is identical for "read level 0 instead of the base"
+and "the base fill leaked into the chain and the generate did nothing", and
+the level *below* the generate's range is the only thing that separates them.
+
+    tri-fbo-tex-mip   0.276008 -> 0.00045764   against both references

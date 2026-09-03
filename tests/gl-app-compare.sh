@@ -34,13 +34,32 @@ DELAY=${GEX_COMPARE_DELAY:-5}
 # the driver's own two images are apart -- the animation floor, below which a
 # difference from llvmpipe says nothing.
 SELF=${GEX_COMPARE_SELF:-}
+# GEX_COMPARE_REF2=1 photographs softpipe as a *second reference* and reports
+# how far the two references are from each other.
+#
+# The animation floor retires one class of false defect; this retires the
+# other, which is a reference that is simply wrong. llvmpipe advertises
+# MESA_PRIM_QUADS and splits an immediate-mode quad on the opposite diagonal
+# from softpipe, radeonsi and this driver, so `quad` and `quad-degenerate`
+# scored 0.244 while being correct -- and the two references disagree with
+# each other by 0.251, more than the driver disagrees with either. Four of the
+# nine deterministic entries at the top of the tail turned out to be this:
+# `quad`, `quad-degenerate`, `tri-viewport` and `simplex-noise`. The three
+# that survived it -- `tri-fbo-tex-mip`, `dlist-degenerate`, `dlist-edgeflag`
+# -- are the ones where the references agree to within 0.03 and the driver
+# does not, and the first of those was two real driver bugs.
+#
+# Read the columns as: rmse means nothing unless it is well above both self
+# and refdiff. Off by default because it is another run per program, and
+# softpipe is slow enough to need a longer window.
+REF2=${GEX_COMPARE_REF2:-}
 export DISPLAY=${GEX_DISPLAY:-:77}
 
 [ -d "$INST/lib/dri" ] || { echo "no driver at $INST/lib/dri" >&2; exit 2; }
 xdpyinfo >/dev/null 2>&1 || { echo "no X display at $DISPLAY" >&2; exit 2; }
 mkdir -p "$OUT"
 : > "$OUT/results.tsv"
-printf 'app\trmse\tself\tnote\n' >> "$OUT/results.tsv"
+printf 'app\trmse\tself\trefdiff\tnote\n' >> "$OUT/results.tsv"
 
 # A program is photographed by its own window. With no window manager the
 # window's name is whatever the program set, which is usually its argv[0] and
@@ -48,9 +67,9 @@ printf 'app\trmse\tself\tnote\n' >> "$OUT/results.tsv"
 # instead, which is right for the single-window programs this list holds.
 shoot() {
     local driver=$1 out=$2 app=$3
-    if [ "$driver" = llvmpipe ]; then
-        ( LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
-          timeout -s KILL $((DELAY + 10)) "$app" >"$out.log" 2>&1 & )
+    if [ "$driver" = llvmpipe ] || [ "$driver" = softpipe ]; then
+        ( LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=$driver \
+          timeout -s KILL $((DELAY + 20)) "$app" >"$out.log" 2>&1 & )
     else
         ( LD_LIBRARY_PATH=$INST/lib:$HOME/.cache/gex-dawn-native/pkg/lib \
           LIBGL_DRIVERS_PATH=$INST/lib/dri LIBGL_ALWAYS_SOFTWARE=1 \
@@ -138,9 +157,22 @@ while read -r app; do
         fi
         quiet_kill "$name"; sleep 1
     fi
-    printf '%s\t%s\t%s\t%s\n' "$name" "${rmse:--}" "${self:--}" "$note" \
-        >> "$OUT/results.tsv"
-    printf '%-32s %-10s %-10s %s\n' "$name" "${rmse:--}" "${self:--}" "$note"
+    # The reference floor: llvmpipe against softpipe. A program whose two
+    # references disagree as much as the driver disagrees with either is not
+    # evidence of anything about the driver.
+    refdiff=
+    if [ -n "$REF2" ] && [ -z "$note" ]; then
+        if shoot softpipe "$OUT/$name-ref2.png" "$app"; then
+            refdiff=$(compare -metric RMSE "$OUT/$name-ref.png" \
+                      "$OUT/$name-ref2.png" null: 2>&1 \
+                      | sed -n 's/.*(\([0-9.e-]*\)).*/\1/p')
+        fi
+        quiet_kill "$name"; sleep 1
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${rmse:--}" "${self:--}" \
+        "${refdiff:--}" "$note" >> "$OUT/results.tsv"
+    printf '%-32s %-10s %-10s %-10s %s\n' "$name" "${rmse:--}" "${self:--}" \
+        "${refdiff:--}" "$note"
 done < "$LIST"
 
 echo
