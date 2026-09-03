@@ -2816,6 +2816,29 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                             r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7), r(8), r(9), r(10), r(11), r(12), r(13), r(14), r(15),
                             read_u64(data, c + ctx::NZCV)
                         );
+                        if let Some(a) = std::env::var_os("GEX_TRAP_MEM").and_then(|s| {
+                            let s = s.to_string_lossy().to_string();
+                            u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+                        }) {
+                            let a = a as usize;
+                            let mut mem = String::new();
+                            for k in (0..64usize).step_by(8) {
+                                if a + k + 8 <= data.len() {
+                                    mem.push_str(&format!(" [{:#x}]={:#x}", a + k, read_u64(data, a + k)));
+                                }
+                            }
+                            eprintln!("[trace-mem]{mem}");
+                        }
+                        if std::env::var_os("GEX_TRAP_STACK").is_some() {
+                            let sp = r(4) as usize;
+                            let mut stk = String::new();
+                            for k in (0..160usize).step_by(8) {
+                                if sp + k + 8 <= data.len() {
+                                    stk.push_str(&format!(" [sp+{k:#x}]={:#x}", read_u64(data, sp + k)));
+                                }
+                            }
+                            eprintln!("[trace-stack]{stk}");
+                        }
                     } else {
                         let regs: Vec<String> = (0..31u8).map(|i| format!("x{i}={:#x}", r(i))).collect();
                         eprintln!(
