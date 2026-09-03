@@ -10698,11 +10698,12 @@ problems, not driver ones; `compute` additionally stops earlier here because
 - **Compute shader images.** `max_shader_images` is fragment-only by design
   (`launch_grid` binds storage buffers and nothing else). Implementing them is
   the remaining piece of `ARB_shader_image_load_store` in compute.
-- **Sample counts are understated.** `gl44-texture-sampler-probe` reports
-  `sample-counts=1` against llvmpipe's 2 for an RGBA8 renderbuffer. WebGPU
-  offers 1 and 4, so the honest answer is two; an application that queries
-  this and finds one count will disable MSAA. Conservative rather than wrong,
-  but it is a real difference.
+- ~~**Sample counts are understated.**~~ Checked and withdrawn.
+  `st_QuerySamplesForFormat` counts the sample counts *above one* that the
+  driver accepts and only falls back to `{1}` when there are none, so our
+  answer of one entry is the list `{4}` -- correct, because WebGPU core offers
+  sample counts 1 and 4 and nothing else. llvmpipe's two entries are `{4, 2}`;
+  2x is the difference and it is a platform limit, not an under-report.
 - **The u_blitter fallback.** It silently produced black for the window blit.
   Declining, the way `gex_wgpu_blit` declines everything else it cannot do, is
   probably better than a fallback that can be wrong.
@@ -10820,3 +10821,85 @@ pointer where the bound buffer makes that argument an offset, so the host
 answers `GL_INVALID_OPERATION`. It needs the guest to notice the binding and
 send an offset instead. `ARB_query_buffer_object` is mostly used by profilers
 rather than by the applications being targeted, which is why it is last.
+
+## Krita: the driver draws it correctly and the window stays black
+
+Krita 6.0.3 is one of the named target applications and had not been checked
+at GL 4.4. It renders a black window on this driver. The useful part of this
+section is how much of that turned out *not* to be the driver, and the two
+real bugs found on the way.
+
+### First, a harness mistake worth naming
+
+`scratchpad/appshot.sh` takes the driver environment from its caller. Run
+without it, Krita drew perfectly -- on the *system* Mesa. Any app-sweep result
+is only about the driver whose environment was actually set, and the sweep's
+logs are worth checking for `gex-wgpu: native screen on Dawn` before being
+believed. (Of the 336 in the last sweep, 308 have it; the 28 without are
+Wayland compositors, KMS programs and X servers, which cannot run here at all.)
+
+### Two real driver bugs, neither of them the cause
+
+**One WebGPU device per process, not per screen.** Mesa builds a screen per X
+display connection, and a toolkit rendering on several threads opens several:
+Krita reaches five. `create_device` ran per screen, so each got its own device.
+That costs seconds of adapter and device creation each, and makes resource
+sharing across them impossible -- Qt shares GL contexts, `QOpenGLWidget`
+requires it, and a texture on one WebGPU device does not exist on another.
+Nothing reports that; the sharing just yields nothing. Now created once.
+
+**One drawable per screen, not one global.** The per-screen present state was a
+single global that the last screen created overwrote, so every other screen
+presented through that one's winsys and displaytarget, at that one's size. Now
+looked up by `pipe_screen`, which `flush_frontbuffer` is already handed.
+
+### Then three defects in the instruments
+
+Each of these sent the investigation somewhere wrong, which is the reason they
+are worth recording:
+
+- The present log reported **every thirtieth** present. Krita presents six, so
+  one line appeared, and "one present for six swaps" read as five dropped
+  frames. There were none. The first eight are now reported too.
+- The PPM dump wrote a texel's first three bytes as RGB. A window here is
+  BGRA, so every dumped frame had red and blue swapped -- which reads as a
+  driver colour bug in an otherwise correct picture.
+- Every early return in `flush_frontbuffer` was silent. Each now names itself.
+
+### What is actually true
+
+With the instruments fixed, the driver comes out clean:
+
+- `qtdiag6` reports `4.4 (Compatibility Profile)` through Qt on this driver,
+  with the right device string.
+- A Qt Quick scene (`qml6`) renders identically to softpipe -- 142 colours
+  against 141.
+- Krita makes **the same 39 GLX calls in the same order with the same return
+  values** on this driver and on softpipe, six `glXSwapBuffers` among them,
+  each preceded by a successful `glXMakeCurrent`. (`scratchpad/glxspy.c`
+  interposes them.)
+- Our `flush_frontbuffer` is called for all six, drops none, and the readback
+  of each is **Krita's complete interface** -- menus, panels, thumbnails,
+  text -- at 960x998, `mean=126`, pixel-comparable to the same run on
+  softpipe. The dumped frames are in the handoff's own record.
+- Every thread is idle in Qt's event loop afterwards. Krita is not stuck.
+- `glXQueryDrawable` reports the resized size correctly (checked against
+  softpipe with `scratchpad/qdrawable.c`), drawable resize works (glxgears
+  resized to 700x500 presents 700x500), and no resource or format was refused.
+
+So the driver draws the right pixels and hands them to the winsys, and they do
+not reach the X window. The hand-off code was read end to end --
+`drisw_swap_buffers` → `drisw_copy_to_front` → `drisw_present_texture` →
+`flush_frontbuffer` → `dri_sw_displaytarget_display` → `swrastXPutImage`, with
+its shm and non-shm paths -- and nothing in it is conditional on anything this
+driver does differently. glxgears goes through the identical path and works.
+
+**Not blocked in principle**: the next step is X-protocol-level tracing
+(`xtrace`, or an `XPutImage`/`XShmPutImage` interposer) to see whether the
+request is issued and what the server does with it. It stops here because
+every cheaper instrument has been exhausted and the two bugs above were the
+payoff. One difference worth starting from: softpipe renders *into* the
+winsys's own displaytarget, while this driver renders into a WebGPU texture
+and copies into a displaytarget of its own -- so if a drawable's images must
+come from the displaytarget the loader associated with it, that is where the
+asymmetry lies.
