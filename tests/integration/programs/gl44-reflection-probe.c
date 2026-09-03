@@ -4,6 +4,22 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Mesa's non-glvnd libGL exports a frozen legacy symbol list -- 1369 names in
+ * src/glx/libgl-symbols.txt -- and glGetProgramResourceLocationIndex is not on it, nor is it
+ * anywhere in the library. Linking it resolves against the system's glvnd
+ * libGL at build time and then dies at load against the driver's:
+ *
+ *   symbol lookup error: undefined symbol: glGetProgramResourceLocationIndex
+ *
+ * which took this probe's whole result with it, silently. Every real toolkit
+ * resolves modern entry points through glXGetProcAddress or eglGetProcAddress
+ * -- Minecraft's GLFW among them -- so do the same rather than depend on a
+ * list that has not moved since GL 4.3. */
+static GLint (*resolved_getprogramresourcelocationindex)(GLuint, GLenum, const char *);
+#define glGetProgramResourceLocationIndex resolved_getprogramresourcelocationindex
+static void (*resolved_shaderstorageblockbinding)(GLuint, GLuint, GLuint);
+#define glShaderStorageBlockBinding resolved_shaderstorageblockbinding
+
 #define CHECK(condition, message) do { \
     if (!(condition)) { fprintf(stderr, "reflection query failed: %s (line %d)\n", message, __LINE__); return __LINE__; } \
 } while (0)
@@ -33,6 +49,12 @@ int main(void) {
     EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, NULL);
     EGLSurface surface = eglCreatePbufferSurface(display, config, NULL);
     CHECK(eglMakeCurrent(display, surface, surface, context), "eglMakeCurrent");
+    resolved_getprogramresourcelocationindex = (GLint (*)(GLuint, GLenum, const char *))
+        eglGetProcAddress("glGetProgramResourceLocationIndex");
+    CHECK(resolved_getprogramresourcelocationindex != NULL, "glGetProgramResourceLocationIndex unavailable");
+    resolved_shaderstorageblockbinding = (void (*)(GLuint, GLuint, GLuint))
+        eglGetProcAddress("glShaderStorageBlockBinding");
+    CHECK(resolved_shaderstorageblockbinding != NULL, "glShaderStorageBlockBinding unavailable");
 
     const char *vertex_source =
         "#version 430 core\n"

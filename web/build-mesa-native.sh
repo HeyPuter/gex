@@ -48,5 +48,30 @@ if [ ! -f "$OUT/build.ninja" ]; then
         -Dbuild-tests=false
 fi
 ninja -C "$OUT"
+
+# Aliases for the names a dlopen-based toolkit asks for.
+#
+# This build is not glvnd, so it installs a plain libGL.so.1 with the whole
+# GLX implementation in it. That is enough for a program linked -lGL: the
+# loader resolves the SONAME out of LD_LIBRARY_PATH and gets ours. It is not
+# enough for one that dlopens GL at run time -- GLFW, SDL and Qt all do -- and
+# on a glvnd system /usr/lib/libGLX.so.0 is glvnd's dispatch, which loads its
+# *vendor* from /usr/lib and with it the distribution's Mesa. Two Mesa builds
+# then share one process, and our libGL's call to driCreateNewScreen3 binds to
+# the older one, which has no gex_wgpu driver in it:
+#
+#   glx: failed to create drisw screen
+#
+# Minecraft 26.2 fails exactly there, and reports it as "Driver does not
+# support OpenGL 3.3" -- which is not what happened. GLFW 3.5 asks for
+# libGLX.so.0 *before* libGL.so.1, so a file of that name next to ours, found
+# first on LD_LIBRARY_PATH, is the whole fix: one Mesa in the process, and
+# dlopen finds it whatever name it asks for.
+if [ -d "$OUT/inst/lib" ] && [ -e "$OUT/inst/lib/libGL.so.1" ]; then
+    for alias in libGLX.so.0 libOpenGL.so.0; do
+        ln -sfn libGL.so.1 "$OUT/inst/lib/$alias"
+    done
+fi
+
 echo "built: $OUT"
 find "$OUT" -name "libgallium_dri.so" -o -name "libGL.so*" | head -5

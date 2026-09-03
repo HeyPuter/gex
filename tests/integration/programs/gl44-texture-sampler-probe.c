@@ -5,6 +5,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Mesa's non-glvnd libGL exports a frozen legacy symbol list -- 1369 names in
+ * src/glx/libgl-symbols.txt -- and glGetInternalformativ is not on it, nor is it
+ * anywhere in the library. Linking it resolves against the system's glvnd
+ * libGL at build time and then dies at load against the driver's:
+ *
+ *   symbol lookup error: undefined symbol: glGetInternalformativ
+ *
+ * which took this probe's whole result with it, silently. Every real toolkit
+ * resolves modern entry points through glXGetProcAddress or eglGetProcAddress
+ * -- Minecraft's GLFW among them -- so do the same rather than depend on a
+ * list that has not moved since GL 4.3. */
+static void (*resolved_getinternalformativ)(GLenum, GLenum, GLenum, GLsizei, GLint *);
+#define glGetInternalformativ resolved_getinternalformativ
+
 #define CHECK(condition, message) do { \
     if (!(condition)) { \
         fprintf(stderr, "texture/sampler probe failed: %s (line %d, error=0x%x)\n", \
@@ -39,6 +53,9 @@ int main(void) {
     const EGLint pbuffer_attributes[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
     EGLSurface surface = eglCreatePbufferSurface(display, config, pbuffer_attributes);
     CHECK(eglMakeCurrent(display, surface, surface, context), "eglMakeCurrent");
+    resolved_getinternalformativ = (void (*)(GLenum, GLenum, GLenum, GLsizei, GLint *))
+        eglGetProcAddress("glGetInternalformativ");
+    CHECK(resolved_getinternalformativ != NULL, "glGetInternalformativ unavailable");
 
     GLint values[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
     glGetInternalformativ(GL_TEXTURE_2D, GL_RGBA8, GL_INTERNALFORMAT_SUPPORTED, 1, values);
