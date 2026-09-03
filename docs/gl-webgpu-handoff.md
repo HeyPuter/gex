@@ -11201,3 +11201,90 @@ count in the shader, and `ARB_cull_distance` and
 `ARB_conditional_render_inverted` need real implementations -- so the rung
 does not move by granting the cheap two, and granting a cap the driver does
 not honour would draw when it should not.
+
+## GL 4.5 is one extension away
+
+The ladder said 4.5 wanted five extensions plus GLSL450. Four of them landed
+this pass, each with a probe, and the fifth is the one that needs real work.
+
+### ARB_conditional_render_inverted -- and a claimed feature that latched
+
+`caps->conditional_render` was set, so Mesa advertised
+**ARB_conditional_render, which is GL 3.0** -- and `render_condition` failed
+the context for any query, on a comment that "queries do not exist here".
+True when written; not since occlusion queries landed. So an application that
+used a feature the driver claimed got `GL_OUT_OF_MEMORY` from every later
+call.
+
+It now stores the predicate and tests it before each draw (at the outermost
+level, so a draw the rewrite paths split stays one decision) and before a blit
+that asks for it. The convention is worth writing down because it is not
+obvious and getting it backwards inverts every conditional draw: **st passes
+`condition` true for GL's `*_INVERTED` modes, and the test is against the
+negation of "result is non-zero"**. `GEX_WGPU_CONDRENDER_LOG=1` prints each
+decision.
+
+Two bugs surfaced underneath, both wrong independently of conditional render:
+
+- **An occlusion query with no draws reported the previous query's count.**
+  The result is resolved from slot 0 of one `WGPUQuerySet`, which holds
+  whatever the last pass wrote -- so a query that counted nothing read back a
+  stale total (64 where 0 was right). Queries now record whether a pass ever
+  carried them. *Any* application using an occlusion query to decide whether
+  something is visible was affected.
+- **A draw with the scissor test enabled and no rectangle pushed was
+  refused.** st's `update_scissor` pushes only when the rectangle differs from
+  its own zero-initialised cache, so an *empty* scissor is never sent at all.
+  "Enabled and never pushed" therefore means an **empty box**, not GL's
+  default whole-window one -- an application that never calls `glScissor` gets
+  the window dimensions, which do differ from the cache and are pushed
+  normally. Getting this backwards (treating it as no scissoring) drew the
+  whole framebuffer and made the occlusion query above count 64.
+
+### ARB_texture_barrier / NV_texture_barrier
+
+`glTextureBarrier` promises that writes to a texture are visible to later
+reads, and `gex_wgpu_texture_barrier` already submitted everything recorded --
+which on a driver that orders every command on the WebGPU queue *is* that
+guarantee rather than an approximation of it. The cap was simply missing.
+
+The guest could not claim it, though: `gen_gl_extensions` claims an extension
+only when the guest exports its commands, and `glTextureBarrier` was not
+generated because the transport generator's command universe stopped at GL 4.4
+core. The universe now runs through 4.5 -- which widens the universe only,
+since emission is still driven by the policy sets.
+
+### ARB_derivative_control and ARB_shader_texture_image_samples
+
+Both were a missing cap over a chain that already worked: zink's emitter has
+`SpvOpDPdxFine`/`Coarse` and declares the DerivativeControl capability, and
+`textureSamples()` becomes `OpImageQuerySamples`, which Tint takes as
+`textureNumSamples`. That is exactly the situation where it is tempting to
+turn a cap on and move on, so both got probes:
+`gl44-derivative-control-probe` (fine and coarse must agree on a linear ramp,
+compared by magnitude because GL does not fix a derivative's sign) and
+`gl44-texture-samples-probe` (checked against what the implementation says it
+allocated, not against 4).
+
+### What is left: ARB_cull_distance
+
+A primitive is discarded when, for some i, **all** of its vertices have
+`gl_CullDistance[i] < 0`. WGSL has clip distances and no cull distances.
+
+Mapping cull onto clip is tempting and wrong: clipping cuts a primitive where
+the interpolated value crosses zero, so an all-negative primitive does
+disappear (correct) but a mixed-sign one is partly cut when culling would keep
+it whole. That is a silent mis-render, which this driver refuses elsewhere on
+principle.
+
+The honest implementation is primitive-level culling, and the machinery for it
+exists: the driver already runs a compute pass to emulate geometry shaders,
+captures vertex outputs, culls by facing on the CPU for per-face polygon mode,
+and rewrites index lists in several places. A cull pass would evaluate the
+distances per vertex and build a filtered index list. It is a real piece of
+work rather than a cap, which is why 4.5 does not land in this pass.
+
+Note the rung does not move by granting the four: `_mesa_compute_version`
+wants all of them plus GLSL450. So the version stays 4.4 while four of its
+five extensions are now advertised and tested -- applications that detect
+them individually can use them today.
