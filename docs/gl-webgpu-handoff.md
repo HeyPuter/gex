@@ -10314,3 +10314,84 @@ real conflict, not a bookkeeping one. Whether Blender declares two samplers
 that st collapsed onto one unit, or the shader reads one texture through two
 differently-typed samplers, is the next thing to find out: dump the shader
 before theorising about it.
+
+## Blender: the UI draws, the viewport is blocked on WebGPU
+
+Six more fixes past the platform check, and Blender's shaders now all link.
+Where it stops is worth stating precisely, because it is not a driver gap:
+
+    gex-wgpu: colour target 1 refused (surface reinterprets the format)
+    fb=1048x900 surface=r16_uint texture=r16_float 1048x900
+
+    gex-wgpu: sampler view refused (shape or format)
+    format=r16g16_float texture=r32_float
+
+Blender's viewport renders integer object IDs into a float texture and reads
+one format's storage as another. **WebGPU allows a view's format to differ
+from its texture's only by the sRGB suffix** -- that is the whole of its
+format-reinterpretation rule, for attachments and for sampled views alike. So
+the read side could be emulated with a per-draw shader conversion (see
+`ARB_texture_view` above, whose sixth probe case is exactly this), and the
+*write* side cannot: a fragment shader writing an f16 attachment goes through
+WebGPU's own conversion, and there is no way to make it deposit an arbitrary
+bit pattern.
+
+That is a platform ceiling, not a missing feature, and it is where Blender's
+3D viewport stops. Its interface -- header, toolbars, sidebars, text, widgets
+-- draws.
+
+### The six fixes
+
+**Uniform blocks in compute shaders.** `create_compute_state` hand-rolled the
+storage half of the block lowering and skipped the uniform half, so a compute
+shader with a uniform block reached ntv with a raw `load_ubo` and *asserted*.
+Patching that in separately then grew its own, lower limits -- "compute
+uniform block slot=12 above max=12", "compute storage block slot=4 above
+max=4" -- on shaders the graphics path takes without complaint. It calls
+`gex_wgpu_lower_gallium_ubos` now, so the limits and the spill to storage
+above the device's uniform count come for free, and `launch_grid` binds one
+table of blocks that records where each buffer comes from rather than three
+parallel notions of "slot".
+
+**`set_constant_buffer` had to accept the compute stage**, which it refused --
+and a refusal latches.
+
+**A dynamically indexed scalar UBO load.** std140 pads an array of vec4 so the
+element index is `offset/16`, but a *scalar* array indexed at run time arrives
+with `align_mul = 4` and the component has to be computed too. The lowering
+computes it now and extracts dynamically; the guard that remains is that the
+load must not straddle two vec4s, which the alignment guarantees.
+
+**A query is not a sample.** `textureSize()` returns an `ivec2`, and the
+texture-metadata scan read that as the texture's *sample type* -- so a shader
+that both samples a float texture and asks its size declared slot 0 as float
+and sint at once and was refused for an inconsistency it did not have.
+Blender's whole `workbench_resolve` family does exactly that. The masks pick
+the bind group's sample type, which only a sampling op constrains.
+
+**Non-finite bits in an *integer* constant.** The earlier fix covered float
+constants; `uintBitsToFloat(0x7FC00000u)` -- how Blender spells NaN -- reaches
+NIR as a **uint** constant with an implicit bitcast, so ntv emitted
+`OpBitcast %float %const` at the use site and Tint folded it straight back into
+the value it rejects. Any 32-bit constant whose bits are a non-finite float is
+made unfoldable now, whatever type it is used as. The OR that does that
+produces an unsigned result, so anything else is bitcast back -- storing a
+uint-typed id against a signed type made a later `OpCompositeConstruct` mix the
+two ("Expected Constituents to be scalars or vectors of the same type as
+Result Type components").
+
+**Two diagnostics learnt to name things**: the refused colour target prints
+format *names* rather than `pipe_format` numbers (which is how a
+`surface=r16_uint texture=r16_float` pair was mistaken for something exotic),
+and a refused texture allocation says its format and shape at all.
+
+### A process note
+
+One of these edits replaced a span whose end anchor matched a *later*
+occurrence, deleting a chunk of `launch_grid` and the top of the depth-resolve
+pipeline. The compiler caught it immediately -- four `redefinition of` errors
+-- and the recovery was `git checkout HEAD --` on the one file plus re-applying
+two small patches by hand. **Anchor a span replacement on strings that are
+unique in the file, and check the size of what is being replaced**; a
+mechanical edit that silently eats 1500 lines is a worse failure than one that
+does not compile.
