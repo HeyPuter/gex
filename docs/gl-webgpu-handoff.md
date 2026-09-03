@@ -10482,3 +10482,229 @@ the worst failure shape available.
 **The suite is now 61 probes passing with two known divergences**: `quad`,
 where llvmpipe is the outlier, and `texture-view` 5/6, which is the WebGPU
 format-reinterpretation ceiling.
+
+## Minecraft 26.2 renders
+
+GL 4.4 got Minecraft past its version check. Getting it to draw took seven
+more fixes, and the last one is the reason this section is long: the game ran
+at 30 fps with 148 draws a frame into a window that screenshotted pure black,
+with not one refusal in the log.
+
+### It never reached the driver
+
+`scratchpad/mc262.sh` produced a window and zero `gex-wgpu` lines. The game's
+log said:
+
+```
+Failed to create backend OpenGL
+com.mojang.blaze3d.systems.BackendCreationException: Driver does not support OpenGL 3.3
+```
+
+That sentence is not what happened, and believing it costs an hour. Launching
+`net.minecraft.client.main.Main` directly, without PrismLauncher's environment
+scrubbing, gave the real message:
+
+```
+glx: failed to create drisw screen
+```
+
+`tests/integration/programs/gl44-glx-context-probe.c` was written to test the
+obvious suspect and cleared it: 3.3 core, 3.3 core forward-compatible and 4.4
+core all create through `glXCreateContextAttribsARB`, 5/5 on this driver and
+5/5 on the system's. `LD_DEBUG=libs` showed why. GLFW `dlopen`s GL at run time,
+and **GLFW 3.5 asks the loader for `libGLX.so.0` before `libGL.so.1`**. On any
+modern distribution that name is libglvnd's dispatch, which loads its *vendor*
+library from `/usr/lib` and with it the distribution's Mesa:
+
+```
+calling init: /tmp/gex-mesa-native/inst/lib/libGL.so.1        <- ours, loaded
+calling init: /usr/lib/libgallium-26.1.6-arch1.1.so           <- theirs, also loaded
+calling init: /usr/lib/libGLX_mesa.so.0
+calling init: /usr/lib/libGLX.so.0
+```
+
+Two Mesa builds in one process. Our libGL's call to `driCreateNewScreen3` binds
+to the older one, which has no `gex_wgpu` driver, so `GALLIUM_DRIVER=gex_wgpu`
+selects nothing and screen creation fails. `LD_PRELOAD` of our libGL does not
+help: it loads ours *as well*, and the collision is what matters.
+
+The fix is one line per name, now in `web/build-mesa-native.sh`:
+
+```sh
+ln -sfn libGL.so.1 "$OUT/inst/lib/libGLX.so.0"
+ln -sfn libGL.so.1 "$OUT/inst/lib/libOpenGL.so.0"
+```
+
+`dlopen` of a bare soname searches `LD_LIBRARY_PATH` first, so a file of that
+name next to ours is found before `/usr/lib`, and there is exactly one Mesa in
+the process. No sandbox, no glvnd build, and it fixes every `dlopen`-based
+toolkit at once -- SDL and Qt ask the same way.
+
+This matters beyond Minecraft: **a native run that uses `-lGL` proves nothing
+about a `dlopen`-based application**, which is most of them. Add
+`scratchpad/dlprobe.c`-style resolution to the harness before concluding an app
+is broken.
+
+### Five refusals of things the driver already did
+
+Each of these was a guard stricter than the code behind it, and each latched
+the context -- which reports as `GL_OUT_OF_MEMORY` from the next unrelated
+call.
+
+1. **A buffer with no bind flags at all.** `st/mesa` derives binds from the GL
+   target named at allocation, and `glBufferStorage` on an object with no usage
+   yet -- the normal way `ARB_buffer_storage` is used -- yields none.
+   `resource_create` required at least one. Nothing downstream cared:
+   `desc.usage` is already the union of every usage a GL buffer might later
+   need, precisely because the creating target does not predict it. Minecraft's
+   uniform ring was refused, which `glBufferStorage` reports as
+   `IllegalStateException: Failed to map buffer`.
+
+2. **`set_constant_buffer` demanding `PIPE_BIND_CONSTANT_BUFFER`** on those
+   same buffers. The bind flag was never the right question; the WebGPU usage
+   is. It now asks whether the buffer's usage includes `Uniform`.
+
+3. **No buffer-to-buffer copy.** `resource_copy_region` needs a `WGPUTexture`
+   on both sides, and a buffer has none, so `glCopyBufferSubData` was refused.
+   WebGPU has `copyBufferToBuffer`; it only wants both offsets and the size to
+   be multiples of four, and unaligned copies go through the shadow.
+
+4. **The layer stride on a single-layer upload.** st passed 2048 for a 32-row,
+   128-byte-stride 2D image -- half of the 4096 the rows occupy -- and
+   `texture_subdata` refused the inconsistency. At depth 1 nothing reads past
+   layer zero. The refusal surfaced as
+   `GL_INVALID_OPERATION in glTexSubImage2D(PBO is mapped)`, from an internal
+   map of a PBO that had nothing wrong with it: a latched context returns NULL
+   from every map.
+
+5. **`seamless_cube_map` missing from the sampler whitelist.** `st_atom_sampler`
+   sets it for every sampler in a core profile, so *every* sampler was refused
+   -- and a refused sampler is served by the default one, silently, so the
+   picture is quietly wrong with nothing in the log. WebGPU filters across cube
+   faces unconditionally, so the set bit is exactly what this driver does.
+   `reduction_mode` stays a refusal (it is `EXT_texture_filter_minmax`) but is
+   now a named one; both fields are printed.
+
+And a sixth of the same kind: **`index_bias` was refused on indexed draws**
+even though `wgpuRenderPassEncoderDrawIndexed` takes a signed `baseVertex` and
+the call already passed it. `glDrawElementsBaseVertex` is how Minecraft draws
+terrain.
+
+### The black window
+
+With those, the game ran. `GEX_WGPU_TIMING=1` said 29.9 frames/s, 148
+draws/frame, and the window was `mean=0 sd=0`: one colour, black.
+
+This is the trap in `docs`' oldest note -- "the guest drew" and "the canvas
+shows it" are different claims -- and neither existing instrument could tell
+them apart, so three were added or repaired. `GEX_WGPU_PRESENT_LOG=1` prints:
+
+- the mean and non-zero fraction of the pixels that actually reached the front
+  buffer (validated against `glxgears`: `mean=33.6 nonzero=22.3%`),
+- the histogram of colour targets the frame's draws went to, via
+  `gex_wgpu_report_draw_targets`, which nothing had ever called, and
+- the ordered list of clears, blits and draws that touched the window texture.
+
+`gex_wgpu_presented_texture` is now assigned in `flush_frontbuffer`; it never
+was, so the "presented buffer: N" counter that has always been printed read 0
+whatever happened -- indistinguishable from a frame whose draws all went
+elsewhere, the exact question being asked.
+
+They said: `854x480/b8g8r8a8_unorm: 7080` draws with `presented buffer: 7080`
+and `present 7080` -- **one draw per frame, on exactly the right texture**, and
+the readback all zeros. Then the sequence:
+
+```
+gex-wgpu: on the window this frame: blit(854x-480->854x480) draw
+```
+
+`src.box.height` is **-480**. A negative height is Gallium's vertical flip and
+it means the box runs *upward* from `y`: the rows it covers are
+`[y - |height|, y)`, not `[y, y + height)`. `u_blitter` normalises it as
+`box.y += box.height; box.height *= -1`, and `gex_wgpu_copy_texture_region`
+does the same by hand. `gex_wgpu_blit_by_transfer` took the absolute value and
+left `y` at 480, so the copy asked for rows 480..959 of a 480-row texture.
+
+That is a WebGPU validation error, which costs the copy and **raises nothing in
+the GL API**. The blit then fell back to `u_blitter` -- the log's only hint,
+one line: `blit sent to u_blitter: 854x4294966816->854x480` -- and u_blitter
+got the same blit wrong for that destination, also silently.
+
+Minecraft's frame ends with this blit because its render target is drawn
+upside down relative to the window, which is true of any renderer that draws
+into its own framebuffer. Its own F2 screenshot was the decisive test: it reads
+the *main render target* rather than the window, and it came out perfect while
+the window was black, which localised the defect to the last operation of the
+frame.
+
+### What the probe can and cannot see
+
+`gl44-flip-blit-probe.c` covers seven flipped-blit shapes: whole surface,
+sub-rectangle, and each with a format conversion to force the transfer path.
+All seven pass -- **and all seven still pass with the fix reverted**, which was
+checked. A declined blit falls back to u_blitter, and for an ordinary
+FBO-to-FBO pair u_blitter gets the flip right, so GL never sees the difference.
+Minecraft's frame only broke because u_blitter *also* failed for that one
+destination.
+
+So the probe is a regression guard over all three flip implementations, not a
+test that any particular one ran. Two lessons worth keeping:
+
+- **A silent fallback hides a broken fast path.** `blit sent to u_blitter` is
+  printed once per process and is easy to miss; it should be read as "something
+  the driver claims to do was declined", not as informational.
+- **u_blitter is not a safety net.** In the browser it aborts the module
+  outright (see the decline comments in `gex_wgpu_blit`), and natively it can
+  return wrong pixels. A path that falls back to it is unverified, not covered.
+
+### Also fixed: texelFetchOffset
+
+`nir_lower_tex_options.lower_txf_offset` is now set. SPIR-V permits
+`ConstOffset` on `OpImageFetch`; Tint does not:
+
+```
+error: ConstOffset is only permitted for sampling, gather, or depth-reference
+gather operations: %41 = OpImageFetch %38 %40 %18 Lod|ConstOffset %16 %20
+```
+
+A rejected module means the program does not *link*, so
+`gl44-integer-texture-probe` died at `glLinkProgram` rather than returning a
+wrong texel. Adding the offset to the coordinate is what the offset means for a
+fetch, which never wraps or filters.
+
+### Probes that were failing invisibly
+
+The native harness reported anything without a `SUMMARY` line as `NOSUMMARY`
+and moved on, which hid nine probes that use an older `<name> ok` convention.
+Three of those were genuinely broken:
+
+- `integer-texture` -- the Tint rejection above.
+- `texture-sampler` and `reflection` -- linked `glGetInternalformativ`,
+  `glGetProgramResourceLocationIndex` and `glShaderStorageBlockBinding`
+  directly. **None of the three is in Mesa's non-glvnd libGL**, whose export
+  list is 1369 frozen names in `src/glx/libgl-symbols.txt`, and none is
+  anywhere in the library. They resolved against the system's glvnd libGL at
+  build time and died at load against the driver's, after printing part of
+  their output -- which reads as a mid-run failure. Resolved through
+  `eglGetProcAddress` now, as every real toolkit does. `nprobe2.sh` names any
+  such symbol before running the probe, so this class cannot hide again.
+
+`compute` and `indexed` fail on llvmpipe too and are probe or reference
+problems, not driver ones; `compute` additionally stops earlier here because
+`max_shader_images` is deliberately zero outside the fragment stage.
+
+### Open, and honest about it
+
+- **Compute shader images.** `max_shader_images` is fragment-only by design
+  (`launch_grid` binds storage buffers and nothing else). Implementing them is
+  the remaining piece of `ARB_shader_image_load_store` in compute.
+- **Sample counts are understated.** `gl44-texture-sampler-probe` reports
+  `sample-counts=1` against llvmpipe's 2 for an RGBA8 renderbuffer. WebGPU
+  offers 1 and 4, so the honest answer is two; an application that queries
+  this and finds one count will disable MSAA. Conservative rather than wrong,
+  but it is a real difference.
+- **The u_blitter fallback.** It silently produced black for the window blit.
+  Declining, the way `gex_wgpu_blit` declines everything else it cannot do, is
+  probably better than a fallback that can be wrong.
+- **In-game rendering.** The title screen is verified pixel by pixel. Loading a
+  world is the next thing to check.
