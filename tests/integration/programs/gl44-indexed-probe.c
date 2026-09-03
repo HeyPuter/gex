@@ -23,16 +23,30 @@ static GLuint compile_shader(GLenum type, const char *source) {
     return shader;
 }
 
+/* Records the case and carries on.
+ *
+ * This used to exit(3) on the first failure, and the fourth-from-last case
+ * fails on llvmpipe as well as here -- so the three instanced base-vertex /
+ * base-instance draws after it, which are the GL 4.2 and 4.4 features this
+ * probe exists to cover, had never run on *either* driver. A fail-fast probe
+ * turns one defect into a blind spot behind it. */
+static int cases;
+static int passed;
+
 static void check_green(const char *operation) {
     unsigned char pixel[4] = {0, 0, 0, 0};
     glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
     GLenum error = glGetError();
-    if (error != GL_NO_ERROR || pixel[0] > 2 || pixel[1] < 253 ||
-        pixel[2] > 2 || pixel[3] < 253) {
-        fprintf(stderr, "indexed draw failed: %s error=0x%x pixel=%u,%u,%u,%u\n",
+    const int ok = error == GL_NO_ERROR && pixel[0] <= 2 && pixel[1] >= 253 &&
+                   pixel[2] <= 2 && pixel[3] >= 253;
+    ++cases;
+    if (ok) {
+        ++passed;
+    } else {
+        fprintf(stderr, "INFO %s error=0x%x pixel=%u,%u,%u,%u\n",
                 operation, error, pixel[0], pixel[1], pixel[2], pixel[3]);
-        exit(3);
     }
+    printf("CASE %s %s\n", operation, ok ? "PASS" : "FAIL");
 }
 
 static void begin_draw(void) {
@@ -71,7 +85,15 @@ int main(void) {
     GLuint buffer = 0;
     glGenBuffers(1, &buffer);
     CHECK(buffer != 0, "buffer name allocation");
-    if (!getenv("GEX_NATIVE_REFERENCE"))
+    /* Only the guest allocates object names from one global pool, so this is
+     * a property of the transport and not of GL: a native driver is entitled
+     * to hand out shader 1 and buffer 1, and llvmpipe and this driver both
+     * do. The condition used to be "not the reference run", which the native
+     * reference set and the *native driver* run did not -- so a guest-only
+     * invariant was asserted against a native driver and stopped the probe at
+     * its third case, hiding the six after it on that driver entirely. Opt in
+     * from the guest instead, so both native runs skip it. */
+    if (getenv("GEX_GUEST_NAMES"))
         CHECK(buffer != shader, "global guest name allocation");
     glBindBuffer(GL_UNIFORM_BUFFER, buffer);
     glBufferData(GL_UNIFORM_BUFFER, 1024, NULL, GL_DYNAMIC_DRAW);
@@ -205,6 +227,7 @@ int main(void) {
     check_green("glDrawElementsInstancedBaseVertexBaseInstance");
 
     CHECK(glGetError() == GL_NO_ERROR, "unexpected GL error");
-    puts("gl44 indexed state and draw transport ok");
-    return 0;
+    printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
+           cases - passed);
+    return cases == passed ? 0 : 1;
 }
