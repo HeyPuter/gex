@@ -354,6 +354,17 @@ impl MemoryMap {
         }
         let grew = (new > self.brk_cur).then_some((self.brk_cur, new));
         if let Some((from, to)) = grew {
+            // Linux will not grow the break into an existing mapping: if the
+            // range from the old break to the new one intersects any VMA it
+            // leaves the break where it was and returns it, and libc's
+            // allocator falls back to mmap. Without this the break grows
+            // straight over an mmap -- Wine reserves its address space with
+            // mmap while glibc's malloc (inside ntdll.so) extends the break,
+            // and the two alias, so a heap object lands inside a thread stack
+            // or a GDI table and is overwritten out from under the guest.
+            if self.vmas.iter().any(|v| v.start < to && v.end > from) {
+                return (self.brk_cur, None);
+            }
             self.insert(from, to, prot::READ | prot::WRITE, "[heap]");
         }
         self.brk_cur = new;
