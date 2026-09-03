@@ -11601,3 +11601,70 @@ time:
   application here reaches it; it would show up as an `incompatible with the
   format` validation line rather than silently, now that the log is grepped
   for those.
+
+### Blender's *rendered* viewport, and the ceiling that stops it
+
+Pushing Blender past its default viewport -- `--python-expr` setting a VIEW_3D
+area's `shading.type` to RENDERED, so EEVEE runs -- found one bug and one real
+platform ceiling.
+
+The bug: EEVEE attaches a **layered** colour target (two layers of a 1x1
+r32_float) early in its setup, which was refused, which latched the context
+and stopped every draw after it. Fixed by rendering the attachment's first
+layer, which is what GL specifies when nothing writes `gl_Layer` -- the same
+policy the geometry path already states for a shader that does write it.
+
+The ceiling: EEVEE's shaders declare **storage images in formats WebGPU has
+no storage support for**, and three are enough to stop it:
+
+```
+image 'out_scattering_img'      r11g11b10_float
+image 'indirect_radiance_1_img' r11g11b10_float
+image 'rp_value_img'            r16_float
+```
+
+Each makes the shader fail to link, and Blender dumps core on the null
+program rather than degrading -- so this is not a partial render, it is no
+window at all. With the layered refusal gone, these three messages are the
+*only* driver complaints in the whole run.
+
+WebGPU's base storage formats do not include either, and the optional feature
+that would add them (`texture-formats-tier1`) does not exist in the pinned
+emdawnwebgpu package (April 2025) -- its whole feature list is 22 names, and
+neither tier is among them. So this needs either a Dawn/emdawn pin bump or a
+driver-side workaround.
+
+**The workaround that fits the driver already exists in miniature.**
+`gex_wgpu_format_backing()` maps a format to a wider one and
+`texture_subdata` converts through `util_format_translate`, which is how the
+16-bit normalized formats are served by float32 today. Adding
+`R16_FLOAT -> R32_FLOAT` and `R11G11B10_FLOAT -> R16G16B16A16_FLOAT` would
+make both storage-capable, since r32float and rgba16float *are* base storage
+formats, and would raise precision rather than lower it.
+
+What stops that being an obvious win is the trigger. Promoting the formats
+unconditionally doubles or quadruples the memory of two formats renderers use
+heavily for HDR and depth, for the sake of the few textures actually bound as
+images -- and the driver cannot know which those are at creation, because
+st/mesa never asks for `PIPE_BIND_SHADER_IMAGE` (the same reason
+StorageBinding is given to everything storage-capable). The honest version is
+a **lazy promotion**: when `set_shader_images` binds a texture whose format is
+not storage-capable, recreate it with the wider backing, convert the contents
+once, and bump `cache_epoch` so views holding the old handle are rebuilt.
+That is a contained piece of work with a measured payoff, and it is the next
+thing to do on Blender. It is deliberately not started here rather than
+guessed at, because the memory cost of getting the trigger wrong is paid by
+every application.
+
+### The 341-application sweep, re-run against all of this
+
+Against the previous run: **RAN 281 -> 285, REFUSED 6 -> 2**, CRASH 11 -> 11
+with an *identical* set (no application crashes that did not crash before,
+none that stopped), EXIT and OK unchanged. The four that recovered --
+`convolutions`, `projtex`, `shadowtex`, `texenv` -- were all refused for
+`wrap=1`, GL_CLAMP, which this pass accepted. The two remaining refusals are
+the GL_XOR logic-op demos, which are a genuine WebGPU ceiling.
+
+That is the broad statement that the pass's larger changes -- the scratch
+render target, the batch-touched resource classes, the un-gated uploads and
+maps -- did not cost anything elsewhere.
