@@ -9767,3 +9767,90 @@ catches it *inside ntv*, after ntv's own copy-prop:
 One of the four cases passed anyway because DCE happened to run first, which
 made it look like a format problem rather than an ordering one. `nir_opt_dce`
 now runs before the variables are dropped.
+
+## Stencil as data: ARB_stencil_texturing and ARB_texture_stencil8
+
+`gl44-stencil-texture-probe` is 4/4 against llvmpipe and the two extensions are
+advertised, which takes GL 4.3 from six missing items to four and the total to
+4.4 from fifteen to **thirteen**.
+
+They arrive as a pair because st/mesa lights both from one
+`is_format_supported` question about `X24S8_UINT` or `S8X24_UINT` as a sampler
+view, so there is no way to have one without the other.
+
+WebGPU has all the pieces: `stencil8` is a real texture format, a depth-stencil
+view takes `aspect: "stencil-only"`, and such a view binds as an unfilterable
+`texture_2d<u32>`. It was a wiring exercise, and the wiring was four things:
+
+- **`gex_wgpu_is_stencil_only_format`**, because
+  `util_format_is_depth_or_stencil` says yes to all four spellings and every
+  place that asks "depth or stencil?" has to distinguish them. Asking it alone
+  gave a stencil view the `Depth` sample type, and the draw was then refused
+  for a sample type differing from the shader's `usampler2D`.
+- **A stencil-aspect view names a different format from its texture by
+  construction** -- `X24S8_UINT` of a `Z24_UNORM_S8_UINT` texture -- so the
+  sRGB-pairing rule in `create_sampler_view` could not stay the only exception
+  to the format-equality guard.
+- **`stencil8` takes a buffer copy.** The spec's depth-stencil table gives it
+  CopySrc and CopyDst, unlike `depth24plus` and `depth32float`, so a
+  `GL_STENCIL_INDEX8` upload is an ordinary texel copy and skips the driver's
+  render-pass depth-upload detour, which cannot serve it.
+- **A stencil-only attachment has no depth half to load or store**, and WebGPU
+  says so as a validation error rather than ignoring the ops:
+
+      Both depthLoadOp (LoadOp::Load) and depthStoreOp (StoreOp::Store) must
+      not be set if the attachment has no depth aspect
+
+  Every attachment in this driver had a depth aspect until `GL_STENCIL_INDEX8`
+  became a texture. Two sites needed the guard: the clear path and the render
+  pass.
+
+The probe's own trap is worth keeping: **`glGetString(GL_EXTENSIONS)` is removed
+in a core profile** and raises `GL_INVALID_ENUM`, so it reads as "no
+extensions" on a driver that has them. llvmpipe reported GL 4.6 core and zero
+for both extensions until the indexed `glGetStringi` query went in.
+
+## Correction: Mesa *does* clamp the GLSL version to the GL version
+
+An earlier note in this document said it does not, on the strength of
+`st_extensions.c` doing `consts->GLSLVersion = screen->caps.glsl_feature_level`
+with nothing lowering it. That assignment is real and there is no clamp *there*
+-- but `_mesa_compute_version` runs afterwards and overwrites it
+(`src/mesa/main/version.c:623`):
+
+    default:
+       if (ctx->Version >= 33)
+          ctx->Const.GLSLVersion = ctx->Version * 10;
+
+So in the 3.3 context this driver is granted, `ctx->Const.GLSLVersion` is
+**330**, whatever the cap says. The list of versions the compiler will accept
+is built from it, which is why `gl44-sampling-matrix-probe` still says
+
+    error: GLSL 4.40 is not supported. Supported versions are: 1.10, 1.20,
+    1.30, 1.40, 1.50, 3.30, 1.00 ES, and 3.00 ES
+
+while `caps->glsl_feature_level` has been 400 since fp64 landed.
+
+**What the cap does and does not do.** It is read *before* the clamp, by
+`st_init_extensions`, so it still gates extensions by GLSL level --
+`ARB_gpu_shader5` at 400, `ARB_shader_precision` at 410 -- and it is what each
+rung of `_mesa_compute_version` tests. It is a precondition declaration, not a
+lever on what a shader may `#version`. Raising it cannot make a 4.x shader
+compile; only granting the GL version can, and the clamp then sets the level
+from the version regardless of the cap.
+
+**Which settles the priority question.** Modern Blender and Minecraft 26.2 need
+shaders above `#version 330`. That needs the GL version. The GL version needs
+GL 4.0. GL 4.0 needs exactly one thing:
+
+    tests/gl-version-ladder.sh
+    GL 4.0: ARB_tessellation_shader
+
+There is no way around it and nothing else on the ladder substitutes for it.
+
+`tests/gl-version-ladder.sh` is new, and reports the GLSL requirement per rung
+alongside the extensions for exactly this reason. Its first version reported
+every rung complete: it looked for `ver_4_N:` labels, `version.c` has
+`const bool ver_4_N = (...)` expressions, and an empty requirement list reads
+as nothing missing. A measurement tool that cannot find its input has to say
+so, so it now exits rather than printing a clean sheet.
