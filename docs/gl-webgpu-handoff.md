@@ -9002,3 +9002,66 @@ and "the base fill leaked into the chain and the generate did nothing", and
 the level *below* the generate's range is the only thing that separates them.
 
     tri-fbo-tex-mip   0.276008 -> 0.00045764   against both references
+
+### The third class: the driver was never loaded
+
+After the animation floor and the second reference, the largest divergence
+left in the run was `wayfire` -- a real Wayland compositor -- at 0.576 with an
+animation floor of **zero** and two references agreeing to **0.0015**. That is
+the perfect signature of a real deterministic defect, and it is not one.
+
+It renders a black screen because it never loads this driver. wlroots wants a
+DRM render node; the reference run gets one from the system Mesa, and the
+build under test has no such device, so wayfire logs
+
+    Failed to open DRM render device, consider specifying WLR_RENDER_DRM_DEVICE.
+    Trying SW rendering instead.
+
+and falls back to pixman. The two runs were not comparing two drivers. Nothing
+in the three numeric columns could say so -- a program that renders in
+software renders *consistently* in software.
+
+The driver announces itself on every successful init, so the absence of any
+`gex-wgpu` line in the captured log is conclusive, and the harness now reports
+`driver never loaded` instead of an rmse. One program in 59 hit it, and it was
+top of the ranking.
+
+### And a fourth the columns cannot see
+
+`gltestperf` is a *performance* benchmark: it walks a sequence of test cases
+and what is on screen depends on how far it got in the time it was given. Its
+two images are at different stages of that sequence, not two renderings of one
+scene. Its animation floor is zero because the driver progresses identically
+on both of its own runs -- consistently *different* from the reference is
+indistinguishable from consistently *wrong* by any of these measures.
+
+There is no cheap column for this one. The rule it leaves behind is the same
+one the whole section is about: **look at the images before believing a
+number.** Every false positive in this run announced itself in one glance and
+in none of the statistics.
+
+### Where the tail stands after all four filters
+
+Of the nine deterministic entries at the top of the comparison:
+
+| retired as | programs |
+|---|---|
+| llvmpipe's own quad diagonal | `quad`, `quad-degenerate` |
+| references disagree | `cubemap`, `tri-viewport`, `simplex-noise`, `textures`, `arbfplight`, `sharedtex_mt` |
+| driver never loaded | `wayfire` |
+| benchmark progress, not a scene | `gltestperf` |
+| **fixed this pass** | **`tri-fbo-tex-mip` 0.276 -> 0.00046** |
+| real, known, still open | `dlist-degenerate`, `dlist-edgeflag`, `dlist-edgeflag-dangling` |
+
+The whole deterministic tail is now either explained or one known feature
+(edge flags) away from being explained. That is a much stronger statement than
+the ranking supported before, and it is the reason to spend a run on the
+`refdiff` and driver-loaded columns before spending a build on a fix.
+
+Two notes on running the harness: it now refuses to start if the display
+already has windows, because "the largest window on the display" is how it
+finds its subject and a foreign window defeats that. A concurrent run of nine
+real applications on the same display produced a `textures` row of 0.792 whose
+three images were MaterialXGraphEditor, aseprite and SuperTuxKart. And
+softpipe needs a longer settle than llvmpipe; `GEX_COMPARE_DELAY=25` is enough
+for the slow ones.

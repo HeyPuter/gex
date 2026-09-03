@@ -57,6 +57,24 @@ export DISPLAY=${GEX_DISPLAY:-:77}
 
 [ -d "$INST/lib/dri" ] || { echo "no driver at $INST/lib/dri" >&2; exit 2; }
 xdpyinfo >/dev/null 2>&1 || { echo "no X display at $DISPLAY" >&2; exit 2; }
+# The display has to be empty before this starts.
+#
+# A program is photographed by "the largest window that is not the root",
+# which handles a window a previous program left behind but not a *foreign*
+# window that happens to be bigger. Running anything else on the same display
+# silently photographs it instead: a concurrent run of nine real applications
+# on :78 produced a `textures` row of 0.792 whose three images were
+# MaterialXGraphEditor, aseprite and SuperTuxKart. Nothing about that row was
+# about textures, and nothing said so -- it simply appeared at the top of the
+# ranking as the largest deterministic divergence in the run.
+stale=$(xwininfo -root -children 2>/dev/null | grep -cE '^ +0x' || true)
+if [ "${stale:-0}" -gt 0 ]; then
+    echo "display $DISPLAY already has $stale window(s); close them first -- " \
+         "this harness photographs the largest window on the display and " \
+         "would photograph those" >&2
+    xwininfo -root -children 2>/dev/null | grep -E '^ +0x' >&2
+    exit 2
+fi
 mkdir -p "$OUT"
 : > "$OUT/results.tsv"
 printf 'app\trmse\tself\trefdiff\tnote\n' >> "$OUT/results.tsv"
@@ -133,6 +151,26 @@ while read -r app; do
     quiet_kill "$name"; sleep 1
     if [ -z "$note" ] && ! shoot gex_wgpu "$OUT/$name-gex.png" "$app"; then
         note="no gex window"
+    fi
+    # Did the program actually load this driver?
+    #
+    # The third class of false defect, after the animation floor and the
+    # second reference, and the one that produced the largest divergence in
+    # the whole run. `wayfire` scored 0.576 with an animation floor of zero
+    # and two references agreeing to 0.0015 -- the perfect signature of a real
+    # deterministic bug -- while rendering a black screen because it never
+    # loaded gex_wgpu at all. It needs a DRM render node, the reference run
+    # gets one from the system Mesa, and the driver under test lives in a
+    # build that has no such device; wlroots said "Failed to open DRM render
+    # device [...] Trying SW rendering instead" and fell back to pixman. The
+    # two runs were not comparing two drivers.
+    #
+    # The driver announces itself on every successful init, so the absence of
+    # the string is conclusive. One program in 59 -- and it was top of the
+    # ranking.
+    if [ -z "$note" ] && [ -f "$OUT/$name-gex.png.log" ] &&
+       ! grep -q 'gex-wgpu' "$OUT/$name-gex.png.log"; then
+        note="driver never loaded"
     fi
     quiet_kill "$name"; sleep 1
     if [ -z "$note" ]; then
