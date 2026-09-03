@@ -85,7 +85,8 @@ done
 # GEX_GUEST_ENV=NAME=VALUE reaches the guest process as an environment
 # variable -- GEXGL_EXTENSION_TRACE=1 is the one worth knowing about, which
 # lists the host extensions the guest declines to repeat. Deliberately
-# unquoted below so it expands to two words; it may not contain spaces.
+# unquoted below so it expands to separate words; no value may contain a
+# space.
 #
 # GEX_GUEST_NAMES=1 is always in the guest's environment: it tells a probe it
 # is the guest, which is the only place object names come from one global pool.
@@ -93,8 +94,11 @@ done
 # reference run and not on the *native driver* run, both of which are native --
 # so gl44-indexed-probe asserted a guest-only invariant against a native
 # driver and stopped at its third case.
+# `glenv` is repeatable and each value is one KEY=VALUE, so a second pair is a
+# second --query, not a comma.
 GUEST_ENV_ARGS="--query glenv=GEX_GUEST_NAMES=1"
-[ -z "${GEX_GUEST_ENV:-}" ] || GUEST_ENV_ARGS="--query glenv=$GEX_GUEST_ENV,GEX_GUEST_NAMES=1"
+[ -z "${GEX_GUEST_ENV:-}" ] ||
+    GUEST_ENV_ARGS="$GUEST_ENV_ARGS --query glenv=$GEX_GUEST_ENV"
 
 GEX_CHROME_PORT=${GEX_CHROME_PORT:-9335} GEX_SERVE_PORT=${GEX_SERVE_PORT:-8091} \
 node "$ROOT/web/test/drive.mjs" gears --allow-errors \
