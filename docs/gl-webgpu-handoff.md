@@ -9305,3 +9305,108 @@ so at 0.2255 in an earlier run, which was read as animation noise and was not.
 program slow enough that a fixed delay lands mid-frame. The facing filter's
 readback is a full GPU stall per unfilled draw, which makes the second case
 more likely for polygon-mode programs than it used to be.
+
+# Above GL 3.3
+
+The driver advertises GL 3.3 / GLSL 3.30. The project targets **4.4** -- which
+is why every probe here is named `gl44-*` -- and the ceiling is 4.6. The app
+targets that need it are in the goal now: Minecraft 26.2 (which wants 4.4),
+modern Blender, FreeCAD, Krita.
+
+## What the version ladder actually costs
+
+Mesa's `_mesa_compute_version` states each rung's requirements exactly, and
+diffing them against what this driver exposes gives the real roadmap rather
+than an impression. To 4.4 it is 26 extensions plus GLSL 440:
+
+| rung | missing |
+|---|---|
+| 4.0 | `gpu_shader5`, `gpu_shader_fp64`, `tessellation_shader`, `texture_buffer_object_rgb32` |
+| 4.1 | `shader_precision`, `vertex_attrib_64bit`, `viewport_array` |
+| 4.2 | `base_instance`, `shader_atomic_counters`, `shader_image_load_store` |
+| 4.3 | `compute_shader`, `copy_image`, `fragment_layer_viewport`, `framebuffer_no_attachments`, `robust_buffer_access_behavior`, `shader_image_size`, `shader_storage_buffer_object`, `stencil_texturing`, `texture_buffer_range`, `texture_view` |
+| 4.4 | `buffer_storage`, `enhanced_layouts`, `query_buffer_object`, `texture_mirror_clamp_to_edge`, `texture_stencil8`, `vertex_type_10f_11f_11f_rev` |
+
+**Two of those are walls, and they sit on the lowest rung.**
+`ARB_tessellation_shader` -- WebGPU has no tessellation stage at all -- and
+`ARB_gpu_shader_fp64`, because WGSL has no `f64`. `ARB_vertex_attrib_64bit` is
+the same f64 problem one rung up. Mesa's ladder is strict, so until those are
+answered the *version number* cannot rise past 3.3 however many other
+extensions land. Geometry shaders were solved by lowering to compute; that is
+the shape an answer to tessellation would have to take.
+
+**The version number may not be what the applications need, though.** Mesa
+advertises extensions independently of the version, and the wire already
+grants a context request it cannot literally satisfy -- SuperTuxKart's own log
+says so:
+
+    gex-wgpu: application asked for 4.4, this context is 3.3 (granted;
+    GL_VERSION reports the real one)
+
+So the practical route is feature-driven: implement the extensions modern
+applications actually use, and let the version follow if tessellation and fp64
+are ever answered.
+
+## The first rung: shader storage buffers
+
+`ARB_shader_storage_buffer_object` now works. `caps->max_shader_buffers` was
+zero, which is the single number st/mesa reads to decide the extension exists.
+
+This was the right rung to take first because WebGPU **has** storage buffers.
+Everything in the legacy tail -- polygon mode, logic ops, wide lines, quads --
+was emulating something WebGPU lacks; from here on the features are mostly
+ones it has. The driver was also already binding storage buffers for transform
+feedback, for its own capture passes, and for the uniform blocks that overflow
+WebGPU's twelve-uniform limit.
+
+`tests/integration/programs/gl44-ssbo-probe.c` is the gate: 5/5, identical to
+llvmpipe -- a fragment read, a fragment write read back on the CPU, a vertex
+read, and two blocks at once so a slot cannot be confused for a binding.
+
+### Four things it needed, in the order they were found
+
+**1. A binding range of their own.** A real storage block and a *spilled*
+uniform block are both `nir_var_mem_ssbo` by the time the shader is walked --
+`gex_wgpu_lower_gallium_ubos` moves uniform slots past the device limit into
+storage mode -- so mode cannot tell them apart. Storage blocks are assigned
+`GEX_WGPU_SSBO_FIRST_BINDING + slot`, *before* the spill runs, and that range
+is what identifies them afterwards. They also get the stage's descriptor set;
+without it they arrived at set 0 and were rejected as "wrong descriptor set".
+
+**2. A table of their own.** They are bound from `ctx->shader_buffers` rather
+than from the constant buffers, and block 0 of one is not block 0 of the
+other, so sharing the `ubo_slots` table would have collided.
+
+**3. The SPIR-V emitter does not implement `load_ssbo`.** It asserts:
+
+    emit_intrinsic: not implemented (load_ssbo)
+    Assertion `!"unsupported intrinsic"' failed.
+
+What it supports is a storage block declared as a variable and reached by
+deref -- which is how this driver's own capture buffers are written. So the
+block is flattened to a runtime-sized `uint` array and the intrinsics become
+word-indexed derefs of it, the same shape `gex_wgpu_lower_ubo_load` gives
+uniform blocks, one element size down because std430 packs to words rather
+than vec4s. 32-bit only, and atomics and `length()` are refused by name.
+
+**4. The layout must agree with the shader's *access*, not just its type.**
+This one produced a silent zero rather than an error. `nir_opt_access` marks a
+block the shader never writes, the emitter then declares it
+`var<storage, read>`, and a layout saying `Storage` does not match: the bind
+group fails to build and the draw reads zeros. The fragment cases split
+exactly on this -- the write case passed while both read cases returned 0 --
+which is what named it. There is now an `ssbo_readonly_mask` per shader.
+
+WGSL forbids writable storage in the **vertex** stage, so a vertex block that
+is written is declined with that reason rather than left to fail at pipeline
+creation. Reading one there is legal and works.
+
+### What came with it, and the risk in that
+
+Exposing it also lit up `ARB_shader_atomic_counters` and
+`ARB_program_interface_query`, which st/mesa derives from SSBO support.
+Atomic counters lower to SSBO atomics, and this pass **refuses atomics** -- so
+a shader using them now fails to link where before it could not have been
+written at all. That is the thing to watch in the next app sweep and CTS run;
+the honest fix is SSBO atomics, which WGSL supports but only on `atomic<u32>`
+storage, a different declaration from the plain array used here.
