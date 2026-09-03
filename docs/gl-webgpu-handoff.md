@@ -10395,3 +10395,90 @@ two small patches by hand. **Anchor a span replacement on strings that are
 unique in the file, and check the size of what is being replaced**; a
 mechanical edit that silently eats 1500 lines is a worse failure than one that
 does not compile.
+
+## GL 4.4. Minecraft 26.2's floor.
+
+    OpenGL core profile version string: 4.4 (Core Profile)
+    OpenGL core profile shading language version string: 4.40
+
+All five of 4.4's extensions, each gated:
+
+- **`ARB_vertex_type_10f_11f_11f_rev`** (3/3). Three unsigned floats in one
+  dword, fetched as a raw `uint32` and unpacked in a per-layout vertex variant
+  -- the machinery the 10/10/10/2 family already uses. **Not**
+  `nir_format_unpack_11f11f10f**, which reaches for `unpack_half_2x16_split_x`:
+  ntv emits that as a 16-bit float type and does not declare the Float16
+  capability, so the module is rejected (`OpTypeFloat 16` against
+  `[Int16, Matrix, Int8]`), and declaring it would need WebGPU's optional
+  shader-f16 feature for what is only a bit-field extraction. The unpack is
+  written out in integer arithmetic plus `ldexp`, which is exact.
+- **`ARB_texture_mirror_clamp_to_edge`** (6/6). One instruction: the mode *is*
+  `abs()` followed by clamp-to-edge, applied per axis -- a whole-vector `abs`
+  would break a texture that wraps one axis and mirrors another.
+- **`ARB_query_buffer_object`** (4/4). A readback plus a buffer write, which is
+  the extension without its performance point, since this driver resolves
+  queries on the CPU. `PIPE_BIND_QUERY_BUFFER` also had to be *admitted* --
+  `resource_create` refused it, turning the first use into `GL_OUT_OF_MEMORY`.
+- **`ARB_enhanced_layouts`** (4/4, **first try**). Already supported in full:
+  the GLSL linker packs small varyings into a shared location with or without
+  the extension -- this driver's transform-feedback capture reads
+  `location_frac` for exactly that reason -- an explicit member offset is a
+  byte offset the UBO lowering already addresses, and the shader's
+  `xfb_buffer`/`xfb_offset` qualifiers produce the same `nir_xfb_info` the
+  capture pass already walks. What the cap adds is permission for the
+  *application* to choose the packing.
+- **`ARB_buffer_storage`** (5/5, first try). WebGPU has no persistent mapping
+  at all -- a mapped `GPUBuffer` is unusable by the GPU until unmapped -- so
+  the mapping is the buffer's CPU shadow and **every submit uploads it**.
+  "Coherent" is therefore a promise the driver keeps rather than one the
+  hardware does, and it is kept at submit granularity: writes made before a
+  draw are visible to it, which is all GL requires without a barrier. The
+  probe's decisive case is the second draw -- different vertices written
+  through the *same still-mapped* pointer, no flush, no unmap -- which is what
+  separates this from uploading once at map time.
+
+### What the 4.4 context revealed
+
+Nine probes in the tree had been asking for a GL 4.4 context and producing
+nothing all session. Six now pass outright: `msaa-blit` 8/8,
+`msaa-depth-blit` 1/1, `multi-draw` 4/4, `point-parameter` 10/10,
+`sample-shading` 4/4, `transform-feedback` 1/1, and `fragment-state-matrix`
+23/23. The other two failed, and both were **pre-existing defects that had
+been invisible**:
+
+**`vertex-fetch-matrix` 7/16 → 16/16.** Two clusters. Five cases used
+attributes at odd offsets or strides, which WebGPU forbids and
+`create_vertex_elements_state` refuses -- by refusing the whole state, which
+leaves nothing bound and latches the next draw. The cap that fixes it is one
+line: `vertex_input_alignment` was left at `NONE`, which told u_vbuf unaligned
+attributes were fine, so it passed them through to be refused. `4BYTE` makes
+u_vbuf translate them, which is what it is for.
+
+The other four used `glVertexAttribDivisor` with a divisor above one, which the
+driver refused outright. WebGPU's `stepMode: "instance"` advances once per
+instance and takes no divisor -- so the *layout* for a divisor of two is
+already right and it is the data that is wrong: record `i` has to be the
+source's record `i / d`. The buffer is de-interleaved on the CPU for the length
+of the draw, at the outermost `draw_vbo` only (the restart and multi-draw
+splits re-enter, and expanding an expanded buffer would divide twice). A divisor
+exists precisely because the per-instance data is *shared*, so there is little
+of it to copy.
+
+**`sampling-matrix` 11/15 → 15/15.** All four failures were
+`GL_CLAMP_TO_BORDER`, and the cause was one over-strict guard.
+`create_sampler_state` demanded `min_lod == max_lod == 0` of a border sampler
+on top of `MIPFILTER_NONE` -- but with mip filtering off only the base level is
+ever sampled and the lod *range* is irrelevant, while st/mesa gives a texture
+with `GL_TEXTURE_MAX_LEVEL = 1` a non-zero range whatever the filter. So an
+ordinary NEAREST clamp-to-border sample of a two-level texture had its sampler
+**refused**, and a refused sampler is served by the default one, which clamps
+to edge. The picture was quietly wrong with nothing in the log.
+
+That silence is now fixed too: every refusal in `create_sampler_state` names
+the field that caused it. A refused sampler is never an error the application
+sees -- the draw proceeds with the wrong wrap mode and filter -- which makes it
+the worst failure shape available.
+
+**The suite is now 61 probes passing with two known divergences**: `quad`,
+where llvmpipe is the outlier, and `texture-view` 5/6, which is the WebGPU
+format-reinterpretation ceiling.
