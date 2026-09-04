@@ -2902,7 +2902,20 @@ const char *eglQueryString(void *dpy, int name) {
     /* EGL requires "<major>.<minor> <vendor-specific>", and applications do
        parse the number off the front. */
     case 0x3054: return "1.5 gex";   /* EGL_VERSION */
-    case 0x3055: return "";          /* EGL_EXTENSIONS */
+    case 0x3055:                     /* EGL_EXTENSIONS */
+        /* Advertise the extensions a real EGL of this era carries and that
+           this marshaller honours. winewayland.drv refuses to bring up
+           OpenGL without the first two on the client string (EGL_NO_DISPLAY)
+           and the last three on a display string; eglGetProcAddress already
+           returns core entry points (client_get_all_proc_addresses), the
+           Wayland platform is handled by eglGetPlatformDisplay, and
+           eglCreateContext takes a version/flags attrib list and a null
+           config, so the create-context extensions hold too. One superset
+           string serves both queries -- has_extension is a substring test. */
+        return "EGL_KHR_client_get_all_proc_addresses EGL_KHR_platform_wayland "
+               "EGL_EXT_platform_wayland EGL_KHR_create_context "
+               "EGL_KHR_create_context_no_error EGL_KHR_no_config_context "
+               "EGL_KHR_surfaceless_context EGL_EXT_platform_base";
     case 0x308D: return "OpenGL OpenGL_ES"; /* EGL_CLIENT_APIS */
     default: return "";
     }
