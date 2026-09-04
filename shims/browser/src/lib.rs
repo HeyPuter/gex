@@ -5931,10 +5931,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     gex_kernel::BlockOp::AcceptWait { socket } => {
                         Waiting::Accept(Arc::clone(socket))
                     }
-                    // `sigsuspend` waits for a signal only, and signals are
-                    // delivered in the scheduler, so coming back round each
-                    // turn is the whole implementation.
-                    gex_kernel::BlockOp::SigSuspend { .. } => Waiting::Runnable,
+                    // `sigsuspend` waits for a signal. Marking it Runnable makes
+                    // the scheduler re-run it every turn -- fine when other
+                    // threads share the turn, but for a lone runnable process it
+                    // busy-polls at 100% CPU. dash's `dowait` spins here waiting
+                    // for a child's SIGCHLD, and the spin starves the very
+                    // Workers (the child, wineserver) that would post it, so
+                    // winemine never starts. Deliver at once if a signal is
+                    // already deliverable; otherwise park briefly and re-check,
+                    // yielding the core so the sender can run. The re-check pulls
+                    // cross-Worker signals in and delivers them within the poll.
+                    gex_kernel::BlockOp::SigSuspend { .. } => {
+                        if h.kernel.signals.would_deliver() {
+                            Waiting::Runnable
+                        } else {
+                            Waiting::Sleep(now_ns() + 2_000_000)
+                        }
+                    }
                 };
                 let t = &mut h.threads[cur()];
                 t.pc = pc as u64 + gex_abi::SYSCALL_INST_BYTES;
