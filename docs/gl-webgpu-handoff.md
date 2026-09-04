@@ -14159,3 +14159,56 @@ Note also: `glGetError` *between* `glBegin` and `glEnd` is itself
 `GL_INVALID_OPERATION`. The first version of the reproducer did that and
 reported an error on every driver, which looked like agreement that something
 was broken.
+
+## The y flip puts a horizontal line one row off, and only that
+
+The `glEdgeFlag` cluster in the pixel comparison -- `tri-edgeflag`,
+`tri-edgeflag-array` (identical RMSE) and `tri-unfilled-edgeflag` -- resolves
+to one precisely bounded difference, and it is worth recording exactly because
+the symptom looks much bigger than the cause.
+
+**The measurement.** A width-1 line at exact device coordinates in a 64x64
+viewport, reported as GL rows (row 0 at the bottom):
+
+| line | gex_wgpu | radeonsi | llvmpipe |
+| --- | --- | --- | --- |
+| horizontal at clip y=0 | row **32** | row 31 | row 31 |
+| vertical at clip x=0 | col 31 | col 31 | col 31 |
+| diagonal 1:1 | identical | identical | identical |
+| diagonal 2:1 | identical | identical | identical |
+
+A **filled** rectangle spanning device 16.0 to 48.0 covers rows 16..47 on all
+three, identically. So this is not a global offset: geometry is placed
+correctly, and only a *zero-height* primitive lying exactly on a pixel
+boundary resolves the other way. The x axis is unaffected because it is not
+flipped.
+
+**The cause.** WebGPU has no negative viewport height, so the flip is done in
+the shader (`gex_wgpu_lower_position_y`, a plain `y = -y`). Negating y maps a
+GL coordinate on a pixel boundary onto a device coordinate on a pixel
+boundary -- the same place -- but the rasteriser's tie-break then awards the
+boundary to the pixel on the opposite side in GL terms.
+
+**Why it is left alone.** Two fixes exist and both cost more than a pixel:
+
+1. *A sub-pixel bias in the flip.* It cannot be a constant. An NDC epsilon
+   moves device y by `epsilon * H / 2` pixels, so staying sub-pixel at
+   H = 16384 needs `epsilon < 6e-5` while exceeding the rasteriser's ~1/256
+   pixel quantum at H = 64 needs `epsilon > 1.2e-4`. The ranges do not
+   overlap, so the bias has to scale with viewport height -- coupling the flip
+   to viewport state and needing a uniform or a variant key.
+2. *Flip at present instead of in the shader*, so geometry rasterises in GL
+   orientation and the tie-break is right. Architecturally the better answer,
+   and it costs a full-frame blit unless one is already happening.
+
+Neither is worth a one-pixel difference on boundary-aligned horizontal lines
+on its own. But if the flip is ever revisited for another reason, this is the
+correctness argument for doing it at present time.
+
+**What it explains.** Horizontal lines at integer device coordinates are
+everywhere in 2D and wireframe drawing -- plot axes, table rules, borders,
+axis-aligned mesh edges -- so this accounts for a family of small
+deterministic differences in the comparison, all internally consistent and
+none of them an artifact a user would call broken. `radeonsi` and `llvmpipe`
+are **pixel-identical** on `tri-edgeflag` (RMSE 0.0), which is what made this
+worth running down rather than dismissing as rasteriser noise.
