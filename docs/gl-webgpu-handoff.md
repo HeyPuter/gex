@@ -12310,3 +12310,178 @@ SSBO layout rather than this driver's, so it needs the size supplied by the
 driver instead -- the shape to copy is the draw-parameters block; 6 are a
 storage block indexed at run time; 4 are `OpMemoryBarrier` outside compute,
 where WGSL has no barrier at all.
+
+## The geometry stage, generalised: 12 of 76 to 73 of 76
+
+`KHR-GL44.geometry_shader` was the densest remaining cluster after the
+storage-block and interpolation work, and almost all of it came down to the
+geometry path implementing one shape of geometry shader and refusing the rest
+at *link* time -- which fails the application, not the draw.
+
+The path itself is sound and did not change: a geometry shader runs as a
+compute pass that writes vertices and indices for an ordinary indexed draw.
+What changed is everything around it that used to be hard-coded.
+
+### Input and output primitives are separate tables now
+
+Two refusals accounted for 29 of the 64 failures:
+
+    gex_wgpu geometry shaders must output points or a triangle strip   (15)
+    gex_wgpu geometry shaders must take points or triangles            (14)
+
+GL has five input primitives and three output ones. The input decides only how
+many vertices an invocation reads and which draw topology feeds it; the output
+decides how many indices a primitive takes and how many of them a strip of
+`vertices_out` closes. Both are now tables in `gex_wgpu_create_gs_state`, and
+the emitter grew a line-strip branch beside the triangle-strip one -- a line
+strip closes a line from the *previous* vertex, one back rather than two, with
+no winding to alternate.
+
+Removing those refusals moved the score not at all: 12/76 before, 12/76 after,
+with every shader now compiling. That is worth stating plainly, because it is
+the shape of a whole class of driver work -- **a refusal often hides a second
+defect, and lifting it only reveals the one behind.**
+
+### The one behind: indexed and instanced draws
+
+Each `rendering` case runs its geometry through *five* draw calls -- arrays,
+arrays-instanced, elements, elements-instanced, range-elements -- and the
+geometry path took only the first. So every one of those cases failed however
+many primitives it could compile.
+
+Both were much less work than they look, because the vertex capture already
+had the pieces:
+
+  * **Indexed.** The capture can read a slot table -- one entry per captured
+    vertex, naming which vertex of the draw it is -- because the wide-line
+    rewrite needed exactly that. Building one for the geometry pass makes the
+    capture write the vertex shader's outputs in *primitive* order, so the
+    geometry pass goes on reading `invocation * verts_per_input_prim + vertex`
+    and never learns that indices exist.
+  * **Instanced.** Unrolled into the capture rather than handed to the
+    rasterizer. The capture runs once per (instance, vertex) and the geometry
+    pass once per (instance, primitive), both instance-major -- and because
+    `prims_per_instance * verts_per_input_prim == count`, that same linear
+    formula already lands on the right vertex. The capture gained a
+    slot-to-(instance, vertex) split and, with it, real `gl_InstanceID` and
+    real vertex-attribute divisors, which it had never had: instanced capture
+    was refused outright, so the layout carried no divisor and every attribute
+    was read per vertex.
+
+That took the family from 12/76 to 39/76.
+
+### A strip is a topology, not a primitive
+
+A `layout(triangles)` shader may be fed triangles, a strip or a fan; GL calls
+those the same primitives assembled differently. The path compared the draw's
+mode against the shader's declared one and declined anything else. Now
+`gex_wgpu_gs_input_class` maps a draw topology to the class of shader that
+takes it, and anything that is not already a plain list is resolved through
+the same slot table the indexed case uses.
+
+Fans and loops never reached this code -- `GEX_WGPU_PRIM_MODES` does not claim
+them, so u_primconvert had already rewritten them into lists. Strips it does
+claim, which is why only strips were left.
+
+**GL's vertex order for a strip is not transform feedback's.** Both keep the
+winding of an odd triangle by exchanging two of its three vertices, but they
+exchange a different two: feedback swaps the last pair, `(i, i+2, i+1)`, and
+GL's table for what a geometry shader reads swaps the first, `(i+1, i, i+2)`.
+A shader that reads `gl_in[0]` and `gl_in[1]` separately can tell, and the
+CTS's rendering cases do. The two orders now live in two functions.
+
+### Transform feedback out of a geometry shader
+
+28 of the 37 failures that remained at that point were this one feature --
+every `primitive_counter` case, both `input` cases, and all of `adjacency`.
+The driver captured nothing and said so only on stderr, leaving the feedback
+buffers holding whatever they held.
+
+It is not the same problem as capturing a vertex stage. A vertex shader emits
+exactly one vertex per invocation, so where each writes is known before the
+draw. A geometry shader emits a number it decides at run time and may emit
+none -- and an unemitted index slot holds a degenerate primitive that an
+emitted degenerate one is indistinguishable from. So:
+
+  1. the geometry pass records how many primitives each invocation closed,
+     written at the end of the shader and *before* the bounds check is
+     lowered, so `nir_lower_returns` predicates it away for an invocation with
+     no primitive exactly as it does everything else;
+  2. a scan turns those counts into the offset each invocation starts at;
+  3. a compaction pass -- one invocation per (invocation, primitive slot) --
+     writes the captured components packed, reading the vertices through the
+     indices the geometry pass already wrote, so a triangle strip is recorded
+     as separate triangles with its winding applied and this pass never learns
+     that strips exist.
+
+The scan is one invocation running a serial loop. That is the honest shape for
+what this is: the upgrade, if a profile ever asks, is the usual two-level scan
+-- block sums in parallel, a serial pass over those, then each invocation
+adding its within-block prefix -- and it needs no change anywhere else,
+because only that module's contents would differ.
+
+How much was recorded is a number only the GPU has, and both the append offset
+on each target and the primitive queries need it on the CPU, so it is read
+back. That stalls. The alternative is to leave it on the target and resolve it
+at the three places that can observe it -- a resumed capture, an appended one,
+`DrawTransformFeedback` -- which is the shape to reach for if this ever
+matters. It recorded *nothing* before, so four bytes are cheaper than the
+bookkeeping.
+
+### Two smaller things the tests then found
+
+**gl_PrimitiveIDIn must survive a primitive restart.** The driver splits a
+restart draw into restart-free sub-draws through Mesa's own helper, and each
+sub-draw's invocations start at zero -- so the geometry shader numbered its
+primitives 0, 1, 2, 0, 1, 2 where GL numbers them across the whole draw call.
+The sub-draws cannot carry a base, being ordinary draws, so the context holds
+one for the length of the split. That was the nine `*_rp` cases.
+
+**PRIMITIVES_GENERATED counts the last stage before rasterization.** With a
+geometry shader that is the geometry stage, not the draw's vertex count -- and
+the generic counting in `draw_vbo` was adding the vertex-stage count, the
+geometry path was adding its own, and the re-entry that rasterizes what the
+geometry stage produced was adding a third. A shader emitting six primitives
+from three points reported **18**. The generic count now stands aside for both
+a bound geometry shader and that re-entry, and a draw with a query but no
+feedback bound runs the scan alone to get the number.
+
+### And one bug that was not this driver's
+
+`adjacency_*_triangle_strip` survived all of the above. The draw was arriving
+as `TRIANGLES_ADJACENCY` -- `GEX_WGPU_PRIM_MODES` claims no adjacency
+topology, so u_indices had already converted it -- and the six vertices it
+produced were wrong.
+
+`u_indices_gen.py`'s `tristripadj` writes the odd primitive from GL's table
+and the even one as the identity, `(i+0 … i+5)`. That is right for the
+triangle's own three vertices, which are at slots 0, 2 and 4 either way, and
+wrong for the three *adjacent* ones -- which nothing noticed, because the
+consumer it was written for discards adjacency. A geometry shader reads all
+six. GL's table (4.6 spec, table 10.2) gives the even primitive
+`(i, i-2, i+2, i+6, i+4, i+3)`, and gives the first and last primitives rows
+of their own because the ends have no neighbour to borrow from.
+
+The identity also walked off the end of the buffer: the last primitive of a
+12-vertex strip read index 12. That is visible in the driver's own dump --
+
+    GEX_WGPU_GS_ASSEMBLY=1
+    gex-gs:   prim 3: 8 4 6 9 10 12      <- before
+    gex-gs:   prim 3: 8 4 6 9 10 11      <- after
+
+-- which is what that flag is for, and how this was found at all.
+
+### Where it stands
+
+`KHR-GL44.geometry_shader` 12/76 -> 73/76. The three left are not the geometry
+stage: `layered_rendering` cannot build its texture, and
+`layered_rendering_boundary_condition_various_textures` and `stencil_support`
+are the layered-FBO and stencil paths.
+
+New probes, both gated in the browser: `gl44-gs-topology-probe` (line-strip
+output, lines in, triangles-adjacency in, indexed, instanced, and a strip draw
+whose only discriminator is which vertex `gl_in[0]` is) and
+`gl44-gs-feedback-probe` (packing, ordering, strip decomposition, an
+invocation that emits nothing, and `GL_PRIMITIVES_GENERATED`). The native
+suite is 83 OK with the same three known differences; STK is unchanged at
+mean 67 / stdev 17.
