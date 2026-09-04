@@ -1663,24 +1663,43 @@ pub extern "C" fn gex_set_wl_trace(on: i32) {
 /// even when a crash left the kernel borrowed.
 #[no_mangle]
 pub extern "C" fn gex_dump_threads() {
+    // Rendered into a stack buffer, never `String`/`format!`: this is a crash
+    // reporter, and the crash it reports on is often a `memory access out of
+    // bounds` trap whose handler calls here WHILE a Worker (this one, or a dead
+    // one) still holds the shared talc heap's `RawSpinlock`. Allocating here
+    // then spins on that lock forever -- a silent 100% CPU hang instead of a
+    // printed dump. (winemine hit exactly this: the dump never appeared and the
+    // Worker pegged a core in `<Counting as GlobalAlloc>::alloc`.) So the whole
+    // report must be alloc-free; `warn` takes raw bytes and keeps none.
+    use core::fmt::Write as _;
+    struct Buf([u8; 2048], usize);
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let room = self.0.len() - self.1;
+            let n = s.len().min(room);
+            self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut b = Buf([0; 2048], 0);
+    let _ = write!(b, "[gex] threads at crash:");
     with_host_free(|h| {
-        let mut s = String::from("[gex] threads at crash:");
         for (i, t) in h.threads.iter().enumerate() {
-            s.push_str(&format!(
+            let _ = write!(
+                b,
                 " t{i}(tid={} ctx={:#x} pc={:#x} {})",
                 t.kstate.tid,
                 t.kstate.ctx_addr,
                 t.pc,
                 waiting_name(&t.waiting),
-            ));
+            );
         }
-        // Per-Worker JS phase (0 init, 3 compiling, 4 installing, 6 in-enter,
-        // 7 post-enter, 8 parked) -- says which Workers are stuck in a JS await
-        // vs the scheduler, without the console logging that perturbs the
-        // timing. klock too. Same process memory, so these are this pid's.
-        s.push_str(&format!(" klock={}\n", klock_holder()));
-        warn_line(&s);
     });
+    // klock too, which is exactly what a heap/lock deadlock needs named.
+    let _ = write!(b, " klock={}\n", klock_holder());
+    // SAFETY: `warn` reads the bytes and keeps none of them.
+    unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
 }
 
 /// How many of an object's stored units one dispatch miss may take, merged
