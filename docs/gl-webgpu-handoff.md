@@ -14699,9 +14699,9 @@ Measured against llvmpipe, with the reference number where it was taken:
     limits                        135/140    -
     cull_distance                 145/218    202/218
     shader_storage_buffer_object  78/124     -
-    es_31_compatibility           163/355    355/355
+    es_31_compatibility           235/355    355/355
     direct_state_access           288/371    370/371
-    sample_variables              53/190     190/190
+    sample_variables              125/190    190/190
     shading_language_420pack      47/329     329/329
 
 **Sampling in the geometry and tessellation stages is now built** -- see the
@@ -14928,3 +14928,51 @@ integer targets are a WebGPU limit and part of that tail is genuinely
 unreachable, but the `samples_0` integer cases are not, and this is where to
 resume. The binding diagnostic now prints the format's name, which is what made
 that line readable.
+
+
+## A sampler that is declared, not executed, and has nothing valid bound
+
+The resume point from the previous section turned out to be worth more than
+the section itself. `sample_variables` is **125/190** and
+`es_31_compatibility` **235/355** -- the same tests nested -- from one change.
+
+The failing draw was the CTS's *verification* shader, not the one under test:
+
+    uniform highp isampler2D   u_tex;
+    uniform highp isampler2DMS u_texMS;
+    o_color = u_samples > 0 ? texelFetch(u_texMS, coord, sampleId)
+                            : texelFetch(u_tex, coord, 0);
+
+With one sample the multisampled half never runs, and its unit holds whatever
+was left there. GL calls such a sampler **incomplete** and says it reads
+(0,0,0,1); it does not say the draw is an error. WebGPU requires every
+declared binding to match the layout and every layout entry to name a real
+view, so the driver declined the draw -- and the frame lost geometry that had
+nothing to do with the sampler in question.
+
+**The usual answer does not work here.** An *unbound* unit already gets a 1x1
+stand-in of the declared type. This one is bound, and the declaration to match
+is a multisampled **integer** texture -- which WebGPU has no format for at
+all, since integer formats have no multisample capability. There is no view
+that can satisfy it.
+
+So the sampler is removed from the variant and its uses fold to GL's own
+incomplete-texture value. Two mismatches count as unsatisfiable -- integer
+against non-integer, and multisampled against single-sampled -- and nothing
+else: a depth view read as an ordinary float texture is a working shape that
+other code deliberately relaxes, and a slot with *nothing* bound keeps its
+stand-in, because there the shader may legitimately use the result.
+
+**The binding side keeps the slot rather than compacting around it.** A bind
+group layout may carry entries the shader does not use, so the omitted slot is
+declared as a plain float 2D texture and bound to the ordinary stand-in. That
+is three values changed instead of every index in two loops -- and index
+arithmetic that disagrees between a layout and its entries is reported by Dawn
+as "invalid bind group" and nothing more specific, which is a bad thing to go
+looking for.
+
+`gl44-unused-sampler-probe` pins both halves: the unused mismatched sampler,
+and -- deliberately -- the same program with that sampler *selected* and a real
+integer texture bound, so that "always ignore the second sampler" cannot pass.
+Verified to discriminate: with the omission removed the first case fails and
+the second still passes.
