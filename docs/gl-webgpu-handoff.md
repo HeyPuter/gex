@@ -12674,3 +12674,65 @@ what the driver holds live across contexts than by more bisection.
 
 Until then the mustpass is measurable to 878 cases, which is where it stops:
 **853 passed, 9 failed, 16 not supported.** Before this pass it stopped at 31.
+
+## gl_SamplePosition, and the two gates that hid it
+
+`KHR-GL44.frag_coord_conventions.multisample` failed with
+
+    Tint rejected SPIR-V: error: unknown SPIR-V builtin: 19
+
+which is `SamplePosition`. I had recorded that as a WGSL ceiling. It is not
+one: WebGPU does not let a pipeline *place* its samples, so they are at the
+standard locations Vulkan and D3D both specify, and the sample *index* does
+reach WGSL as `@builtin(sample_index)`. The position is a lookup on
+gl_SampleID, which already worked.
+
+The other half was worse and quieter. `get_sample_position` was
+unimplemented, so `glGetMultisamplefv(GL_SAMPLE_POSITION, i)` answered
+(0.5, 0.5) for **every** sample of a 4x target -- an answer true of no sample
+but the single-sampled one, returned without complaint. GL requires that query
+and gl_SamplePosition to agree, and they cannot disagree now because there is
+one table.
+
+llvmpipe reports exactly the same four points -- (0.375, 0.125),
+(0.875, 0.375), (0.125, 0.625), (0.625, 0.875) -- so no y flip is needed
+despite this driver rendering flipped: the flip cancels the difference between
+GL's lower-left pixel origin and the table's upper-left one.
+
+### Three things had to line up, and each failed silently
+
+  1. **gl_SamplePosition is a variable, not an intrinsic.** GLSL gives it as a
+     `nir_var_system_value` variable, which is what the SPIR-V emitter
+     decorates and so what Tint refuses; only a shader already through
+     `nir_lower_system_values` has `nir_intrinsic_load_sample_pos`. Matching
+     the intrinsic alone found neither form.
+  2. **It cannot have a base module.** The position depends on the
+     framebuffer's sample count, which is not known when the shader is
+     created -- the same reason a `samplerBuffer` defers, and with the same
+     consequence: compiling eagerly does not give a wrong module, it gives one
+     Tint refuses, which reaches the application as a link error.
+  3. **`gex_wgpu_fragment_module` has *two* "does this need a variant?"
+     gates**, and both had to learn about it. Missing either returns
+     `fs->module` -- NULL, because the shader is deferred -- and the caller's
+     `if (!fragment.module) return;` is a silent early exit. The draw did not
+     happen, no message was printed anywhere, and the probe's marker channel
+     is what said so: a constant written alongside the position, so a zero
+     result could be told from a target nothing wrote.
+
+That marker is worth copying. "The value is wrong" and "the draw never
+happened" look identical in a readback, and they have nothing to do with each
+other.
+
+New probe `gl44-sample-position-probe`, gated in the browser: the query
+reports four distinct in-range points; the shader compiles at all; the two
+agree per sample; and an edge through the middle of a pixel covers two of its
+four samples and not the other two -- `covers 1 0 1 0`, the same on llvmpipe,
+which is what makes the positions describe geometry rather than agreeing with
+themselves.
+
+What is left in `shader_multisample_interpolation` is `interpolateAtSample`
+and `interpolateAtOffset` (GLSL.std.450 77 and 78). Those could be emulated
+from screen-space derivatives -- `v + dpdx(v)*dx + dpdy(v)*dy`, with the
+offset coming from this same table -- but that is exact only for a
+noperspective varying, and these tests check values rather than plausibility,
+so it is not obviously worth having.
