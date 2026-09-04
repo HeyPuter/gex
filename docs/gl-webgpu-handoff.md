@@ -14495,3 +14495,94 @@ whose two references disagree with each other by 0.0597. Clipped-wireframe
 coverage is where the remaining `-clip` rows live (`poly-flat-unfilled-clip`
 0.133, `tri-unfilled-userclip-stip` 0.109, `trifan-flat-unfilled-clip` 0.105);
 none of them is a clean signal the way `quad-unfilled` was at refdiff 0.
+
+## The clipped wireframe, and a second rewrite hiding behind it
+
+The previous pass left the comparison's three `-clip` rows unattributed, with
+the note that the differences were "distributed across the whole frame rather
+than being one missing edge". That reasoning was wrong, and wrong in a way
+worth recording: those programs draw *many* primitives, so a defect that costs
+one edge per primitive is distributed too. Spatial spread does not distinguish
+a global difference from a per-primitive one.
+
+A single-primitive reproducer settled it immediately -- one unfilled quad, one
+user clip plane -- and the difference was exactly one edge, 44 pixels, with
+everything else matching to the pixel:
+
+    .........#######################................................
+    .........#.....................o................................
+    .........#.....................o................................     o = only
+     ... 40 more rows ...                                                 llvmpipe
+    .........#.....................o................................      draws it
+    .........#######################................................
+
+**GL clips a polygon and then applies polygon mode.** The clipped polygon's
+outline therefore includes the edge clipping introduced along the plane. This
+driver applied polygon mode first and let the GPU clip the resulting lines,
+which gets every original edge right and draws no boundary edge at all. Both
+references agree exactly (llvmpipe and radeonsi pixel-identical, 134 lit
+pixels against 90) and the unclipped control matched perfectly, so the
+boundary edge was the whole of it.
+
+**Frustum clipping is not the same question, and needed measuring rather than
+assuming.** GL does *not* introduce a drawn edge where a polygon leaves the
+view volume -- a quad extending past clip x = 1 gives 114 lit pixels on
+llvmpipe and 114 on this driver, identical. Only user clip planes matter here.
+Two of the three rows have no user clip plane at all, which is why the fix
+moved one of them and not the others, and which is what pointed at the second
+defect below.
+
+**The fix clips on the CPU from the capture.** st has already run
+nir_lower_clip_vs, so the vertex shader writes one gl_ClipDistance component
+per enabled plane and the captured distances *encode* the planes:
+Sutherland-Hodgman runs on those numbers with no geometry to re-derive and no
+plane state to read. `gex_wgpu_cull_polygons` already takes that capture for
+the facing cull, so the clip costs no extra pass.
+
+A vertex of the clipped ring is a point along an original edge, which no index
+list can name, so the outlines go through the replay the flat rewrite already
+had -- with a third slot-table section and a shader that mixes two records by
+a per-vertex factor. Mixing in clip space is what clipping does, so the
+position lands where GL puts it. Two cases decline rather than approximate: a
+vertex where one plane's boundary edge is cut by a second plane is a mix of
+two already-mixed vertices, and edge flags are not combined with clipping.
+
+**Then the two remaining rows turned out to be a different bug entirely.**
+Their outlines had the right colours and about 70% of the reference's lit
+pixels, and the images showed why at a glance -- the reference draws thick
+solid edges, this driver thin broken ones. The apps call `glLineWidth(4)`.
+
+The wide-line rewrite draws each segment as two triangles, and polygon mode
+was **still GL_LINE** when that draw came back round to `gex_wgpu_draw_vbo`.
+So the unfilled rewrite turned every quad into its own wireframe: a one-pixel
+outline plus a sloped band per edge, which is each quad's outline and its
+diagonal. 520 lit pixels against llvmpipe's 696.
+
+The driver's own log named it, not the pixels: `GEX_WGPU_UNFILLED_LOG` printed
+`unfilled mode=4 fill=1 count=6` immediately after the line rewrite reported
+`instances=4` -- an unfilled draw of six triangle vertices that no application
+had issued. `ctx->line_rewritten` already existed for exactly this and the
+unfilled gate simply did not consult it.
+
+It predates both the flat-unfilled and the clipping work: smooth shading,
+which takes neither path, reproduces it identically. Worth remembering when a
+rewrite's output re-enters the draw path -- **polygon mode has already been
+applied by the time that draw exists.** `gs_rasterizing` is deliberately not
+excluded with it, because GL *does* apply polygon mode to a geometry shader's
+output primitives.
+
+**Where the family stands now.** Every row of the unfilled and flat family is
+inside the disagreement between the two references:
+
+    tri-unfilled-smooth         0.078  -> 0.0031   (refdiff 0.0402)
+    poly-flat-unfilled-clip     0.147  -> 0.0163   (refdiff 0.0597)
+    trifan-flat-unfilled-clip   0.105  -> 0.0120   (refdiff 0.0487)
+    tri-unfilled-userclip-stip  0.109  -> 0.0306   (refdiff 0.0316)
+    quad-unfilled               0.045  -> 6.8e-05  (refdiff 0)
+    quad-unfilled-clip          0.045  -> 6.6e-05  (refdiff 0.0058)
+
+The only rows still above their refdiff are `tri-edgeflag`,
+`tri-edgeflag-array` and `tri-unfilled-edgeflag` at ~0.029 against ~6e-05,
+which are the y-flip horizontal-line tie-break documented earlier -- a
+platform limitation, since WebGPU has no negative viewport height, and one a
+constant epsilon provably cannot fix.

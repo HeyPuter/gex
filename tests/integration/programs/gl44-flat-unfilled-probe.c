@@ -395,6 +395,95 @@ int main(void) {
                same_colour(right, want) && same_colour(left, want));
     }
 
+    /* 2g. A user clip plane cutting an unfilled quad in half.
+     *
+     * GL clips the polygon and *then* applies polygon mode, so the clipped
+     * polygon's outline includes the edge clipping introduced along the
+     * plane. This driver applies polygon mode first and lets the GPU clip the
+     * resulting lines, which gets every original edge right and draws no
+     * boundary edge at all -- three edges where GL draws four.
+     *
+     * Both references agree exactly on this (llvmpipe and radeonsi
+     * pixel-identical, 134 lit pixels against 90), and the unclipped control
+     * matches perfectly, so the boundary edge is the whole of the
+     * difference. It is also the whole of the residual on the comparison's
+     * three surviving `-clip` rows.
+     *
+     * The assertion counts lit pixels in a vertical band at the plane, well
+     * away from the quad's own left and right edges, so only the introduced
+     * edge can light them.
+     */
+    {
+        const double plane[4] = {-1.0, 0.0, 0.0, 0.0};   /* keep x <= 0 */
+        glClipPlane(GL_CLIP_PLANE0, plane);
+        glEnable(GL_CLIP_PLANE0);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glColor3f(1.0f, 0.0f, 0.0f);
+        glBegin(GL_QUADS);
+        glVertex2f(-0.7f, -0.7f); glVertex2f( 0.7f, -0.7f);
+        glVertex2f( 0.7f,  0.7f); glVertex2f(-0.7f,  0.7f);
+        glEnd();
+        const GLenum error = glGetError();
+        glDisable(GL_CLIP_PLANE0);
+        read_target();
+        /* Clip x = 0 is device x = 32. The quad's own edges sit at 9.6 and
+         * 54.4, so a band of 28..35 can only be the introduced edge. Rows
+         * 15..49 exclude the top and bottom edges. */
+        int on_boundary = 0;
+        for (unsigned y = 15; y <= 49; ++y)
+            for (unsigned x = 28; x <= 35; ++x) {
+                const unsigned char *p =
+                    &pixels[((unsigned)y * SIDE + x) * 4];
+                if (p[0] > 40 || p[1] > 40 || p[2] > 40) ++on_boundary;
+            }
+        fprintf(stderr, "INFO clip_boundary_edge lit_at_plane=%d want>=30 "
+                "err=0x%04x\n", on_boundary, (unsigned)error);
+        result("clip_boundary_edge",
+               error == GL_NO_ERROR && on_boundary >= 30);
+    }
+
+    /* 2h. A *wide* unfilled quad, which is two of this driver's rewrites
+     * meeting.
+     *
+     * glLineWidth above one is served by drawing each segment as a pair of
+     * triangles, and polygon mode was still GL_LINE when that draw arrived
+     * back at the unfilled rewrite -- so each quad was turned into its own
+     * wireframe. The result was a one-pixel outline plus a sloped band per
+     * edge, which is each quad's outline and its diagonal: 520 lit pixels
+     * against llvmpipe's 696, and interior pixels where there should be
+     * none.
+     *
+     * Polygon mode has already been applied by the time that draw exists, so
+     * the fix is for it not to apply twice. Checked two ways: the top edge
+     * has to be several pixels thick, and the middle of the quad has to stay
+     * empty -- a wireframed quad fails the second even where it passes the
+     * first.
+     */
+    {
+        glLineWidth(4.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glColor3f(1.0f, 0.0f, 0.0f);
+        glBegin(GL_QUADS);
+        glVertex2f(-0.7f, -0.7f); glVertex2f( 0.7f, -0.7f);
+        glVertex2f( 0.7f,  0.7f); glVertex2f(-0.7f,  0.7f);
+        glEnd();
+        const GLenum error = glGetError();
+        glLineWidth(1.0f);
+        read_target();
+        /* A column through the middle of the top edge, which sits at device
+         * y = 54.4; a band of 48..60 catches it at any plausible width. */
+        int thickness = 0;
+        for (unsigned y = 48; y <= 60; ++y) {
+            const unsigned char *p = &pixels[((unsigned)y * SIDE + 32) * 4];
+            if (p[0] > 40 || p[1] > 40 || p[2] > 40) ++thickness;
+        }
+        const int inside = lit_inside_quad();
+        fprintf(stderr, "INFO wide_unfilled thickness=%d want>=3 inside=%d "
+                "want=0 err=0x%04x\n", thickness, inside, (unsigned)error);
+        result("wide_unfilled",
+               error == GL_NO_ERROR && thickness >= 3 && inside == 0);
+    }
+
     /* 3. The same triangle with a `flat out` varying from a real shader.
      * Fixed-function flat shading is lowered by st/mesa into exactly such a
      * varying, so this should behave identically -- and if it does not, the
