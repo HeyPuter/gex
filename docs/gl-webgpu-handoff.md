@@ -13152,3 +13152,56 @@ double count.
 The 13 that remain are a different shape: three are `barrier()` in a control
 shader, four more are link failures, and the rest are single cases about
 `gl_PatchVerticesIn`, `gl_InvocationID` and level values.
+
+### Two more, and one of them explains a whole class of false leads
+
+**`barrier()` sat inside an unreachable guard.** Both tessellation stages run
+as compute, and both got a tail guard -- "if this invocation is past the work,
+return" -- because a dispatch rounded up to whole workgroups has invocations
+with nothing to do. The evaluation shader needs it. The control shader does
+not: its dispatch is one workgroup per patch with `vertices_out` invocations
+in each, so the guard's condition is unreachable by construction.
+
+It was not merely redundant. An early return becomes a conditional around
+everything after it, and a `barrier()` inside a conditional is not in uniform
+control flow, so Tint rejected the whole module --
+
+    'storageBarrier' must only be called from uniform control flow
+
+-- and a control shader that shares data between invocations, which is the
+only reason to write one that barriers at all, failed to compile. Skipping the
+guard for the control shader fixed two of the three
+`tessellation_shader_tc_barriers` cases.
+
+**An evaluation shader can stand alone.** GL lets you bind a vertex and an
+evaluation shader with no control shader: the levels come from
+`glPatchParameterfv`, `gl_in[]` is the vertex shader's output directly, and
+`gl_PatchVerticesIn` is the draw's `GL_PATCH_VERTICES`. This driver declined
+that combination by name and drew nothing, and `set_tess_state` was not
+implemented at all, so the default levels never reached it.
+
+The shader side needed no change, which is worth knowing before touching it:
+the per-vertex stride the evaluation module reads is already a dispatch
+parameter, so setting that parameter to the patch size instead of the control
+shader's output size is the whole of it. The draw path skips pass two, builds
+the level records on the CPU from the default levels -- which also skips the
+readback stall, since nothing on the GPU computed them -- and points the
+evaluation pass at the vertex capture buffer instead of the control shader's
+output. The variant cache already keyed on the producer's layouts, so it only
+had to stop insisting the producer was a control shader.
+
+**The false leads are the lesson.** Four of the remaining failures reported a
+captured value of 0 where they wanted 2.7, or 4, or 3 -- an unmistakable
+"wrong builtin" signature. A builtin probe reproduced none of it: the levels,
+`gl_PatchVerticesIn` and `gl_TessLevelOuter` all read correctly. They were
+`TESSELLATION_TEST_TYPE_TES` iterations, and the draw never ran. **A zero in a
+feedback buffer means "nobody wrote here" exactly as readily as it means "the
+wrong value was written."** Before chasing a zero as a value bug, check that
+the draw happened -- a primitive-count query, or a marker component the shader
+writes unconditionally, distinguishes them in one run.
+
+`KHR-GL44.tessellation_shader` is 132/140 now, from 31. The eight that remain:
+three need a geometry shader *after* tessellation (a real missing feature --
+Mesa strips an evaluation output the geometry stage does not read, so those
+shaders arrive empty and are refused for writing nothing), one needs an
+array-typed per-patch output, and four are individual value cases.
