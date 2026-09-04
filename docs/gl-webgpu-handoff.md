@@ -14212,3 +14212,46 @@ deterministic differences in the comparison, all internally consistent and
 none of them an artifact a user would call broken. `radeonsi` and `llvmpipe`
 are **pixel-identical** on `tri-edgeflag` (RMSE 0.0), which is what made this
 worth running down rather than dismissing as rasteriser noise.
+
+## Flat shading an unfilled polygon gives every edge its own colour
+
+The other cluster the comparison turned up, and unlike the y-flip this one is
+a visible wrong answer rather than a pixel.
+
+`poly-flat-unfilled-clip` -- `glShadeModel(GL_FLAT)` with
+`glPolygonMode(GL_LINE)` -- renders with **five** colours here and **two** on
+both references. The histograms say it plainly:
+
+    reference   60404 blue (background)   2096 red
+    gex_wgpu    60662 blue               557 red  508 magenta  389 cyan  384 yellow
+
+GL flat-shades an unfilled polygon with **one** colour, its provoking
+vertex's, across every edge. This driver gives each edge the colour of one of
+*its own* two vertices, so a four-sided polygon comes out in four colours.
+`trifan-flat-unfilled-clip` is the same, and it accounts for the `-flat`
+family in the deterministic ranking (`poly-flat`, `quad-flat`, `trifan-flat`,
+`tristrip-flat`, `line-flat`, `linestrip-flat-stipple`).
+
+**Not the provoking-vertex rewrite.** That was the first hypothesis --
+`u_primconvert` is told `flatshade_first` *and* the driver runs its own
+provoking-last rewrite, so a double application looked likely. Running with
+`GEX_WGPU_NO_PROVOKING=1` changes nothing: the four colours are identical to
+the pixel. Rule it out before spending anything there.
+
+**The mechanism.** `util_primconvert` rewrites *indices*. It can choose which
+end of a generated line supplies the flat value -- which is what
+`util_primconvert_save_flatshade_first` is for, and what the comment beside it
+already describes -- but every generated line still references its own two
+vertices. No index reordering can make four different edges share one colour;
+that needs the provoking vertex's attributes **duplicated** into each
+generated line, which is what Mesa's `draw` module unfilled stage does for the
+software drivers and what the hardware does natively.
+
+**What a fix needs.** Somewhere that can write vertex data rather than
+indices. The driver already has exactly that shape in the wide-line path,
+which captures the vertex shader's output into a buffer and draws quads from
+it -- an unfilled-polygon rewrite could do the same and overwrite the flat
+varying with the polygon's provoking value. That is a real piece of work, and
+the audience is legacy fixed-function flat shading: modern apps use shaders,
+where the flat varying is whatever the shader wrote and this does not arise.
+Weigh it accordingly.
