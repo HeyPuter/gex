@@ -13019,3 +13019,54 @@ is the good part -- it filters its own extension list against its exports, so
 the browser reports `gl_spirv=0` and never claims what it cannot do. The
 native path advertises and implements it; the browser advertises neither. Both
 are honest, and they differ, so a gate comparing the two would only ever fail.
+
+## The device loss, down to three cases — and it is our path
+
+    KHR-GL44.framebuffer_blit.scissor_blit
+    KHR-GL44.texture_storage.compressed_data
+    KHR-GL44.texture_size_promotion.functional
+
+In that order, in one process. All three are needed: no pair reproduces it.
+It is deterministic -- twenty-one cases never lose the device and the same
+twenty-one behind `scissor_blit` always do, twice each way.
+
+**radeonsi runs the same three cases clean.** That is the fact worth having:
+this is not the tests, the hardware, or Mesa's front end. It is our stream
+through Dawn.
+
+What the hang is, from `RADV_DEBUG=hang`: **zero active waves**, an **empty
+vm_fault log**, and the command processor stopped on a `WAIT_REG_MEM` after a
+`RELEASE_MEM` -- a GPU-side fence wait that never completes. Not a runaway
+shader, not a bad address: something was waited for that nothing signalled.
+The failure surfaces later, at `gex_wgpu_texture_map` reporting `[Device] is
+lost`, which is where it is *noticed* rather than where it is caused.
+
+### Eliminated, each by experiment
+
+| hypothesis | how |
+| --- | --- |
+| the pipeline cache | survives `GEX_WGPU_NO_PIPELINE_CACHE` |
+| u_blitter's quad draw | survives `GEX_WGPU_NO_BLITTER` |
+| NGG | survives `RADV_DEBUG=nongg` |
+| command-buffer batching | survives `GEX_WGPU_MAX_BATCH=1` |
+
+And by reading rather than running: resource destruction releases its textures
+and buffers; views, samplers, query sets and compute pipelines are each
+created and released in balance; the bind-group-layout cache's deliberate
+leak-when-full never fires, because its warning is in none of the logs; and
+the pipeline key holds module and layout pointers but Dawn refcounts them, so
+the address-reuse hazard that cache guards against cannot bite there.
+
+### Where to go next
+
+Not more bisection -- three cases is where that ends. The reproducer is now
+small enough to run under Dawn's own instrumentation, and the question to put
+to it is which fence the command processor is waiting on and what was supposed
+to signal it. `GEX_WGPU_FALLBACK_ADAPTER` is in place for the other half of
+the question -- whether a CPU implementation executes the same stream happily
+-- and needs a Dawn built with SwiftShader, which this tree's is not.
+
+One thing to keep in mind while reading the reports: after a recovery the
+*next* run's report says "This context is innocent", because it inherited a
+GPU that was already unwell. Only a run on a settled GPU says "guilty", and
+only that one is evidence.
