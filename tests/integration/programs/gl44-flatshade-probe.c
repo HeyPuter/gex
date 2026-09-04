@@ -161,6 +161,93 @@ int main(void) {
         glShadeModel(GL_SMOOTH);
     }
 
+    /* A flat varying emitted by a *geometry* shader.
+     *
+     * This driver serves GL's provoking-vertex convention by reordering the
+     * draw's indices, and that rewrite is deliberately skipped when a
+     * geometry or tessellation stage is bound: those stages generate the
+     * primitives that get rasterized, so the order the *input* vertices
+     * arrived in has nothing to do with it -- and rotating a patch draw's
+     * vertices broke tessellation outright, since the rewrite also makes the
+     * draw indexed and the tessellation path declines an indexed patch draw.
+     *
+     * The geometry path handles the convention itself, which is what makes
+     * that skip safe. This case is here to keep it that way: the triangle is
+     * emitted with three different flat colours and must come out the
+     * *third* one, GL's last vertex.
+     */
+    {
+        static const char *vs_src =
+            "#version 330 core\n"
+            "void main() { gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }\n";
+        static const char *gs_src =
+            "#version 330 core\n"
+            "layout(points) in;\n"
+            "layout(triangle_strip, max_vertices = 3) out;\n"
+            "flat out vec3 tint;\n"
+            "void main() {\n"
+            "  tint = vec3(1.0, 0.0, 0.0);\n"
+            "  gl_Position = vec4(-1.0, -1.0, 0.0, 1.0); EmitVertex();\n"
+            "  tint = vec3(0.0, 1.0, 0.0);\n"
+            "  gl_Position = vec4( 3.0, -1.0, 0.0, 1.0); EmitVertex();\n"
+            "  tint = vec3(0.0, 0.0, 1.0);\n"
+            "  gl_Position = vec4(-1.0,  3.0, 0.0, 1.0); EmitVertex();\n"
+            "  EndPrimitive();\n"
+            "}\n";
+        static const char *fs_src =
+            "#version 330 core\n"
+            "flat in vec3 tint;\n"
+            "out vec4 colour;\n"
+            "void main() { colour = vec4(tint, 1.0); }\n";
+        struct { GLenum stage; const char *src; } parts[] = {
+            {GL_VERTEX_SHADER, vs_src}, {GL_GEOMETRY_SHADER, gs_src},
+            {GL_FRAGMENT_SHADER, fs_src},
+        };
+        GLuint prog = glCreateProgram();
+        int built = 1;
+        for (unsigned i = 0; i < 3 && built; ++i) {
+            GLuint sh = glCreateShader(parts[i].stage);
+            glShaderSource(sh, 1, &parts[i].src, NULL);
+            glCompileShader(sh);
+            GLint ok = 0;
+            glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+            if (!ok) {
+                char log[600] = {0};
+                glGetShaderInfoLog(sh, sizeof(log) - 1, NULL, log);
+                fprintf(stderr, "INFO gs_flat compile %u: %s\n", i, log);
+                built = 0;
+            } else {
+                glAttachShader(prog, sh);
+            }
+        }
+        GLint linked = 0;
+        if (built) {
+            glLinkProgram(prog);
+            glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+            if (!linked) {
+                char log[600] = {0};
+                glGetProgramInfoLog(prog, sizeof(log) - 1, NULL, log);
+                fprintf(stderr, "INFO gs_flat link: %s\n", log);
+            }
+        }
+        if (!built || !linked) {
+            result("gs_flat_provoking", 0);
+        } else {
+            glUseProgram(prog);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawArrays(GL_POINTS, 0, 1);
+            read_target();
+            const unsigned char r = channel(4, 4, 0), g = channel(4, 4, 1),
+                                b = channel(4, 4, 2);
+            const GLenum error = glGetError();
+            fprintf(stderr, "INFO gs_flat_provoking got=%u,%u,%u want=0,0,255 "
+                    "err=0x%04x\n", r, g, b, (unsigned)error);
+            result("gs_flat_provoking",
+                   error == GL_NO_ERROR && b > 160 && r < 60 && g < 60);
+        }
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;
