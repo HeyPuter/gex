@@ -14699,9 +14699,9 @@ Measured against llvmpipe, with the reference number where it was taken:
     limits                        135/140    -
     cull_distance                 145/218    202/218
     shader_storage_buffer_object  78/124     -
-    es_31_compatibility           150/355    -
+    es_31_compatibility           163/355    355/355
     direct_state_access           288/371    370/371
-    sample_variables              40/190     190/190
+    sample_variables              53/190     190/190
     shading_language_420pack      47/329     329/329
 
 **Sampling in the geometry and tessellation stages is now built** -- see the
@@ -14880,3 +14880,51 @@ The other families measured -- `sample_variables`, `es_31_compatibility`,
 -- are **unchanged**. This latch was specific to what `direct_state_access`
 exercises. Worth stating, because "a latch poisons everything" invites the
 assumption that fixing one lifts every family, and it did not.
+
+
+## The driver was stricter than GL, and that looked like missing geometry
+
+`sample_variables` and `es_31_compatibility` turned out to be the same tests
+under two names -- 112 of the latter's 160 failures are `sample_variables.*`
+nested inside it -- so they are one target, not two.
+
+Checked for a latched context first, on the lesson from `direct_state_access`:
+there is none here, 160 clean failures against a reference that passes
+**355/355**. Its 45 NotSupported results are `samples_8`, which WebGPU caps at
+4x; those are a genuine platform limit and llvmpipe passing them is expected.
+
+**gl_SampleMask has no effect on a single-sample framebuffer.** GL performs
+the multisample fragment operations -- where the shader's mask is ANDed into
+the coverage -- only when `SAMPLE_BUFFERS` is one. WebGPU honours
+`@builtin(sample_mask)` whatever the sample count, so a shader writing zero had
+its fragments discarded here and drawn everywhere else.
+
+The direction is the thing to remember. A driver bug usually shows up as
+something drawn that should not have been; **this one was stricter than the
+spec**, so it showed up as missing geometry, which reads like a lowering or a
+binding problem rather than an over-eager one. The one-line reproducer
+(`gl_SampleMask[0] = 0` on an ordinary FBO, expecting the fragment to survive)
+settled it against llvmpipe in a single run.
+
+**The fix is one lowering and one placement, and the placement was the hard
+half.** `gex_wgpu_fragment_module` has *two* early returns that hand back the
+base module when no variant is wanted. The decision to neutralise the mask has
+to sit above both. Putting it below the first left a shader that needs no other
+variant taking that path and going on discarding -- and then, having found and
+moved past that one, below the second, with exactly the same symptom. If a
+per-draw variant reason ever seems not to take effect, check how many ways the
+function can return before it.
+
+53/190 and 163/355. What remains there is format-specific: the failures are
+`rgba8i`, `rgba8ui` and some `rgba32f`, and the first one examined declines
+with
+
+    draw declined (sample type differs from the shader's) slot=1
+    shader_type=5 view_format=r8g8b8a8_unorm(84)
+
+on the *verification* draw's second sampler, not on the integer texture it
+renders to (which is created correctly as `r8g8b8a8_sint`). Multisampled
+integer targets are a WebGPU limit and part of that tail is genuinely
+unreachable, but the `samples_0` integer cases are not, and this is where to
+resume. The binding diagnostic now prints the format's name, which is what made
+that line readable.

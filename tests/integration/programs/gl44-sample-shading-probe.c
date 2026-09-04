@@ -166,6 +166,81 @@ int main(int argc, char **argv)
     result("per_sample_shading",
            error == GL_NO_ERROR && pixel[0] > 110 && pixel[0] < 146);
 
+    /* gl_SampleMask has no effect on a *single-sample* framebuffer.
+     *
+     * GL performs the multisample fragment operations -- where the shader's
+     * sample mask is ANDed into the coverage -- only when SAMPLE_BUFFERS is
+     * one. Writing the mask on an ordinary framebuffer is therefore ignored.
+     * WebGPU honours @builtin(sample_mask) whatever the sample count, so a
+     * shader writing zero had its fragments discarded here and drawn on every
+     * other driver.
+     *
+     * That is the wrong way round from what one expects of a driver bug, and
+     * it is worth stating: this one was *stricter* than GL, not laxer, so it
+     * showed up as missing geometry rather than as something drawn twice.
+     * KHR-GL45.sample_variables' samples_0 cases are exactly this.
+     */
+    {
+        static const char *vs_src =
+            "#version 400 core\n"
+            "void main() {\n"
+            "  vec2 p = vec2((gl_VertexID & 1) == 0 ? -1.0 : 3.0,\n"
+            "                (gl_VertexID & 2) == 0 ? -1.0 : 3.0);\n"
+            "  gl_Position = vec4(p, 0.0, 1.0);\n"
+            "}\n";
+        static const char *fs_src =
+            "#version 400 core\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  gl_SampleMask[0] = 0;\n"
+            "  colour = vec4(0.0, 1.0, 0.0, 1.0);\n"
+            "}\n";
+        GLuint single_fbo = 0, single_tex = 0, vao2 = 0;
+        glGenTextures(1, &single_tex);
+        glBindTexture(GL_TEXTURE_2D, single_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 16, 16, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, NULL);
+        glGenFramebuffers(1, &single_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, single_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, single_tex, 0);
+        glGenVertexArrays(1, &vao2);
+        glBindVertexArray(vao2);
+        glViewport(0, 0, 16, 16);
+        GLuint vs2 = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vs2, 1, &vs_src, NULL);
+        glCompileShader(vs2);
+        GLuint fs2 = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fs2, 1, &fs_src, NULL);
+        glCompileShader(fs2);
+        GLuint prog2 = glCreateProgram();
+        glAttachShader(prog2, vs2);
+        glAttachShader(prog2, fs2);
+        glLinkProgram(prog2);
+        GLint ok2 = 0;
+        glGetProgramiv(prog2, GL_LINK_STATUS, &ok2);
+        if (!ok2 ||
+            glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            fprintf(stderr, "INFO sample_mask_single unavailable\n");
+            result("sample_mask_ignored_single_sample", 0);
+        } else {
+            glUseProgram(prog2);
+            glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            unsigned char px[4] = {0};
+            glReadPixels(8, 8, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            const GLenum error = glGetError();
+            fprintf(stderr, "INFO sample_mask_ignored_single_sample "
+                    "got=%u,%u,%u want=green err=0x%04x\n",
+                    px[0], px[1], px[2], (unsigned)error);
+            /* Green: the write is ignored and the fragment survives. Red
+             * means the mask was honoured, which is the bug. */
+            result("sample_mask_ignored_single_sample",
+                   error == GL_NO_ERROR && px[1] > 160 && px[0] < 60);
+        }
+    }
+
 done:
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
