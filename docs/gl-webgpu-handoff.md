@@ -12793,3 +12793,49 @@ varying draws at all and carries its value, and a `sample` pair does not choke.
 Each case writes a constant marker beside the value, because a draw that never
 happened and a value that came back zero are indistinguishable otherwise --
 and while this was being written, both were true at different moments.
+
+## The device loss, narrowed from 121 cases to 22
+
+The app sweep re-ran against the current driver and came back **identical** to
+the one before the decline work -- 285 RAN, 22 EXIT, 16 OK, 11 CRASH, 2
+REFUSED, the two refusals still logic-op -- and SuperTuxKart, Minecraft 26.2
+and Blender all render at their recorded baselines. So the latch changes cost
+no application anything, which is what that sweep is for.
+
+The hard recovery is the one thing still open, and it is now much better
+understood. Two knobs went in for it, both inert unless set:
+`GEX_WGPU_NO_PIPELINE_CACHE` builds every pipeline fresh, and
+`GEX_WGPU_NO_BLITTER` declines a blit that would have gone through
+u_blitter's quad.
+
+**Eliminated by experiment:**
+
+  * not the pipeline cache -- the loss survives building every pipeline fresh;
+  * not u_blitter's quad draw -- the loss survives declining the blit;
+  * `KHR-GL44.framebuffer_blit.scissor_blit` is **necessary**: the same 21
+    following cases keep the device without it and lose it with it;
+  * and not sufficient: that case alone, forty times over, or followed only by
+    the case that reports the loss, does not reproduce.
+
+**Eliminated by reading:** resource destruction releases its textures and
+buffers; texture views, samplers, query sets and compute pipelines are each
+created and released in balance; the bind-group-layout cache's deliberate
+leak-when-full never fires, because its warning appears in none of the logs;
+and the pipeline key does contain the module and layout pointers, but Dawn
+refcounts those, so the address-reuse hazard that cache guards against cannot
+bite there.
+
+The reproducer is `sed -n '866,887p' /tmp/mp-filtered.txt` -- 22 cases, ending
+at `texture_size_promotion.functional`, which is where the loss is reported
+rather than where it is caused.
+
+One thing worth saying about *when* this became reachable: before the refusal
+latch was fixed, the context was dead long before this point, so the suite
+never got here. This is newly exposed rather than newly broken.
+
+### A trap in how I was waiting for it
+
+Several background waits of the form `while pgrep -f gl-app-sweep; do ...`
+never exited, because `pgrep -f` matches the *waiting shell's own command
+line*. It cost an hour of apparently-stalled sweeps. Match on something the
+waiter does not contain, or use the task machinery.
