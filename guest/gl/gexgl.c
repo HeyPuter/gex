@@ -2921,6 +2921,12 @@ const char *eglQueryString(void *dpy, int name) {
     }
 }
 
+/* Returned by eglGetProcAddress for GL entry points this marshaller does not
+   implement, so Wine can finish loading its GL table (it demands every name
+   resolve). Wide enough that an accidental call returns zero rather than
+   jumping through a null pointer. */
+static long gexgl_unimplemented(void) { return 0; }
+
 /* An application that looks a function up by name gets the same one it would
    have linked against, so a loader-style application works unchanged. */
 void *eglGetProcAddress(const char *name) {
@@ -2939,7 +2945,18 @@ void *eglGetProcAddress(const char *name) {
         if (!self) self = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
         if (!self) self = dlopen("libGLESv2.so.2", RTLD_LAZY | RTLD_LOCAL);
     }
-    return self ? dlsym(self, name) : NULL;
+    if (self) { proc = dlsym(self, name); if (proc) return proc; }
+
+    /* A GL entry point this marshaller does not implement. Wine's
+       winewayland.drv loads its whole desktop-GL table through
+       eglGetProcAddress and disables OpenGL if any name -- including a legacy
+       one like glAccum -- comes back NULL, even though the running program
+       never calls it. Hand back a stub so bring-up succeeds; a program that
+       actually calls an unimplemented entry point lands here and gets a
+       harmless zero rather than a crash in the loader. */
+    if (name[0] == 'g' && name[1] == 'l')
+        return (void *)gexgl_unimplemented;
+    return NULL;
 }
 
 /* Fixed function: the compatibility-profile calls a pre-shader program makes.
