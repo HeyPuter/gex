@@ -14247,11 +14247,98 @@ that needs the provoking vertex's attributes **duplicated** into each
 generated line, which is what Mesa's `draw` module unfilled stage does for the
 software drivers and what the hardware does natively.
 
-**What a fix needs.** Somewhere that can write vertex data rather than
-indices. The driver already has exactly that shape in the wide-line path,
-which captures the vertex shader's output into a buffer and draws quads from
-it -- an unfilled-polygon rewrite could do the same and overwrite the flat
-varying with the polygon's provoking value. That is a real piece of work, and
-the audience is legacy fixed-function flat shading: modern apps use shaders,
-where the flat varying is whatever the shader wrote and this does not arise.
-Weigh it accordingly.
+**It is not legacy-only, which is what settled whether to build it.** The
+paragraph that used to close this section guessed that the audience was
+fixed-function flat shading and that modern shaders would not hit it. That
+guess was wrong, and a probe is what said so: `gl44-flat-unfilled-probe`'s
+`shader_flat_edges` draws the same triangle with a `flat out` varying from a
+real GLSL program and fails identically. Flat varyings plus a wireframe is
+ordinary CAD and modelling drawing, not a compatibility-profile relic.
+
+**The fix: redraw the edges from a capture.** `gex_wgpu_flat_unfilled_draw`
+runs the vertex shader as compute into a capture buffer -- the same first pass
+the wide-line and facing-cull rewrites use -- and redraws the edge list with
+the geometry stage's own passthrough vertex shader.
+
+What keeps it to one pass and one buffer is the **slot table at double
+length**. The capture reads the vertex it runs for out of a table, so the
+table is built with twice as many entries as there are edge vertices: the
+first half is the edge endpoints, the second half is each edge's polygon's
+provoking vertex, repeated. One capture buffer then holds both sets
+contiguously, and it is bound *twice* as two vertex buffers a half apart. Only
+the element table differs from the geometry stage's: a flat slot reads binding
+one and every other slot reads binding zero. So each vertex draws at its own
+position carrying the provoking vertex's flat varyings, the passthrough shader
+needs no modification at all, and the cost is one extra vertex-shader
+invocation per edge vertex.
+
+`line_rewritten` is deliberately *not* set around that draw, so a wide, smooth
+or stippled wireframe still picks up its own rewrite on the way through -- and
+that rewrite blends the flat varying between two endpoint records which now
+hold the same value, so it stays correct.
+
+**Finding the provoking vertex.** For all six of `u_unfilled`'s topologies it
+is the **last vertex of the emitted edge ring**, so no topology needs a case
+of its own. The quad strip is the one worth checking rather than assuming: it
+emits the ring `(v2,v0,v1,v3)`, whose last entry is the same `v3` that GL's own
+quad-strip ordering ends on. Down the cull/edge-flag route it is taken from the
+resolved source list instead, because edge flags drop edges and a polygon
+cannot then be recovered by counting emitted ones.
+
+**Two things had to change besides.**
+
+*The provoking-vertex rewrite must be skipped for unfilled draws.* It ran
+first, and it was doing two things wrong at once: it rotates each primitive so
+GL's provoking vertex comes first, which moved the per-polygon provoking vertex
+out of the position the edge list would report it at; and for a quad the
+rotation goes through `u_index_translator`, which emits **triangles**, so the
+wireframe gained the diagonal `glPolygonMode` is documented not to draw. Both
+appeared the moment a flat quad was drawn unfilled. The unfilled path serves
+the convention itself now, so skipping it there loses nothing.
+
+*There are two routes to the edge list and both needed wiring.* The
+`u_unfilled_translator` route, and `gex_wgpu_cull_polygons`, which emits the
+final LINES list itself whenever culling or edge flags are in play. Fixing only
+the first leaves every culled or edge-flagged wireframe still wrong, which is
+what `culled_edges_agree` is in the probe to catch -- and it caught a second,
+older bug behind it; see the next section.
+
+All six probe cases now match llvmpipe, and the whole polygon-mode probe family
+still passes.
+
+
+## The facing cull was culling the wrong face into an FBO
+
+Wiring the flat-unfilled replay into the culling route turned up a defect
+older than either: with `GL_CULL_FACE` on, a flat unfilled triangle drew
+**nothing at all**, and `GEX_WGPU_NO_FACING_CULL=1` brought it straight back.
+
+The instrumentation says it in one line:
+
+    gex-wgpu: facing p=0 area=2.5600 usable=1 front=0 culled=1 cull_face=2 front_ccw=0 flip=1
+
+The area is positive -- the triangle is counter-clockwise, which is what it was
+written to be -- and `front_ccw` is **zero**, so `(area > 0) == front_ccw` made
+it back-facing and `cull_face=2` (`PIPE_FACE_BACK`) threw it away.
+
+**The two sides of that comparison were in different spaces.**
+`st_atom_rasterizer.c` flips `front_ccw` when the framebuffer is `Y_0_BOTTOM`
+-- its own comment says "Drawing to an FBO. The viewport will be inverted." --
+so `front_ccw` describes the space the *rasterizer* sees. The driver pairs that
+with a y-flipped vertex module, chosen by `ctx->viewport_set &&
+ctx->viewport.scale[1] > 0.0f`, and maps `front_ccw` to WebGPU's `frontFace`
+directly on that basis. But `gex_wgpu_cull_polygons` decides facing from the
+*capture* variant, which is compiled `flip_y = false`. So its area sign is the
+opposite of the rasterizer's exactly when the flipped module is in use -- which
+is every FBO.
+
+The fix is to read `front_ccw` through the same flip:
+`(area > 0) == (front_ccw != vertex_flip)`, using the predicate the draw state
+already uses. Any future CPU-side geometry decision taken from a capture needs
+the same correction: the capture is in Gallium clip space, not in the space the
+rasterizer state describes.
+
+**Why nothing caught it.** `polygon-mode-probe`'s cull case culls *both* faces,
+so the sign cannot matter to it, and `polygon-mode-faces` passes with either
+sign. It took a case that culls one face of a polygon whose winding is known
+and asserts something is still drawn.

@@ -53,6 +53,25 @@ SELF=${GEX_COMPARE_SELF:-}
 # and refdiff. Off by default because it is another run per program, and
 # softpipe is slow enough to need a longer window.
 REF2=${GEX_COMPARE_REF2:-}
+# GEX_COMPARE_LOAD=1 photographs llvmpipe a second time with the process
+# pinned to a single core, and reports how far the reference moves from
+# itself when it is merely slower.
+#
+# This retires the third class of false defect, and it is the one the other
+# two columns cannot see: a program whose framebuffer encodes *how much work
+# finished*. `gltestperf` is a benchmark -- "GLTest v1.0" -- that draws for a
+# fixed wall-clock window, so its image is a function of throughput. It
+# scored 0.306, the largest deterministic row in the corpus, with self=0 and
+# with llvmpipe and radeonsi pixel-identical to each other: every existing
+# column called it a real defect. Pinned to one core llvmpipe disagrees with
+# *itself* by 0.356 -- more than the driver disagrees with it -- which is
+# what says the number is unattributable.
+#
+# self=0 proves determinism, not time-independence: two runs of one driver
+# on an idle machine both finish the same amount of work, so an animation
+# floor of zero is exactly what a benchmark produces. Off by default because
+# it is another run per program.
+LOAD=${GEX_COMPARE_LOAD:-}
 export DISPLAY=${GEX_DISPLAY:-:77}
 
 [ -d "$INST/lib/dri" ] || { echo "no driver at $INST/lib/dri" >&2; exit 2; }
@@ -77,7 +96,7 @@ if [ "${stale:-0}" -gt 0 ]; then
 fi
 mkdir -p "$OUT"
 : > "$OUT/results.tsv"
-printf 'app\trmse\tself\trefdiff\tnote\n' >> "$OUT/results.tsv"
+printf 'app\trmse\tself\trefdiff\tload\tnote\n' >> "$OUT/results.tsv"
 
 # A program is photographed by its own window. With no window manager the
 # window's name is whatever the program set, which is usually its argv[0] and
@@ -85,14 +104,20 @@ printf 'app\trmse\tself\trefdiff\tnote\n' >> "$OUT/results.tsv"
 # instead, which is right for the single-window programs this list holds.
 shoot() {
     local driver=$1 out=$2 app=$3
+    # GEX_COMPARE_PIN, set only by the load probe below, starves the run of
+    # CPU so a program whose image depends on throughput renders a different
+    # one. It is deliberately not a driver choice: the same driver is run
+    # twice and only the core count differs.
+    local pin=
+    [ -n "${GEX_COMPARE_PIN:-}" ] && pin="taskset -c 0"
     if [ "$driver" = llvmpipe ] || [ "$driver" = softpipe ]; then
         ( LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=$driver \
-          timeout -s KILL $((DELAY + 20)) "$app" >"$out.log" 2>&1 & )
+          $pin timeout -s KILL $((DELAY + 20)) "$app" >"$out.log" 2>&1 & )
     else
         ( LD_LIBRARY_PATH=$INST/lib:$HOME/.cache/gex-dawn-native/pkg/lib \
           LIBGL_DRIVERS_PATH=$INST/lib/dri LIBGL_ALWAYS_SOFTWARE=1 \
           GALLIUM_DRIVER=gex_wgpu \
-          timeout -s KILL $((DELAY + 10)) "$app" >"$out.log" 2>&1 & )
+          $pin timeout -s KILL $((DELAY + 10)) "$app" >"$out.log" 2>&1 & )
     fi
     sleep "$DELAY"
     # The largest window, not the first. With no window manager the root's
@@ -207,10 +232,24 @@ while read -r app; do
         fi
         quiet_kill "$name"; sleep 1
     fi
-    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${rmse:--}" "${self:--}" \
-        "${refdiff:--}" "$note" >> "$OUT/results.tsv"
-    printf '%-32s %-10s %-10s %-10s %s\n' "$name" "${rmse:--}" "${self:--}" \
-        "${refdiff:--}" "$note"
+    # The throughput floor: llvmpipe against llvmpipe with one core. A
+    # program that renders how much work finished moves here, and its rmse
+    # against any other driver is a speed measurement wearing a
+    # correctness column's name.
+    load=
+    if [ -n "$LOAD" ] && [ -z "$note" ]; then
+        if GEX_COMPARE_PIN=1 shoot llvmpipe "$OUT/$name-refslow.png" "$app"
+        then
+            load=$(compare -metric RMSE "$OUT/$name-ref.png" \
+                   "$OUT/$name-refslow.png" null: 2>&1 \
+                   | sed -n 's/.*(\([0-9.e-]*\)).*/\1/p')
+        fi
+        quiet_kill "$name"; sleep 1
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "${rmse:--}" "${self:--}" \
+        "${refdiff:--}" "${load:--}" "$note" >> "$OUT/results.tsv"
+    printf '%-32s %-10s %-10s %-10s %-10s %s\n' "$name" "${rmse:--}" \
+        "${self:--}" "${refdiff:--}" "${load:--}" "$note"
 done < "$LIST"
 
 echo

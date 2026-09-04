@@ -214,6 +214,52 @@ int main(void) {
         result("varyings_interpolate", ok);
     }
 
+    /* 4b. A *flat* varying on a wide line. The same geometry as the case
+     * above with the opposite shade model, which is what makes this a pair:
+     * GL_SMOOTH must give a gradient, GL_FLAT must give one solid colour.
+     *
+     * A wide line is not drawn as a line by this driver -- it becomes two
+     * triangles fed from a capture of the vertex shader's output, and that
+     * replay wrote every varying as a blend between the two endpoint records
+     * with the default (smooth) interpolation. So a flat varying came out
+     * interpolated: the case above and this one drew the *same* gradient,
+     * and only the smooth one was right.
+     *
+     * GL takes a line's flat value from its *last* vertex, so this line is
+     * blue from end to end. The assertion is deliberately about both ends at
+     * once -- a driver that took the first vertex instead passes a "solid
+     * colour" check while drawing the wrong one, and a driver that
+     * interpolates fails both halves.
+     */
+    {
+        clear_black();
+        glLineWidth(5.0f);
+        glShadeModel(GL_FLAT);
+        glBegin(GL_LINES);
+        glColor3f(1.0f, 0.0f, 0.0f); glVertex2f(-0.8f, 0.0f);
+        glColor3f(0.0f, 0.0f, 1.0f); glVertex2f(0.8f, 0.0f);
+        glEnd();
+        glShadeModel(GL_SMOOTH);
+        unsigned y = SIZE / 2;
+        read_target();
+        int best = -1;
+        for (unsigned row = 0; row < SIZE; ++row) {
+            const int n = lit_in_row(row);
+            if (n > best) { best = n; y = row; }
+        }
+        const unsigned left = 5, right = SIZE - 6;
+        /* Blue at both ends, and no red anywhere along it. */
+        const int ok = glGetError() == GL_NO_ERROR &&
+                       channel(left, y, 2) > 150 && channel(right, y, 2) > 150 &&
+                       channel(left, y, 0) < 60 && channel(right, y, 0) < 60;
+        fprintf(stderr, "INFO flat_wide_line left=%u,%u,%u right=%u,%u,%u "
+                "want both blue\n",
+                channel(left, y, 0), channel(left, y, 1), channel(left, y, 2),
+                channel(right, y, 0), channel(right, y, 1),
+                channel(right, y, 2));
+        result("flat_wide_line", ok);
+    }
+
     /* 5. GL_LINE_STIPPLE. A 1-pixel line with the pattern 0x00FF and factor 1
      * is eight pixels on, eight off, so a 24-pixel span has two thirds of its
      * pixels lit rather than all of them. */
