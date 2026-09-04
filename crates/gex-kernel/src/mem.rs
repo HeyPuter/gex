@@ -481,7 +481,19 @@ impl MemoryMap {
             // keep the requested address for the guest's bookkeeping.
             let map_lo = addr.max(gex_abi::RESERVE_FLOOR);
             if map_lo < end {
-                self.ensure_backed(end)?;
+                // A PROT_NONE reservation is not backed: on Linux it has no
+                // physical pages, and backing it here would grow the wasm
+                // memory to its top address for nothing. That is fatal for a
+                // 64-bit Wine, whose ntdll reserves the whole low 2 GiB with
+                // PROT_NONE FIXED_NOREPLACE -- backing it tried to grow the
+                // memory toward 2 GiB, failed (ENOMEM), and sent Wine bisecting
+                // the range into tens of thousands of tiny mmaps that never
+                // finish in the browser. The commit that follows (`mprotect` to
+                // a real prot, or a `MAP_FIXED` with one over the reservation)
+                // is what backs the pages it actually touches -- see `protect`.
+                if prot != 0 {
+                    self.ensure_backed(end)?;
+                }
                 self.unmap(map_lo, end - map_lo)?;
                 self.insert_from(map_lo, end, prot, name, origin);
             }
@@ -638,6 +650,13 @@ impl MemoryMap {
         }
         let len = page_align_up(len);
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+        // Committing (giving a range real permissions) is what backs the pages
+        // a PROT_NONE reservation left unbacked: the guest is about to touch
+        // them, so the wasm memory must reach that far. A reservation stays
+        // unbacked -- `mprotect(PROT_NONE)` needs nothing behind it.
+        if new_prot != 0 {
+            self.ensure_backed(end)?;
+        }
         let mut out = Vec::with_capacity(self.vmas.len() + 2);
         let mut touched = false;
         for v in std::mem::take(&mut self.vmas) {
