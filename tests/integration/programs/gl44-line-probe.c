@@ -298,10 +298,31 @@ int main(void) {
         read_target();
         int smooth = 0;
         for (unsigned y = 0; y < SIZE; ++y) smooth += lit_in_row(y);
-        fprintf(stderr, "INFO smooth aliased=%d smooth=%d err=0x%04x\n",
-                aliased, smooth, (unsigned)glGetError());
+        /* Partial coverage is the thing GL_LINE_SMOOTH actually provides, and
+         * counting lit pixels does not test for it: enabling smoothing also
+         * rebuilds the quad perpendicular to the segment, which changes the
+         * count on its own. This case passed for a long time while smoothing
+         * did *nothing* -- the pass that modulates alpha by coverage looked
+         * for a colour output at FRAG_RESULT_DATA0 and a fixed-function
+         * shader writes FRAG_RESULT_COLOR, so it matched nothing and said
+         * nothing. Assert on a value strictly between background and full. */
+        int partial = 0;
+        for (unsigned i = 0; i < SIZE * SIZE; ++i) {
+            /* Alpha, not red. GL_LINE_SMOOTH multiplies the fragment's alpha
+             * by its coverage; with no GL_BLEND enabled the colour channels
+             * are written at full strength regardless, so a gradient only
+             * appears in alpha. Looking at red found nothing on *both*
+             * drivers, which is the assertion being wrong rather than either
+             * driver. */
+            const unsigned char a = pixels[i * 4 + 3];
+            if (a > 8 && a < 247) ++partial;
+        }
+        fprintf(stderr, "INFO smooth aliased=%d smooth=%d partial=%d "
+                "err=0x%04x\n", aliased, smooth, partial,
+                (unsigned)glGetError());
         result("line_smooth_differs", aliased > 0 && smooth > 0 &&
                                       aliased != smooth);
+        result("line_smooth_coverage", partial > 0);
     }
 
     /* The same wide and smooth lines from an *indexed* draw.
