@@ -14125,10 +14125,37 @@ The one row so far that survives all three checks.
   `CurrentExecPrimitive` is 15 (outside begin/end), and `DrawGLError` is
   already `GL_INVALID_OPERATION`.
 
-`OPCODE_BEGIN`/`OPCODE_END` are only compiled into a display list for a
-*degenerate* primitive -- one with no vertices, which is what the test is for;
-ordinary vertex sequences become a single `OPCODE_VERTEX_LIST`. So the
-compiled list holds an `END` whose `BEGIN` is missing, which means **list
-compilation diverged**, not replay. The next step is a differential trace of
-`vbo_save` between the two drivers rather than more state inspection at the
-error -- the state there is already known to be sane.
+An `LD_PRELOAD` interposer over `glBegin`/`glEnd`/`glNewList`/`glCallList`
+settles what the program actually does, and it is not what the name suggests:
+
+    glNewList(list=1)  glBegin(GL_POLYGON)  glVertex2f  glVertex2f  glEndList
+    glNewList(list=2)  glVertex2f  glVertex2f  glEnd()              glEndList
+    glCallList(1)  glCallList(2)
+
+It splits **one begin/end pair across two display lists** -- a dangling
+`glBegin` in the first, the matching `glEnd` in the second -- which GL permits
+and which is the whole point of the test. Replaying them in order should give
+one four-vertex polygon.
+
+A minimal reproducer of just that (compile the two lists, call both, check
+`glGetError`) gives `GL_INVALID_OPERATION` on this driver and `GL_NO_ERROR`
+on softpipe **with the same Mesa**, so the divergence is real and isolated.
+
+**But it probably is not ours to fix.** Extending that reproducer to try each
+primitive mode in turn, with a whole-pair control list first, trips an
+assertion inside Mesa on *every* driver:
+
+    vbo_save_api.c:1166: upgrade_vertex: Assertion `save->copied.nr == 0' failed
+
+So Mesa's own display-list vertex compiler barely supports this pattern, and
+the gex/softpipe difference is far more likely to be `vbo_save` reaching a
+different state than a defect in the driver's own code -- nothing in the
+driver is even called. If this is picked up again, start in `vbo_save_api.c`
+with the two drivers side by side, not in `gex_wgpu_screen.c`; and weigh it
+against how rare the pattern is, since Mesa asserts on mild variations of
+it.
+
+Note also: `glGetError` *between* `glBegin` and `glEnd` is itself
+`GL_INVALID_OPERATION`. The first version of the reproducer did that and
+reported an error on every driver, which looked like agreement that something
+was broken.
