@@ -13057,6 +13057,25 @@ leak-when-full never fires, because its warning is in none of the logs; and
 the pipeline key holds module and layout pointers but Dawn refcounts them, so
 the address-reuse hazard that cache guards against cannot bite there.
 
+### Three more facts
+
+**Block compression is required.** With `GEX_WGPU_NO_BC` withholding
+`TextureCompressionBC` the reproducer keeps the device, twice; with it, the
+device is lost, twice. Weaker evidence than it looks, and worth saying so:
+without BC the compressed test errors out early and therefore also does
+*less*, so this may be about the work rather than about the format.
+
+**Order does not matter.** All three orderings lose the device. It is a set,
+not a sequence -- not "one leaves state the next trips on", which is what the
+first bisection made it look like.
+
+**A standalone approximation does not reproduce it.** A program doing a
+scissored multisample blit, a BC1 texture with data, and a dozen
+single-format render targets cleared and read back survives. So the trigger is
+more particular than the shape of the three tests. That is a negative result
+worth having: the obvious next move is to hand-write a small reproducer, and
+it does not work.
+
 ### Where to go next
 
 Not more bisection -- three cases is where that ends. The reproducer is now
