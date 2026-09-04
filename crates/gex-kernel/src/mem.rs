@@ -334,6 +334,39 @@ impl MemoryMap {
             origin,
         });
         self.vmas.sort_by_key(|v| v.start);
+        self.merge_adjacent();
+    }
+
+    /// Fold contiguous anonymous mappings with the same permissions into one.
+    ///
+    /// A 64-bit Wine reserves the low 2 GiB one chunk at a time, leaving
+    /// thousands of adjacent PROT_NONE VMAs -- which `/proc/self/maps` then
+    /// renders as thousands of lines that Wine's own loader re-parses with
+    /// `sscanf`, a real crawl under the browser's translated libc (winemine
+    /// spends minutes there). Contiguous same-permission anonymous spans are
+    /// indistinguishable to any reader, so a merge is transparent. Only
+    /// anonymous ones (no `code`/`origin` identity, so no shared translation
+    /// keyed on the exact span) are eligible; a named library stays whole.
+    fn merge_adjacent(&mut self) {
+        let mut i = 0;
+        while i + 1 < self.vmas.len() {
+            let a = &self.vmas[i];
+            let b = &self.vmas[i + 1];
+            if a.end == b.start
+                && a.prot == b.prot
+                && a.name == b.name
+                && a.code.is_none()
+                && b.code.is_none()
+                && a.origin.is_none()
+                && b.origin.is_none()
+            {
+                let end = self.vmas[i + 1].end;
+                self.vmas[i].end = end;
+                self.vmas.remove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// `brk(0)` reports the break; `brk(addr)` moves it and returns the new
