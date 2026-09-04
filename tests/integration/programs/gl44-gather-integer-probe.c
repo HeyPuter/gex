@@ -245,6 +245,30 @@ int main(void) {
                     GL_COMPARE_REF_TO_TEXTURE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
 
+    /* An integer cube, whose six faces carry distinct values. WebGPU has no
+     * integer cube sample type, so the driver declares such a texture as a
+     * 2D array and reaches it through an alternate view of the same six-layer
+     * allocation -- and the shader, the bind group layout and the bound view
+     * all have to agree on that. */
+    GLuint cube_tex = 0;
+    glGenTextures(1, &cube_tex);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cube_tex);
+    for (unsigned face = 0; face < 6; ++face) {
+        /* 2x2 per face; every texel of face f holds 10*(f+1). */
+        GLint faceels[4][4];
+        for (unsigned t = 0; t < 4; ++t) {
+            faceels[t][0] = (GLint)(10 * (face + 1));
+            faceels[t][1] = faceels[t][2] = 0;
+            faceels[t][3] = 1;
+        }
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGBA32I,
+                     2, 2, 0, GL_RGBA_INTEGER, GL_INT, faceels);
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
     if (glGetError() != GL_NO_ERROR) {
         fprintf(stderr, "INFO setup failed\n");
         printf("SUMMARY cases=0 passed=0 failed=0\n");
@@ -271,17 +295,27 @@ int main(void) {
         {"depth_compare", "sampler2DShadow",
          "colour = ivec4(textureGather(src, vec2(0.5), 0.25) * 100.0);", 0,
          {100, 100, 0, 0}},
+        /* +Y is face 2, so every gathered texel is 30. Gathering a cube is a
+         * decomposition into four fetches with edge handling, and every
+         * texel of the face is the same value so no rotation rule enters --
+         * this case is about the *shape* reaching the GPU at all. */
+        {"int_cube", "isamplerCube",
+         "colour = textureGather(src, vec3(0.0, 1.0, 0.0), 0);", 0,
+         {30, 30, 30, 30}},
     };
     tests[0].tex = signed_tex;
     tests[1].tex = signed_tex;
     tests[2].tex = unsigned_tex;
     tests[3].tex = depth_tex;
+    tests[4].tex = cube_tex;
 
     for (unsigned i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
         GLuint prog = build(tests[i].sampler, tests[i].body);
         GLint got[4] = {-9, -9, -9, -9};
+        const GLenum target = strstr(tests[i].sampler, "Cube")
+            ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
         if (prog)
-            draw_and_read(prog, GL_TEXTURE_2D, tests[i].tex, got);
+            draw_and_read(prog, target, tests[i].tex, got);
         const GLenum error = glGetError();
         const int ok = prog && error == GL_NO_ERROR &&
                        !memcmp(got, tests[i].want, sizeof(got));
@@ -302,16 +336,22 @@ int main(void) {
         {"depth_in_vertex", "sampler2DShadow",
          "gathered = ivec4(textureGather(src, vec2(0.5), 0.25) * 100.0);", 0,
          {100, 100, 0, 0}},
+        {"int_cube_in_vertex", "isamplerCube",
+         "gathered = textureGather(src, vec3(0.0, 1.0, 0.0), 0);", 0,
+         {30, 30, 30, 30}},
     };
     vertex_tests[0].tex = signed_tex;
     vertex_tests[1].tex = depth_tex;
+    vertex_tests[2].tex = cube_tex;
     for (unsigned i = 0; i < sizeof(vertex_tests) / sizeof(vertex_tests[0]);
          ++i) {
         GLuint prog = build_vertex_sampled(vertex_tests[i].sampler,
                                            vertex_tests[i].body);
         GLint got[4] = {-9, -9, -9, -9};
+        const GLenum target = strstr(vertex_tests[i].sampler, "Cube")
+            ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
         if (prog)
-            draw_and_read(prog, GL_TEXTURE_2D, vertex_tests[i].tex, got);
+            draw_and_read(prog, target, vertex_tests[i].tex, got);
         const GLenum error = glGetError();
         const int ok = prog && error == GL_NO_ERROR &&
                        !memcmp(got, vertex_tests[i].want, sizeof(got));

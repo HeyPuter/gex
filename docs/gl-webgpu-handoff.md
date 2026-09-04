@@ -13357,3 +13357,97 @@ free unread. Both of those were needed to find the above at all -- the failing
 shader never reaches the dump in `gex_wgpu_compile_nir`, so "could not build a
 vertex shader variant" plus a list of four possible causes was all the log
 said.
+
+## An integer cube map, and the image format wall behind EEVEE
+
+`KHR-GL44.texture_gather` finished at 73/75 (from 29 three passes ago). The
+five remaining cube cases were three separate disagreements about one fact:
+WebGPU has no integer cube sample type, so an integer cube is declared as a
+2D array and reached through an alternate view of the same six-layer
+allocation. The **shader**, the **bind group layout** and the **bound view**
+all have to say so, and only the fragment stage did.
+
+The first was invalid SPIR-V, which fails the whole program rather than one
+draw. `dxil_nir_lower_int_cubemaps` rewrites the variable's type to a 2D
+array, but its gather path derives a size query from the original cube op --
+`nir_get_texture_size` copies the op's shape -- so it asked for two
+components where an arrayed image gives three. Widening it is safe for every
+reader in that pass. d3d12, the pass's other consumer, lowers the query
+further and never saw the mismatch.
+
+The second was the vertex and compute stages binding `view->view` whatever
+their layout declared. That is now one helper all three stages call, so they
+cannot diverge again; the fragment stage's open-coded version is gone. The
+third was compute declaring the texture as `Cube` while its variant module ran
+the same cubemap lowering and came out as a 2D array.
+
+**A note on the A/B I got wrong.** I first concluded the invalid SPIR-V
+predated this work, on the grounds that disabling the integer gather pass left
+the same validator error in the log. It did not: the driver prints its
+rejected module **once per process**, and the CTS builds many programs, so
+both runs were showing the same *other* shader's error. The disassembly said
+otherwise -- four `OpImageFetch` and one size query is a gather decomposition,
+not anything else. **When a diagnostic is once-per-process, an A/B on its
+presence proves nothing**; compare the disassembly, or count.
+
+### Colour targets a shader does not write
+
+WebGPU requires a colour target with no corresponding fragment output to be
+masked out, and rejects the pipeline otherwise -- which invalidates the whole
+command buffer, so every batched draw is lost with it, not only the offending
+one. A fragment shader that writes only to an image or a storage buffer is an
+ordinary GL shader that writes no colour at all; so is one drawn for its side
+effects alone. The attachment-less framebuffer had a special case for exactly
+this reasoning and the general one was missing.
+
+The mask comes from the shader's declared outputs, and two details matter:
+`gl_FragColor` broadcasts to every target, and a dual-source second output
+sits at `DATA0` with index 1 -- that is not target 1 and must not be counted
+as one.
+
+### What actually blocks Blender's EEVEE viewport
+
+Worth stating plainly because it is the largest remaining capability gap and
+it has a named application behind it. Blender's *rendered* viewport fails to
+link six shaders and crashes, and the driver's reason is:
+
+    shader rejected: gex_wgpu image 'out_scattering_img' has format
+    r11g11b10_float, which WebGPU cannot take as a storage texture
+
+`gex_wgpu_storage_texture_format` matches WebGPU's core storage list exactly
+and completely -- there is no missing entry to add. WebGPU offers storage
+textures only for the four-channel 8/16/32-bit formats and the one- and
+two-channel 32-bit ones. GL 4.2 *requires* about twenty more: `rg16f`, `r16f`,
+`r8ui`, `rgb10_a2`, `r11f_g11f_b10f` and the rest of the 1- and 2-channel
+sizes. Thirteen of the twenty-four real failures in
+`KHR-GL44.shader_image_load_store` are this one thing, and so is EEVEE.
+
+Two routes exist and both are real work rather than a fix:
+
+- **Pack into a supported format.** Every missing format is 1, 2 or 4 bytes,
+  and `r32uint` is a supported 4-byte storage format, so a 4-byte format can
+  be stored packed and unpacked in the shader. The obstacle is that WebGPU's
+  `viewFormats` spans only the sRGB pair, so a texture allocated as
+  `rg11b10ufloat` cannot be *viewed* as `r32uint` -- the texture would have to
+  be allocated as `r32uint` from the start, and then every other use of it
+  (sampling, rendering, copying) needs the same pack/unpack. This is the same
+  wall as [[blender-format-reinterpretation]]. The 1- and 2-byte formats are
+  worse: there is no 1-byte storage format at all, so they would need several
+  texels per word and a changed addressing scheme.
+- **Lower read-only images to textures.** `nir_lower_readonly_images_to_tex`
+  already exists in Mesa and needs no storage format at all -- a `readonly`
+  image of any format becomes an ordinary `texelFetch`. It is used by d3d12
+  and CLC, where images and textures share a descriptor space; here they are
+  separate binding tables fed by `set_shader_images`, so the driver would need
+  to bind an image view as a texture binding. That is a bounded change and it
+  would cover every `readonly` image regardless of format -- a good first
+  step, and it is where I would start.
+
+Smaller things fixed on the way: an image unit with nothing bound now binds a
+1x1 stand-in, which is what GL says such a unit reads (zero, with stores
+discarded) rather than the dead context it used to produce; and a view WebGPU
+refuses is declined by name, with the message saying what was asked for.
+
+`KHR-GL44.texture_cube_map_array` is 0/2 with and without the cube size-query
+change, so those failures are older than this work; I have not looked into
+them.
