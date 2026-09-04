@@ -425,7 +425,21 @@ impl MemoryMap {
             // 0..`RESERVE_FLOOR`). Wine reserves address space this way and
             // relies on the failure to reserve only the free gaps.
             let noreplace = flags & flags::FIXED_NOREPLACE != 0 && flags & flags::FIXED == 0;
-            let hits_reserved = addr < gex_abi::RESERVE_FLOOR;
+            // The gap between the guest's stack and where the mmap allocator
+            // begins ([`STACK_TOP`], [`MMAP_BOTTOM`)) is not free space: in the
+            // browser the shim shares the guest's linear memory and its own
+            // stack and static data live here, so a guest mapping into it
+            // overwrites the runtime and the Worker dies with a bare
+            // `unreachable`. A 64-bit Wine's `virtual_init` probes low address
+            // space with `MAP_FIXED_NOREPLACE` and, finding this gap "free",
+            // reserved straight over the shim -- winemine's browser crash.
+            // Treat it as occupied like the low reserved region: a NOREPLACE
+            // probe steps past it (as it already does over the stack below), a
+            // plain `MAP_FIXED` is refused rather than allowed to clip into it.
+            // Natively the gap is unused guest memory and refusing it only
+            // moves Wine's reservation a little higher, which is harmless.
+            let hits_shim = addr < gex_abi::MMAP_BOTTOM && end > gex_abi::STACK_TOP;
+            let hits_reserved = addr < gex_abi::RESERVE_FLOOR || hits_shim;
             // `MAP_FIXED_NOREPLACE` must not disturb anything already there.
             // Linux fails it over *any* existing mapping, PROT_NONE included,
             // and that failure is load-bearing for a multithreaded guest: Wine
@@ -455,6 +469,13 @@ impl MemoryMap {
             if noreplace && (conflict || hits_reserved) {
                 return Err(Errno::EEXIST);
             }
+            // A plain `MAP_FIXED` into the shim's gap would clip straight over
+            // the runtime (the clip below only protects the low reserved
+            // region), so refuse it outright. Reservations there are already
+            // refused above, so a commit never legitimately reaches here.
+            if hits_shim {
+                return Err(Errno::ENOMEM);
+            }
             // Plain `MAP_FIXED` replaces whatever was there -- except the
             // reserved region, which it must never overwrite. Clip it out and
             // keep the requested address for the guest's bookkeeping.
@@ -467,10 +488,15 @@ impl MemoryMap {
             return Ok(addr);
         }
 
-        // An address hint is honoured when the range happens to be free.
+        // An address hint is honoured when the range happens to be free --
+        // but never in the shim's gap ([`STACK_TOP`], [`MMAP_BOTTOM`)), which
+        // `is_free` reports as free (no VMA there) yet holds the runtime in the
+        // browser. Fall through to the allocator, which hands out at or above
+        // `MMAP_BOTTOM`.
         if addr != 0 && addr.is_multiple_of(PAGE_SIZE) {
             let end = addr.saturating_add(len);
-            if end <= MMAP_TOP && self.is_free(addr, end) && self.ensure_backed(end).is_ok() {
+            let in_shim = addr < gex_abi::MMAP_BOTTOM && end > gex_abi::STACK_TOP;
+            if !in_shim && end <= MMAP_TOP && self.is_free(addr, end) && self.ensure_backed(end).is_ok() {
                 self.insert_from(addr, end, prot, name, origin);
                 return Ok(addr);
             }
@@ -812,6 +838,33 @@ mod tests {
             .unwrap();
         assert_eq!(got, a);
         assert!(m.check_access(a, 0x1000, prot::WRITE));
+    }
+
+    #[test]
+    fn the_shim_gap_is_not_free_space() {
+        // The gap between the guest stack and the mmap allocator holds the
+        // browser shim. A NOREPLACE probe there must fail (so Wine steps past
+        // it, as its virtual_init does) and a plain FIXED must be refused,
+        // never allowed to clip over the runtime -- winemine's browser crash.
+        let mut m = MemoryMap::new(0x40_1000);
+        let gap = gex_abi::STACK_TOP + 0x30_0000;
+        assert!(gap < gex_abi::MMAP_BOTTOM);
+        assert_eq!(
+            m.mmap(gap, 0x1000, 0, flags::ANONYMOUS | flags::FIXED_NOREPLACE, "r"),
+            Err(Errno::EEXIST),
+        );
+        assert_eq!(
+            m.mmap(gap, 0x1000, prot::WRITE, flags::ANONYMOUS | flags::FIXED, "c"),
+            Err(Errno::ENOMEM),
+        );
+        // A hint into the gap is not honoured either: it falls through to the
+        // allocator, which hands out at or above MMAP_BOTTOM.
+        let got = m.mmap(gap, 0x1000, prot::WRITE, flags::ANONYMOUS, "h").unwrap();
+        assert!(got >= gex_abi::MMAP_BOTTOM, "hint honoured inside the shim gap: {got:#x}");
+        // And an ordinary NOREPLACE reservation above MMAP_BOTTOM still works.
+        assert!(m
+            .mmap(gex_abi::MMAP_BOTTOM, 0x1000, 0, flags::ANONYMOUS | flags::FIXED_NOREPLACE, "ok")
+            .is_ok());
     }
 
     #[test]
