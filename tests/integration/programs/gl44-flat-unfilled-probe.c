@@ -353,6 +353,48 @@ int main(void) {
                same_colour(left, want));
     }
 
+    /* 2f. A flat unfilled GL_POLYGON, whose provoking vertex is the one
+     * exception in GL's flatshading table.
+     *
+     * Every other topology takes its primitive's *last* vertex. A single
+     * polygon takes vertex **one**, its first, and glProvokingVertex does not
+     * change that -- the table names vertex 1 outright. Applying the
+     * last-vertex rule painted poly-flat-unfilled-clip cyan where both
+     * references draw red.
+     *
+     * Laid out as the same square as the quad cases so the four edge
+     * midpoints are the same pixels, with the expected colour on v0 and three
+     * different colours behind it, so taking any other vertex fails.
+     */
+    {
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBegin(GL_POLYGON);
+        glColor3f(0.0f, 0.0f, 1.0f); glVertex2f(-0.7f, -0.7f);
+        glColor3f(1.0f, 0.0f, 0.0f); glVertex2f( 0.7f, -0.7f);
+        glColor3f(0.0f, 1.0f, 0.0f); glVertex2f( 0.7f,  0.7f);
+        glColor3f(1.0f, 1.0f, 0.0f); glVertex2f(-0.7f,  0.7f);
+        glEnd();
+        const GLenum error = glGetError();
+        read_target();
+        unsigned char bottom[3], top[3], right[3], left[3];
+        const int ok_b = edge_colour(32, 10, bottom);
+        const int ok_t = edge_colour(32, 54, top);
+        const int ok_r = edge_colour(54, 32, right);
+        const int ok_l = edge_colour(10, 32, left);
+        const int inside = lit_inside_quad();
+        fprintf(stderr, "INFO polygon bottom=%u,%u,%u top=%u,%u,%u "
+                "right=%u,%u,%u left=%u,%u,%u inside=%d err=0x%04x\n",
+                bottom[0], bottom[1], bottom[2], top[0], top[1], top[2],
+                right[0], right[1], right[2], left[0], left[1], left[2],
+                inside, (unsigned)error);
+        static const unsigned char want[3] = {0, 0, 255};
+        result("polygon_edges_agree",
+               error == GL_NO_ERROR && ok_b && ok_t && ok_r && ok_l &&
+               inside == 0 &&
+               same_colour(bottom, want) && same_colour(top, want) &&
+               same_colour(right, want) && same_colour(left, want));
+    }
+
     /* 3. The same triangle with a `flat out` varying from a real shader.
      * Fixed-function flat shading is lowered by st/mesa into exactly such a
      * varying, so this should behave identically -- and if it does not, the

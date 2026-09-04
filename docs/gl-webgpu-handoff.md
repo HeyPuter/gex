@@ -14386,7 +14386,13 @@ drawing one: the diagonal runs along `x + y = 63` and the probe sampled
 quad, which no real edge comes near and any spurious edge must cross. Count an
 interior, do not sample a computed line.
 
-**The obvious fix crashes primitive restart, and I could not resolve it.**
+**Resolved: it was a Mesa bug, not the cap.** See the next section. The cap
+change is in, `quad-unfilled` and `quad-unfilled-clip` are down from 0.0446 to
+6.8e-05 and 6.6e-05, and both quad-diagonal probe cases now pass. What follows
+is the diagnosis as it stood before that, kept because the reasoning is what
+led to the real cause.
+
+**The obvious fix appeared to crash primitive restart.**
 The driver's own `u_primconvert` is created with the narrow WebGPU-native mask
 and the draw dispatch converts against that same mask, so advertising quads in
 `caps->supported_prim_modes` *alone* looked free: the unfilled rewrite runs
@@ -14404,8 +14410,88 @@ Four variants all crash the same way: all of quads+quad-strip+polygon+fan;
 dropping the fan (which is not needed anyway -- a fan's every triangle is
 already its own polygon, so splitting one loses no edges); quads alone; and
 quads with `supported_prim_modes_with_restart` widened to match, on the theory
-that the two masks disagreeing moved which layer resolves restart. None of
-them helped, and the index bound of 12 against an eight-vertex buffer is not
-explained yet. The change is **reverted** -- a 0.0446 wireframe difference is
-not worth a segfault -- and the diagnosis is here so the next attempt starts
-from the restart interaction rather than from the cap.
+that the two masks disagreeing moved which layer resolves restart. None of them
+helped. The index bound of 12 against an eight-vertex buffer was a red
+herring: it is a stale bound printed by a diagnostic, not the fault.
+
+## The quad cap's segfault was a Mesa bug in u_index_prim_type_convert
+
+The previous section reported the quad-diagonal fix blocked on a segfault in
+`gl44-primrestart-probe` that four variants of the cap change could not get
+past. That was the wrong conclusion, and one backtrace was enough to show it.
+
+    #0  0x0000000000000000 in ?? ()
+    #1  primconvert_init_draw (...) at u_primconvert.c:251
+    #2  util_primconvert_draw_single_vbo (...)
+    #4  u_vbuf_draw_vbo (...)
+    #5  _mesa_validated_drawrangeelements (... mode=6, count=13 ...)
+
+The crash is a jump to address zero **inside Mesa**, not in the driver, and
+line 251 is `trans_func`, not the `direct_draw_func` on the line above it that
+the earlier read had assumed. Inspecting the frame settles it in one look:
+
+    $1 = (u_translate_func) 0x0                 <- trans_func
+    $2 = translate_memcpy_uint                  <- direct_draw_func, fine
+    $3 = MESA_PRIM_QUADS                        <- mode
+    $6 = MESA_PRIM_TRIANGLE_FAN                 <- info->mode
+    $4 = 0x40bb  primtypes_mask (with quads)
+    $5 = 0x403b  restart_primtypes_mask
+
+`u_index_prim_type_convert` answered **QUADS for an input of TRIANGLE_FAN**. It
+lumps the whole triangle family in with the quad family:
+
+    case MESA_PRIM_TRIANGLES:
+    case MESA_PRIM_TRIANGLE_STRIP:
+    case MESA_PRIM_TRIANGLE_FAN:
+    case MESA_PRIM_QUADS:
+    case MESA_PRIM_QUAD_STRIP:
+       if ((hw_mask & (1<<MESA_PRIM_QUADS)) && pv_matches)
+          return MESA_PRIM_QUADS;
+
+and no fan-to-quads translator exists: `u_indices_gen.py` populates
+`translate_quads[]` from `quads()` and `quadstrip()` alone, so
+`translate_quads[..][MESA_PRIM_TRIANGLE_FAN]` is NULL and `u_primconvert`
+calls it. Nor could one exist -- a fan is not expressible as quads.
+
+**Why it has stood upstream.** Reaching that switch at all requires a driver
+that advertises `MESA_PRIM_QUADS` but *not* `MESA_PRIM_TRIANGLE_FAN`. Every
+driver that supports quads today supports fans too, so the
+`(hw_mask & (1<<prim))` early-out above the switch returns first. This driver
+advertises triangle strips and quads and not fans, which is the combination
+that finds it.
+
+The fix is to return `MESA_PRIM_TRIANGLES` for the triangle family and leave
+the quad family's behaviour, `pv_matches` gate included, exactly as it was.
+With it in, `primrestart` is back to 22 of 22 and the cap change is clean.
+
+**The lesson worth keeping** is about the earlier pass, not the bug: four
+rebuild-and-measure cycles went into varying the cap, on the assumption that a
+crash appearing when a cap changed was caused by the cap. One backtrace, which
+cost less than any of those cycles, named the real caller and the real NULL. A
+segfault has a stack; read it before varying the input that exposed it.
+
+## GL_POLYGON's provoking vertex is its first, not its last
+
+Keeping a polygon intact immediately painted `poly-flat-unfilled-clip` **cyan**
+where both references draw red, and the row went from 0.147 to 0.174 -- worse
+than before the cap change.
+
+GL's flatshading table gives every topology its primitive's *last* vertex and
+makes exactly one exception: a single polygon takes vertex **one**. It is not
+affected by `glProvokingVertex` either; the table names vertex 1 outright. The
+driver had never had to know this, because until the cap change st split every
+polygon before the driver saw it and Mesa's own split carried the right colour.
+
+Both routes needed it -- `gex_wgpu_cull_polygons` and the translator hook in
+`gex_wgpu_draw_unfilled` -- and `polygon_edges_agree` in
+`gl44-flat-unfilled-probe` pins it, with three different colours behind v0 so
+that taking any other vertex fails.
+
+With it fixed the row is 0.133, better than the 0.147 it sat at before any of
+this, and its histogram matches the reference exactly: two colours, red on
+blue. The residual is coverage -- 1477 outline pixels against 2096 -- and it is
+distributed across the whole frame rather than being one missing edge, on a row
+whose two references disagree with each other by 0.0597. Clipped-wireframe
+coverage is where the remaining `-clip` rows live (`poly-flat-unfilled-clip`
+0.133, `tri-unfilled-userclip-stip` 0.109, `trifan-flat-unfilled-clip` 0.105);
+none of them is a clean signal the way `quad-unfilled` was at refdiff 0.
