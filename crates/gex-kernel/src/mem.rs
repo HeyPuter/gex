@@ -466,46 +466,6 @@ impl MemoryMap {
                 .any(|v| v.start < end && v.end > addr && v.prot == 0);
             let committing = prot != 0;
             let conflict = over_real || (!committing && over_reservation);
-            // Coalesce Wine's `reserve_area`: a PROT_NONE reservation that
-            // overlaps the runtime's own real mappings (its images, arena and
-            // loaded libraries) reserves the free gaps in one call instead of
-            // returning EEXIST and making the guest bisect the range into
-            // thousands of tiny probes -- unbearable when each is a browser
-            // syscall (Wine reserves the low 2 GiB this way, ~2500 mmaps).
-            // Gated on `over_real` so it cannot touch thread-stack reservation:
-            // that steps NOREPLACE through the *empty* high half and relies on
-            // EEXIST for exclusivity (two threads must never get the same
-            // stack), and it never overlaps a real mapping there. The low
-            // reserved region and the shim gap stay occupied and unhanded-out;
-            // a later commit (prot != 0) still checks and fails over a real
-            // mapping, so nothing lands on top of anything.
-            if noreplace && prot == 0 && over_real {
-                let lo = addr.max(gex_abi::RESERVE_FLOOR);
-                if lo < end {
-                    let mut occ: Vec<(u64, u64)> = self
-                        .vmas
-                        .iter()
-                        .filter(|v| v.start < end && v.end > lo)
-                        .map(|v| (v.start.max(lo), v.end.min(end)))
-                        .collect();
-                    let (s0, s1) = (gex_abi::STACK_TOP.max(lo), gex_abi::MMAP_BOTTOM.min(end));
-                    if s0 < s1 {
-                        occ.push((s0, s1));
-                    }
-                    occ.sort_unstable();
-                    let mut cur = lo;
-                    for (bs, be) in occ {
-                        if bs > cur {
-                            self.insert_from(cur, bs, 0, name, None);
-                        }
-                        cur = cur.max(be);
-                    }
-                    if cur < end {
-                        self.insert_from(cur, end, 0, name, None);
-                    }
-                }
-                return Ok(addr);
-            }
             if noreplace && (conflict || hits_reserved) {
                 return Err(Errno::EEXIST);
             }
@@ -924,41 +884,6 @@ mod tests {
         assert!(m
             .mmap(gex_abi::MMAP_BOTTOM, 0x1000, 0, flags::ANONYMOUS | flags::FIXED_NOREPLACE, "ok")
             .is_ok());
-    }
-
-    #[test]
-    fn a_reservation_over_real_mappings_coalesces() {
-        // Wine's reserve_area: a PROT_NONE NOREPLACE reservation that overlaps
-        // the runtime's own real mappings succeeds in one call, reserving the
-        // free gaps around them rather than returning EEXIST. A NOREPLACE
-        // reservation that overlaps only another reservation (thread stacks)
-        // still fails, so stacks cannot alias.
-        let mut m = MemoryMap::new(0x40_1000);
-        let base = gex_abi::MMAP_BOTTOM + 0x1000_0000;
-        // a real (committed) mapping in the middle of the range
-        let lib = base + 0x10_0000;
-        m.mmap(lib, 0x2000, prot::READ | prot::EXEC, flags::ANONYMOUS | flags::FIXED, "lib")
-            .unwrap();
-        // reserve a large range spanning it: succeeds, and the lib is untouched
-        assert_eq!(
-            m.mmap(base, 0x100_0000, 0, flags::ANONYMOUS | flags::FIXED_NOREPLACE, "reserve"),
-            Ok(base),
-        );
-        assert!(m.check_access(lib, 0x1000, prot::EXEC), "coalesce clobbered a real mapping");
-        // the gap before the lib is now reserved (PROT_NONE) -- a reservation
-        // there now conflicts
-        assert_eq!(
-            m.mmap(base, 0x1000, 0, flags::ANONYMOUS | flags::FIXED_NOREPLACE, "again"),
-            Err(Errno::EEXIST),
-        );
-        // a reservation over empty space (thread stack) that overlaps only a
-        // prior reservation still fails -- exclusivity preserved
-        let stack = gex_abi::MMAP_BOTTOM + 0x2000_0000;
-        m.mmap(stack, 0x4000, 0, flags::ANONYMOUS | flags::FIXED_NOREPLACE, "stack1").unwrap();
-        assert_eq!(
-            m.mmap(stack, 0x4000, 0, flags::ANONYMOUS | flags::FIXED_NOREPLACE, "stack2"),
-            Err(Errno::EEXIST),
-        );
     }
 
     #[test]
