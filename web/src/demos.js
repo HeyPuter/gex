@@ -1572,6 +1572,24 @@ const supertuxkart = {
 // compositor decorates and stacks them like any other window.
 const SESSION_APPS = [
   {
+    // A 32-bit Windows program through Wine's Wayland driver, in the browser.
+    // Its own rootfs (curated Wine + winemine) rather than the aarch64 session
+    // image, and the x86-64 guest -- run with ?arch=x86.
+    id: 'winemine',
+    label: 'WineMine \u2014 Windows Minesweeper through Wine (x86-64)',
+    kind: 'wl',
+    rootfs: '/rootfs/wine.tar',
+    cmd: '/usr/lib/wine/wine64 /root/.wine/drive_c/windows/syswow64/winemine.exe',
+    env: 'export WINELOADER=/usr/lib/wine/wine64\n'
+      + 'export WINESERVER=/usr/lib/wine/wineserver64\n'
+      + 'export WINEPREFIX=/root/.wine\n'
+      + 'export WINEDEBUG=-all\n'
+      // The curated rootfs has no /etc/ld.so.cache, so glibc's loader only
+      // searches /lib and /usr/lib. Point it at the multiarch triplet dirs
+      // where libunwind/libwayland/libxkbcommon live, plus Wine's unix libs.
+      + 'export LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/lib/wine/x86_64-unix:/usr/lib/wine/x86_64-linux-gnu\n',
+  },
+  {
     id: 'kcalc',
     label: 'KCalc — Qt 5 / KF5, native Wayland',
     kind: 'wl',
