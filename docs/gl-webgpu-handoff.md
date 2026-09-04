@@ -12840,7 +12840,7 @@ never exited, because `pgrep -f` matches the *waiting shell's own command
 line*. It cost an hour of apparently-stalled sweeps. Match on something the
 waiter does not contain, or use the task machinery.
 
-## Logic ops: the last application-level refusal, and how to build it
+## Logic ops: the last application-level refusal, now served
 
 The 341-program sweep has exactly two refusals left and both are the same
 cause: `glLogicOp`. `line-xor` and `tri-logicop-xor` are the programs; the
@@ -12889,3 +12889,20 @@ A probe should check the ops that are not self-inverse (`XOR` twice restores
 the original, which a driver doing nothing at all also passes), so: `XOR` once
 against a known destination, `INVERT`, `AND` and `OR` against a destination
 with bits the source does not have, and `NOOP` leaving the target untouched.
+
+### It was built that way, and one thing the plan did not predict
+
+All of the above holds, and `gl44-logicop-probe` checks exactly those cases
+against a destination that is neither black nor white, so "did nothing" and
+"wrote the source" are both visible. It matches llvmpipe 5/5, and `line-xor`
+and `tri-logicop-xor` now run with no refusal -- the sweep has no driver
+refusals left.
+
+What the plan missed: **the snapshot has to be taken before the render pass
+begins.** Taking it where the bind group is filled reads naturally, because
+that is where the view is needed, and it crashes inside Dawn's
+`BeginRenderPass` -- the copy wants a command encoder of its own, and by then
+one is already open. The feedback path takes its own snapshot much earlier,
+during binding validation, which is where this one goes too. The backtrace
+says `DeviceBase::GetScopedLock` and names neither the copy nor the reason;
+it took a core dump to find.
