@@ -12906,3 +12906,55 @@ one is already open. The feedback path takes its own snapshot much earlier,
 during binding validation, which is where this one goes too. The backtrace
 says `DeviceBase::GetScopedLock` and names neither the copy nor the reason;
 it took a core dump to find.
+
+## GL 4.5: ARB_cull_distance, and why the hard part was not hard
+
+`gl_CullDistance` was withheld for several passes with a comment explaining
+why: turning the cap on grants 4.5 immediately and silently eats geometry,
+because Mesa's linker merges the cull values into the `gl_ClipDistance` array
+and the emitter hands that whole array to WebGPU's `clip_distances` -- so the
+cull values *clip*. A clip distance cuts a primitive where it reaches zero; a
+cull distance discards the primitive only when **every** vertex is negative
+and otherwise leaves it whole, including the parts where the distance is
+negative. Mapping one onto the other looks right for the two easy cases and
+eats a corner of the third.
+
+That note said the split had to happen structurally, and that what made it
+more than a morning's work was where: the same array is what
+`nir_lower_clip_vs` writes for every user clip plane, a path real applications
+here depend on.
+
+**It does not have to be split.** A clip distance of +1 never clips anything,
+so storing +1 into the cull components at the end of the rasterising shader
+neutralises them however the shader wrote them -- no understanding of the
+writes, and the user-clip-plane path untouched. `gex_wgpu_neutralise_cull_-
+distances` is fifty lines.
+
+The culling itself reuses the facing cull's machinery: the vertex shader
+already runs as compute there, so it runs here, and the primitives every
+vertex of which is negative in one distance are dropped from an index list the
+draw is reissued with. It declines rather than guesses, which draws too much
+rather than too little -- the safer direction for something that only removes
+geometry.
+
+One thing did have to give. `gex_wgpu_emit_varying_stores` refused any output
+that was not a vector or scalar, and `gl_ClipDistance` is an **array** -- so
+the capture failed with "no compute variant for this layout" and the cull
+never ran. Four elements now go into a capture slot. That is the whole reason
+the first attempt culled nothing while the neutralisation worked: the probe
+showed `mixed_kept` passing and `all_negative_culled` failing, which is the
+exact inverse of the old failure and was the clue.
+
+With the extension in place, GL 4.5's rung wanted only GLSL 4.50, so the
+feature level goes to 450.
+
+    GL 4.4: ** COMPLETE **
+    GL 4.5: ** COMPLETE **
+    GL 4.6: ARB_gl_spirv ARB_indirect_parameters ARB_polygon_offset_clamp
+            ARB_shader_group_vote ARB_spirv_extensions
+            ARB_transform_feedback_overflow_query GLSL460
+
+`gl44-cull-distance-probe` is 3/3 against llvmpipe and gated in the browser,
+and it is no longer one of the native suite's differences: **88 OK with two
+left, and both are cases where llvmpipe is the outlier.** SuperTuxKart,
+Blender and Minecraft 26.2 are unchanged at 4.5.
