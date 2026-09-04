@@ -615,6 +615,82 @@ int main(void) {
         glDeleteBuffers(1, &buf);
     }
 
+    /* Image atomics. GL's imageAtomic* reach SPIR-V as OpImageTexelPointer,
+     * whose result lives in storage class Image, and Tint's reader has no
+     * such class -- "unknown SPIR-V storage class: 11". So the atomic decides
+     * the *binding*: such an image is served through a buffer, where a texel
+     * that is a whole 32-bit word makes the image atomic an ordinary buffer
+     * atomic. This was Blender EEVEE's last shader-level refusal.
+     *
+     * Every fragment adds 1 to the same texel, so the answer is the number of
+     * fragments -- SIDE * SIDE -- and any implementation that lost the
+     * atomicity, or turned the add into a store, gets a smaller number. A
+     * second texel is left alone to catch an address that ignored the
+     * coordinate. */
+    {
+        GLuint prog = build(
+            "#version 330 core\n"
+            "#extension GL_ARB_shader_image_load_store : require\n"
+            "layout(r32ui) uniform uimage2D img;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  imageAtomicAdd(img, ivec2(2, 3), 1u);\n"
+            "  colour = vec4(0, 1, 0, 1);\n"
+            "}\n");
+        GLuint tex = make_r32ui(7u);
+        glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (prog) {
+            glUseProgram(prog);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_UPDATE_BARRIER_BIT);
+        }
+        const unsigned counted = read_texel(tex, 2, 3);
+        const unsigned untouched = read_texel(tex, 3, 3);
+        const GLenum error = glGetError();
+        /* Seeded at 7, so the total is 7 + one per fragment. */
+        const unsigned want = 7u + (unsigned)(SIDE * SIDE);
+        fprintf(stderr, "INFO atomic_add got=%u want=%u other=%u want=7 "
+                "err=0x%04x\n", counted, want, untouched, (unsigned)error);
+        result("atomic_add", prog && error == GL_NO_ERROR &&
+                             counted == want && untouched == 7u);
+        glDeleteTextures(1, &tex);
+    }
+
+    /* imageAtomicCompSwap, which takes an extra operand and so travels a
+     * different source layout -- getting that wrong reads the comparand as
+     * the value and swaps in the wrong number. */
+    {
+        GLuint prog = build(
+            "#version 330 core\n"
+            "#extension GL_ARB_shader_image_load_store : require\n"
+            "layout(r32ui) uniform uimage2D img;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  imageAtomicCompSwap(img, ivec2(1, 1), 9u, 0xabcu);\n"
+            "  colour = vec4(0, 1, 0, 1);\n"
+            "}\n");
+        GLuint tex = make_r32ui(9u);
+        glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (prog) {
+            glUseProgram(prog);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_UPDATE_BARRIER_BIT);
+        }
+        const unsigned swapped = read_texel(tex, 1, 1);
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO atomic_swap got=0x%x want=0xabc err=0x%04x\n",
+                swapped, (unsigned)error);
+        result("atomic_swap", prog && error == GL_NO_ERROR &&
+                              swapped == 0xabcu);
+        glDeleteTextures(1, &tex);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;
