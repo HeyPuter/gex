@@ -302,6 +302,8 @@ for (const [event, describe] of [
   // `?stracepid=N`: the same narration for one process only -- a page survives
   // a shell's syscalls, not a session's.
   if (params.has('stracepid')) globalThis.GEX_STRACE_PID = Number(params.get('stracepid'));
+  // `?heartbeat=N`: at every Nth back-edge safepoint, print where the guest is -- the only way to see where a syscall-free spin is stuck.
+  if (params.has('heartbeat')) globalThis.GEX_HEARTBEAT = Number(params.get('heartbeat'));
   // `?trapstack=1`: the engine's stack for a trap -- which names the shim
   // function the fault was in -- without `?debug`'s mirroring of every guest
   // write to the console. That mirroring is not free: it changed the timing

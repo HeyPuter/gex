@@ -1666,6 +1666,8 @@ export class Gex {
     // `?strace=1` narrates every process; `?stracepid=N` only that one, which
     // is what a run that must stay alive can afford.
     if (o.strace || (o.stracePid && o.stracePid === child.pid)) e.gex_set_trace(1);
+    if (o.heartbeat && (!o.stracePid || o.stracePid === child.pid))
+      e.gex_set_heartbeat?.(BigInt(o.heartbeat));
     if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
     if (o.watchMem) e.gex_set_watch_mem?.(BigInt(o.watchMem));
     if (o.traceMisses) e.gex_set_trace_misses?.(1);

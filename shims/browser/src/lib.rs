@@ -5425,15 +5425,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             "unknown" => format!("unknown#{raw_nr}"),
             s => s.to_string(),
         };
-        warn_line(&format!(
-            "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{obj} <-{}  ...\n",
-            name,
-            g(0),
-            g(1),
-            g(2),
-            named.map_or(String::new(), |p| format!(" \"{p}\"")),
-            if caller.is_empty() { format!("{ret:#x}") } else { caller },
-        ));
+        // Wine's ntdll reserves the low 2 GiB one PROT_NONE mmap at a time --
+        // thousands of them, and each traced line is a Worker round-trip that
+        // both floods the log and slows the guest so much a strace never
+        // reaches what Wine does *after* the reservation. Skip them (they still
+        // run); every other syscall prints.
+        let quiet = n == gex_kernel::syscalls::nr::MMAP && g(2) == 0;
+        if !quiet {
+            warn_line(&format!(
+                "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{obj} <-{}  ...\n",
+                name,
+                g(0),
+                g(1),
+                g(2),
+                named.map_or(String::new(), |p| format!(" \"{p}\"")),
+                if caller.is_empty() { format!("{ret:#x}") } else { caller },
+            ));
+        }
         // For a gather write, what the kernel sees at each iovec: a mismatch
         // with the guest means they disagree about the memory they share.
         if n == 66 {
@@ -9444,6 +9452,33 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
             SAFEPOINT_INTERVAL,
         );
     }
+    // Advance KUSER_SHARED_DATA's timers. Windows/Wine read the interrupt time
+    // and tick count from the fixed page at 0x7ffe0000 *without a syscall* for
+    // elapsed-time waits, so a `while (tick < deadline)` spin -- which gex only
+    // sees at its back-edge safepoints, never a syscall -- would otherwise wait
+    // on a clock that never moves and hang forever (Wine wedges in ntdll init
+    // before it loads a single DLL). gex sets the page up once and leaves the
+    // timers at zero; refresh them here. Only when the guest's memory actually
+    // reaches the page (a 64-bit Wine process; a small guest without a USD page
+    // never gets here).
+    if gex_abi::X86 && (warch::memory_size(0) as u64) * 65536 > 0x7ffe_1000 {
+        let ns = unsafe { now() }.max(0) as u64;
+        let it = ns / 100; // InterruptTime: 100 ns units
+        let ms = ns / 1_000_000; // TickCount: milliseconds
+        let mut gm = GuestMem::new(guest_bytes());
+        // Each field is a KSYSTEM_TIME { LowPart, High1Time, High2Time }; write
+        // High2 first then Low then High1 so a torn read (High1 != High2) is
+        // retried, never accepted.
+        let ith = (it >> 32) as u32;
+        let _ = gm.write_u32(0x7ffe_0010, ith); // InterruptTime.High2Time
+        let _ = gm.write_u32(0x7ffe_0008, it as u32); // InterruptTime.LowPart
+        let _ = gm.write_u32(0x7ffe_000c, ith); // InterruptTime.High1Time
+        let msh = (ms >> 32) as u32;
+        let _ = gm.write_u32(0x7ffe_0004, 1 << 24); // TickCountMultiplier: GetTickCount == ms
+        let _ = gm.write_u32(0x7ffe_0328, msh); // TickCount.High2Time
+        let _ = gm.write_u32(0x7ffe_0320, ms as u32); // TickCount.LowPart
+        let _ = gm.write_u32(0x7ffe_0324, msh); // TickCount.High1Time
+    }
     // Catch a worker running on a stray SP that reaches into the MAIN thread's
     // stack -- a store there smashes a canary the quiet main thread detects much
     // later, which is the complex-Qt (designer) stack smash. Cheap (one guest
@@ -9544,8 +9579,18 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
                     .unwrap_or_default();
                 (h.jit.blocks, out, whose)
             });
-            trace_line(&format!(
-                "[beat] {beat} safepoints, pc={:#x} ({whose}), {blocks} blocks, \
+            let bytes = {
+                let gm = GuestMem::new(guest_bytes());
+                let mut b = String::new();
+                for i in 0..6u64 {
+                    if let Ok(v) = gm.read_u32(pc as u64 + i * 4) {
+                        b.push_str(&format!("{:08x}", v.swap_bytes()));
+                    }
+                }
+                b
+            };
+            warn_line(&format!(
+                "[beat] {beat} safepoints, pc={:#x} ({whose}) bytes={bytes}, {blocks} blocks, \
                  threads:{census}\n",
                 pc as u64
             ));

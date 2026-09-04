@@ -410,6 +410,9 @@ pub struct Kernel {
     pub gid: u32,
     /// Trace every syscall to stderr (PLAN §11's strace mode).
     pub trace: bool,
+    /// PROT_NONE reservation mmaps skipped in the strace since the last
+    /// printed line, so the count can be shown when a real syscall prints.
+    pub quiet_mmaps: u64,
     /// Signal dispositions, masks and pending set.
     pub signals: Signals,
     /// Futex wait queues. A single-threaded guest still uses these: musl's
@@ -1057,6 +1060,7 @@ impl Kernel {
             signals: Signals::new(),
             futexes: Arc::new(FutexTable::new()),
             trace: false,
+            quiet_mmaps: 0,
             unimplemented: Vec::new(),
             next_tid: 2,
             next_ctx_slot: 1,
@@ -1276,6 +1280,7 @@ impl Kernel {
             uid: self.uid,
             gid: self.gid,
             trace: self.trace,
+            quiet_mmaps: 0,
             // A fork resets pending signals but keeps the dispositions.
             signals: self.signals.fork(),
             // Futexes live in the address space, and the child has its own.
@@ -1722,7 +1727,17 @@ impl Kernel {
                 return SyscallOutcome::Exit(*exit);
             }
         };
-        if self.trace {
+        // A PROT_NONE mmap is Wine's reserve_area probing the low 2 GiB one
+        // step at a time -- thousands of them, and each traced line is a Worker
+        // round-trip that both floods the log and slows the guest ~100x, so a
+        // strace never reaches what Wine does *after* the reservation. Skip
+        // printing them (they still run); every other syscall is shown. A
+        // running count is kept so the transition is still visible.
+        let quiet_mmap = n == nr::MMAP && a[2] == 0;
+        if quiet_mmap {
+            self.quiet_mmaps += 1;
+        }
+        if self.trace && !quiet_mmap {
             // A 64-byte write is the size of a wineserver request; its first
             // word is the request code, which is what a Wine trace wants.
             let req = if n == nr::WRITE && a[2] == 64 {
@@ -1732,8 +1747,14 @@ impl Kernel {
             } else {
                 String::new()
             };
+            let reserved = if self.quiet_mmaps != 0 {
+                let c = std::mem::take(&mut self.quiet_mmaps);
+                format!(" [+{c} PROT_NONE reservations]")
+            } else {
+                String::new()
+            };
             eprintln!(
-                "[gex:{}] {:.3}s pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{} = {}",
+                "[gex:{}] {:.3}s pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{}{} = {}",
                 self.pid,
                 Self::trace_clock(),
                 syscall_name(n),
@@ -1742,6 +1763,7 @@ impl Kernel {
                 a[2],
                 traced_path(m, n, a),
                 req,
+                reserved,
                 ret as i64
             );
         }
