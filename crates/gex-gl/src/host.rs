@@ -466,7 +466,7 @@ impl Gl {
             if eglMakeCurrent(display, surface, surface, context) == 0 {
                 return Err(format!("makeCurrent failed: {:#x}", eglGetError()));
             }
-            Ok(Gl {
+            let _gl = Gl {
                 display,
                 surface,
                 config,
@@ -481,7 +481,8 @@ impl Gl {
                 renderer: gl_string(0x1F01),
                 version: gl_string(0x1F02),
                 last_frame: None,
-            })
+            };
+            Ok(_gl)
         }
     }
 
@@ -533,6 +534,25 @@ impl Gl {
         Ok(())
     }
 
+    /// Unbind the context from this thread. EGL only lets a context be made
+    /// current on one thread at a time, and gex may dispatch a client's GL
+    /// from a different host thread on the next batch (Wine does), so hand it
+    /// back after each batch rather than leave it pinned here.
+    fn release(&mut self) {
+        if self.current_on.is_none() {
+            return;
+        }
+        unsafe {
+            eglMakeCurrent(
+                self.display,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
+        self.current_on = None;
+    }
+
     fn shader(&self, guest: u32) -> Option<GLuint> {
         self.names.shaders.get(&guest).copied()
     }
@@ -545,14 +565,18 @@ impl Gl {
     /// where and why.
     pub fn run(&mut self, batch: &[u8]) -> (Reply, u32, u32) {
         let mut reply = Reply::default();
-        if self.make_current().is_err() {
+        if let Err(e) = self.make_current() {
+            eprintln!("gex-gl: {e}");
             return (reply, error::NO_CONTEXT, 0);
         }
         let mut commands = Commands::new(batch);
         let mut index = 0u32;
         loop {
             match commands.next() {
-                None => return (reply, error::NONE, index),
+                None => {
+                    self.release();
+                    return (reply, error::NONE, index);
+                }
                 Some(Err(())) => return (reply, error::TRUNCATED, index),
                 Some(Ok((opcode, body))) => {
                     if !self.one(opcode, body, &mut reply) {
@@ -564,9 +588,32 @@ impl Gl {
         }
     }
 
-    /// Take the frame read back at the last `PRESENT`, if any.
+    /// Take the frame read back at the last present/finish, if any.
     pub fn take_frame(&mut self) -> Option<(i32, i32, Vec<u8>)> {
         self.last_frame.take()
+    }
+
+    /// Read the pbuffer's pixels back into `last_frame`. A native Wayland GL
+    /// client attaches no buffer to its wl_surface -- the frame lives here --
+    /// so this is the only way the drawn pixels leave the host. glReadPixels
+    /// returns rows bottom-up; flip to the top-down order every consumer wants.
+    fn grab_frame(&mut self) {
+        let (w, h) = (self.width.max(0), self.height.max(0));
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (wu, hu) = (w as usize, h as usize);
+        let mut px = vec![0u8; wu * hu * 4];
+        unsafe {
+            glReadPixels(0, 0, w, h, 0x1908, 0x1401, px.as_mut_ptr() as *mut c_void);
+        }
+        let mut flipped = vec![0u8; wu * hu * 4];
+        for row in 0..hu {
+            let src = (hu - 1 - row) * wu * 4;
+            let dst = row * wu * 4;
+            flipped[dst..dst + wu * 4].copy_from_slice(&px[src..src + wu * 4]);
+        }
+        self.last_frame = Some((w, h, flipped));
     }
 
     /// Execute one command. `false` means the opcode is unknown, which is a
@@ -596,35 +643,25 @@ impl Gl {
                     };
                     let _ = self.resize(w, h);
                 }
+                // This host draws into its one pbuffer, so which named
+                // drawable a frame belongs to matters only to the compositor
+                // and the dump, not here. Consume the arguments (the decoder
+                // rejects a command whose payload it ignores) and carry on.
+                op::SURFACE_ATTACH => {
+                    let (_kind, _id, _token, _surface) =
+                        (a.u32(), a.u32(), a.u32(), a.u32());
+                }
+                op::SURFACE_CURRENT | op::SURFACE_DETACH => {
+                    let _ = a.u32();
+                }
                 op::FINISH => {
                     glFinish();
+                    self.grab_frame();
                     reply.u32(0);
                 }
                 op::PRESENT => {
-                    // A native Wayland GL client attaches no buffer to its
-                    // wl_surface -- the frame lives here, in the pbuffer. Read
-                    // it back so the host can show it (dump, or composite into
-                    // the client's window). glReadPixels returns rows bottom
-                    // up, so flip them to the top-down order every consumer
-                    // wants.
                     glFinish();
-                    let (w, h) = (self.width.max(0), self.height.max(0));
-                    if w > 0 && h > 0 {
-                        let (wu, hu) = (w as usize, h as usize);
-                        let mut px = vec![0u8; wu * hu * 4];
-                        glReadPixels(
-                            0, 0, w, h, 0x1908, 0x1401,
-                            px.as_mut_ptr() as *mut c_void,
-                        );
-                        let mut flipped = vec![0u8; wu * hu * 4];
-                        for row in 0..hu {
-                            let src = (hu - 1 - row) * wu * 4;
-                            let dst = row * wu * 4;
-                            flipped[dst..dst + wu * 4]
-                                .copy_from_slice(&px[src..src + wu * 4]);
-                        }
-                        self.last_frame = Some((w, h, flipped));
-                    }
+                    self.grab_frame();
                     reply.u32(0);
                 }
 

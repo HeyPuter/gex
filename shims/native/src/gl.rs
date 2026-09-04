@@ -160,7 +160,11 @@ impl GlDevice {
 
         let mut slot = self.gl.lock().unwrap();
         if slot.is_none() {
-            *slot = Some(Gl::new(self.size.0, self.size.1));
+            let made = Gl::new(self.size.0, self.size.1);
+            if let Err(e) = &made {
+                eprintln!("gex-gl: host GL unavailable: {e}");
+            }
+            *slot = Some(made);
         }
         let (reply, status, executed) = match slot.as_mut().unwrap() {
             Ok(gl) => {
