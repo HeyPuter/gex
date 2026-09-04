@@ -14024,94 +14024,41 @@ and all four are fixed:
    compute path used the shader's declared type unchanged, so a dispatch
    sampling a depth buffer lost its bind group and wrote nothing.
 
-### What EEVEE's viewport still stops on
+### EEVEE's rendered viewport is blocked on the platform
 
-A chain of *runtime validation* issues rather than refusals, and each fix
-reveals the next rather than all of them at once:
+Every WebGPU **validation error** is gone -- the run is clean -- and the
+viewport still does not come up, for a reason the driver cannot fix:
 
-- ~~Views whose format WebGPU will not take~~ -- **done**, and worth reading
-  as a worked example of the diagnosis. `viewFormats` spans only the sRGB
-  pair, so every other format change needs a copy. `GEX_WGPU_IMAGE_TRACE` is
-  what identified the source: they were **image bindings**, not sampler views.
+    gex-limits: adapter colour bytes/sample 32 (asked 32)
+    gex-wgpu: colour target 4 dropped: the attachments exceed 32 bytes per sample
 
-      gex-imgview: fragment slot=2 image=r16g16_unorm texture=r32_float
-      gex-imgview: fragment slot=3 image=r32_uint    texture=r32_float
+EEVEE binds **five** colour attachments. WebGPU bounds their combined bytes
+per sample, WebGPU's own arithmetic charges an rgba8 target eight bytes rather
+than four, and this adapter reports 32 as its *maximum* -- so the driver asks
+for 64, is given 32, and four targets is all there is. GL allows eight draw
+buffers and a fragment shader writing five cannot be split across passes, so
+there is nothing to trade. Use `GEX_WGPU_LIMIT_TRACE` before treating any
+limit as a wall: it prints the adapter's own maximum beside the granted one,
+which is the difference between this and the three limits that turned out to
+be nobody having asked.
 
-  `glBindImageTexture` may name any format in the texture's class, so both are
-  legal GL. `gex_wgpu_image_alias` now binds a texture of the *image's* format
-  and moves the bytes across either side (through a buffer, because
-  `copyTextureToTexture` needs equal formats -- the very thing that differs).
+Blender itself is fine. Its **default viewport matches llvmpipe exactly**
+(1280x1024 mean 61, 336 colours against 338), which is the app-facing claim;
+it is the rendered/EEVEE shading mode that needs the fifth attachment.
 
-  Two things that only a value test finds:
+Two driver-side refusals remain in that path, and neither would bring the
+viewport up on its own:
 
-  - **Seed the alias whatever the access says.** The copy back writes the
-    whole subresource, so a texel the shader never stores to would take the
-    alias's contents. GL is explicit that a store touches only the texel it
-    names, and the probe showed it at once: the two stored texels right, every
-    other one zero.
-  - **Size it from the *stored* formats**, and refuse when they disagree. The
-    promotion makes an r16g16_unorm image eight bytes per texel over an
-    r32_float texture's four, so there is no correspondence to copy; doing it
-    anyway gave "the byte size of each row (8384) is > bytesPerRow (4352)".
-
-  That refusal leaves a **real tension**: the promotion exists because WebGPU
-  has no 16-bit normalised formats, so such a *texture* has to be stored
-  wider, and that is exactly what makes the class binding impossible. The
-  packed-image path would serve it exactly -- a buffer has no format to
-  promote -- but reaching it needs a variant keyed on the bound format,
-  because the bind group layout differs between a storage texture and two
-  buffers. That is the shape of the next fix here.
-
-- ~~A texture bound as both sampled and write-only storage in one pass~~ --
-  **done**. WebGPU forbids a writable storage binding sharing a scope with any
-  other use of the texture. Two draws with `glMemoryBarrier` between them
-  already worked (the barrier submits, and a submit closes the scope), so what
-  was left was *one* draw doing both, which no pass boundary separates: the
-  image writes go to an alias and are copied back at pass end.
-- ~~A copy whose `bytesPerRow` is smaller than its row~~ -- **done**, and it
-  is the lesson worth keeping from this whole stretch. **Anything that creates
-  a texture from `gex_wgpu_texture_format` and then measures its rows must ask
-  `gex_wgpu_stored_format` for the texel size.** The promotion applies to the
-  creation and not to the arithmetic, so the two disagree:
-
-      The byte size of each row (8384) is > bytesPerRow (4352)
-
-  Three places had it -- the cross-class sampler view's scratch, the
-  render-target scratch, and the image alias. A guard meant to catch this
-  compared the view's *Gallium* size against the texture's *stored* size and
-  so let the very case through; it is stored-against-stored now.
-- ~~A buffer used as both writable and read-only storage~~ -- **mostly done**.
-  GL lets one buffer sit at several storage slots, written through one and read
-  through the others; WebGPU refuses the overlap and **names neither
-  binding**, which is what `GEX_WGPU_ALIAS_TRACE` exists for. EEVEE binds one
-  48 KiB buffer to three slots of its light-culling dispatch. All-writable is
-  refused too and all-read-only would drop the write, so the read-only side
-  takes a copy on the dispatch's own encoder ahead of the pass.
-
-  **One instance survives**, and `GEX_WGPU_ALIAS_TRACE` now covers the
-  compute, fragment and vertex groups *and* the driver's internal passes and
-  is silent on all four -- which narrows it to the bind groups built outside
-  them: the logic-op snapshot, the depth upload, and the gather/prefix passes,
-  each of which builds its own. Start there.
-
-  Two things about the instrument, because both cost a run. It has to report
-  what is actually **submitted** -- placed before the snapshot rewrite it
-  named every case the fix already handled. And only a *writable* binding
-  conflicts: firing on any two differing types named the driver's own
-  draw-parameters block sharing a constant ring with a uniform buffer, which
-  is legal. A diagnostic that reports legal states is worse than none,
-  because it sends the next reader after the wrong binding.
 - A compute shader calling **`workgroupBarrier` from non-uniform control
-  flow**, which Tint rejects. GLSL says the same thing about `barrier()`, so
-  the shader is relying on a condition that is uniform in practice and not
-  provably so. Hoisting or dropping it are both wrong in general; this one
-  needs reading before it is touched.
+  flow**, which Tint rejects. GLSL says the same about `barrier()`, so the
+  shader relies on a condition that is uniform in practice and not provably
+  so. Hoisting and dropping are both wrong in general; read it before
+  touching it.
 - One **declined draw**: a *read-only* image at a promoted format over a
   differently-formatted texture. A read-only image normally falls back to a
-  sampled texture, whose format table is richer -- but that fallback needs the
-  formats to agree, and the promotion breaks it. This is the bind-time case
-  that only a bound-format-keyed variant of the packed path can serve, which
-  is also the answer to the writable version of the same problem.
+  sampled texture, whose format table is richer, but that needs the formats to
+  agree and the promotion breaks it. This is the bind-time case only a
+  bound-format-keyed variant of the packed path can serve -- the same answer
+  as for the writable version.
 
-Do not read the ordering as a priority list -- it is the order Blender happens
 to hit them in.

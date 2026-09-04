@@ -367,6 +367,49 @@ int main(void) {
         if (base) glDeleteTextures(1, &base);
     }
 
+    /* Case 7: the same class change, over *one layer of an array*. The bytes
+     * and the reinterpretation are identical to case 6; only the target the
+     * view names is different, and that alone used to refuse it -- the
+     * scratch copy that serves a cross-class view was accepted for
+     * PIPE_TEXTURE_2D and nothing else, while the machinery underneath it
+     * copies one layer either way. Blender's EEVEE spells its r32ui-over-r32f
+     * view exactly like this.
+     *
+     * Layer 1 rather than layer 0, so a driver that quietly copied the first
+     * layer reads 0x11 and fails instead of passing by luck. */
+    {
+        unsigned got = 0xffff;
+        GLuint base = 0, view = 0, prog = 0;
+        if (have) {
+            unsigned char first[SIDE * SIDE * 4], second[SIDE * SIDE * 4];
+            memset(first, 0x11, sizeof(first));
+            memset(second, 0x3b, sizeof(second));
+            glGenTextures(1, &base);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, base);
+            glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA8, SIDE, SIDE, 2);
+            glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, SIDE, SIDE, 1,
+                            GL_RGBA, GL_UNSIGNED_BYTE, first);
+            glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 1, SIDE, SIDE, 1,
+                            GL_RGBA, GL_UNSIGNED_BYTE, second);
+            glGenTextures(1, &view);
+            /* One layer, named as an array view -- which is the whole point. */
+            glTextureView(view, GL_TEXTURE_2D_ARRAY, base, GL_RGBA8UI, 0, 1,
+                          1, 1);
+            prog = build("usampler2DArray",
+                         "colour = vec4(float(texture(tex, vec3(0.5, 0.5, "
+                         "0.0)).r) / 255.0, 0.0, 0.0, 1.0);");
+            got = sample_through(prog, GL_TEXTURE_2D_ARRAY, view);
+        }
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO format-class-layer got=%u want=59 err=0x%04x\n",
+                got, (unsigned)error);
+        result("format-class-layer",
+               have && prog && error == GL_NO_ERROR && got == 0x3b);
+        if (prog) glDeleteProgram(prog);
+        if (view) glDeleteTextures(1, &view);
+        if (base) glDeleteTextures(1, &base);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

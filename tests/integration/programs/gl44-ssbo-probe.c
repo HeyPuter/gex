@@ -389,6 +389,70 @@ int main(void) {
         glDeleteBuffers(1, &buffer);
     }
 
+    /* One storage block declared in *both* stages, written in the fragment
+     * shader and only read in the vertex one. That is ordinary GL, and it is
+     * a combination WebGPU refuses: a buffer may not be writable in one
+     * binding and anything else in another within a pass, and Dawn's message
+     * names neither binding --
+     *
+     *   [Buffer] usage (Storage(read-write)|Storage(read-only)) includes
+     *   writable usage and another usage in the same synchronization scope
+     *
+     * -- so a per-*group* check cannot find it either: the vertex group and
+     * the fragment group are each perfectly consistent on their own. It took
+     * accumulating the check across a whole draw to see, and Blender's EEVEE
+     * does it with a 22 MB buffer.
+     *
+     * The vertex side reads a copy now, which is legal rather than
+     * approximate: GL leaves what the vertex stage sees undefined without a
+     * barrier. So this asserts only the defined part -- that the fragment
+     * store lands and the draw is not dropped -- and reads the vertex side's
+     * value into the colour output without asserting on it. */
+    {
+        GLuint prog = build(
+            "#version 430 core\n"
+            "layout(std430, binding = 3) buffer Shared { uint value[]; };\n"
+            "out float carried;\n"
+            "void main() {\n"
+            "  vec2 p = vec2((gl_VertexID & 1) == 0 ? -1.0 : 1.0,\n"
+            "                (gl_VertexID & 2) == 0 ? -1.0 : 1.0);\n"
+            "  gl_Position = vec4(p, 0.0, 1.0);\n"
+            "  carried = float(value[0] & 1u);\n"
+            "}\n",
+            "#version 430 core\n"
+            "layout(std430, binding = 3) buffer Shared { uint value[]; };\n"
+            "in float carried;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  value[1] = 0xa5a5u;\n"
+            "  colour = vec4(carried, 1.0, 0.0, 1.0);\n"
+            "}\n");
+        GLuint buffer = 0;
+        GLuint seed[4] = {0x9999u, 0x8888u, 0x7777u, 0x6666u};
+        glGenBuffers(1, &buffer);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(seed), seed,
+                     GL_DYNAMIC_COPY);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, buffer);
+        if (prog) {
+            glUseProgram(prog);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
+        GLuint back[4] = {0, 0, 0, 0};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(back), back);
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO cross_stage_storage at1=0x%x at0=0x%x "
+                "want=0xa5a5,0x9999 err=0x%04x\n", back[1], back[0],
+                (unsigned)error);
+        result("cross_stage_storage", prog && error == GL_NO_ERROR &&
+                                      back[1] == 0xa5a5u &&
+                                      back[0] == 0x9999u);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, 0);
+        glDeleteBuffers(1, &buffer);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;
