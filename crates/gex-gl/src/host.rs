@@ -349,6 +349,11 @@ pub struct Gl {
     pub vendor: String,
     pub renderer: String,
     pub version: String,
+    /// The last frame read back at `PRESENT`: width, height, and RGBA rows
+    /// top-down. A native Wayland GL client attaches no buffer, so this is how
+    /// the drawn pixels leave the host -- to be dumped, or composited into the
+    /// client's window.
+    last_frame: Option<(i32, i32, Vec<u8>)>,
 }
 
 /// What the host wants to say back, appended to the reply area in order.
@@ -475,6 +480,7 @@ impl Gl {
                 vendor: gl_string(0x1F00),
                 renderer: gl_string(0x1F01),
                 version: gl_string(0x1F02),
+                last_frame: None,
             })
         }
     }
@@ -558,6 +564,11 @@ impl Gl {
         }
     }
 
+    /// Take the frame read back at the last `PRESENT`, if any.
+    pub fn take_frame(&mut self) -> Option<(i32, i32, Vec<u8>)> {
+        self.last_frame.take()
+    }
+
     /// Execute one command. `false` means the opcode is unknown, which is a
     /// stream the host cannot keep reading.
     fn one(&mut self, opcode: u32, body: &[u8], reply: &mut Reply) -> bool {
@@ -587,6 +598,33 @@ impl Gl {
                 }
                 op::FINISH => {
                     glFinish();
+                    reply.u32(0);
+                }
+                op::PRESENT => {
+                    // A native Wayland GL client attaches no buffer to its
+                    // wl_surface -- the frame lives here, in the pbuffer. Read
+                    // it back so the host can show it (dump, or composite into
+                    // the client's window). glReadPixels returns rows bottom
+                    // up, so flip them to the top-down order every consumer
+                    // wants.
+                    glFinish();
+                    let (w, h) = (self.width.max(0), self.height.max(0));
+                    if w > 0 && h > 0 {
+                        let (wu, hu) = (w as usize, h as usize);
+                        let mut px = vec![0u8; wu * hu * 4];
+                        glReadPixels(
+                            0, 0, w, h, 0x1908, 0x1401,
+                            px.as_mut_ptr() as *mut c_void,
+                        );
+                        let mut flipped = vec![0u8; wu * hu * 4];
+                        for row in 0..hu {
+                            let src = (hu - 1 - row) * wu * 4;
+                            let dst = row * wu * 4;
+                            flipped[dst..dst + wu * 4]
+                                .copy_from_slice(&px[src..src + wu * 4]);
+                        }
+                        self.last_frame = Some((w, h, flipped));
+                    }
                     reply.u32(0);
                 }
 

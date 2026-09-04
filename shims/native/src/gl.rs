@@ -19,6 +19,12 @@ use std::sync::{Arc, Mutex};
 pub const GEX_GL_SUBMIT: u64 = 0xc008_6701;
 /// `_IOR('g', 2, ...)`: how big a batch the device will take.
 pub const GEX_GL_LIMITS: u64 = 0x8008_6702;
+/// `_IOW('g', 3, u32[4])`: {kind, surface id, width, height}. The guest's GL
+/// library uses it to tell the compositor a Wayland surface's frames live on
+/// the host and it should be shown even with nothing attached. Accepted here
+/// (the batch's SURFACE_ATTACH already carries the same in the wire stream);
+/// without it the guest logs "Inappropriate ioctl for device".
+pub const GEX_GL_SURFACE: u64 = 0x4010_6703;
 
 /// The largest batch the device will read in one go.
 const MAX_BATCH: u32 = 32 * 1024 * 1024;
@@ -30,6 +36,8 @@ const MAX_BATCH: u32 = 32 * 1024 * 1024;
 pub struct GlDevice {
     gl: Mutex<Option<Result<Gl, String>>>,
     size: (i32, i32),
+    /// How many frames GEX_GL_DUMP has written, for the file name.
+    dumped: Mutex<u32>,
     /// Where `GEX_GL_CAPTURE` said to record the command stream, and the file
     /// once one batch has arrived. Recording is a debugging aid: a guest whose
     /// trace cannot be written still runs.
@@ -61,6 +69,7 @@ impl GlDevice {
             _ => Capture::Off,
         };
         Arc::new(GlDevice {
+            dumped: Mutex::new(0),
             gl: Mutex::new(None),
             size: (width, height),
             capture: Mutex::new(capture),
@@ -106,6 +115,31 @@ impl GlDevice {
     }
 
     /// Run one batch, reading it out of guest memory and writing the reply back.
+    /// Write a presented frame to `<GEX_GL_DUMP>-NNN.ppm`, if that variable
+    /// is set. RGBA in, RGB out (a PPM has no alpha).
+    fn dump_frame(&self, w: i32, h: i32, rgba: &[u8]) {
+        let Some(prefix) = std::env::var_os("GEX_GL_DUMP") else {
+            return;
+        };
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let mut n = self.dumped.lock().unwrap();
+        let path = format!("{}-{:03}.ppm", prefix.to_string_lossy(), *n);
+        *n += 1;
+        let (wu, hu) = (w as usize, h as usize);
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        out.reserve(wu * hu * 3);
+        for px in rgba.chunks_exact(4) {
+            out.push(px[0]);
+            out.push(px[1]);
+            out.push(px[2]);
+        }
+        if let Err(e) = std::fs::write(&path, out) {
+            eprintln!("gex-gl: could not write {path}: {e}");
+        }
+    }
+
     fn submit(&self, m: &mut GuestMem<'_>, ring: u64) -> SysResult {
         let head = m.read(ring, Header::SIZE)?.to_vec();
         let Some(header) = read_header(&head) else {
@@ -129,7 +163,17 @@ impl GlDevice {
             *slot = Some(Gl::new(self.size.0, self.size.1));
         }
         let (reply, status, executed) = match slot.as_mut().unwrap() {
-            Ok(gl) => gl.run(&batch),
+            Ok(gl) => {
+                let r = gl.run(&batch);
+                // GEX_GL_DUMP=<prefix>: write each presented frame to
+                // <prefix>-NNN.ppm. The GL runs on the host; a native Wayland
+                // client attaches no buffer, so this is how the drawn pixels
+                // are seen at all.
+                if let Some((w, h, rgba)) = gl.take_frame() {
+                    self.dump_frame(w, h, &rgba);
+                }
+                r
+            }
             // No GL is reported in the header, not as a failed ioctl, so the
             // guest falls back as it would for a driver that refused to load.
             Err(_) => {
@@ -195,6 +239,7 @@ impl FileHandle for GlDevice {
                     .map(|()| 0)
                     .map_err(|e| e),
             ),
+            GEX_GL_SURFACE => Some(Ok(0)),
             _ => None,
         }
     }
