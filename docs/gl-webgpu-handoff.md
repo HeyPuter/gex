@@ -14086,8 +14086,21 @@ reveals the next rather than all of them at once:
   binding**, which is what `GEX_WGPU_ALIAS_TRACE` exists for. EEVEE binds one
   48 KiB buffer to three slots of its light-culling dispatch. All-writable is
   refused too and all-read-only would drop the write, so the read-only side
-  takes a copy on the dispatch's own encoder ahead of the pass. One instance
-  survives in a path this does not cover; the trace will name it.
+  takes a copy on the dispatch's own encoder ahead of the pass.
+
+  **One instance survives**, and `GEX_WGPU_ALIAS_TRACE` now covers the
+  compute, fragment and vertex groups *and* the driver's internal passes and
+  is silent on all four -- which narrows it to the bind groups built outside
+  them: the logic-op snapshot, the depth upload, and the gather/prefix passes,
+  each of which builds its own. Start there.
+
+  Two things about the instrument, because both cost a run. It has to report
+  what is actually **submitted** -- placed before the snapshot rewrite it
+  named every case the fix already handled. And only a *writable* binding
+  conflicts: firing on any two differing types named the driver's own
+  draw-parameters block sharing a constant ring with a uniform buffer, which
+  is legal. A diagnostic that reports legal states is worse than none,
+  because it sends the next reader after the wrong binding.
 - A compute shader calling **`workgroupBarrier` from non-uniform control
   flow**, which Tint rejects. GLSL says the same thing about `barrier()`, so
   the shader is relying on a condition that is uniform in practice and not
