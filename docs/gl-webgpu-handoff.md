@@ -12736,3 +12736,60 @@ from screen-space derivatives -- `v + dpdx(v)*dx + dpdy(v)*dy`, with the
 offset coming from this same table -- but that is exact only for a
 noperspective varying, and these tests check values rather than plausibility,
 so it is not obviously worth having.
+
+## A correction: the centroid fix was not a fix
+
+Earlier in this work I recorded that WebGPU's interpolation-*sampling*
+mismatch had been fixed by emitting `SpvDecorationCentroid` and
+`SpvDecorationSample` on the vertex output as well as the fragment input. It
+had not been. Fifteen of those validation errors were still happening, and I
+had not looked -- what I measured then were Tint *SPIR-V rejections*, which
+are a different failure from a WebGPU *validation* error, and the two do not
+appear in the same place in the log.
+
+**Those decorations are defined for fragment inputs.** A pre-fragment output
+carrying them is not valid SPIR-V, Tint drops them, and the variant the driver
+built to differ from the base module came out byte-identical to it. There is
+no SPIR-V spelling for "this vertex output is interpolated per sample", so
+through a SPIR-V intermediate the two stages *cannot* be made to agree that
+way.
+
+`GEX_WGPU_DUMP_VS` now dumps both stages, and it shows the whole thing at
+once:
+
+    @fragment fn main(@location(0) @interpolate(perspective, sample) ...)
+    struct main_out { @builtin(position) ..., @location(0) v_base_1 : f32, }
+
+The fragment side has the attribute; the vertex side never does.
+
+### What it does instead
+
+The fragment side gives the qualifier up: `centroid` and `sample` are stripped
+from every fragment input, and the varying is interpolated at the pixel
+centre. Centroid and centre differ only where a pixel is partially covered,
+which GL already leaves to the implementation. `sample` is a real difference
+and is reported once by name.
+
+That is not a compromise between two working options -- the alternative was
+losing the draw, and everything batched with it. `shader_multisample_-
+interpolation` went **10/109 to 40/109**: thirty cases were being thrown away
+by a pipeline that never got created.
+
+GLSL helps here in a way worth knowing: it permits `centroid` on the fragment
+input alone -- that asymmetry is exactly what WebGPU objects to -- but
+*requires* `sample` on both sides. So stripping keeps a sample-qualified pair
+consistent rather than making it disagree.
+
+The remaining route to honouring `sample` is patching the WGSL text after
+Tint, which is worth doing only if something actually needs it.
+
+`interpolateAtSample(v, gl_SampleID)` was implemented against this and then
+removed. It reduces exactly to a read of a `sample`-qualified varying -- which
+is the thing that does not exist here, so the read would silently have been
+the centre value. It stays refused by name.
+
+New probe `gl44-centroid-varying-probe`, gated in the browser: a `centroid in`
+varying draws at all and carries its value, and a `sample` pair does not choke.
+Each case writes a constant marker beside the value, because a draw that never
+happened and a value that came back zero are indistinguishable otherwise --
+and while this was being written, both were true at different moments.
