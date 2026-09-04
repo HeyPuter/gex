@@ -13089,3 +13089,66 @@ One thing to keep in mind while reading the reports: after a recovery the
 *next* run's report says "This context is innocent", because it inherited a
 GPU that was already unwell. Only a run on a settled GPU says "guilty", and
 only that one is evidence.
+
+## Tessellation had no transform feedback, and counted its primitives twice
+
+`KHR-GL44.tessellation_shader` sat at 31/140 and was the largest failing
+family left. 76 of the 109 failures were one sub-family,
+`tessellation_control_to_tessellation_evaluation`, and 72 of those failed on
+one of two messages -- "Invalid gl_Position data exposed in TE stage" or
+"Invalid gl_PointSize data exposed in TE stage". That reads like a builtin
+problem, and it is not: it is 91/140 now, from two defects that had nothing to
+do with builtins.
+
+**The evaluation stage recorded nothing.** With tessellation bound the
+evaluation shader is the last stage before rasterization, so its output is
+what GL captures -- and the tessellated draw had no capture path at all. It
+also had no refusal for one, so a draw with feedback active rasterized
+normally and wrote *nothing* to the bound buffers. Every case in that
+sub-family reads its result back through feedback, so all of them read zeroes
+and blamed whichever value they happened to check first. `gl_Position` is
+simply the first thing that function checks.
+
+The fix is a third capture pass beside the vertex stage's and the geometry
+stage's, and it is the simplest of the three: a geometry shader decides at run
+time how many primitives each invocation emits, so the geometry capture needs
+a prefix sum before it knows where anything goes, whereas the tessellator has
+already produced a fixed mesh -- every primitive in the index buffer is
+emitted, in order -- so a primitive's destination is its own position in that
+buffer and there is nothing to scan. It reads the evaluation pass's own output
+buffer through the tessellator's index buffer, which already names the right
+vertices in the right order, so winding is applied before this pass sees it
+and it never learns that domains exist.
+
+**`GL_PRIMITIVES_GENERATED` counted the same draw twice**, and this is the
+half worth remembering. The tessellated draw ends by re-entering `draw_vbo`
+with the tessellation stages unbound to rasterize the finished mesh. The
+geometry stage has a guard against exactly this -- its comment says the count
+was reported three times over -- and tessellation needed the same one: the
+patch draw itself must not count, because the tessellator has not run yet, and
+neither must the rasterizing pass.
+
+Almost no application reads that query. It mattered because **the CTS sizes
+its feedback buffer from it**: it measures the expected vertex count by
+running a counter program and asking this query, so a count of twice the truth
+produced a buffer of twice the size, the capture filled half of it, and the
+tail stayed zero. The tests collect the *unique* values they read and require
+there to be exactly one; they saw two. Both halves of the value were correct
+and the log said so -- "set gl_Position to (1984, 2016, 2048, 2080) instead of
+expected value (1984, 2016, 2048, 2080)" -- which is what a length check
+failing behind an equality check looks like, and it is worth recognising: an
+identical got/expected pair in a failure message means the count is wrong, not
+the value.
+
+`tests/integration/programs/gl44-tess-builtin-probe.c` covers both. Its
+`every_vertex` case exists because the sum it captures is patch-constant, so
+a capture that records the first primitive and stops satisfies any check that
+reads vertex 0 alone -- which is how a partial capture survives a probe that
+looks only at the front. Its `primitives_generated` case asserts that
+`GL_PRIMITIVES_GENERATED` and `GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN` agree
+when the buffer is oversized, which is false by a factor of two under the
+double count.
+
+The 13 that remain are a different shape: three are `barrier()` in a control
+shader, four more are link failures, and the rest are single cases about
+`gl_PatchVerticesIn`, `gl_InvocationID` and level values.
