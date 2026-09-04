@@ -14700,7 +14700,7 @@ Measured against llvmpipe, with the reference number where it was taken:
     cull_distance                 145/218    202/218
     shader_storage_buffer_object  78/124     -
     es_31_compatibility           150/355    -
-    direct_state_access           76/371     -
+    direct_state_access           288/371    370/371
     sample_variables              40/190     190/190
     shading_language_420pack      47/329     329/329
 
@@ -14808,3 +14808,75 @@ there are worth reading before picking the next thing:
      2  tessellation evaluation shader writes nothing
      1  a geometry shader after tessellation
      1  a buffer texture in the tessellation control stage
+
+
+## 266 InternalErrors, and none of them were about what they said
+
+`direct_state_access` scored 76 of 371 and reported **266 InternalError**
+results -- a status neither pass nor fail, and the most anomalous number in
+the whole sweep. Run individually, most of those cases pass.
+
+The whole family is now **288/371** against llvmpipe's 370, and no latch fires
+anywhere in it. Nothing about that came from making a feature work.
+
+### The shape of the bug is worth more than the fixes
+
+**A latch in a shared context is not one failure. It is every failure after
+it, and the ones it causes look nothing like the one it came from.**
+
+dEQP reuses a single GL context for a whole family. This driver latches
+`ctx->failed` when it hits something it cannot do; every later call then
+declines, which reaches the test as an unexpected GL error and is reported as
+InternalError. So one case that legitimately could not run cost the two
+hundred after it -- all of them for features they never used, all of them
+passing when run alone.
+
+Finding it needed the *order*, not the totals. The method was:
+
+1. Count result kinds, not just pass/fail. `InternalError` being the majority
+   is what said the failures were not about the features being tested.
+2. Run one failing case alone. It passed -- so the failures were collateral.
+3. Bisect on the prefix. Take one victim case, prepend each earlier group in
+   turn, and see which prefix turns it from Pass into InternalError. That
+   named `buffers_*`, then `buffers_functional`, in four runs.
+4. Read the driver's own first-refusal line, which names the file and line
+   that latched.
+
+Steps 2 and 3 are the ones to remember. A family's score is not a measurement
+until you know whether its cases are independent.
+
+### Four faults, in the order they were peeled
+
+**A buffer copied into itself.** GL allows it when the ranges do not overlap
+-- `glCopyBufferSubData` says so, and a program compacting a buffer in place
+does exactly that. WebGPU refuses it whatever the ranges ("Source and
+destination are the same buffer"), and an invalid copy invalidates the command
+buffer, fails the submit and latches the context. It goes through a staging
+buffer now.
+
+**An integer vertex attribute could not be captured.** The transform feedback
+capture runs the vertex shader as compute and fetches attributes itself, and
+it handled the four float formats and `R8G8B8A8_UNORM` and nothing else -- so
+an `in int` (`r32_sint`) failed outright. A NIR value is an untyped bit
+pattern, so the 32-bit integer formats are the same code as the float ones;
+only the fill for absent components has to be an integer one. The narrow and
+normalised formats still need unpacking, and are now declined *by name with
+the format in the message* rather than refused blankly.
+
+**Four capture exits latched for things that are not device errors** -- an
+instanced draw, an unreadable index buffer, a stream output target with no
+buffer, a vertex buffer the capture reads being unbound. They decline by name
+now, and the **draw still goes ahead**: abandoning it as well made one wrong
+answer into two, and the second was silent.
+
+**A fragment sampler variant that cannot be built latched too**, though its
+caller already dropped the draw on a NULL module, which is the right answer on
+its own.
+
+### What it did not do
+
+The other families measured -- `sample_variables`, `es_31_compatibility`,
+`shader_storage_buffer_object`, `shader_bitfield_operation`, `cull_distance`
+-- are **unchanged**. This latch was specific to what `direct_state_access`
+exercises. Worth stating, because "a latch poisons everything" invites the
+assumption that fixing one lifts every family, and it did not.
