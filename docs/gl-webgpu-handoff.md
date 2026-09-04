@@ -13991,3 +13991,55 @@ subnormal is `mantissa * 2^-(14 + mantissa_bits)`, exact in f32.
 The asymmetry is the thing to recognise: **the pack side never hits this**, so
 such an image can be written and not read back. If a half or packed-float
 format works one way only, this is why.
+
+## Blender's EEVEE now compiles every shader
+
+Four things stood between EEVEE and a link, none of them about image formats,
+and all four are fixed:
+
+1. **Dual-source blending.** The device has the feature and the SRC1 blend
+   factors were already allowed once granted, so the blend state was right and
+   the *shader* was rejected: `'@blend_src' and '@location' are used on one
+   member while another member with '@location' doesn't use '@blend_src'`.
+   ntv omits the Index decoration on index 0 because Tint turns one into
+   `@blend_src(0)` and WGSL allows that only on a pair -- but omitting it on a
+   shader that *does* have an index 1 output is the mirror of the same rule.
+   The flag is conditional now, decided from the output variables (this runs
+   after passes that rewrite the outputs, so `info.fs.color_is_dual_source` is
+   only as fresh as the last `nir_shader_gather_info`).
+2. **Image atomics.** `imageAtomic*` reaches SPIR-V as `OpImageTexelPointer`,
+   whose result lives in storage class Image, and Tint's reader has none. So
+   an atomic decides the **binding**: the image goes through the packed path,
+   where a texel that is a whole 32-bit word makes it an ordinary buffer
+   atomic. Only at 4 bytes -- below that several texels share a word and an
+   atomic on the shared word would carry its neighbours -- which costs nothing,
+   since GL defines image atomics for r32i and r32ui only.
+3. **`maxStorageTexturesPerShaderStage`.** WebGPU defaults to four where GL
+   4.2 asks for eight image uniforms, and Dawn's own message says "this
+   adapter supports a higher maximum". Nobody had asked. Same shape as the
+   compute-invocation limit already handled in `gex_wgpu_native.c`; when a
+   limit looks like a device restriction, check the request first.
+4. **A depth view read by a plain sampler in a *dispatch*.** The draw path
+   works this out per draw and drops the filter rather than the draw; the
+   compute path used the shader's declared type unchanged, so a dispatch
+   sampling a depth buffer lost its bind group and wrote nothing.
+
+### What EEVEE's viewport still stops on
+
+A chain of *runtime validation* issues rather than refusals, and each fix
+reveals the next rather than all of them at once:
+
+- A **format-class texture view on an array target** -- "the texture view
+  format (RG32Float) is not compatible with the texture format". The
+  reinterpretation machinery exists but is deliberately limited to one level
+  of one layer.
+- A texture bound as **both sampled and write-only storage in one pass**,
+  which WebGPU forbids and GL does not. The contained fix is the one the
+  colour-attachment feedback loop already uses: give the writer a scratch
+  texture and copy it out when the pass ends. It is a *binding* change, so no
+  shader variant is needed.
+- A copy whose **`bytesPerRow` is smaller than its row**.
+- A buffer used as **both writable and read-only storage** in one scope.
+
+Do not read the ordering as a priority list -- it is the order Blender happens
+to hit them in.

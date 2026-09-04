@@ -352,6 +352,58 @@ int main(void) {
                                got_depth[3] == 0x3u);
     }
 
+    /* A depth texture read by a *plain* sampler, which is not the shadow case
+     * above and needs the opposite treatment. GL lets a sampler2D read a
+     * depth texture and get the depth back as a float; WebGPU serves that
+     * only as unfilterable-float with a non-filtering sampler, and naming
+     * Float with a filtering sampler is refused by the texture rather than by
+     * the stage:
+     *
+     *   None of the supported sample types (UnfilterableFloat|Depth) of
+     *   [Texture (Depth32Float)] ...
+     *
+     * The draw path had this rule and the dispatch path did not, so a compute
+     * pass sampling a depth buffer -- which is what Blender's EEVEE does --
+     * lost its bind group and wrote nothing. The comparison mode is turned
+     * off first, because with it on this would be the shadow case again. */
+    glBindTexture(GL_TEXTURE_2D, shadow_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    {
+        GLuint program = build_compute(
+            "#version 430\n"
+            "layout(local_size_x = 1) in;\n"
+            "layout(binding = 0) uniform sampler2D depth;\n"
+            "layout(std430, binding = 0) buffer Out { uint value[]; };\n"
+            "void main() {\n"
+            /* texelFetch, so the answer is one texel and not a filter
+             * argument: (0,1) of the 2x2 is 0.3, scaled to 300. */
+            "  value[3] = uint(texelFetch(depth, ivec2(0, 1), 0).x * 1000.0);\n"
+            "}\n");
+        GLuint filler[4] = {0xbeefu, 0xbeefu, 0xbeefu, 0xbeefu};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, out_buffer);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(filler), filler);
+        if (program) {
+            glUseProgram(program);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, shadow_tex);
+            glUniform1i(glGetUniformLocation(program, "depth"), 0);
+            glDispatchCompute(1, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
+        GLuint got_plain[4] = {0, 0, 0, 0};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, out_buffer);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(got_plain),
+                           got_plain);
+        const GLenum plain_error = glGetError();
+        fprintf(stderr, "INFO depth_as_float got=%u want=300 err=0x%04x%s\n",
+                got_plain[3], (unsigned)plain_error,
+                got_plain[3] == 0xbeefu ? " (never written)" : "");
+        result("depth_as_float", program && plain_error == GL_NO_ERROR &&
+                                 got_plain[3] >= 297 && got_plain[3] <= 303);
+    }
+
     /* The array case, whose view dimension the layout has to name as 2DArray
      * or the bind group is rejected. */
     GLuint array_program = build_compute(
