@@ -82,6 +82,25 @@ static int edge_colour(int cx, int cy, unsigned char out[3]) {
     return best > 40;
 }
 
+/* Lit pixels strictly inside the quad, away from its four real edges.
+ *
+ * Any spurious edge -- the diagonal a quad decomposition introduces -- has to
+ * cross this band, and no real edge of a quad spanning device 9.6..54.4 comes
+ * near it. Counting the interior rather than sampling a computed diagonal is
+ * what makes this independent of *which* diagonal a split happens to choose:
+ * an earlier version of this probe sampled x+y=64 while the diagonal ran
+ * along x+y=63 and reported no diagonal for a driver that was drawing one.
+ */
+static int lit_inside_quad(void) {
+    int n = 0;
+    for (unsigned y = 15; y <= 49; ++y)
+        for (unsigned x = 15; x <= 49; ++x) {
+            const unsigned char *p = &pixels[((unsigned)y * SIDE + x) * 4];
+            if (p[0] > 40 || p[1] > 40 || p[2] > 40) ++n;
+        }
+    return n;
+}
+
 static int same_colour(const unsigned char a[3], const unsigned char b[3]) {
     for (unsigned c = 0; c < 3; ++c) {
         const int d = (int)a[c] - (int)b[c];
@@ -221,21 +240,46 @@ int main(void) {
      */
     {
         read_target();
-        /* Both diagonals, because which one a split introduces is Mesa's
-         * choice and not something to assume. */
-        int lit_main = 0, lit_anti = 0;
-        for (int t = 20; t <= 44; ++t) {
-            const unsigned char *m = &pixels[((unsigned)t * SIDE + t) * 4];
-            const unsigned char *a =
-                &pixels[((unsigned)t * SIDE + (64 - t)) * 4];
-            if (m[0] > 40 || m[1] > 40 || m[2] > 40) ++lit_main;
-            if (a[0] > 40 || a[1] > 40 || a[2] > 40) ++lit_anti;
-        }
-        fprintf(stderr, "INFO quad_no_diagonal main=%d anti=%d want=0,0\n",
-                lit_main, lit_anti);
-        result("quad_no_diagonal", lit_main == 0 && lit_anti == 0);
+        const int inside = lit_inside_quad();
+        fprintf(stderr, "INFO quad_no_diagonal inside=%d want=0\n", inside);
+        result("quad_no_diagonal", inside == 0);
     }
 
+
+    /* 2e. And the same, smooth-shaded.
+     *
+     * This is a separate case from the flat one above and not a redundant
+     * copy of it: with no flat varying, neither the provoking-vertex rewrite
+     * nor the flat-unfilled replay runs, so a smooth unfilled quad reaches
+     * the plain edge-list path and nothing else. The pixel comparison found
+     * the driver drawing a diagonal there -- `quad-unfilled` differs from
+     * llvmpipe by 0.0446 while llvmpipe and softpipe are *pixel-identical*,
+     * and the differing pixels are exactly 224, one per row and one per
+     * column, which is a line from corner to corner.
+     */
+    {
+        glShadeModel(GL_SMOOTH);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBegin(GL_QUADS);
+        glColor3f(1.0f, 0.0f, 0.0f); glVertex2f(-0.7f, -0.7f);
+        glColor3f(0.0f, 1.0f, 0.0f); glVertex2f( 0.7f, -0.7f);
+        glColor3f(1.0f, 1.0f, 0.0f); glVertex2f( 0.7f,  0.7f);
+        glColor3f(0.0f, 0.0f, 1.0f); glVertex2f(-0.7f,  0.7f);
+        glEnd();
+        const GLenum error = glGetError();
+        glShadeModel(GL_FLAT);
+        read_target();
+        const int inside = lit_inside_quad();
+        int total = 0;
+        for (unsigned i = 0; i < SIDE * SIDE; ++i)
+            if (pixels[i * 4] > 40 || pixels[i * 4 + 1] > 40 ||
+                pixels[i * 4 + 2] > 40) ++total;
+        fprintf(stderr, "INFO smooth_quad_no_diagonal inside=%d total_lit=%d "
+                "want inside=0 err=0x%04x\n", inside, total,
+                (unsigned)error);
+        result("smooth_quad_no_diagonal",
+               error == GL_NO_ERROR && inside == 0);
+    }
 
     /* 2c. The same triangle again with back-face culling on.
      *

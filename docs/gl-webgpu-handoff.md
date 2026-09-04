@@ -14342,3 +14342,70 @@ rasterizer state describes.
 so the sign cannot matter to it, and `polygon-mode-faces` passes with either
 sign. It took a case that culls one face of a polygon whose winding is known
 and asserts something is still drawn.
+
+## An unfilled quad draws its decomposition diagonal
+
+Found by the `load` column's own housekeeping rather than by looking for it.
+With `gltestperf` retired, the cleanest remaining signal in the comparison was
+`quad-unfilled`: **refdiff 0** -- llvmpipe and softpipe pixel-identical -- and
+gex 0.0446 away from both. `quad-unfilled-clip` has the same rmse to seven
+digits, so it is one defect, not two.
+
+The differing pixels say what it is without any guessing. There are 224 of
+them, in 224 distinct rows *and* 224 distinct columns, which is a line from
+corner to corner; and gex has exactly 224 more lit pixels than the reference.
+Reduced to 64x64 it draws like this, with `X` for the pixels only gex lights:
+
+    .........##############################################.........
+    .........#X...........................................#.........
+    .........#.X..........................................#.........
+    .........#..X.........................................#.........
+     ... 40 more rows ...
+    .........#...........................................X#.........
+    .........##############################################.........
+
+GL draws a quad's **four** edges. This driver does not advertise
+`MESA_PRIM_QUADS`, so st splits every quad into two triangles before the draw
+arrives, and by the time `glPolygonMode(GL_LINE)`'s rewrite runs the quad's
+identity is gone: it emits six edges, and the two extra ones are the
+decomposition diagonal drawn twice. `GEX_WGPU_UNFILLED_LOG=1` confirms it
+plainly -- `unfilled mode=4 fill=1 count=6` for a four-vertex quad, mode 4
+being `MESA_PRIM_TRIANGLES`.
+
+It is not a flat-shading problem: it happens with `GL_SMOOTH` too, where
+neither the provoking rewrite nor the flat-unfilled replay runs at all. Both
+`quad_no_diagonal` and `smooth_quad_no_diagonal` in
+`gl44-flat-unfilled-probe` fail on this, at 34 interior lit pixels against the
+reference's 0, and they are **left failing on purpose** -- they document a real
+defect rather than a regression.
+
+**A warning about measuring it.** The first version of those two cases sampled
+the two diagonals directly and reported *no* diagonal for a driver that was
+drawing one: the diagonal runs along `x + y = 63` and the probe sampled
+`x + y = 64`. Both cases now count lit pixels in a band strictly inside the
+quad, which no real edge comes near and any spurious edge must cross. Count an
+interior, do not sample a computed line.
+
+**The obvious fix crashes primitive restart, and I could not resolve it.**
+The driver's own `u_primconvert` is created with the narrow WebGPU-native mask
+and the draw dispatch converts against that same mask, so advertising quads in
+`caps->supported_prim_modes` *alone* looked free: the unfilled rewrite runs
+first and would see the real quad, while a filled quad would still be split
+exactly as before. It works, precisely -- the smooth unfilled quad becomes
+**pixel-identical** to llvmpipe, 224 lit pixels down to 180.
+
+But it segfaults `gl44-primrestart-probe` at its `triangle_fan` case, with the
+vertex buffer reported unbound and an index past its end:
+
+    vertex element reads past its buffer (element 0 reads to 104, buffer slot 0
+    is 64 bytes) ... draw=6 indexed ... bounds=1/0..12 bias=0 start=7
+
+Four variants all crash the same way: all of quads+quad-strip+polygon+fan;
+dropping the fan (which is not needed anyway -- a fan's every triangle is
+already its own polygon, so splitting one loses no edges); quads alone; and
+quads with `supported_prim_modes_with_restart` widened to match, on the theory
+that the two masks disagreeing moved which layer resolves restart. None of
+them helped, and the index bound of 12 against an eight-vertex buffer is not
+explained yet. The change is **reverted** -- a 0.0446 wireframe difference is
+not worth a segfault -- and the diagnosis is here so the next attempt starts
+from the restart interaction rather than from the cap.
