@@ -14050,10 +14050,22 @@ Two driver-side refusals remain in that path, and neither would bring the
 viewport up on its own:
 
 - A compute shader calling **`workgroupBarrier` from non-uniform control
-  flow**, which Tint rejects. GLSL says the same about `barrier()`, so the
-  shader relies on a condition that is uniform in practice and not provably
-  so. Hoisting and dropping are both wrong in general; read it before
-  touching it.
+  flow**. Read the SPIR-V before spending anything on this: **the shader is
+  invalid GLSL and WebGPU is the only implementation that checks.**
+
+  The module has five control barriers. Four are in uniform flow -- after a
+  selection merge, which is the ordinary `if (...) { shared[i] = 0; }
+  barrier();` shape. The fifth sits at the top of a loop body whose bound
+  comes from
+
+      %155 = (gl_WorkGroupID << 5) + gl_LocalInvocationID
+
+  a per-invocation coordinate, so the trip count differs per invocation and
+  the barrier is genuinely non-uniform. GLSL says `barrier()` must be in
+  uniform control flow too; other drivers simply do not enforce it, so the
+  shader works everywhere else. There is nothing to fix here -- hoisting the
+  barrier out of the loop is not semantically equivalent, and dropping it is
+  worse.
 - One **declined draw**: a *read-only* image at a promoted format over a
   differently-formatted texture. A read-only image normally falls back to a
   sampled texture, whose format table is richer, but that needs the formats to
