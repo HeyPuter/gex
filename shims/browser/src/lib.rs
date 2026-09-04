@@ -6555,6 +6555,18 @@ fn set_resume_ctx(v: u64) {
 /// read.
 static CTX_ADDR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Set the live guest context so the crash reporter can read the faulting
+/// thread's pc/registers even on a syscall-free straight-line fault (the memory
+/// out-of-bounds case). Called from JS just before `enter`.
+#[no_mangle]
+pub extern "C" fn gex_set_ctx(ctx: i32) {
+    CTX_ADDR.store(ctx as u32 as u64, std::sync::atomic::Ordering::Relaxed);
+}
+#[no_mangle]
+pub extern "C" fn gex_ctx_addr() -> i64 {
+    CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
 fn set_resume_ctx_none() {
     RESUME_CTX.with(|c| c.set(None));
 }

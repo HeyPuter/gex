@@ -2260,6 +2260,9 @@ export class Gex {
             console.error(`[enter] t=${_now.toFixed(0)} pid=${_epid} n=${this._enterN} pc=0x${pc.toString(16)}`);
           }
         }
+        // Record the live ctx so a syscall-free OOB fault still has a valid
+        // context for the crash reporter (gex_current_pc / register dump).
+        this.#shim.exports.gex_set_ctx?.(ctx);
         this.#guest.exports.enter(ctx, pc);
         // `enter` returning means the guest gave the stack back for good,
         // normally because the last process exited.
@@ -2333,6 +2336,16 @@ export class Gex {
           // wild pointer beyond it.
           try {
             console.error(`[trap] linear memory grown to ${(this.#memory.buffer.byteLength / (1024 * 1024)) | 0} MiB (0x${this.#memory.buffer.byteLength.toString(16)})`);
+            // Guest pc + registers at the fault, read from the live ctx (x86 GPRs
+            // map to x-slots in encoding order: rax0 rcx1 rdx2 rbx3 rsp4 rbp5 rsi6 rdi7).
+            try {
+              const ca = Number(e.gex_ctx_addr?.() ?? 0n) >>> 0;
+              if (ca) {
+                const dv = new DataView(this.#memory.buffer);
+                const g = (o) => dv.getBigUint64(ca + o, true).toString(16);
+                console.error(`[trap] pc=0x${g(256)} rax=0x${g(0)} rcx=0x${g(8)} rdx=0x${g(16)} rbx=0x${g(24)} rsp=0x${g(32)} rbp=0x${g(40)} rsi=0x${g(48)} rdi=0x${g(56)}`);
+              }
+            } catch (er) { console.error('[trap] reg dump failed', er.message); }
           } catch {}
           // Dump every thread's register context: two with the same ctx is #126
           // (two Workers on one context). Prints via the shim; safe if borrowed.
