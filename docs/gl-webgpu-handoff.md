@@ -13691,3 +13691,134 @@ passes, so a genuinely one-channel storage format returns `(x, 0, 0, 1)`
 without the driver doing anything -- WGSL specifies it -- whereas a
 four-channel allocation would return whatever the store left in the other
 components. That is the part the probe exists to keep honest.
+
+## The unset-hook audit is finished, and it found one bug
+
+Following the note from the `resource_get_handle` fix, I enumerated every
+function-pointer member of `pipe_screen` (76) and `pipe_context` (147), diffed
+them against every assignment the driver makes, and grepped Mesa for each
+unset hook's call sites: 63 screen and 59 context hooks are unset, reached from
+110 call sites across 47 distinct hooks.
+
+**`resource_get_handle` was the only reachable one.** Everything else is either
+guarded by a pattern static analysis cannot see, or gated behind something the
+driver does not advertise. The cases worth naming, because they *look* reachable
+and are not:
+
+- `set_hw_atomic_buffers` (`st_atom_atomicbuf.c:188`) -- an atom, so it runs on
+  ordinary state changes, but `st_bind_hw_atomic_buffers` returns early when
+  `max_hw_atomic_counters == 0`, which this driver sets explicitly.
+- `set_inlinable_constants` (`st_atom_constbuf.c:174`) -- also an atom, guarded
+  by `prog->info.num_inlinable_uniforms`, which only becomes non-zero if the
+  driver calls `nir_find_inlinable_uniforms`. This one does not.
+- `invalidate_resource`, `emit_string_marker`, `get_device_reset_status`,
+  `generate_mipmap`, `clear_buffer` -- all behind **core** GL entry points
+  (`glInvalidateBufferData`, `glDebugMessageInsert`, `glGenerateMipmap`,
+  `glClearBufferData`, ...), so no extension gates them. I exercised all of them
+  from one program on both drivers rather than trusting a regex: no crash, no
+  error, identical behaviour. st/mesa checks each before calling.
+- `set_sample_locations`, `evaluate_depth_buffer`, the memory-object and
+  semaphore family, the bindless handles, `create_ms_state`/`create_ts_state`
+  and the perf-query hooks -- gated behind extensions an extension query
+  confirms are absent.
+
+The method mattered more than the result. Scanning back a fixed number of lines
+for a guard produced false positives twice -- guards sit at function entry, or
+behind a forward `goto`, or in the *caller* -- so each candidate had to be read
+at function scope and, where it was cheap, actually run. And the negative result
+is the useful part: it means "we left this NULL" is now a checked claim rather
+than an assumption, for both structures.
+
+Note also what *not* to do with the list: st/mesa uses "the hook is set" as a
+capability signal in places (`if (screen->resource_from_memobj)` is what gates
+`EXT_memory_object`), so blanket-stubbing the unset hooks would advertise
+features the driver does not have. Only a hook that is genuinely unguarded and
+reachable should be set, and it must answer "no" correctly.
+
+## Shader images in formats WebGPU has no storage texture for
+
+WebGPU offers storage textures for the four-channel 8/16/32-bit formats and
+the one- and two-channel 32-bit ones. GL 4.2 requires eighteen more --
+r11f_g11f_b10f, r16f, rg16f, r8ui, rgb10_a2 and every 16-bit normalised format
+among them -- and this driver used to refuse a shader that wrote one. A
+refusal is worse here than a wrong pixel: it arrives as a *link* error, the
+application gets a null program, and Blender's EEVEE dumped core on it.
+
+Such an image is now an ordinary **storage buffer**. The shader packs the
+texel itself and the driver copies the buffer into the texture when the pass
+ends. Reading the design in one line: a buffer has no format, which is the
+whole point.
+
+The parts worth knowing before touching it:
+
+- **`nir_format_pack_rgba` does the work.** One Mesa helper converts a vec4
+  into any plain format's packed words -- unorm, snorm, half float, integer,
+  sRGB -- from the format's own `util_format_description`. It also handles
+  r11f_g11f_b10f and r9g9b9e5, which are *not* plain layouts. Filtering on
+  `UTIL_FORMAT_LAYOUT_PLAIN` alone therefore excluded exactly the format
+  Blender needed, and the first version of this path shipped with EEVEE still
+  refused because of it. Match the classifier to what the packer supports, not
+  to a layout enum.
+
+- **The copy goes in `gex_wgpu_end_pass`.** A texture copy cannot be recorded
+  inside a render pass, and that function is the one place every pass closes
+  through. The context carries the copies the pass owes.
+
+- **Rows are padded to 256 bytes**, because that is what a texture copy
+  demands of `bytesPerRow`. The shader is told the padded stride in a header
+  rather than deriving one, so the module never depends on the texture bound
+  to it.
+
+- **The header needs its own buffer *and* its own type.** Both were measured.
+  A read-only binding over the same buffer as a writable one is refused --
+  "includes writable usage and another usage in the same synchronization
+  scope" -- which is a stricter rule than the one about two writable bindings
+  aliasing. And a *sub-word* format packs several texels into one word, so
+  neighbouring invocations write different halves and the bits go in with
+  atomics; Tint retypes an atomically-accessed array as `array<atomic<u32>>`,
+  and SPIR-V gives every runtime array of uint a single type, so making the
+  data block atomic made the header block atomic too. The header gets a
+  fixed-size array.
+
+- **Two atomics may not share a deref.** ntv emits one `OpAccessChain` per
+  deref and reuses it; Tint cannot take the address of a pointer it has
+  already retyped as atomic. A sub-word store is exactly two atomics on one
+  word -- clear the field, set the field -- so it failed every time while
+  either atomic *alone* compiled. That asymmetry is what identified it, since
+  the message names neither the image nor the atomics.
+  `gex_wgpu_split_atomic_derefs` gives each atomic its own, and it must run
+  after `nir_rematerialize_derefs_in_use_blocks_impl` (which is per *block*,
+  so two atomics in one block still share) and after every optimisation, or
+  CSE merges the copies straight back.
+
+The method note, because it recurred three times in one sitting: **dump the
+SPIR-V.** Each of the three findings above came from `spirv-dis` on the
+rejected module, and none of them was guessable from Tint's message -- the
+shared runtime-array type was visible only as two access chains naming the
+same pointer type. The driver prints the module as `SPIRVHEX` lines; it is a
+plain byte stream, not 8-hex-digit words, and decoding it as words produces a
+file the disassembler rejects for its own reasons.
+
+### What is still refused, and why
+
+- **An image that is read as well as written.** It needs the texture copied
+  *into* the buffer before the pass, which means breaking the render pass open
+  around every draw that binds one. Blender's `color_accum_img` (rgba16f) and
+  `cryptomatte_img` (rgba32f) are this case, and note that both are formats
+  WebGPU *does* have storage textures for -- what they lack is read_write
+  access, which WebGPU allows only for r32ui/r32i/r32f.
+- **The compute stage**, which collects its images through a separate path
+  that has not been converted. Blender's `output_img` (r16f) is this case, and
+  it is the cheaper of the two to fix: a compute pass has no render pass, so
+  copies either side of the dispatch need no pass surgery -- which makes
+  read+write tractable there too.
+- **Partial writes.** The whole buffer is copied out, so a texel the shader
+  did not write takes whatever the buffer held. Because the buffer is cached
+  on the resource and rewritten after every pass, that is the texture's own
+  content in the common case -- but not if something else wrote the texture in
+  between.
+
+`gl44-packed-image-probe` is the test. It checks values against llvmpipe
+rather than checking that the shader linked, which is the distinction that
+matters: the whole point of packing over promotion is exactness, and a
+link-success test would not notice a packer that rounded.
