@@ -218,15 +218,46 @@ struct PoolView<'a, 'm> {
 
 impl Buffers for PoolView<'_, '_> {
     fn map(&self, fd: u32, size: usize) -> Option<Vec<u8>> {
-        let file = self.fds.get(fd as usize)?;
-        // The client mapped this shared, so the live pixels are in the guest's
-        // memory; the file's own bytes are what was there before it drew (zero).
-        let map = self
+        let Some(file) = self.fds.get(fd as usize) else {
+            if std::env::var_os("GEX_WL_TRACE").is_some() {
+                eprintln!("[wl-map] fd {fd} not in session fds (have {})", self.fds.len());
+            }
+            return None;
+        };
+        // When the pump is running for the process that owns this pool, the
+        // live pixels are in that process's guest memory (fast, no copy). But
+        // the compositor pumps every session on any process's syscall, so a
+        // client's commit can be processed while another process's memory is
+        // mounted -- then this pool is not in *this* kernel's shared maps.
+        // Fall back to the file behind the descriptor: gex keeps a
+        // single-writer shared mapping coherent with its file at each
+        // safepoint (see Kernel::sync_shared_maps), so the drawn pixels are
+        // there regardless of whose memory is mounted.
+        if let Some(map) = self
             .kernel
             .shared_maps
             .iter()
-            .find(|m| Arc::ptr_eq(&m.file, file))?;
-        let len = size.min(map.len as usize);
-        self.mem.read(map.start, len).ok().map(|b| b.to_vec())
+            .find(|m| Arc::ptr_eq(&m.file, file))
+        {
+            let len = size.min(map.len as usize);
+            if let Ok(bytes) = self.mem.read(map.start, len) {
+                return Some(bytes.to_vec());
+            }
+        }
+        let mut buf = vec![0u8; size];
+        match gex_kernel::vfs::FileHandle::read_at(&*file.handle, 0, &mut buf) {
+            Ok(n) if n > 0 => {
+                if std::env::var_os("GEX_WL_TRACE").is_some() {
+                    eprintln!("[wl-map] fd {fd} read {n} bytes from the file (cross-process)");
+                }
+                Some(buf)
+            }
+            _ => {
+                if std::env::var_os("GEX_WL_TRACE").is_some() {
+                    eprintln!("[wl-map] fd {fd}: no shared map here and file empty");
+                }
+                None
+            }
+        }
     }
 }
