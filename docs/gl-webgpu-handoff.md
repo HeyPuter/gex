@@ -14074,3 +14074,61 @@ viewport up on its own:
   as for the writable version.
 
 to hit them in.
+
+## The pixel comparison, and a confound in it
+
+`tests/gl-app-compare.sh` photographs each program under llvmpipe and under
+this driver and ranks them by RMSE. It answers the question the app sweep
+cannot: **a program that runs, draws every frame it was asked to, and produces
+the wrong pixels is a `RAN` in the sweep and a silent defect.**
+
+Before acting on any row, three things:
+
+1. **The reference runs a different Mesa.** This driver loads the tree's
+   Mesa (26.3-devel); the system llvmpipe is whatever is installed (26.1.6
+   here). A difference can therefore be a *Mesa version* difference and
+   nothing to do with the driver. The way to isolate is
+   `GALLIUM_DRIVER=softpipe` with the tree's `LIBGL_DRIVERS_PATH` -- same
+   Mesa, different driver. Do this first; it is one run and it decides
+   whether the row is yours.
+2. **`self` is not a complete animation floor.** It measures run-to-run
+   variation of the *same* driver, so a program that is deterministic in
+   *frame count* but whose output depends on how many frames elapsed shows
+   `self = 0` and still differs between drivers purely by speed. `clearspd`
+   is exactly this -- a clear-speed benchmark that changes colour per frame,
+   flat-coloured in both images and 25/255 apart, with `self = 0`. A direct
+   probe confirmed both drivers clear a window to the same value.
+3. **Two references can disagree.** `drawarrays`, `draw2arrays`,
+   `drawelements` and `drawrange` all differ by *exactly* 0.0201116 -- one
+   shared cause, and 225 differing pixels all on a single row. gex and
+   softpipe draw that row; llvmpipe and radeonsi do not. So the hardware says
+   exclude it, but it is a one-row edge-inclusion difference on an edge that
+   lands on a pixel boundary, and the mechanism is the y-flip: WebGPU has no
+   negative viewport height, so the flip is done in the shader, which inverts
+   which boundary edges a top-left fill rule includes. Worth knowing about for
+   pixel-exact 2D work; not worth a sub-pixel position hack.
+
+### `dlist-degenerate` renders black, and it is ours
+
+The one row so far that survives all three checks.
+
+- This driver renders an **entirely black frame** (1 colour, mean 0);
+  llvmpipe renders content. `self = 0`, so it is not animation.
+- **Softpipe on the same Mesa is clean**, so it is not a version difference.
+- Exactly one GL error, `GL_INVALID_OPERATION in glEnd`, and it comes from
+  *Mesa's own* `execute_list` (`dlist.c:12426`) rather than from the driver.
+- **No draw reaches the driver at all** -- the per-shape vertex-input trace
+  prints nothing, and the only driver output for the whole run is one depth
+  clear.
+- At the error: the framebuffer is complete (`GL_FRAMEBUFFER_COMPLETE`),
+  `ValidPrimMask` is full (`0x3fff`) so mode validation is not the cause,
+  `CurrentExecPrimitive` is 15 (outside begin/end), and `DrawGLError` is
+  already `GL_INVALID_OPERATION`.
+
+`OPCODE_BEGIN`/`OPCODE_END` are only compiled into a display list for a
+*degenerate* primitive -- one with no vertices, which is what the test is for;
+ordinary vertex sequences become a single `OPCODE_VERTEX_LIST`. So the
+compiled list holds an `END` whose `BEGIN` is missing, which means **list
+compilation diverged**, not replay. The next step is a differential trace of
+`vbo_save` between the two drivers rather than more state inspection at the
+error -- the state there is already known to be sane.
