@@ -12839,3 +12839,53 @@ Several background waits of the form `while pgrep -f gl-app-sweep; do ...`
 never exited, because `pgrep -f` matches the *waiting shell's own command
 line*. It cost an hour of apparently-stalled sweeps. Match on something the
 waiter does not contain, or use the task machinery.
+
+## Logic ops: the last application-level refusal, and how to build it
+
+The 341-program sweep has exactly two refusals left and both are the same
+cause: `glLogicOp`. `line-xor` and `tri-logicop-xor` are the programs; the
+idiom behind them is the XOR rubber-band rectangle that 2D and CAD software
+has drawn selections with since the 1990s. Nothing else in the sweep is
+refused by this driver at all.
+
+WebGPU has no logic-op blend state, so it needs the destination in the
+shader, and the pieces are all already here:
+
+  * `gex_wgpu_feedback_snapshot` already copies a colour attachment and hands
+    back a view, per draw, precisely so a shader can read what it is also
+    writing -- WebGPU forbids the direct feedback loop. Logic ops want the
+    same copy for a different reason.
+  * The fragment variant machinery already specialises on framebuffer state.
+  * `gex_wgpu_declined` already exists for the shapes this will not serve.
+
+The shape of the work:
+
+  1. Accept `logicop_enable` in `gex_wgpu_create_blend_state` instead of
+     refusing it -- it already copies the whole `pipe_blend_state`.
+  2. `PIPE_LOGICOP_COPY` is the default and means "write normally"; handle it
+     as no work at all. `PIPE_LOGICOP_NOOP` means "leave the target alone",
+     which is a zero colour write mask and needs no shader.
+  3. Everything else needs the destination. Snapshot colour target 0, bind it
+     at a texture binding of its own, and have the fragment variant read it
+     with `texelFetch(snapshot, ivec2(gl_FragCoord.xy), 0)` -- a fetch, not a
+     sample, so it needs no sampler.
+  4. GL's logic ops act on the framebuffer's *integer* representation, so for
+     an 8-bit unorm target the shader converts both sides with
+     `u32(round(x * 255.0))`, applies the operation, and divides back. Other
+     formats have other conversions: **refuse them by name** rather than
+     approximate, which is what this driver does everywhere else.
+  5. Both of `gex_wgpu_fragment_module`'s "does this need a variant?" gates
+     have to learn about it, or the draw disappears silently -- see the
+     gl_SamplePosition section for what that looks like.
+
+Two things to know before starting. GL disables blending when a logic op is
+enabled, so the two never have to combine. And overlapping primitives *within
+one draw* will read a stale snapshot, because the copy is taken once per draw
+-- which is correct enough for a rubber-band rectangle and wrong for anything
+that overdraws itself, so that limit belongs in a comment and probably in a
+refusal.
+
+A probe should check the ops that are not self-inverse (`XOR` twice restores
+the original, which a driver doing nothing at all also passes), so: `XOR` once
+against a known destination, `INVERT`, `AND` and `OR` against a destination
+with bits the source does not have, and `NOOP` leaving the target untouched.
