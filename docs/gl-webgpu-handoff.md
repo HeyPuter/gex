@@ -13604,3 +13604,90 @@ restriction; three fail on values with nothing in any log, and
 `advanced-usage-draw-update-draw` was one of them until the map fix, so the
 others may be a different mechanism rather than the same one twice. Batching
 is ruled out for them -- `GEX_WGPU_MAX_BATCH=1` changes nothing.
+
+## The app sweep could not tell a driver problem from a broken machine
+
+This pass went looking at applications rather than the CTS, and the first
+thing it found was that the instrument was untrustworthy.
+
+The sweep reported **193 of 337 programs "exited"** where the notes recorded
+22, which reads as a driver collapse. It was not one. `openbox` had died --
+killing an application's process group takes the window manager with it and
+leaves Xvfb alone -- and `ensure-display.sh` returned early the moment the
+*display* answered, so the manager was never restarted. Without one, a GLUT
+program that reads window properties dies with
+
+    X Error of failed request: BadWindow (invalid Window parameter)
+    Major opcode of failed request: 20 (X_GetProperty)
+
+which is not a GL error and looks nothing like one. `bezier` failed
+**identically on llvmpipe**, which is what settled it -- and running llvmpipe
+was an afterthought rather than part of the harness. Forty-five minutes went
+into that.
+
+So the sweep now runs **every program twice**, once against gex_wgpu and once
+against the system's llvmpipe, and reports a `differs` column. A verdict is
+evidence only when the reference disagrees with it; everything else is
+context. `ensure-display.sh` checks the window manager separately from the
+display, through EWMH rather than by process name (`pgrep -f openbox` also
+matches the script). Both are now tracked in the repo -- `ensure-display.sh`
+was not tracked at all, so the fix would have evaporated with the scratchpad.
+
+**With the reference in place, 6 of 337 programs differ**, and only two are
+about this driver:
+
+    muffin                gex=CRASH  ref=RAN   signal 11
+    texture_from_pixmap   gex=CRASH  ref=RAN   signal 11
+
+Three more (`dotewm`, `qs`, `quickshell`) are the harness failing to execute
+them at all -- the same LD_LIBRARY_PATH problem as
+[[suite-buildfail-false-alarm]] -- and `eglinfo` works here and exits on
+llvmpipe.
+
+### One missing hook, two crashes
+
+Both segfaulted at address zero. Gallium leaves
+`pipe_screen::resource_get_handle` optional, and Mesa's own drisw frontend
+calls it with no NULL check:
+
+    get_image_shm (drisw.c:136)
+      res->screen->resource_get_handle(res->screen, NULL, res, &whandle, ...)
+
+so a driver that does not set it crashes instead of falling back. It is set
+now and returns false -- which is the answer, not a placeholder: a WebGPU
+resource has no shared-memory identifier to hand out, and the caller's next
+line is `get_image(...)`, which copies the drawable through the CPU. Both
+programs run to the timeout now, which is llvmpipe's verdict for them.
+
+Worth generalising: **an optional Gallium hook may still be called
+unconditionally**, so "we don't implement that" and "we set it to say no" are
+different states, and only the second is safe. This one was reachable by any
+GLX pixmap path.
+
+### The cheap route to Blender's EEVEE viewport is ruled out
+
+The previous handoff recorded a plausible shortcut for the storage-format wall:
+a float format can be held in a wider float format losing nothing -- half
+float has a 10-bit mantissa where `r11f_g11f_b10f` has six -- so the driver
+could allocate `rgba16float` and the shader would never know, *provided nothing
+else looks at the texture*. `GEX_WGPU_IMGFMT_LOG=1` now reports every texture
+in an unsupported format with the binds st/mesa asked for, and EEVEE's answer
+is:
+
+    gex-imgfmt: r11g11b10_float binds=0xa SAMPLED RT 1x1
+    gex-imgfmt: r16_float       binds=0xa SAMPLED RT 1x1
+
+**Sampled and rendered to.** So a substitution would have to be undone again
+for every sample and every attachment: the sampled view would need the missing
+components restored to 0 and 1, the attachment format would change under the
+application, and `glTexImage`/`glGetTexImage` would need pack and unpack
+routines that exist for only a few formats today. The knob stays so the next
+person with the same idea can check in one run instead of reasoning about it.
+
+`gl44-image-format-probe` is committed as a marker for the gap and **is
+expected to fail 4 of its 6 cases**, like `gl44-group-vote-probe`. One of its
+results is already useful for building the substitution: `r32f_channels`
+passes, so a genuinely one-channel storage format returns `(x, 0, 0, 1)`
+without the driver doing anything -- WGSL specifies it -- whereas a
+four-channel allocation would return whatever the store left in the other
+components. That is the part the probe exists to keep honest.

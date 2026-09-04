@@ -1,5 +1,6 @@
 #!/bin/bash
-# Run every installed GL program briefly against gex_wgpu and classify it.
+# Run every installed GL program briefly against gex_wgpu *and* llvmpipe and
+# report where the two differ.
 #
 #   tests/gl-app-sweep.sh [outdir] [list]
 #
@@ -31,7 +32,7 @@ OUT=${1:-/tmp/glsweep}
 LIST=${2:-/tmp/glapps.txt}
 mkdir -p "$OUT"
 : > "$OUT/results.tsv"
-printf 'app\tverdict\texit\tnote\n' >> "$OUT/results.tsv"
+printf 'app\tverdict\tref\tdiffers\texit\tnote\n' >> "$OUT/results.tsv"
 
 # Self-contained, deliberately. An earlier version shelled out to a run.sh
 # beside itself, which was true where it was written and false once it lived
@@ -39,6 +40,12 @@ printf 'app\tverdict\texit\tnote\n' >> "$OUT/results.tsv"
 # of the driver verdicts below, the whole run read as though the failures had
 # been fixed. A harness that cannot run the thing it is measuring has to say
 # so, which is what the HARNESS verdict is for.
+# The reference run is not decoration. Without it this sweep cannot tell a
+# driver problem from an environment one: it once reported 193 of 337 programs
+# "exited" after the window manager quietly died, every one of them failing
+# identically on llvmpipe with an X BadWindow error that looks nothing like
+# GL. A verdict is evidence only when the reference disagrees with it, so
+# `differs` is the column to read and the rest is context.
 INST=${GEX_INST:-/tmp/gex-mesa-native/inst}
 export DISPLAY=${GEX_DISPLAY:-:77}
 export LD_LIBRARY_PATH=$INST/lib:$HOME/.cache/gex-dawn-native/pkg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
@@ -46,22 +53,54 @@ export LIBGL_DRIVERS_PATH=$INST/lib/dri
 export LIBGL_ALWAYS_SOFTWARE=1
 export GALLIUM_DRIVER=${GALLIUM_DRIVER:-gex_wgpu}
 [ -d "$INST/lib/dri" ] || { echo "no driver at $INST/lib/dri" >&2; exit 2; }
+# Brings up the display *and* the window manager if either is missing. Both
+# are needed and they die separately: Xvfb outlives openbox whenever an
+# application's process group is killed, and a GLUT program that reads window
+# properties then dies with BadWindow -- an X error that looks nothing like
+# GL and which read, across a whole sweep, as though the driver had collapsed.
+bash "$(dirname "$0")/ensure-display.sh" >/dev/null 2>&1 || true
 xdpyinfo >/dev/null 2>&1 || { echo "no X display at $DISPLAY" >&2; exit 2; }
+xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q "window id" || \
+  echo "WARNING: no window manager on $DISPLAY; GLUT programs will exit 1" >&2
 while read -r app; do
   name=$(basename "$app")
   case "$name" in
     aseprite|cemu|dolphin-emu|dolphin-emu-nogui|mpv) continue ;;
   esac
   log="$OUT/$name.log"
-  timeout -s KILL 8 "$app" >"$log" 2>&1
-  rc=$?
+  # One classifier for both drivers, so a difference between them cannot be a
+  # difference of rules.
+  classify() {
+    local l=$1 r=$2 refused_real wgpuerr latched
+    refused_real=$(grep -E "gex-wgpu: .*(rejected|refused)" "$l" 2>/dev/null \
+                   | grep -vc "render target refused")
+    wgpuerr=$(grep -c "WebGPU error" "$l" 2>/dev/null)
+    latched=$(grep -c "gex_wgpu context failed\|context latched" "$l" 2>/dev/null)
+    refused_real=${refused_real:-0}; wgpuerr=${wgpuerr:-0}; latched=${latched:-0}
+    if [ "$r" -gt 128 ] && [ "$r" -ne 137 ]; then echo CRASH
+    elif [ "$wgpuerr" -gt 0 ]; then echo WGPU-ERROR
+    elif [ "$refused_real" -gt 0 ]; then echo REFUSED
+    elif [ "$latched" -gt 0 ]; then echo LATCHED
+    elif [ "$r" -eq 137 ]; then echo RAN
+    elif [ "$r" -eq 0 ]; then echo OK
+    else echo EXIT; fi
+  }
+  { timeout -s KILL 8 "$app" >"$log" 2>&1; rc=$?; } 2>/dev/null
+  # The same program on the system's llvmpipe, which is what says whether the
+  # verdict above is about this driver or about this machine. `env -u` because
+  # the driver's paths are exported for the whole script.
+  reflog="$OUT/$name.ref.log"
+  { env -u LD_LIBRARY_PATH -u LIBGL_DRIVERS_PATH -u GALLIUM_DRIVER \
+        LIBGL_ALWAYS_SOFTWARE=1 DISPLAY="$DISPLAY" \
+        timeout -s KILL 8 "$app" >"$reflog" 2>&1; refrc=$?; } 2>/dev/null
+  refverdict=$(classify "$reflog" "$refrc")
   # The driver's own complaints, which are the point of the sweep. Format
   # probing ("render target refused") is routine and not a complaint.
-  refused=$(grep -cE "gex-wgpu: .*(rejected|refused)" "$log" 2>/dev/null || echo 0)
+  refused=$(grep -cE "gex-wgpu: .*(rejected|refused)" "$log" 2>/dev/null)
   refused_real=$(grep -E "gex-wgpu: .*(rejected|refused)" "$log" 2>/dev/null \
-                 | grep -vc "render target refused" || echo 0)
-  wgpuerr=$(grep -c "WebGPU error" "$log" 2>/dev/null || echo 0)
-  latched=$(grep -c "gex_wgpu context failed\|context latched" "$log" 2>/dev/null || echo 0)
+                 | grep -vc "render target refused")
+  wgpuerr=$(grep -c "WebGPU error" "$log" 2>/dev/null)
+  latched=$(grep -c "gex_wgpu context failed\|context latched" "$log" 2>/dev/null)
   note=""
   if [ "$rc" -eq 127 ]; then
     verdict=HARNESS; note="could not execute"
@@ -82,7 +121,16 @@ while read -r app; do
   else
     verdict=EXIT; note="exit $rc"
   fi
-  printf '%s\t%s\t%s\t%s\n' "$name" "$verdict" "$rc" "$note" >> "$OUT/results.tsv"
+  differs=no
+  [ "$verdict" != "$refverdict" ] && differs=YES
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$name" "$verdict" "$refverdict" "$differs" "$rc" "$note" \
+    >> "$OUT/results.tsv"
 done < "$LIST"
-echo "--- verdicts ---"
+echo "--- verdicts (gex_wgpu) ---"
 tail -n +2 "$OUT/results.tsv" | cut -f2 | sort | uniq -c | sort -rn
+echo "--- verdicts (llvmpipe) ---"
+tail -n +2 "$OUT/results.tsv" | cut -f3 | sort | uniq -c | sort -rn
+echo "--- where they differ, which is the only part that is evidence ---"
+awk -F'\t' 'NR>1 && $4=="YES"{printf "  %-34s gex=%-11s ref=%-11s %s\n", \
+                                      $1, $2, $3, $6}' "$OUT/results.tsv"
