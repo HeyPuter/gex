@@ -14037,16 +14037,40 @@ reveals the next rather than all of them at once:
   A guard in `create_sampler_view` now refuses the cross-size case by name,
   because the driver used to build the view anyway and an invalid view means
   an invalid bind group means an invalid *command buffer* -- every batched
-  draw lost, with nothing in the GL error path. **But both errors survive
-  that guard**, so these views are created somewhere other than
-  `create_sampler_view`. Twenty call sites reach `wgpuTextureCreateView`; the
-  next step is to instrument them and find which. The likely candidate is the
-  *image* path: `glBindImageTexture` may name a different format from the
-  texture's, which GL allows within a format class, and a storage view then
-  carries a format WebGPU rejects. If that is where it comes from, the fix is
-  the same shape as the packed-image path -- a scratch of the image's own
-  format with a copy either side -- and **not** `viewFormats`, which WebGPU
-  will not accept for a non-sRGB pair even at creation.
+  draw lost, with nothing in the GL error path.
+
+  **Both errors survive that guard, and `GEX_WGPU_IMAGE_TRACE` says why: they
+  are image bindings, not sampler views.**
+
+      gex-imgview: fragment slot=2 image=r16g16_unorm texture=r32_float
+      gex-imgview: fragment slot=3 image=r32_uint    texture=r32_float
+
+  `glBindImageTexture` may name any format in the texture's format class, so
+  both of these are legal GL, and both are 4 bytes per texel. The driver
+  builds the storage view with the *image's* format and WebGPU rejects it.
+  Note the second row is made worse by the format promotion: r16g16_unorm has
+  no WebGPU format at all, so it is stored as rg32float, and the view is
+  therefore RG32Float over R32Float -- a *different* texel size, purely as an
+  artefact. (The promotion cannot simply be dropped: WebGPU has no 16-bit
+  normalised formats, so such a *texture* has to be stored wider regardless.)
+
+  `viewFormats` is not the answer -- WebGPU accepts only the sRGB pair there,
+  even at creation. Two routes are:
+
+  1. **A scratch texture of the image's own format**, with byte copies through
+     a buffer either side (the texel sizes match, so the bytes correspond
+     exactly). This reuses the `reinterpret_staging` hop and the
+     `gex_wgpu_end_pass` drain the packed images already use.
+  2. **The packed path**, which is byte-exact by construction: the shader
+     packs in the image's format and the copy out writes those bytes into the
+     texture, which is precisely what GL specifies. It cannot be reached from
+     the classifier, though, because the mismatch is only known once a texture
+     is bound -- so it would need a *variant* keyed on the bound format, and
+     the bind group layout differs between the two forms (a storage texture
+     versus two buffers), which the per-shader image tables do not currently
+     express.
+
+  Route 1 is the smaller change; route 2 is the more principled one.
 - A texture bound as **both sampled and write-only storage in one pass**,
   which WebGPU forbids and GL does not. The contained fix is the one the
   colour-attachment feedback loop already uses: give the writer a scratch
