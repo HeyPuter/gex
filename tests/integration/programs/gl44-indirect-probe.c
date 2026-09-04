@@ -3,6 +3,7 @@
 #include <GL/glcorearb.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 #define CHECK(condition, message) do { \
@@ -44,6 +45,16 @@ static void check_green(const char* operation) {
                 operation, error, pixel[0], pixel[1], pixel[2], pixel[3]);
         exit(3);
     }
+}
+
+static int have_extension(const char *want) {
+    GLint count = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+    for (GLint i = 0; i < count; ++i) {
+        const GLubyte *one = glGetStringi(GL_EXTENSIONS, (GLuint)i);
+        if (one && strcmp((const char *)one, want) == 0) return 1;
+    }
+    return 0;
 }
 
 int main(void) {
@@ -135,6 +146,54 @@ int main(void) {
     glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT, 0, 2,
                                 sizeof(elements_many[0]));
     check_green("glMultiDrawElementsIndirect");
+
+    /* ARB_indirect_parameters: the *number of draws* comes from a buffer
+     * too. The commands below hold three, and the count buffer says two --
+     * so a driver ignoring the count draws the third, whose vertices are the
+     * ones that miss the pixel, and one that reads the count wrong draws
+     * nothing. The second command is the one that covers it. */
+    /* Resolved rather than linked: Mesa's non-glvnd libGL does not export
+     * these, so a direct call fails at load with "undefined symbol" and takes
+     * the whole probe with it. */
+    void (*multi_arrays_count)(GLenum, GLintptr, GLintptr, GLsizei, GLsizei) =
+        (void (*)(GLenum, GLintptr, GLintptr, GLsizei, GLsizei))
+            eglGetProcAddress("glMultiDrawArraysIndirectCount");
+    void (*multi_elements_count)(GLenum, GLenum, GLintptr, GLintptr, GLsizei,
+                                 GLsizei) =
+        (void (*)(GLenum, GLenum, GLintptr, GLintptr, GLsizei, GLsizei))
+            eglGetProcAddress("glMultiDrawElementsIndirectCount");
+    if (have_extension("GL_ARB_indirect_parameters") && multi_arrays_count &&
+        multi_elements_count) {
+        const struct draw_arrays_command counted[] = {
+            {0, 1, 0, 0}, {3, 1, 0, 7}, {3, 1, 0, 11},
+        };
+        const GLuint how_many = 2;
+        GLuint count_buffer = 0;
+        glGenBuffers(1, &count_buffer);
+        glBindBuffer(GL_PARAMETER_BUFFER, count_buffer);
+        glBufferData(GL_PARAMETER_BUFFER, sizeof(how_many), &how_many,
+                     GL_STATIC_DRAW);
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirect_buffer);
+        glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof(counted), counted,
+                     GL_STATIC_DRAW);
+        glClear(GL_COLOR_BUFFER_BIT);
+        multi_arrays_count(GL_TRIANGLES, 0, 0, 3, sizeof(counted[0]));
+        check_green("glMultiDrawArraysIndirectCount");
+
+        const struct draw_elements_command counted_elements[] = {
+            {0, 1, 0, 0, 0}, {3, 1, 0, 0, 9}, {3, 1, 0, 0, 13},
+        };
+        glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof(counted_elements),
+                     counted_elements, GL_STATIC_DRAW);
+        glClear(GL_COLOR_BUFFER_BIT);
+        multi_elements_count(GL_TRIANGLES, GL_UNSIGNED_SHORT, 0, 0, 3,
+                             sizeof(counted_elements[0]));
+        check_green("glMultiDrawElementsIndirectCount");
+        glDeleteBuffers(1, &count_buffer);
+    } else {
+        fprintf(stderr, "INFO GL_ARB_indirect_parameters absent; the count "
+                        "variants are not tested\n");
+    }
 
     puts("gl44 indirect draw backend ok");
     return 0;

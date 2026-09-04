@@ -12958,3 +12958,64 @@ feature level goes to 450.
 and it is no longer one of the native suite's differences: **88 OK with two
 left, and both are cases where llvmpipe is the outlier.** SuperTuxKart,
 Blender and Minecraft 26.2 are unchanged at 4.5.
+
+## Four of GL 4.6's six, and why the last two are not this driver's
+
+With 4.5 granted the ladder listed six for 4.6. Four are now in, and the two
+left are limits of the platform rather than of the driver.
+
+**ARB_transform_feedback_overflow_query.** Both capture passes already worked
+the answer out: GL stops recording on a *whole* primitive, so the
+primitives-written counter has to report what fit rather than what was
+produced, and the predicate is that comparison. `gl44-xfb-overflow-probe`
+checks a capture that fits, one that does not, and that the counter agrees
+with the predicate in the overflowing case -- the third being what catches a
+predicate bolted on beside a counter that disagrees with it.
+
+**ARB_indirect_parameters.** `util_draw_indirect` already maps the count
+buffer, and this driver resolves every indirect draw through it. The existing
+`gl44-indirect-probe` gained the two `Count` variants, with three commands in
+the buffer and a count of two -- so a driver ignoring the count draws the
+third, whose vertices miss the sampled pixel.
+
+**ARB_gl_spirv and ARB_spirv_extensions.** Mesa does the whole thing;
+`glSpecializeShader` runs `spirv_to_nir` and what arrives is the NIR this
+driver already takes. An extension whose implementation is "nothing" is one
+nobody has checked, so `gl44-spirv-probe` embeds a real module built with
+`glslangValidator -G` and checks the pixel, over a red clear so a program that
+links but draws nothing fails.
+
+### The two that are left
+
+**ARB_shader_group_vote** has every link of its chain but one. Mesa gives the
+three ballots as NIR vote intrinsics, zink's emitter has
+`SpvOpGroupNonUniformAny/All/AllEqual` for exactly those, WGSL has
+`subgroupAny` and `subgroupAll`, and this adapter grants `Subgroups` -- which
+is now requested with the other optional features, so the day it works nothing
+else has to change. Tint's SPIR-V **reader** does not know the instruction:
+
+    Tint rejected SPIR-V: error: unhandled instruction with opcode 335:
+    %27 = OpGroupNonUniformAny %24 %26 %25
+
+The shader is refused and the program fails, which is worse than not having
+the extension, so the cap stays off. `gl44-group-vote-probe` measures it and
+skips cleanly meanwhile.
+
+**ARB_polygon_offset_clamp** was measured earlier: the clamp reaches Dawn's
+descriptor intact and has no effect on it.
+
+### A note on probes and entry points
+
+Three of these probes had to resolve their entry points through
+`eglGetProcAddress` -- `glMultiDrawArraysIndirectCount`, `glSpecializeShader`,
+`glShaderBinary`. Mesa's non-glvnd libGL exports none of them, and a direct
+call fails at *load* with "undefined symbol", killing the probe before it
+prints anything. The harness warns about this ("UNLINKABLE needs via
+getProcAddress") and it is worth reading.
+
+The SPIR-V probe is deliberately **not** gated in the browser. The guest GL
+library exports neither `glShaderBinary` nor `glSpecializeShader`, and -- this
+is the good part -- it filters its own extension list against its exports, so
+the browser reports `gl_spirv=0` and never claims what it cannot do. The
+native path advertises and implements it; the browser advertises neither. Both
+are honest, and they differ, so a gate comparing the two would only ever fail.
