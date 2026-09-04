@@ -13254,3 +13254,93 @@ Note also that Mesa strips an evaluation-shader output the geometry stage does
 not read, so those shaders arrive with no outputs at all and are refused for
 writing nothing. That refusal is accurate about what it sees; the cause is
 downstream of it.
+
+## textureGather, and four bugs that were not about gather
+
+`KHR-GL44.texture_gather` went 29/75 to 68/75. Only the first of the four
+defects was a gather problem; the rest were general and the suite happened to
+be the thing that reached them.
+
+**A dynamic texture offset cannot reach WGSL.** Tint's SPIR-V reader takes the
+`ConstOffset` image operand and refuses the dynamic `Offset` one, and WGSL's
+offset parameter must be a const-expression, so there is nothing to translate
+it to. GL 4.0 allows a non-constant offset for `textureGatherOffset`, so this
+is a real feature rather than a bad shader, and it was every `offset-gather`
+case including the float ones. `nir_lower_tex`'s `lower_offset_filter` folds
+such an offset into the coordinate instead. A *constant* offset is
+deliberately left alone: `ConstOffset` is exact, while the lowering divides by
+the texture size and lands on a texel boundary, which is precisely where a
+gather's footprint is ambiguous.
+
+**An integer gather has to be decomposed.** WGSL has `textureGather` for
+`texture_2d<i32>`, but Tint's *reader* rejects `OpImageGather` on an integer
+image outright -- "sampled image must have float component type". A gather is
+four unfiltered texel reads, so it becomes four nearest samples at the four
+texel centres, and this driver already lowers a nearest integer sample into a
+fetch with GL's wrap rule, edge clamp, border colour and view swizzle applied.
+Two details cost a rebuild each: the footprint is `floor(P * size - 0.5)`, and
+GL's rotation is `(i0,j1), (i1,j1), (i1,j0), (i0,j0)` -- component 3 is the
+lower-left texel, which is not the order anyone guesses. And the four samples
+must carry an **explicit LOD**: an implicit-LOD sample is illegal outside a
+fragment shader, and SPIR-V validation reports that against the *entry point*
+rather than the instruction --
+
+    OpEntryPoint Entry Point's callgraph contains function %main, which
+    cannot be used with the current execution model
+
+-- so an implicit decomposition passes a fragment-shader probe and fails every
+case in a suite that samples in the vertex stage. A gather reads the base
+level anyway.
+
+**A partial depth upload wrote zeroes over its own region.** This is the one
+worth remembering, because it has nothing to do with gather and affects any
+application that builds a depth texture incrementally. WebGPU takes no buffer
+copy into the depth aspect of `depth32float`, so depth is uploaded by
+rendering: the floats go into an r32float staging texture and a fullscreen
+draw moves them in through `@builtin(frag_depth)`, with the viewport limiting
+the draw to the box. The fragment shader indexed the staging texture by
+`@builtin(position)` -- the *framebuffer* coordinate -- while the staging
+texture holds only the box, so every upload away from the origin read out of
+range. WGSL's `textureLoad` answers that with a zero rather than an error, so
+the draw wrote a depth of zero over exactly the region it was filling.
+`glTexImage2D` with data was correct and `glTexSubImage2D` was not, and the
+damage was confined to the piece a test then reads.
+`gl44-depth-upload-probe` covers it, and its `neighbours` case is there so
+that a "fix" which uploads the whole level, or clears before drawing, fails
+too.
+
+**Three bind-group declarations were wrong in ways that write nothing.** A
+compute shader declared every texture as a `Float` sample type; a compute
+shader comparing a depth texture needs `Depth` and a `Comparison` sampler; and
+the vertex stage hardcoded every sampler to non-filtering, which is true of
+filtering and false of comparison -- a comparison is a binding type of its
+own. Each of the three is rejected by Dawn, and **a rejected bind group means
+the work runs and writes nothing**, so all three read back as zeroes: an
+integer texelFetch that returned whatever the buffer held, and two depth
+comparisons that looked like they had answered false everywhere.
+
+### Two process notes from this
+
+**A fixup that derives one table from another must run after everything that
+writes the second.** The compute sampler-type fixup reads the texture sample
+types; it was placed before the scans that decide them and so read zeroes.
+That is a shape to watch for, not a typo.
+
+**Both of the "reads as zero" traps here were only diagnosable because
+something distinguished "never written" from "written wrong."** The compute
+probe fills its buffer with `0xbeef` rather than zero for exactly that reason,
+and it is what turned the sample-type bug from a mystery into a one-line read.
+See also the tessellation section above, where four failures looked like wrong
+builtins and were a draw that never ran.
+
+The 7 that remain are 5 integer *cube* gathers -- WebGPU has no integer cube
+sample type, so the driver lowers integer cube sampling to a 2D-array load,
+and the gather decomposition does not yet follow it there -- and the two
+`gather-geometry-shader` / `gather-tesselation-shader` cases.
+
+Also raised in passing: every texture-lowering refusal now names its
+condition, and the vertex variant path prints the compile error it used to
+free unread. Both of those were needed to find the above at all -- the failing
+shader never reaches the dump in `gex_wgpu_compile_nir`, so "could not build a
+vertex shader variant" plus a list of four possible causes was all the log
+said.
