@@ -14701,7 +14701,7 @@ Measured against llvmpipe, with the reference number where it was taken:
     shader_storage_buffer_object  78/124     -
     es_31_compatibility           117/355    -
     direct_state_access           76/371     -
-    sample_variables              8/190      190/190
+    sample_variables              40/190     190/190
     shading_language_420pack      47/329     329/329
 
 **Sampling in the geometry and tessellation stages is the largest single
@@ -14709,6 +14709,30 @@ cluster left**, and it is a feature, not a defect: the generated compute
 module has to declare the texture and sampler bindings and the dispatch has to
 bind them, the way the compute path already does. It gates all 282 of
 `shading_language_420pack` and an unknown share of `es_31_compatibility`.
-`sample_variables` at 8/190 against a clean reference is the next-largest and
-has not been diagnosed at all. `direct_state_access` reported 267 results that
-were neither pass nor fail, which is its own thing to look at.
+`direct_state_access` reported 267 results that were neither pass nor fail,
+which is its own thing to look at.
+
+### gl_SampleMask could not be translated at all, and three of four shapes are wrong
+
+`sample_variables` was 8/190 against a reference that passes all 190, and 117
+of the failures were one Tint rejection: `cannot assign 'array<i32, 1>' to
+'i32'`. This one needed the disassembly rather than a guess, because every
+obvious repair is also invalid:
+
+| declaration | store | verdict |
+|---|---|---|
+| array | array value | valid SPIR-V, what Vulkan mandates -- **Tint refuses**: WGSL's `@builtin(sample_mask)` is a u32 *scalar*, so it flattens the declaration and has nothing an array can be assigned to |
+| array | scalar | **invalid**: "OpStore Pointer's type does not match Object's type" |
+| scalar | scalar | **invalid**: "[VUID-SampleMask-SampleMask-04359] BuiltIn SampleMask variable needs to be a 32-bit int array" -- Tint runs the Vulkan validation rules too |
+| array | scalar **through an access chain to element zero** | valid SPIR-V, and the form the flattened builtin accepts |
+
+ntv emitted the first. It now emits the fourth behind a new `ntv_info` flag,
+so Vulkan consumers keep the composite-construct they require and only a
+driver that has declared its consumer to be WGSL opts in -- beside
+`omit_fragment_output_index_zero` and `avoid_spv_khr_fma`, which exist for the
+same reason. 8/190 → 40/190.
+
+What is left there is behavioural rather than translation: `gl_SampleMask`,
+`gl_SampleID` and `gl_SamplePosition` semantics under real multisampling, plus
+27 cases reporting `GL_INVALID_OPERATION` from `glCreateProgram`, which is a
+separate thread.
