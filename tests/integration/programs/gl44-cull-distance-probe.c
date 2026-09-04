@@ -199,6 +199,105 @@ int main(void) {
         result(tests[i].name, ok);
     }
 
+    /* A cull distance in the *upper* half of the merged clip/cull array.
+     *
+     * gl_ClipDistance and gl_CullDistance share one array of up to eight
+     * components, spanning two varying slots. This driver decides cull on the
+     * CPU from a capture of the vertex shader's outputs, and that capture
+     * matched its slots by location -- but a shader with more than four
+     * distances between the two declares a single variable at CLIP_DIST0 and
+     * there is no variable at CLIP_DIST1 to find, so the upper four
+     * components captured as zero. Zero does not cull, so gl_CullDistance
+     * simply stopped working past the fourth component while the three cases
+     * above, which use component zero, kept passing.
+     *
+     * Here the culling distance is component *five* of the merged array --
+     * clip[0..2] then cull[0..4], and it is cull[1] that goes negative --
+     * which lands in the second slot. Three clip distances are declared and
+     * held positive so they cannot clip anything away themselves.
+     */
+    {
+        static const char *vs_src =
+            "#version 450 core\n"
+            "layout(location = 0) in vec2 position;\n"
+            "layout(location = 1) in float cull;\n"
+            "out float gl_ClipDistance[3];\n"
+            "out float gl_CullDistance[5];\n"
+            "void main() {\n"
+            "  gl_Position = vec4(position, 0.0, 1.0);\n"
+            "  gl_ClipDistance[0] = 1.0;\n"
+            "  gl_ClipDistance[1] = 1.0;\n"
+            "  gl_ClipDistance[2] = 1.0;\n"
+            "  gl_CullDistance[0] = 1.0;\n"
+            "  gl_CullDistance[1] = cull;\n"
+            "  gl_CullDistance[2] = 1.0;\n"
+            "  gl_CullDistance[3] = 1.0;\n"
+            "  gl_CullDistance[4] = 1.0;\n"
+            "}\n";
+        static const char *fs_src =
+            "#version 450 core\n"
+            "out vec4 colour;\n"
+            "void main() { colour = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+        GLint most_clip = 0;
+        glGetIntegerv(GL_MAX_CLIP_DISTANCES, &most_clip);
+        while (glGetError() != GL_NO_ERROR) {}
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vs, 1, &vs_src, NULL);
+        glCompileShader(vs);
+        GLint ok = 0;
+        glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
+        GLuint prog = 0;
+        if (ok) {
+            GLuint fs2 = glCreateShader(GL_FRAGMENT_SHADER);
+            glShaderSource(fs2, 1, &fs_src, NULL);
+            glCompileShader(fs2);
+            prog = glCreateProgram();
+            glAttachShader(prog, vs);
+            glAttachShader(prog, fs2);
+            glLinkProgram(prog);
+            glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+            if (!ok) {
+                char log[900] = {0};
+                glGetProgramInfoLog(prog, sizeof(log) - 1, NULL, log);
+                fprintf(stderr, "INFO upper_half link: %s\n", log);
+                prog = 0;
+            }
+        } else {
+            char log[900] = {0};
+            glGetShaderInfoLog(vs, sizeof(log) - 1, NULL, log);
+            fprintf(stderr, "INFO upper_half compile: %s\n", log);
+        }
+        if (!prog || most_clip < 3) {
+            fprintf(stderr, "INFO upper_half unavailable (max_clip=%d)\n",
+                    most_clip);
+            result("cull_upper_half", 0);
+        } else {
+            glUseProgram(prog);
+            const float vertices[9] = {
+                -1.0f, -1.0f, -1.0f,
+                 3.0f, -1.0f, -1.0f,
+                -1.0f,  3.0f, -1.0f,
+            };
+            glBindBuffer(GL_ARRAY_BUFFER, buffer);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices,
+                         GL_STREAM_DRAW);
+            glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            unsigned char px[4] = {0};
+            glReadPixels(SIDE / 2, SIDE / 2, 1, 1, GL_RGBA,
+                         GL_UNSIGNED_BYTE, px);
+            const GLenum error = glGetError();
+            fprintf(stderr, "INFO cull_upper_half got=%u,%u,%u want=red "
+                    "err=0x%04x\n", px[0], px[1], px[2], (unsigned)error);
+            /* Every vertex negative in cull[1]: the triangle goes away and
+             * the clear colour stands. */
+            result("cull_upper_half", error == GL_NO_ERROR &&
+                                      px[0] > 128 && px[1] < 128);
+            glUseProgram(program);
+        }
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

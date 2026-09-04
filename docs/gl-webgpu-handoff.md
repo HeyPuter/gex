@@ -14586,3 +14586,129 @@ The only rows still above their refdiff are `tri-edgeflag`,
 which are the y-flip horizontal-line tie-break documented earlier -- a
 platform limitation, since WebGPU has no negative viewport height, and one a
 constant epsilon provably cannot fix.
+
+## The GL45 CTS was unrunnable, and what it found once it ran
+
+The pixel comparison had nothing attributable left, so the next instrument was
+the native CTS. It did not work at all -- every family died instantly:
+
+    FATAL ERROR: GLX extension "GLX_ARB_create_context_robustness" not
+    supported at tcuLnxX11GlxPlatform.cpp:315
+
+That reads as an environment problem and is half one. **Two** things were
+needed, and the distinction matters because fixing either alone changes
+nothing:
+
+1. The driver must set `caps.device_reset_status_query`. Mesa gates
+   `GLX_ARB_create_context_robustness` on that cap alone
+   (`__glXEnableDirectExtension` in `src/glx/glxext.c`), and this driver never
+   set it. Real applications that ask for a robust context were refused the
+   same way, so this is not only a test concern.
+2. The X server must advertise it as well. Mesa only puts an extension in the
+   string if `direct_support & (server_support | direct_glx_only)`, and
+   robustness is not marked `direct_only`, so a *direct* context still needs
+   server support it has no protocol for. Xvfb does not advertise it.
+   `tests/gl-cts-native.sh` therefore force-enables it through Mesa's own
+   `glx_extension_override` driconf, scoped with `DRIRC_CONFIGDIR` so no
+   user's `~/.drirc` is touched.
+
+The instrument that settled where the fault lay was a nine-line program
+calling `glXQueryServerString` and `glXQueryExtensionsString` exactly as the
+CTS does. `glxinfo` was actively misleading here: it prints an extension in
+its *client* list that `glXQueryExtensionsString` does not return.
+
+**A trap worth knowing:** Mesa's driconf parser silently ignores a `.conf`
+file that contains an XML comment. The only symptom is the FATAL ERROR coming
+back, which reads as the option not existing.
+
+`KHR-GL45.limits` runs 135/140 with both in place. The list of cases is the
+CTS build's own `khronos_mustpass/main/gl45-main.txt` -- 19714 of them; the
+`khronos_mustpass_single` list is a different and much smaller set that
+contains almost no families, which is a good way to waste an hour.
+
+### What it found
+
+A family's score is meaningless without the reference run. `copy_image` came
+back 31/31; `shading_language_420pack` came back 47/329 and llvmpipe scores
+**329/329**, which is what made it worth reading.
+
+**gl_CullDistance stopped working past its fourth component.**
+`KHR-GL45.cull_distance` scored **1 of 218** against llvmpipe's 202 with zero
+failures. `GEX_WGPU_CULL_TRACE` said why in one line: every distance above the
+third read back `k0.000` while the shader had written real values, and zero
+does not cull.
+
+gl_ClipDistance and gl_CullDistance share *one* array of up to eight
+components across two varying slots, and a shader with more than four between
+them declares a single variable at `CLIP_DIST0` -- there is no variable at
+`CLIP_DIST1` to find. The capture matched slots by location alone, found
+nothing for the upper slot and filled it with the zeros an unwritten input is
+worth. 1/218 → 145/218.
+
+Behind that, the geometry and tessellation passthrough declared every output
+as a `vec4`, and a clip distance may not be one -- SPIR-V wants "BuiltIn
+ClipDistance ... a 32-bit float array" and Tint enforces it, so the module was
+rejected and the link failed with nothing but "Program linking failed" to go
+on. ntv already carries the same workaround for `FRAG_RESULT_SAMPLE_MASK` a
+few lines away. Fixing it converted 48 link failures into real behavioural
+ones: no change in score, and the whole difference between a shader that
+cannot build and a feature that is missing.
+
+What remains in that family is `gl_CullDistance` written by a geometry or
+tessellation stage. GL takes it from the last stage before rasterization and
+this filter reads the vertex shader's; that is items 5, 6 and 8, and it is a
+feature rather than a defect.
+
+**The entire `shading_language_420pack` family failed on one cause, and the
+giveaway was `utf8_characters_case_in_comment_character_two_bytes`.** A test
+about a UTF-8 character in a comment has no business depending on the driver,
+and it did not: every program in that family binds a sampler in *every* stage,
+and the tessellation and geometry shaders were refused before the test began.
+
+Three shader creators -- `create_tcs_state`, `create_tes_state` and
+`create_gs_state`, each of which builds its NIR itself instead of going
+through `create_shader_state` -- never called
+`gex_wgpu_split_combined_samplers`, so a shader that samples reached the
+SPIR-V emitter with a tex instruction carrying no texture deref. That is the
+third stage to need that pass after compute and the fragment path.
+
+Running the split is necessary and not sufficient, and the second half is the
+more useful lesson. Nothing binds textures for those stages:
+`gex_wgpu_bind_sampler_states` takes fragment, vertex and compute only, and a
+real sampler bound anywhere else calls `gex_fail` -- which latches the context,
+surfaces as `GL_OUT_OF_MEMORY`, and in the CTS **aborts the entire run at the
+first case**. With the split alone, 329 cases became 1 case and "Test run was
+ABORTED!" -- strictly worse than the 282 clean failures it started with.
+
+So those shaders are now refused where they are created, by name. The score is
+unchanged at 47/329 -- this fixes no case -- but the run completes, every later
+case is judged on its own merits, and the message says which feature is
+missing rather than reading like an internal error about derefs. **A refusal
+must not latch, and a refusal that aborts the harness is worse than the
+failure it replaces.**
+
+### Where the CTS stands, and what is worth doing next
+
+Measured against llvmpipe, with the reference number where it was taken:
+
+    family                        gex        llvmpipe
+    copy_image                    31/31      -
+    shader_bitfield_operation     300/324    -
+    tessellation_shader           132/140    -
+    geometry_shader               117/136    -
+    limits                        135/140    -
+    cull_distance                 145/218    202/218
+    shader_storage_buffer_object  78/124     -
+    es_31_compatibility           117/355    -
+    direct_state_access           76/371     -
+    sample_variables              8/190      190/190
+    shading_language_420pack      47/329     329/329
+
+**Sampling in the geometry and tessellation stages is the largest single
+cluster left**, and it is a feature, not a defect: the generated compute
+module has to declare the texture and sampler bindings and the dispatch has to
+bind them, the way the compute path already does. It gates all 282 of
+`shading_language_420pack` and an unknown share of `es_31_compatibility`.
+`sample_variables` at 8/190 against a clean reference is the next-largest and
+has not been diagnosed at all. `direct_state_access` reported 267 results that
+were neither pass nor fail, which is its own thing to look at.
