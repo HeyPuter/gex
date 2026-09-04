@@ -13830,14 +13830,6 @@ Two more things had to be measured there:
 
 ### What is still refused, and why
 
-- **A fragment image that is read as well as written.** It needs the texture
-  copied into the buffer before the pass, which means breaking the render pass
-  open around every draw that binds one. Blender's `color_accum_img` (rgba16f)
-  is this case and the only image refusal EEVEE has left. The tractable route
-  is to seed the buffer when the image is *bound* rather than when the bind
-  group is built -- `glBindImageTexture` is a state change, and ending a pass
-  on one is ordinary -- reseeding whenever the resource's `write_serial` has
-  moved, the way `gex_wgpu_sampler_view_refresh` does.
 - **An image with no format qualifier** (`format none`). GL allows a
   `writeonly` image to omit it and takes the format from the bound texture,
   which makes the packing arithmetic per-*draw* state rather than per-shader:
@@ -13853,6 +13845,31 @@ Two more things had to be measured there:
   content in the common case -- but not if something else wrote the texture in
   between. The compute read path seeds the buffer from the texture and does
   not have this gap.
+
+### The fragment read case, and why the reasoning against it was wrong
+
+A draw *can* serve an image it reads. I had ruled it out because seeding the
+buffer has to submit -- the texture's own writes must reach the queue before
+they are copied -- and a submit closes the open render pass. What that misses
+is that the bind group is built **before** this draw's pass is opened, so the
+submit ends whatever pass came *before*, which is what any state change does.
+The cost is a pass break per draw that binds one, and Blender's EEVEE went
+from one image refusal to none.
+
+Two ordering bugs came with it, and both are the kind that only a value test
+finds:
+
+- **Seed before registering the copy out, not after.** Registering first meant
+  the seed's submit flushed that copy immediately, so an unwritten buffer
+  landed on the texture before the draw ran *and* the copy the draw needed was
+  gone. The seed now happens inside `gex_wgpu_packed_image_bind`, before
+  registration, so both stages share one ordering.
+- **Re-read the encoder after building the bind groups.** The draw captures
+  `ctx->pending_encoder` long before it builds them, and the submit releases
+  it; beginning a render pass on the freed one segfaults inside Dawn's
+  encoding context with this driver nowhere in the backtrace above
+  `BeginRenderPass`. Nothing is lost by refreshing it -- the old encoder was
+  submitted, not discarded.
 
 ### A refusal was hiding a driver bug, again
 

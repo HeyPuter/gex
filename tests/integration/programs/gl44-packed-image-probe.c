@@ -296,6 +296,78 @@ int main(void) {
             result("stride", ok && error == GL_NO_ERROR);
     }
 
+    /* A fragment image read *and* written. WebGPU has storage textures for
+     * rgba16f but will not give them read_write access -- only r32ui/r32i/
+     * r32f get that -- so this is packed for a different reason from the
+     * cases above, and it is the one that needs the texture copied *into* the
+     * buffer before the draw. Seeding it is what this checks: the shader adds
+     * to what is already there, so a driver that bound an unseeded buffer
+     * reads zero and the sum comes out short. */
+    {
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA16F, WIDTH, HEIGHT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        /* 0.25 everywhere, so the shader's +0.5 must read back as 0.75. */
+        static float seed[WIDTH * HEIGHT * 4];
+        for (unsigned i = 0; i < WIDTH * HEIGHT * 4; ++i) seed[i] = 0.25f;
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WIDTH, HEIGHT, GL_RGBA,
+                        GL_FLOAT, seed);
+        static const char *rmw_src =
+            "#version 420 core\n"
+            "layout(rgba16f) uniform image2D img;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  ivec2 at = ivec2(gl_FragCoord.xy);\n"
+            "  vec4 was = imageLoad(img, at);\n"
+            "  imageStore(img, at, was + vec4(0.5));\n"
+            "  colour = vec4(0.0, 0.0, 0.0, 1.0);\n"
+            "}\n";
+        GLuint program = link(vs_quad, rmw_src, "read_write");
+        int ok = 0;
+        if (program) {
+            glUseProgram(program);
+            glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_READ_WRITE,
+                               GL_RGBA16F);
+            glUniform1i(glGetUniformLocation(program, "img"), 0);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_UPDATE_BARRIER_BIT);
+            /* Read back by sampling, as above. */
+            GLuint fetch = link(vs_quad,
+                "#version 420 core\n"
+                "uniform sampler2D src;\n"
+                "out vec4 colour;\n"
+                "void main() {\n"
+                "  colour = vec4(texelFetch(src, ivec2(gl_FragCoord.xy),\n"
+                "                           0).xyz, 1.0);\n"
+                "}\n", "read_write");
+            if (fetch) {
+                glUseProgram(fetch);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glUniform1i(glGetUniformLocation(fetch, "src"), 0);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                unsigned char got[4] = {0};
+                glReadPixels(WIDTH - 2, HEIGHT - 1, 1, 1, GL_RGBA,
+                             GL_UNSIGNED_BYTE, got);
+                const GLenum error = glGetError();
+                fprintf(stderr, "INFO read_write got=%u,%u,%u want~=191 "
+                        "err=0x%04x\n", got[0], got[1], got[2],
+                        (unsigned)error);
+                /* 0.75 of 255 is 191; an unseeded buffer gives 0.5 -> 128. */
+                ok = error == GL_NO_ERROR && got[0] >= 187 && got[0] <= 195 &&
+                     got[1] >= 187 && got[1] <= 195;
+            }
+        }
+        result("read_write", ok);
+    }
+
     /* imageSize must report the texture, not the padded buffer row. */
     {
         GLuint tex = 0;
