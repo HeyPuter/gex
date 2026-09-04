@@ -14029,10 +14029,24 @@ and all four are fixed:
 A chain of *runtime validation* issues rather than refusals, and each fix
 reveals the next rather than all of them at once:
 
-- A **format-class texture view on an array target** -- "the texture view
-  format (RG32Float) is not compatible with the texture format". The
-  reinterpretation machinery exists but is deliberately limited to one level
-  of one layer.
+- **Views whose format WebGPU will not take.** `viewFormats` spans only the
+  sRGB pair (see `resource_create`), so every other format change needs the
+  scratch copy -- and EEVEE asks for `R32Uint` over `R32Float` (same texel
+  size, so serveable) and `RG32Float` over `R32Float` (different, so not).
+
+  A guard in `create_sampler_view` now refuses the cross-size case by name,
+  because the driver used to build the view anyway and an invalid view means
+  an invalid bind group means an invalid *command buffer* -- every batched
+  draw lost, with nothing in the GL error path. **But both errors survive
+  that guard**, so these views are created somewhere other than
+  `create_sampler_view`. Twenty call sites reach `wgpuTextureCreateView`; the
+  next step is to instrument them and find which. The likely candidate is the
+  *image* path: `glBindImageTexture` may name a different format from the
+  texture's, which GL allows within a format class, and a storage view then
+  carries a format WebGPU rejects. If that is where it comes from, the fix is
+  the same shape as the packed-image path -- a scratch of the image's own
+  format with a copy either side -- and **not** `viewFormats`, which WebGPU
+  will not accept for a non-sRGB pair even at creation.
 - A texture bound as **both sampled and write-only storage in one pass**,
   which WebGPU forbids and GL does not. The contained fix is the one the
   colour-attachment feedback loop already uses: give the writer a scratch
