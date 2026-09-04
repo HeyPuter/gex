@@ -14693,6 +14693,7 @@ Measured against llvmpipe, with the reference number where it was taken:
 
     family                        gex        llvmpipe
     copy_image                    31/31      -
+    gpu_shader_fp64               558/659    -
     shader_bitfield_operation     300/324    -
     tessellation_shader           132/140    -
     geometry_shader               117/136    -
@@ -14976,3 +14977,61 @@ and -- deliberately -- the same program with that sampler *selected* and a real
 integer texture bound, so that "always ignore the second sampler" cannot pass.
 Verified to discriminate: with the omission removed the first case fails and
 the second still passes.
+
+
+## fp64: the arithmetic was fine, the load was not
+
+`gpu_shader_fp64` is 659 cases and had never been measured. It was **482/659**;
+it is **558/659** now, from two fixes that both come down to a 64-bit type
+reaching Tint, which refuses a module for it outright -- so one survivor costs
+a whole shader, which fails the link and takes the program with it.
+
+**The diagnostic that mattered was a pattern in the case names.** Every
+`dmat*` variant passed and every `double` and `dvec*` variant failed, for all
+48 builtins. That says the fault is not in the arithmetic -- a matrix does the
+same arithmetic -- and it pointed straight at the load:
+
+    gex_wgpu requires vec4-backed, 16-byte-aligned Gallium UBO loads:
+    load_ubo bit_size=64 block-index-const=1
+
+st turns every double *operation* into software 32-bit arithmetic, but a
+`double` in a uniform block is still loaded as one 64-bit value, and this
+driver's UBO lowering takes 32-bit loads only. Each component is now a two-word
+load packed back into a 64-bit value -- which reintroduces nothing, because the
+consumers are already `unpack_64_2x32` pairs from the doubles lowering and the
+optimiser folds pack straight into unpack.
+
+**That fold needs somewhere to happen, which is the other half.** st lowers in
+the right order -- `nir_lower_doubles`, then `nir_lower_int64` -- but runs
+`gl_nir_opts` *after* both, and an optimisation puts a 64-bit value back: an
+if/else assigning a double becomes a `bcsel` on the packed value, with no
+earlier pass left to see it. The driver now sweeps once more at the last point
+before the emitter. Three things make that work rather than merely run:
+
+- **The optimiser loop afterwards is not optional.** `nir_lower_int64`
+  *represents* its results with `pack_64_2x32_split`, so it leaves 64-bit
+  values behind by construction and relies on something folding the pairs.
+- **A 64-bit local variable is not an operation.** No ALU lowering touches it;
+  it reaches the emitter as `OpTypePointer Function %ulong`. It survives SSA
+  conversion when it is an array indexed dynamically -- which the `dvec3` tests
+  do and the `dvec2` ones do not -- so the indirect indexing is flattened and
+  vars-to-ssa re-run first.
+- **The sweep is gated on the shader containing something 64-bit at all.**
+  Almost none do, and they pay one walk rather than a deref flattening that can
+  grow a large shader.
+
+`shading_language_420pack` went from 17 shaders refused for this to none. Its
+*pass rate did not move* -- those cases fail for other reasons too -- and that
+is worth stating rather than quietly folding into a headline number.
+
+### Where it stops, and why
+
+97 link failures remain, and some are now **float** rather than integer:
+`unhandled float width: 64`. The driver cannot sweep those the way it sweeps
+integers: re-running `nir_lower_doubles` needs the software fp64 shader, and
+that lives in st as `ctx->SoftFP64`, not here. Building one with
+`glsl_float64_funcs_to_nir` is the route if it is worth taking.
+
+`fp64.varyings` is separate and smaller: a `double` on an interface variable,
+which no operation lowering can reach -- it needs the varying split into two
+32-bit halves across the stage boundary.
