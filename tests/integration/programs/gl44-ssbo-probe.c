@@ -58,6 +58,33 @@ static int has_extension(const char *want) {
     return 0;
 }
 
+/* A compute program, for the aliasing case below -- the graphics build()
+ * beneath this one takes a vertex and fragment pair. */
+static GLuint build_compute(const char *src) {
+    GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(shader, 1, &src, NULL);
+    glCompileShader(shader);
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[900] = {0};
+        glGetShaderInfoLog(shader, sizeof(log) - 1, NULL, log);
+        fprintf(stderr, "INFO compute compile: %s\n", log);
+        return 0;
+    }
+    GLuint program = glCreateProgram();
+    glAttachShader(program, shader);
+    glLinkProgram(program);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[900] = {0};
+        glGetProgramInfoLog(program, sizeof(log) - 1, NULL, log);
+        fprintf(stderr, "INFO compute link: %s\n", log);
+        return 0;
+    }
+    return program;
+}
+
 static GLuint build(const char *vs_src, const char *fs_src) {
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vs, 1, &vs_src, NULL);
@@ -310,6 +337,56 @@ int main(void) {
                              px[0] >= 38 && px[0] <= 42 &&
                              px[1] >= 198 && px[1] <= 202);
         glDeleteBuffers(2, ssbo);
+    }
+
+    /* One buffer bound to two storage slots at once, written through one and
+     * read through the other. GL allows it -- the values read are undefined
+     * without a barrier, but the binding and the write are not -- and WebGPU
+     * refuses any writable binding that shares a synchronization scope with
+     * another use of the same buffer:
+     *
+     *   [Buffer] usage (Storage(read-write)|Storage(read-only)) includes
+     *   writable usage and another usage in the same synchronization scope
+     *
+     * naming neither binding. Blender's EEVEE binds one buffer to three slots
+     * of its light-culling dispatch. The read-only side takes a copy now, so
+     * what this asserts is the part GL does define: the *write* lands, and
+     * the draw is not dropped. Nothing is asserted about the value read
+     * through the other binding, because GL leaves it undefined and a test
+     * that asserted on it would be a test that lies. */
+    {
+        GLuint prog = build_compute(
+            "#version 430\n"
+            "layout(local_size_x = 1) in;\n"
+            "layout(std430, binding = 0) buffer Written { uint out_value[]; };\n"
+            "layout(std430, binding = 1) readonly buffer Read { uint in_value[]; };\n"
+            "void main() {\n"
+            "  out_value[1] = 0xd1ceu + (in_value[0] & 0u);\n"
+            "}\n");
+        GLuint buffer = 0;
+        GLuint seed[4] = {0x1111u, 0x2222u, 0x3333u, 0x4444u};
+        glGenBuffers(1, &buffer);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(seed), seed,
+                     GL_DYNAMIC_COPY);
+        /* The same buffer at both slots. */
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, buffer);
+        if (prog) {
+            glUseProgram(prog);
+            glDispatchCompute(1, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
+        GLuint back[4] = {0, 0, 0, 0};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(back), back);
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO aliased_storage at1=0x%x at0=0x%x want=0xd1ce,"
+                "0x1111 err=0x%04x\n", back[1], back[0], (unsigned)error);
+        result("aliased_storage", prog && error == GL_NO_ERROR &&
+                                  back[1] == 0xd1ceu && back[0] == 0x1111u);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, 0);
+        glDeleteBuffers(1, &buffer);
     }
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,

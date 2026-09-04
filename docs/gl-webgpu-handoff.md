@@ -14062,13 +14062,43 @@ reveals the next rather than all of them at once:
   because the bind group layout differs between a storage texture and two
   buffers. That is the shape of the next fix here.
 
-- A texture bound as **both sampled and write-only storage in one pass**,
-  which WebGPU forbids and GL does not. The contained fix is the one the
-  colour-attachment feedback loop already uses: give the writer a scratch
-  texture and copy it out when the pass ends. It is a *binding* change, so no
-  shader variant is needed.
-- A copy whose **`bytesPerRow` is smaller than its row**.
-- A buffer used as **both writable and read-only storage** in one scope.
+- ~~A texture bound as both sampled and write-only storage in one pass~~ --
+  **done**. WebGPU forbids a writable storage binding sharing a scope with any
+  other use of the texture. Two draws with `glMemoryBarrier` between them
+  already worked (the barrier submits, and a submit closes the scope), so what
+  was left was *one* draw doing both, which no pass boundary separates: the
+  image writes go to an alias and are copied back at pass end.
+- ~~A copy whose `bytesPerRow` is smaller than its row~~ -- **done**, and it
+  is the lesson worth keeping from this whole stretch. **Anything that creates
+  a texture from `gex_wgpu_texture_format` and then measures its rows must ask
+  `gex_wgpu_stored_format` for the texel size.** The promotion applies to the
+  creation and not to the arithmetic, so the two disagree:
+
+      The byte size of each row (8384) is > bytesPerRow (4352)
+
+  Three places had it -- the cross-class sampler view's scratch, the
+  render-target scratch, and the image alias. A guard meant to catch this
+  compared the view's *Gallium* size against the texture's *stored* size and
+  so let the very case through; it is stored-against-stored now.
+- ~~A buffer used as both writable and read-only storage~~ -- **mostly done**.
+  GL lets one buffer sit at several storage slots, written through one and read
+  through the others; WebGPU refuses the overlap and **names neither
+  binding**, which is what `GEX_WGPU_ALIAS_TRACE` exists for. EEVEE binds one
+  48 KiB buffer to three slots of its light-culling dispatch. All-writable is
+  refused too and all-read-only would drop the write, so the read-only side
+  takes a copy on the dispatch's own encoder ahead of the pass. One instance
+  survives in a path this does not cover; the trace will name it.
+- A compute shader calling **`workgroupBarrier` from non-uniform control
+  flow**, which Tint rejects. GLSL says the same thing about `barrier()`, so
+  the shader is relying on a condition that is uniform in practice and not
+  provably so. Hoisting or dropping it are both wrong in general; this one
+  needs reading before it is touched.
+- One **declined draw**: a *read-only* image at a promoted format over a
+  differently-formatted texture. A read-only image normally falls back to a
+  sampled texture, whose format table is richer -- but that fallback needs the
+  formats to agree, and the promotion breaks it. This is the bind-time case
+  that only a bound-format-keyed variant of the packed path can serve, which
+  is also the answer to the writable version of the same problem.
 
 Do not read the ordering as a priority list -- it is the order Blender happens
 to hit them in.

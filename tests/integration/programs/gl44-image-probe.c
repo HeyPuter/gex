@@ -691,6 +691,120 @@ int main(void) {
         glDeleteTextures(1, &tex);
     }
 
+    /* An image bound at a *different format in the texture's class*, which
+     * glBindImageTexture allows and which GL defines as reinterpreting the
+     * same bits. Here an r32f texture is written through an r32ui image, so
+     * the bit pattern stored is the integer and reading it back as a float
+     * gives whatever that pattern means -- 1.0 is 0x3f800000, so writing that
+     * integer and reading 1.0 says the bytes went through untouched.
+     *
+     * WebGPU has no such view: a storage view naming R32Uint over an
+     * R32Float texture is refused, and viewFormats will not take the pair
+     * even at creation. The driver binds a texture of the image's own format
+     * and copies the bytes across instead. Blender's EEVEE binds two such
+     * images per frame, and the failure was silent -- an invalid view is an
+     * invalid bind group is an invalid command buffer, and every batched draw
+     * went with it. */
+    {
+        GLuint prog = build(
+            "#version 330 core\n"
+            "#extension GL_ARB_shader_image_load_store : require\n"
+            "layout(r32ui) uniform uimage2D img;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            /* 0x3f800000 is 1.0f; 0x40000000 is 2.0f. */
+            "  imageStore(img, ivec2(1, 0), uvec4(0x3f800000u, 0, 0, 0));\n"
+            "  imageStore(img, ivec2(2, 0), uvec4(0x40000000u, 0, 0, 0));\n"
+            "  colour = vec4(0, 1, 0, 1);\n"
+            "}\n");
+        GLuint tex = 0;
+        float zeros[SIDE * SIDE];
+        for (int i = 0; i < SIDE * SIDE; ++i) zeros[i] = -1.0f;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, SIDE, SIDE, 0, GL_RED,
+                     GL_FLOAT, zeros);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        /* The image format is r32ui and the texture is r32f: same class. */
+        glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (prog) {
+            glUseProgram(prog);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_UPDATE_BARRIER_BIT);
+        }
+        float back[SIDE * SIDE];
+        for (int i = 0; i < SIDE * SIDE; ++i) back[i] = -99.0f;
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_FLOAT, back);
+        const GLenum error = glGetError();
+        /* Texel 0 is untouched, so it keeps the -1 it was uploaded with. */
+        fprintf(stderr, "INFO class_view at1=%.3f at2=%.3f at0=%.3f "
+                "want=1,2,-1 err=0x%04x\n", back[1], back[2], back[0],
+                (unsigned)error);
+        result("class_view", prog && error == GL_NO_ERROR &&
+                             back[1] > 0.99f && back[1] < 1.01f &&
+                             back[2] > 1.99f && back[2] < 2.01f &&
+                             back[0] < -0.99f);
+        glDeleteTextures(1, &tex);
+    }
+
+    /* One draw that both *samples* a texture and writes it through an image.
+     * WebGPU forbids a writable storage binding sharing a synchronization
+     * scope with anything else, and refuses the bind group -- so the draw
+     * wrote nothing and, because an invalid bind group invalidates the
+     * command buffer, took every batched draw with it.
+     *
+     * GL allows the draw: the values it samples are undefined without a
+     * barrier, but the store is not, and a store is what this checks. The
+     * sampled value is written to the colour output so it cannot be optimised
+     * away, and nothing is asserted about it -- asserting on an undefined
+     * value would be a test that lies. What is asserted is that the image
+     * store landed and that a texel it did not name kept what it had.
+     *
+     * (Two draws with glMemoryBarrier between them is the well-defined form
+     * of this, and it already worked: the barrier submits, and a submit
+     * closes the pass.) */
+    {
+        GLuint prog = build(
+            "#version 330 core\n"
+            "#extension GL_ARB_shader_image_load_store : require\n"
+            "layout(r32ui) uniform uimage2D img;\n"
+            "uniform usampler2D same;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  uint seen = texelFetch(same, ivec2(0, 0), 0).x;\n"
+            "  imageStore(img, ivec2(4, 4), uvec4(0x5150u, 0, 0, 0));\n"
+            "  colour = vec4(float(seen & 1u), 1, 0, 1);\n"
+            "}\n");
+        GLuint tex = make_r32ui(0x77u);
+        glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (prog) {
+            glUseProgram(prog);
+            /* The same texture, sampled and image-written by one draw. */
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glUniform1i(glGetUniformLocation(prog, "same"), 0);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_UPDATE_BARRIER_BIT);
+        }
+        const unsigned stored = read_texel(tex, 4, 4);
+        const unsigned untouched = read_texel(tex, 0, 0);
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO sampled_and_written at4,4=0x%x at0,0=0x%x "
+                "want=0x5150,0x77 err=0x%04x\n", stored, untouched,
+                (unsigned)error);
+        result("sampled_and_written", prog && error == GL_NO_ERROR &&
+                                      stored == 0x5150u && untouched == 0x77u);
+        glDeleteTextures(1, &tex);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;
