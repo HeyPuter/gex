@@ -14029,48 +14029,39 @@ and all four are fixed:
 A chain of *runtime validation* issues rather than refusals, and each fix
 reveals the next rather than all of them at once:
 
-- **Views whose format WebGPU will not take.** `viewFormats` spans only the
-  sRGB pair (see `resource_create`), so every other format change needs the
-  scratch copy -- and EEVEE asks for `R32Uint` over `R32Float` (same texel
-  size, so serveable) and `RG32Float` over `R32Float` (different, so not).
-
-  A guard in `create_sampler_view` now refuses the cross-size case by name,
-  because the driver used to build the view anyway and an invalid view means
-  an invalid bind group means an invalid *command buffer* -- every batched
-  draw lost, with nothing in the GL error path.
-
-  **Both errors survive that guard, and `GEX_WGPU_IMAGE_TRACE` says why: they
-  are image bindings, not sampler views.**
+- ~~Views whose format WebGPU will not take~~ -- **done**, and worth reading
+  as a worked example of the diagnosis. `viewFormats` spans only the sRGB
+  pair, so every other format change needs a copy. `GEX_WGPU_IMAGE_TRACE` is
+  what identified the source: they were **image bindings**, not sampler views.
 
       gex-imgview: fragment slot=2 image=r16g16_unorm texture=r32_float
       gex-imgview: fragment slot=3 image=r32_uint    texture=r32_float
 
-  `glBindImageTexture` may name any format in the texture's format class, so
-  both of these are legal GL, and both are 4 bytes per texel. The driver
-  builds the storage view with the *image's* format and WebGPU rejects it.
-  Note the second row is made worse by the format promotion: r16g16_unorm has
-  no WebGPU format at all, so it is stored as rg32float, and the view is
-  therefore RG32Float over R32Float -- a *different* texel size, purely as an
-  artefact. (The promotion cannot simply be dropped: WebGPU has no 16-bit
-  normalised formats, so such a *texture* has to be stored wider regardless.)
+  `glBindImageTexture` may name any format in the texture's class, so both are
+  legal GL. `gex_wgpu_image_alias` now binds a texture of the *image's* format
+  and moves the bytes across either side (through a buffer, because
+  `copyTextureToTexture` needs equal formats -- the very thing that differs).
 
-  `viewFormats` is not the answer -- WebGPU accepts only the sRGB pair there,
-  even at creation. Two routes are:
+  Two things that only a value test finds:
 
-  1. **A scratch texture of the image's own format**, with byte copies through
-     a buffer either side (the texel sizes match, so the bytes correspond
-     exactly). This reuses the `reinterpret_staging` hop and the
-     `gex_wgpu_end_pass` drain the packed images already use.
-  2. **The packed path**, which is byte-exact by construction: the shader
-     packs in the image's format and the copy out writes those bytes into the
-     texture, which is precisely what GL specifies. It cannot be reached from
-     the classifier, though, because the mismatch is only known once a texture
-     is bound -- so it would need a *variant* keyed on the bound format, and
-     the bind group layout differs between the two forms (a storage texture
-     versus two buffers), which the per-shader image tables do not currently
-     express.
+  - **Seed the alias whatever the access says.** The copy back writes the
+    whole subresource, so a texel the shader never stores to would take the
+    alias's contents. GL is explicit that a store touches only the texel it
+    names, and the probe showed it at once: the two stored texels right, every
+    other one zero.
+  - **Size it from the *stored* formats**, and refuse when they disagree. The
+    promotion makes an r16g16_unorm image eight bytes per texel over an
+    r32_float texture's four, so there is no correspondence to copy; doing it
+    anyway gave "the byte size of each row (8384) is > bytesPerRow (4352)".
 
-  Route 1 is the smaller change; route 2 is the more principled one.
+  That refusal leaves a **real tension**: the promotion exists because WebGPU
+  has no 16-bit normalised formats, so such a *texture* has to be stored
+  wider, and that is exactly what makes the class binding impossible. The
+  packed-image path would serve it exactly -- a buffer has no format to
+  promote -- but reaching it needs a variant keyed on the bound format,
+  because the bind group layout differs between a storage texture and two
+  buffers. That is the shape of the next fix here.
+
 - A texture bound as **both sampled and write-only storage in one pass**,
   which WebGPU forbids and GL does not. The contained fix is the one the
   colour-attachment feedback loop already uses: give the writer a scratch
