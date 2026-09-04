@@ -13451,3 +13451,89 @@ refuses is declined by name, with the message saying what was asked for.
 `KHR-GL44.texture_cube_map_array` is 0/2 with and without the cube size-query
 change, so those failures are older than this work; I have not looked into
 them.
+
+## Shared memory was indexed by byte where ntv wants words
+
+`KHR-GL44.compute_shader` 24/42 to 28/42 and `shader_storage_buffer_object`
+67/124 to 71/124, from one division. It is the most consequential single line
+found in a while, because shared memory is what makes a compute shader worth
+writing -- every reduction, prefix sum, tile filter and sorting network is
+built on it -- and it was silently producing wrong numbers.
+
+ntv's shared and scratch blocks are `array<uintN, size/(N/8)>` in a wrapper
+struct, and `emit_load_special` / `emit_store_special` use the intrinsic's
+offset **directly** as the access-chain index. NIR's `load_shared` and
+`store_shared` offsets are in *bytes*. zink divides them in
+`rewrite_bo_access_instr`; this driver reuses ntv without zink's pipeline
+around it, and never did.
+
+**The two halves of ntv disagree about the units**, which is the part to
+remember: `emit_shared_atomic_intrinsic` divides by the element size *itself*,
+so atomics must not be scaled or they divide twice. Each caller has to match
+the emitter it reaches.
+
+Nothing refused. A byte offset used as a word index addresses four times too
+far, and WGSL clamps an out-of-range constant-size array index rather than
+trapping -- so `shared uint lane[64]` kept only the sixteen entries whose
+scaled index still landed inside it, and read back numbers that look like
+arithmetic rather than corruption: a sum of 0..63 came out as **3144** instead
+of 2016, and the same sum through a shared struct as **120**, which is exactly
+sum(0..15). That last number is what identified it: a clean prefix means an
+addressing stride, not corruption.
+
+Scratch travels the same ntv path, which is where the storage-buffer cases
+come from -- a spilled array was equally wrong, in any stage.
+
+**`GEX_WGPU_DUMP_WGSL=<n>` now prints the first n modules Tint produces**, and
+it is what found this: the SPIR-V is dumped only when Tint *rejects* a module,
+so one that translates cleanly and computes the wrong thing left nothing to
+read. The bug was a single `<< 2` in the WGSL, visible at a glance. Add it to
+the list of first moves for a "compiles but wrong" shader.
+
+### A memory barrier is not a control barrier
+
+The driver turned a pure `memoryBarrier*()` into a control barrier because
+Tint's SPIR-V reader has no `OpMemoryBarrier` and WGSL has no standalone
+memory barrier. The justification was that a control barrier is *stronger* --
+true of ordering, and false of the one requirement it adds: **it must be
+reached in uniform control flow**. GLSL allows `memoryBarrier*()` anywhere,
+and `compute_shader.shared-struct` puts one in each arm of a branch on
+`gl_LocalInvocationID`, with a comment saying the calls are unnecessary and
+are there to check the compiler accepts them. Substituting produced a module
+Tint rejects, losing the whole shader.
+
+Such a barrier is now dropped instead, which is a real weakening and worth
+being explicit about. What makes it defensible: a standalone memory barrier
+orders nothing observable on its own -- without a control barrier there is no
+execution ordering for the fence to be relative to -- and a shader that does
+pair one with `barrier()` has that barrier in uniform control flow, where it
+carries the memory semantics itself. "Uniform" is judged conservatively as
+"not nested in any if or loop", which errs towards dropping a fence rather
+than emitting a module that cannot be read.
+
+### Also this pass
+
+**A read-only image needs no storage format.** WebGPU offers storage textures
+for far fewer formats than GL 4.2 requires, but a read-only image is bound as
+a *sampled* texture -- Tint lowers a SPIR-V storage image that is only read to
+a plain `texture_2d<T>` -- so it needs only a sampleable format, and that
+table is far richer. This does **not** reach Blender's EEVEE viewport, which
+was the hope: its images are all written, so they still need the packing route
+described in the section above.
+
+**Buffer textures work in a compute shader.** A `samplerBuffer` becomes a
+read-only storage buffer whose texel word count comes from the bound view, so
+such a shader has no base module and needs the per-dispatch variant the
+compute path gained for integer sampling. It also turned up a limit that read
+as a capacity problem and was not one: everything about a buffer texture is
+indexed by its sampler *unit*, so `GEX_WGPU_MAX_BUFFER_TEXTURES` bounded which
+units could hold one rather than how many there could be, and a shader with a
+few ordinary textures plus one `samplerBuffer` was refused with
+"slot=6 count=0 max=4". It is one per sampler unit now, with a static_assert
+saying so.
+
+`compute_shader`'s remaining 14: three are `fp64` (WebGPU has no f64),
+`resource-texture` wants a multisampled *array* texture (WebGPU has no form of
+one), `shared-indexing` trips Tint's uniformity analysis on a `barrier()`
+reached through a function containing early returns, and the rest are
+unexamined.

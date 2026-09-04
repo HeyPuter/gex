@@ -228,6 +228,74 @@ int main(void) {
                              got_int[3] == ints[i].want);
     }
 
+    /* A samplerBuffer in a compute shader. WebGPU has no texel buffer, so one
+     * becomes a read-only storage buffer and its texelFetch becomes word
+     * loads -- and the word count per texel comes from the *bound* view's
+     * format, so the module depends on bound state and there is no base
+     * module. The graphics stages have done this for a while; compute
+     * refused it by name, which made a samplerBuffer in a compute shader
+     * fail to link on a driver claiming GL 4.3, where it is core.
+     *
+     * The declaration deliberately sits at unit 3 with other textures below
+     * it, because everything about a buffer texture is indexed by its
+     * sampler *unit*: the limit used to be four such units rather than four
+     * buffer textures, so a shader with a few ordinary textures and one
+     * samplerBuffer was refused with a message that read like a capacity
+     * problem. */
+    const float buftexels[4] = {1.5f, 2.5f, 3.5f, 4.5f};
+    GLuint tbo = 0, tbo_tex = 0;
+    glGenBuffers(1, &tbo);
+    glBindBuffer(GL_TEXTURE_BUFFER, tbo);
+    glBufferData(GL_TEXTURE_BUFFER, sizeof(buftexels), buftexels,
+                 GL_STATIC_DRAW);
+    glGenTextures(1, &tbo_tex);
+    glBindTexture(GL_TEXTURE_BUFFER, tbo_tex);
+    glTexBuffer(GL_TEXTURE_BUFFER, GL_R32F, tbo);
+    {
+        GLuint program = build_compute(
+            "#version 430\n"
+            "layout(local_size_x = 1) in;\n"
+            "layout(binding = 0) uniform sampler2D pad0;\n"
+            "layout(binding = 1) uniform sampler2D pad1;\n"
+            "layout(binding = 2) uniform sampler2D pad2;\n"
+            "layout(binding = 3) uniform samplerBuffer texels;\n"
+            "layout(std430, binding = 0) buffer Out { uint value[]; };\n"
+            "void main() {\n"
+            /* 2.5 and 4.5 scaled by 10 so the two arrive as distinct ints. */
+            "  value[3] = uint(texelFetch(texels, 1).r * 10.0) |\n"
+            "             (uint(texelFetch(texels, 3).r * 10.0) << 8);\n"
+            "}\n");
+        GLuint filler[4] = {0xbeefu, 0xbeefu, 0xbeefu, 0xbeefu};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, out_buffer);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(filler), filler);
+        if (program) {
+            glUseProgram(program);
+            for (unsigned u = 0; u < 3; ++u) {
+                char name[8];
+                snprintf(name, sizeof(name), "pad%u", u);
+                glActiveTexture(GL_TEXTURE0 + u);
+                glBindTexture(GL_TEXTURE_2D, flat);
+                glUniform1i(glGetUniformLocation(program, name), (GLint)u);
+            }
+            glActiveTexture(GL_TEXTURE3);
+            glBindTexture(GL_TEXTURE_BUFFER, tbo_tex);
+            glUniform1i(glGetUniformLocation(program, "texels"), 3);
+            glDispatchCompute(1, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
+        GLuint got_buf[4] = {0, 0, 0, 0};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, out_buffer);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(got_buf),
+                           got_buf);
+        const GLenum buf_error = glGetError();
+        fprintf(stderr, "INFO buffer_texture got=0x%x want=0x2d19 err=0x%04x%s\n",
+                got_buf[3], (unsigned)buf_error,
+                got_buf[3] == 0xbeefu ? " (never written)" : "");
+        /* 25 | (45 << 8) = 0x2d19 */
+        result("buffer_texture", program && buf_error == GL_NO_ERROR &&
+                                 got_buf[3] == 0x2d19u);
+    }
+
     /* A depth texture *compared* in a compute shader. Its bind group layout
      * has to name the Depth sample type and a Comparison sampler, and neither
      * follows from the texture's type: the combined-sampler split has already
