@@ -13333,10 +13333,23 @@ and it is what turned the sample-type bug from a mystery into a one-line read.
 See also the tessellation section above, where four failures looked like wrong
 builtins and were a draw that never ran.
 
-The 7 that remain are 5 integer *cube* gathers -- WebGPU has no integer cube
-sample type, so the driver lowers integer cube sampling to a 2D-array load,
-and the gather decomposition does not yet follow it there -- and the two
+The 7 that remain are 5 integer *cube* gathers and the two
 `gather-geometry-shader` / `gather-tesselation-shader` cases.
+
+The cube ones are **not** the gather decomposition's fault, which is worth
+writing down because it looks like it should be. WebGPU has no integer cube
+sample type, so integer cube sampling is lowered to a 2D-array load over an
+alternate view of the same six-layer allocation, and the result is SPIR-V the
+validator rejects --
+
+    Result Type has 2 components, but 3 expected
+
+-- which fails the whole program. Disabling the integer gather pass entirely
+leaves the error exactly where it was, so it is in that older lowering and
+predates this work; an integer cube *sample* is presumably as broken as the
+gather. Start by disassembling the rejected module: the driver prints it as
+hex, and `xxd -r -p > m.spv && spirv-dis m.spv` is what the comment in
+`gex_wgpu_tint.cpp` is there for.
 
 Also raised in passing: every texture-lowering refusal now names its
 condition, and the vertex variant path prints the compile error it used to
