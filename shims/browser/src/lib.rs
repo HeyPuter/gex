@@ -5385,6 +5385,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let named = match n {
             nr::EXECVE | nr::STATX => Some(path(g(0))),
             nr::OPENAT | nr::UNLINKAT | nr::RENAMEAT | nr::NEWFSTATAT => Some(path(g(1))),
+            // A sockaddr_un: 2-byte family then the path. Diagnostic for the
+            // wineserver socket -- which path a bind/connect actually names.
+            nr::CONNECT | nr::BIND => Some(path(g(1) + 2)),
             _ => None,
         };
         // For calls whose first argument is a descriptor, what it *is*: an fd
