@@ -13205,3 +13205,52 @@ three need a geometry shader *after* tessellation (a real missing feature --
 Mesa strips an evaluation output the geometry stage does not read, so those
 shaders arrive empty and are refused for writing nothing), one needs an
 array-typed per-patch output, and four are individual value cases.
+
+### Where 128 components are honest and where they are not
+
+`MAX_TESS_CONTROL_OUTPUT_COMPONENTS` was 64 where GL 4.0 requires 128, and
+`MAX_TESS_PATCH_COMPONENTS` is st/mesa's own 120 while the layouts held
+sixteen vec4 slots -- so a shader built to the advertised limit overflowed and
+was refused. The layouts hold 32 slots now.
+
+The interesting part is which caps were *not* raised with them, because the
+reasoning generalises to every stage limit this driver reports. A stage whose
+outputs are rasterized reaches the fragment shader through the passthrough
+vertex shader, so WebGPU bounds it **twice** -- once by the vertex-attribute
+count and once by the inter-stage variable count, both sixteen. Advertising
+more would move the failure from link time to pipeline creation, which is
+strictly worse: a link error is a diagnosable thing an application can read,
+and a rejected pipeline is a silently dropped draw. So only the control
+shader's outputs and the evaluation shader's inputs are raised -- the one
+interface in this driver that is a buffer at both ends.
+
+And these limits have to agree with **each other**, not only with the
+hardware. Raising the control shader's *inputs* to match made the CTS skip the
+case outright -- "GL_MAX_VERTEX_OUTPUT_COMPONENTS <
+GL_MAX_TESS_CONTROL_INPUT_COMPONENTS" -- because a vertex shader's outputs may
+be rasterized and so stay at sixteen. A skip reads as green on a pass-rate
+summary and is not a pass; watch for one after any limit change.
+
+### The three that need a geometry shader after tessellation
+
+This is the one real feature left in the family, and it is worth writing down
+what it would take, because the shape is already there. The geometry pass
+reads its input as "slot k holds the k-th vertex of the k/N-th primitive",
+built by a CPU slot table plus the vertex capture. After tessellation the same
+buffer can be produced by a small gather: the evaluation pass has already
+written one record per generated vertex, and the tessellator's index buffer
+already names them in primitive order, so record k is evaluation vertex
+`indices[k]`. Then the geometry pass runs unchanged with `prims =
+index_count / per_prim`.
+
+It was left undone deliberately rather than missed. The payoff is three CTS
+cases and no known application -- tessellation and a geometry shader together
+is rare -- and the cost is a bypass threaded through `gex_wgpu_gs_draw`, which
+is long, deeply parameterised on the draw, and currently serving real
+applications at 117/136. That is the wrong trade to make without a reason to,
+so the reason should be an application that needs it.
+
+Note also that Mesa strips an evaluation-shader output the geometry stage does
+not read, so those shaders arrive with no outputs at all and are refused for
+writing nothing. That refusal is accurate about what it sees; the cause is
+downstream of it.
