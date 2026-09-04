@@ -2232,6 +2232,34 @@ export class Gex {
               'A trap gave the stack back without setting a resume address.',
           );
         }
+        // DIAGNOSTIC (?enterlog=PID): the pc handed to enter(). enter() returns
+        // by TRAPPING (a miss/syscall/safepoint), so a healthy run logs a steady
+        // stream of pcs. If the guest wedges in a CPU-bound spin (an infinite
+        // loop in one already-translated block, no back-edge safepoint), enter()
+        // runs that block forever and never comes back: the [enter] stream stops
+        // and the JS thread freezes (the [alive] setInterval, being a macrotask,
+        // is starved by the run loop's microtask awaits, so it too goes quiet).
+        // The LAST [enter] pc before the silence pins the spinning block. Used to
+        // root-cause the winemine wedge -> see winemine-browser-ntdll-trap memory.
+        const _epid = this.#shim.exports.gex_my_pid?.() ?? -1;
+        const _elog = globalThis.GEX_ENTERLOG && _epid === (globalThis.GEX_ENTERLOG|0);
+        if (_elog) {
+          this._enterN = (this._enterN|0) + 1;
+          // Throttle: one line per 200ms per pid, plus a JS-side alive ticker so
+          // a frozen enter() (no ticks) is distinguishable from an await-park
+          // (ticks continue, enters stop). The last-logged pc pins the wedge.
+          const _now = performance.now();
+          this._lastEnterPc = pc;
+          if (!this._aliveTick) {
+            this._aliveTick = setInterval(() => {
+              console.error(`[alive] pid=${_epid} tick n=${this._enterN} lastpc=0x${(this._lastEnterPc>>>0).toString(16)}`);
+            }, 1000);
+          }
+          if (_now - (this._lastEnterLog||0) > 200) {
+            this._lastEnterLog = _now;
+            console.error(`[enter] t=${_now.toFixed(0)} pid=${_epid} n=${this._enterN} pc=0x${pc.toString(16)}`);
+          }
+        }
         this.#guest.exports.enter(ctx, pc);
         // `enter` returning means the guest gave the stack back for good,
         // normally because the last process exited.

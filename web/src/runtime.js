@@ -608,7 +608,7 @@ export async function runProgram(
     extra: {
       // In `extra` so every Worker gets it, not only pid 1: the interesting
       // process is the X server and the client it forks, not the demo's shell.
-      heartbeat: heartbeat || undefined,
+      heartbeat: heartbeat || undefined, enterlog: globalThis.GEX_ENTERLOG || undefined,
       // How many traps a forked child takes before it stops waiting to be an
       // `execve` and installs its parent's modules.
       adoptAfter: typeof globalThis.GEX_ADOPT_AFTER === "number"
@@ -784,7 +784,7 @@ export async function runProgram(
         strace: globalThis.GEX_STRACE ? 1 : undefined,
         // `?stracepid=N`: narrate that one process, which is affordable.
         stracePid: globalThis.GEX_STRACE_PID || undefined,
-        heartbeat: globalThis.GEX_HEARTBEAT || undefined,
+        heartbeat: globalThis.GEX_HEARTBEAT || undefined, enterlog: globalThis.GEX_ENTERLOG || undefined,
         // Which program pid 1 is, so its own text gets a code identity and a
         // second process can reuse what the first translated of it.
         //

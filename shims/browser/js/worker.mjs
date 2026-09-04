@@ -341,6 +341,7 @@ async function handle(msg) {
   // default -- it is one line per phase per thread. See threads-worker note.
   if (msg.attachTrace) globalThis.GEX_ATTACH_TRACE = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
+  if (msg.enterlog !== undefined) globalThis.GEX_ENTERLOG = msg.enterlog;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
   const gex = new Gex(new WorkerEnv(), {

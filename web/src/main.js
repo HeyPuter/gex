@@ -289,6 +289,7 @@ for (const [event, describe] of [
   // `?heartbeat=N`: every N syscalls, print the census -- how many of each kind
   // and how long was spent inside them.
   if (params.has('heartbeat')) globalThis.GEX_HEARTBEAT = Number(params.get('heartbeat'));
+  if (params.has('enterlog')) globalThis.GEX_ENTERLOG = Number(params.get('enterlog'));
   if (params.get('debug')) {
     globalThis.GEX_DEBUG_EXIT = 1;
     globalThis.GEX_TRAP_STACK = 1;
@@ -304,6 +305,7 @@ for (const [event, describe] of [
   if (params.has('stracepid')) globalThis.GEX_STRACE_PID = Number(params.get('stracepid'));
   // `?heartbeat=N`: at every Nth back-edge safepoint, print where the guest is -- the only way to see where a syscall-free spin is stuck.
   if (params.has('heartbeat')) globalThis.GEX_HEARTBEAT = Number(params.get('heartbeat'));
+  if (params.has('enterlog')) globalThis.GEX_ENTERLOG = Number(params.get('enterlog'));
   // `?trapstack=1`: the engine's stack for a trap -- which names the shim
   // function the fault was in -- without `?debug`'s mirroring of every guest
   // write to the console. That mirroring is not free: it changed the timing
