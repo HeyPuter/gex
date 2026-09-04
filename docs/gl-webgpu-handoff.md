@@ -13885,3 +13885,58 @@ texture at all. Two CTS cases came back from that one line.
 rather than checking that the shader linked, which is the distinction that
 matters: the whole point of packing over promotion is exactness, and a
 link-success test would not notice a packer that rounded.
+
+## Image shapes WGSL has no storage texture for
+
+WGSL has exactly four storage-texture types -- `texture_storage_1d`, `_2d`,
+`_2d_array`, `_3d`. GL has more, and each extra one was its own refusal until
+now. All of them are served by rewriting the *declaration*
+(`gex_wgpu_lower_image_shape`) so that the shader, the bind group layout and
+the view all say the same thing, and every rewrite is **exact** -- which is the
+only reason to make one, per [[crashes-hide-behind-close-enough]]:
+
+| GL declares | served as | why it is exact |
+| --- | --- | --- |
+| `image2DRect` | 2D | a rectangle texture differs only in being *sampled* with unnormalised coordinates; image access is by texel either way |
+| `imageCube` | 2D array | the coordinate is already `ivec3(x, y, face)`, and GL's face order +X,-X,+Y,-Y,+Z,-Z is the order the six array layers are in |
+| `image1D` | 2D | every non-3D texture here is created as `WGPUTextureDimension_2D` |
+| `image1DArray` | 2D array | as above, rows one texel tall |
+
+`image1D` is the one worth pausing on, because it was **not** refused -- it was
+silently wrong. The driver asked for a 1D texture view of a 2D texture, which
+is an invalid object, so the bind group was rejected and the draw wrote nothing
+with no GL error to show for it. The sampled path had always viewed these as
+2D; only the image path had not. This is the shape of defect
+[[a-draw-can-vanish-silently]] describes, and a probe that checks a *named
+texel* is what catches it -- a probe that only checked "the shader linked"
+would have passed throughout.
+
+Two compiler details that cost a rebuild each:
+
+- **A NIR image coordinate is declared as `vec4`** whatever the dimension
+  actually uses (`image("store", src_comp=[4, 1, 0, 1], ...)`). So inserting a
+  row index moves the layer from `.y` to `.z` rather than growing the vector.
+  Building a `vec3` is a validation failure -- `src->ssa->num_components ==
+  num_components` -- which aborts inside the driver with the whole shader
+  printed and no indication of which source was wrong.
+- **`imageSize` is where a rewritten shape shows through.** On a 1D array the
+  query now answers `(width, 1, layers)` where the shader asked for `(width,
+  layers)`, so the first and last components are taken and the height dropped.
+  Without the array no fixup is needed, because the first component of a 2D
+  query is the width either way. Getting this wrong returns the height as the
+  layer count, which is a plausible number and not an error.
+
+### What the allTargets cases still stop on
+
+`KHR-GL44.shader_image_load_store`'s `allTargets` cases walk every target in
+one test, so each refusal hid the next -- the rectangle came off first, the
+cube was immediately behind it, then the 1D array. Their score is unchanged
+because they need every target at once, and two remain:
+
+- **`imageBuffer`**, which needs a *writable* storage buffer standing in for a
+  texture. The read-only half of that already exists for `samplerBuffer` (see
+  the `buftex` tables), and the packed-image machinery is close, so this is
+  mostly plumbing a third binding class rather than new ground.
+- **A 1D array *upload*.** `texture_subdata` declines `target=6` with a
+  `16x1x2` box, which is not an image bug at all -- it is the upload path, and
+  it will show up anywhere a 1D array texture is given data.

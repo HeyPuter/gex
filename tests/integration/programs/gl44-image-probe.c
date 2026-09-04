@@ -279,6 +279,235 @@ int main(void) {
         glDeleteTextures(1, &tex);
     }
 
+    /* `image2DRect`. SPIR-V has a Dim of its own for a rectangle image and
+     * WGSL has no storage-texture type for it, so a shader declaring one was
+     * refused outright -- and KHR-GL44.shader_image_load_store's allTargets
+     * cases walk every target, so each of them stopped there.
+     *
+     * A rectangle image is a 2D image, though, and exactly so: the difference
+     * between the two targets is that a rectangle texture is *sampled* with
+     * unnormalised coordinates, and imageStore addresses by texel whatever
+     * the dimension is. The store below therefore has to land at the texel it
+     * names, which is what a driver that quietly substituted a 2D image with
+     * scaled coordinates would get wrong. */
+    {
+        GLuint prog = build(
+            "#version 330 core\n"
+            "#extension GL_ARB_shader_image_load_store : require\n"
+            "layout(r32ui) uniform uimage2DRect img;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  imageStore(img, ivec2(3, 2), uvec4(0xfeedu, 0, 0, 0));\n"
+            "  colour = vec4(0, 1, 0, 1);\n"
+            "}\n");
+        GLuint tex = 0;
+        unsigned *data = malloc((size_t)SIDE * SIDE * sizeof(unsigned));
+        for (int i = 0; i < SIDE * SIDE; ++i) data[i] = 0u;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_RECTANGLE, tex);
+        glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER,
+                        GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER,
+                        GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_R32UI, SIDE, SIDE, 0,
+                     GL_RED_INTEGER, GL_UNSIGNED_INT, data);
+        glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (prog) {
+            glUseProgram(prog);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_UPDATE_BARRIER_BIT);
+        }
+        memset(data, 0xAB, (size_t)SIDE * SIDE * sizeof(unsigned));
+        glBindTexture(GL_TEXTURE_RECTANGLE, tex);
+        glGetTexImage(GL_TEXTURE_RECTANGLE, 0, GL_RED_INTEGER,
+                      GL_UNSIGNED_INT, data);
+        const unsigned at = data[2 * SIDE + 3];
+        /* A neighbour, so a driver that wrote the whole image fails too. */
+        const unsigned next = data[2 * SIDE + 4];
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO rect_store at(3,2)=0x%x next=0x%x want=0xfeed,0 "
+                "err=0x%04x\n", at, next, (unsigned)error);
+        result("rect_store", prog && error == GL_NO_ERROR &&
+                             at == 0xfeedu && next == 0u);
+        free(data);
+        glDeleteTextures(1, &tex);
+    }
+
+    /* `imageCube`. WGSL has no storage cube either, but a cube image is a 2D
+     * array of six faces and GL's face order -- +X,-X,+Y,-Y,+Z,-Z -- is the
+     * order a cube texture's array layers are in, so the two are the same
+     * operation written twice. The store names face 3, GL_TEXTURE_CUBE_MAP_
+     * NEGATIVE_Y, and the read back asks that face specifically: a driver
+     * that dropped the layer, or counted the faces the other way round,
+     * writes a different one and fails. */
+    {
+        GLuint prog = build(
+            "#version 330 core\n"
+            "#extension GL_ARB_shader_image_load_store : require\n"
+            "layout(r32ui) uniform uimageCube img;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  imageStore(img, ivec3(1, 1, 3), uvec4(0xc0feu, 0, 0, 0));\n"
+            "  colour = vec4(0, 1, 0, 1);\n"
+            "}\n");
+        GLuint tex = 0;
+        unsigned *data = malloc((size_t)SIDE * SIDE * sizeof(unsigned));
+        for (int i = 0; i < SIDE * SIDE; ++i) data[i] = 0u;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER,
+                        GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER,
+                        GL_NEAREST);
+        for (int face = 0; face < 6; ++face)
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_R32UI,
+                         SIDE, SIDE, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, data);
+        /* Layered, so all six faces are one image. */
+        glBindImageTexture(0, tex, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32UI);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (prog) {
+            glUseProgram(prog);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_UPDATE_BARRIER_BIT);
+        }
+        memset(data, 0xAB, (size_t)SIDE * SIDE * sizeof(unsigned));
+        glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+        glGetTexImage(GL_TEXTURE_CUBE_MAP_POSITIVE_X + 3, 0, GL_RED_INTEGER,
+                      GL_UNSIGNED_INT, data);
+        const unsigned written = data[1 * SIDE + 1];
+        /* And face 0 must be untouched, so writing every face fails. */
+        memset(data, 0xAB, (size_t)SIDE * SIDE * sizeof(unsigned));
+        glGetTexImage(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 0, GL_RED_INTEGER,
+                      GL_UNSIGNED_INT, data);
+        const unsigned other = data[1 * SIDE + 1];
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO cube_store face3=0x%x face0=0x%x want=0xc0fe,0 "
+                "err=0x%04x\n", written, other, (unsigned)error);
+        result("cube_store", prog && error == GL_NO_ERROR &&
+                             written == 0xc0feu && other == 0u);
+        free(data);
+        glDeleteTextures(1, &tex);
+    }
+
+    /* `image1DArray`. WGSL has no storage 1d-array type, and a 1D array
+     * texture is stored here as a 2D array one texel tall -- so `(x, layer)`
+     * becomes `(x, 0, layer)` and the shapes match exactly. The store names
+     * layer 2 and the read back asks layer 2, with layer 0 checked as well so
+     * a driver that lost the layer index fails rather than passing on a write
+     * that landed somewhere plausible.
+     *
+     * imageSize is checked in the same shader because it is the one place the
+     * rewritten shape shows through: the query answers (width, 1, layers) and
+     * the shader asked for (width, layers). */
+    {
+        GLuint prog = build(
+            "#version 330 core\n"
+            "#extension GL_ARB_shader_image_load_store : require\n"
+            "#extension GL_ARB_shader_image_size : require\n"
+            "layout(r32ui) uniform uimage1DArray img;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  ivec2 s = imageSize(img);\n"
+            "  imageStore(img, ivec2(5, 2), uvec4(0xbeadu, 0, 0, 0));\n"
+            "  colour = vec4(float(s.x) / 255.0, float(s.y) / 255.0, 0, 1);\n"
+            "}\n");
+        const int layers = 4;
+        GLuint tex = 0;
+        unsigned *data = malloc((size_t)SIDE * layers * sizeof(unsigned));
+        for (int i = 0; i < SIDE * layers; ++i) data[i] = 0u;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_1D_ARRAY, tex);
+        glTexParameteri(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_MIN_FILTER,
+                        GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_1D_ARRAY, GL_TEXTURE_MAG_FILTER,
+                        GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_1D_ARRAY, 0, GL_R32UI, SIDE, layers, 0,
+                     GL_RED_INTEGER, GL_UNSIGNED_INT, data);
+        glBindImageTexture(0, tex, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32UI);
+        glClear(GL_COLOR_BUFFER_BIT);
+        unsigned char px[4] = {0};
+        if (prog) {
+            glUseProgram(prog);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_UPDATE_BARRIER_BIT);
+            glReadPixels(SIDE / 2, SIDE / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                         px);
+        }
+        memset(data, 0xAB, (size_t)SIDE * layers * sizeof(unsigned));
+        glBindTexture(GL_TEXTURE_1D_ARRAY, tex);
+        glGetTexImage(GL_TEXTURE_1D_ARRAY, 0, GL_RED_INTEGER,
+                      GL_UNSIGNED_INT, data);
+        const unsigned written = data[2 * SIDE + 5];
+        const unsigned other = data[0 * SIDE + 5];
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO array_store layer2=0x%x layer0=0x%x "
+                "size=%u,%u want=0xbead,0 and %u,%d err=0x%04x\n", written,
+                other, px[0], px[1], (unsigned)SIDE, layers,
+                (unsigned)error);
+        result("array_store", prog && error == GL_NO_ERROR &&
+                              written == 0xbeadu && other == 0u);
+        result("array_size", prog && error == GL_NO_ERROR &&
+                             px[0] == SIDE && px[1] == layers);
+        free(data);
+        glDeleteTextures(1, &tex);
+    }
+
+    /* `image1D`. This one was never refused -- it was *silently wrong*, which
+     * is worse: the driver asked for a 1D texture view, every non-3D texture
+     * here is created as a 2D WebGPU texture, and an incompatible view is an
+     * invalid object, so the bind group was rejected and the draw wrote
+     * nothing at all with no GL error to show for it. A store that has to
+     * land at texel 6 and nowhere else is what catches that. */
+    {
+        GLuint prog = build(
+            "#version 330 core\n"
+            "#extension GL_ARB_shader_image_load_store : require\n"
+            "layout(r32ui) uniform uimage1D img;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  imageStore(img, 6, uvec4(0xd00du, 0, 0, 0));\n"
+            "  colour = vec4(0, 1, 0, 1);\n"
+            "}\n");
+        GLuint tex = 0;
+        unsigned *data = malloc((size_t)SIDE * sizeof(unsigned));
+        for (int i = 0; i < SIDE; ++i) data[i] = 0u;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_1D, tex);
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage1D(GL_TEXTURE_1D, 0, GL_R32UI, SIDE, 0, GL_RED_INTEGER,
+                     GL_UNSIGNED_INT, data);
+        glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (prog) {
+            glUseProgram(prog);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_UPDATE_BARRIER_BIT);
+        }
+        memset(data, 0xAB, (size_t)SIDE * sizeof(unsigned));
+        glBindTexture(GL_TEXTURE_1D, tex);
+        glGetTexImage(GL_TEXTURE_1D, 0, GL_RED_INTEGER, GL_UNSIGNED_INT,
+                      data);
+        const unsigned at = data[6];
+        const unsigned next = data[5];
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO one_d_store at6=0x%x at5=0x%x want=0xd00d,0 "
+                "err=0x%04x\n", at, next, (unsigned)error);
+        result("one_d_store", prog && error == GL_NO_ERROR &&
+                              at == 0xd00du && next == 0u);
+        free(data);
+        glDeleteTextures(1, &tex);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;
