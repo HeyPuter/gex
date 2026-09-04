@@ -174,7 +174,26 @@ impl MemoryMap {
         }
         let _ = take;
         match self.back {
-            Some(back) if end <= MMAP_TOP && back(end) => Ok(()),
+            Some(back) if end <= MMAP_TOP && back(end) => {
+                // The grow backed everything up to `end`. Record that span as
+                // claimable arena so a later anonymous mmap reuses it instead of
+                // growing the memory again. A 64-bit Wine maps KUSER_SHARED_DATA
+                // at the fixed 0x7ffe0000 (~2 GiB), which grows the contiguous
+                // wasm memory to 2 GiB; without this the region [old top, 2 GiB]
+                // was backed but untracked, so Wine's next mmap (its vprot
+                // table) `extend_arena`d PAST 2 GiB and that grow hit the
+                // browser's memory ceiling -- "failed to map the shared user
+                // data", exit 1. Extending the arena lets that mmap land in the
+                // already-backed span with no further grow. The take cursor was
+                // already moved to `end` by `back`, so the chunk and cursor stay
+                // consistent; `is_free` keeps placements off the mappings (the
+                // USD page, the libraries) inside the span.
+                match self.arena.last_mut() {
+                    Some(last) if last.1 < end => last.1 = end,
+                    _ => {}
+                }
+                Ok(())
+            }
             _ => Err(Errno::ENOMEM),
         }
     }
