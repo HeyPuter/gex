@@ -14699,16 +14699,13 @@ Measured against llvmpipe, with the reference number where it was taken:
     limits                        135/140    -
     cull_distance                 145/218    202/218
     shader_storage_buffer_object  78/124     -
-    es_31_compatibility           117/355    -
+    es_31_compatibility           150/355    -
     direct_state_access           76/371     -
     sample_variables              40/190     190/190
     shading_language_420pack      47/329     329/329
 
-**Sampling in the geometry and tessellation stages is the largest single
-cluster left**, and it is a feature, not a defect: the generated compute
-module has to declare the texture and sampler bindings and the dispatch has to
-bind them, the way the compute path already does. It gates all 282 of
-`shading_language_420pack` and an unknown share of `es_31_compatibility`.
+**Sampling in the geometry and tessellation stages is now built** -- see the
+section below, which also records what it did and did not buy.
 `direct_state_access` reported 267 results that were neither pass nor fail,
 which is its own thing to look at.
 
@@ -14736,3 +14733,78 @@ What is left there is behavioural rather than translation: `gl_SampleMask`,
 `gl_SampleID` and `gl_SamplePosition` semantics under real multisampling, plus
 27 cases reporting `GL_INVALID_OPERATION` from `glCreateProgram`, which is a
 separate thread.
+
+
+## Sampling in the geometry and tessellation stages, and the bug behind it
+
+GL lets every stage sample. These three run here as compute passes and nothing
+bound their textures, so such a shader was refused at creation and the link
+failed. Four things were missing:
+
+- **Per-stage sampler state.** `ctx->stage_sampler_views` and
+  `stage_samplers`, indexed by `gex_wgpu_compute_stage_index`. Both setters
+  used to *latch* the context on those stages.
+- **The binding range.** `gex_wgpu_split_combined_samplers` numbered the
+  texture/sampler pair from zero for anything that was not literally
+  `MESA_SHADER_COMPUTE`. These stages are *compiled* as compute and dispatched
+  with one bind group, so from zero their textures landed on top of the pass's
+  own blocks. They take the compute range now, which starts at 68 against the
+  geometry pass's 0..4.
+- **Texture entries in the group.** `struct gex_wgpu_bindings` could describe
+  only buffers. Its two new kind masks are **64-bit**, because a dispatch's
+  own blocks plus a texture and a sampler per unit no longer fit in 32.
+- **Two helpers, not a fourth copy.** `gex_wgpu_collect_stage_textures` and
+  `gex_wgpu_bind_stage_textures` serve all three stages, and build the layout
+  entries and the group entries from the same numbers -- Dawn reports a layout
+  that disagrees with its entries as an invalid bind group and nothing more
+  specific.
+
+What is still refused is refused by name *and reason*: a buffer texture in one
+of these stages needs a storage-buffer binding of its own, and the message
+says that rather than reading like an internal error.
+
+### The bug this found is worth more than the feature
+
+**A tessellated draw whose fragment shader had a flat varying rendered nothing
+at all.** The provoking-vertex rewrite fired on it; that rewrite makes the draw
+indexed; and `gex_wgpu_tess_draw` then declined "an indexed or instanced patch
+draw" -- naming the index buffer the rewrite had created one frame earlier in
+the call stack.
+
+    #0  gex_wgpu_tess_draw
+    #1  gex_wgpu_draw_vbo_inner
+    #3  gex_wgpu_draw_provoking_last        <- made it indexed
+    #6  u_vbuf_draw_vbo
+    #7  _mesa_draw_arrays
+
+The rewrite is wrong there twice over. A patch's vertex order is meaningful --
+the control shader indexes `gl_in[]` -- so rotating it does not give back the
+same primitive the way rotating a triangle does; and the provoking vertex
+belongs to the primitives that are *rasterized*, which tessellation and
+geometry stages generate downstream. Patch draws, and any draw with those
+stages bound, are excluded now.
+
+**Read the stack first.** Three rounds went into the probe's own shape before
+that -- a one-vertex patch, then a three-vertex one, then a core profile
+instead of compatibility -- and none of them was the cause. One gdb breakpoint
+(with `set breakpoint pending on`, since the driver is a shared object) named
+it outright.
+
+### What it bought, and what it did not
+
+`es_31_compatibility` went **117/355 to 150/355**. `gl44-stage-sampling-probe`
+covers all three stages and passes 3 of 3, matching llvmpipe to the pixel.
+
+`shading_language_420pack` went 47/329 to **48/329**, and that is the honest
+number. Its programs bind a sampler in every stage, which is how the gap was
+found, but they also want 64-bit integers (17 shaders: "unhandled integer
+width: 64") and vertex-stage writable storage, and WGSL has neither. Lifting
+one refusal reveals what was behind it, and a family gated on several platform
+limits at once will not move for any single fix. The remaining refusal reasons
+there are worth reading before picking the next thing:
+
+    17  unhandled integer width: 64                       (no i64/u64 in WGSL)
+     3  storage ... read_write ... vertex pipeline stage   (WGSL forbids)
+     2  tessellation evaluation shader writes nothing
+     1  a geometry shader after tessellation
+     1  a buffer texture in the tessellation control stage
