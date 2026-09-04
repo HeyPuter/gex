@@ -13799,24 +13799,70 @@ same pointer type. The driver prints the module as `SPIRVHEX` lines; it is a
 plain byte stream, not 8-hex-digit words, and decoding it as words produces a
 file the disassembler rejects for its own reasons.
 
+### The compute stage takes the read case too
+
+A dispatch has nowhere that must be broken open to copy the texture *into* the
+buffer, so `gex_wgpu_image_is_packed` takes an `allow_read` argument: compute
+passes true, a graphics stage passes false. For a read image the format need
+not be missing from WebGPU's storage list at all -- rgba16f and rgba32f *are*
+storage textures, what they lack is `read_write` access, which WebGPU allows
+only for r32ui/r32i/r32f, and a buffer has no such rule.
+
+Two more things had to be measured there:
+
+- **A 16-bit float channel cannot be unpacked through NIR at all.** Every
+  route ends in a 16-bit type and Tint's reader has none ("unhandled integer
+  width: 16"). `nir_format_unpack_rgba` writes `f2f32(u2u16(word))`; asking
+  for `nir_unpack_half_2x16` instead only moves it, because
+  `nir_lower_alu_width` expands that into `nir_unpack_32_2x16` plus `f2f32` --
+  the same 16-bit vector spelled differently. `gex_wgpu_half_bits_to_float`
+  does it in 32-bit integer arithmetic instead, exactly, including subnormals
+  and NaN payloads. The *store* side never hits this, which is why an r16f
+  image could be written and not read back, and why it only surfaced once
+  compute took the read case.
+- **The bindings collided with the compute textures.**
+  `GEX_WGPU_DRAW_PARAMS_BINDING` and `GEX_WGPU_COMPUTE_TEXTURE_FIRST_BINDING`
+  are the same number -- the graphics stages and a dispatch reuse it for
+  different things -- so starting one past the draw parameters put every
+  packed image inside the range a dispatch numbers its textures in. Dawn
+  reported an invalid bind group and nothing more, because a collision looks
+  exactly like a layout that does not match its entries.
+
 ### What is still refused, and why
 
-- **An image that is read as well as written.** It needs the texture copied
-  *into* the buffer before the pass, which means breaking the render pass open
-  around every draw that binds one. Blender's `color_accum_img` (rgba16f) and
-  `cryptomatte_img` (rgba32f) are this case, and note that both are formats
-  WebGPU *does* have storage textures for -- what they lack is read_write
-  access, which WebGPU allows only for r32ui/r32i/r32f.
-- **The compute stage**, which collects its images through a separate path
-  that has not been converted. Blender's `output_img` (r16f) is this case, and
-  it is the cheaper of the two to fix: a compute pass has no render pass, so
-  copies either side of the dispatch need no pass surgery -- which makes
-  read+write tractable there too.
+- **A fragment image that is read as well as written.** It needs the texture
+  copied into the buffer before the pass, which means breaking the render pass
+  open around every draw that binds one. Blender's `color_accum_img` (rgba16f)
+  is this case and the only image refusal EEVEE has left. The tractable route
+  is to seed the buffer when the image is *bound* rather than when the bind
+  group is built -- `glBindImageTexture` is a state change, and ending a pass
+  on one is ordinary -- reseeding whenever the resource's `write_serial` has
+  moved, the way `gex_wgpu_sampler_view_refresh` does.
+- **An image with no format qualifier** (`format none`). GL allows a
+  `writeonly` image to omit it and takes the format from the bound texture,
+  which makes the packing arithmetic per-*draw* state rather than per-shader:
+  it needs a variant keyed on the bound format, like integer sampling and
+  buffer textures already have. Three CTS cases.
+- **Atomics on a packed image**, refused by name. An atomic on the *packed
+  word* is not the same operation once several texels share one, and Tint has
+  no SPIR-V image-texel-pointer support to fall back on either -- `unknown
+  SPIR-V storage class: 11` is that, and it is a separate ceiling.
 - **Partial writes.** The whole buffer is copied out, so a texel the shader
   did not write takes whatever the buffer held. Because the buffer is cached
   on the resource and rewritten after every pass, that is the texture's own
   content in the common case -- but not if something else wrote the texture in
-  between.
+  between. The compute read path seeds the buffer from the texture and does
+  not have this gap.
+
+### A refusal was hiding a driver bug, again
+
+Lifting the format refusals made a *promoted* texture reachable for the first
+time, and it was allocated wrong: `gex_wgpu_resource_create` decided
+`StorageBinding` from the Gallium format while creating the texture in the
+wider stored one, so rgba16_unorm-as-rgba32float never got the usage its own
+image binding needs. That promotion is far older than this work. Nothing had
+reached it because the shaders died earlier, on a format with no storage
+texture at all. Two CTS cases came back from that one line.
 
 `gl44-packed-image-probe` is the test. It checks values against llvmpipe
 rather than checking that the shader linked, which is the distinction that
