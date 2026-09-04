@@ -4779,8 +4779,18 @@ impl Kernel {
         if let Some((path, base)) = pinned {
             self.pin_landed.push((path, base, start));
         }
-        // Anonymous memory is defined to read as zero.
-        m.zero(start, crate::mem::page_align_up(len) as usize)?;
+        // Anonymous memory is defined to read as zero -- but only zero it when
+        // it is actually backed. A PROT_NONE reservation is NOT backed (`mmap`
+        // grows the linear memory only for a committing `prot`), so zeroing its
+        // range walks past the end of the wasm memory and takes a "memory access
+        // out of bounds" trap. It is inaccessible until a later commit
+        // (mprotect to a real prot) backs it, and freshly grown wasm pages are
+        // already zero, so nothing needs zeroing here. This was winemine's
+        // browser crash: a 26 MiB PROT_NONE reservation at 0xd000000, zeroed
+        // past the 245 MiB live memory.
+        if prot_bits != 0 {
+            m.zero(start, crate::mem::page_align_up(len) as usize)?;
+        }
         Ok(start)
     }
 
