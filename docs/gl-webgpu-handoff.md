@@ -12485,3 +12485,192 @@ whose only discriminator is which vertex `gl_in[0]` is) and
 invocation that emits nothing, and `GL_PRIMITIVES_GENERATED`). The native
 suite is 83 OK with the same three known differences; STK is unchanged at
 mean 67 / stdev 17.
+
+## The refusal latch was costing whole families
+
+`.length()` on an unsized storage array turned out to be two findings, and the
+second is much larger than the first.
+
+### `.length()` itself
+
+WGSL has `arrayLength`, and this driver's flattened storage block -- a struct
+whose one member is a runtime-sized array of words -- is exactly the shape it
+wants. What did not work was the route: ntv's `emit_get_ssbo_size` takes the
+length against *zink's* descriptor array, `ctx->ssbos[2]`, indexed by buffer
+number, which names a binding layout no other consumer of that emitter has.
+
+So ntv gained `deref_buffer_array_length` -- the NIR intrinsic already existed
+and nothing emitted it -- which takes the length against the block the deref
+names, assuming no layout at all. The driver lowers `get_ssbo_size` onto it
+and multiplies by four, because `get_ssbo_size` is defined to give bytes and
+its consumers go on to compute `(size - offset) / stride`.
+
+One thing had to be put back. **A block whose only use is `length()` has no
+deref anywhere**, so nothing keeps its variable alive and NIR removes it long
+before the driver sees the shader -- leaving a hole in the slot numbering that
+the `length()` still names. KHR-GL44's unsizedArrayLength shaders declare
+eight blocks and arrive with seven variables, numbered 0-4, 6, 7. The driver
+recreates it, marked read-only, because a block that is only measured must not
+become a writable storage variable in a vertex shader -- WGSL forbids that
+outright, so putting it back to let a vertex shader measure a buffer would
+have been what stopped it.
+
+That took `advanced-unsizedArrayLength` from 0/28 to 19/28. The nine left are
+the separate WGSL rule above: those shaders genuinely write storage from the
+vertex and fragment stages.
+
+### The second finding
+
+The subfamily passed 19/28 run on its own and 3/28 run inside its family.
+
+`ctx->failed` is never cleared, and **a refusal latched it**. So the first
+shader the driver could not compile killed everything after it: every later
+draw and dispatch returned early, unrelated calls came back as
+`GL_OUT_OF_MEMORY`, and dEQP stopped running the family's remaining cases
+altogether -- which is why the case *counts* below change as well as the
+scores.
+
+Four sites, all of the same kind -- a state combination this backend does not
+serve, none of which touches the device:
+
+  * the draw path's refusal list (no vertex shader, no fragment shader, no
+    colour target, multi-draw, topology, index size, primitive restart, …);
+  * `launch_grid` with no compute state, which means the compute shader was
+    refused when it was created;
+  * the tessellation caller, which turned `gex_wgpu_tess_draw`'s decline --
+    already refused *by name*, which was the point -- back into a latch;
+  * `texture_subdata` refusing an upload, which left one texture stale and
+    took every later operation on every other object with it.
+
+The geometry path had never done this: its caller returns without latching,
+and its own declines say "declined, not latched" for the reason. That is the
+model the other three now follow. `gex_fail` still means what it should --
+the device has actually broken.
+
+| family | before | after |
+| --- | --- | --- |
+| `shader_storage_buffer_object` | 28/124 | **67/124** |
+| `transform_feedback` | 5/21 | **18/21** |
+| `compute_shader` | 3/19 *(19 of 42 run)* | **24/42** |
+| `tessellation_shader` | 6/20 *(20 of 140 run)* | **31/140** |
+| `geometry_shader` | 73/76 | 73/76 |
+
+Two of those families were only *reporting* a fifth and a seventh of their
+cases. Any earlier ranking of "the biggest remaining clusters" taken from a
+whole-family run was measuring the latch as much as the driver.
+
+**What this means outside the CTS is larger.** An application that hits one
+unsupported shader used to lose every frame afterwards -- not the feature, the
+whole context, surfacing as `GL_OUT_OF_MEMORY` from whatever it called next.
+Now it loses the draw. The app sweep's shape did not change (285 RAN, 2
+REFUSED, both logic-op), because those applications never hit a refusal in the
+first place; the ones this helps are the ones that did.
+
+New probe `gl44-ssbo-length-probe`, gated in the browser: the whole buffer,
+a `glBindBufferRange` over half of it (so a driver reporting the allocation
+rather than the binding fails there and only there), a fixed member ahead of
+the array, and `length()` bounding a loop that writes every element.
+
+### And the run itself was ending 31 cases in
+
+With the four latch sites fixed, a full GL 4.4 mustpass run still stopped
+after 31 of 16843 cases:
+
+    Test case 'KHR-GL44.transform_feedback.geometry'..
+    Mesa: error: GL_OUT_OF_MEMORY in glBeginQuery
+      InternalError (Error)
+    Test run was ABORTED!
+
+Not a latch this time. `gex_wgpu_begin_query` held **one** active query, and
+GL allows one per *target*: an occlusion query, a primitives-generated query
+and a primitives-written query may all be running at once. That test begins
+two, the second `glBeginQuery` returned false, st/mesa turned that into
+`GL_OUT_OF_MEMORY`, and dEQP treats it as a fatal ResourceError.
+
+The context now holds one slot per target group -- occlusion, generated,
+emitted -- and each counting site adds to the group it belongs to rather than
+switching on whatever single query happened to be active. A non-zero *stream*
+index is accepted too, and answered with zero, which is the truth here: a
+geometry shader that writes any stream but zero is refused when it is created,
+so nothing is ever produced on the others. Refusing the query outright was the
+last remaining way for one unsupported thing to end an entire run.
+
+`transform_feedback` 5/21 -> **19/21**.
+
+The general shape of all five of these is one thing worth remembering: **the
+cost of a refusal is not the feature it refuses.** Four of them cost every
+operation after them, and the fifth cost every test after it. Refusing by name
+is right; refusing by killing the context is what made these expensive, and
+the geometry path had the answer written in a comment the whole time.
+
+### Two more, found by running the suite end to end
+
+Fixing the four latch sites let the mustpass reach 864 cases instead of 31,
+and it then stopped at `framebuffer_blit`: a multisample resolve between two
+formats `gex_wgpu_resolve` declines by name, whose decline the *caller* turned
+into a latch, whose latch turned the next `glReadPixels` into
+`GL_OUT_OF_MEMORY`, which dEQP treats as fatal. Exactly the tessellation
+pattern, in a different caller.
+
+Rather than fix that one site and find the next, the rule was applied to the
+class it belongs to. Gallium's clears, blits, copies and state setters return
+**void**: the caller cannot be told the operation failed, so latching does not
+report anything -- it only converts a local no-op into a global failure.
+Eighteen more sites across `clear`, `clear_render_target`,
+`clear_depth_stencil`, `resource_copy_region`, `set_framebuffer_state`,
+`set_viewport_states`, `set_scissor_states` and `set_blend_color` now call
+`gex_decline` instead, which reports the site once, exactly as `gex_fail`
+does, and leaves the context alive.
+
+`gex_fail` keeps its meaning: the device has broken and nothing after it can
+be trusted. That is a real state and it is worth latching. What was wrong was
+using it for "this driver does not implement that".
+
+### The colour-attachment budget was being spent in the wrong currency
+
+With the latches gone, a full mustpass run reached `draw_buffers`, and there
+the **GPU was lost**:
+
+    Total color attachment bytes per sample (56) exceeds maximum (32)
+      with formats ([ 7 x TextureFormat::RGBA8Unorm ])
+    ...
+    radv/amdgpu: The CS has been cancelled because the context is lost.
+      This context is guilty of a hard recovery.
+
+There was already a budget check here. It spent the budget in the formats'
+*own* byte sizes -- seven rgba8 targets came to 28 against a limit of 32, so
+it let them all through -- and WebGPU does not count that way. Its table
+charges everything from 32 to 64 bits wide a flat **eight**, so those seven
+are 56, and the guaranteed budget of 32 buys **four** rgba8 attachments and
+not the eight the old comment claimed. The accounting is now the spec's own,
+alignment included; `gex_wgpu_color_sample_cost` has the table.
+
+The native path already asks for 64 at device creation. This adapter grants 32
+regardless, so four is what there is, and `draw_buffers_1` fails honestly
+instead of building a pipeline WebGPU rejects.
+
+### Still open: a GPU hang in draw_buffers_1, late in a long run
+
+The fix above removed the *validation* error and the run got no further: the
+device is still lost at the same case, now with no validation error before it.
+What is established:
+
+  * `draw_buffers_1` **alone** is clean -- it fails, drops the targets past the
+    budget, and the device survives;
+  * the last 121 cases before it reproduce the loss;
+  * the last 16 reproduce it;
+  * the last 8 do **not**, and the 8 before those plus the test do **not**.
+
+So it is cumulative rather than a specific pair, which points at something the
+driver accumulates rather than at one bad command buffer. VRAM at rest is
+unchanged (~520 MB) so it is not a simple allocation leak.
+
+**I stopped bisecting here deliberately.** Each attempt costs an AMD hard
+recovery on a machine that cannot be physically reset, and this blocks a
+*measurement* rather than any application -- the app sweep is unaffected and
+every target app renders. The next pass should start from the four facts
+above rather than from scratch, and is probably better served by instrumenting
+what the driver holds live across contexts than by more bisection.
+
+Until then the mustpass is measurable to 878 cases, which is where it stops:
+**853 passed, 9 failed, 16 not supported.** Before this pass it stopped at 31.
