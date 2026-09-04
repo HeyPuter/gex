@@ -13537,3 +13537,70 @@ saying so.
 one), `shared-indexing` trips Tint's uniformity analysis on a `barrier()`
 reached through a function containing early returns, and the rest are
 unexamined.
+
+## A hole in the block numbering, and an edit thrown away
+
+Four fixes; `shader_storage_buffer_object` 71/124 to 77/124,
+`shader_atomic_counters` 22/30 to 26/30, `compute_shader` 28/42 to 29/42.
+
+**st/mesa leaves accesses whose block is gone.** It lowers an access through
+an interface block into `load_ssbo` / `store_ssbo` carrying a block index, and
+that leaves no deref -- so NIR removes the storage variable, and the driver's
+lowering pass cannot name the slot the access asks for. The `length()` path
+already had to fill that hole. It is now one get-or-create helper for every
+caller, and routing the **atomic** path through it too was worth three cases
+on its own: an atomic counter reaches the driver as an ssbo atomic with the
+same missing block, and its refusal read word for word like the load path's --
+"a 32-bit atomic on storage block 1, which this shader does not declare" --
+which is what made it obvious once the load path was fixed. A recreated block
+is writable only for a store, because a store to a readonly block is not
+expressible in GLSL and getting it wrong the other way would make a vertex
+shader that only reads a buffer declare a `read_write` storage variable, which
+WGSL forbids in that stage.
+
+**A dynamic block index unrolls.** `buffer B {...} blocks[4]` reached as
+`blocks[i]` is GL 4.3 and this suite uses it. WGSL has no array of storage
+buffers: every binding is its own variable and none can be selected at run
+time -- but the set of blocks is known when the shader is compiled, so the
+choice can be unrolled. Loads read every block and select afterwards rather
+than branching, because reading a block this invocation did not choose is
+harmless (an unbound one has a placeholder behind it) and it keeps the pass
+free of control flow. Stores cannot do that -- writing every block would
+corrupt the ones not chosen -- so they branch, and the pass now declares
+`nir_metadata_none`.
+
+**An edit through a read-write map was discarded**, and this is data loss
+rather than a missing feature. A map that *reads* a GPU-written buffer cannot
+be served from the shadow copy, because the shadow does not know what the GPU
+wrote -- so it is served from a private block read back off the device, and
+the caller's edits land there and nowhere else. Unmap then uploaded from the
+*shadow*, which still held the copy taken when the map was made, before the
+caller touched anything. **Both branches matched a read-write map and the
+wrong one won.** `glMapBufferRange(GL_READ_BIT | GL_WRITE_BIT)` over a buffer
+a shader has written is how an application reads back a counter, adjusts it
+and carries on. `gl44-map-readwrite-probe` covers it, verified by reverting
+the fix (4/4 to 2/4); its `neighbours_kept` case exists so a "fix" that
+uploads the whole buffer from a stale shadow fails too.
+
+**A `memoryBarrier` outside compute is dropped rather than emitted.** WGSL has
+no barrier of any kind in those stages -- not even the control barrier the
+compute path substitutes -- so one there was left as `OpMemoryBarrier`, which
+Tint cannot read, losing the whole shader. A fragment shader with a storage
+buffer and a `memoryBarrier()` is an ordinary thing to write. No CTS case
+turns on it by itself, so it is in for the refusal it removes rather than for
+a score.
+
+### What is left in these families, and why
+
+`shader_storage_buffer_object`'s remaining 47: **28 are a vertex shader
+writing a storage buffer**, which WebGPU forbids outright -- confirmed by
+reading the shaders rather than inferring it, since several are named for
+`readonly` buffers and it is the *output* buffer that blocks them. Two are
+Tint declining to take the address of an atomic through a pointer. The rest
+are unexamined.
+
+`shader_atomic_counters`' remaining 4: one is the same vertex-stage
+restriction; three fail on values with nothing in any log, and
+`advanced-usage-draw-update-draw` was one of them until the map fix, so the
+others may be a different mechanism rather than the same one twice. Batching
+is ruled out for them -- `GEX_WGPU_MAX_BATCH=1` changes nothing.
