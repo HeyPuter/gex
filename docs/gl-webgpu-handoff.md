@@ -13933,10 +13933,61 @@ one test, so each refusal hid the next -- the rectangle came off first, the
 cube was immediately behind it, then the 1D array. Their score is unchanged
 because they need every target at once, and two remain:
 
-- **`imageBuffer`**, which needs a *writable* storage buffer standing in for a
-  texture. The read-only half of that already exists for `samplerBuffer` (see
-  the `buftex` tables), and the packed-image machinery is close, so this is
-  mostly plumbing a third binding class rather than new ground.
-- **A 1D array *upload*.** `texture_subdata` declines `target=6` with a
-  `16x1x2` box, which is not an image bug at all -- it is the upload path, and
-  it will show up anywhere a 1D array texture is given data.
+Both are now served, and what stops those cases is no longer a shape:
+`basic-allTargets-store` reports "the number of storage textures (7) exceeds"
+the device limit, which is the platform rather than the driver.
+
+- **`imageBuffer`** turned out to be the *cheapest* shape rather than the
+  hardest. WebGPU has no texel buffer, so there is no storage texture to
+  compare a format against -- but there is also nothing to copy: the resource
+  *is* a buffer, so the shader addresses it in place, with no staging and no
+  copies at all. Read-only counts too, and unlike a read-only texture image it
+  has no sampled fallback to take instead.
+
+  Two bugs on the way there produced **no message of any kind**, which is
+  worth remembering because both are easy to write again:
+
+  - The incomplete-texture check asks whether the resource has a *texture*,
+    and a buffer resource has none, so every buffer image took the
+    discard-to-scratch path. The draw ran, the module was right, the stores
+    went nowhere. `gex_wgpu_image_is_bound` asks the right question per
+    target.
+  - A read map only consults the device for a buffer it knows was written
+    there, and the bind flags say `SHADER_IMAGE` rather than `SHADER_BUFFER`
+    -- *and* the batch has to be told it touched the resource, or the read
+    finds no conflict, skips the flush, and copies to its staging before the
+    draw that writes it is submitted. See "the batch must track every
+    resource".
+
+  A probe seeded with **zeroes could not have found either**: a store that
+  never happened and a store that wrote zero read back identically. Seeding
+  with a pattern is what separated them.
+
+- **A 1D array upload.** Gallium's convention puts the layer in `box->y` and
+  `st_TexSubImage` converts to it -- but not on every path, and a two-layer 1D
+  array arrives as a plain 3D box, `16x1x2`. That was declined for having
+  depth 2 on a target whose depth must be 1: an upload dropped for good, on a
+  target nothing else in the suite exercises. Both readings are accepted now
+  rather than one being declared correct; they differ only when an axis
+  carries something to disambiguate on.
+
+### Small floats cannot be unpacked through NIR at all
+
+`nir_format_unpack_rgba` writes a half channel as `f2f32(u2u16(word))`, and
+`nir_format_unpack_11f11f10f` writes the identical pattern -- so **both**
+formats Blender's EEVEE cares about hit `unhandled integer width: 16` from
+Tint, which has no 16-bit integer type. Asking for `nir_unpack_half_2x16`
+instead only moves it: `nir_lower_alu_width` expands that into
+`nir_unpack_32_2x16` plus `f2f32`, the same 16-bit vector spelled differently,
+and the driver already asks for that lowering.
+
+`gex_wgpu_small_float_to_float` does it in 32-bit integer arithmetic. Every one
+of these formats has a 5-bit exponent biased by 15, so one function serves
+f16, the 11-bit pair and the 10-bit one, differing only in mantissa width and
+whether there is a sign: bias 15 to 127 is +112, the mantissa moves to bit 23,
+all-ones stays all-ones so infinities and NaN payloads survive, and a
+subnormal is `mantissa * 2^-(14 + mantissa_bits)`, exact in f32.
+
+The asymmetry is the thing to recognise: **the pack side never hits this**, so
+such an image can be written and not read back. If a half or packed-float
+format works one way only, this is why.

@@ -508,6 +508,113 @@ int main(void) {
         glDeleteTextures(1, &tex);
     }
 
+    /* `imageBuffer`. WebGPU has no texel buffer at all, so there is nothing
+     * to compare a format against -- but there is also nothing to copy: the
+     * resource *is* a buffer, so the shader packs into it in place and this
+     * is the one image shape that costs nothing to serve. The read-only half
+     * of the same idea is `samplerBuffer`, which has worked for a while.
+     *
+     * The store names texel 4 and its neighbours are checked, because the
+     * texel address here is arithmetic the driver does itself rather than
+     * something the hardware indexes. */
+    {
+        GLuint prog = build(
+            "#version 330 core\n"
+            "#extension GL_ARB_shader_image_load_store : require\n"
+            "layout(r32ui) uniform uimageBuffer img;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  imageStore(img, 4, uvec4(0xfaceu, 0, 0, 0));\n"
+            "  colour = vec4(0, 1, 0, 1);\n"
+            "}\n");
+        const int texels = 8;
+        /* Seeded with a pattern rather than zeroes, and that mattered: with
+         * a zero seed a store that never happened and a store that wrote
+         * zero read back identically, which is exactly the ambiguity that
+         * hid a bug here -- every buffer image was taking the driver's
+         * incomplete-texture path, because that check asks whether the
+         * resource has a *texture* and a buffer resource has none. The draw
+         * ran, the module was right, the stores went to a scratch buffer and
+         * were discarded, and nothing anywhere said so. */
+        unsigned seed[8];
+        for (int i = 0; i < 8; ++i) seed[i] = 0x11111111u;
+        GLuint buf = 0, tex = 0;
+        glGenBuffers(1, &buf);
+        glBindBuffer(GL_TEXTURE_BUFFER, buf);
+        glBufferData(GL_TEXTURE_BUFFER, sizeof(seed), seed, GL_DYNAMIC_DRAW);
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_BUFFER, tex);
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, buf);
+        glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32UI);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (prog) {
+            glUseProgram(prog);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_BUFFER_UPDATE_BARRIER_BIT);
+        }
+        unsigned back[8];
+        memset(back, 0xAB, sizeof(back));
+        glBindBuffer(GL_TEXTURE_BUFFER, buf);
+        glGetBufferSubData(GL_TEXTURE_BUFFER, 0, sizeof(back), back);
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO buffer_store at4=0x%x at3=0x%x at5=0x%x "
+                "want=0xface and 0x11111111 twice err=0x%04x\n", back[4],
+                back[3], back[5], (unsigned)error);
+        (void)texels;
+        result("buffer_store", prog && error == GL_NO_ERROR &&
+                               back[4] == 0xfaceu &&
+                               back[3] == 0x11111111u &&
+                               back[5] == 0x11111111u);
+        glDeleteTextures(1, &tex);
+        glDeleteBuffers(1, &buf);
+    }
+
+    /* A *read-only* buffer image. This is not the same claim as the store
+     * above: a read-only *texture* image falls back to being sampled, whose
+     * format table is far richer, but a buffer image has no such fallback --
+     * WebGPU has no texel buffer at all -- so it has to take the same path
+     * whichever way it is accessed. Reading a texel the CPU wrote is what
+     * says the address arithmetic agrees in both directions. */
+    {
+        GLuint prog = build(
+            "#version 330 core\n"
+            "#extension GL_ARB_shader_image_load_store : require\n"
+            "layout(r32ui) uniform readonly uimageBuffer img;\n"
+            "out vec4 colour;\n"
+            "void main() {\n"
+            "  uint v = imageLoad(img, 3).x;\n"
+            "  colour = vec4(float(v) / 255.0, 0, 0, 1);\n"
+            "}\n");
+        unsigned seed[8];
+        for (int i = 0; i < 8; ++i) seed[i] = 0u;
+        seed[3] = 200u;
+        GLuint buf = 0, tex = 0;
+        glGenBuffers(1, &buf);
+        glBindBuffer(GL_TEXTURE_BUFFER, buf);
+        glBufferData(GL_TEXTURE_BUFFER, sizeof(seed), seed, GL_DYNAMIC_DRAW);
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_BUFFER, tex);
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, buf);
+        glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32UI);
+        glClear(GL_COLOR_BUFFER_BIT);
+        unsigned char px[4] = {0};
+        if (prog) {
+            glUseProgram(prog);
+            glUniform1i(glGetUniformLocation(prog, "img"), 0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glReadPixels(SIDE / 2, SIDE / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                         px);
+        }
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO buffer_load got=%u want=200 err=0x%04x\n",
+                px[0], (unsigned)error);
+        result("buffer_load", prog && error == GL_NO_ERROR && px[0] == 200);
+        glDeleteTextures(1, &tex);
+        glDeleteBuffers(1, &buf);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;
