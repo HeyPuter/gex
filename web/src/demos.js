@@ -1579,7 +1579,7 @@ const SESSION_APPS = [
     label: 'WineMine \u2014 Windows Minesweeper through Wine (x86-64)',
     kind: 'wl',
     rootfs: '/rootfs/wine.tar',
-    cmd: '/usr/lib/wine/wine64 /root/.wine/drive_c/windows/syswow64/winemine.exe',
+    cmd: '/usr/lib/wine/wine64 /root/.wine/drive_c/windows/system32/winemine.exe',
     env: 'export WINELOADER=/usr/lib/wine/wine64\n'
       + 'export WINESERVER=/usr/lib/wine/wineserver64\n'
       + 'export WINEPREFIX=/root/.wine\n'
