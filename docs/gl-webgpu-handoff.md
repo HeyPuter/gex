@@ -16093,3 +16093,37 @@ two, and whether the capture writes 32 bytes for it or 16. See
 [[merged-clip-cull-array-spans-two-slots]] for the same defect in the vertex
 path, and [[zero-means-nobody-wrote]] — an all-zero read is the signature of a
 slot nobody filled, not of arithmetic going wrong.
+
+## The largest thing left is one platform limit, in three families
+
+Having grouped every large family's failures by structure, the same wall
+accounts for most of what remains:
+
+| family | failures | of which multisample-format |
+|---|---|---|
+| `es_31_compatibility` | 81 | 27 (`sample_variables.mask.rgba32f`) |
+| `sample_variables` | 27 | **27** — the whole of it |
+| `direct_state_access` | 30 identified | 23 (`textures_storage_multisample_2d_*`) |
+
+**WebGPU has no multisample capability for the 32-bit-per-component formats or
+for the integer ones**, and GL requires every colour-renderable format to be
+multisample-renderable. That is roughly 77 cases, and it is not reachable from
+this driver: claiming 4x for such a format hands st a framebuffer Dawn refuses
+at creation, and the single-sample case that would otherwise work is unreachable
+because st rewrites a one-sample request to two and searches upward (see the
+section on `glTexStorage2DMultisample` above).
+
+`sample_variables` is the clearest statement of it — 125 passed, 38 not
+supported, and **every one of its 27 failures is this**. The family is at its
+practical ceiling; there is nothing to fix in it.
+
+What is left elsewhere is genuinely scattered. `shader_image_load_store` has 15
+real failures across ten different subgroups, the largest being three; about
+four of them are `writeonly uniform image2D` with no format qualifier in a
+*graphics* stage, which `gex_wgpu_resolve_unformatted_images` already serves for
+compute and could be extended to. `direct_state_access` has seven individual
+functional failures. Nothing else groups.
+
+So the useful shape of further CTS work is no longer "find the next cluster" —
+the clusters are served or blocked. It is either individual cases, or lifting
+the multisample-format wall, which needs the platform rather than this driver.
