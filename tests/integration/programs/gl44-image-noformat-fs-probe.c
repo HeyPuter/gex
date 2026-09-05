@@ -103,6 +103,7 @@ static float run(GLuint prog, GLenum internal_format, GLenum read_type,
                  const char *what) {
     GLuint tex = 0;
     glGenTextures(1, &tex);
+    glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexStorage2D(GL_TEXTURE_2D, 1, internal_format, SIDE, SIDE);
     glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_WRITE_ONLY,
@@ -160,6 +161,23 @@ int main(void) {
     GLuint vao = 0;
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
+
+    /* Its own framebuffer and viewport, rather than the default one. The
+     * fragment only has to run -- what it writes as colour is not read -- but
+     * "the fragment runs" depends on there being somewhere to rasterize into,
+     * and the default framebuffer's size is the platform's business. In the
+     * browser this probe drew nothing and read zeros for exactly that, while
+     * the compute probe beside it passed because a dispatch needs no
+     * framebuffer at all. */
+    GLuint target = 0, fbo = 0;
+    glGenTextures(1, &target);
+    glBindTexture(GL_TEXTURE_2D, target);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, SIDE, SIDE);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, target, 0);
+    glViewport(0, 0, SIDE, SIDE);
 
     GLuint prog = build();
     if (!prog) {

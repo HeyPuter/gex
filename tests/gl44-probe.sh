@@ -38,6 +38,16 @@ EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1 GEX_NATIVE_REFERENCE=1 \
 # Two SUMMARY shapes are in use -- some probes print `passed=`, some do not --
 # so the pattern accepts either and only insists on `failed=0`.
 EXPECT=$(grep -oE 'SUMMARY cases=[0-9]+( passed=[0-9]+)? failed=0' "$WORK/mesa.log" | tail -1)
+# GEX_PROBE_EXPECT overrides it, for the probes where the *reference* is what
+# fails. gl44-image-noformat-fs is one: llvmpipe returns uninitialised memory
+# for a format-less image store to an r32f unit, radeonsi and this driver both
+# return the value stored, and radeonsi is the tie-breaker. Without an
+# override such a probe can never be browser-gated at all, because the gate
+# insists its oracle passed first -- which is the right default and the wrong
+# answer here.
+#
+#   GEX_PROBE_EXPECT='SUMMARY cases=2 passed=2 failed=0' #     tests/gl44-probe.sh image-noformat-fs
+[ -n "${GEX_PROBE_EXPECT:-}" ] && EXPECT=$GEX_PROBE_EXPECT
 # Not every probe prints a SUMMARY -- gl44-state-probe ends with its own
 # marker line instead. Falling back to the last line the native run produced
 # keeps the gate generic rather than needing a pattern per probe.
