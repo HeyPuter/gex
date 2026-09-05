@@ -16127,3 +16127,26 @@ functional failures. Nothing else groups.
 So the useful shape of further CTS work is no longer "find the next cluster" —
 the clusters are served or blocked. It is either individual cases, or lifting
 the multisample-format wall, which needs the platform rather than this driver.
+
+## A partial depth copy has no WebGPU spelling
+
+`KHR-GL45.direct_state_access.framebuffers_blit` fails on a constraint worth
+knowing: **WebGPU allows a partial texture-to-texture copy for colour and not
+for depth-stencil.**
+
+    Copy origin ([0,0,0]) and size ([1,1,1]) does not cover the entire
+    subresource (origin [0,0], size [2,2,1]) of [Texture (2x2 px,
+    TextureFormat::Depth24PlusStencil8)]. The entire subresource must be
+    copied when the format is a depth/stencil format
+
+`gex_wgpu_copy_texture_region` now declines that by name instead of issuing it
+and letting Dawn discover it. **No CTS score changes**, and the CTS cannot show
+what the change is for — it gives each case its own context, so the invalid
+command buffer never takes anything else down. An application batches unrelated
+draws into one command buffer, where it does; that is the standing reason
+"refused here rather than there" is the rule in this file.
+
+Serving it properly means a render pass that samples the source depth and
+writes `gl_FragDepth` under a scissor. That is real work, and so far exactly
+one case has asked for it — so the decline is the honest state, not a
+placeholder for something nearly working.
