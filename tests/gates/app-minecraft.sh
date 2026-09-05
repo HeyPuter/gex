@@ -39,20 +39,26 @@ while [ "$t" -lt "$BUDGET" ]; do
     echo "launch dialog: $(ps -o args= -p "$z" | grep -oE -- '--text=.*' | cut -c1-300)"
     kill -9 "$z" 2>/dev/null
   done
-  W=$(xwininfo -root -tree 2>/dev/null |
-      awk '{ if (match($0,/0x[0-9a-f]+/)) { id=substr($0,RSTART,RLENGTH)
-             if (match($0,/[0-9]+x[0-9]+\+/)) { split(substr($0,RSTART,RLENGTH),d,/[x+]/)
-               if (d[1] >= 640 && d[2] >= 360) print id } } }' | head -1)
-  [ -z "$W" ] && continue
-  import -window "$W" "$OUT" 2>/dev/null || continue
+  # The root window, not a window found by walking the tree: while the game
+  # runs, xwininfo and even xdpyinfo can block indefinitely on this server, so
+  # any query that enumerates windows will hang the poll rather than time out
+  # cleanly. Capturing root needs no query at all.
+  timeout 25 import -window root "$OUT" 2>/dev/null || { echo "t=${t}s capture stalled"; continue; }
   [ -s "$OUT" ] || continue
-  k=$(magick "$OUT" -depth 4 -format '%k' info: 2>/dev/null)
-  echo "t=${t}s win=$W colours=$k"
-  # The loading frame has ~67 colours; a drawn title screen has thousands.
-  if [ -n "$prev" ] && [ "$k" = "$prev" ] && [ "${k:-0}" -gt 200 ]; then
+  k=$(timeout 25 magick "$OUT" -depth 4 -format '%k' info: 2>/dev/null)
+  m=$(timeout 25 magick identify -format '%[fx:int(mean*255)]' "$OUT" 2>/dev/null)
+  echo "t=${t}s mean=$m colours=$k"
+  # Settle on the *mean*, not the colour count. The loading frame and the drawn
+  # title screen differ by only 171 vs ~185 colours -- a threshold between them
+  # is indistinguishable from noise, and one set at 200 never fires at all, so
+  # the poll runs to its budget and whatever it last captured gets read as the
+  # result. That is how a loading frame was mistaken for a rendering defect and
+  # bisected to an innocent commit. The panorama is the whole background, so
+  # its absence halves the brightness: mean 29 without it, ~40 with it.
+  if [ "${m:-0}" -ge 35 ]; then
     stable=$((stable + 1)); [ "$stable" -ge 2 ] && break
   else stable=0; fi
-  prev=$k
+  prev=$m
 done
 python3 "$S/killmatch.py" prismlauncher EntryPoint net.minecraft zenity >/dev/null 2>&1
 [ -s "$OUT" ] && magick identify -format 'final %wx%h mean=%[fx:int(mean*255)] colours=' "$OUT" \

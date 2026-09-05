@@ -15716,3 +15716,56 @@ minus the middle pass; `gex_wgpu_capture_dispatch` is pass one and the
 passthrough vertex shader is pass three, so what is missing is the glue for
 "no geometry shader in between", plus that path's existing limits (no
 instancing, `verts_per_prim <= 3`, a CPU-readable index buffer).
+
+## Minecraft reaches a world, and its title screen has a trap
+
+Minecraft 26.2 now runs a real singleplayer world on this driver, not just its
+title screen: the integrated server starts, prepares the spawn area, and the
+client draws terrain, the crosshair and the hotbar with its items. Drive it
+with
+
+    tests/gates/app-minecraft-direct.sh <out.png> <budget> CoolCrafters
+
+which invokes `net.minecraft.client.main.Main` itself and passes
+`--quickPlaySingleplayer`. Two reasons not to go through PrismLauncher: it
+**captures the game's stdout and stderr into its own console**, so no driver
+diagnostic can be read through it, and Quick Play needs an instance-config key
+rather than an argument.
+
+The world's appearance is **unjudged**. It renders as a washed-out pink, and
+there is no reference for it on this machine: the system Mesa cannot give the
+game GL 3.3 through Xvfb's GLX ("Driver does not support OpenGL 3.3", plus a
+zenity dialog), and run-native.sh's megadriver contains only gex_wgpu. Get a
+reference some other way before calling it a defect.
+
+**The title screen's loading frame is not a defect.** The logo, the buttons and
+the three account icons draw well before the panorama and the fonts are ready,
+so an early capture shows a black background with every piece of text missing
+-- which is a thoroughly convincing texture-atlas or vertex bug. On 2026-09-05
+I photographed it, called it a regression, bisected across four commits and
+reported `942159a4cfc` (buffer textures narrower than a word) as the cause.
+Wrong, on three counts:
+
+- Minecraft creates **no buffer textures at all**, so that commit's code never
+  runs in it (`grep -c buftex` on the driver log is 0);
+- glxinfo's extension list and limits are **identical** across the suspect
+  commits;
+- HEAD draws the title screen perfectly once given long enough.
+
+The good and bad runs differed only in when they were photographed. Settling
+takes anywhere from ~30 s to several minutes here.
+
+The reason the mistake survived so long is that the discriminator could not
+work: the loading frame has 171 distinct colours at depth 4 and the finished
+screen has ~185, so no threshold separates them, and the one in the gate (200)
+never fired at all -- the poll ran to its budget and whatever it last captured
+was read as the result. Judge this game by **mean brightness** instead. The
+panorama is the entire background, so it is mean 29 without it and ~40 with it.
+Both Minecraft gates settle on that now.
+
+Two harness faults came out of the same investigation. `ensure-display.sh` ran
+`openbox --display "$D"`, which openbox rejects outright, so the window manager
+its own comment says is worth an entire app sweep was never actually started;
+and a failed launch leaves a **zenity error dialog titled "Minecraft"**, which
+matches a window search by name and photographs as a small grey box. Match the
+game window by size, and read the dialog's text -- it names the cause.
