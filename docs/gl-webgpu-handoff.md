@@ -15638,3 +15638,39 @@ Two things behind it:
 over: the integer-resolve refusal and the attribute signedness fix took it from
 about 180 to 92.
 
+## cull_distance: what the remaining 58 are, and a normalisation that cost 96
+
+`KHR-GL45.cull_distance` is 145 of 218 (llvmpipe: 202). Grouping it:
+
+- **8** are a *fragment* shader with `BuiltIn CullDistance` as an **input**.
+  WGSL has clip distances as a vertex output and nothing on the fragment side,
+  and Tint says so in a way that names neither: "no matching call to
+  `bitcast<f32>(array<f32, 8>)`". Serving it means passing the values as
+  ordinary varyings, which the vertex shader would have to write twice -- once
+  as the builtin for clipping and once as a varying for the fragment shader to
+  read.
+- **50** fail with "Primitive is expected to be culled, but one of its
+  vertices is visible."
+
+**I first wrote that the culling was never implemented. That was wrong** --
+`gex_wgpu_cull_distance_filter` exists, reads the distances back and rebuilds
+the index list, and it is what earns the 145. What is actually happening is
+narrower: the filter is gated on `info.cull_distance_array_size`, and for the
+failing cases the driver receives that as **zero**, with the distances sitting
+in generic varyings (`VAR0`/`VAR1`) rather than at `CLIP_DIST0`. Mesa's varying
+compaction relocates them and clears the sizes; by the time the driver sees the
+shader there is nothing to say those eight floats are cull distances.
+
+The obvious repair is to normalise on the way in --
+`nir_gather_clip_cull_distance_sizes_from_vars` to recover the sizes from the
+variables, then `nir_merge_clip_cull_distance_vars` to put them in the merged
+shape everything here expects. **It took the family from 145 to 49.** The
+recovery reads a redeclared, unsized `gl_ClipDistance` as four *clip*
+distances, and clipping against distances that were meant to cull throws away
+geometry that should have been drawn. Reverted.
+
+So the real question for the next attempt is not how to cull but how to know:
+the split between clip and cull has to survive from the linker to the driver,
+and for these shaders it does not. Recovering it from the variables is what
+does not work, because after compaction the variables no longer say.
+
