@@ -16944,3 +16944,78 @@ The probes were run in this order on purpose — `image` first, on a 3.3 context
 to establish that the harness and the fresh build work at all, and only then
 the 4.1 ones. Without that step a harness failure would have read as a driver
 bug, which is the shape of mistake this document records twice already today.
+
+### Eight bits for sixteen slots
+
+`gl44-fs-sampler-array-probe` was written as a *known-failing* probe. A
+fragment shader reading `usampler2D s[16]` by a dynamic index got units 0..7
+right and read every unit from eight upwards as zero:
+
+    llvmpipe:  0 1 2 3 4 5 6 7  8  9 10 11 12 13 14 15
+    gex_wgpu:  0 1 2 3 4 5 6 7  0  0  0  0  0  0  0  0
+
+A hard cut at eight, unchanged by the array's size, and correct in the vertex
+and geometry stages. Several plausible causes were eliminated first: the
+collection (`tex=16 int_sampled=0xffff`), the unroll that turns a dynamic
+sampler index into one constant-index copy per unit, the lowering table, the
+bind group layout array bound, and the bind group cache — which does cap at 32
+entries, exactly what sixteen textures and sixteen samplers need, but the same
+failure appears at nine units and eighteen entries.
+
+What settled it was dumping the WGSL rather than reasoning about the driver.
+`GEX_WGPU_DUMP_WGSL=40` showed a fragment module that declares all sixteen
+textures at bindings 0..31, issues **eight** `textureLoad` calls, and ends:
+
+```wgsl
+outc = select(x_106, 0u, (x_79 == 15 | == 14 | == 13 | == 12 |
+                          == 11 | == 10 | == 9  | == 8));
+```
+
+Units 8..15 were not lost. They were *deliberately replaced with zero*, which
+is a thing this driver does on purpose: `gex_wgpu_omit_textures` implements
+GL's incomplete-texture rule, where a sampler whose bound texture does not
+match its declaration samples as zero rather than failing the draw. Correct
+machinery, reached from a wrong premise.
+
+The premise came from `gex_wgpu_collect_shader_state`:
+
+```c
+uint8_t shadow_slots = 0, float_slots = 0, uint_slots = 0, sint_slots = 0;
+```
+
+One bit per sampler slot in an eight-bit word, over a sixteen-slot space.
+`shadow_slots |= 1u << texture_slot` for any slot from eight up shifted the bit
+straight out. Those units kept the default `Float` sample type;
+`gex_wgpu_unusable_texture_slots` compared Float against the bound integer view,
+called the slot unsatisfiable, and the omit pass did the rest. The masks are
+`uint16_t` now, matching `GEX_WGPU_MAX_SAMPLERS`.
+
+It cost `KHR-GL45.geometry_shader.limits.max_combined_texture_units`, which sums
+units `0..point-1` across three stages: its first wrong point is 9, the first
+sum to include unit 8, short by exactly that unit's contribution. That family is
+126/136, and `max_output_components` — a numeric device limit — is the only
+`limits` case left in it.
+
+#### The same truncation drops entire draws
+
+The masks feed two tables, not one. Besides `texture_sample_types[i]`, they set
+`sampler_types[i]`, so a *depth-comparison* sampler above the eighth slot was
+declared `Filtering` instead of `Comparison`, over a view whose format is a
+depth one. WebGPU does not allow that pairing, the bind group is invalid, and
+the draw is dropped — **all** of it. `gl44-shadow-high-unit-probe` run against
+the reverted driver reads back the clear value in every pixel, low slots
+included. A renderer declaring nine or more comparison samplers rendered
+nothing; a cascaded shadow map on top of a full material set reaches that
+easily. It is not visible in the integer probe, whose failure is confined to
+the units it touches.
+
+That probe took two attempts, and the first one is the lesson. It declared two
+shadow samplers and bound one to texture unit 10 — and passed with the bug
+present, because a sampler's *slot* is its compacted `driver_location`, not the
+unit `glUniform1i` names. Two declared samplers occupy slots 0 and 1 whatever
+units they read. Only twelve declared samplers put four of them above seven.
+This is the trap already recorded for the u_vbuf layouts, in a second place:
+**prove a probe fails against the defect before trusting it to guard the fix.**
+
+Both probes are in the suite, which is 114/117 with the same three long-standing
+expected DIFFs.
