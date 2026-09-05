@@ -16640,13 +16640,43 @@ nothing is being dropped for want of room. The draw is not declined
     captured vec4(14880, 15377, 15874, 16371)
     expected vec4(8160, 8417, 8674, 8931)
 
-`compareValues` prints the *first* mismatching vec4 and not necessarily the
-first element, so the index is unknown. Both sequences step evenly — 497
-captured against 257 expected — and neither reconciles with a first-order
-reading of the reference arithmetic, which for these limits should step by 32.
-So the index is not zero and the model is incomplete; the next step is to dump
-the captured buffer against the reference array rather than to read the test
-again.
+**The driver is right here, and that is now measured rather than argued.**
+
+`tests/…/scratchpad` reproductions of the test's exact shader chain — the same
+vertex, control and evaluation shaders, `layout(vertices = 2)`, a two-vertex
+patch, and the test's own capture list of fifteen individually-named
+`Vertex.value[i]` plus `gl_Position` — produce this on gex_wgpu:
+
+    [ 0] 14880 15377 15874 16371
+    [ 1] 14884 15381 15878 16375
+      …          (stepping by 4)
+    [14] 14936 15433 15930 16427
+    [15]     0     0     0     1
+
+That is exactly what the GLSL computes, by hand: the vertex shader writes
+fifteen vec4s, the control shader adds all fifteen into each of its
+thirty-one outputs (`Σ₀¹⁴4i = 420`, so output *j* is `4j+420`), and the
+evaluation shader adds all thirty-one into each of its fifteen
+(`Σ₀³⁰(4j+420) = 1860+13020 = 14880`). It is *also* exactly what the test's own
+reference model computes — `ref[i] = sumInTES[i%4] + i`, with `sumInTES[0] =
+31·420 + 1860 = 14880` — and `[15]` is the `(0,0,0,1)` the model puts last.
+Every element agrees, including the stride and the position slot.
+
+So the captured half of the test's complaint is correct, element for element.
+What is not explained is the *expected* half: the test prints
+`vec4(8160, 8417, 8674, 8931)`, which its own source, read against these
+limits, should not produce. Ruled out along the way: a stale binary (the
+executable is newer than the source and the tree is clean), an overflow of
+`m_ref_vertex_attributes` (sized 128, written to 124), case 2 clobbering case
+1's array (it uses a different one), initialisation order (the limits are
+retrieved first), and GLSL's built-in constants disagreeing with the API — a
+shader that returns them reports `(64, 128, 128, 64)`, matching
+`glGetIntegerv` exactly.
+
+**Do not spend another pass looking for a driver bug in this one.** If it is
+revisited, the question to answer is why the test's reference array holds
+8160 at the index it compares, and the way to answer it is a debugger on the
+CTS, not more reading — that has now been tried twice.
 
 A caution about how that number was arrived at. Three earlier measurements of
 this family were taken while **four CTS runs were competing for one GPU** —
