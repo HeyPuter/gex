@@ -16524,3 +16524,43 @@ one more; the wall is real — `maxStorageBuffersPerShaderStage` is 10 on this
 adapter and the driver already asks for more. `tessellation_shader` holds at
 134/140 and `geometry_shader` at 124/136, which is what the two dispatches
 this touched most needed to show.
+
+### An evaluation shader that writes nothing is not an error
+
+`KHR-GL45.shading_language_420pack.line_numbering` failed on a refusal in
+`create_tes_state`: *gex_wgpu tessellation evaluation shader writes nothing*.
+The note beside it said the refusal was accurate about what it saw and that
+the cause was downstream, which was half right and stopped one step too early.
+
+The shader arrives with **no output variables at all** — `out vars=0
+written=0x0`, before any pass of this driver's runs. Its one varying,
+`tes_gs_result`, is stripped by Mesa's linker, and the reason is a cascade: the
+geometry shader that reads it arrives with only `gl_Position` too, so nothing
+downstream survives to keep the chain alive.
+
+Two things were wrong with refusing it.
+
+**A create-time refusal makes the *link* fail**, and nothing in GL requires an
+evaluation shader to write anything. llvmpipe links the same program without
+complaint, which is the tell: a driver refusing at create is saying more than
+the specification does.
+
+**And the shader is not even undrawable.** It generates vertices and nothing
+else — which is precisely what this program wants, because its geometry shader
+writes its own `gl_Position` and needs only the vertex count from the stage
+before it. `layout(isolines, point_mode)` producing points for a
+`layout(points) in` geometry shader is exactly that arrangement.
+
+The draw had a second guard for the same shape, `if (!tes_stride)`, three lines
+below three strides that all take `MAX2(..., 16u)`. It now takes the same
+minimum: the output buffer is allocated and left unwritten, and the consumer
+reads none of it. A zero stride would only ever have meant a zero-sized buffer,
+which WebGPU refuses.
+
+`shading_language_420pack` 319 → **320/329**, and `tessellation_shader`
+134 → **137/140** — three cases in that family were sitting behind the same
+guard, which is the usual shape of a refusal that was never a rule. Every one
+of the nine failures left in 420pack is now the same storage-buffer wall —
+`maxStorageBuffersPerShaderStage` is 10 on this adapter, a packed image costs
+two of them, and the driver already asks for more than it is given. There is no
+second cause left in it.
