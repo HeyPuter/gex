@@ -15337,3 +15337,29 @@ Three view rules were stricter than WebGPU requires and are relaxed:
 And the refusal message printed the texture's target without the view's --
 which is the half that decides `gex_wgpu_view_target_ok`. It prints both now.
 
+### The feedback capture can sample too
+
+Two of `texture_view`'s failures -- `coherency` and `reference_counting` -- turn
+out to be the *other* capture refusal, the one the last pass did not lift.
+Both sample a texture view in the **vertex shader** and read the answer back
+through transform feedback, and `gex_wgpu_capture_variant_get` declined any
+vertex shader with a texture for exactly the reason the varying variant did:
+the split numbers a vertex stage's texture into descriptor set 3 and a dispatch
+has only group zero.
+
+The lift is the same -- renumber into the compute range, collect with
+`gex_wgpu_collect_stage_textures` -- but the binding is not, because this
+dispatch builds its bind group layout by hand rather than through
+`gex_wgpu_bindings`. Its arrays grew by two entries per sampler unit and the
+pair is appended there, with the same depth and non-filtering rules the other
+binders apply.
+
+**And it immediately produced 808 validation errors.** Not new ones: two
+feedback targets on one buffer is writable-storage aliasing, and this was the
+one dispatch the aliasing check did not cover, because it was also the one
+building its layout by hand. It had never mattered while a capturing shader
+that samples was refused outright. With the check wired in, the run is clean.
+
+`texture_view` 1 -> 3 of 7. `transform_feedback` measured at 6/21 before and
+after -- by stashing the change and rebuilding, rather than by argument.
+
