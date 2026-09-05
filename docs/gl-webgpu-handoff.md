@@ -15973,6 +15973,82 @@ evaluation), and it consumes generic varying slots, which is the layout STK,
 Minecraft and Blender all depend on. Weigh that against eight cases of
 something applications almost never do.
 
+### Served: four defects between the emulated stages and the cull
+
+**Done.** `cull_distance` 145 → 193 of 218.
+
+Grouping the family's failures by the CTS's own test items is what turned 73
+scattered value mismatches into one thing: **items 5 and 6 failed in all three
+primitive modes while 2, 3, 4 and 7 passed in all of them**, and
+`glcCullDistance.cpp`'s item table says item 5 adds a passthrough geometry
+shader and item 6 adds tessellation. 48 cases, one path.
+
+Four defects, stacked, each hiding the next:
+
+1. **The cull filter never ran.** It is gated on `ctx->vs->cull_distances`, and
+   the draw that rasterizes an emulated stage's output comes back through the
+   draw path with the *generated passthrough* bound, whose info says zero.
+   `GEX_WGPU_CULL_TRACE` printing a whole trace for the same test without the
+   extra stage and nothing at all with it is what located this.
+2. **The merged clip/cull array got one varying slot.** Mesa hands over a
+   single `float[8]` at `CLIP_DIST0` and there is no variable at `CLIP_DIST1`
+   to count, so eight floats were allotted sixteen bytes and components 4..7 —
+   the whole cull half — had nowhere to live.
+3. **The geometry emit loop wrote zeros for both halves.** It matched outputs
+   by location, so `CLIP_DIST1` found nothing, and read them with
+   `nir_load_var`, which an array is not. `gex_wgpu_emit_varying_stores`
+   already carried both rules — the geometry stage's copy of it had neither.
+4. **SPIR-V has only one ClipDistance builtin.** A second variable at
+   `CLIP_DIST1` is undecorated, so ntv emits it as an ordinary varying at
+   location 18 and WebGPU refuses the module: *"has a location (18) that is too
+   large. It should be less than (15 = 16 - 1 (clip_distances))"*. One array of
+   eight, written from two captured slots, is the shape that works — the same
+   trap the note about `gl_ViewportIndex` in that builder describes, reached
+   from the other direction.
+
+**The intermediate states are the lesson.** After (1) the filter ran and read
+eight zeros. After (2) and (3) the distances matched the passing item *exactly*
+and the culling decisions were identical to it — and the test still failed, now
+on over-clipping. The family sat at exactly 145/218 through all of that, so on
+a score-only rule each step looked like a change that fixed nothing and should
+be reverted. What justified continuing was the trace: all-zero distances
+becoming real ones is a measured behaviour change even when no case flips. See
+[[zero-means-nobody-wrote]] and [[refusal-hides-a-second-defect]].
+
+`GEX_WGPU_GS_VARYING_LOG` was added along the way and prints the geometry
+stage's output layout and its declared output variables, which is what showed
+`gl_ClipDistance loc=17 type=float[8]` sharing a layout with two slots.
+
+## A fragment shader cannot read gl_ClipDistance
+
+Eight of `cull_distance`'s remaining failures — all of
+`functional_test_item_8_primitive_mode_points_max_culldist_*` — are refused
+with
+
+    Tint rejected SPIR-V: error: no matching call to
+      'bitcast<f32>(array<f32, 8>)'
+
+which reads like the driver emitting nonsense. It is not. Assembling the
+rejected module (`spirv-dis` on the hex the driver dumps, which is the standing
+practice here) shows it is **correct**: `BuiltIn ClipDistance`, an
+`array<float,8>` in the `Input` storage class, read one element at a time by
+`OpAccessChain`. Nothing in this driver bitcasts anything.
+
+The bitcast is Tint's, trying to produce WGSL for a shape WGSL does not have.
+**Clip distances exist in WGSL only as a vertex output** — the `clip_distances`
+feature is written from the vertex stage and consumed by fixed-function
+clipping. There is no fragment-stage input for them, so a fragment shader that
+reads `gl_ClipDistance` or `gl_CullDistance` has no spelling at all.
+
+The workaround, if these eight are ever worth it: have the producing stage
+write a *second* copy of the distances into an ordinary generic varying and
+rewrite the fragment input to read that, keeping the real builtin for the
+clipping itself. Two things make it more than it looks — the copy has to follow
+the producing stage wherever it is (vertex, geometry, or tessellation
+evaluation), and it consumes generic varying slots, which is the layout STK,
+Minecraft and Blender all depend on. Weigh that against eight cases of
+something applications almost never do.
+
 ### The other 65 are two causes, both located
 
 They are silent — no refusal, no validation error — but they are not
