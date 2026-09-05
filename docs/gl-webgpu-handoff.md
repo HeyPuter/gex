@@ -16260,8 +16260,33 @@ One thing to be careful of when reading the shader: its WGSL is full of
 `1.0f`'s bit pattern. That is ordinary NIR type-punning through integer
 registers, not a symptom.
 
-What has not been checked: whether the glyph draw's *geometry* lands where it
-should (the instanced quad positions), and whether the atlas contains what
-alacritty thinks it does rather than merely having been written to. Reading
-the atlas back and comparing it against llvmpipe's would settle the second in
-one step.
+**The strongest lead: the glyph draws bind no vertex buffers.**
+`GEX_WGPU_CMD_LOG` for the two draws that carry the atlas reads
+
+    pipe ... | bg1 n=1 | dyn0=7168 | t0=1024x1024 | bg2 n=1 | dyn0=7424
+             | ib w0=1048576+12488 fmt=2 | drawIndexed count=6 inst=29
+
+with **no `vb0`/`vb1` at all**, while the third draw in the same frame has
+them. The binding loop logs `vbN ... SKIPPED` when it elides a redundant bind,
+and neither that nor a plain `vbN` appears — so the loop never reaches those
+slots, meaning the driver has no vertex elements for the draw.
+
+Yet that shader wants five attributes: its WGSL entry point is
+`main(@location(0) gridCoords_param, @location(3) textColor_param,
+@location(4) backgroundColor_param, @location(1) glyph_param,
+@location(2) uv_param, ...)`. Five instanced attributes fed by nothing read the
+default `(0,0,0,1)`, which collapses every glyph quad to a degenerate one at
+grid origin — exactly "the background draws and the text does not".
+
+Corroborating it: `GEX_WGPU_VS_STATE_LOG` never prints a line for this shader,
+and its guard is `if (want_state && ctx->vertex_elements)` — so
+`ctx->vertex_elements` really is absent, not merely empty of bound buffers.
+Only the 2-element background shader ever logs (`inputs 0x3 supplied 0x3
+missing 0x0`).
+
+Not the instance-divisor expansion: `gex_wgpu_expand_instance_divisors` only
+acts on a divisor above one, and alacritty's is one.
+
+So the question for the next attempt is why `set_vertex_elements` /
+`set_vertex_buffers` state is missing by the time this draw is issued, when
+llvmpipe on the same calls has it.
