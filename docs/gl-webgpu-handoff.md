@@ -16729,3 +16729,40 @@ missing call.
 reports `Fail (Fail)` with no driver message at all — the same shape as
 tessellation's `max_in_out_attributes`, and plausibly the same underlying
 question about what happens at the ceiling of the varying limits.
+
+### Every named target application re-verified (2026-09-05)
+
+A day of large driver changes — shader images in every stage including the
+vertex one, packed images in the compute-emulated stages, instanced and indexed
+patch draws, the vertex-layout gap fix behind alacritty's glyphs, and an
+evaluation shader with no outputs no longer failing a link — is exactly the
+kind of day after which "the gates are green" is not the same as "the
+applications still work". The standing gates cover SuperTuxKart and alacritty;
+the rest were checked by hand.
+
+| application | result |
+| --- | --- |
+| SuperTuxKart | renders; mean 0.67, stdev 0.17 |
+| alacritty | 95 distinct colours against llvmpipe's 95 |
+| Blender 5.2 | full interface, grid, axes, gizmos |
+| Minecraft 26.2 | title screen with logo and buttons |
+| Krita | interface, thumbnails, **and the canvas** — a document opens and draws |
+| FreeCAD 1.1.3 | interface, and the **3D viewport** shows the macro's solid with the cylinder cut through it and its edges |
+
+No refusals in any of them beyond the fourteen routine `render target refused`
+lines every application produces at startup, which are `is_format_supported`
+answers rather than anything being turned away.
+
+Two practical notes for the next person:
+
+- **FreeCAD's extracted AppImage is in the session scratchpad**, already
+  symlinked at `usr/lib/libGL.so.1` to `/tmp/gex-mesa-native/inst`. It does not
+  need re-downloading; check
+  `/tmp/claude-1000/-home-velzie-src-gex2/*/scratchpad/squashfs-root` before
+  fetching a gigabyte again.
+- Its **recovery dialog** appears whenever a previous run was killed, and it
+  sits over everything. Deleting `~/.local/share/FreeCAD/v1-1/Recovery*` does
+  not clear it. Clicking Cancel at about (803, 621) does, and the document tab
+  is then at about (313, 953) — the sequence has to happen inside one run,
+  because the app exits when its timeout expires and a screenshot taken after
+  that photographs a stale window.
