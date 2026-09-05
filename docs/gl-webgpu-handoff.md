@@ -15187,3 +15187,38 @@ vertex, tessellation or geometry stage, which this driver serves nowhere but
 the fragment and compute paths. That is the next lever here, and it is a
 feature rather than a refusal to lift. The other three are `line_numbering`,
 `binding_sampler_array` and `binding_samplers_texture_type_buffer`.
+
+## Dawn does not return null
+
+Two image paths declined "a slice of a 3D texture bound as a non-layered
+image2D" by testing whether `wgpuTextureCreateView` returned null. It never
+does. The WebGPU C API reports validation through the device error scope and
+hands back an *invalid* object, which then invalidates the bind group, the
+pipeline, the command buffer, and everything recorded with it -- so one case
+asking for an impossible view took unrelated work down with it. A null check
+reads like a guard and is not one.
+
+The combination has to be recognised from state already held, before the object
+is asked for: `wgpuTextureGetDimension` and `wgpuTextureGetDepthOrArrayLayers`
+on the target. **Expect more than one rule per combination.** The 3D-slice case
+is rejected twice over -- once for its layer range and once for its view
+dimension -- and fixing only the range simply moved the error:
+
+    Texture view array layer range (baseArrayLayer: 1, arrayLayerCount: 1)
+    exceeds the texture's array layer count (1).
+    -> The dimension (TextureViewDimension::e2D) of the texture view is not
+       compatible with the dimension (TextureDimension::e3D) of [Texture]
+
+The same shape appears in bind group layouts. `max_shader_buffers` is
+deliberately over-reported (a shader using the maximum of *both* halves at once
+is a combination nothing does), so a shader combining storage blocks, buffer
+textures and packed images can exceed the device's real per-stage limit --
+which WebGPU reports as a validation error rather than a failed create. Both
+the draw path and `launch_grid` now count the storage entries first and decline
+by name. **The draw path declines without latching**: this is a device limit,
+not a driver failure, and a latch would cost every case after it.
+
+`shader_image_load_store` did not move (14/51) -- these were all cases already
+failing for want of the feature -- but the run no longer emits WebGPU
+validation errors, which is the thing worth having: an error there was never
+confined to the case that caused it.
