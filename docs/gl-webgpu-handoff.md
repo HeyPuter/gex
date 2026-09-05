@@ -15536,6 +15536,16 @@ counting those made four applications report `refused=15` and look broken when
 nothing they asked for had been refused. All nine candidates show zero real
 refusals.
 
+**It gained a `NO-DRIVER` marker on 2026-09-05**, for the opposite failure of
+the same kind. Three of the nine — `aseprite`, `dolphin-emu` and `hello_xr` —
+print *no driver line at all*, meaning they never reached this driver: they run
+headless for their allotted seconds and are killed, and the gate reported
+`ran-to-timeout`, which reads exactly like the success the other six earned.
+A run that never touched the driver is not evidence about the driver in either
+direction, and the gate now says so rather than implying otherwise. Every
+context that does reach it prints at least the startup format queries, so zero
+is unambiguous.
+
 ## es_31_compatibility: 235 of 355, and what the gap is made of
 
 The largest remaining family gap, grouped:

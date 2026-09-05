@@ -29,6 +29,11 @@ run() {  # run <name> <seconds> <cmd...>
   local draws=$(grep -cE "gex-wgpu" "$log" 2>/dev/null)
   local note=""
   case $rc in 137|124) note="ran-to-timeout" ;; 0) note="exited-clean" ;; *) note="exit $rc" ;; esac
+  # An application that printed *no* driver line never reached this driver at
+  # all, and "ran-to-timeout" then reads as a success it did not earn: the run
+  # says nothing about the driver either way. Every context that does reach it
+  # prints at least the startup format queries, so zero is unambiguous.
+  [ "$draws" -eq 0 ] && note="$note NO-DRIVER"
   [ "$refused" -gt 0 ] && note="$note refused=$refused"
   printf '%-24s %-18s driverlines=%s\n' "$name" "$note" "$draws" | tee -a "$OUT/results.txt"
 }
