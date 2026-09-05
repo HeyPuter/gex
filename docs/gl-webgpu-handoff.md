@@ -15732,11 +15732,29 @@ which invokes `net.minecraft.client.main.Main` itself and passes
 diagnostic can be read through it, and Quick Play needs an instance-config key
 rather than an argument.
 
-The world's appearance is **unjudged**. It renders as a washed-out pink, and
-there is no reference for it on this machine: the system Mesa cannot give the
-game GL 3.3 through Xvfb's GLX ("Driver does not support OpenGL 3.3", plus a
-zenity dialog), and run-native.sh's megadriver contains only gex_wgpu. Get a
-reference some other way before calling it a defect.
+**The world renders correctly.** A village with houses, cliffs, wheat and
+flowers, trees, clouds, distance fog, the player's hand and the full HUD --
+indistinguishable in quality from the llvmpipe reference on the same save.
+
+Pick the save carefully. `CoolCrafters` spawns the player *outside* the world:
+the llvmpipe reference dies in it too ("You Died! velzie_ fell out of the
+world"), and the void fall renders as a washed-out pink that reads exactly like
+a colour bug. Use `New World (2)`. No pixel diff is possible on it either --
+it has no stored player position, so each launch spawns somewhere different and
+the two runs look at different scenery -- so judge by eye, or build a save with
+a fixed position.
+
+Getting the reference to run at all takes three separate corrections, and each
+one failed the same way, with `glx: failed to create drisw screen` followed by
+the game reporting "Driver does not support OpenGL 3.3" -- which reads as the
+platform refusing a software context when glxinfo on the same display, under
+the same environment, reports 4.6. The launch must name `LIBGL_DRIVERS_PATH`
+explicitly (GLFW dlopens libGLX rather than linking it, and the loader does not
+resolve the driver the same way inside that process); must *not* set
+`GALLIUM_DRIVER`, which otherwise asks the system Mesa for a driver it does not
+have; and must *not* set `-Djava.library.path`, which PrismLauncher points at
+an instance `natives` directory that does not exist here, and which *replaces*
+the default search path rather than adding to it. The gate handles all three.
 
 **The title screen's loading frame is not a defect.** The logo, the buttons and
 the three account icons draw well before the panorama and the fonts are ready,
