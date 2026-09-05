@@ -15400,3 +15400,42 @@ The index check declines now rather than latching. It still names the problem
 loudly, which is all it needed to do: latching is what turned one bad draw into
 a family that looked broken from the start.
 
+## Layered rendering
+
+`KHR-GL45.geometry_shader` was 118 of 136 against llvmpipe's 136, and half the
+gap was one feature: a geometry shader writing `gl_Layer`, which the driver
+answered with a message saying it rasterized the bound layer only.
+
+WebGPU attaches one array layer at a time, so layered rendering has to be one
+pass per layer -- which is **exactly the shape the viewport routing beside it
+already had**. `gex_wgpu_gs_route_layers` is that function against a different
+piece of state: sort the emitted triangles by the layer their first vertex
+asked for, then draw each run with that layer installed on every attachment.
+The render pass key already includes the attachment layer, so moving
+`ctx->color_layers` between draws opens the next pass by itself, and `loadOp`
+is always Load so a later layer does not disturb an earlier one.
+
+Three things had to be true besides the routing.
+
+- **The framebuffer had to admit it was layered.** `set_framebuffer_state`
+  recorded only `first_layer`; it now also records how many layers every
+  attachment has in common, which is what bounds the routing. One for every
+  ordinary framebuffer, so nothing else changes.
+- **A layered depth attachment had to be accepted.** It was rejected outright
+  -- `first_layer == last_layer` or decline -- which took the context with it.
+- **`is_format_supported` had to allow an array as a render target at all.**
+  It granted `PIPE_BIND_RENDER_TARGET` only for `PIPE_TEXTURE_2D`, so st was
+  told the *texture* could not exist long before anything drew. WebGPU renders
+  into one layer of an array through `baseArrayLayer`; the restriction was
+  simply wrong. Not 3D, which genuinely has no 2D view of a slice.
+
+And then `glClear` had to clear every layer, which GL says and the driver did
+not: it cleared the bound one and left the other cascades or cube faces holding
+whatever was there. That alone was two more cases.
+
+118 -> **121 of 136**, with no validation errors. What remains is four cases
+that create a `GL_TEXTURE_2D_MULTISAMPLE_ARRAY` before doing anything else --
+WebGPU has no multisampled array texture, so they are blocked -- geometry
+shader *instancing* (two cases, refused by name), and two shaders whose
+combined-sampler split fails at the texture-unit limit.
+
