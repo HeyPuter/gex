@@ -16290,3 +16290,65 @@ acts on a divisor above one, and alacritty's is one.
 So the question for the next attempt is why `set_vertex_elements` /
 `set_vertex_buffers` state is missing by the time this draw is issued, when
 llvmpipe on the same calls has it.
+
+### Answered: the vertex-element state was refused, for a gap in the buffer numbers
+
+The state was missing because `gex_wgpu_create_vertex_elements_state` returned
+NULL. A refused element state is not an error anywhere — cso binds the NULL it
+is handed, `ctx->vertex_elements` becomes absent, and the next draw proceeds
+with no vertex layout at all. That is the whole distance between "refused" and
+"a window with no text in it".
+
+The refusal was this, and it had outlived its reason:
+
+```c
+for (unsigned buffer = 0; buffer <= highest_buffer; ++buffer)
+   if (!buffers_used[buffer])
+      return NULL;   /* "vertex buffer slot %u unreferenced below highest %u" */
+```
+
+It assumed Gallium's buffer indices had to be contiguous, because the WebGPU
+`vertex.buffers` array is positional. The pipeline stopped needing that when it
+grew `vb_slot[buffer][step]`, a dense slot assigned per referenced buffer; an
+unreferenced index simply never gets a slot. Deleting the check is the fix.
+
+Two things made it hard to see. The message it printed did not name vertex
+elements, so it did not group with the shader's own diagnostics; and the
+`GEX_WGPU_VS_STATE_LOG` guard was `if (want_state && ctx->vertex_elements)`,
+which made the instrument blind in exactly the case worth reporting. Both are
+fixed: the dump prints `elements=-1` for an absent state, and
+`create velems` lists the buffer index and divisor of every element.
+
+**Where the gap comes from.** Not from the application. st compacts the binding
+numbers it is given — an enabled-but-undeclared attribute, and even explicit
+`glVertexAttribBinding(attrib, 2)`, both arrive dense. The producer is u_vbuf:
+it reserves one fallback slot per step mode for attributes it has to translate.
+Alacritty's glyph layout is five per-instance attributes in one interleaved
+buffer, one of them three bytes of colour — and WebGPU has no `unorm8x3`, so
+u_vbuf moves that one attribute into a buffer of its own at its per-instance
+slot. With nothing per-vertex to translate, the slot it reserved for that is
+left unreferenced:
+
+```
+create velems n=5 -> buf0(div=1) buf0(div=1) buf2(div=1) buf0(div=1) buf0(div=1)
+```
+
+**No probe covers this**, and it is worth saying why rather than leaving a gap
+in the suite. A probe can only ask st for a layout, and st will not hand the
+driver a hole; five attempts at a synthetic reproduction — separate buffers,
+locations 0 and 2, an undeclared attribute at 1, an interleaved
+`unorm8x3`, explicit attrib bindings — all arrived dense and all passed with
+the refusal restored. Only u_vbuf's own reservation produces the hole. The
+regression test is therefore the application: `tests/gates/app-alacritty.sh`,
+which photographs alacritty on both drivers and compares distinct colour counts
+(95 vs 95 now; 2 with the bug, since antialiased text is most of the palette).
+
+A probe that passes with the bug present is worse than no probe. This one was
+written, checked against a rebuild with the refusal restored, found to pass
+anyway, and deleted.
+
+**A second bug fell out of it.** The `buffers_used` array was `bool[8]`, indexed
+by `vertex_buffer_index`, which is validated only against
+`GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS` — `PIPE_MAX_ATTRIBS`, 32. Any layout using
+buffer slot 8 or above wrote past the end of a stack array. Deleting the check
+removed that too.
