@@ -15712,62 +15712,56 @@ all that shape -- `advanced-unsizedArrayLength-vs-int`, for one, reads two
 blocks (both correctly read-only) and writes its answer to a third -- and
 `shader_storage_buffer_object` proper has about 39 more.
 
-### Serving them: what transform feedback already does
+### Served, the way transform feedback already was
 
-**This driver already runs a vertex shader twice for exactly this reason.**
-`gex_wgpu_draw_vbo_inner` says so in as many words:
+**Done.** `shader_storage_buffer_object` 78 → 108 of 124 and
+`es_31_compatibility` 238 → 267 of 355.
 
-    /* Transform feedback is its own compute pass, run before the draw: WGSL
-     * will not let the vertex stage write a storage buffer, so the vertex
-     * shader is run a second time as compute to do the capturing. */
-    if (ctx->so_target_count && ctx->vs->capture_nir)
-       (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
+This driver already ran a vertex shader twice for exactly this reason, and said
+so beside the call: transform feedback dispatches the shader as compute
+*"because WGSL will not let the vertex stage write a storage buffer"*, then
+rasterizes normally. A vertex shader that writes an SSBO is the same problem
+with the stores inside the shader, so it took the same shape — the copy that
+rasterizes has its stores deleted (Tint accepts it, and it computes the same
+positions because a store has no result), while the compute copy keeps them and
+is dispatched for the side effects.
 
-The rasterization draw then proceeds normally with the ordinary vertex shader,
-because for transform feedback that shader has no stores of its own. A vertex
-shader that writes an SSBO is the same problem with the stores moved inside the
-shader, so it takes the same shape:
+An earlier draft here proposed capturing the varyings and rasterizing them
+through `gex_wgpu_gs_passthrough_nir` instead. That would also have worked and
+is strictly more machinery: a varyings buffer, a generated passthrough, the
+topology re-expanded, and the capture path's no-instancing limit inherited by
+the *rasterization* as well rather than only by the side-effect pass.
 
-1. **Detect.** The vertex shader stores to, or atomically updates, a storage
-   block -- `store_ssbo` / `ssbo_atomic` / `ssbo_atomic_swap`, plus the deref
-   spellings. Route on that rather than letting Tint refuse the module.
-2. **Side effects as compute.** Dispatch the capture variant so the stores
-   actually happen. This is where the work is: `gex_wgpu_capture_dispatch`
-   currently binds the vertex buffers, the params block, the index table and
-   the *transform-feedback* targets, and knows nothing about the shader's own
-   storage blocks, so those bindings have to be added.
-3. **Rasterize with the stores removed.** Compile a variant of the vertex
-   shader whose stores are deleted. Tint then accepts it, and it computes the
-   same positions and varyings, because a store has no result.
+Four things had to move, and every one of them was found by running the probe
+and reading the failure rather than by reading the code first:
 
-An earlier draft of this section proposed capturing the varyings and
-rasterizing them through `gex_wgpu_gs_passthrough_nir` -- the geometry
-architecture minus its middle pass. That works, but it is strictly more
-machinery for the same outcome: it needs a varyings buffer, a generated
-passthrough shader, the topology re-expanded into independent primitives, and
-it inherits the capture path's no-instancing limit for the *rasterization* draw
-as well. Stripping the stores keeps the real vertex shader on the draw and
-inherits that limit only for the side-effect pass.
+1. **`gex_wgpu_capture_store` dereferenced `shader->xfb_info` unconditionally.**
+   Safe while the capture variant existed for transform feedback alone; an
+   immediate segfault the moment a shader that merely writes storage wanted the
+   same dispatch. It has nothing to record, and wants the pass run for the
+   stores it already contains and nothing added.
+2. **The variant was refused when no feedback buffer was written.**
+   `if (state.failed || !state.so_mask)` — legitimately zero here.
+3. **The dispatch bound the vertex stage's uniform blocks in group 1 but not
+   its storage blocks.** The module puts them exactly where the graphics vertex
+   stage does, so the pipeline was invalid with "Binding doesn't exist in
+   BindGroupLayoutInternal", which takes the command buffer with it.
+4. **Stripping the stores must not remove the now-dead blocks.** This is the
+   one that cost the most time. Their *declarations* are what tell the
+   collection pass how many storage blocks there are and at which bindings —
+   which is precisely what the dispatch reads to bind the buffers its compute
+   copy writes. Delete them and `ssbo_count` is silently zero, the dispatch
+   binds nothing, and you are back at failure 3 with no clue why. Marking them
+   `ACCESS_NON_WRITEABLE` keeps them and is honest: after the pass that shader
+   only reads.
 
-Two things to get right:
-
-- **An atomic whose result is used.** Deleting the instruction changes what the
-  shader computes, not just what it writes. Refuse by name in that case rather
-  than substituting something close; that is the standing rule here, and a
-  substituted shape is how Tint and Mesa have been made to abort before.
-- **The invocation count.** The compute pass runs once per *assembled* vertex,
-  so a strip re-runs its shared vertices. GL does not promise one invocation
-  per unique vertex either (a post-transform cache is allowed to reuse), and
-  the failing cases all write to a location indexed by `gl_VertexID`, which
-  makes the duplicate write idempotent. A shader accumulating with `atomicAdd`
-  would count differently, which is another reason to refuse a used result.
-
-Worth knowing before starting: this buys CTS cases and essentially no
-application. A vertex shader writing a storage buffer is a GPU-driven-rendering
-idiom, and none of the target applications do it -- so measure it against
-`es_31_compatibility` and `shader_storage_buffer_object`, keep an eye on
-`transform_feedback` in the CTS gate because step 2 edits its path, and do not
-expect the app sweep or the pixel comparison to move at all.
+Two limits worth knowing, both inherited from the capture path and both
+harmless for the cases this serves: no instancing (the variant does not model
+the instance index), and the compute pass runs once per *assembled* vertex, so
+a strip re-runs its shared vertices. GL does not promise one invocation per
+unique vertex either, and these shaders write at `gl_VertexID`, which makes the
+duplicate idempotent. An accumulating `atomicAdd` would count differently —
+which is the second reason an atomic whose result is used is refused by name.
 
 ## Minecraft reaches a world, and its title screen has a trap
 
