@@ -16845,10 +16845,29 @@ recording as a second, independent signal, but it is the weaker of the two: a
 program can render *wrongly* while printing nothing at all, which is precisely
 what the differ column catches and a log scan cannot.
 
-One thing noticed in passing and not chased: `eglinfo` lists about 20 EGL
-configs here against llvmpipe's ~105. No application in the sweep minded, but
-config coverage has caused trouble before — see the opaque-GLX-config note —
-so it is written down rather than forgotten.
+One thing noticed in passing, and then chased rather than left: `eglinfo`
+lists **88** configs here against llvmpipe's **475**. Config coverage has
+caused real trouble before — see the opaque-GLX-config note, where the absence
+of alpha-0 configs put depth-32 images into depth-24 windows and broke Krita
+with a silent BadMatch — so a seven-to-one difference deserved an explanation
+rather than a shrug. It has one, in three parts:
+
+- **Sample counts.** We offer 1 and 4; llvmpipe offers 0, 2, 4 and 8. WebGPU
+  has no 2x or 8x multisampling, so this is honesty rather than a gap. And
+  `EGL_SAMPLES` matches *at least*, so a 2x request is satisfied by a 4x
+  config. Only an application demanding 8x fails, which is correct.
+- **Depth/stencil.** We have `32/0`, `24/8`, `16/0` and `0/0`; llvmpipe adds
+  `24/0`. Also at-least matched, so a depth-24, stencil-0 request lands on our
+  `24/8`.
+- **Alpha.** We have 0, 8 and 16; llvmpipe has 0, 1, 2 and 8. **The alpha-0
+  configs are present**, which is the thing that mattered historically. The
+  exotic 1- and 2-bit alphas are again satisfiable by our 8.
+
+So the count differs mostly because llvmpipe enumerates four sample counts
+against our two and more redundant combinations within each, and everything an
+application can actually ask for is matchable except 8x multisampling. Which
+is consistent with the sweep: 336 programs, and the only difference is
+`eglinfo`'s own exit code.
 
 ### Today's work verified in the real browser, not only natively
 
