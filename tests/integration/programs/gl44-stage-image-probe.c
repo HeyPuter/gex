@@ -1,15 +1,17 @@
 /* An image written from a stage that is not the fragment shader.
  *
- * GL 4.2's ARB_shader_image_load_store puts image uniforms in *every* stage,
- * and this driver serves them in the fragment and compute paths only:
- * GL_MAX_VERTEX_IMAGE_UNIFORMS and GL_MAX_GEOMETRY_IMAGE_UNIFORMS are zero, so
- * the *linker* refuses such a shader before the driver sees it. Sixteen of
- * KHR-GL45.shading_language_420pack's remaining failures are this, and they
- * are invisible in a driver log -- no refusal appears anywhere, because the
- * refusal is Mesa's.
+ * GL 4.2's ARB_shader_image_load_store puts image uniforms in *every* stage.
+ * This driver served the fragment and compute paths only, reporting
+ * GL_MAX_VERTEX_IMAGE_UNIFORMS and GL_MAX_GEOMETRY_IMAGE_UNIFORMS as zero, so
+ * the *linker* refused such a shader before the driver saw it -- invisibly, no
+ * refusal anywhere in a driver log, because the refusal was Mesa's.
  *
- * **This probe is expected to DIFF, and the two cases fail for different
- * reasons.** That is what it is for: it says which.
+ * The geometry stage is served now: it runs as a compute pass, where WebGPU
+ * allows a writable storage texture, and it needed only the collection and the
+ * binding. See the handoff document's "Images in the geometry stage".
+ *
+ * **This probe is still expected to DIFF, on the vertex case alone.** That is
+ * what it is for: it says which of the two is blocked and which is not.
  *
  *   `vertex`    platform-blocked, measured rather than assumed. With the cap
  *               raised the shader reaches Tint, which refuses it by name:
@@ -20,11 +22,11 @@
  *               A vertex image that is only *read* would be expressible --
  *               Tint lowers a read-only storage image to a sampled texture --
  *               but every CTS case that binds one also stores through it.
- *   `geometry`  not blocked, just unimplemented. The geometry stage runs here
- *               as a compute pass, where a writable storage texture is
- *               allowed; it needs the image collected at shader creation and
- *               bound into the dispatch's group, which is what the compute
- *               path already does for its own.
+ *   `geometry`  served, and this case passes. A store of (0.75, 0.5, 0.25)
+ *               reads back as 191,128,64. A *packed* geometry image -- one
+ *               whose format WebGPU has no storage texture for -- is still
+ *               refused by name: it needs a buffer copied into and out of the
+ *               texture around the pass, and this path has nowhere to do it.
  *
  * Both draw a single point with no fragment output that matters, so nothing
  * the fragment stage does can supply the answer; the only route from the

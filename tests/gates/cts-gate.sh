@@ -37,4 +37,4 @@ run transform_feedback2  1/1
 # actually prints, not what it ought to be.
 run transform_feedback3  2/3
 run texture_view         3/7
-run geometry_shader      123/136
+run geometry_shader      124/136

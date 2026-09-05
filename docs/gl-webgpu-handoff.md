@@ -16352,3 +16352,64 @@ by `vertex_buffer_index`, which is validated only against
 `GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS` — `PIPE_MAX_ATTRIBS`, 32. Any layout using
 buffer slot 8 or above wrote past the end of a stack array. Deleting the check
 removed that too.
+
+## Images in the geometry stage
+
+GL 4.2's `ARB_shader_image_load_store` puts image uniforms in every stage. This
+driver served the fragment and compute paths, and reported
+`GL_MAX_GEOMETRY_IMAGE_UNIFORMS` as zero — so the *linker* refused a geometry
+shader that declared one, before the driver ever saw it. No refusal appeared in
+any driver log, because the refusal was Mesa's.
+
+Nothing about it was blocked. The geometry stage runs here as a compute pass,
+and WebGPU allows a writable storage texture in compute; the collection and the
+binding were the only things missing. Both now exist and are shared rather than
+copied:
+
+- `struct gex_wgpu_stage_images` — the table, in the form a bind group layout
+  needs. WGSL puts format, access and view dimension all in the storage
+  texture's type, so the layout has to name the same three or the device
+  rejects the group.
+- `gex_wgpu_collect_stage_images` — lifted out of `create_compute_state`, which
+  is now one of its two callers. Its refusals name the stage.
+- `gex_wgpu_stage_image_view` — the view one image binds through, also lifted
+  out of `launch_grid`. The rules belong to the image unit, not the stage: an
+  unbound unit reads zero and discards its stores, a format outside the
+  resource's class needs an alias, and a view WebGPU will not make is declined
+  by name.
+- `gex_wgpu_bind_stage_images` — appends to a dispatch's group accumulator,
+  which grew an `image_mask` and a storage access/format per entry.
+
+Two things had to be right, and each failed first as the same unhelpful
+message — `[Invalid BindGroupLayout (unlabeled)] is invalid`:
+
+1. **Collect after `gex_wgpu_lower_gallium_ubos`, not before.** That pass is
+   what assigns image bindings. Collecting first recorded binding 0 for every
+   image — `GEX_WGPU_GS_PARAMS_BINDING` — so two entries claimed one number.
+2. **Put images in group zero.** An image is not a block, so
+   `gex_wgpu_blocks_to_group_one` leaves it at the descriptor set
+   `lower_gallium_ubos` gave it, and the module then declares `@group(2)` for
+   which the dispatch's layout has no group.
+
+A binding collision and a missing group produce the same three lines from Dawn
+— an invalid layout, then an invalid pipeline, then an invalid command buffer —
+and none of them names an image. `gl44-stage-image-probe`'s `geometry` case
+reads back `191,128,64` for a store of `(0.75, 0.5, 0.25)`, which is the
+statement worth having.
+
+Measured: `shading_language_420pack` 309 → **311/329**, `geometry_shader`
+123 → **124/136**. Modest on purpose — most of the image-outside-fragment class
+is the *vertex* stage, which is blocked below and is not what this reaches.
+
+**What is still refused, and why.** A *packed* geometry image — one whose
+format WebGPU has no storage texture for — needs a storage buffer copied into
+and out of the texture around the pass, and this path has nowhere to do that.
+It is refused by name. Tessellation images are likewise still uncollected; the
+same three helpers would serve them, and the work is the dispatch wiring.
+
+The vertex stage stays at zero on purpose: Tint refuses a write-access storage
+texture there by name — *storage texture with 'write' access mode cannot be
+used by vertex pipeline stage* — and every CTS case that binds a vertex image
+stores through it. A vertex image that is only read would be expressible, since
+Tint lowers a read-only storage image to a sampled texture, but nothing asks
+for one.
