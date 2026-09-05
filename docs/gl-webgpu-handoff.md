@@ -16167,3 +16167,40 @@ costs that were removed earlier are still gone, and there is no systemic
 per-draw problem to chase. Worth re-running after any change to the render-pass
 or bind-group paths, and worth remembering that this is the *trustworthy*
 instrument: an application's FPS counter here is not.
+
+## The 32-byte attachment budget is Dawn's Vulkan backend, not the GPU
+
+`maxColorAttachmentBytesPerSample` is 32 here, which is four rgba8 targets
+(rgba8 costs 8, not 4). It blocks Blender's EEVEE viewport, which wants five,
+and `direct_state_access.framebuffers_draw_buffers`, which reports
+
+    gex-wgpu: colour target 2 dropped: the attachments exceed 32 bytes
+    per sample
+
+**It is not the hardware.** Dawn's other backends derive the limit from the
+device and its Vulkan backend never assigns it at all, so it keeps the
+frontend default:
+
+| backend | `maxColorAttachmentBytesPerSample` |
+|---|---|
+| D3D12 | `D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT * 16` = 128 |
+| D3D11 | `D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT * 16` = 128 |
+| Metal | `mtlLimits.maxTotalRenderTargetSize` |
+| OpenGL | commented out |
+| **Vulkan** | **absent — nothing sets it** |
+
+Dawn's own limit table (`Limits.cpp`) tiers this at 32/32/64/128, so the tiers
+exist and this adapter simply never claims one. This machine is Vulkan on
+RADV, which does eight 16-byte targets; the same Dawn on D3D12 would report
+128.
+
+Nothing on this side reaches it. The driver already asks for 32 and gets 32,
+and `ApplyLimitTiers` only ever moves a limit *down* to a tier boundary — it
+cannot raise one nobody set.
+
+**And do not "fix" it by patching the local Dawn.** This driver targets WebGPU
+in a browser as well as this native build; there Dawn is Chrome's and cannot be
+patched, so a local patch would make the native build pass what the real target
+still refuses — which is the same trap as any measurement that flatters the
+thing being measured. The honest place for a fix is upstream Dawn, giving its
+Vulkan physical device the same derivation D3D12 and Metal already have.
