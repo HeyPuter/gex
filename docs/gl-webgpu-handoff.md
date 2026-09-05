@@ -16353,7 +16353,7 @@ by `vertex_buffer_index`, which is validated only against
 buffer slot 8 or above wrote past the end of a stack array. Deleting the check
 removed that too.
 
-## Images in the geometry and tessellation stages
+## Images in every stage
 
 GL 4.2's `ARB_shader_image_load_store` puts image uniforms in every stage. This
 driver served the fragment and compute paths, and reported
@@ -16417,9 +16417,43 @@ cases, tessellation three — and `tessellation_shader` from 132 to **134/140**,
 which was run as the regression check on the two dispatches this touched and
 came back better rather than merely unbroken.
 
-The vertex stage stays at zero on purpose: Tint refuses a write-access storage
-texture there by name — *storage texture with 'write' access mode cannot be
-used by vertex pipeline stage* — and every CTS case that binds a vertex image
-stores through it. A vertex image that is only read would be expressible, since
-Tint lowers a read-only storage image to a sampled texture, but nothing asks
-for one.
+### The vertex stage was not blocked after all
+
+I had this one recorded as platform-blocked, in the probe and in the handoff,
+on the strength of a real and still-current Tint refusal:
+
+    storage texture with 'write' access mode cannot be used by vertex
+    pipeline stage
+
+That refusal is genuine — raising the cap and rebuilding reproduces it exactly
+— but it only rules out *rasterising* a module that declares a written image.
+It says nothing about whether the store can happen, and this driver already
+owned the way round it: a vertex shader that writes a storage buffer is
+dispatched as compute for its side effects and rasterises from a copy with the
+stores stripped (`gex_wgpu_writes_storage` / `gex_wgpu_strip_storage_writes`).
+An image store is the same shape with a harder wall in front of it, so it takes
+the same route:
+
+- both passes learned the image intrinsics, `image_deref_store` and the image
+  atomics among them;
+- the rasterising copy has its image variables **removed** rather than made
+  read-only, which is where images differ from blocks. A block must stay
+  declared because the dispatch binds from this shader's own collection; an
+  image must not, because a declared write-access storage texture is precisely
+  what Tint refuses, store or no store;
+- so the dispatch binds from `capture_images`, collected off the clone before
+  the strip;
+- and those bindings go in group 1, because the graphics vertex stage puts
+  images in descriptor set 1 and the compute clone keeps them there.
+
+`gl44-stage-image-probe` now passes four of four and matches its reference, so
+it is no longer one of the suite's expected DIFFs — 113/116, three DIFFs.
+`shading_language_420pack` holds at 314/329 and cts-gate is at baseline: this
+last step bought no CTS cases, only the honest capability and one fewer wrong
+belief in the notes.
+
+The lesson is the one already written down as *ask for the limit*, in a
+different disguise: a wall that names itself convincingly is still worth
+testing against what the driver can already do. A read-only vertex image, the
+thing I had said would be "expressible but unwanted", turns out to be the
+uninteresting case; the written one was reachable all along.

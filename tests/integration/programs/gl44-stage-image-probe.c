@@ -6,23 +6,26 @@
  * the *linker* refused such a shader before the driver saw it -- invisibly, no
  * refusal anywhere in a driver log, because the refusal was Mesa's.
  *
- * The geometry stage and both tessellation stages are served now: each runs as
- * a compute pass, where WebGPU allows a writable storage texture, and each
- * needed only the collection and the binding. See the handoff document's
- * "Images in the geometry and tessellation stages".
+ * Every stage is served now, and this probe is expected to match its
+ * reference. The geometry stage and both tessellation stages run as compute
+ * passes, where WebGPU allows a writable storage texture, and needed only the
+ * collection and the binding. The vertex stage needed more, because Tint
+ * refuses a write-access storage texture there by name -- it rides the route
+ * this driver already had for vertex storage *writes*: the shader is
+ * dispatched as compute for its side effects and rasterises from a copy with
+ * the stores stripped and the images removed. See the handoff document's
+ * "Images in every stage".
  *
- * **This probe is still expected to DIFF, on the vertex case alone.** That is
- * what it is for: it says which stage is blocked and which are not.
- *
- *   `vertex`    platform-blocked, measured rather than assumed. With the cap
- *               raised the shader reaches Tint, which refuses it by name:
+ *   `vertex`    served through the compute dispatch. Tint's refusal is real
+ *               and still there --
  *
  *                 storage texture with 'write' access mode cannot be used by
  *                 vertex pipeline stage
  *
- *               A vertex image that is only *read* would be expressible --
- *               Tint lowers a read-only storage image to a sampled texture --
- *               but every CTS case that binds one also stores through it.
+ *               -- so what rasterises must not declare the image at all; it
+ *               is the dispatch that stores. This case was recorded here as
+ *               platform-blocked for a while, which it was not: the wall was
+ *               Tint's, and the driver already owned a way round it.
  *   `geometry`  served, and this case passes. A store of (0.75, 0.5, 0.25)
  *               reads back as 191,128,64. A *packed* geometry image -- one
  *               whose format WebGPU has no storage texture for -- is still
