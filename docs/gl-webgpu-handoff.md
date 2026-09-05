@@ -17261,3 +17261,74 @@ loaded world — the death screen with its text, buttons, hearts, hunger and
 hotbar, the save having spawned the player falling out of the world as it
 always does. FreeCAD and Krita were verified earlier in the session's history
 and are unchanged by this work.
+
+## GL 4.6, by not depending on the platform for the last extension
+
+`ARB_polygon_offset_clamp` was the only one of GL 4.6's nine the driver did
+not claim, and the reason was good: every part of it is already here —
+`pipe_rasterizer_state::offset_clamp` reaches
+`WGPUDepthStencilState::depthBiasClamp`, which means the same thing, and the
+value arrives intact — but the clamp has no effect on this platform. It was
+measured twice, the second time traced as far as Dawn's Vulkan backend
+enabling the device feature (`DeviceVk.cpp`) and handing the value to the
+pipeline (`RenderPipelineVk.cpp`), so it is dropped past both. Claiming an
+extension whose effect is silently absent is worse than not having it.
+
+The way out is not to depend on the platform for it. GL's offset is
+
+    o = m * factor + r * units
+
+with `m` the polygon's maximum depth slope and `r` the minimum resolvable
+difference, and all of that is computable in a fragment shader: `m` from the
+screen-space derivatives of `gl_FragCoord.z`, `r` as a constant of the depth
+format. So when a **finite, non-zero** clamp is set, the fixed-function bias is
+switched off and the whole offset is done in the shader instead, clamped as the
+spec says. Zero and infinity clamp nothing, so they keep the fixed-function
+path — which is also what keeps this off the path of every ordinary
+polygon-offset draw, and there is no infinity to build in WGSL, which cannot
+spell one.
+
+`r` is `2 / (2^bits - 1)`, and that is not a guess. It is what the reference
+does: `draw_pipe_offset.c` computes `offset_units * mrd * 2` with `mrd` from
+`util_get_depth_format_mrd`, and it is the same factor of two this driver
+already applied when handing `offset_units` to WebGPU — which is where that
+otherwise unexplained `* 2.0f` came from.
+
+Two things it gives up, stated rather than hidden: a shader that writes
+`gl_FragDepth` itself is left alone, because its own write is what reaches the
+depth test in GL too; and `gl_FragCoord.z` is unbiased here where GL would have
+offset it before the shader ran.
+
+`gl44-polygon-offset-probe`'s two clamp cases had been written out of the table
+rather than run, because llvmpipe claimed the extension and this driver did
+not, so running them made the probe differ on the case count. They are back and
+both sides agree: `offset_clamp_rounds_away` now draws the red it should.
+
+### The other half was one number
+
+With the extension claimed the version was still 4.5, because `ver_4_6` also
+wants `consts->GLSLVersion >= 460` and the driver's `glsl_feature_level` was
+450. Everything GLSL 4.60 folds into core — `gl_spirv`, the draw parameters,
+the group vote, the atomic counter ops, anisotropic filtering, the offset clamp
+— is already claimed here as an extension, so raising it grants applications
+the core spelling of what they could already ask for by name.
+
+    OpenGL core profile version string: 4.6 (Core Profile) Mesa 26.3.0-devel
+    OpenGL core profile shading language version string: 4.60
+
+**GL 4.6 is the ceiling, and the driver is at it.**
+
+### An infinite clamp is a dropped draw
+
+`KHR-GL46.polygon_offset_clamp` then failed one of its three,
+`PolygonOffsetClampZeroInfinity`, reading back a depth of exactly 1.0 — the
+clear value, so the draw never happened. GL allows an infinite or NaN clamp and
+means "do not clamp" by it; WebGPU takes a finite float and spells no-clamp as
+zero, and handing it an infinity fails pipeline validation. A non-finite clamp
+becomes zero on the way in now. 3/3 on both KHR-GL45 and KHR-GL46, matching
+llvmpipe.
+
+This is the shape of every extension claimed for the first time: the value an
+application is newly allowed to pass reaches a validator that never saw it
+before. The CTS case that catches it only becomes *runnable* once the extension
+is claimed, so it cannot have been passing beforehand.

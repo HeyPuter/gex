@@ -163,25 +163,23 @@ int main(void) {
          * is the control -- without it, a driver that ignored the offset
          * entirely would still pass the case above. */
         {"offset_disabled_loses", 0.0f, 0},
-        /* ARB_polygon_offset_clamp's two cases -- offset through
-         * glPolygonOffsetClampEXT with no clamp, and the same offset clamped
-         * to -1e-9, a sixtieth of a 24-bit depth unit, so the pull must round
-         * away -- are written out here rather than run, because this driver
-         * does not claim the extension and llvmpipe does. Run they would make
-         * this probe differ from its reference on the *case count*, which is
-         * noise, not evidence.
+        /* ARB_polygon_offset_clamp: the same offset through
+         * glPolygonOffsetClampEXT with no clamp, and clamped to -1e-9 -- a
+         * sixtieth of a 24-bit depth unit, so the pull must round away.
          *
-         *     {"offset_clamp_absent",      -8.0f, 1,  0.0f,  1},
-         *     {"offset_clamp_rounds_away", -8.0f, 0, -1e-9f, 1},
+         * These ran only on llvmpipe for a long time, because the platform
+         * drops WGPUDepthStencilState::depthBiasClamp and the driver would
+         * not claim an extension whose effect is silently absent. The driver
+         * computes the whole offset in the fragment shader when a finite
+         * clamp is set now -- see gex_wgpu_lower_polygon_offset_clamp -- so
+         * both sides run them and both must agree.
          *
-         * They were restored and measured on 2026-09-05 to check whether a
-         * newer Dawn had implemented the clamp. It has not:
-         * `offset_clamp_rounds_away` still drew the pull it should have
-         * rounded away, while `offset_clamp_absent` passed -- so the entry
-         * point is wired to the same bias and it is the clamp alone that is
-         * dropped. Paste them back to re-check; they discriminate at once.
-         * The reasoning, and where Dawn does *not* drop it, is recorded next
-         * to caps->polygon_offset_clamp. */
+         * `offset_clamp_absent` also stands on its own: it is the control
+         * that says the entry point is wired to the same bias, so a failure
+         * of `offset_clamp_rounds_away` alone is about the clamp and nothing
+         * else. */
+        {"offset_clamp_absent",      -8.0f, 1,  0.0f,  1},
+        {"offset_clamp_rounds_away", -8.0f, 0, -1e-9f, 1},
     };
 
     for (unsigned i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
