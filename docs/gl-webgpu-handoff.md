@@ -17499,3 +17499,127 @@ It does **not** say the pictures are right: the sweep classifies verdicts
 it unnoticed — which is exactly how Minecraft's title screen stayed broken. The
 target applications are checked by opening their frames, and that is a separate
 instrument for a separate question.
+
+## Shader images: seven defects, and one of them was mine
+
+`KHR-GL46.shader_image_load_store` went 26 → 33 of 51. Seven separate
+defects, and the interesting part is how differently they announced
+themselves — three named their own refusal, three said nothing at all, and
+one was introduced by the fix two lines above it.
+
+### An image coordinate is an integer, whatever the vote said
+
+`nir_to_spirv` types a `vecN` by majority vote over its sources (the
+typeless block in `emit_alu`). One geometry shader stored to an ivec2 image
+and an ivec3 image from the *same values*: the 2D coordinate came out
+`v2uint`, bitcasting the uniform's float-labelled components itself, and the
+3D one came out `v3float`, because one more of its four components was
+float. SPIR-V:
+
+    error: line:260: Expected Coordinate to be int scalar or vector
+
+The bits are the coordinate either way; the vote decides only the label.
+`get_image_coords` now bitcasts to uint, which is what the surviving 2D
+spelling already did by hand. Worth remembering as a shape: **a value's ntv
+type is bookkeeping, and a consumer with a hard requirement has to state
+it.**
+
+### A geometry shader with no outputs is not "nothing to draw"
+
+GL lets a geometry shader never call `EmitVertex`. Such a shader exists for
+its stores — the CTS's is twenty `imageStore`s and no emit — and this driver
+lumped "no outputs" together with "nothing to draw" and declined the whole
+draw. None of the stores ran. The passes now run; only the *rasterizing* one
+is skipped, because there is no primitive and no passthrough to build from.
+
+### Two image units on one texture shared one buffer
+
+A packed image's buffer was sized for the *bound* layer range at offset
+zero. Two units on one texture — layer 0 and layer 1, which is ordinary GL —
+therefore shared one slice's worth: the second unit's copy-in overwrote the
+first's, and both bindings covered the same range, which WebGPU refuses for
+a writable pair. The buffer now holds every layer of the level and each view
+binds its own slice range, disjoint by construction and 256-aligned because
+the row stride is.
+
+### A vertex shader's stores never happened with a geometry or tess stage
+
+This one was silent and total. A vertex shader that writes storage has its
+stores performed by a compute dispatch, because WGSL will not let the vertex
+stage write a storage buffer. That dispatch sat *below* the two branches
+that replace the draw with a geometry or tessellation stage's own passes and
+return. So the stores simply did not happen — for the whole of any draw with
+either stage bound — and the only symptom was a zero where a value should
+have been.
+
+The varying pass those stages run cannot stand in for it: that one is built
+from the copy whose stores were stripped, precisely so the same writes do
+not happen twice.
+
+### The capture dispatch assembled primitives it had no use for
+
+Moving the dispatch up was not enough, because it then declined:
+
+    capture declined (topology 14, 3 vertices)
+
+Transform feedback records *primitives*, so the capture's slot table is the
+draw assembled into them. A dispatch that exists only for the vertex
+shader's own stores wants no assembly at all — GL runs that shader once per
+vertex, and the topology is not its business. `GL_PATCHES` has no primitive
+size to assemble by, so insisting on assembly declined every tessellated
+draw. The dispatch now assembles only when something is actually being
+recorded.
+
+### Refusing the shader was too strong for an atomic
+
+A vertex shader whose atomic result is *used* cannot have that atomic
+stripped from the rasterizing copy. Refusing the shader failed the link, so
+`glUseProgram` errored and the application never ran the side effects at
+all — yet only the rasterizing copy has the problem, and such a shader is
+normally driven under `GL_RASTERIZER_DISCARD` precisely because only its
+stores matter.
+
+The rasterizing copy is now left arithmetically wrong (the atomic reads as
+zero) and the *shader* is marked unrasterisable. That is not the "close
+enough" substitution this driver refuses elsewhere, because nothing can
+observe the wrong value: every draw that would rasterize it is declined by
+name, after the capture dispatch, and a draw under rasterizer discard never
+reaches that copy.
+
+### Changing a block's address space changes which sweep claims it
+
+The self-inflicted one. Eight packed images plus their shared header plus a
+geometry pass's own five buffers came to fourteen storage buffers against a
+limit of ten. The header is read-only driver metadata half a kilobyte long,
+so it became a *uniform* buffer — uniform buffers have a limit of their own,
+twelve — declared `array<vec4<u32>>` because a uniform array has a 16-byte
+stride, with every index a compile-time constant so the `/4` and `%4` fold
+away.
+
+That worked, and silently broke every compute-emulated stage. The pass that
+moves an application's constant buffers into group one,
+`gex_wgpu_blocks_to_group_one`, took the header with them — its comment
+already documents the trap for *storage* blocks ("the pass's own blocks
+belong in group zero") and the range test that implements it only covered
+storage. The module then read `@group(1) @binding(120)` while the dispatch
+bound it in group zero: an invalid pipeline, so the store did nothing, and
+the value read back was a zero indistinguishable from a store that never
+happened.
+
+Two things to carry forward. **A block's address space decides which sweeps
+claim it**, so changing one means re-reading every pass that filters on
+mode. And the four gates that were green throughout — probe suite, EEVEE,
+Blender, STK — were green because none of them puts a packed image in an
+emulated stage; a gate is only evidence about what it exercises.
+
+### What is left
+
+Five of the remaining sixteen are one wall: a geometry or tessellation pass
+spends five storage buffers of its own, so eight packed images no longer
+fit in the device's ten. Two savings are available and neither is done — the
+pass's parameter block is read-only and could be uniform (−1), and a stage
+with no outputs needs neither its vertex, index nor count buffer (−3). The
+rest are separate: an unformatted `imageBuffer` in the vertex stage, a 3D
+slice bound as a non-layered `image2D` (which WebGPU cannot view and which
+would have to be packed on a per-draw decision), and a fragment group that
+wants twelve storage buffers.
