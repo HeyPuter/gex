@@ -15536,3 +15536,36 @@ counting those made four applications report `refused=15` and look broken when
 nothing they asked for had been refused. All nine candidates show zero real
 refusals.
 
+## es_31_compatibility: 235 of 355, and what the gap is made of
+
+The largest remaining family gap, grouped:
+
+- **40 cases: a vertex shader that writes a storage buffer.** WGSL forbids
+  `var<storage, read_write>` in the vertex stage outright. These are the
+  `basic-std430Layout-caseN-vs` layout tests, and writing the block *from the
+  vertex shader* is what they are testing. Platform-blocked.
+- **8: an array of images**, which reaches Tint as an array variable --
+  "arrays of textures or samplers are not supported in WGSL". The combined
+  sampler split handles sampler arrays; nothing splits an image array.
+- A handful of one-offs: an integer cube sample without an explicit LOD, a
+  texture bound as a sampled view without the usage, an unwritten texture.
+
+**A wrong turn worth recording.** Three comments in this driver say
+`nir_opt_access` marks a block the shader only reads, and nothing called it. I
+wired it in; the number did not move. Reading the pass says why -- it
+identifies the block behind an access with `nir_chase_binding`, which wants a
+deref, and by the time this driver sees a shader an access is a `load_ssbo`
+with a plain block number; failing to identify one it marks *every* block both
+read and written. So I wrote the analysis this IR form needs, and the number
+still did not move. Instrumenting it showed the blocks already arriving with
+`ACCESS_NON_WRITEABLE` set: **Mesa infers this before the driver sees the
+shader**, and the comments were right all along about the outcome even though
+they named the wrong pass. The analysis was reverted.
+
+The thing that would have saved two rebuilds is the thing that finally settled
+it: print the access flags on the way in, before writing code that sets them.
+`gl44-vertex-ssbo-read-probe` stays, because it pins a capability that does
+work and nothing else covered -- a vertex shader reading instance data or
+skinning matrices out of a storage buffer, which is how a modern engine feeds
+one.
+
