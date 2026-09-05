@@ -16150,3 +16150,20 @@ Serving it properly means a render pass that samples the source depth and
 writes `gl_FragDepth` under a scissor. That is real work, and so far exactly
 one case has asked for it — so the decline is the honest state, not a
 placeholder for something nearly working.
+
+## Draw-issue rate, measured again
+
+`tests/gl-drawrate.sh 2000` on a quiet machine (load 0.49 — the harness warns
+that measurements here swing 30% between load 3 and 24), 2026-09-05:
+
+| | gex_wgpu | softpipe |
+|---|---|---|
+| `state=1` | 191,148 draws/s | 194,728 |
+| `state=7` | 147,751 draws/s | 132,114 |
+
+Parity for plain draws and **faster than softpipe once state changes between
+them**, which is the case a real frame is made of. The two structural per-draw
+costs that were removed earlier are still gone, and there is no systemic
+per-draw problem to chase. Worth re-running after any change to the render-pass
+or bind-group paths, and worth remembering that this is the *trustworthy*
+instrument: an application's FPS counter here is not.
