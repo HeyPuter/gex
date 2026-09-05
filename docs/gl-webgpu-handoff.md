@@ -15891,3 +15891,54 @@ The cases now live written-out in a comment rather than run, because llvmpipe
 claims the extension and this driver does not, so running them would make the
 probe differ on the *case count* — noise rather than evidence. Paste them back
 to re-check.
+
+## rgba32f sample masks are blocked, and a bind nobody handled
+
+`es_31_compatibility.sample_variables.mask.rgba32f` is 27 of that family's
+remaining failures — the largest single cluster left in it — and every one dies
+before a sample mask is read:
+
+    GL_INVALID_OPERATION in glTexStorage2DMultisample(format/samplecount
+      not supported)
+    GL_INVALID_FRAMEBUFFER_OPERATION in glClearBufferfv(incomplete framebuffer)
+
+WebGPU has no multisample capability for `rgba32float`, so `samples_2` and
+`samples_4` are plainly blocked. **`samples_1` looks servable and is not**, and
+the reason is worth knowing because it is not in this driver at all —
+`st_cb_texture.c` rewrites the request:
+
+    if (ctx->Const.MaxSamples > 1 && num_samples == 1) {
+       /* don't try num_samples = 1 with drivers that support real msaa */
+       num_samples = 2;
+    }
+    for (; num_samples <= MAX_SAMPLES; num_samples++)
+       if (screen->is_format_supported(..., num_samples, ...)) { found; break; }
+
+A one-sample "multisample" texture is an ordinary texture and this driver would
+create it happily, but st never asks: it bumps to two and searches *upward*, so
+a format that cannot be multisampled at all fails the whole search. The only
+way to be asked is to claim 4x for `rgba32float`, which hands st a framebuffer
+Dawn rejects at creation — an extension's worth of "silently absent effect".
+
+The measurement, if it needs redoing: `glGetInternalformativ` and
+`glTexStorage2DMultisample` are both absent from Mesa's non-glvnd libGL, so a
+probe that calls them directly dies at *load* with "undefined symbol" before
+printing anything. Resolve them through `eglGetProcAddress`.
+
+**What that hunt did turn up** is that `PIPE_BIND_BLENDABLE` was never handled:
+the constant appeared nowhere in the driver, so `bind & ~allowed` was non-zero
+for any query carrying it and every one was refused as "bad binds", whatever
+the format. st asks with that bit to decide whether a colour format may be
+blended, so `GL_FRAMEBUFFER_BLEND` reported NONE for `rgba8` as readily as for
+`rgba32f`. WebGPU blends every renderable format except the pure-integer ones,
+and the 32-bit float set with `Float32Blendable`, which the screen already
+records — the answer was available and nothing asked for it.
+
+No CTS family moves, because the families that blend do it into `rgba8` through
+paths that never ask. `gl44-float-blend-probe` is what makes the fix
+measurable: it checks the four non-integer formats report FULL, as llvmpipe
+does, and that 0.25 over 0.5 under `GL_ONE`/`GL_ONE` is 0.75 in an RGBA32F
+attachment — a value no 8-bit target holds exactly. Integer formats are left
+out of it on purpose: this driver reports NONE for them and llvmpipe reports
+FULL, so including them would make the probe differ from its reference for
+being the more accurate of the two.
