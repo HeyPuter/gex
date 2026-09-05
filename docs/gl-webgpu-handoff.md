@@ -17229,3 +17229,35 @@ on top of it.
 This is the third time in this file that a probe has agreed with a bug rather
 than caught it — the u_vbuf layouts, the two-sampler shadow probe, and now
 this. **Reproduce the defect with the probe before trusting the probe.**
+
+#### The same shape, twice more
+
+The persistent pool is one instance of a shape worth grepping for: a fixed
+array whose overflow path `return`s rather than fails. Two others were sized
+wrong for what goes into them.
+
+`gex_wgpu_dynamic_offsets` held `GEX_WGPU_MAX_CONSTANT_BUFFERS` entries, and
+the vertex group puts the draw parameters into it *as well as* every uniform
+block — one more than there are constant buffers. Overflowing is not a missing
+offset; it is a count that disagrees with the layout, which invalidates the
+bind group and every draw recorded with it. Only the device advertising fewer
+uniform buffers per stage than the driver's own maximum kept it from happening.
+
+`packed_copies` was `GEX_WGPU_MAX_SHADER_IMAGES`, but its bound is per *pass*
+rather than per draw and its entries are keyed by level and first layer as well
+as by buffer — so one pass that rebinds an image at several levels needs more
+entries than there are image units. Overflowing leaves an image's bytes
+uncopied.
+
+Neither has a reproducer. They are in because the third one did, and because
+the cost of the shape is not a crash but a picture that is quietly wrong.
+
+#### All six targets re-verified by picture (2026-09-05)
+
+Not by gate number. SuperTuxKart (kart, track, minimap, timer text),
+Blender 5.2 (full UI, viewport, every label), Blender EEVEE (shaded viewport),
+alacritty (95 colours, matching llvmpipe), Minecraft's title screen and a
+loaded world — the death screen with its text, buttons, hearts, hunger and
+hotbar, the save having spawned the player falling out of the world as it
+always does. FreeCAD and Krita were verified earlier in the session's history
+and are unchanged by this work.
