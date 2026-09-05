@@ -17386,3 +17386,93 @@ Profile) / 4.60`, `polygon-offset` 5/5 including `offset_clamp_rounds_away`,
 `persistent-buffers` 2/2, `shadow-border` and `fs-sampler-array` both passing —
 so the sampler-mask fix, the shadow border and the offset clamp are all good on
 the platform this actually ships to.
+
+### A shader does not know what topology it is used with
+
+Re-reading the offset-clamp change found a bug in it, and then the same bug
+somewhere older.
+
+GL offsets **polygons**. The fixed-function path has always known that — it
+sets `depthBias` only for a triangle topology, with a note that an application
+leaving `GL_POLYGON_OFFSET_FILL` enabled while drawing lines is ordinary. The
+new shader path did not: `gex_wgpu_offset_clamp_in_shader` asked about the
+rasterizer and the depth attachment and nothing about what was being drawn, so
+a line or point draw with a finite clamp set would have had the offset baked
+into its fragment variant and applied where GL applies none.
+
+Then the same question of `want_stipple`, which is much older:
+
+```c
+const bool want_stipple = ctx->rasterizer && ctx->rasterizer->poly_stipple &&
+                          ctx->poly_stipple_set;
+```
+
+`GL_POLYGON_STIPPLE` is context state, not per-draw, so a program that enables
+it and then draws lines is ordinary in exactly the same way — and those lines
+were being stippled. Both take the topology now.
+
+The general shape: **a fragment variant is keyed on state, and some state is
+only meaningful for some primitives.** Anything baked into a shader that GL
+scopes to polygons has to carry the topology into the decision, or the variant
+is correct for the draw that built it and wrong for the next one that finds it
+in the cache.
+
+Both probes needed care to be worth anything. The first version of the offset
+one drew a line along the quad's bottom edge and checked the pixel stayed red —
+which passes whenever the line simply misses that pixel. It has its own
+horizontal line through the centre of the viewport now, and an
+`offset_line_covers` case that proves the line reaches the sampled pixel before
+`offset_skips_lines` asserts anything about it. The stipple one draws its line
+along **row 1**, which the every-other-row pattern masks off for polygons, so
+the line vanishing is what a regression looks like rather than something to be
+inferred.
+
+### An image with no format, in a graphics stage
+
+The handoff's own survey of what was left named this: "about four of them are
+`writeonly uniform image2D` with no format qualifier in a *graphics* stage,
+which `gex_wgpu_resolve_unformatted_images` already serves for compute and
+could be extended to." Reading it out showed it is worse than four cases.
+
+GLSL permits `writeonly uniform image2D img;` with no `layout(rgba8)` on it,
+and GL then says the store converts to the **image unit's** format — the one
+`glBindImageTexture` named, not one the shader declared. WebGPU has no such
+thing: a storage texture binding carries a concrete format, and a shader that
+names none reaches SPIR-V with an `Unknown` format, which is a different
+capability and not one WGSL has.
+
+The compute path has resolved that from the bound unit since
+`shading_language_420pack` needed it — every one of that family's 329 cases
+writes its result through exactly this declaration. The graphics path never
+did, and it did not merely produce a wrong format: the collection **refuses the
+whole shader**, because a written image whose format WebGPU cannot represent is
+rejected, and an unformatted image has no format to represent yet. The compute
+collect has excluded that case since it was written; the graphics one did not.
+
+So a fragment shader with a format-less image did not link at all. It is the
+same fix as compute, in four places that all have to agree:
+
+- the collection records an `unformatted_images` mask and stops refusing;
+- `gex_wgpu_stage_image_format` resolves the format from the bound image view,
+  and is *shared* so the module, the layout and the view cannot disagree —
+  the bound-image view creation was a fourth site still using the declared
+  format, which would have named a different one from the layout;
+- the fragment variant is keyed on the resolved formats, since the emitter
+  takes an image's format from the variable;
+- and the format is written back onto that variable before SPIR-V.
+
+The other stages were traced before calling it done. The vertex bind-group
+layout has no image entries at all — a vertex shader that stores to an image is
+dispatched as compute for the side effects and rasterized with the stores
+stripped, so it goes through the path that already resolves. The emulated
+stages use the shared `gex_wgpu_stage_images`. What is left is the **capture
+variant** (`ctx->vs->capture_images`), which has no resolve: transform feedback
+from a vertex shader that also stores to a format-less image. Reusing the
+resolver there means generalising it from `gex_wgpu_compute_state *` to
+`gex_wgpu_stage_images *`, which is the obvious next step and wants its own
+test.
+
+`gl44-image-noformat-fs-probe` is the graphics counterpart of the compute one,
+with the same two cases: an `rgba8` unit and then an `r32f` unit through the
+*same shader*, which is what says the format came from the unit rather than
+from a guess.

@@ -10,24 +10,27 @@ was missing was everything that drives them.
 
 - `probe-suite.sh [name]` — build every `gl44-*-probe.c` and run it twice,
   once on llvmpipe and once on gex_wgpu, comparing the SUMMARY lines. With a
-  name, just that one. **113 of 116, and three DIFFs are expected**:
+  name, just that one. **Four DIFFs are expected**, and in two of them the
+  reference is the one that is wrong:
   `group-vote` (2/3 — the extension is claimed and conformant, but its
   invocation group is one invocation, so `all_mixed` answers true where
   llvmpipe's wider ballot answers false; the probe exists to say so), `quad`
   (gex passes 6/6 where llvmpipe passes 3/6 — the reference is the one
-  failing) and `texture-sampler` (sample-counts 1 vs 2). A fourth is a
-  regression.
+  failing), `texture-sampler` (sample-counts 1 vs 2), and
+  `image-noformat-fs` (gex 2/2, llvmpipe 1/2 — llvmpipe returns uninitialised
+  memory for a format-less image store to an r32f unit, and radeonsi agrees
+  with gex, which is the tie-breaker). A fifth is a regression.
 
   `stage-image` **used to be the fourth** and is no longer: it passes 4/4 as of
   2026-09-05, images now working in every stage including the vertex one. If it
   reappears in this list, that is a regression rather than the old expected
   failure.
 
-  `polygon-offset` is deliberately *not* among them. Its two clamp cases are
-  written out in a comment rather than run: this driver does not claim
-  ARB_polygon_offset_clamp and llvmpipe does, so running them would make the
-  probe differ on the case count, which is noise. Paste them back to re-check
-  whether the platform has learned the clamp.
+  `polygon-offset` **used to be** in that position and is no longer. Its clamp
+  cases were written out in a comment rather than run, because this driver did
+  not claim ARB_polygon_offset_clamp and llvmpipe did. The driver computes the
+  clamped offset in the fragment shader now and claims the extension, so all
+  seven cases run on both sides and agree.
 - `cts-gate.sh` — a few fast CTS families, chosen because they lean on the
   driver's *internal* buffers, which the probes barely touch. A buffer-growth
   regression once lived through the probe suite, SuperTuxKart and Blender for

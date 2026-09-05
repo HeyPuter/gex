@@ -108,8 +108,13 @@ int main(void) {
     }
     glViewport(0, 0, 32, 32);
 
-    static const float quad[8] = {
+    static const float quad[12] = {
         -1.0f, -1.0f,  1.0f, -1.0f,  -1.0f, 1.0f,  1.0f, 1.0f,
+        /* Vertices 4 and 5: a horizontal line along row 1 of the 32x32
+         * viewport -- an *odd* row, which the every-other-row pattern below
+         * masks off for polygons. A line is not a polygon, so it has to come
+         * through anyway. */
+        -1.0f, -1.0f + 3.0f / 32.0f,  1.0f, -1.0f + 3.0f / 32.0f,
     };
     GLuint position_buffer = 0;
     glGenBuffers(1, &position_buffer);
@@ -257,6 +262,33 @@ int main(void) {
         for (unsigned x = 0; x < 32; ++x)
             if (at(x, y) <= 128) { all_lit = 0; break; }
     result("disabled_draws_everything", all_lit);
+
+    /* GL stipples polygons, and GL_POLYGON_STIPPLE is context state rather
+     * than per-draw -- so a program that enables it and then draws lines is
+     * ordinary, and the lines must come through unstippled. The driver bakes
+     * the pattern into a fragment variant as a discard, and a shader does not
+     * know what topology it is being used with, so the decision has to carry
+     * the topology with it.
+     *
+     * Row 1 is masked off for polygons by the every-other-row pattern, which
+     * is what makes the line a discriminator rather than a coincidence: if
+     * the stipple reached it, the line would vanish. */
+    glEnable(GL_POLYGON_STIPPLE);
+    glPolygonStipple(rows);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_LINES, 4, 2);
+    memset(pixels, 0xAB, sizeof(pixels));
+    glReadPixels(0, 0, 32, 32, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    int line_drawn = glGetError() == GL_NO_ERROR;
+    unsigned lit_on_row1 = 0;
+    for (unsigned x = 0; x < 32; ++x)
+        if (at(x, 1) > 128) ++lit_on_row1;
+    fprintf(stderr, "INFO line_row1 lit=%u of 32\n", lit_on_row1);
+    /* Most of the row, not all of it: the endpoints are the rasterizer's
+     * business and this is not a line-coverage test. */
+    result("stipple_skips_lines", line_drawn && lit_on_row1 >= 24);
+    glDisable(GL_POLYGON_STIPPLE);
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);

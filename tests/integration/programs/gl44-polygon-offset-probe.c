@@ -127,9 +127,16 @@ int main(void) {
     GLuint vao = 0;
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
-    static const float quad[12] = {
+    static const float quad[16] = {
         -1.0f, -1.0f,  1.0f, -1.0f,  -1.0f, 1.0f,
          1.0f, -1.0f,  1.0f,  1.0f,  -1.0f, 1.0f,
+        /* Vertices 6 and 7: a horizontal line through the *centre* of row 4
+         * of the 8x8 viewport, which is the pixel every case here reads. Its
+         * own geometry rather than an edge of the quad, so that whether the
+         * line covers that pixel is not a question about rasterization rules
+         * -- and y = 0.125 rather than 0, because NDC zero lands exactly on
+         * the boundary between rows 3 and 4 and covered neither. */
+        -1.0f,  0.125f,  1.0f,  0.125f,
     };
     GLuint buffer = 0;
     glGenBuffers(1, &buffer);
@@ -217,6 +224,56 @@ int main(void) {
                 tests[i].name, tests[i].units, pixel[0], pixel[1], pixel[2],
                 tests[i].want_green ? "green" : "red", (unsigned)error);
         result(tests[i].name, ok);
+    }
+
+    /* GL offsets *polygons*. With GL_POLYGON_OFFSET_FILL enabled and the fill
+     * mode FILL, a LINE draw gets no offset at all -- and an application that
+     * leaves the enable on while drawing lines is ordinary, so this is not a
+     * corner. It is here because the driver computes a clamped offset in the
+     * fragment shader, and a shader does not know what topology it is being
+     * used with: the decision has to carry the topology with it, and the first
+     * version of that code did not. Without the clamp the fixed-function path
+     * refuses the topology on its own, so only the clamped case discriminates.
+     *
+     * Red at z = 0 first, then a line at the same z pulled by the same -8
+     * units. GL_LESS rejects equal depth, so the line must lose; if the
+     * offset were applied to it, it would win. */
+    if (have_clamp) {
+        /* First that the line covers the pixel at all. Without this the case
+         * below passes whenever the line misses -- a probe agreeing with the
+         * bug rather than catching it, which has happened here before. */
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(0.0f, 0.0f);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClearDepth(1.0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glUniform4f(colour_location, 0.0f, 1.0f, 0.0f, 1.0f);
+        glDrawArrays(GL_LINES, 6, 2);
+        unsigned char covered[4] = {0xAB, 0xAB, 0xAB, 0xAB};
+        glReadPixels(4, 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, covered);
+        fprintf(stderr, "INFO offset_line_covers got=%u,%u,%u want=green\n",
+                covered[0], covered[1], covered[2]);
+        result("offset_line_covers", covered[1] > 128 && covered[0] < 128);
+
+        /* Then that the offset leaves it alone. Red at z = 0, then the same
+         * line at the same z with a clamped pull of -8 units: GL_LESS rejects
+         * equal depth, and GL does not offset a line, so it must lose. */
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glUniform4f(colour_location, 1.0f, 0.0f, 0.0f, 1.0f);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        polygon_offset_clamp(0.0f, -8.0f, -1.0f);
+        glUniform4f(colour_location, 0.0f, 1.0f, 0.0f, 1.0f);
+        glDrawArrays(GL_LINES, 6, 2);
+
+        unsigned char pixel[4] = {0xAB, 0xAB, 0xAB, 0xAB};
+        glReadPixels(4, 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+        const GLenum error = glGetError();
+        const int red = pixel[0] > 128 && pixel[1] < 128;
+        fprintf(stderr, "INFO offset_skips_lines got=%u,%u,%u want=red "
+                "err=0x%04x\n", pixel[0], pixel[1], pixel[2],
+                (unsigned)error);
+        result("offset_skips_lines", error == GL_NO_ERROR && red);
     }
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
