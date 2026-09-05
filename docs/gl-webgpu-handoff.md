@@ -16457,3 +16457,70 @@ different disguise: a wall that names itself convincingly is still worth
 testing against what the driver can already do. A read-only vertex image, the
 thing I had said would be "expressible but unwanted", turns out to be the
 uninteresting case; the written one was reachable all along.
+
+### Packed images in the emulated stages, and a latch that aborted a run
+
+Images in every stage was not the end of it. `KHR-GL45.shading_language_420pack`
+declares one image uniform in every stage and uses it in one, and thirteen of
+its cases turned on that shape. Three separate things stood in the way, and the
+third was worth more than the other two.
+
+**An image a stage only declares should be dropped, not refused.** GLSL lets a
+program declare `uniform image2D` in every stage and touch it in one. In the
+stages that only declare it there is nothing for `nir_opt_access` to infer, so
+it arrives read *and* written with no format qualifier — a shape WebGPU grants
+only `r32ui`/`r32i`/`r32f`, so it classifies as a packed image and the stage
+refused it. Refusing killed the whole program for a variable nothing reads or
+writes. The emulated stages now run `nir_remove_dead_variables` over
+`nir_var_image` before collecting, and `nir_opt_access` after it — which no
+path here had ever run, though three comments already assumed something had.
+
+**Packed images work in the emulated stages now.** What is left after that pass
+is genuinely read and written, so the packed route is needed rather than
+avoided. Each emulated dispatch applies `gex_wgpu_apply_packed_images`
+(`MESA_SHADER_COMPUTE`, descriptor set 0 — the group they bind) and binds the
+header and data buffers through a new `gex_wgpu_bind_stage_packed_images`.
+`gex_wgpu_dispatch` flushes the copies back into the textures once its pass has
+ended, which is the one place every emulated stage passes through.
+
+The vertex stage takes the same route with `MESA_SHADER_VERTEX` and set 1, into
+the capture dispatch's group 1. **Both kinds have to go there**, and finding
+that out cost an attempt: a packed image is served through a storage *buffer*,
+so it looked as though the rasterising shader could write it itself. Tint has a
+second refusal for that:
+
+    var with 'storage' address space and 'read_write' access mode cannot be
+    used by vertex pipeline stage
+
+**The varying variant needed its own images**, and this was a real defect
+already shipped with vertex images rather than a new one: a vertex shader with
+an image *and* a geometry shader produced
+
+    the entry-point uses bindings in group 1 but [PipelineLayout] doesn't
+    have a BindGroupLayout for this index
+
+because the variant kept the vertex descriptor set while its dispatch provides
+only group 0. All five places that bind a varying variant go through
+`gex_wgpu_bind_varying_textures`, so the images went in there, with the views
+owned by the variant — each bind releases what the last one made — which is
+what kept the five callers free of lifetime handling. The *capture* variant is
+deliberately left at set 1, because that is the module the capture dispatch
+binds at group 1; making both the same was wrong and cost a run.
+
+**And the one that mattered most: a decline must not latch.** Eight of these
+cases want eleven storage buffers where the adapter gives ten — a packed image
+costs two — and the emulated stages all reported a dispatch that did not happen
+by calling `gex_fail`. That is right for a broken dispatch and wrong for one
+the device declined. The chain from there is the one already written beside
+`gex_decline`: `ctx->failed` sticks, the next map returns NULL, Mesa turns it
+into `GL_OUT_OF_MEMORY`, and the CTS **aborted the whole run** — 200 of 329
+cases, reported as `197/200`, which reads like a good score and is not a score
+at all. `gex_dispatch_gave_up` now tells the two apart at the eight sites that
+follow a dispatch.
+
+Measured: `shading_language_420pack` 314 → **319/329**, and all 329 run. The
+ten that remain are eight of that storage-buffer wall, `line_numbering`, and
+one more; the wall is real — `maxStorageBuffersPerShaderStage` is 10 on this
+adapter and the driver already asks for more. `tessellation_shader` holds at
+134/140 and `geometry_shader` at 124/136, which is what the two dispatches
+this touched most needed to show.
