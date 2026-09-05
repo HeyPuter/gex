@@ -52,6 +52,32 @@ static const char *vs_read =
     "  gl_Position = vec4(corners.at[gl_VertexID].xy, 0.0, 1.0);\n"
     "  tint = vec3(0.0, 1.0, 0.0);\n"
     "}\n";
+/* The same read, but through an *unsized* block that the shader also
+ * measures. length() needs the storage variable itself, so unlike an access
+ * through a sized block -- lowered to a load_ssbo carrying a block number,
+ * after which the variable is dead -- this one survives all the way to the
+ * SPIR-V emitter, carrying whatever access qualifier it was given.
+ *
+ * It is here because that looked like a gap and is not: a block reaching the
+ * emitter writable would be declared `var<storage, read_write>`, which WGSL
+ * forbids in the vertex stage, and inferring read-only from "nothing stores to
+ * it" seemed to be missing. Measured with the inference disabled, the WGSL for
+ * this shader already reads `var<storage, read>` -- Mesa sets the qualifier
+ * before the driver ever sees the shader. The inference was written twice and
+ * reverted twice; this case is what a third attempt should run first.
+ *
+ * `advanced-unsizedArrayLength-vs-*` in the CTS is this shape plus an output
+ * block the vertex shader writes, and those stay blocked on the write itself:
+ * a vertex-stage storage *write* is the real WGSL wall, and no qualifier
+ * inference reaches it. */
+static const char *vs_length =
+    "#version 430 core\n"
+    "layout(std430, binding = 0) buffer Corners { vec4 at[]; } corners;\n"
+    "out vec3 tint;\n"
+    "void main() {\n"
+    "  gl_Position = vec4(corners.at[gl_VertexID].xy, 0.0, 1.0);\n"
+    "  tint = vec3(0.0, corners.at.length() == 4 ? 1.0 : 0.0, 0.0);\n"
+    "}\n";
 static const char *fs_plain =
     "#version 430 core\n"
     "in vec3 tint;\n"
@@ -69,9 +95,9 @@ static const char *fs_write =
     "  colour = vec4(tint, 1.0);\n"
     "}\n";
 
-static GLuint build(const char *fs_src) {
+static GLuint build_vs(const char *vs_src, const char *fs_src) {
     struct { GLenum stage; const char *src; } parts[] = {
-        {GL_VERTEX_SHADER, vs_read}, {GL_FRAGMENT_SHADER, fs_src},
+        {GL_VERTEX_SHADER, vs_src}, {GL_FRAGMENT_SHADER, fs_src},
     };
     GLuint prog = glCreateProgram();
     for (unsigned i = 0; i < 2; ++i) {
@@ -103,6 +129,8 @@ static GLuint build(const char *fs_src) {
     }
     return prog;
 }
+
+static GLuint build(const char *fs_src) { return build_vs(vs_read, fs_src); }
 
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -204,6 +232,25 @@ int main(void) {
     fprintf(stderr, "INFO two_blocks hits=%u err=0x%04x\n", hits,
             (unsigned)error);
     result("two_blocks", prog2 && error == GL_NO_ERROR && hits > 0);
+
+    GLuint prog3 = build_vs(vs_length, fs_plain);
+    unsigned char lit[4] = {0}, unlit[4] = {0};
+    if (prog3) {
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(prog3);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glReadPixels(SIDE / 4, SIDE / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, lit);
+        glReadPixels(3 * SIDE / 4, SIDE / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                     unlit);
+    }
+    error = glGetError();
+    /* Green only if length() returned 4, and only on the left half, so this
+     * fails both when the block was not read and when it was not measured. */
+    fprintf(stderr, "INFO length lit=%u,%u,%u unlit=%u,%u,%u err=0x%04x\n",
+            lit[0], lit[1], lit[2], unlit[0], unlit[1], unlit[2],
+            (unsigned)error);
+    result("length", prog3 && error == GL_NO_ERROR && lit[1] > 128 &&
+                     unlit[1] < 64);
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
