@@ -6,12 +6,13 @@
  * the *linker* refused such a shader before the driver saw it -- invisibly, no
  * refusal anywhere in a driver log, because the refusal was Mesa's.
  *
- * The geometry stage is served now: it runs as a compute pass, where WebGPU
- * allows a writable storage texture, and it needed only the collection and the
- * binding. See the handoff document's "Images in the geometry stage".
+ * The geometry stage and both tessellation stages are served now: each runs as
+ * a compute pass, where WebGPU allows a writable storage texture, and each
+ * needed only the collection and the binding. See the handoff document's
+ * "Images in the geometry and tessellation stages".
  *
  * **This probe is still expected to DIFF, on the vertex case alone.** That is
- * what it is for: it says which of the two is blocked and which is not.
+ * what it is for: it says which stage is blocked and which are not.
  *
  *   `vertex`    platform-blocked, measured rather than assumed. With the cap
  *               raised the shader reaches Tint, which refuses it by name:
@@ -27,6 +28,9 @@
  *               whose format WebGPU has no storage texture for -- is still
  *               refused by name: it needs a buffer copied into and out of the
  *               texture around the pass, and this path has nowhere to do it.
+ *   `tess_control`, `tess_eval`
+ *               served as well, and for the same reason. A patch of one
+ *               vertex through isolines is the least that reaches both.
  *
  * Both draw a single point with no fragment output that matters, so nothing
  * the fragment stage does can supply the answer; the only route from the
@@ -81,11 +85,53 @@ static const char *gs_store =
     "  EndPrimitive();\n"
     "}\n";
 
-static GLuint build(const char *vs, const char *gs) {
-    struct { GLenum stage; const char *src; const char *what; } parts[3];
+/* A tessellated patch of one vertex, which is the least that reaches both
+ * tessellation stages. isolines keeps the levels to two numbers. */
+static const char *tcs_plain =
+    "#version 400 core\n"
+    "layout(vertices = 1) out;\n"
+    "void main() {\n"
+    "  gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0;\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "}\n";
+static const char *tcs_store =
+    "#version 400 core\n"
+    "#extension GL_ARB_shader_image_load_store : require\n"
+    "layout(vertices = 1) out;\n"
+    "layout(rgba8) writeonly uniform image2D img;\n"
+    "void main() {\n"
+    "  imageStore(img, ivec2(1, 1), vec4(0.75, 0.5, 0.25, 1.0));\n"
+    "  gl_TessLevelOuter[0] = 1.0; gl_TessLevelOuter[1] = 1.0;\n"
+    "  gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+    "}\n";
+static const char *tes_plain =
+    "#version 400 core\n"
+    "layout(isolines, equal_spacing) in;\n"
+    "void main() { gl_Position = gl_in[0].gl_Position; }\n";
+static const char *tes_store =
+    "#version 400 core\n"
+    "#extension GL_ARB_shader_image_load_store : require\n"
+    "layout(isolines, equal_spacing) in;\n"
+    "layout(rgba8) writeonly uniform image2D img;\n"
+    "void main() {\n"
+    "  imageStore(img, ivec2(1, 1), vec4(0.75, 0.5, 0.25, 1.0));\n"
+    "  gl_Position = gl_in[0].gl_Position;\n"
+    "}\n";
+
+static GLuint build(const char *vs, const char *tcs, const char *tes,
+                    const char *gs) {
+    struct { GLenum stage; const char *src; const char *what; } parts[5];
     unsigned n = 0;
     parts[n].stage = GL_VERTEX_SHADER;   parts[n].src = vs;
     parts[n].what = "vs"; ++n;
+    if (tcs) {
+        parts[n].stage = GL_TESS_CONTROL_SHADER; parts[n].src = tcs;
+        parts[n].what = "tcs"; ++n;
+    }
+    if (tes) {
+        parts[n].stage = GL_TESS_EVALUATION_SHADER; parts[n].src = tes;
+        parts[n].what = "tes"; ++n;
+    }
     if (gs) {
         parts[n].stage = GL_GEOMETRY_SHADER; parts[n].src = gs;
         parts[n].what = "gs"; ++n;
@@ -132,7 +178,7 @@ static GLuint build(const char *vs, const char *gs) {
 
 /* Draw one point with the store in the named stage, then read the image's
  * texel (1,1) back. Returns the red channel, or -1 on any GL error. */
-static int run(GLuint prog, const char *what) {
+static int run(GLuint prog, const char *what, int patches) {
     if (!prog) return -1;
     GLuint tex = 0;
     glGenTextures(1, &tex);
@@ -144,7 +190,12 @@ static int run(GLuint prog, const char *what) {
     glBindImageTexture(0, tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glUseProgram(prog);
     glUniform1i(glGetUniformLocation(prog, "img"), 0);
-    glDrawArrays(GL_POINTS, 0, 1);
+    if (patches) {
+        glPatchParameteri(GL_PATCH_VERTICES, 1);
+        glDrawArrays(GL_PATCHES, 0, 1);
+    } else {
+        glDrawArrays(GL_POINTS, 0, 1);
+    }
     glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
 
     unsigned char texels[SIDE * SIDE * 4] = {0};
@@ -171,7 +222,8 @@ int main(void) {
     if (!eglChooseConfig(display, config_attributes, &config, 1, &config_count)
         || config_count < 1) return 2;
     const EGLint context_attributes[] = {
-        EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3, EGL_NONE,
+        /* 4.0 at least: the tessellation cases declare #version 400. */
+        EGL_CONTEXT_MAJOR_VERSION, 4, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE,
     };
     const EGLint surface_attributes[] = {EGL_WIDTH, 8, EGL_HEIGHT, 8, EGL_NONE};
     EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT,
@@ -204,11 +256,20 @@ int main(void) {
     glBindVertexArray(vao);
 
     /* 0.75 in an 8-bit unorm is 191. */
-    const int from_vertex = run(build(vs_store, NULL), "vertex");
+    const int from_vertex = run(build(vs_store, NULL, NULL, NULL), "vertex", 0);
     result("vertex", from_vertex >= 187 && from_vertex <= 195);
 
-    const int from_geometry = run(build(vs_plain, gs_store), "geometry");
+    const int from_geometry =
+        run(build(vs_plain, NULL, NULL, gs_store), "geometry", 0);
     result("geometry", from_geometry >= 187 && from_geometry <= 195);
+
+    const int from_tcs =
+        run(build(vs_plain, tcs_store, tes_plain, NULL), "tess_control", 1);
+    result("tess_control", from_tcs >= 187 && from_tcs <= 195);
+
+    const int from_tes =
+        run(build(vs_plain, tcs_plain, tes_store, NULL), "tess_eval", 1);
+    result("tess_eval", from_tes >= 187 && from_tes <= 195);
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);

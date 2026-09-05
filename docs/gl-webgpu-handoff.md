@@ -16353,7 +16353,7 @@ by `vertex_buffer_index`, which is validated only against
 buffer slot 8 or above wrote past the end of a stack array. Deleting the check
 removed that too.
 
-## Images in the geometry stage
+## Images in the geometry and tessellation stages
 
 GL 4.2's `ARB_shader_image_load_store` puts image uniforms in every stage. This
 driver served the fragment and compute paths, and reported
@@ -16397,15 +16397,25 @@ and none of them names an image. `gl44-stage-image-probe`'s `geometry` case
 reads back `191,128,64` for a store of `(0.75, 0.5, 0.25)`, which is the
 statement worth having.
 
-Measured: `shading_language_420pack` 309 → **311/329**, `geometry_shader`
-123 → **124/136**. Modest on purpose — most of the image-outside-fragment class
-is the *vertex* stage, which is blocked below and is not what this reaches.
+Measured: `shading_language_420pack` 309 → **314/329** across all three
+emulated stages, `geometry_shader` 123 → **124/136**. Modest on purpose — much
+of the image-outside-fragment class is the *vertex* stage, which is blocked
+below and is not what this reaches. `gl44-stage-image-probe` now runs four
+cases and gex passes three; llvmpipe passes four.
 
 **What is still refused, and why.** A *packed* geometry image — one whose
 format WebGPU has no storage texture for — needs a storage buffer copied into
 and out of the texture around the pass, and this path has nowhere to do that.
-It is refused by name. Tessellation images are likewise still uncollected; the
-same three helpers would serve them, and the work is the dispatch wiring.
+It is refused by name.
+
+Both tessellation stages followed immediately, and cost almost nothing once the
+three helpers existed: the same collection after `lower_gallium_ubos`, the same
+`descriptor_set = 0`, the same binder into the dispatch's group zero, and the
+same two caps. Together the three emulated stages take
+`shading_language_420pack` from 309 to **314/329** — the geometry stage two
+cases, tessellation three — and `tessellation_shader` from 132 to **134/140**,
+which was run as the regression check on the two dispatches this touched and
+came back better rather than merely unbroken.
 
 The vertex stage stays at zero on purpose: Tint refuses a write-access storage
 texture there by name — *storage texture with 'write' access mode cannot be
