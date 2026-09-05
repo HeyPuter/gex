@@ -15973,5 +15973,47 @@ evaluation), and it consumes generic varying slots, which is the layout STK,
 Minecraft and Blender all depend on. Weigh that against eight cases of
 something applications almost never do.
 
-The rest of `cull_distance`'s 73 failures are silent value mismatches rather
-than refusals, so the whole family is not one cause.
+### The other 65 are two causes, both located
+
+They are silent — no refusal, no validation error — but they are not
+unstructured. Grouping the failures by the CTS's own test items shows a clean
+split: **items 5 and 6 fail in all three primitive modes and items 2, 3, 4 and
+7 pass in all of them**. Reading `glcCullDistance.cpp`'s item table says what
+that means — item 5 sets `use_passthrough_gs`, item 6 sets
+`use_passthrough_ts`. So it is 48 cases of one thing: **cull distances do not
+survive the compute-emulated geometry and tessellation stages.**
+
+`GEX_WGPU_CULL_TRACE` locates it exactly. For item 4 it prints a full trace and
+the culling is right:
+
+    gex-cull: enter vs=... cull=4 orig=... mode=4 count=432
+    gex-cull: captured record=48 clip_offset=16 clip=4 cull=4
+    gex-cull: prim 2 culled=1 dists: c0.250 ... k-0.250 ...
+
+For item 5 it prints **nothing at all**. The filter is never entered, because
+the draw path gates it on `ctx->vs->cull_distances` and the draw that
+rasterizes a geometry shader's output comes back through that path with the
+*passthrough* shader bound. `gex_wgpu_create_shader_state` takes that count
+from the shader's own `info`, and the passthrough is generated, so its info
+says zero however many distances the stage it stands in for produced. The
+distances are computed, carried through the capture, handed to the rasterizer,
+and nothing ever culls on them.
+
+**That is only the first half.** Copying `clip_distance_array_size` and
+`cull_distance_array_size` from the geometry (or tessellation evaluation)
+shader onto the passthrough's info before `gex_wgpu_create_shader_state` does
+make the filter run — and it then reads **all eight distances as zero**, so the
+family stays at 145/218 exactly. Tried and reverted on 2026-09-05, because a
+change that fixes nothing is not worth carrying.
+
+The second half is where the values are lost between the geometry stage's
+outputs and the passthrough's. The suspect is the shape the vertex path already
+had to be taught: Mesa merges clip and cull into **one variable at
+`VARYING_SLOT_CLIP_DIST0` holding all eight floats**, which is two 16-byte
+slots, while `gex_wgpu_gs_passthrough_nir` declares a clip slot as
+`array<float, 4>` — one slot. Confirm that before writing code: dump
+`gs->outputs` and check whether the merged array arrives as one location or
+two, and whether the capture writes 32 bytes for it or 16. See
+[[merged-clip-cull-array-spans-two-slots]] for the same defect in the vertex
+path, and [[zero-means-nobody-wrote]] — an all-zero read is the signature of a
+slot nobody filled, not of arithmetic going wrong.
