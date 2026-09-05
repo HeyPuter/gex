@@ -34,6 +34,13 @@ was missing was everything that drives them.
   colour-attachment byte budget.
 - `app-minecraft.sh <driver> <out.png> [seconds]` — Minecraft 26.2, which
   needs a GL 4.4 context and so is the widest single statement available.
+- `app-alacritty.sh <out.png> [settle]` — alacritty against llvmpipe on the
+  same display, compared by distinct colour count (95 vs 95 healthy, 2 when
+  glyphs are missing). It is here because it is the only app that hands the
+  driver a non-dense vertex layout: u_vbuf reserves a translate slot per step
+  mode, and alacritty's per-instance three-byte colour leaves the per-vertex
+  one unreferenced. No probe can reproduce that — st compacts the binding
+  numbers a GL program asks for — so this gate is the regression test.
 - `app-compare-top.sh <results.tsv> [count] [outdir]` — re-measure the worst
   rows of a `tests/gl-app-compare.sh` run with both extra references. The cheap
   sweep reports one number and one number cannot tell a driver defect from an
