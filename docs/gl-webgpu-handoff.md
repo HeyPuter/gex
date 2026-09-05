@@ -15604,3 +15604,37 @@ took three goes to get right, each failure teaching something different:
 **16 of 51**, and the capability is the point -- an image array is how a
 renderer addresses its mip chain or its G-buffer.
 
+## Buffer textures narrower than a word
+
+A `samplerBuffer` is not a texture here at all -- WebGPU has no texel buffer --
+so the driver binds the buffer as a read-only storage buffer and lowers
+`texelFetch` to word loads. That made the *word* the unit, and only the
+32-bit-per-component formats could be served. GL's table of required
+buffer-texture formats has three widths, and the narrow ones are exactly what
+an application reaches for: a palette, an index list, packed attributes.
+
+The per-slot key was a word count. It is a **texel format code** now -- an
+index into a table of (components, bits, kind) -- which changed nothing about
+the variant machinery, because that key is compared with `memcmp` and never
+read. Only the lowering and the two "is this format servable" tests knew what
+the byte meant.
+
+The unpacking itself is arithmetic on the containing word: the texel's *byte*
+offset picks both the word and the shift inside it, and the kind decides how
+the bits become a value. R8UI and R8 are the same byte read as 255 or as 1.0;
+sign extension is what separates -2 from 65534.
+
+Two things behind it:
+
+- **A half float cannot go through NIR.** `nir_unpack_half_2x16` and every
+  other route end in a 16-bit type, and Tint's SPIR-V reader has none --
+  "unhandled integer width: 16". `gex_wgpu_small_float_to_float` already
+  existed for exactly this, for EEVEE's r16f images, and carries the
+  reasoning; this is its third caller.
+- **A storage binding's size must be a multiple of four**, and five R8 texels
+  is five bytes. Rounding up is safe because every allocation is 16-aligned.
+
+`direct_state_access` **288 -> 306 of 371**, with its error count halved twice
+over: the integer-resolve refusal and the attribute signedness fix took it from
+about 180 to 92.
+
