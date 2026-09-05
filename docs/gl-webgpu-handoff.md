@@ -15024,14 +15024,129 @@ before the emitter. Three things make that work rather than merely run:
 *pass rate did not move* -- those cases fail for other reasons too -- and that
 is worth stating rather than quietly folding into a headline number.
 
-### Where it stops, and why
+### The three constructs an ALU lowering cannot reach
 
-97 link failures remain, and some are now **float** rather than integer:
-`unhandled float width: 64`. The driver cannot sweep those the way it sweeps
-integers: re-running `nir_lower_doubles` needs the software fp64 shader, and
-that lives in st as `ctx->SoftFP64`, not here. Building one with
-`glsl_float64_funcs_to_nir` is the route if it is worth taking.
+That first sweep left 97 link failures, and my note here said some of them were
+now *float* rather than integer -- that `nir_lower_doubles` would have to be
+re-run from a software fp64 shader the driver does not have. **That was wrong,
+and counting said so.** Grouping the surviving 64-bit values in the rejected
+shaders by type gave one case with an f64 and a hundred with an i64: the
+dominant problem was the kind the driver *can* sweep, and the sweep was missing
+it. The instrument was a `GEX_WGPU_INT64_LOG` that prints every 64-bit
+construct left at the end of the sweep -- and then, for a surviving ALU
+instruction, what consumes it, which is what turned each round into a name.
 
-`fp64.varyings` is separate and smaller: a `double` on an interface variable,
-which no operation lowering can reach -- it needs the varying split into two
-32-bit halves across the stage boundary.
+`nir_lower_int64` rewrites **operations**. Three things in a NIR shader carry a
+bit size without being one, so no amount of re-running it reaches them, and
+each reaches the emitter as a 64-bit type Tint refuses outright:
+
+- **A register.** The consumers said `store_reg`, and ntv gives every register
+  an `OpVariable` in the Function storage class -- so a 64-bit one is the
+  `OpTypePointer Function %ulong` in the disassembly. `nir_lower_int64` only
+  rewrites SSA defs, and a register is not one.
+- **A phi.** Putting the shader back into SSA turned those registers into
+  phis, and a phi merging two 64-bit values stays 64-bit.
+  `nir_lower_64bit_phis` splits each into a pair of 32-bit phis; it belongs
+  *inside* the optimiser loop, because its sources are unpacks of the packs the
+  lowering leaves behind and only the fold cancels the two.
+- **An undef.** The last survivor was an `OpUndef %ulong` read by an
+  `unpack_64_2x32_split` -- which is what kept it alive through DCE. Rebuilt as
+  a pack of two 32-bit undefs it says the same thing in a type the emitter can
+  spell, and the same fold removes it.
+
+**The register form is borrowed, not discarded.** `nir_to_spirv` has no case
+for a phi -- it asserts -- so a shader reaches it out of SSA, which is why the
+64-bit values were in registers to begin with. Taking them out of that form is
+only for the length of the lowering; the sweep ends with `nir_convert_from_ssa`
+and hands the emitter back what it requires. Skipping that step swapped one
+crash for another, in the same case, which is the clearest possible statement
+that the conversion was load-bearing.
+
+`gpu_shader_fp64` went **558/659 to 657/659**. The two that remain are not
+64-bit problems at all: `named_uniform_blocks` wants a geometry shader after
+tessellation, and `fp64.varyings` wants a `double` on an interface variable
+split into two 32-bit halves across the stage boundary -- a construct that is
+not an operation either, but one that lives in the linker rather than here.
+
+## Three refusals in a row, and 261 cases behind them
+
+`shading_language_420pack` sat at 48 of 329 for a long time, and the reason it
+never moved is worth more than the number: **its whole failure was three
+refusals stacked on one another, and lifting any two of them changes nothing.**
+The first pass lifted one and the score stayed at 48 exactly. That is the
+expected shape, not a disappointment -- but it is only readable if you know to
+look for the next refusal instead of concluding the first was not the cause.
+
+What made this family a single lever is how its harness is built. Every case
+runs `testDrawArray` twice and `testCompute` once, and `testDrawArray` links
+**vertex, tessellation control, tessellation evaluation, geometry and
+fragment** with a sampler in each. So all 329 cases exercise the same five-stage
+program, whatever the case is nominally about -- and 250 of them additionally
+write their result through `writeonly uniform image2D`. Reading the CTS source
+was what turned "281 failures" into "one shape".
+
+**A caution that cost a wrong count here.** Most decline messages carry a
+`static bool said`, so they print *once per process* and the whole family runs
+in one process. One occurrence in the log does not mean one case. The
+format-none refusal was countable at 250 only because it is printed per shader
+at creation; the tessellation decline showed up once and covered all 329.
+
+The three, in the order they surfaced:
+
+**An image with no format qualifier.** GLSL permits `writeonly uniform image2D`
+with no `layout(...)` on it, and GL then converts the store to the *image
+unit's* format. WebGPU's storage texture binding carries a concrete format, so
+the driver refused the shader. But the format is not unknown -- it is bound
+state, exactly like a buffer texture's texel width, and the compute path
+already has the machinery for that: no base module, one variant per resolved
+configuration. Resolving the bound `pipe_image_view::format` at the top of the
+dispatch, keying the variant on it and stamping it back onto the NIR variable
+is the whole fix. An unbound unit resolves to rgba8, because GL says its stores
+are discarded and the stand-in view is that already; a bound format WebGPU
+cannot store is declined by name rather than approximated.
+
+**A geometry shader after tessellation.** The tessellated draw ends by
+rebinding a passthrough vertex shader over the tessellated mesh and re-entering
+`draw_vbo`, and it already cleared `ctx->tcs` and `ctx->tes` before doing so --
+so the geometry path, which sits immediately below the tessellation check in
+that function, would have taken the draw if it had ever been allowed to reach
+it. The refusal was older than the machinery that made it unnecessary. The one
+thing that did need saying is which stage transform feedback records: with a
+geometry shader bound *it* is the last stage before rasterization, so the
+evaluation shader's capture and its `PRIMITIVES_GENERATED` count are skipped and
+the geometry path's own are used. Doing both would have recorded the wrong
+stage and counted it twice.
+
+**A vertex shader that samples, in a capture pass.** Both emulated stages run
+the vertex shader as a compute pass to capture its varyings, and that pass
+declined any vertex shader with a texture. The comment on the refusal already
+named the fix -- "the variant's textures remapped into group zero and bound by
+the dispatch" -- and the reason it was real: the combined-sampler split stamps
+a *vertex* shader's texture into descriptor set 3, a dispatch has only group
+zero, and a pipeline using a group with no layout is invalid, which loses the
+whole command buffer rather than one draw. The variant already sets
+`info.stage = MESA_SHADER_COMPUTE`, so it need only renumber the texture and
+sampler variables with the same arithmetic the split uses for a compute stage,
+collect them with `gex_wgpu_collect_stage_textures`, and bind them from the
+vertex stage's own sampler state at each of the five dispatch sites.
+
+48 -> 309 of 329.
+
+### A uniform buffer is padded to 16, and the buffer must cover it
+
+One real device error surfaced behind the three: a 12-byte buffer bound to a
+uniform block, where WebGPU rounds the binding size up to 16 and then refuses
+the buffer for not covering it. Buffers *created* as constant buffers were
+already padded; a GL buffer object is retargetable, so one made as an array
+buffer and bound to a uniform block later was not. Every buffer allocation is
+now 16-aligned -- the same reasoning the usage union already used -- and the
+binding size is rounded up and clamped to what the allocation holds.
+
+### What is left in this family
+
+20 cases, and 19 of them are one missing feature: **images in the stages that
+are not compute.** `binding_image_single_stage_vertex`, the four
+`binding_images_texture_type_*` shapes and the rest all bind an image to the
+vertex, tessellation or geometry stage, which this driver serves nowhere but
+the fragment and compute paths. That is the next lever here, and it is a
+feature rather than a refusal to lift.
