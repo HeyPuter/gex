@@ -17178,3 +17178,54 @@ the right place for it rather than each caller.
 The general shape is worth keeping in mind when widening any of these
 predicates: **the code a narrow condition was protecting has not been tested
 against the cases the wider one lets through.** Run the gate.
+
+### Minecraft's title screen had no panorama and no text
+
+The Minecraft gate settles on the *mean*, and it had stopped settling: mean 29
+for its whole budget where the reference is ~40. Looking at the frame rather
+than the number showed why — the logo, the buttons and the three account icons
+were drawn, and the panorama, every button label, the splash, the version and
+the copyright line were simply absent. `GEX_MC_SYSTEM=1` gives the reference
+picture on llvmpipe, and it has all of them.
+
+It was **not** a regression from this session's work: rebuilding the driver at
+the pre-session commit gave the identical mean 29 / 171 colours. It had been
+wrong for as long as anyone had been reading the number instead of the picture.
+
+The log had said so all along, once:
+
+    gex-wgpu: more than 8 persistent buffer mappings; the rest are not kept
+    coherent
+
+`ARB_buffer_storage` lets an application keep a buffer mapped while it draws
+from it and write through the pointer with no further API call. WebGPU has
+nothing of the kind, so the driver shadows such a buffer and uploads it before
+each submit — and it tracked the mappings in `struct pipe_resource
+*persistent[8]`. Everything past the eighth was silently not kept coherent:
+its writes never reached the device, and every draw from it read whatever the
+buffer held when it was created. Minecraft's GUI draws from a pool of them, so
+which elements survived was down to which slot their buffer happened to land
+in. The array grows now.
+
+The causal link was proved on the application before the probe existed, by
+capping the new array back down and re-running: mean 41 uncapped, mean 29
+capped, same binary.
+
+#### The probe that agreed with the bug
+
+`gl44-persistent-buffers-probe` maps N coherent buffers, writes through every
+mapping twice and draws one point from each. At N=16 it passed *with the defect
+present* — because the tracking array grows in powers of two from sixteen, so
+sixteen mappings never reach the limit. The number that matters is not the
+eight in the original declaration but whatever the implementation would settle
+on, and a probe has to exceed that. At N=40 the defect is unmistakable:
+
+    round1: 0 102 103 104 105 106 107 108 0 0 0 0 0 …
+
+slots one to seven carry their values, everything from the eighth on reads
+zero, and slot zero reads zero too because every untracked point drew at x = 0
+on top of it.
+
+This is the third time in this file that a probe has agreed with a bug rather
+than caught it — the u_vbuf layouts, the two-sampler shadow probe, and now
+this. **Reproduce the defect with the probe before trusting the probe.**
