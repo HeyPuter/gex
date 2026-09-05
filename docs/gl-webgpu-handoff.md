@@ -16656,3 +16656,46 @@ merely slow this suite down; it changes what the numbers mean. `pgrep -xc`
 prints `0` *and* exits non-zero, so the usual `$(pgrep -xc foo || echo 0)`
 yields `0\n0` and every equality test against `0` fails forever. Check
 `ps -eo args | grep -c '[g]lcts'` before believing a family total.
+
+### What is left in KHR-GL45.geometry_shader
+
+124/136 on an idle machine: **nine** failures and three NotSupported, which is
+worth stating because 136 − 124 is twelve and only nine of them are ours.
+Grouped by cause rather than listed, since the grouping is the useful part:
+
+**Multisampled array textures — platform-blocked (3 confirmed).**
+`layered_fbo.layered_fbo`, `layered_fbo.layered_fbo_attachments` and
+`layered_rendering.layered_rendering` all die in
+`glTexStorage3DMultisample(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, …)` with
+`GL_INVALID_OPERATION`. WebGPU has no multisampled array texture at any sample
+count. The tempting escape is that the test asks for **one** sample, which is
+an ordinary array texture — but st never asks the driver at one sample: it
+rewrites 1 to 2 whenever `MaxSamples > 1` and searches upward. That rewrite is
+already written up under `st-bumps-one-sample-to-two`, and the only way to be
+asked at one sample is to claim 4x, which hands st a framebuffer Dawn rejects.
+So there is no third option here.
+
+Three more layered cases — `layered_rendering_boundary_condition`,
+`layered_rendering_fbo_no_attachment` and `layered_framebuffer.stencil_support`
+— fail on data rather than on an API error and have not been separated from
+that group by evidence; two of them report only `Fail (Fail)`.
+
+**An integer texture sampled in the geometry stage (2).**
+`limits.max_texture_units` and `limits.max_combined_texture_units` fail at
+program creation with
+
+    Tint rejected SPIR-V: error: sampled image must have float component type
+
+The driver handles integer sampled textures through
+`gex_wgpu_lower_texture_variant`, which the fragment, vertex and compute paths
+all run and the compute-emulated stages do not. It is not a small omission:
+that lowering depends on the *bound* sampler state — filters, wrap modes,
+border colour, view target — so wiring it into the geometry stage means that
+stage's module becomes a per-sampler-state variant, as the fragment shader's
+already is. Worth knowing before starting: this is a structural change, not a
+missing call.
+
+**One data mismatch at the maximum (1).** `limits.max_output_components`
+reports `Fail (Fail)` with no driver message at all — the same shape as
+tessellation's `max_in_out_attributes`, and plausibly the same underlying
+question about what happens at the ceiling of the varying limits.
