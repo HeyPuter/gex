@@ -17476,3 +17476,26 @@ test.
 with the same two cases: an `rgba8` unit and then an `r32f` unit through the
 *same shader*, which is what says the format came from the unit rather than
 from a guess.
+
+### The app sweep at GL 4.6: 337 programs, no difference
+
+Re-run against the driver that reports 4.6, because a version bump is exactly
+the change an application can see — programs check `GL_VERSION` and take
+different paths on it.
+
+    337 programs
+    differs from llvmpipe: 0
+    287 RAN   24 EXIT   16 OK   6 CRASH   3 HARNESS
+
+Zero, where the previous run had one (`eglinfo`, and that one favoured us). The
+six crashes are shared with the reference — which is what "differs: 0" means
+here, since the sweep compares each program's verdict against llvmpipe's rather
+than judging it alone.
+
+Two things this does and does not say. It **does** say that raising the version
+ceiling to 4.6 cost nothing across every GL program installed on this machine.
+It does **not** say the pictures are right: the sweep classifies verdicts
+(OK/RAN/CRASH/REFUSED), so a wrongly-stippled line or a missing panorama passes
+it unnoticed — which is exactly how Minecraft's title screen stayed broken. The
+target applications are checked by opening their frames, and that is a separate
+instrument for a separate question.
