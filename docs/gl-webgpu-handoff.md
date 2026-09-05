@@ -15546,6 +15546,25 @@ direction, and the gate now says so rather than implying otherwise. Every
 context that does reach it prints at least the startup format queries, so zero
 is unambiguous.
 
+All three were then chased down, because a marker nobody explains becomes a
+suspected driver bug on the next reading. **None of them is one:**
+
+- **dolphin-emu** runs perfectly well — its window comes up and reports
+  *"Dolphin could not find any GameCube/Wii ISOs or WADs … 0 game(s) in your
+  collection"*. With no ROM it never starts emulation, and it is emulation that
+  creates the GL context. Testing it properly needs a game image, which this
+  machine does not have.
+- **aseprite** links `libGL`/`libEGL` and puts its window up, but creates no
+  context: its GPU acceleration is off by default and it draws through a
+  software renderer.
+- **hello_xr** never gets as far as graphics at all —
+  *"Failed to find default runtime with RuntimeInterface::LoadRuntime()"* —
+  and then dumps core. It wants an OpenXR runtime, not a GL driver.
+
+So the candidate gate genuinely tests six applications, not nine, and the three
+it cannot test would each need something the machine does not have rather than
+anything from the driver.
+
 ## es_31_compatibility: 235 of 355, and what the gap is made of
 
 The largest remaining family gap, grouped:
