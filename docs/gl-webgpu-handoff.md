@@ -16604,9 +16604,22 @@ whole dispatch. `gex_wgpu_tess_primitive_id` wraps it against a new parameter
 that is zero for a non-instanced draw, where the two coincide.
 
 `tessellation_shader` 137 → **139/140**, measured on an idle machine. The one
-left is `max_in_out_attributes`, which produces wrong data at the maximum
-attribute count with no driver message at all — a separate question from this
-one, and the only failure that family has left.
+left is `max_in_out_attributes`, and it is worth knowing that **the reference
+never runs it**:
+
+    NotSupported (GL_MAX_TESS_EVALUATION_OUTPUT_COMPONENTS >
+                  GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS)
+
+llvmpipe skips because its evaluation stage can output more components than
+its transform feedback can capture. Ours cannot: both numbers are 64, because
+both are `GEX_WGPU_MAX_RASTER_VARYINGS * 4` and both are honest — 16 vec4 slots
+is what the rasterized interface carries and what the feedback buffer holds.
+Equal fails the test's `>`, so the case runs here and captures 64 components of
+evaluation-shader output, which comes back wrong with no driver message.
+
+That is a genuine defect of ours rather than a reference divergence, and it is
+the only one left in the family. It is also at the exact ceiling of two limits
+at once, which is why nothing else has ever reached it.
 
 A caution about how that number was arrived at. Three earlier measurements of
 this family were taken while **four CTS runs were competing for one GPU** —
