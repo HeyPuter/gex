@@ -17332,3 +17332,57 @@ This is the shape of every extension claimed for the first time: the value an
 application is newly allowed to pass reaches a validator that never saw it
 before. The CTS case that catches it only becomes *runnable* once the extension
 is claimed, so it cannot have been passing beforehand.
+
+### The browser, where the same shape was waiting one layer down
+
+`web/dist` was two days old, which is the recorded trap — a stale bundle once
+had the browser reporting GL 4.0 against a native 4.4. Rebuilding the wasm Mesa
+and the assets and running the driver's own probes through a real browser found
+two more defects, both on the guest side.
+
+**The clamp had no way across.** With GL 4.6 reported, `glPolygonOffsetClamp`
+is core, and the guest exported nothing for it. A new opcode carries it —
+appended as 241 rather than inserted, because the number is shared by *four*
+tables (`gexgl.h`, `proto.rs`, `gl-proto.js`, and the replay host's own enum)
+and anything but appending renumbers a protocol both sides have already been
+built against. That is what the old note beside `caps->polygon_offset_clamp`
+was worried about, and appending answers it. The generated alias and extension
+tables picked up the `EXT` spelling by themselves once the base function
+existed.
+
+On the host it has to go through `_mesa_glapi_get_proc_address`, as that file's
+other extension entry points already do. Mesa exposes an extension entry point
+through GetProcAddress rather than as a linkable symbol — even the native
+`libGL.so` does not export this one — so calling it by name linked
+**Emscripten's WebGL implementation** instead, and the first draw that used it
+threw `Cannot read properties of undefined (reading 'extPolygonOffsetClamp')`.
+A GL call in this host that resolves to Emscripten's `-lGL` rather than to
+Mesa's dispatch is a whole class of mistake worth watching for.
+
+**And the coherent flush was losing most of a pool.** `gexgl_flush_coherent_maps`
+uploads a persistent mapping with `glBufferSubData`, which names a *target*, and
+it skipped any mapping not currently bound to one:
+
+```c
+if (!target) continue;
+```
+
+A pool of persistent buffers has only the one it drew from last still bound, so
+every other buffer in it went unsent. Worse, the shadow was updated *before*
+that check, so a buffer that missed its one chance never recovered — the next
+diff found nothing to send. An unbound mapping borrows `GL_COPY_WRITE_BUFFER`
+for the upload now and the previous binding is put back, and the shadow is
+updated only after the send.
+
+**This is the third instance of one shape in a day**: `persistent[8]` in the
+driver, `if (!target) continue` in the guest, and the two fixed arrays beside
+them. A container or a precondition that quietly drops an application's write
+does not fail — it produces a picture that is wrong in a way no log mentions.
+`gl44-persistent-buffers-probe`, written for the native bug, read 40 zeros in
+the browser against 1..40 natively and caught this one for free.
+
+Verified in a real browser afterwards: `negotiated desktop GL 4.6 … 4.6 (Core
+Profile) / 4.60`, `polygon-offset` 5/5 including `offset_clamp_rounds_away`,
+`persistent-buffers` 2/2, `shadow-border` and `fs-sampler-array` both passing —
+so the sampler-mask fix, the shadow border and the offset clamp are all good on
+the platform this actually ships to.
