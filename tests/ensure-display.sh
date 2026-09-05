@@ -23,7 +23,11 @@ ensure_wm() {
        | grep -q "window id"; then
     return 0
   fi
-  setsid nohup openbox --display "$D" >/tmp/openbox${D#:}.log 2>&1 </dev/null &
+  # Through DISPLAY, not --display: openbox rejects that argument outright
+  # ("Invalid command line argument"), so this exited nonzero every time and
+  # the manager was never actually started -- the failure this whole
+  # function exists to prevent, hidden inside the fix for it.
+  DISPLAY=$D setsid nohup openbox >/tmp/openbox${D#:}.log 2>&1 </dev/null &
   for _ in $(seq 20); do
     DISPLAY=$D timeout 3 xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null \
       | grep -q "window id" && return 0
@@ -33,7 +37,7 @@ ensure_wm() {
   return 1
 }
 
-if DISPLAY=$D timeout 5 xdpyinfo >/dev/null 2>&1; then ensure_wm; exit 0; fi
+if DISPLAY=$D timeout 5 xdpyinfo >/dev/null 2>&1; then ensure_wm; exit $?; fi
 # Kill any server still holding the number before clearing its files: an
 # earlier version deleted the socket of a live Xvfb, which left a server
 # nothing could connect to and a display that could never be restarted.

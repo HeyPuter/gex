@@ -15674,3 +15674,45 @@ the split between clip and cull has to survive from the linker to the driver,
 and for these shaders it does not. Recovering it from the variables is what
 does not work, because after compaction the variables no longer say.
 
+
+## Inferring read-only storage blocks: redundant, twice over
+
+Tint refuses `var<storage, read_write>` in the vertex stage, so a storage block
+a vertex shader only reads has to be declared read-only. It looks like the
+driver must infer that: GLSL's `readonly` is optional, so an unqualified
+`buffer` block arrives writable however little the shader does with it, and
+Mesa's `nir_opt_access` genuinely cannot help -- it identifies the block behind
+an access with `nir_chase_binding`, which wants a deref, and st/mesa has
+already lowered these to `load_ssbo` carrying a plain block number. Failing to
+identify one, it marks every block written.
+
+**Mesa sets the qualifier anyway, before the driver sees the shader.** A
+hand-written inference over the block-number form -- collect the slots that are
+stored to or atomically updated, mark the rest `ACCESS_NON_WRITEABLE` -- has
+now been written and reverted twice, most recently on 2026-09-05. It is
+correct, it fires (the log shows blocks flipping from `W` to `R`), and it
+changes no score: `es_31_compatibility` 238/355 and
+`shader_storage_buffer_object` 78/124 both before and after, with the probe
+suite and the CTS gate flat.
+
+The measurement that ends the question in one minute, rather than a build and a
+gate cycle:
+
+    GEX_WGPU_DUMP_WGSL=1 tests/gates/probe-suite.sh vertex-ssbo-read
+
+The declaration already reads `var<storage, read>`. The `length` case in that
+probe exists for this check -- an unsized block measured with `length()` is the
+shape whose variable survives to the emitter rather than being lowered away and
+recreated, so it is the one that would expose a real gap if there were one.
+
+What is *not* covered, and is the real wall here, is a vertex-stage storage
+**write**. WGSL forbids it outright and no qualifier inference reaches it. The
+40 failing `es_31_compatibility.shader_storage_buffer_object.*-vs*` cases are
+all that shape -- `advanced-unsizedArrayLength-vs-int`, for one, reads two
+blocks (both correctly read-only) and writes its answer to a third. Serving
+them means running the vertex shader as a compute dispatch and rasterizing from
+its captured varyings, which is the three-pass geometry-shader architecture
+minus the middle pass; `gex_wgpu_capture_dispatch` is pass one and the
+passthrough vertex shader is pass three, so what is missing is the glue for
+"no geometry shader in between", plus that path's existing limits (no
+instancing, `verts_per_prim <= 3`, a CPU-readable index buffer).
