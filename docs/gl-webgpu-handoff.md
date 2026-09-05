@@ -15712,55 +15712,62 @@ all that shape -- `advanced-unsizedArrayLength-vs-int`, for one, reads two
 blocks (both correctly read-only) and writes its answer to a third -- and
 `shader_storage_buffer_object` proper has about 39 more.
 
-### Serving them: the geometry architecture minus its middle pass
+### Serving them: what transform feedback already does
 
-A draw with a geometry shader is already three passes here: the vertex shader
-runs as **compute** and writes its varyings to a buffer, the geometry shader
-runs as compute over those, and an ordinary indexed draw rasterizes the result
-with a generated passthrough vertex shader. A vertex shader that writes storage
-wants the first and third of those and nothing in between -- and compute may
-write storage freely, so the refusal disappears.
+**This driver already runs a vertex shader twice for exactly this reason.**
+`gex_wgpu_draw_vbo_inner` says so in as many words:
 
-Both ends exist:
+    /* Transform feedback is its own compute pass, run before the draw: WGSL
+     * will not let the vertex stage write a storage buffer, so the vertex
+     * shader is run a second time as compute to do the capturing. */
+    if (ctx->so_target_count && ctx->vs->capture_nir)
+       (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
 
-- **Pass one** is `gex_wgpu_capture_dispatch`, which resolves the index buffer
-  and the topology into a slot table of assembled vertices, builds the vertex
-  shader's compute variant with `gex_wgpu_capture_variant_get`, and writes
-  every output into a varyings buffer.
-- **Pass three** is `gex_wgpu_gs_passthrough_nir(pipe, outputs, skip)`, which
-  builds a vertex shader reading one `vec4` attribute per slot and writing it
-  to that slot's varying location. Note its two existing traps, both of which
-  apply unchanged: a clip or cull slot must be declared as a **float array**
-  with `compact` set, not a `vec4` (SPIR-V requires it and Tint enforces it),
-  and a slot that is not a varying at all -- `gl_ViewportIndex`, `gl_Layer` --
-  must be kept in the buffer for stride purposes but excluded from the shader
-  via `skip`, or ntv gives it an `@location` past WebGPU's sixteen.
-
-What is missing is only the glue. The shape:
+The rasterization draw then proceeds normally with the ordinary vertex shader,
+because for transform feedback that shader has no stores of its own. A vertex
+shader that writes an SSBO is the same problem with the stores moved inside the
+shader, so it takes the same shape:
 
 1. **Detect.** The vertex shader stores to, or atomically updates, a storage
-   block. This is the same scan `gex_wgpu_infer_readonly_ssbos` would have
-   done -- `store_ssbo` / `ssbo_atomic` / `ssbo_atomic_swap`, plus the deref
-   spellings -- so route the draw rather than let Tint refuse the module.
-2. **Capture.** Run pass one as it stands. The slot table already expands the
-   topology into independent primitives, so the captured buffer is in
-   assembled order.
-3. **Rasterize.** Draw the captured vertices **non-indexed** with the
-   equivalent independent topology -- a strip or fan of N vertices has become
-   `prims * verts_per_prim` vertices of `GL_TRIANGLES`/`LINES`/`POINTS` -- and
-   bind the passthrough shader plus a vertex element per captured slot.
+   block -- `store_ssbo` / `ssbo_atomic` / `ssbo_atomic_swap`, plus the deref
+   spellings. Route on that rather than letting Tint refuse the module.
+2. **Side effects as compute.** Dispatch the capture variant so the stores
+   actually happen. This is where the work is: `gex_wgpu_capture_dispatch`
+   currently binds the vertex buffers, the params block, the index table and
+   the *transform-feedback* targets, and knows nothing about the shader's own
+   storage blocks, so those bindings have to be added.
+3. **Rasterize with the stores removed.** Compile a variant of the vertex
+   shader whose stores are deleted. Tint then accepts it, and it computes the
+   same positions and varyings, because a store has no result.
 
-The limits come free with pass one and are worth stating in the refusal rather
-than discovering later: no instancing (the capture variant does not model the
-instance index), `verts_per_prim <= 3`, and an index buffer readable on the
-CPU. Every failing case in these two families is a plain small draw, so none of
-those bite there.
+An earlier draft of this section proposed capturing the varyings and
+rasterizing them through `gex_wgpu_gs_passthrough_nir` -- the geometry
+architecture minus its middle pass. That works, but it is strictly more
+machinery for the same outcome: it needs a varyings buffer, a generated
+passthrough shader, the topology re-expanded into independent primitives, and
+it inherits the capture path's no-instancing limit for the *rasterization* draw
+as well. Stripping the stores keeps the real vertex shader on the draw and
+inherits that limit only for the side-effect pass.
+
+Two things to get right:
+
+- **An atomic whose result is used.** Deleting the instruction changes what the
+  shader computes, not just what it writes. Refuse by name in that case rather
+  than substituting something close; that is the standing rule here, and a
+  substituted shape is how Tint and Mesa have been made to abort before.
+- **The invocation count.** The compute pass runs once per *assembled* vertex,
+  so a strip re-runs its shared vertices. GL does not promise one invocation
+  per unique vertex either (a post-transform cache is allowed to reuse), and
+  the failing cases all write to a location indexed by `gl_VertexID`, which
+  makes the duplicate write idempotent. A shader accumulating with `atomicAdd`
+  would count differently, which is another reason to refuse a used result.
 
 Worth knowing before starting: this buys CTS cases and essentially no
 application. A vertex shader writing a storage buffer is a GPU-driven-rendering
 idiom, and none of the target applications do it -- so measure it against
-`es_31_compatibility` and `shader_storage_buffer_object`, and do not expect the
-app sweep or the pixel comparison to move at all.
+`es_31_compatibility` and `shader_storage_buffer_object`, keep an eye on
+`transform_feedback` in the CTS gate because step 2 edits its path, and do not
+expect the app sweep or the pixel comparison to move at all.
 
 ## Minecraft reaches a world, and its title screen has a trap
 
