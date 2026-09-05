@@ -16229,3 +16229,39 @@ And fixing it revealed what it hid: alacritty now runs and draws its window,
 while its **glyphs do not appear at all, with no message from the driver**.
 That is the next thing to chase there, and it is a silently vanishing draw
 rather than anything that announces itself.
+
+## Alacritty draws its window and none of its glyphs
+
+Fixing the `b2b32` abort got alacritty running; it now draws its terminal
+background and cursor and **no text at all**. llvmpipe on the same display
+renders the text plainly (13 distinct colours in the top strip against our 2),
+so this is ours.
+
+Four hypotheses are already eliminated, with evidence, so the next attempt
+should not spend time on them:
+
+- **The draws happen.** `GEX_WGPU_CMD_LOG=8` shows three draws in the frame,
+  two of them with the glyph atlas bound (`t0=1024x1024`), and a `SUBMIT
+  gex_wgpu_flush draws=3`.
+- **The atlas is written.** The driver's own "samples a texture nothing ever
+  wrote" diagnostic never fires for it.
+- **It is not dual-source blending**, even though the `glsl3` renderer's
+  fragment shader really does use it — the WGSL has `@location(0)
+  @blend_src(0)` and `@blend_src(1)`, and `PIPE_BLENDFACTOR_SRC1_*` map to
+  `WGPUBlendFactor_Src1*` correctly. Forcing the other renderer with
+  `alacritty -o 'debug.renderer="gles2"'`, which does not use dual-source at
+  all, gives the same blank text.
+- **It is not the RGB→RGBA promotion of a partially-uploaded atlas.** A probe
+  that builds a 64x64 `GL_RGB` texture and `glTexSubImage2D`s a 4x4 patch into
+  the middle of it reads back identically on this driver and on llvmpipe.
+
+One thing to be careful of when reading the shader: its WGSL is full of
+`bitcast<vec4f>(vec4u(...))` and constants like `1065353216u`, which is
+`1.0f`'s bit pattern. That is ordinary NIR type-punning through integer
+registers, not a symptom.
+
+What has not been checked: whether the glyph draw's *geometry* lands where it
+should (the instanced quad positions), and whether the atlas contains what
+alacritty thinks it does rather than merely having been written to. Reading
+the atlas back and comparing it against llvmpipe's would settle the second in
+one step.
