@@ -17623,3 +17623,95 @@ rest are separate: an unformatted `imageBuffer` in the vertex stage, a 3D
 slice bound as a non-layered `image2D` (which WebGPU cannot view and which
 would have to be packed on a per-draw decision), and a fragment group that
 wants twelve storage buffers.
+
+## Sampling the big families, and the two gaps it found
+
+Nine families account for more than half the GL 4.6 mustpass, and none of
+them had ever been measured here. Running them whole was not on — one
+`texture_swizzle` case takes nineteen seconds (twenty-five on llvmpipe:
+the cost is the test, not the driver), so the family alone is nearly four
+hours. A strided sample of ~50 cases each answered the question in
+minutes:
+
+    packed_pixels          50/50
+    shaders                50/50
+    shaders30              47/47
+    pixelstoragemodes     896/896   (small enough to run whole)
+    constant_expressions   33/50
+    texture_swizzle        25/50
+
+The first four are clean — the whole pixel-transfer area, which every
+texture upload and readback in every application goes through, needs no
+work. The last two were the gaps, and neither was what the score suggested.
+
+### A cap of zero is a silent refusal
+
+`constant_expressions`' 17 losses were not failures at all: they were
+`NotSupported`, and every one was a `_tess_control` variant. The reference
+passed all 50. What the CTS was actually saying:
+
+    Test requires GL_MAX_TESS_CONTROL_SHADER_STORAGE_BLOCKS >= 2, got 0
+
+The driver reported zero shader storage blocks for the geometry stage and
+both tessellation stages, against twelve for the vertex stage. Zero is a
+legal answer in GL, so nothing ever complained — no error, no refusal, no
+line in any log. It simply meant that no application could use an SSBO in
+those stages and that a third of a 1392-case family skipped itself.
+
+Nothing about the platform required it. All three stages run as compute
+passes, where a storage buffer is entirely legal. What was missing was the
+collection and the binding: the block collector those stages share treated
+everything in descriptor set two as a constant buffer, so an application's
+storage block would have been bound from `ctx->constant_buffers` — the
+wrong resource entirely — and `gex_wgpu_blocks_to_group_one` stopped its
+upper bound at the storage range, so a block that *was* collected stayed
+in group two with no layout for it.
+
+    constant_expressions          930 -> 1392/1392, matching llvmpipe
+    shader_storage_buffer_object  113 -> 117/124
+    geometry_shader               126 -> 129/136
+
+The lesson is about the instrument, not the fix. **A family's
+`NotSupported` count is only meaningful beside the reference's.** Read
+alone it looks like the test declining to run; read beside a reference
+that runs all of them, it is the driver saying no in the one way that
+produces no diagnostic anywhere.
+
+### A refusal inside a shared lowering costs more than the thing refused
+
+`texture_swizzle`'s failures split cleanly once separated by reason. Two
+thirds were `glTexImage2DMultisample` refusing to create the texture at
+all — 32-bit formats and multisampled *array* textures, both of which
+WebGPU genuinely does not have. Those are honest.
+
+The rest were every unsigned-integer format on `GL_TEXTURE_2D_MULTISAMPLE`,
+returning the texture's own channel order instead of the swizzled one. The
+integer-texture pass — which exists because WebGPU forbids a *filtering*
+sampler on an integer texture — let an ordinary `texelFetch` and a size
+query past untouched, but not `txf_ms`, and a multisample texture can only
+ever be fetched. Falling through recorded a lowering failure, and that
+fails the **whole** texture lowering for the shader, so the view swizzle
+never ran either. One unhandled opcode removed a feature from every
+texture in the shader, and said so in one latched line naming a "sample"
+that was a fetch.
+
+Fixing it needed the swizzle pass narrowed too. It skipped every
+instruction on an integer-sampled slot, reasoning that the integer pass
+owns them; but that pass rewrites only `texture()` and `textureLod()`, so
+a `texelFetch` on a slot that also had a sampler had nobody to swizzle it.
+The instructions the integer pass *produces* are now marked with
+`pass_flags`, and the swizzle pass skips those rather than the whole slot —
+which is the distinction that was wanted all along, since the double-swizzle
+the blanket skip was avoiding could only ever come from an instruction the
+pass had made itself.
+
+Measured afterwards on every one of the 71 formats at
+`GL_TEXTURE_2D_MULTISAMPLE`: 35 pass, 9 not supported, and **27 failures
+that are all the same refusal** — `glTexImage2DMultisample` declining to
+create the texture. Not one value mismatch left. The 27 are the SNORM set,
+the 16-bit normalized set (which this driver keeps in r32float, and WebGPU
+cannot multisample a 32-bit format), the odd depths, and the 32-bit set.
+llvmpipe passes 62 of them, so the gap is real, but it is the format table
+and not the swizzle. The other multisample target, `2D_MULTISAMPLE_ARRAY`,
+is refused outright for every format: WebGPU has no multisampled array
+texture at all.
