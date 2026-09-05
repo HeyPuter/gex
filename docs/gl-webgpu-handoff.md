@@ -17715,3 +17715,82 @@ llvmpipe passes 62 of them, so the gap is real, but it is the format table
 and not the swizzle. The other multisample target, `2D_MULTISAMPLE_ARRAY`,
 is refused outright for every format: WebGPU has no multisampled array
 texture at all.
+
+## Three silent defects in clear and readback, and two features not taken
+
+`direct_state_access` and `sample_variables` were the two biggest failing
+clusters left. Grouping both by cause first was worth more than either
+score: `sample_variables`' 65 losses turned out to be entirely platform —
+38 skips for `samples_8`, which WebGPU has no equivalent for at all, and
+27 for `rgba32f` multisampling, which it also has no equivalent for. That
+family is finished. `direct_state_access` had 35 `InternalError`s, which
+is normally the shape of a latch taking every case after it; these were
+isolated, so something was throwing per-case instead.
+
+### The clear's attachment view never named the surface's format
+
+The clearest of the three, and the one with app consequences.
+`gex_wgpu_clear_render_target` built its view with no format, so it
+defaulted to the texture's own. There is exactly one pair where that
+matters, and it is how `GL_FRAMEBUFFER_SRGB` is expressed: with sRGB
+conversion off — the default — st/mesa attaches an sRGB texture through a
+*linear* surface. The view ignored that, so WebGPU encoded the clear on
+the way in. A clear to 0.25 read back as 0.537255, which is
+`srgb_encode(0.25)` to the last digit.
+
+Any application clearing an sRGB framebuffer without enabling sRGB
+conversion got a washed-out background, and nothing reported anything. The
+draw path had named the surface's format all along; only the clear had
+not. `tests/gl44-srgb-clear-probe.c` gates it, and was shown to fail with
+that one line reverted — 137 where 64 belongs — natively *and* in the
+browser, which needed the wasm driver rebuilt to demonstrate.
+
+### A stencil-only texture is not a depth texture
+
+`stencil8` is a single-plane format WebGPU copies to a buffer like any
+other. It was being sent to the depth resolve instead, which builds a
+`DepthOnly` view:
+
+    Texture format (TextureFormat::Stencil8) does not have the texture
+    view's selected aspect (TextureAspect::DepthOnly)
+
+A validation error, so the readback raised a GL error, and the CTS's
+`catch (...)` turned that into `InternalError` with nothing logged at all.
+That is the whole reason those cases said nothing: the failure was an
+exception, not a comparison.
+
+### An integer clear value is clamped, not wrapped
+
+GL clamps a `glClearBuffer{i,ui}v` value to what the attachment holds.
+WebGPU takes the number as given, so `rgb10a2uint`'s two-bit alpha handed
+4 came back as 0 rather than 3.
+
+### Two features measured and not taken
+
+`GEX_WGPU_FEATURE_TRACE=1` prints what the adapter actually has, and it
+turned up two that look like free wins and are not:
+
+- **Unorm16/Snorm16TextureFormats.** Native Dawn grants both. They would
+  store `R16_UNORM` and its relatives exactly instead of promoting them to
+  float32 — which is lossy in the wrong direction and is what blocks their
+  multisample cases. Chromium 151 offers no `texture-formats-tier1`, so
+  taking them would improve every *native* number while the browser stayed
+  exactly where it is. The promotion is the honest common denominator.
+- **texture-component-swizzle.** The mirror image: Chromium has it, the
+  pinned Dawn does not. It would replace the whole in-shader swizzle
+  lowering — the one that produced a defect earlier in this same session —
+  but adopting it would leave the native path unable to reproduce what the
+  browser does, and the native path is the one with a debugger.
+
+Both are worth revisiting when the two ends line up. Neither is worth a
+divergence now.
+
+### What direct_state_access has left
+
+55 cases, and they are one wall in two shapes: 30 are
+`textures_storage_multisample_3d_*`, which is a multisampled *array*
+texture that WGSL has no type for, and most of the rest are the
+multisample formats WebGPU does not have — 32-bit, SNORM, and the 16-bit
+normalized set this driver keeps in float32. Those raise
+`GL_INVALID_OPERATION` from `glTexStorage*Multisample`, which is the right
+answer to give and which the CTS does not catch.
