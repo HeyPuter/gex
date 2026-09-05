@@ -15267,3 +15267,37 @@ gave the whole thing.
 `shader_image_load_store` 14 -> 15 of 51, and its run went from about forty
 WebGPU validation errors to **none**.
 
+### A decline that became a latch, and what it was hiding
+
+The capture pass learning to sample had a consequence I did not see at the
+time. A vertex shader with a texture used to be refused when its *variant* was
+built, and that path declines. Now the variant builds and the binding can fail
+later instead -- inside a chain that ends in `gex_fail`. So a sampler view the
+driver would not make turned into a **context latch**, and `KHR-GL45.texture_view`
+died on its first case: three cases ran where there are seven.
+
+Both remaining sites now test the binding separately and decline by name. The
+rule is worth restating because it is easy to lose in a refactor: **when
+lifting a refusal, check what the newly reachable path does on failure.** A
+decline moved into a chain whose failure latches is a regression even though
+nothing about it looks wrong.
+
+Behind the latch were two more layout gaps in the compute-emulated stages,
+both invisible until the family could run:
+
+- **`texture.multisampled` was never set** in a dispatch's bind group layout,
+  so a `sampler2DMS` in a geometry or tessellation shader produced "Binding
+  multisampled flag (0) doesn't match the layout's multisampled flag (1)". The
+  collector had worked the flag out for the sample type and thrown it away.
+- **The non-filtering sampler twin was used only for depth.** An integer or
+  multisampled texture is `UnfilterableFloat`/`Uint`/`Sint`, so its sampler
+  binding is NonFiltering, and the application's ordinary sampler is refused
+  against it. Depth was simply the first shape to reach that code.
+
+The same deferred-copy reference bug was in `alias_copies` as well as
+`packed_copies`; both hold a reference now.
+
+`texture_view` still fails 6 of 7 (llvmpipe passes all seven) and the run is
+clean of validation errors -- those six want format-class view sampling, which
+is the next lever there.
+
