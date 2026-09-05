@@ -15439,3 +15439,29 @@ WebGPU has no multisampled array texture, so they are blocked -- geometry
 shader *instancing* (two cases, refused by name), and two shaders whose
 combined-sampler split fails at the texture-unit limit.
 
+### Geometry shader instancing
+
+`layout(invocations = N) in;` runs the geometry shader N times per input
+primitive, with `gl_InvocationID` saying which run this is. It was refused by
+name.
+
+The compute pass is already indexed by a flat invocation id, and that id was
+doing two jobs at once -- picking the input primitive *and* choosing the output
+slice. Separating them is the whole feature: dispatch `prims * N` invocations,
+and the quotient `id / N` picks the primitive while the remainder `id % N`
+**is** `gl_InvocationID`. The output slice stays one per compute invocation, so
+the emit path did not change at all. With N = 1 the division folds away and
+every existing shader compiles to what it compiled to before.
+
+On the host, the distinction to keep straight is which counts mean *input
+primitives* and which mean *runs of the shader body*. Everything the pass
+writes -- the output slices, the emitted-count slots, the index runs -- is
+sized in runs; `gl_PrimitiveIDIn` and the primitive-id base advance in
+primitives. `gl44-gs-instancing-probe` pins the division down in the direction
+that matters: getting quotient and remainder the wrong way round is not a
+crash, it draws the same number of triangles in the wrong places, so one case
+puts the invocation id in the *position* and the other puts the primitive in
+the *colour*.
+
+`geometry_shader` 121 -> **123 of 136**.
+
