@@ -1,0 +1,45 @@
+#!/bin/bash
+# Run each real-application candidate once under gex_wgpu and say which of
+# three things happened: the driver refused something, the app needs an
+# environment we did not give it, or it drew.  Separate from the app sweep
+# because these need arguments, a compositor or a file, which is exactly why
+# the sweep skips them.
+set -u
+OUT=${1:-/tmp/newapps}
+mkdir -p "$OUT"
+INST=${GEX_INST:-/tmp/gex-mesa-native/inst}
+export DISPLAY=${GEX_DISPLAY:-:78}
+export LD_LIBRARY_PATH=$INST/lib:$HOME/.cache/gex-dawn-native/pkg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export LIBGL_DRIVERS_PATH=$INST/lib/dri
+export LIBGL_ALWAYS_SOFTWARE=1
+export GALLIUM_DRIVER=${GALLIUM_DRIVER:-gex_wgpu}
+export vblank_mode=0
+VID=$(ls ~/Videos/*.mp4 2>/dev/null | head -1)
+run() {  # run <name> <seconds> <cmd...>
+  local name=$1 secs=$2; shift 2
+  local log="$OUT/$name.log"
+  timeout -s KILL "$secs" "$@" >"$log" 2>&1; local rc=$?
+  # Not the startup format probe. Every context asks the driver which formats
+  # are renderable and prints a "render target refused" line for each one that
+  # is not -- fifteen of them, every run, for every application. Counting
+  # those made four apps here report refused=15 and look broken when nothing
+  # had been refused of anything they asked for.
+  local refused=$(grep -E "gex-wgpu: .*(rejected|refused|unsupported|TODO)" "$log" 2>/dev/null |
+                  grep -vc "render target refused")
+  local draws=$(grep -cE "gex-wgpu" "$log" 2>/dev/null)
+  local note=""
+  case $rc in 137|124) note="ran-to-timeout" ;; 0) note="exited-clean" ;; *) note="exit $rc" ;; esac
+  [ "$refused" -gt 0 ] && note="$note refused=$refused"
+  printf '%-24s %-18s driverlines=%s\n' "$name" "$note" "$draws" | tee -a "$OUT/results.txt"
+}
+: > "$OUT/results.txt"
+run alacritty            12 alacritty -e sleep 10
+run amdgpu_top           12 amdgpu_top --gui
+run MaterialXGraphEditor 12 MaterialXGraphEditor
+run aseprite             12 aseprite
+run mpv                  15 mpv --gpu-api=opengl --vo=gpu --length=5 --no-audio --really-quiet "$VID"
+run dolphin-emu          15 dolphin-emu
+run cemu                 15 cemu
+run sunshine             10 sunshine
+run hello_xr             10 hello_xr -g OpenGL
+echo DONE >> "$OUT/results.txt"

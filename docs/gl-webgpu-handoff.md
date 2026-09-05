@@ -15502,3 +15502,37 @@ reader refuses ("sampled image must have float component type") and which the
 compute path already answers with per-dispatch variants -- the same treatment
 extended to the emulated stages is the next step there.
 
+## The gates are in the repository now
+
+Every standing gate was living in a session scratchpad. The probe *programs*
+were always tracked -- 175 of them, in `tests/integration/programs` -- but
+nothing that drove them was, so the note above telling you to run the probe
+suite pointed at a path a new session does not have.
+
+They are in `tests/gates` now, with a README that says what each is for and
+which of its results are expected to differ:
+
+    tests/gates/probe-suite.sh     [name]              107 of 111, four known DIFFs
+    tests/gates/cts-gate.sh                            five families, ~16 seconds
+    tests/gates/app-stk.sh         <out.png> [settle]
+    tests/gates/app-blender.sh     <out.png> [settle]   GEX_REF=1 for llvmpipe
+    tests/gates/app-minecraft.sh   <driver> <out.png>
+    tests/gates/app-candidates.sh  [outdir]
+
+`cts-gate.sh` exists because the other three missed a regression for two
+sessions: it runs families that lean on the driver's *internal* buffers, which
+the probes barely touch. `texture_swizzle` was tried in it and taken out again
+-- thousands of cases turns a sixteen-second gate into a half-hour job, and a
+gate nobody runs is not a gate.
+
+One baseline in it was wrong when first written: `transform_feedback3` prints
+2 of 3 because the third case is NotSupported, and I had put down 3/3 from what
+it ought to be rather than what it prints. A baseline is a measurement.
+
+`app-candidates.sh` also had its "refused" count corrected. Every context asks
+the driver which formats are renderable and prints a refusal line for each one
+that is not -- fifteen of them, every run, for every application -- and
+counting those made four applications report `refused=15` and look broken when
+nothing they asked for had been refused. All nine candidates show zero real
+refusals.
+
