@@ -17089,3 +17089,92 @@ texels can be outside independently, so it wants the per-texel decomposition
 the integer gather already has. That is the whole of what the two remaining
 `texture_gather_offset_depth_clamp` cases want, and they now fail on values
 rather than on a rejected module.
+
+### The variant trigger asked the wrong question
+
+With the border reaching ordinary shadow samples, the two
+`texture_gather_offset_depth_clamp` cases still failed — and `GEX_WGPU_BORDER_LOG`
+printed nothing at all, because the pass never ran. The capture and varying
+variants decide whether to specialize a module against bound sampler state by
+asking one question:
+
+```c
+if (vs->integer_sampled_slots) { … gex_wgpu_lower_texture_variant(…) … }
+```
+
+That is the case which makes Tint *reject* the module — a loud failure, so it
+was the one that got fixed. Everything else the lowering does is silently wrong
+instead: a border, a mirror clamp, a LOD bias and a view swizzle all need the
+same specialization, and a shadow gather over a bordered texture simply came
+back with clamp-to-edge results. The fragment path already asks the full
+question in `needs_sampler_variant`; `gex_wgpu_stage_wants_texture_variant` now
+asks it for a stage, and both variants use it for the lowering *and* for their
+cache key — a module built against state has to be matched against that state.
+
+The gather itself needs decomposing, because a border is not a property of the
+sample as a whole: each of the four texels in the footprint can fall outside
+independently. WGSL's `textureGatherCompare` serves every other shadow gather
+natively and is left alone; a bordered one becomes four shadow samples at the
+four texel centres, in GL's rotation, and the existing border pass then gives
+each of them its border. That is the same shape the integer gather uses, and
+the reason both run before it.
+
+Shapes that cannot be decomposed are left alone rather than refused — the
+opposite of the integer gather's choice, and deliberately. An integer gather
+has no native form at all, so refusing one is honest; a shadow gather does, and
+declining a draw over a border would cost more than the border is worth.
+
+#### A constant has no type, and Tint wanted to see one
+
+The decomposition then hit:
+
+    WGSL comparison sampling without derivatives requires level-of-detail 0.0
+    %69 = OpImageSampleDrefExplicitLod %5 %68 %64 %27 Lod %65
+
+The LOD *was* zero. Disassembling said how it got there:
+
+    %65 = OpBitcast %float %uint_0
+
+A NIR constant carries no type, and 0.0 and 0u are the same bits, so
+`nir_imm_float(b, 0.0f)` had been inferred uint; `get_src_float` then bitcast it
+back. The bits are identical either way — but `textureSampleCompareLevel` takes
+only a *literal* zero, and a bitcast is not one, so Tint rejected the module.
+`get_src_float` now emits a scalar constant as a float constant rather than
+bitcasting one, which reinterprets exactly the bits the bitcast would and keeps
+the value where a consumer can see it. It is in `nir_to_spirv`, so zink gets it
+too; nothing about the value changes.
+
+`KHR-GL45.gpu_shader5` is 21/22. What is left is `precise_qualifier`, and that
+one is the platform: the test demands bitwise-identical results when the inputs
+are reversed, which holds only if nothing contracts `a*b + c` into an fma.
+`nir_to_spirv` does emit `SpvDecorationNoContraction` for an exact ALU op, so
+our SPIR-V says so — but WGSL has no way to spell it, the WGSL Tint gives back
+is plain `*` and `+`, and whatever compiles it below is free to contract. There
+is no driver fix behind that.
+
+#### Widening a predicate exposed a null nobody had reached
+
+Making the variants ask the full question cost a crash before it paid: the CTS
+gate reported `texture_view (no result)` in two seconds, and running it alone
+said `timeout: the monitored command dumped core`. The stack landed on
+
+```c
+variant->swizzles[slot][channel] = gex_wgpu_effective_view_swizzle(view, channel);
+```
+
+with a null `view` — in a loop whose *very next line* reads
+`view ? (uint8_t)view->target : 0xffu`. The hazard had been sitting in the
+varying variant's key fill all along; nothing had reached it, because the fill
+only ran for integer sampling and those slots always had a view.
+`KHR-GL45.texture_view` refuses one on purpose — an `r16g16b16a16_unorm` view
+of an `r16g16b16a16_float` texture, which WebGPU cannot express — and a refused
+view is a null one.
+
+`gex_wgpu_effective_view_swizzle` answers the identity for a null view now,
+which is the truth: an unbound slot is served by a 1x1 stand-in that carries no
+swizzle. Asking about a slot with no view is legitimate, so the *function* is
+the right place for it rather than each caller.
+
+The general shape is worth keeping in mind when widening any of these
+predicates: **the code a narrow condition was protecting has not been tested
+against the cases the wider one lets through.** Run the gate.
