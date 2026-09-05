@@ -15714,8 +15714,8 @@ blocks (both correctly read-only) and writes its answer to a third -- and
 
 ### Served, the way transform feedback already was
 
-**Done.** `shader_storage_buffer_object` 78 → 108 of 124 and
-`es_31_compatibility` 238 → 267 of 355.
+**Done.** `shader_storage_buffer_object` 78 → 113 of 124 and
+`es_31_compatibility` 238 → 274 of 355.
 
 This driver already ran a vertex shader twice for exactly this reason, and said
 so beside the call: transform feedback dispatches the shader as compute
@@ -15754,6 +15754,18 @@ and reading the failure rather than by reading the code first:
    binds nothing, and you are back at failure 3 with no clue why. Marking them
    `ACCESS_NON_WRITEABLE` keeps them and is honest: after the pass that shader
    only reads.
+
+And then a fifth, because lifting a refusal moves the failure. Five cases came
+back with *"the buffer type in the shader (ReadOnlyStorage) is not compatible
+with the type in the layout (Storage)"*: the dispatch binds every block
+writable, while the compute copy declares the ones it only reads as read-only.
+Making the shader's own blocks uniformly writable fixes it — legal in compute,
+free — but **where** that happens is the whole of it. Written just before the
+compile, which is the obvious place, it also sweeps up the blocks the capture
+pass adds for itself, and `gex_capture_index` is created read-only on purpose:
+that cost one case of `transform_feedback` and two of `transform_feedback3`
+while the family under test kept improving. Immediately after the clone, where
+only the shader's own blocks exist, keeps both.
 
 Two limits worth knowing, both inherited from the capture path and both
 harmless for the cases this serves: no instancing (the variant does not model
