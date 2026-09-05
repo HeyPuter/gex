@@ -15942,3 +15942,36 @@ attachment — a value no 8-bit target holds exactly. Integer formats are left
 out of it on purpose: this driver reports NONE for them and llvmpipe reports
 FULL, so including them would make the probe differ from its reference for
 being the more accurate of the two.
+
+## A fragment shader cannot read gl_ClipDistance
+
+Eight of `cull_distance`'s remaining failures — all of
+`functional_test_item_8_primitive_mode_points_max_culldist_*` — are refused
+with
+
+    Tint rejected SPIR-V: error: no matching call to
+      'bitcast<f32>(array<f32, 8>)'
+
+which reads like the driver emitting nonsense. It is not. Assembling the
+rejected module (`spirv-dis` on the hex the driver dumps, which is the standing
+practice here) shows it is **correct**: `BuiltIn ClipDistance`, an
+`array<float,8>` in the `Input` storage class, read one element at a time by
+`OpAccessChain`. Nothing in this driver bitcasts anything.
+
+The bitcast is Tint's, trying to produce WGSL for a shape WGSL does not have.
+**Clip distances exist in WGSL only as a vertex output** — the `clip_distances`
+feature is written from the vertex stage and consumed by fixed-function
+clipping. There is no fragment-stage input for them, so a fragment shader that
+reads `gl_ClipDistance` or `gl_CullDistance` has no spelling at all.
+
+The workaround, if these eight are ever worth it: have the producing stage
+write a *second* copy of the distances into an ordinary generic varying and
+rewrite the fragment input to read that, keeping the real builtin for the
+clipping itself. Two things make it more than it looks — the copy has to follow
+the producing stage wherever it is (vertex, geometry, or tessellation
+evaluation), and it consumes generic varying slots, which is the layout STK,
+Minecraft and Blender all depend on. Weigh that against eight cases of
+something applications almost never do.
+
+The rest of `cull_distance`'s 73 failures are silent value mismatches rather
+than refusals, so the whole family is not one cause.
