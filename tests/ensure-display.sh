@@ -23,6 +23,16 @@ ensure_wm() {
        | grep -q "window id"; then
     return 0
   fi
+  # A manager that is running but has not claimed EWMH is worse than none:
+  # the check above says there is none, and the start below then fails with
+  # "A window manager is already running on screen 0" -- so ensure_wm reports
+  # FAILED forever and every gate that honours it refuses to run. Clear any
+  # such process first. Safe when there is none, and this only ever runs on a
+  # headless test display.
+  if pgrep -x openbox >/dev/null 2>&1; then
+    pkill -x openbox >/dev/null 2>&1
+    sleep 1
+  fi
   # Through DISPLAY, not --display: openbox rejects that argument outright
   # ("Invalid command line argument"), so this exited nonzero every time and
   # the manager was never actually started -- the failure this whole

@@ -86,11 +86,21 @@ xdpyinfo >/dev/null 2>&1 || { echo "no X display at $DISPLAY" >&2; exit 2; }
 # MaterialXGraphEditor, aseprite and SuperTuxKart. Nothing about that row was
 # about textures, and nothing said so -- it simply appeared at the top of the
 # ranking as the largest deterministic divergence in the run.
-stale=$(xwininfo -root -children 2>/dev/null | grep -cE '^ +0x' || true)
+# Only windows big enough to *be* photographed count. The rule above picks the
+# largest window, so anything smaller than a plausible application window can
+# never be picked -- and a window manager keeps a handful of 1x1 internal
+# windows of its own. Counting those made this refuse to run at all the moment
+# a manager was actually present, which it now always is: openbox contributes
+# eleven such windows and none of them can ever be the largest.
+stale=$(xwininfo -root -children 2>/dev/null |
+        awk '/^ +0x/ && match($0, /[0-9]+x[0-9]+\+/) {
+               split(substr($0, RSTART, RLENGTH), d, /[x+]/)
+               if (d[1] >= 64 && d[2] >= 64) n++
+             } END { print n + 0 }')
 if [ "${stale:-0}" -gt 0 ]; then
-    echo "display $DISPLAY already has $stale window(s); close them first -- " \
-         "this harness photographs the largest window on the display and " \
-         "would photograph those" >&2
+    echo "display $DISPLAY already has $stale window(s) large enough to be " \
+         "photographed; close them first -- this harness photographs the " \
+         "largest window on the display and would photograph those" >&2
     xwininfo -root -children 2>/dev/null | grep -E '^ +0x' >&2
     exit 2
 fi
