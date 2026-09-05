@@ -16756,20 +16756,32 @@ Three more layered cases — `layered_rendering_boundary_condition`,
 — fail on data rather than on an API error and have not been separated from
 that group by evidence; two of them report only `Fail (Fail)`.
 
-**An integer texture sampled in the geometry stage (2).**
-`limits.max_texture_units` and `limits.max_combined_texture_units` fail at
-program creation with
+**~~An integer texture sampled in the geometry stage (2).~~ Served, and it was
+not the structural change I costed.** This entry said the geometry module would
+have to become a per-sampler-state variant "as the fragment shader's already
+is", and estimated it accordingly. That was right about the requirement and
+wrong about the size, because it assumed a draw-time module meant moving the
+build. The compute path does not do that: it keeps its base module and only
+builds a variant when one is *needed* —
 
-    Tint rejected SPIR-V: error: sampled image must have float component type
+    if (!integer_sampled_slots && !buftex_count && !images.unformatted)
+       return compute->module;
 
-The driver handles integer sampled textures through
-`gex_wgpu_lower_texture_variant`, which the fragment, vertex and compute paths
-all run and the compute-emulated stages do not. It is not a small omission:
-that lowering depends on the *bound* sampler state — filters, wrap modes,
-border colour, view target — so wiring it into the geometry stage means that
-stage's module becomes a per-sampler-state variant, as the fragment shader's
-already is. Worth knowing before starting: this is a structural change, not a
-missing call.
+— so every shader that does not sample an integer texture is untouched. The
+geometry stage now does the same, and the piece that actually unblocks the link
+is that it **skips building a base module at all** for such a shader: compiling
+one fails in Tint and refuses the whole *shader*, so the program never links
+for want of a module the draw was never going to use.
+
+Lifting it moved the failure one stage back, which is the usual result — the
+varying variant hit the identical refusal and needed the same lowering, plus
+the sampler state in its cache key, since a module that bakes in wrap and
+swizzle can no longer be reused just because the layouts match.
+
+`limits.max_texture_units` passes. `max_combined_texture_units` now links and
+returns *wrong data* instead, which is a different problem: it drives sixteen
+`usampler2D` in each of the vertex, geometry and fragment stages, and something
+in that is not producing the values it should.
 
 **One data mismatch at the maximum (1).** `limits.max_output_components`
 reports `Fail (Fail)` with no driver message at all — the same shape as
