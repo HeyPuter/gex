@@ -15363,3 +15363,40 @@ that samples was refused outright. With the check wired in, the run is clean.
 `texture_view` 1 -> 3 of 7. `transform_feedback` measured at 6/21 before and
 after -- by stashing the change and rebuilding, rather than by argument.
 
+## Padding is not size
+
+`KHR-GL45.transform_feedback` sat at 6 of 21 (llvmpipe: 21) and the failures
+looked general -- most cases reporting "context already failed". They were not
+general. One case latched, and the thirteen after it were collateral.
+
+The latch was an index-range check in `draw_vbo_inner`: a geometry draw reading
+four indices out of a two-index buffer. The buffer was the driver's own
+`gs_indices`, grown on demand by `gex_wgpu_ensure_buffer` -- which compares the
+request against `allocation_size`. **That is the padded number**, and every
+buffer allocation was made 16-byte aligned two sessions ago (WebGPU rounds a
+uniform binding up to 16, and a GL buffer object is retargetable). So a buffer
+created for 8 bytes reported 16, satisfied a request for 16, and came back with
+its `width0` still 8.
+
+Comparing `width0` instead took the family from **6 to 19 of 21**.
+
+Two things about this are worth keeping.
+
+**The data was never wrong.** `allocation_size >= size` did hold, so the memory
+was there and the geometry pass wrote into it correctly; only the code that
+reads `width0` disagreed. That is the index check -- and
+`gex_wgpu_buffer_subdata`, which bounds-checks the same field and would have
+*silently dropped* a tessellation index upload rather than complaining. A
+latch that shouts is the lucky version of this bug.
+
+**The standing gates all missed it, for two sessions.** The probe suite, STK
+and Blender were clean throughout, because none of them grows a driver-internal
+buffer past a 16-byte boundary. `scratchpad/ctsgate.sh` now runs a few fast
+families that lean on those buffers -- transform feedback and texture views --
+as a gate beside the probes. One run of it would have caught this the day it
+landed.
+
+The index check declines now rather than latching. It still names the problem
+loudly, which is all it needed to do: latching is what turned one bad draw into
+a family that looked broken from the start.
+
