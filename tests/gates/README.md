@@ -26,6 +26,13 @@ was missing was everything that drives them.
   colour-attachment byte budget.
 - `app-minecraft.sh <driver> <out.png> [seconds]` — Minecraft 26.2, which
   needs a GL 4.4 context and so is the widest single statement available.
+- `app-compare-top.sh <results.tsv> [count] [outdir]` — re-measure the worst
+  rows of a `tests/gl-app-compare.sh` run with both extra references. The cheap
+  sweep reports one number and one number cannot tell a driver defect from an
+  animation; this adds gex-against-itself (which is animation) and softpipe as
+  a second reference (which is the two references disagreeing). **rmse means
+  nothing unless it is well above both.** Half the deterministic top of that
+  corpus has previously turned out to be llvmpipe rather than the driver.
 - `app-candidates.sh [outdir]` — the applications that need arguments, a
   compositor or a file, which is why the broad sweep in `tests/gl-app-sweep.sh`
   skips them.
