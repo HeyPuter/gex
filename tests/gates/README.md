@@ -10,13 +10,18 @@ was missing was everything that drives them.
 
 - `probe-suite.sh [name]` — build every `gl44-*-probe.c` and run it twice,
   once on llvmpipe and once on gex_wgpu, comparing the SUMMARY lines. With a
-  name, just that one. **Four DIFFs are expected**: `group-vote` (2/3 — the
-  extension is claimed and conformant, but its invocation group is one
-  invocation, so `all_mixed` answers true where llvmpipe's wider ballot
-  answers false; the probe exists to say so), `quad` (gex passes 6/6 where
-  llvmpipe passes 3/6 — the reference is the one failing), `texture-sampler`
-  (sample-counts 1 vs 2) and `stage-image` (deliberately failing; its comment
-  says why for each case). A fifth is a regression.
+  name, just that one. **113 of 116, and three DIFFs are expected**:
+  `group-vote` (2/3 — the extension is claimed and conformant, but its
+  invocation group is one invocation, so `all_mixed` answers true where
+  llvmpipe's wider ballot answers false; the probe exists to say so), `quad`
+  (gex passes 6/6 where llvmpipe passes 3/6 — the reference is the one
+  failing) and `texture-sampler` (sample-counts 1 vs 2). A fourth is a
+  regression.
+
+  `stage-image` **used to be the fourth** and is no longer: it passes 4/4 as of
+  2026-09-05, images now working in every stage including the vertex one. If it
+  reappears in this list, that is a regression rather than the old expected
+  failure.
 
   `polygon-offset` is deliberately *not* among them. Its two clamp cases are
   written out in a comment rather than run: this driver does not claim
