@@ -15301,3 +15301,39 @@ The same deferred-copy reference bug was in `alias_copies` as well as
 clean of validation errors -- those six want format-class view sampling, which
 is the next lever there.
 
+### texture_view, characterised
+
+Seven cases, llvmpipe passes all seven, this driver passes one. Now that the
+run is clean of validation errors the six are separable, and most are not
+driver gaps:
+
+- **`gettexparameter` and `errors`** fail at `glTexStorage*Multisample`.
+  WebGPU has no multisampled *array* texture (a texture with `sampleCount > 1`
+  must have one layer), and no multisampled `rgba32float` either. Both are
+  what the CTS asks for. Platform-blocked.
+- **`view_sampling`** wants `sampler2DMSArray`, and WGSL has no
+  `texture_multisampled_2d_array`. Platform-blocked -- and it now says so:
+  that refusal used to read "gex_wgpu invalid or duplicate texture binding",
+  one message shared by five conditions, and a link failure is the only thing
+  the application sees. Each condition names itself now.
+- **`view_classes`** wants an `r16g16b16a16_unorm` view of an
+  `r16g16b16a16_float` texture. Same texel size in GL, different *stored* size
+  here, because the driver promotes `rgba16_unorm`. The format promotion
+  fighting views again.
+- **`coherency`** ("Invalid data was sampled in vertex shader") and
+  **`reference_counting`** ("Mip-map sampling failed") are real driver bugs and
+  the two worth chasing next.
+
+Three view rules were stricter than WebGPU requires and are relaxed:
+
+- A **1D texture** could only be viewed as 1D. `VIEW_CLASS_1D` is symmetric and
+  the array half was already there; st builds a one-layer array view of an
+  immutable 1D texture exactly as it does for 2D.
+- A **cube view** demanded layers 0..5 of its parent, and a **cube-array view**
+  a first layer that was a multiple of six. WebGPU asks only for a layer
+  *count* that is a multiple of six; where the faces begin in the parent is
+  the parent's numbering, not the view's.
+
+And the refusal message printed the texture's target without the view's --
+which is the half that decides `gex_wgpu_view_target_ok`. It prints both now.
+
