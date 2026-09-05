@@ -16621,6 +16621,33 @@ That is a genuine defect of ours rather than a reference divergence, and it is
 the only one left in the family. It is also at the exact ceiling of two limits
 at once, which is why nothing else has ever reached it.
 
+What is known, so the next attempt starts from data rather than from reading:
+
+| limit | value |
+| --- | --- |
+| `MAX_VERTEX_OUTPUT_COMPONENTS` | 64 |
+| `MAX_TESS_CONTROL_INPUT_COMPONENTS` | 64 |
+| `MAX_TESS_CONTROL_OUTPUT_COMPONENTS` | 128 |
+| `MAX_TESS_EVALUATION_INPUT_COMPONENTS` | 128 |
+| `MAX_TESS_EVALUATION_OUTPUT_COMPONENTS` | 64 |
+| `MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS` | 64 |
+
+The evaluation shader arrives with `out vars=16 written=0x7fff00000001` —
+`gl_Position` and fifteen user varyings, exactly the sixteen raster slots, so
+nothing is being dropped for want of room. The draw is not declined
+(`tess draw isz=0 inst=1 count=2 start=0 patch_vertices=2`). The test reports
+
+    captured vec4(14880, 15377, 15874, 16371)
+    expected vec4(8160, 8417, 8674, 8931)
+
+`compareValues` prints the *first* mismatching vec4 and not necessarily the
+first element, so the index is unknown. Both sequences step evenly — 497
+captured against 257 expected — and neither reconciles with a first-order
+reading of the reference arithmetic, which for these limits should step by 32.
+So the index is not zero and the model is incomplete; the next step is to dump
+the captured buffer against the reference array rather than to read the test
+again.
+
 A caution about how that number was arrived at. Three earlier measurements of
 this family were taken while **four CTS runs were competing for one GPU** —
 several of my own wait loops had never exited and were each holding an
