@@ -16564,3 +16564,55 @@ of the nine failures left in 420pack is now the same storage-buffer wall —
 `maxStorageBuffersPerShaderStage` is 10 on this adapter, a packed image costs
 two of them, and the driver already asks for more than it is given. There is no
 second cause left in it.
+
+### Instanced and indexed patch draws
+
+The last three `KHR-GL45.tessellation_shader` failures looked like three
+problems and were one. Two were `tessellation_shader_tc_barriers` cases
+failing with *Invalid data captured*, which reads as a memory-ordering bug in
+the control stage, and the third was
+`gl_InvocationID_PatchVerticesIn_PrimitiveID` reporting *Invalid gl_InvocationID
+value used in TC stage*, which reads as a bad invocation mapping.
+
+Neither was true. `GEX_WGPU_TESS_LOG` says what actually happened:
+
+    tess decline detail isz=0 inst=4 count=12 patch_vertices=4
+    tessellated draw declined (an indexed or instanced patch draw)
+
+The draw never ran. Every value the test read back was whatever the buffer
+held before, and the first mismatch it reported named the innocent thing it
+happened to check first. **A declined draw and a wrong draw are not
+distinguishable from the test's side**, which is worth remembering before
+believing a CTS failure's description of itself.
+
+Both halves of that decline are now served, and both were already solved one
+stage over:
+
+- **Instanced.** The capture models instances through
+  `GEX_WGPU_PARAM_VERTS_PER_INSTANCE` — the geometry path has used it all
+  along — and runs the vertex shader once per (instance, vertex),
+  instance-major, so a linear invocation still lands on the right vertex. The
+  tessellation path simply never set it. The control and evaluation passes need
+  no changes at all: they see one long run of patches.
+- **Indexed.** The same CPU-built slot table the geometry path uploads, minus
+  the primitive assembly, since a patch's vertices are consecutive. One
+  instance's worth, because every instance repeats the same indices.
+
+The one thing that genuinely differs is `gl_PrimitiveID`, which GL numbers
+within the *instance* while everything that addresses a patch counts across the
+whole dispatch. `gex_wgpu_tess_primitive_id` wraps it against a new parameter
+that is zero for a non-instanced draw, where the two coincide.
+
+`tessellation_shader` 137 → **139/140**, measured on an idle machine. The one
+left is `max_in_out_attributes`, which produces wrong data at the maximum
+attribute count with no driver message at all — a separate question from this
+one, and the only failure that family has left.
+
+A caution about how that number was arrived at. Three earlier measurements of
+this family were taken while **four CTS runs were competing for one GPU** —
+several of my own wait loops had never exited and were each holding an
+invocation alive, truncating each other's output. A concurrent run does not
+merely slow this suite down; it changes what the numbers mean. `pgrep -xc`
+prints `0` *and* exits non-zero, so the usual `$(pgrep -xc foo || echo 0)`
+yields `0\n0` and every equality test against `0` fails forever. Check
+`ps -eo args | grep -c '[g]lcts'` before believing a family total.
