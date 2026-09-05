@@ -15839,3 +15839,49 @@ its own comment says is worth an entire app sweep was never actually started;
 and a failed launch leaves a **zenity error dialog titled "Minecraft"**, which
 matches a window search by name and photographs as a small grey box. Match the
 game window by size, and read the dialog's text -- it names the cause.
+
+## GL 4.6 is one extension away, not two
+
+`ARB_shader_group_vote` is in, and the route was not the one the note beside it
+described. Every link of the obvious chain exists — NIR's vote intrinsics,
+ntv's `SpvOpGroupNonUniformAny/All/AllEqual`, WGSL's `subgroupAny`, and the
+adapter granting `Subgroups` — except that **Tint's SPIR-V reader has never
+heard of the opcodes**. Re-checked against the Tint in use on 2026-09-05: they
+appear in its writer and nowhere else in the tree, so waiting for that link is
+still waiting.
+
+Carrying a real ballot through is not the only way to answer one. GL leaves the
+invocation group implementation-defined and a group of one is legal, which
+makes `anyInvocationARB` and `allInvocationsARB` the value itself and
+`allInvocationsEqualARB` true. No subgroup operation is emitted, so Tint's
+reader is never asked. That is `nir_lower_subgroups`' `lower_vote_trivial`, and
+it is what **zink** — where this driver's emitter comes from — does for a stage
+its device lacks subgroup support in, while still claiming the extension.
+
+`KHR-GL45.shader_group_vote` passes **5/5**, which is what the change was
+conditional on: trading NotSupported for Failed would be worse than not
+claiming it. The honest cost is that the answers differ from a driver with
+wider ballots — llvmpipe answers `allInvocationsARB` of a condition only one
+invocation sees with false, and this answers true — which is why
+`gl44-group-vote-probe` is an expected DIFF at 2 of 3 rather than a pass.
+
+**What is left for 4.6 is `ARB_polygon_offset_clamp` and the GLSL level**, and
+they have to move together: `st_extensions` assigns
+`consts->GLSLVersion = caps.glsl_feature_level` and *nothing lowers it*, so
+raising it to 460 before the extension lands would advertise GLSL 4.60 against
+a 4.5 context.
+
+The clamp was re-measured the same day, on the guess that a newer Dawn had
+implemented it. It has not. The probe's two clamp cases were restored and
+discriminated at once: `offset_clamp_absent` passes, so the entry point is
+wired to the same bias, while `offset_clamp_rounds_away` still draws a pull it
+should have rounded away. The old note's guess about *where* it goes missing
+was wrong and is corrected in the source: Dawn's Vulkan backend does enable the
+device feature (`usedKnobs.features.depthBiasClamp = VK_TRUE`) and does hand
+the value to the pipeline (`rasterization.depthBiasClamp = GetDepthBiasClamp()`),
+and this adapter is Vulkan on RADV, so it is dropped past both.
+
+The cases now live written-out in a comment rather than run, because llvmpipe
+claims the extension and this driver does not, so running them would make the
+probe differ on the *case count* — noise rather than evidence. Paste them back
+to re-check.

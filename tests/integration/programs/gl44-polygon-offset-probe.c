@@ -165,12 +165,23 @@ int main(void) {
         {"offset_disabled_loses", 0.0f, 0},
         /* ARB_polygon_offset_clamp's two cases -- offset through
          * glPolygonOffsetClampEXT with no clamp, and the same offset clamped
-         * to a magnitude below one depth unit so the pull rounds away -- were
-         * written and then removed. This driver does not claim the extension:
-         * the clamp reaches WebGPU intact and has no effect on Dawn, while
-         * the bias beside it works. The reasoning is recorded next to
-         * caps->polygon_offset_clamp; restore the cases when the platform
-         * honours it, and they will discriminate immediately. */
+         * to -1e-9, a sixtieth of a 24-bit depth unit, so the pull must round
+         * away -- are written out here rather than run, because this driver
+         * does not claim the extension and llvmpipe does. Run they would make
+         * this probe differ from its reference on the *case count*, which is
+         * noise, not evidence.
+         *
+         *     {"offset_clamp_absent",      -8.0f, 1,  0.0f,  1},
+         *     {"offset_clamp_rounds_away", -8.0f, 0, -1e-9f, 1},
+         *
+         * They were restored and measured on 2026-09-05 to check whether a
+         * newer Dawn had implemented the clamp. It has not:
+         * `offset_clamp_rounds_away` still drew the pull it should have
+         * rounded away, while `offset_clamp_absent` passed -- so the entry
+         * point is wired to the same bias and it is the clamp alone that is
+         * dropped. Paste them back to re-check; they discriminate at once.
+         * The reasoning, and where Dawn does *not* drop it, is recorded next
+         * to caps->polygon_offset_clamp. */
     };
 
     for (unsigned i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {

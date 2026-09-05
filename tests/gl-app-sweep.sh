@@ -77,7 +77,22 @@ while read -r app; do
     wgpuerr=$(grep -c "WebGPU error" "$l" 2>/dev/null)
     latched=$(grep -c "gex_wgpu context failed\|context latched" "$l" 2>/dev/null)
     refused_real=${refused_real:-0}; wgpuerr=${wgpuerr:-0}; latched=${latched:-0}
-    if [ "$r" -gt 128 ] && [ "$r" -ne 137 ]; then echo CRASH
+    # 127 first, and in *this* function rather than only beside the driver
+    # run. The comment above promises one classifier for both drivers so that a
+    # difference between them cannot be a difference of rules -- and this was
+    # the one rule the reference did not have. A program that cannot start at
+    # all (dotewm, wanting a libGLEW this machine does not have) exits 127
+    # under both, was called HARNESS on one side and EXIT on the other, and so
+    # appeared in the differs column, which is the column meant to be evidence.
+    if [ "$r" -eq 127 ]; then echo HARNESS
+    # A signal death is 128+signo and signo never exceeds 64, so the crash
+    # range ends at 192. Without the upper bound an ordinary `exit 255` was
+    # reported as "CRASH ... signal 127": glsync exits that way saying
+    # "GLX_SGI_video_sync not supported", glxpixmap saying "glXCreateContext
+    # failed", and both do it identically on llvmpipe. Crash counts from this
+    # sweep have been the starting point for investigations before, so an
+    # inflated one is expensive.
+    elif [ "$r" -gt 128 ] && [ "$r" -le 192 ] && [ "$r" -ne 137 ]; then echo CRASH
     elif [ "$wgpuerr" -gt 0 ]; then echo WGPU-ERROR
     elif [ "$refused_real" -gt 0 ]; then echo REFUSED
     elif [ "$latched" -gt 0 ]; then echo LATCHED
@@ -104,7 +119,7 @@ while read -r app; do
   note=""
   if [ "$rc" -eq 127 ]; then
     verdict=HARNESS; note="could not execute"
-  elif [ "$rc" -gt 128 ] && [ "$rc" -ne 137 ]; then
+  elif [ "$rc" -gt 128 ] && [ "$rc" -le 192 ] && [ "$rc" -ne 137 ]; then
     verdict=CRASH; note="signal $((rc-128))"
   elif [ "$wgpuerr" -gt 0 ]; then
     verdict=WGPU-ERROR
