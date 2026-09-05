@@ -16204,3 +16204,28 @@ patched, so a local patch would make the native build pass what the real target
 still refuses — which is the same trap as any measurement that flatters the
 thing being measured. The honest place for a fix is upstream Dawn, giving its
 Vulkan physical device the same derivation D3D12 and Metal already have.
+
+## An unhandled opcode aborts the application
+
+`emit_alu` in `nir_to_spirv.c` ends in `assert(!"unsupported opcode")`, which
+takes the **process** down rather than failing one shader. Every other failure
+mode here degrades — a refusal, a decline, a validation error — and this one
+does not.
+
+Alacritty exited 134 on startup for want of `nir_op_b2b32`. Nothing in the CTS
+finds that, because the CTS does not run terminal emulators;
+`tests/gates/app-candidates.sh` does, and reports it as an exit code with
+`not implemented (b2b32)` in the application's own log.
+
+Two things to know before adding a case to that family. `get_alu_type` maps
+*any* `nir_type_bool` to a SPIR-V bool whatever the NIR bit size, so `b2b1` and
+`b2b32` look interchangeable — and are not: a **wide** NIR boolean is a 0/~0
+integer here, so the widening direction must produce those bits and record
+`atype = nir_type_int`. Returning a SPIR-V bool clears the abort and then fails
+downstream, where the consumer bitcasts it and Tint refuses
+`OpBitcast %float %<bool>`.
+
+And fixing it revealed what it hid: alacritty now runs and draws its window,
+while its **glyphs do not appear at all, with no message from the driver**.
+That is the next thing to chase there, and it is a silently vanishing draw
+rather than anything that announces itself.
