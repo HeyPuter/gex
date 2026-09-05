@@ -17019,3 +17019,73 @@ This is the trap already recorded for the u_vbuf layouts, in a second place:
 
 Both probes are in the suite, which is 114/117 with the same three long-standing
 expected DIFFs.
+
+### A refused sampler is not a neutral outcome
+
+`KHR-GL45.gpu_shader5` was 13/22 against llvmpipe's 22/22, and seven of the
+nine failures were `texture_gather_offset`. The message was
+
+    gex-wgpu: capture shader rejected: Tint rejected SPIR-V:
+    error: sampled image must have float component type
+
+These tests gather in the *vertex* stage and read the results back through
+transform feedback, so what failed was the vertex-as-compute **capture**
+variant. The varying variant has run `gex_wgpu_lower_texture_variant` since
+the emulated stages learned to sample — WGSL cannot sample an integer texture,
+so `texture()` or a gather on one becomes a fetch that applies the wrap,
+filter and swizzle itself — and the capture variant never did. Adding it, with
+the sampler state in its cache key the way the varying variant carries it,
+took the family to 16/22.
+
+The four `clamp` cases stayed. Assembling the rejected SPIR-V is what located
+them: the module held four lowered `OpImageFetch` **and** two surviving
+`OpImageGather %v4int`, and the decorations named the difference — the fetches
+went through `gex_texture0`, the gathers through `gex_texture1`. Slot 1 had not
+been lowered. A one-line diagnostic said why:
+
+    gex-captex: int_sampled=0x0003 tex=2: [0]view=1 samp=1 [1]view=1 samp=0
+
+**A view with no sampler state.** The lowering reads that as "texelFetch only —
+there is nothing to model", and leaves the gather alone.
+
+Three layers had to be ruled out before the last one. Mesa's `SamplersUsed` was
+`0x3` with `SamplerUnits` 0 and 1, so st did want both; st handed cso two
+non-null states; and cso's `set_samplers` only skips a *null* template. The
+null was ours. `create_sampler_state` had refused the sampler, and a refusal
+returns NULL — which is indistinguishable from "no sampler was ever bound".
+
+The refusal was `clamp-to-border with … mip filtering`, and it was stricter
+than the pass that would have served it: `gex_wgpu_border_lowering` carries
+`integer_mip_filter` and `integer_levels`, computes the level and clamps it,
+and declines only `MIPFILTER_LINEAR`. Allowing mip-nearest with a border took
+the family to 18/22.
+
+The general lesson is the one the existing comments in that function keep
+circling: **a refusal in `create_sampler_state` does not decline the draw, it
+deletes the state.** Every consumer downstream then reads the slot as one that
+needs no sampler, so the very lowering written to handle the refused case never
+runs. When a refusal is the honest answer it has to be a *named* one; when a
+shader pass can serve the state, the refusal must not fire first.
+
+#### The shadow map that lost its border
+
+The same refusal covered `comparison` too, and that one is not a CTS curiosity.
+`GL_CLAMP_TO_BORDER` with a border of 1.0 on a `sampler2DShadow` is *the*
+shadow-mapping idiom — it is how everything outside the shadow map is made lit.
+The sampler was refused, a refused sampler is served by the default one, and
+the border silently became clamp-to-edge, comparing the reference against
+whichever edge texel happened to be there. `gl44-shadow-border-probe` reads 0
+where llvmpipe reads 255, at every map boundary, with nothing in the log.
+
+The fix needs one idea beyond the colour case: the border texel is not a value
+that replaces the result. GL compares the reference against it exactly as
+against a real texel, so what the outside of the texture returns is
+`compare_func(ref, border)` as a 0.0/1.0 result. The lowering table carries the
+comparison and its function for that, and a shadow result skips the view
+swizzle because it is a scalar rather than a vec4.
+
+What is still not served is a shadow **gather** with a border: each of its four
+texels can be outside independently, so it wants the per-texel decomposition
+the integer gather already has. That is the whole of what the two remaining
+`texture_gather_offset_depth_clamp` cases want, and they now fail on values
+rather than on a rejected module.
