@@ -15569,3 +15569,38 @@ work and nothing else covered -- a vertex shader reading instance data or
 skinning matrices out of a storage buffer, which is how a modern engine feeds
 one.
 
+### An array of images
+
+`layout(rgba32f) uniform image2D g_image[6]` is ordinary GL 4.2, and WGSL has
+no arrays of textures or samplers at all. The combined-sampler split had always
+turned `sampler2D tex[N]` into N variables; nothing did the same for images, so
+the array reached Tint intact and the refusal named an OpVariable number and
+nothing else.
+
+The split is the same shape -- consecutive units, one variable each -- and it
+took three goes to get right, each failure teaching something different:
+
+- **Unlinking the array variable by hand left dangling derefs.** The derefs
+  that named it are still in the IR, dead but present, and the symptom is not
+  local: `nir_clone.c: _lookup_ptr: Assertion state->allow_remap_fallback`
+  in whichever later pass clones the shader. DCE and
+  `nir_remove_dead_variables` do it in the right order.
+- **`for (int i = 0; i < 6; ++i) imageStore(img[i], …)` does not always
+  unroll.** Refusing a dynamic element would have left the split useful only
+  for shaders that had already been unrolled for it, so it unrolls the access
+  the way `gex_wgpu_lower_dynamic_sampler_index` does -- one copy per element
+  under a comparison, accumulating into a temporary where there is a result.
+- **The elements arrive with no access qualifier and Tint infers one anyway.**
+  GLSL's `readonly`/`writeonly` are optional and Mesa cannot fill them in
+  here -- its analysis identifies the variable behind an access with
+  `nir_chase_binding`, which an array element defeats -- so the driver called
+  every element read_write while Tint, reading the SPIR-V, lowered a
+  read-only image to a plain texture. "Binding type in the shader (texture)
+  doesn't match the type in the layout (storageTexture)". The split visits
+  every access, so it is the one place that knows: it records reads and writes
+  per element and sets the qualifier itself.
+
+`es_31_compatibility` 235 -> **238 of 355**, `shader_image_load_store` 15 ->
+**16 of 51**, and the capability is the point -- an image array is how a
+renderer addresses its mip chain or its G-buffer.
+
