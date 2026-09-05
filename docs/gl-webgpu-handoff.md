@@ -16779,9 +16779,34 @@ the sampler state in its cache key, since a module that bakes in wrap and
 swizzle can no longer be reused just because the layouts match.
 
 `limits.max_texture_units` passes. `max_combined_texture_units` now links and
-returns *wrong data* instead, which is a different problem: it drives sixteen
-`usampler2D` in each of the vertex, geometry and fragment stages, and something
-in that is not producing the values it should.
+returns *wrong data* instead — a different problem, and narrowed enough to be
+worth handing over precisely:
+
+    Wrong result! Expected: 108 Extracted: 100 Point: 9 X: 0 Y: 0
+
+Each of the three stages sums `textures[0 .. point-1]`, and `textures[i].data`
+is `i`, so point 9 expects `3 × (0+…+8) = 108`. We return 100 — **exactly 8
+short, once**. Points 0 through 8 all pass, and point 9 is the first whose sum
+includes **texture unit 8**. So one stage reads unit 8 as zero and the other two
+read it correctly.
+
+Ruled out on the way there:
+
+- The dynamic sampler index is unrolled correctly in all three stages —
+  `GEX_WGPU_SPLIT_LOG` reports *unrolling a dynamic sampler index over 16
+  unit(s)* three times, and `split 16 combined sampler(s), 16 rebuilt` for each.
+- The stage split is not lopsided. The test derives its per-stage counts from
+  `MAX_COMBINED_TEXTURE_IMAGE_UNITS`, and ours is 80 (five stages of sixteen),
+  so it gives vertex, geometry and fragment sixteen each. A smaller combined
+  limit *would* have produced exactly this symptom by giving the geometry stage
+  eight units, which is why it was worth checking.
+
+**The next step is to find out which stage**, and the shader hands that over
+for free: it carries the partial sums as flat varyings — `vs_gs_sum`,
+`gs_fs_vertex_sum` and `gs_fs_geometry_sum` — so capturing those separates the
+three contributions without any guessing. We sit at exactly the device's
+sixteen sampled textures per stage, which is the obvious thing to suspect next
+and not yet evidence of anything.
 
 **One data mismatch at the maximum (1).** `limits.max_output_components`
 reports `Fail (Fail)` with no driver message at all — the same shape as
