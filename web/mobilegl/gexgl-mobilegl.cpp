@@ -91,6 +91,19 @@ void mesa_get_internal_format_iv(GLenum target, GLenum internal_format,
     function(target, internal_format, pname, count, values);
 }
 
+/* ARB_polygon_offset_clamp. Mesa exposes an extension entry point through
+   GetProcAddress rather than as a linkable symbol -- even the native libGL.so
+   does not export this one -- so calling it by name here linked Emscripten's
+   *WebGL* implementation instead, which threw
+   "Cannot read properties of undefined (reading 'extPolygonOffsetClamp')"
+   on the first draw that used it. */
+void mesa_polygon_offset_clamp(GLfloat factor, GLfloat units, GLfloat clamp) {
+    using Function = void (*)(GLfloat, GLfloat, GLfloat);
+    static Function function = mesa_proc<Function>("glPolygonOffsetClampEXT");
+    function(factor, units, clamp);
+}
+
+#define glPolygonOffsetClampEXT mesa_polygon_offset_clamp
 #define glGetProgramResourceLocationIndex mesa_get_program_resource_location_index
 #define glPatchParameterfv mesa_patch_parameter_fv
 #define glGetInternalformativ mesa_get_internal_format_iv
@@ -182,7 +195,7 @@ enum Op : uint32_t {
     TEX_GENI = 231, TEX_GENFV = 232, WINDOW_POS3F = 233,
     SELECT_BUFFER = 234, RENDER_MODE = 235, INIT_NAMES = 236,
     LOAD_NAME = 237, PUSH_NAME = 238, POP_NAME = 239,
-    DRAW_ELEMENTS_FULL = 240,
+    DRAW_ELEMENTS_FULL = 240, POLYGON_OFFSET_CLAMP = 241,
 };
 
 struct Reader {
@@ -1403,6 +1416,7 @@ bool one(uint32_t op, Reader& a) {
     case STENCIL_OP_SEPARATE: { GLenum face=a.u32(), fail=a.u32(), zfail=a.u32(), zpass=a.u32(); glStencilOpSeparate(face,fail,zfail,zpass); break; }
     case BLEND_FUNC_SEPARATE: { GLenum srgb=a.u32(), drgb=a.u32(), sa=a.u32(), da=a.u32(); glBlendFuncSeparate(srgb,drgb,sa,da); break; }
     case POLYGON_OFFSET: { GLfloat factor=a.f32(), units=a.f32(); glPolygonOffset(factor,units); break; }
+    case POLYGON_OFFSET_CLAMP: { GLfloat factor=a.f32(), units=a.f32(), clamp=a.f32(); glPolygonOffsetClampEXT(factor,units,clamp); break; }
     case LINE_WIDTH: glLineWidth(a.f32()); break;
     case CLEAR_STENCIL: current_clear_stencil=a.i32(); glClearStencil(current_clear_stencil); break;
     case DEPTH_RANGE: { GLfloat near_value=a.f32(), far_value=a.f32(); glDepthRangef(near_value,far_value); break; }

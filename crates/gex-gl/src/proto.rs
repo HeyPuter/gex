@@ -407,6 +407,7 @@ pub mod op {
     /// then the indices have to travel with the command and the client vertex
     /// arrays have to be uploaded as far as they reach.
     pub const DRAW_ELEMENTS_FULL: u32 = 240;
+    pub const POLYGON_OFFSET_CLAMP: u32 = 241;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

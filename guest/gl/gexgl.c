@@ -341,6 +341,17 @@ void glBlendFuncSeparate(unsigned srgb, unsigned drgb, unsigned sa, unsigned da)
 void glPolygonOffset(float factor, float units) {
     CMD2(GEXGL_POLYGON_OFFSET, as_bits(factor), as_bits(units));
 }
+/* ARB_polygon_offset_clamp. Core in GL 4.6, which this driver now reports,
+   so an application that checks the version and calls it has to find it --
+   the extension string is generated from what this library exports, and the
+   version came from the host either way. */
+void glPolygonOffsetClamp(float factor, float units, float clamp) {
+    CMD3(GEXGL_POLYGON_OFFSET_CLAMP, as_bits(factor), as_bits(units),
+         as_bits(clamp));
+}
+/* No glPolygonOffsetClampEXT alias here: gl-aliases-generated.inc emits one
+   for every registry alias whose base function this library defines, and it
+   started emitting this one as soon as the base appeared above. */
 void glLineWidth(float width) { CMD1(GEXGL_LINE_WIDTH, as_bits(width)); }
 void glClearStencil(int value) { CMD1(GEXGL_CLEAR_STENCIL, value); }
 void glDepthRangef(float near_value, float far_value) {
@@ -1317,19 +1328,37 @@ static void gexgl_flush_coherent_maps(void) {
         size_t last = object->map_length;
         while (last > first && now[last - 1] == sent[last - 1]) --last;
         const size_t length = last - first;
-        memcpy(sent + first, now + first, length);
-        /* glBufferSubData names a target, so the buffer has to be the bound
-           one. Every buffer this loop can reach was mapped through a binding
-           that is still recorded, and the mapping's own target is the one to
-           use. */
+        /* glBufferSubData names a target, so the buffer has to be *a* bound
+           one. Whichever target it is already bound to will do; when it is
+           bound to none, it is bound to GL_COPY_WRITE_BUFFER for the upload
+           and the previous binding put back. That target exists for exactly
+           this and disturbs nothing else.
+           This used to `continue` instead, which loses an application's
+           writes without a word: a pool of persistent mappings has only the
+           one it drew from last still bound, so every other buffer in it went
+           unsent. It is the same shape as the driver's own persistent[8]. */
         unsigned target = 0;
         for (size_t i = 0; i < sizeof(buffer_targets) / sizeof(buffer_targets[0]);
              ++i)
             if (buffer_targets[i].target && buffer_targets[i].name == object->name)
                 { target = buffer_targets[i].target; break; }
-        if (!target) continue;
+        const unsigned copy_write = 0x8F37u; /* GL_COPY_WRITE_BUFFER */
+        unsigned restore = 0;
+        const int borrowed = !target;
+        if (borrowed) {
+            target = copy_write;
+            restore = bound_buffer(copy_write);
+            glBindBuffer(copy_write, object->name);
+        }
         glBufferSubData(target, (long)(object->map_offset + first), (long)length,
                         now + first);
+        if (borrowed)
+            glBindBuffer(copy_write, restore);
+        /* Only now. Recording the span as sent before the send could be
+           skipped left the mapping claiming bytes the host never saw, and the
+           next diff then found nothing to send -- so a buffer that missed its
+           one chance never recovered. */
+        memcpy(sent + first, now + first, length);
     }
 }
 

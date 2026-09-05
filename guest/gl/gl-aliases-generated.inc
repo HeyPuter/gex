@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 470 of them whose target this
+ * claimed -- so here are the 471 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -244,6 +244,7 @@ extern __typeof(glPointParameterfv) glPointParameterfvSGIS __attribute__((alias(
 extern __typeof(glPointParameteri) glPointParameteriNV __attribute__((alias("glPointParameteri")));
 extern __typeof(glPointParameteriv) glPointParameterivNV __attribute__((alias("glPointParameteriv")));
 extern __typeof(glPolygonMode) glPolygonModeNV __attribute__((alias("glPolygonMode")));
+extern __typeof(glPolygonOffsetClamp) glPolygonOffsetClampEXT __attribute__((alias("glPolygonOffsetClamp")));
 extern __typeof(glPopDebugGroup) glPopDebugGroupKHR __attribute__((alias("glPopDebugGroup")));
 extern __typeof(glProgramParameteri) glProgramParameteriARB __attribute__((alias("glProgramParameteri")));
 extern __typeof(glProgramParameteri) glProgramParameteriEXT __attribute__((alias("glProgramParameteri")));
