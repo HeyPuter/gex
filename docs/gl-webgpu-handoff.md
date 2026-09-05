@@ -27,12 +27,26 @@ Active goal: build a conformant OpenGL 4.4 to WebGPU path, then achieve stable r
 
 ## Current direction
 
+**This section was stale for a long time and is corrected as of 2026-09-05.**
+It used to say "do not run STK or benchmark FPS yet; rendering correctness is
+demonstrably unresolved", which was true when written and is the first thing a
+new reader sees. STK has been a standing gate for many sessions.
+
 - Production architecture is stock guest GL transport -> Mesa `st/mesa` -> NIR -> the `gex_wgpu` Gallium driver -> WebGPU.
 - MobileGL is no longer treated as the production implementation.
-- STK is an acceptance workload, not the debugging method.
-- Do not run STK or benchmark FPS yet. Rendering correctness is demonstrably unresolved.
-- Keep all unproven Gallium capabilities disabled.
+- **GL 4.5 is granted**, past the 4.4 the goal asks for; 4.6 needs
+  `ARB_polygon_offset_clamp`, which this platform drops below Dawn.
+- **STK renders, and is a gate** — `tests/gates/app-stk.sh`, run every pass.
+  So do Blender, Minecraft 26.2, Krita (canvas included), FreeCAD (viewport
+  included) and alacritty.
+- Capabilities are exposed when proven and *only* then, which has not changed.
+  What has changed is how many are proven: see the gate list below and the
+  family scores throughout.
 - No ThinLTO is enabled or desired.
+- **Everything above is native.** The browser is the real target and is more
+  strictly validated than native Dawn, so a native-only pass is not a pass —
+  see the note on that further down before believing any of these numbers of
+  the browser.
 
 The user's key correction was that repeated STK launches cannot uncover the implementation's many independent correctness defects. Work therefore moved to deterministic differential testing, sanitizers, capture/replay, and sequence minimization.
 
