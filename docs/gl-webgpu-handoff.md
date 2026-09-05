@@ -15222,3 +15222,48 @@ not a driver failure, and a latch would cost every case after it.
 failing for want of the feature -- but the run no longer emits WebGPU
 validation errors, which is the thing worth having: an error there was never
 confined to the case that caused it.
+
+### Clearing the rest of the validation errors, and the bug underneath
+
+Chasing `shader_image_load_store`'s remaining WebGPU errors to zero turned up
+four more of the same shape and one that was not.
+
+- **A texture created for image use alone had no `TextureBinding`.** A
+  *read-only* image is not a storage texture in WGSL at all -- Tint lowers one
+  to a plain `texture_2d<T>` read with `textureLoad` -- so it wants a sampled
+  binding. `StorageBinding` is already granted to every storable single-sampled
+  texture, because `glBindImageTexture` arrives long after creation; the same
+  argument gives `TextureBinding`, and the two now travel together.
+- **The 1x1 stand-in for an unbound image unit** had the same gap, and then a
+  second one behind it: the cache was keyed on dimension and format, so one
+  texture served both a read-only unit and a write-only one in the same pass --
+  "writable usage and another usage in the same synchronization scope". The
+  access is part of the key now.
+- **Two writable storage bindings over one range** cannot be repaired: it is
+  one texture bound to two image units, and the packed buffer lives on the
+  resource, so both bindings are the same buffer. The existing
+  `GEX_WGPU_ALIAS_TRACE` helper already walked the pairs -- it deliberately
+  ignored same-type pairs, because the mixed pair was the case being chased
+  then -- so it now returns whether it found the unfixable one and the draw
+  declines. It stays cheap by counting writable bindings first; almost every
+  draw has none.
+
+**And then the one that was not a validation error.** Adding that decline made
+the run *crash*, in a later case, inside Dawn's `AbslFormatConvert` --
+formatting a dangling object's label for a validation message. A packed image's
+copy back into its texture is deferred to when the render pass closes, and the
+pending copy held its `pipe_resource` as a **bare pointer**; what normally kept
+it alive was the batch, which a draw touches at its *end*. A draw that declined
+after registering the copy left nothing holding the resource, so it died with
+the test case and the flush copied into freed memory. The pending copy takes a
+reference now, released on every path that clears the queue.
+
+That bug was already there -- two older declines on the same path have the same
+shape and had simply never been reached. It is worth noting how it presented:
+the case crashed only in company, passed alone, and the stack named neither the
+draw that declined nor the image. One `gdb -batch -ex run -ex bt` on the pair
+gave the whole thing.
+
+`shader_image_load_store` 14 -> 15 of 51, and its run went from about forty
+WebGPU validation errors to **none**.
+
