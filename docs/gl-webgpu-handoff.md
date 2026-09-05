@@ -15465,3 +15465,40 @@ the *colour*.
 
 `geometry_shader` 121 -> **123 of 136**.
 
+### A sampler array indexed by a variable
+
+`texture(samplers[i], c)` with a variable `i` -- a texture atlas, a material
+array, any shader looping over its inputs -- was refused, and the refusal
+reached the application as a failed link with no reason attached: *five*
+different conditions shared the message "could not split a combined sampler".
+Naming each one is what found this.
+
+WGSL has no sampler arrays in any form, so the index cannot survive into the
+module. It can be **unrolled**: the array is a known, small number of units, so
+the instruction becomes one copy per unit under a comparison against the index,
+each copy naming its unit as a constant. The result lands in a function
+temporary rather than a phi web -- the builder makes that far easier to get
+right -- and vars-to-ssa turns it back into values immediately.
+
+Three things about it were not obvious, and each cost a build:
+
+- **A clone's sources are not in any use list until the instruction is
+  inserted.** Removing one from an uninserted clone walks a list node whose
+  `prev` is null. Insert first, then edit.
+- **The index arrives in two spellings.** The graphics stages have it as a
+  `texture_offset` src (st has lowered samplers to indices); the compute and
+  emulated stages still have a deref with a dynamic array index. An
+  instruction can carry *both*, and fixing only one leaves it dynamic as far
+  as the split is concerned -- which is what kept refusing after the first
+  version.
+- **The texture and sampler offsets are different SSA values.** They compute
+  the same element, because nothing has CSE'd them yet. Requiring the same
+  *value* refused every real case; the condition that matters is the same base
+  unit, which a combined sampler guarantees and a separated pair would fail.
+
+`shading_language_420pack` 310 -> **311 of 329**. The two geometry cases that
+still fail want an *integer* sampler in an emulated stage, which Tint's SPIR-V
+reader refuses ("sampled image must have float component type") and which the
+compute path already answers with per-dispatch variants -- the same treatment
+extended to the emulated stages is the next step there.
+
