@@ -16812,3 +16812,40 @@ Two practical notes for the next person:
   is then at about (313, 953) — the sequence has to happen inside one run,
   because the app exits when its timeout expires and a screenshot taken after
   that photographs a stale window.
+
+### The app sweep after a day of driver changes: 336 programs, one difference
+
+Run on an idle machine after images in every stage, packed images in the
+compute-emulated stages, instanced and indexed patch draws, the vertex-layout
+gap fix and the evaluation-shader link change. Every installed GL program runs
+twice, once on gex_wgpu and once on llvmpipe, and the same classifier judges
+both so that a difference between them cannot be a difference of rules.
+
+    287 RAN   24 EXIT   16 OK   6 CRASH   3 HARNESS
+
+**One program in 336 differs, and it favours this driver:** `eglinfo` exits 0
+here and non-zero on llvmpipe. Nothing else in the file has `differs=YES`.
+
+The six crashes are the reason the differ column exists rather than the totals.
+Every one of them is `differs=no`:
+
+    hyprland, Hyprland, muffin          signal 6 on *both* drivers
+    weston-simple-dmabuf-egl
+    weston-simple-dmabuf-feedback       likewise
+    weston-simple-egl
+
+Three Wayland compositors and three Wayland dmabuf clients, none of which can
+run in this environment on any driver. Read as a total, "6 CRASH" invites an
+investigation into a driver that caused none of them — which is exactly how an
+earlier sweep was misread as 193/337 failing when a window manager had died.
+
+A separate scan of every gex log found **no** Tint rejection, WebGPU error,
+shader rejection, decline, segfault or abort anywhere in the run. That is worth
+recording as a second, independent signal, but it is the weaker of the two: a
+program can render *wrongly* while printing nothing at all, which is precisely
+what the differ column catches and a log scan cannot.
+
+One thing noticed in passing and not chased: `eglinfo` lists about 20 EGL
+configs here against llvmpipe's ~105. No application in the sweep minded, but
+config coverage has caused trouble before — see the opaque-GLX-config note —
+so it is written down rather than forgotten.
