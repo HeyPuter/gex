@@ -16849,3 +16849,42 @@ One thing noticed in passing and not chased: `eglinfo` lists about 20 EGL
 configs here against llvmpipe's ~105. No application in the sweep minded, but
 config coverage has caused trouble before — see the opaque-GLX-config note —
 so it is written down rather than forgotten.
+
+### Today's work verified in the real browser, not only natively
+
+The note added at the top of this document warns that native Dawn is more
+permissive than the browser, so a native-only pass is not a pass. Everything
+above had been measured natively, and the browser was still running the wasm
+driver built on **3 September** — none of images-in-every-stage, packed images
+in the emulated stages, instanced and indexed patch draws, the vertex-layout
+gap fix or the evaluation-shader link change had ever executed on the real
+target.
+
+Rebuilt (`web/build-mesa-wasm.sh`) and checked with `tests/gl44-probe.sh`,
+which is the only harness here whose WebGPU results are *compared* rather than
+looked at: it builds each probe twice, natively for the expected `SUMMARY` line
+and again for the guest, and requires the browser run to produce the same line.
+
+    image          15 of 15    fragment/compute images, atomics, format-class
+                               views, sampled-and-written
+    stage-image     4 of 4     vertex, geometry, tess control, tess eval
+    tessellation   12 of 12    quad/tri/fractional/culled/winding
+
+`stage-image` is the one that matters most: all four stages read back
+`191,128,64` in the browser, the same values they produce natively, so images
+in every stage is real on the target platform and not an artefact of Dawn's
+permissiveness.
+
+**And the browser is not capped at 3.3.** The probe reports
+
+    version=4.5 (Core Profile) … vertex_images=8 geometry_images=8
+
+The existing note that the guest's EGL hands out 3.3 Core describes what an
+*empty* attribute list yields, which is still true and still a trap for a probe
+that does not ask. It is not a ceiling: request 4.1 and the browser gives 4.5
+Core, the same version the driver grants natively.
+
+The probes were run in this order on purpose — `image` first, on a 3.3 context,
+to establish that the harness and the fresh build work at all, and only then
+the 4.1 ones. Without that step a harness failure would have read as a driver
+bug, which is the shape of mistake this document records twice already today.
