@@ -15142,11 +15142,48 @@ buffer and bound to a uniform block later was not. Every buffer allocation is
 now 16-aligned -- the same reasoning the usage union already used -- and the
 binding size is rounded up and clamped to what the allocation holds.
 
+### A spilled uniform block is read-only, and nobody had said so
+
+The last case with a device error, `binding_uniform_block_array`, took four
+more steps, each one revealed by the last -- the same shape as the three
+refusals, but in validation rather than in refusals.
+
+A shader with more uniform blocks than the device's uniform-buffer limit has
+the overflow **spilled into storage buffers**. Nothing marked them read-only,
+so the emitter declared them `var<storage, read_write>`, and WGSL forbids that
+in the vertex stage outright: such a shader did not compile at all, however
+little it did with the blocks. Marking `ACCESS_NON_WRITEABLE` at the spill
+fixes the module, and then three things that must agree with it had to be told:
+the dispatch's bind group (`readonly_mask`), and the graphics layout for both
+the vertex and fragment stages, whose comment still said "Storage, not
+ReadOnlyStorage ... the emitter declares every storage buffer read_write".
+
+Two more sat behind those. `maxDynamicUniformBuffersPerPipelineLayout` defaults
+to 8 and this driver binds every uniform block with a dynamic offset, so eleven
+blocks across two stages exceeded it -- with Dawn again saying in the message
+that the adapter supports 16. And a spilled block in a compute-emulated stage
+was still stamped with the *graphics* descriptor set, which a dispatch has no
+group for.
+
+**That last fix is the one that bit.** Moving "storage blocks below the storage
+binding range" to group one also moved the pass's *own* blocks -- the capture
+parameters, the emitted vertices, the per-primitive counts all number from
+zero and are storage blocks too. Every emulated-stage pipeline in the run went
+invalid and the family fell straight back to 48. The predicate has to be the
+spilled-uniform range exactly, `[STORAGE_UBO_FIRST, SSBO_FIRST)`, bounded on
+both sides. **A single case passing is not evidence a shared path is intact**:
+`binding_uniform_block_array` was the case under test and it improved at every
+step, including the step that broke 261 others.
+
+`shading_language_420pack`: **310 of 329**, with no WebGPU validation errors
+left anywhere in the run.
+
 ### What is left in this family
 
-20 cases, and 19 of them are one missing feature: **images in the stages that
-are not compute.** `binding_image_single_stage_vertex`, the four
+19 cases, and 16 of them are one missing feature: **images in the stages that
+are not compute.** `binding_image_single_stage_vertex`, the eight
 `binding_images_texture_type_*` shapes and the rest all bind an image to the
 vertex, tessellation or geometry stage, which this driver serves nowhere but
 the fragment and compute paths. That is the next lever here, and it is a
-feature rather than a refusal to lift.
+feature rather than a refusal to lift. The other three are `line_numbering`,
+`binding_sampler_array` and `binding_samplers_texture_type_buffer`.
