@@ -15709,13 +15709,58 @@ What is *not* covered, and is the real wall here, is a vertex-stage storage
 **write**. WGSL forbids it outright and no qualifier inference reaches it. The
 40 failing `es_31_compatibility.shader_storage_buffer_object.*-vs*` cases are
 all that shape -- `advanced-unsizedArrayLength-vs-int`, for one, reads two
-blocks (both correctly read-only) and writes its answer to a third. Serving
-them means running the vertex shader as a compute dispatch and rasterizing from
-its captured varyings, which is the three-pass geometry-shader architecture
-minus the middle pass; `gex_wgpu_capture_dispatch` is pass one and the
-passthrough vertex shader is pass three, so what is missing is the glue for
-"no geometry shader in between", plus that path's existing limits (no
-instancing, `verts_per_prim <= 3`, a CPU-readable index buffer).
+blocks (both correctly read-only) and writes its answer to a third -- and
+`shader_storage_buffer_object` proper has about 39 more.
+
+### Serving them: the geometry architecture minus its middle pass
+
+A draw with a geometry shader is already three passes here: the vertex shader
+runs as **compute** and writes its varyings to a buffer, the geometry shader
+runs as compute over those, and an ordinary indexed draw rasterizes the result
+with a generated passthrough vertex shader. A vertex shader that writes storage
+wants the first and third of those and nothing in between -- and compute may
+write storage freely, so the refusal disappears.
+
+Both ends exist:
+
+- **Pass one** is `gex_wgpu_capture_dispatch`, which resolves the index buffer
+  and the topology into a slot table of assembled vertices, builds the vertex
+  shader's compute variant with `gex_wgpu_capture_variant_get`, and writes
+  every output into a varyings buffer.
+- **Pass three** is `gex_wgpu_gs_passthrough_nir(pipe, outputs, skip)`, which
+  builds a vertex shader reading one `vec4` attribute per slot and writing it
+  to that slot's varying location. Note its two existing traps, both of which
+  apply unchanged: a clip or cull slot must be declared as a **float array**
+  with `compact` set, not a `vec4` (SPIR-V requires it and Tint enforces it),
+  and a slot that is not a varying at all -- `gl_ViewportIndex`, `gl_Layer` --
+  must be kept in the buffer for stride purposes but excluded from the shader
+  via `skip`, or ntv gives it an `@location` past WebGPU's sixteen.
+
+What is missing is only the glue. The shape:
+
+1. **Detect.** The vertex shader stores to, or atomically updates, a storage
+   block. This is the same scan `gex_wgpu_infer_readonly_ssbos` would have
+   done -- `store_ssbo` / `ssbo_atomic` / `ssbo_atomic_swap`, plus the deref
+   spellings -- so route the draw rather than let Tint refuse the module.
+2. **Capture.** Run pass one as it stands. The slot table already expands the
+   topology into independent primitives, so the captured buffer is in
+   assembled order.
+3. **Rasterize.** Draw the captured vertices **non-indexed** with the
+   equivalent independent topology -- a strip or fan of N vertices has become
+   `prims * verts_per_prim` vertices of `GL_TRIANGLES`/`LINES`/`POINTS` -- and
+   bind the passthrough shader plus a vertex element per captured slot.
+
+The limits come free with pass one and are worth stating in the refusal rather
+than discovering later: no instancing (the capture variant does not model the
+instance index), `verts_per_prim <= 3`, and an index buffer readable on the
+CPU. Every failing case in these two families is a plain small draw, so none of
+those bite there.
+
+Worth knowing before starting: this buys CTS cases and essentially no
+application. A vertex shader writing a storage buffer is a GPU-driven-rendering
+idiom, and none of the target applications do it -- so measure it against
+`es_31_compatibility` and `shader_storage_buffer_object`, and do not expect the
+app sweep or the pixel comparison to move at all.
 
 ## Minecraft reaches a world, and its title screen has a trap
 
