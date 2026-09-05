@@ -10695,9 +10695,12 @@ problems, not driver ones; `compute` additionally stops earlier here because
 
 ### Open, and honest about it
 
-- **Compute shader images.** `max_shader_images` is fragment-only by design
-  (`launch_grid` binds storage buffers and nothing else). Implementing them is
-  the remaining piece of `ARB_shader_image_load_store` in compute.
+- ~~**Compute shader images.**~~ Done, and then some. `launch_grid` builds a
+  view and a layout entry per image, and as of 2026-09-05 `max_shader_images`
+  covers *every* stage — fragment, compute, geometry, both tessellation stages
+  and the vertex stage. See "Images in every stage"; this bullet stayed here
+  claiming the opposite for long enough to be worth striking rather than
+  deleting.
 - ~~**Sample counts are understated.**~~ Checked and withdrawn.
   `st_QuerySamplesForFormat` counts the sample counts *above one* that the
   driver accepts and only falls back to `{1}` when there are none, so our
@@ -15512,7 +15515,7 @@ suite pointed at a path a new session does not have.
 They are in `tests/gates` now, with a README that says what each is for and
 which of its results are expected to differ:
 
-    tests/gates/probe-suite.sh     [name]              107 of 111, four known DIFFs
+    tests/gates/probe-suite.sh     [name]              113 of 116, three known DIFFs
     tests/gates/cts-gate.sh                            five families, ~16 seconds
     tests/gates/app-stk.sh         <out.png> [settle]
     tests/gates/app-blender.sh     <out.png> [settle]   GEX_REF=1 for llvmpipe
