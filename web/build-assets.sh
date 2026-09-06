@@ -259,4 +259,28 @@ else
     echo "skipping the gears: no cross compiler or no GLES2 headers"
 fi
 
+# Mirror what was just built into web/dist as well, when a dist tree exists.
+#
+# web/dist is what tests/gl44-probe.sh and web/test/drive.mjs actually serve,
+# and it is produced by `vite build`, which copies web/public. That copy
+# happens *before* this script writes the drivers above, so dist was always one
+# build behind -- and both copies then carry a fresh mtime, so nothing looks
+# wrong. Measured on 2026-09-06: public/fs/glibc/libGLESv2.so.2 was 398,656
+# bytes and the dist copy 324,920, written 28 seconds apart. The glibc driver
+# is the one SuperTuxKart loads, so a browser run was measuring a guest that
+# predated the whole GL 4.5 transport.
+#
+# Compare sizes, never mtimes, when checking whether these agree.
+if [ -d "$HERE/dist" ]; then
+    for _sub in fs fs/glibc gex; do
+        [ -d "$PUB/$_sub" ] || continue
+        mkdir -p "$HERE/dist/$_sub"
+        for _f in "$PUB/$_sub"/*; do
+            [ -f "$_f" ] || continue
+            cp -f "$_f" "$HERE/dist/$_sub/" || exit 1
+        done
+    done
+    echo "mirrored public/{fs,fs/glibc,gex} into dist"
+fi
+
 echo "done"
