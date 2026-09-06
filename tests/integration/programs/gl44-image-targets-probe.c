@@ -503,6 +503,49 @@ int main(void) {
                            cleared[0] == 0 && cleared[1] == 255 &&
                            cleared[2] == 0);
                 }
+                /* A control with no image stores at all: the same triangle,
+                   a fragment shader that only writes colour. If this reaches
+                   fb0 and the storing one does not, then a shader with side
+                   effects is what diverts the draw. */
+                {
+                    static const char *plain_fs =
+                        "#version 430 core\n"
+                        "out vec4 colour;\n"
+                        "void main() { colour = vec4(1.0); }\n";
+                    GLuint pf = glCreateShader(GL_FRAGMENT_SHADER);
+                    glShaderSource(pf, 1, &plain_fs, NULL);
+                    glCompileShader(pf);
+                    GLuint plain = glCreateProgram();
+                    glAttachShader(plain, fvs);
+                    glAttachShader(plain, pf);
+                    glLinkProgram(plain);
+                    GLint ok2 = 0; glGetProgramiv(plain, GL_LINK_STATUS, &ok2);
+                    unsigned char c[4] = {0, 0, 0, 0};
+                    if (ok2) {
+                        glUseProgram(plain);
+                        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                        glClear(GL_COLOR_BUFFER_BIT);
+                        while (glGetError() != GL_NO_ERROR) {}
+                        glDrawArrays(GL_TRIANGLES, 0, 3);
+                        glReadPixels(dvp[2] / 2, dvp[3] / 2, 1, 1, GL_RGBA,
+                                     GL_UNSIGNED_BYTE, c);
+                        /* And again after a glFinish. If the pixel appears
+                           only now, the read-back is not submitting the
+                           pending render pass -- GL requires glReadPixels to
+                           see everything issued before it, with or without a
+                           finish. */
+                        unsigned char after[4] = {0, 0, 0, 0};
+                        glFinish();
+                        glReadPixels(dvp[2] / 2, dvp[3] / 2, 1, 1, GL_RGBA,
+                                     GL_UNSIGNED_BYTE, after);
+                        fprintf(stderr, "INFO fb0 after-finish centre=%u\n",
+                                after[0]);
+                    }
+                    fprintf(stderr, "INFO fb0 plain-triangle centre=%u "
+                            "want=255\n", c[0]);
+                    result("fb0_plain_draw_colour", ok2 && c[0] == 255);
+                    while (glGetError() != GL_NO_ERROR) {}
+                }
                 for (int pass = 0; pass < 2; ++pass) {
                     const int is_point = pass == 1;
                     const GLuint which = is_point ? pprog : fprog;
@@ -529,6 +572,26 @@ int main(void) {
                     unsigned char centre[4] = {0, 0, 0, 0};
                     glReadPixels(dvp[2] / 2, dvp[3] / 2, 1, 1, GL_RGBA,
                                  GL_UNSIGNED_BYTE, centre);
+                    /* Which buffer holds it? If the draw went to one and the
+                       default read buffer names the other, the colour is
+                       there and simply not where the read looked. */
+                    unsigned char from_back[4] = {0, 0, 0, 0};
+                    unsigned char from_front[4] = {0, 0, 0, 0};
+                    GLint read_buffer = 0;
+                    glGetIntegerv(GL_READ_BUFFER, &read_buffer);
+                    glReadBuffer(GL_BACK);
+                    glReadPixels(dvp[2] / 2, dvp[3] / 2, 1, 1, GL_RGBA,
+                                 GL_UNSIGNED_BYTE, from_back);
+                    glReadBuffer(GL_FRONT);
+                    glReadPixels(dvp[2] / 2, dvp[3] / 2, 1, 1, GL_RGBA,
+                                 GL_UNSIGNED_BYTE, from_front);
+                    glReadBuffer((GLenum)read_buffer);
+                    fprintf(stderr, "INFO fb0 %-8s default_read=0x%x "
+                            "back=%u front=%u\n",
+                            is_point ? "point" : "triangle",
+                            (unsigned)read_buffer, from_back[0],
+                            from_front[0]);
+                    while (glGetError() != GL_NO_ERROR) {}
                     fprintf(stderr, "INFO fb0 %-8s store=[%d,%d,%d,%d] "
                             "want=[7,8,9,10] centre=%u err=0x%04x\n",
                             is_point ? "point" : "triangle", stored[0],
