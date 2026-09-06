@@ -232,6 +232,8 @@ enum Op : uint32_t {
     CLEAR_NAMED_FRAMEBUFFER_FV = 251, CLEAR_NAMED_FRAMEBUFFER_IV = 252,
     CLEAR_NAMED_FRAMEBUFFER_UIV = 253,
     CHECK_NAMED_FRAMEBUFFER_STATUS = 254, GET_NAMED_BUFFER_SUB_DATA = 255,
+    VERTEX_ARRAY_VERTEX_BUFFERS = 256,
+    INVALIDATE_NAMED_FRAMEBUFFER_SUB_DATA = 257,
 };
 
 struct Reader {
@@ -1490,6 +1492,54 @@ bool one(uint32_t op, Reader& a) {
        same gexgl_compute_pixel_layout the guest used, against the same
        GL_UNPACK_* state -- agreeing on it is what keeps a malformed packet
        from being read past its end, so it is checked rather than trusted. */
+    case VERTEX_ARRAY_VERTEX_BUFFERS: {
+        const GLuint vaobj = lookup(vertex_arrays, a.u32());
+        const GLuint first = a.u32();
+        const GLsizei count = a.i32();
+        const bool have_buffers = a.u32() != 0;
+        uint32_t bytes = 0;
+        const uint8_t* wire = a.blob(bytes);
+        if (count < 0 || bytes != (uint32_t)count * 16u) { a.ok = false; break; }
+        if (!have_buffers) {
+            /* GL's unbind form: a null array detaches the whole range. */
+            GEX_GL_CALL(glVertexArrayVertexBuffers, vaobj, first, count,
+                        nullptr, nullptr, nullptr);
+            break;
+        }
+        std::vector<GLuint> names((size_t)count);
+        std::vector<GLintptr> offsets((size_t)count);
+        std::vector<GLsizei> strides((size_t)count);
+        for (GLsizei i = 0; i < count; ++i) {
+            uint32_t name = 0, lo = 0, hi = 0, stride = 0;
+            std::memcpy(&name, wire + (size_t)i * 16u + 0, 4);
+            std::memcpy(&lo, wire + (size_t)i * 16u + 4, 4);
+            std::memcpy(&hi, wire + (size_t)i * 16u + 8, 4);
+            std::memcpy(&stride, wire + (size_t)i * 16u + 12, 4);
+            names[(size_t)i] = lookup(buffers, name);
+            offsets[(size_t)i] =
+                (GLintptr)(((uint64_t)hi << 32) | (uint64_t)lo);
+            strides[(size_t)i] = (GLsizei)stride;
+        }
+        GEX_GL_CALL(glVertexArrayVertexBuffers, vaobj, first, count,
+                    names.data(), offsets.data(), strides.data());
+        break;
+    }
+    case INVALIDATE_NAMED_FRAMEBUFFER_SUB_DATA: {
+        const GLuint fb = lookup(framebuffers, a.u32());
+        const GLsizei numAttachments = a.i32();
+        const GLint x = a.i32(), y = a.i32();
+        const GLsizei width = a.i32(), height = a.i32();
+        uint32_t bytes = 0;
+        const uint8_t* wire = a.blob(bytes);
+        if (numAttachments < 0 || bytes != (uint32_t)numAttachments * 4u) {
+            a.ok = false; break;
+        }
+        std::vector<GLenum> attachments((size_t)numAttachments);
+        if (bytes) std::memcpy(attachments.data(), wire, bytes);
+        GEX_GL_CALL(glInvalidateNamedFramebufferSubData, fb, numAttachments,
+                    attachments.data(), x, y, width, height);
+        break;
+    }
     case CHECK_NAMED_FRAMEBUFFER_STATUS: {
         const GLuint fb = lookup(framebuffers, a.u32());
         const GLenum target = a.u32();

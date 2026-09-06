@@ -2,7 +2,7 @@
  *
  * Extensions the guest may repeat from the host: every command the
  * Khronos registry says they require is exported by this library.
- * 591 claimable, 269 withheld for missing entry
+ * 592 claimable, 268 withheld for missing entry
  * points, out of the registry's whole extension set. A host
  * extension absent from this table is not advertised to the guest,
  * which is why adding a driver capability can need a rebuild here.
@@ -83,6 +83,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_ARB_depth_clamp",
     "GL_ARB_depth_texture",
     "GL_ARB_derivative_control",
+    "GL_ARB_direct_state_access",
     "GL_ARB_draw_buffers",
     "GL_ARB_draw_buffers_blend",
     "GL_ARB_draw_elements_base_vertex",

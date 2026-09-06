@@ -857,6 +857,61 @@ void glGetNamedBufferPointerv(unsigned buffer, unsigned pname, void **params) {
         ? object->map : NULL;
 }
 
+/* The last two DSA commands, both shapes the generator cannot express.
+ *
+ * glVertexArrayVertexBuffers takes three parallel arrays -- names, offsets and
+ * strides -- where every policy here carries at most one. They travel as one
+ * blob of count*(4+8+4) bytes rather than three, so a truncated packet cannot
+ * leave them disagreeing about how many entries arrived.
+ *
+ * glInvalidateNamedFramebufferSubData puts its attachment array ahead of
+ * x/y/width/height, and ARRAY_COMMANDS requires the array last; the generator
+ * refuses it rather than emitting something wrong, which is why it is here. */
+void glVertexArrayVertexBuffers(unsigned vaobj, unsigned first, int count,
+                                const unsigned *buffers, const long *offsets,
+                                const int *strides) {
+    if (count < 0) return;
+    /* GL says a NULL buffers array unbinds the range; offsets and strides are
+       then ignored. Anything else with a missing array is a caller error. */
+    if (count > 0 && buffers && (!offsets || !strides)) return;
+    const size_t entries = (size_t)count;
+    if (entries > (UINT32_MAX - 8u) / 16u) return;
+    const size_t blob = entries * 16u;
+    uint32_t *p = begin(GEXGL_VERTEX_ARRAY_VERTEX_BUFFERS, 4, 4 + blob);
+    if (!p) return;
+    p[0] = vaobj;
+    p[1] = first;
+    p[2] = (uint32_t)count;
+    p[3] = buffers != NULL;
+    p[4] = (uint32_t)blob;
+    uint32_t *at = p + 5;
+    for (size_t i = 0; i < entries; ++i) {
+        const uint64_t off = buffers ? (uint64_t)offsets[i] : 0u;
+        at[0] = buffers ? buffers[i] : 0u;
+        at[1] = (uint32_t)off;
+        at[2] = (uint32_t)(off >> 32);
+        at[3] = buffers ? (uint32_t)strides[i] : 0u;
+        at += 4;
+    }
+}
+
+void glInvalidateNamedFramebufferSubData(unsigned framebuffer, int numAttachments,
+                                         const unsigned *attachments, int x, int y,
+                                         int width, int height) {
+    if (numAttachments < 0 || (numAttachments > 0 && !attachments)) return;
+    const size_t entries = (size_t)numAttachments;
+    if (entries > (UINT32_MAX - 8u) / 4u) return;
+    const size_t blob = entries * 4u;
+    uint32_t *p = begin(GEXGL_INVALIDATE_NAMED_FRAMEBUFFER_SUB_DATA, 6, 4 + blob);
+    if (!p) return;
+    p[0] = framebuffer;
+    p[1] = (uint32_t)numAttachments;
+    p[2] = (uint32_t)x; p[3] = (uint32_t)y;
+    p[4] = (uint32_t)width; p[5] = (uint32_t)height;
+    p[6] = (uint32_t)blob;
+    if (blob) memcpy(p + 7, attachments, blob);
+}
+
 void glBindBufferBase(unsigned target, unsigned index, unsigned buffer) {
     CMD3(GEXGL_BIND_BUFFER_BASE, target, index, buffer);
 }

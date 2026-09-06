@@ -307,6 +307,44 @@ int main(void) {
                    after[0] == 1.0f && after[3] == 4.0f, detail);
     }
 
+    /* The extension string itself. An engine takes the DSA path on the
+     * version, but a library that asks by name only gets there if every one
+     * of the 97 commands ARB_direct_state_access requires is exported --
+     * gen_gl_extensions.py withholds the whole extension otherwise, so this
+     * one line stands in for all of them. */
+    {
+        GLint extension_count = 0;
+        int found = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &extension_count);
+        for (GLint i = 0; i < extension_count && !found; ++i) {
+            const char* name = (const char*)glGetStringi(GL_EXTENSIONS, (GLuint)i);
+            if (name && strcmp(name, "GL_ARB_direct_state_access") == 0) found = 1;
+        }
+        char detail[64];
+        snprintf(detail, sizeof detail, "%d extensions advertised",
+                 (int)extension_count);
+        report("arb_direct_state_access_advertised", found, detail);
+    }
+
+    /* glVertexArrayVertexBuffers: three parallel arrays, sent interleaved. */
+    {
+        GLuint many = 0;
+        glCreateVertexArrays(1, &many);
+        const GLuint names[2] = {buffer, buffer};
+        const GLintptr offsets[2] = {0, 12};
+        const GLsizei strides[2] = {12, 12};
+        glVertexArrayVertexBuffers(many, 0, 2, names, offsets, strides);
+        const GLenum err = glGetError();
+        GLint bound_stride = 0;
+        glGetVertexArrayIndexediv(many, 1, GL_VERTEX_BINDING_STRIDE,
+                                  &bound_stride);
+        char detail[80];
+        snprintf(detail, sizeof detail, "err=0x%x binding1 stride=%d",
+                 (unsigned)err, bound_stride);
+        report("vertex_array_vertex_buffers",
+               err == GL_NO_ERROR && bound_stride == 12, detail);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, cases - failures,
            failures);
     return failures ? 1 : 0;

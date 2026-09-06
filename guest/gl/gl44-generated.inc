@@ -1057,7 +1057,21 @@ void glGetCompressedTexImage(unsigned target, int level, void *img) {
     if (!a) return;
     uint64_t pointer = (uint64_t)(uintptr_t)img;
     a[0] = target; a[1] = (uint32_t)level; a[2] = (uint32_t)pbo;
-    a[3] = (uint32_t)pointer; a[4] = (uint32_t)(pointer >> 32); flush();
+    a[3] = (uint32_t)pointer; a[4] = (uint32_t)(pointer >> 32);
+    flush();
+    if (pbo) return;
+    uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
+    if (img && source && bytes) memcpy(img, source, bytes);
+}
+void glGetCompressedTextureImage(unsigned texture, int level, int bufSize, void *img) {
+    int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
+    uint32_t *a = begin(1225, 6, 0);
+    if (!a) return;
+    uint64_t pointer = (uint64_t)(uintptr_t)img;
+    a[0] = texture; a[1] = (uint32_t)level; a[2] = (uint32_t)pbo;
+    a[3] = (uint32_t)pointer; a[4] = (uint32_t)(pointer >> 32);
+    a[5] = (uint32_t)bufSize;
+    flush();
     if (pbo) return;
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     if (img && source && bytes) memcpy(img, source, bytes);
@@ -1355,6 +1369,54 @@ void glGetProgramStageiv(unsigned program, unsigned shadertype, unsigned pname, 
     uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
     if (values && source && reply_len == expected)
         memcpy(values, source, expected);
+}
+void glGetQueryBufferObjecti64v(unsigned id, unsigned buffer, unsigned pname, long offset) {
+    uint32_t *packet = begin(1267, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(id);
+    packet[at++] = (uint32_t)(buffer);
+    packet[at++] = (uint32_t)(pname);
+    uint64_t bits_offset;
+    bits_offset = (uint64_t)(offset);
+    packet[at++] = (uint32_t)bits_offset;
+    packet[at++] = (uint32_t)(bits_offset >> 32);
+}
+void glGetQueryBufferObjectiv(unsigned id, unsigned buffer, unsigned pname, long offset) {
+    uint32_t *packet = begin(1268, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(id);
+    packet[at++] = (uint32_t)(buffer);
+    packet[at++] = (uint32_t)(pname);
+    uint64_t bits_offset;
+    bits_offset = (uint64_t)(offset);
+    packet[at++] = (uint32_t)bits_offset;
+    packet[at++] = (uint32_t)(bits_offset >> 32);
+}
+void glGetQueryBufferObjectui64v(unsigned id, unsigned buffer, unsigned pname, long offset) {
+    uint32_t *packet = begin(1269, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(id);
+    packet[at++] = (uint32_t)(buffer);
+    packet[at++] = (uint32_t)(pname);
+    uint64_t bits_offset;
+    bits_offset = (uint64_t)(offset);
+    packet[at++] = (uint32_t)bits_offset;
+    packet[at++] = (uint32_t)(bits_offset >> 32);
+}
+void glGetQueryBufferObjectuiv(unsigned id, unsigned buffer, unsigned pname, long offset) {
+    uint32_t *packet = begin(1270, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(id);
+    packet[at++] = (uint32_t)(buffer);
+    packet[at++] = (uint32_t)(pname);
+    uint64_t bits_offset;
+    bits_offset = (uint64_t)(offset);
+    packet[at++] = (uint32_t)bits_offset;
+    packet[at++] = (uint32_t)(bits_offset >> 32);
 }
 void glGetQueryIndexediv(unsigned target, unsigned index, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
@@ -1665,6 +1727,42 @@ void glGetTexParameteriv(unsigned target, unsigned pname, int *params) {
     uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
     if (params && source && reply_len == expected)
         memcpy(params, source, expected);
+}
+void glGetTextureImage(unsigned texture, int level, unsigned format, unsigned type, int bufSize,
+                       void *pixels) {
+    int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
+    uint32_t *a = begin(1298, 8, 0);
+    if (!a) return;
+    a[0] = texture; a[1] = (uint32_t)level; a[2] = format; a[3] = type;
+    a[4] = (uint32_t)pbo;
+    a[5] = (uint32_t)(uintptr_t)pixels;
+    a[6] = (uint32_t)((uint64_t)(uintptr_t)pixels >> 32);
+    a[7] = (uint32_t)bufSize;
+    flush();
+    if (pbo) return;
+    /* Row by row, exactly the span GL defines as written -- not the whole
+       [offset, end) run. The padding GL_PACK_ROW_LENGTH, _SKIP_PIXELS and
+       _ALIGNMENT leave between rows belongs to the caller and must survive:
+       copying the run wholesale overwrote it with the zero-fill of the host's
+       staging vector, which is precisely what packed_pixels checks when it
+       varies the pack modes. glReadPixels has always scattered this way; this
+       did not. */
+    uint32_t offset = reply_u32();
+    uint32_t row_stride = reply_u32();
+    uint32_t row_bytes = reply_u32();
+    uint32_t rows = reply_u32();
+    uint32_t image_stride = reply_u32();
+    uint32_t images = reply_u32();
+    uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
+    if (!pixels || !source || !bytes) return;
+    for (uint32_t image = 0; image < images; ++image) {
+        for (uint32_t row = 0; row < rows; ++row) {
+            uint64_t at = (uint64_t)image * image_stride +
+                          (uint64_t)row * row_stride;
+            if (at > bytes || row_bytes > bytes - at) return;
+            memcpy((uint8_t *)pixels + offset + at, source + at, row_bytes);
+        }
+    }
 }
 void glGetTextureLevelParameterfv(unsigned texture, int level, unsigned pname, float *params) {
     const size_t expected = (size_t)1u * sizeof(*params);

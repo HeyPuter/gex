@@ -197,7 +197,7 @@ MULTI_BIND_NAME_ARRAYS = {
 }
 INTERNAL_FORMAT_QUERIES = {"glGetInternalformativ", "glGetInternalformati64v"}
 MULTISAMPLE_QUERIES = {"glGetMultisamplefv"}
-COMPRESSED_TEXTURE_READBACK_QUERIES = {"glGetCompressedTexImage"}
+COMPRESSED_TEXTURE_READBACK_QUERIES = {"glGetCompressedTexImage", "glGetCompressedTextureImage"}
 
 # An opaque pointer interpreted by core OpenGL as a byte offset into the bound
 # GL_DRAW_INDIRECT_BUFFER. It is transported as a 64-bit offset, never followed
@@ -305,7 +305,10 @@ PIXEL_IMAGE_LENGTHS = {
     "glTexSubImage1D": "COMPSIZE(format,type,width)",
     "glTexSubImage3D": "COMPSIZE(format,type,width,height,depth)",
 }
-TEXTURE_READBACK_QUERIES = {"glGetTexImage"}
+TEXTURE_READBACK_QUERIES = {"glGetTexImage", "glGetTextureImage"}
+# The DSA readback has no target to reason from, so the host asks the
+# texture itself how deep the level is; see host_case. It also carries a
+# bufSize the bound form has not got.
 
 # Arrays of separately terminated strings cannot use the typed-array policy:
 # the pointer array itself is guest-addressed, while each pointed-to string has
@@ -394,8 +397,10 @@ OBJECT_COMMANDS["glShaderStorageBlockBinding"] = {"program": "programs"}
 #     buffer mapping is hand-written and needs a reply round trip
 #   glCheckNamedFramebufferStatus                                -- returns a
 #     value, so it needs the same round trip
-#   glGetQueryBufferObject*                                      -- writes into
-#     a buffer object rather than to the caller
+#   (glGetQueryBufferObject* was listed here and should not have been: it takes
+#    id, buffer, pname and a GLintptr offset -- four scalars and no client
+#    memory at all. The host writes the result into the host buffer itself, so
+#    there is nothing to carry back. It is in the set below.)
 #   glFlushMappedNamedBufferRange                                -- looked
 #     scalar and is not: the guest's mapping is a shadow buffer it owns, so a
 #     flush has to carry the bytes. Generated from this set it sent the offset
@@ -417,6 +422,10 @@ DIRECT_STATE_ACCESS_COMMANDS = {
     "glDisableVertexArrayAttrib",
     "glEnableVertexArrayAttrib",
     "glGenerateTextureMipmap",
+    "glGetQueryBufferObjecti64v",
+    "glGetQueryBufferObjectiv",
+    "glGetQueryBufferObjectui64v",
+    "glGetQueryBufferObjectuiv",
     "glMemoryBarrierByRegion",
     "glNamedFramebufferDrawBuffer",
     "glNamedFramebufferParameteri",
@@ -537,6 +546,10 @@ OBJECT_COMMANDS.update({
     "glDisableVertexArrayAttrib": {"vaobj": "vertex_arrays"},
     "glEnableVertexArrayAttrib": {"vaobj": "vertex_arrays"},
     "glGenerateTextureMipmap": {"texture": "textures"},
+    "glGetQueryBufferObjecti64v": {"id": "queries", "buffer": "buffers"},
+    "glGetQueryBufferObjectiv": {"id": "queries", "buffer": "buffers"},
+    "glGetQueryBufferObjectui64v": {"id": "queries", "buffer": "buffers"},
+    "glGetQueryBufferObjectuiv": {"id": "queries", "buffer": "buffers"},
     "glNamedFramebufferDrawBuffer": {"framebuffer": "framebuffers"},
     "glNamedFramebufferParameteri": {"framebuffer": "framebuffers"},
     "glNamedFramebufferReadBuffer": {"framebuffer": "framebuffers"},
@@ -1124,14 +1137,21 @@ def _guest_function(command: dict, opcode: int) -> str:
     if (val && source && bytes == 2u * sizeof(*val)) memcpy(val, source, bytes);
 }}
 """
-    if name == "glGetCompressedTexImage":
-        return f"""void {name}(unsigned target, int level, void *img) {{
+    if name in COMPRESSED_TEXTURE_READBACK_QUERIES:
+        named = name == "glGetCompressedTextureImage"
+        first = "unsigned texture" if named else "unsigned target"
+        first_word = "texture" if named else "target"
+        size_param = ", int bufSize" if named else ""
+        size_word = "    a[5] = (uint32_t)bufSize;\n" if named else ""
+        words = 6 if named else 5
+        return f"""void {name}({first}, int level{size_param}, void *img) {{
     int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
-    uint32_t *a = begin({opcode}, 5, 0);
+    uint32_t *a = begin({opcode}, {words}, 0);
     if (!a) return;
     uint64_t pointer = (uint64_t)(uintptr_t)img;
-    a[0] = target; a[1] = (uint32_t)level; a[2] = (uint32_t)pbo;
-    a[3] = (uint32_t)pointer; a[4] = (uint32_t)(pointer >> 32); flush();
+    a[0] = {first_word}; a[1] = (uint32_t)level; a[2] = (uint32_t)pbo;
+    a[3] = (uint32_t)pointer; a[4] = (uint32_t)(pointer >> 32);
+{size_word}    flush();
     if (pbo) return;
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     if (img && source && bytes) memcpy(img, source, bytes);
@@ -1178,17 +1198,23 @@ def _guest_function(command: dict, opcode: int) -> str:
     }}
 }}
 """
-    if name == "glGetTexImage":
-        return f"""void {name}(unsigned target, int level, unsigned format, unsigned type,
+    if name in TEXTURE_READBACK_QUERIES:
+        named = name == "glGetTextureImage"
+        first = "unsigned texture" if named else "unsigned target"
+        first_word = "texture" if named else "target"
+        size_param = ", int bufSize" if named else ""
+        size_word = "    a[7] = (uint32_t)bufSize;\n" if named else ""
+        words = 8 if named else 7
+        return f"""void {name}({first}, int level, unsigned format, unsigned type{size_param},
                        void *pixels) {{
     int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
-    uint32_t *a = begin({opcode}, 7, 0);
+    uint32_t *a = begin({opcode}, {words}, 0);
     if (!a) return;
-    a[0] = target; a[1] = (uint32_t)level; a[2] = format; a[3] = type;
+    a[0] = {first_word}; a[1] = (uint32_t)level; a[2] = format; a[3] = type;
     a[4] = (uint32_t)pbo;
     a[5] = (uint32_t)(uintptr_t)pixels;
     a[6] = (uint32_t)((uint64_t)(uintptr_t)pixels >> 32);
-    flush();
+{size_word}    flush();
     if (pbo) return;
     /* Row by row, exactly the span GL defines as written -- not the whole
        [offset, end) run. The padding GL_PACK_ROW_LENGTH, _SKIP_PIXELS and
@@ -1693,14 +1719,24 @@ def host_case(command: dict, opcode: int) -> str:
     glGetMultisamplefv(pname, index, values); put_blob(values, sizeof(values));
     break;
 }}"""
-    if name == "glGetCompressedTexImage":
+    if name in COMPRESSED_TEXTURE_READBACK_QUERIES:
+        named = name == "glGetCompressedTextureImage"
+        read_first = ("    GLuint texture = lookup(textures, a.u32());"
+                      if named else "    GLenum target = a.u32();")
+        subject = "texture" if named else "target"
+        level_query = ("glGetTextureLevelParameteriv"
+                       if named else "glGetTexLevelParameteriv")
+        read_size = "    const GLsizei bufSize = a.i32();\n" if named else ""
+        pass_size = "bufSize, " if named else ""
         return f"""case {opcode}: {{
-    GLenum target = a.u32(); GLint level = a.i32(); const bool pbo = a.u32() != 0;
+{read_first}
+    GLint level = a.i32(); const bool pbo = a.u32() != 0;
     const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
-    if (pbo) {{ glGetCompressedTexImage(target, level, reinterpret_cast<void *>(pointer)); break; }}
-    GLint size = 0; glGetTexLevelParameteriv(target, level, GL_TEXTURE_COMPRESSED_IMAGE_SIZE, &size);
+{read_size}    if (pbo) {{ GEX_GL_CALL({name}, {subject}, level, {pass_size}reinterpret_cast<void *>(pointer)); break; }}
+    GLint size = 0; GEX_GL_CALL({level_query}, {subject}, level, GL_TEXTURE_COMPRESSED_IMAGE_SIZE, &size);
     if (size < 0 || size > (1 << 28)) {{ a.ok = false; break; }}
-    std::vector<uint8_t> image((size_t)size); glGetCompressedTexImage(target, level, image.data());
+    std::vector<uint8_t> image((size_t)size);
+    GEX_GL_CALL({name}, {subject}, level, {pass_size}image.data());
     put_blob(image.data(), image.size());
     break;
 }}"""
@@ -1745,24 +1781,40 @@ def host_case(command: dict, opcode: int) -> str:
     {name}(mode, counts.data(), type, indices.data(), drawcount{base_argument});
     break;
 }}"""
-    if name == "glGetTexImage":
+    if name in TEXTURE_READBACK_QUERIES:
+        named = name == "glGetTextureImage"
+        # The DSA form is given a texture, not a target, so it cannot test the
+        # target to decide whether the level is three-dimensional. It asks the
+        # texture how deep the level is instead, which answers the same
+        # question more directly: a 2D texture reports depth 1, an array or 3D
+        # texture reports its layers.
+        read_first = ("    GLuint texture = lookup(textures, a.u32());"
+                      if named else "    GLenum target = a.u32();")
+        subject = "texture" if named else "target"
+        level_query = ("glGetTextureLevelParameteriv"
+                       if named else "glGetTexLevelParameteriv")
+        read_size = "    const GLsizei bufSize = a.i32();\n" if named else ""
+        pass_size = "bufSize, " if named else ""
+        three_d = ("depth > 1" if named else
+                   "target == GL_TEXTURE_3D || target == GL_TEXTURE_2D_ARRAY ||\n"
+                   "                                  target == GL_TEXTURE_CUBE_MAP_ARRAY")
         return f"""case {opcode}: {{
-    GLenum target = a.u32(); GLint level = a.i32(); GLenum format = a.u32(), type = a.u32();
+{read_first}
+    GLint level = a.i32(); GLenum format = a.u32(), type = a.u32();
     const bool pbo = a.u32() != 0; const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
-    if (pbo) {{ glGetTexImage(target, level, format, type, reinterpret_cast<void*>(pointer)); break; }}
+{read_size}    if (pbo) {{ GEX_GL_CALL({name}, {subject}, level, format, type, {pass_size}reinterpret_cast<void*>(pointer)); break; }}
     GLint width = 0, height = 0, depth = 1;
-    glGetTexLevelParameteriv(target, level, GL_TEXTURE_WIDTH, &width);
-    glGetTexLevelParameteriv(target, level, GL_TEXTURE_HEIGHT, &height);
-    glGetTexLevelParameteriv(target, level, GL_TEXTURE_DEPTH, &depth);
+    GEX_GL_CALL({level_query}, {subject}, level, GL_TEXTURE_WIDTH, &width);
+    GEX_GL_CALL({level_query}, {subject}, level, GL_TEXTURE_HEIGHT, &height);
+    GEX_GL_CALL({level_query}, {subject}, level, GL_TEXTURE_DEPTH, &depth);
     if (depth < 1) depth = 1;
-    const bool threeDimensional = target == GL_TEXTURE_3D || target == GL_TEXTURE_2D_ARRAY ||
-                                  target == GL_TEXTURE_CUBE_MAP_ARRAY;
+    const bool threeDimensional = {three_d};
     gexgl_pixel_layout layout{{}};
     if (!gexgl_compute_pixel_layout(format, type, width, height, threeDimensional ? depth : -1,
                                     &pack_store, &layout) ||
         layout.end > UINT32_MAX) {{ a.ok = false; break; }}
     std::vector<uint8_t> pixels(layout.end, 0);
-    glGetTexImage(target, level, format, type, pixels.data());
+    GEX_GL_CALL({name}, {subject}, level, format, type, {pass_size}pixels.data());
     const size_t group = gexgl_pixel_group_bytes(format, type);
     const uint32_t rows = height > 0 ? static_cast<uint32_t>(height) : 0;
     const uint32_t images = threeDimensional && depth > 0

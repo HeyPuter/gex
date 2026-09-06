@@ -1020,12 +1020,27 @@ case 1223: {
     break;
 }
 case 1224: {
-    GLenum target = a.u32(); GLint level = a.i32(); const bool pbo = a.u32() != 0;
+    GLenum target = a.u32();
+    GLint level = a.i32(); const bool pbo = a.u32() != 0;
     const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
-    if (pbo) { glGetCompressedTexImage(target, level, reinterpret_cast<void *>(pointer)); break; }
-    GLint size = 0; glGetTexLevelParameteriv(target, level, GL_TEXTURE_COMPRESSED_IMAGE_SIZE, &size);
+    if (pbo) { GEX_GL_CALL(glGetCompressedTexImage, target, level, reinterpret_cast<void *>(pointer)); break; }
+    GLint size = 0; GEX_GL_CALL(glGetTexLevelParameteriv, target, level, GL_TEXTURE_COMPRESSED_IMAGE_SIZE, &size);
     if (size < 0 || size > (1 << 28)) { a.ok = false; break; }
-    std::vector<uint8_t> image((size_t)size); glGetCompressedTexImage(target, level, image.data());
+    std::vector<uint8_t> image((size_t)size);
+    GEX_GL_CALL(glGetCompressedTexImage, target, level, image.data());
+    put_blob(image.data(), image.size());
+    break;
+}
+case 1225: {
+    GLuint texture = lookup(textures, a.u32());
+    GLint level = a.i32(); const bool pbo = a.u32() != 0;
+    const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
+    const GLsizei bufSize = a.i32();
+    if (pbo) { GEX_GL_CALL(glGetCompressedTextureImage, texture, level, bufSize, reinterpret_cast<void *>(pointer)); break; }
+    GLint size = 0; GEX_GL_CALL(glGetTextureLevelParameteriv, texture, level, GL_TEXTURE_COMPRESSED_IMAGE_SIZE, &size);
+    if (size < 0 || size > (1 << 28)) { a.ok = false; break; }
+    std::vector<uint8_t> image((size_t)size);
+    GEX_GL_CALL(glGetCompressedTextureImage, texture, level, bufSize, image.data());
     put_blob(image.data(), image.size());
     break;
 }
@@ -1276,6 +1291,38 @@ case 1265: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
+case 1267: {
+    GLuint id = a.u32();
+    GLuint buffer = a.u32();
+    GLenum pname = a.u32();
+    GLintptr offset = a.i64();
+    GEX_GL_CALL(glGetQueryBufferObjecti64v, lookup(queries, id), lookup(buffers, buffer), pname, offset);
+    break;
+}
+case 1268: {
+    GLuint id = a.u32();
+    GLuint buffer = a.u32();
+    GLenum pname = a.u32();
+    GLintptr offset = a.i64();
+    GEX_GL_CALL(glGetQueryBufferObjectiv, lookup(queries, id), lookup(buffers, buffer), pname, offset);
+    break;
+}
+case 1269: {
+    GLuint id = a.u32();
+    GLuint buffer = a.u32();
+    GLenum pname = a.u32();
+    GLintptr offset = a.i64();
+    GEX_GL_CALL(glGetQueryBufferObjectui64v, lookup(queries, id), lookup(buffers, buffer), pname, offset);
+    break;
+}
+case 1270: {
+    GLuint id = a.u32();
+    GLuint buffer = a.u32();
+    GLenum pname = a.u32();
+    GLintptr offset = a.i64();
+    GEX_GL_CALL(glGetQueryBufferObjectuiv, lookup(queries, id), lookup(buffers, buffer), pname, offset);
+    break;
+}
 case 1271: {
     GLenum target = a.u32();
     GLuint index = a.u32();
@@ -1393,13 +1440,14 @@ case 1289: {
     break;
 }
 case 1291: {
-    GLenum target = a.u32(); GLint level = a.i32(); GLenum format = a.u32(), type = a.u32();
+    GLenum target = a.u32();
+    GLint level = a.i32(); GLenum format = a.u32(), type = a.u32();
     const bool pbo = a.u32() != 0; const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
-    if (pbo) { glGetTexImage(target, level, format, type, reinterpret_cast<void*>(pointer)); break; }
+    if (pbo) { GEX_GL_CALL(glGetTexImage, target, level, format, type, reinterpret_cast<void*>(pointer)); break; }
     GLint width = 0, height = 0, depth = 1;
-    glGetTexLevelParameteriv(target, level, GL_TEXTURE_WIDTH, &width);
-    glGetTexLevelParameteriv(target, level, GL_TEXTURE_HEIGHT, &height);
-    glGetTexLevelParameteriv(target, level, GL_TEXTURE_DEPTH, &depth);
+    GEX_GL_CALL(glGetTexLevelParameteriv, target, level, GL_TEXTURE_WIDTH, &width);
+    GEX_GL_CALL(glGetTexLevelParameteriv, target, level, GL_TEXTURE_HEIGHT, &height);
+    GEX_GL_CALL(glGetTexLevelParameteriv, target, level, GL_TEXTURE_DEPTH, &depth);
     if (depth < 1) depth = 1;
     const bool threeDimensional = target == GL_TEXTURE_3D || target == GL_TEXTURE_2D_ARRAY ||
                                   target == GL_TEXTURE_CUBE_MAP_ARRAY;
@@ -1408,7 +1456,7 @@ case 1291: {
                                     &pack_store, &layout) ||
         layout.end > UINT32_MAX) { a.ok = false; break; }
     std::vector<uint8_t> pixels(layout.end, 0);
-    glGetTexImage(target, level, format, type, pixels.data());
+    GEX_GL_CALL(glGetTexImage, target, level, format, type, pixels.data());
     const size_t group = gexgl_pixel_group_bytes(format, type);
     const uint32_t rows = height > 0 ? static_cast<uint32_t>(height) : 0;
     const uint32_t images = threeDimensional && depth > 0
@@ -1477,6 +1525,38 @@ case 1297: {
     GLint values[4]{};
     GEX_GL_CALL(glGetTexParameteriv, target, pname, values);
     put_blob(values, components * sizeof(GLint));
+    break;
+}
+case 1298: {
+    GLuint texture = lookup(textures, a.u32());
+    GLint level = a.i32(); GLenum format = a.u32(), type = a.u32();
+    const bool pbo = a.u32() != 0; const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
+    const GLsizei bufSize = a.i32();
+    if (pbo) { GEX_GL_CALL(glGetTextureImage, texture, level, format, type, bufSize, reinterpret_cast<void*>(pointer)); break; }
+    GLint width = 0, height = 0, depth = 1;
+    GEX_GL_CALL(glGetTextureLevelParameteriv, texture, level, GL_TEXTURE_WIDTH, &width);
+    GEX_GL_CALL(glGetTextureLevelParameteriv, texture, level, GL_TEXTURE_HEIGHT, &height);
+    GEX_GL_CALL(glGetTextureLevelParameteriv, texture, level, GL_TEXTURE_DEPTH, &depth);
+    if (depth < 1) depth = 1;
+    const bool threeDimensional = depth > 1;
+    gexgl_pixel_layout layout{};
+    if (!gexgl_compute_pixel_layout(format, type, width, height, threeDimensional ? depth : -1,
+                                    &pack_store, &layout) ||
+        layout.end > UINT32_MAX) { a.ok = false; break; }
+    std::vector<uint8_t> pixels(layout.end, 0);
+    GEX_GL_CALL(glGetTextureImage, texture, level, format, type, bufSize, pixels.data());
+    const size_t group = gexgl_pixel_group_bytes(format, type);
+    const uint32_t rows = height > 0 ? static_cast<uint32_t>(height) : 0;
+    const uint32_t images = threeDimensional && depth > 0
+        ? static_cast<uint32_t>(depth) : 1;
+    put_u32(static_cast<uint32_t>(layout.offset));
+    put_u32(static_cast<uint32_t>(layout.row_stride));
+    put_u32(static_cast<uint32_t>(group * (width > 0 ? (size_t)width : 0)));
+    put_u32(rows);
+    put_u32(static_cast<uint32_t>(layout.image_stride));
+    put_u32(images);
+    put_blob(pixels.data() + layout.offset,
+             static_cast<uint32_t>(layout.end - layout.offset));
     break;
 }
 case 1299: {
