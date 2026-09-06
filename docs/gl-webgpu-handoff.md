@@ -17902,3 +17902,45 @@ reaches a shader that declares `layout(blend_support_*)` —
 off, because that needs `fbfetch >= max_render_targets`. No ordinary
 application shader changes. But that is an argument, not a measurement,
 and the measurement is owed.
+
+### The browser gate: what it actually is (2026-09-06)
+
+Discharged the diagnosis, not the measurement. **Chromium on this machine
+cannot make an http connection**, and nothing about the driver is
+involved.
+
+The first thing needed was a fact instead of a hang. `Cdp.send` had no
+timeout, so a command the browser accepts and never answers blocked the
+client for ever -- upstream of `drive.mjs`'s own `--wall`/`--idle` timers,
+which is why the gate produced no output at all whatever went wrong. With
+a timeout it says:
+
+    cdp: Page.navigate did not answer in 45000ms
+
+From there it took a handful of experiments to bound. `about:blank` and
+`data:` URLs navigate in **milliseconds**; any `http://` URL never
+answers. It reproduces with:
+
+- a bare chromium: no GPU flags, no WebGPU, no ANGLE, old *and* new
+  headless;
+- a fresh `--user-data-dir` and a fresh `HOME`;
+- `--no-proxy-server`, and `--disable-features=NetworkServiceSandbox`;
+- against `python3 -m http.server` on a verified-free port, serving one
+  static file.
+
+The server logs `curl`'s request and **never sees chromium's**, while
+chromium's own verbose log shows `NetworkDelegate::NotifyBeforeURLRequest`
+for the same URL. So the request is issued and dies between the browser
+and the socket. DNS is healthy, there is no proxy in the environment, the
+network-service processes are running, and pids, threads, file descriptors
+and `/dev/shm` are all far from any limit.
+
+That is a machine-level chromium fault. It blocks every browser gate here
+-- `gl44-probe.sh`, the probe suite's browser half, `gl44-cts-browser.sh`
+-- and no driver change can lift it.
+
+Two things did come out of the search and are fixed: the CDP timeout
+above, and **77 leaked harness servers** listening across 8091-8210, the
+oldest over a day old. They are kept warm for reuse deliberately and
+nothing ever reaped them; `serve-dist.mjs` now retires after half an hour
+idle.
