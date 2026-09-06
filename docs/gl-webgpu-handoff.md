@@ -17947,6 +17947,33 @@ oldest over a day old. They are kept warm for reuse deliberately and
 nothing ever reaped them; `serve-dist.mjs` now retires after half an hour
 idle.
 
+### The app sweep, and what a clean one is worth (2026-09-06)
+
+`tests/gl-app-sweep.sh` over all 341 installed GL programs, driver against
+llvmpipe, the first since the clear paths, the caps, blend, framebuffer fetch,
+the 64-bit memory lowering and the inter-stage variable limit all changed.
+
+**336 programs run, one differing verdict, one driver refusal.**
+
+- The difference is `eglinfo`, and it favours the driver: gex_wgpu exits clean
+  where llvmpipe exits non-zero, both printing full config lists.
+- The refusal is `wincopy` declining a draw whose viewport covers no pixels,
+  which draws nothing in GL either. The reference behaves identically.
+- Six CRASH verdicts are Wayland compositors and clients with no compositor
+  running; all six crash identically on the reference.
+
+Grouping the driver's complaints by cause is the product of this sweep, not
+the pass rate -- and across 328 program logs there is exactly one line. That
+is the statement worth keeping: **no application-visible driver refusals
+remain on this machine.**
+
+Two cautions for whoever runs it next. The `differs` column is written `no`
+and `YES`; an `awk '$4=="yes"'` monitor matches neither and reports a clean
+sweep unconditionally. And the list is mesa-demos and piglit-style binaries --
+it contains no SuperTuxKart, Blender, FreeCAD, Krita or Minecraft, so a clean
+sweep says nothing about the target applications. Those have their own gates
+in `tests/gates`.
+
 ### The keyring was holding the browser (2026-09-06)
 
 One flag, and the browser gate is available again:
