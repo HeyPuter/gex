@@ -17974,6 +17974,73 @@ it contains no SuperTuxKart, Blender, FreeCAD, Krita or Minecraft, so a clean
 sweep says nothing about the target applications. Those have their own gates
 in `tests/gates`.
 
+### The guest transport now carries all of GL (2026-09-06)
+
+**653 of 653 core commands**, and 585 claimable extensions became **604**.
+
+The gap this closed: the driver reported GL 4.6 while the marshaller carried
+GL 4.4. An engine does not test for direct state access, it tests the
+*version* -- that is what a version is for -- so it took the 4.5 path, got
+NULL out of `eglGetProcAddress` and stopped before drawing. **No native gate
+could see any of it**, because the native path reaches the driver through the
+system libGL and never through the guest marshaller. STK, Blender and
+Minecraft are all gated natively, so all three were green throughout.
+
+Extensions an application asks for by name, withheld before and claimable now:
+`ARB_direct_state_access` (all 97 commands), `KHR_debug`,
+`ARB_separate_shader_objects`, `ARB_get_program_binary`, `KHR_robustness`,
+`ARB_gl_spirv`, `ARB_clip_control`, `ARB_get_texture_sub_image`,
+`ARB_invalidate_subdata`, `ARB_ES3_1_compatibility`,
+`ARB_parallel_shader_compile`, `ARB_shader_subroutine`.
+
+Extending the transport costs **no ABI renumbering**, contrary to what I first
+recorded: opcodes are indices into the sorted manifest and
+`gl44_coverage.VERSIONS` has spanned 1.0-4.5 since `glTextureBarrier` needed
+it, so the slots were already reserved. The DSA batch added 713 lines across
+the two generated files and deleted none.
+
+Five probes cover it -- `dsa` (20 cases), `debug`, `sso`, `robustness`, and
+`spirv` -- each passing identically native and in a browser.
+
+#### Four traps, in the order they cost time
+
+1. **A signature tells you the arguments, not where the data lives.** Both
+   misclassifications were this, in opposite directions.
+   `glFlushMappedNamedBufferRange` looks like three scalars and must carry the
+   mapping's bytes -- generated as a scalar it sent offset and length alone,
+   the data never travelled, and *neither end reported an error*.
+   `glGetQueryBufferObject*` look special and are four plain scalars, because
+   the host writes into the host buffer.
+2. **A bare GL call in the decoder is a coin flip** between Mesa and
+   Emscripten's WebGL, and it links cleanly either way. Safe exactly when
+   `libglapi_bridge.a` defines the name -- checked with `llvm-nm`, never `nm`,
+   which cannot read wasm archives, prints nothing and exits quietly. Reading
+   that silence as "undefined" led me to assert two wrong things in commit
+   messages; `gl44-multi-draw-probe` passing in a browser is what refused the
+   theory.
+3. **Composing a guest call reaches functions defined later in the file.**
+   Four times. C assumes `int()`, so the convention differs for any non-int
+   argument. There is no header to include -- this library uses plain C types,
+   not the GL typedefs -- so build with warnings visible and declare what a new
+   composition reaches.
+4. **A refusal must be reported, not merely performed.** The bounded
+   robustness queries left the caller's buffer untouched and raised no
+   `GL_INVALID_OPERATION`, which is worse than not refusing: the application
+   checks `glGetError`, sees success, and reads a buffer that was never
+   filled -- the exact hazard the extension exists to remove. The probe passed
+   until it asserted the error code as well as the sentinel bytes. **A test
+   that only checks "nothing bad happened" passes an implementation that
+   silently does nothing.**
+
+#### The browser sweep
+
+`tests/gl44-browser-sweep.sh` runs every probe through chromium. After all of
+the above: **123 PASS of 129, and no real failures.** Two are deliberate skips
+(`glx-context`, `window-present` -- the aarch64-musl toolchain has no GLX or
+X11 headers), one is platform-blocked (`group-vote`), two are the driver
+beating the llvmpipe oracle (`quad`, `image-noformat-fs`), and one is the
+known `texture-sampler` DIFF. The previous run had eight, two of them real.
+
 ### The keyring was holding the browser (2026-09-06)
 
 One flag, and the browser gate is available again:
