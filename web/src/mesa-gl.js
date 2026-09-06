@@ -146,6 +146,14 @@ export class MesaGlDevice {
       // requesting above the adapter's maximum makes requestDevice reject.
       const want = {
         maxUniformBuffersPerShaderStage: 16,
+        // Varyings. WebGPU guarantees sixteen and the driver used to assume
+        // exactly that, which put GL_MAX_FRAGMENT_INPUT_COMPONENTS at 64
+        // against a required 128 -- so a shader with more than sixteen
+        // varyings did not link. Adapters offer far more: 31 on native Dawn,
+        // 28 in Chromium 151. The driver reads back what the device granted
+        // and sizes the GL limit from that, so asking here is the whole of
+        // it; the clamp below keeps the request inside the adapter.
+        maxInterStageShaderVariables: 32,
         maxStorageBuffersPerShaderStage: 16,
         maxStorageBuffersInVertexStage: 16,
         maxStorageBuffersInFragmentStage: 16,

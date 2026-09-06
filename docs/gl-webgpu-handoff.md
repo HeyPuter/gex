@@ -18056,3 +18056,56 @@ descriptor built for it has to say so. Describing it with the resource's
 shape produces a validation error at best — and at worst, as with the
 single-layer restriction, a refusal that reads as "this driver cannot do
 that" when it only means "the stand-in was built too small".
+
+## Four thousand cases that need nothing, and one limit nobody asked for
+
+### The unmeasured families were unmeasurable on purpose
+
+`sparse_texture_tests`, `sparse_texture2_tests`,
+`sparse_texture_clamp_tests`, `fragment_shading_rate` and
+`sparse_buffer_tests` — 4,017 cases, never run here — are **entirely
+`NotSupported`, and identically so on llvmpipe**. Sparse residency and
+shading rate are not things WebGPU has, and the reference does not have
+them either, so there is nothing to chase. Recorded because a
+`NotSupported` count means nothing without the reference beside it, and
+now that comparison has been made once for all five.
+
+The sixth, `negative_texture_lookup_functions_with_bias_tests`, differs by
+exactly one case: `textureOffset_sampler2DArrayShadow_bias` needs
+`EXT_texture_shadow_lod`, which llvmpipe has and this driver does not. It
+would mean a shadow compare at an explicit LOD, which WGSL has only at
+level zero, plus PCF by hand — about fifteen cases across the suite and no
+application known to want it. Left alone deliberately.
+
+### GL_MAX_FRAGMENT_INPUT_COMPONENTS was 64 because nobody asked
+
+`KHR-GL46.limits` is 135/140, and two of the five are real shortfalls:
+`GL_MAX_VERTEX_STREAMS` is 1 against a required 4, and
+`GL_MAX_FRAGMENT_INPUT_COMPONENTS` was 64 against 128.
+
+The second was [[ask-for-the-limit]] again. The driver took WebGPU's
+*guaranteed* sixteen inter-stage variables for the number it had, so a
+shader with more than sixteen varyings did not link. The adapter offers
+**31** natively and Chromium offers **28** — nearly double, and never
+requested. The device now asks, the screen reads back what it was granted,
+and the caps are sized from that: 64 → 124 components.
+
+It took one correction, and the correction is the interesting half.
+Applying the raise everywhere broke `transform_feedback`, because **not
+every varying interface is inter-stage**. A vertex shader's *inputs* are
+vertex attributes. The geometry and evaluation stages hand their outputs
+to the passthrough vertex shader, which reads them back as attributes too.
+Both are `maxVertexAttributes` — sixteen, and not raised by anyone. A
+geometry shader allowed 31 outputs produced a passthrough whose vertex
+layout could not be built at all.
+
+The limits case itself still fails: 31 variables is 124 components and it
+wants 128. The point was never that case.
+
+One side effect worth naming, because it looks like a regression and is
+not. `tessellation_shader` stays at 139/140, but its one loss changed
+kind: `max_in_out_attributes` used to be skipped because the advertised
+limits disagreed with each other, and now that they agree it runs and
+fails — for the reason already recorded, which is the test's expected half
+and not this driver's capture. GL requires the limits to be consistent
+with one another, so running and failing is the honest state.
