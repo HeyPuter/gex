@@ -275,6 +275,38 @@ int main(void) {
                cleared[0] > 200 && cleared[1] < 60 && cleared[2] > 200, detail);
     }
 
+    /* Map by name, write through the mapping, unmap, and read it back with a
+     * different call. A GL mapping here is a shadow this library owns, so the
+     * bytes only reach the buffer on unmap -- if that path were missing the
+     * write would vanish and no error would say so. */
+    {
+        GLuint mapped = 0;
+        glCreateBuffers(1, &mapped);
+        static const float initial[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+        glNamedBufferData(mapped, (GLsizeiptr)sizeof initial, initial,
+                          GL_DYNAMIC_DRAW);
+        float* view = (float*)glMapNamedBufferRange(
+            mapped, 0, (GLsizeiptr)sizeof initial,
+            GL_MAP_READ_BIT | GL_MAP_WRITE_BIT);
+        const int mapped_ok = view != NULL;
+        /* GL_MAP_READ_BIT means the mapping must already hold what the buffer
+         * holds -- that is a round trip, and getting it wrong shows here. */
+        const int read_through = mapped_ok && view[2] == 3.0f;
+        if (mapped_ok) { view[1] = 42.0f; }
+        const GLboolean unmapped = mapped_ok ? glUnmapNamedBuffer(mapped)
+                                             : GL_FALSE;
+        float after[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        glGetNamedBufferSubData(mapped, 0, (GLsizeiptr)sizeof after, after);
+        char detail[128];
+        snprintf(detail, sizeof detail,
+                 "mapped=%d read=%d unmapped=%d after=%.0f,%.0f,%.0f,%.0f",
+                 mapped_ok, read_through, (int)unmapped, after[0], after[1],
+                 after[2], after[3]);
+        report("map_named_buffer_range",
+               mapped_ok && read_through && unmapped && after[1] == 42.0f &&
+                   after[0] == 1.0f && after[3] == 4.0f, detail);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, cases - failures,
            failures);
     return failures ? 1 : 0;

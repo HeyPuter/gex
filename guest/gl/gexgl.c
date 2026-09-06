@@ -790,6 +790,73 @@ void glFlushMappedBufferRange(unsigned target, long offset, long length) {
                     (uint8_t *)object->map + offset);
 }
 
+/* The named mapping family. GL 4.5 core, and entirely guest-side, like the
+   bound forms directly above: a GL mapping here is a shadow buffer this
+   library owns, filled by a readback when the caller asks to read and sent
+   back when it unmaps. Nothing is mapped on the host at all.
+
+   That is why these could not be generated. glFlushMappedNamedBufferRange in
+   particular *looks* like three scalars and is not -- the bytes live in the
+   shadow, so the flush has to carry them. Generated as a scalar it sent the
+   offset and length alone, the data never travelled, and nothing reported an
+   error; it is written out here for the same reason its bound twin is. */
+void *glMapNamedBufferRange(unsigned buffer, long offset, long length,
+                            unsigned access) {
+    struct buffer_object_state *object = buffer_object(buffer, 0);
+    if (!object || offset < 0 || length < 0 || object->map ||
+        (size_t)offset > object->size ||
+        (size_t)length > object->size - (size_t)offset)
+        return NULL;
+    object->map_length = (size_t)length;
+    object->map_offset = (size_t)offset;
+    object->map_access = access;
+    object->map = calloc(1, object->map_length ? object->map_length : 1);
+    /* Only GL_MAP_READ_BIT pays for the round trip. A write-only mapping that
+       fetched the old contents first would double the cost of the streaming
+       case this exists to serve. */
+    if (object->map && (access & 1u) && object->map_length)
+        glGetNamedBufferSubData(buffer, offset, length, object->map);
+    return object->map;
+}
+
+void *glMapNamedBuffer(unsigned buffer, unsigned access) {
+    struct buffer_object_state *object = buffer_object(buffer, 0);
+    const unsigned bits = access == 0x88B8u ? 1u :   /* GL_READ_ONLY */
+                          access == 0x88B9u ? 2u : 3u; /* WRITE / READ_WRITE */
+    return object ? glMapNamedBufferRange(buffer, 0, (long)object->size, bits)
+                  : NULL;
+}
+
+unsigned char glUnmapNamedBuffer(unsigned buffer) {
+    struct buffer_object_state *object = buffer_object(buffer, 0);
+    if (!object || !object->map) return 0;
+    if (object->map_access & 2u)
+        glNamedBufferSubData(buffer, (long)object->map_offset,
+                             (long)object->map_length, object->map);
+    free(object->map);
+    free(object->map_sent);
+    object->map = NULL;
+    object->map_sent = NULL;
+    object->map_offset = object->map_length = 0;
+    return 1;
+}
+
+void glFlushMappedNamedBufferRange(unsigned buffer, long offset, long length) {
+    struct buffer_object_state *object = buffer_object(buffer, 0);
+    if (!object || !object->map || offset < 0 || length < 0 ||
+        (size_t)offset > object->map_length ||
+        (size_t)length > object->map_length - (size_t)offset) return;
+    glNamedBufferSubData(buffer, (long)(object->map_offset + (size_t)offset),
+                         length, (uint8_t *)object->map + offset);
+}
+
+void glGetNamedBufferPointerv(unsigned buffer, unsigned pname, void **params) {
+    if (!params) return;
+    struct buffer_object_state *object = buffer_object(buffer, 0);
+    *params = (pname == 0x88BDu /* GL_BUFFER_MAP_POINTER */ && object)
+        ? object->map : NULL;
+}
+
 void glBindBufferBase(unsigned target, unsigned index, unsigned buffer) {
     CMD3(GEXGL_BIND_BUFFER_BASE, target, index, buffer);
 }

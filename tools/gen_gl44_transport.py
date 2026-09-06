@@ -396,6 +396,10 @@ OBJECT_COMMANDS["glShaderStorageBlockBinding"] = {"program": "programs"}
 #     value, so it needs the same round trip
 #   glGetQueryBufferObject*                                      -- writes into
 #     a buffer object rather than to the caller
+#   glFlushMappedNamedBufferRange                                -- looked
+#     scalar and is not: the guest's mapping is a shadow buffer it owns, so a
+#     flush has to carry the bytes. Generated from this set it sent the offset
+#     and length alone and the data never travelled, which no error reports
 #
 # Adding a name here does NOT renumber the ABI. The opcode is the index into
 # the sorted manifest, and gl44_coverage.VERSIONS has spanned 1.0-4.5 since
@@ -412,7 +416,6 @@ DIRECT_STATE_ACCESS_COMMANDS = {
     "glCopyTextureSubImage3D",
     "glDisableVertexArrayAttrib",
     "glEnableVertexArrayAttrib",
-    "glFlushMappedNamedBufferRange",
     "glGenerateTextureMipmap",
     "glMemoryBarrierByRegion",
     "glNamedFramebufferDrawBuffer",
@@ -533,7 +536,6 @@ OBJECT_COMMANDS.update({
     "glCopyTextureSubImage3D": {"texture": "textures"},
     "glDisableVertexArrayAttrib": {"vaobj": "vertex_arrays"},
     "glEnableVertexArrayAttrib": {"vaobj": "vertex_arrays"},
-    "glFlushMappedNamedBufferRange": {"buffer": "buffers"},
     "glGenerateTextureMipmap": {"texture": "textures"},
     "glNamedFramebufferDrawBuffer": {"framebuffer": "framebuffers"},
     "glNamedFramebufferParameteri": {"framebuffer": "framebuffers"},

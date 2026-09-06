@@ -924,20 +924,6 @@ void glEndTransformFeedback(void) {
     uint32_t *packet = begin(1181, 0, 0);
     if (!packet) return;
 }
-void glFlushMappedNamedBufferRange(unsigned buffer, long offset, long length) {
-    uint32_t *packet = begin(1186, 5, 0);
-    if (!packet) return;
-    size_t at = 0;
-    packet[at++] = (uint32_t)(buffer);
-    uint64_t bits_offset;
-    bits_offset = (uint64_t)(offset);
-    packet[at++] = (uint32_t)bits_offset;
-    packet[at++] = (uint32_t)(bits_offset >> 32);
-    uint64_t bits_length;
-    bits_length = (uint64_t)(length);
-    packet[at++] = (uint32_t)bits_length;
-    packet[at++] = (uint32_t)(bits_length >> 32);
-}
 void glFramebufferParameteri(unsigned target, unsigned pname, int param) {
     uint32_t *packet = begin(1187, 3, 0);
     if (!packet) return;

@@ -920,13 +920,6 @@ case 1181: {
     GEX_GL_CALL(glEndTransformFeedback, );
     break;
 }
-case 1186: {
-    GLuint buffer = a.u32();
-    GLintptr offset = a.i64();
-    GLsizeiptr length = a.i64();
-    GEX_GL_CALL(glFlushMappedNamedBufferRange, lookup(buffers, buffer), offset, length);
-    break;
-}
 case 1187: {
     GLenum target = a.u32();
     GLenum pname = a.u32();
