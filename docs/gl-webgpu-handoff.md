@@ -17794,3 +17794,111 @@ multisample formats WebGPU does not have — 32-bit, SNORM, and the 16-bit
 normalized set this driver keeps in float32. Those raise
 `GL_INVALID_OPERATION` from `glTexStorage*Multisample`, which is the right
 answer to give and which the CTS does not catch.
+
+## Advanced blending, a crash, and a header everyone but one path could find
+
+### KHR_blend_equation_advanced, from 0 to 87 of 88
+
+The family was 88 `NotSupported` against llvmpipe's 88 passes, and it is
+what Krita's layer blend modes are — multiply, screen, overlay, the lot —
+so it is not only a conformance number.
+
+Almost none of it needed writing. Mesa's GLSL linker lowers all fourteen
+equations itself, gated on nothing but `caps.fbfetch`, and asks the driver
+for one thing back: a readable colour attachment. It creates a
+`nir_var_shader_out` variable with `data.fb_fetch_output` set and loads
+from it. This driver already produces that value — the colour-attachment
+snapshot that serves `glLogicOp` — so the work was to rewrite those loads
+into a texelFetch of the snapshot at `gl_FragCoord`, and to bind it. The
+two share a binding, which is safe rather than lucky: GL says enabling
+`GL_COLOR_LOGIC_OP` disables blending, so no draw can want both.
+
+Non-coherent, deliberately: the snapshot is taken once per draw, so
+overlapping primitives inside one draw do not see each other. That is
+exactly what the extension without `_coherent` allows, and why it makes
+the application call `glBlendBarrier`.
+
+Three things had to be got right, and each was found by getting it wrong:
+
+- **The lowering must run after the texture slots are collected**, or the
+  destination texture — the driver's own, with no sampler beside it — is
+  refused as an inconsistent slot and takes the whole shader with it. The
+  logic op's texture is created later still, on a variant, for the same
+  reason.
+- **The blend state must stop being refused for `advanced_blend_func`.**
+  st leaves `rt[0].blend_enable` clear when it sets that, so the pipeline
+  has blending off, which is right. Refusing left the shader blending
+  correctly against no blend state at all.
+- **The variable must be kept.** By the time the driver sees the shader it
+  has been merged with the application's own output at the same location:
+  reading it is the destination, writing it is the colour. Removing it, or
+  removing the stores to it, emptied the fragment shader — `fn main_1() {
+  return; }` — and every pixel came back holding what the destination
+  already had. That reads as a blend that computed nothing, and it was a
+  shader that wrote nothing.
+
+### A refused sampler view killed the process inside u_blitter
+
+`copy_image` died at its 32nd case: `util_blitter_blit_generic`, `src=0x0`.
+u_blitter creates the source view itself and does not check the result,
+and this driver can refuse one.
+
+The refusal was a real bug — a 3D view's layer range was compared only
+against the *base* level's depth, so every 3D view above level zero was
+refused, and u_blitter's own template asks for `u_minify(depth0, srclevel)
+- 1`. But the crash deserved its own fix, because any other refusal would
+do the same: the view u_blitter is about to build is now built first,
+purely to find out, using u_blitter's own helper so the templates cannot
+drift. A blit declined by name is a wrong picture; a dead process is every
+case after it as well.
+
+copy_image now runs to the end, 225 of 324.
+
+### The shared header, and the one path that never learned about it
+
+`shader_image_size` was 2 of 74. Every packed image shares one header
+block and finds its own entry at `base_word[slot]` — a change made earlier
+in this same session. The texel-offset path was taught that; the
+`imageSize` path was not, and neither was the slice stride beside it. So
+`imageSize` of any packed image but slot zero reported *slot zero's*
+dimensions, and a layered packed image at a non-zero slot indexed its
+slices by the wrong stride.
+
+Beside it, a genuine one: a cube array's third size component is its
+number of **cubes**. The driver reshapes a cube image into the 2D array
+WGSL has, which reports layers — six times as many.
+
+2 → 32 of 74; 36 of the rest are multisample images, which WebGPU has no
+storage texture for at all.
+
+### What the family sweep said, and what it did not
+
+`shader_bitfield_operation` 324/324, `clear_tex_image` 78/78, `limits`
+135/140 — clean. `sample_variables` is finished: its 65 losses are 38
+`samples_8` skips and 27 `rgba32f` multisample, neither of which WebGPU
+has. `shader_multisample_interpolation` is 40/109 and unexamined.
+
+### The browser gate is wedged, and this pass could not use it
+
+Everything above is verified natively: the CTS gate at baseline, the probe
+suite at its four expected DIFFs, EEVEE 58/359, Blender 61/338, STK not
+dark, alacritty matching llvmpipe.
+
+The **browser** half is outstanding. `tests/gl44-probe.sh` now hangs before
+the page reports anything — for the plain `gears` demo as much as for any
+probe, so it is not this pass's work. The server is right (correct
+COOP/COEP, every asset present, 200 on the module), chromium launches and
+opens renderers, its debug endpoint answers, and the harness simply never
+gets a console line and never fires its own `--wall`/`--idle` timers. What
+preceded it: 58 chromium processes left over from an interrupted run,
+which were killed en masse, and several `web/test/drive.mjs` servers still
+listening from sessions days old. Killing all of those, deleting
+`/tmp/gex-harness` and using fresh ports did not recover it.
+
+The reason to think the driver is not implicated: `caps.fbfetch = 1` only
+reaches a shader that declares `layout(blend_support_*)` —
+`gl_nir_lower_blend_equation_advanced` returns immediately when
+`advanced_blend_modes` is zero — and `EXT_shader_framebuffer_fetch` stays
+off, because that needs `fbfetch >= max_render_targets`. No ordinary
+application shader changes. But that is an argument, not a measurement,
+and the measurement is owed.
