@@ -233,7 +233,16 @@ if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
         "$ROOT/tests/integration/programs/gl44-integer-texture-probe.c" \
         -I "$ROOT/third_party/mobilegl-webgpu/include" \
         -I "$WORK/glinc" -L "$WORK/gldriver" -lEGL -lGLESv2 -lm
-    cp "$WORK/gldriver/libGLESv2.so.2" "$WORK/gldriver/libEGL.so.1" "$PUB/fs/"
+    # libGL.so.1 as well as the ES pair. Every GLX application loads it --
+    # glmark2, glxgears, glxinfo -- and it was the one guest library no build
+    # step ever refreshed, so whatever had last been copied by hand stayed
+    # there for good. A stale one is not inert: it speaks an older opcode
+    # numbering, the host rejects the batch carrying an unknown opcode, and the
+    # whole batch is discarded. That cost glmark2 36 of its scenes, which
+    # failed at "Failed to add vertex shader ... source length 1252, but got 0"
+    # because the glShaderSource in the discarded batch never arrived.
+    cp "$WORK/gldriver/libGLESv2.so.2" "$WORK/gldriver/libEGL.so.1" \
+       "$WORK/gldriver/libGL.so.1" "$PUB/fs/"
     # The packaged desktop applications are Debian/glibc, while gles-gears is
     # intentionally a tiny musl binary. Build the same marshaller against each
     # ABI instead of making either process load the other C runtime.
@@ -243,6 +252,7 @@ if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
             "$ROOT/guest/gl/build.sh" "$WORK/gldriver-glibc" >/dev/null
         cp "$WORK/gldriver-glibc/libGLESv2.so.2" \
            "$WORK/gldriver-glibc/libEGL.so.1" \
+           "$WORK/gldriver-glibc/libGL.so.1" \
            "$WORK/gldriver-glibc/libgex-gl-sdl.so" "$PUB/fs/glibc/"
     elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
         mkdir -p "$PUB/fs/glibc"
@@ -250,6 +260,7 @@ if [ -x "$CC" ] && [ -d /usr/include/GLES2 ]; then
             "$ROOT/guest/gl/build.sh" "$WORK/gldriver-glibc" >/dev/null
         cp "$WORK/gldriver-glibc/libGLESv2.so.2" \
            "$WORK/gldriver-glibc/libEGL.so.1" \
+           "$WORK/gldriver-glibc/libGL.so.1" \
            "$WORK/gldriver-glibc/libgex-gl-sdl.so" "$PUB/fs/glibc/"
     else
         echo "skipping glibc GL driver: no aarch64-linux-gnu-gcc"

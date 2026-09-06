@@ -138,9 +138,28 @@ cp -L "$SRC/lib/ld-linux-aarch64.so.1" "$R/lib/ld-linux-aarch64.so.1"
 # /lib and /usr/lib are the same directory on a Debian this recent, and the
 # guest's ld.so looks in both. Copying twice would double 22 MB, so the
 # search path is what points at one place.
+# A program named here and absent from the source is *reported*, not skipped
+# quietly. This list is what a trace found and DT_NEEDED cannot see, so a
+# missing entry is a demo that will not start -- and the failure surfaces far
+# away, inside the guest, as the shell saying "not found" while the browser
+# shows an empty canvas.
+#
+# Xwayland is the case that proves it. It has been in this list while the
+# source rootfs only ever had Xvfb, so every X-mode demo -- glmark2, glxgears,
+# es2gears-x11 -- has been unable to start an X server since the demo script
+# moved from Xvfb to Xwayland, and nothing anywhere said so.
+missing=
 for p in $PROGS; do
-    [ -e "$SRC/usr/bin/$p" ] && cp -L "$SRC/usr/bin/$p" "$R/usr/bin/$p"
+    if [ -e "$SRC/usr/bin/$p" ]; then
+        cp -L "$SRC/usr/bin/$p" "$R/usr/bin/$p"
+    else
+        missing="$missing $p"
+    fi
 done
+if [ -n "$missing" ]; then
+    echo "build-graphics-rootfs: NOT IN $SRC/usr/bin:$missing" >&2
+    echo "build-graphics-rootfs: demos needing those will fail inside the guest" >&2
+fi
 cp -L "$SRC/bin/dash" "$R/bin/sh"
 # The one coreutils program in the image. dash has no `sleep` builtin, and
 # without one the wait for the X socket spins through six hundred iterations

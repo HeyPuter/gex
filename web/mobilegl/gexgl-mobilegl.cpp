@@ -3014,6 +3014,17 @@ EMSCRIPTEN_KEEPALIVE int gex_gl_init(int width, int height) {
 
 EMSCRIPTEN_KEEPALIVE int gex_gl_submit(const uint8_t* data, uint32_t len) {
     reply.clear(); uint32_t at = 0;
+    /* The command decoded immediately before the current one, and how big it
+       said it was.
+       
+       An opcode this decoder does not know is usually not a version skew: the
+       guest and the host are generated from one manifest and ship together. It
+       is far more often *garbage read from inside a payload*, because the
+       command before it declared a smaller size than it wrote, and the parser
+       resumed in the middle of that command's data. The unknown opcode is then
+       a fragment of somebody's vertex data and says nothing at all -- while the
+       command before it is the entire diagnosis. */
+    uint32_t previous_op = 0, previous_size = 0;
     while (at < len) {
         if (len - at < 8) return -1;
         uint32_t op, size; std::memcpy(&op, data + at, 4); std::memcpy(&size, data + at + 4, 4);
@@ -3033,14 +3044,16 @@ EMSCRIPTEN_KEEPALIVE int gex_gl_submit(const uint8_t* data, uint32_t len) {
                 said = true;
                 std::fprintf(stderr,
                              "gexgl: batch rejected at opcode %u (%s) "
-                             "payload=%u\n", op,
+                             "payload=%u after opcode %u (size %u)\n", op,
                              !args.ok ? "short read"
                              : args.p != args.end ? "trailing data"
                              : "unhandled opcode",
-                             size - 8);
+                             size - 8, previous_op, previous_size);
             }
             return -2;
         }
+        previous_op = op;
+        previous_size = size;
         at += size;
     }
     return 0;

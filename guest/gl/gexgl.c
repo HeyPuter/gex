@@ -173,11 +173,57 @@ static void gexgl_note_submit(void) {
 }
 
 /* Hand everything recorded so far to the host and wait for it. */
+/* Walk the queued batch and check that every command's declared length lands
+ * exactly on the next header, and that the last one ends exactly at `tail`.
+ *
+ * begin() advances `tail` by the same length it writes into the header, so the
+ * host and the guest can never disagree about where a command *ends* -- which
+ * means a decode failure on the host is not a size mismatch, it is a command
+ * that wrote past its own reservation and overwrote the next header with data.
+ * The host sees only the wreckage: an opcode that is really a fragment of
+ * somebody's payload, and no way to name the command that scribbled it.
+ *
+ * Here the writer is still in scope. GEX_GL_CHECK_BATCH=1 turns it on.
+ */
+static void gexgl_check_batch(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("GEX_GL_CHECK_BATCH") ? 1 : 0;
+    if (!enabled || !ring) return;
+    uint32_t at = 0, previous_op = 0, previous_at = 0;
+    while (at < ring->tail) {
+        if (ring->tail - at < 8) {
+            fprintf(stderr, "gexgl: batch tail %u has %u stray bytes after "
+                            "opcode %u at %u\n",
+                    ring->tail, ring->tail - at, previous_op, previous_at);
+            return;
+        }
+        uint32_t op, size;
+        memcpy(&op, cmds + at, 4);
+        memcpy(&size, cmds + at + 4, 4);
+        if (size < 8 || size > ring->tail - at) {
+            fprintf(stderr,
+                    "gexgl: malformed header at %u (opcode %u size %u, %u left) "
+                    "-- written by opcode %u at %u, which overran\n",
+                    at, op, size, ring->tail - at, previous_op, previous_at);
+            return;
+        }
+        previous_op = op;
+        previous_at = at;
+        at += size;
+    }
+    /* Ends exactly on the boundary, or the host will read past the last
+       command into whatever the previous batch left behind. */
+    if (at != ring->tail)
+        fprintf(stderr, "gexgl: batch ends at %u but tail is %u (last opcode %u)\n",
+                at, ring->tail, previous_op);
+}
+
 static void flush(void) {
     if (!ring || ring->tail == 0) {
         reply_at = 0;
         return;
     }
+    gexgl_check_batch();
     gexgl_note_submit();
     if (ioctl(gl_fd, GEX_GL_SUBMIT, ring) != 0) {
         /* Said out loud, because the alternative is losing GL commands in
