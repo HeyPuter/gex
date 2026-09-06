@@ -120,6 +120,86 @@ int main(void) {
         while (glGetError() != GL_NO_ERROR) {}
     }
 
+    /* And the integer path, which is a different question. A normalized or
+     * scaled attribute can be widened to float when the driver has no format
+     * for it, and u_vbuf does that; glVertexAttribIPointer means the shader
+     * reads integers, so the fallback has to stay integer.
+     *
+     * u_vbuf's table held exactly four integer entries, all three-component
+     * 16-bit. So GL_UNSIGNED_SHORT with a count of three worked and
+     * GL_UNSIGNED_BYTE with a count of three read as zero: no fallback, the
+     * element reached the driver, the whole vertex-element state was refused,
+     * and the draw ran with no vertex layout at all. Silent, and the sort of
+     * thing older content does constantly for colours and normals. */
+    {
+        static const char *ivs_src =
+            "#version 330 core\n"
+            "in uvec3 a_value;\n"
+            "flat out uvec3 v_value;\n"
+            "void main() { v_value = a_value;\n"
+            "              gl_Position = vec4(0.0,0.0,0.0,1.0); }\n";
+        static const char *ifs_src =
+            "#version 330 core\n"
+            "out vec4 c;\n"
+            "void main() { c = vec4(1.0); }\n";
+        GLuint ivs = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(ivs, 1, &ivs_src, NULL); glCompileShader(ivs);
+        GLuint ifs = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(ifs, 1, &ifs_src, NULL); glCompileShader(ifs);
+        GLuint iprog = glCreateProgram();
+        glAttachShader(iprog, ivs); glAttachShader(iprog, ifs);
+        glBindAttribLocation(iprog, 0, "a_value");
+        const char *ifeedback[] = { "v_value" };
+        glTransformFeedbackVaryings(iprog, 1, ifeedback, GL_INTERLEAVED_ATTRIBS);
+        glLinkProgram(iprog);
+        GLint ilinked = 0; glGetProgramiv(iprog, GL_LINK_STATUS, &ilinked);
+        if (!ilinked) {
+            char log[1024] = {0};
+            glGetProgramInfoLog(iprog, sizeof log, NULL, log);
+            fprintf(stderr, "INFO integer link failed: %s\n", log);
+        }
+        GLuint ixfb = 0;
+        glGenBuffers(1, &ixfb);
+        glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, ixfb);
+        glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, 3 * sizeof(GLuint), NULL,
+                     GL_DYNAMIC_READ);
+        struct { const char *name; GLenum type; unsigned char raw[6];
+                 size_t bytes; unsigned want[3]; } itable[] = {
+            { "ubyte3_integer",  GL_UNSIGNED_BYTE,  {1, 2, 3},
+              3, {1, 2, 3} },
+            { "ushort3_integer", GL_UNSIGNED_SHORT, {1, 0, 2, 0, 3, 0},
+              6, {1, 2, 3} },
+        };
+        for (unsigned i = 0; i < sizeof itable / sizeof itable[0]; ++i) {
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)itable[i].bytes,
+                         itable[i].raw, GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0);
+            glVertexAttribIPointer(0, 3, itable[i].type, 0, NULL);
+            glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, ixfb);
+            glEnable(GL_RASTERIZER_DISCARD);
+            glUseProgram(iprog);
+            glBeginTransformFeedback(GL_POINTS);
+            glDrawArrays(GL_POINTS, 0, 1);
+            glEndTransformFeedback();
+            glDisable(GL_RASTERIZER_DISCARD);
+            GLuint got[3] = {0, 0, 0};
+            glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, sizeof got,
+                               got);
+            const GLenum error = glGetError();
+            fprintf(stderr, "INFO %-16s got=%u,%u,%u want=%u,%u,%u "
+                    "err=0x%04x\n", itable[i].name, got[0], got[1], got[2],
+                    itable[i].want[0], itable[i].want[1], itable[i].want[2],
+                    (unsigned)error);
+            result(itable[i].name,
+                   ilinked && error == GL_NO_ERROR &&
+                   got[0] == itable[i].want[0] &&
+                   got[1] == itable[i].want[1] &&
+                   got[2] == itable[i].want[2]);
+            while (glGetError() != GL_NO_ERROR) {}
+        }
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;
