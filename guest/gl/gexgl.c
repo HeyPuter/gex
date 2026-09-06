@@ -929,7 +929,17 @@ void *glMapBufferRange(unsigned target, long offset, long length,
     object->map_offset = (size_t)offset;
     object->map_access = access;
     object->map = calloc(1, object->map_length ? object->map_length : 1);
-    if (object->map && (access & 1u) && object->map_length)
+    /* GL_MAP_READ_BIT, or any persistent mapping. A write-only mapping is
+       normally handed a zeroed block and never asks the host what the buffer
+       already holds -- that is what keeps the streaming case cheap, and it is
+       right, because such a mapping is written whole and uploaded at unmap.
+       A persistent one is not: the coherent flush uploads whatever differs
+       from what it last sent, so a shadow that starts out zeroed uploads
+       zeros over data the application never touched. glBufferStorage's own
+       initial contents went that way, and the compute shader reading that
+       buffer saw nothing but zeroes. One fetch, on a mapping that lives for
+       the program's lifetime. */
+    if (object->map && ((access & 1u) || (access & 0x40u)) && object->map_length)
         glGetBufferSubData(target, offset, length, object->map);
     return object->map;
 }
@@ -992,10 +1002,11 @@ void *glMapNamedBufferRange(unsigned buffer, long offset, long length,
     object->map_offset = (size_t)offset;
     object->map_access = access;
     object->map = calloc(1, object->map_length ? object->map_length : 1);
-    /* Only GL_MAP_READ_BIT pays for the round trip. A write-only mapping that
-       fetched the old contents first would double the cost of the streaming
-       case this exists to serve. */
-    if (object->map && (access & 1u) && object->map_length)
+    /* GL_MAP_READ_BIT pays for the round trip, and so does any persistent
+       mapping -- see the note in glMapBufferRange. A write-only,
+       non-persistent mapping still does not: that would double the cost of
+       the streaming case this exists to serve. */
+    if (object->map && ((access & 1u) || (access & 0x40u)) && object->map_length)
         glGetNamedBufferSubData(buffer, offset, length, object->map);
     return object->map;
 }

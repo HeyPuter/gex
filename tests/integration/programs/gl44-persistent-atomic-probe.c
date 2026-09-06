@@ -128,6 +128,172 @@ int main(void) {
     result("host_writes_visible", *atom == want2);
 
     glUnmapBuffer(GL_ATOMIC_COUNTER_BUFFER);
+
+    /* The same again, but with the mapping the suite's draw case actually
+     * uses on a core context: persistent and explicitly flushed rather than
+     * coherent, over storage that carries no GL_DYNAMIC_STORAGE_BIT. A
+     * compatibility context takes the coherent branch instead, so a native
+     * run of KHR-GL44.buffer_storage.map_persistent_draw never reaches this
+     * at all -- the browser gets a core profile and does. */
+    {
+        GLuint fe = 0;
+        GLuint *fe_map = NULL;
+        const GLbitfield fe_storage = GL_MAP_PERSISTENT_BIT | GL_MAP_READ_BIT |
+                                      GL_MAP_WRITE_BIT;
+        const GLbitfield fe_access = fe_storage | GL_MAP_FLUSH_EXPLICIT_BIT;
+        glGenBuffers(1, &fe);
+        glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, fe);
+        glBufferStorage(GL_ATOMIC_COUNTER_BUFFER, sizeof(GLuint), NULL,
+                        fe_storage);
+        glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, 0, fe);
+        fe_map = (GLuint *)glMapBufferRange(GL_ATOMIC_COUNTER_BUFFER, 0,
+                                            sizeof(GLuint), fe_access);
+        GLenum fe_err = glGetError();
+        result("flush_explicit_map", fe_map != NULL && fe_err == GL_NO_ERROR);
+        if (fe_map) {
+            *fe_map = 20u;
+            glFlushMappedBufferRange(GL_ATOMIC_COUNTER_BUFFER, 0,
+                                     sizeof(GLuint));
+            glDrawArrays(GL_POINTS, 0, points);
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            glFinish();
+        }
+        GLuint fe_direct = 0;
+        glGetBufferSubData(GL_ATOMIC_COUNTER_BUFFER, 0, sizeof fe_direct,
+                           &fe_direct);
+        const GLuint fe_want = 20u + (GLuint)points;
+        fprintf(stderr, "INFO flush-explicit map=%d through=%u direct=%u "
+                "want=%u err=0x%04x\n", fe_map != NULL,
+                fe_map ? *fe_map : 0, fe_direct, fe_want, (unsigned)fe_err);
+        result("flush_explicit_reaches_device", fe_direct == fe_want);
+        result("flush_explicit_visible", fe_map && *fe_map == fe_want);
+        if (fe_map) glUnmapBuffer(GL_ATOMIC_COUNTER_BUFFER);
+        if (fe) glDeleteBuffers(1, &fe);
+        while (glGetError() != GL_NO_ERROR) {}
+    }
+
+    /* A write-only persistent uniform buffer, explicitly flushed: the shape
+     * the suite's draw case gives its "rectangles" buffer, and the one thing
+     * about that case not covered above. Write-only matters -- the shadow is
+     * never filled from the device for such a mapping unless it is
+     * persistent, which is the seeding this probe's dispatch case caught. */
+    {
+        GLuint ubo = 0;
+        GLuint pattern[4] = { 0x11111111u, 0x22222222u, 0x33333333u,
+                              0x44444444u };
+        GLuint *ubo_map = NULL;
+        GLuint readback[4] = { 0, 0, 0, 0 };
+        glGenBuffers(1, &ubo);
+        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+        glBufferStorage(GL_UNIFORM_BUFFER, sizeof pattern, NULL,
+                        GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT);
+        glBindBuffer(GL_UNIFORM_BUFFER, 0);
+        glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+        ubo_map = (GLuint *)glMapBufferRange(
+            GL_UNIFORM_BUFFER, 0, sizeof pattern,
+            GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT |
+            GL_MAP_FLUSH_EXPLICIT_BIT);
+        if (ubo_map) {
+            memcpy(ubo_map, pattern, sizeof pattern);
+            glFlushMappedBufferRange(GL_UNIFORM_BUFFER, 0, sizeof pattern);
+        }
+        glGetBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof readback, readback);
+        const int same = memcmp(readback, pattern, sizeof pattern) == 0;
+        fprintf(stderr, "INFO ubo-flush map=%d got=%08x,%08x want=%08x,%08x "
+                "err=0x%04x\n", ubo_map != NULL, readback[0], readback[1],
+                pattern[0], pattern[1], (unsigned)glGetError());
+        result("uniform_write_only_flush", ubo_map != NULL && same);
+        if (ubo_map) glUnmapBuffer(GL_UNIFORM_BUFFER);
+        if (ubo) glDeleteBuffers(1, &ubo);
+        while (glGetError() != GL_NO_ERROR) {}
+    }
+
+    /* And the same two directions across a compute dispatch rather than a
+     * draw, which is what KHR-GL44.buffer_storage.map_persistent_dispatch
+     * asks: a source mapped write-only and a destination mapped read-only,
+     * both persistent and coherent, with nothing but glFinish between the
+     * dispatch and the read. */
+    {
+        static const char *cs_src =
+            "#version 430 core\n"
+            "layout(local_size_x = 1) in;\n"
+            "layout(binding = 0, std430) readonly buffer Source { uint src[]; };\n"
+            "layout(binding = 1, std430) writeonly buffer Dest { uint dst[]; };\n"
+            "void main() { dst[gl_GlobalInvocationID.x] =\n"
+            "                  src[gl_GlobalInvocationID.x] + 1u; }\n";
+        enum { COUNT = 16 };
+        GLuint initial[COUNT];
+        for (unsigned i = 0; i < COUNT; ++i) initial[i] = i;
+
+        GLuint cs = compile(GL_COMPUTE_SHADER, cs_src);
+        GLuint cprog = 0;
+        if (cs) {
+            cprog = glCreateProgram();
+            glAttachShader(cprog, cs);
+            glLinkProgram(cprog);
+            GLint ok = 0; glGetProgramiv(cprog, GL_LINK_STATUS, &ok);
+            if (!ok) { char log[1024] = {0};
+                       glGetProgramInfoLog(cprog, sizeof log, NULL, log);
+                       fprintf(stderr, "INFO compute link failed: %s\n", log);
+                       cprog = 0; }
+        }
+        if (cprog) {
+            GLuint src_buf = 0, dst_buf = 0;
+            glGenBuffers(1, &src_buf);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, src_buf);
+            glBufferStorage(GL_SHADER_STORAGE_BUFFER, sizeof initial, initial,
+                            GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT |
+                            GL_MAP_WRITE_BIT);
+            GLuint *src_map = (GLuint *)glMapBufferRange(
+                GL_SHADER_STORAGE_BUFFER, 0, sizeof initial,
+                GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT);
+
+            glGenBuffers(1, &dst_buf);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, dst_buf);
+            glBufferStorage(GL_SHADER_STORAGE_BUFFER, sizeof initial, NULL,
+                            GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT |
+                            GL_MAP_READ_BIT);
+            GLuint *dst_map = (GLuint *)glMapBufferRange(
+                GL_SHADER_STORAGE_BUFFER, 0, sizeof initial,
+                GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_READ_BIT);
+
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, src_buf);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, dst_buf);
+            glUseProgram(cprog);
+            glDispatchCompute(COUNT, 1, 1);
+            glFinish();
+
+            int first_ok = dst_map != NULL;
+            for (unsigned i = 0; first_ok && i < COUNT; ++i)
+                if (dst_map[i] != i + 1u) first_ok = 0;
+            fprintf(stderr, "INFO dispatch first dst[0..3]=%u,%u,%u,%u "
+                    "want=1,2,3,4 err=0x%04x\n",
+                    dst_map ? dst_map[0] : 0, dst_map ? dst_map[1] : 0,
+                    dst_map ? dst_map[2] : 0, dst_map ? dst_map[3] : 0,
+                    (unsigned)glGetError());
+            result("dispatch_result_visible", first_ok);
+
+            /* Now change the source through its mapping and dispatch again. */
+            int second_ok = src_map != NULL && dst_map != NULL;
+            if (src_map)
+                for (unsigned i = 0; i < COUNT; ++i) src_map[i] = 100u + i;
+            glDispatchCompute(COUNT, 1, 1);
+            glFinish();
+            for (unsigned i = 0; second_ok && i < COUNT; ++i)
+                if (dst_map[i] != 101u + i) second_ok = 0;
+            fprintf(stderr, "INFO dispatch second dst[0..3]=%u,%u,%u,%u "
+                    "want=101,102,103,104\n",
+                    dst_map ? dst_map[0] : 0, dst_map ? dst_map[1] : 0,
+                    dst_map ? dst_map[2] : 0, dst_map ? dst_map[3] : 0);
+            result("dispatch_source_update", second_ok);
+
+            if (src_map) { glBindBuffer(GL_SHADER_STORAGE_BUFFER, src_buf);
+                           glUnmapBuffer(GL_SHADER_STORAGE_BUFFER); }
+            if (dst_map) { glBindBuffer(GL_SHADER_STORAGE_BUFFER, dst_buf);
+                           glUnmapBuffer(GL_SHADER_STORAGE_BUFFER); }
+        }
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n",
            cases, passed, cases - passed);
     return cases == passed ? 0 : 1;
