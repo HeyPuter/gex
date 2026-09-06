@@ -1665,6 +1665,137 @@ void glGetPointerv(unsigned pname, void **params) {
     *params = NULL;
 }
 
+/* The error latch, defined with glGetError further down. The bounded queries
+   below need it: GL requires them to raise GL_INVALID_OPERATION when the
+   caller's buffer is too small, and refusing quietly is worse than useless --
+   an application checks glGetError, sees success, and reads the buffer it just
+   failed to have filled. That is exactly the hazard robustness exists to
+   remove, so the refusal has to be reported as well as performed. */
+static void gexgl_set_error(unsigned error);
+
+/* Declared because they are defined below this point, some of them in the
+   generated include.
+ *
+ * This is the fourth time in one session that composing a call out of existing
+ * ones reached a function defined later in the file. C accepts it silently --
+ * an implicit declaration is assumed to be int() -- and the argument
+ * conventions then differ for anything that is not an int. The compiler warns,
+ * so the rule is simply to build with warnings visible and declare what a new
+ * composition reaches; there is no header to include, because this library
+ * deliberately uses plain C types rather than the GL typedefs. */
+void glReadPixels(int x, int y, int w, int h, unsigned format, unsigned type,
+                  void *out);
+void glGetTexLevelParameteriv(unsigned target, int level, unsigned pname,
+                              int *params);
+void glGetTexImage(unsigned target, int level, unsigned format, unsigned type,
+                   void *pixels);
+void glGetCompressedTexImage(unsigned target, int level, void *img);
+
+/* KHR_robustness' bounded readbacks, and ARB_get_texture_sub_image.
+ *
+ * The whole point of the bounded forms is that GL reports INVALID_OPERATION
+ * instead of writing past the caller's buffer, so each asks the host how large
+ * the answer is and refuses before any bytes move. That costs a round trip the
+ * unbounded twin does not pay, which is the trade the caller asked for. */
+void glReadnPixels(int x, int y, int w, int h, unsigned format, unsigned type,
+                   int bufSize, void *data) {
+    if (bufSize < 0) return;
+    /* Computed with the same pixel-store state the transfer will use, so the
+       check and the copy cannot disagree. */
+    struct gexgl_pixel_layout layout;
+    if (!gexgl_compute_pixel_layout(format, type, w, h, -1, &pack_store,
+                                    &layout))
+        return;
+    if (layout.end > (size_t)bufSize) {
+        gexgl_set_error(0x0502u); /* GL_INVALID_OPERATION */
+        return;
+    }
+    glReadPixels(x, y, w, h, format, type, data);
+}
+
+void glGetnTexImage(unsigned target, int level, unsigned format, unsigned type,
+                    int bufSize, void *pixels) {
+    if (bufSize < 0) return;
+    int width = 0, height = 0, depth = 1;
+    glGetTexLevelParameteriv(target, level, 0x1000u /* GL_TEXTURE_WIDTH */, &width);
+    glGetTexLevelParameteriv(target, level, 0x1001u /* GL_TEXTURE_HEIGHT */, &height);
+    glGetTexLevelParameteriv(target, level, 0x8071u /* GL_TEXTURE_DEPTH */, &depth);
+    if (depth < 1) depth = 1;
+    const int volume = target == 0x806Fu /* 3D */ || target == 0x8C1Au /* 2D_ARRAY */ ||
+                       target == 0x9009u /* CUBE_MAP_ARRAY */;
+    struct gexgl_pixel_layout layout;
+    if (!gexgl_compute_pixel_layout(format, type, width, height,
+                                    volume ? depth : -1, &pack_store, &layout))
+        return;
+    if (layout.end > (size_t)bufSize) {
+        gexgl_set_error(0x0502u);
+        return;
+    }
+    glGetTexImage(target, level, format, type, pixels);
+}
+
+void glGetnCompressedTexImage(unsigned target, int lod, int bufSize,
+                              void *pixels) {
+    if (bufSize < 0) return;
+    int size = 0;
+    glGetTexLevelParameteriv(target, lod,
+                             0x86A0u /* GL_TEXTURE_COMPRESSED_IMAGE_SIZE */,
+                             &size);
+    if (size < 0 || size > bufSize) {
+        gexgl_set_error(0x0502u);
+        return;
+    }
+    glGetCompressedTexImage(target, lod, pixels);
+}
+
+/* ARB_get_texture_sub_image. A region of a level rather than the whole thing,
+   which is what a readback of one tile or one array layer wants, and the only
+   readback GL offers that does not force the caller to allocate the lot. */
+void glGetTextureSubImage(unsigned texture, int level, int x, int y, int z,
+                          int w, int h, int d, unsigned format, unsigned type,
+                          int bufSize, void *pixels) {
+    if (bufSize < 0) return;
+    const int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
+    uint32_t *p = begin(GEXGL_GET_TEXTURE_SUB_IMAGE, 14, 0);
+    if (!p) return;
+    p[0] = texture; p[1] = (uint32_t)level;
+    p[2] = (uint32_t)x; p[3] = (uint32_t)y; p[4] = (uint32_t)z;
+    p[5] = (uint32_t)w; p[6] = (uint32_t)h; p[7] = (uint32_t)d;
+    p[8] = format; p[9] = type; p[10] = (uint32_t)bufSize;
+    p[11] = (uint32_t)pbo;
+    p[12] = (uint32_t)(uintptr_t)pixels;
+    p[13] = (uint32_t)((uint64_t)(uintptr_t)pixels >> 32);
+    flush();
+    if (pbo) return;
+    uint32_t bytes = 0;
+    const uint8_t *source = reply_blob(&bytes);
+    /* Exact length only, as everywhere else here: a short reply means the host
+       refused, and a partial copy would leave the caller unable to tell. */
+    if (pixels && source && bytes && (int)bytes <= bufSize)
+        memcpy(pixels, source, bytes);
+}
+
+void glGetCompressedTextureSubImage(unsigned texture, int level, int x, int y,
+                                    int z, int w, int h, int d, int bufSize,
+                                    void *pixels) {
+    if (bufSize < 0) return;
+    const int pbo = bound_buffer(0x88EBu) != 0;
+    uint32_t *p = begin(GEXGL_GET_COMPRESSED_TEXTURE_SUB_IMAGE, 12, 0);
+    if (!p) return;
+    p[0] = texture; p[1] = (uint32_t)level;
+    p[2] = (uint32_t)x; p[3] = (uint32_t)y; p[4] = (uint32_t)z;
+    p[5] = (uint32_t)w; p[6] = (uint32_t)h; p[7] = (uint32_t)d;
+    p[8] = (uint32_t)bufSize; p[9] = (uint32_t)pbo;
+    p[10] = (uint32_t)(uintptr_t)pixels;
+    p[11] = (uint32_t)((uint64_t)(uintptr_t)pixels >> 32);
+    flush();
+    if (pbo) return;
+    uint32_t bytes = 0;
+    const uint8_t *source = reply_blob(&bytes);
+    if (pixels && source && bytes && (int)bytes <= bufSize)
+        memcpy(pixels, source, bytes);
+}
+
 void glGetVertexAttribPointerv(unsigned index, unsigned pname, void **pointer) {
     if (!pointer) return;
     *pointer = (pname == 0x8645u /* GL_VERTEX_ATTRIB_ARRAY_POINTER */ &&

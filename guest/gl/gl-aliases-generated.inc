@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 495 of them whose target this
+ * claimed -- so here are the 503 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -222,6 +222,11 @@ extern __typeof(glGetVertexAttribfv) glGetVertexAttribfvARB __attribute__((alias
 extern __typeof(glGetVertexAttribfv) glGetVertexAttribfvNV __attribute__((alias("glGetVertexAttribfv")));
 extern __typeof(glGetVertexAttribiv) glGetVertexAttribivARB __attribute__((alias("glGetVertexAttribiv")));
 extern __typeof(glGetVertexAttribiv) glGetVertexAttribivNV __attribute__((alias("glGetVertexAttribiv")));
+extern __typeof(glGetnUniformfv) glGetnUniformfvEXT __attribute__((alias("glGetnUniformfv")));
+extern __typeof(glGetnUniformfv) glGetnUniformfvKHR __attribute__((alias("glGetnUniformfv")));
+extern __typeof(glGetnUniformiv) glGetnUniformivEXT __attribute__((alias("glGetnUniformiv")));
+extern __typeof(glGetnUniformiv) glGetnUniformivKHR __attribute__((alias("glGetnUniformiv")));
+extern __typeof(glGetnUniformuiv) glGetnUniformuivKHR __attribute__((alias("glGetnUniformuiv")));
 extern __typeof(glIsBuffer) glIsBufferARB __attribute__((alias("glIsBuffer")));
 extern __typeof(glIsEnabledi) glIsEnabledIndexedEXT __attribute__((alias("glIsEnabledi")));
 extern __typeof(glIsEnabledi) glIsEnablediEXT __attribute__((alias("glIsEnabledi")));
@@ -306,6 +311,9 @@ extern __typeof(glProgramUniformMatrix4x3fv) glProgramUniformMatrix4x3fvEXT __at
 extern __typeof(glProvokingVertex) glProvokingVertexEXT __attribute__((alias("glProvokingVertex")));
 extern __typeof(glPushDebugGroup) glPushDebugGroupKHR __attribute__((alias("glPushDebugGroup")));
 extern __typeof(glQueryCounter) glQueryCounterEXT __attribute__((alias("glQueryCounter")));
+extern __typeof(glReadnPixels) glReadnPixelsARB __attribute__((alias("glReadnPixels")));
+extern __typeof(glReadnPixels) glReadnPixelsEXT __attribute__((alias("glReadnPixels")));
+extern __typeof(glReadnPixels) glReadnPixelsKHR __attribute__((alias("glReadnPixels")));
 extern __typeof(glRenderbufferStorage) glRenderbufferStorageEXT __attribute__((alias("glRenderbufferStorage")));
 extern __typeof(glRenderbufferStorageMultisample) glRenderbufferStorageMultisampleEXT __attribute__((alias("glRenderbufferStorageMultisample")));
 extern __typeof(glRenderbufferStorageMultisample) glRenderbufferStorageMultisampleNV __attribute__((alias("glRenderbufferStorageMultisample")));

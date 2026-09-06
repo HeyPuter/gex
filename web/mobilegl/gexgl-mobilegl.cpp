@@ -236,6 +236,7 @@ enum Op : uint32_t {
     INVALIDATE_NAMED_FRAMEBUFFER_SUB_DATA = 257,
     GET_PROGRAM_PIPELINE_INFO_LOG = 258, GET_PROGRAM_BINARY = 259,
     PROGRAM_BINARY = 260, INVALIDATE_SUB_FRAMEBUFFER = 261,
+    GET_TEXTURE_SUB_IMAGE = 262, GET_COMPRESSED_TEXTURE_SUB_IMAGE = 263,
 };
 
 struct Reader {
@@ -1494,6 +1495,60 @@ bool one(uint32_t op, Reader& a) {
        same gexgl_compute_pixel_layout the guest used, against the same
        GL_UNPACK_* state -- agreeing on it is what keeps a malformed packet
        from being read past its end, so it is checked rather than trusted. */
+    /* ARB_get_texture_sub_image. The size is computed from the *region*, not
+       the level, which is the whole reason the call exists -- and it is
+       recomputed here from the same pack state rather than trusting the
+       bufSize the guest sent. */
+    case GET_TEXTURE_SUB_IMAGE: {
+        const GLuint texture = lookup(textures, a.u32());
+        const GLint level = a.i32();
+        const GLint x = a.i32(), y = a.i32(), z = a.i32();
+        const GLsizei w = a.i32(), h = a.i32(), d = a.i32();
+        const GLenum format = a.u32(), type = a.u32();
+        const GLsizei bufSize = a.i32();
+        const bool pbo = a.u32() != 0;
+        const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
+        if (pbo) {
+            GEX_GL_CALL(glGetTextureSubImage, texture, level, x, y, z, w, h, d,
+                        format, type, bufSize,
+                        reinterpret_cast<void*>(pointer));
+            break;
+        }
+        gexgl_pixel_layout layout{};
+        if (!gexgl_compute_pixel_layout(format, type, w, h, d > 1 ? d : -1,
+                                        &pack_store, &layout) ||
+            layout.end > UINT32_MAX || (GLsizei)layout.end > bufSize) {
+            a.ok = false; break;
+        }
+        std::vector<uint8_t> pixels(layout.end, 0);
+        GEX_GL_CALL(glGetTextureSubImage, texture, level, x, y, z, w, h, d,
+                    format, type, (GLsizei)pixels.size(), pixels.data());
+        put_blob(pixels.data(), (uint32_t)pixels.size());
+        break;
+    }
+    case GET_COMPRESSED_TEXTURE_SUB_IMAGE: {
+        const GLuint texture = lookup(textures, a.u32());
+        const GLint level = a.i32();
+        const GLint x = a.i32(), y = a.i32(), z = a.i32();
+        const GLsizei w = a.i32(), h = a.i32(), d = a.i32();
+        const GLsizei bufSize = a.i32();
+        const bool pbo = a.u32() != 0;
+        const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
+        if (pbo) {
+            GEX_GL_CALL(glGetCompressedTextureSubImage, texture, level, x, y, z,
+                        w, h, d, bufSize, reinterpret_cast<void*>(pointer));
+            break;
+        }
+        /* A compressed region's size is not derivable from the format here, so
+           the guest's bufSize is the allocation -- bounded, because it is used
+           to size a host vector. */
+        if (bufSize < 0 || bufSize > (1 << 26)) { a.ok = false; break; }
+        std::vector<uint8_t> image((size_t)bufSize, 0);
+        GEX_GL_CALL(glGetCompressedTextureSubImage, texture, level, x, y, z, w,
+                    h, d, bufSize, image.data());
+        put_blob(image.data(), (uint32_t)image.size());
+        break;
+    }
     case GET_PROGRAM_PIPELINE_INFO_LOG: {
         const GLuint pipeline = lookup(program_pipelines, a.u32());
         GLint length = 0;

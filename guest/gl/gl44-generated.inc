@@ -2012,6 +2012,38 @@ void glGetVertexAttribiv(unsigned index, unsigned pname, int *params) {
     if (params && source && reply_len == expected)
         memcpy(params, source, expected);
 }
+void glGetnUniformdv(unsigned program, int location, int bufSize, double *params) {
+    uint32_t *a = begin(1330, 2, 0);
+    if (!a) return;
+    a[0] = program; a[1] = (uint32_t)location; flush();
+    uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
+    if (source && (int)bytes > bufSize) { gexgl_set_error(0x0502u); return; }
+    if (params && source && bytes) memcpy(params, source, bytes);
+}
+void glGetnUniformfv(unsigned program, int location, int bufSize, float *params) {
+    uint32_t *a = begin(1331, 2, 0);
+    if (!a) return;
+    a[0] = program; a[1] = (uint32_t)location; flush();
+    uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
+    if (source && (int)bytes > bufSize) { gexgl_set_error(0x0502u); return; }
+    if (params && source && bytes) memcpy(params, source, bytes);
+}
+void glGetnUniformiv(unsigned program, int location, int bufSize, int *params) {
+    uint32_t *a = begin(1332, 2, 0);
+    if (!a) return;
+    a[0] = program; a[1] = (uint32_t)location; flush();
+    uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
+    if (source && (int)bytes > bufSize) { gexgl_set_error(0x0502u); return; }
+    if (params && source && bytes) memcpy(params, source, bytes);
+}
+void glGetnUniformuiv(unsigned program, int location, int bufSize, unsigned *params) {
+    uint32_t *a = begin(1333, 2, 0);
+    if (!a) return;
+    a[0] = program; a[1] = (uint32_t)location; flush();
+    uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
+    if (source && (int)bytes > bufSize) { gexgl_set_error(0x0502u); return; }
+    if (params && source && bytes) memcpy(params, source, bytes);
+}
 void glInvalidateBufferData(unsigned buffer) {
     uint32_t *packet = begin(1335, 1, 0);
     if (!packet) return;

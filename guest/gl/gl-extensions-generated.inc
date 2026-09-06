@@ -2,7 +2,7 @@
  *
  * Extensions the guest may repeat from the host: every command the
  * Khronos registry says they require is exported by this library.
- * 600 claimable, 260 withheld for missing entry
+ * 603 claimable, 257 withheld for missing entry
  * points, out of the registry's whole extension set. A host
  * extension absent from this table is not advertised to the guest,
  * which is why adding a driver capability can need a rebuild here.
@@ -102,6 +102,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_ARB_framebuffer_object",
     "GL_ARB_framebuffer_sRGB",
     "GL_ARB_get_program_binary",
+    "GL_ARB_get_texture_sub_image",
     "GL_ARB_gl_spirv",
     "GL_ARB_gpu_shader5",
     "GL_ARB_gpu_shader_fp64",
@@ -294,6 +295,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_EXT_read_format_bgra",
     "GL_EXT_render_snorm",
     "GL_EXT_rescale_normal",
+    "GL_EXT_robustness",
     "GL_EXT_sRGB",
     "GL_EXT_sRGB_write_control",
     "GL_EXT_separate_depth_stencil",
@@ -388,6 +390,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_KHR_no_error",
     "GL_KHR_parallel_shader_compile",
     "GL_KHR_robust_buffer_access_behavior",
+    "GL_KHR_robustness",
     "GL_KHR_shader_subgroup",
     "GL_KHR_texture_compression_astc_hdr",
     "GL_KHR_texture_compression_astc_ldr",

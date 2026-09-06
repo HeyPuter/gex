@@ -231,7 +231,17 @@ BUFFER_STORAGE_COMMANDS = {"glBufferStorage"}
 UNIFORM_VALUE_QUERIES = {
     "glGetUniformdv": ("double", "GLdouble"),
     "glGetUniformuiv": ("unsigned", "GLuint"),
+    # KHR_robustness' bounded forms. Same query with a caller-supplied ceiling,
+    # and the ceiling is the whole point: GL requires INVALID_OPERATION rather
+    # than a write past the end when the value does not fit. The reply already
+    # carries the true byte count, so the guest can enforce it without asking
+    # the host anything extra.
+    "glGetnUniformdv": ("double", "GLdouble"),
+    "glGetnUniformfv": ("float", "GLfloat"),
+    "glGetnUniformiv": ("int", "GLint"),
+    "glGetnUniformuiv": ("unsigned", "GLuint"),
 }
+BOUNDED_UNIFORM_QUERIES = {n for n in UNIFORM_VALUE_QUERIES if n.startswith("glGetn")}
 CLEAR_VALUE_COMMANDS = {
     "glClearBufferData", "glClearBufferSubData",
     "glClearTexImage", "glClearTexSubImage",
@@ -997,12 +1007,22 @@ def _guest_function(command: dict, opcode: int) -> str:
 """
     if name in UNIFORM_VALUE_QUERIES:
         c_type, _ = UNIFORM_VALUE_QUERIES[name]
-        return f"""void {name}(unsigned program, int location, {c_type} *params) {{
+        bounded = name in BOUNDED_UNIFORM_QUERIES
+        size_param = ", int bufSize" if bounded else ""
+        # The bounded form refuses rather than truncates: a short buffer is
+        # GL_INVALID_OPERATION, not a partial answer the caller cannot detect.
+        # And it reports the refusal. Leaving the buffer alone without
+        # raising GL_INVALID_OPERATION is the worst of both: the caller
+        # checks glGetError, sees success, and reads what it never had
+        # filled -- the exact hazard robustness exists to remove.
+        body = ("    if (source && (int)bytes > bufSize) { gexgl_set_error(0x0502u); return; }\n    if (params && source && bytes) memcpy(params, source, bytes);" if bounded
+                else "    if (params && source && bytes <= 16u * sizeof(*params)) memcpy(params, source, bytes);")
+        return f"""void {name}(unsigned program, int location{size_param}, {c_type} *params) {{
     uint32_t *a = begin({opcode}, 2, 0);
     if (!a) return;
     a[0] = program; a[1] = (uint32_t)location; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
-    if (params && source && bytes <= 16u * sizeof(*params)) memcpy(params, source, bytes);
+{body}
 }}
 """
     if name in CLEAR_VALUE_COMMANDS:
@@ -1598,12 +1618,16 @@ def host_case(command: dict, opcode: int) -> str:
 }}"""
     if name in UNIFORM_VALUE_QUERIES:
         _, gl_type = UNIFORM_VALUE_QUERIES[name]
+        # The bufSize the caller gave is enforced guest-side, so the host asks
+        # for the whole value and passes its own buffer's size along.
+        size_argument = (", (GLsizei)sizeof(values)"
+                         if name in BOUNDED_UNIFORM_QUERIES else "")
         return f"""case {opcode}: {{
     GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
     uint32_t components = uniform_components(program, location);
     if (components > 16) {{ a.ok = false; break; }}
     {gl_type} values[16]{{}};
-    GEX_GL_CALL({name}, program, location, values);
+    GEX_GL_CALL({name}, program, location{size_argument}, values);
     put_blob(values, components * sizeof(values[0]));
     break;
 }}"""

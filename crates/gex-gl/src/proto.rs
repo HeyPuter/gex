@@ -428,6 +428,8 @@ pub mod op {
     pub const GET_PROGRAM_BINARY: u32 = 259;
     pub const PROGRAM_BINARY: u32 = 260;
     pub const INVALIDATE_SUB_FRAMEBUFFER: u32 = 261;
+    pub const GET_TEXTURE_SUB_IMAGE: u32 = 262;
+    pub const GET_COMPRESSED_TEXTURE_SUB_IMAGE: u32 = 263;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

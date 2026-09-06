@@ -1760,6 +1760,42 @@ case 1327: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
+case 1330: {
+    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    uint32_t components = uniform_components(program, location);
+    if (components > 16) { a.ok = false; break; }
+    GLdouble values[16]{};
+    GEX_GL_CALL(glGetnUniformdv, program, location, (GLsizei)sizeof(values), values);
+    put_blob(values, components * sizeof(values[0]));
+    break;
+}
+case 1331: {
+    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    uint32_t components = uniform_components(program, location);
+    if (components > 16) { a.ok = false; break; }
+    GLfloat values[16]{};
+    GEX_GL_CALL(glGetnUniformfv, program, location, (GLsizei)sizeof(values), values);
+    put_blob(values, components * sizeof(values[0]));
+    break;
+}
+case 1332: {
+    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    uint32_t components = uniform_components(program, location);
+    if (components > 16) { a.ok = false; break; }
+    GLint values[16]{};
+    GEX_GL_CALL(glGetnUniformiv, program, location, (GLsizei)sizeof(values), values);
+    put_blob(values, components * sizeof(values[0]));
+    break;
+}
+case 1333: {
+    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    uint32_t components = uniform_components(program, location);
+    if (components > 16) { a.ok = false; break; }
+    GLuint values[16]{};
+    GEX_GL_CALL(glGetnUniformuiv, program, location, (GLsizei)sizeof(values), values);
+    put_blob(values, components * sizeof(values[0]));
+    break;
+}
 case 1335: {
     GLuint buffer = a.u32();
     GEX_GL_CALL(glInvalidateBufferData, lookup(buffers, buffer));
