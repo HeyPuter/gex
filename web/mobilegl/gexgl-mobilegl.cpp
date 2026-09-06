@@ -2113,9 +2113,15 @@ bool one(uint32_t op, Reader& a) {
         put_u32(v); break;
     }
     case GET_PROGRAM_IV: {
-        GLuint p = lookup(programs, a.u32()); GLenum q = a.u32(); GLint v = 0; glGetProgramiv(p, q, &v);
-        if (q == GL_LINK_STATUS && !v) { GLint n=0; glGetProgramiv(p,GL_INFO_LOG_LENGTH,&n); std::vector<char> log(std::max(n,1)); glGetProgramInfoLog(p,log.size(),nullptr,log.data()); emscripten_log(EM_LOG_ERROR,"gex-gl program link: %s",log.data()); }
-        put_u32(v); break;
+        GLuint p = lookup(programs, a.u32()); GLenum q = a.u32();
+        /* Three for GL_COMPUTE_WORK_GROUP_SIZE, one for every other program
+           property; the guest reads the same number back. */
+        const int words = q == GL_COMPUTE_WORK_GROUP_SIZE ? 3 : 1;
+        GLint v[3] = { 0, 0, 0 };
+        glGetProgramiv(p, q, v);
+        if (q == GL_LINK_STATUS && !v[0]) { GLint n=0; glGetProgramiv(p,GL_INFO_LOG_LENGTH,&n); std::vector<char> log(std::max(n,1)); glGetProgramInfoLog(p,log.size(),nullptr,log.data()); emscripten_log(EM_LOG_ERROR,"gex-gl program link: %s",log.data()); }
+        for (int i = 0; i < words; ++i) put_u32(v[i]);
+        break;
     }
     case GET_SHADER_INFO_LOG: {
         GLuint s = lookup(shaders, a.u32()); GLint n = 0; glGetShaderiv(s, GL_INFO_LOG_LENGTH, &n);

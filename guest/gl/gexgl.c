@@ -1251,9 +1251,17 @@ void glGetShaderiv(unsigned shader, unsigned pname, int *out) {
 }
 
 void glGetProgramiv(unsigned program, unsigned pname, int *out) {
+    if (!out) return;
+    /* GL_COMPUTE_WORK_GROUP_SIZE is the one program property that is three
+       integers rather than one. Transporting a single word left the second
+       and third untouched, so every caller read the local size as (x, 0, 0)
+       -- and dEQP checks it in the *setup* of its compute cases, which is why
+       KHR-GL44.compute_shader.simple-compute, one-work-group and
+       dispatch-indirect failed before their bodies ran. */
+    const int words = pname == 0x8267u ? 3 : 1;
     CMD2(GEXGL_GET_PROGRAM_IV, program, pname);
     flush();
-    *out = (int)reply_u32();
+    for (int i = 0; i < words; ++i) out[i] = (int)reply_u32();
 }
 
 static void get_log(uint32_t opcode, unsigned name, int max, int *len, char *out) {

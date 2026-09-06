@@ -171,6 +171,34 @@ int main(void) {
         result("invocations", right == GROUP && back[GROUP] == 0u);
     }
 
+    /* The same result read through a mapping rather than glGetBufferSubData.
+     * Every compute probe here read back the second way and none the first,
+     * so the map path after a dispatch was never asked about at all --
+     * KHR-GL44.compute_shader.simple-compute, one-work-group and
+     * dispatch-indirect all read their result exactly this way, and all three
+     * fail in the browser while their bodies report success, because the
+     * comparison that fails logs nothing. */
+    {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+        const unsigned *mapped = (const unsigned *)glMapBufferRange(
+            GL_SHADER_STORAGE_BUFFER, 0, SLOTS * sizeof(unsigned),
+            GL_MAP_READ_BIT);
+        unsigned right = 0;
+        if (mapped)
+            for (unsigned i = 0; i < GROUP; ++i)
+                if (mapped[i] == i + 1000u) ++right;
+        const GLenum error = glGetError();
+        fprintf(stderr, "INFO mapped-read map=%d slot0=%u want=1000 "
+                "correct=%u/%u err=0x%04x\n", mapped != NULL,
+                mapped ? mapped[0] : 0u, right, (unsigned)GROUP,
+                (unsigned)error);
+        result("mapped_readback", mapped != NULL && error == GL_NO_ERROR &&
+                                  right == GROUP);
+        if (mapped) glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        while (glGetError() != GL_NO_ERROR) {}
+    }
+
     /* Two workgroups, so the grid dimension is exercised rather than only the
      * local size. */
     glBufferData(GL_SHADER_STORAGE_BUFFER, SLOTS * sizeof(unsigned), zero,
