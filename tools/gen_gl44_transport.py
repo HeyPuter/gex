@@ -2052,9 +2052,7 @@ def host_case(command: dict, opcode: int) -> str:
     const unsigned components =
         (target == GL_VIEWPORT || target == GL_SCISSOR_BOX) ? 4u : 1u;
     {name}(target, index, value);
-    if (target == GL_UNIFORM_BUFFER_BINDING || target == GL_TRANSFORM_FEEDBACK_BUFFER_BINDING ||
-        target == GL_ATOMIC_COUNTER_BUFFER_BINDING || target == GL_SHADER_STORAGE_BUFFER_BINDING)
-        value[0] = external_name(buffers, (GLuint)value[0]);{image_translation}{sampler_translation}
+    value[0] = ({value_type})binding_query_external(target, (GLuint)value[0]);{image_translation}
     put_blob(value, components * sizeof(value[0]));
     break;
 }}"""
@@ -2153,6 +2151,21 @@ def host_case(command: dict, opcode: int) -> str:
                       "        else if (objectType == GL_RENDERBUFFER)",
                       "            values[0] = (GLint)external_name(renderbuffers, (GLuint)values[0]);",
                       "    }"]
+        # The same binding queries glGetIntegerv answers, asked through the
+        # other spellings. GL converts the object name to the requested type,
+        # so a float, a double or a 64-bit integer carries it just as much as
+        # an int does and needs translating just as much --
+        # KHR-GL44.compute_shader.dispatch-indirect asks
+        # GL_DISPATCH_INDIRECT_BUFFER_BINDING four ways in one helper and
+        # requires all four to agree.
+        #
+        # Not glGetBooleanv: GL defines that one as false for zero and true
+        # for anything else, so it is already right, and running a boolean
+        # through the name map would turn GL_TRUE into whichever object the
+        # host happened to number one.
+        if name in {"glGetFloatv", "glGetDoublev", "glGetInteger64v"}:
+            lines += ["    if (components)",
+                      f"        values[0] = ({output_type})binding_query_external(pname, (GLuint)values[0]);"]
         if name in {"glGetVertexAttribiv", "glGetVertexAttribIiv", "glGetVertexAttribIuiv"}:
             lines += ["    if (pname == GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING)",
                       f"        values[0] = ({output_type})external_name(buffers, (GLuint)values[0]);"]

@@ -102,6 +102,46 @@ int main(void) {
     result("framebuffer_binding", (GLuint)got == fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+    /* The same binding through the other spellings. GL converts the object
+     * name to whatever type was asked for, so a float and a double and a
+     * 64-bit integer all carry it and all have to be translated --
+     * KHR-GL44.compute_shader.dispatch-indirect asks
+     * GL_DISPATCH_INDIRECT_BUFFER_BINDING four ways in one helper and
+     * requires every answer to agree.
+     *
+     * glBooleanv is the exception and is checked as such: GL defines it as
+     * false for zero and true for anything else, so it must NOT go through
+     * the name map -- doing so would turn GL_TRUE into whichever object the
+     * host numbered one. */
+    {
+        glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, dispatch);
+        GLfloat f = -1.0f;
+        GLdouble db = -1.0;
+        GLint64 i64 = -1;
+        GLboolean b = GL_FALSE;
+        glGetFloatv(GL_DISPATCH_INDIRECT_BUFFER_BINDING, &f);
+        glGetDoublev(GL_DISPATCH_INDIRECT_BUFFER_BINDING, &db);
+        glGetInteger64v(GL_DISPATCH_INDIRECT_BUFFER_BINDING, &i64);
+        glGetBooleanv(GL_DISPATCH_INDIRECT_BUFFER_BINDING, &b);
+        fprintf(stderr, "INFO other_spellings name=%u float=%g double=%g "
+                "int64=%lld boolean=%d err=0x%04x\n", dispatch, (double)f,
+                (double)db, (long long)i64, (int)b, (unsigned)glGetError());
+        result("binding_as_float", f == (GLfloat)dispatch);
+        result("binding_as_double", db == (GLdouble)dispatch);
+        result("binding_as_int64", i64 == (GLint64)dispatch);
+        result("binding_as_boolean", b == GL_TRUE);
+
+        /* And zero stays zero in every spelling. */
+        glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+        f = -1.0f; b = GL_TRUE;
+        glGetFloatv(GL_DISPATCH_INDIRECT_BUFFER_BINDING, &f);
+        glGetBooleanv(GL_DISPATCH_INDIRECT_BUFFER_BINDING, &b);
+        fprintf(stderr, "INFO unbound float=%g boolean=%d want=0,0\n",
+                (double)f, (int)b);
+        result("unbound_is_zero", f == 0.0f && b == GL_FALSE);
+        while (glGetError() != GL_NO_ERROR) {}
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

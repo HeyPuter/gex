@@ -1058,6 +1058,8 @@ case 1229: {
     const uint32_t components = gexgl_state_query_components(pname);
     std::vector<GLdouble> values(components);
     if (components) GEX_GL_CALL(glGetDoublev, pname, values.data());
+    if (components)
+        values[0] = (GLdouble)binding_query_external(pname, (GLuint)values[0]);
     put_blob(values.data(), components * sizeof(GLdouble));
     break;
 }
@@ -1075,6 +1077,8 @@ case 1232: {
     const uint32_t components = gexgl_state_query_components(pname);
     std::vector<GLfloat> values(components);
     if (components) GEX_GL_CALL(glGetFloatv, pname, values.data());
+    if (components)
+        values[0] = (GLfloat)binding_query_external(pname, (GLuint)values[0]);
     put_blob(values.data(), components * sizeof(GLfloat));
     break;
 }
@@ -1127,9 +1131,7 @@ case 1238: {
     const unsigned components =
         (target == GL_VIEWPORT || target == GL_SCISSOR_BOX) ? 4u : 1u;
     glGetInteger64i_v(target, index, value);
-    if (target == GL_UNIFORM_BUFFER_BINDING || target == GL_TRANSFORM_FEEDBACK_BUFFER_BINDING ||
-        target == GL_ATOMIC_COUNTER_BUFFER_BINDING || target == GL_SHADER_STORAGE_BUFFER_BINDING)
-        value[0] = external_name(buffers, (GLuint)value[0]);
+    value[0] = (GLint64)binding_query_external(target, (GLuint)value[0]);
     put_blob(value, components * sizeof(value[0]));
     break;
 }
@@ -1138,6 +1140,8 @@ case 1239: {
     const uint32_t components = gexgl_state_query_components(pname);
     std::vector<GLint64> values(components);
     if (components) GEX_GL_CALL(glGetInteger64v, pname, values.data());
+    if (components)
+        values[0] = (GLint64)binding_query_external(pname, (GLuint)values[0]);
     put_blob(values.data(), components * sizeof(GLint64));
     break;
 }
@@ -1147,11 +1151,8 @@ case 1240: {
     const unsigned components =
         (target == GL_VIEWPORT || target == GL_SCISSOR_BOX) ? 4u : 1u;
     glGetIntegeri_v(target, index, value);
-    if (target == GL_UNIFORM_BUFFER_BINDING || target == GL_TRANSFORM_FEEDBACK_BUFFER_BINDING ||
-        target == GL_ATOMIC_COUNTER_BUFFER_BINDING || target == GL_SHADER_STORAGE_BUFFER_BINDING)
-        value[0] = external_name(buffers, (GLuint)value[0]);
+    value[0] = (GLint)binding_query_external(target, (GLuint)value[0]);
     if (target == GL_IMAGE_BINDING_NAME) value[0] = external_name(textures, (GLuint)value[0]);
-    if (target == GL_SAMPLER_BINDING) value[0] = external_name(samplers, (GLuint)value[0]);
     put_blob(value, components * sizeof(value[0]));
     break;
 }

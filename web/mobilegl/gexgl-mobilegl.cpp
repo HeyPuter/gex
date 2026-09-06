@@ -1313,6 +1313,11 @@ uint32_t binding_query_external(GLenum pname, GLuint name) {
         return external_name(samplers, name);
     case GL_TRANSFORM_FEEDBACK_BINDING:
         return external_name(transform_feedbacks, name);
+    /* Indexed, and asked through glGetIntegeri_v: the buffer attached to a
+       vertex binding point. The four indexed buffer bindings beside it were
+       translated and this was not. */
+    case GL_VERTEX_BINDING_BUFFER:
+        return external_name(buffers, name);
     default:
         return name;
     }
