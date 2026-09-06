@@ -424,6 +424,9 @@ const gears = {
         api: query.get('glapi') || 'es',
         major: Number(query.get('glmajor') || 0),
         minor: Number(query.get('glminor') || 0),
+        // `mesaenv=NAME=VALUE`, repeatable: the driver's own diagnostics,
+        // which are getenv-gated and so were native-only until now.
+        hostEnv: query.getAll('mesaenv'),
       });
     } else if (directWebGpu) {
       // This used to be an unconditional MobileGL construction, so a demo
@@ -434,6 +437,9 @@ const gears = {
         api: query.get('glapi') || 'es',
         major: Number(query.get('glmajor') || 0),
         minor: Number(query.get('glminor') || 0),
+        // `mesaenv=NAME=VALUE`, repeatable: the driver's own diagnostics,
+        // which are getenv-gated and so were native-only until now.
+        hostEnv: query.getAll('mesaenv'),
       });
     } else {
       gl = new GlDevice(canvas);
@@ -1440,6 +1446,7 @@ async function createDirectGlDevice(canvas, backend = null) {
     api: query.get('glapi') || 'core',
     major: Number(query.get('glmajor') || 0),
     minor: Number(query.get('glminor') || 0),
+    hostEnv: query.getAll('mesaenv'),
   });
 }
 

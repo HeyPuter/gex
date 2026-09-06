@@ -111,6 +111,7 @@ export class MesaGlDevice {
       api = 'es',
       major = 0,
       minor = 0,
+      hostEnv = [],
     } = options;
     const out = new MesaGlDevice();
     canvas.id = 'gex-gl';
@@ -237,6 +238,22 @@ export class MesaGlDevice {
 
       // Readback suspends the wasm stack, so submission goes through JSPI.
       out.#submit = WebAssembly.promising(out.#module.gexGlSubmitRaw);
+      // Host-side environment, before anything reads it. Every driver
+      // diagnostic is getenv-gated and getenv answers NULL in the browser
+      // without this, so the instruments existed everywhere except the place
+      // they were needed.
+      if (hostEnv.length && out.#module._gex_gl_setenv) {
+        const encoder = new TextEncoder();
+        for (const pair of hostEnv) {
+          const bytes = encoder.encode(`${pair}\0`);
+          const ptr = out.#module._malloc(bytes.length);
+          if (!ptr) continue;
+          out.#module.HEAPU8.set(bytes, ptr);
+          out.#module._gex_gl_setenv(ptr);
+          out.#module._free(ptr);
+        }
+        console.warn('[mesa-gl] host env:', hostEnv.join(' '));
+      }
       if (out.#module._gex_gl_set_api)
         out.#module._gex_gl_set_api(api === 'core' ? 1 : 0, major, minor);
       const rc = out.#module._gex_gl_init(canvas.width, canvas.height);

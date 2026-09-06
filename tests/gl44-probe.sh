@@ -153,6 +153,14 @@ done
 GUEST_ENV_ARGS="--query glenv=GEX_GUEST_NAMES=1"
 [ -z "${GEX_GUEST_ENV:-}" ] ||
     GUEST_ENV_ARGS="$GUEST_ENV_ARGS --query glenv=$GEX_GUEST_ENV"
+# And the host's own environment, which is a different thing: `glenv` reaches
+# the guest process, `mesaenv` reaches the driver inside the wasm module. Every
+# GEX_WGPU_* diagnostic is getenv-gated, and getenv answered NULL in the
+# browser until there was a way to set one -- so the instruments existed
+# everywhere except the place their defects live.
+#   GEX_MESA_ENV=GEX_WGPU_DRAW_DROP=1 tests/gl44-probe.sh image-targets
+[ -z "${GEX_MESA_ENV:-}" ] ||
+    GUEST_ENV_ARGS="$GUEST_ENV_ARGS --query mesaenv=$GEX_MESA_ENV"
 
 GEX_CHROME_PORT=${GEX_CHROME_PORT:-9335} GEX_SERVE_PORT=${GEX_SERVE_PORT:-8091} \
 node "$ROOT/web/test/drive.mjs" gears --allow-errors \
