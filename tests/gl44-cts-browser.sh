@@ -68,6 +68,31 @@ CTS_PUBLIC="$ROOT/web/public/fs/$CTS_NAME"
 CTS_DIST="$ROOT/web/dist/fs/$CTS_NAME"
 mv "$CTS_STAGE" "$CTS_PUBLIC"
 
+# Rebuild that marshaller from the current tree first.
+#
+# $BUILD/guest-gl is written by tests/gl44-cts.sh when the CTS is *compiled*,
+# and never again -- so it goes stale the moment the transport gains a command,
+# and it is then copied over the production driver below. On 2026-09-06 it was
+# 193,448 bytes against a current 387,768, missing about 130 commands: the CTS
+# aborted on "unknown opcode 1306" (glGetTransformFeedbackVarying, generated in
+# that old build and hand-written now), and every later browser run inherited
+# the stale driver until the assets were rebuilt.
+#
+# Refreshing it costs a few seconds and cannot break the ABI glcts linked
+# against: a shared object that gains symbols still satisfies every old one.
+if [ -n "${GEX_CTS_TOOLCHAIN:-}" ] && [ -x "$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc" ]; then
+    GEX_CC="$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc" \
+        "$ROOT/guest/gl/build.sh" "$BUILD/guest-gl" >/dev/null || {
+            echo "could not rebuild the CTS guest driver" >&2; exit 1; }
+elif command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
+    GEX_CC="$(command -v aarch64-linux-musl-gcc)" \
+        "$ROOT/guest/gl/build.sh" "$BUILD/guest-gl" >/dev/null || {
+            echo "could not rebuild the CTS guest driver" >&2; exit 1; }
+else
+    echo "warning: no musl cross compiler; serving whatever guest driver" >&2
+    echo "         $BUILD/guest-gl already holds, which may be stale" >&2
+fi
+
 # glcts links the one-object EGL/GLES marshaller for the few EGL calls the
 # surfaceless platform makes directly. Install the exact build it linked.
 if [ -f "$BUILD/guest-gl/libGLESv2.so.2" ]; then
@@ -79,6 +104,13 @@ if [ -f "$BUILD/guest-gl/libGLESv2.so.2" ]; then
     mkdir -p "$ROOT/web/dist/fs"
     cp "$BUILD/guest-gl/libGLESv2.so.2" "$ROOT/web/dist/fs/libGLESv2.so.2"
     cp "$BUILD/guest-gl/libEGL.so.1" "$ROOT/web/dist/fs/libEGL.so.1"
+    # And libGL.so.1, which GLX applications load and which nothing else here
+    # refreshes -- leaving a stale one behind broke glmark2 for the same
+    # reason this block just broke the CTS.
+    [ -f "$BUILD/guest-gl/libGL.so.1" ] && {
+        cp "$BUILD/guest-gl/libGL.so.1" "$ROOT/web/public/fs/libGL.so.1"
+        cp "$BUILD/guest-gl/libGL.so.1" "$ROOT/web/dist/fs/libGL.so.1"
+    }
 fi
 
 if [ "${GEX_CTS_SKIP_BUILD:-0}" = 1 ]; then
