@@ -1895,6 +1895,22 @@ case 1375: {
     GEX_GL_CALL(glNamedFramebufferDrawBuffer, lookup(framebuffers, framebuffer), buf);
     break;
 }
+case 1376: {
+    GLuint framebuffer = a.u32();
+    GLsizei n = a.i32();
+    uint32_t bufs_bytes = 0;
+    const uint8_t *bufs_wire = a.blob(bufs_bytes);
+    size_t bufs_expected = 0;
+    if (n > 0 &&
+        (size_t)n <= SIZE_MAX / (1u * sizeof(GLenum)))
+        bufs_expected = (size_t)n * 1u * sizeof(GLenum);
+    if (bufs_bytes != bufs_expected) { a.ok = false; break; }
+    std::vector<GLenum> bufs_aligned(bufs_bytes / sizeof(GLenum));
+    if (bufs_bytes) memcpy(bufs_aligned.data(), bufs_wire, bufs_bytes);
+    const GLenum *bufs = bufs_bytes ? bufs_aligned.data() : nullptr;
+    GEX_GL_CALL(glNamedFramebufferDrawBuffers, lookup(framebuffers, framebuffer), n, bufs);
+    break;
+}
 case 1377: {
     GLuint framebuffer = a.u32();
     GLenum pname = a.u32();
@@ -3026,11 +3042,27 @@ case 1509: {
     GEX_GL_CALL(glTextureParameterf, lookup(textures, texture), pname, param);
     break;
 }
+case 1510: {
+    GLuint first = a.u32(); GLenum pname = a.u32();
+    uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
+    const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLfloat);
+    if (bytes != expected) { a.ok = false; break; }
+    GEX_GL_CALL(glTextureParameterfv, lookup(textures, first), pname, reinterpret_cast<const GLfloat *>(wire));
+    break;
+}
 case 1511: {
     GLuint texture = a.u32();
     GLenum pname = a.u32();
     GLint param = a.i32();
     GEX_GL_CALL(glTextureParameteri, lookup(textures, texture), pname, param);
+    break;
+}
+case 1512: {
+    GLuint first = a.u32(); GLenum pname = a.u32();
+    uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
+    const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLint);
+    if (bytes != expected) { a.ok = false; break; }
+    GEX_GL_CALL(glTextureParameteriv, lookup(textures, first), pname, reinterpret_cast<const GLint *>(wire));
     break;
 }
 case 1513: {

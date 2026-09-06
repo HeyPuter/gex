@@ -1774,6 +1774,72 @@ void glTexSubImage2D(unsigned target, int level, int x, int y, int w, int h,
     put_blob(p + 11, pbo ? NULL : pixels, len);
 }
 
+/* The named texture uploads. GL 4.5 core, and the last thing between an engine
+   on the DSA path and a textured frame: the object model, the storage and the
+   buffer uploads all landed already, and without these a texture could be
+   created and sized by name and then never filled.
+
+   Hand-written beside their bound twins for the same reason those are: the
+   byte count comes from gexgl_compute_pixel_layout against the guest's own
+   GL_UNPACK_* state, and both ends must compute it identically -- that shared
+   calculation is a memory-safety requirement, not an optimisation. A pixel
+   unpack buffer is passed as an offset instead of a blob, exactly as above.
+
+   The only difference from the bound forms is the first word: a texture name
+   here, a target there. */
+void glTextureSubImage1D(unsigned texture, int level, int x, int w,
+                         unsigned format, unsigned type, const void *pixels) {
+    const int pbo = bound_buffer(0x88ECu) != 0;
+    const size_t len = pixels && !pbo
+        ? pixel_transfer_bytes(format, type, w, 1, -1, &unpack_store, NULL) : 0;
+    if (len > UINT32_MAX - 4u) return;
+    uint32_t *p = begin(GEXGL_TEXTURE_SUB_IMAGE_1D, 9, 4 + len);
+    if (!p) return;
+    p[0] = texture; p[1] = (uint32_t)level; p[2] = (uint32_t)x;
+    p[3] = (uint32_t)w; p[4] = format; p[5] = type;
+    p[6] = (uint32_t)pbo;
+    /* Two words, like the 2D and 3D forms: with a pixel unpack buffer bound
+       this is an offset, not a pointer, and truncating it to 32 bits would
+       silently read the wrong place in a large buffer. */
+    p[7] = (uint32_t)(uintptr_t)pixels;
+    p[8] = (uint32_t)((uint64_t)(uintptr_t)pixels >> 32);
+    put_blob(p + 9, pbo ? NULL : pixels, len);
+}
+
+void glTextureSubImage2D(unsigned texture, int level, int x, int y, int w, int h,
+                         unsigned format, unsigned type, const void *pixels) {
+    const int pbo = bound_buffer(0x88ECu) != 0;
+    const size_t len = pixels && !pbo
+        ? pixel_transfer_bytes(format, type, w, h, -1, &unpack_store, NULL) : 0;
+    if (len > UINT32_MAX - 4u) return;
+    uint32_t *p = begin(GEXGL_TEXTURE_SUB_IMAGE_2D, 11, 4 + len);
+    if (!p) return;
+    p[0] = texture; p[1] = (uint32_t)level; p[2] = (uint32_t)x; p[3] = (uint32_t)y;
+    p[4] = (uint32_t)w; p[5] = (uint32_t)h; p[6] = format; p[7] = type;
+    p[8] = (uint32_t)pbo;
+    p[9] = (uint32_t)(uintptr_t)pixels;
+    p[10] = (uint32_t)((uint64_t)(uintptr_t)pixels >> 32);
+    put_blob(p + 11, pbo ? NULL : pixels, len);
+}
+
+void glTextureSubImage3D(unsigned texture, int level, int x, int y, int z,
+                         int w, int h, int d, unsigned format, unsigned type,
+                         const void *pixels) {
+    const int pbo = bound_buffer(0x88ECu) != 0;
+    const size_t len = pixels && !pbo
+        ? pixel_transfer_bytes(format, type, w, h, d, &unpack_store, NULL) : 0;
+    if (len > UINT32_MAX - 4u) return;
+    uint32_t *p = begin(GEXGL_TEXTURE_SUB_IMAGE_3D, 13, 4 + len);
+    if (!p) return;
+    p[0] = texture; p[1] = (uint32_t)level; p[2] = (uint32_t)x; p[3] = (uint32_t)y;
+    p[4] = (uint32_t)z; p[5] = (uint32_t)w; p[6] = (uint32_t)h; p[7] = (uint32_t)d;
+    p[8] = format; p[9] = type;
+    p[10] = (uint32_t)pbo;
+    p[11] = (uint32_t)(uintptr_t)pixels;
+    p[12] = (uint32_t)((uint64_t)(uintptr_t)pixels >> 32);
+    put_blob(p + 13, pbo ? NULL : pixels, len);
+}
+
 /* Defined further down, with the fixed-function set they belong to. */
 static void put_float(uint32_t *slot, float value);
 static size_t light_parameter_floats(unsigned pname);

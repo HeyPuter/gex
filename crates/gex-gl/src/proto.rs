@@ -414,6 +414,9 @@ pub mod op {
     pub const NAMED_BUFFER_DATA: u32 = 245;
     pub const NAMED_BUFFER_SUB_DATA: u32 = 246;
     pub const NAMED_BUFFER_STORAGE: u32 = 247;
+    pub const TEXTURE_SUB_IMAGE_1D: u32 = 248;
+    pub const TEXTURE_SUB_IMAGE_2D: u32 = 249;
+    pub const TEXTURE_SUB_IMAGE_3D: u32 = 250;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

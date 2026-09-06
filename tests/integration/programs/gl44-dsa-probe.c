@@ -208,6 +208,34 @@ int main(void) {
                linked && drawn[1] > 200 && drawn[0] < 60 && drawn[2] < 60, detail);
     }
 
+    /* Texture data by name, and read back. Everything above proved the object
+     * model and the buffer path; this is the one that fails if pixels never
+     * arrive -- and it is what an engine does immediately after
+     * glTextureStorage2D. Read through a framebuffer because glGetTexImage has
+     * no bearing on whether the *upload* worked and would mask a bad path. */
+    GLuint uploaded = 0, upload_fbo = 0;
+    glCreateTextures(GL_TEXTURE_2D, 1, &uploaded);
+    glTextureStorage2D(uploaded, 1, GL_RGBA8, 2, 2);
+    static const unsigned char texels[16] = {
+        255, 0, 0, 255,     0, 255, 0, 255,
+        0, 0, 255, 255,     255, 255, 0, 255,
+    };
+    glTextureSubImage2D(uploaded, 0, 0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE,
+                        texels);
+    glCreateFramebuffers(1, &upload_fbo);
+    glNamedFramebufferTexture(upload_fbo, GL_COLOR_ATTACHMENT0, uploaded, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, upload_fbo);
+    unsigned char got[4] = {0, 0, 0, 0};
+    glReadPixels(1, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, got);
+    {
+        char detail[96];
+        snprintf(detail, sizeof detail, "texel(1,0) = %u,%u,%u,%u", got[0],
+                 got[1], got[2], got[3]);
+        report("texture_sub_image_by_name",
+               got[0] == 0 && got[1] == 255 && got[2] == 0 && got[3] == 255,
+               detail);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, cases - failures,
            failures);
     return failures ? 1 : 0;

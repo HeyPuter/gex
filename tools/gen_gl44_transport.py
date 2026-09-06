@@ -447,12 +447,14 @@ SCALAR_COMMANDS |= DIRECT_STATE_ACCESS_COMMANDS
 # The rest of DSA that fits a policy its bound twin already uses. Each is the
 # same wire shape with the object named instead of bound, so the only new
 # information is which map resolves the name.
-TEXTURE_PARAMETER_ARRAYS |= {"glTextureParameterIiv", "glTextureParameterIuiv"}
+TEXTURE_PARAMETER_ARRAYS |= {"glTextureParameterIiv", "glTextureParameterIuiv",
+                             "glTextureParameterfv", "glTextureParameteriv"}
 # Only the Data form: glInvalidateNamedFramebufferSubData puts its attachment
 # array mid-signature, ahead of x/y/width/height, and ARRAY_COMMANDS requires
 # the array last. The generator says so rather than emitting something wrong,
 # which is the whole point of it failing closed.
-ARRAY_COMMANDS |= {"glInvalidateNamedFramebufferData"}
+ARRAY_COMMANDS |= {"glInvalidateNamedFramebufferData",
+                   "glNamedFramebufferDrawBuffers"}
 BLOB_COMMANDS |= {"glCompressedTextureSubImage1D",
                   "glCompressedTextureSubImage2D",
                   "glCompressedTextureSubImage3D"}
@@ -466,6 +468,9 @@ RESOURCE_OUTPUT_QUERIES.update({
 OBJECT_COMMANDS.update({
     "glTextureParameterIiv": {"texture": "textures"},
     "glTextureParameterIuiv": {"texture": "textures"},
+    "glTextureParameterfv": {"texture": "textures"},
+    "glTextureParameteriv": {"texture": "textures"},
+    "glNamedFramebufferDrawBuffers": {"framebuffer": "framebuffers"},
     "glInvalidateNamedFramebufferData": {"framebuffer": "framebuffers"},
     "glCompressedTextureSubImage1D": {"texture": "textures"},
     "glCompressedTextureSubImage2D": {"texture": "textures"},
@@ -701,8 +706,13 @@ def validate(commands: list[dict]) -> list[dict]:
         if command["name"] in TEXTURE_PARAMETER_ARRAYS:
             if (len(pointers) != 1 or pointers[0] is not command["params"][-1] or
                     not pointers[0]["const"] or pointers[0]["length"] != "COMPSIZE(pname)" or
-                    pointers[0]["type"] not in {"GLint", "GLuint"}):
+                    pointers[0]["type"] not in {"GLint", "GLuint", "GLfloat"}):
                 raise RuntimeError(f"{command['name']}: unexpected texture parameter array")
+            # GLfloat joins the two integer types for glTextureParameterfv and
+            # glSamplerParameterfv: the emitter has always been generic over
+            # the pointer type -- it sizes the payload with sizeof() and casts
+            # back with the same type -- so the restriction was the validator's
+            # alone, and a float border colour is exactly the case it names.
         elif command["name"] in SAMPLER_MULTI_BIND_COMMANDS:
             if (len(pointers) != 1 or pointers[0]["name"] != "samplers" or
                     pointers[0]["type"] != "GLuint" or pointers[0]["length"] != "count"):

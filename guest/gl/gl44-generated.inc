@@ -2184,6 +2184,18 @@ void glNamedFramebufferDrawBuffer(unsigned framebuffer, unsigned buf) {
     packet[at++] = (uint32_t)(framebuffer);
     packet[at++] = (uint32_t)(buf);
 }
+void glNamedFramebufferDrawBuffers(unsigned framebuffer, int n, const unsigned *bufs) {
+    size_t blob_len = 0;
+    if (bufs && n > 0 &&
+        (size_t)n <= SIZE_MAX / (1u * sizeof(*bufs)))
+        blob_len = (size_t)n * 1u * sizeof(*bufs);
+    uint32_t *packet = begin(1376, 3, blob_len);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
+    packet[at++] = (uint32_t)(n);
+    put_blob(packet + at, bufs, blob_len);
+}
 void glNamedFramebufferParameteri(unsigned framebuffer, unsigned pname, int param) {
     uint32_t *packet = begin(1377, 3, 0);
     if (!packet) return;
@@ -3260,6 +3272,14 @@ void glTextureParameterf(unsigned texture, unsigned pname, float param) {
     packet[at++] = (uint32_t)(pname);
     packet[at++] = as_bits(param);
 }
+void glTextureParameterfv(unsigned texture, unsigned pname, const float *param) {
+    size_t components = pname == 0x1004u ? 4u : 1u; /* GL_TEXTURE_BORDER_COLOR */
+    size_t blob_len = param ? components * sizeof(*param) : 0;
+    uint32_t *a = begin(1510, 2, 4 + blob_len);
+    if (!a) return;
+    a[0] = texture; a[1] = pname;
+    put_blob(a + 2, param, blob_len);
+}
 void glTextureParameteri(unsigned texture, unsigned pname, int param) {
     uint32_t *packet = begin(1511, 3, 0);
     if (!packet) return;
@@ -3267,6 +3287,14 @@ void glTextureParameteri(unsigned texture, unsigned pname, int param) {
     packet[at++] = (uint32_t)(texture);
     packet[at++] = (uint32_t)(pname);
     packet[at++] = (uint32_t)(param);
+}
+void glTextureParameteriv(unsigned texture, unsigned pname, const int *param) {
+    size_t components = pname == 0x1004u ? 4u : 1u; /* GL_TEXTURE_BORDER_COLOR */
+    size_t blob_len = param ? components * sizeof(*param) : 0;
+    uint32_t *a = begin(1512, 2, 4 + blob_len);
+    if (!a) return;
+    a[0] = texture; a[1] = pname;
+    put_blob(a + 2, param, blob_len);
 }
 void glTextureStorage1D(unsigned texture, int levels, unsigned internalformat, int width) {
     uint32_t *packet = begin(1513, 4, 0);

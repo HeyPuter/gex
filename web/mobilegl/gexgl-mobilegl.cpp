@@ -227,7 +227,8 @@ enum Op : uint32_t {
     DRAW_ELEMENTS_FULL = 240, POLYGON_OFFSET_CLAMP = 241,
     BLEND_BARRIER = 242, SHADER_BINARY = 243, SPECIALIZE_SHADER = 244,
     NAMED_BUFFER_DATA = 245, NAMED_BUFFER_SUB_DATA = 246,
-    NAMED_BUFFER_STORAGE = 247,
+    NAMED_BUFFER_STORAGE = 247, TEXTURE_SUB_IMAGE_1D = 248,
+    TEXTURE_SUB_IMAGE_2D = 249, TEXTURE_SUB_IMAGE_3D = 250,
 };
 
 struct Reader {
@@ -1480,6 +1481,72 @@ bool one(uint32_t op, Reader& a) {
             size != n) { a.ok = false; break; }
         GEX_GL_CALL(glNamedBufferSubData, buffer, (GLintptr)offset,
                     (GLsizeiptr)size, wire);
+        break;
+    }
+    /* The named texture uploads. The byte count is recomputed here from the
+       same gexgl_compute_pixel_layout the guest used, against the same
+       GL_UNPACK_* state -- agreeing on it is what keeps a malformed packet
+       from being read past its end, so it is checked rather than trusted. */
+    case TEXTURE_SUB_IMAGE_1D: {
+        const GLuint texture = lookup(textures, a.u32());
+        const GLint level = a.i32(), x = a.i32();
+        const GLsizei w = a.i32();
+        const GLenum format = a.u32(), type = a.u32();
+        const bool pbo = a.u32() != 0;
+        const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
+        uint32_t n = 0;
+        const uint8_t* wire = a.blob(n);
+        gexgl_pixel_layout layout{};
+        const bool valid = gexgl_compute_pixel_layout(format, type, w, 1, -1,
+                                                      &unpack_store, &layout);
+        if ((pbo && n != 0) || (!pbo && pointer && (!valid || layout.end != n))) {
+            a.ok = false; break;
+        }
+        const void* data = pbo ? reinterpret_cast<const void*>(pointer)
+                               : (pointer ? wire : nullptr);
+        GEX_GL_CALL(glTextureSubImage1D, texture, level, x, w, format, type, data);
+        break;
+    }
+    case TEXTURE_SUB_IMAGE_2D: {
+        const GLuint texture = lookup(textures, a.u32());
+        const GLint level = a.i32(), x = a.i32(), y = a.i32();
+        const GLsizei w = a.i32(), h = a.i32();
+        const GLenum format = a.u32(), type = a.u32();
+        const bool pbo = a.u32() != 0;
+        const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
+        uint32_t n = 0;
+        const uint8_t* wire = a.blob(n);
+        gexgl_pixel_layout layout{};
+        const bool valid = gexgl_compute_pixel_layout(format, type, w, h, -1,
+                                                      &unpack_store, &layout);
+        if ((pbo && n != 0) || (!pbo && pointer && (!valid || layout.end != n))) {
+            a.ok = false; break;
+        }
+        const void* data = pbo ? reinterpret_cast<const void*>(pointer)
+                               : (pointer ? wire : nullptr);
+        GEX_GL_CALL(glTextureSubImage2D, texture, level, x, y, w, h, format,
+                    type, data);
+        break;
+    }
+    case TEXTURE_SUB_IMAGE_3D: {
+        const GLuint texture = lookup(textures, a.u32());
+        const GLint level = a.i32(), x = a.i32(), y = a.i32(), z = a.i32();
+        const GLsizei w = a.i32(), h = a.i32(), d = a.i32();
+        const GLenum format = a.u32(), type = a.u32();
+        const bool pbo = a.u32() != 0;
+        const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
+        uint32_t n = 0;
+        const uint8_t* wire = a.blob(n);
+        gexgl_pixel_layout layout{};
+        const bool valid = gexgl_compute_pixel_layout(format, type, w, h, d,
+                                                      &unpack_store, &layout);
+        if ((pbo && n != 0) || (!pbo && pointer && (!valid || layout.end != n))) {
+            a.ok = false; break;
+        }
+        const void* data = pbo ? reinterpret_cast<const void*>(pointer)
+                               : (pointer ? wire : nullptr);
+        GEX_GL_CALL(glTextureSubImage3D, texture, level, x, y, z, w, h, d,
+                    format, type, data);
         break;
     }
     case NAMED_BUFFER_STORAGE: {
