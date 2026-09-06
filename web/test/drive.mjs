@@ -1022,13 +1022,38 @@ function capped(promise, ms, what) {
 function compileMatcher(s) {
   if (!s) return null;
   const m = /^\/(.*)\/([a-z]*)$/s.exec(s);
-  return m ? new RegExp(m[1], m[2]) : new RegExp(s);
+  if (m) return new RegExp(m[1], m[2]);
+  /* A bare string is a LITERAL first and a pattern second.
+   *
+   * tests/gl44-probe.sh reads a probe's own output line off the native run and
+   * passes it straight through as --want, and some of those carry brackets:
+   *
+   *   gl44 shadow gather border ok (centre=3 corner00=13 corner11=15 outside=15)
+   *
+   * Compiled as a regex those parentheses are a capture group, so the pattern
+   * matched only text WITHOUT them -- and a probe whose browser output was
+   * byte-identical to the expectation reported FAIL. That reads as a driver
+   * regression and is nothing of the kind.
+   *
+   * The /.../ form stays an explicit regex, and a bare string still falls back
+   * to its regex reading so existing callers keep working -- `--fail
+   * 'SUMMARY .*failed=[1-9]|FATAL'` is one, and it has no literal match. */
+  let re = null;
+  try { re = new RegExp(s); } catch { /* not a valid pattern; literal only */ }
+  return { literal: s, re };
 }
 function matches(m, t) {
-  return typeof m === 'function' ? !!m(t) : m instanceof RegExp ? m.test(t) : false;
+  if (typeof m === 'function') return !!m(t);
+  if (m instanceof RegExp) return m.test(t);
+  if (m && typeof m === 'object') {
+    return t.includes(m.literal) || (m.re ? m.re.test(t) : false);
+  }
+  return false;
 }
 function describe(m) {
-  return typeof m === 'function' ? '(demo predicate)' : String(m ?? '(none)');
+  if (typeof m === 'function') return '(demo predicate)';
+  if (m && typeof m === 'object' && !(m instanceof RegExp)) return m.literal;
+  return String(m ?? '(none)');
 }
 const MAX_ERRORS = 200;
 function record(list, line) {

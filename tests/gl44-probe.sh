@@ -23,7 +23,19 @@ WORK=${GEX_PROBE_WORK:-${TMPDIR:-/tmp}/gex-gl44-$NAME}
 GUEST_CC=${GEX_CC:-/home/velzie/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc}
 mkdir -p "$WORK" "$ROOT/web/public/fs" "$ROOT/web/dist/fs"
 
-${CC:-cc} -O2 -Wall -Wextra -o "$WORK/mesa" "$SOURCE" -lEGL -lGL
+# A probe that opens its own X connection needs -lX11 as well. Two do --
+# glx-context and window-present -- and without it the *native reference*
+# fails to link:
+#
+#   /usr/bin/ld: /usr/lib/libX11.so.6: error adding symbols: DSO missing
+#   from command line
+#
+# which the gate reports as a probe FAIL indistinguishable from a driver one.
+# Keyed off the source so no other probe takes the dependency.
+PROBE_LIBS="-lEGL -lGL"
+grep -q '<X11/' "$SOURCE" && PROBE_LIBS="$PROBE_LIBS -lX11"
+# shellcheck disable=SC2086
+${CC:-cc} -O2 -Wall -Wextra -o "$WORK/mesa" "$SOURCE" $PROBE_LIBS
 # stderr as well as stdout: a probe that fails says so on stderr, and capturing
 # only stdout left the log empty and the failure reported as "no output".
 # GEX_NATIVE_REFERENCE tells a probe it is the reference run, so it can skip
@@ -63,6 +75,22 @@ if [ -z "$EXPECT" ]; then
     esac
 fi
 echo "expecting: $EXPECT"
+
+# A probe that needs GLX or Xlib cannot be built for the guest here, and that
+# is about this machine rather than about the driver: the guest's libGL really
+# does export 31 glX* entry points ([[glx-and-glmark2]]), but the aarch64-musl
+# cross toolchain carries neither <GL/glx.h> nor the X11 headers it pulls in.
+# Reported as an explicit skip, exit 3, so it cannot be read as a driver
+# failure -- glx-context and window-present spent a whole browser sweep filed
+# as FAIL next to real defects.
+if grep -qE '<GL/glx\.h>|<X11/' "$SOURCE"; then
+    if ! printf '#include <GL/glx.h>\nint main(void){return 0;}\n' |
+         "$GUEST_CC" -x c -I"$ROOT/third_party/mobilegl-webgpu/include" \
+             -fsyntax-only - 2>/dev/null; then
+        echo "SKIP $NAME: needs GLX/X11 headers the guest toolchain has not got"
+        exit 3
+    fi
+fi
 
 GEX_CC="$GUEST_CC" "$ROOT/guest/gl/build.sh" "$WORK/guest-gl" >/dev/null
 "$GUEST_CC" -O2 -Wall -Wextra -I"$ROOT/third_party/mobilegl-webgpu/include" \
