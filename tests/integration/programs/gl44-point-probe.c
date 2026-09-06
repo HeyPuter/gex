@@ -179,6 +179,33 @@ int main(void) {
         result("extent", ok);
     }
 
+    /* 1b. A point of the default size, which is one pixel.
+     *
+     * Everything else here draws a *wide* point, and a wide point is expanded
+     * into a quad by the driver -- so the whole of this probe was testing the
+     * expansion and none of it the plain rasterised point WebGPU draws when
+     * no expansion is wanted. A one-pixel point is what a particle system, a
+     * point cloud or a debug overlay draws. */
+    {
+        clear_black();
+        glColor3f(1.0f, 1.0f, 1.0f);
+        glPointSize(1.0f);
+        glBegin(GL_POINTS);
+        /* Not the exact centre: on an even viewport that is a pixel corner,
+         * and whether a one-pixel point covers anything there is a fill-rule
+         * question rather than a fact about the driver. */
+        glVertex2f(0.1234f, 0.1234f);
+        glEnd();
+        read_target();
+        int x0, y0, x1, y1;
+        lit_bounds(&x0, &y0, &x1, &y1);
+        const int lit = x0 <= x1 && y0 <= y1;
+        fprintf(stderr, "INFO single_pixel lit=%d box=%d,%d..%d,%d\n", lit,
+                x0, y0, x1, y1);
+        result("single_pixel", glGetError() == GL_NO_ERROR && lit &&
+                               x1 - x0 <= 1 && y1 - y0 <= 1);
+    }
+
     /* 2. A viewport smaller than the framebuffer, which is what tells a
      * viewport-relative offset from a framebuffer-relative one. Half the
      * width means clip space spans half as many pixels, so the same size in
