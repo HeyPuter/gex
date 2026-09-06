@@ -352,6 +352,29 @@ void glPolygonOffsetClamp(float factor, float units, float clamp) {
 /* No glPolygonOffsetClampEXT alias here: gl-aliases-generated.inc emits one
    for every registry alias whose base function this library defines, and it
    started emitting this one as soon as the base appeared above. */
+/* KHR_blend_equation_advanced. The barrier is the whole extension's contract:
+   it tells the driver that the draws after it read what the draws before it
+   wrote, which is how a non-coherent implementation -- ours, via a colour
+   attachment snapshot -- knows when to take one.
+
+   Not generated, because it is an extension entry point and the manifest
+   holds the GL 4.4 core set; and it cannot join that set anyway, since the
+   generated opcodes are indices into the sorted core command list and a name
+   inserted near the front would renumber almost the whole ABI. It takes a
+   hand-written opcode beside glPolygonOffsetClamp instead.
+
+   Without it the extension was *withheld*: gen_gl_extensions.py claims an
+   extension only when this library exports every command the registry says
+   it requires, and glBlendBarrier was the one missing. So the host driver
+   passed 87 of 88 blend_equation_advanced cases natively while no guest could
+   ask for the feature at all -- 585 claimable extensions became 586 when this
+   appeared. That gap is invisible to every native gate, because the native
+   driver is reached through the system libGL and not through this
+   marshaller.
+
+   glBlendBarrierKHR and glBlendBarrierNV both alias this in the registry, so
+   gl-aliases-generated.inc emits them from the base defined here. */
+void glBlendBarrier(void) { CMD0(GEXGL_BLEND_BARRIER); }
 void glLineWidth(float width) { CMD1(GEXGL_LINE_WIDTH, as_bits(width)); }
 void glClearStencil(int value) { CMD1(GEXGL_CLEAR_STENCIL, value); }
 void glDepthRangef(float near_value, float far_value) {

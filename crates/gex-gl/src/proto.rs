@@ -408,6 +408,7 @@ pub mod op {
     /// arrays have to be uploaded as far as they reach.
     pub const DRAW_ELEMENTS_FULL: u32 = 240;
     pub const POLYGON_OFFSET_CLAMP: u32 = 241;
+    pub const BLEND_BARRIER: u32 = 242;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

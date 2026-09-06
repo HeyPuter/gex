@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 471 of them whose target this
+ * claimed -- so here are the 473 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -26,6 +26,8 @@ extern __typeof(glBindFramebuffer) glBindFramebufferEXT __attribute__((alias("gl
 extern __typeof(glBindRenderbuffer) glBindRenderbufferEXT __attribute__((alias("glBindRenderbuffer")));
 extern __typeof(glBindTexture) glBindTextureEXT __attribute__((alias("glBindTexture")));
 extern __typeof(glBindVertexArray) glBindVertexArrayOES __attribute__((alias("glBindVertexArray")));
+extern __typeof(glBlendBarrier) glBlendBarrierKHR __attribute__((alias("glBlendBarrier")));
+extern __typeof(glBlendBarrier) glBlendBarrierNV __attribute__((alias("glBlendBarrier")));
 extern __typeof(glBlendColor) glBlendColorEXT __attribute__((alias("glBlendColor")));
 extern __typeof(glBlendEquation) glBlendEquationEXT __attribute__((alias("glBlendEquation")));
 extern __typeof(glBlendEquationi) glBlendEquationIndexedAMD __attribute__((alias("glBlendEquationi")));

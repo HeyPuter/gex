@@ -233,6 +233,7 @@ export const op = {
     POP_NAME: 239,
     DRAW_ELEMENTS_FULL: 240,
     POLYGON_OFFSET_CLAMP: 241,
+    BLEND_BARRIER: 242,
 };
 
 export const MAGIC = 0x47584547;

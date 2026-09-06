@@ -196,6 +196,7 @@ enum Op : uint32_t {
     SELECT_BUFFER = 234, RENDER_MODE = 235, INIT_NAMES = 236,
     LOAD_NAME = 237, PUSH_NAME = 238, POP_NAME = 239,
     DRAW_ELEMENTS_FULL = 240, POLYGON_OFFSET_CLAMP = 241,
+    BLEND_BARRIER = 242,
 };
 
 struct Reader {
@@ -1417,6 +1418,10 @@ bool one(uint32_t op, Reader& a) {
     case BLEND_FUNC_SEPARATE: { GLenum srgb=a.u32(), drgb=a.u32(), sa=a.u32(), da=a.u32(); glBlendFuncSeparate(srgb,drgb,sa,da); break; }
     case POLYGON_OFFSET: { GLfloat factor=a.f32(), units=a.f32(); glPolygonOffset(factor,units); break; }
     case POLYGON_OFFSET_CLAMP: { GLfloat factor=a.f32(), units=a.f32(), clamp=a.f32(); glPolygonOffsetClampEXT(factor,units,clamp); break; }
+    /* KHR_blend_equation_advanced's barrier. The guest has no way to take a
+       framebuffer snapshot itself, so the call has to reach the host driver
+       for the extension to mean anything. */
+    case BLEND_BARRIER: glBlendBarrier(); break;
     case LINE_WIDTH: glLineWidth(a.f32()); break;
     case CLEAR_STENCIL: current_clear_stencil=a.i32(); glClearStencil(current_clear_stencil); break;
     case DEPTH_RANGE: { GLfloat near_value=a.f32(), far_value=a.f32(); glDepthRangef(near_value,far_value); break; }

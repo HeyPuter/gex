@@ -2,7 +2,7 @@
  *
  * Extensions the guest may repeat from the host: every command the
  * Khronos registry says they require is exported by this library.
- * 585 claimable, 275 withheld for missing entry
+ * 586 claimable, 274 withheld for missing entry
  * points, out of the registry's whole extension set. A host
  * extension absent from this table is not advertised to the guest,
  * which is why adding a driver capability can need a rebuild here.
@@ -370,6 +370,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_INTEL_blackhole_render",
     "GL_INTEL_conservative_rasterization",
     "GL_INTEL_fragment_shader_ordering",
+    "GL_KHR_blend_equation_advanced",
     "GL_KHR_blend_equation_advanced_coherent",
     "GL_KHR_context_flush_control",
     "GL_KHR_no_error",
