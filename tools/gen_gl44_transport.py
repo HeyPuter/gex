@@ -1042,7 +1042,7 @@ def _guest_function(command: dict, opcode: int) -> str:
         # immutability itself comes from having called glBufferStorage at all,
         # which glBufferData still refuses.
         return f"""void {name}(unsigned target, long size, const void *data, unsigned flags) {{
-    if (size < 0) {{ gexgl_set_error(0x0501u); return; }} /* GL_INVALID_VALUE */
+    if (size < 0) {{ GEXGL_SET_ERROR(0x0501u); return; }} /* GL_INVALID_VALUE */
     size_t blob_len = data ? (size_t)size : 0;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
     if (object) {{
@@ -1096,7 +1096,7 @@ def _guest_function(command: dict, opcode: int) -> str:
         # raising GL_INVALID_OPERATION is the worst of both: the caller
         # checks glGetError, sees success, and reads what it never had
         # filled -- the exact hazard robustness exists to remove.
-        body = ("    if (source && (int)bytes > bufSize) { gexgl_set_error(0x0502u); return; }\n    if (params && source && bytes) memcpy(params, source, bytes);" if bounded
+        body = ("    if (source && (int)bytes > bufSize) { GEXGL_SET_ERROR(0x0502u); return; }\n    if (params && source && bytes) memcpy(params, source, bytes);" if bounded
                 else "    if (params && source && bytes <= 16u * sizeof(*params)) memcpy(params, source, bytes);")
         return f"""void {name}(unsigned program, int location{size_param}, {c_type} *params) {{
     uint32_t *a = begin({opcode}, 2, 0);

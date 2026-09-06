@@ -235,7 +235,7 @@ void glBlitNamedFramebuffer(unsigned readFramebuffer, unsigned drawFramebuffer, 
     packet[at++] = (uint32_t)(filter);
 }
 void glBufferStorage(unsigned target, long size, const void *data, unsigned flags) {
-    if (size < 0) { gexgl_set_error(0x0501u); return; } /* GL_INVALID_VALUE */
+    if (size < 0) { GEXGL_SET_ERROR(0x0501u); return; } /* GL_INVALID_VALUE */
     size_t blob_len = data ? (size_t)size : 0;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
     if (object) {
@@ -2182,7 +2182,7 @@ void glGetnUniformdv(unsigned program, int location, int bufSize, double *params
     if (!a) return;
     a[0] = program; a[1] = (uint32_t)location; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
-    if (source && (int)bytes > bufSize) { gexgl_set_error(0x0502u); return; }
+    if (source && (int)bytes > bufSize) { GEXGL_SET_ERROR(0x0502u); return; }
     if (params && source && bytes) memcpy(params, source, bytes);
 }
 void glGetnUniformfv(unsigned program, int location, int bufSize, float *params) {
@@ -2190,7 +2190,7 @@ void glGetnUniformfv(unsigned program, int location, int bufSize, float *params)
     if (!a) return;
     a[0] = program; a[1] = (uint32_t)location; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
-    if (source && (int)bytes > bufSize) { gexgl_set_error(0x0502u); return; }
+    if (source && (int)bytes > bufSize) { GEXGL_SET_ERROR(0x0502u); return; }
     if (params && source && bytes) memcpy(params, source, bytes);
 }
 void glGetnUniformiv(unsigned program, int location, int bufSize, int *params) {
@@ -2198,7 +2198,7 @@ void glGetnUniformiv(unsigned program, int location, int bufSize, int *params) {
     if (!a) return;
     a[0] = program; a[1] = (uint32_t)location; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
-    if (source && (int)bytes > bufSize) { gexgl_set_error(0x0502u); return; }
+    if (source && (int)bytes > bufSize) { GEXGL_SET_ERROR(0x0502u); return; }
     if (params && source && bytes) memcpy(params, source, bytes);
 }
 void glGetnUniformuiv(unsigned program, int location, int bufSize, unsigned *params) {
@@ -2206,7 +2206,7 @@ void glGetnUniformuiv(unsigned program, int location, int bufSize, unsigned *par
     if (!a) return;
     a[0] = program; a[1] = (uint32_t)location; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
-    if (source && (int)bytes > bufSize) { gexgl_set_error(0x0502u); return; }
+    if (source && (int)bytes > bufSize) { GEXGL_SET_ERROR(0x0502u); return; }
     if (params && source && bytes) memcpy(params, source, bytes);
 }
 void glInvalidateBufferData(unsigned buffer) {

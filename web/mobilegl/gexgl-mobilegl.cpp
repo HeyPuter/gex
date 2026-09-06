@@ -2009,14 +2009,48 @@ bool one(uint32_t op, Reader& a) {
         else glSamplerParameterf(sampler, pname, values[0]);
         break;
     }
-    case CREATE_SHADER: { uint32_t g = a.u32(); shaders[g] = glCreateShader(a.u32()); break; }
+    case CREATE_SHADER: {
+        uint32_t g = a.u32();
+        const GLenum type = a.u32();
+        const GLuint made = glCreateShader(type);
+        /* Zero means GL refused the type, and the name then maps to nothing:
+           every later glShaderSource, glCompileShader and glGetShaderiv on it
+           is GL_INVALID_VALUE against shader zero. The application sees a
+           valid-looking name and a latched error with no source -- 39 of the
+           42 KHR-GL44.compute_shader cases fail their end-of-case error check
+           that way while their own bodies pass. */
+        if (!made)
+            std::fprintf(stderr, "gexgl: glCreateShader(0x%x) refused, guest "
+                                 "name %u maps to nothing\n",
+                         (unsigned)type, g);
+        shaders[g] = made;
+        break;
+    }
     case SHADER_SOURCE: {
         GLuint s = lookup(shaders, a.u32()); std::string src = a.string(); const char* p = src.c_str();
         shader_source_heads[s] = src.substr(0, 512);
         glShaderSource(s, 1, &p, nullptr); break;
     }
     case COMPILE_SHADER: glCompileShader(lookup(shaders, a.u32())); break;
-    case DELETE_SHADER: { uint32_t g = a.u32(); glDeleteShader(lookup(shaders, g)); shaders.erase(g); break; }
+    case DELETE_SHADER: {
+        const uint32_t g = a.u32();
+        const GLuint real = lookup(shaders, g);
+        glDeleteShader(real);
+        /* glDeleteShader on a shader that is attached to a program only flags
+           it: the object survives until it is detached, and its name stays
+           valid meanwhile. Programs are routinely built in exactly that order
+           -- create, attach, delete, and only then source and compile, which
+           is what dEQP's own shader helper does -- so erasing the mapping
+           here made every later call on the name resolve to shader zero.
+           glShaderSource, glCompileShader and glGetShaderiv then each raised
+           GL_INVALID_VALUE against a name the application had every right to
+           use, and KHR-GL44.compute_shader failed 39 of its 42 cases on the
+           error check at the end of a case whose own body had passed.
+           DELETE_PROGRAM below already keeps a program alive while it is
+           current; this is the same rule for the other object. */
+        if (!real || glIsShader(real) == GL_FALSE) shaders.erase(g);
+        break;
+    }
     case CREATE_PROGRAM: { uint32_t g = a.u32(); programs[g] = glCreateProgram(); break; }
     case ATTACH_SHADER: { GLuint p = lookup(programs, a.u32()); glAttachShader(p, lookup(shaders, a.u32())); break; }
     case DETACH_SHADER: { GLuint p = lookup(programs, a.u32()); glDetachShader(p, lookup(shaders, a.u32())); break; }

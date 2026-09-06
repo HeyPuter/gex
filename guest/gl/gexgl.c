@@ -248,6 +248,48 @@ static void flush(void) {
 /* Start a command. Returns where to write its arguments, having reserved
    room for them, or NULL if the batch is full -- in which case it is flushed
    and the caller tries again. */
+/* GEX_GL_TRACE_ERRORS=1 asks the host for its error after every single
+   command and names the opcode that raised one.
+
+   A spurious GL error is otherwise close to undiagnosable from this side. The
+   suite checks glGetError once at the end of a case and reports whatever it
+   finds against the whole case -- 39 of the 42 compute_shader cases fail that
+   way while their own bodies report "Everything works as expected" -- and the
+   guest's own latch, which GEX_GL_LOG_ERRORS names, is innocent, so the call
+   that raised it is somewhere in a stream of thousands.
+
+   One flush and one round trip per command, so this is a diagnosis and never
+   a measurement. */
+unsigned glGetError(void);
+
+static int gexgl_trace_errors(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("GEX_GL_TRACE_ERRORS") ? 1 : 0;
+    return on;
+}
+
+static void gexgl_watch_errors(uint32_t next_opcode) {
+    static int on = -1;
+    static int inside;
+    static uint32_t previous;
+    if (on < 0) {
+        const char *v = getenv("GEX_GL_TRACE_ERRORS");
+        on = v ? atoi(v) : 0;
+        if (v && on < 1) on = 1;
+    }
+    if (!on || inside) return;
+    inside = 1;
+    if (on > 1) fprintf(stderr, "gexgl: op %u\n", next_opcode);
+    if (previous) {
+        const unsigned error = glGetError();
+        if (error)
+            fprintf(stderr, "gexgl: host error 0x%04x after opcode %u\n",
+                    error, previous);
+    }
+    previous = next_opcode;
+    inside = 0;
+}
+
 static uint32_t *begin(uint32_t opcode, size_t arg_words, size_t tail_bytes) {
     if (!ring && ring_open() != 0) {
         return NULL;
@@ -265,6 +307,7 @@ static uint32_t *begin(uint32_t opcode, size_t arg_words, size_t tail_bytes) {
             return NULL; /* one command larger than the whole buffer */
         }
     }
+    gexgl_watch_errors(opcode);
     uint32_t *at = (uint32_t *)(cmds + ring->tail);
     at[0] = opcode;
     at[1] = (uint32_t)len;
@@ -509,8 +552,16 @@ void glPixelStorei(unsigned p, int v) {
 }
 
 /* The error latch lives with glGetError further down; mapping is emulated
-   here, so these need it before then. */
+   here, so these need it before then.
+
+   GEX_GL_LOG_ERRORS=1 names the call that latched one. The guest raises GL's
+   errors for everything it answers on this side, and a spurious one is
+   otherwise invisible: the application sees the code with nothing to say
+   where it came from, and the CTS reports it against whichever case happened
+   to check next. */
 static void gexgl_set_error(unsigned error);
+static void gexgl_set_error_at(unsigned error, const char *who);
+#define GEXGL_SET_ERROR(e) gexgl_set_error_at((e), __func__)
 /* Both halves of the persistent-mapping traffic, defined with the draw path
    further down and called from glFinish above it. */
 static void gexgl_flush_coherent_maps(void);
@@ -786,7 +837,7 @@ void glBindBuffer(unsigned target, unsigned name) {
 }
 
 void glBufferData(unsigned target, long size, const void *data, unsigned usage) {
-    if (size < 0) { gexgl_set_error(0x0501u); return; }
+    if (size < 0) { GEXGL_SET_ERROR(0x0501u); return; }
     size_t len = (size_t)size;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
     if (object) object->size = len;
@@ -820,12 +871,12 @@ static void buffer_sub_data_raw(unsigned target, long offset, long size,
 }
 
 void glBufferSubData(unsigned target, long offset, long size, const void *data) {
-    if (offset < 0 || size < 0) { gexgl_set_error(0x0501u); return; }
+    if (offset < 0 || size < 0) { GEXGL_SET_ERROR(0x0501u); return; }
     if (size && !data) return;
     {
         const unsigned bad =
             sub_data_error(buffer_object(bound_buffer(target), 0), offset, size);
-        if (bad) { gexgl_set_error(bad); return; }
+        if (bad) { GEXGL_SET_ERROR(bad); return; }
     }
     buffer_sub_data_raw(target, offset, size, data);
 }
@@ -845,7 +896,7 @@ void glBufferSubData(unsigned target, long offset, long size, const void *data) 
    named here, `bound_buffer(target)` there. */
 void glNamedBufferData(unsigned buffer, long size, const void *data,
                        unsigned usage) {
-    if (size < 0) { gexgl_set_error(0x0501u); return; }
+    if (size < 0) { GEXGL_SET_ERROR(0x0501u); return; }
     size_t len = (size_t)size;
     struct buffer_object_state *object = buffer_object(buffer, 1);
     if (object) object->size = len;
@@ -876,12 +927,12 @@ static void named_buffer_sub_data_raw(unsigned buffer, long offset, long size,
 
 void glNamedBufferSubData(unsigned buffer, long offset, long size,
                           const void *data) {
-    if (offset < 0 || size < 0) { gexgl_set_error(0x0501u); return; }
+    if (offset < 0 || size < 0) { GEXGL_SET_ERROR(0x0501u); return; }
     if (size && !data) return;
     {
         const unsigned bad =
             sub_data_error(buffer_object(buffer, 0), offset, size);
-        if (bad) { gexgl_set_error(bad); return; }
+        if (bad) { GEXGL_SET_ERROR(bad); return; }
     }
     named_buffer_sub_data_raw(buffer, offset, size, data);
 }
@@ -891,7 +942,7 @@ void glNamedBufferStorage(unsigned buffer, long size, const void *data,
     /* A refusal with no error is worse than no refusal: the application asks
        glGetError, is told nothing went wrong, and uses a buffer that has no
        storage. */
-    if (size < 0) { gexgl_set_error(0x0501u); return; }
+    if (size < 0) { GEXGL_SET_ERROR(0x0501u); return; }
     size_t blob_len = data ? (size_t)size : 0;
     struct buffer_object_state *object = buffer_object(buffer, 1);
     if (object) {
@@ -924,7 +975,7 @@ void *glMapBufferRange(unsigned target, long offset, long length,
                        unsigned access) {
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
     const unsigned bad = map_range_error(object, offset, length, access);
-    if (bad) { gexgl_set_error(bad); return NULL; }
+    if (bad) { GEXGL_SET_ERROR(bad); return NULL; }
     object->map_length = (size_t)length;
     object->map_offset = (size_t)offset;
     object->map_access = access;
@@ -997,7 +1048,7 @@ void *glMapNamedBufferRange(unsigned buffer, long offset, long length,
                             unsigned access) {
     struct buffer_object_state *object = buffer_object(buffer, 0);
     const unsigned bad = map_range_error(object, offset, length, access);
-    if (bad) { gexgl_set_error(bad); return NULL; }
+    if (bad) { GEXGL_SET_ERROR(bad); return NULL; }
     object->map_length = (size_t)length;
     object->map_offset = (size_t)offset;
     object->map_access = access;
@@ -1129,6 +1180,8 @@ void glSamplerParameterf(unsigned sampler, unsigned pname, float value) {
 
 unsigned glCreateShader(unsigned type) {
     unsigned name = take_name();
+    if (gexgl_trace_errors())
+        fprintf(stderr, "gexgl: glCreateShader(0x%x) -> %u\n", type, name);
     CMD2(GEXGL_CREATE_SHADER, name, type);
     return name;
 }
@@ -1147,6 +1200,9 @@ void glShaderSource(unsigned shader, int count, const char *const *strings,
     }
     size_t tail;
     if (total > UINT32_MAX || !gexgl_size_add(4, total, &tail)) return;
+    if (gexgl_trace_errors())
+        fprintf(stderr, "gexgl: glShaderSource(%u, %zu bytes)\n", shader,
+                total);
     uint32_t *p = begin(GEXGL_SHADER_SOURCE, 1, tail);
     if (!p) return;
     p[0] = shader;
@@ -1902,8 +1958,8 @@ void glGetPointerv(unsigned pname, void **params) {
    caller's buffer is too small, and refusing quietly is worse than useless --
    an application checks glGetError, sees success, and reads the buffer it just
    failed to have filled. That is exactly the hazard robustness exists to
-   remove, so the refusal has to be reported as well as performed. */
-static void gexgl_set_error(unsigned error);
+   remove, so the refusal has to be reported as well as performed.
+   Declared above, with the mapping helpers that also need it. */
 
 /* Declared because they are defined below this point, some of them in the
    generated include.
@@ -1939,7 +1995,7 @@ void glReadnPixels(int x, int y, int w, int h, unsigned format, unsigned type,
                                     &layout))
         return;
     if (layout.end > (size_t)bufSize) {
-        gexgl_set_error(0x0502u); /* GL_INVALID_OPERATION */
+        GEXGL_SET_ERROR(0x0502u); /* GL_INVALID_OPERATION */
         return;
     }
     glReadPixels(x, y, w, h, format, type, data);
@@ -1960,7 +2016,7 @@ void glGetnTexImage(unsigned target, int level, unsigned format, unsigned type,
                                     volume ? depth : -1, &pack_store, &layout))
         return;
     if (layout.end > (size_t)bufSize) {
-        gexgl_set_error(0x0502u);
+        GEXGL_SET_ERROR(0x0502u);
         return;
     }
     glGetTexImage(target, level, format, type, pixels);
@@ -1974,7 +2030,7 @@ void glGetnCompressedTexImage(unsigned target, int lod, int bufSize,
                              0x86A0u /* GL_TEXTURE_COMPRESSED_IMAGE_SIZE */,
                              &size);
     if (size < 0 || size > bufSize) {
-        gexgl_set_error(0x0502u);
+        GEXGL_SET_ERROR(0x0502u);
         return;
     }
     glGetCompressedTexImage(target, lod, pixels);
@@ -3316,7 +3372,7 @@ void glReadPixels(int x, int y, int w, int h, unsigned format, unsigned type, vo
     {
         const struct buffer_object_state *object = buffer_object(pack, 0);
         if (object && object->map && !(object->map_access & 0x0040u)) {
-            gexgl_set_error(0x0502u); /* GL_INVALID_OPERATION */
+            GEXGL_SET_ERROR(0x0502u); /* GL_INVALID_OPERATION */
             return;
         }
     }
@@ -3362,6 +3418,18 @@ void glReadPixels(int x, int y, int w, int h, unsigned format, unsigned type, vo
  * error is the one worth keeping -- a later call's error is usually a
  * consequence of the first. */
 static _Atomic unsigned pending_error;
+
+/* GEX_GL_LOG_ERRORS=1 names the call that latched an error. The guest raises
+   GL's errors for everything it answers locally -- mapping above all -- and a
+   spurious one is invisible otherwise: the application sees GL_INVALID_VALUE
+   with nothing to say where it came from, and the CTS reports it against
+   whichever case happened to check next. */
+static void gexgl_set_error_at(unsigned error, const char *who) {
+    static int on = -1;
+    if (on < 0) on = getenv("GEX_GL_LOG_ERRORS") ? 1 : 0;
+    if (on) fprintf(stderr, "gexgl: error 0x%04x set by %s\n", error, who);
+    gexgl_set_error(error);
+}
 
 static void gexgl_set_error(unsigned error) {
     unsigned none = 0;
@@ -3708,11 +3776,11 @@ void *glFenceSync(unsigned condition, unsigned flags) {
      * was not enough: GL requires the error too, and a caller that checks
      * glGetError rather than the handle saw success. */
     if (condition != 0x9117u) {
-        gexgl_set_error(0x0500u); /* GL_INVALID_ENUM */
+        GEXGL_SET_ERROR(0x0500u); /* GL_INVALID_ENUM */
         return NULL;
     }
     if (flags != 0) {
-        gexgl_set_error(0x0501u); /* GL_INVALID_VALUE */
+        GEXGL_SET_ERROR(0x0501u); /* GL_INVALID_VALUE */
         return NULL;
     }
     uintptr_t serial = atomic_fetch_add_explicit(&sync_next, 1, memory_order_relaxed);
@@ -3736,7 +3804,7 @@ void glDeleteSync(void *sync) {
      * error. */
     if (!handle) return;
     if (!sync_valid(handle)) {
-        gexgl_set_error(0x0501u); /* GL_INVALID_VALUE */
+        GEXGL_SET_ERROR(0x0501u); /* GL_INVALID_VALUE */
         return;
     }
     size_t slot = (handle - 1) % SYNC_SLOTS;
@@ -3753,11 +3821,11 @@ unsigned char glIsSync(void *sync) { return sync_valid((uintptr_t)sync); }
 unsigned glClientWaitSync(void *sync, unsigned flags, uint64_t timeout) {
     (void)timeout;
     if (!sync_valid((uintptr_t)sync)) {
-        gexgl_set_error(0x0501u); /* GL_INVALID_VALUE */
+        GEXGL_SET_ERROR(0x0501u); /* GL_INVALID_VALUE */
         return 0x911Du; /* GL_WAIT_FAILED */
     }
     if (flags & ~0x00000001u) { /* only GL_SYNC_FLUSH_COMMANDS_BIT */
-        gexgl_set_error(0x0501u);
+        GEXGL_SET_ERROR(0x0501u);
         return 0x911Du;
     }
     return 0x911Au; /* GL_ALREADY_SIGNALED */
@@ -3766,16 +3834,16 @@ unsigned glClientWaitSync(void *sync, unsigned flags, uint64_t timeout) {
 void glWaitSync(void *sync, unsigned flags, uint64_t timeout) {
     if (!sync_valid((uintptr_t)sync) || flags != 0 ||
         timeout != 0xFFFFFFFFFFFFFFFFull /* GL_TIMEOUT_IGNORED */)
-        gexgl_set_error(0x0501u); /* GL_INVALID_VALUE */
+        GEXGL_SET_ERROR(0x0501u); /* GL_INVALID_VALUE */
 }
 
 void glGetSynciv(void *sync, unsigned pname, int buf_size, int *length, int *values) {
     if (!sync_valid((uintptr_t)sync)) {
-        gexgl_set_error(0x0501u); /* GL_INVALID_VALUE */
+        GEXGL_SET_ERROR(0x0501u); /* GL_INVALID_VALUE */
         return;
     }
     if (buf_size < 0) {
-        gexgl_set_error(0x0501u);
+        GEXGL_SET_ERROR(0x0501u);
         return;
     }
     int value;
@@ -3785,7 +3853,7 @@ void glGetSynciv(void *sync, unsigned pname, int buf_size, int *length, int *val
     case 0x9114: value = 0x9119; break; /* GL_SYNC_STATUS: GL_SIGNALED */
     case 0x9115: value = 0; break;      /* GL_SYNC_FLAGS */
     default:
-        gexgl_set_error(0x0500u); /* GL_INVALID_ENUM */
+        GEXGL_SET_ERROR(0x0500u); /* GL_INVALID_ENUM */
         return;
     }
     if (buf_size > 0 && values) {
