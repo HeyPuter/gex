@@ -287,6 +287,34 @@ case 1078: {
     GEX_GL_CALL(glClearDepth, depth);
     break;
 }
+case 1080: {
+    GLuint buffer = a.u32();
+    GLenum internalformat = a.u32();
+    GLenum format = a.u32();
+    GLenum type = a.u32();
+    uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
+    size_t expected = gexgl_pixel_group_bytes(format, type);
+    if (bytes && bytes != expected) { a.ok = false; break; }
+    std::vector<uint64_t> aligned((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+    if (bytes) memcpy(aligned.data(), wire, bytes);
+    GEX_GL_CALL(glClearNamedBufferData, lookup(buffers, buffer), internalformat, format, type, bytes ? aligned.data() : nullptr);
+    break;
+}
+case 1081: {
+    GLuint buffer = a.u32();
+    GLenum internalformat = a.u32();
+    GLintptr offset = a.i64();
+    GLsizeiptr size = a.i64();
+    GLenum format = a.u32();
+    GLenum type = a.u32();
+    uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
+    size_t expected = gexgl_pixel_group_bytes(format, type);
+    if (bytes && bytes != expected) { a.ok = false; break; }
+    std::vector<uint64_t> aligned((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+    if (bytes) memcpy(aligned.data(), wire, bytes);
+    GEX_GL_CALL(glClearNamedBufferSubData, lookup(buffers, buffer), internalformat, offset, size, format, type, bytes ? aligned.data() : nullptr);
+    break;
+}
 case 1082: {
     GLuint framebuffer = a.u32();
     GLenum buffer = a.u32();
@@ -360,7 +388,7 @@ case 1094: {
     }
     const void *data = pbo ? reinterpret_cast<const void *>(pointer) :
                                       (data_bytes ? data_wire : nullptr);
-    glCompressedTexImage1D(target, level, internalformat, width, border, imageSize, data);
+    GEX_GL_CALL(glCompressedTexImage1D, target, level, internalformat, width, border, imageSize, data);
     break;
 }
 case 1095: {
@@ -381,7 +409,7 @@ case 1095: {
     }
     const void *data = pbo ? reinterpret_cast<const void *>(pointer) :
                                       (data_bytes ? data_wire : nullptr);
-    glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
+    GEX_GL_CALL(glCompressedTexImage2D, target, level, internalformat, width, height, border, imageSize, data);
     break;
 }
 case 1096: {
@@ -403,7 +431,7 @@ case 1096: {
     }
     const void *data = pbo ? reinterpret_cast<const void *>(pointer) :
                                       (data_bytes ? data_wire : nullptr);
-    glCompressedTexImage3D(target, level, internalformat, width, height, depth, border, imageSize, data);
+    GEX_GL_CALL(glCompressedTexImage3D, target, level, internalformat, width, height, depth, border, imageSize, data);
     break;
 }
 case 1097: {
@@ -423,7 +451,7 @@ case 1097: {
     }
     const void *data = pbo ? reinterpret_cast<const void *>(pointer) :
                                       (data_bytes ? data_wire : nullptr);
-    glCompressedTexSubImage1D(target, level, xoffset, width, format, imageSize, data);
+    GEX_GL_CALL(glCompressedTexSubImage1D, target, level, xoffset, width, format, imageSize, data);
     break;
 }
 case 1098: {
@@ -445,7 +473,7 @@ case 1098: {
     }
     const void *data = pbo ? reinterpret_cast<const void *>(pointer) :
                                       (data_bytes ? data_wire : nullptr);
-    glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
+    GEX_GL_CALL(glCompressedTexSubImage2D, target, level, xoffset, yoffset, width, height, format, imageSize, data);
     break;
 }
 case 1099: {
@@ -469,7 +497,73 @@ case 1099: {
     }
     const void *data = pbo ? reinterpret_cast<const void *>(pointer) :
                                       (data_bytes ? data_wire : nullptr);
-    glCompressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
+    GEX_GL_CALL(glCompressedTexSubImage3D, target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
+    break;
+}
+case 1100: {
+    GLuint texture = a.u32();
+    GLint level = a.i32();
+    GLint xoffset = a.i32();
+    GLsizei width = a.i32();
+    GLenum format = a.u32();
+    GLsizei imageSize = a.i32();
+    const bool pbo = a.u32() != 0;
+    const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
+    uint32_t data_bytes = 0;
+    const uint8_t *data_wire = a.blob(data_bytes);
+    if (!pbo && data_bytes &&
+        (imageSize < 0 || data_bytes != static_cast<uint32_t>(imageSize))) {
+        a.ok = false; break;
+    }
+    const void *data = pbo ? reinterpret_cast<const void *>(pointer) :
+                                      (data_bytes ? data_wire : nullptr);
+    GEX_GL_CALL(glCompressedTextureSubImage1D, lookup(textures, texture), level, xoffset, width, format, imageSize, data);
+    break;
+}
+case 1101: {
+    GLuint texture = a.u32();
+    GLint level = a.i32();
+    GLint xoffset = a.i32();
+    GLint yoffset = a.i32();
+    GLsizei width = a.i32();
+    GLsizei height = a.i32();
+    GLenum format = a.u32();
+    GLsizei imageSize = a.i32();
+    const bool pbo = a.u32() != 0;
+    const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
+    uint32_t data_bytes = 0;
+    const uint8_t *data_wire = a.blob(data_bytes);
+    if (!pbo && data_bytes &&
+        (imageSize < 0 || data_bytes != static_cast<uint32_t>(imageSize))) {
+        a.ok = false; break;
+    }
+    const void *data = pbo ? reinterpret_cast<const void *>(pointer) :
+                                      (data_bytes ? data_wire : nullptr);
+    GEX_GL_CALL(glCompressedTextureSubImage2D, lookup(textures, texture), level, xoffset, yoffset, width, height, format, imageSize, data);
+    break;
+}
+case 1102: {
+    GLuint texture = a.u32();
+    GLint level = a.i32();
+    GLint xoffset = a.i32();
+    GLint yoffset = a.i32();
+    GLint zoffset = a.i32();
+    GLsizei width = a.i32();
+    GLsizei height = a.i32();
+    GLsizei depth = a.i32();
+    GLenum format = a.u32();
+    GLsizei imageSize = a.i32();
+    const bool pbo = a.u32() != 0;
+    const uintptr_t pointer = static_cast<uintptr_t>(a.u64());
+    uint32_t data_bytes = 0;
+    const uint8_t *data_wire = a.blob(data_bytes);
+    if (!pbo && data_bytes &&
+        (imageSize < 0 || data_bytes != static_cast<uint32_t>(imageSize))) {
+        a.ok = false; break;
+    }
+    const void *data = pbo ? reinterpret_cast<const void *>(pointer) :
+                                      (data_bytes ? data_wire : nullptr);
+    GEX_GL_CALL(glCompressedTextureSubImage3D, lookup(textures, texture), level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
     break;
 }
 case 1103: {
@@ -1448,6 +1542,26 @@ case 1304: {
     put_blob(values, components * sizeof(GLint));
     break;
 }
+case 1307: {
+    GLuint xfb = a.u32();
+    GLenum pname = a.u32();
+    GLuint index = a.u32();
+    const uint32_t components = 1u;
+    GLint64 values[4]{};
+    GEX_GL_CALL(glGetTransformFeedbacki64_v, lookup(transform_feedbacks, xfb), pname, index, values);
+    put_blob(values, components * sizeof(GLint64));
+    break;
+}
+case 1308: {
+    GLuint xfb = a.u32();
+    GLenum pname = a.u32();
+    GLuint index = a.u32();
+    const uint32_t components = 1u;
+    GLint values[4]{};
+    GEX_GL_CALL(glGetTransformFeedbacki_v, lookup(transform_feedbacks, xfb), pname, index, values);
+    put_blob(values, components * sizeof(GLint));
+    break;
+}
 case 1309: {
     GLuint xfb = a.u32();
     GLenum pname = a.u32();
@@ -1482,6 +1596,26 @@ case 1317: {
     GLuint values[16]{};
     GEX_GL_CALL(glGetUniformuiv, program, location, values);
     put_blob(values, components * sizeof(values[0]));
+    break;
+}
+case 1318: {
+    GLuint vaobj = a.u32();
+    GLuint index = a.u32();
+    GLenum pname = a.u32();
+    const uint32_t components = 1u;
+    GLint64 values[4]{};
+    GEX_GL_CALL(glGetVertexArrayIndexed64iv, lookup(vertex_arrays, vaobj), index, pname, values);
+    put_blob(values, components * sizeof(GLint64));
+    break;
+}
+case 1319: {
+    GLuint vaobj = a.u32();
+    GLuint index = a.u32();
+    GLenum pname = a.u32();
+    const uint32_t components = 1u;
+    GLint values[4]{};
+    GEX_GL_CALL(glGetVertexArrayIndexediv, lookup(vertex_arrays, vaobj), index, pname, values);
+    put_blob(values, components * sizeof(GLint));
     break;
 }
 case 1320: {
@@ -1579,6 +1713,22 @@ case 1337: {
     if (attachments_bytes) memcpy(attachments_aligned.data(), attachments_wire, attachments_bytes);
     const GLenum *attachments = attachments_bytes ? attachments_aligned.data() : nullptr;
     GEX_GL_CALL(glInvalidateFramebuffer, target, numAttachments, attachments);
+    break;
+}
+case 1338: {
+    GLuint framebuffer = a.u32();
+    GLsizei numAttachments = a.i32();
+    uint32_t attachments_bytes = 0;
+    const uint8_t *attachments_wire = a.blob(attachments_bytes);
+    size_t attachments_expected = 0;
+    if (numAttachments > 0 &&
+        (size_t)numAttachments <= SIZE_MAX / (1u * sizeof(GLenum)))
+        attachments_expected = (size_t)numAttachments * 1u * sizeof(GLenum);
+    if (attachments_bytes != attachments_expected) { a.ok = false; break; }
+    std::vector<GLenum> attachments_aligned(attachments_bytes / sizeof(GLenum));
+    if (attachments_bytes) memcpy(attachments_aligned.data(), attachments_wire, attachments_bytes);
+    const GLenum *attachments = attachments_bytes ? attachments_aligned.data() : nullptr;
+    GEX_GL_CALL(glInvalidateNamedFramebufferData, lookup(framebuffers, framebuffer), numAttachments, attachments);
     break;
 }
 case 1341: {
@@ -2649,7 +2799,7 @@ case 1464: {
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLint);
     if (bytes != expected) { a.ok = false; break; }
-    glSamplerParameterIiv(lookup(samplers, first), pname, reinterpret_cast<const GLint *>(wire));
+    GEX_GL_CALL(glSamplerParameterIiv, lookup(samplers, first), pname, reinterpret_cast<const GLint *>(wire));
     break;
 }
 case 1465: {
@@ -2657,7 +2807,7 @@ case 1465: {
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLuint);
     if (bytes != expected) { a.ok = false; break; }
-    glSamplerParameterIuiv(lookup(samplers, first), pname, reinterpret_cast<const GLuint *>(wire));
+    GEX_GL_CALL(glSamplerParameterIuiv, lookup(samplers, first), pname, reinterpret_cast<const GLuint *>(wire));
     break;
 }
 case 1471: {
@@ -2762,7 +2912,7 @@ case 1490: {
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLint);
     if (bytes != expected) { a.ok = false; break; }
-    glTexParameterIiv(first, pname, reinterpret_cast<const GLint *>(wire));
+    GEX_GL_CALL(glTexParameterIiv, first, pname, reinterpret_cast<const GLint *>(wire));
     break;
 }
 case 1491: {
@@ -2770,7 +2920,7 @@ case 1491: {
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLuint);
     if (bytes != expected) { a.ok = false; break; }
-    glTexParameterIuiv(first, pname, reinterpret_cast<const GLuint *>(wire));
+    GEX_GL_CALL(glTexParameterIuiv, first, pname, reinterpret_cast<const GLuint *>(wire));
     break;
 }
 case 1496: {
@@ -2851,6 +3001,22 @@ case 1506: {
     GLintptr offset = a.i64();
     GLsizeiptr size = a.i64();
     GEX_GL_CALL(glTextureBufferRange, lookup(textures, texture), internalformat, lookup(buffers, buffer), offset, size);
+    break;
+}
+case 1507: {
+    GLuint first = a.u32(); GLenum pname = a.u32();
+    uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
+    const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLint);
+    if (bytes != expected) { a.ok = false; break; }
+    GEX_GL_CALL(glTextureParameterIiv, lookup(textures, first), pname, reinterpret_cast<const GLint *>(wire));
+    break;
+}
+case 1508: {
+    GLuint first = a.u32(); GLenum pname = a.u32();
+    uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
+    const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof(GLuint);
+    if (bytes != expected) { a.ok = false; break; }
+    GEX_GL_CALL(glTextureParameterIuiv, lookup(textures, first), pname, reinterpret_cast<const GLuint *>(wire));
     break;
 }
 case 1509: {

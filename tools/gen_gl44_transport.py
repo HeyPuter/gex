@@ -444,6 +444,40 @@ DIRECT_STATE_ACCESS_COMMANDS = {
 }
 SCALAR_COMMANDS |= DIRECT_STATE_ACCESS_COMMANDS
 
+# The rest of DSA that fits a policy its bound twin already uses. Each is the
+# same wire shape with the object named instead of bound, so the only new
+# information is which map resolves the name.
+TEXTURE_PARAMETER_ARRAYS |= {"glTextureParameterIiv", "glTextureParameterIuiv"}
+# Only the Data form: glInvalidateNamedFramebufferSubData puts its attachment
+# array mid-signature, ahead of x/y/width/height, and ARRAY_COMMANDS requires
+# the array last. The generator says so rather than emitting something wrong,
+# which is the whole point of it failing closed.
+ARRAY_COMMANDS |= {"glInvalidateNamedFramebufferData"}
+BLOB_COMMANDS |= {"glCompressedTextureSubImage1D",
+                  "glCompressedTextureSubImage2D",
+                  "glCompressedTextureSubImage3D"}
+CLEAR_VALUE_COMMANDS |= {"glClearNamedBufferData", "glClearNamedBufferSubData"}
+RESOURCE_OUTPUT_QUERIES.update({
+    "glGetVertexArrayIndexediv": "one",
+    "glGetVertexArrayIndexed64iv": "one",
+    "glGetTransformFeedbacki_v": "one",
+    "glGetTransformFeedbacki64_v": "one",
+})
+OBJECT_COMMANDS.update({
+    "glTextureParameterIiv": {"texture": "textures"},
+    "glTextureParameterIuiv": {"texture": "textures"},
+    "glInvalidateNamedFramebufferData": {"framebuffer": "framebuffers"},
+    "glCompressedTextureSubImage1D": {"texture": "textures"},
+    "glCompressedTextureSubImage2D": {"texture": "textures"},
+    "glCompressedTextureSubImage3D": {"texture": "textures"},
+    "glClearNamedBufferData": {"buffer": "buffers"},
+    "glClearNamedBufferSubData": {"buffer": "buffers"},
+    "glGetVertexArrayIndexediv": {"vaobj": "vertex_arrays"},
+    "glGetVertexArrayIndexed64iv": {"vaobj": "vertex_arrays"},
+    "glGetTransformFeedbacki_v": {"xfb": "transform_feedbacks"},
+    "glGetTransformFeedbacki64_v": {"xfb": "transform_feedbacks"},
+})
+
 # The DSA queries that read a fixed-size result, which are the same shape as
 # their bound-state twins one table up -- glGetTextureLevelParameteriv is
 # glGetTexLevelParameteriv with the texture named instead of bound. Without
@@ -1616,14 +1650,19 @@ def host_case(command: dict, opcode: int) -> str:
     if name in TEXTURE_PARAMETER_ARRAYS:
         pointer = command["params"][-1]
         scalar0 = command["params"][0]
-        namespace = "samplers" if name.startswith("glSampler") else None
+        # From OBJECT_COMMANDS rather than from the name: glSamplerParameter*
+        # resolves through samplers and glTextureParameter* through textures,
+        # and a spelling test knew only about the first of those.
+        namespace = OBJECT_COMMANDS.get(name, {}).get(scalar0["name"])
+        if namespace is None and name.startswith("glSampler"):
+            namespace = "samplers"
         first = f"lookup({namespace}, first)" if namespace else "first"
         return f"""case {opcode}: {{
     {scalar0['type']} first = a.{TYPE_INFO[scalar0['type']][1]}(); GLenum pname = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     const uint32_t expected = (pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u) * sizeof({pointer['type']});
     if (bytes != expected) {{ a.ok = false; break; }}
-    {name}({first}, pname, reinterpret_cast<const {pointer['type']} *>(wire));
+    GEX_GL_CALL({name}, {first}, pname, reinterpret_cast<const {pointer['type']} *>(wire));
     break;
 }}"""
     if name in INTERNAL_FORMAT_QUERIES:
@@ -1905,6 +1944,10 @@ def host_case(command: dict, opcode: int) -> str:
         # produced a query answering with a host name -- invisible until a
         # probe created objects of another kind first, because the guest's
         # single counter and GL's per-kind numbering agree until then.
+        #
+        # This one must go through GEX_GL_CALL for a second reason: unlike its
+        # bound twin it is NOT in libglapi_bridge.a, so a bare call does not
+        # link at all.
         if name == "glGetNamedFramebufferAttachmentParameteriv":
             lines += ["    if (pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME) {",
                       "        GLint objectType = GL_NONE;",
@@ -1919,15 +1962,15 @@ def host_case(command: dict, opcode: int) -> str:
         if name == "glGetFramebufferAttachmentParameteriv":
             lines += ["    if (pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME) {",
                       "        GLint objectType = GL_NONE;",
-                      # Through the dispatch, not by name. Emscripten's WebGL
-                      # library defines glGetFramebufferAttachmentParameteriv,
-                      # so a direct call here bound to *WebGL* rather than to
-                      # Mesa -- it answered about a context this path does not
-                      # use, objectType came back as neither GL_TEXTURE nor
-                      # GL_RENDERBUFFER, and the translation below quietly did
-                      # nothing. The guest then got a host name. Same trap as
-                      # glPolygonOffsetClampEXT, and it links cleanly either
-                      # way, which is what makes it worth a comment.
+                      # Through the dispatch for consistency with the named
+                      # form below, not because this one was broken: Mesa's
+                      # libglapi_bridge.a defines
+                      # glGetFramebufferAttachmentParameteriv and is linked
+                      # --whole-archive, so a direct call here has always
+                      # reached Mesa. The rule for this file is that a bare
+                      # call is safe exactly when the bridge defines the name
+                      # -- check with llvm-nm, not nm, which cannot read wasm
+                      # archives and reports nothing for everything.
                       "        GEX_GL_CALL(glGetFramebufferAttachmentParameteriv, target, attachment,",
                       "                                                GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,",
                       "                                                &objectType);",
@@ -1949,7 +1992,12 @@ def host_case(command: dict, opcode: int) -> str:
         for param in command["params"][:-1]:
             param_name, ty = param["name"], param["type"]
             lines.append(f"    {ty} {param_name} = a.{TYPE_INFO[ty][1]}();")
-            scalar_names.append(param_name)
+            # A DSA blob command names its object; the bound forms take a
+            # target and have nothing to resolve, which is why this was not
+            # needed until glCompressedTextureSubImage2D arrived.
+            namespace = OBJECT_COMMANDS.get(command["name"], {}).get(param_name)
+            scalar_names.append(
+                f"lookup({namespace}, {param_name})" if namespace else param_name)
         pointer = command["params"][-1]
         pointer_name = pointer["name"]
         length = pointer["length"]
@@ -1963,7 +2011,10 @@ def host_case(command: dict, opcode: int) -> str:
                   "    }",
                   f"    const void *{pointer_name} = pbo ? reinterpret_cast<const void *>(pointer) :",
                   f"                                      ({pointer_name}_bytes ? {pointer_name}_wire : nullptr);",
-                  f"    {command['name']}({', '.join(scalar_names + [pointer_name])});",
+                  # GEX_GL_CALL, not a bare call: the DSA members of this
+                  # set are absent from libglapi_bridge.a and a direct call to
+                  # them does not link at all.
+                  f"    GEX_GL_CALL({command['name']}, {', '.join(scalar_names + [pointer_name])});",
                   "    break;", "}"]
         return "\n".join(lines)
     if command["name"] in OPAQUE_OFFSET_COMMANDS:

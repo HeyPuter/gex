@@ -292,6 +292,36 @@ void glClearDepth(double depth) {
     packet[at++] = (uint32_t)bits_depth;
     packet[at++] = (uint32_t)(bits_depth >> 32);
 }
+void glClearNamedBufferData(unsigned buffer, unsigned internalformat, unsigned format, unsigned type, const void *data) {
+    size_t value_bytes = gexgl_pixel_group_bytes(format, type);
+    size_t blob_len = data ? value_bytes : 0;
+    uint32_t *a = begin(1080, 4, 4 + blob_len);
+    if (!a) return;
+    a[0] = (uint32_t)(buffer);
+    a[1] = (uint32_t)(internalformat);
+    a[2] = (uint32_t)(format);
+    a[3] = (uint32_t)(type);
+    put_blob(a + 4, data, blob_len);
+}
+void glClearNamedBufferSubData(unsigned buffer, unsigned internalformat, long offset, long size, unsigned format, unsigned type, const void *data) {
+    size_t value_bytes = gexgl_pixel_group_bytes(format, type);
+    size_t blob_len = data ? value_bytes : 0;
+    uint32_t *a = begin(1081, 8, 4 + blob_len);
+    if (!a) return;
+    a[0] = (uint32_t)(buffer);
+    a[1] = (uint32_t)(internalformat);
+    uint64_t bits_offset;
+    bits_offset = (uint64_t)(offset);
+    a[2] = (uint32_t)bits_offset;
+    a[3] = (uint32_t)(bits_offset >> 32);
+    uint64_t bits_size;
+    bits_size = (uint64_t)(size);
+    a[4] = (uint32_t)bits_size;
+    a[5] = (uint32_t)(bits_size >> 32);
+    a[6] = (uint32_t)(format);
+    a[7] = (uint32_t)(type);
+    put_blob(a + 8, data, blob_len);
+}
 void glClearNamedFramebufferfi(unsigned framebuffer, unsigned buffer, int drawbuffer, float depth, int stencil) {
     uint32_t *packet = begin(1082, 5, 0);
     if (!packet) return;
@@ -449,6 +479,66 @@ void glCompressedTexSubImage3D(unsigned target, int level, int xoffset, int yoff
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
+    packet[at++] = (uint32_t)(level);
+    packet[at++] = (uint32_t)(xoffset);
+    packet[at++] = (uint32_t)(yoffset);
+    packet[at++] = (uint32_t)(zoffset);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(height);
+    packet[at++] = (uint32_t)(depth);
+    packet[at++] = (uint32_t)(format);
+    packet[at++] = (uint32_t)(imageSize);
+    packet[at++] = (uint32_t)pbo;
+    uint64_t bits_data = (uint64_t)(uintptr_t)data;
+    packet[at++] = (uint32_t)bits_data;
+    packet[at++] = (uint32_t)(bits_data >> 32);
+    put_blob(packet + at, data, blob_len);
+}
+void glCompressedTextureSubImage1D(unsigned texture, int level, int xoffset, int width, unsigned format, int imageSize, const void *data) {
+    int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
+    size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
+    uint32_t *packet = begin(1100, 10, blob_len);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(level);
+    packet[at++] = (uint32_t)(xoffset);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(format);
+    packet[at++] = (uint32_t)(imageSize);
+    packet[at++] = (uint32_t)pbo;
+    uint64_t bits_data = (uint64_t)(uintptr_t)data;
+    packet[at++] = (uint32_t)bits_data;
+    packet[at++] = (uint32_t)(bits_data >> 32);
+    put_blob(packet + at, data, blob_len);
+}
+void glCompressedTextureSubImage2D(unsigned texture, int level, int xoffset, int yoffset, int width, int height, unsigned format, int imageSize, const void *data) {
+    int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
+    size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
+    uint32_t *packet = begin(1101, 12, blob_len);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(level);
+    packet[at++] = (uint32_t)(xoffset);
+    packet[at++] = (uint32_t)(yoffset);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(height);
+    packet[at++] = (uint32_t)(format);
+    packet[at++] = (uint32_t)(imageSize);
+    packet[at++] = (uint32_t)pbo;
+    uint64_t bits_data = (uint64_t)(uintptr_t)data;
+    packet[at++] = (uint32_t)bits_data;
+    packet[at++] = (uint32_t)(bits_data >> 32);
+    put_blob(packet + at, data, blob_len);
+}
+void glCompressedTextureSubImage3D(unsigned texture, int level, int xoffset, int yoffset, int zoffset, int width, int height, int depth, unsigned format, int imageSize, const void *data) {
+    int pbo = bound_buffer(0x88ECu) != 0; /* GL_PIXEL_UNPACK_BUFFER */
+    size_t blob_len = !pbo && data && imageSize > 0 ? (size_t)(imageSize) : 0;
+    uint32_t *packet = begin(1102, 14, blob_len);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
     packet[at++] = (uint32_t)(level);
     packet[at++] = (uint32_t)(xoffset);
     packet[at++] = (uint32_t)(yoffset);
@@ -1664,6 +1754,32 @@ void glGetTextureParameteriv(unsigned texture, unsigned pname, int *params) {
     if (params && source && reply_len == expected)
         memcpy(params, source, expected);
 }
+void glGetTransformFeedbacki64_v(unsigned xfb, unsigned pname, unsigned index, long long *param) {
+    const size_t expected = (size_t)1u * sizeof(*param);
+    uint32_t *packet = begin(1307, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(xfb);
+    packet[at++] = (uint32_t)(pname);
+    packet[at++] = (uint32_t)(index);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (param && source && reply_len == expected)
+        memcpy(param, source, expected);
+}
+void glGetTransformFeedbacki_v(unsigned xfb, unsigned pname, unsigned index, int *param) {
+    const size_t expected = (size_t)1u * sizeof(*param);
+    uint32_t *packet = begin(1308, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(xfb);
+    packet[at++] = (uint32_t)(pname);
+    packet[at++] = (uint32_t)(index);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (param && source && reply_len == expected)
+        memcpy(param, source, expected);
+}
 void glGetTransformFeedbackiv(unsigned xfb, unsigned pname, int *param) {
     const size_t expected = (size_t)1u * sizeof(*param);
     uint32_t *packet = begin(1309, 2, 0);
@@ -1701,6 +1817,32 @@ void glGetUniformuiv(unsigned program, int location, unsigned *params) {
     a[0] = program; a[1] = (uint32_t)location; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     if (params && source && bytes <= 16u * sizeof(*params)) memcpy(params, source, bytes);
+}
+void glGetVertexArrayIndexed64iv(unsigned vaobj, unsigned index, unsigned pname, long long *param) {
+    const size_t expected = (size_t)1u * sizeof(*param);
+    uint32_t *packet = begin(1318, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(index);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (param && source && reply_len == expected)
+        memcpy(param, source, expected);
+}
+void glGetVertexArrayIndexediv(unsigned vaobj, unsigned index, unsigned pname, int *param) {
+    const size_t expected = (size_t)1u * sizeof(*param);
+    uint32_t *packet = begin(1319, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(index);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (param && source && reply_len == expected)
+        memcpy(param, source, expected);
 }
 void glGetVertexArrayiv(unsigned vaobj, unsigned pname, int *param) {
     const size_t expected = (size_t)1u * sizeof(*param);
@@ -1815,6 +1957,18 @@ void glInvalidateFramebuffer(unsigned target, int numAttachments, const unsigned
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(target);
+    packet[at++] = (uint32_t)(numAttachments);
+    put_blob(packet + at, attachments, blob_len);
+}
+void glInvalidateNamedFramebufferData(unsigned framebuffer, int numAttachments, const unsigned *attachments) {
+    size_t blob_len = 0;
+    if (attachments && numAttachments > 0 &&
+        (size_t)numAttachments <= SIZE_MAX / (1u * sizeof(*attachments)))
+        blob_len = (size_t)numAttachments * 1u * sizeof(*attachments);
+    uint32_t *packet = begin(1338, 3, blob_len);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
     packet[at++] = (uint32_t)(numAttachments);
     put_blob(packet + at, attachments, blob_len);
 }
@@ -3081,6 +3235,22 @@ void glTextureBufferRange(unsigned texture, unsigned internalformat, unsigned bu
     bits_size = (uint64_t)(size);
     packet[at++] = (uint32_t)bits_size;
     packet[at++] = (uint32_t)(bits_size >> 32);
+}
+void glTextureParameterIiv(unsigned texture, unsigned pname, const int *params) {
+    size_t components = pname == 0x1004u ? 4u : 1u; /* GL_TEXTURE_BORDER_COLOR */
+    size_t blob_len = params ? components * sizeof(*params) : 0;
+    uint32_t *a = begin(1507, 2, 4 + blob_len);
+    if (!a) return;
+    a[0] = texture; a[1] = pname;
+    put_blob(a + 2, params, blob_len);
+}
+void glTextureParameterIuiv(unsigned texture, unsigned pname, const unsigned *params) {
+    size_t components = pname == 0x1004u ? 4u : 1u; /* GL_TEXTURE_BORDER_COLOR */
+    size_t blob_len = params ? components * sizeof(*params) : 0;
+    uint32_t *a = begin(1508, 2, 4 + blob_len);
+    if (!a) return;
+    a[0] = texture; a[1] = pname;
+    put_blob(a + 2, params, blob_len);
 }
 void glTextureParameterf(unsigned texture, unsigned pname, float param) {
     uint32_t *packet = begin(1509, 3, 0);
