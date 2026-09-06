@@ -1349,6 +1349,44 @@ void glGetActiveUniformBlockName(unsigned program, unsigned index, int max,
                      length, name);
 }
 
+/* The subroutine queries, and the last of GL 4.6's core command set to arrive.
+ *
+ * They are get_indexed_name with a shader stage in front -- GL keeps a
+ * separate subroutine namespace per stage, so the stage is part of the key
+ * rather than context. glGetActiveSubroutineUniformiv answers a variable
+ * number of integers, GL_COMPATIBLE_SUBROUTINES most of all, so its reply is
+ * sized by the host and read with reply_ints below. */
+static void get_stage_indexed_name(uint32_t opcode, unsigned program,
+                                   unsigned shadertype, unsigned index,
+                                   int max, int *length, char *name) {
+    uint32_t *p = begin(opcode, 3, 0);
+    if (!p) return;
+    p[0] = program; p[1] = shadertype; p[2] = index;
+    flush();
+    uint32_t n = 0;
+    const uint8_t *reply = reply_blob(&n);
+    if ((int)n > max - 1) n = max > 0 ? (uint32_t)max - 1 : 0;
+    if (reply && name && max > 0) {
+        memcpy(name, reply, n);
+        name[n] = 0;
+    }
+    if (length) *length = (int)n;
+}
+
+void glGetActiveSubroutineName(unsigned program, unsigned shadertype,
+                               unsigned index, int bufSize, int *length,
+                               char *name) {
+    get_stage_indexed_name(GEXGL_GET_ACTIVE_SUBROUTINE_NAME, program,
+                           shadertype, index, bufSize, length, name);
+}
+
+void glGetActiveSubroutineUniformName(unsigned program, unsigned shadertype,
+                                      unsigned index, int bufSize, int *length,
+                                      char *name) {
+    get_stage_indexed_name(GEXGL_GET_ACTIVE_SUBROUTINE_UNIFORM_NAME, program,
+                           shadertype, index, bufSize, length, name);
+}
+
 /* However many integers the query yields; the host knows the count from the
    pname, so the reply carries it. */
 static void reply_ints(int *params) {
@@ -1356,6 +1394,16 @@ static void reply_ints(int *params) {
     const uint8_t *p = reply_blob(&n);
     if (params && p && n)
         memcpy(params, p, n - (n % 4));
+}
+
+void glGetActiveSubroutineUniformiv(unsigned program, unsigned shadertype,
+                                    unsigned index, unsigned pname,
+                                    int *values) {
+    uint32_t *p = begin(GEXGL_GET_ACTIVE_SUBROUTINE_UNIFORM_IV, 4, 0);
+    if (!p) return;
+    p[0] = program; p[1] = shadertype; p[2] = index; p[3] = pname;
+    flush();
+    reply_ints(values);
 }
 
 void glGetActiveUniformBlockiv(unsigned program, unsigned index,

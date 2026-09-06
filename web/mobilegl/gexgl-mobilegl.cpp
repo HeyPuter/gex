@@ -237,6 +237,9 @@ enum Op : uint32_t {
     GET_PROGRAM_PIPELINE_INFO_LOG = 258, GET_PROGRAM_BINARY = 259,
     PROGRAM_BINARY = 260, INVALIDATE_SUB_FRAMEBUFFER = 261,
     GET_TEXTURE_SUB_IMAGE = 262, GET_COMPRESSED_TEXTURE_SUB_IMAGE = 263,
+    GET_ACTIVE_SUBROUTINE_NAME = 264,
+    GET_ACTIVE_SUBROUTINE_UNIFORM_NAME = 265,
+    GET_ACTIVE_SUBROUTINE_UNIFORM_IV = 266,
 };
 
 struct Reader {
@@ -1499,6 +1502,57 @@ bool one(uint32_t op, Reader& a) {
        the level, which is the whole reason the call exists -- and it is
        recomputed here from the same pack state rather than trusting the
        bufSize the guest sent. */
+    /* The subroutine queries. GL sizes the name from the stage's own maximum,
+       so the host asks for that rather than guessing a buffer. */
+    case GET_ACTIVE_SUBROUTINE_NAME:
+    case GET_ACTIVE_SUBROUTINE_UNIFORM_NAME: {
+        const bool uniform_name = op == GET_ACTIVE_SUBROUTINE_UNIFORM_NAME;
+        const GLuint program = lookup(programs, a.u32());
+        const GLenum shadertype = a.u32();
+        const GLuint index = a.u32();
+        GLint longest = 0;
+        GEX_GL_CALL(glGetProgramStageiv, program, shadertype,
+                    uniform_name ? GL_ACTIVE_SUBROUTINE_UNIFORM_MAX_LENGTH
+                                 : GL_ACTIVE_SUBROUTINE_MAX_LENGTH,
+                    &longest);
+        if (longest < 0 || longest > (1 << 16)) { a.ok = false; break; }
+        std::vector<char> name((size_t)longest + 1, '\0');
+        GLsizei written = 0;
+        if (longest) {
+            if (uniform_name) {
+                GEX_GL_CALL(glGetActiveSubroutineUniformName, program,
+                            shadertype, index, longest + 1, &written,
+                            name.data());
+            } else {
+                GEX_GL_CALL(glGetActiveSubroutineName, program, shadertype,
+                            index, longest + 1, &written, name.data());
+            }
+        }
+        put_blob(name.data(), (uint32_t)(written > 0 ? written : 0));
+        break;
+    }
+    case GET_ACTIVE_SUBROUTINE_UNIFORM_IV: {
+        const GLuint program = lookup(programs, a.u32());
+        const GLenum shadertype = a.u32();
+        const GLuint index = a.u32();
+        const GLenum pname = a.u32();
+        /* GL_COMPATIBLE_SUBROUTINES returns one integer per compatible
+           subroutine, so the count has to be asked for first; every other
+           pname answers with exactly one. */
+        GLint count = 1;
+        if (pname == GL_COMPATIBLE_SUBROUTINES) {
+            GEX_GL_CALL(glGetActiveSubroutineUniformiv, program, shadertype,
+                        index, GL_NUM_COMPATIBLE_SUBROUTINES, &count);
+        }
+        if (count < 0 || count > (1 << 16)) { a.ok = false; break; }
+        std::vector<GLint> values((size_t)count ? (size_t)count : 1, 0);
+        if (count) {
+            GEX_GL_CALL(glGetActiveSubroutineUniformiv, program, shadertype,
+                        index, pname, values.data());
+        }
+        put_blob(values.data(), (uint32_t)((size_t)count * sizeof(GLint)));
+        break;
+    }
     case GET_TEXTURE_SUB_IMAGE: {
         const GLuint texture = lookup(textures, a.u32());
         const GLint level = a.i32();

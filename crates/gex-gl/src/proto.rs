@@ -430,6 +430,9 @@ pub mod op {
     pub const INVALIDATE_SUB_FRAMEBUFFER: u32 = 261;
     pub const GET_TEXTURE_SUB_IMAGE: u32 = 262;
     pub const GET_COMPRESSED_TEXTURE_SUB_IMAGE: u32 = 263;
+    pub const GET_ACTIVE_SUBROUTINE_NAME: u32 = 264;
+    pub const GET_ACTIVE_SUBROUTINE_UNIFORM_NAME: u32 = 265;
+    pub const GET_ACTIVE_SUBROUTINE_UNIFORM_IV: u32 = 266;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,
