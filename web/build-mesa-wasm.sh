@@ -102,3 +102,27 @@ printf '%s\n' \
     "$BUILD/src/mesa/glapi/shared-glapi/libglapi.a" \
     "$BUILD/src/gallium/auxiliary/libgallium.a" \
     "$BUILD/src/gallium/drivers/softpipe/libsoftpipe.a"
+
+# Stage the replay/smoke pair into both served trees.
+#
+# This used to be a manual step, documented in a comment in
+# tests/stk-webgpu-fps.sh, and skipping it is invisible: drive.mjs serves
+# web/dist, so a browser run against an unstaged build measures the PREVIOUS
+# driver and says nothing about it. A whole pass's diagnostics then describe
+# code that is not in the tree -- it has cost three investigations, most
+# recently 2026-09-06, when web/build-assets.sh rebuilt every other asset and
+# faithfully re-copied a fourteen-hour-old wasm. Both trees, every build.
+#
+# web/public is the source tree the asset build reads; web/dist is what the
+# harness serves. They must not disagree.
+for _n in gex-wgpu-replay gex-wgpu-smoke; do
+    for _e in js wasm; do
+        _src="$BUILD/src/gallium/targets/gex-wasm/$_n.$_e"
+        [ -f "$_src" ] || continue
+        for _dst in "$(dirname "$0")/public/gex" "$(dirname "$0")/dist/gex"; do
+            [ -d "$_dst" ] || continue
+            cp -f "$_src" "$_dst/$_n.$_e" || exit 1
+            echo "staged: $_dst/$_n.$_e"
+        done
+    done
+done
