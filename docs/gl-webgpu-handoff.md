@@ -17990,3 +17990,69 @@ Recorded so they are not re-opened:
   promotion changing a view's stored texel size, and the compressed
   signed/unsigned BPTC pair. The promotion one is understood; see
   `format-class-views-work`.
+
+## copy_image: two shapes the scratch texture did not describe
+
+`KHR-GL46.copy_image` was 225 of 324, and every one of the 99 failures was
+a format-reinterpreting copy — `rgb10`, `rgb10_a2`, `rgb10_a2ui`,
+`r11f_g11f_b10f`, `rgb9_e5`, all four bytes and all mutually
+size-compatible, which is exactly what `glCopyImageSubData` exists to
+copy between. 45 other copies from the same sources passed, so the
+formats were the axis, not the targets.
+
+Both defects were the same mistake in two places: **a scratch texture
+described by the resource it stands in for rather than by itself.**
+
+### The colour attachment's scratch is 2D
+
+A colour target whose surface reinterprets the format renders into a
+scratch of that format — one level, one layer, always 2D. The view built
+for it kept the resource's shape, so a 3D destination asked for a 3D view
+of a 2D texture:
+
+    The dimension (TextureViewDimension::e3D) of the texture view is not
+    compatible with the dimension (TextureDimension::e2D)
+
+An invalid view is an invalid bind group is an invalid command buffer, so
+the copy and everything batched with it went. The depth slice a few lines
+down had the same fault: a slice index on a 2D attachment is as invalid as
+the 3D view, and the slice is applied when the scratch is copied back
+anyway. 22 cases, and a strict improvement — none broken.
+
+### The sampler view's scratch was one layer
+
+st implements a cross-class `glCopyImageSubData` by blitting between
+*canonical* formats: it asks for an `r8g8b8a8_unorm` view of an
+`r11g11b10_float` array, all twelve layers. The driver's cross-class view
+is served by copying the bytes into a scratch texture of the view's
+format, and that scratch was restricted to a single layer — so the view
+was refused, the blit was declined by name, and the copy did nothing.
+
+The scratch is now an array of the view's whole range — or a 3D texture of
+the level's depth, since st views a 3D source the same way — and the
+staging buffer, the refresh copy and the view over it all carry every
+slice.
+
+**Bounded, deliberately.** The scratch is a whole copy of the range and
+the range is the application's to choose: a cross-class view of a
+2048×2048×256 array would ask for four gigabytes, quietly, on a card with
+less. Above 64 MiB the view is refused by name, as it was before layers
+were served at all. A declined blit is a wrong picture; an exhausted
+device is the whole process.
+
+### The result
+
+    KHR-GL46.copy_image 225 -> 319 of 324
+
+94 fixed, none broken. The five that remain are error-check cases that
+cannot get past `glTexStorage3DMultisample` on
+`GL_TEXTURE_2D_MULTISAMPLE_ARRAY`, which WGSL has no type for — the same
+wall the rest of that target keeps hitting.
+
+**The shape to carry forward.** Both halves were found by asking what the
+*scratch* is, not what the resource is. A stand-in texture has its own
+dimension, its own layer count and its own base level, and every
+descriptor built for it has to say so. Describing it with the resource's
+shape produces a validation error at best — and at worst, as with the
+single-layer restriction, a refusal that reads as "this driver cannot do
+that" when it only means "the stand-in was built too small".
