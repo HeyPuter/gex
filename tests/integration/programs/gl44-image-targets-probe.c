@@ -477,63 +477,82 @@ int main(void) {
                 glUseProgram(pprog);
                 glUniform1i(glGetUniformLocation(pprog, "img"), 0);
                 glUniform1i(glGetUniformLocation(pprog, "flat_img"), 1);
-                /* The same draw against the default framebuffer, which is
-                 * where it does not work in the browser. Everything about
-                 * this is identical to the run below except the target:
-                 * GL_TRIANGLES to fb0 draws, GL_POINTS to a framebuffer
-                 * object draws, and GL_POINTS to fb0 produces no fragment
-                 * anywhere in it -- the whole surface is scanned, not the one
-                 * pixel the arithmetic expects. Not the viewport (setting it
-                 * to its own reported value changes nothing), not the vertex
-                 * count (three points behave as one does), not multisampling
-                 * (fb0 reports 0 samples on both paths), and not the pixel
-                 * grid (0.1234 is inside a pixel, not on a corner).
+                /* Triangle and point into the default framebuffer: the
+                 * same fragment shader, each checked two ways. The colour it
+                 * writes, and the image it stores to.
                  *
-                 * Anything drawing points straight to the window -- a
-                 * particle effect, a point cloud, a debug overlay -- gets
-                 * nothing. */
+                 * Measuring only one of them is how this went wrong twice. A
+                 * clear to fb0 reads back correctly, so fb0 read-back is
+                 * sound; but the *colour* of a draw into fb0 does not come
+                 * back in the browser even for a triangle whose image store
+                 * plainly landed. The store is the independent witness that
+                 * the fragment ran, and the two together say which half is
+                 * missing. */
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                GLint dvp[4] = {0, 0, 0, 0};
+                glGetIntegerv(GL_VIEWPORT, dvp);
                 {
-                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                    GLint fvp[4] = {0, 0, 0, 0};
-                    glGetIntegerv(GL_VIEWPORT, fvp);
+                    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    unsigned char cleared[4] = {0, 0, 0, 0};
+                    glReadPixels(1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                                 cleared);
+                    fprintf(stderr, "INFO fb0 clear=%u,%u,%u want=0,255,0\n",
+                            cleared[0], cleared[1], cleared[2]);
+                    result("fb0_clear_reads_back",
+                           cleared[0] == 0 && cleared[1] == 255 &&
+                           cleared[2] == 0);
+                }
+                for (int pass = 0; pass < 2; ++pass) {
+                    const int is_point = pass == 1;
+                    const GLuint which = is_point ? pprog : fprog;
+                    GLuint witness = 0;
+                    glGenTextures(1, &witness);
+                    glBindTexture(GL_TEXTURE_2D, witness);
+                    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32I, 1, 1);
+                    glBindImageTexture(1, witness, 0, GL_FALSE, 0,
+                                       GL_WRITE_ONLY, GL_RGBA32I);
+                    glUseProgram(which);
+                    glUniform1i(glGetUniformLocation(which, "img"), 0);
+                    glUniform1i(glGetUniformLocation(which, "flat_img"), 1);
                     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
                     glClear(GL_COLOR_BUFFER_BIT);
                     while (glGetError() != GL_NO_ERROR) {}
-                    glDrawArrays(GL_POINTS, 0, 1);
-                    /* The viewport exactly. Reading past the attachment
-                       returns undefined bytes, which can read as a lit pixel
-                       and hide the very thing this is looking for -- a scan
-                       of three times this area was run once by hand to rule
-                       out a point drawn somewhere unexpected, and found
-                       nothing either. */
-                    const int fw = fvp[2] > 0 ? fvp[2] : 1;
-                    const int fh = fvp[3] > 0 ? fvp[3] : 1;
-                    unsigned char *surface =
-                        (unsigned char *)calloc((size_t)fw * fh, 4);
-                    int fb0_lit = 0;
-                    if (surface) {
-                        glReadPixels(0, 0, fw, fh, GL_RGBA, GL_UNSIGNED_BYTE,
-                                     surface);
-                        int fx = -1, fy = -1;
-                        for (int yy = 0; yy < fh; ++yy)
-                            for (int xx = 0; xx < fw; ++xx)
-                                if (surface[((size_t)yy * fw + xx) * 4] > 127) {
-                                    ++fb0_lit;
-                                    if (fx < 0) { fx = xx; fy = yy; }
-                                }
-                        fprintf(stderr, "INFO point_fb0 first lit at %d,%d\n",
-                                fx, fy);
-                        free(surface);
-                    }
-                    fprintf(stderr, "INFO point_fb0 %dx%d lit=%d want>=1\n",
-                            fw, fh, fb0_lit);
-                    result("point_draw_to_default_framebuffer", fb0_lit >= 1);
+                    if (is_point) glDrawArrays(GL_POINTS, 0, 1);
+                    else          glDrawArrays(GL_TRIANGLES, 0, 3);
+                    glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT |
+                                    GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+                    GLint stored[4] = {0, 0, 0, 0};
+                    glBindTexture(GL_TEXTURE_2D, witness);
+                    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA_INTEGER, GL_INT,
+                                  stored);
+                    unsigned char centre[4] = {0, 0, 0, 0};
+                    glReadPixels(dvp[2] / 2, dvp[3] / 2, 1, 1, GL_RGBA,
+                                 GL_UNSIGNED_BYTE, centre);
+                    fprintf(stderr, "INFO fb0 %-8s store=[%d,%d,%d,%d] "
+                            "want=[7,8,9,10] centre=%u err=0x%04x\n",
+                            is_point ? "point" : "triangle", stored[0],
+                            stored[1], stored[2], stored[3], centre[0],
+                            (unsigned)glGetError());
+                    result(is_point ? "point_to_fb0_stores"
+                                    : "triangle_to_fb0_stores",
+                           stored[0] == 7 && stored[1] == 8 &&
+                           stored[2] == 9 && stored[3] == 10);
+                    /* And the colour, which is a separate question. The
+                     * triangle's store lands and its colour does not, so the
+                     * draw ran and what fb0 gives back afterwards is the
+                     * contents from before it -- a clear read back through
+                     * the same call is correct, so this is not read-back in
+                     * general. Anything screenshotting its own window with
+                     * glReadPixels gets the frame before the one it drew. */
+                    if (!is_point)
+                        result("fb0_draw_colour_reads_back", centre[0] == 255);
+                    glDeleteTextures(1, &witness);
                     while (glGetError() != GL_NO_ERROR) {}
                 }
-                /* Into an explicit framebuffer rather than fb0, to tell
-                   "points do not draw" from "points do not draw to the
-                   default framebuffer". */
-                GLuint pfbo = 0, pcolour = 0;
+                /* And the same point into an explicit framebuffer, which
+                   is the comparison that says whether the target matters. */
+                GLuint pfbo = 0, pcolour = 0, pwitness = 0;
                 glGenTextures(1, &pcolour);
                 glBindTexture(GL_TEXTURE_2D, pcolour);
                 glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 64, 64);
@@ -542,57 +561,30 @@ int main(void) {
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                        GL_TEXTURE_2D, pcolour, 0);
                 glViewport(0, 0, 64, 64);
-                GLint vp0[4] = {0, 0, 0, 0};
-                glGetIntegerv(GL_VIEWPORT, vp0);
-                /* Set the viewport to what GL already says it is. Nothing
-                   should change, and if it does the initial viewport is being
-                   reported rather than applied. */
-                glViewport(vp0[0], vp0[1], vp0[2], vp0[3]);
+                glGenTextures(1, &pwitness);
+                glBindTexture(GL_TEXTURE_2D, pwitness);
+                glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32I, 1, 1);
+                glBindImageTexture(1, pwitness, 0, GL_FALSE, 0, GL_WRITE_ONLY,
+                                   GL_RGBA32I);
+                glUseProgram(pprog);
+                glUniform1i(glGetUniformLocation(pprog, "img"), 0);
+                glUniform1i(glGetUniformLocation(pprog, "flat_img"), 1);
                 glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
                 glClear(GL_COLOR_BUFFER_BIT);
                 while (glGetError() != GL_NO_ERROR) {}
-                glDrawArrays(GL_POINTS, 0, 3);
-                glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
-                /* Did the fragment run at all? The point writes white, so a
-                   lit pixel anywhere says the draw reached the raster and the
-                   store is what went missing. */
-                GLint pvp[4] = {0, 0, 0, 0};
-                glGetIntegerv(GL_VIEWPORT, pvp);
-                const int px = (int)((0.1234f * 0.5f + 0.5f) * (float)pvp[2]);
-                const int py = (int)((0.1234f * 0.5f + 0.5f) * (float)pvp[3]);
-                /* Scan rather than sample: fb0 may be a different size and
-                   a different way up in the browser, and looking at the one
-                   pixel arithmetic says should be lit answers a question
-                   about the arithmetic. */
-                const int pw = pvp[2] > 0 ? pvp[2] : 1;
-                const int ph = pvp[3] > 0 ? pvp[3] : 1;
-                unsigned char *whole =
-                    (unsigned char *)calloc((size_t)pw * ph, 4);
-                int lit_x = -1, lit_y = -1, lit_count = 0;
-                if (whole) {
-                    glReadPixels(0, 0, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE,
-                                 whole);
-                    for (int yy = 0; yy < ph; ++yy)
-                        for (int xx = 0; xx < pw; ++xx)
-                            if (whole[((size_t)yy * pw + xx) * 4] > 127) {
-                                ++lit_count;
-                                if (lit_x < 0) { lit_x = xx; lit_y = yy; }
-                            }
-                    free(whole);
-                }
-                fprintf(stderr, "INFO point_fs viewport=%dx%d expected=%d,%d "
-                        "lit=%d first=%d,%d\n", pw, ph, px, py, lit_count,
-                        lit_x, lit_y);
-                glBindTexture(GL_TEXTURE_2D, pflat);
+                glDrawArrays(GL_POINTS, 0, 1);
+                glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT |
+                                GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+                glBindTexture(GL_TEXTURE_2D, pwitness);
                 glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA_INTEGER, GL_INT, pgot);
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 if (pfbo) glDeleteFramebuffers(1, &pfbo);
                 if (pcolour) glDeleteTextures(1, &pcolour);
-                if (pflat) glDeleteTextures(1, &pflat);
+                if (pwitness) glDeleteTextures(1, &pwitness);
             }
             fprintf(stderr, "INFO point_fs control2d=[%d,%d,%d,%d] "
                     "want=[7,8,9,10]\n", pgot[0], pgot[1], pgot[2], pgot[3]);
-            result("image2d_from_point_draw",
+            result("point_to_fbo_stores",
                    plinked && pgot[0] == 7 && pgot[1] == 8 && pgot[2] == 9 &&
                    pgot[3] == 10);
             while (glGetError() != GL_NO_ERROR) {}
