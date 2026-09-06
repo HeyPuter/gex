@@ -94,17 +94,34 @@ fi
 #
 # Refreshing it costs a few seconds and cannot break the ABI glcts linked
 # against: a shared object that gains symbols still satisfies every old one.
-if [ -n "${GEX_CTS_TOOLCHAIN:-}" ] && [ -x "$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc" ]; then
-    GEX_CC="$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc" \
-        "$ROOT/guest/gl/build.sh" "$BUILD/guest-gl" >/dev/null || {
-            echo "could not rebuild the CTS guest driver" >&2; exit 1; }
-elif command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
-    GEX_CC="$(command -v aarch64-linux-musl-gcc)" \
-        "$ROOT/guest/gl/build.sh" "$BUILD/guest-gl" >/dev/null || {
-            echo "could not rebuild the CTS guest driver" >&2; exit 1; }
-else
+#
+# The compiler is looked for in the same three places, in the same order, as
+# tests/gl44-probe.sh -- it defaulted to PATH alone, where the cross compiler
+# is not, so every run took the warning branch below and served the driver
+# from whenever the CTS was last compiled. A warning is the wrong shape for
+# this: nothing downstream can tell a stale-driver run from a conformance
+# result, and a whole afternoon of buffer_storage numbers were measured
+# against a driver that predated the fixes they were meant to check. Refuse
+# instead, and let GEX_CTS_ALLOW_STALE say otherwise on purpose.
+for candidate in \
+    ${GEX_CTS_TOOLCHAIN:+$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc} \
+    "${GEX_CC:-/home/velzie/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc}" \
+    "$(command -v aarch64-linux-musl-gcc 2>/dev/null || true)"
+do
+    [ -n "$candidate" ] && [ -x "$candidate" ] && { GUEST_CC=$candidate; break; }
+done
+if [ -n "${GUEST_CC:-}" ]; then
+    echo "guest driver: rebuilding with $GUEST_CC" >&2
+    GEX_CC="$GUEST_CC" "$ROOT/guest/gl/build.sh" "$BUILD/guest-gl" >/dev/null || {
+        echo "could not rebuild the CTS guest driver" >&2; exit 1; }
+elif [ -n "${GEX_CTS_ALLOW_STALE:-}" ]; then
     echo "warning: no musl cross compiler; serving whatever guest driver" >&2
     echo "         $BUILD/guest-gl already holds, which may be stale" >&2
+else
+    echo "no musl cross compiler, so the guest driver cannot be rebuilt and" >&2
+    echo "$BUILD/guest-gl would be served as-is. Set GEX_CC or" >&2
+    echo "GEX_CTS_TOOLCHAIN, or GEX_CTS_ALLOW_STALE=1 to run anyway." >&2
+    exit 2
 fi
 
 # glcts links the one-object EGL/GLES marshaller for the few EGL calls the

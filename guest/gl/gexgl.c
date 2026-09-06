@@ -508,10 +508,22 @@ void glPixelStorei(unsigned p, int v) {
     CMD2(GEXGL_PIXEL_STOREI, p, v);
 }
 
+/* The error latch lives with glGetError further down; mapping is emulated
+   here, so these need it before then. */
+static void gexgl_set_error(unsigned error);
+/* Both halves of the persistent-mapping traffic, defined with the draw path
+   further down and called from glFinish above it. */
+static void gexgl_flush_coherent_maps(void);
+static void gexgl_refresh_persistent_reads(void);
+
 void glFinish(void) {
     CMD0(GEXGL_FINISH);
     flush();
     (void)reply_u32();
+    /* After the host has finished, whatever it wrote through a persistent
+       mapping is visible; the shadow has to catch up before the application
+       reads it. */
+    gexgl_refresh_persistent_reads();
 }
 
 void glFlush(void) { flush(); }
@@ -631,7 +643,11 @@ struct buffer_object_state {
     void *map_sent;
     struct buffer_object_state *next;
 };
-static struct buffer_target_state buffer_targets[16];
+/* GL 4.6 has fifteen generic buffer targets (ARB_indirect_parameters'
+   GL_PARAMETER_BUFFER is the fifteenth). A table that cannot hold them all
+   made buffer_target() return NULL, and every caller read that as "nothing
+   bound" -- a silent drop, so say so instead. */
+static struct buffer_target_state buffer_targets[24];
 static struct buffer_object_state *buffer_objects;
 
 static struct buffer_target_state *buffer_target(unsigned target) {
@@ -640,8 +656,13 @@ static struct buffer_target_state *buffer_target(unsigned target) {
         if (buffer_targets[i].target == target) return &buffer_targets[i];
         if (!buffer_targets[i].target && !free_slot) free_slot = &buffer_targets[i];
     }
-    if (free_slot) free_slot->target = target;
-    return free_slot;
+    if (free_slot) {
+        free_slot->target = target;
+        return free_slot;
+    }
+    fprintf(stderr, "gexgl: buffer target table full, dropping target 0x%x\n",
+            target);
+    return NULL;
 }
 
 static unsigned bound_buffer(unsigned target) {
@@ -662,6 +683,82 @@ static struct buffer_object_state *buffer_object(unsigned name, int create) {
     object->next = buffer_objects;
     buffer_objects = object;
     return object;
+}
+
+/* An indexed bind also sets the generic binding point of the same target --
+   glBindBufferBase(target, i, b) is defined to do what glBindBuffer(target, b)
+   does as well. Guest-side buffer state (storage flags, size, mappings) is
+   keyed off that generic point, so without this a glBufferStorage issued
+   after glBindBufferBase recorded nothing at all: GL_BUFFER_STORAGE_FLAGS
+   answered 0, and glMapBufferRange on the target returned NULL. */
+static void bind_generic_buffer(unsigned target, unsigned name) {
+    struct buffer_target_state *s = buffer_target(target);
+    if (s) s->name = name;
+    if (name) (void)buffer_object(name, 1);
+}
+
+/* Mapping is emulated on this side: the host is never told a buffer is
+   mapped, so it cannot raise any of mapping's errors and cannot answer any of
+   mapping's state queries. Both belong here, with the bookkeeping.
+
+   Returns the GL error a map of this range would raise, or 0. Shared by the
+   bound and named spellings so the two cannot drift -- the same split is what
+   left GL_BUFFER_STORAGE_FLAGS answered for one form and forwarded for the
+   other. */
+static unsigned map_range_error(const struct buffer_object_state *object,
+                                long offset, long length, unsigned access) {
+    const unsigned defined = 0x0001u | 0x0002u | 0x0004u | 0x0008u |
+                             0x0010u | 0x0020u | 0x0040u | 0x0080u;
+    /* The split between the two error codes is the spec's, not intuition's:
+       everything about the *range* is GL_INVALID_VALUE and everything about
+       the *access bits* is GL_INVALID_OPERATION, including the empty length
+       and the "neither read nor write" case. Reporting INVALID_VALUE for the
+       latter is what KHR-GL44.buffer_storage.errors caught. */
+    if (!object) return 0x0502u;                    /* GL_INVALID_OPERATION */
+    if (offset < 0 || length < 0) return 0x0501u;   /* GL_INVALID_VALUE */
+    if ((size_t)offset > object->size ||
+        (size_t)length > object->size - (size_t)offset)
+        return 0x0501u;
+    if (access & ~defined) return 0x0501u;
+    if (length == 0) return 0x0502u;
+    if (object->map) return 0x0502u;                /* already mapped */
+    if (!(access & (0x0001u | 0x0002u))) return 0x0502u;  /* neither R nor W */
+    /* Reading forbids the three bits that say the old contents do not
+       matter, and an explicit flush needs something to flush. */
+    if ((access & 0x0001u) && (access & (0x0004u | 0x0008u | 0x0020u)))
+        return 0x0502u;
+    if ((access & 0x0010u) && !(access & 0x0002u)) return 0x0502u;
+    if (!object->has_storage_flags) return 0;  /* mutable: flags do not gate */
+    /* An immutable buffer may only be mapped with what its storage allows.
+       The host's copy of the flags has GL_DYNAMIC_STORAGE_BIT added so a
+       write-back is accepted at all, so only this side can make this check. */
+    {
+        const unsigned gated = 0x0001u | 0x0002u | 0x0040u | 0x0080u;
+        if ((access & gated) & ~object->storage_flags) return 0x0502u;
+    }
+    return 0;
+}
+
+/* The GL error a glBufferSubData into this range would raise, or 0. Two rules,
+   both of which only this side can apply:
+
+   - 6.2: an error on any part of a range that is mapped, unless that mapping
+     set GL_MAP_PERSISTENT_BIT. The host is never told about the mapping.
+   - an immutable buffer whose storage flags lack GL_DYNAMIC_STORAGE_BIT
+     cannot be written this way at all. The host's copy of the flags always
+     has that bit added -- it is what makes the mapping write-back work -- so
+     the host will never raise this. */
+static unsigned sub_data_error(const struct buffer_object_state *object,
+                               long offset, long size) {
+    if (!object) return 0;
+    if (object->has_storage_flags && !(object->storage_flags & 0x0100u))
+        return 0x0502u;                           /* GL_INVALID_OPERATION */
+    if (!object->map) return 0;
+    if (object->map_access & 0x0040u) return 0;   /* GL_MAP_PERSISTENT_BIT */
+    if ((size_t)offset < object->map_offset + object->map_length &&
+        object->map_offset < (size_t)offset + (size_t)size)
+        return 0x0502u;
+    return 0;
 }
 
 static void forget_buffer_object(unsigned name) {
@@ -689,7 +786,7 @@ void glBindBuffer(unsigned target, unsigned name) {
 }
 
 void glBufferData(unsigned target, long size, const void *data, unsigned usage) {
-    if (size < 0) return;
+    if (size < 0) { gexgl_set_error(0x0501u); return; }
     size_t len = (size_t)size;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
     if (object) object->size = len;
@@ -704,7 +801,12 @@ void glBufferData(unsigned target, long size, const void *data, unsigned usage) 
     put_blob(p + 5, data, blob_len);
 }
 
-void glBufferSubData(unsigned target, long offset, long size, const void *data) {
+/* The write itself, with none of GL's checks. The driver's own write-back of
+   a mapping goes through here: the flags the application asked for need carry
+   neither GL_DYNAMIC_STORAGE_BIT nor anything else that would let it make this
+   call, and the checks below would reject the driver's own traffic. */
+static void buffer_sub_data_raw(unsigned target, long offset, long size,
+                                const void *data) {
     if (offset < 0 || size < 0 || (size && !data)) return;
     size_t len = (size_t)size;
     uint32_t *p = begin(GEXGL_BUFFER_SUB_DATA, 5, 4 + len);
@@ -715,6 +817,17 @@ void glBufferSubData(unsigned target, long offset, long size, const void *data) 
     p[3] = (uint32_t)(uint64_t)size;
     p[4] = (uint32_t)((uint64_t)size >> 32);
     put_blob(p + 5, data, len);
+}
+
+void glBufferSubData(unsigned target, long offset, long size, const void *data) {
+    if (offset < 0 || size < 0) { gexgl_set_error(0x0501u); return; }
+    if (size && !data) return;
+    {
+        const unsigned bad =
+            sub_data_error(buffer_object(bound_buffer(target), 0), offset, size);
+        if (bad) { gexgl_set_error(bad); return; }
+    }
+    buffer_sub_data_raw(target, offset, size, data);
 }
 
 /* The named forms of the three above. GL 4.5 core, and the ones that make
@@ -732,7 +845,7 @@ void glBufferSubData(unsigned target, long offset, long size, const void *data) 
    named here, `bound_buffer(target)` there. */
 void glNamedBufferData(unsigned buffer, long size, const void *data,
                        unsigned usage) {
-    if (size < 0) return;
+    if (size < 0) { gexgl_set_error(0x0501u); return; }
     size_t len = (size_t)size;
     struct buffer_object_state *object = buffer_object(buffer, 1);
     if (object) object->size = len;
@@ -747,8 +860,8 @@ void glNamedBufferData(unsigned buffer, long size, const void *data,
     put_blob(p + 5, data, blob_len);
 }
 
-void glNamedBufferSubData(unsigned buffer, long offset, long size,
-                          const void *data) {
+static void named_buffer_sub_data_raw(unsigned buffer, long offset, long size,
+                                      const void *data) {
     if (offset < 0 || size < 0 || (size && !data)) return;
     size_t len = (size_t)size;
     uint32_t *p = begin(GEXGL_NAMED_BUFFER_SUB_DATA, 5, 4 + len);
@@ -761,9 +874,24 @@ void glNamedBufferSubData(unsigned buffer, long offset, long size,
     put_blob(p + 5, data, len);
 }
 
+void glNamedBufferSubData(unsigned buffer, long offset, long size,
+                          const void *data) {
+    if (offset < 0 || size < 0) { gexgl_set_error(0x0501u); return; }
+    if (size && !data) return;
+    {
+        const unsigned bad =
+            sub_data_error(buffer_object(buffer, 0), offset, size);
+        if (bad) { gexgl_set_error(bad); return; }
+    }
+    named_buffer_sub_data_raw(buffer, offset, size, data);
+}
+
 void glNamedBufferStorage(unsigned buffer, long size, const void *data,
                           unsigned flags) {
-    if (size < 0) return;
+    /* A refusal with no error is worse than no refusal: the application asks
+       glGetError, is told nothing went wrong, and uses a buffer that has no
+       storage. */
+    if (size < 0) { gexgl_set_error(0x0501u); return; }
     size_t blob_len = data ? (size_t)size : 0;
     struct buffer_object_state *object = buffer_object(buffer, 1);
     if (object) {
@@ -795,9 +923,8 @@ void glGetBufferSubData(unsigned target, long offset, long size, void *data);
 void *glMapBufferRange(unsigned target, long offset, long length,
                        unsigned access) {
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
-    if (!object || offset < 0 || length < 0 || object->map ||
-        (size_t)offset > object->size || (size_t)length > object->size - (size_t)offset)
-        return NULL;
+    const unsigned bad = map_range_error(object, offset, length, access);
+    if (bad) { gexgl_set_error(bad); return NULL; }
     object->map_length = (size_t)length;
     object->map_offset = (size_t)offset;
     object->map_access = access;
@@ -818,7 +945,8 @@ unsigned char glUnmapBuffer(unsigned target) {
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
     if (!object || !object->map) return 0;
     if (object->map_access & 2u)
-        glBufferSubData(target, (long)object->map_offset, (long)object->map_length, object->map);
+        buffer_sub_data_raw(target, (long)object->map_offset,
+                            (long)object->map_length, object->map);
     free(object->map);
     free(object->map_sent);
     object->map = NULL;
@@ -832,7 +960,7 @@ void glFlushMappedBufferRange(unsigned target, long offset, long length) {
     if (!object || !object->map || offset < 0 || length < 0 ||
         (size_t)offset > object->map_length ||
         (size_t)length > object->map_length - (size_t)offset) return;
-    glBufferSubData(target, (long)(object->map_offset + (size_t)offset), length,
+    buffer_sub_data_raw(target, (long)(object->map_offset + (size_t)offset), length,
                     (uint8_t *)object->map + offset);
 }
 
@@ -858,10 +986,8 @@ void glGetNamedBufferSubData(unsigned buffer, long offset, long size,
 void *glMapNamedBufferRange(unsigned buffer, long offset, long length,
                             unsigned access) {
     struct buffer_object_state *object = buffer_object(buffer, 0);
-    if (!object || offset < 0 || length < 0 || object->map ||
-        (size_t)offset > object->size ||
-        (size_t)length > object->size - (size_t)offset)
-        return NULL;
+    const unsigned bad = map_range_error(object, offset, length, access);
+    if (bad) { gexgl_set_error(bad); return NULL; }
     object->map_length = (size_t)length;
     object->map_offset = (size_t)offset;
     object->map_access = access;
@@ -886,7 +1012,7 @@ unsigned char glUnmapNamedBuffer(unsigned buffer) {
     struct buffer_object_state *object = buffer_object(buffer, 0);
     if (!object || !object->map) return 0;
     if (object->map_access & 2u)
-        glNamedBufferSubData(buffer, (long)object->map_offset,
+        named_buffer_sub_data_raw(buffer, (long)object->map_offset,
                              (long)object->map_length, object->map);
     free(object->map);
     free(object->map_sent);
@@ -901,7 +1027,7 @@ void glFlushMappedNamedBufferRange(unsigned buffer, long offset, long length) {
     if (!object || !object->map || offset < 0 || length < 0 ||
         (size_t)offset > object->map_length ||
         (size_t)length > object->map_length - (size_t)offset) return;
-    glNamedBufferSubData(buffer, (long)(object->map_offset + (size_t)offset),
+    named_buffer_sub_data_raw(buffer, (long)(object->map_offset + (size_t)offset),
                          length, (uint8_t *)object->map + offset);
 }
 
@@ -968,6 +1094,7 @@ void glInvalidateNamedFramebufferSubData(unsigned framebuffer, int numAttachment
 }
 
 void glBindBufferBase(unsigned target, unsigned index, unsigned buffer) {
+    bind_generic_buffer(target, buffer);
     CMD3(GEXGL_BIND_BUFFER_BASE, target, index, buffer);
 }
 
@@ -2230,7 +2357,7 @@ static void gexgl_flush_coherent_maps(void) {
             restore = bound_buffer(copy_write);
             glBindBuffer(copy_write, object->name);
         }
-        glBufferSubData(target, (long)(object->map_offset + first), (long)length,
+        buffer_sub_data_raw(target, (long)(object->map_offset + first), (long)length,
                         now + first);
         if (borrowed)
             glBindBuffer(copy_write, restore);
@@ -2240,6 +2367,45 @@ static void gexgl_flush_coherent_maps(void) {
            one chance never recovered. */
         memcpy(sent + first, now + first, length);
     }
+}
+
+/* And the other direction. A persistent mapping is two-way: the application
+ * writes through it and the GPU writes through it, and only the first half
+ * existed here -- the shadow was filled once, at map time, and never again.
+ * Anything reading GPU output through a persistent mapping (an asynchronous
+ * PBO read-back, a compute result, a query written into a buffer) saw the
+ * contents from whenever it mapped.
+ *
+ * GL says when: MemoryBarrier with CLIENT_MAPPED_BUFFER_BARRIER_BIT is the
+ * point at which those writes become visible to the client, and glFinish
+ * carries it too. Both are explicit and rare, so a round trip each is the
+ * right price -- this is not on any draw path. */
+static void gexgl_refresh_persistent_reads(void) {
+    /* Guest writes first: a mapping that is both readable and coherent has
+       unsent bytes of its own, and fetching over them would lose them. */
+    gexgl_flush_coherent_maps();
+    for (struct buffer_object_state *object = buffer_objects; object;
+         object = object->next) {
+        /* Readable and persistent: 0x1 | 0x40. A non-persistent read mapping
+           cannot legally see a GPU write at all -- the application has to
+           unmap first, and that path already refetches. */
+        if (!object->map || !object->map_length ||
+            (object->map_access & 0x41u) != 0x41u)
+            continue;
+        glGetNamedBufferSubData(object->name, (long)object->map_offset,
+                                (long)object->map_length, object->map);
+        /* The diff above must not now read these as the application's own
+           writes and send them straight back. */
+        if (object->map_sent)
+            memcpy(object->map_sent, object->map, object->map_length);
+    }
+}
+
+void glMemoryBarrier(unsigned barriers);
+
+static void gexgl_client_mapped_barrier(unsigned barriers) {
+    const unsigned client_mapped = 0x00004000u;
+    if (barriers & client_mapped) gexgl_refresh_persistent_reads();
 }
 
 static void gexgl_upload_client_arrays(size_t vertices, int instances) {
@@ -3131,7 +3297,18 @@ void glStencilOp(unsigned fail,unsigned zfail,unsigned zpass){CMD3(GEXGL_STENCIL
 void glStencilOpSeparate(unsigned face,unsigned fail,unsigned zfail,unsigned zpass){CMD4(GEXGL_STENCIL_OP_SEPARATE,face,fail,zfail,zpass);}
 
 void glReadPixels(int x, int y, int w, int h, unsigned format, unsigned type, void *out) {
-    int pbo = bound_buffer(0x88EBu) != 0; /* GL_PIXEL_PACK_BUFFER */
+    const unsigned pack = bound_buffer(0x88EBu); /* GL_PIXEL_PACK_BUFFER */
+    int pbo = pack != 0;
+    /* GL forbids packing into a buffer that is mapped, unless the mapping is
+       persistent. The host is never told about the mapping, so it cannot
+       raise this; the guest holds the only copy of the fact. */
+    {
+        const struct buffer_object_state *object = buffer_object(pack, 0);
+        if (object && object->map && !(object->map_access & 0x0040u)) {
+            gexgl_set_error(0x0502u); /* GL_INVALID_OPERATION */
+            return;
+        }
+    }
     uint32_t *p = begin(GEXGL_READ_PIXELS, 9, 0);
     if (!p) return;
     p[0] = (uint32_t)x; p[1] = (uint32_t)y; p[2] = (uint32_t)w; p[3] = (uint32_t)h;

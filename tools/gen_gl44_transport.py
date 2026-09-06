@@ -866,19 +866,97 @@ def _needs_coherent_flush(name: str) -> bool:
 
 def guest_function(command: dict, opcode: int) -> str:
     text = _guest_function(command, opcode)
-    if command["name"] == "glGetBufferParameteriv":
-        brace = text.index("{\n") + 2
-        text = text[:brace] + """    if (pname == 0x8220u) { /* GL_BUFFER_STORAGE_FLAGS */
-        /* Not forwarded: the host was given an extra bit so that a mapping
-           can be written back at all. What the application asked for is
-           recorded on this side. */
-        struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
-        if (params && object && object->has_storage_flags)
-            *params = (int)object->storage_flags;
-        else if (params)
-            *params = 0;
-        return;
+    # Every spelling of the storage-flags query, bound or named, 32-bit or 64.
+    #
+    # Only the bound 32-bit form had this, and the DSA forms were added later
+    # without it -- so glGetNamedBufferParameteriv forwarded to the host and
+    # reported the extra bit: KHR-GL44.buffer_storage saw
+    # "E_FLAGS: 257 expected: 1", 257 being GL_DYNAMIC_STORAGE_BIT | the flag
+    # the application actually asked for. A behaviour implemented for one
+    # spelling of a call is implemented for none of the others.
+    # An indexed buffer bind also sets the generic binding point of the same
+    # target -- glBindBufferBase(t, i, b) does what glBindBuffer(t, b) does as
+    # well.  Guest-side buffer state is keyed off that generic point, so
+    # without this a glBufferStorage after an indexed bind recorded nothing:
+    # KHR-GL44.buffer_storage read GL_BUFFER_STORAGE_FLAGS back as 0 for every
+    # atomic-counter case, and glMapBufferRange on such a target returned NULL.
+    # The array forms bind the generic point to the last name, as the loop of
+    # single binds they are defined to be; a NULL array unbinds.
+    GENERIC_BUFFER_BINDS = {
+        "glBindBufferRange": "    bind_generic_buffer(target, buffer);\n",
+        "glBindBuffersBase": "    if (count > 0) bind_generic_buffer(target, names ? names[count - 1] : 0u);\n",
+        "glBindBuffersRange": "    if (count > 0 && (!buffers || (offsets && sizes)))\n        bind_generic_buffer(target, buffers ? buffers[count - 1] : 0u);\n",
     }
+    if command["name"] in GENERIC_BUFFER_BINDS:
+        brace = text.index("{\n") + 2
+        text = text[:brace] + GENERIC_BUFFER_BINDS[command["name"]] + text[brace:]
+
+    STORAGE_FLAG_QUERIES = {
+        "glGetBufferParameteriv": ("bound_buffer(target)", "int"),
+        "glGetBufferParameteri64v": ("bound_buffer(target)", "long long"),
+        "glGetNamedBufferParameteriv": ("buffer", "int"),
+        "glGetNamedBufferParameteri64v": ("buffer", "long long"),
+    }
+    if command["name"] in ("glMemoryBarrier", "glMemoryBarrierByRegion"):
+        # GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT is the point at which the GPU's
+        # writes through a persistent mapping become visible to the client.
+        # The mapping is a guest-side shadow, so that visibility has to be
+        # made to happen rather than merely permitted.
+        # After the packet, not before it: the refresh is a synchronous fetch
+        # and has to follow the barrier the host is being asked to execute.
+        close = text.rindex("}")
+        text = (text[:close] +
+                "    gexgl_client_mapped_barrier(barriers);\n" + text[close:])
+
+    if command["name"] in STORAGE_FLAG_QUERIES:
+        which, cast = STORAGE_FLAG_QUERIES[command["name"]]
+        brace = text.index("{\n") + 2
+        # Everything the guest owns rather than forwards. Mapping is emulated
+        # on this side and the host is never told a buffer is mapped, so it
+        # answers GL_BUFFER_MAPPED and friends for a buffer it believes is
+        # idle -- KHR-GL44.buffer_storage.get_buffer_parameter read
+        # GL_BUFFER_ACCESS_FLAGS back as 0 for every case. GL_BUFFER_ACCESS is
+        # the pre-3.0 spelling, derived from the same bits.
+        text = text[:brace] + f"""    switch (pname) {{
+    case 0x8220u:   /* GL_BUFFER_STORAGE_FLAGS */
+    case 0x88BCu:   /* GL_BUFFER_MAPPED */
+    case 0x911Fu:   /* GL_BUFFER_ACCESS_FLAGS */
+    case 0x9121u:   /* GL_BUFFER_MAP_OFFSET */
+    case 0x9120u:   /* GL_BUFFER_MAP_LENGTH */
+    case 0x88BBu: {{ /* GL_BUFFER_ACCESS */
+        /* Not forwarded. The storage flags the host holds have an extra bit
+           so a mapping can be written back at all, and the host does not know
+           about the mapping itself; both are recorded on this side. */
+        struct buffer_object_state *object = buffer_object({which}, 0);
+        long long answer = 0;
+        const unsigned access = object && object->map ? object->map_access : 0u;
+        switch (pname) {{
+        case 0x8220u:
+            answer = object && object->has_storage_flags
+                         ? (long long)object->storage_flags : 0;
+            break;
+        case 0x88BCu: answer = object && object->map ? 1 : 0; break;
+        case 0x911Fu: answer = (long long)access; break;
+        case 0x9121u:
+            answer = object && object->map ? (long long)object->map_offset : 0;
+            break;
+        case 0x9120u:
+            answer = object && object->map ? (long long)object->map_length : 0;
+            break;
+        default:
+            /* READ_ONLY, WRITE_ONLY, READ_WRITE. An unmapped buffer reports
+               the GL default, READ_WRITE. */
+            answer = !access                        ? 0x88BA
+                     : (access & 3u) == 1u          ? 0x88B8
+                     : (access & 3u) == 2u          ? 0x88B9
+                                                    : 0x88BA;
+            break;
+        }}
+        if (params) *params = ({cast})answer;
+        return;
+    }}
+    default: break;
+    }}
 """ + text[brace:]
     if command["name"] in QUERY_OBJECT_READS:
         # ARB_query_buffer_object. With a buffer bound to GL_QUERY_BUFFER,
@@ -905,8 +983,11 @@ def guest_function(command: dict, opcode: int) -> str:
             glBindBuffer(0x9192u, 0);
             {command["name"]}(id, pname, &value);
             glBindBuffer(0x9192u, query_buffer);
-            glBufferSubData(0x9192u, (long)(size_t)params,
-                            (long)sizeof(value), &value);
+            /* Driver traffic, not the application's: GL fills a query
+               buffer through the query mechanism, where neither
+               GL_DYNAMIC_STORAGE_BIT nor a live mapping gates the write. */
+            buffer_sub_data_raw(0x9192u, (long)(size_t)params,
+                                (long)sizeof(value), &value);
             return;
         }}
     }}
@@ -961,7 +1042,7 @@ def _guest_function(command: dict, opcode: int) -> str:
         # immutability itself comes from having called glBufferStorage at all,
         # which glBufferData still refuses.
         return f"""void {name}(unsigned target, long size, const void *data, unsigned flags) {{
-    if (size < 0) return;
+    if (size < 0) {{ gexgl_set_error(0x0501u); return; }} /* GL_INVALID_VALUE */
     size_t blob_len = data ? (size_t)size : 0;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
     if (object) {{

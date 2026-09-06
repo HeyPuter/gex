@@ -36,6 +36,7 @@ void glBeginTransformFeedback(unsigned primitiveMode) {
     packet[at++] = (uint32_t)(primitiveMode);
 }
 void glBindBufferRange(unsigned target, unsigned index, unsigned buffer, long offset, long size) {
+    bind_generic_buffer(target, buffer);
     uint32_t *packet = begin(1034, 7, 0);
     if (!packet) return;
     size_t at = 0;
@@ -52,6 +53,7 @@ void glBindBufferRange(unsigned target, unsigned index, unsigned buffer, long of
     packet[at++] = (uint32_t)(bits_size >> 32);
 }
 void glBindBuffersBase(unsigned target, unsigned first, int count, const unsigned *names) {
+    if (count > 0) bind_generic_buffer(target, names ? names[count - 1] : 0u);
     if (count < 0 || (size_t)count > UINT32_MAX / sizeof(*names)) return;
     size_t blob_len = names ? (size_t)count * sizeof(*names) : 0;
     uint32_t *a = begin(1035, 3, 4 + blob_len);
@@ -64,6 +66,8 @@ void glBindBuffersBase(unsigned target, unsigned first, int count, const unsigne
 void glBindBuffersRange(unsigned target, unsigned first, int count, const unsigned *buffers,
                          const long *offsets,
                          const long *sizes) {
+    if (count > 0 && (!buffers || (offsets && sizes)))
+        bind_generic_buffer(target, buffers ? buffers[count - 1] : 0u);
     if (count < 0 || (buffers && (!offsets || !sizes))) return;
     size_t per_item = sizeof(*buffers) + sizeof(*offsets) + sizeof(*sizes);
     if ((size_t)count > (UINT32_MAX - 12u) / per_item) return;
@@ -231,7 +235,7 @@ void glBlitNamedFramebuffer(unsigned readFramebuffer, unsigned drawFramebuffer, 
     packet[at++] = (uint32_t)(filter);
 }
 void glBufferStorage(unsigned target, long size, const void *data, unsigned flags) {
-    if (size < 0) return;
+    if (size < 0) { gexgl_set_error(0x0501u); return; } /* GL_INVALID_VALUE */
     size_t blob_len = data ? (size_t)size : 0;
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 1);
     if (object) {
@@ -1008,6 +1012,46 @@ void glGetBooleanv(unsigned pname, unsigned char *data) {
         memcpy(data, source, expected);
 }
 void glGetBufferParameteri64v(unsigned target, unsigned pname, long long *params) {
+    switch (pname) {
+    case 0x8220u:   /* GL_BUFFER_STORAGE_FLAGS */
+    case 0x88BCu:   /* GL_BUFFER_MAPPED */
+    case 0x911Fu:   /* GL_BUFFER_ACCESS_FLAGS */
+    case 0x9121u:   /* GL_BUFFER_MAP_OFFSET */
+    case 0x9120u:   /* GL_BUFFER_MAP_LENGTH */
+    case 0x88BBu: { /* GL_BUFFER_ACCESS */
+        /* Not forwarded. The storage flags the host holds have an extra bit
+           so a mapping can be written back at all, and the host does not know
+           about the mapping itself; both are recorded on this side. */
+        struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
+        long long answer = 0;
+        const unsigned access = object && object->map ? object->map_access : 0u;
+        switch (pname) {
+        case 0x8220u:
+            answer = object && object->has_storage_flags
+                         ? (long long)object->storage_flags : 0;
+            break;
+        case 0x88BCu: answer = object && object->map ? 1 : 0; break;
+        case 0x911Fu: answer = (long long)access; break;
+        case 0x9121u:
+            answer = object && object->map ? (long long)object->map_offset : 0;
+            break;
+        case 0x9120u:
+            answer = object && object->map ? (long long)object->map_length : 0;
+            break;
+        default:
+            /* READ_ONLY, WRITE_ONLY, READ_WRITE. An unmapped buffer reports
+               the GL default, READ_WRITE. */
+            answer = !access                        ? 0x88BA
+                     : (access & 3u) == 1u          ? 0x88B8
+                     : (access & 3u) == 2u          ? 0x88B9
+                                                    : 0x88BA;
+            break;
+        }
+        if (params) *params = (long long)answer;
+        return;
+    }
+    default: break;
+    }
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1220, 2, 0);
     if (!packet) return;
@@ -1020,16 +1064,45 @@ void glGetBufferParameteri64v(unsigned target, unsigned pname, long long *params
         memcpy(params, source, expected);
 }
 void glGetBufferParameteriv(unsigned target, unsigned pname, int *params) {
-    if (pname == 0x8220u) { /* GL_BUFFER_STORAGE_FLAGS */
-        /* Not forwarded: the host was given an extra bit so that a mapping
-           can be written back at all. What the application asked for is
-           recorded on this side. */
+    switch (pname) {
+    case 0x8220u:   /* GL_BUFFER_STORAGE_FLAGS */
+    case 0x88BCu:   /* GL_BUFFER_MAPPED */
+    case 0x911Fu:   /* GL_BUFFER_ACCESS_FLAGS */
+    case 0x9121u:   /* GL_BUFFER_MAP_OFFSET */
+    case 0x9120u:   /* GL_BUFFER_MAP_LENGTH */
+    case 0x88BBu: { /* GL_BUFFER_ACCESS */
+        /* Not forwarded. The storage flags the host holds have an extra bit
+           so a mapping can be written back at all, and the host does not know
+           about the mapping itself; both are recorded on this side. */
         struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
-        if (params && object && object->has_storage_flags)
-            *params = (int)object->storage_flags;
-        else if (params)
-            *params = 0;
+        long long answer = 0;
+        const unsigned access = object && object->map ? object->map_access : 0u;
+        switch (pname) {
+        case 0x8220u:
+            answer = object && object->has_storage_flags
+                         ? (long long)object->storage_flags : 0;
+            break;
+        case 0x88BCu: answer = object && object->map ? 1 : 0; break;
+        case 0x911Fu: answer = (long long)access; break;
+        case 0x9121u:
+            answer = object && object->map ? (long long)object->map_offset : 0;
+            break;
+        case 0x9120u:
+            answer = object && object->map ? (long long)object->map_length : 0;
+            break;
+        default:
+            /* READ_ONLY, WRITE_ONLY, READ_WRITE. An unmapped buffer reports
+               the GL default, READ_WRITE. */
+            answer = !access                        ? 0x88BA
+                     : (access & 3u) == 1u          ? 0x88B8
+                     : (access & 3u) == 2u          ? 0x88B9
+                                                    : 0x88BA;
+            break;
+        }
+        if (params) *params = (int)answer;
         return;
+    }
+    default: break;
     }
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1221, 2, 0);
@@ -1224,6 +1297,46 @@ void glGetMultisamplefv(unsigned pname, unsigned index, float *val) {
     if (val && source && bytes == 2u * sizeof(*val)) memcpy(val, source, bytes);
 }
 void glGetNamedBufferParameteri64v(unsigned buffer, unsigned pname, long long *params) {
+    switch (pname) {
+    case 0x8220u:   /* GL_BUFFER_STORAGE_FLAGS */
+    case 0x88BCu:   /* GL_BUFFER_MAPPED */
+    case 0x911Fu:   /* GL_BUFFER_ACCESS_FLAGS */
+    case 0x9121u:   /* GL_BUFFER_MAP_OFFSET */
+    case 0x9120u:   /* GL_BUFFER_MAP_LENGTH */
+    case 0x88BBu: { /* GL_BUFFER_ACCESS */
+        /* Not forwarded. The storage flags the host holds have an extra bit
+           so a mapping can be written back at all, and the host does not know
+           about the mapping itself; both are recorded on this side. */
+        struct buffer_object_state *object = buffer_object(buffer, 0);
+        long long answer = 0;
+        const unsigned access = object && object->map ? object->map_access : 0u;
+        switch (pname) {
+        case 0x8220u:
+            answer = object && object->has_storage_flags
+                         ? (long long)object->storage_flags : 0;
+            break;
+        case 0x88BCu: answer = object && object->map ? 1 : 0; break;
+        case 0x911Fu: answer = (long long)access; break;
+        case 0x9121u:
+            answer = object && object->map ? (long long)object->map_offset : 0;
+            break;
+        case 0x9120u:
+            answer = object && object->map ? (long long)object->map_length : 0;
+            break;
+        default:
+            /* READ_ONLY, WRITE_ONLY, READ_WRITE. An unmapped buffer reports
+               the GL default, READ_WRITE. */
+            answer = !access                        ? 0x88BA
+                     : (access & 3u) == 1u          ? 0x88B8
+                     : (access & 3u) == 2u          ? 0x88B9
+                                                    : 0x88BA;
+            break;
+        }
+        if (params) *params = (long long)answer;
+        return;
+    }
+    default: break;
+    }
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1245, 2, 0);
     if (!packet) return;
@@ -1236,6 +1349,46 @@ void glGetNamedBufferParameteri64v(unsigned buffer, unsigned pname, long long *p
         memcpy(params, source, expected);
 }
 void glGetNamedBufferParameteriv(unsigned buffer, unsigned pname, int *params) {
+    switch (pname) {
+    case 0x8220u:   /* GL_BUFFER_STORAGE_FLAGS */
+    case 0x88BCu:   /* GL_BUFFER_MAPPED */
+    case 0x911Fu:   /* GL_BUFFER_ACCESS_FLAGS */
+    case 0x9121u:   /* GL_BUFFER_MAP_OFFSET */
+    case 0x9120u:   /* GL_BUFFER_MAP_LENGTH */
+    case 0x88BBu: { /* GL_BUFFER_ACCESS */
+        /* Not forwarded. The storage flags the host holds have an extra bit
+           so a mapping can be written back at all, and the host does not know
+           about the mapping itself; both are recorded on this side. */
+        struct buffer_object_state *object = buffer_object(buffer, 0);
+        long long answer = 0;
+        const unsigned access = object && object->map ? object->map_access : 0u;
+        switch (pname) {
+        case 0x8220u:
+            answer = object && object->has_storage_flags
+                         ? (long long)object->storage_flags : 0;
+            break;
+        case 0x88BCu: answer = object && object->map ? 1 : 0; break;
+        case 0x911Fu: answer = (long long)access; break;
+        case 0x9121u:
+            answer = object && object->map ? (long long)object->map_offset : 0;
+            break;
+        case 0x9120u:
+            answer = object && object->map ? (long long)object->map_length : 0;
+            break;
+        default:
+            /* READ_ONLY, WRITE_ONLY, READ_WRITE. An unmapped buffer reports
+               the GL default, READ_WRITE. */
+            answer = !access                        ? 0x88BA
+                     : (access & 3u) == 1u          ? 0x88B8
+                     : (access & 3u) == 2u          ? 0x88B9
+                                                    : 0x88BA;
+            break;
+        }
+        if (params) *params = (int)answer;
+        return;
+    }
+    default: break;
+    }
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1246, 2, 0);
     if (!packet) return;
@@ -1439,8 +1592,11 @@ void glGetQueryObjecti64v(unsigned id, unsigned pname, long long *params) {
             glBindBuffer(0x9192u, 0);
             glGetQueryObjecti64v(id, pname, &value);
             glBindBuffer(0x9192u, query_buffer);
-            glBufferSubData(0x9192u, (long)(size_t)params,
-                            (long)sizeof(value), &value);
+            /* Driver traffic, not the application's: GL fills a query
+               buffer through the query mechanism, where neither
+               GL_DYNAMIC_STORAGE_BIT nor a live mapping gates the write. */
+            buffer_sub_data_raw(0x9192u, (long)(size_t)params,
+                                (long)sizeof(value), &value);
             return;
         }
     }
@@ -1463,8 +1619,11 @@ void glGetQueryObjectiv(unsigned id, unsigned pname, int *params) {
             glBindBuffer(0x9192u, 0);
             glGetQueryObjectiv(id, pname, &value);
             glBindBuffer(0x9192u, query_buffer);
-            glBufferSubData(0x9192u, (long)(size_t)params,
-                            (long)sizeof(value), &value);
+            /* Driver traffic, not the application's: GL fills a query
+               buffer through the query mechanism, where neither
+               GL_DYNAMIC_STORAGE_BIT nor a live mapping gates the write. */
+            buffer_sub_data_raw(0x9192u, (long)(size_t)params,
+                                (long)sizeof(value), &value);
             return;
         }
     }
@@ -1487,8 +1646,11 @@ void glGetQueryObjectui64v(unsigned id, unsigned pname, unsigned long long *para
             glBindBuffer(0x9192u, 0);
             glGetQueryObjectui64v(id, pname, &value);
             glBindBuffer(0x9192u, query_buffer);
-            glBufferSubData(0x9192u, (long)(size_t)params,
-                            (long)sizeof(value), &value);
+            /* Driver traffic, not the application's: GL fills a query
+               buffer through the query mechanism, where neither
+               GL_DYNAMIC_STORAGE_BIT nor a live mapping gates the write. */
+            buffer_sub_data_raw(0x9192u, (long)(size_t)params,
+                                (long)sizeof(value), &value);
             return;
         }
     }
@@ -1511,8 +1673,11 @@ void glGetQueryObjectuiv(unsigned id, unsigned pname, unsigned *params) {
             glBindBuffer(0x9192u, 0);
             glGetQueryObjectuiv(id, pname, &value);
             glBindBuffer(0x9192u, query_buffer);
-            glBufferSubData(0x9192u, (long)(size_t)params,
-                            (long)sizeof(value), &value);
+            /* Driver traffic, not the application's: GL fills a query
+               buffer through the query mechanism, where neither
+               GL_DYNAMIC_STORAGE_BIT nor a live mapping gates the write. */
+            buffer_sub_data_raw(0x9192u, (long)(size_t)params,
+                                (long)sizeof(value), &value);
             return;
         }
     }
@@ -2208,12 +2373,14 @@ void glMemoryBarrier(unsigned barriers) {
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(barriers);
+    gexgl_client_mapped_barrier(barriers);
 }
 void glMemoryBarrierByRegion(unsigned barriers) {
     uint32_t *packet = begin(1365, 1, 0);
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(barriers);
+    gexgl_client_mapped_barrier(barriers);
 }
 void glMinSampleShading(float value) {
     uint32_t *packet = begin(1366, 1, 0);
