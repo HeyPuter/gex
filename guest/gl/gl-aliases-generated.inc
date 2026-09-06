@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 474 of them whose target this
+ * claimed -- so here are the 475 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -61,6 +61,7 @@ extern __typeof(glClearTexImage) glClearTexImageEXT __attribute__((alias("glClea
 extern __typeof(glClearTexSubImage) glClearTexSubImageEXT __attribute__((alias("glClearTexSubImage")));
 extern __typeof(glClientActiveTexture) glClientActiveTextureARB __attribute__((alias("glClientActiveTexture")));
 extern __typeof(glClientWaitSync) glClientWaitSyncAPPLE __attribute__((alias("glClientWaitSync")));
+extern __typeof(glClipControl) glClipControlEXT __attribute__((alias("glClipControl")));
 extern __typeof(glColorMaski) glColorMaskIndexedEXT __attribute__((alias("glColorMaski")));
 extern __typeof(glColorMaski) glColorMaskiEXT __attribute__((alias("glColorMaski")));
 extern __typeof(glColorMaski) glColorMaskiOES __attribute__((alias("glColorMaski")));

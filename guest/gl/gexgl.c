@@ -484,6 +484,25 @@ void glGenBuffers(int n, unsigned *out) {
     }
 }
 
+/* The same, for GL 4.5's glCreate* family, whose texture and query forms take
+   a target ahead of the count. Names are still chosen here and simply told to
+   the host, so there is no reply to wait for. */
+static void gen_named_objects_target(unsigned opcode, unsigned target, int n,
+                                     unsigned *out) {
+    if (n < 0) {
+        CMD2(opcode, target, n);
+        return;
+    }
+    uint32_t *p = begin(opcode, 2 + (size_t)n, 0);
+    if (!p) return;
+    p[0] = target;
+    p[1] = (uint32_t)n;
+    for (int i = 0; i < n; ++i) {
+        out[i] = take_name();
+        p[2 + i] = out[i];
+    }
+}
+
 static void gen_named_objects(unsigned opcode, int n, unsigned *out) {
     if (n < 0) {
         /* Let the host implementation record GL_INVALID_VALUE. */

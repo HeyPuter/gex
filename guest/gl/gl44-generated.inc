@@ -133,6 +133,13 @@ void glBindSamplers(unsigned first, int count, const unsigned *samplers) {
     if (!a) return;
     a[0] = first; a[1] = (uint32_t)count; put_blob(a + 2, samplers, blob_len);
 }
+void glBindTextureUnit(unsigned unit, unsigned texture) {
+    uint32_t *packet = begin(1047, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(unit);
+    packet[at++] = (uint32_t)(texture);
+}
 void glBindTextures(unsigned first, int count, const unsigned *names) {
     if (count < 0 || (size_t)count > UINT32_MAX / sizeof(*names)) return;
     size_t blob_len = names ? (size_t)count * sizeof(*names) : 0;
@@ -206,6 +213,23 @@ void glBlendFunci(unsigned buf, unsigned src, unsigned dst) {
     packet[at++] = (uint32_t)(src);
     packet[at++] = (uint32_t)(dst);
 }
+void glBlitNamedFramebuffer(unsigned readFramebuffer, unsigned drawFramebuffer, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0, int dstX1, int dstY1, unsigned mask, unsigned filter) {
+    uint32_t *packet = begin(1063, 12, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(readFramebuffer);
+    packet[at++] = (uint32_t)(drawFramebuffer);
+    packet[at++] = (uint32_t)(srcX0);
+    packet[at++] = (uint32_t)(srcY0);
+    packet[at++] = (uint32_t)(srcX1);
+    packet[at++] = (uint32_t)(srcY1);
+    packet[at++] = (uint32_t)(dstX0);
+    packet[at++] = (uint32_t)(dstY0);
+    packet[at++] = (uint32_t)(dstX1);
+    packet[at++] = (uint32_t)(dstY1);
+    packet[at++] = (uint32_t)(mask);
+    packet[at++] = (uint32_t)(filter);
+}
 void glBufferStorage(unsigned target, long size, const void *data, unsigned flags) {
     if (size < 0) return;
     size_t blob_len = data ? (size_t)size : 0;
@@ -268,6 +292,16 @@ void glClearDepth(double depth) {
     packet[at++] = (uint32_t)bits_depth;
     packet[at++] = (uint32_t)(bits_depth >> 32);
 }
+void glClearNamedFramebufferfi(unsigned framebuffer, unsigned buffer, int drawbuffer, float depth, int stencil) {
+    uint32_t *packet = begin(1082, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
+    packet[at++] = (uint32_t)(buffer);
+    packet[at++] = (uint32_t)(drawbuffer);
+    packet[at++] = as_bits(depth);
+    packet[at++] = (uint32_t)(stencil);
+}
 void glClearTexImage(unsigned texture, int level, unsigned format, unsigned type, const void *data) {
     size_t value_bytes = gexgl_pixel_group_bytes(format, type);
     size_t blob_len = data ? value_bytes : 0;
@@ -295,6 +329,13 @@ void glClearTexSubImage(unsigned texture, int level, int xoffset, int yoffset, i
     a[8] = (uint32_t)(format);
     a[9] = (uint32_t)(type);
     put_blob(a + 10, data, blob_len);
+}
+void glClipControl(unsigned origin, unsigned depth) {
+    uint32_t *packet = begin(1090, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(origin);
+    packet[at++] = (uint32_t)(depth);
 }
 void glColorMaski(unsigned index, unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
     uint32_t *packet = begin(1092, 5, 0);
@@ -462,6 +503,25 @@ void glCopyImageSubData(unsigned srcName, unsigned srcTarget, int srcLevel, int 
     packet[at++] = (uint32_t)(srcHeight);
     packet[at++] = (uint32_t)(srcDepth);
 }
+void glCopyNamedBufferSubData(unsigned readBuffer, unsigned writeBuffer, long readOffset, long writeOffset, long size) {
+    uint32_t *packet = begin(1105, 8, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(readBuffer);
+    packet[at++] = (uint32_t)(writeBuffer);
+    uint64_t bits_readOffset;
+    bits_readOffset = (uint64_t)(readOffset);
+    packet[at++] = (uint32_t)bits_readOffset;
+    packet[at++] = (uint32_t)(bits_readOffset >> 32);
+    uint64_t bits_writeOffset;
+    bits_writeOffset = (uint64_t)(writeOffset);
+    packet[at++] = (uint32_t)bits_writeOffset;
+    packet[at++] = (uint32_t)(bits_writeOffset >> 32);
+    uint64_t bits_size;
+    bits_size = (uint64_t)(size);
+    packet[at++] = (uint32_t)bits_size;
+    packet[at++] = (uint32_t)(bits_size >> 32);
+}
 void glCopyTexImage1D(unsigned target, int level, unsigned internalformat, int x, int y, int width, int border) {
     uint32_t *packet = begin(1106, 7, 0);
     if (!packet) return;
@@ -525,6 +585,71 @@ void glCopyTexSubImage3D(unsigned target, int level, int xoffset, int yoffset, i
     packet[at++] = (uint32_t)(width);
     packet[at++] = (uint32_t)(height);
 }
+void glCopyTextureSubImage1D(unsigned texture, int level, int xoffset, int x, int y, int width) {
+    uint32_t *packet = begin(1111, 6, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(level);
+    packet[at++] = (uint32_t)(xoffset);
+    packet[at++] = (uint32_t)(x);
+    packet[at++] = (uint32_t)(y);
+    packet[at++] = (uint32_t)(width);
+}
+void glCopyTextureSubImage2D(unsigned texture, int level, int xoffset, int yoffset, int x, int y, int width, int height) {
+    uint32_t *packet = begin(1112, 8, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(level);
+    packet[at++] = (uint32_t)(xoffset);
+    packet[at++] = (uint32_t)(yoffset);
+    packet[at++] = (uint32_t)(x);
+    packet[at++] = (uint32_t)(y);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(height);
+}
+void glCopyTextureSubImage3D(unsigned texture, int level, int xoffset, int yoffset, int zoffset, int x, int y, int width, int height) {
+    uint32_t *packet = begin(1113, 9, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(level);
+    packet[at++] = (uint32_t)(xoffset);
+    packet[at++] = (uint32_t)(yoffset);
+    packet[at++] = (uint32_t)(zoffset);
+    packet[at++] = (uint32_t)(x);
+    packet[at++] = (uint32_t)(y);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(height);
+}
+void glCreateBuffers(int n, unsigned *names) {
+    gen_named_objects(1114, n, names);
+}
+void glCreateFramebuffers(int n, unsigned *names) {
+    gen_named_objects(1115, n, names);
+}
+void glCreateProgramPipelines(int n, unsigned *names) {
+    gen_named_objects(1117, n, names);
+}
+void glCreateQueries(unsigned target, int n, unsigned *names) {
+    gen_named_objects_target(1118, target, n, names);
+}
+void glCreateRenderbuffers(int n, unsigned *names) {
+    gen_named_objects(1119, n, names);
+}
+void glCreateSamplers(int n, unsigned *names) {
+    gen_named_objects(1120, n, names);
+}
+void glCreateTextures(unsigned target, int n, unsigned *names) {
+    gen_named_objects_target(1123, target, n, names);
+}
+void glCreateTransformFeedbacks(int n, unsigned *names) {
+    gen_named_objects(1124, n, names);
+}
+void glCreateVertexArrays(int n, unsigned *names) {
+    gen_named_objects(1125, n, names);
+}
 void glDeleteProgramPipelines(int n, const unsigned *pipelines) {
     delete_named_objects(1133, n, pipelines);
 }
@@ -566,6 +691,13 @@ void glDepthRangeIndexed(unsigned index, double n, double f) {
     memcpy(&bits_f, &f, sizeof(bits_f));
     packet[at++] = (uint32_t)bits_f;
     packet[at++] = (uint32_t)(bits_f >> 32);
+}
+void glDisableVertexArrayAttrib(unsigned vaobj, unsigned index) {
+    uint32_t *packet = begin(1150, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(index);
 }
 void glDisablei(unsigned target, unsigned index) {
     uint32_t *packet = begin(1152, 2, 0);
@@ -667,6 +799,13 @@ void glDrawTransformFeedbackStreamInstanced(unsigned mode, unsigned id, unsigned
     packet[at++] = (uint32_t)(stream);
     packet[at++] = (uint32_t)(instancecount);
 }
+void glEnableVertexArrayAttrib(unsigned vaobj, unsigned index) {
+    uint32_t *packet = begin(1175, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(index);
+}
 void glEnablei(unsigned target, unsigned index) {
     uint32_t *packet = begin(1177, 2, 0);
     if (!packet) return;
@@ -694,6 +833,20 @@ void glEndQueryIndexed(unsigned target, unsigned index) {
 void glEndTransformFeedback(void) {
     uint32_t *packet = begin(1181, 0, 0);
     if (!packet) return;
+}
+void glFlushMappedNamedBufferRange(unsigned buffer, long offset, long length) {
+    uint32_t *packet = begin(1186, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(buffer);
+    uint64_t bits_offset;
+    bits_offset = (uint64_t)(offset);
+    packet[at++] = (uint32_t)bits_offset;
+    packet[at++] = (uint32_t)(bits_offset >> 32);
+    uint64_t bits_length;
+    bits_length = (uint64_t)(length);
+    packet[at++] = (uint32_t)bits_length;
+    packet[at++] = (uint32_t)(bits_length >> 32);
 }
 void glFramebufferParameteri(unsigned target, unsigned pname, int param) {
     uint32_t *packet = begin(1187, 3, 0);
@@ -735,6 +888,12 @@ void glFramebufferTexture3D(unsigned target, unsigned attachment, unsigned texta
 }
 void glGenProgramPipelines(int n, unsigned *pipelines) {
     gen_named_objects(1197, n, pipelines);
+}
+void glGenerateTextureMipmap(unsigned texture) {
+    uint32_t *packet = begin(1205, 1, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
 }
 void glGetActiveAtomicCounterBufferiv(unsigned program, unsigned bufferIndex, unsigned pname, int *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
@@ -973,6 +1132,67 @@ void glGetMultisamplefv(unsigned pname, unsigned index, float *val) {
     a[0] = pname; a[1] = index; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     if (val && source && bytes == 2u * sizeof(*val)) memcpy(val, source, bytes);
+}
+void glGetNamedBufferParameteri64v(unsigned buffer, unsigned pname, long long *params) {
+    const size_t expected = (size_t)1u * sizeof(*params);
+    uint32_t *packet = begin(1245, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(buffer);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (params && source && reply_len == expected)
+        memcpy(params, source, expected);
+}
+void glGetNamedBufferParameteriv(unsigned buffer, unsigned pname, int *params) {
+    const size_t expected = (size_t)1u * sizeof(*params);
+    uint32_t *packet = begin(1246, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(buffer);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (params && source && reply_len == expected)
+        memcpy(params, source, expected);
+}
+void glGetNamedFramebufferAttachmentParameteriv(unsigned framebuffer, unsigned attachment, unsigned pname, int *params) {
+    const size_t expected = (size_t)1u * sizeof(*params);
+    uint32_t *packet = begin(1249, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
+    packet[at++] = (uint32_t)(attachment);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (params && source && reply_len == expected)
+        memcpy(params, source, expected);
+}
+void glGetNamedFramebufferParameteriv(unsigned framebuffer, unsigned pname, int *param) {
+    const size_t expected = (size_t)1u * sizeof(*param);
+    uint32_t *packet = begin(1250, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (param && source && reply_len == expected)
+        memcpy(param, source, expected);
+}
+void glGetNamedRenderbufferParameteriv(unsigned renderbuffer, unsigned pname, int *params) {
+    const size_t expected = (size_t)1u * sizeof(*params);
+    uint32_t *packet = begin(1251, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(renderbuffer);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (params && source && reply_len == expected)
+        memcpy(params, source, expected);
 }
 void glGetProgramInterfaceiv(unsigned program, unsigned programInterface, unsigned pname, int *params) {
     uint32_t *a = begin(1257, 3, 0);
@@ -1370,6 +1590,92 @@ void glGetTexParameteriv(unsigned target, unsigned pname, int *params) {
     if (params && source && reply_len == expected)
         memcpy(params, source, expected);
 }
+void glGetTextureLevelParameterfv(unsigned texture, int level, unsigned pname, float *params) {
+    const size_t expected = (size_t)1u * sizeof(*params);
+    uint32_t *packet = begin(1299, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(level);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (params && source && reply_len == expected)
+        memcpy(params, source, expected);
+}
+void glGetTextureLevelParameteriv(unsigned texture, int level, unsigned pname, int *params) {
+    const size_t expected = (size_t)1u * sizeof(*params);
+    uint32_t *packet = begin(1300, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(level);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (params && source && reply_len == expected)
+        memcpy(params, source, expected);
+}
+void glGetTextureParameterIiv(unsigned texture, unsigned pname, int *params) {
+    const size_t expected = (size_t)1u * sizeof(*params);
+    uint32_t *packet = begin(1301, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (params && source && reply_len == expected)
+        memcpy(params, source, expected);
+}
+void glGetTextureParameterIuiv(unsigned texture, unsigned pname, unsigned *params) {
+    const size_t expected = (size_t)1u * sizeof(*params);
+    uint32_t *packet = begin(1302, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (params && source && reply_len == expected)
+        memcpy(params, source, expected);
+}
+void glGetTextureParameterfv(unsigned texture, unsigned pname, float *params) {
+    const size_t expected = (size_t)1u * sizeof(*params);
+    uint32_t *packet = begin(1303, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (params && source && reply_len == expected)
+        memcpy(params, source, expected);
+}
+void glGetTextureParameteriv(unsigned texture, unsigned pname, int *params) {
+    const size_t expected = (size_t)1u * sizeof(*params);
+    uint32_t *packet = begin(1304, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (params && source && reply_len == expected)
+        memcpy(params, source, expected);
+}
+void glGetTransformFeedbackiv(unsigned xfb, unsigned pname, int *param) {
+    const size_t expected = (size_t)1u * sizeof(*param);
+    uint32_t *packet = begin(1309, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(xfb);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (param && source && reply_len == expected)
+        memcpy(param, source, expected);
+}
 void glGetUniformSubroutineuiv(unsigned shadertype, int location, unsigned *params) {
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1313, 2, 0);
@@ -1395,6 +1701,18 @@ void glGetUniformuiv(unsigned program, int location, unsigned *params) {
     a[0] = program; a[1] = (uint32_t)location; flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     if (params && source && bytes <= 16u * sizeof(*params)) memcpy(params, source, bytes);
+}
+void glGetVertexArrayiv(unsigned vaobj, unsigned pname, int *param) {
+    const size_t expected = (size_t)1u * sizeof(*param);
+    uint32_t *packet = begin(1320, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(pname);
+    flush();
+    uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
+    if (param && source && reply_len == expected)
+        memcpy(param, source, expected);
 }
 void glGetVertexAttribIiv(unsigned index, unsigned pname, int *params) {
     const size_t expected = (size_t)((pname) == 0x8626u ? 4u : 1u) * sizeof(*params);
@@ -1621,6 +1939,12 @@ void glMemoryBarrier(unsigned barriers) {
     size_t at = 0;
     packet[at++] = (uint32_t)(barriers);
 }
+void glMemoryBarrierByRegion(unsigned barriers) {
+    uint32_t *packet = begin(1365, 1, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(barriers);
+}
 void glMinSampleShading(float value) {
     uint32_t *packet = begin(1366, 1, 0);
     if (!packet) return;
@@ -1698,6 +2022,75 @@ void glMultiDrawElementsIndirect(unsigned mode, unsigned type, const void *indir
     uint64_t bits_indirect = (uint64_t)(uintptr_t)indirect;
     packet[at++] = (uint32_t)bits_indirect;
     packet[at++] = (uint32_t)(bits_indirect >> 32);
+}
+void glNamedFramebufferDrawBuffer(unsigned framebuffer, unsigned buf) {
+    uint32_t *packet = begin(1375, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
+    packet[at++] = (uint32_t)(buf);
+}
+void glNamedFramebufferParameteri(unsigned framebuffer, unsigned pname, int param) {
+    uint32_t *packet = begin(1377, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
+    packet[at++] = (uint32_t)(pname);
+    packet[at++] = (uint32_t)(param);
+}
+void glNamedFramebufferReadBuffer(unsigned framebuffer, unsigned src) {
+    uint32_t *packet = begin(1378, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
+    packet[at++] = (uint32_t)(src);
+}
+void glNamedFramebufferRenderbuffer(unsigned framebuffer, unsigned attachment, unsigned renderbuffertarget, unsigned renderbuffer) {
+    uint32_t *packet = begin(1379, 4, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
+    packet[at++] = (uint32_t)(attachment);
+    packet[at++] = (uint32_t)(renderbuffertarget);
+    packet[at++] = (uint32_t)(renderbuffer);
+}
+void glNamedFramebufferTexture(unsigned framebuffer, unsigned attachment, unsigned texture, int level) {
+    uint32_t *packet = begin(1380, 4, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
+    packet[at++] = (uint32_t)(attachment);
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(level);
+}
+void glNamedFramebufferTextureLayer(unsigned framebuffer, unsigned attachment, unsigned texture, int level, int layer) {
+    uint32_t *packet = begin(1381, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(framebuffer);
+    packet[at++] = (uint32_t)(attachment);
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(level);
+    packet[at++] = (uint32_t)(layer);
+}
+void glNamedRenderbufferStorage(unsigned renderbuffer, unsigned internalformat, int width, int height) {
+    uint32_t *packet = begin(1382, 4, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(renderbuffer);
+    packet[at++] = (uint32_t)(internalformat);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(height);
+}
+void glNamedRenderbufferStorageMultisample(unsigned renderbuffer, int samples, unsigned internalformat, int width, int height) {
+    uint32_t *packet = begin(1383, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(renderbuffer);
+    packet[at++] = (uint32_t)(samples);
+    packet[at++] = (uint32_t)(internalformat);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(height);
 }
 void glPatchParameterfv(unsigned pname, const float *values) {
     size_t count = pname == 0x8e73u ? 2u : pname == 0x8e74u ? 4u : 0u;
@@ -2665,6 +3058,99 @@ void glTextureBarrier(void) {
     uint32_t *packet = begin(1504, 0, 0);
     if (!packet) return;
 }
+void glTextureBuffer(unsigned texture, unsigned internalformat, unsigned buffer) {
+    uint32_t *packet = begin(1505, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(internalformat);
+    packet[at++] = (uint32_t)(buffer);
+}
+void glTextureBufferRange(unsigned texture, unsigned internalformat, unsigned buffer, long offset, long size) {
+    uint32_t *packet = begin(1506, 7, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(internalformat);
+    packet[at++] = (uint32_t)(buffer);
+    uint64_t bits_offset;
+    bits_offset = (uint64_t)(offset);
+    packet[at++] = (uint32_t)bits_offset;
+    packet[at++] = (uint32_t)(bits_offset >> 32);
+    uint64_t bits_size;
+    bits_size = (uint64_t)(size);
+    packet[at++] = (uint32_t)bits_size;
+    packet[at++] = (uint32_t)(bits_size >> 32);
+}
+void glTextureParameterf(unsigned texture, unsigned pname, float param) {
+    uint32_t *packet = begin(1509, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(pname);
+    packet[at++] = as_bits(param);
+}
+void glTextureParameteri(unsigned texture, unsigned pname, int param) {
+    uint32_t *packet = begin(1511, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(pname);
+    packet[at++] = (uint32_t)(param);
+}
+void glTextureStorage1D(unsigned texture, int levels, unsigned internalformat, int width) {
+    uint32_t *packet = begin(1513, 4, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(levels);
+    packet[at++] = (uint32_t)(internalformat);
+    packet[at++] = (uint32_t)(width);
+}
+void glTextureStorage2D(unsigned texture, int levels, unsigned internalformat, int width, int height) {
+    uint32_t *packet = begin(1514, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(levels);
+    packet[at++] = (uint32_t)(internalformat);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(height);
+}
+void glTextureStorage2DMultisample(unsigned texture, int samples, unsigned internalformat, int width, int height, unsigned char fixedsamplelocations) {
+    uint32_t *packet = begin(1515, 6, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(samples);
+    packet[at++] = (uint32_t)(internalformat);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(height);
+    packet[at++] = (uint32_t)(fixedsamplelocations);
+}
+void glTextureStorage3D(unsigned texture, int levels, unsigned internalformat, int width, int height, int depth) {
+    uint32_t *packet = begin(1516, 6, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(levels);
+    packet[at++] = (uint32_t)(internalformat);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(height);
+    packet[at++] = (uint32_t)(depth);
+}
+void glTextureStorage3DMultisample(unsigned texture, int samples, unsigned internalformat, int width, int height, int depth, unsigned char fixedsamplelocations) {
+    uint32_t *packet = begin(1517, 7, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(texture);
+    packet[at++] = (uint32_t)(samples);
+    packet[at++] = (uint32_t)(internalformat);
+    packet[at++] = (uint32_t)(width);
+    packet[at++] = (uint32_t)(height);
+    packet[at++] = (uint32_t)(depth);
+    packet[at++] = (uint32_t)(fixedsamplelocations);
+}
 void glTextureView(unsigned texture, unsigned target, unsigned origtexture, unsigned internalformat, unsigned minlevel, unsigned numlevels, unsigned minlayer, unsigned numlayers) {
     uint32_t *packet = begin(1521, 8, 0);
     if (!packet) return;
@@ -2677,6 +3163,30 @@ void glTextureView(unsigned texture, unsigned target, unsigned origtexture, unsi
     packet[at++] = (uint32_t)(numlevels);
     packet[at++] = (uint32_t)(minlayer);
     packet[at++] = (uint32_t)(numlayers);
+}
+void glTransformFeedbackBufferBase(unsigned xfb, unsigned index, unsigned buffer) {
+    uint32_t *packet = begin(1522, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(xfb);
+    packet[at++] = (uint32_t)(index);
+    packet[at++] = (uint32_t)(buffer);
+}
+void glTransformFeedbackBufferRange(unsigned xfb, unsigned index, unsigned buffer, long offset, long size) {
+    uint32_t *packet = begin(1523, 7, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(xfb);
+    packet[at++] = (uint32_t)(index);
+    packet[at++] = (uint32_t)(buffer);
+    uint64_t bits_offset;
+    bits_offset = (uint64_t)(offset);
+    packet[at++] = (uint32_t)bits_offset;
+    packet[at++] = (uint32_t)(bits_offset >> 32);
+    uint64_t bits_size;
+    bits_size = (uint64_t)(size);
+    packet[at++] = (uint32_t)bits_size;
+    packet[at++] = (uint32_t)(bits_size >> 32);
 }
 void glTransformFeedbackVaryings(unsigned program, int count, const char *const *varyings,
                                  unsigned bufferMode) {
@@ -3119,6 +3629,73 @@ void glValidateProgramPipeline(unsigned pipeline) {
     if (!packet) return;
     size_t at = 0;
     packet[at++] = (uint32_t)(pipeline);
+}
+void glVertexArrayAttribBinding(unsigned vaobj, unsigned attribindex, unsigned bindingindex) {
+    uint32_t *packet = begin(1583, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(attribindex);
+    packet[at++] = (uint32_t)(bindingindex);
+}
+void glVertexArrayAttribFormat(unsigned vaobj, unsigned attribindex, int size, unsigned type, unsigned char normalized, unsigned relativeoffset) {
+    uint32_t *packet = begin(1584, 6, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(attribindex);
+    packet[at++] = (uint32_t)(size);
+    packet[at++] = (uint32_t)(type);
+    packet[at++] = (uint32_t)(normalized);
+    packet[at++] = (uint32_t)(relativeoffset);
+}
+void glVertexArrayAttribIFormat(unsigned vaobj, unsigned attribindex, int size, unsigned type, unsigned relativeoffset) {
+    uint32_t *packet = begin(1585, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(attribindex);
+    packet[at++] = (uint32_t)(size);
+    packet[at++] = (uint32_t)(type);
+    packet[at++] = (uint32_t)(relativeoffset);
+}
+void glVertexArrayAttribLFormat(unsigned vaobj, unsigned attribindex, int size, unsigned type, unsigned relativeoffset) {
+    uint32_t *packet = begin(1586, 5, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(attribindex);
+    packet[at++] = (uint32_t)(size);
+    packet[at++] = (uint32_t)(type);
+    packet[at++] = (uint32_t)(relativeoffset);
+}
+void glVertexArrayBindingDivisor(unsigned vaobj, unsigned bindingindex, unsigned divisor) {
+    uint32_t *packet = begin(1587, 3, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(bindingindex);
+    packet[at++] = (uint32_t)(divisor);
+}
+void glVertexArrayElementBuffer(unsigned vaobj, unsigned buffer) {
+    uint32_t *packet = begin(1588, 2, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(buffer);
+}
+void glVertexArrayVertexBuffer(unsigned vaobj, unsigned bindingindex, unsigned buffer, long offset, int stride) {
+    uint32_t *packet = begin(1589, 6, 0);
+    if (!packet) return;
+    size_t at = 0;
+    packet[at++] = (uint32_t)(vaobj);
+    packet[at++] = (uint32_t)(bindingindex);
+    packet[at++] = (uint32_t)(buffer);
+    uint64_t bits_offset;
+    bits_offset = (uint64_t)(offset);
+    packet[at++] = (uint32_t)bits_offset;
+    packet[at++] = (uint32_t)(bits_offset >> 32);
+    packet[at++] = (uint32_t)(stride);
 }
 void glVertexAttrib1d(unsigned index, double x) {
     uint32_t *packet = begin(1591, 3, 0);

@@ -91,6 +91,28 @@ RETURN_COMMANDS = {
 }
 
 PROGRAM_PIPELINE_GENERATORS = {"glGenProgramPipelines"}
+
+# GL 4.5's glCreate* family, and the reason the DSA block below is usable at
+# all. A direct-state-access object has to be *created*, not merely named:
+# glGenTextures reserves a number and leaves it uninitialised, so
+# glTextureStorage2D on it is an error until something binds it -- which is
+# precisely the bind DSA exists to avoid. Without these, every one of the
+# commands in DIRECT_STATE_ACCESS_COMMANDS is present and unreachable.
+#
+# Same shape as glGenProgramPipelines: the guest picks the names and tells the
+# host, so nothing waits for a reply. The value is the host map to record the
+# mapping in, and whether the call takes a target ahead of the count.
+NAME_GENERATORS = {
+    "glCreateBuffers": ("buffers", False),
+    "glCreateFramebuffers": ("framebuffers", False),
+    "glCreateProgramPipelines": ("program_pipelines", False),
+    "glCreateQueries": ("queries", True),
+    "glCreateRenderbuffers": ("renderbuffers", False),
+    "glCreateSamplers": ("samplers", False),
+    "glCreateTextures": ("textures", True),
+    "glCreateTransformFeedbacks": ("transform_feedbacks", False),
+    "glCreateVertexArrays": ("vertex_arrays", False),
+}
 PROGRAM_PIPELINE_DELETERS = {"glDeleteProgramPipelines"}
 
 # Program reflection is synchronous and has mixed string/array input and
@@ -355,6 +377,153 @@ OBJECT_COMMANDS.update({
     if name.startswith("glProgramUniform")
 })
 OBJECT_COMMANDS["glShaderStorageBlockBinding"] = {"program": "programs"}
+
+# --------------------------------------------------------- direct state access
+#
+# GL 4.5 core, and the guest had none of it while the driver reported 4.6.
+# An engine does not test for DSA, it tests the *version* -- that is what a
+# version is for -- so it took the 4.5 path, found NULL from eglGetProcAddress
+# and stopped. gen_gl_extensions.py withheld GL_ARB_direct_state_access for
+# the same reason, and no native gate could see any of it: the native path
+# reaches the driver through the system libGL, never through this marshaller.
+#
+# These are the ones that are pure void plus scalars and object names. The
+# rest of DSA needs machinery that does not exist here yet and is deliberately
+# left out rather than half-done:
+#   glMapNamedBuffer, glMapNamedBufferRange, glUnmapNamedBuffer  -- the guest's
+#     buffer mapping is hand-written and needs a reply round trip
+#   glCheckNamedFramebufferStatus                                -- returns a
+#     value, so it needs the same round trip
+#   glGetQueryBufferObject*                                      -- writes into
+#     a buffer object rather than to the caller
+#
+# Adding a name here does NOT renumber the ABI. The opcode is the index into
+# the sorted manifest, and gl44_coverage.VERSIONS has spanned 1.0-4.5 since
+# glTextureBarrier needed it, so every one of these already had its slot
+# reserved -- the generator simply was not emitting them.
+DIRECT_STATE_ACCESS_COMMANDS = {
+    "glBindTextureUnit",
+    "glBlitNamedFramebuffer",
+    "glClearNamedFramebufferfi",
+    "glClipControl",
+    "glCopyNamedBufferSubData",
+    "glCopyTextureSubImage1D",
+    "glCopyTextureSubImage2D",
+    "glCopyTextureSubImage3D",
+    "glDisableVertexArrayAttrib",
+    "glEnableVertexArrayAttrib",
+    "glFlushMappedNamedBufferRange",
+    "glGenerateTextureMipmap",
+    "glMemoryBarrierByRegion",
+    "glNamedFramebufferDrawBuffer",
+    "glNamedFramebufferParameteri",
+    "glNamedFramebufferReadBuffer",
+    "glNamedFramebufferRenderbuffer",
+    "glNamedFramebufferTexture",
+    "glNamedFramebufferTextureLayer",
+    "glNamedRenderbufferStorage",
+    "glNamedRenderbufferStorageMultisample",
+    "glTextureBuffer",
+    "glTextureBufferRange",
+    "glTextureParameterf",
+    "glTextureParameteri",
+    "glTextureStorage1D",
+    "glTextureStorage2D",
+    "glTextureStorage2DMultisample",
+    "glTextureStorage3D",
+    "glTextureStorage3DMultisample",
+    "glTransformFeedbackBufferBase",
+    "glTransformFeedbackBufferRange",
+    "glVertexArrayAttribBinding",
+    "glVertexArrayAttribFormat",
+    "glVertexArrayAttribIFormat",
+    "glVertexArrayAttribLFormat",
+    "glVertexArrayBindingDivisor",
+    "glVertexArrayElementBuffer",
+    "glVertexArrayVertexBuffer",
+}
+SCALAR_COMMANDS |= DIRECT_STATE_ACCESS_COMMANDS
+
+# The DSA queries that read a fixed-size result, which are the same shape as
+# their bound-state twins one table up -- glGetTextureLevelParameteriv is
+# glGetTexLevelParameteriv with the texture named instead of bound. Without
+# them a program cannot ask an object it just built how big it is, which is
+# the first thing any loader does after allocating storage.
+RESOURCE_OUTPUT_QUERIES.update({
+    "glGetTextureLevelParameterfv": "one",
+    "glGetTextureLevelParameteriv": "one",
+    "glGetTextureParameterIiv": "one",
+    "glGetTextureParameterIuiv": "one",
+    "glGetTextureParameterfv": "one",
+    "glGetTextureParameteriv": "one",
+    "glGetNamedBufferParameteri64v": "one",
+    "glGetNamedBufferParameteriv": "one",
+    "glGetNamedFramebufferAttachmentParameteriv": "one",
+    "glGetNamedFramebufferParameteriv": "one",
+    "glGetNamedRenderbufferParameteriv": "one",
+    "glGetTransformFeedbackiv": "one",
+    "glGetVertexArrayiv": "one",
+})
+OBJECT_COMMANDS.update({
+    "glGetTextureLevelParameterfv": {"texture": "textures"},
+    "glGetTextureLevelParameteriv": {"texture": "textures"},
+    "glGetTextureParameterIiv": {"texture": "textures"},
+    "glGetTextureParameterIuiv": {"texture": "textures"},
+    "glGetTextureParameterfv": {"texture": "textures"},
+    "glGetTextureParameteriv": {"texture": "textures"},
+    "glGetNamedBufferParameteri64v": {"buffer": "buffers"},
+    "glGetNamedBufferParameteriv": {"buffer": "buffers"},
+    "glGetNamedFramebufferAttachmentParameteriv": {"framebuffer": "framebuffers"},
+    "glGetNamedFramebufferParameteriv": {"framebuffer": "framebuffers"},
+    "glGetNamedRenderbufferParameteriv": {"renderbuffer": "renderbuffers"},
+    "glGetTransformFeedbackiv": {"xfb": "transform_feedbacks"},
+    "glGetVertexArrayiv": {"vaobj": "vertex_arrays"},
+})
+
+# Each object-bearing parameter, resolved through the host map before the call.
+# A DSA command names its object instead of relying on what is bound, so almost
+# every one of them has at least one -- and a guest name used unresolved would
+# address whichever host object happened to hold that number.
+OBJECT_COMMANDS.update({
+    "glBindTextureUnit": {"texture": "textures"},
+    "glBlitNamedFramebuffer": {"drawFramebuffer": "framebuffers", "readFramebuffer": "framebuffers"},
+    "glClearNamedFramebufferfi": {"framebuffer": "framebuffers"},
+    "glCopyNamedBufferSubData": {"readBuffer": "buffers", "writeBuffer": "buffers"},
+    "glCopyTextureSubImage1D": {"texture": "textures"},
+    "glCopyTextureSubImage2D": {"texture": "textures"},
+    "glCopyTextureSubImage3D": {"texture": "textures"},
+    "glDisableVertexArrayAttrib": {"vaobj": "vertex_arrays"},
+    "glEnableVertexArrayAttrib": {"vaobj": "vertex_arrays"},
+    "glFlushMappedNamedBufferRange": {"buffer": "buffers"},
+    "glGenerateTextureMipmap": {"texture": "textures"},
+    "glNamedFramebufferDrawBuffer": {"framebuffer": "framebuffers"},
+    "glNamedFramebufferParameteri": {"framebuffer": "framebuffers"},
+    "glNamedFramebufferReadBuffer": {"framebuffer": "framebuffers"},
+    "glNamedFramebufferRenderbuffer": {"framebuffer": "framebuffers", "renderbuffer": "renderbuffers"},
+    "glNamedFramebufferTexture": {"framebuffer": "framebuffers", "texture": "textures"},
+    "glNamedFramebufferTextureLayer": {"framebuffer": "framebuffers", "texture": "textures"},
+    "glNamedRenderbufferStorage": {"renderbuffer": "renderbuffers"},
+    "glNamedRenderbufferStorageMultisample": {"renderbuffer": "renderbuffers"},
+    "glTextureBuffer": {"buffer": "buffers", "texture": "textures"},
+    "glTextureBufferRange": {"buffer": "buffers", "texture": "textures"},
+    "glTextureParameterf": {"texture": "textures"},
+    "glTextureParameteri": {"texture": "textures"},
+    "glTextureStorage1D": {"texture": "textures"},
+    "glTextureStorage2D": {"texture": "textures"},
+    "glTextureStorage2DMultisample": {"texture": "textures"},
+    "glTextureStorage3D": {"texture": "textures"},
+    "glTextureStorage3DMultisample": {"texture": "textures"},
+    "glTransformFeedbackBufferBase": {"buffer": "buffers", "xfb": "transform_feedbacks"},
+    "glTransformFeedbackBufferRange": {"buffer": "buffers", "xfb": "transform_feedbacks"},
+    "glVertexArrayAttribBinding": {"vaobj": "vertex_arrays"},
+    "glVertexArrayAttribFormat": {"vaobj": "vertex_arrays"},
+    "glVertexArrayAttribIFormat": {"vaobj": "vertex_arrays"},
+    "glVertexArrayAttribLFormat": {"vaobj": "vertex_arrays"},
+    "glVertexArrayBindingDivisor": {"vaobj": "vertex_arrays"},
+    "glVertexArrayElementBuffer": {"buffer": "buffers", "vaobj": "vertex_arrays"},
+    "glVertexArrayVertexBuffer": {"buffer": "buffers", "vaobj": "vertex_arrays"},
+})
+
 OBJECT_COMMANDS.update({
     name: {"sampler": "samplers"}
     for name in RESOURCE_OUTPUT_QUERIES
@@ -424,6 +593,7 @@ def validate(commands: list[dict]) -> list[dict]:
                 INTERNAL_FORMAT_QUERIES | MULTISAMPLE_QUERIES |
                 COMPRESSED_TEXTURE_READBACK_QUERIES | OBJECT_COMMANDS.keys())
     policies |= PROGRAM_PIPELINE_GENERATORS | PROGRAM_PIPELINE_DELETERS
+    policies |= set(NAME_GENERATORS)
     policies |= BUFFER_STORAGE_COMMANDS
     policies |= STRING_INPUT_COMMANDS | STRING_RETURN_COMMANDS.keys()
     policies |= UNIFORM_VALUE_QUERIES.keys()
@@ -450,6 +620,8 @@ def validate(commands: list[dict]) -> list[dict]:
             )
         pointers = [param for param in command["params"] if param["pointer"]]
         if command["name"] in PROGRAM_PIPELINE_GENERATORS | PROGRAM_PIPELINE_DELETERS:
+            continue
+        if command["name"] in NAME_GENERATORS:
             continue
         if command["name"] in BUFFER_STORAGE_COMMANDS:
             if (len(pointers) != 1 or pointers[0]["name"] != "data" or
@@ -676,6 +848,17 @@ def guest_function(command: dict, opcode: int) -> str:
 
 def _guest_function(command: dict, opcode: int) -> str:
     name = command["name"]
+    if name in NAME_GENERATORS:
+        _map, targeted = NAME_GENERATORS[name]
+        if targeted:
+            return f"""void {name}(unsigned target, int n, unsigned *names) {{
+    gen_named_objects_target({opcode}, target, n, names);
+}}
+"""
+        return f"""void {name}(int n, unsigned *names) {{
+    gen_named_objects({opcode}, n, names);
+}}
+"""
     if name in PROGRAM_PIPELINE_GENERATORS:
         return f"""void {name}(int n, unsigned *pipelines) {{
     gen_named_objects({opcode}, n, pipelines);
@@ -1276,6 +1459,18 @@ def _guest_function(command: dict, opcode: int) -> str:
 
 def host_case(command: dict, opcode: int) -> str:
     name = command["name"]
+    if name in NAME_GENERATORS:
+        table, targeted = NAME_GENERATORS[name]
+        read_target = "    GLenum target = a.u32();\n" if targeted else ""
+        pass_target = "target, " if targeted else ""
+        return f"""case {opcode}: {{
+{read_target}    GLsizei count = a.i32();
+    if (count < 0) {{ GEX_GL_CALL({name}, {pass_target}count, nullptr); break; }}
+    std::vector<GLuint> host((size_t)count);
+    GEX_GL_CALL({name}, {pass_target}count, host.data());
+    for (GLsizei i = 0; i < count; ++i) {table}[a.u32()] = host[(size_t)i];
+    break;
+}}"""
     if name in PROGRAM_PIPELINE_GENERATORS:
         return f"""case {opcode}: {{
     GLsizei count = a.i32();
@@ -1703,10 +1898,37 @@ def host_case(command: dict, opcode: int) -> str:
         else:
             lines += [f"    {output_type} values[4]{{}};",
                       f"    GEX_GL_CALL({name}, {', '.join(call_names + ['values'])});"]
+        # The DSA form needs exactly what the bound form below needs: a name
+        # returned to the guest has to be in the guest's numbering. The two
+        # differ only in how the framebuffer is identified, so they share the
+        # shape. Adding glGetNamedFramebufferAttachmentParameteriv without this
+        # produced a query answering with a host name -- invisible until a
+        # probe created objects of another kind first, because the guest's
+        # single counter and GL's per-kind numbering agree until then.
+        if name == "glGetNamedFramebufferAttachmentParameteriv":
+            lines += ["    if (pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME) {",
+                      "        GLint objectType = GL_NONE;",
+                      "        GEX_GL_CALL(glGetNamedFramebufferAttachmentParameteriv,",
+                      "            lookup(framebuffers, framebuffer), attachment,",
+                      "            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &objectType);",
+                      "        if (objectType == GL_TEXTURE)",
+                      "            values[0] = (GLint)external_name(textures, (GLuint)values[0]);",
+                      "        else if (objectType == GL_RENDERBUFFER)",
+                      "            values[0] = (GLint)external_name(renderbuffers, (GLuint)values[0]);",
+                      "    }"]
         if name == "glGetFramebufferAttachmentParameteriv":
             lines += ["    if (pname == GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME) {",
                       "        GLint objectType = GL_NONE;",
-                      "        glGetFramebufferAttachmentParameteriv(target, attachment,",
+                      # Through the dispatch, not by name. Emscripten's WebGL
+                      # library defines glGetFramebufferAttachmentParameteriv,
+                      # so a direct call here bound to *WebGL* rather than to
+                      # Mesa -- it answered about a context this path does not
+                      # use, objectType came back as neither GL_TEXTURE nor
+                      # GL_RENDERBUFFER, and the translation below quietly did
+                      # nothing. The guest then got a host name. Same trap as
+                      # glPolygonOffsetClampEXT, and it links cleanly either
+                      # way, which is what makes it worth a comment.
+                      "        GEX_GL_CALL(glGetFramebufferAttachmentParameteriv, target, attachment,",
                       "                                                GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,",
                       "                                                &objectType);",
                       "        if (objectType == GL_TEXTURE)",
@@ -1815,6 +2037,7 @@ def main() -> int:
                 INTERNAL_FORMAT_QUERIES | MULTISAMPLE_QUERIES |
                 COMPRESSED_TEXTURE_READBACK_QUERIES | OBJECT_COMMANDS.keys())
     policies |= PROGRAM_PIPELINE_GENERATORS | PROGRAM_PIPELINE_DELETERS
+    policies |= set(NAME_GENERATORS)
     policies |= BUFFER_STORAGE_COMMANDS
     policies |= STRING_INPUT_COMMANDS | STRING_RETURN_COMMANDS.keys()
     policies |= UNIFORM_VALUE_QUERIES.keys()
