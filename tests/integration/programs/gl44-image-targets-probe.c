@@ -133,6 +133,16 @@ int main(void) {
     const EGLint sa[] = { EGL_WIDTH, 8, EGL_HEIGHT, 8, EGL_NONE };
     EGLContext c = eglCreateContext(d, cfg, EGL_NO_CONTEXT, cx);
     EGLSurface s = eglCreatePbufferSurface(d, cfg, sa);
+    {
+        /* What the surface actually is, against what was asked for. The
+           default framebuffer's size comes from here, and if EGL hands back
+           something other than the 8x8 requested then every conclusion drawn
+           from fb0 is about a surface the program never asked for. */
+        EGLint sw = -1, sh = -1;
+        eglQuerySurface(d, s, EGL_WIDTH, &sw);
+        eglQuerySurface(d, s, EGL_HEIGHT, &sh);
+        fprintf(stderr, "INFO pbuffer requested=8x8 reported=%dx%d\n", sw, sh);
+    }
     if (c == EGL_NO_CONTEXT || s == EGL_NO_SURFACE ||
         !eglMakeCurrent(d, s, s, c)) return 2;
 
@@ -491,6 +501,19 @@ int main(void) {
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 GLint dvp[4] = {0, 0, 0, 0};
                 glGetIntegerv(GL_VIEWPORT, dvp);
+                /* GL's initial viewport is the surface the context was first
+                   made current to, and EGL says that surface is 8x8. If the
+                   viewport disagrees, the default framebuffer and the surface
+                   are two different sizes and everything drawn into fb0 is
+                   being placed by one of them and read by the other. */
+                fprintf(stderr, "INFO fb0 viewport=%dx%d egl_surface=8x8\n",
+                        dvp[2], dvp[3]);
+                result("fb0_viewport_matches_surface",
+                       dvp[2] == 8 && dvp[3] == 8);
+                /* No glViewport here on purpose. Everything below draws
+                   against whatever GL says the initial viewport is, which is
+                   the thing being tested: forcing it to the surface size
+                   would hide exactly the defect this found. */
                 {
                     glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
                     glClear(GL_COLOR_BUFFER_BIT);

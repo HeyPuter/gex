@@ -4243,7 +4243,20 @@ void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
         (!asked_version || egl_context_major < 3 ||
          (egl_context_major == 3 && egl_context_minor < 2)))
         egl_context_profile = 1;
-    context_create();
+    /* Deliberately *not* context_create() here.
+     *
+     * A context becomes current at eglMakeCurrent, not at eglCreateContext,
+     * and creating the host context is what makes it current. Doing it here
+     * made it current against whatever the drawable was at the time -- the
+     * canvas -- and GL latches the initial viewport at first make-current.
+     * A program that then created an 8x8 pbuffer and drew without calling
+     * glViewport had its geometry placed by a 320x240 viewport into an 8x8
+     * attachment: a point landed outside it entirely and drew nothing, and a
+     * full-viewport triangle covered the attachment but read back from
+     * somewhere else. Both looked like defects in points and in read-back.
+     *
+     * eglMakeCurrent creates it instead, by which time the surface exists and
+     * its size has reached the host. */
     return (void *)3;
 }
 
