@@ -11,6 +11,11 @@
 // the browser session, a string for an attached page/worker target. Commands
 // take an optional `sessionId` to address a specific target.
 
+/* Long enough that a slow page-load command is not cut off, short enough that
+ * a wedged browser is reported inside one gate's patience rather than never.
+ * GEX_CDP_TIMEOUT overrides it. */
+const CDP_TIMEOUT_MS = Number(process.env.GEX_CDP_TIMEOUT || 45000);
+
 export class Cdp {
   #ws;
   #id = 0;
@@ -69,14 +74,37 @@ export class Cdp {
     }
   }
 
-  /** Send a command; resolves with its result, rejects on protocol error. */
-  send(method, params = {}, sessionId) {
+  /**
+   * Send a command; resolves with its result, rejects on protocol error, and
+   * rejects by name if the browser never answers.
+   *
+   * The timeout is not belt-and-braces. A CDP command the browser accepts and
+   * never replies to used to hang this client for ever, and every caller is
+   * upstream of drive.mjs's own --wall/--idle timers, which are armed later --
+   * so the whole gate stopped with no output at all, no diagnosis, and the
+   * same appearance whatever the cause. That happened for a week's worth of
+   * runs and read as "the driver broke the browser" every time. A named
+   * rejection naming the method is the difference between a mystery and a
+   * fact.
+   */
+  send(method, params = {}, sessionId, timeoutMs = CDP_TIMEOUT_MS) {
     if (this.#closed) return Promise.reject(this.#closed);
     const id = ++this.#id;
     const payload = { id, method, params };
     if (sessionId) payload.sessionId = sessionId;
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.#pending.delete(id)) return;
+        reject(new Error(
+          `cdp: ${method} did not answer in ${timeoutMs}ms` +
+          (sessionId ? ` (session ${sessionId})` : '')));
+      }, timeoutMs);
+      // Unref so a pending command cannot by itself keep node alive.
+      timer.unref?.();
+      this.#pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
       this.#ws.send(JSON.stringify(payload));
     });
   }

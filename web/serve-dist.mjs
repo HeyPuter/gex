@@ -33,7 +33,31 @@ const TYPES = {
   '.ico': 'image/x-icon',
 };
 
+/* Retire when nothing has asked for anything in a while.
+ *
+ * These are deliberately left running so the next gate reuses a warm one, and
+ * with a port per caller that meant they accumulated for ever: 77 of them were
+ * found listening on 8091-8210, the oldest over a day old, one for every probe
+ * that had ever been run. Nothing reaps them and nothing was going to.
+ *
+ * Half an hour keeps the warm start within a run -- and across a sweep, which
+ * reuses the same port every few seconds -- while making a day-old listener
+ * impossible. GEX_SERVE_IDLE overrides it; 0 disables the timer.
+ */
+const IDLE_MS = Number(process.env.GEX_SERVE_IDLE ?? 30 * 60 * 1000);
+let idleTimer = null;
+const touch = () => {
+  if (!IDLE_MS) return;
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    console.log(`idle for ${Math.round(IDLE_MS / 1000)}s, exiting`);
+    process.exit(0);
+  }, IDLE_MS);
+  /* Not unref'd: this timer is the only thing that should end the process. */
+};
+
 const server = createServer(async (req, res) => {
+  touch();
   const url = new URL(req.url, 'http://x');
   // `normalize` and then reject anything that climbs out: this serves a
   // directory, not the filesystem.
@@ -65,6 +89,7 @@ const server = createServer(async (req, res) => {
   }
 });
 
+touch();
 server.listen(port, '0.0.0.0', () => {
   console.log(`serving ${root}`);
   console.log(`  http://127.0.0.1:${port}/`);
