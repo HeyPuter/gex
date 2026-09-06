@@ -1206,6 +1206,9 @@ GLuint lookup_program_or_shader(uint32_t name) {
     if (shader != shaders.end()) return shader->second;
     return GEXGL_UNGENERATED_NAME;
 }
+/* Declared here and defined below the maps it needs. */
+uint32_t binding_query_external(GLenum pname, GLuint name);
+
 uint32_t external_name(const std::unordered_map<uint32_t, GLuint>& map, GLuint name) {
     if (!name) return 0;
     for (const auto& [external, internal] : map) {
@@ -1263,6 +1266,58 @@ void reset_guest_namespace() {
 
     current_draw_buffers.assign(1, GL_BACK);
 }
+/* Which of glGetIntegerv's answers is an object name, and whose. Anything not
+   listed is a number in its own right and passes through. */
+uint32_t binding_query_external(GLenum pname, GLuint name) {
+    if (!name) return 0;
+    switch (pname) {
+    case GL_ARRAY_BUFFER_BINDING:
+    case GL_ELEMENT_ARRAY_BUFFER_BINDING:
+    case GL_COPY_READ_BUFFER_BINDING:
+    case GL_COPY_WRITE_BUFFER_BINDING:
+    case GL_PIXEL_PACK_BUFFER_BINDING:
+    case GL_PIXEL_UNPACK_BUFFER_BINDING:
+    case GL_UNIFORM_BUFFER_BINDING:
+    case GL_TRANSFORM_FEEDBACK_BUFFER_BINDING:
+    case GL_ATOMIC_COUNTER_BUFFER_BINDING:
+    case GL_SHADER_STORAGE_BUFFER_BINDING:
+    case GL_DISPATCH_INDIRECT_BUFFER_BINDING:
+    case GL_DRAW_INDIRECT_BUFFER_BINDING:
+    case GL_QUERY_BUFFER_BINDING:
+    case GL_TEXTURE_BUFFER_BINDING:
+        return external_name(buffers, name);
+    case GL_TEXTURE_BINDING_1D:
+    case GL_TEXTURE_BINDING_2D:
+    case GL_TEXTURE_BINDING_3D:
+    case GL_TEXTURE_BINDING_1D_ARRAY:
+    case GL_TEXTURE_BINDING_2D_ARRAY:
+    case GL_TEXTURE_BINDING_RECTANGLE:
+    case GL_TEXTURE_BINDING_CUBE_MAP:
+    case GL_TEXTURE_BINDING_CUBE_MAP_ARRAY:
+    case GL_TEXTURE_BINDING_BUFFER:
+    case GL_TEXTURE_BINDING_2D_MULTISAMPLE:
+    case GL_TEXTURE_BINDING_2D_MULTISAMPLE_ARRAY:
+        return external_name(textures, name);
+    case GL_CURRENT_PROGRAM:
+        return external_name(programs, name);
+    case GL_PROGRAM_PIPELINE_BINDING:
+        return external_name(program_pipelines, name);
+    case GL_VERTEX_ARRAY_BINDING:
+        return external_name(vertex_arrays, name);
+    case GL_DRAW_FRAMEBUFFER_BINDING:   /* and GL_FRAMEBUFFER_BINDING */
+    case GL_READ_FRAMEBUFFER_BINDING:
+        return external_name(framebuffers, name);
+    case GL_RENDERBUFFER_BINDING:
+        return external_name(renderbuffers, name);
+    case GL_SAMPLER_BINDING:
+        return external_name(samplers, name);
+    case GL_TRANSFORM_FEEDBACK_BINDING:
+        return external_name(transform_feedbacks, name);
+    default:
+        return name;
+    }
+}
+
 size_t integer_query_components(GLenum pname) {
     switch (pname) {
     case GL_VIEWPORT:
@@ -2534,6 +2589,16 @@ bool one(uint32_t op, Reader& a) {
         const GLenum pname = a.u32();
         std::vector<GLint> values(integer_query_components(pname));
         if (!values.empty()) glGetIntegerv(pname, values.data());
+        /* A query that returns an object name has to answer in the
+           application's names, not this host's. Every call that *takes* a
+           name translates one way and this translated not at all, so the
+           application was handed a number it never generated -- and the two
+           numberings agree often enough (both start at one and count up) that
+           it only shows once deleting objects has pushed them apart, which is
+           why it went unseen. Reading a binding, changing it and putting it
+           back is what every toolkit sharing a context does. */
+        if (!values.empty())
+            values[0] = (GLint)binding_query_external(pname, (GLuint)values[0]);
         put_blob(values.data(), values.size() * sizeof(values[0]));
         break;
     }
