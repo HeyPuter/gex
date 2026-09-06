@@ -17939,11 +17939,50 @@ That is a machine-level chromium fault. It blocks every browser gate here
 -- `gl44-probe.sh`, the probe suite's browser half, `gl44-cts-browser.sh`
 -- and no driver change can lift it.
 
+**Solved the same day; see "The keyring was holding the browser" below.**
+
 Two things did come out of the search and are fixed: the CDP timeout
 above, and **77 leaked harness servers** listening across 8091-8210, the
 oldest over a day old. They are kept warm for reuse deliberately and
 nothing ever reaped them; `serve-dist.mjs` now retires after half an hour
 idle.
+
+### The keyring was holding the browser (2026-09-06)
+
+One flag, and the browser gate is available again:
+
+    '--password-store=basic'          // web/test/drive.mjs
+
+Chromium's Linux cookie encryption autodetects an OS keyring over the D-Bus
+**Secret Service**. Nothing answers on this machine, so `OSCrypt` never
+produces a key and **every request that needs cookies blocks for ever**.
+Deterministic: three runs with the flag load the page, three without hang.
+It reproduces identically on Chromium 151 and on Google Chrome 141, 146 and
+152, so it is the machine rather than a version regression.
+
+**Why it read as "no http at all".** It is not all http. Of six requests in
+one run, three *completed* -- the component updater, the time service, the
+optimization-guide model fetch -- and three hung: `accounts.google.com`,
+`www.google.com`, and our own page. The three that completed are exactly the
+ones that carry no cookies. Every hung one stopped at the same net-log event,
+`COMPUTED_PRIVACY_MODE`, the step immediately before the cookie read.
+
+**The instrument.** `--log-net-log=/tmp/netlog.json
+--net-log-capture-mode=Everything`, then group the events by `source.id` and
+print the last event of each `URL_REQUEST`. The partition into completed and
+hung, plus the shared final event, is the whole diagnosis. Do not bother with
+stacks: every thread in every process is *sleeping*, because this is a dropped
+callback and not a block. Note the file's own quirk -- the constants object is
+terminated by `"events": [` with a space, so a parser looking for `"events":[`
+finds nothing.
+
+**A trap worth not repeating.** The fixture -- a small python http server --
+was written with a 180-second lifetime and expired partway through the flag
+matrix. A batch of trials therefore ran against a dead port and every one read
+"no effect", `--password-store=basic` among them. The flag that actually fixes
+this was tested and dismissed on invalid evidence, and only a second pass with
+a `curl` check *inside each iteration* found it. Re-verify the fixture in every
+trial, never once at the start.
 
 ## A 64-bit load is not an ALU operation
 

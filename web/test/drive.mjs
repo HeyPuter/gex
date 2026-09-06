@@ -389,6 +389,16 @@ async function ensureChrome(restart) {
     '--v=0',
     '--no-first-run',
     '--no-default-browser-check',
+    // Chromium's Linux cookie encryption autodetects an OS keyring over the
+    // D-Bus Secret Service. Where nothing answers -- this machine -- OSCrypt
+    // never produces a key, and every request that needs cookies blocks
+    // forever while cookieless ones (the component updater, the time service)
+    // sail through. The page then never loads and nothing says why: the
+    // netlog's last event for the navigation is COMPUTED_PRIVACY_MODE, the
+    // step immediately before the cookie read, and chromium prints nothing at
+    // all. It cost hours to find and is one flag to avoid: `basic` keeps the
+    // key in the profile and never speaks to D-Bus.
+    '--password-store=basic',
     '--remote-allow-origins=*',
     `--remote-debugging-port=${CHROME_PORT}`,
     `--user-data-dir=${join(CHROME_STATE, 'profile')}`,
