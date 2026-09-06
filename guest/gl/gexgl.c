@@ -790,6 +790,15 @@ void glFlushMappedBufferRange(unsigned target, long offset, long length) {
                     (uint8_t *)object->map + offset);
 }
 
+/* Declared here, defined with the other round-trip calls further down -- the
+   same arrangement glGetBufferSubData has, and for the same reason: the
+   mapping code below needs it and the definition belongs beside its siblings.
+   Without this the compiler assumed int(), which is a different calling
+   convention for the pointer argument and would have passed it wrongly on any
+   ABI where that matters. */
+void glGetNamedBufferSubData(unsigned buffer, long offset, long size,
+                             void *data);
+
 /* The named mapping family. GL 4.5 core, and entirely guest-side, like the
    bound forms directly above: a GL mapping here is a shadow buffer this
    library owns, filled by a readback when the caller asks to read and sent
@@ -1307,6 +1316,251 @@ void glGetBufferPointerv(unsigned target, unsigned pname, void **params) {
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
     *params = (pname == 0x88BDu /* GL_BUFFER_MAP_POINTER */ && object)
         ? object->map : NULL;
+}
+
+/* ------------------------------------------------------------- KHR_debug */
+/*
+ * Entirely on this side of the ring, and it has to be: the callback an
+ * application installs is a pointer into *its* address space, so nothing on
+ * the host could ever call it. GL allows an implementation to produce no
+ * messages of its own, which is what this one does -- what it must get right
+ * is that the calls exist, that a message the application inserts comes back,
+ * and that a label it sets can be read again.
+ *
+ * That matters more than it sounds. An engine that sees GL 4.3 installs a
+ * debug callback during start-up, and glDebugMessageCallback resolving to NULL
+ * is a crash before the first frame rather than a missing diagnostic.
+ */
+#define GEXGL_DEBUG_MESSAGE_MAX 1024
+#define GEXGL_DEBUG_LOG_DEPTH 64
+#define GEXGL_DEBUG_GROUP_DEPTH 64
+#define GEXGL_DEBUG_LABEL_MAX 256
+
+typedef void (*gexgl_debug_proc)(unsigned source, unsigned type, unsigned id,
+                                 unsigned severity, int length,
+                                 const char *message, const void *user);
+
+struct gexgl_debug_record {
+    unsigned source, type, id, severity;
+    int length;
+    char text[GEXGL_DEBUG_MESSAGE_MAX];
+};
+
+struct gexgl_debug_label {
+    unsigned identifier;
+    unsigned name;
+    const void *pointer;
+    char text[GEXGL_DEBUG_LABEL_MAX];
+};
+
+static struct {
+    gexgl_debug_proc callback;
+    const void *user;
+    int output_enabled;
+    struct gexgl_debug_record log[GEXGL_DEBUG_LOG_DEPTH];
+    unsigned logged;              /* how many of `log` are live */
+    struct { unsigned source, id; char text[GEXGL_DEBUG_MESSAGE_MAX]; }
+        group[GEXGL_DEBUG_GROUP_DEPTH];
+    unsigned depth;
+    struct gexgl_debug_label *labels;
+    size_t label_count;
+} debug_state;
+
+/* GL's "is this message wanted" test, reduced to what this implementation can
+   actually distinguish. glDebugMessageControl's per-id filtering is accepted
+   and ignored: nothing here generates ids of its own, so the only messages it
+   could suppress are the application's own inserts, and GL permits an
+   implementation to keep those. */
+static int gexgl_debug_wanted(void) {
+    return debug_state.output_enabled;
+}
+
+static void gexgl_debug_emit(unsigned source, unsigned type, unsigned id,
+                             unsigned severity, int length, const char *text) {
+    if (!gexgl_debug_wanted() || !text) return;
+    size_t n = length < 0 ? strlen(text) : (size_t)length;
+    if (n >= GEXGL_DEBUG_MESSAGE_MAX) n = GEXGL_DEBUG_MESSAGE_MAX - 1;
+    if (debug_state.callback) {
+        /* Straight through, as GL_DEBUG_OUTPUT_SYNCHRONOUS demands and as an
+           application single-stepping in a debugger expects. A copy, because
+           the callback is handed a NUL-terminated string and the caller's may
+           not be. */
+        char copy[GEXGL_DEBUG_MESSAGE_MAX];
+        memcpy(copy, text, n);
+        copy[n] = '\0';
+        debug_state.callback(source, type, id, severity, (int)n, copy,
+                             debug_state.user);
+        return;
+    }
+    /* No callback: the message queues for glGetDebugMessageLog. GL drops the
+       oldest when the log is full, so this does too. */
+    if (debug_state.logged == GEXGL_DEBUG_LOG_DEPTH) {
+        memmove(&debug_state.log[0], &debug_state.log[1],
+                sizeof(debug_state.log[0]) * (GEXGL_DEBUG_LOG_DEPTH - 1));
+        debug_state.logged--;
+    }
+    struct gexgl_debug_record *slot = &debug_state.log[debug_state.logged++];
+    slot->source = source; slot->type = type; slot->id = id;
+    slot->severity = severity; slot->length = (int)n;
+    memcpy(slot->text, text, n);
+    slot->text[n] = '\0';
+}
+
+void glDebugMessageCallback(gexgl_debug_proc callback, const void *user) {
+    debug_state.callback = callback;
+    debug_state.user = user;
+}
+
+void glDebugMessageControl(unsigned source, unsigned type, unsigned severity,
+                           int count, const unsigned *ids, unsigned char enabled) {
+    (void)source; (void)type; (void)severity; (void)ids;
+    if (count < 0) return;
+    /* A control call naming no ids and GL_DONT_CARE throughout is the global
+       switch, and that one is honoured. */
+    if (count == 0 && source == 0x1100u && type == 0x1100u && severity == 0x1100u)
+        debug_state.output_enabled = enabled ? 1 : 0;
+}
+
+void glDebugMessageInsert(unsigned source, unsigned type, unsigned id,
+                          unsigned severity, int length, const char *buf) {
+    gexgl_debug_emit(source, type, id, severity, length, buf);
+}
+
+unsigned glGetDebugMessageLog(unsigned count, int bufSize, unsigned *sources,
+                              unsigned *types, unsigned *ids, unsigned *severities,
+                              int *lengths, char *messageLog) {
+    unsigned written = 0;
+    int used = 0;
+    while (written < count && written < debug_state.logged) {
+        const struct gexgl_debug_record *r = &debug_state.log[written];
+        const int need = r->length + 1;
+        /* GL stops before a message that will not fit and leaves it queued. */
+        if (messageLog && (bufSize < 0 || used + need > bufSize)) break;
+        if (sources) sources[written] = r->source;
+        if (types) types[written] = r->type;
+        if (ids) ids[written] = r->id;
+        if (severities) severities[written] = r->severity;
+        if (lengths) lengths[written] = need;
+        if (messageLog) {
+            memcpy(messageLog + used, r->text, (size_t)r->length);
+            messageLog[used + r->length] = '\0';
+            used += need;
+        }
+        ++written;
+    }
+    if (written) {
+        memmove(&debug_state.log[0], &debug_state.log[written],
+                sizeof(debug_state.log[0]) * (debug_state.logged - written));
+        debug_state.logged -= written;
+    }
+    return written;
+}
+
+void glPushDebugGroup(unsigned source, unsigned id, int length,
+                      const char *message) {
+    if (debug_state.depth >= GEXGL_DEBUG_GROUP_DEPTH) return;
+    size_t n = message ? (length < 0 ? strlen(message) : (size_t)length) : 0;
+    if (n >= GEXGL_DEBUG_MESSAGE_MAX) n = GEXGL_DEBUG_MESSAGE_MAX - 1;
+    unsigned at = debug_state.depth++;
+    debug_state.group[at].source = source;
+    debug_state.group[at].id = id;
+    if (n && message) memcpy(debug_state.group[at].text, message, n);
+    debug_state.group[at].text[n] = '\0';
+    /* GL_DEBUG_TYPE_PUSH_GROUP, GL_DEBUG_SEVERITY_NOTIFICATION. */
+    gexgl_debug_emit(source, 0x8269u, id, 0x826Bu, (int)n,
+                     debug_state.group[at].text);
+}
+
+void glPopDebugGroup(void) {
+    if (!debug_state.depth) return;
+    const unsigned at = --debug_state.depth;
+    gexgl_debug_emit(debug_state.group[at].source, 0x826Au /* POP_GROUP */,
+                     debug_state.group[at].id, 0x826Bu,
+                     (int)strlen(debug_state.group[at].text),
+                     debug_state.group[at].text);
+}
+
+static struct gexgl_debug_label *gexgl_debug_label_slot(unsigned identifier,
+                                                        unsigned name,
+                                                        const void *pointer,
+                                                        int create) {
+    for (size_t i = 0; i < debug_state.label_count; ++i) {
+        struct gexgl_debug_label *l = &debug_state.labels[i];
+        if (pointer ? l->pointer == pointer
+                    : (l->identifier == identifier && l->name == name &&
+                       !l->pointer))
+            return l;
+    }
+    if (!create) return NULL;
+    struct gexgl_debug_label *grown =
+        realloc(debug_state.labels,
+                (debug_state.label_count + 1) * sizeof(*grown));
+    if (!grown) return NULL;
+    debug_state.labels = grown;
+    struct gexgl_debug_label *l = &grown[debug_state.label_count++];
+    memset(l, 0, sizeof(*l));
+    l->identifier = identifier;
+    l->name = name;
+    l->pointer = pointer;
+    return l;
+}
+
+static void gexgl_debug_set_label(unsigned identifier, unsigned name,
+                                  const void *pointer, int length,
+                                  const char *label) {
+    struct gexgl_debug_label *slot =
+        gexgl_debug_label_slot(identifier, name, pointer, 1);
+    if (!slot) return;
+    if (!label) { slot->text[0] = '\0'; return; }
+    size_t n = length < 0 ? strlen(label) : (size_t)length;
+    if (n >= GEXGL_DEBUG_LABEL_MAX) n = GEXGL_DEBUG_LABEL_MAX - 1;
+    memcpy(slot->text, label, n);
+    slot->text[n] = '\0';
+}
+
+static void gexgl_debug_get_label(unsigned identifier, unsigned name,
+                                  const void *pointer, int bufSize,
+                                  int *length, char *label) {
+    const struct gexgl_debug_label *slot =
+        gexgl_debug_label_slot(identifier, name, pointer, 0);
+    const char *text = slot ? slot->text : "";
+    const size_t n = strlen(text);
+    if (label && bufSize > 0) {
+        const size_t copy = n < (size_t)bufSize - 1 ? n : (size_t)bufSize - 1;
+        memcpy(label, text, copy);
+        label[copy] = '\0';
+        if (length) *length = (int)copy;
+    } else if (length) {
+        *length = (int)n;
+    }
+}
+
+void glObjectLabel(unsigned identifier, unsigned name, int length,
+                   const char *label) {
+    gexgl_debug_set_label(identifier, name, NULL, length, label);
+}
+
+void glGetObjectLabel(unsigned identifier, unsigned name, int bufSize,
+                      int *length, char *label) {
+    gexgl_debug_get_label(identifier, name, NULL, bufSize, length, label);
+}
+
+void glObjectPtrLabel(const void *ptr, int length, const char *label) {
+    gexgl_debug_set_label(0, 0, ptr, length, label);
+}
+
+void glGetObjectPtrLabel(const void *ptr, int bufSize, int *length,
+                         char *label) {
+    gexgl_debug_get_label(0, 0, ptr, bufSize, length, label);
+}
+
+/* GL_DEBUG_CALLBACK_FUNCTION 0x8244, GL_DEBUG_CALLBACK_USER_PARAM 0x8245.
+   The only two pointers GL 4.6 core defines for this query. */
+void glGetPointerv(unsigned pname, void **params) {
+    if (!params) return;
+    if (pname == 0x8244u) { *params = (void *)(uintptr_t)debug_state.callback; return; }
+    if (pname == 0x8245u) { *params = (void *)(uintptr_t)debug_state.user; return; }
+    *params = NULL;
 }
 
 void glGetVertexAttribPointerv(unsigned index, unsigned pname, void **pointer) {

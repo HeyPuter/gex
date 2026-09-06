@@ -64,7 +64,12 @@ SCALAR_COMMANDS |= {
     "glDrawTransformFeedbackStream", "glDrawTransformFeedbackStreamInstanced",
     "glEndConditionalRender", "glEndQueryIndexed", "glFramebufferParameteri",
     "glInvalidateBufferData", "glInvalidateBufferSubData", "glInvalidateTexImage",
-    "glInvalidateTexSubImage", "glPopDebugGroup",
+    "glInvalidateTexSubImage",
+    # glPopDebugGroup is implemented in the guest with the rest of
+    # KHR_debug: the debug group stack has to sit beside the callback,
+    # which is a pointer into the application's address space and can
+    # never be called from the host. Forwarded here it also had no
+    # matching push, so the two halves could not agree.
     "glProgramParameteri", "glQueryCounter", "glReleaseShaderCompiler",
     "glScissorIndexed", "glTexBufferRange", "glUseProgramStages",
     "glValidateProgramPipeline",

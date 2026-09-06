@@ -2094,10 +2094,6 @@ case 1396: {
     GEX_GL_CALL(glPolygonMode, face, mode);
     break;
 }
-case 1398: {
-    GEX_GL_CALL(glPopDebugGroup, );
-    break;
-}
 case 1399: {
     GLuint index = a.u32();
     GEX_GL_CALL(glPrimitiveRestartIndex, index);

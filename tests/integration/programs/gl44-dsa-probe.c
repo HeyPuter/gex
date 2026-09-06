@@ -8,6 +8,16 @@
  * before drawing anything. None of that is reachable from a native run: the
  * native path goes through the system libGL and never through the guest.
  *
+ * NOTE: tests/gates/probe-suite.sh reports this probe UNLINKABLE / NORESULT,
+ * and that is correct rather than a failure. That suite links each probe
+ * against the gex driver's own libGL, which does not export the GL 4.5 entry
+ * points as linkable symbols -- Mesa publishes them through the dispatch
+ * table, so an application reaches them with getProcAddress. The two contexts
+ * that matter do run it: `tests/gl44-probe.sh dsa` builds it against the
+ * system libGL for the native oracle and against the guest library for the
+ * browser. Nothing is lost, either, because DSA is a transport feature; the
+ * driver below Mesa sees ordinary Gallium calls whichever spelling was used.
+ *
  * Deliberately uses no glBind* for the objects it configures. glCreateTextures
  * is what makes that legal -- a name from glGenTextures is uninitialised, and
  * glTextureStorage2D on one is an error until something binds it, which is the

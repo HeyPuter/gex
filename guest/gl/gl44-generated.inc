@@ -2405,10 +2405,6 @@ void glPolygonMode(unsigned face, unsigned mode) {
     packet[at++] = (uint32_t)(face);
     packet[at++] = (uint32_t)(mode);
 }
-void glPopDebugGroup(void) {
-    uint32_t *packet = begin(1398, 0, 0);
-    if (!packet) return;
-}
 void glPrimitiveRestartIndex(unsigned index) {
     uint32_t *packet = begin(1399, 1, 0);
     if (!packet) return;

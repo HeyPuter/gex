@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 477 of them whose target this
+ * claimed -- so here are the 492 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -82,6 +82,12 @@ extern __typeof(glCopyTexSubImage2D) glCopyTexSubImage2DEXT __attribute__((alias
 extern __typeof(glCopyTexSubImage3D) glCopyTexSubImage3DEXT __attribute__((alias("glCopyTexSubImage3D")));
 extern __typeof(glCreateProgram) glCreateProgramObjectARB __attribute__((alias("glCreateProgram")));
 extern __typeof(glCreateShader) glCreateShaderObjectARB __attribute__((alias("glCreateShader")));
+extern __typeof(glDebugMessageCallback) glDebugMessageCallbackARB __attribute__((alias("glDebugMessageCallback")));
+extern __typeof(glDebugMessageCallback) glDebugMessageCallbackKHR __attribute__((alias("glDebugMessageCallback")));
+extern __typeof(glDebugMessageControl) glDebugMessageControlARB __attribute__((alias("glDebugMessageControl")));
+extern __typeof(glDebugMessageControl) glDebugMessageControlKHR __attribute__((alias("glDebugMessageControl")));
+extern __typeof(glDebugMessageInsert) glDebugMessageInsertARB __attribute__((alias("glDebugMessageInsert")));
+extern __typeof(glDebugMessageInsert) glDebugMessageInsertKHR __attribute__((alias("glDebugMessageInsert")));
 extern __typeof(glDeleteBuffers) glDeleteBuffersARB __attribute__((alias("glDeleteBuffers")));
 extern __typeof(glDeleteFramebuffers) glDeleteFramebuffersEXT __attribute__((alias("glDeleteFramebuffers")));
 extern __typeof(glDeleteQueries) glDeleteQueriesARB __attribute__((alias("glDeleteQueries")));
@@ -161,6 +167,8 @@ extern __typeof(glGetBufferPointerv) glGetBufferPointervARB __attribute__((alias
 extern __typeof(glGetBufferPointerv) glGetBufferPointervOES __attribute__((alias("glGetBufferPointerv")));
 extern __typeof(glGetBufferSubData) glGetBufferSubDataARB __attribute__((alias("glGetBufferSubData")));
 extern __typeof(glGetCompressedTexImage) glGetCompressedTexImageARB __attribute__((alias("glGetCompressedTexImage")));
+extern __typeof(glGetDebugMessageLog) glGetDebugMessageLogARB __attribute__((alias("glGetDebugMessageLog")));
+extern __typeof(glGetDebugMessageLog) glGetDebugMessageLogKHR __attribute__((alias("glGetDebugMessageLog")));
 extern __typeof(glGetDoublei_v) glGetDoubleIndexedvEXT __attribute__((alias("glGetDoublei_v")));
 extern __typeof(glGetDoublei_v) glGetDoublei_vEXT __attribute__((alias("glGetDoublei_v")));
 extern __typeof(glGetFloati_v) glGetFloatIndexedvEXT __attribute__((alias("glGetFloati_v")));
@@ -176,6 +184,10 @@ extern __typeof(glGetInteger64v) glGetInteger64vAPPLE __attribute__((alias("glGe
 extern __typeof(glGetInteger64v) glGetInteger64vEXT __attribute__((alias("glGetInteger64v")));
 extern __typeof(glGetIntegeri_v) glGetIntegerIndexedvEXT __attribute__((alias("glGetIntegeri_v")));
 extern __typeof(glGetMultisamplefv) glGetMultisamplefvNV __attribute__((alias("glGetMultisamplefv")));
+extern __typeof(glGetObjectLabel) glGetObjectLabelKHR __attribute__((alias("glGetObjectLabel")));
+extern __typeof(glGetObjectPtrLabel) glGetObjectPtrLabelKHR __attribute__((alias("glGetObjectPtrLabel")));
+extern __typeof(glGetPointerv) glGetPointervEXT __attribute__((alias("glGetPointerv")));
+extern __typeof(glGetPointerv) glGetPointervKHR __attribute__((alias("glGetPointerv")));
 extern __typeof(glGetQueryObjecti64v) glGetQueryObjecti64vEXT __attribute__((alias("glGetQueryObjecti64v")));
 extern __typeof(glGetQueryObjectiv) glGetQueryObjectivARB __attribute__((alias("glGetQueryObjectiv")));
 extern __typeof(glGetQueryObjectiv) glGetQueryObjectivEXT __attribute__((alias("glGetQueryObjectiv")));
@@ -237,6 +249,8 @@ extern __typeof(glMultiDrawElementsIndirect) glMultiDrawElementsIndirectAMD __at
 extern __typeof(glMultiDrawElementsIndirect) glMultiDrawElementsIndirectEXT __attribute__((alias("glMultiDrawElementsIndirect")));
 extern __typeof(glNamedBufferStorage) glNamedBufferStorageEXT __attribute__((alias("glNamedBufferStorage")));
 extern __typeof(glNamedBufferSubData) glNamedBufferSubDataEXT __attribute__((alias("glNamedBufferSubData")));
+extern __typeof(glObjectLabel) glObjectLabelKHR __attribute__((alias("glObjectLabel")));
+extern __typeof(glObjectPtrLabel) glObjectPtrLabelKHR __attribute__((alias("glObjectPtrLabel")));
 extern __typeof(glPatchParameteri) glPatchParameteriEXT __attribute__((alias("glPatchParameteri")));
 extern __typeof(glPatchParameteri) glPatchParameteriOES __attribute__((alias("glPatchParameteri")));
 extern __typeof(glPauseTransformFeedback) glPauseTransformFeedbackNV __attribute__((alias("glPauseTransformFeedback")));
@@ -287,6 +301,7 @@ extern __typeof(glProgramUniformMatrix4fv) glProgramUniformMatrix4fvEXT __attrib
 extern __typeof(glProgramUniformMatrix4x2fv) glProgramUniformMatrix4x2fvEXT __attribute__((alias("glProgramUniformMatrix4x2fv")));
 extern __typeof(glProgramUniformMatrix4x3fv) glProgramUniformMatrix4x3fvEXT __attribute__((alias("glProgramUniformMatrix4x3fv")));
 extern __typeof(glProvokingVertex) glProvokingVertexEXT __attribute__((alias("glProvokingVertex")));
+extern __typeof(glPushDebugGroup) glPushDebugGroupKHR __attribute__((alias("glPushDebugGroup")));
 extern __typeof(glQueryCounter) glQueryCounterEXT __attribute__((alias("glQueryCounter")));
 extern __typeof(glRenderbufferStorage) glRenderbufferStorageEXT __attribute__((alias("glRenderbufferStorage")));
 extern __typeof(glRenderbufferStorageMultisample) glRenderbufferStorageMultisampleEXT __attribute__((alias("glRenderbufferStorageMultisample")));
