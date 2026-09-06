@@ -103,6 +103,35 @@ void mesa_polygon_offset_clamp(GLfloat factor, GLfloat units, GLfloat clamp) {
     function(factor, units, clamp);
 }
 
+/* ARB_gl_spirv, and a near miss worth recording. glSpecializeShader is not a
+   linkable symbol in Mesa at all -- Mesa implements _mesa_SpecializeShaderARB
+   and publishes only the ARB-suffixed dispatch entry, so the link failed
+   outright with "undefined symbol: glSpecializeShader". That is the *lucky*
+   half. glShaderBinary linked with no complaint whatever, because Emscripten's
+   WebGL library provides one -- so the decoder would have called the browser's
+   GLES stub instead of Mesa, exactly as glPolygonOffsetClampEXT did above, and
+   nothing would have said so. Both go through the dispatch.
+
+   A null check, unlike the neighbours: these two are reachable from a guest
+   that asked for a SPIR-V shader, and a null call takes down the host and with
+   it every later command in the batch. */
+void mesa_shader_binary(GLsizei count, const GLuint* shaders, GLenum format,
+                        const void* binary, GLsizei length) {
+    using Function = void (*)(GLsizei, const GLuint*, GLenum, const void*, GLsizei);
+    static Function function = mesa_proc<Function>("glShaderBinary");
+    if (function) function(count, shaders, format, binary, length);
+}
+
+void mesa_specialize_shader(GLuint shader, const GLchar* entry, GLuint count,
+                            const GLuint* index, const GLuint* value) {
+    using Function = void (*)(GLuint, const GLchar*, GLuint, const GLuint*,
+                              const GLuint*);
+    static Function function = mesa_proc<Function>("glSpecializeShaderARB");
+    if (function) function(shader, entry, count, index, value);
+}
+
+#define glShaderBinary mesa_shader_binary
+#define glSpecializeShader mesa_specialize_shader
 #define glPolygonOffsetClampEXT mesa_polygon_offset_clamp
 #define glGetProgramResourceLocationIndex mesa_get_program_resource_location_index
 #define glPatchParameterfv mesa_patch_parameter_fv
@@ -196,7 +225,7 @@ enum Op : uint32_t {
     SELECT_BUFFER = 234, RENDER_MODE = 235, INIT_NAMES = 236,
     LOAD_NAME = 237, PUSH_NAME = 238, POP_NAME = 239,
     DRAW_ELEMENTS_FULL = 240, POLYGON_OFFSET_CLAMP = 241,
-    BLEND_BARRIER = 242,
+    BLEND_BARRIER = 242, SHADER_BINARY = 243, SPECIALIZE_SHADER = 244,
 };
 
 struct Reader {
@@ -1422,6 +1451,46 @@ bool one(uint32_t op, Reader& a) {
        framebuffer snapshot itself, so the call has to reach the host driver
        for the extension to mean anything. */
     case BLEND_BARRIER: glBlendBarrier(); break;
+    /* ARB_gl_spirv. The shader names arrive in the guest's own namespace, so
+       each has to come back through the shaders table before GL sees it --
+       glShaderBinary takes an array of them rather than one. */
+    case SHADER_BINARY: {
+        const uint32_t count = a.u32();
+        const GLenum format = a.u32();
+        uint32_t name_bytes = 0;
+        const uint8_t* names = a.blob(name_bytes);
+        uint32_t bin_bytes = 0;
+        const uint8_t* binary = a.blob(bin_bytes);
+        if (!a.ok || name_bytes != count * 4u) break;
+        std::vector<GLuint> host_names(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t guest_name = 0;
+            std::memcpy(&guest_name, names + i * 4u, 4);
+            host_names[i] = lookup(shaders, guest_name);
+        }
+        glShaderBinary((GLsizei)count, host_names.data(), format,
+                       binary, (GLsizei)bin_bytes);
+        break;
+    }
+    case SPECIALIZE_SHADER: {
+        const GLuint shader = lookup(shaders, a.u32());
+        const uint32_t count = a.u32();
+        const std::string entry = a.string();
+        uint32_t index_bytes = 0;
+        const uint8_t* index = a.blob(index_bytes);
+        uint32_t value_bytes = 0;
+        const uint8_t* value = a.blob(value_bytes);
+        if (!a.ok || index_bytes != count * 4u || value_bytes != count * 4u) break;
+        std::vector<GLuint> idx(count), val(count);
+        if (count) {
+            std::memcpy(idx.data(), index, index_bytes);
+            std::memcpy(val.data(), value, value_bytes);
+        }
+        glSpecializeShader(shader, entry.c_str(), count,
+                           count ? idx.data() : nullptr,
+                           count ? val.data() : nullptr);
+        break;
+    }
     case LINE_WIDTH: glLineWidth(a.f32()); break;
     case CLEAR_STENCIL: current_clear_stencil=a.i32(); glClearStencil(current_clear_stencil); break;
     case DEPTH_RANGE: { GLfloat near_value=a.f32(), far_value=a.f32(); glDepthRangef(near_value,far_value); break; }

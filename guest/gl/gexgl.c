@@ -375,6 +375,74 @@ void glPolygonOffsetClamp(float factor, float units, float clamp) {
    glBlendBarrierKHR and glBlendBarrierNV both alias this in the registry, so
    gl-aliases-generated.inc emits them from the base defined here. */
 void glBlendBarrier(void) { CMD0(GEXGL_BLEND_BARRIER); }
+
+/* ARB_gl_spirv: hand a shader to GL as a SPIR-V module rather than as GLSL.
+   Mesa does the whole job -- glSpecializeShader runs spirv_to_nir and what
+   reaches the driver is the NIR it already takes -- so the only thing between
+   a guest and working SPIR-V was these two entry points. Without them
+   gen_gl_extensions.py withheld GL_ARB_gl_spirv, and gl44-spirv-probe ran its
+   three cases natively and *zero* in a browser: it asks for the extension,
+   does not find it, and skips. A probe reporting cases=0 is the quiet shape
+   of this whole class of gap.
+
+   Both are hand-written for the reason glBlendBarrier is: they are GL 4.6 and
+   4.1 core entry points that the 4.4 manifest does not carry, and the
+   generated opcodes are indices into the sorted 4.4 command list, so a new
+   name cannot join it without renumbering nearly the whole ABI.
+
+   Arrays travel as blobs -- a length word then the bytes, padded to four --
+   because that is what the host's reader already understands. */
+void glShaderBinary(int count, const unsigned *shaders, unsigned format,
+                    const void *binary, int length) {
+    if (count < 0 || length < 0) return;
+    if (count > 0 && !shaders) return;
+    if (length > 0 && !binary) return;
+    size_t names = (size_t)count * 4u;
+    size_t blob = (size_t)length;
+    size_t tail;
+    /* two blobs: a length word and padded payload each */
+    if (!gexgl_size_add(4u + names, 4u + ((blob + 3u) & ~(size_t)3u), &tail))
+        return;
+    uint32_t *p = begin(GEXGL_SHADER_BINARY, 2, tail);
+    if (!p) return;
+    p[0] = (uint32_t)count;
+    p[1] = format;
+    p[2] = (uint32_t)names;
+    if (names) memcpy(p + 3, shaders, names);
+    uint32_t *at = p + 3 + count;
+    at[0] = (uint32_t)blob;
+    if (blob) {
+        memcpy(at + 1, binary, blob);
+        size_t padded = (blob + 3u) & ~(size_t)3u;
+        if (padded > blob) memset((uint8_t *)(at + 1) + blob, 0, padded - blob);
+    }
+}
+
+void glSpecializeShader(unsigned shader, const char *entry, unsigned count,
+                        const unsigned *index, const unsigned *value) {
+    if (count > 0 && (!index || !value)) return;
+    size_t entry_len = entry ? strlen(entry) : 0;
+    size_t padded_entry = (entry_len + 3u) & ~(size_t)3u;
+    size_t words = (size_t)count * 4u;
+    size_t tail;
+    if (!gexgl_size_add(4u + padded_entry, (4u + words) * 2u, &tail)) return;
+    uint32_t *p = begin(GEXGL_SPECIALIZE_SHADER, 2, tail);
+    if (!p) return;
+    p[0] = shader;
+    p[1] = count;
+    p[2] = (uint32_t)entry_len;
+    if (entry_len) {
+        memcpy(p + 3, entry, entry_len);
+        if (padded_entry > entry_len)
+            memset((uint8_t *)(p + 3) + entry_len, 0, padded_entry - entry_len);
+    }
+    uint32_t *at = p + 3 + padded_entry / 4u;
+    at[0] = (uint32_t)words;
+    if (words) memcpy(at + 1, index, words);
+    at += 1 + count;
+    at[0] = (uint32_t)words;
+    if (words) memcpy(at + 1, value, words);
+}
 void glLineWidth(float width) { CMD1(GEXGL_LINE_WIDTH, as_bits(width)); }
 void glClearStencil(int value) { CMD1(GEXGL_CLEAR_STENCIL, value); }
 void glDepthRangef(float near_value, float far_value) {

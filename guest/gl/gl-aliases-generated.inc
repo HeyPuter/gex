@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 473 of them whose target this
+ * claimed -- so here are the 474 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -301,6 +301,7 @@ extern __typeof(glScissorIndexed) glScissorIndexedOES __attribute__((alias("glSc
 extern __typeof(glScissorIndexedv) glScissorIndexedvNV __attribute__((alias("glScissorIndexedv")));
 extern __typeof(glScissorIndexedv) glScissorIndexedvOES __attribute__((alias("glScissorIndexedv")));
 extern __typeof(glShaderSource) glShaderSourceARB __attribute__((alias("glShaderSource")));
+extern __typeof(glSpecializeShader) glSpecializeShaderARB __attribute__((alias("glSpecializeShader")));
 extern __typeof(glStencilOpSeparate) glStencilOpSeparateATI __attribute__((alias("glStencilOpSeparate")));
 extern __typeof(glTexBuffer) glTexBufferARB __attribute__((alias("glTexBuffer")));
 extern __typeof(glTexBuffer) glTexBufferEXT __attribute__((alias("glTexBuffer")));

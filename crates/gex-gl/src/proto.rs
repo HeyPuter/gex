@@ -409,6 +409,8 @@ pub mod op {
     pub const DRAW_ELEMENTS_FULL: u32 = 240;
     pub const POLYGON_OFFSET_CLAMP: u32 = 241;
     pub const BLEND_BARRIER: u32 = 242;
+    pub const SHADER_BINARY: u32 = 243;
+    pub const SPECIALIZE_SHADER: u32 = 244;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,
