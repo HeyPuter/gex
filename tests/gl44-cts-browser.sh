@@ -68,6 +68,20 @@ CTS_PUBLIC="$ROOT/web/public/fs/$CTS_NAME"
 CTS_DIST="$ROOT/web/dist/fs/$CTS_NAME"
 mv "$CTS_STAGE" "$CTS_PUBLIC"
 
+# The log wrapper, from source, for the same reason as the marshaller below:
+# $BUILD/glcts-log-wrapper is written only when the CTS is compiled, and the
+# copy here was five days old while its source had changed. An instrument that
+# does not track its source reports yesterday's answers.
+if [ -n "${GEX_CTS_TOOLCHAIN:-}" ] && [ -x "$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc" ]; then
+    "$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc" -O2 \
+        "$ROOT/tests/cts/glcts-log-wrapper.c" -o "$BUILD/glcts-log-wrapper" || {
+            echo "could not rebuild the CTS log wrapper" >&2; exit 1; }
+elif command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
+    aarch64-linux-musl-gcc -O2 \
+        "$ROOT/tests/cts/glcts-log-wrapper.c" -o "$BUILD/glcts-log-wrapper" || {
+            echo "could not rebuild the CTS log wrapper" >&2; exit 1; }
+fi
+
 # Rebuild that marshaller from the current tree first.
 #
 # $BUILD/guest-gl is written by tests/gl44-cts.sh when the CTS is *compiled*,

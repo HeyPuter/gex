@@ -109,6 +109,26 @@ int main(int argc, char **argv)
                     strncmp(status, "NotSupported", 12) == 0;
                 const int failed = !unsupported &&
                                    strncmp(status, "Pass", 4) != 0;
+                /* And *why*. dEQP puts the reason in the body of the Result
+                   element -- <Result StatusCode="Fail">reason</Result> --
+                   while every other message it writes goes in <Text>. Reading
+                   only <Text> meant a failing case reported the last thing
+                   that went right: transform_feedback.api_errors_test failed
+                   in a browser and its only line was "Linking failed as
+                   expected", which describes a check that passed. One line
+                   per failure, so a sweep stays readable. */
+                if (failed) {
+                    char *body = strchr(status, '>');
+                    if (body) {
+                        ++body;
+                        char *shut = strstr(body, "</Result>");
+                        if (shut) *shut = '\0';
+                        for (char *c = body; *c; ++c)
+                            if (*c == '\n' || *c == '\r') *c = ' ';
+                        while (*body == ' ') ++body;
+                        if (*body) printf("QPA-WHY    %s: %s\n", current, body);
+                    }
+                }
                 /* Tally both halves of the name separately. */
                 char split[512];
                 snprintf(split, sizeof(split), "%s", current);
