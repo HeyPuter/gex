@@ -204,6 +204,153 @@ int main(void) {
     result("image2darray",   no_error && got[2] == 21 && got[3] == 22);
     result("imagecubearray", no_error && got[4] == 31 && got[5] == 32);
 
+    /* A plain cube map, written through a layered image and read back one
+     * face at a time with glGetTexImage.
+     *
+     * Everything above reads its result out of another image, which says the
+     * store landed but nothing about whether the face can be read back by
+     * name. KHR-GL44.shader_image_load_store.basic-allTargets-store does it
+     * the second way and fails in the browser with
+     * "GL_TEXTURE_CUBE_MAP_POSITIVE_X target failed. Value is: [0,0,0,0]",
+     * which is [[zero-means-nobody-wrote]] and could be either half. */
+    {
+        static const char *cube_src =
+            "#version 430 core\n"
+            "layout(local_size_x = 1) in;\n"
+            "layout(r32ui, binding = 0) uniform uimageCube img;\n"
+            "void main() {\n"
+            "  for (int face = 0; face < 6; ++face)\n"
+            "    imageStore(img, ivec3(0, 0, face), uvec4(100u + uint(face)));\n"
+            "}\n";
+        GLuint sh = glCreateShader(GL_COMPUTE_SHADER);
+        glShaderSource(sh, 1, &cube_src, NULL);
+        glCompileShader(sh);
+        GLint ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+        GLuint cprog = 0;
+        if (ok) {
+            cprog = glCreateProgram();
+            glAttachShader(cprog, sh);
+            glLinkProgram(cprog);
+            GLint linked = 0; glGetProgramiv(cprog, GL_LINK_STATUS, &linked);
+            if (!linked) {
+                char log[1024] = {0};
+                glGetProgramInfoLog(cprog, sizeof log, NULL, log);
+                fprintf(stderr, "INFO cube link failed: %s\n", log);
+                cprog = 0;
+            }
+        } else {
+            char log[1024] = {0};
+            glGetShaderInfoLog(sh, sizeof log, NULL, log);
+            fprintf(stderr, "INFO cube compile failed: %s\n", log);
+        }
+
+        GLuint cube = 0;
+        unsigned faces[6] = {0, 0, 0, 0, 0, 0};
+        GLenum cube_error = GL_NO_ERROR;
+        if (cprog) {
+            glGenTextures(1, &cube);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+            glTexStorage2D(GL_TEXTURE_CUBE_MAP, 1, GL_R32UI, 1, 1);
+            glBindImageTexture(0, cube, 0, GL_TRUE, 0, GL_WRITE_ONLY,
+                               GL_R32UI);
+            glUseProgram(cprog);
+            glUniform1i(glGetUniformLocation(cprog, "img"), 0);
+            glDispatchCompute(1, 1, 1);
+            glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
+            while (glGetError() != GL_NO_ERROR) {}
+            glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+            for (int face = 0; face < 6; ++face)
+                glGetTexImage(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0,
+                              GL_RED_INTEGER, GL_UNSIGNED_INT, &faces[face]);
+            cube_error = glGetError();
+        }
+        fprintf(stderr, "INFO cube faces=%u,%u,%u,%u,%u,%u want=100..105 "
+                "err=0x%04x\n", faces[0], faces[1], faces[2], faces[3],
+                faces[4], faces[5], (unsigned)cube_error);
+        int right = 0;
+        for (int face = 0; face < 6; ++face)
+            if (faces[face] == 100u + (unsigned)face) ++right;
+        result("imagecube_face0", cprog != 0 && cube_error == GL_NO_ERROR &&
+                                  faces[0] == 100u);
+        result("imagecube_all_faces", cprog != 0 && right == 6);
+        if (cube) glDeleteTextures(1, &cube);
+
+        /* And the signed four-component form, which is the one the suite
+         * actually uses: rgba32i, storing ivec4(-1, 2, 3, -4). r32ui above
+         * passes, so if this does not, the shape is not the problem and the
+         * format is. */
+        static const char *cube_i_src =
+            "#version 430 core\n"
+            "layout(local_size_x = 1) in;\n"
+            "layout(rgba32i, binding = 0) uniform iimageCube img;\n"
+            "void main() {\n"
+            "  for (int face = 0; face < 6; ++face)\n"
+            "    imageStore(img, ivec3(0, 0, face), ivec4(-1, 2, 3, -4));\n"
+            "}\n";
+        GLuint ish = glCreateShader(GL_COMPUTE_SHADER);
+        glShaderSource(ish, 1, &cube_i_src, NULL);
+        glCompileShader(ish);
+        GLint iok = 0; glGetShaderiv(ish, GL_COMPILE_STATUS, &iok);
+        GLuint iprog = 0;
+        if (iok) {
+            iprog = glCreateProgram();
+            glAttachShader(iprog, ish);
+            glLinkProgram(iprog);
+            GLint linked = 0; glGetProgramiv(iprog, GL_LINK_STATUS, &linked);
+            if (!linked) {
+                char log[1024] = {0};
+                glGetProgramInfoLog(iprog, sizeof log, NULL, log);
+                fprintf(stderr, "INFO cube_i link failed: %s\n", log);
+                iprog = 0;
+            }
+        } else {
+            char log[1024] = {0};
+            glGetShaderInfoLog(ish, sizeof log, NULL, log);
+            fprintf(stderr, "INFO cube_i compile failed: %s\n", log);
+        }
+        GLuint icube = 0;
+        GLint face0[4] = {0, 0, 0, 0};
+        GLenum ierror = GL_NO_ERROR;
+        if (iprog) {
+            glGenTextures(1, &icube);
+            glBindTexture(GL_TEXTURE_CUBE_MAP, icube);
+            /* Six glTexImage2D faces, not glTexStorage2D: mutable storage is
+             * what the suite uses, and a cube map assembled face by face is
+             * only complete once the sixth arrives. st drops an incomplete
+             * texture into an empty image view without a word, so the
+             * difference between the two ways of making the same texture is
+             * the difference between a store landing and going nowhere. */
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER,
+                            GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER,
+                            GL_NEAREST);
+            for (int face = 0; face < 6; ++face)
+                glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0,
+                             GL_RGBA32I, 1, 1, 0, GL_RGBA_INTEGER, GL_INT,
+                             NULL);
+            glBindImageTexture(0, icube, 0, GL_TRUE, 0, GL_WRITE_ONLY,
+                               GL_RGBA32I);
+            glUseProgram(iprog);
+            glUniform1i(glGetUniformLocation(iprog, "img"), 0);
+            glDispatchCompute(1, 1, 1);
+            glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
+            while (glGetError() != GL_NO_ERROR) {}
+            glBindTexture(GL_TEXTURE_CUBE_MAP, icube);
+            glGetTexImage(GL_TEXTURE_CUBE_MAP_POSITIVE_X, 0, GL_RGBA_INTEGER,
+                          GL_INT, face0);
+            ierror = glGetError();
+        }
+        fprintf(stderr, "INFO cube_i +X=[%d,%d,%d,%d] want=[-1,2,3,-4] "
+                "err=0x%04x\n", face0[0], face0[1], face0[2], face0[3],
+                (unsigned)ierror);
+        result("imagecube_rgba32i", iprog != 0 && ierror == GL_NO_ERROR &&
+                                    face0[0] == -1 && face0[1] == 2 &&
+                                    face0[2] == 3 && face0[3] == -4);
+        if (icube) glDeleteTextures(1, &icube);
+        glUseProgram(prog);
+        while (glGetError() != GL_NO_ERROR) {}
+    }
+
     /* And the same shapes at rgba32f read-write, which cannot be a storage
      * texture in WebGPU and goes through the packed path instead. */
     GLuint psh = glCreateShader(GL_COMPUTE_SHADER);
