@@ -226,6 +226,8 @@ enum Op : uint32_t {
     LOAD_NAME = 237, PUSH_NAME = 238, POP_NAME = 239,
     DRAW_ELEMENTS_FULL = 240, POLYGON_OFFSET_CLAMP = 241,
     BLEND_BARRIER = 242, SHADER_BINARY = 243, SPECIALIZE_SHADER = 244,
+    NAMED_BUFFER_DATA = 245, NAMED_BUFFER_SUB_DATA = 246,
+    NAMED_BUFFER_STORAGE = 247,
 };
 
 struct Reader {
@@ -1451,6 +1453,48 @@ bool one(uint32_t op, Reader& a) {
        framebuffer snapshot itself, so the call has to reach the host driver
        for the extension to mean anything. */
     case BLEND_BARRIER: glBlendBarrier(); break;
+    /* The named buffer uploads. Through GEX_GL_CALL like everything else that
+       is not plain GL 1.x -- these are GL 4.5, so Emscripten's WebGL library
+       has no same-named function to bind to by mistake, but the rule is the
+       rule and the next one added might not be so lucky. */
+    case NAMED_BUFFER_DATA: {
+        const GLuint buffer = lookup(buffers, a.u32());
+        const GLenum usage = a.u32();
+        const uint64_t size = a.u64();
+        const bool has_data = a.u32() != 0;
+        uint32_t n = 0;
+        const uint8_t* wire = a.blob(n);
+        if (size > (uint64_t)std::numeric_limits<GLsizeiptr>::max() ||
+            (has_data && size != n) || (!has_data && n != 0)) { a.ok = false; break; }
+        GEX_GL_CALL(glNamedBufferData, buffer, (GLsizeiptr)size,
+                    has_data ? wire : nullptr, usage);
+        break;
+    }
+    case NAMED_BUFFER_SUB_DATA: {
+        const GLuint buffer = lookup(buffers, a.u32());
+        const uint64_t offset = a.u64(), size = a.u64();
+        uint32_t n = 0;
+        const uint8_t* wire = a.blob(n);
+        if (offset > (uint64_t)std::numeric_limits<GLintptr>::max() ||
+            size > (uint64_t)std::numeric_limits<GLsizeiptr>::max() ||
+            size != n) { a.ok = false; break; }
+        GEX_GL_CALL(glNamedBufferSubData, buffer, (GLintptr)offset,
+                    (GLsizeiptr)size, wire);
+        break;
+    }
+    case NAMED_BUFFER_STORAGE: {
+        const GLuint buffer = lookup(buffers, a.u32());
+        const uint64_t size = a.u64();
+        const GLbitfield flags = a.u32();
+        const bool has_data = a.u32() != 0;
+        uint32_t n = 0;
+        const uint8_t* wire = a.blob(n);
+        if (size > (uint64_t)std::numeric_limits<GLsizeiptr>::max() ||
+            (has_data && size != n) || (!has_data && n != 0)) { a.ok = false; break; }
+        GEX_GL_CALL(glNamedBufferStorage, buffer, (GLsizeiptr)size,
+                    has_data ? wire : nullptr, flags);
+        break;
+    }
     /* ARB_gl_spirv. The shader names arrive in the guest's own namespace, so
        each has to come back through the shaders table before GL sees it --
        glShaderBinary takes an array of them rather than one. */

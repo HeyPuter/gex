@@ -671,6 +671,73 @@ void glBufferSubData(unsigned target, long offset, long size, const void *data) 
     put_blob(p + 5, data, len);
 }
 
+/* The named forms of the three above. GL 4.5 core, and the ones that make
+   direct state access usable rather than merely present: the DSA object model
+   is there now, but a buffer cannot be filled without these, so an engine
+   taking the 4.5 path still stopped at its first vertex upload.
+
+   Hand-written beside their bound twins rather than generated, because those
+   twins are hand-written too -- the guest keeps a shadow of each buffer's size
+   and storage flags, and that bookkeeping is what glMapBufferRange and the
+   persistent-mapping path read. A generated version would send the bytes and
+   silently skip the shadow.
+
+   The only difference from the bound forms is where the buffer comes from:
+   named here, `bound_buffer(target)` there. */
+void glNamedBufferData(unsigned buffer, long size, const void *data,
+                       unsigned usage) {
+    if (size < 0) return;
+    size_t len = (size_t)size;
+    struct buffer_object_state *object = buffer_object(buffer, 1);
+    if (object) object->size = len;
+    size_t blob_len = data ? len : 0;
+    uint32_t *p = begin(GEXGL_NAMED_BUFFER_DATA, 5, 4 + blob_len);
+    if (!p) return;
+    p[0] = buffer;
+    p[1] = usage;
+    p[2] = (uint32_t)(uint64_t)size;
+    p[3] = (uint32_t)((uint64_t)size >> 32);
+    p[4] = data != NULL;
+    put_blob(p + 5, data, blob_len);
+}
+
+void glNamedBufferSubData(unsigned buffer, long offset, long size,
+                          const void *data) {
+    if (offset < 0 || size < 0 || (size && !data)) return;
+    size_t len = (size_t)size;
+    uint32_t *p = begin(GEXGL_NAMED_BUFFER_SUB_DATA, 5, 4 + len);
+    if (!p) return;
+    p[0] = buffer;
+    p[1] = (uint32_t)(uint64_t)offset;
+    p[2] = (uint32_t)((uint64_t)offset >> 32);
+    p[3] = (uint32_t)(uint64_t)size;
+    p[4] = (uint32_t)((uint64_t)size >> 32);
+    put_blob(p + 5, data, len);
+}
+
+void glNamedBufferStorage(unsigned buffer, long size, const void *data,
+                          unsigned flags) {
+    if (size < 0) return;
+    size_t blob_len = data ? (size_t)size : 0;
+    struct buffer_object_state *object = buffer_object(buffer, 1);
+    if (object) {
+        object->size = (size_t)size;
+        object->storage_flags = flags;
+        object->has_storage_flags = 1;
+    }
+    uint32_t *p = begin(GEXGL_NAMED_BUFFER_STORAGE, 5, 4 + blob_len);
+    if (!p) return;
+    const uint64_t bytes = (uint64_t)size;
+    p[0] = buffer;
+    p[1] = (uint32_t)bytes;
+    p[2] = (uint32_t)(bytes >> 32);
+    /* GL_DYNAMIC_STORAGE_BIT, as the generated glBufferStorage adds: the host
+       must accept a later glNamedBufferSubData whatever the guest asked for. */
+    p[3] = flags | 0x0100u;
+    p[4] = data != NULL;
+    put_blob(p + 5, data, blob_len);
+}
+
 /* Generated below with the rest of the GL 4.4 synchronous query surface.
    Mapping a readable buffer must use that transport query to populate the
    guest shadow before returning it to an unmodified desktop application. */

@@ -142,6 +142,72 @@ int main(void) {
     glBindTextureUnit(0, texture);
     report("bind_texture_unit", glGetError() == GL_NO_ERROR, "");
 
+    /* Fill a buffer by name and draw from it. Everything before this only
+     * *configured* objects; this is the first case that would fail if the
+     * bytes never arrived, which is what makes it the one worth having --
+     * without glNamedBufferData an engine on the 4.5 path stops at its first
+     * vertex upload however much of the object model works. */
+    static const float triangle[] = {
+        -1.0f, -1.0f, 0.0f,   3.0f, -1.0f, 0.0f,   -1.0f, 3.0f, 0.0f,
+    };
+    glNamedBufferData(buffer, (GLsizeiptr)sizeof triangle, triangle,
+                      GL_STATIC_DRAW);
+    GLint stored_size = 0;
+    glGetNamedBufferParameteriv(buffer, GL_BUFFER_SIZE, &stored_size);
+    {
+        char detail[64];
+        snprintf(detail, sizeof detail, "buffer holds %d bytes", stored_size);
+        report("named_buffer_data",
+               stored_size == (GLint)sizeof triangle && glGetError() == GL_NO_ERROR,
+               detail);
+    }
+
+    glVertexArrayVertexBuffer(vao, 0, buffer, 0, 3 * (GLsizei)sizeof(float));
+    report("vertex_array_vertex_buffer", glGetError() == GL_NO_ERROR, "");
+
+    /* And the bytes really are the ones sent: read a corner back. */
+    glNamedBufferSubData(buffer, 0, sizeof(float), &(const float){-0.5f});
+    report("named_buffer_sub_data", glGetError() == GL_NO_ERROR, "");
+
+    /* A draw that covers the framebuffer, sourced entirely from objects
+     * configured without ever binding them except the VAO the draw needs. */
+    const char* vs_source =
+        "#version 450\n"
+        "layout(location = 0) in vec3 position;\n"
+        "void main() { gl_Position = vec4(position, 1.0); }\n";
+    const char* fs_source =
+        "#version 450\n"
+        "out vec4 colour;\n"
+        "void main() { colour = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(vs, 1, &vs_source, NULL);
+    glShaderSource(fs, 1, &fs_source, NULL);
+    glCompileShader(vs);
+    glCompileShader(fs);
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
+    GLint linked = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    glUseProgram(program);
+    glBindVertexArray(vao);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glViewport(0, 0, 4, 4);
+    const GLfloat black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    glClearBufferfv(GL_COLOR, 0, black);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    unsigned char drawn[4] = {0, 0, 0, 0};
+    glReadPixels(2, 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, drawn);
+    {
+        char detail[96];
+        snprintf(detail, sizeof detail, "linked=%d pixel %u,%u,%u,%u", linked,
+                 drawn[0], drawn[1], drawn[2], drawn[3]);
+        report("draw_from_named_buffer",
+               linked && drawn[1] > 200 && drawn[0] < 60 && drawn[2] < 60, detail);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, cases - failures,
            failures);
     return failures ? 1 : 0;

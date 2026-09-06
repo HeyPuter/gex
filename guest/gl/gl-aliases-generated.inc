@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 475 of them whose target this
+ * claimed -- so here are the 477 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -235,6 +235,8 @@ extern __typeof(glMultiDrawElementsBaseVertex) glMultiDrawElementsBaseVertexEXT 
 extern __typeof(glMultiDrawElements) glMultiDrawElementsEXT __attribute__((alias("glMultiDrawElements")));
 extern __typeof(glMultiDrawElementsIndirect) glMultiDrawElementsIndirectAMD __attribute__((alias("glMultiDrawElementsIndirect")));
 extern __typeof(glMultiDrawElementsIndirect) glMultiDrawElementsIndirectEXT __attribute__((alias("glMultiDrawElementsIndirect")));
+extern __typeof(glNamedBufferStorage) glNamedBufferStorageEXT __attribute__((alias("glNamedBufferStorage")));
+extern __typeof(glNamedBufferSubData) glNamedBufferSubDataEXT __attribute__((alias("glNamedBufferSubData")));
 extern __typeof(glPatchParameteri) glPatchParameteriEXT __attribute__((alias("glPatchParameteri")));
 extern __typeof(glPatchParameteri) glPatchParameteriOES __attribute__((alias("glPatchParameteri")));
 extern __typeof(glPauseTransformFeedback) glPauseTransformFeedbackNV __attribute__((alias("glPauseTransformFeedback")));

@@ -411,6 +411,9 @@ pub mod op {
     pub const BLEND_BARRIER: u32 = 242;
     pub const SHADER_BINARY: u32 = 243;
     pub const SPECIALIZE_SHADER: u32 = 244;
+    pub const NAMED_BUFFER_DATA: u32 = 245;
+    pub const NAMED_BUFFER_SUB_DATA: u32 = 246;
+    pub const NAMED_BUFFER_STORAGE: u32 = 247;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,
