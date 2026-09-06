@@ -17944,3 +17944,49 @@ above, and **77 leaked harness servers** listening across 8091-8210, the
 oldest over a day old. They are kept warm for reuse deliberately and
 nothing ever reaped them; `serve-dist.mjs` now retires after half an hour
 idle.
+
+## A 64-bit load is not an ALU operation
+
+`gpu_shader_fp64` 558 → **658 of 659**, and
+`shader_storage_buffer_object` 117 → 119, from one pass in one place.
+
+The driver refused any buffer access wider than 32 bits by name --
+`load_ssbo bit_size=64` -- and that refusal costs the whole shader. The
+64-bit sweep in `gex_wgpu_compile_nir` is thorough about everything it can
+reach: ALU operations, registers, undefs, local variables, and the
+pack/unpack pairs `nir_lower_int64` leaves behind. It cannot reach a
+*memory access*, because that lowering rewrites arithmetic and a load is
+not arithmetic. A shader that merely read a double out of a buffer arrived
+at the emitter still 64 bits wide however much had been lowered around it.
+
+`nir_lower_mem_access_bit_sizes` is Mesa's pass for exactly this, and the
+callback is a constant here: every buffer this driver addresses is a run
+of 32-bit words, in every address space it serves.
+
+The part worth remembering is *where*. Put in `gex_wgpu_compile_nir`
+alongside the rest of the 64-bit work, it changed nothing and the refusal
+still fired — because the refusal lives in `gex_wgpu_lower_gallium_ubos`,
+which runs at shader creation, long before the module is compiled. **A
+lowering that exists to prevent a refusal has to run before the refusal,
+not next to its relatives.**
+
+`shading_language_420pack` 327/329, `shader_image_load_store` 35/51, the
+CTS gate, EEVEE, Blender and STK are unchanged.
+
+### Two families that are at their ceiling
+
+Recorded so they are not re-opened:
+
+- **`shader_multisample_interpolation` 40/109.** The 69 losses are
+  `rgba32f` at every sample count (WebGPU cannot multisample a 32-bit
+  format), the `sample` qualifier (no SPIR-V spelling for a per-sample
+  vertex output — see the note in the driver and
+  `no-spirv-sampling-on-outputs`), and `interpolateAtSample` /
+  `interpolateAtOffset`, which WGSL has no equivalent for at all.
+- **`texture_view` 3/7.** `gettexparameter`, `errors` and `view_sampling`
+  all need `GL_TEXTURE_2D_MULTISAMPLE_ARRAY`, which WGSL has no type for.
+  `view_classes` is the one with substance: 129 format pairs read zeros,
+  and the two named refusals behind them are the 16-bit-normalized
+  promotion changing a view's stored texel size, and the compressed
+  signed/unsigned BPTC pair. The promotion one is understood; see
+  `format-class-views-work`.
