@@ -229,6 +229,9 @@ enum Op : uint32_t {
     NAMED_BUFFER_DATA = 245, NAMED_BUFFER_SUB_DATA = 246,
     NAMED_BUFFER_STORAGE = 247, TEXTURE_SUB_IMAGE_1D = 248,
     TEXTURE_SUB_IMAGE_2D = 249, TEXTURE_SUB_IMAGE_3D = 250,
+    CLEAR_NAMED_FRAMEBUFFER_FV = 251, CLEAR_NAMED_FRAMEBUFFER_IV = 252,
+    CLEAR_NAMED_FRAMEBUFFER_UIV = 253,
+    CHECK_NAMED_FRAMEBUFFER_STATUS = 254, GET_NAMED_BUFFER_SUB_DATA = 255,
 };
 
 struct Reader {
@@ -1487,6 +1490,54 @@ bool one(uint32_t op, Reader& a) {
        same gexgl_compute_pixel_layout the guest used, against the same
        GL_UNPACK_* state -- agreeing on it is what keeps a malformed packet
        from being read past its end, so it is checked rather than trusted. */
+    case CHECK_NAMED_FRAMEBUFFER_STATUS: {
+        const GLuint fb = lookup(framebuffers, a.u32());
+        const GLenum target = a.u32();
+        put_u32(GEX_GL_CALL(glCheckNamedFramebufferStatus, fb, target));
+        break;
+    }
+    case GET_NAMED_BUFFER_SUB_DATA: {
+        const GLuint buffer = lookup(buffers, a.u32());
+        const GLintptr offset = (GLintptr)a.u64();
+        const GLsizeiptr size = (GLsizeiptr)a.u64();
+        /* The same 256 MiB ceiling the bound form uses: the reply is built in
+           host memory before it is sent, so an absurd size is a way to exhaust
+           it rather than a request to honour. */
+        if (offset < 0 || size < 0 || (uint64_t)size > (1u << 28)) {
+            a.ok = false; break;
+        }
+        std::vector<uint8_t> value((size_t)size);
+        GEX_GL_CALL(glGetNamedBufferSubData, buffer, offset, size, value.data());
+        put_blob(value.data(), value.size());
+        break;
+    }
+    case CLEAR_NAMED_FRAMEBUFFER_FV: {
+        const GLuint fb = lookup(framebuffers, a.u32());
+        const GLenum buffer = a.u32();
+        const GLint drawbuffer = a.i32();
+        GLfloat v[4];
+        for (int i = 0; i < 4; ++i) v[i] = a.f32();
+        GEX_GL_CALL(glClearNamedFramebufferfv, fb, buffer, drawbuffer, v);
+        break;
+    }
+    case CLEAR_NAMED_FRAMEBUFFER_IV: {
+        const GLuint fb = lookup(framebuffers, a.u32());
+        const GLenum buffer = a.u32();
+        const GLint drawbuffer = a.i32();
+        GLint v[4];
+        for (int i = 0; i < 4; ++i) v[i] = a.i32();
+        GEX_GL_CALL(glClearNamedFramebufferiv, fb, buffer, drawbuffer, v);
+        break;
+    }
+    case CLEAR_NAMED_FRAMEBUFFER_UIV: {
+        const GLuint fb = lookup(framebuffers, a.u32());
+        const GLenum buffer = a.u32();
+        const GLint drawbuffer = a.i32();
+        GLuint v[4];
+        for (int i = 0; i < 4; ++i) v[i] = a.u32();
+        GEX_GL_CALL(glClearNamedFramebufferuiv, fb, buffer, drawbuffer, v);
+        break;
+    }
     case TEXTURE_SUB_IMAGE_1D: {
         const GLuint texture = lookup(textures, a.u32());
         const GLint level = a.i32(), x = a.i32();

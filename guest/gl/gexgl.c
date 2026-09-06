@@ -2060,6 +2060,45 @@ void glBindFramebuffer(unsigned target, unsigned name) {
     CMD2(GEXGL_BIND_FRAMEBUFFER, target, name);
 }
 void glBindRenderbuffer(unsigned target, unsigned name) { CMD2(GEXGL_BIND_RENDERBUFFER, target, name); }
+/* Two DSA calls that need an answer back, not just bytes out.
+ *
+ * Both flush and wait, exactly as their bound twins do: the ring is
+ * one-directional and the reply is read after the batch is submitted. That
+ * cost is why GL has so few of these, and why an engine calls
+ * glCheckNamedFramebufferStatus once at setup rather than per frame. */
+unsigned glCheckNamedFramebufferStatus(unsigned framebuffer, unsigned target) {
+    uint32_t *p = begin(GEXGL_CHECK_NAMED_FRAMEBUFFER_STATUS, 2, 0);
+    if (!p) return 0;
+    p[0] = framebuffer;
+    p[1] = target;
+    flush();
+    const unsigned status = reply_u32();
+    if (status != 0x8CD5u)
+        fprintf(stderr,
+                "gex-gl: framebuffer %u status 0x%x for target 0x%x\n",
+                framebuffer, status, target);
+    return status;
+}
+
+void glGetNamedBufferSubData(unsigned buffer, long offset, long size,
+                             void *data) {
+    if (offset < 0 || size < 0) return;
+    uint32_t *p = begin(GEXGL_GET_NAMED_BUFFER_SUB_DATA, 5, 0);
+    if (!p) return;
+    const uint64_t off = (uint64_t)offset, bytes = (uint64_t)size;
+    p[0] = buffer;
+    p[1] = (uint32_t)off; p[2] = (uint32_t)(off >> 32);
+    p[3] = (uint32_t)bytes; p[4] = (uint32_t)(bytes >> 32);
+    flush();
+    uint32_t reply_len = 0;
+    const uint8_t *reply = reply_blob(&reply_len);
+    /* Only on an exact-length reply: a short one means the host refused or
+       clamped, and copying it would leave the caller's buffer half updated
+       with no way to tell. */
+    if (data && size > 0 && reply && reply_len == (uint64_t)size)
+        memcpy(data, reply, reply_len);
+}
+
 unsigned glCheckFramebufferStatus(unsigned target) {
     CMD1(GEXGL_CHECK_FRAMEBUFFER_STATUS, target);
     flush();
@@ -2322,6 +2361,43 @@ void glBlendColor(float r,float g,float b,float a) {
 void glBlendEquationSeparate(unsigned rgb,unsigned alpha) {
     CMD2(GEXGL_BLEND_EQUATION_SEPARATE,rgb,alpha);
 }
+/* The named framebuffer clears. GL 4.5 core; the same three values with the
+   framebuffer given instead of bound. The component count follows GL: GL_COLOR
+   (0x1800) takes four, GL_DEPTH and GL_STENCIL one -- reading four from a
+   one-element array is how a caller's stack gets read past its end, so the
+   count is applied here rather than always copying four. */
+void glClearNamedFramebufferfv(unsigned framebuffer, unsigned buffer,
+                               int drawbuffer, const float *value) {
+    uint32_t *p = begin(GEXGL_CLEAR_NAMED_FRAMEBUFFER_FV, 7, 0);
+    if (!p) return;
+    p[0] = framebuffer; p[1] = buffer; p[2] = (uint32_t)drawbuffer;
+    const int count = buffer == 0x1800u ? 4 : 1;
+    for (int i = 0; i < 4; i++) {
+        const float v = i < count && value ? value[i] : 0.0f;
+        memcpy(&p[3 + i], &v, 4);
+    }
+}
+
+void glClearNamedFramebufferiv(unsigned framebuffer, unsigned buffer,
+                               int drawbuffer, const int *value) {
+    uint32_t *p = begin(GEXGL_CLEAR_NAMED_FRAMEBUFFER_IV, 7, 0);
+    if (!p) return;
+    p[0] = framebuffer; p[1] = buffer; p[2] = (uint32_t)drawbuffer;
+    const int count = buffer == 0x1800u ? 4 : 1;
+    for (int i = 0; i < 4; i++)
+        p[3 + i] = (uint32_t)(i < count && value ? value[i] : 0);
+}
+
+void glClearNamedFramebufferuiv(unsigned framebuffer, unsigned buffer,
+                                int drawbuffer, const unsigned *value) {
+    uint32_t *p = begin(GEXGL_CLEAR_NAMED_FRAMEBUFFER_UIV, 7, 0);
+    if (!p) return;
+    p[0] = framebuffer; p[1] = buffer; p[2] = (uint32_t)drawbuffer;
+    const int count = buffer == 0x1800u ? 4 : 1;
+    for (int i = 0; i < 4; i++)
+        p[3 + i] = i < count && value ? value[i] : 0u;
+}
+
 void glClearBufferfv(unsigned buffer,int drawbuffer,const float *value) {
     uint32_t *p=begin(GEXGL_CLEAR_BUFFER_FV,6,0); if(!p)return;
     p[0]=buffer;p[1]=(uint32_t)drawbuffer;

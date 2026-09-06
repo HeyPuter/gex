@@ -417,6 +417,11 @@ pub mod op {
     pub const TEXTURE_SUB_IMAGE_1D: u32 = 248;
     pub const TEXTURE_SUB_IMAGE_2D: u32 = 249;
     pub const TEXTURE_SUB_IMAGE_3D: u32 = 250;
+    pub const CLEAR_NAMED_FRAMEBUFFER_FV: u32 = 251;
+    pub const CLEAR_NAMED_FRAMEBUFFER_IV: u32 = 252;
+    pub const CLEAR_NAMED_FRAMEBUFFER_UIV: u32 = 253;
+    pub const CHECK_NAMED_FRAMEBUFFER_STATUS: u32 = 254;
+    pub const GET_NAMED_BUFFER_SUB_DATA: u32 = 255;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

@@ -236,6 +236,45 @@ int main(void) {
                detail);
     }
 
+    /* The two round-trip calls: both flush the ring and wait for an answer,
+     * so a wrong reply length or a missed lookup shows up as a wrong value
+     * here rather than as a silent no-op. */
+    {
+        const GLenum status = glCheckNamedFramebufferStatus(upload_fbo,
+                                                            GL_FRAMEBUFFER);
+        char detail[64];
+        snprintf(detail, sizeof detail, "status 0x%x", (unsigned)status);
+        report("check_named_framebuffer_status",
+               status == GL_FRAMEBUFFER_COMPLETE, detail);
+    }
+    {
+        /* Read the vertex data back out of the buffer it was uploaded into.
+         * The first float was overwritten by glNamedBufferSubData above, so
+         * this also confirms that landed rather than merely not erroring. */
+        float readback[3] = {0.0f, 0.0f, 0.0f};
+        glGetNamedBufferSubData(buffer, 0, (GLsizeiptr)sizeof readback,
+                                readback);
+        char detail[96];
+        snprintf(detail, sizeof detail, "read %.2f,%.2f,%.2f", readback[0],
+                 readback[1], readback[2]);
+        report("get_named_buffer_sub_data",
+               readback[0] == -0.5f && readback[1] == -1.0f &&
+                   readback[2] == 0.0f, detail);
+    }
+    /* And a clear addressed by name, read back through the same framebuffer. */
+    {
+        const GLfloat magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+        glClearNamedFramebufferfv(upload_fbo, GL_COLOR, 0, magenta);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, upload_fbo);
+        unsigned char cleared[4] = {0, 0, 0, 0};
+        glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, cleared);
+        char detail[96];
+        snprintf(detail, sizeof detail, "read %u,%u,%u,%u", cleared[0],
+                 cleared[1], cleared[2], cleared[3]);
+        report("clear_named_framebuffer_fv",
+               cleared[0] > 200 && cleared[1] < 60 && cleared[2] > 200, detail);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, cases - failures,
            failures);
     return failures ? 1 : 0;
