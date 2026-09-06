@@ -1069,6 +1069,108 @@ void glGetProgramInfoLog(unsigned p, int max, int *len, char *out) {
     get_log(GEXGL_GET_PROGRAM_INFO_LOG, p, max, len, out);
 }
 
+/* Generated further down, used just below. Without the declaration the
+   compiler assumes int() and the third argument goes through a different
+   convention -- the same trap glGetNamedBufferSubData fell into earlier. */
+void glProgramParameteri(unsigned program, unsigned pname, int value);
+
+/* ARB_separate_shader_objects' last two, ARB_get_program_binary, and two
+   odds. None of these was reachable before; each is the only thing its
+   extension was waiting on.
+
+   glCreateShaderProgramv needs no opcode at all. The specification defines it
+   as a sequence of calls this library already has, so it is written as that
+   sequence -- create, compile, mark separable, attach, link, detach, delete --
+   and the host sees ordinary commands. Composing it here also means the guest
+   keeps its own program and shader names, which is what every other call
+   expects. */
+unsigned glCreateShaderProgramv(unsigned type, int count,
+                                const char *const *strings) {
+    if (count < 0) return 0;
+    const unsigned shader = glCreateShader(type);
+    if (!shader) return 0;
+    glShaderSource(shader, count, strings, NULL);
+    glCompileShader(shader);
+    const unsigned program = glCreateProgram();
+    if (!program) { glDeleteShader(shader); return 0; }
+    int compiled = 0;
+    glGetShaderiv(shader, 0x8B81u /* GL_COMPILE_STATUS */, &compiled);
+    if (compiled) {
+        /* GL_PROGRAM_SEPARABLE, and it must be set *before* the link or the
+           program cannot be used in a pipeline, which is the entire point. */
+        glProgramParameteri(program, 0x8258u, 1);
+        glAttachShader(program, shader);
+        glLinkProgram(program);
+        glDetachShader(program, shader);
+    }
+    glDeleteShader(shader);
+    return program;
+}
+
+void glGetProgramPipelineInfoLog(unsigned pipeline, int bufSize, int *length,
+                                 char *infoLog) {
+    get_log(GEXGL_GET_PROGRAM_PIPELINE_INFO_LOG, pipeline, bufSize, length,
+            infoLog);
+}
+
+/* A program binary is opaque: the guest neither makes nor reads it, it only
+   carries the bytes and the format between the application and the host. What
+   it must not do is hand back a truncated one -- an application stores what it
+   is given and feeds it back later, so a short binary is a cache that fails at
+   the next run rather than at this one. */
+void glGetProgramBinary(unsigned program, int bufSize, int *length,
+                        unsigned *binaryFormat, void *binary) {
+    if (length) *length = 0;
+    if (bufSize < 0) return;
+    uint32_t *p = begin(GEXGL_GET_PROGRAM_BINARY, 2, 0);
+    if (!p) return;
+    p[0] = program;
+    p[1] = (uint32_t)bufSize;
+    flush();
+    const unsigned format = reply_u32();
+    uint32_t n = 0;
+    const uint8_t *reply = reply_blob(&n);
+    if (binaryFormat) *binaryFormat = format;
+    if (!reply || (int)n > bufSize) return;
+    if (binary && n) memcpy(binary, reply, n);
+    if (length) *length = (int)n;
+}
+
+void glProgramBinary(unsigned program, unsigned binaryFormat,
+                     const void *binary, int length) {
+    if (length < 0 || (length && !binary)) return;
+    uint32_t *p = begin(GEXGL_PROGRAM_BINARY, 2, 4 + (size_t)length);
+    if (!p) return;
+    p[0] = program;
+    p[1] = binaryFormat;
+    put_blob(p + 2, binary, (size_t)length);
+}
+
+/* ARB_invalidate_subdata's remaining call. Like its DSA twin the attachment
+   array sits ahead of x/y/width/height, which no policy here can express. */
+void glInvalidateSubFramebuffer(unsigned target, int numAttachments,
+                                const unsigned *attachments, int x, int y,
+                                int width, int height) {
+    if (numAttachments < 0 || (numAttachments > 0 && !attachments)) return;
+    const size_t entries = (size_t)numAttachments;
+    if (entries > (UINT32_MAX - 8u) / 4u) return;
+    const size_t blob = entries * 4u;
+    uint32_t *p = begin(GEXGL_INVALIDATE_SUB_FRAMEBUFFER, 6, 4 + blob);
+    if (!p) return;
+    p[0] = target;
+    p[1] = (uint32_t)numAttachments;
+    p[2] = (uint32_t)x; p[3] = (uint32_t)y;
+    p[4] = (uint32_t)width; p[5] = (uint32_t)height;
+    p[6] = (uint32_t)blob;
+    if (blob) memcpy(p + 7, attachments, blob);
+}
+
+/* KHR_parallel_shader_compile. A hint, and the specification says so: an
+   implementation may ignore it entirely. This one does, rather than adding a
+   round trip to tell the host a number it would also ignore -- the guest
+   compiles nothing itself, so there are no threads here to bound. */
+void glMaxShaderCompilerThreadsKHR(unsigned count) { (void)count; }
+
 int glGetUniformLocation(unsigned program, const char *name) {
     if (!name) return -1;
     size_t len = strlen(name);

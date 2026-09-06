@@ -234,6 +234,8 @@ enum Op : uint32_t {
     CHECK_NAMED_FRAMEBUFFER_STATUS = 254, GET_NAMED_BUFFER_SUB_DATA = 255,
     VERTEX_ARRAY_VERTEX_BUFFERS = 256,
     INVALIDATE_NAMED_FRAMEBUFFER_SUB_DATA = 257,
+    GET_PROGRAM_PIPELINE_INFO_LOG = 258, GET_PROGRAM_BINARY = 259,
+    PROGRAM_BINARY = 260, INVALIDATE_SUB_FRAMEBUFFER = 261,
 };
 
 struct Reader {
@@ -1492,6 +1494,70 @@ bool one(uint32_t op, Reader& a) {
        same gexgl_compute_pixel_layout the guest used, against the same
        GL_UNPACK_* state -- agreeing on it is what keeps a malformed packet
        from being read past its end, so it is checked rather than trusted. */
+    case GET_PROGRAM_PIPELINE_INFO_LOG: {
+        const GLuint pipeline = lookup(program_pipelines, a.u32());
+        GLint length = 0;
+        GEX_GL_CALL(glGetProgramPipelineiv, pipeline, GL_INFO_LOG_LENGTH,
+                    &length);
+        if (length < 0 || length > (1 << 20)) { a.ok = false; break; }
+        std::vector<char> log((size_t)length ? (size_t)length : 1, '\0');
+        GLsizei written = 0;
+        if (length) {
+            GEX_GL_CALL(glGetProgramPipelineInfoLog, pipeline, length, &written,
+                        log.data());
+        }
+        put_blob(log.data(), (uint32_t)(written > 0 ? written : 0));
+        break;
+    }
+    case GET_PROGRAM_BINARY: {
+        const GLuint program = lookup(programs, a.u32());
+        const GLsizei bufSize = a.i32();
+        GLint length = 0;
+        GEX_GL_CALL(glGetProgramiv, program, GL_PROGRAM_BINARY_LENGTH, &length);
+        if (length < 0 || length > (1 << 26)) { a.ok = false; break; }
+        std::vector<uint8_t> binary((size_t)length);
+        GLenum format = 0;
+        GLsizei written = 0;
+        if (length) {
+            GEX_GL_CALL(glGetProgramBinary, program, length, &written, &format,
+                        binary.data());
+        }
+        put_u32(format);
+        /* Nothing at all rather than a truncated binary: an application keeps
+           what it is handed and replays it on a later run, so a short one is a
+           cache that fails then instead of now. */
+        if (written < 0 || (bufSize >= 0 && written > bufSize)) {
+            put_blob(nullptr, 0);
+        } else {
+            put_blob(binary.data(), (uint32_t)written);
+        }
+        break;
+    }
+    case PROGRAM_BINARY: {
+        const GLuint program = lookup(programs, a.u32());
+        const GLenum format = a.u32();
+        uint32_t bytes = 0;
+        const uint8_t* wire = a.blob(bytes);
+        GEX_GL_CALL(glProgramBinary, program, format, bytes ? wire : nullptr,
+                    (GLsizei)bytes);
+        break;
+    }
+    case INVALIDATE_SUB_FRAMEBUFFER: {
+        const GLenum target = a.u32();
+        const GLsizei numAttachments = a.i32();
+        const GLint x = a.i32(), y = a.i32();
+        const GLsizei width = a.i32(), height = a.i32();
+        uint32_t bytes = 0;
+        const uint8_t* wire = a.blob(bytes);
+        if (numAttachments < 0 || bytes != (uint32_t)numAttachments * 4u) {
+            a.ok = false; break;
+        }
+        std::vector<GLenum> attachments((size_t)numAttachments);
+        if (bytes) std::memcpy(attachments.data(), wire, bytes);
+        GEX_GL_CALL(glInvalidateSubFramebuffer, target, numAttachments,
+                    attachments.data(), x, y, width, height);
+        break;
+    }
     case VERTEX_ARRAY_VERTEX_BUFFERS: {
         const GLuint vaobj = lookup(vertex_arrays, a.u32());
         const GLuint first = a.u32();

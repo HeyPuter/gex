@@ -2,7 +2,7 @@
  *
  * Extensions the guest may repeat from the host: every command the
  * Khronos registry says they require is exported by this library.
- * 594 claimable, 266 withheld for missing entry
+ * 600 claimable, 260 withheld for missing entry
  * points, out of the registry's whole extension set. A host
  * extension absent from this table is not advertised to the guest,
  * which is why adding a driver capability can need a rebuild here.
@@ -101,6 +101,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_ARB_framebuffer_no_attachments",
     "GL_ARB_framebuffer_object",
     "GL_ARB_framebuffer_sRGB",
+    "GL_ARB_get_program_binary",
     "GL_ARB_gl_spirv",
     "GL_ARB_gpu_shader5",
     "GL_ARB_gpu_shader_fp64",
@@ -110,6 +111,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_ARB_instanced_arrays",
     "GL_ARB_internalformat_query",
     "GL_ARB_internalformat_query2",
+    "GL_ARB_invalidate_subdata",
     "GL_ARB_map_buffer_alignment",
     "GL_ARB_map_buffer_range",
     "GL_ARB_multi_bind",
@@ -117,6 +119,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_ARB_multisample",
     "GL_ARB_occlusion_query",
     "GL_ARB_occlusion_query2",
+    "GL_ARB_parallel_shader_compile",
     "GL_ARB_pipeline_statistics_query",
     "GL_ARB_pixel_buffer_object",
     "GL_ARB_point_parameters",
@@ -132,6 +135,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_ARB_sampler_objects",
     "GL_ARB_seamless_cube_map",
     "GL_ARB_seamless_cubemap_per_texture",
+    "GL_ARB_separate_shader_objects",
     "GL_ARB_shader_atomic_counter_ops",
     "GL_ARB_shader_atomic_counters",
     "GL_ARB_shader_ballot",
@@ -382,6 +386,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_KHR_context_flush_control",
     "GL_KHR_debug",
     "GL_KHR_no_error",
+    "GL_KHR_parallel_shader_compile",
     "GL_KHR_robust_buffer_access_behavior",
     "GL_KHR_shader_subgroup",
     "GL_KHR_texture_compression_astc_hdr",
@@ -506,6 +511,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_OES_fragment_precision_high",
     "GL_OES_geometry_point_size",
     "GL_OES_geometry_shader",
+    "GL_OES_get_program_binary",
     "GL_OES_gpu_shader5",
     "GL_OES_mapbuffer",
     "GL_OES_matrix_get",

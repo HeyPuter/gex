@@ -4,7 +4,7 @@
  * a different name. An extension requires the suffixed spelling even
  * when the function has been core, unsuffixed, for twenty years, and
  * an extension whose entry points are missing cannot honestly be
- * claimed -- so here are the 492 of them whose target this
+ * claimed -- so here are the 495 of them whose target this
  * library already exports. Included last, where every target is
  * declared, and typed from the target so the two cannot disagree.
  */
@@ -188,6 +188,7 @@ extern __typeof(glGetObjectLabel) glGetObjectLabelKHR __attribute__((alias("glGe
 extern __typeof(glGetObjectPtrLabel) glGetObjectPtrLabelKHR __attribute__((alias("glGetObjectPtrLabel")));
 extern __typeof(glGetPointerv) glGetPointervEXT __attribute__((alias("glGetPointerv")));
 extern __typeof(glGetPointerv) glGetPointervKHR __attribute__((alias("glGetPointerv")));
+extern __typeof(glGetProgramBinary) glGetProgramBinaryOES __attribute__((alias("glGetProgramBinary")));
 extern __typeof(glGetQueryObjecti64v) glGetQueryObjecti64vEXT __attribute__((alias("glGetQueryObjecti64v")));
 extern __typeof(glGetQueryObjectiv) glGetQueryObjectivARB __attribute__((alias("glGetQueryObjectiv")));
 extern __typeof(glGetQueryObjectiv) glGetQueryObjectivEXT __attribute__((alias("glGetQueryObjectiv")));
@@ -237,6 +238,7 @@ extern __typeof(glLinkProgram) glLinkProgramARB __attribute__((alias("glLinkProg
 extern __typeof(glMapBuffer) glMapBufferARB __attribute__((alias("glMapBuffer")));
 extern __typeof(glMapBuffer) glMapBufferOES __attribute__((alias("glMapBuffer")));
 extern __typeof(glMapBufferRange) glMapBufferRangeEXT __attribute__((alias("glMapBufferRange")));
+extern __typeof(glMaxShaderCompilerThreadsKHR) glMaxShaderCompilerThreadsARB __attribute__((alias("glMaxShaderCompilerThreadsKHR")));
 extern __typeof(glMemoryBarrier) glMemoryBarrierEXT __attribute__((alias("glMemoryBarrier")));
 extern __typeof(glMinSampleShading) glMinSampleShadingARB __attribute__((alias("glMinSampleShading")));
 extern __typeof(glMinSampleShading) glMinSampleShadingOES __attribute__((alias("glMinSampleShading")));
@@ -265,6 +267,7 @@ extern __typeof(glPointParameteriv) glPointParameterivNV __attribute__((alias("g
 extern __typeof(glPolygonMode) glPolygonModeNV __attribute__((alias("glPolygonMode")));
 extern __typeof(glPolygonOffsetClamp) glPolygonOffsetClampEXT __attribute__((alias("glPolygonOffsetClamp")));
 extern __typeof(glPopDebugGroup) glPopDebugGroupKHR __attribute__((alias("glPopDebugGroup")));
+extern __typeof(glProgramBinary) glProgramBinaryOES __attribute__((alias("glProgramBinary")));
 extern __typeof(glProgramParameteri) glProgramParameteriARB __attribute__((alias("glProgramParameteri")));
 extern __typeof(glProgramParameteri) glProgramParameteriEXT __attribute__((alias("glProgramParameteri")));
 extern __typeof(glProgramUniform1f) glProgramUniform1fEXT __attribute__((alias("glProgramUniform1f")));

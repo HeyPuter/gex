@@ -424,6 +424,10 @@ pub mod op {
     pub const GET_NAMED_BUFFER_SUB_DATA: u32 = 255;
     pub const VERTEX_ARRAY_VERTEX_BUFFERS: u32 = 256;
     pub const INVALIDATE_NAMED_FRAMEBUFFER_SUB_DATA: u32 = 257;
+    pub const GET_PROGRAM_PIPELINE_INFO_LOG: u32 = 258;
+    pub const GET_PROGRAM_BINARY: u32 = 259;
+    pub const PROGRAM_BINARY: u32 = 260;
+    pub const INVALIDATE_SUB_FRAMEBUFFER: u32 = 261;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,
