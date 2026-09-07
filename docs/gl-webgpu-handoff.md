@@ -20958,3 +20958,36 @@ applications do not use, in the path transform feedback depends on, at the end
 of a long session -- and the last two attempts left a silent wrong answer where
 an honest refusal had been. The diagnosis is the deliverable; the fix wants
 fresh context and the full gate cycle.
+
+### Two writable images over one subresource: a lost draw, not a lost frame
+
+`advanced-sso-subroutine` binds one rgba32f 3-layer texture at two writable
+image units. GL permits it; WebGPU refuses it. **What was worth fixing is not
+the case -- it still fails, because there is no repair -- but the shape of the
+failure.** Dawn reports it against the *command buffer*:
+
+    Writable storage texture binding aliasing found between [BindGroup] set at
+    bind group index 2, binding index 1, and ... binding index 2, with
+    subresources ... in [Texture (400x300 px, 3 layer, RGBA32Float)]
+    [Invalid CommandBuffer] is invalid.
+
+An invalid command buffer takes **every draw recorded beside it**, so one
+unservable draw became a lost frame. The buffer equivalent of this check
+already exists for exactly that reason, and its comment says so; this is the
+texture half, which was missing.
+
+`gex_wgpu_writable_image_alias` answers the question before any view exists,
+from the `pipe_image_view`s the application bound: same resource, same level,
+overlapping layer ranges. Different levels and disjoint layer ranges are
+allowed and pass through. There is no repair to attempt -- the read-only half
+of a *mixed* pair can be snapshotted and is, but two writable bindings over one
+range cannot both be served -- so it declines by name.
+
+Nothing that worked can regress: a draw that trips this produced an invalid
+command buffer, so it rendered nothing either way. What changes is that its
+neighbours now survive.
+
+Gates: probe suite 168 OK with the same seven expected -- no false positive
+from the new check -- `shader_image_load_store` unchanged at 36/51, CTS gate at
+every baseline, browser `image` 15/15, Blender identical at mean 61 / 336
+colours, Krita `panels_rmse=0`, browser STK 59.90 FPS at 99.83% fresh.
