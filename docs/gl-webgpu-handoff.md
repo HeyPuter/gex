@@ -18242,3 +18242,250 @@ limits disagreed with each other, and now that they agree it runs and
 fails — for the reason already recorded, which is the test's expected half
 and not this driver's capture. GL requires the limits to be consistent
 with one another, so running and failing is the honest state.
+
+## Mapping is emulated here, so its errors and state are ours (2026-09-06)
+
+`KHR-GL44.buffer_storage` was **1 of 9** in the browser against 6 of 9
+natively. It is **8 of 9**, and natively **9 of 9**. Six defects with one
+cause: the guest emulates buffer mapping with a shadow allocation and never
+tells the host a buffer is mapped, so the host can answer none of mapping's
+state queries and raise none of mapping's errors — and neither did we.
+
+- An indexed bind never set the generic binding point. GL defines
+  `glBindBufferBase(t, i, b)` to do what `glBindBuffer(t, b)` does as well,
+  and all the guest's buffer bookkeeping is keyed off that point, so a
+  `glBufferStorage` after an indexed bind recorded nothing and a
+  `glMapBufferRange` on that target returned NULL. Four spellings had it.
+- `GL_BUFFER_MAPPED`, `ACCESS_FLAGS`, `MAP_OFFSET`, `MAP_LENGTH` and
+  `ACCESS` were forwarded to a host that believes the buffer is idle.
+- A negative size was a silent return with no `GL_INVALID_VALUE`.
+- `glMapBufferRange` applied none of the access checks, and had the two
+  error codes the wrong way round: the spec makes everything about the
+  *range* `GL_INVALID_VALUE` and everything about the *access bits*
+  `GL_INVALID_OPERATION`, the empty length and "neither read nor write"
+  included.
+- `glBufferSubData` ignored both of its rules — the mapped-range overlap,
+  and that an immutable buffer without `GL_DYNAMIC_STORAGE_BIT` cannot be
+  written this way at all. The host's copy of the storage flags always has
+  that bit added, which is what makes the write-back work, so only the guest
+  can apply either. The driver's own write-back had to be split out of the
+  validated entry point for the same reason.
+- A persistent mapping was **one-way**. The shadow was filled at map time
+  and never again, so anything reading GPU output through one — an
+  asynchronous PBO read-back, a compute result — saw the contents from
+  whenever it mapped.
+
+### The same defect one layer down
+
+Gallium's own header says what `PIPE_MAP_COHERENT` promises: "any writes done
+by the device are immediately visible to the CPU **and vice versa**". Only
+the vice versa was ever implemented.
+
+A persistent mapping that also *reads* was served from a private `MALLOC`
+block by `buffer_map`'s read path and never tracked, so the application held
+memory the driver had no further connection to. The staged *write* path
+immediately below already made exactly that exception with exactly that
+reasoning; the read path did not.
+
+Worse, `flush_persistent_maps` uploaded the whole shadow at every submit,
+over the top of whatever the shader had written into the same buffer — and a
+buffer that is both persistently mapped and written by a shader is precisely
+what an atomic counter under this extension is. The increments landed and the
+next submit wiped them.
+
+`gex_wgpu_buffer_readback` took the device guard, which is not a recursive
+mutex and is taken as soon as a process has a second GL context, so both new
+callers would have deadlocked the first time an application made one. The
+body is split out and the guard left on a wrapper.
+
+### A performance regression, found and fixed in the same pass
+
+The diff that preserves shader writes cost **54.30 FPS against the gate's
+59.80**, with frame freshness down from 99% to 90%: st/mesa's own upload
+manager is persistently mapped, it is a megabyte, and it was re-scanned at
+every one of the 45,000 submits an STK run makes. The diff exists to preserve
+the *shader's* writes and a buffer no shader writes has none to preserve, so
+it is confined to buffers the device may have written. Back to 59.3–59.7 and
+99%.
+
+## A shader attached to a program outlives glDeleteShader (2026-09-06)
+
+Browser `KHR-GL44.compute_shader` was **3 of 42** against 38 natively. It is
+**38**, and no browser-only failure is left in the family.
+
+`glDeleteShader` on a shader attached to a program does not delete it: the
+object is flagged, survives until it is detached, and its name stays valid
+the whole time. Programs are routinely built in exactly that order — create,
+attach, delete, and only then source and compile, which is what dEQP's own
+shader helper does — and the decoder erased the guest-to-host name mapping
+the moment the delete arrived. Every later call on that name resolved to
+shader zero, so `glShaderSource`, `glCompileShader` and `glGetShaderiv` each
+raised `GL_INVALID_VALUE` against a name the application had every right to
+use.
+
+That is why it was so hard to see: the suite checks `glGetError` once at the
+end of a case and reported a latched `GL_INVALID_VALUE` against cases whose
+own bodies had passed. Thirty-nine cases failed on a check with nothing to do
+with what they tested. **One fix moved thirty-two cases.**
+
+The rule is the one `DELETE_PROGRAM` already applied to a program that is
+current. Every other object type is erased on delete correctly, because
+buffers, textures, queries, samplers, framebuffers, renderbuffers and vertex
+arrays all lose their names immediately.
+
+### And two transport gaps behind it
+
+`GL_COMPUTE_WORK_GROUP_SIZE` is the one program property that is three
+integers. The transport carried a single word, so every caller read the local
+size as `(x, 0, 0)` — and dEQP checks it in the *setup* of its compute cases,
+before the body runs.
+
+**A binding query must answer in the application's own names.** The guest
+allocates GL object names itself and the host maps them; every call that
+*takes* a name translated one way and `glGetIntegerv`, which returns them,
+translated not at all. The two numberings agree most of the time — both start
+at one and count up — which is why nothing caught it. Push them apart by
+making objects and deleting them, and the guest's buffer is 17 while the
+query answers 1. Fourteen buffer bindings, eleven texture bindings, the
+current program, the pipeline, the vertex array, both framebuffer bindings,
+the renderbuffer, the sampler and the transform feedback; and the same
+answers through `glGetFloatv`, `glGetDoublev` and `glGetInteger64v`, because
+GL converts the name to whatever type was asked for. **Not** `glGetBooleanv`,
+which GL defines as false for zero and true for anything else.
+
+This one is not a suite question. Read the current binding, change it, put it
+back is what every toolkit sharing a context does.
+
+## A context becomes current at eglMakeCurrent (2026-09-06)
+
+One line, and it was the cause of two defects that had already been written up
+separately.
+
+`eglCreateContext` called `context_create()`, and creating the host context is
+what makes it current. So the context was made current against whatever the
+drawable happened to be — the canvas, 320×240 — and GL latches the initial
+viewport at first make-current. A program that then created an 8×8 pbuffer and
+drew without calling `glViewport` had its geometry placed by a 320×240
+viewport into an 8×8 attachment.
+
+That is why a point drawn to the default framebuffer "did not execute": at NDC
+0.1234 a 320×240 viewport puts it at (179,134), outside the attachment
+entirely. And why a triangle's colour "never came back": a full-viewport
+triangle still covers an 8×8 attachment, so its fragments ran and its image
+store landed, but the pixel the read-back sampled was chosen with the same
+wrong viewport. A **clear** read back correctly throughout, because a clear
+does not care where the viewport is — which is exactly what made the pair look
+like two unrelated defects in points and in read-back.
+
+### The method, which is the part worth keeping
+
+Measure a fragment's colour **and** an image store the same fragment writes.
+The store is an independent witness that the fragment ran, and colour alone
+cannot separate "the draw did not happen" from "the framebuffer does not give
+back what was drawn". Reading colour alone produced a committed claim whose
+evidence could not support it, and it had to be corrected.
+
+Ruled out one rebuild at a time before the cause was found: a stale pending
+pass, a front/back mix-up, the image store, the viewport as reported, the
+vertex count, multisampling, the pixel grid, `GL_PROGRAM_POINT_SIZE`, point
+expansion, the format-reinterpretation scratch target, and all fifty-six
+refusals in `draw_vbo_inner`.
+
+## The instruments only worked where the defects were not (2026-09-06)
+
+Every diagnostic this driver has is `getenv`-gated — `GEX_WGPU_DUMP_WGSL`,
+`GEX_WGPU_CMD_LOG`, `GEX_WGPU_PERSIST_LOG` and the rest — and `getenv` answers
+NULL inside the wasm module. So the entire instrument shelf was native-only,
+and the browser is precisely where the defects that cannot be reproduced
+natively live.
+
+`gex_gl_setenv` takes one `"NAME=VALUE"` and the page calls it before
+`gex_gl_init`, so a flag read once and cached is still read after it.
+`?mesaenv=NAME=VALUE` on the page, and `GEX_MESA_ENV=` on
+`tests/gl44-probe.sh`. Deliberately not spelled `glenv`, which reaches the
+*guest* process: two different environments, and one name for both would be a
+trap.
+
+Alongside it, `GEX_WGPU_DRAW_DROP=1` names which of the **fifty-six** bare
+`return`s in `draw_vbo_inner` gave up on a draw. Every one of them was silent.
+A line number rather than a reason string on purpose: a reason has to be
+written fifty-six times and will be wrong somewhere.
+
+It paid for itself immediately — one run ruled out all fifty-six for the
+point-to-fb0 case, which was otherwise a day of bisection.
+
+## Integer vertex formats had almost no fallbacks (2026-09-06)
+
+`glVertexAttribIPointer` with `GL_UNSIGNED_BYTE` and a count of three read
+**0,0,0** where llvmpipe read 1,2,3; the same call with `GL_UNSIGNED_SHORT`
+was fine. `u_vbuf`'s fallback table held exactly four integer entries, all of
+them three-component 16-bit.
+
+A normalized or scaled attribute can be widened to float when the driver has
+no format for it, and most of that table does exactly that. An integer one
+cannot — `glVertexAttribIPointer` means the shader reads integers — so with no
+entry there is no route at all: the element reaches the driver,
+`create_vertex_elements_state` refuses the whole state, and the draw runs with
+no vertex layout and reads zeros. Nothing raises a GL error. Older content
+packs colours and normals exactly this way.
+
+### And the thing not to do
+
+`gex_wgpu_vertex_format` maps no single-component 8- or 16-bit format, so
+`GL_BYTE` attributes log `vertex element 0 format r8_sint (77) unsupported`.
+That message is **not** a defect: reporting a vertex format unsupported is
+what hands it to u_vbuf, which converts it and gets all of them right.
+
+Adding the nine formats WebGPU has had since 2024 — the enum values are
+already in the header — made four attribute types silently draw nothing:
+`GL_BYTE` normalized, `GL_UNSIGNED_BYTE` normalized, `GL_SHORT` normalized
+and `GL_HALF_FLOAT`. No Dawn validation error, no driver message; the
+transform feedback buffer simply kept the previous draw's value.
+`KHR-GL44.vertex_attrib_binding` scores 16 of 30 either way, so nothing in the
+suite would have said a word. `gl44-vertex-narrow-probe` reads each attribute
+back through transform feedback, which is the only way to see what the vertex
+stage *fetched* rather than what it drew.
+
+## Where the remaining gap is, measured (2026-09-06)
+
+`tests/gl44-cts-families.sh` runs the browser CTS family by family, with
+`GEX_CTS_NATIVE=1` producing the other column from the same list. Over
+eighteen families: native **1124 / 87 / 56**, browser **1108 / 103 / 56**.
+
+The whole browser-only gap is **16 cases in 8 families**, the largest being
+`shader_image_load_store` at 5 and `program_interface_query` at 3.
+`compute_shader`, `texture_gather`, `texture_view`,
+`explicit_uniform_location`, `sample_variables`, `cull_distance`,
+`gpu_shader5` and `shader_subroutine` are identical on both paths, so they are
+driver questions and belong in the native suite.
+
+**A large share of the native gap is not fixable driver work.**
+`sample_variables` — all 27 failures are `mask.rgba32f.*` and 36 of the 38
+skips are `samples_8`, with llvmpipe at 190/190; WebGPU excludes the
+32-bit-per-component formats from multisampling and offers only 1 and 4
+samples. `shader_image_load_store` — about 13 of 14 are the storage-format
+list. `compute_shader.resource-texture` and half of `texture_view` — WGSL has
+`texture_multisampled_2d` and `texture_depth_multisampled_2d` and no array
+form, and WebGPU forbids `depthOrArrayLayers > 1` on any multisampled
+texture. The fixable target is `vertex_attrib_binding`, 16 of 30 with llvmpipe
+at 30/30.
+
+### Two traps the family table set before it could be trusted
+
+A family that goes quiet while the guest JIT translates gets killed as a hang:
+`explicit_uniform_location` reported NORESULT and actually passes **48 of 48**,
+after 173 seconds with a two-minute silence in the middle. And
+`direct_state_access` and `enhanced_layouts` have no cases under `KHR-GL44` at
+all — DSA is a GL 4.5 family — which printed as a clean `0 pass 0 fail`. A run
+that produced nothing is not a run that found nothing.
+
+### And one the sweeps set
+
+`tests/gl44-browser-sweep.sh` warns against editing the tree while it runs,
+because every probe rebuilds the guest driver. That is the smaller half. The
+probe gate's *native reference* is `/tmp/gex-mesa-native/inst`, so a
+`meson install` during a sweep replaces the oracle a probe is being compared
+against, mid-run — which produced a `point-parameter FAIL` in an otherwise
+clean sweep, for a pure state probe with no rendering in it that passes 10 of
+10 when run again. A probe that fails in a sweep and passes alone is
+contamination until proven otherwise.
