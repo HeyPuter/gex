@@ -43,6 +43,13 @@ if [ -z "$FAMILIES" ]; then
               sample_variables cull_distance"
 fi
 
+# Each family's full output is kept. Without this a sweep runs for an hour and
+# throws away the only copy of the driver's own refusal messages, so answering
+# "why did those sixteen fail" costs another hour.
+LOGDIR=${GEX_CTS_LOGDIR:-$ROOT/web/.work/gl44-families/$(date +%Y%m%d-%H%M%S)}
+mkdir -p "$LOGDIR"
+echo "per-family logs: $LOGDIR"
+
 printf '%-38s %6s %6s %6s\n' family pass fail skip
 total_pass=0 total_fail=0 total_skip=0
 for family in $FAMILIES; do
@@ -52,6 +59,7 @@ for family in $FAMILIES; do
         pass=$(printf '%s' "$out" | sed -n 's/.*Passed: *\([0-9]*\)\/.*/\1/p' | tail -1)
         fail=$(printf '%s' "$out" | sed -n 's/.*Failed: *\([0-9]*\)\/.*/\1/p' | tail -1)
         skip=$(printf '%s' "$out" | sed -n 's/.*Not supported: *\([0-9]*\)\/.*/\1/p' | tail -1)
+        printf '%s\n' "$out" > "$LOGDIR/$family.log"
     else
         out=$(GEX_CTS_CASE="$case_set" \
               GEX_CTS_IDLE=${GEX_CTS_IDLE:-420} \
@@ -63,6 +71,7 @@ for family in $FAMILIES; do
         line=$(printf '%s' "$out" | grep -oE 'QPA-TOTAL pass=[0-9]+ fail=[0-9]+ skip=[0-9]+' | tail -1)
         pass=$(printf '%s' "$line" | sed -n 's/.*pass=\([0-9]*\).*/\1/p')
         fail=$(printf '%s' "$line" | sed -n 's/.*fail=\([0-9]*\).*/\1/p')
+        printf '%s\n' "$out" > "$LOGDIR/$family.log"
         skip=$(printf '%s' "$line" | sed -n 's/.*skip=\([0-9]*\).*/\1/p')
     fi
     # No numbers at all is not zero failures: the run did not produce a
