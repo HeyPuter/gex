@@ -353,8 +353,20 @@ STRING_RETURN_COMMANDS = {
 # where binding an ungenerated name is legal, so only the core-profile browser
 # owed the error and only the browser was silent about it.
 #
-# Bind calls only. A DSA call has the same rule and is deliberately left alone
-# until it is measured rather than assumed.
+# Bind calls only, plus the four DrawTransformFeedback* commands, which were
+# measured rather than assumed: KHR-GL44.transform_feedback.api_errors_test
+# ends by finding a name glIsTransformFeedback says is not a transform feedback
+# object and requiring GL_INVALID_VALUE from glDrawTransformFeedback on it.
+# `lookup` maps that unknown name to zero, and zero is the *default* transform
+# feedback object -- a perfectly legal draw -- so the error became a silent
+# success in the browser only. Name zero still resolves to zero, which is the
+# one name that must stay legal here.
+#
+# Read that failure's message with suspicion: the CTS prints "glUseProgram
+# unexpectedly failed when transform feedback is paused" at this site too, a
+# copy-paste of the check above it. The message names the wrong call.
+#
+# Other DSA calls have the same rule and are still left alone until measured.
 # How wide one element of an array is *on the wire*.
 #
 # The guest is always aarch64, where GLintptr and GLsizeiptr are eight bytes;
@@ -389,6 +401,10 @@ BINDABLE_NAME_COMMANDS = {
     "glBindTextures",
     "glBindSamplers",
     "glBindImageTextures",
+    "glDrawTransformFeedback",
+    "glDrawTransformFeedbackInstanced",
+    "glDrawTransformFeedbackStream",
+    "glDrawTransformFeedbackStreamInstanced",
 }
 
 

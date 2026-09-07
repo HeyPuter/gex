@@ -19894,3 +19894,118 @@ That unformatted work is reverted for now and remains as described above: it
 needs the packed lowering moved into a per-draw variant, and there is no safe
 partial step, because clearing the refusal alone would pack with a `NONE`
 format instead of failing.
+
+## An unknown name became a legal operation
+
+The host transport keeps a map from guest object names to MobileGL's own, and
+resolves every object-bearing parameter through it. Its `lookup` answers
+**zero** for a name it has never seen. That is not a neutral failure: zero is a
+*legal argument* to each of these calls. An unbind. The default framebuffer.
+The default vertex array. The default transform feedback object.
+
+So an unknown name did not lose an error, it **performed a different valid
+operation and reported success**. A stale framebuffer name redirected drawing
+to the window. A stale vertex array name unbound the live one.
+
+`lookup_bindable` has existed for this since `KHR-GL32.buffer_objects.
+gen_buffers`, and it is the right shape: rather than deciding which error is
+owed, it hands GL a sentinel name GL has itself never generated, so GL raises
+the error. It had **three callers out of the eight sites that wanted it** --
+`glBindBuffer`, and two generated ones added when
+`vertex_attrib_binding.negative-bindVertexBuffer` measured the same thing.
+
+**Which answer is right depends on the guest's profile, and that is the part I
+got wrong first.** The five candidate sites split cleanly:
+
+| call | ungenerated name owes | landed |
+|---|---|---|
+| `glBindSampler` | `INVALID_OPERATION` in **both** profiles | yes |
+| `glDrawTransformFeedback*` (4) | `INVALID_VALUE` in **both** profiles | yes |
+| `glBindFramebuffer` | profile-dependent | **no** |
+| `glBindRenderbuffer` | profile-dependent | **no** |
+| `glBindVertexArray` | profile-dependent | **no** |
+
+Samplers and transform feedback objects never had implicit creation, so an
+ungenerated name is an error whatever the profile. Framebuffers, renderbuffers
+and vertex arrays are different: a core context owes `INVALID_OPERATION`, but a
+compatibility context has `EXT_framebuffer_object` semantics and must
+*implicitly create* the object -- system llvmpipe 26.1 binds the arbitrary
+name and raises nothing at all.
+
+And **both profiles really occur.** The guest picks one per EGL context
+(`gexgl_egl_context_profile`): the CTS asks for core, a default
+`eglCreateContext` gets compatibility. The host is never told which, so it
+cannot answer either, and all three currently resolve the unknown name to zero
+-- wrong in *both* profiles. They are deliberately left on `lookup`: this is
+the hottest bind path in the driver and a guess there is not worth a CTS case.
+Closing it means putting the profile on the wire, then `lookup_bindable` for
+core and a lookup-or-create for compatibility.
+
+A second measurement backs the decision: `gl44-ungenerated-name` reports these
+three *identically* on native gex_wgpu and in the browser, so the transport is
+not what differs for them. Only the two landed rows were browser-only.
+
+The generator had recorded "bind calls only -- a DSA call has the same rule
+and is deliberately left alone until it is measured rather than assumed",
+which was exactly the right instinct. The `glDrawTransformFeedback*` family is
+now measured; the rest still wait for a measurement.
+
+### The failing case named a call it never made
+
+This surfaced as `KHR-GL44.transform_feedback.api_errors_test`, browser-only
+against native's pass, and it cost more than it should have because the CTS
+message is wrong. The test prints
+
+    glUseProgram unexpectedly failed when transform feedback is paused.
+
+at **two** sites, and the second is a copy-paste: the code beneath it is
+
+    gl.drawTransformFeedback(GL_POINTS, invalid_name);
+    if (GL_INVALID_VALUE != gl.getError()) { ...that same message... }
+
+`glUseProgram` is not called there at all. An earlier probe had already cleared
+the real `glUseProgram` site -- `gl44-xfb-paused-errors` proves that sequence
+12/12 -- and that result read as a dead end for as long as the message was
+believed. Two identical messages in one function is worth grepping for before
+trusting one.
+
+Note also how the test picks its name: it *asks*, walking upward from 1 while
+`glIsTransformFeedback` says the name is taken. A probe that hard-codes an
+"invalid" name proves nothing, because the transport allocates guest names and
+the literal may well be live. `gl44-ungenerated-name` asks the same way.
+
+### Why no native gate could see any of it
+
+The native reference is a **compatibility** context; the browser's guest EGL
+gives a **core** one, and binding an ungenerated name is legal in
+compatibility. Beyond that, a native probe hands the driver names the driver
+itself generated, so the guest-to-host map is never exercised at all. This is
+the class of defect the browser column exists to find -- ours, in the
+transport, invisible to every native measurement.
+
+Buffers and textures are deliberately left out of the probe: a compatibility
+context really may create those objects implicitly, so the two paths would
+differ for a legitimate reason and the probe could not tell that from a defect.
+The probe **asserts** only the two profile-independent facts and **reports**
+the three profile-dependent ones as `gap:` lines, so the gap stays visible in
+every run's log rather than only here -- a probe that fails for a known
+missing feature stops working as a regression gate.
+
+### And behind it, a second defect
+
+Fixing this moved the case's failure rather than clearing it:
+`api_errors_test` went from "glUseProgram unexpectedly failed" to
+
+    INVALID_ENUM was not generated by DrawTransformFeedbackInstanced and
+    DrawTransformFeedbackStreamInstanced when <mode> was invalid.
+
+which is the next check along, so the transform feedback family is still 18/21.
+The test builds its "invalid" mode by counting upward out of the set of modes
+it believes are supported, and that set is **profile-dependent too**: a
+compatibility context adds `GL_QUAD_STRIP` and `GL_POLYGON`, so the first
+unsupported enum is 10 natively and **8 (`GL_QUAD_STRIP`) in a core context**.
+This driver advertises quads, quad-strip and polygon -- see the unfilled-quad
+work earlier -- so the suspicion is that it accepts `GL_QUAD_STRIP` in a core
+context where GL owes `INVALID_ENUM`. Not yet measured; that is the next step,
+and note it is the same profile question as above, arriving from a second
+direction.

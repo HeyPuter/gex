@@ -1221,6 +1221,35 @@ GLuint lookup(const std::unordered_map<uint32_t, GLuint>& map, uint32_t name) {
    error, which is the answer GL owes the application. */
 constexpr GLuint GEXGL_UNGENERATED_NAME = 0x7ffffffeu;
 
+/* `lookup` answers zero for a name it does not know, and zero is a *legal*
+   argument to every one of these calls -- an unbind, the default framebuffer,
+   the default vertex array, the default transform feedback object. So an
+   unknown name does not merely lose the error GL owes: it performs a
+   different valid operation and reports success. glBindFramebuffer with a
+   stale name rendered to the window.
+
+   Which answer is right depends on the guest's profile, and that is why only
+   some of these sites use lookup_bindable:
+
+     - Samplers and transform feedback objects never had implicit creation, in
+       either profile, so an ungenerated name is always an error.
+       lookup_bindable hands GL a name it has never generated and lets GL
+       raise it. Both measured against llvmpipe by
+       tests/integration/programs/gl44-ungenerated-name-probe.c.
+
+     - Framebuffers, renderbuffers and vertex arrays are **profile-dependent**
+       and are deliberately left on `lookup`. A core context owes
+       INVALID_OPERATION, but a compatibility context has EXT_framebuffer_object
+       semantics and must *implicitly create* the object -- llvmpipe binds the
+       arbitrary name and reports no error. The guest picks its profile per
+       EGL context (gexgl_egl_context_profile), so both cases really occur: the
+       CTS asks for core, a default eglCreateContext gets compatibility. The
+       host is not told which, so neither answer can be given here yet.
+       Closing it means putting the profile on the wire, then lookup_bindable
+       for core and a lookup-or-create for compatibility. Today all three bind
+       zero, which is wrong in both profiles -- an honest, documented gap
+       rather than a guess in the hottest bind path in the driver. */
+
 GLuint lookup_bindable(const std::unordered_map<uint32_t, GLuint>& map,
                        uint32_t name) {
     if (!name) return 0;
@@ -2169,7 +2198,7 @@ bool one(uint32_t op, Reader& a) {
         for (uint32_t i = 0; i < n; ++i) { uint32_t g=a.u32(); ids.push_back(lookup(samplers,g)); samplers.erase(g); }
         glDeleteSamplers(n, ids.data()); break;
     }
-    case BIND_SAMPLER: { GLuint unit=a.u32(); glBindSampler(unit, lookup(samplers,a.u32())); break; }
+    case BIND_SAMPLER: { GLuint unit=a.u32(); glBindSampler(unit, lookup_bindable(samplers,a.u32())); break; }
     case SAMPLER_PARAMETER_I: {
         GLuint sampler = lookup(samplers, a.u32()); GLenum pname = a.u32();
         GLint values[4]{}; const size_t count = pname == GL_TEXTURE_BORDER_COLOR ? 4u : 1u;

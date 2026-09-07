@@ -930,21 +930,21 @@ case 1163: {
 case 1170: {
     GLenum mode = a.u32();
     GLuint id = a.u32();
-    GEX_GL_CALL(glDrawTransformFeedback, mode, lookup(transform_feedbacks, id));
+    GEX_GL_CALL(glDrawTransformFeedback, mode, lookup_bindable(transform_feedbacks, id));
     break;
 }
 case 1171: {
     GLenum mode = a.u32();
     GLuint id = a.u32();
     GLsizei instancecount = a.i32();
-    GEX_GL_CALL(glDrawTransformFeedbackInstanced, mode, lookup(transform_feedbacks, id), instancecount);
+    GEX_GL_CALL(glDrawTransformFeedbackInstanced, mode, lookup_bindable(transform_feedbacks, id), instancecount);
     break;
 }
 case 1172: {
     GLenum mode = a.u32();
     GLuint id = a.u32();
     GLuint stream = a.u32();
-    GEX_GL_CALL(glDrawTransformFeedbackStream, mode, lookup(transform_feedbacks, id), stream);
+    GEX_GL_CALL(glDrawTransformFeedbackStream, mode, lookup_bindable(transform_feedbacks, id), stream);
     break;
 }
 case 1173: {
@@ -952,7 +952,7 @@ case 1173: {
     GLuint id = a.u32();
     GLuint stream = a.u32();
     GLsizei instancecount = a.i32();
-    GEX_GL_CALL(glDrawTransformFeedbackStreamInstanced, mode, lookup(transform_feedbacks, id), stream, instancecount);
+    GEX_GL_CALL(glDrawTransformFeedbackStreamInstanced, mode, lookup_bindable(transform_feedbacks, id), stream, instancecount);
     break;
 }
 case 1175: {
