@@ -113,7 +113,7 @@ int main(void) {
        writable binding and read through the read-only one. It exercises the
        same aliasing machinery, so if the failure below is a cache collision
        this is the likeliest partner. It turned out to be a second, separate
-       gap in its own right -- see the note beside it. */
+       defect in its own right, now fixed -- see the note beside it. */
     {
         GLuint alias_prog = build(
             "#version 430 core\n"
@@ -145,18 +145,16 @@ int main(void) {
         glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(alias_back),
                            alias_back);
         drain();
-        /* Reported, not asserted. This is a *fragment* group holding one
-           buffer at two storage slots, one writable and one read-only, which
-           WebGPU refuses within a pass. The driver repairs that shape in two
-           places -- the compute path snapshots it, and the vertex group
-           snapshots its half when the fragment stage writes the same slot --
-           but there is no repair for a mixed pair inside the fragment group
-           itself, so the write is lost with no message. gl44-ssbo-probe's
-           `aliased_storage` looks like this case and is not: it dispatches
-           *compute*, which is the path that is handled. */
-        fprintf(stderr, "INFO %-22s at1=0x%04x want=0x%04x%s\n",
-                "gap:fragment_alias", alias_back[1], 0xd1ceu,
-                alias_back[1] == 0xd1ceu ? "" : "   <-- write lost");
+        /* A *fragment* group holding one buffer at two storage slots, one
+           writable and one read-only. WebGPU refuses that pair within a pass
+           and names neither binding, so the read-only half now reads a
+           snapshot -- the same repair the compute path and the vertex group
+           already used. Before that, the write was lost with no message.
+
+           gl44-ssbo-probe's `aliased_storage` looks like this case and is
+           not: it dispatches *compute*, which was already handled. Mimicking
+           it with a fragment shader is what found the hole. */
+        eq("fragment_alias_write", alias_back[1], 0xd1ceu);
         /* The identical draw again. A pass only here means the *first* such
            draw in the process loses its write, which is a different fault
            from the construct being unsupported. */
@@ -168,9 +166,8 @@ int main(void) {
         glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(alias_back),
                            alias_back);
         drain();
-        fprintf(stderr, "INFO %-22s at1=0x%04x want=0x%04x (not a"
-                " first-draw effect)\n", "gap:fragment_alias2",
-                alias_back[1], 0xd1ceu);
+        /* Again, so a repair that only works once cannot pass. */
+        eq("fragment_alias_again", alias_back[1], 0xd1ceu);
         /* Leave the slots as the failing family leaves them. */
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, 0);

@@ -20230,3 +20230,56 @@ residual is inside this gate's own spread, which is as wide as the difference.
 Bind groups naming a destroyed resource still have to be rebuilt; narrowing
 that further would mean evicting only the slots that name it, which costs a
 scan per destroy and is worth measuring before assuming it is cheaper.
+
+### The fragment group had no repair for a mixed alias pair
+
+Mimicking `gl44-ssbo-probe`'s `aliased_storage` with a *fragment* shader rather
+than a compute dispatch found a second silent lost write, and the difference
+between those two is the whole point: **`aliased_storage` dispatches compute,
+which was already handled.** One buffer at two storage slots, writable at one
+and read-only at the other, is ordinary GL -- and WebGPU refuses any writable
+binding that shares a synchronization scope with another use of the same
+buffer, naming neither binding.
+
+The driver already had the repair in two places and neither covered this one:
+
+| where | repaired |
+|---|---|
+| compute dispatch | yes -- `gex_wgpu_alias_snapshot_ensure` at the dispatch |
+| vertex group, when the fragment stage writes the same **slot** | yes -- `gex_wgpu_fragment_writes_ssbo` |
+| **fragment group, one buffer at two of its own slots** | **no** |
+
+The slot-keyed question is not the same question: a mixed pair inside one group
+names the buffer at two *different* slots, so the writable half has to be found
+**by resource**, which is what `gex_wgpu_fragment_writes_resource` now does. The
+read-only half then reads a snapshot, legal for the same reason as the other
+two: GL leaves a read of what is concurrently written undefined without a
+barrier, and a barrier submits, which closes the scope.
+
+The offset is **kept** rather than zeroed, unlike the vertex path -- the
+snapshot copies the whole allocation, so the requested range sits at the same
+place in it, and zeroing would hand the shader the start of the buffer instead.
+
+Fixed alongside it: **the snapshot buffer was never released.**
+`gex_wgpu_resource_destroy` freed the texture, the scratch, its staging buffer
+and the buffer, and left `alias_snapshot` behind -- one whole allocation leaked
+per resource that ever took part in a mixed pair, and one more address handed
+back for reuse without invalidating anything.
+
+After both, browser STK measured 59.6 / 59.8 / 59.7 FPS at 99.2 / 99.7 / 99.7%
+fresh -- indistinguishable from the pre-fix baseline, so the small residual
+that the separated epoch left behind is gone, most likely the leak. Probe suite
+164 OK of 171 with no new DIFF; CTS gate at every baseline.
+
+#### A stale install said the fix worked only in the browser
+
+Worth recording because it cost a wrong conclusion for several minutes:
+`web/build-mesa-native.sh` **builds without installing**, so the probe suite ran
+against a `libgallium` two hours old and reported `cross-stage-ssbo DIFF
+ref=[6/6] gex=[4/6]` -- which reads exactly like a fix that works in wasm and
+not natively. The native half needs
+
+    cd /tmp/gex-mesa-native && meson install --only-changed --destdir ""
+
+and the check that costs nothing is comparing the installed library's timestamp
+against the source's before believing any native measurement.
