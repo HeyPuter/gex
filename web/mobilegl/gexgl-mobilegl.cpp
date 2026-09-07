@@ -245,6 +245,7 @@ enum Op : uint32_t {
     GET_MATERIALFV = 269, GET_MATERIALIV = 270,
     GET_CLIP_PLANE = 271,
     GET_TEX_ENVFV = 272, GET_TEX_ENVIV = 273,
+    CONTEXT_ADD = 274, CONTEXT_SET_CURRENT = 275,
 };
 
 struct Reader {
@@ -299,6 +300,28 @@ struct sw_winsys* mesa_winsys = nullptr;
 #endif
 struct pipe_frontend_screen mesa_frontend_screen = {};
 struct st_context* mesa_context = nullptr;
+/* Every host GL context, with mesa_context as the first.
+ *
+ * The guest used to create one and alias every EGLContext to it, so a program
+ * with two contexts got two handles to one pile of state -- pixel store,
+ * bindings, the lot. gl44-two-contexts-probe measures it: 6/6 against native
+ * Mesa and 4/6 here before this.
+ *
+ * Objects are shared between them on purpose. st_api_create_context takes the
+ * context to share with as its fourth argument, and passing the first one
+ * keeps every buffer, texture and program visible from all of them. That is
+ * not what GL says an unshared context is, and it is deliberate:
+ * eglCreateContext's share_context argument is not honoured yet, and because
+ * every context has aliased one namespace, a toolkit that asked for sharing
+ * has been getting it. Separating the namespaces without implementing sharing
+ * would break exactly those programs. Sharing everything keeps them working
+ * while the per-context *state* becomes real, which is the part that is
+ * observably wrong. */
+std::vector<struct st_context*> mesa_contexts;
+unsigned mesa_current_context = 0;
+/* The visual every context's default framebuffer has, filled in by
+   create_backend_context and reused by CONTEXT_ADD. */
+struct st_visual mesa_visual = {};
 
 /* The default framebuffer.
  *
@@ -790,7 +813,12 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
     /* A visual the guest's default framebuffer can actually be: a colour
      * buffer it draws to and a depth/stencil buffer, both at the size the
      * transport was given. */
-    struct st_visual visual = {};
+    /* Kept at file scope as mesa_visual, because CONTEXT_ADD creates its
+       context with the same one: a second context whose default framebuffer
+       had a different shape would not be sharing the drawable this one is
+       made current with. */
+    struct st_visual& visual = mesa_visual;
+    visual = st_visual{};
     visual.buffer_mask = ST_ATTACHMENT_FRONT_LEFT_MASK |
                          ST_ATTACHMENT_BACK_LEFT_MASK |
                          ST_ATTACHMENT_DEPTH_STENCIL_MASK;
@@ -892,6 +920,10 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
     if (!st_api_make_current(mesa_context, &mesa_drawable.base,
                              &mesa_drawable.base))
         return -9;
+    /* Index zero. CONTEXT_ADD appends to this and CONTEXT_SET_CURRENT
+       switches between them. */
+    mesa_contexts.assign(1, mesa_context);
+    mesa_current_context = 0;
 #if defined(GEX_MESA_WGPU)
     report_version_gap();
 #endif
@@ -2693,6 +2725,67 @@ bool one(uint32_t op, Reader& a) {
                 values[0] = (GLint)named;
         }
         put_blob(values.data(), values.size() * sizeof(values[0]));
+        break;
+    }
+    case CONTEXT_ADD: {
+#if defined(GEX_MESA_WASM)
+        /* An additional context, sharing objects with the first. Replies with
+           its index, or with 0 when another cannot be made -- index 0 always
+           exists, so a guest that gets it back simply keeps using the context
+           it already had rather than losing its draws. */
+        if (mesa_contexts.empty() || !mesa_frontend_screen.screen) {
+            put_u32(0u);
+            break;
+        }
+        struct st_context_attribs attribs = {};
+        attribs.visual = mesa_visual;
+        attribs.major = mesa_contexts[0]->ctx->Version / 10;
+        attribs.minor = mesa_contexts[0]->ctx->Version % 10;
+        attribs.profile = mesa_contexts[0]->ctx->API == API_OPENGL_CORE
+            ? API_OPENGL_CORE : API_OPENGL_COMPAT;
+        enum st_context_error error = ST_CONTEXT_SUCCESS;
+        struct st_context* added = st_api_create_context(
+            &mesa_frontend_screen, &attribs, &error, mesa_contexts[0]);
+        if (!added) {
+            fprintf(stderr, "gexgl: could not create an additional GL "
+                            "context (error %d); the guest keeps the one it "
+                            "has and its contexts stay aliased\n", (int)error);
+            put_u32(0u);
+            break;
+        }
+        mesa_contexts.push_back(added);
+        put_u32((uint32_t)(mesa_contexts.size() - 1));
+#else
+        put_u32(0u);
+#endif
+        break;
+    }
+    case CONTEXT_SET_CURRENT: {
+        const uint32_t want = a.u32();
+        if (!a.ok) break;
+#if defined(GEX_MESA_WASM)
+        if (want >= mesa_contexts.size()) {
+            static bool said;
+            if (!said) {
+                said = true;
+                fprintf(stderr, "gexgl: context %u does not exist; staying on "
+                                "%u\n", want, mesa_current_context);
+            }
+            break;
+        }
+        if (want == mesa_current_context)
+            break;
+        if (!st_api_make_current(mesa_contexts[want], &mesa_drawable.base,
+                                 &mesa_drawable.base)) {
+            fprintf(stderr, "gexgl: could not make context %u current\n", want);
+            break;
+        }
+        mesa_current_context = want;
+        /* Everything downstream reads mesa_context, so it has to follow. */
+        mesa_context = mesa_contexts[want];
+#else
+        (void)want;
+#endif
         break;
     }
     case GET_ERROR: put_u32(glGetError()); break;

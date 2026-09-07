@@ -265,6 +265,8 @@ export const op = {
     GET_CLIP_PLANE: 271,
     GET_TEX_ENVFV: 272,
     GET_TEX_ENVIV: 273,
+    CONTEXT_ADD: 274,
+    CONTEXT_SET_CURRENT: 275,
 };
 
 export const MAGIC = 0x47584547;

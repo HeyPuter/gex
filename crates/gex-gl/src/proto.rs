@@ -459,6 +459,24 @@ pub mod op {
     pub const GET_CLIP_PLANE: u32 = 271;
     pub const GET_TEX_ENVFV: u32 = 272;
     pub const GET_TEX_ENVIV: u32 = 273;
+    /// Create an *additional* host GL context, sharing objects with the
+    /// first, and reply with its index.
+    ///
+    /// Not CONTEXT_CREATE: that opcode means "a new guest process starts
+    /// here" and resets the whole object namespace, so sending it a second
+    /// time would destroy the buffers and textures the application still
+    /// holds names for. This one adds a context and touches nothing else.
+    ///
+    /// Objects stay shared deliberately. `eglCreateContext`'s share_context
+    /// argument is not yet honoured, and because every context has aliased
+    /// one namespace until now, a toolkit that asked for sharing has been
+    /// getting it. Separating the namespaces without implementing sharing
+    /// would break those programs; sharing everything keeps them working
+    /// while the per-context *state* becomes real, which is the observable
+    /// bug (gl44-two-contexts-probe).
+    pub const CONTEXT_ADD: u32 = 274;
+    /// Make one of those contexts current, by index.
+    pub const CONTEXT_SET_CURRENT: u32 = 275;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

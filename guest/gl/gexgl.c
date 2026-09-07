@@ -4027,6 +4027,110 @@ void glGetSynciv(void *sync, unsigned pname, int buf_size, int *length, int *val
 static int egl_ready;
 static void *egl_current_display;
 static void *egl_current_context;
+
+/* Per-context state, and the handles that name it.
+ *
+ * eglCreateContext used to return the constant (void *)3 for every call, so an
+ * application with two contexts held two copies of one handle and every
+ * eglMakeCurrent was a no-op. Everything this library caches -- pixel store,
+ * buffer bindings, vertex attribute layout, the fixed-function arrays -- is a
+ * single process-global set, and the host had one GL context behind it, so the
+ * two contexts shared all of it. gl44-two-contexts-probe measures the
+ * consequence: 6/6 against native Mesa and 4/6 here.
+ *
+ * The first context keeps the handle it always had, and its path through this
+ * file is unchanged: nothing an application with one context does can reach the
+ * code below. Only a second eglCreateContext allocates a slot, asks the host
+ * for another GL context with CONTEXT_ADD, and starts switching.
+ *
+ * Objects stay shared, because the host creates the additional context sharing
+ * the first's -- see CONTEXT_ADD. eglCreateContext's `share` argument is still
+ * ignored, which is wrong for a program that asks for an *unshared* context;
+ * it is the same wrong as before rather than a new one, and separating the
+ * namespaces without implementing sharing would break the toolkits that have
+ * been getting sharing by accident. */
+#define GEXGL_FIRST_CONTEXT_HANDLE ((void *)3)
+#define GEXGL_MAX_GUEST_CONTEXTS 8
+
+struct gexgl_context_slot {
+    void *handle;            /* what eglCreateContext returned */
+    unsigned host_index;     /* the host's context, 0 for the first */
+    int host_made;           /* whether CONTEXT_ADD has run for it */
+    /* The caches, parked while another context is current. */
+    struct gexgl_pixel_store pack, unpack;
+    struct buffer_target_state buffer_targets[24];
+    struct vertex_attrib_state vertex_attribs[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
+    int vertex_attrib_client_count;
+    struct gexgl_ff_array_state ff_arrays[GEXGL_FF_COUNT];
+    int ff_client_count;
+    unsigned client_texture_unit;
+};
+static struct gexgl_context_slot egl_context_slots[GEXGL_MAX_GUEST_CONTEXTS];
+static unsigned egl_context_count;
+static unsigned egl_context_current_slot;
+
+/* Park the live caches in a slot, and take a slot's caches live. Swapping the
+   globals rather than threading a context pointer through every access site is
+   what keeps this change small: nothing that reads pack_store or
+   vertex_attribs has to know a context switch can happen. */
+static void gexgl_context_save(struct gexgl_context_slot *slot) {
+    slot->pack = pack_store;
+    slot->unpack = unpack_store;
+    memcpy(slot->buffer_targets, buffer_targets, sizeof(buffer_targets));
+    memcpy(slot->vertex_attribs, vertex_attribs, sizeof(vertex_attribs));
+    slot->vertex_attrib_client_count = vertex_attrib_client_count;
+    memcpy(slot->ff_arrays, gexgl_ff_arrays, sizeof(gexgl_ff_arrays));
+    slot->ff_client_count = gexgl_ff_client_count;
+    slot->client_texture_unit = gexgl_client_texture_unit;
+}
+
+static void gexgl_context_load(const struct gexgl_context_slot *slot) {
+    pack_store = slot->pack;
+    unpack_store = slot->unpack;
+    memcpy(buffer_targets, slot->buffer_targets, sizeof(buffer_targets));
+    memcpy(vertex_attribs, slot->vertex_attribs, sizeof(vertex_attribs));
+    vertex_attrib_client_count = slot->vertex_attrib_client_count;
+    memcpy(gexgl_ff_arrays, slot->ff_arrays, sizeof(gexgl_ff_arrays));
+    gexgl_ff_client_count = slot->ff_client_count;
+    gexgl_client_texture_unit = slot->client_texture_unit;
+}
+
+/* A fresh context starts at GL's defaults, not at whatever the last one left.
+   Only the two pixel-store blocks have non-zero defaults. */
+static void gexgl_context_defaults(struct gexgl_context_slot *slot) {
+    void *handle = slot->handle;
+    const unsigned host = slot->host_index;
+    const int made = slot->host_made;
+    memset(slot, 0, sizeof(*slot));
+    slot->handle = handle;
+    slot->host_index = host;
+    slot->host_made = made;
+    slot->pack = (struct gexgl_pixel_store){4, 0, 0, 0, 0, 0};
+    slot->unpack = (struct gexgl_pixel_store){4, 0, 0, 0, 0, 0};
+}
+
+static void gexgl_context_switch_to(unsigned slot_index) {
+    if (slot_index >= egl_context_count ||
+        slot_index == egl_context_current_slot)
+        return;
+    gexgl_context_save(&egl_context_slots[egl_context_current_slot]);
+    struct gexgl_context_slot *to = &egl_context_slots[slot_index];
+    /* The host side, first time only: an additional GL context sharing the
+       first's objects. A host that cannot make one replies with index zero,
+       and then both slots drive the same GL context -- the old behaviour,
+       which is wrong but is what the application had before. */
+    if (!to->host_made) {
+        to->host_made = 1;
+        uint32_t *p = begin(GEXGL_CONTEXT_ADD, 0, 0);
+        if (p) {
+            flush();
+            to->host_index = reply_u32();
+        }
+    }
+    CMD1(GEXGL_CONTEXT_SET_CURRENT, to->host_index);
+    gexgl_context_load(to);
+    egl_context_current_slot = slot_index;
+}
 static void *egl_current_draw;
 static void *egl_current_read;
 static int egl_surface_width = 256;
@@ -4396,7 +4500,38 @@ void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
      *
      * eglMakeCurrent creates it instead, by which time the surface exists and
      * its size has reached the host. */
-    return (void *)3;
+    /* The first context keeps the handle this function has always returned,
+       so an application with one context sees no change at all -- and every
+       program in the app sweep has one. A second gets a distinct handle,
+       which it has to: two contexts that compare equal made every
+       eglMakeCurrent between them a no-op, which is how their state came to
+       be shared. */
+    if (egl_context_count == 0) {
+        egl_context_slots[0].handle = GEXGL_FIRST_CONTEXT_HANDLE;
+        egl_context_slots[0].host_index = 0;
+        egl_context_slots[0].host_made = 1;
+        gexgl_context_defaults(&egl_context_slots[0]);
+        egl_context_count = 1;
+        egl_context_current_slot = 0;
+        return GEXGL_FIRST_CONTEXT_HANDLE;
+    }
+    if (egl_context_count >= GEXGL_MAX_GUEST_CONTEXTS) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "gex-gl: more than %d GL contexts; the newest "
+                            "share the last one's state\n",
+                    GEXGL_MAX_GUEST_CONTEXTS);
+        }
+        return egl_context_slots[GEXGL_MAX_GUEST_CONTEXTS - 1].handle;
+    }
+    const unsigned slot = egl_context_count++;
+    egl_context_slots[slot].handle =
+        (void *)(uintptr_t)(0x3000u + slot);
+    egl_context_slots[slot].host_index = 0;
+    egl_context_slots[slot].host_made = 0;
+    gexgl_context_defaults(&egl_context_slots[slot]);
+    return egl_context_slots[slot].handle;
 }
 
 unsigned eglDestroyContext(void *dpy, void *ctx) { (void)dpy; (void)ctx; return EGL_TRUE; }
@@ -4407,6 +4542,17 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
        through this library's eglCreateContext. The latch inside makes it a
        no-op once the host context exists. */
     if (ctx) context_create();
+    /* Switch the cached state and the host's context when the application
+       moves between two of them. A single-context program never gets here
+       with anything but slot zero, so its path is unchanged. */
+    if (ctx) {
+        for (unsigned i = 0; i < egl_context_count; ++i) {
+            if (egl_context_slots[i].handle == ctx) {
+                gexgl_context_switch_to(i);
+                break;
+            }
+        }
+    }
     egl_current_display = ctx ? dpy : NULL;
     egl_current_context = ctx;
     egl_current_draw = ctx ? draw : NULL;
