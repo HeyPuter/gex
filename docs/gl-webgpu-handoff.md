@@ -20508,3 +20508,46 @@ describes. Worth attacking as a memory-model question rather than as two cases.
 
 **`basic-allTargets-store-fs` / `-cs`** remain the storage-format question:
 a format WebGPU will not store to. See the storage-format wall section.
+
+### Following the looser cap, and the latch it was hiding
+
+Lowering the reported alignment was correct and left a live trap two thousand
+lines away. The constant-buffer path refused any offset that was not a multiple
+of **256**, as a hardcoded `buffer_offset & 255u`, and refusing a constant
+buffer calls `gex_fail` -- which **latches the context**, so every later draw
+becomes a no-op while the application keeps presenting at full rate.
+
+Reproduced before fixing, on the installed driver, with the reported alignment
+already at 32:
+
+    uniform_offset_alignment=32
+    gex-wgpu: constant buffer refused (offset not 256-aligned) ... offset=32
+    gex-wgpu: draw refused (context already failed) ...
+    centre pixel 0,0,0,0
+
+The pixel is black rather than the red clear because the `glClear` was lost to
+the latch too. The application had done nothing wrong: it asked GL for the
+alignment and used exactly it.
+
+**No existing gate caught this**, and the reason is worth keeping: st/mesa
+aligns its own uniform uploads, so the driver is normally handed 256-aligned
+offsets no matter what it reports. Only an application choosing its own tighter
+offset -- which is ordinary -- reaches the check. `gl44-ubo-min-offset` now
+does exactly that: it binds at `GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT` itself, the
+smallest non-zero offset GL permits, and asserts the draw sees the uniform.
+Note what it asserts on: a *pixel*, not an error code, because the symptom of a
+latch is a frame with nothing in it.
+
+After the fix the same run gives `centre pixel 0,255,0,255`.
+
+`caps->texture_buffer_offset_alignment` was hardcoded to 256 beside it and now
+follows the granted *storage* alignment, since a buffer texture is served
+through a storage buffer binding.
+
+Three other `255` masks in the file are `bytesPerRow`, which is a genuine and
+separate WebGPU 256-byte rule, and stay. The same literal means different
+things in one file, so reading each one is the work.
+
+**The general rule: when a cap gets looser, grep for the old value as a
+literal.** Asking the adapter for a limit is step one; following it into every
+check that assumed the old answer is step two.
