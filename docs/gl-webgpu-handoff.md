@@ -19109,13 +19109,47 @@ leakage, not the 64-bit failures, not context teardown. What is left is that
 some state basic-state1..3 sets is reported wrongly only once set, and the
 case logs nothing to say which.
 
-### The latent bug it turned up
+### The real bug it turned up: there is only one GL context
 
-Independent of the above: with the caches process-global and
-`eglDestroyContext` a no-op, an application that uses **more than one GL
-context** gets one context's cached pixel-store, buffer-binding and
-vertex-attribute state while another is current. Per-context storage is the
-correct fix; resetting on `eglMakeCurrent` is not, because a program switching
-between two contexts would then read defaults instead of the state it left.
-Toolkits that create a second context, and programs that recreate theirs on
-resize, are the shapes that would hit it.
+My first note here blamed the process-global caches. That was the symptom. The
+guest creates its host context behind a latch --
+
+    static void context_create(void) {
+        if (host_context_made || !ring) return;
+        host_context_made = 1;
+        ...
+    }
+
+-- so **one `CONTEXT_CREATE` is ever sent per process** and every `EGLContext`
+an application creates aliases the same host GL context. `eglDestroyContext` is
+a no-op for the same reason: there is nothing per-context to destroy.
+
+`gl44-two-contexts-probe` proves it rather than inferring it from the code.
+Against the reference, 6/6 with real isolation. In the browser, **4/6**:
+
+    second_context_has_default_pack   FAIL   sees the first context's PACK_ALIGNMENT
+    second_context_has_no_binding     FAIL   sees the first context's buffer binding
+
+The first context's own state survives, so this is aliasing rather than
+corruption -- two handles to one pile of state, with objects, bindings and
+pixel-store settings shared.
+
+**Why it has gone unnoticed:** essentially every application in the 341-program
+sweep uses one context, so the aliasing is invisible. The shapes that would hit
+it are toolkits creating a second context for a second window or for loading
+resources, and anything relying on context isolation.
+
+**What the fix needs**, in order: send `CONTEXT_CREATE` per guest context
+rather than once; have the host create and track a GL context per guest handle
+and switch on `MAKE_CURRENT`; and make the guest's caches -- `pack_store`,
+`unpack_store`, `buffer_targets`, `vertex_attribs`, `gexgl_ff_arrays`,
+`gexgl_client_texture_unit`, `extension_count` -- follow the switch. Those
+caches can be saved and restored around a switch without touching their access
+sites, which is much cheaper than threading a context pointer through all of
+them, but it is worth nothing until the host side is real. Resetting them on
+`eglMakeCurrent` is *not* a cheap partial fix: a program alternating between
+two contexts would then read defaults instead of the state it left.
+
+The probe is committed expecting 4/6 in the browser, so it will report a DIFF
+in probe-suite until this lands -- the same convention as
+gl44-internalformat-negative. It is the acceptance test for the fix.
